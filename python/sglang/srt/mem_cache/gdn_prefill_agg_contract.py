@@ -174,20 +174,42 @@ def set_k42_route(route):
 K31_AB_DUAL = "SGLANG_GDN_K31_AB_DUAL"
 K31_AB_ENV = "SGLANG_GDN_K31_AB_ENV"
 _K31_AB = {"label": None, "logged": set()}
+_PD_MICRO_ROUTE = None
+
+
+def set_pd_micro_route(route):
+    """Debug-only forward selection, called before checkpoint preparation.
+
+    C+ already uses full-N today. Only shallow P uses its N-1/boundary
+    adapter for 0n; 0 and 1 always use the admitted full-N contract.
+    """
+    global _PD_MICRO_ROUTE
+    if route not in ("0n", "0", "1"):
+        raise ValueError("PD micro route must be 0n, 0 or 1")
+    if os.environ.get(K31_AB_DUAL) != "1":
+        raise ValueError("PD route micro requires dual-prewarmed k31 graphs")
+    _PD_MICRO_ROUTE = route
+    set_k31_ab_label("B" if route == "1" else "A")
 
 
 def k31_ab_env():
     return os.environ.get(K31_AB_ENV, "SGLANG_GDN_K31_FUSED")
 
 
+def k31_ab_envs():
+    return tuple(k31_ab_env().split(","))
+
+
 def set_k31_ab_label(label):
     if label not in ("A", "B"):
         raise ValueError("k31 A/B label must be 'A' or 'B'")
     _K31_AB["label"] = label
-    os.environ[k31_ab_env()] = "1" if label == "B" else "0"
+    for name in k31_ab_envs():
+        os.environ[name] = "1" if label == "B" else "0"
     if label not in _K31_AB["logged"]:
         _K31_AB["logged"].add(label)
-        logger.info("K31_AB_LABEL_ACTIVE label=%s %s=%s", label, k31_ab_env(), os.environ[k31_ab_env()])
+        logger.info("K31_AB_LABEL_ACTIVE label=%s %s=%s", label, k31_ab_env(),
+                    "1" if label == "B" else "0")
 
 
 def k31_ab_graph(default, dual):
@@ -199,19 +221,21 @@ def k31_ab_graph(default, dual):
 
 def capture_dual(build):
     """build() -> graph; returns {'A': ..., 'B': ...} captured with the switch at 0 / 1."""
-    name = k31_ab_env()
-    saved = os.environ.get(name)
+    names = k31_ab_envs()
+    saved = {name: os.environ.get(name) for name in names}
     out = {}
     try:
         for label, value in (("A", "0"), ("B", "1")):
-            os.environ[name] = value
+            for name in names:
+                os.environ[name] = value
             out[label] = build()
     finally:
-        if saved is None:
-            os.environ.pop(name, None)
-        else:
-            os.environ[name] = saved
-    logger.info("K31_AB_DUAL_PREWARM %s: A=0 B=1 (two graph sets, shared static inputs)", name)
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    logger.info("K31_AB_DUAL_PREWARM %s: A=0 B=1 (two graph sets, shared static inputs)", names)
     return out
 
 
@@ -507,7 +531,7 @@ def install(runner):
             publication = pool._pd_batch_publication
             # Fallback batches (original N-1 route) keep the forward-stream k31:
             # their boundary decode reads these factors inside the same forward.
-    state_dump = StateDump.from_env(pool) if agg_mode else None
+    state_dump = StateDump.from_env(pool)
     k42_control = os.environ.get(K42_CONTROL) if agg_mode else None
     checksum = FactorChecksum(pool) if agg_mode and os.environ.get(K42_CHECKSUM) == "1" else None
     install_contracts(ForwardBatch, ScheduleBatch, GDNAttnBackend, FactorStateHandoff,
@@ -553,6 +577,8 @@ def install(runner):
         if plan is None or getattr(pool, "_exact_tail_transaction", None) is not None:
             raise RuntimeError("AGG prefill needs one native full-N plan without a tail transaction")
         route = publication
+        if not agg_mode and _PD_MICRO_ROUTE in ("0n", "0"):
+            route = None
         if _AB_ROUTE["value"] == "forward":
             route = None  # ab_measure label A: today's forward-stream k31 for this forward
         flags = None if k42_control is None else _control_route(k42_control)
@@ -619,11 +645,11 @@ def install(runner):
                                 done=route.transfer_event())
         elif overlap is not None:
             overlap.publish(forward_batch.fulln_overlap_record)
-        if not agg_mode and publication is not None:
+        if not agg_mode and route is not None:
             # The full-N trunk, mixer and logits have all been enqueued. The
             # side stream waits for them. Readers retain either the original
             # join or an opt-in slot/transport fence before consuming factors.
-            publication.start_after_forward()
+            route.start_after_forward()
         # The graph publishes r, with no boundary update or manual count edit.
         forward_batch.factored_prefill_boundary_steps = 0
         owner._agg_fulln_prefills += 1
