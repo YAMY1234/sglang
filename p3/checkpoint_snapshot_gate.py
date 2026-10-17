@@ -49,7 +49,7 @@ def main():
                     torch.tensor([(length - 1) // 64], device='cuda', dtype=torch.int32)
                     if snapshot else None))
             out = chunk_fwd_o(q=qn, k=kn, v=vn, h=h, g=decay,
-                              scale=128 ** -.5, cu_seqlens=cu, chunk_indices=indices)
+                              scale=128 ** -.5, cu_seqlens=cu)
             return state, h, out, tracked
 
         old, _, _, _ = run(length - 1)
