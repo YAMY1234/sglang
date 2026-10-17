@@ -9,7 +9,7 @@ keep the stock path on every rank.
 from __future__ import annotations
 
 import logging
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 
@@ -118,3 +118,28 @@ class FcPeerSum:
             peer_slots=self.peer.peer_slots,
             epoch=self.peer.epoch,
         )
+
+
+# Draft-graph attention metadata on a side branch (SGLANG_Q35MF_KDENSE_DRAFT_META_BRANCH):
+# captured on its own stream from the graph's start, joined before the first attention kernel.
+_meta_stream: Optional[torch.cuda.Stream] = None
+_meta_join: Optional[torch.cuda.Event] = None
+
+
+def fork_metadata(launch: Callable[[], None]) -> None:
+    global _meta_stream, _meta_join
+    if _meta_stream is None:
+        _meta_stream = torch.cuda.Stream()
+    _meta_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(_meta_stream):
+        launch()
+    event = torch.cuda.Event()
+    event.record(_meta_stream)
+    _meta_join = event
+
+
+def join_metadata() -> None:
+    global _meta_join
+    if _meta_join is not None:
+        torch.cuda.current_stream().wait_event(_meta_join)
+        _meta_join = None

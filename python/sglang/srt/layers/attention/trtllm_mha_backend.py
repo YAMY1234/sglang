@@ -29,6 +29,7 @@ from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
+from sglang.srt.layers.kdense_draft_xchg import fork_metadata, join_metadata
 from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferAttnBackend,
     FlashInferMultiStepDraftBackend,
@@ -77,6 +78,7 @@ from sglang.srt.speculative.ragged_verify import (
 from sglang.srt.utils import is_flashinfer_available
 
 logger = logging.getLogger(__name__)
+_KDENSE_META_BRANCH = envs.SGLANG_Q35MF_KDENSE_DRAFT_META_BRANCH.get()
 
 if is_flashinfer_available():
     import flashinfer
@@ -1216,14 +1218,25 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         self._decode_group_plans.reset()
-        self._apply_cuda_graph_metadata(
-            bs=forward_batch.batch_size,
-            req_pool_indices=forward_batch.req_pool_indices,
-            seq_lens=forward_batch.seq_lens,
-            forward_mode=forward_batch.forward_mode,
-            spec_info=forward_batch.spec_info,
-            out_cache_loc=forward_batch.out_cache_loc,
-        )
+
+        def launch():
+            self._apply_cuda_graph_metadata(
+                bs=forward_batch.batch_size,
+                req_pool_indices=forward_batch.req_pool_indices,
+                seq_lens=forward_batch.seq_lens,
+                forward_mode=forward_batch.forward_mode,
+                spec_info=forward_batch.spec_info,
+                out_cache_loc=forward_batch.out_cache_loc,
+            )
+
+        if (
+            _KDENSE_META_BRANCH
+            and forward_batch.forward_mode.is_draft_extend_v2()
+            and torch.cuda.is_current_stream_capturing()
+        ):
+            fork_metadata(launch)
+        else:
+            launch()
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
@@ -1760,6 +1773,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         **kwargs,
     ) -> torch.Tensor:
         """Run forward for decode using TRTLLM MHA kernel."""
+        join_metadata()
 
         use_fused_fp8_path = self._should_use_fused_fp8_path(
             save_kv_cache, k, forward_batch
@@ -1866,6 +1880,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         save_kv_cache=True,
         **kwargs,
     ):
+        join_metadata()
         cp_active = is_cp_active(forward_batch)
         uses_native_fp4 = self._forward_extend_uses_native_fp4(forward_batch)
         if uses_native_fp4 and cp_active:
@@ -2313,21 +2328,28 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
             backends = self.attn_backends[: self.speculative_num_steps - 1]
             b0 = backends[0]
             unified = b0.kv_index_translator.is_translating
-            update_trtllm_mha_graph_metadata_multistep(
-                req_pool_indices=forward_batch.req_pool_indices[:bs],
-                seq_lens=forward_batch.seq_lens[:bs],
-                req_to_token=b0.req_to_token,
-                addr_table=addr,
-                num_steps=len(backends),
-                bs=bs,
-                first_offset=1,
-                max_seq_pages=b0.max_num_pages,
-                page_size=b0.page_size,
-                page_table_stride=(
-                    0 if unified else b0.decode_cuda_graph_metadata[bs].page_table.stride(0)
-                ),
-                skip_page_table=unified,
-            )
+
+            def launch():
+                update_trtllm_mha_graph_metadata_multistep(
+                    req_pool_indices=forward_batch.req_pool_indices[:bs],
+                    seq_lens=forward_batch.seq_lens[:bs],
+                    req_to_token=b0.req_to_token,
+                    addr_table=addr,
+                    num_steps=len(backends),
+                    bs=bs,
+                    first_offset=1,
+                    max_seq_pages=b0.max_num_pages,
+                    page_size=b0.page_size,
+                    page_table_stride=(
+                        0 if unified else b0.decode_cuda_graph_metadata[bs].page_table.stride(0)
+                    ),
+                    skip_page_table=unified,
+                )
+
+            if _KDENSE_META_BRANCH and torch.cuda.is_current_stream_capturing():
+                fork_metadata(launch)
+            else:
+                launch()
             for b in backends:
                 b.forward_metadata = b.decode_cuda_graph_metadata[bs]
             return

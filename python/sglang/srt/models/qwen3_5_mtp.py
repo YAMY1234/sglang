@@ -33,7 +33,7 @@ from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.layers.kdense_draft_xchg import FcPeerSum
+from sglang.srt.layers.kdense_draft_xchg import FcPeerSum, join_metadata
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -396,6 +396,8 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 )
             if self._mkd is not None and self._mkd.armed:
                 self._mkd.hidden_partial(hidden_states)
+            # A metadata side branch must rejoin inside this capture even without attention.
+            join_metadata()
         finally:
             exit_stack.close()
 

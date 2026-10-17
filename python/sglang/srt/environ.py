@@ -635,6 +635,9 @@ class Envs:
     # TP2 with the vocab exchange: shard argmax, packed-row exchange through the peer's
     # symmetric buffer and selection in one kernel (no all-gather; same token and row).
     SGLANG_Q35MF_KDENSE_DRAFT_ARGMAX_XCHG = EnvBool(False)
+    # Draft decode / draft extend graphs capture the TRT-LLM MHA metadata rebuild on a side
+    # stream from the graph's start and join it before the first attention kernel.
+    SGLANG_Q35MF_KDENSE_DRAFT_META_BRANCH = EnvBool(False)
 
     # ===================================================================
     # Memory pools and KV-cache sizing
