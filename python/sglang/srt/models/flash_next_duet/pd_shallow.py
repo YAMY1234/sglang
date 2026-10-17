@@ -117,6 +117,7 @@ def prefill_extend(owner, input_ids, positions, fb):
             raise RuntimeError("full-N shallow requires a nonempty emitter prefix per row")
         emitter_fb.mamba_track_seqlens = getattr(
             fb, "_pd_fulln_emitter_track_seqlens", fb.mamba_track_seqlens)
+        emitter_fb._pd_fulln_fp32_track_mask = None  # deep aligned state is already fp32 final
     emitter_fb.flashnext_gdn_layer_range = (0, 35)
     # One native N-1 plan is reused for all layers. It is made before any
     # recurrent append can mark a live slot stale; its exact ring sources and

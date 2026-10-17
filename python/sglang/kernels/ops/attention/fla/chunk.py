@@ -46,6 +46,8 @@ def chunk_gated_delta_rule_fwd(
     chunk_indices: torch.LongTensor | None = None,
     inplace_update: bool = True,
     real_end: torch.Tensor | None = None,
+    track_state: torch.Tensor | None = None,
+    track_chunk_idx: torch.Tensor | None = None,
 ):
     g = chunk_local_cumsum(
         g, chunk_size=CHUNK_SIZE, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
@@ -71,6 +73,8 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         inplace_update=inplace_update,
+        **({"track_state": track_state, "track_chunk_idx": track_chunk_idx}
+           if track_state is not None else {}),
         **({"real_end": real_end} if real_end is not None else {}),
     )
     o = chunk_fwd_o(
@@ -105,6 +109,8 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         cu_seqlens: Optional[torch.LongTensor] = None,
         use_qk_l2norm_in_kernel: bool = False,
         inplace_update: bool = True,
+        track_state: torch.Tensor | None = None,
+        track_chunk_idx: torch.Tensor | None = None,
     ):
         q_orig = q
         k_orig = k
@@ -130,6 +136,8 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
             inplace_update=inplace_update,
+            track_state=track_state,
+            track_chunk_idx=track_chunk_idx,
         )
         return o.to(q.dtype), h
 
@@ -148,6 +156,8 @@ def chunk_gated_delta_rule(
     head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     inplace_update: bool = True,
+    track_state: torch.Tensor | None = None,
+    track_chunk_idx: torch.Tensor | None = None,
 ):
     r"""
     Args:
@@ -215,6 +225,7 @@ def chunk_gated_delta_rule(
         )
     """
     assert q.dtype == k.dtype == v.dtype
+    assert (track_state is None) == (track_chunk_idx is None)
     assert q.dtype != torch.float32, (
         "ChunkGatedDeltaRuleFunction does not support float32. Please use bfloat16."
     )
@@ -265,6 +276,8 @@ def chunk_gated_delta_rule(
         cu_seqlens,
         use_qk_l2norm_in_kernel,
         inplace_update,
+        track_state,
+        track_chunk_idx,
     )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")

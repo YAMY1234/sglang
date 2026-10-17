@@ -212,6 +212,9 @@ class TritonGDNKernel(LinearAttnKernelBase):
             use_qk_l2norm_in_kernel=True,
             **recurrent_state_indices_args,
             **inplace_update_args,
+            **({"track_state": kwargs["track_state"],
+                "track_chunk_idx": kwargs["track_chunk_idx"]}
+               if kwargs.get("track_state") is not None else {}),
         )
 
     def target_verify(

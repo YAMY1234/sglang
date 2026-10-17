@@ -10,6 +10,7 @@ from pathlib import Path
 
 def main():
     import torch
+    from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
     from sglang.kernels.ops.attention.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
     from sglang.kernels.ops.attention.fla.chunk_fwd import chunk_gated_delta_rule_fwd_intra
     from sglang.kernels.ops.attention.fla.chunk_o import chunk_fwd_o
@@ -55,14 +56,27 @@ def main():
         old, _, _, _ = run(length - 1)
         final, h, out, _ = run(length)
         final2, h2, out2, tracked = run(length, snapshot=True)
+        public_state = torch.zeros_like(old)
+        public_track = torch.empty_like(old)
+        public_out, _, public_h = chunk_gated_delta_rule(
+            q=q, k=k, v=v, g=g, beta=beta, initial_state=public_state,
+            initial_state_indices=torch.zeros(1, device='cuda', dtype=torch.int32),
+            cu_seqlens=torch.tensor([0, length], device='cuda', dtype=torch.int32),
+            use_qk_l2norm_in_kernel=True, track_state=public_track,
+            track_chunk_idx=torch.tensor([(length - 1) // 64], device='cuda', dtype=torch.int32))
         torch.cuda.synchronize()
         row = dict(length=length, old_dtype=str(old.dtype), h_dtype=str(h.dtype),
                    snapshot_bitwise=torch.equal(tracked, old),
                    rounded_h_negative_detected=not torch.equal(h[:, (length - 1) // 64].float(), old),
                    final_unchanged=torch.equal(final, final2), h_unchanged=torch.equal(h, h2),
-                   output_unchanged=torch.equal(out, out2))
+                   output_unchanged=torch.equal(out, out2),
+                   public_snapshot_bitwise=torch.equal(public_track, old),
+                   public_outputs_bitwise=(torch.equal(public_state, final)
+                                           and torch.equal(public_out, out)
+                                           and torch.equal(public_h, h)))
         assert all(row[key] for key in ('snapshot_bitwise', 'rounded_h_negative_detected',
-                                        'final_unchanged', 'h_unchanged', 'output_unchanged')), row
+                                        'final_unchanged', 'h_unchanged', 'output_unchanged',
+                                        'public_snapshot_bitwise', 'public_outputs_bitwise')), row
         records.append(row)
         print('P3_CHECKPOINT_SNAPSHOT', json.dumps(row), flush=True)
     args.out.write_text(json.dumps(dict(passed=True, scope='synthetic primitive only',

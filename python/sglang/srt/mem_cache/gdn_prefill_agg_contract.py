@@ -426,6 +426,17 @@ def install_contracts(forward_cls, schedule_cls, backend_cls, handoff_cls, *, ag
                 mask, depth + (depth != emitter_end).to(base.dtype), base)
             result.mamba_track_seqlens = torch.where(
                 mask, depth + (depth != result.seq_lens).to(base.dtype), base)
+            # Legacy aligned S_(N-1) was an fp32 final state. The ordinary
+            # intermediate h is bf16, so selecting h alone changes the cache
+            # bytes. Snapshot that boundary in fp32 without changing h/output.
+            fp32_rows = [
+                req.extend_range.end == len(req.origin_input_ids)
+                and req.extend_range.end - 1 == req.kv.mamba_last_track_seqlen
+                and (req.extend_range.length - 1) % chunk == 0
+                for req in batch.reqs]
+            result._pd_fulln_fp32_track_mask = (
+                mask & base.new_tensor(fp32_rows, dtype=torch.bool)
+                if any(fp32_rows) else None)
         if not agg_mode and not shallow and result.forward_mode.is_extend():
             result.pd_factor_only_full_batch = True
             result._pfactor_legacy_mixed = result.forward_mode.is_mixed()

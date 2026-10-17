@@ -1031,7 +1031,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if self.factored is not None and _FACTORED_DUMP_DIR is None:
             from sglang.srt.mem_cache.gdn_pside_layer_graph import eligible, run_layer
 
-            if eligible(
+            if getattr(forward_batch, "_pd_fulln_fp32_track_mask", None) is None and eligible(
                 self, layer, forward_batch, mixed_qkv, forward_metadata, conv_states
             ):
                 # Preserve the native raw-input convolution checkpoint before
@@ -1807,7 +1807,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         pool = self.factored
         plan = forward_metadata.factored_extend
         assert plan is not None, "factored extend plan missing (init_forward_metadata)"
+        fp32_track_mask = getattr(forward_batch, "_pd_fulln_fp32_track_mask", None)
+        h_track_buf = None
         if self._stepwise_active(forward_batch):
+            assert fp32_track_mask is None, "P3 fp32 checkpoint snapshot requires the chunk path"
             self._stepwise_log("factored", forward_batch)
             return self._forward_extend_factored_stepwise(
                 layer=layer,
@@ -1821,6 +1824,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 output=output,
             )
         if precomputed is not None:
+            assert fp32_track_mask is None, "P3 fp32 checkpoint snapshot cannot use a precomputed bf16 h"
             core_attn_out, S0, h = precomputed
         else:
             B = plan.slots.shape[0]
@@ -1830,8 +1834,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 layer.layer_id, plan
             )  # (B, HV, V, K) fp32, contiguous
             row_indices = torch.arange(B, device=S0.device, dtype=torch.int32)
+            if fp32_track_mask is not None and forward_metadata.track_ssm_h_src.numel():
+                assert isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)
+                assert query.dtype == torch.bfloat16, "P3 fp32 snapshot requires the served bf16 trunk"
+                h_track_buf = torch.empty_like(S0)
             block = None
-            if _os.environ.get("SGLANG_GDN_PSIDE_GRAPH") == "1":
+            if h_track_buf is None and _os.environ.get("SGLANG_GDN_PSIDE_GRAPH") == "1":
                 from sglang.srt.mem_cache.gdn_pside_prefill import run
 
                 block = run(
@@ -1851,7 +1859,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     layer, a, b, query
                 )  # fp32 emitter path (3af0d413155) or fused gating
                 extend = self.kernel_dispatcher.extend
-                if _os.environ.get(
+                if h_track_buf is None and _os.environ.get(
                     "SGLANG_GDN_PREFILL_DENSE_GRAPH", "0"
                 ) == "1" and isinstance(
                     self.kernel_dispatcher.extend_kernel, TritonGDNKernel
@@ -1885,6 +1893,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     num_state_checkpoints=forward_metadata.num_state_checkpoints,
                     state_checkpoint_every_n_tokens=forward_metadata.state_checkpoint_every_n_tokens,
                     output=output,
+                    **({"track_state": h_track_buf,
+                        "track_chunk_idx": forward_metadata.track_chunk_idx}
+                       if h_track_buf is not None else {}),
                 )
             core_attn_out, last_recurrent_state, h = block
             if (
@@ -1902,6 +1913,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 if forward_metadata.track_ssm_h_src.numel():
                     assert h is not None
                     hs = h.squeeze(0)[forward_metadata.track_ssm_h_src]
+                    if h_track_buf is not None:
+                        rows = forward_metadata.track_ssm_h_batch_src
+                        hs = torch.where(fp32_track_mask[rows, None, None, None],
+                                         h_track_buf[rows], hs.float())
                     track_slots = forward_metadata.track_ssm_h_dst
                 final_src = forward_metadata.track_ssm_final_src
                 final_dst = forward_metadata.track_ssm_final_dst
