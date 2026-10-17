@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# docs/222 §16 P3 route-0 C8 window: zero-GPU CPU gate of the derived package (copy of integration submit_cpu_ssm219pd.sh; own campaign root / job name).
+set -euo pipefail
+W=/lustre/fsw/portfolios/coreai/users/yangminl/twinstar-20260911; R=$W/results/p3pd-20261017; B=$R/inputs/pkg-${1:?FP}
+sbatch --parsable -A coreai_comparch_inferencex --job-name=ws2-p3pd-cpu --partition=cpu --qos=cpu-short -N1 --ntasks=1 --ntasks-per-node=1 --cpus-per-task=32 --mem=128G --time=01:00:00 --no-requeue --output=$R/logs/cmh-cpu-%j.out \
+ --export=ALL,PARITY_BUNDLE=$B,PARITY_FORK_SHA=7a841e4189445d108085423c3d6054bd9a7b486c,FINAL_FORK=/work/results/remeasure-v6-fivearm-tp1-20261004/inputs/source-42bbc39e-capsule-f28999a8,PDREF_MODE=cpu,RECON_MODE=PD,V3_DEPLOYMENT=PD,V3_MODEL=bf16,V3_SERVING_GPUS=4,PSIDE_ARM=factor,PSIDE_C=32,REMEASURE_REPEAT=1,PARITY_ARM_LABEL=factor,PARITY_STOCK_DTYPE=bfloat16,B35_PAIR_STAGE=0,PFACTOR3_PAIR=0,REMEASURE_COHORT=ladder,REMEASURE_PROMPT_ONLY_STATE_CACHE=1,SGLANG_GDN_PROMPT_ONLY_STATE_CACHE=1,SGLANG_FLASHNEXT_ALLOFF_PREFILL_GRAPH=1,SGLANG_GDN_DEFER_SHALLOW_FACTOR_PLAN=1,REMEASURE_GPU_AUTHORITY=V6_OVERLAP_ON,V6_HARNESS_DRY_RUN=0,V6_GPU_ADMISSION=NOT_RUN,V6_VARIANT=C+,SGLANG_GDN_K31_MIXED_EIGH=1,SGLANG_GDN_PREFILL_RESTORE_GRAPH=1,R16_CPU_GATE=1 $B/support/job.sh
