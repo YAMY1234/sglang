@@ -52,17 +52,20 @@ def main():
             # Warm both route graphs, emitter caches, kernels and exact-tail.
             for route in dict.fromkeys(route for pair in pairs for route in pair):
                 set_pd_micro_route(route)
-                workload.prepare(prefix, extend, 42)
-                workload.forward()
-                workload.join()
-                torch.cuda.synchronize()
+                # The second changing-input replay also completes the emitter
+                # rebind byte guard before any scored ABBA sample.
+                for seed in (42, 43):
+                    workload.prepare(prefix, extend, seed)
+                    workload.forward()
+                    workload.join()
+                    torch.cuda.synchronize()
             for pair in pairs:
                 for block in range(args.blocks):
                     for order, route in enumerate((*pair, *reversed(pair))):
                         set_pd_micro_route(route)
                         workload.prepare(prefix, extend, 1000 + block)
                         torch.cuda.synchronize()
-                        before = workload.counters()
+                        before = dict(workload.counters())
                         if "fallbacks" not in before:
                             raise RuntimeError("workload must expose fallback counters")
                         start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
@@ -73,7 +76,7 @@ def main():
                         end.record()
                         end.synchronize()
                         host_ms = (time.perf_counter_ns() - began) / 1e6
-                        after = workload.counters()
+                        after = dict(workload.counters())
                         if after["fallbacks"] != before["fallbacks"]:
                             raise RuntimeError("P-route fallback in measured forward")
                         row = dict(rank=rank, prefix=prefix, extend=extend, pair=pair,
