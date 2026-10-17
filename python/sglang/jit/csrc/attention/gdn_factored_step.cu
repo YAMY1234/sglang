@@ -92,6 +92,7 @@ __device__ __forceinline__ float bias_float(__half x) { return __half2float(x); 
 
 // P4: only warp 0 enters; both half warps hold the same 128 outputs.
 // Preserve the materialized K1 bf16 rounding before the RMS calculation.
+template<bool SHARED = false>
 __device__ __forceinline__ void norm_gate(float (&o)[8], int col,
     const __nv_bfloat16* z, const __nv_bfloat16* weight, float eps) {
   bf8(pack_bf(o), o);
@@ -103,16 +104,22 @@ __device__ __forceinline__ void norm_gate(float (&o)[8], int col,
   float hi = __fmaf_rn(o[7], o[7], __fmaf_rn(o[6], o[6],
                  __fmaf_rn(o[4], o[4], __fmul_rn(o[5], o[5]))));
   int lane = threadIdx.x & 31;
-  lo = __shfl_sync(0xffffffff, lo, lane >> 1);
-  hi = __shfl_sync(0xffffffff, hi, lane >> 1);
-  float ss = lane & 1 ? hi : lo;
+  // Permute Triton's lane bits instead of moving its partials: the low
+  // half warp owns even four-element groups, the high half owns odd groups.
+  float ss = lane < 16 ? lo : hi;
   #pragma unroll
-  for (int d = 16; d; d >>= 1)
+  for (int d = 8; d; d >>= 1)
     ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffff, ss, d));
+  ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffff, ss, 16));
   float v = __fadd_rn(div_full(ss, 128.f), eps), rstd;
   asm("rsqrt.approx.ftz.f32 %0,%1;" : "=f"(rstd) : "f"(v));
   float zv[8], wv[8];
-  bf8(load128(z + col), zv); bf8(load128(weight + col), wv);
+  if constexpr (SHARED) {
+    bf8(*reinterpret_cast<const uint4*>(z + col), zv);
+    bf8(*reinterpret_cast<const uint4*>(weight + col), wv);
+  } else {
+    bf8(load128(z + col), zv); bf8(load128(weight + col), wv);
+  }
   #pragma unroll
   for (int k = 0; k < 8; ++k) {
     float sig = div_full(1.f, 1.f + ex(-zv[k]));
@@ -149,6 +156,22 @@ __global__ __launch_bounds__(128, 4) void factored_step_r32_kernel(
     }
     // Only the first 16 uint4 vectors belong to this 128-element output.
     return;
+  }
+  // Immutable z/weight are staged by warp 0 while K1 performs its recurrence.
+  // Only warp 0 reads these slabs. wait_group + syncwarp below publishes all
+  // sixteen writers to both half-warp readers, with no new CTA barrier.
+  __shared__ __align__(16) __nv_bfloat16 norm_z[D], norm_w[D];
+  if constexpr (NORM) {
+    if (warp == 0) {
+      if (lane < 16) {
+        unsigned zs = __cvta_generic_to_shared(norm_z + col);
+        unsigned ws = __cvta_generic_to_shared(norm_w + col);
+        const __nv_bfloat16* zg = z + (int64_t(n)*HV+hv)*D + col;
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(zs), "l"(zg) : "memory");
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(ws), "l"(norm_weight + col) : "memory");
+      }
+      asm volatile("cp.async.commit_group;" ::: "memory");
+    }
   }
   int64_t sh = slot * HV + hv;
   const __nv_bfloat16* inp = mixed + n * sm;
@@ -292,7 +315,11 @@ __global__ __launch_bounds__(128, 4) void factored_step_r32_kernel(
       *reinterpret_cast<uint4*>(fu + sh*32*D + row*D + col) = pack_half(khat);
   }
   if constexpr (NORM) {
-    if (warp == 0) norm_gate(oval, col, z + (int64_t(n)*HV+hv)*D, norm_weight, norm_eps);
+    if (warp == 0) {
+      asm volatile("cp.async.wait_group 0;" ::: "memory");
+      __syncwarp();
+      norm_gate<true>(oval, col, norm_z, norm_w, norm_eps);
+    }
   }
   if (warp == 0 && lane < 16)
     *reinterpret_cast<uint4*>(out + (int64_t(n)*HV+hv)*D + col) = pack_bf(oval);
