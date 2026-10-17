@@ -27,6 +27,17 @@ def main():
         data = torch.load(path, map_location='cpu', weights_only=False)
         if data['row']['route'] != '0' or data['row']['route_index'] != 2:
             continue
+        repeated = torch.load(str(Path(path).with_name(Path(path).name.replace('-2.pt', '-3.pt'))),
+                              map_location='cpu', weights_only=False)
+        audit = dict(fulln_self_raw_equal=torch.equal(data['raw'], repeated['raw']),
+            fulln_self_factor_equal={name: torch.equal(value, repeated['factors'][name])
+                                     for name, value in data['factors'].items()})
+        if data['row']['length'] == 129:
+            matched = torch.load(path.replace('-129-1-2.pt', '-128-0-2.pt'),
+                                 map_location='cpu', weights_only=False)
+            audit['matched_prefix_checkpoint_equal'] = torch.equal(data['raw'], matched['raw'])
+            audit['matched_prefix_unequal_layers'] = [int(lid) for lid, a, b in
+                zip(data['layer_ids'], data['raw'], matched['raw']) if not torch.equal(a, b)]
         raw, normal = data['raw'].cuda(), data['publication']['normal_raw'].cuda()
         layers, heads = raw.shape[:2]
         pool = SimpleNamespace(vbar=data['vbar'].cuda(), k31_omega=data['omega'].cuda(),
@@ -49,6 +60,7 @@ def main():
             report = factor_diagnostic(raw.cpu(), data['old_factors'], factors, pool)
             report.update(mode=mode, evidence=path, rank=data['row']['rank'],
                           length=data['row']['length'], final=data['row']['final'],
+                          repeat_and_prefix_audit=audit,
                           saved_candidate_equal={name: torch.equal(factors[name], data['factors'][name])
                                                  for name in factors})
             records.append(report)
