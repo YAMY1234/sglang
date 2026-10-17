@@ -285,6 +285,13 @@ def fullstack_state_config(model_config, *, radix=False, disaggregation_mode="nu
         if reference or prefix_state == "exact" or not (radix or wire_factors)
         else "fp16"
     )
+    # docs/218 §8 (lead 10-16): factor storage dtype sensitivity. Unset = the production choice above, unchanged.
+    # docs/219 (user 10-17 11:0x): same one-file gate as src-fdt, on the v12 tree, for the fp32-factor arm C+f32x.
+    override = os.environ.get("TWINSTAR_FACTOR_DTYPE")
+    if override is not None:
+        if override not in ("fp16", "bf16", "fp32") or reference or prefix_state == "exact":
+            raise ValueError(f"TWINSTAR_FACTOR_DTYPE={override!r} applies to iter/factored-prefix serving only")
+        precision = override
     return (
         f"r={r},m={w},dtype={precision},ring={factored_ring_size()},async={int(not reference)},"
         f"strict_chunk=1,init_method=k31,decode_method={'warm' if reference else 'iter'},vbar={path}"
