@@ -61,6 +61,12 @@ def _can_fuse_norm(backend, forward_batch, mixed, z, norm):
     """
     if not enabled() or not forward_batch.forward_mode.is_decode():
         return False
+    from sglang.srt.model_executor.runner_utils.capture_mode import get_capture_attention_variant
+
+    if get_capture_attention_variant() == "fdnw":
+        # docs/223 §13.A (b): the first-decode graphs keep the model's standalone norm for every row (dense rows have
+        # no fused epilogue; for factored rows fused == standalone bitwise, P4 certificate)
+        return False
     backend = decode_backend(backend)
     pool = getattr(backend, "factored", None)
     if pool is None or getattr(pool, "_exact_tail_transaction", None) is not None:

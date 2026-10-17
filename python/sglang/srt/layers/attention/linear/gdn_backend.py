@@ -1696,6 +1696,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
             if self._factored_join_pending is not None:
                 self._factored_join_missed("decode layer 0")
             self._factored_cur_side = self._factored_pick_side()
+        # docs/223 §13.A (b): inside an 'fdnw' decode-graph capture, rows flagged in the static mask take the stock dense
+        # step on S0 (their factor slot is masked to -1, i.e. treated as padding, while the publication writes it)
+        first_dense = self._fdnw_dense_step(pool, li, layer, mixed_qkv, a, b, cache_indices)
+        if first_dense is not None:
+            dense_out, mask_b, cache_indices = first_dense
         plan = self._factored_group_plan() if self._factored_side_stream is not None else None
         grouped = bool(plan) and (
             cache_indices.numel() <= envs.SGLANG_GDN_FACTORED_TRUNC_GROUPS_MAX_BATCH.get()
@@ -1768,7 +1773,88 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 forward_batch.mamba_track_mask,
                 self.forward_metadata.mamba_track_indices,
             )
+        if first_dense is not None:
+            return torch.where(mask_b.view(1, -1, 1, 1), dense_out, out.transpose(0, 1))
         return out.transpose(0, 1)  # [1, B, HV, V]
+
+    # ------------------------------------------------------------------ docs/223 §13.A (b): first decode, no wait
+    def _fdnw_dense_step(self, pool, li, layer, mixed_qkv, a, b, cache_indices):
+        """Only while capturing the 'fdnw' decode-graph variant (SGLANG_GDN_FIRST_DECODE_NO_WAIT=1).  Returns
+        (dense_out [1, B, HV, V], mask [B], masked cache_indices) or None.  Dense rows: S0 = workspace slab row
+        (the publication's own input) copied to scratch, then the stock packed decode (the S32 kernel) on the scratch;
+        x1 saved for the catch-up.  Their factor slot index becomes -1 for every factored op of this step."""
+        from sglang.srt.mem_cache import gdn_first_decode as fd
+        from sglang.srt.model_executor.runner_utils.capture_mode import get_capture_attention_variant
+
+        first = getattr(pool, "_first_decode", None)
+        if first is None or get_capture_attention_variant() != fd.FDNW_LABEL:
+            return None
+        slab = self._fdnw_slab(pool)
+        if slab is None:
+            # no full-N workspace yet: this 'fdnw' graph equals 'base' and catchup_fn stays unset -> switch inert
+            if not getattr(first, "_no_slab_logged", False):
+                first._no_slab_logged = True
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "FIRST_DECODE_NO_WAIT inert: no full-N workspace slab at decode-graph capture")
+            return None
+        B = cache_indices.numel()
+        if first.graph is None:
+            first.graph = fd.FirstDecodeGraphState(
+                max_batch=first.max_batch, layers=len(pool.layer_ids), qkv_dim=mixed_qkv.shape[-1], hv=slab.shape[2],
+                v=slab.shape[3], k=slab.shape[4], act_dtype=mixed_qkv.dtype, ab_dtype=a.dtype, device=mixed_qkv.device)
+        g = first.graph
+        g.layers[li] = layer
+        mask = g.mask[:B]
+        torch.index_select(slab[li], 0, g.src[:B], out=g.scratch[:B])
+        dense_out = self.kernel_dispatcher.packed_decode(
+            mixed_qkv=mixed_qkv, a=a, b=b, A_log=layer.A_log, dt_bias=layer.dt_bias, scale=layer.head_k_dim**-0.5,
+            ssm_states=g.scratch, cache_indices=g.rows[:B], num_v_heads=layer.num_v_heads,
+            head_v_dim=layer.head_v_dim)
+        g.save_qkv[li, :B].copy_(mixed_qkv)
+        g.save_a[li, :B].copy_(a)
+        g.save_b[li, :B].copy_(b)
+        masked = torch.where(mask, g.neg1[:B].to(cache_indices.dtype), cache_indices)
+        if first.catchup_fn is None and li == len(pool.layer_ids) - 1:
+            first.catchup_fn = lambda slots, saved, _pool=pool: self._fdnw_catchup(_pool, slots, saved)
+        return dense_out, mask, masked
+
+    @staticmethod
+    def _fdnw_slab(pool):
+        graph = getattr(pool, "_agg_prefill_graph", None)
+        workspace = getattr(graph, "workspace", None)
+        return None if workspace is None else workspace.slabs["normal"]
+
+    def _fdnw_catchup(self, pool, slots, saved):
+        """At the next pool reader, after the publication join: replay the first decode step of these rows on the
+        factored path with the saved x1 (same kernel and flags as the served step; the dense rows' prefix_valid
+        invalidation of that step lands here too).  saved = the batch rows of the dense step."""
+        from sglang.srt.layers.attention.linear.kernels.gdn_factored import factored_packed_decode
+        from sglang.srt.mem_cache.gdn_factored_pool import bookkeeping_fold
+
+        g = pool._first_decode.graph
+        rows = torch.tensor(list(saved), dtype=torch.long, device=g.mask.device)
+        idx = torch.tensor(list(slots), dtype=torch.int32, device=g.mask.device)
+        for li in sorted(g.layers):
+            layer = g.layers[li]
+            fa, fu, fw, fcount, vbar = pool.layer_tensors(layer.layer_id)
+            fold = li == 0 and pool.prefix_valid is not None and bookkeeping_fold()
+            if li == 0 and not fold:
+                pool.invalidate_prefix_dense(idx)
+            factored_packed_decode(
+                g.save_qkv[li].index_select(0, rows), g.save_a[li].index_select(0, rows),
+                g.save_b[li].index_select(0, rows), A_log=layer.A_log, dt_bias=layer.dt_bias,
+                scale=layer.head_k_dim**-0.5, vbar=vbar, fa=fa, fu=fu, fw=fw, fcount=fcount, stale=pool.stale,
+                ssm_state_indices=idx, num_q_heads=layer.num_q_heads, num_v_heads=layer.num_v_heads,
+                head_k_dim=layer.head_k_dim, head_v_dim=layer.head_v_dim, r=pool.cfg.r, rfull=pool.cfg.rfull,
+                async_stream=None, truncate=not self._factored_batch_trunc and pool.cfg.decode_method != "warm",
+                **pool.cfg.kernel_kwargs(),
+                **(dict(prefix_valid=pool.prefix_valid, invalidate=True) if fold else {}))
+        if self._factored_batch_trunc:
+            from sglang.srt.layers.attention.linear.kernels.gdn_factored import factored_expiry_truncate_layers
+
+            factored_expiry_truncate_layers(pool.U, pool.W, pool.count, idx, pool.cfg.r, pool.cfg.rfull)
 
     def _factored_group_plan(self):
         """{closing local layer: first local layer} for SGLANG_GDN_FACTORED_TRUNC_GROUPS (0 / unset -> None); cached."""
