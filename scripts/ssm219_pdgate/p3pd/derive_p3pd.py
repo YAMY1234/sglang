@@ -88,8 +88,11 @@ def main(cat_sha, cat_n):
     # the P3 helper base differs from the frozen helper in exactly pd_shallow.py (and, by the bind, pd_emitter_graph.py)
     frozen = json.loads(frozen_manifest.read_text())['files']
     p3_over = {}
+    missing = [n for n in frozen if n.startswith('helpers/') and not Path(P3_HELPER_HOST, n).is_file()]
+    assert not missing, missing  # everything PYTHONPATH imports is present in the P3 base
+    outside = sorted(n for n in frozen if not n.startswith('helpers/'))  # e.g. tests/...: not in the P3 base, never imported
     for name, digest in frozen.items():
-        if name.startswith('helpers/') and Path(P3_HELPER_HOST, name).is_file():
+        if name.startswith('helpers/'):
             d = sha256(Path(P3_HELPER_HOST, name))
             if d != digest:
                 p3_over[name] = d
@@ -162,6 +165,7 @@ def main(cat_sha, cat_n):
           "    helper_manifest=Path('/work/results/r16-pd-20261014/overlay/helper-runtime/helper-source.json')\n")
     patch('support/runtime_preflight.py', "assert set(AUTHORIZED)<=set(helper_files),AUTHORIZED\n",
           f"if P3:AUTHORIZED.update({p3_over!r})  # docs/222 §16: P3 pd_shallow.py (e2f2a76) + pd_emitter_graph.py (99125ac43)\n"
+          f"if P3:helper_files={{k:v for k,v in helper_files.items() if k.startswith('helpers/')}}  # P3 base has no {outside} (tests; not imported)\n"
           "assert set(AUTHORIZED)<=set(helper_files),AUTHORIZED\n")
 
     # ---- entry_guard: the P3 capsule, helper base and graph file ----
