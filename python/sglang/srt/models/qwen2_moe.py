@@ -460,6 +460,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         )
         if self._k4_side_prio_max_tokens:
             _k4_gate_stream()  # created before graph capture
+        self._ktp2_shared_fused_max_tokens = (
+            min(envs.SGLANG_Q35MF_KTP2_SHARED_FUSED_MAX_TOKENS.get(), 128)
+            if self.alt_stream is not None
+            else 0
+        )
+        self._ktp2_shared_fused_ok: Optional[bool] = None
 
     def get_moe_weights(self):
         return [
@@ -841,6 +847,56 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             shared_output,
         )
 
+    def _ktp2_shared_fused_supported(self) -> bool:
+        """The FP8 static per-tensor shared expert and BF16 sigmoid gate that qwen_shared_fused reproduces."""
+        from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8LinearMethod
+
+        mlp, gate = self.shared_expert, self.shared_expert_gate
+        if not isinstance(mlp, Qwen2MoeMLP) or not isinstance(gate, torch.nn.Linear):
+            return False
+        gu, dp = mlp.gate_up_proj, mlp.down_proj
+        return (
+            all(
+                isinstance(p.quant_method, ModelOptFp8LinearMethod)
+                and p.use_flashinfer_bmm
+                and p.bias is None
+                and p.weight.dtype == torch.float8_e4m3fn
+                and p.weight.t().is_contiguous()
+                and p.weight_scale.numel() == 1
+                and p.input_scale.numel() == 1
+                for p in (gu, dp)
+            )
+            and isinstance(mlp.act_fn, SiluAndMul)
+            and tuple(gu.weight.shape) == (4096, 1024)
+            and tuple(dp.weight.shape) == (512, 4096)
+            and gate.bias is None
+            and tuple(gate.weight.shape) == (1, 4096)
+            and gate.weight.dtype == torch.bfloat16
+        )
+
+    def _use_ktp2_shared_fused(self, m: int) -> bool:
+        # The ROUTE_SHARED front already produced this call's gate/up; keep the served tail for it.
+        if m > self._ktp2_shared_fused_max_tokens or self._route_sh_gate_up is not None:
+            return False
+        if self._ktp2_shared_fused_ok is None:
+            self._ktp2_shared_fused_ok = self._ktp2_shared_fused_supported()
+        return self._ktp2_shared_fused_ok
+
+    def _ktp2_shared_fused(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        from sglang.kernels.ops.moe.qwen_shared_fused import shared_expert_fused
+
+        gu, dp = self.shared_expert.gate_up_proj, self.shared_expert.down_proj
+        return shared_expert_fused(
+            hidden_states.contiguous(),
+            w1_nk=gu.weight.t(),
+            w2_nk=dp.weight.t(),
+            gate_weight=self.shared_expert_gate.weight.view(-1),
+            in_scale1=gu.input_scale.reshape(1),
+            w_scale1=gu.weight_scale.reshape(1),
+            in_scale2=dp.input_scale.reshape(1),
+            w_scale2=dp.weight_scale.reshape(1),
+        )
+
     def forward_normal_dual_stream(
         self,
         hidden_states: torch.Tensor,
@@ -864,6 +920,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             router_output = self._forward_router_experts(
                 hidden_states, defer_finalize=True
             )
+            if self._use_ktp2_shared_fused(hidden_states.shape[0]):
+                # Gate included; the chain holds 16-48 CTAs instead of the cuBLASLt GEMMs' 128.
+                with torch.cuda.stream(side):
+                    shared_output = self._ktp2_shared_fused(hidden_states)
+                current_stream.wait_stream(side)
+                return router_output, shared_output
             with torch.cuda.stream(side):
                 shared_output = self._forward_shared_experts(
                     hidden_states, apply_gate=False
