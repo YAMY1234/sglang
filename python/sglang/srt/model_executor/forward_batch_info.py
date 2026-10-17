@@ -460,6 +460,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     twinstar_prompt_final: Optional[list[bool]] = None
     # Eager/graph registry views use dataclasses.replace, so retain the contract.
     _pfactor_agg_contract: bool = False
+    # P3 has distinct shallow/deep checkpoint sources; eager replace must keep
+    # both encodings and the fp32 legacy-final snapshot policy.
+    _pd_fulln_emitter_track_seqlens: Optional[torch.Tensor] = None
+    _pd_fulln_fp32_track_mask: Optional[torch.Tensor] = None
     fulln_overlap_record: Optional[Any] = None
     # The layerwise fallback must defer its full-batch plan across eager views.
     pd_factor_only_full_batch: bool = False

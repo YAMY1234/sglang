@@ -10,6 +10,27 @@ from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKerne
 
 
 class SnapshotTest(unittest.TestCase):
+    def test_actual_eager_copy_preserves_both_checkpoint_policies(self):
+        from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+        from sglang.srt.model_executor.runner.eager_runner import EagerRunner
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import CudaGraphBufferRegistry
+        batch = ForwardBatch(
+            forward_mode=ForwardMode.EXTEND, batch_size=1, input_ids=torch.arange(65),
+            req_pool_indices=torch.tensor([3]), seq_lens=torch.tensor([65]),
+            out_cache_loc=torch.arange(65), seq_lens_sum=65,
+            mamba_track_seqlens=torch.tensor([65]), _pfactor_agg_contract=True,
+            _pd_fulln_emitter_track_seqlens=torch.tensor([64]),
+            _pd_fulln_fp32_track_mask=torch.tensor([True]))
+        registry = NS(_slots={}, fill_from=Mock())
+        registry.extract_buffer = lambda **kwargs: CudaGraphBufferRegistry.extract_buffer(registry, **kwargs)
+        for no_copy in ('0', '1'):
+            with self.subTest(no_copy=no_copy), patch.dict(os.environ, SGLANG_EAGER_INPUT_NO_COPY=no_copy):
+                copied = EagerRunner.load_batch(NS(_eager_registry=registry), batch)
+            self.assertIsNot(copied, batch)
+            self.assertEqual(copied.mamba_track_seqlens.item(), 65)
+            self.assertEqual(copied._pd_fulln_emitter_track_seqlens.item(), 64)
+            self.assertTrue(copied._pd_fulln_fp32_track_mask.item())
+
     def run_case(self, mask):
         stage = torch.zeros(2, 1, 2, 2)
         h = torch.full((1, 4, 1, 2, 2), .12345, dtype=torch.bfloat16)
