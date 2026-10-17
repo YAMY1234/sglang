@@ -77,7 +77,8 @@ def dispatch_case(ext,tp,w,gen):
     ref=clone(p)
     raw=torch.empty(1,1,48//tp,128,device='cuda',dtype=torch.bfloat16)
     pool=SimpleNamespace(U=p['fu'],W=p['fw'],cfg=SimpleNamespace(kernel='split'))
-    backend=SimpleNamespace(linear_attn_backend=SimpleNamespace(factored=pool))
+    backend=SimpleNamespace(decode_backend=SimpleNamespace(
+        linear_attn_backend=SimpleNamespace(factored=pool)))
     batch=SimpleNamespace(forward_mode=SimpleNamespace(is_decode=lambda:True))
     layernorm=SimpleNamespace(weight=w,bias=None,activation='sigmoid',
                               norm_before_gate=True,group_size=None,eps=1e-6)
