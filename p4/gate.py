@@ -102,7 +102,7 @@ def dispatch_case(ext,tp,w,gen):
     return dict(pass_=all(checks.values()),checks=checks)
 
 
-def service_case(ext,path):
+def service_case(ext,path,baseline=None):
     data=torch.load(path,map_location='cuda',weights_only=False)
     assert data['schema']=='p4-service-step-v1'
     pa,pb=clone(data['p']),clone(data['p'])
@@ -115,7 +115,7 @@ def service_case(ext,path):
         for k in FIELDS:
             pa[k].copy_(data['p'][k]);pb[k].copy_(data['p'][k])
         def ref():
-            step(ext,pa,i,slots,raw,0,48//HV,invalidate=data['invalidate'])
+            step(baseline or ext,pa,i,slots,raw,0,48//HV,invalidate=data['invalidate'])
         def cand():
             step(ext,pb,i,slots,out,0,48//HV,z,w,data['eps'],data['invalidate'])
         if graph:
@@ -189,7 +189,7 @@ def main():
         paths=sorted(Path(args.service_dir).rglob('p4-*.pt'))
         assert paths, 'no actual service snapshots found'
         for path in paths:
-            rec=service_case(ext,path)
+            rec=service_case(ext,path,baseline)
             result['cases'][str(path)]=rec;save()
             print('SERVICE',str(path),json.dumps(rec),flush=True)
             if not rec['pass_']: raise SystemExit(1)
