@@ -90,26 +90,37 @@ __device__ __forceinline__ float bias_float(float x) { return x; }
 __device__ __forceinline__ float bias_float(__nv_bfloat16 x) { return __bfloat162float(x); }
 __device__ __forceinline__ float bias_float(__half x) { return __half2float(x); }
 
+struct Norm4 { float o[4]; float ss; };
+__device__ __forceinline__ Norm4 norm_prepare(const float (&oval)[8]) {
+  bool high = (threadIdx.x & 31) >= 16;
+  Norm4 n;
+  n.o[0]=high?oval[4]:oval[0]; n.o[1]=high?oval[5]:oval[1];
+  n.o[2]=high?oval[6]:oval[2]; n.o[3]=high?oval[7]:oval[3];
+  #pragma unroll
+  for (int k=0;k<4;++k) n.o[k]=__bfloat162float(__float2bfloat16_rn(n.o[k]));
+  n.ss=__fmaf_rn(n.o[3],n.o[3],__fmaf_rn(n.o[2],n.o[2],
+          __fmaf_rn(n.o[0],n.o[0],__fmul_rn(n.o[1],n.o[1]))));
+  return n;
+}
+
 // P4: warp 0 owns 128 outputs. Use all 32 lanes, four elements each;
 // K1's two half warps originally hold duplicate eight-element vectors.
 template<bool SHARED = false>
 __device__ __forceinline__ void norm_gate(const float (&oval)[8], int col,
     const __nv_bfloat16* z, const __nv_bfloat16* weight, float eps, __nv_bfloat16* out,
-    const float* staged_sig = nullptr) {
+    const float* staged_sig = nullptr, const Norm4* prepared = nullptr) {
   int lane = threadIdx.x & 31;
   bool high = lane >= 16;
   col += high ? 4 : 0;
-  float o[4] = {high ? oval[4] : oval[0], high ? oval[5] : oval[1],
-                high ? oval[6] : oval[2], high ? oval[7] : oval[3]};
-  #pragma unroll
-  for (int k = 0; k < 4; ++k)
-    o[k] = __bfloat162float(__float2bfloat16_rn(o[k]));
-  // Triton local order and the exact lane-bit permutation t=2*(l%16)+l/16.
-  float ss = __fmaf_rn(o[3], o[3], __fmaf_rn(o[2], o[2],
-                 __fmaf_rn(o[0], o[0], __fmul_rn(o[1], o[1]))));
-  #pragma unroll
-  for (int d = 8; d; d >>= 1)
-    ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffff, ss, d));
+  Norm4 n;
+  if constexpr (SHARED) n = *prepared;
+  else {
+    n = norm_prepare(oval);
+    #pragma unroll
+    for (int d = 8; d; d >>= 1)
+      n.ss = __fadd_rn(n.ss, __shfl_xor_sync(0xffffffff, n.ss, d));
+  }
+  float ss = n.ss;
   ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffff, ss, 16));
   float v = __fadd_rn(div_full(ss, 128.f), eps), rstd;
   asm("rsqrt.approx.ftz.f32 %0,%1;" : "=f"(rstd) : "f"(v));
@@ -137,7 +148,7 @@ __device__ __forceinline__ void norm_gate(const float (&oval)[8], int col,
       float zv = __uint_as_float((zb[k/2] >> (16*(k&1))) << 16);
       sig = div_full(1.f, 1.f + ex(-zv));
     }
-    y[k] = __fmul_rn(__fmul_rn(__fmul_rn(o[k],rstd),wv),sig);
+    y[k] = __fmul_rn(__fmul_rn(__fmul_rn(n.o[k],rstd),wv),sig);
   }
   #pragma unroll
   for (int k = 0; k < 2; ++k)
@@ -337,9 +348,17 @@ __global__ __launch_bounds__(128, 4) void factored_step_r32_kernel(
     delta[k] = beta * ((v[k]-vbv[k])-gt*m);
     oval[k] = (vbv[k]*sink+gt*w)+delta[k]*cd_all;
   }
+  Norm4 norm;
+  if constexpr (NORM) {
+    if (warp == 0) norm = norm_prepare(oval);
+  }
   #pragma unroll
   for (int j = 0; j < NR; ++j) {
     int row = 2 * (NW * j + warp) + parity;
+    float norm_peer = 0.f;
+    if constexpr (NORM) {
+      if (warp == 0) norm_peer = __shfl_xor_sync(0xffffffff, norm.ss, 8 >> j);
+    }
     if (row <= cnt) {
       float nw[8];
       #pragma unroll
@@ -348,11 +367,14 @@ __global__ __launch_bounds__(128, 4) void factored_step_r32_kernel(
     }
     if (row == cnt && cnt < 32)
       *reinterpret_cast<uint4*>(fu + sh*32*D + row*D + col) = pack_half(khat);
+    if constexpr (NORM) {
+      if (warp == 0) norm.ss = __fadd_rn(norm.ss, norm_peer);
+    }
   }
   if constexpr (NORM) {
     if (warp == 0) {
       norm_gate<true>(oval, col, nullptr, norm_w, norm_eps,
-                      out + (int64_t(n)*HV+hv)*D, norm_sig);
+                      out + (int64_t(n)*HV+hv)*D, norm_sig, &norm);
     }
   } else {
     if (warp == 0 && lane < 16)
