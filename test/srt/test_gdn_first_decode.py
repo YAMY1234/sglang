@@ -95,6 +95,25 @@ class FirstDecodeNoWaitTest(unittest.TestCase):
         self.assertEqual(self.calls, [])
 
 
+class FirstDecodeABTest(unittest.TestCase):
+    def test_abba_labels_alternate_join_and_dense(self):
+        saved = os.environ.get(fd.SWITCH)
+        os.environ[fd.SWITCH] = "ab"
+        try:
+            m = fd.FirstDecodeNoWait(max_batch=1, catchup_fn=lambda slots, saved: None)
+            joins = []
+            for i in range(4):
+                m.on_submit([7], [True])
+                d = m.decide(is_decode=True, batch_slots=[7], publication_pending=True)
+                joins.append(d.join)
+            self.assertEqual(joins, [True, False, False, True])
+        finally:
+            if saved is None:
+                os.environ.pop(fd.SWITCH, None)
+            else:
+                os.environ[fd.SWITCH] = saved
+
+
 class _FM:
     def __init__(self, decode):
         self.decode = decode

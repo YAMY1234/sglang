@@ -29,7 +29,13 @@ MAX_BATCH = "SGLANG_GDN_FIRST_DECODE_NO_WAIT_MAX_BATCH"
 
 
 def enabled() -> bool:
-    return os.environ.get(SWITCH, "0") == "1"
+    return os.environ.get(SWITCH, "0") in ("1", "ab")
+
+
+def _ab() -> bool:
+    """In-process A/B (docs/223 §13.A.3): SWITCH=ab labels every eligible first decode A (today's join) or B (dense
+    first) in the order A B B A, logged to <TWINSTAR_CUDA_TIMELINE>/fdnw-<pid>.jsonl when that directory is set."""
+    return os.environ.get(SWITCH, "0") == "ab"
 
 
 @dataclass(frozen=True)
@@ -53,10 +59,11 @@ class FirstDecodeNoWait:
     active: Optional[Decision] = None
     stats: Dict[str, int] = field(default_factory=lambda: dict(
         submitted=0, dense_first=0, dense_rows=0, catchups=0, join_other=0, join_batch=0, join_pool_op=0,
-        join_not_decode=0, dropped=0))
+        join_not_decode=0, dropped=0, ab_decisions=0))
     _logged: bool = False
     graph: Optional["FirstDecodeGraphState"] = None
     join_fn: Optional[Callable[[], None]] = None  # joins the publication (set at install)
+    _sink: object = None
 
     @classmethod
     def from_env(cls, catchup_fn=None) -> Optional["FirstDecodeNoWait"]:
@@ -102,7 +109,28 @@ class FirstDecodeNoWait:
         slots = tuple(int(batch_slots[r]) for r in rows)
         decision = Decision(False, "dense first", tuple(rows), tuple(self.candidates[s] for s in slots), slots)
         self._drop()  # one dense step per row; rows not in this batch decode later on the joined path
+        if _ab():
+            label = "ABBA"[self.stats["ab_decisions"] % 4]
+            self.stats["ab_decisions"] += 1
+            self._log(label, decision, len(batch_slots))
+            if label == "A":
+                return Decision(True, "ab label A")
         return decision
+
+    def _log(self, label, decision, batch):
+        import json
+        import time
+
+        if self._sink is None:
+            directory = os.environ.get("TWINSTAR_CUDA_TIMELINE")
+            if not directory:
+                self._sink = False
+                return
+            os.makedirs(directory, exist_ok=True)
+            self._sink = open(os.path.join(directory, f"fdnw-{os.getpid()}.jsonl"), "a", buffering=1)
+        if self._sink:
+            self._sink.write(json.dumps(dict(j=self.stats["ab_decisions"] - 1, l=label, t=time.time_ns(),
+                                             slots=list(decision.slots), rows=list(decision.rows), batch=batch)) + "\n")
 
     def _drop(self) -> None:
         self.stats["dropped"] += len(self.candidates)
