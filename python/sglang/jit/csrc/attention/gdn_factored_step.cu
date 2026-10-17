@@ -349,6 +349,15 @@ struct F32Frag {
     return __uint_as_float(j == 0 ? q.x : j == 1 ? q.y : j == 2 ? q.z : q.w);
   }
 };
+// lead 14:1x (option 3c): in the fp32 instance every reduction accumulates with FMA, no pre-rounded products --
+// the in-thread part is a fused chain (first product rounded once, then fma), the cross-lane / cross-warp parts add
+// partial sums (no products) as before.  The fp16 kernel above keeps its dot() (rounded products, pairwise tree).
+__device__ __forceinline__ float dotf(const float (&a)[8], const float (&b)[8]) {
+  float acc = __fmul_rn(a[0], b[0]);
+  #pragma unroll
+  for (int i = 1; i < 8; ++i) acc = __fmaf_rn(a[i], b[i], acc);
+  return sum16(acc);
+}
 __device__ __forceinline__ void store8(float* p, const float (&v)[8]) {
   reinterpret_cast<float4*>(p)[0] = make_float4(v[0], v[1], v[2], v[3]);
   reinterpret_cast<float4*>(p)[1] = make_float4(v[4], v[5], v[6], v[7]);
@@ -435,7 +444,7 @@ __global__ __launch_bounds__(128, 4) void factored_step_r32_f32_kernel(
   }
   float q[8], kn[8], qn[8];
   bf8(qr, q); bf8(kr, kn);
-  float qnorm = sq(dot(q,q) + 1.e-6f), knorm = sq(dot(kn,kn) + 1.e-6f);
+  float qnorm = sq(dotf(q,q) + 1.e-6f), knorm = sq(dotf(kn,kn) + 1.e-6f);
   #pragma unroll
   for (int k = 0; k < 8; ++k) { qn[k] = div_full(q[k], qnorm) * scale; kn[k] = div_full(kn[k], knorm); }
   float gt, beta;
@@ -443,10 +452,10 @@ __global__ __launch_bounds__(128, 4) void factored_step_r32_f32_kernel(
   float sink = 0.f;
   if (warp == 0) {
     float avec[8] = {ar0.x,ar0.y,ar0.z,ar0.w,ar1.x,ar1.y,ar1.z,ar1.w};
-    float ka = dot(kn, avec);
+    float ka = dotf(kn, avec);
     #pragma unroll
     for (int k = 0; k < 8; ++k) avec[k] = gt * (avec[k] - beta * kn[k] * ka) + beta * kn[k];
-    sink = dot(avec, qn);
+    sink = dotf(avec, qn);
     if (lane < 16) {
       *reinterpret_cast<float4*>(fa + sh * D + col) = make_float4(avec[0],avec[1],avec[2],avec[3]);
       *reinterpret_cast<float4*>(fa + sh * D + col + 4) = make_float4(avec[4],avec[5],avec[6],avec[7]);
@@ -455,10 +464,10 @@ __global__ __launch_bounds__(128, 4) void factored_step_r32_f32_kernel(
   float c[NR], cq[NR], partial[8] = {};
   #pragma unroll
   for (int j = 0; j < NR; ++j) {
-    c[j] = dot(U[j], kn);
-    cq[j] = dot(U[j], qn);
+    c[j] = dotf(U[j], kn);
+    cq[j] = dotf(U[j], qn);
     #pragma unroll
-    for (int k = 0; k < 8; ++k) partial[k] += U[j][k] * c[j];
+    for (int k = 0; k < 8; ++k) partial[k] = __fmaf_rn(U[j][k], c[j], partial[k]);
   }
   __shared__ float kp0[NW][D], kp1[NW][D], mv_s[NW][D], wq_s[NW][D], cd_s[NW];
   #pragma unroll
@@ -471,14 +480,14 @@ __global__ __launch_bounds__(128, 4) void factored_step_r32_f32_kernel(
   #pragma unroll
   for (int k = 0; k < 8; ++k)
     kp[k] = kn[k] - ((kp0[0][col+k]+kp0[1][col+k])+(kp0[2][col+k]+kp0[3][col+k]));
-  float nrm2 = dot(kp,kp);
+  float nrm2 = dotf(kp,kp);
   if (nrm2 < .25f) {
     float p2[8] = {};
     #pragma unroll
     for (int j = 0; j < NR; ++j) {
-      float c2 = dot(U[j],kp); c[j] += c2;
+      float c2 = dotf(U[j],kp); c[j] += c2;
       #pragma unroll
-      for (int k = 0; k < 8; ++k) p2[k] += U[j][k] * c2;
+      for (int k = 0; k < 8; ++k) p2[k] = __fmaf_rn(U[j][k], c2, p2[k]);
     }
     #pragma unroll
     for (int k = 0; k < 8; ++k) {
@@ -489,24 +498,24 @@ __global__ __launch_bounds__(128, 4) void factored_step_r32_f32_kernel(
     #pragma unroll
     for (int k = 0; k < 8; ++k)
       kp[k] -= (kp1[0][col+k]+kp1[1][col+k])+(kp1[2][col+k]+kp1[3][col+k]);
-    nrm2 = dot(kp,kp);
+    nrm2 = dotf(kp,kp);
   }
   float nrm = sq(nrm2), khat[8];
   bool keep = nrm > eps;
   #pragma unroll
   for (int k = 0; k < 8; ++k) khat[k] = keep ? div_full(kp[k], fmaxf(nrm,eps)) : 0.f;
-  float clast = keep ? nrm : 0.f, kq = dot(khat,qn);
+  float clast = keep ? nrm : 0.f, kq = dotf(khat,qn);
   float mv[8] = {}, wq[8] = {}, cf[NR], cd = 0.f;
   #pragma unroll
   for (int j = 0; j < NR; ++j) {
     int row = 2 * (NW * j + warp) + parity;
     cf[j] = row == cnt ? clast : c[j];
     cq[j] += row == cnt ? kq : 0.f;
-    cd += cf[j] * cq[j];
+    cd = __fmaf_rn(cf[j], cq[j], cd);
     #pragma unroll
     for (int k = 0; k < 8; ++k) {
       float w = row < cnt ? wraw[j].at(k) : 0.f;
-      mv[k] += w * c[j]; wq[k] += w * cq[j];
+      mv[k] = __fmaf_rn(w, c[j], mv[k]); wq[k] = __fmaf_rn(w, cq[j], wq[k]);
     }
   }
   #pragma unroll
