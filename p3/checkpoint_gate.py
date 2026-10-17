@@ -116,7 +116,6 @@ def main():
             # Fusion/mixed may alter U/W at the registered rounding level;
             # the raw donated S checkpoint and a/count must remain exact.
             a_equal = torch.equal(factors['a'], reference[1]['a'])
-            assert raw_equal and counts_equal and a_equal
             row = dict(rank=rank, length=length, final=final, route=route,
                        cache_depth=depth, hit=hit, expected=expected,
                        old_checkpoint_bitwise=raw_equal, a_bitwise=a_equal,
@@ -124,8 +123,14 @@ def main():
                        shallow_encoding=fb.mamba_track_seqlens.cpu().tolist(),
                        deep_encoding=getattr(fb, '_pd_fulln_emitter_track_seqlens',
                                              fb.mamba_track_seqlens).cpu().tolist())
+            if not raw_equal:
+                row['raw_difference'] = dict(
+                    max=float((raw.float() - reference[0].float()).abs().max()),
+                    layers=[layer for layer, (actual, old) in enumerate(zip(raw, reference[0]))
+                            if not torch.equal(actual, old)])
             results.append(row)
             print('P3_CHECKPOINT_GATE', json.dumps(row), flush=True)
+            assert raw_equal and counts_equal and a_equal, row
     out = Path(os.environ['P3_OUT']) / f'checkpoint-r{rank}.json'
     out.write_text(json.dumps(dict(passed=True, cases=results,
                                   diagnostic_only=os.environ.get('P3_CHECKPOINT_DEBUG') == '1'),
