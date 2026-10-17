@@ -2,6 +2,8 @@
 import argparse
 import importlib.util
 import json
+import os
+from types import SimpleNamespace
 from pathlib import Path
 import torch
 from common import FIELDS,bitwise,clone,fixture,norm,step,weights,diff
@@ -65,6 +67,39 @@ def case(ext,tp,b,inv,graph,w,gen,steps,baseline=None):
     minimum=int(due[0,1:b+1].min())
     assert steps<64 or minimum>=3, minimum
     return dict(pass_=True,steps=steps,min_expiries=minimum,fields=[*FIELDS,'y'])
+
+
+def dispatch_case(ext,tp,w,gen):
+    from common import configure
+    from sglang.srt.layers.attention.linear.kernels.gdn_factored_norm import can_fuse_norm
+    configure()
+    p,i,slots,z=fixture(tp,1,gen)
+    ref=clone(p)
+    raw=torch.empty(1,1,48//tp,128,device='cuda',dtype=torch.bfloat16)
+    pool=SimpleNamespace(U=p['fu'],W=p['fw'],cfg=SimpleNamespace(kernel='split'))
+    backend=SimpleNamespace(linear_attn_backend=SimpleNamespace(factored=pool))
+    batch=SimpleNamespace(forward_mode=SimpleNamespace(is_decode=lambda:True))
+    layernorm=SimpleNamespace(weight=w,bias=None,activation='sigmoid',
+                              norm_before_gate=True,group_size=None,eps=1e-6)
+    old=os.environ.get('SGLANG_GDN_FACTORED_STEP_FUSE_NORM')
+    try:
+        os.environ['SGLANG_GDN_FACTORED_STEP_FUSE_NORM']='0'
+        assert not can_fuse_norm(backend,batch,i['mixed'],z,layernorm)
+        os.environ['SGLANG_GDN_FACTORED_STEP_FUSE_NORM']='1'
+        assert can_fuse_norm(backend,batch,i['mixed'],z,layernorm)
+        out=gf.factored_packed_decode(i['mixed'],i['a'],i['b'],A_log=i['alog'][0],
+            dt_bias=i['bias'][0],scale=128**-.5,vbar=i['vbar'][0],fa=p['fa'][0],fu=p['fu'][0],
+            fw=p['fw'][0],fcount=p['fcount'][0],stale=p['stale'],ssm_state_indices=slots,
+            num_q_heads=16//tp,num_v_heads=48//tp,head_k_dim=128,head_v_dim=128,r=16,rfull=32,
+            truncate=False,kernel='split',prefix_valid=p['prefix_valid'],invalidate=True,
+            z=z,norm_weight=w,norm_eps=1e-6)
+    finally:
+        if old is None: os.environ.pop('SGLANG_GDN_FACTORED_STEP_FUSE_NORM',None)
+        else: os.environ['SGLANG_GDN_FACTORED_STEP_FUSE_NORM']=old
+    step(ext,ref,i,slots,raw,0,tp,invalidate=True)
+    checks={k:bitwise(ref[k],p[k]) for k in FIELDS}
+    checks['y']=bitwise(norm(raw,z,w),out)
+    return dict(pass_=all(checks.values()),checks=checks)
 
 
 def service_case(ext,path):
@@ -138,6 +173,10 @@ def main():
                     print(key,json.dumps(rec),flush=True)
                     if not rec['pass_']:
                         raise SystemExit(1)
+    for tp in (2,1):
+        rec=dispatch_case(ext,tp,ws[0],gen)
+        result['cases'][f'production_dispatch_tp{tp}']=rec;save()
+        if not rec['pass_']: raise SystemExit(1)
     # Each actual layer weight is exercised, including weights with negative
     # components; this also checks signed zeros for padded rows.
     for n,w in enumerate(() if args.service_only else ws):
