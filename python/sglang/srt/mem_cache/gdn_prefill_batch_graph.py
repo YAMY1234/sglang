@@ -1,5 +1,6 @@
 """One prompt-prefix commit graph for every layer and both checkpoint branches."""
 import logging
+import os
 from types import SimpleNamespace
 
 import torch
@@ -11,6 +12,21 @@ from .gdn_prefill_commit_graph import BATCH_BUCKETS, _publish_valid, prewarm_sha
 from . import gdn_prefill_joint as joint
 
 logger = logging.getLogger(__name__)
+
+# docs/223 §16 J1: capture the deferred publication as two graphs, the normal half (request slots: k31, store, ring,
+# prefix_valid, dense_required, final copies) then the tracked half (P-1 checkpoint k31 into the track slots), so a
+# decode can join the first half only.  0 (default) = one graph, today's order.
+SPLIT_FLAG = "SGLANG_GDN_J1_SPLIT_PUBLICATION"
+
+
+def split_mode():
+    mode = os.environ.get(SPLIT_FLAG, "0")
+    if mode not in ("0", "1", "ab"):
+        raise ValueError(f"{SPLIT_FLAG} must be 0, 1 or ab, got {mode!r}")
+    if mode != "0" and joint.configured():
+        raise ValueError(f"{SPLIT_FLAG} splits the separate normal / tracked factorizations; "
+                         f"it cannot be combined with {joint.FLAG}=1")
+    return mode
 
 
 class BatchCollector:
@@ -235,6 +251,49 @@ class BatchBuffers:
                     head_v_dim=layer.head_v_dim, r=p.cfg.r, rfull=p.cfg.rfull,
                     truncate=False, **p.cfg.kernel_kwargs())
 
+    # ---------------------------------------------------------------- docs/223 §16 J1: the two halves of evaluate()
+    # Same kernels on the same inputs as evaluate(); only the order of the tracked branch moves behind the final copies.
+    # The halves write disjoint rows: track_slots (unaligned P-1 checkpoints) vs the request slots and final_dst
+    # (aligned checkpoints, copied from the request slots), so the pool bytes equal evaluate()'s.
+    def evaluate_normal(self, eager):
+        from sglang.srt.layers.attention.linear.kernels.gdn_factored_io import store_factored
+
+        p = self.pool
+        normal = eager(self.normal, p.vbar, p.cfg, omega=self.omega)
+        for i in range(len(p.layer_ids)):
+            store_factored(*normal[i], p.a[i], p.U[i], p.W[i], p.count[i],
+                           p.stale, p.dense_of, self.slots, p.cfg.r, stale_value=0,
+                           dense=self.normal[i], ring=self.ring_pointers[i:i+1],
+                           ring_dst=self.ring_dst, ring_indirect=True)
+        _publish_valid[(1,)](p.prefix_valid, self.slots, self.slots.numel(),
+                             triton.next_power_of_2(self.slots.numel()))
+        if p.dense_required is not None:
+            scatter_rows(self.required[None, :, None], p.dense_required[None, :, None], self.slots)
+        source = self.final_src.clamp_min(0)
+        for tensor in (p.a, p.U, p.W, p.count):
+            scatter_rows(tensor.index_select(1, source), tensor, self.final_dst)
+        for tensor, value in ((p.stale, 1), (p.dense_of, -1), (p.dense_required, 0)):
+            if tensor is not None:
+                rows = torch.full((1, self.batch, 1), value, dtype=tensor.dtype, device=tensor.device)
+                scatter_rows(rows, tensor[None, :, None], self.final_dst)
+        valid = p.prefix_valid.index_select(0, source)[None, :, None]
+        scatter_rows(valid, p.prefix_valid[None, :, None], self.final_dst)
+        if self.tail:
+            raise RuntimeError("J1 split publication runs without the recurrent tail (publication graphs only)")
+
+    def evaluate_tracked(self, eager):
+        from sglang.srt.layers.attention.linear.kernels.gdn_factored_io import store_factored
+
+        if self.tracked is None:
+            return
+        p = self.pool
+        tracked = eager(self.tracked, p.vbar, p.cfg, omega=self.track_omega)
+        for i in range(len(p.layer_ids)):
+            store_factored(*tracked[i], p.a[i], p.U[i], p.W[i], p.count[i],
+                           p.stale, p.dense_of, self.track_slots, p.cfg.r, stale_value=1)
+        _publish_valid[(1,)](p.prefix_valid, self.track_slots, self.track_slots.numel(),
+                             triton.next_power_of_2(self.track_slots.numel()))
+
 
 class PrefillBatchGraph:
     def __init__(self, *, include_tail=True, shared=None, workspace=None):
@@ -254,7 +313,7 @@ class PrefillBatchGraph:
                 torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction, join_branches)
 
     def run(self, pool, plan, states, track_slots, final_src, final_dst, *, eager, policy,
-            join_branches=None, launch_replay=None):
+            join_branches=None, launch_replay=None, split=False, between=None):
         size = max(plan.slots.numel(), 0 if track_slots is None else track_slots.numel())
         batch = next((b for b in BATCH_BUCKETS if 0 < size <= b), None)
         if batch is None:
@@ -264,7 +323,11 @@ class PrefillBatchGraph:
                          1 if states[0][1].shape[0] == 1 else batch)
         if join_branches is None:
             join_branches = joint.enabled() and joint.eligible(pool.cfg, normal_batch, tracked_batch)
+        if split and (join_branches or launch_replay is not None):
+            raise ValueError("J1 split publication graph excludes the joint branch and the join-offload route")
         key = self.key(normal_batch, tracked_batch, eager, policy, join_branches)
+        if split:
+            key = key + ("j1-split",)
         entry = self.entries.get(key)
         if entry is None:
             if self.warmed:
@@ -277,23 +340,37 @@ class PrefillBatchGraph:
                 self.stream = torch.cuda.Stream(device=pool.a.device)
                 self.memory_pool = torch.cuda.graph_pool_handle()
             self.stream.wait_stream(current)
+            halves = ((buffers.evaluate,) if not split else (buffers.evaluate_normal,) if tracked_batch is None
+                      else (buffers.evaluate_normal, buffers.evaluate_tracked))
             with torch.cuda.stream(self.stream):
-                buffers.evaluate(eager)
+                for half in halves:
+                    half(eager)
             current.wait_stream(self.stream)
-            graph = torch.cuda.CUDAGraph()
-            with graph_capture_lock, torch.cuda.graph(graph, stream=self.stream,
-                    pool=self.memory_pool, capture_error_mode="thread_local"):
-                buffers.evaluate(eager)
-            entry = self.entries[key] = (buffers, graph)
+            graphs = []
+            for half in halves:
+                graph = torch.cuda.CUDAGraph()
+                with graph_capture_lock, torch.cuda.graph(graph, stream=self.stream,
+                        pool=self.memory_pool, capture_error_mode="thread_local"):
+                    half(eager)
+                graphs.append(graph)
+            entry = self.entries[key] = (buffers, *graphs)
             self.stats["captured"] += 1
-            logger.info("GDN prefill batch graph captured: layers=%d normal_batch=%d tracked_batch=%s",
-                        len(pool.layer_ids), normal_batch, tracked_batch)
+            logger.info("GDN prefill batch graph captured: layers=%d normal_batch=%d tracked_batch=%s%s",
+                        len(pool.layer_ids), normal_batch, tracked_batch, " (J1 split: normal + tracked)" if split else "")
         else:
             entry[0].bind(plan, states, track_slots, final_src, final_dst)
-        # The join-offload route binds on the producer stream before a later
-        # forward can overwrite static model outputs. Only replay moves to the
-        # publication stream; the callback records the producer event here.
-        result = entry[1].replay() if launch_replay is None else launch_replay(entry[1].replay)
+        if split:
+            # docs/223 §16 J1: normal half, the caller's event (decode join point), then the tracked half.
+            result = entry[1].replay()
+            if between is not None:
+                between()
+            if len(entry) > 2:
+                result = entry[2].replay()
+        else:
+            # The join-offload route binds on the producer stream before a later
+            # forward can overwrite static model outputs. Only replay moves to the
+            # publication stream; the callback records the producer event here.
+            result = entry[1].replay() if launch_replay is None else launch_replay(entry[1].replay)
         self.stats["replayed"] += 1
         self.stats["joint_replayed"] += int(join_branches)
         return result
@@ -319,6 +396,12 @@ class PrefillBatchGraph:
                 self.run(pool, plan, states, track_slots, None, None, eager=eager,
                          policy=policy, join_branches=joined)
                 expected.add(self.key(batch, tracked_batch, eager, policy, joined))
+            if not self.include_tail and split_mode() != "0":
+                # docs/223 §16 J1: the publication's split variant of every bucket (the one-graph variant stays for
+                # the forward-stream callers)
+                self.run(pool, plan, states, track_slots, None, None, eager=eager, policy=policy,
+                         join_branches=False, split=True)
+                expected.add(self.key(batch, tracked_batch, eager, policy, False) + ("j1-split",))
         torch.cuda.synchronize(pool.a.device)
         if set(self.entries) != expected:
             raise RuntimeError("whole-prefix prewarm did not cover both branches and every bucket")

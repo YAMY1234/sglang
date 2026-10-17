@@ -4,13 +4,67 @@ Only one publication may own the graph's static inputs at a time. This does not
 reorder the PD scheduler or wait indefinitely for a future request: an early
 reader drains the queued work immediately.
 """
+import json
 import logging
+import os
+import time
 from contextlib import contextmanager
 from functools import wraps
 
 import torch
 
 logger = logging.getLogger(__name__)
+
+
+class J1Split:
+    """docs/223 §16 J1 (SGLANG_GDN_J1_SPLIT_PUBLICATION, AGG deferred publication only).
+
+    The publication replays its normal half (request slots) and records an event before the tracked half (P-1
+    checkpoint k31).  Label B: a plain decode forward joins only that event; every other reader still joins the
+    whole publication.  Label A: today's whole join (same two graphs).  Mode 1 = B always; ab = per publication
+    A B B A, logged to <TWINSTAR_CUDA_TIMELINE>/j1-<pid>.jsonl."""
+
+    def __init__(self, mode):
+        self.mode = mode
+        self.j = 0
+        self.sink = None
+        self.prompt_only = None
+        self.logged_active = False
+
+    def next_label(self, rows):
+        label = "B" if self.mode == "1" else "ABBA"[self.j % 4]
+        self.j += 1
+        directory = os.environ.get("TWINSTAR_CUDA_TIMELINE")
+        if self.mode == "ab" and directory:
+            if self.sink is None:
+                self.sink = open(os.path.join(directory, f"j1-{os.getpid()}.jsonl"), "a", buffering=1)
+            self.sink.write(json.dumps(dict(j=self.j - 1, l=label, t=time.time_ns(), rows=rows)) + "\n")
+        return label
+
+    def decode_only(self, runner, batch):
+        """A forward that reads only its own request slots: a plain decode (graph replay or eager), no pool copy /
+        clear, and no decode-time radix tracking (prompt-only state cache: the decode track mask is all-false)."""
+        from sglang.srt.model_executor.runner import get_is_capture_mode
+
+        if get_is_capture_mode():
+            return False
+        mode = getattr(batch, "forward_mode", None)
+        if (mode is None or not mode.is_decode() or getattr(batch, "spec_info", None) is not None
+                or getattr(batch, "can_run_tbo", False)):
+            return False
+        for name in ("mamba_cow_src_indices", "mamba_cow_dst_indices", "mamba_clear_indices"):
+            tensor = getattr(batch, name, None)
+            if tensor is not None and tensor.numel():
+                return False
+        if self.prompt_only is None:
+            policy = getattr(runner.req_to_token_pool, "_prompt_only_state_cache", None)
+            if policy is None:
+                return False
+            self.prompt_only = bool(policy)
+            if not self.prompt_only:
+                logger.warning("J1_SPLIT_PUBLICATION inert: decode-time radix tracking is on (no prompt-only state "
+                               "cache), every decode keeps the whole join")
+        return self.prompt_only
 
 
 class CudaPublicationRuntime:
@@ -60,6 +114,11 @@ class PDBatchPublication:
         self.pending_slots = None
         self.stats = dict(submitted=0, launched=0, joins=0, early_reader=0, rows=0)
         self.stats.update(disjoint_forwards=0, dependent_forwards=0, transfer_fences=0)
+        # docs/223 §16 J1 (AGG only; set by install)
+        self.j1 = None
+        self.ticket_normal = None
+        self.label = None
+        self.normal_joined = False
 
     def submit(self, graph, plan, states, controls, *, eager, policy):
         if self.offload_join:
@@ -88,7 +147,21 @@ class PDBatchPublication:
         inputs.extend(controls)
         inputs.extend((plan.slots, plan.ring_dst, plan.dense_required_after_commit))
         try:
-            if self.offload_join:
+            if self.j1 is not None:
+                # docs/223 §16 J1: one side-stream launch; the event between the halves is the decode join point
+                normal_done = torch.cuda.Event()
+                hook = self.after_replay
+
+                def replay_split():
+                    graph.run(self.pool, plan, states, *controls, eager=eager, policy=policy, split=True,
+                              between=lambda: normal_done.record(torch.cuda.current_stream(self.pool.a.device)))
+                    if hook is not None:
+                        hook()
+                self.label = self.j1.next_label(plan.slots.numel())
+                self.ticket = self.runtime.launch_after_forward(replay_split, inputs)
+                self.ticket_normal = normal_done
+                self.normal_joined = False
+            elif self.offload_join:
                 # Snapshot the model's possibly reusable static outputs on
                 # the producer stream. Main-stream order protects that source
                 # reuse without waiting for the much longer factorization.
@@ -125,6 +198,31 @@ class PDBatchPublication:
         self.stats["joins"] += 1
         self.pending = self.ticket = None
         self.pending_slots = None
+        self.ticket_normal = self.label = None
+        self.normal_joined = False
+
+    def join_decode(self):
+        """docs/223 §16 J1: a plain decode forward (J1Split.decode_only) under label B waits for the normal half
+        only -- its request slots, ring, prefix_valid, dense_required and the aligned checkpoints' final copies are
+        written; the tracked half (P-1 checkpoint k31 into track slots this forward never reads) keeps running and
+        the next other reader joins the whole publication.  Label A: today's whole join."""
+        if self.failed is not None:
+            raise RuntimeError("PD publication failed; state is not publishable") from self.failed
+        if self.pending is None:
+            return
+        if self.ticket is None:
+            self.stats["early_reader"] += 1
+            self.start_after_forward()
+        if self.label != "B" or self.ticket_normal is None:
+            return self.join()
+        if not self.normal_joined:
+            self.runtime.join(self.ticket_normal)
+            self.normal_joined = True
+            self.stats["normal_joins"] = self.stats.get("normal_joins", 0) + 1
+            if not self.j1.logged_active:
+                self.j1.logged_active = True
+                logger.info("J1_SPLIT_PUBLICATION_ACTIVE mode=%s: decode joined the normal half; the tracked "
+                            "checkpoint k31 continues on the publication stream", self.j1.mode)
 
     def transfer_event(self):
         """Immutable per-publication event; a worker may retain it after join."""
@@ -225,7 +323,12 @@ def install_forward_join(runner, pool):
             batch = args[0] if args else kwargs["forward_batch"]
             with publication.forward_scope(forward_slot_ids(runner, batch)):
                 return original(*args, **kwargs)
-        pool.pside_join()
+        if (publication is not None and publication.j1 is not None and publication.pending is not None
+                and getattr(pool, "_pside_deferred_commit", None) is None
+                and publication.j1.decode_only(runner, args[0] if args else kwargs["forward_batch"])):
+            publication.join_decode()
+        else:
+            pool.pside_join()
         return original(*args, **kwargs)
 
     runner.forward = forward
@@ -239,6 +342,13 @@ def install(pool, runner, *, agg=False):
         # K4.2 (docs/223): AGG keeps the unconditional pre-forward join; the
         # PD-only slot-closure offload is never enabled here.
         pool._pd_batch_publication = PDBatchPublication(pool, agg=True)
+        from .gdn_prefill_batch_graph import SPLIT_FLAG, split_mode
+
+        mode = split_mode()
+        if mode != "0":
+            pool._pd_batch_publication.j1 = J1Split(mode)
+            logger.info("J1_SPLIT_PUBLICATION_INSTALLED %s=%s: two-graph publication (normal, tracked); plain "
+                        "decodes under label B join the normal half only", SPLIT_FLAG, mode)
         install_forward_join(runner, pool)
         logger.info("AGG full-N deferred publication enabled: after-forward event, side priority=0; "
                     "join before every runner.forward and pool reader; join_offload=False")
