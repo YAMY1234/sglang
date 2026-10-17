@@ -906,7 +906,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         z_shape_og = z.shape
         # reshape input data into 2D tensor
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-        if use_strided_prefill_z:
+        if use_strided_prefill_z or norm_fused:
             z_flat_shape = (z.numel() // z.shape[-1], z.shape[-1])
         else:
             z = z.reshape(-1, z.shape[-1])

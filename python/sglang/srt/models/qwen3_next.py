@@ -451,11 +451,15 @@ class Qwen3GatedDeltaNet(nn.Module):
         z_shape_og = z.shape
         # reshape input data into 2D tensor
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-        z = z.reshape(-1, z.shape[-1])
+        z_flat_shape = (z.numel() // z.shape[-1], z.shape[-1])
+        if not norm_fused:
+            z = z.reshape(-1, z.shape[-1])
+            z_flat_shape = z.shape
 
         # Add padding for DP-Attn
-        if core_attn_out.shape != z.shape:
-            core_attn_out_pad = torch.zeros_like(z)
+        if core_attn_out.shape != z_flat_shape:
+            core_attn_out_pad = (z.new_zeros(z_flat_shape) if norm_fused
+                                 else torch.zeros_like(z))
             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
             core_attn_out = core_attn_out_pad
 
