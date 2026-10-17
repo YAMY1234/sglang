@@ -145,14 +145,15 @@ class ModelWiringTest(unittest.TestCase):
             program=ast.Module(body=[fn],type_ignores=[])
             for fused in (False,True):
                 with self.subTest(model=cls,fused=fused):
-                    mixed=torch.ones(1,5120,dtype=torch.bfloat16)
-                    z=torch.ones(1,24,128,dtype=torch.bfloat16)
-                    a=b=torch.ones(1,24,dtype=torch.bfloat16)
+                    mixed=torch.ones(2,5120,dtype=torch.bfloat16)
+                    z=torch.ones(2*8240+8192,dtype=torch.bfloat16).as_strided(
+                        (2,24,128),(8240,128,1),5120)
+                    a=b=torch.ones(2,24,dtype=torch.bfloat16)
                     class Attn:
                         def can_fuse_norm(self,*args): return fused
                         def __call__(self,batch,**kwargs):
                             self.kwargs=kwargs
-                            return z[None]*(2 if fused else 1)
+                            return torch.ones(2,1,24,128,dtype=torch.bfloat16)*(2 if fused else 1)
                     class Norm:
                         weight=torch.ones(128,dtype=torch.bfloat16)
                         eps=1e-6
@@ -172,8 +173,14 @@ class ModelWiringTest(unittest.TestCase):
                               fused_qkvzba_split_reshape_cat_contiguous=split)
                     exec(compile(ast.fix_missing_locations(program),file,'exec'),gl)
                     batch=NS(forward_mode=NS(is_decode=lambda:True,is_extend_without_speculative=lambda:False))
-                    y=gl['forward'](obj,torch.ones(1,4096),batch)
-                    self.assertTrue(torch.equal(y,torch.full((1,3072),2,dtype=y.dtype)))
+                    original_reshape=torch.Tensor.reshape
+                    def reshape(tensor,*args,**kwargs):
+                        if tensor is z and fused:
+                            raise AssertionError('fused forward must not reshape/copy z')
+                        return original_reshape(tensor,*args,**kwargs)
+                    with patch.object(torch.Tensor,'reshape',reshape):
+                        y=gl['forward'](obj,torch.ones(2,4096),batch)
+                    self.assertTrue(torch.equal(y,torch.full((2,3072),2,dtype=y.dtype)))
                     self.assertEqual(obj.norm.calls,int(not fused))
                     self.assertEqual('norm_weight' in obj.attn.kwargs,fused)
                     if fused:

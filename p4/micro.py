@@ -12,6 +12,9 @@ def point(ext,tp,b,ws,gen,reps,layout):
     layers,hv,hidden=36,48//tp,4096
     base,i,slots,z=fixture(tp,b,gen,layers,layout)
     p=clone(base)
+    flat=z.reshape(-1,128)
+    separate_copy_bytes=layers*z.numel()*z.element_size() if flat.data_ptr()!=z.data_ptr() else 0
+    del flat
     raw=torch.empty(layers,b,1,hv,128,device='cuda',dtype=torch.bfloat16)
     fused=torch.empty_like(raw)
     matrices=[torch.randn(hv*128,hidden,device='cuda',dtype=torch.bfloat16,generator=gen)*.01 for _ in range(layers)]
@@ -49,7 +52,10 @@ def point(ext,tp,b,ws,gen,reps,layout):
     delta=(med['fused_chain']-med['separate_chain'])/layers
     kernel_delta=(med['fused_only']-med['k1_only'])/layers
     return dict(tp=tp,batch=b,layers=layers,z_layout=layout,z_metadata=z_metadata(z),
-        layout_copy_bytes_per_step=0,layout_copy_us_per_step=0,
+        layout_copy_bytes_per_step=dict(separate=separate_copy_bytes,fused=0),
+        layout_copy_us_per_step=dict(separate=None,fused=0),
+        separate_copy_timing='included in separate_chain; not isolated',
+        producer_layout_change=False,
         measurement_scope='measured-layout' if layout['measured'] else 'synthetic-layout-preflight',
         spacer_gemm=[b,hv*128,hidden],
         samples_us=samples,median_step_us=med,median_layer_us={k:v/layers for k,v in med.items()},

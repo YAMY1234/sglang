@@ -24,15 +24,18 @@ python p4/gate.py --service-only --service-dir /path/to/dumps --out service-gate
 Shared commits: `5af94800f57` (radix + qwen3_next + the actual served qwen3_5 forward), `dd8d55ba1de` (integration review: early-return on extend). Integration owns their merge and the formal service C1/C8 A/B gates.
 
 The stride-aware repair (lead 20:09) uses no producer layout change and no z copy
-in either timed arm. Snapshots use `p4-service-step-v2` and preserve z shape,
+in the fused arm. The separate arm retains the model's existing reshape and any
+copy it causes; that cost is included in the separate-chain time. Snapshots use `p4-service-step-v2` and preserve z shape,
 stride and storage offset. Service replay writes `z-layouts.json` beside its
 certificate; rerun `P4_Z_LAYOUTS=/path/to/z-layouts.json bash p4/run_gate.sh 0`,
 then `bash p4/micro.sh 0`. The gate adds those exact stride/offset patterns to
 all B/INVALIDATE/eager/graph cases; micro uses the primary patterns from that
-same certificate, records metadata and zero layout-copy bytes/time. Batch
+same certificate, records metadata and per-arm layout-copy bytes. Fused copy time is zero;
+separate copy time is included in the chain and is not separately isolated. Batch
 sizes absent in the capture reuse the captured strides and are identified by
 `measured_shape`. The built-in token/head-gap patterns are labelled synthetic
 preflight and cannot substitute for a measured-layout admission result. The
-norm reference passes z as 3D to production Triton, avoiding a hidden reshape
-copy for token-strided views. Prior contiguous-layout timing remains historical
+norm reference mirrors the production standalone norm's 2D z reshape, including
+the original copy for token-strided views. The fused model skips that unused
+reshape (shared patch a15fbde8c2a). Prior contiguous-layout timing remains historical
 evidence; stride-aware service admission requires requalification.

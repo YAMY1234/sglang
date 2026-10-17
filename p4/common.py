@@ -87,6 +87,9 @@ def step(ext,p,i,slots,out,l,tp,z=None,weight=None,eps=1e-6,invalidate=False):
     ext.factored_step_r32(*args, *((z,weight,eps) if weight is not None else ()))
 
 def norm(x,z,weight,eps=1e-6):
+    # Mirror the model's existing standalone-norm preparation. For token-gap
+    # views this may copy; micro includes that original cost in the baseline.
+    z=z.reshape(-1,128)
     return rms_norm_gated(x=x.reshape(-1,128),weight=weight,bias=None,z=z,
         eps=eps,norm_before_gate=True,is_rms_norm=True,activation='sigmoid').reshape(x.shape)
 
