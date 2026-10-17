@@ -10,7 +10,9 @@ from types import SimpleNamespace as NS
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--dumps', required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument('--dumps')
+    source.add_argument('--synthetic', action='store_true', help='explicit synthetic R16/36-layer protocol fixture')
     parser.add_argument('--out', required=True, type=Path)
     args = parser.parse_args()
     import torch
@@ -19,14 +21,23 @@ def main():
     from sglang.srt.mem_cache.gdn_pd_publication import PDBatchPublication
     from sglang.srt.disaggregation.state_handoff import FactorStateHandoff, FactorTransferFence
 
-    paths = sorted(glob.glob(args.dumps))
+    paths = ['synthetic-seed20261016'] if args.synthetic else sorted(glob.glob(args.dumps))
     if not paths or not torch.cuda.is_available():
         parser.error('requires P dump files and the target CUDA device')
     os.environ.update(SGLANG_GDN_K31_FUSED='1', SGLANG_GDN_K31_CHOLQR_MIXED='1')
     results = []
     for path in paths:
-        data = torch.load(path, map_location='cpu', weights_only=False)
-        assert data['meta']['role'] == 'prefill'
+        if args.synthetic:
+            generator = torch.Generator().manual_seed(20261016)
+            vbar = torch.randn(36, 24, 128, generator=generator)
+            vbar /= vbar.norm(dim=-1, keepdim=True)
+            data = dict(S=torch.randn(1, 36, 24, 128, 128, generator=generator),
+                        S_tracked=torch.randn(1, 36, 24, 128, 128, generator=generator),
+                        vbar=vbar, omega=torch.randn(1, 24, 128, 24, generator=generator),
+                        meta=dict(role='synthetic-protocol-fixture'))
+        else:
+            data = torch.load(path, map_location='cpu', weights_only=False)
+            assert data['meta']['role'] == 'prefill'
         vb, omega = data['vbar'].cuda(), data['omega'].cuda()
         layers, heads, width = vb.shape
         with tempfile.TemporaryDirectory() as temporary:
