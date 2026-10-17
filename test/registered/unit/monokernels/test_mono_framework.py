@@ -240,6 +240,16 @@ class TestMonokernelFramework(CustomTestCase):
             reasons_for(server_args(), isa=None), (None, ["no GPU is visible"])
         )
 
+    def test_overlap_weight_loading_is_refused_for_every_spec(self):
+        """Overlap loading builds a spec before its weights are loaded; a spec
+        without a load hook must be refused too, not only one that keeps copies."""
+        no_load_hook = replace(SPEC, load_tensor=None)
+        with patch.object(guards, "find_spec", return_value=(no_load_hook, "")):
+            _, reasons = reasons_for(server_args(startup_weight_load_mode="overlap"))
+        self.assertTrue(
+            any("--startup-weight-load-mode overlap" in r for r in reasons), reasons
+        )
+
     def test_exact_modes_take_only_bitwise_specs(self):
         modes = {"enable_deterministic_inference": True, "rl_on_policy_target": "fsdp"}
         self.assertEqual(reasons_for(server_args(**modes))[1], [])  # SPEC is BITWISE
