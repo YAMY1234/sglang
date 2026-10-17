@@ -4,6 +4,7 @@ import importlib.util
 import os
 from pathlib import Path
 import sys
+import tempfile
 from types import SimpleNamespace as NS, ModuleType
 import unittest
 from unittest.mock import patch
@@ -139,6 +140,52 @@ class ModelWiringTest(unittest.TestCase):
                     if fused:
                         self.assertIs(obj.attn.kwargs['z'],z)
                         self.assertIs(obj.attn.kwargs['norm_weight'],obj.norm.weight)
+
+class CaptureTest(unittest.TestCase):
+    def setUp(self):
+        path=ROOT/'python/sglang/srt/layers/attention/linear/kernels/gdn_factored_norm_capture.py'
+        spec=importlib.util.spec_from_file_location('_p4_capture_cpu',path)
+        self.capture=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.capture)
+
+    def test_missing_flag_and_graph_capture_never_read_tensors(self):
+        with tempfile.TemporaryDirectory() as d:
+            flag=Path(d)/'enable'
+            with patch.dict(os.environ,{'SGLANG_GDN_P4_CAPTURE_DIR':d,
+                                         'SGLANG_GDN_P4_CAPTURE_FLAGFILE':str(flag)}), \
+                 patch.object(torch.cuda,'is_current_stream_capturing',return_value=True):
+                # All inputs deliberately invalid: either guard must exit first.
+                self.capture.capture_step(*([None]*18))
+                flag.touch()
+                self.capture.capture_step(*([None]*18))
+            self.assertEqual(list(Path(d).glob('*.pt')),[])
+
+    def test_compacts_slots_and_preserves_payload_and_padding(self):
+        with tempfile.TemporaryDirectory() as d:
+            flag=Path(d)/'enable';flag.touch()
+            fa=torch.arange(6*2*128,dtype=torch.float32).reshape(6,2,128)
+            fu=fa[:,:,None,:].expand(6,2,32,128).half().contiguous()
+            mixed=torch.randn(3,768).bfloat16();ab=torch.randn(3,2).bfloat16()
+            count=torch.arange(6,dtype=torch.int32)[:,None].expand(6,2).contiguous()
+            stale=torch.arange(6,dtype=torch.int32);pv=stale+10
+            indices=torch.tensor([-1,5,2],dtype=torch.int64)
+            weight=torch.randn(128).bfloat16();z=torch.randn(3,2,128).bfloat16()
+            args=(mixed,ab,ab,torch.zeros(2),torch.zeros(2).bfloat16(),torch.zeros(2,128),
+                  fa,fu,fu,count,stale,indices,pv,True,z,weight,1e-6,1)
+            with patch.dict(os.environ,{'SGLANG_GDN_P4_CAPTURE_DIR':d,
+                                         'SGLANG_GDN_P4_CAPTURE_FLAGFILE':str(flag),
+                                         'SGLANG_GDN_P4_CAPTURE_LIMIT':'2'}), \
+                 patch.object(torch.cuda,'is_current_stream_capturing',return_value=False):
+                for _ in range(3): self.capture.capture_step(*args)
+            paths=sorted(Path(d).glob('*.pt'));self.assertEqual(len(paths),2)
+            for path in paths:
+                data=torch.load(path,weights_only=False)
+                self.assertEqual(data['source_pool_slots'],[0,2,5])
+                self.assertEqual(data['slots'].tolist(),[-1,2,1])
+                self.assertTrue(torch.equal(data['p']['fa'][0],fa[[0,2,5]]))
+                self.assertTrue(torch.equal(data['p']['prefix_valid'],pv[[0,2,5]]))
+                self.assertTrue(torch.equal(data['inp']['mixed'],mixed))
+                self.assertTrue(torch.equal(data['z'],z))
+                self.assertTrue(torch.equal(data['weight'],weight))
 
 if __name__=='__main__':
     unittest.main()
