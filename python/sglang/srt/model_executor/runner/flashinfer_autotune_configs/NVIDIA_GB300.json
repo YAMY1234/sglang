@@ -1,0 +1,251 @@
+{
+  "_metadata": {
+    "flashinfer_version": "0.7.2",
+    "cuda_version": "*",
+    "cublas_version": "*",
+    "cudnn_version": "*",
+    "cudnn_frontend_version": "*",
+    "cutlass_dsl_version": "*",
+    "gpu": "NVIDIA GB300"
+  },
+  "('mxfp8_gemm', 'CutedslLowLatencyBlockscaledGemmRunner', ((1, 1280), (1280, 4096), (-1,), (163840,), (0,), (-1, 4096), (41943040,)), (<class 'cutlass.base_dsl.typing.Float8E4M3FN'>, <class 'cutlass.base_dsl.typing.Float8E4M3FN'>, <class 'cutlass.base_dsl.typing.Float8E8M0FNU'>, 32, <class 'cutlass.base_dsl.typing.BFloat16'>, torch.bfloat16, True, False, False))": [
+    "CutedslLowLatencyBlockscaledGemmRunner",
+    [
+      128,
+      12,
+      1,
+      2
+    ],
+    [
+      "cuda_graph_profile_replays",
+      1,
+      "l2_cache_policy",
+      "cold"
+    ]
+  ],
+  "('mxfp8_gemm', 'CutedslLowLatencyBlockscaledGemmRunner', ((1, 1280), (1280, 8192), (-1,), (327680,), (0,), (-1, 8192), (41943040,)), (<class 'cutlass.base_dsl.typing.Float8E4M3FN'>, <class 'cutlass.base_dsl.typing.Float8E4M3FN'>, <class 'cutlass.base_dsl.typing.Float8E8M0FNU'>, 32, <class 'cutlass.base_dsl.typing.BFloat16'>, torch.bfloat16, True, False, False))": [
+    "CutedslLowLatencyBlockscaledGemmRunner",
+    [
+      128,
+      8,
+      1,
+      1
+    ],
+    [
+      "cuda_graph_profile_replays",
+      1,
+      "l2_cache_policy",
+      "cold"
+    ]
+  ],
+  "('mxfp8_gemm', 'CutedslLowLatencyBlockscaledGemmRunner', ((1, 2048), (2048, 5120), (-1,), (327680,), (0,), (-1, 5120), (41943040,)), (<class 'cutlass.base_dsl.typing.Float8E4M3FN'>, <class 'cutlass.base_dsl.typing.Float8E4M3FN'>, <class 'cutlass.base_dsl.typing.Float8E8M0FNU'>, 32, <class 'cutlass.base_dsl.typing.BFloat16'>, torch.bfloat16, True, False, False))": [
+    "CutedslLowLatencyBlockscaledGemmRunner",
+    [
+      128,
+      8,
+      1,
+      1
+    ],
+    [
+      "cuda_graph_profile_replays",
+      1,
+      "l2_cache_policy",
+      "cold"
+    ]
+  ],
+  "('mxfp8_gemm', 'CutedslLowLatencyBlockscaledGemmRunner', ((1, 5120), (5120, 1792), (-1,), (286720,), (0,), (-1, 1792), (41943040,)), (<class 'cutlass.base_dsl.typing.Float8E4M3FN'>, <class 'cutlass.base_dsl.typing.Float8E4M3FN'>, <class 'cutlass.base_dsl.typing.Float8E8M0FNU'>, 32, <class 'cutlass.base_dsl.typing.BFloat16'>, torch.bfloat16, True, False, False))": [
+    "CutedslLowLatencyBlockscaledGemmRunner",
+    [
+      128,
+      8,
+      1,
+      4
+    ],
+    [
+      "cuda_graph_profile_replays",
+      1,
+      "l2_cache_policy",
+      "cold"
+    ]
+  ],
+  "('mxfp8_gemm', 'CutedslLowLatencyBlockscaledGemmRunner', ((2, 1280), (1280, 4096), (-1,), (163840,), (0,), (-1, 4096), (41943040,)), (<class 'cutlass.base_dsl.typing.Float8E4M3FN'>, <class 'cutlass.base_dsl.typing.Float8E4M3FN'>, <class 'cutlass.base_dsl.typing.Float8E8M0FNU'>, 32, <class 'cutlass.base_dsl.typing.BFloat16'>, torch.bfloat16, True, False, False))": [
+    "CutedslLowLatencyBlockscaledGemmRunner",
+    [
+      256,
+      6,
+      1,
+      4
+    ],
+    [
+      "cuda_graph_profile_replays",
+      1,
+      "l2_cache_policy",
+      "cold"
+    ]
+  ],
+  "('mxfp8_gemm', 'CutedslLowLatencyBlockscaledGemmRunner', ((2, 1280), (1280, 8192), (-1,), (327680,), (0,), (-1, 8192), (41943040,)), (<class 'cutlass.base_dsl.typing.Float8E4M3FN'>, <class 'cutlass.base_dsl.typing.Float8E4M3FN'>, <class 'cutlass.base_dsl.typing.Float8E8M0FNU'>, 32, <class 'cutlass.base_dsl.typing.BFloat16'>, torch.bfloat16, True, False, False))": [
+    "CutedslLowLatencyBlockscaledGemmRunner",
+    [
+      128,
+      8,
+      1,
+      1
+    ],
+    [
+      "cuda_graph_profile_replays",
+      1,
+      "l2_cache_policy",
+      "cold"
+    ]
+  ],
+  "('mxfp8_gemm', 'CutedslLowLatencyBlockscaledGemmRunner', ((2, 2048), (2048, 5120), (-1,), (327680,), (0,), (-1, 5120), (41943040,)), (<class 'cutlass.base_dsl.typing.Float8E4M3FN'>, <class 'cutlass.base_dsl.typing.Float8E4M3FN'>, <class 'cutlass.base_dsl.typing.Float8E8M0FNU'>, 32, <class 'cutlass.base_dsl.typing.BFloat16'>, torch.bfloat16, True, False, False))": [
+    "CutedslLowLatencyBlockscaledGemmRunner",
+    [
+      128,
+      8,
+      1,
+      1
+    ],
+    [
+      "cuda_graph_profile_replays",
+      1,
+      "l2_cache_policy",
+      "cold"
+    ]
+  ],
+  "('mxfp8_gemm', 'CutedslLowLatencyBlockscaledGemmRunner', ((2, 5120), (5120, 1792), (-1,), (286720,), (0,), (-1, 1792), (41943040,)), (<class 'cutlass.base_dsl.typing.Float8E4M3FN'>, <class 'cutlass.base_dsl.typing.Float8E4M3FN'>, <class 'cutlass.base_dsl.typing.Float8E8M0FNU'>, 32, <class 'cutlass.base_dsl.typing.BFloat16'>, torch.bfloat16, True, False, False))": [
+    "CutedslLowLatencyBlockscaledGemmRunner",
+    [
+      128,
+      9,
+      1,
+      2
+    ],
+    [
+      "cuda_graph_profile_replays",
+      1,
+      "l2_cache_policy",
+      "cold"
+    ]
+  ],
+  "('mxfp8_gemm', 'CutedslLowLatencyBlockscaledGemmRunner', ((4, 1280), (1280, 4096), (-1,), (163840,), (0,), (-1, 4096), (41943040,)), (<class 'cutlass.base_dsl.typing.Float8E4M3FN'>, <class 'cutlass.base_dsl.typing.Float8E4M3FN'>, <class 'cutlass.base_dsl.typing.Float8E8M0FNU'>, 32, <class 'cutlass.base_dsl.typing.BFloat16'>, torch.bfloat16, True, False, False))": [
+    "CutedslLowLatencyBlockscaledGemmRunner",
+    [
+      128,
+      8,
+      1,
+      1
+    ],
+    [
+      "cuda_graph_profile_replays",
+      1,
+      "l2_cache_policy",
+      "cold"
+    ]
+  ],
+  "('mxfp8_gemm', 'CutedslLowLatencyBlockscaledGemmRunner', ((4, 1280), (1280, 8192), (-1,), (327680,), (0,), (-1, 8192), (41943040,)), (<class 'cutlass.base_dsl.typing.Float8E4M3FN'>, <class 'cutlass.base_dsl.typing.Float8E4M3FN'>, <class 'cutlass.base_dsl.typing.Float8E8M0FNU'>, 32, <class 'cutlass.base_dsl.typing.BFloat16'>, torch.bfloat16, True, False, False))": [
+    "CutedslLowLatencyBlockscaledGemmRunner",
+    [
+      128,
+      6,
+      1,
+      1
+    ],
+    [
+      "cuda_graph_profile_replays",
+      1,
+      "l2_cache_policy",
+      "cold"
+    ]
+  ],
+  "('mxfp8_gemm', 'CutedslLowLatencyBlockscaledGemmRunner', ((4, 2048), (2048, 5120), (-1,), (327680,), (0,), (-1, 5120), (41943040,)), (<class 'cutlass.base_dsl.typing.Float8E4M3FN'>, <class 'cutlass.base_dsl.typing.Float8E4M3FN'>, <class 'cutlass.base_dsl.typing.Float8E8M0FNU'>, 32, <class 'cutlass.base_dsl.typing.BFloat16'>, torch.bfloat16, True, False, False))": [
+    "CutedslLowLatencyBlockscaledGemmRunner",
+    [
+      128,
+      8,
+      1,
+      2
+    ],
+    [
+      "cuda_graph_profile_replays",
+      1,
+      "l2_cache_policy",
+      "cold"
+    ]
+  ],
+  "('mxfp8_gemm', 'CutedslLowLatencyBlockscaledGemmRunner', ((4, 5120), (5120, 1792), (-1,), (286720,), (0,), (-1, 1792), (41943040,)), (<class 'cutlass.base_dsl.typing.Float8E4M3FN'>, <class 'cutlass.base_dsl.typing.Float8E4M3FN'>, <class 'cutlass.base_dsl.typing.Float8E8M0FNU'>, 32, <class 'cutlass.base_dsl.typing.BFloat16'>, torch.bfloat16, True, False, False))": [
+    "CutedslLowLatencyBlockscaledGemmRunner",
+    [
+      256,
+      1,
+      1,
+      8
+    ],
+    [
+      "cuda_graph_profile_replays",
+      1,
+      "l2_cache_policy",
+      "cold"
+    ]
+  ],
+  "('mxfp8_gemm', 'CutedslLowLatencyBlockscaledGemmRunner', ((8, 1280), (1280, 4096), (-1,), (163840,), (0,), (-1, 4096), (41943040,)), (<class 'cutlass.base_dsl.typing.Float8E4M3FN'>, <class 'cutlass.base_dsl.typing.Float8E4M3FN'>, <class 'cutlass.base_dsl.typing.Float8E8M0FNU'>, 32, <class 'cutlass.base_dsl.typing.BFloat16'>, torch.bfloat16, True, False, False))": [
+    "CutedslLowLatencyBlockscaledGemmRunner",
+    [
+      640,
+      1,
+      1,
+      2
+    ],
+    [
+      "cuda_graph_profile_replays",
+      1,
+      "l2_cache_policy",
+      "cold"
+    ]
+  ],
+  "('mxfp8_gemm', 'CutedslLowLatencyBlockscaledGemmRunner', ((8, 1280), (1280, 8192), (-1,), (327680,), (0,), (-1, 8192), (41943040,)), (<class 'cutlass.base_dsl.typing.Float8E4M3FN'>, <class 'cutlass.base_dsl.typing.Float8E4M3FN'>, <class 'cutlass.base_dsl.typing.Float8E8M0FNU'>, 32, <class 'cutlass.base_dsl.typing.BFloat16'>, torch.bfloat16, True, False, False))": [
+    "CutedslLowLatencyBlockscaledGemmRunner",
+    [
+      256,
+      6,
+      1,
+      1
+    ],
+    [
+      "cuda_graph_profile_replays",
+      1,
+      "l2_cache_policy",
+      "cold"
+    ]
+  ],
+  "('mxfp8_gemm', 'CutedslLowLatencyBlockscaledGemmRunner', ((8, 2048), (2048, 5120), (-1,), (327680,), (0,), (-1, 5120), (41943040,)), (<class 'cutlass.base_dsl.typing.Float8E4M3FN'>, <class 'cutlass.base_dsl.typing.Float8E4M3FN'>, <class 'cutlass.base_dsl.typing.Float8E8M0FNU'>, 32, <class 'cutlass.base_dsl.typing.BFloat16'>, torch.bfloat16, True, False, False))": [
+    "CutedslLowLatencyBlockscaledGemmRunner",
+    [
+      256,
+      4,
+      1,
+      2
+    ],
+    [
+      "cuda_graph_profile_replays",
+      1,
+      "l2_cache_policy",
+      "cold"
+    ]
+  ],
+  "('mxfp8_gemm', 'CutedslLowLatencyBlockscaledGemmRunner', ((8, 5120), (5120, 1792), (-1,), (286720,), (0,), (-1, 1792), (41943040,)), (<class 'cutlass.base_dsl.typing.Float8E4M3FN'>, <class 'cutlass.base_dsl.typing.Float8E4M3FN'>, <class 'cutlass.base_dsl.typing.Float8E8M0FNU'>, 32, <class 'cutlass.base_dsl.typing.BFloat16'>, torch.bfloat16, True, False, False))": [
+    "CutedslLowLatencyBlockscaledGemmRunner",
+    [
+      128,
+      10,
+      1,
+      4
+    ],
+    [
+      "cuda_graph_profile_replays",
+      1,
+      "l2_cache_policy",
+      "cold"
+    ]
+  ]
+}
