@@ -149,6 +149,25 @@ def main():
           "        rec['environment'].update(r16_delta.U1_ENV)\n")
     patch(cg, "result['passed'] = True\n", (HERE / 'cpu_gate_u1.py.in').read_text() + "result['passed'] = True\n")
 
+    # ---- docs/222 §21.1 (LHR): NFS-safe coordination reads in the two-node harness ----
+    shutil.copyfile(HERE.parent / 'common/nfs_retry.py', OUT / 'support/nfs_retry.py')
+    patches.append(dict(file='support/nfs_retry.py', added=True))
+    patch('support/v3_services.py', 'from job_ports import plan\n',
+          'from job_ports import plan\nimport nfs_retry  # noqa: F401  docs/222 §21.1: LHR NFS coordination reads retry EBADHANDLE / ESTALE\n')
+    patch('support/r16_cpu_gate.py', "result['checks']['u1'] = u1\n",
+          "result['checks']['u1'] = u1\n"
+          "import errno, pathlib, nfs_retry, v3_services  # docs/222 §21.1: the retry is installed and retries only NFS handle errors\n"
+          "assert pathlib.Path.read_text._nfs_retry and pathlib.Path.read_bytes._nfs_retry\n"
+          "_n = []\n"
+          "def _flaky(self, _e=[521, 116]):\n"
+          "    _n.append(1)\n"
+          "    if _e: raise OSError(_e.pop(0), 'nfs')\n"
+          "    return 'ok'\n"
+          "assert nfs_retry._wrap(_flaky)(None) == 'ok' and len(_n) == 3\n"
+          "try:\n    nfs_retry._wrap(lambda self: (_ for _ in ()).throw(OSError(errno.ENOENT, 'x')))(None); raise AssertionError('ENOENT retried')\n"
+          "except FileNotFoundError:\n    pass\n"
+          "result['checks']['nfs_retry'] = dict(installed=True, retried_521_116=True, enoent_passthrough=True)\n")
+
     # ---- docs/222 §20.2 (LHR port): NCCL / UCX fabric keys follow the job environment ----
     sys.path.insert(0, str(HERE.parent / 'common'))
     import fabric_patch

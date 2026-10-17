@@ -40,3 +40,30 @@ results/p3pd-20261017/runs mkdir run dirs
 results/p3pd-20261017/logs mkdir CPU-gate / job logs
 results/p3pd-20261017/control mkdir V4_COORD_ROOT
 results/p3pd-20261017/cache-prelude mkdir prelude receipts
+# --- docs/222 §21.1 (LHR canary 253111 / reducer): paths the window harness / helper / tools name, small, pulled rather
+#     than predicted (the pruned set already cost two failures: router topology token files, reducer snapshots) ---
+results/flashnext-pd-tuning-20260924/knee-A-retain2-j856111/workers/retain2-480-aggG/cache-audit/458060f949424e85c3b27cf6e7ab5545551880fbaf216ff083c8be1947310876.i32.z copy router phase0 topology token file (topology572-inputs.json)
+results/flashnext-pd-tuning-20260924/knee-A-retain2-j856111/workers/retain2-480-aggG/cache-audit/b80952bb0f6aa51c7974c91af03313f385c7970801d605e30f8d42f5e4f3bcfe.i32.z copy router phase0 topology token file
+results/flashnext-pd-tuning-20260924/knee-A-retain2-j856111/workers/retain2-480-aggG/cache-audit/ea6108431b5ed1d9945a704ca850466ca7e232cf7995044767b3c12f4f1dc907.i32.z copy router phase0 topology token file
+results/flashnext-agentx-peak-20260920/theory277/snapshots.json copy reduce_ladder.py theory snapshots
+results/flashnext-factored-kernel-20260918/consts.pt copy named by helper / tools
+results/flashnext-final-serving-20260922/pd-j838465 copy named by helper / tools
+results/flashnext-hicache-20260926 copy named by helper / tools
+results/flashnext-pchk-20260921/j808469/factored-8192/guard.json copy named by tools
+results/flashnext-pchk-20260921/j808469/model copy named by helper / tools
+results/flashnext-pchk-20260921/j808770/stock copy named by tools
+results/flashnext-pchk-20260921/j808825 copy named by tools
+results/flashnext-pd-pside-fixes-20260925/requests20.json copy named by tools
+results/flashnext-pside-20260927/k31u-arm2stock1087-batch/reference-binding.json copy named by the package
+results/flashnext-pside-20260927/k31u-cpu-A-C0-j903889/complete.json copy named by the package
+results/flashnext-pside-20260927/k31u-env1054-batch2 copy named by the package
+results/flashnext-pside-20260927/k31u-numerical-cpu-arm2-C0-j904503/complete.json copy named by the package
+results/resolution-stats-122-20260914/fn-clean-tf31/teacher/needle.json copy named by helper / tools (needle)
+results/remeasure-pcplus-tp1-20261005 copy named by the package
+results/r16-pd-20261014/control copy named by the package manifest
+results/fp32-pd-20261015/control copy named by the package manifest
+results/flashnext-k3a-rows/j788790/whole-ncu.ncu-rep copy named by tools
+scratch/duet-agentx-venv-7ee18816 copy older aiperf venv named by tools
+data/tok-qwen35 copy tokens named by helper / tools
+exports/ts-qwen38fn-teacher copy named by helper / tools
+assets/release/duet-flash-next-k31-r4096-u mkdir empty on CMH too (mountpoint)
