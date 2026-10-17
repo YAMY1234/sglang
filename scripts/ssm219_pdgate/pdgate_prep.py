@@ -61,6 +61,10 @@ KNOWN = {
     "SGLANG_GDN_FACTORED_TRUNC_CUDA": (r"FACTORED_TRUNC_CUDA_ACTIVE", "gdn_factored_expiry_cuda.py"),
     "SGLANG_GDN_FACTORED_BOOKKEEPING_FOLD": (r"GDN_FACTORED_BOOKKEEPING_FOLD_ACTIVE", "gdn_factored_pool.py"),
     "SGLANG_GDN_K31_MIXED_EIGH_ANY_BATCH": (r"K31_MIXED_EIGH_ANY_BATCH_ACTIVE", "fires only when b > 1 rows end one prefill"),
+    # P3 (fork 9827e05cb25 gdn_prefill_agg_contract.py; helper e2f2a76 twinstar_sgl/pd_emitter_graph.py receipt())
+    "SGLANG_GDN_PD_SHALLOW_FULLN": (r"GDN_PD_SHALLOW_FULLN_ACTIVE role=prefill shallow_layers=24 deep_layers=12 phase=r/r",
+                                    "P3 fork gdn_prefill_agg_contract.py"),
+    "TWINSTAR_PD_EMITTER_GRAPH": (r"Flash-Next P emitter graph: ", "helper pd_emitter_graph.py receipt (per capture)"),
 }
 # switches whose code path this gate cannot show on its own
 COVERED_BY = {"SGLANG_GDN_K31_CHOLQR_MIXED": ("SGLANG_GDN_K31_FUSED",
@@ -174,6 +178,14 @@ def mounts_for(mounts, out, helper=None, helper_overlay=None):
         parts = m.split(":")
         host, cont, opts = parts[0], parts[1], parts[2] if len(parts) > 2 else ""
         if helper and cont == HELPER_CONT:
+            # the receipt's layout: helpers/twinstar_sgl (+ helpers/twinstar); a bare infra/sglang checkout would not import
+            assert Path(helper, "helpers/twinstar_sgl/__init__.py").is_file(), \
+                f"{helper}: not a helper-runtime tree (build one with pdgate_helper.py)"
+            hs = Path(helper, "helper-source.json")
+            if hs.is_file():
+                d = json.loads(hs.read_text()).get("diff_vs_frozen") or {}
+                notes.append(f"helper {json.loads(hs.read_text()).get('sha')}: vs frozen changed "
+                             f"{len(d.get('changed', []))} added {len(d.get('added', []))} removed {len(d.get('removed', []))}")
             notes.append(f"helper tree {host} -> {helper}")
             host = helper
         elif helper and cont.startswith(HELPER_CONT + "/"):

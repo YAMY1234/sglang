@@ -140,6 +140,11 @@ def prep_tests(root):
     raises(lambda: run_prep(root, "helper-noflag", ["--before", "C+", "--cand1", "C+", "--helper", helper]), SystemExit,
            "helper override refuses a differing package overlay without --helper-overlay")
     shutil.rmtree(Path(root) / "helper-noflag", ignore_errors=True)
+    raises(lambda: run_prep(root, "helper-layout", ["--before", "PC+", "--cand1", "PC+", "--helper",
+                                                    "/lustre/fsw/portfolios/coreai/users/yangminl/twinstar-20260911/results/"
+                                                    "r16-pd-20261014/overlay/helper-runtime/helpers"]),
+           AssertionError, "helper override refuses a tree without helpers/twinstar_sgl (e.g. a bare infra/sglang)")
+    shutil.rmtree(Path(root) / "helper-layout", ignore_errors=True)
     pp, out, plan = run_prep(root, "helper", ["--before", "C+", "--cand1", "C+", "--helper", helper, "--helper-overlay", "drop",
                                               "--hit-pass", "--before-p-env", '{"SGLANG_GDN_PREFIX_RESTORE_FUSED":"0"}'])
     m = (out / "g-cand1.mounts").read_text().split(",")
