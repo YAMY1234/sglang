@@ -324,6 +324,52 @@ class TestBlockFp8AsMxfp8Linear(_LinearBackendCheck):
     def test_flashinfer_cutedsl(self):
         self._run("flashinfer_cutedsl")
 
+    def test_decode_rows_take_the_low_latency_gemm(self):
+        """1-8 rows of a block-fp8-as-MXFP8 layer run the low-latency GEMM; 9+ rows
+        and deterministic inference keep the persistent cute-dsl GEMM."""
+        if "flashinfer_cutedsl" not in _block32_backends():
+            self.skipTest(f"cutedsl not in SM{get_device_sm()} backend set")
+        if not fp8_utils._mxfp8_low_latency_supported():
+            self.skipTest("FlashInfer has no cutedsl_low_latency MXFP8 backend")
+
+        def kernels(layer, rows, k):
+            x = torch.randn((rows, k), device="cuda", dtype=torch.bfloat16) / 10
+            layer(x)
+            torch.cuda.synchronize()
+            with torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CUDA]
+            ) as prof:
+                out, _ = layer(x)
+                torch.cuda.synchronize()
+            names = " ".join(e.name for e in prof.events())
+            return x, out, "low_latency_blockscaled" in names
+
+        torch.manual_seed(7)
+        deterministic = SimpleNamespace(
+            deterministic=SimpleNamespace(enable_deterministic_inference=True)
+        )
+        with mock.patch.object(
+            fp8_utils,
+            "FP8_GEMM_RUNNER_BACKEND",
+            Fp8GemmRunnerBackend.FLASHINFER_CUTEDSL,
+        ):
+            # DeepSeek-V4.1-Flash TP4 projections (N, K).
+            for n, k in ((5120, 2048), (8192, 1280), (1792, 5120)):
+                layer, w_dequant = self._build_layer(n, k)
+                layer.quant_method.process_weights_after_loading(layer)
+                with self.subTest(n=n, k=k):
+                    x, out, low_latency = kernels(layer, 6, k)
+                    self.assertTrue(low_latency)
+                    assert_output_close(
+                        self, out, x.float() @ w_dequant.T, rtol=5e-2, atol=1e-1
+                    )
+                    self.assertFalse(kernels(layer, 16, k)[2])
+                    with mock.patch(
+                        "sglang.srt.runtime_context.get_exec",
+                        return_value=deterministic,
+                    ):
+                        self.assertFalse(kernels(layer, 6, k)[2])
+
     def test_mxfp8_view_and_swizzled_input(self):
         if "flashinfer_cutedsl" not in _block32_backends():
             self.skipTest(f"cutedsl not in SM{get_device_sm()} backend set")

@@ -371,27 +371,50 @@ class TestApplyFp8LinearScaleDispatch(CustomTestCase):
 
 class TestMxfp8LowLatencyDispatch(CustomTestCase):
     def test_decode_rows_take_the_low_latency_gemm(self):
-        """Only 1-8 rows with K % 128 == 0 switch cute-dsl to the low-latency GEMM, and
-        never under a pinned tactic, which promises one kernel at every row count."""
+        """1-8 rows with K % 128 == 0 switch cute-dsl to the low-latency GEMM, pinned
+        or not; batch-invariant and deterministic modes keep one kernel at every row."""
         weight = torch.zeros(16, 256, dtype=torch.float8_e4m3fn)
+        ll, cd = "cutedsl_low_latency", "cute-dsl"
+        # rows, k, supported, pin, batch_invariant, deterministic, expected
         cases = (
-            (8, 256, True, False, "cutedsl_low_latency"),
-            (1, 256, True, False, "cutedsl_low_latency"),
-            (9, 256, True, False, "cute-dsl"),
-            (8, 160, True, False, "cute-dsl"),
-            (8, 256, False, False, "cute-dsl"),
-            (8, 256, True, True, "cute-dsl"),
+            (8, 256, True, False, False, False, ll),
+            (1, 256, True, True, False, False, ll),
+            (9, 256, True, True, False, False, cd),
+            (8, 160, True, False, False, False, cd),
+            (8, 256, False, True, False, False, cd),
+            (8, 256, True, True, True, False, cd),
+            (8, 256, True, True, False, True, cd),
         )
-        for rows, k, supported, pin, expected in cases:
+        for rows, k, supported, pin, invariant, deterministic, expected in cases:
             mm = MagicMock(
                 side_effect=lambda q, w, *a, **kw: q.new_zeros(q.shape[0], 16)
             )
+            exec_ = SimpleNamespace(
+                deterministic=SimpleNamespace(
+                    enable_deterministic_inference=deterministic
+                )
+            )
             with (
-                self.subTest(rows=rows, k=k, supported=supported, pin=pin),
+                self.subTest(
+                    rows=rows,
+                    k=k,
+                    supported=supported,
+                    pin=pin,
+                    invariant=invariant,
+                    deterministic=deterministic,
+                ),
                 patch.object(fp8_utils, "flashinfer_mm_mxfp8", mm, create=True),
                 patch.object(
                     fp8_utils, "_mxfp8_low_latency_supported", return_value=supported
                 ),
+                patch.object(
+                    fp8_utils, "_load_shipped_mxfp8_tactics", return_value=True
+                ),
+                patch(
+                    "sglang.srt.batch_invariant_ops.is_batch_invariant_mode_enabled",
+                    return_value=invariant,
+                ),
+                patch("sglang.srt.runtime_context.get_exec", return_value=exec_),
                 patch("flashinfer.autotuner.autotune", create=True),
             ):
                 fp8_utils.flashinfer_mxfp8_blockscaled_linear(
@@ -400,7 +423,7 @@ class TestMxfp8LowLatencyDispatch(CustomTestCase):
                     weight_scale=torch.zeros(16 * k // 32, dtype=torch.uint8),
                     input_scale=torch.zeros(rows * k // 32, dtype=torch.uint8),
                     output_dtype=torch.bfloat16,
-                    backend="cute-dsl",
+                    backend=cd,
                     pin_tactic=pin,
                 )
                 self.assertEqual(mm.call_args.kwargs["backend"], expected)
