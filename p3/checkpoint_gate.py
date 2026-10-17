@@ -39,6 +39,16 @@ def main():
             emit = emitter.emit
             def traced(*a, _emit=emit, _id=layer_id, **k):
                 print('P3_EMITTER_BEGIN', rank, _id, flush=True)
+                if _id == 32:
+                    from sglang.srt.model_executor.forward_context import get_attn_backend
+                    meta = get_attn_backend().linear_attn_backend.forward_metadata
+                    for name in ('query_start_loc', 'mamba_cache_indices', 'track_ssm_h_src',
+                                 'track_ssm_h_dst', 'track_ssm_final_src', 'track_ssm_final_dst'):
+                        value = getattr(meta, name, None)
+                        print('P3_DEEP_METADATA', rank, name,
+                              None if value is None else value.cpu().tolist(), flush=True)
+                    print('P3_DEEP_BATCH', rank, a[1].mamba_track_seqlens.cpu().tolist(),
+                          a[1].extend_seq_lens.cpu().tolist(), flush=True)
                 value = _emit(*a, **k)
                 torch.cuda.synchronize()
                 print('P3_EMITTER_DONE', rank, _id, flush=True)
