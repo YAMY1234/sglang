@@ -308,6 +308,40 @@ class TestDropDivergedAutotuneCache(CustomTestCase):
         )
 
 
+class TestShippedTacticTables(CustomTestCase):
+    def test_tables_match_their_gpu_and_the_pinned_flashinfer(self):
+        """FlashInfer skips a table whose stamp disagrees with the environment, so
+        a FlashInfer bump without re-tuning would silently drop the tactics."""
+        import re
+
+        pyproject = Path(autotune.__file__).parents[4] / "pyproject.toml"
+        pinned = re.search(
+            r'"flashinfer_python\[cu13\]==([^"]+)"', pyproject.read_text()
+        ).group(1)
+        tables = sorted(autotune._SHIPPED_TACTICS_DIR.glob("*.json"))
+        self.assertTrue(tables)
+        for table in tables:
+            configs = json.loads(table.read_text())
+            meta = configs.pop("_metadata")
+            with self.subTest(table=table.name):
+                self.assertEqual(table.stem, meta["gpu"].replace(" ", "_"))
+                self.assertEqual(meta["flashinfer_version"], pinned)
+                for runner, tactic, policy in configs.values():
+                    self.assertIsInstance(tactic, list)
+
+    def test_table_is_picked_by_device_name(self):
+        with (
+            patch.object(torch.cuda, "is_available", return_value=True),
+            patch.object(torch.cuda, "get_device_name", return_value="NVIDIA GB300"),
+        ):
+            self.assertEqual(autotune._shipped_tactic_table().name, "NVIDIA_GB300.json")
+        with (
+            patch.object(torch.cuda, "is_available", return_value=True),
+            patch.object(torch.cuda, "get_device_name", return_value="NVIDIA H100"),
+        ):
+            self.assertIsNone(autotune._shipped_tactic_table())
+
+
 class TestModelPrefillAutotune(CustomTestCase):
     """Model kernel warmup must cover prefill without a speculative dummy batch."""
 

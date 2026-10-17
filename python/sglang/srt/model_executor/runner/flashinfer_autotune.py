@@ -138,6 +138,19 @@ def should_run_flashinfer_autotune(
     return True
 
 
+# Per-GPU FlashInfer tactic tables, named after torch.cuda.get_device_name() with
+# spaces as underscores; autotuning still profiles every shape a table misses.
+_SHIPPED_TACTICS_DIR = Path(__file__).with_name("flashinfer_autotune_configs")
+
+
+def _shipped_tactic_table() -> Optional[Path]:
+    if not torch.cuda.is_available():
+        return None
+    name = torch.cuda.get_device_name().replace(" ", "_")
+    path = _SHIPPED_TACTICS_DIR / f"{name}.json"
+    return path if path.is_file() else None
+
+
 def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
     import flashinfer
 
@@ -303,6 +316,9 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
         # autotune(cache=...) clears all file-loaded tactics on entry, which would drop
         # the target's tactics when the draft worker loads; load and save them by hand.
         tuner = AutoTuner.get()
+        shipped = _shipped_tactic_table()
+        if shipped is not None:
+            tuner.load_configs(str(shipped))
         if reuse_cache and autotune_cache.is_file():
             tuner.load_configs(str(autotune_cache))
         mega_context = empty_context()
