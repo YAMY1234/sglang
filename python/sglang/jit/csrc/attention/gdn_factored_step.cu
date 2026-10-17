@@ -90,41 +90,50 @@ __device__ __forceinline__ float bias_float(float x) { return x; }
 __device__ __forceinline__ float bias_float(__nv_bfloat16 x) { return __bfloat162float(x); }
 __device__ __forceinline__ float bias_float(__half x) { return __half2float(x); }
 
-// P4: only warp 0 enters; both half warps hold the same 128 outputs.
-// Preserve the materialized K1 bf16 rounding before the RMS calculation.
+// P4: warp 0 owns 128 outputs. Use all 32 lanes, four elements each;
+// K1's two half warps originally hold duplicate eight-element vectors.
 template<bool SHARED = false>
-__device__ __forceinline__ void norm_gate(float (&o)[8], int col,
-    const __nv_bfloat16* z, const __nv_bfloat16* weight, float eps) {
-  bf8(pack_bf(o), o);
-  // Qualified Triton ROWS_PER_BLOCK=1: four consecutive values per
-  // lane, square accumulation p1^2 -> fma(p0) -> fma(p2) -> fma(p3),
-  // then xor 16/8/4/2/1. Remap K1's eight values per half-warp lane.
-  float lo = __fmaf_rn(o[3], o[3], __fmaf_rn(o[2], o[2],
-                 __fmaf_rn(o[0], o[0], __fmul_rn(o[1], o[1]))));
-  float hi = __fmaf_rn(o[7], o[7], __fmaf_rn(o[6], o[6],
-                 __fmaf_rn(o[4], o[4], __fmul_rn(o[5], o[5]))));
+__device__ __forceinline__ void norm_gate(const float (&oval)[8], int col,
+    const __nv_bfloat16* z, const __nv_bfloat16* weight, float eps, __nv_bfloat16* out) {
   int lane = threadIdx.x & 31;
-  // Permute Triton's lane bits instead of moving its partials: the low
-  // half warp owns even four-element groups, the high half owns odd groups.
-  float ss = lane < 16 ? lo : hi;
+  bool high = lane >= 16;
+  col += high ? 4 : 0;
+  float o[4] = {high ? oval[4] : oval[0], high ? oval[5] : oval[1],
+                high ? oval[6] : oval[2], high ? oval[7] : oval[3]};
+  #pragma unroll
+  for (int k = 0; k < 4; ++k)
+    o[k] = __bfloat162float(__float2bfloat16_rn(o[k]));
+  // Triton local order and the exact lane-bit permutation t=2*(l%16)+l/16.
+  float ss = __fmaf_rn(o[3], o[3], __fmaf_rn(o[2], o[2],
+                 __fmaf_rn(o[0], o[0], __fmul_rn(o[1], o[1]))));
   #pragma unroll
   for (int d = 8; d; d >>= 1)
     ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffff, ss, d));
   ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffff, ss, 16));
   float v = __fadd_rn(div_full(ss, 128.f), eps), rstd;
   asm("rsqrt.approx.ftz.f32 %0,%1;" : "=f"(rstd) : "f"(v));
-  float zv[8], wv[8];
+  uint2 zr, wr;
   if constexpr (SHARED) {
-    bf8(*reinterpret_cast<const uint4*>(z + col), zv);
-    bf8(*reinterpret_cast<const uint4*>(weight + col), wv);
+    zr = *reinterpret_cast<const uint2*>(z + col);
+    wr = *reinterpret_cast<const uint2*>(weight + col);
   } else {
-    bf8(load128(z + col), zv); bf8(load128(weight + col), wv);
+    asm volatile("ld.global.v2.u32 {%0,%1}, [%2];" : "=r"(zr.x), "=r"(zr.y) : "l"(z+col) : "memory");
+    asm volatile("ld.global.v2.u32 {%0,%1}, [%2];" : "=r"(wr.x), "=r"(wr.y) : "l"(weight+col) : "memory");
+  }
+  unsigned zb[2] = {zr.x,zr.y}, wb[2] = {wr.x,wr.y}, packed[2];
+  float y[4];
+  #pragma unroll
+  for (int k = 0; k < 4; ++k) {
+    float zv = __uint_as_float((zb[k/2] >> (16*(k&1))) << 16);
+    float wv = __uint_as_float((wb[k/2] >> (16*(k&1))) << 16);
+    float sig = div_full(1.f, 1.f + ex(-zv));
+    y[k] = __fmul_rn(__fmul_rn(__fmul_rn(o[k],rstd),wv),sig);
   }
   #pragma unroll
-  for (int k = 0; k < 8; ++k) {
-    float sig = div_full(1.f, 1.f + ex(-zv[k]));
-    o[k] = __fmul_rn(__fmul_rn(__fmul_rn(o[k], rstd), wv[k]), sig);
-  }
+  for (int k = 0; k < 2; ++k)
+    packed[k] = unsigned(__bfloat16_as_ushort(__float2bfloat16_rn(y[2*k]))) |
+                (unsigned(__bfloat16_as_ushort(__float2bfloat16_rn(y[2*k+1]))) << 16);
+  *reinterpret_cast<uint2*>(out + col) = make_uint2(packed[0],packed[1]);
 }
 
 template<typename BiasT, bool INVALIDATE, bool NORM>
@@ -147,9 +156,8 @@ __global__ __launch_bounds__(128, 4) void factored_step_r32_kernel(
     if constexpr (NORM) {
       if (warp == 0) {
         float zero[8] = {};
-        norm_gate(zero, col, z + (int64_t(n)*HV+hv)*D, norm_weight, norm_eps);
-        if (lane < 16)
-          *reinterpret_cast<uint4*>(out + (int64_t(n)*HV+hv)*D + col) = pack_bf(zero);
+        norm_gate(zero, col, z + (int64_t(n)*HV+hv)*D, norm_weight, norm_eps,
+                  out + (int64_t(n)*HV+hv)*D);
       }
     } else {
       if (tid < 16) reinterpret_cast<uint4*>(out + (int64_t(n) * HV + hv) * D)[tid] = make_uint4(0,0,0,0);
@@ -318,11 +326,12 @@ __global__ __launch_bounds__(128, 4) void factored_step_r32_kernel(
     if (warp == 0) {
       asm volatile("cp.async.wait_group 0;" ::: "memory");
       __syncwarp();
-      norm_gate<true>(oval, col, norm_z, norm_w, norm_eps);
+      norm_gate<true>(oval, col, norm_z, norm_w, norm_eps, out + (int64_t(n)*HV+hv)*D);
     }
+  } else {
+    if (warp == 0 && lane < 16)
+      *reinterpret_cast<uint4*>(out + (int64_t(n)*HV+hv)*D + col) = pack_bf(oval);
   }
-  if (warp == 0 && lane < 16)
-    *reinterpret_cast<uint4*>(out + (int64_t(n)*HV+hv)*D + col) = pack_bf(oval);
   if (tid == 0) { fc[sh]=cnt+1; stale[slot]=1; }
 }
 
