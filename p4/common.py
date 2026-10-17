@@ -20,7 +20,7 @@ def layouts(path=None):
         width = (2 * h + 2 * hv) * 128 + 2 * hv
         result[tp] = [
             dict(name='contiguous', stride=[hv*128,128,1], storage_offset=0,
-                 source='synthetic contiguous control', measured=False, primary=False),
+                 source='synthetic contiguous control', measured=False, primary=(tp == 1)),
             dict(name='projection_view', stride=[width,128,1], storage_offset=(2*h+hv)*128,
                  source='source-derived merged projection stress; not measured service layout',
                  measured=False, primary=True),
