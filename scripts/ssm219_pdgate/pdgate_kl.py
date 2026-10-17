@@ -205,7 +205,12 @@ def score(a):
                 raise SystemExit(f"{f} exists")
     refs = dict(kv.split("=", 1) for kv in a.refs.split(",")) if a.refs else {}
     pd = _pd(a)
-    flushed = pd.flush()  # cold prefill: an earlier pass must not serve the prefix from P's radix cache
+    if a.prefix_hit:  # docs/215 D9: keep P's radix cache, the windows' prefixes come back as hits (restore path)
+        if not a.tag:
+            raise SystemExit("--prefix-hit is a tagged score pass")
+        flushed = None
+    else:
+        flushed = pd.flush()  # cold prefill: an earlier pass must not serve the prefix from P's radix cache
     import importlib
     proc = importlib.import_module("pdgate_kl").PDKLProbe.to_str()  # by reference, not __main__ by value
     metas = {}
@@ -221,8 +226,9 @@ def score(a):
         mp, md = op["meta_info"], od["meta_info"]
         if md["completion_tokens"] != cont:
             raise ValueError(f"window {i}: D returned {md['completion_tokens']} of {cont} forced tokens: {md}")
-        if mp.get("cached_tokens", 0) != 0:
-            raise ValueError(f"window {i}: P served {mp.get('cached_tokens')} prompt tokens from cache (cold pass): {mp}")
+        if (mp.get("cached_tokens", 0) == 0) == bool(a.prefix_hit):
+            raise ValueError(f"window {i}: P cached_tokens {mp.get('cached_tokens')} on a "
+                             f"{'prefix-hit' if a.prefix_hit else 'cold'} pass: {mp}")
         metas[i] = {"P_cached": mp.get("cached_tokens"), "D_cached": md.get("cached_tokens"),
                     "P_completion": mp.get("completion_tokens"), "seconds": round(time.time() - t, 2)}
 
@@ -239,7 +245,7 @@ def score(a):
     if step0[a.step0] != len(rows):
         raise ValueError(f"step 0 scored by {step0}, expected all {len(rows)} on {a.step0}")
     Path(f"{out}/score-meta-{a.arm}{a.tag}.json").write_text(json.dumps(
-        {"flush": flushed, "by_role": by_role, "step0_by_role": step0, "step0_owner": a.step0, "seconds": round(time.time() - t0, 1),
+        {"flush": flushed, "prefix_hit": bool(a.prefix_hit), "by_role": by_role, "step0_by_role": step0, "step0_owner": a.step0, "seconds": round(time.time() - t0, 1),
          "windows": metas}, indent=1))
     print(f"SCORE {a.arm}{a.tag}: {len(recs)} positions in {time.time() - t0:.0f} s (P {by_role['P']}, D {by_role['D']}); "
           f"mean nll {statistics.fmean(r['nll'] for r in recs):.5f}"
@@ -307,6 +313,7 @@ def main():
             p.add_argument("--refs", required=True); p.add_argument("--step0", choices=ROLES, required=True)
             p.add_argument("--out-root", default="/out"); p.add_argument("--conc", type=int, default=16)
             p.add_argument("--topk", type=int, default=8192); p.add_argument("--tag", default="")
+            p.add_argument("--prefix-hit", action="store_true", help="tagged pass on P's cached prefixes (no flush)")
         else:
             p.add_argument("--data", required=True); p.add_argument("--arm", required=True); p.add_argument("--out", required=True)
             p.add_argument("--n", type=int, default=200); p.add_argument("--conc", type=int, default=64)

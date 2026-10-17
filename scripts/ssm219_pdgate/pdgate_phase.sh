@@ -23,5 +23,9 @@ for r in P D; do p=$([ $r = P ] && echo $PP || echo $DP)
 done
 $K smoke $PAIR --out /out/smoke-$ARM.json || { echo "SMOKE-FAIL $ARM"; exit 5; }
 $K score $PAIR --windows /out/windows.json --arm $ARM --refs s32=/out/ref-s32 --step0 $S0 || { echo "SCORE-FAIL $ARM"; exit 6; }
+if [ "$(q "int(bool(p.get('hit_pass')))")" = 1 ]; then  # same windows again, P serves the prefixes from radix (restore path)
+  $K score $PAIR --windows /out/windows.json --arm $ARM --refs s32=/out/ref-s32 --step0 $S0 --tag=-hit --prefix-hit \
+    || { echo "SCORE-HIT-FAIL $ARM"; exit 8; }
+fi
 $K gsm $PAIR --data /work/data/unified-gsm8k-test.jsonl --arm $ARM --out /out/gsm-$ARM.json --conc 64 || { echo "GSM-FAIL $ARM"; exit 7; }
 echo "PHASE-DONE $ARM $(date -u +%T)"

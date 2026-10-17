@@ -136,6 +136,18 @@ def prep_tests(root):
     check(plan["arms"]["before"]["source_sha"].startswith("7a841e4189"), "PC+: stock capsule tree")
     check(any(e["regex"] == "PD_SHALLOW_FULLN_ACTIVE" for e in plan["expectations"]["cand1"]["P"]), "PC+: --expect line kept")
     shutil.rmtree(out)
+    helper = "/lustre/fsw/portfolios/coreai/users/yangminl/twinstar-20260911/results/remeasure-v6-fivearm-tp1-20261004/inputs/helper-runtime"
+    raises(lambda: run_prep(root, "helper-noflag", ["--before", "C+", "--cand1", "C+", "--helper", helper]), SystemExit,
+           "helper override refuses a differing package overlay without --helper-overlay")
+    shutil.rmtree(Path(root) / "helper-noflag", ignore_errors=True)
+    pp, out, plan = run_prep(root, "helper", ["--before", "C+", "--cand1", "C+", "--helper", helper, "--helper-overlay", "drop",
+                                              "--hit-pass", "--before-p-env", '{"SGLANG_GDN_PREFIX_RESTORE_FUSED":"0"}'])
+    m = (out / "g-cand1.mounts").read_text().split(",")
+    check(f"{helper}:{pp.HELPER_CONT}:ro" in m and not any(x.split(":")[1].startswith(pp.HELPER_CONT + "/") for x in m)
+          and plan["arms"]["cand1"]["helper_digest"], "helper override: tree replaced, overlay dropped, digest recorded")
+    check(any(e["regex"] == "PREFIX_RESTORE_FUSED_ACTIVE" for e in plan["expectations"]["cand1"]["P"]) and plan["hit_pass"],
+          "hit pass: prefix-restore switch becomes gateable (its line required)")
+    shutil.rmtree(out)
     pp, out, plan = run_prep(root, "sfloor", ["--before", "S", "--cand1", "S"])
     check(plan["arms"]["before"]["step0_owner"] == "P" and plan["expectations"]["cand1"] == {"P": [], "D": []},
           "S floor: no switch, no expectation")
@@ -323,6 +335,15 @@ def dispatch_tests(tmp):
     raises(lambda: run("score", *base, "--windows", str(tmp / "w.json"), "--arm", "c3", "--refs", "s32=/x", "--step0", "P",
                        "--out-root", str(tmp)), ValueError, "score refuses an incomplete forced continuation")
     mode["short"] = False
+    mode["cached"] = 3840
+    run("score", *base, "--windows", str(tmp / "w.json"), "--arm", "cand1", "--refs", "s32=/x", "--step0", "P",
+        "--out-root", str(tmp), "--tag=-hit", "--prefix-hit")
+    hm = json.loads((tmp / "score-meta-cand1-hit.json").read_text())
+    check(hm["prefix_hit"] and hm["flush"] is None and (tmp / "rec-cand1-score-hit.D.jsonl").exists(),
+          "score --prefix-hit: no flush, hit records under the -hit tag")
+    mode["cached"] = 0
+    raises(lambda: run("score", *base, "--windows", str(tmp / "w.json"), "--arm", "c4", "--refs", "s32=/x", "--step0", "P",
+                       "--out-root", str(tmp), "--tag=-hit", "--prefix-hit"), ValueError, "prefix-hit pass refuses a miss on P")
     data = tmp / "gsm.jsonl"
     data.write_text("".join(json.dumps({"question": f"q{i}", "answer": "#### 18"}) + "\n" for i in range(5)))
     run("gsm", *base, "--data", str(data), "--arm", "cand1", "--out", str(tmp / "gsm.json"), "--n", "5", "--conc", "5")
@@ -341,11 +362,12 @@ def summary_tests(tmp, gate_summary):
     NW, CONT = 48, 8
     rng = random.Random(3)
 
-    def make(name, shift, gsm_c, lines_c, lines_b, step0="P"):
+    def make(name, shift, gsm_c, lines_c, lines_b, step0="P", hit=None):
         out = Path(tmp) / name
         out.mkdir()
         plan = {"phases": ["before", "cand1"], "ref": {"name": "s32"}, "windows": {"n": NW, "cont": CONT},
                 "arms": {a: {"step0_owner": step0} for a in ("before", "cand1")}, "expectation_notes": [],
+                "hit_pass": hit is not None, "hit_gate": hit is not None,
                 "expectations": {"cand1": {"P": [{"key": "SGLANG_GDN_K31_FUSED", "kind": "line", "regex": r"K31_FUSED_ACTIVE 36 \d+ 24",
                                                   "forbid_in_before": True},
                                                  {"key": "SGLANG_GDN_K31_FUSED", "kind": "env",
@@ -353,10 +375,12 @@ def summary_tests(tmp, gate_summary):
         (out / "plan.json").write_text(json.dumps(plan))
         base = [rng.uniform(0.01, 0.03) for _ in range(NW)]
         per = {}
-        for arm, sh in (("before", 0.0), ("cand1", shift)):
+        tags = [("", 0.0)] + ([("-hit", hit)] if hit is not None else [])
+        for (arm, sh), (tag, hsh) in [(x, y) for x in (("before", 0.0), ("cand1", shift)) for y in tags]:
+            sh = sh + (hsh if arm == "cand1" else 0.0)
             per[arm] = []
             for role in ("P", "D"):
-                with open(out / f"rec-{arm}-score.{role}.jsonl", "w") as f:
+                with open(out / f"rec-{arm}-score{tag}.{role}.jsonl", "w") as f:
                     for w in range(NW):
                         for s in range(CONT):
                             if (s == 0 and role == step0) or (s > 0 and role == "D"):
@@ -396,6 +420,10 @@ def summary_tests(tmp, gate_summary):
     check(make("inbefore", 0.0, 190, good, good[:1])[1]["verdict"]["cand1"].startswith("VOID"),
           "summary: line also in before -> VOID")
     check(make("pcplus", 0.0, 190, good, [], step0="D")[1]["verdict"]["cand1"] == "PASS", "summary: PC+ layout (step 0 on D)")
+    r = make("hitok", 0.0, 190, good, [], hit=0.0)[1]
+    check(r["verdict"]["cand1"] == "PASS" and r["gate_hit"]["cand1"]["kl_pass"], "summary: hit gate, equal -> PASS")
+    r = make("hitfail", 0.0, 190, good, [], hit=0.004)[1]
+    check(r["verdict"]["cand1"] == "FAIL" and r["gate"]["cand1"]["kl_pass"], "summary: cold pass ok, hit pass shifted -> FAIL")
 
 
 STUB_SRUN = r"""#!/bin/bash

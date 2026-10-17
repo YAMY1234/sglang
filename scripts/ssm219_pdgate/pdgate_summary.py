@@ -15,10 +15,10 @@ INFO = ("DUET controls", "Factored GDN pool allocated", "R3A_PREFILL_MIXED_ACTIV
         "Flash-Next D boundary")
 
 
-def records(out, arm, ref):
+def records(out, arm, ref, tag=""):
     by = {}
     for role in ("P", "D"):
-        f = out / f"rec-{arm}-score.{role}.jsonl"
+        f = out / f"rec-{arm}-score{tag}.{role}.jsonl"
         if f.exists():
             for s in f.read_text().splitlines():
                 r = json.loads(s)
@@ -55,12 +55,20 @@ def main(out):
         complete[arm] = len(by) == nw and all(len(v) == cont for v in by.values())
         if complete[arm]:
             kl[arm] = per_window(by)
+    kl_hit = {}  # optional prefix-hit pass (P serves the windows' prefixes from radix: the restore / donation path)
+    if plan.get("hit_pass"):
+        for arm in phases:
+            by = records(out, arm, ref, "-hit")
+            if len(by) == nw and all(len(v) == cont for v in by.values()):
+                kl_hit[arm] = per_window(by)
     gsm = {}
     for arm in phases:
         f = out / f"gsm-{arm}.json"
         if f.exists():
             gsm[arm] = json.loads(f.read_text())
     res = dict(kl={a: dict(zip(("mean", "se"), mse(v))) for a, v in kl.items()}, gate={},
+               kl_hit={a: dict(zip(("mean", "se"), mse(v))) for a, v in kl_hit.items()}, gate_hit={},
+               hit_pass=bool(plan.get("hit_pass")), hit_gate=bool(plan.get("hit_gate")),
                gsm={a: g["correct"] for a, g in gsm.items()}, pd={}, activation={}, lines={}, verdict={},
                reference=plan["ref"], windows=plan["windows"], expectation_notes=plan["expectation_notes"])
     # PD role split (score() already refused anything but one scored record per (window, step) and step 0 on its owner)
@@ -111,13 +119,18 @@ def main(out):
             gm, gse = mse(dd)
             g.update(gsm_diff_pp=100 * gm, gsm_se_pp=100 * gse, gsm_pass=gm >= -2 * gse)
         res["gate"][c] = g
+        if c in kl_hit and "before" in kl_hit:
+            m, se = mse([x - y for x, y in zip(kl_hit[c], kl_hit["before"])])
+            res["gate_hit"][c] = dict(kl_minus_before=m, se=se, z=m / se if se else None, kl_pass=m <= 2 * se)
+        hit_ok = not plan.get("hit_gate") or res["gate_hit"].get(c, {}).get("kl_pass")
         act_ok = res["activation"].get(c, {"ok": True})["ok"]
-        if "kl_pass" not in g or "gsm_pass" not in g or not complete.get("before") or not complete.get(c):
+        if ("kl_pass" not in g or "gsm_pass" not in g or not complete.get("before") or not complete.get(c)
+                or (plan.get("hit_gate") and c not in res["gate_hit"])):
             v = "INCOMPLETE"
         elif not act_ok:
             v = "VOID (activation line missing or present in before)"
         else:
-            v = "PASS" if g["kl_pass"] and g["gsm_pass"] else "FAIL"
+            v = "PASS" if g["kl_pass"] and g["gsm_pass"] and hit_ok else "FAIL"
         res["verdict"][c] = v
     text = json.dumps(res, indent=1)
     (out / "gate-summary.json").write_text(text)

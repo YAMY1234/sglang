@@ -153,23 +153,52 @@ def build_role(arm, role, cls, receipt, src, sha, extra_env, gate_root):
     return spec, env, argv, mounts
 
 
-def mounts_for(mounts, out):
-    """The receipt's container mounts (the window's exact layout), campaign trees read-only, model as @MODEL@, + /out."""
-    res = []
+HELPER_CONT = "/work/results/remeasure-v6-fivearm-tp1-20261004/inputs/helper-runtime"
+
+
+def tree_digest(root):
+    """sha256 over (relative path, file sha256) of every file under root, __pycache__ excluded."""
+    h = hashlib.sha256()
+    for p in sorted(Path(root).rglob("*")):
+        if p.is_file() and "__pycache__" not in p.parts:
+            h.update(f"{p.relative_to(root)}\0{sha256(p)}\n".encode())
+    return h.hexdigest()
+
+
+def mounts_for(mounts, out, helper=None, helper_overlay=None):
+    """The receipt's container mounts (the window's exact layout), campaign trees read-only, model as @MODEL@, + /out.
+    helper: host directory that replaces the helper-runtime tree (P3 ships helper code); the package's file overlays onto
+    that tree are kept only when they equal the new tree's file, or by an explicit --helper-overlay keep / drop."""
+    res, notes = [], []
     for m in mounts:
         parts = m.split(":")
         host, cont, opts = parts[0], parts[1], parts[2] if len(parts) > 2 else ""
+        if helper and cont == HELPER_CONT:
+            notes.append(f"helper tree {host} -> {helper}")
+            host = helper
+        elif helper and cont.startswith(HELPER_CONT + "/"):
+            mine = Path(helper) / cont[len(HELPER_CONT) + 1:]
+            same = mine.is_file() and sha256(mine) == sha256(host)
+            if not same and helper_overlay is None:
+                raise SystemExit(f"package overlay {host} -> {cont} differs from the new helper tree's {mine}; "
+                                 "pass --helper-overlay keep|drop")
+            if not same and helper_overlay == "drop":
+                notes.append(f"overlay dropped: {cont} (new helper tree's own file)")
+                continue
+            notes.append(f"overlay kept: {cont} ({'identical' if same else 'differs, kept by --helper-overlay keep'})")
         if cont == "/model":
             assert host == MODEL_HOST, host
             host = "@MODEL@"
         if re.match(rf"{W}/(results|archives)/[^/]+$", host) and opts != "ro":
             opts = "ro"  # the window's campaign / archive trees: the gate writes only to /out and node-local /tmp
         res.append(":".join([host, cont] + ([opts] if opts else [])))
+    if helper:
+        assert any(n.startswith("helper tree") for n in notes), "receipt has no helper-runtime mount"
     res.append(f"{out}:/out")
-    return ",".join(res)
+    return ",".join(res), notes
 
 
-def expectations(arms, declared_env, extra, no_line):
+def expectations(arms, declared_env, extra, no_line, hit_pass=False):
     """Activation lines per (arm, role): every switch whose value differs from `before` must show its line on that role
     of the candidate and must not show it on `before`."""
     exp, notes = {}, []
@@ -193,6 +222,9 @@ def expectations(arms, declared_env, extra, no_line):
                     req.append(dict(key=k, kind="line", regex=KNOWN[k][0], note=KNOWN[k][1], forbid_in_before=True))
                 elif k in COVERED_BY and env.get(COVERED_BY[k][0], "") not in FALSE and COVERED_BY[k][0] in delta:
                     notes.append(f"{arm}/{role}: {k}: {COVERED_BY[k][1]}")
+                elif k in NOT_EXERCISED and hit_pass:
+                    req.append(dict(key=k, kind="line", regex=r"PREFIX_RESTORE_FUSED_ACTIVE", note="prefix-hit pass",
+                                    forbid_in_before=True))
                 elif k in NOT_EXERCISED:
                     if k not in no_line:
                         raise SystemExit(f"{arm}/{role}: {k} is not exercised by this gate ({NOT_EXERCISED[k]}); "
@@ -213,7 +245,8 @@ def expectations(arms, declared_env, extra, no_line):
 
 REUSE_FILES = ("rec-before-score.P.jsonl", "rec-before-score.D.jsonl", "calls-before.P.jsonl", "calls-before.D.jsonl",
                "score-meta-before.json", "smoke-before.json", "gsm-before.json", "srv-before-P.log", "srv-before-D.log",
-               "phase-before.log")
+               "phase-before.log", "rec-before-score-hit.P.jsonl", "rec-before-score-hit.D.jsonl",
+               "calls-before-hit.P.jsonl", "calls-before-hit.D.jsonl", "score-meta-before-hit.json")
 
 
 def reuse_before(src, out, gate_root, arm_plan, a):
@@ -223,6 +256,8 @@ def reuse_before(src, out, gate_root, arm_plan, a):
     old = json.loads((src / "plan.json").read_text())
     for k in ("image",):
         assert old[k] == getattr(a, k), (k, old[k])
+    assert bool(old.get("hit_pass")) or not (a.hit_pass or a.hit_gate), "earlier gate had no prefix-hit pass"
+    assert old["arms"]["before"].get("helper_digest") == arm_plan["helper_digest"], "helper tree differs"
     assert old["windows"]["sha256"] == sha256(a.windows) and old["ref"]["path"] == a.ref, "reference / windows differ"
     assert old["arms"]["before"]["receipt"] == arm_plan["receipt"], "receipt differs"
     for f in ("g-before-P.env", "g-before-P.argv", "g-before-D.env", "g-before-D.argv", "g-before.mounts"):
@@ -242,11 +277,16 @@ def main(argv=None):
     ap.add_argument("--out", required=True)
     ap.add_argument("--src", help="tree for every arm (container path /work/...); default: each receipt's capsule")
     ap.add_argument("--sha")
+    ap.add_argument("--helper", help="host dir replacing the helper-runtime tree for every arm (P3 helper code)")
+    ap.add_argument("--helper-overlay", choices=("keep", "drop"))
+    ap.add_argument("--hit-pass", action="store_true", help="second KL pass on P's cached prefixes (restore path), reported")
+    ap.add_argument("--hit-gate", action="store_true", help="the prefix-hit pass is part of the verdict (implies --hit-pass)")
     for arm in ("before", "cand1", "cand2"):
         ap.add_argument(f"--{arm}", choices=sorted(RECEIPTS), required=arm != "cand2")
         ap.add_argument(f"--{arm}-receipt")
         ap.add_argument(f"--{arm}-src")
         ap.add_argument(f"--{arm}-sha")
+        ap.add_argument(f"--{arm}-helper")
         ap.add_argument(f"--{arm}-p-env", default="{}")
         ap.add_argument(f"--{arm}-d-env", default="{}")
     ap.add_argument("--expect", action="append", default=[], help="ARM:ROLE:KEY:REGEX")
@@ -291,16 +331,20 @@ def main(argv=None):
         assert len(mounts_seen) == 1, f"{arm}: P and D receipts mount differently"
         assert specs["P"]["shallow"] == ("--flashnext-pd-shallow-prefill" in specs["D"]["argv"]), arm
         assert specs["P"]["source"] == specs["D"]["source"], arm
-        (out / f"g-{arm}.mounts").write_text(mounts_for(mounts_seen.pop().split(","), str(out)))
+        helper = getattr(a, f"{arm}_helper") or a.helper
+        mnt, mnotes = mounts_for(mounts_seen.pop().split(","), str(out), helper, a.helper_overlay)
+        (out / f"g-{arm}.mounts").write_text(mnt)
         bundle = arms_env[arm]["P"]["PARITY_BUNDLE"]
         assert arms_env[arm]["D"]["PARITY_BUNDLE"] == bundle, arm
         plan_arms[arm] = dict(cls=cls, receipt=receipt, source=specs["P"]["source"], source_sha=specs["P"]["source_sha"],
                               p_env=role_env["P"], d_env=role_env["D"], step0_owner="D" if specs["P"]["shallow"] else "P",
                               bundle=bundle, prelude=f"{host_path(bundle)}/support/prelude/{PRELUDE[cls]}.json",
-                              cache_env={r: specs[r]["cache_env"] for r in ("P", "D")})
+                              cache_env={r: specs[r]["cache_env"] for r in ("P", "D")}, helper=helper,
+                              helper_digest=tree_digest(helper) if helper else None, mount_notes=mnotes)
         assert Path(plan_arms[arm]["prelude"]).is_file(), plan_arms[arm]["prelude"]
+    a.hit_pass = a.hit_pass or a.hit_gate
     exp, notes = expectations(arms_env, {x: {"P": plan_arms[x]["p_env"], "D": plan_arms[x]["d_env"]} for x in phases},
-                              extra, no_line)
+                              extra, no_line, a.hit_pass)
     # reference + windows (hard links, like the agg gate's ref-stock)
     assert sha256(a.windows) == WINDOWS_SHA or a.windows != WINDOWS, "windows.json changed"
     spec = json.loads(Path(a.windows).read_text())
@@ -324,7 +368,7 @@ def main(argv=None):
     if a.before_from:
         reused = reuse_before(Path(a.before_from), out, gate_root, plan_arms["before"], a)
         run_phases.remove("before")
-    plan = dict(phases=phases, run_phases=run_phases, before_reused=reused, arms=plan_arms, ports=PORTS, gpus=GPUS, gate_root=gate_root, image=a.image,
+    plan = dict(hit_pass=a.hit_pass, hit_gate=a.hit_gate, phases=phases, run_phases=run_phases, before_reused=reused, arms=plan_arms, ports=PORTS, gpus=GPUS, gate_root=gate_root, image=a.image,
                 model_host=MODEL_HOST, ref=dict(name="s32", path=a.ref, job="4538682 (docs/218 kl-fdt-2, agg S_fp32)"),
                 windows=dict(path=a.windows, sha256=sha256(a.windows), n=n, cont=cont), expectations=exp,
                 expectation_notes=notes, no_line=no_line, tools=tools, prep_argv=sys.argv if argv is None else argv,
