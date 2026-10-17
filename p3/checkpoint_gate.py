@@ -290,6 +290,8 @@ def main():
                        count_bitwise=counts_equal, cache_store_bitwise=stored_equal,
                        factor_diagnostic=numerical,
                        fallback_delta=after['fallbacks'] - before['fallbacks'],
+                       publication_delta={key: after[key] - before[key] for key in after
+                                          if key.startswith('pub_')},
                        shallow_encoding=fb.mamba_track_seqlens.cpu().tolist(),
                        deep_encoding=deep_encoding.cpu().tolist())
             if focus:
