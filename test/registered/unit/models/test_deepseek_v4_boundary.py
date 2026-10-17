@@ -204,6 +204,39 @@ class TestAttentionCompletion(unittest.TestCase):
                 torch.testing.assert_close(completed, (value + 1) * 2, atol=0, rtol=0)
 
 
+class TestAttentionWoBSplit(unittest.TestCase):
+    def test_forward_is_wo_b_of_forward_before_wo_b(self):
+        """A caller that runs wo_b itself must get the attention output forward projects."""
+        from sglang.srt.models import deepseek_v4
+
+        attention = deepseek_v4.MQALayer.__new__(deepseek_v4.MQALayer)
+        torch.nn.Module.__init__(attention)
+        before = torch.randn(3, 4)
+        attention.forward_before_wo_b = Mock(return_value=before)
+        attention._project_wo_b = Mock(side_effect=lambda o, defer: (o, defer))
+        context = SimpleNamespace(input_scattered=False)
+        with patch.object(deepseek_v4, "get_attn_tp_context", return_value=context):
+            out = deepseek_v4.MQALayer.forward(
+                attention,
+                torch.ones(3, 8),
+                None,
+                None,
+                x_quant="q",
+                defer_all_reduce=True,
+            )
+            self.assertEqual(out, (before, True))
+            self.assertEqual(
+                attention.forward_before_wo_b.call_args.kwargs, {"x_quant": "q"}
+            )
+
+            empty = torch.ones(0, 8)
+            self.assertIs(
+                deepseek_v4.MQALayer.forward(attention, empty, None, None), empty
+            )
+        attention.forward_before_wo_b.assert_called_once()
+        attention._project_wo_b.assert_called_once()
+
+
 class TestMoeSourceRows(unittest.TestCase):
     def test_cp_operand_is_released_before_return_and_v41_uses_contiguous_rows(self):
         from sglang.srt.layers.layer_boundary.layout import TokenAxis
