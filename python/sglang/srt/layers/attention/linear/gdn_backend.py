@@ -555,6 +555,51 @@ def _fp32_track_buffer(backend, S0):
     return torch.empty_like(S0)
 
 
+_FP32_TRACK_PREWARMED = []
+# one prompt per NT_BUCKET of chunk_gated_delta_rule_fwd_h (NT <= 32 / <= 128 / > 128 chunks of 64 tokens)
+FP32_TRACK_PREWARM_NT = (2, 64, 160)
+
+
+def _fp32_track_prewarm(backend, layer, query, key, value, a, b, query_start_loc):
+    """docs/223 §11 (A') first-use fix (S2-triple-prime, j4568208): TRACK_STATE is a constexpr of the fwd_h kernel and
+    NT_BUCKET is in its autotune key, so the first snapshot extend of each NT bucket compiled a new variant inside the
+    serving path (+615..750 ms).  Once per process, at the first eager factored extend (server warmup), run the served
+    Triton chunk call with track_state on scratch tensors of this layer's shapes / dtypes, one NT per bucket.  Scratch
+    state and track buffers only: no pool slot and no radix state is touched.
+    SGLANG_GDN_FULLN_CKPT_FP32_SNAPSHOT_PREWARM=0 skips it (negative control)."""
+    if (_FP32_TRACK_PREWARMED or _os.environ.get("SGLANG_GDN_FULLN_CKPT_FP32_SNAPSHOT", "0") != "1"
+            or _os.environ.get("SGLANG_GDN_FULLN_CKPT_FP32_SNAPSHOT_PREWARM", "1") != "1"
+            or torch.cuda.is_current_stream_capturing()
+            or not isinstance(backend.kernel_dispatcher.extend_kernel, TritonGDNKernel)):
+        return
+    _FP32_TRACK_PREWARMED.append(True)
+    import logging
+    import time
+
+    torch.cuda.synchronize()
+    began = time.perf_counter()
+    HV, V, K = value.shape[2], value.shape[3], key.shape[3]
+    for nt in FP32_TRACK_PREWARM_NT:
+        T = nt * 64
+        q = query.new_zeros((1, T) + tuple(query.shape[2:]))
+        k = key.new_zeros((1, T) + tuple(key.shape[2:]))
+        v = value.new_zeros((1, T) + tuple(value.shape[2:]))
+        g, beta = _gating(layer, a.new_zeros((T,) + tuple(a.shape[1:])), b.new_zeros((T,) + tuple(b.shape[1:])), q)
+        S0 = torch.zeros((1, HV, V, K), dtype=torch.float32, device=value.device)
+        backend.kernel_dispatcher.extend(
+            q=q, k=k, v=v, g=g, beta=beta, ssm_states=S0,
+            cache_indices=torch.zeros(1, dtype=torch.int32, device=value.device),
+            query_start_loc=torch.tensor([0, T], dtype=query_start_loc.dtype, device=query_start_loc.device),
+            state_checkpoint_cu_starts=None, num_state_checkpoints=None, state_checkpoint_every_n_tokens=None,
+            output=None, track_state=torch.empty_like(S0),
+            track_chunk_idx=torch.full((1,), nt - 1, dtype=torch.int32, device=value.device))
+    torch.cuda.synchronize()
+    logging.getLogger(__name__).info(
+        "FULLN_CKPT_FP32_SNAPSHOT_PREWARM nt=%s hv=%d v=%d k=%d dtype=%s: %.0f ms (fwd_h TRACK_STATE variants compiled "
+        "before serving)", FP32_TRACK_PREWARM_NT, HV, V, K, str(query.dtype).replace("torch.", ""),
+        (time.perf_counter() - began) * 1e3)
+
+
 def _gating(layer, a, b, query):
     """Decay / beta for the extend kernels; fp32 inputs (#873 fp32 emitter) take the reference's torch formula."""
     if query.dtype == torch.float32:
@@ -1873,6 +1918,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 layer.layer_id, plan
             )  # (B, HV, V, K) fp32, contiguous
             row_indices = torch.arange(B, device=S0.device, dtype=torch.int32)
+            _fp32_track_prewarm(self, layer, query, key, value, a, b, query_start_loc)
             if forward_metadata.track_ssm_fp32_any:
                 h_track_buf = _fp32_track_buffer(self, S0)
             block = None
