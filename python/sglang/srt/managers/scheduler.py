@@ -439,6 +439,30 @@ _is_npu = is_npu()
 _is_hip = is_hip()
 
 
+def prompt_logprob_refusal(req: Req) -> Optional[str]:
+    """Why this server cannot return the prompt-token logprobs ``req`` asks for, else
+    None; refused at admission so one request cannot fail the whole batch."""
+    if not (
+        req.return_logprob and 0 <= req.logprob_start_len < len(req.origin_input_ids)
+    ):
+        return None
+    if get_device().mlx_enable_sampling:
+        # The MLX prefill result carries no input_token_logprobs.
+        return (
+            "Prompt input logprobs (logprob_start_len) are not supported "
+            "on the MLX sampling path; omit logprob_start_len to get "
+            "output logprobs."
+        )
+    if get_exec().features.enable_decoder_swa_bounded_replay:
+        # Late layers compute only each request's last SWA window of prompt rows.
+        return (
+            "Prompt input logprobs (logprob_start_len) are not supported with "
+            "decoder SWA bounded replay; omit logprob_start_len to get output "
+            "logprobs, or serve with --no-enable-decoder-swa-bounded-replay."
+        )
+    return None
+
+
 class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
@@ -3203,19 +3227,8 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        if (
-            get_device().mlx_enable_sampling
-            and req.return_logprob
-            and 0 <= req.logprob_start_len < len(req.origin_input_ids)
-        ):
-            # The MLX sampling path computes output logprobs only; the
-            # prefill result carries no input_token_logprobs, so letting
-            # this through would crash output processing.
-            error_msg = (
-                "Prompt input logprobs (logprob_start_len) are not supported "
-                "on the MLX sampling path; omit logprob_start_len to get "
-                "output logprobs."
-            )
+        error_msg = prompt_logprob_refusal(req)
+        if error_msg is not None:
             req.logprob_start_len = -1
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)

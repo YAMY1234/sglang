@@ -1,4 +1,4 @@
-"""Reject PD sampling-mask requests before entering transfer queues."""
+"""Requests a server cannot serve are refused at admission, before any queue."""
 
 import unittest
 from http import HTTPStatus
@@ -11,6 +11,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers import scheduler as scheduler_module
 from sglang.srt.managers.scheduler import Scheduler
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -71,6 +72,39 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                     [req], False
                 )
                 scheduler._add_request_to_queue.assert_not_called()
+
+
+class TestPromptLogprobRefusal(CustomTestCase):
+    def test_decoder_replay_refuses_prompt_logprobs_at_admission(self):
+        """Decoder SWA bounded replay never computes most prompt rows in its late
+        layers; a prompt-logprob request must fail alone, not raise in the scheduler."""
+        prompt = list(range(10))
+
+        def refusal(start, *, replay=False, mlx=False, logprob=True):
+            req = SimpleNamespace(
+                return_logprob=logprob, logprob_start_len=start, origin_input_ids=prompt
+            )
+            exec_ = SimpleNamespace(
+                features=SimpleNamespace(enable_decoder_swa_bounded_replay=replay)
+            )
+            with (
+                patch.object(scheduler_module, "get_exec", return_value=exec_),
+                patch.object(
+                    scheduler_module,
+                    "get_device",
+                    return_value=SimpleNamespace(mlx_enable_sampling=mlx),
+                ),
+            ):
+                return scheduler_module.prompt_logprob_refusal(req)
+
+        self.assertIn("decoder SWA bounded replay", refusal(0, replay=True))
+        self.assertIn("decoder SWA bounded replay", refusal(9, replay=True))
+        self.assertIn("MLX", refusal(0, mlx=True))
+        # Output-only logprobs (start at the prompt end) and no logprobs pass.
+        self.assertIsNone(refusal(len(prompt), replay=True))
+        self.assertIsNone(refusal(-1, replay=True))
+        self.assertIsNone(refusal(0, replay=True, logprob=False))
+        self.assertIsNone(refusal(0, replay=False))
 
 
 if __name__ == "__main__":
