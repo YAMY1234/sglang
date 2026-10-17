@@ -1,7 +1,84 @@
 """Opt-in Flash-Next boundary protocol; no factor arithmetic or transactions."""
 import copy
+import logging
+import os
 
 from sglang.srt.runtime_context import get_disagg
+
+logger = logging.getLogger(__name__)
+_ASYNC = None
+
+
+def boundary_async():
+    """SGLANG_GDN_PD_BOUNDARY_ASYNC=off|concurrent (docs/233 P6); read once."""
+    global _ASYNC
+    if _ASYNC is None:
+        value = os.environ.get("SGLANG_GDN_PD_BOUNDARY_ASYNC", "off")
+        if value not in ("off", "concurrent"):
+            raise ValueError(f"SGLANG_GDN_PD_BOUNDARY_ASYNC={value!r}")
+        _ASYNC = value == "concurrent"
+        if _ASYNC:
+            logger.info("PD_BOUNDARY_ASYNC_ACTIVE scheduler: slot-reuse events replace the PREBUILT stream fence")
+    return _ASYNC
+
+
+def note_preallocated(scheduler, decode_reqs):
+    """Concurrent boundary: remember what the reused slots' previous occupants
+    may still have in flight. Every forward that could touch a freed row was
+    launched before this allocation; an event on forward_stream now covers it."""
+    if not decode_reqs or not boundary_async():
+        return
+    import torch
+
+    event = torch.cuda.Event()
+    event.record(scheduler.forward_stream)
+    for decode_req in decode_reqs:
+        decode_req.req.flashnext_slot_reuse_event = event
+
+
+def prebuilt_fence(scheduler, requests):
+    """Stock: drain forward_stream before a prebuilt request seeds a reused row.
+    Concurrent boundary: wait only for the events recorded when those rows were
+    preallocated (falls back to the stock fence for any request without one)."""
+    if not boundary_async():
+        scheduler.schedule_stream.wait_stream(scheduler.forward_stream)
+        return
+    events = [getattr(req, "flashnext_slot_reuse_event", None) for req in requests]
+    pending = bool(requests) and all(
+        getattr(req, "flashnext_pd_boundary_pending", False) for req in requests
+    )
+    # The admission counter advances identically on every TP rank (same
+    # scheduling decisions), so all ranks pick the same boundary path.
+    use = pending and _ab_concurrent() and all(e is not None for e in events)
+    for req in requests:
+        req.flashnext_slot_reuse_event = None  # one admission per allocation
+        req.flashnext_boundary_concurrent = use
+    if use:
+        for event in {id(e): e for e in events}.values():
+            scheduler.schedule_stream.wait_event(event)
+        return
+    scheduler.schedule_stream.wait_stream(scheduler.forward_stream)
+
+
+_AB = None
+_admissions = 0
+
+
+def _ab_concurrent():
+    """SGLANG_GDN_PD_BOUNDARY_AB=alternate:<K> (docs/233 §4 A/B): boundary
+    admissions alternate serial / concurrent, parity swapped after K
+    admissions. Unset: every boundary admission is concurrent."""
+    global _AB, _admissions
+    if _AB is None:
+        value = os.environ.get("SGLANG_GDN_PD_BOUNDARY_AB", "")
+        _AB = int(value.split(":", 1)[1]) if value.startswith("alternate:") else -1
+        if value and _AB < 0:
+            raise ValueError(f"SGLANG_GDN_PD_BOUNDARY_AB={value!r}")
+    n = _admissions
+    _admissions += 1
+    if _AB < 0:
+        return True
+    return (n % 2 == 0) != (n >= _AB)
 
 
 def enabled(model_config):
@@ -35,6 +112,8 @@ def complete_prebuilt(scheduler, batch):
     # PREBUILT batch. Boundary MoE layers use the same DP collectives as decode;
     # their counts must be gathered before any rank enters the deep layers.
     dp_boundary = enabled(scheduler.model_config) and scheduler.dp_attn_adapter.ps.attn_dp_size > 1
+    if dp_boundary and boundary_async():
+        raise ValueError("concurrent PD boundary (docs/233) supports attention DP 1 only")
     work = batch if pending else None
     if dp_boundary:
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
