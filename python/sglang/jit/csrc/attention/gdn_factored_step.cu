@@ -57,30 +57,6 @@ __device__ __forceinline__ uint4 pack_half(const float (&v)[8]) {
            (unsigned(__half_as_ushort(__float2half_rn(v[2*i+1]))) << 16);
   return make_uint4(z[0], z[1], z[2], z[3]);
 }
-// Factor storage (docs/219 fp32-factor arm C+f32x): FT = __half (the K1 kernel, unchanged instruction sequence) or
-// float.  A thread owns 8 consecutive columns of a factor row: one 128-bit word at fp16, two at fp32.
-template<typename FT> struct Frag;
-template<> struct Frag<__half> {
-  uint4 v;
-  __device__ __forceinline__ void load(const __half* p) { v = load128(p); }
-  __device__ __forceinline__ float at(int i) const { return half_at(v, i); }
-};
-template<> struct Frag<float> {
-  uint4 lo, hi;
-  __device__ __forceinline__ void load(const float* p) { lo = load128(p); hi = load128(p + 4); }
-  __device__ __forceinline__ float at(int i) const {
-    const uint4& q = i < 4 ? lo : hi;
-    int j = i & 3;
-    return __uint_as_float(j == 0 ? q.x : j == 1 ? q.y : j == 2 ? q.z : q.w);
-  }
-};
-__device__ __forceinline__ void store8(__half* p, const float (&v)[8]) {
-  *reinterpret_cast<uint4*>(p) = pack_half(v);
-}
-__device__ __forceinline__ void store8(float* p, const float (&v)[8]) {
-  reinterpret_cast<float4*>(p)[0] = make_float4(v[0], v[1], v[2], v[3]);
-  reinterpret_cast<float4*>(p)[1] = make_float4(v[4], v[5], v[6], v[7]);
-}
 __device__ __forceinline__ uint4 pack_bf(const float (&v)[8]) {
   unsigned z[4];
   #pragma unroll
@@ -161,11 +137,11 @@ __device__ __forceinline__ void norm_gate(const float (&oval)[8], int col,
   *reinterpret_cast<uint2*>(out + col) = make_uint2(packed[0],packed[1]);
 }
 
-template<typename BiasT, bool INVALIDATE, bool NORM, typename FT>
+template<typename BiasT, bool INVALIDATE, bool NORM>
 __global__ __launch_bounds__(128, 4) void factored_step_r32_kernel(
     const __nv_bfloat16* mixed, const __nv_bfloat16* ag, const __nv_bfloat16* bg,
     const float* alog, const BiasT* bias, const float* vb,
-    float* fa, FT* fu, FT* fw, int* fc, int* stale,
+    float* fa, __half* fu, __half* fw, int* fc, int* stale,
     const void* idx, bool idx64, __nv_bfloat16* out, int* pv,
     int H, int HV, int64_t sm, int64_t sa, int64_t sb, int64_t si, float scale, float eps,
     const __nv_bfloat16* z, const __nv_bfloat16* norm_weight, float norm_eps,
@@ -210,7 +186,224 @@ __global__ __launch_bounds__(128, 4) void factored_step_r32_kernel(
   int64_t sh = slot * HV + hv;
   const __nv_bfloat16* inp = mixed + n * sm;
   // All physical factor rows are loaded before count-dependent selections.
-  Frag<FT> uraw[NR], wraw[NR];
+  uint4 uraw[NR], wraw[NR];
+  #pragma unroll
+  for (int j = 0; j < NR; ++j) {
+    int row = 2 * (NW * j + warp) + parity;
+    uraw[j] = load128(fu + sh * 32 * D + row * D + col);
+    wraw[j] = load128(fw + sh * 32 * D + row * D + col);
+  }
+  uint4 qr = load128(inp + h * D + col);
+  uint4 kr = load128(inp + H * D + h * D + col);
+  uint4 vr = load128(inp + 2 * H * D + hv * D + col);
+  float4 ar0 = {}, ar1 = {};
+  // Only warp 0 reads/writes the sink. Its shuffle reductions join all sink
+  // readers before the store; other warps cannot race this in-place update.
+  if (warp == 0) {
+    ar0 = *reinterpret_cast<const float4*>(fa + sh * D + col);
+    ar1 = *reinterpret_cast<const float4*>(fa + sh * D + col + 4);
+  }
+  float4 vb0 = *reinterpret_cast<const float4*>(vb + hv * D + col);
+  float4 vb1 = *reinterpret_cast<const float4*>(vb + hv * D + col + 4);
+  float av = __bfloat162float(ag[n * sa + hv]);
+  float bv = __bfloat162float(bg[n * sb + hv]);
+  float al = alog[hv], db = bias_float(bias[hv]);
+  int cnt = fc[sh];
+  float U[NR][8];
+  #pragma unroll
+  for (int j = 0; j < NR; ++j) {
+    int row = 2 * (NW * j + warp) + parity;
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) U[j][k] = row < cnt ? half_at(uraw[j], k) : 0.f;
+  }
+  float q[8], kn[8], qn[8];
+  bf8(qr, q); bf8(kr, kn);
+  float qnorm = sq(dot(q,q) + 1.e-6f), knorm = sq(dot(kn,kn) + 1.e-6f);
+  #pragma unroll
+  for (int k = 0; k < 8; ++k) { qn[k] = div_full(q[k], qnorm) * scale; kn[k] = div_full(kn[k], knorm); }
+  float gt, beta;
+  gate(av, bv, al, db, gt, beta);
+  float sink = 0.f;
+  if (warp == 0) {
+    float avec[8] = {ar0.x,ar0.y,ar0.z,ar0.w,ar1.x,ar1.y,ar1.z,ar1.w};
+    float ka = dot(kn, avec);
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) avec[k] = gt * (avec[k] - beta * kn[k] * ka) + beta * kn[k];
+    sink = dot(avec, qn);
+    if (lane < 16) {
+      *reinterpret_cast<float4*>(fa + sh * D + col) = make_float4(avec[0],avec[1],avec[2],avec[3]);
+      *reinterpret_cast<float4*>(fa + sh * D + col + 4) = make_float4(avec[4],avec[5],avec[6],avec[7]);
+    }
+  }
+  float c[NR], cq[NR], partial[8] = {};
+  #pragma unroll
+  for (int j = 0; j < NR; ++j) {
+    c[j] = dot(U[j], kn);
+    cq[j] = dot(U[j], qn);
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) partial[k] += U[j][k] * c[j];
+  }
+  __shared__ float kp0[NW][D], kp1[NW][D], mv_s[NW][D], wq_s[NW][D], cd_s[NW];
+  #pragma unroll
+  for (int k = 0; k < 8; ++k) {
+    float x = partial[k] + __shfl_xor_sync(0xffffffff, partial[k], 16);
+    if (lane < 16) kp0[warp][col+k] = x;
+  }
+  __syncthreads();
+  float kp[8];
+  #pragma unroll
+  for (int k = 0; k < 8; ++k)
+    kp[k] = kn[k] - ((kp0[0][col+k]+kp0[1][col+k])+(kp0[2][col+k]+kp0[3][col+k]));
+  float nrm2 = dot(kp,kp);
+  if (nrm2 < .25f) {
+    float p2[8] = {};
+    #pragma unroll
+    for (int j = 0; j < NR; ++j) {
+      float c2 = dot(U[j],kp); c[j] += c2;
+      #pragma unroll
+      for (int k = 0; k < 8; ++k) p2[k] += U[j][k] * c2;
+    }
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      float x = p2[k] + __shfl_xor_sync(0xffffffff,p2[k],16);
+      if (lane < 16) kp1[warp][col+k] = x;
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int k = 0; k < 8; ++k)
+      kp[k] -= (kp1[0][col+k]+kp1[1][col+k])+(kp1[2][col+k]+kp1[3][col+k]);
+    nrm2 = dot(kp,kp);
+  }
+  float nrm = sq(nrm2), khat[8];
+  bool keep = nrm > eps;
+  #pragma unroll
+  for (int k = 0; k < 8; ++k) khat[k] = keep ? div_full(kp[k], fmaxf(nrm,eps)) : 0.f;
+  float clast = keep ? nrm : 0.f, kq = dot(khat,qn);
+  float mv[8] = {}, wq[8] = {}, cf[NR], cd = 0.f;
+  #pragma unroll
+  for (int j = 0; j < NR; ++j) {
+    int row = 2 * (NW * j + warp) + parity;
+    cf[j] = row == cnt ? clast : c[j];
+    cq[j] += row == cnt ? kq : 0.f;
+    cd += cf[j] * cq[j];
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      float w = row < cnt ? half_at(wraw[j],k) : 0.f;
+      mv[k] += w * c[j]; wq[k] += w * cq[j];
+    }
+  }
+  #pragma unroll
+  for (int k = 0; k < 8; ++k) {
+    float m = mv[k] + __shfl_xor_sync(0xffffffff,mv[k],16);
+    float w = wq[k] + __shfl_xor_sync(0xffffffff,wq[k],16);
+    if (lane < 16) { mv_s[warp][col+k]=m; wq_s[warp][col+k]=w; }
+  }
+  cd += __shfl_xor_sync(0xffffffff,cd,16);
+  if (lane == 0) cd_s[warp]=cd;
+  __syncthreads();
+  float cd_all = (cd_s[0]+cd_s[1])+(cd_s[2]+cd_s[3]);
+  float delta[8], oval[8];
+  float vbv[8] = {vb0.x,vb0.y,vb0.z,vb0.w,vb1.x,vb1.y,vb1.z,vb1.w};
+  float v[8]; bf8(vr,v);
+  #pragma unroll
+  for (int k = 0; k < 8; ++k) {
+    float m = (mv_s[0][col+k]+mv_s[1][col+k])+(mv_s[2][col+k]+mv_s[3][col+k]);
+    float w = (wq_s[0][col+k]+wq_s[1][col+k])+(wq_s[2][col+k]+wq_s[3][col+k]);
+    delta[k] = beta * ((v[k]-vbv[k])-gt*m);
+    oval[k] = (vbv[k]*sink+gt*w)+delta[k]*cd_all;
+  }
+  #pragma unroll
+  for (int j = 0; j < NR; ++j) {
+    int row = 2 * (NW * j + warp) + parity;
+    if (row <= cnt) {
+      float nw[8];
+      #pragma unroll
+      for (int k = 0; k < 8; ++k) nw[k] = gt * (row < cnt ? half_at(wraw[j],k) : 0.f) + cf[j]*delta[k];
+      *reinterpret_cast<uint4*>(fw + sh*32*D + row*D + col) = pack_half(nw);
+    }
+    if (row == cnt && cnt < 32)
+      *reinterpret_cast<uint4*>(fu + sh*32*D + row*D + col) = pack_half(khat);
+  }
+  if constexpr (NORM) {
+    if (warp == 0) {
+      asm volatile("cp.async.wait_group 0;" ::: "memory");
+      __syncwarp();
+      norm_gate<true>(oval, col, norm_z, norm_w, norm_eps, out + (int64_t(n)*HV+hv)*D);
+    }
+  } else {
+    if (warp == 0 && lane < 16)
+      *reinterpret_cast<uint4*>(out + (int64_t(n)*HV+hv)*D + col) = pack_bf(oval);
+  }
+  if (tid == 0) { fc[sh]=cnt+1; stale[slot]=1; }
+}
+
+// docs/219 fp32-factor arm (C+f32x): the same kernel with fp32 U / W storage (SGLANG_GDN_FACTORED_CUDA_FP32=1).
+// A copy, so the fp16 kernel above keeps its source and instruction sequence.  Each thread owns 8 consecutive columns of
+// a factor row: two 128-bit words instead of one; fp32 stores (no fp16 rounding); arithmetic and order unchanged.
+struct F32Frag {
+  uint4 lo, hi;
+  __device__ __forceinline__ void load(const float* p) { lo = load128(p); hi = load128(p + 4); }
+  __device__ __forceinline__ float at(int i) const {
+    const uint4& q = i < 4 ? lo : hi;
+    int j = i & 3;
+    return __uint_as_float(j == 0 ? q.x : j == 1 ? q.y : j == 2 ? q.z : q.w);
+  }
+};
+__device__ __forceinline__ void store8(float* p, const float (&v)[8]) {
+  reinterpret_cast<float4*>(p)[0] = make_float4(v[0], v[1], v[2], v[3]);
+  reinterpret_cast<float4*>(p)[1] = make_float4(v[4], v[5], v[6], v[7]);
+}
+
+template<typename BiasT, bool INVALIDATE, bool NORM>
+__global__ __launch_bounds__(128, 4) void factored_step_r32_f32_kernel(
+    const __nv_bfloat16* mixed, const __nv_bfloat16* ag, const __nv_bfloat16* bg,
+    const float* alog, const BiasT* bias, const float* vb,
+    float* fa, float* fu, float* fw, int* fc, int* stale,
+    const void* idx, bool idx64, __nv_bfloat16* out, int* pv,
+    int H, int HV, int64_t sm, int64_t sa, int64_t sb, int64_t si, float scale, float eps,
+    const __nv_bfloat16* z, const __nv_bfloat16* norm_weight, float norm_eps,
+    int sz_token, int sz_head) {
+  int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  int col = (lane & 15) * 8, parity = lane >> 4;
+  int n = blockIdx.x / HV, hv = blockIdx.x % HV, h = hv / (HV / H);
+  int64_t slot = idx64 ? static_cast<const int64_t*>(idx)[n * si] :
+                        static_cast<const int*>(idx)[n * si];
+  if constexpr (INVALIDATE) {
+    if (tid == 0 && hv == 0) pv[slot < 0 ? 0 : slot] = 0;
+  }
+  if (slot < 0) {
+    if constexpr (NORM) {
+      if (warp == 0) {
+        float zero[8] = {};
+        norm_gate(zero, col, z + (n*sz_token + hv*sz_head), norm_weight, norm_eps,
+                  out + (int64_t(n)*HV+hv)*D);
+      }
+    } else {
+      if (tid < 16) reinterpret_cast<uint4*>(out + (int64_t(n) * HV + hv) * D)[tid] = make_uint4(0,0,0,0);
+    }
+    // Only the first 16 uint4 vectors belong to this 128-element output.
+    return;
+  }
+  // Immutable z/weight are staged by warp 0 while K1 performs its recurrence.
+  // Only warp 0 reads these slabs. wait_group + syncwarp below publishes all
+  // sixteen writers to both half-warp readers, with no new CTA barrier.
+  __shared__ __align__(16) __nv_bfloat16 norm_z[D], norm_w[D];
+  if constexpr (NORM) {
+    if (warp == 0) {
+      if (lane < 16) {
+        unsigned zs = __cvta_generic_to_shared(norm_z + col);
+        unsigned ws = __cvta_generic_to_shared(norm_w + col);
+        const __nv_bfloat16* zg = z + (n*sz_token + hv*sz_head) + col;
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(zs), "l"(zg) : "memory");
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(ws), "l"(norm_weight + col) : "memory");
+      }
+      asm volatile("cp.async.commit_group;" ::: "memory");
+    }
+  }
+  int64_t sh = slot * HV + hv;
+  const __nv_bfloat16* inp = mixed + n * sm;
+  // All physical factor rows are loaded before count-dependent selections.
+  F32Frag uraw[NR], wraw[NR];
   #pragma unroll
   for (int j = 0; j < NR; ++j) {
     int row = 2 * (NW * j + warp) + parity;
@@ -402,14 +595,12 @@ void factored_step_r32(torch::Tensor mixed,torch::Tensor ag,torch::Tensor bg,
     TORCH_CHECK(norm_eps>0 && std::isfinite(norm_eps));
   }
   auto stream=at::cuda::getCurrentCUDAStream();
-  bool f32 = fu.scalar_type()==at::kFloat;
-  auto launch_ft=[&](auto flag, auto norm_flag, auto bias_value, auto factor_value) {
+  auto launch=[&](auto flag, auto norm_flag, auto bias_value) {
     using BiasT = decltype(bias_value);
-    using FT = decltype(factor_value);
-    factored_step_r32_kernel<BiasT, decltype(flag)::value, decltype(norm_flag)::value, FT><<<B*HV,128,0,stream>>>(
+    factored_step_r32_kernel<BiasT, decltype(flag)::value, decltype(norm_flag)::value><<<B*HV,128,0,stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(mixed.data_ptr()),reinterpret_cast<const __nv_bfloat16*>(ag.data_ptr()),
       reinterpret_cast<const __nv_bfloat16*>(bg.data_ptr()),alog.data_ptr<float>(),reinterpret_cast<const BiasT*>(bias.data_ptr()),vb.data_ptr<float>(),
-      fa.data_ptr<float>(),reinterpret_cast<FT*>(fu.data_ptr()),reinterpret_cast<FT*>(fw.data_ptr()),
+      fa.data_ptr<float>(),reinterpret_cast<__half*>(fu.data_ptr()),reinterpret_cast<__half*>(fw.data_ptr()),
       fc.data_ptr<int>(),stale.data_ptr<int>(),idx.data_ptr(),idx.scalar_type()==at::kLong,
       reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),invalidate?pv->data_ptr<int>():nullptr,
       H,HV,mixed.stride(0),ag.stride(0),bg.stride(0),idx.stride(0),float(scale),float(eps),
@@ -417,11 +608,30 @@ void factored_step_r32(torch::Tensor mixed,torch::Tensor ag,torch::Tensor bg,
       norm?reinterpret_cast<const __nv_bfloat16*>(norm_weight->data_ptr()):nullptr,float(norm_eps),
       norm?int(z->stride(0)):0,norm?int(z->stride(1)):0);
   };
-  auto launch=[&](auto flag, auto norm_flag, auto bias_value) {
-    if(f32) launch_ft(flag, norm_flag, bias_value, float{});
-    else launch_ft(flag, norm_flag, bias_value, __half{});
+  auto launch_f32=[&](auto flag, auto norm_flag, auto bias_value) {
+    using BiasT = decltype(bias_value);
+    factored_step_r32_f32_kernel<BiasT, decltype(flag)::value, decltype(norm_flag)::value><<<B*HV,128,0,stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(mixed.data_ptr()),reinterpret_cast<const __nv_bfloat16*>(ag.data_ptr()),
+      reinterpret_cast<const __nv_bfloat16*>(bg.data_ptr()),alog.data_ptr<float>(),reinterpret_cast<const BiasT*>(bias.data_ptr()),vb.data_ptr<float>(),
+      fa.data_ptr<float>(),fu.data_ptr<float>(),fw.data_ptr<float>(),
+      fc.data_ptr<int>(),stale.data_ptr<int>(),idx.data_ptr(),idx.scalar_type()==at::kLong,
+      reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),invalidate?pv->data_ptr<int>():nullptr,
+      H,HV,mixed.stride(0),ag.stride(0),bg.stride(0),idx.stride(0),float(scale),float(eps),
+      norm?reinterpret_cast<const __nv_bfloat16*>(z->data_ptr()):nullptr,
+      norm?reinterpret_cast<const __nv_bfloat16*>(norm_weight->data_ptr()):nullptr,float(norm_eps),
+      norm?int(z->stride(0)):0,norm?int(z->stride(1)):0);
   };
   auto dispatch=[&](auto bias_value) {
+    if(fu.scalar_type()==at::kFloat) {
+      if(norm) {
+        if(invalidate) launch_f32(std::true_type{}, std::true_type{}, bias_value);
+        else launch_f32(std::false_type{}, std::true_type{}, bias_value);
+      } else {
+        if(invalidate) launch_f32(std::true_type{}, std::false_type{}, bias_value);
+        else launch_f32(std::false_type{}, std::false_type{}, bias_value);
+      }
+      return;
+    }
     if(norm) {
       if(invalidate) launch(std::true_type{}, std::true_type{}, bias_value);
       else launch(std::false_type{}, std::true_type{}, bias_value);
