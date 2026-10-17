@@ -1024,6 +1024,8 @@ def factored_packed_decode(
         out = mixed_qkv.new_empty(B, 1, HV, V)
     assert out.is_contiguous()
     kernel = kernel or DEFAULT_KERNEL
+    if norm_weight is not None:
+        assert z is not None and kernel == "split", "P4 norm requires the split step and z"
     iters = trunc_iters or TRUNC_ITERS
     if invalidate:
         assert prefix_valid is not None and prefix_valid.is_contiguous() and prefix_valid.ndim == 1
@@ -1079,6 +1081,10 @@ def factored_packed_decode(
         assert z is not None and cuda_ext is not None, "P4 norm requires the qualified CUDA step"
         assert kernel == "split", "P4 norm requires the split step"
     if cuda_ext is not None:
+        if fuse_norm and "NORM" not in _STEP_FEATURE_LOGGED:
+            _STEP_FEATURE_LOGGED.add("NORM")
+            import logging
+            logging.getLogger(__name__).info("FACTORED_STEP_FUSE_NORM_ACTIVE gate=sigmoid batch=%d hv=%d", B, HV)
         if "CUDA" not in _STEP_FEATURE_LOGGED:
             _STEP_FEATURE_LOGGED.add("CUDA")
             import logging
