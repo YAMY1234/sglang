@@ -1,9 +1,16 @@
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
+from sglang.srt.layers import logits_processor
+from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
+from sglang.srt.speculative.dspark_components.dspark_local_argmax import (
+    unsupported_reason,
+)
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
@@ -130,6 +137,147 @@ class TestAcceptTailParity(CustomTestCase):
                         None if simulated is None else torch.tensor([simulated])
                     )
                     self._run(simulated_correct_len, verify_lens)
+
+
+class _FakeSink:
+    """A LocalArgmaxSink that forked with ``ids``; counts joins."""
+
+    def __init__(self, ids):
+        self.ids = ids
+        self.joins = 0
+
+    @property
+    def pending(self) -> bool:
+        return self.ids is not None
+
+    def supports(self, local_logits, *, vocab_size) -> bool:
+        return True
+
+    def join(self) -> None:
+        self.joins += 1
+        self.ids = None
+
+
+class TestStaticGreedyArgmaxIds(CustomTestCase):
+    def setUp(self):
+        self.addCleanup(logits_processor.set_local_argmax_sink, None)
+
+    def _capture(self, *, ids, logits, draft_worker=False):
+        candidates, _, prefix_lens = _greedy_inputs()
+        sink = _FakeSink(ids)
+        epilogue = DsparkVerifyEpilogue(
+            max_bs=BS,
+            verify_num_draft_tokens=STRIDE,
+            device="cpu",
+            tp_sync=_RecordingTpSync(),
+            local_argmax=sink,
+        )
+        runner = SimpleNamespace(
+            model_runner=SimpleNamespace(is_draft_worker=draft_worker),
+            ragged_verify_mode=None,
+        )
+        out = LogitsProcessorOutput(
+            next_token_logits=logits, hidden_states=torch.zeros(BS * STRIDE, 4)
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            batch_size=BS,
+            input_ids=candidates.reshape(-1),
+            seq_lens=prefix_lens,
+        )
+        epilogue.capture_hook(runner, out, forward_batch, BS * STRIDE)
+        return epilogue.read_accept(BS), sink
+
+    def test_accept_reads_the_exchange_ids(self):
+        """With the gather skipped the full logits are stale; the accept must follow
+        the exchange ids when they cover every verify row, the logits otherwise, and
+        the capture tail must join the sink's stream either way."""
+        _, logits, _ = _greedy_inputs()
+        want, _ = self._capture(ids=None, logits=logits)
+        ids = logits.argmax(dim=1)
+        stale = torch.randn_like(logits)
+        got, sink = self._capture(ids=ids, logits=stale)
+        self.assertEqual(sink.joins, 1)
+        for field in want.__struct_fields__:
+            self.assertTrue(torch.equal(getattr(got, field), getattr(want, field)))
+        # Ids of another row count (an unsupported capture) leave the logits in charge.
+        got, sink = self._capture(ids=ids[:-1], logits=logits)
+        self.assertEqual(sink.joins, 1)
+        self.assertTrue(torch.equal(got.out_tokens, want.out_tokens))
+        # A capture tail that returns early still joins.
+        _, sink = self._capture(ids=ids, logits=stale, draft_worker=True)
+        self.assertEqual(sink.joins, 1)
+
+
+class TestLocalArgmaxEligibility(CustomTestCase):
+    def test_unsupported_configurations(self):
+        for capability in ((10, 0), (10, 3)):
+            for world in (2, 4, 8):
+                self.assertIsNone(
+                    unsupported_reason(
+                        world=world, vocab_size=129_280, capability=capability
+                    )
+                )
+        # The key's 17-bit index field holds 2**17 columns.
+        self.assertIsNone(
+            unsupported_reason(world=4, vocab_size=1 << 17, capability=(10, 3))
+        )
+        for world, vocab_size, capability in (
+            (1, 129_280, (10, 3)),
+            (16, 129_280, (10, 3)),
+            (4, 129_280, (9, 0)),
+            (4, 129_280, (12, 0)),
+            (4, (1 << 17) + 1, (10, 3)),
+        ):
+            self.assertIsNotNone(
+                unsupported_reason(
+                    world=world, vocab_size=vocab_size, capability=capability
+                ),
+                (world, vocab_size, capability),
+            )
+
+    def test_sink_serves_only_target_verify_capture(self):
+        """The sink forks only inside a target-verify graph capture over a plain
+        vocab-parallel TP gather; eager warm-up and other LM-head layouts keep the
+        stock gather."""
+        processor = LogitsProcessor.__new__(LogitsProcessor)
+        torch.nn.Module.__init__(processor)
+        processor.vocab_size = 64
+        processor.do_tensor_parallel_all_gather = True
+        processor.do_tensor_parallel_all_gather_dp_attn = False
+        processor.use_attn_tp_group = False
+        processor.use_tp_lm_head_all_to_all = False
+        processor.final_logit_softcapping = None
+        sink = _FakeSink(None)
+        logits_processor.set_local_argmax_sink(sink)
+        self.addCleanup(logits_processor.set_local_argmax_sink, None)
+        logits = torch.zeros(4, 16)
+
+        def selected(mode=ForwardMode.TARGET_VERIFY, capturing=True, **fields):
+            for name, value in fields.items():
+                setattr(processor, name, value)
+            try:
+                with mock.patch.object(
+                    torch.cuda, "is_current_stream_capturing", return_value=capturing
+                ):
+                    return processor._local_argmax_sink_for(
+                        logits, SimpleNamespace(forward_mode=mode)
+                    )
+            finally:
+                processor.do_tensor_parallel_all_gather = True
+                processor.do_tensor_parallel_all_gather_dp_attn = False
+                processor.use_attn_tp_group = False
+                processor.use_tp_lm_head_all_to_all = False
+                processor.final_logit_softcapping = None
+
+        self.assertIs(selected(), sink)
+        self.assertIsNone(selected(capturing=False))
+        self.assertIsNone(selected(mode=ForwardMode.DECODE))
+        self.assertIsNone(selected(do_tensor_parallel_all_gather=False))
+        self.assertIsNone(selected(do_tensor_parallel_all_gather_dp_attn=True))
+        self.assertIsNone(selected(use_attn_tp_group=True))
+        self.assertIsNone(selected(use_tp_lm_head_all_to_all=True))
+        self.assertIsNone(selected(final_logit_softcapping=30.0))
 
 
 if __name__ == "__main__":

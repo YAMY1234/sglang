@@ -163,6 +163,53 @@ def test_symm_mem_all_gather(
         torch.testing.assert_close(out, ref, atol=0, rtol=0)
 
 
+@torch.inference_mode()
+def test_symm_mem_all_gather_enable_flag() -> None:
+    """A zero enable flag on every rank skips the gather, barriers included, so the
+    buffer keeps its contents and the next enabled gather neither hangs nor differs;
+    alternation is replayed from one CUDA graph."""
+    nccl_group = _init_nccl_group_once()
+    state = _init_state_once()
+    world_size = state.world_size
+    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+    if state.symm_mem_hdl.multicast_ptr == 0:
+        pytest.skip(f"multimem multicast unavailable for world_size={world_size}")
+    hidden, num_tokens = MAX_HIDDEN, MAX_TOKENS
+    x = torch.zeros(
+        num_tokens, hidden // world_size, dtype=torch.bfloat16, device=device
+    )
+    enable = torch.ones((1,), dtype=torch.int32, device=device)
+    out = state.comm_buff[:num_tokens, :hidden]
+    # Compile the predicated variant outside capture (a skipped launch).
+    enable.zero_()
+    all_gather_inner(
+        state, x, tp_hidden_dim=hidden, skip_entry_sync=True, safe=False, enable=enable
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        all_gather_inner(
+            state,
+            x,
+            tp_hidden_dim=hidden,
+            skip_entry_sync=True,
+            safe=False,
+            enable=enable,
+        )
+    for step in range(TEST_LOOP):
+        dist.barrier(nccl_group)
+        x.copy_(torch.randn_like(x))
+        enable.fill_(step % 2)
+        before = out.clone()
+        dist.barrier(nccl_group)
+        graph.replay()
+        torch.cuda.synchronize()
+        if step % 2:
+            ref = _nccl_all_gather(x, nccl_group, world_size)
+            torch.testing.assert_close(out, ref, atol=0, rtol=0)
+        else:
+            torch.testing.assert_close(out, before, atol=0, rtol=0)
+
+
 if __name__ == "__main__":
     # multimem multicast needs world_size in {4, 6, 8} (cc9) or {6, 8} (cc10);
     # unsupported sizes self-skip via the multicast_ptr guard above.
