@@ -6,7 +6,9 @@ import os
 
 # docs/231: only timed buckets meeting the unchanged >=1 us/layer gate.
 # This filters norm fusion, independently of the wider K1 CUDA whitelist.
-QUALIFIED_NORM_BATCHES = {24: frozenset((1, 2, 4, 8)), 48: frozenset((1, 2, 3))}
+# docs/219 lead 01:14 / 01:27 (v10): HV24 admitted buckets {1, 4} by the served A/B (np4ab-043542 bucket 1,
+# np4ab-051459 bucket 4); 2 / 8 not admitted (no certificate in two loads).
+QUALIFIED_NORM_BATCHES = {24: frozenset((1, 4)), 48: frozenset((1, 2, 3))}
 
 
 def enabled():

@@ -62,12 +62,12 @@ class FusionPromiseTest(unittest.TestCase):
     def test_tp2_all_and_only_qualified_buckets(self):
         for b in range(1,13):
             self.x, self.z = Tensor((b,5120)), Tensor((b,24,128))
-            self.assertEqual(self.promise(),b in (1,2,4,8))
+            self.assertEqual(self.promise(),b in (1,4))
     def test_unadmitted_norm_buckets_keep_the_original_cuda_step(self):
         for b in range(1,9):
             self.x,self.z=Tensor((b,5120)),Tensor((b,24,128))
             self.assertTrue(m.cuda_step_eligible(self.gf,self.x,self.x,self.x,self.pool.U[0],self.pool.W[0]))
-            self.assertEqual(self.promise(),b in (1,2,4,8))
+            self.assertEqual(self.promise(),b in (1,4))
 
     def test_tp1_all_and_only_qualified_buckets(self):
         self.pool.U.shape=self.pool.W.shape=(36,9,48,32,128)
