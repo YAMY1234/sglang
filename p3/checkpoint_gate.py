@@ -95,9 +95,12 @@ def main():
             req.last_node = tree.root_node
             tree.inc_lock_ref(req.last_node)
             fb = w._forward_batch(req, tree=tree)
+            before = w.counters()
             w._run(fb)
             w.join()
             torch.cuda.synchronize()
+            after = w.counters()
+            assert after['fallbacks'] == before['fallbacks'], (before, after)
             depth = req.kv.mamba_last_track_seqlen
             keep = rp.get_mamba_ping_pong_keep_idx(req)
             slot = int(req.kv.mamba_ping_pong_track_buffer[keep])
@@ -130,6 +133,7 @@ def main():
                        cache_depth=depth, hit=hit, expected=expected,
                        old_checkpoint_bitwise=raw_equal, a_bitwise=a_equal,
                        count_bitwise=counts_equal, cache_store_bitwise=stored_equal,
+                       fallback_delta=after['fallbacks'] - before['fallbacks'],
                        shallow_encoding=fb.mamba_track_seqlens.cpu().tolist(),
                        deep_encoding=getattr(fb, '_pd_fulln_emitter_track_seqlens',
                                              fb.mamba_track_seqlens).cpu().tolist())
