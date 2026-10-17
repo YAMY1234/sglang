@@ -118,7 +118,12 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     CombineInput,
     DispatchOutput,
 )
-from sglang.srt.layers.moe.topk import BypassedTopKOutput, TopK, TopKOutputFormat
+from sglang.srt.layers.moe.topk import (
+    BypassedTopKOutput,
+    TopK,
+    TopKOutput,
+    TopKOutputFormat,
+)
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     adds_replicated_output_to_partial,
@@ -1080,7 +1085,13 @@ class DeepseekV2MoE(nn.Module):
         use_vision_topk: bool = False,
         return_moe_output: bool = False,
         leave_output_sum: bool = False,
+        *,
+        select_experts: Optional[Callable[..., TopKOutput]] = None,
+        run_routed_experts: Optional[Callable[..., torch.Tensor]] = None,
     ) -> Union[torch.Tensor, MoEOutput]:
+        """``select_experts`` replaces the top-k on this block's router logits and
+        ``run_routed_experts`` the routed-expert call, which must then return the
+        deferred-finalize output; the gate, streams and shared expert are unchanged."""
         # Note(kpham-sgl): issue order satisfies 3 constraints:
         # - no stream explosion: main (routed) issued before alt block -> capture reuses 1 alt stream;
         # - PDL overlap: routed is the last main-stream kernel (fuses w/ residual add);
@@ -1123,7 +1134,15 @@ class DeepseekV2MoE(nn.Module):
         else:
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
             router_logits_partials = None
-        if use_flashinfer_trtllm_bypass:
+        if select_experts is not None:
+            topk_output = select_experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                input_ids_global=input_ids_global,
+                num_token_non_padded=num_token_non_padded,
+                use_vision_topk=use_vision_topk,
+            )
+        elif use_flashinfer_trtllm_bypass:
             topk_output = BypassedTopKOutput(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
@@ -1161,7 +1180,7 @@ class DeepseekV2MoE(nn.Module):
                 )
                 ready = self.routed_quant_stream.record_event()
             routed_pre_quant_input = Mxfp8RoutedInputPreQuant(x_q, x_sf, ready)
-        deferred_finalize = (
+        deferred_finalize = run_routed_experts is not None or (
             has_shared_output
             and not self._shared_expert_tp1
             and topk_output.format == TopKOutputFormat.BYPASSED
@@ -1176,7 +1195,13 @@ class DeepseekV2MoE(nn.Module):
             return_moe_output
             and isinstance(self.experts.quant_method, Mxfp4FlashinferTrtllmMoEMethod)
         )
-        if deferred_finalize:
+        if run_routed_experts is not None:
+            final_hidden_states = run_routed_experts(
+                hidden_states=hidden_states,
+                topk_output=topk_output,
+                pre_quant_input=routed_pre_quant_input,
+            )
+        elif deferred_finalize:
             final_hidden_states = self.experts.forward_deferred_finalize(
                 hidden_states, topk_output, pre_quant_input=routed_pre_quant_input
             )
