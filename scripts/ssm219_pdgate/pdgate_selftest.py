@@ -526,6 +526,11 @@ def hjob_tests(tmp):
         shutil.copy(HERE / f, tools / f)
     (stub / "srun").write_text(STUB_SRUN)
     (stub / "srun").chmod(0o755)
+    # stub ss: STUB_SS_BUSY=N -> the first N queries per run report a TIME_WAIT socket, then free; "always" -> never free
+    (stub / "ss").write_text("#!/bin/bash\nc=$STUB_OUT/.ss_calls; n=$(cat $c 2>/dev/null || echo 0); echo $((n+1)) > $c\n"
+                             "case ${STUB_SS_BUSY:-0} in always) echo 'TIME-WAIT 0 0 127.0.0.1:65301 127.0.0.1:40000';; "
+                             "*) [ $n -lt ${STUB_SS_BUSY:-0} ] && echo 'TIME-WAIT 0 0 127.0.0.1:65301 127.0.0.1:40000';; esac\nexit 0\n")
+    (stub / "ss").chmod(0o755)
     (stub / "hlib.sh").write_text("W=/tmp; R=/tmp\nh_image() { echo IMG; }\nh_set() { echo $2; }\n")
     (stub / "Cplus.json").write_text(json.dumps({"seed": "x", "seed_MANIFEST_SHA256": "y", "cache_environment": {}}))
     (stub / "cache_seed_node.py").write_text(
@@ -563,6 +568,11 @@ def hjob_tests(tmp):
     check(rc == 0 and "PHASE before rc=0" in log and "PHASE cand1 rc=0" in log and "END rc=0" in log,
           f"hjob dry run: two phases, rc 0 ({dt:.0f} s)")
     check(summ.get("verdict", {}).get("cand1") == "PASS", "hjob dry run: summary verdict PASS from the stub lines")
+    rc, log, summ, dt = run("ports-wait", {"STUB_SS_BUSY": "8"})
+    check(rc == 0 and "ports clear before" in log and "PORTS-BUSY" not in log,
+          f"hjob ports: TIME_WAIT on the pair's ports -> waits, then runs ({dt:.0f} s)")
+    rc, log, summ, dt = run("ports-busy", {"STUB_SS_BUSY": "always", "PDGATE_PORT_WAIT_S": "12"})
+    check(rc == 11 and "PORTS-BUSY before before after" in log, "hjob ports: never free -> PORTS-BUSY rc 11 after the wait")
     rc, log, summ, dt = run("die", {"STUB_DIE": "cand1-D", "STUB_SLOW": "cand1"})
     check(rc == 10 and "SERVER-EXIT cand1" in log and dt < 100, f"hjob watchdog: D exits mid-phase -> rc 10 in {dt:.0f} s")
     if dt >= 100:

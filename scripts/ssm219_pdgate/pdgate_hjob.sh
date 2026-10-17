@@ -53,10 +53,19 @@ RC=0
 for ARM in $PHASES; do
   python3 $OUT/tools/pdgate_seed.py $OUT $ARM > $OUT/seed-$ARM.log 2>&1 || { log "SEED-FAIL $ARM $(tail -1 $OUT/seed-$ARM.log)"; RC=8; break; }
   gpu_idle || { log "GPUS-BUSY before $ARM"; RC=9; break; }
-  # the pair's ports must be free (a taken port fails the bind at random otherwise; WS-4 P6 10-17)
-  busy=$(python3 -c "import json;p=json.load(open('$OUT/plan.json'))['ports'];print(' '.join(str(v) for r in p.values() for v in r.values()))" \
-         | tr ' ' '\n' | while read q; do ss -Htan "sport = :$q" 2>/dev/null | grep -q . && echo $q; done | tr '\n' ' ')
-  [[ -z $busy ]] || { log "PORTS-BUSY before $ARM: $busy"; RC=11; break; }
+  # the pair's ports must be free (a taken port fails the bind at random otherwise; WS-4 P6 10-17).  The previous phase's
+  # own sockets sit in TIME_WAIT for ~60 s after its servers exit (4565xxx P6 / P3 died here, 10-17 06:39Z), so wait up
+  # to PDGATE_PORT_WAIT_S (180 s) for every state on the six ports to clear before declaring PORTS-BUSY
+  ports=$(python3 -c "import json;p=json.load(open('$OUT/plan.json'))['ports'];print(' '.join(str(v) for r in p.values() for v in r.values()))")
+  t1=$(date +%s)
+  while :; do
+    busy=$(for q in $ports; do ss -Htan "sport = :$q" 2>/dev/null | grep -q . && echo $q; done | tr '\n' ' ')
+    [[ -z ${busy// /} ]] && break
+    (( $(date +%s) - t1 >= ${PDGATE_PORT_WAIT_S:-180} )) && break
+    sleep 5
+  done
+  [[ -z ${busy// /} ]] || { log "PORTS-BUSY before $ARM after $(( $(date +%s) - t1 )) s: $busy $(ss -Htan 2>/dev/null | grep -E ":(${ports// /|}) " | awk '{print $1}' | sort | uniq -c | tr '\n' ' ')"; RC=11; break; }
+  (( $(date +%s) - t1 > 0 )) && log "ports clear before $ARM after $(( $(date +%s) - t1 )) s"
   log "PHASE $ARM start"
   SP=$(serve $ARM P); SD=$(serve $ARM D)
   client bash /out/tools/pdgate_phase.sh $ARM $BH > $OUT/phase-$ARM.log 2>&1 &
