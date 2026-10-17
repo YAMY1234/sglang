@@ -1,9 +1,10 @@
 """P4 capture-time promise: skip norm only when the exact CUDA route will fuse it."""
+import ast
 import importlib.util
 import os
 from pathlib import Path
 import sys
-from types import SimpleNamespace as NS
+from types import SimpleNamespace as NS, ModuleType
 import unittest
 from unittest.mock import patch
 import torch
@@ -85,6 +86,55 @@ class FusionPromiseTest(unittest.TestCase):
         for dtype in (torch.int32,torch.int64):
             self.assertEqual(m.cuda_step_eligible(self.gf,self.x,self.x,self.x,self.pool.U[0],self.pool.W[0],
                 invalidate=True,prefix_valid=Tensor((9,),dtype)),dtype==torch.int32)
+
+class ModelWiringTest(unittest.TestCase):
+    def test_both_served_model_forwards_apply_norm_exactly_once(self):
+        # Execute the repository's real forward bodies with CPU projection /
+        # attention doubles; imports/CUDA ops are outside this wiring test.
+        for file,cls in (('qwen3_next.py','Qwen3GatedDeltaNet'),
+                         ('qwen3_5.py','Qwen3_5GatedDeltaNet')):
+            tree=ast.parse((ROOT/'python/sglang/srt/models'/file).read_text())
+            node=next(x for x in tree.body if isinstance(x,ast.ClassDef) and x.name==cls)
+            fn=next(x for x in node.body if isinstance(x,ast.FunctionDef) and x.name=='forward')
+            fn.returns=None
+            for arg in fn.args.args: arg.annotation=None
+            program=ast.Module(body=[fn],type_ignores=[])
+            for fused in (False,True):
+                with self.subTest(model=cls,fused=fused):
+                    mixed=torch.ones(1,5120,dtype=torch.bfloat16)
+                    z=torch.ones(1,24,128,dtype=torch.bfloat16)
+                    a=b=torch.ones(1,24,dtype=torch.bfloat16)
+                    class Attn:
+                        def can_fuse_norm(self,*args): return fused
+                        def __call__(self,batch,**kwargs):
+                            self.kwargs=kwargs
+                            return z[None]*(2 if fused else 1)
+                    class Norm:
+                        weight=torch.ones(128,dtype=torch.bfloat16)
+                        eps=1e-6
+                        calls=0
+                        def __call__(self,x,z):
+                            self.calls+=1
+                            return x*2
+                    obj=NS(_forward_input_proj=lambda h:(h,h),num_v_heads=24,num_k_heads=8,
+                           attn_tp_size=1,head_k_dim=128,head_v_dim=128,attn=Attn(),norm=Norm(),
+                           out_proj=lambda x:(x,None))
+                    gl=dict(torch=torch,_is_cpu=False,_is_npu=False,_is_xpu=False,_is_cuda=True,
+                            _is_amx_available=False,_gdn_decode_fused_proj_conv=False,
+                            _GDN_FUSED_QKVZBA_RATIOS=(1,2,3,4),
+                            triton=NS(cdiv=lambda a,b:(a+b-1)//b))
+                    split=lambda *args:(mixed,z,b,a)
+                    gl.update(fused_qkvzba_split_reshape_cat=split,
+                              fused_qkvzba_split_reshape_cat_contiguous=split)
+                    exec(compile(ast.fix_missing_locations(program),file,'exec'),gl)
+                    batch=NS(forward_mode=NS(is_decode=lambda:True,is_extend_without_speculative=lambda:False))
+                    y=gl['forward'](obj,torch.ones(1,4096),batch)
+                    self.assertTrue(torch.equal(y,torch.full((1,3072),2,dtype=y.dtype)))
+                    self.assertEqual(obj.norm.calls,int(not fused))
+                    self.assertEqual('norm_weight' in obj.attn.kwargs,fused)
+                    if fused:
+                        self.assertIs(obj.attn.kwargs['z'],z)
+                        self.assertIs(obj.attn.kwargs['norm_weight'],obj.norm.weight)
 
 if __name__=='__main__':
     unittest.main()
