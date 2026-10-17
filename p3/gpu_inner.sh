@@ -19,11 +19,15 @@ mkdir -p "$SGLANG_GDN_K31_STATE_DUMP_DIR"
 python3 - <<'PY'
 import argparse, json, os
 import sglang
+import torch
 from p3_factory import frozen_argv
 from sglang.srt.server_args import ServerArgs
 got = os.path.realpath(sglang.__file__)
 assert got == '/p3/src/python/sglang/__init__.py', got
 print('P3_SGLANG_PATH_PASS', got, flush=True)
+assert len(os.environ['CUDA_VISIBLE_DEVICES'].split(',')) == 2
+assert torch.cuda.device_count() == 2, torch.cuda.device_count()
+print('P3_GPU_SLOTS_PASS', os.environ['CUDA_VISIBLE_DEVICES'], torch.cuda.device_count(), flush=True)
 p = argparse.ArgumentParser()
 ServerArgs.add_cli_args(p)
 argv = frozen_argv(json.load(open(os.environ['P3_LAUNCH_JSON']))['command'], 30795)

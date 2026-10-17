@@ -266,7 +266,8 @@ def _receipt(out, rank, extra):
                helper_sha=os.environ.get('P3_HELPER_SHA') or None, src=os.environ.get('P3_SRC'),
                helper_files_vs_shared=(os.environ.get('P3_HELPER_DIFF') or '').split(),
                launch=os.environ.get('P3_LAUNCH_JSON'), stage=os.environ.get('P3_STAGE'),
-               nccl_port=tp_nccl_port(), not_exercised=['scheduler', 'tree cache insertion / track donation',
+               nccl_port=tp_nccl_port(), cuda_visible_devices=os.environ.get('CUDA_VISIBLE_DEVICES'),
+               not_exercised=['scheduler', 'tree cache insertion / track donation',
                                                         'bootstrap / KV sender / transfer', 'HTTP / tokenizer manager'],
                **extra)
     Path(out, f'factory-r{rank}.json').write_text(json.dumps(rec, indent=1, default=str) + '\n')

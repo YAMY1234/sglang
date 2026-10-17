@@ -15,6 +15,7 @@ DST=${O/#$W/\/work}
 echo "STEP START module stage=$P3_STAGE holder=$HOLDER_JOB cvd=$HOLDER_CVD $(date -u +%FT%TZ) out=$O"
 H_MEM=96G H_CPUS=16 h_srun "$HOLDER_CVD" "
 set -Eeuo pipefail
+export CUDA_VISIBLE_DEVICES=$HOLDER_CVD
 export PYTHONPATH=$SRC/python:/work/pyuser/lib/python3.12/site-packages
 export PYTHONUNBUFFERED=1 SGLANG_GDN_K31_EIGH=jacobi
 export TORCH_EXTENSIONS_DIR=/tmp/p3-module-extensions TRITON_CACHE_DIR=/tmp/p3-module-triton MAX_JOBS=8

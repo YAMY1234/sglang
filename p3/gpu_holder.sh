@@ -19,5 +19,5 @@ h_mounts() { echo "$MOUNTS"; }
 echo "STEP START holder=$HOLDER_JOB cvd=$HOLDER_CVD stage=$P3_STAGE mode=$P3_MODE tree=$P3_TREE out=$O at=$(date -u +%FT%TZ)"
 cat "$P3_TREE/SHA" > "$O/SHA"
 H_MEM=400G H_CPUS=32 h_srun "$HOLDER_CVD" \
-    "export P3_STAGE=$P3_STAGE P3_MODE=$P3_MODE; bash /p3/src/p3/gpu_inner.sh" 2>&1 | tee "$O/driver.log"
+    "export CUDA_VISIBLE_DEVICES=$HOLDER_CVD P3_STAGE=$P3_STAGE P3_MODE=$P3_MODE; bash /p3/src/p3/gpu_inner.sh" 2>&1 | tee "$O/driver.log"
 echo "STEP END holder=$HOLDER_JOB stage=$P3_STAGE at=$(date -u +%FT%TZ) out=$O"
