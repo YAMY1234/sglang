@@ -11,7 +11,9 @@ TREE_REL=$(realpath --relative-to="$W" "$TREE")
 C_TREE=/work/$TREE_REL
 DUMP=$(find "$W/results/ssm-kernel-231" -maxdepth 1 -type d -name 'service-dump-p4cap-*' | sort | tail -1)
 [[ -n $DUMP ]]
-C_DUMP=/work/${DUMP#"$W/"}
+DUMP_REL=$(realpath --relative-to="$W" "$DUMP")
+[[ $DUMP_REL != ..* ]]
+C_DUMP=/work/$DUMP_REL
 h_srun "$HOLDER_CVD" "set -euo pipefail
 cd '$C_TREE'
 export PYTHONPATH='$C_TREE/python:/work/pyuser/lib/python3.12/site-packages'

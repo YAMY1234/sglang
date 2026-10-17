@@ -18,7 +18,9 @@ if [[ ! -f $DUMP/z-layouts.json ]]; then
     echo 'BLOCKED measured z-layouts.json missing; no timing'
     exit 1
 fi
-C_DUMP=/work/${DUMP#"$W/"}
+DUMP_REL=$(realpath --relative-to="$W" "$DUMP")
+[[ $DUMP_REL != ..* ]]
+C_DUMP=/work/$DUMP_REL
 O=/work/results/ssm-kernel-231/measured-$(basename "$RUN_DIR")
 mkdir -p "${O/#\/work/$W}"
 h_srun "$HOLDER_CVD" "set -euo pipefail

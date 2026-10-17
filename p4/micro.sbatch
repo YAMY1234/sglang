@@ -12,7 +12,9 @@ set -euo pipefail
 W=/lustre/fsw/portfolios/coreai/users/yangminl/twinstar-20260911
 source "$W/results/ssm-kernel-219/holder/scripts/hlib.sh"
 P4_TREE=${P4_TREE:?}; P4_GATE_JSON=${P4_GATE_JSON:?}
-P4_CONTAINER_TREE=/work/${P4_TREE#"$W/"}; export P4_CONTAINER_TREE
+P4_TREE_REL=$(realpath --relative-to="$W" "$P4_TREE")
+[[ $P4_TREE_REL != ..* ]]
+P4_CONTAINER_TREE=/work/$P4_TREE_REL; export P4_CONTAINER_TREE
 O=$W/results/ssm-kernel-231/micro-j$SLURM_JOB_ID
 mkdir -p "$O"
 cp "$P4_GATE_JSON" "$O/gate.json"
