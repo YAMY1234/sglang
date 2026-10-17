@@ -57,6 +57,8 @@ for ARM in $PHASES; do
   kill $SP $SD 2>/dev/null
   for i in $(seq 1 60); do kill -0 $SP 2>/dev/null || kill -0 $SD 2>/dev/null || break; sleep 2; done
   kill -9 $SP $SD 2>/dev/null
+  # 8 = only the prefix-hit pass failed (cold KL and GSM are complete): keep going, the summary marks the hit gate
+  [[ $rc == 8 ]] && { RC=8; continue; }
   [[ $rc == 0 ]] || { RC=$rc; break; }
 done
 client python3 /out/tools/pdgate_summary.py /out > $OUT/summary.log 2>&1
