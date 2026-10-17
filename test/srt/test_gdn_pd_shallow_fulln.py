@@ -20,7 +20,7 @@ from twinstar_sgl import pd_emitter_graph as emitter_graph
 
 class ShallowFullNTest(unittest.TestCase):
     def test_fulln_and_0n_keep_common_checkpoint_but_encode_shallow_h(self):
-        for route in ('0n', '0', '1'):
+        for route, encoded in (('0n', 64), ('0', 64), ('0', 65), ('1', 64), ('1', 65)):
             class Schedule:
                 def _mamba_radix_cache_v2_req_prepare_for_extend(self, req):
                     # The real scheduler's prompt_p_extent policy.
@@ -32,12 +32,14 @@ class ShallowFullNTest(unittest.TestCase):
                 def init_new(cls, batch, runner):
                     return NS(forward_mode=batch.forward_mode, batch_size=1,
                               input_ids=torch.arange(65), extend_seq_lens_cpu=[65],
-                              mamba_track_seqlens=torch.tensor([64]), seq_lens=torch.tensor([65]),
+                              mamba_track_seqlens=torch.tensor([encoded]),
+                              mamba_track_mask=torch.tensor([True]), seq_lens=torch.tensor([65]),
                               extend_prefix_lens=torch.tensor([0]))
             class Backend:
                 def init_forward_metadata(self, batch): pass
             class Handoff(FactorStateHandoff): pass
-            req = NS(extend_range=NS(length=65), kv=NS(mamba_last_track_idx=None,
+            req = NS(extend_range=NS(length=65, end=65), origin_input_ids=list(range(65)),
+                     kv=NS(mamba_last_track_idx=None,
                      mamba_next_track_idx=0, mamba_last_track_seqlen=None))
             batch = Schedule()
             batch.reqs = [req]

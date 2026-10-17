@@ -410,11 +410,22 @@ def install_contracts(forward_cls, schedule_cls, backend_cls, handoff_cls, *, ag
             # that checkpoint must come from h, never its final S_N. Keep the
             # original encoding for the deep emitter, which really ends N-1.
             base = result.mamba_track_seqlens
-            result._pd_fulln_emitter_track_seqlens = base
             chunk = getattr(model_runner.model.config, "mamba_chunk_size", 64)
-            force_h = ((base == result.seq_lens - 1)
-                       & ((base - result.extend_prefix_lens) % chunk == 0))
-            result.mamba_track_seqlens = base + force_h.to(base.dtype)
+            # The legacy tracker may already use +1 to name an h checkpoint.
+            # Decode its actual depth before choosing either side's source;
+            # blindly forwarding that encoding can index h past a deep N-1
+            # sequence whose checkpoint is exactly its final state.
+            depth = result.extend_prefix_lens + (
+                (base - result.extend_prefix_lens) // chunk) * chunk
+            final = base.new_tensor([
+                int(req.extend_range.end >= len(req.origin_input_ids))
+                for req in batch.reqs])
+            emitter_end = result.seq_lens - final
+            mask = result.mamba_track_mask
+            result._pd_fulln_emitter_track_seqlens = torch.where(
+                mask, depth + (depth != emitter_end).to(base.dtype), base)
+            result.mamba_track_seqlens = torch.where(
+                mask, depth + (depth != result.seq_lens).to(base.dtype), base)
         if not agg_mode and not shallow and result.forward_mode.is_extend():
             result.pd_factor_only_full_batch = True
             result._pfactor_legacy_mixed = result.forward_mode.is_mixed()
