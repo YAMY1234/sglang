@@ -55,6 +55,8 @@ class FirstDecodeNoWait:
         submitted=0, dense_first=0, dense_rows=0, catchups=0, join_other=0, join_batch=0, join_pool_op=0,
         join_not_decode=0, dropped=0))
     _logged: bool = False
+    graph: Optional["FirstDecodeGraphState"] = None
+    join_fn: Optional[Callable[[], None]] = None  # joins the publication (set at install)
 
     @classmethod
     def from_env(cls, catchup_fn=None) -> Optional["FirstDecodeNoWait"]:
@@ -124,10 +126,20 @@ class FirstDecodeNoWait:
         try:
             yield
         finally:
+            cancelled = self.active is not decision
             self.active = None
-        self.pending.append((decision.slots, saved))
+        if cancelled:
+            return
+        self.pending.append((decision.slots, decision.rows if saved is None else saved))
         self.stats["dense_first"] += 1
         self.stats["dense_rows"] += len(decision.rows)
+
+    def cancel_active(self) -> None:
+        """The dense step cannot run for the active decision: join the publication before the forward reads factors."""
+        self.stats["cancelled"] = self.stats.get("cancelled", 0) + 1
+        self.active = Decision(True, "cancelled: no fdnw graph")
+        if self.join_fn is not None:
+            self.join_fn()
 
     def on_join(self) -> None:
         """pool.pside_join has joined the publication: replay every pending first step on the factored path."""
@@ -142,3 +154,74 @@ class FirstDecodeNoWait:
 
     def needs_join(self) -> bool:
         return bool(self.pending)
+
+
+# ------------------------------------------------------------------ decode-graph side (variant (b), lead 03:49)
+FDNW_LABEL = "fdnw"
+BASE_LABEL = "base"
+
+
+class FirstDecodeGraphState:
+    """Static buffers read by the captured 'fdnw' decode graphs (allocated once, before the first variant capture).
+
+    mask[b]  True for batch rows that take the dense first step (their factor slot is masked to -1 = padding);
+    src[b]   their row in the full-N workspace slab (the publication's input states, S0);
+    scratch  per-row copy of S0 for the current layer: the stock packed decode writes its state back, and the slab
+             itself is still being read by the side-stream publication, so the stock kernel runs on this copy;
+    save_*   x1 = (mixed_qkv, a, b) of every GDN layer, replayed on the factored path by the catch-up."""
+
+    def __init__(self, *, max_batch, layers, qkv_dim, hv, v, k, act_dtype, ab_dtype, device):
+        import torch
+
+        self.max_batch = max_batch
+        self.mask = torch.zeros(max_batch, dtype=torch.bool, device=device)
+        self.src = torch.zeros(max_batch, dtype=torch.long, device=device)
+        self.rows = torch.arange(max_batch, dtype=torch.int32, device=device)
+        self.neg1 = torch.full((max_batch,), -1, dtype=torch.int32, device=device)
+        self.scratch = torch.zeros(max_batch, hv, v, k, dtype=torch.float32, device=device)
+        self.save_qkv = torch.zeros(layers, max_batch, qkv_dim, dtype=act_dtype, device=device)
+        self.save_a = torch.zeros(layers, max_batch, hv, dtype=ab_dtype, device=device)
+        self.save_b = torch.zeros(layers, max_batch, hv, dtype=ab_dtype, device=device)
+        self.layers = {}  # local layer index -> RadixLinearAttention (A_log, dt_bias, head shapes)
+
+    def prepare(self, decision, bucket):
+        """Host -> static buffers before an 'fdnw' replay (on the forward stream, so ordered before the replay)."""
+        import torch
+
+        mask = [False] * self.max_batch
+        src = [0] * self.max_batch
+        for r, s in zip(decision.rows, decision.sources):
+            mask[r], src[r] = True, s
+        self.mask.copy_(torch.tensor(mask, dtype=torch.bool), non_blocking=True)
+        self.src.copy_(torch.tensor(src, dtype=torch.long), non_blocking=True)
+
+
+class FirstDecodeVariants:
+    """AttentionGraphVariants for the decode runner: 'fdnw' graphs only for buckets <= max_batch."""
+
+    capture_labels = (BASE_LABEL, FDNW_LABEL)
+
+    def __init__(self, first, capture_bs):
+        self.first = first
+        self.capture_bs = sorted(capture_bs)
+
+    def labels_for(self, bs):
+        return self.capture_labels if bs <= self.first.max_batch else (BASE_LABEL,)
+
+    def bucket(self, n):
+        for b in self.capture_bs:
+            if b >= n:
+                return b
+        return None
+
+    def select(self, forward_batch):
+        d = self.first.active
+        bucket = self.bucket(forward_batch.batch_size)
+        if (d is None or d.join or bucket is None or bucket > self.first.max_batch
+                or self.first.graph is None or not forward_batch.forward_mode.is_decode()):
+            if d is not None and not d.join:
+                # no fdnw graph for this batch: never read unpublished factors -> join now, no dense step, no catch-up
+                self.first.cancel_active()
+            return BASE_LABEL
+        self.first.graph.prepare(d, bucket)
+        return FDNW_LABEL

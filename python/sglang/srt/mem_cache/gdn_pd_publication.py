@@ -270,6 +270,8 @@ def install(pool, runner, *, agg=False):
         from .gdn_first_decode import FirstDecodeNoWait
 
         pool._first_decode = FirstDecodeNoWait.from_env()
+        if pool._first_decode is not None:
+            pool._first_decode.join_fn = pool._pd_batch_publication.join
         install_forward_join(runner, pool)
         logger.info("AGG full-N deferred publication enabled: after-forward event, side priority=0; "
                     "join before every runner.forward and pool reader; join_offload=False")

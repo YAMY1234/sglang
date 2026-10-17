@@ -311,6 +311,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.attention_graph_variants: Optional[AttentionGraphVariants] = (
             create_attention_graph_variants(model_runner.model_config.hf_config)
         )
+        self._first_decode_variants_pending = self.attention_graph_variants is None
 
         # --- bucket sizes ---------------------------------------------
         if capture_bs_override is None:
@@ -1093,6 +1094,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             else [(None, None)]
         )
         variants = self.attention_graph_variants
+        if variants is None and getattr(self, "_first_decode_variants_pending", False):
+            # docs/223 §13.A (SGLANG_GDN_FIRST_DECODE_NO_WAIT=1): 'fdnw' decode graphs for small buckets only
+            pool = getattr(self.model_runner.req_to_token_pool, "factored_gdn_pool", None)
+            first = getattr(pool, "_first_decode", None)
+            if first is not None:
+                from sglang.srt.mem_cache.gdn_first_decode import FirstDecodeVariants
+
+                variants = self.attention_graph_variants = FirstDecodeVariants(first, self.capture_bs)
         attention_variants = (
             variants.capture_labels if variants is not None else (None,)
         )
@@ -1109,7 +1118,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
             for variant_label, _variant_has_lora in lora_variants:
                 _set_capture_lora_variant(variant_label)
-                for attention_variant in attention_variants:
+                for attention_variant in (variants.labels_for(bs) if hasattr(variants, "labels_for")
+                                          else attention_variants):
                     _set_capture_attention_variant(attention_variant)
                     with torch_compile_decoration.patch_model(
                         self.model_runner.model,

@@ -95,5 +95,57 @@ class FirstDecodeNoWaitTest(unittest.TestCase):
         self.assertEqual(self.calls, [])
 
 
+class _FM:
+    def __init__(self, decode):
+        self.decode = decode
+
+    def is_decode(self):
+        return self.decode
+
+
+class _FB:
+    def __init__(self, n, decode=True):
+        self.batch_size, self.forward_mode = n, _FM(decode)
+
+
+class FirstDecodeVariantsTest(unittest.TestCase):
+    def setUp(self):
+        self.joins = []
+        self.m = fd.FirstDecodeNoWait(max_batch=2, catchup_fn=lambda slots, saved: None)
+        self.m.join_fn = lambda: self.joins.append(1)
+        self.v = fd.FirstDecodeVariants(self.m, [1, 2, 4, 8])
+
+    def test_labels_only_for_small_buckets(self):
+        self.assertEqual(self.v.labels_for(2), (fd.BASE_LABEL, fd.FDNW_LABEL))
+        self.assertEqual(self.v.labels_for(4), (fd.BASE_LABEL,))
+
+    def test_base_without_decision(self):
+        self.assertEqual(self.v.select(_FB(1)), fd.BASE_LABEL)
+
+    def test_dense_decision_without_graph_cancels_and_joins(self):
+        self.m.on_submit([7], [True])
+        d = self.m.decide(is_decode=True, batch_slots=[7], publication_pending=True)
+        with self.m.scope(d):
+            self.assertEqual(self.v.select(_FB(1)), fd.BASE_LABEL)  # graph state not captured
+            self.assertEqual(self.joins, [1])
+        self.assertFalse(self.m.needs_join())  # no catch-up after a cancelled dense step
+
+    def test_dense_decision_selects_fdnw_and_prepares(self):
+        class G:
+            def __init__(self):
+                self.calls = []
+
+            def prepare(self, d, bucket):
+                self.calls.append((d.rows, d.sources, bucket))
+
+        self.m.graph = G()
+        self.m.on_submit([5, 7], [True, True])
+        d = self.m.decide(is_decode=True, batch_slots=[9, 7], publication_pending=True)
+        with self.m.scope(d):
+            self.assertEqual(self.v.select(_FB(2)), fd.FDNW_LABEL)
+        self.assertEqual(self.m.graph.calls, [((1,), (1,), 2)])
+        self.assertEqual(self.m.pending, [((7,), (1,))])
+
+
 if __name__ == "__main__":
     unittest.main()
