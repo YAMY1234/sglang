@@ -8,6 +8,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <type_traits>
+#include <cmath>
 
 namespace {
 constexpr int NW = 4, NR = 4, D = 128;
@@ -89,13 +90,44 @@ __device__ __forceinline__ float bias_float(float x) { return x; }
 __device__ __forceinline__ float bias_float(__nv_bfloat16 x) { return __bfloat162float(x); }
 __device__ __forceinline__ float bias_float(__half x) { return __half2float(x); }
 
-template<typename BiasT, bool INVALIDATE>
+// P4: only warp 0 enters; both half warps hold the same 128 outputs.
+// Preserve the materialized K1 bf16 rounding before the RMS calculation.
+__device__ __forceinline__ void norm_gate(float (&o)[8], int col,
+    const __nv_bfloat16* z, const __nv_bfloat16* weight, float eps) {
+  bf8(pack_bf(o), o);
+  // Qualified Triton ROWS_PER_BLOCK=1: four consecutive values per
+  // lane, square accumulation p1^2 -> fma(p0) -> fma(p2) -> fma(p3),
+  // then xor 16/8/4/2/1. Remap K1's eight values per half-warp lane.
+  float lo = __fmaf_rn(o[3], o[3], __fmaf_rn(o[2], o[2],
+                 __fmaf_rn(o[0], o[0], __fmul_rn(o[1], o[1]))));
+  float hi = __fmaf_rn(o[7], o[7], __fmaf_rn(o[6], o[6],
+                 __fmaf_rn(o[4], o[4], __fmul_rn(o[5], o[5]))));
+  int lane = threadIdx.x & 31;
+  lo = __shfl_sync(0xffffffff, lo, lane >> 1);
+  hi = __shfl_sync(0xffffffff, hi, lane >> 1);
+  float ss = lane & 1 ? hi : lo;
+  #pragma unroll
+  for (int d = 16; d; d >>= 1)
+    ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffff, ss, d));
+  float v = __fadd_rn(div_full(ss, 128.f), eps), rstd;
+  asm("rsqrt.approx.ftz.f32 %0,%1;" : "=f"(rstd) : "f"(v));
+  float zv[8], wv[8];
+  bf8(load128(z + col), zv); bf8(load128(weight + col), wv);
+  #pragma unroll
+  for (int k = 0; k < 8; ++k) {
+    float sig = div_full(1.f, 1.f + ex(-zv[k]));
+    o[k] = __fmul_rn(__fmul_rn(__fmul_rn(o[k], rstd), wv[k]), sig);
+  }
+}
+
+template<typename BiasT, bool INVALIDATE, bool NORM>
 __global__ __launch_bounds__(128, 4) void factored_step_r32_kernel(
     const __nv_bfloat16* mixed, const __nv_bfloat16* ag, const __nv_bfloat16* bg,
     const float* alog, const BiasT* bias, const float* vb,
     float* fa, __half* fu, __half* fw, int* fc, int* stale,
     const void* idx, bool idx64, __nv_bfloat16* out, int* pv,
-    int H, int HV, int64_t sm, int64_t sa, int64_t sb, int64_t si, float scale, float eps) {
+    int H, int HV, int64_t sm, int64_t sa, int64_t sb, int64_t si, float scale, float eps,
+    const __nv_bfloat16* z, const __nv_bfloat16* norm_weight, float norm_eps) {
   int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   int col = (lane & 15) * 8, parity = lane >> 4;
   int n = blockIdx.x / HV, hv = blockIdx.x % HV, h = hv / (HV / H);
@@ -105,7 +137,16 @@ __global__ __launch_bounds__(128, 4) void factored_step_r32_kernel(
     if (tid == 0 && hv == 0) pv[slot < 0 ? 0 : slot] = 0;
   }
   if (slot < 0) {
-    if (tid < 16) reinterpret_cast<uint4*>(out + (int64_t(n) * HV + hv) * D)[tid] = make_uint4(0,0,0,0);
+    if constexpr (NORM) {
+      if (warp == 0) {
+        float zero[8] = {};
+        norm_gate(zero, col, z + (int64_t(n)*HV+hv)*D, norm_weight, norm_eps);
+        if (lane < 16)
+          *reinterpret_cast<uint4*>(out + (int64_t(n)*HV+hv)*D + col) = pack_bf(zero);
+      }
+    } else {
+      if (tid < 16) reinterpret_cast<uint4*>(out + (int64_t(n) * HV + hv) * D)[tid] = make_uint4(0,0,0,0);
+    }
     // Only the first 16 uint4 vectors belong to this 128-element output.
     return;
   }
@@ -250,6 +291,9 @@ __global__ __launch_bounds__(128, 4) void factored_step_r32_kernel(
     if (row == cnt && cnt < 32)
       *reinterpret_cast<uint4*>(fu + sh*32*D + row*D + col) = pack_half(khat);
   }
+  if constexpr (NORM) {
+    if (warp == 0) norm_gate(oval, col, z + (int64_t(n)*HV+hv)*D, norm_weight, norm_eps);
+  }
   if (warp == 0 && lane < 16)
     *reinterpret_cast<uint4*>(out + (int64_t(n)*HV+hv)*D + col) = pack_bf(oval);
   if (tid == 0) { fc[sh]=cnt+1; stale[slot]=1; }
@@ -267,7 +311,8 @@ void factored_step_r32(torch::Tensor mixed,torch::Tensor ag,torch::Tensor bg,
     torch::Tensor alog,torch::Tensor bias,torch::Tensor vb,torch::Tensor fa,
     torch::Tensor fu,torch::Tensor fw,torch::Tensor fc,torch::Tensor stale,
     torch::Tensor idx,torch::Tensor out,int H,double scale,double eps,
-    c10::optional<torch::Tensor> pv,bool invalidate) {
+    c10::optional<torch::Tensor> pv,bool invalidate,
+    c10::optional<torch::Tensor> z,c10::optional<torch::Tensor> norm_weight,double norm_eps) {
   const c10::cuda::CUDAGuard guard(mixed.device());
   int HV=fu.size(1), B=mixed.size(0);
   TORCH_CHECK(mixed.scalar_type()==at::kBFloat16 && ag.scalar_type()==at::kBFloat16 && bg.scalar_type()==at::kBFloat16);
@@ -278,19 +323,36 @@ void factored_step_r32(torch::Tensor mixed,torch::Tensor ag,torch::Tensor bg,
   TORCH_CHECK(idx.scalar_type()==at::kInt || idx.scalar_type()==at::kLong);
   TORCH_CHECK(fu.size(2)==32 && fu.size(3)==128 && fw.size(3)==128 && HV%H==0);
   TORCH_CHECK(!invalidate || (pv.has_value() && pv->scalar_type()==at::kInt && pv->numel()>=fu.size(0)));
+  bool norm = norm_weight.has_value();
+  if (norm) {
+    TORCH_CHECK(z.has_value() && z->is_cuda() && norm_weight->is_cuda());
+    TORCH_CHECK(z->device()==mixed.device() && norm_weight->device()==mixed.device());
+    TORCH_CHECK(z->scalar_type()==at::kBFloat16 && norm_weight->scalar_type()==at::kBFloat16);
+    TORCH_CHECK(z->is_contiguous() && z->dim()==3 && z->size(0)==B && z->size(1)==HV && z->size(2)==D);
+    TORCH_CHECK(norm_weight->is_contiguous() && norm_weight->dim()==1 && norm_weight->numel()==D);
+    TORCH_CHECK(norm_eps>0 && std::isfinite(norm_eps));
+  }
   auto stream=at::cuda::getCurrentCUDAStream();
-  auto launch=[&](auto flag, auto bias_value) {
+  auto launch=[&](auto flag, auto norm_flag, auto bias_value) {
     using BiasT = decltype(bias_value);
-    factored_step_r32_kernel<BiasT, decltype(flag)::value><<<B*HV,128,0,stream>>>(
+    factored_step_r32_kernel<BiasT, decltype(flag)::value, decltype(norm_flag)::value><<<B*HV,128,0,stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(mixed.data_ptr()),reinterpret_cast<const __nv_bfloat16*>(ag.data_ptr()),
       reinterpret_cast<const __nv_bfloat16*>(bg.data_ptr()),alog.data_ptr<float>(),reinterpret_cast<const BiasT*>(bias.data_ptr()),vb.data_ptr<float>(),
       fa.data_ptr<float>(),reinterpret_cast<__half*>(fu.data_ptr()),reinterpret_cast<__half*>(fw.data_ptr()),
       fc.data_ptr<int>(),stale.data_ptr<int>(),idx.data_ptr(),idx.scalar_type()==at::kLong,
       reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),invalidate?pv->data_ptr<int>():nullptr,
-      H,HV,mixed.stride(0),ag.stride(0),bg.stride(0),idx.stride(0),float(scale),float(eps));
+      H,HV,mixed.stride(0),ag.stride(0),bg.stride(0),idx.stride(0),float(scale),float(eps),
+      norm?reinterpret_cast<const __nv_bfloat16*>(z->data_ptr()):nullptr,
+      norm?reinterpret_cast<const __nv_bfloat16*>(norm_weight->data_ptr()):nullptr,float(norm_eps));
   };
   auto dispatch=[&](auto bias_value) {
-    if(invalidate) launch(std::true_type{}, bias_value); else launch(std::false_type{}, bias_value);
+    if(norm) {
+      if(invalidate) launch(std::true_type{}, std::true_type{}, bias_value);
+      else launch(std::false_type{}, std::true_type{}, bias_value);
+    } else {
+      if(invalidate) launch(std::true_type{}, std::false_type{}, bias_value);
+      else launch(std::false_type{}, std::false_type{}, bias_value);
+    }
   };
   if(bias.scalar_type()==at::kFloat) dispatch(float{});
   else if(bias.scalar_type()==at::kBFloat16) dispatch(__nv_bfloat16{});
@@ -313,4 +375,13 @@ torch::Tensor gates(torch::Tensor a,torch::Tensor b,torch::Tensor al,torch::Tens
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
 }
-PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) { m.def("factored_step_r32",&factored_step_r32); m.def("gates",&gates); }
+PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {
+  namespace py = pybind11;
+  m.def("factored_step_r32", &factored_step_r32,
+    py::arg("mixed"), py::arg("ag"), py::arg("bg"), py::arg("alog"), py::arg("bias"),
+    py::arg("vb"), py::arg("fa"), py::arg("fu"), py::arg("fw"), py::arg("fc"), py::arg("stale"),
+    py::arg("idx"), py::arg("out"), py::arg("H"), py::arg("scale"), py::arg("eps"),
+    py::arg("pv"), py::arg("invalidate"), py::arg("z")=c10::nullopt,
+    py::arg("norm_weight")=c10::nullopt, py::arg("norm_eps")=1e-6);
+  m.def("gates", &gates);
+}

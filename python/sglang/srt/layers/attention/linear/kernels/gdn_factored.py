@@ -994,6 +994,9 @@ def factored_packed_decode(
     post_order: bool = False,
     prefix_valid: Optional[torch.Tensor] = None,
     invalidate: bool = False,
+    z: Optional[torch.Tensor] = None,
+    norm_weight: Optional[torch.Tensor] = None,
+    norm_eps: float = 1e-6,
 ) -> torch.Tensor:
     """One factored decode step for a batch of rows.  kernel = "split" (expiry truncation launch for the slots with
     count >= rfull + step launch) | "fused" (K2: one launch, the expiring programs truncate in registers first, K1 order).
@@ -1065,20 +1068,24 @@ def factored_packed_decode(
             import logging
             logging.getLogger(__name__).info("GDN_FACTORED_STEP_%s_ACTIVE batch=%d rmax=%d", feature, B, RMAX)
     cuda_ext = None
-    if (STEP_IMPL_BY_RMAX.get(RMAX) == "cuda" and B in STEP_CUDA_BATCHES and B <= (3 if HV == 48 else 8 if HV == 24 else 0) and K == V == 128 and not rch and nv == 1
-            and (not STEP_CUDA_MAX_BATCH or B <= STEP_CUDA_MAX_BATCH)
-            and mixed_qkv.dtype == a.dtype == b.dtype == torch.bfloat16
-            and fu.dtype == fw.dtype == torch.float16
-            and (not invalidate or prefix_valid.dtype == torch.int32)):
+    from .gdn_factored_norm import cuda_step_eligible
+    import sys
+    if cuda_step_eligible(sys.modules[__name__], mixed_qkv, a, b, fu, fw,
+                          invalidate=invalidate, prefix_valid=prefix_valid):
         from .gdn_factored_cuda import load_extension
         cuda_ext = load_extension()
+    fuse_norm = norm_weight is not None
+    if fuse_norm:
+        assert z is not None and cuda_ext is not None, "P4 norm requires the qualified CUDA step"
+        assert kernel == "split", "P4 norm requires the split step"
     if cuda_ext is not None:
         if "CUDA" not in _STEP_FEATURE_LOGGED:
             _STEP_FEATURE_LOGGED.add("CUDA")
             import logging
             logging.getLogger(__name__).info("FACTORED_STEP_CUDA_ACTIVE nw=%d batch=%d rmax=%d", STEP_CUDA_WARPS, B, RMAX)
         cuda_ext.factored_step_r32(mixed_qkv, a, b, A_log, dt_bias, vbar, fa, fu, fw, fcount, stale,
-                                  ssm_state_indices, out, num_q_heads, scale, GS_EPS, prefix_valid, invalidate)
+                                  ssm_state_indices, out, num_q_heads, scale, GS_EPS, prefix_valid, invalidate,
+                                  z if fuse_norm else None, norm_weight, norm_eps)
     elif rch:
         _factored_packed_step_rows_kernel[(B * HV,)](
             mixed_qkv, a, b, A_log, dt_bias, vbar, fa, fu, fw, fcount, stale, ssm_state_indices, out,

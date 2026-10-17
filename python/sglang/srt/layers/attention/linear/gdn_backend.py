@@ -913,6 +913,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 conv_states,
                 ssm_states,
                 cache_indices,
+                z=kwargs.get("z"),
+                norm_weight=kwargs.get("norm_weight"),
+                norm_eps=kwargs.get("norm_eps", 1e-6),
             )
             return (core_attn_out, z) if return_z else core_attn_out
 
@@ -1588,6 +1591,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         conv_states: torch.Tensor,
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
+        *,
+        z: Optional[torch.Tensor] = None,
+        norm_weight: Optional[torch.Tensor] = None,
+        norm_eps: float = 1e-6,
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.linear.kernels.gdn_factored import (
             factored_expiry_truncate_layers,
@@ -1647,6 +1654,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             truncate=not self._factored_batch_trunc
             and not grouped
             and pool.cfg.decode_method != "warm",
+            z=z,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
             **pool.cfg.kernel_kwargs(),
             **(dict(prefix_valid=pool.prefix_valid, invalidate=True) if fold else {}),
         )
