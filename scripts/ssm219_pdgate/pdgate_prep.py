@@ -190,6 +190,11 @@ def build_role(arm, role, cls, receipt, src, sha, extra_env, gate_root):
 HELPER_CONT = "/work/results/remeasure-v6-fivearm-tp1-20261004/inputs/helper-runtime"
 
 
+def git_blob(path):
+    data = Path(path).read_bytes()
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
 def tree_digest(root):
     """sha256 over (relative path, file sha256) of every file under root, __pycache__ excluded."""
     h = hashlib.sha256()
@@ -199,7 +204,7 @@ def tree_digest(root):
     return h.hexdigest()
 
 
-def mounts_for(mounts, out, helper=None, helper_overlay=None):
+def mounts_for(mounts, out, helper=None, helper_overlay=None, helper_files=()):
     """The receipt's container mounts (the window's exact layout), campaign trees read-only, model as @MODEL@, + /out.
     helper: host directory that replaces the helper-runtime tree (P3 ships helper code); the package's file overlays onto
     that tree are kept only when they equal the new tree's file, or by an explicit --helper-overlay keep / drop."""
@@ -236,6 +241,11 @@ def mounts_for(mounts, out, helper=None, helper_overlay=None):
         res.append(":".join([host, cont] + ([opts] if opts else [])))
     if helper:
         assert any(n.startswith("helper tree") for n in notes), "receipt has no helper-runtime mount"
+    # single-file binds over the helper tree, after it (P3 10-17: base tree + pd_emitter_graph.py @ 99125ac43)
+    for host, rel in helper_files:
+        assert Path(host).is_file(), host
+        res.append(f"{host}:{HELPER_CONT}/{rel}:ro")
+        notes.append(f"helper file {rel} <- {host} (git blob {git_blob(host)})")
     res.append(f"{out}:/out")
     return ",".join(res), notes
 
@@ -331,6 +341,8 @@ def main(argv=None):
     ap.add_argument("--sha")
     ap.add_argument("--helper", help="host dir replacing the helper-runtime tree for every arm (P3 helper code)")
     ap.add_argument("--helper-overlay", choices=("keep", "drop"))
+    ap.add_argument("--helper-file", action="append", default=[], help="HOST_FILE:REL single-file bind over the helper tree "
+                                                                       "(REL under helper-runtime, e.g. helpers/twinstar_sgl/x.py)")
     ap.add_argument("--hit-pass", action="store_true", help="second KL pass on P's cached prefixes (restore path), reported")
     ap.add_argument("--hit-gate", action="store_true", help="the prefix-hit pass is part of the verdict (implies --hit-pass)")
     for arm in ("before", "cand1", "cand2"):
@@ -384,7 +396,8 @@ def main(argv=None):
         assert specs["P"]["shallow"] == ("--flashnext-pd-shallow-prefill" in specs["D"]["argv"]), arm
         assert specs["P"]["source"] == specs["D"]["source"], arm
         helper = getattr(a, f"{arm}_helper") or a.helper
-        mnt, mnotes = mounts_for(mounts_seen.pop().split(","), str(out), helper, a.helper_overlay)
+        hfiles = [tuple(x.split(":", 1)) for x in a.helper_file]
+        mnt, mnotes = mounts_for(mounts_seen.pop().split(","), str(out), helper, a.helper_overlay, hfiles)
         (out / f"g-{arm}.mounts").write_text(mnt)
         bundle = arms_env[arm]["P"]["PARITY_BUNDLE"]
         assert arms_env[arm]["D"]["PARITY_BUNDLE"] == bundle, arm
@@ -392,7 +405,9 @@ def main(argv=None):
                               p_env=role_env["P"], d_env=role_env["D"], step0_owner="D" if specs["P"]["shallow"] else "P",
                               bundle=bundle, prelude=f"{host_path(bundle)}/support/prelude/{PRELUDE[cls]}.json",
                               cache_env={r: specs[r]["cache_env"] for r in ("P", "D")}, helper=helper,
-                              helper_digest=tree_digest(helper) if helper else None, mount_notes=mnotes)
+                              helper_digest=tree_digest(helper) if helper else None, mount_notes=mnotes,
+                              helper_files=[dict(host=h, cont=f"{HELPER_CONT}/{r}", sha256=sha256(h), git_blob=git_blob(h))
+                                            for h, r in hfiles])
         assert Path(plan_arms[arm]["prelude"]).is_file(), plan_arms[arm]["prelude"]
     a.hit_pass = a.hit_pass or a.hit_gate
     exp, notes = expectations(arms_env, {x: {"P": plan_arms[x]["p_env"], "D": plan_arms[x]["d_env"]} for x in phases},
@@ -436,6 +451,11 @@ def main(argv=None):
                 print("expect", arm, role, it["kind"], it["regex"])
     for s in notes:
         print("note", s)
+    for arm in phases[1:]:
+        for role in ("P", "D"):
+            b, c = arms_env["before"][role], arms_env[arm][role]
+            delta = {k: (b.get(k), c.get(k)) for k in sorted(set(b) | set(c)) if b.get(k) != c.get(k) and k not in LOCAL}
+            print("delta", arm, "vs before", role, json.dumps(delta))
     return plan
 
 

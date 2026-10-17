@@ -40,8 +40,13 @@ p = argparse.ArgumentParser()
 ServerArgs.add_cli_args(p)
 ns = p.parse_args(argv[i + 1:])
 print('ARGV-OK', len(argv[i + 1:]), 'tokens; port', ns.port, 'mode', ns.disaggregation_mode)
+import hashlib
+for hf in json.load(open('/out/plan.json'))['arms']['$arm'].get('helper_files') or []:
+    got = hashlib.sha256(open(hf['cont'], 'rb').read()).hexdigest()
+    print('HELPER-FILE', hf['cont'].rsplit('/', 1)[-1], 'ok' if got == hf['sha256'] else 'MISMATCH', hf['git_blob'][:12])
+    assert got == hf['sha256'], hf
 PY" > $OUT/argcheck-$arm-$role.log 2>&1
-    r=$?; echo "$arm/$role rc=$r $(grep -E 'PDGATE_SGLANG|ARGV-OK|Error|error:' $OUT/argcheck-$arm-$role.log | tail -2 | tr '\n' ' ')"
+    r=$?; echo "$arm/$role rc=$r $(grep -E 'PDGATE_SGLANG|ARGV-OK|HELPER-FILE|Error|error:' $OUT/argcheck-$arm-$role.log | tail -2 | tr '\n' ' ')"
     [ $r = 0 ] || rc=1
   done
 done
