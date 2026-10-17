@@ -66,7 +66,11 @@ def build(launch, src, out, helper_dir=None, exists=os.path.exists):
             remapped[k] = (v, nv)
             v = nv
         kept[k] = v
-    cache = f'/tmp/p3micro-{hashlib.sha1(out.encode()).hexdigest()[:10]}'
+    # A container can mount every run's output at /p3out. Include a host run
+    # identity so an interrupted JIT in one run cannot strand later workers on
+    # the same torch FileBaton; TP ranks of a single run still share a cache.
+    cache_key = os.environ.get('P3_RUN_ID', out)
+    cache = f'/tmp/p3micro-{hashlib.sha1(cache_key.encode()).hexdigest()[:10]}'
     for k in ('TORCH_EXTENSIONS_DIR', 'TRITON_CACHE_DIR', 'TORCHINDUCTOR_CACHE_DIR', 'SGLANG_CACHE_DIR', 'XDG_CACHE_HOME'):
         kept[k] = f'{cache}/{k.lower()}'
     path, path_dropped = [], []
