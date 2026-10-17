@@ -588,7 +588,6 @@ class TestLayerCallMhcOverrides(unittest.TestCase):
         layer.self_attn.accepts_mxfp8_swizzled_input.assert_called_once_with()
 
 
-
 class TestDraftAttentionSlots(unittest.TestCase):
     """DSparkAttention: forward is wo_b of forward_before_wo_b, and each op slot
     replaces only its own step; unset, SGLang's projections run."""
@@ -610,7 +609,9 @@ class TestDraftAttentionSlots(unittest.TestCase):
             o_lora_rank=rank,
             freqs_cis=torch.ones(8, 1),
             attn=object(),
-            wo_a=SimpleNamespace(weight=torch.ones(groups * rank, heads * dim // groups)),
+            wo_a=SimpleNamespace(
+                weight=torch.ones(groups * rank, heads * dim // groups)
+            ),
             wq_a=Mock(return_value=(torch.ones(2, 5), None)),
             q_norm=Mock(side_effect=lambda q: q),
             wq_b=Mock(return_value=(torch.ones(2, heads * dim), None)),
@@ -624,12 +625,8 @@ class TestDraftAttentionSlots(unittest.TestCase):
         _, attention = self._attention()
         attention.forward_before_wo_b = Mock(return_value="value")
         attention._project_wo_b = Mock(return_value="out")
-        batch = SimpleNamespace(
-            forward_mode=SimpleNamespace(is_idle=lambda: False)
-        )
-        out = attention.forward(
-            "pos", "x", batch, x_quant="xq", defer_all_reduce=True
-        )
+        batch = SimpleNamespace(forward_mode=SimpleNamespace(is_idle=lambda: False))
+        out = attention.forward("pos", "x", batch, x_quant="xq", defer_all_reduce=True)
         self.assertEqual(out, "out")
         attention.forward_before_wo_b.assert_called_once_with(
             "pos", "x", batch, x_quant="xq"
