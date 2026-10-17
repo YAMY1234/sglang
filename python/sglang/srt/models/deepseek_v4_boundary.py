@@ -45,6 +45,9 @@ class LayerCall(msgspec.Struct, frozen=True):
     allow_cross_layer_fusion: bool = True
     tbo: bool = False
     tbo_subbatch_index: object = None
+    # (rows, hidden) -> whether the sublayer defers its sum to the fused post;
+    # None keeps the push plane's own check, can_fuse_all_reduce.
+    can_fuse_sum: object = None
 
 
 class ReadState(msgspec.Struct):
@@ -453,6 +456,12 @@ def stages(config, layer_id, *, layer=None):
     )
 
 
+def _can_fuse_sum(call, rows, hidden):
+    if call.can_fuse_sum is not None:
+        return call.can_fuse_sum(rows, hidden)
+    return can_fuse_all_reduce(rows, hidden)
+
+
 class AttentionTransport(ComputeTransport):
     def __init__(self, layer, hidden_states, batch, call, rows):
         if rows.source != rows.compute or rows.source != rows.returned:
@@ -469,7 +478,7 @@ class AttentionTransport(ComputeTransport):
             layer.boundary_mhc_fusions
             and layer.boundary_pre_from_prev
             and layer._can_fuse_attn_mhc
-            and can_fuse_all_reduce(hidden_states.shape[0], layer.hc_cfg.hidden)
+            and _can_fuse_sum(call, hidden_states.shape[0], layer.hc_cfg.hidden)
         )
 
     def release(self):
@@ -516,7 +525,7 @@ class MoeTransport(MoeRowTransport):
             layer.boundary_mhc_fusions
             and layer.boundary_pre_from_prev
             and layer._can_fuse_ffn_mhc
-            and can_fuse_all_reduce(self.input.shape[0], layer.hc_cfg.hidden)
+            and _can_fuse_sum(call, self.input.shape[0], layer.hc_cfg.hidden)
             and not self._use_cp
             and not self._use_tp_moe_gather
             and not self._use_tp_attn_a2a_scatter

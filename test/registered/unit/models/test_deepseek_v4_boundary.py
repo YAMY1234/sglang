@@ -391,6 +391,66 @@ class TestMoeFusedPost(unittest.TestCase):
         self.assertIsNone(state.input)
 
 
+class TestSumDeferral(unittest.TestCase):
+    @staticmethod
+    def _defers(call, num_rows):
+        layer = SimpleNamespace(
+            boundary_mhc_fusions=True,
+            boundary_pre_from_prev=True,
+            _can_fuse_attn_mhc=True,
+            _can_fuse_ffn_mhc=True,
+            hc_cfg=SimpleNamespace(hidden=4),
+            mlp=SimpleNamespace(),
+            config=SimpleNamespace(model_type="deepseek_v41"),
+        )
+        plain = (Layout(frozenset()),) * 3
+        hidden = torch.ones(num_rows, 4)
+        backend = SimpleNamespace(is_none=lambda: True)
+        with (
+            patch.object(moe_transport, "get_moe_a2a_backend", return_value=backend),
+            patch.object(boundary, "get_moe_a2a_backend", return_value=backend),
+        ):
+            attn = boundary.AttentionTransport(
+                layer,
+                hidden,
+                SimpleNamespace(),
+                call,
+                TransportRows(*plain, SumGroup.ATTN_TP),
+            )
+            moe = boundary.MoeTransport(
+                layer,
+                hidden,
+                SimpleNamespace(dp_padding_mode=None),
+                call,
+                TransportRows(*plain, SumGroup.MOE_OUTPUT),
+            )
+        return attn.defers_sum, moe.defers_sum
+
+    def test_call_predicate_decides_both_sublayers_alone(self):
+        """A call's predicate must decide the deferral of both sums in both
+        directions; the push plane's width check must not veto or force it."""
+        predicate = Mock(side_effect=lambda rows, hidden: rows == 300)
+        call = boundary.LayerCall(can_fuse_sum=predicate)
+        with patch.object(
+            boundary, "can_fuse_all_reduce", return_value=False
+        ) as stock:
+            self.assertEqual(self._defers(call, 300), (True, True))
+            self.assertEqual(predicate.call_args_list[-2:], [((300, 4),)] * 2)
+            stock.return_value = True
+            self.assertEqual(self._defers(call, 40), (False, False))
+        stock.assert_not_called()
+
+    def test_unset_predicate_keeps_the_push_plane_check(self):
+        for fits in (True, False):
+            with patch.object(
+                boundary, "can_fuse_all_reduce", return_value=fits
+            ) as stock:
+                self.assertEqual(
+                    self._defers(boundary.LayerCall(), 300), (fits, fits)
+                )
+            self.assertEqual(stock.call_args_list, [((300, 4),)] * 2)
+
+
 class TestMoeSourceRows(unittest.TestCase):
     def test_cp_operand_is_released_before_return_and_v41_uses_contiguous_rows(self):
         from sglang.srt.layers.layer_boundary.layout import TokenAxis
