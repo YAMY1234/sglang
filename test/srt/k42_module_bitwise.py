@@ -275,29 +275,35 @@ def build_fulln_graph(pool):
 
 
 def load_events(patterns, h):
-    """Served prompt-end states as h-head rows (36, h, V, K) on the CPU; h48 dumps give two h24 halves."""
+    """Served prompt-end states as h-head rows (36, h, V, K) on the CPU; h48 dumps give two h24 halves.
+
+    A dump's tracked checkpoints are their own rows (at most one per prompt-end row, not row-aligned), so they
+    form a separate list that tracked collector inputs draw from first."""
     import glob
 
-    events, vbar = [], None
+    events, tracked_events, vbar = [], [], None
     for path in sorted(p for pattern in patterns for p in glob.glob(pattern)):
         payload = torch.load(path, map_location="cpu", weights_only=False)
         heads = payload["S"].shape[2]
         if heads % h:
             raise SystemExit(f"{path}: {heads} heads do not split into {h}")
+        tracked = payload.get("S_tracked")
         for half in range(heads // h):
             sl = slice(half * h, (half + 1) * h)
             if vbar is None:
                 vbar = payload["vbar"][:, sl]
+            name = f"{os.path.basename(path)}:h{half}"
             for row in range(payload["S"].shape[0]):
-                tracked = payload.get("S_tracked")
-                events.append(dict(name=f"{os.path.basename(path)}:h{half}:r{row}", S=payload["S"][row, :, sl],
-                                   T=None if tracked is None else tracked[row, :, sl]))
-    return events, vbar
+                events.append(dict(name=f"{name}:r{row}", S=payload["S"][row, :, sl]))
+            for row in range(0 if tracked is None else tracked.shape[0]):
+                tracked_events.append(dict(name=f"{name}:T{row}", S=tracked[row, :, sl]))
+    return events, tracked_events, vbar
 
 
 class EventSource:
-    def __init__(self, events, seed, h):
-        self.events, self.cursor, self.h = events, 0, h
+    def __init__(self, events, tracked_events, seed, h):
+        self.events, self.tracked_events, self.h = events, tracked_events, h
+        self.cursor = {False: 0, True: 0}
         self.gen = torch.Generator(device=DEV).manual_seed(seed)
 
     def synthetic(self):
@@ -308,18 +314,19 @@ class EventSource:
         return (u * sv) @ w + 1e-3 * torch.randn(len(GDN_LAYERS), h, V, K, generator=self.gen, device=DEV)
 
     def rows(self, n, tracked=False):
-        """n rows of (36, h, V, K); tracked rows prefer a dump's own tracked checkpoint."""
+        """n rows of (36, h, V, K); tracked rows come from the dumps' tracked checkpoints when there are any."""
+        pool = self.tracked_events if tracked and self.tracked_events else self.events
+        key = bool(tracked and self.tracked_events)
         out, names = [], []
         for _ in range(n):
-            if not self.events:
+            if not pool:
                 out.append(self.synthetic())
                 names.append("synthetic")
                 continue
-            event = self.events[self.cursor % len(self.events)]
-            self.cursor += 1
-            source = event["T"] if tracked and event["T"] is not None else event["S"]
-            out.append(source.to(DEV, torch.float32))
-            names.append(event["name"] + (":T" if tracked and event["T"] is not None else ""))
+            event = pool[self.cursor[key] % len(pool)]
+            self.cursor[key] += 1
+            out.append(event["S"].to(DEV, torch.float32))
+            names.append(event["name"])
         return torch.stack(out, dim=1).contiguous(), names  # (36, n, h, V, K)
 
 
@@ -412,14 +419,15 @@ def run_forwards(kind, pool, graph, extends, reader, standin, runtime, producers
 
 def route_e(args, result):
     patterns = [p for p in (args.dumps or "").split(",") if p]
-    events, vbar = load_events(patterns, args.heads) if patterns else ([], None)
+    events, tracked_events, vbar = load_events(patterns, args.heads) if patterns else ([], [], None)
     tmpdir = tempfile.mkdtemp(prefix="k42e_bitwise_")
     t_start = time.time()
     pool, _ = build_pool(args.heads, tmpdir, vbar_source=vbar, pool_route=False)
     graph, workspace = build_fulln_graph(pool)
     from sglang.srt.mem_cache import gdn_pd_publication as pubmod
 
-    result["meta"].update(route="E", events=len(events), dumps=patterns, fast_bind=pubmod._FAST_BIND,
+    result["meta"].update(route="E", events=len(events), tracked_events=len(tracked_events), dumps=patterns,
+                          fast_bind=pubmod._FAST_BIND,
                           graph_entries=sorted(str(k[:2]) for k in graph.entries), capacity=CAPACITY,
                           spin_cycles=args.spin_cycles, device=torch.cuda.get_device_name(),
                           cfg=pool.cfg.raw, pool_file=gp.__file__,
@@ -429,9 +437,9 @@ def route_e(args, result):
     runtime = ForkRuntime(pool.a.device)
     producers = dict(normal=torch.empty(CAPACITY, pool.hv, V, K, device=DEV),
                      tracked=torch.empty(CAPACITY, pool.hv, V, K, device=DEV))
-    source = EventSource(events, args.seed, pool.hv)
+    source = EventSource(events, tracked_events, args.seed, pool.hv)
     print(f"pool + full-N graph prewarm ready in {time.time() - t_start:.0f}s on {result['meta']['device']}; "
-          f"{len(events)} event rows; entries {result['meta']['graph_entries']}", flush=True)
+          f"{len(events)} event rows + {len(tracked_events)} tracked; entries {result['meta']['graph_entries']}", flush=True)
 
     def extends_for(b, tracked, rep, seed):
         gen = torch.Generator(device=DEV).manual_seed(seed)
