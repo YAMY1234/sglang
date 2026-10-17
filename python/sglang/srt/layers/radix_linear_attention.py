@@ -77,12 +77,23 @@ class RadixLinearAttention(nn.Module):
         self.dt_bias = dt_bias
         self.lower_bound = lower_bound
 
+    def can_fuse_norm(self, forward_batch, mixed_qkv, z, norm):
+        from sglang.srt.layers.attention.linear.kernels.gdn_factored_norm import (
+            can_fuse_norm, enabled,
+        )
+        return enabled() and can_fuse_norm(
+            get_attn_backend(), forward_batch, mixed_qkv, z, norm
+        )
+
     def forward(
         self,
         forward_batch: ForwardBatch,
         mixed_qkv: torch.Tensor,
         a: torch.Tensor,
         b: torch.Tensor,
+        z: Optional[torch.Tensor] = None,
+        norm_weight: Optional[torch.Tensor] = None,
+        norm_eps: float = 1e-6,
     ) -> torch.Tensor:
         is_extend = forward_batch.forward_mode.is_extend()
         if is_extend and get_tc_piecewise_forward_context() is not None:
@@ -145,6 +156,8 @@ class RadixLinearAttention(nn.Module):
             mixed_qkv=mixed_qkv,
             a=a,
             b=b,
+            **(dict(z=z, norm_weight=norm_weight, norm_eps=norm_eps)
+               if norm_weight is not None else {}),
         )
 
 

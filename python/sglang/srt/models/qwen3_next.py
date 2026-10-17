@@ -438,11 +438,14 @@ class Qwen3GatedDeltaNet(nn.Module):
                 lambda x: x.reshape(x.shape[0], -1), (query, key, value)
             )
             mixed_qkv = torch.cat((query, key, value), dim=-1)
+        norm_fused = self.attn.can_fuse_norm(forward_batch, mixed_qkv, z, self.norm)
         core_attn_out = self.attn(
             forward_batch,
             mixed_qkv=mixed_qkv,
             a=a,
             b=b,
+            **(dict(z=z, norm_weight=self.norm.weight, norm_eps=self.norm.eps)
+               if norm_fused else {}),
         )
 
         z_shape_og = z.shape
@@ -456,7 +459,8 @@ class Qwen3GatedDeltaNet(nn.Module):
             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
             core_attn_out = core_attn_out_pad
 
-        core_attn_out = self.norm(core_attn_out, z)
+        if not norm_fused:
+            core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
 
