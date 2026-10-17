@@ -3,7 +3,7 @@
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -111,6 +111,82 @@ class TestOverlappedTransport(unittest.TestCase):
             [x for x in trace if x[0] == "gather"], [("gather", 0), ("gather", 1)]
         )
         self.assertIsNot(buffers[("gh", 0)], buffers[("gh", 1)])
+
+
+class TestDualStreamSlots(unittest.TestCase):
+    def test_slots_replace_only_topk_and_routed_experts(self):
+        """A caller's top-k and routed experts run in the stock slots: the gate,
+        the shared expert on the alt stream and the deferred-finalize output stay."""
+        from sglang.srt.models import deepseek_v2
+
+        trace = []
+        stream = SimpleNamespace(wait_stream=lambda other: trace.append("join"))
+        hidden = torch.ones(2, 4)
+        moe = SimpleNamespace(
+            alt_stream=SimpleNamespace(wait_stream=lambda other: trace.append("fork")),
+            routed_quant_stream=None,
+            num_fused_shared_experts=0,
+            layer_id=3,
+            is_nextn=False,
+            _shared_expert_tp1=False,
+            routed_scaling_factor=2.5,
+            gate=lambda x, allocator: trace.append("gate") or x[:, :3],
+            topk=SimpleNamespace(side_effect=AssertionError("stock top-k ran")),
+            experts=SimpleNamespace(
+                forward_deferred_finalize=Mock(side_effect=AssertionError("stock")),
+                quant_method=None,
+            ),
+            _maybe_quant_moe_input_once=lambda x: None,
+            _should_quant_routed_input_mxfp8=lambda x: False,
+            _forward_shared_experts=lambda x, allocator, pre_quant_input: (
+                trace.append("shared") or x * 3
+            ),
+        )
+        select = Mock(side_effect=lambda **kw: trace.append("select") or "topk")
+        routed = Mock(side_effect=lambda **kw: trace.append("routed") or "triple")
+        with (
+            patch.object(deepseek_v2, "_is_hip", False),
+            patch.object(deepseek_v2, "_is_cuda", True),
+            patch.object(deepseek_v2.torch.cuda, "current_stream", return_value=stream),
+            patch.object(deepseek_v2.torch.cuda, "stream", return_value=nullcontext()),
+            patch.object(
+                deepseek_v2,
+                "get_forward",
+                return_value=SimpleNamespace(
+                    flashinfer_trtllm_bypass=True, defer_moe_finalize=False
+                ),
+            ),
+            patch.object(
+                deepseek_v2,
+                "get_exec",
+                return_value=SimpleNamespace(moe=SimpleNamespace(enable_eplb=False)),
+            ),
+        ):
+            out = deepseek_v2.DeepseekV2MoE.forward_normal_dual_stream(
+                moe,
+                hidden,
+                input_ids_global="ids",
+                num_token_non_padded="n",
+                use_vision_topk=True,
+                leave_output_sum=True,
+                select_experts=select,
+                run_routed_experts=routed,
+            )
+        self.assertEqual(trace, ["fork", "gate", "select", "routed", "shared", "join"])
+        self.assertEqual(
+            select.call_args.kwargs.keys(),
+            {
+                "hidden_states",
+                "router_logits",
+                "input_ids_global",
+                "num_token_non_padded",
+                "use_vision_topk",
+            },
+        )
+        self.assertEqual(select.call_args.kwargs["use_vision_topk"], True)
+        self.assertEqual(routed.call_args.kwargs["topk_output"], "topk")
+        self.assertEqual(out.routed, "triple")
+        torch.testing.assert_close(out.shared, hidden * 3)
 
 
 if __name__ == "__main__":
