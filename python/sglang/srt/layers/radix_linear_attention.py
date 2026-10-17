@@ -78,6 +78,8 @@ class RadixLinearAttention(nn.Module):
         self.lower_bound = lower_bound
 
     def can_fuse_norm(self, forward_batch, mixed_qkv, z, norm):
+        if not forward_batch.forward_mode.is_decode():
+            return False
         from sglang.srt.layers.attention.linear.kernels.gdn_factored_norm import (
             can_fuse_norm, enabled,
         )
