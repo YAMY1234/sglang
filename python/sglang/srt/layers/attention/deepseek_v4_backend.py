@@ -6,6 +6,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
+    Callable,
     Dict,
     List,
     Literal,
@@ -3667,6 +3668,7 @@ class DeepseekV4AttnBackend(
         save_kv_cache: bool = True,
         attn_sink: Optional[torch.Tensor] = None,
         cos_sin_cache: Optional[torch.Tensor] = None,
+        sparse_decode: Optional[Callable[..., torch.Tensor]] = None,
         **_,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if self.mtp_enabled and forward_batch.forward_mode.is_idle():
@@ -3818,6 +3820,22 @@ class DeepseekV4AttnBackend(
                     if extra_indices is None
                     else extra_indices.squeeze(1),
                     extra_topk_lengths=extra_topk_lengths,
+                )
+
+            # A caller-supplied sparse decode attention takes the place of swap-AB
+            # and FlashMLA below: q and the indices are [rows, 1, ...] here, and it
+            # returns [rows, heads, head_dim_v] as the FlashMLA arm does.
+            if sparse_decode is not None:
+                return sparse_decode(
+                    q=q,
+                    swa_k_cache=swa_k_cache,
+                    swa_page_indices=swa_page_indices,
+                    swa_topk_lengths=swa_topk_lengths,
+                    attn_sink=attn_sink,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices=extra_indices,
+                    extra_topk_lengths=extra_topk_lengths,
+                    flashmla_metadata=flashmla_metadata,
                 )
 
             if (
