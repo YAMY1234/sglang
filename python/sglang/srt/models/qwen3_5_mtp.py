@@ -33,6 +33,7 @@ from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.layers.kdense_draft_xchg import FcPeerSum
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -156,6 +157,13 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             if self.fc_split_slice is not None
             else None
         )
+        self._fc_peer_sum = (
+            FcPeerSum(max_rows=_FC_SPLIT_MAX_TOKENS, cols=config.hidden_size)
+            if self.fc_split_slice is not None
+            and envs.SGLANG_Q35MF_KDENSE_DRAFT_FC_XCHG.get()
+            and get_parallel().tp_size == 2
+            else None
+        )
         RMSNorm_cls = GemmaRMSNorm
         self.pre_fc_norm_embedding = RMSNorm_cls(
             config.hidden_size, config.rms_norm_eps
@@ -271,6 +279,10 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         return self._gather_partials(partial)
 
     def _gather_partials(self, partial: torch.Tensor) -> torch.Tensor:
+        if self._fc_peer_sum is not None:
+            out = self._fc_peer_sum(partial)
+            if out is not None:
+                return out
         gathered = self._fc_gather(partial.view(torch.bfloat16))
         out = partial.new_empty(partial.shape, dtype=torch.bfloat16)
         return ordered_partial_sum(

@@ -629,6 +629,12 @@ class Envs:
     # One-row draft steps run the draft layer's o_proj as mkd_draft_gemv (fp32 accumulation; only the
     # summation order differs from the served GEMM), pushing it into the draft hop when that runs.
     SGLANG_Q35MF_MKD_GEMV = EnvBool(False)
+    # TP2 with the fc split: each rank stores its fp32 fc partial into the peer's symmetric
+    # buffer and sums the pair in the same kernel (no all-gather; same bf16 result).
+    SGLANG_Q35MF_KDENSE_DRAFT_FC_XCHG = EnvBool(False)
+    # TP2 with the vocab exchange: shard argmax, packed-row exchange through the peer's
+    # symmetric buffer and selection in one kernel (no all-gather; same token and row).
+    SGLANG_Q35MF_KDENSE_DRAFT_ARGMAX_XCHG = EnvBool(False)
 
     # ===================================================================
     # Memory pools and KV-cache sizing

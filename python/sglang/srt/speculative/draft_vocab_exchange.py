@@ -21,8 +21,10 @@ from sglang.kernels.ops.speculative.draft_vocab_argmax import (
     vocab_argmax_pack,
     vocab_argmax_select,
 )
+from sglang.kernels.ops.speculative.draft_peer_xchg import draft_argmax_xchg
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
+from sglang.srt.layers.kdense_draft_xchg import make_argmax_slots
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.draft_hot_vocab import DraftHotVocab, build_hot_head_shard
@@ -132,6 +134,12 @@ class DraftVocabExchange:
         self.gatherer = triton_symm_mem_ag.MultimemAllGatherer(
             max_tokens=rows, enabled=True, skip_entry_sync=True
         )
+        self.peer = (
+            make_argmax_slots(self.MAX_ROWS, hidden)
+            if envs.SGLANG_Q35MF_KDENSE_DRAFT_ARGMAX_XCHG.get() and self.world == 2
+            else None
+        )
+        self.no_mrope = torch.empty(0, dtype=torch.int64, device=dev)
 
     @classmethod
     def maybe_create(
@@ -195,6 +203,19 @@ class DraftVocabExchange:
             )
             mkd.armed = False
             return topk_p, topk_index
+        if self.peer is not None and self.peer.ready():
+            self._exchange_select(
+                local_logits,
+                m=m,
+                nan_key=NAN_KEY_SPLIT_ARGMAX,
+                topk_index=topk_index,
+                topk_p=topk_p,
+                draft_tokens=draft_tokens if draft_tokens is not None else self.no_tokens,
+                positions=positions,
+                mrope_positions=mrope_positions if mrope_positions is not None else self.no_mrope,
+                draft_column=draft_column,
+            )
+            return topk_p, topk_index
         gathered = self._pack_and_gather(local_logits, m, NAN_KEY_SPLIT_ARGMAX)
         vocab_argmax_select(
             gathered,
@@ -224,9 +245,22 @@ class DraftVocabExchange:
         m = local_logits.shape[0]
         if self.mkd is not None and m == 1:
             return self.mkd.exchange_extend(local_logits, hidden_states)
-        gathered = self._pack_and_gather(local_logits, m, NAN_KEY_TORCH_ARGMAX)
         topk_index = torch.empty((m, 1), dtype=torch.int64, device=local_logits.device)
         topk_p = torch.empty((m, 1), dtype=torch.float32, device=local_logits.device)
+        if self.peer is not None and self.peer.ready():
+            self._exchange_select(
+                local_logits,
+                m=m,
+                nan_key=NAN_KEY_TORCH_ARGMAX,
+                topk_index=topk_index,
+                topk_p=topk_p,
+                draft_tokens=self.no_tokens,
+                positions=self.no_positions,
+                mrope_positions=self.no_mrope,
+                draft_column=0,
+            )
+            return topk_p, topk_index
+        gathered = self._pack_and_gather(local_logits, m, NAN_KEY_TORCH_ARGMAX)
         vocab_argmax_select(
             gathered,
             topk_index,
@@ -239,6 +273,42 @@ class DraftVocabExchange:
             self.world,
         )
         return topk_p, topk_index
+
+    def _exchange_select(
+        self,
+        local_logits: torch.Tensor,
+        *,
+        m: int,
+        nan_key: int,
+        topk_index: torch.Tensor,
+        topk_p: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        positions: torch.Tensor,
+        mrope_positions: torch.Tensor,
+        draft_column: int,
+    ) -> None:
+        # Same pack and selection as _pack_and_gather + vocab_argmax_select, in one launch.
+        draft_argmax_xchg(
+            local_logits,
+            self.embed_weight,
+            self.part_key[:m],
+            self.part_idx[:m],
+            self.counter[:m],
+            self.token_map,
+            self.peer.slots,
+            self.peer.peer_slots,
+            self.peer.epoch,
+            topk_index,
+            topk_p,
+            draft_tokens,
+            positions,
+            mrope_positions,
+            self.next_embeds[:m],
+            self.vocab_start,
+            nan_key,
+            self.peer.rank,
+            draft_column,
+        )
 
     def _pack_and_gather(self, local_logits: torch.Tensor, m: int, nan_key: int) -> torch.Tensor:
         vocab_argmax_pack(
