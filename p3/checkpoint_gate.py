@@ -82,6 +82,31 @@ def main():
     torch.set_grad_enabled(False)
     w = build()
     rank = int(os.environ['RANK'])
+    trace_length = int(os.environ.get('P3_CHECKPOINT_TRACE_LENGTH', '0'))
+    trace, trace_current = {}, {'route': None}
+    if trace_length:
+        def snapshot(value):
+            if isinstance(value, torch.Tensor):
+                return value.detach().cpu().clone()
+            if isinstance(value, (tuple, list)):
+                return [snapshot(item) for item in value]
+            return value
+
+        def before(layer_id):
+            def hook(module, args, kwargs):
+                trace.setdefault(trace_current['route'], {})[f'layer{layer_id}_input'] = snapshot(
+                    (kwargs.get('hidden_states'), kwargs.get('residual')))
+            return hook
+
+        def after(layer_id):
+            def hook(module, args, output):
+                trace.setdefault(trace_current['route'], {})[f'layer{layer_id}_output'] = snapshot(output)
+            return hook
+
+        for layer_id in range(4):
+            layer = w.r.model.model.model.layers[layer_id]
+            layer.register_forward_pre_hook(before(layer_id), with_kwargs=True)
+            layer.register_forward_hook(after(layer_id))
     if os.environ.get('P3_CHECKPOINT_DEBUG') == '1':
         # Diagnostic-only barriers locate the first failing layer; this mode
         # is never a timing or complete cache-admission result.
@@ -137,9 +162,12 @@ def main():
              (4097, True), (128, False))
     if os.environ.get('P3_CHECKPOINT_DEBUG') == '1':
         cases = ((65, True),)
+    if trace_length:
+        cases = ((trace_length, True),)
     for length, final in cases:
         reference = None
-        for route in ('0n', '0', '1'):
+        for route in (('0n', '0') if trace_length else ('0n', '0', '1')):
+            trace_current['route'] = route
             set_pd_micro_route(route)
             captured.clear()
             rp, alloc = w.r.req_to_token_pool, w.r.token_to_kv_pool_allocator
@@ -192,7 +220,8 @@ def main():
             # Across grouping routes, a/U/W are rounding-level diagnostics.
             # Raw checkpoint, count and cached-store bytes remain strict gates.
             a_equal = torch.equal(factors['a'], reference[1]['a'])
-            numerical = factor_diagnostic(raw, reference[1], factors, w.pool)
+            numerical = (factor_diagnostic(raw, reference[1], factors, w.pool) if raw_equal else
+                         dict(passed=False, skipped='different raw states; no same-S numeric admission comparison'))
             deep_encoding = getattr(fb, '_pd_fulln_emitter_track_seqlens', None)
             if deep_encoding is None:
                 deep_encoding = fb.mamba_track_seqlens
@@ -212,6 +241,28 @@ def main():
                             if not torch.equal(actual, old)])
             results.append(row)
             print('P3_CHECKPOINT_GATE', json.dumps(row), flush=True)
+            out.write_text(json.dumps(dict(complete=False, cases=results), indent=2) + '\n')
+            if not raw_equal or trace_length:
+                evidence = dict(raw=raw, old_raw=reference[0], factors=factors,
+                                old_factors=reference[1], trunk=trace, row=row)
+                torch.save(evidence, out.parent / f'checkpoint-evidence-r{rank}-{length}-{route}.pt')
+            if trace_length and route != '0n':
+                comparisons = []
+                for name, current in trace[route].items():
+                    old = trace['0n'][name]
+                    for part, (left, right) in enumerate(zip(current, old)):
+                        if not isinstance(left, torch.Tensor):
+                            continue
+                        changed = (left != right).reshape(left.shape[0], -1).any(-1)
+                        prefix = changed[:int(depth)]
+                        comparisons.append(dict(name=name, part=part, shape=list(left.shape),
+                            equal=torch.equal(left, right), unequal_rows=int(changed.sum()),
+                            prefix_equal=not bool(prefix.any()),
+                            first_changed_token=(int(changed.nonzero()[0]) if bool(changed.any()) else None),
+                            max_abs=float((left.float() - right.float()).abs().max())))
+                (out.parent / f'checkpoint-trace-r{rank}.json').write_text(
+                    json.dumps(dict(diagnostic_only=True, length=length, comparisons=comparisons), indent=2) + '\n')
+                print('P3_TRUNK_TRACE', json.dumps(comparisons), flush=True)
             assert raw_equal and counts_equal, row
             # Persist completed rows even if a later forward fails. Numerical
             # failure is collected across all cases, separately for each route.
@@ -223,7 +274,7 @@ def main():
                    routing_only_pass=per_route['0n'] and per_route['0'],
                    combined_pass=per_route['0n'] and per_route['1'],
                    passed=all(per_route.values()), cases=results,
-                   diagnostic_only=os.environ.get('P3_CHECKPOINT_DEBUG') == '1')
+                   diagnostic_only=bool(trace_length) or os.environ.get('P3_CHECKPOINT_DEBUG') == '1')
     out.write_text(json.dumps(summary, indent=2) + '\n')
     print('P3_CHECKPOINT_SUMMARY', json.dumps({k: v for k, v in summary.items() if k != 'cases'}), flush=True)
     if not summary['passed']:
