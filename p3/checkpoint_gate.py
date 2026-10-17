@@ -152,8 +152,8 @@ def main():
             ids = token_ids(length + (0 if final else 64), 7000 + length, w.vocab)
             req = w._req(ids)
             req.set_extend_range(0, length)
-            req.last_node = tree.root_node
-            tree.inc_lock_ref(req.last_node)
+            req.last_node = tree.root_node_handle(req.extra_key)
+            req.lock_receipt = tree.inc_lock_ref(req.last_node).to_dec_params()
             fb = w._forward_batch(req, tree=tree)
             before = w.counters()
             w._run(fb)
