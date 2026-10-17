@@ -107,6 +107,9 @@ class AttnOutput(NamedTuple):
     """Attention's wo_b rows with the TP reduction left to the fused post."""
 
     partial: torch.Tensor
+    # Replaces the collective post kernel when set, same contract:
+    # (partial, residual, post_mix, comb, pre, norm_weight, eps) -> (updated, normalized).
+    fused_post: Optional[Callable[..., Tuple[torch.Tensor, torch.Tensor]]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -667,22 +670,19 @@ def run_attn_post(
     folds ``next``'s norm); the attention may decline the handover even when asked,
     so the type is the ground truth."""
     if isinstance(out, AttnOutput):
-        from sglang.kernels.ops.communication.all_reduce_mhc import (
-            all_reduce_mhc_post_combine_norm,
-        )
-
         assert next is not None
         pre, post_mix, comb = _compute_triplet(hc, residual, stats_stream, precomputed)
-        _, updated, normalized = all_reduce_mhc_post_combine_norm(
-            out.partial,
-            residual,
-            post_mix,
-            comb,
-            pre,
-            next.norm.weight,
-            next.norm.variance_epsilon,
-            world_size=world_size,
-        )
+        args = (out.partial, residual, post_mix, comb, pre, next.norm.weight)
+        if out.fused_post is not None:
+            updated, normalized = out.fused_post(*args, next.norm.variance_epsilon)
+        else:
+            from sglang.kernels.ops.communication.all_reduce_mhc import (
+                all_reduce_mhc_post_combine_norm,
+            )
+
+            _, updated, normalized = all_reduce_mhc_post_combine_norm(
+                *args, next.norm.variance_epsilon, world_size=world_size
+            )
         return HcState(updated, pre, HcNormed(normalized))
     coefficients = _compute_triplet(hc, residual, stats_stream, precomputed)
     return _post_fusion(hc, out, residual, coefficients, next)
