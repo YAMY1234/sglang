@@ -24,6 +24,26 @@ def main():
     torch.set_grad_enabled(False)
     w = build()
     rank = int(os.environ['RANK'])
+    if os.environ.get('P3_CHECKPOINT_DEBUG') == '1':
+        # Diagnostic-only barriers locate the first failing layer; this mode
+        # is never a timing or complete cache-admission result.
+        def after_layer(label):
+            def hook(*unused):
+                torch.cuda.synchronize()
+                print('P3_LAYER_DONE', rank, label, flush=True)
+            return hook
+        for layer_id in w.r.model.p_layer_ids:
+            w.r.model.model.model.layers[layer_id].register_forward_hook(after_layer(layer_id))
+        for layer_id in w.r.model.emitter_ids:
+            emitter = w.r.model.emitters[str(layer_id)]
+            emit = emitter.emit
+            def traced(*a, _emit=emit, _id=layer_id, **k):
+                print('P3_EMITTER_BEGIN', rank, _id, flush=True)
+                value = _emit(*a, **k)
+                torch.cuda.synchronize()
+                print('P3_EMITTER_DONE', rank, _id, flush=True)
+                return value
+            emitter.emit = traced
     assert get_exec().mamba.enable_mamba_extra_buffer
     captured = {}
     original = PrefillBatchGraph.run
@@ -46,6 +66,8 @@ def main():
     # more than one GDN chunk, with the exact same P input across routes.
     cases = ((65, True), (128, True), (129, True), (4096, True),
              (4097, True), (128, False))
+    if os.environ.get('P3_CHECKPOINT_DEBUG') == '1':
+        cases = ((65, True),)
     for length, final in cases:
         reference = None
         for route in ('0n', '0', '1'):
@@ -105,7 +127,9 @@ def main():
             results.append(row)
             print('P3_CHECKPOINT_GATE', json.dumps(row), flush=True)
     out = Path(os.environ['P3_OUT']) / f'checkpoint-r{rank}.json'
-    out.write_text(json.dumps(dict(passed=True, cases=results), indent=2) + '\n')
+    out.write_text(json.dumps(dict(passed=True, cases=results,
+                                  diagnostic_only=os.environ.get('P3_CHECKPOINT_DEBUG') == '1'),
+                              indent=2) + '\n')
 
 
 if __name__ == '__main__':
