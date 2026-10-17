@@ -30,6 +30,10 @@ serve() {  # serve <arm> <role> -> pid of the srun step
       set -a; . /out/g-$1-$2.env; set +a
       export CUDA_VISIBLE_DEVICES=$g
       env | grep -E '^(SGLANG|TWINSTAR|PD|PDGATE|V4)_' | sort | sed 's/^/PDGATE_ENV /'
+      # the tree the server imports must be the declared one (4560175: the image's stock sglang answered instead)
+      want=\$(python3 -c 'import json;print(json.load(open(\"/out/g-$1-$2.json\"))[\"sglang_expect\"])')
+      got=\$(/opt/sglang/bin/python -c 'import sglang,os;print(os.path.dirname(sglang.__file__)+\"/\")' 2>&1 | tail -1)
+      echo \"PDGATE_SGLANG \$got (expect \$want)\"; [ \"\$got\" = \"\$want\" ] || { echo 'PDGATE_SGLANG_MISMATCH'; exit 3; }
       eval exec \"\$(cat /out/g-$1-$2.argv)\"" > $OUT/srv-$1-$2.log 2>&1 &
   echo $!
 }

@@ -128,6 +128,18 @@ def prep_tests(root):
             ("cross-class", ["--before", "C+", "--cand1", "PC+"], AssertionError)):
         raises(lambda: run_prep(root, "refuse-" + name, args), exc, f"prep refuses {name}")
         shutil.rmtree(Path(root) / ("refuse-" + name), ignore_errors=True)
+    # a tree under /work/src (shadowed by the receipts' stable-src mount): must get its own mount (4560175 / 4560392)
+    pp, out, plan = run_prep(root, "src-shadow", ["--src", "/work/src/ssm219-int-d053bd5e346",
+                                                  "--sha", "d053bd5e346b41bd701adc14b8bd412a4af177e7", "--before", "C+", "--cand1", "C+"])
+    env = load_env(out / "g-cand1-P.env")
+    spec = json.loads((out / "g-cand1-P.json").read_text())
+    m = (out / "g-cand1.mounts").read_text().split(",")
+    check(env["V4_SOURCE"] == "/pdgate/src/ssm219-int-d053bd5e346" and env["PYTHONPATH"].split(":")[1] == env["V4_SOURCE"] + "/python"
+          and any(x.endswith(":/pdgate/src/ssm219-int-d053bd5e346:ro") for x in m)
+          and spec["sglang_expect"] == "/pdgate/src/ssm219-int-d053bd5e346/python/sglang/",
+          "shadowed /work/src tree -> own mount /pdgate/src/<name>, PYTHONPATH and sglang_expect follow")
+    check(pp.resolve(m, spec["sglang_expect"] + "__init__.py") is not None, "sglang_expect resolves through the gate mounts")
+    shutil.rmtree(out)
     # PC+ with a declared line for a switch the fork does not have yet
     pp, out, plan = run_prep(root, "pcplus", ["--before", "PC+", "--cand1", "PC+", "--cand1-p-env",
                                               '{"SGLANG_GDN_PD_SHALLOW_FULLN":"1"}',

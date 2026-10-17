@@ -98,6 +98,20 @@ def arg_set(argv, flag, value, changed):
     argv[i + 1] = value
 
 
+def resolve(mounts, cont):
+    """Host path behind a container path under the receipt's mounts (longest container prefix wins), else None."""
+    best = None
+    for m in mounts:
+        parts = m.split(":")
+        host, c = parts[0], parts[1]
+        if (cont == c or cont.startswith(c.rstrip("/") + "/")) and (best is None or len(c) > len(best[1])):
+            best = (host, c)
+    return None if best is None else best[0] + cont[len(best[1]):]
+
+
+SRC_MOUNT = "/pdgate/src"
+
+
 def build_role(arm, role, cls, receipt, src, sha, extra_env, gate_root):
     rec, exec_env = load_receipt(receipt, role)
     env = dict(rec["environment"])
@@ -121,9 +135,20 @@ def build_role(arm, role, cls, receipt, src, sha, extra_env, gate_root):
     old_src = env["V4_SOURCE"]
     pp = env["PYTHONPATH"].split(":")
     assert pp.count(old_src + "/python") == 1 and env["FINAL_FORK"] == old_src, (pp, old_src)
+    extra_mounts = []
     if src and src != old_src:
         assert sha and len(sha) == 40, "--src needs the full 40-hex --sha"
-        assert Path(host_path(src) + "/python/sglang").is_dir(), src
+        host_src = host_path(src)
+        assert Path(host_src + "/python/sglang").is_dir(), src
+        # the PD receipts mount stable-src over /work/src (and other trees over /work/...): a tree uploaded to $W/src is
+        # invisible at its /work path inside the window's container -> the stock /sgl-workspace sglang answers instead
+        # (P5 / P3 gates 4560175 / 4560392: 'sglang serve: unrecognized arguments --duet-release ...').  Mount it at
+        # /pdgate/src/<name> whenever the receipt's mount table does not resolve the path to the same host tree.
+        if resolve(mounts, src) != host_src:
+            cont = f"{SRC_MOUNT}/{Path(src).name}"
+            extra_mounts.append(f"{host_src}:{cont}:ro")
+            changed["source_mount"] = [src, f"{host_src} -> {cont} (receipt mounts shadow {src})"]
+            src = cont
         pp[pp.index(old_src + "/python")] = src + "/python"
         for k, v in (("V4_SOURCE", src), ("FINAL_FORK", src), ("V4_SHA", sha)):
             changed[k] = [env[k], v]
@@ -151,7 +176,11 @@ def build_role(arm, role, cls, receipt, src, sha, extra_env, gate_root):
             changed[flag] = [None, True]
     shallow = "--flashnext-pd-shallow-prefill" in argv
     mk = sorted({env[k] for k in CACHE + LOCAL if k in env} | {f"{local}/hf"})
+    mounts = mounts + extra_mounts
+    for path in (env["V4_SOURCE"] + "/python/sglang/__init__.py",):  # what the server will import, through the mounts
+        assert resolve(mounts, path) and Path(resolve(mounts, path)).is_file(), f"{arm}/{role}: {path} not visible in the container"
     spec = dict(arm=arm, role=role, cls=cls, receipt=str(receipt), gpus=GPUS[role], ports=PORTS[role], shallow=shallow,
+                sglang_expect=env["V4_SOURCE"] + "/python/sglang/",
                 source=env["V4_SOURCE"], source_sha=env["V4_SHA"], changed=changed, argv=argv, mkdirs=mk,
                 cache_env={k: env[k] for k in CACHE if k in env})
     return spec, env, argv, mounts
