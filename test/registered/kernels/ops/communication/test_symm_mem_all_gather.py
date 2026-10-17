@@ -53,6 +53,8 @@ TEST_HIDDEN = get_ci_test_range(TEST_HIDDEN, [7168])
 TEST_NUM_TOKENS = get_ci_test_range(TEST_NUM_TOKENS, [16])
 
 MAX_HIDDEN = max(TEST_HIDDEN)
+# Arbitrary; far above any gather, so only a rank that never arrives reaches it.
+ENABLE_TIMEOUT_NS = 20 * 10**9
 MAX_TOKENS = max(TEST_NUM_TOKENS)
 
 # ---------------------------------------------------------------------------
@@ -183,7 +185,13 @@ def test_symm_mem_all_gather_enable_flag() -> None:
     # Compile the predicated variant outside capture (a skipped launch).
     enable.zero_()
     all_gather_inner(
-        state, x, tp_hidden_dim=hidden, skip_entry_sync=True, safe=False, enable=enable
+        state,
+        x,
+        tp_hidden_dim=hidden,
+        skip_entry_sync=True,
+        safe=False,
+        enable=enable,
+        timeout_ns=ENABLE_TIMEOUT_NS,
     )
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -194,6 +202,7 @@ def test_symm_mem_all_gather_enable_flag() -> None:
             skip_entry_sync=True,
             safe=False,
             enable=enable,
+            timeout_ns=ENABLE_TIMEOUT_NS,
         )
     for step in range(TEST_LOOP):
         dist.barrier(nccl_group)

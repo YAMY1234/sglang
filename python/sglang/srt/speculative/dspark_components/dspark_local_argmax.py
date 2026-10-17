@@ -181,6 +181,8 @@ class LocalArgmaxSink:
         # Rank-uniform by contract (set from batch properties all TP ranks share).
         self.full_logits_flag = torch.ones((1,), dtype=torch.int32, device=device)
         self._full_logits_needed = True
+        # The flag-gated gather's barriers trap at the exchange's deadline.
+        self.timeout_ns = exchange.timeout_ns
 
     @property
     def pending(self) -> bool:
