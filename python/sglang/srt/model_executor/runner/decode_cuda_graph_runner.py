@@ -318,16 +318,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 model_runner, self.captured_req_width
             )
         else:
-            # A nested PD tail owns a single independent bucket; the private PD
-            # boundary runner (SGLANG_GDN_PD_BOUNDARY_ASYNC) owns its own short
-            # ascending list. Neither may capture the ordinary D bucket list.
-            if (not capture_bs_override
-                    or capture_bs_override != sorted(set(capture_bs_override))
-                    or capture_bs_override[0] < 1 or self.captured_req_width != 1
+            # A nested PD tail owns a single independent bucket. In particular,
+            # it must not capture the ordinary D runner's full bucket list.
+            if (capture_bs_override != [1] or self.captured_req_width != 1
                     or self.enable_torch_compile or self.enable_two_batch_overlap
                     or self.require_gathered_buffer or self.pp_size != 1):
-                raise ValueError("isolated decode capture requires unsharded ascending buckets")
-            self.capture_bs, self.compile_bs = list(capture_bs_override), []
+                raise ValueError("isolated decode capture requires unsharded B1")
+            self.capture_bs, self.compile_bs = [1], []
         self.max_bs = max(self.capture_bs)
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
