@@ -173,7 +173,9 @@ class ExactTailTransaction:
         if self.tail_expected and set(self.tails) != expected:
             raise RuntimeError("exact-tail forward is missing recurrent layer activations")
         if self.plan is not None:
-            graph = self.pool._prefill_batch_graph
+            from .gdn_prefill_agg_contract import k31_ab_graph
+            graph = k31_ab_graph(self.pool._prefill_batch_graph,
+                                getattr(self.pool, "_prefill_batch_graph_ab", None))
             if not graph.warmed:
                 raise RuntimeError("exact-tail publication graph must be prewarmed")
             tails = self.tails
