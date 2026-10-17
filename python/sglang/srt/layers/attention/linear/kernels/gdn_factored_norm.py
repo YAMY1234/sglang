@@ -102,7 +102,7 @@ def can_fuse_norm(backend, forward_batch, mixed, z, norm):
     result = _can_fuse_norm(backend, forward_batch, mixed, z, norm)
     if (not result and enabled() and os.environ.get("SGLANG_GDN_P4_CAPTURE_DIR")
             and forward_batch.forward_mode.is_decode()
-            and getattr(mixed, "shape", (0,))[0] in (1, 2, 8)):
+            and getattr(mixed, "shape", (0,))[0] in range(1, 9)):
         leaf = decode_backend(backend)
         key = (type(backend).__name__, type(leaf).__name__, mixed.shape[0])
         if key not in _REJECTIONS:

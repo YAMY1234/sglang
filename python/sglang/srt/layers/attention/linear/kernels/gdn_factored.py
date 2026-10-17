@@ -1081,8 +1081,8 @@ def factored_packed_decode(
         assert z is not None and cuda_ext is not None, "P4 norm requires the qualified CUDA step"
         assert kernel == "split", "P4 norm requires the split step"
     if cuda_ext is not None:
-        if fuse_norm and "NORM" not in _STEP_FEATURE_LOGGED:
-            _STEP_FEATURE_LOGGED.add("NORM")
+        if fuse_norm and ("NORM", B, HV) not in _STEP_FEATURE_LOGGED:
+            _STEP_FEATURE_LOGGED.add(("NORM", B, HV))
             import logging
             logging.getLogger(__name__).info("FACTORED_STEP_FUSE_NORM_ACTIVE gate=sigmoid batch=%d hv=%d z_shape=%s z_stride=%s z_storage_offset=%d",
                                             B, HV, tuple(z.shape), tuple(z.stride()), z.storage_offset())
