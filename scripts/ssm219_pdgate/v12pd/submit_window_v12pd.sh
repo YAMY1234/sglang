@@ -12,6 +12,8 @@ W=/lustre/fsw/portfolios/coreai/users/yangminl/twinstar-20260911
 R=$W/results/p3pd-20261017
 B=$R/inputs/pkg-$FP
 [[ -f $R/CPU-ready-$FP.json ]] || { echo "no CPU gate receipt for $FP on this cluster"; exit 2; }
+T=$(dirname "$(readlink -f "$0")")/..
+python3 $T/p12/lhr/depcheck.py $T/p12/lhr/items.txt $B || exit 3  # docs/222 §20.3: every dependency exists on this cluster
 read -ra V <<< "$VARIANTS"; N=${#V[@]}
 export TRIO_VARIANTS="$VARIANTS"
 NAME="v12pd-C$C-$(echo "$VARIANTS" | tr -d ' +' )${SECS:+-canary}"

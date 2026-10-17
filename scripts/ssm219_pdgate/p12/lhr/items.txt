@@ -19,6 +19,7 @@ results/remeasure-ladder-20260930/inputs/pside303-extra-0fb22cc5c44 copy PSIDE_E
 results/remeasure-ladder-20260930/cache/hf copy /work/hf-cache mount (empty on CMH)
 results/remeasure-bf16-pd-fourarm-20261006/cache copy container workdir runtime/, client-hf, aiperf-mmap, hf-native
 results/remeasure-side-stream-host-decode-triple-tp1-20261006/cache/shared-warm-seed copy prelude compile-cache seed (cache_seed_node.py)
+results/pfactor4-rung1-20260930 copy torch / triton best_config autotune cache the seeded inductor kernels look up (absent -> autotune writes under read-only /work, scheduler dies; LHR 252802)
 scratch/duet-agentx-uvpy copy client venv's base interpreter (/work/scratch/duet-agentx-uvpy)
 results/flashnext-stage2-20260923/client-runtime copy aiperf client venv (CLIENT_BIN)
 results/flashnext-stage2-20260923/preflight/quality-v3-c520-manifest.json copy PDFIX_QUALITY_MANIFEST

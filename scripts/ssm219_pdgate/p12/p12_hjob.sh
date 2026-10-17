@@ -13,7 +13,7 @@ set -uo pipefail
 KIND=$1; FP=$2
 W=/lustre/fsw/portfolios/coreai/users/yangminl/twinstar-20260911
 R=$W/results/p3pd-20261017; B=$R/inputs/pkg-$FP
-T=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+T=${P12_JOBDIR:-$W/results/ssm-kernel-219/ws2/p12/pkg-$FP}   # not dirname $0: plain sbatch runs a spool copy (LHR 252802)
 JOB=${HOLDER_JOB:-${SLURM_JOB_ID:?}}
 NODE=$(hostname -s)
 OUT=$R/p12/$KIND-$JOB-$(date -u +%Y%m%dT%H%M%SZ); mkdir -p $OUT
