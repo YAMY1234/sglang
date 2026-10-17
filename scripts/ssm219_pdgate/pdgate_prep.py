@@ -64,7 +64,9 @@ KNOWN = {
 }
 # switches whose code path this gate cannot show on its own
 COVERED_BY = {"SGLANG_GDN_K31_CHOLQR_MIXED": ("SGLANG_GDN_K31_FUSED",
-              "no own line; K31_FUSED_ACTIVE implies it (fused = CHOLQR_MIXED and fused_supported, gdn_factored_pool.py)")}
+              "no own line; K31_FUSED_ACTIVE implies it (fused = CHOLQR_MIXED and fused_supported, gdn_factored_pool.py)"),
+              "SGLANG_GDN_FACTORED_HOST_SYNC_FREE": ("SGLANG_GDN_PD_PUBLISH_JOIN_OFFLOAD",
+              "no own line; join_offload=True implies it (offload raises without HOST_SYNC_FREE, gdn_pd_publication.py)")}
 NOT_EXERCISED = {"SGLANG_GDN_PREFIX_RESTORE_FUSED": "prefix hits only; the gate's windows are cold (P cached_tokens == 0)"}
 FALSE = ("", "0", "false", "False", "off")
 

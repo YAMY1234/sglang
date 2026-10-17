@@ -398,9 +398,103 @@ def summary_tests(tmp, gate_summary):
     check(make("pcplus", 0.0, 190, good, [], step0="D")[1]["verdict"]["cand1"] == "PASS", "summary: PC+ layout (step 0 on D)")
 
 
+STUB_SRUN = r"""#!/bin/bash
+# stub srun for the hjob dry run: host GPU query, fake servers, fake client phase, real summary
+args="$*"
+if [[ $args == *nvidia-smi* ]]; then exit 0; fi
+if [[ $args == *pdgate_summary.py* ]]; then exec python3 $STUB_TOOLS/pdgate_summary.py $STUB_OUT; fi
+if [[ $args == *pdgate_phase.sh* ]]; then
+  arm=$(echo "$args" | grep -oE 'pdgate_phase.sh [a-z0-9]+' | cut -d' ' -f2)
+  exec python3 $STUB_TOOLS/pdgate_selftest.py _fakephase $STUB_OUT $arm
+fi
+if [[ $args == *"eval exec"* ]]; then
+  a=$(echo "$args" | grep -oE 'g-[a-z0-9]+-[PD][.]json' | head -1); a=${a%.json}; role=${a##*-}; arm=${a#g-}; arm=${arm%-*}
+  echo "PDGATE_ENV PDGATE_ROLE=$role"
+  if [[ $arm == cand1 && $role == P ]]; then echo "PDGATE_ENV SGLANG_GDN_K31_FUSED=1"; echo "[TP0] K31_FUSED_ACTIVE 36 1 24"; fi
+  if [[ "${STUB_DIE:-}" == "$arm-$role" ]]; then sleep 3; exit 1; fi
+  exec sleep 600
+fi
+echo "stub srun: unknown $args" >&2; exit 99
+"""
+
+
+def fake_phase(out, arm):
+    """Client stand-in for the hjob dry run: the files a finished phase leaves (step 0 on P)."""
+    import random
+    out = Path(out)
+    print(f"READY {arm}-P after 1 s\nREADY {arm}-D after 1 s", flush=True)
+    if os.environ.get("STUB_SLOW") == arm:
+        time.sleep(120)
+    rng = random.Random(arm)
+    for role in ("P", "D"):
+        with open(out / f"rec-{arm}-score.{role}.jsonl", "w") as f:
+            for w in range(48):
+                for s in range(8):
+                    if (s == 0) == (role == "P"):
+                        f.write(json.dumps({"window": w, "step": s, "role": role, "kl_s32": 0.02 + rng.gauss(0, 0.002)}) + "\n")
+    (out / f"score-meta-{arm}.json").write_text(json.dumps({"by_role": {}, "step0_by_role": {}, "windows": {"0": {"P_cached": 0}}}))
+    (out / f"gsm-{arm}.json").write_text(json.dumps({"arm": arm, "correct": 190, "records": [{"correct": i < 190} for i in range(200)]}))
+    print(f"PHASE-DONE {arm}", flush=True)
+
+
+def hjob_tests(tmp):
+    import subprocess
+    tmp = Path(tmp)
+    tools, stub = tmp / "tools", tmp / "stub"
+    tools.mkdir()
+    stub.mkdir()
+    for f in ("pdgate_hjob.sh", "pdgate_seed.py", "pdgate_summary.py", "pdgate_selftest.py"):
+        shutil.copy(HERE / f, tools / f)
+    (stub / "srun").write_text(STUB_SRUN)
+    (stub / "srun").chmod(0o755)
+    (stub / "hlib.sh").write_text("W=/tmp; R=/tmp\nh_image() { echo IMG; }\nh_set() { echo $2; }\n")
+    (stub / "Cplus.json").write_text(json.dumps({"seed": "x", "seed_MANIFEST_SHA256": "y", "cache_environment": {}}))
+    (stub / "cache_seed_node.py").write_text(
+        "import json\ndef populate(seed, expected, env, receipt):\n"
+        "    r = dict(passed=True, mappings={})\n    open(receipt, 'w').write(json.dumps(r))\n    return r\n")
+
+    def run(name, extra_env):
+        out = tmp / name
+        out.mkdir()
+        (out / "tools").symlink_to(tools)
+        exp = {"cand1": {"P": [{"key": "SGLANG_GDN_K31_FUSED", "kind": "line", "regex": r"K31_FUSED_ACTIVE 36 \d+ 24",
+                                "forbid_in_before": True},
+                               {"key": "SGLANG_GDN_K31_FUSED", "kind": "env", "regex": "PDGATE_ENV SGLANG_GDN_K31_FUSED=1$"}],
+                         "D": []}}
+        arms = {a: {"step0_owner": "P", "prelude": str(stub / "Cplus.json"), "cache_env": {"P": {}, "D": {}}}
+                for a in ("before", "cand1")}
+        (out / "plan.json").write_text(json.dumps({"phases": ["before", "cand1"], "run_phases": ["before", "cand1"],
+                                                   "arms": arms, "ref": {"name": "s32"}, "windows": {"n": 48, "cont": 8},
+                                                   "expectations": exp, "expectation_notes": []}))
+        for a in ("before", "cand1"):
+            (out / f"g-{a}.mounts").write_text("@MODEL@:/model:ro")
+            for r, g in (("P", "0,1"), ("D", "2,3")):
+                (out / f"g-{a}-{r}.json").write_text(json.dumps({"gpus": g}))
+        env = dict(os.environ, OUT=str(out), HOLDER_JOB="1", HOLDER_CVD="0,1,2,3", PDGATE_HLIB=str(stub / "hlib.sh"),
+                   PATH=f"{stub}:{os.environ['PATH']}", STUB_OUT=str(out), STUB_TOOLS=str(tools), **extra_env)
+        t0 = time.time()
+        p = subprocess.run(["bash", "-c", f"source {out}/tools/pdgate_hjob.sh"], env=env, capture_output=True, text=True,
+                           timeout=400)
+        log = (out / "job.log").read_text()
+        summ = json.loads((out / "gate-summary.json").read_text()) if (out / "gate-summary.json").exists() else {}
+        return p.returncode, log, summ, time.time() - t0
+
+    rc, log, summ, dt = run("ok", {})
+    check(rc == 0 and "PHASE before rc=0" in log and "PHASE cand1 rc=0" in log and "END rc=0" in log,
+          f"hjob dry run: two phases, rc 0 ({dt:.0f} s)")
+    check(summ.get("verdict", {}).get("cand1") == "PASS", "hjob dry run: summary verdict PASS from the stub lines")
+    rc, log, summ, dt = run("die", {"STUB_DIE": "cand1-D", "STUB_SLOW": "cand1"})
+    check(rc == 10 and "SERVER-EXIT cand1" in log and dt < 100, f"hjob watchdog: D exits mid-phase -> rc 10 in {dt:.0f} s")
+    if dt >= 100:
+        print(log)
+    check(summ.get("verdict", {}).get("cand1") == "INCOMPLETE", "hjob watchdog: verdict INCOMPLETE")
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "_fakephase":
+        return fake_phase(sys.argv[2], sys.argv[3])
     ap = argparse.ArgumentParser()
-    ap.add_argument("what", choices=("prep", "units"))
+    ap.add_argument("what", choices=("prep", "units", "hjob"))
     ap.add_argument("--root")
     ap.add_argument("--acc-audit")
     ap.add_argument("--gate-summary")
@@ -408,6 +502,9 @@ def main():
     a = ap.parse_args()
     if a.what == "prep":
         prep_tests(a.root)
+    elif a.what == "hjob":
+        with tempfile.TemporaryDirectory() as tmp:
+            hjob_tests(tmp)
     else:
         with tempfile.TemporaryDirectory() as tmp:
             if a.stub_sglang:

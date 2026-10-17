@@ -7,7 +7,7 @@
 # then pdgate_summary.py -> gate-summary.json / summary.json (agg gate schema + PD role split + activation lines).
 set -uo pipefail
 : "${OUT:?OUT}" "${HOLDER_JOB:?HOLDER_JOB}"
-source /lustre/fsw/portfolios/coreai/users/yangminl/twinstar-20260911/results/ssm-kernel-219/holder/scripts/hlib.sh
+source ${PDGATE_HLIB:-/lustre/fsw/portfolios/coreai/users/yangminl/twinstar-20260911/results/ssm-kernel-219/holder/scripts/hlib.sh}
 IMG=$(h_image); MODEL=$(h_set model $R/staging/model); BH=$(hostname)
 log() { echo "PDGATE $(date -u +%FT%TZ) $*" | tee -a $OUT/job.log; }
 log "START holder=$HOLDER_JOB node=$BH run=${RUN_DIR:-} cvd=${HOLDER_CVD:-} image=$IMG model=$MODEL"
@@ -43,8 +43,17 @@ for ARM in $PHASES; do
   gpu_idle || { log "GPUS-BUSY before $ARM"; RC=9; break; }
   log "PHASE $ARM start"
   SP=$(serve $ARM P); SD=$(serve $ARM D)
-  client bash /out/tools/pdgate_phase.sh $ARM $BH > $OUT/phase-$ARM.log 2>&1
-  rc=$?; log "PHASE $ARM rc=$rc $(grep -E 'READY|SMOKE|SCORE|GSM|PHASE|DEAD|TIMEOUT|FAIL' $OUT/phase-$ARM.log | tr '\n' ' ')"
+  client bash /out/tools/pdgate_phase.sh $ARM $BH > $OUT/phase-$ARM.log 2>&1 &
+  CP=$!; t0=$(date +%s); why=
+  # watchdog: a server that exits after READY would leave the client blocked on HTTP; the phase also has a wall cap
+  while kill -0 $CP 2>/dev/null; do
+    kill -0 $SP 2>/dev/null && kill -0 $SD 2>/dev/null || { why="SERVER-EXIT"; break; }
+    (( $(date +%s) - t0 > ${PDGATE_PHASE_MAX_S:-2400} )) && { why="PHASE-WALL-CAP"; break; }
+    sleep 10
+  done
+  [[ -n $why ]] && { log "$why $ARM: stopping the client"; kill $CP 2>/dev/null; }
+  wait $CP; rc=$?; [[ -n $why ]] && rc=10
+  log "PHASE $ARM rc=$rc $(grep -E 'READY|SMOKE|SCORE|GSM|PHASE|DEAD|TIMEOUT|FAIL' $OUT/phase-$ARM.log | tr '\n' ' ')"
   kill $SP $SD 2>/dev/null
   for i in $(seq 1 60); do kill -0 $SP 2>/dev/null || kill -0 $SD 2>/dev/null || break; sleep 2; done
   kill -9 $SP $SD 2>/dev/null
