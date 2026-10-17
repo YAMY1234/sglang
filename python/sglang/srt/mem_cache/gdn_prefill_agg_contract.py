@@ -496,6 +496,11 @@ def install(runner):
         return
     if getattr(owner, "_pfactor_agg_installed", False):
         return
+    if shallow_fulln and getattr(owner, "pd_trunk_prefill_graph", False):
+        # That runner explicitly rebuilds ForwardBatch and does not carry the
+        # current deep encoding / fp32 snapshot policy. The qualified P recipe
+        # uses eager trunk + the separate whole-emitter graph.
+        raise ValueError("P3 shallow full-N requires SGLANG_FLASHNEXT_PD_TRUNK_PREFILL_GRAPH=0")
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend

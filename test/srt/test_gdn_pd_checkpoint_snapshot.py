@@ -10,6 +10,22 @@ from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKerne
 
 
 class SnapshotTest(unittest.TestCase):
+    def test_unqualified_trunk_graph_is_rejected_only_with_p3_requested(self):
+        from sglang.srt.mem_cache import gdn_prefill_agg_contract as contract
+        owner = NS(pd_shallow_role='prefill', pd_trunk_prefill_graph=True,
+                   fullstack={'gdn_rank': 16})
+        runner = NS(model=owner, req_to_token_pool=None,
+                    server_args=NS(disaggregation_mode='prefill'))
+        for enabled in ('0', '1'):
+            with patch.dict(os.environ, SGLANG_GDN_PD_SHALLOW_FULLN=enabled,
+                            SGLANG_GDN_PREFILL_AGG_CONTRACT='1'):
+                if enabled == '1':
+                    with self.assertLogs(level='WARNING'), self.assertRaisesRegex(
+                            ValueError, 'PD_TRUNK_PREFILL_GRAPH=0'):
+                        contract.install(runner)
+                else:
+                    contract.install(runner)
+
     def test_actual_eager_copy_preserves_both_checkpoint_policies(self):
         from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
         from sglang.srt.model_executor.runner.eager_runner import EagerRunner
