@@ -1592,9 +1592,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
 
-        from sglang.srt.disaggregation.flashnext_shallow import note_preallocated
-
-        note_preallocated(self.scheduler, preallocated_reqs)
         return preallocated_reqs, failed_reqs
 
     @property
@@ -2828,9 +2825,7 @@ class SchedulerDisaggregationDecodeMixin:
         if self.enable_overlap:
             # A finished request can still have one redundant forward in flight.
             # Drain it before a prebuilt request seeds a potentially reused row.
-            from sglang.srt.disaggregation.flashnext_shallow import prebuilt_fence
-
-            prebuilt_fence(self, can_run_list)
+            self.schedule_stream.wait_stream(self.forward_stream)
         return new_batch
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
