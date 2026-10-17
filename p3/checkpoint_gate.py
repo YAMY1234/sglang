@@ -206,6 +206,8 @@ def main():
         cases = ((trace_length, True),)
     if focus:
         cases = ((128, False), (129, True))
+        if os.environ.get('P3_CHECKPOINT_NONFINAL_H') == '1':
+            cases += ((130, False),)
     for length, final in cases:
         reference = None
         reference_qsa = None
@@ -215,6 +217,11 @@ def main():
         for route_index, route in enumerate(routes):
             trace_current['route'] = route
             set_pd_micro_route(route)
+            if route == '0' and os.environ.get('P3_CHECKPOINT_SERVICE_DEFERRED') == '1':
+                # Production route 0+deferred: keep A (R1 off), remove only
+                # the micro's explicit forward-publication override.
+                from sglang.srt.mem_cache import gdn_prefill_agg_contract as contract
+                contract._PD_MICRO_ROUTE = None
             captured.clear()
             publication.clear()
             qsa_capture.clear()
@@ -368,12 +375,14 @@ def main():
                 route_stored_content=fulln['factor_diagnostic']['content_max'],
                 route_residual_max=fulln['factor_diagnostic']['residual_ratio_max']))
     summary = dict(complete=True, required_bitwise_pass=all(row['old_checkpoint_bitwise'] for row in results),
-                   repeat_controls=controls, admission_paused=repeat_control,
+                   repeat_controls=controls, admission_paused=focus or repeat_control,
                    factor_bounds_pass_by_route=per_route,
                    routing_only_pass=per_route['0n'] and per_route['0'],
                    combined_pass=per_route['0n'] and per_route['1'],
                    passed=all(per_route.values()), cases=results,
                    diagnostic_only=focus or repeat_control or bool(trace_length) or os.environ.get('P3_CHECKPOINT_DEBUG') == '1')
+    if focus:
+        summary['passed'] = summary['routing_only_pass'] and summary['required_bitwise_pass']
     out.write_text(json.dumps(summary, indent=2) + '\n')
     print('P3_CHECKPOINT_SUMMARY', json.dumps({k: v for k, v in summary.items() if k != 'cases'}), flush=True)
     if not summary['passed']:
