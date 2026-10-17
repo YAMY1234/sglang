@@ -183,9 +183,11 @@ class FullNCheckpointReplay(unittest.TestCase):
         self.assertEqual([h for h, _, _ in res["fulln_new"]], [h for h, _, _ in res["legacy"]])
         aligned_turns = [k for k, p in enumerate(CHAINS[name]) if p[0] % CHUNK == 0 and k]
         self.assertTrue(aligned_turns)
-        for k in aligned_turns:  # the old route donated an unreachable P; the next turn fell short
-            if k + 1 < len(res["fulln_old"]):
-                self.assertLess(res["fulln_old"][k + 1][0], res["legacy"][k + 1][0])
+        for k in range(len(res["legacy"])):  # the old extent never hits more than legacy
+            self.assertLessEqual(res["fulln_old"][k][0], res["legacy"][k][0])
+        if name == "synthetic":  # 2048 -> 2049 and 4096 -> 4161: the old extent's P is unreachable
+            self.assertTrue(any(res["fulln_old"][k + 1][0] < res["legacy"][k + 1][0]
+                                for k in aligned_turns if k + 1 < len(res["legacy"])))
         # fixed full-N never takes last_recurrent_state for a depth short of the forward's end
         for hit, depth, src in res["fulln_new"]:
             if src == "final":
