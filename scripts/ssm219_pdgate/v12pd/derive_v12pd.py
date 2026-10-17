@@ -9,7 +9,9 @@ on P) with the U1 overlay on EVERY variant and role, as the agg row sets F219_U1
          The two WS-3 files are frozen read-only under the campaign inputs (u1-overlay-<blobs>), same bytes as
          $W/results/ws3-ttft-223/tools/u1a.  Structurally inert in PD (WS-3): P runs --disable-overlap-schedule, D has
          only decode / prebuilt batches; set anyway for "same stack" (lead 09:44).
-  U1-c : SGLANG_QSA_PREFILL_HOIST=1 (stock switch, present in both PD trees: environ.py:309, qsa/metadata.py:135).
+  U1-c : SGLANG_QSA_PREFILL_HOIST=1 (stock switch, present in both PD trees: environ.py:309, qsa/metadata.py:135) is ALREADY
+         on in every 4569012 PD recipe (baseline env of S / C+ / P / PC+, P and D): apply_u1 asserts it, changes nothing
+         (CPU gate 252399 found it).
 
 Points (each text patch asserts its exact hit count):
   r16_delta apply_u1 + constants; clone_role apply_u1 after apply_p3; prewindow_gate U1 env + "WS3_U1A installed" on both
@@ -96,13 +98,14 @@ def main():
         "def apply_u1(variant, role, env, setv, worker_root):\n"
         "    \"\"\"U1-a (site dir first on PYTHONPATH + switch + decision-log dir) and U1-c (QSA prefill hoist).\"\"\"\n"
         "    pp = env['PYTHONPATH'].split(':')\n"
-        "    assert U1_SITE not in pp and not set(U1_ENV) & set(env) and 'SGLANG_AB_OUT' not in env, (variant, role)\n"
-        "    why = 'docs/222 §21: v12 stack U1-a (WS-3 u1a site, frozen) + U1-c on every variant / role (lead 09:44)'\n"
+        "    # U1-c is already on in every 4569012 PD recipe (baseline env SGLANG_QSA_PREFILL_HOIST=1, all variants / roles)\n"
+        "    assert env.get('SGLANG_QSA_PREFILL_HOIST') == '1', (variant, role, env.get('SGLANG_QSA_PREFILL_HOIST'))\n"
+        "    assert U1_SITE not in pp and 'SGLANG_GDN_U1A_RESULT_BEFORE_EXTEND' not in env and 'SGLANG_AB_OUT' not in env, (variant, role)\n"
+        "    why = 'docs/222 §21: v12 stack U1-a (WS-3 u1a site, frozen) on every variant / role (lead 09:44); U1-c already on'\n"
         "    setv('PYTHONPATH', ':'.join([U1_SITE] + pp), why)\n"
-        "    for k, v in U1_ENV.items():\n"
-        "        setv(k, v, why)\n"
+        "    setv('SGLANG_GDN_U1A_RESULT_BEFORE_EXTEND', '1', why)\n"
         "    setv('SGLANG_AB_OUT', str(worker_root) + '/u1a', why)\n"
-        "    return sorted(U1_ENV) + ['SGLANG_AB_OUT']\n"))
+        "    return ['SGLANG_AB_OUT', 'SGLANG_GDN_U1A_RESULT_BEFORE_EXTEND']\n"))
     patches.append(dict(file='support/r16_delta.py', appended='apply_u1 + constants'))
 
     # ---- clone_role ----
@@ -136,7 +139,7 @@ def main():
     # ---- CPU gate ----
     cg = 'support/r16_cpu_gate.py'
     patch(cg, "        assert sorted(science_env) == sorted(want), (variant, role, science_env)\n",
-          "        want = sorted(set(want) | {'PYTHONPATH', 'SGLANG_AB_OUT'} | set(r16_delta.U1_ENV))  # docs/222 §21\n"
+          "        want = sorted(set(want) | {'PYTHONPATH', 'SGLANG_AB_OUT', 'SGLANG_GDN_U1A_RESULT_BEFORE_EXTEND'})  # docs/222 §21 (U1-c already in the baseline)\n"
           "        assert sorted(science_env) == sorted(want), (variant, role, science_env)\n"
           "        assert env['PYTHONPATH'].split(':')[0] == r16_delta.U1_SITE and env['SGLANG_AB_OUT'].endswith('/u1a')\n"
           "        assert all(env[k] == v for k, v in r16_delta.U1_ENV.items()), (variant, role)\n")
