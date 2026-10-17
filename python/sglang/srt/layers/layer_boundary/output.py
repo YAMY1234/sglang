@@ -83,6 +83,10 @@ class UnreducedOutput(msgspec.Struct, frozen=True):
     # Custom implementation of the same group, without token redistribution.
     complete_sum: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
 
+    # A producer kernel that completes this sum fused with its consumer's post;
+    # only that consumer reads it, everyone else calls complete().
+    fused_post: Optional[Callable] = None
+
     def __post_init__(self):
         if self.complete_sum is not None and self.reduce_to_dp_local is not None:
             raise ValueError("choose a custom sum or a DP redistribution")
