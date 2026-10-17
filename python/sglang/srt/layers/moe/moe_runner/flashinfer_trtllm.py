@@ -3,7 +3,7 @@ from __future__ import annotations
 import contextvars
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Generator, Optional, cast
+from typing import TYPE_CHECKING, Any, Callable, Generator, Optional, Tuple, cast
 
 import torch
 from torch.nn import Module
@@ -62,6 +62,9 @@ class FlashInferTrtllmDeferredFinalizeOutput:
     expert_weights: torch.Tensor
     expanded_idx_to_permuted_idx: torch.Tensor
     top_k: int
+    # Replaces the collective MoE post when set: (gemm2_out, expanded_idx_to_permuted_idx,
+    # expert_weights, top_k, shared, residual, post_mix, comb, pre, next) -> (updated, input).
+    fused_post: Optional[Callable[..., Tuple[torch.Tensor, Any]]] = None
 
 
 @contextmanager

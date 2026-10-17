@@ -291,6 +291,106 @@ class TestAttentionFusedPost(unittest.TestCase):
         torch.testing.assert_close(state.streams, residual + 1)
 
 
+class TestMoeFusedPost(unittest.TestCase):
+    @staticmethod
+    def _moe_output(rows, fused_post):
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+            FlashInferTrtllmDeferredFinalizeOutput,
+        )
+        from sglang.srt.models.deepseek_v2 import MoEOutput
+
+        routed = FlashInferTrtllmDeferredFinalizeOutput(
+            torch.ones(rows * 6, 4),
+            torch.ones(rows, 6),
+            torch.zeros(rows, 6, dtype=torch.int32),
+            6,
+            fused_post=fused_post,
+        )
+        return MoEOutput(routed, torch.ones(rows, 4), None, 1.0, False)
+
+    @staticmethod
+    def _triplet(rows):
+        return (torch.ones(rows, 2), torch.ones(rows, 2), torch.ones(rows, 2, 2))
+
+    def test_fused_post_runs_at_any_width_and_builds_the_next_input(self):
+        """A fused post on the deferred output must replace the collective kernel at
+        widths the push plane cannot carry, with or without a next boundary."""
+        rows = 512
+        residual = torch.zeros(rows, 2, 4)
+        next_input = object()
+        fused_post = Mock(return_value=(residual + 1, next_input))
+        out = self._moe_output(rows, fused_post)
+        triplet = self._triplet(rows)
+        stock = SimpleNamespace(moe_finalize_all_reduce_mhc_post=Mock())
+        for nxt in (None, SimpleNamespace(accepts_mxfp8=True, norm_fusable=True)):
+            fused_post.reset_mock()
+            with patch.dict(
+                "sys.modules",
+                {"sglang.kernels.ops.communication.all_reduce_mhc": stock},
+            ):
+                state = mhc.run_moe_post(
+                    None,
+                    out,
+                    residual,
+                    stats_stream=None,
+                    next=nxt,
+                    world_size=4,
+                    precomputed=triplet,
+                )
+            r = out.routed
+            pre, post_mix, comb = triplet
+            want = (r.gemm2_out, r.expanded_idx_to_permuted_idx, r.expert_weights)
+            want += (r.top_k, out.shared, residual, post_mix, comb, pre, nxt)
+            args = fused_post.call_args.args
+            self.assertEqual(len(args), len(want))
+            for got, expected in zip(args, want):
+                self.assertIs(got, expected)
+            torch.testing.assert_close(state.streams, residual + 1)
+            self.assertIs(state.pre, pre)
+            self.assertIs(state.input, next_input)
+        stock.moe_finalize_all_reduce_mhc_post.assert_not_called()
+
+    def test_unset_fused_post_runs_the_collective_kernel(self):
+        from sglang.srt.layers.quantization import mxfp4_flashinfer_trtllm_moe
+
+        rows = 3
+        residual = torch.zeros(rows, 2, 4)
+        out = self._moe_output(rows, None)
+        triplet = self._triplet(rows)
+        stock = SimpleNamespace(
+            moe_finalize_all_reduce_mhc_post=Mock(return_value=(None, residual + 2))
+        )
+        with (
+            patch.dict(
+                "sys.modules",
+                {"sglang.kernels.ops.communication.all_reduce_mhc": stock},
+            ),
+            patch.object(
+                mxfp4_flashinfer_trtllm_moe, "can_fuse_all_reduce", return_value=True
+            ),
+        ):
+            state = mhc.run_moe_post(
+                SimpleNamespace(cfg=SimpleNamespace(hidden=4)),
+                out,
+                residual,
+                stats_stream=None,
+                next=None,
+                world_size=4,
+                precomputed=triplet,
+            )
+        r = out.routed
+        pre, post_mix, comb = triplet
+        want = (r.gemm2_out, r.expanded_idx_to_permuted_idx, r.expert_weights)
+        want += (r.top_k, out.shared, residual, post_mix, comb)
+        call = stock.moe_finalize_all_reduce_mhc_post.call_args
+        self.assertEqual(len(call.args), len(want))
+        for got, expected in zip(call.args, want):
+            self.assertIs(got, expected)
+        self.assertEqual(call.kwargs, {"world_size": 4})
+        torch.testing.assert_close(state.streams, residual + 2)
+        self.assertIsNone(state.input)
+
+
 class TestMoeSourceRows(unittest.TestCase):
     def test_cp_operand_is_released_before_return_and_v41_uses_contiguous_rows(self):
         from sglang.srt.layers.layer_boundary.layout import TokenAxis

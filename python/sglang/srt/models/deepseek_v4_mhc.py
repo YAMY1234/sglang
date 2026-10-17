@@ -700,12 +700,33 @@ def run_moe_post(
 ) -> HcState:
     """The MoE post. A deferred finalize the push plane can carry rides the
     collective kernel (finalize + shared add + all-reduce, quantizing ``next``'s
-    input when a boundary is given); anything else is finalized here and takes
-    the plain post."""
+    input when a boundary is given); one carrying its own fused post runs that at
+    any width, and it builds ``next``'s input itself; anything else is finalized
+    here and takes the plain post."""
     from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
         can_fuse_all_reduce,
     )
 
+    if (
+        isinstance(out, MoEOutput)
+        and is_deferred_finalize(out.routed)
+        and out.routed.fused_post is not None
+    ):
+        pre, post_mix, comb = _compute_triplet(hc, residual, stats_stream, precomputed)
+        r = out.routed
+        updated, next_input = r.fused_post(
+            r.gemm2_out,
+            r.expanded_idx_to_permuted_idx,
+            r.expert_weights,
+            r.top_k,
+            out.shared,
+            residual,
+            post_mix,
+            comb,
+            pre,
+            next,
+        )
+        return HcState(updated, pre, next_input)
     if (
         isinstance(out, MoEOutput)
         and is_deferred_finalize(out.routed)
