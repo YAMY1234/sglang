@@ -8,6 +8,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <type_traits>
+#include <cmath>
+#include <climits>
 
 namespace {
 constexpr int NW = 4, NR = 4, D = 128;
@@ -89,13 +91,61 @@ __device__ __forceinline__ float bias_float(float x) { return x; }
 __device__ __forceinline__ float bias_float(__nv_bfloat16 x) { return __bfloat162float(x); }
 __device__ __forceinline__ float bias_float(__half x) { return __half2float(x); }
 
-template<typename BiasT, bool INVALIDATE>
+// P4: warp 0 owns 128 outputs. Use all 32 lanes, four elements each;
+// K1's two half warps originally hold duplicate eight-element vectors.
+template<bool SHARED = false>
+__device__ __forceinline__ void norm_gate(const float (&oval)[8], int col,
+    const __nv_bfloat16* z, const __nv_bfloat16* weight, float eps, __nv_bfloat16* out) {
+  int lane = threadIdx.x & 31;
+  bool high = lane >= 16;
+  col += high ? 4 : 0;
+  float o[4] = {high ? oval[4] : oval[0], high ? oval[5] : oval[1],
+                high ? oval[6] : oval[2], high ? oval[7] : oval[3]};
+  #pragma unroll
+  for (int k = 0; k < 4; ++k)
+    o[k] = __bfloat162float(__float2bfloat16_rn(o[k]));
+  // Triton local order and the exact lane-bit permutation t=2*(l%16)+l/16.
+  float ss = __fmaf_rn(o[3], o[3], __fmaf_rn(o[2], o[2],
+                 __fmaf_rn(o[0], o[0], __fmul_rn(o[1], o[1]))));
+  #pragma unroll
+  for (int d = 8; d; d >>= 1)
+    ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffff, ss, d));
+  ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffff, ss, 16));
+  float v = __fadd_rn(div_full(ss, 128.f), eps), rstd;
+  asm("rsqrt.approx.ftz.f32 %0,%1;" : "=f"(rstd) : "f"(v));
+  uint2 zr, wr;
+  if constexpr (SHARED) {
+    zr = *reinterpret_cast<const uint2*>(z + col);
+    wr = *reinterpret_cast<const uint2*>(weight + col);
+  } else {
+    asm volatile("ld.global.v2.u32 {%0,%1}, [%2];" : "=r"(zr.x), "=r"(zr.y) : "l"(z+col) : "memory");
+    asm volatile("ld.global.v2.u32 {%0,%1}, [%2];" : "=r"(wr.x), "=r"(wr.y) : "l"(weight+col) : "memory");
+  }
+  unsigned zb[2] = {zr.x,zr.y}, wb[2] = {wr.x,wr.y}, packed[2];
+  float y[4];
+  #pragma unroll
+  for (int k = 0; k < 4; ++k) {
+    float zv = __uint_as_float((zb[k/2] >> (16*(k&1))) << 16);
+    float wv = __uint_as_float((wb[k/2] >> (16*(k&1))) << 16);
+    float sig = div_full(1.f, 1.f + ex(-zv));
+    y[k] = __fmul_rn(__fmul_rn(__fmul_rn(o[k],rstd),wv),sig);
+  }
+  #pragma unroll
+  for (int k = 0; k < 2; ++k)
+    packed[k] = unsigned(__bfloat16_as_ushort(__float2bfloat16_rn(y[2*k]))) |
+                (unsigned(__bfloat16_as_ushort(__float2bfloat16_rn(y[2*k+1]))) << 16);
+  *reinterpret_cast<uint2*>(out + col) = make_uint2(packed[0],packed[1]);
+}
+
+template<typename BiasT, bool INVALIDATE, bool NORM>
 __global__ __launch_bounds__(128, 4) void factored_step_r32_kernel(
     const __nv_bfloat16* mixed, const __nv_bfloat16* ag, const __nv_bfloat16* bg,
     const float* alog, const BiasT* bias, const float* vb,
     float* fa, __half* fu, __half* fw, int* fc, int* stale,
     const void* idx, bool idx64, __nv_bfloat16* out, int* pv,
-    int H, int HV, int64_t sm, int64_t sa, int64_t sb, int64_t si, float scale, float eps) {
+    int H, int HV, int64_t sm, int64_t sa, int64_t sb, int64_t si, float scale, float eps,
+    const __nv_bfloat16* z, const __nv_bfloat16* norm_weight, float norm_eps,
+    int sz_token, int sz_head) {
   int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   int col = (lane & 15) * 8, parity = lane >> 4;
   int n = blockIdx.x / HV, hv = blockIdx.x % HV, h = hv / (HV / H);
@@ -105,9 +155,33 @@ __global__ __launch_bounds__(128, 4) void factored_step_r32_kernel(
     if (tid == 0 && hv == 0) pv[slot < 0 ? 0 : slot] = 0;
   }
   if (slot < 0) {
-    if (tid < 16) reinterpret_cast<uint4*>(out + (int64_t(n) * HV + hv) * D)[tid] = make_uint4(0,0,0,0);
+    if constexpr (NORM) {
+      if (warp == 0) {
+        float zero[8] = {};
+        norm_gate(zero, col, z + (n*sz_token + hv*sz_head), norm_weight, norm_eps,
+                  out + (int64_t(n)*HV+hv)*D);
+      }
+    } else {
+      if (tid < 16) reinterpret_cast<uint4*>(out + (int64_t(n) * HV + hv) * D)[tid] = make_uint4(0,0,0,0);
+    }
     // Only the first 16 uint4 vectors belong to this 128-element output.
     return;
+  }
+  // Immutable z/weight are staged by warp 0 while K1 performs its recurrence.
+  // Only warp 0 reads these slabs. wait_group + syncwarp below publishes all
+  // sixteen writers to both half-warp readers, with no new CTA barrier.
+  __shared__ __align__(16) __nv_bfloat16 norm_z[D], norm_w[D];
+  if constexpr (NORM) {
+    if (warp == 0) {
+      if (lane < 16) {
+        unsigned zs = __cvta_generic_to_shared(norm_z + col);
+        unsigned ws = __cvta_generic_to_shared(norm_w + col);
+        const __nv_bfloat16* zg = z + (n*sz_token + hv*sz_head) + col;
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(zs), "l"(zg) : "memory");
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(ws), "l"(norm_weight + col) : "memory");
+      }
+      asm volatile("cp.async.commit_group;" ::: "memory");
+    }
   }
   int64_t sh = slot * HV + hv;
   const __nv_bfloat16* inp = mixed + n * sm;
@@ -250,8 +324,16 @@ __global__ __launch_bounds__(128, 4) void factored_step_r32_kernel(
     if (row == cnt && cnt < 32)
       *reinterpret_cast<uint4*>(fu + sh*32*D + row*D + col) = pack_half(khat);
   }
-  if (warp == 0 && lane < 16)
-    *reinterpret_cast<uint4*>(out + (int64_t(n)*HV+hv)*D + col) = pack_bf(oval);
+  if constexpr (NORM) {
+    if (warp == 0) {
+      asm volatile("cp.async.wait_group 0;" ::: "memory");
+      __syncwarp();
+      norm_gate<true>(oval, col, norm_z, norm_w, norm_eps, out + (int64_t(n)*HV+hv)*D);
+    }
+  } else {
+    if (warp == 0 && lane < 16)
+      *reinterpret_cast<uint4*>(out + (int64_t(n)*HV+hv)*D + col) = pack_bf(oval);
+  }
   if (tid == 0) { fc[sh]=cnt+1; stale[slot]=1; }
 }
 
@@ -267,7 +349,8 @@ void factored_step_r32(torch::Tensor mixed,torch::Tensor ag,torch::Tensor bg,
     torch::Tensor alog,torch::Tensor bias,torch::Tensor vb,torch::Tensor fa,
     torch::Tensor fu,torch::Tensor fw,torch::Tensor fc,torch::Tensor stale,
     torch::Tensor idx,torch::Tensor out,int H,double scale,double eps,
-    c10::optional<torch::Tensor> pv,bool invalidate) {
+    c10::optional<torch::Tensor> pv,bool invalidate,
+    c10::optional<torch::Tensor> z,c10::optional<torch::Tensor> norm_weight,double norm_eps) {
   const c10::cuda::CUDAGuard guard(mixed.device());
   int HV=fu.size(1), B=mixed.size(0);
   TORCH_CHECK(mixed.scalar_type()==at::kBFloat16 && ag.scalar_type()==at::kBFloat16 && bg.scalar_type()==at::kBFloat16);
@@ -278,19 +361,44 @@ void factored_step_r32(torch::Tensor mixed,torch::Tensor ag,torch::Tensor bg,
   TORCH_CHECK(idx.scalar_type()==at::kInt || idx.scalar_type()==at::kLong);
   TORCH_CHECK(fu.size(2)==32 && fu.size(3)==128 && fw.size(3)==128 && HV%H==0);
   TORCH_CHECK(!invalidate || (pv.has_value() && pv->scalar_type()==at::kInt && pv->numel()>=fu.size(0)));
+  bool norm = norm_weight.has_value();
+  if (norm) {
+    TORCH_CHECK(z.has_value() && z->is_cuda() && norm_weight->is_cuda());
+    TORCH_CHECK(z->device()==mixed.device() && norm_weight->device()==mixed.device());
+    TORCH_CHECK(z->scalar_type()==at::kBFloat16 && norm_weight->scalar_type()==at::kBFloat16);
+    TORCH_CHECK(z->dim()==3 && z->size(0)==B && z->size(1)==HV && z->size(2)==D);
+    // Projection views may have padding between tokens and/or heads. Keep
+    // 16-byte per-head alignment for cp.async; no layout copy is necessary.
+    TORCH_CHECK(z->stride(2)==1 && z->stride(0)>0 && z->stride(1)>0);
+    TORCH_CHECK(z->stride(0)%8==0 && z->stride(1)%8==0 &&
+                reinterpret_cast<uintptr_t>(z->data_ptr())%16==0);
+    TORCH_CHECK(z->stride(0)<=INT_MAX && z->stride(1)<=INT_MAX);
+    TORCH_CHECK((B-1)*z->stride(0)+(HV-1)*z->stride(1)+D-1<=INT_MAX);
+    TORCH_CHECK(norm_weight->is_contiguous() && norm_weight->dim()==1 && norm_weight->numel()==D);
+    TORCH_CHECK(norm_eps>0 && std::isfinite(norm_eps));
+  }
   auto stream=at::cuda::getCurrentCUDAStream();
-  auto launch=[&](auto flag, auto bias_value) {
+  auto launch=[&](auto flag, auto norm_flag, auto bias_value) {
     using BiasT = decltype(bias_value);
-    factored_step_r32_kernel<BiasT, decltype(flag)::value><<<B*HV,128,0,stream>>>(
+    factored_step_r32_kernel<BiasT, decltype(flag)::value, decltype(norm_flag)::value><<<B*HV,128,0,stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(mixed.data_ptr()),reinterpret_cast<const __nv_bfloat16*>(ag.data_ptr()),
       reinterpret_cast<const __nv_bfloat16*>(bg.data_ptr()),alog.data_ptr<float>(),reinterpret_cast<const BiasT*>(bias.data_ptr()),vb.data_ptr<float>(),
       fa.data_ptr<float>(),reinterpret_cast<__half*>(fu.data_ptr()),reinterpret_cast<__half*>(fw.data_ptr()),
       fc.data_ptr<int>(),stale.data_ptr<int>(),idx.data_ptr(),idx.scalar_type()==at::kLong,
       reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),invalidate?pv->data_ptr<int>():nullptr,
-      H,HV,mixed.stride(0),ag.stride(0),bg.stride(0),idx.stride(0),float(scale),float(eps));
+      H,HV,mixed.stride(0),ag.stride(0),bg.stride(0),idx.stride(0),float(scale),float(eps),
+      norm?reinterpret_cast<const __nv_bfloat16*>(z->data_ptr()):nullptr,
+      norm?reinterpret_cast<const __nv_bfloat16*>(norm_weight->data_ptr()):nullptr,float(norm_eps),
+      norm?int(z->stride(0)):0,norm?int(z->stride(1)):0);
   };
   auto dispatch=[&](auto bias_value) {
-    if(invalidate) launch(std::true_type{}, bias_value); else launch(std::false_type{}, bias_value);
+    if(norm) {
+      if(invalidate) launch(std::true_type{}, std::true_type{}, bias_value);
+      else launch(std::false_type{}, std::true_type{}, bias_value);
+    } else {
+      if(invalidate) launch(std::true_type{}, std::false_type{}, bias_value);
+      else launch(std::false_type{}, std::false_type{}, bias_value);
+    }
   };
   if(bias.scalar_type()==at::kFloat) dispatch(float{});
   else if(bias.scalar_type()==at::kBFloat16) dispatch(__nv_bfloat16{});
@@ -313,4 +421,13 @@ torch::Tensor gates(torch::Tensor a,torch::Tensor b,torch::Tensor al,torch::Tens
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
 }
-PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) { m.def("factored_step_r32",&factored_step_r32); m.def("gates",&gates); }
+PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {
+  namespace py = pybind11;
+  m.def("factored_step_r32", &factored_step_r32,
+    py::arg("mixed"), py::arg("ag"), py::arg("bg"), py::arg("alog"), py::arg("bias"),
+    py::arg("vb"), py::arg("fa"), py::arg("fu"), py::arg("fw"), py::arg("fc"), py::arg("stale"),
+    py::arg("idx"), py::arg("out"), py::arg("H"), py::arg("scale"), py::arg("eps"),
+    py::arg("pv"), py::arg("invalidate"), py::arg("z")=c10::nullopt,
+    py::arg("norm_weight")=c10::nullopt, py::arg("norm_eps")=1e-6);
+  m.def("gates", &gates);
+}
