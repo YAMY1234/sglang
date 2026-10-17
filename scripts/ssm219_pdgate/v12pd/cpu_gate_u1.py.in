@@ -1,0 +1,29 @@
+# docs/222 §21 (v12 PD row): U1-a installs on both PD trees' Scheduler through the frozen site dir (CPU import, the same
+# PYTHONPATH head as the launch), U1-c's switch exists and reads; the canary window-length hook accepts 300 / 900 only.
+u1 = dict(scheduler={}, hoist={})
+for tree in (r16_delta.OLD_SOURCE, r16_delta.P3_SOURCE):
+    out = subprocess.run([sys.executable, '-c', 'import os,sglang\n'
+                          'import sglang.srt.managers.scheduler as s\n'
+                          'from sglang.srt.environ import envs\n'
+                          'print(os.path.dirname(sglang.__file__), getattr(s.Scheduler, "_ws3_u1a", False), envs.SGLANG_QSA_PREFILL_HOIST.get())'],
+                         capture_output=True, text=True, timeout=1200,
+                         env=dict(os.environ, PYTHONPATH=':'.join([r16_delta.U1_SITE, tree + '/python', '/pdrefresh/native-observer',
+                                                                    '/work/pyuser/lib/python3.12/site-packages']),
+                                  SGLANG_AB_OUT=str(root / 'u1a'), REMEASURE_SOURCE_ONLY='1', **r16_delta.U1_ENV))
+    assert out.returncode == 0, (tree, out.stderr[-3000:])
+    where, installed, hoist = out.stdout.strip().splitlines()[-1].split()
+    line = [x for x in out.stderr.splitlines() if 'WS3_U1A installed on sglang.srt.managers.scheduler.Scheduler' in x]
+    assert where == tree + '/python/sglang' and installed == 'True' and hoist == 'True' and line, (tree, where, installed, hoist)
+    u1['scheduler'][tree] = line[0][-120:]
+    u1['hoist'][tree] = hoist
+import harness_mode
+for s, ok in (('300', True), ('900', True), ('600', False)):
+    os.environ['LADDER_WINDOW_SECONDS'] = s
+    try:
+        got = harness_mode.Mode(False).window_seconds
+        assert ok and got == int(s), (s, got)
+    except AssertionError:
+        assert not ok, s
+os.environ.pop('LADDER_WINDOW_SECONDS')
+assert harness_mode.Mode(False).window_seconds == 900
+result['checks']['u1'] = u1

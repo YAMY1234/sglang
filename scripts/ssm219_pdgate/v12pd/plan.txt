@@ -1,0 +1,13 @@
+# docs/222 §21 v12 PD row on LHR: one N3 window per C; placement order per C = the fp32 ladder's (docs/218 §9.9 (b),
+# fp32-pd submissions 4549867 ... 4556040) so the arm-to-node pattern matches; time = docs/214 per C.
+# <C> <variants in placement order> <time>
+canary 8 "PC+ S C+" 00:50:00 300
+8  "PC+ S C+" 01:20:00
+16 "S C+ PC+" 01:20:00
+24 "C+ PC+ S" 01:20:00
+32 "C+ PC+ S" 01:20:00
+40 "PC+ S C+" 01:20:00
+48 "S C+ PC+" 01:20:00
+56 "C+ PC+ S" 01:25:00
+64 "PC+ S C+" 01:30:00
+96 "S C+ PC+" 01:30:00
