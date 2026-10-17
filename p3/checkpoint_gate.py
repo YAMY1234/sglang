@@ -267,7 +267,8 @@ def main():
             # Persist completed rows even if a later forward fails. Numerical
             # failure is collected across all cases, separately for each route.
             out.write_text(json.dumps(dict(complete=False, cases=results), indent=2) + '\n')
-    per_route = {route: all(row['factor_diagnostic']['passed'] for row in results if row['route'] == route)
+    per_route = {route: sum(row['route'] == route for row in results) == len(cases)
+                 and all(row['factor_diagnostic']['passed'] for row in results if row['route'] == route)
                  for route in ('0n', '0', '1')}
     summary = dict(complete=True, required_bitwise_pass=True,
                    factor_bounds_pass_by_route=per_route,
