@@ -588,5 +588,107 @@ class TestLayerCallMhcOverrides(unittest.TestCase):
         layer.self_attn.accepts_mxfp8_swizzled_input.assert_called_once_with()
 
 
+
+class TestDraftAttentionSlots(unittest.TestCase):
+    """DSparkAttention: forward is wo_b of forward_before_wo_b, and each op slot
+    replaces only its own step; unset, SGLang's projections run."""
+
+    def _attention(self):
+        from sglang.srt.models import deepseek_v4_dspark as dspark
+
+        attention = dspark.DSparkAttention.__new__(dspark.DSparkAttention)
+        torch.nn.Module.__init__(attention)
+        heads, dim, groups, rank = dspark._PAD_NUM_HEADS, 4, 2, 3
+        attention.__dict__.update(
+            alt_streams=None,
+            n_local_heads=heads,
+            head_dim=dim,
+            rope_head_dim=2,
+            q_head_norm=False,
+            _use_fast_kernel=False,
+            n_local_groups=groups,
+            o_lora_rank=rank,
+            freqs_cis=torch.ones(8, 1),
+            attn=object(),
+            wo_a=SimpleNamespace(weight=torch.ones(groups * rank, heads * dim // groups)),
+            wq_a=Mock(return_value=(torch.ones(2, 5), None)),
+            q_norm=Mock(side_effect=lambda q: q),
+            wq_b=Mock(return_value=(torch.ones(2, heads * dim), None)),
+            kv_proj_only=Mock(return_value=torch.ones(2, dim)),
+            _store_block_kv=Mock(),
+            _local_attn_sink=Mock(return_value=None),
+        )
+        return dspark, attention
+
+    def test_forward_is_wo_b_of_forward_before_wo_b(self):
+        _, attention = self._attention()
+        attention.forward_before_wo_b = Mock(return_value="value")
+        attention._project_wo_b = Mock(return_value="out")
+        batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_idle=lambda: False)
+        )
+        out = attention.forward(
+            "pos", "x", batch, x_quant="xq", defer_all_reduce=True
+        )
+        self.assertEqual(out, "out")
+        attention.forward_before_wo_b.assert_called_once_with(
+            "pos", "x", batch, x_quant="xq"
+        )
+        attention._project_wo_b.assert_called_once_with("value", True)
+
+    def _run(self, dspark, attention):
+        o = torch.ones(2, attention.n_local_heads, attention.head_dim)
+        backend = SimpleNamespace(forward=Mock(return_value=o))
+        x, positions = torch.ones(2, 8), torch.arange(2)
+        with (
+            patch.object(
+                dspark,
+                "_resolve_dspark_pool",
+                return_value=SimpleNamespace(uniform_fp8=False),
+            ),
+            patch(
+                "sglang.srt.model_executor.forward_context.get_attn_backend",
+                return_value=backend,
+            ),
+            patch.object(dspark, "get_is_capture_mode", return_value=False),
+            patch.object(dspark, "apply_rotary_emb"),
+        ):
+            value = attention.forward_before_wo_b(
+                positions, x, SimpleNamespace(), x_quant="xq"
+            )
+        return value, backend, o, x, positions
+
+    def test_unset_slots_run_sglang_projections(self):
+        dspark, attention = self._attention()
+        value, backend, _, x, _ = self._run(dspark, attention)
+        attention.wq_a.assert_called_once_with(x)
+        attention.kv_proj_only.assert_called_once_with(x)
+        self.assertIs(
+            attention._store_block_kv.call_args.kwargs["kv"],
+            attention.kv_proj_only.return_value,
+        )
+        attention.wq_b.assert_called_once()
+        self.assertEqual(tuple(value.shape), (2, 6))
+
+    def test_set_slots_replace_only_their_step(self):
+        dspark, attention = self._attention()
+        q_lora, kv, q = torch.zeros(2, 5), torch.zeros(2, 4), torch.zeros(2, 64, 4)
+        attention.qkv_a_op = Mock(return_value=(q_lora, kv))
+        attention.q_op = Mock(return_value=q)
+        attention.wo_a_op = Mock(return_value="wo_b input")
+        value, backend, o, x, positions = self._run(dspark, attention)
+        self.assertEqual(value, "wo_b input")
+        attention.qkv_a_op.assert_called_once_with(x, "xq")
+        attention.wq_a.assert_not_called()
+        attention.kv_proj_only.assert_not_called()
+        self.assertIs(attention._store_block_kv.call_args.kwargs["kv"], kv)
+        attention.q_op.assert_called_once_with(q_lora, positions, None)
+        attention.wq_b.assert_not_called()
+        self.assertIs(backend.forward.call_args.kwargs["q"], q)
+        got_o, got_positions = attention.wo_a_op.call_args.args
+        self.assertIs(got_positions, positions)
+        torch.testing.assert_close(got_o, o)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -97,6 +97,15 @@ def apply_rotary_emb(
 
 
 class DSparkAttention(MqaAttentionBase):
+    # Optional replacements for the draft's projections; None runs SGLang's own.
+    # qkv_a_op(x, x_quant) -> (q_lora, kv): wq_a and wkv as one op; the KV store
+    # runs after it. q_op(q_lora, positions, q_out) -> q: q norm, wq_b and RoPE,
+    # writing q_out when given. wo_a_op(o, positions) -> wo_b's input: inverse
+    # RoPE and wo_a on the local heads' attention output.
+    qkv_a_op = None
+    q_op = None
+    wo_a_op = None
+
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -186,9 +195,13 @@ class DSparkAttention(MqaAttentionBase):
         x: torch.Tensor,
         positions: torch.Tensor,
         q_out: Optional[torch.Tensor] = None,
+        q_lora: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        q, _ = self.wq_a(x)
-        q = self.q_norm(q)
+        if q_lora is None:
+            q_lora, _ = self.wq_a(x)
+        if self.q_op is not None:
+            return self.q_op(q_lora, positions, q_out)
+        q = self.q_norm(q_lora)
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if not self.q_head_norm:
@@ -257,13 +270,28 @@ class DSparkAttention(MqaAttentionBase):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         *,
+        x_quant=None,
         defer_all_reduce: bool = False,
     ) -> torch.Tensor:
         # Idle ranks have no draft KV rows or attention metadata, but still
         # participate in the shared MoE forward later in the draft stage.
         if forward_batch.forward_mode.is_idle():
             return torch.zeros_like(hidden_states)
+        value = self.forward_before_wo_b(
+            positions, hidden_states, forward_batch, x_quant=x_quant
+        )
+        return self._project_wo_b(value, defer_all_reduce)
 
+    def forward_before_wo_b(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        *,
+        x_quant=None,
+    ) -> torch.Tensor:
+        """wo_b's input; ``x_quant`` is the MXFP8 input a post wrote for this
+        attention, read only by ``qkv_a_op``."""
         from sglang.srt.model_executor.forward_context import get_attn_backend
 
         pool = _resolve_dspark_pool()
@@ -294,12 +322,16 @@ class DSparkAttention(MqaAttentionBase):
             )
             q_out = q_padded[:, : self.n_local_heads, :]
 
+        q_lora = None
+        if self.qkv_a_op is not None:
+            q_lora, kv = self.qkv_a_op(hidden_states, x_quant)
         if enable_multi_stream:
             current_stream = torch.cuda.current_stream()
             stream_kv = self.alt_streams[0]
             stream_kv.wait_stream(current_stream)
             with torch.cuda.stream(stream_kv):
-                kv = self.kv_proj_only(hidden_states)
+                if q_lora is None:
+                    kv = self.kv_proj_only(hidden_states)
                 self._store_block_kv(
                     kv=kv,
                     positions=positions,
@@ -307,10 +339,11 @@ class DSparkAttention(MqaAttentionBase):
                     attn_backend=attn_backend,
                     pool=pool,
                 )
-            q = self._compute_q(hidden_states, positions, q_out=q_out)
+            q = self._compute_q(hidden_states, positions, q_out, q_lora)
             current_stream.wait_stream(stream_kv)
         else:
-            kv = self.kv_proj_only(hidden_states)
+            if q_lora is None:
+                kv = self.kv_proj_only(hidden_states)
             self._store_block_kv(
                 kv=kv,
                 positions=positions,
@@ -318,7 +351,7 @@ class DSparkAttention(MqaAttentionBase):
                 attn_backend=attn_backend,
                 pool=pool,
             )
-            q = self._compute_q(hidden_states, positions, q_out=q_out)
+            q = self._compute_q(hidden_states, positions, q_out, q_lora)
 
         if q_padded is not None:
             q = q_padded
@@ -337,6 +370,8 @@ class DSparkAttention(MqaAttentionBase):
 
         if o.shape[1] != self.n_local_heads:
             o = o[:, : self.n_local_heads, :]
+        if self.wo_a_op is not None:
+            return self.wo_a_op(o, positions)
 
         if self._use_fast_kernel:
             fused_rope_inplace(
@@ -379,7 +414,9 @@ class DSparkAttention(MqaAttentionBase):
             )
         else:
             o = torch.einsum("bgd,grd->bgr", o.float(), wo_a.float()).to(q.dtype)
-        value = o.reshape(o.shape[0], o.shape[1] * o.shape[2])
+        return o.reshape(o.shape[0], o.shape[1] * o.shape[2])
+
+    def _project_wo_b(self, value, defer_all_reduce: bool = False):
         out, _ = self.wo_b(value, skip_all_reduce=defer_all_reduce)
         return (
             mhc.AttnOutput(out)
@@ -654,7 +691,11 @@ class DSparkV4CudaStage(DSparkV4StageMixin, DeepseekV4CudaDecoderLayer):
         self, hidden_states, positions, forward_batch, quantized
     ):
         return self.self_attn(
-            positions, hidden_states, forward_batch, defer_all_reduce=True
+            positions,
+            hidden_states,
+            forward_batch,
+            x_quant=quantized,
+            defer_all_reduce=True,
         )
 
     def forward(self, positions, hidden_states, forward_batch):
