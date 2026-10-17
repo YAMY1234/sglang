@@ -12,4 +12,7 @@ O=${P4_OUT:-$ROOT/p4/results}; mkdir -p "$O"
 python -c 'from sglang.srt.layers.attention.linear.kernels.gdn_factored_cuda import load_extension; assert load_extension() is not None' > "$O/build.log" 2>&1
 cuobjdump --dump-resource-usage "$TORCH_EXTENSIONS_DIR"/gdn_factored_step_sm103a_*/*.so > "$O/resources.txt"
 python "$ROOT/p4/resources.py" "$O/build.log" "$O/resources.txt"
-python "$ROOT/p4/gate.py" --out "$O/gate.json" --model "${P4_MODEL:-/model}" 2>&1 | tee "$O/gate.log"
+EXTRA=()
+[[ -z ${P4_SERVICE_DIR:-} ]] || EXTRA+=(--service-dir "$P4_SERVICE_DIR")
+[[ -z ${P4_BASELINE_TREE:-} ]] || EXTRA+=(--baseline-tree "$P4_BASELINE_TREE")
+python "$ROOT/p4/gate.py" --out "$O/gate.json" --model "${P4_MODEL:-/model}" "${EXTRA[@]}" 2>&1 | tee "$O/gate.log"
