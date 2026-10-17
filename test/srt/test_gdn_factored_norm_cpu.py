@@ -121,7 +121,8 @@ class FusionPromiseTest(unittest.TestCase):
             self.z = Tensor((1,24,128), contiguous=False, strides=stride, offset=offset)
             self.assertTrue(self.promise())
         for stride, offset in (((8241,128,1),0), ((8240,129,1),0),
-                               ((8240,128,1),1), ((8240,128,2),0)):
+                               ((8240,128,1),1), ((8240,128,2),0),
+                               ((2**31,128,1),0)):
             self.z = Tensor((1,24,128), contiguous=False, strides=stride, offset=offset)
             self.assertFalse(self.promise())
 
