@@ -318,6 +318,7 @@ class Envs:
     SGLANG_GDN_AGG_FULLN_OVERLAP_OK = EnvBool(False)
     SGLANG_GDN_AGG_FULLN_LOG_INTERVAL = EnvInt(100)
     SGLANG_GDN_PD_BATCH_PUBLISH_DEFERRED = EnvBool(False)
+    SGLANG_GDN_PD_SHALLOW_FULLN = EnvBool(False)
     # P-only: wait/validate in Mooncake's worker, and join forward slot hazards.
     SGLANG_GDN_PD_PUBLISH_JOIN_OFFLOAD = EnvBool(False)
     # Independent P-only whole-batch trunk route for native S/C/P/PC arms.

@@ -24,7 +24,7 @@ SHAPES = ((16384, 1024), (32768, 2048), (0, 4096))
 
 
 def main():
-    parser = argparse.ArgumentParser(__doc__)
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--factory", required=True)
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--stage", choices=("p5", "p3"), default="p5")
@@ -32,6 +32,9 @@ def main():
     args = parser.parse_args()
     if args.blocks != 30:
         parser.error("pre-registered measurement requires 30 ABBA blocks")
+    if args.stage == "p3":
+        os.environ['SGLANG_GDN_PD_SHALLOW_FULLN'] = '1'
+        os.environ['TWINSTAR_PD_EMITTER_GRAPH'] = '1'
     import torch
     from sglang.srt.mem_cache.gdn_prefill_agg_contract import set_pd_micro_route
 

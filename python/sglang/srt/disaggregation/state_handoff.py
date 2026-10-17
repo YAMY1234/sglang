@@ -98,13 +98,17 @@ class FactorStateHandoff:
         if steps not in (0, 1) or (steps and not self.pool.cfg.strict_chunk):
             raise RuntimeError("invalid factor prefill boundary phase")
         expected = self.pool.cfg.r + steps
+        boundary_valid = getattr(req, "_pd_fulln_boundary_valid", None)
         if offload:
             sender.set_state_handoff_fence(FactorTransferFence(
-                publication.transfer_event(), self.pool.count, slot, expected))
+                publication.transfer_event(), self.pool.count, slot, expected,
+                boundary_valid=boundary_valid))
             return
         # Reading count also synchronizes the producer before publication.
         if not bool((self.pool.count[:, slot] == expected).all().item()):
             raise RuntimeError("factor P/D send before final prefill r truncation")
+        if boundary_valid is not None and not bool((boundary_valid[slot] == 1).all().item()):
+            raise RuntimeError("shallow boundary state was not published")
 
     def prepare_receive(self, req):
         slot = req.kv.mamba_pool_idx
@@ -136,10 +140,11 @@ class FactorTransferFence:
     A failed event or count check never permits a send or a success status.
     """
 
-    def __init__(self, publication_done, count, slot, expected):
+    def __init__(self, publication_done, count, slot, expected, *, boundary_valid=None):
         self.publication_done = publication_done
         self.count, self.slot, self.expected = count, slot, expected
         self.validated = False
+        self.boundary_valid = boundary_valid
 
     def wait(self, producer_done):
         if self.validated:
@@ -165,4 +170,6 @@ class FactorTransferFence:
         with context:
             if not bool((self.count[:, self.slot] == self.expected).all().item()):
                 raise RuntimeError("factor P/D send before final prefill r truncation")
+            if self.boundary_valid is not None and not bool((self.boundary_valid[self.slot] == 1).all().item()):
+                raise RuntimeError("shallow boundary state was not published")
         self.validated = True
