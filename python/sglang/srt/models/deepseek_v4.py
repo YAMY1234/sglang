@@ -2368,7 +2368,18 @@ class MQALayer(MqaAttentionBase):
     ) -> Union[torch.Tensor, mhc.AttnOutput]:
         if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
             return x
+        o = self.forward_before_wo_b(x, positions, forward_batch, x_quant=x_quant)
+        return self._project_wo_b(o, defer_all_reduce)
 
+    def forward_before_wo_b(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        x_quant: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
+        """Attention through wo_a, including every KV-cache write; the result is
+        the input `_project_wo_b` expects."""
         attn_backend = get_attn_backend()
         if TYPE_CHECKING:
             assert isinstance(
@@ -2585,10 +2596,9 @@ class MQALayer(MqaAttentionBase):
             )
 
         if self.use_mega_attention:
-            o = self._forward_mega(
+            return self._forward_mega(
                 q, kernel_num_heads, attn_sink, forward_batch, attn_backend
             )
-            return self._project_wo_b(o, defer_all_reduce)
 
         # save_kv_cache = kv is not None selects who writes the ring. When kv is
         # None the store was already fused into _forward_prepare* (decode) or
@@ -2827,7 +2837,7 @@ class MQALayer(MqaAttentionBase):
                         self.o_lora_rank,
                     )
 
-        return self._project_wo_b(o, defer_all_reduce)
+        return o
 
     def _project_wo_b(self, o, defer_all_reduce: bool = False):
         from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
