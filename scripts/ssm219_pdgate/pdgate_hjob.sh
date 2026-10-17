@@ -45,6 +45,10 @@ RC=0
 for ARM in $PHASES; do
   python3 $OUT/tools/pdgate_seed.py $OUT $ARM > $OUT/seed-$ARM.log 2>&1 || { log "SEED-FAIL $ARM $(tail -1 $OUT/seed-$ARM.log)"; RC=8; break; }
   gpu_idle || { log "GPUS-BUSY before $ARM"; RC=9; break; }
+  # the pair's ports must be free (a taken port fails the bind at random otherwise; WS-4 P6 10-17)
+  busy=$(python3 -c "import json;p=json.load(open('$OUT/plan.json'))['ports'];print(' '.join(str(v) for r in p.values() for v in r.values()))" \
+         | tr ' ' '\n' | while read q; do ss -Htan "sport = :$q" 2>/dev/null | grep -q . && echo $q; done | tr '\n' ' ')
+  [[ -z $busy ]] || { log "PORTS-BUSY before $ARM: $busy"; RC=11; break; }
   log "PHASE $ARM start"
   SP=$(serve $ARM P); SD=$(serve $ARM D)
   client bash /out/tools/pdgate_phase.sh $ARM $BH > $OUT/phase-$ARM.log 2>&1 &

@@ -39,8 +39,9 @@ REF = f"{RES}/fp32-state-20261015/kl-fdt-2/ref-s32"
 WINDOWS = f"{RES}/fp32-state-20261015/kl-fdt-2/windows.json"
 WINDOWS_SHA = "af5cd62b294ff245510c19f2cae19d93d091139fe71c7278b1974f5c8e471df9"
 MODEL_HOST = f"{RES}/bf16-regress-20261013/staging/model"
-# ports of the pair (phases run one after another; the job waits for the previous pair to exit)
-PORTS = {"P": dict(http=30301, bootstrap=30303, nccl=30305), "D": dict(http=30302, bootstrap=30304, nccl=30306)}
+# ports of the pair (phases run one after another; the job waits for the previous pair to exit).  Above the CMH nodes'
+# ephemeral range (ip_local_port_range 9000-65000; WS-4 P6 lost D to EADDRINUSE on 30302, 10-17): 65301-65306, as WS-4.
+PORTS = {"P": dict(http=65301, bootstrap=65303, nccl=65305), "D": dict(http=65302, bootstrap=65304, nccl=65306)}
 GPUS = {"P": "0,1", "D": "2,3"}
 # dropped from the receipt environment (pre-registered, docs/222 §15.2): instrumentation, harness plumbing, process state
 DROP = {"TWINSTAR_AGENTX_INVENTORY", "TWINSTAR_CUDA_TIMELINE", "TWINSTAR_PD_CACHE_AUDIT", "TWINSTAR_AGENTX_PRIVATE_OCCUPANCY",
@@ -301,15 +302,25 @@ def reuse_before(src, out, gate_root, arm_plan, a):
     assert old["arms"]["before"].get("helper_digest") == arm_plan["helper_digest"], "helper tree differs"
     assert old["windows"]["sha256"] == sha256(a.windows) and old["ref"]["path"] == a.ref, "reference / windows differ"
     assert old["arms"]["before"]["receipt"] == arm_plan["receipt"], "receipt differs"
+    # ports are not part of the measured launch: an earlier gate on other ports is compared with its ports mapped to ours
+    remap = {}
+    for role in ("P", "D"):
+        for k, v in old["ports"][role].items():
+            remap[str(v)] = str(PORTS[role][k])
+    def ports(text):
+        return " ".join(remap.get(tok, tok) for tok in text.split(" "))
     for f in ("g-before-P.env", "g-before-P.argv", "g-before-D.env", "g-before-D.argv", "g-before.mounts"):
         mine = (out / f).read_text()
         theirs = (src / f).read_text().replace(old["gate_root"], gate_root).replace(f"{src}:/out", f"{out}:/out")
+        if f.endswith(".argv"):
+            theirs = ports(theirs)
         assert mine == theirs, f"{f} differs from {src}"
     assert "PHASE-DONE before" in (src / "phase-before.log").read_text(), "earlier before phase did not finish"
     for f in REUSE_FILES:
         if (src / f).exists():
             shutil.copyfile(src / f, out / f)
     return dict(source=str(src), files=[f for f in REUSE_FILES if (out / f).exists()],
+                ports_remapped={k: v for k, v in remap.items() if k != v},
                 job_log=(src / "job.log").read_text().splitlines()[:1] if (src / "job.log").exists() else None)
 
 

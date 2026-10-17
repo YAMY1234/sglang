@@ -82,6 +82,8 @@ def prep_tests(root):
             check(env["SGLANG_GDN_PROMPT_ONLY_STATE_CACHE"] == "1", f"{tag}: launcher env prefix kept")
             check(all(env[k].startswith(f"{plan['gate_root']}/{arm}-{role}/") for k in pp.LOCAL if k in env),
                   f"{tag}: output paths node-local per arm/role")
+            check(all(65000 < v < 65536 for r in pp.PORTS.values() for v in r.values()),
+                  f"{tag}: ports above the ephemeral range (9000-65000)")
             check(argv[argv.index("--port") + 1] == str(pp.PORTS[role]["http"]) and
                   argv[argv.index("--nccl-port") + 1] == str(pp.PORTS[role]["nccl"]), f"{tag}: ports")
             check(argv.count("--enable-custom-logit-processor") == 1 and argv.count("--disable-overlap-schedule") == 1,
@@ -509,6 +511,7 @@ def hjob_tests(tmp):
         arms = {a: {"step0_owner": "P", "prelude": str(stub / "Cplus.json"), "cache_env": {"P": {}, "D": {}}}
                 for a in ("before", "cand1")}
         (out / "plan.json").write_text(json.dumps({"phases": ["before", "cand1"], "run_phases": ["before", "cand1"],
+                                                   "ports": {"P": {"http": 65301}, "D": {"http": 65302}},
                                                    "arms": arms, "ref": {"name": "s32"}, "windows": {"n": 48, "cont": 8},
                                                    "expectations": exp, "expectation_notes": []}))
         for a in ("before", "cand1"):
