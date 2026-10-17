@@ -19,8 +19,11 @@ export PYTHONPATH=$SRC/python:/work/pyuser/lib/python3.12/site-packages
 export PYTHONUNBUFFERED=1 SGLANG_GDN_K31_EIGH=jacobi
 export TORCH_EXTENSIONS_DIR=/tmp/p3-module-extensions TRITON_CACHE_DIR=/tmp/p3-module-triton MAX_JOBS=8
 python -c 'import sglang; print(\"P3_MODULE_SOURCE\", sglang.__file__); assert sglang.__file__.startswith(\"$SRC/\")'
-python $SRC/p3/module_gate.py --stage $P3_STAGE --dumps '$DUMPS/k31dump-r*-*.pt' --out $DST/module.json > $DST/module.log 2>&1
-python $SRC/p3/publication_gate.py --dumps '$DUMPS/k31dump-r*-*.pt' --out $DST/publication.json > $DST/publication.log 2>&1
+module_rc=0
+python $SRC/p3/module_gate.py --stage $P3_STAGE --dumps '$DUMPS/k31dump-r*-*.pt' --out $DST/module.json > $DST/module.log 2>&1 || module_rc=\$?
+publication_rc=0
+python $SRC/p3/publication_gate.py --dumps '$DUMPS/k31dump-r*-*.pt' --out $DST/publication.json > $DST/publication.log 2>&1 || publication_rc=\$?
 tail -1 $DST/module.log
-tail -1 $DST/publication.log" 2>&1 | tee "$O/driver.log"
+tail -1 $DST/publication.log
+exit \$((module_rc || publication_rc))" 2>&1 | tee "$O/driver.log"
 echo "STEP END module stage=$P3_STAGE holder=$HOLDER_JOB $(date -u +%FT%TZ) out=$O"
