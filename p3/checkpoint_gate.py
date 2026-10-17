@@ -82,6 +82,21 @@ def main():
     torch.set_grad_enabled(False)
     w = build()
     rank = int(os.environ['RANK'])
+    repeat_control = os.environ.get('P3_CHECKPOINT_REPEAT_CONTROL') == '1'
+    qsa_capture = {}
+    qsa_config = None
+    if repeat_control:
+        from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
+        indexers = [(name, module) for name, module in w.r.model.model.model.layers[3].named_modules()
+                    if isinstance(module, QSAIndexer)]
+        assert len(indexers) == 1, indexers
+        name, indexer = indexers[0]
+        qsa_config = dict(name=name, token_topk=indexer.token_topk,
+                          block_topk=indexer.block_topk, compress_ratio=indexer.compress_ratio)
+        # Producer-stream copy only; host readback follows the ordinary join.
+        def selection_hook(module, args, output):
+            qsa_capture['indices'] = output.detach().clone()
+        indexer.register_forward_hook(selection_hook)
     trace_length = int(os.environ.get('P3_CHECKPOINT_TRACE_LENGTH', '0'))
     trace, trace_current = {}, {'route': None}
     if trace_length:
@@ -166,10 +181,13 @@ def main():
         cases = ((trace_length, True),)
     for length, final in cases:
         reference = None
-        for route in (('0n', '0') if trace_length else ('0n', '0', '1')):
+        reference_qsa = None
+        routes = ('0n', '0n', '0') if repeat_control else (('0n', '0') if trace_length else ('0n', '0', '1'))
+        for route_index, route in enumerate(routes):
             trace_current['route'] = route
             set_pd_micro_route(route)
             captured.clear()
+            qsa_capture.clear()
             rp, alloc = w.r.req_to_token_pool, w.r.token_to_kv_pool_allocator
             tree = UnifiedRadixCache(CacheInitParams(
                 disable=False, req_to_token_pool=rp, token_to_kv_pool_allocator=alloc,
@@ -220,12 +238,13 @@ def main():
             # Across grouping routes, a/U/W are rounding-level diagnostics.
             # Raw checkpoint, count and cached-store bytes remain strict gates.
             a_equal = torch.equal(factors['a'], reference[1]['a'])
-            numerical = (factor_diagnostic(raw, reference[1], factors, w.pool) if raw_equal else
+            numerical = (factor_diagnostic(raw, reference[1], factors, w.pool) if raw_equal or repeat_control else
                          dict(passed=False, skipped='different raw states; no same-S numeric admission comparison'))
             deep_encoding = getattr(fb, '_pd_fulln_emitter_track_seqlens', None)
             if deep_encoding is None:
                 deep_encoding = fb.mamba_track_seqlens
             row = dict(rank=rank, length=length, final=final, route=route,
+                       route_index=route_index, repeat_control=repeat_control,
                        cache_backend=type(tree).__name__, tree_core=type(tree.tree_core).__name__,
                        cache_depth=depth, hit=hit, expected=expected,
                        old_checkpoint_bitwise=raw_equal, a_bitwise=a_equal,
@@ -234,6 +253,25 @@ def main():
                        fallback_delta=after['fallbacks'] - before['fallbacks'],
                        shallow_encoding=fb.mamba_track_seqlens.cpu().tolist(),
                        deep_encoding=deep_encoding.cpu().tolist())
+            if repeat_control:
+                selection = qsa_capture['indices'].cpu()
+                if reference_qsa is None:
+                    reference_qsa = selection
+                changed = (selection != reference_qsa).any(-1)
+                same_set = torch.equal(selection.sort(-1).values, reference_qsa.sort(-1).values)
+                row['qsa_selection'] = dict(config=qsa_config, shape=list(selection.shape),
+                    max_visible_blocks=length // qsa_config['compress_ratio'],
+                    pruning_possible=length // qsa_config['compress_ratio'] > qsa_config['block_topk'],
+                    order_equal=torch.equal(selection, reference_qsa), set_equal=same_set,
+                    unequal_query_rows=int(changed.sum()),
+                    first_changed_query=int(changed.nonzero()[0]) if bool(changed.any()) else None)
+                torch.save(selection, out.parent / f'qsa-selection-r{rank}-{length}-{int(final)}-{route_index}.pt')
+                difference = raw.float() - reference[0].float()
+                normalized = difference.flatten(2).norm(dim=-1) / reference[0].float().flatten(2).norm(dim=-1).clamp_min(1e-30)
+                row['raw_content'] = dict(max=float(normalized.max()), median=float(normalized.median()),
+                                          finite=bool(torch.isfinite(normalized).all()))
+                if not raw_equal:
+                    numerical['scope'] = 'S vs S-prime or routing variability, conditional lead rule; not a same-S rounding comparison'
             if not raw_equal:
                 row['raw_difference'] = dict(
                     max=float((raw.float() - reference[0].float()).abs().max()),
@@ -263,19 +301,34 @@ def main():
                 (out.parent / f'checkpoint-trace-r{rank}.json').write_text(
                     json.dumps(dict(diagnostic_only=True, length=length, comparisons=comparisons), indent=2) + '\n')
                 print('P3_TRUNK_TRACE', json.dumps(comparisons), flush=True)
-            assert raw_equal and counts_equal, row
+            assert counts_equal and (raw_equal or repeat_control), row
             # Persist completed rows even if a later forward fails. Numerical
             # failure is collected across all cases, separately for each route.
             out.write_text(json.dumps(dict(complete=False, cases=results), indent=2) + '\n')
     per_route = {route: sum(row['route'] == route for row in results) == len(cases)
                  and all(row['factor_diagnostic']['passed'] for row in results if row['route'] == route)
                  for route in ('0n', '0', '1')}
-    summary = dict(complete=True, required_bitwise_pass=True,
+    controls = []
+    if repeat_control:
+        for length, final in cases:
+            selected = [row for row in results if row['length'] == length and row['final'] == final]
+            first, second, fulln = selected
+            repeat_equal, route_equal = second['old_checkpoint_bitwise'], fulln['old_checkpoint_bitwise']
+            controls.append(dict(length=length, final=final, self_repeat_bitwise=repeat_equal,
+                routing_bitwise=route_equal,
+                decision=('real_route_defect' if repeat_equal and not route_equal else
+                          'strict_pass' if repeat_equal and route_equal else 'self_nonreproducible'),
+                self_raw_content=second['raw_content'], route_raw_content=fulln['raw_content'],
+                self_stored_content=second['factor_diagnostic']['content_max'],
+                route_stored_content=fulln['factor_diagnostic']['content_max'],
+                route_residual_max=fulln['factor_diagnostic']['residual_ratio_max']))
+    summary = dict(complete=True, required_bitwise_pass=all(row['old_checkpoint_bitwise'] for row in results),
+                   repeat_controls=controls, admission_paused=repeat_control,
                    factor_bounds_pass_by_route=per_route,
                    routing_only_pass=per_route['0n'] and per_route['0'],
                    combined_pass=per_route['0n'] and per_route['1'],
                    passed=all(per_route.values()), cases=results,
-                   diagnostic_only=bool(trace_length) or os.environ.get('P3_CHECKPOINT_DEBUG') == '1')
+                   diagnostic_only=repeat_control or bool(trace_length) or os.environ.get('P3_CHECKPOINT_DEBUG') == '1')
     out.write_text(json.dumps(summary, indent=2) + '\n')
     print('P3_CHECKPOINT_SUMMARY', json.dumps({k: v for k, v in summary.items() if k != 'cases'}), flush=True)
     if not summary['passed']:
