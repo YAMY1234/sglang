@@ -66,12 +66,43 @@ def case(ext,tp,b,inv,graph,w,gen,steps):
     return dict(pass_=True,steps=steps,min_expiries=minimum,fields=[*FIELDS,'y'])
 
 
+def service_case(ext,path):
+    data=torch.load(path,map_location='cuda',weights_only=False)
+    assert data['schema']=='p4-service-step-v1'
+    pa,pb=clone(data['p']),clone(data['p'])
+    i,slots,z,w=data['inp'],data['slots'],data['z'],data['weight']
+    B,HV=slots.numel(),data['HV']
+    out=torch.empty(B,1,HV,128,device='cuda',dtype=torch.bfloat16)
+    raw=torch.empty_like(out)
+    checks={}
+    for graph in (False,True):
+        for k in FIELDS:
+            pa[k].copy_(data['p'][k]);pb[k].copy_(data['p'][k])
+        def ref():
+            step(ext,pa,i,slots,raw,0,48//HV,invalidate=data['invalidate'])
+        def cand():
+            step(ext,pb,i,slots,out,0,48//HV,z,w,data['eps'],data['invalidate'])
+        if graph:
+            ga,gb=torch.cuda.CUDAGraph(),torch.cuda.CUDAGraph()
+            with torch.cuda.graph(ga): ref()
+            with torch.cuda.graph(gb): cand()
+            ga.replay();gb.replay()
+        else:
+            ref();cand()
+        checks.update({f'graph{int(graph)}_{k}':bitwise(pa[k],pb[k]) for k in FIELDS})
+        checks[f'graph{int(graph)}_y']=bitwise(norm(raw,z,w,data['eps']),out)
+        checks[f'graph{int(graph)}_finite']=bool(torch.isfinite(out).all())
+    return dict(pass_=all(checks.values()),checks=checks,original_slots=data['original_slots'].cpu().tolist())
+
+
 def main():
     ap=argparse.ArgumentParser()
     ap.add_argument('--out',required=True)
     ap.add_argument('--model',default='/model')
     ap.add_argument('--steps',type=int,default=64)
     ap.add_argument('--batches',default='')
+    ap.add_argument('--service-dir')
+    ap.add_argument('--service-only',action='store_true')
     args=ap.parse_args()
     dst=Path(args.out);dst.parent.mkdir(parents=True,exist_ok=True)
     result=dict(complete=False,cases={},runtime=dict(torch=torch.__version__,gpu=torch.cuda.get_device_name()),
@@ -84,7 +115,7 @@ def main():
     result['extension']=ext.__file__
     ws,meta=weights(args.model);result['norm_weights']=meta
     gen=torch.Generator(device='cuda').manual_seed(221)
-    for tp in (2,1):
+    for tp in (() if args.service_only else (2,1)):
         for b in ([int(v) for v in args.batches.split(',')] if args.batches else range(1,9 if tp==2 else 4)):
             if tp==1 and b>3:
                 continue
@@ -99,12 +130,22 @@ def main():
                         raise SystemExit(1)
     # Each actual layer weight is exercised, including weights with negative
     # components; this also checks signed zeros for padded rows.
-    for n,w in enumerate(ws):
+    for n,w in enumerate(() if args.service_only else ws):
         key=f'weight{n}'
         rec=case(ext,2,1,True,False,w,gen,8)
         result['cases'][key]=rec;save()
         if not rec['pass_']:
             raise SystemExit(1)
+    if args.service_dir:
+        paths=sorted(Path(args.service_dir).rglob('p4-*.pt'))
+        assert paths, 'no actual service snapshots found'
+        for path in paths:
+            rec=service_case(ext,path)
+            result['cases'][str(path)]=rec;save()
+            print('SERVICE',str(path),json.dumps(rec),flush=True)
+            if not rec['pass_']: raise SystemExit(1)
+        result['service_dump']=dict(path=args.service_dir,files=len(paths))
+    assert not args.service_only or args.service_dir
     result['complete']=True;result['pass']=True;save()
     print('BITWISE_PASS',len(result['cases']),flush=True)
 

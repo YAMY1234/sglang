@@ -1089,6 +1089,11 @@ def factored_packed_decode(
             _STEP_FEATURE_LOGGED.add("CUDA")
             import logging
             logging.getLogger(__name__).info("FACTORED_STEP_CUDA_ACTIVE nw=%d batch=%d rmax=%d", STEP_CUDA_WARPS, B, RMAX)
+        if fuse_norm and os.environ.get("SGLANG_GDN_P4_CAPTURE_DIR"):
+            from .gdn_factored_norm_capture import capture_step
+            capture_step(mixed_qkv, a, b, A_log, dt_bias, vbar, fa, fu, fw, fcount,
+                         stale, ssm_state_indices, prefix_valid, invalidate,
+                         z, norm_weight, norm_eps, num_q_heads)
         cuda_ext.factored_step_r32(mixed_qkv, a, b, A_log, dt_bias, vbar, fa, fu, fw, fcount, stale,
                                   ssm_state_indices, out, num_q_heads, scale, GS_EPS, prefix_valid, invalidate,
                                   z if fuse_norm else None, norm_weight, norm_eps)
