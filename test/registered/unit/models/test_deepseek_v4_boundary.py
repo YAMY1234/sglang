@@ -235,6 +235,8 @@ class TestAttentionWoBSplit(unittest.TestCase):
             )
         attention.forward_before_wo_b.assert_called_once()
         attention._project_wo_b.assert_called_once()
+
+
 class TestAttentionFusedPost(unittest.TestCase):
     def test_fused_post_crosses_the_transport_and_replaces_the_collective(self):
         """A fused post handed in with the attention partial must run in place of
