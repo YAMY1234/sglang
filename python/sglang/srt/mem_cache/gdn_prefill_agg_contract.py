@@ -647,12 +647,15 @@ def install(runner):
         if checksum is not None:
             checksum.drain()
         collector_cls = BatchCollector
+        collector_options = {}
         if shallow_fulln:
             from .gdn_pd_fulln_collector import ShallowFullNCollector
             collector_cls = ShallowFullNCollector
+            collector_options['same_extent'] = not any(owner._boundary_lens(forward_batch))
         with collector_cls(pool, plan, graph=k31_ab_graph(pool._agg_prefill_graph,
                                                          getattr(pool, "_agg_prefill_graph_ab", None)),
-                            token_count=input_ids.shape[0], publication=route) as collector:
+                            token_count=input_ids.shape[0], publication=route,
+                            **collector_options) as collector:
             if agg_mode:
                 trunk = owner._prefill_runners["trunk"]
                 if not trunk.can_run(forward_batch):

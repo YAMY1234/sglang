@@ -19,6 +19,35 @@ from twinstar_sgl import pd_emitter_graph as emitter_graph
 
 
 class ShallowFullNTest(unittest.TestCase):
+    def test_nonfinal_shared_extent_retains_one_factorization_and_final_copy(self):
+        pool, captured = fake_pool(2), []
+        plan = make_plan(pool, 1)
+        graph = NS(warmed=True, run=lambda p, plan, states, *args, **kw:
+                   captured.append((list(states), args)))
+        values = [torch.randn(1, 2, 16, 16) for _ in range(2)]
+        with ShallowFullNCollector(pool, plan, graph=graph, same_extent=True) as c:
+            for layer in range(2):
+                # Deep metadata is rebuilt: equal controls have distinct
+                # storage, but name the same source and checkpoint slot.
+                c.add(layer, values[layer], None, None, plan.slots.clone(), torch.tensor([20]))
+        states, controls = captured[0]
+        self.assertTrue(all(tracked is None for _, tracked in states))
+        self.assertTrue(all(normal is value for (normal, _), value in zip(states, values)))
+        self.assertIsNone(controls[0])
+        self.assertTrue(torch.equal(controls[1], plan.slots))
+        self.assertEqual(controls[2].tolist(), [20])
+
+    def test_same_extent_rejects_changed_checkpoint_before_publication(self):
+        pool = fake_pool(2)
+        plan = make_plan(pool, 1)
+        graph = NS(warmed=True, run=Mock())
+        dense = torch.randn(1, 2, 16, 16)
+        with self.assertRaisesRegex(RuntimeError, 'destinations changed'):
+            with ShallowFullNCollector(pool, plan, graph=graph, same_extent=True) as c:
+                c.add(0, dense, None, None, plan.slots.clone(), torch.tensor([20]))
+                c.add(1, dense, None, None, plan.slots.clone(), torch.tensor([21]))
+        graph.run.assert_not_called()
+
     def test_fulln_and_0n_keep_common_checkpoint_but_encode_shallow_h(self):
         for route, encoded in (('0n', 64), ('0', 64), ('0', 65), ('1', 64), ('1', 65)):
             class Schedule:
