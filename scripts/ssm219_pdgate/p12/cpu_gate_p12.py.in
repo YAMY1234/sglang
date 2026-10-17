@@ -39,7 +39,10 @@ for role in ('P', 'D'):
         assert argvg == argv1, (role, proof)
         got = {k: v[1] for k, v in p12_delta(e1, eg).items()}
         assert all(v[0] is None for v in p12_delta(e1, eg).values()), (role, proof)
-        assert got == r16_delta.p12_env(role, '1', proof, 'jcpu-p12') and r16_delta.P12_KEY not in got, (role, proof, got)
+        # the arm-1 key is already in the timing render; the gate mode adds exactly the rest of p12_env
+        want_g = r16_delta.p12_env(role, '1', proof, 'jcpu-p12')
+        assert eg.get(r16_delta.P12_KEY) == want_g.pop(r16_delta.P12_KEY, None), (role, proof)
+        assert got == want_g and r16_delta.P12_KEY not in got, (role, proof, got)
         d = '/work/results/p3pd-20261017/runs/jcpu-p12/p12-proof/' + role
         assert got['SGLANG_FLASHNEXT_PD_STAGING_PROOF_DIR'] == d and got['SGLANG_FLASHNEXT_PD_STAGING_PROOF_TENSORS'] == '1'
         if role == 'P':
