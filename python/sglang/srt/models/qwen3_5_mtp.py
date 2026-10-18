@@ -377,7 +377,6 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 )
             if self._mkd is not None and self._mkd.armed:
                 self._mkd.hidden_partial(hidden_states)
-                self._mkd.join_prefetch()
         finally:
             exit_stack.close()
 

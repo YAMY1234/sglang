@@ -10,14 +10,15 @@
 
 #include <tvm/ffi/container/tensor.h>
 
+#include <algorithm>
 #include <cstdint>
 
 namespace sglang {
 
-/** \brief Each thread issues bulk L2 prefetches for its chunks of [base, base + bytes). */
+/** \brief Bulk L2 prefetches of [base, base + bytes), chunk i issued by CTA i % gridDim.x. */
 __global__ void mkd_l2_prefetch_kernel(const char* base, int64_t bytes, int32_t chunk) {
   const int64_t nchunks = (bytes + chunk - 1) / chunk;
-  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < nchunks;
+  for (int64_t i = blockIdx.x + static_cast<int64_t>(gridDim.x) * threadIdx.x; i < nchunks;
        i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
     const int64_t off = i * chunk;
     const uint32_t size = static_cast<uint32_t>(min(static_cast<int64_t>(chunk), bytes - off));
@@ -33,7 +34,10 @@ struct MkdPrefetch {
     TensorMatcher({-1, -1}).with_device(device).ensure_alignment(16).verify(weight);
     CHECK_HOST(chunk % 16 == 0 && bytes % 16 == 0) << "bulk prefetch sizes must be multiples of 16 bytes";
     const auto* base = static_cast<const char*>(weight.data_ptr());
-    LaunchKernel(2, 128, device.unwrap())(mkd_l2_prefetch_kernel, base, bytes, static_cast<int32_t>(chunk));
+    // One SM issues bulk prefetches at ~0.25 TB/s (2 CTAs took 64 us for 32 MB); spread over SMs.
+    const int64_t nchunks = (bytes + chunk - 1) / chunk;
+    const uint32_t grid = static_cast<uint32_t>(std::min<int64_t>(128, std::max<int64_t>(1, nchunks)));
+    LaunchKernel(grid, 32, device.unwrap())(mkd_l2_prefetch_kernel, base, bytes, static_cast<int32_t>(chunk));
   }
 };
 

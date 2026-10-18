@@ -592,6 +592,9 @@ class Envs:
     SGLANG_Q35MF_MKD_L2PF_MB = EnvInt(0)
     # MB of the draft qkv projection weight prefetched into L2 by the draft-step exchange (0 = off).
     SGLANG_Q35MF_MKD_L2PF_QKV_MB = EnvInt(0)
+    # Diagnostic: the draft-step exchange stamps per-phase %globaltimer into pinned host memory
+    # and a thread logs percentiles every 20 s (slows the kernel; never in a timed run).
+    SGLANG_Q35MF_MKD_TRACE = EnvBool(False)
 
     # ===================================================================
     # Memory pools and KV-cache sizing

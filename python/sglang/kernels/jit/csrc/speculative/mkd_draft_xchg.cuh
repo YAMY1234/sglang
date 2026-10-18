@@ -104,7 +104,8 @@ struct MkdXchgParams {
   int32_t rank;
   int32_t draft_column;
   int32_t mrope_stride;
-  uint64_t* trace;               // [kChunks, 9] %globaltimer per phase, or null
+  uint64_t* trace;               // [trace_slots, kChunks, 9] %globaltimer per phase, or null
+  int32_t trace_slots;           // calls kept in the trace ring (slot = epoch % trace_slots)
   const char* pf;                // static weight range prefetched into L2 for a later kernel, or null
   int64_t pf_bytes;
 };
@@ -361,7 +362,7 @@ __global__ void __launch_bounds__(kThreads) mkd_xchg_kernel(const MkdXchgParams 
 
   __syncthreads();
   if (threadIdx.x == 0 && p.trace != nullptr) {
-    uint64_t* t = p.trace + c * 9;
+    uint64_t* t = p.trace + (static_cast<int64_t>(tag % static_cast<uint32_t>(p.trace_slots)) * kChunks + c) * 9;
     t[0] = t_start;
     t[1] = t_wait;
     t[2] = t_ld;
@@ -421,6 +422,7 @@ struct MkdXchg {
       int64_t draft_column,
       int64_t nan_key,
       int64_t trace_ptr,
+      int64_t trace_slots,
       int64_t pf_ptr,
       int64_t pf_bytes) {
     using namespace host;
@@ -444,6 +446,7 @@ struct MkdXchg {
     TensorMatcher({1, 1}).with_dtype<int64_t>().with_device(device).verify(topk_index);
     TensorMatcher({1, 1}).with_dtype<fp32_t>().with_device(device).verify(topk_p);
     CHECK_HOST(V.unwrap() % 8 == 0 && V.unwrap() <= 65536) << "local vocab must be a multiple of 8 and <= 65536";
+    CHECK_HOST(trace_slots >= 1) << "trace_slots must be >= 1";
     int64_t* tokens = nullptr;
     if (draft_tokens.numel() > 0) {
       auto S = SymbolicSize{"num_steps"};
@@ -487,6 +490,7 @@ struct MkdXchg {
         .draft_column = static_cast<int32_t>(draft_column),
         .mrope_stride = mrope_stride,
         .trace = reinterpret_cast<uint64_t*>(trace_ptr),
+        .trace_slots = static_cast<int32_t>(trace_slots),
         .pf = reinterpret_cast<const char*>(pf_ptr),
         .pf_bytes = pf_bytes,
     };

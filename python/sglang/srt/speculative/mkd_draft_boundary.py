@@ -43,6 +43,8 @@ logger = logging.getLogger(__name__)
 
 # Memo rows built per launch at load time.
 _MEMO_BLOCK = 4096
+# Exchange calls kept in the diagnostic trace ring.
+_TRACE_SLOTS = 64
 
 
 def _clear_negative_zero(rows: torch.Tensor) -> torch.Tensor:
@@ -116,6 +118,9 @@ class MkdDraftBoundary:
         self.ext_partials = torch.empty_like(self.out_partials)
         self.side_stream = torch.cuda.Stream(device=dev)
         self._install_l2_prefetch(envs.SGLANG_Q35MF_MKD_L2PF_MB.get())
+        self.trace = None
+        if envs.SGLANG_Q35MF_MKD_TRACE.get():
+            self._start_trace_reader()
         self.qkv_pf, self.qkv_pf_bytes = self._qkv_prefetch_target(envs.SGLANG_Q35MF_MKD_L2PF_QKV_MB.get())
         # armed: this draft step ends in the exchange; pending: the next step's fc reads it.
         self.armed = False
@@ -234,11 +239,6 @@ class MkdDraftBoundary:
             mkd_l2_prefetch(self.model.lm_head.weight, self.pf_bytes)
         self.pf_pending = True
 
-    def join_prefetch(self) -> None:
-        if self.pf_stream is not None and self.pf_pending:
-            torch.cuda.current_stream().wait_stream(self.pf_stream)
-            self.pf_pending = False
-
     # ---------------------------------------------------------------- per step
 
     def hidden_partial(self, hidden_states: torch.Tensor) -> None:
@@ -263,6 +263,10 @@ class MkdDraftBoundary:
     def join(self) -> None:
         if self.is_hidden_rank:
             torch.cuda.current_stream().wait_stream(self.side_stream)
+        # The L2 prefetch is a hint for the lm_head; it only has to rejoin before capture ends.
+        if self.pf_stream is not None and self.pf_pending:
+            torch.cuda.current_stream().wait_stream(self.pf_stream)
+            self.pf_pending = False
 
     def exchange(
         self,
@@ -294,10 +298,45 @@ class MkdDraftBoundary:
             self.world,
             draft_column,
             NAN_KEY_SPLIT_ARGMAX,
+            trace=self.trace,
             prefetch=self.qkv_pf,
             prefetch_bytes=self.qkv_pf_bytes,
         )
         self.pending = True
+
+    def _start_trace_reader(self) -> None:
+        """Diagnostic: the kernel stamps a pinned host ring; a thread logs phase times, no CUDA calls."""
+        import threading
+        import time
+
+        import numpy as np
+
+        self.trace = torch.zeros(_TRACE_SLOTS, 16, 9, dtype=torch.int64, pin_memory=True)
+        ring = self.trace.numpy()
+        names = ("scan", "sent", "recv", "end")
+
+        def run() -> None:
+            while True:
+                time.sleep(20)
+                t = ring.astype(np.float64)
+                ok = (t[:, :, 0] > 0).all(axis=1) & (t[:, :, 8] >= t[:, :, 1]).all(axis=1)
+                t = t[ok]
+                if len(t) == 0:
+                    continue
+                w0 = t[:, :, 1].min(axis=1)
+                pre = (w0 - t[:, :, 0].min(axis=1)) / 1e3
+                # Latest CTA at each phase, from the earliest CTA's PDL wait release.
+                rel = (t[:, :, [5, 6, 7, 8]].max(axis=1) - w0[:, None]) / 1e3
+                q = np.percentile(np.concatenate([pre[:, None], rel], axis=1), [10, 50, 90], axis=0)
+                logger.info(
+                    "MKD exchange trace rank %d, %d calls, us p10/p50/p90: pre_wait %s; %s",
+                    self.rank,
+                    len(t),
+                    "/".join(f"{x:.2f}" for x in q[:, 0]),
+                    "; ".join(f"{n} {'/'.join(f'{x:.2f}' for x in q[:, i + 1])}" for i, n in enumerate(names)),
+                )
+
+        threading.Thread(target=run, daemon=True, name="mkd-xchg-trace").start()
 
     def exchange_extend(self, local_logits: torch.Tensor):
         """Draft-extend token (torch.argmax NaN rule) through the same one-launch exchange."""
@@ -322,6 +361,7 @@ class MkdDraftBoundary:
             self.world,
             0,
             NAN_KEY_TORCH_ARGMAX,
+            trace=self.trace,
         )
         return topk_p, topk_index
 

@@ -76,7 +76,8 @@ def mkd_xchg(
     ``rank``-th contiguous slice.
     ``cand`` holds bf16 embedding rows or fp32 memo rows of the local hot shard; the winner's
     row lands in ``out_cand`` and the hidden-slice fc partials of every hidden rank in
-    ``out_partials`` [world / 2, H]."""
+    ``out_partials`` [world / 2, H]. ``trace`` is an int64 ring [slots, CHUNKS, 9] of
+    %globaltimer stamps (device or mapped pinned host memory), slot = call epoch % slots."""
     memo = cand.dtype == torch.float32
     empty = topk_index.new_empty(0)
     _module(cand.shape[-1], world, memo, CHUNKS).run(
@@ -98,6 +99,7 @@ def mkd_xchg(
         draft_column,
         nan_key,
         trace.data_ptr() if trace is not None else 0,
+        trace.numel() // (CHUNKS * 9) if trace is not None else 1,
         prefetch.data_ptr() if prefetch is not None else 0,
         min(prefetch_bytes, prefetch.numel() * prefetch.element_size()) if prefetch is not None else 0,
     )
