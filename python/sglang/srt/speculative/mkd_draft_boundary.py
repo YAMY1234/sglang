@@ -60,8 +60,8 @@ _JIT_SOURCES = (
     "speculative/draft_moe_fused.cuh",
     "speculative/mkd_draft_head.cuh",
 )
-# CTAs of mkd_draft_head per SM (two waves of one resident CTA measured fastest at T1).
-_HEAD_CTAS_PER_SM = 2
+# CTAs of mkd_draft_head per SM (T1, TP8 shard: 1 -> 39.3 us, 2 -> 40.5 us, 3 -> 41.6 us).
+_HEAD_CTAS_PER_SM = 1
 # Draft calls between checks that every rank takes the same extend-fc fill decision (arbitrary).
 _FILL_AGREE_EVERY = 512
 
