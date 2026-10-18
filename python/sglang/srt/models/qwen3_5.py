@@ -1770,11 +1770,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         return out
 
     def _mka_push_hop(self, m: int):
-        if not (
-            envs.SGLANG_Q35MF_MKA_PUSH.get()
-            and envs.SGLANG_Q35MF_MKH_HOP.get()
-            and envs.SGLANG_Q35MF_MKH_OPROJ.get()
-        ):
+        if not (envs.SGLANG_Q35MF_MKA_PUSH.get() and envs.SGLANG_Q35MF_MKH_HOP.get()):
             return None
         from sglang.srt.layers.q35_hop import active
 
