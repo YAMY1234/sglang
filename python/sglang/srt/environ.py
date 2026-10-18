@@ -1053,6 +1053,8 @@ class Envs:
     # _DRAFT=0 keeps the draft-model extend on the stock kernel.
     SGLANG_Q35MF_MKA_SKV2 = EnvBool(False)
     SGLANG_Q35MF_MKA_SKV2_DRAFT = EnvBool(True)
+    # KV length from which target verify uses SKV2 (trtllm-gen below); measured crossover 2048 at TP8, 4096 at TP4.
+    SGLANG_Q35MF_MKA_SKV2_VERIFY_MIN_LENGTH = EnvInt(32768)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
 
     # ===================================================================
