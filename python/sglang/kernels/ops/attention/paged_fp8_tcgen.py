@@ -494,7 +494,7 @@ class PagedFP8DecodePlan:
         kernel = DecoupledPagedDecode(self.heads, self.qlen, splits, stages=2,
                                       dual_tma=False, pack_probabilities=True,
                                       slots=2, parallel_denom=True,
-                                      compensate_probabilities=self.qlen == 1)
+                                      compensate_probabilities=True)
         views = self._views(query, kv, table, lengths)
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         self.compiled = cute.compile(kernel, *views, cutlass.Float32(1.0), stream)
