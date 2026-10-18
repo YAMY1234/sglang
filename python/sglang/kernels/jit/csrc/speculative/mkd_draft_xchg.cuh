@@ -1,7 +1,8 @@
 // Greedy MTP draft step boundary in one launch: shard argmax of the hot-vocab logits, a
 // multicast push of each rank's candidate (its embedding row, or its fc memo row) plus the
 // rank's hidden-half fc partial, and the selection, replacing pack + all-gather + select and
-// the fc partial all-gather. Selection rules are those of vocab_argmax_pack / _select
+// the fc partial all-gather; with memo rows it also writes the next step's fc output (the
+// mkd_fc_sum memo arithmetic). Selection rules are those of vocab_argmax_pack / _select
 // (order key, -0.0 == +0.0, NaN key from the caller, lowest vocabulary id on ties).
 //
 // Transport: a symmetric buffer with a multicast mapping (multi-node NVLink). Every 32-bit
@@ -94,6 +95,8 @@ struct MkdXchgParams {
   uint32_t* done;                // [1] CTA arrival counter, zero between calls
   void* out_cand;                // [H] winner's embedding row (bf16) or memo row (fp32)
   float* out_partials;           // [world - embed, H] hidden-slice partials in rank order
+  bf16_t* fc_out;                // [H] memo only: the next step's fc output, else null
+  int32_t token_only;            // 1: exchange keys only (no next step reads the payload)
   int64_t* topk_index;           // [1]
   float* topk_p;                 // [1]
   int64_t* draft_tokens;         // [1, S] or null
@@ -132,6 +135,7 @@ __global__ void __launch_bounds__(kThreads) mkd_xchg_kernel(const MkdXchgParams 
   __shared__ int32_t s_i[kWarps];
   __shared__ uint32_t s_key[kWorld];
   __shared__ uint32_t s_cand[kWorld][kCandWords];
+  __shared__ float s_part[kWorld - kEmbed][kPartWords];
   __shared__ int64_t s_gid[kWorld];
   __shared__ int s_win;
   __shared__ uint32_t s_tag;
@@ -265,21 +269,24 @@ __global__ void __launch_bounds__(kThreads) mkd_xchg_kernel(const MkdXchgParams 
     mkd_xchg::mc_store(dst, best, tag);
     mkd_xchg::mc_store(dst + 1, hot_pos, tag);
   }
-  if constexpr (kMemo) {
-    const float* row = static_cast<const float*>(p.cand) + brow * kH + c * kCols;
-    for (int w = static_cast<int>(threadIdx.x); w < kCandWords; w += kThreads) {
-      mkd_xchg::mc_store(dst + 2 + w, __float_as_uint(row[w]), tag);
+  const bool payload = p.token_only == 0;
+  if (payload) {
+    if constexpr (kMemo) {
+      const float* row = static_cast<const float*>(p.cand) + brow * kH + c * kCols;
+      for (int w = static_cast<int>(threadIdx.x); w < kCandWords; w += kThreads) {
+        mkd_xchg::mc_store(dst + 2 + w, __float_as_uint(row[w]), tag);
+      }
+    } else {
+      const uint32_t* row = reinterpret_cast<const uint32_t*>(static_cast<const bf16_t*>(p.cand) + brow * kH + c * kCols);
+      for (int w = static_cast<int>(threadIdx.x); w < kCandWords; w += kThreads) {
+        mkd_xchg::mc_store(dst + 2 + w, mkd_xchg::clear_negative_zero(row[w]), tag);
+      }
     }
-  } else {
-    const uint32_t* row = reinterpret_cast<const uint32_t*>(static_cast<const bf16_t*>(p.cand) + brow * kH + c * kCols);
-    for (int w = static_cast<int>(threadIdx.x); w < kCandWords; w += kThreads) {
-      mkd_xchg::mc_store(dst + 2 + w, mkd_xchg::clear_negative_zero(row[w]), tag);
-    }
-  }
-  if (p.rank >= kEmbed) {
-    const float* part = p.own_partial + c * kCols;
-    for (int w = static_cast<int>(threadIdx.x); w < kPartWords; w += kThreads) {
-      mkd_xchg::mc_store(dst + 2 + kCandWords + w, __float_as_uint(part[w]), tag);
+    if (p.rank >= kEmbed) {
+      const float* part = p.own_partial + c * kCols;
+      for (int w = static_cast<int>(threadIdx.x); w < kPartWords; w += kThreads) {
+        mkd_xchg::mc_store(dst + 2 + kCandWords + w, __float_as_uint(part[w]), tag);
+      }
     }
   }
 
@@ -288,20 +295,22 @@ __global__ void __launch_bounds__(kThreads) mkd_xchg_kernel(const MkdXchgParams 
   // partial chunks; the winner's candidate is then picked from shared memory.
   auto rec = [&](int s) { return p.uc + ((static_cast<int64_t>(slot) * kWorld + s) * kChunks + c) * kRec; };
   constexpr int kHead = 2 + kCandWords;
-  constexpr int kTotal = kWorld * kHead + (kWorld - kEmbed) * kPartWords;
+  const int head = payload ? kHead : 2;
+  const int heads = kWorld * head;
+  const int total = payload ? heads + (kWorld - kEmbed) * kPartWords : heads;
   constexpr int kRecvUnroll = 4;
-  for (int w0 = static_cast<int>(threadIdx.x); w0 < kTotal; w0 += kThreads * kRecvUnroll) {
+  for (int w0 = static_cast<int>(threadIdx.x); w0 < total; w0 += kThreads * kRecvUnroll) {
     const uint64_t* addr[kRecvUnroll];
     uint64_t v[kRecvUnroll];
 #pragma unroll
     for (int u = 0; u < kRecvUnroll; ++u) {
       const int i = w0 + u * kThreads;
       addr[u] = nullptr;
-      if (i < kTotal) {
-        if (i < kWorld * kHead) {
-          addr[u] = rec(i / kHead) + i % kHead;
+      if (i < total) {
+        if (i < heads) {
+          addr[u] = rec(i / head) + i % head;
         } else {
-          const int j = i - kWorld * kHead;
+          const int j = i - heads;
           addr[u] = rec(kEmbed + j / kPartWords) + kHead + j % kPartWords;
         }
         asm volatile("ld.relaxed.sys.global.u64 %0, [%1];" : "=l"(v[u]) : "l"(addr[u]) : "memory");
@@ -310,10 +319,10 @@ __global__ void __launch_bounds__(kThreads) mkd_xchg_kernel(const MkdXchgParams 
 #pragma unroll
     for (int u = 0; u < kRecvUnroll; ++u) {
       const int i = w0 + u * kThreads;
-      if (i < kTotal) {
+      if (i < total) {
         const uint32_t x = static_cast<uint32_t>(v[u] >> 32) == tag ? static_cast<uint32_t>(v[u]) : mkd_xchg::poll(addr[u], tag);
-        if (i < kWorld * kHead) {
-          const int s = i / kHead, w = i % kHead;
+        if (i < heads) {
+          const int s = i / head, w = i % head;
           if (w == 0) {
             s_key[s] = x;
           } else if (w == 1) {
@@ -322,8 +331,8 @@ __global__ void __launch_bounds__(kThreads) mkd_xchg_kernel(const MkdXchgParams 
             s_cand[s][w - 2] = x;
           }
         } else {
-          const int j = i - kWorld * kHead;
-          p.out_partials[static_cast<int64_t>(j / kPartWords) * kH + c * kCols + j % kPartWords] = __uint_as_float(x);
+          const int j = i - heads;
+          s_part[j / kPartWords][j % kPartWords] = __uint_as_float(x);
         }
       }
     }
@@ -356,8 +365,23 @@ __global__ void __launch_bounds__(kThreads) mkd_xchg_kernel(const MkdXchgParams 
     }
   }
   __syncthreads();
-  for (int w = static_cast<int>(threadIdx.x); w < kCandWords; w += kThreads) {
-    static_cast<uint32_t*>(p.out_cand)[(kMemo ? c * kCols : c * kCols / 2) + w] = s_cand[s_win][w];
+  bool fold = false;
+  if constexpr (kMemo) fold = p.fc_out != nullptr;
+  if (payload && fold) {
+    // The fc output (mkd_fc_sum, memo path): memo row, then the hidden partials in rank order.
+    for (int w = static_cast<int>(threadIdx.x); w < kCandWords; w += kThreads) {
+      float acc = __uint_as_float(s_cand[s_win][w]);
+#pragma unroll
+      for (int h = 0; h < kWorld - kEmbed; ++h) acc += s_part[h][w];
+      p.fc_out[c * kCols + w] = cast<bf16_t>(acc);
+    }
+  } else if (payload) {
+    for (int w = static_cast<int>(threadIdx.x); w < kCandWords; w += kThreads) {
+      static_cast<uint32_t*>(p.out_cand)[(kMemo ? c * kCols : c * kCols / 2) + w] = s_cand[s_win][w];
+    }
+    for (int j = static_cast<int>(threadIdx.x); j < (kWorld - kEmbed) * kPartWords; j += kThreads) {
+      p.out_partials[static_cast<int64_t>(j / kPartWords) * kH + c * kCols + j % kPartWords] = s_part[j / kPartWords][j % kPartWords];
+    }
   }
 
   __syncthreads();
@@ -411,6 +435,7 @@ struct MkdXchg {
       const tvm::ffi::TensorView epoch_done,
       const tvm::ffi::TensorView out_cand,
       const tvm::ffi::TensorView out_partials,
+      const tvm::ffi::TensorView fc_out,
       const tvm::ffi::TensorView topk_index,
       const tvm::ffi::TensorView topk_p,
       const tvm::ffi::TensorView draft_tokens,
@@ -421,6 +446,7 @@ struct MkdXchg {
       int64_t rank,
       int64_t draft_column,
       int64_t nan_key,
+      int64_t token_only,
       int64_t trace_ptr,
       int64_t trace_slots,
       int64_t pf_ptr,
@@ -443,6 +469,12 @@ struct MkdXchg {
     TensorMatcher({1, kH}).with_dtype<fp32_t>().with_device(device).verify(own_partial);
     TensorMatcher({2}).with_dtype<int32_t>().with_device(device).verify(epoch_done);
     TensorMatcher({kWorld - kEmbed, kH}).with_dtype<fp32_t>().with_device(device).verify(out_partials);
+    bf16_t* fc = nullptr;
+    if (fc_out.numel() > 0) {
+      CHECK_HOST(kMemo) << "fc_out needs memo candidates";
+      TensorMatcher({1, kH}).with_dtype<bf16_t>().with_device(device).verify(fc_out);
+      fc = static_cast<bf16_t*>(fc_out.data_ptr());
+    }
     TensorMatcher({1, 1}).with_dtype<int64_t>().with_device(device).verify(topk_index);
     TensorMatcher({1, 1}).with_dtype<fp32_t>().with_device(device).verify(topk_p);
     CHECK_HOST(V.unwrap() % 8 == 0 && V.unwrap() <= 65536) << "local vocab must be a multiple of 8 and <= 65536";
@@ -479,6 +511,8 @@ struct MkdXchg {
         .done = ed + 1,
         .out_cand = out_cand.data_ptr(),
         .out_partials = static_cast<float*>(out_partials.data_ptr()),
+        .fc_out = fc,
+        .token_only = static_cast<int32_t>(token_only != 0),
         .topk_index = static_cast<int64_t*>(topk_index.data_ptr()),
         .topk_p = static_cast<float*>(topk_p.data_ptr()),
         .draft_tokens = tokens,

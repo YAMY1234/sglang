@@ -70,13 +70,17 @@ def mkd_xchg(
     trace: torch.Tensor | None = None,
     prefetch: torch.Tensor | None = None,
     prefetch_bytes: int = 0,
+    fc_out: torch.Tensor | None = None,
+    token_only: bool = False,
 ) -> None:
     """Shard argmax + multicast exchange + selection for one draft token (see the .cuh).
     ``hot_ids`` is the full sorted hot-vocabulary id list; this rank's rows are its
     ``rank``-th contiguous slice.
     ``cand`` holds bf16 embedding rows or fp32 memo rows of the local hot shard; the winner's
     row lands in ``out_cand`` and the hidden-slice fc partials of every hidden rank in
-    ``out_partials`` [world / 2, H]. ``trace`` is an int64 ring [slots, CHUNKS, 9] of
+    ``out_partials`` [world / 2, H], or with memo rows and ``fc_out`` [1, H] bf16 the next
+    step's fc output directly. ``token_only`` exchanges the keys alone (last draft step,
+    draft extend). ``trace`` is an int64 ring [slots, CHUNKS, 9] of
     %globaltimer stamps (device or mapped pinned host memory), slot = call epoch % slots."""
     memo = cand.dtype == torch.float32
     empty = topk_index.new_empty(0)
@@ -88,6 +92,7 @@ def mkd_xchg(
         epoch_done,
         out_cand,
         out_partials,
+        fc_out if fc_out is not None else out_partials.new_empty(0, dtype=torch.bfloat16),
         topk_index,
         topk_p,
         draft_tokens if draft_tokens is not None else empty,
@@ -98,6 +103,7 @@ def mkd_xchg(
         rank,
         draft_column,
         nan_key,
+        int(token_only),
         trace.data_ptr() if trace is not None else 0,
         trace.numel() // (CHUNKS * 9) if trace is not None else 1,
         prefetch.data_ptr() if prefetch is not None else 0,

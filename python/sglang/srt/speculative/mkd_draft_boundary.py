@@ -113,6 +113,8 @@ class MkdDraftBoundary:
             1, hidden, dtype=torch.float32 if self.memo else torch.bfloat16, device=dev
         )
         self.fc_out = torch.empty(1, hidden, dtype=torch.bfloat16, device=dev)
+        # Memo mode: the exchange writes the next step's fc output here directly.
+        self.fc_buf = torch.empty(1, hidden, dtype=torch.bfloat16, device=dev) if self.memo else None
         # The draft extend's exchange only needs the token; its payload lands here unused.
         self.ext_cand = torch.empty_like(self.out_cand)
         self.ext_partials = torch.empty_like(self.out_partials)
@@ -122,9 +124,12 @@ class MkdDraftBoundary:
         if envs.SGLANG_Q35MF_MKD_TRACE.get():
             self._start_trace_reader()
         self.qkv_pf, self.qkv_pf_bytes = self._qkv_prefetch_target(envs.SGLANG_Q35MF_MKD_L2PF_QKV_MB.get())
-        # armed: this draft step ends in the exchange; pending: the next step's fc reads it.
+        # armed: this draft step ends in the exchange; pending: the next step's fc reads it;
+        # last_step: no draft step follows, so the exchange carries the token alone.
         self.armed = False
         self.pending = False
+        self.last_step = False
+        self.partial_pending = False
         self.pf_pending = False
         logger.info(
             "MKD draft boundary active (tp=%d, %s candidates, %.1f MB exchange buffer).",
@@ -243,7 +248,7 @@ class MkdDraftBoundary:
 
     def hidden_partial(self, hidden_states: torch.Tensor) -> None:
         """This rank's hidden-slice fc partial for the next draft step, on a side stream."""
-        if not self.is_hidden_rank:
+        if not self.is_hidden_rank or self.last_step:
             return
         model = self.model
         norm = model.pre_fc_norm_hidden
@@ -259,10 +264,12 @@ class MkdDraftBoundary:
                 self.own_partial,
                 model._fc_gemv_rows,
             )
+        self.partial_pending = True
 
     def join(self) -> None:
-        if self.is_hidden_rank:
+        if self.partial_pending:
             torch.cuda.current_stream().wait_stream(self.side_stream)
+            self.partial_pending = False
         # The L2 prefetch is a hint for the lm_head; it only has to rejoin before capture ends.
         if self.pf_stream is not None and self.pf_pending:
             torch.cuda.current_stream().wait_stream(self.pf_stream)
@@ -299,10 +306,12 @@ class MkdDraftBoundary:
             draft_column,
             NAN_KEY_SPLIT_ARGMAX,
             trace=self.trace,
-            prefetch=self.qkv_pf,
+            prefetch=None if self.last_step else self.qkv_pf,
             prefetch_bytes=self.qkv_pf_bytes,
+            fc_out=self.fc_buf,
+            token_only=self.last_step,
         )
-        self.pending = True
+        self.pending = not self.last_step
 
     def _start_trace_reader(self) -> None:
         """Diagnostic: the kernel stamps a pinned host ring; a thread logs phase times, no CUDA calls."""
@@ -362,11 +371,15 @@ class MkdDraftBoundary:
             0,
             NAN_KEY_TORCH_ARGMAX,
             trace=self.trace,
+            token_only=True,
         )
         return topk_p, topk_index
 
     def fc(self) -> torch.Tensor:
         """The draft fc output [1, H] of the step after an exchange."""
+        self.pending = False
+        if self.fc_buf is not None:
+            return self.fc_buf
         model = self.model
         norm = model.pre_fc_norm_embedding
         out = torch.empty_like(self.fc_out)
@@ -380,5 +393,4 @@ class MkdDraftBoundary:
             out,
             self.world,
         )
-        self.pending = False
         return out

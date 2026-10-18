@@ -83,6 +83,7 @@ class DraftVocabExchange:
 
     def __init__(self, model, num_steps: int, hot: Optional[DraftHotVocab] = None) -> None:
         self.model = model
+        self.num_steps = num_steps
         embed = model.model.embed_tokens
         parallel = get_parallel()
         self.world = parallel.tp_size
@@ -148,6 +149,8 @@ class DraftVocabExchange:
         mkd = self.mkd
         if mkd is not None:
             mkd.armed = num_rows == 1
+            # The draft loop forwards steps 0 .. num_steps - 2.
+            mkd.last_step = step == self.num_steps - 2
             if step == 0:
                 mkd.pending = False
         if step > 0 and mkd is not None and mkd.pending:
