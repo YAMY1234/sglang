@@ -1,5 +1,6 @@
 """Fused Qwen3.5 full-attention prologue / epilogue for bs1 MTP verify (kernels in mka_fused.cu)."""
 
+import hashlib
 import threading
 from pathlib import Path
 
@@ -17,9 +18,13 @@ def _ext():
                 from torch.utils.cpp_extension import load
 
                 major, minor = torch.cuda.get_device_capability()
+                source = Path(__file__).with_suffix(".cu")
+                # Every overlay tree mounts at the same path, so a name without the source digest
+                # can reuse another tree's cached build whose objects are newer than this source.
+                digest = hashlib.sha256(source.read_bytes()).hexdigest()[:12]
                 _EXT = load(
-                    name="sglang_q35mf_mka_fused",
-                    sources=[str(Path(__file__).with_suffix(".cu"))],
+                    name=f"sglang_q35mf_mka_fused_{digest}",
+                    sources=[str(source)],
                     extra_cuda_cflags=[
                         "-O3",
                         "--std=c++17",
