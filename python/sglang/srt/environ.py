@@ -1564,6 +1564,13 @@ class Envs:
     # With SGLANG_Q35MF_MKH_HOP: the GatedDeltaNet out_proj (static FP8, M <= 8) runs as a q35 hop
     # launch that pushes its partial straight into the hop mailbox, so its all-reduce only consumes.
     SGLANG_Q35MF_MKH_OPROJ = EnvBool(False)
+    # Verify input staging, bit-identical: reuse last round's mamba track indices while their
+    # inputs are unchanged, and skip the replay-time input_ids / positions copies that the
+    # same-stream pre-planned load_batch already made.
+    SGLANG_Q35MF_MKH_N3B = EnvBool(False)
+    # The post-verify graph's per-round input load as one small_field_copy launch that also
+    # reads the injected acceptance length from its pinned host slot (bit-identical).
+    SGLANG_Q35MF_MKH_N3C = EnvBool(False)
 
     # ===================================================================
     # Multimodal processing

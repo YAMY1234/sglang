@@ -43,7 +43,9 @@ def _jit_small_field_copy_module() -> Module:
 
 
 def _describe(
-    dsts: List[torch.Tensor], srcs: List[torch.Tensor]
+    dsts: List[torch.Tensor],
+    srcs: List[torch.Tensor],
+    allow_pinned_src: bool = False,
 ) -> Optional[List[int]]:
     """Per field: src_ptr, dst_ptr, rows, cols, src_stride, dst_stride, kind; None
     when a field is not supported."""
@@ -56,11 +58,11 @@ def _describe(
     desc: List[int] = []
     for dst, src in zip(dsts, srcs):
         shape = dst.shape
-        if (
-            src.shape != shape
-            or src.get_device() != device
-            or dst.get_device() != device
-        ):
+        src_device = src.get_device()
+        if allow_pinned_src and src_device < 0 and src.is_pinned():
+            # Page-locked host memory from cudaHostAlloc is mapped; kernels read it by its host pointer.
+            src_device = device
+        if src.shape != shape or src_device != device or dst.get_device() != device:
             return None
         ndim = len(shape)
         if ndim == 1:
@@ -118,10 +120,12 @@ class SmallFieldCopyPlan:
     against the first call, refresh the source pointers and hand the descriptor
     over as one tensor. The C++ overlap check still runs on every call."""
 
-    def __init__(self):
+    def __init__(self, allow_pinned_src: bool = False):
         self._sigs = None
         self._desc = None
         self._desc_view = None
+        # Sources may also be page-locked host tensors; later calls must pass pinned ones there too.
+        self._allow_pinned_src = allow_pinned_src
 
     def __call__(self, dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> bool:
         sigs = self._sigs
@@ -141,7 +145,7 @@ class SmallFieldCopyPlan:
                 view[_ENTRIES * i] = src.data_ptr()
             else:
                 return _run_host_desc(dsts[0], self._desc)
-        desc = _describe(dsts, srcs)
+        desc = _describe(dsts, srcs, self._allow_pinned_src)
         if desc is None:
             self._sigs = None
             return False
