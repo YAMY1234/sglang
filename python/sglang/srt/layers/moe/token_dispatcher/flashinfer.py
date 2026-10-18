@@ -20,6 +20,11 @@ from sglang.srt.layers.moe.token_dispatcher import (
     DispatchOutput,
     DispatchOutputFormat,
 )
+from sglang.srt.layers.moe.token_dispatcher.flashinfer_midq import (
+    get_combine_proof,
+    install_split_combine,
+    stock_combine_module,
+)
 from sglang.srt.layers.moe.token_dispatcher.flashinfer_utils import (
     TorchDistributedCommBackend,
 )
@@ -46,6 +51,8 @@ try:
     from flashinfer.comm import MoeAlltoAll, moe_a2a_get_workspace_size_per_rank
     from flashinfer.comm.mapping import Mapping
     from flashinfer.comm.mnnvl import MnnvlConfig
+    from flashinfer.tllm_enums import SfLayout
+    from flashinfer.utils import device_support_pdl
 
     from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 
@@ -149,6 +156,9 @@ class FlashinferDispatcher(BaseDispatcher):
                 "Please install the appropriate version of Flashinfer."
             )
 
+        # The split-combine module must replace FlashInfer's before the first a2a call below.
+        if envs.SGLANG_Q35MF_MIDQ_COMBINE_SPLIT.get() > 1:
+            install_split_combine(envs.SGLANG_Q35MF_MIDQ_COMBINE_SPLIT.get())
         self.ep_size = group.size()
         self.ep_rank = group.rank()
         self.router_topk = router_topk
@@ -242,6 +252,11 @@ class FlashinferDispatcher(BaseDispatcher):
             envs.SGLANG_Q35MF_MIDQ_FP8_COMBINE.get() and not is_speculative_model
         )
         _log_midq_combine(self.use_low_precision_combine, is_speculative_model)
+        self.combine_proof = (
+            get_combine_proof(is_speculative_model)
+            if envs.SGLANG_Q35MF_MIDQ_COMBINE_PROOF.get()
+            else None
+        )
 
         def make_moe_a2a() -> MoeAlltoAll:
             # Target and draft decode graphs can coexist.
@@ -470,15 +485,46 @@ class FlashinferDispatcher(BaseDispatcher):
                 f"received {hidden_states.dtype}."
             )
         output_hidden_size = hidden_states.shape[-1]
+        payload = hidden_states.view(
+            self.ep_size, self.runtime_max_tokens_per_rank, output_hidden_size
+        )
+        reference = (
+            self._stock_combine(payload) if self.combine_proof is not None else None
+        )
         hidden_states = self.active_moe_a2a.combine(
-            hidden_states.view(
-                self.ep_size, self.runtime_max_tokens_per_rank, output_hidden_size
-            ),
+            payload,
             self.runtime_max_tokens_per_rank,
             payload_in_workspace=self.payload_in_workspace,
             use_low_precision=self.use_low_precision_combine,
         )
+        if reference is not None:
+            self.combine_proof.check(reference, hidden_states)
 
         del self.runtime_max_tokens_per_rank
         del self.active_moe_a2a
         return hidden_states
+
+    def _stock_combine(self, payload: torch.Tensor) -> torch.Tensor:
+        # Same workspace and dispatch state, unpatched kernel; every rank runs it, so the
+        # completion flags stay in step.
+        a2a = self.active_moe_a2a
+        return stock_combine_module().moe_a2a_combine(
+            payload,
+            a2a._state.local_num_tokens,
+            a2a.workspace,
+            a2a.metainfo,
+            self.runtime_max_tokens_per_rank,
+            self.ep_rank,
+            self.ep_size,
+            self.router_topk,
+            a2a._state.combine_payload_offset,
+            self.payload_in_workspace,
+            None,
+            None,
+            1.0,
+            SfLayout.layout_linear.value,
+            self.use_low_precision_combine,
+            device_support_pdl(payload.device),
+            a2a.enable_rank_mask,
+            None,
+        )

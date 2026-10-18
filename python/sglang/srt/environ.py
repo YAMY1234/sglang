@@ -1143,6 +1143,11 @@ class Envs:
     # Target-model FlashInfer a2a combine transfers E4M3 partials (unscaled cast,
     # FP32 accumulate, BF16 output); draft MoE layers keep the BF16 combine.
     SGLANG_Q35MF_MIDQ_FP8_COMBINE = EnvBool(False)
+    # > 1: FlashInfer a2a built from token_dispatcher/midq_csrc, whose combine splits each
+    # token row over this many CTAs (bit-identical output, target and draft).
+    SGLANG_Q35MF_MIDQ_COMBINE_SPLIT = EnvInt(0)
+    # Eager-only check of every combine against the stock FlashInfer kernel, bit for bit.
+    SGLANG_Q35MF_MIDQ_COMBINE_PROOF = EnvBool(False)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
