@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import logging
 from typing import NamedTuple, Optional
 
@@ -83,20 +84,19 @@ def _workspace_size_for_namespace(workspace_size: int, *, speculative: bool) -> 
     return workspace_size + slot * _WORKSPACE_NAMESPACE_ALIGNMENT
 
 
-_midq_combine_logged: set[tuple[bool, bool]] = set()
+# One line per dispatcher so engagement can be counted per layer (target and draft).
+_midq_dispatcher_index = itertools.count(1)
 
 
-def _log_midq_combine_once(low_precision: bool, speculative: bool) -> None:
+def _log_midq_combine(low_precision: bool, speculative: bool) -> None:
     if not envs.SGLANG_Q35MF_MIDQ_FP8_COMBINE.get():
         return
-    key = (low_precision, speculative)
-    if key not in _midq_combine_logged:
-        _midq_combine_logged.add(key)
-        logger.info(
-            "MIDQ FlashInfer a2a combine: %s (speculative=%s)",
-            "e4m3" if low_precision else "bf16",
-            speculative,
-        )
+    logger.info(
+        "MIDQ FlashInfer a2a combine dispatcher #%d: %s (speculative=%s)",
+        next(_midq_dispatcher_index),
+        "e4m3" if low_precision else "bf16",
+        speculative,
+    )
 
 
 class FlashinferDispatchOutput(NamedTuple):
@@ -241,7 +241,7 @@ class FlashinferDispatcher(BaseDispatcher):
         self.use_low_precision_combine = (
             envs.SGLANG_Q35MF_MIDQ_FP8_COMBINE.get() and not is_speculative_model
         )
-        _log_midq_combine_once(self.use_low_precision_combine, is_speculative_model)
+        _log_midq_combine(self.use_low_precision_combine, is_speculative_model)
 
         def make_moe_a2a() -> MoeAlltoAll:
             # Target and draft decode graphs can coexist.
