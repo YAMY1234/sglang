@@ -51,7 +51,7 @@ def mkd_xchg_zero(hidden: int, world: int, memo: bool, uc_ptr: int) -> None:
 def mkd_xchg(
     logits: torch.Tensor,
     cand: torch.Tensor,
-    token_map: torch.Tensor,
+    hot_ids: torch.Tensor,
     own_partial: torch.Tensor,
     epoch_done: torch.Tensor,
     out_cand: torch.Tensor,
@@ -67,8 +67,11 @@ def mkd_xchg(
     world: int,
     draft_column: int,
     nan_key: int,
+    trace: torch.Tensor | None = None,
 ) -> None:
     """Shard argmax + multicast exchange + selection for one draft token (see the .cuh).
+    ``hot_ids`` is the full sorted hot-vocabulary id list; this rank's rows are its
+    ``rank``-th contiguous slice.
     ``cand`` holds bf16 embedding rows or fp32 memo rows of the local hot shard; the winner's
     row lands in ``out_cand`` and the hidden-slice fc partials of every hidden rank in
     ``out_partials`` [world / 2, H]."""
@@ -77,7 +80,7 @@ def mkd_xchg(
     _module(cand.shape[-1], world, memo, CHUNKS).run(
         logits,
         cand,
-        token_map,
+        hot_ids,
         own_partial,
         epoch_done,
         out_cand,
@@ -92,4 +95,5 @@ def mkd_xchg(
         rank,
         draft_column,
         nan_key,
+        trace.data_ptr() if trace is not None else 0,
     )

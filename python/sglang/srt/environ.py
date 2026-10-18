@@ -587,6 +587,9 @@ class Envs:
     # With SGLANG_Q35MF_MKD_XCHG: candidates carry a load-time memo of their embedding-half
     # fc partials (summed in rank order) instead of the embedding row.
     SGLANG_Q35MF_MKD_TTABLE = EnvBool(False)
+    # MB of the draft lm_head shard prefetched into L2 while single-token draft steps wait on
+    # the all-reduce after the MoE (0 = off); a cache hint, values unchanged.
+    SGLANG_Q35MF_MKD_L2PF_MB = EnvInt(0)
 
     # ===================================================================
     # Memory pools and KV-cache sizing

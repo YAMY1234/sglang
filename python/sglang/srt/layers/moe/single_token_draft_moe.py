@@ -5,7 +5,7 @@ gate combine. Rounding points match that path; only dot-product order differs.""
 from __future__ import annotations
 
 import logging
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 
@@ -31,6 +31,8 @@ class SingleTokenDraftMoe:
         self.fused_router = envs.SGLANG_Q35MF_DRAFT_MOE_ROUTER.get()
         self._scratch: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._router_scratch: Optional[Tuple[torch.Tensor, ...]] = None
+        # Called after the block's last kernel (single-token path only).
+        self.after_hook: Optional[Callable[[], None]] = None
 
     def _unsupported_reason(self, block, hidden_states, topk_output) -> Optional[str]:
         from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
@@ -169,4 +171,6 @@ class SingleTokenDraftMoe:
                 act,
                 gate,
             )
+        if self.after_hook is not None:
+            self.after_hook()
         return out

@@ -27,6 +27,7 @@ from sglang.kernels.ops.speculative.draft_fc_partial import (
 )
 from sglang.kernels.ops.speculative.draft_vocab_argmax import NAN_KEY_SPLIT_ARGMAX
 from sglang.kernels.ops.speculative.mkd_draft_fc import mkd_fc_memo, mkd_fc_sum
+from sglang.kernels.ops.speculative.mkd_prefetch import mkd_l2_prefetch
 from sglang.kernels.ops.speculative.mkd_draft_xchg import (
     mkd_xchg,
     mkd_xchg_words,
@@ -63,7 +64,7 @@ def _unsupported_reason(model, exchange) -> Optional[str]:
 class MkdDraftBoundary:
     """Exchange buffers, the optional memo table and the per-step launches."""
 
-    def __init__(self, model, exchange) -> None:
+    def __init__(self, model, exchange, hot_ids: torch.Tensor) -> None:
         from flashinfer.comm.mnnvl import McastGPUBuffer
 
         from sglang.srt.distributed.parallel_state import get_tp_group
@@ -80,7 +81,10 @@ class MkdDraftBoundary:
         self.n_embed = hidden // width
         dev = model.fc.weight.device
         self.memo = envs.SGLANG_Q35MF_MKD_TTABLE.get()
-        self.token_map = exchange.token_map
+        rows = exchange.local_vocab
+        self.hot_ids = hot_ids.to(exchange.token_map.device)
+        if not torch.equal(self.hot_ids[self.rank * rows : (self.rank + 1) * rows], exchange.token_map):
+            raise RuntimeError("MKD draft boundary: hot shard is not the rank-th slice of the hot list")
         self.cand = self._build_memo(exchange) if self.memo else exchange.embed_weight
 
         tp = get_tp_group()
@@ -105,9 +109,11 @@ class MkdDraftBoundary:
         )
         self.fc_out = torch.empty(1, hidden, dtype=torch.bfloat16, device=dev)
         self.side_stream = torch.cuda.Stream(device=dev)
+        self._install_l2_prefetch(envs.SGLANG_Q35MF_MKD_L2PF_MB.get())
         # armed: this draft step ends in the exchange; pending: the next step's fc reads it.
         self.armed = False
         self.pending = False
+        self.pf_pending = False
         logger.info(
             "MKD draft boundary active (tp=%d, %s candidates, %.1f MB exchange buffer).",
             self.world,
@@ -116,12 +122,14 @@ class MkdDraftBoundary:
         )
 
     @classmethod
-    def maybe_create(cls, model, exchange) -> Optional["MkdDraftBoundary"]:
+    def maybe_create(cls, model, exchange, hot) -> Optional["MkdDraftBoundary"]:
         reason = _unsupported_reason(model, exchange)
+        if reason is None and hot is None:
+            reason = "needs the hot vocabulary"
         if reason is not None:
             logger.warning("MKD draft boundary disabled (%s); using the stock path.", reason)
             return None
-        return cls(model, exchange)
+        return cls(model, exchange, hot.token_ids)
 
     # ---------------------------------------------------------------- memo table
 
@@ -178,6 +186,40 @@ class MkdDraftBoundary:
             bad += (acc.view(torch.int32) != memo[v : v + 1].view(torch.int32)).any()
         return int(bad)
 
+    # ---------------------------------------------------------------- L2 prefetch
+
+    def _install_l2_prefetch(self, mb: int) -> None:
+        self.pf_bytes = mb * 2**20
+        self.pf_stream = None
+        if self.pf_bytes <= 0:
+            return
+        from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
+
+        moe = None
+        for module in self.model.modules():
+            if isinstance(module, Qwen2MoeSparseMoeBlock) and module._single_token_draft_moe is not None:
+                moe = module._single_token_draft_moe
+        if moe is None:
+            logger.warning("MKD L2 prefetch disabled (no single-token draft MoE).")
+            self.pf_bytes = 0
+            return
+        self.pf_stream = torch.cuda.Stream(device=self.model.fc.weight.device)
+        moe.after_hook = self._prefetch_lm_head
+        logger.info("MKD L2 prefetch: %d MB of the draft lm_head after the draft MoE.", mb)
+
+    def _prefetch_lm_head(self) -> None:
+        if not self.armed:
+            return
+        self.pf_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self.pf_stream):
+            mkd_l2_prefetch(self.model.lm_head.weight, self.pf_bytes)
+        self.pf_pending = True
+
+    def join_prefetch(self) -> None:
+        if self.pf_stream is not None and self.pf_pending:
+            torch.cuda.current_stream().wait_stream(self.pf_stream)
+            self.pf_pending = False
+
     # ---------------------------------------------------------------- per step
 
     def hidden_partial(self, hidden_states: torch.Tensor) -> None:
@@ -217,7 +259,7 @@ class MkdDraftBoundary:
         mkd_xchg(
             local_logits,
             self.cand,
-            self.token_map,
+            self.hot_ids,
             self.own_partial,
             self.epoch_done,
             self.out_cand,

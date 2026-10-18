@@ -163,6 +163,7 @@ __global__ void __launch_bounds__(256, 1) mkd_fc_sum_kernel(const MkdFcSumParams
     __syncthreads();
   }
   PDLWaitPrimary<kUsePDL>();
+  PDLTriggerSecondary<kUsePDL>();
   if constexpr (!kMemo) {
     mkd_fc::gemma_norm_row<kH>(p.emb, p.norm_w, p.eps, s_x, s_red);
     if (nrows > 0) ptx::mbar_wait_parity(&bar, 0);
@@ -184,7 +185,6 @@ __global__ void __launch_bounds__(256, 1) mkd_fc_sum_kernel(const MkdFcSumParams
       p.out[j] = cast<bf16_t>(acc);
     }
   }
-  PDLTriggerSecondary<kUsePDL>();
 }
 
 struct MkdFcMemoParams {

@@ -270,7 +270,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
             if envs.SGLANG_Q35MF_MKD_XCHG.get() and self._exchange_in_draft_steps:
                 mkd = MkdDraftBoundary.maybe_create(
-                    self.draft_runner.model, self._draft_vocab_exchange
+                    self.draft_runner.model, self._draft_vocab_exchange, self._hot_vocab
                 )
                 self._draft_vocab_exchange.mkd = mkd
                 self.draft_runner.model._mkd = mkd
