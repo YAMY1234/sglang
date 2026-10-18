@@ -157,6 +157,8 @@ class MkdDraftBoundary:
         if envs.SGLANG_Q35MF_MKD_TRACE.get():
             self._start_trace_reader()
         self.qkv_pf, self.qkv_pf_bytes = self._qkv_prefetch_target(envs.SGLANG_Q35MF_MKD_L2PF_QKV_MB.get())
+        self.qkv_stream = torch.cuda.Stream(device=dev) if self.qkv_pf is not None else None
+        self.qkv_pending = False
         # extend_fc: the draft extend's exchange writes fc_buf for the next draft's first step;
         # fc_buf_src: the (token, hidden) tensors it was written from, matched by identity
         # against the next draft's input (any other path leaves fc_buf to the stock fill).
@@ -272,7 +274,7 @@ class MkdDraftBoundary:
 
         for module in self.model.modules():
             if isinstance(module, QKVParallelLinear):
-                logger.info("MKD L2 prefetch: %d MB of the draft qkv weight during the exchange.", mb)
+                logger.info("MKD L2 prefetch: %d MB of the draft qkv weight beside the exchange.", mb)
                 return module.weight, mb * 2**20
         logger.warning("MKD qkv L2 prefetch disabled (no qkv projection found).")
         return None, 0
@@ -318,6 +320,16 @@ class MkdDraftBoundary:
         if self.pf_stream is not None and self.pf_pending:
             torch.cuda.current_stream().wait_stream(self.pf_stream)
             self.pf_pending = False
+        if self.qkv_pending:
+            torch.cuda.current_stream().wait_stream(self.qkv_stream)
+            self.qkv_pending = False
+
+    def _prefetch_qkv(self) -> None:
+        # HBM idles during the latency-bound exchange; the next step's qkv GEMV reads from L2.
+        self.qkv_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self.qkv_stream):
+            mkd_l2_prefetch(self.qkv_pf, self.qkv_pf_bytes)
+        self.qkv_pending = True
 
     def exchange(
         self,
@@ -330,6 +342,8 @@ class MkdDraftBoundary:
         mrope_positions: Optional[torch.Tensor],
     ) -> None:
         partial_flag = self.partial_sync[1:] if self.partial_pending and not self.last_step else None
+        if self.qkv_pf is not None and not self.last_step:
+            self._prefetch_qkv()
         mkd_xchg(
             local_logits,
             self.cand,
@@ -350,8 +364,6 @@ class MkdDraftBoundary:
             draft_column,
             NAN_KEY_SPLIT_ARGMAX,
             trace=self.trace,
-            prefetch=None if self.last_step else self.qkv_pf,
-            prefetch_bytes=self.qkv_pf_bytes,
             fc_out=self.fc_buf,
             token_only=self.last_step,
             partial_flag=partial_flag,

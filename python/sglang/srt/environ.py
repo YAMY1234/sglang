@@ -593,7 +593,7 @@ class Envs:
     # MB of the draft lm_head shard prefetched into L2 while single-token draft steps wait on
     # the all-reduce after the MoE (0 = off); a cache hint, values unchanged.
     SGLANG_Q35MF_MKD_L2PF_MB = EnvInt(0)
-    # MB of the draft qkv projection weight prefetched into L2 by the draft-step exchange (0 = off).
+    # MB of the draft qkv projection weight prefetched into L2 beside the draft-step exchange (0 = off).
     SGLANG_Q35MF_MKD_L2PF_QKV_MB = EnvInt(0)
     # Diagnostic: the draft-step exchange stamps per-phase %globaltimer into pinned host memory
     # and a thread logs percentiles every 20 s (slows the kernel; never in a timed run).
