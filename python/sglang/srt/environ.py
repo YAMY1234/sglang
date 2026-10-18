@@ -1022,6 +1022,8 @@ class Envs:
     SGLANG_Q35MF_ATTN_GATE_QUANT = EnvBool(False)
     SGLANG_Q35MF_ATTN_FRONT = EnvBool(False)
     SGLANG_Q35MF_ATTN_SPLIT_KV = EnvBool(False)
+    # Fused full-attention prologue / epilogue kernels for TP8 bs1 MTP verify (Qwen3.5 FP8 projections).
+    SGLANG_Q35MF_MKA_FUSED = EnvBool(False)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
 
     # ===================================================================
