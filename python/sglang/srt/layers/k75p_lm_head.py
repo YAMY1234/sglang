@@ -9,11 +9,14 @@ id, with the NaN rule of the argmax each draft call replaces.
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from typing import Optional
 
 import torch
 
 from sglang.kernels.ops.speculative.k75p_argmax import k75p_select, k75p_shard_argmax
+from sglang.kernels.ops.speculative.topk1 import draft_topk1_argmax_only
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.runtime_context import get_parallel
 
@@ -110,3 +113,55 @@ class K75PDraftSelect:
             num_rows=num_local_rows,
             torch_nan=torch_nan,
         )
+
+
+class K75PProof:
+    """Check every K75P draft pick against the stock LM-head path, eager or in CUDA graphs.
+
+    Counters live on the device and are mirrored into pinned host memory by a copy that is part
+    of the check, so the reporter thread logs them without any CUDA call (as CombineProof).
+    """
+
+    PERIOD_S = 30.0
+    KINDS = ("decode", "extend")
+
+    def __init__(self):
+        # [kind][calls, rows, mismatched rows]
+        self.counters = torch.zeros(
+            (2, 3), dtype=torch.int64, device=torch.cuda.current_device()
+        )
+        # Model init runs under a CUDA default-device context; pinned memory must say cpu.
+        self.host_counters = torch.zeros(
+            (2, 3), dtype=torch.int64, device="cpu", pin_memory=True
+        )
+        logger.info("K75P proof active")
+        threading.Thread(target=self._report, daemon=True).start()
+
+    def check(
+        self, *, extend: bool, token_ids: torch.Tensor, stock_logits: torch.Tensor
+    ) -> None:
+        # The stock pick of the replaced path: torch.argmax after the draft extend,
+        # the split argmax of draft_topk1_postprocess in draft decode steps.
+        if extend:
+            stock_ids = torch.argmax(stock_logits, dim=-1, keepdim=True)
+        else:
+            _, stock_ids = draft_topk1_argmax_only(stock_logits)
+        counters = self.counters[int(extend)]
+        counters[0].add_(1)
+        counters[1].add_(token_ids.shape[0])
+        counters[2].add_(torch.count_nonzero(stock_ids != token_ids))
+        self.host_counters.copy_(self.counters, non_blocking=True)
+
+    def _report(self) -> None:
+        while True:
+            time.sleep(self.PERIOD_S)
+            for kind, (calls, rows, mismatched) in zip(
+                self.KINDS, self.host_counters.tolist()
+            ):
+                logger.info(
+                    "K75P proof: kind=%s calls=%d rows=%d mismatched=%d",
+                    kind,
+                    calls,
+                    rows,
+                    mismatched,
+                )

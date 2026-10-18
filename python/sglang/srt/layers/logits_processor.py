@@ -44,7 +44,7 @@ from sglang.srt.layers.dp_attention import (
     get_dp_dtype,
     get_dp_hidden_size,
 )
-from sglang.srt.layers.k75p_lm_head import K75PDraftSelect
+from sglang.srt.layers.k75p_lm_head import K75PDraftSelect, K75PProof
 from sglang.srt.layers.logprob_processor import (
     InputLogprobProcessor,
     LogprobStage,
@@ -514,6 +514,7 @@ class LogitsProcessor(nn.Module):
         )
         # Set by the EAGLE worker for its draft head (SGLANG_Q35MF_K75P_LMHEAD).
         self.k75p_draft_select: Optional[K75PDraftSelect] = None
+        self.k75p_proof: Optional[K75PProof] = None
 
     def enable_k75p_draft_select(
         self, *, lm_head: VocabParallelEmbedding, max_rows: int, hidden_size: int
@@ -532,6 +533,8 @@ class LogitsProcessor(nn.Module):
         self.k75p_draft_select = K75PDraftSelect.create(
             max_rows=max_rows, hidden_size=hidden_size
         )
+        if self.k75p_draft_select is not None and envs.SGLANG_Q35MF_K75P_PROOF.get():
+            self.k75p_proof = K75PProof()
 
     def forward(
         self,
@@ -946,13 +949,21 @@ class LogitsProcessor(nn.Module):
     ) -> torch.Tensor:
         select = self.k75p_draft_select
         logits = self._compute_lm_head(select.gather_rows(hidden_states), lm_head)
+        extend = logits_metadata.forward_mode.is_draft_extend_v2()
         # Draft extend replaces torch.argmax (NaN wins); draft decode replaces the
         # split argmax of draft_topk1_postprocess (NaN reads as -1e30).
-        return select.select(
+        token_ids = select.select(
             logits=logits,
             num_local_rows=hidden_states.shape[0],
-            torch_nan=logits_metadata.forward_mode.is_draft_extend_v2(),
+            torch_nan=extend,
         )
+        if self.k75p_proof is not None:
+            self.k75p_proof.check(
+                extend=extend,
+                token_ids=token_ids,
+                stock_logits=self._get_logits(hidden_states, lm_head, logits_metadata),
+            )
+        return token_ids
 
     def _get_logits(
         self,

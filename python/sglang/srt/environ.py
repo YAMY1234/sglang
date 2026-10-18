@@ -1151,6 +1151,9 @@ class Envs:
     # EAGLE topk-1 draft calls on the vocab-parallel TP head (attention DP) pick their
     # tokens on the vocab shards: multimem row gather + (value, id) gather, no logits a2a.
     SGLANG_Q35MF_K75P_LMHEAD = EnvBool(False)
+    # With K75P engaged, also run the stock LM-head path on every K75P call and count
+    # token mismatches per kind (decode / extend); a thread logs the counters every 30 s.
+    SGLANG_Q35MF_K75P_PROOF = EnvBool(False)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
