@@ -51,6 +51,27 @@ _MEMO_BLOCK = 4096
 _TRACE_SLOTS = 64
 
 
+# Sources of the MKD JIT kernels; load_jit keys its build cache on their contents.
+_JIT_SOURCES = (
+    "speculative/mkd_draft_xchg.cuh",
+    "speculative/mkd_draft_fc.cuh",
+    "speculative/mkd_prefetch.cuh",
+    "speculative/draft_moe_fused.cuh",
+)
+
+
+def _jit_source_digests() -> str:
+    import hashlib
+    import os
+
+    from sglang.kernels.jit.utils.compile.spec import resolve_sources
+
+    return " ".join(
+        f"{os.path.basename(path)}={hashlib.sha256(open(path, 'rb').read()).hexdigest()[:16]}"
+        for path in resolve_sources(list(_JIT_SOURCES))
+    )
+
+
 def _clear_negative_zero(rows: torch.Tensor) -> torch.Tensor:
     # The exchanged embedding row has -0.0 cleared (vocab_argmax_pack); memo from the same row.
     bits = rows.view(torch.int16)
@@ -147,10 +168,11 @@ class MkdDraftBoundary:
         self.partial_pending = False
         self.pf_pending = False
         logger.info(
-            "MKD draft boundary active (tp=%d, %s candidates, %.1f MB exchange buffer).",
+            "MKD draft boundary active (tp=%d, %s candidates, %.1f MB exchange buffer); JIT sources %s.",
             self.world,
             "memo" if self.memo else "embedding",
             words * 8 / 2**20,
+            _jit_source_digests(),
         )
 
     @classmethod
