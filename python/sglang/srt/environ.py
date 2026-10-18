@@ -1172,6 +1172,9 @@ class Envs:
     # expert's FP8 gate/up projection in the same launch (fp32 accumulation order
     # differs from cuBLASLt).
     SGLANG_Q35MF_ROUTE_SHARED = EnvBool(False)
+    # Qwen MoE blocks on the trtllm NVFP4 runner with deferred finalize at <= 7 tokens (TP8 shapes):
+    # top-10 routing, FC1, SwiGLU and FC2 in one fused launch after router_gemm_quant.
+    SGLANG_Q35MF_MKM_FUSED = EnvBool(False)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
