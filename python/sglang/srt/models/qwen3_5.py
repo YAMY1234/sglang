@@ -1110,6 +1110,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 and self.out_proj.input_scale.numel() == 1
                 and core_attn_out.dtype == torch.bfloat16
             ):
+                hop = self._q35_push_hop(core_attn_out.shape[0] // nv)
                 (fp8, _), _, _ = _layer_norm_fwd(
                     core_attn_out,
                     self.norm.weight,
@@ -1119,8 +1120,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     is_rms_norm=True,
                     activation=self.norm.activation,
                     static_quant_scale=self.out_proj.input_scale,
+                    # The push launch waits on this grid before reading fp8; let it load its weights now.
+                    early_dependents=hop is not None,
                 )
                 fp8 = fp8.reshape(-1, nv * self.head_v_dim)
+                if hop is not None:
+                    return hop.out_proj_push(
+                        x_fp8=fp8,
+                        packed_w=self.out_proj.q35_packed,
+                        input_scale=self.out_proj.input_scale,
+                        weight_scale=self.out_proj.weight_scale,
+                    )
                 return self.out_proj(fp8)[0]
             print_warning_once(
                 "GDN static FP8 norm is unsupported; using the original path"
@@ -1147,6 +1157,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         output, _ = self.out_proj(core_attn_out)
         return output
+
+    def _q35_push_hop(self, m: int):
+        if not (envs.SGLANG_Q35MF_MKH_OPROJ.get() and m <= 8):
+            return None
+        from sglang.srt.layers.q35_hop import active
+
+        hop = active()
+        return hop if hop is not None and self.out_proj.q35_packed is not None else None
 
 
 class Qwen3_5LinearDecoderLayer(nn.Module):
