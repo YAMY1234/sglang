@@ -73,6 +73,7 @@ def mkd_xchg(
     fc_out: torch.Tensor | None = None,
     token_only: bool = False,
     partial_flag: torch.Tensor | None = None,
+    scan_part: torch.Tensor | None = None,
 ) -> None:
     """Shard argmax + multicast exchange + selection for one draft token (see the .cuh).
     ``hot_ids`` is the full sorted hot-vocabulary id list; this rank's rows are its
@@ -83,6 +84,7 @@ def mkd_xchg(
     step's fc output directly. ``token_only`` exchanges the keys alone (last draft step,
     draft extend). ``partial_flag`` (int32, 1 element) makes a hidden rank wait until it equals
     the call's epoch before reading ``own_partial`` (written by a kernel on another stream).
+    ``scan_part`` (int64 [SLOTS * CHUNKS], zeroed once) lets large shards be scanned in parts.
     ``trace`` is an int64 ring [slots, CHUNKS, 9] of
     %globaltimer stamps (device or mapped pinned host memory), slot = call epoch % slots."""
     memo = cand.dtype == torch.float32
@@ -108,6 +110,7 @@ def mkd_xchg(
         nan_key,
         int(token_only),
         partial_flag.data_ptr() if partial_flag is not None else 0,
+        scan_part.data_ptr() if scan_part is not None else 0,
         trace.data_ptr() if trace is not None else 0,
         trace.numel() // (CHUNKS * 9) if trace is not None else 1,
         prefetch.data_ptr() if prefetch is not None else 0,

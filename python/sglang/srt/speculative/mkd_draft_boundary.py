@@ -136,6 +136,8 @@ class MkdDraftBoundary:
         self.own_partial = torch.zeros(1, hidden, dtype=torch.float32, device=dev)
         # [CTA counter, epoch flag] of the side-stream hidden partial (mkd_hidden_partial).
         self.partial_sync = torch.zeros(2, dtype=torch.int32, device=dev)
+        # Per-CTA shard-argmax partials for large (full-vocabulary) shards.
+        self.scan_part = torch.zeros(3 * 16, dtype=torch.int64, device=dev)
         self.out_partials = torch.zeros(
             self.world - self.n_embed, hidden, dtype=torch.float32, device=dev
         )
@@ -353,6 +355,7 @@ class MkdDraftBoundary:
             fc_out=self.fc_buf,
             token_only=self.last_step,
             partial_flag=partial_flag,
+            scan_part=self.scan_part,
         )
         self.pending = not self.last_step
         if self.last_step:
@@ -432,6 +435,7 @@ class MkdDraftBoundary:
             trace=self.trace,
             fc_out=self.fc_buf if payload else None,
             token_only=not payload,
+            scan_part=self.scan_part,
         )
         self.fc_buf_src = (topk_index, hidden_states) if payload else None
         return topk_p, topk_index
