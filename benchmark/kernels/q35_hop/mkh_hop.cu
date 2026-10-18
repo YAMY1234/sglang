@@ -66,6 +66,9 @@ struct Params {
   float eps, prod_coeff;
   unsigned long long timeout_ns;
   unsigned long long peer_uc[8];  // every rank's unicast mailbox base (unicast push)
+  unsigned int poll_sleep_ns;     // back-off between polls of the mailbox (0 = spin)
+  int self_only;                  // diagnostic: poll only this rank's own slot
+  int active_rank;                // diagnostic: >= 0 makes every other rank's launch a no-op
 };
 
 // ---------------------------------------------------------------- PTX helpers
@@ -82,6 +85,14 @@ __device__ __forceinline__ unsigned long long gtimer() {
 __device__ __forceinline__ uint4 ld_v4(const void* p) {
   // Plain load: the compiler may batch it, but not move it above an asm memory clobber.
   return *static_cast<const uint4*>(p);
+}
+__device__ __forceinline__ uint4 ld_relaxed_sys_v4(const void* p) {
+  uint4 v;
+  asm volatile("ld.relaxed.sys.global.v4.u32 {%0,%1,%2,%3}, [%4];"
+               : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+               : "l"(p)
+               : "memory");
+  return v;
 }
 __device__ __forceinline__ uint4 ld_volatile_v4(const void* p) {
   uint4 v;
@@ -104,6 +115,11 @@ __device__ __forceinline__ void st_relaxed_sys_v4(void* p, uint4 v) {
 __device__ __forceinline__ void mc_st_v4(void* mc, uint4 v) {
   asm volatile("multimem.st.relaxed.sys.global.v4.bf16x2 [%0], {%1,%2,%3,%4};" ::"l"(mc),
                "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w)
+               : "memory");
+}
+__device__ __forceinline__ void mc_st_v4_weak(void* mc, uint4 v) {
+  asm volatile("multimem.st.global.v4.bf16x2 [%0], {%1,%2,%3,%4};" ::"l"(mc), "r"(v.x), "r"(v.y), "r"(v.z),
+               "r"(v.w)
                : "memory");
 }
 __device__ __forceinline__ void mc_st_b64(void* mc, unsigned long long v) {
@@ -271,10 +287,12 @@ __device__ __forceinline__ void fail(const Params& p, uint32_t bits) {
 
 // ---------------------------------------------------------------- push side
 
-template <int W, bool UNI>
+template <int W, bool UNI, bool WEAK = false>
 __device__ __forceinline__ void push_ll(const Params& p, uint32_t stage, int token, int frag, uint4 v) {
   v = sanitize(v);
-  if (UNI) {
+  if (WEAK) {
+    mc_st_v4_weak(static_cast<uint16_t*>(p.mb_mc) + mb_off(p, stage, p.rank, token, frag), v);
+  } else if (UNI) {
 #pragma unroll
     for (int r = 0; r < W; ++r)
       st_relaxed_sys_v4(reinterpret_cast<uint16_t*>(p.peer_uc[r]) + mb_off(p, stage, p.rank, token, frag), v);
@@ -286,36 +304,31 @@ __device__ __forceinline__ void push_ll(const Params& p, uint32_t stage, int tok
 // ---------------------------------------------------------------- pull side
 
 // Poll W sources of one fragment until none holds the -0.0 sentinel; sum in rank order (fp32).
-template <int W>
+template <int W, bool RELAXED = false>
 __device__ __forceinline__ bool pull_ll(const Params& p, uint32_t stage, int token, int frag,
-                                        float acc[8], unsigned long long* arrival = nullptr) {
+                                        float acc[8]) {
   const uint16_t* uc = static_cast<const uint16_t*>(p.mb_uc);
   uint4 v[W];
 #pragma unroll
-  for (int r = 0; r < W; ++r) v[r] = ld_volatile_v4(uc + mb_off(p, stage, r, token, frag));
+  for (int r = 0; r < W; ++r)
+    v[r] = RELAXED ? ld_relaxed_sys_v4(uc + mb_off(p, stage, r, token, frag))
+                   : ld_volatile_v4(uc + mb_off(p, stage, r, token, frag));
   uint32_t pending = 0;
 #pragma unroll
   for (int r = 0; r < W; ++r) pending |= frag_has_negzero(v[r]) ? (1u << r) : 0u;
-  if (arrival != nullptr) {
-    const unsigned long long now = gtimer();
-#pragma unroll
-    for (int r = 0; r < W; ++r) if (!(pending & (1u << r))) arrival[r] = now;
-  }
+  if (p.self_only) pending &= 1u << p.rank;
   unsigned long long t0 = 0;
   uint32_t spins = 0;
   while (pending) {
 #pragma unroll
     for (int r = 0; r < W; ++r)
-      if (pending & (1u << r)) v[r] = ld_volatile_v4(uc + mb_off(p, stage, r, token, frag));
+      if (pending & (1u << r))
+        v[r] = RELAXED ? ld_relaxed_sys_v4(uc + mb_off(p, stage, r, token, frag))
+                       : ld_volatile_v4(uc + mb_off(p, stage, r, token, frag));
     uint32_t still = 0;
 #pragma unroll
     for (int r = 0; r < W; ++r)
       if ((pending & (1u << r)) && frag_has_negzero(v[r])) still |= 1u << r;
-    if (arrival != nullptr && still != pending) {
-      const unsigned long long now = gtimer();
-#pragma unroll
-      for (int r = 0; r < W; ++r) if ((pending & ~still) & (1u << r)) arrival[r] = now;
-    }
     pending = still;
     if (pending && ((++spins & 255u) == 0)) {
       unsigned long long now = gtimer();
@@ -548,15 +561,15 @@ __device__ __forceinline__ uint4 finalize_frag(const Params& p, int token, int f
 // 3 all sources arrived, 4 cluster RMS done, 5 last store issued.
 
 // M1: one kernel = push + pull + residual + RMSNorm (+ FP8). FIN adds the MoE finalize.
-template <int W, bool FIN, bool FIN_FMA, int SQ, int WR, bool TU, bool UNI>
+template <int W, bool FIN, bool FIN_FMA, int SQ, int WR, bool TU, bool UNI, bool WEAK = false>
 __global__ void __launch_bounds__(kThreads) hop_one_kernel(Params p) {
   __shared__ ClusterSmem cs;
   __shared__ int32_t meta_rows[16];
   __shared__ float meta_wts[16];
   const int token = blockIdx.x;
   const int frag = blockIdx.y * kThreads + threadIdx.x;
+  if (p.active_rank >= 0 && p.rank != p.active_rank) { pdl_trigger(); pdl_wait(); return; }
   const unsigned long long t_entry = gtimer();
-  unsigned long long arrival[8] = {0, 0, 0, 0, 0, 0, 0, 0};
   pdl_trigger();
   float gam[8];
   load_gamma(p, frag, gam);
@@ -599,7 +612,7 @@ __global__ void __launch_bounds__(kThreads) hop_one_kernel(Params p) {
   } else {
     push_ll<W, UNI>(p, hs.stage, token, frag, mine);
     t_push = gtimer();
-    ok = pull_ll<W>(p, hs.stage, token, frag, acc, threadIdx.x == 0 && p.stamps != nullptr ? arrival : nullptr);
+    ok = pull_ll<W, WEAK>(p, hs.stage, token, frag, acc);
   }
   const unsigned long long t_pull = gtimer();
   unsigned long long t_rms = 0;
@@ -611,8 +624,6 @@ __global__ void __launch_bounds__(kThreads) hop_one_kernel(Params p) {
     unsigned long long* st = p.stamps + (call * gridDim.x * gridDim.y + blockIdx.x * gridDim.y + blockIdx.y) * 16;
     st[0] = t_entry; st[1] = t_wait; st[2] = t_push; st[3] = t_pull; st[4] = t_rms; st[5] = gtimer();
     st[6] = hs.seq;
-#pragma unroll
-    for (int r = 0; r < 8; ++r) st[8 + r] = arrival[r];
   }
 }
 
@@ -636,6 +647,86 @@ __global__ void __launch_bounds__(kThreads) prod_kernel(Params p) {
   } else {
     st_v4(p.prod_out + row, out);
   }
+}
+
+// Fused-state probe: one launch consumes hop k (stage s) and, from the registers holding its
+// normalized output, produces hop k+1 (stage s+1) as a half-layer kernel's epilogue would.
+template <int W, int SQ, int WR>
+__global__ void __launch_bounds__(kThreads) fused_kernel(Params p) {
+  __shared__ ClusterSmem cs;
+  const int token = blockIdx.x;
+  const int frag = blockIdx.y * kThreads + threadIdx.x;
+  pdl_trigger();
+  float gam[8];
+  load_gamma(p, frag, gam);
+  const float inv_s = p.fp8_out != nullptr ? div_full(1.f, *p.fp8_scale) : 1.f;
+  cluster_exchange_init(cs);
+  pdl_wait();
+  const HopState hs = hop_begin(p);
+  const size_t row = static_cast<size_t>(token) * kHidden + static_cast<size_t>(frag) * kVec;
+  const uint4 res_in = ld_v4(p.residual_in + row);
+  float acc[8];
+  const bool ok = pull_ll<W>(p, hs.stage, token, frag, acc);
+  // residual + RMSNorm in registers; the next hop is pushed before any store of this one.
+  float res[8], pre[8];
+  unpack8(res_in, res);
+#pragma unroll
+  for (int e = 0; e < 8; ++e) pre[e] = __fadd_rn(acc[e], res[e]);
+  const uint4 pre_bf = pack8(pre);
+  unpack8(pre_bf, pre);
+  const float total = cluster_sum<WR>(sum_sq8<SQ>(pre), cs);
+  const float inv = rsqrtf(__fadd_rn(total / static_cast<float>(kHidden), p.eps));
+  float out[8];
+#pragma unroll
+  for (int e = 0; e < 8; ++e) out[e] = __fmul_rn(__fmul_rn(pre[e], inv), gam[e]);
+  uint4 out_bf = pack8(out);
+  if (!ok) out_bf = make_uint4(kNanPair, kNanPair, kNanPair, kNanPair);
+  float f[8];
+  unpack8(out_bf, f);
+#pragma unroll
+  for (int e = 0; e < 8; ++e) f[e] = __fmul_rn(f[e], p.prod_coeff);
+  push_ll<W, false>(p, (hs.stage + 1) % kStages, token, frag, pack8(f));
+  st_v4(p.residual_out + row, pre_bf);
+  if (p.norm_out != nullptr) st_v4(p.norm_out + row, out_bf);
+  if (p.fp8_out != nullptr) {
+    float q[8];
+    unpack8(out_bf, q);
+    uint32_t w[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const float a = fminf(fmaxf(__fmul_rn(q[2 * j], inv_s), -448.f), 448.f);
+      const float b = fminf(fmaxf(__fmul_rn(q[2 * j + 1], inv_s), -448.f), 448.f);
+      w[j] = cvt_e4m3x2(a, b);
+    }
+    *reinterpret_cast<uint2*>(p.fp8_out + row) = make_uint2(w[0] | (w[1] << 16), w[2] | (w[3] << 16));
+  }
+  rearm_ll<W>(p, hs.stage, token, frag);
+  hop_end(p, hs);
+}
+
+// Split-hop publishers for the drop-in: push this rank's partial straight from global memory
+// (hop B) or finalize the routed rows first (hop A, metadata staged before the PDL wait).
+template <int W, bool FIN>
+__global__ void __launch_bounds__(kThreads) publish_kernel(Params p) {
+  __shared__ int32_t meta_rows[16];
+  __shared__ float meta_wts[16];
+  const int token = blockIdx.x;
+  const int frag = blockIdx.y * kThreads + threadIdx.x;
+  if (FIN) {
+    if (threadIdx.x < p.top_k) {
+      const int i = token * p.top_k + threadIdx.x;
+      const int r = p.permuted[i];
+      meta_rows[threadIdx.x] = r;
+      meta_wts[threadIdx.x] = r < 0 ? 0.f : __uint_as_float(static_cast<uint32_t>(p.expert_w[i]) << 16);
+    }
+    __syncthreads();
+  }
+  pdl_wait();
+  const uint32_t stage = ld_volatile_u32(&p.ctrl->stage);
+  const size_t row = static_cast<size_t>(token) * kHidden + static_cast<size_t>(frag) * kVec;
+  const uint4 mine = FIN ? finalize_frag<false>(p, token, frag, meta_rows, meta_wts) : ld_v4(p.partial + row);
+  push_ll<W, false>(p, stage, token, frag, mine);
+  pdl_trigger();
 }
 
 // M2 consumer: pull + residual + RMSNorm (+ FP8); its producer already pushed.
@@ -837,7 +928,11 @@ enum Variant : int {
   kOneTU = 8,       // M4 tagged words, all-reduce
   kOneLLFinFma = 9,
   kOneLLUni = 10,   // M1, unicast push to every peer
-  kProdPushUni = 11 // M2 producer, unicast push
+  kProdPushUni = 11, // M2 producer, unicast push
+  kOneLLWeak = 12,   // M1 polling with ld.relaxed.sys instead of ld.volatile
+  kPublish = 13,     // split hop: push the global partial
+  kPublishFin = 14,  // split hop: finalize + push
+  kFused = 15        // consume hop k and produce hop k+1 in one launch
 };
 
 template <typename K>
@@ -880,13 +975,17 @@ static int dispatch(int variant, int order, const Params& p, cudaStream_t s) {
   switch (variant) {
     case kOneLL: MKH_BY_ORDER(return launch(hop_one_kernel<W, false, false, SQ, WR, false, false>, p, s, true))
     case kOneLLUni: MKH_BY_ORDER(return launch(hop_one_kernel<W, false, false, SQ, WR, false, true>, p, s, true))
+    case kOneLLWeak: MKH_BY_ORDER(return launch(hop_one_kernel<W, false, false, SQ, WR, false, false, true>, p, s, true))
     case kOneLLFin: MKH_BY_ORDER(return launch(hop_one_kernel<W, true, false, SQ, WR, false, false>, p, s, true))
     case kOneLLFinFma: MKH_BY_ORDER(return launch(hop_one_kernel<W, true, true, SQ, WR, false, false>, p, s, true))
     case kOneTU: MKH_BY_ORDER(return launch(hop_one_kernel<W, false, false, SQ, WR, true, false>, p, s, true))
     case kProdPush: return launch(prod_kernel<W, true, false>, p, s, false);
     case kProdPushUni: return launch(prod_kernel<W, true, true>, p, s, false);
     case kProdPlain: return launch(prod_kernel<W, false, false>, p, s, false);
+    case kPublish: return launch(publish_kernel<W, false>, p, s, false);
+    case kPublishFin: return launch(publish_kernel<W, true>, p, s, false);
     case kConsume: MKH_BY_ORDER(return launch(consume_kernel<W, SQ, WR>, p, s, true))
+    case kFused: MKH_BY_ORDER(return launch(fused_kernel<W, SQ, WR>, p, s, true))
     case kLdr1: MKH_BY_ORDER(return launch(ldr1_kernel<SQ, WR>, p, s, true))
     case kLdr2: MKH_BY_ORDER(return launch(ldr2_kernel<W, SQ, WR>, p, s, true))
     default: return -1;

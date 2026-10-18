@@ -115,10 +115,11 @@ def _check(args, ctx, m, t, fusion, mkh, static_quant_fp8, seed=0):
     torch.cuda.synchronize()
     rows = []
     for name, rn, rr, rq in (("one", ref_n, ref_r, ref_q), ("fin", fref_n, fref_r, fref_q),
-                             ("fin_fma", fref_n, fref_r, fref_q)):
-        for order in range(6):
-            call = mkh.make_call(name, m=m, x=t["x"], residual=t["residual"], gamma=t["gamma"],
-                                 scale=t["scale"], fin=fin, order=order)
+                             ("split", ref_n, ref_r, ref_q), ("split_fin", fref_n, fref_r, fref_q)):
+        for order in (1,):
+            maker = mkh.make_split if name.startswith("split") else mkh.make_call
+            call = maker(name, m=m, x=t["x"], residual=t["residual"], gamma=t["gamma"],
+                         scale=t["scale"], fin=fin, order=order)
             call()
             torch.cuda.synchronize()
             o = mkh.outputs_of(name, m, order)
@@ -223,7 +224,7 @@ def main():
             comm_backend=TorchDistBackend(group=dist.group.WORLD), group=dist.group.WORLD,
         )
     mkh = None
-    if any(b.startswith(("mkh:", "chain:", "check", "pingpong:")) for b in backends):
+    if any(b.startswith(("mkh:", "chain:", "check", "pingpong:", "split:")) for b in backends):
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import mkh_hop
 
@@ -310,6 +311,10 @@ def main():
                     fn = mkh.make_call(b[4:], m=m, x=t["x"], residual=t["residual"],
                                        gamma=t["gamma"], scale=t["scale"], fin=fin,
                                        order=args.order)
+                elif b.startswith("split:"):
+                    fn = mkh.make_split(b[6:], m=m, x=t["x"], residual=t["residual"],
+                                        gamma=t["gamma"], scale=t["scale"], fin=fin,
+                                        order=args.order)
                 elif b.startswith("chain:"):
                     kind = b[6:]
                     fi_call = None

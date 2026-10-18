@@ -16,7 +16,7 @@ FRAGS = 512
 
 # Variant codes, mirrored from mkh_hop.cu.
 (V_ONE_LL, V_ONE_FIN, V_PROD_PUSH, V_PROD_PLAIN, V_CONSUME, V_LDR1, V_LDR2, V_ONE_TU, V_ONE_FIN_FMA,
- V_ONE_LL_UNI, V_PROD_PUSH_UNI) = range(1, 12)
+ V_ONE_LL_UNI, V_PROD_PUSH_UNI, V_ONE_LL_WEAK, V_PUBLISH, V_PUBLISH_FIN, V_FUSED) = range(1, 16)
 
 
 class Params(ctypes.Structure):
@@ -26,7 +26,8 @@ class Params(ctypes.Structure):
         "mb_mc", "mb_uc", "aux_mc", "aux_uc", "ctrl", "stamps")] + [
         (n, ctypes.c_int) for n in ("rank", "world", "m", "m_cap", "top_k", "stamp_calls")] + [
         ("eps", ctypes.c_float), ("prod_coeff", ctypes.c_float),
-        ("timeout_ns", ctypes.c_ulonglong), ("peer_uc", ctypes.c_uint64 * 8)]
+        ("timeout_ns", ctypes.c_ulonglong), ("peer_uc", ctypes.c_uint64 * 8),
+        ("poll_sleep_ns", ctypes.c_uint), ("self_only", ctypes.c_int), ("active_rank", ctypes.c_int)]
 
 
 def _build(rank):
@@ -101,9 +102,12 @@ class MkhHop:
         self.instances = {}
         self.outputs = {}
         self.stamps = None
+        self.poll_sleep_ns = int(os.environ.get("MKH_POLL_SLEEP_NS", "0"))
+        self.self_only = int(os.environ.get("MKH_SELF_ONLY", "0"))
+        self.active_rank = int(os.environ.get("MKH_ACTIVE_RANK", "-1"))
 
-    def _instance(self, kind, m):
-        key = (kind, m)
+    def _instance(self, kind, m, tag=""):
+        key = (kind + tag, m)
         if key not in self.instances:
             self.instances[key] = _Instance(self, kind, m)
         return self.instances[key]
@@ -144,6 +148,9 @@ class MkhHop:
         p.eps, p.prod_coeff, p.timeout_ns = 1e-6, coeff, self.timeout_ns
         for i, a in enumerate(inst.peers):
             p.peer_uc[i] = a
+        p.poll_sleep_ns = self.poll_sleep_ns
+        p.self_only = self.self_only
+        p.active_rank = self.active_rank
         return p
 
     def _launch(self, variant, order, p):
@@ -154,10 +161,11 @@ class MkhHop:
 
     def make_call(self, name, *, m, x, residual, gamma, scale, fin=None, order=0):
         """name: one | one_nq | fin | fin_fma | tu | ldr1 | ldr2 (single hop calls)."""
-        kind = {"one": "ll", "one_nq": "ll", "one_uni": "ll", "fin": "ll", "fin_fma": "ll",
-                "tu": "tu", "ldr1": "ldr1", "ldr2": "ldr2"}[name]
-        variant = {"one": V_ONE_LL, "one_nq": V_ONE_LL, "one_uni": V_ONE_LL_UNI, "fin": V_ONE_FIN,
-                   "fin_fma": V_ONE_FIN_FMA, "tu": V_ONE_TU, "ldr1": V_LDR1, "ldr2": V_LDR2}[name]
+        kind = {"one": "ll", "one_nq": "ll", "one_uni": "ll", "one_rlx": "ll", "fin": "ll",
+                "fin_fma": "ll", "tu": "tu", "ldr1": "ldr1", "ldr2": "ldr2"}[name]
+        variant = {"one": V_ONE_LL, "one_nq": V_ONE_LL, "one_uni": V_ONE_LL_UNI, "one_rlx": V_ONE_LL_WEAK,
+                   "fin": V_ONE_FIN, "fin_fma": V_ONE_FIN_FMA, "tu": V_ONE_TU, "ldr1": V_LDR1,
+                   "ldr2": V_LDR2}[name]
         inst = self._instance(kind, m)
         outs = self._outputs((name, m, order), m)
         p = self._params(inst, m=m, outs=outs, x=x, residual=residual, gamma=gamma, scale=scale,
@@ -165,6 +173,20 @@ class MkhHop:
 
         def call():
             self._launch(variant, order, p)
+
+        return call
+
+    def make_split(self, name, *, m, x, residual, gamma, scale, fin=None, order=0):
+        """split | split_nq | split_fin: publish launch + consume launch (the drop-in shape)."""
+        inst = self._instance("ll", m)
+        outs = self._outputs((name, m, order), m)
+        p = self._params(inst, m=m, outs=outs, x=x, residual=residual, gamma=gamma, scale=scale,
+                         fin=fin if name == "split_fin" else None, quant=name != "split_nq")
+        pub = V_PUBLISH_FIN if name == "split_fin" else V_PUBLISH
+
+        def call():
+            self._launch(pub, 0, p)
+            self._launch(V_CONSUME, order, p)
 
         return call
 
@@ -194,6 +216,13 @@ class MkhHop:
             return lambda: (self._launch(V_PROD_PLAIN, 0, pp), fi_call(outs["prod"], outs["norm"]))
         if name == "prod":
             return lambda: self._launch(V_PROD_PLAIN, 0, pp)
+        if name in ("fused", "fused_nq"):
+            # Own mailbox: the chain always leaves one pushed, unconsumed hop behind.
+            fi = self._instance("ll", m, tag=f"-{name}")
+            pf = self._params(fi, m=m, outs=outs, x=outs["prod"], residual=residual, gamma=gamma,
+                              scale=scale, prod_src=src, coeff=1.0, quant=name == "fused")
+            self._launch(V_PROD_PUSH, 0, pf)  # prime hop 0 for the first fused launch
+            return lambda: self._launch(V_FUSED, order, pf)
         raise ValueError(name)
 
     def pingpong(self, *, peer, iters, unicast, x, residual, gamma, scale, gap_ns=0):
