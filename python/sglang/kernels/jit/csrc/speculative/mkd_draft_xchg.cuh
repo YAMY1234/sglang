@@ -198,6 +198,11 @@ __global__ void __launch_bounds__(kThreads) mkd_xchg_kernel(const MkdXchgParams 
       }
     }
   }
+  if (from_head && static_cast<int>(threadIdx.x) < p.head_parts) {
+    // The lm_head kernel (complete after the PDL wait) left one packed maximum per CTA; every
+    // thread takes one, so the block reduce below combines them in one L2 round trip.
+    best = p.head_part[threadIdx.x];
+  }
   t_cmp = mkd_xchg::now_ns();
   best = __reduce_max_sync(0xffffffffu, best);
   nan_any = __reduce_or_sync(0xffffffffu, nan_any);
@@ -212,16 +217,7 @@ __global__ void __launch_bounds__(kThreads) mkd_xchg_kernel(const MkdXchgParams 
   best = __reduce_max_sync(0xffffffffu, lane < kWarps ? s_v[lane] : 0u);
   nan_any = __reduce_or_sync(0xffffffffu, lane < kWarps ? static_cast<uint32_t>(s_i[lane]) : 0u);
   if (from_head) {
-    // The lm_head kernel (the grid before us, complete after the PDL wait) left one packed
-    // maximum per CTA; kNanPart (all ones) wins the max and sends us to the exact rescan.
-    if (warp == 0) {
-      uint32_t v = 0u;
-      for (int i = lane; i < p.head_parts; i += 32) v = max(v, p.head_part[i]);
-      v = __reduce_max_sync(0xffffffffu, v);
-      if (lane == 0) s_best = v;
-    }
-    __syncthreads();
-    best = s_best;
+    // kNanPart (all ones) won the max: a head CTA saw a NaN logit, so take the exact rescan.
     nan_any = best == mkd_xchg::kNanPart ? 1u : 0u;
   } else if (split) {
     // Every CTA publishes its sub-shard maximum (tagged with the epoch) and takes the max of all.
@@ -547,6 +543,7 @@ struct MkdXchg {
     TensorMatcher({1, 1}).with_dtype<int64_t>().with_device(device).verify(topk_index);
     TensorMatcher({1, 1}).with_dtype<fp32_t>().with_device(device).verify(topk_p);
     CHECK_HOST(V.unwrap() % 8 == 0 && V.unwrap() <= 65536) << "local vocab must be a multiple of 8 and <= 65536";
+    CHECK_HOST(head_parts <= kThreads) << "at most one head partial per exchange thread";
     CHECK_HOST(trace_slots >= 1) << "trace_slots must be >= 1";
     int64_t* tokens = nullptr;
     if (draft_tokens.numel() > 0) {
