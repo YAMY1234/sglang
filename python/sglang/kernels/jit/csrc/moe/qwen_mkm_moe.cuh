@@ -750,7 +750,9 @@ struct MkmMoe {
     TensorMatcher({kE, kN1, kH / 2}).with_dtype<uint8_t>().with_device(device).ensure_alignment(16).verify(w13);
     TensorMatcher({kE, kN1, kH / 16}).with_dtype<uint8_t>().with_device(device).ensure_alignment(16).verify(w13_sf);
     TensorMatcher({kE, kH, 64}).with_dtype<uint8_t>().with_device(device).ensure_alignment(16).verify(w2);
-    TensorMatcher({kE, kH, 8}).with_dtype<uint8_t>().with_device(device).ensure_alignment(16).verify(w2_sf);
+    TensorMatcher({kE, kH, 8}).with_dtype<uint8_t>().with_device(device).verify(w2_sf);
+    // Scale-factor blocks are bulk-copied in 2 KB pieces from 512 B aligned offsets of the base.
+    CHECK_HOST(reinterpret_cast<uintptr_t>(w2_sf.data_ptr()) % 16 == 0) << "qwen_mkm_moe: w2_sf base not 16 B aligned";
     TensorMatcher({kE}).with_dtype<fp32_t>().with_device(device).verify(g1_alpha).verify(g1_scale_c).verify(g2_alpha);
     TensorMatcher({R_, kH}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(out);
     const auto M = static_cast<int64_t>(M_.unwrap());
