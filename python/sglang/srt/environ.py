@@ -593,7 +593,7 @@ class Envs:
     # MB of the draft lm_head shard prefetched into L2 while single-token draft steps wait on
     # the all-reduce after the MoE (0 = off); a cache hint, values unchanged.
     SGLANG_Q35MF_MKD_L2PF_MB = EnvInt(0)
-    # MB of the draft qkv projection weight prefetched into L2 by the draft-step exchange (0 = off).
+    # MB of the draft qkv projection weight prefetched into L2 beside the draft-step exchange (0 = off).
     SGLANG_Q35MF_MKD_L2PF_QKV_MB = EnvInt(0)
     # Diagnostic: the draft-step exchange stamps per-phase %globaltimer into pinned host memory
     # and a thread logs percentiles every 20 s (slows the kernel; never in a timed run).
@@ -601,6 +601,13 @@ class Envs:
     # With SGLANG_Q35MF_MKD_TTABLE: the draft extend's exchange also finishes the fc of the next
     # draft's first step, which then skips its embedding and fc (stock fill when no extend ran).
     SGLANG_Q35MF_MKD_EXTEND_FC = EnvBool(False)
+    # With SGLANG_Q35MF_MKD_XCHG: one-row draft steps compute the draft lm_head with mkd_draft_head
+    # (fp32 accumulation, bf16 logits; only the summation order differs from the served GEMM) and
+    # the exchange reads its per-CTA maxima instead of scanning the logits.
+    SGLANG_Q35MF_MKD_HEAD = EnvBool(False)
+    # Diagnostic for SGLANG_Q35MF_MKD_HEAD: also run the served GEMM every step and log how often
+    # the argmax differs and by how much the served logits separate the two picks.
+    SGLANG_Q35MF_MKD_HEAD_CHECK = EnvBool(False)
 
     # ===================================================================
     # Memory pools and KV-cache sizing
