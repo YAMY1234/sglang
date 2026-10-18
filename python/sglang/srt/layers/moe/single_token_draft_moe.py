@@ -174,8 +174,6 @@ class SingleTokenDraftMoe:
     def forward(self, block, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
         """Return the block output, or None when the caller must take the stock path.
         Each of the (at most MAX_TOKENS) tokens runs its own GEMV passes in turn."""
-        from sglang.kernels.ops.speculative.draft_moe_gemv import draft_moe_gemv
-
         if self._scratch is None and not self._setup(block, hidden_states[:1]):
             return None
         with use_symmetric_memory(
@@ -183,7 +181,16 @@ class SingleTokenDraftMoe:
         ):
             out = torch.empty_like(hidden_states)
         if self._single_launch_scratch is not None:
-            return self._forward_single_launch(block, hidden_states, out)
+            self._forward_single_launch(block, hidden_states, out)
+        else:
+            self._forward_gemv(block, hidden_states, out)
+        if self.after_hook is not None:
+            self.after_hook()
+        return out
+
+    def _forward_gemv(self, block, hidden_states, out) -> None:
+        from sglang.kernels.ops.speculative.draft_moe_gemv import draft_moe_gemv
+
         act, gate = self._scratch
         stock_route = None
         if self._router_scratch is None:
@@ -209,6 +216,3 @@ class SingleTokenDraftMoe:
                 act,
                 gate,
             )
-        if self.after_hook is not None:
-            self.after_hook()
-        return out
