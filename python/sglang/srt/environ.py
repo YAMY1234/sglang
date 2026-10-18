@@ -614,9 +614,12 @@ class Envs:
     # With SGLANG_Q35MF_MKD_HOP: the single-launch draft MoE pushes its output into the hop itself,
     # so the MoE-output hop only consumes.
     SGLANG_Q35MF_MKD_HOP_PUSH = EnvBool(False)
-    # With SGLANG_Q35MF_MKD_HOP: the draft hops release their direct dependents (the single-launch draft
-    # MoE, the draft head) at entry, so their weight prefetch overlaps the hop.
+    # With SGLANG_Q35MF_MKD_HOP: the attention-output hop releases the single-launch draft MoE at entry,
+    # so its weight prefetch overlaps the hop.
     SGLANG_Q35MF_MKD_HOP_EARLY = EnvBool(False)
+    # With SGLANG_Q35MF_MKD_HOP_EARLY: the final hop releases the draft head at entry too (slower at TP8:
+    # the head's one-per-SM CTAs then launch while the draft MoE drains).
+    SGLANG_Q35MF_MKD_HOP_EARLY_HEAD = EnvBool(False)
     # Diagnostic for SGLANG_Q35MF_MKD_HOP: hold every draft hop's output stores this many ns (delay probe).
     SGLANG_Q35MF_MKD_HOP_DELAY_NS = EnvInt(0)
 

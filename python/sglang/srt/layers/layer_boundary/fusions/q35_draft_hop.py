@@ -74,6 +74,7 @@ class DraftHopFusion:
         self.moe_single_launch: Optional[Callable[[int], bool]] = None
         self.head_follows: Optional[Callable[[], bool]] = None
         self._early = envs.SGLANG_Q35MF_MKD_HOP_EARLY.get()
+        self._early_head = self._early and envs.SGLANG_Q35MF_MKD_HOP_EARLY_HEAD.get()
         self._delay_ns = envs.SGLANG_Q35MF_MKD_HOP_DELAY_NS.get()
         self._logged = False
 
@@ -112,7 +113,7 @@ class DraftHopFusion:
             eps=norm.variance_epsilon,
             weight_bias=1.0,
             add_norm=True,
-            early_release=self._early
+            early_release=self._early_head
             and self.head_follows is not None
             and self.head_follows(),
             delay_ns=self._delay_ns,
@@ -148,7 +149,9 @@ class DraftHopFusion:
             self._logged = True
             logger.info(
                 "MKD draft hop active (tp=%d): attention output with MNNVL rounding, "
-                "MoE output with one-shot + CuTe add-norm rounding.",
+                "MoE output with one-shot + CuTe add-norm rounding; entry release MoE %s, head %s.",
                 hop.world,
+                self._early,
+                self._early_head,
             )
         return hop
