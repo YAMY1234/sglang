@@ -45,9 +45,29 @@ def _pack_fragments(w_nk: torch.Tensor, units: int, steps: int) -> torch.Tensor:
     return v.permute(0, 5, 1, 6, 2, 4, 8, 7, 3, 9).contiguous().view(-1)
 
 
-def pack_qkv(w_nk: torch.Tensor) -> torch.Tensor:
-    """qkv(+gate) weight [N, 4096] e4m3 -> prologue layout (K chunk 512 per cluster rank)."""
-    return _pack_fragments(w_nk, w_nk.shape[0] // 256, 16)
+def _pack_rows32(w_nk: torch.Tensor) -> torch.Tensor:
+    # [R, 4096] e4m3 -> [cta = R/32][warp 8][step 16][m16 block 2][lane 32][16 B]; warp w covers K
+    # [512w, 512w + 512) of the CTA's 32 rows (mka_gate_kernel).
+    w = w_nk.contiguous().view(torch.uint8)
+    v = w.view(w.shape[0] // 32, 2, 2, 8, 8, 16, 2, 4, 4)
+    return v.permute(0, 4, 5, 1, 3, 7, 6, 2, 8).contiguous().view(-1)
+
+
+def split_gate(nq: int) -> bool:
+    """Whether the prologue hands the gate rows to mka_gate_kernel.
+
+    2*nq + 2 clusters of 8 CTAs exceed the 15 that co-reside on GB300 once nq = 8 (TP4).
+    """
+    return nq >= 8
+
+
+def pack_qkv(w_nk: torch.Tensor, nq: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """qkv(+gate) weight [N, 4096] e4m3 -> (prologue layout, gate-kernel layout or empty)."""
+    main = _pack_fragments(w_nk, w_nk.shape[0] // 256, 16)
+    if not split_gate(nq):
+        return main, main.new_empty(0)
+    gate_rows = w_nk[: nq * 512].reshape(nq, 2, 256, w_nk.shape[1])[:, 1].reshape(nq * 256, w_nk.shape[1])
+    return main, _pack_rows32(gate_rows)
 
 
 def pack_o(w_nk: torch.Tensor) -> torch.Tensor:
@@ -59,9 +79,10 @@ def prologue(
     x, w_packed, sx, sw, q_norm_w, k_norm_w, cos_sin, positions, axis_map, cache_loc,
     k_cache, v_cache, k_scale, v_scale, q_out, gate_out, nq: int, eps: float,
 ):
+    w_main, w_gate = w_packed
     _ext().prologue(
-        x, w_packed, sx, sw, q_norm_w, k_norm_w, cos_sin, positions, axis_map, cache_loc,
-        k_cache, v_cache, k_scale, v_scale, q_out, gate_out, nq, eps, True,
+        x, w_main, sx, sw, q_norm_w, k_norm_w, cos_sin, positions, axis_map, cache_loc,
+        k_cache, v_cache, k_scale, v_scale, q_out, gate_out, w_gate, nq, eps, True,
     )
 
 

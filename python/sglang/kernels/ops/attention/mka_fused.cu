@@ -162,6 +162,8 @@ struct ProParams {
   int pos_stride;
   int cs_stride;
   float eps;
+  int split;               // 1: this launch skips the gate units, which mka_gate_kernel computes
+  const uint4* wg;         // split: gate rows packed 32 rows x full K per CTA
 };
 
 // grid = (2*nq + 2) units x 8 ranks; unit u = qkv rows [256u, 256u + 256) (q_h, gate_h per head, then k,
@@ -174,7 +176,10 @@ __global__ void __launch_bounds__(kThreads, 1) mka_prologue_kernel(const ProPara
   __shared__ float nrm[256];
   __shared__ __align__(8) uint64_t ibar;
   const int rank = (int)cluster_ctarank();
-  const int unit = blockIdx.x / kCluster;
+  const int nq = p.nq;
+  // split launches cover q_0..q_{nq-1}, k, v; natural units interleave q_h and gate_h, then k, v
+  const int u = blockIdx.x / kCluster;
+  const int unit = !p.split ? u : (u < nq ? 2 * u : 2 * nq + (u - nq));
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   const int g = lane >> 2, t = lane & 3;
   if (tid == 0) {
@@ -193,7 +198,6 @@ __global__ void __launch_bounds__(kThreads, 1) mka_prologue_kernel(const ProPara
       for (int b = 0; b < 2; ++b) a[s][b] = ldg_nc_v4(wb + (s * 2 + b) * 32);
   }
   // Static operands only before the wait, and nothing consumes them there.
-  const int nq = p.nq;
   const bool is_q = unit < 2 * nq && (unit & 1) == 0;
   const bool is_gate = unit < 2 * nq && (unit & 1) == 1;
   const bool is_k = unit == 2 * nq;
@@ -310,6 +314,77 @@ __global__ void __launch_bounds__(kThreads, 1) mka_prologue_kernel(const ProPara
       p.q_out[(size_t)tok * nq * kHeadDim + (unit >> 1) * kHeadDim + f] = e4m3(n);
   }
   if (!kEarlyTrigger) pdl_trigger();
+}
+
+// Gate rows for split launches: no cluster, CTA c owns gate rows [32c, 32c + 32) (head c/8) over the
+// full K = 4096; warp w takes K [512w, 512w + 512) and the 8 warp partials are summed in warp order.
+// It runs beside the prologue: launched when the prologue triggers (after the hop's output is visible),
+// it reads x through L2 without its own griddepcontrol.wait and waits for the prologue only at the end,
+// so a consumer of this launch also sees the prologue's Q / KV.
+__global__ void __launch_bounds__(kThreads, 1) mka_gate_kernel(const ProParams p) {
+  __shared__ __align__(16) float red[8][32][8];
+  const int cta = blockIdx.x;
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int g = lane >> 2, t = lane & 3;
+  pdl_trigger();
+  uint4 a[16][2];
+  {
+    const uint4* wb = p.wg + ((size_t)cta * 8 + warp) * (16 * 2 * 32) + lane;
+#pragma unroll
+    for (int s = 0; s < 16; ++s)
+#pragma unroll
+      for (int b = 0; b < 2; ++b) a[s][b] = ldg_nc_v4(wb + (s * 2 + b) * 32);
+  }
+  const float sx = __ldg(p.sx), sw = __ldg(p.sw);
+  const float inv_sx = div_full(1.0f, sx);
+  const float alpha = __fmul_rn(sx, sw);
+  const int m = p.m;
+  const bool tok_ok = g < m;
+  const __nv_bfloat16* xr = p.x + (size_t)g * 4096 + warp * 512 + 4 * t;
+  uint2 raw[16][2];
+#pragma unroll
+  for (int s = 0; s < 16; ++s)
+#pragma unroll
+    for (int h = 0; h < 2; ++h)
+      raw[s][h] = tok_ok ? __ldcg(reinterpret_cast<const uint2*>(xr + s * 32 + h * 16)) : make_uint2(0u, 0u);
+  float ch[2][4][4];
+#pragma unroll
+  for (int b = 0; b < 2; ++b)
+#pragma unroll
+    for (int c = 0; c < 4; ++c)
+#pragma unroll
+      for (int i = 0; i < 4; ++i) ch[b][c][i] = 0.f;
+#pragma unroll
+  for (int s = 0; s < 16; ++s) {
+    const uint32_t b0 = quant4_static(reinterpret_cast<const __nv_bfloat16*>(&raw[s][0]), inv_sx);
+    const uint32_t b1 = quant4_static(reinterpret_cast<const __nv_bfloat16*>(&raw[s][1]), inv_sx);
+    mma_e4m3(ch[0][s & 3], a[s][0], b0, b1);
+    mma_e4m3(ch[1][s & 3], a[s][1], b0, b1);
+  }
+  {
+    float4* dst = reinterpret_cast<float4*>(&red[warp][lane][0]);
+#pragma unroll
+    for (int b = 0; b < 2; ++b)
+      dst[b] = make_float4(__fadd_rn(__fadd_rn(ch[b][0][0], ch[b][1][0]), __fadd_rn(ch[b][2][0], ch[b][3][0])),
+                           __fadd_rn(__fadd_rn(ch[b][0][1], ch[b][1][1]), __fadd_rn(ch[b][2][1], ch[b][3][1])),
+                           __fadd_rn(__fadd_rn(ch[b][0][2], ch[b][1][2]), __fadd_rn(ch[b][2][2], ch[b][3][2])),
+                           __fadd_rn(__fadd_rn(ch[b][0][3], ch[b][1][3]), __fadd_rn(ch[b][2][3], ch[b][3][3])));
+  }
+  __syncthreads();
+  {
+    // thread -> fragment lane l = tid/8, element e = tid%8: block e/4, row 16*(e/4) + g' + 8*((e%4)/2),
+    // token 2t' + (e%2)
+    const int l = tid >> 3, e = tid & 7;
+    float v = red[0][l][e];
+#pragma unroll
+    for (int w = 1; w < 8; ++w) v = __fadd_rn(v, red[w][l][e]);
+    const int row = 16 * (e >> 2) + (l >> 2) + 8 * ((e & 3) >> 1);
+    const int tok = 2 * (l & 3) + (e & 1);
+    const int h = cta >> 3, r = (cta & 7) * 32 + row;
+    if (tok < m)
+      p.gate_out[(size_t)tok * p.nq * kHeadDim + h * kHeadDim + r] = __float2bfloat16_rn(__fmul_rn(v, alpha));
+  }
+  pdl_wait();  // completes only after the prologue grid has completed
 }
 
 struct EpiParams {
@@ -435,12 +510,27 @@ void launch(Kernel kernel, int grid, const Params& params) {
   C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel, params));
 }
 
+template <typename Kernel, typename Params>
+void launch_plain(Kernel kernel, int grid, const Params& params) {
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = dim3(grid, 1, 1);
+  cfg.blockDim = dim3(kThreads, 1, 1);
+  cfg.stream = at::cuda::getCurrentCUDAStream();
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = 1;
+  cfg.attrs = attrs;
+  cfg.numAttrs = 1;
+  C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel, params));
+}
+
 }  // namespace
 
 void prologue(torch::Tensor x, torch::Tensor w, torch::Tensor sx, torch::Tensor sw, torch::Tensor qnw,
               torch::Tensor knw, torch::Tensor cos_sin, torch::Tensor pos, torch::Tensor axis, torch::Tensor loc,
               torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor k_scale, torch::Tensor v_scale,
-              torch::Tensor q_out, torch::Tensor gate_out, int64_t nq, double eps, bool early_trigger) {
+              torch::Tensor q_out, torch::Tensor gate_out, torch::Tensor w_gate, int64_t nq, double eps,
+              bool early_trigger) {
   const at::cuda::CUDAGuard guard(x.device());
   TORCH_CHECK(x.dim() == 2 && x.size(0) <= 8 && x.size(1) == 4096 && x.is_contiguous());
   TORCH_CHECK(pos.dim() == 2 && pos.size(0) == 3 && pos.stride(1) == 1);
@@ -471,11 +561,17 @@ void prologue(torch::Tensor x, torch::Tensor w, torch::Tensor sx, torch::Tensor 
   p.pos_stride = (int)pos.stride(0);
   p.cs_stride = (int)cos_sin.stride(0);
   p.eps = (float)eps;
-  const int grid = (2 * (int)nq + 2) * kCluster;
-  if (early_trigger)
-    launch(mka_prologue_kernel<true>, grid, p);
-  else
-    launch(mka_prologue_kernel<false>, grid, p);
+  p.split = w_gate.numel() > 0;
+  p.wg = p.split ? reinterpret_cast<const uint4*>(w_gate.data_ptr()) : nullptr;
+  if (!p.split) {
+    const int grid = (2 * (int)nq + 2) * kCluster;
+    if (early_trigger) launch(mka_prologue_kernel<true>, grid, p);
+    else launch(mka_prologue_kernel<false>, grid, p);
+    return;
+  }
+  // The gate launch must start while the prologue runs, so the prologue triggers right after its wait.
+  launch(mka_prologue_kernel<true>, ((int)nq + 2) * kCluster, p);
+  launch_plain(mka_gate_kernel, (int)nq * kHeadDim / 32, p);
 }
 
 void epilogue(torch::Tensor attn, torch::Tensor gate, torch::Tensor w, torch::Tensor sx, torch::Tensor sw,

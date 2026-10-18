@@ -1655,7 +1655,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
         return (
             self.attn_output_gate
-            and self.num_heads == 4
+            and self.num_heads in (4, 8)
             and self.num_kv_heads == 1
             and self.head_dim == 256
             and self.hidden_size == 4096
@@ -1694,7 +1694,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             from sglang.kernels.ops.attention import mka_fused
 
             self._mka_weights = (
-                mka_fused.pack_qkv(self.qkv_proj.weight.t()),
+                mka_fused.pack_qkv(self.qkv_proj.weight.t(), self.num_heads),
                 mka_fused.pack_o(self.o_proj.weight.t()),
             )
             logger.warning_once("MKA fused attention prologue/epilogue enabled for target verify.")
