@@ -2008,6 +2008,7 @@ class Envs:
     SGLANG_Q35MF_GDN_EMPTY_HISTORY = EnvBool(False)
     SGLANG_Q35MF_GDN_NORM_FP8 = EnvBool(False)
     SGLANG_Q35MF_MKG_FUSED = EnvBool(False)
+    SGLANG_Q35MF_MKG_BA_TC = EnvBool(False)
 
     # ===================================================================
     # Plugin system
