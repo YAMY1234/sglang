@@ -1063,6 +1063,8 @@ class Envs:
     # With SGLANG_Q35MF_MKA_FUSED and SGLANG_Q35MF_MKH_HOP: the fused o_proj pushes its partial into the
     # q35 hop mailbox, so the attention output hop only consumes.
     SGLANG_Q35MF_MKA_PUSH = EnvBool(False)
+    # KV length from which target verify uses SKV2 (trtllm-gen below); measured crossover 2048 at TP8, 4096 at TP4.
+    SGLANG_Q35MF_MKA_SKV2_VERIFY_MIN_LENGTH = EnvInt(32768)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
 
     # ===================================================================
