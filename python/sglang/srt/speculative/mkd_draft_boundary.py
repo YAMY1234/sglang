@@ -60,9 +60,9 @@ def _clear_negative_zero(rows: torch.Tensor) -> torch.Tensor:
 def _unsupported_reason(model, exchange) -> Optional[str]:
     if model.fc_split_slice is None or model._fc_gemv_rows is None:
         return "needs SGLANG_Q35MF_DRAFT_FC_SPLIT and SGLANG_Q35MF_DRAFT_FC_GEMV"
-    if exchange.token_map.numel() == 0:
-        return "needs the hot vocabulary (SGLANG_Q35MF_SPEC_HOT_VOCAB)"
     world = get_parallel().tp_size
+    if exchange.token_map.numel() == 0 and exchange.local_vocab * world != model.config.vocab_size:
+        return "full-vocabulary shards with padding rows"
     if world not in (4, 8):
         return f"tp_size {world}"
     if model.config.hidden_size != 4096:
@@ -91,9 +91,12 @@ class MkdDraftBoundary:
         dev = model.fc.weight.device
         self.memo = envs.SGLANG_Q35MF_MKD_TTABLE.get()
         rows = exchange.local_vocab
-        self.hot_ids = hot_ids.to(exchange.token_map.device)
-        if not torch.equal(self.hot_ids[self.rank * rows : (self.rank + 1) * rows], exchange.token_map):
-            raise RuntimeError("MKD draft boundary: hot shard is not the rank-th slice of the hot list")
+        self.hot_ids = hot_ids.to(dev)
+        if exchange.token_map.numel() > 0:
+            if not torch.equal(self.hot_ids[self.rank * rows : (self.rank + 1) * rows], exchange.token_map):
+                raise RuntimeError("MKD draft boundary: hot shard is not the rank-th slice of the hot list")
+        elif exchange.vocab_start != self.rank * rows:
+            raise RuntimeError("MKD draft boundary: vocabulary shard is not the rank-th equal slice")
         self.cand = self._build_memo(exchange) if self.memo else exchange.embed_weight
 
         tp = get_tp_group()
@@ -152,12 +155,14 @@ class MkdDraftBoundary:
     @classmethod
     def maybe_create(cls, model, exchange, hot) -> Optional["MkdDraftBoundary"]:
         reason = _unsupported_reason(model, exchange)
-        if reason is None and hot is None:
-            reason = "needs the hot vocabulary"
         if reason is not None:
             logger.warning("MKD draft boundary disabled (%s); using the stock path.", reason)
             return None
-        return cls(model, exchange, hot.token_ids)
+        if hot is not None:
+            return cls(model, exchange, hot.token_ids)
+        # Full vocabulary: candidate position p (rank-major) is vocabulary id p.
+        ids = torch.arange(exchange.local_vocab * get_parallel().tp_size, dtype=torch.int64)
+        return cls(model, exchange, ids)
 
     # ---------------------------------------------------------------- memo table
 
@@ -182,10 +187,10 @@ class MkdDraftBoundary:
         dist.all_reduce(bad_t, group=get_parallel().tp_group.device_group)
         if int(bad_t[0]) != 0:
             raise RuntimeError(
-                f"MKD memo table differs from the split fc on {int(bad_t[0])} of {int(bad_t[1])} hot rows"
+                f"MKD memo table differs from the split fc on {int(bad_t[0])} of {int(bad_t[1])} rows"
             )
         logger.info(
-            "MKD memo table: %d rows on this rank (%.1f MB), equal to the split fc on all %d hot rows.",
+            "MKD memo table: %d rows on this rank (%.1f MB), equal to the split fc on all %d rows.",
             rows,
             memo.numel() * 4 / 2**20,
             int(bad_t[1]),
