@@ -91,9 +91,10 @@ class Shape:
         self.box = torch.empty(m, N, dtype=torch.bfloat16, device=dev)
 
 
-def producer(sh, i):
+def producer(sh, i, early=False):
     from sglang.kernels.ops.attention.fla.layernorm_gated import _layer_norm_fwd
 
+    kw = {"early_dependents": True} if early else {}
     (fp8, _), _, _ = _layer_norm_fwd(
         sh.core[i % 2],
         sh.gamma,
@@ -103,6 +104,7 @@ def producer(sh, i):
         is_rms_norm=True,
         activation="swish",
         static_quant_scale=sh.sx,
+        **kw,
     )
     return fp8.reshape(sh.m, sh.k)
 
@@ -141,12 +143,12 @@ def arm_step(lib, sh, arm):
     use_prod = chain == "chain"
 
     def step(i):
-        x = producer(sh, i) if use_prod else sh.x
+        x = producer(sh, i, early=name.endswith("_early")) if use_prod else sh.x
         if name == "served":
             served(sh, x, i)
         elif name == "rows32":
             core_call(lib, sh, 0, 0, x, i)
-        elif name == "rows32_push":
+        elif name in ("rows32_push", "rows32_push_early"):
             core_call(lib, sh, 0, 1, x, i)
         elif name == "cluster":
             core_call(lib, sh, 1, 0, x, i)
