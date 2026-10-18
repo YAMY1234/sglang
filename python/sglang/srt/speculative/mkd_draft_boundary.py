@@ -114,7 +114,8 @@ class MkdDraftBoundary:
         )
         self.fc_out = torch.empty(1, hidden, dtype=torch.bfloat16, device=dev)
         # Memo mode: the exchange writes the next step's fc output here directly.
-        self.fc_buf = torch.empty(1, hidden, dtype=torch.bfloat16, device=dev) if self.memo else None
+        # Zeros: graph-capture warmups read it before any exchange has written it.
+        self.fc_buf = torch.zeros(1, hidden, dtype=torch.bfloat16, device=dev) if self.memo else None
         # The draft extend's exchange only needs the token; its payload lands here unused.
         self.ext_cand = torch.empty_like(self.out_cand)
         self.ext_partials = torch.empty_like(self.out_partials)
@@ -124,6 +125,10 @@ class MkdDraftBoundary:
         if envs.SGLANG_Q35MF_MKD_TRACE.get():
             self._start_trace_reader()
         self.qkv_pf, self.qkv_pf_bytes = self._qkv_prefetch_target(envs.SGLANG_Q35MF_MKD_L2PF_QKV_MB.get())
+        # extend_fc: the draft extend's exchange writes fc_buf for the next draft's first step;
+        # fc_buf_ready: it did so since the last draft (else the draft fills fc_buf itself).
+        self.extend_fc = self.memo and envs.SGLANG_Q35MF_MKD_EXTEND_FC.get()
+        self.fc_buf_ready = False
         # armed: this draft step ends in the exchange; pending: the next step's fc reads it;
         # last_step: no draft step follows, so the exchange carries the token alone.
         self.armed = False
@@ -347,10 +352,24 @@ class MkdDraftBoundary:
 
         threading.Thread(target=run, daemon=True, name="mkd-xchg-trace").start()
 
-    def exchange_extend(self, local_logits: torch.Tensor):
-        """Draft-extend token (torch.argmax NaN rule) through the same one-launch exchange."""
+    def exchange_extend(self, local_logits: torch.Tensor, hidden_states: Optional[torch.Tensor]):
+        """Draft-extend token (torch.argmax NaN rule) through the same one-launch exchange;
+        with extend_fc it also writes the next draft's first fc into fc_buf."""
         topk_index = torch.empty((1, 1), dtype=torch.int64, device=local_logits.device)
         topk_p = torch.empty((1, 1), dtype=torch.float32, device=local_logits.device)
+        payload = self.extend_fc and hidden_states is not None and hidden_states.shape[0] == 1
+        if payload and self.is_hidden_rank:
+            model = self.model
+            norm = model.pre_fc_norm_hidden
+            draft_fc_partial(
+                hidden_states.contiguous(),
+                norm.weight.data,
+                norm.variance_epsilon,
+                model._fc_shard,
+                self.slice_start,
+                self.own_partial,
+                model._fc_gemv_rows,
+            )
         mkd_xchg(
             local_logits,
             self.cand,
@@ -371,9 +390,18 @@ class MkdDraftBoundary:
             0,
             NAN_KEY_TORCH_ARGMAX,
             trace=self.trace,
-            token_only=True,
+            fc_out=self.fc_buf if payload else None,
+            token_only=not payload,
         )
+        self.fc_buf_ready = payload
         return topk_p, topk_index
+
+    def fill_fc(self, token_ids: torch.Tensor, hidden_states: torch.Tensor, forward_batch) -> None:
+        """Stock fc of a draft's first step into fc_buf, when no extend exchange produced it."""
+        model = self.model
+        self.pending = False
+        embeds = model.model.embed_tokens(token_ids.flatten())
+        self.fc_buf.copy_(model._split_fc(embeds, hidden_states, forward_batch))
 
     def fc(self) -> torch.Tensor:
         """The draft fc output [1, H] of the step after an exchange."""

@@ -595,6 +595,9 @@ class Envs:
     # Diagnostic: the draft-step exchange stamps per-phase %globaltimer into pinned host memory
     # and a thread logs percentiles every 20 s (slows the kernel; never in a timed run).
     SGLANG_Q35MF_MKD_TRACE = EnvBool(False)
+    # With SGLANG_Q35MF_MKD_TTABLE: the draft extend's exchange also finishes the fc of the next
+    # draft's first step, which then skips its embedding and fc (stock fill when no extend ran).
+    SGLANG_Q35MF_MKD_EXTEND_FC = EnvBool(False)
 
     # ===================================================================
     # Memory pools and KV-cache sizing

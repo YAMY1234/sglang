@@ -693,6 +693,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         ):
             can_run_decode_cuda_graph = False
 
+        mkd = (
+            self._draft_vocab_exchange.mkd if self._exchange_in_draft_steps else None
+        )
+        if mkd is not None and mkd.extend_fc:
+            # A one-row draft's first step reads its fc from fc_buf (MKD extend fc); the
+            # extend's exchange wrote it only if it ran right before this draft.
+            if (
+                not mkd.fc_buf_ready
+                and not forward_batch.forward_mode.is_idle()
+                and draft_input.topk_index.shape[0] == 1
+            ):
+                mkd.fill_fc(draft_input.topk_index, draft_input.hidden_states, forward_batch)
+            mkd.fc_buf_ready = False
+
         n_inner = self.speculative_num_steps - 1
         canary_outside_ctx = (
             c.with_ops_outside_graph(
@@ -1303,7 +1317,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
         ):
             ret_topk_p, ret_topk_index = self._draft_vocab_exchange.select_extend(
-                draft_logits_output.next_token_logits
+                draft_logits_output.next_token_logits, draft_logits_output.hidden_states
             )
             ret_draft_probs = None
         elif self.topk == 1 and not _is_hip:
