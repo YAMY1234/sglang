@@ -9,7 +9,9 @@ Per arm (run dir runs/j<job>-<label>):
   all     : complete.json (reducer cell: N > 0, tps_gpu > 0, user_p90 > 0); lead-prewindow-admission.json passed.
   Cpf32c  : prewindow f32 gate passed on P and D (pool `dtype=fp32 ... factors float32`, no BUILD_FAILED);
             D0 log: FACTORED_CUDA_FP32_ACTIVE step and expiry, FACTORED_STEP_CUDA_ACTIVE, FACTORED_STEP_FUSE_NORM_ACTIVE,
-            FACTORED_TRUNC_CUDA_ACTIVE each >= 1; no BUILD_FAILED, no Traceback on either role.
+            FACTORED_TRUNC_CUDA_ACTIVE each >= 1; no BUILD_FAILED, no Traceback on either role during service (lead 23:3x
+            clarification after the 261411 reading: before the 'SIGTERM received' line; the post-SIGTERM graceful-shutdown race
+            after 'Remaining number of requests 0' is counted separately as post_sigterm_shutdown_race, not a failure).
             P0 log: FACTORED_CUDA_FP32_ACTIVE counted and reported.  Lead 19:3x asks for it on P too; WS-2 expects 0 on P
             (P serves prefill only; the line is logged only by the CUDA decode step / expiry).  P = 0 is reported as
             P_FP32_ACTIVE_ABSENT for the lead's ruling, never silently passed.
@@ -61,7 +63,11 @@ def main(runs, job, kind='n3'):
                 a[f'{role}_log'] = str(path)
                 a[f'{role}_active'] = {k: sum(k in l for l in lines) for k in ACT}
                 a[f'{role}_build_failed'] = sum('BUILD_FAILED' in l for l in lines)
-                a[f'{role}_traceback'] = sum('Traceback' in l for l in lines)
+                sig = next((i for i, l in enumerate(lines) if 'SIGTERM received' in l), len(lines))
+                a[f'{role}_traceback'] = sum('Traceback' in l for l in lines[:sig])  # during service (lead 23:3x)
+                a[f'{role}_post_sigterm_shutdown_race'] = sum('Traceback' in l for l in lines[sig:])
+                if a[f'{role}_post_sigterm_shutdown_race'] and not any('Remaining number of requests 0' in l for l in lines[sig:]):
+                    a['fails'].append(f'{role}0 traceback after SIGTERM without a drained shutdown')
                 dt = 'dtype=fp16' if lab == 'Cpk15' else 'dtype=fp32'
                 fl = 'factors float16' if lab == 'Cpk15' else 'factors float32'
                 pool = [l for l in lines if 'Factored GDN pool allocated' in l]
