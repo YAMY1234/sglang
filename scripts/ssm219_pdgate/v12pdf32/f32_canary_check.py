@@ -1,5 +1,9 @@
 """docs/222 §23 C8 canary verdict (pre-registered before the canary runs): python3 f32_canary_check.py <runs dir> <job> [n2]
-n2 (docs/222 §24): the N2 {S, PC+f32c} window; PCpf32c is checked as Cpf32c, plus P0 GDN_PD_SHALLOW_FULLN_ACTIVE >= 1.
+n2 (docs/222 §24): the N2 {S, PC+f32c} window; PCpf32c is checked as Cpf32c, plus P0 GDN_PD_SHALLOW_FULLN_ACTIVE >= 1;
+   by role per lead 22:5x (pre-registration update made before the N2 canary / windows ran): P0 FACTORED_CUDA_FP32_ACTIVE is
+   NOT expected on the shallow P (prefill only) and only reported; D0 must show the executed set (FP32 step + expiry,
+   STEP_CUDA, FUSE_NORM, TRUNC_CUDA); K31_FUSED / K31_MIXED_EIGH_ANY_BATCH / PREFIX_RESTORE_FUSED / BOOKKEEPING_FOLD are
+   structurally not executed on D (captured boundary graph) and are not checked.
 
 Per arm (run dir runs/j<job>-<label>):
   all     : complete.json (reducer cell: N > 0, tps_gpu > 0, user_p90 > 0); lead-prewindow-admission.json passed.
@@ -75,7 +79,9 @@ def main(runs, job, kind='n3'):
                 for k in ACT:
                     if d[k] < 1:
                         a['fails'].append(f'D0 lacks {k}')
-                if a['P_active']['FACTORED_CUDA_FP32_ACTIVE step'] + a['P_active']['FACTORED_CUDA_FP32_ACTIVE expiry'] == 0:
+                if lab == 'PCpf32c':  # lead 22:5x (before the N2 canary ran): shallow P only prefills -> not expected, reported
+                    a['P_fp32_active_not_expected'] = a['P_active']['FACTORED_CUDA_FP32_ACTIVE step'] + a['P_active']['FACTORED_CUDA_FP32_ACTIVE expiry']
+                elif a['P_active']['FACTORED_CUDA_FP32_ACTIVE step'] + a['P_active']['FACTORED_CUDA_FP32_ACTIVE expiry'] == 0:
                     a['P_FP32_ACTIVE_ABSENT'] = True
                     out['notes'].append(f'{lab} P0 has no FACTORED_CUDA_FP32_ACTIVE line (expected: P is prefill-only); '
                                         'lead 19:3x criterion on P not met -> lead rules')
