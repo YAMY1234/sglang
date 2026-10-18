@@ -601,6 +601,13 @@ class Envs:
     # With SGLANG_Q35MF_MKD_TTABLE: the draft extend's exchange also finishes the fc of the next
     # draft's first step, which then skips its embedding and fc (stock fill when no extend ran).
     SGLANG_Q35MF_MKD_EXTEND_FC = EnvBool(False)
+    # With SGLANG_Q35MF_MKD_XCHG: one-row draft steps compute the draft lm_head with mkd_draft_head
+    # (fp32 accumulation, bf16 logits; only the summation order differs from the served GEMM) and
+    # the exchange reads its per-CTA maxima instead of scanning the logits.
+    SGLANG_Q35MF_MKD_HEAD = EnvBool(False)
+    # Diagnostic for SGLANG_Q35MF_MKD_HEAD: also run the served GEMM every step and log how often
+    # the argmax differs and by how much the served logits separate the two picks.
+    SGLANG_Q35MF_MKD_HEAD_CHECK = EnvBool(False)
 
     # ===================================================================
     # Memory pools and KV-cache sizing

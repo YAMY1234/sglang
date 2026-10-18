@@ -86,6 +86,8 @@ struct MkdXchgParams {
   const float* own_partial;      // [H] this rank's hidden-slice fc partial (hidden ranks only)
   const uint32_t* partial_flag;  // equals the epoch once own_partial is written, or null
   uint64_t* scan_part;           // [kSlots, kChunks] per-CTA shard-argmax partials, or null
+  const uint32_t* head_part;     // [head_parts] packed partials of mkd_head (no scan), or null
+  int32_t head_parts;
   uint64_t* mc;                  // multicast base of the exchange buffer
   const uint64_t* uc;            // this rank's own copy of the exchange buffer
   uint32_t* epoch;               // [1] call counter shared by all ranks, starts at 1
@@ -170,9 +172,10 @@ __global__ void __launch_bounds__(kThreads) mkd_xchg_kernel(const MkdXchgParams 
   uint64_t t_ld = 0, t_cmp = 0, t_warp = 0;
   constexpr int kScanUnroll = 4;
   const int nvec = p.vocab / 8;
-  const bool split = p.scan_part != nullptr && nvec >= mkd_xchg::kSplitScanMinVecs;
+  const bool from_head = p.head_part != nullptr;
+  const bool split = !from_head && p.scan_part != nullptr && nvec >= mkd_xchg::kSplitScanMinVecs;
   const int lo = split ? static_cast<int>((static_cast<int64_t>(nvec) * c) / kChunks) : 0;
-  const int hi = split ? static_cast<int>((static_cast<int64_t>(nvec) * (c + 1)) / kChunks) : nvec;
+  const int hi = from_head ? 0 : split ? static_cast<int>((static_cast<int64_t>(nvec) * (c + 1)) / kChunks) : nvec;
   for (int v0 = lo + static_cast<int>(threadIdx.x); v0 < hi; v0 += kThreads * kScanUnroll) {
     uint4 x[kScanUnroll];
 #pragma unroll
@@ -208,7 +211,19 @@ __global__ void __launch_bounds__(kThreads) mkd_xchg_kernel(const MkdXchgParams 
   static_assert(kWarps <= 32);
   best = __reduce_max_sync(0xffffffffu, lane < kWarps ? s_v[lane] : 0u);
   nan_any = __reduce_or_sync(0xffffffffu, lane < kWarps ? static_cast<uint32_t>(s_i[lane]) : 0u);
-  if (split) {
+  if (from_head) {
+    // The lm_head kernel (the grid before us, complete after the PDL wait) left one packed
+    // maximum per CTA; kNanPart (all ones) wins the max and sends us to the exact rescan.
+    if (warp == 0) {
+      uint32_t v = 0u;
+      for (int i = lane; i < p.head_parts; i += 32) v = max(v, p.head_part[i]);
+      v = __reduce_max_sync(0xffffffffu, v);
+      if (lane == 0) s_best = v;
+    }
+    __syncthreads();
+    best = s_best;
+    nan_any = best == mkd_xchg::kNanPart ? 1u : 0u;
+  } else if (split) {
     // Every CTA publishes its sub-shard maximum (tagged with the epoch) and takes the max of all.
     if (warp == 0) {
       const uint32_t tg = __shfl_sync(0xffffffffu, epoch, 0);  // only thread 0 loaded it
@@ -499,6 +514,8 @@ struct MkdXchg {
       int64_t token_only,
       int64_t partial_flag_ptr,
       int64_t scan_part_ptr,
+      int64_t head_part_ptr,
+      int64_t head_parts,
       int64_t trace_ptr,
       int64_t trace_slots,
       int64_t pf_ptr,
@@ -559,6 +576,8 @@ struct MkdXchg {
         .own_partial = static_cast<const float*>(own_partial.data_ptr()),
         .partial_flag = reinterpret_cast<const uint32_t*>(partial_flag_ptr),
         .scan_part = reinterpret_cast<uint64_t*>(scan_part_ptr),
+        .head_part = reinterpret_cast<const uint32_t*>(head_part_ptr),
+        .head_parts = static_cast<int32_t>(head_parts),
         .mc = reinterpret_cast<uint64_t*>(mc_ptr),
         .uc = reinterpret_cast<const uint64_t*>(uc_ptr),
         .epoch = ed,

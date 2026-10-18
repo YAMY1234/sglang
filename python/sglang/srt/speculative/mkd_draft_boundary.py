@@ -16,7 +16,7 @@ the critical path.
 from __future__ import annotations
 
 import logging
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -34,6 +34,7 @@ from sglang.kernels.ops.speculative.mkd_draft_fc import (
     mkd_fc_sum,
     mkd_hidden_partial,
 )
+from sglang.kernels.ops.speculative.mkd_draft_head import mkd_draft_head
 from sglang.kernels.ops.speculative.mkd_prefetch import mkd_l2_prefetch
 from sglang.kernels.ops.speculative.mkd_draft_xchg import (
     mkd_xchg,
@@ -57,7 +58,12 @@ _JIT_SOURCES = (
     "speculative/mkd_draft_fc.cuh",
     "speculative/mkd_prefetch.cuh",
     "speculative/draft_moe_fused.cuh",
+    "speculative/mkd_draft_head.cuh",
 )
+# CTAs of mkd_draft_head per SM (two waves of one resident CTA measured fastest at T1).
+_HEAD_CTAS_PER_SM = 2
+# Draft calls between checks that every rank takes the same extend-fc fill decision (arbitrary).
+_FILL_AGREE_EVERY = 512
 
 
 def _jit_source_digests() -> str:
@@ -156,14 +162,18 @@ class MkdDraftBoundary:
         self.trace = None
         if envs.SGLANG_Q35MF_MKD_TRACE.get():
             self._start_trace_reader()
+        self._install_head(envs.SGLANG_Q35MF_MKD_HEAD.get(), dev)
         self.qkv_pf, self.qkv_pf_bytes = self._qkv_prefetch_target(envs.SGLANG_Q35MF_MKD_L2PF_QKV_MB.get())
         self.qkv_stream = torch.cuda.Stream(device=dev) if self.qkv_pf is not None else None
         self.qkv_pending = False
-        # extend_fc: the draft extend's exchange writes fc_buf for the next draft's first step;
-        # fc_buf_src: the (token, hidden) tensors it was written from, matched by identity
-        # against the next draft's input (any other path leaves fc_buf to the stock fill).
+        # extend_fc: the draft extend's exchange writes fc_buf for the next draft's first step.
+        # input_seq counts calls that produce a draft input (draft extends after prefill or
+        # decode); fc_buf_key is the input_seq whose extend wrote fc_buf. Both follow the same
+        # SPMD control flow on every rank, so every rank makes the same fill decision.
         self.extend_fc = self.memo and envs.SGLANG_Q35MF_MKD_EXTEND_FC.get()
-        self.fc_buf_src: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self.input_seq = 0
+        self.fc_buf_key: Optional[int] = None
+        self._fill_checks = 0
         # armed: this draft step ends in the exchange; pending: the next step's fc reads it;
         # last_step: no draft step follows, so the exchange carries the token alone.
         self.armed = False
@@ -287,6 +297,71 @@ class MkdDraftBoundary:
             mkd_l2_prefetch(self.model.lm_head.weight, self.pf_bytes)
         self.pf_pending = True
 
+    # ---------------------------------------------------------------- draft lm_head
+
+    def _install_head(self, enabled: bool, dev: torch.device) -> None:
+        self.head_part = None
+        self.head_used = False
+        self.head_stats = None
+        if not enabled:
+            return
+        head = self.model.lm_head.weight
+        if head.dtype != torch.bfloat16 or head.dim() != 2 or head.shape[1] != self.hidden or head.shape[0] > 65536:
+            logger.warning("MKD draft head disabled (lm_head %s %s).", head.dtype, tuple(head.shape))
+            return
+        sms = torch.cuda.get_device_properties(dev).multi_processor_count
+        self.head_part = torch.zeros(_HEAD_CTAS_PER_SM * sms, dtype=torch.int32, device=dev)
+        self.model.logits_processor.mkd_head = self
+        if envs.SGLANG_Q35MF_MKD_HEAD_CHECK.get():
+            self._start_head_check(dev)
+        logger.info("MKD draft head active: %d x %d shard, %d CTAs.", head.shape[0], head.shape[1], self.head_part.numel())
+
+    def head(self, hidden_states: torch.Tensor, lm_head) -> torch.Tensor:
+        """The one-row draft logits [1, N] bf16 (the exchange then reads the per-CTA maxima)."""
+        x = hidden_states.to(torch.bfloat16).contiguous()
+        logits = torch.empty(1, lm_head.weight.shape[0], dtype=torch.bfloat16, device=x.device)
+        mkd_draft_head(x, lm_head.weight, logits, self.head_part)
+        self.head_used = True
+        if self.head_stats is not None:
+            self._check_head(x, lm_head.weight, logits)
+        return logits
+
+    def _start_head_check(self, dev: torch.device) -> None:
+        """Diagnostic: steps, argmax differences vs the served GEMM, and the largest served-logit
+        gap between the two picks, copied to pinned memory each step and logged by a thread."""
+        import threading
+        import time
+
+        self.head_stats = torch.zeros(3, dtype=torch.float32, device=dev)
+        self.head_stats_host = torch.zeros(3, dtype=torch.float32, pin_memory=True)
+        host = self.head_stats_host.numpy()
+
+        def run() -> None:
+            while True:
+                time.sleep(20)
+                logger.info(
+                    "MKD draft head check rank %d: %d steps, %d argmax differences, max served-logit gap %.5f.",
+                    self.rank,
+                    int(host[0]),
+                    int(host[1]),
+                    float(host[2]),
+                )
+
+        threading.Thread(target=run, daemon=True, name="mkd-head-check").start()
+
+    def _check_head(self, x: torch.Tensor, weight: torch.Tensor, logits: torch.Tensor) -> None:
+        ref = torch.matmul(x, weight.t()).float()
+        mine = logits.float()
+        pick_ref = ref.argmax(dim=-1)
+        pick_mine = mine.argmax(dim=-1)
+        diff = (pick_ref != pick_mine).float()
+        gap = (ref.gather(-1, pick_ref.view(1, 1)) - ref.gather(-1, pick_mine.view(1, 1))).view(-1) * diff
+        st = self.head_stats
+        st[0:1] += 1.0
+        st[1:2] += diff
+        torch.maximum(st[2:3], gap, out=st[2:3])
+        self.head_stats_host.copy_(st, non_blocking=True)
+
     # ---------------------------------------------------------------- per step
 
     def hidden_partial(self, hidden_states: torch.Tensor) -> None:
@@ -368,7 +443,9 @@ class MkdDraftBoundary:
             token_only=self.last_step,
             partial_flag=partial_flag,
             scan_part=self.scan_part,
+            head_part=self.head_part if self.head_used else None,
         )
+        self.head_used = False
         self.pending = not self.last_step
         if self.last_step:
             self._join_side_streams()
@@ -449,12 +526,32 @@ class MkdDraftBoundary:
             token_only=not payload,
             scan_part=self.scan_part,
         )
-        self.fc_buf_src = (topk_index, hidden_states) if payload else None
+        self.fc_buf_key = self.input_seq if payload else None
         return topk_p, topk_index
 
-    def fc_buf_holds(self, token_ids: torch.Tensor, hidden_states: torch.Tensor) -> bool:
-        src = self.fc_buf_src
-        return src is not None and src[0] is token_ids and src[1] is hidden_states
+    def note_draft_input(self) -> None:
+        """A draft extend (after prefill or decode) is about to produce the next draft input."""
+        self.input_seq += 1
+
+    def take_fc_buf(self) -> bool:
+        """True when fc_buf holds the first fc of the coming draft: its extend produced the
+        current draft input. Consumes it (the draft's own exchanges overwrite fc_buf)."""
+        holds = self.fc_buf_key is not None and self.fc_buf_key == self.input_seq
+        self.fc_buf_key = None
+        self._fill_checks += 1
+        if self._fill_checks % _FILL_AGREE_EVERY == 1:
+            self._check_ranks_agree(holds)
+        return holds
+
+    def _check_ranks_agree(self, holds: bool) -> None:
+        # The decision feeds eager collectives (fill_fc); confirm the SPMD premise now and then.
+        t = torch.tensor([self.input_seq, int(holds)], dtype=torch.int64)
+        lo, hi = t.clone(), t.clone()
+        group = get_parallel().tp_group.cpu_group
+        dist.all_reduce(lo, op=dist.ReduceOp.MIN, group=group)
+        dist.all_reduce(hi, op=dist.ReduceOp.MAX, group=group)
+        if not torch.equal(lo, hi):
+            raise RuntimeError(f"MKD extend fc: ranks disagree on the fill decision ({lo.tolist()} vs {hi.tolist()})")
 
     def fill_fc(self, token_ids: torch.Tensor, hidden_states: torch.Tensor, forward_batch) -> None:
         """Stock fc of a draft's first step into fc_buf, when no extend exchange produced it."""
