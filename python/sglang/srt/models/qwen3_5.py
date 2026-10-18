@@ -1542,6 +1542,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         )
         self._attn_front_requested = _is_cuda and envs.SGLANG_Q35MF_ATTN_FRONT.get()
         self._mka_requested = _is_cuda and envs.SGLANG_Q35MF_MKA_FUSED.get()
+        self._mkd_gemv = is_nextn and _is_cuda and envs.SGLANG_Q35MF_MKD_GEMV.get()
+        # Host int64 site fields of the hop the draft o_proj pushes into, built on first use.
+        self._mkd_hop_site = None
         # Packed (qkv, o_proj) weights; built on the first eager verify forward, after weight loading.
         self._mka_weights = None
         self._mka_static_ok = None
@@ -2028,8 +2031,32 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
                 attn_output = npu_fused_sigmoid_mul(attn_output, gate_val.contiguous())
 
+        if (
+            self._mkd_gemv
+            and attn_output.shape[0] == 1
+            and self.o_proj.weight.dtype == torch.bfloat16
+        ):
+            return self._draft_o_proj(attn_output)
         output, _ = self.o_proj(attn_output)
         return output
+
+    def _draft_o_proj(self, attn_output: torch.Tensor) -> torch.Tensor:
+        """The one-row draft o_proj partial as mkd_draft_gemv, pushed into the FFN input's hop when
+        that hop runs (it then only consumes)."""
+        from sglang.kernels.ops.speculative.mkd_draft_gemv import mkd_draft_gemv
+        from sglang.srt.layers.layer_boundary.fusions.q35_draft_hop import DraftHopFusion
+
+        weight = self.o_proj.weight
+        out = torch.empty(1, weight.shape[0], dtype=torch.bfloat16, device=weight.device)
+        fusion = self.ffn_boundary.fusions
+        hop = fusion.attn_push_target(1) if isinstance(fusion, DraftHopFusion) else None
+        if hop is None:
+            return mkd_draft_gemv(attn_output, weight, out)
+        if self._mkd_hop_site is None:
+            self._mkd_hop_site = torch.tensor(hop.site_fields(), dtype=torch.int64)
+        mkd_draft_gemv(attn_output, weight, out, hop_site=self._mkd_hop_site)
+        hop.mark_pushed(out)
+        return out
 
     def forward(
         self,

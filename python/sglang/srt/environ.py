@@ -619,6 +619,9 @@ class Envs:
     SGLANG_Q35MF_MKD_HOP_EARLY = EnvBool(False)
     # Diagnostic for SGLANG_Q35MF_MKD_HOP: hold every draft hop's output stores this many ns (delay probe).
     SGLANG_Q35MF_MKD_HOP_DELAY_NS = EnvInt(0)
+    # One-row draft steps run the draft layer's o_proj as mkd_draft_gemv (fp32 accumulation; only the
+    # summation order differs from the served GEMM), pushing it into the draft hop when that runs.
+    SGLANG_Q35MF_MKD_GEMV = EnvBool(False)
 
     # ===================================================================
     # Memory pools and KV-cache sizing

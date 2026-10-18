@@ -85,6 +85,11 @@ class DraftHopFusion:
             return ()
         return (FfnInputFusion(completes=SumGroup.ATTN_TP, run=partial(self._ffn_input, plan)),)
 
+    def attn_push_target(self, m: int):
+        """The hop the attention output's producer may push into: the one this layer's FFN input
+        consumes for m rows, or None."""
+        return self._hop(m)
+
     def can_defer_all_reduce(self, plan, forward_batch: ForwardBatch) -> bool:
         return False
 
