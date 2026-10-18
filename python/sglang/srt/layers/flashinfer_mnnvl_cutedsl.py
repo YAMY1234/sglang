@@ -98,7 +98,8 @@ def _ht_retarget(preset, *, hidden_size: int, tp_size: int):
         # Kernel: "hidden vector count must be divisible by tp".
         return None
     packs_per_shard = packs // tp_size
-    for reduction_warps in _ht_reduction_warp_order(preset.reduction_warps):
+    preferred = envs.SGLANG_Q35MF_MKH_HT_REDUCTION_WARPS.get() or preset.reduction_warps
+    for reduction_warps in _ht_reduction_warp_order(preferred):
         if packs_per_shard % (reduction_warps * _WARP_SIZE):
             continue
         split = _ht_shard_split(
