@@ -116,7 +116,7 @@ def _check(args, ctx, m, t, fusion, mkh, static_quant_fp8, seed=0):
     rows = []
     for name, rn, rr, rq in (("one", ref_n, ref_r, ref_q), ("fin", fref_n, fref_r, fref_q),
                              ("split", ref_n, ref_r, ref_q), ("split_fin", fref_n, fref_r, fref_q),
-                             ("split_finq", fref_n, fref_r, fref_q)):
+                             ("split_finq", fref_n, fref_r, fref_q), ("split_finq4", fref_n, fref_r, fref_q), ("split_fink", fref_n, fref_r, fref_q)):
         for order in (1,):
             maker = mkh.make_split if name.startswith("split") else mkh.make_call
             call = maker(name, m=m, x=t["x"], residual=t["residual"], gamma=t["gamma"],

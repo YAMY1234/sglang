@@ -92,6 +92,7 @@ def _build() -> ctypes.CDLL:
                 raise RuntimeError(f"q35_hop build failed: {res.stderr[-3000:]}")
             os.replace(tmp, lib)
     handle = ctypes.CDLL(str(lib))
+    logger.info("q35_hop: loaded %s", lib)
     if handle.q35hop_args_size() != ctypes.sizeof(_Args):
         raise RuntimeError("q35_hop Args layout mismatch")
     if handle.q35hop_oproj_args_size() != ctypes.sizeof(_OprojArgs):
@@ -215,6 +216,17 @@ class Q35Hop:
             raise RuntimeError(f"q35hop_oproj failed with {rc}")
         self._pushed = (out.data_ptr(), out.shape)
         return out
+
+    def site_fields(self) -> list[int]:
+        """[mc, uc, ctrl, rank, world, m_cap, timeout_ns] for producers that push from their own kernel."""
+        s = self._site
+        return [s.mc, s.uc, s.ctrl, s.rank, s.world, s.m_cap, s.timeout_ns]
+
+    def mark_pushed(self, partial: torch.Tensor) -> None:
+        """Record that a producer kernel already pushed this bf16 partial; its all-reduce only consumes."""
+        if self._pushed is not None:
+            raise RuntimeError("q35_hop: a pushed partial was never consumed")
+        self._pushed = (partial.data_ptr(), partial.shape)
 
     def has_pushed(self, partial: torch.Tensor) -> bool:
         return self._pushed is not None and self._pushed == (partial.data_ptr(), partial.shape)

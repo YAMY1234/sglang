@@ -17,7 +17,7 @@ FRAGS = 512
 # Variant codes, mirrored from mkh_hop.cu.
 (V_ONE_LL, V_ONE_FIN, V_PROD_PUSH, V_PROD_PLAIN, V_CONSUME, V_LDR1, V_LDR2, V_ONE_TU, V_ONE_FIN_FMA,
  V_ONE_LL_UNI, V_PROD_PUSH_UNI, V_ONE_LL_WEAK, V_PUBLISH, V_PUBLISH_FIN, V_FUSED,
- V_PUBLISH_FIN_QUAD) = range(1, 17)
+ V_PUBLISH_FIN_QUAD, V_PUBLISH_FIN_QUAD4, V_PUBLISH_FIN_K10) = range(1, 19)
 
 
 class Params(ctypes.Structure):
@@ -198,14 +198,16 @@ class MkhHop:
         return call
 
     def make_split(self, name, *, m, x, residual, gamma, scale, fin=None, order=0):
-        """split | split_nq | split_fin | split_finq | split_finq_nq: publish launch + consume launch."""
+        """split | split_nq | split_fin | split_finq[4] | split_finq[4]_nq: publish launch + consume launch."""
         inst = self._instance("ll", m)
         outs = self._outputs((name, m, order), m)
         is_fin = name.startswith("split_fin")
         p = self._params(inst, m=m, outs=outs, x=x, residual=residual, gamma=gamma, scale=scale,
                          fin=fin if is_fin else None, quant=not name.endswith("_nq"))
         pub = {"split_fin": V_PUBLISH_FIN, "split_finq": V_PUBLISH_FIN_QUAD,
-               "split_finq_nq": V_PUBLISH_FIN_QUAD}.get(name, V_PUBLISH)
+               "split_finq_nq": V_PUBLISH_FIN_QUAD, "split_finq4": V_PUBLISH_FIN_QUAD4,
+               "split_finq4_nq": V_PUBLISH_FIN_QUAD4, "split_fink": V_PUBLISH_FIN_K10,
+               "split_fink_nq": V_PUBLISH_FIN_K10}.get(name, V_PUBLISH)
 
         def call():
             self._launch(pub, 0, p)
