@@ -1140,6 +1140,9 @@ class Envs:
     # CuTe DSL MoE behind the FlashInfer all-to-all writes its output straight into
     # the a2a combine payload buffer (dispatcher and runner sides read the same switch).
     SGLANG_Q35MF_EXPERT_ENABLE_A2A_DIRECT_OUTPUT = EnvBool(False)
+    # Target-model FlashInfer a2a combine transfers E4M3 partials (unscaled cast,
+    # FP32 accumulate, BF16 output); draft MoE layers keep the BF16 combine.
+    SGLANG_Q35MF_MIDQ_FP8_COMBINE = EnvBool(False)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)

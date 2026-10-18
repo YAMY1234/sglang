@@ -83,6 +83,22 @@ def _workspace_size_for_namespace(workspace_size: int, *, speculative: bool) -> 
     return workspace_size + slot * _WORKSPACE_NAMESPACE_ALIGNMENT
 
 
+_midq_combine_logged: set[tuple[bool, bool]] = set()
+
+
+def _log_midq_combine_once(low_precision: bool, speculative: bool) -> None:
+    if not envs.SGLANG_Q35MF_MIDQ_FP8_COMBINE.get():
+        return
+    key = (low_precision, speculative)
+    if key not in _midq_combine_logged:
+        _midq_combine_logged.add(key)
+        logger.info(
+            "MIDQ FlashInfer a2a combine: %s (speculative=%s)",
+            "e4m3" if low_precision else "bf16",
+            speculative,
+        )
+
+
 class FlashinferDispatchOutput(NamedTuple):
     """Flashinfer EP dispatch output."""
 
@@ -221,6 +237,11 @@ class FlashinferDispatcher(BaseDispatcher):
         )
         mnnvl_config = MnnvlConfig(comm_backend=TorchDistributedCommBackend(group))
         is_speculative_model = get_flags().moe.speculative_context
+        # Draft layers are built under speculative_context and keep the BF16 combine.
+        self.use_low_precision_combine = (
+            envs.SGLANG_Q35MF_MIDQ_FP8_COMBINE.get() and not is_speculative_model
+        )
+        _log_midq_combine_once(self.use_low_precision_combine, is_speculative_model)
 
         def make_moe_a2a() -> MoeAlltoAll:
             # Target and draft decode graphs can coexist.
@@ -455,6 +476,7 @@ class FlashinferDispatcher(BaseDispatcher):
             ),
             self.runtime_max_tokens_per_rank,
             payload_in_workspace=self.payload_in_workspace,
+            use_low_precision=self.use_low_precision_combine,
         )
 
         del self.runtime_max_tokens_per_rank
