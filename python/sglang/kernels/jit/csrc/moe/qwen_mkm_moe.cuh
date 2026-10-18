@@ -3,7 +3,7 @@
 // hidden 4096, intermediate 128 per rank): DynBlock-exact top-10 from the router logits, FC1, SwiGLU, NVFP4
 // requantization and FC2 in one launch over the trtllm-gen weight layout. Writes the RT deferred-finalize rows
 // (row t * 10 + k, identity permutation) and the expert weights.
-// Device code generated from the MKM lane engine (source md5 1193f5e7f13b8261f987b2926714a1dc) by lanes/mkm/tools/export_cuh.py.
+// Device code generated from the MKM lane engine (source md5 b9e67605511026a2f1771bd52dbf56aa) by lanes/mkm/tools/export_cuh.py.
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/utils.h>
@@ -43,6 +43,27 @@ constexpr int kSfbSlots = 16;
 constexpr int kPRow = 260;
 #ifndef SF_UTCCP_FC1
 #define SF_UTCCP_FC1 0
+#endif
+#ifndef DIAG_NO_SFWAIT  // timing diagnostic only: the MMA issuer does not wait for staged scale factors
+#define DIAG_NO_SFWAIT 0
+#endif
+#ifndef L2_EVICT_FIRST  // stream expert weights with an L2 evict-first policy (they are read once per layer)
+#define L2_EVICT_FIRST 1
+#endif
+#ifndef TOPK_RANK  // 1: all-pairs rank top-10; 0: chains of warp max reductions (faster: 13.14 vs 13.32 us)
+#define TOPK_RANK 0
+#endif
+#ifndef PDL_TRIGGER  // 1: let dependent grids launch once the FC2 MMAs are queued (only safe if they all wait)
+#define PDL_TRIGGER 0
+#endif
+#ifndef HOIST_SCALES  // 1: per-expert dequant scales loaded right after routing; 0: at first use
+#define HOIST_SCALES 1
+#endif
+#ifndef FC2SF_PRE  // 1: stage FC2 scale factors of stages 8, 9 during the partial exchange; 0: after h
+#define FC2SF_PRE 1
+#endif
+#ifndef DIAG_NO_MMA  // timing diagnostic only: no MMAs, stages are released as soon as they land
+#define DIAG_NO_MMA 0
 #endif  // partial row stride in floats: 16 B aligned, rows land on distinct banks
 
 struct Params {
@@ -69,13 +90,12 @@ struct __align__(1024) Smem {
   uint8_t xsf[8][128];          // x scale bytes of this CTA's K half (row t = token t), by bulk copy
   uint32_t hsf[8][2];           // h scale words: token t, k-block kb (4 e4m3 bytes)
   uint64_t full[kStages], empty[kStages], sf_full[kStages];
-  uint64_t x_full, sfa_ready, fc1_done, peer_bar, h_ready, fc2_done;
+  uint64_t x_full, sfa_ready, fc1_done, peer_bar, h_ready, fc2_done, route_done;
   uint32_t tmem;
   int expert;
   uint32_t tokmask;
   int kslot[8];
-  uint32_t mask[16];
-  uint32_t cand[8][32];
+  alignas(16) uint32_t cand[8][32];  // read as uint4 by the rank-based top-k
   int32_t ids[8][kTopK];
 };
 
@@ -91,6 +111,11 @@ __device__ __forceinline__ uint32_t cluster_rank() {
 }
 __device__ __forceinline__ void cluster_arrive() {
   asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+}
+// no release: the phase only orders DSMEM traffic that mbarriers already completed, so pending global stores
+// (stamps, routing outputs, output rows) need not drain before the arrive
+__device__ __forceinline__ void cluster_arrive_relaxed() {
+  asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
 }
 __device__ __forceinline__ void cluster_wait() {
   asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
@@ -224,8 +249,63 @@ __device__ __forceinline__ uint32_t warp_topk_of_lanes(uint32_t v, uint32_t lane
   }
   return mine;
 }
-// Top-10 keys of 512 (16 per lane), lane k holding the k-th largest (keys unique and nonzero).
+__device__ __forceinline__ uint32_t count_greater(const uint32_t* s_cand, uint32_t v) {
+  uint32_t r = 0;
+#pragma unroll
+  for (int j = 0; j < 32; j += 4) {
+    const uint4 q = *reinterpret_cast<const uint4*>(s_cand + j);
+    r += (q.x > v) + (q.y > v) + (q.z > v) + (q.w > v);
+  }
+  return r;
+}
+// Top-10 keys of 512 (16 per lane), lane k < 10 holding the k-th largest (keys unique and nonzero). Ranks come from
+// all-pairs compares over shared memory rather than chains of warp reductions.
 __device__ __forceinline__ uint32_t warp_top10(uint32_t (&keys)[16], uint32_t lane, uint32_t* s_cand) {
+  // bound = the 10th largest lane maximum; every top-10 key is >= bound
+  const uint32_t m = max16(keys);
+  s_cand[lane] = m;
+  __syncwarp();
+  const uint32_t r = count_greater(s_cand, m);
+  const uint32_t bound = __shfl_sync(0xffffffffu, m, __ffs(__ballot_sync(0xffffffffu, r == kTopK - 1)) - 1);
+  uint32_t count = 0;
+#pragma unroll
+  for (uint32_t i = 0; i < 16; ++i) count += keys[i] >= bound;
+  // exclusive prefix of count over the lanes, from the ballots of its bits (count <= 16)
+  const uint32_t lt = (1u << lane) - 1u;
+  uint32_t offset = 0, total = 0;
+#pragma unroll
+  for (int b = 0; b < 5; ++b) {
+    const uint32_t bb = __ballot_sync(0xffffffffu, (count >> b) & 1u);
+    offset += (uint32_t)__popc(bb & lt) << b;
+    total += (uint32_t)__popc(bb) << b;
+  }
+  if (total <= 32) {
+    __syncwarp();  // every lane has read the lane maxima
+#pragma unroll
+    for (uint32_t i = 0; i < 16; ++i) {
+      if (keys[i] >= bound) s_cand[offset++] = keys[i];
+    }
+    if (lane >= total) s_cand[lane] = 0u;
+    __syncwarp();
+    const uint32_t cand = s_cand[lane];
+    const uint32_t rk = count_greater(s_cand, cand);
+    __syncwarp();
+    if (lane < total && rk < kTopK) s_cand[rk] = cand;
+    __syncwarp();
+    return lane < kTopK ? s_cand[lane] : 0u;
+  }
+  uint32_t mine = 0;
+#pragma unroll 1
+  for (uint32_t k = 0; k < kTopK; ++k) {
+    const uint32_t top = warp_max_u32(max16(keys));
+#pragma unroll
+    for (uint32_t i = 0; i < 16; ++i) keys[i] = keys[i] == top ? 0u : keys[i];
+    mine = lane == k ? top : mine;
+  }
+  return mine;
+}
+// Top-10 keys of 512 (16 per lane), lane k holding the k-th largest (keys unique and nonzero).
+__device__ __forceinline__ uint32_t warp_top10_redux(uint32_t (&keys)[16], uint32_t lane, uint32_t* s_cand) {
   uint32_t v = max16(keys);
   uint32_t bound = 0;
 #pragma unroll
@@ -297,8 +377,38 @@ __device__ __forceinline__ uint16_t softmax_topk(uint16_t score_bits, uint32_t l
   return out;
 }
 
+__device__ __forceinline__ uint64_t policy_evict_first() {
+  uint64_t pol;
+  asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol));
+  return pol;
+}
+__device__ __forceinline__ void tma_load_2d_w(void* dst, const void* tmap, uint64_t* bar, int c0, int c1, uint64_t pol) {
+  if (L2_EVICT_FIRST)
+    asm volatile(
+        "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.L2::cache_hint"
+        " [%0], [%1, {%3, %4}], [%2], %5;" ::"r"(smem_u32(dst)),
+        "l"(tmap), "r"(smem_u32(bar)), "r"(c0), "r"(c1), "l"(pol)
+        : "memory");
+  else
+    tma_load_2d(dst, tmap, bar, c0, c1);
+}
+__device__ __forceinline__ void bulk_load_w(void* dst, const void* src, uint32_t bytes, uint64_t* bar, uint64_t pol) {
+  if (L2_EVICT_FIRST)
+    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1], %2, [%3], %4;" ::"r"(
+                     smem_u32(dst)),
+                 "l"(src), "r"(bytes), "r"(smem_u32(bar)), "l"(pol)
+                 : "memory");
+  else
+    bulk_load(dst, src, bytes, bar);
+}
+
 __device__ __forceinline__ void stamp(const Params& p, int slot) {
   if (p.trace) p.trace[blockIdx.x * 16 + slot] = (long long)gtime();
+}
+// stamp after `dep` is available (the branch needs its value; keys are never 0)
+__device__ __forceinline__ void stamp_dep(const Params& p, int slot, uint32_t dep) {
+  if (dep == 0u) __trap();
+  stamp(p, slot);
 }
 // Physical W13 column (accumulator column) holding reordered row q: block-32 shuffle of FlashInfer's
 // get_shuffle_matrix_a_row_indices (epilogue_tile_m = 128); reordered row 2j is up_j, 2j + 1 is gate_j.
@@ -319,14 +429,14 @@ __device__ __forceinline__ void drain_cols(uint32_t tm, float* own, int lane) {
 }
 
 // FC2 drain of TMEM lane quarter q (tiles 4 q .. 4 q + 3), column half `half` (128 accumulator columns)
-__device__ __forceinline__ void fc2_drain(const Params& p, Smem& s, uint32_t tm, int q, int lane, int half, int e,
-                                          uint32_t rank) {
+__device__ __forceinline__ void fc2_drain(const Params& p, Smem& s, uint32_t tm, int q, int lane, int half, float a2,
+                                          uint32_t rank, int e) {
   mbar_wait(&s.fc2_done, 0);
+  if (!HOIST_SCALES) a2 = p.g2_alpha[e];
   tc_fence_after();
   if (q == 0 && half == 0 && lane == 0) stamp(p, 7);
   const int row = q * 32 + lane, tile = row / 8, t = row % 8;
   const bool valid = t < p.num_tokens && ((s.tokmask >> t) & 1u);
-  const float a2 = p.g2_alpha[e];
   __nv_bfloat16* orow = p.out + (size_t)(t * kTopK + s.kslot[t]) * kH + rank * 2048 + tile * 256 + half * 128;
 #pragma unroll 1
   for (int c = 0; c < 2; ++c) {
@@ -374,26 +484,61 @@ s1_kernel(const __grid_constant__ CUtensorMap tm13, const __grid_constant__ CUte
     mbar_init(&s.peer_bar, 1);
     mbar_init(&s.h_ready, 4);
     mbar_init(&s.fc2_done, 1);
+    mbar_init(&s.route_done, 1);
     mbar_expect_tx(&s.peer_bar, 8 * kPRow * 4);
     fence_mbar_init();
   }
-  if (warp == 0 && lane < 16) s.mask[lane] = 0;
-  if (warp == 2) { tmem_alloc(&s.tmem, 512); tmem_relinquish(); }
+  if (warp == 2) { tmem_alloc(&s.tmem, 512); tmem_relinquish(); tc_fence_before(); }
   if (warp == 1 && lane == 0) { prefetch_tmap(&tm13); prefetch_tmap(&tm2); prefetch_tmap(&tmx); }
   __syncthreads();
   cluster_arrive();  // waited on before the first DSMEM transfer and at exit
+  tc_fence_after();
+  const uint32_t tm = s.tmem;
+  // cluster `pair` serves (token my_t, top-k slot my_k) unless an earlier pair (in t * 10 + k order) has its expert
+  const int my_t = pair / kTopK, my_k = pair % kTopK;
+  if (my_t >= p.num_tokens) {  // both CTAs of the pair agree; nothing was issued
+    cluster_wait();
+    if (warp == 2) tmem_dealloc(tm, 512);
+    return;
+  }
+  auto issue_stage = [&](int st, int e, uint64_t pol) {
+    const int b = st % kStages;
+    mbar_expect_tx(&s.full[b], kStageBytes);
+    uint8_t* dst = s.ring[b];
+    if (st < kFc1Stages) {
+      const int kb0 = (int)rank * 32 + st * 4;
+      tma_load_2d_w(dst, &tm13, &s.full[b], (int)rank * 1024 + st * 128, e * kN1, pol);
+      const uint8_t* sf = p.w13_sf + (size_t)e * (kN1 * kH / 16);
+      bulk_load_w(dst + 32768, sf + (size_t)(0 * 64 + kb0) * 512, 2048, &s.full[b], pol);
+      bulk_load_w(dst + 34816, sf + (size_t)(1 * 64 + kb0) * 512, 2048, &s.full[b], pol);
+    } else {
+      const int f = st - kFc1Stages;
+#pragma unroll
+      for (int tl = 0; tl < 2; ++tl) {
+        const int j = f * 2 + tl;
+        const int row0 = (int)rank * 2048 + j * 256;
+        tma_load_2d_w(dst + tl * 16384, &tm2, &s.full[b], 0, e * kH + row0, pol);
+        bulk_load_w(dst + 32768 + tl * 2048, p.w2_sf + (size_t)e * (kH * 8) + (size_t)(row0 / 128) * 2 * 512, 2048,
+                    &s.full[b], pol);
+      }
+    }
+  };
+  // routing: warps 0, 2..7 take tokens 0..6 (DynBlock-exact top-10 + softmax); warp 1 recomputes token my_t's top-10
+  // and starts this pair's weight stream at once (a duplicate pair only wastes its first ring fill, mostly L2 hits)
+  const int rtok = warp == 1 ? my_t : (warp == 0 ? 0 : warp - 1);
+  uint32_t key = 0;
   asm volatile("griddepcontrol.wait;" ::: "memory");
-  if (warp == 1 && lane == 0) {
+  if (threadIdx.x == 32) stamp(p, 10);
+  if (warp == 3 && lane == 0) {
     // x (8 atoms of this CTA's K half, rows >= M zero-filled) and its scale bytes; independent of the routing
     mbar_expect_tx(&s.x_full, 8 * 1024 + p.num_tokens * 128);
 #pragma unroll
     for (int a = 0; a < 8; ++a) tma_load_2d(s.xa + a * 1024, &tmx, &s.x_full, (int)rank * 1024 + a * 128, 0);
-    for (int t = 0; t < p.num_tokens; ++t) bulk_load(s.xsf[t], p.x_sf + (size_t)t * (kH / 16) + rank * 128, 128, &s.x_full);
+    for (int t = 0; t < p.num_tokens; ++t)
+      bulk_load(s.xsf[t], p.x_sf + (size_t)t * (kH / 16) + rank * 128, 128, &s.x_full);
   }
-
-  // routing: warp t computes token t's top-10 (DynBlock-exact) from the bf16 logits; then the pair-th selected expert
-  if (warp < p.num_tokens) {
-    const uint4* src = reinterpret_cast<const uint4*>(p.logits + (size_t)warp * kE + lane * 16);
+  if (rtok < p.num_tokens) {
+    const uint4* src = reinterpret_cast<const uint4*>(p.logits + (size_t)rtok * kE + lane * 16);
     const uint4 v0 = src[0], v1 = src[1];
     uint32_t keys[16];
 #pragma unroll
@@ -402,86 +547,83 @@ s1_kernel(const __grid_constant__ CUtensorMap tm13, const __grid_constant__ CUte
       keys[2 * i] = topk_key(w & 0xFFFFu, (uint32_t)(lane * 16 + 2 * i));
       keys[2 * i + 1] = topk_key(w >> 16, (uint32_t)(lane * 16 + 2 * i + 1));
     }
-    uint32_t bits, expert;
-    topk_unkey(warp_top10(keys, (uint32_t)lane, s.cand[warp]), bits, expert);
-    const uint16_t wbits = softmax_topk((uint16_t)bits, (uint32_t)lane);
-    if (lane < kTopK) {
-      s.ids[warp][lane] = (int32_t)expert;
-      atomicOr(&s.mask[expert >> 5], 1u << (expert & 31));
-      if (blockIdx.x == 0) {
-        p.expert_weights[warp * kTopK + lane] = wbits;
-        p.topk_ids[warp * kTopK + lane] = (int32_t)expert;
+    if (threadIdx.x == 32) stamp_dep(p, 11, keys[0]);
+    key = TOPK_RANK ? warp_top10(keys, (uint32_t)lane, s.cand[warp]) : warp_top10_redux(keys, (uint32_t)lane, s.cand[warp]);
+  }
+  int e;
+  if (warp == 1) {
+    uint32_t bits, espec;
+    topk_unkey(__shfl_sync(0xffffffffu, key, my_k), bits, espec);
+    if (lane == 0) {
+      stamp(p, 9);
+      const uint64_t pol = policy_evict_first();
+      for (int st = 0; st < kStages; ++st) issue_stage(st, (int)espec, pol);
+      stamp(p, 2);
+    }
+    mbar_wait(&s.route_done, 0);
+    e = s.expert;
+  } else {
+    if (rtok < p.num_tokens) {
+      uint32_t bits, expert;
+      topk_unkey(key, bits, expert);
+      const uint16_t wbits = softmax_topk((uint16_t)bits, (uint32_t)lane);
+      if (lane < kTopK) {
+        s.ids[rtok][lane] = (int32_t)expert;
+        if (blockIdx.x == 0) {
+          p.expert_weights[rtok * kTopK + lane] = wbits;
+          p.topk_ids[rtok * kTopK + lane] = (int32_t)expert;
+        }
       }
     }
+    named_bar(4, 224);
+    if (warp == 0) {
+      // this pair's expert, whether an earlier pair picked it, and which tokens use it (top-k slot per token)
+      const int ee = s.ids[my_t][my_k];
+      bool dup = false;
+      for (int q = lane; q < pair; q += 32) dup |= s.ids[q / kTopK][q % kTopK] == ee;
+      dup = __any_sync(0xffffffffu, dup);
+      uint32_t mbit = 0;
+      int ks = 0;
+      if (lane < p.num_tokens) {
+#pragma unroll
+        for (int k = 0; k < kTopK; ++k)
+          if (s.ids[lane][k] == ee) { mbit = 1u << lane; ks = k; }
+      }
+      const uint32_t mask = __reduce_or_sync(0xffffffffu, mbit);
+      if (lane < 8) s.kslot[lane] = ks;
+      if (lane == 0) {
+        s.expert = dup ? -1 : ee;
+        s.tokmask = mask;
+        stamp(p, 1);
+        mbar_arrive(&s.route_done);
+      }
+    }
+    named_bar(4, 224);
+    e = s.expert;
   }
-  __syncthreads();
-  if (warp == 0) {
-    const uint32_t word = lane < 16 ? s.mask[lane] : 0u;
-    const int cnt = __popc(word);
-    int incl = cnt;
-#pragma unroll
-    for (int d = 1; d < 32; d <<= 1) {
-      const int up = __shfl_up_sync(0xffffffffu, incl, d);
-      if (lane >= d) incl += up;
+  if (e < 0) {  // duplicate pair (both CTAs agree): let the speculative loads land; nothing was sent over DSMEM
+    if (warp == 1) {
+      if (lane == 0)
+        for (int b = 0; b < kStages; ++b) mbar_wait(&s.full[b], 0);
+      __syncwarp();
     }
-    const int excl = incl - cnt;
-    int e = -1;
-    if (pair >= excl && pair < incl) {
-      uint32_t w = word;
-      for (int q = pair - excl; q > 0; --q) w &= w - 1;
-      e = lane * 32 + __ffs(w) - 1;
-    }
-#pragma unroll
-    for (int d = 16; d > 0; d >>= 1) e = max(e, __shfl_xor_sync(0xffffffffu, e, d));
-    uint32_t mbit = 0;
-    int ks = 0;
-    if (lane < p.num_tokens && e >= 0) {
-#pragma unroll
-      for (int k = 0; k < kTopK; ++k)
-        if (s.ids[lane][k] == e) { mbit = 1u << lane; ks = k; }
-    }
-    const uint32_t mask = __reduce_or_sync(0xffffffffu, mbit);
-    if (lane < 8) s.kslot[lane] = ks;
-    if (lane == 0) { s.expert = e; s.tokmask = mask; }
-  }
-  __syncthreads();
-  const int e = s.expert;
-  const uint32_t tm = s.tmem;
-  if (e < 0) {  // both CTAs of the pair agree; nothing was sent over DSMEM
-    mbar_wait(&s.x_full, 0);  // no async copy may still target this CTA's smem
+    mbar_wait(&s.x_full, 0);
     cluster_wait();
     if (warp == 2) tmem_dealloc(tm, 512);
     return;
   }
   tc_fence_after();
-  if (threadIdx.x == 0) stamp(p, 1);
+  // per-expert dequant scales, loaded now so that no global read sits behind the FC1 -> h -> FC2 chain
+  float ag = 0.f, sc = 0.f, a2 = 0.f;
+  if (HOIST_SCALES) { ag = p.g1_alpha[e]; sc = p.g1_scale_c[e]; a2 = p.g2_alpha[e]; }
 
   if (warp == 1) {
     if (lane == 0) {
-      // ---------------- TMA producer: the weight stream
-      for (int st = 0; st < kTotStages; ++st) {
-        const int b = st % kStages;
-        if (st >= kStages) mbar_wait(&s.empty[b], ((st / kStages) - 1) & 1);
-        mbar_expect_tx(&s.full[b], kStageBytes);
-        uint8_t* dst = s.ring[b];
-        if (st < kFc1Stages) {
-          const int kb0 = (int)rank * 32 + st * 4;
-          tma_load_2d(dst, &tm13, &s.full[b], (int)rank * 1024 + st * 128, e * kN1);
-          const uint8_t* sf = p.w13_sf + (size_t)e * (kN1 * kH / 16);
-          bulk_load(dst + 32768, sf + (size_t)(0 * 64 + kb0) * 512, 2048, &s.full[b]);
-          bulk_load(dst + 34816, sf + (size_t)(1 * 64 + kb0) * 512, 2048, &s.full[b]);
-        } else {
-          const int f = st - kFc1Stages;
-#pragma unroll
-          for (int tl = 0; tl < 2; ++tl) {
-            const int j = f * 2 + tl;
-            const int row0 = (int)rank * 2048 + j * 256;
-            tma_load_2d(dst + tl * 16384, &tm2, &s.full[b], 0, e * kH + row0);
-            bulk_load(dst + 32768 + tl * 2048, p.w2_sf + (size_t)e * (kH * 8) + (size_t)(row0 / 128) * 2 * 512, 2048,
-                      &s.full[b]);
-          }
-        }
-        if (st == 0) stamp(p, 2);
+      // ---------------- TMA producer: the rest of the weight stream (stages 0 .. kStages - 1 went out above)
+      const uint64_t pol = policy_evict_first();
+      for (int st = kStages; st < kTotStages; ++st) {
+        mbar_wait(&s.empty[st % kStages], ((st / kStages) - 1) & 1);
+        issue_stage(st, e, pol);
       }
     }
     __syncwarp();
@@ -496,9 +638,10 @@ s1_kernel(const __grid_constant__ CUtensorMap tm13, const __grid_constant__ CUte
       for (int st = 0; st < kFc1Stages; ++st) {
         const int b = st % kStages;
         mbar_wait(&s.full[b], (st / kStages) & 1);
-        if (!SF_UTCCP_FC1) mbar_wait(&s.sf_full[b], (st / kStages) & 1);
+        if (!SF_UTCCP_FC1 && !DIAG_NO_SFWAIT) mbar_wait(&s.sf_full[b], (st / kStages) & 1);
         tc_fence_after();
         if (st == 0) stamp(p, 3);
+        if (DIAG_NO_MMA) { n += 4; tc_commit(&s.empty[b]); continue; }
 #pragma unroll
         for (int q = 0; q < 4; ++q, ++n) {
           const int kb = st * 4 + q;
@@ -522,8 +665,9 @@ s1_kernel(const __grid_constant__ CUtensorMap tm13, const __grid_constant__ CUte
       for (int st = kFc1Stages; st < kTotStages; ++st) {
         const int b = st % kStages;
         mbar_wait(&s.full[b], (st / kStages) & 1);
-        mbar_wait(&s.sf_full[b], (st / kStages) & 1);
+        if (!DIAG_NO_SFWAIT) mbar_wait(&s.sf_full[b], (st / kStages) & 1);
         tc_fence_after();
+        if (DIAG_NO_MMA) { n += 4; tc_commit(&s.empty[b]); continue; }
 #pragma unroll
         for (int tl = 0; tl < 2; ++tl) {
           const int j = (st - kFc1Stages) * 2 + tl;
@@ -537,6 +681,7 @@ s1_kernel(const __grid_constant__ CUtensorMap tm13, const __grid_constant__ CUte
         tc_commit(&s.empty[b]);
       }
       tc_commit(&s.fc2_done);
+      if (PDL_TRIGGER) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     }
     __syncwarp();
   } else if (warp == 0) {
@@ -609,13 +754,20 @@ s1_kernel(const __grid_constant__ CUtensorMap tm13, const __grid_constant__ CUte
         bulk_s2s(mapa(smem_u32(s.peer), rank ^ 1u), smem_u32(s.own), 8 * kPRow * 4, mapa(smem_u32(&s.peer_bar), rank ^ 1u));
       __syncwarp();
     }
+    // FC2 scale factors of stages 8 and 9 while the partials travel (all FC1 MMAs are done, so every slot is free)
+    if (FC2SF_PRE) {
+      stage_sf(kFc1Stages, 32, 4, 1, 1024);
+      stage_sf(kFc1Stages + 1, 36, 4, 1, 1024);
+    }
+    if (threadIdx.x == 128) stamp(p, 15);
     tc_fence_before();
     mbar_wait(&s.peer_bar, 0);
     named_bar(2, 128);  // quarter 0's writes of the own partial are visible to the whole warpgroup
+
     if (threadIdx.x == 128) stamp(p, 5);
+    if (!HOIST_SCALES) { ag = p.g1_alpha[e]; sc = p.g1_scale_c[e]; }
     const float* P0 = rank == 0 ? s.own : s.peer;
     const float* P1 = rank == 0 ? s.peer : s.own;
-    const float ag = p.g1_alpha[e], sc = p.g1_scale_c[e];
     {
       const int it = threadIdx.x - 128;  // 0..127: (token row, 16-wide block, half)
       const int row = it / 16, blk = (it / 2) % 8, hf = it % 2;
@@ -674,16 +826,18 @@ s1_kernel(const __grid_constant__ CUtensorMap tm13, const __grid_constant__ CUte
     __syncwarp();
     if (lane == 0) mbar_arrive(&s.h_ready);
     // FC2 weight scale factors (the MMA issuer waits for each stage's)
-    for (int st = kFc1Stages; st < kTotStages; ++st) stage_sf(st, 32 + (st - kFc1Stages) * 4, 4, 1, 1024);
+    for (int st = kFc1Stages + (FC2SF_PRE ? 2 : 0); st < kTotStages; ++st)
+      stage_sf(st, 32 + (st - kFc1Stages) * 4, 4, 1, 1024);
 
-    if (q < 2) fc2_drain(p, s, tm, q, lane, 0, e, rank);
+    if (q < 2) fc2_drain(p, s, tm, q, lane, 0, a2, rank, e);
   }
-  if (warp < 2) fc2_drain(p, s, tm, warp, lane, 1, e, rank);
+  if (warp < 2) fc2_drain(p, s, tm, warp, lane, 1, a2, rank, e);
   tc_fence_before();
   __syncthreads();
-  // every warp but warp 4 still owes its wait on the first cluster phase; then exit together
+  if (threadIdx.x == 0) stamp(p, 13);
+  // every warp but warp 4 still owes its wait on the first cluster phase; phase 2 then ends the DSMEM exchange
   if (warp != 4) cluster_wait();
-  cluster_arrive();
+  cluster_arrive_relaxed();
   cluster_wait();
   if (threadIdx.x == 0) stamp(p, 8);
   if (warp == 2) tmem_dealloc(tm, 512);
