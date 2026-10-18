@@ -216,6 +216,17 @@ class Q35Hop:
         self._pushed = (out.data_ptr(), out.shape)
         return out
 
+    def site_fields(self) -> list[int]:
+        """[mc, uc, ctrl, rank, world, m_cap, timeout_ns] for producers that push from their own kernel."""
+        s = self._site
+        return [s.mc, s.uc, s.ctrl, s.rank, s.world, s.m_cap, s.timeout_ns]
+
+    def mark_pushed(self, partial: torch.Tensor) -> None:
+        """Record that a producer kernel already pushed this bf16 partial; its all-reduce only consumes."""
+        if self._pushed is not None:
+            raise RuntimeError("q35_hop: a pushed partial was never consumed")
+        self._pushed = (partial.data_ptr(), partial.shape)
+
     def has_pushed(self, partial: torch.Tensor) -> bool:
         return self._pushed is not None and self._pushed == (partial.data_ptr(), partial.shape)
 
