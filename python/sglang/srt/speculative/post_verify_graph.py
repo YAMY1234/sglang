@@ -36,6 +36,9 @@ _NUM_WARMUP = 2
 _MAX_BS = int(os.environ.get("SGLANG_Q35MF_EDGE_POST_VERIFY_MAX_BS", "2"))
 # Arbitrary bound on captured graph sets (key x verify logits buffer).
 _MAX_STATES = max(16, 8 * _MAX_BS)
+# With the side-stream commit: largest batch whose commit runs on the side stream; larger
+# batches commit inside the main graph (the side commit slows the overlapping draft extend).
+_SIDE_MAX_BS = int(os.environ.get("SGLANG_Q35MF_EDGE_POST_VERIFY_SIDE_MAX_BS", str(_MAX_BS)))
 
 
 def post_verify_graph_enabled() -> bool:
@@ -434,6 +437,7 @@ class PostVerifyGraph:
             self._pool = torch.cuda.graph_pool_handle()
         stream = torch.cuda.current_stream()
         graph = torch.cuda.CUDAGraph()
+        side = self._side_stream is not None and len(batch.seq_lens) <= _SIDE_MAX_BS
         with _count_acceptance_calls() as acceptance_calls:
             with graph_capture(stream=stream) as ctx:
                 with torch.cuda.graph(
@@ -448,14 +452,14 @@ class PostVerifyGraph:
                         verify_input,
                         logits_output,
                         num_draft_tokens,
-                        commit=self._side_stream is None,
+                        commit=not side,
                     )
         # Injected acceptance only overrides the result; the real acceptance kernel must be in the graph.
         if acceptance_calls[0] == 0:
             raise RuntimeError(
                 "post-verify graph captured without the acceptance kernel"
             )
-        if self._side_stream is not None:
+        if side:
             # Captured after the main graph in the same pool and replayed after it every round.
             commit_graph = torch.cuda.CUDAGraph()
             self._side_stream.wait_stream(torch.cuda.current_stream())
