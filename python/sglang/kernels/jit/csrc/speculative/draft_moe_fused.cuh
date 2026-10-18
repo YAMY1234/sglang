@@ -338,12 +338,6 @@ __global__ void __launch_bounds__(288, 1) draft_moe_fused_kernel(const DraftMoeF
       const uint32_t ord = (b & 0x8000u) ? (~b & 0xffffu) : (b | 0x8000u);
       key[i] = (ord << 16) | (0xffffu - static_cast<uint32_t>(i * kWarpThreads + lane));
     }
-    row_max = warp::reduce_max(row_max);
-    float lsum = 0.0f;
-#pragma unroll
-    for (int i = 0; i < kPerLaneE; ++i) lsum += expf(v[i] - row_max);
-    const float row_sum = warp::reduce_sum(lsum);
-
     // Round k of the router's warp max picks the k-th largest (unique) key; with
     // each lane's keys sorted, a round is one warp max and a shift.
     fz::sort_desc(key);
@@ -357,8 +351,22 @@ __global__ void __launch_bounds__(288, 1) draft_moe_fused_kernel(const DraftMoeF
       for (int i = 0; i + 1 < kPerLaneE; ++i) key[i] = pop ? key[i + 1] : key[i];
       key[kPerLaneE - 1] = pop ? 0u : key[kPerLaneE - 1];
     }
-    __syncwarp();
     const int32_t id = lane < kTopK ? static_cast<int32_t>(0xffffu - (my_key & 0xffffu)) : 0;
+    if (lane < kTopK) s_ids[lane] = id;
+    __syncwarp();
+    // The routed copies need only the ids; the weights are only read by the final combine.
+    int next = nstatic;
+    if (lane == 0) {
+      for (; next < min(nstatic + kWindow, nup); ++next) {
+        ptx::mbar_wait_parity(&empty_bar[next % kStages], ((next / kStages) & 1) ^ 1);
+        issue(next);
+      }
+    }
+    row_max = warp::reduce_max(row_max);
+    float lsum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kPerLaneE; ++i) lsum += expf(v[i] - row_max);
+    const float row_sum = warp::reduce_sum(lsum);
     const float pw = expf(s_v[id] - row_max) / row_sum;
     float routed_sum = 0.0f;
 #pragma unroll
@@ -367,7 +375,6 @@ __global__ void __launch_bounds__(288, 1) draft_moe_fused_kernel(const DraftMoeF
     if (lane < kTopK) {
       const float w = pw / norm;
       s_w[lane] = w;
-      s_ids[lane] = id;
       if (c == 0) {
         p.topk_weights[lane] = w;
         p.topk_ids[lane] = id;
@@ -378,7 +385,7 @@ __global__ void __launch_bounds__(288, 1) draft_moe_fused_kernel(const DraftMoeF
       if (c == 0) *p.epoch = tag;
       ptx::mbar_arrive(&sel_bar);
       if constexpr (kTrace) trace[3] = clock64();
-      for (int n = nstatic; n < nup + kTopK; ++n) {
+      for (int n = next; n < nup + kTopK; ++n) {
         // A short window keeps every CTA's rows arriving at the same pace.
         const int m = n - kWindow;
         if (n < nup && m >= nstatic) ptx::mbar_wait_parity(&empty_bar[m % kStages], (m / kStages) & 1);
