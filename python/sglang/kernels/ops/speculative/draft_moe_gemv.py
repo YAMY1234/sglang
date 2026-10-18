@@ -114,6 +114,10 @@ def draft_moe_gemv(
 # Ring stages (16 KB each) of the fused kernel; at least topk, since every routed
 # down slice holds a stage until the end.
 _FUSED_STAGES = 11
+# Routed pairs a CTA keeps in flight; measured on GB300 (moe1_bench): 4 is best at
+# I = 128 (8-9 pairs per CTA, -0.35 us per call), the full ring at I = 256.
+def _fused_window(inter: int) -> int:
+    return 4 if inter <= 128 else _FUSED_STAGES
 
 
 @cache_once
@@ -124,10 +128,11 @@ def _draft_moe_fused_module(
     topk: int,
     cols: int,
     stages: int,
+    window: int,
     trace: bool,
 ) -> Module:
     args = make_cpp_args(
-        hidden, inter, experts, topk, cols, stages, trace, is_arch_support_pdl()
+        hidden, inter, experts, topk, cols, stages, window, trace, is_arch_support_pdl()
     )
     return load_jit(
         "draft_moe_fused",
@@ -176,6 +181,7 @@ def draft_moe_fused(
     out: torch.Tensor,
     trace: Optional[torch.Tensor] = None,
     stages: int = _FUSED_STAGES,
+    window: Optional[int] = None,
 ) -> torch.Tensor:
     """draft_router_topk + draft_moe_gemv as one launch, bitwise equal in ids,
     weights and output. Shapes as in those two; scratch from
@@ -189,6 +195,7 @@ def draft_moe_fused(
         topk_ids.shape[-1],
         cols,
         stages,
+        _fused_window(inter) if window is None else window,
         trace is not None,
     )
     logit_buf, act_buf, epoch = scratch

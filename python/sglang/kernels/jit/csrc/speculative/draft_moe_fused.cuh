@@ -150,9 +150,10 @@ SGL_DEVICE_HOST constexpr int kFusedLogitWords(int experts) {
  * \tparam kTopK   routed experts per token
  * \tparam kCols   output columns per CTA (grid = ceil(kH / kCols))
  * \tparam kStages ring stages of 16 KB; at least kTopK
+ * \tparam kWindow routed pairs a CTA keeps in flight (at most kStages)
  * \tparam kTrace  record per-phase clock64 stamps
  */
-template <int kH, int kI, int kE, int kTopK, int kCols, int kStages, bool kTrace, bool kUsePDL>
+template <int kH, int kI, int kE, int kTopK, int kCols, int kStages, int kWindow, bool kTrace, bool kUsePDL>
 __global__ void __launch_bounds__(288, 1) draft_moe_fused_kernel(const DraftMoeFusedParams __grid_constant__ p) {
   using namespace device;
   namespace fz = draft_moe_fused;
@@ -378,6 +379,9 @@ __global__ void __launch_bounds__(288, 1) draft_moe_fused_kernel(const DraftMoeF
       ptx::mbar_arrive(&sel_bar);
       if constexpr (kTrace) trace[3] = clock64();
       for (int n = nstatic; n < nup + kTopK; ++n) {
+        // A short window keeps every CTA's rows arriving at the same pace.
+        const int m = n - kWindow;
+        if (n < nup && m >= nstatic) ptx::mbar_wait_parity(&empty_bar[m % kStages], (m / kStages) & 1);
         ptx::mbar_wait_parity(&empty_bar[n % kStages], ((n / kStages) & 1) ^ 1);
         issue(n);
         if constexpr (kTrace) {
@@ -625,8 +629,9 @@ __global__ void __launch_bounds__(288, 1) draft_moe_fused_kernel(const DraftMoeF
   }
 }
 
-template <int kH, int kI, int kE, int kTopK, int kCols, int kStages, bool kTrace, bool kUsePDL>
+template <int kH, int kI, int kE, int kTopK, int kCols, int kStages, int kWindow, bool kTrace, bool kUsePDL>
 struct DraftMoeFused {
+  static_assert(kWindow >= 1 && kWindow <= kStages);
   static constexpr int kThreads = 288;
   static constexpr std::size_t kSmem = static_cast<std::size_t>(kStages) * 4 * kH +
                                        (static_cast<std::size_t>(kCols) * kI * 2 + 127) / 128 * 128 + 2 * kH +
@@ -688,7 +693,7 @@ struct DraftMoeFused {
         .out = static_cast<bf16_t*>(out.data_ptr()),
         .trace = static_cast<int64_t*>(trace.data_ptr()),
     };
-    auto kernel = draft_moe_fused_kernel<kH, kI, kE, kTopK, kCols, kStages, kTrace, kUsePDL>;
+    auto kernel = draft_moe_fused_kernel<kH, kI, kE, kTopK, kCols, kStages, kWindow, kTrace, kUsePDL>;
     static const bool attr_set = [&] {
       RuntimeDeviceCheck(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
       return true;
