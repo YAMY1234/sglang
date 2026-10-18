@@ -349,6 +349,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.forward_metadata: Optional[TRTLLMMHAMetadata] = None
         self._split_kv_enabled = envs.SGLANG_Q35MF_ATTN_SPLIT_KV.get()
         self._split_kv_scratch = {}
+        self._skv2_enabled = (
+            envs.SGLANG_Q35MF_MKA_SKV2.get()
+            and torch.cuda.get_device_capability()[0] == 10
+        )
+        self._skv2_plans = {}
         self._paged_fp8_enabled = envs.SGLANG_Q35MF_LL1_K1B.get()
         if self._paged_fp8_enabled:
             self._paged_fp8_enabled = torch.cuda.get_device_capability()[0] == 10
@@ -1368,6 +1373,35 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         assert self.is_nvfp4_kvcache
         return self.kv_cache_quant_method.get_bmm_scales(layer.layer_id)
 
+    def _run_skv2(self, query, kv_cache, block_tables, seq_lens, *, out, qk_scale, v_scale):
+        from sglang.kernels.ops.attention.skv2_split_kv import (
+            StockSplitPlan,
+            skv2_split_kv,
+        )
+
+        key = (
+            query.shape,
+            kv_cache[0].shape,
+            block_tables.shape,
+            block_tables.stride(),
+            seq_lens.shape,
+        )
+        plan = self._skv2_plans.get(key)
+        if plan is None:
+            # Compiles the producer; graph warmup runs this eagerly before capture.
+            plan = StockSplitPlan(query, kv_cache, block_tables, seq_lens)
+            self._skv2_plans[key] = plan
+        return skv2_split_kv(
+            query,
+            kv_cache,
+            block_tables,
+            seq_lens,
+            plan,
+            qk_scale=qk_scale,
+            v_scale=v_scale,
+            out=out,
+        )
+
     def _run_fixed_q_len_decode(
         self,
         query: torch.Tensor,
@@ -1386,6 +1420,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         mask: Optional[torch.Tensor] = None,
         use_split_kv: bool = True,
         use_paged_fp8: bool = False,
+        use_skv2: bool = False,
     ) -> torch.Tensor:
         """Run decode, optionally sorting and splitting requests by KV length."""
 
@@ -1485,13 +1520,23 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     split_kv_verify,
                 )
 
+                if out is None:
+                    out = torch.empty_like(query, dtype=resolved_out_dtype)
+                if use_skv2 and all(value.is_contiguous() for value in kv_cache):
+                    return self._run_skv2(
+                        query,
+                        kv_cache,
+                        block_tables,
+                        seq_lens,
+                        out=out,
+                        qk_scale=float(bmm1_scale),
+                        v_scale=float(bmm2_scale),
+                    )
                 key = (query.shape[-2], q_len_per_req)
                 scratch = self._split_kv_scratch.get(key)
                 if scratch is None:
                     scratch = allocate_scratch(query, 1, 148, q_len_per_req)
                     self._split_kv_scratch[key] = scratch
-                if out is None:
-                    out = torch.empty_like(query, dtype=resolved_out_dtype)
                 return split_kv_verify(
                     query,
                     kv_cache,
@@ -1897,6 +1942,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     mask=mask,
                     use_split_kv=(
                         self._split_kv_enabled and use_split_kv_attention(forward_batch)
+                    ),
+                    use_skv2=(
+                        self._skv2_enabled
+                        and (
+                            forward_batch.forward_mode.is_target_verify()
+                            or envs.SGLANG_Q35MF_MKA_SKV2_DRAFT.get()
+                        )
                     ),
                     use_paged_fp8=(
                         self._paged_fp8_enabled
