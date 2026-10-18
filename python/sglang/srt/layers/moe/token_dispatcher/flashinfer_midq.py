@@ -90,17 +90,18 @@ class CombineProof:
     """Check that the installed combine equals the stock kernel bit for bit, eager or in CUDA graphs.
 
     One instance per process and per (target, draft); every dispatcher of that kind shares it.
-    Counters live on the device, so the check is capturable; a reporter thread logs them every
-    PERIOD_S seconds through its own stream, without synchronising the forward stream.
+    Counters live on the device and are mirrored into pinned host memory by a copy that is part
+    of the check, so the reporter thread logs them every PERIOD_S seconds without any CUDA call
+    (a CUDA call from another thread can disturb a stream capture).
     """
 
     PERIOD_S = 30.0
 
     def __init__(self, speculative: bool):
         self.speculative = speculative
-        self.device = torch.cuda.current_device()
         # [calls, compared elements, differing elements]
-        self.counters = torch.zeros(3, dtype=torch.int64, device=self.device)
+        self.counters = torch.zeros(3, dtype=torch.int64, device=torch.cuda.current_device())
+        self.host_counters = torch.zeros(3, dtype=torch.int64, pin_memory=True)
         threading.Thread(target=self._report, daemon=True).start()
 
     def check(self, ref: torch.Tensor, out: torch.Tensor) -> None:
@@ -108,14 +109,12 @@ class CombineProof:
         self.counters[0].add_(1)
         self.counters[1].add_(ref.numel())
         self.counters[2].add_(differing)
+        self.host_counters.copy_(self.counters, non_blocking=True)
 
     def _report(self) -> None:
-        torch.cuda.set_device(self.device)
-        stream = torch.cuda.Stream()
         while True:
             time.sleep(self.PERIOD_S)
-            with torch.cuda.stream(stream):
-                calls, elements, differing = self.counters.cpu().tolist()
+            calls, elements, differing = self.host_counters.tolist()
             logger.info(
                 "MIDQ combine proof: speculative=%s calls=%d elements=%d mismatched=%d",
                 self.speculative,
