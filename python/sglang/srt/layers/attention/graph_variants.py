@@ -44,10 +44,10 @@ class PagedFP8GraphVariants:
         )
 
 
-def create_paged_fp8_graph_variants(capture_forward_mode, captured_req_width):
+def create_paged_fp8_graph_variants(capture_forward_mode, captured_req_width, *, enabled=True):
     from sglang.srt.environ import envs
 
-    if envs.SGLANG_Q35MF_LL1_K1B.get() and captured_req_width in (1, 7):
+    if enabled and envs.SGLANG_Q35MF_LL1_K1B.get() and captured_req_width in (1, 7):
         if (capture_forward_mode.is_decode_or_idle()
             or capture_forward_mode.is_target_verify()
             or capture_forward_mode.is_draft_extend_v2()):

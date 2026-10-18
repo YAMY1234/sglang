@@ -161,7 +161,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # num_steps + 1 -- topk > 1 draft-extend overflows the buffers.
         self.captured_req_width = resolve_num_tokens_per_req(phase="draft_extend")
         self.attention_graph_variants = (
-            create_paged_fp8_graph_variants(self.capture_forward_mode, self.captured_req_width)
+            create_paged_fp8_graph_variants(
+                self.capture_forward_mode, self.captured_req_width,
+                enabled=envs.SGLANG_Q35MF_LL1_K1B_EXTEND.get(),
+            )
             or create_split_kv_graph_variants(self.capture_forward_mode, self.captured_req_width)
         )
         self.max_bs = max(self.capture_bs)

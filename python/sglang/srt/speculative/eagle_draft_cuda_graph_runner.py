@@ -152,7 +152,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         self.enable_pdmux = False
         self.record_nolora_graph = False
         self.attention_graph_variants = (
-            PagedFP8GraphVariants() if envs.SGLANG_Q35MF_LL1_K1B.get() else None
+            PagedFP8GraphVariants()
+            if envs.SGLANG_Q35MF_LL1_K1B.get() and envs.SGLANG_Q35MF_LL1_K1B_DRAFT.get()
+            else None
         )
         self.is_dllm = False
 
