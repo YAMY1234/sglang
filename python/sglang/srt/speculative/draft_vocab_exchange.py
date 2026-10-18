@@ -22,6 +22,7 @@ from sglang.kernels.ops.speculative.draft_vocab_argmax import (
     vocab_argmax_select,
 )
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.draft_hot_vocab import DraftHotVocab, build_hot_head_shard
@@ -110,7 +111,9 @@ class DraftVocabExchange:
             self.token_map = hot.token_ids[parallel.tp_rank * rows : (parallel.tp_rank + 1) * rows].contiguous()
         self.local_vocab = self.embed_weight.shape[0]
         hidden = self.embed_weight.shape[1]
-        rows = self.MAX_ROWS
+        # Draft steps of up to step_rows requests use the exchange; the draft extend keeps MAX_ROWS.
+        self.step_rows = min(max(envs.SGLANG_Q35MF_DRAFT_EXCHANGE_STEP_ROWS.get(), 1), 8)
+        rows = max(self.MAX_ROWS, self.step_rows)
         self.payload = torch.empty(rows, hidden + META_ELEMS, dtype=torch.bfloat16, device=dev)
         self.part_key = torch.empty(rows, PACK_BLOCKS, dtype=torch.int32, device=dev)
         self.part_idx = torch.empty(rows, PACK_BLOCKS, dtype=torch.int32, device=dev)
@@ -126,7 +129,7 @@ class DraftVocabExchange:
         # Same guarded multimem all-gather as the logits gather; a cross-rank
         # all-reduce always sits between two draft steps' gathers.
         self.gatherer = triton_symm_mem_ag.MultimemAllGatherer(
-            max_tokens=self.MAX_ROWS, enabled=True, skip_entry_sync=True
+            max_tokens=rows, enabled=True, skip_entry_sync=True
         )
 
     @classmethod
@@ -137,12 +140,14 @@ class DraftVocabExchange:
         if reason is not None:
             logger.warning("Draft vocab exchange disabled (%s); using the stock path.", reason)
             return None
+        exchange = cls(model, num_steps, hot)
         logger.info(
-            "Draft vocab exchange active (tp=%d%s).",
+            "Draft vocab exchange active (tp=%d%s, draft steps up to %d rows).",
             get_parallel().tp_size,
             ", hot vocabulary" if hot is not None else "",
+            exchange.step_rows,
         )
-        return cls(model, num_steps, hot)
+        return exchange
 
     def begin_step(self, step: int, num_rows: int) -> None:
         self.num_rows = num_rows
@@ -159,7 +164,7 @@ class DraftVocabExchange:
             self.model.draft_input_embeds = self.next_embeds[:num_rows]
         else:
             self.model.draft_input_embeds = self.next_embeds[:num_rows] if step > 0 else None
-        self.model.logits_processor.skip_vocab_gather_rows = self.MAX_ROWS
+        self.model.logits_processor.skip_vocab_gather_rows = self.step_rows
 
     def finish_step(
         self,

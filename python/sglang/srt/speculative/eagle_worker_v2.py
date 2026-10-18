@@ -831,7 +831,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self._draft_vocab_exchange
             if self._exchange_in_draft_steps
             and draft_tokens_topk1 is not None
-            and topk_index.shape[0] <= DraftVocabExchange.MAX_ROWS
+            and topk_index.shape[0] <= self._draft_vocab_exchange.step_rows
             else None
         )
 
