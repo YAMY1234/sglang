@@ -105,6 +105,8 @@ struct MkdXchgParams {
   int32_t draft_column;
   int32_t mrope_stride;
   uint64_t* trace;               // [kChunks, 9] %globaltimer per phase, or null
+  const char* pf;                // static weight range prefetched into L2 for a later kernel, or null
+  int64_t pf_bytes;
 };
 
 /**
@@ -138,6 +140,17 @@ __global__ void __launch_bounds__(kThreads) mkd_xchg_kernel(const MkdXchgParams 
   const int lane = static_cast<int>(get_lane_id());
 
   const uint64_t t_start = mkd_xchg::now_ns();
+  if (p.pf != nullptr) {
+    // Each CTA hints its share of the range in 64 KB bulk prefetches (static weights only).
+    constexpr int64_t kPfChunk = 64 * 1024;
+    const int64_t share = (p.pf_bytes + kChunks - 1) / kChunks;
+    const int64_t beg = c * share, end = min(p.pf_bytes, beg + share);
+    for (int64_t off = beg + static_cast<int64_t>(threadIdx.x) * kPfChunk; off < end;
+         off += static_cast<int64_t>(kThreads) * kPfChunk) {
+      const uint32_t size = static_cast<uint32_t>(min(kPfChunk, end - off)) & ~15u;
+      if (size > 0) asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(p.pf + off), "r"(size) : "memory");
+    }
+  }
   PDLWaitPrimary<kUsePDL>();
   // The fc launch behind us only prefetches static weights before its own wait.
   PDLTriggerSecondary<kUsePDL>();
@@ -407,7 +420,9 @@ struct MkdXchg {
       int64_t rank,
       int64_t draft_column,
       int64_t nan_key,
-      int64_t trace_ptr) {
+      int64_t trace_ptr,
+      int64_t pf_ptr,
+      int64_t pf_bytes) {
     using namespace host;
     constexpr int kW = 2 * kH / kWorld;
     constexpr int kEmbed = kH / kW;
@@ -472,6 +487,8 @@ struct MkdXchg {
         .draft_column = static_cast<int32_t>(draft_column),
         .mrope_stride = mrope_stride,
         .trace = reinterpret_cast<uint64_t*>(trace_ptr),
+        .pf = reinterpret_cast<const char*>(pf_ptr),
+        .pf_bytes = pf_bytes,
     };
     LaunchKernel(kChunks, kThreads, device.unwrap())
         .enable_pdl(kUsePDL)(mkd_xchg_kernel<kH, kWorld, kMemo, kChunks, kThreads, kUsePDL>, params);

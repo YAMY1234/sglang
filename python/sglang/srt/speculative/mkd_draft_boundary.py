@@ -110,6 +110,7 @@ class MkdDraftBoundary:
         self.fc_out = torch.empty(1, hidden, dtype=torch.bfloat16, device=dev)
         self.side_stream = torch.cuda.Stream(device=dev)
         self._install_l2_prefetch(envs.SGLANG_Q35MF_MKD_L2PF_MB.get())
+        self.qkv_pf, self.qkv_pf_bytes = self._qkv_prefetch_target(envs.SGLANG_Q35MF_MKD_L2PF_QKV_MB.get())
         # armed: this draft step ends in the exchange; pending: the next step's fc reads it.
         self.armed = False
         self.pending = False
@@ -207,6 +208,18 @@ class MkdDraftBoundary:
         moe.after_hook = self._prefetch_lm_head
         logger.info("MKD L2 prefetch: %d MB of the draft lm_head after the draft MoE.", mb)
 
+    def _qkv_prefetch_target(self, mb: int):
+        if mb <= 0:
+            return None, 0
+        from sglang.srt.layers.linear import QKVParallelLinear
+
+        for module in self.model.modules():
+            if isinstance(module, QKVParallelLinear):
+                logger.info("MKD L2 prefetch: %d MB of the draft qkv weight during the exchange.", mb)
+                return module.weight, mb * 2**20
+        logger.warning("MKD qkv L2 prefetch disabled (no qkv projection found).")
+        return None, 0
+
     def _prefetch_lm_head(self) -> None:
         if not self.armed:
             return
@@ -275,6 +288,8 @@ class MkdDraftBoundary:
             self.world,
             draft_column,
             NAN_KEY_SPLIT_ARGMAX,
+            prefetch=self.qkv_pf,
+            prefetch_bytes=self.qkv_pf_bytes,
         )
         self.pending = True
 

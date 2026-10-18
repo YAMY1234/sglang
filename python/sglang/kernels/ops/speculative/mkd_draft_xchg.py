@@ -68,6 +68,8 @@ def mkd_xchg(
     draft_column: int,
     nan_key: int,
     trace: torch.Tensor | None = None,
+    prefetch: torch.Tensor | None = None,
+    prefetch_bytes: int = 0,
 ) -> None:
     """Shard argmax + multicast exchange + selection for one draft token (see the .cuh).
     ``hot_ids`` is the full sorted hot-vocabulary id list; this rank's rows are its
@@ -96,4 +98,6 @@ def mkd_xchg(
         draft_column,
         nan_key,
         trace.data_ptr() if trace is not None else 0,
+        prefetch.data_ptr() if prefetch is not None else 0,
+        min(prefetch_bytes, prefetch.numel() * prefetch.element_size()) if prefetch is not None else 0,
     )
