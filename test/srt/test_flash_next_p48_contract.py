@@ -146,6 +146,23 @@ def worker(*, native_model=True, flag=True):
 
 
 class NativeP48ContractTest(unittest.TestCase):
+    def test_shallow_fulln_opt_in_admits_24_trunk_layers_and_emitter_graph(self):
+        from sglang.srt.mem_cache import gdn_prefill_exact_tail as exact
+        with worker() as w:
+            w.owner.pd_shallow_role = 'prefill'
+            w.owner.p_layer_ids = list(range(31))
+            w.owner.fullstack.update(prefill_layer_trim=True, gdn_every=8)
+            w.owner.emitter_ids = list(range(31, 48))
+            w.owner.prepare_forward_batch = lambda batch: None
+            with patch.dict(os.environ, {'SGLANG_GDN_PD_SHALLOW_FULLN': '1',
+                                         'TWINSTAR_PD_FACTOR_ONLY_TAIL': '0',
+                                         'TWINSTAR_PD_EMITTER_GRAPH': '1'}):
+                exact.install(w.runner)
+                agg.install(w.runner)
+            self.assertEqual([layer.layer_id for layer in w.pool._exact_tail_layers],
+                             [layer for layer in IDS if layer < 31])
+            self.assertTrue(w.owner._pfactor_agg_installed)
+
     def test_native_and_legacy_real_init_chain_and_prewarm(self):
         for native_model in (False, True):
             with (

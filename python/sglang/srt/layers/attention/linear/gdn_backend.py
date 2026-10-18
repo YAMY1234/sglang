@@ -1109,7 +1109,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if self.factored is not None and _FACTORED_DUMP_DIR is None:
             from sglang.srt.mem_cache.gdn_pside_layer_graph import eligible, run_layer
 
-            if eligible(
+            if getattr(forward_batch, "_pd_fulln_fp32_track_mask", None) is None and eligible(
                 self, layer, forward_batch, mixed_qkv, forward_metadata, conv_states
             ):
                 # Preserve the native raw-input convolution checkpoint before
@@ -1892,7 +1892,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         pool = self.factored
         plan = forward_metadata.factored_extend
         assert plan is not None, "factored extend plan missing (init_forward_metadata)"
+        fp32_track_mask = getattr(forward_batch, "_pd_fulln_fp32_track_mask", None)
+        h_track_buf = None
         if self._stepwise_active(forward_batch):
+            assert fp32_track_mask is None, "P3 fp32 checkpoint snapshot requires the chunk path"
             self._stepwise_log("factored", forward_batch)
             return self._forward_extend_factored_stepwise(
                 layer=layer,
@@ -1905,8 +1908,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 plan=plan,
                 output=output,
             )
-        h_track_buf = None
         if precomputed is not None:
+            assert fp32_track_mask is None, "P3 fp32 checkpoint snapshot cannot use a precomputed bf16 h"
             core_attn_out, S0, h = precomputed
             if forward_metadata.track_ssm_fp32_any:
                 _fp32_track_fallback("the precomputed layer graph returns only the bf16 h")
@@ -1919,7 +1922,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )  # (B, HV, V, K) fp32, contiguous
             row_indices = torch.arange(B, device=S0.device, dtype=torch.int32)
             _fp32_track_prewarm(self, layer, query, key, value, a, b, query_start_loc)
-            if forward_metadata.track_ssm_fp32_any:
+            # docs/223 §11 (A') and P3's PD full-N snapshot fill the same fp32
+            # track_state; one forward uses at most one of them.
+            assert fp32_track_mask is None or not forward_metadata.track_ssm_fp32_any, (
+                "FULLN_CKPT_FP32_SNAPSHOT and the P3 PD full-N fp32 snapshot are both active")
+            if fp32_track_mask is not None and forward_metadata.track_ssm_h_src.numel():
+                assert isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)
+                assert query.dtype == torch.bfloat16, "P3 fp32 snapshot requires the served bf16 trunk"
+                h_track_buf = torch.empty_like(S0)
+            elif forward_metadata.track_ssm_fp32_any:
                 h_track_buf = _fp32_track_buffer(self, S0)
             block = None
             if h_track_buf is None and _os.environ.get("SGLANG_GDN_PSIDE_GRAPH") == "1":
@@ -1998,9 +2009,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     if h_track_buf is not None:
                         # docs/223 §11 (A'): P-1 rows take the fp32 snapshot (the
                         # legacy N-1 final state); the others keep the bf16 h,
-                        # which the collector widens to fp32 anyway.
+                        # which the collector widens to fp32 anyway. P3 PD
+                        # full-N: rows selected by its own per-batch mask.
                         rows = forward_metadata.track_ssm_h_batch_src
-                        hs = torch.where(forward_metadata.track_ssm_fp32_rows[:, None, None, None],
+                        fp32_rows = (fp32_track_mask[rows] if fp32_track_mask is not None
+                                     else forward_metadata.track_ssm_fp32_rows)
+                        hs = torch.where(fp32_rows[:, None, None, None],
                                          h_track_buf[rows], hs.float())
                     track_slots = forward_metadata.track_ssm_h_dst
                 final_src = forward_metadata.track_ssm_final_src

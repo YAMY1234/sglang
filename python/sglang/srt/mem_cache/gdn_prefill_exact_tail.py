@@ -173,7 +173,9 @@ class ExactTailTransaction:
         if self.tail_expected and set(self.tails) != expected:
             raise RuntimeError("exact-tail forward is missing recurrent layer activations")
         if self.plan is not None:
-            graph = self.pool._prefill_batch_graph
+            from .gdn_prefill_agg_contract import k31_ab_graph
+            graph = k31_ab_graph(self.pool._prefill_batch_graph,
+                                getattr(self.pool, "_prefill_batch_graph_ab", None))
             if not graph.warmed:
                 raise RuntimeError("exact-tail publication graph must be prewarmed")
             tails = self.tails
@@ -291,8 +293,11 @@ def install(runner):
     conflicts = ("SGLANG_GDN_PREFILL_BATCH_GRAPH", "SGLANG_GDN_PREFILL_TRACKED_GRAPH",
                  "SGLANG_GDN_PREFILL_CHECKPOINT_GRAPH", "SGLANG_GDN_PREFILL_TAIL_GRAPH",
                  "SGLANG_GDN_PREFILL_MODEL_TAIL_GRAPH", "SGLANG_GDN_PSIDE_GRAPH",
-                 "SGLANG_GDN_PSIDE_COMPOSITE", "TWINSTAR_PD_EMITTER_GRAPH")
+                 "SGLANG_GDN_PSIDE_COMPOSITE")
     shallow = getattr(owner, "pd_shallow_role", None) == "prefill"
+    if (os.environ.get("TWINSTAR_PD_EMITTER_GRAPH") == "1"
+            and not (shallow and os.environ.get("SGLANG_GDN_PD_SHALLOW_FULLN") == "1")):
+        raise ValueError("exact-tail emitter graph requires the shallow full-N route")
     if (any(os.environ.get(k) == "1" for k in conflicts)
             or not get_schedule().disable_overlap_schedule
             or os.environ.get("SGLANG_FLASHNEXT_ARRIVAL_OVERLAP") == "1"

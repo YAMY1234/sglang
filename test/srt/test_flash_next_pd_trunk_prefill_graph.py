@@ -367,7 +367,7 @@ class PDTrunkReplayTest(unittest.TestCase):
         self.assertEqual(runner.run_count, 0)
         self.assertEqual(owner.n_pd_trunk_graph, 0)
 
-    def run_arm(self, arm, graph_on, *, reject=False, final=True, exact_on=False):
+    def run_arm(self, arm, graph_on, *, reject=False, final=True, exact_on=False, fulln=False):
         """Actual native shallow envelope and per-layer split with CPU kernels."""
         import torch
         from sglang.srt.models import qwen4_exp as stock
@@ -377,6 +377,7 @@ class PDTrunkReplayTest(unittest.TestCase):
         from sglang.srt.model_executor.forward_context import (
             ForwardContext,
             forward_context,
+            get_attn_backend,
         )
         from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.context_manager import (
             get_tc_piecewise_forward_context,
@@ -401,6 +402,7 @@ class PDTrunkReplayTest(unittest.TestCase):
                 itertools=itertools,
                 ForwardMode=ForwardMode,
                 _stock=stock,
+                get_attn_backend=get_attn_backend,
                 _optional_prefill_graph=lambda: None,
                 get_global_expert_distribution_recorder=lambda: recorder,
                 _dev=lambda values, dtype, device: torch.as_tensor(
@@ -499,7 +501,7 @@ class PDTrunkReplayTest(unittest.TestCase):
             self.assertEqual(len(values), 36)
             for li, (value, track) in enumerate(values):
                 publish(li, value, track)
-                if IDS[li] < 31 and final:
+                if IDS[li] < 31 and final and not fulln:
                     pool.count[li, 1] += 1
             events.append("exact-publication")
 
@@ -524,7 +526,10 @@ class PDTrunkReplayTest(unittest.TestCase):
                 events.append(("prefix", lid, mixed_qkv.shape[0]))
                 value = torch.full((1, 2, 16, 16), float(lid + 1))
                 tx = getattr(pool, "_exact_tail_transaction", None)
-                if tx is None:
+                collector = getattr(self.forward_metadata.factored_extend, 'batch_collector', None)
+                if collector is not None:
+                    collector.add(lid, value, value + 2, track_slots, None, None)
+                elif tx is None:
                     publish(li, value, value + 2)
                     self.forward_metadata.factored_extend.next_layer += 1
                 else:
@@ -675,9 +680,15 @@ class PDTrunkReplayTest(unittest.TestCase):
                     patch.object(pd_shallow_gdn, "split_boundary", exact.split_boundary)
                 )
                 stack.enter_context(exact.ExactTailTransaction(pool, rp, fb))
-            if not trim:
+            if not trim or fulln:
                 linear.init_forward_metadata(fb)
-            output = owner.forward(ids, ids, fb)
+            if fulln:
+                from sglang.srt.mem_cache.gdn_pd_fulln_collector import ShallowFullNCollector
+                fb._pfactor_agg_contract = True
+                with ShallowFullNCollector(pool, plan, graph=pool._prefill_batch_graph):
+                    output = owner.forward(ids, ids, fb)
+            else:
+                output = owner.forward(ids, ids, fb)
         expected_runs = int(graph_on and not reject)
         self.assertEqual(runner.run_count, expected_runs)
         self.assertEqual(owner.n_pd_trunk_graph, expected_runs)
@@ -685,7 +696,7 @@ class PDTrunkReplayTest(unittest.TestCase):
             break_ids,
             [lid for lid in IDS if lid < (31 if trim else 48)] if expected_runs else [],
         )
-        self.assertEqual(pool._prefill_batch_graph.run.call_count, int(exact_on))
+        self.assertEqual(pool._prefill_batch_graph.run.call_count, int(exact_on or fulln))
         if trim:
             self.assertEqual(
                 [e for e in events if isinstance(e, tuple) and e[0] == "emitter"],
@@ -693,12 +704,18 @@ class PDTrunkReplayTest(unittest.TestCase):
             )
             self.assertEqual(
                 [e[1] for e in events if isinstance(e, tuple) and e[0] == "tail"],
-                [lid for lid in IDS if lid < 31] if final else [],
+                [lid for lid in IDS if lid < 31] if final and not fulln else [],
             )
             if final:
                 req = NS(kv=NS(mamba_pool_idx=torch.tensor([1])))
                 if factor:
-                    SplitBoundaryPhase(NS(pool=pool), state).before_send(req)
+                    if fulln:
+                        from sglang.srt.disaggregation.state_handoff import FactorStateHandoff
+                        req._pfactor_agg_contract = True
+                        handler = FactorStateHandoff(pool)
+                    else:
+                        handler = NS(pool=pool)
+                    SplitBoundaryPhase(handler, state).before_send(req)
                 else:
                     DenseBoundaryHandoff(state).before_send(req)
                 self.assertEqual(state.position[1].tolist(), [2])
@@ -740,6 +757,14 @@ class PDTrunkReplayTest(unittest.TestCase):
         actual = self.run_arm("PC", True, exact_on=True)
         for a, b in zip(expected, actual, strict=True):
             self.assertTrue(torch.equal(a, b))
+
+    def test_PC_fulln_has_one_publication_no_tail_and_graph_matches_eager(self):
+        import torch
+        for final in (False, True):
+            expected = self.run_arm('PC', False, final=final, fulln=True)
+            actual = self.run_arm('PC', True, final=final, fulln=True)
+            for a, b in zip(expected, actual, strict=True):
+                self.assertTrue(torch.equal(a, b))
 
 
 if __name__ == "__main__":

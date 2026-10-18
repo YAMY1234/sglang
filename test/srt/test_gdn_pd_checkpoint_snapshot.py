@@ -1,0 +1,106 @@
+"""P3 alone replaces the aligned legacy final state with an fp32 snapshot."""
+import os
+from types import SimpleNamespace as NS
+import unittest
+from unittest.mock import Mock, patch
+
+import torch
+from sglang.srt.layers.attention.linear import gdn_backend as gdn
+from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
+
+
+class SnapshotTest(unittest.TestCase):
+    def test_unqualified_trunk_graph_is_rejected_only_with_p3_requested(self):
+        from sglang.srt.mem_cache import gdn_prefill_agg_contract as contract
+        owner = NS(pd_shallow_role='prefill', pd_trunk_prefill_graph=True,
+                   fullstack={'gdn_rank': 16})
+        runner = NS(model=owner, req_to_token_pool=None,
+                    server_args=NS(disaggregation_mode='prefill'))
+        for enabled in ('0', '1'):
+            with patch.dict(os.environ, SGLANG_GDN_PD_SHALLOW_FULLN=enabled,
+                            SGLANG_GDN_PREFILL_AGG_CONTRACT='1'):
+                if enabled == '1':
+                    with self.assertLogs(level='WARNING'), self.assertRaisesRegex(
+                            ValueError, 'PD_TRUNK_PREFILL_GRAPH=0'):
+                        contract.install(runner)
+                else:
+                    contract.install(runner)
+
+    def test_actual_eager_copy_preserves_both_checkpoint_policies(self):
+        from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+        from sglang.srt.model_executor.runner.eager_runner import EagerRunner
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import CudaGraphBufferRegistry
+        batch = ForwardBatch(
+            forward_mode=ForwardMode.EXTEND, batch_size=1, input_ids=torch.arange(65),
+            req_pool_indices=torch.tensor([3]), seq_lens=torch.tensor([65]),
+            out_cache_loc=torch.arange(65), seq_lens_sum=65,
+            mamba_track_seqlens=torch.tensor([65]), _pfactor_agg_contract=True,
+            _pd_fulln_emitter_track_seqlens=torch.tensor([64]),
+            _pd_fulln_fp32_track_mask=torch.tensor([True]))
+        registry = NS(_slots={}, fill_from=Mock())
+        registry.extract_buffer = lambda **kwargs: CudaGraphBufferRegistry.extract_buffer(registry, **kwargs)
+        for no_copy in ('0', '1'):
+            with self.subTest(no_copy=no_copy), patch.dict(os.environ, SGLANG_EAGER_INPUT_NO_COPY=no_copy):
+                copied = EagerRunner.load_batch(NS(_eager_registry=registry), batch)
+            self.assertIsNot(copied, batch)
+            self.assertEqual(copied.mamba_track_seqlens.item(), 65)
+            self.assertEqual(copied._pd_fulln_emitter_track_seqlens.item(), 64)
+            self.assertTrue(copied._pd_fulln_fp32_track_mask.item())
+
+    def run_case(self, mask):
+        stage = torch.zeros(2, 1, 2, 2)
+        h = torch.full((1, 4, 1, 2, 2), .12345, dtype=torch.bfloat16)
+        snapshot = torch.full_like(stage, .1234567)
+        commit = Mock()
+        calls = []
+
+        def extend(**kwargs):
+            calls.append(kwargs)
+            if kwargs.get('track_state') is not None:
+                kwargs['track_state'].copy_(snapshot)
+            return torch.zeros(1, 130, 1, 2), None, h
+
+        backend = NS(factored=NS(initial_dense=lambda *a: stage,
+                                commit_extend_batched=commit, batch_prefill=True),
+                     _stepwise_active=lambda _: False,
+                     kernel_dispatcher=NS(extend_kernel=object.__new__(TritonGDNKernel),
+                                          extend=extend))
+        metadata = NS(factored_extend=NS(slots=torch.tensor([1, 2])),
+                      track_ssm_h_src=torch.tensor([1, 3]),
+                      track_ssm_h_batch_src=torch.tensor([0, 1]),
+                      track_ssm_h_dst=torch.tensor([10, 11]),
+                      track_chunk_idx=torch.tensor([1, 1]),
+                      track_ssm_final_src=None, track_ssm_final_dst=None,
+                      has_mamba_track_mask=True, track_ssm_recompute_dst=None,
+                      state_checkpoint_cu_starts=None, num_state_checkpoints=None,
+                      state_checkpoint_every_n_tokens=None,
+                      # Mamba2Metadata defaults of the merged fp32 tree's (A') snapshot fields
+                      track_ssm_fp32_rows=None, track_ssm_fp32_any=False)
+        env = {name: '0' for name in ('SGLANG_GDN_PSIDE_GRAPH', 'SGLANG_GDN_PREFILL_DENSE_GRAPH')}
+        with patch.dict(os.environ, env), patch.object(gdn, '_FACTORED_DUMP_DIR', None), \
+             patch.object(gdn, '_gating', return_value=(None, None)):
+            gdn.GDNAttnBackend._forward_extend_factored(
+                backend, layer=NS(layer_id=0),
+                forward_batch=NS(_pd_fulln_fp32_track_mask=mask),
+                query=torch.zeros(1, 130, 1, 2, dtype=torch.bfloat16), key=None,
+                value=None, a=None, b=None, query_start_loc=torch.tensor([0, 65, 130]),
+                forward_metadata=metadata, output=None)
+        return calls[0], commit.call_args.args[3], h, snapshot
+
+    def test_only_legacy_final_rows_use_the_fp32_snapshot(self):
+        call, tracked, h, snapshot = self.run_case(torch.tensor([True, False]))
+        self.assertIsNotNone(call['track_state'])
+        self.assertEqual(tracked.dtype, torch.float32)
+        self.assertTrue(torch.equal(tracked[0], snapshot[0]))
+        self.assertTrue(torch.equal(tracked[1], h[0, 3].float()))
+        self.assertFalse(torch.equal(tracked[0], h[0, 1].float()))
+
+    def test_absent_p3_marker_keeps_the_original_bf16_h(self):
+        call, tracked, h, _ = self.run_case(None)
+        self.assertNotIn('track_state', call)
+        self.assertEqual(tracked.dtype, torch.bfloat16)
+        self.assertTrue(torch.equal(tracked, h[0, [1, 3]]))
+
+
+if __name__ == '__main__':
+    unittest.main()

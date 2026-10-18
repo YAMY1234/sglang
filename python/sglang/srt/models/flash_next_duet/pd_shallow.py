@@ -108,25 +108,41 @@ def prefill_extend(owner, input_ids, positions, fb):
     backend = get_attn_backend()
     body = owner.model.model
     linear = backend.linear_attn_backend
+    fulln = getattr(fb, "_pfactor_agg_contract", False)
+    full_metadata = linear.forward_metadata if fulln else None
     ms = owner._boundary_lens(fb)
     emitter_fb, emitter_idx = owner._sub_batch(fb, input_ids, positions, "p")
+    if fulln:
+        if emitter_fb.batch_size != fb.batch_size:
+            raise RuntimeError("full-N shallow requires a nonempty emitter prefix per row")
+        emitter_fb.mamba_track_seqlens = getattr(
+            fb, "_pd_fulln_emitter_track_seqlens", fb.mamba_track_seqlens)
+        emitter_fb._pd_fulln_fp32_track_mask = None  # deep aligned state is already fp32 final
     emitter_fb.flashnext_gdn_layer_range = (0, 35)
     # One native N-1 plan is reused for all layers. It is made before any
     # recurrent append can mark a live slot stale; its exact ring sources and
     # per-layer radix checkpoint indices remain authoritative for that prefix.
     prefix_metadata = None
     if emitter_fb.batch_size:
+        # Reuse the only ring reservation. N-1 emitter attention metadata may
+        # differ, but its initial factor state/ownership is the same batch.
+        if fulln:
+            emitter_fb._twinstar_defer_factor_plan = True
         linear.init_forward_metadata(emitter_fb)
         prefix_metadata = linear.forward_metadata
+        if fulln:
+            emitter_fb._twinstar_defer_factor_plan = False
+            prefix_metadata.factored_extend = full_metadata.factored_extend
     boundary = boundary_idx = boundary_metadata = None
     if any(ms):
         boundary, boundary_idx = boundary_inputs(owner, input_ids, positions, fb)
-        linear.init_forward_metadata(boundary)
-        boundary_metadata = linear.forward_metadata
+        if not fulln:
+            linear.init_forward_metadata(boundary)
+            boundary_metadata = linear.forward_metadata
     from twinstar_sgl.pd_final_metadata import initialize_shallow
 
     initialize_shallow(backend.full_attn_backend, fb)
-    linear.forward_metadata = prefix_metadata
+    linear.forward_metadata = full_metadata if fulln else prefix_metadata
     prefetched = None
     if os.environ.get("SGLANG_FLASHNEXT_ARRIVAL_OVERLAP", "0") == "1":
         from sglang.srt.mem_cache.flashnext_arrival_overlap import begin
@@ -148,7 +164,7 @@ def prefill_extend(owner, input_ids, positions, fb):
             prefix_metadata,
             boundary_metadata,
         )
-        if any(ms)
+        if any(ms) and not fulln
         else nullcontext()
     )
     with context:
@@ -247,7 +263,7 @@ def prefill_extend(owner, input_ids, positions, fb):
         logger.info(
             "Flash-Next P boundary: extra_forwards=0 extend_boundary_requests=%d wire_phase=%s",
             owner.pd_boundary_requests,
-            "dense:N/N-1" if dense_enabled(owner) else "9/8",
+            "full-N:r/r" if fulln else "dense:N/N-1" if dense_enabled(owner) else "9/8",
         )
     owner.n_twinstar += 1
     if any(int(p) > 0 for p in fb.extend_prefix_lens_cpu):
@@ -255,6 +271,8 @@ def prefill_extend(owner, input_ids, positions, fb):
     audit = getattr(owner, "pd_final_launch_audit", None)
     if audit is not None:
         audit.record(fb)
+    if fulln:
+        linear.forward_metadata = full_metadata
     return LogitsProcessorOutput(
         next_token_logits=torch.zeros(
             fb.batch_size,

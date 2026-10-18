@@ -71,17 +71,17 @@ class StateDump:
     Host-synchronizing; only for the first SGLANG_GDN_K31_STATE_DUMP_MAX full-N
     forwards (default 8) of a dump run, never in a measured window.
     """
-    def __init__(self, pool, directory, limit):
-        self.pool, self.directory, self.limit = pool, directory, limit
+    def __init__(self, pool, directory, limit, role=None):
+        self.pool, self.directory, self.limit, self.role = pool, directory, limit, role
         self.count = 0
         os.makedirs(directory, exist_ok=True)
 
     @classmethod
-    def from_env(cls, pool):
+    def from_env(cls, pool, role=None):
         directory = os.environ.get(STATE_DUMP_DIR)
         if not directory:
             return None
-        return cls(pool, directory, int(os.environ.get(STATE_DUMP_MAX, "8")))
+        return cls(pool, directory, int(os.environ.get(STATE_DUMP_MAX, "8")), role)
 
     def __call__(self, plan, forward_batch, token_count):
         if self.count >= self.limit:
@@ -101,7 +101,8 @@ class StateDump:
         payload = dict(
             S=stack(0), S_tracked=stack(1), vbar=p.vbar.float().cpu(),
             omega=None if getattr(p, "k31_omega", None) is None else p.k31_omega.float().cpu(),
-            meta=dict(rank=rank, layer_ids=list(p.layer_ids), r=p.cfg.r, rmax=p.cfg.rmax,
+            meta=dict(rank=rank, role=self.role, layer_ids=list(p.layer_ids), r=p.cfg.r, rmax=p.cfg.rmax,
+                      shallow_fulln=bool(getattr(forward_batch, "_pd_shallow_fulln", False)),
                       rows=int(plan.slots.numel()), token_count=int(token_count),
                       extend_lengths=host("extend_seq_lens_cpu"),
                       prefix_lengths=host("extend_prefix_lens_cpu")))
@@ -174,20 +175,42 @@ def set_k42_route(route):
 K31_AB_DUAL = "SGLANG_GDN_K31_AB_DUAL"
 K31_AB_ENV = "SGLANG_GDN_K31_AB_ENV"
 _K31_AB = {"label": None, "logged": set()}
+_PD_MICRO_ROUTE = None
+
+
+def set_pd_micro_route(route):
+    """Debug-only forward selection, called before checkpoint preparation.
+
+    C+ already uses full-N today. Only shallow P uses its N-1/boundary
+    adapter for 0n; 0 and 1 always use the admitted full-N contract.
+    """
+    global _PD_MICRO_ROUTE
+    if route not in ("0n", "0", "1"):
+        raise ValueError("PD micro route must be 0n, 0 or 1")
+    if os.environ.get(K31_AB_DUAL) != "1":
+        raise ValueError("PD route micro requires dual-prewarmed k31 graphs")
+    _PD_MICRO_ROUTE = route
+    set_k31_ab_label("B" if route == "1" else "A")
 
 
 def k31_ab_env():
     return os.environ.get(K31_AB_ENV, "SGLANG_GDN_K31_FUSED")
 
 
+def k31_ab_envs():
+    return tuple(k31_ab_env().split(","))
+
+
 def set_k31_ab_label(label):
     if label not in ("A", "B"):
         raise ValueError("k31 A/B label must be 'A' or 'B'")
     _K31_AB["label"] = label
-    os.environ[k31_ab_env()] = "1" if label == "B" else "0"
+    for name in k31_ab_envs():
+        os.environ[name] = "1" if label == "B" else "0"
     if label not in _K31_AB["logged"]:
         _K31_AB["logged"].add(label)
-        logger.info("K31_AB_LABEL_ACTIVE label=%s %s=%s", label, k31_ab_env(), os.environ[k31_ab_env()])
+        logger.info("K31_AB_LABEL_ACTIVE label=%s %s=%s", label, k31_ab_env(),
+                    "1" if label == "B" else "0")
 
 
 def k31_ab_graph(default, dual):
@@ -199,19 +222,21 @@ def k31_ab_graph(default, dual):
 
 def capture_dual(build):
     """build() -> graph; returns {'A': ..., 'B': ...} captured with the switch at 0 / 1."""
-    name = k31_ab_env()
-    saved = os.environ.get(name)
+    names = k31_ab_envs()
+    saved = {name: os.environ.get(name) for name in names}
     out = {}
     try:
         for label, value in (("A", "0"), ("B", "1")):
-            os.environ[name] = value
+            for name in names:
+                os.environ[name] = value
             out[label] = build()
     finally:
-        if saved is None:
-            os.environ.pop(name, None)
-        else:
-            os.environ[name] = saved
-    logger.info("K31_AB_DUAL_PREWARM %s: A=0 B=1 (two graph sets, shared static inputs)", name)
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    logger.info("K31_AB_DUAL_PREWARM %s: A=0 B=1 (two graph sets, shared static inputs)", names)
     return out
 
 
@@ -252,7 +277,7 @@ def agg_eligible(batch):
 
 
 def install_contracts(forward_cls, schedule_cls, backend_cls, handoff_cls, *, agg_mode=False,
-                      workspace_limits=None, overlap=None):
+                      workspace_limits=None, overlap=None, shallow=False):
     """Select the track extent before backend metadata and ring ownership exist."""
     if getattr(forward_cls, "_pfactor_agg_contract_installed", False):
         return
@@ -262,7 +287,7 @@ def install_contracts(forward_cls, schedule_cls, backend_cls, handoff_cls, *, ag
     legacy_metadata = backend_cls.init_forward_metadata
     legacy_send = handoff_cls.before_send
     native_send = inspect.unwrap(legacy_send)
-    if not agg_mode and (native_track is legacy_track or native_send is legacy_send):
+    if not agg_mode and not shallow and (native_track is legacy_track or native_send is legacy_send):
         raise ValueError("P48 AGG contract requires the frozen factor-only wrappers")
 
     control = os.environ.get(K42_CONTROL) if agg_mode else None
@@ -270,6 +295,8 @@ def install_contracts(forward_cls, schedule_cls, backend_cls, handoff_cls, *, ag
     def select(batch):
         selected = (agg_enabled() and agg_eligible(batch) if agg_mode
                     else enabled() and eligible(batch))
+        if shallow and _PD_MICRO_ROUTE == "0n":
+            selected = False
         if selected and control is not None and "n" in _control_route(control):
             selected = False  # debug in-process A/B: original route for this batch
         if selected and workspace_limits is not None:
@@ -286,7 +313,13 @@ def install_contracts(forward_cls, schedule_cls, backend_cls, handoff_cls, *, ag
             from .gdn_fulln_overlap import track_selection
             with track_selection(req, selected):
                 return (native_track if selected else legacy_track)(batch, req)
-        req._pfactor_agg_contract = selected
+        # Deep emitters stop at N-1, so their reusable checkpoint cannot be N.
+        # Both sides retain the original common N-1 radix donation extent.
+        req._pfactor_agg_contract = selected and not shallow
+        if shallow:
+            result = legacy_track(batch, req)
+            req._pfactor_agg_contract = selected
+            return result
         return (native_track if selected else legacy_track)(batch, req)
 
     @wraps(legacy_track)
@@ -372,7 +405,39 @@ def install_contracts(forward_cls, schedule_cls, backend_cls, handoff_cls, *, ag
             batch.fulln_overlap_record = record if selected else None
             result.fulln_overlap_record = record if selected else None
         result._pfactor_agg_contract = selected
-        if not agg_mode and result.forward_mode.is_extend():
+        if shallow and selected and result.mamba_track_seqlens is not None:
+            # N-1 may be chunk-aligned. The shallow kernel runs N tokens, so
+            # that checkpoint must come from h, never its final S_N. Keep the
+            # original encoding for the deep emitter, which really ends N-1.
+            base = result.mamba_track_seqlens
+            chunk = getattr(model_runner.model.config, "mamba_chunk_size", 64)
+            # The legacy tracker may already use +1 to name an h checkpoint.
+            # Decode its actual depth before choosing either side's source;
+            # blindly forwarding that encoding can index h past a deep N-1
+            # sequence whose checkpoint is exactly its final state.
+            depth = result.extend_prefix_lens + (
+                (base - result.extend_prefix_lens) // chunk) * chunk
+            final = base.new_tensor([
+                int(req.extend_range.end >= len(req.origin_input_ids))
+                for req in batch.reqs])
+            emitter_end = result.seq_lens - final
+            mask = result.mamba_track_mask
+            result._pd_fulln_emitter_track_seqlens = torch.where(
+                mask, depth + (depth != emitter_end).to(base.dtype), base)
+            result.mamba_track_seqlens = torch.where(
+                mask, depth + (depth != result.seq_lens).to(base.dtype), base)
+            # Legacy aligned S_(N-1) was an fp32 final state. The ordinary
+            # intermediate h is bf16, so selecting h alone changes the cache
+            # bytes. Snapshot that boundary in fp32 without changing h/output.
+            fp32_rows = [
+                req.extend_range.end == len(req.origin_input_ids)
+                and req.extend_range.end - 1 == req.kv.mamba_last_track_seqlen
+                and (req.extend_range.length - 1) % chunk == 0
+                for req in batch.reqs]
+            result._pd_fulln_fp32_track_mask = (
+                mask & base.new_tensor(fp32_rows, dtype=torch.bool)
+                if any(fp32_rows) else None)
+        if not agg_mode and not shallow and result.forward_mode.is_extend():
             result.pd_factor_only_full_batch = True
             result._pfactor_legacy_mixed = result.forward_mode.is_mixed()
             if result._pfactor_legacy_mixed:
@@ -420,15 +485,22 @@ def install(runner):
     owner = runner.model
     role = runner.server_args.disaggregation_mode
     agg_mode = role == "null"
+    shallow = getattr(owner, "pd_shallow_role", None) == "prefill"
+    shallow_fulln = shallow and os.environ.get("SGLANG_GDN_PD_SHALLOW_FULLN") == "1"
     if agg_mode:
         if not agg_enabled():
             return
     elif (role != "prefill" or os.environ.get(FLAG, "1") != "1"
-          or os.environ.get("TWINSTAR_PD_FACTOR_ONLY_TAIL") != "1"
-          or getattr(owner, "pd_shallow_role", None) == "prefill"):
+          or (not shallow_fulln and os.environ.get("TWINSTAR_PD_FACTOR_ONLY_TAIL") != "1")
+          or (shallow and not shallow_fulln)):
         return
     if getattr(owner, "_pfactor_agg_installed", False):
         return
+    if shallow_fulln and getattr(owner, "pd_trunk_prefill_graph", False):
+        # That runner explicitly rebuilds ForwardBatch and does not carry the
+        # current deep encoding / fp32 snapshot policy. The qualified P recipe
+        # uses eager trunk + the separate whole-emitter graph.
+        raise ValueError("P3 shallow full-N requires SGLANG_FLASHNEXT_PD_TRUNK_PREFILL_GRAPH=0")
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
@@ -445,7 +517,15 @@ def install(runner):
             or pool.prefix_dense is not None or not pool.batch_prefill
             or (not agg_mode and not getattr(owner, "_exact_tail_installed", False))):
         raise ValueError("AGG contract requires the full-depth strict k31 P48 recipe")
-    if owner.fullstack:
+    if shallow_fulln:
+        if (not owner.fullstack or "duet_spec" not in owner.fullstack
+                or owner.p_layer_ids != list(range(31))
+                or list(owner.emitter_ids) != list(range(31, 48))
+                or owner.fullstack.get("gdn_rank", 0) <= 0
+                or owner.fullstack.get("gdn_every", 0) <= 0
+                or owner.fullstack_v3_latent):
+            raise ValueError("shallow full-N requires native DUET P31, 17 emitters and factored state")
+    elif owner.fullstack:
         from sglang.srt.models.flash_next_duet.pd_shallow_install import factor_only_contract
 
         factor_only_contract(owner)
@@ -507,11 +587,12 @@ def install(runner):
             publication = pool._pd_batch_publication
             # Fallback batches (original N-1 route) keep the forward-stream k31:
             # their boundary decode reads these factors inside the same forward.
-    state_dump = StateDump.from_env(pool) if agg_mode else None
+    state_dump = StateDump.from_env(pool, role)
     k42_control = os.environ.get(K42_CONTROL) if agg_mode else None
     checksum = FactorChecksum(pool) if agg_mode and os.environ.get(K42_CHECKSUM) == "1" else None
     install_contracts(ForwardBatch, ScheduleBatch, GDNAttnBackend, FactorStateHandoff,
-                      agg_mode=agg_mode, workspace_limits=workspace_limits, overlap=overlap)
+                      agg_mode=agg_mode, workspace_limits=workspace_limits, overlap=overlap,
+                      shallow=shallow_fulln)
     legacy_forward = owner.forward
     summary = FullNSummary(role, envs.SGLANG_GDN_AGG_FULLN_LOG_INTERVAL.get())
     owner._agg_fulln_summary = summary
@@ -519,7 +600,7 @@ def install(runner):
     # workers need interval=1 (or an explicit summary.log at the window boundary).
     atexit.register(summary.log)
 
-    if agg_mode:
+    if agg_mode or shallow_fulln:
         legacy_prepare = owner.prepare_forward_batch
 
         @wraps(legacy_prepare)
@@ -541,7 +622,8 @@ def install(runner):
         if not getattr(forward_batch, "_pfactor_agg_contract", False):
             output = legacy_forward(input_ids, positions, forward_batch, *args, **kwargs)
             if forward_batch.forward_mode.is_extend() or forward_batch.forward_mode.is_mixed():
-                summary.record(forward_batch.batch_size, fallback=True)
+                if not (shallow_fulln and _PD_MICRO_ROUTE == "0n"):
+                    summary.record(forward_batch.batch_size, fallback=True)
             return output
         if not (agg_eligible(forward_batch) if agg_mode else eligible(forward_batch)):
             raise RuntimeError("AGG batch contract changed after checkpoint planning")
@@ -553,6 +635,8 @@ def install(runner):
         if plan is None or getattr(pool, "_exact_tail_transaction", None) is not None:
             raise RuntimeError("AGG prefill needs one native full-N plan without a tail transaction")
         route = publication
+        if not agg_mode and _PD_MICRO_ROUTE in ("0n", "0"):
+            route = None
         if _AB_ROUTE["value"] == "forward":
             route = None  # ab_measure label A: today's forward-stream k31 for this forward
         flags = None if k42_control is None else _control_route(k42_control)
@@ -562,9 +646,16 @@ def install(runner):
         dump = state_dump if state_dump is not None and (flags is None or "d" in flags) else None
         if checksum is not None:
             checksum.drain()
-        with BatchCollector(pool, plan, graph=k31_ab_graph(pool._agg_prefill_graph,
+        collector_cls = BatchCollector
+        collector_options = {}
+        if shallow_fulln:
+            from .gdn_pd_fulln_collector import ShallowFullNCollector
+            collector_cls = ShallowFullNCollector
+            collector_options['same_extent'] = not any(owner._boundary_lens(forward_batch))
+        with collector_cls(pool, plan, graph=k31_ab_graph(pool._agg_prefill_graph,
                                                          getattr(pool, "_agg_prefill_graph_ab", None)),
-                            token_count=input_ids.shape[0], publication=route) as collector:
+                            token_count=input_ids.shape[0], publication=route,
+                            **collector_options) as collector:
             if agg_mode:
                 trunk = owner._prefill_runners["trunk"]
                 if not trunk.can_run(forward_batch):
@@ -579,6 +670,10 @@ def install(runner):
                     input_ids, hidden, owner.model.lm_head, forward_batch)
                 output.hidden_states = streams
                 owner._agg_fulln_trunk_replays += 1
+            elif shallow_fulln:
+                from sglang.srt.models.flash_next_duet.pd_shallow import prefill_extend
+                forward_batch._pd_shallow_fulln = True
+                output = prefill_extend(owner, input_ids, positions, forward_batch)
             else:
                 # PD's admitted full-N route has already selected its checkpoint
                 # extent. Reuse that collector/plan for an opt-in owner trunk;
@@ -619,14 +714,16 @@ def install(runner):
                                 done=route.transfer_event())
         elif overlap is not None:
             overlap.publish(forward_batch.fulln_overlap_record)
-        if not agg_mode and publication is not None:
+        if not agg_mode and route is not None:
             # The full-N trunk, mixer and logits have all been enqueued. The
             # side stream waits for them. Readers retain either the original
             # join or an opt-in slot/transport fence before consuming factors.
-            publication.start_after_forward()
+            route.start_after_forward()
         # The graph publishes r, with no boundary update or manual count edit.
         forward_batch.factored_prefill_boundary_steps = 0
         owner._agg_fulln_prefills += 1
+        if shallow_fulln and owner._agg_fulln_prefills == 1:
+            logger.info("GDN_PD_SHALLOW_FULLN_ACTIVE role=prefill shallow_layers=24 deep_layers=12 phase=r/r")
         summary.record(forward_batch.batch_size, trunk=agg_mode, published=collector.published)
         return output
 

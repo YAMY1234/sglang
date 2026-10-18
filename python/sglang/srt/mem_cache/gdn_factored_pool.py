@@ -1384,14 +1384,26 @@ class FactoredGDNPool:
         ):
             from .gdn_prefill_batch_graph import PrefillBatchGraph
 
-            batch = getattr(self, "_prefill_batch_graph", None)
-            if batch is None:
-                batch = self._prefill_batch_graph = PrefillBatchGraph()
-            batch.prewarm(
-                self,
-                eager=factorize_layers,
-                policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense),
-            )
+            if os.environ.get("SGLANG_GDN_K31_AB_DUAL", "0") == "1":
+                from .gdn_prefill_agg_contract import capture_dual
+
+                shared = {}
+                def build():
+                    batch = PrefillBatchGraph(shared=shared)
+                    batch.prewarm(self, eager=factorize_layers,
+                                  policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense))
+                    return batch
+                self._prefill_batch_graph_ab = capture_dual(build)
+                self._prefill_batch_graph = self._prefill_batch_graph_ab["A"]
+            else:
+                batch = getattr(self, "_prefill_batch_graph", None)
+                if batch is None:
+                    batch = self._prefill_batch_graph = PrefillBatchGraph()
+                batch.prewarm(
+                    self,
+                    eager=factorize_layers,
+                    policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense),
+                )
         if os.environ.get("SGLANG_GDN_PREFILL_CHECKPOINT_GRAPH") == "1":
             from .gdn_prefill_checkpoint_graph import CheckpointGraph
 
