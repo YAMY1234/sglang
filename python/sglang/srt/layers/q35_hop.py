@@ -92,6 +92,7 @@ def _build() -> ctypes.CDLL:
                 raise RuntimeError(f"q35_hop build failed: {res.stderr[-3000:]}")
             os.replace(tmp, lib)
     handle = ctypes.CDLL(str(lib))
+    logger.info("q35_hop: loaded %s", lib)
     if handle.q35hop_args_size() != ctypes.sizeof(_Args):
         raise RuntimeError("q35_hop Args layout mismatch")
     if handle.q35hop_oproj_args_size() != ctypes.sizeof(_OprojArgs):
