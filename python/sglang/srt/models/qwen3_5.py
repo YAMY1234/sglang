@@ -1697,6 +1697,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 mka_fused.pack_qkv(self.qkv_proj.weight.t()),
                 mka_fused.pack_o(self.o_proj.weight.t()),
             )
+            logger.warning_once("MKA fused attention prologue/epilogue enabled for target verify.")
         return True
 
     def _mka_self_attention(self, positions, hidden_states, forward_batch: ForwardBatch, backend):
