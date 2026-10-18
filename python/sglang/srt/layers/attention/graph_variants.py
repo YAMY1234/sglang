@@ -95,6 +95,7 @@ class AttentionGraphVariants(Protocol):
 class SplitKVGraphVariants:
     """Keep short sequences on stock attention without a device-to-host copy."""
 
+    min_length: int = SPLIT_KV_MIN_LENGTH
     capture_labels: ClassVar[tuple[str, ...]] = (SPLIT_KV_STOCK, SPLIT_KV_LONG)
 
     def select(self, forward_batch: ForwardBatch) -> str:
@@ -111,9 +112,18 @@ class SplitKVGraphVariants:
                 length = int(lengths[0])
         return (
             SPLIT_KV_LONG
-            if length is not None and length >= SPLIT_KV_MIN_LENGTH
+            if length is not None and length >= self.min_length
             else SPLIT_KV_STOCK
         )
+
+
+def _split_kv_min_length(is_target_verify: bool) -> int:
+    from sglang.srt.environ import envs
+
+    # SKV2 may also take target verify below 32K; the draft extend keeps the stock threshold.
+    if is_target_verify and envs.SGLANG_Q35MF_MKA_SKV2.get():
+        return envs.SGLANG_Q35MF_MKA_SKV2_VERIFY_MIN_LENGTH.get()
+    return SPLIT_KV_MIN_LENGTH
 
 
 def create_split_kv_graph_variants(
@@ -129,7 +139,9 @@ def create_split_kv_graph_variants(
             or capture_forward_mode.is_draft_extend_v2()
         )
     ):
-        return SplitKVGraphVariants()
+        return SplitKVGraphVariants(
+            min_length=_split_kv_min_length(capture_forward_mode.is_target_verify())
+        )
     return None
 
 
@@ -146,7 +158,10 @@ def use_split_kv_attention(forward_batch: ForwardBatch) -> bool:
         return variant == SPLIT_KV_LONG
     if get_is_capture_mode():
         return False
-    return SplitKVGraphVariants().select(forward_batch) == SPLIT_KV_LONG
+    variants = SplitKVGraphVariants(
+        min_length=_split_kv_min_length(forward_batch.forward_mode.is_target_verify())
+    )
+    return variants.select(forward_batch) == SPLIT_KV_LONG
 
 
 @dataclass(frozen=True)
