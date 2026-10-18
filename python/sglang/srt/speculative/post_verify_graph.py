@@ -50,6 +50,11 @@ def post_verify_graph_enabled() -> bool:
 _SPARSE_VERIFY = os.environ.get("SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING", "0") == "1"
 _SIDE_STREAM_COMMIT = os.environ.get("SGLANG_Q35MF_EDGE_SIDE_STREAM_COMMIT", "0") == "1"
 _ONE_LAUNCH_LOAD = envs.SGLANG_Q35MF_MKH_N3C.get()
+_SHARDED_IN_GRAPH = envs.SGLANG_Q35MF_D2R_PVG_SHARDED.get()
+
+
+class PostVerifySamplingView(SimpleNamespace):
+    """Batch sampling info inside the post-verify graph that the sharded verify sampler accepts."""
 
 
 def sparse_verify_max_top_k(batch) -> Optional[int]:
@@ -71,9 +76,12 @@ def _count_acceptance_calls():
     from sglang.kernels.ops.speculative import sampling as sampling_ops
     from sglang.srt.speculative import eagle_utils
 
+    from sglang.srt.speculative.sharded_verify_sampling import ShardedVerifySampler
+
     calls = [0]
     greedy_fn = eagle_utils.verify_tree_greedy_func
     tree_fn = sampling_ops.tree_speculative_sampling_target_only
+    sharded_fn = ShardedVerifySampler.run
 
     def counted(fn):
         def call(*args, **kwargs):
@@ -90,6 +98,8 @@ def _count_acceptance_calls():
 
         local_fn = local_ops.sample_chain_full_vocab
         local_ops.sample_chain_full_vocab = counted(local_fn)
+    # The sharded sampler decides acceptance inside its own kernels.
+    ShardedVerifySampler.run = counted(sharded_fn)
     try:
         yield calls
     finally:
@@ -97,6 +107,7 @@ def _count_acceptance_calls():
         sampling_ops.tree_speculative_sampling_target_only = tree_fn
         if eagle_utils._LOCAL_VERIFY_SAMPLING:
             local_ops.sample_chain_full_vocab = local_fn
+        ShardedVerifySampler.run = sharded_fn
 
 
 class _Slot:
@@ -242,6 +253,7 @@ class PostVerifyGraph:
         topk,
         token_to_kv_pool_allocator,
     ):
+        from sglang.srt.layers.logits_processor import verify_logits_on_shards
         from sglang.srt.speculative.spec_utils import SIMULATE_ACC_LEN
 
         info = batch.sampling_info
@@ -272,6 +284,11 @@ class PostVerifyGraph:
             )
             is not None
             or not logits_output.next_token_logits.is_cuda
+            or (
+                _SHARDED_IN_GRAPH
+                and batch.return_logprob
+                and verify_logits_on_shards(logits_output.next_token_logits)
+            )
         ):
             return None
         return (
@@ -577,7 +594,7 @@ class PostVerifyGraph:
     @staticmethod
     def _views(x, batch, verify_input):
         info = batch.sampling_info
-        info_view = SimpleNamespace(
+        view_fields = dict(
             acc_additive_penalties=None,
             acc_scaling_penalties=None,
             logit_bias=None,
@@ -591,6 +608,14 @@ class PostVerifyGraph:
             need_min_p_sampling=False,
             sampling_seed=None,
         )
+        if _SHARDED_IN_GRAPH:
+            info_view = PostVerifySamplingView(
+                vocab_size=info.vocab_size,
+                has_custom_logit_processor=info.has_custom_logit_processor,
+                **view_fields,
+            )
+        else:
+            info_view = SimpleNamespace(**view_fields)
         batch_view = SimpleNamespace(
             device=batch.device,
             forward_mode=batch.forward_mode,

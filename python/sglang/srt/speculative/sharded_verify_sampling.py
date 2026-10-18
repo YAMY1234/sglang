@@ -400,7 +400,12 @@ class ShardedVerifySampler:
 
     def eligible_reason(self, *, logits, sampling_info, verify_input, batch, grammar_mask, watermark_state,
                         use_rejection_sampling, uno_target_max_top_k) -> Optional[str]:
-        if torch.cuda.is_current_stream_capturing():
+        from sglang.srt.speculative.post_verify_graph import PostVerifySamplingView
+
+        # The post-verify graph captures this sampler on purpose; other captures gather.
+        if torch.cuda.is_current_stream_capturing() and not isinstance(
+            sampling_info, PostVerifySamplingView
+        ):
             return "inside a graph capture"
         if logits.shape[-1] * self.world != sampling_info.vocab_size:
             return "shards do not tile the vocabulary"

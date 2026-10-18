@@ -728,8 +728,11 @@ def _sample_on_vocab_shards(
     from sglang.srt.speculative import sharded_verify_sampling
 
     sampler = sharded_verify_sampling.get_sampler()
-    # Graph-capture helpers pass a namespace stand-in for the batch sampling info.
-    if not isinstance(sampling_info, SamplingBatchInfo):
+    from sglang.srt.speculative.post_verify_graph import PostVerifySamplingView
+
+    # Graph-capture helpers pass a namespace stand-in for the batch sampling info; the
+    # post-verify graph's PostVerifySamplingView carries every field the sharded sampler reads.
+    if not isinstance(sampling_info, (SamplingBatchInfo, PostVerifySamplingView)):
         sampler.count("gathered", candidates.shape[0])
         return None, False
     reason = sampler.eligible_reason(

@@ -578,6 +578,9 @@ class Envs:
     SGLANG_Q35MF_K4_LOCAL_VERIFY_SAMPLING = EnvBool(False)
     # Largest row count (draft-step or draft-extend batch) that uses the vocab exchange.
     SGLANG_Q35MF_DRAFT_VOCAB_EXCHANGE_MAX_ROWS = EnvInt(2)
+    # With the post-verify graph: sample shard-local verify logits inside the graph (the sharded
+    # sampler above) instead of gathering them; batches that return logprobs keep the eager chain.
+    SGLANG_Q35MF_D2R_PVG_SHARDED = EnvBool(False)
     # Row-split MTP fc for draft-width batches: each rank multiplies its input-column
     # slice (one normalized half); fp32 partials are gathered and summed in rank order.
     SGLANG_Q35MF_DRAFT_FC_SPLIT = EnvBool(False)
