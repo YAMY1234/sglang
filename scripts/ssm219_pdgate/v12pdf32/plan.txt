@@ -1,0 +1,13 @@
+# docs/222 §23 fp32-factor 1P:1D row on LHR (lead 19:3x): N3 {S, C+f32c, C+k15}, one window per C, 900 s; placement
+# order per C = the v12pd row's with C+ -> C+f32c and PC+ -> C+k15 (same node groups); time = docs/214 per C.
+# The canary is the full 900 s C8 window (reduce_ladder.py asserts 900 s).
+# <C> <variants in placement order> <time>
+8  "C+k15 S C+f32c" 01:20:00
+16 "S C+f32c C+k15" 01:20:00
+24 "C+f32c C+k15 S" 01:20:00
+32 "C+f32c C+k15 S" 01:20:00
+40 "C+k15 S C+f32c" 01:20:00
+48 "S C+f32c C+k15" 01:20:00
+56 "C+f32c C+k15 S" 01:25:00
+64 "C+k15 S C+f32c" 01:30:00
+96 "S C+f32c C+k15" 01:30:00
