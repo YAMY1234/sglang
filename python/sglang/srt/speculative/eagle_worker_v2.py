@@ -81,6 +81,7 @@ from sglang.srt.speculative.dp_spec_prefill_coordination import (
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.draft_hot_vocab import DraftHotVocab
 from sglang.srt.speculative.draft_vocab_exchange import DraftVocabExchange
+from sglang.srt.speculative.mkd_draft_boundary import MkdDraftBoundary
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
@@ -267,6 +268,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self._exchange_in_draft_extend = (
                 in_extend and self._draft_vocab_exchange is not None
             )
+            if envs.SGLANG_Q35MF_MKD_XCHG.get() and self._exchange_in_draft_steps:
+                mkd = MkdDraftBoundary.maybe_create(
+                    self.draft_runner.model, self._draft_vocab_exchange
+                )
+                self._draft_vocab_exchange.mkd = mkd
+                self.draft_runner.model._mkd = mkd
 
         if get_spec().speculative_use_rejection_sampling:
             target_vocab_size = self.target_worker.model_config.vocab_size

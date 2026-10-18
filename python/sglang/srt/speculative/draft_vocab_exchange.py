@@ -120,6 +120,8 @@ class DraftVocabExchange:
         self.no_tokens = torch.empty(0, dtype=torch.int64, device=dev)
         self.no_positions = torch.empty(0, dtype=torch.int64, device=dev)
         self.num_rows = 1
+        # One-launch boundary (SGLANG_Q35MF_MKD_XCHG), attached after construction.
+        self.mkd = None
         # Same guarded multimem all-gather as the logits gather; a cross-rank
         # all-reduce always sits between two draft steps' gathers.
         self.gatherer = triton_symm_mem_ag.MultimemAllGatherer(
@@ -143,7 +145,16 @@ class DraftVocabExchange:
 
     def begin_step(self, step: int, num_rows: int) -> None:
         self.num_rows = num_rows
-        self.model.draft_input_embeds = self.next_embeds[:num_rows] if step > 0 else None
+        mkd = self.mkd
+        if mkd is not None:
+            mkd.armed = num_rows == 1
+            if step == 0:
+                mkd.pending = False
+        if step > 0 and mkd is not None and mkd.pending:
+            # The model finishes the fc from the exchange; this row only carries the shape.
+            self.model.draft_input_embeds = self.next_embeds[:num_rows]
+        else:
+            self.model.draft_input_embeds = self.next_embeds[:num_rows] if step > 0 else None
         self.model.logits_processor.skip_vocab_gather_rows = self.MAX_ROWS
 
     def finish_step(
@@ -156,8 +167,21 @@ class DraftVocabExchange:
         mrope_positions: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         m = self.num_rows
-        gathered = self._pack_and_gather(local_logits, m, NAN_KEY_SPLIT_ARGMAX)
         topk_index, topk_p = self.topk_index[step][:m], self.topk_p[step][:m]
+        mkd = self.mkd
+        if mkd is not None and mkd.armed:
+            mkd.exchange(
+                local_logits,
+                topk_index,
+                topk_p,
+                draft_tokens,
+                positions,
+                draft_column,
+                mrope_positions,
+            )
+            mkd.armed = False
+            return topk_p, topk_index
+        gathered = self._pack_and_gather(local_logits, m, NAN_KEY_SPLIT_ARGMAX)
         vocab_argmax_select(
             gathered,
             topk_index,

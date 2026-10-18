@@ -185,6 +185,8 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         # Input embedding handed over by the previous greedy draft step, if any.
         self.draft_input_embeds: Optional[torch.Tensor] = None
+        # One-launch draft step boundary (SGLANG_Q35MF_MKD_XCHG), set by the spec worker.
+        self._mkd = None
 
     @staticmethod
     def _fc_split_slice(hidden_size: int) -> Optional[Tuple[bool, int, int]]:
@@ -228,6 +230,8 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
     def _split_fc(self, input_embeds, hidden_states, forward_batch):
         """fp32 partial of this rank's input-column slice, all-gathered and summed in
         rank order, rounded once to bf16 (the replicated fc's rounding points)."""
+        if self._mkd is not None and self._mkd.pending and self.draft_input_embeds is not None:
+            return self._mkd.fc()
         use_hidden, start, width = self.fc_split_slice
         x = hidden_states if use_hidden else input_embeds
         norm = self.pre_fc_norm_hidden if use_hidden else self.pre_fc_norm_embedding
@@ -371,6 +375,8 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                     forward_batch,
                     hidden_states,
                 )
+            if self._mkd is not None and self._mkd.armed:
+                self._mkd.hidden_partial(hidden_states)
         finally:
             exit_stack.close()
 

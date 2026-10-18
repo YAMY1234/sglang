@@ -580,6 +580,13 @@ class Envs:
     # Path of a sorted token-id list (torch int64 tensor); the greedy MTP draft then
     # scores only these vocabulary rows of the shared bf16 lm_head, split across TP ranks.
     SGLANG_Q35MF_SPEC_HOT_VOCAB = EnvStr(None)
+    # With the draft argmax exchange and the fc split: single-token draft steps exchange the
+    # candidate row and the hidden-half fc partials in one multicast launch, and each rank
+    # finishes the fc from the exchanged data (bitwise equal to the split fc).
+    SGLANG_Q35MF_MKD_XCHG = EnvBool(False)
+    # With SGLANG_Q35MF_MKD_XCHG: candidates carry a load-time memo of their embedding-half
+    # fc partials (summed in rank order) instead of the embedding row.
+    SGLANG_Q35MF_MKD_TTABLE = EnvBool(False)
 
     # ===================================================================
     # Memory pools and KV-cache sizing
