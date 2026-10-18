@@ -307,10 +307,11 @@ __global__ __launch_bounds__(kThreads, 1) void front_kernel(Params p) {
   // Convolution owners: warp 0 reads the weights, indices and rolling state off the projection path.
   const bool conv_reader = FuseConv && unit < 6 && warp == 0;
   const int conv_channel = unit * 256 + rank * 32 + (tid >> 2) + 8 * (tid & 3);
-  float conv_tap[4] = {};
+  // Raw BF16 until the staging write, so no thread waits on these reads before the projection.
+  __nv_bfloat16 conv_tap[4] = {};
   if (conv_reader) {
 #pragma unroll
-    for (int tap = 0; tap < 4; ++tap) conv_tap[tap] = __bfloat162float(p.conv_weight[conv_channel * 4 + tap]);
+    for (int tap = 0; tap < 4; ++tap) conv_tap[tap] = p.conv_weight[conv_channel * 4 + tap];
   }
   uint4 weights[16][2];
   const uint4* wp = p.weight + (size_t)(unit * kCluster + rank) * (8 * 16 * 2 * 32) + warp * 1024 + lane;
@@ -367,11 +368,11 @@ __global__ __launch_bounds__(kThreads, 1) void front_kernel(Params p) {
   const bool feature_owner = FuseConv && unit < 6;
   const bool owner = feature_owner || rank < p.m;
   const bool conv_valid = conv_reader && conv_slot != p.pad_slot;
-  float conv_old[3] = {};
+  __nv_bfloat16 conv_old[3] = {};
   if (conv_valid) {
     const int64_t base = conv_slot * p.state_stride[0] + conv_channel * p.state_stride[1];
 #pragma unroll
-    for (int j = 0; j < 3; ++j) conv_old[j] = __bfloat162float(p.conv_state[base + j * p.state_stride[2]]);
+    for (int j = 0; j < 3; ++j) conv_old[j] = p.conv_state[base + j * p.state_stride[2]];
   }
   const unsigned bytes = feature_owner ? kCluster * p.m * 32 * sizeof(float)
                                         : kCluster * 256 * sizeof(float);
@@ -392,9 +393,9 @@ __global__ __launch_bounds__(kThreads, 1) void front_kernel(Params p) {
   if (!owner) return;
   if (conv_reader) {
 #pragma unroll
-    for (int j = 0; j < 3; ++j) conv_stage[lane][j] = conv_old[j];
+    for (int j = 0; j < 3; ++j) conv_stage[lane][j] = __bfloat162float(conv_old[j]);
 #pragma unroll
-    for (int j = 0; j < 4; ++j) conv_stage[lane][3 + j] = conv_tap[j];
+    for (int j = 0; j < 4; ++j) conv_stage[lane][3 + j] = __bfloat162float(conv_tap[j]);
     if (lane == 0) {
       conv_meta[0] = conv_slot != p.pad_slot;
       conv_meta[1] = conv_slot;
