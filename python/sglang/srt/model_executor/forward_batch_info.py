@@ -1656,10 +1656,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     )
             mrope_positions_list[batch_idx] = mrope_positions
 
-        self.mrope_positions = torch.cat(
-            mrope_positions_list,
-            dim=1,
-        ).to(dtype=torch.int64, device=model_runner.device, non_blocking=True)
+        mrope_positions = torch.cat(mrope_positions_list, dim=1)
+        if envs.SGLANG_Q35MF_PPO.get() and is_pin_memory_available(model_runner.device):
+            # A pageable copy this size blocks the host until the forward stream drains.
+            mrope_positions = mrope_positions.to(torch.int64).pin_memory()
+        self.mrope_positions = mrope_positions.to(
+            dtype=torch.int64, device=model_runner.device, non_blocking=True
+        )
 
     def _pad_tensor_to_size(self, tensor: torch.Tensor, size: int, *, value: int = 0):
         if value == 0:
