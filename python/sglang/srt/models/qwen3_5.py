@@ -539,10 +539,28 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             and get_parallel().pp_size == 1
         )
         self._fused_verify_buffers = None
+        self._fused_verify_ba_enabled = (
+            self._fused_verify_enabled and envs.SGLANG_Q35MF_MKG_BA_TC.get()
+        )
+        self._fused_verify_mkm_front = (
+            self._fused_verify_ba_enabled and envs.SGLANG_Q35MF_MKM_GDN_FRONT.get()
+        )
         if self._fused_verify_enabled:
             from sglang.kernels.ops.attention.gdn_pdl_front import ensure_built
 
             ensure_built()
+            if self._fused_verify_ba_enabled:
+                from sglang.kernels.ops.attention.gdn_pdl_front_ba import (
+                    ensure_built as ensure_ba_built,
+                )
+
+                ensure_ba_built()
+            if self._fused_verify_mkm_front:
+                from sglang.kernels.ops.attention.gdn_pdl_front_ba_mkm import (
+                    ensure_built as ensure_mkm_front_built,
+                )
+
+                ensure_mkm_front_built()
             self._derived_weight_cache_error = (
                 "Online weight updates are unsupported with the packed GDN "
                 "projection cache. Restart the worker to reload projection weights."
@@ -1085,6 +1103,20 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         from sglang.kernels.ops.attention.gdn_pdl_front import front, pack
         from sglang.kernels.ops.attention.gdn_pdl_norm import norm
 
+        use_fused_ba = (
+            self._fused_verify_ba_enabled
+            and isinstance(self.in_proj_ba.quant_method, UnquantizedLinearMethod)
+            and self.in_proj_ba.bias is None
+            and self.in_proj_ba.weight.dtype == torch.bfloat16
+            and self.in_proj_ba.weight.shape == (16, 4096)
+            and self.in_proj_ba.weight.is_contiguous()
+        )
+        if use_fused_ba:
+            from sglang.kernels.ops.attention.gdn_pdl_front_ba import front
+        use_mkm_front = use_fused_ba and self._fused_verify_mkm_front
+        if use_mkm_front:
+            from sglang.kernels.ops.attention.gdn_pdl_front_ba_mkm import front
+
         source = self.in_proj_qkvz.weight.data_ptr()
         buffers = self._fused_verify_buffers
         if buffers is None or buffers["source"] != source:
@@ -1108,11 +1140,35 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             }
             self._fused_verify_buffers = buffers
             logger.info("Fused GDN projection/Conv1D enabled for layer %s", self.layer_id)
+        if use_fused_ba and "ba" not in buffers:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("Fused GDN b/a output must be prepared before capture")
+            buffers["ba"] = hidden_states.new_empty((7, 16))
+            logger.info("Fused GDN BF16 b/a enabled for layer %s", self.layer_id)
 
         def projection_conv(conv_states, windows, state_indices, replay_indices):
             current_stream = torch.cuda.current_stream()
-            if self.alt_stream is not None:
+            if self.alt_stream is not None and not use_fused_ba:
                 self.alt_stream.wait_stream(current_stream)
+            ba_args = (
+                {
+                    "original_bf16": hidden_states,
+                    "ba_weight": self.in_proj_ba.weight,
+                    "ba_out": buffers["ba"],
+                }
+                if use_fused_ba
+                else {}
+            )
+            if use_mkm_front:
+                # L2 prefetch hint for the verify core's checkpoint (physical slot) and history ring
+                # (request slot), the same tensors and indices the backend passes to the core.
+                ba_args.update(
+                    checkpoint=cache.temporal,
+                    history_d=cache.replayssm_d,
+                    history_k=cache.replayssm_k,
+                    history_g=cache.replayssm_g,
+                    ring_indices=forward_batch.req_pool_indices[:1],
+                )
             front(
                 hidden_states,
                 buffers["weight"],
@@ -1127,8 +1183,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 buffers["conv"],
                 buffers["error"],
                 pad_slot=backend.pad_slot_id,
+                **ba_args,
             )
-            if self.alt_stream is not None:
+            if use_fused_ba:
+                ba = buffers["ba"]
+            elif self.alt_stream is not None:
                 with torch.cuda.stream(self.alt_stream):
                     ba = self.in_proj_ba(hidden_states)[0]
                 current_stream.wait_stream(self.alt_stream)
