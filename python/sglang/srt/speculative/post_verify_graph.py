@@ -78,14 +78,16 @@ def _count_acceptance_calls():
 
     from sglang.srt.speculative.sharded_verify_sampling import ShardedVerifySampler
 
-    calls = [0]
+    # [acceptance calls, of which sharded sampler runs]
+    calls = [0, 0]
     greedy_fn = eagle_utils.verify_tree_greedy_func
     tree_fn = sampling_ops.tree_speculative_sampling_target_only
     sharded_fn = ShardedVerifySampler.run
 
-    def counted(fn):
+    def counted(fn, sharded=False):
         def call(*args, **kwargs):
             calls[0] += 1
+            calls[1] += int(sharded)
             return fn(*args, **kwargs)
 
         return call
@@ -99,7 +101,7 @@ def _count_acceptance_calls():
         local_fn = local_ops.sample_chain_full_vocab
         local_ops.sample_chain_full_vocab = counted(local_fn)
     # The sharded sampler decides acceptance inside its own kernels.
-    ShardedVerifySampler.run = counted(sharded_fn)
+    ShardedVerifySampler.run = counted(sharded_fn, sharded=True)
     try:
         yield calls
     finally:
@@ -286,7 +288,7 @@ class PostVerifyGraph:
             or not logits_output.next_token_logits.is_cuda
             or (
                 _SHARDED_IN_GRAPH
-                and batch.return_logprob
+                and (batch.return_logprob or info.has_custom_logit_processor)
                 and verify_logits_on_shards(logits_output.next_token_logits)
             )
         ):
@@ -316,6 +318,9 @@ class PostVerifyGraph:
             x["temperatures"] = info.temperatures
             x["top_ks"] = info.top_ks
             x["top_ps"] = info.top_ps
+        elif _SHARDED_IN_GRAPH:
+            # The sharded sampler reads a temperature for every row, greedy batches included.
+            x["temperatures"] = info.temperatures
         if batch.mamba_track_indices is not None:
             x["mamba_track_indices"] = batch.mamba_track_indices
         return x
@@ -529,10 +534,11 @@ class PostVerifyGraph:
         slot.graph = graph
         slot.outputs = outputs
         logger.info(
-            "Captured post-verify graph for bs=%d key=%s side_commit=%s",
+            "Captured post-verify graph for bs=%d key=%s side_commit=%s sharded_sampler=%s",
             len(batch.seq_lens),
             key,
             slot.commit_graph is not None,
+            acceptance_calls[1] > 0,
         )
 
     def _body(
