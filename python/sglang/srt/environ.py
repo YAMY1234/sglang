@@ -1541,6 +1541,9 @@ class Envs:
     # Reduction warps the MNNVL CuTe DSL HT presets prefer when re-targeted to an unshipped
     # shape (0 = the preset's own); they only split the work, outputs are bit-identical.
     SGLANG_Q35MF_MKH_HT_REDUCTION_WARPS = EnvInt(0)
+    # Prefill batch prep issues its index / scalar writes as stream-ordered GPU ops instead of
+    # blocking ones, so the scheduler stops waiting for the in-flight decode round (same values).
+    SGLANG_Q35MF_MKH_PREP_NOSYNC = EnvBool(False)
 
     # ===================================================================
     # Multimodal processing
