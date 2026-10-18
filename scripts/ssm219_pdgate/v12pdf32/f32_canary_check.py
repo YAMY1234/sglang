@@ -1,4 +1,5 @@
-"""docs/222 §23 C8 canary verdict (pre-registered before the canary runs): python3 f32_canary_check.py <runs dir> <job>
+"""docs/222 §23 C8 canary verdict (pre-registered before the canary runs): python3 f32_canary_check.py <runs dir> <job> [n2]
+n2 (docs/222 §24): the N2 {S, PC+f32c} window; PCpf32c is checked as Cpf32c, plus P0 GDN_PD_SHALLOW_FULLN_ACTIVE >= 1.
 
 Per arm (run dir runs/j<job>-<label>):
   all     : complete.json (reducer cell: N > 0, tps_gpu > 0, user_p90 > 0); lead-prewindow-admission.json passed.
@@ -28,9 +29,9 @@ def log_of(run, role):
     return None, ''
 
 
-def main(runs, job):
-    out = dict(job=job, arms={}, verdict='PASS', notes=[])
-    for lab in ('S', 'Cpf32c', 'Cpk15'):
+def main(runs, job, kind='n3'):
+    out = dict(job=job, kind=kind, arms={}, verdict='PASS', notes=[])
+    for lab in (('S', 'Cpf32c', 'Cpk15') if kind == 'n3' else ('S', 'PCpf32c')):
         run = Path(runs) / f'j{job}-{lab}'
         a = dict(run=str(run), fails=[])
         c = run / 'complete.json'
@@ -57,21 +58,26 @@ def main(runs, job):
                 a[f'{role}_active'] = {k: sum(k in l for l in lines) for k in ACT}
                 a[f'{role}_build_failed'] = sum('BUILD_FAILED' in l for l in lines)
                 a[f'{role}_traceback'] = sum('Traceback' in l for l in lines)
-                dt = 'dtype=fp32' if lab == 'Cpf32c' else 'dtype=fp16'
-                fl = 'factors float32' if lab == 'Cpf32c' else 'factors float16'
+                dt = 'dtype=fp16' if lab == 'Cpk15' else 'dtype=fp32'
+                fl = 'factors float16' if lab == 'Cpk15' else 'factors float32'
                 pool = [l for l in lines if 'Factored GDN pool allocated' in l]
                 if not pool or not all(dt in l and fl in l for l in pool):
                     a['fails'].append(f'{role}0 pool line not {dt} / {fl}')
                 if a[f'{role}_build_failed'] or a[f'{role}_traceback']:
                     a['fails'].append(f'{role}0 BUILD_FAILED / Traceback')
             d = a['D_active']
-            if lab == 'Cpf32c':
+            if lab == 'PCpf32c':
+                path, log = log_of(run, 'P')
+                a['P_shallow_fulln'] = sum('GDN_PD_SHALLOW_FULLN_ACTIVE' in l for l in log.splitlines())
+                if a['P_shallow_fulln'] < 1:
+                    a['fails'].append('P0 lacks GDN_PD_SHALLOW_FULLN_ACTIVE')
+            if lab in ('Cpf32c', 'PCpf32c'):
                 for k in ACT:
                     if d[k] < 1:
                         a['fails'].append(f'D0 lacks {k}')
                 if a['P_active']['FACTORED_CUDA_FP32_ACTIVE step'] + a['P_active']['FACTORED_CUDA_FP32_ACTIVE expiry'] == 0:
                     a['P_FP32_ACTIVE_ABSENT'] = True
-                    out['notes'].append('Cpf32c P0 has no FACTORED_CUDA_FP32_ACTIVE line (expected: P is prefill-only); '
+                    out['notes'].append(f'{lab} P0 has no FACTORED_CUDA_FP32_ACTIVE line (expected: P is prefill-only); '
                                         'lead 19:3x criterion on P not met -> lead rules')
             else:
                 for k in ACT[2:]:
@@ -82,10 +88,10 @@ def main(runs, job):
         out['arms'][lab] = a
         if a['fails']:
             out['verdict'] = 'FAIL'
-    if out['verdict'] == 'PASS' and out['arms']['Cpf32c'].get('P_FP32_ACTIVE_ABSENT'):
+    if out['verdict'] == 'PASS' and any(a.get('P_FP32_ACTIVE_ABSENT') for a in out['arms'].values()):
         out['verdict'] = 'PASS_D__P_FP32_ACTIVE_ABSENT_LEAD_RULES'
     print(json.dumps(out, indent=1))
 
 
 if __name__ == '__main__':
-    main(sys.argv[1], sys.argv[2])
+    main(sys.argv[1], sys.argv[2], *(sys.argv[3:4] or ['n3']))
