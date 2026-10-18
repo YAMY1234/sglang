@@ -1024,6 +1024,9 @@ class Envs:
     SGLANG_Q35MF_ATTN_SPLIT_KV = EnvBool(False)
     # Fused full-attention prologue / epilogue kernels for TP8 bs1 MTP verify (Qwen3.5 FP8 projections).
     SGLANG_Q35MF_MKA_FUSED = EnvBool(False)
+    # With SGLANG_Q35MF_MKA_FUSED, SGLANG_Q35MF_MKH_HOP and SGLANG_Q35MF_MKH_OPROJ: the fused o_proj pushes
+    # its partial into the q35 hop mailbox, so the attention output hop only consumes.
+    SGLANG_Q35MF_MKA_PUSH = EnvBool(False)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
 
     # ===================================================================

@@ -28,8 +28,9 @@ def _ext():
                     extra_cuda_cflags=[
                         "-O3",
                         "--std=c++17",
-                        f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}",
+                        f"-gencode=arch=compute_{major}{minor}a,code=sm_{major}{minor}a",
                     ],
+                    extra_include_paths=[str(Path(__file__).resolve().parents[2] / "jit" / "include")],
                     verbose=False,
                 )
     return _EXT
@@ -91,5 +92,6 @@ def prologue(
     )
 
 
-def epilogue(attn, gate, w_packed, sx, sw, out, nq: int):
-    _ext().epilogue(attn, gate, w_packed, sx, sw, out, nq, True)
+def epilogue(attn, gate, w_packed, sx, sw, out, nq: int, site: list[int] | None = None):
+    """site: [mc, uc, ctrl, rank, world, m_cap, timeout_ns] of the q35 hop workspace to push into."""
+    _ext().epilogue(attn, gate, w_packed, sx, sw, out, nq, True, site or [])
