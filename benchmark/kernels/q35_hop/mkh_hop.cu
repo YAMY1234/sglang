@@ -727,8 +727,9 @@ __global__ void __launch_bounds__(kThreads) fused_kernel(Params p) {
   hop_end(p, hs);
 }
 
-// Finalize-publish with 4 bf16 per thread (8 CTAs x 128 threads per token).
-template <int W>
+// Finalize-publish with 4 bf16 per thread (8 CTAs x 128 threads per token). V4: lane pairs combine
+// their halves with a shuffle and the even lane pushes the whole 16-B fragment.
+template <int W, bool V4>
 __global__ void __launch_bounds__(kThreads) publish_fin_quad_kernel(Params p) {
   __shared__ int32_t meta_rows[16];
   __shared__ float meta_wts[16];
@@ -767,8 +768,19 @@ __global__ void __launch_bounds__(kThreads) publish_fin_quad_kernel(Params p) {
     for (int e = 0; e < 4; ++e) acc[e] = __fadd_rn(acc[e], f[e]);
   }
   uint2 v = make_uint2(sanitize_word(pack_bf16x2(acc[0], acc[1])), sanitize_word(pack_bf16x2(acc[2], acc[3])));
-  uint16_t* dst = static_cast<uint16_t*>(p.mb_mc) + mb_off(p, stage, p.rank, token, quad >> 1) + (quad & 1) * 4;
-  asm volatile("multimem.st.relaxed.sys.global.v2.bf16x2 [%0], {%1,%2};" ::"l"(dst), "r"(v.x), "r"(v.y) : "memory");
+  if (V4) {
+    const uint32_t hx = __shfl_xor_sync(0xffffffffu, v.x, 1);
+    const uint32_t hy = __shfl_xor_sync(0xffffffffu, v.y, 1);
+    if ((quad & 1) == 0) {
+      uint16_t* dst = static_cast<uint16_t*>(p.mb_mc) + mb_off(p, stage, p.rank, token, quad >> 1);
+      asm volatile("multimem.st.relaxed.sys.global.v4.bf16x2 [%0], {%1,%2,%3,%4};" ::"l"(dst), "r"(v.x), "r"(v.y),
+                   "r"(hx), "r"(hy)
+                   : "memory");
+    }
+  } else {
+    uint16_t* dst = static_cast<uint16_t*>(p.mb_mc) + mb_off(p, stage, p.rank, token, quad >> 1) + (quad & 1) * 4;
+    asm volatile("multimem.st.relaxed.sys.global.v2.bf16x2 [%0], {%1,%2};" ::"l"(dst), "r"(v.x), "r"(v.y) : "memory");
+  }
   if (!p.early_trigger) pdl_trigger();
 }
 
@@ -1101,7 +1113,8 @@ enum Variant : int {
   kPublish = 13,     // split hop: push the global partial
   kPublishFin = 14,  // split hop: finalize + push
   kFused = 15,       // consume hop k and produce hop k+1 in one launch
-  kPublishFinQuad = 16
+  kPublishFinQuad = 16,
+  kPublishFinQuad4 = 17  // finalize-publish, 4 bf16 per thread, 16-B pushes
 };
 
 template <typename K>
@@ -1153,7 +1166,8 @@ static int dispatch(int variant, int order, const Params& p, cudaStream_t s) {
     case kProdPlain: return launch(prod_kernel<W, false, false>, p, s, false);
     case kPublish: return launch(publish_kernel<W, false>, p, s, false);
     case kPublishFin: return launch(publish_kernel<W, true>, p, s, false);
-    case kPublishFinQuad: return launch(publish_fin_quad_kernel<W>, p, s, false, 8);
+    case kPublishFinQuad: return launch(publish_fin_quad_kernel<W, false>, p, s, false, 8);
+    case kPublishFinQuad4: return launch(publish_fin_quad_kernel<W, true>, p, s, false, 8);
     case kConsume: MKH_BY_ORDER(return launch(consume_kernel<W, SQ, WR>, p, s, true))
     case kFused: MKH_BY_ORDER(return launch(fused_kernel<W, SQ, WR>, p, s, true))
     case kLdr1: MKH_BY_ORDER(return launch(ldr1_kernel<SQ, WR>, p, s, true))
