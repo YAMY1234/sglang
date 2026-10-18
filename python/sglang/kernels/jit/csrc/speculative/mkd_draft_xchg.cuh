@@ -71,17 +71,6 @@ SGL_DEVICE uint64_t now_ns() {
   return t;
 }
 
-SGL_DEVICE uint32_t poll(const uint64_t* addr, uint32_t tag) {
-  uint64_t w;
-  uint32_t n = 0;
-  while (true) {
-    asm volatile("ld.relaxed.sys.global.u64 %0, [%1];" : "=l"(w) : "l"(addr) : "memory");
-    if (static_cast<uint32_t>(w >> 32) == tag) break;
-    if (++n > kSpinLimit) __trap();
-  }
-  return static_cast<uint32_t>(w);
-}
-
 }  // namespace mkd_xchg
 
 struct MkdXchgParams {
@@ -160,11 +149,9 @@ __global__ void __launch_bounds__(kThreads) mkd_xchg_kernel(const MkdXchgParams 
   // The fc launch behind us only prefetches static weights before its own wait.
   PDLTriggerSecondary<kUsePDL>();
   const uint64_t t_wait = mkd_xchg::now_ns();
-  if (threadIdx.x == 0) {
-    uint32_t e;
-    asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(e) : "l"(p.epoch) : "memory");
-    s_tag = e;
-  }
+  // Read the epoch now, publish it after the scan: the load overlaps the logits loads.
+  uint32_t epoch = 0;
+  if (threadIdx.x == 0) asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(epoch) : "l"(p.epoch) : "memory");
 
   // Shard argmax, ties to the lowest local row; hot positions order like vocabulary ids.
   // Fast pass on packed 16-bit order keys (exact for NaN-free shards, see packed_key); a shard
@@ -204,14 +191,11 @@ __global__ void __launch_bounds__(kThreads) mkd_xchg_kernel(const MkdXchgParams 
     s_v[warp] = best;
     s_i[warp] = static_cast<int32_t>(nan_any);
   }
+  if (threadIdx.x == 0) s_tag = epoch;
   __syncthreads();
-  best = s_v[0];
-  nan_any = static_cast<uint32_t>(s_i[0]);
-#pragma unroll
-  for (int w = 1; w < kWarps; ++w) {
-    best = max(best, s_v[w]);
-    nan_any |= static_cast<uint32_t>(s_i[w]);
-  }
+  static_assert(kWarps <= 32);
+  best = __reduce_max_sync(0xffffffffu, lane < kWarps ? s_v[lane] : 0u);
+  nan_any = __reduce_or_sync(0xffffffffu, lane < kWarps ? static_cast<uint32_t>(s_i[lane]) : 0u);
   int32_t bidx = static_cast<int32_t>(0xffffu - (best & 0xffffu));
   const uint32_t k16 = best >> 16;
   best = (k16 << 16) | (k16 < 0x8000u ? 0xffffu : 0u);
@@ -316,11 +300,31 @@ __global__ void __launch_bounds__(kThreads) mkd_xchg_kernel(const MkdXchgParams 
         asm volatile("ld.relaxed.sys.global.u64 %0, [%1];" : "=l"(v[u]) : "l"(addr[u]) : "memory");
       }
     }
+    // Re-poll every word still missing in one batch, so the last arrivals cost one round trip.
+    uint32_t want = 0, got = 0;
+#pragma unroll
+    for (int u = 0; u < kRecvUnroll; ++u) {
+      if (w0 + u * kThreads < total) {
+        want |= 1u << u;
+        if (static_cast<uint32_t>(v[u] >> 32) == tag) got |= 1u << u;
+      }
+    }
+    for (uint32_t n = 0; got != want;) {
+      if (++n > mkd_xchg::kSpinLimit) __trap();
+#pragma unroll
+      for (int u = 0; u < kRecvUnroll; ++u) {
+        if ((want & ~got) >> u & 1u) asm volatile("ld.relaxed.sys.global.u64 %0, [%1];" : "=l"(v[u]) : "l"(addr[u]) : "memory");
+      }
+#pragma unroll
+      for (int u = 0; u < kRecvUnroll; ++u) {
+        if (((want & ~got) >> u & 1u) && static_cast<uint32_t>(v[u] >> 32) == tag) got |= 1u << u;
+      }
+    }
 #pragma unroll
     for (int u = 0; u < kRecvUnroll; ++u) {
       const int i = w0 + u * kThreads;
       if (i < total) {
-        const uint32_t x = static_cast<uint32_t>(v[u] >> 32) == tag ? static_cast<uint32_t>(v[u]) : mkd_xchg::poll(addr[u], tag);
+        const uint32_t x = static_cast<uint32_t>(v[u]);
         if (i < heads) {
           const int s = i / head, w = i % head;
           if (w == 0) {
