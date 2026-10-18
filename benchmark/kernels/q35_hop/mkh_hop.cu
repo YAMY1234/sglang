@@ -784,6 +784,55 @@ __global__ void __launch_bounds__(kThreads) publish_fin_quad_kernel(Params p) {
   if (!p.early_trigger) pdl_trigger();
 }
 
+// Finalize-publish shaped like the reference kernel: top-k fixed at compile time, every routed row
+// loaded into registers before any accumulation.
+template <int W, int TOPK>
+__global__ void __launch_bounds__(kThreads) publish_fin_k_kernel(Params p) {
+  __shared__ int32_t meta_rows[TOPK];
+  __shared__ float meta_wts[TOPK];
+  const int token = blockIdx.x;
+  const int quad = blockIdx.y * kThreads + threadIdx.x;
+  if (threadIdx.x < TOPK) {
+    const int i = token * TOPK + threadIdx.x;
+    const int r = p.permuted[i];
+    meta_rows[threadIdx.x] = r;
+    meta_wts[threadIdx.x] = r < 0 ? 0.f : __uint_as_float(static_cast<uint32_t>(p.expert_w[i]) << 16);
+  }
+  __syncthreads();
+  const size_t col = static_cast<size_t>(quad) * 4;
+  uint2 sh = make_uint2(0, 0);
+  if (p.shared != nullptr) sh = *reinterpret_cast<const uint2*>(p.shared + static_cast<size_t>(token) * kHidden + col);
+  pdl_wait();
+  const uint32_t stage = ld_volatile_u32(&p.ctrl->stage);
+  int rows[TOPK];
+#pragma unroll
+  for (int k = 0; k < TOPK; ++k) rows[k] = meta_rows[k];
+  uint2 src[TOPK];
+#pragma unroll
+  for (int k = 0; k < TOPK; ++k)
+    src[k] = rows[k] >= 0 ? *reinterpret_cast<const uint2*>(p.routed + static_cast<size_t>(rows[k]) * kHidden + col)
+                          : make_uint2(0, 0);
+  float acc[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+  for (int k = 0; k < TOPK; ++k) {
+    if (rows[k] >= 0) {
+      const float w = meta_wts[k];
+      const float f[4] = {bf_lo(src[k].x), bf_hi(src[k].x), bf_lo(src[k].y), bf_hi(src[k].y)};
+#pragma unroll
+      for (int e = 0; e < 4; ++e) acc[e] = __fadd_rn(acc[e], __fmul_rn(f[e], w));
+    }
+  }
+  if (p.shared != nullptr) {
+    const float f[4] = {bf_lo(sh.x), bf_hi(sh.x), bf_lo(sh.y), bf_hi(sh.y)};
+#pragma unroll
+    for (int e = 0; e < 4; ++e) acc[e] = __fadd_rn(acc[e], f[e]);
+  }
+  uint2 v = make_uint2(sanitize_word(pack_bf16x2(acc[0], acc[1])), sanitize_word(pack_bf16x2(acc[2], acc[3])));
+  uint16_t* dst = static_cast<uint16_t*>(p.mb_mc) + mb_off(p, stage, p.rank, token, quad >> 1) + (quad & 1) * 4;
+  asm volatile("multimem.st.relaxed.sys.global.v2.bf16x2 [%0], {%1,%2};" ::"l"(dst), "r"(v.x), "r"(v.y) : "memory");
+  pdl_trigger();
+}
+
 // Split-hop publishers for the drop-in: push this rank's partial straight from global memory
 // (hop B) or finalize the routed rows first (hop A, metadata staged before the PDL wait).
 template <int W, bool FIN>
@@ -1114,7 +1163,8 @@ enum Variant : int {
   kPublishFin = 14,  // split hop: finalize + push
   kFused = 15,       // consume hop k and produce hop k+1 in one launch
   kPublishFinQuad = 16,
-  kPublishFinQuad4 = 17  // finalize-publish, 4 bf16 per thread, 16-B pushes
+  kPublishFinQuad4 = 17,  // finalize-publish, 4 bf16 per thread, 16-B pushes
+  kPublishFinK10 = 18     // finalize-publish with top-k 10 fixed at compile time
 };
 
 template <typename K>
@@ -1168,6 +1218,7 @@ static int dispatch(int variant, int order, const Params& p, cudaStream_t s) {
     case kPublishFin: return launch(publish_kernel<W, true>, p, s, false);
     case kPublishFinQuad: return launch(publish_fin_quad_kernel<W, false>, p, s, false, 8);
     case kPublishFinQuad4: return launch(publish_fin_quad_kernel<W, true>, p, s, false, 8);
+    case kPublishFinK10: return p.top_k == 10 ? launch(publish_fin_k_kernel<W, 10>, p, s, false, 8) : -5;
     case kConsume: MKH_BY_ORDER(return launch(consume_kernel<W, SQ, WR>, p, s, true))
     case kFused: MKH_BY_ORDER(return launch(fused_kernel<W, SQ, WR>, p, s, true))
     case kLdr1: MKH_BY_ORDER(return launch(ldr1_kernel<SQ, WR>, p, s, true))

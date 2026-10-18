@@ -75,16 +75,21 @@ __device__ __forceinline__ uint4 finalize_frag(const Args& a, int token, int fra
 // flight of the fragment-wide layout; the per-element sum order is unchanged.
 constexpr int kQuadCtas = 8;
 
+// TOPK > 0 fixes top-k at compile time: every routed row is loaded into registers before any
+// accumulation (TOPK = 0 reads top_k at run time).
+template <int TOPK>
 __global__ void __launch_bounds__(kRowThreads) publish_fin_quad_kernel(Args a) {
-  __shared__ int32_t rows[kMaxTopK];
-  __shared__ float wts[kMaxTopK];
+  constexpr int kSlots = TOPK > 0 ? TOPK : kMaxTopK;
+  __shared__ int32_t rows_s[kSlots];
+  __shared__ float wts_s[kSlots];
+  const int top_k = TOPK > 0 ? TOPK : a.top_k;
   const int token = blockIdx.x;
   const int quad = blockIdx.y * kRowThreads + threadIdx.x;
-  if (threadIdx.x < a.top_k) {
-    const int i = token * a.top_k + threadIdx.x;
+  if (threadIdx.x < top_k) {
+    const int i = token * top_k + threadIdx.x;
     const int r = a.permuted[i];
-    rows[threadIdx.x] = r;
-    wts[threadIdx.x] = r < 0 ? 0.f : __uint_as_float(static_cast<uint32_t>(a.expert_w[i]) << 16);
+    rows_s[threadIdx.x] = r;
+    wts_s[threadIdx.x] = r < 0 ? 0.f : __uint_as_float(static_cast<uint32_t>(a.expert_w[i]) << 16);
   }
   __syncthreads();
   const size_t col = static_cast<size_t>(quad) * 4;
@@ -94,17 +99,22 @@ __global__ void __launch_bounds__(kRowThreads) publish_fin_quad_kernel(Args a) {
   if (a.shared != nullptr) sh = *reinterpret_cast<const uint2*>(a.shared + static_cast<size_t>(token) * kHidden + col);
   pdl_wait();
   const uint32_t stage = stage_peek(a.site);
-  uint2 src[kMaxTopK];
+  int rows[kSlots];
 #pragma unroll
-  for (int k = 0; k < kMaxTopK; ++k)
-    if (k < a.top_k && rows[k] >= 0) src[k] = *reinterpret_cast<const uint2*>(a.routed + static_cast<size_t>(rows[k]) * kHidden + col);
+  for (int k = 0; k < kSlots; ++k) rows[k] = k < top_k ? rows_s[k] : -1;
+  uint2 src[kSlots];
+#pragma unroll
+  for (int k = 0; k < kSlots; ++k)
+    src[k] = rows[k] >= 0 ? *reinterpret_cast<const uint2*>(a.routed + static_cast<size_t>(rows[k]) * kHidden + col)
+                          : make_uint2(0, 0);
   float acc[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
-  for (int k = 0; k < kMaxTopK; ++k) {
-    if (k < a.top_k && rows[k] >= 0) {
+  for (int k = 0; k < kSlots; ++k) {
+    if (rows[k] >= 0) {
+      const float w = wts_s[k];
       const float f[4] = {bf_lo(src[k].x), bf_hi(src[k].x), bf_lo(src[k].y), bf_hi(src[k].y)};
 #pragma unroll
-      for (int e = 0; e < 4; ++e) acc[e] = __fadd_rn(acc[e], __fmul_rn(f[e], wts[k]));
+      for (int e = 0; e < 4; ++e) acc[e] = __fadd_rn(acc[e], __fmul_rn(f[e], w));
     }
   }
   if (a.shared != nullptr) {
@@ -293,7 +303,9 @@ extern "C" int q35hop_launch(int which, const void* args, void* stream) {
   cudaStream_t s = static_cast<cudaStream_t>(stream);
   switch (which) {
     case 0: return launch(publish_kernel<false>, a, s, false);
-    case 1: return launch(publish_fin_quad_kernel, a, s, false, kQuadCtas);
+    case 1:
+      return a.top_k == 10 ? launch(publish_fin_quad_kernel<10>, a, s, false, kQuadCtas)
+                           : launch(publish_fin_quad_kernel<0>, a, s, false, kQuadCtas);
     case 2:
       switch (a.site.world) {
         case 2: return launch(consume_kernel<2>, a, s, true);
