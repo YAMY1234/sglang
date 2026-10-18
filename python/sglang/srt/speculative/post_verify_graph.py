@@ -12,7 +12,8 @@ as before and enters the graph as a device scalar, so real and injected
 acceptance replay the same graph. Two graphs per key alternate so that one
 round's outputs stay valid until the host has consumed them.
 
-Enabled by SGLANG_Q35MF_EDGE_POST_VERIFY_GRAPH=1 (default off).
+Enabled by SGLANG_Q35MF_EDGE_POST_VERIFY_GRAPH=1 (default off), for batches of up to
+SGLANG_Q35MF_EDGE_POST_VERIFY_MAX_BS requests (default 2).
 """
 
 from __future__ import annotations
@@ -31,9 +32,10 @@ from sglang.srt.runtime_context import get_parallel, get_spec, mamba_track_grid
 logger = logging.getLogger(__name__)
 
 _NUM_WARMUP = 2
-_MAX_BS = 2
+# Largest batch replayed from the graph; larger batches keep the eager chain.
+_MAX_BS = int(os.environ.get("SGLANG_Q35MF_EDGE_POST_VERIFY_MAX_BS", "2"))
 # Arbitrary bound on captured graph sets (key x verify logits buffer).
-_MAX_STATES = 16
+_MAX_STATES = max(16, 8 * _MAX_BS)
 
 
 def post_verify_graph_enabled() -> bool:
