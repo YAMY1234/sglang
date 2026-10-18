@@ -4,6 +4,8 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Optional, Protocol
 
+import msgspec
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -80,6 +82,51 @@ def record_paged_fp8_call(qlen):
     counts = paged_fp8_engagement()["calls"]
     key = f"q{qlen}"
     counts[key] = counts.get(key, 0) + 1
+
+
+Q1_STOCK = "q1_stock"
+Q1_LONG = "q1_long"
+
+
+class Q1GraphVariants(msgspec.Struct, frozen=True):
+    """Draft q1 decode: SKV2-Q1 from a host-only KV length lower bound, trtllm-gen below it."""
+
+    min_length: int
+    capture_labels: ClassVar[tuple[str, ...]] = (Q1_STOCK, Q1_LONG)
+
+    def select(self, forward_batch: ForwardBatch) -> str:
+        if forward_batch.batch_size != 1:
+            return Q1_STOCK
+        length = forward_batch.attention_kv_len_lower_bound
+        if length is None:
+            lengths = forward_batch.seq_lens_cpu
+            if lengths is not None and lengths.device.type == "cpu" and lengths.numel() == 1:
+                length = int(lengths[0])
+        return Q1_LONG if length is not None and length >= self.min_length else Q1_STOCK
+
+
+def create_q1_graph_variants() -> Optional[Q1GraphVariants]:
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_Q35MF_MKA_Q1.get():
+        return Q1GraphVariants(min_length=envs.SGLANG_Q35MF_MKA_Q1_MIN_LENGTH.get())
+    return None
+
+
+def use_q1_attention(forward_batch: ForwardBatch) -> bool:
+    from sglang.srt.environ import envs
+    from sglang.srt.model_executor.runner_utils.capture_mode import (
+        get_capture_attention_variant,
+        get_is_capture_mode,
+    )
+
+    variant = get_capture_attention_variant()
+    if variant is not None:
+        return variant == Q1_LONG
+    if get_is_capture_mode():
+        return False
+    variants = Q1GraphVariants(min_length=envs.SGLANG_Q35MF_MKA_Q1_MIN_LENGTH.get())
+    return variants.select(forward_batch) == Q1_LONG
 
 
 class AttentionGraphVariants(Protocol):

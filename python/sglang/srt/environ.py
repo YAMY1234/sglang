@@ -1082,6 +1082,9 @@ class Envs:
     SGLANG_Q35MF_MKA_PUSH = EnvBool(False)
     # KV length from which target verify uses SKV2 (trtllm-gen below); measured crossover 2048 at TP8, 4096 at TP4.
     SGLANG_Q35MF_MKA_SKV2_VERIFY_MIN_LENGTH = EnvInt(32768)
+    # Draft-model q1 decode with trtllm-gen's KV split and rounding plus a separate merge, from this KV length.
+    SGLANG_Q35MF_MKA_Q1 = EnvBool(False)
+    SGLANG_Q35MF_MKA_Q1_MIN_LENGTH = EnvInt(16384)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
 
     # ===================================================================
