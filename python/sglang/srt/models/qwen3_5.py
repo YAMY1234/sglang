@@ -1942,6 +1942,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         # Same allocation as RowParallelLinear's output, which the layer boundary all-reduces.
         with use_symmetric_memory(get_parallel().tp_group, disabled=not is_allocation_symmetric()):
             out = torch.empty((m, self.hidden_size), dtype=torch.bfloat16, device=device)
+        hop = self._mka_push_hop(m)
         mka_fused.epilogue(
             attn=attn_output,
             gate=gate,
@@ -1950,8 +1951,19 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             sw=self.o_proj.weight_scale,
             out=out,
             nq=self.num_heads,
+            site=None if hop is None else hop.site_fields(),
         )
+        if hop is not None:
+            hop.mark_pushed(out)
         return out
+
+    def _mka_push_hop(self, m: int):
+        if not (envs.SGLANG_Q35MF_MKA_PUSH.get() and envs.SGLANG_Q35MF_MKH_HOP.get()):
+            return None
+        from sglang.srt.layers.q35_hop import active
+
+        hop = active()
+        return hop if hop is not None and hop.supports(m) else None
 
     def self_attention(
         self,

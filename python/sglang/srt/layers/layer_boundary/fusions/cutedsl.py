@@ -382,7 +382,7 @@ class CuteDSLFusion:
 
 
 def _q35_hop_pushed(partial: torch.Tensor) -> bool:
-    if not envs.SGLANG_Q35MF_MKH_OPROJ.get():
+    if not (envs.SGLANG_Q35MF_MKH_OPROJ.get() or envs.SGLANG_Q35MF_MKA_PUSH.get()):
         return False
     from sglang.srt.layers.q35_hop import active
 

@@ -1053,6 +1053,9 @@ class Envs:
     # _DRAFT=0 keeps the draft-model extend on the stock kernel.
     SGLANG_Q35MF_MKA_SKV2 = EnvBool(False)
     SGLANG_Q35MF_MKA_SKV2_DRAFT = EnvBool(True)
+    # With SGLANG_Q35MF_MKA_FUSED and SGLANG_Q35MF_MKH_HOP: the fused o_proj pushes its partial into the
+    # q35 hop mailbox, so the attention output hop only consumes.
+    SGLANG_Q35MF_MKA_PUSH = EnvBool(False)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
 
     # ===================================================================
