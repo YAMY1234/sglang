@@ -16,6 +16,8 @@
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
+#include <sgl_kernel/distributed/q35_hop.cuh>
+
 namespace {
 
 constexpr int kThreads = 256;
@@ -395,6 +397,8 @@ struct EpiParams {
   const float* sw;
   __nv_bfloat16* out;         // [M, 4096]
   int m;
+  int push;                   // 1: also push the bf16 partial into the q35 hop mailbox (MKH interface v1)
+  q35hop::Site site;
 };
 
 // grid = 16 units x 8 ranks; NQ = q heads per rank (K = NQ*256, K chunk NQ*32 per rank).
@@ -405,6 +409,7 @@ __global__ void __launch_bounds__(kThreads, 1) mka_epilogue_kernel(const EpiPara
   constexpr int kWarpU4 = kSteps * 2 * 32;
   __shared__ __align__(16) float inbox[kCluster][256];
   __shared__ __align__(16) uint2 bfr[kSteps][32];
+  __shared__ __align__(16) __nv_bfloat16 ob[256];
   __shared__ __align__(8) uint64_t ibar;
   const int rank = (int)cluster_ctarank();
   const int unit = blockIdx.x / kCluster;
@@ -488,7 +493,16 @@ __global__ void __launch_bounds__(kThreads, 1) mka_epilogue_kernel(const EpiPara
   float v = 0.f;
 #pragma unroll
   for (int r = 0; r < kCluster; ++r) v = __fadd_rn(v, inbox[r][tid]);
-  p.out[(size_t)rank * 4096 + unit * kHeadDim + slot_row(tid)] = __float2bfloat16_rn(__fmul_rn(v, alpha));
+  const __nv_bfloat16 o = __float2bfloat16_rn(__fmul_rn(v, alpha));
+  if (p.push) {
+    // fragments are 8 consecutive columns, so regroup the row through smem; push before the store
+    ob[slot_row(tid)] = o;
+    __syncthreads();
+    if (tid < 32)
+      q35hop::push_frag(p.site, q35hop::stage_peek(p.site), rank, unit * 32 + tid,
+                        *reinterpret_cast<const uint4*>(&ob[8 * tid]));
+  }
+  p.out[(size_t)rank * 4096 + unit * kHeadDim + slot_row(tid)] = o;
   if (!kEarlyTrigger) pdl_trigger();
 }
 
@@ -575,7 +589,7 @@ void prologue(torch::Tensor x, torch::Tensor w, torch::Tensor sx, torch::Tensor 
 }
 
 void epilogue(torch::Tensor attn, torch::Tensor gate, torch::Tensor w, torch::Tensor sx, torch::Tensor sw,
-              torch::Tensor out, int64_t nq, bool early_trigger) {
+              torch::Tensor out, int64_t nq, bool early_trigger, std::vector<int64_t> site) {
   const at::cuda::CUDAGuard guard(attn.device());
   TORCH_CHECK(attn.is_contiguous() && gate.is_contiguous() && out.is_contiguous());
   TORCH_CHECK(attn.size(0) <= 8 && attn.size(1) == nq * kHeadDim);
@@ -587,6 +601,19 @@ void epilogue(torch::Tensor attn, torch::Tensor gate, torch::Tensor w, torch::Te
   p.sw = sw.data_ptr<float>();
   p.out = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
   p.m = (int)attn.size(0);
+  // site = [mc, uc, ctrl, rank, world, m_cap, timeout_ns] of the q35 hop workspace, or empty
+  p.push = !site.empty();
+  p.site = {};
+  if (p.push) {
+    TORCH_CHECK(site.size() == 7 && p.m <= site[5]);
+    p.site.mc = reinterpret_cast<void*>(site[0]);
+    p.site.uc = reinterpret_cast<void*>(site[1]);
+    p.site.ctrl = reinterpret_cast<q35hop::Ctrl*>(site[2]);
+    p.site.rank = (int)site[3];
+    p.site.world = (int)site[4];
+    p.site.m_cap = (int)site[5];
+    p.site.timeout_ns = (unsigned long long)site[6];
+  }
   const int grid = 16 * kCluster;
   if (nq == 4) {
     if (early_trigger) launch(mka_epilogue_kernel<4, true>, grid, p);
