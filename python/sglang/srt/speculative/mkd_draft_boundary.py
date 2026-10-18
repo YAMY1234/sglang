@@ -25,7 +25,10 @@ from sglang.kernels.ops.speculative.draft_fc_partial import (
     draft_fc_partial,
     draft_fc_partial_rows,
 )
-from sglang.kernels.ops.speculative.draft_vocab_argmax import NAN_KEY_SPLIT_ARGMAX
+from sglang.kernels.ops.speculative.draft_vocab_argmax import (
+    NAN_KEY_SPLIT_ARGMAX,
+    NAN_KEY_TORCH_ARGMAX,
+)
 from sglang.kernels.ops.speculative.mkd_draft_fc import mkd_fc_memo, mkd_fc_sum
 from sglang.kernels.ops.speculative.mkd_prefetch import mkd_l2_prefetch
 from sglang.kernels.ops.speculative.mkd_draft_xchg import (
@@ -108,6 +111,9 @@ class MkdDraftBoundary:
             1, hidden, dtype=torch.float32 if self.memo else torch.bfloat16, device=dev
         )
         self.fc_out = torch.empty(1, hidden, dtype=torch.bfloat16, device=dev)
+        # The draft extend's exchange only needs the token; its payload lands here unused.
+        self.ext_cand = torch.empty_like(self.out_cand)
+        self.ext_partials = torch.empty_like(self.out_partials)
         self.side_stream = torch.cuda.Stream(device=dev)
         self._install_l2_prefetch(envs.SGLANG_Q35MF_MKD_L2PF_MB.get())
         self.qkv_pf, self.qkv_pf_bytes = self._qkv_prefetch_target(envs.SGLANG_Q35MF_MKD_L2PF_QKV_MB.get())
@@ -292,6 +298,32 @@ class MkdDraftBoundary:
             prefetch_bytes=self.qkv_pf_bytes,
         )
         self.pending = True
+
+    def exchange_extend(self, local_logits: torch.Tensor):
+        """Draft-extend token (torch.argmax NaN rule) through the same one-launch exchange."""
+        topk_index = torch.empty((1, 1), dtype=torch.int64, device=local_logits.device)
+        topk_p = torch.empty((1, 1), dtype=torch.float32, device=local_logits.device)
+        mkd_xchg(
+            local_logits,
+            self.cand,
+            self.hot_ids,
+            self.own_partial,
+            self.epoch_done,
+            self.ext_cand,
+            self.ext_partials,
+            topk_index,
+            topk_p,
+            None,
+            None,
+            None,
+            self.mc,
+            self.uc,
+            self.rank,
+            self.world,
+            0,
+            NAN_KEY_TORCH_ARGMAX,
+        )
+        return topk_p, topk_index
 
     def fc(self) -> torch.Tensor:
         """The draft fc output [1, H] of the step after an exchange."""

@@ -206,6 +206,8 @@ class DraftVocabExchange:
     def select_extend(self, local_logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Draft-extend argmax (torch.argmax semantics) from shard-local logits."""
         m = local_logits.shape[0]
+        if self.mkd is not None and m == 1:
+            return self.mkd.exchange_extend(local_logits)
         gathered = self._pack_and_gather(local_logits, m, NAN_KEY_TORCH_ARGMAX)
         topk_index = torch.empty((m, 1), dtype=torch.int64, device=local_logits.device)
         topk_p = torch.empty((m, 1), dtype=torch.float32, device=local_logits.device)
