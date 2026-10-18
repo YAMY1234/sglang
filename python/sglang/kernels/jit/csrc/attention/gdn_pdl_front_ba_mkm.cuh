@@ -2,7 +2,8 @@
 // Modified by NVIDIA: specialize the cluster projection for a linear-attention front.
 // Modified by NVIDIA: use BF16 warp matrix products for a side projection.
 // Modified by NVIDIA: take the convolution state reads and the sticky-error read off the projection
-// path, and prefetch the recurrent checkpoint and history for the next kernel into L2.
+// path, run the seven convolution tokens on separate warps, and prefetch the recurrent checkpoint and
+// history for the next kernel into L2.
 #pragma once
 
 #include <sgl_kernel/tensor.h>
@@ -286,6 +287,8 @@ __global__ __launch_bounds__(kThreads, 1) void front_kernel(Params p) {
   __shared__ __align__(16) float inbox[kCluster][256];
   __shared__ __align__(16) uint2 fragments[16][32];
   __shared__ __align__(8) uint64_t barrier;
+  __shared__ float conv_stage[32][8];  // per channel: state taps 0..2, weights 3..6
+  __shared__ int64_t conv_meta[3];     // valid, state slot, replay slot
   const int rank = cluster_rank(), unit = blockIdx.x / kCluster;
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   const int g = lane >> 2, t = lane & 3;
@@ -301,7 +304,7 @@ __global__ __launch_bounds__(kThreads, 1) void front_kernel(Params p) {
   if (tid == 0) { mbar_init(&barrier, 1); mbar_init_fence(); }
   __syncthreads();
   cluster_arrive();
-  // Convolution owners: warp 0 reads the rolling state while warps 1..7 stage the activation.
+  // Convolution owners: warp 0 reads the weights, indices and rolling state off the projection path.
   const bool conv_reader = FuseConv && unit < 6 && warp == 0;
   const int conv_channel = unit * 256 + rank * 32 + (tid >> 2) + 8 * (tid & 3);
   float conv_tap[4] = {};
@@ -320,31 +323,18 @@ __global__ __launch_bounds__(kThreads, 1) void front_kernel(Params p) {
   pdl_wait();
   // Issued now, tested before the first push: no store precedes the check.
   const unsigned sticky = tid == 0 ? *reinterpret_cast<volatile unsigned*>(p.error) : 0u;
-  bool conv_valid = false;
-  int64_t conv_base = 0;
-  __nv_bfloat16* conv_window = nullptr;
-  float conv_old[3] = {};
+  // Both indices are read now (independently) and used only after the projection.
+  int64_t conv_slot = 0, conv_replay = 0;
   if (conv_reader) {
-    const int64_t state_slot = p.state_index64 ? static_cast<const int64_t*>(p.state_indices)[0]
-                                              : static_cast<const int32_t*>(p.state_indices)[0];
-    conv_valid = state_slot != p.pad_slot;
-    const int64_t replay_slot = conv_valid ? (p.replay_index64 ? static_cast<const int64_t*>(p.replay_indices)[0]
-                                                            : static_cast<const int32_t*>(p.replay_indices)[0]) : 0;
-    conv_base = conv_valid ? state_slot * p.state_stride[0] + conv_channel * p.state_stride[1] : 0;
-    conv_window = conv_valid ? p.windows + replay_slot * p.window_stride[0] + conv_channel * p.window_stride[1]
-                             : nullptr;
-    if (conv_valid) {
-#pragma unroll
-      for (int j = 0; j < 3; ++j) conv_old[j] = __bfloat162float(p.conv_state[conv_base + j * p.state_stride[2]]);
-    }
+    conv_slot = p.state_index64 ? static_cast<const int64_t*>(p.state_indices)[0]
+                                : static_cast<const int32_t*>(p.state_indices)[0];
+    conv_replay = p.replay_index64 ? static_cast<const int64_t*>(p.replay_indices)[0]
+                                   : static_cast<const int32_t*>(p.replay_indices)[0];
   }
   const float inverse = div_full(1.0f, sx);
-  const bool split_staging = FuseConv && unit < 6;
 #pragma unroll
-  for (int i = 0; i < 3; ++i) {
-    // Conv owners: warps 1..7 cover steps 0..15; the other units keep two steps per warp.
-    const int step = split_staging ? warp - 1 + 7 * i : 2 * warp + i;
-    if (split_staging ? (warp == 0 || step >= 16) : i == 2) continue;
+  for (int i = 0; i < 2; ++i) {
+    const int step = 2 * warp + i;
     uint2 value = make_uint2(0u, 0u);
     if (g < p.m) {
       const int offset = g * 4096 + rank * 512 + step * 32 + 4 * t;
@@ -376,6 +366,13 @@ __global__ __launch_bounds__(kThreads, 1) void front_kernel(Params p) {
                                __fadd_rn(chains[block][2][i], chains[block][3][i]));
   const bool feature_owner = FuseConv && unit < 6;
   const bool owner = feature_owner || rank < p.m;
+  const bool conv_valid = conv_reader && conv_slot != p.pad_slot;
+  float conv_old[3] = {};
+  if (conv_valid) {
+    const int64_t base = conv_slot * p.state_stride[0] + conv_channel * p.state_stride[1];
+#pragma unroll
+    for (int j = 0; j < 3; ++j) conv_old[j] = __bfloat162float(p.conv_state[base + j * p.state_stride[2]]);
+  }
   const unsigned bytes = feature_owner ? kCluster * p.m * 32 * sizeof(float)
                                         : kCluster * 256 * sizeof(float);
   if (tid == 0 && owner) mbar_expect_tx(&barrier, bytes);
@@ -393,53 +390,72 @@ __global__ __launch_bounds__(kThreads, 1) void front_kernel(Params p) {
     }
   }
   if (!owner) return;
+  if (conv_reader) {
+#pragma unroll
+    for (int j = 0; j < 3; ++j) conv_stage[lane][j] = conv_old[j];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) conv_stage[lane][3 + j] = conv_tap[j];
+    if (lane == 0) {
+      conv_meta[0] = conv_slot != p.pad_slot;
+      conv_meta[1] = conv_slot;
+      conv_meta[2] = conv_replay;
+    }
+  }
   if (tid == 0) wait_inbox(&barrier, p.error, p.timeout);
   __syncthreads();
   if (feature_owner) {
-    if (tid >= 32) return;
-    const int channel = conv_channel;
-    const bool valid = conv_valid;
-    const int64_t state_base = conv_base;
-    __nv_bfloat16* window = conv_window;
-    float old0 = conv_old[0], old1 = conv_old[1], old2 = conv_old[2];
-    const float weight[4] = {conv_tap[0], conv_tap[1], conv_tap[2], conv_tap[3]};
-    if (valid) {
-      // The overlapping logical windows have one physical writer per channel.
-      window[0] = __float2bfloat16_rn(old1);
-      window[1] = __float2bfloat16_rn(old2);
-    }
+    // Token `warp` of 32 channels; neighbours' projected values are recomputed with the same arithmetic.
+    if (warp >= 7) return;
+    const int token = warp;
+    const int channel = unit * 256 + rank * 32 + (lane >> 2) + 8 * (lane & 3);
+    const bool valid = conv_meta[0] != 0;
+    float value[4];  // projected BF16 values of tokens token-3 .. token (state taps before token 0)
+    __nv_bfloat16 rounded = __float2bfloat16_rn(0.f);
 #pragma unroll
-    for (int token = 0; token < 7; ++token) {
-      float sum = 0.f;
+    for (int j = 0; j < 4; ++j) {
+      const int t = token - 3 + j;
+      if (t < 0) {
+        value[j] = conv_stage[lane][t + 3];
+      } else {
+        float sum = 0.f;
 #pragma unroll
-      for (int source = 0; source < kCluster; ++source)
-        sum = __fadd_rn(sum, inbox[source][token * 32 + tid]);
-      const __nv_bfloat16 rounded = __float2bfloat16_rn(__fmul_rn(sum, alpha));
-      p.output[token * 2560 + channel] = rounded;
-      if (valid) {
-        const float value = __bfloat162float(rounded);
-        // Preserve the BF16 product boundary before the stock FP32 additions.
-        const float p0 = __bfloat162float(__float2bfloat16_rn(__fmul_rn(old0,weight[0])));
-        const float p1 = __bfloat162float(__float2bfloat16_rn(__fmul_rn(old1,weight[1])));
-        const float p2 = __bfloat162float(__float2bfloat16_rn(__fmul_rn(old2,weight[2])));
-        const float p3 = __bfloat162float(__float2bfloat16_rn(__fmul_rn(value,weight[3])));
-        float accumulator = __fadd_rn(p0,0.f);
-        accumulator = __fadd_rn(accumulator,p1);
-        accumulator = __fadd_rn(accumulator,p2);
-        accumulator = __fadd_rn(accumulator,p3);
-        float exponential;
-        const float exponent = __fmul_rn(accumulator,__int_as_float(0xBFB8AA3B));
-        asm("ex2.approx.f32 %0, %1;" : "=f"(exponential) : "f"(exponent));
-        const float activated = div_full(accumulator, __fadd_rn(1.f, exponential));
-        p.conv_output[token * 1536 + channel] = __float2bfloat16_rn(activated);
-        window[token + 2] = rounded;
-        old0 = old1; old1 = old2; old2 = value;
+        for (int source = 0; source < kCluster; ++source)
+          sum = __fadd_rn(sum, inbox[source][t * 32 + lane]);
+        const __nv_bfloat16 r = __float2bfloat16_rn(__fmul_rn(sum, alpha));
+        value[j] = __bfloat162float(r);
+        if (j == 3) rounded = r;
       }
     }
+    p.output[token * 2560 + channel] = rounded;
     if (valid) {
-      p.conv_state[state_base] = __float2bfloat16_rn(old0);
-      p.conv_state[state_base + p.state_stride[2]] = __float2bfloat16_rn(old1);
-      p.conv_state[state_base + 2 * p.state_stride[2]] = __float2bfloat16_rn(old2);
+      const int64_t state_base = conv_meta[1] * p.state_stride[0] + channel * p.state_stride[1];
+      __nv_bfloat16* window = p.windows + conv_meta[2] * p.window_stride[0] + channel * p.window_stride[1];
+      const float weight[4] = {conv_stage[lane][3], conv_stage[lane][4], conv_stage[lane][5], conv_stage[lane][6]};
+      if (token == 0) {
+        // The overlapping logical windows have one physical writer per channel.
+        window[0] = __float2bfloat16_rn(value[1]);
+        window[1] = __float2bfloat16_rn(value[2]);
+      }
+      // Preserve the BF16 product boundary before the stock FP32 additions.
+      const float p0 = __bfloat162float(__float2bfloat16_rn(__fmul_rn(value[0],weight[0])));
+      const float p1 = __bfloat162float(__float2bfloat16_rn(__fmul_rn(value[1],weight[1])));
+      const float p2 = __bfloat162float(__float2bfloat16_rn(__fmul_rn(value[2],weight[2])));
+      const float p3 = __bfloat162float(__float2bfloat16_rn(__fmul_rn(value[3],weight[3])));
+      float accumulator = __fadd_rn(p0,0.f);
+      accumulator = __fadd_rn(accumulator,p1);
+      accumulator = __fadd_rn(accumulator,p2);
+      accumulator = __fadd_rn(accumulator,p3);
+      float exponential;
+      const float exponent = __fmul_rn(accumulator,__int_as_float(0xBFB8AA3B));
+      asm("ex2.approx.f32 %0, %1;" : "=f"(exponential) : "f"(exponent));
+      const float activated = div_full(accumulator, __fadd_rn(1.f, exponential));
+      p.conv_output[token * 1536 + channel] = __float2bfloat16_rn(activated);
+      window[token + 2] = rounded;
+      if (token == 6) {
+        p.conv_state[state_base] = __float2bfloat16_rn(value[1]);
+        p.conv_state[state_base + p.state_stride[2]] = __float2bfloat16_rn(value[2]);
+        p.conv_state[state_base + 2 * p.state_stride[2]] = __float2bfloat16_rn(value[3]);
+      }
     }
   } else {
     float sum = 0.f;
