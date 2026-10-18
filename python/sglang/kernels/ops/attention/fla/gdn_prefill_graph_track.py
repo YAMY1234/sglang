@@ -88,11 +88,8 @@ def _gdn_track_ssm_kernel(
     else:
         row = tl.load(track_h_row + r).to(tl.int64)
         val = tl.load(h + row * stride_h_row + offs, mask=mask)
-    tl.store(
-        ssm_pool + dst * stride_ssm_slot + offs,
-        val.to(ssm_pool.dtype.element_ty),
-        mask=mask,
-    )
+        val = val.to(ssm_pool.dtype.element_ty)
+    tl.store(ssm_pool + dst * stride_ssm_slot + offs, val, mask=mask)
 
 
 def gdn_track_conv_window(
