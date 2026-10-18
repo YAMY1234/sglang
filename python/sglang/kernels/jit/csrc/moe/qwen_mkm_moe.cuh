@@ -3,7 +3,7 @@
 // hidden 4096, intermediate 128 per rank): DynBlock-exact top-10 from the router logits, FC1, SwiGLU, NVFP4
 // requantization and FC2 in one launch over the trtllm-gen weight layout. Writes the RT deferred-finalize rows
 // (row t * 10 + k, identity permutation) and the expert weights.
-// Device code generated from the MKM lane engine (source md5 f73b6a34654fb70e6f1f5809b2ec2471, PTX helpers md5 b4d0b7dea5606da866a21d8e1a373dd9) by
+// Device code generated from the MKM lane engine (source md5 8056bd3ec9ed9b19cf4b189407d2578b, PTX helpers md5 b4d0b7dea5606da866a21d8e1a373dd9) by
 // lanes/mkm/tools/export_cuh.py.
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.cuh>
@@ -177,6 +177,7 @@ constexpr int kN1 = 256;            // W13 rows per expert (gate + up, TP8)
 constexpr int kStageBytes = 36864;  // 32 KB weights + 4 KB scale factors
 constexpr int kStages = 5;
 constexpr int kN1c = 128;           // W13 rows per CTA (row split)
+constexpr int kW13BoxRows = kN1c;   // rows of one W13 TMA box; the host tensor map must use the same
 constexpr int kFc1Stages = 8;       // 8 k-blocks each (full K = 4096): 2 TMA boxes of 128 rows x 128 B
 constexpr int kFc2Stages = 4;       // 2 tiles each
 constexpr int kTotStages = kFc1Stages + kFc2Stages;
@@ -1030,7 +1031,7 @@ inline CUtensorMap make_tmap(const void* base, uint64_t rows, uint64_t row_bytes
 /// \brief Launcher of the fused expert phase; every CTA pair beyond the number of selected experts exits.
 struct MkmMoe {
   /// Low 60 bits of the engine source md5 this module was compiled from (stale-build check).
-  static int64_t source_md5_lo() { return 0xf73b6a34654fb70LL; }
+  static int64_t source_md5_lo() { return 0x8056bd3ec9ed9b1LL; }
 
   /// \param logits         [M, 512] bf16 router logits (router_gemm_quant output), M <= 7.
   /// \param expert_weights [M, 10] bf16 out, DynBlock softmax-over-top-10 weights.
@@ -1075,7 +1076,7 @@ struct MkmMoe {
     const auto M = static_cast<int64_t>(M_.unwrap());
     CHECK_HOST(M >= 1 && M <= kMaxTok) << "qwen_mkm_moe: num_tokens " << M << " outside 1.." << kMaxTok;
     CHECK_HOST(R_.unwrap() >= M * kTopK) << "qwen_mkm_moe: out has " << R_.unwrap() << " rows, needs " << M * kTopK;
-    const CUtensorMap m13 = make_tmap(w13.data_ptr(), static_cast<uint64_t>(kE) * kN1, kH / 2, 128, 256,
+    const CUtensorMap m13 = make_tmap(w13.data_ptr(), static_cast<uint64_t>(kE) * kN1, kH / 2, 128, kW13BoxRows,
                                       CU_TENSOR_MAP_SWIZZLE_128B);
     const CUtensorMap m2 = make_tmap(w2.data_ptr(), static_cast<uint64_t>(kE) * kH, 64, 64, 256,
                                      CU_TENSOR_MAP_SWIZZLE_64B);
