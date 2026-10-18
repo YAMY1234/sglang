@@ -69,7 +69,7 @@ struct Params {
   unsigned int poll_sleep_ns;     // back-off between polls of the mailbox (0 = spin)
   int self_only;                  // diagnostic: poll only this rank's own slot
   int active_rank;                // diagnostic: >= 0 makes every other rank's launch a no-op
-  int early_trigger;              // publish launches trigger their dependents at entry
+  int early_trigger;              // publish / out_proj launches trigger their dependents early
   int poll_mode;                  // 0: re-poll every pending source; 1: re-poll the first pending one
 };
 
@@ -1026,6 +1026,7 @@ __global__ void __launch_bounds__(256, 1) oproj_push_kernel(Params p, OprojArgs 
   }
   const float alpha = __fmul_rn(__ldg(o.sx), __ldg(o.sw));
   pdl_wait();
+  if (p.early_trigger) pdl_trigger();
   const int m = p.m;
   const bool tok_ok = g < m;
   const uint8_t* xr = o.x + (size_t)g * kK + warp * S * 32 + 4 * t;
@@ -1075,7 +1076,7 @@ __global__ void __launch_bounds__(256, 1) oproj_push_kernel(Params p, OprojArgs 
     }
     if (o.out != nullptr) st_v4(o.out + (size_t)tok * kHidden + (size_t)fr * kVec, frag);
   }
-  pdl_trigger();
+  if (!p.early_trigger) pdl_trigger();
 }
 
 }  // namespace mkh
