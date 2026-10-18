@@ -1567,6 +1567,13 @@ class Envs:
     # Breakable prefill CUDA graphs capture the GDN extend on per-bucket static tables
     # instead of breaking the graph at every GDN layer (bit-identical outputs).
     SGLANG_Q35MF_MKH_PF_GRAPH = EnvBool(False)
+    # Verify input staging, bit-identical: reuse last round's mamba track indices while their
+    # inputs are unchanged, and skip the replay-time input_ids / positions copies that the
+    # same-stream pre-planned load_batch already made.
+    SGLANG_Q35MF_MKH_N3B = EnvBool(False)
+    # The post-verify graph's per-round input load as one small_field_copy launch that also
+    # reads the injected acceptance length from its pinned host slot (bit-identical).
+    SGLANG_Q35MF_MKH_N3C = EnvBool(False)
 
     # ===================================================================
     # Multimodal processing

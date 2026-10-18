@@ -25,7 +25,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.memory.small_field_copy import SmallFieldCopyPlan
 from sglang.kernels.ops.speculative.eagle import prepare_verify_commit_outputs
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel, get_spec, mamba_track_grid
 
 logger = logging.getLogger(__name__)
@@ -42,6 +44,7 @@ def post_verify_graph_enabled() -> bool:
 
 _SPARSE_VERIFY = os.environ.get("SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING", "0") == "1"
 _SIDE_STREAM_COMMIT = os.environ.get("SGLANG_Q35MF_EDGE_SIDE_STREAM_COMMIT", "0") == "1"
+_ONE_LAUNCH_LOAD = envs.SGLANG_Q35MF_MKH_N3C.get()
 
 
 def sparse_verify_max_top_k(batch) -> Optional[int]:
@@ -97,6 +100,9 @@ class _Slot:
         self.commit_graph: Optional[torch.cuda.CUDAGraph] = None
         self.inputs: Dict[str, torch.Tensor] = {}
         self.outputs: Optional[Tuple] = None
+        self.load_plan = (
+            SmallFieldCopyPlan(allow_pinned_src=True) if _ONE_LAUNCH_LOAD else None
+        )
 
 
 class _KeyState:
@@ -135,6 +141,7 @@ class PostVerifyGraph:
         self._stock_rounds = 0
         self._checked = 0
         self._mismatch = 0
+        self._load_mismatch = 0
 
     def try_run(
         self,
@@ -349,6 +356,8 @@ class PostVerifyGraph:
             )
         else:
             self._load(slot, inputs, sim_len)
+        if self._check:
+            self._check_load(slot, inputs, sim_len)
         slot.graph.replay()
         if slot.commit_graph is not None:
             self._main_done.record()
@@ -360,6 +369,18 @@ class PostVerifyGraph:
         if self._check:
             self._compare(slot, batch, verify_input, logits_output, num_draft_tokens)
         return slot.outputs[:6]
+
+    def _check_load(self, slot: _Slot, inputs: Dict[str, torch.Tensor], sim_len):
+        # Debug only (host syncs): the slot must hold exactly this round's sources.
+        same = all(torch.equal(slot.inputs[k], v) for k, v in inputs.items())
+        if sim_len is not None:
+            same = same and torch.equal(slot.inputs["sim_len"].cpu(), sim_len)
+        if not same:
+            self._load_mismatch += 1
+            logger.error(
+                "post-verify graph: slot inputs differ from their sources (%d so far)",
+                self._load_mismatch,
+            )
 
     def _compare(
         self, slot: _Slot, batch, verify_input, logits_output, num_draft_tokens
@@ -394,12 +415,23 @@ class PostVerifyGraph:
         self._mismatch += 0 if same else 1
         if not same or self._checked % 1000 == 0:
             logger.info(
-                "post-verify graph check: %d rounds, %d mismatches",
+                "post-verify graph check: %d rounds, %d mismatches, %d load mismatches",
                 self._checked,
                 self._mismatch,
+                self._load_mismatch,
             )
 
     def _load(self, slot: _Slot, inputs: Dict[str, torch.Tensor], sim_len):
+        if slot.load_plan is not None:
+            dsts = [slot.inputs[name] for name in inputs]
+            srcs = list(inputs.values())
+            if sim_len is not None:
+                dsts.append(slot.inputs["sim_len"])
+                srcs.append(sim_len)
+            if slot.load_plan(dsts, srcs):
+                if sim_len is not None:
+                    self._record_sim_len_done()
+                return
         # One multi-tensor copy per dtype; one memcpy per input costs ~4 us of GPU time each.
         groups: Dict[torch.dtype, Tuple[List[torch.Tensor], List[torch.Tensor]]] = {}
         for name, src in inputs.items():
@@ -412,10 +444,13 @@ class PostVerifyGraph:
             torch._foreach_copy_(dsts, srcs, non_blocking=True)
         if sim_len is not None:
             slot.inputs["sim_len"].copy_(sim_len, non_blocking=True)
-            done = self._sim_len_done[self._sim_len_slot]
-            if done is None:
-                done = self._sim_len_done[self._sim_len_slot] = torch.cuda.Event()
-            done.record()
+            self._record_sim_len_done()
+
+    def _record_sim_len_done(self) -> None:
+        done = self._sim_len_done[self._sim_len_slot]
+        if done is None:
+            done = self._sim_len_done[self._sim_len_slot] = torch.cuda.Event()
+        done.record()
 
     def _capture(
         self,
