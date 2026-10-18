@@ -28,6 +28,7 @@ def _module(hidden: int, world: int, max_rows: int) -> Module:
         cuda_wrappers=[
             ("sum", f"MkdFc<{args}>::sum"),
             ("memo", f"MkdFc<{args}>::memo"),
+            ("hidden_partial", f"MkdFc<{args}>::hidden_partial"),
         ],
     )
 
@@ -64,3 +65,21 @@ def mkd_fc_memo(
     embedding-half partials the row-split fc would compute for each row."""
     _module(emb.shape[-1], world, MAX_ROWS).memo(emb, fc_weight, norm_weight, out, eps)
     return out
+
+
+def mkd_hidden_partial(
+    h: torch.Tensor,
+    shard: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    col: int,
+    out: torch.Tensor,
+    epoch_done: torch.Tensor,
+    sync: torch.Tensor,
+    world: int,
+) -> None:
+    """Hidden-slice fc partial [1, H] fp32 of ``h`` [1, H] (draft_fc_partial arithmetic over
+    ``shard`` [H, W] at hidden-half column ``col``); the last CTA then sets ``sync[1]`` to
+    the exchange epoch ``epoch_done[0]`` (``sync[0]`` counts CTAs, zero between calls)."""
+    _module(h.shape[-1], world, MAX_ROWS).hidden_partial(h, shard, norm_weight, out, epoch_done, sync, eps, col)
+

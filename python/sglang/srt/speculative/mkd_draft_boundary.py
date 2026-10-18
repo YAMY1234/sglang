@@ -29,7 +29,11 @@ from sglang.kernels.ops.speculative.draft_vocab_argmax import (
     NAN_KEY_SPLIT_ARGMAX,
     NAN_KEY_TORCH_ARGMAX,
 )
-from sglang.kernels.ops.speculative.mkd_draft_fc import mkd_fc_memo, mkd_fc_sum
+from sglang.kernels.ops.speculative.mkd_draft_fc import (
+    mkd_fc_memo,
+    mkd_fc_sum,
+    mkd_hidden_partial,
+)
 from sglang.kernels.ops.speculative.mkd_prefetch import mkd_l2_prefetch
 from sglang.kernels.ops.speculative.mkd_draft_xchg import (
     mkd_xchg,
@@ -106,6 +110,8 @@ class MkdDraftBoundary:
 
         self.epoch_done = torch.tensor([1, 0], dtype=torch.int32, device=dev)
         self.own_partial = torch.zeros(1, hidden, dtype=torch.float32, device=dev)
+        # [CTA counter, epoch flag] of the side-stream hidden partial (mkd_hidden_partial).
+        self.partial_sync = torch.zeros(2, dtype=torch.int32, device=dev)
         self.out_partials = torch.zeros(
             self.world - self.n_embed, hidden, dtype=torch.float32, device=dev
         )
@@ -252,30 +258,33 @@ class MkdDraftBoundary:
     # ---------------------------------------------------------------- per step
 
     def hidden_partial(self, hidden_states: torch.Tensor) -> None:
-        """This rank's hidden-slice fc partial for the next draft step, on a side stream."""
+        """This rank's hidden-slice fc partial for the next draft step, on a side stream;
+        the exchange waits on its flag, not on a stream join."""
         if not self.is_hidden_rank or self.last_step:
             return
         model = self.model
         norm = model.pre_fc_norm_hidden
-        cur = torch.cuda.current_stream()
-        self.side_stream.wait_stream(cur)
+        self.side_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.side_stream):
-            draft_fc_partial(
+            mkd_hidden_partial(
                 hidden_states,
+                model._fc_shard,
                 norm.weight.data,
                 norm.variance_epsilon,
-                model._fc_shard,
                 self.slice_start,
                 self.own_partial,
-                model._fc_gemv_rows,
+                self.epoch_done,
+                self.partial_sync,
+                self.world,
             )
         self.partial_pending = True
 
-    def join(self) -> None:
+    def _join_side_streams(self) -> None:
+        # Joins only end graph capture cleanly: the exchange syncs on flags, and the L2
+        # prefetch is a hint; a join before the exchange would cost its early launch.
         if self.partial_pending:
             torch.cuda.current_stream().wait_stream(self.side_stream)
             self.partial_pending = False
-        # The L2 prefetch is a hint for the lm_head; it only has to rejoin before capture ends.
         if self.pf_stream is not None and self.pf_pending:
             torch.cuda.current_stream().wait_stream(self.pf_stream)
             self.pf_pending = False
@@ -290,7 +299,7 @@ class MkdDraftBoundary:
         draft_column: int,
         mrope_positions: Optional[torch.Tensor],
     ) -> None:
-        self.join()
+        partial_flag = self.partial_sync[1:] if self.partial_pending and not self.last_step else None
         mkd_xchg(
             local_logits,
             self.cand,
@@ -315,8 +324,11 @@ class MkdDraftBoundary:
             prefetch_bytes=self.qkv_pf_bytes,
             fc_out=self.fc_buf,
             token_only=self.last_step,
+            partial_flag=partial_flag,
         )
         self.pending = not self.last_step
+        if self.last_step:
+            self._join_side_streams()
 
     def _start_trace_reader(self) -> None:
         """Diagnostic: the kernel stamps a pinned host ring; a thread logs phase times, no CUDA calls."""

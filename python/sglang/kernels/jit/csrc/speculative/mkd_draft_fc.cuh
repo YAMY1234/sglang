@@ -251,6 +251,49 @@ __global__ void __launch_bounds__(256) mkd_fc_memo_kernel(const MkdFcMemoParams 
   }
 }
 
+struct MkdHiddenPartialParams {
+  const bf16_t* __restrict__ h;       // [kH] hidden state row
+  const bf16_t* __restrict__ w;       // [kH, kW] this rank's fc input-column slice (contiguous)
+  const bf16_t* __restrict__ norm_w;  // [kH] pre_fc_norm_hidden
+  float* out;                         // [kH] fp32 partial
+  const uint32_t* epoch;              // tag of the exchange that sends out
+  uint32_t* done;                     // [1] CTA arrival counter, zero between calls
+  uint32_t* flag;                     // [1] set to the tag once out is complete
+  float eps;
+  int32_t col;                        // slice start inside the hidden half
+};
+
+/**
+ * \brief The hidden-slice fc partial of one row (draft_fc_partial arithmetic), then a flag:
+ * the step-boundary exchange waits on the flag instead of a stream join, so it keeps its
+ * programmatic early launch behind the lm_head.
+ */
+template <int kH, int kWorld>
+__global__ void __launch_bounds__(256) mkd_hidden_partial_kernel(const MkdHiddenPartialParams __grid_constant__ p) {
+  using namespace device;
+  constexpr int kW = 2 * kH / kWorld;
+  constexpr int kWarps = 8;
+  __shared__ alignas(16) bf16_t s_x[kH];
+  __shared__ float s_red[kWarps];
+  const int warp = static_cast<int>(threadIdx.x / kWarpThreads);
+  const int lane = static_cast<int>(get_lane_id());
+  mkd_fc::gemma_norm_row<kH>(p.h, p.norm_w, p.eps, s_x, s_red);
+  for (int j = static_cast<int>(blockIdx.x) * kWarps + warp; j < kH; j += static_cast<int>(gridDim.x) * kWarps) {
+    const float acc = mkd_fc::slice_dot<kW>(p.w + static_cast<int64_t>(j) * kW, s_x + p.col);
+    if (lane == 0) p.out[j] = acc;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    __threadfence();
+    if (atomicAdd(p.done, 1u) == gridDim.x - 1) {
+      *p.done = 0u;
+      uint32_t e;
+      asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(e) : "l"(p.epoch) : "memory");
+      asm volatile("st.release.gpu.global.u32 [%0], %1;" ::"l"(p.flag), "r"(e) : "memory");
+    }
+  }
+}
+
 template <int kH, int kWorld, int kMaxRows, bool kUsePDL>
 struct MkdFc {
   static constexpr std::size_t kSmem = static_cast<std::size_t>(kMaxRows) * kH * sizeof(bf16_t);
@@ -336,6 +379,42 @@ struct MkdFc {
     (void)attr_set;
     const uint32_t grid = runtime::get_sm_count(dev.device_id) * 2;
     LaunchKernel(grid, 256, dev, kMemoSmem)(kernel, params);
+  }
+
+  static void hidden_partial(
+      const tvm::ffi::TensorView h,
+      const tvm::ffi::TensorView w,
+      const tvm::ffi::TensorView norm_w,
+      const tvm::ffi::TensorView out,
+      const tvm::ffi::TensorView epoch_done,
+      const tvm::ffi::TensorView sync,
+      double eps,
+      int64_t col) {
+    using namespace host;
+    constexpr int kW = 2 * kH / kWorld;
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    TensorMatcher({1, kH}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(h);
+    TensorMatcher({kH, kW}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(w);
+    TensorMatcher({kH}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(norm_w);
+    TensorMatcher({1, kH}).with_dtype<fp32_t>().with_device(device).verify(out);
+    TensorMatcher({2}).with_dtype<int32_t>().with_device(device).verify(epoch_done);
+    TensorMatcher({2}).with_dtype<int32_t>().with_device(device).verify(sync);
+    CHECK_HOST(col >= 0 && col % kW == 0 && col + kW <= kH) << "slice start must be a slice boundary";
+    const DLDevice dev = device.unwrap();
+    auto* sy = static_cast<uint32_t*>(sync.data_ptr());
+    const auto params = MkdHiddenPartialParams{
+        .h = static_cast<const bf16_t*>(h.data_ptr()),
+        .w = static_cast<const bf16_t*>(w.data_ptr()),
+        .norm_w = static_cast<const bf16_t*>(norm_w.data_ptr()),
+        .out = static_cast<float*>(out.data_ptr()),
+        .epoch = static_cast<const uint32_t*>(epoch_done.data_ptr()),
+        .done = sy,
+        .flag = sy + 1,
+        .eps = static_cast<float>(eps),
+        .col = static_cast<int32_t>(col),
+    };
+    LaunchKernel(runtime::get_sm_count(dev.device_id), 256, dev)(mkd_hidden_partial_kernel<kH, kWorld>, params);
   }
 };
 

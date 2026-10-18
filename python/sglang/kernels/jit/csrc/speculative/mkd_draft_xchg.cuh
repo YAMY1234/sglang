@@ -78,6 +78,7 @@ struct MkdXchgParams {
   const void* __restrict__ cand; // [V_local, H] embedding rows (bf16) or memo rows (fp32)
   const int64_t* hot_ids;        // [world * V_local] vocabulary ids in hot order (sorted, rank-major)
   const float* own_partial;      // [H] this rank's hidden-slice fc partial (hidden ranks only)
+  const uint32_t* partial_flag;  // equals the epoch once own_partial is written, or null
   uint64_t* mc;                  // multicast base of the exchange buffer
   const uint64_t* uc;            // this rank's own copy of the exchange buffer
   uint32_t* epoch;               // [1] call counter shared by all ranks, starts at 1
@@ -269,6 +270,14 @@ __global__ void __launch_bounds__(kThreads) mkd_xchg_kernel(const MkdXchgParams 
     if (p.rank >= kEmbed) {
       const float* part = p.own_partial + c * kCols;
       for (int w = static_cast<int>(threadIdx.x); w < kPartWords; w += kThreads) {
+        if (p.partial_flag != nullptr) {
+          // The partial comes from a side-stream kernel that is not a stream predecessor.
+          uint32_t f, n = 0;
+          do {
+            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(f) : "l"(p.partial_flag) : "memory");
+            if (++n > mkd_xchg::kSpinLimit) __trap();
+          } while (f != tag);
+        }
         mkd_xchg::mc_store(dst + 2 + kCandWords + w, __float_as_uint(part[w]), tag);
       }
     }
@@ -451,6 +460,7 @@ struct MkdXchg {
       int64_t draft_column,
       int64_t nan_key,
       int64_t token_only,
+      int64_t partial_flag_ptr,
       int64_t trace_ptr,
       int64_t trace_slots,
       int64_t pf_ptr,
@@ -509,6 +519,7 @@ struct MkdXchg {
         .cand = cand.data_ptr(),
         .hot_ids = static_cast<const int64_t*>(hot_ids.data_ptr()),
         .own_partial = static_cast<const float*>(own_partial.data_ptr()),
+        .partial_flag = reinterpret_cast<const uint32_t*>(partial_flag_ptr),
         .mc = reinterpret_cast<uint64_t*>(mc_ptr),
         .uc = reinterpret_cast<const uint64_t*>(uc_ptr),
         .epoch = ed,
