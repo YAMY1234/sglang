@@ -1330,6 +1330,14 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             _is_cuda and envs.SGLANG_Q35MF_ATTN_GATE_QUANT.get()
         )
         self._attn_front_requested = _is_cuda and envs.SGLANG_Q35MF_ATTN_FRONT.get()
+        self._mka_requested = _is_cuda and envs.SGLANG_Q35MF_MKA_FUSED.get()
+        # Packed (qkv, o_proj) weights; built on the first eager verify forward, after weight loading.
+        self._mka_weights = None
+        self._mka_static_ok = None
+        if self._mka_requested:
+            from sglang.kernels.ops.attention import mka_fused
+
+            mka_fused.ensure_built()
         if self.attn_output_gate:
             logger.warning_once("using attn output gate!")
 
@@ -1644,6 +1652,112 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             forward_batch=forward_batch,
         )
 
+    def _mka_static_eligible(self) -> bool:
+        def per_tensor_fp8(linear) -> bool:
+            method = linear.quant_method
+            return (
+                type(method).__name__ == "ModelOptFp8LinearMethod"
+                and not method.use_marlin
+                and linear.weight.dtype == torch.float8_e4m3fn
+                and linear.input_scale is not None
+                and linear.input_scale.numel() == 1
+                and linear.weight_scale.numel() == 1
+            )
+
+        return (
+            self.attn_output_gate
+            and self.num_heads in (4, 8)
+            and self.num_kv_heads == 1
+            and self.head_dim == 256
+            and self.hidden_size == 4096
+            and self.rotary_emb.rotary_dim == 64
+            and self.rotary_emb.cos_sin_cache.dtype == torch.float32
+            and per_tensor_fp8(self.qkv_proj)
+            and per_tensor_fp8(self.o_proj)
+        )
+
+    def _mka_eligible(self, positions, hidden_states, forward_batch: ForwardBatch, backend) -> bool:
+        if not (
+            isinstance(hidden_states, torch.Tensor)
+            and hidden_states.dtype == torch.bfloat16
+            and 0 < hidden_states.shape[0] <= 8
+            and forward_batch.forward_mode.is_target_verify()
+            and positions.dim() == 2
+        ):
+            return False
+        if self._mka_static_ok is None:
+            self._mka_static_ok = self._mka_static_eligible()
+        from sglang.srt.layers.cp.utils import is_cp_active
+
+        if not (
+            self._mka_static_ok
+            and type(backend).__name__ == "TRTLLMHAAttnBackend"
+            and backend.data_type == torch.float8_e4m3fn
+            and not backend.is_xqa_impl
+            and not backend.use_sliding_window_kv_pool
+            and not is_cp_active(forward_batch)
+        ):
+            return False
+        if self._mka_weights is None:
+            if torch.cuda.is_current_stream_capturing():
+                logger.warning_once("MKA fused attention weights not packed before capture; using stock.")
+                return False
+            from sglang.kernels.ops.attention import mka_fused
+
+            self._mka_weights = (
+                mka_fused.pack_qkv(self.qkv_proj.weight.t(), self.num_heads),
+                mka_fused.pack_o(self.o_proj.weight.t()),
+            )
+            logger.warning_once("MKA fused attention prologue/epilogue enabled for target verify.")
+        return True
+
+    def _mka_self_attention(self, positions, hidden_states, forward_batch: ForwardBatch, backend):
+        from sglang.kernels.ops.attention import mka_fused
+        from sglang.srt.distributed.device_communicators.pynccl_allocator import use_symmetric_memory
+        from sglang.srt.layers.dp_attention import is_allocation_symmetric
+
+        m = hidden_states.shape[0]
+        width = self.num_heads * self.head_dim
+        device = hidden_states.device
+        q = torch.empty((m, width), dtype=torch.float8_e4m3fn, device=device)
+        gate = torch.empty((m, width), dtype=torch.bfloat16, device=device)
+        k_cache, v_cache = backend.token_to_kv_pool.get_kv_buffer(self.attn.layer_id)
+        w_qkv, w_o = self._mka_weights
+        mka_fused.prologue(
+            x=hidden_states.contiguous(),
+            w_packed=w_qkv,
+            sx=self.qkv_proj.input_scale,
+            sw=self.qkv_proj.weight_scale,
+            q_norm_w=self.q_norm.weight.data,
+            k_norm_w=self.k_norm.weight.data,
+            cos_sin=self.rotary_emb.cos_sin_cache,
+            positions=positions,
+            axis_map=self.rotary_emb.axis_map,
+            cache_loc=backend._get_layer_cache_loc(self.attn, forward_batch),
+            k_cache=k_cache,
+            v_cache=v_cache,
+            k_scale=self.attn.k_scale if self.attn.k_scale is not None else backend._default_kv_scale,
+            v_scale=self.attn.v_scale if self.attn.v_scale is not None else backend._default_kv_scale,
+            q_out=q,
+            gate_out=gate,
+            nq=self.num_heads,
+            eps=self.q_norm.variance_epsilon,
+        )
+        attn_output = self.attn(q, None, None, forward_batch).reshape(m, width).contiguous()
+        # Same allocation as RowParallelLinear's output, which the layer boundary all-reduces.
+        with use_symmetric_memory(get_parallel().tp_group, disabled=not is_allocation_symmetric()):
+            out = torch.empty((m, self.hidden_size), dtype=torch.bfloat16, device=device)
+        mka_fused.epilogue(
+            attn=attn_output,
+            gate=gate,
+            w_packed=w_o,
+            sx=self.o_proj.input_scale,
+            sw=self.o_proj.weight_scale,
+            out=out,
+            nq=self.num_heads,
+        )
+        return out
+
     def self_attention(
         self,
         positions: torch.Tensor,
@@ -1651,6 +1765,13 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Full attention forward pass."""
+        if self._mka_requested:
+            from sglang.srt.model_executor.forward_context import get_attn_backend
+
+            backend = get_attn_backend()
+            backend = getattr(backend, "full_attn_backend", backend)
+            if self._mka_eligible(positions, hidden_states, forward_batch, backend):
+                return self._mka_self_attention(positions, hidden_states, forward_batch, backend)
         q, k, v, gate = self._prepare_qkv_gate(
             positions=positions,
             hidden_states=hidden_states,
