@@ -51,21 +51,20 @@ __global__ __launch_bounds__(256, 2) void projection_wrapper(
     const __grid_constant__ CUtensorMap weight_map,
     const __grid_constant__ CUtensorMap activation_map,
     __nv_bfloat16* output, int n, float alpha, bool prefetched,
-    gdn_fp8::WaitControl control, bool omit_prefix) {
+    gdn_fp8::WaitControl control) {
   extern __shared__ __align__(128) unsigned char storage[];
   auto& ring = *reinterpret_cast<gdn_fp8::ProjectionRing<64, TileK, 2>*>(storage);
   gdn_fp8::initialize(ring);
   gdn_fp8::begin_roles<32, 128>();
-  if (prefetched && !omit_prefix && threadIdx.x < 128) {
+  if (prefetched && threadIdx.x < 128) {
     gdn_fp8::prefetch_weight_prefix<K>(&weight_map, blockIdx.x * 64, ring);
   }
   gdn_fp8::project<7, K>(&weight_map, &activation_map, blockIdx.x * 64, alpha,
-                        output, n, ring, control, prefetched || omit_prefix);
+                        output, n, ring, control, prefetched);
 }
 
 template <int K, int N, int TileK>
-static int run(int extra_shared, bool prefetched, bool validation_only,
-               bool omit_prefix) {
+static int run(int extra_shared, bool prefetched) {
   constexpr int m = 7;
   constexpr float alpha = 0.03125f;
   std::vector<__nv_fp8_e4m3> weights(N * K);
@@ -131,8 +130,7 @@ static int run(int extra_shared, bool prefetched, bool validation_only,
              "query occupancy");
 
   projection_wrapper<K, TileK><<<N / 64, 256, shared_bytes>>>(
-      weight_map, activation_map, device_output, N, alpha, prefetched, control,
-      omit_prefix);
+      weight_map, activation_map, device_output, N, alpha, prefetched, control);
   check_cuda(cudaGetLastError(), "projection launch");
   check_cuda(cudaDeviceSynchronize(), "projection completion");
   unsigned int error = 0;
@@ -172,24 +170,6 @@ static int run(int extra_shared, bool prefetched, bool validation_only,
     }
   }
 
-  if (validation_only) {
-    std::printf(
-        "{\"m\":7,\"n\":%d,\"k\":%d,\"tile_k\":%d,"
-        "\"validation_only\":true,\"prefetched\":%s,"
-        "\"shared_bytes\":%d,\"num_regs\":%d,\"local_bytes\":%zu,"
-        "\"max_absolute_error\":%.9g,\"relative_l2_error\":%.9g,"
-        "\"different_bf16\":%d,\"elements\":%d,\"nonfinite\":%d}\n",
-        N, K, TileK, prefetched ? "true" : "false", shared_bytes,
-        attributes.numRegs, attributes.localSizeBytes, max_absolute,
-        std::sqrt(squared_error / squared_reference), differing, m * N,
-        nonfinite);
-    check_cuda(cudaFree(device_error), "free error");
-    check_cuda(cudaFree(device_weights), "free weights");
-    check_cuda(cudaFree(device_activation), "free activation");
-    check_cuda(cudaFree(device_output), "free output");
-    return nonfinite || max_absolute > 0.01 ? 1 : 0;
-  }
-
   cudaStream_t stream;
   cudaGraph_t graph;
   cudaGraphExec_t executable;
@@ -198,8 +178,7 @@ static int run(int extra_shared, bool prefetched, bool validation_only,
              "begin graph");
   for (int repeat = 0; repeat < 20; ++repeat) {
     projection_wrapper<K, TileK><<<N / 64, 256, shared_bytes, stream>>>(
-        weight_map, activation_map, device_output, N, alpha, prefetched, control,
-        omit_prefix);
+        weight_map, activation_map, device_output, N, alpha, prefetched, control);
   }
   check_cuda(cudaStreamEndCapture(stream, &graph), "end graph");
   check_cuda(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0),
@@ -260,20 +239,14 @@ int main(int argc, char** argv) {
   const int extra_shared = argc > 1 ? std::atoi(argv[1]) : 0;
   const bool prefetched = argc > 2 && std::atoi(argv[2]) != 0;
   const int tile_k = argc > 3 ? std::atoi(argv[3]) : 128;
-  const bool validation_only = argc > 4 && std::atoi(argv[4]) != 0;
-  const bool omit_prefix = argc > 5 && std::atoi(argv[5]) != 0;
   check_cuda(cudaFree(nullptr), "initialize runtime");
   if (tile_k == 128) {
-    return run<4096, 2560, 128>(extra_shared, prefetched, validation_only,
-                               omit_prefix) |
-           run<1024, 4096, 128>(extra_shared, prefetched, validation_only,
-                               omit_prefix);
+    return run<4096, 2560, 128>(extra_shared, prefetched) |
+           run<1024, 4096, 128>(extra_shared, prefetched);
   }
   if (tile_k == 256) {
-    return run<4096, 2560, 256>(extra_shared, prefetched, validation_only,
-                               omit_prefix) |
-           run<1024, 4096, 256>(extra_shared, prefetched, validation_only,
-                               omit_prefix);
+    return run<4096, 2560, 256>(extra_shared, prefetched) |
+           run<1024, 4096, 256>(extra_shared, prefetched);
   }
   std::fprintf(stderr, "tile_k must be 128 or 256\n");
   return 2;
