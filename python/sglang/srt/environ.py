@@ -565,6 +565,8 @@ class Envs:
     # Greedy draft steps select the token on vocab shards and exchange one packed
     # row (argmax + embedding) instead of all-gathering the logits.
     SGLANG_Q35MF_DRAFT_ARGMAX_EXCHANGE = EnvBool(False)
+    # Largest draft-step batch (rows) the exchange serves, 1..8; larger batches gather the logits.
+    SGLANG_Q35MF_DRAFT_EXCHANGE_STEP_ROWS = EnvInt(2)
     # Same exchange for the greedy token after the draft extend (torch.argmax NaN rule).
     SGLANG_Q35MF_DRAFT_EXTEND_EXCHANGE = EnvBool(False)
     # Target verify of topk-1 chains keeps the logits on vocab shards and samples there
