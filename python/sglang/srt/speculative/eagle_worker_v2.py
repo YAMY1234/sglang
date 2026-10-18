@@ -697,15 +697,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self._draft_vocab_exchange.mkd if self._exchange_in_draft_steps else None
         )
         if mkd is not None and mkd.extend_fc:
-            # A one-row draft's first step reads its fc from fc_buf (MKD extend fc); the
-            # extend's exchange wrote it only if it ran right before this draft.
+            # A one-row draft's first step reads its fc from fc_buf (MKD extend fc); only the
+            # extend exchange that produced exactly this draft input may have written it.
             if (
-                not mkd.fc_buf_ready
-                and not forward_batch.forward_mode.is_idle()
+                not forward_batch.forward_mode.is_idle()
                 and draft_input.topk_index.shape[0] == 1
+                and not mkd.fc_buf_holds(draft_input.topk_index, draft_input.hidden_states)
             ):
                 mkd.fill_fc(draft_input.topk_index, draft_input.hidden_states, forward_batch)
-            mkd.fc_buf_ready = False
+            mkd.fc_buf_src = None
 
         n_inner = self.speculative_num_steps - 1
         canary_outside_ctx = (

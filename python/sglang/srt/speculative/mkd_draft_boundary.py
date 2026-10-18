@@ -16,7 +16,7 @@ the critical path.
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -135,9 +135,10 @@ class MkdDraftBoundary:
             self._start_trace_reader()
         self.qkv_pf, self.qkv_pf_bytes = self._qkv_prefetch_target(envs.SGLANG_Q35MF_MKD_L2PF_QKV_MB.get())
         # extend_fc: the draft extend's exchange writes fc_buf for the next draft's first step;
-        # fc_buf_ready: it did so since the last draft (else the draft fills fc_buf itself).
+        # fc_buf_src: the (token, hidden) tensors it was written from, matched by identity
+        # against the next draft's input (any other path leaves fc_buf to the stock fill).
         self.extend_fc = self.memo and envs.SGLANG_Q35MF_MKD_EXTEND_FC.get()
-        self.fc_buf_ready = False
+        self.fc_buf_src: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         # armed: this draft step ends in the exchange; pending: the next step's fc reads it;
         # last_step: no draft step follows, so the exchange carries the token alone.
         self.armed = False
@@ -410,8 +411,12 @@ class MkdDraftBoundary:
             fc_out=self.fc_buf if payload else None,
             token_only=not payload,
         )
-        self.fc_buf_ready = payload
+        self.fc_buf_src = (topk_index, hidden_states) if payload else None
         return topk_p, topk_index
+
+    def fc_buf_holds(self, token_ids: torch.Tensor, hidden_states: torch.Tensor) -> bool:
+        src = self.fc_buf_src
+        return src is not None and src[0] is token_ids and src[1] is hidden_states
 
     def fill_fc(self, token_ids: torch.Tensor, hidden_states: torch.Tensor, forward_batch) -> None:
         """Stock fc of a draft's first step into fc_buf, when no extend exchange produced it."""
