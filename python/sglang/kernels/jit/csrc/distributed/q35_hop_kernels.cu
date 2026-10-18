@@ -93,12 +93,12 @@ __global__ void __launch_bounds__(kRowThreads) publish_fin_quad_kernel(Args a) {
   }
   __syncthreads();
   const size_t col = static_cast<size_t>(quad) * 4;
-  // The gated shared-expert output comes from a side stream joined before this launch, so it is
-  // read before the PDL wait, as the reference finalize does.
-  uint2 sh = make_uint2(0, 0);
-  if (a.shared != nullptr) sh = *reinterpret_cast<const uint2*>(a.shared + static_cast<size_t>(token) * kHidden + col);
   pdl_wait();
   const uint32_t stage = stage_peek(a.site);
+  // Read after the wait: the side-stream join that produces it may be captured as a programmatic
+  // edge, which lets this launch start before the producer has finished.
+  uint2 sh = make_uint2(0, 0);
+  if (a.shared != nullptr) sh = *reinterpret_cast<const uint2*>(a.shared + static_cast<size_t>(token) * kHidden + col);
   int rows[kSlots];
 #pragma unroll
   for (int k = 0; k < kSlots; ++k) rows[k] = k < top_k ? rows_s[k] : -1;
