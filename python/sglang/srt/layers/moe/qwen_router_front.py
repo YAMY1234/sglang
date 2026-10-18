@@ -321,6 +321,29 @@ def _forward_mkm_fused(
     return experts.dispatcher.combine(combine_input=StandardCombineInput(hidden_states=deferred))
 
 
+def mkm_wide_supported(block: "Qwen2MoeSparseMoeBlock", hidden_states: torch.Tensor) -> bool:
+    """A 17..21-token call, past the router front, that SGLANG_Q35MF_MKM_FUSED_M21 takes from the block gate's logits."""
+    m = hidden_states.shape[0]
+    return (
+        _MKM_M16_MAX_TOKENS < m <= _MKM_M21_MAX_TOKENS
+        and hidden_states.dtype == torch.bfloat16
+        and hidden_states.is_contiguous()
+        and block.supports_deferred_finalize
+        # the stock runner quantizes such inputs with quantize_hidden_states_fp4, as forward_mkm_wide does
+        and not block.experts.quant_method.quant_config.use_per_token_activation
+        and block.experts.trtllm_padded_hidden_size is None
+        and _mkm_supported(block, m)
+    )
+
+
+def forward_mkm_wide(block: "Qwen2MoeSparseMoeBlock", hidden_states: torch.Tensor, router_logits: torch.Tensor):
+    """The stock runner's input quantization, then the fused engine (the stock path's inputs, bit for bit)."""
+    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import quantize_hidden_states_fp4
+
+    x_fp4, x_sf = quantize_hidden_states_fp4(hidden_states, block.experts.w13_input_scale_quant)
+    return _forward_mkm_fused(block, logits=router_logits, x_fp4=x_fp4, x_sf=x_sf.view(torch.uint8))
+
+
 def forward_routed_rt(
     block: "Qwen2MoeSparseMoeBlock", hidden_states: torch.Tensor, *, defer_finalize: bool
 ):
