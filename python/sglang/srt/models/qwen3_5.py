@@ -1035,6 +1035,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         cache = backend.req_to_token_pool.mamba2_layer_cache(self.layer_id)
         if not isinstance(cache, MambaPool.SpeculativeState):
             return None
+        mamba_pool = backend.req_to_token_pool.mamba_pool
+        if (
+            cache.temporal.dtype != torch.bfloat16
+            or cache.replayssm_d is None
+            or getattr(mamba_pool, "replayssm_cache_base", None) is None
+            or getattr(mamba_pool, "replayssm_spec_fold", False)
+            or getattr(mamba_pool, "replayssm_is_kda", False)
+        ):
+            return None
         windows = cache.intermediate_conv_window[0]
         if (
             cache.conv[0].dtype != torch.bfloat16
@@ -1128,6 +1137,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             a=None,
             b=None,
             projection_conv=projection_conv,
+            wait_for_gate_producer=True,
         )
         if not buffers["checked"]:
             if torch.cuda.is_current_stream_capturing():

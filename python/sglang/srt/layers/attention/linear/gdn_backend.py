@@ -993,6 +993,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             return mixed_qkv.new_zeros((1, 0, layer.num_v_heads, layer.head_v_dim))
 
         is_target_verify = forward_batch.forward_mode.is_target_verify()
+        wait_for_gate_producer = kwargs.get("wait_for_gate_producer", False)
         forward_metadata = self.forward_metadata
 
         query_start_loc = forward_metadata.query_start_loc
@@ -1182,6 +1183,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     replay_indices=forward_batch.req_pool_indices,
                     query_start_loc=query_start_loc,
                     draft_token_num=forward_batch.spec_info.draft_token_num,
+                    wait_for_gate_producer=wait_for_gate_producer,
                 )
             else:
                 # The recurrent fallback needs the per-draft snapshots, which
@@ -1502,6 +1504,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         replay_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         draft_token_num: int,
+        wait_for_gate_producer: bool = False,
     ) -> torch.Tensor:
         """ReplaySSM GDN spec-verify (Part B of #28511).
 
@@ -1561,8 +1564,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if envs.SGLANG_Q35MF_GDN_PDL.get():
             if q.is_cuda and is_arch_support_pdl():
                 verify_options["pdl"] = True
+                verify_options["wait_for_gate_producer"] = True
             else:
                 print_warning_once("GDN verify PDL is unsupported; using the original path")
+        if wait_for_gate_producer:
+            verify_options["wait_for_gate_producer"] = True
         gdn_replayssm_spec_decode(
             q=q,
             k=k,
