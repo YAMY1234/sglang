@@ -2,8 +2,8 @@
 
 One launch computes the DynBlock-exact top-10 from the router logits, FC1, SwiGLU, the NVFP4 requantization of the
 intermediate activation and FC2 for M <= 7 tokens (512 experts, hidden 4096, intermediate 128 per rank at TP8 or
-256 at TP4), and writes the trtllm deferred-finalize rows: row ``t * 10 + k`` is expert ``k`` of token ``t``, identity
-permutation.
+256 at TP4; at TP4 a second engine takes 8..16 tokens), and writes the trtllm deferred-finalize rows: row ``t * 10 + k``
+is expert ``k`` of token ``t``, identity permutation.
 """
 
 from __future__ import annotations
@@ -25,15 +25,20 @@ if TYPE_CHECKING:
 HIDDEN = 4096
 NUM_EXPERTS = 512
 TOP_K = 10
-# intermediate size per rank -> (JIT module name, launcher struct)
-_ENGINES = {128: ("qwen_mkm_moe", "MkmMoe"), 256: ("qwen_mkm_moe_tp4", "MkmMoeTp4")}
-INTERMEDIATES = tuple(_ENGINES)
+# (intermediate size per rank, more than MAX_TOKENS tokens) -> (JIT module name, launcher struct)
+_ENGINES = {
+    (128, False): ("qwen_mkm_moe", "MkmMoe"),
+    (256, False): ("qwen_mkm_moe_tp4", "MkmMoeTp4"),
+    (256, True): ("qwen_mkm_moe_tp4m16", "MkmMoeTp4M16"),
+}
+INTERMEDIATES = (128, 256)
 MAX_TOKENS = 7
+MAX_TOKENS_M16 = 16
 
 
 @cache_once
-def _jit_module(intermediate: int) -> Module:
-    name, launcher = _ENGINES[intermediate]
+def _jit_module(intermediate: int, m16: bool) -> Module:
+    name, launcher = _ENGINES[(intermediate, m16)]
     module = load_jit(
         name,
         cuda_files=[f"moe/{name}.cuh"],
@@ -76,7 +81,7 @@ def mkm_moe(
     gemm2_out = torch.empty((m * TOP_K, HIDDEN), dtype=torch.bfloat16, device=device)
     expert_weights = torch.empty((m, TOP_K), dtype=torch.bfloat16, device=device)
     topk_ids = torch.empty((m, TOP_K), dtype=torch.int32, device=device)
-    _jit_module(w2.shape[2] * 2).run(
+    _jit_module(w2.shape[2] * 2, m > MAX_TOKENS).run(
         logits,
         expert_weights,
         topk_ids,

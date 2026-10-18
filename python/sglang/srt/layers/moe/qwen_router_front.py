@@ -211,6 +211,7 @@ def shared_expert_tail(mlp, gate_up: torch.Tensor) -> torch.Tensor:
 
 
 _MKM_MAX_TOKENS = 7
+_MKM_M16_MAX_TOKENS = 16  # SGLANG_Q35MF_MKM_FUSED_M16, TP4 (intermediate 256) only
 _MKM_INTERMEDIATES = (128, 256)  # per rank: TP8, TP4
 # Keyed by id(block): blocks live for the whole process.
 _mkm_static_by_block: dict[int, bool] = {}
@@ -260,7 +261,11 @@ def _mkm_static_supported(block: "Qwen2MoeSparseMoeBlock") -> bool:
 
 def _mkm_supported(block: "Qwen2MoeSparseMoeBlock", m: int) -> bool:
     """SGLANG_Q35MF_MKM_FUSED and a call the fused engine covers; the static part is evaluated once per block."""
-    if not envs.SGLANG_Q35MF_MKM_FUSED.get() or m > _MKM_MAX_TOKENS:
+    if not envs.SGLANG_Q35MF_MKM_FUSED.get() or m > _MKM_M16_MAX_TOKENS:
+        return False
+    if m > _MKM_MAX_TOKENS and not (
+        envs.SGLANG_Q35MF_MKM_FUSED_M16.get() and block.experts.intermediate_size_per_partition == 256
+    ):
         return False
     ok = _mkm_static_by_block.get(id(block))
     if ok is None:
@@ -300,7 +305,7 @@ def _forward_mkm_fused(
     expanded_idx = _mkm_expanded_idx_by_device.get(logits.device)
     if expanded_idx is None:
         expanded_idx = _mkm_expanded_idx_by_device[logits.device] = torch.arange(
-            _MKM_MAX_TOKENS * _TOP_K, dtype=torch.int32, device=logits.device
+            _MKM_M16_MAX_TOKENS * _TOP_K, dtype=torch.int32, device=logits.device
         )
     key = (block.topk.layer_id, m)
     if key not in _mkm_engaged:
