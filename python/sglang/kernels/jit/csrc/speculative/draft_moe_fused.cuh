@@ -475,10 +475,12 @@ __global__ void __launch_bounds__(288, 1) draft_moe_fused_kernel(const DraftMoeF
     s_word[t] = ((tag & 0xffffu) << 16) | static_cast<uint32_t>(__bfloat16_as_ushort(a));
   }
   fz::named_sync(1, kConsumerThreads);
-  for (int k = static_cast<int>(threadIdx.x); k < npairs * kFusedReplicas; k += kConsumerThreads) {
-    const int t = k % npairs;
-    const int idx = t < nsh ? kTopK * kI + sh0 + t : rq0 + t - nsh;
-    fz::st_relaxed(p.act_buf + (k / npairs) * kActWords + idx, s_word[t]);
+  // One warp store per replica: the routed words of a CTA are contiguous, so a replica
+  // costs one or two lines instead of one line per word.
+  if (lane < npairs) {
+    const int idx = lane < nsh ? kTopK * kI + sh0 + lane : rq0 + lane - nsh;
+    const uint32_t word = s_word[lane];
+    for (int r = warp; r < kFusedReplicas; r += kConsumers) fz::st_relaxed(p.act_buf + r * kActWords + idx, word);
   }
   if constexpr (kTrace) {
     if (threadIdx.x == 0) trace[29] = static_cast<int64_t>(fz::globaltimer());
