@@ -408,3 +408,17 @@ for _fn in ("fp4_index_logits_paged", "finish_paged_indexer_topk"):
         )
     )
 del _fn
+
+
+register_kernel(
+    KernelSpec(
+        op="attention.paged_fp8_decode",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.attention.paged_fp8_tcgen:paged_fp8_decode",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))}),
+        format_signature=FormatSignature(
+            supported_dtypes=("float8_e4m3fn",),
+            description="Single-request q1/q7, Q4/Q8, KV1, D256, page64 FP8 attention.",
+        ),
+    )
+)

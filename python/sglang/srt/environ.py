@@ -1022,6 +1022,10 @@ class Envs:
     SGLANG_Q35MF_ATTN_GATE_QUANT = EnvBool(False)
     SGLANG_Q35MF_ATTN_FRONT = EnvBool(False)
     SGLANG_Q35MF_ATTN_SPLIT_KV = EnvBool(False)
+    SGLANG_Q35MF_LL1_K1B = EnvBool(False)
+    SGLANG_Q35MF_LL1_K1B_VERIFY = EnvBool(True)
+    SGLANG_Q35MF_LL1_K1B_EXTEND = EnvBool(True)
+    SGLANG_Q35MF_LL1_K1B_DRAFT = EnvBool(True)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
 
     # ===================================================================

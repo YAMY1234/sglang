@@ -33,7 +33,11 @@ from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferAttnBackend,
     FlashInferMultiStepDraftBackend,
 )
-from sglang.srt.layers.attention.graph_variants import use_split_kv_attention
+from sglang.srt.layers.attention.graph_variants import (
+    record_paged_fp8_call,
+    use_paged_fp8_attention,
+    use_split_kv_attention,
+)
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     make_persistent_multi_ctas_kv_counter_buffer,
 )
@@ -345,6 +349,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.forward_metadata: Optional[TRTLLMMHAMetadata] = None
         self._split_kv_enabled = envs.SGLANG_Q35MF_ATTN_SPLIT_KV.get()
         self._split_kv_scratch = {}
+        self._paged_fp8_enabled = envs.SGLANG_Q35MF_LL1_K1B.get()
+        if self._paged_fp8_enabled:
+            self._paged_fp8_enabled = torch.cuda.get_device_capability()[0] == 10
+        self._paged_fp8_plans = {}
 
         # Init backend (XQA or TRTLLM-GEN)
         # We need to specify q_type and out_type for different backend
@@ -1377,6 +1385,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         out_dtype: Optional[torch.dtype] = None,
         mask: Optional[torch.Tensor] = None,
         use_split_kv: bool = True,
+        use_paged_fp8: bool = False,
     ) -> torch.Tensor:
         """Run decode, optionally sorting and splitting requests by KV length."""
 
@@ -1385,6 +1394,51 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             if out_dtype is not None
             else (out.dtype if out is not None else self.q_data_type)
         )
+
+        if self._paged_fp8_enabled and use_paged_fp8:
+            supported = (
+                not self.is_xqa_impl
+                and get_parallel().attn_dcp_size == 1
+                and self.page_size == 64
+                and q_len_per_req in (1, 7)
+                and seq_lens.numel() == 1
+                and query.shape == (q_len_per_req, query.shape[-2], 256)
+                and query.shape[-2] in (4, 8)
+                and query.dtype == torch.float8_e4m3fn
+                and query.is_contiguous()
+                and isinstance(kv_cache, tuple) and len(kv_cache) == 2
+                and all(x.dtype == query.dtype and x.ndim == 4
+                        and x.shape[1:] == (1, 64, 256) and x.is_contiguous()
+                        for x in kv_cache)
+                and resolved_out_dtype == torch.bfloat16
+                and (out is None or (out.is_contiguous() and out.shape == query.shape
+                                     and out.dtype == resolved_out_dtype))
+                and isinstance(bmm1_scale, (int, float))
+                and isinstance(bmm2_scale, (int, float))
+                and window_left < 0 and sinks is None and mask is None
+                and kv_cache_sf is None
+                and envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get() in (None, 0.0)
+            )
+            if supported:
+                from sglang.kernels.ops.attention.paged_fp8_tcgen import (
+                    PagedFP8DecodePlan,
+                    paged_fp8_decode,
+                )
+
+                key = (query.shape, kv_cache[0].shape, block_tables.shape,
+                       block_tables.stride(), seq_lens.shape)
+                plan = self._paged_fp8_plans.get(key)
+                if plan is None:
+                    plan = PagedFP8DecodePlan(query, kv_cache, block_tables, seq_lens)
+                    self._paged_fp8_plans[key] = plan
+                record_paged_fp8_call(q_len_per_req)
+                return paged_fp8_decode(query, kv_cache, block_tables, seq_lens, plan,
+                                        qk_scale=float(bmm1_scale), v_scale=float(bmm2_scale),
+                                        out=out)
+            logger.warning_once(
+                "Paged tensor-core FP8 attention is unsupported for this configuration; "
+                "using the stock attention implementation."
+            )
 
         if self._split_kv_enabled and use_split_kv:
             supported = (
@@ -1644,6 +1698,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 else self.q_data_type
             ),
             kv_cache_sf=kv_cache_block_scales,
+            use_paged_fp8=(
+                self._paged_fp8_enabled
+                and envs.SGLANG_Q35MF_LL1_K1B_DRAFT.get()
+                and use_paged_fp8_attention(forward_batch)
+            ),
         )
         if self.decode_uses_native_fp4 and not self.is_xqa_impl:
             o = self._finalize_nvfp4_output(o, forward_batch)
@@ -1838,6 +1897,15 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     mask=mask,
                     use_split_kv=(
                         self._split_kv_enabled and use_split_kv_attention(forward_batch)
+                    ),
+                    use_paged_fp8=(
+                        self._paged_fp8_enabled
+                        and (
+                            envs.SGLANG_Q35MF_LL1_K1B_VERIFY.get()
+                            if forward_batch.forward_mode.is_target_verify()
+                            else envs.SGLANG_Q35MF_LL1_K1B_EXTEND.get()
+                        )
+                        and use_paged_fp8_attention(forward_batch)
                     ),
                 )
         elif self.use_fmha_v2 and not cp_active:

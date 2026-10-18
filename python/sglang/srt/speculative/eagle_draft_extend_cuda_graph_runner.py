@@ -13,7 +13,7 @@ from sglang.kernels.ops.memory.small_field_copy import (
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
-from sglang.srt.layers.attention.graph_variants import create_split_kv_graph_variants
+from sglang.srt.layers.attention.graph_variants import create_paged_fp8_graph_variants, create_split_kv_graph_variants
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     deployment_attn_dp_size,
@@ -160,8 +160,9 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # Static capture width: full tree width (num_draft_tokens), not
         # num_steps + 1 -- topk > 1 draft-extend overflows the buffers.
         self.captured_req_width = resolve_num_tokens_per_req(phase="draft_extend")
-        self.attention_graph_variants = create_split_kv_graph_variants(
-            self.capture_forward_mode, self.captured_req_width
+        self.attention_graph_variants = (
+            create_paged_fp8_graph_variants(self.capture_forward_mode, self.captured_req_width)
+            or create_split_kv_graph_variants(self.capture_forward_mode, self.captured_req_width)
         )
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.captured_req_width
