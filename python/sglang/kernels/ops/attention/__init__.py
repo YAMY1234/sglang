@@ -464,3 +464,17 @@ register_kernel(
         ),
     )
 )
+
+register_kernel(
+    KernelSpec(
+        op="attention.gdn_pdl_front_ba_mkm",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.gdn_pdl_front_ba_mkm:front",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(9, 0))}),
+        format_signature=FormatSignature(
+            supported_dtypes=("bfloat16", "float8_e4m3fn"),
+            in_place=True,
+            description="gdn_pdl_front_ba with overlapped convolution-state reads and an L2 prefetch of the recurrent state.",
+        ),
+    )
+)

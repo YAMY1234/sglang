@@ -536,6 +536,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self._fused_verify_ba_enabled = (
             self._fused_verify_enabled and envs.SGLANG_Q35MF_MKG_BA_TC.get()
         )
+        self._fused_verify_mkm_front = (
+            self._fused_verify_ba_enabled and envs.SGLANG_Q35MF_MKM_GDN_FRONT.get()
+        )
         if self._fused_verify_enabled:
             from sglang.kernels.ops.attention.gdn_pdl_front import ensure_built
 
@@ -546,6 +549,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 )
 
                 ensure_ba_built()
+            if self._fused_verify_mkm_front:
+                from sglang.kernels.ops.attention.gdn_pdl_front_ba_mkm import (
+                    ensure_built as ensure_mkm_front_built,
+                )
+
+                ensure_mkm_front_built()
             self._derived_weight_cache_error = (
                 "Online weight updates are unsupported with the packed GDN "
                 "projection cache. Restart the worker to reload projection weights."
@@ -1098,6 +1107,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
         if use_fused_ba:
             from sglang.kernels.ops.attention.gdn_pdl_front_ba import front
+        use_mkm_front = use_fused_ba and self._fused_verify_mkm_front
+        if use_mkm_front:
+            from sglang.kernels.ops.attention.gdn_pdl_front_ba_mkm import front
 
         source = self.in_proj_qkvz.weight.data_ptr()
         buffers = self._fused_verify_buffers
@@ -1141,6 +1153,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 if use_fused_ba
                 else {}
             )
+            if use_mkm_front:
+                # L2 prefetch hint for the verify core's checkpoint (physical slot) and history ring
+                # (request slot), the same tensors and indices the backend passes to the core.
+                ba_args.update(
+                    checkpoint=cache.temporal,
+                    history_d=cache.replayssm_d,
+                    history_k=cache.replayssm_k,
+                    history_g=cache.replayssm_g,
+                    ring_indices=forward_batch.req_pool_indices[:1],
+                )
             front(
                 hidden_states,
                 buffers["weight"],
