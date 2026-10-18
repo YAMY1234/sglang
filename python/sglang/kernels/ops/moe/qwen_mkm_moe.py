@@ -7,11 +7,16 @@ the trtllm deferred-finalize rows: row ``t * 10 + k`` is expert ``k`` of token `
 
 from __future__ import annotations
 
+import logging
+import re
 from typing import TYPE_CHECKING
 
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit
+from sglang.kernels.jit.utils.compile.spec import resolve_sources
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -25,13 +30,22 @@ MAX_TOKENS = 7
 
 @cache_once
 def _jit_module() -> Module:
-    return load_jit(
+    module = load_jit(
         "qwen_mkm_moe",
         cuda_files=["moe/qwen_mkm_moe.cuh"],
-        cuda_wrappers=[("run", "MkmMoe::run")],
+        cuda_wrappers=[("run", "MkmMoe::run"), ("source_md5_lo", "MkmMoe::source_md5_lo")],
         # No fast-math: the routing softmax pins its approximate instructions explicitly.
         extra_cuda_cflags=["-O3"],
     )
+    # The loaded module must come from the header on disk, not from a cached build of another tree.
+    (header,) = resolve_sources(["moe/qwen_mkm_moe.cuh"])
+    with open(header) as f:
+        md5 = re.search(r"source md5 ([0-9a-f]{32})", f.read()).group(1)
+    loaded = int(module.source_md5_lo())
+    if loaded != int(md5[:15], 16):
+        raise RuntimeError(f"qwen_mkm_moe: loaded module was built from source {loaded:015x}, header {header} has {md5}")
+    logger.info("qwen_mkm_moe JIT module loaded: device code md5 %s (%s)", md5, header)
+    return module
 
 
 def mkm_moe(
