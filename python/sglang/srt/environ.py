@@ -1148,6 +1148,9 @@ class Envs:
     SGLANG_Q35MF_MIDQ_COMBINE_SPLIT = EnvInt(0)
     # Check every combine against the stock FlashInfer kernel bit for bit (eager or graphs).
     SGLANG_Q35MF_MIDQ_COMBINE_PROOF = EnvBool(False)
+    # EAGLE topk-1 draft calls on the vocab-parallel TP head (attention DP) pick their
+    # tokens on the vocab shards: multimem row gather + (value, id) gather, no logits a2a.
+    SGLANG_Q35MF_K75P_LMHEAD = EnvBool(False)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)

@@ -5,6 +5,7 @@ from typing import List, Optional
 
 import torch
 
+from sglang.kernels.ops.speculative.k75p_argmax import k75p_topk1_postprocess
 from sglang.kernels.ops.speculative.topk1 import (
     draft_topk1_argmax_only,
     draft_topk1_postprocess,
@@ -251,6 +252,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     "--speculative-use-rejection-sampling requires the draft and "
                     f"target to share one vocab, but the draft vocab "
                     f"({draft_vocab_size}) != target vocab ({target_vocab_size})."
+                )
+
+        if (
+            envs.SGLANG_Q35MF_K75P_LMHEAD.get()
+            and _is_cuda
+            and self.topk == 1
+            and self.hot_token_id is None
+            and not get_spec().speculative_use_rejection_sampling
+        ):
+            with draft_tp_context(self.draft_owns_attention):
+                self.draft_runner.model.logits_processor.enable_k75p_draft_select(
+                    lm_head=self.draft_runner.model.lm_head,
+                    max_rows=self._topk1_parents_prealloc.shape[0],
+                    hidden_size=self.draft_runner.model_config.hidden_size,
                 )
 
     def init_attention_backends(self):
@@ -815,7 +830,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     draft_probs_list.append(probs)
                     forward_batch.positions.add_(1)
                 elif self.topk == 1:
-                    if _is_cuda or _is_hip:
+                    if logits_output.next_token_ids is not None:
+                        topk_p, topk_index = k75p_topk1_postprocess(
+                            next_token_ids=logits_output.next_token_ids,
+                            positions=forward_batch.positions,
+                            draft_tokens=draft_tokens_topk1,
+                            draft_token_column=i + 1,
+                        )
+                    elif _is_cuda or _is_hip:
                         topk_p, topk_index = draft_topk1_postprocess(
                             logits_output.next_token_logits,
                             forward_batch.positions,
@@ -838,11 +860,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     forward_batch.positions.add_(1)
                 if self.draft_runner.model_config.model_is_mrope:
                     forward_batch.mrope_positions.add_(1)
+                vocab_size = (
+                    self.draft_runner.model_config.vocab_size
+                    if logits_output.next_token_ids is not None
+                    else logits_output.next_token_logits.shape[-1]
+                )
                 maybe_detect_oob(
                     topk_index,
                     0,
-                    logits_output.next_token_logits.shape[-1],
-                    f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
+                    vocab_size,
+                    f"draft_forward step {i}: topk_index OOB vs vocab_size={vocab_size}",
                 )
                 if self.hot_token_id is not None:
                     topk_index = self.hot_token_id[topk_index]
@@ -1178,9 +1205,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Reorganize the spec info for the next batch
         if not can_run_decode_cuda_graph:
-            draft_logits_output.next_token_logits = (
-                draft_logits_output.next_token_logits[select_index]
-            )
+            if draft_logits_output.next_token_ids is not None:
+                draft_logits_output.next_token_ids = (
+                    draft_logits_output.next_token_ids[select_index]
+                )
+            else:
+                draft_logits_output.next_token_logits = (
+                    draft_logits_output.next_token_logits[select_index]
+                )
             if draft_logits_output.hidden_states is not None:
                 draft_logits_output.hidden_states = draft_logits_output.hidden_states[
                     select_index
@@ -1193,6 +1225,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 batch.sampling_info.temperatures,
                 batch.sampling_info.top_ks,
             )
+        elif draft_logits_output.next_token_ids is not None:
+            ret_topk_index = draft_logits_output.next_token_ids
+            ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
+            ret_draft_probs = None
         elif self.topk == 1 and _is_hip:
             ret_topk_p, ret_topk_index = draft_topk1_argmax_only(
                 draft_logits_output.next_token_logits
