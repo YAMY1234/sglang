@@ -130,9 +130,19 @@ def _draft_moe_fused_module(
     stages: int,
     window: int,
     trace: bool,
+    push: bool,
 ) -> Module:
     args = make_cpp_args(
-        hidden, inter, experts, topk, cols, stages, window, trace, is_arch_support_pdl()
+        hidden,
+        inter,
+        experts,
+        topk,
+        cols,
+        stages,
+        window,
+        trace,
+        is_arch_support_pdl(),
+        push,
     )
     return load_jit(
         "draft_moe_fused",
@@ -182,10 +192,14 @@ def draft_moe_fused(
     trace: Optional[torch.Tensor] = None,
     stages: int = _FUSED_STAGES,
     window: Optional[int] = None,
+    hop_site: Optional[torch.Tensor] = None,
+    hop_token: int = 0,
 ) -> torch.Tensor:
     """draft_router_topk + draft_moe_gemv as one launch, bitwise equal in ids,
     weights and output. Shapes as in those two; scratch from
-    draft_moe_fused_scratch. trace: int64 [grid * 16] globaltimer stamps, or None."""
+    draft_moe_fused_scratch. trace: int64 [grid * 16] globaltimer stamps, or None.
+    hop_site: host int64 [7] from Q35Hop.site_fields(); the output is then also pushed
+    into that hop as row hop_token, and its all-reduce only consumes."""
     hidden, inter = x.shape[-1], w2.shape[-1]
     cols = -(-hidden // _sm_count(x.device.index))
     module = _draft_moe_fused_module(
@@ -197,6 +211,7 @@ def draft_moe_fused(
         stages,
         _fused_window(inter) if window is None else window,
         trace is not None,
+        hop_site is not None,
     )
     logit_buf, act_buf, epoch = scratch
     module.run(
@@ -214,6 +229,8 @@ def draft_moe_fused(
         topk_ids,
         out,
         epoch if trace is None else trace,
+        epoch if hop_site is None else hop_site,
+        hop_token,
     )
     return out
 

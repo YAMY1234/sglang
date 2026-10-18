@@ -183,10 +183,17 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 )
 
         self.logits_processor = LogitsProcessor(config)
+        if self.model.draft_hop is not None:
+            self.model.draft_hop.head_follows = self._mkd_head_follows
         # Input embedding handed over by the previous greedy draft step, if any.
         self.draft_input_embeds: Optional[torch.Tensor] = None
         # One-launch draft step boundary (SGLANG_Q35MF_MKD_XCHG), set by the spec worker.
         self._mkd = None
+
+    def _mkd_head_follows(self) -> bool:
+        """Whether the draft head (mkd_draft_head) is the next kernel after the final norm."""
+        head = self.logits_processor.mkd_head
+        return head is not None and head.armed
 
     @staticmethod
     def _fc_split_slice(hidden_size: int) -> Optional[Tuple[bool, int, int]]:

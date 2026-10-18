@@ -741,6 +741,22 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             self.experts.supports_deferred_finalize and self.shared_expert is not None
         )
 
+    def single_token_draft_single_launch(self, num_tokens: int) -> bool:
+        """Whether the batch runs the single-launch draft MoE kernel (draft_moe_fused)."""
+        return (
+            self.single_token_draft_ready(num_tokens)
+            and self._single_token_draft_moe.single_launch_ready
+        )
+
+    def single_token_draft_ready(self, num_tokens: int) -> bool:
+        """Whether the single-token draft MoE, already set up, runs a batch of this many tokens."""
+        draft_moe = self._single_token_draft_moe
+        return (
+            draft_moe is not None
+            and not self.reduce_results
+            and draft_moe.ready(num_tokens)
+        )
+
     def _forward_router_experts(
         self,
         hidden_states: torch.Tensor,
@@ -898,10 +914,25 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             and draft_moe.active
             and 0 < num_tokens <= draft_moe.MAX_TOKENS
         ):
-            if not defer_finalize and not self.reduce_results:
-                out = draft_moe.forward(self, hidden_states)
+            if not self.reduce_results:
+                # Only the draft step hop defers here (single_token_draft_ready).
+                from sglang.srt.layers.layer_boundary.fusions.q35_draft_hop import (
+                    DraftMoePartial,
+                    moe_push_target,
+                )
+
+                out = draft_moe.forward(
+                    self,
+                    hidden_states,
+                    push_hop=moe_push_target() if defer_finalize else None,
+                )
                 if out is not None:
-                    return out.view(num_tokens, hidden_dim)
+                    out = out.view(num_tokens, hidden_dim)
+                    if defer_finalize:
+                        return DraftMoePartial(
+                            partial=out, reduce=sum_post_experts_output
+                        )
+                    return out
 
         if self._use_mega_moe:
             return self._forward_mega_moe(hidden_states, forward_batch)

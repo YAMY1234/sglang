@@ -26,6 +26,9 @@ HIDDEN = 4096
 STAGES = 3
 ROW_CTAS = 4
 _PUBLISH, _PUBLISH_FIN, _CONSUME = 0, 1, 2
+_DRAFT_MNNVL, _DRAFT_ADD_NORM = 3, 4
+# The same, releasing their dependents at entry.
+_DRAFT_MNNVL_EARLY, _DRAFT_ADD_NORM_EARLY = 7, 8
 
 _JIT_ROOT = pathlib.Path(__file__).resolve().parents[2] / "kernels" / "jit"
 _SOURCE = _JIT_ROOT / "csrc" / "distributed" / "q35_hop_kernels.cu"
@@ -51,7 +54,10 @@ class _Args(ctypes.Structure):
             "partial", "routed", "expert_w", "permuted", "shared", "residual_in", "gamma",
             "fp8_scale", "residual_out", "norm_out", "fp8_out",
         )
-    ] + [("m", ctypes.c_int), ("top_k", ctypes.c_int), ("eps", ctypes.c_float)]
+    ] + [
+        ("m", ctypes.c_int), ("top_k", ctypes.c_int), ("eps", ctypes.c_float),
+        ("weight_bias", ctypes.c_float), ("delay_ns", ctypes.c_int),
+    ]
 
 
 class _OprojArgs(ctypes.Structure):
@@ -243,6 +249,32 @@ class Q35Hop:
             a.partial = local_contribution.data_ptr()
             self._launch(_PUBLISH, a)
         self._launch(_CONSUME, a)
+        return outs
+
+    def draft_all_reduce_rms_norm(
+        self, *, local_contribution, residual, gamma, eps, weight_bias, add_norm,
+        early_release=False, delay_ns=0,
+    ):
+        """One draft-step hop with the rounding of the kernels it replaces. add_norm=False: FlashInfer's
+        legacy MNNVL fused all-reduce, gamma the applied multiplier (weight_bias 0). add_norm=True: the
+        one-shot all-reduce, then FlashInfer's CuTe DSL FusedAddRMSNorm with multiplier weight_bias + gamma.
+        early_release: the consume releases its dependents at entry (they must read only static data before
+        their PDL wait). delay_ns: diagnostic hold of the output stores."""
+        m = int(local_contribution.shape[0])
+        outs = self._outputs(m, None)
+        a = self._args(m=m, residual=residual, gamma=gamma, fp8_scale=None, outs=outs)
+        a.eps, a.weight_bias, a.delay_ns = eps, weight_bias, delay_ns
+        if self.has_pushed(local_contribution):
+            self._pushed = None
+        else:
+            if self._pushed is not None:
+                raise RuntimeError("q35_hop: a pushed partial was never consumed")
+            a.partial = local_contribution.data_ptr()
+            self._launch(_PUBLISH, a)
+        if early_release:
+            self._launch(_DRAFT_ADD_NORM_EARLY if add_norm else _DRAFT_MNNVL_EARLY, a)
+        else:
+            self._launch(_DRAFT_ADD_NORM if add_norm else _DRAFT_MNNVL, a)
         return outs
 
     def moe_finalize_all_reduce_rms_norm(
