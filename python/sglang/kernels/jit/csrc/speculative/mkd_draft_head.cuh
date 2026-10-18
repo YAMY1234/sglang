@@ -39,6 +39,7 @@ struct MkdHeadParams {
   bf16_t* logits;                // [N]
   uint32_t* part;                // [gridDim.x] packed (key16 << 16) | (0xffff - row), or kNanPart
   int32_t n;
+  int32_t reverse;               // 1: walk the rows from the end (alternate steps, see the caller)
 };
 
 /**
@@ -55,9 +56,11 @@ __global__ void __launch_bounds__(kWarps * 32) mkd_head_kernel(const MkdHeadPara
   const int lane = static_cast<int>(threadIdx.x % 32);
   const int stride = static_cast<int>(gridDim.x) * kWarps;
   int row = static_cast<int>(blockIdx.x) * kWarps + warp;
+  // Walk position i maps to weight row i, or n - 1 - i on reversed calls.
+  auto wrow = [&](int i) { return p.reverse ? p.n - 1 - i : i; };
   uint4 wv[kVecs];
   if (row < p.n) {
-    const uint4* wr = reinterpret_cast<const uint4*>(p.w + static_cast<int64_t>(row) * kK);
+    const uint4* wr = reinterpret_cast<const uint4*>(p.w + static_cast<int64_t>(wrow(row)) * kK);
 #pragma unroll
     for (int j = 0; j < kVecs; ++j) wv[j] = __ldg(wr + j * 32 + lane);
   }
@@ -81,16 +84,17 @@ __global__ void __launch_bounds__(kWarps * 32) mkd_head_kernel(const MkdHeadPara
     }
     const int next = row + stride;
     if (next < p.n) {
-      const uint4* wr = reinterpret_cast<const uint4*>(p.w + static_cast<int64_t>(next) * kK);
+      const uint4* wr = reinterpret_cast<const uint4*>(p.w + static_cast<int64_t>(wrow(next)) * kK);
 #pragma unroll
       for (int j = 0; j < kVecs; ++j) wv[j] = __ldg(wr + j * 32 + lane);
     }
     acc = warp::reduce_sum(acc);
     if (lane == 0) {
+      const int r = wrow(row);
       const bf16_t v = cast<bf16_t>(acc);
-      p.logits[row] = v;
+      p.logits[r] = v;
       const uint32_t k = mkd_head::key16(v, nan);
-      best = max(best, (k << 16) | (0xffffu - static_cast<uint32_t>(row)));
+      best = max(best, (k << 16) | (0xffffu - static_cast<uint32_t>(r)));
     }
   }
   if (lane == 0) s_best[warp] = nan ? mkd_head::kNanPart : best;
@@ -109,7 +113,7 @@ struct MkdHead {
   static constexpr int kWarps = 16;
 
   static void run(const tvm::ffi::TensorView x, const tvm::ffi::TensorView w, const tvm::ffi::TensorView logits,
-                  const tvm::ffi::TensorView part) {
+                  const tvm::ffi::TensorView part, int64_t reverse) {
     using namespace host;
     auto N = SymbolicSize{"rows"};
     auto G = SymbolicSize{"ctas"};
@@ -126,6 +130,7 @@ struct MkdHead {
         .logits = static_cast<bf16_t*>(logits.data_ptr()),
         .part = static_cast<uint32_t*>(part.data_ptr()),
         .n = static_cast<int32_t>(N.unwrap()),
+        .reverse = static_cast<int32_t>(reverse != 0),
     };
     LaunchKernel(static_cast<uint32_t>(G.unwrap()), kWarps * 32, device.unwrap())
         .enable_pdl(kUsePDL)(mkd_head_kernel<kK, kWarps, kUsePDL>, params);

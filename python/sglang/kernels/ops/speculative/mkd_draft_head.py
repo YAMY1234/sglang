@@ -26,7 +26,11 @@ def _module() -> Module:
     )
 
 
-def mkd_draft_head(x: torch.Tensor, weight: torch.Tensor, logits: torch.Tensor, part: torch.Tensor) -> None:
+def mkd_draft_head(
+    x: torch.Tensor, weight: torch.Tensor, logits: torch.Tensor, part: torch.Tensor, reverse: bool = False
+) -> None:
     """Draft lm_head of one token, ``logits`` [1, N] bf16 = ``x`` [1, 4096] @ ``weight`` [N, 4096]^T with
-    fp32 accumulation, and per CTA (``part.numel()`` CTAs) the packed maximum of its rows for mkd_xchg."""
-    _module().run(x, weight, logits, part)
+    fp32 accumulation, and per CTA (``part.numel()`` CTAs) the packed maximum of its rows for mkd_xchg.
+    ``reverse`` walks the rows from the end (same values; the rows a previous forward walk read last,
+    likeliest still in L2, are read first)."""
+    _module().run(x, weight, logits, part, int(reverse))
