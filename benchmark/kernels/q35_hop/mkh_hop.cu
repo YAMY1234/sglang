@@ -69,6 +69,7 @@ struct Params {
   unsigned int poll_sleep_ns;     // back-off between polls of the mailbox (0 = spin)
   int self_only;                  // diagnostic: poll only this rank's own slot
   int active_rank;                // diagnostic: >= 0 makes every other rank's launch a no-op
+  int early_trigger;              // publish launches trigger their dependents at entry
 };
 
 // ---------------------------------------------------------------- PTX helpers
@@ -704,6 +705,51 @@ __global__ void __launch_bounds__(kThreads) fused_kernel(Params p) {
   hop_end(p, hs);
 }
 
+// Finalize-publish with 4 bf16 per thread (8 CTAs x 128 threads per token).
+template <int W>
+__global__ void __launch_bounds__(kThreads) publish_fin_quad_kernel(Params p) {
+  __shared__ int32_t meta_rows[16];
+  __shared__ float meta_wts[16];
+  const int token = blockIdx.x;
+  const int quad = blockIdx.y * kThreads + threadIdx.x;
+  if (threadIdx.x < p.top_k) {
+    const int i = token * p.top_k + threadIdx.x;
+    const int r = p.permuted[i];
+    meta_rows[threadIdx.x] = r;
+    meta_wts[threadIdx.x] = r < 0 ? 0.f : __uint_as_float(static_cast<uint32_t>(p.expert_w[i]) << 16);
+  }
+  __syncthreads();
+  if (p.early_trigger) pdl_trigger();
+  pdl_wait();
+  const uint32_t stage = ld_volatile_u32(&p.ctrl->stage);
+  const size_t col = static_cast<size_t>(quad) * 4;
+  uint2 src[16];
+#pragma unroll
+  for (int k = 0; k < 16; ++k)
+    if (k < p.top_k && meta_rows[k] >= 0)
+      src[k] = *reinterpret_cast<const uint2*>(p.routed + static_cast<size_t>(meta_rows[k]) * kHidden + col);
+  uint2 sh = make_uint2(0, 0);
+  if (p.shared != nullptr) sh = *reinterpret_cast<const uint2*>(p.shared + static_cast<size_t>(token) * kHidden + col);
+  float acc[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+  for (int k = 0; k < 16; ++k) {
+    if (k < p.top_k && meta_rows[k] >= 0) {
+      const float f[4] = {bf_lo(src[k].x), bf_hi(src[k].x), bf_lo(src[k].y), bf_hi(src[k].y)};
+#pragma unroll
+      for (int e = 0; e < 4; ++e) acc[e] = __fadd_rn(acc[e], __fmul_rn(f[e], meta_wts[k]));
+    }
+  }
+  if (p.shared != nullptr) {
+    const float f[4] = {bf_lo(sh.x), bf_hi(sh.x), bf_lo(sh.y), bf_hi(sh.y)};
+#pragma unroll
+    for (int e = 0; e < 4; ++e) acc[e] = __fadd_rn(acc[e], f[e]);
+  }
+  uint2 v = make_uint2(sanitize_word(pack_bf16x2(acc[0], acc[1])), sanitize_word(pack_bf16x2(acc[2], acc[3])));
+  uint16_t* dst = static_cast<uint16_t*>(p.mb_mc) + mb_off(p, stage, p.rank, token, quad >> 1) + (quad & 1) * 4;
+  asm volatile("multimem.st.relaxed.sys.global.v2.bf16x2 [%0], {%1,%2};" ::"l"(dst), "r"(v.x), "r"(v.y) : "memory");
+  if (!p.early_trigger) pdl_trigger();
+}
+
 // Split-hop publishers for the drop-in: push this rank's partial straight from global memory
 // (hop B) or finalize the routed rows first (hop A, metadata staged before the PDL wait).
 template <int W, bool FIN>
@@ -721,12 +767,13 @@ __global__ void __launch_bounds__(kThreads) publish_kernel(Params p) {
     }
     __syncthreads();
   }
+  if (p.early_trigger) pdl_trigger();
   pdl_wait();
   const uint32_t stage = ld_volatile_u32(&p.ctrl->stage);
   const size_t row = static_cast<size_t>(token) * kHidden + static_cast<size_t>(frag) * kVec;
   const uint4 mine = FIN ? finalize_frag<false>(p, token, frag, meta_rows, meta_wts) : ld_v4(p.partial + row);
   push_ll<W, false>(p, stage, token, frag, mine);
-  pdl_trigger();
+  if (!p.early_trigger) pdl_trigger();
 }
 
 // M2 consumer: pull + residual + RMSNorm (+ FP8); its producer already pushed.
@@ -932,13 +979,14 @@ enum Variant : int {
   kOneLLWeak = 12,   // M1 polling with ld.relaxed.sys instead of ld.volatile
   kPublish = 13,     // split hop: push the global partial
   kPublishFin = 14,  // split hop: finalize + push
-  kFused = 15        // consume hop k and produce hop k+1 in one launch
+  kFused = 15,       // consume hop k and produce hop k+1 in one launch
+  kPublishFinQuad = 16
 };
 
 template <typename K>
-static int launch(K kernel, const Params& p, cudaStream_t stream, bool cluster) {
+static int launch(K kernel, const Params& p, cudaStream_t stream, bool cluster, int ctas = kCtas) {
   cudaLaunchConfig_t cfg = {};
-  cfg.gridDim = dim3(p.m, kCtas, 1);
+  cfg.gridDim = dim3(p.m, ctas, 1);
   cfg.blockDim = dim3(kThreads, 1, 1);
   cfg.dynamicSmemBytes = 0;
   cfg.stream = stream;
@@ -984,6 +1032,7 @@ static int dispatch(int variant, int order, const Params& p, cudaStream_t s) {
     case kProdPlain: return launch(prod_kernel<W, false, false>, p, s, false);
     case kPublish: return launch(publish_kernel<W, false>, p, s, false);
     case kPublishFin: return launch(publish_kernel<W, true>, p, s, false);
+    case kPublishFinQuad: return launch(publish_fin_quad_kernel<W>, p, s, false, 8);
     case kConsume: MKH_BY_ORDER(return launch(consume_kernel<W, SQ, WR>, p, s, true))
     case kFused: MKH_BY_ORDER(return launch(fused_kernel<W, SQ, WR>, p, s, true))
     case kLdr1: MKH_BY_ORDER(return launch(ldr1_kernel<SQ, WR>, p, s, true))

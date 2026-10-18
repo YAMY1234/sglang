@@ -1494,6 +1494,10 @@ class Envs:
     # With --flashinfer-allreduce-fusion-backend cutedsl, build and capture the draft
     # with the auto (mnnvl) FlashInfer all-reduce fusion instead of a plain all-reduce.
     SGLANG_Q35MF_DRAFT_MNNVL_AR = EnvBool(False)
+    # With --flashinfer-allreduce-fusion-backend cutedsl, run the M <= 15 all-reduce and
+    # MoE-finalize hops on srt/layers/q35_hop.py (bit-identical outputs; the attention-input
+    # hop also hands its FP8 to the next linear).
+    SGLANG_Q35MF_MKH_HOP = EnvBool(False)
 
     # ===================================================================
     # Multimodal processing

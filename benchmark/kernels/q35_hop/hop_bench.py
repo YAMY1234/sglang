@@ -115,7 +115,8 @@ def _check(args, ctx, m, t, fusion, mkh, static_quant_fp8, seed=0):
     torch.cuda.synchronize()
     rows = []
     for name, rn, rr, rq in (("one", ref_n, ref_r, ref_q), ("fin", fref_n, fref_r, fref_q),
-                             ("split", ref_n, ref_r, ref_q), ("split_fin", fref_n, fref_r, fref_q)):
+                             ("split", ref_n, ref_r, ref_q), ("split_fin", fref_n, fref_r, fref_q),
+                             ("split_finq", fref_n, fref_r, fref_q)):
         for order in (1,):
             maker = mkh.make_split if name.startswith("split") else mkh.make_call
             call = maker(name, m=m, x=t["x"], residual=t["residual"], gamma=t["gamma"],
@@ -197,7 +198,7 @@ def main():
 
     from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
 
-    need_fusion = any(b.startswith(("fi_ar", "fi_fin", "chain:plain_fi")) or b.startswith("check")
+    need_fusion = any(b.startswith(("fi_ar", "fi_fin", "chain:plain_fi", "q35check")) or b.startswith("check")
                       for b in backends)
     fusion = None
     if need_fusion:
@@ -233,6 +234,12 @@ def main():
         print(json.dumps(dict(event="mkh_build", rank=rank, digest=mkh.digest)), flush=True)
         if args.stamps:
             mkh.stamps = torch.zeros(64, args.max_m * mkh_hop.CTAS, 16, dtype=torch.int64, device=dev)
+
+    q35 = None
+    if any(b.startswith("q35:") for b in backends):
+        from sglang.srt.layers.q35_hop import Q35Hop
+
+        q35 = Q35Hop(max_m=args.max_m, rms_epsilon=1e-6, process_group=dist.group.WORLD, device=dev)
 
     results = {}
     for m in ms:
@@ -290,6 +297,48 @@ def main():
             try:
                 if b == "check":
                     _check(args, ctx, m, t, fusion, mkh, static_quant_fp8)
+                    continue
+                if b.startswith("q35check"):
+                    # production module (srt/layers/q35_hop.py) vs FlashInfer + Triton quant, bitwise
+                    ref_n, ref_r = fusion.all_reduce_residual_rms_norm(
+                        local_contribution=t["x"], residual=t["residual"], gamma=t["gamma"])
+                    ref_q, _ = static_quant_fp8(ref_n, t["scale"])
+                    fref_n, fref_r = fusion.moe_finalize_all_reduce_rms_norm(
+                        routed_output=t["routed"], expert_weights=t["weights"],
+                        permuted_indices=t["permuted"], gated_shared_output=t["shared"],
+                        residual=t["residual"], gamma=t["gamma"])
+                    fref_q, _ = static_quant_fp8(fref_n, t["scale"])
+                    a_n, a_r, a_q = q35.all_reduce_residual_rms_norm(
+                        local_contribution=t["x"], residual=t["residual"], gamma=t["gamma"],
+                        fp8_scale=t["scale"])
+                    f_n, f_r, f_q = q35.moe_finalize_all_reduce_rms_norm(
+                        routed_output=t["routed"], expert_weights=t["weights"],
+                        permuted_indices=t["permuted"], gated_shared_output=t["shared"],
+                        residual=t["residual"], gamma=t["gamma"], fp8_scale=t["scale"])
+                    torch.cuda.synchronize()
+                    for nm, got, ref in (("q35_ar", (a_n, a_r, a_q), (ref_n, ref_r, ref_q)),
+                                         ("q35_fin", (f_n, f_r, f_q), (fref_n, fref_r, fref_q))):
+                        print(json.dumps(dict(event="check", backend=nm, order=1, m=m, rank=rank,
+                                              norm=_diff(got[0], ref[0]), residual=_diff(got[1], ref[1]),
+                                              fp8=_diff(got[2], ref[2]))), flush=True)
+                    print(json.dumps(dict(event="errors", rank=rank, q35=q35.error_bits())), flush=True)
+                    continue
+                if b.startswith("q35:"):
+                    kind = b[4:]
+                    if kind == "ar":
+                        fn = lambda: q35.all_reduce_residual_rms_norm(
+                            local_contribution=t["x"], residual=t["residual"], gamma=t["gamma"],
+                            fp8_scale=t["scale"])
+                    elif kind == "ar_nq":
+                        fn = lambda: q35.all_reduce_residual_rms_norm(
+                            local_contribution=t["x"], residual=t["residual"], gamma=t["gamma"])
+                    else:
+                        fn = lambda: q35.moe_finalize_all_reduce_rms_norm(
+                            routed_output=t["routed"], expert_weights=t["weights"],
+                            permuted_indices=t["permuted"], gated_shared_output=t["shared"],
+                            residual=t["residual"], gamma=t["gamma"],
+                            fp8_scale=None if kind == "fin_nq" else t["scale"])
+                    results[name] = _bench(b, fn, args, ctx, m)
                     continue
                 if b.startswith("pingpong:"):
                     parts = b.split(":")
