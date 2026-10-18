@@ -559,6 +559,9 @@ class Envs:
     SGLANG_Q35MF_DRAFT_MOE_GEMV = EnvBool(False)
     # With the draft MoE GEMV path: also fuse the router GEMV, softmax and top-k.
     SGLANG_Q35MF_DRAFT_MOE_ROUTER = EnvBool(False)
+    # With the draft MoE GEMV path: router, top-k and both GEMV passes as one
+    # launch, bitwise equal to the fused router + GEMV path.
+    SGLANG_Q35MF_MKD_MOE1 = EnvBool(False)
     # Greedy draft steps select the token on vocab shards and exchange one packed
     # row (argmax + embedding) instead of all-gathering the logits.
     SGLANG_Q35MF_DRAFT_ARGMAX_EXCHANGE = EnvBool(False)
