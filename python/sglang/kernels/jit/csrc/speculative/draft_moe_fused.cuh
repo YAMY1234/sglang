@@ -695,7 +695,7 @@ struct DraftMoeFused {
     }();
     (void)attr_set;
     // CTAs spin on each other's results, so the whole grid has to be resident at once.
-    const auto per_sm = runtime::get_blocks_per_sm(kernel, kThreads, kSmem);
+    static const uint32_t per_sm = runtime::get_blocks_per_sm(kernel, kThreads, kSmem);
     const auto sms = runtime::get_sm_count(dev.device_id);
     CHECK_HOST(per_sm >= 1 && static_cast<uint32_t>(grid) <= per_sm * sms)
         << "fused draft MoE grid " << grid << " does not fit: " << per_sm << " CTA/SM x " << sms << " SMs";
