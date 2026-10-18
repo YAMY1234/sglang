@@ -1121,6 +1121,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     static_quant_scale=self.out_proj.input_scale,
                 )
                 fp8 = fp8.reshape(-1, nv * self.head_v_dim)
+                if envs.SGLANG_Q35MF_MKH_OPROJ.get() and fp8.shape[0] <= 8:
+                    from sglang.srt.layers.q35_hop import active
+
+                    hop = active()
+                    if hop is not None and self.out_proj.q35_packed is not None:
+                        return hop.out_proj_push(
+                            x_fp8=fp8,
+                            packed_w=self.out_proj.q35_packed,
+                            input_scale=self.out_proj.input_scale,
+                            weight_scale=self.out_proj.weight_scale,
+                        )
                 return self.out_proj(fp8)[0]
             print_warning_once(
                 "GDN static FP8 norm is unsupported; using the original path"
