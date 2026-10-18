@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+# Modified by NVIDIA: add opt-in clustered linear-attention verification.
 """Inference-only Qwen3.5 model and Qwen3.5 MoE model compatible with HuggingFace weights."""
 
 import logging
@@ -525,6 +526,22 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             prefix=add_prefix("out_proj", prefix),
         )
 
+        self._fused_verify_enabled = (
+            _is_cuda
+            and envs.SGLANG_Q35MF_MKG_FUSED.get()
+            and self.attn_tp_size == 8
+            and get_parallel().pp_size == 1
+        )
+        self._fused_verify_buffers = None
+        if self._fused_verify_enabled:
+            from sglang.kernels.ops.attention.gdn_pdl_front import ensure_built
+
+            ensure_built()
+            self._derived_weight_cache_error = (
+                "Online weight updates are unsupported with the packed GDN "
+                "projection cache. Restart the worker to reload projection weights."
+            )
+
     @staticmethod
     def _override_weight_loader(param, loader):
         """Robustly override loader for:
@@ -973,6 +990,163 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         output, _ = self.out_proj(core_attn_out)
         return output
 
+    def _try_fused_verify(self, hidden_states, forward_batch):
+        """Use the clustered projection/Conv1D path for its supported layout."""
+        if (
+            not forward_batch.forward_mode.is_target_verify()
+            or not isinstance(hidden_states, torch.Tensor)
+            or hidden_states.dtype != torch.bfloat16
+            or hidden_states.shape != (7, 4096)
+            or not hidden_states.is_contiguous()
+            or self.attn_tp_size != 8
+            or (self.attn.num_k_heads, self.attn.num_v_heads) != (2, 8)
+            or (self.head_k_dim, self.head_v_dim) != (128, 128)
+            or self.conv_kernel_size != 4
+            or self.activation not in ("silu", "swish")
+            or self.norm.activation not in ("silu", "swish")
+            or not self.norm.norm_before_gate
+            or self.norm.bias is not None
+            or self.norm.group_size is not None
+            or self.attn.bias is not None
+            or forward_batch.spec_info.draft_token_num != 7
+            or forward_batch.spec_info.ragged_verify_layout is not None
+        ):
+            return None
+
+        from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+        from sglang.srt.layers.quantization.modelopt_quant import (
+            ModelOptFp8LinearMethod,
+        )
+        from sglang.srt.mem_cache.memory_pool import MambaPool
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        backend = get_attn_backend()
+        backend = getattr(backend, "linear_attn_backend", backend)
+        if not isinstance(backend, GDNAttnBackend) or backend.mis_metadata is not None:
+            return None
+        metadata = backend.forward_metadata
+        if (
+            metadata.query_start_loc.numel() != 2
+            or metadata.retrieve_next_token is not None
+            or metadata.retrieve_next_sibling is not None
+            or metadata.retrieve_parent_token is not None
+        ):
+            return None
+        cache = backend.req_to_token_pool.mamba2_layer_cache(self.layer_id)
+        if not isinstance(cache, MambaPool.SpeculativeState):
+            return None
+        windows = cache.intermediate_conv_window[0]
+        if (
+            cache.conv[0].dtype != torch.bfloat16
+            or cache.conv[0].shape[1:] != (1536, 3)
+            or windows is None
+            or windows.dtype != torch.bfloat16
+            or windows.shape[1:] != (7, 1536, 3)
+            or windows.stride()[1:] != (1, 9, 1)
+            or windows.stride(0) < 1536 * 9
+            or self.attn.conv_weights.shape != (1536, 4)
+            or self.attn.conv_weights.dtype != torch.bfloat16
+            or not self.attn.conv_weights.is_contiguous()
+        ):
+            return None
+        for projection, weight_shape in (
+            (self.in_proj_qkvz, (4096, 2560)),
+            (self.out_proj, (1024, 4096)),
+        ):
+            method = projection.quant_method
+            if (
+                not isinstance(method, ModelOptFp8LinearMethod)
+                or method.use_marlin
+                or method.use_sm120_fp8
+                or projection.weight.dtype != torch.float8_e4m3fn
+                or projection.weight.shape != weight_shape
+                or projection.input_scale.numel() != 1
+                or projection.weight_scale.numel() != 1
+                or projection.input_scale.dtype != torch.float32
+                or projection.weight_scale.dtype != torch.float32
+            ):
+                return None
+
+        from sglang.kernels.ops.attention.gdn_pdl_front import front, pack
+        from sglang.kernels.ops.attention.gdn_pdl_norm import norm
+
+        source = self.in_proj_qkvz.weight.data_ptr()
+        buffers = self._fused_verify_buffers
+        if buffers is None or buffers["source"] != source:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("Fused GDN weights must be prepared before capture")
+            buffers = {
+                "source": source,
+                "checked": False,
+                "weight": pack(self.in_proj_qkvz.weight.t()),
+                "projected": hidden_states.new_empty((7, 2560)),
+                "conv": hidden_states.new_empty((7, 1536)),
+                "quant": torch.empty(
+                    (56, 128), device=hidden_states.device, dtype=torch.float8_e4m3fn
+                ),
+                "rstd": torch.empty(
+                    (56,), device=hidden_states.device, dtype=torch.float32
+                ),
+                "error": torch.zeros(
+                    (1,), device=hidden_states.device, dtype=torch.int32
+                ),
+            }
+            self._fused_verify_buffers = buffers
+            logger.info("Fused GDN projection/Conv1D enabled for layer %s", self.layer_id)
+
+        def projection_conv(conv_states, windows, state_indices, replay_indices):
+            current_stream = torch.cuda.current_stream()
+            if self.alt_stream is not None:
+                self.alt_stream.wait_stream(current_stream)
+            front(
+                hidden_states,
+                buffers["weight"],
+                self.in_proj_qkvz.input_scale,
+                self.in_proj_qkvz.weight_scale,
+                self.attn.conv_weights,
+                conv_states,
+                windows,
+                state_indices[:1],
+                replay_indices[:1],
+                buffers["projected"],
+                buffers["conv"],
+                buffers["error"],
+                pad_slot=backend.pad_slot_id,
+            )
+            if self.alt_stream is not None:
+                with torch.cuda.stream(self.alt_stream):
+                    ba = self.in_proj_ba(hidden_states)[0]
+                current_stream.wait_stream(self.alt_stream)
+            else:
+                ba = self.in_proj_ba(hidden_states)[0]
+            return buffers["conv"], ba[:, 8:], ba[:, :8]
+
+        core = backend.forward_extend(
+            layer=self.attn,
+            forward_batch=forward_batch,
+            mixed_qkv=buffers["conv"],
+            a=None,
+            b=None,
+            projection_conv=projection_conv,
+        )
+        if not buffers["checked"]:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("Fused GDN must pass its eager warmup before capture")
+            if int(buffers["error"].item()):
+                raise RuntimeError("Fused GDN projection reported a sticky error")
+            buffers["checked"] = True
+        z = buffers["projected"][:, 1536:].view(7, 8, 128)
+        norm(
+            core.reshape(56, 128),
+            z,
+            self.norm.weight,
+            self.out_proj.input_scale,
+            buffers["quant"],
+            buffers["rstd"],
+            self.norm.eps,
+        )
+        return self.out_proj(buffers["quant"].view(7, 1024))[0]
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -984,6 +1158,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         2. Core attention (custom op)
         3. Output projection
         """
+        if self._fused_verify_enabled:
+            fused_output = self._try_fused_verify(hidden_states, forward_batch)
+            if fused_output is not None:
+                return fused_output
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
             hidden_states
         )
