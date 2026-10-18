@@ -3,7 +3,7 @@
 // hidden 4096, intermediate 128 per rank): DynBlock-exact top-10 from the router logits, FC1, SwiGLU, NVFP4
 // requantization and FC2 in one launch over the trtllm-gen weight layout. Writes the RT deferred-finalize rows
 // (row t * 10 + k, identity permutation) and the expert weights.
-// Device code generated from the MKM lane engine (source md5 8056bd3ec9ed9b19cf4b189407d2578b, PTX helpers md5 b4d0b7dea5606da866a21d8e1a373dd9) by
+// Device code generated from the MKM lane engine (source md5 974c0ada1b3cec90241d52b262e5463e, PTX helpers md5 b4d0b7dea5606da866a21d8e1a373dd9) by
 // lanes/mkm/tools/export_cuh.py.
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.cuh>
@@ -340,6 +340,11 @@ __device__ __forceinline__ void tmem_st_x32(uint32_t taddr, const uint32_t (&r)[
 __device__ __forceinline__ float ex2_approx(float x) {
   float y;
   asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+  return y;
+}
+__device__ __forceinline__ float mul_ftz(float a, float b) {
+  float y;
+  asm("mul.ftz.f32 %0, %1, %2;" : "=f"(y) : "f"(a), "f"(b));
   return y;
 }
 __device__ __forceinline__ float rcp_approx(float x) {
@@ -925,24 +930,26 @@ s1_kernel(const __grid_constant__ CUtensorMap tm13, const __grid_constant__ CUte
       const float4 ue = ar[0], ge = ar[2], uo = ar[4], go = ar[6];
       const float ga[8] = {ge.x, go.x, ge.y, go.y, ge.z, go.z, ge.w, go.w};
       const float ua[8] = {ue.x, uo.x, ue.y, uo.y, ue.z, uo.z, ue.w, uo.w};
+      // trtllm-gen's SwiGLU + NVFP4 epilogue op for op (from its SASS); a = FC1 dequant, c = a x FC2 input scale:
+      // h' = (u a)(g sigmoid(g a)), sigmoid = rcp(ex2(-(g (a log2e))) + 1), block scale e4m3(max|h'| c / 6), FP4 (h' / scale) c
+      const float a_l2e = mul_ftz(ag, 1.4426950216293334961f);
       float h[8];
       float amax = 0.f;
 #pragma unroll
       for (int i = 0; i < 8; ++i) {
-        const float g = ga[i] * ag;
-        const float u = ua[i] * sc;
-        const float sg = rcp_approx(ex2_approx(g * -1.4426950408889634f) + 1.0f);
-        const float v = g * sg * u;
+        const float e = ex2_approx(-(ga[i] * a_l2e));
+        const float sg = rcp_approx(e + 1.0f);
+        const float v = fmaf(ua[i], ag, 0.0f) * (ga[i] * sg);
         h[i] = v;
         amax = fmaxf(amax, fabsf(v));
       }
       amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
-      const uint32_t sf = cvt_e4m3(amax * rcp_approx(6.0f));
+      const uint32_t sf = cvt_e4m3(fmaxf(0.f, fabsf(amax * sc)) * 0.16666667163372039795f);
       const float sff = e4m3_to_f32(sf);
       const float osc = sff == 0.f ? 0.f : rcp_approx(sff);
       float qv[8];
 #pragma unroll
-      for (int i = 0; i < 8; ++i) qv[i] = h[i] * osc;
+      for (int i = 0; i < 8; ++i) qv[i] = mul_ftz(h[i], osc) * sc;
       const uint32_t packed = cvt_e2m1x8(qv);
       const int gblk = 4 * (int)rank + blk;  // 16-wide block over the 128 intermediates; k-block = rank
       const int chunk = gblk / 2;
@@ -1031,7 +1038,7 @@ inline CUtensorMap make_tmap(const void* base, uint64_t rows, uint64_t row_bytes
 /// \brief Launcher of the fused expert phase; every CTA pair beyond the number of selected experts exits.
 struct MkmMoe {
   /// Low 60 bits of the engine source md5 this module was compiled from (stale-build check).
-  static int64_t source_md5_lo() { return 0x8056bd3ec9ed9b1LL; }
+  static int64_t source_md5_lo() { return 0x974c0ada1b3cec9LL; }
 
   /// \param logits         [M, 512] bf16 router logits (router_gemm_quant output), M <= 7.
   /// \param expert_weights [M, 10] bf16 out, DynBlock softmax-over-top-10 weights.
