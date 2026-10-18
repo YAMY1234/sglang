@@ -87,15 +87,17 @@ __global__ void __launch_bounds__(kRowThreads) publish_fin_quad_kernel(Args a) {
     wts[threadIdx.x] = r < 0 ? 0.f : __uint_as_float(static_cast<uint32_t>(a.expert_w[i]) << 16);
   }
   __syncthreads();
+  const size_t col = static_cast<size_t>(quad) * 4;
+  // The gated shared-expert output comes from a side stream joined before this launch, so it is
+  // read before the PDL wait, as the reference finalize does.
+  uint2 sh = make_uint2(0, 0);
+  if (a.shared != nullptr) sh = *reinterpret_cast<const uint2*>(a.shared + static_cast<size_t>(token) * kHidden + col);
   pdl_wait();
   const uint32_t stage = stage_peek(a.site);
-  const size_t col = static_cast<size_t>(quad) * 4;
   uint2 src[kMaxTopK];
 #pragma unroll
   for (int k = 0; k < kMaxTopK; ++k)
     if (k < a.top_k && rows[k] >= 0) src[k] = *reinterpret_cast<const uint2*>(a.routed + static_cast<size_t>(rows[k]) * kHidden + col);
-  uint2 sh = make_uint2(0, 0);
-  if (a.shared != nullptr) sh = *reinterpret_cast<const uint2*>(a.shared + static_cast<size_t>(token) * kHidden + col);
   float acc[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
   for (int k = 0; k < kMaxTopK; ++k) {

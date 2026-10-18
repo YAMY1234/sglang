@@ -742,17 +742,17 @@ __global__ void __launch_bounds__(kThreads) publish_fin_quad_kernel(Params p) {
     meta_wts[threadIdx.x] = r < 0 ? 0.f : __uint_as_float(static_cast<uint32_t>(p.expert_w[i]) << 16);
   }
   __syncthreads();
+  const size_t col = static_cast<size_t>(quad) * 4;
+  uint2 sh = make_uint2(0, 0);
+  if (p.shared != nullptr) sh = *reinterpret_cast<const uint2*>(p.shared + static_cast<size_t>(token) * kHidden + col);
   if (p.early_trigger) pdl_trigger();
   pdl_wait();
   const uint32_t stage = ld_volatile_u32(&p.ctrl->stage);
-  const size_t col = static_cast<size_t>(quad) * 4;
   uint2 src[16];
 #pragma unroll
   for (int k = 0; k < 16; ++k)
     if (k < p.top_k && meta_rows[k] >= 0)
       src[k] = *reinterpret_cast<const uint2*>(p.routed + static_cast<size_t>(meta_rows[k]) * kHidden + col);
-  uint2 sh = make_uint2(0, 0);
-  if (p.shared != nullptr) sh = *reinterpret_cast<const uint2*>(p.shared + static_cast<size_t>(token) * kHidden + col);
   float acc[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
   for (int k = 0; k < 16; ++k) {
