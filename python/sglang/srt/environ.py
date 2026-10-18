@@ -559,6 +559,9 @@ class Envs:
     SGLANG_Q35MF_DRAFT_MOE_GEMV = EnvBool(False)
     # With the draft MoE GEMV path: also fuse the router GEMV, softmax and top-k.
     SGLANG_Q35MF_DRAFT_MOE_ROUTER = EnvBool(False)
+    # With the draft MoE GEMV path: router, top-k and both GEMV passes as one
+    # launch, bitwise equal to the fused router + GEMV path.
+    SGLANG_Q35MF_MKD_MOE1 = EnvBool(False)
     # Greedy draft steps select the token on vocab shards and exchange one packed
     # row (argmax + embedding) instead of all-gathering the logits.
     SGLANG_Q35MF_DRAFT_ARGMAX_EXCHANGE = EnvBool(False)
@@ -580,6 +583,24 @@ class Envs:
     # Path of a sorted token-id list (torch int64 tensor); the greedy MTP draft then
     # scores only these vocabulary rows of the shared bf16 lm_head, split across TP ranks.
     SGLANG_Q35MF_SPEC_HOT_VOCAB = EnvStr(None)
+    # With the draft argmax exchange and the fc split: single-token draft steps exchange the
+    # candidate row and the hidden-half fc partials in one multicast launch, and each rank
+    # finishes the fc from the exchanged data (bitwise equal to the split fc).
+    SGLANG_Q35MF_MKD_XCHG = EnvBool(False)
+    # With SGLANG_Q35MF_MKD_XCHG: candidates carry a load-time memo of their embedding-half
+    # fc partials (summed in rank order) instead of the embedding row.
+    SGLANG_Q35MF_MKD_TTABLE = EnvBool(False)
+    # MB of the draft lm_head shard prefetched into L2 while single-token draft steps wait on
+    # the all-reduce after the MoE (0 = off); a cache hint, values unchanged.
+    SGLANG_Q35MF_MKD_L2PF_MB = EnvInt(0)
+    # MB of the draft qkv projection weight prefetched into L2 by the draft-step exchange (0 = off).
+    SGLANG_Q35MF_MKD_L2PF_QKV_MB = EnvInt(0)
+    # Diagnostic: the draft-step exchange stamps per-phase %globaltimer into pinned host memory
+    # and a thread logs percentiles every 20 s (slows the kernel; never in a timed run).
+    SGLANG_Q35MF_MKD_TRACE = EnvBool(False)
+    # With SGLANG_Q35MF_MKD_TTABLE: the draft extend's exchange also finishes the fc of the next
+    # draft's first step, which then skips its embedding and fc (stock fill when no extend ran).
+    SGLANG_Q35MF_MKD_EXTEND_FC = EnvBool(False)
 
     # ===================================================================
     # Memory pools and KV-cache sizing

@@ -83,6 +83,7 @@ class DraftVocabExchange:
 
     def __init__(self, model, num_steps: int, hot: Optional[DraftHotVocab] = None) -> None:
         self.model = model
+        self.num_steps = num_steps
         embed = model.model.embed_tokens
         parallel = get_parallel()
         self.world = parallel.tp_size
@@ -120,6 +121,8 @@ class DraftVocabExchange:
         self.no_tokens = torch.empty(0, dtype=torch.int64, device=dev)
         self.no_positions = torch.empty(0, dtype=torch.int64, device=dev)
         self.num_rows = 1
+        # One-launch boundary (SGLANG_Q35MF_MKD_XCHG), attached after construction.
+        self.mkd = None
         # Same guarded multimem all-gather as the logits gather; a cross-rank
         # all-reduce always sits between two draft steps' gathers.
         self.gatherer = triton_symm_mem_ag.MultimemAllGatherer(
@@ -143,7 +146,19 @@ class DraftVocabExchange:
 
     def begin_step(self, step: int, num_rows: int) -> None:
         self.num_rows = num_rows
-        self.model.draft_input_embeds = self.next_embeds[:num_rows] if step > 0 else None
+        mkd = self.mkd
+        if mkd is not None:
+            mkd.armed = num_rows == 1
+            # The draft loop forwards steps 0 .. num_steps - 2.
+            mkd.last_step = step == self.num_steps - 2
+            if step == 0:
+                # With extend_fc the draft caller guarantees fc_buf holds this step's fc.
+                mkd.pending = mkd.extend_fc and num_rows == 1
+        if mkd is not None and mkd.pending:
+            # The model finishes the fc from the exchange; this row only carries the shape.
+            self.model.draft_input_embeds = self.next_embeds[:num_rows]
+        else:
+            self.model.draft_input_embeds = self.next_embeds[:num_rows] if step > 0 else None
         self.model.logits_processor.skip_vocab_gather_rows = self.MAX_ROWS
 
     def finish_step(
@@ -156,8 +171,21 @@ class DraftVocabExchange:
         mrope_positions: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         m = self.num_rows
-        gathered = self._pack_and_gather(local_logits, m, NAN_KEY_SPLIT_ARGMAX)
         topk_index, topk_p = self.topk_index[step][:m], self.topk_p[step][:m]
+        mkd = self.mkd
+        if mkd is not None and mkd.armed:
+            mkd.exchange(
+                local_logits,
+                topk_index,
+                topk_p,
+                draft_tokens,
+                positions,
+                draft_column,
+                mrope_positions,
+            )
+            mkd.armed = False
+            return topk_p, topk_index
+        gathered = self._pack_and_gather(local_logits, m, NAN_KEY_SPLIT_ARGMAX)
         vocab_argmax_select(
             gathered,
             topk_index,
@@ -179,9 +207,13 @@ class DraftVocabExchange:
     def is_local(self, logits: torch.Tensor) -> bool:
         return logits.shape[-1] == self.local_vocab and 0 < logits.shape[0] <= self.MAX_ROWS
 
-    def select_extend(self, local_logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def select_extend(
+        self, local_logits: torch.Tensor, hidden_states: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Draft-extend argmax (torch.argmax semantics) from shard-local logits."""
         m = local_logits.shape[0]
+        if self.mkd is not None and m == 1:
+            return self.mkd.exchange_extend(local_logits, hidden_states)
         gathered = self._pack_and_gather(local_logits, m, NAN_KEY_TORCH_ARGMAX)
         topk_index = torch.empty((m, 1), dtype=torch.int64, device=local_logits.device)
         topk_p = torch.empty((m, 1), dtype=torch.float32, device=local_logits.device)

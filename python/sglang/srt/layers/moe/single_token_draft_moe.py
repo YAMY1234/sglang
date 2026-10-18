@@ -5,7 +5,7 @@ gate combine. Rounding points match that path; only dot-product order differs.""
 from __future__ import annotations
 
 import logging
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 
@@ -29,8 +29,12 @@ class SingleTokenDraftMoe:
         self.layer_id = layer_id
         self.active = True
         self.fused_router = envs.SGLANG_Q35MF_DRAFT_MOE_ROUTER.get()
+        self.single_launch = envs.SGLANG_Q35MF_MKD_MOE1.get()
         self._scratch: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._router_scratch: Optional[Tuple[torch.Tensor, ...]] = None
+        self._single_launch_scratch: Optional[Tuple[torch.Tensor, ...]] = None
+        # Called after the block's last kernel (single-token path only).
+        self.after_hook: Optional[Callable[[], None]] = None
 
     def _unsupported_reason(self, block, hidden_states, topk_output) -> Optional[str]:
         from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
@@ -117,8 +121,21 @@ class SingleTokenDraftMoe:
             torch.empty(topk + 1, inter, dtype=torch.bfloat16, device=dev),
             torch.empty(1, dtype=torch.float32, device=dev),
         )
-        router_reason = self._router_unsupported_reason(block) if self.fused_router else "off"
-        if router_reason is None:
+        router_on = self.fused_router or self.single_launch
+        router_reason = self._router_unsupported_reason(block) if router_on else "off"
+        if router_reason is None and self.single_launch:
+            from sglang.kernels.ops.speculative.draft_moe_gemv import (
+                draft_moe_fused_scratch,
+            )
+
+            num_experts = block.gate.weight.shape[0]
+            self._single_launch_scratch = draft_moe_fused_scratch(
+                num_experts, topk, inter, dev
+            ) + (
+                torch.empty(1, topk, dtype=torch.float32, device=dev),
+                torch.empty(1, topk, dtype=torch.int32, device=dev),
+            )
+        elif router_reason is None:
             num_experts = block.gate.weight.shape[0]
             self._router_scratch = (
                 torch.empty(num_experts, dtype=torch.float32, device=dev),
@@ -127,23 +144,53 @@ class SingleTokenDraftMoe:
                 torch.empty(1, topk, dtype=torch.int32, device=dev),
             )
         logger.info(
-            "Single-token draft MoE active for layer %d (fused router: %s).",
+            "Single-token draft MoE active for layer %d (fused router: %s%s).",
             self.layer_id,
             "yes" if router_reason is None else router_reason,
+            ", single launch" if self._single_launch_scratch is not None else "",
         )
         return True
+
+    def _forward_single_launch(self, block, hidden_states, out) -> torch.Tensor:
+        from sglang.kernels.ops.speculative.draft_moe_gemv import draft_moe_fused
+
+        logit_buf, act_buf, epoch, weights, ids = self._single_launch_scratch
+        for m in range(hidden_states.shape[0]):
+            draft_moe_fused(
+                hidden_states[m : m + 1],
+                block.gate.weight,
+                block.experts.w13_weight,
+                block.experts.w2_weight,
+                block.shared_expert.gate_up_proj.weight,
+                block.shared_expert.down_proj.weight,
+                block.shared_expert_gate.weight.view(-1),
+                (logit_buf, act_buf, epoch),
+                weights,
+                ids,
+                out[m : m + 1],
+            )
+        return out
 
     def forward(self, block, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
         """Return the block output, or None when the caller must take the stock path.
         Each of the (at most MAX_TOKENS) tokens runs its own GEMV passes in turn."""
-        from sglang.kernels.ops.speculative.draft_moe_gemv import draft_moe_gemv
-
         if self._scratch is None and not self._setup(block, hidden_states[:1]):
             return None
         with use_symmetric_memory(
             get_parallel().tp_group, disabled=not is_allocation_symmetric()
         ):
             out = torch.empty_like(hidden_states)
+        if self._single_launch_scratch is not None:
+            self._forward_single_launch(block, hidden_states, out)
+        else:
+            self._forward_gemv(block, hidden_states, out)
+        if self.after_hook is not None:
+            self.after_hook()
+        return out
+
+    def _forward_gemv(self, block, hidden_states, out) -> None:
+        from sglang.kernels.ops.speculative.draft_moe_gemv import draft_moe_gemv
+
         act, gate = self._scratch
         stock_route = None
         if self._router_scratch is None:
@@ -169,4 +216,3 @@ class SingleTokenDraftMoe:
                 act,
                 gate,
             )
-        return out

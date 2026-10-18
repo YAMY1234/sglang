@@ -81,6 +81,7 @@ from sglang.srt.speculative.dp_spec_prefill_coordination import (
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.draft_hot_vocab import DraftHotVocab
 from sglang.srt.speculative.draft_vocab_exchange import DraftVocabExchange
+from sglang.srt.speculative.mkd_draft_boundary import MkdDraftBoundary
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
@@ -267,6 +268,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self._exchange_in_draft_extend = (
                 in_extend and self._draft_vocab_exchange is not None
             )
+            if envs.SGLANG_Q35MF_MKD_XCHG.get() and self._exchange_in_draft_steps:
+                mkd = MkdDraftBoundary.maybe_create(
+                    self.draft_runner.model, self._draft_vocab_exchange, self._hot_vocab
+                )
+                self._draft_vocab_exchange.mkd = mkd
+                self.draft_runner.model._mkd = mkd
 
         if get_spec().speculative_use_rejection_sampling:
             target_vocab_size = self.target_worker.model_config.vocab_size
@@ -685,6 +692,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             and draft_input.dsa_topk_indices is None
         ):
             can_run_decode_cuda_graph = False
+
+        mkd = (
+            self._draft_vocab_exchange.mkd if self._exchange_in_draft_steps else None
+        )
+        if mkd is not None and mkd.extend_fc:
+            # A one-row draft's first step reads its fc from fc_buf (MKD extend fc); only the
+            # extend exchange that produced exactly this draft input may have written it.
+            if (
+                not forward_batch.forward_mode.is_idle()
+                and draft_input.topk_index.shape[0] == 1
+                and not mkd.fc_buf_holds(draft_input.topk_index, draft_input.hidden_states)
+            ):
+                mkd.fill_fc(draft_input.topk_index, draft_input.hidden_states, forward_batch)
+            mkd.fc_buf_src = None
 
         n_inner = self.speculative_num_steps - 1
         canary_outside_ctx = (
@@ -1296,7 +1317,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
         ):
             ret_topk_p, ret_topk_index = self._draft_vocab_exchange.select_extend(
-                draft_logits_output.next_token_logits
+                draft_logits_output.next_token_logits, draft_logits_output.hidden_states
             )
             ret_draft_probs = None
         elif self.topk == 1 and not _is_hip:
