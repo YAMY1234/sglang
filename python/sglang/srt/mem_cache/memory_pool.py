@@ -1152,7 +1152,12 @@ class MambaPool:
             fused_clear_conv_slots(self._conv_slot_desc, indices)
             temporal = self.mamba_cache.temporal
             if temporal.numel() > 0:
-                temporal[:, indices] = 0
+                if envs.SGLANG_Q35MF_PPO.get():
+                    # A scalar index_put copies the 0 to the device and syncs;
+                    # index_fill_ does not.
+                    temporal.index_fill_(1, indices.to(torch.int64), 0)
+                else:
+                    temporal[:, indices] = 0
             return
         if not _is_npu:
             need_size = len(indices)

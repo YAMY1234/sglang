@@ -587,7 +587,7 @@ class SchedulerPPMixin:
         self.pp_comm_stream = None
         self.pp_comm_stream_ctx = nullcontext()
         if (
-            envs.SGLANG_PP_COMM_OVERLAP.get()
+            (envs.SGLANG_PP_COMM_OVERLAP.get() or envs.SGLANG_Q35MF_PPO.get())
             and torch.cuda.is_available()
             and str(self.device).startswith("cuda")
         ):

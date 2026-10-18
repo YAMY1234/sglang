@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 import math
 import os
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
@@ -80,6 +80,32 @@ _flashinfer_gated_delta_rule_decode = None
 _flashinfer_gated_delta_rule_mtp_bf16 = None
 
 
+def _checkpoint_plan_host_lens(
+    forward_batch: ForwardBatch,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Checkpoint-plan inputs from the host copies of the batch lengths, or None."""
+    if not envs.SGLANG_Q35MF_PPO.get():
+        return None
+    bs = forward_batch.extend_seq_lens.numel()
+    host = (
+        forward_batch.extend_seq_lens_cpu,
+        forward_batch.extend_prefix_lens_cpu,
+        forward_batch.mamba_prefill_track_mask_cpu,
+        forward_batch.mamba_track_seqlens_cpu,
+    )
+    if any(x is None or len(x) != bs for x in host):
+        return None
+    seq_lens, prefix_lens, mask, track_lens = host
+    relative = torch.tensor(track_lens, dtype=torch.int64) - torch.tensor(
+        prefix_lens, dtype=torch.int64
+    )
+    return (
+        torch.tensor(seq_lens, dtype=torch.int64),
+        torch.tensor(mask, dtype=torch.bool),
+        relative,
+    )
+
+
 def maybe_build_flashinfer_checkpoint_plan(
     forward_batch: ForwardBatch,
     forward_metadata: ForwardMetadata,
@@ -94,11 +120,17 @@ def maybe_build_flashinfer_checkpoint_plan(
 
     chunk_size = mamba_cache_chunk_size()
     checkpoint_every_n_tokens = chunk_size
-    extend_seq_lens = forward_batch.extend_seq_lens.to(device="cpu", dtype=torch.int64)
-    track_mask = forward_batch.mamba_track_mask.to(device="cpu", dtype=torch.bool)
-    relative_track_lens = forward_batch.mamba_track_seqlens.to(
-        device="cpu", dtype=torch.int64
-    ) - forward_batch.extend_prefix_lens.to(device="cpu", dtype=torch.int64)
+    host_lens = _checkpoint_plan_host_lens(forward_batch)
+    if host_lens is not None:
+        extend_seq_lens, track_mask, relative_track_lens = host_lens
+    else:
+        extend_seq_lens = forward_batch.extend_seq_lens.to(
+            device="cpu", dtype=torch.int64
+        )
+        track_mask = forward_batch.mamba_track_mask.to(device="cpu", dtype=torch.bool)
+        relative_track_lens = forward_batch.mamba_track_seqlens.to(
+            device="cpu", dtype=torch.int64
+        ) - forward_batch.extend_prefix_lens.to(device="cpu", dtype=torch.int64)
 
     use_checkpoint = track_mask & (relative_track_lens % chunk_size != 0)
     if envs.SGLANG_Q35MF_K4_FI_CKPT_SPARSE.get():
