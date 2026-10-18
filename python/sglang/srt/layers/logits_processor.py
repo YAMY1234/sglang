@@ -503,6 +503,8 @@ class LogitsProcessor(nn.Module):
         # Set around greedy draft forwards that select on vocab shards: logits of
         # at most this many rows are returned unreduced (0 = always gather).
         self.skip_vocab_gather_rows = 0
+        # MKD draft boundary that computes one-row draft lm_heads itself (SGLANG_Q35MF_MKD_HEAD).
+        self.mkd_head = None
         # Target-verify logits are returned unreduced for sampling on the vocab shards.
         self.verify_logits_on_shards = (
             envs.SGLANG_Q35MF_PDDEC_SHARDED_VERIFY_SAMPLING.get()
@@ -1021,6 +1023,8 @@ class LogitsProcessor(nn.Module):
         lm_head: VocabParallelEmbedding,
         embedding_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if self.mkd_head is not None and self.mkd_head.armed and hidden_states.shape[0] == 1:
+            return self.mkd_head.head(hidden_states, lm_head)
         quant_method = getattr(lm_head, "quant_method", None)
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
             # This is a LoRA-wrapped module, use its forward method
