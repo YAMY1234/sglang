@@ -1535,6 +1535,12 @@ class Envs:
     # With SGLANG_Q35MF_MKH_HOP: the GatedDeltaNet out_proj (static FP8, M <= 8) runs as a q35 hop
     # launch that pushes its partial straight into the hop mailbox, so its all-reduce only consumes.
     SGLANG_Q35MF_MKH_OPROJ = EnvBool(False)
+    # Breakable prefill CUDA graphs capture the GDN extend on per-bucket static tables
+    # instead of breaking the graph at every GDN layer (bit-identical outputs).
+    SGLANG_Q35MF_MKH_PF_GRAPH = EnvBool(False)
+    # Reduction warps the MNNVL CuTe DSL HT presets prefer when re-targeted to an unshipped
+    # shape (0 = the preset's own); they only split the work, outputs are bit-identical.
+    SGLANG_Q35MF_MKH_HT_REDUCTION_WARPS = EnvInt(0)
 
     # ===================================================================
     # Multimodal processing
