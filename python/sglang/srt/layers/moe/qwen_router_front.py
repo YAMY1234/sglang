@@ -211,7 +211,7 @@ def shared_expert_tail(mlp, gate_up: torch.Tensor) -> torch.Tensor:
 
 
 _MKM_MAX_TOKENS = 7
-_MKM_INTERMEDIATE = 128
+_MKM_INTERMEDIATES = (128, 256)  # per rank: TP8, TP4
 # Keyed by id(block): blocks live for the whole process.
 _mkm_static_by_block: dict[int, bool] = {}
 _mkm_expanded_idx_by_device: dict[torch.device, torch.Tensor] = {}
@@ -219,18 +219,19 @@ _mkm_engaged: set[tuple[int, int]] = set()
 
 
 def _mkm_static_supported(block: "Qwen2MoeSparseMoeBlock") -> bool:
-    """The fused engine's fixed shapes: TP8 Qwen3.5 NVFP4 on the trtllm-gen weight layout, no EP."""
+    """The fused engine's fixed shapes: TP8 or TP4 Qwen3.5 NVFP4 on the trtllm-gen weight layout, no EP."""
     from sglang.srt.layers.moe.utils import RoutingMethodType
 
     experts = block.experts
     cfg = block.topk.topk_config
     runner_config = experts.moe_runner_config
     expert_scales = (experts.g1_alphas, experts.g1_scale_c, experts.g2_alphas)
+    inter = experts.intermediate_size_per_partition
     return (
         experts.num_experts == _NUM_EXPERTS
         and experts.num_local_experts == _NUM_EXPERTS
         and experts.moe_ep_rank == 0
-        and experts.intermediate_size_per_partition == _MKM_INTERMEDIATE
+        and inter in _MKM_INTERMEDIATES
         and experts.top_k == _TOP_K
         and cfg.top_k == _TOP_K
         and cfg.renormalize
@@ -246,13 +247,13 @@ def _mkm_static_supported(block: "Qwen2MoeSparseMoeBlock") -> bool:
         and runner_config.gemm1_clamp_limit is None
         and runner_config.swiglu_limit is None
         and experts.w13_weight.dtype == torch.uint8
-        and tuple(experts.w13_weight.shape) == (_NUM_EXPERTS, 2 * _MKM_INTERMEDIATE, _HIDDEN // 2)
+        and tuple(experts.w13_weight.shape) == (_NUM_EXPERTS, 2 * inter, _HIDDEN // 2)
         and experts.w2_weight.dtype == torch.uint8
-        and tuple(experts.w2_weight.shape) == (_NUM_EXPERTS, _HIDDEN, _MKM_INTERMEDIATE // 2)
+        and tuple(experts.w2_weight.shape) == (_NUM_EXPERTS, _HIDDEN, inter // 2)
         and experts.w13_weight_scale.dtype == torch.float8_e4m3fn
-        and tuple(experts.w13_weight_scale.shape) == (_NUM_EXPERTS, 2 * _MKM_INTERMEDIATE, _HIDDEN // 16)
+        and tuple(experts.w13_weight_scale.shape) == (_NUM_EXPERTS, 2 * inter, _HIDDEN // 16)
         and experts.w2_weight_scale.dtype == torch.float8_e4m3fn
-        and tuple(experts.w2_weight_scale.shape) == (_NUM_EXPERTS, _HIDDEN, _MKM_INTERMEDIATE // 16)
+        and tuple(experts.w2_weight_scale.shape) == (_NUM_EXPERTS, _HIDDEN, inter // 16)
         and all(t.dtype == torch.float32 and tuple(t.shape) == (_NUM_EXPERTS,) for t in expert_scales)
     )
 
