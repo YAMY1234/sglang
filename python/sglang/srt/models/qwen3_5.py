@@ -252,6 +252,12 @@ def _layer_fusions(config: Qwen3_5TextConfig, is_nextn: bool):
         from sglang.srt.layers.layer_boundary.fusions.cutedsl import CuteDSLFusion
 
         return CuteDSLFusion()
+    if is_nextn and _is_cuda and envs.SGLANG_Q35MF_MKD_HOP.get():
+        from sglang.srt.layers.layer_boundary.fusions.q35_draft_hop import (
+            DraftHopFusion,
+        )
+
+        return DraftHopFusion()
     return None
 
 
@@ -2363,8 +2369,31 @@ class Qwen3_5ForCausalLM(nn.Module):
             self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
+        # The adapter the final norm hands a deferred terminal output to.
+        self._final_norm_handoff = self.flashinfer_mnnvl_cutedsl_fusion
+        # The draft layer's step hops (SGLANG_Q35MF_MKD_HOP), or None.
+        self.draft_hop = None
+        if is_nextn and self.pp_group.is_last_rank:
+            self._install_draft_hop()
 
         self.layers_to_capture = []
+
+    def _install_draft_hop(self) -> None:
+        from sglang.srt.layers.layer_boundary.fusions.q35_draft_hop import (
+            DraftHopFusion,
+        )
+
+        last = self.layers[self.end_layer - 1]
+        fusion = last.ffn_boundary.fusions
+        if not isinstance(fusion, DraftHopFusion) or not isinstance(
+            last.mlp, Qwen2MoeSparseMoeBlock
+        ):
+            return
+        fusion.final_norm = self.norm
+        fusion.moe_ready = last.mlp.single_token_draft_ready
+        fusion.moe_single_launch = last.mlp.single_token_draft_single_launch
+        self._final_norm_handoff = fusion
+        self.draft_hop = fusion
 
     def _build_embed_tokens(self, config: Qwen3_5TextConfig) -> nn.Module:
         """Embedding sharding hook for models reusing this backbone."""
@@ -2478,7 +2507,7 @@ class Qwen3_5ForCausalLM(nn.Module):
             hidden_states,
             forward_batch,
             self.norm,
-            finalize_norm=self.flashinfer_mnnvl_cutedsl_fusion,
+            finalize_norm=self._final_norm_handoff,
             skip_empty=True,
         )
 

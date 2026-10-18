@@ -30,6 +30,8 @@ struct Args {
   uint8_t* fp8_out;             // [M, H] e4m3, or null
   int m, top_k;
   float eps;
+  float weight_bias;  // draft consume modes only: multiplier = weight_bias + gamma
+  int32_t delay_ns;   // draft consume modes only, diagnostic: hold the output stores this long
 };
 
 constexpr int kMaxTopK = 16;
@@ -177,6 +179,217 @@ __global__ void __launch_bounds__(kRowThreads) consume_kernel(Args a) {
   hop_leave(a.site, h, gridDim.x * gridDim.y);
 }
 
+// ---------------------------------------------------------------- draft-side consume
+// The draft keeps the rounding of the stock kernels these replace; only the transport differs.
+// kDraftMnnvl: FlashInfer's legacy MNNVL one-shot all-reduce + residual + RMSNorm as it launches for
+//   M <= 16 (clusters of 8 x 64 threads, thread t of a row owning columns [8t, 8t + 8)): fp32 rank sum
+//   rounded to bf16, bf16 residual add, bf16 squares summed in fp32 per thread, a 16 -> 1 butterfly per
+//   warp, the two warps of each 64-thread block, then the 8 blocks in order from 0.
+// kDraftAddNorm: sglang's one-shot push all-reduce (fp32 rank sum rounded to bf16), then FlashInfer's
+//   CuTe DSL FusedAddRMSNorm for hidden 4096 (64 threads per row, thread t owning the 8-column chunks
+//   64b + t, b = 0..7): fp32 residual add, squares accumulated by fma per thread in (b, column) order
+//   from 0, a 1 -> 16 butterfly per 32 threads, then the two warps.
+constexpr int kDraftMnnvl = 1;
+constexpr int kDraftAddNorm = 2;
+// Test variant: FusedAddRMSNorm in FlashInfer's CUDA kernel order (512 threads x 8 columns).
+constexpr int kDraftAddNormCuda = 3;
+
+__device__ __forceinline__ float add_ftz(float a, float b) {
+  float r;
+  asm("add.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+  return r;
+}
+__device__ __forceinline__ float mul_ftz(float a, float b) {
+  float r;
+  asm("mul.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+  return r;
+}
+__device__ __forceinline__ float rsqrt_ftz(float a) {
+  float r;
+  asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(a));
+  return r;
+}
+
+struct DraftSmem {
+  // Add-norm: the fp32 values of this CTA's 16 CuTe threads, [chunk b][thread t % 16][column].
+  alignas(16) float xv[8][16][kVec];
+  float xs[kRowCtas][kRowWarps];  // one value per warp of the row, from every CTA
+  float hs[kRowCtas];             // add-norm: every CTA's tree over its 16 CuTe threads
+  uint64_t mbar, mbar_x, mbar_h;
+};
+
+__device__ __forceinline__ uint32_t smem_u32(const void* p) {
+  return static_cast<uint32_t>(__cvta_generic_to_shared(p));
+}
+__device__ __forceinline__ uint32_t peer_addr(uint32_t local, uint32_t cta) {
+  uint32_t r;
+  asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(r) : "r"(local), "r"(cta));
+  return r;
+}
+__device__ __forceinline__ void st_async_f32(uint32_t addr, float v, uint32_t mbar) {
+  asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [%0], %1, [%2];" ::"r"(addr), "f"(v),
+               "r"(mbar)
+               : "memory");
+}
+__device__ __forceinline__ void st_async_v4(uint32_t addr, float a, float b, float c, float d, uint32_t mbar) {
+  asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.f32 [%0], {%1, %2, %3, %4}, [%5];" ::"r"(addr),
+               "f"(a), "f"(b), "f"(c), "f"(d), "r"(mbar)
+               : "memory");
+}
+__device__ __forceinline__ void mbar_wait(const uint64_t* mbar) {
+  asm volatile(
+      "{\n\t.reg .pred P;\n\tWAIT_DRAFT:\n\t"
+      "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 P, [%0], 0;\n\t"
+      "@!P bra WAIT_DRAFT;\n\t}" ::"r"(smem_u32(mbar))
+      : "memory");
+}
+
+// Prologue of every CTA of the row cluster, before griddepcontrol.wait: arm the barriers this mode
+// receives on and make them visible to the peers before any of them can send.
+template <int MODE>
+__device__ __forceinline__ void draft_init(DraftSmem& ds) {
+  if (threadIdx.x == 0) {
+    const auto arm = [](uint64_t* mbar, uint32_t bytes) {
+      asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(smem_u32(mbar)) : "memory");
+      asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(smem_u32(mbar)), "r"(bytes)
+                   : "memory");
+    };
+    if (MODE == kDraftAddNorm) {
+      arm(&ds.mbar_x, static_cast<uint32_t>(sizeof(ds.xv)));
+      arm(&ds.mbar_h, static_cast<uint32_t>(sizeof(ds.hs)));
+    } else {
+      arm(&ds.mbar, static_cast<uint32_t>(sizeof(ds.xs)));
+    }
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  }
+  asm volatile("barrier.cluster.arrive.relaxed.aligned;\n\tbarrier.cluster.wait.acquire.aligned;" ::: "memory");
+}
+
+// Every CTA of the row cluster gets this warp's value v in xs[cta][warp].
+__device__ __forceinline__ void row_exchange(float v, DraftSmem& ds) {
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  if (lane < kRowCtas)
+    st_async_f32(peer_addr(smem_u32(&ds.xs[cluster_ctarank()][warp]), lane), v, peer_addr(smem_u32(&ds.mbar), lane));
+  mbar_wait(&ds.mbar);
+}
+
+// Sum of squares in the CuTe DSL FusedAddRMSNorm order. Thread frag = 64b + t sends its 8 values to the
+// CTA owning CuTe threads [16c, 16c + 16), where 16 lanes each accumulate one thread's 64 squares; the
+// butterfly then pairs (0 + 1) + (2 + 3) ... within those 16, the CTAs as (0 + 1) + (2 + 3).
+__device__ __forceinline__ float cute_sumsq(const float x[8], int frag, DraftSmem& ds) {
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int b = frag >> 6, t = frag & 63;
+  const uint32_t dst = static_cast<uint32_t>(t >> 4);
+  const uint32_t slot = peer_addr(smem_u32(&ds.xv[b][t & 15][0]), dst);
+  const uint32_t mbar = peer_addr(smem_u32(&ds.mbar_x), dst);
+  st_async_v4(slot, x[0], x[1], x[2], x[3], mbar);
+  st_async_v4(slot + 16, x[4], x[5], x[6], x[7], mbar);
+  mbar_wait(&ds.mbar_x);
+  if (warp == 0) {
+    float sum = 0.f;
+    if (lane < 16) {
+#pragma unroll
+      for (int c = 0; c < 8; ++c) {
+        const float4 lo = *reinterpret_cast<const float4*>(&ds.xv[c][lane][0]);
+        const float4 hi = *reinterpret_cast<const float4*>(&ds.xv[c][lane][4]);
+        sum = __fmaf_rn(lo.x, lo.x, sum);
+        sum = __fmaf_rn(lo.y, lo.y, sum);
+        sum = __fmaf_rn(lo.z, lo.z, sum);
+        sum = __fmaf_rn(lo.w, lo.w, sum);
+        sum = __fmaf_rn(hi.x, hi.x, sum);
+        sum = __fmaf_rn(hi.y, hi.y, sum);
+        sum = __fmaf_rn(hi.z, hi.z, sum);
+        sum = __fmaf_rn(hi.w, hi.w, sum);
+      }
+    }
+#pragma unroll
+    for (int off = 1; off < 16; off <<= 1) sum = __fadd_rn(sum, __shfl_xor_sync(0xffffffffu, sum, off));
+    if (lane < kRowCtas)
+      st_async_f32(peer_addr(smem_u32(&ds.hs[cluster_ctarank()]), lane), sum, peer_addr(smem_u32(&ds.mbar_h), lane));
+  }
+  mbar_wait(&ds.mbar_h);
+  return __fadd_rn(__fadd_rn(ds.hs[0], ds.hs[1]), __fadd_rn(ds.hs[2], ds.hs[3]));
+}
+
+// EARLY releases the dependents at entry, as consume_kernel does; they read only static data before
+// their own griddepcontrol.wait, which returns once this grid has completed.
+template <int W, int MODE, bool EARLY = false>
+__global__ void __launch_bounds__(kRowThreads) consume_draft_kernel(Args a) {
+  __shared__ DraftSmem ds;
+  const int token = blockIdx.x;
+  const int frag = static_cast<int>(blockIdx.y) * kRowThreads + threadIdx.x;
+  if (EARLY) pdl_trigger();
+  float gam[8];
+  unpack8(ld_v4(a.gamma + static_cast<size_t>(frag) * kVec), gam);
+  draft_init<MODE>(ds);
+  pdl_wait();
+  const Hop h = hop_enter(a.site);
+  const uint4 res = ld_v4(a.residual_in + row_elem(token, frag));
+  float acc[8];
+  const bool ok = pull_frag<W>(a.site, h.stage, token, frag, acc);
+  float res_f[8];
+  unpack8(res, res_f);
+  float x[8];
+  uint4 res_out;
+  float total;
+  if (MODE == kDraftMnnvl) {
+    float part = 0.f;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      const __nv_bfloat16 r = __hadd(__float2bfloat16_rn(acc[e]), __float2bfloat16_rn(res_f[e]));
+      x[e] = __bfloat162float(r);
+      part = add_ftz(part, __bfloat162float(__hmul(r, r)));
+    }
+    res_out = pack8(x);
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) part = add_ftz(part, __shfl_xor_sync(0xffffffffu, part, off));
+    row_exchange(part, ds);
+    // Global warp 2k + i is xs[k / 2][(k % 2) * 2 + i]; 64-thread block k sums its two warps.
+    total = 0.f;
+#pragma unroll
+    for (int k = 0; k < 8; ++k)
+      total = add_ftz(total, add_ftz(ds.xs[k >> 1][(k & 1) * 2], ds.xs[k >> 1][(k & 1) * 2 + 1]));
+  } else {
+#pragma unroll
+    for (int e = 0; e < 8; ++e) x[e] = __fadd_rn(__bfloat162float(__float2bfloat16_rn(acc[e])), res_f[e]);
+    res_out = pack8(x);
+    if (MODE == kDraftAddNorm) {
+      total = cute_sumsq(x, frag, ds);
+    } else {
+      float part = 0.f;
+#pragma unroll
+      for (int e = 0; e < 8; ++e) part = __fmaf_rn(x[e], x[e], part);
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1) part = __fadd_rn(part, __shfl_xor_sync(0xffffffffu, part, off));
+      row_exchange(part, ds);
+      float v[16];
+#pragma unroll
+      for (int i = 0; i < 16; ++i) v[i] = ds.xs[i >> 2][i & 3];
+#pragma unroll
+      for (int w = 8; w > 0; w >>= 1)
+#pragma unroll
+        for (int i = 0; i < w; ++i) v[i] = __fadd_rn(v[i], v[i + w]);
+      total = v[0];
+    }
+  }
+  const float inv = rsqrt_ftz(add_ftz(mul_ftz(total, 1.f / static_cast<float>(kHidden)), a.eps));
+  float out[8];
+#pragma unroll
+  for (int e = 0; e < 8; ++e) out[e] = __fmul_rn(__fmul_rn(x[e], inv), __fadd_rn(a.weight_bias, gam[e]));
+  uint4 norm = pack8(out);
+  if (!ok) norm = make_uint4(kNanPair, kNanPair, kNanPair, kNanPair);
+  if (a.delay_ns > 0) {
+    const unsigned long long t0 = gtimer();
+    while (gtimer() - t0 < static_cast<unsigned long long>(a.delay_ns)) {
+    }
+  }
+  *reinterpret_cast<uint4*>(a.residual_out + row_elem(token, frag)) = res_out;
+  *reinterpret_cast<uint4*>(a.norm_out + row_elem(token, frag)) = norm;
+  if (!EARLY) pdl_trigger();
+  rearm_frag<W>(a.site, h.stage, token, frag);
+  hop_leave(a.site, h, gridDim.x * gridDim.y);
+}
+
 // ---------------------------------------------------------------- out_proj + push
 // Row-parallel FP8 out_proj (M <= 8, N = 4096, K = 8 * S * 32) whose epilogue pushes the bf16 partial
 // into the hop mailbox. The MMA core follows the fused attention lane's o_proj kernel: CTA c owns
@@ -292,9 +505,19 @@ int launch(K kernel, const Args& a, cudaStream_t stream, bool cluster, int ctas 
   return static_cast<int>(cudaLaunchKernelEx(&cfg, kernel, a));
 }
 
+template <int W>
+int launch_draft(int which, const Args& a, cudaStream_t s) {
+  if (which == 3) return launch(consume_draft_kernel<W, kDraftMnnvl>, a, s, true);
+  if (which == 4) return launch(consume_draft_kernel<W, kDraftAddNorm>, a, s, true);
+  if (which == 7) return launch(consume_draft_kernel<W, kDraftMnnvl, true>, a, s, true);
+  if (which == 8) return launch(consume_draft_kernel<W, kDraftAddNorm, true>, a, s, true);
+  return launch(consume_draft_kernel<W, kDraftAddNormCuda>, a, s, true);
+}
+
 }  // namespace
 
-// which: 0 publish, 1 publish_fin, 2 consume.
+// which: 0 publish, 1 publish_fin, 2 consume, 3 / 4 draft consume with MNNVL / add-norm rounding, 7 / 8 the
+// same releasing their dependents at entry; 6 (test) the add-norm in the CUDA FusedAddRMSNorm order.
 // The C entry takes an opaque pointer: Args lives in an unnamed namespace, and a C-linkage
 // function whose signature names it would not be exported.
 extern "C" int q35hop_launch(int which, const void* args, void* stream) {
@@ -311,6 +534,18 @@ extern "C" int q35hop_launch(int which, const void* args, void* stream) {
         case 2: return launch(consume_kernel<2>, a, s, true);
         case 4: return launch(consume_kernel<4>, a, s, true);
         case 8: return launch(consume_kernel<8>, a, s, true);
+        default: return -3;
+      }
+    case 3:
+    case 4:
+    case 6:
+    case 7:
+    case 8:
+      if (a.norm_out == nullptr || a.fp8_out != nullptr) return -4;
+      switch (a.site.world) {
+        case 2: return launch_draft<2>(which, a, s);
+        case 4: return launch_draft<4>(which, a, s);
+        case 8: return launch_draft<8>(which, a, s);
         default: return -3;
       }
     default: return -1;

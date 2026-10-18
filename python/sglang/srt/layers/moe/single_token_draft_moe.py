@@ -35,6 +35,16 @@ class SingleTokenDraftMoe:
         self._single_launch_scratch: Optional[Tuple[torch.Tensor, ...]] = None
         # Called after the block's last kernel (single-token path only).
         self.after_hook: Optional[Callable[[], None]] = None
+        # Host int64 site fields of the hop the single launch pushes into, built on first use.
+        self._hop_site: Optional[torch.Tensor] = None
+
+    def ready(self, num_tokens: int) -> bool:
+        """Set up by an eager call and taking a batch of this many tokens."""
+        return self.active and self._scratch is not None and 0 < num_tokens <= self.MAX_TOKENS
+
+    @property
+    def single_launch_ready(self) -> bool:
+        return self._single_launch_scratch is not None
 
     def _unsupported_reason(self, block, hidden_states, topk_output) -> Optional[str]:
         from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
@@ -151,10 +161,15 @@ class SingleTokenDraftMoe:
         )
         return True
 
-    def _forward_single_launch(self, block, hidden_states, out) -> torch.Tensor:
+    def _forward_single_launch(self, block, hidden_states, out, push_hop) -> torch.Tensor:
         from sglang.kernels.ops.speculative.draft_moe_gemv import draft_moe_fused
 
         logit_buf, act_buf, epoch, weights, ids = self._single_launch_scratch
+        hop_site = None
+        if push_hop is not None:
+            if self._hop_site is None:
+                self._hop_site = torch.tensor(push_hop.site_fields(), dtype=torch.int64)
+            hop_site = self._hop_site
         for m in range(hidden_states.shape[0]):
             draft_moe_fused(
                 hidden_states[m : m + 1],
@@ -168,12 +183,19 @@ class SingleTokenDraftMoe:
                 weights,
                 ids,
                 out[m : m + 1],
+                hop_site=hop_site,
+                hop_token=m,
             )
+        if push_hop is not None:
+            push_hop.mark_pushed(out)
         return out
 
-    def forward(self, block, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
+    def forward(
+        self, block, hidden_states: torch.Tensor, push_hop=None
+    ) -> Optional[torch.Tensor]:
         """Return the block output, or None when the caller must take the stock path.
-        Each of the (at most MAX_TOKENS) tokens runs its own GEMV passes in turn."""
+        Each of the (at most MAX_TOKENS) tokens runs its own GEMV passes in turn.
+        push_hop: a Q35Hop the single launch also pushes the output into (row = token)."""
         if self._scratch is None and not self._setup(block, hidden_states[:1]):
             return None
         with use_symmetric_memory(
@@ -181,7 +203,7 @@ class SingleTokenDraftMoe:
         ):
             out = torch.empty_like(hidden_states)
         if self._single_launch_scratch is not None:
-            self._forward_single_launch(block, hidden_states, out)
+            self._forward_single_launch(block, hidden_states, out, push_hop)
         else:
             self._forward_gemv(block, hidden_states, out)
         if self.after_hook is not None:

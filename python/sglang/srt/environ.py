@@ -608,6 +608,17 @@ class Envs:
     # Diagnostic for SGLANG_Q35MF_MKD_HEAD: also run the served GEMM every step and log how often
     # the argmax differs and by how much the served logits separate the two picks.
     SGLANG_Q35MF_MKD_HEAD_CHECK = EnvBool(False)
+    # With SGLANG_Q35MF_MKH_HOP: one-row draft steps run the attention-output and MoE-output
+    # all-reduce + residual + norm as q35 hops, bit-identical to the kernels they replace.
+    SGLANG_Q35MF_MKD_HOP = EnvBool(False)
+    # With SGLANG_Q35MF_MKD_HOP: the single-launch draft MoE pushes its output into the hop itself,
+    # so the MoE-output hop only consumes.
+    SGLANG_Q35MF_MKD_HOP_PUSH = EnvBool(False)
+    # With SGLANG_Q35MF_MKD_HOP: the draft hops release their direct dependents (the single-launch draft
+    # MoE, the draft head) at entry, so their weight prefetch overlaps the hop.
+    SGLANG_Q35MF_MKD_HOP_EARLY = EnvBool(False)
+    # Diagnostic for SGLANG_Q35MF_MKD_HOP: hold every draft hop's output stores this many ns (delay probe).
+    SGLANG_Q35MF_MKD_HOP_DELAY_NS = EnvInt(0)
 
     # ===================================================================
     # Memory pools and KV-cache sizing
