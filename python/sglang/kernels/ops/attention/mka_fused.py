@@ -19,9 +19,11 @@ def _ext():
 
                 major, minor = torch.cuda.get_device_capability()
                 source = Path(__file__).with_suffix(".cu")
-                # Every overlay tree mounts at the same path, so a name without the source digest
-                # can reuse another tree's cached build whose objects are newer than this source.
-                digest = hashlib.sha256(source.read_bytes()).hexdigest()[:12]
+                include = Path(__file__).resolve().parents[2] / "jit" / "include"
+                hop_header = include / "sgl_kernel" / "distributed" / "q35_hop.cuh"
+                # Every overlay tree mounts at the same path, so a name without the digest of the source
+                # and its hop header can reuse another tree's cached build whose objects are newer.
+                digest = hashlib.sha256(source.read_bytes() + hop_header.read_bytes()).hexdigest()[:12]
                 _EXT = load(
                     name=f"sglang_q35mf_mka_fused_{digest}",
                     sources=[str(source)],
@@ -30,7 +32,7 @@ def _ext():
                         "--std=c++17",
                         f"-gencode=arch=compute_{major}{minor}a,code=sm_{major}{minor}a",
                     ],
-                    extra_include_paths=[str(Path(__file__).resolve().parents[2] / "jit" / "include")],
+                    extra_include_paths=[str(include)],
                     verbose=False,
                 )
     return _EXT
