@@ -54,6 +54,24 @@ class _Args(ctypes.Structure):
     ] + [("m", ctypes.c_int), ("top_k", ctypes.c_int), ("eps", ctypes.c_float)]
 
 
+class _OprojArgs(ctypes.Structure):
+    _fields_ = [("site", _Site)] + [
+        (name, ctypes.c_void_p) for name in ("w", "x", "sx", "sw", "out")
+    ] + [("m", ctypes.c_int)]
+
+
+def pack_out_proj(weight_nk: torch.Tensor) -> torch.Tensor:
+    """[4096, K] e4m3 row-major -> mma.m16n8k32 A fragments in the out_proj kernel's order:
+    [cta 128][warp 8][k-step S][block 2][lane 32][16 B], K = 8 * S * 32."""
+    w = weight_nk.contiguous().view(torch.uint8)
+    n, k = w.shape
+    steps = k // 256
+    if n != HIDDEN or k != 8 * steps * 32:
+        raise ValueError(f"out_proj packing needs [4096, 256 * S], got {tuple(w.shape)}")
+    v = w.view(n // 32, 2, 2, 8, 8, steps, 2, 4, 4)
+    return v.permute(0, 4, 5, 1, 3, 7, 6, 2, 8).contiguous().view(-1)
+
+
 def _build() -> ctypes.CDLL:
     text = _SOURCE.read_bytes() + _HEADER.read_bytes()
     digest = hashlib.sha256(text).hexdigest()[:16]
@@ -76,7 +94,17 @@ def _build() -> ctypes.CDLL:
     handle = ctypes.CDLL(str(lib))
     if handle.q35hop_args_size() != ctypes.sizeof(_Args):
         raise RuntimeError("q35_hop Args layout mismatch")
+    if handle.q35hop_oproj_args_size() != ctypes.sizeof(_OprojArgs):
+        raise RuntimeError("q35_hop OprojArgs layout mismatch")
     return handle
+
+
+# The process's hop workspace once built; layers that push into it look it up here.
+_active: "Q35Hop | None" = None
+
+
+def active() -> "Q35Hop | None":
+    return _active
 
 
 def input_fp8_linear(layer: torch.nn.Module) -> torch.nn.Module | None:
@@ -124,8 +152,13 @@ class Q35Hop:
             self._mailbox.multicast_address, self._mailbox.tensor.data_ptr(), self._ctrl.data_ptr(),
             self.rank, self.world, self.max_m, int(timeout_s * 1e9),
         )
+        # bf16 partial of a producer that already pushed it; the next all-reduce call on exactly
+        # this tensor only consumes.
+        self._pushed: tuple[int, torch.Size] | None = None
         torch.cuda.synchronize(device)
         dist.barrier(group=process_group)
+        global _active
+        _active = self
 
     def supports(self, m: int) -> bool:
         return 1 <= m <= self.max_m
@@ -159,12 +192,44 @@ class Q35Hop:
             return (norm, residual_out)
         return (norm, residual_out, torch.empty(shape, dtype=torch.float8_e4m3fn, device=self.device))
 
+    def out_proj_push(self, *, x_fp8, packed_w, input_scale, weight_scale) -> torch.Tensor:
+        """out_proj of an [M, K] static-FP8 activation whose result goes straight into the mailbox.
+
+        Returns the bf16 partial (also written to global memory); its all-reduce must come next and
+        only consumes.
+        """
+        m = int(x_fp8.shape[0])
+        if self._pushed is not None:
+            raise RuntimeError("q35_hop: a pushed partial was never consumed")
+        out = torch.empty((m, HIDDEN), dtype=torch.bfloat16, device=self.device)
+        o = _OprojArgs()
+        o.site = self._site
+        o.w, o.x = packed_w.data_ptr(), x_fp8.data_ptr()
+        o.sx, o.sw = input_scale.data_ptr(), weight_scale.data_ptr()
+        o.out, o.m = out.data_ptr(), m
+        steps = packed_w.numel() // (HIDDEN * 256)
+        rc = self._lib.q35hop_oproj(
+            steps, ctypes.byref(o), ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
+        )
+        if rc != 0:
+            raise RuntimeError(f"q35hop_oproj failed with {rc}")
+        self._pushed = (out.data_ptr(), out.shape)
+        return out
+
+    def has_pushed(self, partial: torch.Tensor) -> bool:
+        return self._pushed is not None and self._pushed == (partial.data_ptr(), partial.shape)
+
     def all_reduce_residual_rms_norm(self, *, local_contribution, residual, gamma, fp8_scale=None):
         m = int(local_contribution.shape[0])
         outs = self._outputs(m, fp8_scale)
         a = self._args(m=m, residual=residual, gamma=gamma, fp8_scale=fp8_scale, outs=outs)
-        a.partial = local_contribution.data_ptr()
-        self._launch(_PUBLISH, a)
+        if self.has_pushed(local_contribution):
+            self._pushed = None
+        else:
+            if self._pushed is not None:
+                raise RuntimeError("q35_hop: a pushed partial was never consumed")
+            a.partial = local_contribution.data_ptr()
+            self._launch(_PUBLISH, a)
         self._launch(_CONSUME, a)
         return outs
 
@@ -172,6 +237,8 @@ class Q35Hop:
         self, *, routed_output, expert_weights, permuted_indices, gated_shared_output, residual,
         gamma, fp8_scale=None,
     ):
+        if self._pushed is not None:
+            raise RuntimeError("q35_hop: a pushed partial was never consumed")
         m = int(permuted_indices.shape[0])
         outs = self._outputs(m, fp8_scale)
         a = self._args(m=m, residual=residual, gamma=gamma, fp8_scale=fp8_scale, outs=outs)
@@ -181,3 +248,28 @@ class Q35Hop:
         self._launch(_PUBLISH_FIN, a)
         self._launch(_CONSUME, a)
         return outs
+
+
+def prepare_out_proj(model: torch.nn.Module) -> int:
+    """Pack the FP8 out_proj weights of every GatedDeltaNet mixer for out_proj_push; returns count."""
+    packed = 0
+    for module in model.modules():
+        if type(module).__name__ != "Qwen3_5GatedDeltaNet":
+            continue
+        linear = module._modules["out_proj"]
+        linear.q35_packed = None
+        method = linear.quant_method
+        if (
+            type(method).__name__ != "ModelOptFp8LinearMethod"
+            or linear.weight.dtype != torch.float8_e4m3fn
+            or linear.input_scale.numel() != 1
+            or linear.weight_scale.numel() != 1
+        ):
+            continue
+        # The method keeps the weight as the [K, N] transpose of a row-major [N, K] tensor.
+        weight_nk = linear.weight.t()
+        if weight_nk.shape[0] != HIDDEN or weight_nk.shape[1] not in (1024, 2048):
+            continue
+        linear.q35_packed = pack_out_proj(weight_nk)
+        packed += 1
+    return packed

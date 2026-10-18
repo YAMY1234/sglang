@@ -1498,6 +1498,9 @@ class Envs:
     # MoE-finalize hops on srt/layers/q35_hop.py (bit-identical outputs; the attention-input
     # hop also hands its FP8 to the next linear).
     SGLANG_Q35MF_MKH_HOP = EnvBool(False)
+    # With SGLANG_Q35MF_MKH_HOP: the GatedDeltaNet out_proj (static FP8, M <= 8) runs as a q35 hop
+    # launch that pushes its partial straight into the hop mailbox, so its all-reduce only consumes.
+    SGLANG_Q35MF_MKH_OPROJ = EnvBool(False)
 
     # ===================================================================
     # Multimodal processing

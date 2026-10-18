@@ -70,6 +70,7 @@ struct Params {
   int self_only;                  // diagnostic: poll only this rank's own slot
   int active_rank;                // diagnostic: >= 0 makes every other rank's launch a no-op
   int early_trigger;              // publish launches trigger their dependents at entry
+  int poll_mode;                  // 0: re-poll every pending source; 1: re-poll the first pending one
 };
 
 // ---------------------------------------------------------------- PTX helpers
@@ -320,6 +321,27 @@ __device__ __forceinline__ bool pull_ll(const Params& p, uint32_t stage, int tok
   if (p.self_only) pending &= 1u << p.rank;
   unsigned long long t0 = 0;
   uint32_t spins = 0;
+  while (pending && p.poll_mode == 1) {
+    // One load per spin on the lowest pending source; once it lands, sweep the rest once.
+    const int r0 = __ffs(pending) - 1;
+    const uint4 x = ld_volatile_v4(uc + mb_off(p, stage, r0, token, frag));
+    if (!frag_has_negzero(x)) {
+#pragma unroll
+      for (int r = 0; r < W; ++r) if (r == r0) v[r] = x;
+      pending &= ~(1u << r0);
+#pragma unroll
+      for (int r = 0; r < W; ++r)
+        if (pending & (1u << r)) {
+          v[r] = ld_volatile_v4(uc + mb_off(p, stage, r, token, frag));
+          if (!frag_has_negzero(v[r])) pending &= ~(1u << r);
+        }
+    }
+    if (pending && ((++spins & 255u) == 0)) {
+      unsigned long long now = gtimer();
+      if (t0 == 0) t0 = now;
+      else if (now - t0 > p.timeout_ns) { fail(p, kErrTimeout); return false; }
+    }
+  }
   while (pending) {
 #pragma unroll
     for (int r = 0; r < W; ++r)
@@ -958,6 +980,104 @@ __global__ void pingpong_kernel(Params p, int peer, int iters, unsigned long lon
   if (a) out[0] = gtimer() - t0 - static_cast<unsigned long long>(iters) * gap_ns;
 }
 
+// ---------------------------------------------------------------- GDN out_proj + push (M2 producer)
+// FP8 o_proj core forked from the attention-epilogue kernel of the fused attention lane (no K split:
+// CTA c owns output rows [32c, 32c + 32) over the full K = 8 * S * 32; warp w takes k-steps
+// [w*S, (w+1)*S); weights pre-packed as mma.m16n8k32 e4m3 A fragments and loaded to registers
+// before the PDL wait; warp partials summed in fixed warp order). Modified: the activation is
+// already static-FP8 (no gate), and the bf16 result is pushed into the hop mailbox.
+struct OprojArgs {
+  const uint4* w;          // packed [128 CTA][8 warp][S step][2 block][32 lane] x 16 B
+  const uint8_t* x;        // [M, K] e4m3, row-major
+  const float* sx;         // input scale
+  const float* sw;         // weight scale
+  uint16_t* out;           // [M, 4096] bf16 or null
+};
+
+__device__ __forceinline__ void mma_e4m3(float (&d)[4], const uint4& a, uint32_t b0, uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+      "{%0,%1,%2,%3};"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+      : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ uint4 ldg_nc_v4(const uint4* q) {
+  uint4 r;
+  asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
+               : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w)
+               : "l"(q));
+  return r;
+}
+
+template <int S, int W, bool PUSH>
+__global__ void __launch_bounds__(256, 1) oproj_push_kernel(Params p, OprojArgs o) {
+  constexpr int kK = 8 * S * 32;
+  __shared__ __align__(16) float red[8][32][8];
+  const int cta = blockIdx.x;
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int g = lane >> 2, t = lane & 3;
+  uint4 a[S][2];
+  {
+    const uint4* wb = o.w + ((size_t)cta * 8 + warp) * (S * 2 * 32) + lane;
+#pragma unroll
+    for (int st = 0; st < S; ++st)
+#pragma unroll
+      for (int b = 0; b < 2; ++b) a[st][b] = ldg_nc_v4(wb + (st * 2 + b) * 32);
+  }
+  const float alpha = __fmul_rn(__ldg(o.sx), __ldg(o.sw));
+  pdl_wait();
+  const int m = p.m;
+  const bool tok_ok = g < m;
+  const uint8_t* xr = o.x + (size_t)g * kK + warp * S * 32 + 4 * t;
+  float ch[2][2][4];
+#pragma unroll
+  for (int b = 0; b < 2; ++b)
+#pragma unroll
+    for (int c = 0; c < 2; ++c)
+#pragma unroll
+      for (int i = 0; i < 4; ++i) ch[b][c][i] = 0.f;
+#pragma unroll
+  for (int st = 0; st < S; ++st) {
+    const uint32_t b0 = tok_ok ? *reinterpret_cast<const uint32_t*>(xr + st * 32) : 0u;
+    const uint32_t b1 = tok_ok ? *reinterpret_cast<const uint32_t*>(xr + st * 32 + 16) : 0u;
+    mma_e4m3(ch[0][st & 1], a[st][0], b0, b1);
+    mma_e4m3(ch[1][st & 1], a[st][1], b0, b1);
+  }
+  {
+    float4* dst = reinterpret_cast<float4*>(&red[warp][lane][0]);
+    dst[0] = make_float4(__fadd_rn(ch[0][0][0], ch[0][1][0]), __fadd_rn(ch[0][0][1], ch[0][1][1]),
+                         __fadd_rn(ch[0][0][2], ch[0][1][2]), __fadd_rn(ch[0][0][3], ch[0][1][3]));
+    dst[1] = make_float4(__fadd_rn(ch[1][0][0], ch[1][1][0]), __fadd_rn(ch[1][0][1], ch[1][1][1]),
+                         __fadd_rn(ch[1][0][2], ch[1][1][2]), __fadd_rn(ch[1][0][3], ch[1][1][3]));
+  }
+  __syncthreads();
+  // Thread (tok, j), j = 0..3, owns rows [8j, 8j + 8) of token tok: sum the warps in order, scale,
+  // round to bf16, push one 16-byte fragment. Accumulator element (row r, token k) sits at lane
+  // l = (r % 8) * 4 + k / 2, entry e = (r / 16) * 4 + ((r % 16) / 8) * 2 + (k % 2).
+  const int tok = tid >> 2, j = tid & 3;
+  if (tok < m) {
+    float v[8];
+#pragma unroll
+    for (int q = 0; q < 8; ++q) {
+      const int r = 8 * j + q;
+      const int l = (r % 8) * 4 + tok / 2;
+      const int e = (r / 16) * 4 + ((r % 16) / 8) * 2 + (tok % 2);
+      float x = red[0][l][e];
+#pragma unroll
+      for (int w = 1; w < 8; ++w) x = __fadd_rn(x, red[w][l][e]);
+      v[q] = __fmul_rn(x, alpha);
+    }
+    const uint4 frag = pack8(v);
+    const int fr = cta * 4 + j;
+    if (PUSH) {
+      const uint32_t stage = ld_volatile_u32(&p.ctrl->stage);
+      push_ll<W, false>(p, stage, tok, fr, frag);
+    }
+    if (o.out != nullptr) st_v4(o.out + (size_t)tok * kHidden + (size_t)fr * kVec, frag);
+  }
+  pdl_trigger();
+}
+
 }  // namespace mkh
 
 // ---------------------------------------------------------------- host entry points
@@ -1060,6 +1180,34 @@ extern "C" int mkh_pingpong(const Params* params, int peer, int iters, int unica
   if (unicast) pingpong_kernel<true><<<1, 32, 0, s>>>(*params, peer, iters, out, gap_ns);
   else pingpong_kernel<false><<<1, 32, 0, s>>>(*params, peer, iters, out, gap_ns);
   return static_cast<int>(cudaGetLastError());
+}
+
+// which: 0 = out_proj only (writes o.out), 1 = out_proj + push (and o.out if set).
+extern "C" int mkh_oproj(int which, int k_steps, const Params* params, const OprojArgs* oargs, void* stream) {
+  const Params& p = *params;
+  const OprojArgs& o = *oargs;
+  if (p.m < 1 || p.m > 8) return -2;
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = dim3(kHidden / 32, 1, 1);
+  cfg.blockDim = dim3(256, 1, 1);
+  cfg.stream = static_cast<cudaStream_t>(stream);
+  cudaLaunchAttribute attr;
+  attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr.val.programmaticStreamSerializationAllowed = 1;
+  cfg.attrs = &attr;
+  cfg.numAttrs = 1;
+#define MKH_OPROJ(S)                                                                                   \
+  switch (p.world * 2 + which) {                                                                      \
+    case 8: return (int)cudaLaunchKernelEx(&cfg, oproj_push_kernel<S, 4, false>, p, o);               \
+    case 9: return (int)cudaLaunchKernelEx(&cfg, oproj_push_kernel<S, 4, true>, p, o);                \
+    case 16: return (int)cudaLaunchKernelEx(&cfg, oproj_push_kernel<S, 8, false>, p, o);              \
+    case 17: return (int)cudaLaunchKernelEx(&cfg, oproj_push_kernel<S, 8, true>, p, o);               \
+    default: return -3;                                                                               \
+  }
+  if (k_steps == 4) { MKH_OPROJ(4) }
+  if (k_steps == 8) { MKH_OPROJ(8) }
+#undef MKH_OPROJ
+  return -4;
 }
 
 extern "C" int mkh_params_size() { return static_cast<int>(sizeof(Params)); }

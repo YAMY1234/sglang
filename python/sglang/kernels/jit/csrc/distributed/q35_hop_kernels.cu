@@ -165,6 +165,98 @@ __global__ void __launch_bounds__(kRowThreads) consume_kernel(Args a) {
   hop_leave(a.site, h, gridDim.x * gridDim.y);
 }
 
+// ---------------------------------------------------------------- out_proj + push
+// Row-parallel FP8 out_proj (M <= 8, N = 4096, K = 8 * S * 32) whose epilogue pushes the bf16 partial
+// into the hop mailbox. The MMA core follows the fused attention lane's o_proj kernel: CTA c owns
+// output rows [32c, 32c + 32) over the full K, warp w takes k-steps [w*S, (w+1)*S), weights are
+// packed as mma.m16n8k32 e4m3 A fragments and loaded to registers before the PDL wait, and the
+// warp partials are summed in warp order.
+struct OprojArgs {
+  Site site;
+  const uint4* w;      // packed [128 cta][8 warp][S step][2 block][32 lane] x 16 B
+  const uint8_t* x;    // [M, K] e4m3 activation
+  const float* sx;     // input scale
+  const float* sw;     // weight scale
+  uint16_t* out;       // [M, 4096] bf16 copy of the partial, or null
+  int m;
+};
+
+__device__ __forceinline__ void mma_e4m3(float (&d)[4], const uint4& a, uint32_t b0, uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+      "{%0,%1,%2,%3};"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+      : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ uint4 ldg_nc_v4(const uint4* q) {
+  uint4 r;
+  // Weights are static for the life of the process.
+  asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
+               : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w)
+               : "l"(q));
+  return r;
+}
+
+template <int S>
+__global__ void __launch_bounds__(256, 1) oproj_push_kernel(OprojArgs o) {
+  constexpr int kK = 8 * S * 32;
+  __shared__ __align__(16) float red[8][32][8];
+  const int cta = blockIdx.x;
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int g = lane >> 2, t = lane & 3;
+  uint4 a[S][2];
+  {
+    const uint4* wb = o.w + (static_cast<size_t>(cta) * 8 + warp) * (S * 2 * 32) + lane;
+#pragma unroll
+    for (int st = 0; st < S; ++st)
+#pragma unroll
+      for (int b = 0; b < 2; ++b) a[st][b] = ldg_nc_v4(wb + (st * 2 + b) * 32);
+  }
+  const float alpha = __fmul_rn(*o.sx, *o.sw);
+  pdl_wait();
+  const int m = o.m;
+  const bool tok_ok = g < m;
+  const uint8_t* xr = o.x + static_cast<size_t>(g) * kK + warp * S * 32 + 4 * t;
+  float ch[2][2][4] = {};
+#pragma unroll
+  for (int st = 0; st < S; ++st) {
+    const uint32_t b0 = tok_ok ? *reinterpret_cast<const uint32_t*>(xr + st * 32) : 0u;
+    const uint32_t b1 = tok_ok ? *reinterpret_cast<const uint32_t*>(xr + st * 32 + 16) : 0u;
+    mma_e4m3(ch[0][st & 1], a[st][0], b0, b1);
+    mma_e4m3(ch[1][st & 1], a[st][1], b0, b1);
+  }
+  {
+    float4* dst = reinterpret_cast<float4*>(&red[warp][lane][0]);
+    dst[0] = make_float4(__fadd_rn(ch[0][0][0], ch[0][1][0]), __fadd_rn(ch[0][0][1], ch[0][1][1]),
+                         __fadd_rn(ch[0][0][2], ch[0][1][2]), __fadd_rn(ch[0][0][3], ch[0][1][3]));
+    dst[1] = make_float4(__fadd_rn(ch[1][0][0], ch[1][1][0]), __fadd_rn(ch[1][0][1], ch[1][1][1]),
+                         __fadd_rn(ch[1][0][2], ch[1][1][2]), __fadd_rn(ch[1][0][3], ch[1][1][3]));
+  }
+  __syncthreads();
+  // Thread (tok, j) owns rows [8j, 8j + 8) of token tok. Accumulator element (row r, token k) sits at
+  // lane (r % 8) * 4 + k / 2, entry (r / 16) * 4 + ((r % 16) / 8) * 2 + k % 2 of the mma layout.
+  const int tok = tid >> 2, j = tid & 3;
+  if (tok < m) {
+    float v[8];
+#pragma unroll
+    for (int q = 0; q < 8; ++q) {
+      const int r = 8 * j + q;
+      const int l = (r % 8) * 4 + tok / 2;
+      const int e = (r / 16) * 4 + ((r % 16) / 8) * 2 + (tok % 2);
+      float x = red[0][l][e];
+#pragma unroll
+      for (int w = 1; w < 8; ++w) x = __fadd_rn(x, red[w][l][e]);
+      v[q] = __fmul_rn(x, alpha);
+    }
+    const uint4 frag = pack8(v);
+    const int fr = cta * 4 + j;
+    push_frag(o.site, stage_peek(o.site), tok, fr, frag);
+    if (o.out != nullptr) *reinterpret_cast<uint4*>(o.out + row_elem(tok, fr)) = frag;
+  }
+  pdl_trigger();
+}
+
 template <typename K>
 int launch(K kernel, const Args& a, cudaStream_t stream, bool cluster, int ctas = kRowCtas) {
   cudaLaunchConfig_t cfg = {};
@@ -211,4 +303,24 @@ extern "C" int q35hop_launch(int which, const void* args, void* stream) {
   }
 }
 
+extern "C" int q35hop_oproj(int k_steps, const void* args, void* stream) {
+  const OprojArgs& o = *static_cast<const OprojArgs*>(args);
+  if (o.m < 1 || o.m > 8 || o.m > o.site.m_cap) return -2;
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = dim3(kHidden / 32, 1, 1);
+  cfg.blockDim = dim3(256, 1, 1);
+  cfg.stream = static_cast<cudaStream_t>(stream);
+  cudaLaunchAttribute attr;
+  attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr.val.programmaticStreamSerializationAllowed = 1;
+  cfg.attrs = &attr;
+  cfg.numAttrs = 1;
+  switch (k_steps) {
+    case 4: return static_cast<int>(cudaLaunchKernelEx(&cfg, oproj_push_kernel<4>, o));
+    case 8: return static_cast<int>(cudaLaunchKernelEx(&cfg, oproj_push_kernel<8>, o));
+    default: return -3;
+  }
+}
+
 extern "C" int q35hop_args_size() { return static_cast<int>(sizeof(Args)); }
+extern "C" int q35hop_oproj_args_size() { return static_cast<int>(sizeof(OprojArgs)); }

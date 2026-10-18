@@ -309,6 +309,13 @@ class CuteDSLFusion:
     ):
         """The attention output's all-reduce with the residual add and the
         post-attention norm."""
+        if self.service is not None and _q35_hop_pushed(hidden_states):
+            # The producer already pushed this partial; only the consume half is left.
+            return self.service.all_reduce_residual_rms_norm(
+                local_contribution=hidden_states,
+                residual=residual,
+                gamma=_fused_norm_gamma(plan.norm),
+            )
         if not (
             self._eligible(plan, forward_batch, int(hidden_states.shape[0]))
             and residual is not None
@@ -372,6 +379,15 @@ class CuteDSLFusion:
             # The FFN runs on the full rows, not each rank's own slice.
             and TokenAxis.ATTN_TP not in plan.fused_input_rows(forward_batch).sharded
         )
+
+
+def _q35_hop_pushed(partial: torch.Tensor) -> bool:
+    if not envs.SGLANG_Q35MF_MKH_OPROJ.get():
+        return False
+    from sglang.srt.layers.q35_hop import active
+
+    hop = active()
+    return hop is not None and hop.has_pushed(partial)
 
 
 def _fusion_of(layer: torch.nn.Module) -> CuteDSLFusion | None:
@@ -486,6 +502,10 @@ def prepare_cutedsl_fusion(
     max_m = _resolve_max_m(max_running_requests=max_running_requests)
     for service in services.values():
         service.prepare(max_m=max_m)
+    if envs.SGLANG_Q35MF_MKH_HOP.get() and envs.SGLANG_Q35MF_MKH_OPROJ.get():
+        from sglang.srt.layers.q35_hop import prepare_out_proj
+
+        logger.info("Packed %d out_proj weights for the q35 hop push", prepare_out_proj(model))
     logger.info(
         "Prepared the FlashInfer MNNVL CuTe DSL fusion workspace for M_max=%d "
         "(%d fused layers)",

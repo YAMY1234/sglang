@@ -167,6 +167,92 @@ def _report_stamps(backend, m, ctx, stamps):
                           **out)), flush=True)
 
 
+_OPROJ = {}
+
+
+def _oproj_data(m, k, dev, rank):
+    key = (m, k)
+    if key not in _OPROJ:
+        gen = torch.Generator(device=dev).manual_seed(4242 + rank)
+        x = (torch.randn(m, k, device=dev, generator=gen) * 2.0).to(torch.float8_e4m3fn)
+        w = (torch.randn(4096, k, device=dev, generator=gen) * 2.0).to(torch.float8_e4m3fn)
+        sx = torch.full((1,), 0.02, device=dev, dtype=torch.float32)
+        sw = torch.full((1,), 0.003, device=dev, dtype=torch.float32)
+        import mkh_hop
+        wp = mkh_hop.pack_rows32(w, k // 256)
+        _OPROJ[key] = dict(x=x, w=w, wp=wp, sx=sx, sw=sw,
+                           out=torch.empty(m, 4096, device=dev, dtype=torch.bfloat16))
+    return _OPROJ[key]
+
+
+def _oproj_backend(b, args, ctx, m, t, mkh, fusion, k, dev, rank):
+    """oproj:mkh | oproj:cublas | oproj_chain:push | oproj_chain:stock | oprojcheck"""
+    d = _oproj_data(m, k, dev, rank)
+    if b == "oproj:mkh":
+        return mkh.make_oproj("oproj", m=m, x_fp8=d["x"], w_packed=d["wp"], k_steps=k // 256, sx=d["sx"],
+                              sw=d["sw"], residual=t["residual"], gamma=t["gamma"], scale=t["scale"], out=d["out"])
+    if b == "oproj:cublas":
+        return lambda: torch._scaled_mm(d["x"], d["w"].t(), scale_a=d["sx"], scale_b=d["sw"],
+                                        out_dtype=torch.bfloat16)
+    if b == "oproj_chain:push":
+        return mkh.make_oproj("oproj_push", m=m, x_fp8=d["x"], w_packed=d["wp"], k_steps=k // 256,
+                              sx=d["sx"], sw=d["sw"], residual=t["residual"], gamma=t["gamma"],
+                              scale=t["scale"], out=d["out"])
+    if b == "oproj_chain:stock":
+        def stock():
+            y = torch._scaled_mm(d["x"], d["w"].t(), scale_a=d["sx"], scale_b=d["sw"], out_dtype=torch.bfloat16)
+            fusion.all_reduce_residual_rms_norm(local_contribution=y, residual=t["residual"], gamma=t["gamma"])
+        return stock
+    if b in ("oproj_chain:push_cold", "oproj_chain:stock_cold", "oproj:mkh_cold", "oproj:cublas_cold"):
+        # 48 weight sets (192 MB at K = 1024) rotate so every call reads cold weights, as serving does.
+        layers = 48
+        key = ("cold", m, k)
+        if key not in _OPROJ:
+            import mkh_hop
+            gen = torch.Generator(device=dev).manual_seed(777 + rank)
+            ws = [(torch.randn(4096, k, device=dev, generator=gen) * 2.0).to(torch.float8_e4m3fn)
+                  for _ in range(layers)]
+            _OPROJ[key] = dict(w=ws, wp=[mkh_hop.pack_rows32(w, k // 256) for w in ws])
+        cold = _OPROJ[key]
+        kind = b.split(":")[1]
+        if kind in ("push_cold", "mkh_cold"):
+            calls = [mkh.make_oproj("oproj_push" if kind == "push_cold" else "oproj", m=m, x_fp8=d["x"],
+                                    w_packed=cold["wp"][i], k_steps=k // 256, sx=d["sx"], sw=d["sw"],
+                                    residual=t["residual"], gamma=t["gamma"], scale=t["scale"], out=d["out"])
+                     for i in range(layers)]
+        else:
+            def mk(i, with_hop):
+                def f():
+                    y = torch._scaled_mm(d["x"], cold["w"][i].t(), scale_a=d["sx"], scale_b=d["sw"],
+                                         out_dtype=torch.bfloat16)
+                    if with_hop:
+                        fusion.all_reduce_residual_rms_norm(local_contribution=y, residual=t["residual"],
+                                                            gamma=t["gamma"])
+                return f
+            calls = [mk(i, kind == "stock_cold") for i in range(layers)]
+        state = {"i": 0}
+
+        def rotate():
+            calls[state["i"] % layers]()
+            state["i"] += 1
+        return rotate
+    if b == "oprojcheck":
+        y = torch._scaled_mm(d["x"], d["w"].t(), scale_a=d["sx"], scale_b=d["sw"], out_dtype=torch.bfloat16)
+        mk = mkh.make_oproj("oproj", m=m, x_fp8=d["x"], w_packed=d["wp"], k_steps=k // 256, sx=d["sx"],
+                            sw=d["sw"], residual=t["residual"], gamma=t["gamma"], scale=t["scale"], out=d["out"])
+        mk()
+        ref64 = (d["x"].double() @ d["w"].double().t()) * (0.02 * 0.003)
+        torch.cuda.synchronize()
+        err_mkh = (d["out"].double() - ref64).abs()
+        err_cub = (y.double() - ref64).abs()
+        print(json.dumps(dict(event="oprojcheck", m=m, k=k, rank=rank, diff_vs_cublas=_diff(d["out"], y),
+                              max_err_mkh=float(err_mkh.max()), max_err_cublas=float(err_cub.max()),
+                              mean_err_mkh=float(err_mkh.mean()), mean_err_cublas=float(err_cub.mean()))),
+              flush=True)
+        return None
+    raise ValueError(b)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--m", default="7,1")
@@ -198,7 +284,8 @@ def main():
 
     from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
 
-    need_fusion = any(b.startswith(("fi_ar", "fi_fin", "chain:plain_fi", "q35check")) or b.startswith("check")
+    need_fusion = any(b.startswith(("fi_ar", "fi_fin", "chain:plain_fi", "q35check", "oproj_chain:stock"))
+                      or b.startswith("check")
                       for b in backends)
     fusion = None
     if need_fusion:
@@ -225,7 +312,7 @@ def main():
             comm_backend=TorchDistBackend(group=dist.group.WORLD), group=dist.group.WORLD,
         )
     mkh = None
-    if any(b.startswith(("mkh:", "chain:", "check", "pingpong:", "split:")) for b in backends):
+    if any(b.startswith(("mkh:", "chain:", "check", "pingpong:", "split:", "oproj")) for b in backends):
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import mkh_hop
 
@@ -235,6 +322,7 @@ def main():
         if args.stamps:
             mkh.stamps = torch.zeros(64, args.max_m * mkh_hop.CTAS, 16, dtype=torch.int64, device=dev)
 
+    oproj_k = int(os.environ.get("MKH_OPROJ_K", "1024"))
     q35 = None
     if any(b.startswith("q35:") for b in backends):
         from sglang.srt.layers.q35_hop import Q35Hop
@@ -297,6 +385,12 @@ def main():
             try:
                 if b == "check":
                     _check(args, ctx, m, t, fusion, mkh, static_quant_fp8)
+                    continue
+                if b.startswith("oproj"):
+                    fn = _oproj_backend(b, args, ctx, m, t, mkh, fusion, oproj_k, dev, rank)
+                    if fn is None:
+                        continue
+                    results[name] = _bench(b, fn, args, ctx, m)
                     continue
                 if b.startswith("q35check"):
                     # production module (srt/layers/q35_hop.py) vs FlashInfer + Triton quant, bitwise

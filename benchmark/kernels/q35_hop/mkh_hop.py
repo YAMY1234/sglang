@@ -29,7 +29,22 @@ class Params(ctypes.Structure):
         ("eps", ctypes.c_float), ("prod_coeff", ctypes.c_float),
         ("timeout_ns", ctypes.c_ulonglong), ("peer_uc", ctypes.c_uint64 * 8),
         ("poll_sleep_ns", ctypes.c_uint), ("self_only", ctypes.c_int), ("active_rank", ctypes.c_int),
-        ("early_trigger", ctypes.c_int)]
+        ("early_trigger", ctypes.c_int), ("poll_mode", ctypes.c_int)]
+
+
+class OprojArgs(ctypes.Structure):
+    _fields_ = [(n, ctypes.c_uint64) for n in ("w", "x", "sx", "sw", "out")]
+
+
+def pack_rows32(w_fp8, k_steps_per_warp):
+    """[4096, K] e4m3 -> [cta 128][warp 8][step S][block 2][lane 32][16 B] mma A fragments
+    (same packing as the fused attention lane's o_proj core)."""
+    w = w_fp8.view(torch.uint8)
+    n, k = w.shape
+    S = k_steps_per_warp
+    assert k == 8 * S * 32
+    v = w.view(n // 32, 2, 2, 8, 8, S, 2, 4, 4)
+    return v.permute(0, 4, 5, 1, 3, 7, 6, 2, 8).contiguous().view(-1)
 
 
 def _build(rank):
@@ -108,6 +123,7 @@ class MkhHop:
         self.self_only = int(os.environ.get("MKH_SELF_ONLY", "0"))
         self.active_rank = int(os.environ.get("MKH_ACTIVE_RANK", "-1"))
         self.early_trigger = int(os.environ.get("MKH_EARLY_TRIGGER", "0"))
+        self.poll_mode = int(os.environ.get("MKH_POLL_MODE", "0"))
 
     def _instance(self, kind, m, tag=""):
         key = (kind + tag, m)
@@ -155,6 +171,7 @@ class MkhHop:
         p.self_only = self.self_only
         p.active_rank = self.active_rank
         p.early_trigger = self.early_trigger
+        p.poll_mode = self.poll_mode
         return p
 
     def _launch(self, variant, order, p):
@@ -252,6 +269,25 @@ class MkhHop:
         if rc != 0:
             raise RuntimeError(f"mkh_pingpong returned {rc}")
         return int(out.item()) / (2 * iters)
+
+    def make_oproj(self, name, *, m, x_fp8, w_packed, k_steps, sx, sw, residual, gamma, scale, out):
+        """oproj (GEMM only, writes out) | oproj_push (GEMM + push, then consume) | oproj_push_out."""
+        inst = self._instance("ll", m, tag="-oproj")
+        outs = self._outputs((name, m, 0), m)
+        p = self._params(inst, m=m, outs=outs, x=None, residual=residual, gamma=gamma, scale=scale,
+                         quant=False)
+        o = OprojArgs(w_packed.data_ptr(), x_fp8.data_ptr(), sx.data_ptr(), sw.data_ptr(),
+                      0 if name == "oproj_push" else out.data_ptr())
+        stream = lambda: ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
+
+        def gemm(which):
+            rc = self.lib.mkh_oproj(which, k_steps, ctypes.byref(p), ctypes.byref(o), stream())
+            if rc != 0:
+                raise RuntimeError(f"mkh_oproj failed {rc}")
+
+        if name == "oproj":
+            return lambda: gemm(0)
+        return lambda: (gemm(1), self._launch(V_CONSUME, 1, p))
 
     def outputs_of(self, name, m, order=0):
         return self.outputs[(name, m, order)]
