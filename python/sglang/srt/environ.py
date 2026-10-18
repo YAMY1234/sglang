@@ -1198,6 +1198,8 @@ class Envs:
     SGLANG_Q35MF_MKM_FUSED = EnvBool(False)
     # With SGLANG_Q35MF_MKM_FUSED at TP4: also take 8..16 tokens (two requests of 7) through the fused engine.
     SGLANG_Q35MF_MKM_FUSED_M16 = EnvBool(False)
+    # With SGLANG_Q35MF_MKM_FUSED at TP4: also take 17..21 tokens (three requests of 7) through the fused engine.
+    SGLANG_Q35MF_MKM_FUSED_M21 = EnvBool(False)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
