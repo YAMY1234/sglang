@@ -533,6 +533,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             and get_parallel().pp_size == 1
         )
         self._fused_verify_buffers = None
+        self._middle_verify_enabled = (
+            _is_cuda
+            and envs.SGLANG_Q35MF_MKG_TP4_MIDDLE.get()
+            and self.attn_tp_size == 4
+            and get_parallel().pp_size == 1
+        )
+        self._middle_verify_buffers = None
         if self._fused_verify_enabled:
             from sglang.kernels.ops.attention.gdn_pdl_front import ensure_built
 
@@ -990,6 +997,91 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         output, _ = self.out_proj(core_attn_out)
         return output
 
+    def _middle_verify_backend(
+        self, hidden_states, projected_states_qkvz, projected_states_ba, forward_batch
+    ):
+        """Select the stock-front verify path with an early gated-norm tail."""
+        if (
+            not forward_batch.forward_mode.is_target_verify()
+            or not isinstance(hidden_states, torch.Tensor)
+            or hidden_states.dtype != torch.bfloat16
+            or hidden_states.shape != (7, 4096)
+            or not isinstance(projected_states_qkvz, torch.Tensor)
+            or projected_states_qkvz.dtype != torch.bfloat16
+            or projected_states_qkvz.shape != (7, 5120)
+            or not isinstance(projected_states_ba, torch.Tensor)
+            or projected_states_ba.dtype != torch.bfloat16
+            or projected_states_ba.shape != (7, 32)
+            or (self.attn.num_k_heads, self.attn.num_v_heads) != (4, 16)
+            or (self.head_k_dim, self.head_v_dim) != (128, 128)
+            or self.conv_kernel_size != 4
+            or self.activation not in ("silu", "swish")
+            or self.norm.activation not in ("silu", "swish")
+            or not self.norm.norm_before_gate
+            or self.norm.bias is not None
+            or self.norm.group_size is not None
+            or self.attn.bias is not None
+            or forward_batch.spec_info.draft_token_num != 7
+            or forward_batch.spec_info.ragged_verify_layout is not None
+            or not envs.SGLANG_Q35MF_GDN_VIEWS.get()
+            or not envs.SGLANG_Q35MF_GDN_CONV_TILE.get()
+            or not envs.SGLANG_Q35MF_GDN_NORM_FP8.get()
+        ):
+            return None
+
+        from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+        from sglang.srt.layers.quantization.modelopt_quant import (
+            ModelOptFp8LinearMethod,
+        )
+        from sglang.srt.mem_cache.memory_pool import MambaPool
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        backend = get_attn_backend()
+        backend = getattr(backend, "linear_attn_backend", backend)
+        if not isinstance(backend, GDNAttnBackend) or backend.mis_metadata is not None:
+            return None
+        if _gdn_decode_fused_proj_conv and getattr(backend, "supports_packed_verify", False):
+            return None
+        metadata = backend.forward_metadata
+        if (
+            metadata.query_start_loc.numel() != 2
+            or metadata.retrieve_next_token is not None
+            or metadata.retrieve_next_sibling is not None
+            or metadata.retrieve_parent_token is not None
+        ):
+            return None
+        cache = backend.req_to_token_pool.mamba2_layer_cache(self.layer_id)
+        pool = backend.req_to_token_pool.mamba_pool
+        if (
+            not isinstance(cache, MambaPool.SpeculativeState)
+            or cache.temporal.dtype != torch.bfloat16
+            or cache.replayssm_d is None
+            or cache.replayssm_d.shape[-2] != 16
+            or getattr(pool, "replayssm_cache_base", None) is None
+            or getattr(pool, "replayssm_spec_fold", False)
+            or getattr(pool, "replayssm_is_kda", False)
+        ):
+            return None
+        method = self.out_proj.quant_method
+        if (
+            not isinstance(method, ModelOptFp8LinearMethod)
+            or method.use_marlin
+            or method.use_sm120_fp8
+            or self.out_proj.input_scale.numel() != 1
+            or self.out_proj.input_scale.dtype != torch.float32
+        ):
+            return None
+        if self._middle_verify_buffers is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("GDN gated norm must be prepared before capture")
+            self._middle_verify_buffers = (
+                torch.empty(
+                    (112, 128), device=hidden_states.device, dtype=torch.float8_e4m3fn
+                ),
+                torch.empty((112,), device=hidden_states.device, dtype=torch.float32),
+            )
+        return backend
+
     def _try_fused_verify(self, hidden_states, forward_batch):
         """Use the clustered projection/Conv1D path for its supported layout."""
         if (
@@ -1185,6 +1277,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
             hidden_states
         )
+        middle_backend = (
+            self._middle_verify_backend(
+                hidden_states, projected_states_qkvz, projected_states_ba, forward_batch
+            )
+            if self._middle_verify_enabled
+            else None
+        )
 
         if _is_xpu and get_exec().mamba.linear_attn_backend == "intel_xpu":
             from sglang.srt.model_executor.forward_context import get_attn_backend
@@ -1259,12 +1358,23 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
             mixed_qkv = torch.cat((query, key, value), dim=-1)
 
-        attn_result = self.attn(
-            forward_batch,
-            mixed_qkv=mixed_qkv,
-            a=a,
-            b=b,
-        )
+        if middle_backend is not None:
+            attn_result = middle_backend.forward_extend(
+                layer=self.attn,
+                forward_batch=forward_batch,
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+                verify_pdl=True,
+                wait_for_gate_producer=True,
+            )
+        else:
+            attn_result = self.attn(
+                forward_batch,
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+            )
         if use_fused_proj_conv:
             if not isinstance(attn_result, tuple) or len(attn_result) != 2:
                 raise RuntimeError(
@@ -1291,6 +1401,20 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out = core_attn_out_pad
 
         nv = self.num_v_heads // self.attn_tp_size
+        if middle_backend is not None:
+            from sglang.kernels.ops.attention.gdn_pdl_norm import norm
+
+            quant, rstd = self._middle_verify_buffers
+            norm(
+                core_attn_out,
+                z,
+                self.norm.weight,
+                self.out_proj.input_scale,
+                quant,
+                rstd,
+                self.norm.eps,
+            )
+            return self.out_proj(quant.view(7, 2048))[0]
         if (
             _is_cuda
             and forward_batch.forward_mode.is_target_verify()

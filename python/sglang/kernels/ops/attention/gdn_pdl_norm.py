@@ -171,8 +171,8 @@ def norm(
 ) -> None:
     """Write gated RMSNorm followed by static FP8 conversion into caller buffers.
 
-    ``x`` is BF16 with shape ``[tokens * 8, 128]``. The BF16 gate ``z``
-    has shape ``[tokens, 8, 128]`` and may have strided token/head axes.
+    ``x`` is BF16 with shape ``[tokens * heads, 128]``. The BF16 gate ``z``
+    has shape ``[tokens, heads, 128]`` and may have strided token/head axes.
     ``weight`` is contiguous with 128 elements, ``scale`` is a device FP32
     scalar, and both destinations are contiguous. The caller must provide
     non-overlapping output storage on the same CUDA device.
@@ -183,9 +183,11 @@ def norm(
     the unfused operator. No output or workspace is allocated.
     """
     assert x.ndim == 2 and x.shape[1] == 128
-    assert x.shape[0] > 0 and x.shape[0] % 8 == 0
+    assert z.ndim == 3 and z.shape[1] in (8, 16)
+    heads = z.shape[1]
+    assert x.shape[0] > 0 and x.shape[0] % heads == 0
     assert x.dtype == torch.bfloat16 and x.is_contiguous()
-    assert z.shape == (x.shape[0] // 8, 8, 128)
+    assert z.shape == (x.shape[0] // heads, heads, 128)
     assert z.dtype == torch.bfloat16 and z.stride(-1) == 1
     assert weight.shape == (128,) and weight.stride(0) == 1
     assert weight.dtype in (torch.bfloat16, torch.float32)
@@ -222,7 +224,7 @@ def norm(
         HAS_BIAS=False,
         HAS_Z=True,
         Z_IS_3D=True,
-        Z_HEADS=8,
+        Z_HEADS=heads,
         NORM_BEFORE_GATE=True,
         IS_RMS_NORM=True,
         ACTIVATION="swish",
