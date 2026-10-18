@@ -191,8 +191,10 @@ int launch(K kernel, const Args& a, cudaStream_t stream, bool cluster, int ctas 
 }  // namespace
 
 // which: 0 publish, 1 publish_fin, 2 consume.
-extern "C" int q35hop_launch(int which, const Args* args, void* stream) {
-  const Args& a = *args;
+// The C entry takes an opaque pointer: Args lives in an unnamed namespace, and a C-linkage
+// function whose signature names it would not be exported.
+extern "C" int q35hop_launch(int which, const void* args, void* stream) {
+  const Args& a = *static_cast<const Args*>(args);
   if (a.m < 1 || a.m > a.site.m_cap || a.top_k > kMaxTopK) return -2;
   cudaStream_t s = static_cast<cudaStream_t>(stream);
   switch (which) {
