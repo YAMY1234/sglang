@@ -3,7 +3,7 @@
 // hidden 4096, intermediate 256 per rank): DynBlock-exact top-10 from the router logits, FC1, SwiGLU, NVFP4
 // requantization and FC2 in one launch over the trtllm-gen weight layout. Writes the RT deferred-finalize rows
 // (row t * 10 + k, identity permutation) and the expert weights.
-// Device code generated from the MKM lane engine (source md5 ae6d752c3a787b9f8d76d820433747bc, PTX helpers md5 b4d0b7dea5606da866a21d8e1a373dd9) by
+// Device code generated from the MKM lane engine (source md5 b74ba8cb6f7e6d4053790bb653aac7a5, PTX helpers md5 b4d0b7dea5606da866a21d8e1a373dd9) by
 // lanes/mkm/tools/export_cuh.py.
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.cuh>
@@ -221,6 +221,9 @@ constexpr int kTraceStride = STAGE_STAMPS ? 128 : 16;
 #endif
 #ifndef PF_N2  // stages prefetched at the FC2 trigger
 #define PF_N2 4
+#endif
+#ifndef SM_RESERVE  // SMs left free by the persistent grid, for kernels the serving path runs concurrently (the shared
+#define SM_RESERVE 8  // expert's projections on the alt stream: with all SMs taken they wait and the layer's join slips)
 #endif
 #ifndef TAILV  // FC2 drains: bit 0 = last pass on all 8 warps; bit 1 = TMEM loads double-buffered; bit 2 = coalesced stores
 #define TAILV 3
@@ -1294,7 +1297,7 @@ inline CUtensorMap make_tmap(const void* base, uint64_t rows, uint64_t row_bytes
 /// \brief Launcher of the fused expert phase; min(M * 10, SMs) persistent CTAs, each running its share of the distinct experts.
 struct MkmMoeTp4M21 {
   /// Low 60 bits of the engine source md5 this module was compiled from (stale-build check).
-  static int64_t source_md5_lo() { return 0xae6d752c3a787b9LL; }
+  static int64_t source_md5_lo() { return 0xb74ba8cb6f7e6d4LL; }
 
   /// \param logits         [M, 512] bf16 router logits (router_gemm_quant output), M <= 21.
   /// \param expert_weights [M, 10] bf16 out, DynBlock softmax-over-top-10 weights.
@@ -1367,8 +1370,9 @@ struct MkmMoeTp4M21 {
     (void)smem_attr_set;
     int sms = 0;
     CHECK_CUDA(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device.unwrap().device_id));
-    // min(M * 10, SMs) CTAs, no clusters: one CTA per SM (shared memory), all resident at once
-    LaunchKernel(dim3(static_cast<unsigned>(M * kTopK < sms ? M * kTopK : sms)), dim3(kThreads), device.unwrap(), kSmem)
+    // min(M * 10, SMs - SM_RESERVE) CTAs, no clusters: one CTA per SM (shared memory), all resident at once
+    const int64_t ctas = sms - SM_RESERVE;
+    LaunchKernel(dim3(static_cast<unsigned>(M * kTopK < ctas ? M * kTopK : ctas)), dim3(kThreads), device.unwrap(), kSmem)
         .enable_pdl(true)(s1_kernel, m13, m2, mx, p);
   }
 };
