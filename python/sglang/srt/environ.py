@@ -1567,6 +1567,9 @@ class Envs:
     # With SGLANG_Q35MF_MKH_HOP: the GatedDeltaNet out_proj (static FP8, M <= 8) runs as a q35 hop
     # launch that pushes its partial straight into the hop mailbox, so its all-reduce only consumes.
     SGLANG_Q35MF_MKH_OPROJ = EnvBool(False)
+    # Breakable prefill CUDA graphs capture the GDN extend on per-bucket static tables
+    # instead of breaking the graph at every GDN layer (bit-identical outputs).
+    SGLANG_Q35MF_MKH_PF_GRAPH = EnvBool(False)
     # Verify input staging, bit-identical: reuse last round's mamba track indices while their
     # inputs are unchanged, and skip the replay-time input_ids / positions copies that the
     # same-stream pre-planned load_batch already made.
