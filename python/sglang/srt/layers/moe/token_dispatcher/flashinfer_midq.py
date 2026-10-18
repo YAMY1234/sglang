@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import logging
 import pathlib
+import threading
+import time
 from typing import Optional
 
 import torch
@@ -85,35 +87,41 @@ def stock_combine_module():
 
 
 class CombineProof:
-    """Eager-only check that the installed combine equals the stock kernel bit for bit.
+    """Check that the installed combine equals the stock kernel bit for bit, eager or in CUDA graphs.
 
     One instance per process and per (target, draft); every dispatcher of that kind shares it.
+    Counters live on the device, so the check is capturable; a reporter thread logs them every
+    PERIOD_S seconds through its own stream, without synchronising the forward stream.
     """
+
+    PERIOD_S = 30.0
 
     def __init__(self, speculative: bool):
         self.speculative = speculative
-        self.calls = 0
-        self.elements = 0
+        self.device = torch.cuda.current_device()
+        # [calls, compared elements, differing elements]
+        self.counters = torch.zeros(3, dtype=torch.int64, device=self.device)
+        threading.Thread(target=self._report, daemon=True).start()
 
     def check(self, ref: torch.Tensor, out: torch.Tensor) -> None:
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("MIDQ combine proof runs eager only (--disable-cuda-graph)")
-        mismatched = int(
-            torch.count_nonzero(ref.view(torch.int16) != out.view(torch.int16)).item()
-        )
-        self.calls += 1
-        self.elements += ref.numel()
-        if mismatched:
-            raise RuntimeError(
-                f"MIDQ combine proof: {mismatched} of {ref.numel()} elements differ "
-                f"(speculative={self.speculative}, call {self.calls})"
-            )
-        if self.calls % 200 == 0:
+        differing = torch.count_nonzero(ref.view(torch.int16) != out.view(torch.int16))
+        self.counters[0].add_(1)
+        self.counters[1].add_(ref.numel())
+        self.counters[2].add_(differing)
+
+    def _report(self) -> None:
+        torch.cuda.set_device(self.device)
+        stream = torch.cuda.Stream()
+        while True:
+            time.sleep(self.PERIOD_S)
+            with torch.cuda.stream(stream):
+                calls, elements, differing = self.counters.cpu().tolist()
             logger.info(
-                "MIDQ combine proof: speculative=%s calls=%d elements=%d mismatched=0",
+                "MIDQ combine proof: speculative=%s calls=%d elements=%d mismatched=%d",
                 self.speculative,
-                self.calls,
-                self.elements,
+                calls,
+                elements,
+                differing,
             )
 
 

@@ -1146,7 +1146,7 @@ class Envs:
     # > 1: FlashInfer a2a built from token_dispatcher/midq_csrc, whose combine splits each
     # token row over this many CTAs (bit-identical output, target and draft).
     SGLANG_Q35MF_MIDQ_COMBINE_SPLIT = EnvInt(0)
-    # Eager-only check of every combine against the stock FlashInfer kernel, bit for bit.
+    # Check every combine against the stock FlashInfer kernel bit for bit (eager or graphs).
     SGLANG_Q35MF_MIDQ_COMBINE_PROOF = EnvBool(False)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
