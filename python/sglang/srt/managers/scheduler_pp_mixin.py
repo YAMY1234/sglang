@@ -567,6 +567,8 @@ class SchedulerPPMixin:
         ]
         self.mb_metadata: List[Optional[PPBatchMetadata]] = [None] * self.pp_loop_size
         self.pp_outputs: Optional[PPProxyTensors] = None
+        # (req, cached_end) early-sends waiting for the forward launch (PPO only).
+        self.deferred_prefix_sends: List[Tuple[Req, int]] = []
         self.last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]] = deque()
         self._pp_spec_relay = (
             pp_spec_stable_rows_enabled()
@@ -1653,6 +1655,7 @@ class SchedulerPPMixin:
                     trace_only=True,
                 )
                 result = self.run_batch(cur_batch, pp_proxy_tensors)
+                self.flush_deferred_prefix_sends()
                 set_time_batch(
                     cur_batch.reqs,
                     "set_run_batch_cpu_end_time",
