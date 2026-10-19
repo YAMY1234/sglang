@@ -16,13 +16,23 @@ the raw value must be restored once replay finishes.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative import (
+    eagle_draft_cuda_graph_runner,
+    eagle_draft_extend_cuda_graph_runner,
+)
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
+)
+from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
+    EAGLEDraftExtendCudaGraphRunner,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -58,6 +68,23 @@ class _RecordingDraftBackend:
                 seq_lens=None if seq_lens is None else seq_lens.clone(),
             )
         )
+
+
+class _CopyPlan:
+    """The one-launch copy, as plain copies on CPU."""
+
+    def __call__(self, dsts, srcs):
+        for dst, src in zip(dsts, srcs):
+            dst.copy_(src)
+        return True
+
+
+def _buffer_snapshot(buffers):
+    return {
+        name: buffer.clone()
+        for name, buffer in vars(buffers).items()
+        if isinstance(buffer, torch.Tensor)
+    }
 
 
 class TestEagleDraftCudaGraphRunner(CustomTestCase):
@@ -193,6 +220,31 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
             )
         self.assertEqual(forward_batch.seq_lens_sum, sum(seq_lens))
 
+    def test_one_launch_staging_writes_what_the_stock_copies_write(self):
+        """With EAGLE entries the inputs are staged in one launch; every static
+        buffer the graph reads must end up as the stock per-field copies leave it."""
+        staged = []
+        for megakernel in (None, object()):
+            runner = self._build_runner(_RecordingDraftBackend())
+            for buffer in vars(runner.buffers).values():
+                if buffer is not None:
+                    buffer.fill_(-3)
+            runner.megakernel = megakernel
+            runner._input_views_cache, runner._copy_plans = {}, {}
+            forward_batch = self._build_forward_batch([10, 11], 21)
+            torch.manual_seed(0)  # the same inputs for both paths
+            forward_batch.spec_info.hidden_states.uniform_()
+            forward_batch.spec_info.topk_index.random_(0, 8)
+            with patch.object(
+                eagle_draft_cuda_graph_runner, "SmallFieldCopyPlan", _CopyPlan
+            ):
+                runner.execute(forward_batch)
+            staged.append(_buffer_snapshot(runner.buffers))
+        stock, fused = staged
+        self.assertEqual(stock.keys(), fused.keys())
+        for name in stock:
+            self.assertTrue(torch.equal(stock[name], fused[name]), name)
+
     def test_none_seq_lens_sum_is_preserved(self):
         # seq_lens_sum may be intentionally absent; padding must keep it None
         # rather than coerce it into an int.
@@ -201,6 +253,103 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
         for observation in backend.observations:
             self.assertIsNone(observation.seq_lens_sum, msg=observation.phase)
         self.assertIsNone(forward_batch.seq_lens_sum)
+
+
+WIDTH = 3  # draft-extend rows per request
+
+
+def _build_extend_runner(*, megakernel, with_track):
+    runner = EAGLEDraftExtendCudaGraphRunner.__new__(EAGLEDraftExtendCudaGraphRunner)
+    rows = 2 * WIDTH
+    runner.deepep_adapter = SimpleNamespace(replay=lambda: None)
+    runner.buffers = SimpleNamespace(
+        input_ids=torch.full((rows,), -3, dtype=torch.int64),
+        seq_lens=torch.full((2,), -3, dtype=torch.int64),
+        out_cache_loc=torch.full((rows,), -3, dtype=torch.int64),
+        positions=torch.full((rows,), -3, dtype=torch.int64),
+        req_pool_indices=torch.full((2,), -3, dtype=torch.int64),
+        num_correct_drafts=torch.full((2,), -3, dtype=torch.int32),
+        num_accept_tokens=torch.full((2,), -3, dtype=torch.int32),
+        extend_seq_lens=torch.full((2,), -3, dtype=torch.int32),
+        select_index=torch.full((2,), -3, dtype=torch.int64),
+        mamba_track_indices=(
+            torch.full((2,), -3, dtype=torch.int64) if with_track else None
+        ),
+        hidden_states=torch.full((rows, 2), -3.0),
+        seq_lens_cpu=torch.full((2,), -3, dtype=torch.int64),
+    )
+    runner.megakernel = megakernel
+    runner._input_views_cache, runner._copy_plans = {}, {}
+    runner.require_mlp_tp_gather = False
+    runner.require_gathered_buffer = False
+    runner.captured_req_width = WIDTH
+    runner.capture_bs = [2]
+    runner.seq_len_fill_value = 1
+    runner.extend_seq_lens_cpu = [WIDTH] * 2
+    runner.forward_mode = ForwardMode.DRAFT_EXTEND_V2
+    runner.model_runner = SimpleNamespace(
+        model_config=SimpleNamespace(model_is_mrope=False), device_timer=None
+    )
+    runner.draft_extend_attn_backend = SimpleNamespace(
+        init_forward_metadata_out_graph=lambda fb_view: None,
+        shared_read_ends=lambda mode: SharedReadEnds.UNKNOWN,
+    )
+    runner._replay_graph = lambda key, fb: SimpleNamespace(
+        next_token_logits=torch.zeros((2, 4)), hidden_states=torch.zeros((2, 2))
+    )
+    return runner
+
+
+def _extend_batch(raw_bs, with_track):
+    torch.manual_seed(raw_bs)  # the same inputs for both paths
+    rows = raw_bs * WIDTH
+    return SimpleNamespace(
+        batch_size=raw_bs,
+        input_ids=torch.randint(0, 100, (rows,)),
+        seq_lens=torch.randint(10, 20, (raw_bs,)),
+        out_cache_loc=torch.randint(0, 100, (rows,)),
+        positions=torch.randint(0, 100, (rows,)),
+        req_pool_indices=torch.randint(1, 8, (raw_bs,)),
+        mrope_positions=None,
+        extend_seq_lens=torch.full((raw_bs,), WIDTH, dtype=torch.int32),
+        mamba_track_indices=torch.randint(0, 8, (raw_bs,)) if with_track else None,
+        seq_lens_cpu=None,
+        extend_seq_lens_cpu=[WIDTH] * raw_bs,
+        seq_lens_sum=None,
+        out_cache_loc_virtual=None,
+        kv_loc_plan=None,
+        kv_loc_cols=None,
+        spec_info=SimpleNamespace(
+            num_correct_drafts=torch.randint(0, WIDTH, (raw_bs,), dtype=torch.int32),
+            num_accept_tokens=torch.randint(1, WIDTH, (raw_bs,), dtype=torch.int32),
+            hidden_states=torch.rand((rows, 2)),
+        ),
+    )
+
+
+class TestEagleDraftExtendCudaGraphRunner(CustomTestCase):
+    def test_one_launch_staging_writes_what_the_stock_copies_write(self):
+        """The draft-extend runner's one-launch staging with EAGLE entries must
+        leave every static buffer as the stock copies leave it, padded or not."""
+        for raw_bs, with_track in ((2, True), (1, True), (2, False)):
+            staged = []
+            for megakernel in (None, object()):
+                runner = _build_extend_runner(
+                    megakernel=megakernel, with_track=with_track
+                )
+                forward_batch = _extend_batch(raw_bs, with_track)
+                select_index = torch.arange(raw_bs) * WIDTH + WIDTH - 1
+                with patch.object(
+                    eagle_draft_extend_cuda_graph_runner,
+                    "SmallFieldCopyPlan",
+                    _CopyPlan,
+                ):
+                    runner.execute(forward_batch, select_index)
+                staged.append(_buffer_snapshot(runner.buffers))
+            stock, fused = staged
+            for name in stock:
+                with self.subTest(raw_bs=raw_bs, with_track=with_track, name=name):
+                    self.assertTrue(torch.equal(stock[name], fused[name]))
 
 
 if __name__ == "__main__":
