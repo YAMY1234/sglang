@@ -9,6 +9,7 @@ from sglang.kernels.ops.attention.fla.gdn_prefill_graph_track import (
     gdn_track_conv_window,
     gdn_track_ssm_state,
 )
+from sglang.kernels.ops.mamba import causal_conv1d_prefill_vectorized
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     CAUSAL_CONV1D_FWD_BLOCK_M,
 )
@@ -561,6 +562,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
     needs_cpu_seq_lens: bool = False
     supports_mis: bool = True
     requires_contiguous_prefill_state: bool = True
+    _vector_conv_prefill: bool = False
 
     # Set while a breakable prefill CUDA graph captures or replays a bucket:
     # forward_extend then runs the graph-safe chain on these static tables.
@@ -603,6 +605,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self._use_strided_target_verify_qkv = False
         self._split_conv_prefill = (
             is_cuda() and envs.SGLANG_Q35MF_GDN_PREFILL_SPLIT_CONV.get()
+        )
+        self._vector_conv_prefill = (
+            is_cuda() and envs.SGLANG_Q35MF_GDN_PREFILL_CONV_VEC.get()
         )
         # Every prefill batch fits: it never holds more requests than the pool.
         self.prefill_graph_max_seqs = self.req_to_token_pool.size
@@ -1109,20 +1114,57 @@ class GDNAttnBackend(MambaAttnBackendBase):
         conv_states: torch.Tensor,
         cache_indices: torch.Tensor,
     ) -> torch.Tensor:
+        return self._run_prefill_conv(
+            layer=layer,
+            forward_batch=forward_batch,
+            x=mixed_qkv.transpose(0, 1),
+            weight=layer.conv_weights,
+            bias=layer.bias,
+            conv_states=conv_states,
+            cache_indices=cache_indices,
+            has_initial_state=forward_batch.extend_prefix_lens > 0,
+        ).transpose(0, 1)[: mixed_qkv.shape[0]]
+
+    def _run_prefill_conv(
+        self,
+        *,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        conv_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        has_initial_state: torch.Tensor,
+    ) -> torch.Tensor:
+        if self._vector_conv_prefill:
+            print_info_once("GDN prefill: vectorized conv engaged")
+            # Tiles tokens by 64; the stock 8-token conv block table does not apply.
+            return causal_conv1d_prefill_vectorized(
+                x,
+                weight,
+                bias,
+                conv_states,
+                self.forward_metadata.query_start_loc,
+                forward_batch.extend_seq_lens_cpu,
+                cache_indices=cache_indices,
+                has_initial_state=has_initial_state,
+                activation=layer.activation,
+            )
         block_table = self.forward_metadata.conv_block_table
         conv_kwargs = {"block_table": block_table} if block_table is not None else {}
         return causal_conv1d_fn(
-            mixed_qkv.transpose(0, 1),
-            layer.conv_weights,
-            layer.bias,
+            x,
+            weight,
+            bias,
             activation=layer.activation,
             conv_states=conv_states,
-            has_initial_state=forward_batch.extend_prefix_lens > 0,
+            has_initial_state=has_initial_state,
             cache_indices=cache_indices,
             query_start_loc=self.forward_metadata.query_start_loc,
             seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             **conv_kwargs,
-        ).transpose(0, 1)[: mixed_qkv.shape[0]]
+        )
 
     def _convolve_prefill_split(
         self,
@@ -1134,8 +1176,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
     ) -> list[torch.Tensor]:
         # The conv is per channel, so channel slices give the same values bitwise;
         # each launch's output is a contiguous [1, T, H, D] tensor.
-        block_table = self.forward_metadata.conv_block_table
-        conv_kwargs = {"block_table": block_table} if block_table is not None else {}
+        print_info_once("GDN prefill: per-group split conv engaged")
         has_initial_state = forward_batch.extend_prefix_lens > 0
         seq_len = mixed_qkv.shape[0]
         outputs = []
@@ -1147,17 +1188,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ):
             channels = slice(start, start + num_heads * head_dim)
             start = channels.stop
-            out = causal_conv1d_fn(
-                mixed_qkv[:, channels].transpose(0, 1),
-                layer.conv_weights[channels],
-                None if layer.bias is None else layer.bias[channels],
-                activation=layer.activation,
+            out = self._run_prefill_conv(
+                layer=layer,
+                forward_batch=forward_batch,
+                x=mixed_qkv[:, channels].transpose(0, 1),
+                weight=layer.conv_weights[channels],
+                bias=None if layer.bias is None else layer.bias[channels],
                 conv_states=conv_states[:, channels],
-                has_initial_state=has_initial_state,
                 cache_indices=cache_indices,
-                query_start_loc=self.forward_metadata.query_start_loc,
-                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-                **conv_kwargs,
+                has_initial_state=has_initial_state,
             )
             outputs.append(
                 out.transpose(0, 1)[:seq_len].view(1, seq_len, num_heads, head_dim)

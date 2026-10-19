@@ -768,6 +768,9 @@ class Envs:
     # Run PP tensor communication on a dedicated stream so asynchronous sends
     # do not fence the next forward through the scheduler stream.
     SGLANG_PP_COMM_OVERLAP = EnvBool(False)
+    # PD-prefill PP loop without host waits on the in-flight forward: PP comm on its own
+    # stream, early-send readback and GDN prefill metadata off the forward stream.
+    SGLANG_Q35MF_PPO = EnvBool(False)
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
     # Opt-in: keep receiving prefill requests while forward results are pending.
     SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING = EnvBool(False)
@@ -1305,6 +1308,20 @@ class Envs:
     # With SGLANG_Q35MF_ROUTE2_SMALL_TABLES: the smallest token count the tables kernel takes over (stock routing
     # below it); 1 = all. Measured: at TP2 a single verify request (7 tokens) ran slower with the tables kernel.
     SGLANG_Q35MF_ROUTE2_SMALL_TABLES_MIN_TOKENS = EnvInt(1)
+    # Target-model FlashInfer a2a combine transfers E4M3 partials (unscaled cast,
+    # FP32 accumulate, BF16 output); draft MoE layers keep the BF16 combine.
+    SGLANG_Q35MF_MIDQ_FP8_COMBINE = EnvBool(False)
+    # > 1: FlashInfer a2a built from token_dispatcher/midq_csrc, whose combine splits each
+    # token row over this many CTAs (bit-identical output, target and draft).
+    SGLANG_Q35MF_MIDQ_COMBINE_SPLIT = EnvInt(0)
+    # Check every combine against the stock FlashInfer kernel bit for bit (eager or graphs).
+    SGLANG_Q35MF_MIDQ_COMBINE_PROOF = EnvBool(False)
+    # EAGLE topk-1 draft calls on the vocab-parallel TP head (attention DP) pick their
+    # tokens on the vocab shards: multimem row gather + (value, id) gather, no logits a2a.
+    SGLANG_Q35MF_K75P_LMHEAD = EnvBool(False)
+    # With K75P engaged, also run the stock LM-head path on every K75P call and count
+    # token mismatches per kind (decode / extend); a thread logs the counters every 30 s.
+    SGLANG_Q35MF_K75P_PROOF = EnvBool(False)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
@@ -1716,6 +1733,18 @@ class Envs:
     # GDN prefill conv runs once per q / k / v channel group when qkv_dim is above the
     # fused split limit (TP1), so the chunk kernels' input guard copies nothing.
     SGLANG_Q35MF_GDN_PREFILL_SPLIT_CONV = EnvBool(False)
+    # Larger tiles for the GDN prefill output and w / u kernels (tuned for GB300).
+    SGLANG_Q35MF_GDN_PREFILL_TILES = EnvBool(False)
+    # The intra-chunk solve writes the zero upper blocks of A itself instead of a memset.
+    SGLANG_Q35MF_GDN_PREFILL_NO_A_MEMSET = EnvBool(False)
+    # Vectorized long-T prefill conv (kernels/ops/mamba/causal_conv1d_prefill.py).
+    SGLANG_Q35MF_GDN_PREFILL_CONV_VEC = EnvBool(False)
+    # Prefill gated RMSNorm writes the static-FP8 input of the GDN out_proj directly.
+    SGLANG_Q35MF_GDN_PREFILL_NORM_FP8 = EnvBool(False)
+    SGLANG_Q35MF_K4_CONV_WINDOW_STORES = EnvBool(False)
+    # Run the scheduler's device-side MLP sync gather on its own stream, so it does not
+    # queue behind the schedule stream's WAR barrier on the in-flight forward.
+    SGLANG_Q35MF_K4_MLP_SYNC_SIDE_STREAM = EnvBool(False)
 
     # ===================================================================
     # CUDA graphs and execution buffers
@@ -2144,6 +2173,9 @@ class Envs:
     # instead of a host arange copied from pageable memory (that copy waits for
     # the forward stream to drain).
     SGLANG_Q35MF_K4_MROPE_GPU = EnvBool(False)
+    # FlashInfer GDN prefill writes state checkpoints only on the grid that holds
+    # the tracked states (gcd of their chunk-aligned lengths) instead of every chunk.
+    SGLANG_Q35MF_K4_FI_CKPT_SPARSE = EnvBool(False)
 
     # ===================================================================
     # Plugin system

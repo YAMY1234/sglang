@@ -11,6 +11,8 @@ import triton.language as tl
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
 from sglang.kernels.ops.attention.fla.op import exp, safe_exp
 from sglang.kernels.ops.attention.fla.utils import check_shared_mem, is_nvidia_hopper
+from sglang.srt.environ import envs
+from sglang.srt.utils.common import print_info_once
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
@@ -150,6 +152,15 @@ def chunk_fwd_o(
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), NT, B * H)
 
+    # Measured on GB300 at the Qwen3.5 TP1 prefill shape: BV 128 / 8 warps is 6% faster, bitwise.
+    bv, num_warps, num_stages = (
+        (128, 8, 3) if envs.SGLANG_Q35MF_GDN_PREFILL_TILES.get() else (64, 4, 2)
+    )
+    if bv == 128:
+        print_info_once(
+            f"GDN prefill tiles engaged: chunk_fwd_o BV={bv} num_warps={num_warps} "
+            f"num_stages={num_stages}"
+        )
     chunk_fwd_kernel_o[grid](
         q,
         k,
@@ -167,10 +178,10 @@ def chunk_fwd_o(
         V=V,
         BT=BT,
         BK=128,
-        BV=64,
+        BV=bv,
         USE_G=g is not None,
         IS_VARLEN=cu_seqlens is not None,
-        num_warps=4,
-        num_stages=2,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return o
