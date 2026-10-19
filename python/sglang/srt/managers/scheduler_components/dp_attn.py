@@ -48,6 +48,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import require_mlp_tp_gather
+from sglang.srt.utils.q35mf_rt_toggle import rt_flag
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -61,7 +62,10 @@ _mlp_sync_streams: dict = {}
 def _mlp_sync_stream_context(device):
     # The gather reads and writes only its own fresh tensors, so it has no WAR hazard with the
     # forward and can skip the schedule stream's barrier; the host still blocks on its D2H read.
-    if not _MLP_SYNC_SIDE_STREAM or torch.device(device).type != "cuda":
+    if (
+        not rt_flag("K4_MLP_SYNC_SIDE_STREAM", _MLP_SYNC_SIDE_STREAM)
+        or torch.device(device).type != "cuda"
+    ):
         return contextlib.nullcontext()
     stream = _mlp_sync_streams.get(device)
     if stream is None:

@@ -1745,6 +1745,9 @@ class Envs:
     # Run the scheduler's device-side MLP sync gather on its own stream, so it does not
     # queue behind the schedule stream's WAR barrier on the in-flight forward.
     SGLANG_Q35MF_K4_MLP_SYNC_SIDE_STREAM = EnvBool(False)
+    # JSON file of run-time switch overrides ({"K4_MLP_SYNC_SIDE_STREAM": true, ...}), re-read when it
+    # changes, for A/B variants inside one loaded server; empty keeps every switch at its env value.
+    SGLANG_Q35MF_RT_TOGGLE_FILE = EnvStr("")
 
     # ===================================================================
     # CUDA graphs and execution buffers
