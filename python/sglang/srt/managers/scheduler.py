@@ -1652,6 +1652,7 @@ class Scheduler(
         )
         if megakernel_enabled():
             self.future_map.enable_stash_reuse()
+            self.future_map.enable_seq_lens_index_select()
 
         self._confidence_budget_prepare = None
         if (

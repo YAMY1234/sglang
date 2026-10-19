@@ -262,9 +262,11 @@ class FutureMap:
     publish/stash; next iter reads via resolve_forward_inputs / resolve_seq_lens_cpu.
     """
 
-    # see enable_stash_reuse; class defaults, since test harnesses skip __init__
+    # see enable_stash_reuse and enable_seq_lens_index_select; class defaults,
+    # since test harnesses skip __init__
     _reuse_stash = False
     _last_stash: Optional[tuple] = None
+    _index_select_seq_lens = False
 
     def __init__(
         self,
@@ -525,6 +527,11 @@ class FutureMap:
         tensors it stashed instead of gathering the same values back."""
         self._reuse_stash = True
 
+    def enable_seq_lens_index_select(self) -> None:
+        """Gather a decode round's seq_lens with index_select instead of advanced
+        indexing: the same values for less host work."""
+        self._index_select_seq_lens = True
+
     def _stashed_tensors(self, source: Any) -> tuple:
         hidden_states = source.hidden_states if self.need_hidden_states else None
         return source.bonus_tokens, source.topk_p, source.topk_index, hidden_states
@@ -622,7 +629,10 @@ class FutureMap:
                 self.publish_ready.synchronize()
             else:
                 self.publish_ready.wait()
-        batch.seq_lens = self.new_seq_lens_buf[fi]
+        if self._index_select_seq_lens and fi.device == self.new_seq_lens_buf.device:
+            batch.seq_lens = torch.index_select(self.new_seq_lens_buf, 0, fi)
+        else:
+            batch.seq_lens = self.new_seq_lens_buf[fi]
 
         if not self.needs_cpu_seq_lens:
             # GPU gather above is kept (SB.seq_lens must advance each verify);

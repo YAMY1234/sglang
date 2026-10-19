@@ -1748,6 +1748,21 @@ class TestFutureMapStashReuse(CustomTestCase):
                     self.assertTrue(torch.equal(g, w))
 
 
+class TestFutureMapSeqLensIndexSelect(CustomTestCase):
+    def test_index_select_gathers_the_batch_rows(self):
+        future_map = object.__new__(FutureMap)
+        future_map.new_seq_lens_buf = torch.tensor([10, 11, 12, 13])
+        future_map.publish_ready, future_map.needs_cpu_seq_lens = None, False
+        future_map.enable_seq_lens_index_select()
+        batch = SimpleNamespace(
+            spec_info=SimpleNamespace(future_indices=torch.tensor([3, 1]))
+        )
+        with patch("torch.index_select", wraps=torch.index_select) as index_select:
+            future_map.resolve_seq_lens_cpu(batch)
+        index_select.assert_called_once()
+        self.assertEqual(batch.seq_lens.tolist(), [13, 11])
+
+
 class TestMooncakePPStaging(unittest.TestCase):
     def test_staging_response_targets_requesting_pp_rank(self):
         sock = Mock()
