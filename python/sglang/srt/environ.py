@@ -2165,6 +2165,8 @@ class Envs:
     SGLANG_Q35MF_E2X_TP2_GDN = EnvBool(False)
     # DEP16 fixed-q7 verify: native FMHA with eight KV CTAs at B10..16 (KER3 launcher).
     SGLANG_Q35MF_E2X_VFMHA_CTA8 = EnvBool(False)
+    # Same launcher with a per-batch KV CTA count (8 / 12 / 16) at B6..16; takes precedence over CTA8.
+    SGLANG_Q35MF_E2X_VFMHA_CTAB = EnvBool(False)
     SGLANG_Q35MF_GDN_DIRECT_SOLVE = EnvBool(False)
     SGLANG_Q35MF_GDN_EMPTY_HISTORY = EnvBool(False)
     SGLANG_Q35MF_GDN_NORM_FP8 = EnvBool(False)

@@ -447,11 +447,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         )
         self._decode_group_plans = DecodeGroupPlans()
         self._dep16_verify_cta8 = None
-        if envs.SGLANG_Q35MF_E2X_VFMHA_CTA8.get():
+        use_ctab = envs.SGLANG_Q35MF_E2X_VFMHA_CTAB.get()
+        if use_ctab or envs.SGLANG_Q35MF_E2X_VFMHA_CTA8.get():
             from sglang.kernels.ops.attention.dep16_verify_cta8 import (
                 prepare_dep16_verify_cta8,
+                prepare_dep16_verify_ctab,
                 supports_dep16_verify_cta8,
                 trtllm_dep16_verify_cta8,
+                trtllm_dep16_verify_ctab,
             )
 
             if (
@@ -462,11 +465,16 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 and self.data_type == torch.float8_e4m3fn
                 and supports_dep16_verify_cta8(torch.device(self.device))
             ):
-                prepare_dep16_verify_cta8(torch.device(self.device))
-                self._dep16_verify_cta8 = trtllm_dep16_verify_cta8
+                if use_ctab:
+                    prepare_dep16_verify_ctab(torch.device(self.device))
+                    self._dep16_verify_cta8 = trtllm_dep16_verify_ctab
+                else:
+                    prepare_dep16_verify_cta8(torch.device(self.device))
+                    self._dep16_verify_cta8 = trtllm_dep16_verify_cta8
                 logger.info(
-                    "E2X_VFMHA_CTA8 prepared: target-verify q7 only, "
-                    "B10..16/Q32/KV2/H256/FP8-QKV/BF16-out; all other shapes stay stock"
+                    "E2X_VFMHA_CTA8 prepared (%s): target-verify q7 only, "
+                    "Q32/KV2/H256/FP8-QKV/BF16-out; all other shapes stay stock",
+                    "per-batch table B6..16" if use_ctab else "8 KV CTAs at B10..16",
                 )
             else:
                 logger.warning("E2X_VFMHA_CTA8 unsupported runtime/topology; using stock")

@@ -18,6 +18,11 @@
 
 // Modified by NVIDIA: fixed KV CTA count and disjoint scratch for the opt-in verify launcher.
 
+// A variant include directory defines a different count before including this header.
+#ifndef SGLANG_DEP16_VERIFY_KV_CTAS
+#define SGLANG_DEP16_VERIFY_KV_CTAS 8
+#endif
+
 #include <cuda.h>
 
 #include <cfloat>
@@ -692,7 +697,7 @@ class TllmGenFmhaKernel {
           tunedMaxNumCtasPerSeqKv,
           std::max(1, int32_t(params.mMultiProcessorCount / (numCtasX * numCtasY * numCtasZ))));
       // The opt-in DEP16 q7 launcher fixes KV parallelism without changing physical SM facts.
-      numCtasPerSeqKv = std::min(maxNumCtasPerSeqKv, 8);
+      numCtasPerSeqKv = std::min(maxNumCtasPerSeqKv, SGLANG_DEP16_VERIFY_KV_CTAS);
       // Update the numCtasX.
       numCtasX *= numCtasPerSeqKv;
       // The current total number of CTAs.
