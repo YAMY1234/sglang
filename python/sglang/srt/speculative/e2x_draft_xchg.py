@@ -71,7 +71,6 @@ class E2xDraftXchg:
 
     def __init__(self, model, exchange) -> None:
         self.model = model
-        self.exchange = exchange
         parallel = get_parallel()
         self.rank = parallel.tp_rank
         self.hidden = model.config.hidden_size
