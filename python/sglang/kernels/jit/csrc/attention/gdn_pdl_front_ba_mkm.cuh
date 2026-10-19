@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-// Modified by NVIDIA: specialize the cluster projection for a linear-attention front.
-// Modified by NVIDIA: use BF16 warp matrix products for a side projection.
-// Modified by NVIDIA: take the convolution state reads and the sticky-error read off the projection
-// path, run the seven convolution tokens on separate warps, and prefetch the recurrent checkpoint and
-// history for the next kernel into L2.
+// Cluster split-K FP8 projection, as in the fused attention epilogue kernel, specialized for the
+// linear-attention front.
+// BF16 warp matrix products for the side projection.
+// The convolution state reads and the sticky-error read run off the projection path, the seven convolution
+// tokens run on separate warps, and the recurrent checkpoint and history for the next kernel are prefetched
+// into L2.
 #pragma once
 
 #include <sgl_kernel/tensor.h>

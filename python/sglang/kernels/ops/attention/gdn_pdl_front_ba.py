@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Modified by NVIDIA: expose the fused linear-attention front through the JIT API.
-# Modified by NVIDIA: include a side projection from the original BF16 activation.
+# JIT wrapper for kernels/jit/csrc/attention/gdn_pdl_front_ba.cuh.
 """Preallocated FP8 projection, rolling convolution and BF16 side projection."""
 
 from __future__ import annotations

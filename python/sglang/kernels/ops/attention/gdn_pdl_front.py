@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Modified by NVIDIA: expose the fused linear-attention front through the JIT API.
+# JIT wrapper for kernels/jit/csrc/attention/gdn_pdl_front.cuh.
 """FP8 projection and BF16 convolution for seven-token linear-attention verification."""
 
 from __future__ import annotations

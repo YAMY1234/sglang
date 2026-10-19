@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-// Modified by NVIDIA: specialize the cluster projection for a linear-attention front.
-// SPDX-License-Identifier: Apache-2.0
-// Modified by NVIDIA: use BF16 warp matrix products for a side projection.
+// Cluster split-K FP8 projection, as in the fused attention epilogue kernel, specialized for the
+// linear-attention front.
+// BF16 warp matrix products for the side projection.
 #pragma once
 
 #include <sgl_kernel/tensor.h>
