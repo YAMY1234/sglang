@@ -243,9 +243,11 @@ def test_native_nvfp4_output_capacity_includes_unchunked_batch(
 
 
 def _make_backend_for_hook_test(speculative_num_draft_tokens=None):
+    from sglang.srt.layers.attention.trtllm_mha_decode_groups import DecodeGroupPlans
     from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 
     backend = TRTLLMHAAttnBackend.__new__(TRTLLMHAAttnBackend)
+    backend._decode_group_plans = DecodeGroupPlans()
     backend.device = torch.device("cpu")
     backend.max_context_len = 1024
     backend.page_size = PAGE_SIZE
@@ -366,6 +368,46 @@ def test_draft_extend_in_graph_uses_captured_static_q_stride(monkeypatch):
     assert len(calls) == 1
     assert calls[0]["q_mode"] == Q_MODE_STRIDED
     assert calls[0]["q_stride"] == 4
+
+
+@pytest.mark.parametrize("meta_branch", [False, True])
+def test_in_graph_metadata_resets_plans_then_launches_once(monkeypatch, meta_branch):
+    """The decode length-group plans (PDDEC_SPLIT_HOIST) are reset before the metadata
+    launch, which runs once: on the side branch for a captured draft extend under
+    KDENSE_DRAFT_META_BRANCH, inline otherwise."""
+    events = []
+    monkeypatch.setattr(
+        trtllm_mha_backend,
+        "update_trtllm_mha_graph_metadata",
+        lambda **kwargs: events.append("update"),
+    )
+    monkeypatch.setattr(trtllm_mha_backend, "_KDENSE_META_BRANCH", meta_branch)
+    monkeypatch.setattr(
+        trtllm_mha_backend,
+        "fork_metadata",
+        lambda launch: (events.append("fork"), launch()),
+    )
+    backend = _make_backend_for_hook_test(speculative_num_draft_tokens=4)
+    fb = SimpleNamespace(
+        batch_size=2,
+        req_pool_indices=torch.arange(2, dtype=torch.int64),
+        seq_lens=torch.ones(2, dtype=torch.int32),
+        forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+        spec_info=SimpleNamespace(num_tokens_per_req=4),
+        positions=torch.arange(8, dtype=torch.int64),
+        out_cache_loc=torch.arange(8, dtype=torch.int64),
+    )
+    backend.init_forward_metadata_out_graph(fb, in_capture=True)
+    monkeypatch.setattr(
+        backend._decode_group_plans, "reset", lambda: events.append("reset")
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    backend.init_forward_metadata_in_graph(fb)
+
+    assert events == (
+        ["reset", "fork", "update"] if meta_branch else ["reset", "update"]
+    )
 
 
 def test_hybrid_wrappers_forward_in_graph_hook():
