@@ -239,11 +239,13 @@ class E2xDraftFuse(IntFlag):
         and the hidden-half partial in one launch (bitwise equal to the split fc).
     EXTEND_PADDING: draft-extend padding rows reuse their request's last real row's router logits.
     Q1_BATCHED: draft q1 decode of up to 8 requests with 16-head GQA groups on the paged FP8 q1 kernel.
+    HEAD_ROWS: draft lm_heads of 1-2 rows run on 3 zero-padded rows (cuBLAS non-split-K, no reduce kernel).
     """
 
     XCHG = 1
     EXTEND_PADDING = 2
     Q1_BATCHED = 8
+    HEAD_ROWS = 16
 
 
 class InvariantCheckLevel(IntEnum):

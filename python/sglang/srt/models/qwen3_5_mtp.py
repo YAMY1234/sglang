@@ -195,6 +195,8 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 )
 
         self.logits_processor = LogitsProcessor(config)
+        if envs.SGLANG_Q35MF_E2X_DRAFT_FUSE.get() & E2xDraftFuse.HEAD_ROWS:
+            self.logits_processor.min_head_rows = 3
         if self.model.draft_hop is not None:
             self.model.draft_hop.head_follows = self._mkd_head_follows
         # Input embedding handed over by the previous greedy draft step, if any.
