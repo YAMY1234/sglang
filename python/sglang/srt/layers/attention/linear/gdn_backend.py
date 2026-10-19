@@ -97,6 +97,28 @@ def gdn_verify_history_stats():
     return result
 
 
+def _verify_pdl_options(
+    *,
+    verify_pdl: Optional[bool],
+    num_k_heads: int,
+    num_v_heads: int,
+    draft_token_num: int,
+    batch_size: int,
+) -> dict:
+    """Dependent-launch options of the ReplaySSM verify kernel; empty for a plain launch."""
+    use = envs.SGLANG_Q35MF_GDN_PDL.get() if verify_pdl is None else verify_pdl
+    # At the TP2 verify shape (8 / 32 heads, 7 tokens) only these batches measured faster.
+    if not use or (
+        (num_k_heads, num_v_heads, draft_token_num) == (8, 32, 7)
+        and batch_size not in (4, 6, 10)
+    ):
+        return {}
+    # The MKG verify fronts write a/b in the PDL prerequisite; other paths write them earlier.
+    if envs.SGLANG_Q35MF_MKG_FUSED.get() or envs.SGLANG_Q35MF_MKG_TP4_MIDDLE.get():
+        return dict(pdl=True, wait_for_gate_producer=True)
+    return dict(pdl=True)
+
+
 class GDNMISMetadata(msgspec.Struct, frozen=True):
     query_token_indices: torch.Tensor
     query_cu_seqlens: torch.Tensor
@@ -1945,16 +1967,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 print_warning_once(
                     "GDN verify tiling is unsupported; using the original path"
                 )
-        use_verify_pdl = (
-            envs.SGLANG_Q35MF_GDN_PDL.get() if verify_pdl is None else verify_pdl
+        pdl_options = _verify_pdl_options(
+            verify_pdl=verify_pdl,
+            num_k_heads=H,
+            num_v_heads=HV,
+            draft_token_num=draft_token_num,
+            batch_size=query_start_loc.numel() - 1,
         )
-        if use_verify_pdl and (
-            (H, HV, draft_token_num) != (8, 32, 7)
-            or query_start_loc.numel() - 1 in (4, 6, 10)
-        ):
+        if pdl_options:
             if q.is_cuda and is_arch_support_pdl():
-                verify_options["pdl"] = True
-                verify_options["wait_for_gate_producer"] = True
+                verify_options.update(pdl_options)
                 print_info_once(
                     "Dependent GDN verify launch active: "
                     f"batch={query_start_loc.numel() - 1}, "
