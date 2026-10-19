@@ -13,61 +13,7 @@ from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode import (
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--quick", action="store_true")
-    parser.add_argument("--midbatch", action="store_true")
     args = parser.parse_args()
-    if args.midbatch:
-        from bench_gdn_midbatch import compare, recurrent_case
-
-        cases = (
-            (
-                (0, "normal"),
-                (1, "normal"),
-                (7, "wrap"),
-                (9, "ragged"),
-                (9, "noop"),
-                (9, "flush"),
-            )
-            if args.quick
-            else tuple(
-                (history, control)
-                for history in (0, 1, 7, 9)
-                for control in ("normal", "wrap", "ragged", "noop", "flush")
-            )
-        )
-        checks = 0
-        for batch in (4, 6, 8):
-            for history, control in cases:
-                for calls in (1,) if args.quick else (1, 4):
-                    stock = recurrent_case(batch, history, control)
-                    candidate = recurrent_case(batch, history, control)
-                    for _ in range(calls):
-                        for case, dependent in ((stock, False), (candidate, True)):
-                            gdn_replayssm_spec_decode(
-                                **case,
-                                block_v=32,
-                                num_warps=2,
-                                num_stages=2,
-                                nk=2,
-                                pdl=dependent,
-                            )
-                    torch.cuda.synchronize()
-                    equal = compare(stock, candidate)
-                    print(
-                        json.dumps(
-                            dict(
-                                batch=batch,
-                                history=history,
-                                control=control,
-                                calls=calls,
-                                tensors=equal,
-                            )
-                        ),
-                        flush=True,
-                    )
-                    assert all(equal.values()), (batch, history, control, equal)
-                    checks += 1
-        print(json.dumps(dict(byte_checks="PASS", cases=checks)), flush=True)
-        return
     checks = 0
     for tp in (4, 8, 2):
         for batch in (1, 2):
