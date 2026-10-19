@@ -626,7 +626,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else:
                 self.processor = _processor
                 self.tokenizer = get_tokenizer_from_processor(self.processor)
-                os.environ["TOKENIZERS_PARALLELISM"] = "false"
+                # The tokenizers thread pool stays on only when asked: long chat prompts
+                # are then encoded in parallel chunks (parallel_prompt_encode).
+                os.environ["TOKENIZERS_PARALLELISM"] = (
+                    "true" if envs.SGLANG_Q35MF_E2X_TOKENIZER_POOL.get() else "false"
+                )
         else:
             self.mm_processor = self.processor = None
 

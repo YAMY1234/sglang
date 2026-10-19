@@ -1799,6 +1799,9 @@ class Envs:
     # Shorter prompts use the single-call encode; below this the gain is eaten
     # by rayon dispatch and the id merge.
     SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS = EnvInt(32768)
+    # Keep the tokenizers thread pool enabled in the tokenizer manager of multimodal
+    # models (it is otherwise turned off there), so long prompts encode in parallel.
+    SGLANG_Q35MF_E2X_TOKENIZER_POOL = EnvBool(False)
     # Build the parallel prompt-encode plan when the chat server starts.
     SGLANG_Q35MF_ARRIVE_PREWARM = EnvBool(False)
     # Chat requests forwarded as token ids skip the full-prompt decode.
