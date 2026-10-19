@@ -285,6 +285,9 @@ def parallel_prompt_encode(tokenizer, text, encode_kwargs=None):
     check = _parallel_ok is None
     if check:
         w0, c0 = time.perf_counter(), time.process_time()
+    if envs.SGLANG_Q35MF_E2X_TOKENIZER_POOL.get():
+        # Re-assert the pool right before the call: other modules may turn it off after startup.
+        os.environ["TOKENIZERS_PARALLELISM"] = "true"
     encodings = backend.encode_batch(chunks, add_special_tokens=False)
     if check:
         wall, cpu = time.perf_counter() - w0, time.process_time() - c0
