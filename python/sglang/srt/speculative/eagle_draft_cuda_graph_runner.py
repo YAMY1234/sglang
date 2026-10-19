@@ -11,6 +11,9 @@ from sglang.kernels.ops.memory.small_field_copy import (
 )
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.trtllm_mha_backend import (
+    TRTLLMHAAttnMultiStepDraftBackend,
+)
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     deployment_attn_dp_size,
@@ -296,6 +299,11 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             if self.megakernel is None
             else self.megakernel.bind_draft_graphs(self)
         )
+        if self.megakernel is not None and isinstance(
+            self.draft_attn_backend, TRTLLMHAAttnMultiStepDraftBackend
+        ):
+            # one launch rebuilds every draft step's metadata in the captured graphs
+            self.draft_attn_backend.enable_one_launch_step_metadata()
 
         self.backend = resolve_decode_backend(self)
 

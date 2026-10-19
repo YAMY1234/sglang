@@ -1995,6 +1995,14 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
                 kv_last_page_len_buf=self.kv_last_page_len,
                 speculative_step_id=i,
             )
+        # bs -> [num_steps, 3] device address table of the per-step metadata buffers
+        # once enable_one_launch_step_metadata() ran, else None
+        self._step_metadata_addr: Optional[dict[int, torch.Tensor]] = None
+
+    def enable_one_launch_step_metadata(self) -> None:
+        """Rebuild every draft step's graph metadata in one launch; call before the
+        draft graphs are captured."""
+        self._step_metadata_addr = {}
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         for i in range(self.speculative_num_steps - 1):
@@ -2026,6 +2034,51 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
             self.attn_backends[i].init_forward_metadata_out_graph(
                 inner_fb, in_capture=in_capture
             )
+        if in_capture and self._step_metadata_addr is not None:
+            self._build_step_metadata_addr(forward_batch.batch_size)
+
+    def _build_step_metadata_addr(self, bs: int) -> None:
+        """Address table for the one-launch rebuild; built outside capture, only
+        when every step uses the plain draft-decode layout (no SWA tables)."""
+        self._step_metadata_addr.pop(bs, None)
+        backends = self.attn_backends[: self.speculative_num_steps - 1]
+        metas = [b.decode_cuda_graph_metadata.get(bs) for b in backends]
+        if not backends or any(m is None for m in metas):
+            return
+        b0, m0 = backends[0], metas[0]
+        unified = b0.kv_index_translator.is_translating
+        for i, (b, m) in enumerate(zip(backends, metas)):
+            if (
+                b.speculative_step_id != i
+                or b._swa_full_to_swa_mapping is not None
+                or m.swa_page_table is not None
+                or m.swa_out_cache_loc is not None
+                or b.kv_index_translator.is_translating != unified
+                or b.req_to_token is not b0.req_to_token
+                or b.max_num_pages != b0.max_num_pages
+                or b.page_size != b0.page_size
+                or m.cache_seqlens_int32.dtype != torch.int32
+                or m.cu_seqlens_k.dtype != torch.int32
+                or (
+                    not unified
+                    and (
+                        m.page_table.dtype != torch.int32
+                        or m.page_table.stride(0) != m0.page_table.stride(0)
+                    )
+                )
+            ):
+                return
+        rows = [
+            [
+                m.cache_seqlens_int32.data_ptr(),
+                m.cu_seqlens_k.data_ptr(),
+                0 if unified else m.page_table.data_ptr(),
+            ]
+            for m in metas
+        ]
+        self._step_metadata_addr[bs] = torch.tensor(
+            rows, dtype=torch.int64, device=m0.cache_seqlens_int32.device
+        )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
@@ -2033,6 +2086,40 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
         assert forward_batch.spec_info is not None
         assert forward_batch.spec_info.is_draft_input()
 
+        bs = forward_batch.batch_size
+        addr = (
+            None
+            if self._step_metadata_addr is None
+            else self._step_metadata_addr.get(bs)
+        )
+        if addr is not None:
+            from sglang.kernels.ops.kvcache.trtllm_mha_graph_metadata import (
+                update_trtllm_mha_graph_metadata_multistep,
+            )
+
+            backends = self.attn_backends[: self.speculative_num_steps - 1]
+            b0 = backends[0]
+            unified = b0.kv_index_translator.is_translating
+            update_trtllm_mha_graph_metadata_multistep(
+                req_pool_indices=forward_batch.req_pool_indices[:bs],
+                seq_lens=forward_batch.seq_lens[:bs],
+                req_to_token=b0.req_to_token,
+                addr_table=addr,
+                num_steps=len(backends),
+                bs=bs,
+                first_offset=1,
+                max_seq_pages=b0.max_num_pages,
+                page_size=b0.page_size,
+                page_table_stride=(
+                    0
+                    if unified
+                    else b0.decode_cuda_graph_metadata[bs].page_table.stride(0)
+                ),
+                skip_page_table=unified,
+            )
+            for b in backends:
+                b.forward_metadata = b.decode_cuda_graph_metadata[bs]
+            return
         inner_fb = build_inner_fb_view(
             forward_batch,
             bs=forward_batch.batch_size,
