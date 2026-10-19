@@ -1400,6 +1400,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 max_bs=verify_graphs.max_bs,
                 tokens_per_request=self.speculative_num_draft_tokens,
             )
+            verify_graphs.enable_restage_skip()
         # Build adaptive runtime states after target and draft backends exist.
         if self.adaptive_controller is not None:
             with (

@@ -497,6 +497,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self._metadata_glue = (
             MetadataGlueGraph(self.device) if enable_metadata_glue else None
         )
+        # see enable_restage_skip
+        self._restage_skip = False
+        self._staged_inputs: Optional[tuple] = None
 
         # --- backend ---------------------------------------------------
         self.backend = resolve_decode_backend(self)
@@ -1412,8 +1415,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
                 self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
             self._set_dp_real_num_tokens(self.raw_num_token)
-            self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
-            self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
+            staged, self._staged_inputs = self._staged_inputs, None
+            if not self._restage_is_redundant(staged, forward_batch):
+                self.buffers.input_ids[: self.raw_num_token].copy_(
+                    forward_batch.input_ids
+                )
+                self.buffers.positions[: self.raw_num_token].copy_(
+                    forward_batch.positions
+                )
             if (
                 pp_proxy_tensors is not None
                 and self.buffers.pp_proxy_tensors is not None
@@ -1488,6 +1497,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             padded_num_tokens=padded_num_tokens,
             pp_proxy_tensors=pp_proxy_tensors,
         )
+        if self._restage_skip:
+            self._staged_inputs = self._staged_signature(forward_batch)
 
         if (
             not is_ragged
@@ -1580,6 +1591,33 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         self._replay_graph_key = self._make_graph_key(
             graph_size_key, stream_idx, variant_label, attention_variant
+        )
+
+    def enable_restage_skip(self) -> None:
+        """Let a pre-planned replay skip copying input_ids and positions again when
+        this runner's full load_batch copied the same tensors, unchanged since, on
+        the same stream."""
+        self._restage_skip = True
+
+    def _staged_signature(self, forward_batch: ForwardBatch) -> Optional[tuple]:
+        input_ids, positions = forward_batch.input_ids, forward_batch.positions
+        if input_ids is None or positions is None:
+            return None
+        # PyTorch bumps a tensor's version on every in-place write it makes
+        versions = (input_ids._version, positions._version)
+        return input_ids, positions, versions, self.device_module.current_stream()
+
+    def _restage_is_redundant(
+        self, staged: Optional[tuple], forward_batch: ForwardBatch
+    ) -> bool:
+        # a load on another stream, such as the plan stream, is never trusted
+        now = self._staged_signature(forward_batch)
+        return (
+            staged is not None
+            and now is not None
+            and staged[0] is now[0]
+            and staged[1] is now[1]
+            and staged[2:] == now[2:]
         )
 
     def _ragged_graph_num_tokens(self, total_verify_tokens: int) -> int:
