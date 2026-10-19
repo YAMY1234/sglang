@@ -13,9 +13,12 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
+from sglang.srt.speculative.draft_vocab_exchange import DraftVocabExchange
 from sglang.srt.speculative.eagle_info import EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import organize_draft_results
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
@@ -417,6 +420,63 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
 
         self.assertIs(worker.last_shared_read_runner, target_runner)
         self.assertEqual(worker.spec_v2_attn_backends, (target_runner.attn_backend,))
+
+
+class TestDraftVocabExchangeRowCaps(CustomTestCase):
+    """Small-PD decode sets only DRAFT_VOCAB_EXCHANGE_MAX_ROWS and BSX / E2EM only
+    DRAFT_EXCHANGE_STEP_ROWS; draft steps up to the limit that was set must stay on
+    the vocab exchange instead of falling back to the logits gather."""
+
+    @contextlib.contextmanager
+    def _exchange(self, *, max_rows, step_rows, tp_size):
+        embed = SimpleNamespace(
+            weight=torch.empty(64, 16, dtype=torch.bfloat16),
+            shard_indices=SimpleNamespace(org_vocab_start_index=0),
+        )
+        model = SimpleNamespace(
+            model=SimpleNamespace(embed_tokens=embed),
+            config=SimpleNamespace(vocab_size=64 * tp_size),
+            logits_processor=SimpleNamespace(skip_vocab_gather_rows=0),
+        )
+        slots = MagicMock()
+        with (
+            patch.object(DraftVocabExchange, "MAX_ROWS", max_rows),
+            envs.SGLANG_Q35MF_DRAFT_EXCHANGE_STEP_ROWS.override(step_rows),
+            envs.SGLANG_Q35MF_KDENSE_DRAFT_ARGMAX_XCHG.override(True),
+            patch(
+                "sglang.srt.speculative.draft_vocab_exchange.get_parallel",
+                return_value=SimpleNamespace(tp_size=tp_size, tp_rank=0),
+            ),
+            patch(
+                "sglang.srt.speculative.draft_vocab_exchange.make_argmax_slots", slots
+            ),
+            patch.object(triton_symm_mem_ag, "MultimemAllGatherer"),
+        ):
+            yield DraftVocabExchange(model, num_steps=3), slots
+
+    def test_draft_steps_follow_max_rows_without_step_rows(self):
+        with self._exchange(max_rows=12, step_rows=None, tp_size=2) as (ex, slots):
+            self.assertEqual(ex.step_rows, 12)
+            self.assertEqual(ex.payload.shape[0], 12)
+            slots.assert_called_once_with(12, 16)
+            ex.begin_step(1, 12)
+            self.assertEqual(ex.model.logits_processor.skip_vocab_gather_rows, 12)
+
+    def test_step_rows_moves_only_the_draft_step_limit(self):
+        # The 1..8 clamp applies to an explicit STEP_ROWS; the draft extend keeps MAX_ROWS.
+        for step_rows, expected in ((8, 8), (12, 8)):
+            with (
+                self.subTest(step_rows=step_rows),
+                self._exchange(max_rows=2, step_rows=step_rows, tp_size=2) as (
+                    ex,
+                    slots,
+                ),
+            ):
+                self.assertEqual(ex.step_rows, expected)
+                self.assertEqual(ex.payload.shape[0], expected)
+                slots.assert_called_once_with(expected, 16)
+                self.assertTrue(ex.is_local(torch.empty(2, 64)))
+                self.assertFalse(ex.is_local(torch.empty(3, 64)))
 
 
 if __name__ == "__main__":

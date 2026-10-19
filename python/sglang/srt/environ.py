@@ -566,7 +566,8 @@ class Envs:
     # row (argmax + embedding) instead of all-gathering the logits.
     SGLANG_Q35MF_DRAFT_ARGMAX_EXCHANGE = EnvBool(False)
     # Largest draft-step batch (rows) the exchange serves, 1..8; larger batches gather the logits.
-    SGLANG_Q35MF_DRAFT_EXCHANGE_STEP_ROWS = EnvInt(2)
+    # Unset follows SGLANG_Q35MF_DRAFT_VOCAB_EXCHANGE_MAX_ROWS.
+    SGLANG_Q35MF_DRAFT_EXCHANGE_STEP_ROWS = EnvInt(None)
     # Same exchange for the greedy token after the draft extend (torch.argmax NaN rule).
     SGLANG_Q35MF_DRAFT_EXTEND_EXCHANGE = EnvBool(False)
     # Target verify of topk-1 chains keeps the logits on vocab shards and samples there
@@ -576,7 +577,8 @@ class Envs:
     # the chunked chain sampler of the sharded path on one rank instead of softmax +
     # tree_speculative_sampling_target_only.
     SGLANG_Q35MF_K4_LOCAL_VERIFY_SAMPLING = EnvBool(False)
-    # Largest row count (draft-step or draft-extend batch) that uses the vocab exchange.
+    # Largest draft-extend batch (rows) that uses the vocab exchange, and the draft-step
+    # limit while SGLANG_Q35MF_DRAFT_EXCHANGE_STEP_ROWS is unset.
     SGLANG_Q35MF_DRAFT_VOCAB_EXCHANGE_MAX_ROWS = EnvInt(2)
     # With the post-verify graph: sample shard-local verify logits inside the graph (the sharded
     # sampler above) instead of gathering them; batches that return logprobs keep the eager chain.

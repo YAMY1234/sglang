@@ -114,7 +114,10 @@ class DraftVocabExchange:
         self.local_vocab = self.embed_weight.shape[0]
         hidden = self.embed_weight.shape[1]
         # Draft steps of up to step_rows requests use the exchange; the draft extend keeps MAX_ROWS.
-        self.step_rows = min(max(envs.SGLANG_Q35MF_DRAFT_EXCHANGE_STEP_ROWS.get(), 1), 8)
+        step_rows = envs.SGLANG_Q35MF_DRAFT_EXCHANGE_STEP_ROWS.get()
+        self.step_rows = (
+            self.MAX_ROWS if step_rows is None else min(max(step_rows, 1), 8)
+        )
         rows = max(self.MAX_ROWS, self.step_rows)
         self.payload = torch.empty(rows, hidden + META_ELEMS, dtype=torch.bfloat16, device=dev)
         self.part_key = torch.empty(rows, PACK_BLOCKS, dtype=torch.int32, device=dev)
@@ -135,7 +138,7 @@ class DraftVocabExchange:
             max_tokens=rows, enabled=True, skip_entry_sync=True
         )
         self.peer = (
-            make_argmax_slots(self.MAX_ROWS, hidden)
+            make_argmax_slots(rows, hidden)
             if envs.SGLANG_Q35MF_KDENSE_DRAFT_ARGMAX_XCHG.get() and self.world == 2
             else None
         )
@@ -151,10 +154,11 @@ class DraftVocabExchange:
             return None
         exchange = cls(model, num_steps, hot)
         logger.info(
-            "Draft vocab exchange active (tp=%d%s, draft steps up to %d rows).",
+            "Draft vocab exchange active (tp=%d%s, draft steps up to %d rows, draft extend up to %d rows).",
             get_parallel().tp_size,
             ", hot vocabulary" if hot is not None else "",
             exchange.step_rows,
+            cls.MAX_ROWS,
         )
         return exchange
 
