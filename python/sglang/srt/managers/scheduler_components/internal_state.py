@@ -18,7 +18,12 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReqOutput,
 )
 from sglang.srt.managers.scheduler_components.memory_usage import build_memory_usage
-from sglang.srt.runtime_context import get_context, get_exec, get_parallel
+from sglang.srt.runtime_context import (
+    get_context,
+    get_exec,
+    get_parallel,
+    get_schedule,
+)
 from sglang.srt.server_args import compute_world_size
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
@@ -165,7 +170,19 @@ class SchedulerInternalStateController:
         return SetInternalStateReqOutput(updated=True)
 
     def _update_handlers(self) -> Dict[str, _UpdateHandler]:
+        knobs = {}
+        if envs.SGLANG_Q35MF_PF_RUNTIME_KNOBS.get():
+            knobs = {
+                key: _UpdateHandler(self._validate_pf_knob, self._apply_pf_knob)
+                for key in (
+                    "chunked_prefill_size",
+                    "max_prefill_tokens",
+                    "prefill_decode_interval",
+                    "enable_mixed_chunk",
+                )
+            }
         return {
+            **knobs,
             "pp_max_micro_batch_size": _UpdateHandler(
                 self._validate_pp_micro_batch_size, _override
             ),
@@ -182,6 +199,45 @@ class SchedulerInternalStateController:
                 self._validate_dspark_clear_records, self._apply_dspark_clear_records
             ),
         }
+
+    def _validate_pf_knob(self, key: str, value: Any) -> None:
+        schedule = get_schedule()
+        if key == "enable_mixed_chunk":
+            if not isinstance(value, bool) or not schedule.enable_mixed_chunk:
+                raise UpdateRejected(
+                    f"{key} takes a bool and needs a --enable-mixed-chunk boot."
+                )
+            return
+        if not isinstance(value, int) or value < 0:
+            raise UpdateRejected(f"{key} must be a non-negative int, got {value}.")
+        if key == "prefill_decode_interval":
+            return
+        # Buffers and prefill graph buckets are sized for the boot value.
+        boot = getattr(schedule, key)
+        page = self.scheduler.page_size
+        if boot is None or value < page or value > boot or value % page:
+            raise UpdateRejected(
+                f"{key}={value} must be a multiple of {page} in [{page}, {boot}]."
+            )
+
+    def _apply_pf_knob(self, key: str, value: Any) -> None:
+        # Scheduler state only, not a config override: init-sized users keep the boot value.
+        scheduler = self.scheduler
+        if key == "enable_mixed_chunk":
+            scheduler.is_mixed_chunk = (
+                value and scheduler.chunked_prefill_size is not None
+            )
+        elif key == "prefill_decode_interval":
+            scheduler.prefill_decode_interval = value
+            scheduler._prefill_decode_interval_remaining = 0
+        else:
+            setattr(scheduler, key, value)
+        logger.info(
+            f"PF runtime knob {key}={value}: chunked_prefill_size="
+            f"{scheduler.chunked_prefill_size} max_prefill_tokens="
+            f"{scheduler.max_prefill_tokens} prefill_decode_interval="
+            f"{scheduler.prefill_decode_interval} is_mixed_chunk={scheduler.is_mixed_chunk}"
+        )
 
     def _validate_pp_micro_batch_size(self, key: str, value: Any) -> None:
         upper = self.scheduler.max_running_requests // get_parallel().pp_size
