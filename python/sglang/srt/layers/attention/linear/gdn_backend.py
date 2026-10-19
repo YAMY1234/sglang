@@ -119,6 +119,45 @@ def _verify_pdl_options(
     return dict(pdl=True)
 
 
+# TP2 verify launch per captured batch: (block_v, num_warps, num_stages, maxnreg, conv block_n).
+# Byte-identical to the stock launch on every output and state write; measured on GB300 with the
+# 45-layer conv -> verify -> gated-norm chain, so re-tune when any of those kernels changes.
+_E2X_TP2_VERIFY_LAUNCH = {
+    1: (32, 2, 3, None, 128),
+    2: (64, 2, 3, None, 128),
+    3: (64, 2, 2, None, 32),
+    4: (64, 2, 2, None, 64),
+    5: (64, 2, 2, None, 64),
+    6: (64, 2, 2, None, 64),
+    7: (64, 2, 2, None, 64),
+    8: (64, 2, 2, None, 64),
+    9: (64, 2, 2, None, 64),
+    10: (64, 2, 3, 168, 64),
+    11: (64, 2, 3, 168, 64),
+    12: (64, 2, 3, 168, 64),
+    13: (64, 2, 3, 168, 64),
+    14: (64, 2, 2, 168, 64),
+    15: (64, 1, 2, None, 64),
+    16: (64, 1, 2, None, 64),
+}
+
+
+def _e2x_tp2_verify_launch(
+    *,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_dim: int,
+    draft_token_num: int,
+    batch_size: int,
+) -> Optional[Tuple[int, int, int, Optional[int], int]]:
+    """Per-batch TP2 verify launch override; None keeps the stock launch."""
+    if not envs.SGLANG_Q35MF_E2X_TP2_GDN.get():
+        return None
+    if (num_k_heads, num_v_heads, head_dim, draft_token_num) != (8, 32, 128, 7):
+        return None
+    return _E2X_TP2_VERIFY_LAUNCH.get(batch_size)
+
+
 class GDNMISMetadata(msgspec.Struct, frozen=True):
     query_token_indices: torch.Tensor
     query_cu_seqlens: torch.Tensor
@@ -1451,6 +1490,20 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 mixed_qkv_reshaped = mixed_qkv.view(
                     batch_size, draft_token_num, -1
                 ).transpose(1, 2)
+                conv_block_n = 128 if envs.SGLANG_Q35MF_GDN_CONV_TILE.get() else 256
+                e2x_launch = _e2x_tp2_verify_launch(
+                    num_k_heads=layer.num_k_heads,
+                    num_v_heads=layer.num_v_heads,
+                    head_dim=layer.head_v_dim,
+                    draft_token_num=draft_token_num,
+                    batch_size=batch_size,
+                )
+                if (
+                    e2x_launch is not None
+                    and envs.SGLANG_Q35MF_GDN_CONV_TILE.get()
+                    and envs.SGLANG_Q35MF_GDN_VIEWS.get()
+                ):
+                    conv_block_n = e2x_launch[4]
                 mixed_qkv_processed = causal_conv1d_update(
                     mixed_qkv_reshaped,
                     conv_states,
@@ -1464,7 +1517,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     retrieve_next_sibling=retrieve_next_sibling,
                     retrieve_parent_token=retrieve_parent_token,
                     token_major_out=envs.SGLANG_Q35MF_GDN_VIEWS.get(),
-                    block_n=128 if envs.SGLANG_Q35MF_GDN_CONV_TILE.get() else 256,
+                    block_n=conv_block_n,
                 )
                 mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
@@ -1986,6 +2039,42 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 print_warning_once(
                     "GDN verify PDL is unsupported; using the original path"
                 )
+        e2x_launch = (
+            _e2x_tp2_verify_launch(
+                num_k_heads=H,
+                num_v_heads=HV,
+                head_dim=K,
+                draft_token_num=draft_token_num,
+                batch_size=query_start_loc.numel() - 1,
+            )
+            if tiled_verify
+            and not direct_solve
+            and not empty_history
+            and "block_v" in verify_options
+            else None
+        )
+        if e2x_launch is not None:
+            block_v, num_warps, num_stages, maxnreg, _ = e2x_launch
+            verify_options.update(
+                block_v=block_v, num_warps=num_warps, num_stages=num_stages
+            )
+            verify_options.pop("maxnreg", None)
+            if maxnreg is not None:
+                verify_options["maxnreg"] = maxnreg
+            use_pdl = (
+                envs.SGLANG_Q35MF_GDN_PDL.get() if verify_pdl is None else verify_pdl
+            )
+            if use_pdl and q.is_cuda and is_arch_support_pdl():
+                verify_options["pdl"] = True
+                if (
+                    envs.SGLANG_Q35MF_MKG_FUSED.get()
+                    or envs.SGLANG_Q35MF_MKG_TP4_MIDDLE.get()
+                ):
+                    verify_options["wait_for_gate_producer"] = True
+            print_info_once(
+                "E2X TP2 GDN verify launch table active: "
+                f"batch={query_start_loc.numel() - 1}, launch={e2x_launch}"
+            )
         if wait_for_gate_producer:
             verify_options["wait_for_gate_producer"] = True
         gdn_replayssm_spec_decode(
