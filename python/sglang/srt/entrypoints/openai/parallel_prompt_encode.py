@@ -250,6 +250,44 @@ def prebuild_parallel_prompt_encode_plan(tokenizer):
         _plan_for(tokenizer)
 
 
+_verify_stats = {"n": 0, "chunked": 0, "mismatch": 0}
+
+
+def _verify_chunked(tokenizer, backend, text, chunks, encode_kwargs):
+    """Compare the chunked encode with the single encode of the same prompt and log
+    the result (SGLANG_Q35MF_E2X_TOKENIZER_VERIFY; measurement only, doubles the cost)."""
+    import hashlib
+
+    full = list(tokenizer.encode(text, **encode_kwargs))
+    if len(chunks) >= 2:
+        enc = backend.encode_batch(chunks, add_special_tokens=False)
+        got = list(chain.from_iterable(e.ids for e in enc))
+    else:
+        got = full
+    st = _verify_stats
+    st["n"] += 1
+    st["chunked"] += int(len(chunks) >= 2)
+    equal = got == full
+    st["mismatch"] += int(not equal)
+    rec = {
+        "chars": len(text),
+        "ids": len(full),
+        "chunks": len(chunks),
+        "equal": equal,
+        "sha256": hashlib.sha256(str(full).encode()).hexdigest()[:16],
+    }
+    if not equal:
+        first = next((i for i, (a, b) in enumerate(zip(got, full)) if a != b), min(len(got), len(full)))
+        rec["first_diff"] = first
+        logger.warning("tokenizer verify MISMATCH: %s", rec)
+    path = os.environ.get("SGLANG_Q35MF_E2X_TOKENIZER_VERIFY_LOG")
+    if path:
+        with open(path, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    if st["n"] % 25 == 0:
+        logger.info("tokenizer verify: %s", st)
+
+
 def parallel_prompt_encode(tokenizer, text, encode_kwargs=None):
     """Drop-in for ``tokenizer.encode(text, **encode_kwargs)``."""
     global _parallel_ok, _parallel_pid
@@ -258,8 +296,9 @@ def parallel_prompt_encode(tokenizer, text, encode_kwargs=None):
         _parallel_pid = pid
         _parallel_ok = None
     encode_kwargs = encode_kwargs or {}
+    pool = envs.SGLANG_Q35MF_E2X_TOKENIZER_POOL.get()
     if (
-        _parallel_ok is False
+        (_parallel_ok is False and not pool)
         or not envs.SGLANG_PARALLEL_PROMPT_ENCODE.get()
         or not isinstance(text, str)
         or len(text) < envs.SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.get()
@@ -279,13 +318,15 @@ def parallel_prompt_encode(tokenizer, text, encode_kwargs=None):
     ):
         return tokenizer.encode(text, **encode_kwargs)
     chunks = split_prompt(text, pattern, npattern, intra)
+    if envs.SGLANG_Q35MF_E2X_TOKENIZER_VERIFY.get():
+        _verify_chunked(tokenizer, backend, text, chunks, encode_kwargs)
     if len(chunks) < 2:
         return tokenizer.encode(text, **encode_kwargs)
 
-    check = _parallel_ok is None
+    check = _parallel_ok is None and not pool
     if check:
         w0, c0 = time.perf_counter(), time.process_time()
-    if envs.SGLANG_Q35MF_E2X_TOKENIZER_POOL.get():
+    if pool:
         # Re-assert the pool right before the call: other modules may turn it off after startup.
         os.environ["TOKENIZERS_PARALLELISM"] = "true"
     encodings = backend.encode_batch(chunks, add_special_tokens=False)
