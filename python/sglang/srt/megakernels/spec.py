@@ -111,7 +111,17 @@ class BuiltMegakernel(Protocol):
 
     SGLang's runtime state reaches a build as BuildContext.binding and a covered
     step as Step.view (megakernels/binding.py, which also lists what else may be
-    called, written or read).
+    called, written or read). The binding is MegakernelBinding unless SGLang has
+    one for the model's architecture (runtime.py).
+
+    A built object may also offer the EAGLE entries ENTRIES names (absent or None:
+    SGLang's own path). SGLang asks for them with runtime.megakernel_entry. A draft
+    model's draft_loop and draft_extend, and a target's verify_sample, are factories
+    an SGLang component calls once with its own buffers: like draft_sampler, they
+    return bs -> None (SGLang's code at that batch size) or the step to run there,
+    and every rank must serve the same sizes. A draft's begin_draft_round and a
+    target's gdn_extend are called as they are. The entries a built object offers
+    must agree on every rank.
     """
 
     widths: tuple[int, ...]  # the rows it built, possibly fewer than requested
@@ -129,6 +139,17 @@ class BuiltMegakernel(Protocol):
     def forward(self, step: Step, original: Callable, *args: Any, **kwargs: Any) -> Any:
         """Run step in place of original (the model's bound forward), taking and
         returning what it does; capturable in a CUDA graph."""
+
+
+# The optional entries of a built megakernel, beyond draft_sampler the EAGLE ones
+ENTRIES = (
+    "draft_sampler",
+    "draft_loop",
+    "draft_extend",
+    "begin_draft_round",
+    "verify_sample",
+    "gdn_extend",
+)
 
 
 class MegakernelSpec(msgspec.Struct, frozen=True):
