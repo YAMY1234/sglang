@@ -41,6 +41,7 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.megakernels.runtime import megakernel_enabled
 from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -92,6 +93,7 @@ from sglang.srt.speculative.eagle_info import (
 )
 from sglang.srt.speculative.eagle_megakernel import (
     EagleMegakernel,
+    forced_length_generator,
     offers_eagle_entries,
     unservable_reasons,
 )
@@ -1271,9 +1273,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
 
 class EAGLEWorkerV2(BaseSpecWorker):
-    # SGLang's side of the megakernel's EAGLE entries (init_attention_backends); a
-    # class default, since unit-test harnesses build workers without __init__.
+    # Set in init_attention_backends: SGLang's side of the megakernel's EAGLE entries,
+    # and with --enable-nvidia-megakernel the forced acceptance lengths' generator;
+    # class defaults, since unit-test harnesses build workers without __init__.
     _megakernel: Optional[EagleMegakernel] = None
+    _simulated_acc_len_rng: Optional[torch.Generator] = None
 
     def __init__(
         self,
@@ -1358,6 +1362,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
     def init_attention_backends(self):
         super().init_attention_backends()
+        if megakernel_enabled():
+            # one stream of forced acceptance lengths, from which the post-verify
+            # graphs and the eager verify both draw; the global CPU RNG otherwise
+            self._simulated_acc_len_rng = forced_length_generator(
+                self.target_worker.random_seed
+            )
         draft = self._draft_worker
         # the pools and both attention backends exist, no graph is captured yet
         if draft is not None and offers_eagle_entries(
@@ -1368,7 +1378,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             if reasons:
                 raise ValueError("the EAGLE entries cannot run: " + "; ".join(reasons))
             self._megakernel = EagleMegakernel(
-                target_worker=self.target_worker, draft_worker=draft
+                target_worker=self.target_worker,
+                draft_worker=draft,
+                simulated_acc_len_rng=self._simulated_acc_len_rng,
             )
             draft.megakernel = self._megakernel
             # breakable prefill graphs capture the target's GDN extend, the
@@ -1991,4 +2003,5 @@ class EAGLEWorkerV2(BaseSpecWorker):
             finalize_tree_path=True,
             grammar_barrier=grammar_barrier,
             megakernel=self._megakernel,
+            simulated_acc_len_rng=self._simulated_acc_len_rng,
         )

@@ -48,6 +48,12 @@ _SIM_ACC_LEN_DOMAIN = 0x0F3D6B8C2A915E47
 _MAX_POST_VERIFY_STATES = 64
 
 
+def forced_length_generator(seed: int) -> torch.Generator:
+    """The forced acceptance lengths' generator (SGLANG_SIMULATE_ACC_LEN), seeded
+    alike on every rank from the server seed."""
+    return torch.Generator().manual_seed(_domain_key(seed, _SIM_ACC_LEN_DOMAIN))
+
+
 def offers_eagle_entries(*, target_model: Any, draft_model: Any) -> bool:
     """Whether the target's or the draft's megakernel offers an EAGLE entry."""
     return any(
@@ -82,7 +88,13 @@ class EagleMegakernel:
     outputs, where each draft round's input came from, and SGLang's post-verify
     graphs."""
 
-    def __init__(self, *, target_worker: Any, draft_worker: Any):
+    def __init__(
+        self,
+        *,
+        target_worker: Any,
+        draft_worker: Any,
+        simulated_acc_len_rng: torch.Generator,
+    ):
         self._target_worker = target_worker
         self._draft_worker = draft_worker
         draft_runner = draft_worker.draft_runner
@@ -119,7 +131,7 @@ class EagleMegakernel:
         self._post_verify = _PostVerifyGraphs(
             body=self._post_verify_body,
             commit=self._post_verify_commit,
-            sim_seed=_domain_key(seed, _SIM_ACC_LEN_DOMAIN),
+            sim_rng=simulated_acc_len_rng,
         )
 
     # ----- the EAGLE draft and draft-extend graphs -----
@@ -602,11 +614,11 @@ class _PostVerifyGraphs:
     and outputs alternate, so one round's outputs stay valid while the host consumes
     them; the GDN state commit replays on a side stream until join()."""
 
-    def __init__(self, *, body: Callable, commit: Callable, sim_seed: int):
+    def __init__(self, *, body: Callable, commit: Callable, sim_rng: torch.Generator):
         self._body, self._commit = body, commit
-        # forced acceptance lengths: every rank seeds this alike and draws once per
-        # round, whatever else uses its global RNG
-        self._sim_rng = torch.Generator().manual_seed(sim_seed)
+        # forced acceptance lengths: the worker's one stream, from which SGLang's eager
+        # verify draws too; once per round, whatever else uses the global RNG
+        self._sim_rng = sim_rng
         self._states: dict[tuple, SimpleNamespace] = {}
         self._pool = None
         self._side_stream = self._main_done = self._commit_done = None

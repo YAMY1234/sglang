@@ -485,12 +485,13 @@ def generate_simulated_accept_index(
     simulate_acc_len: float = SIMULATE_ACC_LEN,
     simulate_acc_method: str = SIMULATE_ACC_METHOD,
     simulate_acc_token_mode: str = SIMULATE_ACC_TOKEN_MODE,
+    generator: Optional[torch.Generator] = None,
 ):
     use_real_draft_tokens = simulate_acc_token_mode == "real-draft-token"
 
     assert simulate_acc_len > 0.0
     simulate_acc_len = sample_simulated_acc_len(
-        simulate_acc_len, simulate_acc_method, spec_steps + 1
+        simulate_acc_len, simulate_acc_method, spec_steps + 1, generator=generator
     )
 
     accept_indx_first_col = accept_index[:, 0].view(-1, 1)

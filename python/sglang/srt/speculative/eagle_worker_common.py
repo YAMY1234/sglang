@@ -580,6 +580,7 @@ def run_eagle_verify(
     grammar_barrier=None,
     uno_target_max_top_k: Optional[int] = None,
     megakernel: Optional[EagleMegakernel] = None,
+    simulated_acc_len_rng: Optional[torch.Generator] = None,
 ) -> GenerationBatchResult:
     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
 
@@ -742,6 +743,7 @@ def run_eagle_verify(
             or target_worker.model_runner.attn_backend.verify_mask.mode
             == TreeMaskMode.FULL_MASK
         ),
+        simulated_acc_len_rng=simulated_acc_len_rng,
     )
     fused_commit_outputs = predict.is_cuda and not batch.forward_mode.is_idle()
     prepared_commit_steps = prepared_draft_inputs = None

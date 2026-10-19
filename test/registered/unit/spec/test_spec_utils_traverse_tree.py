@@ -7,11 +7,10 @@ explicitly cast before being handed to the grammar matcher.
 """
 
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.speculative import spec_utils
 from sglang.srt.speculative.spec_utils import GrammarTree, traverse_tree
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -106,53 +105,6 @@ class TestTraverseTreePassesIntsToGrammar(unittest.TestCase):
         # Node 1 accepted+filled; node 2 rejected -> node 2 and node 3 skipped.
         self.assertEqual(accept_calls, [5])
         self.assertEqual(fill_calls, [0, 1])
-
-
-class TestSimulatedAcceptIndexOnDevice(unittest.TestCase):
-    def test_device_length_writes_what_the_host_length_writes(self):
-        """A CUDA graph replays the injected acceptance from a device length; for every
-        length and token mode it must write what the host-length path writes."""
-        bs, width = 3, 7
-        for mode in ("real-draft-token", "fixed"):
-            for length in range(1, width + 1):
-                with self.subTest(mode=mode, length=length):
-                    candidates = torch.randint(0, 1000, (bs, width))
-                    target_predict = torch.randint(0, 1000, (bs, width))
-                    first = (torch.arange(bs) * width).to(torch.int32).view(bs, 1)
-                    outs = []
-                    for device_length in (False, True):
-                        accept_index = torch.cat(
-                            [first, torch.full((bs, width - 1), -1, dtype=torch.int32)],
-                            dim=1,
-                        )
-                        predict = torch.arange(bs * width, dtype=torch.int32)
-                        correct = torch.zeros(bs, dtype=torch.int32)
-                        kwargs = dict(
-                            accept_index=accept_index,
-                            predict=predict,
-                            num_correct_drafts=correct,
-                            candidates=candidates,
-                            target_predict=target_predict,
-                            bs=bs,
-                            spec_steps=width - 1,
-                            simulate_acc_token_mode=mode,
-                        )
-                        if device_length:
-                            index = spec_utils.generate_simulated_accept_index_device(
-                                simulate_acc_len=torch.tensor([length]), **kwargs
-                            )
-                        else:
-                            with patch.object(
-                                spec_utils,
-                                "sample_simulated_acc_len",
-                                return_value=length,
-                            ):
-                                index = spec_utils.generate_simulated_accept_index(
-                                    simulate_acc_len=4.8, **kwargs
-                                )
-                        outs.append((index, predict, correct))
-                    for host, device in zip(*outs):
-                        self.assertTrue(torch.equal(host, device), (host, device))
 
 
 if __name__ == "__main__":

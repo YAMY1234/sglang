@@ -748,12 +748,14 @@ def eagle_sample(
     watermark_state: Optional[WatermarkState] = None,
     watermark_full_mask: bool = True,
     simulated_acc_len: Optional[torch.Tensor] = None,
+    simulated_acc_len_rng: Optional[torch.Generator] = None,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
     (which contains spec decoding information). simulated_acc_len: the injected
     acceptance length already drawn on the host, as a device int64 [1], so a CUDA
-    graph can replay the injection.
+    graph can replay the injection. simulated_acc_len_rng: the generator to draw
+    it from here otherwise (the global CPU RNG when None).
     """
     from sglang.srt.layers.dp_attention import (
         is_dp_attention_enabled,
@@ -1109,6 +1111,7 @@ def eagle_sample(
                 simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
                 bs=bs,
                 spec_steps=verify_input.max_tree_depth - 1,
+                generator=simulated_acc_len_rng,
             )
 
     # `num_correct_drafts` stays drafts-only inside this function; the returned

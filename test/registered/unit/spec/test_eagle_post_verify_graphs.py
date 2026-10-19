@@ -1,7 +1,8 @@
 """SGLang's post-verify graphs at batch sizes up to 64: every round's outputs, eager
 warm-ups and graph replays alike, must equal bitwise what SGLang's eager sampling
 gives on the same inputs, greedy and with forced acceptance, and stay unchanged
-through the next round. Requires a GPU."""
+through the next round; rounds that run eagerly in between draw from the same
+forced-length generator. Requires a GPU."""
 
 import unittest
 from contextlib import contextmanager
@@ -84,12 +85,12 @@ def _round(bs, generator):
     return batch, verify_input, logits
 
 
-def _eager(batch, verify_input, logits, sim_len):
+def _eager(batch, verify_input, logits, sim_rng):
     predict, accept_lens, accept_index = eagle_sample(
         verify_input,
         batch,
         SimpleNamespace(next_token_logits=logits.clone()),
-        simulated_acc_len=sim_len,
+        simulated_acc_len_rng=sim_rng,
     )
     new_seq_lens, bonus_tokens, _, _ = prepare_verify_commit_outputs(
         predict, accept_index, accept_lens, batch.seq_lens, num_draft_tokens=TOKENS
@@ -104,6 +105,10 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
         self.addCleanup(reset_context)
 
     def _check(self, *, sim_acc_len):
+        # the worker's forced lengths, drawn by its graphs and its eager rounds alike;
+        # the all-eager reference draws the same stream from its own generator
+        worker_rng = eagle_megakernel.forced_length_generator(0)
+        reference_rng = eagle_megakernel.forced_length_generator(0)
         # SGLang's sampling in the graphs: neither model's megakernel offers an entry
         megakernel = eagle_megakernel.EagleMegakernel(
             target_worker=SimpleNamespace(
@@ -116,10 +121,7 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
             draft_worker=SimpleNamespace(
                 draft_runner=SimpleNamespace(model=torch.nn.Module(), model_config=None)
             ),
-        )
-        # the forced lengths the graphs draw, drawn alike for the eager reference
-        sim_rng = torch.Generator().manual_seed(
-            eagle_megakernel._domain_key(0, eagle_megakernel._SIM_ACC_LEN_DOMAIN)
+            simulated_acc_len_rng=worker_rng,
         )
         generator = torch.Generator(device="cuda").manual_seed(0)
         stream = torch.cuda.Stream()
@@ -137,28 +139,24 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
                 # the verify graph's logits buffer: one per batch size, refilled
                 logits_buf = torch.empty(bs * TOKENS, VOCAB, device="cuda")
                 previous = None
-                for i in range(ROUNDS):
+                # every third round runs eagerly, as when its verify ran without a graph
+                for i in range(ROUNDS * 3 // 2):
                     batch, verify_input, logits = _round(bs, generator)
                     logits_buf.copy_(logits)
-                    sim_len = None
-                    if sim_acc_len > 0:
-                        sim_len = torch.tensor(
-                            [
-                                spec_utils.sample_simulated_acc_len(
-                                    sim_acc_len, "match-expected", TOKENS, sim_rng
-                                )
-                            ],
-                            device="cuda",
-                        )
-                    want = _eager(batch, verify_input, logits, sim_len)
+                    want = _eager(batch, verify_input, logits, reference_rng)
+                    graphed = i % 3 != 2
                     got = megakernel.verify_post(
                         batch=batch,
                         verify_input=verify_input,
                         logits_output=SimpleNamespace(next_token_logits=logits_buf),
-                        can_run_cuda_graph=True,
+                        can_run_cuda_graph=graphed,
                     )
                     megakernel.join()
-                    self.assertIsNotNone(got)
+                    if graphed:
+                        self.assertIsNotNone(got)
+                    else:
+                        self.assertIsNone(got)
+                        got = _eager(batch, verify_input, logits, worker_rng)
                     rows = want[2].clamp(min=0).long()
                     with self.subTest(bs=bs, round=i):
                         self.assertTrue(torch.equal(got[0][rows], want[0][rows]))

@@ -2,7 +2,9 @@
 covered step's view is the running forward's own metadata and pools, sealed at their
 first read and checked after capture; the structs carry data only and the tolerated
 lists name real members; offered entries run only at the batch sizes every rank
-serves, an unservable setup is refused, and without an offer SGLang's path runs."""
+serves, an unservable setup is refused, and without an offer SGLang's path runs; with
+--enable-nvidia-megakernel the forced acceptance lengths are one rank-identical
+stream, and without it they come from the global CPU RNG as before."""
 
 import typing
 import unittest
@@ -136,6 +138,7 @@ def _megakernel(target_entries=None, **entries):
                 model_config=SimpleNamespace(hidden_size=4, dtype=torch.float32),
             )
         ),
+        simulated_acc_len_rng=eagle_megakernel.forced_length_generator(0),
     )
 
 
@@ -148,11 +151,12 @@ def _worker(
     target_backend=None,
     draft_backend=None,
     extends=None,
+    flag=False,
 ):
-    """An EAGLE worker after init_attention_backends, whose models' megakernels
-    offer these entries; by default its target runs GDN and trtllm_mha under a
-    hybrid backend and its draft trtllm_mha. extends collects what reached the
-    target backend's enable_prefill_graph_extend."""
+    """An EAGLE worker after init_attention_backends, with --enable-nvidia-megakernel
+    if flag, whose models' megakernels offer these entries; by default its target
+    runs GDN and trtllm_mha under a hybrid backend and its draft trtllm_mha. extends
+    collects what reached the target backend's enable_prefill_graph_extend."""
     if target_backend is None:
         target_backend = _hybrid()
     target_backend.enable_prefill_graph_extend = (
@@ -168,7 +172,7 @@ def _worker(
                 model=_model(**(target or {})),
                 attn_backend=target_backend,
             ),
-            random_seed=0,
+            random_seed=11,
             device="cpu",
         ),
         _draft_worker=SimpleNamespace(
@@ -182,11 +186,47 @@ def _worker(
             draft_extend_attn_backend=None,
             megakernel=None,
         ),
+        # the rest of what verify hands run_eagle_verify
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=None,
+        plan_stream=None,
+        plan_stream_ctx=None,
+        speculative_num_draft_tokens=7,
+        device="cpu",
     )
     spec = SimpleNamespace(speculative_use_rejection_sampling=rejection_sampling)
-    with patch.object(eagle_megakernel, "get_spec", return_value=spec):
+    with (
+        patch.object(eagle_megakernel, "get_spec", return_value=spec),
+        patch.object(eagle_worker_v2, "megakernel_enabled", return_value=flag),
+    ):
         worker.init_attention_backends()
     return worker
+
+
+def _verify_rng(worker):
+    """The generator the worker's verify hands SGLang's eager sampling."""
+    with patch.object(eagle_worker_v2, "run_eagle_verify") as run_eagle_verify:
+        worker.verify(batch=None)
+    return run_eagle_verify.call_args.kwargs["simulated_acc_len_rng"]
+
+
+def _eager_length(generator):
+    """The forced acceptance length SGLang's eager verify draws for one round."""
+    correct = torch.zeros(1, dtype=torch.int32)
+    spec_utils.generate_simulated_accept_index(
+        accept_index=torch.zeros((1, 7), dtype=torch.int32),
+        predict=torch.zeros(7, dtype=torch.int32),
+        num_correct_drafts=correct,
+        candidates=None,
+        target_predict=None,
+        bs=1,
+        spec_steps=6,
+        simulate_acc_len=4.8,
+        simulate_acc_method="match-expected",
+        simulate_acc_token_mode="fixed",
+        generator=generator,
+    )
+    return int(correct) + 1
 
 
 def _ranks(other=None):
@@ -509,32 +549,54 @@ class TestEagleEntries(CustomTestCase):
             with self.subTest(change=sorted(change)):
                 self.assertIsNone(key(**change))
 
-    def test_every_rank_draws_the_same_forced_acceptance_lengths(self):
-        """Each rank draws the forced acceptance length on its host; the draws must
-        agree across ranks even where a rank uses its global RNG differently."""
+    def test_forced_lengths_are_one_stream_with_the_flag_and_unchanged_without(self):
+        """With --enable-nvidia-megakernel the post-verify graphs and the eager verify
+        draw each round's forced length from the worker's one generator, seeded from
+        the server seed: every rank forces the same lengths, whichever path each round
+        took and whatever else used its global RNG. Without the flag the eager verify
+        draws from the global CPU RNG exactly as before."""
 
-        def draws(graphs, *, other_use):
+        def lengths(paths, global_seed):
+            worker = _worker(target={"verify_sample": print}, flag=True)
+            rng = worker._simulated_acc_len_rng
+            self.assertIs(_verify_rng(worker), rng)
+            graphs = worker._megakernel._post_verify
+            # the draw a graph round makes, without its pinned ring on a CPU host
             graphs._sim_host = [torch.zeros(1, dtype=torch.int64) for _ in range(4)]
             graphs._sim_done = [None] * 4
-            lengths = []
-            for _ in range(32):
-                if other_use:
-                    torch.rand(3)  # this rank's other use of its global RNG
-                host, _ = graphs._draw_sim_len(7)
-                lengths.append(int(host[0]))
-            return lengths
+            torch.manual_seed(global_seed)  # this rank's global RNG
+            drawn = []
+            for path in paths:
+                torch.rand(3)  # other uses of the global RNG
+                if path == "graph":
+                    drawn.append(int(graphs._draw_sim_len(7)[0][0]))
+                else:
+                    drawn.append(_eager_length(rng))
+            return drawn
 
         with (
             patch.object(spec_utils, "SIMULATE_ACC_LEN", 4.8),
             patch.object(spec_utils, "SIMULATE_ACC_METHOD", "match-expected"),
         ):
-            rank0, rank1 = (
-                eagle_megakernel._PostVerifyGraphs(body=None, commit=None, sim_seed=7)
-                for _ in range(2)
-            )
-            self.assertEqual(
-                draws(rank0, other_use=False), draws(rank1, other_use=True)
-            )
+            all_graph = lengths(["graph"] * 48, global_seed=1)
+            all_eager = lengths(["eager"] * 48, global_seed=2)
+            mixed = lengths(["graph", "eager", "eager"] * 16, global_seed=3)
+        self.assertEqual(set(all_graph), {4, 5})
+        self.assertEqual(all_eager, all_graph)
+        self.assertEqual(mixed, all_graph)
+        server_seeded = eagle_megakernel.forced_length_generator(11)
+        self.assertEqual(all_graph, [_eager_length(server_seeded) for _ in range(48)])
+
+        self.assertIsNone(_verify_rng(_worker()))
+        torch.manual_seed(3)
+        drawn = [_eager_length(None) for _ in range(32)]
+        state = torch.get_rng_state()
+        torch.manual_seed(3)
+        weight = 4.8 - 4
+        probs = torch.tensor([1.0 - weight, weight])
+        before = [4 + int(torch.multinomial(probs, num_samples=1)) for _ in range(32)]
+        self.assertEqual(drawn, before)
+        self.assertTrue(torch.equal(torch.get_rng_state(), state))
 
 
 if __name__ == "__main__":
