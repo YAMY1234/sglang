@@ -17,11 +17,13 @@ from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
+from sglang.srt.speculative import post_verify_graph
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
 from sglang.srt.speculative.draft_vocab_exchange import DraftVocabExchange
 from sglang.srt.speculative.eagle_info import EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import organize_draft_results
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
+from sglang.srt.speculative.post_verify_graph import PostVerifyGraph
 from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -477,6 +479,89 @@ class TestDraftVocabExchangeRowCaps(CustomTestCase):
                 slots.assert_called_once_with(expected, 16)
                 self.assertTrue(ex.is_local(torch.empty(2, 64)))
                 self.assertFalse(ex.is_local(torch.empty(3, 64)))
+
+
+class TestPostVerifyGraphShardedLogits(CustomTestCase):
+    """Shard-local verify logits (PDDEC_SHARDED_VERIFY_SAMPLING) must not reach a graphed round
+    that returns logprobs, and only the in-graph sharded sampler may graph rounds above batch 2."""
+
+    def _key(self, *, return_logprob=False, custom_logit_processor=False):
+        info = SimpleNamespace(
+            acc_additive_penalties=None,
+            acc_scaling_penalties=None,
+            logit_bias=None,
+            sampling_seed=None,
+            need_min_p_sampling=False,
+            has_watermark_candidates=False,
+            has_custom_logit_processor=custom_logit_processor,
+            is_all_greedy=True,
+            need_top_k_sampling=False,
+            need_top_p_sampling=False,
+        )
+        batch = SimpleNamespace(
+            sampling_info=info,
+            seq_lens=torch.zeros(2),
+            forward_mode=ForwardMode.DECODE,
+            has_grammar=False,
+            hisparse_coordinator=None,
+            return_logprob=return_logprob,
+            mamba_track_indices=None,
+        )
+        graph = object.__new__(PostVerifyGraph)
+        graph.target_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(watermark_state=None)
+        )
+        # Narrower than the vocabulary: the target kept its verify logits on the shards.
+        logits = SimpleNamespace(is_cuda=True, shape=(14, 512))
+        with (
+            patch.object(post_verify_graph, "_SHARDED_IN_GRAPH", False),
+            patch.object(
+                post_verify_graph,
+                "get_parallel",
+                return_value=SimpleNamespace(pp_size=1),
+            ),
+            patch.object(
+                post_verify_graph,
+                "get_spec",
+                return_value=SimpleNamespace(speculative_use_rejection_sampling=False),
+            ),
+            patch(
+                "sglang.srt.layers.logits_processor._VERIFY_SHARD_SOURCE",
+                SimpleNamespace(vocab_size=1024),
+            ),
+        ):
+            return graph._key(
+                batch=batch,
+                verify_input=SimpleNamespace(draft_probs=None, max_tree_depth=7),
+                logits_output=SimpleNamespace(next_token_logits=logits),
+                num_draft_tokens=7,
+                topk=1,
+                token_to_kv_pool_allocator=SimpleNamespace(get_kvcache=object),
+            )
+
+    def test_logprob_rounds_keep_the_eager_chain(self):
+        self.assertIsNotNone(self._key())
+        self.assertIsNone(self._key(return_logprob=True))
+        self.assertIsNone(self._key(custom_logit_processor=True))
+
+    def test_wide_graph_needs_the_sharded_sampler(self):
+        for max_bs, sharded_in_graph, rejected in (
+            (3, False, True),
+            (3, True, False),
+            (2, False, False),
+        ):
+            with (
+                self.subTest(max_bs=max_bs, sharded_in_graph=sharded_in_graph),
+                envs.SGLANG_Q35MF_PDDEC_SHARDED_VERIFY_SAMPLING.override(True),
+                patch.object(post_verify_graph, "_MAX_BS", max_bs),
+                patch.object(post_verify_graph, "_SHARDED_IN_GRAPH", sharded_in_graph),
+            ):
+                if rejected:
+                    # Rejected at construction, i.e. at worker startup.
+                    with self.assertRaises(ValueError):
+                        PostVerifyGraph(device=torch.device("cpu"), target_worker=None)
+                else:
+                    post_verify_graph._check_sharded_sampling_config()
 
 
 if __name__ == "__main__":

@@ -53,6 +53,21 @@ _ONE_LAUNCH_LOAD = envs.SGLANG_Q35MF_MKH_N3C.get()
 _SHARDED_IN_GRAPH = envs.SGLANG_Q35MF_D2R_PVG_SHARDED.get()
 
 
+def _check_sharded_sampling_config() -> None:
+    # Without the in-graph sharded sampler, graphed rounds above batch 2 would gather the
+    # shard-local verify logits; that combination is slower and was never validated.
+    if (
+        _MAX_BS > 2
+        and envs.SGLANG_Q35MF_PDDEC_SHARDED_VERIFY_SAMPLING.get()
+        and not _SHARDED_IN_GRAPH
+    ):
+        raise ValueError(
+            "SGLANG_Q35MF_EDGE_POST_VERIFY_MAX_BS > 2 with "
+            "SGLANG_Q35MF_PDDEC_SHARDED_VERIFY_SAMPLING=1 requires "
+            "SGLANG_Q35MF_D2R_PVG_SHARDED=1"
+        )
+
+
 class PostVerifySamplingView(SimpleNamespace):
     """Batch sampling info inside the post-verify graph that the sharded verify sampler accepts."""
 
@@ -132,6 +147,7 @@ class _KeyState:
 
 class PostVerifyGraph:
     def __init__(self, *, device: torch.device, target_worker: Any):
+        _check_sharded_sampling_config()
         self.device = device
         self.target_worker = target_worker
         self.disabled = False
@@ -287,8 +303,7 @@ class PostVerifyGraph:
             is not None
             or not logits_output.next_token_logits.is_cuda
             or (
-                _SHARDED_IN_GRAPH
-                and (batch.return_logprob or info.has_custom_logit_processor)
+                (batch.return_logprob or info.has_custom_logit_processor)
                 and verify_logits_on_shards(logits_output.next_token_logits)
             )
         ):
