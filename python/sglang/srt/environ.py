@@ -4,7 +4,7 @@ import json
 import os
 import warnings
 from contextlib import contextmanager
-from enum import IntEnum
+from enum import IntEnum, IntFlag
 from typing import Any, Callable, Dict, Optional
 
 
@@ -230,6 +230,20 @@ class ToolStrictLevel(IntEnum):
     OFF = 0
     FUNCTION = 1
     PARAMETER = 2
+
+
+class E2xDraftFuse(IntFlag):
+    """Bits of SGLANG_Q35MF_E2X_DRAFT_FUSE (TP2 draft-path fusion; 0 keeps the stock path).
+
+    XCHG: draft steps of <= 8 rows exchange the candidate with its load-time embedding-half fc memo
+        and the hidden-half partial in one launch (bitwise equal to the split fc).
+    EXTEND_PADDING: draft-extend padding rows reuse their request's last real row's router logits.
+    Q1_BATCHED: draft q1 decode of up to 8 requests with 16-head GQA groups on the paged FP8 q1 kernel.
+    """
+
+    XCHG = 1
+    EXTEND_PADDING = 2
+    Q1_BATCHED = 8
 
 
 class InvariantCheckLevel(IntEnum):
@@ -640,9 +654,7 @@ class Envs:
     # Draft decode / draft extend graphs capture the TRT-LLM MHA metadata rebuild on a side
     # stream from the graph's start and join it before the first attention kernel.
     SGLANG_Q35MF_KDENSE_DRAFT_META_BRANCH = EnvBool(False)
-    # TP2 draft-path fusion bits (0 = stock). Bit 1: draft steps of <= 8 rows exchange the
-    # candidate with its load-time embedding-half fc memo and the hidden-half partial in one
-    # launch, bitwise equal to the split fc (needs the fc split and the TP2 argmax exchange).
+    # TP2 draft-path fusion bits (E2xDraftFuse; 0 = stock).
     SGLANG_Q35MF_E2X_DRAFT_FUSE = EnvInt(0)
 
     # ===================================================================

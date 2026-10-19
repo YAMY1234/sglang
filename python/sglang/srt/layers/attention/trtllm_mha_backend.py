@@ -27,7 +27,7 @@ from sglang.kernels.ops.kvcache.trtllm_mha_graph_metadata import (
 from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
-from sglang.srt.environ import envs
+from sglang.srt.environ import E2xDraftFuse, envs
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferAttnBackend,
@@ -78,6 +78,11 @@ from sglang.srt.speculative.ragged_verify import (
 from sglang.srt.utils import is_flashinfer_available
 
 logger = logging.getLogger(__name__)
+
+# Batched draft q1 decode: up to this many requests per call, and from this many the CTAs are
+# shared by request length (measured on GB300 TP2; equal shares win at 1-2 requests).
+_Q1_MAX_BATCH = 8
+_Q1_BALANCED_MIN_BATCH = 3
 _KDENSE_META_BRANCH = envs.SGLANG_Q35MF_KDENSE_DRAFT_META_BRANCH.get()
 
 if is_flashinfer_available():
@@ -374,8 +379,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self._paged_fp8_plans = {}
         # The paged FP8 q1 decode reproduces trtllm-gen's one-CTA-per-SM KV split, which it only uses when
         # max_context_len spans at least that many 256-token steps.
+        # Batched 16-head draft q1 (TP2 / 16-query-head GQA groups), up to 8 requests.
+        self._q1_batched = bool(
+            envs.SGLANG_Q35MF_E2X_DRAFT_FUSE.get() & E2xDraftFuse.Q1_BATCHED
+        )
         self._q1_enabled = (
-            envs.SGLANG_Q35MF_MKA_Q1.get()
+            (envs.SGLANG_Q35MF_MKA_Q1.get() or self._q1_batched)
             and torch.cuda.get_device_capability()[0] == 10
             and -(-self.max_context_len // 256)
             >= torch.cuda.get_device_properties(
@@ -1462,7 +1471,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         plan = self._q1_plans.get(key)
         if plan is None:
             # Compiles the producer; graph warmup runs this eagerly before capture.
-            plan = Q1SplitPlan(query, kv_cache, block_tables, seq_lens)
+            # From 3 requests the SMs are shared by length (ragged batches tail on equal shares).
+            plan = Q1SplitPlan(
+                query,
+                kv_cache,
+                block_tables,
+                seq_lens,
+                balanced=query.shape[0] >= _Q1_BALANCED_MIN_BATCH,
+            )
             self._q1_plans[key] = plan
         return skv2_q1_decode(
             query,
@@ -1505,14 +1521,21 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         )
 
         if self._q1_enabled and use_q1:
+            num_requests = seq_lens.numel()
             supported = (
                 not self.is_xqa_impl
                 and get_parallel().attn_dcp_size == 1
                 and self.page_size == 64
                 and q_len_per_req == 1
-                and seq_lens.numel() == 1
-                and query.shape == (1, query.shape[-2], 256)
-                and query.shape[-2] in (4, 8)
+                and (
+                    (num_requests == 1 and query.shape[-2] in (4, 8))
+                    or (
+                        self._q1_batched
+                        and 1 <= num_requests <= _Q1_MAX_BATCH
+                        and query.shape[-2] == 16
+                    )
+                )
+                and query.shape == (num_requests, query.shape[-2], 256)
                 and query.dtype == torch.float8_e4m3fn
                 and query.is_contiguous()
                 and isinstance(kv_cache, tuple)

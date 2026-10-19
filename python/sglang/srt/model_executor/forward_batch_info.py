@@ -39,7 +39,7 @@ import torch
 from sglang.kernels.ops.attention.clamp_position import clamp_position
 from sglang.kernels.ops.attention.position import compute_position_triton
 from sglang.srt.configs.hybrid_arch import mambaish_config
-from sglang.srt.environ import envs
+from sglang.srt.environ import E2xDraftFuse, envs
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     compute_req_all_ids_info,
 )
@@ -1075,7 +1075,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             rids=[req.rid for req in batch.reqs],
             attention_kv_len_lower_bound=(
                 min(req.kv.kv_committed_len for req in batch.reqs)
-                if envs.SGLANG_Q35MF_LL1_K1B.get() and batch.reqs
+                if (
+                    envs.SGLANG_Q35MF_LL1_K1B.get()
+                    or envs.SGLANG_Q35MF_E2X_DRAFT_FUSE.get() & E2xDraftFuse.Q1_BATCHED
+                )
+                and batch.reqs
                 else (
                     batch.reqs[0].kv.kv_committed_len
                     if envs.SGLANG_Q35MF_ATTN_SPLIT_KV.get() and len(batch.reqs) == 1

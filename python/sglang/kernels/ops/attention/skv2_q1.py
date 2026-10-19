@@ -37,11 +37,13 @@
 # Modified by NVIDIA: runtime attention scales, page-tail bounds and reusable buffers.
 # Modified by NVIDIA: stock split-KV rounding (page splits, one FP8 P rounding, bf16 partials).
 # Modified by NVIDIA: q1 decode with the trtllm-gen generation kernel's KV split and rounding (two streams per CTA).
+# Modified by NVIDIA: batched requests (trtllm-gen gives each of B requests SMs // B CTAs) and 16-head GQA groups.
 
 """Paged FP8 q1 decode (draft model) with trtllm-gen's rounding structure.
 
-Same KV split as trtllm-gen's multi-CTA generation kernel: one CTA per SM, ceil(steps / CTAs) contiguous 256-token
-steps per CTA. Each CTA keeps two softmax streams (the two 128-token halves of every step) with a running max of the
+Same KV split as trtllm-gen's multi-CTA generation kernel: SMs // B CTAs per request, ceil(steps / CTAs) contiguous
+256-token steps per CTA (the balanced variant instead shares the SMs between requests by length, a different split).
+Each CTA keeps two softmax streams (the two 128-token halves of every step) with a running max of the
 raw scores; P x 448 = ex2(fma(s, c, -fma(m, c, -log2 448))) is rounded once to e4m3, the CTA writes bf16(O / 448)
 with fp32 maxima and denominators, and a small kernel merges the CTAs in fp32. Only fp32 association differs.
 """
@@ -68,6 +70,7 @@ def load_keys(
     stage: cutlass.Int32,
     tile: cutlass.Constexpr[int],
     length: cutlass.Int32,
+    req: cutlass.Int32,
 ):
     with cute.arch.elect_one():
         cute.arch.mbarrier_arrive_and_expect_tx(barrier, tile * 256)
@@ -75,7 +78,7 @@ def load_keys(
         page_index = first_page + half
         page = cutlass.Int32(0)
         if page_index < cute.ceil_div(length, 64):
-            page = table[0, page_index]
+            page = table[req, page_index]
         source = cute.local_tile(k, (64, 256), (page, 0))
         dest = cute.local_tile(sk[None, None, stage], (64, 256), (half, 0))
         ex.tma_load(source, dest, barrier.value, update_expect_tx=False)
@@ -91,6 +94,7 @@ def load_values(
     stage: cutlass.Int32,
     tile: cutlass.Constexpr[int],
     length: cutlass.Int32,
+    req: cutlass.Int32,
 ):
     with cute.arch.elect_one():
         cute.arch.mbarrier_arrive_and_expect_tx(barrier, tile * 256)
@@ -98,16 +102,21 @@ def load_values(
         page_index = first_page + half
         page = cutlass.Int32(0)
         if page_index < cute.ceil_div(length, 64):
-            page = table[0, page_index]
+            page = table[req, page_index]
         source = cute.local_tile(v, (256, 64), (0, page))
         dest = cute.local_tile(sv[None, None, stage], (256, 64), (0, half))
         ex.tma_load(source, dest, barrier.value, update_expect_tx=False)
 
 
 class Q1SplitDecode:
-    def __init__(self, heads=4, nsplit=152, stages=2, slots=2):
-        assert stages >= 1 and slots in (2, 3, 4) and 1 <= heads <= 12
+    def __init__(self, heads=4, nsplit=152, stages=2, slots=2, batch=1, balanced=False):
+        # Batched launches load each request's query rows by TMA at row req * heads (8-row swizzle atoms).
+        assert stages >= 1 and slots in (2, 3, 4) and 1 <= heads <= 16
+        assert batch == 1 or heads % 8 == 0
         self.heads, self.nsplit, self.stages, self.slots = heads, nsplit, stages, slots
+        self.batch = batch
+        # balanced: the nsplit CTAs are shared by request length instead of nsplit per request.
+        self.balanced = balanced
         self.rows = heads
         self.width = 32
         self.tile = 128
@@ -153,7 +162,11 @@ class Q1SplitDecode:
         )
         self.kernel(
             q, k, v, table, lengths, partial, maxima, denom, qk_scale, out_scale, kq, vp
-        ).launch(grid=(self.nsplit, 1, 1), block=(384, 1, 1), stream=stream)
+        ).launch(
+            grid=(self.nsplit, 1, 1 if self.balanced else self.batch),
+            block=(384, 1, 1),
+            stream=stream,
+        )
 
     @cute.experimental.kernel
     def kernel(
@@ -172,7 +185,36 @@ class Q1SplitDecode:
         vp: cute.TiledMma,
     ):
         tid, _, _ = cute.arch.thread_idx()
-        split, _, _ = cute.arch.block_idx()
+        split, _, req = cute.arch.block_idx()
+        # Partial / maxima / denominator row of this CTA: request-major, nsplit CTAs per request.
+        prow = req * self.nsplit + split
+        nsp = cutlass.Int32(self.nsplit)
+        length = lengths[req]
+        if cutlass.const_expr(self.balanced):
+            # Request b owns 1 + (nsplit - batch) * steps_b // total CTAs (same rule as the merge);
+            # CTAs past the last request run an empty span.
+            prow = split
+            all_steps = cutlass.Int32(0)
+            for b in cutlass.range_constexpr(self.batch):
+                all_steps = all_steps + cute.ceil_div(lengths[b], 256)
+            cta_first = cutlass.Int32(0)
+            req = cutlass.Int32(0)
+            nsp = cutlass.Int32(1)
+            length = cutlass.Int32(0)
+            own_split = cutlass.Int32(0)
+            for b in cutlass.range_constexpr(self.batch):
+                req_steps = cute.ceil_div(lengths[b], 256)
+                req_ctas = cutlass.Int32(0)
+                if req_steps > 0:
+                    req_ctas = 1 + ((self.nsplit - self.batch) * req_steps) // all_steps
+                if split >= cta_first:
+                    if split < cta_first + req_ctas:
+                        req = cutlass.Int32(b)
+                        nsp = req_ctas
+                        length = lengths[b]
+                        own_split = split - cta_first
+                cta_first = cta_first + req_ctas
+            split = own_split
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         lane = cute.arch.lane_idx()
         local_tid = tid % 128
@@ -284,8 +326,7 @@ class Q1SplitDecode:
         copy_s = tcgen05.make_tmem_copy(copy_atom, s_plane).get_slice(local_tid)
         rlayout = copy_s.partition_D(s_plane).layout
         # trtllm-gen split: one CTA per SM, ceil(steps / CTAs) contiguous 256-token steps each.
-        length = lengths[0]
-        spc = cute.ceil_div(cute.ceil_div(length, 256), self.nsplit)
+        spc = cute.ceil_div(cute.ceil_div(length, 256), nsp)
         begin_tok = split * spc * 256
         end_tok = begin_tok + spc * 256
         if end_tok > length:
@@ -422,7 +463,7 @@ class Q1SplitDecode:
                     w1 = cute.math.exp2(o1 - top, fastmath=True)
                 for dm in cutlass.range_constexpr(2):
                     merged = accum[0, j, dm] * w0 + accum[1, j, dm] * w1
-                    partial[split, j, local_tid + dm * 128] = cutlass.BFloat16(
+                    partial[prow, j, local_tid + dm * 128] = cutlass.BFloat16(
                         merged * out_scale
                     )
         else:
@@ -475,14 +516,25 @@ class Q1SplitDecode:
                         tcgen05.commit(bo + slot, None, tcgen05.CtaGroup.ONE)
                         tcgen05.commit(bvfree + stage, None, tcgen05.CtaGroup.ONE)
             elif warp == 10:
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(bq, width * 256)
-                ex.tma_load(
-                    cute.local_tile(q, (width, 256), (0, 0)),
-                    sq,
-                    bq.value,
-                    update_expect_tx=False,
-                )
+                if cutlass.const_expr(self.batch == 1):
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive_and_expect_tx(bq, width * 256)
+                    ex.tma_load(
+                        cute.local_tile(q, (width, 256), (0, 0)),
+                        sq,
+                        bq.value,
+                        update_expect_tx=False,
+                    )
+                else:
+                    # Rows past the request's heads stay stale; their scores never reach P or O.
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive_and_expect_tx(bq, rows * 256)
+                    ex.tma_load(
+                        cute.local_tile(q, (rows, 256), (req, 0)),
+                        cute.local_tile(sq, (rows, 256), (0, 0)),
+                        bq.value,
+                        update_expect_tx=False,
+                    )
                 for stage in cutlass.range_constexpr(self.stages):
                     if stage < nblk:
                         load_keys(
@@ -494,6 +546,7 @@ class Q1SplitDecode:
                             stage,
                             self.tile,
                             length,
+                            req,
                         )
                 for it in cutlass.range(0, nblk):
                     stage = it % self.stages
@@ -509,6 +562,7 @@ class Q1SplitDecode:
                         stage,
                         self.tile,
                         length,
+                        req,
                     )
                     if it + self.stages < nblk:
                         cute.arch.mbarrier_wait(
@@ -523,6 +577,7 @@ class Q1SplitDecode:
                             stage,
                             self.tile,
                             length,
+                            req,
                         )
         cute.arch.mbarrier_wait(bdenom, phase=0)
         for chunk in cutlass.range_constexpr(cute.ceil_div(rows, 12)):
@@ -545,8 +600,8 @@ class Q1SplitDecode:
                     if stream_top != -f32.inf:
                         total += part * cute.math.exp2(stream_top - top, fastmath=True)
                 if lane == 0:
-                    denom[split, column] = total
-                    maxima[split, column] = top
+                    denom[prow, column] = total
+                    maxima[prow, column] = top
 
 
 import torch
@@ -566,51 +621,91 @@ def _q1_merge(
     NSPLIT: tl.constexpr,
     NP2: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    BATCH: tl.constexpr,
+    BALANCED: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    flat = tl.program_id(0)
     dblk = tl.program_id(1)
-    length = tl.load(lengths)
+    req = flat // ROWS
+    row = flat % ROWS
+    length = tl.load(lengths + req)
     steps = tl.cdiv(length, 256)
-    spc = tl.cdiv(steps, NSPLIT)
+    if BALANCED:
+        total = 0
+        for b in tl.static_range(BATCH):
+            total += tl.cdiv(tl.load(lengths + b), 256)
+        first = 0
+        ctas = 1
+        for b in tl.static_range(BATCH):
+            sb = tl.cdiv(tl.load(lengths + b), 256)
+            cb = tl.where(sb > 0, 1 + ((NSPLIT - BATCH) * sb) // total, 0)
+            first += tl.where(b < req, cb, 0)
+            ctas = tl.where(b == req, cb, ctas)
+        spc = tl.cdiv(steps, tl.maximum(ctas, 1))
+    else:
+        first = req * NSPLIT
+        spc = tl.cdiv(steps, NSPLIT)
     active = tl.cdiv(steps, spc)
     c = tl.arange(0, NP2)
     valid = c < active
-    m = tl.load(maxima + c * ROWS + row, mask=valid, other=float("-inf"))
+    prow = first + c
+    m = tl.load(maxima + prow * ROWS + row, mask=valid, other=float("-inf"))
     w = tl.where(valid, tl.exp2(m - tl.max(m, 0)), 0.0)
-    total = tl.sum(tl.load(denom + c * ROWS + row, mask=valid, other=0.0) * w, 0)
+    total = tl.sum(tl.load(denom + prow * ROWS + row, mask=valid, other=0.0) * w, 0)
     d = dblk * BLOCK_D + tl.arange(0, BLOCK_D)
     part = tl.load(
-        partial + (c[:, None] * ROWS + row) * 256 + d[None, :],
+        partial + (prow[:, None] * ROWS + row) * 256 + d[None, :],
         mask=valid[:, None],
         other=0.0,
     )
     o = tl.sum(part.to(tl.float32) * w[:, None], 0)
     # Denominators are sums of P x 448; partials are O / 448.
-    tl.store(out + row * 256 + d, (o / (total * (1.0 / 448.0))).to(tl.bfloat16))
+    tl.store(
+        out + (req * ROWS + row) * 256 + d,
+        (o / (total * (1.0 / 448.0))).to(tl.bfloat16),
+    )
 
 
 class Q1SplitPlan:
     """Reusable storage and a compiled producer for one fixed input layout, plus the fp32 merge."""
 
-    def __init__(self, query, kv, table, lengths, *, nsplit=None, stages=2, slots=2):
+    def __init__(
+        self,
+        query,
+        kv,
+        table,
+        lengths,
+        *,
+        nsplit=None,
+        stages=2,
+        slots=2,
+        balanced=False
+    ):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "Paged FP8 q1 decode storage must be prepared before graph capture"
             )
-        qlen, self.heads, _ = query.shape
-        assert qlen == 1
-        self.nsplit = (
-            nsplit
-            or torch.cuda.get_device_properties(query.device).multi_processor_count
-        )
+        self.batch, self.heads, _ = query.shape
+        self.balanced = balanced
+        sms = torch.cuda.get_device_properties(query.device).multi_processor_count
+        # trtllm-gen's generation kernel gives each request SMs // batch CTAs; balanced shares SMs by length.
+        self.nsplit = nsplit or (sms if balanced else sms // self.batch)
+        rows = self.nsplit if balanced else self.batch * self.nsplit
         self.partial = torch.empty(
-            (self.nsplit, self.heads, 256), dtype=torch.bfloat16, device=query.device
+            (rows, self.heads, 256), dtype=torch.bfloat16, device=query.device
         )
         self.maximum = torch.empty(
-            (self.nsplit, self.heads), dtype=torch.float32, device=query.device
+            (rows, self.heads), dtype=torch.float32, device=query.device
         )
         self.denom = torch.empty_like(self.maximum)
-        kernel = Q1SplitDecode(self.heads, self.nsplit, stages=stages, slots=slots)
+        kernel = Q1SplitDecode(
+            self.heads,
+            self.nsplit,
+            stages=stages,
+            slots=slots,
+            batch=self.batch,
+            balanced=balanced,
+        )
         views = self._views(query, kv, table, lengths)
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         self.compiled = cute.compile(
@@ -640,7 +735,7 @@ class Q1SplitPlan:
             cutlass.Float32(v_scale / 448.0),
             stream,
         )
-        _q1_merge[(self.heads, 256 // 32, 1)](
+        _q1_merge[(self.batch * self.heads, 256 // 32, 1)](
             self.partial,
             self.maximum,
             self.denom,
@@ -650,13 +745,15 @@ class Q1SplitPlan:
             self.nsplit,
             triton.next_power_of_2(self.nsplit),
             32,
+            self.batch,
+            self.balanced,
             num_warps=4,
         )
         return out
 
 
 def skv2_q1_decode(query, kv, table, lengths, plan, *, qk_scale, v_scale, out):
-    """q1 decode for one request through a prepared plan; same contract as trtllm_batch_decode_with_kv_cache."""
+    """q1 decode of the plan's batch through a prepared plan; same contract as trtllm_batch_decode_with_kv_cache."""
     return plan.run(
         query, kv, table, lengths, qk_scale=qk_scale, v_scale=v_scale, out=out
     )

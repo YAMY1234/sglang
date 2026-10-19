@@ -96,10 +96,12 @@ class Q1GraphVariants(msgspec.Struct, frozen=True):
     """Draft q1 decode: the paged FP8 q1 kernel from a host-only KV length lower bound, trtllm-gen below it."""
 
     min_length: int
+    # Largest batch the q1 kernel serves (the shortest request's lower bound must clear min_length).
+    max_batch: int = 1
     capture_labels: ClassVar[tuple[str, ...]] = (Q1_STOCK, Q1_LONG)
 
     def select(self, forward_batch: ForwardBatch) -> str:
-        if forward_batch.batch_size != 1:
+        if not 1 <= forward_batch.batch_size <= self.max_batch:
             return Q1_STOCK
         length = forward_batch.attention_kv_len_lower_bound
         if length is None:
@@ -107,22 +109,33 @@ class Q1GraphVariants(msgspec.Struct, frozen=True):
             if (
                 lengths is not None
                 and lengths.device.type == "cpu"
-                and lengths.numel() == 1
+                and lengths.numel() == forward_batch.batch_size
             ):
-                length = int(lengths[0])
+                length = int(lengths.min())
         return Q1_LONG if length is not None and length >= self.min_length else Q1_STOCK
 
 
-def create_q1_graph_variants() -> Optional[Q1GraphVariants]:
-    from sglang.srt.environ import envs
+def _q1_graph_variants() -> Q1GraphVariants:
+    from sglang.srt.environ import E2xDraftFuse, envs
 
-    if envs.SGLANG_Q35MF_MKA_Q1.get():
-        return Q1GraphVariants(min_length=envs.SGLANG_Q35MF_MKA_Q1_MIN_LENGTH.get())
+    batched = envs.SGLANG_Q35MF_E2X_DRAFT_FUSE.get() & E2xDraftFuse.Q1_BATCHED
+    return Q1GraphVariants(
+        min_length=envs.SGLANG_Q35MF_MKA_Q1_MIN_LENGTH.get(),
+        max_batch=8 if batched else 1,
+    )
+
+
+def create_q1_graph_variants() -> Optional[Q1GraphVariants]:
+    from sglang.srt.environ import E2xDraftFuse, envs
+
+    if envs.SGLANG_Q35MF_MKA_Q1.get() or (
+        envs.SGLANG_Q35MF_E2X_DRAFT_FUSE.get() & E2xDraftFuse.Q1_BATCHED
+    ):
+        return _q1_graph_variants()
     return None
 
 
 def use_q1_attention(forward_batch: ForwardBatch) -> bool:
-    from sglang.srt.environ import envs
     from sglang.srt.model_executor.runner_utils.capture_mode import (
         get_capture_attention_variant,
         get_is_capture_mode,
@@ -133,8 +146,7 @@ def use_q1_attention(forward_batch: ForwardBatch) -> bool:
         return variant == Q1_LONG
     if get_is_capture_mode():
         return False
-    variants = Q1GraphVariants(min_length=envs.SGLANG_Q35MF_MKA_Q1_MIN_LENGTH.get())
-    return variants.select(forward_batch) == Q1_LONG
+    return _q1_graph_variants().select(forward_batch) == Q1_LONG
 
 
 class AttentionGraphVariants(Protocol):

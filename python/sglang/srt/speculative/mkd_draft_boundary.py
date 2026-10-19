@@ -105,6 +105,10 @@ def _unsupported_reason(model, exchange) -> Optional[str]:
 class MkdDraftBoundary:
     """Exchange buffers, the optional memo table and the per-step launches."""
 
+    # One-row draft steps only; rows of the current draft step (set by the vocab exchange).
+    max_rows = 1
+    rows = 1
+
     def __init__(self, model, exchange, hot_ids: torch.Tensor) -> None:
         from flashinfer.comm.mnnvl import McastGPUBuffer
 

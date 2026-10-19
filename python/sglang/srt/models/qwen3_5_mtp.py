@@ -14,6 +14,7 @@
 
 """Inference-only Qwen3_5 MTP model."""
 
+import contextlib
 import copy
 import logging
 from contextlib import ExitStack
@@ -32,7 +33,7 @@ from sglang.kernels.ops.speculative.draft_fc_partial import (
 )
 from sglang.kernels.ops.speculative.ordered_partial_sum import ordered_partial_sum
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
-from sglang.srt.environ import envs
+from sglang.srt.environ import E2xDraftFuse, envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.kdense_draft_xchg import FcPeerSum, join_metadata
@@ -49,6 +50,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
 )
+from sglang.srt.speculative import e2x_extend_padding
 from sglang.srt.utils import add_prefix, get_bool_env_var, is_hip, is_npu
 
 logger = logging.getLogger(__name__)
@@ -199,6 +201,26 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         self.draft_input_embeds: Optional[torch.Tensor] = None
         # One-launch draft step boundary (SGLANG_Q35MF_MKD_XCHG), set by the spec worker.
         self._mkd = None
+        self._e2x_extend_padding = bool(
+            envs.SGLANG_Q35MF_E2X_DRAFT_FUSE.get() & E2xDraftFuse.EXTEND_PADDING
+        )
+
+    def _extend_padding_rows(self, forward_batch: ForwardBatch):
+        """Draft-extend padding rows reuse their request's last real row's routing (E2X bit)."""
+        from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+
+        spec_info = forward_batch.spec_info
+        if (
+            self._e2x_extend_padding
+            and forward_batch.forward_mode.is_draft_extend_v2()
+            and isinstance(spec_info, EagleDraftExtendInput)
+            and spec_info.num_accept_tokens is not None
+            and spec_info.num_tokens_per_req > 1
+        ):
+            return e2x_extend_padding.padding_rows(
+                spec_info.num_accept_tokens, spec_info.num_tokens_per_req
+            )
+        return contextlib.nullcontext()
 
     def _mkd_head_follows(self) -> bool:
         """Whether the draft head (mkd_draft_head) is the next kernel after the final norm."""
@@ -393,7 +415,10 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
 
                 hidden_states = self.fc(hidden_states)
 
-            with get_global_expert_distribution_recorder().disable_this_region():
+            with (
+                get_global_expert_distribution_recorder().disable_this_region(),
+                self._extend_padding_rows(forward_batch),
+            ):
                 hidden_states = self.model(
                     input_ids,
                     positions,

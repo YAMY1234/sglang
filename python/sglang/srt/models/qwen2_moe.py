@@ -103,6 +103,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_stream,
 )
+from sglang.srt.speculative import e2x_extend_padding
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
@@ -820,6 +821,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+        if self.is_nextn:
+            router_logits = e2x_extend_padding.remap_router_logits(router_logits)
         if defer_finalize and qwen_router_front.mkm_wide_supported(self, hidden_states):
             return qwen_router_front.forward_mkm_wide(
                 self, hidden_states, router_logits

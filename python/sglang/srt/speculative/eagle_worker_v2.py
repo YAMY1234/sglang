@@ -11,7 +11,7 @@ from sglang.kernels.ops.speculative.topk1 import (
     draft_topk1_postprocess,
 )
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
-from sglang.srt.environ import envs
+from sglang.srt.environ import E2xDraftFuse, envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
     EAGLEDraftExtendNpuGraphRunner,
 )
@@ -106,6 +106,7 @@ from sglang.srt.speculative.eagle_worker_common import (
     prepare_for_draft_extend,
     run_eagle_verify,
 )
+from sglang.srt.speculative.e2x_draft_xchg import E2xDraftXchg
 from sglang.srt.speculative.mkd_draft_boundary import MkdDraftBoundary
 from sglang.srt.speculative.post_verify_graph import (
     PostVerifyGraph,
@@ -275,6 +276,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 )
                 self._draft_vocab_exchange.mkd = mkd
                 self.draft_runner.model._mkd = mkd
+            elif (
+                envs.SGLANG_Q35MF_E2X_DRAFT_FUSE.get() & E2xDraftFuse.XCHG
+                and self._exchange_in_draft_steps
+            ):
+                boundary = E2xDraftXchg.maybe_create(
+                    self.draft_runner.model, self._draft_vocab_exchange
+                )
+                self._draft_vocab_exchange.mkd = boundary
+                self.draft_runner.model._mkd = boundary
 
         if get_spec().speculative_use_rejection_sampling:
             target_vocab_size = self.target_worker.model_config.vocab_size
@@ -710,7 +720,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             if (
                 not holds
                 and not forward_batch.forward_mode.is_idle()
-                and draft_input.topk_index.shape[0] == 1
+                and draft_input.topk_index.shape[0] <= mkd.max_rows
             ):
                 mkd.fill_fc(
                     draft_input.topk_index, draft_input.hidden_states, forward_batch

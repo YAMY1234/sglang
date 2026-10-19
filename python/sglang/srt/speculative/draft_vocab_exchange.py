@@ -189,13 +189,14 @@ class DraftVocabExchange:
             )
         mkd = self.mkd
         if mkd is not None:
-            mkd.armed = num_rows == 1
+            mkd.armed = num_rows <= mkd.max_rows
+            mkd.rows = num_rows
             mkd.step = step
             # The draft loop forwards steps 0 .. num_steps - 2.
             mkd.last_step = step == self.num_steps - 2
             if step == 0:
                 # With extend_fc the draft caller guarantees fc_buf holds this step's fc.
-                mkd.pending = mkd.extend_fc and num_rows == 1
+                mkd.pending = mkd.extend_fc and num_rows <= mkd.max_rows
         if mkd is not None and mkd.pending:
             # The model finishes the fc from the exchange; this row only carries the shape.
             self.model.draft_input_embeds = self.next_embeds[:num_rows]
@@ -276,7 +277,7 @@ class DraftVocabExchange:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Draft-extend argmax (torch.argmax semantics) from shard-local logits."""
         m = local_logits.shape[0]
-        if self.mkd is not None and m == 1:
+        if self.mkd is not None and m <= self.mkd.max_rows:
             return self.mkd.exchange_extend(local_logits, hidden_states)
         topk_index = torch.empty((m, 1), dtype=torch.int64, device=local_logits.device)
         topk_p = torch.empty((m, 1), dtype=torch.float32, device=local_logits.device)
