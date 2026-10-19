@@ -1650,6 +1650,8 @@ class Scheduler(
             needs_cpu_seq_lens=needs_cpu_seq_lens,
             needs_confidence_relay=needs_confidence_relay,
         )
+        if megakernel_enabled():
+            self.future_map.enable_stash_reuse()
 
         self._confidence_budget_prepare = None
         if (
