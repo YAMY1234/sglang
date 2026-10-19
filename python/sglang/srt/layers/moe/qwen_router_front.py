@@ -1027,7 +1027,8 @@ def _run_experts_from_tables(
     return moe_output
 
 
-_DEP_MAX_TOKENS = 16
+_DEP_FRONT_MAX_TOKENS = 16  # router GEMM in the launch; above it the stock router GEMM feeds the tail launch
+_DEP_MAX_TOKENS = 64
 _dep_static_by_block: dict[int, bool] = {}
 _dep_engaged: set[tuple[int, int]] = set()
 
@@ -1110,8 +1111,12 @@ def dep_front_supported(
 def forward_routed_dep(
     block: Qwen2MoeSparseMoeBlock, hidden_states: torch.Tensor
 ) -> torch.Tensor:
-    """The stock FlashInfer A2A routed path with its router GEMM, top-k and dispatch quantization from one launch."""
-    from sglang.kernels.ops.moe.qwen_router_front import router_topk_quant
+    """The stock FlashInfer A2A routed path with router GEMM, top-k and dispatch quantization in one launch (<= 16
+    tokens) or top-k and quantization in one launch behind the stock router GEMM (17-64 tokens)."""
+    from sglang.kernels.ops.moe.qwen_router_front import (
+        router_tail_dep,
+        router_topk_quant,
+    )
     from sglang.srt.layers.moe.topk import (
         StandardTopKOutput,
         build_precomputed_topk_output,
@@ -1119,12 +1124,16 @@ def forward_routed_dep(
 
     experts = block.experts
     disp = experts.dispatcher
-    logits, topk_weights, topk_ids, x_fp4, x_sf = router_topk_quant(
-        hidden_states,
-        block.gate.weight,
-        disp.quant_config["input_global_scale"].reshape(1),
-        block._dep_front_arrival,
-    )
+    global_scale = disp.quant_config["input_global_scale"].reshape(1)
+    if hidden_states.shape[0] <= _DEP_FRONT_MAX_TOKENS:
+        logits, topk_weights, topk_ids, x_fp4, x_sf = router_topk_quant(
+            hidden_states, block.gate.weight, global_scale, block._dep_front_arrival
+        )
+    else:
+        logits, _ = block.gate(hidden_states)
+        topk_weights, topk_ids, x_fp4, x_sf = router_tail_dep(
+            logits, hidden_states, global_scale
+        )
     # Capture hook and expert-distribution recorder, as select_experts would run them.
     build_precomputed_topk_output(
         topk_weights, topk_ids, block.topk.topk_config, block.topk.layer_id

@@ -1026,6 +1026,45 @@ __global__ __launch_bounds__(kThreads, 1) void router_tail_kernel(const __grid_c
   p.x_sf[static_cast<size_t>(row) * kBlocksPerRow + blk] = static_cast<uint8_t>(sf);
 }
 
+inline constexpr uint32_t kDepTailMaxTokens = 64;
+
+/// \brief Top-k and NVFP4 input quantization behind a router GEMM computed elsewhere, up to 64 tokens and no
+/// routing tables: CTA b < ceil(M / 8) runs one token per warp, CTA b >= that quantizes token row b - ceil(M / 8).
+template <bool kUsePDL>
+__global__ __launch_bounds__(kThreads, 1) void router_tail_dep_kernel(const __grid_constant__ Params p) {
+  // Scratch for the table bookkeeping topk_tokens_fast also writes; this kernel builds no tables.
+  __shared__ uint32_t s_mask[kExperts];
+  __shared__ int16_t s_ids[kMaxTokens * kTopK];
+
+  device::PDLWaitPrimary<kUsePDL>();
+  device::PDLTriggerSecondary<kUsePDL>();
+  const uint32_t M = p.num_tokens;
+  const uint32_t topk_ctas = (M + kWarps - 1) / kWarps;
+  if (blockIdx.x < topk_ctas) {
+    const uint32_t warp = threadIdx.x / 32;
+    const uint32_t base = blockIdx.x * kWarps;
+    if (base + warp >= M) return;
+    // Rebase so the token is local index `warp` (s_ids / s_mask hold at most 16 tokens).
+    Params q = p;
+    q.logits = p.logits + static_cast<size_t>(base) * kExperts;
+    q.topk_weights = p.topk_weights + static_cast<size_t>(base) * kTopK;
+    q.topk_ids = p.topk_ids + static_cast<size_t>(base) * kTopK;
+    const uint32_t m1[1] = {warp};
+    const bool v1[1] = {true};
+    topk_tokens_fast<1, false>(q, m1, v1, s_mask, s_ids);
+    return;
+  }
+  const uint32_t row = blockIdx.x - topk_ctas;
+  const uint32_t qk = (threadIdx.x / 32) * kKPerWarp + (threadIdx.x % 32) * kKPerLane;
+  const U32x8 v = ld_produced32(p.x + static_cast<size_t>(row) * kHidden + qk);
+  uint32_t sf;
+  uint2 packed;
+  quantize_block(v.lo, v.hi, p.global_scale[0], sf, packed);
+  const uint32_t blk = qk / kSfVec;
+  *reinterpret_cast<uint2*>(p.x_fp4 + static_cast<size_t>(row) * (kHidden / 2) + blk * 8) = packed;
+  p.x_sf[static_cast<size_t>(row) * kBlocksPerRow + blk] = static_cast<uint8_t>(sf);
+}
+
 template <uint32_t kMaxM, bool kUsePDL, bool kTrace>
 struct RouterFrontKernel {
   static void
@@ -1269,6 +1308,43 @@ struct RouterFrontKernel {
     params.num_tokens = M;
     params.mode = kModeQuant | kModeTopk;
     launch_front<false>(params, device.unwrap());
+  }
+
+  /// \brief Softmax top-k and NVFP4 input quantization from router logits computed elsewhere, at up to 64 tokens.
+  static void run_tail_dep(
+      const tvm::ffi::TensorView logits,
+      const tvm::ffi::TensorView x,
+      const tvm::ffi::TensorView global_scale,
+      const tvm::ffi::TensorView topk_weights,
+      const tvm::ffi::TensorView topk_ids,
+      const tvm::ffi::TensorView x_fp4,
+      const tvm::ffi::TensorView x_sf) {
+    using namespace host;
+    auto M_ = SymbolicSize{"num_tokens"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    TensorMatcher({M_, kExperts}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(logits);
+    TensorMatcher({M_, kHidden}).with_dtype<bf16_t>().with_device(device).ensure_alignment(32).verify(x);
+    TensorMatcher({1}).with_dtype<fp32_t>().with_device(device).verify(global_scale);
+    TensorMatcher({M_, kTopK}).with_dtype<fp32_t>().with_device(device).verify(topk_weights);
+    TensorMatcher({M_, kTopK}).with_dtype<int32_t>().with_device(device).verify(topk_ids);
+    TensorMatcher({M_, kHidden / 2}).with_dtype<uint8_t>().with_device(device).ensure_alignment(8).verify(x_fp4);
+    TensorMatcher({M_, kBlocksPerRow}).with_dtype<uint8_t>().with_device(device).verify(x_sf);
+    const auto M = static_cast<uint32_t>(M_.unwrap());
+    CHECK_HOST(M <= kDepTailMaxTokens) << "router_tail_dep: num_tokens " << M << " exceeds " << kDepTailMaxTokens;
+    if (M == 0) return;
+    Params params{};
+    params.x = static_cast<const bf16_t*>(x.data_ptr());
+    params.global_scale = static_cast<const float*>(global_scale.data_ptr());
+    params.logits = static_cast<bf16_t*>(logits.data_ptr());
+    params.topk_weights = static_cast<float*>(topk_weights.data_ptr());
+    params.topk_ids = static_cast<int32_t*>(topk_ids.data_ptr());
+    params.x_fp4 = static_cast<uint8_t*>(x_fp4.data_ptr());
+    params.x_sf = static_cast<uint8_t*>(x_sf.data_ptr());
+    params.num_tokens = M;
+    params.mode = kModeQuant | kModeTopk;
+    const uint32_t grid = (M + kWarps - 1) / kWarps + M;
+    LaunchKernel(grid, kThreads, device.unwrap()).enable_pdl(kUsePDL)(router_tail_dep_kernel<kUsePDL>, params);
   }
 
   /// \brief run_gemm plus the shared-expert gate/up projection (static per-tensor FP8) in the same launch.
