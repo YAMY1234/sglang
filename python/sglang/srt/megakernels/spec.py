@@ -121,7 +121,8 @@ class BuiltMegakernel(Protocol):
     return bs -> None (SGLang's code at that batch size) or the step to run there,
     and every rank must serve the same sizes. A draft's begin_draft_round and a
     target's gdn_extend are called as they are. The entries a built object offers
-    must agree on every rank.
+    must agree on every rank. megakernels/eagle_binding.py holds the binding of the
+    Qwen3.5 architectures and the structs these entries get.
     """
 
     widths: tuple[int, ...]  # the rows it built, possibly fewer than requested

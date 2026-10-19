@@ -48,7 +48,16 @@ logger = logging.getLogger(__name__)
 
 # HF architecture -> the "module:attribute" path of the binding its megakernel gets;
 # every other architecture gets MegakernelBinding
-_BINDINGS: dict[str, str] = {}
+_BINDINGS: dict[str, str] = {
+    arch: "sglang.srt.megakernels.eagle_binding:EagleBinding"
+    for arch in (
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5ForCausalLMMTP",
+    )
+}
 
 
 def megakernel_enabled() -> bool:
