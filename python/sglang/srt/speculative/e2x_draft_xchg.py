@@ -67,6 +67,7 @@ class E2xDraftXchg:
 
     max_rows = 8
     extend_fc = True
+    extend_partial_in_graph = True
 
     def __init__(self, model, exchange) -> None:
         self.model = model
@@ -106,6 +107,12 @@ class E2xDraftXchg:
         self.counter = torch.zeros(self.max_rows, dtype=torch.int32, device=dev)
         # Zeros: graph-capture warmups read it before any exchange has written it.
         self.fc_buf = torch.zeros(self.max_rows, h, dtype=torch.bfloat16, device=dev)
+        # Rank 1: hidden-half partial of the draft extend's selected rows, written inside the extend graph.
+        self.p_extend = (
+            torch.zeros(self.max_rows, h, dtype=torch.float32, device=dev)
+            if self.is_hidden_rank
+            else None
+        )
         self.no_partial = torch.empty(0, dtype=torch.float32, device=dev)
         self.no_ints = torch.empty(0, dtype=torch.int64, device=dev)
         self.no_out = torch.empty(0, dtype=torch.bfloat16, device=dev)
@@ -187,6 +194,32 @@ class E2xDraftXchg:
             )
         self.partial_pending = True
 
+    def extend_hidden_partial(
+        self, hidden_states: torch.Tensor, select_index: Optional[torch.Tensor]
+    ) -> bool:
+        """Rank 1: the draft extend's selected rows' hidden-half partial on the side stream (joined after
+        the lm_head by join_extend_partial); same norm and cuBLAS call as the stock first draft step.
+        """
+        if (
+            not self.is_hidden_rank
+            or select_index is None
+            or not 0 < select_index.numel() <= self.max_rows
+        ):
+            return False
+        norm = self.model.pre_fc_norm_hidden
+        self.side_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self.side_stream):
+            partial = torch.mm(
+                norm(hidden_states[select_index]),
+                self.w_hidden.T,
+                out_dtype=torch.float32,
+            )
+            self.p_extend[: partial.shape[0]].copy_(partial)
+        return True
+
+    def join_extend_partial(self) -> None:
+        torch.cuda.current_stream().wait_stream(self.side_stream)
+
     def _launch(
         self,
         local_logits: torch.Tensor,
@@ -264,10 +297,8 @@ class E2xDraftXchg:
         topk_p = torch.empty((m, 1), dtype=torch.float32, device=local_logits.device)
         payload = hidden_states is not None and hidden_states.shape[0] == m
         if payload and self.is_hidden_rank:
-            norm = self.model.pre_fc_norm_hidden
-            self.p_hidden = torch.mm(
-                norm(hidden_states), self.w_hidden.T, out_dtype=torch.float32
-            )
+            # Written by extend_hidden_partial in the extend forward for these rows.
+            self.p_hidden = self.p_extend
         self._launch(
             local_logits,
             topk_index,

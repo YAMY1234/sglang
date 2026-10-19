@@ -427,14 +427,26 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 )
             if self._mkd is not None and self._mkd.armed:
                 self._mkd.hidden_partial(hidden_states)
+            # The draft extend's hidden-half partial for its exchange, beside the lm_head.
+            extend_partial = (
+                self._mkd is not None
+                and self._mkd.extend_partial_in_graph
+                and forward_batch.forward_mode.is_draft_extend_v2()
+                and self._mkd.extend_hidden_partial(
+                    hidden_states, forward_batch.spec_info.select_index
+                )
+            )
             # A metadata side branch must rejoin inside this capture even without attention.
             join_metadata()
         finally:
             exit_stack.close()
 
-        return self.logits_processor(
+        logits_output = self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
+        if extend_partial:
+            self._mkd.join_extend_partial()
+        return logits_output
 
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False

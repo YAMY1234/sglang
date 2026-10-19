@@ -108,6 +108,8 @@ class MkdDraftBoundary:
     # One-row draft steps only; rows of the current draft step (set by the vocab exchange).
     max_rows = 1
     rows = 1
+    # The extend's hidden-half partial is computed in exchange_extend, not in the extend graph.
+    extend_partial_in_graph = False
 
     def __init__(self, model, exchange, hot_ids: torch.Tensor) -> None:
         from flashinfer.comm.mnnvl import McastGPUBuffer
