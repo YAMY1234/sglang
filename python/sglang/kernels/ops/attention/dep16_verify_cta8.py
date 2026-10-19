@@ -16,6 +16,7 @@ import torch
 from flashinfer.jit import env as jit_env
 
 from sglang.kernels.jit.utils import cache_once
+from sglang.srt.utils.common import print_info_once
 
 _STOCK_HEADER_SHA256 = (
     "7f2ea5116d4929cfb5350614671c7524da29df49db969f668d2e672bc5c0369c"
@@ -144,6 +145,7 @@ def trtllm_dep16_verify_cta8(
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         )
     module = prepare_dep16_verify_cta8(query.device)
+    print_info_once(f"E2X_VFMHA_CTA8 engaged: target-verify batch={batch}")
     if out is None:
         out = torch.empty_like(query, dtype=torch.bfloat16)
     fd.check_shape_dtype_device(out, query.shape, torch.bfloat16, query.device, "out")
