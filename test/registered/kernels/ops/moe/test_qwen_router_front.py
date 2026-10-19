@@ -227,5 +227,59 @@ def test_router_topk_tables_small(m: int, tile: int, early_trigger: bool) -> Non
     assert small.num_tokens_per_expert.tolist() == counts
 
 
+def test_routed_rt_dispatch_order(monkeypatch) -> None:
+    """The fused MKM engine takes the deferred-finalize calls it covers before the trtllm runner;
+    only ROUTE_PARQ admits calls above the router front, and those skip the fused front."""
+    import contextlib
+    from types import SimpleNamespace
+
+    from sglang.kernels.ops.moe import qwen_router_front as kernels
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe import qwen_router_front as front
+    from sglang.srt.model_executor import runner
+
+    calls = []
+
+    def record(name):
+        def fn(*args, **kwargs):
+            calls.append(name)
+            return "logits", "x_fp4", "x_sf"
+
+        return fn
+
+    monkeypatch.setattr(kernels, "router_gemm_quant", record("front"))
+    monkeypatch.setattr(front, "_logits_and_quant_parallel", record("parq"))
+    monkeypatch.setattr(front, "_forward_mkm_fused", record("mkm"))
+    monkeypatch.setattr(front, "_run_rt_experts", record("runner"))
+    monkeypatch.setattr(front, "_use_shared", lambda *args: False)
+    block = SimpleNamespace(
+        experts=SimpleNamespace(w13_input_scale_quant=torch.ones(())),
+        gate=SimpleNamespace(weight=None),
+    )
+    for m, defer, mkm, expected in (
+        (7, True, True, ["front", "mkm"]),
+        (7, False, True, ["front", "runner"]),
+        (16, True, False, ["front", "runner"]),
+        (56, True, True, ["parq", "runner"]),
+    ):
+        calls.clear()
+        monkeypatch.setattr(front, "_mkm_supported", lambda *args, on=mkm: on)
+        hidden = torch.zeros(m, 8, dtype=torch.bfloat16)
+        front.forward_routed_rt(block, hidden, defer_finalize=defer)
+        assert calls == expected, (m, defer, mkm)
+    # At the ROUTE_TABLES / ROUTE2 defaults the runner keeps FlashInfer's own routing.
+    for m in (1, 16, 56):
+        assert isinstance(front._tables_context(m), contextlib.nullcontext), m
+
+    # Without ROUTE_PARQ, 17..21-token calls stay off this path (MKM_FUSED_M21 takes them).
+    monkeypatch.setattr(runner, "get_is_capture_mode", lambda: True)
+    block = SimpleNamespace(_route_rt_static_ok=True, alt_stream=object())
+    hidden = torch.zeros(17, 8, dtype=torch.bfloat16)
+    with envs.SGLANG_Q35MF_ROUTE_PARQ.override(False):
+        assert not front.supported_rt(block, hidden)
+    with envs.SGLANG_Q35MF_ROUTE_PARQ.override(True):
+        assert front.supported_rt(block, hidden)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
