@@ -203,12 +203,13 @@ class SchedulerInternalStateController:
     def _validate_pf_knob(self, key: str, value: Any) -> None:
         schedule = get_schedule()
         if key == "enable_mixed_chunk":
-            if not isinstance(value, bool) or not schedule.enable_mixed_chunk:
+            # SetInternalStateReq carries numbers only, so the switch arrives as 0 / 1.
+            if value not in (0, 1) or not schedule.enable_mixed_chunk:
                 raise UpdateRejected(
-                    f"{key} takes a bool and needs a --enable-mixed-chunk boot."
+                    f"{key} takes 0 / 1 and needs a --enable-mixed-chunk boot."
                 )
             return
-        if not isinstance(value, int) or value < 0:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise UpdateRejected(f"{key} must be a non-negative int, got {value}.")
         if key == "prefill_decode_interval":
             return
@@ -225,7 +226,7 @@ class SchedulerInternalStateController:
         scheduler = self.scheduler
         if key == "enable_mixed_chunk":
             scheduler.is_mixed_chunk = (
-                value and scheduler.chunked_prefill_size is not None
+                bool(value) and scheduler.chunked_prefill_size is not None
             )
         elif key == "prefill_decode_interval":
             scheduler.prefill_decode_interval = value
