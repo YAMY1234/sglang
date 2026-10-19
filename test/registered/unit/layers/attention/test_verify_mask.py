@@ -1,9 +1,11 @@
 import contextlib
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.attention import trtllm_mha_backend
 from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
 from sglang.srt.layers.attention.verify_mask import (
     VerifyMask,
@@ -183,6 +185,39 @@ class TestHybridAttnBackendHandsOutSelectedChildMask(CustomTestCase):
         backend = _make_hybrid_backend("prefill", _mask(64, is_read=False), None)
 
         self.assertTrue(backend.verify_mask.fits(_MAX_BS))
+
+
+class TestTrtllmMhaVerifyMask(CustomTestCase):
+    """TRT-LLM MHA's target verify reads no tree mask. With the megakernel flag, a
+    topk-1 target declares an unread mask, which builds the chain without one; a
+    tree, a draft runner, or a server without the flag keeps SGLang's default."""
+
+    def _mask(self, *, topk=1, megakernel=True, draft=False):
+        backend = trtllm_mha_backend.TRTLLMHAAttnBackend.__new__(
+            trtllm_mha_backend.TRTLLMHAAttnBackend
+        )
+        backend.__dict__.update(
+            topk=topk,
+            is_draft_runner=draft,
+            skip_prefill=False,
+            max_context_len=_MAX_CONTEXT_LEN,
+            speculative_num_draft_tokens=_DRAFT,
+            device="cpu",
+        )
+        with patch.object(
+            trtllm_mha_backend, "megakernel_enabled", return_value=megakernel
+        ):
+            return backend._unread_verify_mask(_MAX_BS)
+
+    def test_only_a_topk1_target_with_the_flag_declares_an_unread_mask(self):
+        mask = self._mask()
+        self.assertEqual(
+            (mask.mode, mask.is_read, mask.max_bs),
+            (TreeMaskMode.QLEN_ONLY, False, _MAX_BS),
+        )
+        for case in (dict(topk=2), dict(megakernel=False), dict(draft=True)):
+            with self.subTest(**case):
+                self.assertIsNone(self._mask(**case))
 
 
 class TestTreeMaskNumel(CustomTestCase):
