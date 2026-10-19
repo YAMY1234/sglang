@@ -286,10 +286,12 @@ from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
+    PinnedHostRing,
     allocate_distinct_stream,
     is_health_check_generate_req,
     validate_input_length,
 )
+from sglang.srt.megakernels.runtime import megakernel_enabled
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
@@ -675,6 +677,7 @@ class Scheduler(
 
         # Init overlap schedule
         self.init_overlap()
+        self.maybe_init_result_host_ring()
 
         # Init Ngram Embedding
         self.maybe_init_ngram_embedding()
@@ -1698,6 +1701,19 @@ class Scheduler(
 
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
+
+    def maybe_init_result_host_ring(self):
+        """Reused pinned host slots for each overlapped round's result ids, with
+        --enable-nvidia-megakernel; not under CC, whose copies run on a worker
+        thread."""
+        self.result_host_ring = None
+        if (
+            megakernel_enabled()
+            and self.enable_overlap
+            and not self.enable_async_d2h_copy
+        ):
+            # ids are read within two rounds; eight is an arbitrary margin
+            self.result_host_ring = PinnedHostRing(depth=8)
 
     def maybe_init_ngram_embedding(self):
         self.ngram_embedding_manager = (
@@ -4957,6 +4973,7 @@ class Scheduler(
             batch_result.copy_to_cpu,
             return_logprob=batch.return_logprob,
             return_hidden_states=batch.return_hidden_states,
+            host_ring=self.result_host_ring,
         )
         self.copy_stream.wait_stream(self.forward_stream)
         with self.copy_stream_ctx:

@@ -164,9 +164,9 @@ class TestSchedulerReadbackRouting(CustomTestCase):
         self.worker = AsyncD2HCopyWorker(torch.cuda)
         self.addCleanup(self.worker.shutdown)
 
-    def _readback(self, cc: bool, hidden: bool, dspark: bool):
+    def _readback(self, cc: bool, hidden: bool, dspark: bool, ring: bool = False):
         from sglang.srt.managers.scheduler import Scheduler
-        from sglang.srt.managers.utils import GenerationBatchResult
+        from sglang.srt.managers.utils import GenerationBatchResult, PinnedHostRing
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
         forward_stream, copy_stream = torch.cuda.Stream(), torch.cuda.Stream()
@@ -176,9 +176,10 @@ class TestSchedulerReadbackRouting(CustomTestCase):
             copy_stream_ctx=torch.cuda.stream(copy_stream),
             enable_async_d2h_copy=cc,
             async_d2h_worker=self.worker if cc else None,
+            result_host_ring=PinnedHostRing(depth=2) if ring else None,
         )
         # Distinct per case, so a reused host block cannot pass a stale value.
-        value = 7 + cc + hidden + 2 * dspark
+        value = 7 + cc + hidden + 2 * dspark + 4 * ring
         with torch.cuda.stream(forward_stream):
             ids = _late_source(value, numel=1 << 24)  # 128 MiB: the copy takes a while
             logits = SimpleNamespace(
@@ -201,14 +202,15 @@ class TestSchedulerReadbackRouting(CustomTestCase):
 
     def test_readback_lands_after_the_forward(self):
         cases = {
-            "off-inline": (False, False, False),
-            "cc-worker": (True, False, False),
-            "cc-hidden-states-inline": (True, True, False),
-            "cc-dspark-inline": (True, False, True),
+            "off-inline": (False, False, False, False),
+            "off-host-ring": (False, False, False, True),
+            "cc-worker": (True, False, False, False),
+            "cc-hidden-states-inline": (True, True, False, False),
+            "cc-dspark-inline": (True, False, True, False),
         }
-        for name, (cc, hidden, dspark) in cases.items():
+        for name, (cc, hidden, dspark, ring) in cases.items():
             with self.subTest(name):
-                result, hidden_states, value = self._readback(cc, hidden, dspark)
+                result, hidden_states, value = self._readback(cc, hidden, dspark, ring)
                 offloaded = cc and not (hidden or dspark)
                 self.assertEqual(isinstance(result.copy_done, HostCopyDone), offloaded)
                 for host in (result.next_token_ids, hidden_states):
@@ -218,6 +220,20 @@ class TestSchedulerReadbackRouting(CustomTestCase):
                         (host.device.type, host.is_pinned()), ("cpu", not cc)
                     )
                     self.assertTrue(torch.equal(host, torch.full_like(host, value)))
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "pinned host memory requires CUDA")
+class TestPinnedHostRing(CustomTestCase):
+    def test_a_slot_is_rewritten_only_after_depth_copies(self):
+        from sglang.srt.managers.utils import PinnedHostRing
+
+        ring = PinnedHostRing(depth=2)
+        hosts = [ring.copy(torch.full((3,), i, device="cuda")) for i in range(3)]
+        torch.cuda.current_stream().synchronize()
+        self.assertIsNot(hosts[1], hosts[0])
+        self.assertIs(hosts[2], hosts[0])
+        self.assertEqual([h.tolist() for h in hosts[:2]], [[2] * 3, [1] * 3])
+        self.assertTrue(all(h.is_pinned() for h in hosts))
 
 
 if __name__ == "__main__":

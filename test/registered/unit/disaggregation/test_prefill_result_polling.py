@@ -171,6 +171,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.enable_staging = False
         self.enable_overlap = True
         self.enable_async_d2h_copy = False
+        self.result_host_ring = None
         self.enable_overlap_mlx = False
         self.disagg_prefill_bootstrap_queue = SimpleNamespace(
             pop_bootstrapped=lambda: []

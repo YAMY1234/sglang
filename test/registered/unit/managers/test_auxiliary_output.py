@@ -126,6 +126,50 @@ def test_auxiliary_output_releases_device_holder_after_copy():
     assert result.copy_done.record_count == 1
 
 
+@pytest.mark.parametrize(
+    "case",
+    [
+        "ids only",
+        "logprobs",
+        "hidden states",
+        "sampling mask",
+        "auxiliary output",
+        "routed experts",
+        "indexer top-k",
+        "expert metrics",
+    ],
+)
+def test_result_ids_take_the_host_ring_only_when_nothing_else_is_copied(case):
+    # The scheduler reads the ids within two rounds, before their slots are reused;
+    # every other output stays in fresh host tensors.
+    def only(name, value):
+        return value if case == name else None
+
+    result = GenerationBatchResult(
+        logits_output=LogitsProcessorOutput(
+            next_token_logits=None,
+            hidden_states=only("hidden states", torch.ones(1, 2)),
+            sampling_mask_output=only("sampling mask", Mock()),
+            auxiliary_device_output=only(
+                "auxiliary output", DeviceOutput(torch.ones(1))
+            ),
+        ),
+        next_token_ids=torch.tensor([7]),
+        accept_lens=torch.tensor([2]),
+        routed_experts_output=only("routed experts", Mock()),
+        indexer_topk_output=only("indexer top-k", Mock()),
+        expert_distribution_metrics=only("expert metrics", Mock()),
+        copy_done=CopyDone(),
+    )
+    ring = Mock(copy=Mock(side_effect=lambda tensor: tensor.clone()))
+
+    result.copy_to_cpu(return_logprob=case == "logprobs", host_ring=ring)
+
+    assert ring.copy.call_count == (2 if case == "ids only" else 0)
+    assert (result.next_token_ids.tolist(), result.accept_lens.tolist()) == ([7], [2])
+    assert result.copy_done.record_count == 1
+
+
 def test_sampling_mask_output_uses_generation_result_copy_path():
     sampling_output = SamplingMaskOutput(
         token_ids=torch.tensor([[3, 5]], dtype=torch.int32),
