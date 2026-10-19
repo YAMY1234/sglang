@@ -672,6 +672,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"avail mem={after_mem:.2f} GB.",
             )
 
+    def _note_draft_input(self) -> None:
+        mkd = self._draft_vocab_exchange.mkd if self._exchange_in_draft_steps else None
+        if mkd is not None and mkd.extend_fc:
+            mkd.note_draft_input()
+
     def draft(self, batch: ScheduleBatch, *, with_topology: bool = False):
         draft_input: EagleDraftInput = batch.spec_info
         forward_batch, can_run_decode_cuda_graph, kv_loc_plan = prepare_for_draft(
@@ -698,14 +703,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         if mkd is not None and mkd.extend_fc:
             # A one-row draft's first step reads its fc from fc_buf (MKD extend fc); only the
-            # extend exchange that produced exactly this draft input may have written it.
+            # extend that produced this draft input may have written it.
+            holds = mkd.take_fc_buf()
             if (
-                not forward_batch.forward_mode.is_idle()
+                not holds
+                and not forward_batch.forward_mode.is_idle()
                 and draft_input.topk_index.shape[0] == 1
-                and not mkd.fc_buf_holds(draft_input.topk_index, draft_input.hidden_states)
             ):
                 mkd.fill_fc(draft_input.topk_index, draft_input.hidden_states, forward_batch)
-            mkd.fc_buf_src = None
 
         n_inner = self.speculative_num_steps - 1
         canary_outside_ctx = (
@@ -1034,6 +1039,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             kv_loc_plan: The target prefill's plan; the draft writes the same
                 slots.
         """
+        self._note_draft_input()
         # Construct input_ids
         if not batch.forward_mode.is_idle():
             # Chunked-prefill-aware tail tokens (see PR #26329).
@@ -1169,6 +1175,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         *,
         kv_loc_plan: Optional[KVLocPlan] = None,
     ):
+        self._note_draft_input()
         # Cast to int64 before entering plan stream to avoid cross-stream
         # synchronization issues with .to() inside the plan stream context.
         if batch_result.prepared_draft_extend_inputs is not None:

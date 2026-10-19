@@ -1276,6 +1276,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
             return self._forward_extend_in_graph(
                 layer=layer, mixed_qkv=mixed_qkv, a=a, b=b
             )
+        wait_for_gate_producer = kwargs.get("wait_for_gate_producer", False)
+        verify_pdl = kwargs.get("verify_pdl")
+        if verify_pdl is not None and not is_target_verify:
+            raise ValueError("A verify PDL override requires target verify")
+        if wait_for_gate_producer and not is_target_verify:
+            raise ValueError("A gate producer wait requires target verify")
         forward_metadata = self.forward_metadata
 
         query_start_loc = forward_metadata.query_start_loc
@@ -1328,6 +1334,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 and getattr(mamba_pool, "replayssm_cache_base", None) is not None
                 and not getattr(mamba_pool, "replayssm_is_kda", False)
             )
+            if (wait_for_gate_producer or verify_pdl is not None) and (
+                ssm_states.dtype != torch.bfloat16
+                or use_replayssm_fold
+                or not use_replayssm_spec
+            ):
+                raise ValueError(
+                    "An explicit gate wait or PDL override requires BF16 circular ReplaySSM verify"
+                )
 
         # Page-major envelope: the prefill kernels (CUDA causal_conv1d_fwd,
         # chunk_gated_delta_rule) write state back in place assuming a contiguous
@@ -1480,6 +1494,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     replay_indices=forward_batch.req_pool_indices,
                     query_start_loc=query_start_loc,
                     draft_token_num=forward_batch.spec_info.draft_token_num,
+                    wait_for_gate_producer=wait_for_gate_producer,
+                    **({"verify_pdl": verify_pdl} if verify_pdl is not None else {}),
                 )
             else:
                 # The recurrent fallback needs the per-draft snapshots, which
@@ -1800,6 +1816,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         replay_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         draft_token_num: int,
+        wait_for_gate_producer: bool = False,
+        verify_pdl: Optional[bool] = None,
     ) -> torch.Tensor:
         """ReplaySSM GDN spec-verify (Part B of #28511).
 
@@ -1856,11 +1874,20 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 print_warning_once(
                     "GDN verify tiling is unsupported; using the original path"
                 )
-        if envs.SGLANG_Q35MF_GDN_PDL.get():
+        if (
+            envs.SGLANG_Q35MF_GDN_PDL.get()
+            if verify_pdl is None
+            else verify_pdl
+        ):
             if q.is_cuda and is_arch_support_pdl():
                 verify_options["pdl"] = True
+                verify_options["wait_for_gate_producer"] = True
             else:
-                print_warning_once("GDN verify PDL is unsupported; using the original path")
+                print_warning_once(
+                    "GDN verify PDL is unsupported; using the original path"
+                )
+        if wait_for_gate_producer:
+            verify_options["wait_for_gate_producer"] = True
         gdn_replayssm_spec_decode(
             q=q,
             k=k,

@@ -4,6 +4,8 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Optional, Protocol
 
+import msgspec
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -82,6 +84,51 @@ def record_paged_fp8_call(qlen):
     counts[key] = counts.get(key, 0) + 1
 
 
+Q1_STOCK = "q1_stock"
+Q1_LONG = "q1_long"
+
+
+class Q1GraphVariants(msgspec.Struct, frozen=True):
+    """Draft q1 decode: SKV2-Q1 from a host-only KV length lower bound, trtllm-gen below it."""
+
+    min_length: int
+    capture_labels: ClassVar[tuple[str, ...]] = (Q1_STOCK, Q1_LONG)
+
+    def select(self, forward_batch: ForwardBatch) -> str:
+        if forward_batch.batch_size != 1:
+            return Q1_STOCK
+        length = forward_batch.attention_kv_len_lower_bound
+        if length is None:
+            lengths = forward_batch.seq_lens_cpu
+            if lengths is not None and lengths.device.type == "cpu" and lengths.numel() == 1:
+                length = int(lengths[0])
+        return Q1_LONG if length is not None and length >= self.min_length else Q1_STOCK
+
+
+def create_q1_graph_variants() -> Optional[Q1GraphVariants]:
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_Q35MF_MKA_Q1.get():
+        return Q1GraphVariants(min_length=envs.SGLANG_Q35MF_MKA_Q1_MIN_LENGTH.get())
+    return None
+
+
+def use_q1_attention(forward_batch: ForwardBatch) -> bool:
+    from sglang.srt.environ import envs
+    from sglang.srt.model_executor.runner_utils.capture_mode import (
+        get_capture_attention_variant,
+        get_is_capture_mode,
+    )
+
+    variant = get_capture_attention_variant()
+    if variant is not None:
+        return variant == Q1_LONG
+    if get_is_capture_mode():
+        return False
+    variants = Q1GraphVariants(min_length=envs.SGLANG_Q35MF_MKA_Q1_MIN_LENGTH.get())
+    return variants.select(forward_batch) == Q1_LONG
+
+
 class AttentionGraphVariants(Protocol):
     # Capture order is significant when variants share a graph memory pool.
     capture_labels: ClassVar[tuple[str, ...]]
@@ -95,6 +142,7 @@ class AttentionGraphVariants(Protocol):
 class SplitKVGraphVariants:
     """Keep short sequences on stock attention without a device-to-host copy."""
 
+    min_length: int = SPLIT_KV_MIN_LENGTH
     capture_labels: ClassVar[tuple[str, ...]] = (SPLIT_KV_STOCK, SPLIT_KV_LONG)
 
     def select(self, forward_batch: ForwardBatch) -> str:
@@ -111,9 +159,18 @@ class SplitKVGraphVariants:
                 length = int(lengths[0])
         return (
             SPLIT_KV_LONG
-            if length is not None and length >= SPLIT_KV_MIN_LENGTH
+            if length is not None and length >= self.min_length
             else SPLIT_KV_STOCK
         )
+
+
+def _split_kv_min_length(is_target_verify: bool) -> int:
+    from sglang.srt.environ import envs
+
+    # SKV2 may also take target verify below 32K; the draft extend keeps the stock threshold.
+    if is_target_verify and envs.SGLANG_Q35MF_MKA_SKV2.get():
+        return envs.SGLANG_Q35MF_MKA_SKV2_VERIFY_MIN_LENGTH.get()
+    return SPLIT_KV_MIN_LENGTH
 
 
 def create_split_kv_graph_variants(
@@ -129,7 +186,9 @@ def create_split_kv_graph_variants(
             or capture_forward_mode.is_draft_extend_v2()
         )
     ):
-        return SplitKVGraphVariants()
+        return SplitKVGraphVariants(
+            min_length=_split_kv_min_length(capture_forward_mode.is_target_verify())
+        )
     return None
 
 
@@ -146,7 +205,10 @@ def use_split_kv_attention(forward_batch: ForwardBatch) -> bool:
         return variant == SPLIT_KV_LONG
     if get_is_capture_mode():
         return False
-    return SplitKVGraphVariants().select(forward_batch) == SPLIT_KV_LONG
+    variants = SplitKVGraphVariants(
+        min_length=_split_kv_min_length(forward_batch.forward_mode.is_target_verify())
+    )
+    return variants.select(forward_batch) == SPLIT_KV_LONG
 
 
 @dataclass(frozen=True)

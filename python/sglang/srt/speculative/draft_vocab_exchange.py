@@ -154,6 +154,7 @@ class DraftVocabExchange:
         mkd = self.mkd
         if mkd is not None:
             mkd.armed = num_rows == 1
+            mkd.step = step
             # The draft loop forwards steps 0 .. num_steps - 2.
             mkd.last_step = step == self.num_steps - 2
             if step == 0:

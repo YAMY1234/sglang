@@ -36,6 +36,7 @@ from sglang.srt.layers.attention.flashinfer_backend import (
 from sglang.srt.layers.attention.graph_variants import (
     record_paged_fp8_call,
     use_paged_fp8_attention,
+    use_q1_attention,
     use_split_kv_attention,
 )
 from sglang.srt.layers.attention.trtllm_mha_decode_groups import (
@@ -360,10 +361,24 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.forward_metadata: Optional[TRTLLMMHAMetadata] = None
         self._split_kv_enabled = envs.SGLANG_Q35MF_ATTN_SPLIT_KV.get()
         self._split_kv_scratch = {}
+        self._skv2_enabled = (
+            envs.SGLANG_Q35MF_MKA_SKV2.get()
+            and torch.cuda.get_device_capability()[0] == 10
+        )
+        self._skv2_plans = {}
         self._paged_fp8_enabled = envs.SGLANG_Q35MF_LL1_K1B.get()
         if self._paged_fp8_enabled:
             self._paged_fp8_enabled = torch.cuda.get_device_capability()[0] == 10
         self._paged_fp8_plans = {}
+        # SKV2-Q1 reproduces trtllm-gen's one-CTA-per-SM KV split, which it only uses when
+        # max_context_len spans at least that many 256-token steps.
+        self._q1_enabled = (
+            envs.SGLANG_Q35MF_MKA_Q1.get()
+            and torch.cuda.get_device_capability()[0] == 10
+            and -(-self.max_context_len // 256)
+            >= torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+        )
+        self._q1_plans = {}
 
         # Init backend (XQA or TRTLLM-GEN)
         # We need to specify q_type and out_type for different backend
@@ -1386,6 +1401,61 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         assert self.is_nvfp4_kvcache
         return self.kv_cache_quant_method.get_bmm_scales(layer.layer_id)
 
+    def _run_skv2(self, query, kv_cache, block_tables, seq_lens, *, out, qk_scale, v_scale):
+        from sglang.kernels.ops.attention.skv2_split_kv import (
+            StockSplitPlan,
+            skv2_split_kv,
+        )
+
+        key = (
+            query.shape,
+            kv_cache[0].shape,
+            block_tables.shape,
+            block_tables.stride(),
+            seq_lens.shape,
+        )
+        plan = self._skv2_plans.get(key)
+        if plan is None:
+            # Compiles the producer; graph warmup runs this eagerly before capture.
+            plan = StockSplitPlan(query, kv_cache, block_tables, seq_lens)
+            self._skv2_plans[key] = plan
+        return skv2_split_kv(
+            query,
+            kv_cache,
+            block_tables,
+            seq_lens,
+            plan,
+            qk_scale=qk_scale,
+            v_scale=v_scale,
+            out=out,
+        )
+
+    def _run_q1(self, query, kv_cache, block_tables, seq_lens, *, out, qk_scale, v_scale):
+        from sglang.kernels.ops.attention.skv2_q1 import Q1SplitPlan, skv2_q1_decode
+
+        key = (
+            query.shape,
+            kv_cache[0].shape,
+            block_tables.shape,
+            block_tables.stride(),
+            seq_lens.shape,
+        )
+        plan = self._q1_plans.get(key)
+        if plan is None:
+            # Compiles the producer; graph warmup runs this eagerly before capture.
+            plan = Q1SplitPlan(query, kv_cache, block_tables, seq_lens)
+            self._q1_plans[key] = plan
+        return skv2_q1_decode(
+            query,
+            kv_cache,
+            block_tables,
+            seq_lens,
+            plan,
+            qk_scale=qk_scale,
+            v_scale=v_scale,
+            out=out,
+        )
+
     def _run_fixed_q_len_decode(
         self,
         query: torch.Tensor,
@@ -1404,6 +1474,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         mask: Optional[torch.Tensor] = None,
         use_split_kv: bool = True,
         use_paged_fp8: bool = False,
+        use_skv2: bool = False,
+        use_q1: bool = False,
     ) -> torch.Tensor:
         """Run decode, optionally sorting and splitting requests by KV length."""
 
@@ -1412,6 +1484,40 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             if out_dtype is not None
             else (out.dtype if out is not None else self.q_data_type)
         )
+
+        if self._q1_enabled and use_q1:
+            supported = (
+                not self.is_xqa_impl
+                and get_parallel().attn_dcp_size == 1
+                and self.page_size == 64
+                and q_len_per_req == 1
+                and seq_lens.numel() == 1
+                and query.shape == (1, query.shape[-2], 256)
+                and query.shape[-2] in (4, 8)
+                and query.dtype == torch.float8_e4m3fn
+                and query.is_contiguous()
+                and isinstance(kv_cache, tuple) and len(kv_cache) == 2
+                and all(x.dtype == query.dtype and x.ndim == 4
+                        and x.shape[1:] == (1, 64, 256) and x.is_contiguous()
+                        for x in kv_cache)
+                and resolved_out_dtype == torch.bfloat16
+                and (out is None or (out.is_contiguous() and out.shape == query.shape
+                                     and out.dtype == resolved_out_dtype))
+                and isinstance(bmm1_scale, (int, float))
+                # Where trtllm-gen applies bmm2_scale relative to its bf16 partials is not pinned down.
+                and isinstance(bmm2_scale, (int, float)) and bmm2_scale == 1.0
+                and window_left < 0 and sinks is None and mask is None
+                and kv_cache_sf is None
+                and envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get() in (None, 0.0)
+            )
+            if supported:
+                if out is None:
+                    out = torch.empty_like(query, dtype=resolved_out_dtype)
+                return self._run_q1(query, kv_cache, block_tables, seq_lens, out=out,
+                                    qk_scale=float(bmm1_scale), v_scale=float(bmm2_scale))
+            logger.warning_once(
+                "SKV2-Q1 is unsupported for this configuration; using trtllm-gen."
+            )
 
         if self._paged_fp8_enabled and use_paged_fp8:
             supported = (
@@ -1503,13 +1609,23 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     split_kv_verify,
                 )
 
+                if out is None:
+                    out = torch.empty_like(query, dtype=resolved_out_dtype)
+                if use_skv2 and all(value.is_contiguous() for value in kv_cache):
+                    return self._run_skv2(
+                        query,
+                        kv_cache,
+                        block_tables,
+                        seq_lens,
+                        out=out,
+                        qk_scale=float(bmm1_scale),
+                        v_scale=float(bmm2_scale),
+                    )
                 key = (query.shape[-2], q_len_per_req)
                 scratch = self._split_kv_scratch.get(key)
                 if scratch is None:
                     scratch = allocate_scratch(query, 1, 148, q_len_per_req)
                     self._split_kv_scratch[key] = scratch
-                if out is None:
-                    out = torch.empty_like(query, dtype=resolved_out_dtype)
                 return split_kv_verify(
                     query,
                     kv_cache,
@@ -1733,6 +1849,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 and envs.SGLANG_Q35MF_LL1_K1B_DRAFT.get()
                 and use_paged_fp8_attention(forward_batch)
             ),
+            use_q1=self._q1_enabled and use_q1_attention(forward_batch),
         )
         if self.decode_uses_native_fp4 and not self.is_xqa_impl:
             o = self._finalize_nvfp4_output(o, forward_batch)
@@ -1927,6 +2044,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     mask=mask,
                     use_split_kv=(
                         self._split_kv_enabled and use_split_kv_attention(forward_batch)
+                    ),
+                    use_skv2=(
+                        self._skv2_enabled
+                        and (
+                            forward_batch.forward_mode.is_target_verify()
+                            or envs.SGLANG_Q35MF_MKA_SKV2_DRAFT.get()
+                        )
                     ),
                     use_paged_fp8=(
                         self._paged_fp8_enabled

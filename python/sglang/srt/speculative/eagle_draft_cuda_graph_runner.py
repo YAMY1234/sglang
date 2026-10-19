@@ -12,7 +12,7 @@ from sglang.kernels.ops.memory.small_field_copy import (
 )
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.graph_variants import PagedFP8GraphVariants
+from sglang.srt.layers.attention.graph_variants import PagedFP8GraphVariants, create_q1_graph_variants
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     deployment_attn_dp_size,
@@ -154,7 +154,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         self.attention_graph_variants = (
             PagedFP8GraphVariants()
             if envs.SGLANG_Q35MF_LL1_K1B.get() and envs.SGLANG_Q35MF_LL1_K1B_DRAFT.get()
-            else None
+            else create_q1_graph_variants()
         )
         self.is_dllm = False
 

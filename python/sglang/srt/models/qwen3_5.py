@@ -252,6 +252,12 @@ def _layer_fusions(config: Qwen3_5TextConfig, is_nextn: bool):
         from sglang.srt.layers.layer_boundary.fusions.cutedsl import CuteDSLFusion
 
         return CuteDSLFusion()
+    if is_nextn and _is_cuda and envs.SGLANG_Q35MF_MKD_HOP.get():
+        from sglang.srt.layers.layer_boundary.fusions.q35_draft_hop import (
+            DraftHopFusion,
+        )
+
+        return DraftHopFusion()
     return None
 
 
@@ -533,6 +539,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             and get_parallel().pp_size == 1
         )
         self._fused_verify_buffers = None
+        self._middle_verify_enabled = (
+            _is_cuda
+            and envs.SGLANG_Q35MF_MKG_TP4_MIDDLE.get()
+            and self.attn_tp_size == 4
+            and get_parallel().pp_size == 1
+        )
+        self._middle_verify_buffers = None
         if self._fused_verify_enabled:
             from sglang.kernels.ops.attention.gdn_pdl_front import ensure_built
 
@@ -990,6 +1003,91 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         output, _ = self.out_proj(core_attn_out)
         return output
 
+    def _middle_verify_backend(
+        self, hidden_states, projected_states_qkvz, projected_states_ba, forward_batch
+    ):
+        """Select the stock-front verify path with an early gated-norm tail."""
+        if (
+            not forward_batch.forward_mode.is_target_verify()
+            or not isinstance(hidden_states, torch.Tensor)
+            or hidden_states.dtype != torch.bfloat16
+            or hidden_states.shape != (7, 4096)
+            or not isinstance(projected_states_qkvz, torch.Tensor)
+            or projected_states_qkvz.dtype != torch.bfloat16
+            or projected_states_qkvz.shape != (7, 5120)
+            or not isinstance(projected_states_ba, torch.Tensor)
+            or projected_states_ba.dtype != torch.bfloat16
+            or projected_states_ba.shape != (7, 32)
+            or (self.attn.num_k_heads, self.attn.num_v_heads) != (4, 16)
+            or (self.head_k_dim, self.head_v_dim) != (128, 128)
+            or self.conv_kernel_size != 4
+            or self.activation not in ("silu", "swish")
+            or self.norm.activation not in ("silu", "swish")
+            or not self.norm.norm_before_gate
+            or self.norm.bias is not None
+            or self.norm.group_size is not None
+            or self.attn.bias is not None
+            or forward_batch.spec_info.draft_token_num != 7
+            or forward_batch.spec_info.ragged_verify_layout is not None
+            or not envs.SGLANG_Q35MF_GDN_VIEWS.get()
+            or not envs.SGLANG_Q35MF_GDN_CONV_TILE.get()
+            or not envs.SGLANG_Q35MF_GDN_NORM_FP8.get()
+        ):
+            return None
+
+        from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+        from sglang.srt.layers.quantization.modelopt_quant import (
+            ModelOptFp8LinearMethod,
+        )
+        from sglang.srt.mem_cache.memory_pool import MambaPool
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        backend = get_attn_backend()
+        backend = getattr(backend, "linear_attn_backend", backend)
+        if not isinstance(backend, GDNAttnBackend) or backend.mis_metadata is not None:
+            return None
+        if _gdn_decode_fused_proj_conv and getattr(backend, "supports_packed_verify", False):
+            return None
+        metadata = backend.forward_metadata
+        if (
+            metadata.query_start_loc.numel() != 2
+            or metadata.retrieve_next_token is not None
+            or metadata.retrieve_next_sibling is not None
+            or metadata.retrieve_parent_token is not None
+        ):
+            return None
+        cache = backend.req_to_token_pool.mamba2_layer_cache(self.layer_id)
+        pool = backend.req_to_token_pool.mamba_pool
+        if (
+            not isinstance(cache, MambaPool.SpeculativeState)
+            or cache.temporal.dtype != torch.bfloat16
+            or cache.replayssm_d is None
+            or cache.replayssm_d.shape[-2] != 16
+            or getattr(pool, "replayssm_cache_base", None) is None
+            or getattr(pool, "replayssm_spec_fold", False)
+            or getattr(pool, "replayssm_is_kda", False)
+        ):
+            return None
+        method = self.out_proj.quant_method
+        if (
+            not isinstance(method, ModelOptFp8LinearMethod)
+            or method.use_marlin
+            or method.use_sm120_fp8
+            or self.out_proj.input_scale.numel() != 1
+            or self.out_proj.input_scale.dtype != torch.float32
+        ):
+            return None
+        if self._middle_verify_buffers is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("GDN gated norm must be prepared before capture")
+            self._middle_verify_buffers = (
+                torch.empty(
+                    (112, 128), device=hidden_states.device, dtype=torch.float8_e4m3fn
+                ),
+                torch.empty((112,), device=hidden_states.device, dtype=torch.float32),
+            )
+        return backend
+
     def _try_fused_verify(self, hidden_states, forward_batch):
         """Use the clustered projection/Conv1D path for its supported layout."""
         if (
@@ -1034,6 +1132,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             return None
         cache = backend.req_to_token_pool.mamba2_layer_cache(self.layer_id)
         if not isinstance(cache, MambaPool.SpeculativeState):
+            return None
+        mamba_pool = backend.req_to_token_pool.mamba_pool
+        if (
+            cache.temporal.dtype != torch.bfloat16
+            or cache.replayssm_d is None
+            or getattr(mamba_pool, "replayssm_cache_base", None) is None
+            or getattr(mamba_pool, "replayssm_spec_fold", False)
+            or getattr(mamba_pool, "replayssm_is_kda", False)
+        ):
             return None
         windows = cache.intermediate_conv_window[0]
         if (
@@ -1128,6 +1235,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             a=None,
             b=None,
             projection_conv=projection_conv,
+            wait_for_gate_producer=True,
         )
         if not buffers["checked"]:
             if torch.cuda.is_current_stream_capturing():
@@ -1174,6 +1282,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 return fused_output
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
             hidden_states
+        )
+        middle_backend = (
+            self._middle_verify_backend(
+                hidden_states, projected_states_qkvz, projected_states_ba, forward_batch
+            )
+            if self._middle_verify_enabled
+            else None
         )
 
         if _is_xpu and get_exec().mamba.linear_attn_backend == "intel_xpu":
@@ -1249,12 +1364,23 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
             mixed_qkv = torch.cat((query, key, value), dim=-1)
 
-        attn_result = self.attn(
-            forward_batch,
-            mixed_qkv=mixed_qkv,
-            a=a,
-            b=b,
-        )
+        if middle_backend is not None:
+            attn_result = middle_backend.forward_extend(
+                layer=self.attn,
+                forward_batch=forward_batch,
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+                verify_pdl=True,
+                wait_for_gate_producer=True,
+            )
+        else:
+            attn_result = self.attn(
+                forward_batch,
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+            )
         if use_fused_proj_conv:
             if not isinstance(attn_result, tuple) or len(attn_result) != 2:
                 raise RuntimeError(
@@ -1281,6 +1407,30 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out = core_attn_out_pad
 
         nv = self.num_v_heads // self.attn_tp_size
+        if middle_backend is not None:
+            from sglang.kernels.ops.attention.gdn_pdl_norm import norm
+
+            quant, rstd = self._middle_verify_buffers
+            norm(
+                core_attn_out,
+                z,
+                self.norm.weight,
+                self.out_proj.input_scale,
+                quant,
+                rstd,
+                self.norm.eps,
+            )
+            x_fp8 = quant.view(7, 2048)
+            # With the MKH out-projection push active, this early return must feed the hop mailbox too.
+            hop = self._q35_push_hop(7)
+            if hop is not None:
+                return hop.out_proj_push(
+                    x_fp8=x_fp8,
+                    packed_w=self.out_proj.q35_packed,
+                    input_scale=self.out_proj.input_scale,
+                    weight_scale=self.out_proj.weight_scale,
+                )
+            return self.out_proj(x_fp8)[0]
         if (
             _is_cuda
             and forward_batch.forward_mode.is_target_verify()
@@ -1942,6 +2092,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         # Same allocation as RowParallelLinear's output, which the layer boundary all-reduces.
         with use_symmetric_memory(get_parallel().tp_group, disabled=not is_allocation_symmetric()):
             out = torch.empty((m, self.hidden_size), dtype=torch.bfloat16, device=device)
+        hop = self._mka_push_hop(m)
         mka_fused.epilogue(
             attn=attn_output,
             gate=gate,
@@ -1950,8 +2101,19 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             sw=self.o_proj.weight_scale,
             out=out,
             nq=self.num_heads,
+            site=None if hop is None else hop.site_fields(),
         )
+        if hop is not None:
+            hop.mark_pushed(out)
         return out
+
+    def _mka_push_hop(self, m: int):
+        if not (envs.SGLANG_Q35MF_MKA_PUSH.get() and envs.SGLANG_Q35MF_MKH_HOP.get()):
+            return None
+        from sglang.srt.layers.q35_hop import active
+
+        hop = active()
+        return hop if hop is not None and hop.supports(m) else None
 
     def self_attention(
         self,
@@ -2217,8 +2379,31 @@ class Qwen3_5ForCausalLM(nn.Module):
             self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
+        # The adapter the final norm hands a deferred terminal output to.
+        self._final_norm_handoff = self.flashinfer_mnnvl_cutedsl_fusion
+        # The draft layer's step hops (SGLANG_Q35MF_MKD_HOP), or None.
+        self.draft_hop = None
+        if is_nextn and self.pp_group.is_last_rank:
+            self._install_draft_hop()
 
         self.layers_to_capture = []
+
+    def _install_draft_hop(self) -> None:
+        from sglang.srt.layers.layer_boundary.fusions.q35_draft_hop import (
+            DraftHopFusion,
+        )
+
+        last = self.layers[self.end_layer - 1]
+        fusion = last.ffn_boundary.fusions
+        if not isinstance(fusion, DraftHopFusion) or not isinstance(
+            last.mlp, Qwen2MoeSparseMoeBlock
+        ):
+            return
+        fusion.final_norm = self.norm
+        fusion.moe_ready = last.mlp.single_token_draft_ready
+        fusion.moe_single_launch = last.mlp.single_token_draft_single_launch
+        self._final_norm_handoff = fusion
+        self.draft_hop = fusion
 
     def _build_embed_tokens(self, config: Qwen3_5TextConfig) -> nn.Module:
         """Embedding sharding hook for models reusing this backbone."""
@@ -2332,7 +2517,7 @@ class Qwen3_5ForCausalLM(nn.Module):
             hidden_states,
             forward_batch,
             self.norm,
-            finalize_norm=self.flashinfer_mnnvl_cutedsl_fusion,
+            finalize_norm=self._final_norm_handoff,
             skip_empty=True,
         )
 

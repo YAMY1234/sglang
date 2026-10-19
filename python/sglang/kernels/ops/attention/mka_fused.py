@@ -19,17 +19,20 @@ def _ext():
 
                 major, minor = torch.cuda.get_device_capability()
                 source = Path(__file__).with_suffix(".cu")
-                # Every overlay tree mounts at the same path, so a name without the source digest
-                # can reuse another tree's cached build whose objects are newer than this source.
-                digest = hashlib.sha256(source.read_bytes()).hexdigest()[:12]
+                include = Path(__file__).resolve().parents[2] / "jit" / "include"
+                hop_header = include / "sgl_kernel" / "distributed" / "q35_hop.cuh"
+                # Every overlay tree mounts at the same path, so a name without the digest of the source
+                # and its hop header can reuse another tree's cached build whose objects are newer.
+                digest = hashlib.sha256(source.read_bytes() + hop_header.read_bytes()).hexdigest()[:12]
                 _EXT = load(
                     name=f"sglang_q35mf_mka_fused_{digest}",
                     sources=[str(source)],
                     extra_cuda_cflags=[
                         "-O3",
                         "--std=c++17",
-                        f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}",
+                        f"-gencode=arch=compute_{major}{minor}a,code=sm_{major}{minor}a",
                     ],
+                    extra_include_paths=[str(include)],
                     verbose=False,
                 )
     return _EXT
@@ -91,5 +94,6 @@ def prologue(
     )
 
 
-def epilogue(attn, gate, w_packed, sx, sw, out, nq: int):
-    _ext().epilogue(attn, gate, w_packed, sx, sw, out, nq, True)
+def epilogue(attn, gate, w_packed, sx, sw, out, nq: int, site: list[int] | None = None):
+    """site: [mc, uc, ctrl, rank, world, m_cap, timeout_ns] of the q35 hop workspace to push into."""
+    _ext().epilogue(attn, gate, w_packed, sx, sw, out, nq, True, site or [])

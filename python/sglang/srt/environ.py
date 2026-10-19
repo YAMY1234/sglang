@@ -595,7 +595,7 @@ class Envs:
     # MB of the draft lm_head shard prefetched into L2 while single-token draft steps wait on
     # the all-reduce after the MoE (0 = off); a cache hint, values unchanged.
     SGLANG_Q35MF_MKD_L2PF_MB = EnvInt(0)
-    # MB of the draft qkv projection weight prefetched into L2 by the draft-step exchange (0 = off).
+    # MB of the draft qkv projection weight prefetched into L2 beside the draft-step exchange (0 = off).
     SGLANG_Q35MF_MKD_L2PF_QKV_MB = EnvInt(0)
     # Diagnostic: the draft-step exchange stamps per-phase %globaltimer into pinned host memory
     # and a thread logs percentiles every 20 s (slows the kernel; never in a timed run).
@@ -603,6 +603,27 @@ class Envs:
     # With SGLANG_Q35MF_MKD_TTABLE: the draft extend's exchange also finishes the fc of the next
     # draft's first step, which then skips its embedding and fc (stock fill when no extend ran).
     SGLANG_Q35MF_MKD_EXTEND_FC = EnvBool(False)
+    # With SGLANG_Q35MF_MKD_XCHG: one-row draft steps compute the draft lm_head with mkd_draft_head
+    # (fp32 accumulation, bf16 logits; only the summation order differs from the served GEMM) and
+    # the exchange reads its per-CTA maxima instead of scanning the logits.
+    SGLANG_Q35MF_MKD_HEAD = EnvBool(False)
+    # Diagnostic for SGLANG_Q35MF_MKD_HEAD: also run the served GEMM every step and log how often
+    # the argmax differs and by how much the served logits separate the two picks.
+    SGLANG_Q35MF_MKD_HEAD_CHECK = EnvBool(False)
+    # With SGLANG_Q35MF_MKH_HOP: one-row draft steps run the attention-output and MoE-output
+    # all-reduce + residual + norm as q35 hops, bit-identical to the kernels they replace.
+    SGLANG_Q35MF_MKD_HOP = EnvBool(False)
+    # With SGLANG_Q35MF_MKD_HOP: the single-launch draft MoE pushes its output into the hop itself,
+    # so the MoE-output hop only consumes.
+    SGLANG_Q35MF_MKD_HOP_PUSH = EnvBool(False)
+    # With SGLANG_Q35MF_MKD_HOP: the attention-output hop releases the single-launch draft MoE at entry,
+    # so its weight prefetch overlaps the hop.
+    SGLANG_Q35MF_MKD_HOP_EARLY = EnvBool(False)
+    # With SGLANG_Q35MF_MKD_HOP_EARLY: the final hop releases the draft head at entry too (slower at TP8:
+    # the head's one-per-SM CTAs then launch while the draft MoE drains).
+    SGLANG_Q35MF_MKD_HOP_EARLY_HEAD = EnvBool(False)
+    # Diagnostic for SGLANG_Q35MF_MKD_HOP: hold every draft hop's output stores this many ns (delay probe).
+    SGLANG_Q35MF_MKD_HOP_DELAY_NS = EnvInt(0)
 
     # ===================================================================
     # Memory pools and KV-cache sizing
@@ -1068,6 +1089,18 @@ class Envs:
     SGLANG_Q35MF_LL1_K1B_DRAFT = EnvBool(True)
     # Fused full-attention prologue / epilogue kernels for TP8 bs1 MTP verify (Qwen3.5 FP8 projections).
     SGLANG_Q35MF_MKA_FUSED = EnvBool(False)
+    # Warp-specialized split-KV producer with the stock split-KV rounding, used where ATTN_SPLIT_KV runs;
+    # _DRAFT=0 keeps the draft-model extend on the stock kernel.
+    SGLANG_Q35MF_MKA_SKV2 = EnvBool(False)
+    SGLANG_Q35MF_MKA_SKV2_DRAFT = EnvBool(True)
+    # With SGLANG_Q35MF_MKA_FUSED and SGLANG_Q35MF_MKH_HOP: the fused o_proj pushes its partial into the
+    # q35 hop mailbox, so the attention output hop only consumes.
+    SGLANG_Q35MF_MKA_PUSH = EnvBool(False)
+    # KV length from which target verify uses SKV2 (trtllm-gen below); measured crossover 2048 at TP8, 4096 at TP4.
+    SGLANG_Q35MF_MKA_SKV2_VERIFY_MIN_LENGTH = EnvInt(32768)
+    # Draft-model q1 decode with trtllm-gen's KV split and rounding plus a separate merge, from this KV length.
+    SGLANG_Q35MF_MKA_Q1 = EnvBool(False)
+    SGLANG_Q35MF_MKA_Q1_MIN_LENGTH = EnvInt(16384)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
 
     # ===================================================================
@@ -1569,6 +1602,13 @@ class Envs:
     # Prefill batch prep issues its index / scalar writes as stream-ordered GPU ops instead of
     # blocking ones, so the scheduler stops waiting for the in-flight decode round (same values).
     SGLANG_Q35MF_MKH_PREP_NOSYNC = EnvBool(False)
+    # Verify input staging, bit-identical: reuse last round's mamba track indices while their
+    # inputs are unchanged, and skip the replay-time input_ids / positions copies that the
+    # same-stream pre-planned load_batch already made.
+    SGLANG_Q35MF_MKH_N3B = EnvBool(False)
+    # The post-verify graph's per-round input load as one small_field_copy launch that also
+    # reads the injected acceptance length from its pinned host slot (bit-identical).
+    SGLANG_Q35MF_MKH_N3C = EnvBool(False)
 
     # ===================================================================
     # Multimodal processing
@@ -2038,6 +2078,7 @@ class Envs:
     SGLANG_Q35MF_GDN_EMPTY_HISTORY = EnvBool(False)
     SGLANG_Q35MF_GDN_NORM_FP8 = EnvBool(False)
     SGLANG_Q35MF_MKG_FUSED = EnvBool(False)
+    SGLANG_Q35MF_MKG_TP4_MIDDLE = EnvBool(False)
 
     # ===================================================================
     # Plugin system
