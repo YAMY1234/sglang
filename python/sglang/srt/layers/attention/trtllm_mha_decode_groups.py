@@ -111,3 +111,53 @@ def run_planned_groups(
     )
     output_by_request.index_copy_(0, plan.order, sorted_output)
     return output_by_request.view(-1, num_heads, head_dim)
+
+
+def run_planned_concurrent_groups(
+    *,
+    query: torch.Tensor,
+    plan: DecodeGroupPlan,
+    num_splits: int,
+    q_len_per_req: int,
+    out: Optional[torch.Tensor],
+    out_dtype: torch.dtype,
+    streams: tuple[torch.cuda.Stream, ...],
+    run_group: Callable[..., torch.Tensor],
+) -> torch.Tensor:
+    """The same groups and native grids, with a fork/join around their launches.
+
+    Streams and each group's native workspace/counter must already exist.
+    Joining every group before the scatter also bounds the temporary tensors'
+    lifetime on the caller stream, including during CUDA-graph capture.
+    """
+    num_requests = plan.order.shape[0]
+    num_heads, head_dim = query.shape[-2:]
+    query_by_request = query.view(num_requests, q_len_per_req, num_heads, head_dim)
+    sorted_query = query_by_request.index_select(0, plan.order)
+    sorted_output = torch.empty(
+        query_by_request.shape, dtype=out_dtype, device=query.device
+    )
+    origin = torch.cuda.current_stream(query.device)
+    start = 0
+    for group, size in enumerate(group_sizes(num_requests, num_splits)):
+        end = start + size
+        stream = streams[group]
+        stream.wait_stream(origin)
+        with torch.cuda.stream(stream):
+            run_group(
+                sorted_query[start:end].reshape(-1, num_heads, head_dim),
+                plan.block_tables[start:end],
+                plan.seq_lens[start:end],
+                sorted_output[start:end].view(-1, num_heads, head_dim),
+                group,
+            )
+        start = end
+    for stream in streams[:num_splits]:
+        origin.wait_stream(stream)
+    output_by_request = (
+        out.view_as(query_by_request)
+        if out is not None
+        else torch.empty_like(sorted_output)
+    )
+    output_by_request.index_copy_(0, plan.order, sorted_output)
+    return output_by_request.view(-1, num_heads, head_dim)

@@ -583,6 +583,9 @@ class Envs:
     # With the post-verify graph: sample shard-local verify logits inside the graph (the sharded
     # sampler above) instead of gathering them; batches that return logprobs keep the eager chain.
     SGLANG_Q35MF_D2R_PVG_SHARDED = EnvBool(False)
+    # Bound on captured post-verify graph sets (key x verify logits buffer); 0 keeps
+    # max(16, 8 x SGLANG_Q35MF_EDGE_POST_VERIFY_MAX_BS).
+    SGLANG_Q35MF_K4_PVG_MAX_STATES = EnvInt(0)
     # Row-split MTP fc for draft-width batches: each rank multiplies its input-column
     # slice (one normalized half); fp32 partials are gathered and summed in rank order.
     SGLANG_Q35MF_DRAFT_FC_SPLIT = EnvBool(False)
@@ -1341,6 +1344,9 @@ class Envs:
     # With splits above one: sort the requests and gather their block tables and
     # seq lens once per forward instead of in every decode attention call.
     SGLANG_Q35MF_PDDEC_SPLIT_HOIST = EnvBool(False)
+    # With the split hoist and four splits: run the four native length groups
+    # concurrently on their own streams, with private scratch.
+    SGLANG_Q35MF_K4_ATTN_GROUP_STREAMS = EnvBool(False)
     # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
     SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
     # Store DeepSeek-V4 SWA KV directly in FlashInfer's 64-token SM120 page
