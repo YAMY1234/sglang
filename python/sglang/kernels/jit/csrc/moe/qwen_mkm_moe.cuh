@@ -3,8 +3,8 @@
 // hidden 4096, intermediate 128 per rank): DynBlock-exact top-10 from the router logits, FC1, SwiGLU, NVFP4
 // requantization and FC2 in one launch over the trtllm-gen weight layout. Writes the RT deferred-finalize rows
 // (row t * 10 + k, identity permutation) and the expert weights.
-// Device code generated from the MKM lane engine (source md5 974c0ada1b3cec90241d52b262e5463e, PTX helpers md5 b4d0b7dea5606da866a21d8e1a373dd9) by
-// lanes/mkm/tools/export_cuh.py.
+// Device code generated from the engine source (source md5 974c0ada1b3cec90241d52b262e5463e,
+// PTX helpers md5 b4d0b7dea5606da866a21d8e1a373dd9); qwen_mkm_moe.py checks the source md5 against source_md5_lo().
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/utils.h>

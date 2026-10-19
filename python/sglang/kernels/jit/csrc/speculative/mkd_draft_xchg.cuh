@@ -32,8 +32,8 @@ namespace mkd_xchg {
 inline constexpr int kSlots = 3;
 inline constexpr uint32_t kSpinLimit = 1u << 27;
 // Shards of at least this many 16-byte vectors are scanned in 1/kChunks parts and combined
-// through scan_part: the redundant full scan per CTA is instruction-bound (2.8 us at 31,040
-// rows), the combine costs one L2 round trip.
+// through scan_part instead of a full scan per CTA (same keys and ties, so the same token);
+// measured faster in A/B.
 inline constexpr int kSplitScanMinVecs = 2048;
 // Packed partial of a CTA that saw a NaN (no NaN-free packed key reaches it).
 inline constexpr uint32_t kNanPart = 0xffffffffu;

@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 // Modified from FlashInfer 0.7.1 csrc/nv_internal/tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.cu
-// (SGLang Q35MF MIDQ): the combine kernel splits each token row over MIDQ_COMBINE_SPLIT CTAs. Every output
+// Modified by NVIDIA: the combine kernel splits each token row over MIDQ_COMBINE_SPLIT CTAs. Every output
 // element is computed by the same instruction sequence as upstream (same 16-byte vectors, same top-k tree, same
 // cast), so the output is bit-identical; only the CTA that computes a vector changes.
 #ifndef MIDQ_COMBINE_SPLIT

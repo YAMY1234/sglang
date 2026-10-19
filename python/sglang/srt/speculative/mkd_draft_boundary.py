@@ -321,8 +321,8 @@ class MkdDraftBoundary:
         """The one-row draft logits [1, N] bf16 (the exchange then reads the per-CTA maxima)."""
         x = hidden_states.to(torch.bfloat16).contiguous()
         logits = torch.empty(1, lm_head.weight.shape[0], dtype=torch.bfloat16, device=x.device)
-        # Alternate the row walk per draft step: the next step re-reads first what is still in L2
-        # (T1: -1.9 to -2.4 us per call on the TP8 shard).
+        # Alternate the row walk per draft step so the next step first re-reads the rows read last;
+        # measured faster in A/B.
         mkd_draft_head(x, lm_head.weight, logits, self.head_part, reverse=self.step % 2 == 1)
         self.head_used = True
         if self.head_stats is not None:
