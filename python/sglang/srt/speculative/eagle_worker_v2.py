@@ -412,20 +412,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             maybe_share_target_lm_head()
 
     def _init_hot_vocab(self) -> None:
-        path = envs.SGLANG_Q35MF_SPEC_HOT_VOCAB.get()
-        if not path:
-            return
-        if not _is_cuda or self.hot_token_id is not None:
-            logger.warning("Draft hot vocabulary disabled (platform or token map).")
-            return
-        if get_spec().speculative_use_rejection_sampling:
-            logger.warning("Draft hot vocabulary disabled (rejection sampling).")
-            return
-        self._hot_vocab = DraftHotVocab.maybe_create(
-            self.draft_runner.model, path=path, topk=self.topk
-        )
-        if self._hot_vocab is not None:
-            self._hot_token_map = self._hot_vocab.token_ids
+        # No hot-vocabulary draft head: the draft always scores the full vocabulary,
+        # so _hot_vocab and _hot_token_map stay None.
+        return None
 
     def _resolve_shared_embed_and_head(self):
         target_runner = self.target_worker.model_runner

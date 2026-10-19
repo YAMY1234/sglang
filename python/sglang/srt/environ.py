@@ -589,9 +589,6 @@ class Envs:
     # With the fc split, draft steps (1-2 rows) run the pre-fc norm and the slice GEMV
     # as one kernel instead of the norm plus a cuBLAS fp32 GEMM.
     SGLANG_Q35MF_DRAFT_FC_GEMV = EnvBool(False)
-    # Path of a sorted token-id list (torch int64 tensor); the greedy MTP draft then
-    # scores only these vocabulary rows of the shared bf16 lm_head, split across TP ranks.
-    SGLANG_Q35MF_SPEC_HOT_VOCAB = EnvStr(None)
     # With the draft argmax exchange and the fc split: single-token draft steps exchange the
     # candidate row and the hidden-half fc partials in one multicast launch, and each rank
     # finishes the fc from the exchanged data (bitwise equal to the split fc).
