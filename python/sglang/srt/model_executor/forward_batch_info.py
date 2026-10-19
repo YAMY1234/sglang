@@ -1070,9 +1070,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             lora_ids=[req.lora_id for req in batch.reqs],
             rids=[req.rid for req in batch.reqs],
             attention_kv_len_lower_bound=(
-                batch.reqs[0].kv.kv_committed_len
-                if envs.SGLANG_Q35MF_ATTN_SPLIT_KV.get() and len(batch.reqs) == 1
-                else None
+                min(req.kv.kv_committed_len for req in batch.reqs)
+                if envs.SGLANG_Q35MF_LL1_K1B.get() and batch.reqs
+                else (
+                    batch.reqs[0].kv.kv_committed_len
+                    if envs.SGLANG_Q35MF_ATTN_SPLIT_KV.get() and len(batch.reqs) == 1
+                    else None
+                )
             ),
             watermark_prompt_tail_ids=(
                 watermark_state.prompt_tails(batch)

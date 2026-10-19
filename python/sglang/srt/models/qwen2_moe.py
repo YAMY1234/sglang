@@ -765,6 +765,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+        if defer_finalize and qwen_router_front.mkm_wide_supported(self, hidden_states):
+            return qwen_router_front.forward_mkm_wide(self, hidden_states, router_logits)
         topk_output = self.topk(hidden_states, router_logits)
         if defer_finalize:
             if not self.supports_deferred_finalize:

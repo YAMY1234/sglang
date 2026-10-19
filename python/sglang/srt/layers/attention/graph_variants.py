@@ -18,6 +18,70 @@ SPLIT_KV_LONG = "split_kv_long"
 SPLIT_KV_MIN_LENGTH = 32768
 
 
+PAGED_FP8_STOCK = "paged_fp8_stock"
+PAGED_FP8_LONG = "paged_fp8_long"
+PAGED_FP8_MIN_LENGTH = 2049
+
+
+@dataclass(frozen=True)
+class PagedFP8GraphVariants:
+    """Use a host-only lower bound to select the qualified attention graph."""
+
+    capture_labels: ClassVar[tuple[str, ...]] = (PAGED_FP8_STOCK, PAGED_FP8_LONG)
+
+    def select(self, forward_batch: ForwardBatch) -> str:
+        if forward_batch.batch_size != 1:
+            return PAGED_FP8_STOCK
+        length = forward_batch.attention_kv_len_lower_bound
+        if length is None:
+            lengths = forward_batch.seq_lens_cpu
+            if lengths is not None and lengths.device.type == "cpu" and lengths.numel():
+                length = int(lengths.min())
+        return (
+            PAGED_FP8_LONG
+            if length is not None and length >= PAGED_FP8_MIN_LENGTH
+            else PAGED_FP8_STOCK
+        )
+
+
+def create_paged_fp8_graph_variants(capture_forward_mode, captured_req_width, *, enabled=True):
+    from sglang.srt.environ import envs
+
+    if enabled and envs.SGLANG_Q35MF_LL1_K1B.get() and captured_req_width in (1, 7):
+        if (capture_forward_mode.is_decode_or_idle()
+            or capture_forward_mode.is_target_verify()
+            or capture_forward_mode.is_draft_extend_v2()):
+            return PagedFP8GraphVariants()
+    return None
+
+
+def use_paged_fp8_attention(forward_batch: ForwardBatch) -> bool:
+    from sglang.srt.model_executor.runner_utils.capture_mode import (
+        get_capture_attention_variant,
+        get_is_capture_mode,
+    )
+
+    variant = get_capture_attention_variant()
+    if variant is not None:
+        return variant == PAGED_FP8_LONG
+    if get_is_capture_mode():
+        return False
+    return PagedFP8GraphVariants().select(forward_batch) == PAGED_FP8_LONG
+
+
+def paged_fp8_engagement():
+    """Host-only operator/captured-graph replay counters for qualification."""
+    from sglang.srt.runtime_context import get_buffer
+
+    return get_buffer("paged_fp8_engagement", lambda: {"calls": {}, "replays": {}})
+
+
+def record_paged_fp8_call(qlen):
+    counts = paged_fp8_engagement()["calls"]
+    key = f"q{qlen}"
+    counts[key] = counts.get(key, 0) + 1
+
+
 class AttentionGraphVariants(Protocol):
     # Capture order is significant when variants share a graph memory pool.
     capture_labels: ClassVar[tuple[str, ...]]
@@ -77,6 +141,8 @@ def use_split_kv_attention(forward_batch: ForwardBatch) -> bool:
 
     variant = get_capture_attention_variant()
     if variant is not None:
+        if variant in (PAGED_FP8_STOCK, PAGED_FP8_LONG):
+            return False
         return variant == SPLIT_KV_LONG
     if get_is_capture_mode():
         return False

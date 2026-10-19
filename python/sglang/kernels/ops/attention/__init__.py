@@ -408,3 +408,45 @@ for _fn in ("fp4_index_logits_paged", "finish_paged_indexer_topk"):
         )
     )
 del _fn
+
+
+register_kernel(
+    KernelSpec(
+        op="attention.paged_fp8_decode",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.attention.paged_fp8_tcgen:paged_fp8_decode",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))}),
+        format_signature=FormatSignature(
+            supported_dtypes=("float8_e4m3fn",),
+            description="Single-request q1/q7, Q4/Q8, KV1, D256, page64 FP8 attention.",
+        ),
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="attention.gdn_pdl_front",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.gdn_pdl_front:front",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(9, 0))}),
+        format_signature=FormatSignature(
+            supported_dtypes=("bfloat16", "float8_e4m3fn"),
+            in_place=True,
+            description="Seven-token FP8 projection with BF16 rolling convolution and deduplicated windows.",
+        ),
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="attention.gdn_pdl_norm",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.gdn_pdl_norm:norm",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(9, 0))}),
+        format_signature=FormatSignature(
+            supported_dtypes=("bfloat16",),
+            in_place=True,
+            description="Gated RMS normalization with BF16 rounding and static FP8 output.",
+        ),
+    )
+)

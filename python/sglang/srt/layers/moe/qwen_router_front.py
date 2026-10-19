@@ -30,6 +30,7 @@ keeps the stock path.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
@@ -38,6 +39,8 @@ from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
+
+logger = logging.getLogger(__name__)
 
 _HIDDEN = 4096
 _NUM_EXPERTS = 512
@@ -208,6 +211,140 @@ def shared_expert_tail(mlp, gate_up: torch.Tensor) -> torch.Tensor:
     return x
 
 
+_MKM_MAX_TOKENS = 7
+_MKM_M16_MAX_TOKENS = 16  # SGLANG_Q35MF_MKM_FUSED_M16, TP4 (intermediate 256) only
+_MKM_M21_MAX_TOKENS = 21  # SGLANG_Q35MF_MKM_FUSED_M21, TP4 (intermediate 256) only
+_MKM_INTERMEDIATES = (128, 256)  # per rank: TP8, TP4
+# Keyed by id(block): blocks live for the whole process.
+_mkm_static_by_block: dict[int, bool] = {}
+_mkm_expanded_idx_by_device: dict[torch.device, torch.Tensor] = {}
+_mkm_engaged: set[tuple[int, int]] = set()
+
+
+def _mkm_static_supported(block: "Qwen2MoeSparseMoeBlock") -> bool:
+    """The fused engine's fixed shapes: TP8 or TP4 Qwen3.5 NVFP4 on the trtllm-gen weight layout, no EP."""
+    from sglang.srt.layers.moe.utils import RoutingMethodType
+
+    experts = block.experts
+    cfg = block.topk.topk_config
+    runner_config = experts.moe_runner_config
+    expert_scales = (experts.g1_alphas, experts.g1_scale_c, experts.g2_alphas)
+    inter = experts.intermediate_size_per_partition
+    return (
+        experts.num_experts == _NUM_EXPERTS
+        and experts.num_local_experts == _NUM_EXPERTS
+        and experts.moe_ep_rank == 0
+        and inter in _MKM_INTERMEDIATES
+        and experts.top_k == _TOP_K
+        and cfg.top_k == _TOP_K
+        and cfg.renormalize
+        and cfg.scoring_func == "softmax"
+        and cfg.correction_bias is None
+        and not cfg.use_grouped_topk
+        and cfg.num_fused_shared_experts == 0
+        and experts.routing_method_type == RoutingMethodType.RenormalizeNaive
+        and runner_config.activation == "silu"
+        and runner_config.is_gated
+        and runner_config.routed_scaling_factor in (None, 1.0)
+        and runner_config.gemm1_alpha is None
+        and runner_config.gemm1_clamp_limit is None
+        and runner_config.swiglu_limit is None
+        and experts.w13_weight.dtype == torch.uint8
+        and tuple(experts.w13_weight.shape) == (_NUM_EXPERTS, 2 * inter, _HIDDEN // 2)
+        and experts.w2_weight.dtype == torch.uint8
+        and tuple(experts.w2_weight.shape) == (_NUM_EXPERTS, _HIDDEN, inter // 2)
+        and experts.w13_weight_scale.dtype == torch.float8_e4m3fn
+        and tuple(experts.w13_weight_scale.shape) == (_NUM_EXPERTS, 2 * inter, _HIDDEN // 16)
+        and experts.w2_weight_scale.dtype == torch.float8_e4m3fn
+        and tuple(experts.w2_weight_scale.shape) == (_NUM_EXPERTS, _HIDDEN, inter // 16)
+        and all(t.dtype == torch.float32 and tuple(t.shape) == (_NUM_EXPERTS,) for t in expert_scales)
+    )
+
+
+def _mkm_supported(block: "Qwen2MoeSparseMoeBlock", m: int) -> bool:
+    """SGLANG_Q35MF_MKM_FUSED and a call the fused engine covers; the static part is evaluated once per block."""
+    if not envs.SGLANG_Q35MF_MKM_FUSED.get() or m > _MKM_M21_MAX_TOKENS:
+        return False
+    if m > _MKM_MAX_TOKENS:
+        wide = envs.SGLANG_Q35MF_MKM_FUSED_M16 if m <= _MKM_M16_MAX_TOKENS else envs.SGLANG_Q35MF_MKM_FUSED_M21
+        if not (wide.get() and block.experts.intermediate_size_per_partition == 256):
+            return False
+    ok = _mkm_static_by_block.get(id(block))
+    if ok is None:
+        ok = _mkm_static_by_block[id(block)] = _mkm_static_supported(block)
+    return ok
+
+
+def _forward_mkm_fused(
+    block: "Qwen2MoeSparseMoeBlock",
+    *,
+    logits: torch.Tensor,
+    x_fp4: torch.Tensor,
+    x_sf: torch.Tensor,
+):
+    """Top-10 routing, FC1, SwiGLU and FC2 in one launch; returns the trtllm deferred-finalize output."""
+    from sglang.kernels.ops.moe.qwen_mkm_moe import mkm_moe
+    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+        FlashInferTrtllmDeferredFinalizeOutput,
+    )
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+
+    experts = block.experts
+    m = logits.shape[0]
+    gemm2_out, expert_weights = mkm_moe(
+        logits,
+        x_fp4,
+        x_sf,
+        experts.w13_weight,
+        experts.w13_weight_scale.view(torch.uint8),
+        experts.w2_weight,
+        experts.w2_weight_scale.view(torch.uint8),
+        experts.g1_alphas,
+        experts.g1_scale_c,
+        experts.g2_alphas,
+    )
+    # gemm2_out row t * 10 + k holds expert k of token t, so the permutation is the identity.
+    expanded_idx = _mkm_expanded_idx_by_device.get(logits.device)
+    if expanded_idx is None:
+        expanded_idx = _mkm_expanded_idx_by_device[logits.device] = torch.arange(
+            _MKM_M21_MAX_TOKENS * _TOP_K, dtype=torch.int32, device=logits.device
+        )
+    key = (block.topk.layer_id, m)
+    if key not in _mkm_engaged:
+        _mkm_engaged.add(key)
+        logger.info("SGLANG_Q35MF_MKM_FUSED engaged: layer %s, %d tokens", key[0], m)
+    deferred = FlashInferTrtllmDeferredFinalizeOutput(
+        gemm2_out=gemm2_out,
+        expert_weights=expert_weights,
+        expanded_idx_to_permuted_idx=expanded_idx[: m * _TOP_K],
+        top_k=_TOP_K,
+    )
+    return experts.dispatcher.combine(combine_input=StandardCombineInput(hidden_states=deferred))
+
+
+def mkm_wide_supported(block: "Qwen2MoeSparseMoeBlock", hidden_states: torch.Tensor) -> bool:
+    """A 17..21-token call, past the router front, that SGLANG_Q35MF_MKM_FUSED_M21 takes from the block gate's logits."""
+    m = hidden_states.shape[0]
+    return (
+        _MKM_M16_MAX_TOKENS < m <= _MKM_M21_MAX_TOKENS
+        and hidden_states.dtype == torch.bfloat16
+        and hidden_states.is_contiguous()
+        and block.supports_deferred_finalize
+        # the stock runner quantizes such inputs with quantize_hidden_states_fp4, as forward_mkm_wide does
+        and not block.experts.quant_method.quant_config.use_per_token_activation
+        and block.experts.trtllm_padded_hidden_size is None
+        and _mkm_supported(block, m)
+    )
+
+
+def forward_mkm_wide(block: "Qwen2MoeSparseMoeBlock", hidden_states: torch.Tensor, router_logits: torch.Tensor):
+    """The stock runner's input quantization, then the fused engine (the stock path's inputs, bit for bit)."""
+    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import quantize_hidden_states_fp4
+
+    x_fp4, x_sf = quantize_hidden_states_fp4(hidden_states, block.experts.w13_input_scale_quant)
+    return _forward_mkm_fused(block, logits=router_logits, x_fp4=x_fp4, x_sf=x_sf.view(torch.uint8))
+
+
 def forward_routed_rt(
     block: "Qwen2MoeSparseMoeBlock", hidden_states: torch.Tensor, *, defer_finalize: bool
 ):
@@ -250,6 +387,8 @@ def forward_routed_rt(
         logits, x_fp4, x_sf = router_gemm_quant(
             hidden_states, block.gate.weight, in_scale
         )
+    if defer_finalize and _mkm_supported(block, hidden_states.shape[0]):
+        return _forward_mkm_fused(block, logits=logits, x_fp4=x_fp4, x_sf=x_sf)
     topk_output = block.topk(hidden_states, logits)
     if not TopKOutputChecker.format_is_bypassed(topk_output):
         raise RuntimeError("router_gemm_quant path requires logits-based bypassed TopK")

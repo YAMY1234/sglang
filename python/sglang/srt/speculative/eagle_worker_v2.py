@@ -79,7 +79,9 @@ from sglang.srt.speculative.dp_spec_prefill_coordination import (
     DPSpecPrefillCoordinationPlan,
 )
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
+from sglang.srt.speculative.draft_hot_vocab import DraftHotVocab
 from sglang.srt.speculative.draft_vocab_exchange import DraftVocabExchange
+from sglang.srt.speculative.mkd_draft_boundary import MkdDraftBoundary
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
@@ -145,6 +147,7 @@ _is_cuda = is_cuda()
 _is_musa = is_musa()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
+_BK_EXTEND_ARGMAX = envs.SGLANG_Q35MF_BK_EXTEND_ARGMAX.get()
 
 
 logger = logging.getLogger(__name__)
@@ -194,6 +197,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self._draft_vocab_exchange: Optional[DraftVocabExchange] = None
         self._exchange_in_draft_steps = False
         self._exchange_in_draft_extend = False
+        self._hot_vocab: Optional[DraftHotVocab] = None
+        self._hot_token_map: Optional[torch.Tensor] = None
 
         # Use the same attention topology during draft construction and execution.
         self.draft_owns_attention = (
@@ -245,6 +250,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         self.init_token_map()
         self.init_lm_head()
+        self._init_hot_vocab()
         in_steps = envs.SGLANG_Q35MF_DRAFT_ARGMAX_EXCHANGE.get()
         # The rejection-sampling extend path needs the full draft distribution.
         in_extend = (
@@ -254,7 +260,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         if (in_steps or in_extend) and self.topk == 1 and self.hot_token_id is None:
             self._draft_vocab_exchange = DraftVocabExchange.maybe_create(
-                self.draft_runner.model, self.speculative_num_steps
+                self.draft_runner.model, self.speculative_num_steps, hot=self._hot_vocab
             )
             self._exchange_in_draft_steps = (
                 in_steps and self._draft_vocab_exchange is not None
@@ -262,6 +268,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self._exchange_in_draft_extend = (
                 in_extend and self._draft_vocab_exchange is not None
             )
+            if envs.SGLANG_Q35MF_MKD_XCHG.get() and self._exchange_in_draft_steps:
+                mkd = MkdDraftBoundary.maybe_create(
+                    self.draft_runner.model, self._draft_vocab_exchange, self._hot_vocab
+                )
+                self._draft_vocab_exchange.mkd = mkd
+                self.draft_runner.model._mkd = mkd
 
         if get_spec().speculative_use_rejection_sampling:
             target_vocab_size = self.target_worker.model_config.vocab_size
@@ -383,6 +395,22 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # Share the embedding and lm_head
             self.draft_runner.model.set_embed_and_head(embed, head)
             maybe_share_target_lm_head()
+
+    def _init_hot_vocab(self) -> None:
+        path = envs.SGLANG_Q35MF_SPEC_HOT_VOCAB.get()
+        if not path:
+            return
+        if not _is_cuda or self.hot_token_id is not None:
+            logger.warning("Draft hot vocabulary disabled (platform or token map).")
+            return
+        if get_spec().speculative_use_rejection_sampling:
+            logger.warning("Draft hot vocabulary disabled (rejection sampling).")
+            return
+        self._hot_vocab = DraftHotVocab.maybe_create(
+            self.draft_runner.model, path=path, topk=self.topk
+        )
+        if self._hot_vocab is not None:
+            self._hot_token_map = self._hot_vocab.token_ids
 
     def _resolve_shared_embed_and_head(self):
         target_runner = self.target_worker.model_runner
@@ -665,6 +693,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         ):
             can_run_decode_cuda_graph = False
 
+        mkd = (
+            self._draft_vocab_exchange.mkd if self._exchange_in_draft_steps else None
+        )
+        if mkd is not None and mkd.extend_fc:
+            # A one-row draft's first step reads its fc from fc_buf (MKD extend fc); only the
+            # extend exchange that produced exactly this draft input may have written it.
+            if (
+                not forward_batch.forward_mode.is_idle()
+                and draft_input.topk_index.shape[0] == 1
+                and not mkd.fc_buf_holds(draft_input.topk_index, draft_input.hidden_states)
+            ):
+                mkd.fill_fc(draft_input.topk_index, draft_input.hidden_states, forward_batch)
+            mkd.fc_buf_src = None
+
         n_inner = self.speculative_num_steps - 1
         canary_outside_ctx = (
             c.with_ops_outside_graph(
@@ -789,7 +831,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self._draft_vocab_exchange
             if self._exchange_in_draft_steps
             and draft_tokens_topk1 is not None
-            and topk_index.shape[0] <= DraftVocabExchange.MAX_ROWS
+            and topk_index.shape[0] <= self._draft_vocab_exchange.step_rows
             else None
         )
 
@@ -879,6 +921,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                             forward_batch.positions,
                             draft_tokens_topk1,
                             i + 1,
+                            token_map=self._hot_token_map,
                         )
                     else:
                         topk_index = torch.argmax(
@@ -902,7 +945,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     (
                         exchange.vocab_size
                         if exchange is not None
-                        else logits_output.next_token_logits.shape[-1]
+                        else (
+                            self._hot_vocab.vocab_size
+                            if self._hot_vocab is not None
+                            else logits_output.next_token_logits.shape[-1]
+                        )
                     ),
                     f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
                 )
@@ -1089,6 +1136,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             topk_p, topk_index = fast_sample(probs, num_samples=1)
         else:
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            if self._hot_token_map is not None:
+                topk_index = self._hot_token_map[topk_index]
         return EagleDraftInput(
             topk_p=topk_p,
             topk_index=topk_index,
@@ -1268,16 +1317,23 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
         ):
             ret_topk_p, ret_topk_index = self._draft_vocab_exchange.select_extend(
-                draft_logits_output.next_token_logits
+                draft_logits_output.next_token_logits, draft_logits_output.hidden_states
             )
             ret_draft_probs = None
         elif self.topk == 1 and not _is_hip:
             # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
             # MTP draft selection on FP8 logits.
-            ret_topk_index = torch.argmax(
-                draft_logits_output.next_token_logits, dim=-1, keepdim=True
-            )
-            ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
+            logits = draft_logits_output.next_token_logits
+            if _BK_EXTEND_ARGMAX and logits.stride(-1) == 1:
+                # Same pick as torch.argmax except on NaN rows (NaN never wins).
+                ret_topk_p, ret_topk_index = draft_topk1_postprocess(
+                    logits, None, token_map=self._hot_token_map
+                )
+            else:
+                ret_topk_index = torch.argmax(logits, dim=-1, keepdim=True)
+                if self._hot_token_map is not None:
+                    ret_topk_index = self._hot_token_map[ret_topk_index]
+                ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
             ret_draft_probs = None
         else:
             probs = renorm_draft_probs(

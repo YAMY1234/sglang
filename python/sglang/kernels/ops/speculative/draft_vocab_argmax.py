@@ -55,12 +55,17 @@ def vocab_argmax_pack(
     vocab_start: int,
     world: int,
     nan_key: int = NAN_KEY_SPLIT_ARGMAX,
+    token_map: torch.Tensor | None = None,
 ) -> None:
     """Per-row shard argmax of bf16 ``logits`` [M, V_local] plus the candidate's
     ``embed`` row, packed into ``payload`` [M, H + META_ELEMS]; int32 scratch
-    part_key / part_idx [M, blocks], counter [M] (zero between calls)."""
+    part_key / part_idx [M, blocks], counter [M] (zero between calls).
+    ``token_map`` (int64 [V_local], increasing) gives each local row's vocabulary id
+    for a vocabulary-subset shard; otherwise the id is ``vocab_start`` + row."""
+    if token_map is None:
+        token_map = logits.new_empty(0, dtype=torch.int64)
     _module(embed.shape[-1], part_key.shape[-1], world).pack(
-        logits, embed, payload, part_key, part_idx, counter, vocab_start, nan_key
+        logits, embed, payload, part_key, part_idx, counter, token_map, vocab_start, nan_key
     )
 
 

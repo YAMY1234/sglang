@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING
 import torch
 import torch.distributed as dist
 
+from sglang.kernels.ops.quantization import fp8_handoff
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_spec
 
 if TYPE_CHECKING:
@@ -42,6 +44,9 @@ _HT_NON_REDUCTION_WARPS = 2
 _HT_REDUCTION_WARP_CHOICES = (1, 2, 4, 8)
 
 SUPPORTED_TP_SIZES = (2, 4, 8, 16)
+
+_Q35_HOP_HIDDEN = 4096
+_Q35_HOP_MAX_M = 15
 
 
 def _ht_shard_split(
@@ -93,7 +98,8 @@ def _ht_retarget(preset, *, hidden_size: int, tp_size: int):
         # Kernel: "hidden vector count must be divisible by tp".
         return None
     packs_per_shard = packs // tp_size
-    for reduction_warps in _ht_reduction_warp_order(preset.reduction_warps):
+    preferred = envs.SGLANG_Q35MF_MKH_HT_REDUCTION_WARPS.get() or preset.reduction_warps
+    for reduction_warps in _ht_reduction_warp_order(preferred):
         if packs_per_shard % (reduction_warps * _WARP_SIZE):
             continue
         split = _ht_shard_split(
@@ -406,6 +412,30 @@ class FlashInferMNNVLCuteDSLARFusion:
             # would desynchronize their Lamport stages.
             torch.cuda.synchronize(self.device)
             dist.barrier(group=process_group)
+            self._hop = self._build_q35_hop() if envs.SGLANG_Q35MF_MKH_HOP.get() else None
+
+    def _build_q35_hop(self):
+        # The q35 hop kernels are hidden-4096, gamma-as-multiplier copies of the LL path.
+        if self.hidden_size != _Q35_HOP_HIDDEN or self.weight_bias != 0.0:
+            logger.warning(
+                "SGLANG_Q35MF_MKH_HOP ignored: hidden_size=%d weight_bias=%s",
+                self.hidden_size,
+                self.weight_bias,
+            )
+            return None
+        from sglang.srt.layers.q35_hop import Q35Hop
+
+        return Q35Hop(
+            max_m=_Q35_HOP_MAX_M + 1,
+            rms_epsilon=self.rms_epsilon,
+            process_group=self.process_group,
+            device=self.device,
+        )
+
+    def _uses_hop(self, m: int) -> bool:
+        # M <= 15 is where FlashInfer routes both operations to its LL kernels, which the
+        # q35 hop reproduces bit for bit.
+        return self._hop is not None and m <= _Q35_HOP_MAX_M
 
     def supports(self, m: int) -> bool:
         if not 1 <= int(m) <= self.max_m:
@@ -426,10 +456,26 @@ class FlashInferMNNVLCuteDSLARFusion:
         gated_shared_output: torch.Tensor | None,
         residual: torch.Tensor,
         gamma: torch.Tensor,
+        fp8_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         m = int(permuted_indices.shape[0])
         if not self.supports(m):
             raise ValueError(f"workspace does not support M={m}")
+        if self._hop is not None:
+            fp8_handoff.clear()
+        if self._uses_hop(m) and expert_weights.dtype == torch.bfloat16:
+            outs = self._hop.moe_finalize_all_reduce_rms_norm(
+                routed_output=routed_output,
+                expert_weights=expert_weights,
+                permuted_indices=permuted_indices,
+                gated_shared_output=gated_shared_output,
+                residual=residual,
+                gamma=gamma,
+                fp8_scale=fp8_scale,
+            )
+            if fp8_scale is not None:
+                fp8_handoff.offer(outs[0], fp8_scale, outs[2])
+            return outs[0], outs[1]
         shape = (m, self.hidden_size)
         norm_output = torch.empty(shape, dtype=torch.bfloat16, device=self.device)
         residual_output = torch.empty(shape, dtype=torch.bfloat16, device=self.device)
@@ -459,10 +505,23 @@ class FlashInferMNNVLCuteDSLARFusion:
         local_contribution: torch.Tensor,
         residual: torch.Tensor,
         gamma: torch.Tensor,
+        fp8_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         m = int(local_contribution.shape[0])
         if not self.supports(m):
             raise ValueError(f"workspace does not support M={m}")
+        if self._hop is not None:
+            fp8_handoff.clear()
+        if self._uses_hop(m):
+            outs = self._hop.all_reduce_residual_rms_norm(
+                local_contribution=local_contribution,
+                residual=residual,
+                gamma=gamma,
+                fp8_scale=fp8_scale,
+            )
+            if fp8_scale is not None:
+                fp8_handoff.offer(outs[0], fp8_scale, outs[2])
+            return outs[0], outs[1]
         norm_output = torch.empty_like(local_contribution)
         residual_output = torch.empty_like(local_contribution)
 

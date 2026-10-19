@@ -103,9 +103,13 @@ def _layer_norm_fwd_1pass_kernel(
     S=None,
     QUANT: tl.constexpr = False,
     STATIC_QUANT: tl.constexpr = False,
+    EARLY_DEPENDENTS: tl.constexpr = False,
 ):
     if USE_GDC:
         tl.extra.cuda.gdc_wait()
+        # The consumer that asks for this waits on the grid before reading the output.
+        if EARLY_DEPENDENTS:
+            tl.extra.cuda.gdc_launch_dependents()
 
     # Map the program id to the starting row of X and Y it should compute.
     row_start = tl.program_id(0) * ROWS_PER_BLOCK
@@ -212,7 +216,7 @@ def _layer_norm_fwd_1pass_kernel(
         # Write output
         tl.store(Y_base, y, mask=mask)
 
-    if USE_GDC:
+    if USE_GDC and not EARLY_DEPENDENTS:
         tl.extra.cuda.gdc_launch_dependents()
 
 
@@ -251,6 +255,7 @@ def _layer_norm_fwd(
     activation: str = "swish",
     quant_heads: int = 0,
     static_quant_scale=None,
+    early_dependents: bool = False,
 ):
     M, N = x.shape
     if group_size is None:
@@ -313,7 +318,11 @@ def _layer_norm_fwd(
         quant = {"Q": q, "S": s, "QUANT": True}
     # Update grid to use rows_per_block
     grid = (cdiv(M, rows_per_block), ngroups)
-    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    pdl_kwargs = (
+        {"USE_GDC": True, "launch_pdl": True, "EARLY_DEPENDENTS": early_dependents}
+        if is_arch_support_pdl()
+        else {}
+    )
     # Workaround for PyTorch <= 2.12: torch.xpu.device is not Dynamo-compatible
     # in that release — it creates a DynamoConfigPatchProxy that
     # SourcelessBuilder cannot wrap, causing a hard error under

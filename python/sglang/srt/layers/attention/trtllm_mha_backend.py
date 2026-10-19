@@ -33,7 +33,11 @@ from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferAttnBackend,
     FlashInferMultiStepDraftBackend,
 )
-from sglang.srt.layers.attention.graph_variants import use_split_kv_attention
+from sglang.srt.layers.attention.graph_variants import (
+    record_paged_fp8_call,
+    use_paged_fp8_attention,
+    use_split_kv_attention,
+)
 from sglang.srt.layers.attention.trtllm_mha_decode_groups import (
     DecodeGroupPlans,
     run_planned_groups,
@@ -356,6 +360,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.forward_metadata: Optional[TRTLLMMHAMetadata] = None
         self._split_kv_enabled = envs.SGLANG_Q35MF_ATTN_SPLIT_KV.get()
         self._split_kv_scratch = {}
+        self._paged_fp8_enabled = envs.SGLANG_Q35MF_LL1_K1B.get()
+        if self._paged_fp8_enabled:
+            self._paged_fp8_enabled = torch.cuda.get_device_capability()[0] == 10
+        self._paged_fp8_plans = {}
 
         # Init backend (XQA or TRTLLM-GEN)
         # We need to specify q_type and out_type for different backend
@@ -1395,6 +1403,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         out_dtype: Optional[torch.dtype] = None,
         mask: Optional[torch.Tensor] = None,
         use_split_kv: bool = True,
+        use_paged_fp8: bool = False,
     ) -> torch.Tensor:
         """Run decode, optionally sorting and splitting requests by KV length."""
 
@@ -1403,6 +1412,51 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             if out_dtype is not None
             else (out.dtype if out is not None else self.q_data_type)
         )
+
+        if self._paged_fp8_enabled and use_paged_fp8:
+            supported = (
+                not self.is_xqa_impl
+                and get_parallel().attn_dcp_size == 1
+                and self.page_size == 64
+                and q_len_per_req in (1, 7)
+                and seq_lens.numel() == 1
+                and query.shape == (q_len_per_req, query.shape[-2], 256)
+                and query.shape[-2] in (4, 8)
+                and query.dtype == torch.float8_e4m3fn
+                and query.is_contiguous()
+                and isinstance(kv_cache, tuple) and len(kv_cache) == 2
+                and all(x.dtype == query.dtype and x.ndim == 4
+                        and x.shape[1:] == (1, 64, 256) and x.is_contiguous()
+                        for x in kv_cache)
+                and resolved_out_dtype == torch.bfloat16
+                and (out is None or (out.is_contiguous() and out.shape == query.shape
+                                     and out.dtype == resolved_out_dtype))
+                and isinstance(bmm1_scale, (int, float))
+                and isinstance(bmm2_scale, (int, float))
+                and window_left < 0 and sinks is None and mask is None
+                and kv_cache_sf is None
+                and envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get() in (None, 0.0)
+            )
+            if supported:
+                from sglang.kernels.ops.attention.paged_fp8_tcgen import (
+                    PagedFP8DecodePlan,
+                    paged_fp8_decode,
+                )
+
+                key = (query.shape, kv_cache[0].shape, block_tables.shape,
+                       block_tables.stride(), seq_lens.shape)
+                plan = self._paged_fp8_plans.get(key)
+                if plan is None:
+                    plan = PagedFP8DecodePlan(query, kv_cache, block_tables, seq_lens)
+                    self._paged_fp8_plans[key] = plan
+                record_paged_fp8_call(q_len_per_req)
+                return paged_fp8_decode(query, kv_cache, block_tables, seq_lens, plan,
+                                        qk_scale=float(bmm1_scale), v_scale=float(bmm2_scale),
+                                        out=out)
+            logger.warning_once(
+                "Paged tensor-core FP8 attention is unsupported for this configuration; "
+                "using the stock attention implementation."
+            )
 
         if self._split_kv_enabled and use_split_kv:
             supported = (
@@ -1674,6 +1728,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 else self.q_data_type
             ),
             kv_cache_sf=kv_cache_block_scales,
+            use_paged_fp8=(
+                self._paged_fp8_enabled
+                and envs.SGLANG_Q35MF_LL1_K1B_DRAFT.get()
+                and use_paged_fp8_attention(forward_batch)
+            ),
         )
         if self.decode_uses_native_fp4 and not self.is_xqa_impl:
             o = self._finalize_nvfp4_output(o, forward_batch)
@@ -1869,6 +1928,15 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     use_split_kv=(
                         self._split_kv_enabled and use_split_kv_attention(forward_batch)
                     ),
+                    use_paged_fp8=(
+                        self._paged_fp8_enabled
+                        and (
+                            envs.SGLANG_Q35MF_LL1_K1B_VERIFY.get()
+                            if forward_batch.forward_mode.is_target_verify()
+                            else envs.SGLANG_Q35MF_LL1_K1B_EXTEND.get()
+                        )
+                        and use_paged_fp8_attention(forward_batch)
+                    ),
                 )
         elif self.use_fmha_v2 and not cp_active:
             # CP must go through cp_strategy.run_attention (per-shard
@@ -2029,6 +2097,9 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
                 kv_last_page_len_buf=self.kv_last_page_len,
                 speculative_step_id=i,
             )
+        # bs -> [num_steps, 3] device address table of the per-step metadata buffers,
+        # for the one-launch metadata rebuild (SGLANG_Q35MF_BK_DRAFT_META).
+        self._bk_meta_addr: dict = {}
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         for i in range(self.speculative_num_steps - 1):
@@ -2060,6 +2131,43 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
             self.attn_backends[i].init_forward_metadata_out_graph(
                 inner_fb, in_capture=in_capture
             )
+        if in_capture and envs.SGLANG_Q35MF_BK_DRAFT_META.get():
+            self._bk_build_meta_addr(forward_batch.batch_size)
+
+    def _bk_build_meta_addr(self, bs: int) -> None:
+        """Address table for the one-launch rebuild; built outside capture, only
+        when every step uses the plain draft-decode layout (no SWA tables)."""
+        self._bk_meta_addr.pop(bs, None)
+        backends = self.attn_backends[: self.speculative_num_steps - 1]
+        metas = [b.decode_cuda_graph_metadata.get(bs) for b in backends]
+        if not backends or any(m is None for m in metas):
+            return
+        b0, m0 = backends[0], metas[0]
+        unified = b0.kv_index_translator.is_translating
+        for i, (b, m) in enumerate(zip(backends, metas)):
+            if (
+                b.speculative_step_id != i
+                or b._swa_full_to_swa_mapping is not None
+                or m.swa_page_table is not None
+                or m.swa_out_cache_loc is not None
+                or b.kv_index_translator.is_translating != unified
+                or b.req_to_token is not b0.req_to_token
+                or b.max_num_pages != b0.max_num_pages
+                or b.page_size != b0.page_size
+                or m.cache_seqlens_int32.dtype != torch.int32
+                or m.cu_seqlens_k.dtype != torch.int32
+                or (not unified and (m.page_table.dtype != torch.int32
+                                     or m.page_table.stride(0) != m0.page_table.stride(0)))
+            ):
+                return
+        rows = [
+            [m.cache_seqlens_int32.data_ptr(), m.cu_seqlens_k.data_ptr(),
+             0 if unified else m.page_table.data_ptr()]
+            for m in metas
+        ]
+        self._bk_meta_addr[bs] = torch.tensor(
+            rows, dtype=torch.int64, device=m0.cache_seqlens_int32.device
+        )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
@@ -2067,6 +2175,38 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
         assert forward_batch.spec_info is not None
         assert forward_batch.spec_info.is_draft_input()
 
+        bs = forward_batch.batch_size
+        addr = (
+            self._bk_meta_addr.get(bs)
+            if envs.SGLANG_Q35MF_BK_DRAFT_META.get()
+            else None
+        )
+        if addr is not None:
+            from sglang.kernels.ops.kvcache.trtllm_mha_graph_metadata import (
+                update_trtllm_mha_graph_metadata_multistep,
+            )
+
+            backends = self.attn_backends[: self.speculative_num_steps - 1]
+            b0 = backends[0]
+            unified = b0.kv_index_translator.is_translating
+            update_trtllm_mha_graph_metadata_multistep(
+                req_pool_indices=forward_batch.req_pool_indices[:bs],
+                seq_lens=forward_batch.seq_lens[:bs],
+                req_to_token=b0.req_to_token,
+                addr_table=addr,
+                num_steps=len(backends),
+                bs=bs,
+                first_offset=1,
+                max_seq_pages=b0.max_num_pages,
+                page_size=b0.page_size,
+                page_table_stride=(
+                    0 if unified else b0.decode_cuda_graph_metadata[bs].page_table.stride(0)
+                ),
+                skip_page_table=unified,
+            )
+            for b in backends:
+                b.forward_metadata = b.decode_cuda_graph_metadata[bs]
+            return
         inner_fb = build_inner_fb_view(
             forward_batch,
             bs=forward_batch.batch_size,
