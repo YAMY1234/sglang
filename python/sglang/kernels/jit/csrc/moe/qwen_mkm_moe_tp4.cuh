@@ -5,6 +5,25 @@
 // (row t * 10 + k, identity permutation) and the expert weights.
 // Device code generated from the engine source (source md5 c33e895e853b034308e1153e73744ac8,
 // PTX helpers md5 b4d0b7dea5606da866a21d8e1a373dd9); qwen_mkm_moe.py checks the source md5 against source_md5_lo().
+//
+// The router top-k key (topk_key / topk_unkey) and softmax (softmax_topk) follow FlashInfer 0.7.1 trtllm-gen MoE
+// routing (TopKRedType in RoutingKernelTopK.cuh, calcSoftmax in RoutingKernel.cuh):
+// Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
+// Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Modified by NVIDIA: explicit approximate instructions reproduce FlashInfer's -use_fast_math routing bit for bit.
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/utils.h>
@@ -21,12 +40,11 @@
 
 #include <cstdint>
 
-// SPDX-License-Identifier: Apache-2.0
 // Minimal SM100 (tcgen05 / TMA / mbarrier) PTX helpers for the small-M NVFP4 MoE engine.
 #include <cstdint>
 #include <cuda_runtime.h>
 
-namespace q35mf {
+namespace sm100_ptx {
 
 __device__ __forceinline__ uint32_t smem_u32(const void* p) {
   return static_cast<uint32_t>(__cvta_generic_to_shared(p));
@@ -163,13 +181,13 @@ __host__ __device__ constexpr uint32_t make_idesc_nvf4(uint32_t M, uint32_t N) {
          | ((M >> 4) << 24);       // m_dim
 }
 
-}  // namespace q35mf
+}  // namespace sm100_ptx
 
 namespace sglang {
 
 namespace qwen_mkm_moe_tp4 {
 
-using namespace q35mf;
+using namespace sm100_ptx;
 
 
 constexpr int kH = 4096, kE = 512, kTopK = 10, kMaxTok = 7;
@@ -197,7 +215,7 @@ constexpr int kARow = 260;  // FC1 accumulator row stride in floats: 16 B aligne
 #ifndef L2_EVICT_FIRST  // stream expert weights with an L2 evict-first policy (they are read once per layer)
 #define L2_EVICT_FIRST 1
 #endif
-#ifndef TOPK_RANK  // 1: all-pairs rank top-10; 0: chains of warp max reductions (faster: 13.14 vs 13.32 us)
+#ifndef TOPK_RANK  // 1: all-pairs rank top-10; 0: chains of warp max reductions (measured faster in A/B)
 #define TOPK_RANK 0
 #endif
 #ifndef PDL_TRIGGER  // 1: let dependent grids launch once the FC2 MMAs are queued (only safe if they all wait)
@@ -627,8 +645,8 @@ __device__ __forceinline__ void fc2_drain(const Params& p, Smem& s, uint32_t tm,
 }
 
 __global__ void __cluster_dims__(2, 1, 1) __launch_bounds__(kThreads, 1)
-s1_kernel(const __grid_constant__ CUtensorMap tm13, const __grid_constant__ CUtensorMap tm2,
-          const __grid_constant__ CUtensorMap tmx, const Params p) {
+fused_expert_kernel(const __grid_constant__ CUtensorMap tm13, const __grid_constant__ CUtensorMap tm2,
+                    const __grid_constant__ CUtensorMap tmx, const Params p) {
   extern __shared__ __align__(1024) uint8_t raw[];
   Smem& s = *reinterpret_cast<Smem*>((reinterpret_cast<uintptr_t>(raw) + 1023) & ~uintptr_t(1023));
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
@@ -683,7 +701,7 @@ s1_kernel(const __grid_constant__ CUtensorMap tm13, const __grid_constant__ CUte
     }
   };
   // routing: warps 0, 2..7 take tokens 0..6 (DynBlock-exact top-10 + softmax); warp 1 recomputes token my_t's top-10
-  // and starts this pair's weight stream at once (a duplicate pair only wastes its first ring fill, mostly L2 hits)
+  // and starts this pair's weight stream at once (a duplicate pair only repeats its first ring fill)
   const int rtok = warp == 1 ? my_t : (warp == 0 ? 0 : warp - 1);
   uint32_t key = 0;
   asm volatile("griddepcontrol.wait;" ::: "memory");
@@ -924,7 +942,8 @@ s1_kernel(const __grid_constant__ CUtensorMap tm13, const __grid_constant__ CUte
       const float4 ue = ar[0], ge = ar[2], uo = ar[4], go = ar[6];
       const float ga[8] = {ge.x, go.x, ge.y, go.y, ge.z, go.z, ge.w, go.w};
       const float ua[8] = {ue.x, uo.x, ue.y, uo.y, ue.z, uo.z, ue.w, uo.w};
-      // trtllm-gen's SwiGLU + NVFP4 epilogue op for op (from its SASS); a = FC1 dequant, c = a x FC2 input scale:
+      // Same SwiGLU + NVFP4 requantization results as trtllm-gen's FC1 epilogue (bit-equal FC2 inputs);
+      // a = FC1 dequant, c = a x FC2 input scale:
       // h' = (u a)(g sigmoid(g a)), sigmoid = rcp(ex2(-(g (a log2e))) + 1), block scale e4m3(max|h'| c / 6), FP4 (h' / scale) c
       const float a_l2e = mul_ftz(ag, 1.4426950216293334961f);
       float h[8];
@@ -1099,13 +1118,13 @@ struct MkmMoeTp4 {
     p.num_tokens = static_cast<int>(M);
     constexpr size_t kSmem = sizeof(Smem) + 1024;
     static const bool smem_attr_set = [] {
-      CHECK_CUDA(cudaFuncSetAttribute(s1_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kSmem)));
+      CHECK_CUDA(cudaFuncSetAttribute(fused_expert_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kSmem)));
       return true;
     }();
     (void)smem_attr_set;
     // Cluster dims are compiled into the kernel (__cluster_dims__); one 2-CTA cluster per possible expert of 70 pairs.
     LaunchKernel(dim3(2 * kMaxTok * kTopK), dim3(kThreads), device.unwrap(), kSmem)
-        .enable_pdl(true)(s1_kernel, m13, m2, mx, p);
+        .enable_pdl(true)(fused_expert_kernel, m13, m2, mx, p);
   }
 };
 

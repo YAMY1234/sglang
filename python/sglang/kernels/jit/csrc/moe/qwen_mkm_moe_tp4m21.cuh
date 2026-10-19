@@ -5,6 +5,25 @@
 // (row t * 10 + k, identity permutation) and the expert weights.
 // Device code generated from the engine source (source md5 b74ba8cb6f7e6d4053790bb653aac7a5,
 // PTX helpers md5 b4d0b7dea5606da866a21d8e1a373dd9); qwen_mkm_moe.py checks the source md5 against source_md5_lo().
+//
+// The router top-k key (topk_key / topk_unkey) and softmax (softmax_topk) follow FlashInfer 0.7.1 trtllm-gen MoE
+// routing (TopKRedType in RoutingKernelTopK.cuh, calcSoftmax in RoutingKernel.cuh):
+// Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
+// Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Modified by NVIDIA: explicit approximate instructions reproduce FlashInfer's -use_fast_math routing bit for bit.
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/utils.h>
@@ -21,12 +40,11 @@
 
 #include <cstdint>
 
-// SPDX-License-Identifier: Apache-2.0
 // Minimal SM100 (tcgen05 / TMA / mbarrier) PTX helpers for the small-M NVFP4 MoE engine.
 #include <cstdint>
 #include <cuda_runtime.h>
 
-namespace q35mf {
+namespace sm100_ptx {
 
 __device__ __forceinline__ uint32_t smem_u32(const void* p) {
   return static_cast<uint32_t>(__cvta_generic_to_shared(p));
@@ -163,13 +181,13 @@ __host__ __device__ constexpr uint32_t make_idesc_nvf4(uint32_t M, uint32_t N) {
          | ((M >> 4) << 24);       // m_dim
 }
 
-}  // namespace q35mf
+}  // namespace sm100_ptx
 
 namespace sglang {
 
 namespace qwen_mkm_moe_tp4m21 {
 
-using namespace q35mf;
+using namespace sm100_ptx;
 
 
 constexpr int kH = 4096, kE = 512, kTopK = 10, kMaxTok = 21;
@@ -231,7 +249,7 @@ constexpr int kTraceStride = STAGE_STAMPS ? 128 : 16;
 #define TAIL8 (TAILV & 1)
 #define DRAIN_PIPE ((TAILV >> 1) & 1)
 #define DRAIN_SMEM ((TAILV >> 2) & 1)
-static_assert(DRAIN_SMEM == 0, "t4m3 keeps its output stores direct");
+static_assert(DRAIN_SMEM == 0, "this engine keeps its output stores direct");
 #ifndef EARLY_SF2  // FC2 stages whose scale factors are staged before the h epilogue (old order: 2)
 #define EARLY_SF2 0
 #endif
@@ -693,10 +711,10 @@ __device__ __forceinline__ void fc2_drain16(const Params& p, Smem& s, uint32_t t
 }
 
 __global__ void __launch_bounds__(kThreads, 1)
-s1_kernel(const __grid_constant__ CUtensorMap tm13, const __grid_constant__ CUtensorMap tm2,
-          const __grid_constant__ CUtensorMap tmx, const Params p) {
+fused_expert_kernel(const __grid_constant__ CUtensorMap tm13, const __grid_constant__ CUtensorMap tm2,
+                    const __grid_constant__ CUtensorMap tmx, const Params p) {
   extern __shared__ __align__(1024) uint8_t raw[];
-#if SMEM_SPACE  // pointer arithmetic on the __shared__ array keeps the shared address space (STS/LDS, not generic)
+#if SMEM_SPACE  // pointer arithmetic on the __shared__ array keeps the shared address space
   Smem& s = *reinterpret_cast<Smem*>(raw + ((1024u - (smem_u32(raw) & 1023u)) & 1023u));
 #else
   Smem& s = *reinterpret_cast<Smem*>((reinterpret_cast<uintptr_t>(raw) + 1023) & ~uintptr_t(1023));
@@ -951,7 +969,8 @@ s1_kernel(const __grid_constant__ CUtensorMap tm13, const __grid_constant__ CUte
       const float4 ue = ar[0], ge = ar[2], uo = ar[4], go = ar[6];
       const float ga[8] = {ge.x, go.x, ge.y, go.y, ge.z, go.z, ge.w, go.w};
       const float ua[8] = {ue.x, uo.x, ue.y, uo.y, ue.z, uo.z, ue.w, uo.w};
-      // trtllm-gen's SwiGLU + NVFP4 epilogue op for op (from its SASS); a = FC1 dequant, c = a x FC2 input scale:
+      // Same SwiGLU + NVFP4 requantization results as trtllm-gen's FC1 epilogue (bit-equal FC2 inputs);
+      // a = FC1 dequant, c = a x FC2 input scale:
       // h' = (u a)(g sigmoid(g a)), sigmoid = rcp(ex2(-(g (a log2e))) + 1), block scale e4m3(max|h'| c / 6), FP4 (h' / scale) c
       const float a_l2e = mul_ftz(ag, 1.4426950216293334961f);
       float hv[8];
@@ -1027,7 +1046,7 @@ s1_kernel(const __grid_constant__ CUtensorMap tm13, const __grid_constant__ CUte
           const int g = base + st;
           if (PF_SET != 0 && ((st == st0 && (PF_SET & 1)) || (st == kHalfStages + 4 && (PF_SET & 2)) ||
                               (st == kFc1Stages + 4 && (PF_SET & 4)) || (st == kFc1Stages + 12 && (PF_SET & 8)))) {
-            // these stages wait for MMAs that are slow to start after a phase change; let HBM fetch them meanwhile
+            // prefetch these stages to L2 ahead of their ring slots (PF_SET; tunable)
             const int n = st == st0 ? PF_N1 : st == kFc1Stages + 4 ? PF_N2 : 4;
             for (int k = st; k < st + n && k < kTotStages; ++k) prefetch_stage(k, e);
           }
@@ -1364,7 +1383,7 @@ struct MkmMoeTp4M21 {
     p.num_tokens = static_cast<int>(M);
     constexpr size_t kSmem = sizeof(Smem) + 1024;
     static const bool smem_attr_set = [] {
-      CHECK_CUDA(cudaFuncSetAttribute(s1_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kSmem)));
+      CHECK_CUDA(cudaFuncSetAttribute(fused_expert_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kSmem)));
       return true;
     }();
     (void)smem_attr_set;
@@ -1373,7 +1392,7 @@ struct MkmMoeTp4M21 {
     // min(M * 10, SMs - SM_RESERVE) CTAs, no clusters: one CTA per SM (shared memory), all resident at once
     const int64_t ctas = sms - SM_RESERVE;
     LaunchKernel(dim3(static_cast<unsigned>(M * kTopK < ctas ? M * kTopK : ctas)), dim3(kThreads), device.unwrap(), kSmem)
-        .enable_pdl(true)(s1_kernel, m13, m2, mx, p);
+        .enable_pdl(true)(fused_expert_kernel, m13, m2, mx, p);
   }
 };
 
