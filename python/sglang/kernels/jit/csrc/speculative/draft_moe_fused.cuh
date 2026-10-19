@@ -124,9 +124,9 @@ struct DraftMoeFusedParams {
   float* topk_weights;                    // [K]
   int32_t* topk_ids;                      // [K]
   bf16_t* out;                            // [H]
-  int64_t* trace;                         // [grid, kFusedTraceSlots] clock64 stamps, globaltimer at 0 and 9 (kTrace only)
-  q35hop::Site hop;                       // kPush: the q35 hop mailbox the output is also pushed into
-  int32_t hop_token;                      // kPush: the output's row in the hop
+  int64_t* trace;     // [grid, kFusedTraceSlots] clock64 stamps, globaltimer at 0 and 9 (kTrace only)
+  q35hop::Site hop;   // kPush: the q35 hop mailbox the output is also pushed into
+  int32_t hop_token;  // kPush: the output's row in the hop
 };
 
 inline constexpr int kFusedTraceSlots = 32;
@@ -157,8 +157,7 @@ SGL_DEVICE_HOST constexpr int kFusedLogitWords(int experts) {
  * \tparam kTrace  record per-phase clock64 stamps
  * \tparam kPush   also push the output into the q35 hop (columns split in whole quads)
  */
-template <int kH, int kI, int kE, int kTopK, int kCols, int kStages, int kWindow, bool kTrace, bool kUsePDL,
-          bool kPush>
+template <int kH, int kI, int kE, int kTopK, int kCols, int kStages, int kWindow, bool kTrace, bool kUsePDL, bool kPush>
 __global__ void __launch_bounds__(288, 1) draft_moe_fused_kernel(const DraftMoeFusedParams __grid_constant__ p) {
   using namespace device;
   namespace fz = draft_moe_fused;
@@ -292,7 +291,8 @@ __global__ void __launch_bounds__(288, 1) draft_moe_fused_kernel(const DraftMoeF
   };
 
   if (warp == kConsumers && lane == 0) {
-    for (int n = 0; n < nstatic; ++n) issue(n);
+    for (int n = 0; n < nstatic; ++n)
+      issue(n);
     ptx::mbar_arrive_expect_tx(&wsd_bar, slice_bytes);
     draft_moe::bulk_g2s(s_wsd, p.w2_shared + static_cast<int64_t>(j0) * kI, slice_bytes, &wsd_bar);
     if constexpr (kTrace) trace[19] = clock64();
@@ -302,7 +302,8 @@ __global__ void __launch_bounds__(288, 1) draft_moe_fused_kernel(const DraftMoeF
   cvec_t gw[kChunksPerLane];
   if (gate_cta && warp < 4) {
 #pragma unroll
-    for (int k = 0; k < kChunksPerLane; ++k) gw[k].load(p.gate_w + warp * kQuarter, k * kWarpThreads + lane);
+    for (int k = 0; k < kChunksPerLane; ++k)
+      gw[k].load(p.gate_w + warp * kQuarter, k * kWarpThreads + lane);
   }
 
   PDLWaitPrimary<kUsePDL>();
@@ -323,12 +324,14 @@ __global__ void __launch_bounds__(288, 1) draft_moe_fused_kernel(const DraftMoeF
     // Every CTA's logits, in the lane layout of the router's selection warp.
     uint64_t lw[kPerLaneE];
 #pragma unroll
-    for (int i = 0; i < kPerLaneE; ++i) lw[i] = fz::ld_relaxed(my_logits + i * kWarpThreads + lane);
+    for (int i = 0; i < kPerLaneE; ++i)
+      lw[i] = fz::ld_relaxed(my_logits + i * kWarpThreads + lane);
     const uint64_t t0 = fz::globaltimer();
     while (true) {
       bool ready = true;
 #pragma unroll
-      for (int i = 0; i < kPerLaneE; ++i) ready &= static_cast<uint32_t>(lw[i] >> 32) == tag;
+      for (int i = 0; i < kPerLaneE; ++i)
+        ready &= static_cast<uint32_t>(lw[i] >> 32) == tag;
       if (__all_sync(0xffffffffu, ready)) break;
       fz::check_spin(t0);
 #pragma unroll
@@ -368,7 +371,8 @@ __global__ void __launch_bounds__(288, 1) draft_moe_fused_kernel(const DraftMoeF
       if (lane == k) my_key = best;
       const bool pop = key[0] == best;
 #pragma unroll
-      for (int i = 0; i + 1 < kPerLaneE; ++i) key[i] = pop ? key[i + 1] : key[i];
+      for (int i = 0; i + 1 < kPerLaneE; ++i)
+        key[i] = pop ? key[i + 1] : key[i];
       key[kPerLaneE - 1] = pop ? 0u : key[kPerLaneE - 1];
     }
     const int32_t id = lane < kTopK ? static_cast<int32_t>(0xffffu - (my_key & 0xffffu)) : 0;
@@ -385,12 +389,14 @@ __global__ void __launch_bounds__(288, 1) draft_moe_fused_kernel(const DraftMoeF
     row_max = warp::reduce_max(row_max);
     float lsum = 0.0f;
 #pragma unroll
-    for (int i = 0; i < kPerLaneE; ++i) lsum += expf(v[i] - row_max);
+    for (int i = 0; i < kPerLaneE; ++i)
+      lsum += expf(v[i] - row_max);
     const float row_sum = warp::reduce_sum(lsum);
     const float pw = expf(s_v[id] - row_max) / row_sum;
     float routed_sum = 0.0f;
 #pragma unroll
-    for (int k = 0; k < kTopK; ++k) routed_sum += __shfl_sync(0xffffffffu, pw, k);
+    for (int k = 0; k < kTopK; ++k)
+      routed_sum += __shfl_sync(0xffffffffu, pw, k);
     const float norm = routed_sum > 0.0f ? routed_sum : 1.0f;
     if (lane < kTopK) {
       const float w = pw / norm;
@@ -431,7 +437,8 @@ __global__ void __launch_bounds__(288, 1) draft_moe_fused_kernel(const DraftMoeF
       w.load(wrow, k * kWarpThreads + lane);
       xv.load(s_x, k * kWarpThreads + lane);
 #pragma unroll
-      for (int j = 0; j < kVecN; ++j) acc = fmaf(cast<fp32_t>(w[j]), cast<fp32_t>(xv[j]), acc);
+      for (int j = 0; j < kVecN; ++j)
+        acc = fmaf(cast<fp32_t>(w[j]), cast<fp32_t>(xv[j]), acc);
     }
     acc = warp::reduce_sum(acc);
     if constexpr (kTrace) {
@@ -452,13 +459,15 @@ __global__ void __launch_bounds__(288, 1) draft_moe_fused_kernel(const DraftMoeF
   const bool is_up = warp >= 4;
   cvec_t xr[kChunksPerLane];
 #pragma unroll
-  for (int k = 0; k < kChunksPerLane; ++k) xr[k].load(s_x + quarter * kQuarter, k * kWarpThreads + lane);
+  for (int k = 0; k < kChunksPerLane; ++k)
+    xr[k].load(s_x + quarter * kQuarter, k * kWarpThreads + lane);
   if (gate_cta && warp < 4) {
     float acc = 0.0f;
 #pragma unroll
     for (int k = 0; k < kChunksPerLane; ++k) {
 #pragma unroll
-      for (int j = 0; j < 8; ++j) acc = fmaf(cast<fp32_t>(xr[k][j]), cast<fp32_t>(gw[k][j]), acc);
+      for (int j = 0; j < 8; ++j)
+        acc = fmaf(cast<fp32_t>(xr[k][j]), cast<fp32_t>(gw[k][j]), acc);
     }
     acc = warp::reduce_sum(acc);
     if (lane == 0) s_gate_part[warp] = acc;
@@ -483,7 +492,8 @@ __global__ void __launch_bounds__(288, 1) draft_moe_fused_kernel(const DraftMoeF
       cvec_t w;
       w.load(row, k * kWarpThreads + lane);
 #pragma unroll
-      for (int j = 0; j < 8; ++j) acc = fmaf(cast<fp32_t>(w[j]), cast<fp32_t>(xr[k][j]), acc);
+      for (int j = 0; j < 8; ++j)
+        acc = fmaf(cast<fp32_t>(w[j]), cast<fp32_t>(xr[k][j]), acc);
     }
     acc = warp::reduce_sum(acc);
     if (lane == 0) {
@@ -507,7 +517,8 @@ __global__ void __launch_bounds__(288, 1) draft_moe_fused_kernel(const DraftMoeF
   if (lane < npairs) {
     const int idx = lane < nsh ? kTopK * kI + sh0 + lane : rq0 + lane - nsh;
     const uint32_t word = s_word[lane];
-    for (int r = warp; r < kFusedReplicas; r += kConsumers) fz::st_relaxed(p.act_buf + r * kActWords + idx, word);
+    for (int r = warp; r < kFusedReplicas; r += kConsumers)
+      fz::st_relaxed(p.act_buf + r * kActWords + idx, word);
   }
   if constexpr (kTrace) {
     if (threadIdx.x == 0) trace[29] = static_cast<int64_t>(fz::globaltimer());
@@ -555,7 +566,8 @@ __global__ void __launch_bounds__(288, 1) draft_moe_fused_kernel(const DraftMoeF
 #pragma unroll
       for (int s = 0; s < kSlots; ++s) {
 #pragma unroll
-        for (int k = 0; k < kDownPerLane; ++k) wpre[r][s][k].load(slices[s] + jr * kI, gl + 8 * k);
+        for (int k = 0; k < kDownPerLane; ++k)
+          wpre[r][s][k].load(slices[s] + jr * kI, gl + 8 * k);
       }
     }
   }
@@ -622,19 +634,24 @@ __global__ void __launch_bounds__(288, 1) draft_moe_fused_kernel(const DraftMoeF
         }
         a.load(s_act + s * kI, gl + 8 * k);
 #pragma unroll
-        for (int e = 0; e < 8; ++e) acc = fmaf(cast<fp32_t>(w[e]), cast<fp32_t>(a[e]), acc);
+        for (int e = 0; e < 8; ++e)
+          acc = fmaf(cast<fp32_t>(w[e]), cast<fp32_t>(a[e]), acc);
       }
       d[s] = acc;
     }
 #pragma unroll
-    for (int s = 0; s < kSlots; ++s) d[s] += __shfl_xor_sync(0xffffffffu, d[s], 4);
+    for (int s = 0; s < kSlots; ++s)
+      d[s] += __shfl_xor_sync(0xffffffffu, d[s], 4);
 #pragma unroll
-    for (int s = 0; s < kSlots; ++s) d[s] += __shfl_xor_sync(0xffffffffu, d[s], 2);
+    for (int s = 0; s < kSlots; ++s)
+      d[s] += __shfl_xor_sync(0xffffffffu, d[s], 2);
 #pragma unroll
-    for (int s = 0; s < kSlots; ++s) d[s] += __shfl_xor_sync(0xffffffffu, d[s], 1);
+    for (int s = 0; s < kSlots; ++s)
+      d[s] += __shfl_xor_sync(0xffffffffu, d[s], 1);
     if (gl == 0 && jj < ncols) {
 #pragma unroll
-      for (int s = 0; s < kSlots; ++s) s_d[s][jj] = d[s];
+      for (int s = 0; s < kSlots; ++s)
+        s_d[s][jj] = d[s];
     }
   }
   fz::named_sync(1, kConsumerThreads);
@@ -642,7 +659,8 @@ __global__ void __launch_bounds__(288, 1) draft_moe_fused_kernel(const DraftMoeF
   auto column = [&](int jj) {
     float sum = 0.0f;
 #pragma unroll
-    for (int s = 0; s < kTopK; ++s) sum += draft_moe::round_bf16(s_d[s][jj] * s_w[s]);
+    for (int s = 0; s < kTopK; ++s)
+      sum += draft_moe::round_bf16(s_d[s][jj] * s_w[s]);
     const float routed = draft_moe::round_bf16(sum);
     const float shared = draft_moe::round_bf16(s_d[kTopK][jj]);
     float r = s_gate * shared;
@@ -673,8 +691,7 @@ __global__ void __launch_bounds__(288, 1) draft_moe_fused_kernel(const DraftMoeF
   }
 }
 
-template <int kH, int kI, int kE, int kTopK, int kCols, int kStages, int kWindow, bool kTrace, bool kUsePDL,
-          bool kPush>
+template <int kH, int kI, int kE, int kTopK, int kCols, int kStages, int kWindow, bool kTrace, bool kUsePDL, bool kPush>
 struct DraftMoeFused {
   static_assert(kWindow >= 1 && kWindow <= kStages);
   static constexpr int kThreads = 288;
@@ -747,9 +764,14 @@ struct DraftMoeFused {
       // [mc, uc, ctrl, rank, world, m_cap, timeout_ns] of Q35Hop.site_fields(), host int64.
       CHECK_HOST(hop_site.device().device_type == kDLCPU && hop_site.numel() == 7) << "hop_site must be 7 host int64";
       const auto* f = static_cast<const int64_t*>(hop_site.data_ptr());
-      params.hop = q35hop::Site{reinterpret_cast<void*>(f[0]), reinterpret_cast<void*>(f[1]),
-                                reinterpret_cast<q35hop::Ctrl*>(f[2]), static_cast<int>(f[3]), static_cast<int>(f[4]),
-                                static_cast<int>(f[5]), static_cast<unsigned long long>(f[6])};
+      params.hop = q35hop::Site{
+          reinterpret_cast<void*>(f[0]),
+          reinterpret_cast<void*>(f[1]),
+          reinterpret_cast<q35hop::Ctrl*>(f[2]),
+          static_cast<int>(f[3]),
+          static_cast<int>(f[4]),
+          static_cast<int>(f[5]),
+          static_cast<unsigned long long>(f[6])};
       CHECK_HOST(hop_token >= 0 && hop_token < params.hop.m_cap) << "hop row out of range";
     }
     auto kernel = draft_moe_fused_kernel<kH, kI, kE, kTopK, kCols, kStages, kWindow, kTrace, kUsePDL, kPush>;

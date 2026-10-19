@@ -200,8 +200,8 @@ __global__ void __launch_bounds__(kThreads) draft_argmax_xchg_kernel(const Draft
   const uint32_t half = p.epoch[m] & 1u;
   const int64_t row_stride = static_cast<int64_t>(2) * kRow;
   const int64_t base = (static_cast<int64_t>(half) * p.max_rows + m) * row_stride;
-  bf16_t* own = p.slots + base + static_cast<int64_t>(p.rank) * kRow;        // my row, read locally
-  bf16_t* remote = p.peer_slots + base + static_cast<int64_t>(p.rank) * kRow;  // my row, at the peer
+  bf16_t* own = p.slots + base + static_cast<int64_t>(p.rank) * kRow;           // my row, read locally
+  bf16_t* remote = p.peer_slots + base + static_cast<int64_t>(p.rank) * kRow;   // my row, at the peer
   bf16_t* incoming = p.slots + base + static_cast<int64_t>(1 - p.rank) * kRow;  // the peer's row, here
 
   const auto* erow = reinterpret_cast<const uint4*>(p.embed + static_cast<int64_t>(i) * kH);
@@ -274,14 +274,16 @@ __global__ void __launch_bounds__(kThreads) draft_argmax_xchg_kernel(const Draft
     if (p.positions != nullptr) p.positions[m] = p.positions[m] + 1;
     if (p.mrope != nullptr) {
 #pragma unroll
-      for (int d = 0; d < 3; ++d) p.mrope[d * p.mrope_stride + m] += 1;
+      for (int d = 0; d < 3; ++d)
+        p.mrope[d * p.mrope_stride + m] += 1;
     }
   }
   // Re-arm the peer's slot once every thread has read it, then flip this row's half.
   __syncthreads();
-  const uint4 marker = make_uint4(
-      peer_xchg::kRowMarker, peer_xchg::kRowMarker, peer_xchg::kRowMarker, peer_xchg::kRowMarker);
-  for (int c = static_cast<int>(threadIdx.x); c < kRowVecs; c += kThreads) ptx::st_global_16B(marker, incoming, c);
+  const uint4 marker =
+      make_uint4(peer_xchg::kRowMarker, peer_xchg::kRowMarker, peer_xchg::kRowMarker, peer_xchg::kRowMarker);
+  for (int c = static_cast<int>(threadIdx.x); c < kRowVecs; c += kThreads)
+    ptx::st_global_16B(marker, incoming, c);
   if (threadIdx.x == 0) p.epoch[m] = p.epoch[m] ^ 1u;
 }
 
@@ -323,8 +325,8 @@ __global__ void __launch_bounds__(kThreads) fc_xchg_sum_kernel(const FcXchgSumPa
     ptx::ld_relaxed_16B(theirs, incoming, vec);
     if (++spins == peer_xchg::kSpinLimit) __trap();
   } while (peer_xchg::has_word(theirs, peer_xchg::kFp32Marker));
-  const uint4 marker = make_uint4(
-      peer_xchg::kFp32Marker, peer_xchg::kFp32Marker, peer_xchg::kFp32Marker, peer_xchg::kFp32Marker);
+  const uint4 marker =
+      make_uint4(peer_xchg::kFp32Marker, peer_xchg::kFp32Marker, peer_xchg::kFp32Marker, peer_xchg::kFp32Marker);
   ptx::st_global_16B(marker, incoming, vec);
 
   // fp32 a + b == b + a, so this is the rank-order sum whichever rank runs it.
@@ -348,8 +350,8 @@ struct DraftArgmaxXchg {
   static_assert(kBlocks <= kThreads, "partials are reduced by one CTA");
   static_assert(kH % 8 == 0);
 
-  static void run(
-      const tvm::ffi::TensorView logits,
+  static void
+  run(const tvm::ffi::TensorView logits,
       const tvm::ffi::TensorView embed,
       const tvm::ffi::TensorView part_key,
       const tvm::ffi::TensorView part_idx,
@@ -453,8 +455,8 @@ template <bool kUsePDL>
 struct FcXchgSum {
   static constexpr int kThreads = 256;
 
-  static void run(
-      const tvm::ffi::TensorView partial,
+  static void
+  run(const tvm::ffi::TensorView partial,
       const tvm::ffi::TensorView out,
       const tvm::ffi::TensorView slots,
       int64_t peer_slots,

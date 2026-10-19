@@ -20,8 +20,8 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.quantization import fp8_handoff
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.ops.quantization import fp8_handoff
 from sglang.kernels.ops.quantization.fp8_utils import fp8_dtype_to_triton
 from sglang.srt.utils import (
     ceil_align,

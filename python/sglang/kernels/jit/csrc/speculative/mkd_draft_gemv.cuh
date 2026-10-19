@@ -13,10 +13,9 @@
 
 #include <tvm/ffi/container/tensor.h>
 
+#include "sgl_kernel/distributed/q35_hop.cuh"
 #include <algorithm>
 #include <cstdint>
-
-#include "sgl_kernel/distributed/q35_hop.cuh"
 
 namespace sglang {
 
@@ -25,8 +24,8 @@ struct MkdGemvParams {
   const bf16_t* __restrict__ w;  // [N, K]
   bf16_t* y;                     // [N]
   int32_t n;
-  q35hop::Site hop;              // kPush: the hop the fragments go to
-  int32_t hop_token;             // kPush: the output's row in the hop
+  q35hop::Site hop;   // kPush: the hop the fragments go to
+  int32_t hop_token;  // kPush: the output's row in the hop
 };
 
 /**
@@ -52,7 +51,8 @@ __global__ void __launch_bounds__(kRows * 32) mkd_gemv_kernel(const MkdGemvParam
   if (row < p.n) {
     const uint4* wr = reinterpret_cast<const uint4*>(p.w + static_cast<int64_t>(row) * kK);
 #pragma unroll
-    for (int j = 0; j < kVecs; ++j) wv[j] = __ldg(wr + j * 32 + lane);
+    for (int j = 0; j < kVecs; ++j)
+      wv[j] = __ldg(wr + j * 32 + lane);
   }
   PDLWaitPrimary<kUsePDL>();
   for (int i = static_cast<int>(threadIdx.x); i < kK / 8; i += kRows * 32) {
@@ -70,13 +70,15 @@ __global__ void __launch_bounds__(kRows * 32) mkd_gemv_kernel(const MkdGemvParam
       const bf16_t* a = reinterpret_cast<const bf16_t*>(&wv[j]);
       const bf16_t* b = reinterpret_cast<const bf16_t*>(&xv);
 #pragma unroll
-      for (int e = 0; e < 8; ++e) acc = fmaf(cast<fp32_t>(a[e]), cast<fp32_t>(b[e]), acc);
+      for (int e = 0; e < 8; ++e)
+        acc = fmaf(cast<fp32_t>(a[e]), cast<fp32_t>(b[e]), acc);
     }
     const int next = row + stride;
     if (next < p.n) {
       const uint4* wr = reinterpret_cast<const uint4*>(p.w + static_cast<int64_t>(next) * kK);
 #pragma unroll
-      for (int j = 0; j < kVecs; ++j) wv[j] = __ldg(wr + j * 32 + lane);
+      for (int j = 0; j < kVecs; ++j)
+        wv[j] = __ldg(wr + j * 32 + lane);
     }
     acc = warp::reduce_sum(acc);
     const bf16_t v = cast<bf16_t>(acc);
@@ -85,8 +87,8 @@ __global__ void __launch_bounds__(kRows * 32) mkd_gemv_kernel(const MkdGemvParam
       __syncthreads();
       // Push before the store: the push starts the flight to every rank.
       if (threadIdx.x == 0)
-        q35hop::push_frag(p.hop, s_stage, p.hop_token, static_cast<int>(blockIdx.x),
-                          *reinterpret_cast<const uint4*>(s_y));
+        q35hop::push_frag(
+            p.hop, s_stage, p.hop_token, static_cast<int>(blockIdx.x), *reinterpret_cast<const uint4*>(s_y));
     }
     if (lane == 0) p.y[row] = v;
   }
@@ -95,8 +97,12 @@ __global__ void __launch_bounds__(kRows * 32) mkd_gemv_kernel(const MkdGemvParam
 
 template <int kK, int kRows, bool kUsePDL, bool kPush>
 struct MkdGemv {
-  static void run(const tvm::ffi::TensorView x, const tvm::ffi::TensorView w, const tvm::ffi::TensorView y,
-                  const tvm::ffi::TensorView hop_site, int64_t hop_token) {
+  static void
+  run(const tvm::ffi::TensorView x,
+      const tvm::ffi::TensorView w,
+      const tvm::ffi::TensorView y,
+      const tvm::ffi::TensorView hop_site,
+      int64_t hop_token) {
     using namespace host;
     auto N = SymbolicSize{"rows"};
     auto device = SymbolicDevice{};
@@ -118,9 +124,14 @@ struct MkdGemv {
       CHECK_HOST(hop_site.device().device_type == kDLCPU && hop_site.numel() == 7) << "hop_site must be 7 host int64";
       CHECK_HOST(n == 4096) << "a pushed partial is one hidden row of 4096";
       const auto* f = static_cast<const int64_t*>(hop_site.data_ptr());
-      params.hop = q35hop::Site{reinterpret_cast<void*>(f[0]), reinterpret_cast<void*>(f[1]),
-                                reinterpret_cast<q35hop::Ctrl*>(f[2]), static_cast<int>(f[3]), static_cast<int>(f[4]),
-                                static_cast<int>(f[5]), static_cast<unsigned long long>(f[6])};
+      params.hop = q35hop::Site{
+          reinterpret_cast<void*>(f[0]),
+          reinterpret_cast<void*>(f[1]),
+          reinterpret_cast<q35hop::Ctrl*>(f[2]),
+          static_cast<int>(f[3]),
+          static_cast<int>(f[4]),
+          static_cast<int>(f[5]),
+          static_cast<unsigned long long>(f[6])};
       CHECK_HOST(hop_token >= 0 && hop_token < params.hop.m_cap) << "hop row out of range";
     }
     const auto kernel = mkd_gemv_kernel<kK, kRows, kUsePDL, kPush>;

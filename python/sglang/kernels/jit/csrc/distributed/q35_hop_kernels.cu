@@ -6,10 +6,9 @@
 // Outputs are bit-identical to the FlashInfer MNNVL LL kernels plus the static FP8 quant.
 // Built as a shared library and driven through ctypes (see srt/layers/q35_hop.py).
 
+#include "sgl_kernel/distributed/q35_hop.cuh"
 #include <cuda_runtime.h>
 #include <stdint.h>
-
-#include "sgl_kernel/distributed/q35_hop.cuh"
 
 namespace {
 
@@ -36,7 +35,9 @@ struct Args {
 
 constexpr int kMaxTopK = 16;
 
-__device__ __forceinline__ uint4 ld_v4(const void* p) { return *static_cast<const uint4*>(p); }
+__device__ __forceinline__ uint4 ld_v4(const void* p) {
+  return *static_cast<const uint4*>(p);
+}
 
 __device__ __forceinline__ size_t row_elem(int token, int frag) {
   return static_cast<size_t>(token) * kHidden + static_cast<size_t>(frag) * kVec;
@@ -44,8 +45,8 @@ __device__ __forceinline__ size_t row_elem(int token, int frag) {
 
 // sum_k w_k * routed[perm_k] + shared, in k order with separate multiply and add, as the
 // reference finalize does; every row load is issued before the sum.
-__device__ __forceinline__ uint4 finalize_frag(const Args& a, int token, int frag, const int32_t* rows,
-                                               const float* wts) {
+__device__ __forceinline__ uint4
+finalize_frag(const Args& a, int token, int frag, const int32_t* rows, const float* wts) {
   uint4 src[kMaxTopK];
 #pragma unroll
   for (int k = 0; k < kMaxTopK; ++k)
@@ -54,21 +55,24 @@ __device__ __forceinline__ uint4 finalize_frag(const Args& a, int token, int fra
   if (a.shared != nullptr) sh = ld_v4(a.shared + row_elem(token, frag));
   float acc[8];
 #pragma unroll
-  for (int e = 0; e < 8; ++e) acc[e] = 0.f;
+  for (int e = 0; e < 8; ++e)
+    acc[e] = 0.f;
 #pragma unroll
   for (int k = 0; k < kMaxTopK; ++k) {
     if (k < a.top_k && rows[k] >= 0) {
       float f[8];
       unpack8(src[k], f);
 #pragma unroll
-      for (int e = 0; e < 8; ++e) acc[e] = __fadd_rn(acc[e], __fmul_rn(f[e], wts[k]));
+      for (int e = 0; e < 8; ++e)
+        acc[e] = __fadd_rn(acc[e], __fmul_rn(f[e], wts[k]));
     }
   }
   if (a.shared != nullptr) {
     float f[8];
     unpack8(sh, f);
 #pragma unroll
-    for (int e = 0; e < 8; ++e) acc[e] = __fadd_rn(acc[e], f[e]);
+    for (int e = 0; e < 8; ++e)
+      acc[e] = __fadd_rn(acc[e], f[e]);
   }
   return pack8(acc);
 }
@@ -103,7 +107,8 @@ __global__ void __launch_bounds__(kRowThreads) publish_fin_quad_kernel(Args a) {
   if (a.shared != nullptr) sh = *reinterpret_cast<const uint2*>(a.shared + static_cast<size_t>(token) * kHidden + col);
   int rows[kSlots];
 #pragma unroll
-  for (int k = 0; k < kSlots; ++k) rows[k] = k < top_k ? rows_s[k] : -1;
+  for (int k = 0; k < kSlots; ++k)
+    rows[k] = k < top_k ? rows_s[k] : -1;
   uint2 src[kSlots];
 #pragma unroll
   for (int k = 0; k < kSlots; ++k)
@@ -116,13 +121,15 @@ __global__ void __launch_bounds__(kRowThreads) publish_fin_quad_kernel(Args a) {
       const float w = wts_s[k];
       const float f[4] = {bf_lo(src[k].x), bf_hi(src[k].x), bf_lo(src[k].y), bf_hi(src[k].y)};
 #pragma unroll
-      for (int e = 0; e < 4; ++e) acc[e] = __fadd_rn(acc[e], __fmul_rn(f[e], w));
+      for (int e = 0; e < 4; ++e)
+        acc[e] = __fadd_rn(acc[e], __fmul_rn(f[e], w));
     }
   }
   if (a.shared != nullptr) {
     const float f[4] = {bf_lo(sh.x), bf_hi(sh.x), bf_lo(sh.y), bf_hi(sh.y)};
 #pragma unroll
-    for (int e = 0; e < 4; ++e) acc[e] = __fadd_rn(acc[e], f[e]);
+    for (int e = 0; e < 4; ++e)
+      acc[e] = __fadd_rn(acc[e], f[e]);
   }
   push_quad(a.site, stage, token, quad, make_uint2(pack_bf16x2(acc[0], acc[1]), pack_bf16x2(acc[2], acc[3])));
   pdl_trigger();
@@ -227,13 +234,17 @@ __device__ __forceinline__ uint32_t peer_addr(uint32_t local, uint32_t cta) {
   return r;
 }
 __device__ __forceinline__ void st_async_f32(uint32_t addr, float v, uint32_t mbar) {
-  asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [%0], %1, [%2];" ::"r"(addr), "f"(v),
-               "r"(mbar)
-               : "memory");
+  asm volatile(
+      "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [%0], %1, [%2];" ::"r"(addr), "f"(v), "r"(mbar)
+      : "memory");
 }
 __device__ __forceinline__ void st_async_v4(uint32_t addr, float a, float b, float c, float d, uint32_t mbar) {
   asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.f32 [%0], {%1, %2, %3, %4}, [%5];" ::"r"(addr),
-               "f"(a), "f"(b), "f"(c), "f"(d), "r"(mbar)
+               "f"(a),
+               "f"(b),
+               "f"(c),
+               "f"(d),
+               "r"(mbar)
                : "memory");
 }
 __device__ __forceinline__ void mbar_wait(const uint64_t* mbar) {
@@ -303,7 +314,8 @@ __device__ __forceinline__ float cute_sumsq(const float x[8], int frag, DraftSme
       }
     }
 #pragma unroll
-    for (int off = 1; off < 16; off <<= 1) sum = __fadd_rn(sum, __shfl_xor_sync(0xffffffffu, sum, off));
+    for (int off = 1; off < 16; off <<= 1)
+      sum = __fadd_rn(sum, __shfl_xor_sync(0xffffffffu, sum, off));
     if (lane < kRowCtas)
       st_async_f32(peer_addr(smem_u32(&ds.hs[cluster_ctarank()]), lane), sum, peer_addr(smem_u32(&ds.mbar_h), lane));
   }
@@ -342,7 +354,8 @@ __global__ void __launch_bounds__(kRowThreads) consume_draft_kernel(Args a) {
     }
     res_out = pack8(x);
 #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) part = add_ftz(part, __shfl_xor_sync(0xffffffffu, part, off));
+    for (int off = 16; off > 0; off >>= 1)
+      part = add_ftz(part, __shfl_xor_sync(0xffffffffu, part, off));
     row_exchange(part, ds);
     // Global warp 2k + i is xs[k / 2][(k % 2) * 2 + i]; 64-thread block k sums its two warps.
     total = 0.f;
@@ -351,31 +364,37 @@ __global__ void __launch_bounds__(kRowThreads) consume_draft_kernel(Args a) {
       total = add_ftz(total, add_ftz(ds.xs[k >> 1][(k & 1) * 2], ds.xs[k >> 1][(k & 1) * 2 + 1]));
   } else {
 #pragma unroll
-    for (int e = 0; e < 8; ++e) x[e] = __fadd_rn(__bfloat162float(__float2bfloat16_rn(acc[e])), res_f[e]);
+    for (int e = 0; e < 8; ++e)
+      x[e] = __fadd_rn(__bfloat162float(__float2bfloat16_rn(acc[e])), res_f[e]);
     res_out = pack8(x);
     if (MODE == kDraftAddNorm) {
       total = cute_sumsq(x, frag, ds);
     } else {
       float part = 0.f;
 #pragma unroll
-      for (int e = 0; e < 8; ++e) part = __fmaf_rn(x[e], x[e], part);
+      for (int e = 0; e < 8; ++e)
+        part = __fmaf_rn(x[e], x[e], part);
 #pragma unroll
-      for (int off = 16; off > 0; off >>= 1) part = __fadd_rn(part, __shfl_xor_sync(0xffffffffu, part, off));
+      for (int off = 16; off > 0; off >>= 1)
+        part = __fadd_rn(part, __shfl_xor_sync(0xffffffffu, part, off));
       row_exchange(part, ds);
       float v[16];
 #pragma unroll
-      for (int i = 0; i < 16; ++i) v[i] = ds.xs[i >> 2][i & 3];
+      for (int i = 0; i < 16; ++i)
+        v[i] = ds.xs[i >> 2][i & 3];
 #pragma unroll
       for (int w = 8; w > 0; w >>= 1)
 #pragma unroll
-        for (int i = 0; i < w; ++i) v[i] = __fadd_rn(v[i], v[i + w]);
+        for (int i = 0; i < w; ++i)
+          v[i] = __fadd_rn(v[i], v[i + w]);
       total = v[0];
     }
   }
   const float inv = rsqrt_ftz(add_ftz(mul_ftz(total, 1.f / static_cast<float>(kHidden)), a.eps));
   float out[8];
 #pragma unroll
-  for (int e = 0; e < 8; ++e) out[e] = __fmul_rn(__fmul_rn(x[e], inv), __fadd_rn(a.weight_bias, gam[e]));
+  for (int e = 0; e < 8; ++e)
+    out[e] = __fmul_rn(__fmul_rn(x[e], inv), __fadd_rn(a.weight_bias, gam[e]));
   uint4 norm = pack8(out);
   if (!ok) norm = make_uint4(kNanPair, kNanPair, kNanPair, kNanPair);
   if (a.delay_ns > 0) {
@@ -398,11 +417,11 @@ __global__ void __launch_bounds__(kRowThreads) consume_draft_kernel(Args a) {
 // warp partials are summed in warp order.
 struct OprojArgs {
   Site site;
-  const uint4* w;      // packed [128 cta][8 warp][S step][2 block][32 lane] x 16 B
-  const uint8_t* x;    // [M, K] e4m3 activation
-  const float* sx;     // input scale
-  const float* sw;     // weight scale
-  uint16_t* out;       // [M, 4096] bf16 copy of the partial, or null
+  const uint4* w;    // packed [128 cta][8 warp][S step][2 block][32 lane] x 16 B
+  const uint8_t* x;  // [M, K] e4m3 activation
+  const float* sx;   // input scale
+  const float* sw;   // weight scale
+  uint16_t* out;     // [M, 4096] bf16 copy of the partial, or null
   int m;
 };
 
@@ -436,7 +455,8 @@ __global__ void __launch_bounds__(256, 1) oproj_push_kernel(OprojArgs o) {
 #pragma unroll
     for (int st = 0; st < S; ++st)
 #pragma unroll
-      for (int b = 0; b < 2; ++b) a[st][b] = ldg_nc_v4(wb + (st * 2 + b) * 32);
+      for (int b = 0; b < 2; ++b)
+        a[st][b] = ldg_nc_v4(wb + (st * 2 + b) * 32);
   }
   const float alpha = __fmul_rn(*o.sx, *o.sw);
   pdl_wait();
@@ -453,10 +473,16 @@ __global__ void __launch_bounds__(256, 1) oproj_push_kernel(OprojArgs o) {
   }
   {
     float4* dst = reinterpret_cast<float4*>(&red[warp][lane][0]);
-    dst[0] = make_float4(__fadd_rn(ch[0][0][0], ch[0][1][0]), __fadd_rn(ch[0][0][1], ch[0][1][1]),
-                         __fadd_rn(ch[0][0][2], ch[0][1][2]), __fadd_rn(ch[0][0][3], ch[0][1][3]));
-    dst[1] = make_float4(__fadd_rn(ch[1][0][0], ch[1][1][0]), __fadd_rn(ch[1][0][1], ch[1][1][1]),
-                         __fadd_rn(ch[1][0][2], ch[1][1][2]), __fadd_rn(ch[1][0][3], ch[1][1][3]));
+    dst[0] = make_float4(
+        __fadd_rn(ch[0][0][0], ch[0][1][0]),
+        __fadd_rn(ch[0][0][1], ch[0][1][1]),
+        __fadd_rn(ch[0][0][2], ch[0][1][2]),
+        __fadd_rn(ch[0][0][3], ch[0][1][3]));
+    dst[1] = make_float4(
+        __fadd_rn(ch[1][0][0], ch[1][1][0]),
+        __fadd_rn(ch[1][0][1], ch[1][1][1]),
+        __fadd_rn(ch[1][0][2], ch[1][1][2]),
+        __fadd_rn(ch[1][0][3], ch[1][1][3]));
   }
   __syncthreads();
   // Thread (tok, j) owns rows [8j, 8j + 8) of token tok. Accumulator element (row r, token k) sits at
@@ -471,7 +497,8 @@ __global__ void __launch_bounds__(256, 1) oproj_push_kernel(OprojArgs o) {
       const int e = (r / 16) * 4 + ((r % 16) / 8) * 2 + (tok % 2);
       float x = red[0][l][e];
 #pragma unroll
-      for (int w = 1; w < 8; ++w) x = __fadd_rn(x, red[w][l][e]);
+      for (int w = 1; w < 8; ++w)
+        x = __fadd_rn(x, red[w][l][e]);
       v[q] = __fmul_rn(x, alpha);
     }
     const uint4 frag = pack8(v);
@@ -525,16 +552,21 @@ extern "C" int q35hop_launch(int which, const void* args, void* stream) {
   if (a.m < 1 || a.m > a.site.m_cap || a.top_k > kMaxTopK) return -2;
   cudaStream_t s = static_cast<cudaStream_t>(stream);
   switch (which) {
-    case 0: return launch(publish_kernel<false>, a, s, false);
+    case 0:
+      return launch(publish_kernel<false>, a, s, false);
     case 1:
       return a.top_k == 10 ? launch(publish_fin_quad_kernel<10>, a, s, false, kQuadCtas)
                            : launch(publish_fin_quad_kernel<0>, a, s, false, kQuadCtas);
     case 2:
       switch (a.site.world) {
-        case 2: return launch(consume_kernel<2>, a, s, true);
-        case 4: return launch(consume_kernel<4>, a, s, true);
-        case 8: return launch(consume_kernel<8>, a, s, true);
-        default: return -3;
+        case 2:
+          return launch(consume_kernel<2>, a, s, true);
+        case 4:
+          return launch(consume_kernel<4>, a, s, true);
+        case 8:
+          return launch(consume_kernel<8>, a, s, true);
+        default:
+          return -3;
       }
     case 3:
     case 4:
@@ -543,12 +575,17 @@ extern "C" int q35hop_launch(int which, const void* args, void* stream) {
     case 8:
       if (a.norm_out == nullptr || a.fp8_out != nullptr) return -4;
       switch (a.site.world) {
-        case 2: return launch_draft<2>(which, a, s);
-        case 4: return launch_draft<4>(which, a, s);
-        case 8: return launch_draft<8>(which, a, s);
-        default: return -3;
+        case 2:
+          return launch_draft<2>(which, a, s);
+        case 4:
+          return launch_draft<4>(which, a, s);
+        case 8:
+          return launch_draft<8>(which, a, s);
+        default:
+          return -3;
       }
-    default: return -1;
+    default:
+      return -1;
   }
 }
 
@@ -565,11 +602,18 @@ extern "C" int q35hop_oproj(int k_steps, const void* args, void* stream) {
   cfg.attrs = &attr;
   cfg.numAttrs = 1;
   switch (k_steps) {
-    case 4: return static_cast<int>(cudaLaunchKernelEx(&cfg, oproj_push_kernel<4>, o));
-    case 8: return static_cast<int>(cudaLaunchKernelEx(&cfg, oproj_push_kernel<8>, o));
-    default: return -3;
+    case 4:
+      return static_cast<int>(cudaLaunchKernelEx(&cfg, oproj_push_kernel<4>, o));
+    case 8:
+      return static_cast<int>(cudaLaunchKernelEx(&cfg, oproj_push_kernel<8>, o));
+    default:
+      return -3;
   }
 }
 
-extern "C" int q35hop_args_size() { return static_cast<int>(sizeof(Args)); }
-extern "C" int q35hop_oproj_args_size() { return static_cast<int>(sizeof(OprojArgs)); }
+extern "C" int q35hop_args_size() {
+  return static_cast<int>(sizeof(Args));
+}
+extern "C" int q35hop_oproj_args_size() {
+  return static_cast<int>(sizeof(OprojArgs));
+}

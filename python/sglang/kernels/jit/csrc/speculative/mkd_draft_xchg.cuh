@@ -80,35 +80,35 @@ SGL_DEVICE uint64_t now_ns() {
 }  // namespace mkd_xchg
 
 struct MkdXchgParams {
-  const bf16_t* logits;          // [V_local] vocabulary-shard logits, written by the lm_head
-  const void* __restrict__ cand; // [V_local, H] embedding rows (bf16) or memo rows (fp32)
-  const int64_t* hot_ids;        // [world * V_local] vocabulary id of each shard row, rank-major
-  const float* own_partial;      // [H] this rank's hidden-slice fc partial (hidden ranks only)
-  const uint32_t* partial_flag;  // equals the epoch once own_partial is written, or null
-  uint64_t* scan_part;           // [kSlots, kChunks] per-CTA shard-argmax partials, or null
-  const uint32_t* head_part;     // [head_parts] packed partials of mkd_head (no scan), or null
+  const bf16_t* logits;           // [V_local] vocabulary-shard logits, written by the lm_head
+  const void* __restrict__ cand;  // [V_local, H] embedding rows (bf16) or memo rows (fp32)
+  const int64_t* hot_ids;         // [world * V_local] vocabulary id of each shard row, rank-major
+  const float* own_partial;       // [H] this rank's hidden-slice fc partial (hidden ranks only)
+  const uint32_t* partial_flag;   // equals the epoch once own_partial is written, or null
+  uint64_t* scan_part;            // [kSlots, kChunks] per-CTA shard-argmax partials, or null
+  const uint32_t* head_part;      // [head_parts] packed partials of mkd_head (no scan), or null
   int32_t head_parts;
-  uint64_t* mc;                  // multicast base of the exchange buffer
-  const uint64_t* uc;            // this rank's own copy of the exchange buffer
-  uint32_t* epoch;               // [1] call counter shared by all ranks, starts at 1
-  uint32_t* done;                // [1] CTA arrival counter, zero between calls
-  void* out_cand;                // [H] winner's embedding row (bf16) or memo row (fp32)
-  float* out_partials;           // [world - embed, H] hidden-slice partials in rank order
-  bf16_t* fc_out;                // [H] memo only: the next step's fc output, else null
-  int32_t token_only;            // 1: exchange keys only (no next step reads the payload)
-  int64_t* topk_index;           // [1]
-  float* topk_p;                 // [1]
-  int64_t* draft_tokens;         // [1, S] or null
-  int64_t* positions;            // [1] or null
-  int64_t* mrope;                // [3, >= 1] or null
-  int32_t vocab;                 // V_local, multiple of 8
+  uint64_t* mc;           // multicast base of the exchange buffer
+  const uint64_t* uc;     // this rank's own copy of the exchange buffer
+  uint32_t* epoch;        // [1] call counter shared by all ranks, starts at 1
+  uint32_t* done;         // [1] CTA arrival counter, zero between calls
+  void* out_cand;         // [H] winner's embedding row (bf16) or memo row (fp32)
+  float* out_partials;    // [world - embed, H] hidden-slice partials in rank order
+  bf16_t* fc_out;         // [H] memo only: the next step's fc output, else null
+  int32_t token_only;     // 1: exchange keys only (no next step reads the payload)
+  int64_t* topk_index;    // [1]
+  float* topk_p;          // [1]
+  int64_t* draft_tokens;  // [1, S] or null
+  int64_t* positions;     // [1] or null
+  int64_t* mrope;         // [3, >= 1] or null
+  int32_t vocab;          // V_local, multiple of 8
   uint32_t nan_key;
   int32_t rank;
   int32_t draft_column;
   int32_t mrope_stride;
-  uint64_t* trace;               // [trace_slots, kChunks, 9] %globaltimer per phase, or null
-  int32_t trace_slots;           // calls kept in the trace ring (slot = epoch % trace_slots)
-  const char* pf;                // static weight range prefetched into L2 for a later kernel, or null
+  uint64_t* trace;      // [trace_slots, kChunks, 9] %globaltimer per phase, or null
+  int32_t trace_slots;  // calls kept in the trace ring (slot = epoch % trace_slots)
+  const char* pf;       // static weight range prefetched into L2 for a later kernel, or null
   int64_t pf_bytes;
 };
 
@@ -226,14 +226,18 @@ __global__ void __launch_bounds__(kThreads) mkd_xchg_kernel(const MkdXchgParams 
       const int part_slot = static_cast<int>(tg % mkd_xchg::kSlots);
       if (lane == 0) {
         const uint64_t w = (static_cast<uint64_t>(tg) << 32) | (nan_any != 0u ? mkd_xchg::kNanPart : best);
-        asm volatile("st.relaxed.gpu.global.u64 [%0], %1;" ::"l"(p.scan_part + part_slot * kChunks + c), "l"(w) : "memory");
+        asm volatile("st.relaxed.gpu.global.u64 [%0], %1;" ::"l"(p.scan_part + part_slot * kChunks + c), "l"(w)
+                     : "memory");
       }
       uint32_t v = 0u;
       if (lane < kChunks) {
         uint64_t w;
         uint32_t n = 0;
         do {
-          asm volatile("ld.relaxed.gpu.global.u64 %0, [%1];" : "=l"(w) : "l"(p.scan_part + part_slot * kChunks + lane) : "memory");
+          asm volatile("ld.relaxed.gpu.global.u64 %0, [%1];"
+                       : "=l"(w)
+                       : "l"(p.scan_part + part_slot * kChunks + lane)
+                       : "memory");
           if (++n > mkd_xchg::kSpinLimit) __trap();
         } while (static_cast<uint32_t>(w >> 32) != tg);
         v = static_cast<uint32_t>(w);
@@ -310,7 +314,8 @@ __global__ void __launch_bounds__(kThreads) mkd_xchg_kernel(const MkdXchgParams 
         mkd_xchg::mc_store(dst + 2 + w, __float_as_uint(row[w]), tag);
       }
     } else {
-      const uint32_t* row = reinterpret_cast<const uint32_t*>(static_cast<const bf16_t*>(p.cand) + brow * kH + c * kCols);
+      const uint32_t* row =
+          reinterpret_cast<const uint32_t*>(static_cast<const bf16_t*>(p.cand) + brow * kH + c * kCols);
       for (int w = static_cast<int>(threadIdx.x); w < kCandWords; w += kThreads) {
         mkd_xchg::mc_store(dst + 2 + w, mkd_xchg::clear_negative_zero(row[w]), tag);
       }
@@ -370,7 +375,8 @@ __global__ void __launch_bounds__(kThreads) mkd_xchg_kernel(const MkdXchgParams 
       if (++n > mkd_xchg::kSpinLimit) __trap();
 #pragma unroll
       for (int u = 0; u < kRecvUnroll; ++u) {
-        if ((want & ~got) >> u & 1u) asm volatile("ld.relaxed.sys.global.u64 %0, [%1];" : "=l"(v[u]) : "l"(addr[u]) : "memory");
+        if ((want & ~got) >> u & 1u)
+          asm volatile("ld.relaxed.sys.global.u64 %0, [%1];" : "=l"(v[u]) : "l"(addr[u]) : "memory");
       }
 #pragma unroll
       for (int u = 0; u < kRecvUnroll; ++u) {
@@ -421,7 +427,8 @@ __global__ void __launch_bounds__(kThreads) mkd_xchg_kernel(const MkdXchgParams 
       if (p.positions != nullptr) p.positions[0] = p.positions[0] + 1;
       if (p.mrope != nullptr) {
 #pragma unroll
-        for (int d = 0; d < 3; ++d) p.mrope[d * p.mrope_stride] += 1;
+        for (int d = 0; d < 3; ++d)
+          p.mrope[d * p.mrope_stride] += 1;
       }
     }
   }
@@ -433,7 +440,8 @@ __global__ void __launch_bounds__(kThreads) mkd_xchg_kernel(const MkdXchgParams 
     for (int w = static_cast<int>(threadIdx.x); w < kCandWords; w += kThreads) {
       float acc = __uint_as_float(s_cand[s_win][w]);
 #pragma unroll
-      for (int h = 0; h < kWorld - kEmbed; ++h) acc += s_part[h][w];
+      for (int h = 0; h < kWorld - kEmbed; ++h)
+        acc += s_part[h][w];
       p.fc_out[c * kCols + w] = cast<bf16_t>(acc);
     }
   } else if (payload) {
@@ -441,7 +449,8 @@ __global__ void __launch_bounds__(kThreads) mkd_xchg_kernel(const MkdXchgParams 
       static_cast<uint32_t*>(p.out_cand)[(kMemo ? c * kCols : c * kCols / 2) + w] = s_cand[s_win][w];
     }
     for (int j = static_cast<int>(threadIdx.x); j < (kWorld - kEmbed) * kPartWords; j += kThreads) {
-      p.out_partials[static_cast<int64_t>(j / kPartWords) * kH + c * kCols + j % kPartWords] = s_part[j / kPartWords][j % kPartWords];
+      p.out_partials[static_cast<int64_t>(j / kPartWords) * kH + c * kCols + j % kPartWords] =
+          s_part[j / kPartWords][j % kPartWords];
     }
   }
 
@@ -488,8 +497,8 @@ struct MkdXchg {
     host::RuntimeDeviceCheck(cudaGetLastError());
   }
 
-  static void run(
-      const tvm::ffi::TensorView logits,
+  static void
+  run(const tvm::ffi::TensorView logits,
       const tvm::ffi::TensorView cand,
       const tvm::ffi::TensorView hot_ids,
       const tvm::ffi::TensorView own_partial,

@@ -78,7 +78,12 @@ class PeerSlots:
         self.peer_slots = int(hdl.buffer_ptrs[1 - hdl.rank])
         self.epoch = torch.zeros(self.epoch_shape, dtype=torch.int32, device=device)
         self.slots = slots
-        logger.info("KDENSE draft exchange %s active (rank %d, slots %s)", self.name, self.rank, tuple(self.shape))
+        logger.info(
+            "KDENSE draft exchange %s active (rank %d, slots %s)",
+            self.name,
+            self.rank,
+            tuple(self.shape),
+        )
 
 
 def make_argmax_slots(max_rows: int, hidden: int) -> PeerSlots:
@@ -106,7 +111,9 @@ class FcPeerSum:
         )
 
     def __call__(self, partial: torch.Tensor) -> Optional[torch.Tensor]:
-        if not (0 < partial.shape[0] <= self.max_rows and partial.shape[1] == self.cols):
+        if not (
+            0 < partial.shape[0] <= self.max_rows and partial.shape[1] == self.cols
+        ):
             return None
         if not partial.is_contiguous() or not self.peer.ready():
             return None

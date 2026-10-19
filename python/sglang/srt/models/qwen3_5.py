@@ -1086,7 +1086,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         backend = getattr(backend, "linear_attn_backend", backend)
         if not isinstance(backend, GDNAttnBackend) or backend.mis_metadata is not None:
             return None
-        if _gdn_decode_fused_proj_conv and getattr(backend, "supports_packed_verify", False):
+        if _gdn_decode_fused_proj_conv and getattr(
+            backend, "supports_packed_verify", False
+        ):
             return None
         metadata = backend.forward_metadata
         if (
@@ -1253,10 +1255,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 ),
             }
             self._fused_verify_buffers = buffers
-            logger.info("Fused GDN projection/Conv1D enabled for layer %s", self.layer_id)
+            logger.info(
+                "Fused GDN projection/Conv1D enabled for layer %s", self.layer_id
+            )
         if use_fused_ba and "ba" not in buffers:
             if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError("Fused GDN b/a output must be prepared before capture")
+                raise RuntimeError(
+                    "Fused GDN b/a output must be prepared before capture"
+                )
             buffers["ba"] = hidden_states.new_empty((7, 16))
             logger.info("Fused GDN BF16 b/a enabled for layer %s", self.layer_id)
 
@@ -1320,7 +1326,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
         if not buffers["checked"]:
             if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError("Fused GDN must pass its eager warmup before capture")
+                raise RuntimeError(
+                    "Fused GDN must pass its eager warmup before capture"
+                )
             if int(buffers["error"].item()):
                 raise RuntimeError("Fused GDN projection reported a sticky error")
             buffers["checked"] = True
@@ -2121,7 +2129,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             and per_tensor_fp8(self.o_proj)
         )
 
-    def _mka_eligible(self, positions, hidden_states, forward_batch: ForwardBatch, backend) -> bool:
+    def _mka_eligible(
+        self, positions, hidden_states, forward_batch: ForwardBatch, backend
+    ) -> bool:
         if not (
             isinstance(hidden_states, torch.Tensor)
             and hidden_states.dtype == torch.bfloat16
@@ -2145,7 +2155,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             return False
         if self._mka_weights is None:
             if torch.cuda.is_current_stream_capturing():
-                logger.warning_once("MKA fused attention weights not packed before capture; using stock.")
+                logger.warning_once(
+                    "MKA fused attention weights not packed before capture; using stock."
+                )
                 return False
             from sglang.kernels.ops.attention import mka_fused
 
@@ -2153,12 +2165,18 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 mka_fused.pack_qkv(self.qkv_proj.weight.t(), self.num_heads),
                 mka_fused.pack_o(self.o_proj.weight.t()),
             )
-            logger.warning_once("MKA fused attention prologue/epilogue enabled for target verify.")
+            logger.warning_once(
+                "MKA fused attention prologue/epilogue enabled for target verify."
+            )
         return True
 
-    def _mka_self_attention(self, positions, hidden_states, forward_batch: ForwardBatch, backend):
+    def _mka_self_attention(
+        self, positions, hidden_states, forward_batch: ForwardBatch, backend
+    ):
         from sglang.kernels.ops.attention import mka_fused
-        from sglang.srt.distributed.device_communicators.pynccl_allocator import use_symmetric_memory
+        from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+            use_symmetric_memory,
+        )
         from sglang.srt.layers.dp_attention import is_allocation_symmetric
 
         m = hidden_states.shape[0]
@@ -2181,17 +2199,27 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             cache_loc=backend._get_layer_cache_loc(self.attn, forward_batch),
             k_cache=k_cache,
             v_cache=v_cache,
-            k_scale=self.attn.k_scale if self.attn.k_scale is not None else backend._default_kv_scale,
-            v_scale=self.attn.v_scale if self.attn.v_scale is not None else backend._default_kv_scale,
+            k_scale=self.attn.k_scale
+            if self.attn.k_scale is not None
+            else backend._default_kv_scale,
+            v_scale=self.attn.v_scale
+            if self.attn.v_scale is not None
+            else backend._default_kv_scale,
             q_out=q,
             gate_out=gate,
             nq=self.num_heads,
             eps=self.q_norm.variance_epsilon,
         )
-        attn_output = self.attn(q, None, None, forward_batch).reshape(m, width).contiguous()
+        attn_output = (
+            self.attn(q, None, None, forward_batch).reshape(m, width).contiguous()
+        )
         # Same allocation as RowParallelLinear's output, which the layer boundary all-reduces.
-        with use_symmetric_memory(get_parallel().tp_group, disabled=not is_allocation_symmetric()):
-            out = torch.empty((m, self.hidden_size), dtype=torch.bfloat16, device=device)
+        with use_symmetric_memory(
+            get_parallel().tp_group, disabled=not is_allocation_symmetric()
+        ):
+            out = torch.empty(
+                (m, self.hidden_size), dtype=torch.bfloat16, device=device
+            )
         hop = self._mka_push_hop(m)
         mka_fused.epilogue(
             attn=attn_output,
@@ -2228,7 +2256,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             backend = get_attn_backend()
             backend = getattr(backend, "full_attn_backend", backend)
             if self._mka_eligible(positions, hidden_states, forward_batch, backend):
-                return self._mka_self_attention(positions, hidden_states, forward_batch, backend)
+                return self._mka_self_attention(
+                    positions, hidden_states, forward_batch, backend
+                )
         q, k, v, gate = self._prepare_qkv_gate(
             positions=positions,
             hidden_states=hidden_states,
@@ -2275,10 +2305,14 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         """The one-row draft o_proj partial as mkd_draft_gemv, pushed into the FFN input's hop when
         that hop runs (it then only consumes)."""
         from sglang.kernels.ops.speculative.mkd_draft_gemv import mkd_draft_gemv
-        from sglang.srt.layers.layer_boundary.fusions.q35_draft_hop import DraftHopFusion
+        from sglang.srt.layers.layer_boundary.fusions.q35_draft_hop import (
+            DraftHopFusion,
+        )
 
         weight = self.o_proj.weight
-        out = torch.empty(1, weight.shape[0], dtype=torch.bfloat16, device=weight.device)
+        out = torch.empty(
+            1, weight.shape[0], dtype=torch.bfloat16, device=weight.device
+        )
         fusion = self.ffn_boundary.fusions
         hop = fusion.attn_push_target(1) if isinstance(fusion, DraftHopFusion) else None
         if hop is None:

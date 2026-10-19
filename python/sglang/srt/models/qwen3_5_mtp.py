@@ -25,6 +25,8 @@ from transformers import PretrainedConfig
 
 from sglang.kernels.ops.speculative.draft_fc_partial import (
     MAX_TOKENS as _FC_GEMV_MAX_TOKENS,
+)
+from sglang.kernels.ops.speculative.draft_fc_partial import (
     draft_fc_partial,
     draft_fc_partial_rows,
 )
@@ -245,7 +247,11 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
     def _split_fc(self, input_embeds, hidden_states, forward_batch):
         """fp32 partial of this rank's input-column slice, all-gathered and summed in
         rank order, rounded once to bf16 (the replicated fc's rounding points)."""
-        if self._mkd is not None and self._mkd.pending and self.draft_input_embeds is not None:
+        if (
+            self._mkd is not None
+            and self._mkd.pending
+            and self.draft_input_embeds is not None
+        ):
             return self._mkd.fc()
         use_hidden, start, width = self.fc_split_slice
         x = hidden_states if use_hidden else input_embeds

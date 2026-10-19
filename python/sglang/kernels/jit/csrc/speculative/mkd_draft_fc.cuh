@@ -32,20 +32,18 @@ namespace sglang {
 namespace mkd_fc {
 
 SGL_DEVICE void bulk_g2s(void* smem_dst, const void* gmem_src, uint32_t bytes, uint64_t* bar) {
-  asm volatile(
-      "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(
-          device::ptx::to_shared(smem_dst)),
-      "l"(gmem_src),
-      "r"(bytes),
-      "r"(device::ptx::to_shared(bar))
-      : "memory");
+  asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(
+                   device::ptx::to_shared(smem_dst)),
+               "l"(gmem_src),
+               "r"(bytes),
+               "r"(device::ptx::to_shared(bar))
+               : "memory");
 }
 
 /// \brief Gemma RMSNorm of one row x[kH] into s_x (bf16), with draft_fc_partial's
 /// statistics order: 256 threads, thread t owns 16-byte vectors t, t + 256, ...
 template <int kH>
-SGL_DEVICE void gemma_norm_row(
-    const bf16_t* x, const bf16_t* norm_w, float eps, bf16_t* s_x, float* s_red) {
+SGL_DEVICE void gemma_norm_row(const bf16_t* x, const bf16_t* norm_w, float eps, bf16_t* s_x, float* s_red) {
   using namespace device;
   constexpr int kThreads = 256;
   constexpr int kWarps = kThreads / 32;
@@ -69,7 +67,8 @@ SGL_DEVICE void gemma_norm_row(
   __syncthreads();
   float tot = 0.0f;
 #pragma unroll
-  for (int w = 0; w < kWarps; ++w) tot += s_red[w];
+  for (int w = 0; w < kWarps; ++w)
+    tot += s_red[w];
   const float inv = rsqrtf(tot / static_cast<float>(kH) + eps);
   for (int k = static_cast<int>(threadIdx.x); k < kH / 8; k += kThreads) {
     vec_t v, g, o;
@@ -93,14 +92,16 @@ SGL_DEVICE float slice_dot(const bf16_t* w_row, const bf16_t* s_x) {
   const int lane = static_cast<int>(get_lane_id());
   vec_t wv[kDotVecs];
 #pragma unroll
-  for (int k = 0; k < kDotVecs; ++k) wv[k].load(w_row, k * kWarpThreads + lane);
+  for (int k = 0; k < kDotVecs; ++k)
+    wv[k].load(w_row, k * kWarpThreads + lane);
   float acc = 0.0f;
 #pragma unroll
   for (int k = 0; k < kDotVecs; ++k) {
     vec_t xv;
     xv.load(s_x, k * kWarpThreads + lane);
 #pragma unroll
-    for (int j = 0; j < 8; ++j) acc = fmaf(cast<fp32_t>(wv[k][j]), cast<fp32_t>(xv[j]), acc);
+    for (int j = 0; j < 8; ++j)
+      acc = fmaf(cast<fp32_t>(wv[k][j]), cast<fp32_t>(xv[j]), acc);
   }
   return warp::reduce_sum(acc);
 }
@@ -126,8 +127,8 @@ __global__ void __launch_bounds__(256, 1) mkd_fc_sum_kernel(const MkdFcSumParams
   using namespace device;
   constexpr int kThreads = 256;
   constexpr int kWarps = kThreads / 32;
-  constexpr int kW = 2 * kH / kWorld;       // slice width
-  constexpr int kEmbed = kH / kW;           // embedding-half slices
+  constexpr int kW = 2 * kH / kWorld;                               // slice width
+  constexpr int kEmbed = kH / kW;                                   // embedding-half slices
   constexpr int kRowBytes = kH * static_cast<int>(sizeof(bf16_t));  // embedding half of one fc row
   static_assert(kW % (8 * 32) == 0 && kH % kW == 0);
 
@@ -177,11 +178,13 @@ __global__ void __launch_bounds__(256, 1) mkd_fc_sum_kernel(const MkdFcSumParams
       const auto* row = reinterpret_cast<const bf16_t*>(smem + static_cast<int64_t>(r) * kRowBytes);
       acc = mkd_fc::slice_dot<kW>(row, s_x);
 #pragma unroll
-      for (int s = 1; s < kEmbed; ++s) acc += mkd_fc::slice_dot<kW>(row + s * kW, s_x + s * kW);
+      for (int s = 1; s < kEmbed; ++s)
+        acc += mkd_fc::slice_dot<kW>(row + s * kW, s_x + s * kW);
     }
     if (lane == 0) {
 #pragma unroll
-      for (int s = 0; s < kWorld - kEmbed; ++s) acc += p.hidden_partials[static_cast<int64_t>(s) * kH + j];
+      for (int s = 0; s < kWorld - kEmbed; ++s)
+        acc += p.hidden_partials[static_cast<int64_t>(s) * kH + j];
       p.out[j] = cast<bf16_t>(acc);
     }
   }
@@ -226,7 +229,8 @@ __global__ void __launch_bounds__(256) mkd_fc_memo_kernel(const MkdFcMemoParams 
       for (int s = 0; s < kEmbed; ++s) {
         vec_t wv[kDotVecs];
 #pragma unroll
-        for (int k = 0; k < kDotVecs; ++k) wv[k].load(row + s * kW, k * kWarpThreads + lane);
+        for (int k = 0; k < kDotVecs; ++k)
+          wv[k].load(row + s * kW, k * kWarpThreads + lane);
 #pragma unroll
         for (int b = 0; b < kB; ++b) {
           float acc = 0.0f;
@@ -236,7 +240,8 @@ __global__ void __launch_bounds__(256) mkd_fc_memo_kernel(const MkdFcMemoParams 
               vec_t xv;
               xv.load(s_x + b * kH + s * kW, k * kWarpThreads + lane);
 #pragma unroll
-              for (int e = 0; e < 8; ++e) acc = fmaf(cast<fp32_t>(wv[k][e]), cast<fp32_t>(xv[e]), acc);
+              for (int e = 0; e < 8; ++e)
+                acc = fmaf(cast<fp32_t>(wv[k][e]), cast<fp32_t>(xv[e]), acc);
             }
           }
           acc = warp::reduce_sum(acc);
@@ -244,7 +249,8 @@ __global__ void __launch_bounds__(256) mkd_fc_memo_kernel(const MkdFcMemoParams 
         }
       }
       if (lane == 0) {
-        for (int b = 0; b < nb; ++b) p.memo[static_cast<int64_t>(i0 + b) * kH + j] = tot[b];
+        for (int b = 0; b < nb; ++b)
+          p.memo[static_cast<int64_t>(i0 + b) * kH + j] = tot[b];
       }
     }
     __syncthreads();
@@ -260,7 +266,7 @@ struct MkdHiddenPartialParams {
   uint32_t* done;                     // [1] CTA arrival counter, zero between calls
   uint32_t* flag;                     // [1] set to the tag once out is complete
   float eps;
-  int32_t col;                        // slice start inside the hidden half
+  int32_t col;  // slice start inside the hidden half
 };
 
 /**
@@ -298,8 +304,8 @@ template <int kH, int kWorld, int kMaxRows, bool kUsePDL>
 struct MkdFc {
   static constexpr std::size_t kSmem = static_cast<std::size_t>(kMaxRows) * kH * sizeof(bf16_t);
 
-  static void sum(
-      const tvm::ffi::TensorView emb,
+  static void
+  sum(const tvm::ffi::TensorView emb,
       const tvm::ffi::TensorView memo,
       const tvm::ffi::TensorView hidden_partials,
       const tvm::ffi::TensorView fc_w,

@@ -222,7 +222,8 @@ __global__ void __launch_bounds__(kThreads)
   }
   const auto* row = reinterpret_cast<const uint4*>(gathered + win * kRow);
   auto* dst = reinterpret_cast<uint4*>(p.next_embeds + m * kH);
-  for (int c = static_cast<int>(threadIdx.x); c < kH / 8; c += kThreads) dst[c] = row[c];
+  for (int c = static_cast<int>(threadIdx.x); c < kH / 8; c += kThreads)
+    dst[c] = row[c];
   if (threadIdx.x == 0) {
     p.topk_index[m] = bi;
     p.topk_p[m] = 1.0f;
@@ -230,7 +231,8 @@ __global__ void __launch_bounds__(kThreads)
     if (p.positions != nullptr) p.positions[m] = p.positions[m] + 1;
     if (p.mrope != nullptr) {
 #pragma unroll
-      for (int d = 0; d < 3; ++d) p.mrope[d * p.mrope_stride + m] += 1;
+      for (int d = 0; d < 3; ++d)
+        p.mrope[d * p.mrope_stride + m] += 1;
     }
   }
 }
@@ -238,26 +240,25 @@ __global__ void __launch_bounds__(kThreads)
 namespace vocab_argmax {
 
 SGL_DEVICE void bulk_g2s(void* smem_dst, const void* gmem_src, uint32_t bytes, uint64_t* bar) {
-  asm volatile(
-      "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(
-          device::ptx::to_shared(smem_dst)),
-      "l"(gmem_src),
-      "r"(bytes),
-      "r"(device::ptx::to_shared(bar))
-      : "memory");
+  asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(
+                   device::ptx::to_shared(smem_dst)),
+               "l"(gmem_src),
+               "r"(bytes),
+               "r"(device::ptx::to_shared(bar))
+               : "memory");
 }
 
 }  // namespace vocab_argmax
 
 struct LmHeadArgmaxParams {
-  const bf16_t* x;                    // [H] lm_head input, written by an earlier grid
-  const bf16_t* __restrict__ w;       // [V_local, H] lm_head shard
-  const bf16_t* __restrict__ embed;   // [V_local, H] embedding shard
-  bf16_t* payload;                    // [H + 8]
-  uint32_t* part_key;                 // [grid]
-  int32_t* part_idx;                  // [grid]
-  uint32_t* counter;                  // [1], zero between launches
-  int32_t vocab;                      // V_local
+  const bf16_t* x;                   // [H] lm_head input, written by an earlier grid
+  const bf16_t* __restrict__ w;      // [V_local, H] lm_head shard
+  const bf16_t* __restrict__ embed;  // [V_local, H] embedding shard
+  bf16_t* payload;                   // [H + 8]
+  uint32_t* part_key;                // [grid]
+  int32_t* part_idx;                 // [grid]
+  uint32_t* counter;                 // [1], zero between launches
+  int32_t vocab;                     // V_local
   int32_t vocab_start;
   uint32_t nan_key;
 };
@@ -330,7 +331,8 @@ __global__ void __launch_bounds__((kRows + 1) * 32, kCtasPerSm)
     PDLWaitPrimary<kUsePDL>();
     cvec_t xr[kChunks];
 #pragma unroll
-    for (int k = 0; k < kChunks; ++k) xr[k].load(p.x, k * kWarpThreads + lane);
+    for (int k = 0; k < kChunks; ++k)
+      xr[k].load(p.x, k * kWarpThreads + lane);
     uint32_t best = 0u;
     int32_t bidx = 0x7fffffff;
     int stage = 0;
@@ -346,7 +348,8 @@ __global__ void __launch_bounds__((kRows + 1) * 32, kCtasPerSm)
           cvec_t w;
           w.load(row, k * kWarpThreads + lane);
 #pragma unroll
-          for (int j = 0; j < 8; ++j) acc = fmaf(cast<fp32_t>(w[j]), cast<fp32_t>(xr[k][j]), acc);
+          for (int j = 0; j < 8; ++j)
+            acc = fmaf(cast<fp32_t>(w[j]), cast<fp32_t>(xr[k][j]), acc);
         }
         acc = warp::reduce_sum(acc);
         const uint32_t key = vocab_argmax::value_key(cast<fp32_t>(cast<bf16_t>(acc)), p.nan_key);
@@ -421,8 +424,8 @@ __global__ void __launch_bounds__((kRows + 1) * 32, kCtasPerSm)
 
 template <int kH, int kRows, int kStages, int kCtasPerSm, bool kUsePDL>
 struct LmHeadArgmax {
-  static void run(
-      const tvm::ffi::TensorView x,
+  static void
+  run(const tvm::ffi::TensorView x,
       const tvm::ffi::TensorView w,
       const tvm::ffi::TensorView embed,
       const tvm::ffi::TensorView payload,

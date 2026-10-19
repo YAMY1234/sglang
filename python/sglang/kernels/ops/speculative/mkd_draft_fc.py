@@ -49,7 +49,9 @@ def mkd_fc_sum(
     hidden = out.shape[-1]
     if memo is None:
         memo = hidden_partials.new_empty(0)
-    _module(hidden, world, MAX_ROWS).sum(emb, memo, hidden_partials, fc_weight, norm_weight, out, eps)
+    _module(hidden, world, MAX_ROWS).sum(
+        emb, memo, hidden_partials, fc_weight, norm_weight, out, eps
+    )
     return out
 
 
@@ -81,5 +83,6 @@ def mkd_hidden_partial(
     """Hidden-slice fc partial [1, H] fp32 of ``h`` [1, H] (draft_fc_partial arithmetic over
     ``shard`` [H, W] at hidden-half column ``col``); the last CTA then sets ``sync[1]`` to
     the exchange epoch ``epoch_done[0]`` (``sync[0]`` counts CTAs, zero between calls)."""
-    _module(h.shape[-1], world, MAX_ROWS).hidden_partial(h, shard, norm_weight, out, epoch_done, sync, eps, col)
-
+    _module(h.shape[-1], world, MAX_ROWS).hidden_partial(
+        h, shard, norm_weight, out, epoch_done, sync, eps, col
+    )

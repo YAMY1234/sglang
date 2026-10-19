@@ -198,7 +198,9 @@ class TestSpecTopk1Triton(CustomTestCase):
             (17, 151666, torch.bfloat16),
             (4, 8193, torch.float16),
         ):
-            with self.subTest(batch_size=batch_size, vocab_size=vocab_size, dtype=dtype):
+            with self.subTest(
+                batch_size=batch_size, vocab_size=vocab_size, dtype=dtype
+            ):
                 logits = torch.randn(
                     (batch_size, vocab_size), device=self.device, generator=g
                 ).to(dtype)
@@ -209,7 +211,10 @@ class TestSpecTopk1Triton(CustomTestCase):
                 expected = torch.argmax(logits, dim=-1, keepdim=True)
                 torch.testing.assert_close(topk_index, expected, rtol=0, atol=0)
                 torch.testing.assert_close(
-                    topk_p, torch.ones_like(expected, dtype=torch.float32), rtol=0, atol=0
+                    topk_p,
+                    torch.ones_like(expected, dtype=torch.float32),
+                    rtol=0,
+                    atol=0,
                 )
 
     def test_empty_batch(self):

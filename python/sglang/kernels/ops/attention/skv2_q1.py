@@ -52,16 +52,23 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute import experimental as ex
-from cutlass.experimental import primitives as prim
 from cutlass.cute.nvgpu import OperandMajorMode, tcgen05
+from cutlass.experimental import primitives as prim
 
 LOG2_448 = math.log2(448.0)
 
 
 @cute.experimental.jit
-def load_keys(k: cute.Tensor, table: cute.Tensor, sk: cute.Tensor,
-              barrier: cute.Pointer, first_page: cutlass.Int32, stage: cutlass.Int32,
-              tile: cutlass.Constexpr[int], length: cutlass.Int32):
+def load_keys(
+    k: cute.Tensor,
+    table: cute.Tensor,
+    sk: cute.Tensor,
+    barrier: cute.Pointer,
+    first_page: cutlass.Int32,
+    stage: cutlass.Int32,
+    tile: cutlass.Constexpr[int],
+    length: cutlass.Int32,
+):
     with cute.arch.elect_one():
         cute.arch.mbarrier_arrive_and_expect_tx(barrier, tile * 256)
     for half in cutlass.range_constexpr(tile // 64):
@@ -75,9 +82,16 @@ def load_keys(k: cute.Tensor, table: cute.Tensor, sk: cute.Tensor,
 
 
 @cute.experimental.jit
-def load_values(v: cute.Tensor, table: cute.Tensor, sv: cute.Tensor,
-                barrier: cute.Pointer, first_page: cutlass.Int32, stage: cutlass.Int32,
-                tile: cutlass.Constexpr[int], length: cutlass.Int32):
+def load_values(
+    v: cute.Tensor,
+    table: cute.Tensor,
+    sv: cute.Tensor,
+    barrier: cute.Pointer,
+    first_page: cutlass.Int32,
+    stage: cutlass.Int32,
+    tile: cutlass.Constexpr[int],
+    length: cutlass.Int32,
+):
     with cute.arch.elect_one():
         cute.arch.mbarrier_arrive_and_expect_tx(barrier, tile * 256)
     for half in cutlass.range_constexpr(tile // 64):
@@ -100,26 +114,63 @@ class Q1SplitDecode:
         assert self.width * slots * 3 <= 512
 
     @cute.experimental.jit
-    def __call__(self, q: cute.Tensor, k: cute.Tensor, v: cute.Tensor,
-                 table: cute.Tensor, lengths: cute.Tensor,
-                 partial: cute.Tensor, maxima: cute.Tensor, denom: cute.Tensor,
-                 qk_scale: cutlass.Float32, out_scale: cutlass.Float32, stream: cuda.CUstream):
+    def __call__(
+        self,
+        q: cute.Tensor,
+        k: cute.Tensor,
+        v: cute.Tensor,
+        table: cute.Tensor,
+        lengths: cute.Tensor,
+        partial: cute.Tensor,
+        maxima: cute.Tensor,
+        denom: cute.Tensor,
+        qk_scale: cutlass.Float32,
+        out_scale: cutlass.Float32,
+        stream: cuda.CUstream,
+    ):
         dtype = cutlass.Float8E4M3FN
-        kq = cute.make_tiled_mma(tcgen05.MmaFP8Op(
-            dtype, cutlass.Float32, (128, self.width), tcgen05.CtaGroup.ONE,
-            tcgen05.OperandSource.SMEM, OperandMajorMode.K, OperandMajorMode.K))
-        vp = cute.make_tiled_mma(tcgen05.MmaFP8Op(
-            dtype, cutlass.Float32, (128, self.width), tcgen05.CtaGroup.ONE,
-            tcgen05.OperandSource.SMEM, OperandMajorMode.MN, OperandMajorMode.MN))
-        self.kernel(q, k, v, table, lengths, partial, maxima, denom, qk_scale, out_scale, kq, vp).launch(
-            grid=(self.nsplit, 1, 1), block=(384, 1, 1), stream=stream)
+        kq = cute.make_tiled_mma(
+            tcgen05.MmaFP8Op(
+                dtype,
+                cutlass.Float32,
+                (128, self.width),
+                tcgen05.CtaGroup.ONE,
+                tcgen05.OperandSource.SMEM,
+                OperandMajorMode.K,
+                OperandMajorMode.K,
+            )
+        )
+        vp = cute.make_tiled_mma(
+            tcgen05.MmaFP8Op(
+                dtype,
+                cutlass.Float32,
+                (128, self.width),
+                tcgen05.CtaGroup.ONE,
+                tcgen05.OperandSource.SMEM,
+                OperandMajorMode.MN,
+                OperandMajorMode.MN,
+            )
+        )
+        self.kernel(
+            q, k, v, table, lengths, partial, maxima, denom, qk_scale, out_scale, kq, vp
+        ).launch(grid=(self.nsplit, 1, 1), block=(384, 1, 1), stream=stream)
 
     @cute.experimental.kernel
-    def kernel(self, q: cute.Tensor, k: cute.Tensor, v: cute.Tensor,
-               table: cute.Tensor, lengths: cute.Tensor,
-               partial: cute.Tensor, maxima: cute.Tensor, denom: cute.Tensor,
-               qk_scale: cutlass.Float32, out_scale: cutlass.Float32,
-               kq: cute.TiledMma, vp: cute.TiledMma):
+    def kernel(
+        self,
+        q: cute.Tensor,
+        k: cute.Tensor,
+        v: cute.Tensor,
+        table: cute.Tensor,
+        lengths: cute.Tensor,
+        partial: cute.Tensor,
+        maxima: cute.Tensor,
+        denom: cute.Tensor,
+        qk_scale: cutlass.Float32,
+        out_scale: cutlass.Float32,
+        kq: cute.TiledMma,
+        vp: cute.TiledMma,
+    ):
         tid, _, _ = cute.arch.thread_idx()
         split, _, _ = cute.arch.block_idx()
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -127,28 +178,70 @@ class Q1SplitDecode:
         local_tid = tid % 128
         width, rows = self.width, self.rows
         dtype, f32 = cutlass.Float8E4M3FN, cutlass.Float32
-        k_atom = tcgen05.make_smem_layout_atom(tcgen05.SmemLayoutAtomKind.K_SW128, dtype)
-        v_atom = tcgen05.make_smem_layout_atom(tcgen05.SmemLayoutAtomKind.MN_SW128, dtype)
-        p_atom = tcgen05.make_smem_layout_atom(tcgen05.SmemLayoutAtomKind.MN_SW32, dtype)
-        sq = ex.allocate(dtype, cutlass.AddressSpace.smem,
-                         cute.tile_to_shape(k_atom, (width, 256), order=(1, 0)), alignment=128)
-        sk = ex.allocate(dtype, cutlass.AddressSpace.smem,
-                         cute.tile_to_shape(k_atom, (self.tile, 256, self.stages), order=(1, 0, 2)), alignment=128)
-        sv = ex.allocate(dtype, cutlass.AddressSpace.smem,
-                         cute.tile_to_shape(v_atom, (256, self.tile, self.stages), order=(0, 1, 2)), alignment=128)
-        sp = ex.allocate(dtype, cutlass.AddressSpace.smem,
-                         cute.tile_to_shape(p_atom, (width, self.tile, self.slots), order=(0, 1, 2)), alignment=128)
+        k_atom = tcgen05.make_smem_layout_atom(
+            tcgen05.SmemLayoutAtomKind.K_SW128, dtype
+        )
+        v_atom = tcgen05.make_smem_layout_atom(
+            tcgen05.SmemLayoutAtomKind.MN_SW128, dtype
+        )
+        p_atom = tcgen05.make_smem_layout_atom(
+            tcgen05.SmemLayoutAtomKind.MN_SW32, dtype
+        )
+        sq = ex.allocate(
+            dtype,
+            cutlass.AddressSpace.smem,
+            cute.tile_to_shape(k_atom, (width, 256), order=(1, 0)),
+            alignment=128,
+        )
+        sk = ex.allocate(
+            dtype,
+            cutlass.AddressSpace.smem,
+            cute.tile_to_shape(k_atom, (self.tile, 256, self.stages), order=(1, 0, 2)),
+            alignment=128,
+        )
+        sv = ex.allocate(
+            dtype,
+            cutlass.AddressSpace.smem,
+            cute.tile_to_shape(v_atom, (256, self.tile, self.stages), order=(0, 1, 2)),
+            alignment=128,
+        )
+        sp = ex.allocate(
+            dtype,
+            cutlass.AddressSpace.smem,
+            cute.tile_to_shape(p_atom, (width, self.tile, self.slots), order=(0, 1, 2)),
+            alignment=128,
+        )
         # Per-thread denominators of both streams, padded against bank conflicts.
-        shared_l = ex.allocate(f32, cutlass.AddressSpace.smem,
-                               cute.make_layout((2, 128, rows), stride=(128 * (rows + 1), rows + 1, 1)), alignment=128)
-        shared = ex.allocate(f32, cutlass.AddressSpace.smem,
-                             cute.make_layout((4, width), stride=(width, 1)), alignment=128)
-        alphas = ex.allocate(f32, cutlass.AddressSpace.smem,
-                             cute.make_layout((width, self.slots), stride=(1, width)), alignment=128)
-        stream_off = ex.allocate(f32, cutlass.AddressSpace.smem,
-                                 cute.make_layout((2, width), stride=(width, 1)), alignment=128)
-        barriers = ex.allocate(cutlass.Int64, cutlass.AddressSpace.smem,
-                               cute.make_layout(4 * self.stages + 5 * self.slots + 2), alignment=8)
+        shared_l = ex.allocate(
+            f32,
+            cutlass.AddressSpace.smem,
+            cute.make_layout((2, 128, rows), stride=(128 * (rows + 1), rows + 1, 1)),
+            alignment=128,
+        )
+        shared = ex.allocate(
+            f32,
+            cutlass.AddressSpace.smem,
+            cute.make_layout((4, width), stride=(width, 1)),
+            alignment=128,
+        )
+        alphas = ex.allocate(
+            f32,
+            cutlass.AddressSpace.smem,
+            cute.make_layout((width, self.slots), stride=(1, width)),
+            alignment=128,
+        )
+        stream_off = ex.allocate(
+            f32,
+            cutlass.AddressSpace.smem,
+            cute.make_layout((2, width), stride=(width, 1)),
+            alignment=128,
+        )
+        barriers = ex.allocate(
+            cutlass.Int64,
+            cutlass.AddressSpace.smem,
+            cute.make_layout(4 * self.stages + 5 * self.slots + 2),
+            alignment=8,
+        )
         bq = barriers.iterator
         bk = bq + 1
         bv = bk + self.stages
@@ -162,18 +255,31 @@ class Q1SplitDecode:
         bdenom = bfree + self.slots
         if tid < 4 * self.stages + 5 * self.slots + 2:
             count = cutlass.Int32(1)
-            if tid >= 4 * self.stages + 1 + 2 * self.slots and tid < 4 * self.stages + 1 + 3 * self.slots:
+            if (
+                tid >= 4 * self.stages + 1 + 2 * self.slots
+                and tid < 4 * self.stages + 1 + 3 * self.slots
+            ):
                 count = cutlass.Int32(128)
             if tid == 4 * self.stages + 5 * self.slots + 1:
                 count = cutlass.Int32(128)
             cute.arch.mbarrier_init(barriers.iterator + tid, count)
         cute.arch.mbarrier_init_fence()
         cute.arch.sync_threads()
-        ts = ex.allocate(f32, cutlass.AddressSpace.tmem,
-                         ex.make_tmem_layout_acc(kq, (128, width, 256), self.slots), alignment=32)
-        to = ex.allocate(f32, cutlass.AddressSpace.tmem,
-                         ex.make_tmem_layout_acc(vp, (128, width, 128), 2 * self.slots), alignment=32)
-        copy_atom = cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition(width)), f32)
+        ts = ex.allocate(
+            f32,
+            cutlass.AddressSpace.tmem,
+            ex.make_tmem_layout_acc(kq, (128, width, 256), self.slots),
+            alignment=32,
+        )
+        to = ex.allocate(
+            f32,
+            cutlass.AddressSpace.tmem,
+            ex.make_tmem_layout_acc(vp, (128, width, 128), 2 * self.slots),
+            alignment=32,
+        )
+        copy_atom = cute.make_copy_atom(
+            tcgen05.Ld32x32bOp(tcgen05.Repetition(width)), f32
+        )
         s_plane = ts[(None, None), 0, 0, 0]
         copy_s = tcgen05.make_tmem_copy(copy_atom, s_plane).get_slice(local_tid)
         rlayout = copy_s.partition_D(s_plane).layout
@@ -208,7 +314,9 @@ class Q1SplitDecode:
                         slot = it % self.slots
                         cute.arch.mbarrier_wait(bs + slot, phase=(it // self.slots) % 2)
                         current_s = ts[(None, None), 0, 0, slot]
-                        current_copy = tcgen05.make_tmem_copy(copy_atom, current_s).get_slice(local_tid)
+                        current_copy = tcgen05.make_tmem_copy(
+                            copy_atom, current_s
+                        ).get_slice(local_tid)
                         sub_scores = cute.make_tensor(scores.iterator, rlayout)
                         ex.partition_and_copy(current_copy, current_s, sub_scores)
                         cute.arch.fence_view_async_tmem_load()
@@ -222,12 +330,16 @@ class Q1SplitDecode:
                             if token >= end_tok:
                                 score = -f32.inf
                             scores[j, 0] = score
-                            maximum = cute.arch.warp_redux_sync(score, kind='fmax', nan=True)
+                            maximum = cute.arch.warp_redux_sync(
+                                score, kind="fmax", nan=True
+                            )
                             if lane == j % 32:
                                 shared[warp, j] = maximum
                         prim.barrier_cta_sync(1, thread_count=128)
                         # The value consumer releases both the probability and alpha slot.
-                        cute.arch.mbarrier_wait(bfree + slot, phase=(it // self.slots + 1) % 2)
+                        cute.arch.mbarrier_wait(
+                            bfree + slot, phase=(it // self.slots + 1) % 2
+                        )
                         raw = running_m[st]
                         if lane < rows:
                             for w in cutlass.range_constexpr(4):
@@ -240,7 +352,9 @@ class Q1SplitDecode:
                         if raw == -f32.inf:
                             safe = f32(0)
                         lane_off[0] = safe
-                        lane_alpha[0] = cute.math.exp2(running_off[st] - safe, fastmath=True)
+                        lane_alpha[0] = cute.math.exp2(
+                            running_off[st] - safe, fastmath=True
+                        )
                         running_m[st] = raw
                         running_off[st] = off
                         if warp == 0:
@@ -249,7 +363,10 @@ class Q1SplitDecode:
                             offset = cute.arch.shuffle_sync(lane_off[0], j)
                             alpha = cute.arch.shuffle_sync(lane_alpha[0], j)
                             total = running_l[st, j] * alpha
-                            probability = cute.math.exp2(cute.math.fma(scores[j, 0], qk_scale, -offset), fastmath=True)
+                            probability = cute.math.exp2(
+                                cute.math.fma(scores[j, 0], qk_scale, -offset),
+                                fastmath=True,
+                            )
                             total += probability
                             scores[j, 0] = probability
                             running_l[st, j] = total
@@ -279,11 +396,15 @@ class Q1SplitDecode:
                         cute.arch.mbarrier_wait(bo + slot, phase=(it // self.slots) % 2)
                         for dm in cutlass.range_constexpr(2):
                             o_plane = to[(None, None), 0, 0, 2 * slot + dm]
-                            copy_o = tcgen05.make_tmem_copy(copy_atom, o_plane).get_slice(local_tid)
+                            copy_o = tcgen05.make_tmem_copy(
+                                copy_atom, o_plane
+                            ).get_slice(local_tid)
                             ex.partition_and_copy(copy_o, o_plane, value)
                             cute.arch.fence_view_async_tmem_load()
                             for j in cutlass.range_constexpr(rows):
-                                accum[st, j, dm] = accum[st, j, dm] * alphas[j, slot] + value[j]
+                                accum[st, j, dm] = (
+                                    accum[st, j, dm] * alphas[j, slot] + value[j]
+                                )
                         prim.barrier_cta_sync(2, thread_count=128)
                         if warp == 4:
                             with cute.arch.elect_one():
@@ -301,7 +422,9 @@ class Q1SplitDecode:
                     w1 = cute.math.exp2(o1 - top, fastmath=True)
                 for dm in cutlass.range_constexpr(2):
                     merged = accum[0, j, dm] * w0 + accum[1, j, dm] * w1
-                    partial[split, j, local_tid + dm * 128] = cutlass.BFloat16(merged * out_scale)
+                    partial[split, j, local_tid + dm * 128] = cutlass.BFloat16(
+                        merged * out_scale
+                    )
         else:
             if warp == 8:
                 q_frag = kq.get_slice(0).partition_B(sq)
@@ -309,13 +432,20 @@ class Q1SplitDecode:
                 cute.arch.mbarrier_wait(bq, phase=0)
                 for it in cutlass.range(0, nblk):
                     slot, stage = it % self.slots, it % self.stages
-                    cute.arch.mbarrier_wait(bsfree + slot, phase=(it // self.slots + 1) % 2)
+                    cute.arch.mbarrier_wait(
+                        bsfree + slot, phase=(it // self.slots + 1) % 2
+                    )
                     cute.arch.mbarrier_wait(bk + stage, phase=(it // self.stages) % 2)
                     ktile = cute.local_tile(sk[None, None, stage], (128, 256), (0, 0))
                     k_frag = kq.get_slice(0).partition_A(ktile)
                     atom_kq.set(tcgen05.Field.ACCUMULATE, False)
                     for kk in cutlass.range_constexpr(cute.size(k_frag, mode=[2])):
-                        ex.dot(atom_kq, k_frag[None, None, kk], q_frag[None, None, kk], ts[None, None, None, slot])
+                        ex.dot(
+                            atom_kq,
+                            k_frag[None, None, kk],
+                            q_frag[None, None, kk],
+                            ts[None, None, None, slot],
+                        )
                         atom_kq.set(tcgen05.Field.ACCUMULATE, True)
                     with cute.arch.elect_one():
                         tcgen05.commit(bs + slot, None, tcgen05.CtaGroup.ONE)
@@ -328,11 +458,18 @@ class Q1SplitDecode:
                     cute.arch.mbarrier_wait(bv + stage, phase=(it // self.stages) % 2)
                     p_frag = vp.get_slice(0).partition_B(sp[None, None, slot])
                     for dm in cutlass.range_constexpr(2):
-                        vtile = cute.local_tile(sv[None, None, stage], (128, self.tile), (dm, 0))
+                        vtile = cute.local_tile(
+                            sv[None, None, stage], (128, self.tile), (dm, 0)
+                        )
                         v_frag = vp.get_slice(0).partition_A(vtile)
                         atom_vp.set(tcgen05.Field.ACCUMULATE, False)
                         for kk in cutlass.range_constexpr(cute.size(v_frag, mode=[2])):
-                            ex.dot(atom_vp, v_frag[None, None, kk], p_frag[None, None, kk], to[None, None, None, 2 * slot + dm])
+                            ex.dot(
+                                atom_vp,
+                                v_frag[None, None, kk],
+                                p_frag[None, None, kk],
+                                to[None, None, None, 2 * slot + dm],
+                            )
                             atom_vp.set(tcgen05.Field.ACCUMULATE, True)
                     with cute.arch.elect_one():
                         tcgen05.commit(bo + slot, None, tcgen05.CtaGroup.ONE)
@@ -340,21 +477,53 @@ class Q1SplitDecode:
             elif warp == 10:
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive_and_expect_tx(bq, width * 256)
-                ex.tma_load(cute.local_tile(q, (width, 256), (0, 0)), sq,
-                            bq.value, update_expect_tx=False)
+                ex.tma_load(
+                    cute.local_tile(q, (width, 256), (0, 0)),
+                    sq,
+                    bq.value,
+                    update_expect_tx=False,
+                )
                 for stage in cutlass.range_constexpr(self.stages):
                     if stage < nblk:
-                        load_keys(k, table, sk, bk + stage, begin_page + stage * (self.tile // 64), stage,
-                                  self.tile, length)
+                        load_keys(
+                            k,
+                            table,
+                            sk,
+                            bk + stage,
+                            begin_page + stage * (self.tile // 64),
+                            stage,
+                            self.tile,
+                            length,
+                        )
                 for it in cutlass.range(0, nblk):
                     stage = it % self.stages
-                    cute.arch.mbarrier_wait(bvfree + stage, phase=(it // self.stages + 1) % 2)
-                    load_values(v, table, sv, bv + stage, begin_page + it * (self.tile // 64), stage,
-                                self.tile, length)
+                    cute.arch.mbarrier_wait(
+                        bvfree + stage, phase=(it // self.stages + 1) % 2
+                    )
+                    load_values(
+                        v,
+                        table,
+                        sv,
+                        bv + stage,
+                        begin_page + it * (self.tile // 64),
+                        stage,
+                        self.tile,
+                        length,
+                    )
                     if it + self.stages < nblk:
-                        cute.arch.mbarrier_wait(bkfree + stage, phase=(it // self.stages) % 2)
-                        load_keys(k, table, sk, bk + stage, begin_page + (it + self.stages) * (self.tile // 64),
-                                  stage, self.tile, length)
+                        cute.arch.mbarrier_wait(
+                            bkfree + stage, phase=(it // self.stages) % 2
+                        )
+                        load_keys(
+                            k,
+                            table,
+                            sk,
+                            bk + stage,
+                            begin_page + (it + self.stages) * (self.tile // 64),
+                            stage,
+                            self.tile,
+                            length,
+                        )
         cute.arch.mbarrier_wait(bdenom, phase=0)
         for chunk in cutlass.range_constexpr(cute.ceil_div(rows, 12)):
             column = warp + 12 * chunk
@@ -364,8 +533,12 @@ class Q1SplitDecode:
                 top = cute.arch.fmax(o0, o1)
                 total = f32(0)
                 for st in cutlass.range_constexpr(2):
-                    part = (shared_l[st, lane, column] + shared_l[st, lane + 32, column]) + (
-                        shared_l[st, lane + 64, column] + shared_l[st, lane + 96, column])
+                    part = (
+                        shared_l[st, lane, column] + shared_l[st, lane + 32, column]
+                    ) + (
+                        shared_l[st, lane + 64, column]
+                        + shared_l[st, lane + 96, column]
+                    )
                     for offset in cutlass.range_constexpr(5):
                         part += cute.arch.shuffle_sync_bfly(part, 1 << offset)
                     stream_top = o0 if st == 0 else o1
@@ -383,8 +556,17 @@ from cutlass.cute.runtime import from_dlpack
 
 
 @triton.jit
-def _q1_merge(partial, maxima, denom, lengths, out, ROWS: tl.constexpr, NSPLIT: tl.constexpr, NP2: tl.constexpr,
-              BLOCK_D: tl.constexpr):
+def _q1_merge(
+    partial,
+    maxima,
+    denom,
+    lengths,
+    out,
+    ROWS: tl.constexpr,
+    NSPLIT: tl.constexpr,
+    NP2: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
     row = tl.program_id(0)
     dblk = tl.program_id(1)
     length = tl.load(lengths)
@@ -397,7 +579,11 @@ def _q1_merge(partial, maxima, denom, lengths, out, ROWS: tl.constexpr, NSPLIT: 
     w = tl.where(valid, tl.exp2(m - tl.max(m, 0)), 0.0)
     total = tl.sum(tl.load(denom + c * ROWS + row, mask=valid, other=0.0) * w, 0)
     d = dblk * BLOCK_D + tl.arange(0, BLOCK_D)
-    part = tl.load(partial + (c[:, None] * ROWS + row) * 256 + d[None, :], mask=valid[:, None], other=0.0)
+    part = tl.load(
+        partial + (c[:, None] * ROWS + row) * 256 + d[None, :],
+        mask=valid[:, None],
+        other=0.0,
+    )
     o = tl.sum(part.to(tl.float32) * w[:, None], 0)
     # Denominators are sums of P x 448; partials are O / 448.
     tl.store(out + row * 256 + d, (o / (total * (1.0 / 448.0))).to(tl.bfloat16))
@@ -408,34 +594,69 @@ class Q1SplitPlan:
 
     def __init__(self, query, kv, table, lengths, *, nsplit=None, stages=2, slots=2):
         if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("Paged FP8 q1 decode storage must be prepared before graph capture")
+            raise RuntimeError(
+                "Paged FP8 q1 decode storage must be prepared before graph capture"
+            )
         qlen, self.heads, _ = query.shape
         assert qlen == 1
-        self.nsplit = nsplit or torch.cuda.get_device_properties(query.device).multi_processor_count
-        self.partial = torch.empty((self.nsplit, self.heads, 256), dtype=torch.bfloat16, device=query.device)
-        self.maximum = torch.empty((self.nsplit, self.heads), dtype=torch.float32, device=query.device)
+        self.nsplit = (
+            nsplit
+            or torch.cuda.get_device_properties(query.device).multi_processor_count
+        )
+        self.partial = torch.empty(
+            (self.nsplit, self.heads, 256), dtype=torch.bfloat16, device=query.device
+        )
+        self.maximum = torch.empty(
+            (self.nsplit, self.heads), dtype=torch.float32, device=query.device
+        )
         self.denom = torch.empty_like(self.maximum)
         kernel = Q1SplitDecode(self.heads, self.nsplit, stages=stages, slots=slots)
         views = self._views(query, kv, table, lengths)
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-        self.compiled = cute.compile(kernel, *views, cutlass.Float32(1.0), cutlass.Float32(1.0), stream)
+        self.compiled = cute.compile(
+            kernel, *views, cutlass.Float32(1.0), cutlass.Float32(1.0), stream
+        )
 
     def _views(self, query, kv, table, lengths):
         k, v = kv
-        tensors = (query.view(-1, 256), k.view(-1, 256), v.view(-1, 256).T,
-                   table, lengths, self.partial, self.maximum, self.denom)
+        tensors = (
+            query.view(-1, 256),
+            k.view(-1, 256),
+            v.view(-1, 256).T,
+            table,
+            lengths,
+            self.partial,
+            self.maximum,
+            self.denom,
+        )
         return tuple(from_dlpack(t) for t in tensors)
 
     def run(self, query, kv, table, lengths, *, qk_scale, v_scale, out):
         views = self._views(query, kv, table, lengths)
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-        self.compiled(*views, cutlass.Float32(qk_scale * 1.4426950408889634), cutlass.Float32(v_scale / 448.0), stream)
+        self.compiled(
+            *views,
+            cutlass.Float32(qk_scale * 1.4426950408889634),
+            cutlass.Float32(v_scale / 448.0),
+            stream,
+        )
         _q1_merge[(self.heads, 256 // 32, 1)](
-            self.partial, self.maximum, self.denom, lengths, out, self.heads, self.nsplit,
-            triton.next_power_of_2(self.nsplit), 32, num_warps=4)
+            self.partial,
+            self.maximum,
+            self.denom,
+            lengths,
+            out,
+            self.heads,
+            self.nsplit,
+            triton.next_power_of_2(self.nsplit),
+            32,
+            num_warps=4,
+        )
         return out
 
 
 def skv2_q1_decode(query, kv, table, lengths, plan, *, qk_scale, v_scale, out):
     """q1 decode for one request through a prepared plan; same contract as trtllm_batch_decode_with_kv_cache."""
-    return plan.run(query, kv, table, lengths, qk_scale=qk_scale, v_scale=v_scale, out=out)
+    return plan.run(
+        query, kv, table, lengths, qk_scale=qk_scale, v_scale=v_scale, out=out
+    )

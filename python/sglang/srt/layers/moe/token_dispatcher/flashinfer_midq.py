@@ -100,7 +100,9 @@ class CombineProof:
     def __init__(self, speculative: bool):
         self.speculative = speculative
         # [calls, compared elements, differing elements]
-        self.counters = torch.zeros(3, dtype=torch.int64, device=torch.cuda.current_device())
+        self.counters = torch.zeros(
+            3, dtype=torch.int64, device=torch.cuda.current_device()
+        )
         # Model init runs under a CUDA default-device context; pinned memory must say cpu.
         self.host_counters = torch.zeros(
             3, dtype=torch.int64, device="cpu", pin_memory=True

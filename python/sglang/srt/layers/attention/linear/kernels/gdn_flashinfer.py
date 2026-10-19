@@ -17,13 +17,13 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
 from sglang.srt.runtime_context import (
     mamba_cache_chunk_size,
 )
-from sglang.srt.environ import envs
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.common import print_info_once
 

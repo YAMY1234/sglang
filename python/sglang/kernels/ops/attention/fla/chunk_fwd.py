@@ -344,7 +344,9 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     if STORE_UPPER_ZEROS:
         # The caller skipped the zero fill of A; write the six upper blocks here.
         b_zero = tl.zeros([BC, BC], dtype=A.dtype.element_ty)
-        p_A01 = tl.make_block_ptr(A, (T, BT), (H * BT, 1), (i_tc0, BC), (BC, BC), (1, 0))
+        p_A01 = tl.make_block_ptr(
+            A, (T, BT), (H * BT, 1), (i_tc0, BC), (BC, BC), (1, 0)
+        )
         p_A02 = tl.make_block_ptr(
             A, (T, BT), (H * BT, 1), (i_tc0, 2 * BC), (BC, BC), (1, 0)
         )

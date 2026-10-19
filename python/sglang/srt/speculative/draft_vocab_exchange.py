@@ -13,6 +13,7 @@ from typing import Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.speculative.draft_peer_xchg import draft_argmax_xchg
 from sglang.kernels.ops.speculative.draft_vocab_argmax import (
     META_ELEMS,
     NAN_KEY_SPLIT_ARGMAX,
@@ -21,7 +22,6 @@ from sglang.kernels.ops.speculative.draft_vocab_argmax import (
     vocab_argmax_pack,
     vocab_argmax_select,
 )
-from sglang.kernels.ops.speculative.draft_peer_xchg import draft_argmax_xchg
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
 from sglang.srt.layers.kdense_draft_xchg import make_argmax_slots
@@ -32,7 +32,9 @@ from sglang.srt.speculative.draft_hot_vocab import DraftHotVocab, build_hot_head
 logger = logging.getLogger(__name__)
 
 
-def _unsupported_reason(model, num_steps: int, hot: Optional[DraftHotVocab]) -> Optional[str]:
+def _unsupported_reason(
+    model, num_steps: int, hot: Optional[DraftHotVocab]
+) -> Optional[str]:
     from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
 
     if not isinstance(model, Qwen3_5ForCausalLMMTP):
@@ -84,7 +86,9 @@ class DraftVocabExchange:
 
     MAX_ROWS = envs.SGLANG_Q35MF_DRAFT_VOCAB_EXCHANGE_MAX_ROWS.get()
 
-    def __init__(self, model, num_steps: int, hot: Optional[DraftHotVocab] = None) -> None:
+    def __init__(
+        self, model, num_steps: int, hot: Optional[DraftHotVocab] = None
+    ) -> None:
         self.model = model
         self.num_steps = num_steps
         embed = model.model.embed_tokens
@@ -110,7 +114,9 @@ class DraftVocabExchange:
             )
             rows = self.embed_weight.shape[0]
             self.vocab_start = 0
-            self.token_map = hot.token_ids[parallel.tp_rank * rows : (parallel.tp_rank + 1) * rows].contiguous()
+            self.token_map = hot.token_ids[
+                parallel.tp_rank * rows : (parallel.tp_rank + 1) * rows
+            ].contiguous()
         self.local_vocab = self.embed_weight.shape[0]
         hidden = self.embed_weight.shape[1]
         # Draft steps of up to step_rows requests use the exchange; the draft extend keeps MAX_ROWS.
@@ -119,13 +125,21 @@ class DraftVocabExchange:
             self.MAX_ROWS if step_rows is None else min(max(step_rows, 1), 8)
         )
         rows = max(self.MAX_ROWS, self.step_rows)
-        self.payload = torch.empty(rows, hidden + META_ELEMS, dtype=torch.bfloat16, device=dev)
+        self.payload = torch.empty(
+            rows, hidden + META_ELEMS, dtype=torch.bfloat16, device=dev
+        )
         self.part_key = torch.empty(rows, PACK_BLOCKS, dtype=torch.int32, device=dev)
         self.part_idx = torch.empty(rows, PACK_BLOCKS, dtype=torch.int32, device=dev)
         self.counter = torch.zeros(rows, dtype=torch.int32, device=dev)
         self.next_embeds = torch.empty(rows, hidden, dtype=torch.bfloat16, device=dev)
-        self.topk_index = [torch.empty(rows, 1, dtype=torch.int64, device=dev) for _ in range(num_steps)]
-        self.topk_p = [torch.empty(rows, 1, dtype=torch.float32, device=dev) for _ in range(num_steps)]
+        self.topk_index = [
+            torch.empty(rows, 1, dtype=torch.int64, device=dev)
+            for _ in range(num_steps)
+        ]
+        self.topk_p = [
+            torch.empty(rows, 1, dtype=torch.float32, device=dev)
+            for _ in range(num_steps)
+        ]
         self.no_tokens = torch.empty(0, dtype=torch.int64, device=dev)
         self.no_positions = torch.empty(0, dtype=torch.int64, device=dev)
         self.num_rows = 1
@@ -147,10 +161,12 @@ class DraftVocabExchange:
     @classmethod
     def maybe_create(
         cls, model, num_steps: int, hot: Optional[DraftHotVocab] = None
-    ) -> Optional["DraftVocabExchange"]:
+    ) -> Optional[DraftVocabExchange]:
         reason = _unsupported_reason(model, num_steps, hot)
         if reason is not None:
-            logger.warning("Draft vocab exchange disabled (%s); using the stock path.", reason)
+            logger.warning(
+                "Draft vocab exchange disabled (%s); using the stock path.", reason
+            )
             return None
         exchange = cls(model, num_steps, hot)
         logger.info(
@@ -166,7 +182,11 @@ class DraftVocabExchange:
         self.num_rows = num_rows
         if num_rows > self.max_rows_seen:
             self.max_rows_seen = num_rows
-            logger.info("Draft vocab exchange covers %d-row draft steps (limit %d).", num_rows, self.step_rows)
+            logger.info(
+                "Draft vocab exchange covers %d-row draft steps (limit %d).",
+                num_rows,
+                self.step_rows,
+            )
         mkd = self.mkd
         if mkd is not None:
             mkd.armed = num_rows == 1
@@ -180,7 +200,9 @@ class DraftVocabExchange:
             # The model finishes the fc from the exchange; this row only carries the shape.
             self.model.draft_input_embeds = self.next_embeds[:num_rows]
         else:
-            self.model.draft_input_embeds = self.next_embeds[:num_rows] if step > 0 else None
+            self.model.draft_input_embeds = (
+                self.next_embeds[:num_rows] if step > 0 else None
+            )
         self.model.logits_processor.skip_vocab_gather_rows = self.step_rows
 
     def finish_step(
@@ -214,9 +236,13 @@ class DraftVocabExchange:
                 nan_key=NAN_KEY_SPLIT_ARGMAX,
                 topk_index=topk_index,
                 topk_p=topk_p,
-                draft_tokens=draft_tokens if draft_tokens is not None else self.no_tokens,
+                draft_tokens=draft_tokens
+                if draft_tokens is not None
+                else self.no_tokens,
                 positions=positions,
-                mrope_positions=mrope_positions if mrope_positions is not None else self.no_mrope,
+                mrope_positions=mrope_positions
+                if mrope_positions is not None
+                else self.no_mrope,
                 draft_column=draft_column,
             )
             return topk_p, topk_index
@@ -240,7 +266,10 @@ class DraftVocabExchange:
         self.model.logits_processor.skip_vocab_gather_rows = 0
 
     def is_local(self, logits: torch.Tensor) -> bool:
-        return logits.shape[-1] == self.local_vocab and 0 < logits.shape[0] <= self.MAX_ROWS
+        return (
+            logits.shape[-1] == self.local_vocab
+            and 0 < logits.shape[0] <= self.MAX_ROWS
+        )
 
     def select_extend(
         self, local_logits: torch.Tensor, hidden_states: Optional[torch.Tensor] = None
@@ -314,7 +343,9 @@ class DraftVocabExchange:
             draft_column,
         )
 
-    def _pack_and_gather(self, local_logits: torch.Tensor, m: int, nan_key: int) -> torch.Tensor:
+    def _pack_and_gather(
+        self, local_logits: torch.Tensor, m: int, nan_key: int
+    ) -> torch.Tensor:
         vocab_argmax_pack(
             local_logits,
             self.embed_weight,

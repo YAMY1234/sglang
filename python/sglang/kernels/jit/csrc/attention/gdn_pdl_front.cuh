@@ -4,20 +4,30 @@
 #pragma once
 
 #include <sgl_kernel/tensor.h>
+
 #include <sgl_kernel/utils.cuh>
+
+#include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
-#include <cstdint>
 
 namespace sglang {
 namespace gdn_pdl_front_detail {
 
 constexpr int kThreads = 256;
 constexpr int kCluster = 8;
-__device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
-__device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
-__device__ __forceinline__ void cluster_arrive() { asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory"); }
-__device__ __forceinline__ void cluster_wait() { asm volatile("barrier.cluster.wait.aligned;" ::: "memory"); }
+__device__ __forceinline__ void pdl_wait() {
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+}
+__device__ __forceinline__ void pdl_trigger() {
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+}
+__device__ __forceinline__ void cluster_arrive() {
+  asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+}
+__device__ __forceinline__ void cluster_wait() {
+  asm volatile("barrier.cluster.wait.aligned;" ::: "memory");
+}
 __device__ __forceinline__ uint4 ldg_nc_v4(const uint4* p) {
   uint4 r;
   asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
@@ -36,8 +46,7 @@ __device__ __forceinline__ void mbar_init_fence() {
   asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
 }
 __device__ __forceinline__ void mbar_expect_tx(uint64_t* bar, uint32_t bytes) {
-  asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(smem_u32(bar)), "r"(bytes)
-               : "memory");
+  asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(smem_u32(bar)), "r"(bytes) : "memory");
 }
 __device__ __forceinline__ float div_full(float a, float b) {
   float r;
@@ -50,7 +59,9 @@ __device__ __forceinline__ uint32_t e4m3x2(float lo, float hi) {
   asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(r) : "f"(hi), "f"(lo));
   return r;
 }
-__device__ __forceinline__ uint8_t e4m3(float v) { return (uint8_t)(e4m3x2(v, 0.f) & 0xff); }
+__device__ __forceinline__ uint8_t e4m3(float v) {
+  return (uint8_t)(e4m3x2(v, 0.f) & 0xff);
+}
 
 __device__ __forceinline__ void mma_e4m3(float (&d)[4], const uint4& a, uint32_t b0, uint32_t b1) {
   asm volatile(
@@ -67,10 +78,10 @@ __device__ __forceinline__ uint32_t quant4_static(const __nv_bfloat16* p, float 
   const __nv_bfloat162 v23 = *reinterpret_cast<const __nv_bfloat162*>(&raw.y);
   float f[4] = {__low2float(v01), __high2float(v01), __low2float(v23), __high2float(v23)};
 #pragma unroll
-  for (int i = 0; i < 4; ++i) f[i] = fminf(fmaxf(__fmul_rn(f[i], inv), -448.f), 448.f);
+  for (int i = 0; i < 4; ++i)
+    f[i] = fminf(fmaxf(__fmul_rn(f[i], inv), -448.f), 448.f);
   return e4m3x2(f[0], f[1]) | (e4m3x2(f[2], f[3]) << 16);
 }
-
 
 __device__ __forceinline__ unsigned cluster_rank() {
   unsigned value;
@@ -83,15 +94,22 @@ __device__ __forceinline__ unsigned peer_address(unsigned value, unsigned rank) 
   return result;
 }
 __device__ __forceinline__ void push4(unsigned dst, float a, float b, float c, float d, unsigned bar) {
-  asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.f32 [%0], {%1,%2,%3,%4}, [%5];"
-      :: "r"(dst), "f"(a), "f"(b), "f"(c), "f"(d), "r"(bar) : "memory");
+  asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.f32 [%0], {%1,%2,%3,%4}, [%5];" ::"r"(dst),
+               "f"(a),
+               "f"(b),
+               "f"(c),
+               "f"(d),
+               "r"(bar)
+               : "memory");
 }
 __device__ __forceinline__ void wait_inbox(uint64_t* bar, unsigned* error, uint64_t timeout) {
   const uint64_t start = clock64();
   unsigned polls = 0, ready = 0;
   do {
     asm volatile("{ .reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 p, [%1], 0; selp.u32 %0, 1, 0, p; }"
-                 : "=r"(ready) : "r"(smem_u32(bar)) : "memory");
+                 : "=r"(ready)
+                 : "r"(smem_u32(bar))
+                 : "memory");
     if (!ready && (clock64() - start > timeout || ++polls >= (1u << 24))) {
       if (atomicCAS(error, 0u, 1u) == 0u) printf("projection inbox timeout block=%u\n", blockIdx.x);
       asm volatile("trap;");
@@ -130,7 +148,10 @@ __global__ __launch_bounds__(kThreads, 1) void front_kernel(Params p) {
   const int rank = cluster_rank(), unit = blockIdx.x / kCluster;
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   const int g = lane >> 2, t = lane & 3;
-  if (tid == 0) { mbar_init(&barrier, 1); mbar_init_fence(); }
+  if (tid == 0) {
+    mbar_init(&barrier, 1);
+    mbar_init_fence();
+  }
   __syncthreads();
   cluster_arrive();
   uint4 weights[16][2];
@@ -152,8 +173,7 @@ __global__ __launch_bounds__(kThreads, 1) void front_kernel(Params p) {
       const int offset = g * 4096 + rank * 512 + step * 32 + 4 * t;
       if constexpr (Quantized) {
         const uint8_t* x = static_cast<const uint8_t*>(p.x) + offset;
-        value = make_uint2(*reinterpret_cast<const uint32_t*>(x),
-                           *reinterpret_cast<const uint32_t*>(x + 16));
+        value = make_uint2(*reinterpret_cast<const uint32_t*>(x), *reinterpret_cast<const uint32_t*>(x + 16));
       } else {
         const auto* x = static_cast<const __nv_bfloat16*>(p.x) + offset;
         value = make_uint2(quant4_static(x, inverse), quant4_static(x + 16, inverse));
@@ -174,12 +194,11 @@ __global__ __launch_bounds__(kThreads, 1) void front_kernel(Params p) {
   for (int block = 0; block < 2; ++block)
 #pragma unroll
     for (int i = 0; i < 4; ++i)
-      acc[block][i] = __fadd_rn(__fadd_rn(chains[block][0][i], chains[block][1][i]),
-                               __fadd_rn(chains[block][2][i], chains[block][3][i]));
+      acc[block][i] = __fadd_rn(
+          __fadd_rn(chains[block][0][i], chains[block][1][i]), __fadd_rn(chains[block][2][i], chains[block][3][i]));
   const bool feature_owner = FuseConv && unit < 6;
   const bool owner = feature_owner || rank < p.m;
-  const unsigned bytes = feature_owner ? kCluster * p.m * 32 * sizeof(float)
-                                        : kCluster * 256 * sizeof(float);
+  const unsigned bytes = feature_owner ? kCluster * p.m * 32 * sizeof(float) : kCluster * 256 * sizeof(float);
   if (tid == 0 && owner) mbar_expect_tx(&barrier, bytes);
   cluster_wait();
 #pragma unroll
@@ -189,8 +208,13 @@ __global__ __launch_bounds__(kThreads, 1) void front_kernel(Params p) {
       const int slot = feature_owner ? token * 32 + g * 4 : warp * 32 + g * 4;
       const unsigned destination = smem_u32(&inbox[rank][slot]);
       const int peer = feature_owner ? warp : token;
-      push4(peer_address(destination, peer), acc[0][j], acc[0][2+j], acc[1][j], acc[1][2+j],
-            peer_address(smem_u32(&barrier), peer));
+      push4(
+          peer_address(destination, peer),
+          acc[0][j],
+          acc[0][2 + j],
+          acc[1][j],
+          acc[1][2 + j],
+          peer_address(smem_u32(&barrier), peer));
     }
   }
   if (!owner) return;
@@ -200,19 +224,22 @@ __global__ __launch_bounds__(kThreads, 1) void front_kernel(Params p) {
     if (tid >= 32) return;
     const int channel = unit * 256 + rank * 32 + (tid >> 2) + 8 * (tid & 3);
     const int64_t state_slot = p.state_index64 ? static_cast<const int64_t*>(p.state_indices)[0]
-                                              : static_cast<const int32_t*>(p.state_indices)[0];
+                                               : static_cast<const int32_t*>(p.state_indices)[0];
     const bool valid = state_slot != p.pad_slot;
     const int64_t replay_slot = valid ? (p.replay_index64 ? static_cast<const int64_t*>(p.replay_indices)[0]
-                                                       : static_cast<const int32_t*>(p.replay_indices)[0]) : 0;
+                                                          : static_cast<const int32_t*>(p.replay_indices)[0])
+                                      : 0;
     const int64_t state_base = valid ? state_slot * p.state_stride[0] + channel * p.state_stride[1] : 0;
-    __nv_bfloat16* window = valid ? p.windows + replay_slot * p.window_stride[0] + channel * p.window_stride[1] : nullptr;
+    __nv_bfloat16* window =
+        valid ? p.windows + replay_slot * p.window_stride[0] + channel * p.window_stride[1] : nullptr;
     float old0 = 0.f, old1 = 0.f, old2 = 0.f, weight[4] = {};
     if (valid) {
       old0 = __bfloat162float(p.conv_state[state_base]);
       old1 = __bfloat162float(p.conv_state[state_base + p.state_stride[2]]);
       old2 = __bfloat162float(p.conv_state[state_base + 2 * p.state_stride[2]]);
 #pragma unroll
-      for (int tap = 0; tap < 4; ++tap) weight[tap] = __bfloat162float(p.conv_weight[channel * 4 + tap]);
+      for (int tap = 0; tap < 4; ++tap)
+        weight[tap] = __bfloat162float(p.conv_weight[channel * 4 + tap]);
       // The overlapping logical windows have one physical writer per channel.
       window[0] = __float2bfloat16_rn(old1);
       window[1] = __float2bfloat16_rn(old2);
@@ -228,21 +255,23 @@ __global__ __launch_bounds__(kThreads, 1) void front_kernel(Params p) {
       if (valid) {
         const float value = __bfloat162float(rounded);
         // Preserve the BF16 product boundary before the stock FP32 additions.
-        const float p0 = __bfloat162float(__float2bfloat16_rn(__fmul_rn(old0,weight[0])));
-        const float p1 = __bfloat162float(__float2bfloat16_rn(__fmul_rn(old1,weight[1])));
-        const float p2 = __bfloat162float(__float2bfloat16_rn(__fmul_rn(old2,weight[2])));
-        const float p3 = __bfloat162float(__float2bfloat16_rn(__fmul_rn(value,weight[3])));
-        float accumulator = __fadd_rn(p0,0.f);
-        accumulator = __fadd_rn(accumulator,p1);
-        accumulator = __fadd_rn(accumulator,p2);
-        accumulator = __fadd_rn(accumulator,p3);
+        const float p0 = __bfloat162float(__float2bfloat16_rn(__fmul_rn(old0, weight[0])));
+        const float p1 = __bfloat162float(__float2bfloat16_rn(__fmul_rn(old1, weight[1])));
+        const float p2 = __bfloat162float(__float2bfloat16_rn(__fmul_rn(old2, weight[2])));
+        const float p3 = __bfloat162float(__float2bfloat16_rn(__fmul_rn(value, weight[3])));
+        float accumulator = __fadd_rn(p0, 0.f);
+        accumulator = __fadd_rn(accumulator, p1);
+        accumulator = __fadd_rn(accumulator, p2);
+        accumulator = __fadd_rn(accumulator, p3);
         float exponential;
-        const float exponent = __fmul_rn(accumulator,__int_as_float(0xBFB8AA3B));
+        const float exponent = __fmul_rn(accumulator, __int_as_float(0xBFB8AA3B));
         asm("ex2.approx.f32 %0, %1;" : "=f"(exponential) : "f"(exponent));
         const float activated = div_full(accumulator, __fadd_rn(1.f, exponential));
         p.conv_output[token * 1536 + channel] = __float2bfloat16_rn(activated);
         window[token + 2] = rounded;
-        old0 = old1; old1 = old2; old2 = value;
+        old0 = old1;
+        old1 = old2;
+        old2 = value;
       }
     }
     if (valid) {
@@ -253,7 +282,8 @@ __global__ __launch_bounds__(kThreads, 1) void front_kernel(Params p) {
   } else {
     float sum = 0.f;
 #pragma unroll
-    for (int source = 0; source < kCluster; ++source) sum = __fadd_rn(sum, inbox[source][tid]);
+    for (int source = 0; source < kCluster; ++source)
+      sum = __fadd_rn(sum, inbox[source][tid]);
     const int feature = 32 * warp + ((lane >> 2) & 7) + 8 * (lane & 3);
     p.output[rank * 2560 + unit * 256 + feature] = __float2bfloat16_rn(__fmul_rn(sum, alpha));
   }
@@ -300,35 +330,46 @@ inline void gdn_pdl_front(
   auto window_slot_stride = SymbolicSize{"window_slot_stride"};
   device.set_options<kDLCUDA>();
   const bool quantized = is_type<fp8_e4m3_t>(input.dtype());
-  TensorMatcher({7,4096}).with_dtype<bf16_t,fp8_e4m3_t>().with_device(device)
-      .ensure_alignment(quantized ? 4 : 8).verify(input);
-  TensorMatcher({2560 * 4096}).with_dtype<uint8_t>().with_device(device)
-      .ensure_alignment(16).verify(packed);
-  for (const auto& scale : {input_scale,weight_scale}) {
+  TensorMatcher({7, 4096})
+      .with_dtype<bf16_t, fp8_e4m3_t>()
+      .with_device(device)
+      .ensure_alignment(quantized ? 4 : 8)
+      .verify(input);
+  TensorMatcher({2560 * 4096}).with_dtype<uint8_t>().with_device(device).ensure_alignment(16).verify(packed);
+  for (const auto& scale : {input_scale, weight_scale}) {
     if (scale.ndim() == 0) {
       TensorMatcher({}).with_dtype<fp32_t>().with_device(device).verify(scale);
     } else {
       TensorMatcher({1}).with_dtype<fp32_t>().with_device(device).verify(scale);
     }
   }
-  TensorMatcher({1536,4}).with_dtype<bf16_t>().with_device(device).verify(conv_weight);
-  TensorMatcher({state_slots,1536,3})
-      .with_strides({state_slot_stride,state_channel_stride,state_token_stride})
-      .with_dtype<bf16_t>().with_device(device).verify(state);
-  TensorMatcher({replay_slots,7,1536,3}).with_strides({window_slot_stride,1,9,1})
-      .with_dtype<bf16_t>().with_device(device).verify(windows);
-  CHECK_HOST(window_slot_stride.unwrap() >= 1536 * 9)
-      << "convolution window slots must not overlap";
-  TensorMatcher({1}).with_dtype<int32_t,int64_t>().with_device(device).verify(state_indices);
-  TensorMatcher({1}).with_dtype<int32_t,int64_t>().with_device(device).verify(replay_indices);
-  TensorMatcher({7,2560}).with_dtype<bf16_t>().with_device(device).verify(projected);
-  TensorMatcher({7,1536}).with_dtype<bf16_t>().with_device(device).verify(conv_output);
+  TensorMatcher({1536, 4}).with_dtype<bf16_t>().with_device(device).verify(conv_weight);
+  TensorMatcher({state_slots, 1536, 3})
+      .with_strides({state_slot_stride, state_channel_stride, state_token_stride})
+      .with_dtype<bf16_t>()
+      .with_device(device)
+      .verify(state);
+  TensorMatcher({replay_slots, 7, 1536, 3})
+      .with_strides({window_slot_stride, 1, 9, 1})
+      .with_dtype<bf16_t>()
+      .with_device(device)
+      .verify(windows);
+  CHECK_HOST(window_slot_stride.unwrap() >= 1536 * 9) << "convolution window slots must not overlap";
+  TensorMatcher({1}).with_dtype<int32_t, int64_t>().with_device(device).verify(state_indices);
+  TensorMatcher({1}).with_dtype<int32_t, int64_t>().with_device(device).verify(replay_indices);
+  TensorMatcher({7, 2560}).with_dtype<bf16_t>().with_device(device).verify(projected);
+  TensorMatcher({7, 1536}).with_dtype<bf16_t>().with_device(device).verify(conv_output);
   TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(error);
 
-  Params p{input.data_ptr(),reinterpret_cast<const uint4*>(packed.data_ptr()),
-           static_cast<const float*>(input_scale.data_ptr()),static_cast<const float*>(weight_scale.data_ptr()),
-           static_cast<__nv_bfloat16*>(projected.data_ptr()),static_cast<unsigned*>(error.data_ptr()),
-           500000000u,7};
+  Params p{
+      input.data_ptr(),
+      reinterpret_cast<const uint4*>(packed.data_ptr()),
+      static_cast<const float*>(input_scale.data_ptr()),
+      static_cast<const float*>(weight_scale.data_ptr()),
+      static_cast<__nv_bfloat16*>(projected.data_ptr()),
+      static_cast<unsigned*>(error.data_ptr()),
+      500000000u,
+      7};
   p.conv_weight = static_cast<const __nv_bfloat16*>(conv_weight.data_ptr());
   p.conv_state = static_cast<__nv_bfloat16*>(state.data_ptr());
   p.windows = static_cast<__nv_bfloat16*>(windows.data_ptr());
@@ -344,11 +385,13 @@ inline void gdn_pdl_front(
   p.replay_index64 = is_type<int64_t>(replay_indices.dtype());
   p.pad_slot = pad_slot;
   if (quantized) {
-    LaunchKernel(dim3(80,1,1),dim3(kThreads,1,1),device.unwrap())
-        .enable_cluster(dim3(kCluster,1,1)).enable_pdl(true)(front_kernel<true,true>,p);
+    LaunchKernel(dim3(80, 1, 1), dim3(kThreads, 1, 1), device.unwrap())
+        .enable_cluster(dim3(kCluster, 1, 1))
+        .enable_pdl(true)(front_kernel<true, true>, p);
   } else {
-    LaunchKernel(dim3(80,1,1),dim3(kThreads,1,1),device.unwrap())
-        .enable_cluster(dim3(kCluster,1,1)).enable_pdl(true)(front_kernel<false,true>,p);
+    LaunchKernel(dim3(80, 1, 1), dim3(kThreads, 1, 1), device.unwrap())
+        .enable_cluster(dim3(kCluster, 1, 1))
+        .enable_pdl(true)(front_kernel<false, true>, p);
   }
 }
 

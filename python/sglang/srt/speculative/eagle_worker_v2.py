@@ -79,10 +79,9 @@ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWo
 from sglang.srt.speculative.dp_spec_prefill_coordination import (
     DPSpecPrefillCoordinationPlan,
 )
-from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.draft_hot_vocab import DraftHotVocab
+from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.draft_vocab_exchange import DraftVocabExchange
-from sglang.srt.speculative.mkd_draft_boundary import MkdDraftBoundary
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
@@ -107,6 +106,7 @@ from sglang.srt.speculative.eagle_worker_common import (
     prepare_for_draft_extend,
     run_eagle_verify,
 )
+from sglang.srt.speculative.mkd_draft_boundary import MkdDraftBoundary
 from sglang.srt.speculative.post_verify_graph import (
     PostVerifyGraph,
     post_verify_graph_enabled,
@@ -702,9 +702,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         ):
             can_run_decode_cuda_graph = False
 
-        mkd = (
-            self._draft_vocab_exchange.mkd if self._exchange_in_draft_steps else None
-        )
+        mkd = self._draft_vocab_exchange.mkd if self._exchange_in_draft_steps else None
         if mkd is not None and mkd.extend_fc:
             # A one-row draft's first step reads its fc from fc_buf (draft-extend fc); only the
             # extend that produced this draft input may have written it.
@@ -714,7 +712,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 and not forward_batch.forward_mode.is_idle()
                 and draft_input.topk_index.shape[0] == 1
             ):
-                mkd.fill_fc(draft_input.topk_index, draft_input.hidden_states, forward_batch)
+                mkd.fill_fc(
+                    draft_input.topk_index, draft_input.hidden_states, forward_batch
+                )
 
         n_inner = self.speculative_num_steps - 1
         canary_outside_ctx = (
@@ -1313,9 +1313,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # Reorganize the spec info for the next batch
         if not can_run_decode_cuda_graph:
             if draft_logits_output.next_token_ids is not None:
-                draft_logits_output.next_token_ids = (
-                    draft_logits_output.next_token_ids[select_index]
-                )
+                draft_logits_output.next_token_ids = draft_logits_output.next_token_ids[
+                    select_index
+                ]
             else:
                 draft_logits_output.next_token_logits = (
                     draft_logits_output.next_token_logits[select_index]

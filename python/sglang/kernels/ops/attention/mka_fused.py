@@ -23,7 +23,9 @@ def _ext():
                 hop_header = include / "sgl_kernel" / "distributed" / "q35_hop.cuh"
                 # Two source trees at the same path must not share a cached build, so the name carries a digest
                 # of the source and the hop header.
-                digest = hashlib.sha256(source.read_bytes() + hop_header.read_bytes()).hexdigest()[:12]
+                digest = hashlib.sha256(
+                    source.read_bytes() + hop_header.read_bytes()
+                ).hexdigest()[:12]
                 _EXT = load(
                     name=f"sglang_attn_fused_{digest}",
                     sources=[str(source)],
@@ -71,7 +73,11 @@ def pack_qkv(w_nk: torch.Tensor, nq: int) -> tuple[torch.Tensor, torch.Tensor]:
     main = _pack_fragments(w_nk, w_nk.shape[0] // 256, 16)
     if not split_gate(nq):
         return main, main.new_empty(0)
-    gate_rows = w_nk[: nq * 512].reshape(nq, 2, 256, w_nk.shape[1])[:, 1].reshape(nq * 256, w_nk.shape[1])
+    gate_rows = (
+        w_nk[: nq * 512]
+        .reshape(nq, 2, 256, w_nk.shape[1])[:, 1]
+        .reshape(nq * 256, w_nk.shape[1])
+    )
     return main, _pack_rows32(gate_rows)
 
 
@@ -81,13 +87,47 @@ def pack_o(w_nk: torch.Tensor) -> torch.Tensor:
 
 
 def prologue(
-    x, w_packed, sx, sw, q_norm_w, k_norm_w, cos_sin, positions, axis_map, cache_loc,
-    k_cache, v_cache, k_scale, v_scale, q_out, gate_out, nq: int, eps: float,
+    x,
+    w_packed,
+    sx,
+    sw,
+    q_norm_w,
+    k_norm_w,
+    cos_sin,
+    positions,
+    axis_map,
+    cache_loc,
+    k_cache,
+    v_cache,
+    k_scale,
+    v_scale,
+    q_out,
+    gate_out,
+    nq: int,
+    eps: float,
 ):
     w_main, w_gate = w_packed
     _ext().prologue(
-        x, w_main, sx, sw, q_norm_w, k_norm_w, cos_sin, positions, axis_map, cache_loc,
-        k_cache, v_cache, k_scale, v_scale, q_out, gate_out, w_gate, nq, eps, True,
+        x,
+        w_main,
+        sx,
+        sw,
+        q_norm_w,
+        k_norm_w,
+        cos_sin,
+        positions,
+        axis_map,
+        cache_loc,
+        k_cache,
+        v_cache,
+        k_scale,
+        v_scale,
+        q_out,
+        gate_out,
+        w_gate,
+        nq,
+        eps,
+        True,
     )
 
 

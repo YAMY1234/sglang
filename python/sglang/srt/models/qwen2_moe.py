@@ -63,8 +63,11 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import get_moe_a2a_backend, reduce_moe_output
-from sglang.srt.layers.moe import qwen_router_front
+from sglang.srt.layers.moe import (
+    get_moe_a2a_backend,
+    qwen_router_front,
+    reduce_moe_output,
+)
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.single_token_draft_moe import SingleTokenDraftMoe
@@ -818,7 +821,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
         if defer_finalize and qwen_router_front.mkm_wide_supported(self, hidden_states):
-            return qwen_router_front.forward_mkm_wide(self, hidden_states, router_logits)
+            return qwen_router_front.forward_mkm_wide(
+                self, hidden_states, router_logits
+            )
         topk_output = self.topk(hidden_states, router_logits)
         if defer_finalize:
             if not self.supports_deferred_finalize:
@@ -852,7 +857,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
     def _ktp2_shared_fused_supported(self) -> bool:
         """The FP8 static per-tensor shared expert and BF16 sigmoid gate that qwen_shared_fused reproduces."""
-        from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8LinearMethod
+        from sglang.srt.layers.quantization.modelopt_quant import (
+            ModelOptFp8LinearMethod,
+        )
 
         mlp, gate = self.shared_expert, self.shared_expert_gate
         if not isinstance(mlp, Qwen2MoeMLP) or not isinstance(gate, torch.nn.Linear):
@@ -1007,7 +1014,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 )
             current_stream.wait_stream(self.alt_stream)
             return router_output, shared_output
-        shared_output = self._forward_shared_experts(hidden_states, apply_gate=apply_gate)
+        shared_output = self._forward_shared_experts(
+            hidden_states, apply_gate=apply_gate
+        )
         return qwen_router_front.forward_routed(self, hidden_states), shared_output
 
     def forward(

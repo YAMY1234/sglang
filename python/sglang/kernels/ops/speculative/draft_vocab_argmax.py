@@ -15,7 +15,9 @@ from sglang.kernels.jit.utils import (
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-META_ELEMS = 8  # packed row tail (bf16 slots): max as an order key, global index, padding
+META_ELEMS = (
+    8  # packed row tail (bf16 slots): max as an order key, global index, padding
+)
 # Tunable: CTAs scanning one vocab shard.
 PACK_BLOCKS = 32
 
@@ -65,7 +67,15 @@ def vocab_argmax_pack(
     if token_map is None:
         token_map = logits.new_empty(0, dtype=torch.int64)
     _module(embed.shape[-1], part_key.shape[-1], world).pack(
-        logits, embed, payload, part_key, part_idx, counter, token_map, vocab_start, nan_key
+        logits,
+        embed,
+        payload,
+        part_key,
+        part_idx,
+        counter,
+        token_map,
+        vocab_start,
+        nan_key,
     )
 
 

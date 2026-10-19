@@ -84,7 +84,11 @@ class DraftHopFusion:
     def ffn_input_fusions(self, plan) -> tuple:
         if not self._stock_matches or not isinstance(plan.norm, GemmaRMSNorm):
             return ()
-        return (FfnInputFusion(completes=SumGroup.ATTN_TP, run=partial(self._ffn_input, plan)),)
+        return (
+            FfnInputFusion(
+                completes=SumGroup.ATTN_TP, run=partial(self._ffn_input, plan)
+            ),
+        )
 
     def attn_push_target(self, m: int):
         """The hop the attention output's producer may push into: the one this layer's FFN input
@@ -108,7 +112,11 @@ class DraftHopFusion:
         """The final norm of the terminal FFN's handoff; ``gamma`` (the folded Gemma multiplier) is
         unused, since FusedAddRMSNorm adds 1 to the raw weight in fp32."""
         norm = self.final_norm
-        hop = self._hop(int(handoff.partial.shape[0])) if isinstance(handoff, DraftMoePartial) else None
+        hop = (
+            self._hop(int(handoff.partial.shape[0]))
+            if isinstance(handoff, DraftMoePartial)
+            else None
+        )
         if hop is None:
             return norm(handoff.complete(), residual)
         return hop.draft_all_reduce_rms_norm(

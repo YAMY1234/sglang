@@ -39,7 +39,7 @@ struct MkdHeadParams {
   bf16_t* logits;                // [N]
   uint32_t* part;                // [gridDim.x] packed (key16 << 16) | (0xffff - row), or kNanPart
   int32_t n;
-  int32_t reverse;               // 1: walk the rows from the end (alternate steps, see the caller)
+  int32_t reverse;  // 1: walk the rows from the end (alternate steps, see the caller)
 };
 
 /**
@@ -62,7 +62,8 @@ __global__ void __launch_bounds__(kWarps * 32) mkd_head_kernel(const MkdHeadPara
   if (row < p.n) {
     const uint4* wr = reinterpret_cast<const uint4*>(p.w + static_cast<int64_t>(wrow(row)) * kK);
 #pragma unroll
-    for (int j = 0; j < kVecs; ++j) wv[j] = __ldg(wr + j * 32 + lane);
+    for (int j = 0; j < kVecs; ++j)
+      wv[j] = __ldg(wr + j * 32 + lane);
   }
   PDLWaitPrimary<kUsePDL>();
   PDLTriggerSecondary<kUsePDL>();
@@ -80,13 +81,15 @@ __global__ void __launch_bounds__(kWarps * 32) mkd_head_kernel(const MkdHeadPara
       const bf16_t* a = reinterpret_cast<const bf16_t*>(&wv[j]);
       const bf16_t* b = reinterpret_cast<const bf16_t*>(&xv);
 #pragma unroll
-      for (int e = 0; e < 8; ++e) acc = fmaf(cast<fp32_t>(a[e]), cast<fp32_t>(b[e]), acc);
+      for (int e = 0; e < 8; ++e)
+        acc = fmaf(cast<fp32_t>(a[e]), cast<fp32_t>(b[e]), acc);
     }
     const int next = row + stride;
     if (next < p.n) {
       const uint4* wr = reinterpret_cast<const uint4*>(p.w + static_cast<int64_t>(wrow(next)) * kK);
 #pragma unroll
-      for (int j = 0; j < kVecs; ++j) wv[j] = __ldg(wr + j * 32 + lane);
+      for (int j = 0; j < kVecs; ++j)
+        wv[j] = __ldg(wr + j * 32 + lane);
     }
     acc = warp::reduce_sum(acc);
     if (lane == 0) {
@@ -102,7 +105,8 @@ __global__ void __launch_bounds__(kWarps * 32) mkd_head_kernel(const MkdHeadPara
   if (threadIdx.x == 0) {
     uint32_t b = s_best[0];
 #pragma unroll
-    for (int i = 1; i < kWarps; ++i) b = max(b, s_best[i]);
+    for (int i = 1; i < kWarps; ++i)
+      b = max(b, s_best[i]);
     p.part[blockIdx.x] = b;
   }
 }
@@ -112,8 +116,12 @@ struct MkdHead {
   static constexpr int kK = 4096;
   static constexpr int kWarps = 16;
 
-  static void run(const tvm::ffi::TensorView x, const tvm::ffi::TensorView w, const tvm::ffi::TensorView logits,
-                  const tvm::ffi::TensorView part, int64_t reverse) {
+  static void
+  run(const tvm::ffi::TensorView x,
+      const tvm::ffi::TensorView w,
+      const tvm::ffi::TensorView logits,
+      const tvm::ffi::TensorView part,
+      int64_t reverse) {
     using namespace host;
     auto N = SymbolicSize{"rows"};
     auto G = SymbolicSize{"ctas"};

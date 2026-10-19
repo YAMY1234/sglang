@@ -934,16 +934,26 @@ def test_multistep_matches_per_step_bytes(bs, num_steps, skip_page_table):
     seed = 4321 + bs * 13 + num_steps * 101 + int(skip_page_table)
     pool_size, max_num_pages = 64, 16
     req_to_token, req_pool_indices, seq_lens, _, _ = _build_inputs(
-        bs, pool_size, max_num_pages, None, (max_num_pages - 2) * PAGE_SIZE - num_steps, seed
+        bs,
+        pool_size,
+        max_num_pages,
+        None,
+        (max_num_pages - 2) * PAGE_SIZE - num_steps,
+        seed,
     )
     # Rows that cross a page boundary between steps.
     seq_lens[: max(1, bs // 2)] = PAGE_SIZE * 3 - 2
     g = torch.Generator(device="cpu").manual_seed(seed + 7)
 
     def garbage(*shape):
-        return torch.randint(-(2**31), 2**31 - 1, shape, generator=g, dtype=torch.int32).to(DEVICE)
+        return torch.randint(
+            -(2**31), 2**31 - 1, shape, generator=g, dtype=torch.int32
+        ).to(DEVICE)
 
-    ref = [(garbage(bs), garbage(bs + 1), garbage(bs, max_num_pages)) for _ in range(num_steps)]
+    ref = [
+        (garbage(bs), garbage(bs + 1), garbage(bs, max_num_pages))
+        for _ in range(num_steps)
+    ]
     out = [tuple(t.clone() for t in r) for r in ref]
     for s, (cs, cu, pt) in enumerate(ref):
         update_trtllm_mha_graph_metadata(
@@ -960,7 +970,10 @@ def test_multistep_matches_per_step_bytes(bs, num_steps, skip_page_table):
             skip_page_table=skip_page_table,
         )
     addr = torch.tensor(
-        [[cs.data_ptr(), cu.data_ptr(), 0 if skip_page_table else pt.data_ptr()] for cs, cu, pt in out],
+        [
+            [cs.data_ptr(), cu.data_ptr(), 0 if skip_page_table else pt.data_ptr()]
+            for cs, cu, pt in out
+        ],
         dtype=torch.int64,
         device=DEVICE,
     )

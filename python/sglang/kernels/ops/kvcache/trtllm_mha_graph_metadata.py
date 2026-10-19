@@ -250,7 +250,9 @@ def update_trtllm_mha_graph_metadata_multistep_kernel(
         seqlen = (tl.load(seq_lens_ptr + pid) + seqlen_offset).to(tl.int32)
         tl.store(cache_seqlens_ptr + pid, seqlen)
         if not SKIP_PAGE_TABLE:
-            page_table_ptr = tl.load(addr_ptr + step * 3 + 2).to(tl.pointer_type(tl.int32))
+            page_table_ptr = tl.load(addr_ptr + step * 3 + 2).to(
+                tl.pointer_type(tl.int32)
+            )
             req_pool_index = tl.load(req_pool_indices_ptr + pid).to(tl.int64)
             row_in = req_to_token_ptr + req_pool_index * req_to_token_stride
             row_out = page_table_ptr + pid.to(tl.int64) * page_table_stride

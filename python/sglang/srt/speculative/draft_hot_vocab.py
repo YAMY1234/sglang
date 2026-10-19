@@ -31,7 +31,9 @@ def build_hot_head_shard(
     own = None
     for dst in range(tp_size):
         ids = hot_ids[dst * rows : (dst + 1) * rows].to(weight.device)
-        buf = torch.zeros((rows, weight.shape[1]), dtype=weight.dtype, device=weight.device)
+        buf = torch.zeros(
+            (rows, weight.shape[1]), dtype=weight.dtype, device=weight.device
+        )
         pos = ((ids >= org_vocab_start) & (ids < org_vocab_end)).nonzero().squeeze(1)
         buf[pos] = weight[ids[pos] - org_vocab_start]
         if tp_size > 1:

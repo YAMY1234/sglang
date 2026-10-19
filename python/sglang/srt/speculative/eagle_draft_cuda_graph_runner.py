@@ -12,7 +12,10 @@ from sglang.kernels.ops.memory.small_field_copy import (
 )
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.graph_variants import PagedFP8GraphVariants, create_q1_graph_variants
+from sglang.srt.layers.attention.graph_variants import (
+    PagedFP8GraphVariants,
+    create_q1_graph_variants,
+)
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     deployment_attn_dp_size,
@@ -320,9 +323,13 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     def _cache_loc_dtype(self):
         return torch.int64
 
-    def _make_graph_key(self, bs, stream_idx=None, variant_label=None, attention_variant=None):
+    def _make_graph_key(
+        self, bs, stream_idx=None, variant_label=None, attention_variant=None
+    ):
         # EAGLE doesn't use stream_idx; variant_label is _GREEDY_VARIANT or None.
-        return ShapeKey(size=bs, variant_label=variant_label, attention_variant=attention_variant)
+        return ShapeKey(
+            size=bs, variant_label=variant_label, attention_variant=attention_variant
+        )
 
     def _sampling_variant(self, forward_batch: ForwardBatch) -> Optional[str]:
         # Under rejection sampling an all-greedy batch replays the graph that
@@ -362,7 +369,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 self._make_graph_key(
                     cuda_graph_bs,
                     variant_label=self._sampling_variant(forward_batch),
-                    attention_variant=self._resolve_attention_variant(forward_batch, cuda_graph_bs),
+                    attention_variant=self._resolve_attention_variant(
+                        forward_batch, cuda_graph_bs
+                    ),
                 ),
             )
             if self.disable_padding
@@ -548,7 +557,11 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             for variant in variants:
                 sampling_info.is_all_greedy = variant == _GREEDY_VARIANT
                 self.backend.capture_one(
-                    self._make_graph_key(num_seqs, variant_label=variant, attention_variant=attention_variant),
+                    self._make_graph_key(
+                        num_seqs,
+                        variant_label=variant,
+                        attention_variant=attention_variant,
+                    ),
                     run_once,
                     capture_inputs=None,
                     post_warmup_hook=post_warmup_hook,
@@ -819,7 +832,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
         # Replay via backend
         shape_key = self._make_graph_key(
-            bs, variant_label=self._sampling_variant(forward_batch),
+            bs,
+            variant_label=self._sampling_variant(forward_batch),
             attention_variant=self._resolve_attention_variant(forward_batch, bs),
         )
         with device_timer_ctx(self.model_runner.device_timer, "eagle_draft"):

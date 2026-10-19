@@ -44,7 +44,10 @@ def _jit_module(intermediate: int, max_tokens: int) -> Module:
     module = load_jit(
         name,
         cuda_files=[f"moe/{name}.cuh"],
-        cuda_wrappers=[("run", f"{launcher}::run"), ("source_md5_lo", f"{launcher}::source_md5_lo")],
+        cuda_wrappers=[
+            ("run", f"{launcher}::run"),
+            ("source_md5_lo", f"{launcher}::source_md5_lo"),
+        ],
         # No fast-math: the routing softmax pins its approximate instructions explicitly.
         extra_cuda_cflags=["-O3"],
     )
@@ -54,7 +57,9 @@ def _jit_module(intermediate: int, max_tokens: int) -> Module:
         md5 = re.search(r"source md5 ([0-9a-f]{32})", f.read()).group(1)
     loaded = int(module.source_md5_lo())
     if loaded != int(md5[:15], 16):
-        raise RuntimeError(f"{name}: loaded module was built from source {loaded:015x}, header {header} has {md5}")
+        raise RuntimeError(
+            f"{name}: loaded module was built from source {loaded:015x}, header {header} has {md5}"
+        )
     logger.info("%s JIT module loaded: device code md5 %s (%s)", name, md5, header)
     return module
 

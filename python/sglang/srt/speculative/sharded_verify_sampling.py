@@ -64,14 +64,21 @@ def _shard_stats_kernel(
     inv_t = tl.where(t > 0, 1.0 / t, 1.0)
     offs = c * CHUNK + tl.arange(0, CHUNK)
     mask = offs < local_vocab
-    x = tl.load(logits_ptr + r * stride_row + offs, mask=mask, other=float("-inf")).to(tl.float32)
+    x = tl.load(logits_ptr + r * stride_row + offs, mask=mask, other=float("-inf")).to(
+        tl.float32
+    )
     key = tl.where(mask, _order_key(x), -1)
     kmax = tl.max(key, axis=0)
     idx = tl.min(tl.where(key == kmax, offs, 1 << 30), axis=0)
     xs = tl.where(x != x, float("-inf"), x)
     m = tl.max(xs, axis=0)
     finite = xs > float("-inf")
-    z = tl.sum(tl.where(finite, tl.exp((xs - tl.where(m > float("-inf"), m, 0.0)) * inv_t), 0.0), axis=0)
+    z = tl.sum(
+        tl.where(
+            finite, tl.exp((xs - tl.where(m > float("-inf"), m, 0.0)) * inv_t), 0.0
+        ),
+        axis=0,
+    )
     o = r * nchunk + c
     tl.store(out_m_ptr + o, m)
     tl.store(out_z_ptr + o, z)
@@ -116,7 +123,9 @@ def _pack_kernel(
     ic = tl.load(idx_ptr + r * nchunk + cs, mask=cm, other=1 << 30)
     m = tl.max(mc, axis=0)
     m_safe = tl.where(m > float("-inf"), m, 0.0)
-    s = tl.sum(tl.where(mc > float("-inf"), zc * tl.exp((mc - m_safe) * inv_t), 0.0), axis=0)
+    s = tl.sum(
+        tl.where(mc > float("-inf"), zc * tl.exp((mc - m_safe) * inv_t), 0.0), axis=0
+    )
     kmax = tl.max(kc, axis=0)
     idx = tl.min(tl.where(kc == kmax, ic, 1 << 30), axis=0) + vocab_start
     # Logit of the draft token this row verifies (row j checks candidates[b, j + 1]).
@@ -124,7 +133,9 @@ def _pack_kernel(
     d = tl.load(cand_ptr + b * D + j + 1, mask=has_next, other=-1)
     local = d - vocab_start
     owned = has_next & (local >= 0) & (local < local_vocab)
-    xd = tl.load(logits_ptr + r * stride_row + local, mask=owned, other=float("-inf")).to(tl.float32)
+    xd = tl.load(
+        logits_ptr + r * stride_row + local, mask=owned, other=float("-inf")
+    ).to(tl.float32)
     xd = tl.where(xd != xd, float("-inf"), xd)
     base = buf_ptr + rank * slot_stride + r * P
     tl.store(base + 0, m)
@@ -171,7 +182,9 @@ def _decide_kernel(
         best_id = tl.full((), 0, tl.int64)
         for w in tl.static_range(WORLD):
             base = buf_ptr + w * slot_stride + r * P
-            key = tl.load(base + 3).to(tl.int64) * 65536 + tl.load(base + 4).to(tl.int64)
+            key = tl.load(base + 3).to(tl.int64) * 65536 + tl.load(base + 4).to(
+                tl.int64
+            )
             take = key > best_key
             best_key = tl.where(take, key, best_key)
             best_id = tl.where(take, tl.load(base + 5).to(tl.int64), best_id)
@@ -200,7 +213,11 @@ def _decide_kernel(
                 for w in tl.static_range(WORLD):
                     base = buf_ptr + w * slot_stride + r * P
                     mw = tl.load(base + 0)
-                    s += tl.where(mw > float("-inf"), tl.load(base + 1) * tl.exp((mw - m_safe) * inv_t), 0.0)
+                    s += tl.where(
+                        mw > float("-inf"),
+                        tl.load(base + 1) * tl.exp((mw - m_safe) * inv_t),
+                        0.0,
+                    )
                 q = tl.where(xd > float("-inf"), tl.exp((xd - m_safe) * inv_t) / s, 0.0)
                 d = tl.load(cand_ptr + b * D + j)
                 acc = alive & (q > 0) & ((coin < q) | (q >= 1.0))
@@ -211,7 +228,9 @@ def _decide_kernel(
                 tl.store(accept_index_ptr + b * W + accepted, ret_j, mask=acc)
                 last_ret = tl.where(acc, ret_j, last_ret)
                 cur_row = tl.where(acc, j, cur_row)
-                coin = tl.where(acc, tl.load(buf_ptr + coin_off + b * (D + 1) + j), coin)
+                coin = tl.where(
+                    acc, tl.load(buf_ptr + coin_off + b * (D + 1) + j), coin
+                )
                 excl = tl.where(rej, d.to(tl.int64), excl)
                 q_excl = tl.where(rej, q, q_excl)
                 alive = alive & acc
@@ -226,13 +245,21 @@ def _decide_kernel(
         for w in tl.static_range(WORLD):
             base = buf_ptr + w * slot_stride + r * P
             mw = tl.load(base + 0)
-            s += tl.where(mw > float("-inf"), tl.load(base + 1) * tl.exp((mw - m_safe) * inv_t), 0.0)
+            s += tl.where(
+                mw > float("-inf"),
+                tl.load(base + 1) * tl.exp((mw - m_safe) * inv_t),
+                0.0,
+            )
         excl_owner = tl.where(excl >= 0, excl // local_vocab, -1)
         total = tl.full((), 0.0, tl.float32)
         for w in tl.static_range(WORLD):
             base = buf_ptr + w * slot_stride + r * P
             mw = tl.load(base + 0)
-            mass = tl.where(mw > float("-inf"), tl.load(base + 1) * tl.exp((mw - m_safe) * inv_t) / s, 0.0)
+            mass = tl.where(
+                mw > float("-inf"),
+                tl.load(base + 1) * tl.exp((mw - m_safe) * inv_t) / s,
+                0.0,
+            )
             mass = tl.maximum(tl.where(excl_owner == w, mass - q_excl, mass), 0.0)
             total += mass
         u = tl.load(buf_ptr + coin_off + b * (D + 1) + D) * total
@@ -244,7 +271,11 @@ def _decide_kernel(
         for w in tl.static_range(WORLD):
             base = buf_ptr + w * slot_stride + r * P
             mw = tl.load(base + 0)
-            mass = tl.where(mw > float("-inf"), tl.load(base + 1) * tl.exp((mw - m_safe) * inv_t) / s, 0.0)
+            mass = tl.where(
+                mw > float("-inf"),
+                tl.load(base + 1) * tl.exp((mw - m_safe) * inv_t) / s,
+                0.0,
+            )
             mass = tl.maximum(tl.where(excl_owner == w, mass - q_excl, mass), 0.0)
             take = (sel < 0) & (cum + mass > u)
             sel = tl.where(take, w, sel)
@@ -293,8 +324,14 @@ def _final_draw_kernel(
     inv_t = tl.where(t > 0, 1.0 / t, 1.0)
     excl_local = excl - vocab_start
     excl_here = (excl >= 0) & (excl_local >= 0) & (excl_local < local_vocab)
-    x_excl = tl.load(logits_ptr + r * stride_row + excl_local, mask=owner & excl_here, other=float("-inf")).to(tl.float32)
-    q_excl = tl.where(owner & excl_here & (x_excl == x_excl), tl.exp((x_excl - m) * inv_t) / s, 0.0)
+    x_excl = tl.load(
+        logits_ptr + r * stride_row + excl_local,
+        mask=owner & excl_here,
+        other=float("-inf"),
+    ).to(tl.float32)
+    q_excl = tl.where(
+        owner & excl_here & (x_excl == x_excl), tl.exp((x_excl - m) * inv_t) / s, 0.0
+    )
     cs = tl.arange(0, NCHUNK_P2)
     cm = owner & (cs < nchunk)
     mc = tl.load(m_ptr + r * nchunk + cs, mask=cm, other=float("-inf"))
@@ -311,13 +348,17 @@ def _final_draw_kernel(
     u2 = tl.where(found_c, u - before, tl.sum(tl.where(cs == c_sel, mass, 0.0), axis=0))
     offs = c_sel * CHUNK + tl.arange(0, CHUNK)
     vm = owner & (offs < local_vocab)
-    x = tl.load(logits_ptr + r * stride_row + offs, mask=vm, other=float("-inf")).to(tl.float32)
+    x = tl.load(logits_ptr + r * stride_row + offs, mask=vm, other=float("-inf")).to(
+        tl.float32
+    )
     q = tl.where(vm & (x == x) & (x > float("-inf")), tl.exp((x - m) * inv_t) / s, 0.0)
     q = tl.where(excl_here & (offs == excl_local), 0.0, q)
     cq = tl.cumsum(q, axis=0)
     first = tl.min(tl.where(vm & (cq > u2), offs, 1 << 30), axis=0)
     last_valid = tl.max(tl.where(q > 0, offs, -1), axis=0)
-    pick = tl.where(first < (1 << 30), first, tl.where(last_valid >= 0, last_valid, local_vocab - 1))
+    pick = tl.where(
+        first < (1 << 30), first, tl.where(last_valid >= 0, last_valid, local_vocab - 1)
+    )
     tok = tl.where(owner, (pick + vocab_start).to(tl.float32), 0.0)
     tl.store(tok_ptr + b, tok)
 
@@ -360,7 +401,18 @@ def sample_chain_full_vocab(
     key = torch.empty((rows, nchunk), dtype=torch.int64, device=dev)
     idx = torch.empty((rows, nchunk), dtype=torch.int32, device=dev)
     _shard_stats_kernel[(rows, nchunk)](
-        logits, logits.stride(0), temps, vocab, nchunk, m, z, key, idx, D=d, CHUNK=_CHUNK, num_warps=8
+        logits,
+        logits.stride(0),
+        temps,
+        vocab,
+        nchunk,
+        m,
+        z,
+        key,
+        idx,
+        D=d,
+        CHUNK=_CHUNK,
+        num_warps=8,
     )
     # One slot of per-row stats, then the coins; every read entry is written by _pack_kernel.
     slot = rows * _P
@@ -368,20 +420,66 @@ def sample_chain_full_vocab(
     total += (-total) % 4
     buf = torch.empty((total,), dtype=torch.float32, device=dev)
     _pack_kernel[(rows,)](
-        m, z, key, idx, nchunk, logits, logits.stride(0), candidates, temps, coins[0], coins[1],
-        0, vocab, 0, buf, slot, slot, D=d, DP2=_next_pow2(d), NCHUNK_P2=nchunk_p2, P=_P,
+        m,
+        z,
+        key,
+        idx,
+        nchunk,
+        logits,
+        logits.stride(0),
+        candidates,
+        temps,
+        coins[0],
+        coins[1],
+        0,
+        vocab,
+        0,
+        buf,
+        slot,
+        slot,
+        D=d,
+        DP2=_next_pow2(d),
+        NCHUNK_P2=nchunk_p2,
+        P=_P,
     )
     argmax = torch.empty((rows,), dtype=torch.int64, device=dev)
     sel = torch.empty((bs, 8), dtype=torch.float32, device=dev)
     _decide_kernel[(bs,)](
-        buf, slot, slot, temps, candidates, retrieve_index, predict, accept_index,
-        num_correct_drafts, argmax, sel, vocab, accept_index.shape[1],
-        D=d, WORLD=1, P=_P, SAMPLE=True,
+        buf,
+        slot,
+        slot,
+        temps,
+        candidates,
+        retrieve_index,
+        predict,
+        accept_index,
+        num_correct_drafts,
+        argmax,
+        sel,
+        vocab,
+        accept_index.shape[1],
+        D=d,
+        WORLD=1,
+        P=_P,
+        SAMPLE=True,
     )
     tok = torch.empty((bs + (-bs) % 4,), dtype=torch.float32, device=dev)
     _final_draw_kernel[(bs,)](
-        sel, logits, logits.stride(0), m, z, nchunk, temps, 0, vocab, 0, tok,
-        D=d, CHUNK=_CHUNK, NCHUNK_P2=nchunk_p2, num_warps=8,
+        sel,
+        logits,
+        logits.stride(0),
+        m,
+        z,
+        nchunk,
+        temps,
+        0,
+        vocab,
+        0,
+        tok,
+        D=d,
+        CHUNK=_CHUNK,
+        NCHUNK_P2=nchunk_p2,
+        num_warps=8,
     )
     _commit_kernel[(bs,)](sel, tok, predict)
     return argmax
@@ -398,8 +496,18 @@ class ShardedVerifySampler:
         self._log_every = 2000
         self._next_log = self._log_every
 
-    def eligible_reason(self, *, logits, sampling_info, verify_input, batch, grammar_mask, watermark_state,
-                        use_rejection_sampling, uno_target_max_top_k) -> Optional[str]:
+    def eligible_reason(
+        self,
+        *,
+        logits,
+        sampling_info,
+        verify_input,
+        batch,
+        grammar_mask,
+        watermark_state,
+        use_rejection_sampling,
+        uno_target_max_top_k,
+    ) -> Optional[str]:
         from sglang.srt.speculative.post_verify_graph import PostVerifySamplingView
 
         # The post-verify graph captures this sampler on purpose; other captures gather.
@@ -412,9 +520,14 @@ class ShardedVerifySampler:
         if verify_input.tree_topk != 1 or use_rejection_sampling:
             return "not a topk-1 chain"
         spec = get_spec()
-        if spec.speculative_accept_threshold_single != 1.0 or spec.speculative_accept_threshold_acc != 1.0:
+        if (
+            spec.speculative_accept_threshold_single != 1.0
+            or spec.speculative_accept_threshold_acc != 1.0
+        ):
             return "acceptance thresholds below 1"
-        if grammar_mask is not None or (watermark_state is not None and sampling_info.has_watermark_candidates):
+        if grammar_mask is not None or (
+            watermark_state is not None and sampling_info.has_watermark_candidates
+        ):
             return "grammar or watermark"
         if (
             sampling_info.acc_additive_penalties is not None
@@ -436,8 +549,18 @@ class ShardedVerifySampler:
             return "top-k / top-p / min-p"
         return None
 
-    def run(self, *, logits, sampling_info, verify_input, candidates, predict, accept_index,
-            num_correct_drafts, coins: Optional[Tuple[torch.Tensor, torch.Tensor]]) -> torch.Tensor:
+    def run(
+        self,
+        *,
+        logits,
+        sampling_info,
+        verify_input,
+        candidates,
+        predict,
+        accept_index,
+        num_correct_drafts,
+        coins: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> torch.Tensor:
         """Return the global argmax per row [R] (int64); with coins, also write the sampled
         chain into predict / accept_index / num_correct_drafts."""
         rows, local_vocab = logits.shape
@@ -451,7 +574,18 @@ class ShardedVerifySampler:
         key = torch.empty((rows, nchunk), dtype=torch.int64, device=dev)
         idx = torch.empty((rows, nchunk), dtype=torch.int32, device=dev)
         _shard_stats_kernel[(rows, nchunk)](
-            logits, logits.stride(0), temps, local_vocab, nchunk, m, z, key, idx, D=d, CHUNK=_CHUNK, num_warps=8
+            logits,
+            logits.stride(0),
+            temps,
+            local_vocab,
+            nchunk,
+            m,
+            z,
+            key,
+            idx,
+            D=d,
+            CHUNK=_CHUNK,
+            num_warps=8,
         )
         slot = rows * _P
         coin_off = slot * self.world
@@ -460,26 +594,73 @@ class ShardedVerifySampler:
         buf = torch.zeros((total,), dtype=torch.float32, device=dev)
         sample = coins is not None
         if coins is None:
-            coins = (torch.zeros((bs, d), dtype=torch.float32, device=dev),
-                     torch.zeros((bs,), dtype=torch.float32, device=dev))
+            coins = (
+                torch.zeros((bs, d), dtype=torch.float32, device=dev),
+                torch.zeros((bs,), dtype=torch.float32, device=dev),
+            )
         _pack_kernel[(rows,)](
-            m, z, key, idx, nchunk, logits, logits.stride(0), candidates, temps, coins[0], coins[1],
-            self.rank * local_vocab, local_vocab, self.rank, buf, slot, coin_off,
-            D=d, DP2=_next_pow2(d), NCHUNK_P2=nchunk_p2, P=_P,
+            m,
+            z,
+            key,
+            idx,
+            nchunk,
+            logits,
+            logits.stride(0),
+            candidates,
+            temps,
+            coins[0],
+            coins[1],
+            self.rank * local_vocab,
+            local_vocab,
+            self.rank,
+            buf,
+            slot,
+            coin_off,
+            D=d,
+            DP2=_next_pow2(d),
+            NCHUNK_P2=nchunk_p2,
+            P=_P,
         )
         buf = tensor_model_parallel_all_reduce(buf)
         argmax = torch.empty((rows,), dtype=torch.int64, device=dev)
         sel = torch.empty((bs, 8), dtype=torch.float32, device=dev)
         _decide_kernel[(bs,)](
-            buf, slot, coin_off, temps, candidates, verify_input.retrieve_index, predict, accept_index,
-            num_correct_drafts, argmax, sel, local_vocab, accept_index.shape[1],
-            D=d, WORLD=self.world, P=_P, SAMPLE=sample,
+            buf,
+            slot,
+            coin_off,
+            temps,
+            candidates,
+            verify_input.retrieve_index,
+            predict,
+            accept_index,
+            num_correct_drafts,
+            argmax,
+            sel,
+            local_vocab,
+            accept_index.shape[1],
+            D=d,
+            WORLD=self.world,
+            P=_P,
+            SAMPLE=sample,
         )
         if sample:
             tok = torch.zeros((bs + (-bs) % 4,), dtype=torch.float32, device=dev)
             _final_draw_kernel[(bs,)](
-                sel, logits, logits.stride(0), m, z, nchunk, temps, self.rank * local_vocab, local_vocab,
-                self.rank, tok, D=d, CHUNK=_CHUNK, NCHUNK_P2=nchunk_p2, num_warps=8,
+                sel,
+                logits,
+                logits.stride(0),
+                m,
+                z,
+                nchunk,
+                temps,
+                self.rank * local_vocab,
+                local_vocab,
+                self.rank,
+                tok,
+                D=d,
+                CHUNK=_CHUNK,
+                NCHUNK_P2=nchunk_p2,
+                num_warps=8,
             )
             tok = tensor_model_parallel_all_reduce(tok)
             _commit_kernel[(bs,)](sel, tok, predict)
@@ -488,13 +669,19 @@ class ShardedVerifySampler:
     def count(self, kind: str, bs: int) -> None:
         if not self.logged and kind != "gathered":
             self.logged = True
-            logger.info("Sharded verify sampling active (tp=%d, rank=%d).", self.world, self.rank)
+            logger.info(
+                "Sharded verify sampling active (tp=%d, rank=%d).",
+                self.world,
+                self.rank,
+            )
         key = f"{kind}@bs{bs}"
         self.rounds[key] = self.rounds.get(key, 0) + 1
         n = sum(self.rounds.values())
         if n >= self._next_log:
             self._next_log += self._log_every
-            logger.info("Sharded verify sampling rounds: %s", dict(sorted(self.rounds.items())))
+            logger.info(
+                "Sharded verify sampling rounds: %s", dict(sorted(self.rounds.items()))
+            )
 
 
 _SAMPLER: Optional[ShardedVerifySampler] = None

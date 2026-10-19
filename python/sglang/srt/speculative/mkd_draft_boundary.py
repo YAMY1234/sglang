@@ -35,12 +35,12 @@ from sglang.kernels.ops.speculative.mkd_draft_fc import (
     mkd_hidden_partial,
 )
 from sglang.kernels.ops.speculative.mkd_draft_head import mkd_draft_head
-from sglang.kernels.ops.speculative.mkd_prefetch import mkd_l2_prefetch
 from sglang.kernels.ops.speculative.mkd_draft_xchg import (
     mkd_xchg,
     mkd_xchg_words,
     mkd_xchg_zero,
 )
+from sglang.kernels.ops.speculative.mkd_prefetch import mkd_l2_prefetch
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel
 
@@ -81,14 +81,19 @@ def _jit_source_digests() -> str:
 def _clear_negative_zero(rows: torch.Tensor) -> torch.Tensor:
     # The exchanged embedding row has -0.0 cleared (vocab_argmax_pack); memo from the same row.
     bits = rows.view(torch.int16)
-    return torch.where(bits == -32768, torch.zeros_like(bits), bits).view(torch.bfloat16)
+    return torch.where(bits == -32768, torch.zeros_like(bits), bits).view(
+        torch.bfloat16
+    )
 
 
 def _unsupported_reason(model, exchange) -> Optional[str]:
     if model.fc_split_slice is None or model._fc_gemv_rows is None:
         return "needs SGLANG_Q35MF_DRAFT_FC_SPLIT and SGLANG_Q35MF_DRAFT_FC_GEMV"
     world = get_parallel().tp_size
-    if exchange.token_map.numel() == 0 and exchange.local_vocab * world != model.config.vocab_size:
+    if (
+        exchange.token_map.numel() == 0
+        and exchange.local_vocab * world != model.config.vocab_size
+    ):
         return "full-vocabulary shards with padding rows"
     if world not in (4, 8):
         return f"tp_size {world}"
@@ -120,10 +125,17 @@ class MkdDraftBoundary:
         rows = exchange.local_vocab
         self.hot_ids = hot_ids.to(dev)
         if exchange.token_map.numel() > 0:
-            if not torch.equal(self.hot_ids[self.rank * rows : (self.rank + 1) * rows], exchange.token_map):
-                raise RuntimeError("Draft step boundary: hot shard is not the rank-th slice of the hot list")
+            if not torch.equal(
+                self.hot_ids[self.rank * rows : (self.rank + 1) * rows],
+                exchange.token_map,
+            ):
+                raise RuntimeError(
+                    "Draft step boundary: hot shard is not the rank-th slice of the hot list"
+                )
         elif exchange.vocab_start != self.rank * rows:
-            raise RuntimeError("Draft step boundary: vocabulary shard is not the rank-th equal slice")
+            raise RuntimeError(
+                "Draft step boundary: vocabulary shard is not the rank-th equal slice"
+            )
         self.cand = self._build_memo(exchange) if self.memo else exchange.embed_weight
 
         tp = get_tp_group()
@@ -153,7 +165,11 @@ class MkdDraftBoundary:
         self.fc_out = torch.empty(1, hidden, dtype=torch.bfloat16, device=dev)
         # Memo mode: the exchange writes the next step's fc output here directly.
         # Zeros: graph-capture warmups read it before any exchange has written it.
-        self.fc_buf = torch.zeros(1, hidden, dtype=torch.bfloat16, device=dev) if self.memo else None
+        self.fc_buf = (
+            torch.zeros(1, hidden, dtype=torch.bfloat16, device=dev)
+            if self.memo
+            else None
+        )
         # The draft extend's exchange only needs the token; its payload lands here unused.
         self.ext_cand = torch.empty_like(self.out_cand)
         self.ext_partials = torch.empty_like(self.out_partials)
@@ -163,8 +179,12 @@ class MkdDraftBoundary:
         if envs.SGLANG_Q35MF_MKD_TRACE.get():
             self._start_trace_reader()
         self._install_head(envs.SGLANG_Q35MF_MKD_HEAD.get(), dev)
-        self.qkv_pf, self.qkv_pf_bytes = self._qkv_prefetch_target(envs.SGLANG_Q35MF_MKD_L2PF_QKV_MB.get())
-        self.qkv_stream = torch.cuda.Stream(device=dev) if self.qkv_pf is not None else None
+        self.qkv_pf, self.qkv_pf_bytes = self._qkv_prefetch_target(
+            envs.SGLANG_Q35MF_MKD_L2PF_QKV_MB.get()
+        )
+        self.qkv_stream = (
+            torch.cuda.Stream(device=dev) if self.qkv_pf is not None else None
+        )
         self.qkv_pending = False
         # extend_fc: the draft extend's exchange writes fc_buf for the next draft's first step.
         # input_seq counts calls that produce a draft input (draft extends after prefill or
@@ -191,15 +211,19 @@ class MkdDraftBoundary:
         )
 
     @classmethod
-    def maybe_create(cls, model, exchange, hot) -> Optional["MkdDraftBoundary"]:
+    def maybe_create(cls, model, exchange, hot) -> Optional[MkdDraftBoundary]:
         reason = _unsupported_reason(model, exchange)
         if reason is not None:
-            logger.warning("MKD draft boundary disabled (%s); using the stock path.", reason)
+            logger.warning(
+                "MKD draft boundary disabled (%s); using the stock path.", reason
+            )
             return None
         if hot is not None:
             return cls(model, exchange, hot.token_ids)
         # Full vocabulary: candidate position p (rank-major) is vocabulary id p.
-        ids = torch.arange(exchange.local_vocab * get_parallel().tp_size, dtype=torch.int64)
+        ids = torch.arange(
+            exchange.local_vocab * get_parallel().tp_size, dtype=torch.int64
+        )
         return cls(model, exchange, ids)
 
     # ---------------------------------------------------------------- memo table
@@ -252,7 +276,15 @@ class MkdDraftBoundary:
             x = _clear_negative_zero(emb[v : v + 1].clone())
             acc = None
             for s in range(self.n_embed):
-                draft_fc_partial(x, norm.weight.data, norm.variance_epsilon, shards[s], s * width, part, gemv_rows)
+                draft_fc_partial(
+                    x,
+                    norm.weight.data,
+                    norm.variance_epsilon,
+                    shards[s],
+                    s * width,
+                    part,
+                    gemv_rows,
+                )
                 acc = part.clone() if acc is None else acc + part
             bad += (acc.view(torch.int32) != memo[v : v + 1].view(torch.int32)).any()
         return int(bad)
@@ -268,7 +300,10 @@ class MkdDraftBoundary:
 
         moe = None
         for module in self.model.modules():
-            if isinstance(module, Qwen2MoeSparseMoeBlock) and module._single_token_draft_moe is not None:
+            if (
+                isinstance(module, Qwen2MoeSparseMoeBlock)
+                and module._single_token_draft_moe is not None
+            ):
                 moe = module._single_token_draft_moe
         if moe is None:
             logger.warning("MKD L2 prefetch disabled (no single-token draft MoE).")
@@ -276,7 +311,9 @@ class MkdDraftBoundary:
             return
         self.pf_stream = torch.cuda.Stream(device=self.model.fc.weight.device)
         moe.after_hook = self._prefetch_lm_head
-        logger.info("MKD L2 prefetch: %d MB of the draft lm_head after the draft MoE.", mb)
+        logger.info(
+            "MKD L2 prefetch: %d MB of the draft lm_head after the draft MoE.", mb
+        )
 
     def _qkv_prefetch_target(self, mb: int):
         if mb <= 0:
@@ -285,7 +322,10 @@ class MkdDraftBoundary:
 
         for module in self.model.modules():
             if isinstance(module, QKVParallelLinear):
-                logger.info("MKD L2 prefetch: %d MB of the draft qkv weight beside the exchange.", mb)
+                logger.info(
+                    "MKD L2 prefetch: %d MB of the draft qkv weight beside the exchange.",
+                    mb,
+                )
                 return module.weight, mb * 2**20
         logger.warning("MKD qkv L2 prefetch disabled (no qkv projection found).")
         return None, 0
@@ -307,23 +347,43 @@ class MkdDraftBoundary:
         if not enabled:
             return
         head = self.model.lm_head.weight
-        if head.dtype != torch.bfloat16 or head.dim() != 2 or head.shape[1] != self.hidden or head.shape[0] > 65536:
-            logger.warning("MKD draft head disabled (lm_head %s %s).", head.dtype, tuple(head.shape))
+        if (
+            head.dtype != torch.bfloat16
+            or head.dim() != 2
+            or head.shape[1] != self.hidden
+            or head.shape[0] > 65536
+        ):
+            logger.warning(
+                "MKD draft head disabled (lm_head %s %s).",
+                head.dtype,
+                tuple(head.shape),
+            )
             return
         sms = torch.cuda.get_device_properties(dev).multi_processor_count
-        self.head_part = torch.zeros(_HEAD_CTAS_PER_SM * sms, dtype=torch.int32, device=dev)
+        self.head_part = torch.zeros(
+            _HEAD_CTAS_PER_SM * sms, dtype=torch.int32, device=dev
+        )
         self.model.logits_processor.mkd_head = self
         if envs.SGLANG_Q35MF_MKD_HEAD_CHECK.get():
             self._start_head_check(dev)
-        logger.info("MKD draft head active: %d x %d shard, %d CTAs.", head.shape[0], head.shape[1], self.head_part.numel())
+        logger.info(
+            "MKD draft head active: %d x %d shard, %d CTAs.",
+            head.shape[0],
+            head.shape[1],
+            self.head_part.numel(),
+        )
 
     def head(self, hidden_states: torch.Tensor, lm_head) -> torch.Tensor:
         """The one-row draft logits [1, N] bf16 (the exchange then reads the per-CTA maxima)."""
         x = hidden_states.to(torch.bfloat16).contiguous()
-        logits = torch.empty(1, lm_head.weight.shape[0], dtype=torch.bfloat16, device=x.device)
+        logits = torch.empty(
+            1, lm_head.weight.shape[0], dtype=torch.bfloat16, device=x.device
+        )
         # Alternate the row walk per draft step so the next step first re-reads the rows read last;
         # measured faster in A/B.
-        mkd_draft_head(x, lm_head.weight, logits, self.head_part, reverse=self.step % 2 == 1)
+        mkd_draft_head(
+            x, lm_head.weight, logits, self.head_part, reverse=self.step % 2 == 1
+        )
         self.head_used = True
         if self.head_stats is not None:
             self._check_head(x, lm_head.weight, logits)
@@ -352,13 +412,17 @@ class MkdDraftBoundary:
 
         threading.Thread(target=run, daemon=True, name="draft-head-check").start()
 
-    def _check_head(self, x: torch.Tensor, weight: torch.Tensor, logits: torch.Tensor) -> None:
+    def _check_head(
+        self, x: torch.Tensor, weight: torch.Tensor, logits: torch.Tensor
+    ) -> None:
         ref = torch.matmul(x, weight.t()).float()
         mine = logits.float()
         pick_ref = ref.argmax(dim=-1)
         pick_mine = mine.argmax(dim=-1)
         diff = (pick_ref != pick_mine).float()
-        gap = (ref.gather(-1, pick_ref.view(1, 1)) - ref.gather(-1, pick_mine.view(1, 1))).view(-1) * diff
+        gap = (
+            ref.gather(-1, pick_ref.view(1, 1)) - ref.gather(-1, pick_mine.view(1, 1))
+        ).view(-1) * diff
         st = self.head_stats
         st[0:1] += 1.0
         st[1:2] += diff
@@ -419,7 +483,11 @@ class MkdDraftBoundary:
         draft_column: int,
         mrope_positions: Optional[torch.Tensor],
     ) -> None:
-        partial_flag = self.partial_sync[1:] if self.partial_pending and not self.last_step else None
+        partial_flag = (
+            self.partial_sync[1:]
+            if self.partial_pending and not self.last_step
+            else None
+        )
         if self.qkv_pf is not None and not self.last_step:
             self._prefetch_qkv()
         mkd_xchg(
@@ -460,7 +528,9 @@ class MkdDraftBoundary:
 
         import numpy as np
 
-        self.trace = torch.zeros(_TRACE_SLOTS, 16, 9, dtype=torch.int64, pin_memory=True)
+        self.trace = torch.zeros(
+            _TRACE_SLOTS, 16, 9, dtype=torch.int64, pin_memory=True
+        )
         ring = self.trace.numpy()
         names = ("scan", "sent", "recv", "end")
 
@@ -468,7 +538,9 @@ class MkdDraftBoundary:
             while True:
                 time.sleep(20)
                 t = ring.astype(np.float64)
-                ok = (t[:, :, 0] > 0).all(axis=1) & (t[:, :, 8] >= t[:, :, 1]).all(axis=1)
+                ok = (t[:, :, 0] > 0).all(axis=1) & (t[:, :, 8] >= t[:, :, 1]).all(
+                    axis=1
+                )
                 t = t[ok]
                 if len(t) == 0:
                     continue
@@ -476,23 +548,32 @@ class MkdDraftBoundary:
                 pre = (w0 - t[:, :, 0].min(axis=1)) / 1e3
                 # Latest CTA at each phase, from the earliest CTA's PDL wait release.
                 rel = (t[:, :, [5, 6, 7, 8]].max(axis=1) - w0[:, None]) / 1e3
-                q = np.percentile(np.concatenate([pre[:, None], rel], axis=1), [10, 50, 90], axis=0)
+                q = np.percentile(
+                    np.concatenate([pre[:, None], rel], axis=1), [10, 50, 90], axis=0
+                )
                 logger.info(
                     "MKD exchange trace rank %d, %d calls, us p10/p50/p90: pre_wait %s; %s",
                     self.rank,
                     len(t),
                     "/".join(f"{x:.2f}" for x in q[:, 0]),
-                    "; ".join(f"{n} {'/'.join(f'{x:.2f}' for x in q[:, i + 1])}" for i, n in enumerate(names)),
+                    "; ".join(
+                        f"{n} {'/'.join(f'{x:.2f}' for x in q[:, i + 1])}"
+                        for i, n in enumerate(names)
+                    ),
                 )
 
         threading.Thread(target=run, daemon=True, name="draft-xchg-trace").start()
 
-    def exchange_extend(self, local_logits: torch.Tensor, hidden_states: Optional[torch.Tensor]):
+    def exchange_extend(
+        self, local_logits: torch.Tensor, hidden_states: Optional[torch.Tensor]
+    ):
         """Draft-extend token (torch.argmax NaN rule) through the same one-launch exchange;
         with extend_fc it also writes the next draft's first fc into fc_buf."""
         topk_index = torch.empty((1, 1), dtype=torch.int64, device=local_logits.device)
         topk_p = torch.empty((1, 1), dtype=torch.float32, device=local_logits.device)
-        payload = self.extend_fc and hidden_states is not None and hidden_states.shape[0] == 1
+        payload = (
+            self.extend_fc and hidden_states is not None and hidden_states.shape[0] == 1
+        )
         if payload and self.is_hidden_rank:
             model = self.model
             norm = model.pre_fc_norm_hidden
@@ -554,9 +635,13 @@ class MkdDraftBoundary:
         dist.all_reduce(lo, op=dist.ReduceOp.MIN, group=group)
         dist.all_reduce(hi, op=dist.ReduceOp.MAX, group=group)
         if not torch.equal(lo, hi):
-            raise RuntimeError(f"Draft extend fc: ranks disagree on the fill decision ({lo.tolist()} vs {hi.tolist()})")
+            raise RuntimeError(
+                f"Draft extend fc: ranks disagree on the fill decision ({lo.tolist()} vs {hi.tolist()})"
+            )
 
-    def fill_fc(self, token_ids: torch.Tensor, hidden_states: torch.Tensor, forward_batch) -> None:
+    def fill_fc(
+        self, token_ids: torch.Tensor, hidden_states: torch.Tensor, forward_batch
+    ) -> None:
         """Stock fc of a draft's first step into fc_buf, when no extend exchange produced it."""
         model = self.model
         self.pending = False

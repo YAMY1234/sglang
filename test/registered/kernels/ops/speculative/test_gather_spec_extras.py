@@ -222,10 +222,14 @@ class TestScatterSpecExtras(CustomTestCase):
 
     def _sources(self, m, topk, hidden_dim, bonus_dtype, hidden_dtype, seed):
         g = torch.Generator(device="cuda").manual_seed(seed)
-        bonus = torch.randint(0, 2**31 - 1, (m,), device="cuda", generator=g).to(bonus_dtype)
+        bonus = torch.randint(0, 2**31 - 1, (m,), device="cuda", generator=g).to(
+            bonus_dtype
+        )
         topk_p = torch.rand((m, topk), device="cuda", generator=g)
         topk_index = torch.randint(0, 2**40, (m, topk), device="cuda", generator=g)
-        hidden = torch.randn((m, hidden_dim), device="cuda", generator=g).to(hidden_dtype)
+        hidden = torch.randn((m, hidden_dim), device="cuda", generator=g).to(
+            hidden_dtype
+        )
         return bonus, topk_p, topk_index, hidden
 
     def _check(self, indices, sources, bufs, with_topk, with_hidden):
@@ -256,34 +260,73 @@ class TestScatterSpecExtras(CustomTestCase):
                 self.assertTrue(torch.equal(r.view(torch.uint8), b.view(torch.uint8)))
 
     def test_matches_index_assignment(self):
-        configs = [(16, 8, 1, 7), (64, 33, 4, 128), (128, 128, 8, 1024), (100, 8, 1, 4096), (2048, 777, 8, 5120)]
-        for (pool_size, m, topk, hidden_dim), with_topk, with_hidden, bonus_dtype in itertools.product(
+        configs = [
+            (16, 8, 1, 7),
+            (64, 33, 4, 128),
+            (128, 128, 8, 1024),
+            (100, 8, 1, 4096),
+            (2048, 777, 8, 5120),
+        ]
+        for (
+            pool_size,
+            m,
+            topk,
+            hidden_dim,
+        ), with_topk, with_hidden, bonus_dtype in itertools.product(
             configs, (True, False), (True, False), (torch.int32, torch.int64)
         ):
-            with self.subTest(pool_size=pool_size, m=m, topk=topk, hidden_dim=hidden_dim,
-                              with_topk=with_topk, with_hidden=with_hidden, bonus_dtype=bonus_dtype):
-                bufs = _make_buffers(pool_size, topk, hidden_dim, with_hidden=True, device="cuda")
-                sources = self._sources(m, topk, hidden_dim, bonus_dtype, torch.bfloat16, pool_size)
+            with self.subTest(
+                pool_size=pool_size,
+                m=m,
+                topk=topk,
+                hidden_dim=hidden_dim,
+                with_topk=with_topk,
+                with_hidden=with_hidden,
+                bonus_dtype=bonus_dtype,
+            ):
+                bufs = _make_buffers(
+                    pool_size, topk, hidden_dim, with_hidden=True, device="cuda"
+                )
+                sources = self._sources(
+                    m, topk, hidden_dim, bonus_dtype, torch.bfloat16, pool_size
+                )
                 indices = torch.randperm(pool_size, device="cuda")[:m]
                 self._check(indices, sources, list(bufs), with_topk, with_hidden)
 
     def test_index_layouts_and_hidden_dtypes(self):
         pool_size, m = 96, 40
         for idx_dtype, strided, hidden_dtype in itertools.product(
-            (torch.int32, torch.int64), (False, True), (torch.bfloat16, torch.float16, torch.float32)
+            (torch.int32, torch.int64),
+            (False, True),
+            (torch.bfloat16, torch.float16, torch.float32),
         ):
-            with self.subTest(idx_dtype=idx_dtype, strided=strided, hidden_dtype=hidden_dtype):
-                bufs = _make_buffers(pool_size, 8, 2048, with_hidden=True, hidden_dtype=hidden_dtype, device="cuda")
+            with self.subTest(
+                idx_dtype=idx_dtype, strided=strided, hidden_dtype=hidden_dtype
+            ):
+                bufs = _make_buffers(
+                    pool_size,
+                    8,
+                    2048,
+                    with_hidden=True,
+                    hidden_dtype=hidden_dtype,
+                    device="cuda",
+                )
                 sources = self._sources(m, 8, 2048, torch.int32, hidden_dtype, 1)
                 perm = torch.randperm(pool_size, device="cuda").to(idx_dtype)
-                indices = torch.stack([perm[:m], perm[m : 2 * m]], dim=1)[:, 0] if strided else perm[:m]
+                indices = (
+                    torch.stack([perm[:m], perm[m : 2 * m]], dim=1)[:, 0]
+                    if strided
+                    else perm[:m]
+                )
                 self._check(indices, sources, list(bufs), True, True)
 
     def test_refusals_leave_buffers_untouched(self):
         pool_size, m = 32, 8
         bufs = _make_buffers(pool_size, 4, 256, with_hidden=True, device="cuda")
         before = [b.clone() for b in bufs]
-        bonus, topk_p, topk_index, hidden = self._sources(m, 4, 256, torch.int32, torch.bfloat16, 2)
+        bonus, topk_p, topk_index, hidden = self._sources(
+            m, 4, 256, torch.int32, torch.bfloat16, 2
+        )
         indices = torch.randperm(pool_size, device="cuda")[:m]
         topk_p_buf, topk_index_buf, output_tokens_buf, hidden_states_buf = bufs
         for args in (
@@ -295,7 +338,17 @@ class TestScatterSpecExtras(CustomTestCase):
         ):
             b, p, i, h = args
             self.assertFalse(
-                scatter_spec_extras(indices, b, output_tokens_buf, p, topk_p_buf, i, topk_index_buf, h, hidden_states_buf)
+                scatter_spec_extras(
+                    indices,
+                    b,
+                    output_tokens_buf,
+                    p,
+                    topk_p_buf,
+                    i,
+                    topk_index_buf,
+                    h,
+                    hidden_states_buf,
+                )
             )
         for x, y in zip(before, bufs):
             self.assertTrue(torch.equal(x, y))

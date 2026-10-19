@@ -40,7 +40,11 @@ class SingleTokenDraftMoe:
 
     def ready(self, num_tokens: int) -> bool:
         """Set up by an eager call and taking a batch of this many tokens."""
-        return self.active and self._scratch is not None and 0 < num_tokens <= self.MAX_TOKENS
+        return (
+            self.active
+            and self._scratch is not None
+            and 0 < num_tokens <= self.MAX_TOKENS
+        )
 
     @property
     def single_launch_ready(self) -> bool:
@@ -71,7 +75,10 @@ class SingleTokenDraftMoe:
             return "non-bf16 operands"
         if w13.dim() != 3 or tuple(w13.shape[1:]) != (2 * inter, hidden):
             return f"w13 shape {tuple(w13.shape)}"
-        if tuple(ws13.shape) != (2 * inter, hidden) or tuple(ws2.shape) != (hidden, inter):
+        if tuple(ws13.shape) != (2 * inter, hidden) or tuple(ws2.shape) != (
+            hidden,
+            inter,
+        ):
             return f"shared expert shapes {tuple(ws13.shape)} {tuple(ws2.shape)}"
         if hidden % 1024 != 0 or inter % 32 != 0:
             return f"hidden {hidden} / intermediate {inter} not tileable"
@@ -108,8 +115,12 @@ class SingleTokenDraftMoe:
         from sglang.kernels.ops.speculative.draft_moe_gemv import draft_router_topk
 
         logits, counter, weights, ids = self._router_scratch
-        draft_router_topk(hidden_states, block.gate.weight, logits, counter, weights, ids)
-        return StandardTopKOutput(topk_weights=weights, topk_ids=ids, router_logits=logits)
+        draft_router_topk(
+            hidden_states, block.gate.weight, logits, counter, weights, ids
+        )
+        return StandardTopKOutput(
+            topk_weights=weights, topk_ids=ids, router_logits=logits
+        )
 
     def _setup(self, block, hidden_states: torch.Tensor) -> bool:
         topk_output = block.topk(hidden_states, block.gate(hidden_states)[0])
@@ -161,7 +172,9 @@ class SingleTokenDraftMoe:
         )
         return True
 
-    def _forward_single_launch(self, block, hidden_states, out, push_hop) -> torch.Tensor:
+    def _forward_single_launch(
+        self, block, hidden_states, out, push_hop
+    ) -> torch.Tensor:
         from sglang.kernels.ops.speculative.draft_moe_gemv import draft_moe_fused
 
         logit_buf, act_buf, epoch, weights, ids = self._single_launch_scratch

@@ -100,7 +100,9 @@ def _k75p_topk1_finish_kernel(
     tl.store(topk_index + b, tok, mask=mask)
     tl.store(topk_p + b, tl.full([BLOCK_ROWS], 1.0, tl.float32), mask=mask)
     if WRITE_DRAFT_TOKEN:
-        tl.store(draft_tokens + b * draft_tokens_stride + draft_token_column, tok, mask=mask)
+        tl.store(
+            draft_tokens + b * draft_tokens_stride + draft_token_column, tok, mask=mask
+        )
     position = tl.load(positions + b, mask=mask)
     tl.store(positions + b, position + 1, mask=mask)
 

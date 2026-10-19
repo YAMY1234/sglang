@@ -54,9 +54,7 @@ class K75PDraftSelect:
         )
 
     @classmethod
-    def create(
-        cls, *, max_rows: int, hidden_size: int
-    ) -> Optional["K75PDraftSelect"]:
+    def create(cls, *, max_rows: int, hidden_size: int) -> Optional[K75PDraftSelect]:
         select = cls(max_rows=max_rows, hidden_size=hidden_size)
         if (
             select.hidden_state.symm_mem_hdl.multicast_ptr == 0
@@ -65,7 +63,9 @@ class K75PDraftSelect:
             logger.warning("K75P draft LM head disabled: no multicast on the TP group.")
             return None
         logger.info(
-            "K75P draft LM head active (tp=%d, rows/rank <= %d).", select.world, max_rows
+            "K75P draft LM head active (tp=%d, rows/rank <= %d).",
+            select.world,
+            max_rows,
         )
         return select
 

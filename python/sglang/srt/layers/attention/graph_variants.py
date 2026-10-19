@@ -46,13 +46,17 @@ class PagedFP8GraphVariants:
         )
 
 
-def create_paged_fp8_graph_variants(capture_forward_mode, captured_req_width, *, enabled=True):
+def create_paged_fp8_graph_variants(
+    capture_forward_mode, captured_req_width, *, enabled=True
+):
     from sglang.srt.environ import envs
 
     if enabled and envs.SGLANG_Q35MF_LL1_K1B.get() and captured_req_width in (1, 7):
-        if (capture_forward_mode.is_decode_or_idle()
+        if (
+            capture_forward_mode.is_decode_or_idle()
             or capture_forward_mode.is_target_verify()
-            or capture_forward_mode.is_draft_extend_v2()):
+            or capture_forward_mode.is_draft_extend_v2()
+        ):
             return PagedFP8GraphVariants()
     return None
 
@@ -100,7 +104,11 @@ class Q1GraphVariants(msgspec.Struct, frozen=True):
         length = forward_batch.attention_kv_len_lower_bound
         if length is None:
             lengths = forward_batch.seq_lens_cpu
-            if lengths is not None and lengths.device.type == "cpu" and lengths.numel() == 1:
+            if (
+                lengths is not None
+                and lengths.device.type == "cpu"
+                and lengths.numel() == 1
+            ):
                 length = int(lengths[0])
         return Q1_LONG if length is not None and length >= self.min_length else Q1_STOCK
 

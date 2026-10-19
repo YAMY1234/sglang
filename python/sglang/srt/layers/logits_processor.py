@@ -1123,7 +1123,11 @@ class LogitsProcessor(nn.Module):
         lm_head: VocabParallelEmbedding,
         embedding_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if self.mkd_head is not None and self.mkd_head.armed and hidden_states.shape[0] == 1:
+        if (
+            self.mkd_head is not None
+            and self.mkd_head.armed
+            and hidden_states.shape[0] == 1
+        ):
             return self.mkd_head.head(hidden_states, lm_head)
         quant_method = getattr(lm_head, "quant_method", None)
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):

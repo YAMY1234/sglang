@@ -17,7 +17,9 @@ if TYPE_CHECKING:
 @cache_once
 def _jit_gdn_pdl_front_ba_mkm_module() -> Module:
     if torch.cuda.get_device_capability()[0] < 9:
-        raise RuntimeError("gdn_pdl_front_ba_mkm requires CUDA compute capability 9.0 or newer")
+        raise RuntimeError(
+            "gdn_pdl_front_ba_mkm requires CUDA compute capability 9.0 or newer"
+        )
     return load_jit(
         "gdn_pdl_front_ba_mkm",
         cuda_files=["attention/gdn_pdl_front_ba_mkm.cuh"],

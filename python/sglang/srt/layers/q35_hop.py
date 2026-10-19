@@ -50,22 +50,40 @@ class _Site(ctypes.Structure):
 
 
 class _Args(ctypes.Structure):
-    _fields_ = [("site", _Site)] + [
-        (name, ctypes.c_void_p)
-        for name in (
-            "partial", "routed", "expert_w", "permuted", "shared", "residual_in", "gamma",
-            "fp8_scale", "residual_out", "norm_out", "fp8_out",
-        )
-    ] + [
-        ("m", ctypes.c_int), ("top_k", ctypes.c_int), ("eps", ctypes.c_float),
-        ("weight_bias", ctypes.c_float), ("delay_ns", ctypes.c_int),
-    ]
+    _fields_ = (
+        [("site", _Site)]
+        + [
+            (name, ctypes.c_void_p)
+            for name in (
+                "partial",
+                "routed",
+                "expert_w",
+                "permuted",
+                "shared",
+                "residual_in",
+                "gamma",
+                "fp8_scale",
+                "residual_out",
+                "norm_out",
+                "fp8_out",
+            )
+        ]
+        + [
+            ("m", ctypes.c_int),
+            ("top_k", ctypes.c_int),
+            ("eps", ctypes.c_float),
+            ("weight_bias", ctypes.c_float),
+            ("delay_ns", ctypes.c_int),
+        ]
+    )
 
 
 class _OprojArgs(ctypes.Structure):
-    _fields_ = [("site", _Site)] + [
-        (name, ctypes.c_void_p) for name in ("w", "x", "sx", "sw", "out")
-    ] + [("m", ctypes.c_int)]
+    _fields_ = (
+        [("site", _Site)]
+        + [(name, ctypes.c_void_p) for name in ("w", "x", "sx", "sw", "out")]
+        + [("m", ctypes.c_int)]
+    )
 
 
 def pack_out_proj(weight_nk: torch.Tensor) -> torch.Tensor:
@@ -75,7 +93,9 @@ def pack_out_proj(weight_nk: torch.Tensor) -> torch.Tensor:
     n, k = w.shape
     steps = k // 256
     if n != HIDDEN or k != 8 * steps * 32:
-        raise ValueError(f"out_proj packing needs [4096, 256 * S], got {tuple(w.shape)}")
+        raise ValueError(
+            f"out_proj packing needs [4096, 256 * S], got {tuple(w.shape)}"
+        )
     v = w.view(n // 32, 2, 2, 8, 8, steps, 2, 4, 4)
     return v.permute(0, 4, 5, 1, 3, 7, 6, 2, 8).contiguous().view(-1)
 
@@ -92,8 +112,17 @@ def _build() -> ctypes.CDLL:
         if not lib.exists():
             tmp = cache / f"libq35hop.{digest}.{os.getpid()}.tmp"
             cmd = [
-                "nvcc", "-O3", "-std=c++17", "-arch=sm_103a", "-shared", "-Xcompiler", "-fPIC",
-                f"-I{_JIT_ROOT / 'include'}", "-o", str(tmp), str(_SOURCE),
+                "nvcc",
+                "-O3",
+                "-std=c++17",
+                "-arch=sm_103a",
+                "-shared",
+                "-Xcompiler",
+                "-fPIC",
+                f"-I{_JIT_ROOT / 'include'}",
+                "-o",
+                str(tmp),
+                str(_SOURCE),
             ]
             res = subprocess.run(cmd, capture_output=True, text=True)
             if res.returncode != 0:
@@ -109,10 +138,10 @@ def _build() -> ctypes.CDLL:
 
 
 # The process's hop workspace once built; layers that push into it look it up here.
-_active: "Q35Hop | None" = None
+_active: Q35Hop | None = None
 
 
-def active() -> "Q35Hop | None":
+def active() -> Q35Hop | None:
     return _active
 
 
@@ -121,7 +150,10 @@ def input_fp8_linear(layer: torch.nn.Module) -> torch.nn.Module | None:
     for owner, name in (("linear_attn", "in_proj_qkvz"), ("self_attn", "qkv_proj")):
         block = layer._modules.get(owner)
         linear = None if block is None else block._modules.get(name)
-        if linear is not None and type(linear.quant_method).__name__ == "ModelOptFp8LinearMethod":
+        if (
+            linear is not None
+            and type(linear.quant_method).__name__ == "ModelOptFp8LinearMethod"
+        ):
             return linear
     return None
 
@@ -152,14 +184,22 @@ class Q35Hop:
         if symm_mem.get_backend(device) is None:
             symm_mem.set_backend("NCCL")
         self._mailbox = SymmetricBuffer.allocate(
-            (STAGES, self.world, self.max_m, HIDDEN), torch.int16, device, process_group,
+            (STAGES, self.world, self.max_m, HIDDEN),
+            torch.int16,
+            device,
+            process_group,
             require_multicast=True,
         )
         self._mailbox.tensor.fill_(-32768)  # every slot holds the bf16 -0.0 sentinel
         self._ctrl = torch.zeros(4, dtype=torch.int32, device=device)
         self._site = _Site(
-            self._mailbox.multicast_address, self._mailbox.tensor.data_ptr(), self._ctrl.data_ptr(),
-            self.rank, self.world, self.max_m, int(timeout_s * 1e9),
+            self._mailbox.multicast_address,
+            self._mailbox.tensor.data_ptr(),
+            self._ctrl.data_ptr(),
+            self.rank,
+            self.world,
+            self.max_m,
+            int(timeout_s * 1e9),
         )
         # bf16 partial of a producer that already pushed it; the next all-reduce call on exactly
         # this tensor only consumes.
@@ -178,7 +218,9 @@ class Q35Hop:
 
     def _launch(self, which: int, args: _Args) -> None:
         rc = self._lib.q35hop_launch(
-            which, ctypes.byref(args), ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
+            which,
+            ctypes.byref(args),
+            ctypes.c_void_p(torch.cuda.current_stream().cuda_stream),
         )
         if rc != 0:
             raise RuntimeError(f"q35hop_launch({which}) failed with {rc}")
@@ -199,9 +241,15 @@ class Q35Hop:
         residual_out = torch.empty(shape, dtype=torch.bfloat16, device=self.device)
         if fp8_scale is None:
             return (norm, residual_out)
-        return (norm, residual_out, torch.empty(shape, dtype=torch.float8_e4m3fn, device=self.device))
+        return (
+            norm,
+            residual_out,
+            torch.empty(shape, dtype=torch.float8_e4m3fn, device=self.device),
+        )
 
-    def out_proj_push(self, *, x_fp8, packed_w, input_scale, weight_scale) -> torch.Tensor:
+    def out_proj_push(
+        self, *, x_fp8, packed_w, input_scale, weight_scale
+    ) -> torch.Tensor:
         """out_proj of an [M, K] static-FP8 activation whose result goes straight into the mailbox.
 
         Returns the bf16 partial (also written to global memory); its all-reduce must come next and
@@ -218,7 +266,9 @@ class Q35Hop:
         o.out, o.m = out.data_ptr(), m
         steps = packed_w.numel() // (HIDDEN * 256)
         rc = self._lib.q35hop_oproj(
-            steps, ctypes.byref(o), ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
+            steps,
+            ctypes.byref(o),
+            ctypes.c_void_p(torch.cuda.current_stream().cuda_stream),
         )
         if rc != 0:
             raise RuntimeError(f"q35hop_oproj failed with {rc}")
@@ -237,12 +287,19 @@ class Q35Hop:
         self._pushed = (partial.data_ptr(), partial.shape)
 
     def has_pushed(self, partial: torch.Tensor) -> bool:
-        return self._pushed is not None and self._pushed == (partial.data_ptr(), partial.shape)
+        return self._pushed is not None and self._pushed == (
+            partial.data_ptr(),
+            partial.shape,
+        )
 
-    def all_reduce_residual_rms_norm(self, *, local_contribution, residual, gamma, fp8_scale=None):
+    def all_reduce_residual_rms_norm(
+        self, *, local_contribution, residual, gamma, fp8_scale=None
+    ):
         m = int(local_contribution.shape[0])
         outs = self._outputs(m, fp8_scale)
-        a = self._args(m=m, residual=residual, gamma=gamma, fp8_scale=fp8_scale, outs=outs)
+        a = self._args(
+            m=m, residual=residual, gamma=gamma, fp8_scale=fp8_scale, outs=outs
+        )
         if self.has_pushed(local_contribution):
             self._pushed = None
         else:
@@ -254,8 +311,16 @@ class Q35Hop:
         return outs
 
     def draft_all_reduce_rms_norm(
-        self, *, local_contribution, residual, gamma, eps, weight_bias, add_norm,
-        early_release=False, delay_ns=0,
+        self,
+        *,
+        local_contribution,
+        residual,
+        gamma,
+        eps,
+        weight_bias,
+        add_norm,
+        early_release=False,
+        delay_ns=0,
     ):
         """One draft-step hop with the rounding of the kernels it replaces. add_norm=False: FlashInfer's
         legacy MNNVL fused all-reduce, gamma the applied multiplier (weight_bias 0). add_norm=True: the
@@ -280,17 +345,31 @@ class Q35Hop:
         return outs
 
     def moe_finalize_all_reduce_rms_norm(
-        self, *, routed_output, expert_weights, permuted_indices, gated_shared_output, residual,
-        gamma, fp8_scale=None,
+        self,
+        *,
+        routed_output,
+        expert_weights,
+        permuted_indices,
+        gated_shared_output,
+        residual,
+        gamma,
+        fp8_scale=None,
     ):
         if self._pushed is not None:
             raise RuntimeError("q35_hop: a pushed partial was never consumed")
         m = int(permuted_indices.shape[0])
         outs = self._outputs(m, fp8_scale)
-        a = self._args(m=m, residual=residual, gamma=gamma, fp8_scale=fp8_scale, outs=outs)
+        a = self._args(
+            m=m, residual=residual, gamma=gamma, fp8_scale=fp8_scale, outs=outs
+        )
         a.routed, a.expert_w = routed_output.data_ptr(), expert_weights.data_ptr()
-        a.permuted, a.top_k = permuted_indices.data_ptr(), int(permuted_indices.shape[1])
-        a.shared = None if gated_shared_output is None else gated_shared_output.data_ptr()
+        a.permuted, a.top_k = (
+            permuted_indices.data_ptr(),
+            int(permuted_indices.shape[1]),
+        )
+        a.shared = (
+            None if gated_shared_output is None else gated_shared_output.data_ptr()
+        )
         self._launch(_PUBLISH_FIN, a)
         self._launch(_CONSUME, a)
         return outs

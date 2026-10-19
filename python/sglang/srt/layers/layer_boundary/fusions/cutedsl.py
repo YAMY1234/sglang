@@ -276,7 +276,10 @@ class CuteDSLFusion:
             residual = residual + post_residual_addition
         assert self.service is not None
         return self.service.finalize(
-            handoff=owed, residual=residual, gamma=gamma, fp8_scale=self._input_fp8_scale()
+            handoff=owed,
+            residual=residual,
+            gamma=gamma,
+            fp8_scale=self._input_fp8_scale(),
         )
 
     def _all_reduce_add_norm(
@@ -505,7 +508,9 @@ def prepare_cutedsl_fusion(
     if envs.SGLANG_Q35MF_MKH_HOP.get() and envs.SGLANG_Q35MF_MKH_OPROJ.get():
         from sglang.srt.layers.q35_hop import prepare_out_proj
 
-        logger.info("Packed %d out_proj weights for the q35 hop push", prepare_out_proj(model))
+        logger.info(
+            "Packed %d out_proj weights for the q35 hop push", prepare_out_proj(model)
+        )
     logger.info(
         "Prepared the FlashInfer MNNVL CuTe DSL fusion workspace for M_max=%d "
         "(%d fused layers)",

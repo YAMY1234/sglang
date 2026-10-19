@@ -63,6 +63,8 @@ def _parq_max_tokens() -> int:
     # SGLANG_Q35MF_K4_PARQ_MAX_TOKENS widens the parallel-quant front and its routing tables up to 128
     # tokens (TP2 verify at batch 12 is 84); unset keeps 64.
     return max(_MAX_PARQ_TOKENS, min(envs.SGLANG_Q35MF_K4_PARQ_MAX_TOKENS.get(), 128))
+
+
 # Precomputed-routing FP4 MoE state, one set for all layers: each layer's body and finalize consume
 # it before the next layer's router writes it. Keys: (tokens, finalize) -> (runner, stock tactic);
 # (tokens, tile) -> RouterTables; (tokens, tile, config, finalize) -> prepared body buffers.
@@ -76,7 +78,7 @@ def enabled() -> bool:
     return envs.SGLANG_Q35MF_ROUTE_FUSED.get()
 
 
-def _static_supported(block: "Qwen2MoeSparseMoeBlock") -> bool:
+def _static_supported(block: Qwen2MoeSparseMoeBlock) -> bool:
     from sglang.srt.layers.moe.topk import precomputed_topk_postprocess_is_noop
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend, get_moe_runner_backend
     from sglang.srt.layers.quantization.modelopt_quant import (
@@ -117,7 +119,7 @@ def _static_supported(block: "Qwen2MoeSparseMoeBlock") -> bool:
     )
 
 
-def supported(block: "Qwen2MoeSparseMoeBlock", hidden_states: torch.Tensor) -> bool:
+def supported(block: Qwen2MoeSparseMoeBlock, hidden_states: torch.Tensor) -> bool:
     """Per-call check; the static part is evaluated once per block."""
     from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
         is_in_tc_piecewise_cuda_graph,
@@ -139,7 +141,7 @@ def supported(block: "Qwen2MoeSparseMoeBlock", hidden_states: torch.Tensor) -> b
     )
 
 
-def _static_supported_rt(block: "Qwen2MoeSparseMoeBlock") -> bool:
+def _static_supported_rt(block: Qwen2MoeSparseMoeBlock) -> bool:
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend, get_moe_runner_backend
     from sglang.srt.layers.quantization.modelopt_quant import (
         ModelOptNvFp4FusedMoEMethod,
@@ -166,7 +168,7 @@ def _static_supported_rt(block: "Qwen2MoeSparseMoeBlock") -> bool:
     )
 
 
-def supported_rt(block: "Qwen2MoeSparseMoeBlock", hidden_states: torch.Tensor) -> bool:
+def supported_rt(block: Qwen2MoeSparseMoeBlock, hidden_states: torch.Tensor) -> bool:
     """Per-call check for the trtllm-runner path; the static part is evaluated once per block."""
     from sglang.srt.model_executor.runner import get_is_capture_mode
     from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -195,7 +197,7 @@ def supported_rt(block: "Qwen2MoeSparseMoeBlock", hidden_states: torch.Tensor) -
     )
 
 
-def _static_supported_shared(block: "Qwen2MoeSparseMoeBlock") -> bool:
+def _static_supported_shared(block: Qwen2MoeSparseMoeBlock) -> bool:
     """The shared expert's gate/up is a static per-tensor FP8 projection the front-end kernel can compute."""
     from sglang.srt.layers.activation import SiluAndMul
     from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8LinearMethod
@@ -220,12 +222,17 @@ def _static_supported_shared(block: "Qwen2MoeSparseMoeBlock") -> bool:
     )
 
 
-def _use_shared(block: "Qwen2MoeSparseMoeBlock", m: int, defer_finalize: bool) -> bool:
+def _use_shared(block: Qwen2MoeSparseMoeBlock, m: int, defer_finalize: bool) -> bool:
     """Whether this launch also computes the shared gate/up: only where the routed path is issued
     before the shared expert (dual-stream deferred finalize), so the side stream can consume it."""
     from sglang.srt.model_executor.runner import get_is_capture_mode
 
-    if not (defer_finalize and m <= 8 and block.alt_stream is not None and get_is_capture_mode()):
+    if not (
+        defer_finalize
+        and m <= 8
+        and block.alt_stream is not None
+        and get_is_capture_mode()
+    ):
         return False
     ok = block._route_sh_static_ok
     if ok is None:
@@ -253,7 +260,7 @@ _mkm_expanded_idx_by_device: dict[torch.device, torch.Tensor] = {}
 _mkm_engaged: set[tuple[int, int]] = set()
 
 
-def _mkm_static_supported(block: "Qwen2MoeSparseMoeBlock") -> bool:
+def _mkm_static_supported(block: Qwen2MoeSparseMoeBlock) -> bool:
     """The fused engine's fixed shapes: TP8 or TP4 Qwen3.5 NVFP4 on the trtllm-gen weight layout, no EP."""
     from sglang.srt.layers.moe.utils import RoutingMethodType
 
@@ -286,19 +293,27 @@ def _mkm_static_supported(block: "Qwen2MoeSparseMoeBlock") -> bool:
         and experts.w2_weight.dtype == torch.uint8
         and tuple(experts.w2_weight.shape) == (_NUM_EXPERTS, _HIDDEN, inter // 2)
         and experts.w13_weight_scale.dtype == torch.float8_e4m3fn
-        and tuple(experts.w13_weight_scale.shape) == (_NUM_EXPERTS, 2 * inter, _HIDDEN // 16)
+        and tuple(experts.w13_weight_scale.shape)
+        == (_NUM_EXPERTS, 2 * inter, _HIDDEN // 16)
         and experts.w2_weight_scale.dtype == torch.float8_e4m3fn
         and tuple(experts.w2_weight_scale.shape) == (_NUM_EXPERTS, _HIDDEN, inter // 16)
-        and all(t.dtype == torch.float32 and tuple(t.shape) == (_NUM_EXPERTS,) for t in expert_scales)
+        and all(
+            t.dtype == torch.float32 and tuple(t.shape) == (_NUM_EXPERTS,)
+            for t in expert_scales
+        )
     )
 
 
-def _mkm_supported(block: "Qwen2MoeSparseMoeBlock", m: int) -> bool:
+def _mkm_supported(block: Qwen2MoeSparseMoeBlock, m: int) -> bool:
     """SGLANG_Q35MF_MKM_FUSED and a call the fused engine covers; the static part is evaluated once per block."""
     if not envs.SGLANG_Q35MF_MKM_FUSED.get() or m > _MKM_M21_MAX_TOKENS:
         return False
     if m > _MKM_MAX_TOKENS:
-        wide = envs.SGLANG_Q35MF_MKM_FUSED_M16 if m <= _MKM_M16_MAX_TOKENS else envs.SGLANG_Q35MF_MKM_FUSED_M21
+        wide = (
+            envs.SGLANG_Q35MF_MKM_FUSED_M16
+            if m <= _MKM_M16_MAX_TOKENS
+            else envs.SGLANG_Q35MF_MKM_FUSED_M21
+        )
         if not (wide.get() and block.experts.intermediate_size_per_partition == 256):
             return False
     ok = _mkm_static_by_block.get(id(block))
@@ -308,7 +323,7 @@ def _mkm_supported(block: "Qwen2MoeSparseMoeBlock", m: int) -> bool:
 
 
 def _forward_mkm_fused(
-    block: "Qwen2MoeSparseMoeBlock",
+    block: Qwen2MoeSparseMoeBlock,
     *,
     logits: torch.Tensor,
     x_fp4: torch.Tensor,
@@ -351,10 +366,14 @@ def _forward_mkm_fused(
         expanded_idx_to_permuted_idx=expanded_idx[: m * _TOP_K],
         top_k=_TOP_K,
     )
-    return experts.dispatcher.combine(combine_input=StandardCombineInput(hidden_states=deferred))
+    return experts.dispatcher.combine(
+        combine_input=StandardCombineInput(hidden_states=deferred)
+    )
 
 
-def mkm_wide_supported(block: "Qwen2MoeSparseMoeBlock", hidden_states: torch.Tensor) -> bool:
+def mkm_wide_supported(
+    block: Qwen2MoeSparseMoeBlock, hidden_states: torch.Tensor
+) -> bool:
     """A 17..21-token call, past the router front, that SGLANG_Q35MF_MKM_FUSED_M21 takes from the block gate's logits."""
     m = hidden_states.shape[0]
     return (
@@ -369,16 +388,26 @@ def mkm_wide_supported(block: "Qwen2MoeSparseMoeBlock", hidden_states: torch.Ten
     )
 
 
-def forward_mkm_wide(block: "Qwen2MoeSparseMoeBlock", hidden_states: torch.Tensor, router_logits: torch.Tensor):
+def forward_mkm_wide(
+    block: Qwen2MoeSparseMoeBlock,
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+):
     """The stock runner's input quantization, then the fused engine (the stock path's inputs, bit for bit)."""
-    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import quantize_hidden_states_fp4
+    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+        quantize_hidden_states_fp4,
+    )
 
-    x_fp4, x_sf = quantize_hidden_states_fp4(hidden_states, block.experts.w13_input_scale_quant)
-    return _forward_mkm_fused(block, logits=router_logits, x_fp4=x_fp4, x_sf=x_sf.view(torch.uint8))
+    x_fp4, x_sf = quantize_hidden_states_fp4(
+        hidden_states, block.experts.w13_input_scale_quant
+    )
+    return _forward_mkm_fused(
+        block, logits=router_logits, x_fp4=x_fp4, x_sf=x_sf.view(torch.uint8)
+    )
 
 
 def forward_routed_rt(
-    block: "Qwen2MoeSparseMoeBlock", hidden_states: torch.Tensor, *, defer_finalize: bool
+    block: Qwen2MoeSparseMoeBlock, hidden_states: torch.Tensor, *, defer_finalize: bool
 ):
     """Routed experts on the trtllm runner with router logits and NVFP4 input from one launch.
 
@@ -393,7 +422,9 @@ def forward_routed_rt(
     experts = block.experts
     if hidden_states.shape[0] > _MAX_TOKENS:
         logits, x_fp4, x_sf = _logits_and_quant_parallel(block, hidden_states)
-        return _run_rt_experts(block, hidden_states, logits, x_fp4, x_sf, defer_finalize)
+        return _run_rt_experts(
+            block, hidden_states, logits, x_fp4, x_sf, defer_finalize
+        )
     # The runner keeps the input scale as a 0-d tensor; the kernel takes shape [1].
     in_scale = experts.w13_input_scale_quant.reshape(1)
     if _use_shared(block, hidden_states.shape[0], defer_finalize):
@@ -419,7 +450,7 @@ def forward_routed_rt(
 
 
 def _logits_and_quant_parallel(
-    block: "Qwen2MoeSparseMoeBlock", hidden_states: torch.Tensor
+    block: Qwen2MoeSparseMoeBlock, hidden_states: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Stock router GEMM on this stream and the runner's own NVFP4 input quantization on the side
     stream, so the quantization leaves the critical path (same kernels and outputs as stock)."""
@@ -430,7 +461,9 @@ def _logits_and_quant_parallel(
     m = hidden_states.shape[0]
     if m not in _parq_logged:
         _parq_logged.add(m)
-        logger.info("ROUTE_PARQ: NVFP4 input quantization on the side stream at %d tokens", m)
+        logger.info(
+            "ROUTE_PARQ: NVFP4 input quantization on the side stream at %d tokens", m
+        )
     current = torch.cuda.current_stream()
     side = block.alt_stream
     if envs.SGLANG_Q35MF_K4_PARQ_STREAM.get():
@@ -450,7 +483,7 @@ def _logits_and_quant_parallel(
 
 
 def _run_rt_experts(
-    block: "Qwen2MoeSparseMoeBlock",
+    block: Qwen2MoeSparseMoeBlock,
     hidden_states: torch.Tensor,
     logits: torch.Tensor,
     x_fp4: torch.Tensor,
@@ -476,8 +509,9 @@ def _run_rt_experts(
         hidden_states=hidden_states, topk_output=topk_output
     )._replace(hidden_states=x_fp4, hidden_states_scale=x_sf.view(torch.float8_e4m3fn))
     if defer_finalize:
-        with flashinfer_trtllm_deferred_finalize_context(), _tables_context(
-            hidden_states.shape[0]
+        with (
+            flashinfer_trtllm_deferred_finalize_context(),
+            _tables_context(hidden_states.shape[0]),
         ):
             combine_input = experts.run_moe_core(dispatch_output=dispatch_output)
         return experts.dispatcher.combine(combine_input=combine_input)
@@ -496,7 +530,9 @@ def _tables_context(m: int):
         flashinfer_trtllm_fp4_from_tables_context,
     )
 
-    max_tokens = min(envs.SGLANG_Q35MF_ROUTE_TABLES_MAX_TOKENS.get(), _parq_max_tokens())
+    max_tokens = min(
+        envs.SGLANG_Q35MF_ROUTE_TABLES_MAX_TOKENS.get(), _parq_max_tokens()
+    )
     if _MAX_TOKENS < m <= max_tokens or (
         envs.SGLANG_Q35MF_ROUTE2_SMALL_TABLES_MIN_TOKENS.get() <= m <= _MAX_TOKENS
         and envs.SGLANG_Q35MF_ROUTE2_SMALL_TABLES.get()
@@ -776,7 +812,7 @@ def _choose_tactic(wrapper, inputs) -> Tuple:
 
 
 def forward_routed(
-    block: "Qwen2MoeSparseMoeBlock", hidden_states: torch.Tensor
+    block: Qwen2MoeSparseMoeBlock, hidden_states: torch.Tensor
 ) -> torch.Tensor:
     """Routed-expert output [M, hidden] for ``hidden_states`` [M, hidden] (bf16)."""
     from flashinfer.autotuner import AutoTuner
@@ -801,7 +837,9 @@ def forward_routed(
     )
     x_sf = bufs.x_sf.view(torch.float8_e4m3fn)
     moe_output = torch.empty(
-        (m, experts.hidden_size), dtype=wrapper.output_dtype, device=hidden_states.device
+        (m, experts.hidden_size),
+        dtype=wrapper.output_dtype,
+        device=hidden_states.device,
     )
     inputs = [
         bufs.x_fp4,
@@ -895,39 +933,41 @@ def _run_experts_from_tables(
         main_event.record()
         moe_output.record_stream(aux_stream)
 
-    intermediate, intermediate_sf = blockscaled_contiguous_gather_grouped_gemm_act_fusion(
-        a=bufs.x_fp4,
-        b=w1_weight,
-        a_scale=x_sf,
-        b_scale=w1_weight_sf,
-        alpha=w1_alpha,
-        tile_idx_to_expert_idx=bufs.tile_idx_to_expert_idx,
-        tile_idx_to_mn_limit=bufs.tile_idx_to_mn_limit,
-        token_id_mapping=bufs.permuted_idx_to_expanded_idx,
-        num_non_exiting_tiles=bufs.num_non_exiting_tiles,
-        out=None,
-        out_scale=None,
-        global_scale=fc2_input_scale,
-        a_per_token_scale=None,
-        c_dtype="float4_e2m1fn",
-        a_dtype="float4_e2m1fn",
-        b_dtype="float4_e2m1fn",
-        sf_dtype="float8_e4m3fn",
-        sf_vec_size=16,
-        quantize_output=True,
-        topk=top_k,
-        mma_tiler_mn=params["gemm1_mma_tiler_mn"],
-        cluster_shape_mn=params["gemm1_cluster_shape_mn"],
-        mma_tiler=params["gemm1_mma_tiler"],
-        mma_inst_shape=params["gemm1_mma_inst_shape"],
-        enable_pdl=enable_pdl,
-        activation_type=wrapper.activation_type.value,
-        swiglu_alpha=wrapper.swiglu_alpha,
-        swiglu_beta=wrapper.swiglu_beta,
-        swiglu_limit=wrapper.swiglu_limit,
-        situ_beta=wrapper.situ_beta,
-        situ_linear_beta=wrapper.situ_linear_beta,
-        gated=wrapper.gated,
+    intermediate, intermediate_sf = (
+        blockscaled_contiguous_gather_grouped_gemm_act_fusion(
+            a=bufs.x_fp4,
+            b=w1_weight,
+            a_scale=x_sf,
+            b_scale=w1_weight_sf,
+            alpha=w1_alpha,
+            tile_idx_to_expert_idx=bufs.tile_idx_to_expert_idx,
+            tile_idx_to_mn_limit=bufs.tile_idx_to_mn_limit,
+            token_id_mapping=bufs.permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles=bufs.num_non_exiting_tiles,
+            out=None,
+            out_scale=None,
+            global_scale=fc2_input_scale,
+            a_per_token_scale=None,
+            c_dtype="float4_e2m1fn",
+            a_dtype="float4_e2m1fn",
+            b_dtype="float4_e2m1fn",
+            sf_dtype="float8_e4m3fn",
+            sf_vec_size=16,
+            quantize_output=True,
+            topk=top_k,
+            mma_tiler_mn=params["gemm1_mma_tiler_mn"],
+            cluster_shape_mn=params["gemm1_cluster_shape_mn"],
+            mma_tiler=params["gemm1_mma_tiler"],
+            mma_inst_shape=params["gemm1_mma_inst_shape"],
+            enable_pdl=enable_pdl,
+            activation_type=wrapper.activation_type.value,
+            swiglu_alpha=wrapper.swiglu_alpha,
+            swiglu_beta=wrapper.swiglu_beta,
+            swiglu_limit=wrapper.swiglu_limit,
+            situ_beta=wrapper.situ_beta,
+            situ_linear_beta=wrapper.situ_linear_beta,
+            gated=wrapper.gated,
+        )
     )
 
     if use_fused_finalize:

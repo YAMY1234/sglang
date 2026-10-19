@@ -26,17 +26,17 @@
 // Modified by NVIDIA: the top-10 over these keys is a bound-and-compact warp selection; softmax kept for bf16 scores.
 
 #include <sgl_kernel/tensor.h>
-#include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/utils.cuh>
+
+#include <cooperative_groups/reduce.h>
+#include <cub/block/block_scan.cuh>
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
-#include <cooperative_groups.h>
-#include <cooperative_groups/reduce.h>
-#include <cub/block/block_scan.cuh>
-
 #include <algorithm>
+#include <cooperative_groups.h>
 #include <cstdint>
 
 namespace sglang {
@@ -87,8 +87,10 @@ SGL_DEVICE void pad_rows(int32_t* token_idx, int32_t begin, int32_t end) {
   for (; begin < end && reinterpret_cast<uintptr_t>(token_idx + begin) % alignof(int4) != 0; ++begin) {
     token_idx[begin] = -1;
   }
-  for (; end - begin >= 4; begin += 4) *reinterpret_cast<int4*>(token_idx + begin) = make_int4(-1, -1, -1, -1);
-  for (; begin < end; ++begin) token_idx[begin] = -1;
+  for (; end - begin >= 4; begin += 4)
+    *reinterpret_cast<int4*>(token_idx + begin) = make_int4(-1, -1, -1, -1);
+  for (; begin < end; ++begin)
+    token_idx[begin] = -1;
 }
 
 SGL_DEVICE uint32_t max16(const uint32_t (&k)[kPerLane]) {
@@ -135,7 +137,8 @@ SGL_DEVICE uint32_t warp_top10(uint32_t (&keys)[kPerLane], uint32_t lane, uint32
   }
   uint32_t count = 0;
 #pragma unroll
-  for (uint32_t i = 0; i < kPerLane; ++i) count += keys[i] >= bound;
+  for (uint32_t i = 0; i < kPerLane; ++i)
+    count += keys[i] >= bound;
   const uint32_t total = warp_sum_u32(count);
   if (total <= 32) {
     uint32_t offset = count;
@@ -159,7 +162,8 @@ SGL_DEVICE uint32_t warp_top10(uint32_t (&keys)[kPerLane], uint32_t lane, uint32
   for (uint32_t k = 0; k < kTopK; ++k) {
     const uint32_t top = warp_max_u32(max16(keys));
 #pragma unroll
-    for (uint32_t i = 0; i < kPerLane; ++i) keys[i] = keys[i] == top ? 0u : keys[i];
+    for (uint32_t i = 0; i < kPerLane; ++i)
+      keys[i] = keys[i] == top ? 0u : keys[i];
     mine = lane == k ? top : mine;
   }
   return mine;

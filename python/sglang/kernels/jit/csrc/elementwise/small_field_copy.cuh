@@ -111,8 +111,7 @@ __global__ void small_field_copy_vec_kernel(const __grid_constant__ SmallFieldCo
   const int64_t src_stride = params.src_row_stride[field];
   const int64_t dst_stride = params.dst_row_stride[field];
   const int32_t kind = params.kind[field];
-  const int64_t stride =
-      static_cast<int64_t>(params.block_start[field + 1] - params.block_start[field]) * blockDim.x;
+  const int64_t stride = static_cast<int64_t>(params.block_start[field + 1] - params.block_start[field]) * blockDim.x;
   for (int64_t i = static_cast<int64_t>(block - params.block_start[field]) * blockDim.x + threadIdx.x; i < n;
        i += stride) {
     const int64_t row = rows == 1 ? 0 : i / cols;
@@ -303,7 +302,8 @@ struct SmallFieldCopy {
         const int64_t units = vp.rows[i] * vp.cols[i];
         const int64_t blocks = div_ceil(units, kSmallFieldCopyBlock);
         vp.block_start[i + 1] =
-            vp.block_start[i] + static_cast<int32_t>(blocks < kSmallFieldCopyVecMaxBlocks ? blocks : kSmallFieldCopyVecMaxBlocks);
+            vp.block_start[i] +
+            static_cast<int32_t>(blocks < kSmallFieldCopyVecMaxBlocks ? blocks : kSmallFieldCopyVecMaxBlocks);
       }
       LaunchKernel(
           dim3(static_cast<uint32_t>(vp.block_start[num_fields])),

@@ -43,7 +43,10 @@ def _inputs(m: int, seed: int, clustered: bool):
 @pytest.mark.parametrize("tile", [128, 256])
 @pytest.mark.parametrize("clustered", [False, True])
 def test_router_front_matches_stock_chain(m: int, tile: int, clustered: bool) -> None:
-    from sglang.kernels.ops.moe.qwen_router_front import RouterFrontBuffers, router_front
+    from sglang.kernels.ops.moe.qwen_router_front import (
+        RouterFrontBuffers,
+        router_front,
+    )
 
     x, weight, gs = _inputs(m, seed=1000 + m, clustered=clustered)
     out = RouterFrontBuffers(m, tile, "cuda")
@@ -89,23 +92,43 @@ def test_router_tail_matches_stock_chain(m: int, tile: int) -> None:
 
 def _assert_matches_stock_chain(out, logits, x, gs, m: int, tile: int) -> None:
     from flashinfer import fp4_quantize
-    from flashinfer.fused_moe.cute_dsl.moe_utils import allocate_moe_sort_buffers, moe_sort
+    from flashinfer.fused_moe.cute_dsl.moe_utils import (
+        allocate_moe_sort_buffers,
+        moe_sort,
+    )
 
     from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
 
-    w_ref, ids_ref = moe_fused_gate(logits, None, TOP_K, scoring_func="softmax", renormalize=True)
+    w_ref, ids_ref = moe_fused_gate(
+        logits, None, TOP_K, scoring_func="softmax", renormalize=True
+    )
     assert torch.equal(out.topk_ids, ids_ref)
     assert torch.equal(out.topk_weights.view(torch.int32), w_ref.view(torch.int32))
 
-    xq, xsf = fp4_quantize(x, gs, sf_vec_size=16, sf_use_ue8m0=False, is_sf_swizzled_layout=False,
-                           is_sf_8x4_layout=False, enable_pdl=None, backend="cute-dsl")
+    xq, xsf = fp4_quantize(
+        x,
+        gs,
+        sf_vec_size=16,
+        sf_use_ue8m0=False,
+        is_sf_swizzled_layout=False,
+        is_sf_8x4_layout=False,
+        enable_pdl=None,
+        backend="cute-dsl",
+    )
     assert torch.equal(out.x_fp4, xq.view(torch.uint8).reshape(m, -1))
     assert torch.equal(out.x_sf, xsf.view(torch.uint8).reshape(m, -1))
 
     bufs = allocate_moe_sort_buffers(m, EXPERTS, TOP_K, EXPERTS, tile, "cuda")
-    tabs = moe_sort(token_selected_experts=out.topk_ids, token_final_scales=out.topk_weights,
-                    num_experts=EXPERTS, top_k=TOP_K, local_expert_offset=0,
-                    num_local_experts=EXPERTS, tile_tokens_dim=tile, **bufs)
+    tabs = moe_sort(
+        token_selected_experts=out.topk_ids,
+        token_final_scales=out.topk_weights,
+        num_experts=EXPERTS,
+        top_k=TOP_K,
+        local_expert_offset=0,
+        num_local_experts=EXPERTS,
+        tile_tokens_dim=tile,
+        **bufs,
+    )
     n = int(tabs[5][0])
     assert n == int(out.num_non_exiting_tiles[0])
     assert int(tabs[4][0]) == int(out.total_num_padded_tokens[0])
@@ -124,24 +147,37 @@ def test_router_gemm_quant_shared(m: int, n_shared: int) -> None:
     and it must leave the router logits and the NVFP4 input bitwise unchanged."""
     from flashinfer import bmm_fp8
 
-    from sglang.kernels.ops.moe.qwen_router_front import router_gemm_quant, router_gemm_quant_shared
+    from sglang.kernels.ops.moe.qwen_router_front import (
+        router_gemm_quant,
+        router_gemm_quant_shared,
+    )
     from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
 
     x, weight, gs = _inputs(m, seed=5000 + m, clustered=False)
     g = torch.Generator(device="cuda")
     g.manual_seed(6000 + n_shared)
-    w_sh = (torch.randn(n_shared, HIDDEN, device="cuda", generator=g) * 64).to(torch.float8_e4m3fn)
+    w_sh = (torch.randn(n_shared, HIDDEN, device="cuda", generator=g) * 64).to(
+        torch.float8_e4m3fn
+    )
     in_scale = torch.tensor([0.05], device="cuda")
     w_scale = torch.tensor([3.7e-4], device="cuda")
-    logits, x_fp4, x_sf, gate_up = router_gemm_quant_shared(x, weight, gs, w_sh, in_scale, w_scale)
+    logits, x_fp4, x_sf, gate_up = router_gemm_quant_shared(
+        x, weight, gs, w_sh, in_scale, w_scale
+    )
     logits_ref, x_fp4_ref, x_sf_ref = router_gemm_quant(x, weight, gs)
     torch.cuda.synchronize()
     assert torch.equal(logits, logits_ref)
     assert torch.equal(x_fp4, x_fp4_ref) and torch.equal(x_sf, x_sf_ref)
 
     qx, qs = static_quant_fp8(x, in_scale)
-    stock = bmm_fp8(qx.unsqueeze(0), w_sh.t().unsqueeze(0), qs.reshape(1), w_scale, torch.bfloat16,
-                    backend="cublas").view(m, n_shared)
+    stock = bmm_fp8(
+        qx.unsqueeze(0),
+        w_sh.t().unsqueeze(0),
+        qs.reshape(1),
+        w_scale,
+        torch.bfloat16,
+        backend="cublas",
+    ).view(m, n_shared)
     ref = (qx.double() @ w_sh.double().t()) * (float(in_scale) * float(w_scale))
     err = lambda y: float((y.double() - ref).norm() / ref.norm())
     assert err(gate_up) <= 1.05 * err(stock)
@@ -214,7 +250,9 @@ def test_router_topk_tables_small(m: int, tile: int, early_trigger: bool) -> Non
     router_topk_tables(logits, ref)
     torch.cuda.synchronize()
     assert torch.equal(small.topk_ids, ref.topk_ids)
-    assert torch.equal(small.expert_weights.view(torch.int16), ref.expert_weights.view(torch.int16))
+    assert torch.equal(
+        small.expert_weights.view(torch.int16), ref.expert_weights.view(torch.int16)
+    )
 
     ctas, limits, e2p, p2t, counts = _expected_tables(small.topk_ids.cpu(), tile)
     n = len(ctas)

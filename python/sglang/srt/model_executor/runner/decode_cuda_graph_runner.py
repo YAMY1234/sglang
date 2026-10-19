@@ -323,7 +323,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 model_runner, self.capture_forward_mode, self.captured_req_width
             )
             or create_paged_fp8_graph_variants(
-                self.capture_forward_mode, self.captured_req_width,
+                self.capture_forward_mode,
+                self.captured_req_width,
                 enabled=envs.SGLANG_Q35MF_LL1_K1B_VERIFY.get(),
             )
             or create_split_kv_graph_variants(

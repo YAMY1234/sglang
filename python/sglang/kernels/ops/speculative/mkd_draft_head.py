@@ -27,7 +27,11 @@ def _module() -> Module:
 
 
 def mkd_draft_head(
-    x: torch.Tensor, weight: torch.Tensor, logits: torch.Tensor, part: torch.Tensor, reverse: bool = False
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    logits: torch.Tensor,
+    part: torch.Tensor,
+    reverse: bool = False,
 ) -> None:
     """Draft lm_head of one token, ``logits`` [1, N] bf16 = ``x`` [1, 4096] @ ``weight`` [N, 4096]^T with
     fp32 accumulation, and per CTA (``part.numel()`` CTAs) the packed maximum of its rows for mkd_xchg.

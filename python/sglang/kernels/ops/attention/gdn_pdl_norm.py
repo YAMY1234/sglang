@@ -197,8 +197,7 @@ def norm(
     assert rstd.shape == (x.shape[0],) and rstd.is_contiguous()
     assert rstd.dtype == torch.float32
     assert x.is_cuda and all(
-        tensor.device == x.device
-        for tensor in (z, weight, scale, quant_out, rstd)
+        tensor.device == x.device for tensor in (z, weight, scale, quant_out, rstd)
     )
     rows = x.shape[0]
     rows_per_block = calc_rows_per_block(rows, x.device)

@@ -99,7 +99,9 @@ def mkd_xchg(
         epoch_done,
         out_cand,
         out_partials,
-        fc_out if fc_out is not None else out_partials.new_empty(0, dtype=torch.bfloat16),
+        fc_out
+        if fc_out is not None
+        else out_partials.new_empty(0, dtype=torch.bfloat16),
         topk_index,
         topk_p,
         draft_tokens if draft_tokens is not None else empty,
@@ -118,5 +120,7 @@ def mkd_xchg(
         trace.data_ptr() if trace is not None else 0,
         trace.numel() // (CHUNKS * 9) if trace is not None else 1,
         prefetch.data_ptr() if prefetch is not None else 0,
-        min(prefetch_bytes, prefetch.numel() * prefetch.element_size()) if prefetch is not None else 0,
+        min(prefetch_bytes, prefetch.numel() * prefetch.element_size())
+        if prefetch is not None
+        else 0,
     )

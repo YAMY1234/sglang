@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit
-from sglang.kernels.ops.attention.gdn_pdl_front import pack
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -18,7 +17,9 @@ if TYPE_CHECKING:
 @cache_once
 def _jit_gdn_pdl_front_ba_module() -> Module:
     if torch.cuda.get_device_capability()[0] < 9:
-        raise RuntimeError("gdn_pdl_front_ba requires CUDA compute capability 9.0 or newer")
+        raise RuntimeError(
+            "gdn_pdl_front_ba requires CUDA compute capability 9.0 or newer"
+        )
     return load_jit(
         "gdn_pdl_front_ba",
         cuda_files=["attention/gdn_pdl_front_ba.cuh"],

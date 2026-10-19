@@ -902,9 +902,7 @@ def _set_track_indices_reusing_last(batch: ScheduleBatch) -> None:
     is the same tensor at the same version and the ping-pong positions are unchanged."""
     global _last_verify_track
     req_pool_indices = batch.req_pool_indices
-    mapping = (
-        batch.req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping
-    )
+    mapping = batch.req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping
     positions = tuple(req.kv.mamba_next_track_idx for req in batch.reqs)
     key = (req_pool_indices._version, mapping._version, positions)
     last = _last_verify_track

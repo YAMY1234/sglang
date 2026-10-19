@@ -461,7 +461,9 @@ def _flashinfer_cublas_fp8_runner():
     return get_gemm_module().cublas_fp8_gemm_runner()
 
 
-def _pinned_flashinfer_bmm_fp8(q_input, weight, x_scale, weight_scale, out_dtype, tactic):
+def _pinned_flashinfer_bmm_fp8(
+    q_input, weight, x_scale, weight_scale, out_dtype, tactic
+):
     # The algo index refers to the cuBLASLt heuristic list for this exact (M, N, K) and
     # FlashInfer's bmm_fp8 workspace; the runner falls back to the default when out of range.
     from flashinfer.gemm.gemm_base import DEFAULT_WORKSPACE_SIZE, _get_cache_buf

@@ -29,7 +29,6 @@ from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
-from sglang.srt.layers.kdense_draft_xchg import fork_metadata, join_metadata
 from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferAttnBackend,
     FlashInferMultiStepDraftBackend,
@@ -49,6 +48,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 )
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
+from sglang.srt.layers.kdense_draft_xchg import fork_metadata, join_metadata
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
@@ -378,7 +378,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             envs.SGLANG_Q35MF_MKA_Q1.get()
             and torch.cuda.get_device_capability()[0] == 10
             and -(-self.max_context_len // 256)
-            >= torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+            >= torch.cuda.get_device_properties(
+                torch.cuda.current_device()
+            ).multi_processor_count
         )
         self._q1_plans = {}
 
@@ -1414,7 +1416,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         assert self.is_nvfp4_kvcache
         return self.kv_cache_quant_method.get_bmm_scales(layer.layer_id)
 
-    def _run_skv2(self, query, kv_cache, block_tables, seq_lens, *, out, qk_scale, v_scale):
+    def _run_skv2(
+        self, query, kv_cache, block_tables, seq_lens, *, out, qk_scale, v_scale
+    ):
         from sglang.kernels.ops.attention.skv2_split_kv import (
             StockSplitPlan,
             skv2_split_kv,
@@ -1443,7 +1447,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             out=out,
         )
 
-    def _run_q1(self, query, kv_cache, block_tables, seq_lens, *, out, qk_scale, v_scale):
+    def _run_q1(
+        self, query, kv_cache, block_tables, seq_lens, *, out, qk_scale, v_scale
+    ):
         from sglang.kernels.ops.attention.skv2_q1 import Q1SplitPlan, skv2_q1_decode
 
         key = (
@@ -1509,25 +1515,47 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 and query.shape[-2] in (4, 8)
                 and query.dtype == torch.float8_e4m3fn
                 and query.is_contiguous()
-                and isinstance(kv_cache, tuple) and len(kv_cache) == 2
-                and all(x.dtype == query.dtype and x.ndim == 4
-                        and x.shape[1:] == (1, 64, 256) and x.is_contiguous()
-                        for x in kv_cache)
+                and isinstance(kv_cache, tuple)
+                and len(kv_cache) == 2
+                and all(
+                    x.dtype == query.dtype
+                    and x.ndim == 4
+                    and x.shape[1:] == (1, 64, 256)
+                    and x.is_contiguous()
+                    for x in kv_cache
+                )
                 and resolved_out_dtype == torch.bfloat16
-                and (out is None or (out.is_contiguous() and out.shape == query.shape
-                                     and out.dtype == resolved_out_dtype))
+                and (
+                    out is None
+                    or (
+                        out.is_contiguous()
+                        and out.shape == query.shape
+                        and out.dtype == resolved_out_dtype
+                    )
+                )
                 and isinstance(bmm1_scale, (int, float))
                 # Where trtllm-gen applies bmm2_scale relative to its bf16 partials is not pinned down.
-                and isinstance(bmm2_scale, (int, float)) and bmm2_scale == 1.0
-                and window_left < 0 and sinks is None and mask is None
+                and isinstance(bmm2_scale, (int, float))
+                and bmm2_scale == 1.0
+                and window_left < 0
+                and sinks is None
+                and mask is None
                 and kv_cache_sf is None
-                and envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get() in (None, 0.0)
+                and envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get()
+                in (None, 0.0)
             )
             if supported:
                 if out is None:
                     out = torch.empty_like(query, dtype=resolved_out_dtype)
-                return self._run_q1(query, kv_cache, block_tables, seq_lens, out=out,
-                                    qk_scale=float(bmm1_scale), v_scale=float(bmm2_scale))
+                return self._run_q1(
+                    query,
+                    kv_cache,
+                    block_tables,
+                    seq_lens,
+                    out=out,
+                    qk_scale=float(bmm1_scale),
+                    v_scale=float(bmm2_scale),
+                )
             logger.warning_once(
                 "SKV2-Q1 is unsupported for this configuration; using trtllm-gen."
             )
@@ -1543,18 +1571,32 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 and query.shape[-2] in (4, 8)
                 and query.dtype == torch.float8_e4m3fn
                 and query.is_contiguous()
-                and isinstance(kv_cache, tuple) and len(kv_cache) == 2
-                and all(x.dtype == query.dtype and x.ndim == 4
-                        and x.shape[1:] == (1, 64, 256) and x.is_contiguous()
-                        for x in kv_cache)
+                and isinstance(kv_cache, tuple)
+                and len(kv_cache) == 2
+                and all(
+                    x.dtype == query.dtype
+                    and x.ndim == 4
+                    and x.shape[1:] == (1, 64, 256)
+                    and x.is_contiguous()
+                    for x in kv_cache
+                )
                 and resolved_out_dtype == torch.bfloat16
-                and (out is None or (out.is_contiguous() and out.shape == query.shape
-                                     and out.dtype == resolved_out_dtype))
+                and (
+                    out is None
+                    or (
+                        out.is_contiguous()
+                        and out.shape == query.shape
+                        and out.dtype == resolved_out_dtype
+                    )
+                )
                 and isinstance(bmm1_scale, (int, float))
                 and isinstance(bmm2_scale, (int, float))
-                and window_left < 0 and sinks is None and mask is None
+                and window_left < 0
+                and sinks is None
+                and mask is None
                 and kv_cache_sf is None
-                and envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get() in (None, 0.0)
+                and envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get()
+                in (None, 0.0)
             )
             if supported:
                 from sglang.kernels.ops.attention.paged_fp8_tcgen import (
@@ -1562,16 +1604,28 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     paged_fp8_decode,
                 )
 
-                key = (query.shape, kv_cache[0].shape, block_tables.shape,
-                       block_tables.stride(), seq_lens.shape)
+                key = (
+                    query.shape,
+                    kv_cache[0].shape,
+                    block_tables.shape,
+                    block_tables.stride(),
+                    seq_lens.shape,
+                )
                 plan = self._paged_fp8_plans.get(key)
                 if plan is None:
                     plan = PagedFP8DecodePlan(query, kv_cache, block_tables, seq_lens)
                     self._paged_fp8_plans[key] = plan
                 record_paged_fp8_call(q_len_per_req)
-                return paged_fp8_decode(query, kv_cache, block_tables, seq_lens, plan,
-                                        qk_scale=float(bmm1_scale), v_scale=float(bmm2_scale),
-                                        out=out)
+                return paged_fp8_decode(
+                    query,
+                    kv_cache,
+                    block_tables,
+                    seq_lens,
+                    plan,
+                    qk_scale=float(bmm1_scale),
+                    v_scale=float(bmm2_scale),
+                    out=out,
+                )
             logger.warning_once(
                 "Paged tensor-core FP8 attention is unsupported for this configuration; "
                 "using the stock attention implementation."
@@ -2295,13 +2349,21 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
                 or b.page_size != b0.page_size
                 or m.cache_seqlens_int32.dtype != torch.int32
                 or m.cu_seqlens_k.dtype != torch.int32
-                or (not unified and (m.page_table.dtype != torch.int32
-                                     or m.page_table.stride(0) != m0.page_table.stride(0)))
+                or (
+                    not unified
+                    and (
+                        m.page_table.dtype != torch.int32
+                        or m.page_table.stride(0) != m0.page_table.stride(0)
+                    )
+                )
             ):
                 return
         rows = [
-            [m.cache_seqlens_int32.data_ptr(), m.cu_seqlens_k.data_ptr(),
-             0 if unified else m.page_table.data_ptr()]
+            [
+                m.cache_seqlens_int32.data_ptr(),
+                m.cu_seqlens_k.data_ptr(),
+                0 if unified else m.page_table.data_ptr(),
+            ]
             for m in metas
         ]
         self._bk_meta_addr[bs] = torch.tensor(
@@ -2341,7 +2403,9 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
                     max_seq_pages=b0.max_num_pages,
                     page_size=b0.page_size,
                     page_table_stride=(
-                        0 if unified else b0.decode_cuda_graph_metadata[bs].page_table.stride(0)
+                        0
+                        if unified
+                        else b0.decode_cuda_graph_metadata[bs].page_table.stride(0)
                     ),
                     skip_page_table=unified,
                 )

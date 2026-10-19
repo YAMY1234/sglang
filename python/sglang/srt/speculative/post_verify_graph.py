@@ -40,7 +40,9 @@ _MAX_BS = int(os.environ.get("SGLANG_Q35MF_EDGE_POST_VERIFY_MAX_BS", "2"))
 _MAX_STATES = max(16, 8 * _MAX_BS)
 # With the side-stream commit: largest batch whose commit runs on the side stream; larger
 # batches commit inside the main graph (the side commit slows the overlapping draft extend).
-_SIDE_MAX_BS = int(os.environ.get("SGLANG_Q35MF_EDGE_POST_VERIFY_SIDE_MAX_BS", str(_MAX_BS)))
+_SIDE_MAX_BS = int(
+    os.environ.get("SGLANG_Q35MF_EDGE_POST_VERIFY_SIDE_MAX_BS", str(_MAX_BS))
+)
 
 
 def post_verify_graph_enabled() -> bool:
@@ -90,7 +92,6 @@ def _count_acceptance_calls():
     # eagle_sample resolves both kernels through these module attributes at call time.
     from sglang.kernels.ops.speculative import sampling as sampling_ops
     from sglang.srt.speculative import eagle_utils
-
     from sglang.srt.speculative.sharded_verify_sampling import ShardedVerifySampler
 
     # [acceptance calls, of which sharded sampler runs]

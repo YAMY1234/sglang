@@ -24,10 +24,10 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
-from sglang.srt.environ import envs
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )
@@ -238,8 +238,10 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             self._graphs[shape_key].replay()
         if self._paged_fp8_stats is not None:
             counts = self._paged_fp8_stats["replays"]
-            key = (f"{type(self._cuda_graph_runner).__name__}|"
-                   f"bs{shape_key.size}|{shape_key.attention_variant}")
+            key = (
+                f"{type(self._cuda_graph_runner).__name__}|"
+                f"bs{shape_key.size}|{shape_key.attention_variant}"
+            )
             counts[key] = counts.get(key, 0) + 1
         return self._outputs[shape_key]
 

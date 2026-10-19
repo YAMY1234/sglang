@@ -157,7 +157,11 @@ class SmallFieldCopyPlan:
 
 def _run_host_desc(anchor: torch.Tensor, desc: torch.Tensor) -> bool:
     module = _jit_small_field_copy_module()
-    run = module.small_field_copy_host_desc_vec if _VEC else module.small_field_copy_host_desc
+    run = (
+        module.small_field_copy_host_desc_vec
+        if _VEC
+        else module.small_field_copy_host_desc
+    )
     return run(anchor, desc) == 0
 
 
