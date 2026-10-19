@@ -422,6 +422,7 @@ class EagleMegakernel:
             bool(info.is_all_greedy),
             bool(info.need_top_k_sampling),
             bool(info.need_top_p_sampling),
+            _compact_max_top_k(batch),
             SIMULATE_ACC_LEN > 0,
             batch.mamba_track_indices is not None,
             verify_input.draft_token_num,
@@ -461,6 +462,7 @@ class EagleMegakernel:
             temperatures=staged.get("temperatures"),
             top_ks=staged.get("top_ks"),
             top_ps=staged.get("top_ps"),
+            max_top_k=_compact_max_top_k(batch),
             sim_accept_len=staged.get("sim_accept_len"),
             track_indices=staged.get("track_indices"),
             noise_key=self._noise_key,
@@ -605,7 +607,10 @@ def _stock_sample(slot: SimpleNamespace) -> tuple:
         verify_view,
         batch_view,
         SimpleNamespace(next_token_logits=io.logits),
+        uno_target_max_top_k=io.max_top_k,
         simulated_acc_len=io.sim_accept_len,
+        sparse_bonus_argmax=io.max_top_k is not None,
+        pack_broadcast=True,
     )
 
 
@@ -772,6 +777,17 @@ def _post_verify_inputs(
     if batch.mamba_track_indices is not None:
         inputs["track_indices"] = batch.mamba_track_indices
     return inputs
+
+
+def _compact_max_top_k(batch: ScheduleBatch) -> Optional[int]:
+    """The largest top-k when every request samples with a finite one within the
+    compact top-k branch's limit, else None (the dense branch)."""
+    top_ks = [req.sampling_params.top_k for req in batch.reqs]
+    if not top_ks or min(top_ks) <= 1:
+        return None
+    from sglang.srt.speculative.uno_utils import _SPARSE_TOP_K_LIMIT
+
+    return max(top_ks) if max(top_ks) <= _SPARSE_TOP_K_LIMIT else None
 
 
 def _gdn_extend_tables(meta: Any) -> GdnExtendTables:

@@ -749,13 +749,18 @@ def eagle_sample(
     watermark_full_mask: bool = True,
     simulated_acc_len: Optional[torch.Tensor] = None,
     simulated_acc_len_rng: Optional[torch.Generator] = None,
+    sparse_bonus_argmax: bool = False,
+    pack_broadcast: bool = False,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
     (which contains spec decoding information). simulated_acc_len: the injected
     acceptance length already drawn on the host, as a device int64 [1], so a CUDA
     graph can replay the injection. simulated_acc_len_rng: the generator to draw
-    it from here otherwise (the global CPU RNG when None).
+    it from here otherwise (the global CPU RNG when None). sparse_bonus_argmax: an
+    injected acceptance's bonus is the target argmax on the compact top-k branch
+    too, as on the dense one. pack_broadcast: a sampled result goes to the TP group
+    in one broadcast.
     """
     from sglang.srt.layers.dp_attention import (
         is_dp_attention_enabled,
@@ -855,11 +860,13 @@ def eagle_sample(
 
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
     predict_shape = list(next_token_logits.shape)[:-1]
-    predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
-    accept_index = torch.full(
-        (bs, verify_input.max_tree_depth), -1, dtype=torch.int32, device=device
+    predict, accept_index, num_correct_drafts, verify_out = _verify_outputs(
+        rows=math.prod(predict_shape),
+        bs=bs,
+        depth=verify_input.max_tree_depth,
+        device=device,
+        packed=pack_broadcast,
     )
-    num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
 
     # Sample tokens
     target_predict = None
@@ -932,9 +939,12 @@ def eagle_sample(
             else get_parallel().tp_group
         )
         if tp_group.world_size > 1:
-            tp_group.broadcast(predict, src=0)
-            tp_group.broadcast(accept_index, src=0)
-            tp_group.broadcast(num_correct_drafts, src=0)
+            if verify_out is not None:
+                tp_group.broadcast(verify_out, src=0)
+            else:
+                tp_group.broadcast(predict, src=0)
+                tp_group.broadcast(accept_index, src=0)
+                tp_group.broadcast(num_correct_drafts, src=0)
     else:
         if _is_npu:
             from sgl_kernel_npu.sample import (
@@ -1061,9 +1071,12 @@ def eagle_sample(
             else get_parallel().tp_group
         )
         if tp_group.world_size > 1:
-            tp_group.broadcast(predict, src=0)
-            tp_group.broadcast(accept_index, src=0)
-            tp_group.broadcast(num_correct_drafts, src=0)
+            if verify_out is not None:
+                tp_group.broadcast(verify_out, src=0)
+            else:
+                tp_group.broadcast(predict, src=0)
+                tp_group.broadcast(accept_index, src=0)
+                tp_group.broadcast(num_correct_drafts, src=0)
 
     if SIMULATE_ACC_LEN > 0:
         # Do simulation. The helper builds (and returns) a replacement
@@ -1084,7 +1097,7 @@ def eagle_sample(
                 )
 
             # Use target argmax as the synthetic bonus for non-greedy requests.
-            if target_predict is None:
+            if target_predict is None or sparse_bonus_argmax:
                 target_predict = torch.argmax(next_token_logits, dim=-1).reshape(
                     bs, verify_input.draft_token_num
                 )
@@ -1127,6 +1140,24 @@ def eagle_sample(
             accept_lens,
         )
     return predict, accept_lens, accept_index
+
+
+def _verify_outputs(
+    *, rows: int, bs: int, depth: int, device, packed: bool
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """predict [rows] (zeros), accept_index [bs, depth] (-1) and num_correct_drafts
+    [bs] int32; packed: views of one buffer, returned last, else None."""
+    if not packed:
+        predict = torch.zeros((rows,), dtype=torch.int32, device=device)
+        accept_index = torch.full((bs, depth), -1, dtype=torch.int32, device=device)
+        num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
+        return predict, accept_index, num_correct_drafts, None
+    out = torch.empty((rows + bs * depth + bs,), dtype=torch.int32, device=device)
+    predict = out[:rows]
+    predict.zero_()
+    accept_index = out[rows : rows + bs * depth].view(bs, depth)
+    accept_index.fill_(-1)
+    return predict, accept_index, out[rows + bs * depth :], out
 
 
 def eagle_prepare_for_decode(batch: ScheduleBatch):

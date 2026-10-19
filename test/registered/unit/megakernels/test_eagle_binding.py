@@ -523,6 +523,7 @@ class TestEagleEntries(CustomTestCase):
             batch = SimpleNamespace(
                 forward_mode=ForwardMode.TARGET_VERIFY,
                 seq_lens=torch.zeros(1),
+                reqs=[SimpleNamespace(sampling_params=SimpleNamespace(top_k=1))],
                 sampling_info=SimpleNamespace(**info),
                 mamba_track_indices=None,
                 **fields,
@@ -548,6 +549,74 @@ class TestEagleEntries(CustomTestCase):
         ):
             with self.subTest(change=sorted(change)):
                 self.assertIsNone(key(**change))
+
+    def test_the_compact_branch_takes_only_batches_of_finite_top_k(self):
+        """A batch samples on the top-k support only when every request has a finite
+        top-k within the compact limit; its graphs are keyed apart from the dense
+        branch's, whose sampling differs."""
+
+        def batch(*top_ks):
+            reqs = [
+                SimpleNamespace(sampling_params=SimpleNamespace(top_k=k))
+                for k in top_ks
+            ]
+            return SimpleNamespace(reqs=reqs)
+
+        limit = SimpleNamespace(_SPARSE_TOP_K_LIMIT=128)
+        with patch.dict("sys.modules", {"sglang.srt.speculative.uno_utils": limit}):
+            self.assertEqual(eagle_megakernel._compact_max_top_k(batch(20, 64)), 64)
+            for dense in ((20, 1 << 30), (20, 1), (129,), ()):
+                with self.subTest(top_ks=dense):
+                    self.assertIsNone(
+                        eagle_megakernel._compact_max_top_k(batch(*dense))
+                    )
+            mk = _megakernel()
+            info = SimpleNamespace(
+                is_all_greedy=False,
+                need_top_k_sampling=True,
+                need_top_p_sampling=False,
+                need_min_p_sampling=False,
+                acc_additive_penalties=None,
+                acc_scaling_penalties=None,
+                logit_bias=None,
+                sampling_seed=None,
+                has_watermark_candidates=False,
+            )
+            verify_input = SimpleNamespace(
+                topk=1, draft_probs=None, draft_token_num=7, max_tree_depth=7
+            )
+            logits = SimpleNamespace(next_token_logits=torch.zeros((7, 8)))
+            keys = set()
+            for top_k in (20, 1 << 30):
+                verify_batch = SimpleNamespace(
+                    forward_mode=ForwardMode.TARGET_VERIFY,
+                    seq_lens=torch.zeros(1),
+                    reqs=batch(top_k).reqs,
+                    sampling_info=info,
+                    mamba_track_indices=None,
+                    has_grammar=False,
+                    hisparse_coordinator=None,
+                )
+                keys.add(mk._post_verify_key(verify_batch, verify_input, logits, True))
+            self.assertEqual(len(keys), 2)
+
+    def test_a_packed_verify_result_is_one_buffer_holding_the_stock_values(self):
+        """The post-verify graphs broadcast a sampled result once: predict,
+        accept_index and num_correct_drafts must be views of one buffer, in order,
+        starting from the values the unpacked tensors start from."""
+        from sglang.srt.speculative.eagle_utils import _verify_outputs
+
+        kw = dict(rows=14, bs=2, depth=7, device="cpu")
+        stock = _verify_outputs(packed=False, **kw)
+        *views, buffer = _verify_outputs(packed=True, **kw)
+        self.assertIsNone(stock[3])
+        for got, want in zip(views[:2], stock[:2]):
+            self.assertTrue(torch.equal(got, want))
+        offset = 0
+        for view in views:
+            self.assertEqual(view.data_ptr(), buffer.data_ptr() + 4 * offset)
+            offset += view.numel()
+        self.assertEqual(offset, buffer.numel())
 
     def test_forced_lengths_are_one_stream_with_the_flag_and_unchanged_without(self):
         """With --enable-nvidia-megakernel the post-verify graphs and the eager verify

@@ -204,6 +204,9 @@ class EagleVerifyIO(msgspec.Struct, frozen=True):
     temperatures: Optional[torch.Tensor]  # [bs, 1] float32, None when all greedy
     top_ks: Optional[torch.Tensor]  # [bs] int32
     top_ps: Optional[torch.Tensor]  # [bs] float32
+    # the largest top-k when every request samples a finite one within the compact
+    # branch's limit (SGLang then samples on that support), else None
+    max_top_k: Optional[int]
     # [1] int64 injected acceptance length (SGLANG_SIMULATE_ACC_LEN), drawn on the
     # host alike on every rank; None without injection
     sim_accept_len: Optional[torch.Tensor]

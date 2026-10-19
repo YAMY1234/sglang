@@ -76,6 +76,7 @@ def _round(bs, generator):
             top_ks=None,
             top_ps=None,
         ),
+        reqs=[SimpleNamespace(sampling_params=SimpleNamespace(top_k=1))] * bs,
         has_grammar=False,
         hisparse_coordinator=None,
         mamba_track_indices=None,
