@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import torch
 
+from sglang.kernels.ops.memory.small_field_copy import SmallFieldCopyPlan
 from sglang.srt.megakernels.eagle_binding import (
     EagleDraftExtendIO,
     EagleDraftLoopIO,
@@ -655,9 +656,9 @@ class _PostVerifyGraphs:
                 )
             slot = state.slots[turn] = make_slot(staged)
             slot.staged, slot.graph, slot.commit_graph = staged, None, None
-        self._load(slot.staged, inputs)
+            slot.load_plan = SmallFieldCopyPlan(allow_pinned_src=True)
+        self._load(slot, inputs, sim_len)
         if sim_len is not None:
-            slot.staged["sim_accept_len"].copy_(sim_len, non_blocking=True)
             self._record_sim_done(sim_turn)
         if slot.graph is None:
             if state.warmups < _NUM_WARMUP * 2:
@@ -681,7 +682,15 @@ class _PostVerifyGraphs:
             self._commit_pending = False
 
     @staticmethod
-    def _load(staged: dict, inputs: dict) -> None:
+    def _load(slot: SimpleNamespace, inputs: dict, sim_len) -> None:
+        staged = slot.staged
+        dsts, srcs = [staged[name] for name in inputs], list(inputs.values())
+        if sim_len is not None:
+            dsts.append(staged["sim_accept_len"])
+            srcs.append(sim_len)
+        # one launch for the round's inputs and the pinned host draw
+        if slot.load_plan(dsts, srcs):
+            return
         # One multi-tensor copy per dtype; one copy per input costs ~4 us of GPU time.
         groups: dict = {}
         for name, src in inputs.items():
@@ -690,6 +699,8 @@ class _PostVerifyGraphs:
             srcs.append(src)
         for dsts, srcs in groups.values():
             torch._foreach_copy_(dsts, srcs, non_blocking=True)
+        if sim_len is not None:
+            staged["sim_accept_len"].copy_(sim_len, non_blocking=True)
 
     def _draw_sim_len(
         self, max_len: int
