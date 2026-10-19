@@ -639,6 +639,7 @@ def run_eagle_verify(
             req_to_token_pool,
             batch,
             target_worker,
+            track_indices=None if megakernel is None else megakernel.track_indices,
         )
 
     # Cover post-prepare rebinds: draft_token, plan_stream-allocated out_cache_loc.

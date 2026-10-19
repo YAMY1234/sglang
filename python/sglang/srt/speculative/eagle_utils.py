@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.sampling.watermarking.core import WatermarkState
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
+    from sglang.srt.speculative.spec_utils import VerifyTrackIndices
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -526,6 +527,8 @@ def eagle_prepare_for_verify(
     req_to_token_pool: ReqToTokenPool,
     batch: ScheduleBatch,
     target_worker: TpModelWorker,
+    *,
+    track_indices: Optional[VerifyTrackIndices] = None,
 ):
     # Imports must stay lazy (import-cycle safety) but only need to resolve
     # once, not on every decode cycle of this hot path.
@@ -588,7 +591,7 @@ def eagle_prepare_for_verify(
             batch, verify_input.draft_token_num
         )
 
-        prepare_mamba_track_for_verify(batch)
+        prepare_mamba_track_for_verify(batch, track_indices=track_indices)
 
         # TBO's split_spec_info reads these; no-verify-sync leaves both None.
         verify_input.seq_lens_cpu = batch.seq_lens_cpu

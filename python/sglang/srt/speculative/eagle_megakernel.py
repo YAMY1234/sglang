@@ -134,6 +134,10 @@ class EagleMegakernel:
             commit=self._post_verify_commit,
             sim_rng=simulated_acc_len_rng,
         )
+        from sglang.srt.speculative.spec_utils import VerifyTrackIndices
+
+        # the mamba track indices verify rounds reuse while their inputs hold
+        self.track_indices = VerifyTrackIndices()
 
     # ----- the EAGLE draft and draft-extend graphs -----
 
