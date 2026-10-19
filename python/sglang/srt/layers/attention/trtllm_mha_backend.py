@@ -446,6 +446,30 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             self.decode_seq_len_splits > 1 and envs.SGLANG_Q35MF_PDDEC_SPLIT_HOIST.get()
         )
         self._decode_group_plans = DecodeGroupPlans()
+        self._dep16_verify_cta8 = None
+        if envs.SGLANG_Q35MF_E2X_VFMHA_CTA8.get():
+            from sglang.kernels.ops.attention.dep16_verify_cta8 import (
+                prepare_dep16_verify_cta8,
+                supports_dep16_verify_cta8,
+                trtllm_dep16_verify_cta8,
+            )
+
+            if (
+                get_parallel().attn_dp_size == 16
+                and get_parallel().attn_tp_size == 1
+                and self.decode_seq_len_splits == 1
+                and self.page_size == 64
+                and self.data_type == torch.float8_e4m3fn
+                and supports_dep16_verify_cta8(torch.device(self.device))
+            ):
+                prepare_dep16_verify_cta8(torch.device(self.device))
+                self._dep16_verify_cta8 = trtllm_dep16_verify_cta8
+                logger.info(
+                    "E2X_VFMHA_CTA8 prepared: target-verify q7 only, "
+                    "B10..16/Q32/KV2/H256/FP8-QKV/BF16-out; all other shapes stay stock"
+                )
+            else:
+                logger.warning("E2X_VFMHA_CTA8 unsupported runtime/topology; using stock")
         self._xqa_spec_dec_mask = None
         if self.is_xqa_impl and self.speculative_num_draft_tokens:
             draft_len = self.speculative_num_draft_tokens
@@ -1495,6 +1519,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         use_paged_fp8: bool = False,
         use_skv2: bool = False,
         use_q1: bool = False,
+        use_dep16_verify_cta8: bool = False,
     ) -> torch.Tensor:
         """Run decode, optionally sorting and splitting requests by KV length."""
 
@@ -1723,7 +1748,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 kwargs["q_len_per_req"] = q_len_per_req
             if mask is not None:
                 kwargs["mask"] = mask[: group_seq_lens.shape[0]]
-            return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+            decode = flashinfer.decode.trtllm_batch_decode_with_kv_cache
+            if use_dep16_verify_cta8 and self._dep16_verify_cta8 is not None:
+                decode = self._dep16_verify_cta8
+            return decode(
                 query=group_query,
                 kv_cache=kv_cache,
                 workspace_buffer=self.workspace_buffer,
@@ -2111,6 +2139,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     kv_cache_sf=kv_cache_block_scales,
                     q_len_per_req=self.forward_metadata.max_seq_len_q,
                     mask=mask,
+                    use_dep16_verify_cta8=forward_batch.forward_mode.is_target_verify(),
                     use_split_kv=(
                         self._split_kv_enabled and use_split_kv_attention(forward_batch)
                     ),
