@@ -1371,6 +1371,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 target_worker=self.target_worker, draft_worker=draft
             )
             draft.megakernel = self._megakernel
+            # breakable prefill graphs capture the target's GDN extend, the
+            # megakernel's when it offers one
+            self.target_worker.model_runner.attn_backend.enable_prefill_graph_extend(
+                self._megakernel.gdn_extend_entry()
+            )
 
     def init_cuda_graphs(self):
         super().init_cuda_graphs()

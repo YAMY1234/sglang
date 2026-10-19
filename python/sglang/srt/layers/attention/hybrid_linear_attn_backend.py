@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 
@@ -1202,21 +1202,32 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.extend_dummy_seqs_capped_by_req_pool = getattr(
             full_attn_backend, "extend_dummy_seqs_capped_by_req_pool", False
         ) or getattr(linear_attn_backend, "extend_dummy_seqs_capped_by_req_pool", False)
+        self._resolve_breakable_linear_extend()
+
+    def enable_prefill_graph_extend(
+        self, megakernel_extend: Optional[Callable[..., None]]
+    ) -> None:
+        """Before any capture: breakable prefill CUDA graphs capture the GDN extend
+        where the linear backend supports it, through megakernel_extend when given."""
+        self.linear_attn_backend.enable_prefill_graph_extend(megakernel_extend)
+        self._resolve_breakable_linear_extend()
+
+    def _resolve_breakable_linear_extend(self) -> None:
         # Breakable prefill CUDA graphs capture the linear extend when the linear
         # backend can run it on static tables (linear/kda_prefill_graph.py);
         # those tables follow the runner's captured-metadata contract.
         self.use_captured_forward_metadata_for_breakable_cuda_graph = (
             check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
-            and linear_attn_backend.supports_prefill_graph_extend()
-            and not full_attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
+            and self.linear_attn_backend.supports_prefill_graph_extend()
+            and not self.full_attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
         )
         if self.use_captured_forward_metadata_for_breakable_cuda_graph:
             self.prefill_cuda_graph_max_batch_size = (
-                linear_attn_backend.prefill_graph_max_seqs
+                self.linear_attn_backend.prefill_graph_max_seqs
             )
             logger.info(
                 "Breakable prefill CUDA graphs capture the %s extend.",
-                type(linear_attn_backend).__name__,
+                type(self.linear_attn_backend).__name__,
             )
 
     @property

@@ -15,10 +15,13 @@ from sglang.srt.megakernels.eagle_binding import (
     EagleDraftExtendIO,
     EagleDraftLoopIO,
     EagleDraftRoundIO,
+    EagleGdnExtendIO,
     EagleVerifyIO,
     EagleVerifyOutputs,
+    GdnExtendTables,
     attn_step_metadata,
     kv_pool_buffers,
+    mamba_pool_buffers,
     split_backend,
 )
 from sglang.srt.megakernels.runtime import megakernel_agree, megakernel_entry
@@ -33,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 # the draft model's entries, and the target's
 DRAFT_ENTRIES = ("draft_loop", "draft_extend", "begin_draft_round")
-TARGET_ENTRIES = ("verify_sample",)
+TARGET_ENTRIES = ("verify_sample", "gdn_extend")
 
 # Eager rounds per post-verify key before its graphs are captured.
 _NUM_WARMUP = 2
@@ -101,6 +104,10 @@ class EagleMegakernel:
         self._verify_sample = megakernel_entry(
             target_worker.model_runner.model, "verify_sample"
         )
+        self._gdn_extend = megakernel_entry(
+            target_worker.model_runner.model, "gdn_extend"
+        )
+        self._mamba = None
         # bs -> verify_sample's step, from bind_verify_sample
         self._verify_steps: dict[int, Callable] = {}
         # the server seed is the same on every rank
@@ -287,6 +294,40 @@ class EagleMegakernel:
                 from_served_extend=from_served_extend,
                 topk_index=draft_input.topk_index,
                 hidden_states=draft_input.hidden_states,
+            )
+        )
+
+    # ----- the target's GDN extend in captured prefill buckets -----
+
+    def gdn_extend_entry(self) -> Optional[Callable[..., None]]:
+        """The GDN backend's megakernel_extend: the target's gdn_extend, or None for
+        SGLang's extend in the captured buckets."""
+        return None if self._gdn_extend is None else self._run_gdn_extend
+
+    def _run_gdn_extend(
+        self,
+        *,
+        layer_id: int,
+        meta: Any,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        if self._mamba is None:
+            # the target's pool, allocated before any prefill graph is captured
+            self._mamba = mamba_pool_buffers(
+                self._target_worker.model_runner.req_to_token_pool
+            )
+        self._gdn_extend(
+            EagleGdnExtendIO(
+                layer_id=layer_id,
+                tables=_gdn_extend_tables(meta),
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+                out=out,
+                mamba=self._mamba,
             )
         )
 
@@ -719,6 +760,28 @@ def _post_verify_inputs(
     if batch.mamba_track_indices is not None:
         inputs["track_indices"] = batch.mamba_track_indices
     return inputs
+
+
+def _gdn_extend_tables(meta: Any) -> GdnExtendTables:
+    """A GDNPrefillGraphMetadata's tables, without its host staging."""
+    return GdnExtendTables(
+        num_tokens=meta.num_tokens,
+        max_seqs=meta.max_seqs,
+        max_chunks=meta.max_chunks,
+        max_conv_blocks=meta.max_conv_blocks,
+        track=meta.track,
+        cu_seqlens=meta.cu_seqlens,
+        chunk_indices=meta.chunk_indices,
+        chunk_offsets=meta.chunk_offsets,
+        conv_block_table=meta.conv_block_table,
+        track_mode=meta.track_mode,
+        track_h_row=meta.track_h_row,
+        track_conv_start=meta.track_conv_start,
+        num_logical_tokens=meta.num_logical_tokens,
+        cache_indices=meta.cache_indices,
+        has_initial_state=meta.has_initial_state,
+        track_dst=meta.track_dst,
+    )
 
 
 def _domain_key(seed: int, domain: int) -> int:

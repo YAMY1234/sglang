@@ -123,7 +123,9 @@ def _megakernel(target_entries=None, **entries):
     return EagleMegakernel(
         target_worker=SimpleNamespace(
             model_runner=SimpleNamespace(
-                model=_model(**(target_entries or {})), watermark_state=None
+                model=_model(**(target_entries or {})),
+                watermark_state=None,
+                req_to_token_pool=_req_pool(),
             ),
             random_seed=0,
             device="cpu",
@@ -145,10 +147,17 @@ def _worker(
     rejection_sampling=False,
     target_backend=None,
     draft_backend=None,
+    extends=None,
 ):
     """An EAGLE worker after init_attention_backends, whose models' megakernels
     offer these entries; by default its target runs GDN and trtllm_mha under a
-    hybrid backend and its draft trtllm_mha."""
+    hybrid backend and its draft trtllm_mha. extends collects what reached the
+    target backend's enable_prefill_graph_extend."""
+    if target_backend is None:
+        target_backend = _hybrid()
+    target_backend.enable_prefill_graph_extend = (
+        [] if extends is None else extends
+    ).append
     if draft_backend is None:
         draft_backend = _trtllm(KvPool())
     worker = eagle_worker_v2.EAGLEWorkerV2.__new__(eagle_worker_v2.EAGLEWorkerV2)
@@ -157,7 +166,7 @@ def _worker(
         _target_worker=SimpleNamespace(
             model_runner=SimpleNamespace(
                 model=_model(**(target or {})),
-                attn_backend=_hybrid() if target_backend is None else target_backend,
+                attn_backend=target_backend,
             ),
             random_seed=0,
             device="cpu",
@@ -265,14 +274,24 @@ class TestEagleBinding(CustomTestCase):
 
 class TestEagleEntries(CustomTestCase):
     def test_without_an_offered_entry_sglang_keeps_its_own_path(self):
-        self.assertIsNone(_worker()._megakernel)
+        """Without an offer SGLang's side of the entries does not exist and prefill
+        keeps breaking at every GDN layer; an offer captures SGLang's own GDN extend,
+        unless the target offers gdn_extend."""
+        extends = []
+        self.assertIsNone(_worker(extends=extends)._megakernel)
+        self.assertEqual(extends, [])
         for offer in (
             dict(draft={"draft_loop": print}),
             dict(target={"verify_sample": print}),
         ):
-            worker = _worker(**offer)
+            extends = []
+            worker = _worker(extends=extends, **offer)
             self.assertIsNotNone(worker._megakernel)
             self.assertIs(worker._draft_worker.megakernel, worker._megakernel)
+            self.assertEqual(extends, [None])
+        extends = []
+        worker = _worker(target={"gdn_extend": print}, extends=extends)
+        self.assertEqual(extends, [worker._megakernel.gdn_extend_entry()])
         runner = SimpleNamespace(capture_bs=[1, 2])
         self.assertEqual(_megakernel().bind_draft_graphs(runner), frozenset())
 
@@ -395,6 +414,50 @@ class TestEagleEntries(CustomTestCase):
         begin("a", "b")
         self.assertEqual(len(rounds), calls)  # batch size 2 is not served
         self.assertIsNone(served_extend("a", "b"))  # SGLang's top-1 there
+
+    def test_a_captured_bucket_hands_the_megakernels_gdn_extend_its_own_tables(self):
+        """A captured prefill bucket replays SGLang's refills of its static tables, so
+        the target's gdn_extend must get those very tensors, the layer's inputs, the
+        mamba pool and SGLang's zeroed output, whose rows past the batch stay zero."""
+        calls = []
+
+        def gdn_extend(io):
+            calls.append(io)
+            io.out[:, :3] = 1.0
+
+        mk = _megakernel(target_entries={"gdn_extend": gdn_extend})
+        scalars = ("num_tokens", "max_seqs", "max_chunks", "max_conv_blocks", "track")
+        meta = SimpleNamespace(
+            num_tokens=6,
+            max_seqs=2,
+            max_chunks=3,
+            max_conv_blocks=4,
+            track=False,
+            **{
+                name: torch.zeros(1)
+                for name in eb.GdnExtendTables.__struct_fields__
+                if name not in scalars
+            },
+        )
+        backend = _backend(
+            GDNAttnBackend,
+            prefill_graph_metadata=meta,
+            megakernel_extend=mk.gdn_extend_entry(),
+        )
+        inputs = dict(
+            mixed_qkv=torch.zeros((6, 16)), a=torch.zeros((6, 2)), b=torch.zeros((6, 2))
+        )
+        layer = SimpleNamespace(layer_id=5, num_v_heads=2, head_v_dim=4)
+        out = backend._forward_extend_in_graph(layer=layer, **inputs)
+        (io,) = calls
+        self.assertEqual((io.layer_id, io.mamba.layer_ids), (5, (0, 2)))
+        for name in eb.GdnExtendTables.__struct_fields__:
+            self.assertIs(getattr(io.tables, name), getattr(meta, name), name)
+        for name, tensor in inputs.items():
+            self.assertIs(getattr(io, name), tensor, name)
+        self.assertIs(io.out, out)
+        self.assertEqual(tuple(out.shape), (1, 6, 2, 4))
+        self.assertTrue(bool((out[:, :3] == 1).all() and (out[:, 3:] == 0).all()))
 
     def test_only_batches_a_graph_can_replay_take_the_post_verify_graphs(self):
         """A batch whose sampling a captured graph cannot reproduce (grammar, penalties,

@@ -4,7 +4,11 @@ from unittest.mock import MagicMock, patch, sentinel
 
 import torch
 
-from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
+from sglang.srt.layers.attention import hybrid_linear_attn_backend
+from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+    HybridLinearAttnBackend,
+    MambaAttnBackendBase,
+)
 from sglang.srt.layers.attention.linear import gdn_backend
 from sglang.srt.layers.attention.linear.gdn_backend import (
     GDNAttnBackend,
@@ -78,6 +82,79 @@ def make_runner(
             )
         ),
     )
+
+
+class TestGDNPrefillGraphExtendForAMegakernel(CustomTestCase):
+    def _enable(self, megakernel_extend, *, cuda=True, enable_mis=False):
+        backend = GDNAttnBackend.__new__(GDNAttnBackend)
+        backend.enable_mis = enable_mis
+        backend._mamba_chunk_size = 64
+        backend.kernel_dispatcher = SimpleNamespace(
+            extend_kernel=TritonGDNKernel.__new__(TritonGDNKernel)
+        )
+        cache = SimpleNamespace(conv=[torch.zeros(2, 3)], temporal=torch.zeros(2, 3))
+        backend.req_to_token_pool = SimpleNamespace(
+            mamba_pool=SimpleNamespace(mamba_cache=cache)
+        )
+        graph = SimpleNamespace(
+            cuda_graph_config=SimpleNamespace(prefill=SimpleNamespace(bs=[512]))
+        )
+        with (
+            patch.object(gdn_backend, "is_cuda", return_value=cuda),
+            patch.object(gdn_backend, "FLA_CHUNK_SIZE", 64, create=True),
+            patch.object(
+                gdn_backend, "buckets_keep_chunk_o_block_size", return_value=True
+            ),
+            patch.object(
+                gdn_backend, "get_exec", return_value=SimpleNamespace(graph=graph)
+            ),
+            patch(
+                "sglang.srt.model_executor.runner.prefill_cuda_graph_runner."
+                "get_prefill_num_tokens_to_capture",
+                return_value=[512],
+            ),
+        ):
+            backend.enable_prefill_graph_extend(megakernel_extend)
+        return backend
+
+    def test_only_a_supported_setup_captures_the_extend_or_takes_a_megakernels(self):
+        """A megakernel's EAGLE entries turn the captured extend on, and install its
+        extend, only where this setup supports the graph-safe chain; elsewhere the
+        layers keep breaking and SGLang's eager extend runs."""
+        extend = object()
+        on = self._enable(extend)
+        self.assertTrue(on.supports_prefill_graph_extend())
+        self.assertIs(on.megakernel_extend, extend)
+        self.assertIsNone(self._enable(None).megakernel_extend)
+        for unsupported in (dict(cuda=False), dict(enable_mis=True)):
+            off = self._enable(extend, **unsupported)
+            self.assertFalse(off.supports_prefill_graph_extend(), unsupported)
+            self.assertIsNone(off.megakernel_extend, unsupported)
+
+    def test_enabling_after_construction_reaches_the_prefill_graph_runner(self):
+        """The hybrid backend decides at construction whether breakable prefill
+        graphs capture the linear extend; the EAGLE worker enables it later, before
+        any capture, so that decision must follow."""
+        state = {"on": False}
+        hybrid = HybridLinearAttnBackend.__new__(HybridLinearAttnBackend)
+        hybrid.linear_attn_backend = SimpleNamespace(
+            supports_prefill_graph_extend=lambda: state["on"],
+            enable_prefill_graph_extend=lambda extend: state.update(on=True),
+            prefill_graph_max_seqs=32,
+        )
+        hybrid.full_attn_backend = SimpleNamespace(
+            use_captured_forward_metadata_for_breakable_cuda_graph=False
+        )
+        with patch.object(
+            hybrid_linear_attn_backend, "check_cuda_graph_backend", return_value=True
+        ):
+            hybrid._resolve_breakable_linear_extend()
+            self.assertFalse(
+                hybrid.use_captured_forward_metadata_for_breakable_cuda_graph
+            )
+            hybrid.enable_prefill_graph_extend(None)
+        self.assertTrue(hybrid.use_captured_forward_metadata_for_breakable_cuda_graph)
+        self.assertEqual(hybrid.prefill_cuda_graph_max_batch_size, 32)
 
 
 class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
