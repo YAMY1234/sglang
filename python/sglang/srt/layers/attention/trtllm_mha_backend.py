@@ -41,6 +41,7 @@ from sglang.srt.layers.attention.graph_variants import (
 )
 from sglang.srt.layers.attention.trtllm_mha_decode_groups import (
     DecodeGroupPlans,
+    run_planned_concurrent_groups,
     run_planned_groups,
 )
 from sglang.srt.layers.attention.trtllm_mla_backend import (
@@ -65,6 +66,7 @@ from sglang.srt.runtime_context import (
     get_platform,
     get_schedule,
     get_spec,
+    get_stream,
     max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
 )
@@ -478,6 +480,36 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 )
             else:
                 logger.warning("E2X_VFMHA_CTA8 unsupported runtime/topology; using stock")
+        self._decode_group_streams = ()
+        if (
+            envs.SGLANG_Q35MF_K4_ATTN_GROUP_STREAMS.get()
+            and self.decode_split_hoist
+            and self.decode_seq_len_splits == 4
+            and not self.is_xqa_impl
+            and get_parallel().attn_tp_size == 1
+            and get_parallel().attn_dcp_size == 1
+        ):
+            # Target and draft forwards join before returning, so their
+            # same-role buffers/streams can be reused across backend instances.
+            self._decode_group_streams = tuple(
+                get_stream(f"trtllm_mha_decode_group_{group}") for group in range(4)
+            )
+            self._decode_group_workspaces = tuple(
+                get_buffer(
+                    f"trtllm_mha_group_workspace_{group}_{self.workspace_size}",
+                    lambda: torch.zeros_like(self.workspace_buffer),
+                )
+                for group in range(4)
+            )
+            counter = self._multi_ctas_kv_counter_buffer
+            self._decode_group_counters = tuple(
+                get_buffer(
+                    f"trtllm_mha_group_counter_{group}_{counter.numel()}",
+                    lambda: torch.zeros_like(counter),
+                )
+                for group in range(4)
+            )
+            self._decode_group_streams_logged = False
         self._xqa_spec_dec_mask = None
         if self.is_xqa_impl and self.speculative_num_draft_tokens:
             draft_len = self.speculative_num_draft_tokens
@@ -1782,6 +1814,54 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         num_splits = min(self.decode_seq_len_splits, num_requests)
         if num_splits == 1:
             return run_group(query, block_tables, seq_lens, out)
+        if (
+            self._decode_group_streams
+            and query.dtype == torch.float8_e4m3fn
+            and resolved_out_dtype == torch.bfloat16
+            and q_len_per_req in (1, 7)
+            and mask is None
+            and kv_cache_sf is None
+        ):
+            if not self._decode_group_streams_logged:
+                self._decode_group_streams_logged = True
+                logger.info(
+                    "Concurrent native decode length groups engaged (%d groups)",
+                    num_splits,
+                )
+
+            def run_concurrent_group(
+                group_query, group_tables, group_lens, group_out, group
+            ):
+                return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+                    query=group_query,
+                    kv_cache=kv_cache,
+                    workspace_buffer=self._decode_group_workspaces[group],
+                    block_tables=group_tables,
+                    seq_lens=group_lens,
+                    max_seq_len=self.max_context_len,
+                    bmm1_scale=bmm1_scale,
+                    bmm2_scale=bmm2_scale,
+                    window_left=window_left,
+                    sinks=sinks,
+                    skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+                    out=group_out,
+                    out_dtype=None,
+                    multi_ctas_kv_counter_buffer=self._decode_group_counters[group],
+                    q_len_per_req=q_len_per_req,
+                )
+
+            return run_planned_concurrent_groups(
+                query=query,
+                plan=self._decode_group_plans.get(
+                    block_tables=block_tables, seq_lens=seq_lens
+                ),
+                num_splits=num_splits,
+                q_len_per_req=q_len_per_req,
+                out=out,
+                out_dtype=resolved_out_dtype,
+                streams=self._decode_group_streams,
+                run_group=run_concurrent_group,
+            )
         if self.decode_split_hoist:
             return run_planned_groups(
                 query=query,

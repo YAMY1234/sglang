@@ -37,7 +37,7 @@ _NUM_WARMUP = 2
 # Largest batch replayed from the graph; larger batches keep the eager chain.
 _MAX_BS = int(os.environ.get("SGLANG_Q35MF_EDGE_POST_VERIFY_MAX_BS", "2"))
 # Arbitrary bound on captured graph sets (key x verify logits buffer).
-_MAX_STATES = max(16, 8 * _MAX_BS)
+_MAX_STATES = envs.SGLANG_Q35MF_K4_PVG_MAX_STATES.get() or max(16, 8 * _MAX_BS)
 # With the side-stream commit: largest batch whose commit runs on the side stream; larger
 # batches commit inside the main graph (the side commit slows the overlapping draft extend).
 _SIDE_MAX_BS = int(
