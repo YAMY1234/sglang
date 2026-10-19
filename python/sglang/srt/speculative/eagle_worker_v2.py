@@ -1361,7 +1361,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
         draft = self._draft_worker
         # the pools and both attention backends exist, no graph is captured yet
         if draft is not None and offers_eagle_entries(
-            draft_model=draft.draft_runner.model
+            target_model=self.target_worker.model_runner.model,
+            draft_model=draft.draft_runner.model,
         ):
             reasons = unservable_reasons(self)
             if reasons:
@@ -1373,6 +1374,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
     def init_cuda_graphs(self):
         super().init_cuda_graphs()
+        verify_graphs = self.target_worker.model_runner.decode_cuda_graph_runner
+        if self._megakernel is not None and verify_graphs is not None:
+            # the post-verify graphs serve batches the verify graphs replay
+            self._megakernel.bind_verify_sample(
+                max_bs=verify_graphs.max_bs,
+                tokens_per_request=self.speculative_num_draft_tokens,
+            )
         # Build adaptive runtime states after target and draft backends exist.
         if self.adaptive_controller is not None:
             with (
@@ -1490,6 +1498,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     self.draft_worker._draft_extend_for_decode(
                         batch, batch_output, kv_loc_plan=verify_input.kv_loc_plan
                     )
+            if self._megakernel is not None:
+                # The GDN state commit may still run on a side stream.
+                self._megakernel.join()
 
             if (
                 get_parallel().pp_size > 1
@@ -1660,6 +1671,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             spec_stage_span("draft_extend"),
         ):
             self.draft_worker._draft_extend_for_decode(batch, result)
+        if self._megakernel is not None:
+            self._megakernel.join()
         return result
 
     def _build_trivial_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
@@ -1972,4 +1985,5 @@ class EAGLEWorkerV2(BaseSpecWorker):
             metadata_ready_pre_pad=False,
             finalize_tree_path=True,
             grammar_barrier=grammar_barrier,
+            megakernel=self._megakernel,
         )

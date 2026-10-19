@@ -63,6 +63,7 @@ if TYPE_CHECKING:
         EAGLEDraftCudaGraphRunner,
     )
     from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+    from sglang.srt.speculative.eagle_megakernel import EagleMegakernel
 
 
 def duplicate_prefix_tail_to_draft_branches(
@@ -578,6 +579,7 @@ def run_eagle_verify(
     pp_proxy_tensors: Optional[PPProxyTensors] = None,
     grammar_barrier=None,
     uno_target_max_top_k: Optional[int] = None,
+    megakernel: Optional[EagleMegakernel] = None,
 ) -> GenerationBatchResult:
     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
 
@@ -676,6 +678,39 @@ def run_eagle_verify(
         pp_proxy_tensors=pp_proxy_tensors,
     )
     logits_output = forward_batch_output.logits_output
+
+    # SGLang's post-verify graphs when a megakernel offers EAGLE entries, for a
+    # batch they can replay.
+    post = (
+        None
+        if megakernel is None
+        else megakernel.verify_post(
+            batch=batch,
+            verify_input=verify_input,
+            logits_output=logits_output,
+            can_run_cuda_graph=can_run_cuda_graph,
+        )
+    )
+    if post is not None:
+        predict, accept_lens, accept_index, new_seq_lens, bonus_tokens = post[:5]
+        if batch.return_logprob:
+            compute_spec_logprobs(
+                batch, logits_output, predict, accept_index=accept_index
+            )
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=predict,
+            can_run_cuda_graph=can_run_cuda_graph,
+            speculative_num_draft_tokens=num_draft_tokens,
+            next_draft_input=EagleDraftInput(bonus_tokens=bonus_tokens),
+            accept_lens=accept_lens,
+            accept_index=accept_index,
+            new_seq_lens=new_seq_lens,
+            routed_experts_output=forward_batch_output.routed_experts_output,
+            indexer_topk_output=forward_batch_output.indexer_topk_output,
+            extra_keep_alive_refs=[verify_forward_batch],
+            prepared_draft_extend_inputs=post[5],
+        )
 
     # Generate vocab mask for constrained decoding
     grammar_mask = None

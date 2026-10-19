@@ -1,7 +1,8 @@
-"""CPU contract of the EAGLE binding: a covered step's view is the running forward's
-own attention metadata and pools, read from a hybrid GDN backend; the pools are
-sealed at their first read and checked after capture; every struct carries data
-only; the tolerated lists name real members."""
+"""CPU contracts of the EAGLE binding and of SGLang's side of the EAGLE entries: a
+covered step's view is the running forward's own metadata and pools, sealed at their
+first read and checked after capture; the structs carry data only and the tolerated
+lists name real members; offered entries run only at the batch sizes every rank
+serves, an unservable setup is refused, and without an offer SGLang's path runs."""
 
 import typing
 import unittest
@@ -18,8 +19,8 @@ from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.megakernels import eagle_binding as eb
 from sglang.srt.megakernels import runtime
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.speculative import eagle_megakernel, eagle_worker_v2
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.speculative import eagle_megakernel, eagle_worker_v2, spec_utils
 from sglang.srt.speculative.eagle_megakernel import EagleMegakernel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -117,10 +118,16 @@ def _model(**entries):
     return model
 
 
-def _megakernel(**entries):
-    """SGLang's side of a draft offering these entries."""
+def _megakernel(target_entries=None, **entries):
+    """SGLang's side of a target and a draft offering these entries."""
     return EagleMegakernel(
-        target_worker=SimpleNamespace(),
+        target_worker=SimpleNamespace(
+            model_runner=SimpleNamespace(
+                model=_model(**(target_entries or {})), watermark_state=None
+            ),
+            random_seed=0,
+            device="cpu",
+        ),
         draft_worker=SimpleNamespace(
             draft_runner=SimpleNamespace(
                 model=_model(**entries),
@@ -132,14 +139,15 @@ def _megakernel(**entries):
 
 def _worker(
     *,
+    target=None,
     draft=None,
     topk=1,
     rejection_sampling=False,
     target_backend=None,
     draft_backend=None,
 ):
-    """An EAGLE worker after init_attention_backends, whose draft model's megakernel
-    offers these entries; by default its target runs GDN and trtllm_mha under a
+    """An EAGLE worker after init_attention_backends, whose models' megakernels
+    offer these entries; by default its target runs GDN and trtllm_mha under a
     hybrid backend and its draft trtllm_mha."""
     if draft_backend is None:
         draft_backend = _trtllm(KvPool())
@@ -148,8 +156,11 @@ def _worker(
         topk=topk,
         _target_worker=SimpleNamespace(
             model_runner=SimpleNamespace(
-                attn_backend=_hybrid() if target_backend is None else target_backend
+                model=_model(**(target or {})),
+                attn_backend=_hybrid() if target_backend is None else target_backend,
             ),
+            random_seed=0,
+            device="cpu",
         ),
         _draft_worker=SimpleNamespace(
             init_attention_backends=lambda: None,
@@ -255,9 +266,13 @@ class TestEagleBinding(CustomTestCase):
 class TestEagleEntries(CustomTestCase):
     def test_without_an_offered_entry_sglang_keeps_its_own_path(self):
         self.assertIsNone(_worker()._megakernel)
-        worker = _worker(draft={"draft_loop": print})
-        self.assertIsNotNone(worker._megakernel)
-        self.assertIs(worker._draft_worker.megakernel, worker._megakernel)
+        for offer in (
+            dict(draft={"draft_loop": print}),
+            dict(target={"verify_sample": print}),
+        ):
+            worker = _worker(**offer)
+            self.assertIsNotNone(worker._megakernel)
+            self.assertIs(worker._draft_worker.megakernel, worker._megakernel)
         runner = SimpleNamespace(capture_bs=[1, 2])
         self.assertEqual(_megakernel().bind_draft_graphs(runner), frozenset())
 
@@ -294,7 +309,11 @@ class TestEagleEntries(CustomTestCase):
             calls.append(buffers)
             return lambda bs: print if bs <= 2 else None
 
-        mk = _megakernel(draft_loop=factory, draft_extend=factory)
+        mk = _megakernel(
+            target_entries={"verify_sample": factory},
+            draft_loop=factory,
+            draft_extend=factory,
+        )
         draft_runner = SimpleNamespace(
             max_bs=4, speculative_num_steps=3, device="cpu", capture_bs=[1, 2, 4]
         )
@@ -304,11 +323,16 @@ class TestEagleEntries(CustomTestCase):
         with _ranks():
             self.assertEqual(mk.bind_draft_graphs(draft_runner), {1, 2})
             self.assertEqual(mk.bind_extend_graphs(extend_runner), {1, 2})
-        loop, extend = calls
+            mk.bind_verify_sample(max_bs=4, tokens_per_request=7)
+        self.assertEqual(sorted(mk._verify_steps), [1, 2])
+        loop, extend, verify = calls
         self.assertEqual(loop["draft_tokens"].shape, (4, 3))
         self.assertEqual((loop["num_steps"], loop["max_bs"]), (3, 4))
         self.assertEqual((extend["tokens_per_request"], extend["max_bs"]), (7, 4))
         self.assertEqual(extend["hidden"].shape, (4, 4))
+        # every round's verify_sample draws on this key and advances this counter
+        self.assertEqual((verify["max_bs"], verify["noise_key"]), (4, mk._noise_key))
+        self.assertIs(verify["noise_offset"], mk._noise_offset)
         with (
             _ranks(lambda sizes: sizes[:1]),
             self.assertRaisesRegex(RuntimeError, "draft_loop batch sizes differ"),
@@ -371,6 +395,83 @@ class TestEagleEntries(CustomTestCase):
         begin("a", "b")
         self.assertEqual(len(rounds), calls)  # batch size 2 is not served
         self.assertIsNone(served_extend("a", "b"))  # SGLang's top-1 there
+
+    def test_only_batches_a_graph_can_replay_take_the_post_verify_graphs(self):
+        """A batch whose sampling a captured graph cannot reproduce (grammar, penalties,
+        seeds, ...) or whose verify ran eagerly must take SGLang's eager path."""
+        mk = _megakernel()
+        logits_output = SimpleNamespace(next_token_logits=torch.zeros((7, 8)))
+
+        def key(can_run_cuda_graph=True, topk=1, **changes):
+            info = dict(
+                acc_additive_penalties=None,
+                acc_scaling_penalties=None,
+                logit_bias=None,
+                sampling_seed=None,
+                need_min_p_sampling=False,
+                has_watermark_candidates=False,
+                is_all_greedy=False,
+                need_top_k_sampling=True,
+                need_top_p_sampling=True,
+            )
+            fields = dict(has_grammar=False, hisparse_coordinator=None)
+            for name, value in changes.items():
+                (info if name in info else fields)[name] = value
+            batch = SimpleNamespace(
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                seq_lens=torch.zeros(1),
+                sampling_info=SimpleNamespace(**info),
+                mamba_track_indices=None,
+                **fields,
+            )
+            verify_input = SimpleNamespace(
+                topk=topk, draft_probs=None, draft_token_num=7, max_tree_depth=7
+            )
+            return mk._post_verify_key(
+                batch, verify_input, logits_output, can_run_cuda_graph
+            )
+
+        self.assertIsNotNone(key())
+        for change in (
+            dict(can_run_cuda_graph=False),
+            dict(topk=2),
+            dict(has_grammar=True),
+            dict(hisparse_coordinator=object()),
+            dict(acc_additive_penalties=torch.zeros(1)),
+            dict(acc_scaling_penalties=torch.zeros(1)),
+            dict(logit_bias=torch.zeros(1)),
+            dict(sampling_seed=torch.zeros(1)),
+            dict(need_min_p_sampling=True),
+        ):
+            with self.subTest(change=sorted(change)):
+                self.assertIsNone(key(**change))
+
+    def test_every_rank_draws_the_same_forced_acceptance_lengths(self):
+        """Each rank draws the forced acceptance length on its host; the draws must
+        agree across ranks even where a rank uses its global RNG differently."""
+
+        def draws(graphs, *, other_use):
+            graphs._sim_host = [torch.zeros(1, dtype=torch.int64) for _ in range(4)]
+            graphs._sim_done = [None] * 4
+            lengths = []
+            for _ in range(32):
+                if other_use:
+                    torch.rand(3)  # this rank's other use of its global RNG
+                host, _ = graphs._draw_sim_len(7)
+                lengths.append(int(host[0]))
+            return lengths
+
+        with (
+            patch.object(spec_utils, "SIMULATE_ACC_LEN", 4.8),
+            patch.object(spec_utils, "SIMULATE_ACC_METHOD", "match-expected"),
+        ):
+            rank0, rank1 = (
+                eagle_megakernel._PostVerifyGraphs(body=None, commit=None, sim_seed=7)
+                for _ in range(2)
+            )
+            self.assertEqual(
+                draws(rank0, other_use=False), draws(rank1, other_use=True)
+            )
 
 
 if __name__ == "__main__":
