@@ -9,6 +9,10 @@
 // Layout contract for bit-exact results: a token row is finished by one cluster of kRowCtas
 // CTAs x kRowThreads threads; CTA c of the cluster owns fragments [128c, 128c + 128) and thread
 // t owns fragment 128c + t. Other layouts may use the same pieces but change the RMS fold.
+//
+// The mailbox layout, the -0.0 sentinel protocol and the reduction order follow the low-latency all-reduce +
+// RMSNorm kernels of FlashInfer's MNNVL CuTe DSL fusion (FlashInfer 0.7.1, flashinfer/comm/mnnvl_cutedsl/kernel_ll),
+// so outputs match them bit for bit.
 
 #pragma once
 

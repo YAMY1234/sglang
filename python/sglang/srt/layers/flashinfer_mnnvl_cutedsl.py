@@ -433,7 +433,8 @@ class FlashInferMNNVLCuteDSLARFusion:
             self._hop = self._build_q35_hop() if envs.SGLANG_Q35MF_MKH_HOP.get() else None
 
     def _build_q35_hop(self):
-        # The q35 hop kernels are hidden-4096, gamma-as-multiplier copies of the LL path.
+        # The q35 hop kernels re-implement the LL path's protocol and arithmetic (bit-identical)
+        # for hidden 4096 with gamma as the multiplier.
         if self.hidden_size != _Q35_HOP_HIDDEN or self.weight_bias != 0.0:
             logger.warning(
                 "SGLANG_Q35MF_MKH_HOP ignored: hidden_size=%d weight_bias=%s",

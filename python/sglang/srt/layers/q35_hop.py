@@ -20,6 +20,8 @@ import subprocess
 import torch
 import torch.distributed as dist
 
+from sglang.kernels.jit.utils.compile.cache import cache_root
+
 logger = logging.getLogger(__name__)
 
 HIDDEN = 4096
@@ -81,7 +83,7 @@ def pack_out_proj(weight_nk: torch.Tensor) -> torch.Tensor:
 def _build() -> ctypes.CDLL:
     text = _SOURCE.read_bytes() + _HEADER.read_bytes()
     digest = hashlib.sha256(text).hexdigest()[:16]
-    cache = pathlib.Path(os.environ.get("SGLANG_Q35MF_MKH_CACHE", "/tmp/sglang-decode-hop-cache"))
+    cache = cache_root() / "decode_hop"
     cache.mkdir(parents=True, exist_ok=True)
     lib = cache / f"libq35hop.{digest}.so"
     # One build per node: the ranks of a node share the cache directory.

@@ -392,7 +392,7 @@ __global__ void __launch_bounds__(kRowThreads) consume_draft_kernel(Args a) {
 
 // ---------------------------------------------------------------- out_proj + push
 // Row-parallel FP8 out_proj (M <= 8, N = 4096, K = 8 * S * 32) whose epilogue pushes the bf16 partial
-// into the hop mailbox. The MMA core follows the fused attention lane's o_proj kernel: CTA c owns
+// into the hop mailbox. The MMA core follows the o_proj kernel of the fused attention epilogue: CTA c owns
 // output rows [32c, 32c + 32) over the full K, warp w takes k-steps [w*S, (w+1)*S), weights are
 // packed as mma.m16n8k32 e4m3 A fragments and loaded to registers before the PDL wait, and the
 // warp partials are summed in warp order.
