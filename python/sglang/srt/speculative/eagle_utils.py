@@ -16,6 +16,7 @@ from sglang.kernels.ops.speculative.spec_tree import (
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
 )
+from sglang.srt.megakernels.runtime import megakernel_enabled
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
 from sglang.srt.mem_cache.allocation_sizing import (
     get_alloc_reserve_per_decode,
@@ -1178,6 +1179,9 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     )
     for r in batch.reqs:
         r.decode_batch_idx += 1
+    if num_needed_tokens == 0 and megakernel_enabled():
+        # Every nxt equals cur: alloc_for_spec_decode would only read the lengths to allocate.
+        return
 
     cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
     nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")

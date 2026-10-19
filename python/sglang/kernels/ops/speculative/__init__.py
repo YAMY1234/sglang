@@ -42,6 +42,18 @@ for _mod, _fn in _TRITON_KERNELS:
     )
 del _mod, _fn
 
+# Draft preparation in one JIT launch each (draft_prep.cuh).
+for _fn in ("draft_cache_locs", "draft_extend_layout"):
+    register_kernel(
+        KernelSpec(
+            op=f"speculative.{_fn}",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.speculative.draft_prep:{_fn}",
+            capabilities=frozenset({CapabilityRequirement.CUDA}),
+        )
+    )
+del _fn
+
 register_kernel(
     KernelSpec(
         op="speculative.div_argmax",

@@ -7,6 +7,10 @@ import torch
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_draft_cache_locs_contiguous,
 )
+from sglang.kernels.ops.speculative.draft_prep import (
+    draft_cache_locs,
+    draft_extend_layout,
+)
 from sglang.kernels.ops.speculative.eagle import (
     build_chain_tree,
     fill_bonus_tokens_func,
@@ -125,9 +129,11 @@ def prepare_for_draft_extend(
     widened_out_cache_loc: Optional[torch.Tensor] = None,
     widened_positions: Optional[torch.Tensor] = None,
     kv_loc_plan: Optional[KVLocPlan] = None,
+    jit_prep: bool = False,
 ):
     """``kv_loc_plan``: the iteration's plan, whose window the draft extend
-    writes again (the verify window); a widened window plans its own."""
+    writes again (the verify window); a widened window plans its own.
+    ``jit_prep``: build the layout with one JIT launch where it supports it."""
     bs = len(batch.seq_lens)
     # Optional window widening (num_front_tokens=0 -> off): prepend that many
     # rows below the boundary. Locs/positions arrive precomputed; token/hidden
@@ -171,13 +177,18 @@ def prepare_for_draft_extend(
     fused_lengths = gpu_only and batch.seq_lens.is_cuda
     extend_position_info = None
     if fused_lengths and not widen and draft_extend_input.positions is None:
-        batch.prefix_lens, batch.extend_lens, post_seq_lens, extend_position_info = (
-            prepare_draft_extend_layout(
-                batch.seq_lens,
-                num_draft_tokens,
-                draft_model_runner.model_config.model_is_mrope
-                and all(x is None for x in batch.multimodal_inputs),
+        with_mrope = draft_model_runner.model_config.model_is_mrope and all(
+            x is None for x in batch.multimodal_inputs
+        )
+        layout = None
+        if jit_prep:
+            layout = draft_extend_layout(batch.seq_lens, num_draft_tokens, with_mrope)
+        if layout is None:
+            layout = prepare_draft_extend_layout(
+                batch.seq_lens, num_draft_tokens, with_mrope
             )
+        batch.prefix_lens, batch.extend_lens, post_seq_lens, extend_position_info = (
+            layout
         )
     elif fused_lengths:
         batch.prefix_lens, batch.extend_lens, post_seq_lens = (
@@ -253,11 +264,13 @@ def prepare_for_draft(
     *,
     target_translator: Optional[KVIndexTranslator] = None,
     num_draft_tokens: Optional[int] = None,
+    jit_prep: bool = False,
 ) -> tuple[ForwardBatch, bool, Optional[KVLocPlan]]:
     """The draft-decode batch. With ``target_translator``, a chain draft plans
     the iteration's whole write window (the ``num_draft_tokens`` slots past
     ``seq_lens`` that verify and draft extend also write) and writes its first
-    ``num_steps`` columns; that plan is returned, else None."""
+    ``num_steps`` columns; that plan is returned, else None. ``jit_prep``: write
+    a topk-1 draft's cache locations with one JIT launch where it supports them."""
     prepared_positions = None
     prepared_mrope_positions = None
     kv_loc_plan = None
@@ -301,21 +314,35 @@ def prepare_for_draft(
                         prepared_mrope_positions = torch.empty(
                             (3, bs), dtype=torch.int64, device=batch.device
                         )
-                # FIXME(lsyin): align with the default code path
-                assign_draft_cache_locs_contiguous[(bs,)](
-                    batch.req_pool_indices,
-                    req_to_token_pool.req_to_token,
-                    batch.seq_lens,
-                    batch.out_cache_loc,
-                    req_to_token_pool.req_to_token.shape[1],
-                    topk,
-                    window_cols,
-                    positions=prepared_positions,
-                    mrope=prepared_mrope_positions,
-                    BS=bs,
-                    WRITE_POSITIONS=prepared_positions is not None,
-                    WRITE_MROPE=prepared_mrope_positions is not None,
+                jit_done = (
+                    jit_prep
+                    and prepared_positions is not None
+                    and draft_cache_locs(
+                        req_pool_indices=batch.req_pool_indices,
+                        req_to_token=req_to_token_pool.req_to_token,
+                        seq_lens=batch.seq_lens,
+                        out_cache_loc=batch.out_cache_loc,
+                        positions=prepared_positions,
+                        mrope=prepared_mrope_positions,
+                        cols=window_cols,
+                    )
                 )
+                if not jit_done:
+                    # FIXME(lsyin): align with the default code path
+                    assign_draft_cache_locs_contiguous[(bs,)](
+                        batch.req_pool_indices,
+                        req_to_token_pool.req_to_token,
+                        batch.seq_lens,
+                        batch.out_cache_loc,
+                        req_to_token_pool.req_to_token.shape[1],
+                        topk,
+                        window_cols,
+                        positions=prepared_positions,
+                        mrope=prepared_mrope_positions,
+                        BS=bs,
+                        WRITE_POSITIONS=prepared_positions is not None,
+                        WRITE_MROPE=prepared_mrope_positions is not None,
+                    )
             if plans_window:
                 kv_loc_plan = target_translator.plan(
                     req_pool_indices=batch.req_pool_indices,

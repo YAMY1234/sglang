@@ -635,6 +635,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.speculative_num_steps,
             target_translator=self.target_worker.model_runner.kv_index_translator,
             num_draft_tokens=self.speculative_num_draft_tokens,
+            jit_prep=self.megakernel is not None,
         )
         if (
             can_run_decode_cuda_graph
@@ -1139,6 +1140,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.cuda_graph_runner_for_draft_extend,
                 return_hidden_states_before_norm=False,
                 kv_loc_plan=kv_loc_plan,
+                jit_prep=self.megakernel is not None,
             )
 
         if self.plan_stream:
