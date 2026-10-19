@@ -640,6 +640,10 @@ class Envs:
     # Draft decode / draft extend graphs capture the TRT-LLM MHA metadata rebuild on a side
     # stream from the graph's start and join it before the first attention kernel.
     SGLANG_Q35MF_KDENSE_DRAFT_META_BRANCH = EnvBool(False)
+    # TP2 draft-path fusion bits (0 = stock). Bit 1: draft steps of <= 8 rows exchange the
+    # candidate with its load-time embedding-half fc memo and the hidden-half partial in one
+    # launch, bitwise equal to the split fc (needs the fc split and the TP2 argmax exchange).
+    SGLANG_Q35MF_E2X_DRAFT_FUSE = EnvInt(0)
 
     # ===================================================================
     # Memory pools and KV-cache sizing
