@@ -15,7 +15,7 @@ from triton.language.extra.cuda import libdevice
 from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
 
 MAX_TOKENS = 128
-# PDL early launch of the down kernel pays off only when the routed front is short (T1, production layer graph).
+# PDL early launch of the down kernel pays off only when the routed front is short (measured on the decode layer graph).
 _PDL_DOWN_MAX_TOKENS = 16
 _FP8_MAX = tl.constexpr(448.0)
 _BN_UP = 32

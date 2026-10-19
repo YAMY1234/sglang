@@ -60,7 +60,7 @@ def install_split_combine(split: int) -> None:
 
     if fi_a2a._get_moe_alltoall_module_for_target.cache_info().currsize:
         raise RuntimeError(
-            "MIDQ split combine must be installed before FlashInfer loads its "
+            "Split combine must be installed before FlashInfer loads its "
             "MoE all-to-all module"
         )
     stock_gen = fi_a2a.gen_moe_alltoall_module

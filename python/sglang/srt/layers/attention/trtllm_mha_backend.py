@@ -372,7 +372,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         if self._paged_fp8_enabled:
             self._paged_fp8_enabled = torch.cuda.get_device_capability()[0] == 10
         self._paged_fp8_plans = {}
-        # SKV2-Q1 reproduces trtllm-gen's one-CTA-per-SM KV split, which it only uses when
+        # The paged FP8 q1 decode reproduces trtllm-gen's one-CTA-per-SM KV split, which it only uses when
         # max_context_len spans at least that many 256-token steps.
         self._q1_enabled = (
             envs.SGLANG_Q35MF_MKA_Q1.get()

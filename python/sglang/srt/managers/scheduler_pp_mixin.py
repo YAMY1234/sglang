@@ -567,7 +567,7 @@ class SchedulerPPMixin:
         ]
         self.mb_metadata: List[Optional[PPBatchMetadata]] = [None] * self.pp_loop_size
         self.pp_outputs: Optional[PPProxyTensors] = None
-        # (req, cached_end) early-sends waiting for the forward launch (PPO only).
+        # (req, cached_end) early-sends waiting for the forward launch (PP prefill overlap only).
         self.deferred_prefix_sends: List[Tuple[Req, int]] = []
         self.last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]] = deque()
         self._pp_spec_relay = (

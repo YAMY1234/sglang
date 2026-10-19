@@ -2,7 +2,7 @@
 
 Without this module a breakable prefill CUDA graph (BCG) breaks at every GDN
 layer and runs the extend chain eagerly: about ten Triton launches plus small
-torch ops, roughly a millisecond of host time per layer. The eager chain derives
+torch ops per layer. The eager chain derives
 its launch grids and index tables from host-side sequence lengths
 (``prepare_chunk_indices``, ``causal_conv1d_fn``'s ``seq_lens_cpu``, the
 prefix-cache track plan); here they come from static per-bucket tables instead,

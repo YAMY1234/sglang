@@ -25,6 +25,9 @@
 # CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# Derived from NVIDIA/cutlass v4.8.0 examples/python/CuTeDSL/cute_ext/blackwell/attention/
+# (gqa_decode_simple.py, gqa_decode_opt.py; BSD-3-Clause): warp-specialized split-KV decode structure,
+# rewritten for paged FP8 KV.
 
 # Modified by NVIDIA: paged FP8 verify with explicit local reduction.
 
@@ -34,11 +37,11 @@
 # Modified by NVIDIA: runtime attention scales, page-tail bounds and reusable buffers.
 # Modified by NVIDIA: stock split-KV rounding (page splits, one FP8 P rounding, bf16 partials).
 
-"""SKV2: paged FP8 q7 split attention with the stock split-KV rounding structure.
+"""Paged FP8 q7 split attention with the stock split-KV rounding structure.
 
 Same splits (page-based, 148), 128-token blocks, running-max sequence, single e4m3 rounding of P x 256 and bf16
 partials x (V_SCALE / 256) as sglang split_kv_verify, so the stock merge kernel reduces the partials unchanged.
-Only fp32 association differs: per-lane denominators and O = O * alpha + O_block (A6).
+Only fp32 association differs: per-lane denominators and O = O * alpha + O_block.
 """
 
 import math
@@ -353,7 +356,7 @@ class StockSplitPlan:
 
     def __init__(self, query, kv, table, lengths, *, splits=148, stages=2, slots=2):
         if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("SKV2 storage must be prepared before graph capture")
+            raise RuntimeError("Paged split-KV storage must be prepared before graph capture")
         self.qlen, self.heads, _ = query.shape
         self.splits = splits
         rows = self.qlen * self.heads

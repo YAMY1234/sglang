@@ -706,7 +706,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self._draft_vocab_exchange.mkd if self._exchange_in_draft_steps else None
         )
         if mkd is not None and mkd.extend_fc:
-            # A one-row draft's first step reads its fc from fc_buf (MKD extend fc); only the
+            # A one-row draft's first step reads its fc from fc_buf (draft-extend fc); only the
             # extend that produced this draft input may have written it.
             holds = mkd.take_fc_buf()
             if (

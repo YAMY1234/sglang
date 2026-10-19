@@ -5,6 +5,7 @@
 # This backward pass is faster for dimensions up to 8k, but after that it's much slower due to register spilling.
 # The models we train have hidden dim up to 8k anyway (e.g. Llama 70B), so this is fine.
 # Modified by NVIDIA: add static FP8 output after activation-dtype rounding.
+# Modified by NVIDIA: optional early dependent-launch trigger.
 
 
 from contextlib import nullcontext

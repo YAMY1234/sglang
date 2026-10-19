@@ -1457,7 +1457,7 @@ class SchedulerDisaggregationPrefillMixin:
         self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
 
     def flush_deferred_prefix_sends(self: Scheduler) -> None:
-        """Early-sends deferred past the forward launch (PPO)."""
+        """Early-sends deferred past the forward launch (PP prefill overlap)."""
         if not self.deferred_prefix_sends:
             return
         sends, self.deferred_prefix_sends = self.deferred_prefix_sends, []

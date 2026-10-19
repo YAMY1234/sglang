@@ -1,4 +1,4 @@
-// Greedy MTP draft step boundary in one launch: shard argmax of the hot-vocab logits, a
+// Greedy MTP draft step boundary in one launch: shard argmax of the draft vocabulary-shard logits, a
 // multicast push of each rank's candidate (its embedding row, or its fc memo row) plus the
 // rank's hidden-half fc partial, and the selection, replacing pack + all-gather + select and
 // the fc partial all-gather; with memo rows it also writes the next step's fc output (the
@@ -80,9 +80,9 @@ SGL_DEVICE uint64_t now_ns() {
 }  // namespace mkd_xchg
 
 struct MkdXchgParams {
-  const bf16_t* logits;          // [V_local] hot-vocab shard logits, written by the lm_head
+  const bf16_t* logits;          // [V_local] vocabulary-shard logits, written by the lm_head
   const void* __restrict__ cand; // [V_local, H] embedding rows (bf16) or memo rows (fp32)
-  const int64_t* hot_ids;        // [world * V_local] vocabulary ids in hot order (sorted, rank-major)
+  const int64_t* hot_ids;        // [world * V_local] vocabulary id of each shard row, rank-major
   const float* own_partial;      // [H] this rank's hidden-slice fc partial (hidden ranks only)
   const uint32_t* partial_flag;  // equals the epoch once own_partial is written, or null
   uint64_t* scan_part;           // [kSlots, kChunks] per-CTA shard-argmax partials, or null

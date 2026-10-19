@@ -29,6 +29,9 @@ runs FlashInfer's FP4 body from those tables.
 # restricted to W4A4 with a scalar input scale and fed externally built routing
 # tables; _choose_tactic and the runner inputs in forward_routed follow
 # CuteDslMoEWrapper.run so the autotuner cache is shared.
+# _stock_runner_and_tactic, _fp4_body_inputs, _fp4_output and _fp4_runner_kwargs follow
+# flashinfer.fused_moe.core.trtllm_fp4_block_scale_moe_op (FlashInfer 0.7.1) so the
+# precomputed-routing call launches the stock call's tactic.
 
 from __future__ import annotations
 
@@ -433,7 +436,7 @@ def _logits_and_quant_parallel(
     if envs.SGLANG_Q35MF_K4_PARQ_STREAM.get():
         from sglang.srt.runtime_context import get_stream
 
-        side = get_stream("q35mf_parq")
+        side = get_stream("moe_input_quant")
     side.wait_stream(current)
     with torch.cuda.stream(side):
         x_fp4, x_sf = quantize_hidden_states_fp4(

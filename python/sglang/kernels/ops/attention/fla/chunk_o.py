@@ -1,6 +1,7 @@
 # Adapted from https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/common/chunk_o.py
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+# Modified by NVIDIA: caller-built chunk indices and an optional larger output tile.
 
 from typing import Optional
 
@@ -152,7 +153,7 @@ def chunk_fwd_o(
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), NT, B * H)
 
-    # Measured on GB300 at the Qwen3.5 TP1 prefill shape: BV 128 / 8 warps is 6% faster, bitwise.
+    # Optional larger tiles; output is bitwise identical (tunable).
     bv, num_warps, num_stages = (
         (128, 8, 3) if envs.SGLANG_Q35MF_GDN_PREFILL_TILES.get() else (64, 4, 2)
     )

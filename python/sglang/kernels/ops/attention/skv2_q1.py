@@ -25,6 +25,9 @@
 # CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# Derived from NVIDIA/cutlass v4.8.0 examples/python/CuTeDSL/cute_ext/blackwell/attention/
+# (gqa_decode_simple.py, gqa_decode_opt.py; BSD-3-Clause): warp-specialized split-KV decode structure,
+# rewritten for paged FP8 KV.
 
 # Modified by NVIDIA: paged FP8 verify with explicit local reduction.
 
@@ -35,12 +38,12 @@
 # Modified by NVIDIA: stock split-KV rounding (page splits, one FP8 P rounding, bf16 partials).
 # Modified by NVIDIA: q1 decode with the trtllm-gen generation kernel's KV split and rounding (two streams per CTA).
 
-"""SKV2-Q1: paged FP8 q1 decode (draft model) with trtllm-gen's rounding structure.
+"""Paged FP8 q1 decode (draft model) with trtllm-gen's rounding structure.
 
 Same KV split as trtllm-gen's multi-CTA generation kernel: one CTA per SM, ceil(steps / CTAs) contiguous 256-token
 steps per CTA. Each CTA keeps two softmax streams (the two 128-token halves of every step) with a running max of the
 raw scores; P x 448 = ex2(fma(s, c, -fma(m, c, -log2 448))) is rounded once to e4m3, the CTA writes bf16(O / 448)
-with fp32 maxima and denominators, and a small kernel merges the CTAs in fp32. Only fp32 association differs (A6).
+with fp32 maxima and denominators, and a small kernel merges the CTAs in fp32. Only fp32 association differs.
 """
 
 import math
@@ -405,7 +408,7 @@ class Q1SplitPlan:
 
     def __init__(self, query, kv, table, lengths, *, nsplit=None, stages=2, slots=2):
         if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("SKV2-Q1 storage must be prepared before graph capture")
+            raise RuntimeError("Paged FP8 q1 decode storage must be prepared before graph capture")
         qlen, self.heads, _ = query.shape
         assert qlen == 1
         self.nsplit = nsplit or torch.cuda.get_device_properties(query.device).multi_processor_count

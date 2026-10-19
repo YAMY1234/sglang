@@ -397,7 +397,7 @@ struct EpiParams {
   const float* sw;
   __nv_bfloat16* out;         // [M, 4096]
   int m;
-  int push;                   // 1: also push the bf16 partial into the q35 hop mailbox (MKH interface v1)
+  int push;                   // 1: also push the bf16 partial into the q35 hop mailbox (q35 hop push)
   q35hop::Site site;
 };
 

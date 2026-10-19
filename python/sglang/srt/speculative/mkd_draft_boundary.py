@@ -52,7 +52,7 @@ _MEMO_BLOCK = 4096
 _TRACE_SLOTS = 64
 
 
-# Sources of the MKD JIT kernels; load_jit keys its build cache on their contents.
+# Sources of the draft-step JIT kernels; load_jit keys its build cache on their contents.
 _JIT_SOURCES = (
     "speculative/mkd_draft_xchg.cuh",
     "speculative/mkd_draft_fc.cuh",
@@ -60,7 +60,7 @@ _JIT_SOURCES = (
     "speculative/draft_moe_fused.cuh",
     "speculative/mkd_draft_head.cuh",
 )
-# CTAs of mkd_draft_head per SM (T1, TP8 shard: 1 -> 39.3 us, 2 -> 40.5 us, 3 -> 41.6 us).
+# CTAs of mkd_draft_head per SM; one per SM measured fastest (tunable).
 _HEAD_CTAS_PER_SM = 1
 # Draft calls between checks that every rank takes the same extend-fc fill decision (arbitrary).
 _FILL_AGREE_EVERY = 512
@@ -121,9 +121,9 @@ class MkdDraftBoundary:
         self.hot_ids = hot_ids.to(dev)
         if exchange.token_map.numel() > 0:
             if not torch.equal(self.hot_ids[self.rank * rows : (self.rank + 1) * rows], exchange.token_map):
-                raise RuntimeError("MKD draft boundary: hot shard is not the rank-th slice of the hot list")
+                raise RuntimeError("Draft step boundary: hot shard is not the rank-th slice of the hot list")
         elif exchange.vocab_start != self.rank * rows:
-            raise RuntimeError("MKD draft boundary: vocabulary shard is not the rank-th equal slice")
+            raise RuntimeError("Draft step boundary: vocabulary shard is not the rank-th equal slice")
         self.cand = self._build_memo(exchange) if self.memo else exchange.embed_weight
 
         tp = get_tp_group()
@@ -225,7 +225,7 @@ class MkdDraftBoundary:
         dist.all_reduce(bad_t, group=get_parallel().tp_group.device_group)
         if int(bad_t[0]) != 0:
             raise RuntimeError(
-                f"MKD memo table differs from the split fc on {int(bad_t[0])} of {int(bad_t[1])} rows"
+                f"Draft fc memo table differs from the split fc on {int(bad_t[0])} of {int(bad_t[1])} rows"
             )
         logger.info(
             "MKD memo table: %d rows on this rank (%.1f MB), equal to the split fc on all %d rows.",
@@ -350,7 +350,7 @@ class MkdDraftBoundary:
                     float(host[2]),
                 )
 
-        threading.Thread(target=run, daemon=True, name="mkd-head-check").start()
+        threading.Thread(target=run, daemon=True, name="draft-head-check").start()
 
     def _check_head(self, x: torch.Tensor, weight: torch.Tensor, logits: torch.Tensor) -> None:
         ref = torch.matmul(x, weight.t()).float()
@@ -485,7 +485,7 @@ class MkdDraftBoundary:
                     "; ".join(f"{n} {'/'.join(f'{x:.2f}' for x in q[:, i + 1])}" for i, n in enumerate(names)),
                 )
 
-        threading.Thread(target=run, daemon=True, name="mkd-xchg-trace").start()
+        threading.Thread(target=run, daemon=True, name="draft-xchg-trace").start()
 
     def exchange_extend(self, local_logits: torch.Tensor, hidden_states: Optional[torch.Tensor]):
         """Draft-extend token (torch.argmax NaN rule) through the same one-launch exchange;
@@ -554,7 +554,7 @@ class MkdDraftBoundary:
         dist.all_reduce(lo, op=dist.ReduceOp.MIN, group=group)
         dist.all_reduce(hi, op=dist.ReduceOp.MAX, group=group)
         if not torch.equal(lo, hi):
-            raise RuntimeError(f"MKD extend fc: ranks disagree on the fill decision ({lo.tolist()} vs {hi.tolist()})")
+            raise RuntimeError(f"Draft extend fc: ranks disagree on the fill decision ({lo.tolist()} vs {hi.tolist()})")
 
     def fill_fc(self, token_ids: torch.Tensor, hidden_states: torch.Tensor, forward_batch) -> None:
         """Stock fc of a draft's first step into fc_buf, when no extend exchange produced it."""

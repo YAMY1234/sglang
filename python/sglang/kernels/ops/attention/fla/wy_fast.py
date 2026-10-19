@@ -1,6 +1,7 @@
 # Adapt from https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/gated_delta_rule/wy_fast.py
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+# Modified by NVIDIA: optional larger value tile.
 
 from typing import Optional, Tuple
 
@@ -128,12 +129,12 @@ def recompute_w_u_fwd(
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    # Measured on GB300 at the Qwen3.5 TP1 prefill shape: BV 128 / 8 warps is 8% faster, bitwise.
-    q35mf_tiles = envs.SGLANG_Q35MF_GDN_PREFILL_TILES.get()
+    # Optional larger tiles; output is bitwise identical (tunable).
+    large_tiles = envs.SGLANG_Q35MF_GDN_PREFILL_TILES.get()
     BK = 64
-    BV = 128 if q35mf_tiles else 64
-    num_warps = 8 if q35mf_tiles else 4
-    if q35mf_tiles:
+    BV = 128 if large_tiles else 64
+    num_warps = 8 if large_tiles else 4
+    if large_tiles:
         print_info_once(
             f"GDN prefill tiles engaged: recompute_w_u BK={BK} BV={BV} num_warps={num_warps}"
         )

@@ -34,7 +34,7 @@ struct MkdPrefetch {
     TensorMatcher({-1, -1}).with_device(device).ensure_alignment(16).verify(weight);
     CHECK_HOST(chunk % 16 == 0 && bytes % 16 == 0) << "bulk prefetch sizes must be multiples of 16 bytes";
     const auto* base = static_cast<const char*>(weight.data_ptr());
-    // One SM issues bulk prefetches at ~0.25 TB/s (2 CTAs took 64 us for 32 MB); spread over SMs.
+    // Spread the chunks over up to 128 CTAs (tunable).
     const int64_t nchunks = (bytes + chunk - 1) / chunk;
     const uint32_t grid = static_cast<uint32_t>(std::min<int64_t>(128, std::max<int64_t>(1, nchunks)));
     LaunchKernel(grid, 32, device.unwrap())(mkd_l2_prefetch_kernel, base, bytes, static_cast<int32_t>(chunk));

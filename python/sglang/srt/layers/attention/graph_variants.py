@@ -27,7 +27,7 @@ PAGED_FP8_MIN_LENGTH = 2049
 
 @dataclass(frozen=True)
 class PagedFP8GraphVariants:
-    """Use a host-only lower bound to select the qualified attention graph."""
+    """Use a host-only lower bound to select the eligible attention graph."""
 
     capture_labels: ClassVar[tuple[str, ...]] = (PAGED_FP8_STOCK, PAGED_FP8_LONG)
 
@@ -72,7 +72,7 @@ def use_paged_fp8_attention(forward_batch: ForwardBatch) -> bool:
 
 
 def paged_fp8_engagement():
-    """Host-only operator/captured-graph replay counters for qualification."""
+    """Host-only operator/captured-graph replay counters for engagement checks."""
     from sglang.srt.runtime_context import get_buffer
 
     return get_buffer("paged_fp8_engagement", lambda: {"calls": {}, "replays": {}})
@@ -89,7 +89,7 @@ Q1_LONG = "q1_long"
 
 
 class Q1GraphVariants(msgspec.Struct, frozen=True):
-    """Draft q1 decode: SKV2-Q1 from a host-only KV length lower bound, trtllm-gen below it."""
+    """Draft q1 decode: the paged FP8 q1 kernel from a host-only KV length lower bound, trtllm-gen below it."""
 
     min_length: int
     capture_labels: ClassVar[tuple[str, ...]] = (Q1_STOCK, Q1_LONG)
@@ -167,7 +167,7 @@ class SplitKVGraphVariants:
 def _split_kv_min_length(is_target_verify: bool) -> int:
     from sglang.srt.environ import envs
 
-    # SKV2 may also take target verify below 32K; the draft extend keeps the stock threshold.
+    # The split-KV producer may also take target verify below 32K; the draft extend keeps the stock threshold.
     if is_target_verify and envs.SGLANG_Q35MF_MKA_SKV2.get():
         return envs.SGLANG_Q35MF_MKA_SKV2_VERIFY_MIN_LENGTH.get()
     return SPLIT_KV_MIN_LENGTH

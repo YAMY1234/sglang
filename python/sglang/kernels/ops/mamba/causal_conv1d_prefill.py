@@ -3,7 +3,7 @@
 # Copyright (c) 2024, Tri Dao.
 # Adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/causal_conv1d/causal_conv1d_interface.py
 # and https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/mamba/ops/causal_conv1d.py
-# Modified by NVIDIA: vectorize short linear verify windows across tokens.
+# Modified by NVIDIA: vectorized four-tap prefill with in-place continuation state; interface follows causal_conv1d_fn.
 # Modified by NVIDIA: vectorize variable-length prefill over tokens and channels.
 
 import torch

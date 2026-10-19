@@ -602,7 +602,7 @@ class Envs:
     # MB of the draft qkv projection weight prefetched into L2 beside the draft-step exchange (0 = off).
     SGLANG_Q35MF_MKD_L2PF_QKV_MB = EnvInt(0)
     # Diagnostic: the draft-step exchange stamps per-phase %globaltimer into pinned host memory
-    # and a thread logs percentiles every 20 s (slows the kernel; never in a timed run).
+    # and a thread logs percentiles every 20 s (slows the kernel; diagnostic only).
     SGLANG_Q35MF_MKD_TRACE = EnvBool(False)
     # With SGLANG_Q35MF_MKD_TTABLE: the draft extend's exchange also finishes the fc of the next
     # draft's first step, which then skips its embedding and fc (stock fill when no extend ran).
@@ -1115,7 +1115,8 @@ class Envs:
     # With SGLANG_Q35MF_MKA_FUSED and SGLANG_Q35MF_MKH_HOP: the fused o_proj pushes its partial into the
     # q35 hop mailbox, so the attention output hop only consumes.
     SGLANG_Q35MF_MKA_PUSH = EnvBool(False)
-    # KV length from which target verify uses SKV2 (trtllm-gen below); measured crossover 2048 at TP8, 4096 at TP4.
+    # KV length from which target verify uses the split-KV producer (trtllm-gen below); the crossover depends on
+    # the TP size (tunable).
     SGLANG_Q35MF_MKA_SKV2_VERIFY_MIN_LENGTH = EnvInt(32768)
     # Draft-model q1 decode with trtllm-gen's KV split and rounding plus a separate merge, from this KV length.
     SGLANG_Q35MF_MKA_Q1 = EnvBool(False)

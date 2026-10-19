@@ -1,5 +1,6 @@
 # Adapted from https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/gated_delta_rule/chunk_fwd.py
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+# Modified by NVIDIA: optionally zero the upper blocks of A in the solve kernel instead of a memset.
 
 import torch
 import triton

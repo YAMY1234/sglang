@@ -447,7 +447,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             torch.cuda.Event() if self._route_front_static_ok is None else None
         )
         if envs.SGLANG_Q35MF_K4_PARQ_STREAM.get() and self.alt_stream is not None:
-            get_stream("q35mf_parq")  # created before graph capture
+            get_stream("moe_input_quant")  # created before graph capture
         self._k4_gate_stream = (
             _k4_gate_stream()
             if envs.SGLANG_Q35MF_K4_GATE_PRIO.get() and self.alt_stream is not None
@@ -878,7 +878,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         )
 
     def _use_ktp2_shared_fused(self, m: int) -> bool:
-        # The ROUTE_SHARED front already produced this call's gate/up; keep the served tail for it.
+        # The fused router front already produced this call's gate/up; keep the served tail for it.
         if (
             not self._ktp2_shared_fused_min_tokens
             <= m

@@ -318,7 +318,7 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
                 )
 
     @unittest.skipIf(is_hip(), "Tiles are tuned for CUDA")
-    def test_q35mf_prefill_tiles_are_bitwise(self):
+    def test_prefill_tiles_are_bitwise(self):
         """The larger prefill tiles must give the same output and state bits as the default tiles."""
         device = get_device()
         torch.manual_seed(0)
@@ -346,7 +346,7 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
         self.assertTrue(torch.equal(runs[False][1], runs[True][1]))
 
     @unittest.skipIf(is_hip(), "Tested on the CUDA Triton path")
-    def test_q35mf_prefill_no_a_memset_is_bitwise(self):
+    def test_prefill_no_a_memset_is_bitwise(self):
         """Without the memset the solve must still write zero upper blocks: A, w and u match bitwise."""
         device = get_device()
         torch.manual_seed(0)

@@ -114,8 +114,7 @@ def draft_moe_gemv(
 # Ring stages (16 KB each) of the fused kernel; at least topk, since every routed
 # down slice holds a stage until the end.
 _FUSED_STAGES = 11
-# Routed pairs a CTA keeps in flight; measured on GB300 (moe1_bench): 4 is best at
-# I = 128 (8-9 pairs per CTA, -0.35 us per call), the full ring at I = 256.
+# Routed pairs a CTA keeps in flight (tunable): 4 at I = 128, the full ring at I = 256.
 def _fused_window(inter: int) -> int:
     return 4 if inter <= 128 else _FUSED_STAGES
 

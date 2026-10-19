@@ -21,11 +21,11 @@ def _ext():
                 source = Path(__file__).with_suffix(".cu")
                 include = Path(__file__).resolve().parents[2] / "jit" / "include"
                 hop_header = include / "sgl_kernel" / "distributed" / "q35_hop.cuh"
-                # Every overlay tree mounts at the same path, so a name without the digest of the source
-                # and its hop header can reuse another tree's cached build whose objects are newer.
+                # Two source trees at the same path must not share a cached build, so the name carries a digest
+                # of the source and the hop header.
                 digest = hashlib.sha256(source.read_bytes() + hop_header.read_bytes()).hexdigest()[:12]
                 _EXT = load(
-                    name=f"sglang_q35mf_mka_fused_{digest}",
+                    name=f"sglang_attn_fused_{digest}",
                     sources=[str(source)],
                     extra_cuda_cflags=[
                         "-O3",
@@ -62,10 +62,7 @@ def _pack_rows32(w_nk: torch.Tensor) -> torch.Tensor:
 
 
 def split_gate(nq: int) -> bool:
-    """Whether the prologue hands the gate rows to mka_gate_kernel.
-
-    2*nq + 2 clusters of 8 CTAs exceed the 15 that co-reside on GB300 once nq = 8 (TP4).
-    """
+    """Whether the prologue hands the gate rows to mka_gate_kernel (used from nq = 8, i.e. TP4)."""
     return nq >= 8
 
 

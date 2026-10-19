@@ -1,6 +1,7 @@
 # Adapted from https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/gated_delta_rule/chunk.py
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+# Modified by NVIDIA: accept caller-built chunk index/offset tables for CUDA-graph capture.
 
 from typing import Optional
 

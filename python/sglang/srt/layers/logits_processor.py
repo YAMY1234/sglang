@@ -282,7 +282,7 @@ class LogitsProcessorOutput:
     # Scheduler-local output copied alongside the ordinary generation result.
     auxiliary_device_output: Optional[DeviceAuxiliaryOutput] = None
 
-    # Greedy draft token ids [#seq, 1] picked on the vocab shards (K75P);
+    # Greedy draft token ids [#seq, 1] picked on the vocab shards (vocab-shard select);
     # next_token_logits is None when this is set.
     next_token_ids: Optional[torch.Tensor] = None
 
@@ -508,7 +508,7 @@ class LogitsProcessor(nn.Module):
         # Set around greedy draft forwards that select on vocab shards: logits of
         # at most this many rows are returned unreduced (0 = always gather).
         self.skip_vocab_gather_rows = 0
-        # MKD draft boundary that computes one-row draft lm_heads itself (SGLANG_Q35MF_MKD_HEAD).
+        # Draft step boundary that computes one-row draft lm_heads itself (SGLANG_Q35MF_MKD_HEAD).
         self.mkd_head = None
         # Target-verify logits are returned unreduced for sampling on the vocab shards.
         self.verify_logits_on_shards = (

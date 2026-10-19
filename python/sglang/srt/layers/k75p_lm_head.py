@@ -1,7 +1,7 @@
 """Greedy draft tokens on the vocab-parallel TP LM head without the logits all-to-all.
 
-S2 gathers the draft hidden rows MAX_LEN-style with a multimem one-shot store instead
-of zero-fill + all-reduce; S1 reduces each row on this rank's vocab shard and gathers
+A row gather collects the draft hidden rows MAX_LEN-style with a multimem one-shot store instead
+of zero-fill + all-reduce; a shard select reduces each row on this rank's vocab shard and gathers
 the (value, id) pairs. Tokens equal the argmax over the full vocab, ties to the lowest
 id, with the NaN rule of the argmax each draft call replaces.
 """

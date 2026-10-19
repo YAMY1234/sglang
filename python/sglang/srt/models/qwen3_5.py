@@ -1335,7 +1335,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             self.norm.eps,
         )
         x_fp8 = buffers["quant"].view(7, 1024)
-        # With the MKH out-projection push active, this early return must feed the hop mailbox too.
+        # With the out_proj hop push active, this early return must feed the hop mailbox too.
         hop = self._q35_push_hop(7)
         if hop is not None:
             return hop.out_proj_push(
@@ -1518,7 +1518,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 self.norm.eps,
             )
             x_fp8 = quant.view(7, 2048)
-            # With the MKH out-projection push active, this early return must feed the hop mailbox too.
+            # With the out_proj hop push active, this early return must feed the hop mailbox too.
             hop = self._q35_push_hop(7)
             if hop is not None:
                 return hop.out_proj_push(
