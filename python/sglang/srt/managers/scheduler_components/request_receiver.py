@@ -47,6 +47,7 @@ from sglang.srt.observability.scheduler_stage_metrics import (
 from sglang.srt.runtime_context import get_disagg, get_exec, get_parallel
 from sglang.srt.utils import (
     broadcast_pyobj,
+    host_fast_path,
     point_to_point_pyobj,
 )
 
@@ -173,6 +174,7 @@ class SchedulerRequestReceiver:
         sharing one waiting queue; the control channel fans out from global
         rank 0 and would overwrite every DP group's aborts but the first.
         """
+        host_fast_path.tick()
         local_reqs = local_reqs or []
         if get_parallel().attn_dp_enabled:
             if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:

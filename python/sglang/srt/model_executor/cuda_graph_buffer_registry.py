@@ -31,11 +31,13 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.memory.small_field_copy import SmallFieldCopyPlan
 from sglang.srt.model_executor.input_buffers import (
     INDEX_SEMANTIC_BUFFERS,
     share_input_buffer,
 )
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import host_fast_path
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -268,6 +270,61 @@ class GraphSlot:
             tail.zero_()
 
 
+class _FillPlan:
+    """What fill_from copies for one unpadded layout: the slots whose FB field is a tensor
+    (destination views, split by device), the slots whose field is absent, the post-fill
+    slots, and one copy descriptor for the device copies."""
+
+    def __init__(self):
+        self.version = -1
+        self.usable = False
+        self.gpu_names: Tuple[str, ...] = ()
+        self.gpu_dsts: List[torch.Tensor] = []
+        self.cpu_names: Tuple[str, ...] = ()
+        self.cpu_dsts: List[torch.Tensor] = []
+        self.absent_names: Tuple[str, ...] = ()
+        self.post_slots: List[GraphSlot] = []
+        self.copier = SmallFieldCopyPlan()
+
+    @classmethod
+    def build(cls, slots, forward_batch, *, raw_bs: int, raw_num_tokens: int) -> _FillPlan:
+        plan = cls()
+        gpu_names, cpu_names, absent = [], [], []
+        for slot in slots:
+            if not slot.enabled or slot.buffer is None:
+                continue
+            if slot.post_fill is not None:
+                plan.post_slots.append(slot)
+            if not slot.copy_from_fb:
+                continue
+            if slot.source_fn is not None:
+                return plan
+            src = getattr(forward_batch, slot.name, None)
+            if not isinstance(src, torch.Tensor):
+                absent.append(slot.name)
+                continue
+            raw_n = slot._raw_n(raw_bs, raw_num_tokens)
+            if slot.slice_fn is not None:
+                dst = slot.slice_fn(slot.buffer, raw_n)
+            elif slot.axis == "none":
+                dst = slot.buffer
+            else:
+                dst = slot.buffer[:raw_n]
+            if dst.device.type == "cpu":
+                cpu_names.append(slot.name)
+                plan.cpu_dsts.append(dst)
+            else:
+                gpu_names.append(slot.name)
+                plan.gpu_dsts.append(dst)
+        plan.gpu_names, plan.cpu_names, plan.absent_names = (
+            tuple(gpu_names),
+            tuple(cpu_names),
+            tuple(absent),
+        )
+        plan.usable = True
+        return plan
+
+
 class CudaGraphBufferRegistry:
     """FB → graph-resident buffer mirror, shared across eager / capture / replay.
 
@@ -314,6 +371,9 @@ class CudaGraphBufferRegistry:
         # when allocating (bind/source bypasses the pool).
         self.share_pool = share_pool
         self._slots: Dict[str, GraphSlot] = {}
+        # Plans of _fill_from_plan, rebuilt when a slot is registered (SGLANG_Q35MF_LL16_PREP).
+        self._slots_version = 0
+        self._fill_plans: Dict[Tuple[int, int], _FillPlan] = {}
 
     # ---- registration ------------------------------------------------------
 
@@ -336,6 +396,7 @@ class CudaGraphBufferRegistry:
                 f"GraphSlot {slot.name!r} already registered; "
                 "use enable()/disable() to gate per-iter."
             )
+        self._slots_version += 1
         if not slot.enabled:
             # Even when disabled, keep the spec so callers can introspect
             # by name; just don't allocate.
@@ -411,6 +472,16 @@ class CudaGraphBufferRegistry:
         silently skipped (the FB doesn't carry that field for the current
         request).
         """
+        if (
+            pp_proxy_tensors is None
+            and raw_bs == padded_bs
+            and raw_num_tokens == padded_num_tokens
+            and host_fast_path.on()
+            and self._fill_from_plan(
+                forward_batch, raw_bs=raw_bs, raw_num_tokens=raw_num_tokens
+            )
+        ):
+            return
         ctx = FillContext(
             raw_bs=raw_bs,
             padded_bs=padded_bs,
@@ -476,6 +547,45 @@ class CudaGraphBufferRegistry:
             if not slot.enabled or slot.buffer is None or slot.post_fill is None:
                 continue
             slot.post_fill(slot.buffer, forward_batch, ctx)
+
+    def _fill_from_plan(
+        self, forward_batch: ForwardBatch, *, raw_bs: int, raw_num_tokens: int
+    ) -> bool:
+        """fill_from for a batch that needs no padding, from a plan kept per
+        (raw_bs, raw_num_tokens); False leaves the call to the stock path (and drops the
+        plan) when the batch carries a different set of fields than the plan's batch."""
+        key = (raw_bs, raw_num_tokens)
+        plan = self._fill_plans.get(key)
+        if plan is None or plan.version != self._slots_version:
+            plan = self._fill_plans[key] = _FillPlan.build(
+                self._slots.values(), forward_batch, raw_bs=raw_bs, raw_num_tokens=raw_num_tokens
+            )
+            plan.version = self._slots_version
+        if not plan.usable:
+            return False
+        gpu_srcs = [getattr(forward_batch, name, None) for name in plan.gpu_names]
+        cpu_srcs = [getattr(forward_batch, name, None) for name in plan.cpu_names]
+        if not all(isinstance(src, torch.Tensor) for src in gpu_srcs + cpu_srcs) or any(
+            isinstance(getattr(forward_batch, name, None), torch.Tensor)
+            for name in plan.absent_names
+        ):
+            del self._fill_plans[key]
+            return False
+        if plan.gpu_dsts and not plan.copier(plan.gpu_dsts, gpu_srcs):
+            _grouped_foreach_copy_(plan.gpu_dsts, gpu_srcs)
+        for dst, src in zip(plan.cpu_dsts, cpu_srcs):
+            dst.copy_(src)
+        if plan.post_slots:
+            ctx = FillContext(
+                raw_bs=raw_bs,
+                padded_bs=raw_bs,
+                raw_num_tokens=raw_num_tokens,
+                padded_num_tokens=raw_num_tokens,
+                pp_proxy_tensors=None,
+            )
+            for slot in plan.post_slots:
+                slot.post_fill(slot.buffer, forward_batch, ctx)
+        return True
 
     def extract_buffer(
         self,

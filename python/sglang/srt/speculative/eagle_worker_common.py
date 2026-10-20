@@ -10,6 +10,7 @@ from sglang.kernels.ops.speculative.cache_locs import (
 )
 from sglang.kernels.ops.speculative.eagle import (
     build_chain_tree,
+    chain_tree_output_specs,
     fill_bonus_tokens_func,
     prepare_draft_extend_layout,
     prepare_draft_extend_lengths,
@@ -41,7 +42,7 @@ from sglang.srt.speculative.spec_utils import (
     record_stream_each,
     record_stream_for_v2_verify,
 )
-from sglang.srt.utils import is_cpu
+from sglang.srt.utils import host_fast_path, is_cpu
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -59,7 +60,12 @@ if _DRAFT_PREP_JIT:
     from sglang.kernels.ops.speculative.draft_prep import (
         draft_cache_locs,
         draft_extend_layout,
+        draft_extend_layout_specs,
     )
+
+# Preallocated outputs of the chain-tree build and the draft-extend layout (SGLANG_Q35MF_LL16_PREP).
+_CHAIN_TREE_OUTPUTS = host_fast_path.OutputRing()
+_EXTEND_LAYOUT_OUTPUTS = host_fast_path.OutputRing()
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -184,7 +190,21 @@ def prepare_for_draft_extend(
         )
         layout = None
         if _DRAFT_PREP_JIT:
-            layout = draft_extend_layout(batch.seq_lens, num_draft_tokens, with_mrope)
+            outputs = None
+            if host_fast_path.on():
+                seq_lens = batch.seq_lens
+                outputs = _EXTEND_LAYOUT_OUTPUTS.next(
+                    (bs, num_draft_tokens, seq_lens.dtype, with_mrope, seq_lens.device),
+                    lambda: host_fast_path.empty_like_spec(
+                        draft_extend_layout_specs(
+                            bs, num_draft_tokens, seq_lens.dtype, with_mrope
+                        ),
+                        seq_lens.device,
+                    ),
+                )
+            layout = draft_extend_layout(
+                batch.seq_lens, num_draft_tokens, with_mrope, outputs=outputs
+            )
         if layout is None:
             layout = prepare_draft_extend_layout(
                 batch.seq_lens, num_draft_tokens, with_mrope
@@ -494,6 +514,25 @@ def build_eagle_verify_input(
         and draft_tokens.shape == (bs, num_steps)
         and mask_mode == TreeMaskMode.QLEN_ONLY
     ):
+        with_mrope = target_worker.model_runner.model_config.model_is_mrope and all(
+            x is None for x in batch.multimodal_inputs
+        )
+        outputs = None
+        if host_fast_path.on():
+            bonus_dtype, device = draft_input.bonus_tokens.dtype, batch.seq_lens.device
+            outputs = _CHAIN_TREE_OUTPUTS.next(
+                (bs, num_steps, bonus_dtype, draft_tokens.dtype, with_mrope, device),
+                lambda: host_fast_path.empty_like_spec(
+                    chain_tree_output_specs(
+                        bs,
+                        num_steps + 1,
+                        torch.promote_types(bonus_dtype, draft_tokens.dtype),
+                        True,
+                        with_mrope,
+                    ),
+                    device,
+                ),
+            )
         tree_outputs = build_chain_tree(
             draft_input.bonus_tokens,
             draft_tokens,
@@ -501,8 +540,8 @@ def build_eagle_verify_input(
             tree_mask_buf,
             req_pool_indices=batch.req_pool_indices,
             req_to_token=batch.req_to_token_pool.req_to_token,
-            with_mrope=target_worker.model_runner.model_config.model_is_mrope
-            and all(x is None for x in batch.multimodal_inputs),
+            with_mrope=with_mrope,
+            outputs=outputs,
         )
         prepared_out_cache_loc, prepared_mrope_positions = tree_outputs[6:]
         tree_outputs = tree_outputs[:6]

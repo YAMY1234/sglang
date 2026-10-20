@@ -349,6 +349,7 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_bool_env_var,
     get_int_env_var,
+    host_fast_path,
     is_cuda,
     is_hip,
     is_mps,
@@ -4459,9 +4460,11 @@ class Scheduler(
         #       - for all non-future tensors (produced only by schedule stream),
         #       we shall keep its reference not being release during all the forwarding pass
         # Snapshot all fields: spec V2 rebinds seq_lens / spec_info mid-forward.
-        attr_snapshot = [
-            getattr(batch, f.name, None) for f in dataclasses.fields(batch)
-        ]
+        attr_snapshot = (
+            host_fast_path.snapshot_fields(batch)
+            if host_fast_path.on()
+            else [getattr(batch, f.name, None) for f in dataclasses.fields(batch)]
+        )
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
         # List (not tuple) so that workers can register additional refs via
         # GenerationBatchResult.extra_keep_alive_refs after forward returns.

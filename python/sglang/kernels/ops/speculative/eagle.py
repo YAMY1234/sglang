@@ -409,6 +409,17 @@ def _build_chain_tree_kernel(
     tl.store(mask + offset, mask_col <= mask_row, offset < BS * WIDTH * WIDTH)
 
 
+def chain_tree_output_specs(bs, width, token_dtype, write_cache, with_mrope):
+    """(shape, dtype) of positions, retrieve, tokens, out_cache_loc and mrope (None = absent)."""
+    return (
+        ((bs * width,), torch.int64),
+        ((3, bs, width), torch.int64),
+        ((bs * width,), token_dtype),
+        ((bs * width,), torch.int64) if write_cache else None,
+        ((3, bs * width), torch.int64) if with_mrope else None,
+    )
+
+
 def build_chain_tree(
     bonus_tokens,
     draft_tokens,
@@ -417,7 +428,10 @@ def build_chain_tree(
     req_pool_indices=None,
     req_to_token=None,
     with_mrope=False,
+    outputs=None,
 ):
+    """``outputs``: optional preallocated (positions, retrieve, tokens, out_cache_loc, mrope)
+    laid out as chain_tree_output_specs."""
     bs, depth = draft_tokens.shape
     width = depth + 1
     assert bonus_tokens.numel() == seq_lens.numel() == bs
@@ -427,19 +441,22 @@ def build_chain_tree(
             (bs * width * width,), dtype=torch.bool, device=seq_lens.device
         )
     assert mask.is_contiguous() and mask.numel() >= bs * width * width
-    positions = torch.empty((bs * width,), dtype=torch.int64, device=seq_lens.device)
-    retrieve = torch.empty((3, bs, width), dtype=torch.int64, device=seq_lens.device)
-    tokens = torch.empty(
-        (bs * width,),
-        dtype=torch.promote_types(bonus_tokens.dtype, draft_tokens.dtype),
-        device=seq_lens.device,
-    )
-    out_cache_loc = torch.empty_like(positions) if req_to_token is not None else None
-    mrope = (
-        torch.empty((3, bs * width), dtype=torch.int64, device=seq_lens.device)
-        if with_mrope
-        else None
-    )
+    if outputs is not None:
+        positions, retrieve, tokens, out_cache_loc, mrope = outputs
+    else:
+        positions = torch.empty((bs * width,), dtype=torch.int64, device=seq_lens.device)
+        retrieve = torch.empty((3, bs, width), dtype=torch.int64, device=seq_lens.device)
+        tokens = torch.empty(
+            (bs * width,),
+            dtype=torch.promote_types(bonus_tokens.dtype, draft_tokens.dtype),
+            device=seq_lens.device,
+        )
+        out_cache_loc = torch.empty_like(positions) if req_to_token is not None else None
+        mrope = (
+            torch.empty((3, bs * width), dtype=torch.int64, device=seq_lens.device)
+            if with_mrope
+            else None
+        )
     if req_to_token is not None:
         assert req_pool_indices is not None and req_pool_indices.numel() == bs
     if bs:

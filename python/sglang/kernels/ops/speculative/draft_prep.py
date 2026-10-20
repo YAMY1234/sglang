@@ -51,23 +51,42 @@ def draft_cache_locs(
     return status == 0
 
 
+def draft_extend_layout_specs(bs: int, num_draft_tokens: int, seq_dtype, with_mrope: bool):
+    """(shape, dtype) of prefix, extend, post, positions, starts and mrope (None = absent)."""
+    return (
+        ((bs,), torch.int32),
+        ((bs,), torch.int32),
+        ((bs,), seq_dtype),
+        ((bs * num_draft_tokens,), torch.int64),
+        ((bs,), torch.int32),
+        ((3, bs * num_draft_tokens), torch.int64) if with_mrope else None,
+    )
+
+
 def draft_extend_layout(
-    seq_lens: torch.Tensor, num_draft_tokens: int, with_mrope: bool
+    seq_lens: torch.Tensor,
+    num_draft_tokens: int,
+    with_mrope: bool,
+    outputs: Optional[tuple] = None,
 ):
     """Same outputs as ``prepare_draft_extend_layout``, or None when the layout
-    is not supported."""
+    is not supported. ``outputs``: optional preallocated tensors laid out as
+    draft_extend_layout_specs."""
     bs = seq_lens.shape[0]
     device = seq_lens.device
-    prefix = torch.empty((bs,), dtype=torch.int32, device=device)
-    extend = torch.empty_like(prefix)
-    post = torch.empty((bs,), dtype=seq_lens.dtype, device=device)
-    positions = torch.empty((bs * num_draft_tokens,), dtype=torch.int64, device=device)
-    starts = torch.empty_like(prefix)
-    mrope = (
-        torch.empty((3, bs * num_draft_tokens), dtype=torch.int64, device=device)
-        if with_mrope
-        else None
-    )
+    if outputs is not None:
+        prefix, extend, post, positions, starts, mrope = outputs
+    else:
+        prefix = torch.empty((bs,), dtype=torch.int32, device=device)
+        extend = torch.empty_like(prefix)
+        post = torch.empty((bs,), dtype=seq_lens.dtype, device=device)
+        positions = torch.empty((bs * num_draft_tokens,), dtype=torch.int64, device=device)
+        starts = torch.empty_like(prefix)
+        mrope = (
+            torch.empty((3, bs * num_draft_tokens), dtype=torch.int64, device=device)
+            if with_mrope
+            else None
+        )
     module = _jit_draft_prep_module()
     status = module.draft_extend_layout(
         seq_lens, prefix, extend, post, starts, positions, mrope, num_draft_tokens

@@ -1827,6 +1827,11 @@ class Envs:
     SGLANG_Q35MF_LL16_RECV_MERGE = EnvBool(False)
     # Measurement only: with RECV_MERGE, alternate the stock and the merged path every N passes.
     SGLANG_Q35MF_LL16_RECV_AB_BLOCK = EnvInt(0)
+    # Host fast paths for the per-round decode prep (snapshot, graph input fill, chain tree and
+    # draft-extend layout outputs); see sglang.srt.utils.host_fast_path.
+    SGLANG_Q35MF_LL16_PREP = EnvBool(False)
+    # Measurement only: with LL16_PREP, alternate the stock and the fast paths every N passes.
+    SGLANG_Q35MF_LL16_PREP_AB_BLOCK = EnvInt(0)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
     SGLANG_DEFAULT_THINKING = EnvBool(False)
 
