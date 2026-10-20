@@ -537,6 +537,30 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
 _ep_tables_engaged: set[tuple[int, int, int]] = set()
 
 
+# SGLANG_Q35MF_DEP_EP_TABLES_CHECK: per received row count, calls, rows compared, rows and elements that differ.
+_EP_CHECK_FIELDS = ("calls", "rows", "rows_diff", "elems_diff")
+_ep_check_counts: Optional[torch.Tensor] = None
+
+
+def _ep_tables_check(output: torch.Tensor, ref: torch.Tensor) -> None:
+    global _ep_check_counts
+    from sglang.srt.layers.moe.qwen_router_front import start_check_reporter
+
+    rows = output.shape[0]
+    if _ep_check_counts is None:
+        _ep_check_counts = torch.zeros(
+            (1025, len(_EP_CHECK_FIELDS)), dtype=torch.int64, device=output.device
+        )
+        start_check_reporter(
+            "SGLANG_Q35MF_DEP_EP_TABLES_CHECK", _ep_check_counts, _EP_CHECK_FIELDS
+        )
+    ne = output != ref
+    one = torch.ones((), dtype=torch.int64, device=output.device)
+    _ep_check_counts[min(rows, 1024)].add_(
+        torch.stack([one, one * rows, ne.any(dim=1).sum(), ne.sum()])
+    )
+
+
 def _ep_tables_fit(topk_ids: torch.Tensor) -> bool:
     from sglang.kernels.ops.moe.qwen_ep_tables import EP_TABLES_MAX_EXPANDED
 
@@ -693,9 +717,26 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
                 dtype=quant_info.wrapper.output_dtype,
                 device=x_fp4.device,
             )
+        ref = None
+        if envs.SGLANG_Q35MF_DEP_EP_TABLES_CHECK.get():
+            ref = quant_info.wrapper.run(
+                x=x_fp4,
+                x_sf=x_sf,
+                token_selected_experts=topk_ids,
+                token_final_scales=topk_weights,
+                w1_weight=quant_info.w13_weight,
+                w1_weight_sf=quant_info.w13_weight_sf,
+                w1_alpha=quant_info.w1_alpha,
+                fc2_input_scale=quant_info.a2_scale,
+                w2_weight=quant_info.w2_weight,
+                w2_weight_sf=quant_info.w2_weight_sf,
+                w2_alpha=quant_info.w2_alpha,
+            ).clone()
         output = _experts_from_ep_tables(
             quant_info, x_fp4, x_sf, topk_ids, topk_weights, moe_output
         )
+        if ref is not None:
+            _ep_tables_check(output, ref)
         return FlashinferCombineInput(hidden_states=output)
 
     output = quant_info.wrapper.run(
