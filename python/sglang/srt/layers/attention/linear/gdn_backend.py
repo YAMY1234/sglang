@@ -1498,10 +1498,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     draft_token_num=draft_token_num,
                     batch_size=batch_size,
                 )
+                # The coalesced window stores take channel tiles 128 / 256 only, so they keep the stock tile.
                 if (
                     e2x_launch is not None
                     and envs.SGLANG_Q35MF_GDN_CONV_TILE.get()
                     and envs.SGLANG_Q35MF_GDN_VIEWS.get()
+                    and not envs.SGLANG_Q35MF_TPX_CONV_WINDOW.get()
                 ):
                     conv_block_n = e2x_launch[4]
                 mixed_qkv_processed = causal_conv1d_update(
