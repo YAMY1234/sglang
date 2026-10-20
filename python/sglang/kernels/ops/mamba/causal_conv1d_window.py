@@ -4,7 +4,8 @@
 # Adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/causal_conv1d/causal_conv1d_interface.py
 # and https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/mamba/ops/causal_conv1d.py
 
-# Modified by NVIDIA: materialize each sliding-window column once with contiguous stores.
+# Modified by NVIDIA: materialize each sliding-window column once with contiguous stores;
+# channel tiles of 128 or 256.
 
 import triton
 import triton.language as tl
@@ -67,6 +68,7 @@ def coalesced_window_update_kernel(
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr,
     USE_GDC: tl.constexpr = False,
     COALESCED_WINDOW: tl.constexpr = False,
+    WINDOW_FLAT: tl.constexpr = 4096,
 ):
     if USE_GDC:
         tl.extra.cuda.gdc_wait()
@@ -118,8 +120,9 @@ def coalesced_window_update_kernel(
         tl.static_assert(
             stride_inter_step == 1 and stride_inter_win == 1 and (stride_inter_dim == 9)
         )
-        tl.static_assert(BLOCK_N == 256)
-        window_flat = tl.arange(0, 4096)
+        tl.static_assert((BLOCK_N == 256) or (BLOCK_N == 128))
+        tl.static_assert(WINDOW_FLAT >= BLOCK_N * 9)
+        window_flat = tl.arange(0, WINDOW_FLAT)
         window_channel_base = tl.program_id(1) * BLOCK_N
         window_channels = window_channel_base + window_flat // 9
         window_positions = window_flat % 9
