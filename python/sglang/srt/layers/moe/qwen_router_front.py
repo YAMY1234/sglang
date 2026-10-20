@@ -7,7 +7,8 @@ the grouped GEMMs consume; FC1 / FC2 / finalize then run as in FlashInfer's
 also moves the router GEMM into the kernel); every unsupported configuration
 keeps the stock path. On the trtllm runner, SGLANG_Q35MF_ROUTE_TABLES_MAX_TOKENS
 replaces FlashInfer's routing kernels by one top-k + routing-tables kernel and
-runs FlashInfer's FP4 body from those tables.
+runs FlashInfer's FP4 body from those tables; SGLANG_Q35MF_TPX_ROUTER_FRONT_MAX_M
+also moves the router GEMM and the input quantization into that launch.
 """
 
 # Copyright (c) 2025 by FlashInfer team.
@@ -72,6 +73,11 @@ _tables_tactics: Dict[Tuple[int, bool], Tuple[Any, Any]] = {}
 _tables_by_tile: Dict[Tuple[int, int], Any] = {}
 _tables_bodies: Dict[Tuple[int, int, int, bool], Tuple[torch.Tensor, ...]] = {}
 _tables_logged: set = set()
+# router_wide_front (SGLANG_Q35MF_TPX_ROUTER_FRONT_MAX_M): (tokens, tile) of the tables it wrote for the next
+# _fp4_from_tables call, its workspace per device, and the token counts already logged.
+_wide_tables_pending: Optional[Tuple[int, int]] = None
+_wide_workspace_by_device: Dict[torch.device, torch.Tensor] = {}
+_wide_logged: set = set()
 
 
 def enabled() -> bool:
@@ -421,7 +427,10 @@ def forward_routed_rt(
 
     experts = block.experts
     if hidden_states.shape[0] > _MAX_TOKENS:
-        logits, x_fp4, x_sf = _logits_and_quant_parallel(block, hidden_states)
+        front = _wide_front(block, hidden_states, defer_finalize)
+        if front is None:
+            front = _logits_and_quant_parallel(block, hidden_states)
+        logits, x_fp4, x_sf = front
         return _run_rt_experts(
             block, hidden_states, logits, x_fp4, x_sf, defer_finalize
         )
@@ -480,6 +489,61 @@ def _logits_and_quant_parallel(
     x_fp4.record_stream(current)
     x_sf.record_stream(current)
     return logits, x_fp4, x_sf
+
+
+def _wide_front(
+    block: Qwen2MoeSparseMoeBlock, hidden_states: torch.Tensor, defer_finalize: bool
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """SGLANG_Q35MF_TPX_ROUTER_FRONT_MAX_M: logits, NVFP4 input and the routing tables of a 17..64-token
+    call from router_wide_front, into the tables the runner's _fp4_from_tables then uses as they are.
+    None keeps the stock router GEMM and input quantization."""
+    from sglang.kernels.ops.moe.qwen_router_tables import (
+        ROUTER_GEMM_K_SPLIT,
+        WIDE_WORKSPACE_WORDS,
+        router_wide_front,
+    )
+
+    global _wide_tables_pending
+    m = hidden_states.shape[0]
+    k_split = ROUTER_GEMM_K_SPLIT.get(m)
+    if (
+        k_split is None
+        or m > envs.SGLANG_Q35MF_TPX_ROUTER_FRONT_MAX_M.get()
+        or isinstance(_tables_context(m), contextlib.nullcontext)
+    ):
+        return None
+    # The tile comes from the stock call's tactic, known after this token count's first (eager) call.
+    stock = _tables_tactics.get((m, not defer_finalize))
+    if stock is None or stock[1] == -1:
+        return None
+    tile_n = int(stock[1][0])
+    tables = _tables_by_tile.get((m, tile_n))
+    if tables is None:
+        return None
+    # One workspace for every layer: the launches are stream-ordered and each leaves it at zero.
+    workspace = _wide_workspace_by_device.get(hidden_states.device)
+    if workspace is None:
+        workspace = _wide_workspace_by_device[hidden_states.device] = torch.zeros(
+            WIDE_WORKSPACE_WORDS, dtype=torch.int32, device=hidden_states.device
+        )
+    front = router_wide_front(
+        hidden_states,
+        block.gate.weight,
+        block.experts.w13_input_scale_quant.reshape(1),
+        tables,
+        workspace,
+        k_split,
+    )
+    _wide_tables_pending = (m, tile_n)
+    if m not in _wide_logged:
+        _wide_logged.add(m)
+        logger.info(
+            "TPX_ROUTER_FRONT: router_wide_front at %d tokens (tile %d, K split %d)",
+            m,
+            tile_n,
+            k_split,
+        )
+    return front
 
 
 def _run_rt_experts(
@@ -554,6 +618,8 @@ def _fp4_from_tables(kw: dict) -> Optional[List[torch.Tensor]]:
         router_topk_tables_small,
     )
 
+    global _wide_tables_pending
+    wide, _wide_tables_pending = _wide_tables_pending, None
     m, fin = kw["hidden_states"].shape[0], kw["do_finalize"]
     if AutoTuner.get().is_tuning_mode or not _fp4_from_tables_supported(kw):
         return None
@@ -584,7 +650,7 @@ def _fp4_from_tables(kw: dict) -> Optional[List[torch.Tensor]]:
             tables,
             early_trigger=envs.SGLANG_Q35MF_ROUTE2_EARLY_TRIGGER.get(),
         )
-    else:
+    elif wide != (m, tile_n):
         router_topk_tables(kw["routing_logits"], tables)
     inputs = _fp4_body_inputs(kw, tables)
     run_kw = _fp4_runner_kwargs(kw, RoutingInputMode.PackedPrecomputed)

@@ -265,6 +265,52 @@ def test_router_topk_tables_small(m: int, tile: int, early_trigger: bool) -> Non
     assert small.num_tokens_per_expert.tolist() == counts
 
 
+@requires_blackwell
+@pytest.mark.parametrize("m", [17, 21, 28, 32, 49, 56, 64])
+@pytest.mark.parametrize("tile", [8, 64])
+def test_router_wide_front_matches_stock_chain(m: int, tile: int) -> None:
+    """One launch for 17..64 tokens: logits bitwise to the cuBLAS router GEMM, NVFP4 input to the stock quant,
+    ids / weights to router_topk_tables, tables in the single-block layout (ascending tokens per expert)."""
+    from sglang.kernels.ops.moe.qwen_router_tables import (
+        ROUTER_GEMM_K_SPLIT,
+        WIDE_WORKSPACE_WORDS,
+        RouterTables,
+        router_topk_tables,
+        router_wide_front,
+    )
+    from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
+
+    x, weight, gs = _inputs(m, seed=7000 + m, clustered=m == 28)
+    workspace = torch.zeros(WIDE_WORKSPACE_WORDS, dtype=torch.int32, device="cuda")
+    out, ref = RouterTables(m, tile, "cuda"), RouterTables(m, tile, "cuda")
+    for _ in range(2):  # the workspace must come back to zero
+        logits, x_fp4, x_sf = router_wide_front(
+            x, weight, gs, out, workspace, ROUTER_GEMM_K_SPLIT[m]
+        )
+    stock_logits = torch.nn.functional.linear(x, weight)
+    router_topk_tables(stock_logits, ref)
+    xq, xsf = fp4_quantize(x, gs, 16, False, False)
+    torch.cuda.synchronize()
+    assert not workspace.any()
+    assert torch.equal(logits, stock_logits)
+    assert torch.equal(x_fp4, xq.view(torch.uint8).reshape(m, -1))
+    assert torch.equal(x_sf, xsf.view(torch.uint8).reshape(m, -1))
+    assert torch.equal(out.topk_ids, ref.topk_ids)
+    assert torch.equal(
+        out.expert_weights.view(torch.int16), ref.expert_weights.view(torch.int16)
+    )
+
+    ctas, limits, e2p, p2t, counts = _expected_tables(out.topk_ids.cpu(), tile)
+    n = len(ctas)
+    assert int(out.num_non_exiting_ctas.item()) == n
+    assert int(out.total_num_padded_tokens.item()) == n * tile
+    assert out.cta_idx_xy_to_batch_idx[:n].tolist() == ctas
+    assert out.cta_idx_xy_to_mn_limit[:n].tolist() == limits
+    assert out.expanded_idx_to_permuted_idx[: m * TOP_K].tolist() == e2p
+    assert out.permuted_idx_to_token_idx[: n * tile].tolist() == p2t
+    assert out.num_tokens_per_expert.tolist() == counts
+
+
 def test_routed_rt_dispatch_order(monkeypatch) -> None:
     """The fused MKM engine takes the deferred-finalize calls it covers before the trtllm runner;
     only ROUTE_PARQ admits calls above the router front, and those skip the fused front."""
@@ -305,6 +351,13 @@ def test_routed_rt_dispatch_order(monkeypatch) -> None:
         hidden = torch.zeros(m, 8, dtype=torch.bfloat16)
         front.forward_routed_rt(block, hidden, defer_finalize=defer)
         assert calls == expected, (m, defer, mkm)
+    # SGLANG_Q35MF_TPX_ROUTER_FRONT_MAX_M is off by default; when the wide front runs, the stock GEMM and quant do not.
+    hidden = torch.zeros(56, 8, dtype=torch.bfloat16)
+    assert front._wide_front(block, hidden, True) is None
+    calls.clear()
+    monkeypatch.setattr(front, "_wide_front", lambda *args: record("wide")())
+    front.forward_routed_rt(block, hidden, defer_finalize=True)
+    assert calls == ["wide", "runner"]
     # At the ROUTE_TABLES / ROUTE2 defaults the runner keeps FlashInfer's own routing.
     for m in (1, 16, 56):
         assert isinstance(front._tables_context(m), contextlib.nullcontext), m

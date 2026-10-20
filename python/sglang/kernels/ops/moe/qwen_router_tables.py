@@ -3,7 +3,8 @@
 The outputs are the precomputed routing metadata FlashInfer's trtllm-gen MoE runs its FC1 / FC2 body
 from (``da_routing_metadata``), so FlashInfer's routing kernels are skipped. Expert ids and weights equal
 FlashInfer's routing (TopK -> Softmax) bit for bit; the tables equal it up to the order of the tokens
-inside one expert's rows, which FlashInfer's own routing does not fix either.
+inside one expert's rows, which FlashInfer's own routing does not fix either. :func:`router_wide_front`
+also computes the router GEMM (bitwise to cuBLAS) and the NVFP4 input quantization in the same launch.
 """
 
 from __future__ import annotations
@@ -129,6 +130,79 @@ def router_topk_tables(logits: torch.Tensor, out: RouterTables) -> None:
         out.arrival,
         out.tile_log2,
     )
+
+
+WIDE_MIN_TOKENS = 17
+WIDE_MAX_TOKENS = 64
+# K order of the cuBLAS router GEMM (F.linear [M, 4096] x [512, 4096]^T, bf16) on GB300 by token count, measured
+# with torch 2.14 / CUDA 13.0 cuBLAS: 2 = split-K over two K halves, 1 = one chain over K.
+ROUTER_GEMM_K_SPLIT = {
+    m: 2 if m <= 24 or m in (32, 48, 64) else 1
+    for m in range(WIDE_MIN_TOKENS, WIDE_MAX_TOKENS + 1)
+}
+
+
+# int32 words of router_wide_front's workspace: the logits and expert ids it passes between its CTAs.
+WIDE_WORKSPACE_WORDS = WIDE_MAX_TOKENS * (NUM_EXPERTS + TOP_K)
+
+
+@cache_once
+def _jit_module_wide(trace: bool = False) -> Module:
+    args = make_cpp_args(is_arch_support_pdl(), trace)
+    return load_jit(
+        "qwen_router_wide_front",
+        *args,
+        cuda_files=["moe/qwen_router_wide_front.cuh"],
+        cuda_wrappers=[("run", f"RouterWideFront<{args}>::run")],
+        # The top-k and softmax are qwen_router_tables.cuh's code and need its flags.
+        extra_cuda_cflags=["-O3", "-use_fast_math"],
+    )
+
+
+def router_wide_front(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    global_scale: torch.Tensor,
+    out: RouterTables,
+    workspace: torch.Tensor,
+    k_split: int,
+    trace: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Router GEMM, NVFP4 input quantization and router_topk_tables for 17..64 tokens in one launch.
+
+    x [M, 4096] bf16, weight [512, 4096] bf16, global_scale [1] fp32 (quantization domain); ``workspace`` is
+    an int32 [WIDE_WORKSPACE_WORDS] zero tensor the kernel leaves at zero (launches using one workspace must
+    be stream-ordered); ``k_split`` is the cuBLAS order at M (ROUTER_GEMM_K_SPLIT). Writes the tables into
+    ``out`` and returns (logits bf16 [M, 512], x_fp4 uint8 [M, 2048], x_sf uint8 [M, 256] linear layout),
+    each equal to the stock chain's. ``trace`` (int64 [129 * 8]) selects an instrumented build that records
+    %globaltimer stamps.
+    """
+    m, hidden = x.shape
+    logits = torch.empty((m, NUM_EXPERTS), dtype=torch.bfloat16, device=x.device)
+    x_fp4 = torch.empty((m, hidden // 2), dtype=torch.uint8, device=x.device)
+    x_sf = torch.empty((m, hidden // 16), dtype=torch.uint8, device=x.device)
+    _jit_module_wide(trace is not None).run(
+        x,
+        weight,
+        global_scale,
+        logits,
+        x_fp4,
+        x_sf,
+        out.expert_weights,
+        out.topk_ids,
+        out.expanded_idx_to_permuted_idx,
+        out.permuted_idx_to_token_idx,
+        out.cta_idx_xy_to_batch_idx,
+        out.cta_idx_xy_to_mn_limit,
+        out.num_non_exiting_ctas,
+        out.total_num_padded_tokens,
+        out.num_tokens_per_expert,
+        workspace,
+        trace if trace is not None else workspace,
+        out.tile_log2,
+        k_split,
+    )
+    return logits, x_fp4, x_sf
 
 
 SMALL_MAX_TOKENS = 16
