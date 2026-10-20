@@ -560,6 +560,12 @@ class Envs:
     SGLANG_DSPARK_NVLINK_VOCAB_GATHER = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
+    # Static verify graphs of a batch in [MIN_BS, MAX_BS] (MAX_BS 0: no upper
+    # bound) run the greedy accept and its bookkeeping as one kernel. Off while
+    # the accept-site TP broadcast is selected (SGLANG_SPEC_TP_SYNC).
+    SGLANG_DSPARK_FUSED_ACCEPT_TAIL = EnvBool(False)
+    SGLANG_DSPARK_ACCEPT_TAIL_MIN_BS = EnvInt(1)
+    SGLANG_DSPARK_ACCEPT_TAIL_MAX_BS = EnvInt(0)
 
     # ===================================================================
     # Memory pools and KV-cache sizing
@@ -1760,6 +1766,12 @@ class Envs:
     SGLANG_OPT_USE_AITER_BATCHED_GEMM = EnvBool(False)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
+    # DSpark decode: build the verify window and the draft anchor column in one
+    # launch instead of two adds, assign_extend_cache_locs and a copy.
+    SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE = EnvBool(False)
+    # DSpark folded draft: the draft graph's tail writes [anchor | draft tokens]
+    # into the sampler's own buffer, so the step skips its eager concat.
+    SGLANG_OPT_DSV41_DSPARK_MID_FOLD = EnvBool(False)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # ===================================================================
