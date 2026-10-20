@@ -16,6 +16,7 @@ from sglang.kernels.ops.communication.qwen_dep_ll_a2a import (
     LL_A2A_MAX_TOKENS,
     ll_a2a_combine,
     ll_a2a_dispatch,
+    ll_a2a_dispatch_tables,
     ll_a2a_region_bytes,
 )
 
@@ -91,6 +92,13 @@ class LlA2AState:
         self.out_ids = torch.empty((rows, top_k), dtype=torch.int32, device=device)
         self.out_wts = torch.empty((rows, top_k), dtype=torch.float32, device=device)
         self.recv_tokens = torch.zeros(ep_size, dtype=torch.int32, device=device)
+        # SGLANG_Q35MF_KRNC_EPX scratch: per-expert counts, listed local entries, list length, CTA ticket.
+        self.table_scratch = (
+            torch.zeros(self.experts_per_rank, dtype=torch.int32, device=device),
+            torch.empty(2 * rows * top_k, dtype=torch.int32, device=device),
+            torch.zeros(1, dtype=torch.int32, device=device),
+            torch.zeros(1, dtype=torch.int32, device=device),
+        )
         logger.info(
             "SGLANG_Q35MF_E2X_LLA2A buffers (%s): %d ranks, %d slots, %d + %d bytes, %d CTAs",
             payload,
@@ -126,9 +134,11 @@ class LlA2AState:
         wts: torch.Tensor,
         tmax: int,
         invalid_id: int,
+        tables=None,
     ) -> list[torch.Tensor]:
         """Returns the received payloads as [ep_size, tmax, ...] views in MoeAlltoAll.dispatch order:
-        x, sf, ids, weights for nvfp4; x, ids, weights for bf16."""
+        x, sf, ids, weights for nvfp4; x, ids, weights for bf16. tables: an EpTablesBuffers over the received rows
+        that this dispatch fills (SGLANG_Q35MF_KRNC_EPX), or None."""
         rows = self.ep_size * tmax
         out = [
             self.out_x[:rows],
@@ -138,7 +148,15 @@ class LlA2AState:
         ]
         if sf is None:
             sf = x.new_empty((x.shape[0], 0), dtype=torch.uint8)
-        ll_a2a_dispatch(
+        kw = dict(
+            tmax=tmax,
+            slots=self.slots,
+            rank=self.ep_rank,
+            experts_per_rank=self.experts_per_rank,
+            invalid_id=invalid_id,
+            hidden=self.hidden,
+        )
+        args = (
             self.dispatch_peers,
             x.view(torch.uint8),
             sf.view(torch.uint8),
@@ -148,13 +166,18 @@ class LlA2AState:
             *out,
             self.recv_tokens,
             self.err,
-            tmax=tmax,
-            slots=self.slots,
-            rank=self.ep_rank,
-            experts_per_rank=self.experts_per_rank,
-            invalid_id=invalid_id,
-            hidden=self.hidden,
         )
+        if tables is None:
+            ll_a2a_dispatch(*args, **kw)
+        else:
+            ll_a2a_dispatch_tables(
+                *args,
+                tables,
+                self.table_scratch,
+                local_offset=self.ep_rank * self.experts_per_rank,
+                num_local=self.experts_per_rank,
+                **kw,
+            )
         out[0] = out[0].view(x.dtype)
         out[1] = out[1].view(sf.dtype)
         if self.payload == "bf16":

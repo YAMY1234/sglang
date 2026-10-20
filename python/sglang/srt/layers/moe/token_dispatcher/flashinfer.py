@@ -138,6 +138,8 @@ class FlashinferDispatchOutput(NamedTuple):
     # Provide an output tensor to fused_moe so it writes directly to our buffer
     moe_output: Optional[torch.Tensor] = None
     output_dtype: Optional[torch.dtype] = None
+    # Routing tables the LL dispatch already built (SGLANG_Q35MF_KRNC_EPX), an EpTablesBuffers, or None.
+    ep_tables: Optional[object] = None
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -323,6 +325,8 @@ class FlashinferDispatcher(BaseDispatcher):
             )
         # (own top-k ids, check) of a dispatch that went through ll_a2a, for the matching combine.
         self._ll_call: Optional[tuple] = None
+        # EpTablesBuffers the current LL dispatch fills (SGLANG_Q35MF_KRNC_EPX), handed to the runner.
+        self._ll_tables = None
         # (data_ptr, shape, x_fp4, x_sf) staged by a fused router front for the next NVFP4 dispatch.
         self._staged_nvfp4: Optional[tuple] = None
         # The next decoder layer's first projections, set by the model (SGLANG_Q35MF_DEP_L2_PREFETCH).
@@ -529,12 +533,15 @@ class FlashinferDispatcher(BaseDispatcher):
             moe_output = self.active_moe_a2a.get_combine_payload_tensor_in_workspace(
                 self.runtime_max_tokens_per_rank, self.hidden_size, output_dtype
             ).view(-1, self.hidden_size)
+        ep_tables = self._ll_tables if self._ll_call is not None else None
+        self._ll_tables = None
         return FlashinferDispatchOutput(
             x,
             x_sf,
             StandardTopKOutput(topk_weights, topk_ids, topk_output.router_logits),
             moe_output,
             output_dtype,
+            ep_tables,
         )
 
     def _use_ll_a2a(self, dispatch_type: FlashinferA2ADispatchType) -> bool:
@@ -567,6 +574,7 @@ class FlashinferDispatcher(BaseDispatcher):
                 )
             x, x_sf = self.ll_a2a.empty_payload(x.device)
         _log_ll_path(self._ll_draft, x)
+        self._ll_tables = self._ll_dispatch_tables()
         recv = self.ll_a2a.dispatch(
             x=x,
             sf=x_sf,
@@ -574,6 +582,7 @@ class FlashinferDispatcher(BaseDispatcher):
             wts=topk_weights,
             tmax=self.runtime_max_tokens_per_rank,
             invalid_id=self.invalid_token_expert_id,
+            tables=self._ll_tables,
         )
         check = None
         if envs.SGLANG_Q35MF_E2X_LLA2A_CHECK.get():
@@ -589,6 +598,31 @@ class FlashinferDispatcher(BaseDispatcher):
             )
         self._ll_call = (topk_ids, check)
         return recv
+
+    def _ll_dispatch_tables(self):
+        """Buffers for the routing tables the target NVFP4 dispatch builds itself (SGLANG_Q35MF_KRNC_EPX, read at
+        capture), once the runner has recorded its tile size for this row count; else None."""
+        if (
+            self._ll_draft
+            or self.ll_a2a.payload != "nvfp4"
+            or not envs.SGLANG_Q35MF_DEP_EP_TABLES.get()
+            or not envs.SGLANG_Q35MF_KRNC_EPX.get()
+        ):
+            return None
+        from sglang.kernels.ops.moe.qwen_ep_tables import EP_TILE_BY_ROWS, EpTablesBuffers
+
+        rows = self.ep_size * self.runtime_max_tokens_per_rank
+        tile = EP_TILE_BY_ROWS.get(rows)
+        if tile is None:
+            return None
+        state = self.ll_a2a
+        return EpTablesBuffers(
+            state.out_ids[:rows],
+            state.out_wts[:rows],
+            state.out_x[:rows],
+            state.experts_per_rank,
+            tile,
+        )
 
     def _ll_a2a_combine(self, hidden_states: torch.Tensor) -> torch.Tensor:
         topk_ids, check = self._ll_call
