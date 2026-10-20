@@ -1,7 +1,8 @@
 """SGLANG_DSPARK_FUSED_ACCEPT_TAIL: the one-launch static greedy accept tail writes
 exactly what the static epilogue's separate ops write (AcceptGreedy, build_accept_outs
 and the gated commit lengths), for padded rows, gate 0 / 1, simulated acceptance on /
-off and a precomputed (in-graph simulated) bonus."""
+off, a precomputed (in-graph simulated) bonus or its per-split maxima, and the
+argmax skipped when the length and bonus are both simulated."""
 
 from types import SimpleNamespace
 
@@ -11,6 +12,11 @@ import torch
 from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     AcceptGreedy,
     _row_argmax,
+)
+from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
+    simulated_bonus_partials_graph,
+    simulated_bonus_sample_graph,
+    simulated_bonus_select_partials,
 )
 from sglang.kernels.ops.speculative.dspark.static_accept_tail import (
     static_accept_tail,
@@ -29,9 +35,17 @@ register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-s
 T = 6  # gamma 5
 VOCAB = 64
 MAX_BS = 64
+NSPLIT = 32
 
 
-def _inputs(bs: int, *, gate: int, simulated: bool, bonus_in: bool, seed: int, device):
+def _parts(bs: int, g: torch.Generator):
+    """Per-split maxima with ties: values from a few levels, indices unsorted."""
+    val = torch.randint(0, 3, (bs, NSPLIT), generator=g).float()
+    idx = torch.randint(0, VOCAB, (bs, NSPLIT), generator=g).to(torch.int32)
+    return val, idx
+
+
+def _inputs(bs: int, *, gate: int, simulated: bool, bonus: str, seed: int, device):
     g = torch.Generator().manual_seed(seed)
     target = torch.randint(0, VOCAB, (bs, T), generator=g)
     logits = torch.randn(bs * T, VOCAB, generator=g)
@@ -53,9 +67,15 @@ def _inputs(bs: int, *, gate: int, simulated: bool, bonus_in: bool, seed: int, d
         verify_lens=torch.where(live, T, 0).to(torch.int64),
         gate=torch.tensor([gate], dtype=torch.int32),
         simulated=(torch.randint(0, T, (1,), generator=g) if simulated else None),
-        bonus=(torch.randint(0, VOCAB, (bs,), generator=g) if bonus_in else None),
+        bonus=(torch.randint(0, VOCAB, (bs,), generator=g) if bonus == "in" else None),
     )
-    return {k: (v.to(device) if v is not None else None) for k, v in tensors.items()}
+    out = {k: (v.to(device) if v is not None else None) for k, v in tensors.items()}
+    out["parts"] = (
+        tuple(t.to(device) for t in _parts(bs, g)) + (VOCAB,)
+        if bonus == "parts"
+        else None
+    )
+    return out
 
 
 def _bufs(device) -> AcceptOuts:
@@ -82,6 +102,12 @@ def _separate_ops(x, out: AcceptOuts) -> torch.Tensor:
     )
     if x["bonus"] is not None:
         bonus = x["bonus"].to(bonus.dtype).view_as(bonus)
+    elif x["parts"] is not None:
+        part_val, part_idx, vocab = x["parts"]
+        selected = simulated_bonus_select_partials(
+            part_val=part_val.cpu(), part_idx=part_idx.cpu(), vocab=vocab
+        )
+        bonus = selected.to(bonus.device, bonus.dtype).view_as(bonus)
     tp_sync = SpecTpSync(SimpleNamespace(world_size=1, rank_in_group=0))
     accept = build_accept_outs(
         correct_len=correct_len,
@@ -102,9 +128,15 @@ def _separate_ops(x, out: AcceptOuts) -> torch.Tensor:
 
 
 def _fused(fn, x, out: AcceptOuts, gated_out: torch.Tensor) -> None:
+    supplied = x["bonus"] is not None or x["parts"] is not None
     fn(
         candidates=x["candidates"],
-        target_predict=_row_argmax(x["logits"]).view(-1),
+        # Simulated length + supplied bonus: the kernel must not need the argmax.
+        target_predict=(
+            None
+            if x["simulated"] is not None and supplied
+            else _row_argmax(x["logits"]).view(-1)
+        ),
         seq_lens=x["seq_lens"],
         verify_lens=x["verify_lens"],
         gate=x["gate"],
@@ -116,13 +148,14 @@ def _fused(fn, x, out: AcceptOuts, gated_out: torch.Tensor) -> None:
         out_tokens_out=out.out_tokens,
         simulated_correct_len=x["simulated"],
         bonus_in=x["bonus"],
+        bonus_parts=x["parts"],
         gated_commit_lens_out=gated_out,
     )
 
 
-def _check(fn, device, bs, gate, simulated, bonus_in, seed):
+def _check(fn, device, bs, gate, simulated, bonus, seed):
     x = _inputs(
-        bs, gate=gate, simulated=simulated, bonus_in=bonus_in, seed=seed, device=device
+        bs, gate=gate, simulated=simulated, bonus=bonus, seed=seed, device=device
     )
     ref, got = _bufs(device), _bufs(device)
     gated_ref = _separate_ops(x, ref)
@@ -139,30 +172,71 @@ def _check(fn, device, bs, gate, simulated, bonus_in, seed):
 
 
 CASES = [
-    (bs, gate, simulated, bonus_in)
+    (bs, gate, simulated, bonus)
     for bs in (1, 3, 8, 64)
     for gate in (0, 1)
     for simulated in (False, True)
-    for bonus_in in (False, True)
+    for bonus in ("argmax", "in", "parts")
 ]
 
 
-@pytest.mark.parametrize("bs,gate,simulated,bonus_in", CASES)
-def test_torch_reference_matches_separate_ops(bs, gate, simulated, bonus_in):
+@pytest.mark.parametrize("bs,gate,simulated,bonus", CASES)
+def test_torch_reference_matches_separate_ops(bs, gate, simulated, bonus):
     _check(
-        static_accept_tail_torch,
-        "cpu",
-        bs,
-        gate,
-        simulated,
-        bonus_in,
-        seed=bs * 7 + gate,
+        static_accept_tail_torch, "cpu", bs, gate, simulated, bonus, seed=bs * 7 + gate
     )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-@pytest.mark.parametrize("bs,gate,simulated,bonus_in", CASES)
-def test_triton_matches_separate_ops(bs, gate, simulated, bonus_in):
-    _check(
-        static_accept_tail, "cuda", bs, gate, simulated, bonus_in, seed=bs * 11 + gate
+@pytest.mark.parametrize("bs,gate,simulated,bonus", CASES)
+def test_triton_matches_separate_ops(bs, gate, simulated, bonus):
+    _check(static_accept_tail, "cuda", bs, gate, simulated, bonus, seed=bs * 11 + gate)
+
+
+def test_select_partials_reference():
+    val = torch.tensor([[1.0, 3.0, 3.0, 2.0], [-1.0, -1.0, -1.0, -1.0]])
+    idx = torch.tensor([[9, 7, 5, 1], [4, 2, 8, 6]], dtype=torch.int32)
+    got = simulated_bonus_select_partials(part_val=val, part_idx=idx, vocab=10)
+    assert got.tolist() == [5, 2]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("bs", (1, 2, 8))
+@pytest.mark.parametrize("temperature", (0.0, 1.0))
+def test_triton_select_fold_matches_sim_bonus_kernel(bs, temperature):
+    """The tail's folded select == _simulated_bonus_row_select_kernel, real vocab."""
+    vocab, device = 129280, "cuda"
+    g = torch.Generator(device=device).manual_seed(bs)
+    logits = torch.randn(bs * T, vocab, device=device, generator=g)
+    # Exact ties across splits at temperature 0: the lowest index must win.
+    logits[:, 5] = logits[:, 70000] = 1e4
+    args = dict(
+        target_logits=logits,
+        correct_len=torch.full((bs,), 3, dtype=torch.int64, device=device),
+        temperatures=torch.full((bs,), temperature, device=device),
+        seed=torch.tensor([1234], dtype=torch.int32, device=device),
+        bs=bs,
+        rows_per_request=T,
     )
+    ref = simulated_bonus_sample_graph(**args)
+    parts = (*simulated_bonus_partials_graph(**args), vocab)
+    out = _bufs(device)
+    candidates = torch.randint(0, vocab, (bs, T), device=device)
+    static_accept_tail(
+        candidates=candidates,
+        target_predict=None,
+        seq_lens=torch.full((bs,), 10, dtype=torch.int64, device=device),
+        verify_lens=torch.full((bs,), T, dtype=torch.int64, device=device),
+        gate=torch.ones(1, dtype=torch.int32, device=device),
+        correct_len_out=out.correct_len,
+        bonus_out=out.bonus,
+        cap_trim_lens_out=out.cap_trim_lens,
+        commit_lens_out=out.commit_lens,
+        new_seq_lens_out=out.new_seq_lens,
+        out_tokens_out=out.out_tokens,
+        simulated_correct_len=torch.tensor([3], dtype=torch.int64, device=device),
+        bonus_parts=parts,
+    )
+    assert torch.equal(out.bonus[:bs], ref)
+    if temperature == 0.0:
+        assert bool((ref == 5).all())

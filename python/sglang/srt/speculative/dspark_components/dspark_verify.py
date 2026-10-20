@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import random
 from typing import Optional
 
@@ -24,6 +25,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     scatter_compact_to_strided_into,
 )
 from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
+    simulated_bonus_partials_graph,
     simulated_bonus_sample,
     simulated_bonus_sample_graph,
 )
@@ -50,6 +52,8 @@ from sglang.srt.speculative.spec_utils import (
 )
 from sglang.srt.utils import is_hip, is_npu
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
+
+logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -581,12 +585,22 @@ class DsparkVerifyEpilogue:
         self.out_tokens_buf = torch.zeros(
             (self.max_bs, self.stride), dtype=torch.int64, device=device
         )
-        # SGLANG_DSPARK_FUSED_ACCEPT_TAIL: with the accept-site broadcast selected,
-        # rank 0's results are broadcast between the ops, so they stay separate.
-        self._fused_accept_tail = bool(fused_accept_tail) and not tp_sync.enabled(
+        # SGLANG_DSPARK_FUSED_ACCEPT_TAIL. With the accept-site broadcast selected, only
+        # simulate_fold's decisions (length, draw) are inputs the kernel can take
+        # broadcast; the greedy accept broadcasts derived lengths, so its ops stay separate.
+        self._tail_broadcasts = bool(fused_accept_tail) and tp_sync.enabled(
             SpecTpSyncSite.DSPARK_ACCEPT_GRAPH
         )
+        self._fused_accept_tail = bool(fused_accept_tail) and (
+            self.simulate_fold or not self._tail_broadcasts
+        )
+        if fused_accept_tail and not self._fused_accept_tail:
+            logger.info(
+                "DSpark fused accept tail off: the accept-site TP broadcast is "
+                "selected without SGLANG_DSPARK_SIMULATE_FOLD."
+            )
         self._accept_tail_bs = (int(accept_tail_min_bs), int(accept_tail_max_bs))
+        self._accept_tail_logged: set[int] = set()
         self.gated_commit_lens_buf = torch.zeros(
             (self.max_bs,), dtype=torch.int32, device=device
         )
@@ -704,22 +718,29 @@ class DsparkVerifyEpilogue:
     def _static_accept_tail(
         self, *, candidates, logits, seq_lens, verify_lens, gated: bool
     ) -> Optional[torch.Tensor]:
-        """The greedy ``_accept`` (and the gated commit lengths) in one launch, after
-        the argmax and, under simulate_fold, the in-graph simulated bonus."""
+        """The greedy ``_accept`` (and the gated commit lengths) in one launch. Under
+        simulate_fold the length and bonus are simulated, so the argmax is skipped and
+        the in-graph bonus's select runs inside the tail."""
         bs = candidates.shape[0]
-        bonus_in = None
-        if self.simulate_fold:
-            bonus_in = simulated_bonus_sample_graph(
-                target_logits=logits,
-                correct_len=self.simulated_correct_len.repeat(bs),
-                temperatures=self.sim_temperatures_buf[:bs],
-                seed=self.sim_seed_buf,
-                bs=bs,
-                rows_per_request=self.stride,
+        target_predict = bonus_in = bonus_parts = None
+        if not self.simulate_fold:
+            target_predict = _row_argmax(logits, fused=self._fused_argmax).view(-1)
+        elif self._tail_broadcasts:
+            bonus_in = self._sim_bonus(logits, bs)
+            # Rank 0's length and draw, as build_accept_outs broadcasts them.
+            self._tp_sync.sync(
+                SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, self.simulated_correct_len
             )
+            self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, bonus_in)
+        else:
+            bonus_parts = (
+                *simulated_bonus_partials_graph(**self._sim_bonus_args(logits, bs)),
+                logits.shape[1],
+            )
+        self._log_accept_tail(bs, bonus_in=bonus_in, bonus_parts=bonus_parts)
         static_accept_tail(
             candidates=candidates,
-            target_predict=_row_argmax(logits, fused=self._fused_argmax).view(-1),
+            target_predict=target_predict,
             seq_lens=seq_lens,
             verify_lens=verify_lens,
             gate=self.inject_gate_buf,
@@ -731,9 +752,39 @@ class DsparkVerifyEpilogue:
             out_tokens_out=self.out_tokens_buf,
             simulated_correct_len=self.simulated_correct_len,
             bonus_in=bonus_in,
+            bonus_parts=bonus_parts,
             gated_commit_lens_out=self.gated_commit_lens_buf if gated else None,
         )
         return self.gated_commit_lens_buf[:bs] if gated else None
+
+    def _sim_bonus_args(self, logits, bs: int) -> dict:
+        return dict(
+            target_logits=logits,
+            correct_len=self.simulated_correct_len.repeat(bs),
+            temperatures=self.sim_temperatures_buf[:bs],
+            seed=self.sim_seed_buf,
+            bs=bs,
+            rows_per_request=self.stride,
+        )
+
+    def _sim_bonus(self, logits, bs: int) -> torch.Tensor:
+        return simulated_bonus_sample_graph(**self._sim_bonus_args(logits, bs))
+
+    def _log_accept_tail(self, bs: int, *, bonus_in, bonus_parts) -> None:
+        """Once per captured batch size, from the branch that launches the kernel."""
+        if (
+            bs in self._accept_tail_logged
+            or not torch.cuda.is_available()
+            or not torch.cuda.is_current_stream_capturing()
+        ):
+            return
+        self._accept_tail_logged.add(bs)
+        logger.info(
+            "DSpark verify graph bs=%d: fused accept tail (bonus=%s, tp-broadcast=%s)",
+            bs,
+            "sim-fold" if self.simulate_fold else "argmax",
+            "inputs" if bonus_in is not None else "off",
+        )
 
     def read_accept(self, bs: int) -> AcceptOuts:
         return AcceptOuts(
@@ -837,18 +888,7 @@ class DsparkVerifyEpilogue:
         )
         if self.simulate_fold:
             # Before the TP broadcast in build_accept_outs: every rank commits rank 0's draw.
-            bonus = (
-                simulated_bonus_sample_graph(
-                    target_logits=logits,
-                    correct_len=self.simulated_correct_len.repeat(bs),
-                    temperatures=self.sim_temperatures_buf[:bs],
-                    seed=self.sim_seed_buf,
-                    bs=bs,
-                    rows_per_request=self.stride,
-                )
-                .to(bonus.dtype)
-                .view_as(bonus)
-            )
+            bonus = self._sim_bonus(logits, bs).to(bonus.dtype).view_as(bonus)
         accept = build_accept_outs(
             correct_len=correct_len,
             bonus=bonus,
