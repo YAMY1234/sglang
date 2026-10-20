@@ -1322,7 +1322,8 @@ class Envs:
     # The same router weight prefetch, forked before the post-attention norm on every MoE layer (read at capture).
     SGLANG_Q35MF_KRNC_ROUTER_PF_PRE = EnvBool(False)
     # GDN ReplaySSM compact commit without track rows: one persistent launch whose programs each walk one request's
-    # (layer, head, V block) tiles with pipelined loads; same per-tile math (read at capture).
+    # (layer, head, V block) tiles with pipelined loads; same per-tile math (read when the post-verify graph is
+    # captured, through the current A/B variant).
     SGLANG_Q35MF_KRNC_COMMIT_PERSIST = EnvBool(False)
     # In-graph shadow checks for the switches above: rows whose outputs differ in any byte, logged every 30 s.
     SGLANG_Q35MF_KRNC_PROOF = EnvBool(False)

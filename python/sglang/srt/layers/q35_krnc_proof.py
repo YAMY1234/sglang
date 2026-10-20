@@ -84,6 +84,16 @@ def active():
     return None
 
 
+def active_now():
+    """As active(), for graphs captured lazily while serving (the post-verify graph), where no variant env is
+    applied: the current A/B variant's override decides."""
+    from sglang.srt.model_executor.runner_backend import ab_variants
+
+    if _PROOF is not None and ab_variants.env("SGLANG_Q35MF_KRNC_PROOF", "0") == "1":
+        return _PROOF
+    return None
+
+
 def check_router(gate, hidden_states: torch.Tensor, logits: torch.Tensor) -> None:
     """Router kind; call only where the stock gate GEMM produced `logits` from `hidden_states`."""
     if _PROOF is None or not envs.SGLANG_Q35MF_KRNC_PROOF.get():

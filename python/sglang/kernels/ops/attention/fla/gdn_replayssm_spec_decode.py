@@ -1816,9 +1816,11 @@ def _finish_circular_fold(
 
 
 def _commit_persist_on() -> bool:
-    from sglang.srt.environ import envs
+    # The post-verify graph is captured lazily while serving, outside the A/B variant env, so read the current
+    # variant's override (the process env without the A/B harness).
+    from sglang.srt.model_executor.runner_backend import ab_variants
 
-    return envs.SGLANG_Q35MF_KRNC_COMMIT_PERSIST.get()
+    return ab_variants.env("SGLANG_Q35MF_KRNC_COMMIT_PERSIST", "0").lower() in ("1", "true")
 
 
 # Measured on GB300 (KRN-C commit T1): 2 programs per SM (234 registers), 4 pipeline stages, BV 64, 4 warps.
@@ -1889,7 +1891,7 @@ def _commit_shadow_begin(checkpoint_state, state_batch_indices):
     """SGLANG_Q35MF_KRNC_PROOF: copy three layers' rows before the persistent fold, for the stock fold to redo."""
     from sglang.srt.layers import q35_krnc_proof
 
-    proof = q35_krnc_proof.active()
+    proof = q35_krnc_proof.active_now()
     if proof is None:
         return None
     num_layers = checkpoint_state.shape[0]
