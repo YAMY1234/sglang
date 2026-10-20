@@ -941,8 +941,8 @@ def eagle_sample(
     sampling_info = batch.sampling_info
     next_token_logits = logits_output.next_token_logits
 
-    # Shard logits of the DEP verify exchange: batches its sampler cannot take pull their whole
-    # rows first (no collective), before anything below reads or writes the logits.
+    # Shard logits of the DEP verify exchange: the scheduler runs any batch its sampler cannot take
+    # without graphs (ll16_vp_verify.decode_batch_eligible), so reaching one here is a bug.
     vp = ll16_vp_verify.owner_of(next_token_logits)
     if vp is not None:
         reason = vp.ineligible_reason(
@@ -960,9 +960,9 @@ def eagle_sample(
             ),
         )
         if reason is not None:
-            next_token_logits = vp.pull_rows(rows=next_token_logits.shape[0])
-            logits_output.next_token_logits = next_token_logits
-            vp = None
+            raise RuntimeError(
+                f"LL16 VP verify exchange took a batch its sampler cannot sample ({reason})"
+            )
 
     sanitize_nan_logits(next_token_logits, "verify: target model logits")
 

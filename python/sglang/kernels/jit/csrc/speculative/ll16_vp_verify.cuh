@@ -1,11 +1,13 @@
 // Target-verify sampling on the vocab-parallel TP LM head under attention DP (SGLANG_Q35MF_LL16_VPSAMP).
-// Shard pass: every rank reduces its vocab shard of every gathered row to per-chunk (max, sum-exp) and the
-// argmax (torch.argmax rule) and sends that 48B payload to the row's owner, with e2x_dep_xchg's slot protocol
-// (marker words, two halves by a per-row epoch every rank flips per launch); the owner's CTA for the row waits
-// for every rank, copies the payloads to its local stats and re-arms the slots.
-// Decide pass (owner, one CTA per request): the chain acceptance and final draw of the one-rank chunked
-// sampler (sharded_verify_sampling.py) over the shard payloads; the draft tokens' logits and the drawn chunk
-// are read from the shards that hold them (symmetric memory).
+// Candidate push: every rank sends each of its verify rows' next draft token to every rank.
+// Shard pass: every rank reduces its vocab shard of every gathered row to per-chunk (max, sum-exp, argmax), the
+// logit of the row's next draft token, and one token drawn from the shard's residual (the shard's distribution
+// without that draft token), and sends them to the row's owner. Every word is self-validating against a marker
+// (e2x_dep_xchg's slot protocol: two halves by a per-row epoch every rank flips per launch), so no fence is needed
+// and the owner never reads another rank's logits.
+// Decide pass (owner, one CTA per request): the chain acceptance of the one-rank chunked sampler
+// (sharded_verify_sampling.py) over the payloads; the final draw picks a shard by residual mass in vocab order and
+// takes that shard's drawn token.
 
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
@@ -28,11 +30,14 @@ namespace ll16_vp {
 
 inline constexpr uint32_t kMarker = 0xffffffffu;
 inline constexpr uint32_t kNanKey = 0xffffffffu;
+// A shard with no residual mass draws nothing.
+inline constexpr uint32_t kNoToken = 0x7fffffffu;
 inline constexpr uint32_t kSpinLimit = 1u << 26;
 inline constexpr int kMaxWorld = 16;
 // Must match CHUNKS / WORDS / MAX_D / MAX_CHUNK in ll16_vp_verify.py.
 inline constexpr int kChunks = 4;
-inline constexpr int kWords = 16;  // per chunk: max, sum-exp, argmax id, argmax-is-NaN
+// Per (row, sender): kChunks words (max, sum-exp, argmax id, argmax-is-NaN), then (draft logit, drawn token, 0, 0).
+inline constexpr int kWords = (kChunks + 1) * 4;
 inline constexpr int kMaxD = 16;
 inline constexpr int kMaxChunk = 4096;
 
@@ -44,6 +49,10 @@ SGL_DEVICE uint32_t order_key(float f) {
 
 SGL_DEVICE bool better(uint32_t v, int32_t i, uint32_t bv, int32_t bi) {
   return v > bv || (v == bv && i < bi);
+}
+
+SGL_DEVICE bool valid(float f) {
+  return f == f && f != -INFINITY;
 }
 
 // (m, z) = (max, sum of exp(x - m)) over the finite or +inf logits seen so far; z == 0 means none.
@@ -66,8 +75,28 @@ SGL_DEVICE bool has_marker(const uint4& v) {
   return v.x == kMarker || v.y == kMarker || v.z == kMarker || v.w == kMarker;
 }
 
-SGL_DEVICE float bf16_bits_to_float(uint32_t bits16) {
-  return __uint_as_float(bits16 << 16);
+// Weight of logit f relative to a maximum m (1 at the maximum itself, so +inf maxima stay finite).
+SGL_DEVICE float rel_weight(float f, float m) {
+  return valid(f) ? (f == m ? 1.f : __expf(f - m)) : 0.f;
+}
+
+// Philox4x32-10 (Salmon et al., SC'11).
+SGL_DEVICE uint4 philox(uint4 ctr, uint2 key) {
+#pragma unroll
+  for (int i = 0; i < 10; ++i) {
+    const uint32_t hi0 = __umulhi(0xD2511F53u, ctr.x);
+    const uint32_t lo0 = 0xD2511F53u * ctr.x;
+    const uint32_t hi1 = __umulhi(0xCD9E8D57u, ctr.z);
+    const uint32_t lo1 = 0xCD9E8D57u * ctr.z;
+    ctr = make_uint4(hi1 ^ ctr.y ^ key.x, lo1, hi0 ^ ctr.w ^ key.y, lo0);
+    key.x += 0x9E3779B9u;
+    key.y += 0xBB67AE85u;
+  }
+  return ctr;
+}
+
+SGL_DEVICE void st_relaxed_sys_u32(uint32_t* ptr, uint32_t v) {
+  asm volatile("st.relaxed.sys.global.u32 [%0], %1;" ::"l"(ptr), "r"(v) : "memory");
 }
 
 // Phase stamps for the T1 harness (null trace = off).
@@ -79,20 +108,46 @@ SGL_DEVICE void stamp(uint64_t* trace, int64_t slot) {
   }
 }
 
-SGL_DEVICE float load_peer_bf16(const bf16_t* ptr) {
-  uint16_t raw;
-  asm volatile("ld.relaxed.sys.global.b16 %0, [%1];" : "=h"(raw) : "l"(ptr) : "memory");
-  return bf16_bits_to_float(raw);
-}
-
 }  // namespace ll16_vp
+
+struct Ll16VpCandParams {
+  const int64_t* input_ids;   // [rows], this rank's verify rows (d per request)
+  const uint64_t* peer_cand;  // [world] every rank's candidate words [2, g_max] (symmetric memory)
+  const uint32_t* epoch;      // [g_max]
+  uint64_t* rng;              // [2]: seed, launch counter
+  int32_t rank;
+  int32_t world;
+  int32_t rows;
+  int32_t d;
+  int32_t g_max;
+};
+
+/// \brief One CTA: row r's next draft token (input_ids[r + 1] inside its request, else none), plus 1, to every
+/// rank's candidate word of gathered row rank * rows + r; also advances the draw counter.
+template <int kThreads, bool kUsePDL>
+__global__ void __launch_bounds__(kThreads) ll16_vp_cand_kernel(const Ll16VpCandParams __grid_constant__ p) {
+  PDLWaitPrimary<kUsePDL>();
+  for (int r = static_cast<int>(threadIdx.x); r < p.rows; r += kThreads) {
+    const int64_t next = r % p.d < p.d - 1 ? p.input_ids[r + 1] : -1;
+    const uint32_t word = static_cast<uint32_t>(next + 1);
+    const int64_t g = static_cast<int64_t>(p.rank) * p.rows + r;
+    const int64_t at = static_cast<int64_t>(p.epoch[g] & 1u) * p.g_max + g;
+    for (int w = 0; w < p.world; ++w)
+      ll16_vp::st_relaxed_sys_u32(reinterpret_cast<uint32_t*>(p.peer_cand[w]) + at, word);
+  }
+  if (threadIdx.x == 0) p.rng[1] += 1;
+}
 
 struct Ll16VpShardParams {
   const bf16_t* logits;        // [g, ld], this rank's vocab shard of every gathered row (rank-major)
   uint32_t* slots;             // this rank's [2, g_max, world, kWords]
   const uint64_t* peer_slots;  // [world] every rank's slots (symmetric memory)
+  uint32_t* cand;              // this rank's candidate words [2, g_max]
   uint32_t* epoch;             // [g_max]
   uint32_t* counter;           // [g_max], zero between launches
+  float2* part;                // [g_max, kChunks] (max, sum-exp) of each chunk, for the row's last CTA
+  float* xd;                   // [g_max] the row's draft logit when this shard holds the token
+  const uint64_t* rng;         // [2]: seed, launch counter
   uint32_t* stats;             // [rows_max, world, kWords], this rank's rows
   int32_t* meta;               // [4]: [0] = rows per rank of the last exchange
   int64_t ld;
@@ -103,16 +158,151 @@ struct Ll16VpShardParams {
   int32_t world;
   int32_t rows;
   int32_t g_max;
-  // bit 0: release fence before the push (publishes the shard logits the owner reads later);
-  // bit 1: acquire fence after the owner has received every word.
-  int32_t fences;
+  // Release fence before each push (only the proof variant, whose check reads peers' logits).
+  int32_t fence;
   uint64_t* trace;  // [g_max, 8] globaltimer stamps or null
 };
 
+/// \brief The row's last CTA: one token from this shard's residual of row g (inverse CDF, chunk by chunk mass, then
+/// a scan of the chosen chunk), with a uniform from the draw counter. Returns kNoToken when nothing remains.
+template <int kThreads>
+SGL_DEVICE uint32_t draw_residual(const Ll16VpShardParams& p, const bf16_t* row, int g, int nd_local, float x_d) {
+  using namespace device;
+  using vec_t = AlignedVector<bf16_t, 8>;
+  constexpr int kWarps = kThreads / 32;
+  constexpr int kPer = ll16_vp::kMaxChunk / 8 / kThreads;
+  __shared__ int s_csel;
+  __shared__ float s_u;
+  __shared__ float s_mw;
+  __shared__ float s_wsum[kWarps];
+  __shared__ int s_wfirst[kWarps];
+  __shared__ int s_wlast[kWarps];
+  const int t = static_cast<int>(threadIdx.x);
+  const int lane = t % 32;
+  const int warp = t / 32;
+  if (t == 0) {
+    float mc[ll16_vp::kChunks];
+    float zc[ll16_vp::kChunks];
+    float m = -INFINITY;
+#pragma unroll
+    for (int c = 0; c < ll16_vp::kChunks; ++c) {
+      const float2 pc = __ldcg(p.part + static_cast<int64_t>(g) * ll16_vp::kChunks + c);
+      mc[c] = pc.x;
+      zc[c] = pc.y;
+      if (pc.y != 0.f) m = fmaxf(m, pc.x);
+    }
+    const int c_x = nd_local >= 0 ? nd_local / p.chunk : -1;
+    const float e_x = nd_local >= 0 ? ll16_vp::rel_weight(x_d, m) : 0.f;
+    float w[ll16_vp::kChunks];
+    float total = 0.f;
+#pragma unroll
+    for (int c = 0; c < ll16_vp::kChunks; ++c) {
+      float wc = zc[c] == 0.f ? 0.f : (mc[c] == m ? zc[c] : zc[c] * __expf(mc[c] - m));
+      if (c == c_x) wc = fmaxf(wc - e_x, 0.f);
+      w[c] = wc;
+      total += wc;
+    }
+    const uint4 r = ll16_vp::philox(
+        make_uint4(
+            static_cast<uint32_t>(g),
+            static_cast<uint32_t>(p.rank),
+            static_cast<uint32_t>(p.rng[1]),
+            static_cast<uint32_t>(p.rng[1] >> 32)),
+        make_uint2(static_cast<uint32_t>(p.rng[0]), static_cast<uint32_t>(p.rng[0] >> 32)));
+    const float u = static_cast<float>(r.x >> 8) * (1.f / 16777216.f) * total;
+    int csel = -1;
+    int clast = -1;
+    float cum = 0.f;
+    float u_in = 0.f;
+#pragma unroll
+    for (int c = 0; c < ll16_vp::kChunks; ++c) {
+      if (csel < 0 && w[c] > 0.f && cum + w[c] > u) {
+        csel = c;
+        u_in = u - cum;
+      }
+      cum += w[c];
+      if (w[c] > 0.f) clast = c;
+    }
+    if (csel < 0 && clast >= 0) {
+      csel = clast;
+      u_in = w[clast];
+    }
+    s_csel = csel;
+    s_u = u_in;
+    s_mw = m;
+  }
+  __syncthreads();
+  const int csel = s_csel;
+  if (csel < 0) return ll16_vp::kNoToken;
+  const float m = s_mw;
+  const float u_in = s_u;
+  const int lo8 = min(csel * p.chunk, p.vocab) / 8;
+  const int hi8 = min(csel * p.chunk + p.chunk, p.vocab) / 8;
+  // Thread t holds kPer consecutive vectors, so the scan below runs in vocab order.
+  vec_t x[kPer];
+#pragma unroll
+  for (int i = 0; i < kPer; ++i) {
+    const int v = lo8 + t * kPer + i;
+    if (v < hi8) x[i].load(row, v);
+  }
+  float wv[kPer * 8];
+  float tsum = 0.f;
+  int last_valid = -1;
+#pragma unroll
+  for (int i = 0; i < kPer; ++i) {
+    const int v = lo8 + t * kPer + i;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      const int idx = v * 8 + e;
+      const float we = (v < hi8 && idx != nd_local) ? ll16_vp::rel_weight(cast<fp32_t>(x[i][e]), m) : 0.f;
+      wv[i * 8 + e] = we;
+      tsum += we;
+      if (we > 0.f) last_valid = idx;
+    }
+  }
+  float incl = tsum;
+#pragma unroll
+  for (int off = 1; off < 32; off <<= 1) {
+    const float o = __shfl_up_sync(0xffffffffu, incl, off);
+    if (lane >= off) incl += o;
+  }
+  if (lane == 31) s_wsum[warp] = incl;
+  __syncthreads();
+  float running = incl - tsum;
+  for (int w = 0; w < warp; ++w)
+    running += s_wsum[w];
+  int first = 0x7fffffff;
+#pragma unroll
+  for (int i = 0; i < kPer * 8; ++i) {
+    running += wv[i];
+    if (first == 0x7fffffff && wv[i] > 0.f && running > u_in) first = (lo8 + t * kPer) * 8 + i;
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    first = min(first, __shfl_xor_sync(0xffffffffu, first, off));
+    last_valid = max(last_valid, __shfl_xor_sync(0xffffffffu, last_valid, off));
+  }
+  if (lane == 0) {
+    s_wfirst[warp] = first;
+    s_wlast[warp] = last_valid;
+  }
+  __syncthreads();
+  int f = 0x7fffffff;
+  int l = -1;
+#pragma unroll
+  for (int w = 0; w < kWarps; ++w) {
+    f = min(f, s_wfirst[w]);
+    l = max(l, s_wlast[w]);
+  }
+  const int pick = f != 0x7fffffff ? f : l;
+  return pick >= 0 ? static_cast<uint32_t>(p.vocab_start + pick) : ll16_vp::kNoToken;
+}
+
 /**
  * \brief Grid (kChunks, world * rows): CTA (c, g) reduces chunk c of gathered row g on this rank's shard and sends
- * its 16B word to rank g / rows. The row's last CTA (atomic counter) flips the row's epoch; on the owner it first
- * waits for every rank's words of row g and copies them to the local stats.
+ * its word to rank g / rows. The row's last CTA (atomic counter) draws the shard's residual token, sends the row
+ * word, re-arms the candidate word and flips the row's epoch; on the owner it first waits for every rank's words of
+ * row g and copies them to the local stats.
  */
 template <int kThreads, bool kUsePDL>
 __global__ void __launch_bounds__(kThreads) ll16_vp_shard_kernel(const Ll16VpShardParams __grid_constant__ p) {
@@ -125,6 +315,7 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_shard_kernel(const Ll16VpSha
   __shared__ float s_z[kWarps];
   __shared__ uint32_t s_k[kWarps];
   __shared__ int32_t s_i[kWarps];
+  __shared__ int s_nd;
   __shared__ bool s_last;
 
   PDLWaitPrimary<kUsePDL>();
@@ -148,6 +339,16 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_shard_kernel(const Ll16VpSha
     const int v = lo8 + t + i * kThreads;
     if (v < hi8) x[i].load(row, v);
   }
+  uint32_t* const cand = p.cand + static_cast<int64_t>(half) * p.g_max + g;
+  if (t == 0) {
+    uint32_t word;
+    uint32_t spins = 0;
+    do {
+      word = ptx::load_relaxed_sys(cand);
+      if (++spins == ll16_vp::kSpinLimit) __trap();
+    } while (word == ll16_vp::kMarker);
+    s_nd = static_cast<int>(static_cast<int64_t>(word) - 1 - p.vocab_start);
+  }
   // Two branch-free passes (max, then sum-exp). A thread visits its ids in increasing order, so a strictly
   // larger key keeps the lowest id among equal ones.
   uint32_t best = 0u;
@@ -164,7 +365,7 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_shard_kernel(const Ll16VpSha
       const bool take = key > best;
       best = take ? key : best;
       bidx = take ? v * 8 + e : bidx;
-      m = (f == f && f != -INFINITY) ? fmaxf(m, f) : m;
+      m = ll16_vp::valid(f) ? fmaxf(m, f) : m;
     }
   }
   float z = 0.f;
@@ -174,9 +375,7 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_shard_kernel(const Ll16VpSha
     if (v >= hi8) continue;
 #pragma unroll
     for (int e = 0; e < 8; ++e) {
-      const float f = cast<fp32_t>(x[i][e]);
-      const float w = f == m ? 1.f : __expf(f - m);
-      z += (f == f && f != -INFINITY) ? w : 0.f;
+      z += ll16_vp::rel_weight(cast<fp32_t>(x[i][e]), m);
     }
   }
 #pragma unroll
@@ -200,7 +399,9 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_shard_kernel(const Ll16VpSha
   __syncthreads();
   if (c == 0) ll16_vp::stamp(p.trace, g * 8 + 1);
 
+  const int nd_local = s_nd >= 0 && s_nd < p.vocab ? s_nd : -1;
   const int64_t row_words = (static_cast<int64_t>(half) * p.g_max + g) * p.world * ll16_vp::kWords;
+  uint32_t* const dst = owner_slots + row_words + p.rank * ll16_vp::kWords;
   if (t == 0) {
     float bm = s_m[0];
     float bz = s_z[0];
@@ -213,15 +414,19 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_shard_kernel(const Ll16VpSha
         i = s_i[w];
       }
     }
+    bm = bz == 0.f ? -INFINITY : bm;
+    p.part[static_cast<int64_t>(g) * ll16_vp::kChunks + c] = make_float2(bm, bz);
+    if (nd_local >= lo8 * 8 && nd_local < hi8 * 8) {
+      const float f = cast<fp32_t>(row[nd_local]);
+      p.xd[g] = f == f ? f : -INFINITY;
+    }
     const uint4 word = make_uint4(
-        __float_as_uint(bz == 0.f ? -INFINITY : bm),
+        __float_as_uint(bm),
         __float_as_uint(bz),
         static_cast<uint32_t>(p.vocab_start + i),
         k == ll16_vp::kNanKey ? 1u : 0u);
-    uint32_t* dst = owner_slots + row_words + (p.rank * ll16_vp::kChunks + c) * 4;
-    // The owner later reads this row's logits from our shard: publish them with the word.
-    if (p.fences & 1) ptx::fence_release_sys();
-    ptx::st_relaxed_16B(word, dst, 0);
+    if (p.fence) ptx::fence_release_sys();
+    ptx::st_relaxed_16B(word, dst, c);
     if (c == 0) ll16_vp::stamp(p.trace, g * 8 + 2);
     __threadfence();
     s_last = atomicAdd(p.counter + g, 1u) == static_cast<uint32_t>(ll16_vp::kChunks - 1);
@@ -230,6 +435,12 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_shard_kernel(const Ll16VpSha
   if (!s_last) return;
   __threadfence();
 
+  const float x_d = nd_local >= 0 ? __ldcg(p.xd + g) : -INFINITY;
+  const uint32_t token = draw_residual<kThreads>(p, row, g, nd_local, x_d);
+  if (t == 0) {
+    if (p.fence) ptx::fence_release_sys();
+    ptx::st_relaxed_16B(make_uint4(__float_as_uint(x_d), token, 0u, 0u), dst, ll16_vp::kChunks);
+  }
   if (owner == p.rank) {
     uint4* incoming = reinterpret_cast<uint4*>(p.slots + row_words);
     const int nvec = p.world * (ll16_vp::kWords / 4);
@@ -248,12 +459,11 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_shard_kernel(const Ll16VpSha
     }
     __syncthreads();
     ll16_vp::stamp(p.trace, g * 8 + 3);
-    if (t == 0) {
-      if (p.fences & 2) asm volatile("fence.acq_rel.sys;" ::: "memory");
-      if (j == 0) p.meta[0] = p.rows;
-    }
+    if (t == 0 && j == 0) p.meta[0] = p.rows;
   }
   if (t == 0) {
+    // Every CTA of the row read its candidate word before its count; the owner's next store is two launches away.
+    *cand = ll16_vp::kMarker;
     p.counter[g] = 0u;
     p.epoch[g] = half ^ 1u;
   }
@@ -262,8 +472,6 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_shard_kernel(const Ll16VpSha
 
 struct Ll16VpDecideParams {
   const uint32_t* stats;          // [rows_max, world, kWords]
-  const int32_t* meta;            // [0] = rows per rank of the exchange
-  const uint64_t* peer_logits;    // [world] every rank's shard logits (symmetric memory)
   const int64_t* candidates;      // [bs, d]
   const int64_t* retrieve_index;  // [bs, d]
   const float* coins;             // [bs, d]
@@ -272,10 +480,7 @@ struct Ll16VpDecideParams {
   int32_t* accept_index;          // [bs, accept_width]
   int32_t* num_correct;           // [bs]
   int64_t* argmax;                // [bs * d]
-  int64_t ld;
-  int32_t vocab;  // shard width
-  int32_t chunk;
-  int32_t rank;
+  int32_t vocab;                  // shard width
   int32_t world;
   int32_t d;
   int32_t accept_width;
@@ -284,69 +489,36 @@ struct Ll16VpDecideParams {
 };
 
 /**
- * \brief Grid (bs). Per request: the argmax of every row (ties to the lowest id, NaN first), and with `sample`
- * the chain acceptance with the stock coins at temperature 1 and the final draw from the residual of the last
- * accepted row, as sample_chain_full_vocab.
+ * \brief Grid (bs). Per request: the argmax of every row (ties to the lowest id, NaN first), and with `sample` the
+ * chain acceptance with the stock coins at temperature 1 and the final draw: a shard by residual mass of the last
+ * accepted row (vocab order, the stock final coin), then that shard's drawn token.
  */
 template <int kThreads, bool kUsePDL>
 __global__ void __launch_bounds__(kThreads) ll16_vp_decide_kernel(const Ll16VpDecideParams __grid_constant__ p) {
   using namespace device;
-  using vec_t = AlignedVector<bf16_t, 8>;
-  constexpr int kWarps = kThreads / 32;
-  constexpr int kMaxPer = ll16_vp::kMaxChunk / 8 / kThreads;
   // Every per-request input the serial chain reads is staged in shared memory first (one load latency).
   __shared__ float s_mw[ll16_vp::kMaxD][ll16_vp::kMaxWorld];
   __shared__ float s_sw[ll16_vp::kMaxD][ll16_vp::kMaxWorld];
-  __shared__ float s_cm[ll16_vp::kMaxD][ll16_vp::kMaxWorld][ll16_vp::kChunks];
-  __shared__ float s_cz[ll16_vp::kMaxD][ll16_vp::kMaxWorld][ll16_vp::kChunks];
+  __shared__ float s_xw[ll16_vp::kMaxD][ll16_vp::kMaxWorld];
+  __shared__ uint32_t s_tok[ll16_vp::kMaxD][ll16_vp::kMaxWorld];
   __shared__ uint32_t s_nan[ll16_vp::kMaxD][ll16_vp::kMaxWorld];
   __shared__ uint32_t s_id[ll16_vp::kMaxD][ll16_vp::kMaxWorld];
+  __shared__ float s_mass[ll16_vp::kMaxD][ll16_vp::kMaxWorld];
   __shared__ int64_t s_cand[ll16_vp::kMaxD];
   __shared__ int32_t s_ret[ll16_vp::kMaxD];
   __shared__ float s_coin[ll16_vp::kMaxD];
   __shared__ float s_coin_final;
   __shared__ float s_q[ll16_vp::kMaxD];
-  __shared__ float s_mass[ll16_vp::kMaxD][ll16_vp::kMaxWorld];
-  __shared__ float s_cmass[ll16_vp::kMaxD][ll16_vp::kMaxWorld][ll16_vp::kChunks];
   __shared__ float s_M[ll16_vp::kMaxD];
   __shared__ float s_S[ll16_vp::kMaxD];
-  __shared__ float s_xd[ll16_vp::kMaxD];
-  __shared__ int32_t s_sel;
-  __shared__ int32_t s_row;
-  __shared__ int32_t s_csel;
-  __shared__ float s_u2;
-  __shared__ int32_t s_excl_local;
-  __shared__ int32_t s_last_ret;
-  __shared__ float s_warp_sum[kWarps];
-  __shared__ int32_t s_warp_first[kWarps];
-  __shared__ int32_t s_warp_last[kWarps];
+  __shared__ int64_t s_arg[ll16_vp::kMaxD];
 
   PDLWaitPrimary<kUsePDL>();
 
   const int b = static_cast<int>(blockIdx.x);
   const int t = static_cast<int>(threadIdx.x);
-  const int warp = t / 32;
-  const int lane = static_cast<int>(get_lane_id());
   const int64_t row0 = static_cast<int64_t>(b) * p.d;
   ll16_vp::stamp(p.trace, b * 8 + 0);
-  const int rows_pad = p.meta[0];
-  // The last d - 1 threads (no payload pairs at d * world <= kThreads - d + 1) read the draft tokens' logits
-  // from their shards while the others combine the payloads.
-  const int xl = t - (kThreads - (p.d - 1));
-  if (p.sample && xl >= 0) {
-    // Row xl verifies draft token xl + 1.
-    const int64_t tok = p.candidates[row0 + xl + 1];
-    float xd = -INFINITY;
-    if (tok >= 0 && tok < static_cast<int64_t>(p.vocab) * p.world) {
-      const int w = static_cast<int>(tok / p.vocab);
-      const int64_t g = static_cast<int64_t>(p.rank) * rows_pad + row0 + xl;
-      const bf16_t* src =
-          reinterpret_cast<const bf16_t*>(p.peer_logits[w]) + g * p.ld + (tok - static_cast<int64_t>(w) * p.vocab);
-      xd = ll16_vp::load_peer_bf16(src);
-      if (xd != xd) xd = -INFINITY;
-    }
-    s_xd[xl] = xd;
-  }
   if (t < p.d) {
     s_cand[t] = p.candidates[row0 + t];
     s_ret[t] = static_cast<int32_t>(p.retrieve_index[row0 + t]);
@@ -357,9 +529,9 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_decide_kernel(const Ll16VpDe
     const int j = pair / p.world;
     const int w = pair % p.world;
     const uint4* pl = reinterpret_cast<const uint4*>(p.stats + ((row0 + j) * p.world + w) * ll16_vp::kWords);
-    uint4 cw[ll16_vp::kChunks];
+    uint4 cw[ll16_vp::kChunks + 1];
 #pragma unroll
-    for (int c = 0; c < ll16_vp::kChunks; ++c)
+    for (int c = 0; c <= ll16_vp::kChunks; ++c)
       cw[c] = pl[c];
     float m = -INFINITY;
     uint32_t bk = 0u;
@@ -368,8 +540,6 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_decide_kernel(const Ll16VpDe
 #pragma unroll
     for (int c = 0; c < ll16_vp::kChunks; ++c) {
       const float mc = __uint_as_float(cw[c].x);
-      s_cm[j][w][c] = mc;
-      s_cz[j][w][c] = __uint_as_float(cw[c].y);
       m = fmaxf(m, mc);
       // Chunks are in vocab order: a later chunk wins only with a strictly larger key.
       const uint32_t key = cw[c].w != 0u ? ll16_vp::kNanKey : ll16_vp::order_key(mc);
@@ -382,14 +552,16 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_decide_kernel(const Ll16VpDe
     float s = 0.f;
 #pragma unroll
     for (int c = 0; c < ll16_vp::kChunks; ++c) {
-      const float zc = s_cz[j][w][c];
-      const float mc = s_cm[j][w][c];
+      const float mc = __uint_as_float(cw[c].x);
+      const float zc = __uint_as_float(cw[c].y);
       if (zc != 0.f) s += mc == m ? zc : zc * __expf(mc - m);
     }
     s_mw[j][w] = m;
     s_sw[j][w] = s;
     s_id[j][w] = bid;
     s_nan[j][w] = bnan;
+    s_xw[j][w] = __uint_as_float(cw[ll16_vp::kChunks].x);
+    s_tok[j][w] = cw[ll16_vp::kChunks].y;
   }
   __syncthreads();
   if (t < p.d) {
@@ -412,30 +584,26 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_decide_kernel(const Ll16VpDe
     }
     s_M[t] = M;
     s_S[t] = S;
+    s_arg[t] = bid;
     p.argmax[row0 + t] = bid;
   }
   if (!p.sample) return;
   __syncthreads();
-  // Every probability the serial chain may need, in parallel: q of each draft token, and the shard and chunk
-  // masses of every row (the final row is known only after the chain).
+  // Every probability the serial chain may need, in parallel: q of each draft token (its logit comes from the one
+  // shard that holds it; the others send -inf), and the shard masses of every row.
   if (t < p.d - 1) {
     const float M = s_M[t];
-    const float xd = s_xd[t];
+    float xd = -INFINITY;
+    for (int w = 0; w < p.world; ++w)
+      xd = fmaxf(xd, s_xw[t][w]);
     s_q[t] = xd > -INFINITY ? __expf(xd - (M > -INFINITY ? M : 0.f)) / s_S[t] : 0.f;
   }
   for (int pair = t; pair < p.d * p.world; pair += kThreads) {
     const int r = pair / p.world;
     const int w = pair % p.world;
     const float M = s_M[r];
-    const float m_safe = M > -INFINITY ? M : 0.f;
-    const float S = s_S[r];
     const float mw = s_mw[r][w];
-    s_mass[r][w] = mw > -INFINITY ? s_sw[r][w] * __expf(mw - m_safe) / S : 0.f;
-#pragma unroll
-    for (int c = 0; c < ll16_vp::kChunks; ++c) {
-      const float mc = s_cm[r][w][c];
-      s_cmass[r][w][c] = mc > -INFINITY ? s_cz[r][w][c] * __expf(mc - m_safe) / S : 0.f;
-    }
+    s_mass[r][w] = mw > -INFINITY ? s_sw[r][w] * __expf(mw - (M > -INFINITY ? M : 0.f)) / s_S[r] : 0.f;
   }
   __syncthreads();
   ll16_vp::stamp(p.trace, b * 8 + 1);
@@ -470,7 +638,7 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_decide_kernel(const Ll16VpDe
     }
     p.num_correct[b] = accepted;
 
-    // Final draw from row cur_row minus the rejected draft's mass: shard, then chunk, in vocab order.
+    // Final draw from row cur_row minus the rejected draft's mass: a shard in vocab order, then its drawn token.
     const int r = cur_row;
     const int excl_owner = excl >= 0 ? static_cast<int>(excl / p.vocab) : -1;
     float total = 0.f;
@@ -482,155 +650,19 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_decide_kernel(const Ll16VpDe
     const float u = s_coin_final * total;
     float cum = 0.f;
     int sel = -1;
-    float u_sel = 0.f;
-    int last_pos = 0;
-    float last_mass = 0.f;
+    int last_pos = -1;
     for (int w = 0; w < p.world; ++w) {
       float mass = s_mass[r][w];
       if (w == excl_owner) mass = mass - q_excl;
       mass = fmaxf(mass, 0.f);
-      if (sel < 0 && cum + mass > u) {
-        sel = w;
-        u_sel = u - cum;
-      }
+      if (sel < 0 && mass > 0.f && cum + mass > u) sel = w;
       cum += mass;
-      if (mass > 0.f) {
-        last_pos = w;
-        last_mass = mass;
-      }
+      if (mass > 0.f) last_pos = w;
     }
-    if (sel < 0) {
-      u_sel = last_mass;
-      sel = last_pos;
-    }
-    const int64_t excl_local = excl - static_cast<int64_t>(sel) * p.vocab;
-    const bool excl_here = excl >= 0 && excl_local >= 0 && excl_local < p.vocab;
-    float cmass[ll16_vp::kChunks];
-    for (int c = 0; c < ll16_vp::kChunks; ++c) {
-      float mass = s_cmass[r][sel][c];
-      if (excl_here && c == static_cast<int>(excl_local / p.chunk)) mass = fmaxf(mass - q_excl, 0.f);
-      cmass[c] = mass;
-    }
-    const int nchunk = (p.vocab + p.chunk - 1) / p.chunk;
-    int c_sel = -1;
-    int c_last = -1;
-    float ccum = 0.f;
-    float before = 0.f;
-    for (int c = 0; c < ll16_vp::kChunks && c < nchunk; ++c) {
-      if (c_sel < 0 && ccum + cmass[c] > u_sel) {
-        c_sel = c;
-        before = ccum;
-      }
-      ccum += cmass[c];
-      if (cmass[c] > 0.f) c_last = c;
-    }
-    float u2;
-    if (c_sel >= 0) {
-      u2 = u_sel - before;
-    } else {
-      c_sel = c_last > 0 ? c_last : 0;
-      u2 = cmass[c_sel];
-    }
-    s_sel = sel;
-    s_row = r;
-    s_csel = c_sel;
-    s_u2 = u2;
-    s_excl_local = excl_here ? static_cast<int32_t>(excl_local) : -1;
-    s_last_ret = last_ret;
-  }
-  __syncthreads();
-  ll16_vp::stamp(p.trace, b * 8 + 2);
-
-  // The drawn chunk, read from its shard: inclusive scan of q in vocab order, first index past u2.
-  const int sel = s_sel;
-  const int r = s_row;
-  const float M = s_M[r];
-  const float m_safe = M > -INFINITY ? M : 0.f;
-  const float S = s_S[r];
-  const float u2 = s_u2;
-  const int excl_local = s_excl_local;
-  const int lo = s_csel * p.chunk;
-  const int hi = min(lo + p.chunk, p.vocab);
-  const int nvec = (hi - lo) / 8;
-  const int per = (nvec + kThreads - 1) / kThreads;
-  const int64_t g = static_cast<int64_t>(p.rank) * rows_pad + row0 + r;
-  const bf16_t* src = reinterpret_cast<const bf16_t*>(p.peer_logits[sel]) + g * p.ld + lo;
-  // Every remote vector load is issued before the first one is used (one round trip, not kMaxPer).
-  vec_t xs[kMaxPer];
-#pragma unroll
-  for (int i = 0; i < kMaxPer; ++i) {
-    const int v = t * per + i;
-    if (i < per && v < nvec) ptx::ld_relaxed_16B(xs[i], src, v);
-  }
-  float q[kMaxPer * 8];
-  float tsum = 0.f;
-  int last_valid = -1;
-#pragma unroll
-  for (int i = 0; i < kMaxPer; ++i) {
-    const int v = t * per + i;
-    if (i < per && v < nvec) {
-      const vec_t& x = xs[i];
-#pragma unroll
-      for (int e = 0; e < 8; ++e) {
-        const float f = cast<fp32_t>(x[e]);
-        const int idx = lo + v * 8 + e;
-        float qe = (f == f && f > -INFINITY) ? __expf(f - m_safe) / S : 0.f;
-        if (idx == excl_local) qe = 0.f;
-        q[i * 8 + e] = qe;
-        tsum += qe;
-        if (qe > 0.f) last_valid = idx;
-      }
-    } else {
-#pragma unroll
-      for (int e = 0; e < 8; ++e)
-        q[i * 8 + e] = 0.f;
-    }
-  }
-  ll16_vp::stamp(p.trace, b * 8 + 3);
-  // Exclusive scan of the per-thread sums (threads hold consecutive ranges).
-  float incl = tsum;
-#pragma unroll
-  for (int off = 1; off < 32; off <<= 1) {
-    const float o = __shfl_up_sync(0xffffffffu, incl, off);
-    if (lane >= off) incl += o;
-  }
-  if (lane == 31) s_warp_sum[warp] = incl;
-  __syncthreads();
-  float base = 0.f;
-  for (int w = 0; w < warp; ++w)
-    base += s_warp_sum[w];
-  float running = base + incl - tsum;
-  int first = 0x7fffffff;
-#pragma unroll
-  for (int i = 0; i < kMaxPer; ++i) {
-#pragma unroll
-    for (int e = 0; e < 8; ++e) {
-      const int v = t * per + i;
-      if (i < per && v < nvec) {
-        running += q[i * 8 + e];
-        if (first == 0x7fffffff && running > u2) first = lo + v * 8 + e;
-      }
-    }
-  }
-#pragma unroll
-  for (int off = 16; off > 0; off >>= 1) {
-    first = min(first, __shfl_xor_sync(0xffffffffu, first, off));
-    last_valid = max(last_valid, __shfl_xor_sync(0xffffffffu, last_valid, off));
-  }
-  if (lane == 0) {
-    s_warp_first[warp] = first;
-    s_warp_last[warp] = last_valid;
-  }
-  __syncthreads();
-  if (t == 0) {
-    int f = 0x7fffffff;
-    int l = -1;
-    for (int w = 0; w < kWarps; ++w) {
-      f = min(f, s_warp_first[w]);
-      l = max(l, s_warp_last[w]);
-    }
-    const int pick = f != 0x7fffffff ? f : (l >= 0 ? l : p.vocab - 1);
-    p.predict[s_last_ret] = static_cast<int32_t>(static_cast<int64_t>(sel) * p.vocab + pick);
+    if (sel < 0) sel = last_pos;
+    const uint32_t tok = sel >= 0 ? s_tok[r][sel] : ll16_vp::kNoToken;
+    // No residual mass anywhere (an all -inf row): the row's argmax keeps a valid id.
+    p.predict[last_ret] = tok != ll16_vp::kNoToken ? static_cast<int32_t>(tok) : static_cast<int32_t>(s_arg[r]);
     ll16_vp::stamp(p.trace, b * 8 + 4);
   }
 }
@@ -646,7 +678,8 @@ struct Ll16VpPullParams {
   int32_t rank;
 };
 
-/// \brief Grid (rows, world): this rank's row r of shard w into out[r, w * vocab : (w + 1) * vocab] as fp32.
+/// \brief Grid (rows, world): this rank's row r of shard w into out[r, w * vocab : (w + 1) * vocab] as fp32 (the
+/// proof's check only; its exchange runs with the release fence).
 template <int kThreads, bool kUsePDL>
 __global__ void __launch_bounds__(kThreads) ll16_vp_pull_kernel(const Ll16VpPullParams __grid_constant__ p) {
   using namespace device;
@@ -681,18 +714,60 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_pull_kernel(const Ll16VpPull
 
 template <bool kUsePDL>
 struct Ll16VpVerify {
+  static constexpr int kCandThreads = 128;
   static constexpr int kShardThreads = 256;
   static constexpr int kDecideThreads = 128;
   static constexpr int kPullThreads = 256;
-  static_assert(ll16_vp::kMaxChunk % (8 * kDecideThreads) == 0, "chunk vectors split evenly over the threads");
   static_assert(ll16_vp::kMaxChunk % (8 * kShardThreads) == 0, "chunk vectors split evenly over the threads");
+
+  static void cand(
+      const tvm::ffi::TensorView input_ids,
+      const tvm::ffi::TensorView peer_cand,
+      const tvm::ffi::TensorView epoch,
+      const tvm::ffi::TensorView rng,
+      int64_t rank,
+      int64_t d) {
+    using namespace host;
+    auto R = SymbolicSize{"rows"};
+    auto WS = SymbolicSize{"world"};
+    auto GM = SymbolicSize{"g_max"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    TensorMatcher({R}).with_dtype<int64_t>().with_device(device).verify(input_ids);
+    TensorMatcher({WS}).with_dtype<int64_t>().with_device(device).verify(peer_cand);
+    TensorMatcher({GM}).with_dtype<int32_t>().with_device(device).verify(epoch);
+    TensorMatcher({2}).with_dtype<int64_t>().with_device(device).verify(rng);
+    const int64_t rows = R.unwrap();
+    const int64_t world = WS.unwrap();
+    CHECK_HOST(world >= 1 && world <= ll16_vp::kMaxWorld) << "world " << world;
+    CHECK_HOST(rows >= 1 && rows * world <= GM.unwrap()) << "rows " << rows;
+    CHECK_HOST(d >= 1 && rows % d == 0) << "rows " << rows << " not a multiple of d " << d;
+    CHECK_HOST(rank >= 0 && rank < world) << "rank " << rank;
+    const auto params = Ll16VpCandParams{
+        .input_ids = static_cast<const int64_t*>(input_ids.data_ptr()),
+        .peer_cand = static_cast<const uint64_t*>(peer_cand.data_ptr()),
+        .epoch = static_cast<const uint32_t*>(epoch.data_ptr()),
+        .rng = static_cast<uint64_t*>(rng.data_ptr()),
+        .rank = static_cast<int32_t>(rank),
+        .world = static_cast<int32_t>(world),
+        .rows = static_cast<int32_t>(rows),
+        .d = static_cast<int32_t>(d),
+        .g_max = static_cast<int32_t>(GM.unwrap()),
+    };
+    LaunchKernel(dim3(1), kCandThreads, device.unwrap())
+        .enable_pdl(kUsePDL)(ll16_vp_cand_kernel<kCandThreads, kUsePDL>, params);
+  }
 
   static void shard(
       const tvm::ffi::TensorView logits,
       const tvm::ffi::TensorView slots,
       const tvm::ffi::TensorView peer_slots,
+      const tvm::ffi::TensorView cand,
       const tvm::ffi::TensorView epoch,
       const tvm::ffi::TensorView counter,
+      const tvm::ffi::TensorView part,
+      const tvm::ffi::TensorView xd,
+      const tvm::ffi::TensorView rng,
       const tvm::ffi::TensorView stats,
       const tvm::ffi::TensorView meta,
       const tvm::ffi::TensorView trace,
@@ -700,7 +775,7 @@ struct Ll16VpVerify {
       int64_t vocab_start,
       int64_t rank,
       int64_t rows,
-      int64_t fences) {
+      int64_t fence) {
     using namespace host;
     auto G = SymbolicSize{"gathered_rows"};
     auto V = SymbolicSize{"vocab_local"};
@@ -718,8 +793,12 @@ struct Ll16VpVerify {
         .ensure_alignment(16)
         .verify(slots);
     TensorMatcher({WS}).with_dtype<int64_t>().with_device(device).verify(peer_slots);
+    TensorMatcher({2, GM}).with_dtype<int32_t>().with_device(device).verify(cand);
     TensorMatcher({GM}).with_dtype<int32_t>().with_device(device).verify(epoch);
     TensorMatcher({GM}).with_dtype<int32_t>().with_device(device).verify(counter);
+    TensorMatcher({GM, ll16_vp::kChunks, 2}).with_dtype<fp32_t>().with_device(device).verify(part);
+    TensorMatcher({GM}).with_dtype<fp32_t>().with_device(device).verify(xd);
+    TensorMatcher({2}).with_dtype<int64_t>().with_device(device).verify(rng);
     TensorMatcher({RM, WS, ll16_vp::kWords})
         .with_dtype<int32_t>()
         .with_device(device)
@@ -739,8 +818,12 @@ struct Ll16VpVerify {
         .logits = static_cast<const bf16_t*>(logits.data_ptr()),
         .slots = static_cast<uint32_t*>(slots.data_ptr()),
         .peer_slots = static_cast<const uint64_t*>(peer_slots.data_ptr()),
+        .cand = static_cast<uint32_t*>(cand.data_ptr()),
         .epoch = static_cast<uint32_t*>(epoch.data_ptr()),
         .counter = static_cast<uint32_t*>(counter.data_ptr()),
+        .part = static_cast<float2*>(part.data_ptr()),
+        .xd = static_cast<float*>(xd.data_ptr()),
+        .rng = static_cast<const uint64_t*>(rng.data_ptr()),
         .stats = static_cast<uint32_t*>(stats.data_ptr()),
         .meta = static_cast<int32_t*>(meta.data_ptr()),
         .ld = LD.unwrap(),
@@ -751,7 +834,7 @@ struct Ll16VpVerify {
         .world = static_cast<int32_t>(world),
         .rows = static_cast<int32_t>(rows),
         .g_max = static_cast<int32_t>(GM.unwrap()),
-        .fences = static_cast<int32_t>(fences),
+        .fence = static_cast<int32_t>(fence != 0),
         .trace = trace.numel() >= g * 8 ? static_cast<uint64_t*>(trace.data_ptr()) : nullptr,
     };
     LaunchKernel(
@@ -761,8 +844,6 @@ struct Ll16VpVerify {
 
   static void decide(
       const tvm::ffi::TensorView stats,
-      const tvm::ffi::TensorView meta,
-      const tvm::ffi::TensorView peer_logits,
       const tvm::ffi::TensorView candidates,
       const tvm::ffi::TensorView retrieve_index,
       const tvm::ffi::TensorView coins,
@@ -772,10 +853,7 @@ struct Ll16VpVerify {
       const tvm::ffi::TensorView num_correct,
       const tvm::ffi::TensorView argmax,
       const tvm::ffi::TensorView trace,
-      int64_t ld,
       int64_t vocab,
-      int64_t chunk,
-      int64_t rank,
       int64_t sample) {
     using namespace host;
     auto RM = SymbolicSize{"rows_max"};
@@ -786,9 +864,11 @@ struct Ll16VpVerify {
     auto N = SymbolicSize{"rows"};
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
-    TensorMatcher({RM, WS, ll16_vp::kWords}).with_dtype<int32_t>().with_device(device).verify(stats);
-    TensorMatcher({4}).with_dtype<int32_t>().with_device(device).verify(meta);
-    TensorMatcher({WS}).with_dtype<int64_t>().with_device(device).verify(peer_logits);
+    TensorMatcher({RM, WS, ll16_vp::kWords})
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .ensure_alignment(16)
+        .verify(stats);
     TensorMatcher({B, D}).with_dtype<int64_t>().with_device(device).verify(candidates);
     TensorMatcher({B, D}).with_dtype<int64_t>().with_device(device).verify(retrieve_index);
     TensorMatcher({N}).with_dtype<int64_t>().with_device(device).verify(argmax);
@@ -799,8 +879,6 @@ struct Ll16VpVerify {
     CHECK_HOST(bs * d <= RM.unwrap()) << "more rows than stats";
     CHECK_HOST(d >= 1 && d <= ll16_vp::kMaxD) << "draft_token_num " << d;
     CHECK_HOST(world >= 1 && world <= ll16_vp::kMaxWorld) << "world " << world;
-    CHECK_HOST(chunk % 8 == 0 && chunk <= ll16_vp::kMaxChunk && chunk * ll16_vp::kChunks >= vocab) << "chunk " << chunk;
-    CHECK_HOST(vocab % 8 == 0 && ld % 8 == 0) << "logits rows must be 16-byte vectors";
     const float* coins_ptr = nullptr;
     const float* coins_final_ptr = nullptr;
     int32_t* predict_ptr = nullptr;
@@ -822,8 +900,6 @@ struct Ll16VpVerify {
     }
     const auto params = Ll16VpDecideParams{
         .stats = static_cast<const uint32_t*>(stats.data_ptr()),
-        .meta = static_cast<const int32_t*>(meta.data_ptr()),
-        .peer_logits = static_cast<const uint64_t*>(peer_logits.data_ptr()),
         .candidates = static_cast<const int64_t*>(candidates.data_ptr()),
         .retrieve_index = static_cast<const int64_t*>(retrieve_index.data_ptr()),
         .coins = coins_ptr,
@@ -832,10 +908,7 @@ struct Ll16VpVerify {
         .accept_index = accept_ptr,
         .num_correct = num_ptr,
         .argmax = static_cast<int64_t*>(argmax.data_ptr()),
-        .ld = ld,
         .vocab = static_cast<int32_t>(vocab),
-        .chunk = static_cast<int32_t>(chunk),
-        .rank = static_cast<int32_t>(rank),
         .world = static_cast<int32_t>(world),
         .d = static_cast<int32_t>(d),
         .accept_width = static_cast<int32_t>(accept_width),

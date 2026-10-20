@@ -340,6 +340,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             target_model.logits_processor.enable_ll16_vp(
                 lm_head=target_model.lm_head,
                 max_rows=decode_max_bs * self.speculative_num_draft_tokens,
+                draft_token_num=self.speculative_num_draft_tokens,
+                seed=torch.initial_seed(),
             )
 
     def init_attention_backends(self):

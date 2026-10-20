@@ -464,9 +464,6 @@ def verify_logits_on_shards(logits: torch.Tensor) -> bool:
 
 def gather_verify_logits(logits: torch.Tensor) -> torch.Tensor:
     """Undo the shard-local return of target-verify logits for the stock paths."""
-    vp = ll16_vp_verify.owner_of(logits)
-    if vp is not None:
-        return vp.pull_rows(rows=logits.shape[0])
     return _VERIFY_SHARD_SOURCE.gather_verify_logits(logits)
 
 
@@ -575,7 +572,14 @@ class LogitsProcessor(nn.Module):
         if self.k75p_draft_select is not None and envs.SGLANG_Q35MF_K75P_PROOF.get():
             self.k75p_proof = K75PProof()
 
-    def enable_ll16_vp(self, *, lm_head: VocabParallelEmbedding, max_rows: int) -> None:
+    def enable_ll16_vp(
+        self,
+        *,
+        lm_head: VocabParallelEmbedding,
+        max_rows: int,
+        draft_token_num: int,
+        seed: int,
+    ) -> None:
         parallel = get_parallel()
         if not (
             self.do_tensor_parallel_all_gather_dp_attn
@@ -603,6 +607,8 @@ class LogitsProcessor(nn.Module):
             max_rows=max_rows,
             vocab_local=lm_head.weight.shape[0],
             vocab_size=self.vocab_size,
+            draft_token_num=draft_token_num,
+            seed=seed,
         )
 
     def _ll16_vp_rows(
@@ -612,12 +618,14 @@ class LogitsProcessor(nn.Module):
         lm_head: VocabParallelEmbedding,
         logits_metadata: LogitsMetadata,
         embedding_bias: Optional[torch.Tensor],
+        verify_input_ids: Optional[torch.Tensor],
     ) -> int:
         """Rows per rank when this target verify takes the shard exchange, else 0; the switch is read
         at capture. Only captured verify graphs take it: every rank replays the same graph (idle ranks
         too), while an eager idle rank sees IDLE here and would pick the all-to-all."""
         if (
             self.ll16_vp is None
+            or verify_input_ids is None
             or not envs.SGLANG_Q35MF_LL16_VPSAMP.get()
             or not torch.cuda.is_current_stream_capturing()
             or not logits_metadata.forward_mode.is_target_verify()
@@ -630,7 +638,10 @@ class LogitsProcessor(nn.Module):
         ):
             return 0
         rows = local_hidden_states.shape[0]
-        return rows if self.ll16_vp.fits(hidden_states=hidden_states, rows=rows) else 0
+        fits = self.ll16_vp.fits(
+            hidden_states=hidden_states, input_ids=verify_input_ids, rows=rows
+        )
+        return rows if fits else 0
 
     def forward(
         self,
@@ -728,7 +739,16 @@ class LogitsProcessor(nn.Module):
                     mm_input_embeds=logits_metadata.mm_input_embeds,
                 )
             # Compute logits for both input and sampled tokens.
-            logits = self._get_logits(pruned_states, lm_head, logits_metadata)
+            logits = self._get_logits(
+                pruned_states,
+                lm_head,
+                logits_metadata,
+                verify_input_ids=(
+                    input_ids
+                    if logits_metadata.forward_mode.is_target_verify()
+                    else None
+                ),
+            )
             sampled_logits = (
                 logits[sample_indices] if sample_indices is not None else logits
             )
@@ -1068,6 +1088,7 @@ class LogitsProcessor(nn.Module):
         logits_metadata: LogitsMetadata,
         embedding_bias: Optional[torch.Tensor] = None,
         use_logits_buffer: bool = True,
+        verify_input_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Get logits from hidden_states.
 
@@ -1102,8 +1123,15 @@ class LogitsProcessor(nn.Module):
             else LoRABatchLayout.DP_LOCAL
         )
         vp_rows = self._ll16_vp_rows(
-            hidden_states, local_hidden_states, lm_head, logits_metadata, embedding_bias
+            hidden_states,
+            local_hidden_states,
+            lm_head,
+            logits_metadata,
+            embedding_bias,
+            verify_input_ids,
         )
+        if vp_rows:
+            self.ll16_vp.push_candidates(input_ids=verify_input_ids)
         with get_forward().scoped(lora_batch_layout=lora_batch_layout):
             if vp_rows:
                 logits = self.ll16_vp.lm_head(

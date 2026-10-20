@@ -1,11 +1,14 @@
 """Target-verify sampling on the vocab-parallel TP LM head under attention DP (SGLANG_Q35MF_LL16_VPSAMP).
 
-The verify LM head writes every gathered row's logits on this rank's vocab shard into symmetric memory. One
-launch reduces each row to per-chunk (max, sum-exp) and the argmax and sends that payload to the row's owner,
-so no logits all-to-all runs. The owner samples its requests from the payloads (temperature 1, no top-k /
-top-p / min-p), reading the draft tokens' logits and the drawn chunk from the shards that hold them; any
-other batch pulls its whole rows from the shards (no collective) and takes the stock path. The argmax equals
-torch.argmax over the full row; sampled chains follow the distribution of sample_chain_full_vocab.
+In a captured verify graph, every rank first sends its rows' next draft tokens to every rank, the LM head writes
+every gathered row's logits on this rank's vocab shard, and one launch reduces each row to per-chunk
+(max, sum-exp, argmax), the draft token's logit and one token drawn from the shard's residual, sent to the row's
+owner. No logits all-to-all runs, no rank reads another rank's logits, and every exchanged word validates itself,
+so no system fence is needed. The owner samples its requests from the payloads (temperature 1, no top-k / top-p /
+min-p, or greedy): the stock chain acceptance with the stock coins, then a shard by residual mass and that shard's
+token. The argmax equals torch.argmax over the full row; sampled chains follow the distribution of
+sample_chain_full_vocab. A batch that cannot take this path makes the scheduler run that round without graphs
+(see decode_batch_eligible), so captured rounds never need the full rows.
 """
 
 from __future__ import annotations
@@ -18,9 +21,11 @@ from typing import Optional, Tuple
 import torch
 
 from sglang.kernels.ops.speculative.ll16_vp_verify import (
+    CHUNKS,
     MAX_D,
     SLOT_MARKER,
     WORDS,
+    vp_cand,
     vp_decide,
     vp_pull,
     vp_shard,
@@ -41,8 +46,39 @@ def owner_of(logits: Optional[torch.Tensor]) -> Optional[VpVerify]:
     return _STATE
 
 
+def built() -> bool:
+    return _STATE is not None
+
+
 def all_temperature_one(reqs) -> bool:
     return all(req.sampling_params.temperature == 1.0 for req in reqs)
+
+
+def decode_batch_eligible(batch) -> bool:
+    """Whether this decode batch's verify can take the shard exchange; the scheduler's decode graph vote is
+    False otherwise, so every captured round is eligible. Same conditions as VpVerify.ineligible_reason."""
+    info = batch.sampling_info
+    if (
+        batch.return_logprob
+        or batch.has_grammar
+        or envs.SGLANG_SANITIZE_NAN_LOGITS.get()
+        or info.logit_bias is not None
+        or info.has_custom_logit_processor
+        or info.has_watermark_candidates
+        or (
+            info.penalizer_orchestrator is not None
+            and info.penalizer_orchestrator.is_required
+        )
+    ):
+        return False
+    if info.is_all_greedy:
+        return True
+    return (
+        not info.need_top_k_sampling
+        and not info.need_top_p_sampling
+        and not info.need_min_p_sampling
+        and all_temperature_one(batch.reqs)
+    )
 
 
 class VpVerify:
@@ -55,6 +91,8 @@ class VpVerify:
         max_rows: int,
         vocab_local: int,
         vocab_size: int,
+        draft_token_num: int,
+        seed: int,
     ):
         import torch.distributed._symmetric_memory as symm_mem
 
@@ -65,6 +103,7 @@ class VpVerify:
         self.max_rows = max_rows
         self.vocab_local = vocab_local
         self.vocab_size = vocab_size
+        self.draft_token_num = draft_token_num
         g_max = world * max_rows
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
         with torch.inference_mode(False), torch.no_grad():
@@ -74,22 +113,35 @@ class VpVerify:
             self.slots = symm_mem.empty(
                 vp_slots_shape(g_max, world), dtype=torch.int32, device=device
             )
-        # Every slot word holds the marker before any peer can see the buffer (rendezvous is collective).
+            self.cand = symm_mem.empty((2, g_max), dtype=torch.int32, device=device)
+        # Every exchanged word holds the marker before any peer can see the buffer (rendezvous is collective).
         self.slots.fill_(SLOT_MARKER)
+        self.cand.fill_(SLOT_MARKER)
         torch.cuda.synchronize()
-        logits_hdl = symm_mem.rendezvous(self.logits, group=device_group)
-        slots_hdl = symm_mem.rendezvous(self.slots, group=device_group)
-        for hdl, buf in ((logits_hdl, self.logits), (slots_hdl, self.slots)):
+        ptrs = {}
+        for name, buf in (
+            ("logits", self.logits),
+            ("slots", self.slots),
+            ("cand", self.cand),
+        ):
+            hdl = symm_mem.rendezvous(buf, group=device_group)
             if hdl.rank != rank or int(hdl.buffer_ptrs[rank]) != buf.data_ptr():
                 raise RuntimeError("LL16 VP: unexpected symmetric memory layout")
-        self.peer_logits = torch.tensor(
-            [int(p) for p in logits_hdl.buffer_ptrs], dtype=torch.int64, device=device
-        )
-        self.peer_slots = torch.tensor(
-            [int(p) for p in slots_hdl.buffer_ptrs], dtype=torch.int64, device=device
-        )
+            ptrs[name] = torch.tensor(
+                [int(p) for p in hdl.buffer_ptrs], dtype=torch.int64, device=device
+            )
+        # Peers' logits are read only by the proof's check.
+        self.peer_logits = ptrs["logits"]
+        self.peer_slots = ptrs["slots"]
+        self.peer_cand = ptrs["cand"]
         self.epoch = torch.zeros(g_max, dtype=torch.int32, device=device)
         self.counter = torch.zeros(g_max, dtype=torch.int32, device=device)
+        self.part = torch.zeros((g_max, CHUNKS, 2), dtype=torch.float32, device=device)
+        self.xd = torch.zeros(g_max, dtype=torch.float32, device=device)
+        # [seed, draw counter]: the counter advances once per verify round.
+        self.rng = torch.tensor(
+            [seed & ((1 << 63) - 1), 0], dtype=torch.int64, device=device
+        )
         self.stats = torch.zeros(
             (max_rows, world, WORDS), dtype=torch.int32, device=device
         )
@@ -114,12 +166,28 @@ class VpVerify:
             and self._begin <= logits.data_ptr() < self._end
         )
 
-    def fits(self, *, hidden_states: torch.Tensor, rows: int) -> bool:
+    def fits(
+        self, *, hidden_states: torch.Tensor, input_ids: torch.Tensor, rows: int
+    ) -> bool:
         return (
             0 < rows <= self.max_rows
+            and rows % self.draft_token_num == 0
             and hidden_states.shape[0] == rows * self.world
             and hidden_states.dtype == torch.bfloat16
             and hidden_states.is_contiguous()
+            and input_ids.shape[0] == rows
+            and input_ids.dtype == torch.int64
+        )
+
+    def push_candidates(self, *, input_ids: torch.Tensor) -> None:
+        """Send this rank's verify rows' next draft tokens to every rank (before the LM head GEMM)."""
+        vp_cand(
+            input_ids=input_ids,
+            peer_cand=self.peer_cand,
+            epoch=self.epoch,
+            rng=self.rng,
+            rank=self.rank,
+            d=self.draft_token_num,
         )
 
     def lm_head(
@@ -133,17 +201,22 @@ class VpVerify:
         """Send every gathered row's payload to its owner; returns this rank's rows of the shard
         logits, the handle the verify sampler recognizes."""
         vp_shard(
-            logits,
-            self.slots,
-            self.peer_slots,
-            self.epoch,
-            self.counter,
-            self.stats,
-            self.meta,
-            self.rank * self.vocab_local,
-            self.rank,
-            rows,
-            fences=envs.SGLANG_Q35MF_LL16_VPSAMP_FENCES.get(),
+            logits=logits,
+            slots=self.slots,
+            peer_slots=self.peer_slots,
+            cand=self.cand,
+            epoch=self.epoch,
+            counter=self.counter,
+            part=self.part,
+            xd=self.xd,
+            rng=self.rng,
+            stats=self.stats,
+            meta=self.meta,
+            vocab_start=self.rank * self.vocab_local,
+            rank=self.rank,
+            rows=rows,
+            # The proof's check reads peers' logits, so its graphs publish them first.
+            fence=self.proof is not None and envs.SGLANG_Q35MF_LL16_VPSAMP_PROOF.get(),
         )
         if not self._logged:
             self._logged = True
@@ -173,9 +246,9 @@ class VpVerify:
         if (
             verify_input.tree_topk != 1
             or use_rejection_sampling
-            or verify_input.draft_token_num > MAX_D
+            or verify_input.draft_token_num != self.draft_token_num
         ):
-            return "not a topk-1 chain"
+            return "not the topk-1 chain the exchange was built for"
         spec = get_spec()
         if (
             spec.speculative_accept_threshold_single != 1.0
@@ -231,8 +304,6 @@ class VpVerify:
         no_coins = torch.empty((0,), dtype=torch.float32, device=candidates.device)
         vp_decide(
             stats=self.stats,
-            meta=self.meta,
-            peer_logits=self.peer_logits,
             candidates=candidates,
             retrieve_index=retrieve_index,
             coins=coins[0] if sample else no_coins,
@@ -241,9 +312,7 @@ class VpVerify:
             accept_index=accept_index,
             num_correct_drafts=num_correct_drafts,
             argmax=argmax,
-            ld=self.vocab_local,
             vocab_local=self.vocab_local,
-            rank=self.rank,
             sample=sample,
         )
         if self.proof is not None and envs.SGLANG_Q35MF_LL16_VPSAMP_PROOF.get():
@@ -252,7 +321,6 @@ class VpVerify:
                 argmax=argmax,
                 candidates=candidates,
                 retrieve_index=retrieve_index,
-                predict=predict,
                 accept_index=accept_index,
                 num_correct_drafts=num_correct_drafts,
                 coins=coins,
@@ -260,7 +328,8 @@ class VpVerify:
         return argmax.view(bs, d)
 
     def pull_rows(self, *, rows: int) -> torch.Tensor:
-        """This rank's first ``rows`` verify rows over the whole vocab, float32 [rows, vocab_size]."""
+        """This rank's first ``rows`` verify rows over the whole vocab, float32 [rows, vocab_size]: the proof's
+        check, after an exchange that ran with the release fence."""
         out = torch.empty(
             (rows, self.vocab_size), dtype=torch.float32, device=self.logits.device
         )
@@ -283,8 +352,12 @@ def create(
     max_rows: int,
     vocab_local: int,
     vocab_size: int,
+    draft_token_num: int,
+    seed: int,
 ) -> VpVerify:
     global _STATE
+    if draft_token_num > MAX_D:
+        raise ValueError(f"LL16 VP: {draft_token_num} draft tokens, at most {MAX_D}")
     _STATE = VpVerify(
         device_group=device_group,
         rank=rank,
@@ -292,6 +365,8 @@ def create(
         max_rows=max_rows,
         vocab_local=vocab_local,
         vocab_size=vocab_size,
+        draft_token_num=draft_token_num,
+        seed=seed,
     )
     logger.info(
         "LL16 VP verify buffers built (world=%d, rows/rank <= %d, vocab shard=%d).",
@@ -303,20 +378,13 @@ def create(
 
 
 class VpProof:
-    """Every sampled round, pull the full rows and compare against torch.argmax and the one-rank chunked
-    sampler with the same coins, eager or in CUDA graphs. Counters live on the device and are mirrored into
-    pinned host memory by a copy that is part of the check, so the reporter thread makes no CUDA call."""
+    """Every sampled round, pull the full rows and compare against torch.argmax and, with the same coins, the
+    accepted counts of the one-rank chunked sampler (the final token is drawn independently, so it is compared in
+    distribution only, by the T1). Counters live on the device and are mirrored into pinned host memory by a copy
+    that is part of the check, so the reporter thread makes no CUDA call."""
 
     PERIOD_S = 30.0
-    # [calls, rows, argmax mismatches, sampled requests, accept-count mismatches, predict-row mismatches]
-    FIELDS = (
-        "calls",
-        "rows",
-        "argmax_mismatch",
-        "requests",
-        "accept_mismatch",
-        "predict_mismatch",
-    )
+    FIELDS = ("calls", "rows", "argmax_mismatch", "requests", "accept_mismatch")
 
     def __init__(self):
         self.counters = torch.zeros(
@@ -335,7 +403,6 @@ class VpProof:
         argmax: torch.Tensor,
         candidates: torch.Tensor,
         retrieve_index: torch.Tensor,
-        predict: torch.Tensor,
         accept_index: torch.Tensor,
         num_correct_drafts: torch.Tensor,
         coins: Optional[Tuple[torch.Tensor, torch.Tensor]],
@@ -350,7 +417,7 @@ class VpProof:
         self.counters[1].add_(bs * d)
         self.counters[2].add_(torch.count_nonzero(torch.argmax(full, dim=-1) != argmax))
         if coins is not None:
-            ref_predict = torch.zeros_like(predict)
+            ref_predict = torch.zeros((bs * d,), dtype=torch.int32, device=full.device)
             ref_accept = torch.full_like(accept_index, -1)
             ref_num = torch.empty_like(num_correct_drafts)
             sample_chain_full_vocab(
@@ -367,9 +434,6 @@ class VpProof:
             )
             self.counters[3].add_(bs)
             self.counters[4].add_(torch.count_nonzero(ref_num != num_correct_drafts))
-            self.counters[5].add_(
-                torch.count_nonzero((ref_predict != predict).view(bs, d).any(dim=1))
-            )
         self.host_counters.copy_(self.counters, non_blocking=True)
 
     def _report(self) -> None:

@@ -14,12 +14,13 @@ from sglang.kernels.jit.utils import (
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-# Must match ll16_vp::kChunks / kWords / kMaxD / kMaxChunk / kMarker in ll16_vp_verify.cuh.
+# Must match ll16_vp::kChunks / kWords / kMaxD / kMaxChunk / kMarker / kNoToken in ll16_vp_verify.cuh.
 CHUNKS = 4
-WORDS = 16
+WORDS = (CHUNKS + 1) * 4
 MAX_D = 16
 MAX_CHUNK = 4096
 SLOT_MARKER = -1
+NO_TOKEN = 0x7FFFFFFF
 
 
 @cache_once
@@ -30,6 +31,7 @@ def _module() -> Module:
         *args,
         cuda_files=["speculative/ll16_vp_verify.cuh"],
         cuda_wrappers=[
+            ("cand", f"Ll16VpVerify<{args}>::cand"),
             ("shard", f"Ll16VpVerify<{args}>::shard"),
             ("decide", f"Ll16VpVerify<{args}>::decide"),
             ("pull", f"Ll16VpVerify<{args}>::pull"),
@@ -52,29 +54,52 @@ def vp_slots_shape(max_gathered_rows: int, world: int) -> tuple:
     return (2, max_gathered_rows, world, WORDS)
 
 
+def vp_cand(
+    *,
+    input_ids: torch.Tensor,
+    peer_cand: torch.Tensor,
+    epoch: torch.Tensor,
+    rng: torch.Tensor,
+    rank: int,
+    d: int,
+) -> None:
+    """Send each of this rank's verify rows' next draft token (``input_ids`` [rows], d per request) to every
+    rank's candidate words, and advance the draw counter ``rng`` [seed, counter]."""
+    _module().cand(input_ids, peer_cand, epoch, rng, rank, d)
+
+
 def vp_shard(
+    *,
     logits: torch.Tensor,
     slots: torch.Tensor,
     peer_slots: torch.Tensor,
+    cand: torch.Tensor,
     epoch: torch.Tensor,
     counter: torch.Tensor,
+    part: torch.Tensor,
+    xd: torch.Tensor,
+    rng: torch.Tensor,
     stats: torch.Tensor,
     meta: torch.Tensor,
     vocab_start: int,
     rank: int,
     rows: int,
-    fences: int = 3,
+    fence: bool,
     trace: Optional[torch.Tensor] = None,
 ) -> None:
-    """Reduce this rank's shard ``logits`` [world * rows, V_local] of every gathered row (rank-major)
-    and exchange the payloads; this rank's rows land in ``stats`` [rows, world, WORDS]. ``trace``
-    (int64 [rows * world, 8], T1 only) gets globaltimer phase stamps."""
+    """Reduce this rank's shard ``logits`` [world * rows, V_local] of every gathered row (rank-major), draw one
+    token per row from the shard's residual and exchange the payloads; this rank's rows land in ``stats``
+    [rows, world, WORDS]. ``trace`` (int64 [rows * world, 8], T1 only) gets globaltimer phase stamps."""
     _module().shard(
         logits,
         slots,
         peer_slots,
+        cand,
         epoch,
         counter,
+        part,
+        xd,
+        rng,
         stats,
         meta,
         _no_trace(logits) if trace is None else trace,
@@ -82,15 +107,13 @@ def vp_shard(
         vocab_start,
         rank,
         rows,
-        fences,
+        int(fence),
     )
 
 
 def vp_decide(
     *,
     stats: torch.Tensor,
-    meta: torch.Tensor,
-    peer_logits: torch.Tensor,
     candidates: torch.Tensor,
     retrieve_index: torch.Tensor,
     coins: torch.Tensor,
@@ -99,18 +122,14 @@ def vp_decide(
     accept_index: torch.Tensor,
     num_correct_drafts: torch.Tensor,
     argmax: torch.Tensor,
-    ld: int,
     vocab_local: int,
-    rank: int,
     sample: bool,
     trace: Optional[torch.Tensor] = None,
 ) -> None:
     """Argmax of every row into ``argmax`` [bs * d]; with ``sample``, the temperature-1 chain into
-    ``predict`` / ``accept_index`` / ``num_correct_drafts`` as sample_chain_full_vocab."""
+    ``predict`` / ``accept_index`` / ``num_correct_drafts``."""
     _module().decide(
         stats,
-        meta,
-        peer_logits,
         candidates,
         retrieve_index,
         coins,
@@ -120,10 +139,7 @@ def vp_decide(
         num_correct_drafts,
         argmax,
         _no_trace(argmax) if trace is None else trace,
-        ld,
         vocab_local,
-        vp_chunk(vocab_local),
-        rank,
         int(sample),
     )
 

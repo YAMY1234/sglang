@@ -372,6 +372,16 @@ def _local_decode_cuda_graph_vote(
     """This rank's vote for the decode graph (min-reduced across dp ranks)."""
     if disable_cuda_graph:
         return False
+    from sglang.srt.layers import ll16_vp_verify
+
+    if (
+        local_batch is not None
+        and local_batch.forward_mode.is_decode()
+        and ll16_vp_verify.built()
+        and not ll16_vp_verify.decode_batch_eligible(local_batch)
+    ):
+        # Captured verify graphs may sample on vocab shards, which this batch's sampling cannot use.
+        return False
     return (
         local_batch is None
         or local_batch.forward_mode.is_decode_or_idle()
