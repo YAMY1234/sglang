@@ -181,6 +181,7 @@ def gdn_replayssm_conv_fused_kernel(
     DOT_PRECISION: tl.constexpr,
     USE_GDC: tl.constexpr = False,
     PREFETCH: tl.constexpr = True,
+    REDUNDANT_QK: tl.constexpr = True,
 ):
     i_v = tl.program_id(0)
     i_n = tl.program_id(1)
@@ -335,10 +336,17 @@ def gdn_replayssm_conv_fused_kernel(
     G_s = tl.cumsum(g_s, axis=0)
     expG_s = tl.exp(G_s)
 
-    _conv_rows(scr + tl.arange(0, K), SCR_W, sq0, sq1, sq2, wq0, wq1, wq2, wq3,
-               xq0, xq1, xq2, xq3, xq4, xq5, xq6)
-    _conv_rows(scr + K + tl.arange(0, K), SCR_W, sk0, sk1, sk2, wk0, wk1, wk2, wk3,
-               xk0, xk1, xk2, xk3, xk4, xk5, xk6)
+    if REDUNDANT_QK:
+        _conv_rows(scr + tl.arange(0, K), SCR_W, sq0, sq1, sq2, wq0, wq1, wq2, wq3,
+                   xq0, xq1, xq2, xq3, xq4, xq5, xq6)
+        _conv_rows(scr + K + tl.arange(0, K), SCR_W, sk0, sk1, sk2, wk0, wk1, wk2, wk3,
+                   xk0, xk1, xk2, xk3, xk4, xk5, xk6)
+    elif write_k:
+        # Timing-only diagnostic: one program per key head convolves q / k (other programs read garbage).
+        _conv_rows(scr + tl.arange(0, K), SCR_W, sq0, sq1, sq2, wq0, wq1, wq2, wq3,
+                   xq0, xq1, xq2, xq3, xq4, xq5, xq6)
+        _conv_rows(scr + K + tl.arange(0, K), SCR_W, sk0, sk1, sk2, wk0, wk1, wk2, wk3,
+                   xk0, xk1, xk2, xk3, xk4, xk5, xk6)
     _conv_rows(scr + 2 * K + tl.arange(0, BV), SCR_W, sv0, sv1, sv2, wv0, wv1, wv2, wv3,
                xv0, xv1, xv2, xv3, xv4, xv5, xv6)
     _window_rows(win_row + ch_v * stride_win_dim, sv1, sv2, xv0, xv1, xv2, xv3, xv4, xv5, xv6)
@@ -606,6 +614,7 @@ def gdn_replayssm_conv_fused_verify(
     maxnreg: int | None = None,
     prefetch: bool = True,
     scratch: torch.Tensor | None = None,
+    redundant_qk: bool = True,
 ) -> torch.Tensor:
     num_slots, HV, V, K = checkpoint_state.shape
     H = k_cache.shape[1]
@@ -721,6 +730,7 @@ def gdn_replayssm_conv_fused_verify(
         NULL_BLOCK_ID=null_block_id,
         DOT_PRECISION=dot_precision,
         PREFETCH=prefetch,
+        REDUNDANT_QK=redundant_qk,
         num_warps=num_warps,
         num_stages=num_stages,
         **options,
