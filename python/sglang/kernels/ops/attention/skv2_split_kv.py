@@ -100,7 +100,7 @@ def load_values(
 
 
 class StockSplitDecode:
-    def __init__(self, heads=4, qlen=7, splits=148, stages=2, slots=2, pdl=False, prefetch=True):
+    def __init__(self, heads=4, qlen=7, splits=148, stages=2, slots=2, pdl=False, prefetch=True, trigger=False):
         assert stages >= 1 and slots in (2, 3, 4)
         self.heads, self.qlen, self.splits, self.stages, self.slots = (
             heads,
@@ -111,7 +111,9 @@ class StockSplitDecode:
         )
         # pdl: launched as a programmatic dependent; CTAs that land while the predecessor runs set up and (prefetch)
         # load their first K / V tiles that hold no token written by this step, then wait for the predecessor.
-        self.pdl, self.prefetch = pdl, prefetch
+        # trigger: release the dependent (merge) after the wait; without it the merge launches at this grid's exit,
+        # which measured faster (an early-resident merge returns from its wait later than a fresh launch starts).
+        self.pdl, self.prefetch, self.trigger = pdl, prefetch, trigger
         self.rows = heads * qlen
         self.width = 32 if self.rows <= 32 else 64
         self.tile = 128
@@ -331,7 +333,8 @@ class StockSplitDecode:
                         )
         if cutlass.const_expr(self.pdl):
             cute.arch.griddepcontrol_wait()
-            cute.arch.griddepcontrol_launch_dependents()
+            if cutlass.const_expr(self.trigger):
+                cute.arch.griddepcontrol_launch_dependents()
         if warp < 4:
             scores = cute.make_rmem_tensor((width, 1), f32)
             running_m = cute.make_rmem_tensor((width // 32,), f32)
@@ -560,7 +563,8 @@ class StockSplitPlan:
     """Reusable storage and a compiled producer for one fixed input layout; merge is the stock kernel."""
 
     def __init__(
-        self, query, kv, table, lengths, *, splits=148, stages=2, slots=2, pdl=False, prefetch=True, merge_pdl=None
+        self, query, kv, table, lengths, *, splits=148, stages=2, slots=2, pdl=False, prefetch=True, merge_pdl=None,
+        trigger=False,
     ):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
@@ -579,7 +583,7 @@ class StockSplitPlan:
         # merge_pdl: the merge is a programmatic dependent of the producer (waits before reading the partials).
         self.merge_pdl = pdl if merge_pdl is None else merge_pdl
         kernel = StockSplitDecode(
-            self.heads, self.qlen, splits, stages=stages, slots=slots, pdl=pdl, prefetch=prefetch
+            self.heads, self.qlen, splits, stages=stages, slots=slots, pdl=pdl, prefetch=prefetch, trigger=trigger
         )
         views = self._views(query, kv, table, lengths)
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
