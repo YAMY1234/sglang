@@ -2542,6 +2542,8 @@ class Qwen3_5ForCausalLM(nn.Module):
             self.norm = PPMissingLayer()
         # The adapter the final norm hands a deferred terminal output to.
         self._final_norm_handoff = self.flashinfer_mnnvl_cutedsl_fusion
+        # Side stream for the optional next-projection L2 prefetch (SGLANG_Q35MF_TPX_L2PF).
+        self._l2pf_stream: Optional[torch.cuda.Stream] = None
         # The draft layer's step hops (SGLANG_Q35MF_MKD_HOP), or None.
         self.draft_hop = None
         if is_nextn and self.pp_group.is_last_rank:
@@ -2643,9 +2645,19 @@ class Qwen3_5ForCausalLM(nn.Module):
             )
 
         aux_hidden_states = AuxHiddenStateList()
+        l2pf = (
+            envs.SGLANG_Q35MF_TPX_L2PF.get()
+            and _is_cuda
+            and (
+                forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_decode()
+            )
+        )
         # Pass through decoder layers
         for layer_idx in range(self.start_layer, self.end_layer):
             layer = self.layers[layer_idx]
+            if l2pf and layer_idx > self.start_layer:
+                self._l2_prefetch_input_proj(layer)
             with get_global_expert_distribution_recorder().with_current_layer(
                 layer_idx
             ):
@@ -2671,6 +2683,9 @@ class Qwen3_5ForCausalLM(nn.Module):
                     input_deepstack_embeds[:, sep : sep + self.hidden_size],
                 )
 
+        if l2pf and self._l2pf_stream is not None:
+            torch.cuda.current_stream().wait_stream(self._l2pf_stream)
+
         if not self.pp_group.is_last_rank:
             return residual_batch.to_pp(hidden_states, forward_batch)
 
@@ -2686,6 +2701,22 @@ class Qwen3_5ForCausalLM(nn.Module):
             return hidden_states
 
         return hidden_states, aux_hidden_states
+
+    def _l2_prefetch_input_proj(self, layer: nn.Module) -> None:
+        # Forked before the layer's input boundary launches the previous layer's all-reduce, so the
+        # prefetch overlaps that latency-bound kernel; the forward joins the stream before returning.
+        mixer = getattr(layer, "linear_attn", None)
+        proj = mixer.in_proj_qkvz if mixer is not None else getattr(layer, "qkv_proj", None)
+        weight = getattr(proj, "weight", None)
+        if not isinstance(weight, torch.Tensor) or weight.dim() != 2:
+            return
+        from sglang.kernels.ops.elementwise.l2_line_prefetch import l2_line_prefetch
+
+        if self._l2pf_stream is None:
+            self._l2pf_stream = torch.cuda.Stream()
+        self._l2pf_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self._l2pf_stream):
+            l2_line_prefetch(weight)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
