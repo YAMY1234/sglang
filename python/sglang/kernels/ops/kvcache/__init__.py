@@ -67,6 +67,7 @@ _TRITON_KERNELS = [
     ("rope_cache", "fused_qk_rope_reshape_and_cache"),
     ("trtllm_mha_page_table", "build_trtllm_mha_page_table"),
     ("trtllm_mha_graph_metadata", "update_trtllm_mha_graph_metadata"),
+    ("trtllm_mha_graph_metadata", "update_trtllm_mha_graph_metadata_multistep"),
     ("aiter_unified_attention", "scatter_ragged_to_page_table_kernel"),
     ("aiter_unified_attention", "scatter_req_to_token_to_page_table_kernel"),
     ("cache_move", "set_kv_buffer_prefix_valid_tiled"),
