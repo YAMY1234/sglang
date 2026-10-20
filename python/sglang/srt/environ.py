@@ -1292,6 +1292,9 @@ class Envs:
     # FlashInfer A2A (EP) NVFP4 dispatch at up to 64 tokens per rank: softmax top-10 and the dispatch-side NVFP4
     # input quant in one launch, with the router GEMM in it up to 16 tokens (same logits, ids, weights and payload).
     SGLANG_Q35MF_DEP_ROUTE_FRONT = EnvBool(False)
+    # With SGLANG_Q35MF_DEP_ROUTE_FRONT, from 17 to 64 tokens: the router GEMM in the same launch too, one 16-row
+    # token group per grid row (bitwise to the stock router GEMM only if that keeps the 16-row order).
+    SGLANG_Q35MF_DEP_ROUTE_FRONT_GROUPED = EnvBool(False)
     # FlashInfer A2A dispatch into the cute-dsl runner: the EP rank's routing tables from one single-CTA launch over
     # the received ids instead of moe_sort, and the finalize written straight into the combine workspace.
     SGLANG_Q35MF_DEP_EP_TABLES = EnvBool(False)
