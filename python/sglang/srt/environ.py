@@ -1300,6 +1300,9 @@ class Envs:
     # trtllm-gen routing tables from one kernel, and FlashInfer's FP4 MoE body run from those tables
     # with the stock call's tactic, so FlashInfer's routing kernels are skipped (same outputs).
     SGLANG_Q35MF_ROUTE_TABLES_MAX_TOKENS = EnvInt(0)
+    # With those routing tables, from 17 tokens up to this many (at most 64; 0 = off): the router GEMM, the
+    # NVFP4 input quantization, the top-k and the tables in one launch (router_wide_front, same outputs).
+    SGLANG_Q35MF_TPX_ROUTER_FRONT_MAX_M = EnvInt(0)
     # On the trtllm runner at up to 16 tokens (the fused router launch): top-k and the trtllm-gen routing
     # tables from one single-CTA kernel instead of FlashInfer's routing kernel, and FlashInfer's FP4 MoE body
     # run from those tables with the stock call's tactic (same table entries and outputs).
