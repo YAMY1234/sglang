@@ -1457,8 +1457,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     ):
         from sglang.kernels.ops.attention.skv2_q1 import Q1SplitPlan, skv2_q1_decode
 
-        # The switch is part of the key: A/B graph variants capture their own plan.
+        # The switches are part of the key: A/B graph variants capture their own plan.
         pdl = envs.SGLANG_Q35MF_LL16_Q1_PDL.get()
+        release = envs.SGLANG_Q35MF_LL16_GATE_FOLD.get() == 2
         key = (
             query.shape,
             kv_cache[0].shape,
@@ -1466,11 +1467,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             block_tables.stride(),
             seq_lens.shape,
             pdl,
+            release,
         )
         plan = self._q1_plans.get(key)
         if plan is None:
             # Compiles the producer; graph warmup runs this eagerly before capture.
-            plan = Q1SplitPlan(query, kv_cache, block_tables, seq_lens, pdl=pdl)
+            plan = Q1SplitPlan(query, kv_cache, block_tables, seq_lens, pdl=pdl, release=release)
             if pdl:
                 logger.info("Draft q1 split decode and merge launch as programmatic dependents.")
             self._q1_plans[key] = plan

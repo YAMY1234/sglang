@@ -1,7 +1,8 @@
 // One-row draft GEMV y[n] = bf16(sum_k W[n, k] * x[k]): bf16 operands, fp32 accumulation, output rounded
 // to bf16 as the served GEMM writes it (only the fp32 summation order differs). One warp per row with the
 // whole row in flight, the row loaded before the PDL wait (weights are static). With a hop site, every CTA
-// owns one 8-row fragment of the output and pushes it into the q35 hop before storing it.
+// owns one 8-row fragment of the output and pushes it into the q35 hop before storing it. With a gate, the input
+// is x * sigmoid(gate) rounded to bf16, as the attention output gate kernel would have written it.
 
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
@@ -21,6 +22,7 @@ namespace sglang {
 
 struct MkdGemvParams {
   const bf16_t* x;               // [K], written by the previous grid
+  const bf16_t* gate;            // kGate: [K], applied to x as it is staged
   const bf16_t* __restrict__ w;  // [N, K]
   bf16_t* y;                     // [N]
   int32_t n;
@@ -28,13 +30,36 @@ struct MkdGemvParams {
   int32_t hop_token;  // kPush: the output's row in the hop
 };
 
+// Eight bf16(x * sigmoid(g)) in the instruction sequence Triton emits for _fused_sigmoid_mul_kernel (fp32,
+// exp(-g) as ex2.approx of -g * log2(e), 1 / (1 + e) by div.full, product rounded to nearest-even bf16).
+__device__ __forceinline__ uint4 gate_mul8(const uint4 xv, const uint4 gv) {
+  const bf16_t* x = reinterpret_cast<const bf16_t*>(&xv);
+  const bf16_t* g = reinterpret_cast<const bf16_t*>(&gv);
+  uint4 out;
+  bf16_t* o = reinterpret_cast<bf16_t*>(&out);
+#pragma unroll
+  for (int e = 0; e < 8; ++e) {
+    float t;
+    asm("mul.rn.f32 %0, %1, 0fBFB8AA3B;\n\t"
+        "ex2.approx.f32 %0, %0;\n\t"
+        "add.rn.f32 %0, %0, 0f3F800000;\n\t"
+        "div.full.f32 %0, 0f3F800000, %0;\n\t"
+        "mul.rn.f32 %0, %2, %0;"
+        : "=&f"(t)
+        : "f"(__bfloat162float(g[e])), "f"(__bfloat162float(x[e])));
+    o[e] = __float2bfloat16_rn(t);
+  }
+  return out;
+}
+
 /**
  * \brief kRows warps per CTA; warp w of CTA c takes rows kRows * c + w, then a grid stride further on, the
  * next row loaded while the current one is reduced (as the draft head does).
  * \tparam kK    reduction length (a multiple of 256)
  * \tparam kRows warps per CTA; 8 when pushing, with one row per warp so a CTA owns one hop fragment
+ * \tparam kGate stage x * sigmoid(gate) instead of x
  */
-template <int kK, int kRows, bool kUsePDL, bool kPush>
+template <int kK, int kRows, bool kUsePDL, bool kPush, bool kGate>
 __global__ void __launch_bounds__(kRows * 32) mkd_gemv_kernel(const MkdGemvParams __grid_constant__ p) {
   using namespace device;
   static_assert(kK % 256 == 0, "K must tile 32 lanes x 8 bf16");
@@ -56,7 +81,9 @@ __global__ void __launch_bounds__(kRows * 32) mkd_gemv_kernel(const MkdGemvParam
   }
   PDLWaitPrimary<kUsePDL>();
   for (int i = static_cast<int>(threadIdx.x); i < kK / 8; i += kRows * 32) {
-    reinterpret_cast<uint4*>(s_x)[i] = reinterpret_cast<const uint4*>(p.x)[i];
+    uint4 xv = reinterpret_cast<const uint4*>(p.x)[i];
+    if constexpr (kGate) xv = gate_mul8(xv, reinterpret_cast<const uint4*>(p.gate)[i]);
+    reinterpret_cast<uint4*>(s_x)[i] = xv;
   }
   if constexpr (kPush) {
     if (threadIdx.x == 0) s_stage = q35hop::stage_peek(p.hop);
@@ -95,14 +122,15 @@ __global__ void __launch_bounds__(kRows * 32) mkd_gemv_kernel(const MkdGemvParam
   PDLTriggerSecondary<kUsePDL>();
 }
 
-template <int kK, int kRows, bool kUsePDL, bool kPush>
+template <int kK, int kRows, bool kUsePDL, bool kPush, bool kGate>
 struct MkdGemv {
   static void
   run(const tvm::ffi::TensorView x,
       const tvm::ffi::TensorView w,
       const tvm::ffi::TensorView y,
       const tvm::ffi::TensorView hop_site,
-      int64_t hop_token) {
+      int64_t hop_token,
+      const tvm::ffi::TensorView gate) {
     using namespace host;
     auto N = SymbolicSize{"rows"};
     auto device = SymbolicDevice{};
@@ -110,9 +138,11 @@ struct MkdGemv {
     TensorMatcher({1, kK}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(x);
     TensorMatcher({N, kK}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(w);
     TensorMatcher({1, N}).with_dtype<bf16_t>().with_device(device).verify(y);
+    if constexpr (kGate) TensorMatcher({1, kK}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(gate);
     const int n = static_cast<int>(N.unwrap());
     auto params = MkdGemvParams{
         .x = static_cast<const bf16_t*>(x.data_ptr()),
+        .gate = static_cast<const bf16_t*>(gate.data_ptr()),
         .w = static_cast<const bf16_t*>(w.data_ptr()),
         .y = static_cast<bf16_t*>(y.data_ptr()),
         .n = n,
@@ -134,7 +164,7 @@ struct MkdGemv {
           static_cast<unsigned long long>(f[6])};
       CHECK_HOST(hop_token >= 0 && hop_token < params.hop.m_cap) << "hop row out of range";
     }
-    const auto kernel = mkd_gemv_kernel<kK, kRows, kUsePDL, kPush>;
+    const auto kernel = mkd_gemv_kernel<kK, kRows, kUsePDL, kPush, kGate>;
     uint32_t grid = static_cast<uint32_t>((n + kRows - 1) / kRows);
     if constexpr (!kPush) {
       // Rows beyond one resident wave loop inside the warps instead of waiting for a second wave.

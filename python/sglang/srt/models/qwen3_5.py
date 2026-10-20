@@ -2270,6 +2270,22 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
         attn_output = self.attn(q, k, v, forward_batch)
 
+        mkd_o_proj = (
+            self._mkd_gemv
+            and attn_output.shape[0] == 1
+            and self.o_proj.weight.dtype == torch.bfloat16
+        )
+        if (
+            mkd_o_proj
+            and self.attn_output_gate
+            and envs.SGLANG_Q35MF_LL16_GATE_FOLD.get()
+            and gate.shape == attn_output.shape
+            and gate.is_contiguous()
+        ):
+            # The o_proj stages attn_output * sigmoid(gate) itself, with the gate kernel's arithmetic.
+            print_info_once("Draft o_proj applies the attention output gate as it loads its input.")
+            return self._draft_o_proj(attn_output, gate=gate)
+
         if self.attn_output_gate:
             use_static_gate = (
                 self._attn_gate_quant_requested
@@ -2295,16 +2311,14 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
                 attn_output = npu_fused_sigmoid_mul(attn_output, gate_val.contiguous())
 
-        if (
-            self._mkd_gemv
-            and attn_output.shape[0] == 1
-            and self.o_proj.weight.dtype == torch.bfloat16
-        ):
+        if mkd_o_proj:
             return self._draft_o_proj(attn_output)
         output, _ = self.o_proj(attn_output)
         return output
 
-    def _draft_o_proj(self, attn_output: torch.Tensor) -> torch.Tensor:
+    def _draft_o_proj(
+        self, attn_output: torch.Tensor, gate: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """The one-row draft o_proj partial as mkd_draft_gemv, pushed into the FFN input's hop when
         that hop runs (it then only consumes)."""
         from sglang.kernels.ops.speculative.mkd_draft_gemv import mkd_draft_gemv
@@ -2319,10 +2333,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         fusion = self.ffn_boundary.fusions
         hop = fusion.attn_push_target(1) if isinstance(fusion, DraftHopFusion) else None
         if hop is None:
-            return mkd_draft_gemv(attn_output, weight, out)
+            return mkd_draft_gemv(attn_output, weight, out, gate=gate)
         if self._mkd_hop_site is None:
             self._mkd_hop_site = torch.tensor(hop.site_fields(), dtype=torch.int64)
-        mkd_draft_gemv(attn_output, weight, out, hop_site=self._mkd_hop_site)
+        mkd_draft_gemv(attn_output, weight, out, hop_site=self._mkd_hop_site, gate=gate)
         hop.mark_pushed(out)
         return out
 

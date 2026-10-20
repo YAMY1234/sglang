@@ -607,7 +607,10 @@ def _q1_merge(
     NP2: tl.constexpr,
     BLOCK_D: tl.constexpr,
     USE_GDC: tl.constexpr = False,
+    RELEASE: tl.constexpr = False,
 ):
+    if RELEASE:  # the consumer's own dependency wait still covers this grid's stores
+        tl.extra.cuda.gdc_launch_dependents()
     if USE_GDC:  # launched as a programmatic dependent of the q1 producer
         tl.extra.cuda.gdc_wait()
     row = tl.program_id(0)
@@ -635,7 +638,7 @@ def _q1_merge(
 class Q1SplitPlan:
     """Reusable storage and a compiled producer for one fixed input layout, plus the fp32 merge."""
 
-    def __init__(self, query, kv, table, lengths, *, nsplit=None, stages=2, slots=2, pdl=False):
+    def __init__(self, query, kv, table, lengths, *, nsplit=None, stages=2, slots=2, pdl=False, release=False):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "Paged FP8 q1 decode storage must be prepared before graph capture"
@@ -654,6 +657,7 @@ class Q1SplitPlan:
         )
         self.denom = torch.empty_like(self.maximum)
         self.pdl = pdl
+        self.release = pdl and release
         kernel = Q1SplitDecode(self.heads, self.nsplit, stages=stages, slots=slots, pdl=pdl)
         views = self._views(query, kv, table, lengths)
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -695,6 +699,7 @@ class Q1SplitPlan:
             triton.next_power_of_2(self.nsplit),
             32,
             USE_GDC=self.pdl,
+            RELEASE=self.release,
             num_warps=4,
             **({"launch_pdl": True} if self.pdl else {}),
         )
