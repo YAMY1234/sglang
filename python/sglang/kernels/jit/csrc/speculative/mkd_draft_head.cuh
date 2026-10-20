@@ -116,12 +116,8 @@ struct MkdHead {
   static constexpr int kK = 4096;
   static constexpr int kWarps = 16;
 
-  static void
-  run(const tvm::ffi::TensorView x,
-      const tvm::ffi::TensorView w,
-      const tvm::ffi::TensorView logits,
-      const tvm::ffi::TensorView part,
-      int64_t reverse) {
+  static void run(const tvm::ffi::TensorView x, const tvm::ffi::TensorView w, const tvm::ffi::TensorView logits,
+                  const tvm::ffi::TensorView part, int64_t reverse, int64_t smem_pad) {
     using namespace host;
     auto N = SymbolicSize{"rows"};
     auto G = SymbolicSize{"ctas"};
@@ -140,7 +136,13 @@ struct MkdHead {
         .n = static_cast<int32_t>(N.unwrap()),
         .reverse = static_cast<int32_t>(reverse != 0),
     };
-    LaunchKernel(static_cast<uint32_t>(G.unwrap()), kWarps * 32, device.unwrap())
+    // Unused dynamic smem: past half an SM it caps residency at one CTA per SM, so CTAs launched while a
+    // predecessor still holds SMs cannot double up on the free ones (rows are split statically).
+    if (smem_pad > 48 * 1024) {
+      RuntimeDeviceCheck(cudaFuncSetAttribute(
+          mkd_head_kernel<kK, kWarps, kUsePDL>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_pad)));
+    }
+    LaunchKernel(static_cast<uint32_t>(G.unwrap()), kWarps * 32, device.unwrap(), static_cast<std::size_t>(smem_pad))
         .enable_pdl(kUsePDL)(mkd_head_kernel<kK, kWarps, kUsePDL>, params);
   }
 };

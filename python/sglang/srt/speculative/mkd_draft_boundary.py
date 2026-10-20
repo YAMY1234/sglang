@@ -342,6 +342,7 @@ class MkdDraftBoundary:
 
     def _install_head(self, enabled: bool, dev: torch.device) -> None:
         self.head_part = None
+        self.head_pad = 0
         self.head_used = False
         self.head_stats = None
         if not enabled:
@@ -360,29 +361,27 @@ class MkdDraftBoundary:
             )
             return
         sms = torch.cuda.get_device_properties(dev).multi_processor_count
-        self.head_part = torch.zeros(
-            _HEAD_CTAS_PER_SM * sms, dtype=torch.int32, device=dev
-        )
+        self.head_part = torch.zeros(_HEAD_CTAS_PER_SM * sms, dtype=torch.int32, device=dev)
+        self.head_pad = envs.SGLANG_Q35MF_MKD_HEAD_SMEM_PAD_KB.get() * 1024
         self.model.logits_processor.mkd_head = self
         if envs.SGLANG_Q35MF_MKD_HEAD_CHECK.get():
             self._start_head_check(dev)
         logger.info(
-            "MKD draft head active: %d x %d shard, %d CTAs.",
+            "MKD draft head active: %d x %d shard, %d CTAs, smem pad %d B.",
             head.shape[0],
             head.shape[1],
             self.head_part.numel(),
+            self.head_pad,
         )
 
     def head(self, hidden_states: torch.Tensor, lm_head) -> torch.Tensor:
         """The one-row draft logits [1, N] bf16 (the exchange then reads the per-CTA maxima)."""
         x = hidden_states.to(torch.bfloat16).contiguous()
-        logits = torch.empty(
-            1, lm_head.weight.shape[0], dtype=torch.bfloat16, device=x.device
-        )
-        # Alternate the row walk per draft step so the next step first re-reads the rows read last;
-        # measured faster in A/B.
+        logits = torch.empty(1, lm_head.weight.shape[0], dtype=torch.bfloat16, device=x.device)
+        # Alternate the row walk per draft step: the next step re-reads first what is still in L2
+        # (T1: -1.9 to -2.4 us per call on the TP8 shard).
         mkd_draft_head(
-            x, lm_head.weight, logits, self.head_part, reverse=self.step % 2 == 1
+            x, lm_head.weight, logits, self.head_part, reverse=self.step % 2 == 1, smem_pad=self.head_pad
         )
         self.head_used = True
         if self.head_stats is not None:

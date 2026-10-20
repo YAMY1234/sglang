@@ -32,8 +32,11 @@ def mkd_draft_head(
     logits: torch.Tensor,
     part: torch.Tensor,
     reverse: bool = False,
+    smem_pad: int = 0,
 ) -> None:
     """Draft lm_head of one token, ``logits`` [1, N] bf16 = ``x`` [1, 4096] @ ``weight`` [N, 4096]^T with
     fp32 accumulation, and per CTA (``part.numel()`` CTAs) the packed maximum of its rows for mkd_xchg.
-    ``reverse`` walks the rows from the end (same values; re-reads the most recently read rows first)."""
-    _module().run(x, weight, logits, part, int(reverse))
+    ``reverse`` walks the rows from the end (same values; the rows a previous forward walk read last,
+    likeliest still in L2, are read first). ``smem_pad`` bytes of unused dynamic shared memory per CTA
+    (same values; above half an SM it allows one CTA per SM)."""
+    _module().run(x, weight, logits, part, int(reverse), int(smem_pad))
