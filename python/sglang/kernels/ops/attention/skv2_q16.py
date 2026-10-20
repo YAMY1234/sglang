@@ -366,13 +366,21 @@ class Q16SplitDecode:
                     o_plane = to[(None, None), 0, 0, wg]
                     running_m = f32(-f32.inf)
                     running_l = f32(0)
+                    # Blocks from mask_from on need the mask: the split's last block (its tail may pass end_tok) and
+                    # any block holding one of the last qlen - 1 tokens, which some verify rows may not see.
+                    mask_from = nblk - 1
+                    hidden = length - self.qlen + 1 - begin_tok
+                    if hidden < (nblk - 1) * self.tile:
+                        mask_from = 0
+                        if hidden > 0:
+                            mask_from = hidden // self.tile
                     for it in cutlass.range(0, nblk):
                         for masked in cutlass.range_constexpr(2):
-                            # Two copies of the block body: the split's last block masks its tail, the others carry no mask code.
+                            # Two copies of the block body: the blocks above mask, the others carry no mask code.
                             if cutlass.const_expr(masked == 1):
-                                run = it == nblk - 1
+                                run = it >= mask_from
                             else:
-                                run = it < nblk - 1
+                                run = it < mask_from
                             if run:
                                 slot = it % self.slots
                                 cute.arch.mbarrier_wait(bs + slot, phase=(it // self.slots) % 2)
