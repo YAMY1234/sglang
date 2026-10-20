@@ -4,11 +4,13 @@
 One launch replaces ``causal_conv1d_update`` followed by the circular verify kernel
 (``gdn_replayssm_spec_circular_kernel``, verify launch) for the BF16-checkpoint verify of
 7 linear draft tokens at head dim 128. Every byte it writes (verify output, rings, conv
-state, conv window) matches the two stock kernels: the conv output is rounded to the
-activation dtype before the recurrence, exactly as the stock conv stores it.
+state, conv window) matches the two stock kernels.
 
-Each program recomputes the q and k conv of its key head; every program of a key-head
-group reads the old q/k conv state, so the last one to take a ticket writes the new state.
+Each program convolves the q and k channels of its key head and its own v channels per
+channel, in the stock conv kernel's operation order, and stages the result in a private
+scratch that the verify body reads with the stock load pattern (so its reduction trees
+match). Every program of a key-head group reads the old q/k conv state, so the last one
+to take a ticket writes the new state.
 """
 
 from __future__ import annotations
@@ -33,143 +35,78 @@ def _prefetch_l2(ptrs):
 
 
 @triton.jit
-def _conv_silu(
-    x_row,
-    stride_x_t: tl.constexpr,
-    cs_row,
-    stride_cs_dim: tl.constexpr,
-    stride_cs_tok: tl.constexpr,
-    conv_w,
-    stride_w_dim: tl.constexpr,
-    stride_w_width: tl.constexpr,
-    tok,
-    ch,
-    ROWS: tl.constexpr,
-    COLS: tl.constexpr,
-):
+def _load_taps(ptrs, stride_w_width: tl.constexpr):
+    return (
+        tl.load(ptrs),
+        tl.load(ptrs + stride_w_width),
+        tl.load(ptrs + 2 * stride_w_width),
+        tl.load(ptrs + 3 * stride_w_width),
+    )
+
+
+@triton.jit
+def _load_state(ptrs, stride_cs_tok: tl.constexpr):
+    return (
+        tl.load(ptrs),
+        tl.load(ptrs + stride_cs_tok),
+        tl.load(ptrs + 2 * stride_cs_tok),
+    )
+
+
+@triton.jit
+def _load_tokens(ptrs, stride_x_t: tl.constexpr):
+    return (
+        tl.load(ptrs),
+        tl.load(ptrs + stride_x_t),
+        tl.load(ptrs + 2 * stride_x_t),
+        tl.load(ptrs + 3 * stride_x_t),
+        tl.load(ptrs + 4 * stride_x_t),
+        tl.load(ptrs + 5 * stride_x_t),
+        tl.load(ptrs + 6 * stride_x_t),
+    )
+
+
+@triton.jit
+def _conv_silu(c0, c1, c2, xt, w0, w1, w2, w3):
     # Operation order of _causal_conv1d_update_kernel: activation-dtype products summed in fp32.
-    # The strided state / weight loads come first so the tile keeps the token-row load layout,
-    # which the verify kernel's q/k norm reduction tree depends on.
-    s0 = tl.load(cs_row + ch * stride_cs_dim)
-    s1 = tl.load(cs_row + ch * stride_cs_dim + stride_cs_tok)
-    s2 = tl.load(cs_row + ch * stride_cs_dim + 2 * stride_cs_tok)
-    w0 = tl.load(conv_w + ch * stride_w_dim)
-    w1 = tl.load(conv_w + ch * stride_w_dim + stride_w_width)
-    w2 = tl.load(conv_w + ch * stride_w_dim + 2 * stride_w_width)
-    w3 = tl.load(conv_w + ch * stride_w_dim + 3 * stride_w_width)
-    acc = tl.zeros([ROWS, COLS], dtype=tl.float32)
-    for j in tl.static_range(4):
-        src = tok + (j - 3)
-        xj = tl.load(
-            x_row + tl.maximum(src, 0) * stride_x_t + ch, mask=src >= 0, other=0.0
-        )
-        tap = tl.where(
-            src >= 0, xj, tl.where(src == -1, s2, tl.where(src == -2, s1, s0))
-        )
-        if j == 0:
-            w = w0
-        elif j == 1:
-            w = w1
-        elif j == 2:
-            w = w2
-        else:
-            w = w3
-        acc += tap * w
-    acc = acc / (1 + tl.exp(-acc))
-    return acc.to(x_row.dtype.element_ty)
+    acc = tl.zeros(c0.shape, dtype=tl.float32)
+    acc += c0 * w0
+    acc += c1 * w1
+    acc += c2 * w2
+    acc += xt * w3
+    return acc / (1 + tl.exp(-acc))
 
 
 @triton.jit
-def _window_values(
-    x_row,
-    stride_x_t: tl.constexpr,
-    cs_row,
-    stride_cs_dim: tl.constexpr,
-    stride_cs_tok: tl.constexpr,
-    ch0,
-    NCH: tl.constexpr,
-    T: tl.constexpr,
-    FLAT: tl.constexpr,
-):
-    # Window position p of a channel holds old state column p + 1 (p < 2) or token p - 2.
-    f = tl.arange(0, FLAT)
-    c = f // (T + 2)
-    p = f % (T + 2)
-    m = f < NCH * (T + 2)
-    old = tl.load(
-        cs_row + (ch0 + c) * stride_cs_dim + (p + 1) * stride_cs_tok,
-        mask=m & (p < 2),
-        other=0.0,
-    )
-    new = tl.load(
-        x_row + tl.maximum(p - 2, 0) * stride_x_t + ch0 + c,
-        mask=m & (p >= 2),
-        other=0.0,
-    )
-    return tl.where(p < 2, old, new)
+def _conv_rows(dst, stride_dst: tl.constexpr, s0, s1, s2, w0, w1, w2, w3, x0, x1, x2, x3, x4, x5, x6):
+    tl.store(dst, _conv_silu(s0, s1, s2, x0, w0, w1, w2, w3))
+    tl.store(dst + stride_dst, _conv_silu(s1, s2, x0, x1, w0, w1, w2, w3))
+    tl.store(dst + 2 * stride_dst, _conv_silu(s2, x0, x1, x2, w0, w1, w2, w3))
+    tl.store(dst + 3 * stride_dst, _conv_silu(x0, x1, x2, x3, w0, w1, w2, w3))
+    tl.store(dst + 4 * stride_dst, _conv_silu(x1, x2, x3, x4, w0, w1, w2, w3))
+    tl.store(dst + 5 * stride_dst, _conv_silu(x2, x3, x4, x5, w0, w1, w2, w3))
+    tl.store(dst + 6 * stride_dst, _conv_silu(x3, x4, x5, x6, w0, w1, w2, w3))
 
 
 @triton.jit
-def _store_window(
-    win_row, stride_win_dim: tl.constexpr, ch0, vals, NCH: tl.constexpr, T: tl.constexpr, FLAT: tl.constexpr
-):
-    f = tl.arange(0, FLAT)
-    c = f // (T + 2)
-    p = f % (T + 2)
-    tl.store(win_row + (ch0 + c) * stride_win_dim + p, vals, mask=f < NCH * (T + 2))
+def _window_rows(dst, s1, s2, x0, x1, x2, x3, x4, x5, x6):
+    # Position p of a channel's window: old state column p + 1 for p < 2, else token p - 2.
+    tl.store(dst, s1)
+    tl.store(dst + 1, s2)
+    tl.store(dst + 2, x0)
+    tl.store(dst + 3, x1)
+    tl.store(dst + 4, x2)
+    tl.store(dst + 5, x3)
+    tl.store(dst + 6, x4)
+    tl.store(dst + 7, x5)
+    tl.store(dst + 8, x6)
 
 
 @triton.jit
-def _new_state_values(
-    x_row, stride_x_t: tl.constexpr, ch0, NCH: tl.constexpr, T: tl.constexpr, FLAT: tl.constexpr
-):
-    g = tl.arange(0, FLAT)
-    return tl.load(
-        x_row + (T - 3 + g % 3) * stride_x_t + ch0 + g // 3, mask=g < NCH * 3
-    )
-
-
-@triton.jit
-def _store_state(
-    cs_row,
-    stride_cs_dim: tl.constexpr,
-    stride_cs_tok: tl.constexpr,
-    ch0,
-    vals,
-    NCH: tl.constexpr,
-    FLAT: tl.constexpr,
-):
-    g = tl.arange(0, FLAT)
-    tl.store(
-        cs_row + (ch0 + g // 3) * stride_cs_dim + (g % 3) * stride_cs_tok,
-        vals,
-        mask=g < NCH * 3,
-    )
-
-
-@triton.jit
-def _conv_writes(
-    x_row,
-    stride_x_t: tl.constexpr,
-    cs_row,
-    stride_cs_dim: tl.constexpr,
-    stride_cs_tok: tl.constexpr,
-    win_row,
-    stride_win_dim: tl.constexpr,
-    ch0,
-    NCH: tl.constexpr,
-    T: tl.constexpr,
-    WIN_FLAT: tl.constexpr,
-    ST_FLAT: tl.constexpr,
-):
-    win = _window_values(
-        x_row, stride_x_t, cs_row, stride_cs_dim, stride_cs_tok, ch0, NCH, T, WIN_FLAT
-    )
-    st = _new_state_values(x_row, stride_x_t, ch0, NCH, T, ST_FLAT)
-    # Every thread's old-state read precedes the in-place state update.
-    tl.debug_barrier()
-    _store_window(win_row, stride_win_dim, ch0, win, NCH, T, WIN_FLAT)
-    _store_state(cs_row, stride_cs_dim, stride_cs_tok, ch0, st, NCH, ST_FLAT)
+def _state_rows(dst, stride_cs_tok: tl.constexpr, x4, x5, x6):
+    tl.store(dst, x4)
+    tl.store(dst + stride_cs_tok, x5)
+    tl.store(dst + 2 * stride_cs_tok, x6)
 
 
 @triton.jit
@@ -177,9 +114,10 @@ def gdn_replayssm_conv_fused_kernel(
     x,  # [total_tokens, >= conv_dim] pre-conv rows, channels q | k | v
     conv_w,  # [conv_dim, 4]
     conv_state,  # [slots, conv_dim, 3]
-    conv_window,  # [slots, conv_dim, T + 2] physical window
+    conv_window,  # [slots, conv_dim, 9] physical window
     window_indices,  # [B]
     tickets,  # [>= B, H] int32, zero between launches
+    scratch,  # [programs, 7, 2 * K + BV] activation dtype
     a,
     b,
     A_log,
@@ -225,16 +163,14 @@ def gdn_replayssm_conv_fused_kernel(
     HV: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
+    BK: tl.constexpr,
     BV: tl.constexpr,
     BS: tl.constexpr,
     BC: tl.constexpr,
+    NK: tl.constexpr,
     BKT: tl.constexpr,
-    T: tl.constexpr,
     NT: tl.constexpr,
-    WIN_FLAT_QK: tl.constexpr,
-    WIN_FLAT_V: tl.constexpr,
-    ST_FLAT_QK: tl.constexpr,
-    ST_FLAT_V: tl.constexpr,
+    SCR_W: tl.constexpr,
     MAX_CACHE_LEN: tl.constexpr,
     SOFTPLUS_THRESHOLD: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
@@ -281,24 +217,25 @@ def gdn_replayssm_conv_fused_kernel(
         )
         return
 
-    ch_q = i_h * K
-    ch_k = H * K + i_h * K
-    ch_v = 2 * H * K + i_hv * V + i_v * BV
+    # Conv channels: q and k of key head i_h (shared by the group) and this program's v.
+    ch_q = i_h * K + tl.arange(0, K)
+    ch_k = H * K + i_h * K + tl.arange(0, K)
+    ch_v = 2 * H * K + i_hv * V + o_v
     x_row = x + bos * stride_x_t
     cs_row = conv_state + state_idx * stride_cs_slot
     win_idx = tl.load(window_indices + i_n * stride_window_indices).to(tl.int64)
     win_row = conv_window + win_idx * stride_win_slot
     write_k = (i_v == 0) and (i_hv == i_h * (HV // H))
+    scr = scratch + ((i_n * HV + i_hv) * (V // BV) + i_v) * (7 * SCR_W)
 
+    # Static weights and the old conv state are not written by the prerequisite grid.
+    wq0, wq1, wq2, wq3 = _load_taps(conv_w + ch_q * stride_w_dim, stride_w_width)
+    wk0, wk1, wk2, wk3 = _load_taps(conv_w + ch_k * stride_w_dim, stride_w_width)
+    wv0, wv1, wv2, wv3 = _load_taps(conv_w + ch_v * stride_w_dim, stride_w_width)
+    sq0, sq1, sq2 = _load_state(cs_row + ch_q * stride_cs_dim, stride_cs_tok)
+    sk0, sk1, sk2 = _load_state(cs_row + ch_k * stride_cs_dim, stride_cs_tok)
+    sv0, sv1, sv2 = _load_state(cs_row + ch_v * stride_cs_dim, stride_cs_tok)
     if PREFETCH:
-        # Inputs the prerequisite grid does not write: conv weights / state, checkpoint, key ring.
-        lines = tl.arange(0, 8) * 64
-        _prefetch_l2(conv_w + ch_q * stride_w_dim + tl.minimum(lines, K * 4 - 1))
-        _prefetch_l2(conv_w + ch_k * stride_w_dim + tl.minimum(lines, K * 4 - 1))
-        _prefetch_l2(conv_w + ch_v * stride_w_dim + tl.minimum(lines, BV * 4 - 1))
-        _prefetch_l2(cs_row + ch_q * stride_cs_dim + tl.minimum(lines, K * 3 - 1))
-        _prefetch_l2(cs_row + ch_k * stride_cs_dim + tl.minimum(lines, K * 3 - 1))
-        _prefetch_l2(cs_row + ch_v * stride_cs_dim + tl.minimum(lines, BV * 3 - 1))
         _prefetch_l2(
             h0
             + state_idx * stride_state_slot
@@ -313,24 +250,32 @@ def gdn_replayssm_conv_fused_kernel(
             + tl.arange(0, MAX_CACHE_LEN * K // 64) * 64
         )
 
+    o_t = tl.arange(0, NT)
+    p_ticket = tickets + i_n * H + i_h + o_t * 0
+    last_ticket = (HV // H) * (V // BV) - 1
+
     b_is_flush = tl.load(is_flush_flags + replay_idx) != 0
     if b_is_flush:
         # The stock verify launch skips flush rows; only the conv writes remain.
         if USE_GDC:
             tl.extra.cuda.gdc_wait()
-        _conv_writes(
-            x_row, stride_x_t, cs_row, stride_cs_dim, stride_cs_tok, win_row,
-            stride_win_dim, ch_v, BV, T, WIN_FLAT_V, ST_FLAT_V,
+        xq0, xq1, xq2, xq3, xq4, xq5, xq6 = _load_tokens(x_row + ch_q, stride_x_t)
+        xk0, xk1, xk2, xk3, xk4, xk5, xk6 = _load_tokens(x_row + ch_k, stride_x_t)
+        xv0, xv1, xv2, xv3, xv4, xv5, xv6 = _load_tokens(x_row + ch_v, stride_x_t)
+        # Every program read the old q/k state above; all old-state reads precede the writes.
+        tl.debug_barrier()
+        ticket = tl.atomic_add(
+            p_ticket, tl.where(o_t == 0, 1, 0), mask=o_t == 0, sem="release", scope="gpu"
         )
+        _window_rows(win_row + ch_v * stride_win_dim, sv1, sv2, xv0, xv1, xv2, xv3, xv4, xv5, xv6)
+        _state_rows(cs_row + ch_v * stride_cs_dim, stride_cs_tok, xv4, xv5, xv6)
         if write_k:
-            _conv_writes(
-                x_row, stride_x_t, cs_row, stride_cs_dim, stride_cs_tok, win_row,
-                stride_win_dim, ch_q, K, T, WIN_FLAT_QK, ST_FLAT_QK,
-            )
-            _conv_writes(
-                x_row, stride_x_t, cs_row, stride_cs_dim, stride_cs_tok, win_row,
-                stride_win_dim, ch_k, K, T, WIN_FLAT_QK, ST_FLAT_QK,
-            )
+            _window_rows(win_row + ch_q * stride_win_dim, sq1, sq2, xq0, xq1, xq2, xq3, xq4, xq5, xq6)
+            _window_rows(win_row + ch_k * stride_win_dim, sk1, sk2, xk0, xk1, xk2, xk3, xk4, xk5, xk6)
+        if tl.sum(tl.where(o_t == 0, ticket, 0), axis=0) == last_ticket:
+            _state_rows(cs_row + ch_q * stride_cs_dim, stride_cs_tok, xq4, xq5, xq6)
+            _state_rows(cs_row + ch_k * stride_cs_dim, stride_cs_tok, xk4, xk5, xk6)
+            tl.store(tickets + i_n * H + i_h, 0)
         return
 
     b_write_pos = tl.load(write_pos + replay_idx).to(tl.int64)
@@ -365,7 +310,7 @@ def gdn_replayssm_conv_fused_kernel(
     b_d_scaled_fp32 = b_d_all * b_replay_decay[None, :]
     b_d_scaled = b_d_scaled_fp32.to(d_cache.dtype.element_ty)
 
-    # The prerequisite writes the pre-conv rows and the gates.
+    # The prerequisite grid writes the pre-conv rows and the gates.
     if USE_GDC:
         tl.extra.cuda.gdc_wait()
 
@@ -375,6 +320,14 @@ def gdn_replayssm_conv_fused_kernel(
     b_s = tl.load(b + (bos + o_s_safe) * stride_b_t + i_hv, mask=mask_s, other=0.0).to(
         tl.float32
     )
+    xq0, xq1, xq2, xq3, xq4, xq5, xq6 = _load_tokens(x_row + ch_q, stride_x_t)
+    xk0, xk1, xk2, xk3, xk4, xk5, xk6 = _load_tokens(x_row + ch_k, stride_x_t)
+    xv0, xv1, xv2, xv3, xv4, xv5, xv6 = _load_tokens(x_row + ch_v, stride_x_t)
+    tl.debug_barrier()
+    ticket = tl.atomic_add(
+        p_ticket, tl.where(o_t == 0, 1, 0), mask=o_t == 0, sem="release", scope="gpu"
+    )
+
     x_g = a_s + dt_bias_val
     softplus_x = tl.where(x_g <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x_g)), x_g)
     g_s = tl.where(mask_s, -tl.exp(A_log_val) * softplus_x, 0.0)
@@ -382,63 +335,40 @@ def gdn_replayssm_conv_fused_kernel(
     G_s = tl.cumsum(g_s, axis=0)
     expG_s = tl.exp(G_s)
 
-    # Conv of the program's channels; padding token rows repeat token 0 like o_s_safe loads.
-    o_kt0 = tl.arange(0, BKT)
-    tok_r = o_s_safe[:, None]
-    q_c0 = _conv_silu(
-        x_row, stride_x_t, cs_row, stride_cs_dim, stride_cs_tok, conv_w, stride_w_dim,
-        stride_w_width, tok_r, (ch_q + o_kt0)[None, :], BS, BKT,
-    )
-    k_c0 = _conv_silu(
-        x_row, stride_x_t, cs_row, stride_cs_dim, stride_cs_tok, conv_w, stride_w_dim,
-        stride_w_width, tok_r, (ch_k + o_kt0)[None, :], BS, BKT,
-    )
-    q_c1 = _conv_silu(
-        x_row, stride_x_t, cs_row, stride_cs_dim, stride_cs_tok, conv_w, stride_w_dim,
-        stride_w_width, tok_r, (ch_q + BKT + o_kt0)[None, :], BS, BKT,
-    )
-    k_c1 = _conv_silu(
-        x_row, stride_x_t, cs_row, stride_cs_dim, stride_cs_tok, conv_w, stride_w_dim,
-        stride_w_width, tok_r, (ch_k + BKT + o_kt0)[None, :], BS, BKT,
-    )
-    v_c = _conv_silu(
-        x_row, stride_x_t, cs_row, stride_cs_dim, stride_cs_tok, conv_w, stride_w_dim,
-        stride_w_width, o_s_safe[None, :], (ch_v + tl.arange(0, BV))[:, None], BV, BS,
-    )
-
-    # Ticket after this program's last old q/k state read; NT lanes keep one owner per element.
-    o_t = tl.arange(0, NT)
-    p_ticket = tickets + i_n * H + i_h + o_t * 0
+    _conv_rows(scr + tl.arange(0, K), SCR_W, sq0, sq1, sq2, wq0, wq1, wq2, wq3,
+               xq0, xq1, xq2, xq3, xq4, xq5, xq6)
+    _conv_rows(scr + K + tl.arange(0, K), SCR_W, sk0, sk1, sk2, wk0, wk1, wk2, wk3,
+               xk0, xk1, xk2, xk3, xk4, xk5, xk6)
+    _conv_rows(scr + 2 * K + tl.arange(0, BV), SCR_W, sv0, sv1, sv2, wv0, wv1, wv2, wv3,
+               xv0, xv1, xv2, xv3, xv4, xv5, xv6)
+    _window_rows(win_row + ch_v * stride_win_dim, sv1, sv2, xv0, xv1, xv2, xv3, xv4, xv5, xv6)
+    _state_rows(cs_row + ch_v * stride_cs_dim, stride_cs_tok, xv4, xv5, xv6)
     if write_k:
-        win_q = _window_values(
-            x_row, stride_x_t, cs_row, stride_cs_dim, stride_cs_tok, ch_q, K, T, WIN_FLAT_QK
-        )
-        win_k = _window_values(
-            x_row, stride_x_t, cs_row, stride_cs_dim, stride_cs_tok, ch_k, K, T, WIN_FLAT_QK
-        )
-        tl.debug_barrier()
-        ticket = tl.atomic_add(
-            p_ticket, tl.where(o_t == 0, 1, 0), mask=o_t == 0, sem="release", scope="gpu"
-        )
-        _store_window(win_row, stride_win_dim, ch_q, win_q, K, T, WIN_FLAT_QK)
-        _store_window(win_row, stride_win_dim, ch_k, win_k, K, T, WIN_FLAT_QK)
-    else:
-        tl.debug_barrier()
-        ticket = tl.atomic_add(
-            p_ticket, tl.where(o_t == 0, 1, 0), mask=o_t == 0, sem="release", scope="gpu"
-        )
+        _window_rows(win_row + ch_q * stride_win_dim, sq1, sq2, xq0, xq1, xq2, xq3, xq4, xq5, xq6)
+        _window_rows(win_row + ch_k * stride_win_dim, sk1, sk2, xk0, xk1, xk2, xk3, xk4, xk5, xk6)
+    # The staged conv rows must be visible to every thread of the program.
+    tl.debug_barrier()
 
+    # From here on the stock verify body, reading q / k / v from the staged rows.
     if USE_QK_L2NORM_IN_KERNEL:
         qnorm_acc = tl.zeros([BS], dtype=tl.float32)
         knorm_acc = tl.zeros([BS], dtype=tl.float32)
-        qn = tl.where(mask_s[:, None], q_c0.to(tl.float32), 0.0)
-        knn = tl.where(mask_s[:, None], k_c0.to(tl.float32), 0.0)
-        qnorm_acc += tl.sum(qn * qn, axis=1)
-        knorm_acc += tl.sum(knn * knn, axis=1)
-        qn = tl.where(mask_s[:, None], q_c1.to(tl.float32), 0.0)
-        knn = tl.where(mask_s[:, None], k_c1.to(tl.float32), 0.0)
-        qnorm_acc += tl.sum(qn * qn, axis=1)
-        knorm_acc += tl.sum(knn * knn, axis=1)
+        for kk in range(NK):
+            o_kt = kk * BKT + tl.arange(0, BKT)
+            mask_kt = o_kt < K
+            ld = mask_s[:, None] & mask_kt[None, :]
+            qn = tl.load(
+                scr + o_s_safe[:, None] * SCR_W + o_kt[None, :],
+                mask=ld,
+                other=0.0,
+            ).to(tl.float32)
+            knn = tl.load(
+                scr + o_s_safe[:, None] * SCR_W + K + o_kt[None, :],
+                mask=ld,
+                other=0.0,
+            ).to(tl.float32)
+            qnorm_acc += tl.sum(qn * qn, axis=1)
+            knorm_acc += tl.sum(knn * knn, axis=1)
         q_rnorm = tl.where(mask_s, 1.0 / tl.sqrt(qnorm_acc + 1e-6), 0.0)
         k_rnorm = tl.where(mask_s, 1.0 / tl.sqrt(knorm_acc + 1e-6), 0.0)
     else:
@@ -452,17 +382,19 @@ def gdn_replayssm_conv_fused_kernel(
     kk_mat = tl.zeros([BS, BS], dtype=tl.float32)
     kq_mat = tl.zeros([BS, BS], dtype=tl.float32)
 
-    for kk in tl.static_range(2):
-        if kk == 0:
-            q_conv = q_c0
-            k_conv = k_c0
-        else:
-            q_conv = q_c1
-            k_conv = k_c1
+    for kk in range(NK):
         o_kt = kk * BKT + tl.arange(0, BKT)
         mask_kt = o_kt < K
-        q_tile = q_conv.to(tl.float32)
-        k_tile = k_conv.to(tl.float32)
+        q_tile = tl.load(
+            scr + o_s_safe[:, None] * SCR_W + o_kt[None, :],
+            mask=mask_kt[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        k_tile = tl.load(
+            scr + o_s_safe[:, None] * SCR_W + K + o_kt[None, :],
+            mask=mask_kt[None, :],
+            other=0.0,
+        ).to(tl.float32)
         k_raw_tile = k_tile
         q_precise = q_tile * (q_rnorm * scale)[:, None]
         k_precise = k_tile * k_rnorm[:, None]
@@ -559,7 +491,10 @@ def gdn_replayssm_conv_fused_kernel(
         b_Ai = tl.where((o_s == ii)[:, None], row, b_Ai)
     T_mat = b_Ai + (o_s[:, None] == o_s[None, :]).to(tl.float32)
 
-    v_tile = tl.where(mask_v[:, None] & mask_s[None, :], v_c.to(tl.float32), 0.0)
+    p_v = scr + o_s_safe[None, :] * SCR_W + 2 * K + tl.arange(0, BV)[:, None]
+    v_tile = tl.load(p_v, mask=mask_v[:, None] & mask_s[None, :], other=0.0).to(
+        tl.float32
+    )
     R_mat = beta_s[None, :] * (v_tile - expG_s[None, :] * hw_k)
     D_spec = tl.zeros([BV, BS], dtype=tl.float32)
     for j in tl.static_range(BS):
@@ -624,17 +559,10 @@ def gdn_replayssm_conv_fused_kernel(
             )
             tl.store(p_cur_beta, beta_s, mask=spec_store_mask)
 
-    _conv_writes(
-        x_row, stride_x_t, cs_row, stride_cs_dim, stride_cs_tok, win_row,
-        stride_win_dim, ch_v, BV, T, WIN_FLAT_V, ST_FLAT_V,
-    )
-    # The store follows the ticket's data dependency; all readers released before it.
-    last = tl.sum(tl.where(o_t == 0, ticket, 0), axis=0) == (HV // H) * (V // BV) - 1
-    if last:
-        st_q = _new_state_values(x_row, stride_x_t, ch_q, K, T, ST_FLAT_QK)
-        st_k = _new_state_values(x_row, stride_x_t, ch_k, K, T, ST_FLAT_QK)
-        _store_state(cs_row, stride_cs_dim, stride_cs_tok, ch_q, st_q, K, ST_FLAT_QK)
-        _store_state(cs_row, stride_cs_dim, stride_cs_tok, ch_k, st_k, K, ST_FLAT_QK)
+    # The store follows the ticket's data dependency; every reader released before it.
+    if tl.sum(tl.where(o_t == 0, ticket, 0), axis=0) == last_ticket:
+        _state_rows(cs_row + ch_q * stride_cs_dim, stride_cs_tok, xq4, xq5, xq6)
+        _state_rows(cs_row + ch_k * stride_cs_dim, stride_cs_tok, xk4, xk5, xk6)
         tl.store(tickets + i_n * H + i_h, 0)
 
 
@@ -671,11 +599,13 @@ def gdn_replayssm_conv_fused_verify(
     block_v: int = 64,
     num_warps: int = 2,
     num_stages: int = 2,
+    nk: int = 2,
     bs_min: int = 4,
     dot_precision: str = "tf32" if is_tf32_supported else "ieee",
     pdl: bool = False,
     maxnreg: int | None = None,
     prefetch: bool = True,
+    scratch: torch.Tensor | None = None,
 ) -> torch.Tensor:
     num_slots, HV, V, K = checkpoint_state.shape
     H = k_cache.shape[1]
@@ -690,16 +620,23 @@ def gdn_replayssm_conv_fused_verify(
     assert K == V == 128 and width == 4 and max_spec_len == 7 and null_block_id == -1
     assert conv_dim == 2 * H * K + HV * V and stride_win_dim == max_spec_len + 2
     assert checkpoint_state.dtype == torch.bfloat16 and x.dtype == torch.bfloat16
-    assert conv_weight.stride() == (4, 1) and conv_state.stride()[1:] == (3, 1)
     assert max_cache_len & (max_cache_len - 1) == 0 and d_cache.shape[2] == max_cache_len
     if scale is None:
         scale = K**-0.5
     if is_flush.dtype != torch.int8:
         is_flush = is_flush.to(torch.int8)
 
+    BK = triton.next_power_of_2(K)
     BV = block_v
     BS = max(bs_min, triton.next_power_of_2(max_spec_len))
     BC = max(16, triton.next_power_of_2(max_cache_len))
+    grid = (triton.cdiv(V, BV), B, HV)
+    if scratch is None:
+        scratch = torch.empty(
+            grid[0] * grid[1] * grid[2] * max_spec_len * (2 * K + BV),
+            dtype=x.dtype,
+            device=x.device,
+        )
     store_exact_raw = (
         rawv_cache is not None and rawk_cache is not None and beta_cache is not None
     )
@@ -714,7 +651,6 @@ def gdn_replayssm_conv_fused_verify(
         options.update(USE_GDC=True, launch_pdl=True)
     if maxnreg is not None:
         options["maxnreg"] = maxnreg
-    grid = (triton.cdiv(V, BV), B, HV)
     gdn_replayssm_conv_fused_kernel[grid](
         x,
         conv_weight,
@@ -722,6 +658,7 @@ def gdn_replayssm_conv_fused_verify(
         conv_window,
         window_indices,
         tickets,
+        scratch,
         a,
         b,
         A_log,
@@ -767,16 +704,14 @@ def gdn_replayssm_conv_fused_verify(
         HV=HV,
         K=K,
         V=V,
+        BK=BK,
         BV=BV,
         BS=BS,
         BC=BC,
-        BKT=K // 2,
-        T=max_spec_len,
+        NK=nk,
+        BKT=BK // nk,
         NT=32 * num_warps,
-        WIN_FLAT_QK=triton.next_power_of_2(K * (max_spec_len + 2)),
-        WIN_FLAT_V=triton.next_power_of_2(BV * (max_spec_len + 2)),
-        ST_FLAT_QK=triton.next_power_of_2(K * 3),
-        ST_FLAT_V=triton.next_power_of_2(BV * 3),
+        SCR_W=2 * K + BV,
         MAX_CACHE_LEN=max_cache_len,
         SOFTPLUS_THRESHOLD=20.0,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
