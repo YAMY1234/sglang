@@ -458,6 +458,11 @@ def _load_fp8_bmm_tactics(path) -> dict:
     return {tuple(int(v) for v in key.split(",")): int(t) for key, t in table.items()}
 
 
+@lru_cache(maxsize=None)
+def _log_pinned_fp8_bmm_once(n, k, m, tactic):
+    logger.info("Pinned FP8 bmm tactic active: n=%d k=%d m=%d tactic=%d", n, k, m, tactic)
+
+
 @lru_cache(maxsize=1)
 def _flashinfer_cublas_fp8_runner():
     from flashinfer.gemm.gemm_base import get_gemm_module
@@ -502,6 +507,7 @@ if flashinfer_per_tensor_fp8_supported():
         m, n = q_input.shape[0], weight.shape[1]
         tactic = _pinned_fp8_bmm_tactics().get((n, weight.shape[0], m))
         if tactic is not None:
+            _log_pinned_fp8_bmm_once(n, weight.shape[0], m, tactic)
             return _pinned_flashinfer_bmm_fp8(
                 q_input, weight, x_scale, weight_scale, out_dtype, tactic
             ).view(m, n)
