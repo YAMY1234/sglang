@@ -279,16 +279,21 @@ class FlashinferDispatcher(BaseDispatcher):
             )
 
         self.moe_a2a = make_moe_a2a()
-        # NVFP4 decode exchange of target layers (SGLANG_Q35MF_E2X_LLA2A, read per dispatch so A/B variants can flip it).
+        # Decode exchange: target NVFP4 (SGLANG_Q35MF_E2X_LLA2A) or draft BF16 (SGLANG_Q35MF_E2X_LLA2A_DRAFT);
+        # the switch is read per dispatch so A/B variants can flip it.
         self.ll_a2a = None
-        if (
-            envs.SGLANG_Q35MF_E2X_LLA2A.get()
-            or envs.SGLANG_Q35MF_E2X_LLA2A_BUFFERS.get()
-        ) and (
-            not is_speculative_model
-            and self.dispatch_type == FlashinferA2ADispatchType.NVFP4
+        self._ll_draft = is_speculative_model
+        self._ll_switch = (
+            envs.SGLANG_Q35MF_E2X_LLA2A_DRAFT
+            if is_speculative_model
+            else envs.SGLANG_Q35MF_E2X_LLA2A
+        )
+        if (self._ll_switch.get() or envs.SGLANG_Q35MF_E2X_LLA2A_BUFFERS.get()) and (
+            is_speculative_model
+            or self.dispatch_type == FlashinferA2ADispatchType.NVFP4
         ):
             self.ll_a2a = get_ll_a2a_state(
+                draft=is_speculative_model,
                 mapping=self.mapping,
                 ep_rank=self.ep_rank,
                 ep_size=self.ep_size,
@@ -296,6 +301,7 @@ class FlashinferDispatcher(BaseDispatcher):
                 hidden=hidden_size,
                 num_experts=num_experts,
                 slots=envs.SGLANG_Q35MF_E2X_LLA2A_MAX_TOKENS.get(),
+                payload="bf16" if is_speculative_model else "nvfp4",
             )
         # (own top-k ids, check) of a dispatch that went through ll_a2a, for the matching combine.
         self._ll_call: Optional[tuple] = None
@@ -471,7 +477,7 @@ class FlashinferDispatcher(BaseDispatcher):
         # padding slots whose expert_id would otherwise route to a real expert
         # and waste downstream MoE compute. Sanitizing the padding to a
         # sentinel id is structural, not optional.
-        if self._use_ll_a2a(x_sf):
+        if self._use_ll_a2a(x, x_sf):
             recv_tensors = self._ll_a2a_dispatch(payloads, expert_id_payload_index)
         else:
             self._ll_call = None
@@ -513,11 +519,11 @@ class FlashinferDispatcher(BaseDispatcher):
             output_dtype,
         )
 
-    def _use_ll_a2a(self, x_sf: Optional[torch.Tensor]) -> bool:
+    def _use_ll_a2a(self, x: torch.Tensor, x_sf: Optional[torch.Tensor]) -> bool:
         return (
             self.ll_a2a is not None
-            and x_sf is not None
-            and envs.SGLANG_Q35MF_E2X_LLA2A.get()
+            and self._ll_switch.get()
+            and self.ll_a2a.matches(x, x_sf)
             and not self.use_low_precision_combine
             and self.runtime_max_tokens_per_rank <= self.ll_a2a.slots
         )
@@ -525,7 +531,10 @@ class FlashinferDispatcher(BaseDispatcher):
     def _ll_a2a_dispatch(
         self, payloads: list[torch.Tensor], expert_id_payload_index: int
     ) -> list[torch.Tensor]:
-        x, x_sf, topk_ids, topk_weights = payloads
+        x = payloads[0]
+        x_sf = payloads[1] if expert_id_payload_index == 2 else None
+        topk_ids = payloads[expert_id_payload_index]
+        topk_weights = payloads[expert_id_payload_index + 1]
         recv = self.ll_a2a.dispatch(
             x=x,
             sf=x_sf,
@@ -536,7 +545,7 @@ class FlashinferDispatcher(BaseDispatcher):
         )
         check = None
         if envs.SGLANG_Q35MF_E2X_LLA2A_CHECK.get():
-            check = get_ll_a2a_check(x.device)
+            check = get_ll_a2a_check(x.device, draft=self._ll_draft)
             check.dispatch(
                 moe_a2a=self.active_moe_a2a,
                 payloads=payloads,

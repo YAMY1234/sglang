@@ -1310,6 +1310,8 @@ class Envs:
     # FlashInfer A2A NVFP4 dispatch of target MoE layers at up to SGLANG_Q35MF_E2X_LLA2A_MAX_TOKENS tokens per rank:
     # one fence-free exchange kernel each way instead of MoeAlltoAll (same rows at fixed slots, same combine bits).
     SGLANG_Q35MF_E2X_LLA2A = EnvBool(False)
+    # The same exchange for the draft MoE layers' BF16 dispatch (one more buffer set of the same token capacity).
+    SGLANG_Q35MF_E2X_LLA2A_DRAFT = EnvBool(False)
     # Allocate the SGLANG_Q35MF_E2X_LLA2A buffers even when the switch is off at init (same-server A/B variants).
     SGLANG_Q35MF_E2X_LLA2A_BUFFERS = EnvBool(False)
     # Tokens per source rank the SGLANG_Q35MF_E2X_LLA2A buffers hold (at most 128); larger batches use MoeAlltoAll.

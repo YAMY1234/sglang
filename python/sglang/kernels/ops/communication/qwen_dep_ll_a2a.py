@@ -21,16 +21,18 @@ LL_A2A_MAX_TOKENS = 128
 
 
 def ll_a2a_region_bytes(
-    ranks: int, top_k: int, hidden: int, slots: int
+    ranks: int, top_k: int, hidden: int, slots: int, x_bytes: int, sf_bytes: int
 ) -> tuple[int, int]:
     """Bytes of the dispatch and combine regions on every rank (csrc Geometry::dispatch_bytes / combine_bytes)."""
-    lines = top_k + hidden // 16 + hidden // 128
+    lines = top_k + (x_bytes + sf_bytes) // 8
     return 2 * ranks * 16 * (1 + slots * lines), 3 * ranks * slots * hidden * 2
 
 
 @cache_once
-def _jit_module(ranks: int, top_k: int, hidden: int) -> Module:
-    args = make_cpp_args(ranks, top_k, hidden, is_arch_support_pdl())
+def _jit_module(
+    ranks: int, top_k: int, hidden: int, x_bytes: int, sf_bytes: int
+) -> Module:
+    args = make_cpp_args(ranks, top_k, hidden, x_bytes, sf_bytes, is_arch_support_pdl())
     return load_jit(
         "qwen_dep_ll_a2a",
         *args,
@@ -62,9 +64,11 @@ def ll_a2a_dispatch(
     rank: int,
     experts_per_rank: int,
     invalid_id: int,
+    hidden: int,
 ) -> None:
-    """peers: CPU int64 [ranks] dispatch-region bases; out_* rows [ranks * tmax]; one CTA per ctr entry."""
-    _jit_module(peers.shape[0], ids.shape[1], x.shape[1] * 2).dispatch(
+    """peers: CPU int64 [ranks] dispatch-region bases; x / sf uint8 [tokens, bytes] (sf [tokens, 0] for BF16);
+    out_* rows [ranks * tmax]; one CTA per ctr entry."""
+    _jit_module(peers.shape[0], ids.shape[1], hidden, x.shape[1], sf.shape[1]).dispatch(
         peers,
         x,
         sf,
@@ -100,9 +104,14 @@ def ll_a2a_combine(
     rank: int,
     experts_per_rank: int,
     num_experts: int,
+    x_bytes: int,
+    sf_bytes: int,
 ) -> None:
-    """peers: CPU int64 [ranks] combine-region bases; partial / rids rows [ranks * tmax] as dispatch wrote them."""
-    _jit_module(peers.shape[0], ids.shape[1], partial.shape[1]).combine(
+    """peers: CPU int64 [ranks] combine-region bases; partial / rids rows [ranks * tmax] as dispatch wrote them;
+    x_bytes / sf_bytes as in the matching dispatch."""
+    _jit_module(
+        peers.shape[0], ids.shape[1], partial.shape[1], x_bytes, sf_bytes
+    ).combine(
         peers,
         partial,
         rids,
