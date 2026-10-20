@@ -185,6 +185,14 @@ class PostVerifyGraph:
         # Shard-built compact support (eagle_utils DB1); under the same-service A/B harness each
         # variant's SGLANG_Q35MF_LL16_DB1 picks it per round, with one graph set per value.
         self._db1 = envs.SGLANG_Q35MF_LL16_DB1.get()
+        if self._db1 or ab_variants.enabled():
+            # Compile DB1's Triton kernels now rather than at the first sampled verify (seconds of JIT).
+            from sglang.srt.speculative.sharded_verify_sampling import precompile_db1
+
+            parallel = get_parallel()
+            vocab = target_worker.model_runner.model_config.vocab_size
+            if parallel.tp_size > 1 and vocab % parallel.tp_size == 0:
+                precompile_db1(device, vocab // parallel.tp_size, parallel.tp_size, parallel.tp_rank)
 
     def try_run(
         self,

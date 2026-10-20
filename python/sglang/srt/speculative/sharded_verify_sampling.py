@@ -975,6 +975,40 @@ class ShardedVerifySampler:
             )
 
 
+def precompile_db1(device, local_vocab: int, world: int, rank: int, max_top_k: int = 20) -> None:
+    """JIT-compile the DB1 kernels before serving (no collective; zero logits). Triton specializes the row count
+    only on == 1 and % 16 == 0, so one verify-shaped call (7 rows) covers batches of 1-15 requests."""
+    rows, k = 7, int(max_top_k)
+    logits = torch.zeros((rows, local_vocab), dtype=torch.bfloat16, device=device)
+    nchunk = triton.cdiv(local_vocab, _DB1_CHUNK)
+    cmax = torch.empty((rows, nchunk), dtype=torch.int64, device=device)
+    thr = torch.empty((rows,), dtype=torch.int64, device=device)
+    cnt = torch.empty((rows,), dtype=torch.int32, device=device)
+    cand = torch.empty((rows, _DB1_CAP), dtype=torch.int64, device=device)
+    buf = torch.empty((world * rows * k * 2,), dtype=torch.float32, device=device)
+    _db1_chunk_max_kernel[(rows, nchunk)](
+        logits, logits.stride(0), local_vocab, cmax, nchunk, CH=_DB1_CHUNK, num_warps=4
+    )
+    _db1_threshold_kernel[(rows,)](
+        cmax, nchunk, thr, cnt, K=k, BN=_next_pow2(nchunk), num_warps=4
+    )
+    _db1_compact_kernel[(rows, nchunk)](
+        logits, logits.stride(0), local_vocab, rank * local_vocab, thr, cnt, cand,
+        CAP=_DB1_CAP, CH=_DB1_CHUNK, num_warps=4,
+    )
+    _db1_select_kernel[(rows,)](
+        logits, logits.stride(0), local_vocab, rank * local_vocab, nchunk, cand, cnt, buf, rank, rows,
+        WORLD=world, K=k, KP2=_next_pow2(k), CAP=_DB1_CAP, CH=_DB1_CHUNK, num_warps=4,
+    )
+    vals = torch.empty((rows, k), dtype=torch.float32, device=device)
+    ids = torch.empty((rows, k), dtype=torch.int64, device=device)
+    argmax = torch.empty((rows,), dtype=torch.int64, device=device)
+    _db1_global_merge_kernel[(rows,)](
+        buf, rows, vals, ids, argmax, WORLD=world, K=k, BW=_next_pow2(world * k), num_warps=4
+    )
+    torch.cuda.synchronize(device)
+
+
 _SAMPLER: Optional[ShardedVerifySampler] = None
 
 
