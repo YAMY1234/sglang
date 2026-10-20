@@ -120,6 +120,10 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_shard_kernel(const Ll16VpSha
   const int warp = t / 32;
   const int lane = static_cast<int>(get_lane_id());
   const bf16_t* row = p.logits + static_cast<int64_t>(g) * p.ld;
+  // Issued with the row loads so the push at the end waits on nothing.
+  const int owner = g / p.rows;
+  const uint32_t half = p.epoch[g] & 1u;
+  uint32_t* const owner_slots = reinterpret_cast<uint32_t*>(p.peer_slots[owner]);
   vec_t x[ll16_vp::kChunks][kPer];
 #pragma unroll
   for (int c = 0; c < ll16_vp::kChunks; ++c) {
@@ -199,8 +203,6 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_shard_kernel(const Ll16VpSha
   }
   __syncthreads();
 
-  const int owner = g / p.rows;
-  const uint32_t half = p.epoch[g] & 1u;
   const int64_t row_words = (static_cast<int64_t>(half) * p.g_max + g) * p.world * ll16_vp::kWords;
   if (threadIdx.x == 0) {
     uint32_t k = s_k[0];
@@ -216,7 +218,7 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_shard_kernel(const Ll16VpSha
     const uint4 w1 = make_uint4(
         __float_as_uint(s_cz[0]), __float_as_uint(s_cz[1]), __float_as_uint(s_cz[2]), __float_as_uint(s_cz[3]));
     const uint4 w2 = make_uint4(static_cast<uint32_t>(p.vocab_start + i), k == ll16_vp::kNanKey ? 1u : 0u, 0u, 0u);
-    uint32_t* dst = reinterpret_cast<uint32_t*>(p.peer_slots[owner]) + row_words + p.rank * ll16_vp::kWords;
+    uint32_t* dst = owner_slots + row_words + p.rank * ll16_vp::kWords;
     // The owner later reads this row's logits from our shard: publish them with the payload.
     ptx::fence_release_sys();
     ptx::st_relaxed_16B(w0, dst, 0);
@@ -284,8 +286,17 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_decide_kernel(const Ll16VpDe
   using vec_t = AlignedVector<bf16_t, 8>;
   constexpr int kWarps = kThreads / 32;
   constexpr int kMaxPer = ll16_vp::kMaxChunk / 8 / kThreads;
+  // Every per-request input the serial chain reads is staged in shared memory first (one load latency).
   __shared__ float s_mw[ll16_vp::kMaxD][ll16_vp::kMaxWorld];
   __shared__ float s_sw[ll16_vp::kMaxD][ll16_vp::kMaxWorld];
+  __shared__ float s_cm[ll16_vp::kMaxD][ll16_vp::kMaxWorld][ll16_vp::kChunks];
+  __shared__ float s_cz[ll16_vp::kMaxD][ll16_vp::kMaxWorld][ll16_vp::kChunks];
+  __shared__ uint32_t s_nan[ll16_vp::kMaxD][ll16_vp::kMaxWorld];
+  __shared__ uint32_t s_id[ll16_vp::kMaxD][ll16_vp::kMaxWorld];
+  __shared__ int64_t s_cand[ll16_vp::kMaxD];
+  __shared__ int32_t s_ret[ll16_vp::kMaxD];
+  __shared__ float s_coin[ll16_vp::kMaxD];
+  __shared__ float s_coin_final;
   __shared__ float s_M[ll16_vp::kMaxD];
   __shared__ float s_S[ll16_vp::kMaxD];
   __shared__ float s_xd[ll16_vp::kMaxD];
@@ -324,23 +335,39 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_decide_kernel(const Ll16VpDe
     }
     s_xd[xl] = xd;
   }
+  if (t < p.d) {
+    s_cand[t] = p.candidates[row0 + t];
+    s_ret[t] = static_cast<int32_t>(p.retrieve_index[row0 + t]);
+    if (p.sample) s_coin[t] = p.coins[row0 + t];
+    if (p.sample && t == 0) s_coin_final = p.coins_final[b];
+  }
   for (int pair = t; pair < p.d * p.world; pair += kThreads) {
     const int j = pair / p.world;
     const int w = pair % p.world;
-    const uint32_t* pl = p.stats + ((row0 + j) * p.world + w) * ll16_vp::kWords;
+    const uint4* pl = reinterpret_cast<const uint4*>(p.stats + ((row0 + j) * p.world + w) * ll16_vp::kWords);
+    const uint4 wm = pl[0];
+    const uint4 wz = pl[1];
+    const uint4 wi = pl[2];
+    const float mc[ll16_vp::kChunks] = {
+        __uint_as_float(wm.x), __uint_as_float(wm.y), __uint_as_float(wm.z), __uint_as_float(wm.w)};
+    const float zc[ll16_vp::kChunks] = {
+        __uint_as_float(wz.x), __uint_as_float(wz.y), __uint_as_float(wz.z), __uint_as_float(wz.w)};
     float m = -INFINITY;
 #pragma unroll
-    for (int c = 0; c < ll16_vp::kChunks; ++c)
-      m = fmaxf(m, __uint_as_float(pl[c]));
+    for (int c = 0; c < ll16_vp::kChunks; ++c) {
+      m = fmaxf(m, mc[c]);
+      s_cm[j][w][c] = mc[c];
+      s_cz[j][w][c] = zc[c];
+    }
     float s = 0.f;
 #pragma unroll
     for (int c = 0; c < ll16_vp::kChunks; ++c) {
-      const float zc = __uint_as_float(pl[ll16_vp::kChunks + c]);
-      const float mc = __uint_as_float(pl[c]);
-      if (zc != 0.f) s += mc == m ? zc : zc * __expf(mc - m);
+      if (zc[c] != 0.f) s += mc[c] == m ? zc[c] : zc[c] * __expf(mc[c] - m);
     }
     s_mw[j][w] = m;
     s_sw[j][w] = s;
+    s_id[j][w] = wi.x;
+    s_nan[j][w] = wi.y;
   }
   __syncthreads();
   if (t < p.d) {
@@ -354,12 +381,11 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_decide_kernel(const Ll16VpDe
       const float mw = s_mw[t][w];
       const float sw = s_sw[t][w];
       if (sw != 0.f) S += mw == M ? sw : sw * __expf(mw - M);
-      const uint32_t* pl = p.stats + ((row0 + t) * p.world + w) * ll16_vp::kWords;
-      const uint32_t key = pl[ll16_vp::kChunks * 2 + 1] != 0u ? ll16_vp::kNanKey : ll16_vp::order_key(mw);
+      const uint32_t key = s_nan[t][w] != 0u ? ll16_vp::kNanKey : ll16_vp::order_key(mw);
       // Shards are in vocab order: a later shard wins only with a strictly larger key.
       if (w == 0 || key > bk) {
         bk = key;
-        bid = static_cast<int64_t>(pl[ll16_vp::kChunks * 2]);
+        bid = static_cast<int64_t>(s_id[t][w]);
       }
     }
     s_M[t] = M;
@@ -370,8 +396,8 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_decide_kernel(const Ll16VpDe
   __syncthreads();
 
   if (t == 0) {
-    float coin = p.coins[row0];
-    int32_t last_ret = static_cast<int32_t>(p.retrieve_index[row0]);
+    float coin = s_coin[0];
+    int32_t last_ret = s_ret[0];
     p.accept_index[static_cast<int64_t>(b) * p.accept_width] = last_ret;
     int32_t accepted = 0;
     int32_t cur_row = 0;
@@ -385,16 +411,16 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_decide_kernel(const Ll16VpDe
       const float m_safe = M > -INFINITY ? M : 0.f;
       const float xd = s_xd[r];
       const float q = xd > -INFINITY ? __expf(xd - m_safe) / s_S[r] : 0.f;
-      const int64_t dtok = p.candidates[row0 + j];
+      const int64_t dtok = s_cand[j];
       const bool acc = alive && q > 0.f && (coin < q || q >= 1.f);
       if (acc) {
         p.predict[last_ret] = static_cast<int32_t>(dtok);
-        const int32_t ret_j = static_cast<int32_t>(p.retrieve_index[row0 + j]);
+        const int32_t ret_j = s_ret[j];
         ++accepted;
         p.accept_index[static_cast<int64_t>(b) * p.accept_width + accepted] = ret_j;
         last_ret = ret_j;
         cur_row = j;
-        coin = p.coins[row0 + j];
+        coin = s_coin[j];
       } else if (alive) {
         excl = dtok;
         q_excl = q;
@@ -416,7 +442,7 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_decide_kernel(const Ll16VpDe
       if (w == excl_owner) mass = mass - q_excl;
       total += fmaxf(mass, 0.f);
     }
-    const float u = p.coins_final[b] * total;
+    const float u = s_coin_final * total;
     float cum = 0.f;
     int sel = -1;
     float u_sel = 0.f;
@@ -443,11 +469,10 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_decide_kernel(const Ll16VpDe
     }
     const int64_t excl_local = excl - static_cast<int64_t>(sel) * p.vocab;
     const bool excl_here = excl >= 0 && excl_local >= 0 && excl_local < p.vocab;
-    const uint32_t* pl = p.stats + ((row0 + r) * p.world + sel) * ll16_vp::kWords;
     float cmass[ll16_vp::kChunks];
     for (int c = 0; c < ll16_vp::kChunks; ++c) {
-      const float mc = __uint_as_float(pl[c]);
-      const float zc = __uint_as_float(pl[ll16_vp::kChunks + c]);
+      const float mc = s_cm[r][sel][c];
+      const float zc = s_cz[r][sel][c];
       float mass = mc > -INFINITY ? zc * __expf(mc - m_safe) / S : 0.f;
       if (excl_here && c == static_cast<int>(excl_local / p.chunk)) mass = fmaxf(mass - q_excl, 0.f);
       cmass[c] = mass;
