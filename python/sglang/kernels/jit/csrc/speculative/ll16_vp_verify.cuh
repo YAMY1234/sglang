@@ -152,8 +152,10 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_shard_kernel(const Ll16VpSha
   for (int c = 0; c < ll16_vp::kChunks; ++c) {
     const int lo8 = min(c * p.chunk, p.vocab) / 8;
     const int hi8 = min(c * p.chunk + p.chunk, p.vocab) / 8;
+    // Branch-free two passes over this thread's elements of the chunk (max, then sum-exp): the fully
+    // unrolled body stays small enough for the instruction cache. A thread visits its ids in increasing
+    // order, so a strictly larger key keeps the lowest id among equal ones.
     float m = -INFINITY;
-    float z = 0.f;
 #pragma unroll
     for (int i = 0; i < kPer; ++i) {
       const int v = lo8 + t + i * kThreads;
@@ -162,21 +164,22 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_shard_kernel(const Ll16VpSha
       for (int e = 0; e < 8; ++e) {
         const float f = cast<fp32_t>(x[c][i][e]);
         const uint32_t key = f == f ? ll16_vp::order_key(f) : ll16_vp::kNanKey;
-        const int32_t idx = v * 8 + e;
-        if (ll16_vp::better(key, idx, best, bidx)) {
-          best = key;
-          bidx = idx;
-        }
-        if (f == f && f != -INFINITY) {
-          if (f > m) {
-            z = z * __expf(m - f) + 1.f;
-            m = f;
-          } else if (f == m) {
-            z += 1.f;
-          } else {
-            z += __expf(f - m);
-          }
-        }
+        const bool take = key > best;
+        best = take ? key : best;
+        bidx = take ? v * 8 + e : bidx;
+        m = (f == f && f != -INFINITY) ? fmaxf(m, f) : m;
+      }
+    }
+    float z = 0.f;
+#pragma unroll
+    for (int i = 0; i < kPer; ++i) {
+      const int v = lo8 + t + i * kThreads;
+      if (v >= hi8) continue;
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        const float f = cast<fp32_t>(x[c][i][e]);
+        const float w = f == m ? 1.f : __expf(f - m);
+        z += (f == f && f != -INFINITY) ? w : 0.f;
       }
     }
 #pragma unroll
