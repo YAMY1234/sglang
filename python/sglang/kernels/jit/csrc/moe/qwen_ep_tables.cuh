@@ -22,9 +22,10 @@ namespace qwen_ep_tables {
 
 inline constexpr uint32_t kThreads = 1024;
 inline constexpr uint32_t kMaxLocalExperts = 256;
-// Entries per thread: 6 covers DEP4 decode (448 rows x top-10); 9 covers DEP8 decode (896 rows x top-10).
+// Entries per thread: 6 covers DEP4 decode (448 rows x top-10); 11 covers DEP16 decode at 10 requests per rank
+// (1120 rows x top-10).
 inline constexpr uint32_t kSmallPerThread = 6;
-inline constexpr uint32_t kMaxPerThread = 9;
+inline constexpr uint32_t kMaxPerThread = 11;
 
 struct Params {
   const int32_t* topk_ids;               // [R * top_k], global expert ids

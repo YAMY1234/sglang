@@ -28,7 +28,7 @@ namespace e2x_dep {
 inline constexpr uint32_t kMarker = 0xffffffffu;
 inline constexpr uint32_t kSpinLimit = 1u << 26;
 inline constexpr int kMaxBlocks = 32;
-inline constexpr int kMaxWorld = 8;
+inline constexpr int kMaxWorld = 16;
 
 SGL_DEVICE uint32_t order_key(float f) {
   uint32_t b = __float_as_uint(f);

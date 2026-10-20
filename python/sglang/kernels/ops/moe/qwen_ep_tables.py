@@ -11,8 +11,8 @@ from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit, 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-# csrc kThreads x kMaxPerThread: DEP8 decode at 16 requests per rank (896 rows x top-10) fits; prefill does not.
-EP_TABLES_MAX_EXPANDED = 1024 * 9
+# csrc kThreads x kMaxPerThread: DEP16 decode at 10 requests per rank (1120 rows x top-10) fits; prefill does not.
+EP_TABLES_MAX_EXPANDED = 1024 * 11
 
 
 @cache_once

@@ -19,7 +19,7 @@ namespace sglang {
 namespace qwen_dep_ll_a2a {
 
 inline constexpr uint32_t kThreads = 256;
-inline constexpr uint32_t kMaxRanks = 8;
+inline constexpr uint32_t kMaxRanks = 16;
 inline constexpr uint32_t kMaxTokens = 128;
 inline constexpr uint32_t kDispatchStages = 2;
 inline constexpr uint32_t kCombineStages = 3;
