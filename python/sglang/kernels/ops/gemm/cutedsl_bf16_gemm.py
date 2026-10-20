@@ -39,8 +39,9 @@ from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
 from sglang.kernels.kernel_api_logging import debug_kernel_api
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_sm100_supported
-from sglang.srt.utils.common import direct_register_custom_op
+from sglang.srt.utils.common import direct_register_custom_op, print_info_once
 
 # Tuple format: (cta_m, cta_n, num_ab_stage, use_2cta); cta_k is fixed at
 # 128. Sorted within each use_2cta block by (cta_m, cta_n, num_ab_stage).
@@ -165,7 +166,8 @@ class TgvGemmCuteExtKernel:
         return (
             f"TgvGemmCuteExtKernel_cta{self.cta_m}x{self.cta_n}x{self.cta_k}"
             f"_2cta{int(self.use_2cta)}_pdl{int(self.use_pdl)}"
-            f"_bias{int(self.has_bias)}"
+            + (f"_rel{self.pdl_count}" if self.pdl_count >= 0 else "")
+            + f"_bias{int(self.has_bias)}"
             f"_out{self.out_dtype.__name__.lower()}"
         )
 
@@ -1110,6 +1112,7 @@ def _get_compiled_cute_ext_kernel(
     a_leading: int,
     b_leading: int,
     c_leading: int,
+    pdl_count: int = -1,
 ):
     """Compile (or fetch from cache) a TgvGemmCuteExtKernel for the given
     config + layout pattern. Returns a callable with signature
@@ -1131,6 +1134,7 @@ def _get_compiled_cute_ext_kernel(
         a_leading,
         b_leading,
         c_leading,
+        pdl_count,
     )
     cached = _TGV_CUTE_EXT_COMPILE_CACHE.get(key)
     if cached is not None:
@@ -1154,6 +1158,7 @@ def _get_compiled_cute_ext_kernel(
         num_ab_stage=num_ab_stage,
         use_2cta=use_2cta,
         use_pdl=use_pdl,
+        pdl_count=pdl_count,
         has_bias=has_bias,
         out_dtype=_TORCH_TO_CUTLASS_OUT_DTYPE[c_dtype],
     )
@@ -1266,8 +1271,10 @@ def _run_tgv(
     out: torch.Tensor,
     pdl: bool,
     tactic: int,
+    pdl_count: int = -1,
 ) -> torch.Tensor:
-    """Dispatch one TGV GEMM: a (M, K) @ b (K, N) -> out (M, N), bias (N,)."""
+    """Dispatch one TGV GEMM: a (M, K) @ b (K, N) -> out (M, N), bias (N,).
+    pdl_count: k-tile at which dependents are released (-1: after the weight DMA loop)."""
     cta_m, cta_n, num_ab_stage, use_2cta = _resolve_tactic(tactic)
     has_bias = bias is not None
 
@@ -1291,6 +1298,7 @@ def _run_tgv(
         a_leading=a_leading,
         b_leading=b_leading,
         c_leading=c_leading,
+        pdl_count=pdl_count,
     )
 
     stream = cuda.CUstream(torch.cuda.current_stream(a.device).cuda_stream)
@@ -1387,6 +1395,15 @@ def use_cutedsl_bf16_gemm(m: int, n: int, k: int) -> bool:
     return n <= 12288 and k >= 6144 and (m <= 32 or (m <= 48 and ragged))
 
 
+def _release_tile(m: int) -> int:
+    # SGLANG_Q35MF_LL16_TGV_EARLY: one-token GEMMs release their dependents at the first k-tile; the dependents
+    # still wait for this grid before reading its output.
+    if m == 1 and envs.SGLANG_Q35MF_LL16_TGV_EARLY.get():
+        print_info_once("One-token TGV GEMMs release their dependents at the first k-tile.")
+        return 0
+    return -1
+
+
 def _tgv_bf16_gemm_run(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1411,6 +1428,7 @@ def _tgv_bf16_gemm_run(
         out,
         pdl=True,
         tactic=_pick_tactic(x.shape[0], weight.shape[0], weight.shape[1]),
+        pdl_count=_release_tile(x.shape[0]),
     )
 
 
@@ -1437,6 +1455,7 @@ def _tgv_bf16_gemm_out_run(
         out,
         pdl=True,
         tactic=_pick_tactic(x.shape[0], weight.shape[0], weight.shape[1]),
+        pdl_count=_release_tile(x.shape[0]),
     )
     return None
 
