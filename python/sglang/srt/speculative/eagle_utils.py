@@ -18,6 +18,7 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
 )
+from sglang.srt.layers import ll16_vp_verify
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
 from sglang.srt.mem_cache.allocation_sizing import (
     get_alloc_reserve_per_decode,
@@ -774,6 +775,43 @@ def _sample_on_vocab_shards(
     return argmax.reshape(candidates.shape), not greedy
 
 
+def _sample_on_dep_vocab_shards(
+    *,
+    vp: ll16_vp_verify.VpVerify,
+    sampling_info: SamplingBatchInfo,
+    verify_input: EagleVerifyInput,
+    batch: ScheduleBatch,
+    candidates: torch.Tensor,
+    predict: torch.Tensor,
+    accept_index: torch.Tensor,
+    num_correct_drafts: torch.Tensor,
+    device,
+) -> Tuple[torch.Tensor, bool]:
+    """Verify on the DEP shard exchange: (argmax [bs, draft_token_num], sampled); sampled batches
+    also get predict / accept_index / num_correct_drafts written."""
+    greedy = sampling_info.is_all_greedy
+    coins = (
+        None
+        if greedy
+        else _verify_coins(
+            sampling_info=sampling_info,
+            seq_lens=batch.seq_lens,
+            draft_token_num=verify_input.draft_token_num,
+            candidates=candidates,
+            device=device,
+        )
+    )
+    argmax = vp.sample(
+        candidates=candidates,
+        retrieve_index=verify_input.retrieve_index,
+        predict=predict,
+        accept_index=accept_index,
+        num_correct_drafts=num_correct_drafts,
+        coins=coins,
+    )
+    return argmax, not greedy
+
+
 _PACKED_VERIFY_BCAST = (
     os.environ.get("SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST", "0") == "1"
 )
@@ -871,6 +909,7 @@ def eagle_sample(
     watermark_full_mask: bool = True,
     simulated_acc_len: Optional[torch.Tensor] = None,
     sparse_bonus_argmax: bool = False,
+    vp_all_t1: Optional[bool] = None,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
@@ -901,6 +940,29 @@ def eagle_sample(
     bs = len(batch.seq_lens)
     sampling_info = batch.sampling_info
     next_token_logits = logits_output.next_token_logits
+
+    # Shard logits of the DEP verify exchange: batches its sampler cannot take pull their whole
+    # rows first (no collective), before anything below reads or writes the logits.
+    vp = ll16_vp_verify.owner_of(next_token_logits)
+    if vp is not None:
+        reason = vp.ineligible_reason(
+            sampling_info=sampling_info,
+            verify_input=verify_input,
+            batch=batch,
+            grammar_mask=grammar_mask,
+            watermark_state=watermark_state,
+            use_rejection_sampling=get_spec().speculative_use_rejection_sampling,
+            uno_target_max_top_k=uno_target_max_top_k,
+            all_t1=(
+                vp_all_t1
+                if vp_all_t1 is not None
+                else ll16_vp_verify.all_temperature_one(batch.reqs)
+            ),
+        )
+        if reason is not None:
+            next_token_logits = vp.pull_rows(rows=next_token_logits.shape[0])
+            logits_output.next_token_logits = next_token_logits
+            vp = None
 
     sanitize_nan_logits(next_token_logits, "verify: target model logits")
 
@@ -1002,7 +1064,19 @@ def eagle_sample(
     sharded_argmax, sharded_sampled = None, False
     from sglang.srt.layers.logits_processor import verify_logits_on_shards
 
-    if verify_logits_on_shards(next_token_logits):
+    if vp is not None:
+        sharded_argmax, sharded_sampled = _sample_on_dep_vocab_shards(
+            vp=vp,
+            sampling_info=sampling_info,
+            verify_input=verify_input,
+            batch=batch,
+            candidates=candidates,
+            predict=predict,
+            accept_index=accept_index,
+            num_correct_drafts=num_correct_drafts,
+            device=device,
+        )
+    elif verify_logits_on_shards(next_token_logits):
         sharded_argmax, sharded_sampled = _sample_on_vocab_shards(
             logits=next_token_logits,
             sampling_info=sampling_info,

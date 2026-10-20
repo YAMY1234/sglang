@@ -32,7 +32,7 @@ from sglang.kernels.ops.activation.softcap import (
 from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
-from sglang.srt.layers import layernorm_sp
+from sglang.srt.layers import layernorm_sp, ll16_vp_verify
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStates, pack_aux_hidden_states
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -454,6 +454,8 @@ _VERIFY_SHARD_SOURCE: Optional["LogitsProcessor"] = None
 
 def verify_logits_on_shards(logits: torch.Tensor) -> bool:
     """Whether these target-verify logits came back shard-local (narrower than the vocab)."""
+    if ll16_vp_verify.owner_of(logits) is not None:
+        return True
     return (
         _VERIFY_SHARD_SOURCE is not None
         and logits.shape[-1] < _VERIFY_SHARD_SOURCE.vocab_size
@@ -462,6 +464,9 @@ def verify_logits_on_shards(logits: torch.Tensor) -> bool:
 
 def gather_verify_logits(logits: torch.Tensor) -> torch.Tensor:
     """Undo the shard-local return of target-verify logits for the stock paths."""
+    vp = ll16_vp_verify.owner_of(logits)
+    if vp is not None:
+        return vp.pull_rows(rows=logits.shape[0])
     return _VERIFY_SHARD_SOURCE.gather_verify_logits(logits)
 
 
@@ -547,6 +552,8 @@ class LogitsProcessor(nn.Module):
         # Set by the EAGLE worker for its draft head (SGLANG_Q35MF_K75P_LMHEAD).
         self.k75p_draft_select: Optional[K75PDraftSelect] = None
         self.k75p_proof: Optional[K75PProof] = None
+        # Set by the EAGLE worker for the target head (SGLANG_Q35MF_LL16_VPSAMP).
+        self.ll16_vp: Optional[ll16_vp_verify.VpVerify] = None
 
     def enable_k75p_draft_select(
         self, *, lm_head: VocabParallelEmbedding, max_rows: int, hidden_size: int
@@ -567,6 +574,61 @@ class LogitsProcessor(nn.Module):
         )
         if self.k75p_draft_select is not None and envs.SGLANG_Q35MF_K75P_PROOF.get():
             self.k75p_proof = K75PProof()
+
+    def enable_ll16_vp(self, *, lm_head: VocabParallelEmbedding, max_rows: int) -> None:
+        parallel = get_parallel()
+        if not (
+            self.do_tensor_parallel_all_gather_dp_attn
+            and self.use_tp_lm_head_all_to_all
+            and self.logit_scale is None
+            and self.final_logit_softcapping is None
+            and not self.use_fp32_lm_head
+            and not hasattr(lm_head, "set_lora")
+            and not should_apply_lm_head_quant_method(
+                lm_head, getattr(lm_head, "quant_method", None)
+            )
+            and lm_head.weight.dtype == torch.bfloat16
+            and lm_head.weight.shape[0] * parallel.tp_size == self.vocab_size
+            and lm_head.weight.shape[0] % 8 == 0
+        ):
+            logger.warning(
+                "LL16 VP verify sampling disabled: unsupported LM head layout."
+            )
+            return
+        tp_group = parallel.tp_group
+        self.ll16_vp = ll16_vp_verify.create(
+            device_group=tp_group.device_group,
+            rank=tp_group.rank_in_group,
+            world=tp_group.world_size,
+            max_rows=max_rows,
+            vocab_local=lm_head.weight.shape[0],
+            vocab_size=self.vocab_size,
+        )
+
+    def _ll16_vp_rows(
+        self,
+        hidden_states: torch.Tensor,
+        local_hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
+        embedding_bias: Optional[torch.Tensor],
+    ) -> int:
+        """Rows per rank when this target verify takes the shard exchange, else 0; the switch is read
+        at capture. The layout guard is the logits all-to-all's, so every rank makes the same choice."""
+        if (
+            self.ll16_vp is None
+            or not envs.SGLANG_Q35MF_LL16_VPSAMP.get()
+            or not logits_metadata.forward_mode.is_target_verify()
+            or embedding_bias is not None
+            or not self.do_tensor_parallel_all_gather
+            or self.use_attn_tp_group
+            or not self._can_use_tp_lm_head_all_to_all(
+                hidden_states, local_hidden_states, lm_head, logits_metadata
+            )
+        ):
+            return 0
+        rows = local_hidden_states.shape[0]
+        return rows if self.ll16_vp.fits(hidden_states=hidden_states, rows=rows) else 0
 
     def forward(
         self,
@@ -1037,9 +1099,19 @@ class LogitsProcessor(nn.Module):
             if self.do_tensor_parallel_all_gather_dp_attn
             else LoRABatchLayout.DP_LOCAL
         )
+        vp_rows = self._ll16_vp_rows(
+            hidden_states, local_hidden_states, lm_head, logits_metadata, embedding_bias
+        )
         with get_forward().scoped(lora_batch_layout=lora_batch_layout):
-            logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
+            if vp_rows:
+                logits = self.ll16_vp.lm_head(
+                    hidden_states=hidden_states, weight=lm_head.weight
+                )
+            else:
+                logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
         _trace_e2e_logits("lm_head_returned", logits_shape=tuple(logits.shape))
+        if vp_rows:
+            return self.ll16_vp.exchange(logits=logits, rows=vp_rows)
         if envs.SGLANG_TRACE_LOGITS_E2E_SYNC.get():
             _trace_e2e_logits("post_lm_head_sync_enter")
             torch.cuda.synchronize()

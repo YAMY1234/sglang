@@ -29,6 +29,7 @@ import torch
 from sglang.kernels.ops.memory.small_field_copy import SmallFieldCopyPlan
 from sglang.kernels.ops.speculative.eagle import prepare_verify_commit_outputs
 from sglang.srt.environ import envs
+from sglang.srt.layers import ll16_vp_verify
 from sglang.srt.model_executor.runner_backend import ab_variants
 from sglang.srt.runtime_context import get_parallel, get_spec, mamba_track_grid
 
@@ -92,6 +93,7 @@ def sparse_verify_max_top_k(batch) -> Optional[int]:
 def _count_acceptance_calls():
     # eagle_sample resolves both kernels through these module attributes at call time.
     from sglang.kernels.ops.speculative import sampling as sampling_ops
+    from sglang.srt.layers.ll16_vp_verify import VpVerify
     from sglang.srt.speculative import eagle_utils
     from sglang.srt.speculative.sharded_verify_sampling import ShardedVerifySampler
 
@@ -100,6 +102,7 @@ def _count_acceptance_calls():
     greedy_fn = eagle_utils.verify_tree_greedy_func
     tree_fn = sampling_ops.tree_speculative_sampling_target_only
     sharded_fn = ShardedVerifySampler.run
+    vp_fn = VpVerify.sample
 
     def counted(fn, sharded=False):
         def call(*args, **kwargs):
@@ -120,9 +123,11 @@ def _count_acceptance_calls():
         local_ops.sample_chain_full_vocab = counted(local_fn)
     # The sharded sampler decides acceptance inside its own kernels.
     ShardedVerifySampler.run = counted(sharded_fn, sharded=True)
+    VpVerify.sample = counted(vp_fn, sharded=True)
     try:
         yield calls
     finally:
+        VpVerify.sample = vp_fn
         eagle_utils.verify_tree_greedy_func = greedy_fn
         sampling_ops.tree_speculative_sampling_target_only = tree_fn
         if local_on:
@@ -377,6 +382,12 @@ class PostVerifyGraph:
             )
         ):
             return None
+        # On the DEP shard exchange the graph's sampler depends on every temperature being 1.
+        vp_all_t1 = (
+            ll16_vp_verify.all_temperature_one(batch.reqs)
+            if ll16_vp_verify.owner_of(logits_output.next_token_logits) is not None
+            else None
+        )
         return (
             bs,
             bool(info.is_all_greedy),
@@ -386,6 +397,7 @@ class PostVerifyGraph:
             batch.mamba_track_indices is not None,
             num_draft_tokens,
             verify_input.max_tree_depth,
+            vp_all_t1,
         )
 
     def _gather_inputs(self, batch, verify_input) -> Dict[str, torch.Tensor]:
@@ -651,6 +663,7 @@ class PostVerifyGraph:
             uno_target_max_top_k=self._max_top_k,
             simulated_acc_len=x["sim_len"],
             sparse_bonus_argmax=self._max_top_k is not None,
+            vp_all_t1=ll16_vp_verify.all_temperature_one(batch.reqs),
         )
         track_interval = (
             mamba_track_grid(batch.tree_cache.page_size)

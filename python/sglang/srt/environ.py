@@ -1370,6 +1370,15 @@ class Envs:
     # With DEP_DX_XCHG engaged, a memo of the whole vocab's normed embedding rows on every rank
     # (2 GB on Qwen3.5) feeds the next draft step's fc input; it skips embed, both norms and cat.
     SGLANG_Q35MF_DEP_DX_MEMO_FULL = EnvBool(False)
+    # Target-verify sampling on the vocab-parallel TP head under attention DP (temperature 1, no top-k / top-p /
+    # min-p): the LM head writes its shard logits into symmetric memory and only per-row payloads move.
+    SGLANG_Q35MF_LL16_VPSAMP = EnvBool(False)
+    # Build the SGLANG_Q35MF_LL16_VPSAMP buffers even when the switch is off at init (same-server A/B variants
+    # turn the switch on at capture).
+    SGLANG_Q35MF_LL16_VPSAMP_BUFFERS = EnvBool(False)
+    # With SGLANG_Q35MF_LL16_VPSAMP engaged, also pull every verify row whole and count argmax and same-coin
+    # chain mismatches against the one-rank chunked sampler; a thread logs the counters every 30 s.
+    SGLANG_Q35MF_LL16_VPSAMP_PROOF = EnvBool(False)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)

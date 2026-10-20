@@ -322,6 +322,26 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 )
                 model._dep_dx = self._dep_draft_xchg
 
+        if (
+            (
+                envs.SGLANG_Q35MF_LL16_VPSAMP.get()
+                or envs.SGLANG_Q35MF_LL16_VPSAMP_BUFFERS.get()
+            )
+            and _is_cuda
+            and self.topk == 1
+            and not get_spec().speculative_use_rejection_sampling
+        ):
+            # Before the target graphs are captured; verify rows per rank of the largest decode graph.
+            graph_config = get_exec().graph.cuda_graph_config
+            decode_max_bs = (
+                graph_config.decode.max_bs if graph_config is not None else None
+            ) or 1
+            target_model = self.target_worker.model_runner.model
+            target_model.logits_processor.enable_ll16_vp(
+                lm_head=target_model.lm_head,
+                max_rows=decode_max_bs * self.speculative_num_draft_tokens,
+            )
+
     def init_attention_backends(self):
         with (
             draft_pp_context(),
