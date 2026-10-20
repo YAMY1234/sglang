@@ -272,7 +272,7 @@ def router_tail_dep(
 
 
 SPLITK_MAX_TOKENS = 64
-# fp32 partial logits [16 slices, 64 tokens, 512 experts], one per device; MoE layers run it one after another.
+# fp32 partial logits [32 slices, 64 tokens, 512 experts], one per device; MoE layers run it one after another.
 _splitk_part: dict = {}
 
 
@@ -281,7 +281,7 @@ def _splitk_workspace(device: torch.device) -> torch.Tensor:
     part = _splitk_part.get(key)
     if part is None:
         part = _splitk_part[key] = torch.empty(
-            16 * SPLITK_MAX_TOKENS * NUM_EXPERTS, dtype=torch.float32, device=device
+            32 * SPLITK_MAX_TOKENS * NUM_EXPERTS, dtype=torch.float32, device=device
         )
     return part
 
@@ -292,7 +292,7 @@ def router_splitk_front(
     global_scale: torch.Tensor,
     slices: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Split-K router GEMM (`slices` = 8 or 16 K slices, fp32 partials summed in increasing slice order), softmax
+    """Split-K router GEMM (`slices` = 8, 16 or 32 K slices, fp32 partials summed in increasing slice order), softmax
     top-10 + renormalize and NVFP4 input quant (M <= 64). Same outputs as router_topk_quant."""
     m = x.shape[0]
     logits = torch.empty((m, NUM_EXPERTS), dtype=torch.bfloat16, device=x.device)
