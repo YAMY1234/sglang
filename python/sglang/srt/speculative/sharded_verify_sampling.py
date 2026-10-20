@@ -370,6 +370,98 @@ def _commit_kernel(sel_ptr, tok_ptr, predict_ptr):
     tl.store(predict_ptr + last_ret, tl.load(tok_ptr + b).to(tl.int32))
 
 
+# ---------------------------------------------------------------- compact top-k support on shards
+# Candidates travel as packed int64 keys: the high half orders the float32 value (larger first, -0.0 equal
+# to +0.0, NaN above everything, as torch.argmax ranks it) and the low half the inverted global id, so a
+# descending sort puts the lower id first among equal values.
+_DB1_CHUNK = 1024
+DB1_MAX_TOP_K = 32
+_I64_MIN = tl.constexpr(-9223372036854775807 - 1)
+
+
+@triton.jit
+def _db1_key(x):
+    u = x.to(tl.int32, bitcast=True).to(tl.int64) & 0xFFFFFFFF
+    u = tl.where(u == 0x80000000, 0, u)
+    key = tl.where(u >= 0x80000000, 0xFFFFFFFF - u, u + 0x80000000)
+    return tl.where(x != x, 0xFFFFFFFF, key)
+
+
+@triton.jit
+def _db1_value(key):
+    bits = tl.where(key >= 0x80000000, key - 0x80000000, 0xFFFFFFFF - key)
+    bits = tl.where(key == 0xFFFFFFFF, 0x7FC00000, bits)
+    return bits.to(tl.uint32).to(tl.float32, bitcast=True)
+
+
+@triton.jit
+def _db1_chunk_topk_kernel(
+    logits_ptr,
+    stride_row,
+    local_vocab,
+    vocab_start,
+    scratch_ptr,
+    nchunk,
+    K: tl.constexpr,
+    CH: tl.constexpr,
+):
+    r = tl.program_id(0)
+    c = tl.program_id(1)
+    offs = c * CH + tl.arange(0, CH)
+    m = offs < local_vocab
+    x = tl.load(logits_ptr + r * stride_row + offs, mask=m, other=0.0).to(tl.float32)
+    gid = (offs + vocab_start).to(tl.int64)
+    packed = ((_db1_key(x) - 2147483648) << 32) | (0x7FFFFFFF - gid)
+    packed = tl.where(m, packed, _I64_MIN)
+    srt = tl.sort(packed, 0, descending=True)
+    k = tl.arange(0, CH)
+    tl.store(scratch_ptr + (r * nchunk + c) * K + k, srt, mask=k < K)
+
+
+@triton.jit
+def _db1_row_merge_kernel(
+    scratch_ptr, nchunk, buf_ptr, rank, rows, K: tl.constexpr, BM: tl.constexpr
+):
+    r = tl.program_id(0)
+    i = tl.arange(0, BM)
+    x = tl.load(scratch_ptr + r * nchunk * K + i, mask=i < nchunk * K, other=_I64_MIN)
+    srt = tl.sort(x, 0, descending=True)
+    key = (srt >> 32) + 2147483648
+    gid = 0x7FFFFFFF - (srt & 0xFFFFFFFF)
+    m = i < K
+    base = buf_ptr + (rank * rows + r) * K * 2
+    tl.store(base + 2 * i, _db1_value(key), mask=m)
+    tl.store(base + 2 * i + 1, gid.to(tl.float32), mask=m)
+
+
+@triton.jit
+def _db1_global_merge_kernel(
+    buf_ptr,
+    rows,
+    out_val_ptr,
+    out_id_ptr,
+    out_arg_ptr,
+    WORLD: tl.constexpr,
+    K: tl.constexpr,
+    BW: tl.constexpr,
+):
+    r = tl.program_id(0)
+    i = tl.arange(0, BW)
+    valid = i < WORLD * K
+    off = (((i // K) * rows + r) * K + i % K) * 2
+    v = tl.load(buf_ptr + off, mask=valid, other=0.0)
+    g = tl.load(buf_ptr + off + 1, mask=valid, other=0.0).to(tl.int64)
+    packed = ((_db1_key(v) - 2147483648) << 32) | (0x7FFFFFFF - g)
+    packed = tl.where(valid, packed, _I64_MIN)
+    srt = tl.sort(packed, 0, descending=True)
+    key = (srt >> 32) + 2147483648
+    gid = 0x7FFFFFFF - (srt & 0xFFFFFFFF)
+    m = i < K
+    tl.store(out_val_ptr + r * K + i, _db1_value(key), mask=m)
+    tl.store(out_id_ptr + r * K + i, gid, mask=m)
+    tl.store(out_arg_ptr + r, tl.max(tl.where(i == 0, gid, -1), axis=0))
+
+
 def _next_pow2(n: int) -> int:
     return 1 << max(0, (n - 1).bit_length())
 
@@ -665,6 +757,88 @@ class ShardedVerifySampler:
             tok = tensor_model_parallel_all_reduce(tok)
             _commit_kernel[(bs,)](sel, tok, predict)
         return argmax
+
+    def db1_reason(
+        self,
+        *,
+        logits,
+        sampling_info,
+        verify_input,
+        batch,
+        grammar_mask,
+        watermark_state,
+        use_rejection_sampling,
+        max_top_k,
+    ) -> Optional[str]:
+        """Why a sampled verify cannot build its compact top-k support on the shards (None: it can)."""
+        if max_top_k is None or max_top_k > DB1_MAX_TOP_K:
+            return "no compact top-k support"
+        if sampling_info.is_all_greedy:
+            return "greedy"
+        if sampling_info.need_min_p_sampling:
+            return "min-p"
+        reason = self.eligible_reason(
+            logits=logits,
+            sampling_info=sampling_info,
+            verify_input=verify_input,
+            batch=batch,
+            grammar_mask=grammar_mask,
+            watermark_state=watermark_state,
+            use_rejection_sampling=use_rejection_sampling,
+            uno_target_max_top_k=None,
+        )
+        return None if reason == "top-k / top-p / min-p" else reason
+
+    def sparse_support(
+        self, *, logits: torch.Tensor, max_top_k: int
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Global top-k of every row from shard-local logits [R, V / world], identical on every rank:
+        (ids [R, k] int64, float32 values [R, k], argmax [R] int64), larger value first and the lower id
+        among equals; the values equal the gathered float32 logits, the argmax equals torch.argmax."""
+        rows, local_vocab = logits.shape
+        dev = logits.device
+        k = int(max_top_k)
+        nchunk = triton.cdiv(local_vocab, _DB1_CHUNK)
+        scratch = torch.empty((rows, nchunk, k), dtype=torch.int64, device=dev)
+        _db1_chunk_topk_kernel[(rows, nchunk)](
+            logits,
+            logits.stride(0),
+            local_vocab,
+            self.rank * local_vocab,
+            scratch,
+            nchunk,
+            K=k,
+            CH=_DB1_CHUNK,
+            num_warps=4,
+        )
+        buf = torch.zeros((self.world * rows * k * 2,), dtype=torch.float32, device=dev)
+        _db1_row_merge_kernel[(rows,)](
+            scratch,
+            nchunk,
+            buf,
+            self.rank,
+            rows,
+            K=k,
+            BM=_next_pow2(nchunk * k),
+            num_warps=8,
+        )
+        if self.world > 1:
+            buf = tensor_model_parallel_all_reduce(buf)
+        vals = torch.empty((rows, k), dtype=torch.float32, device=dev)
+        ids = torch.empty((rows, k), dtype=torch.int64, device=dev)
+        argmax = torch.empty((rows,), dtype=torch.int64, device=dev)
+        _db1_global_merge_kernel[(rows,)](
+            buf,
+            rows,
+            vals,
+            ids,
+            argmax,
+            WORLD=self.world,
+            K=k,
+            BW=_next_pow2(self.world * k),
+            num_warps=4,
+        )
+        return ids, vals, argmax
 
     def count(self, kind: str, bs: int) -> None:
         if not self.logged and kind != "gathered":

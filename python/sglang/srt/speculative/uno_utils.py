@@ -175,6 +175,48 @@ def _build_sparse_target_support_tensors(
     )
 
 
+@torch.compile(dynamic=True)
+def _sparse_target_probs_from_support(
+    topk_logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    batch_size: int,
+    forward_width: int,
+    max_top_k: int,
+) -> torch.Tensor:
+    """The probabilities of _build_sparse_target_support_tensors for a support whose sorted top-k
+    logits are already known (the same operations after its top-k)."""
+    rows = batch_size * forward_width
+    expanded_temperatures = torch.repeat_interleave(
+        temperatures,
+        forward_width,
+        dim=0,
+    ).reshape(rows, -1)
+    expanded_top_ks = torch.repeat_interleave(
+        top_ks,
+        forward_width,
+        dim=0,
+    ).reshape(rows, 1)
+    expanded_top_ps = torch.repeat_interleave(
+        top_ps,
+        forward_width,
+        dim=0,
+    ).reshape(rows, 1)
+    ranks = torch.arange(
+        max_top_k,
+        dtype=expanded_top_ks.dtype,
+        device=topk_logits.device,
+    )[None, :]
+    probs = _normalize_sparse_topk_probs(
+        topk_logits,
+        expanded_temperatures,
+        ranks < expanded_top_ks,
+        expanded_top_ps,
+    )
+    return probs.view(batch_size, forward_width, max_top_k)
+
+
 def _build_sparse_target_support(
     *,
     next_token_logits: torch.Tensor,
@@ -500,6 +542,39 @@ def sample_uno_tree_target_tokens(
         max_top_k=max_top_k,
     )
     return _sample_from_support(support_ids, support_probs)
+
+
+def sample_uno_tree_target_from_support(
+    *,
+    support_ids: torch.Tensor,
+    support_logits: torch.Tensor,
+    sampling_info: Any,
+    batch_size: int,
+    verify_width: int,
+    max_top_k: int,
+) -> torch.Tensor:
+    """sample_uno_tree_target_tokens for a support built elsewhere (sorted top-k ids and float32 logits
+    [rows, max_top_k]); same normalization and draw."""
+    if bool(getattr(sampling_info, "need_top_p_sampling", False)):
+        top_ps = sampling_info.top_ps
+    else:
+        top_ps = torch.ones(
+            (batch_size,),
+            dtype=torch.float32,
+            device=support_logits.device,
+        )
+    probs = _sparse_target_probs_from_support(
+        support_logits,
+        sampling_info.temperatures,
+        sampling_info.top_ks,
+        top_ps,
+        batch_size,
+        verify_width,
+        max_top_k,
+    )
+    return _sample_from_support(
+        support_ids.view(batch_size, verify_width, max_top_k), probs
+    )
 
 
 def pack_uno_tree_result(
