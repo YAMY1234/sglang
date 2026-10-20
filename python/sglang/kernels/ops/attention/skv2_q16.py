@@ -504,9 +504,9 @@ class Q16SplitDecode:
                                 cute.autovec_copy(out16, cute.local_tile(so[row, None], (half,), (wg,)))
                             prim.barrier_cta_sync(2, thread_count=256)
                             for i in cutlass.range_constexpr(rows * 16 // 256):
-                                k = tid + 256 * i
-                                srow = k // 16
-                                ch = k % 16
+                                flat = tid + 256 * i
+                                srow = flat // 16
+                                ch = flat % 16
                                 cute.autovec_copy(cute.local_tile(so[srow, None], (8,), (ch,)), chunk)
                                 cute.autovec_copy(
                                     chunk,
