@@ -1224,6 +1224,14 @@ def forward_routed_dep(
     build_precomputed_topk_output(
         topk_weights, topk_ids, block.topk.topk_config, block.topk.layer_id
     )
+    # Only the stock gate GEMM path is a like-for-like rerun.
+    if (
+        hidden_states.shape[0] > _DEP_FRONT_MAX_TOKENS
+        and not envs.SGLANG_Q35MF_DEP_ROUTE_FRONT_GROUPED.get()
+    ):
+        from sglang.srt.layers import q35_krnc_proof
+
+        q35_krnc_proof.check_router(block.gate, hidden_states, logits)
     if envs.SGLANG_Q35MF_DEP_ROUTE_FRONT_CHECK.get():
         _dep_check(
             block=block,

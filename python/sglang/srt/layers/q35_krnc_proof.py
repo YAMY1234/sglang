@@ -2,7 +2,9 @@
 
 h0_pf:    the GDN verify with SGLANG_Q35MF_KRNC_H0_PF against the stock verify launch on the same inputs;
 in_proj:  the GDN in_proj output after the SGLANG_Q35MF_KRNC_L2PF_LL prefetch against the same GEMM rerun;
-out_proj: the GDN out_proj output after the SGLANG_Q35MF_KRNC_OPROJ_PF prefetch against the same GEMM rerun.
+out_proj: the GDN out_proj output after the SGLANG_Q35MF_KRNC_OPROJ_PF prefetch against the same GEMM rerun;
+router:   the DEP router logits from the stock gate GEMM after a SGLANG_Q35MF_KRNC_ROUTER_PF_* prefetch against the
+          same GEMM rerun.
 Each check counts rows whose outputs differ in any byte; device counters are mirrored into pinned host memory by a
 copy that is part of the check, and a thread logs them every 30 s without CUDA calls (as q35_bundle_proof).
 """
@@ -22,7 +24,7 @@ _PROOF = None
 
 class KrncProof:
     PERIOD_S = 30.0
-    KINDS = ("h0_pf", "in_proj", "out_proj")
+    KINDS = ("h0_pf", "in_proj", "out_proj", "router")
 
     def __init__(self):
         # [kind][calls, rows, mismatched rows]
@@ -78,3 +80,16 @@ def active():
     if _PROOF is not None and envs.SGLANG_Q35MF_KRNC_PROOF.get():
         return _PROOF
     return None
+
+
+def check_router(gate, hidden_states: torch.Tensor, logits: torch.Tensor) -> None:
+    """Router kind; call only where the stock gate GEMM produced `logits` from `hidden_states`."""
+    if _PROOF is None or not envs.SGLANG_Q35MF_KRNC_PROOF.get():
+        return
+    if not (
+        envs.SGLANG_Q35MF_KRNC_ROUTER_PF_CORE.get()
+        or envs.SGLANG_Q35MF_KRNC_ROUTER_PF_PRE.get()
+    ):
+        return
+    ref, _ = gate(hidden_states)
+    _PROOF.check("router", logits, ref)

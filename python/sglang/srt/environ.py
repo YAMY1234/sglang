@@ -1316,7 +1316,12 @@ class Envs:
     # GDN ReplaySSM verify: each program L2-prefetches its checkpoint rows before the PDL wait on the convolution
     # (read at capture).
     SGLANG_Q35MF_KRNC_H0_PF = EnvBool(False)
-    # In-graph shadow checks for the three switches above: rows whose outputs differ in any byte, logged every 30 s.
+    # Target verify: L2-prefetch each MoE layer's router weight from a side stream forked after the GDN in_proj
+    # (attention layers: before the post-attention norm), joined at the end of the target forward (read at capture).
+    SGLANG_Q35MF_KRNC_ROUTER_PF_CORE = EnvBool(False)
+    # The same router weight prefetch, forked before the post-attention norm on every MoE layer (read at capture).
+    SGLANG_Q35MF_KRNC_ROUTER_PF_PRE = EnvBool(False)
+    # In-graph shadow checks for the switches above: rows whose outputs differ in any byte, logged every 30 s.
     SGLANG_Q35MF_KRNC_PROOF = EnvBool(False)
     # FlashInfer A2A NVFP4 dispatch of target MoE layers at up to SGLANG_Q35MF_E2X_LLA2A_MAX_TOKENS tokens per rank:
     # one fence-free exchange kernel each way instead of MoeAlltoAll (same rows at fixed slots, same combine bits).
