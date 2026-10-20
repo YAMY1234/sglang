@@ -276,6 +276,8 @@ class FlashinferDispatcher(BaseDispatcher):
         self.moe_a2a = make_moe_a2a()
         # (data_ptr, shape, x_fp4, x_sf) staged by a fused router front for the next NVFP4 dispatch.
         self._staged_nvfp4: Optional[tuple] = None
+        # The next decoder layer's first projections, set by the model (SGLANG_Q35MF_DEP_L2_PREFETCH).
+        self.l2_prefetch_modules: Optional[list] = None
 
     def stage_nvfp4_input(
         self, hidden_states: torch.Tensor, x_fp4: torch.Tensor, x_sf: torch.Tensor
@@ -507,18 +509,38 @@ class FlashinferDispatcher(BaseDispatcher):
         reference = (
             self._stock_combine(payload) if self.combine_proof is not None else None
         )
+        prefetch_stream = self._fork_l2_prefetch()
         hidden_states = self.active_moe_a2a.combine(
             payload,
             self.runtime_max_tokens_per_rank,
             payload_in_workspace=self.payload_in_workspace,
             use_low_precision=self.use_low_precision_combine,
         )
+        if prefetch_stream is not None:
+            torch.cuda.current_stream().wait_stream(prefetch_stream)
         if reference is not None:
             self.combine_proof.check(reference, hidden_states)
 
         del self.runtime_max_tokens_per_rank
         del self.active_moe_a2a
         return hidden_states
+
+    def _fork_l2_prefetch(self) -> Optional[torch.cuda.Stream]:
+        """Launch the L2 prefetch of the next layer's first projection weights on a side stream, so it overlaps the
+        combine's wait on the other ranks (SGLANG_Q35MF_DEP_L2_PREFETCH, read at capture)."""
+        if not self.l2_prefetch_modules or not envs.SGLANG_Q35MF_DEP_L2_PREFETCH.get():
+            return None
+        from sglang.kernels.ops.gemm.qwen_l2_prefetch import (
+            l2_prefetch,
+            l2_prefetch_stream,
+        )
+
+        side = l2_prefetch_stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for module in self.l2_prefetch_modules:
+                l2_prefetch(module.weight)
+        return side
 
     def _stock_combine(self, payload: torch.Tensor) -> torch.Tensor:
         # Same workspace and dispatch state, unpatched kernel; every rank runs it, so the

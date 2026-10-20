@@ -2543,8 +2543,31 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.draft_hop = None
         if is_nextn and self.pp_group.is_last_rank:
             self._install_draft_hop()
+        if not is_nextn:
+            self._wire_l2_prefetch()
 
         self.layers_to_capture = []
+
+    def _wire_l2_prefetch(self) -> None:
+        """Hand each FlashInfer A2A MoE layer the next layer's first projection, for the combine-time L2 prefetch
+        (SGLANG_Q35MF_DEP_L2_PREFETCH; the dispatcher reads the switch at capture)."""
+        from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+            FlashinferDispatcher,
+        )
+
+        decoder_layers = (Qwen3_5LinearDecoderLayer, Qwen3_5AttentionDecoderLayer)
+        for layer, nxt in zip(self.layers[:-1], self.layers[1:]):
+            if not isinstance(layer, decoder_layers) or not isinstance(
+                layer.mlp, Qwen2MoeSparseMoeBlock
+            ):
+                continue
+            dispatcher = layer.mlp.experts.dispatcher
+            if not isinstance(dispatcher, FlashinferDispatcher):
+                continue
+            if isinstance(nxt, Qwen3_5LinearDecoderLayer):
+                dispatcher.l2_prefetch_modules = [nxt.linear_attn.in_proj_qkvz]
+            elif isinstance(nxt, Qwen3_5AttentionDecoderLayer):
+                dispatcher.l2_prefetch_modules = [nxt.qkv_proj]
 
     def _install_draft_hop(self) -> None:
         from sglang.srt.layers.layer_boundary.fusions.q35_draft_hop import (

@@ -1304,6 +1304,9 @@ class Envs:
     # Debug only: with SGLANG_Q35MF_DEP_EP_TABLES, also run the stock moe_sort path on the same input in the same
     # (captured) forward and log, per received row count, how many output rows differ.
     SGLANG_Q35MF_DEP_EP_TABLES_CHECK = EnvBool(False)
+    # FlashInfer A2A MoE: while the combine waits on the other ranks, prefetch the next layer's first projection
+    # weights into L2 from a side stream (no math change; the dispatcher joins the side stream after the combine).
+    SGLANG_Q35MF_DEP_L2_PREFETCH = EnvBool(False)
     # Dual-stream deferred-finalize MoE at up to this many tokens (0 = off): the whole shared expert
     # on a top-priority side stream (same kernels and outputs; only scheduling changes).
     SGLANG_Q35MF_K4_SIDE_PRIO_MAX_TOKENS = EnvInt(0)
