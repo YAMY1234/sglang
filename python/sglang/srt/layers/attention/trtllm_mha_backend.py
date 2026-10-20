@@ -1424,23 +1424,22 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             skv2_split_kv,
         )
 
+        # The switch is part of the key: A/B graph variants capture their own plan.
+        pdl = envs.SGLANG_Q35MF_LL16_SKV2_PDL.get()
         key = (
             query.shape,
             kv_cache[0].shape,
             block_tables.shape,
             block_tables.stride(),
             seq_lens.shape,
+            pdl,
         )
         plan = self._skv2_plans.get(key)
         if plan is None:
             # Compiles the producer; graph warmup runs this eagerly before capture.
-            plan = StockSplitPlan(
-                query,
-                kv_cache,
-                block_tables,
-                seq_lens,
-                pdl=envs.SGLANG_Q35MF_LL16_SKV2_PDL.get(),
-            )
+            plan = StockSplitPlan(query, kv_cache, block_tables, seq_lens, pdl=pdl)
+            if pdl:
+                logger.info("SKV2 split producer and merge launch as programmatic dependents.")
             self._skv2_plans[key] = plan
         return skv2_split_kv(
             query,
