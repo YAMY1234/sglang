@@ -40,20 +40,42 @@ class TestUniformVerifyWindowExtras(unittest.TestCase):
         positions = torch.full((bs, width), -7, dtype=torch.int64, device=dev)
         anchor = torch.full((bs, width + 2), -9, dtype=torch.int64, device=dev)
         bonus = torch.randint(0, 1000, (bs,), generator=g).to(dev)
-        kw = dict(
-            positions_out=positions, anchor_src=bonus, anchor_out=anchor,
-            anchor_stride=anchor.stride(0),
-        ) if extras else {}
+        kw = (
+            dict(
+                positions_out=positions,
+                anchor_src=bonus,
+                anchor_out=anchor,
+                anchor_stride=anchor.stride(0),
+            )
+            if extras
+            else {}
+        )
         assign_extend_cache_locs_uniform[(bs,)](
-            req_pool_indices, req_to_token, seq_lens, out, pool_len, width,
-            full_v2p=full_v2p, swa_v2p=swa_v2p, full_out=full_out, swa_out=swa_out,
-            PAGE_SIZE=page_size, num_v_pages=num_pages, num_swa_pages=num_pages,
+            req_pool_indices,
+            req_to_token,
+            seq_lens,
+            out,
+            pool_len,
+            width,
+            full_v2p=full_v2p,
+            swa_v2p=swa_v2p,
+            full_out=full_out,
+            swa_out=swa_out,
+            PAGE_SIZE=page_size,
+            num_v_pages=num_pages,
+            num_swa_pages=num_pages,
             **kw,
         )
         return dict(
-            out=out, full_out=full_out, swa_out=swa_out, positions=positions,
-            anchor=anchor, bonus=bonus, seq_lens=seq_lens,
-            req_pool_indices=req_pool_indices, req_to_token=req_to_token,
+            out=out,
+            full_out=full_out,
+            swa_out=swa_out,
+            positions=positions,
+            anchor=anchor,
+            bonus=bonus,
+            seq_lens=seq_lens,
+            req_pool_indices=req_pool_indices,
+            req_to_token=req_to_token,
         )
 
     def test_matches_separate_ops(self):
@@ -61,8 +83,12 @@ class TestUniformVerifyWindowExtras(unittest.TestCase):
             for width in (6, 7, 9):
                 for page_size in (1, 64):
                     with self.subTest(bs=bs, width=width, page_size=page_size):
-                        base = self._run(bs=bs, width=width, page_size=page_size, extras=False)
-                        got = self._run(bs=bs, width=width, page_size=page_size, extras=True)
+                        base = self._run(
+                            bs=bs, width=width, page_size=page_size, extras=False
+                        )
+                        got = self._run(
+                            bs=bs, width=width, page_size=page_size, extras=True
+                        )
                         for k in ("out", "full_out", "swa_out"):
                             self.assertTrue(torch.equal(base[k], got[k]), k)
                         cols = torch.arange(width, device=got["seq_lens"].device)
@@ -104,8 +130,13 @@ class TestAllocVerifyWindowOnce(unittest.TestCase):
         bonus = torch.tensor([11, 22, 33, 44], device=dev)
         anchor = torch.full((bs, width), -1, dtype=torch.int64, device=dev)
         common = dict(
-            batch=batch, bs=bs, device=dev, verify_num_draft_tokens=width,
-            block_pos_offsets=offsets, model_runner=runner, seq_lens_cpu=None,
+            batch=batch,
+            bs=bs,
+            device=dev,
+            verify_num_draft_tokens=width,
+            block_pos_offsets=offsets,
+            model_runner=runner,
+            seq_lens_cpu=None,
         )
         with patch.object(cache_locs, "_is_cuda", True):
             plain = alloc_verify_window(**common)
@@ -142,7 +173,9 @@ class TestDraftSamplerVerifyIds(unittest.TestCase):
         input_ids = torch.arange(bs * gamma, dtype=torch.int64) * 3
         s(torch.zeros(bs * gamma, hidden), input_ids)
         anchor = input_ids.view(bs, gamma)[:, :1]
-        self.assertTrue(torch.equal(s.verify_ids[:bs], torch.cat([anchor, draft], dim=1)))
+        self.assertTrue(
+            torch.equal(s.verify_ids[:bs], torch.cat([anchor, draft], dim=1))
+        )
         self.assertTrue(bool((s.verify_ids[bs:] == -1).all()))
 
 

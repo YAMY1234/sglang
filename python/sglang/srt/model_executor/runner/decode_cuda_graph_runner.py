@@ -230,6 +230,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     dllm_input_preparation = None
     dllm_attention = None
+    # Set in __init__: which DSpark runner's prep the glue graph serves past the guard.
+    _draft_metadata_glue = False
+    _target_metadata_glue = False
 
     def __init__(
         self,
@@ -506,8 +509,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self._draft_metadata_glue = (
             self._metadata_glue is None and self._glues_draft_metadata()
         )
+        # Likewise the DSpark target verify runner's static prep, behind its own switch.
+        self._target_metadata_glue = (
+            not self._draft_metadata_glue
+            and self._metadata_glue is None
+            and self._glues_target_verify_metadata()
+        )
         self._draft_glue_logged = 0
-        if self._draft_metadata_glue:
+        if self._draft_metadata_glue or self._target_metadata_glue:
             self._metadata_glue = MetadataGlueGraph(self.device)
             atexit.register(self._log_draft_glue, " at shutdown")
 
@@ -1578,7 +1587,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if self._metadata_glue is not None:
                 self._metadata_glue.note_not_routed()
             attn_backend.init_forward_metadata_out_graph(fb_view)
-        if self._draft_metadata_glue:
+        if self._draft_metadata_glue or self._target_metadata_glue:
             self._maybe_log_draft_glue()
 
         self.raw_bs = raw_bs
@@ -1612,6 +1621,23 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         logger.info("Draft metadata prep through the glue graph, one per replay key.")
         return True
 
+    def _glues_target_verify_metadata(self) -> bool:
+        """Whether this DSpark target verify runner's metadata prep runs through the
+        glue graph: switched on, and its backend declares the prep host-free."""
+        if (
+            not envs.SGLANG_OPT_DSV41_TARGET_VERIFY_METADATA_GLUE.get()
+            or self.model_runner.is_draft_worker
+            or self.capture_forward_mode != ForwardMode.TARGET_VERIFY
+            or not self.model_runner.spec_algorithm.is_dspark()
+        ):
+            return False
+        why = self.attn_backend.glue_target_verify_metadata()
+        if why:
+            logger.info("Target verify metadata glue graph off: %s.", why)
+            return False
+        logger.info("Target verify metadata prep through the glue graph, one per key.")
+        return True
+
     def _maybe_log_draft_glue(self) -> None:
         glue = self._metadata_glue
         steps = glue.replays + glue.eager
@@ -1621,7 +1647,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def _log_draft_glue(self, when: str) -> None:
         logger.info(
-            "draft glue: %d graph replays, %d eager (since warm-up)%s",
+            "%s glue: %d graph replays, %d eager (since warm-up)%s",
+            "target verify" if self._target_metadata_glue else "draft",
             self._metadata_glue.replays,
             self._metadata_glue.eager,
             when,
@@ -1630,7 +1657,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _glue_draft_inputs(self, fb_view) -> None:
         """The draft glue graph reads its inputs by address: out_cache_loc from the
         registry slot fill_from just wrote, not the step's own (fresh) tensor."""
-        if self._draft_metadata_glue and fb_view.out_cache_loc is not None:
+        if (
+            self._draft_metadata_glue or self._target_metadata_glue
+        ) and fb_view.out_cache_loc is not None:
             n = fb_view.out_cache_loc.shape[0]
             fb_view.out_cache_loc = self.buffers.out_cache_loc[:n]
 
