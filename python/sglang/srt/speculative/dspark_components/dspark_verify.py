@@ -731,7 +731,8 @@ class DsparkVerifyEpilogue:
         self._commit_engram_history(
             candidates, forward_batch, self.commit_lens_buf[:bs], verify_lens
         )
-        self._scatter_future_relay(forward_batch.req_pool_indices, bs)
+        if self._post_fold:
+            self._scatter_future_relay(forward_batch.req_pool_indices, bs)
         if not folds:
             return
         cache_loc = forward_batch.out_cache_loc
@@ -880,7 +881,7 @@ class DsparkVerifyEpilogue:
     def _scatter_future_relay(self, req_pool_indices: torch.Tensor, bs: int) -> None:
         """Unconditional: a step that takes another accept publishes and stashes on
         the host afterwards. Padded rows index slot 0, every pool's dummy row."""
-        if not self._post_fold or self.commit_ctx is None:
+        if self.commit_ctx is None:
             return
         if self.future_relay is None:
             assert not (
