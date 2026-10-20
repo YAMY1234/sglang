@@ -89,6 +89,7 @@ class VpVerify:
             [int(p) for p in slots_hdl.buffer_ptrs], dtype=torch.int64, device=device
         )
         self.epoch = torch.zeros(g_max, dtype=torch.int32, device=device)
+        self.counter = torch.zeros(g_max, dtype=torch.int32, device=device)
         self.stats = torch.zeros(
             (max_rows, world, WORDS), dtype=torch.int32, device=device
         )
@@ -136,6 +137,7 @@ class VpVerify:
             self.slots,
             self.peer_slots,
             self.epoch,
+            self.counter,
             self.stats,
             self.meta,
             self.rank * self.vocab_local,

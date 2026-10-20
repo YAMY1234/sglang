@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 
 # Must match ll16_vp::kChunks / kWords / kMaxD / kMaxChunk / kMarker in ll16_vp_verify.cuh.
 CHUNKS = 4
-WORDS = 12
+WORDS = 16
 MAX_D = 16
 MAX_CHUNK = 4096
 SLOT_MARKER = -1
@@ -57,6 +57,7 @@ def vp_shard(
     slots: torch.Tensor,
     peer_slots: torch.Tensor,
     epoch: torch.Tensor,
+    counter: torch.Tensor,
     stats: torch.Tensor,
     meta: torch.Tensor,
     vocab_start: int,
@@ -72,6 +73,7 @@ def vp_shard(
         slots,
         peer_slots,
         epoch,
+        counter,
         stats,
         meta,
         _no_trace(logits) if trace is None else trace,

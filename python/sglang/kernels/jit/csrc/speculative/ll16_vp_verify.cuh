@@ -32,7 +32,7 @@ inline constexpr uint32_t kSpinLimit = 1u << 26;
 inline constexpr int kMaxWorld = 16;
 // Must match CHUNKS / WORDS / MAX_D / MAX_CHUNK in ll16_vp_verify.py.
 inline constexpr int kChunks = 4;
-inline constexpr int kWords = 12;  // m[4], z[4], argmax id, argmax-is-NaN, 0, 0
+inline constexpr int kWords = 16;  // per chunk: max, sum-exp, argmax id, argmax-is-NaN
 inline constexpr int kMaxD = 16;
 inline constexpr int kMaxChunk = 4096;
 
@@ -92,6 +92,7 @@ struct Ll16VpShardParams {
   uint32_t* slots;             // this rank's [2, g_max, world, kWords]
   const uint64_t* peer_slots;  // [world] every rank's slots (symmetric memory)
   uint32_t* epoch;             // [g_max]
+  uint32_t* counter;           // [g_max], zero between launches
   uint32_t* stats;             // [rows_max, world, kWords], this rank's rows
   int32_t* meta;               // [4]: [0] = rows per rank of the last exchange
   int64_t ld;
@@ -106,95 +107,80 @@ struct Ll16VpShardParams {
 };
 
 /**
- * \brief Grid (world * rows): CTA g reduces gathered row g on this rank's shard and sends the payload to rank
- * g / rows; on that rank it then waits for every rank's payload of row g and copies them to the local stats.
+ * \brief Grid (kChunks, world * rows): CTA (c, g) reduces chunk c of gathered row g on this rank's shard and sends
+ * its 16B word to rank g / rows. The row's last CTA (atomic counter) flips the row's epoch; on the owner it first
+ * waits for every rank's words of row g and copies them to the local stats.
  */
 template <int kThreads, bool kUsePDL>
 __global__ void __launch_bounds__(kThreads) ll16_vp_shard_kernel(const Ll16VpShardParams __grid_constant__ p) {
   using namespace device;
   using vec_t = AlignedVector<bf16_t, 8>;
   constexpr int kWarps = kThreads / 32;
-  // Vectors per thread per chunk: every load of the row is issued before any reduction.
+  // Vectors per thread: every load of the chunk is issued before any reduction.
   constexpr int kPer = ll16_vp::kMaxChunk / 8 / kThreads;
-  __shared__ float s_m[ll16_vp::kChunks][kWarps];
-  __shared__ float s_z[ll16_vp::kChunks][kWarps];
+  __shared__ float s_m[kWarps];
+  __shared__ float s_z[kWarps];
   __shared__ uint32_t s_k[kWarps];
   __shared__ int32_t s_i[kWarps];
-  __shared__ float s_cm[ll16_vp::kChunks];
-  __shared__ float s_cz[ll16_vp::kChunks];
+  __shared__ bool s_last;
 
   PDLWaitPrimary<kUsePDL>();
 
-  const int g = static_cast<int>(blockIdx.x);
+  const int c = static_cast<int>(blockIdx.x);
+  const int g = static_cast<int>(blockIdx.y);
   const int t = static_cast<int>(threadIdx.x);
   const int warp = t / 32;
-  ll16_vp::stamp(p.trace, g * 8 + 0);
   const int lane = static_cast<int>(get_lane_id());
+  if (c == 0) ll16_vp::stamp(p.trace, g * 8 + 0);
   const bf16_t* row = p.logits + static_cast<int64_t>(g) * p.ld;
-  // Issued with the row loads so the push at the end waits on nothing.
+  // Issued with the chunk loads so the push at the end waits on nothing.
   const int owner = g / p.rows;
   const uint32_t half = p.epoch[g] & 1u;
   uint32_t* const owner_slots = reinterpret_cast<uint32_t*>(p.peer_slots[owner]);
-  vec_t x[ll16_vp::kChunks][kPer];
+  const int lo8 = min(c * p.chunk, p.vocab) / 8;
+  const int hi8 = min(c * p.chunk + p.chunk, p.vocab) / 8;
+  vec_t x[kPer];
 #pragma unroll
-  for (int c = 0; c < ll16_vp::kChunks; ++c) {
-    const int lo8 = min(c * p.chunk, p.vocab) / 8;
-    const int hi8 = min(c * p.chunk + p.chunk, p.vocab) / 8;
-#pragma unroll
-    for (int i = 0; i < kPer; ++i) {
-      const int v = lo8 + t + i * kThreads;
-      if (v < hi8) x[c][i].load(row, v);
-    }
+  for (int i = 0; i < kPer; ++i) {
+    const int v = lo8 + t + i * kThreads;
+    if (v < hi8) x[i].load(row, v);
   }
+  // Two branch-free passes (max, then sum-exp). A thread visits its ids in increasing order, so a strictly
+  // larger key keeps the lowest id among equal ones.
   uint32_t best = 0u;
   int32_t bidx = 0x7fffffff;
+  float m = -INFINITY;
 #pragma unroll
-  for (int c = 0; c < ll16_vp::kChunks; ++c) {
-    const int lo8 = min(c * p.chunk, p.vocab) / 8;
-    const int hi8 = min(c * p.chunk + p.chunk, p.vocab) / 8;
-    // Branch-free two passes over this thread's elements of the chunk (max, then sum-exp): the fully
-    // unrolled body stays small enough for the instruction cache. A thread visits its ids in increasing
-    // order, so a strictly larger key keeps the lowest id among equal ones.
-    float m = -INFINITY;
+  for (int i = 0; i < kPer; ++i) {
+    const int v = lo8 + t + i * kThreads;
+    if (v >= hi8) continue;
 #pragma unroll
-    for (int i = 0; i < kPer; ++i) {
-      const int v = lo8 + t + i * kThreads;
-      if (v >= hi8) continue;
-#pragma unroll
-      for (int e = 0; e < 8; ++e) {
-        const float f = cast<fp32_t>(x[c][i][e]);
-        const uint32_t key = f == f ? ll16_vp::order_key(f) : ll16_vp::kNanKey;
-        const bool take = key > best;
-        best = take ? key : best;
-        bidx = take ? v * 8 + e : bidx;
-        m = (f == f && f != -INFINITY) ? fmaxf(m, f) : m;
-      }
+    for (int e = 0; e < 8; ++e) {
+      const float f = cast<fp32_t>(x[i][e]);
+      const uint32_t key = f == f ? ll16_vp::order_key(f) : ll16_vp::kNanKey;
+      const bool take = key > best;
+      best = take ? key : best;
+      bidx = take ? v * 8 + e : bidx;
+      m = (f == f && f != -INFINITY) ? fmaxf(m, f) : m;
     }
-    float z = 0.f;
+  }
+  float z = 0.f;
 #pragma unroll
-    for (int i = 0; i < kPer; ++i) {
-      const int v = lo8 + t + i * kThreads;
-      if (v >= hi8) continue;
+  for (int i = 0; i < kPer; ++i) {
+    const int v = lo8 + t + i * kThreads;
+    if (v >= hi8) continue;
 #pragma unroll
-      for (int e = 0; e < 8; ++e) {
-        const float f = cast<fp32_t>(x[c][i][e]);
-        const float w = f == m ? 1.f : __expf(f - m);
-        z += (f == f && f != -INFINITY) ? w : 0.f;
-      }
-    }
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-      const float om = __shfl_xor_sync(0xffffffffu, m, off);
-      const float oz = __shfl_xor_sync(0xffffffffu, z, off);
-      ll16_vp::merge(m, z, om, oz);
-    }
-    if (lane == 0) {
-      s_m[c][warp] = m;
-      s_z[c][warp] = z;
+    for (int e = 0; e < 8; ++e) {
+      const float f = cast<fp32_t>(x[i][e]);
+      const float w = f == m ? 1.f : __expf(f - m);
+      z += (f == f && f != -INFINITY) ? w : 0.f;
     }
   }
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1) {
+    const float om = __shfl_xor_sync(0xffffffffu, m, off);
+    const float oz = __shfl_xor_sync(0xffffffffu, z, off);
+    ll16_vp::merge(m, z, om, oz);
     const uint32_t ov = __shfl_xor_sync(0xffffffffu, best, off);
     const int32_t oi = __shfl_xor_sync(0xffffffffu, bidx, off);
     if (ll16_vp::better(ov, oi, best, bidx)) {
@@ -203,70 +189,70 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_shard_kernel(const Ll16VpSha
     }
   }
   if (lane == 0) {
+    s_m[warp] = m;
+    s_z[warp] = z;
     s_k[warp] = best;
     s_i[warp] = bidx;
   }
   __syncthreads();
-  if (t < ll16_vp::kChunks) {
-    float bm = s_m[t][0];
-    float bz = s_z[t][0];
-    for (int w = 1; w < kWarps; ++w)
-      ll16_vp::merge(bm, bz, s_m[t][w], s_z[t][w]);
-    s_cm[t] = bz == 0.f ? -INFINITY : bm;
-    s_cz[t] = bz;
-  }
-  __syncthreads();
-  ll16_vp::stamp(p.trace, g * 8 + 1);
+  if (c == 0) ll16_vp::stamp(p.trace, g * 8 + 1);
 
   const int64_t row_words = (static_cast<int64_t>(half) * p.g_max + g) * p.world * ll16_vp::kWords;
-  if (threadIdx.x == 0) {
+  if (t == 0) {
+    float bm = s_m[0];
+    float bz = s_z[0];
     uint32_t k = s_k[0];
     int32_t i = s_i[0];
     for (int w = 1; w < kWarps; ++w) {
+      ll16_vp::merge(bm, bz, s_m[w], s_z[w]);
       if (ll16_vp::better(s_k[w], s_i[w], k, i)) {
         k = s_k[w];
         i = s_i[w];
       }
     }
-    const uint4 w0 = make_uint4(
-        __float_as_uint(s_cm[0]), __float_as_uint(s_cm[1]), __float_as_uint(s_cm[2]), __float_as_uint(s_cm[3]));
-    const uint4 w1 = make_uint4(
-        __float_as_uint(s_cz[0]), __float_as_uint(s_cz[1]), __float_as_uint(s_cz[2]), __float_as_uint(s_cz[3]));
-    const uint4 w2 = make_uint4(static_cast<uint32_t>(p.vocab_start + i), k == ll16_vp::kNanKey ? 1u : 0u, 0u, 0u);
-    uint32_t* dst = owner_slots + row_words + p.rank * ll16_vp::kWords;
-    // The owner later reads this row's logits from our shard: publish them with the payload.
+    const uint4 word = make_uint4(
+        __float_as_uint(bz == 0.f ? -INFINITY : bm),
+        __float_as_uint(bz),
+        static_cast<uint32_t>(p.vocab_start + i),
+        k == ll16_vp::kNanKey ? 1u : 0u);
+    uint32_t* dst = owner_slots + row_words + (p.rank * ll16_vp::kChunks + c) * 4;
+    // The owner later reads this row's logits from our shard: publish them with the word.
     ptx::fence_release_sys();
-    ptx::st_relaxed_16B(w0, dst, 0);
-    ptx::st_relaxed_16B(w1, dst, 1);
-    ptx::st_relaxed_16B(w2, dst, 2);
-    ll16_vp::stamp(p.trace, g * 8 + 2);
-  }
-  if (owner != p.rank) {
-    if (threadIdx.x == 0) p.epoch[g] = half ^ 1u;
-    return;
-  }
-
-  uint4* incoming = reinterpret_cast<uint4*>(p.slots + row_words);
-  const int nvec = p.world * (ll16_vp::kWords / 4);
-  const int64_t j = g - static_cast<int64_t>(p.rank) * p.rows;
-  if (static_cast<int>(threadIdx.x) < nvec) {
-    uint4 r;
-    uint32_t spins = 0;
-    do {
-      ptx::ld_relaxed_16B(r, incoming, threadIdx.x);
-      if (++spins == ll16_vp::kSpinLimit) __trap();
-    } while (ll16_vp::has_marker(r));
-    reinterpret_cast<uint4*>(p.stats + j * p.world * ll16_vp::kWords)[threadIdx.x] = r;
-    // Re-arm the word this thread read; the senders' next store to it is two launches away.
-    const uint4 marker = make_uint4(ll16_vp::kMarker, ll16_vp::kMarker, ll16_vp::kMarker, ll16_vp::kMarker);
-    ptx::st_global_16B(marker, incoming, threadIdx.x);
+    ptx::st_relaxed_16B(word, dst, 0);
+    if (c == 0) ll16_vp::stamp(p.trace, g * 8 + 2);
+    __threadfence();
+    s_last = atomicAdd(p.counter + g, 1u) == static_cast<uint32_t>(ll16_vp::kChunks - 1);
   }
   __syncthreads();
-  ll16_vp::stamp(p.trace, g * 8 + 3);
-  if (threadIdx.x == 0) {
-    asm volatile("fence.acq_rel.sys;" ::: "memory");
+  if (!s_last) return;
+  __threadfence();
+
+  if (owner == p.rank) {
+    uint4* incoming = reinterpret_cast<uint4*>(p.slots + row_words);
+    const int nvec = p.world * (ll16_vp::kWords / 4);
+    const int64_t j = g - static_cast<int64_t>(p.rank) * p.rows;
+    for (int q = t; q < nvec; q += kThreads) {
+      uint4 r;
+      uint32_t spins = 0;
+      do {
+        ptx::ld_relaxed_16B(r, incoming, q);
+        if (++spins == ll16_vp::kSpinLimit) __trap();
+      } while (ll16_vp::has_marker(r));
+      reinterpret_cast<uint4*>(p.stats + j * p.world * ll16_vp::kWords)[q] = r;
+      // Re-arm the word this thread read; the senders' next store to it is two launches away.
+      const uint4 marker = make_uint4(ll16_vp::kMarker, ll16_vp::kMarker, ll16_vp::kMarker, ll16_vp::kMarker);
+      ptx::st_global_16B(marker, incoming, q);
+    }
+    __syncthreads();
+    ll16_vp::stamp(p.trace, g * 8 + 3);
+    if (t == 0) {
+      asm volatile("fence.acq_rel.sys;" ::: "memory");
+      if (j == 0) p.meta[0] = p.rows;
+    }
+  }
+  if (t == 0) {
+    p.counter[g] = 0u;
     p.epoch[g] = half ^ 1u;
-    if (j == 0) p.meta[0] = p.rows;
   }
   ll16_vp::stamp(p.trace, g * 8 + 4);
 }
@@ -365,29 +351,39 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_decide_kernel(const Ll16VpDe
     const int j = pair / p.world;
     const int w = pair % p.world;
     const uint4* pl = reinterpret_cast<const uint4*>(p.stats + ((row0 + j) * p.world + w) * ll16_vp::kWords);
-    const uint4 wm = pl[0];
-    const uint4 wz = pl[1];
-    const uint4 wi = pl[2];
-    const float mc[ll16_vp::kChunks] = {
-        __uint_as_float(wm.x), __uint_as_float(wm.y), __uint_as_float(wm.z), __uint_as_float(wm.w)};
-    const float zc[ll16_vp::kChunks] = {
-        __uint_as_float(wz.x), __uint_as_float(wz.y), __uint_as_float(wz.z), __uint_as_float(wz.w)};
+    uint4 cw[ll16_vp::kChunks];
+#pragma unroll
+    for (int c = 0; c < ll16_vp::kChunks; ++c)
+      cw[c] = pl[c];
     float m = -INFINITY;
+    uint32_t bk = 0u;
+    uint32_t bid = 0u;
+    uint32_t bnan = 0u;
 #pragma unroll
     for (int c = 0; c < ll16_vp::kChunks; ++c) {
-      m = fmaxf(m, mc[c]);
-      s_cm[j][w][c] = mc[c];
-      s_cz[j][w][c] = zc[c];
+      const float mc = __uint_as_float(cw[c].x);
+      s_cm[j][w][c] = mc;
+      s_cz[j][w][c] = __uint_as_float(cw[c].y);
+      m = fmaxf(m, mc);
+      // Chunks are in vocab order: a later chunk wins only with a strictly larger key.
+      const uint32_t key = cw[c].w != 0u ? ll16_vp::kNanKey : ll16_vp::order_key(mc);
+      if (c == 0 || key > bk) {
+        bk = key;
+        bid = cw[c].z;
+        bnan = cw[c].w;
+      }
     }
     float s = 0.f;
 #pragma unroll
     for (int c = 0; c < ll16_vp::kChunks; ++c) {
-      if (zc[c] != 0.f) s += mc[c] == m ? zc[c] : zc[c] * __expf(mc[c] - m);
+      const float zc = s_cz[j][w][c];
+      const float mc = s_cm[j][w][c];
+      if (zc != 0.f) s += mc == m ? zc : zc * __expf(mc - m);
     }
     s_mw[j][w] = m;
     s_sw[j][w] = s;
-    s_id[j][w] = wi.x;
-    s_nan[j][w] = wi.y;
+    s_id[j][w] = bid;
+    s_nan[j][w] = bnan;
   }
   __syncthreads();
   if (t < p.d) {
@@ -679,6 +675,7 @@ struct Ll16VpVerify {
       const tvm::ffi::TensorView slots,
       const tvm::ffi::TensorView peer_slots,
       const tvm::ffi::TensorView epoch,
+      const tvm::ffi::TensorView counter,
       const tvm::ffi::TensorView stats,
       const tvm::ffi::TensorView meta,
       const tvm::ffi::TensorView trace,
@@ -704,6 +701,7 @@ struct Ll16VpVerify {
         .verify(slots);
     TensorMatcher({WS}).with_dtype<int64_t>().with_device(device).verify(peer_slots);
     TensorMatcher({GM}).with_dtype<int32_t>().with_device(device).verify(epoch);
+    TensorMatcher({GM}).with_dtype<int32_t>().with_device(device).verify(counter);
     TensorMatcher({RM, WS, ll16_vp::kWords})
         .with_dtype<int32_t>()
         .with_device(device)
@@ -724,6 +722,7 @@ struct Ll16VpVerify {
         .slots = static_cast<uint32_t*>(slots.data_ptr()),
         .peer_slots = static_cast<const uint64_t*>(peer_slots.data_ptr()),
         .epoch = static_cast<uint32_t*>(epoch.data_ptr()),
+        .counter = static_cast<uint32_t*>(counter.data_ptr()),
         .stats = static_cast<uint32_t*>(stats.data_ptr()),
         .meta = static_cast<int32_t*>(meta.data_ptr()),
         .ld = LD.unwrap(),
@@ -736,7 +735,8 @@ struct Ll16VpVerify {
         .g_max = static_cast<int32_t>(GM.unwrap()),
         .trace = trace.numel() >= g * 8 ? static_cast<uint64_t*>(trace.data_ptr()) : nullptr,
     };
-    LaunchKernel(dim3(static_cast<uint32_t>(g)), kShardThreads, device.unwrap())
+    LaunchKernel(
+        dim3(static_cast<uint32_t>(ll16_vp::kChunks), static_cast<uint32_t>(g)), kShardThreads, device.unwrap())
         .enable_pdl(kUsePDL)(ll16_vp_shard_kernel<kShardThreads, kUsePDL>, params);
   }
 
