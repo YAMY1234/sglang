@@ -449,7 +449,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # Arrival counter of the SGLANG_Q35MF_DEP_ROUTE_FRONT launch; persists across CUDA graph replays.
         if get_moe_a2a_backend().is_flashinfer() and not is_nextn:
             self.register_buffer(
-                "_dep_front_arrival", torch.zeros(1, dtype=torch.int32), persistent=False
+                "_dep_front_arrival", torch.zeros(4, dtype=torch.int32), persistent=False
             )
         self._route_sh_event = (
             torch.cuda.Event() if self._route_front_static_ok is None else None

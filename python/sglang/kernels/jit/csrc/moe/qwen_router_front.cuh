@@ -876,9 +876,25 @@ SGL_DEVICE void shared_gate_up(const Params& p, uint32_t M, uint8_t* smem, uint3
   }
 }
 
-template <uint32_t kMaxM, bool kUsePDL, bool kTrace, bool kShared = false>
-__global__ __launch_bounds__(kThreads, 1) void router_front_kernel(const __grid_constant__ Params p) {
+template <uint32_t kMaxM, bool kUsePDL, bool kTrace, bool kShared = false, bool kGrouped = false>
+__global__ __launch_bounds__(kThreads, 1) void router_front_kernel(const __grid_constant__ Params p0) {
   using L = GemvSmem<kMaxM, kShared>;
+  // kGrouped: token group blockIdx.y of kMaxM rows with its own arrival counter (run_topk_quant above 16 tokens);
+  // otherwise p is the grid-constant parameter itself.
+  Params pg;
+  if constexpr (kGrouped) {
+    pg = p0;
+    const uint32_t row0 = blockIdx.y * kMaxM;
+    pg.x += static_cast<size_t>(row0) * kHidden;
+    pg.logits += static_cast<size_t>(row0) * kExperts;
+    pg.topk_weights += static_cast<size_t>(row0) * kTopK;
+    pg.topk_ids += static_cast<size_t>(row0) * kTopK;
+    pg.x_fp4 += static_cast<size_t>(row0) * (kHidden / 2);
+    pg.x_sf += static_cast<size_t>(row0) * kBlocksPerRow;
+    pg.arrival += blockIdx.y;
+    pg.num_tokens = min(kMaxM, p0.num_tokens - row0);
+  }
+  const Params& p = kGrouped ? pg : p0;
   static_assert(!kShared || kMaxM <= 8, "the shared gate/up stage fits shared memory only for M <= 8");
   extern __shared__ __align__(128) uint8_t smem[];
   __shared__ uint32_t s_mask[kExperts];
@@ -1291,9 +1307,13 @@ struct RouterFrontKernel {
     TensorMatcher({M_, kTopK}).with_dtype<int32_t>().with_device(device).verify(topk_ids);
     TensorMatcher({M_, kHidden / 2}).with_dtype<uint8_t>().with_device(device).ensure_alignment(8).verify(x_fp4);
     TensorMatcher({M_, kBlocksPerRow}).with_dtype<uint8_t>().with_device(device).verify(x_sf);
-    TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(arrival);
+    auto G_ = SymbolicSize{"groups"};
+    TensorMatcher({G_}).with_dtype<int32_t>().with_device(device).verify(arrival);
     const auto M = static_cast<uint32_t>(M_.unwrap());
-    CHECK_HOST(M <= kMaxM && kMaxM <= kMaxTokens) << "router_topk_quant: num_tokens " << M << " exceeds " << kMaxM;
+    const uint32_t groups = (M + kMaxM - 1) / kMaxM;
+    CHECK_HOST(groups == 1 || kMaxM == kMaxTokens) << "router_topk_quant: num_tokens " << M << " needs the 16-row build";
+    CHECK_HOST(groups <= 4 && static_cast<uint32_t>(G_.unwrap()) >= groups)
+        << "router_topk_quant: num_tokens " << M << " needs " << groups << " arrival counters";
     if (M == 0) return;
     Params params{};
     params.x = static_cast<const bf16_t*>(x.data_ptr());
@@ -1307,7 +1327,11 @@ struct RouterFrontKernel {
     params.arrival = static_cast<uint32_t*>(arrival.data_ptr());
     params.num_tokens = M;
     params.mode = kModeQuant | kModeTopk;
-    launch_front<false>(params, device.unwrap());
+    if (groups == 1) {
+      launch_front<false>(params, device.unwrap());
+    } else {
+      if constexpr (kMaxM == kMaxTokens) launch_front<false, false, true>(params, device.unwrap(), groups);
+    }
   }
 
   /// \brief Softmax top-k and NVFP4 input quantization from router logits computed elsewhere, at up to 64 tokens.
@@ -1397,18 +1421,18 @@ struct RouterFrontKernel {
   }
 
  private:
-  template <bool kT, bool kSh = false>
-  static void launch_front(const Params& params, DLDevice device) {
+  template <bool kT, bool kSh = false, bool kGrouped = false>
+  static void launch_front(const Params& params, DLDevice device, uint32_t groups = 1) {
     using namespace host;
     constexpr uint32_t kSmem = GemvSmem<kMaxM, kSh>::kBytes;
     static const bool smem_attr_set = [] {
       CHECK_CUDA(cudaFuncSetAttribute(
-          router_front_kernel<kMaxM, kUsePDL, kT, kSh>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
+          router_front_kernel<kMaxM, kUsePDL, kT, kSh, kGrouped>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
       return true;
     }();
     (void)smem_attr_set;
-    LaunchKernel(kNumCtas, kThreads, device, kSmem)
-        .enable_pdl(kUsePDL)(router_front_kernel<kMaxM, kUsePDL, kT, kSh>, params);
+    LaunchKernel(dim3(kNumCtas, groups), kThreads, device, kSmem)
+        .enable_pdl(kUsePDL)(router_front_kernel<kMaxM, kUsePDL, kT, kSh, kGrouped>, params);
   }
 };
 

@@ -230,7 +230,8 @@ def router_topk_quant(
     global_scale: torch.Tensor,
     arrival: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Router logits, softmax top-10 + renormalize and NVFP4 input quant in one launch (M <= 16).
+    """Router logits, softmax top-10 + renormalize and NVFP4 input quant in one launch (M <= 64; above 16 tokens
+    the launch runs one 16-row token group per grid row, each with its own arrival counter: arrival [>= ceil(M/16)]).
 
     Returns (logits bf16 [M, 512], weights fp32 [M, 10], ids int32 [M, 10], x_fp4 uint8 [M, 2048],
     x_sf uint8 [M, 256] linear layout); no routing tables.

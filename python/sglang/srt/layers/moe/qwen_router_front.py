@@ -1125,7 +1125,10 @@ def forward_routed_dep(
     experts = block.experts
     disp = experts.dispatcher
     global_scale = disp.quant_config["input_global_scale"].reshape(1)
-    if hidden_states.shape[0] <= _DEP_FRONT_MAX_TOKENS:
+    if (
+        hidden_states.shape[0] <= _DEP_FRONT_MAX_TOKENS
+        or envs.SGLANG_Q35MF_DEP_ROUTE_FRONT_GROUPED.get()
+    ):
         logits, topk_weights, topk_ids, x_fp4, x_sf = router_topk_quant(
             hidden_states, block.gate.weight, global_scale, block._dep_front_arrival
         )
