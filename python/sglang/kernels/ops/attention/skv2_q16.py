@@ -54,17 +54,23 @@ from cutlass.experimental import primitives as prim
 @cute.experimental.jit
 def load_keys(
     k: cute.Tensor,
-    pages: cute.Tensor,
+    table: cute.Tensor,
     sk: cute.Tensor,
     barrier: cute.Pointer,
-    first: cutlass.Int32,
+    first_page: cutlass.Int32,
     stage: cutlass.Int32,
     tile: cutlass.Constexpr[int],
+    length: cutlass.Int32,
+    req: cutlass.Int32,
 ):
     with cute.arch.elect_one():
         cute.arch.mbarrier_arrive_and_expect_tx(barrier, tile * 256)
     for half in cutlass.range_constexpr(tile // 64):
-        source = cute.local_tile(k, (64, 256), (pages[first + half], 0))
+        page_index = first_page + half
+        page = cutlass.Int32(0)
+        if page_index < cute.ceil_div(length, 64):
+            page = table[req, page_index]
+        source = cute.local_tile(k, (64, 256), (page, 0))
         dest = cute.local_tile(sk[None, None, stage], (64, 256), (half, 0))
         ex.tma_load(source, dest, barrier.value, update_expect_tx=False)
 
@@ -72,29 +78,35 @@ def load_keys(
 @cute.experimental.jit
 def load_values(
     v: cute.Tensor,
-    pages: cute.Tensor,
+    table: cute.Tensor,
     sv: cute.Tensor,
     barrier: cute.Pointer,
-    first: cutlass.Int32,
+    first_page: cutlass.Int32,
     stage: cutlass.Int32,
     tile: cutlass.Constexpr[int],
+    length: cutlass.Int32,
+    req: cutlass.Int32,
 ):
     with cute.arch.elect_one():
         cute.arch.mbarrier_arrive_and_expect_tx(barrier, tile * 256)
     for half in cutlass.range_constexpr(tile // 64):
-        source = cute.local_tile(v, (256, 64), (0, pages[first + half]))
+        page_index = first_page + half
+        page = cutlass.Int32(0)
+        if page_index < cute.ceil_div(length, 64):
+            page = table[req, page_index]
+        source = cute.local_tile(v, (256, 64), (0, page))
         dest = cute.local_tile(sv[None, None, stage], (256, 64), (0, half))
         ex.tma_load(source, dest, barrier.value, update_expect_tx=False)
 
 
 class Q16SplitDecode:
     """Warps 0-7: two softmax warpgroups (thread = query row; warpgroup g owns S columns g * 64.. and O half g),
-    warp 8: both MMAs, warp 9: Q and K loads, warp 10: V loads."""
+    warp 8: both MMAs, warp 9: TMA loads."""
 
     def __init__(
-        self, heads=16, qlen=7, splits=148, stages=2, batch=1, mode=0, trace=False, lazy=0.0, pdl=False, maxp=32, prio=0
+        self, heads=16, qlen=7, splits=148, stages=2, batch=1, mode=0, trace=False, lazy=0.0, pdl=False
     ):
-        assert heads * qlen <= 128 and (heads * qlen) % 8 == 0 and stages in (1, 2) and maxp % 32 == 0
+        assert heads * qlen <= 128 and (heads * qlen) % 8 == 0 and stages in (1, 2)
         # P x 256 must stay <= 448 (e4m3 max), so a stale reference may trail the maximum by < log2(1.75).
         assert 0.0 <= lazy <= 0.8
         self.lazy = lazy
@@ -113,10 +125,6 @@ class Q16SplitDecode:
             batch,
         )
         self.rows = heads * qlen
-        # Page ids staged per split; must cover 2 * blocks of the longest split (plan: cdiv(table width, splits) + 1).
-        self.maxp = maxp
-        # Startup order: 0 all first stages at once; 1 V after K(0) has landed; 2 also K(1) after K(0) has landed.
-        self.prio = prio
         self.tile = 128
         self.half = 64
         self.slots = 2
@@ -166,7 +174,7 @@ class Q16SplitDecode:
             q, k, v, table, lengths, partial, maxima, denom, trace, qk_scale, out_scale, kq, vp
         ).launch(
             grid=(self.splits, 1, self.batch),
-            block=(352, 1, 1),
+            block=(320, 1, 1),
             stream=stream,
             use_pdl=self.pdl,
         )
@@ -251,13 +259,6 @@ class Q16SplitDecode:
             cutlass.AddressSpace.smem,
             cute.make_layout((self.rows, 128), stride=(136, 1)),
             alignment=128,
-        )
-        # The split's page ids (0 past the request's last page), read once so no TMA issue waits on the table.
-        spages = ex.allocate(
-            cutlass.Int32,
-            cutlass.AddressSpace.smem,
-            cute.make_layout(self.maxp),
-            alignment=16,
         )
         nbar = 1 + 4 * self.stages + 4 * self.slots + 1
         barriers = ex.allocate(
@@ -616,56 +617,61 @@ class Q16SplitDecode:
                 bq.value,
                 update_expect_tx=False,
             )
-            lane = cute.arch.lane_idx()
-            npages = cute.ceil_div(length, 64)
-            for i in cutlass.range_constexpr(self.maxp // 32):
-                local = lane + 32 * i
-                page = cutlass.Int32(0)
-                if local < 2 * nblk:
-                    if begin_page + local < npages:
-                        page = table[req, begin_page + local]
-                spages[local] = page
-            # The value loader (warp 10) reads the page ids after this rendezvous.
-            prim.barrier_cta_sync(5, thread_count=64)
             for stage in cutlass.range_constexpr(self.stages):
                 if stage < nblk:
-                    if cutlass.const_expr(stage == 1 and self.prio == 2):
-                        cute.arch.mbarrier_wait(bk, phase=0)
-                    load_keys(k, spages, sk, bk + stage, stage * 2, stage, self.tile)
-            # K of block it + stages reuses the stage of block it once Q K^T(it) is done.
-            for it in cutlass.range(0, nblk - self.stages):
+                    load_keys(
+                        k,
+                        table,
+                        sk,
+                        bk + stage,
+                        begin_page + stage * (self.tile // 64),
+                        stage,
+                        self.tile,
+                        length,
+                        req,
+                    )
+            for it in cutlass.range(0, nblk):
                 stage = it % self.stages
-                cute.arch.mbarrier_wait(bkfree + stage, phase=(it // self.stages) % 2)
+                cute.arch.mbarrier_wait(
+                    bvfree + stage, phase=(it // self.stages + 1) % 2
+                )
                 if cutlass.const_expr(self.trace):
                     if traced:
                         if tid == 288:
                             if it < 16:
-                                trace[1 * 16 + it] = cute.arch.clock64()
-                load_keys(k, spages, sk, bk + stage, (it + self.stages) * 2, stage, self.tile)
-        elif warp == 10:
-            # A separate warp, so K issues never queue behind a V stage that P V has not released yet.
-            prim.barrier_cta_sync(5, thread_count=64)
-            if cutlass.const_expr(self.prio > 0):
-                if nblk > 0:
-                    cute.arch.mbarrier_wait(bk, phase=0)
-            for stage in cutlass.range_constexpr(self.stages):
-                if stage < nblk:
+                                trace[0 * 16 + it] = cute.arch.clock64()
+                load_values(
+                    v,
+                    table,
+                    sv,
+                    bv + stage,
+                    begin_page + it * (self.tile // 64),
+                    stage,
+                    self.tile,
+                    length,
+                    req,
+                )
+                if it + self.stages < nblk:
+                    cute.arch.mbarrier_wait(
+                        bkfree + stage, phase=(it // self.stages) % 2
+                    )
                     if cutlass.const_expr(self.trace):
                         if traced:
-                            if tid == 320:
-                                trace[0 * 16 + stage] = cute.arch.clock64()
-                    load_values(v, spages, sv, bv + stage, stage * 2, stage, self.tile)
-            # V of block it + stages reuses the stage of block it once P V(it) is done.
-            for it in cutlass.range(0, nblk - self.stages):
-                stage = it % self.stages
-                nxt = it + self.stages
-                cute.arch.mbarrier_wait(bvfree + stage, phase=(it // self.stages) % 2)
-                if cutlass.const_expr(self.trace):
-                    if traced:
-                        if tid == 320:
-                            if nxt < 16:
-                                trace[0 * 16 + nxt] = cute.arch.clock64()
-                load_values(v, spages, sv, bv + stage, nxt * 2, stage, self.tile)
+                            if tid == 288:
+                                if it < 16:
+                                    trace[1 * 16 + it] = cute.arch.clock64()
+                    load_keys(
+                        k,
+                        table,
+                        sk,
+                        bk + stage,
+                        begin_page + (it + self.stages) * (self.tile // 64),
+                        stage,
+                        self.tile,
+                        length,
+                        req,
+                    )
+
 
 import torch
 import triton
@@ -718,7 +724,6 @@ class Q16SplitPlan:
         merge_warps=4,
         lazy=0.0,
         pdl=False,
-        prio=0,
     ):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
@@ -730,8 +735,6 @@ class Q16SplitPlan:
         self.qlen = query.shape[0] // self.batch
         self.splits = splits or 148 // self.batch
         self.rows = self.qlen * self.heads
-        pages_per_split = -(-table.shape[1] // self.splits)
-        maxp = 32 * -(-(pages_per_split + 1) // 32)
         self.partial = torch.empty(
             (self.batch, self.splits, self.rows, 256),
             dtype=torch.bfloat16,
@@ -752,8 +755,6 @@ class Q16SplitPlan:
             trace=trace,
             lazy=lazy,
             pdl=pdl,
-            maxp=maxp,
-            prio=prio,
         )
         self.pdl = pdl
         views = self._views(query, kv, table, lengths)
