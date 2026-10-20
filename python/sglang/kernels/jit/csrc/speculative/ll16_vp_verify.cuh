@@ -539,6 +539,13 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_decide_kernel(const Ll16VpDe
   const int per = (nvec + kThreads - 1) / kThreads;
   const int64_t g = static_cast<int64_t>(p.rank) * rows_pad + row0 + r;
   const bf16_t* src = reinterpret_cast<const bf16_t*>(p.peer_logits[sel]) + g * p.ld + lo;
+  // Every remote vector load is issued before the first one is used (one round trip, not kMaxPer).
+  vec_t xs[kMaxPer];
+#pragma unroll
+  for (int i = 0; i < kMaxPer; ++i) {
+    const int v = t * per + i;
+    if (i < per && v < nvec) ptx::ld_relaxed_16B(xs[i], src, v);
+  }
   float q[kMaxPer * 8];
   float tsum = 0.f;
   int last_valid = -1;
@@ -546,8 +553,7 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_decide_kernel(const Ll16VpDe
   for (int i = 0; i < kMaxPer; ++i) {
     const int v = t * per + i;
     if (i < per && v < nvec) {
-      vec_t x;
-      ptx::ld_relaxed_16B(x, src, v);
+      const vec_t& x = xs[i];
 #pragma unroll
       for (int e = 0; e < 8; ++e) {
         const float f = cast<fp32_t>(x[e]);
@@ -636,12 +642,23 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_pull_kernel(const Ll16VpPull
   const bf16_t* src = reinterpret_cast<const bf16_t*>(p.peer_logits[w]) + g * p.ld;
   float* dst = p.out + r * p.out_stride + static_cast<int64_t>(w) * p.vocab;
   const int64_t col0 = static_cast<int64_t>(w) * p.vocab;
-  for (int v = static_cast<int>(threadIdx.x); v < p.vocab / 8; v += kThreads) {
-    vec_t x;
-    ptx::ld_relaxed_16B(x, src, v);
+  constexpr int kBatch = 8;  // remote loads in flight per thread
+  const int nvec = p.vocab / 8;
+  for (int base = static_cast<int>(threadIdx.x); base < nvec; base += kThreads * kBatch) {
+    vec_t xs[kBatch];
 #pragma unroll
-    for (int e = 0; e < 8; ++e) {
-      if (col0 + v * 8 + e < p.vocab_size) dst[v * 8 + e] = cast<fp32_t>(x[e]);
+    for (int k = 0; k < kBatch; ++k) {
+      const int v = base + k * kThreads;
+      if (v < nvec) ptx::ld_relaxed_16B(xs[k], src, v);
+    }
+#pragma unroll
+    for (int k = 0; k < kBatch; ++k) {
+      const int v = base + k * kThreads;
+      if (v >= nvec) continue;
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        if (col0 + v * 8 + e < p.vocab_size) dst[v * 8 + e] = cast<fp32_t>(xs[k][e]);
+      }
     }
   }
 }
