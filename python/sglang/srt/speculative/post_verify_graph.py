@@ -111,7 +111,8 @@ def _count_acceptance_calls():
 
     eagle_utils.verify_tree_greedy_func = counted(greedy_fn)
     sampling_ops.tree_speculative_sampling_target_only = counted(tree_fn)
-    if eagle_utils._LOCAL_VERIFY_SAMPLING:
+    local_on = eagle_utils._local_verify_sampling_on()
+    if local_on:
         # The one-rank chunked sampler is the acceptance kernel on that path.
         from sglang.srt.speculative import sharded_verify_sampling as local_ops
 
@@ -124,7 +125,7 @@ def _count_acceptance_calls():
     finally:
         eagle_utils.verify_tree_greedy_func = greedy_fn
         sampling_ops.tree_speculative_sampling_target_only = tree_fn
-        if eagle_utils._LOCAL_VERIFY_SAMPLING:
+        if local_on:
             local_ops.sample_chain_full_vocab = local_fn
         ShardedVerifySampler.run = sharded_fn
 

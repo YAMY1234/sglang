@@ -778,6 +778,20 @@ _PACKED_VERIFY_BCAST = (
     os.environ.get("SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST", "0") == "1"
 )
 _LOCAL_VERIFY_SAMPLING = envs.SGLANG_Q35MF_K4_LOCAL_VERIFY_SAMPLING.get()
+# One engagement line per process when the chunked chain sampler first runs.
+_LOCAL_VERIFY_LOGGED: List[bool] = []
+
+
+def _local_verify_sampling_on() -> bool:
+    # Same-service A/B harness (measurement only): a variant may switch the one-rank chain sampler per round.
+    from sglang.srt.model_executor.runner_backend import ab_variants
+
+    if ab_variants.enabled():
+        return ab_variants.env("SGLANG_Q35MF_K4_LOCAL_VERIFY_SAMPLING", "0").lower() in (
+            "1",
+            "true",
+        )
+    return _LOCAL_VERIFY_SAMPLING
 
 
 def _can_use_local_chain_sampling(
@@ -789,9 +803,11 @@ def _can_use_local_chain_sampling(
     uno_target_max_top_k: Optional[int],
 ) -> bool:
     """Dense sampled verify of a topk-1 chain that the one-rank chunked sampler can take."""
+    if not _local_verify_sampling_on():
+        return False
     spec = get_spec()
     return (
-        _LOCAL_VERIFY_SAMPLING
+        True
         and _is_cuda
         and not use_rejection_sampling
         and verify_input.tree_topk == 1
@@ -1058,6 +1074,12 @@ def eagle_sample(
             sample_chain_full_vocab,
         )
 
+        if not _LOCAL_VERIFY_LOGGED:
+            _LOCAL_VERIFY_LOGGED.append(True)
+            logger.info(
+                "SGLANG_Q35MF_K4_LOCAL_VERIFY_SAMPLING engaged: one-rank chunked chain sampler (rows %d)",
+                next_token_logits.shape[0],
+            )
         # Same coin draws as the stock branch below; the argmax also serves as the
         # synthetic bonus under SGLANG_SIMULATE_ACC_LEN.
         coins = _verify_coins(
