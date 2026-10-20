@@ -543,8 +543,14 @@ class FlashinferDispatcher(BaseDispatcher):
             and self._ll_switch.get()
             and self.ll_a2a.payload == _LL_PAYLOAD.get(dispatch_type)
             and not self.use_low_precision_combine
-            and self.runtime_max_tokens_per_rank <= self.ll_a2a.slots
+            and self.runtime_max_tokens_per_rank <= self._ll_max_tokens()
         )
+
+    def _ll_max_tokens(self) -> int:
+        cap = (
+            envs.SGLANG_Q35MF_E2X_LLA2A_DRAFT_MAX_TOKENS.get() if self._ll_draft else 0
+        )
+        return min(cap, self.ll_a2a.slots) if cap > 0 else self.ll_a2a.slots
 
     def _ll_a2a_dispatch(
         self, payloads: list[torch.Tensor], expert_id_payload_index: int
