@@ -108,6 +108,8 @@ class MkdDraftBoundary:
     # One-row draft steps only; rows of the current draft step (set by the vocab exchange).
     max_rows = 1
     rows = 1
+    # Requests of the extend that writes fc_buf (set by the worker; one-row drafts do not need it).
+    extend_rows: Optional[tuple] = None
     # The extend's hidden-half partial is computed in exchange_extend, not in the extend graph.
     extend_partial_in_graph = False
 
@@ -623,9 +625,10 @@ class MkdDraftBoundary:
         """A draft extend (after prefill or decode) is about to produce the next draft input."""
         self.input_seq += 1
 
-    def take_fc_buf(self) -> bool:
+    def take_fc_buf(self, rows: Optional[tuple] = None) -> bool:
         """True when fc_buf holds the first fc of the coming draft: its extend produced the
-        current draft input. Consumes it (the draft's own exchanges overwrite fc_buf)."""
+        current draft input. Consumes it (the draft's own exchanges overwrite fc_buf). One-row
+        drafts cannot be reordered, so ``rows`` is not needed here."""
         holds = self.fc_buf_key is not None and self.fc_buf_key == self.input_seq
         self.fc_buf_key = None
         self._fill_checks += 1

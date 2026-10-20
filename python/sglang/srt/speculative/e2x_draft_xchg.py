@@ -127,6 +127,10 @@ class E2xDraftXchg:
         # every rank follows the same SPMD control flow.
         self.input_seq = 0
         self.fc_buf_key: Optional[int] = None
+        # Requests of fc_buf's rows, in order: a draft input whose batch was filtered or reordered since
+        # its extend must not take them (a finished request shifts every later row).
+        self.extend_rows: Optional[tuple] = None
+        self.fc_buf_rows: Optional[tuple] = None
         self._fill_checks = 0
         logger.info(
             "E2X draft exchange active (tp=2, <= %d rows, memo %.1f MB on this rank).",
@@ -156,13 +160,13 @@ class E2xDraftXchg:
         for i in range(0, rows, _MEMO_BLOCK):
             block = _clear_negative_zero(embed[i : i + _MEMO_BLOCK].clone())
             memo[i : i + _MEMO_BLOCK] = self._embed_partial(block)
-        # Served draft steps compute 1-8 rows at once; check rows at several batch widths.
+        # Served draft steps compute 1-8 rows at once; check rows at every served width.
         gen = torch.Generator(device="cpu").manual_seed(self.rank)
         ids = torch.randint(0, rows, (_MEMO_CHECK_ROWS,), generator=gen).to(
             embed.device
         )
         bad = 0
-        for width in (1, 3, 8):
+        for width in range(1, self.max_rows + 1):
             for i in range(0, _MEMO_CHECK_ROWS, width):
                 sel = ids[i : i + width]
                 ref = self._embed_partial(_clear_negative_zero(embed[sel].clone()))
@@ -310,15 +314,23 @@ class E2xDraftXchg:
             payload=payload,
         )
         self.fc_buf_key = self.input_seq if payload else None
+        self.fc_buf_rows = self.extend_rows if payload else None
         return topk_p, topk_index
 
     def note_draft_input(self) -> None:
         self.input_seq += 1
 
-    def take_fc_buf(self) -> bool:
-        """True when fc_buf holds the first fc of the coming draft (its extend produced the input)."""
-        holds = self.fc_buf_key is not None and self.fc_buf_key == self.input_seq
+    def take_fc_buf(self, rows: Optional[tuple] = None) -> bool:
+        """True when fc_buf holds the first fc of the coming draft: its extend produced the input and
+        the draft batch has the same requests in the same order."""
+        holds = (
+            self.fc_buf_key is not None
+            and self.fc_buf_key == self.input_seq
+            and rows is not None
+            and rows == self.fc_buf_rows
+        )
         self.fc_buf_key = None
+        self.fc_buf_rows = None
         self._fill_checks += 1
         if self._fill_checks % _FILL_AGREE_EVERY == 1:
             self._check_ranks_agree(holds)

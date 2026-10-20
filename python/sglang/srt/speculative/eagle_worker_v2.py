@@ -716,7 +716,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if mkd is not None and mkd.extend_fc:
             # A one-row draft's first step reads its fc from fc_buf (draft-extend fc); only the
             # extend that produced this draft input may have written it.
-            holds = mkd.take_fc_buf()
+            holds = mkd.take_fc_buf(tuple(req.rid for req in batch.reqs))
             if (
                 not holds
                 and not forward_batch.forward_mode.is_idle()
@@ -1358,6 +1358,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 draft_logits_output.next_token_logits
             )
         ):
+            mkd = self._draft_vocab_exchange.mkd
+            if mkd is not None and mkd.extend_fc:
+                mkd.extend_rows = tuple(req.rid for req in batch.reqs)
             ret_topk_p, ret_topk_index = self._draft_vocab_exchange.select_extend(
                 draft_logits_output.next_token_logits, draft_logits_output.hidden_states
             )
