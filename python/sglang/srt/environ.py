@@ -2174,6 +2174,7 @@ class Envs:
     SGLANG_Q35MF_GDN_PDL = EnvBool(False)
     SGLANG_Q35MF_E2X_TP2_GDN = EnvBool(False)
     SGLANG_Q35MF_TPX_TP4_GDN = EnvBool(False)
+    SGLANG_Q35MF_TPX_HEAD_ROWS = EnvInt(0)
     SGLANG_Q35MF_GDN_DIRECT_SOLVE = EnvBool(False)
     SGLANG_Q35MF_GDN_EMPTY_HISTORY = EnvBool(False)
     SGLANG_Q35MF_GDN_NORM_FP8 = EnvBool(False)

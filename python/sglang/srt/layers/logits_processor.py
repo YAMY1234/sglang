@@ -510,6 +510,10 @@ class LogitsProcessor(nn.Module):
         self.skip_vocab_gather_rows = 0
         # Draft step boundary that computes one-row draft lm_heads itself (SGLANG_Q35MF_MKD_HEAD).
         self.mkd_head = None
+        # Draft heads may run short row counts on SGLANG_Q35MF_TPX_HEAD_ROWS zero-padded rows, so
+        # cuBLAS takes the non-split-K GEMM of wider batches instead of split-K plus a reduce kernel.
+        self.pad_head_rows = False
+        self._head_rows_buf: Optional[torch.Tensor] = None
         # Target-verify logits are returned unreduced for sampling on the vocab shards.
         self.verify_logits_on_shards = (
             envs.SGLANG_Q35MF_PDDEC_SHARDED_VERIFY_SAMPLING.get()
@@ -1129,6 +1133,10 @@ class LogitsProcessor(nn.Module):
             and hidden_states.shape[0] == 1
         ):
             return self.mkd_head.head(hidden_states, lm_head)
+        rows = hidden_states.shape[0]
+        min_rows = envs.SGLANG_Q35MF_TPX_HEAD_ROWS.get() if self.pad_head_rows else 0
+        if 0 < rows < min_rows:
+            return self._padded_head(hidden_states, lm_head, min_rows)[:rows]
         quant_method = getattr(lm_head, "quant_method", None)
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
             # This is a LoRA-wrapped module, use its forward method
@@ -1186,6 +1194,22 @@ class LogitsProcessor(nn.Module):
                     lm_head, hidden_states, embedding_bias
                 )
         return logits
+
+    def _padded_head(
+        self, hidden_states: torch.Tensor, lm_head: VocabParallelEmbedding, min_rows: int
+    ) -> torch.Tensor:
+        # Rows past the real ones are ignored; the static buffer keeps graph replays addressable.
+        buf = self._head_rows_buf
+        if buf is None or buf.shape[0] < min_rows:
+            buf = self._head_rows_buf = torch.zeros(
+                min_rows,
+                hidden_states.shape[1],
+                dtype=lm_head.weight.dtype,
+                device=hidden_states.device,
+            )
+        buf = buf[:min_rows]
+        buf[: hidden_states.shape[0]].copy_(hidden_states)
+        return torch.matmul(buf, lm_head.weight.T)
 
     def _gather_dp_attn_hidden_states(
         self, hidden_states: torch.Tensor, logits_metadata: LogitsMetadata

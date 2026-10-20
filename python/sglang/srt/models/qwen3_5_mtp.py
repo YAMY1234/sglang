@@ -193,6 +193,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 )
 
         self.logits_processor = LogitsProcessor(config)
+        self.logits_processor.pad_head_rows = True
         if self.model.draft_hop is not None:
             self.model.draft_hop.head_follows = self._mkd_head_follows
         # Input embedding handed over by the previous greedy draft step, if any.
