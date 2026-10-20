@@ -606,6 +606,8 @@ extern "C" int q35hop_oproj(int k_steps, const void* args, void* stream) {
       return static_cast<int>(cudaLaunchKernelEx(&cfg, oproj_push_kernel<4>, o));
     case 8:
       return static_cast<int>(cudaLaunchKernelEx(&cfg, oproj_push_kernel<8>, o));
+    case 16:
+      return static_cast<int>(cudaLaunchKernelEx(&cfg, oproj_push_kernel<16>, o));
     default:
       return -3;
   }
