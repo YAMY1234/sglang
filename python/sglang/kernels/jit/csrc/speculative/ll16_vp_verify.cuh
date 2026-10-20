@@ -126,6 +126,7 @@ struct Ll16VpCandParams {
 /// rank's candidate word of gathered row rank * rows + r; also advances the draw counter.
 template <int kThreads, bool kUsePDL>
 __global__ void __launch_bounds__(kThreads) ll16_vp_cand_kernel(const Ll16VpCandParams __grid_constant__ p) {
+  using namespace device;
   PDLWaitPrimary<kUsePDL>();
   for (int r = static_cast<int>(threadIdx.x); r < p.rows; r += kThreads) {
     const int64_t next = r % p.d < p.d - 1 ? p.input_ids[r + 1] : -1;
