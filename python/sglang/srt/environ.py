@@ -2215,6 +2215,8 @@ class Envs:
     # Verify conv update: read the prior state rows, weights and bias before the PDL wait (only the
     # projection output is read after it); same values and arithmetic.
     SGLANG_Q35MF_GDN_CONV_EARLY = EnvBool(False)
+    # Verify gated RMSNorm (static FP8 out): read gate, weights and scale before the PDL wait; same values.
+    SGLANG_Q35MF_GDN_NORM_EARLY = EnvBool(False)
     SGLANG_Q35MF_GDN_TILED_VERIFY = EnvBool(False)
     SGLANG_Q35MF_GDN_VERIFY_BV64 = EnvBool(False)
     SGLANG_Q35MF_KGDN_VERIFY_REG168 = EnvBool(False)

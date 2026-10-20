@@ -105,12 +105,14 @@ def _layer_norm_fwd_1pass_kernel(
     QUANT: tl.constexpr = False,
     STATIC_QUANT: tl.constexpr = False,
     EARLY_DEPENDENTS: tl.constexpr = False,
+    EARLY_LOADS: tl.constexpr = False,
 ):
     if USE_GDC:
-        tl.extra.cuda.gdc_wait()
-        # The consumer that asks for this waits on the grid before reading the output.
-        if EARLY_DEPENDENTS:
-            tl.extra.cuda.gdc_launch_dependents()
+        if not EARLY_LOADS:
+            tl.extra.cuda.gdc_wait()
+            # The consumer that asks for this waits on the grid before reading the output.
+            if EARLY_DEPENDENTS:
+                tl.extra.cuda.gdc_launch_dependents()
 
     # Map the program id to the starting row of X and Y it should compute.
     row_start = tl.program_id(0) * ROWS_PER_BLOCK
@@ -133,18 +135,45 @@ def _layer_norm_fwd_1pass_kernel(
     col_mask = cols[None, :] < N
     mask = row_mask & col_mask
 
+    if EARLY_LOADS:
+        # Weights, bias, gate and static scale do not come from the producer; only x is read after the wait.
+        w_offsets = cols + group * N
+        w_mask = cols < N
+        w = tl.load(W + w_offsets, mask=w_mask, other=0.0).to(tl.float32)
+        if HAS_BIAS:
+            b = tl.load(B + w_offsets, mask=w_mask, other=0.0).to(tl.float32)
+        if HAS_Z:
+            if Z_IS_3D:
+                z_row_offsets = (rows[:, None] // Z_HEADS) * stride_z_token + (
+                    rows[:, None] % Z_HEADS
+                ) * stride_z_head
+            else:
+                z_row_offsets = rows[:, None] * stride_z_row
+            z_early = tl.load(
+                Z + z_row_offsets + col_offsets, mask=mask, other=0.0
+            ).to(tl.float32)
+        if STATIC_QUANT:
+            y_s = tl.load(S).to(tl.float32)
+        if USE_GDC:
+            tl.extra.cuda.gdc_wait()
+            if EARLY_DEPENDENTS:
+                tl.extra.cuda.gdc_launch_dependents()
+
     # Load input data with 2D tile
     x = tl.load(X_base, mask=mask, other=0.0).to(tl.float32)
 
     if HAS_Z and not NORM_BEFORE_GATE:
-        if Z_IS_3D:
-            z_row_offsets = (rows[:, None] // Z_HEADS) * stride_z_token + (
-                rows[:, None] % Z_HEADS
-            ) * stride_z_head
+        if EARLY_LOADS:
+            z = z_early
         else:
-            z_row_offsets = rows[:, None] * stride_z_row
-        Z_base = Z + z_row_offsets + col_offsets
-        z = tl.load(Z_base, mask=mask, other=0.0).to(tl.float32)
+            if Z_IS_3D:
+                z_row_offsets = (rows[:, None] // Z_HEADS) * stride_z_token + (
+                    rows[:, None] % Z_HEADS
+                ) * stride_z_head
+            else:
+                z_row_offsets = rows[:, None] * stride_z_row
+            Z_base = Z + z_row_offsets + col_offsets
+            z = tl.load(Z_base, mask=mask, other=0.0).to(tl.float32)
         if ACTIVATION == "swish" or ACTIVATION == "silu":
             x *= z * tl.sigmoid(z)
         elif ACTIVATION == "sigmoid":
@@ -173,12 +202,13 @@ def _layer_norm_fwd_1pass_kernel(
     tl.store(Rstd + rstd_offsets, rstd, mask=rstd_mask)
 
     # Load weights and biases (broadcast across rows)
-    w_offsets = cols + group * N
-    w_mask = cols < N
-    w = tl.load(W + w_offsets, mask=w_mask, other=0.0).to(tl.float32)
+    if not EARLY_LOADS:
+        w_offsets = cols + group * N
+        w_mask = cols < N
+        w = tl.load(W + w_offsets, mask=w_mask, other=0.0).to(tl.float32)
 
-    if HAS_BIAS:
-        b = tl.load(B + w_offsets, mask=w_mask, other=0.0).to(tl.float32)
+        if HAS_BIAS:
+            b = tl.load(B + w_offsets, mask=w_mask, other=0.0).to(tl.float32)
 
     # Normalize and apply linear transformation
     if not IS_RMS_NORM:
@@ -189,14 +219,17 @@ def _layer_norm_fwd_1pass_kernel(
     y = x_hat * w[None, :] + b[None, :] if HAS_BIAS else x_hat * w[None, :]
 
     if HAS_Z and NORM_BEFORE_GATE:
-        if Z_IS_3D:
-            z_row_offsets = (rows[:, None] // Z_HEADS) * stride_z_token + (
-                rows[:, None] % Z_HEADS
-            ) * stride_z_head
+        if EARLY_LOADS:
+            z = z_early
         else:
-            z_row_offsets = rows[:, None] * stride_z_row
-        Z_base = Z + z_row_offsets + col_offsets
-        z = tl.load(Z_base, mask=mask, other=0.0).to(tl.float32)
+            if Z_IS_3D:
+                z_row_offsets = (rows[:, None] // Z_HEADS) * stride_z_token + (
+                    rows[:, None] % Z_HEADS
+                ) * stride_z_head
+            else:
+                z_row_offsets = rows[:, None] * stride_z_row
+            Z_base = Z + z_row_offsets + col_offsets
+            z = tl.load(Z_base, mask=mask, other=0.0).to(tl.float32)
         if ACTIVATION == "swish" or ACTIVATION == "silu":
             y *= z * tl.sigmoid(z)
         elif ACTIVATION == "sigmoid":
@@ -204,7 +237,8 @@ def _layer_norm_fwd_1pass_kernel(
 
     if STATIC_QUANT:
         y = y.to(Y.dtype.element_ty).to(tl.float32)
-        y_s = tl.load(S).to(tl.float32)
+        if not EARLY_LOADS:
+            y_s = tl.load(S).to(tl.float32)
         y_q = tl.clamp(y * (1.0 / y_s), -448.0, 448.0).to(Q.dtype.element_ty)
         tl.store(Q + rows[:, None] * stride_y_row + col_offsets, y_q, mask=mask)
     elif QUANT:  # the block is one token: per-token FP8 as _per_token_group_quant_8bit
@@ -257,6 +291,7 @@ def _layer_norm_fwd(
     quant_heads: int = 0,
     static_quant_scale=None,
     early_dependents: bool = False,
+    early_loads: bool = False,
 ):
     M, N = x.shape
     if group_size is None:
@@ -324,6 +359,8 @@ def _layer_norm_fwd(
         if is_arch_support_pdl()
         else {}
     )
+    if pdl_kwargs and early_loads:
+        pdl_kwargs["EARLY_LOADS"] = True
     # Workaround for PyTorch <= 2.12: torch.xpu.device is not Dynamo-compatible
     # in that release — it creates a DynamoConfigPatchProxy that
     # SourcelessBuilder cannot wrap, causing a hard error under

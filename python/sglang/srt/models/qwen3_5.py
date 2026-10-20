@@ -1555,6 +1555,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 and core_attn_out.dtype == torch.bfloat16
             ):
                 hop = self._q35_push_hop(core_attn_out.shape[0] // nv)
+                early_loads = envs.SGLANG_Q35MF_GDN_NORM_EARLY.get()
+                if early_loads:
+                    print_info_once("GDN verify gated norm early loads active")
                 (fp8, _), _, _ = _layer_norm_fwd(
                     core_attn_out,
                     self.norm.weight,
@@ -1566,6 +1569,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     static_quant_scale=self.out_proj.input_scale,
                     # The push launch waits on this grid before reading fp8; let it load its weights now.
                     early_dependents=hop is not None,
+                    early_loads=early_loads,
                 )
                 fp8 = fp8.reshape(-1, nv * self.head_v_dim)
                 if hop is not None:
