@@ -103,6 +103,9 @@ struct Ll16VpShardParams {
   int32_t world;
   int32_t rows;
   int32_t g_max;
+  // bit 0: release fence before the push (publishes the shard logits the owner reads later);
+  // bit 1: acquire fence after the owner has received every word.
+  int32_t fences;
   uint64_t* trace;  // [g_max, 8] globaltimer stamps or null
 };
 
@@ -217,7 +220,7 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_shard_kernel(const Ll16VpSha
         k == ll16_vp::kNanKey ? 1u : 0u);
     uint32_t* dst = owner_slots + row_words + (p.rank * ll16_vp::kChunks + c) * 4;
     // The owner later reads this row's logits from our shard: publish them with the word.
-    ptx::fence_release_sys();
+    if (p.fences & 1) ptx::fence_release_sys();
     ptx::st_relaxed_16B(word, dst, 0);
     if (c == 0) ll16_vp::stamp(p.trace, g * 8 + 2);
     __threadfence();
@@ -246,7 +249,7 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_shard_kernel(const Ll16VpSha
     __syncthreads();
     ll16_vp::stamp(p.trace, g * 8 + 3);
     if (t == 0) {
-      asm volatile("fence.acq_rel.sys;" ::: "memory");
+      if (p.fences & 2) asm volatile("fence.acq_rel.sys;" ::: "memory");
       if (j == 0) p.meta[0] = p.rows;
     }
   }
@@ -696,7 +699,8 @@ struct Ll16VpVerify {
       int64_t chunk,
       int64_t vocab_start,
       int64_t rank,
-      int64_t rows) {
+      int64_t rows,
+      int64_t fences) {
     using namespace host;
     auto G = SymbolicSize{"gathered_rows"};
     auto V = SymbolicSize{"vocab_local"};
@@ -747,6 +751,7 @@ struct Ll16VpVerify {
         .world = static_cast<int32_t>(world),
         .rows = static_cast<int32_t>(rows),
         .g_max = static_cast<int32_t>(GM.unwrap()),
+        .fences = static_cast<int32_t>(fences),
         .trace = trace.numel() >= g * 8 ? static_cast<uint64_t*>(trace.data_ptr()) : nullptr,
     };
     LaunchKernel(

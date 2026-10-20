@@ -143,6 +143,7 @@ class VpVerify:
             self.rank * self.vocab_local,
             self.rank,
             rows,
+            fences=envs.SGLANG_Q35MF_LL16_VPSAMP_FENCES.get(),
         )
         if not self._logged:
             self._logged = True

@@ -1379,6 +1379,9 @@ class Envs:
     # With SGLANG_Q35MF_LL16_VPSAMP engaged, also pull every verify row whole and count argmax and same-coin
     # chain mismatches against the one-rank chunked sampler; a thread logs the counters every 30 s.
     SGLANG_Q35MF_LL16_VPSAMP_PROOF = EnvBool(False)
+    # System fences of the SGLANG_Q35MF_LL16_VPSAMP exchange (read at capture): bit 0 release before each push,
+    # bit 1 acquire after the owner's receive. Measurement knob for their cost.
+    SGLANG_Q35MF_LL16_VPSAMP_FENCES = EnvInt(3)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)

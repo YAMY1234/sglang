@@ -63,6 +63,7 @@ def vp_shard(
     vocab_start: int,
     rank: int,
     rows: int,
+    fences: int = 3,
     trace: Optional[torch.Tensor] = None,
 ) -> None:
     """Reduce this rank's shard ``logits`` [world * rows, V_local] of every gathered row (rank-major)
@@ -81,6 +82,7 @@ def vp_shard(
         vocab_start,
         rank,
         rows,
+        fences,
     )
 
 
