@@ -35,6 +35,7 @@ from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.layers.e2x_dep_draft_xchg import DepDraftXchg
 from sglang.srt.layers.kdense_draft_xchg import FcPeerSum, join_metadata
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -197,6 +198,8 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             self.model.draft_hop.head_follows = self._mkd_head_follows
         # Input embedding handed over by the previous greedy draft step, if any.
         self.draft_input_embeds: Optional[torch.Tensor] = None
+        # DEP-DX memo (SGLANG_Q35MF_DEP_DX_MEMO), set by the spec worker: fc inputs across draft steps.
+        self._dep_dx: Optional[DepDraftXchg] = None
         # One-launch draft step boundary (SGLANG_Q35MF_MKD_XCHG), set by the spec worker.
         self._mkd = None
 
@@ -362,7 +365,12 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                     input_ids[last_indices]
                 )
 
-            if input_embeds is None:
+            fc_input = (
+                self._dep_dx.take_fc_input(rows=input_ids.shape[0])
+                if self._dep_dx is not None and input_embeds is None
+                else None
+            )
+            if input_embeds is None and fc_input is None:
                 input_embeds = (
                     self.draft_input_embeds
                     if self.draft_input_embeds is not None
@@ -371,7 +379,18 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
 
             hidden_states = forward_batch.spec_info.hidden_states
 
-            if self._fc_split_ready(input_embeds.shape[0]):
+            if fc_input is not None:
+                if self._dep_dx.proof is not None:
+                    stock = torch.cat(
+                        [
+                            self.pre_fc_norm_embedding(self.model.embed_tokens(input_ids)),
+                            self.pre_fc_norm_hidden(hidden_states),
+                        ],
+                        dim=-1,
+                    )
+                    self._dep_dx.proof.check_fc(fc_input=fc_input, stock=stock)
+                hidden_states = self.fc(fc_input)
+            elif self._fc_split_ready(input_embeds.shape[0]):
                 hidden_states = self._split_fc(
                     input_embeds, hidden_states, forward_batch
                 )
@@ -402,6 +421,10 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 )
             if self._mkd is not None and self._mkd.armed:
                 self._mkd.hidden_partial(hidden_states)
+            if self._dep_dx is not None:
+                self._dep_dx.hidden_half(
+                    hidden_states=hidden_states, norm=self.pre_fc_norm_hidden
+                )
             # A metadata side branch must rejoin inside this capture even without attention.
             join_metadata()
         finally:

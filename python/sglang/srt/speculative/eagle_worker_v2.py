@@ -310,6 +310,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             select = self.draft_runner.model.logits_processor.k75p_draft_select
             if select is not None:
                 self._dep_draft_xchg = select.dep
+            if self._dep_draft_xchg is not None and envs.SGLANG_Q35MF_DEP_DX_MEMO.get():
+                model = self.draft_runner.model
+                self._dep_draft_xchg.enable_memo(
+                    embed_weight=model.model.embed_tokens.weight,
+                    norm=model.pre_fc_norm_embedding,
+                    vocab_local=model.lm_head.weight.shape[0],
+                )
+                model._dep_dx = self._dep_draft_xchg
 
     def init_attention_backends(self):
         with (
@@ -857,6 +865,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Forward multiple steps
         scores = None
+        if dep_xchg is not None:
+            dep_xchg.begin_draft()
         with IndexTopKShareState.mtp_iteration(
             forward_batch,
             enabled=self.index_share_for_mtp_iteration,
@@ -904,6 +914,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                             if self.draft_runner.model_config.model_is_mrope
                             else None
                         ),
+                        # The last draft forward has no next step to feed.
+                        produce_fc=i < self.speculative_num_steps - 2,
                     )
                 with (
                     forward_context(
@@ -1006,6 +1018,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 if self.hot_token_id is not None:
                     topk_index = self.hot_token_id[topk_index]
                 hidden_states = logits_output.hidden_states
+        if dep_xchg is not None:
+            dep_xchg.end_draft()
 
         draft_probs = (
             torch.stack(draft_probs_list, dim=1) if needs_draft_probs else None
