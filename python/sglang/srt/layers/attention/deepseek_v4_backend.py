@@ -126,6 +126,9 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakab
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
 )
+from sglang.srt.model_executor.runner_utils.forked_metadata_prep import (
+    join_in_graph_metadata_prep,
+)
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -3947,6 +3950,7 @@ class DeepseekV4AttnBackend(
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Idle always re-translates at store time: its metadata may be stale, and
         translating the zero-padded out_cache_loc writes to the dummy slot."""
+        join_in_graph_metadata_prep()
         if self.pre_kv_store_hook is not None:
             self.pre_kv_store_hook()
         metadata = self.forward_metadata
