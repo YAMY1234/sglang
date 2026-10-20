@@ -1131,6 +1131,9 @@ class Envs:
     # With SGLANG_Q35MF_MKA_Q1: the draft q1 split decode and its merge launch as programmatic dependents (the
     # decode prefetches K / V tiles this step does not write; the one-token qk norm releases it at entry).
     SGLANG_Q35MF_LL16_Q1_PDL = EnvBool(False)
+    # With SGLANG_Q35MF_MKM_GDN_FRONT: the TP8 GDN front takes its projection weights by one bulk copy per CTA into
+    # shared memory before its dependency wait, instead of register loads (same values).
+    SGLANG_Q35MF_LL16_FRONT_TMA = EnvBool(False)
     # With SGLANG_Q35MF_MKA_FUSED and SGLANG_Q35MF_MKH_HOP: the fused o_proj pushes its partial into the
     # q35 hop mailbox, so the attention output hop only consumes.
     SGLANG_Q35MF_MKA_PUSH = EnvBool(False)

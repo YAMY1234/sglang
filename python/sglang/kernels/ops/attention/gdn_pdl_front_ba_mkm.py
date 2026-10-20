@@ -56,12 +56,15 @@ def front(
     history_g: torch.Tensor,
     ring_indices: torch.Tensor,
     pad_slot: int = -1,
+    tma: bool = False,
 ) -> None:
     """Same contract and bytes as ``gdn_pdl_front_ba.front``; also prefetches recurrent operands into L2.
 
     ``checkpoint`` is indexed by ``state_indices[0]``; ``history_d``, ``history_k`` and ``history_g`` by
     ``ring_indices[0]`` (one device int32/int64). Only slot-contiguous operands are prefetched. The
     prefetch is a hint: nothing is written, and the consumer still reads after its own dependency wait.
+    ``tma`` brings each CTA's projection weights in by one bulk copy into shared memory before the dependency
+    wait instead of register loads (same values).
     """
     _jit_gdn_pdl_front_ba_mkm_module().front(
         input,
@@ -85,4 +88,5 @@ def front(
         history_g,
         ring_indices,
         pad_slot,
+        int(tma),
     )

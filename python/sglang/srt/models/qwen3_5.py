@@ -1288,6 +1288,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     history_k=cache.replayssm_k,
                     history_g=cache.replayssm_g,
                     ring_indices=forward_batch.req_pool_indices[:1],
+                    tma=envs.SGLANG_Q35MF_LL16_FRONT_TMA.get(),
                 )
             front(
                 hidden_states,
