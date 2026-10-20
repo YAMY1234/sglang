@@ -393,7 +393,7 @@ def prepare_out_proj(model: torch.nn.Module) -> int:
             continue
         # The method keeps the weight as the [K, N] transpose of a row-major [N, K] tensor.
         weight_nk = linear.weight.t()
-        if weight_nk.shape[0] != HIDDEN or weight_nk.shape[1] not in (1024, 2048):
+        if weight_nk.shape[0] != HIDDEN or weight_nk.shape[1] not in (1024, 2048, 4096):
             continue
         linear.q35_packed = pack_out_proj(weight_nk)
         packed += 1
