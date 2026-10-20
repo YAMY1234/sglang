@@ -1068,6 +1068,61 @@ def _check_report_loop(tag: str, counts: torch.Tensor, fields: Tuple[str, ...]) 
             last = lines
 
 
+# SGLANG_Q35MF_DEP_MOE_EXIT_CHECK: per token count, rows checked and rows where the fused exit differs from stock.
+_EXIT_CHECK_FIELDS = ("rows", "normed", "residual", "fp8")
+_exit_check_counts: Optional[torch.Tensor] = None
+
+
+def moe_exit_stock(
+    *,
+    final: torch.Tensor,
+    residual: torch.Tensor,
+    moe_input: torch.Tensor,
+    shared: torch.Tensor,
+    gate_weight: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    scale: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The stock MoE exit on copies: gated add, gemma_fused_add_rmsnorm, static_quant_fp8."""
+    from sgl_kernel import gemma_fused_add_rmsnorm
+
+    from sglang.kernels.ops.elementwise.elementwise import fused_gate_sigmoid_mul_add
+    from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
+
+    fused_gate_sigmoid_mul_add(moe_input, gate_weight, shared, final)
+    gemma_fused_add_rmsnorm(final, residual, norm_weight, eps)
+    q, _ = static_quant_fp8(final, scale)
+    return final, residual, q
+
+
+def moe_exit_count(*, fused: Tuple[torch.Tensor, ...], stock: Tuple[torch.Tensor, ...]) -> None:
+    global _exit_check_counts
+    m = fused[0].shape[0]
+    if _exit_check_counts is None:
+        _exit_check_counts = torch.zeros(
+            (_DEP_MAX_TOKENS * 4 + 1, len(_EXIT_CHECK_FIELDS)),
+            dtype=torch.int64,
+            device=fused[0].device,
+        )
+        start_check_reporter(
+            "SGLANG_Q35MF_DEP_MOE_EXIT_CHECK", _exit_check_counts, _EXIT_CHECK_FIELDS
+        )
+
+    def rows_ne(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        return (a.view(m, -1).view(torch.uint8) != b.view(m, -1).view(torch.uint8)).any(dim=1).sum()
+
+    diff = torch.stack(
+        [
+            torch.full((), m, dtype=torch.int64, device=fused[0].device),
+            rows_ne(fused[0], stock[0]),
+            rows_ne(fused[1], stock[1]),
+            rows_ne(fused[2], stock[2]),
+        ]
+    )
+    _exit_check_counts[min(m, _DEP_MAX_TOKENS * 4)].add_(diff)
+
+
 def _dep_check(
     *,
     block: Qwen2MoeSparseMoeBlock,

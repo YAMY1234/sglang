@@ -1349,6 +1349,12 @@ class Envs:
     # Debug only: with SGLANG_Q35MF_E2X_LLA2A, also run the stock MoeAlltoAll exchange of the same rows in the same
     # (captured) forward and log, per token count, how many dispatched and combined rows differ.
     SGLANG_Q35MF_E2X_LLA2A_CHECK = EnvBool(False)
+    # FlashInfer A2A MoE: the next layer's input norm runs the gated shared add, residual add, Gemma RMSNorm and the
+    # projection's static FP8 quant in one launch (the gate is computed beside the shared expert).
+    SGLANG_Q35MF_DEP_MOE_EXIT = EnvBool(False)
+    # Debug only: with SGLANG_Q35MF_DEP_MOE_EXIT, also run the stock gate-add, norm and quant on copies in the same
+    # (captured) forward and log, per token count, how many rows of each output differ.
+    SGLANG_Q35MF_DEP_MOE_EXIT_CHECK = EnvBool(False)
     # Dual-stream deferred-finalize MoE at up to this many tokens (0 = off): the whole shared expert
     # on a top-priority side stream (same kernels and outputs; only scheduling changes).
     SGLANG_Q35MF_K4_SIDE_PRIO_MAX_TOKENS = EnvInt(0)

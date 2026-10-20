@@ -178,6 +178,7 @@ if _is_cuda:
 
 
 logger = logging.getLogger(__name__)
+_moe_exit_logged = False
 
 
 if _is_npu:
@@ -1105,6 +1106,9 @@ class GemmaRMSNorm(BaseFusedOp):
         self.register_buffer(
             "gemma_weight", torch.ones_like(self.weight), persistent=False
         )
+        # SGLANG_Q35MF_DEP_MOE_EXIT: the previous layer's MoE block and the FP8 projection this norm feeds.
+        self.moe_exit_source = None
+        self.moe_exit_consumer = None
         # (Chen-0210) Gemma weight = standard_weight + 1. Precompute once.
         # If TRTLLM allreduce fusion ever provides gemma-style norm
         # natively, this can be removed.
@@ -1122,6 +1126,17 @@ class GemmaRMSNorm(BaseFusedOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if self.moe_exit_source is not None:
+            pending = self.moe_exit_source.take_exit(x)
+            if pending is not None:
+                if residual is not None and post_residual_addition is None:
+                    return self._moe_exit(x, residual, pending)
+                from sglang.kernels.ops.elementwise.elementwise import (
+                    fused_gate_sigmoid_mul_add,
+                )
+
+                # Owed gated shared add, applied the stock way before this norm.
+                fused_gate_sigmoid_mul_add(pending[3], pending[4], pending[1], x)
         needs_reshape = x.dim() != 2 and residual is None
         if needs_reshape:
             original_shape = x.shape
@@ -1137,6 +1152,42 @@ class GemmaRMSNorm(BaseFusedOp):
         if needs_reshape:
             out = out.reshape(original_shape)
         return out
+
+    def _moe_exit(self, x, residual, pending):
+        """Gated shared add + residual add + this norm + the consumer's static FP8 quant in one launch; the FP8
+        rows go to the consumer's static_quant_fp8 call through fp8_handoff."""
+        from sglang.kernels.ops.elementwise.qwen_dep_moe_exit import moe_exit
+        from sglang.kernels.ops.quantization import fp8_handoff
+
+        _, shared, gate, moe_input, gate_weight = pending
+        scale = self.moe_exit_consumer.input_scale
+        stock = None
+        if envs.SGLANG_Q35MF_DEP_MOE_EXIT_CHECK.get():
+            from sglang.srt.layers.moe.qwen_router_front import moe_exit_stock
+
+            stock = moe_exit_stock(
+                final=x.clone(),
+                residual=residual.clone(),
+                moe_input=moe_input,
+                shared=shared,
+                gate_weight=gate_weight,
+                norm_weight=self.weight.data,
+                eps=self.variance_epsilon,
+                scale=scale,
+            )
+        _, x_fp8 = moe_exit(
+            x, shared, gate, residual, self.weight.data, scale, self.variance_epsilon, out=x
+        )
+        if stock is not None:
+            from sglang.srt.layers.moe.qwen_router_front import moe_exit_count
+
+            moe_exit_count(fused=(x, residual, x_fp8), stock=stock)
+        fp8_handoff.offer(x, scale, x_fp8)
+        global _moe_exit_logged
+        if not _moe_exit_logged:
+            _moe_exit_logged = True
+            logger.info("SGLANG_Q35MF_DEP_MOE_EXIT engaged: %d rows", x.shape[0])
+        return x, residual
 
     def forward_native(
         self,

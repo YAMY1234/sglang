@@ -2688,8 +2688,35 @@ class Qwen3_5ForCausalLM(nn.Module):
         if not is_nextn:
             self._wire_l2_prefetch()
             self._wire_krnc_router_prefetch()
+            self._wire_moe_exit()
 
         self.layers_to_capture = []
+
+    def _wire_moe_exit(self) -> None:
+        """Let each layer's input norm take the previous FlashInfer A2A MoE layer's exit and feed its first FP8
+        projection (SGLANG_Q35MF_DEP_MOE_EXIT; the MoE block reads the switch at capture)."""
+        from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+            FlashinferDispatcher,
+        )
+
+        decoder_layers = (Qwen3_5LinearDecoderLayer, Qwen3_5AttentionDecoderLayer)
+        for layer, nxt in zip(self.layers[:-1], self.layers[1:]):
+            if not isinstance(layer, decoder_layers) or not isinstance(nxt, decoder_layers):
+                continue
+            mlp = layer.mlp
+            if not isinstance(mlp, Qwen2MoeSparseMoeBlock) or mlp.shared_expert_gate is None:
+                continue
+            if not isinstance(mlp.experts.dispatcher, FlashinferDispatcher):
+                continue
+            if isinstance(nxt, Qwen3_5LinearDecoderLayer):
+                consumer = nxt.linear_attn.in_proj_qkvz
+            else:
+                consumer = nxt.qkv_proj
+            if consumer._parameters.get("input_scale") is None:
+                continue
+            nxt.input_layernorm.moe_exit_source = mlp
+            nxt.input_layernorm.moe_exit_consumer = consumer
+            mlp.moe_exit_wired = True
 
     def _wire_l2_prefetch(self) -> None:
         """Hand each FlashInfer A2A MoE layer the next layer's first projection, for the combine-time L2 prefetch
