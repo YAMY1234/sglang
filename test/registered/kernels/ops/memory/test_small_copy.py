@@ -1,9 +1,11 @@
 import itertools
 import unittest
+from unittest import mock
 
 import torch
 
 from sglang.kernels.ops.memory.small_copy import _small_copy_kernel, try_small_copy
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -110,6 +112,51 @@ class TestSmallCopy(CustomTestCase):
         self.assertTrue(torch.equal(destinations[0], expanded))
         self.assertTrue(torch.equal(destinations[1], source))
         self.assertFalse(try_small_copy(destinations, [expanded, source._neg_view()]))
+
+    def test_one_dense_int_pair_skips_the_fused_copy(self):
+        """The graph-input registry sends one integer dtype pair over dense tensors
+        to a single foreach launch; mixed pairs and strided heads keep this kernel."""
+        from sglang.kernels.ops.memory import small_copy
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            _grouped_foreach_copy_,
+        )
+
+        cuda = dict(device="cuda")
+        backing = torch.full((64,), -1, dtype=torch.int64, **cuda)
+        mrope = torch.full((3, 16), -1, dtype=torch.int64, **cuda)
+        mask = torch.zeros(4, dtype=torch.bool, **cuda)
+        cases = (
+            (
+                [backing[:4], backing[8:13]],
+                [torch.arange(4, **cuda), torch.arange(5, **cuda) + 9],
+                False,
+            ),
+            ([backing[16:20]], [torch.arange(4, dtype=torch.int32, **cuda)], False),
+            (
+                [backing[24:28], mask],
+                [torch.arange(4, **cuda), torch.ones(4, dtype=torch.bool, **cuda)],
+                True,
+            ),
+            (
+                [backing[32:36], mrope[:, :4]],
+                [torch.arange(4, **cuda), torch.arange(12, **cuda).view(3, 4)],
+                True,
+            ),
+        )
+        for dsts, srcs, fused in cases:
+            with (
+                envs.SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH.override(True),
+                self.subTest(fused=fused),
+                mock.patch.object(
+                    small_copy, "try_small_copy", wraps=small_copy.try_small_copy
+                ) as spy,
+            ):
+                _grouped_foreach_copy_(dsts, srcs)
+                self.assertEqual(spy.called, fused)
+                for dst, src in zip(dsts, srcs):
+                    self.assertTrue(torch.equal(dst, src.to(dst.dtype)))
+        self.assertTrue(bool((backing[13:16] == -1).all()))
+        self.assertTrue(bool((mrope[:, 4:] == -1).all()))
 
     def test_dynamic_metadata_has_bounded_specializations(self):
         kernel_cache = _small_copy_kernel.device_caches[torch.cuda.current_device()][0]
