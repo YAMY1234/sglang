@@ -111,18 +111,18 @@ class TargetHiddenKvInjector:
                 target_hidden_is_projected=target_hidden_is_projected,
             )
 
-    def _inject_mla(
+    def committed_swa_loc(
         self,
         *,
         pool,
-        target_hidden: torch.Tensor,
         cache_loc: torch.Tensor,
         positions: torch.Tensor,
         cache_loc_2d: Optional[torch.Tensor],
         commit_lens: Optional[torch.Tensor],
         state_slot: Optional[torch.Tensor] = None,
         final_pos: Optional[torch.Tensor] = None,
-    ) -> None:
+    ) -> torch.Tensor:
+        """The draft SWA rows the committed context tokens store into, -1 elsewhere."""
         if pool.swa_req_ring_size is not None:
             swa_loc = self._ring_inject_loc(
                 pool=pool,
@@ -162,6 +162,29 @@ class TargetHiddenKvInjector:
                     committed_mask, swa_loc, torch.full_like(swa_loc, -1)
                 )
 
+        return swa_loc
+
+    def _inject_mla(
+        self,
+        *,
+        pool,
+        target_hidden: torch.Tensor,
+        cache_loc: torch.Tensor,
+        positions: torch.Tensor,
+        cache_loc_2d: Optional[torch.Tensor],
+        commit_lens: Optional[torch.Tensor],
+        state_slot: Optional[torch.Tensor] = None,
+        final_pos: Optional[torch.Tensor] = None,
+    ) -> None:
+        swa_loc = self.committed_swa_loc(
+            pool=pool,
+            cache_loc=cache_loc,
+            positions=positions,
+            cache_loc_2d=cache_loc_2d,
+            commit_lens=commit_lens,
+            state_slot=state_slot,
+            final_pos=final_pos,
+        )
         with torch.inference_mode():
             self.draft_model.write_target_hidden_kv(
                 main_hidden=target_hidden,
