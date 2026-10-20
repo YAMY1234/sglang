@@ -4,8 +4,9 @@
 // never equal it); rows alternate between two halves by a per-row epoch every rank flips per launch.
 // An owner returns only after every rank sent, i.e. after every rank's lm_head GEMM read the gathered
 // rows: the guarantee K75P's row gather (no entry barrier) took from the pair all-gather.
-// With a memo (SGLANG_Q35MF_DEP_DX_MEMO) each candidate also carries its normalized embedding row,
-// stored before the candidate word and fenced, and the owner copies the winner's row into fc_out.
+// With a memo (SGLANG_Q35MF_DEP_DX_MEMO) the owner copies the winner's normalized embedding row into
+// fc_out: from its own full-vocab memo, or (vocab-sharded memo) from the row each candidate carried,
+// stored before the candidate word and fenced.
 
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
@@ -107,12 +108,13 @@ struct E2xDepXchgParams {
   int32_t draft_column;
   int32_t draft_stride;
   int32_t mrope_stride;
-  const bf16_t* memo;            // [vocab, hidden] normalized embedding rows of this shard, or null
+  const bf16_t* memo;            // [vocab or full vocab, hidden] normalized embedding rows, or null
   uint4* data;                   // this rank's [2, g_max, world, hidden / 8] memo rows sent to it
   const uint64_t* peer_data;     // [world] every rank's data slots (symmetric memory)
   bf16_t* fc_out;                // [rows, fc_stride], the winner's row goes to columns [0, hidden)
   int64_t fc_stride;
   int32_t hidden;
+  bool memo_full;                // memo rows are global token ids, read by the owner; nothing is sent
 };
 
 /**
@@ -130,6 +132,7 @@ __global__ void __launch_bounds__(kThreads) e2x_dep_xchg_kernel(const E2xDepXchg
   __shared__ uint32_t s_key[e2x_dep::kMaxWorld];
   __shared__ int32_t s_tok[e2x_dep::kMaxWorld];
   __shared__ int s_win;
+  __shared__ int32_t s_tok_win;
 
   PDLWaitPrimary<kUsePDL>();
 
@@ -178,7 +181,8 @@ __global__ void __launch_bounds__(kThreads) e2x_dep_xchg_kernel(const E2xDepXchg
   const uint32_t half = p.epoch[g] & 1u;
   const int64_t row_slot = (static_cast<int64_t>(half) * p.g_max + g) * p.world;
   const int hvec = p.hidden / 8;
-  if (p.memo != nullptr) {
+  const bool send_rows = p.memo != nullptr && !p.memo_full;
+  if (send_rows) {
     const uint4* src = reinterpret_cast<const uint4*>(p.memo + static_cast<int64_t>(i) * p.hidden);
     uint4* dst = reinterpret_cast<uint4*>(p.peer_data[owner]) + (row_slot + p.rank) * hvec;
     for (int c = static_cast<int>(threadIdx.x); c < hvec; c += kThreads)
@@ -207,7 +211,7 @@ __global__ void __launch_bounds__(kThreads) e2x_dep_xchg_kernel(const E2xDepXchg
       ptx::ld_relaxed_16B(r, incoming, threadIdx.x);
       if (++spins == e2x_dep::kSpinLimit) __trap();
     } while (e2x_dep::has_marker(r));
-    if (p.fc_out != nullptr) __threadfence_system();
+    if (send_rows) __threadfence_system();
     s_key[threadIdx.x] = r.x | (r.y << 16);
     s_tok[threadIdx.x] = static_cast<int32_t>(r.z);
     // Re-arm the word this thread read; the senders' next store to it is two launches away.
@@ -229,6 +233,7 @@ __global__ void __launch_bounds__(kThreads) e2x_dep_xchg_kernel(const E2xDepXchg
       }
     }
     s_win = win;
+    s_tok_win = bt;
     p.token_out[j] = bt;
     if (p.topk_p != nullptr) p.topk_p[j] = 1.0f;
     if (p.draft_tokens != nullptr) p.draft_tokens[j * p.draft_stride + p.draft_column] = bt;
@@ -242,12 +247,18 @@ __global__ void __launch_bounds__(kThreads) e2x_dep_xchg_kernel(const E2xDepXchg
   }
   if (p.fc_out != nullptr) {
     __syncthreads();
-    const uint4* src = p.data + (row_slot + s_win) * hvec;
     uint4* dst = reinterpret_cast<uint4*>(p.fc_out + j * p.fc_stride);
-    for (int c = static_cast<int>(threadIdx.x); c < hvec; c += kThreads) {
-      uint4 x;
-      ptx::ld_relaxed_16B(x, src, c);
-      dst[c] = x;
+    if (p.memo_full) {
+      const uint4* src = reinterpret_cast<const uint4*>(p.memo + static_cast<int64_t>(s_tok_win) * p.hidden);
+      for (int c = static_cast<int>(threadIdx.x); c < hvec; c += kThreads)
+        dst[c] = src[c];
+    } else {
+      const uint4* src = p.data + (row_slot + s_win) * hvec;
+      for (int c = static_cast<int>(threadIdx.x); c < hvec; c += kThreads) {
+        uint4 x;
+        ptx::ld_relaxed_16B(x, src, c);
+        dst[c] = x;
+      }
     }
   }
 }
@@ -274,6 +285,7 @@ struct E2xDepXchg {
       const tvm::ffi::TensorView data,
       const tvm::ffi::TensorView peer_data,
       const tvm::ffi::TensorView fc_out,
+      bool memo_full,
       int64_t vocab_start,
       int64_t nan_key,
       int64_t rank,
@@ -342,16 +354,22 @@ struct E2xDepXchg {
     if (memo.numel() > 0) {
       auto HD = SymbolicSize{"hidden"};
       auto FS = SymbolicSize{"fc_row_stride"};
-      TensorMatcher({V, HD}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(memo);
-      TensorMatcher({2, GM, WS, HD}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(data);
-      TensorMatcher({WS}).with_dtype<int64_t>().with_device(device).verify(peer_data);
+      if (memo_full) {
+        auto VF = SymbolicSize{"vocab"};
+        VF.set_value(V.unwrap() * world);
+        TensorMatcher({VF, HD}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(memo);
+      } else {
+        TensorMatcher({V, HD}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(memo);
+        TensorMatcher({2, GM, WS, HD}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(data);
+        TensorMatcher({WS}).with_dtype<int64_t>().with_device(device).verify(peer_data);
+        data_ptr = static_cast<uint4*>(data.data_ptr());
+        peer_data_ptr = static_cast<const uint64_t*>(peer_data.data_ptr());
+      }
       TensorMatcher({R, HD}).with_strides({FS, 1}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(fc_out);
       hidden = HD.unwrap();
       fc_stride = FS.unwrap();
       CHECK_HOST(hidden % 8 == 0 && fc_stride % 8 == 0) << "memo rows must be 16-byte vectors";
       memo_ptr = static_cast<const bf16_t*>(memo.data_ptr());
-      data_ptr = static_cast<uint4*>(data.data_ptr());
-      peer_data_ptr = static_cast<const uint64_t*>(peer_data.data_ptr());
       fc_ptr = static_cast<bf16_t*>(fc_out.data_ptr());
     }
     const auto params = E2xDepXchgParams{
@@ -384,6 +402,7 @@ struct E2xDepXchg {
         .fc_out = fc_ptr,
         .fc_stride = fc_stride,
         .hidden = static_cast<int32_t>(hidden),
+        .memo_full = memo_full,
     };
     LaunchKernel(dim3(static_cast<uint32_t>(blocks), static_cast<uint32_t>(g)), kThreads, device.unwrap())
         .enable_pdl(kUsePDL)(e2x_dep_xchg_kernel<kThreads, kUsePDL>, params);

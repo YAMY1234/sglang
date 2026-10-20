@@ -1352,6 +1352,9 @@ class Envs:
     # With DEP_DX_XCHG engaged, each candidate also carries its normed embedding row (a memo of
     # this rank's vocab shard, 0.5 GB on Qwen3.5) and the next draft step skips embed, norms and cat.
     SGLANG_Q35MF_DEP_DX_MEMO = EnvBool(False)
+    # With DEP_DX_MEMO, keep the whole vocab's normed rows on every rank (2 GB on Qwen3.5), read
+    # by the owner, instead of this rank's shard sent with each candidate.
+    SGLANG_Q35MF_DEP_DX_MEMO_FULL = EnvBool(False)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)

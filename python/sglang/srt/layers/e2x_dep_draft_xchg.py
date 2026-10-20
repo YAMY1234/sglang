@@ -83,6 +83,7 @@ class DepDraftXchg:
         self.no_rows = torch.empty(0, dtype=torch.bfloat16, device=device)
         # Memo state (enable_memo): fc_in holds the next draft step's fc input.
         self.memo: Optional[torch.Tensor] = None
+        self.memo_full = False
         self.data: Optional[torch.Tensor] = None
         self.peer_data: Optional[torch.Tensor] = None
         self.fc_in: Optional[torch.Tensor] = None
@@ -104,21 +105,38 @@ class DepDraftXchg:
         embed_weight: torch.Tensor,
         norm: Callable[[torch.Tensor], torch.Tensor],
         vocab_local: int,
+        full: bool,
     ) -> None:
-        """Collective. Normalized embedding rows of this rank's vocab shard, built with the served norm."""
+        """Collective. Normalized embedding rows built with the served norm: this rank's vocab shard,
+        sent with each candidate, or (``full``) the whole vocab, read by the owner."""
         import torch.distributed._symmetric_memory as symm_mem
 
         hidden = embed_weight.shape[1]
-        start = self.rank * vocab_local
+        start = 0 if full else self.rank * vocab_local
+        count = self.world * vocab_local if full else vocab_local
         if embed_weight.shape[0] < self.world * vocab_local or hidden % 8 != 0:
             raise RuntimeError(
                 f"DEP-DX memo needs the full embedding table, got {tuple(embed_weight.shape)}"
             )
-        rows = embed_weight[start : start + vocab_local]
-        memo = torch.empty((vocab_local, hidden), dtype=torch.bfloat16, device=rows.device)
-        for i in range(0, vocab_local, _MEMO_BLOCK):
+        rows = embed_weight[start : start + count]
+        memo = torch.empty((count, hidden), dtype=torch.bfloat16, device=rows.device)
+        for i in range(0, count, _MEMO_BLOCK):
             memo[i : i + _MEMO_BLOCK] = norm(rows[i : i + _MEMO_BLOCK].contiguous())
         self._check_memo(memo=memo, rows=rows, norm=norm)
+        self.memo = memo
+        self.memo_full = full
+        self.fc_in = torch.zeros(
+            (self.max_rows, 2 * hidden), dtype=torch.bfloat16, device=rows.device
+        )
+        self.side_stream = torch.cuda.Stream(device=rows.device)
+        logger.info(
+            "DEP-DX memo active (vocab rows %d:%d, %.1f MB on this rank).",
+            start,
+            start + count,
+            memo.numel() * 2 / 2**20,
+        )
+        if full:
+            return
         with torch.inference_mode(False), torch.no_grad():
             data = symm_mem.empty(
                 dep_data_shape(self.world * self.max_rows, self.world, hidden),
@@ -128,20 +146,9 @@ class DepDraftXchg:
         hdl = symm_mem.rendezvous(data, group=self.device_group)
         if int(hdl.buffer_ptrs[self.rank]) != data.data_ptr():
             raise RuntimeError("DEP-DX memo: unexpected symmetric memory layout")
-        self.memo = memo
         self.data = data
         self.peer_data = torch.tensor(
             [int(p) for p in hdl.buffer_ptrs], dtype=torch.int64, device=rows.device
-        )
-        self.fc_in = torch.zeros(
-            (self.max_rows, 2 * hidden), dtype=torch.bfloat16, device=rows.device
-        )
-        self.side_stream = torch.cuda.Stream(device=rows.device)
-        logger.info(
-            "DEP-DX memo active (vocab rows %d:%d, %.1f MB on this rank).",
-            start,
-            start + vocab_local,
-            memo.numel() * 2 / 2**20,
         )
 
     def _check_memo(
@@ -256,7 +263,9 @@ class DepDraftXchg:
             topk_p = torch.empty((rows, 1), dtype=torch.float32, device=logits.device)
         memo = data = peer_data = fc_out = self.no_rows
         if step is not None and self._produce:
-            memo, data, peer_data = self.memo, self.data, self.peer_data
+            memo = self.memo
+            if not self.memo_full:
+                data, peer_data = self.data, self.peer_data
             fc_out = self.fc_in[:rows, : self.memo.shape[1]]
         before = None
         if self.proof is not None and step is not None:
@@ -278,6 +287,7 @@ class DepDraftXchg:
             data=data,
             peer_data=peer_data,
             fc_out=fc_out,
+            memo_full=self.memo_full,
             vocab_start=self.rank * logits.shape[1],
             torch_nan=torch_nan,
             rank=self.rank,
