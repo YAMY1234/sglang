@@ -877,8 +877,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 for p in (gu, dp)
             )
             and isinstance(mlp.act_fn, SiluAndMul)
-            and tuple(gu.weight.shape) == (4096, 1024)
-            and tuple(dp.weight.shape) == (512, 4096)
+            and (tuple(gu.weight.shape), tuple(dp.weight.shape))
+            in (((4096, 1024), (512, 4096)), ((4096, 512), (256, 4096)))
             and gate.bias is None
             and tuple(gate.weight.shape) == (1, 4096)
             and gate.weight.dtype == torch.bfloat16
@@ -886,12 +886,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
     def _use_ktp2_shared_fused(self, m: int) -> bool:
         # The fused router front already produced this call's gate/up; keep the served tail for it.
-        if (
-            not self._ktp2_shared_fused_min_tokens
-            <= m
-            <= self._ktp2_shared_fused_max_tokens
-            or self._route_sh_gate_up is not None
-        ):
+        lo, hi = self._ktp2_shared_fused_min_tokens, self._ktp2_shared_fused_max_tokens
+        if envs.SGLANG_Q35MF_TPX_SHARED_FUSED_LIVE.get() and self.alt_stream is not None:
+            # Range read per call, so graph variants captured under different values each keep theirs.
+            lo = envs.SGLANG_Q35MF_KTP2_SHARED_FUSED_MIN_TOKENS.get()
+            hi = min(envs.SGLANG_Q35MF_KTP2_SHARED_FUSED_MAX_TOKENS.get(), 128)
+        if not lo <= m <= hi or self._route_sh_gate_up is not None:
             return False
         if self._ktp2_shared_fused_ok is None:
             self._ktp2_shared_fused_ok = self._ktp2_shared_fused_supported()
