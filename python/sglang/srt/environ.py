@@ -575,6 +575,9 @@ class Envs:
     # DSpark static verify: the verify graph scatters new seq lens and the bonus into
     # the FutureMap's slots; the host skips those scatters for folded accepts.
     SGLANG_OPT_DSV41_DSPARK_POST_FOLD = EnvBool(False)
+    # DSpark target verify: a pre-planned replay skips re-copying input_ids / positions
+    # the plan-time load already copied from the same tensors.
+    SGLANG_OPT_DSV41_DSPARK_SKIP_PREFILLED_INPUTS = EnvBool(False)
     # Test-only: spin this long (us) before the forked write, to expose a missing join.
     SGLANG_DSPARK_DEFER_CONTEXT_KV_TEST_SPIN_US = EnvInt(0)
     # The deferred commit's staging (hidden, write locations, positions, commit lengths)
