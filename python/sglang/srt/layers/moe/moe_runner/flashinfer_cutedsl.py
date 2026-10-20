@@ -537,6 +537,12 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
 _ep_tables_engaged: set[tuple[int, int, int]] = set()
 
 
+def _ep_tables_fit(topk_ids: torch.Tensor) -> bool:
+    from sglang.kernels.ops.moe.qwen_ep_tables import EP_TABLES_MAX_EXPANDED
+
+    return topk_ids.numel() <= EP_TABLES_MAX_EXPANDED
+
+
 def _experts_from_ep_tables(
     quant_info: CuteDslFp4MoeQuantInfo,
     x_fp4: torch.Tensor,
@@ -678,6 +684,7 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
         envs.SGLANG_Q35MF_DEP_EP_TABLES.get()
         and quant_info.quant_mode == "w4a4"
         and per_token_scale is None
+        and _ep_tables_fit(topk_ids)
     ):
         moe_output = dispatch_output.moe_output
         if moe_output is None:
