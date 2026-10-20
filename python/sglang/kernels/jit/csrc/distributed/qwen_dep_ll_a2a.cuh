@@ -165,10 +165,13 @@ __global__ __launch_bounds__(kThreads) void dispatch_kernel(const __grid_constan
   const uint32_t sends = p.tokens * kRanks * G::kLines;
   for (uint32_t task = b * kThreads + tid; task < sends; task += grid * kThreads) {
     const uint32_t i = task % G::kLines, j = task / G::kLines, r = j % kRanks, t = j / kRanks;
+    const bool routed = s_mask[t] >> r & 1u;
+    // A token with no expert on rank r sends it only the id lines (all invalid), which its reader checks first.
+    if (!routed && i >= G::kIdLines) continue;
     uint2 d;
     if (i < G::kIdLines) {
-      d = (s_mask[t] >> r & 1u) ? *reinterpret_cast<const uint2*>(p.ids + t * kTopK + 2 * i)
-                                : make_uint2(static_cast<uint32_t>(p.invalid_id), static_cast<uint32_t>(p.invalid_id));
+      d = routed ? *reinterpret_cast<const uint2*>(p.ids + t * kTopK + 2 * i)
+                 : make_uint2(static_cast<uint32_t>(p.invalid_id), static_cast<uint32_t>(p.invalid_id));
     } else if (i < G::kIdLines + G::kWtLines) {
       d = *reinterpret_cast<const uint2*>(p.wts + t * kTopK + 2 * (i - G::kIdLines));
     } else if (i < G::kIdLines + G::kWtLines + G::kXLines) {
@@ -207,10 +210,17 @@ __global__ __launch_bounds__(kThreads) void dispatch_kernel(const __grid_constan
   for (uint32_t task = b * kThreads + tid; task < recvs; task += grid * kThreads) {
     const uint32_t i = task % G::kLines, j = task / G::kLines, s = j % kRanks, t = j / kRanks;
     if (t >= s_tokens[s]) continue;
-    const uint8_t* line = mine + G::slot_offset(stage, s, t, p.slots) + i * 16;
+    const uint8_t* slot = mine + G::slot_offset(stage, s, t, p.slots);
     uint4 v;
     uint32_t spins = 0;
     uint64_t since = 0;
+    if (i >= G::kIdLines) {
+      // Line 0 carries the first id: the invalid id means the source sent only the id lines.
+      for (v = ld_line(slot); v.y != epoch || v.w != epoch; v = ld_line(slot))
+        wait_tick(spins, since, p.err, 2);
+      if (static_cast<int32_t>(v.x) == p.invalid_id) continue;
+    }
+    const uint8_t* line = slot + i * 16;
     for (v = ld_line(line); v.y != epoch || v.w != epoch; v = ld_line(line))
       wait_tick(spins, since, p.err, 2);
     const uint2 d = make_uint2(v.x, v.z);
