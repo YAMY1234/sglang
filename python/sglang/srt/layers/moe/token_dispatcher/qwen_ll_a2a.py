@@ -64,9 +64,10 @@ class LlA2AState:
         # No rank may write into a peer's region before that peer has initialized it.
         MnnvlMemory.allocated_map[self._mem.ptr].comm.barrier()
         bases = [regions[r].data_ptr() for r in range(ep_size)]
-        self.dispatch_peers = torch.tensor(bases, dtype=torch.int64)
+        # Read by the launcher on the host; model init runs under a CUDA default device, so say cpu.
+        self.dispatch_peers = torch.tensor(bases, dtype=torch.int64, device="cpu")
         self.combine_peers = torch.tensor(
-            [b + dispatch_bytes for b in bases], dtype=torch.int64
+            [b + dispatch_bytes for b in bases], dtype=torch.int64, device="cpu"
         )
         device = regions.device
         # Every CTA spins on peer data, so the grid must fit on the GPU at once.
