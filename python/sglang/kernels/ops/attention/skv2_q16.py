@@ -39,8 +39,9 @@ The 112 query rows (7 positions x 16 heads) of one request sit on the TMEM lanes
 softmax thread owns one row: row maxima and sums need no cross-thread reduction, and the output accumulates
 in TMEM across the split's 128-token blocks (rescaled in place when the running maximum moves). Rounding
 follows sglang split_kv_verify: the stock page split (SPLITS per request), the raw running maximum, one e4m3
-rounding of P x 256, bf16 partials x (V_SCALE / 256), so the stock merge kernel reduces the partials unchanged.
-Only fp32 association differs.
+rounding of P x 256, partials x (V_SCALE / 256), so the stock merge kernel reduces the partials unchanged.
+Partials are fp32 by default (one bf16 rounding per output, in the merge); bf16 partials are the split_kv_verify
+contract. Only fp32 association differs.
 """
 
 import cuda.bindings.driver as cuda
@@ -104,7 +105,17 @@ class Q16SplitDecode:
     warp 8: both MMAs, warp 9: TMA loads."""
 
     def __init__(
-        self, heads=16, qlen=7, splits=148, stages=2, batch=1, mode=0, trace=False, lazy=0.0, pdl=False
+        self,
+        heads=16,
+        qlen=7,
+        splits=148,
+        stages=2,
+        batch=1,
+        mode=0,
+        trace=False,
+        lazy=0.0,
+        pdl=False,
+        f32_partials=True,
     ):
         assert heads * qlen <= 128 and (heads * qlen) % 8 == 0 and stages in (1, 2)
         # P x 256 must stay <= 448 (e4m3 max), so a stale reference may trail the maximum by < log2(1.75).
@@ -112,6 +123,7 @@ class Q16SplitDecode:
         self.lazy = lazy
         # Programmatic dependent launch: wait for the previous grid before reading inputs, release the merge early.
         self.pdl = pdl
+        self.f32_partials = f32_partials
         # Timing ablations only (wrong outputs): 1 no O rescale, 2 no softmax math, 4 no P V MMA, 8 no Q K MMA,
         # 16 no tail masking.
         self.mode = mode
@@ -253,13 +265,22 @@ class Q16SplitDecode:
             cute.make_layout(128),
             alignment=128,
         )
-        # Epilogue staging of one 64-column piece of each O half (rows padded by 16 bytes against bank conflicts).
-        so = ex.allocate(
-            cutlass.BFloat16,
-            cutlass.AddressSpace.smem,
-            cute.make_layout((self.rows, 128), stride=(136, 1)),
-            alignment=128,
-        )
+        # Epilogue staging of one piece of each O half: 64 bf16 or 32 fp32 columns, the same 30,464 bytes
+        # (rows padded by 16 bytes against bank conflicts).
+        if cutlass.const_expr(self.f32_partials):
+            so = ex.allocate(
+                f32,
+                cutlass.AddressSpace.smem,
+                cute.make_layout((self.rows, 64), stride=(68, 1)),
+                alignment=128,
+            )
+        else:
+            so = ex.allocate(
+                cutlass.BFloat16,
+                cutlass.AddressSpace.smem,
+                cute.make_layout((self.rows, 128), stride=(136, 1)),
+                alignment=128,
+            )
         nbar = 1 + 4 * self.stages + 4 * self.slots + 1
         barriers = ex.allocate(
             cutlass.Int64,
@@ -506,32 +527,63 @@ class Q16SplitDecode:
                         if cutlass.const_expr(wg == 1):
                             xden[row] = running_l
                         prim.barrier_cta_sync(2, thread_count=256)
-                        out16 = cute.make_rmem_tensor((half,), cutlass.BFloat16)
-                        chunk = cute.make_rmem_tensor((8,), cutlass.BFloat16)
-                        for h in cutlass.range_constexpr(128 // half):
-                            o_sub = cute.local_tile(o_plane, (128, half), (0, h))
-                            load_o = tcgen05.make_tmem_copy(ld_half, o_sub).get_slice(row)
-                            ex.partition_and_copy(load_o, o_sub, oview)
-                            cute.arch.fence_view_async_tmem_load()
-                            out16.store((vals[None, 0].load() * out_scale).to(cutlass.BFloat16))
-                            # Rows land in SMEM first so the global stores below are 128-byte coalesced runs.
-                            if row < rows:
-                                cute.autovec_copy(out16, cute.local_tile(so[row, None], (half,), (wg,)))
-                            prim.barrier_cta_sync(2, thread_count=256)
-                            for i in cutlass.range_constexpr(rows * 16 // 256):
-                                flat = tid + 256 * i
-                                srow = flat // 16
-                                ch = flat % 16
-                                cute.autovec_copy(cute.local_tile(so[srow, None], (8,), (ch,)), chunk)
-                                cute.autovec_copy(
-                                    chunk,
-                                    cute.local_tile(
-                                        partial[prow + srow, None],
-                                        (8,),
-                                        ((ch // 8) * 16 + h * 8 + ch % 8,),
-                                    ),
-                                )
-                            prim.barrier_cta_sync(2, thread_count=256)
+                        if cutlass.const_expr(self.f32_partials):
+                            sub = half // 2
+                            out32 = cute.make_rmem_tensor((sub,), f32)
+                            chunk32 = cute.make_rmem_tensor((4,), f32)
+                            for h in cutlass.range_constexpr(128 // half):
+                                o_sub = cute.local_tile(o_plane, (128, half), (0, h))
+                                load_o = tcgen05.make_tmem_copy(ld_half, o_sub).get_slice(row)
+                                ex.partition_and_copy(load_o, o_sub, oview)
+                                cute.arch.fence_view_async_tmem_load()
+                                for part in cutlass.range_constexpr(2):
+                                    for j in cutlass.range_constexpr(sub):
+                                        out32[j] = vals[part * sub + j, 0] * out_scale
+                                    if row < rows:
+                                        cute.autovec_copy(out32, cute.local_tile(so[row, None], (sub,), (wg,)))
+                                    prim.barrier_cta_sync(2, thread_count=256)
+                                    # 16-byte chunks: 0-7 are O half 0 (dims 0..127), 8-15 O half 1.
+                                    for i in cutlass.range_constexpr(rows * 16 // 256):
+                                        flat = tid + 256 * i
+                                        srow = flat // 16
+                                        ch = flat % 16
+                                        cute.autovec_copy(cute.local_tile(so[srow, None], (4,), (ch,)), chunk32)
+                                        cute.autovec_copy(
+                                            chunk32,
+                                            cute.local_tile(
+                                                partial[prow + srow, None],
+                                                (4,),
+                                                ((ch // 8) * 32 + h * 16 + part * 8 + ch % 8,),
+                                            ),
+                                        )
+                                    prim.barrier_cta_sync(2, thread_count=256)
+                        else:
+                            out16 = cute.make_rmem_tensor((half,), cutlass.BFloat16)
+                            chunk = cute.make_rmem_tensor((8,), cutlass.BFloat16)
+                            for h in cutlass.range_constexpr(128 // half):
+                                o_sub = cute.local_tile(o_plane, (128, half), (0, h))
+                                load_o = tcgen05.make_tmem_copy(ld_half, o_sub).get_slice(row)
+                                ex.partition_and_copy(load_o, o_sub, oview)
+                                cute.arch.fence_view_async_tmem_load()
+                                out16.store((vals[None, 0].load() * out_scale).to(cutlass.BFloat16))
+                                # Rows land in SMEM first so the global stores below are 128-byte coalesced runs.
+                                if row < rows:
+                                    cute.autovec_copy(out16, cute.local_tile(so[row, None], (half,), (wg,)))
+                                prim.barrier_cta_sync(2, thread_count=256)
+                                for i in cutlass.range_constexpr(rows * 16 // 256):
+                                    flat = tid + 256 * i
+                                    srow = flat // 16
+                                    ch = flat % 16
+                                    cute.autovec_copy(cute.local_tile(so[srow, None], (8,), (ch,)), chunk)
+                                    cute.autovec_copy(
+                                        chunk,
+                                        cute.local_tile(
+                                            partial[prow + srow, None],
+                                            (8,),
+                                            ((ch // 8) * 16 + h * 8 + ch % 8,),
+                                        ),
+                                    )
+                                prim.barrier_cta_sync(2, thread_count=256)
                         if row < rows:
                             if cutlass.const_expr(wg == 0):
                                 maxima[prow + row] = running_m
@@ -724,6 +776,7 @@ class Q16SplitPlan:
         merge_warps=4,
         lazy=0.0,
         pdl=False,
+        partial_dtype=torch.float32,
     ):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
@@ -735,9 +788,10 @@ class Q16SplitPlan:
         self.qlen = query.shape[0] // self.batch
         self.splits = splits or 148 // self.batch
         self.rows = self.qlen * self.heads
+        assert partial_dtype in (torch.float32, torch.bfloat16)
         self.partial = torch.empty(
             (self.batch, self.splits, self.rows, 256),
-            dtype=torch.bfloat16,
+            dtype=partial_dtype,
             device=query.device,
         )
         self.maximum = torch.empty(
@@ -755,6 +809,7 @@ class Q16SplitPlan:
             trace=trace,
             lazy=lazy,
             pdl=pdl,
+            f32_partials=partial_dtype == torch.float32,
         )
         self.pdl = pdl
         views = self._views(query, kv, table, lengths)
