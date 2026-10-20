@@ -310,13 +310,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             select = self.draft_runner.model.logits_processor.k75p_draft_select
             if select is not None:
                 self._dep_draft_xchg = select.dep
-            if self._dep_draft_xchg is not None and envs.SGLANG_Q35MF_DEP_DX_MEMO.get():
+            if (
+                self._dep_draft_xchg is not None
+                and envs.SGLANG_Q35MF_DEP_DX_MEMO_FULL.get()
+            ):
                 model = self.draft_runner.model
                 self._dep_draft_xchg.enable_memo(
                     embed_weight=model.model.embed_tokens.weight,
                     norm=model.pre_fc_norm_embedding,
-                    vocab_local=model.lm_head.weight.shape[0],
-                    full=envs.SGLANG_Q35MF_DEP_DX_MEMO_FULL.get(),
+                    vocab=model.lm_head.weight.shape[0] * get_parallel().tp_size,
                 )
                 model._dep_dx = self._dep_draft_xchg
 

@@ -39,11 +39,6 @@ def dep_slots_shape(max_gathered_rows: int, world: int) -> tuple:
     return (2, max_gathered_rows, world, 4)
 
 
-def dep_data_shape(max_gathered_rows: int, world: int, hidden: int) -> tuple:
-    """[2 halves, gathered rows, sender rank, hidden] bf16: the memo row behind each candidate."""
-    return (2, max_gathered_rows, world, hidden)
-
-
 def dep_xchg_blocks(gathered_rows: int) -> int:
     # Arbitrary: about 256 CTAs in flight, at least 4 per row.
     return max(4, min(MAX_BLOCKS, 256 // gathered_rows))
@@ -63,10 +58,7 @@ def e2x_dep_xchg(
     positions: torch.Tensor,
     mrope_positions: torch.Tensor,
     memo: torch.Tensor,
-    data: torch.Tensor,
-    peer_data: torch.Tensor,
     fc_out: torch.Tensor,
-    memo_full: bool,
     vocab_start: int,
     torch_nan: bool,
     rank: int,
@@ -78,10 +70,9 @@ def e2x_dep_xchg(
     [world * rows, V_local] of every gathered row (rank-major): the argmax over the full vocab,
     ties to the lowest id, NaN as torch.argmax (``torch_nan``) or as -1e30. Non-empty ``topk_p``,
     ``draft_tokens`` [rows, steps], ``positions`` [rows] and ``mrope_positions`` [3, rows] get
-    k75p_topk1_postprocess's writes (topk_p = 1, column ``draft_column``, + 1) and mrope + 1. A
-    non-empty ``memo`` has normalized embedding rows: this shard's [V_local, H], sent with each candidate
-    through ``data``, or with ``memo_full`` the whole vocab [V, H], read by the owner; the owner writes
-    the winner's row into ``fc_out`` [rows, H] (row stride free)."""
+    k75p_topk1_postprocess's writes (topk_p = 1, column ``draft_column``, + 1) and mrope + 1. With a
+    non-empty ``memo`` [V, H] of normalized embedding rows, the winner's row also goes to ``fc_out``
+    [rows, H] (row stride free)."""
     if blocks is None:
         blocks = dep_xchg_blocks(logits.shape[0])
     _module().run(
@@ -98,10 +89,7 @@ def e2x_dep_xchg(
         positions,
         mrope_positions,
         memo,
-        data,
-        peer_data,
         fc_out,
-        memo_full,
         vocab_start,
         NAN_KEY_TORCH_ARGMAX if torch_nan else NAN_KEY_SPLIT_ARGMAX,
         rank,

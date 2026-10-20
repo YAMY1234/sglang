@@ -1349,11 +1349,8 @@ class Envs:
     # With DEP_DX_XCHG engaged, also run the stock K75P select and finish on the same logits
     # and count rows whose outputs differ per kind (decode / extend), logged every 30 s.
     SGLANG_Q35MF_DEP_DX_PROOF = EnvBool(False)
-    # With DEP_DX_XCHG engaged, each candidate also carries its normed embedding row (a memo of
-    # this rank's vocab shard, 0.5 GB on Qwen3.5) and the next draft step skips embed, norms and cat.
-    SGLANG_Q35MF_DEP_DX_MEMO = EnvBool(False)
-    # With DEP_DX_MEMO, keep the whole vocab's normed rows on every rank (2 GB on Qwen3.5), read
-    # by the owner, instead of this rank's shard sent with each candidate.
+    # With DEP_DX_XCHG engaged, a memo of the whole vocab's normed embedding rows on every rank
+    # (2 GB on Qwen3.5) feeds the next draft step's fc input; it skips embed, both norms and cat.
     SGLANG_Q35MF_DEP_DX_MEMO_FULL = EnvBool(False)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
