@@ -566,6 +566,11 @@ class Envs:
     SGLANG_DSPARK_FUSED_ACCEPT_TAIL = EnvBool(False)
     SGLANG_DSPARK_ACCEPT_TAIL_MIN_BS = EnvInt(1)
     SGLANG_DSPARK_ACCEPT_TAIL_MAX_BS = EnvInt(0)
+    # Static verify graphs stage the draft context-KV commit; the next draft graph
+    # writes it on a side stream forked at its head, joined at its first KV store.
+    SGLANG_DSPARK_DEFER_CONTEXT_KV = EnvBool(False)
+    # Test-only: spin this long (us) before the forked write, to expose a missing join.
+    SGLANG_DSPARK_DEFER_CONTEXT_KV_TEST_SPIN_US = EnvInt(0)
 
     # ===================================================================
     # Memory pools and KV-cache sizing
@@ -1772,6 +1777,12 @@ class Envs:
     # DSpark folded draft: the draft graph's tail writes [anchor | draft tokens]
     # into the sampler's own buffer, so the step skips its eager concat.
     SGLANG_OPT_DSV41_DSPARK_MID_FOLD = EnvBool(False)
+    # DSpark static verify: run the target verify runner's metadata prep through the
+    # metadata glue graph where its backend declares the prep host-free.
+    SGLANG_OPT_DSV41_TARGET_VERIFY_METADATA_GLUE = EnvBool(False)
+    # DSpark static verify: record the post-verify engram history commit in the
+    # target-verify CUDA graph (epilogue) instead of launching it after the replay.
+    SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH = EnvBool(False)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # ===================================================================

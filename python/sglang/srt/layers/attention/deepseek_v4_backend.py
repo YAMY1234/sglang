@@ -6,6 +6,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
+    Callable,
     Dict,
     List,
     Literal,
@@ -1222,6 +1223,9 @@ class DeepseekV4AttnBackend(
     ):
         super().__init__()
         self.model_runner = model_runner
+        # Run at every KV store-location read; the DSpark deferred context-KV commit
+        # joins its forked write there (SGLANG_DSPARK_DEFER_CONTEXT_KV).
+        self.pre_kv_store_hook: Optional[Callable[[], None]] = None
         self.encoder_replay = False
         self.encoder_row_floor = None
         self.device = torch.device(model_runner.device)
@@ -1346,6 +1350,22 @@ class DeepseekV4AttnBackend(
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
         return pin_tensor.to(self.device, non_blocking=True)
+
+    def glue_target_verify_metadata(self) -> str:
+        # The static target verify prep reads the runner's slots and own buffers only;
+        # host lengths, online c128 MTP, trtllm, a request window and CP are unaudited.
+        for bad, why in (
+            (self.is_draft_runner, "a draft runner"),
+            (self.needs_cpu_seq_lens, "host sequence lengths"),
+            (self.trtllm_attn, "trtllm-gen attention"),
+            (self.online_c128_mtp.enabled(), "online c128 MTP"),
+            (read_ragged_verify_mode() is not RaggedVerifyMode.STATIC, "ragged verify"),
+            (self.token_to_kv_pool.request_window is not None, "a request window"),
+            (get_parallel().attn_cp_size != 1, "context parallelism"),
+        ):
+            if bad:
+                return why
+        return ""
 
     def glue_draft_metadata(self) -> str:
         # On FlashMLA without online c128 MTP, a request window or context
@@ -3927,6 +3947,8 @@ class DeepseekV4AttnBackend(
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Idle always re-translates at store time: its metadata may be stale, and
         translating the zero-padded out_cache_loc writes to the dummy slot."""
+        if self.pre_kv_store_hook is not None:
+            self.pre_kv_store_hook()
         metadata = self.forward_metadata
         if self.token_to_kv_pool.request_window is not None:
             layout = metadata.core_attn_metadata.request_window_layout

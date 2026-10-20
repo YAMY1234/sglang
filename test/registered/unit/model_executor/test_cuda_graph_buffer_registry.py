@@ -260,6 +260,35 @@ class TestFillFromAndExtract(unittest.TestCase):
             )
         )
 
+    def test_padding_reset_follows_each_axis(self):
+        """A replay may pad bs alone (ragged verify slots) or tokens alone (prefill
+        buckets); the padded axis's tail is still reset."""
+        r = self._build_registry()
+
+        def fill(*, raw_bs, raw_num_tokens):
+            for name in ("req_pool_indices", "seq_lens", "out_cache_loc"):
+                r.get_slot(name).buffer.fill_(99)
+            fb = _MiniForwardBatch(
+                batch_size=raw_bs,
+                req_pool_indices=torch.arange(raw_bs, dtype=torch.int64) + 1,
+                seq_lens=torch.arange(raw_bs, dtype=torch.int32) + 20,
+                out_cache_loc=torch.arange(raw_num_tokens, dtype=torch.int64) + 100,
+            )
+            r.fill_from(
+                fb,
+                raw_bs=raw_bs,
+                padded_bs=4,
+                raw_num_tokens=raw_num_tokens,
+                padded_num_tokens=8,
+            )
+            return lambda name: r.get_slot(name).buffer.tolist()
+
+        slots = fill(raw_bs=2, raw_num_tokens=8)
+        self.assertEqual(slots("req_pool_indices"), [1, 2, 0, 0])
+        self.assertEqual(slots("seq_lens"), [20, 21, 5, 5])
+        slots = fill(raw_bs=4, raw_num_tokens=6)
+        self.assertEqual(slots("out_cache_loc"), [100, 101, 102, 103, 104, 105, 0, 0])
+
     def test_keep_pad_preserves_padded_tail(self):
         r = _make_registry(max_bs=4, max_num_tokens=8)
         r.register_slot(
@@ -1512,6 +1541,25 @@ class TestComputedSlots(unittest.TestCase):
                 reg.get_slot("global_num_tokens_gpu").buffer,
                 torch.tensor([4], dtype=torch.int32),
             )
+        )
+
+
+class TestOneDenseIntPair(unittest.TestCase):
+    def test_only_one_dense_integer_dtype_pair_takes_the_single_foreach_copy(self):
+        """A CUDA group of one integer (dst, src) dtype pair over dense tensors goes to
+        one foreach copy; a float, mixed or strided group keeps the small copy."""
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            _one_dense_int_pair,
+        )
+
+        i64 = torch.zeros(8, dtype=torch.int64)
+        i32 = torch.zeros(8, dtype=torch.int32)
+        self.assertTrue(_one_dense_int_pair([i64[:4], i64[4:]], [i64[:4], i64[4:]]))
+        self.assertTrue(_one_dense_int_pair([i64[:4]], [i32[:4]]))
+        self.assertFalse(_one_dense_int_pair([i64[:4], i64[4:]], [i64[:4], i32[4:]]))
+        self.assertFalse(_one_dense_int_pair([torch.zeros(4)], [torch.zeros(4)]))
+        self.assertFalse(
+            _one_dense_int_pair([i64[:4]], [torch.zeros(3, 4, dtype=torch.int64)[:, 0]])
         )
 
 

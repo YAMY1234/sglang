@@ -7,6 +7,7 @@ from typing import Optional
 import msgspec
 import torch
 
+from sglang.kernels.ops.embeddings.engram_hash import engram_commit_history
 from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     AcceptGreedy,
     AcceptSampling,
@@ -30,12 +31,16 @@ from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
     simulated_bonus_sample_graph,
 )
 from sglang.kernels.ops.speculative.dspark.static_accept_tail import static_accept_tail
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
+from sglang.srt.speculative.dspark_components.dspark_deferred_commit import (
+    DeferredContextCommit,
+)
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
@@ -168,6 +173,7 @@ class TargetVerifyExecutor:
         override drawn by begin_simulated_step.
         """
         if folded_accept:
+            self.verify_epilogue.note_static_verify(bs)
             return self.verify_epilogue.read_accept(bs)
 
         simulate = self._simulated_correct_len is not None
@@ -520,6 +526,9 @@ class CommitInjectCtx(msgspec.Struct):
     resolve_pool: object
     resolve_req_to_token: object
     kv_injector: Optional[TargetHiddenKvInjector] = None
+    # SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH: returns the target's engram hasher
+    # (or None), whose history commit the static epilogue then records in-graph.
+    resolve_engram_hasher: Optional[object] = None
 
 
 class AcceptOuts(msgspec.Struct):
@@ -546,8 +555,13 @@ class DsparkVerifyEpilogue:
         fused_accept_tail: bool = False,
         accept_tail_min_bs: int = 1,
         accept_tail_max_bs: int = 0,
+        defer_context_kv: bool = False,
     ) -> None:
         self.max_bs = int(max_bs)
+        # SGLANG_DSPARK_DEFER_CONTEXT_KV: static graphs stage the draft-KV commit into
+        # this, built at the first warmup; the next draft forward writes it.
+        self._defer_context_kv = bool(defer_context_kv)
+        self.deferred_commit: Optional[DeferredContextCommit] = None
         # SGLANG_SIMULATE_ACC_LEN with a sampled bonus inside the graph too: the bonus
         # is drawn at the simulated correct_len from these buffers, which
         # begin_sim_bonus writes before replay (<= 0 temperature: argmax).
@@ -604,11 +618,18 @@ class DsparkVerifyEpilogue:
         self.gated_commit_lens_buf = torch.zeros(
             (self.max_bs,), dtype=torch.int32, device=device
         )
+        self.block_accept_lens_buf = (
+            torch.zeros((self.max_bs,), dtype=torch.int32, device=device)
+            if envs.SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH.get()
+            else None
+        )
         # SGLANG_SIMULATE_ACC_LEN: the step's correct length, filled per step.
         self.simulated_correct_len = simulated_correct_len
         self.strided_logits: Optional[torch.Tensor] = None
         self.strided_hidden: Optional[torch.Tensor] = None
         self._static_step_state: Optional[tuple[int, bool]] = None
+        # Set when a captured static epilogue recorded the engram history commit.
+        self.folds_engram_commit = False
 
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
         if (
@@ -678,6 +699,11 @@ class DsparkVerifyEpilogue:
                 verify_lens=verify_lens,
                 gated=folds,
             )
+            block = self.read_block_accept_lens(bs)
+            if block is not None:
+                torch.add(
+                    self.commit_lens_buf[:bs], self.cap_trim_lens_buf[:bs], out=block
+                )
         else:
             commit_lens = self._accept(
                 candidates=candidates,
@@ -692,6 +718,10 @@ class DsparkVerifyEpilogue:
                 if folds
                 else None
             )
+        # Both accept branches leave the ungated commit lengths in commit_lens_buf.
+        self._commit_engram_history(
+            candidates, forward_batch, self.commit_lens_buf[:bs], verify_lens
+        )
         if not folds:
             return
         cache_loc = forward_batch.out_cache_loc
@@ -702,6 +732,15 @@ class DsparkVerifyEpilogue:
                 .expand(bs, self.stride)
                 .reshape(-1)
             )
+        if self._defer_context_kv:
+            self._stage_commit(
+                target_hidden=out.hidden_states,
+                cache_loc=cache_loc,
+                positions=forward_batch.positions,
+                commit_lens=gated_commit_lens,
+                state_slot=state_slot,
+            )
+            return
         self.commit_ctx.kv_injector.inject_target_hidden(
             target_hidden=out.hidden_states,
             cache_loc=cache_loc,
@@ -786,6 +825,48 @@ class DsparkVerifyEpilogue:
             "inputs" if bonus_in is not None else "off",
         )
 
+    def _stage_commit(self, *, target_hidden, **staged) -> None:
+        if self.deferred_commit is None:
+            assert not (
+                torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+            ), "the deferred commit's staging is built at a warmup, before capture"
+            self.deferred_commit = DeferredContextCommit(
+                max_bs=self.max_bs,
+                stride=self.stride,
+                hidden_width=target_hidden.shape[1],
+                hidden_dtype=target_hidden.dtype,
+                device=target_hidden.device,
+                kv_injector=self.commit_ctx.kv_injector,
+                with_state_slot=staged["state_slot"] is not None,
+            )
+        self.deferred_commit.stage(target_hidden=target_hidden, **staged)
+
+    def note_static_verify(self, bs: int) -> None:
+        """Host, after a static verify graph replayed ``bs`` requests."""
+        if self.deferred_commit is not None:
+            self.deferred_commit.note_static_verify(bs)
+
+    def _commit_engram_history(
+        self, candidates, forward_batch, commit_lens, verify_lens
+    ) -> None:
+        """The post-verify engram history commit, gated per row: padded rows
+        (verify_lens 0) and steps the graph does not commit (gate 0) are skipped."""
+        if self.commit_ctx is None or self.commit_ctx.resolve_engram_hasher is None:
+            return
+        hasher = self.commit_ctx.resolve_engram_hasher()
+        if hasher is None or hasher.history is None:
+            return
+        engram_commit_history(
+            hasher.history,
+            candidates,
+            forward_batch.req_pool_indices,
+            commit_lens,
+            live_rows=verify_lens,
+            gate=self.inject_gate_buf,
+        )
+        if torch.cuda.is_current_stream_capturing():
+            self.folds_engram_commit = True
+
     def read_accept(self, bs: int) -> AcceptOuts:
         return AcceptOuts(
             correct_len=self.correct_len_buf[:bs],
@@ -795,6 +876,12 @@ class DsparkVerifyEpilogue:
             new_seq_lens=self.new_seq_lens_buf[:bs],
             out_tokens=self.out_tokens_buf[:bs],
         )
+
+    def read_block_accept_lens(self, bs: int) -> Optional[torch.Tensor]:
+        """commit_lens + cap_trim_lens from the in-graph accept, or None."""
+        if self.block_accept_lens_buf is None:
+            return None
+        return self.block_accept_lens_buf[:bs]
 
     @property
     def folds_commit(self) -> bool:
@@ -901,6 +988,7 @@ class DsparkVerifyEpilogue:
             sync_site=SpecTpSyncSite.DSPARK_ACCEPT_GRAPH,
             simulated_correct_len=self.simulated_correct_len,
             out=self.read_accept(bs),
+            block_accept_lens_out=self.read_block_accept_lens(bs),
         )
         return accept.commit_lens
 
@@ -956,8 +1044,10 @@ def build_accept_outs(
     target_logits: Optional[torch.Tensor] = None,
     simulate_bonus_sampling_info=None,
     out: Optional[AcceptOuts] = None,
+    block_accept_lens_out: Optional[torch.Tensor] = None,
 ) -> AcceptOuts:
-    """``out``: static buffers (the in-graph accept's) to copy the results into."""
+    """``out``: static buffers (the in-graph accept's) to copy the results into;
+    ``block_accept_lens_out`` (with ``out``) gets commit_lens + cap_trim_lens."""
     bs = correct_len.shape[0]
     if simulated_correct_len is not None:
         # The accept runs as served; only its length is replaced.
@@ -1003,6 +1093,10 @@ def build_accept_outs(
         out.commit_lens.copy_(accept.commit_lens)
         out.new_seq_lens.copy_(accept.new_seq_lens)
         out.out_tokens.copy_(accept.out_tokens)
+        if block_accept_lens_out is not None:
+            torch.add(
+                accept.commit_lens, accept.cap_trim_lens, out=block_accept_lens_out
+            )
         return out
     return accept
 
