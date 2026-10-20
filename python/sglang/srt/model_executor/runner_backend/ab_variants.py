@@ -4,6 +4,8 @@ Q35MF_AB_VARIANTS  JSON object, variant name -> env overrides, e.g.
                    '{"A": {}, "B": {"SGLANG_Q35MF_FOO": "1"}, "A2": {}}'  (A2 = same as A: the in-situ null)
 Q35MF_AB_PATTERN   comma list of variant names, one per block, cycled (default: the variant names in order)
 Q35MF_AB_BLOCK     decode rounds per block (default 200)
+Q35MF_AB_PIN_FILE  optional file naming one variant; while it names one, every round uses that variant (re-read at most
+                   once a second), so one server can run pinned passes (e.g. an accuracy gate per variant)
 
 FullCudaGraphBackend captures every decode-phase graph (target verify, EAGLE draft, draft extend) once per
 variant, with that variant's env applied, so a feature must read its switch at capture time. Replays use the
@@ -16,6 +18,7 @@ capture arms in mirrored order (A, B, B2, A2).
 import json
 import logging
 import os
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +61,31 @@ def restore():
             os.environ[k] = v
 
 
+_PIN_FILE = os.environ.get("Q35MF_AB_PIN_FILE")
+_pin = [None, 0.0]  # [pinned variant or None, monotonic time of the last read]
+
+
+def _pinned():
+    now = time.monotonic()
+    if now - _pin[1] >= 1.0:
+        _pin[1] = now
+        try:
+            with open(_PIN_FILE) as f:
+                name = f.read().strip()
+        except OSError:
+            name = ""
+        name = name if name in VARIANTS else None
+        if name != _pin[0]:
+            logger.info("Q35MF A/B pin: %s", name or "none (pattern)")
+        _pin[0] = name
+    return _pin[0]
+
+
 def current():
+    if _PIN_FILE:
+        name = _pinned()
+        if name is not None:
+            return name
     return PATTERN[(_round // BLOCK) % len(PATTERN)]
 
 
