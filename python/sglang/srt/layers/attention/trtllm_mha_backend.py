@@ -480,6 +480,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 )
             else:
                 logger.warning("E2X_VFMHA_CTA8 unsupported runtime/topology; using stock")
+        self._vch = self._init_vch(model_runner, config)
         self._decode_group_streams = ()
         if (
             envs.SGLANG_Q35MF_K4_ATTN_GROUP_STREAMS.get()
@@ -1539,6 +1540,112 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             out=out,
         )
 
+    def _init_vch(self, model_runner, config):
+        from sglang.srt.model_executor.runner_backend import ab_variants
+
+        self._vch_requested = envs.SGLANG_Q35MF_E2X_VCH.get()
+        wanted = (
+            self._vch_requested
+            or envs.SGLANG_Q35MF_E2X_VCH_BUFFERS.get()
+            or ab_variants.env_any("SGLANG_Q35MF_E2X_VCH", "1")
+        )
+        if not wanted:
+            return None
+        from sglang.kernels.ops.attention.dep16_vch import VchState, vch_supported
+
+        attn_tp = get_parallel().attn_tp_size
+        num_q_heads = config.num_attention_heads // attn_tp
+        num_kv_heads = config.get_num_kv_heads(attn_tp)
+        if not (
+            not self.is_xqa_impl
+            and attn_tp == 1
+            and get_parallel().attn_dcp_size == 1
+            and self.decode_seq_len_splits == 1
+            and not self.is_nvfp4_kvcache
+            and vch_supported(
+                num_q_heads,
+                num_kv_heads,
+                config.head_dim,
+                self.page_size,
+                self.data_type,
+                self.speculative_num_draft_tokens or 0,
+            )
+        ):
+            logger.warning("E2X_VCH unsupported runtime/topology; using stock")
+            return None
+        pool = self.token_to_kv_pool
+        if isinstance(pool, HybridLinearKVPool):
+            self._vch_first_layer = min(pool.full_attention_layer_id_mapping)
+        else:
+            self._vch_first_layer = pool.start_layer
+        device = torch.device(self.device)
+        state = VchState(
+            device,
+            num_q_heads,
+            num_kv_heads,
+            config.head_dim,
+            self.page_size,
+            max_bs=model_runner.max_running_requests + 1,
+            max_pages=self.max_num_pages,
+            nv=envs.SGLANG_Q35MF_E2X_VCH_NV.get(),
+            min_len=envs.SGLANG_Q35MF_E2X_VCH_MIN_LEN.get(),
+            workspace=self.workspace_buffer,
+            counter=get_buffer(
+                "trtllm_mha_vch_counter",
+                lambda: torch.zeros(8 * 1024**2, dtype=torch.uint8, device=device),
+            ),
+            alloc=lambda name, make: get_buffer(f"trtllm_mha_{name}", make),
+        )
+        logger.info(
+            "E2X_VCH prepared: NV %d, min_len %d, first full-attention layer %d",
+            state.nv,
+            state.min_len,
+            self._vch_first_layer,
+        )
+        return state
+
+    def _vch_engaged(self, forward_batch, layer, q, attention_sink) -> bool:
+        from sglang.srt.model_executor.runner_backend import ab_variants
+
+        fm = forward_batch.forward_mode
+        return (
+            self._vch is not None
+            and ab_variants.switch(self._vch_requested, "SGLANG_Q35MF_E2X_VCH")
+            and (fm.is_target_verify() or fm.is_draft_extend_v2())
+            and self.forward_metadata.max_seq_len_q == 7
+            and not self.forward_metadata.is_ragged_verify
+            and layer.attn_type != AttentionType.ENCODER_ONLY
+            and layer.sliding_window_size in (None, -1)
+            and attention_sink is None
+            and q.dtype == torch.float8_e4m3fn
+        )
+
+    def _run_vch(self, q, kv_cache, page_table, layer, bmm1_scale, bmm2_scale):
+        from sglang.kernels.ops.attention import dep16_vch
+        from sglang.srt.utils.common import print_info_once
+
+        state = self._vch
+        seq_lens = self.forward_metadata.cache_seqlens_int32
+        if layer.layer_id == self._vch_first_layer:
+            state.plan(seq_lens, page_table)
+            print_info_once(
+                f"E2X_VCH engaged: q7 verify / draft extend, {state.nv} chunks"
+            )
+        if not dep16_vch.take_folded():
+            state.fold(q)
+        state.prefix(kv_cache, bmm1_scale, bmm2_scale, self.max_context_len)
+        gate = dep16_vch.take_gate()
+        tokens = q.shape[0]
+        if gate is None:
+            out = torch.empty_like(q, dtype=torch.bfloat16)
+            return state.merge(q, kv_cache, page_table, seq_lens, bmm1_scale, bmm2_scale, out)
+        out = torch.empty(
+            (tokens, q.shape[1] * q.shape[2]), dtype=torch.float8_e4m3fn, device=q.device
+        )
+        return state.merge(
+            q, kv_cache, page_table, seq_lens, bmm1_scale, bmm2_scale, out, gate[0], gate[1]
+        )
+
     def _run_fixed_q_len_decode(
         self,
         query: torch.Tensor,
@@ -2206,6 +2313,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     max_q_len=self.forward_metadata.max_seq_len_q,
                     cum_seq_lens_q=self.forward_metadata.cu_seqlens_q,
                     multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
+                )
+            elif self._vch_engaged(forward_batch, layer, q, attention_sink):
+                o = self._run_vch(
+                    q, kv_cache, page_table, layer, bmm1_scale, bmm2_scale
                 )
             else:
                 mask = (

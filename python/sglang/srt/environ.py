@@ -2231,6 +2231,15 @@ class Envs:
     SGLANG_Q35MF_E2X_VFMHA_CTA8 = EnvBool(False)
     # Same launcher with a per-batch KV CTA count (8 / 12 / 16) at B6..16; takes precedence over CTA8.
     SGLANG_Q35MF_E2X_VFMHA_CTAB = EnvBool(False)
+    # DEP16 fixed-q7 verify / draft extend: VCH virtual chunking (equal page-aligned q1 chunks of the keys every
+    # row sees, the causal tail and the output gate-quant in one merge); read at graph capture per A/B variant.
+    SGLANG_Q35MF_E2X_VCH = EnvBool(False)
+    # Allocate the VCH buffers even when SGLANG_Q35MF_E2X_VCH is off at init (same-server A/B variants).
+    SGLANG_Q35MF_E2X_VCH_BUFFERS = EnvBool(False)
+    # Chunks per call; one CTA per SM at the native q1 kernel when it equals SM count / KV heads per rank.
+    SGLANG_Q35MF_E2X_VCH_NV = EnvInt(76)
+    # Requests shorter than this are one chunk (their keys are not split).
+    SGLANG_Q35MF_E2X_VCH_MIN_LEN = EnvInt(2055)
     SGLANG_Q35MF_GDN_DIRECT_SOLVE = EnvBool(False)
     SGLANG_Q35MF_GDN_EMPTY_HISTORY = EnvBool(False)
     SGLANG_Q35MF_GDN_NORM_FP8 = EnvBool(False)

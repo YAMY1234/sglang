@@ -1800,6 +1800,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             _is_cuda and envs.SGLANG_Q35MF_ATTN_GATE_QUANT.get()
         )
         self._attn_front_requested = _is_cuda and envs.SGLANG_Q35MF_ATTN_FRONT.get()
+        self._vch_requested = _is_cuda and envs.SGLANG_Q35MF_E2X_VCH.get()
         self._mka_requested = _is_cuda and envs.SGLANG_Q35MF_MKA_FUSED.get()
         self._mkd_gemv = is_nextn and _is_cuda and envs.SGLANG_Q35MF_MKD_GEMV.get()
         # Host int64 site fields of the hop the draft o_proj pushes into, built on first use.
@@ -2258,6 +2259,25 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             hop.mark_pushed(out)
         return out
 
+    def _vch_gate_eligible(self, gate) -> bool:
+        if not (self.attn_output_gate and gate is not None):
+            return False
+        if not ab_variants.switch(self._vch_requested, "SGLANG_Q35MF_E2X_VCH"):
+            return False
+        if not ab_variants.switch(
+            self._attn_gate_quant_requested, "SGLANG_Q35MF_ATTN_GATE_QUANT"
+        ):
+            return False
+        quant = self.o_proj.quant_method
+        return (
+            type(quant).__name__ == "ModelOptFp8LinearMethod"
+            and not quant.use_marlin
+            and self.o_proj.input_scale is not None
+            and self.o_proj.input_scale.numel() == 1
+            and gate.dim() == 3
+            and gate.stride(-1) == 1
+        )
+
     def _mka_push_hop(self, m: int):
         if not (envs.SGLANG_Q35MF_MKA_PUSH.get() and envs.SGLANG_Q35MF_MKH_HOP.get()):
             return None
@@ -2288,9 +2308,17 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             forward_batch=forward_batch,
         )
 
-        attn_output = self.attn(q, k, v, forward_batch)
+        vch_gate = self._vch_gate_eligible(gate)
+        if vch_gate:
+            from sglang.kernels.ops.attention import dep16_vch
 
-        if self.attn_output_gate:
+            dep16_vch.set_gate(gate, self.o_proj.input_scale)
+        attn_output = self.attn(q, k, v, forward_batch)
+        if vch_gate:
+            dep16_vch.clear_gate()
+
+        # VCH (E2X) returns the gated, statically FP8-quantized o_proj input itself.
+        if self.attn_output_gate and attn_output.dtype != torch.float8_e4m3fn:
             gate_quant_requested = ab_variants.switch(
                 self._attn_gate_quant_requested, "SGLANG_Q35MF_ATTN_GATE_QUANT"
             )
