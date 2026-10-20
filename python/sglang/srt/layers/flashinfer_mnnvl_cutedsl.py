@@ -446,21 +446,30 @@ class FlashInferMNNVLCuteDSLARFusion:
             return None
         from sglang.srt.layers.q35_hop import Q35Hop
 
+        self._hop_max_m = envs.SGLANG_Q35MF_MKH_HOP_MAX_M.get()
+        if self._hop_max_m > _Q35_HOP_MAX_M and envs.SGLANG_Q35MF_CUTEDSL_LL_MAX_M.get() < self._hop_max_m:
+            logger.warning(
+                "SGLANG_Q35MF_MKH_HOP_MAX_M=%d needs the LL protocol up to that M "
+                "(SGLANG_Q35MF_CUTEDSL_LL_MAX_M=%d); keeping %d",
+                self._hop_max_m,
+                envs.SGLANG_Q35MF_CUTEDSL_LL_MAX_M.get(),
+                _Q35_HOP_MAX_M,
+            )
+            self._hop_max_m = _Q35_HOP_MAX_M
         return Q35Hop(
-            max_m=_Q35_HOP_MAX_M + 1,
+            max_m=self._hop_max_m + 1,
             rms_epsilon=self.rms_epsilon,
             process_group=self.process_group,
             device=self.device,
         )
 
     def _uses_hop(self, m: int) -> bool:
-        # M <= 15 is where FlashInfer routes both operations to its LL kernels, which the
-        # q35 hop reproduces bit for bit.
-        return (
-            self._hop is not None
-            and m <= _Q35_HOP_MAX_M
-            and not envs.SGLANG_Q35MF_MKH_HOP_SKIP.get()
-        )
+        # The q35 hop reproduces FlashInfer's LL kernels bit for bit: by default they serve M <= 15,
+        # and up to SGLANG_Q35MF_CUTEDSL_LL_MAX_M when that is set (checked when the hop is built).
+        if self._hop is None or envs.SGLANG_Q35MF_MKH_HOP_SKIP.get():
+            return False
+        cap = envs.SGLANG_Q35MF_MKH_HOP_USE_MAX_M.get()
+        return m <= (min(cap, self._hop_max_m) if cap > 0 else self._hop_max_m)
 
     def supports(self, m: int) -> bool:
         if not 1 <= int(m) <= self.max_m:
