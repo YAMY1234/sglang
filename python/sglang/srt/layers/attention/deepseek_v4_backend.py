@@ -6,6 +6,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
+    Callable,
     Dict,
     List,
     Literal,
@@ -1222,6 +1223,9 @@ class DeepseekV4AttnBackend(
     ):
         super().__init__()
         self.model_runner = model_runner
+        # Run at every KV store-location read; the DSpark deferred context-KV commit
+        # joins its forked write there (SGLANG_DSPARK_DEFER_CONTEXT_KV).
+        self.pre_kv_store_hook: Optional[Callable[[], None]] = None
         self.encoder_replay = False
         self.encoder_row_floor = None
         self.device = torch.device(model_runner.device)
@@ -3927,6 +3931,8 @@ class DeepseekV4AttnBackend(
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Idle always re-translates at store time: its metadata may be stale, and
         translating the zero-padded out_cache_loc writes to the dummy slot."""
+        if self.pre_kv_store_hook is not None:
+            self.pre_kv_store_hook()
         metadata = self.forward_metadata
         if self.token_to_kv_pool.request_window is not None:
             layout = metadata.core_attn_metadata.request_window_layout
