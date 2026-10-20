@@ -1063,7 +1063,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if defer_finalize and num_tokens == 0:
             raise RuntimeError("Qwen deferred finalize does not support M=0")
         if not self.is_nextn:
-            qwen_router_front.krne_dump(self.layer_id, hidden_states)
+            stream = forward_batch.residual_stream if forward_batch is not None else None
+            qwen_router_front.krne_dump(
+                self.layer_id,
+                hidden_states,
+                stream.residual if stream is not None else None,
+            )
 
         draft_moe = self._single_token_draft_moe
         if (

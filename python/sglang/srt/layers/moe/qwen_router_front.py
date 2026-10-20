@@ -1258,10 +1258,13 @@ _krne_rows: dict[int, list] = {}
 _krne_done: set[int] = set()
 
 
-def krne_dump(layer_id: int, hidden_states: torch.Tensor) -> None:
+def krne_dump(
+    layer_id: int, hidden_states: torch.Tensor, residual: Optional[torch.Tensor] = None
+) -> None:
     """Debug (SGLANG_Q35MF_KRNE_DUMP_DIR): collect real MoE-input rows for the router T1, skipping the first 64 rows
     and keeping at most 1024 rows of every call (several prompts per layer); writes moe_in_L<layer>.pt once
-    SGLANG_Q35MF_KRNE_DUMP_ROWS rows are in."""
+    SGLANG_Q35MF_KRNE_DUMP_ROWS rows are in. With `residual` (the post-norm residual stream, i.e. the sum the norm
+    normalized), each saved row is [MoE input | residual] concatenated, 2 x hidden wide."""
     out_dir = envs.SGLANG_Q35MF_KRNE_DUMP_DIR.get()
     if (
         not out_dir
@@ -1271,6 +1274,8 @@ def krne_dump(layer_id: int, hidden_states: torch.Tensor) -> None:
     ):
         return
     rows = hidden_states[64:]
+    if residual is not None and residual.shape == hidden_states.shape:
+        rows = torch.cat([rows, residual[64:]], dim=1)
     if rows.shape[0] == 0:
         return
     want = envs.SGLANG_Q35MF_KRNE_DUMP_ROWS.get()
