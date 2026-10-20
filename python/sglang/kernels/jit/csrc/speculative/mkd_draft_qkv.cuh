@@ -20,6 +20,16 @@ namespace sglang {
 // Five 128-thread CTAs per SM (<= 102 registers a thread) keep all 2560 TP8 rows resident in one wave.
 constexpr int kMinBlocks = 5;
 
+// Volatile so the compiler keeps the weight loads ahead of griddepcontrol.wait (a plain __ldg is invariant and gets
+// sunk past it to its use).
+__device__ __forceinline__ uint4 ld_nc_v4(const uint4* p) {
+  uint4 r;
+  asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
+               : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w)
+               : "l"(p));
+  return r;
+}
+
 struct MkdQkvParams {
   const bf16_t* h;                   // [K], written by the previous grid
   const bf16_t* __restrict__ gamma;  // [K], raw GemmaRMSNorm weight (the kernel adds 1)
@@ -53,12 +63,12 @@ __global__ void __launch_bounds__(kRows * 32, kMinBlocks) mkd_qkv_kernel(const M
     const uint4* wr = reinterpret_cast<const uint4*>(p.w + static_cast<int64_t>(row) * kK);
 #pragma unroll
     for (int j = 0; j < kVecs; ++j)
-      wv[j] = __ldg(wr + j * 32 + lane);
+      wv[j] = ld_nc_v4(wr + j * 32 + lane);
   }
 #pragma unroll
   for (int j = 0; j < kPer; ++j) {
     const int i = static_cast<int>(threadIdx.x) + j * kThreads;
-    reinterpret_cast<uint4*>(s_g)[i] = __ldg(reinterpret_cast<const uint4*>(p.gamma) + i);
+    reinterpret_cast<uint4*>(s_g)[i] = ld_nc_v4(reinterpret_cast<const uint4*>(p.gamma) + i);
   }
   PDLWaitPrimary<kUsePDL>();
   uint4 hv[kPer];
