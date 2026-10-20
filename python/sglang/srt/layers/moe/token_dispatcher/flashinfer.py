@@ -554,10 +554,8 @@ class FlashinferDispatcher(BaseDispatcher):
         self._ll_call = None
         tmax = self.runtime_max_tokens_per_rank
         partial = hidden_states.view(self.ep_size * tmax, hidden_states.shape[-1])
-        prefetch_stream = self._fork_l2_prefetch()
+        # No SGLANG_Q35MF_DEP_L2_PREFETCH fork here: joined right after this short combine, it stalls the stream.
         out = self.ll_a2a.combine(partial=partial, ids=topk_ids, tmax=tmax)
-        if prefetch_stream is not None:
-            torch.cuda.current_stream().wait_stream(prefetch_stream)
         if check is not None:
             check.combine(
                 moe_a2a=self.active_moe_a2a, partial=partial, out=out, tmax=tmax
