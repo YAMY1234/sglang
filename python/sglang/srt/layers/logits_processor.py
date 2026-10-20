@@ -15,6 +15,7 @@
 
 import dataclasses
 import logging
+import os
 from contextlib import contextmanager
 from enum import IntEnum
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -448,6 +449,8 @@ class LogitsMetadata:
         )
 
 
+# runner_backend/ab_variants.py is on (Q35MF_AB_VARIANTS set).
+_AB_HARNESS = bool(os.environ.get("Q35MF_AB_VARIANTS"))
 # The processor whose target-verify logits were last returned on the vocab shards.
 _VERIFY_SHARD_SOURCE: Optional["LogitsProcessor"] = None
 
@@ -1053,6 +1056,11 @@ class LogitsProcessor(nn.Module):
         if (
             self.verify_logits_on_shards
             and logits_metadata.forward_mode.is_target_verify()
+            # Same-service A/B harness (measurement only): each variant's graph capture reads the switch.
+            and (
+                not _AB_HARNESS
+                or envs.SGLANG_Q35MF_PDDEC_SHARDED_VERIFY_SAMPLING.get()
+            )
         ):
             global _VERIFY_SHARD_SOURCE
             _VERIFY_SHARD_SOURCE = self
