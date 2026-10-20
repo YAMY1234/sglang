@@ -61,6 +61,7 @@ except ImportError:
     use_flashinfer = False
 
 logger = logging.getLogger(__name__)
+_l2_prefetch_logged = False
 
 # FlashInfer keys MNNVL allocations by workspace size; aligned tail padding gives
 # concurrently live paths distinct persistent workspaces without extra token work.
@@ -540,6 +541,16 @@ class FlashinferDispatcher(BaseDispatcher):
         with torch.cuda.stream(side):
             for module in self.l2_prefetch_modules:
                 l2_prefetch(module.weight)
+        global _l2_prefetch_logged
+        if not _l2_prefetch_logged:
+            _l2_prefetch_logged = True
+            weight = self.l2_prefetch_modules[0].weight
+            logger.info(
+                "SGLANG_Q35MF_DEP_L2_PREFETCH engaged: %s %s, %d bytes",
+                tuple(weight.shape),
+                weight.dtype,
+                weight.numel() * weight.element_size(),
+            )
         return side
 
     def _stock_combine(self, payload: torch.Tensor) -> torch.Tensor:
