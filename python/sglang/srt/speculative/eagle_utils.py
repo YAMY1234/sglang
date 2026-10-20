@@ -790,7 +790,8 @@ def _db1_support_on_shards(
 ):
     """Compact top-k support of a sampled verify built on the vocab shards: (ids [R, k], float32
     logits [R, k], argmax [R]), or None when the batch must gather (SGLANG_Q35MF_LL16_DB1)."""
-    if not _DB1:
+    # Only where the gathered path would take the compact top-k branch (no request seed, no min-p).
+    if not _DB1 or not _can_use_sparse_uno_tree_target_sampling(max_top_k, sampling_info):
         return None
     from sglang.srt.speculative import sharded_verify_sampling
 
