@@ -1298,6 +1298,13 @@ class Envs:
     # Debug only: with SGLANG_Q35MF_DEP_ROUTE_FRONT, also run the stock gate, top-k and dispatch quant in the same
     # (captured) forward and log, per token count, how many rows of each output differ.
     SGLANG_Q35MF_DEP_ROUTE_FRONT_CHECK = EnvBool(False)
+    # With SGLANG_Q35MF_DEP_ROUTE_FRONT, from 17 to 64 tokens: split-K router GEMM over this many K slices (8 or 16;
+    # 0 = off), fp32 partials summed by the tail; only the logits' fp32 summation order differs from cuBLAS.
+    SGLANG_Q35MF_DEP_ROUTE_SPLITK = EnvInt(0)
+    # Debug only: save up to SGLANG_Q35MF_KRNE_DUMP_ROWS rows of every target MoE layer's input to this directory
+    # (global rank 0, eager forwards only).
+    SGLANG_Q35MF_KRNE_DUMP_DIR = EnvStr("")
+    SGLANG_Q35MF_KRNE_DUMP_ROWS = EnvInt(4096)
     # FlashInfer A2A dispatch into the cute-dsl runner: the EP rank's routing tables from one single-CTA launch over
     # the received ids instead of moe_sort, and the finalize written straight into the combine workspace.
     SGLANG_Q35MF_DEP_EP_TABLES = EnvBool(False)

@@ -48,6 +48,7 @@ def _jit_module(max_m: int, trace: bool = False) -> Module:
             ("run_topk_quant", f"RouterFrontKernel<{args}>::run_topk_quant"),
             ("run_tail_dep", f"RouterFrontKernel<{args}>::run_tail_dep"),
             ("run_wide_gemm", f"RouterFrontKernel<{args}>::run_wide_gemm"),
+            ("run_splitk", f"RouterFrontKernel<{args}>::run_splitk"),
         ],
         # No fast-math: the top-k and quantization arithmetic is pinned to
         # explicit instructions and must not be contracted or flushed.
@@ -268,6 +269,50 @@ def router_tail_dep(
     x_sf = torch.empty((m, HIDDEN // 16), dtype=torch.uint8, device=x.device)
     _jit_module(MAX_TOKENS).run_tail_dep(logits, x, global_scale, topk_weights, topk_ids, x_fp4, x_sf)
     return topk_weights, topk_ids, x_fp4, x_sf
+
+
+SPLITK_MAX_TOKENS = 64
+# fp32 partial logits [16 slices, 64 tokens, 512 experts], one per device; MoE layers run it one after another.
+_splitk_part: dict = {}
+
+
+def _splitk_workspace(device: torch.device) -> torch.Tensor:
+    key = (device.type, device.index)
+    part = _splitk_part.get(key)
+    if part is None:
+        part = _splitk_part[key] = torch.empty(
+            16 * SPLITK_MAX_TOKENS * NUM_EXPERTS, dtype=torch.float32, device=device
+        )
+    return part
+
+
+def router_splitk_front(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    global_scale: torch.Tensor,
+    slices: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Split-K router GEMM (`slices` = 8 or 16 K slices, fp32 partials summed in increasing slice order), softmax
+    top-10 + renormalize and NVFP4 input quant (M <= 64). Same outputs as router_topk_quant."""
+    m = x.shape[0]
+    logits = torch.empty((m, NUM_EXPERTS), dtype=torch.bfloat16, device=x.device)
+    topk_weights = torch.empty((m, TOP_K), dtype=torch.float32, device=x.device)
+    topk_ids = torch.empty((m, TOP_K), dtype=torch.int32, device=x.device)
+    x_fp4 = torch.empty((m, HIDDEN // 2), dtype=torch.uint8, device=x.device)
+    x_sf = torch.empty((m, HIDDEN // 16), dtype=torch.uint8, device=x.device)
+    _jit_module(MAX_TOKENS).run_splitk(
+        x,
+        weight,
+        global_scale,
+        _splitk_workspace(x.device),
+        logits,
+        topk_weights,
+        topk_ids,
+        x_fp4,
+        x_sf,
+        slices,
+    )
+    return logits, topk_weights, topk_ids, x_fp4, x_sf
 
 
 def router_wide_gemm(x: torch.Tensor, weight: torch.Tensor, split: int) -> torch.Tensor:

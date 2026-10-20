@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
@@ -1191,12 +1192,57 @@ def dep_front_supported(
     )
 
 
+_splitk_engaged: set[tuple[int, int, int]] = set()
+
+
+def _log_splitk_engaged(layer_id: int, m: int, slices: int) -> None:
+    key = (layer_id, m, slices)
+    if key not in _splitk_engaged:
+        _splitk_engaged.add(key)
+        logger.info(
+            "SGLANG_Q35MF_DEP_ROUTE_SPLITK engaged: layer %s, %d tokens, %d slices",
+            *key,
+        )
+
+
+_krne_rows: dict[int, list] = {}
+_krne_done: set[int] = set()
+
+
+def krne_dump(layer_id: int, hidden_states: torch.Tensor) -> None:
+    """Debug (SGLANG_Q35MF_KRNE_DUMP_DIR): collect real MoE-input rows for the router T1, skipping the first 64 rows
+    of every call; writes moe_in_L<layer>.pt once SGLANG_Q35MF_KRNE_DUMP_ROWS rows are in."""
+    out_dir = envs.SGLANG_Q35MF_KRNE_DUMP_DIR.get()
+    if (
+        not out_dir
+        or layer_id in _krne_done
+        or torch.cuda.is_current_stream_capturing()
+        or (torch.distributed.is_initialized() and torch.distributed.get_rank() != 0)
+    ):
+        return
+    rows = hidden_states[64:]
+    if rows.shape[0] == 0:
+        return
+    want = envs.SGLANG_Q35MF_KRNE_DUMP_ROWS.get()
+    got = _krne_rows.setdefault(layer_id, [])
+    have = sum(r.shape[0] for r in got)
+    got.append(rows[: want - have].to("cpu", copy=True))
+    if have + got[-1].shape[0] < want:
+        return
+    os.makedirs(out_dir, exist_ok=True)
+    torch.save(torch.cat(got), os.path.join(out_dir, f"moe_in_L{layer_id:02d}.pt"))
+    _krne_done.add(layer_id)
+    del _krne_rows[layer_id]
+    logger.info("KRNE dump: layer %d, %d rows", layer_id, want)
+
+
 def forward_routed_dep(
     block: Qwen2MoeSparseMoeBlock, hidden_states: torch.Tensor
 ) -> torch.Tensor:
     """The stock FlashInfer A2A routed path with router GEMM, top-k and dispatch quantization in one launch (<= 16
     tokens) or top-k and quantization in one launch behind the stock router GEMM (17-64 tokens)."""
     from sglang.kernels.ops.moe.qwen_router_front import (
+        router_splitk_front,
         router_tail_dep,
         router_topk_quant,
     )
@@ -1208,6 +1254,8 @@ def forward_routed_dep(
     experts = block.experts
     disp = experts.dispatcher
     global_scale = disp.quant_config["input_global_scale"].reshape(1)
+    # Read per call so CUDA graph variants captured under different values each keep theirs.
+    splitk = envs.SGLANG_Q35MF_DEP_ROUTE_SPLITK.get()
     if (
         hidden_states.shape[0] <= _DEP_FRONT_MAX_TOKENS
         or envs.SGLANG_Q35MF_DEP_ROUTE_FRONT_GROUPED.get()
@@ -1215,6 +1263,11 @@ def forward_routed_dep(
         logits, topk_weights, topk_ids, x_fp4, x_sf = router_topk_quant(
             hidden_states, block.gate.weight, global_scale, block._dep_front_arrival
         )
+    elif splitk:
+        logits, topk_weights, topk_ids, x_fp4, x_sf = router_splitk_front(
+            hidden_states, block.gate.weight, global_scale, splitk
+        )
+        _log_splitk_engaged(block.topk.layer_id, hidden_states.shape[0], splitk)
     else:
         logits, _ = block.gate(hidden_states)
         topk_weights, topk_ids, x_fp4, x_sf = router_tail_dep(
