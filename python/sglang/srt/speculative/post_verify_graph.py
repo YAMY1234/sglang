@@ -203,6 +203,10 @@ class PostVerifyGraph:
             self.join()
         if self.disabled:
             return None
+        if not rt_flag("EDGE_POST_VERIFY_GRAPH", True):
+            # Run-time A/B: this round takes the eager chain; captured graphs are kept.
+            self._count_round(None)
+            return None
         if self._host_hooked():
             # A per-round host hook on the acceptance kernel cannot be replayed from a graph.
             logger.warning(
