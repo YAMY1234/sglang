@@ -11,9 +11,6 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
-#include <cub/block/block_scan.cuh>
-
-#include <algorithm>
 #include <cstdint>
 #include <cuda_bf16.h>
 
@@ -26,11 +23,6 @@ inline constexpr uint32_t kMaxRanks = 16;
 inline constexpr uint32_t kMaxTokens = 128;
 inline constexpr uint32_t kDispatchStages = 2;
 inline constexpr uint32_t kCombineStages = 3;
-// Local experts the in-dispatch routing tables can hold: one thread of the last CTA per expert.
-inline constexpr uint32_t kMaxLocalExperts = 256;
-// Local entries one CTA can receive: 5 id lines (10 ids) per row, rows spread over the grid; kMaxTokens x kMaxRanks
-// rows over 128 CTAs is at most 160 ids per CTA.
-inline constexpr uint32_t kCtaListCap = 256;
 // A peer may legitimately stall for long (e.g. a JIT compile on one rank); only a wait this long is fatal.
 inline constexpr uint64_t kTimeoutNs = 300ull * 1000 * 1000 * 1000;
 
@@ -72,26 +64,6 @@ struct Peers {
   uint8_t* base[kMaxRanks];
 };
 
-/// \brief Cute-DSL routing tables of this EP rank built inside the dispatch (SGLANG_Q35MF_KRNC_EPX): the same six
-/// outputs as qwen_ep_tables.cuh (rows ranked within an expert by atomics, as there). count is zero between calls;
-/// list holds (expanded index, expert << 16 | rank) pairs of local entries; the last CTA to finish builds the tables
-/// and resets count / list_n / done. Disabled when count is null.
-struct TableParams {
-  int32_t* count;     // [num_local]
-  int32_t* list;      // [2 * rows * top_k]
-  int32_t* list_n;    // [1]
-  int32_t* done;      // [1]
-  int32_t* tile_idx_to_expert_idx;
-  int32_t* tile_idx_to_mn_limit;
-  int32_t* expanded_idx_to_permuted_idx;  // [rows * top_k]
-  int32_t* permuted_idx_to_expanded_idx;
-  int32_t* total_num_padded_tokens;
-  int32_t* num_non_exiting_tiles;
-  int32_t local_offset;
-  uint32_t num_local;
-  uint32_t tile_log2;
-};
-
 struct DispatchParams {
   Peers peers;  // each rank's dispatch region
   const uint8_t* __restrict__ x;
@@ -111,7 +83,6 @@ struct DispatchParams {
   uint32_t rank;
   uint32_t experts_per_rank;
   int32_t invalid_id;
-  TableParams tab;
 };
 
 struct CombineParams {
@@ -169,96 +140,12 @@ SGL_DEVICE bool has_sentinel(const uint4& v) {
           __vcmpeq2(v.w, 0xFFFFFFFFu)) != 0u;
 }
 
-/// \brief Per-CTA staging of the received ids: local entries are ranked per expert in shared memory and listed;
-/// any other entry (another rank's expert or the invalid id) gets permuted index -1 right away.
-static_assert(kThreads >= kMaxLocalExperts, "one thread per local expert in the table staging and build");
-
-struct CtaTables {
-  int32_t cnt[kMaxLocalExperts];
-  int32_t base[kMaxLocalExperts];
-  int32_t idx[kCtaListCap];
-  int32_t er[kCtaListCap];
-  int32_t n;
-  int32_t list_base;
-};
-
-SGL_DEVICE void table_entry(const TableParams& tab, CtaTables& ct, uint32_t idx, int32_t id) {
-  const int32_t e = id - tab.local_offset;
-  if (e >= 0 && e < static_cast<int32_t>(tab.num_local)) {
-    const int32_t r = atomicAdd(&ct.cnt[e], 1);
-    const int32_t slot = atomicAdd(&ct.n, 1);
-    ct.idx[slot] = static_cast<int32_t>(idx);
-    ct.er[slot] = (e << 16) | r;
-  } else {
-    tab.expanded_idx_to_permuted_idx[idx] = -1;
-  }
-}
-
-/// \brief After the CTA's receive loop: one global add per touched expert turns the CTA ranks into expert ranks, one
-/// reservation per CTA places its entries on the global list.
-SGL_DEVICE void flush_cta_tables(const TableParams& tab, CtaTables& ct) {
-  const uint32_t tid = threadIdx.x;
-  if (tid < tab.num_local && ct.cnt[tid] > 0) ct.base[tid] = atomicAdd(tab.count + tid, ct.cnt[tid]);
-  if (tid == 0 && ct.n > 0) ct.list_base = atomicAdd(tab.list_n, ct.n);
-  __syncthreads();
-  for (int32_t j = static_cast<int32_t>(tid); j < ct.n; j += kThreads) {
-    const int32_t e = ct.er[j] >> 16;
-    tab.list[2 * (ct.list_base + j)] = ct.idx[j];
-    tab.list[2 * (ct.list_base + j) + 1] = (e << 16) | (ct.base[e] + (ct.er[j] & 0xFFFF));
-  }
-}
-
-/// \brief Run by the last CTA after every CTA fenced its receive writes: per-expert tiles in ascending local-expert
-/// order (qwen_ep_tables.cuh layout), the permutation of the listed entries, then the reset for the next call.
-SGL_DEVICE void build_tables(const TableParams& tab) {
-  using Scan = cub::BlockScan<int32_t, kThreads>;
-  __shared__ typename Scan::TempStorage scan_storage;
-  __shared__ int32_t s_offset[kMaxLocalExperts];
-  __threadfence();
-  const uint32_t e = threadIdx.x;
-  const int32_t count = e < tab.num_local ? __ldcg(tab.count + e) : 0;
-  const int32_t tile = 1 << tab.tile_log2;
-  const int32_t num_tiles = (count + tile - 1) >> tab.tile_log2;
-  int32_t tile_offset, total_tiles;
-  Scan(scan_storage).ExclusiveSum(num_tiles, tile_offset, total_tiles);
-  for (int32_t c = 0; c < num_tiles; ++c) {
-    const int32_t end = (tile_offset + c + 1) << tab.tile_log2;
-    tab.tile_idx_to_expert_idx[tile_offset + c] = static_cast<int32_t>(e);
-    tab.tile_idx_to_mn_limit[tile_offset + c] = min(end, (tile_offset << tab.tile_log2) + count);
-  }
-  s_offset[e] = tile_offset << tab.tile_log2;
-  if (e == 0) {
-    tab.num_non_exiting_tiles[0] = total_tiles;
-    tab.total_num_padded_tokens[0] = total_tiles << tab.tile_log2;
-  }
-  __syncthreads();
-  const int32_t n = __ldcg(tab.list_n);
-  for (int32_t j = static_cast<int32_t>(e); j < n; j += kThreads) {
-    const int32_t idx = __ldcg(tab.list + 2 * j);
-    const int32_t packed = __ldcg(tab.list + 2 * j + 1);
-    const int32_t permuted = s_offset[packed >> 16] + (packed & 0xFFFF);
-    tab.expanded_idx_to_permuted_idx[idx] = permuted;
-    tab.permuted_idx_to_expanded_idx[permuted] = idx;
-  }
-  if (e < tab.num_local) tab.count[e] = 0;
-  if (e == 0) {
-    *tab.list_n = 0;
-    *tab.done = 0;
-  }
-}
-
 template <uint32_t kRanks, uint32_t kTopK, uint32_t kHidden, uint32_t kX, uint32_t kS, bool kUsePDL>
 __global__ __launch_bounds__(kThreads) void dispatch_kernel(const __grid_constant__ DispatchParams p) {
   using G = Geometry<kRanks, kTopK, kHidden, kX, kS>;
   __shared__ uint32_t s_mask[kMaxTokens];
   __shared__ uint32_t s_tokens[kRanks];
-  __shared__ CtaTables ct;
   const uint32_t b = blockIdx.x, grid = gridDim.x, tid = threadIdx.x;
-  const bool tables = p.tab.count != nullptr;
-  if (tables) {
-    ct.cnt[tid] = 0;
-    if (tid == 0) ct.n = 0;
-  }
   // The counter was written by an earlier call of this kernel; only the wait orders us after it.
   device::PDLWaitPrimary<kUsePDL>();
   device::PDLTriggerSecondary<kUsePDL>();
@@ -313,10 +200,7 @@ __global__ __launch_bounds__(kThreads) void dispatch_kernel(const __grid_constan
   // Padding rows (t >= tokens of that source) get invalid ids, as FlashInfer's sanitize does.
   for (uint32_t task = b * kThreads + tid; task < kRanks * p.tmax * kTopK; task += grid * kThreads) {
     const uint32_t s = task / (p.tmax * kTopK), t = task / kTopK % p.tmax;
-    if (t >= s_tokens[s]) {
-      p.out_ids[task] = p.invalid_id;
-      if (tables) p.tab.expanded_idx_to_permuted_idx[task] = -1;
-    }
+    if (t >= s_tokens[s]) p.out_ids[task] = p.invalid_id;
   }
   uint32_t max_tokens = 0;
 #pragma unroll
@@ -345,10 +229,6 @@ __global__ __launch_bounds__(kThreads) void dispatch_kernel(const __grid_constan
     const uint64_t row = static_cast<uint64_t>(s) * p.tmax + t;
     if (i < G::kIdLines) {
       *reinterpret_cast<uint2*>(p.out_ids + row * kTopK + 2 * i) = d;
-      if (tables) {
-        table_entry(p.tab, ct, static_cast<uint32_t>(row * kTopK + 2 * i), static_cast<int32_t>(d.x));
-        table_entry(p.tab, ct, static_cast<uint32_t>(row * kTopK + 2 * i + 1), static_cast<int32_t>(d.y));
-      }
     } else if (i < G::kIdLines + G::kWtLines) {
       *reinterpret_cast<uint2*>(p.out_wts + row * kTopK + 2 * (i - G::kIdLines)) = d;
     } else if (i < G::kIdLines + G::kWtLines + G::kXLines) {
@@ -359,15 +239,6 @@ __global__ __launch_bounds__(kThreads) void dispatch_kernel(const __grid_constan
   }
   __syncthreads();
   if (tid == 0) p.ctr[b] = static_cast<int32_t>(epoch);
-  if (tables) {
-    __shared__ uint32_t s_last;
-    flush_cta_tables(p.tab, ct);
-    __threadfence();
-    __syncthreads();
-    if (tid == 0) s_last = atomicAdd(p.tab.done, 1) == static_cast<int32_t>(grid - 1);
-    __syncthreads();
-    if (s_last) build_tables(p.tab);
-  }
 }
 
 template <uint32_t kRanks, uint32_t kTopK, uint32_t kHidden, uint32_t kX, uint32_t kS, bool kUsePDL>
@@ -511,111 +382,6 @@ struct LlA2A {
       int64_t rank,
       int64_t experts_per_rank,
       int64_t invalid_id) {
-    launch_dispatch(
-        peers, x, sf, ids, wts, ctr, out_x, out_sf, out_ids, out_wts, recv_tokens, err, tmax, slots, rank,
-        experts_per_rank, invalid_id, TableParams{});
-  }
-
-  /// \brief dispatch that also writes this rank's cute-DSL routing tables (SGLANG_Q35MF_KRNC_EPX); the tables are
-  /// the six tensors of qwen_ep_tables.cuh, count / list / list_n / done its scratch (count, list_n, done zero).
-  static void dispatch_tables(
-      const tvm::ffi::TensorView peers,
-      const tvm::ffi::TensorView x,
-      const tvm::ffi::TensorView sf,
-      const tvm::ffi::TensorView ids,
-      const tvm::ffi::TensorView wts,
-      const tvm::ffi::TensorView ctr,
-      const tvm::ffi::TensorView out_x,
-      const tvm::ffi::TensorView out_sf,
-      const tvm::ffi::TensorView out_ids,
-      const tvm::ffi::TensorView out_wts,
-      const tvm::ffi::TensorView recv_tokens,
-      const tvm::ffi::TensorView err,
-      const tvm::ffi::TensorView count,
-      const tvm::ffi::TensorView list,
-      const tvm::ffi::TensorView list_n,
-      const tvm::ffi::TensorView done,
-      const tvm::ffi::TensorView tile_idx_to_expert_idx,
-      const tvm::ffi::TensorView tile_idx_to_mn_limit,
-      const tvm::ffi::TensorView expanded_idx_to_permuted_idx,
-      const tvm::ffi::TensorView permuted_idx_to_expanded_idx,
-      const tvm::ffi::TensorView total_num_padded_tokens,
-      const tvm::ffi::TensorView num_non_exiting_tiles,
-      int64_t tmax,
-      int64_t slots,
-      int64_t rank,
-      int64_t experts_per_rank,
-      int64_t invalid_id,
-      int64_t local_offset,
-      int64_t num_local,
-      int64_t tile_log2) {
-    using namespace host;
-    auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
-    auto R_ = SymbolicSize{"rows"};
-    auto T_ = SymbolicSize{"max_tiles"};
-    auto P_ = SymbolicSize{"max_permuted"};
-    auto L_ = SymbolicSize{"list"};
-    TensorMatcher({R_, static_cast<int64_t>(kTopK)}).with_dtype<int32_t>().with_device(device).verify(out_ids);
-    TensorMatcher({R_, static_cast<int64_t>(kTopK)})
-        .with_dtype<int32_t>()
-        .with_device(device)
-        .verify(expanded_idx_to_permuted_idx);
-    TensorMatcher({num_local}).with_dtype<int32_t>().with_device(device).verify(count);
-    TensorMatcher({L_}).with_dtype<int32_t>().with_device(device).verify(list);
-    TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(list_n);
-    TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(done);
-    TensorMatcher({T_}).with_dtype<int32_t>().with_device(device).verify(tile_idx_to_expert_idx);
-    TensorMatcher({T_}).with_dtype<int32_t>().with_device(device).verify(tile_idx_to_mn_limit);
-    TensorMatcher({P_}).with_dtype<int32_t>().with_device(device).verify(permuted_idx_to_expanded_idx);
-    TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(total_num_padded_tokens);
-    TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(num_non_exiting_tiles);
-    const int64_t expanded = R_.unwrap() * static_cast<int64_t>(kTopK);
-    CHECK_HOST(num_local > 0 && num_local <= kMaxLocalExperts) << "ll_a2a tables: num_local " << num_local;
-    CHECK_HOST(tile_log2 >= 3 && tile_log2 <= 10) << "ll_a2a tables: tile_log2 " << tile_log2;
-    CHECK_HOST(L_.unwrap() >= 2 * expanded) << "ll_a2a tables: list " << L_.unwrap() << " < 2 x " << expanded;
-    const int64_t filled = std::min<int64_t>(num_local, expanded);
-    const int64_t max_tiles = filled + (expanded - filled) / (int64_t{1} << tile_log2);
-    CHECK_HOST(T_.unwrap() >= max_tiles) << "ll_a2a tables: tile tables too small";
-    CHECK_HOST(P_.unwrap() >= (max_tiles << tile_log2)) << "ll_a2a tables: permuted map too small";
-    TableParams tab{};
-    tab.count = static_cast<int32_t*>(count.data_ptr());
-    tab.list = static_cast<int32_t*>(list.data_ptr());
-    tab.list_n = static_cast<int32_t*>(list_n.data_ptr());
-    tab.done = static_cast<int32_t*>(done.data_ptr());
-    tab.tile_idx_to_expert_idx = static_cast<int32_t*>(tile_idx_to_expert_idx.data_ptr());
-    tab.tile_idx_to_mn_limit = static_cast<int32_t*>(tile_idx_to_mn_limit.data_ptr());
-    tab.expanded_idx_to_permuted_idx = static_cast<int32_t*>(expanded_idx_to_permuted_idx.data_ptr());
-    tab.permuted_idx_to_expanded_idx = static_cast<int32_t*>(permuted_idx_to_expanded_idx.data_ptr());
-    tab.total_num_padded_tokens = static_cast<int32_t*>(total_num_padded_tokens.data_ptr());
-    tab.num_non_exiting_tiles = static_cast<int32_t*>(num_non_exiting_tiles.data_ptr());
-    tab.local_offset = static_cast<int32_t>(local_offset);
-    tab.num_local = static_cast<uint32_t>(num_local);
-    tab.tile_log2 = static_cast<uint32_t>(tile_log2);
-    launch_dispatch(
-        peers, x, sf, ids, wts, ctr, out_x, out_sf, out_ids, out_wts, recv_tokens, err, tmax, slots, rank,
-        experts_per_rank, invalid_id, tab);
-  }
-
-  static void launch_dispatch(
-      const tvm::ffi::TensorView peers,
-      const tvm::ffi::TensorView x,
-      const tvm::ffi::TensorView sf,
-      const tvm::ffi::TensorView ids,
-      const tvm::ffi::TensorView wts,
-      const tvm::ffi::TensorView ctr,
-      const tvm::ffi::TensorView out_x,
-      const tvm::ffi::TensorView out_sf,
-      const tvm::ffi::TensorView out_ids,
-      const tvm::ffi::TensorView out_wts,
-      const tvm::ffi::TensorView recv_tokens,
-      const tvm::ffi::TensorView err,
-      int64_t tmax,
-      int64_t slots,
-      int64_t rank,
-      int64_t experts_per_rank,
-      int64_t invalid_id,
-      const TableParams& tab) {
     using namespace host;
     auto T_ = SymbolicSize{"tokens"};
     auto R_ = SymbolicSize{"rows"};
@@ -659,7 +425,6 @@ struct LlA2A {
     params.rank = static_cast<uint32_t>(rank);
     params.experts_per_rank = static_cast<uint32_t>(experts_per_rank);
     params.invalid_id = static_cast<int32_t>(invalid_id);
-    params.tab = tab;
     LaunchKernel(static_cast<uint32_t>(C_.unwrap()), kThreads, device.unwrap())
         .enable_pdl(kUsePDL)(dispatch_kernel<kRanks, kTopK, kHidden, kX, kS, kUsePDL>, params);
   }

@@ -39,7 +39,6 @@ def _jit_module(
         cuda_files=["distributed/qwen_dep_ll_a2a.cuh"],
         cuda_wrappers=[
             ("dispatch", f"sglang::LlA2A<{args}>::dispatch"),
-            ("dispatch_tables", f"sglang::LlA2A<{args}>::dispatch_tables"),
             ("combine", f"sglang::LlA2A<{args}>::combine"),
         ],
         extra_cuda_cflags=["-O3"],
@@ -87,66 +86,6 @@ def ll_a2a_dispatch(
         rank,
         experts_per_rank,
         invalid_id,
-    )
-
-
-def ll_a2a_dispatch_tables(
-    peers: torch.Tensor,
-    x: torch.Tensor,
-    sf: torch.Tensor,
-    ids: torch.Tensor,
-    wts: torch.Tensor,
-    ctr: torch.Tensor,
-    out_x: torch.Tensor,
-    out_sf: torch.Tensor,
-    out_ids: torch.Tensor,
-    out_wts: torch.Tensor,
-    recv_tokens: torch.Tensor,
-    err: torch.Tensor,
-    tables,
-    scratch,
-    *,
-    tmax: int,
-    slots: int,
-    rank: int,
-    experts_per_rank: int,
-    invalid_id: int,
-    hidden: int,
-    local_offset: int,
-    num_local: int,
-) -> None:
-    """ll_a2a_dispatch that also fills `tables` (an EpTablesBuffers over out_ids) with this rank's routing tables;
-    scratch = (count [num_local], list [2 * rows * top_k], list_n [1], done [1]), int32, count / list_n / done zero."""
-    _jit_module(
-        peers.shape[0], ids.shape[1], hidden, x.shape[1], sf.shape[1]
-    ).dispatch_tables(
-        peers,
-        x,
-        sf,
-        ids,
-        wts,
-        ctr,
-        out_x,
-        out_sf,
-        out_ids,
-        out_wts,
-        recv_tokens,
-        err,
-        *scratch,
-        tables.tile_idx_to_expert_idx,
-        tables.tile_idx_to_mn_limit,
-        tables.expanded_idx_to_permuted_idx,
-        tables.permuted_idx_to_expanded_idx,
-        tables.total_num_padded_tokens,
-        tables.num_non_exiting_tiles,
-        tmax,
-        slots,
-        rank,
-        experts_per_rank,
-        invalid_id,
-        local_offset,
-        num_local,
-        tables.tile_size.bit_length() - 1,
     )
 
 
