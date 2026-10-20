@@ -1574,6 +1574,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             logger.warning("E2X_VCH unsupported runtime/topology; using stock")
             return None
         self._vch_min_bs = envs.SGLANG_Q35MF_E2X_VCH_MIN_BS.get()
+        self._vch_bs_logged = set()
         pool = self.token_to_kv_pool
         if isinstance(pool, HybridLinearKVPool):
             self._vch_first_layer = min(pool.full_attention_layer_id_mapping)
@@ -1610,16 +1611,30 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         from sglang.srt.model_executor.runner_backend import ab_variants
 
         fm = forward_batch.forward_mode
-        return (
+        if not (
             self._vch is not None
             and ab_variants.switch(self._vch_requested, "SGLANG_Q35MF_E2X_VCH")
             and (fm.is_target_verify() or fm.is_draft_extend_v2())
-            and self._vch_min_bs <= forward_batch.batch_size <= self._vch.nv
+        ):
+            return False
+        bs = forward_batch.batch_size
+        ok = (
+            self._vch_min_bs <= bs <= self._vch.nv
             and self.forward_metadata.max_seq_len_q == 7
             and not self.forward_metadata.is_ragged_verify
             and layer.attn_type != AttentionType.ENCODER_ONLY
             and layer.sliding_window_size in (None, -1)
         )
+        key = (fm.is_target_verify(), bs, ok)
+        if key not in self._vch_bs_logged:
+            self._vch_bs_logged.add(key)
+            logger.info(
+                "E2X_VCH per-bs: %s bs=%d -> %s",
+                "verify" if key[0] else "draft-extend",
+                bs,
+                "VCH" if ok else f"native (min_bs {self._vch_min_bs})",
+            )
+        return ok
 
     def _vch_engaged(self, forward_batch, layer, q, attention_sink) -> bool:
         return (
