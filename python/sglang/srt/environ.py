@@ -1358,6 +1358,9 @@ class Envs:
     # With K75P engaged, its draft token select (shard argmax, pair gather, select, topk1
     # finish, mrope + 1) in one launch that sends each candidate to the row's owner rank.
     SGLANG_Q35MF_DEP_DX_XCHG = EnvBool(False)
+    # Build the SGLANG_Q35MF_DEP_DX_XCHG exchange even when the switch is off at init (same-server A/B variants
+    # turn the switch on at capture).
+    SGLANG_Q35MF_DEP_DX_BUFFERS = EnvBool(False)
     # With DEP_DX_XCHG engaged, also run the stock K75P select and finish on the same logits
     # and count rows whose outputs differ per kind (decode / extend), logged every 30 s.
     SGLANG_Q35MF_DEP_DX_PROOF = EnvBool(False)

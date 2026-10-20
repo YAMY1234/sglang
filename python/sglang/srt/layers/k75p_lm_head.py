@@ -65,7 +65,10 @@ class K75PDraftSelect:
         ):
             logger.warning("K75P draft LM head disabled: no multicast on the TP group.")
             return None
-        if envs.SGLANG_Q35MF_DEP_DX_XCHG.get():
+        if (
+            envs.SGLANG_Q35MF_DEP_DX_XCHG.get()
+            or envs.SGLANG_Q35MF_DEP_DX_BUFFERS.get()
+        ):
             tp_group = get_parallel().tp_group
             select.dep = DepDraftXchg(
                 device_group=tp_group.device_group,
@@ -104,7 +107,7 @@ class K75PDraftSelect:
     def select(
         self, *, logits: torch.Tensor, num_local_rows: int, torch_nan: bool
     ) -> torch.Tensor:
-        if self.dep is not None:
+        if self.dep is not None and envs.SGLANG_Q35MF_DEP_DX_XCHG.get():
             return self.dep.select(
                 logits=logits,
                 num_local_rows=num_local_rows,

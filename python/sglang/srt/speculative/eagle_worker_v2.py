@@ -862,7 +862,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # The K75P select writes the topk1 finish outputs itself when it runs in a step.
         dep_xchg = (
             self._dep_draft_xchg
-            if exchange is None and draft_tokens_topk1 is not None
+            if exchange is None
+            and draft_tokens_topk1 is not None
+            and envs.SGLANG_Q35MF_DEP_DX_XCHG.get()
             else None
         )
 
