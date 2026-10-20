@@ -1723,7 +1723,7 @@ struct RouterFrontKernel {
     TensorMatcher({M_, kHidden}).with_dtype<bf16_t>().with_device(device).ensure_alignment(32).verify(x);
     TensorMatcher({kExperts, kHidden}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(weight);
     TensorMatcher({1}).with_dtype<fp32_t>().with_device(device).verify(global_scale);
-    TensorMatcher({32 * kSkMaxTokens * kExperts}).with_dtype<fp32_t>().with_device(device).ensure_alignment(16).verify(part);
+    TensorMatcher({16 * kSkMaxTokens * kExperts}).with_dtype<fp32_t>().with_device(device).ensure_alignment(16).verify(part);
     TensorMatcher({M_, kExperts}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(logits);
     TensorMatcher({M_, kTopK}).with_dtype<fp32_t>().with_device(device).verify(topk_weights);
     TensorMatcher({M_, kTopK}).with_dtype<int32_t>().with_device(device).verify(topk_ids);
@@ -1731,7 +1731,7 @@ struct RouterFrontKernel {
     TensorMatcher({M_, kBlocksPerRow}).with_dtype<uint8_t>().with_device(device).verify(x_sf);
     const auto M = static_cast<uint32_t>(M_.unwrap());
     CHECK_HOST(M <= kSkMaxTokens) << "router_splitk: num_tokens " << M << " exceeds " << kSkMaxTokens;
-    CHECK_HOST(slices == 8 || slices == 16 || slices == 32) << "router_splitk: slices " << slices;
+    CHECK_HOST(slices == 8 || slices == 16) << "router_splitk: slices " << slices;
     if (M == 0) return;
     SkParams gp{};
     gp.x = static_cast<const bf16_t*>(x.data_ptr());
@@ -1750,10 +1750,8 @@ struct RouterFrontKernel {
     tp.mode = kModeQuant | kModeTopk;
     if (slices == 8) {
       launch_splitk<8>(gp, tp, device.unwrap());
-    } else if (slices == 16) {
-      launch_splitk<16>(gp, tp, device.unwrap());
     } else {
-      launch_splitk<32>(gp, tp, device.unwrap());
+      launch_splitk<16>(gp, tp, device.unwrap());
     }
   }
 
