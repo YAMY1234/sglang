@@ -1978,13 +1978,18 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 logger.warning_once(
                     "Fused FP8 attention preparation is unsupported; using standard preparation."
                 )
-        pdl_wait = (
-            hidden_states.shape[0] == 1
-            and bool(cache_kwargs)
-            and envs.SGLANG_Q35MF_LL16_QKN_PDL.get()
+        m = hidden_states.shape[0]
+        # SGLANG_Q35MF_LL16_EXT_QKN: the draft extend's qk norm (1 < m <= 8) also launches as a programmatic
+        # dependent and releases its own dependents (the PDL split-KV producer) at entry.
+        ext_qkn = self._mkd_gemv and 1 < m <= 8 and envs.SGLANG_Q35MF_LL16_EXT_QKN.get()
+        pdl_wait = bool(cache_kwargs) and (
+            (m == 1 and envs.SGLANG_Q35MF_LL16_QKN_PDL.get()) or ext_qkn
         )
+        early_trigger = (m == 1 and envs.SGLANG_Q35MF_LL16_Q1_PDL.get()) or ext_qkn
         if pdl_wait:
             print_info_once("Draft qk norm launches as a programmatic dependent of the qkv GEMM.")
+        if ext_qkn:
+            print_info_once("Draft extend qk norm launches as a programmatic dependent and releases at entry.")
         q_out, k_out, gate_out = fused_qk_gemma_rmsnorm_rope_gate(
             q_gate,
             k,
@@ -2000,7 +2005,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             has_gate=self.attn_output_gate,
             mrope_axis_map=(self.rotary_emb.axis_map if positions.dim() == 2 else None),
             # SGLANG_Q35MF_LL16_Q1_PDL: the one-token draft q1 decode prefetches beside this kernel.
-            early_trigger=hidden_states.shape[0] == 1 and envs.SGLANG_Q35MF_LL16_Q1_PDL.get(),
+            early_trigger=early_trigger,
             pdl_wait=pdl_wait,
             **cache_kwargs,
         )

@@ -1144,6 +1144,9 @@ class Envs:
     # MiB of the lm_head weight under a persisting-L2 access-policy window on every lm_head launch (0 = off); the
     # persisting-L2 limit goes to the device maximum the first time it is used. Cache policy only.
     SGLANG_Q35MF_LL16_XLG_MB = EnvInt(0)
+    # With SGLANG_Q35MF_MKD_GEMV: the draft extend's qk norm (2-8 tokens) launches as a programmatic dependent of the
+    # qkv GEMM and releases the split-KV producer at entry, as the one-token draft step does (QKN_PDL + Q1_PDL).
+    SGLANG_Q35MF_LL16_EXT_QKN = EnvBool(False)
     # With SGLANG_Q35MF_MKA_FUSED and SGLANG_Q35MF_MKH_HOP: the fused o_proj pushes its partial into the
     # q35 hop mailbox, so the attention output hop only consumes.
     SGLANG_Q35MF_MKA_PUSH = EnvBool(False)
