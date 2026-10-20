@@ -4,6 +4,7 @@ the same commit lengths), once, and run before any draft forward that would not 
 them itself (eager, a graph without the fork, or a graph whose rows miss staged ones);
 a static epilogue whose graph forked no projection keeps the inline commit."""
 
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -189,6 +190,75 @@ class TestEpilogueStagesOnlyAfterItsProjection(CustomTestCase):
         injector, commit, _, _ = self._run(projected=False)
         self.assertEqual(len(injector.inline), 1)
         self.assertTrue(bool((commit.commit_lens == 0).all()))
+
+
+_TRITON_DEVICE = (
+    "cuda"
+    if torch.cuda.is_available()
+    else ("cpu" if os.environ.get("TRITON_INTERPRET") == "1" else None)
+)
+
+
+@unittest.skipIf(_TRITON_DEVICE is None, "needs CUDA or TRITON_INTERPRET=1")
+class TestOneLaunchStage(CustomTestCase):
+    def test_one_launch_writes_what_the_copies_write(self):
+        """The staging kernel leaves every staged buffer equal to the copies and the
+        zero tail, with and without state slots, at bs 1 and a partial bs."""
+        from sglang.kernels.ops.speculative.dspark.stage_commit import stage_commit
+
+        dev, max_bs, stride = _TRITON_DEVICE, 4, 6
+        rows = max_bs * stride
+        for bs in (1, 3):
+            for with_slot in (False, True):
+                with self.subTest(bs=bs, with_slot=with_slot):
+                    n = bs * stride
+                    src = dict(
+                        cache_loc=torch.arange(n, device=dev) + 100,
+                        positions=torch.arange(n, device=dev) + 7,
+                        commit_lens=torch.arange(
+                            1, bs + 1, dtype=torch.int32, device=dev
+                        ),
+                        state_slot=(torch.arange(n, device=dev) + 3)
+                        if with_slot
+                        else None,
+                    )
+
+                    def bufs():
+                        return dict(
+                            cache_loc=torch.full(
+                                (rows,), -1, dtype=torch.int64, device=dev
+                            ),
+                            positions=torch.full(
+                                (rows,), -1, dtype=torch.int64, device=dev
+                            ),
+                            commit_lens=torch.full(
+                                (max_bs,), 9, dtype=torch.int32, device=dev
+                            ),
+                            state_slot=torch.full(
+                                (rows,), -1, dtype=torch.int64, device=dev
+                            )
+                            if with_slot
+                            else None,
+                        )
+
+                    ref, got = bufs(), bufs()
+                    ref["cache_loc"][:n].copy_(src["cache_loc"])
+                    ref["positions"][:n].copy_(src["positions"])
+                    ref["commit_lens"][:bs].copy_(src["commit_lens"])
+                    ref["commit_lens"][bs:].zero_()
+                    if with_slot:
+                        ref["state_slot"][:n].copy_(src["state_slot"])
+                    stage_commit(
+                        cache_loc_dst=got["cache_loc"],
+                        positions_dst=got["positions"],
+                        commit_lens_dst=got["commit_lens"],
+                        state_slot_dst=got["state_slot"],
+                        rows=n,
+                        **src,
+                    )
+                    for name, want in ref.items():
+                        if want is not None:
+                            self.assertTrue(torch.equal(got[name], want), name)
 
 
 if __name__ == "__main__":
