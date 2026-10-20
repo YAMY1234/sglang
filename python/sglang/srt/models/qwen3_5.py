@@ -2238,6 +2238,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
     def _mka_push_hop(self, m: int):
         if not (envs.SGLANG_Q35MF_MKA_PUSH.get() and envs.SGLANG_Q35MF_MKH_HOP.get()):
             return None
+        max_m = envs.SGLANG_Q35MF_TPX_MKA_PUSH_MAX_M.get()
+        if max_m and m > max_m:
+            return None
         from sglang.srt.layers.q35_hop import active
 
         hop = active()
