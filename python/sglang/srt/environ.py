@@ -1748,6 +1748,9 @@ class Envs:
     # JSON file of run-time switch overrides ({"K4_MLP_SYNC_SIDE_STREAM": true, ...}), re-read when it
     # changes, for A/B variants inside one loaded server; empty keeps every switch at its env value.
     SGLANG_Q35MF_RT_TOGGLE_FILE = EnvStr("")
+    # total_requests DP dispatch breaks request-count ties by the fewest tokens: equal per-rank
+    # request counts first (the busiest rank sets a DP-attention round), then the shortest KV.
+    SGLANG_Q35MF_DP_REQUESTS_THEN_TOKENS = EnvBool(False)
 
     # ===================================================================
     # CUDA graphs and execution buffers

@@ -31,6 +31,7 @@ from sglang.srt.managers.data_parallel_controller import (
     LoadBalanceMethod,
     WorkerPortHandshake,
 )
+from sglang.srt.environ import envs
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.runtime_context import get_context
 
@@ -334,6 +335,24 @@ class TestDPBudgetDispatch(CustomTestCase):
         self.assertEqual(
             rank, 1, "tie on total_tokens should fall back to min total_requests"
         )
+
+    def test_total_requests_tie_breaks_on_total_tokens_when_enabled(self):
+        budget = DPBudget(num_dp_ranks=3)
+        budget.total_requests = [2, 2, 3]
+        budget.total_tokens = [300, 100, 50]
+        rank = budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS, estimated_tokens=40)
+        self.assertEqual(rank, 0, "default keeps the first rank with min requests")
+        budget.total_requests = [2, 2, 3]
+        budget.total_tokens = [300, 100, 50]
+        with envs.SGLANG_Q35MF_DP_REQUESTS_THEN_TOKENS.override(True):
+            rank = budget.dispatch(
+                LoadBalanceMethod.TOTAL_REQUESTS, estimated_tokens=40
+            )
+        self.assertEqual(
+            rank, 1, "tie on total_requests should fall back to min total_tokens"
+        )
+        self.assertEqual(budget.total_tokens[1], 140)
+        self.assertEqual(budget.total_requests[1], 3)
 
     def test_dispatch_returns_none_for_methods_not_handled(self):
         """Round-robin and follow_bootstrap_room dispatch elsewhere; DPBudget

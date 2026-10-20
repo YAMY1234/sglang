@@ -138,7 +138,13 @@ class DPBudget:
 
     def dispatch(self, method: LoadBalanceMethod, estimated_tokens: int = 0):
         if method == LoadBalanceMethod.TOTAL_REQUESTS:
-            target_rank = self.total_requests.index(min(self.total_requests))
+            if envs.SGLANG_Q35MF_DP_REQUESTS_THEN_TOKENS.get():
+                target_rank = min(
+                    range(self.num_dp_ranks),
+                    key=lambda i: (self.total_requests[i], self.total_tokens[i]),
+                )
+            else:
+                target_rank = self.total_requests.index(min(self.total_requests))
         elif method == LoadBalanceMethod.TOTAL_TOKENS:
             # Use total_requests as a tie-breaker when total_tokens are equal
             target_rank = min(
@@ -886,7 +892,9 @@ class DataParallelController:
     def total_requests_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
-        target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
+        target_worker = self.dp_budget.dispatch(
+            LoadBalanceMethod.TOTAL_REQUESTS, estimated_tokens=len(req.input_ids)
+        )
         sock_send(self.workers[target_worker], req)
 
     def total_tokens_scheduler(self, req: Req):
