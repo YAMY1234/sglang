@@ -28,6 +28,10 @@ from sglang.srt.layers.moe.token_dispatcher.flashinfer_midq import (
 from sglang.srt.layers.moe.token_dispatcher.flashinfer_utils import (
     TorchDistributedCommBackend,
 )
+from sglang.srt.layers.moe.token_dispatcher.qwen_ll_a2a import (
+    get_ll_a2a_check,
+    get_ll_a2a_state,
+)
 from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
     TopKOutput,
@@ -275,6 +279,26 @@ class FlashinferDispatcher(BaseDispatcher):
             )
 
         self.moe_a2a = make_moe_a2a()
+        # NVFP4 decode exchange of target layers (SGLANG_Q35MF_E2X_LLA2A, read per dispatch so A/B variants can flip it).
+        self.ll_a2a = None
+        if (
+            envs.SGLANG_Q35MF_E2X_LLA2A.get()
+            or envs.SGLANG_Q35MF_E2X_LLA2A_BUFFERS.get()
+        ) and (
+            not is_speculative_model
+            and self.dispatch_type == FlashinferA2ADispatchType.NVFP4
+        ):
+            self.ll_a2a = get_ll_a2a_state(
+                mapping=self.mapping,
+                ep_rank=self.ep_rank,
+                ep_size=self.ep_size,
+                top_k=router_topk,
+                hidden=hidden_size,
+                num_experts=num_experts,
+                slots=envs.SGLANG_Q35MF_E2X_LLA2A_MAX_TOKENS.get(),
+            )
+        # (own top-k ids, check) of a dispatch that went through ll_a2a, for the matching combine.
+        self._ll_call: Optional[tuple] = None
         # (data_ptr, shape, x_fp4, x_sf) staged by a fused router front for the next NVFP4 dispatch.
         self._staged_nvfp4: Optional[tuple] = None
         # The next decoder layer's first projections, set by the model (SGLANG_Q35MF_DEP_L2_PREFETCH).
@@ -447,13 +471,17 @@ class FlashinferDispatcher(BaseDispatcher):
         # padding slots whose expert_id would otherwise route to a real expert
         # and waste downstream MoE compute. Sanitizing the padding to a
         # sentinel id is structural, not optional.
-        recv_tensors = self.active_moe_a2a.dispatch(
-            topk_ids,
-            payloads,
-            self.runtime_max_tokens_per_rank,
-            invalid_token_expert_id=self.invalid_token_expert_id,
-            expert_id_payload_index=expert_id_payload_index,
-        )
+        if self._use_ll_a2a(x_sf):
+            recv_tensors = self._ll_a2a_dispatch(payloads, expert_id_payload_index)
+        else:
+            self._ll_call = None
+            recv_tensors = self.active_moe_a2a.dispatch(
+                topk_ids,
+                payloads,
+                self.runtime_max_tokens_per_rank,
+                invalid_token_expert_id=self.invalid_token_expert_id,
+                expert_id_payload_index=expert_id_payload_index,
+            )
         if x_sf is not None:
             x_recv, x_sf_recv, topk_ids_recv, topk_weights_recv = recv_tensors
             x_sf = x_sf_recv.view(-1, x_sf_recv.shape[-1])
@@ -473,7 +501,7 @@ class FlashinferDispatcher(BaseDispatcher):
 
         # Provide an output tensor to fused_moe so it writes directly to our buffer
         moe_output = None
-        if self.payload_in_workspace:
+        if self.payload_in_workspace and self._ll_call is None:
             moe_output = self.active_moe_a2a.get_combine_payload_tensor_in_workspace(
                 self.runtime_max_tokens_per_rank, self.hidden_size, output_dtype
             ).view(-1, self.hidden_size)
@@ -485,9 +513,64 @@ class FlashinferDispatcher(BaseDispatcher):
             output_dtype,
         )
 
+    def _use_ll_a2a(self, x_sf: Optional[torch.Tensor]) -> bool:
+        return (
+            self.ll_a2a is not None
+            and x_sf is not None
+            and envs.SGLANG_Q35MF_E2X_LLA2A.get()
+            and not self.use_low_precision_combine
+            and self.runtime_max_tokens_per_rank <= self.ll_a2a.slots
+        )
+
+    def _ll_a2a_dispatch(
+        self, payloads: list[torch.Tensor], expert_id_payload_index: int
+    ) -> list[torch.Tensor]:
+        x, x_sf, topk_ids, topk_weights = payloads
+        recv = self.ll_a2a.dispatch(
+            x=x,
+            sf=x_sf,
+            ids=topk_ids,
+            wts=topk_weights,
+            tmax=self.runtime_max_tokens_per_rank,
+            invalid_id=self.invalid_token_expert_id,
+        )
+        check = None
+        if envs.SGLANG_Q35MF_E2X_LLA2A_CHECK.get():
+            check = get_ll_a2a_check(x.device)
+            check.dispatch(
+                moe_a2a=self.active_moe_a2a,
+                payloads=payloads,
+                expert_id_payload_index=expert_id_payload_index,
+                invalid_id=self.invalid_token_expert_id,
+                num_experts=self.num_experts,
+                ll_recv=recv,
+                tmax=self.runtime_max_tokens_per_rank,
+            )
+        self._ll_call = (topk_ids, check)
+        return recv
+
+    def _ll_a2a_combine(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        topk_ids, check = self._ll_call
+        self._ll_call = None
+        tmax = self.runtime_max_tokens_per_rank
+        partial = hidden_states.view(self.ep_size * tmax, hidden_states.shape[-1])
+        prefetch_stream = self._fork_l2_prefetch()
+        out = self.ll_a2a.combine(partial=partial, ids=topk_ids, tmax=tmax)
+        if prefetch_stream is not None:
+            torch.cuda.current_stream().wait_stream(prefetch_stream)
+        if check is not None:
+            check.combine(
+                moe_a2a=self.active_moe_a2a, partial=partial, out=out, tmax=tmax
+            )
+        del self.runtime_max_tokens_per_rank
+        del self.active_moe_a2a
+        return out
+
     @debug_kernel_api
     def combine(self, combine_input: FlashinferCombineInput) -> torch.Tensor:
         hidden_states = combine_input.hidden_states
+        if self._ll_call is not None:
+            return self._ll_a2a_combine(hidden_states)
         weight_dtype = self.quant_config.get("weight_dtype")
         runner_backend = get_moe_runner_backend()
         if (

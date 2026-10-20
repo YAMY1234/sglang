@@ -1307,6 +1307,16 @@ class Envs:
     # FlashInfer A2A MoE: while the combine waits on the other ranks, prefetch the next layer's first projection
     # weights into L2 from a side stream (no math change; the dispatcher joins the side stream after the combine).
     SGLANG_Q35MF_DEP_L2_PREFETCH = EnvBool(False)
+    # FlashInfer A2A NVFP4 dispatch of target MoE layers at up to SGLANG_Q35MF_E2X_LLA2A_MAX_TOKENS tokens per rank:
+    # one fence-free exchange kernel each way instead of MoeAlltoAll (same rows at fixed slots, same combine bits).
+    SGLANG_Q35MF_E2X_LLA2A = EnvBool(False)
+    # Allocate the SGLANG_Q35MF_E2X_LLA2A buffers even when the switch is off at init (same-server A/B variants).
+    SGLANG_Q35MF_E2X_LLA2A_BUFFERS = EnvBool(False)
+    # Tokens per source rank the SGLANG_Q35MF_E2X_LLA2A buffers hold (at most 128); larger batches use MoeAlltoAll.
+    SGLANG_Q35MF_E2X_LLA2A_MAX_TOKENS = EnvInt(128)
+    # Debug only: with SGLANG_Q35MF_E2X_LLA2A, also run the stock MoeAlltoAll exchange of the same rows in the same
+    # (captured) forward and log, per token count, how many dispatched and combined rows differ.
+    SGLANG_Q35MF_E2X_LLA2A_CHECK = EnvBool(False)
     # Dual-stream deferred-finalize MoE at up to this many tokens (0 = off): the whole shared expert
     # on a top-priority side stream (same kernels and outputs; only scheduling changes).
     SGLANG_Q35MF_K4_SIDE_PRIO_MAX_TOKENS = EnvInt(0)
