@@ -126,6 +126,8 @@ def test_engram_history_fused_accept_tail_matches_unfused(monkeypatch):
     """SGLANG_DSPARK_FUSED_ACCEPT_TAIL returns only gated lengths; the in-graph engram
     commit must still see the ungated ones, so both accepts leave the same history."""
     monkeypatch.setattr(dspark_verify, "engram_commit_history", _commit_reference)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     bs, stride, vocab = 5, 6, 64
     g = torch.Generator().manual_seed(7)
     target = torch.randint(0, vocab, (bs, stride), generator=g)
