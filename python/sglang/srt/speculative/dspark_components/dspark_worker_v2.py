@@ -260,7 +260,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             length=self.verify_num_draft_tokens, device=self.device
         )
         # Verify-window positions, cache locs and the draft anchor column in one launch.
-        self._prepare_inputs_once = envs.SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE.get()
+        self._prepare_inputs_once = (
+            envs.SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE.get()
+        )
         self.num_folded_verify_ids_steps = 0
         self._draft_block_spec_info = make_draft_block_spec_info(
             draft_token_num=int(self.query_token_num), device=self.device
