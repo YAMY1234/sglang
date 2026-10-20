@@ -1,0 +1,373 @@
+"""The block-wise rejection sampler must draw
+(accept length, bonus) from the exact chain speculative-sampling law, like the classic
+kernel; its draws must be a function of (key, counter) only, so TP ranks and CUDA graph
+replays agree; and the accept must route to it only when the noise is given."""
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from sglang.kernels.ops.speculative.dspark import blockwise_rejection as bwr
+from sglang.srt.speculative.dspark_components import dspark_verify
+from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
+from sglang.srt.speculative.spec_tp_sync import SpecTpSync
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
+
+needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+
+
+def _tp_sync():
+    sync = SpecTpSync.__new__(SpecTpSync)
+    sync._sites = frozenset()
+    return sync
+
+
+def _info(temps, **overrides):
+    fields = dict(
+        temperatures=temps,
+        is_all_greedy=False,
+        is_any_greedy=False,
+        need_top_k_sampling=False,
+        need_top_p_sampling=False,
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def _case(*, stride, vocab, device, seed=0, scale=2.0):
+    gen = torch.Generator(device=device).manual_seed(seed)
+    target = torch.randn(stride, vocab, device=device, generator=gen) * scale
+    draft = torch.randn(stride - 1, vocab, device=device, generator=gen) * scale
+    # Drafts drawn from the draft law, so some get accepted and some rejected.
+    tokens = torch.multinomial(torch.softmax(draft, -1), 1, generator=gen).view(-1)
+    root = torch.zeros(1, dtype=torch.int64, device=device)
+    return target, draft, torch.cat([root, tokens])
+
+
+def _expected_law(target, draft, candidates, t_temp, d_temp, one_hot):
+    """Exact pmf over (accept length k, bonus token x), shape [gamma + 1, vocab]."""
+    gamma, vocab = draft.shape
+    p = torch.softmax(target.double() / t_temp, -1)
+    if one_hot:
+        q = torch.nn.functional.one_hot(candidates[1:], vocab).double()
+    else:
+        q = torch.softmax(draft.double() / d_temp, -1)
+    law = torch.zeros(gamma + 1, vocab, dtype=torch.float64, device=target.device)
+    prefix = 1.0
+    for i in range(gamma):
+        d = candidates[i + 1]
+        a = min(1.0, (p[i, d] / q[i, d]).item())
+        residual = (p[i] - q[i]).clamp_min(0)
+        law[i] = prefix * (1 - a) * residual / residual.sum().clamp_min(1e-300)
+        prefix *= a
+    law[gamma] = prefix * p[gamma]
+    return law
+
+
+def _chi_square_ok(counts, law, n):
+    expected = law.flatten() * n
+    keep = expected >= 5
+    observed = counts.flatten().double()
+    stat = (((observed - expected) ** 2) / expected)[keep].sum().item()
+    tail = observed[~keep].sum().item() - expected[~keep].sum().item()
+    df = int(keep.sum().item()) - 1
+    # About 6 sigma of the chi-square law; the pooled sparse tail within 6 Poisson sigma.
+    bound = df + 6 * (2 * df) ** 0.5
+    sparse = expected[~keep].sum().item()
+    return stat < bound and abs(tail) < 6 * max(sparse, 1.0) ** 0.5 + 5, (stat, bound)
+
+
+def _tile(target, draft, candidates, rows):
+    stride, vocab = target.shape
+    return (
+        candidates.unsqueeze(0).repeat(rows, 1),
+        target.unsqueeze(0).repeat(rows, 1, 1).view(rows * stride, vocab),
+        draft.unsqueeze(0).repeat(rows, 1, 1),
+    )
+
+
+def _blockwise_counts(
+    target, draft, candidates, *, rows, calls, t_temp, d_temp, one_hot
+):
+    stride, vocab = target.shape
+    device = target.device
+    cand, tgt, drf = _tile(target, draft, candidates, rows)
+    noise = bwr.make_rejection_noise(1234, device)
+    counts = torch.zeros(stride * vocab, dtype=torch.int64, device=device)
+    temps_t = torch.full((rows,), t_temp, device=device)
+    temps_d = torch.full((rows,), d_temp, device=device)
+    for _ in range(calls):
+        k, x, _ = bwr.BlockwiseRejection.execute(
+            candidates=cand,
+            target_logits=tgt,
+            draft_logits=None if one_hot else drf,
+            target_temperatures=temps_t,
+            draft_temperatures=temps_d,
+            noise=noise,
+        )
+        counts += torch.bincount(k.long() * vocab + x, minlength=stride * vocab)
+    return counts.view(stride, vocab)
+
+
+def _classic_counts(target, draft, candidates, *, rows, calls, t_temp, d_temp, one_hot):
+    stride, vocab = target.shape
+    device = target.device
+    cand, tgt, drf = _tile(target, draft, candidates, rows)
+    counts = torch.zeros(stride * vocab, dtype=torch.int64, device=device)
+    block = DraftBlockResult(
+        draft_tokens=cand[:, 1:],
+        corrected_logits=None if one_hot else drf,
+        greedy_mask=torch.zeros(rows, dtype=torch.bool, device=device),
+        temperatures=torch.full((rows,), d_temp, device=device),
+        greedy_draft=one_hot,
+    )
+    info = _info(torch.full((rows, 1), t_temp, device=device))
+    for _ in range(calls):
+        k, x, _ = dspark_verify.accept_draft_tokens(
+            candidates=cand,
+            target_logits=tgt,
+            draft_block=block,
+            sampling_info=info,
+            draft_input=None,
+            gamma=stride - 1,
+            verify_num_draft_tokens=stride,
+        )
+        counts += torch.bincount(k.long() * vocab + x, minlength=stride * vocab)
+    return counts.view(stride, vocab)
+
+
+@needs_cuda
+@pytest.mark.parametrize(
+    "t_temp,d_temp,one_hot,seed",
+    [
+        (1.0, 1.0, False, 0),
+        (0.7, 1.3, False, 1),
+        (1.0, 1.0, True, 2),
+        (1.0, 1.0, False, 3),
+    ],
+)
+def test_law_matches_exact_and_classic(t_temp, d_temp, one_hot, seed):
+    stride, vocab, rows, calls = 4, 40, 8192, 64
+    target, draft, cand = _case(stride=stride, vocab=vocab, device="cuda", seed=seed)
+    law = _expected_law(target, draft, cand, t_temp, d_temp, one_hot)
+    n = rows * calls
+    kw = dict(rows=rows, calls=calls, t_temp=t_temp, d_temp=d_temp, one_hot=one_hot)
+    new = _blockwise_counts(target, draft, cand, **kw)
+    ok, detail = _chi_square_ok(new, law, n)
+    assert ok, ("blockwise", detail)
+    old = _classic_counts(target, draft, cand, **kw)
+    ok, detail = _chi_square_ok(old, law, n)
+    assert ok, ("classic", detail)
+    # Power check: the target law alone as the bonus law must be rejected.
+    wrong = law.clone()
+    wrong[:-1] = law[:-1].sum(-1, keepdim=True) * torch.softmax(
+        target[:-1].double() / t_temp, -1
+    )
+    assert not _chi_square_ok(new, wrong, n)[0]
+
+
+@needs_cuda
+def test_first_token_is_target_distributed():
+    """Drafts drawn from q: the first emitted token must follow p (unbiasedness)."""
+    stride, vocab, rows = 3, 32, 1 << 16
+    gen = torch.Generator(device="cuda").manual_seed(5)
+    target = torch.randn(stride, vocab, device="cuda", generator=gen) * 2
+    draft = torch.randn(stride - 1, vocab, device="cuda", generator=gen) * 2
+    q = torch.softmax(draft, -1)
+    noise = bwr.make_rejection_noise(7, "cuda")
+    counts = torch.zeros(vocab, dtype=torch.int64, device="cuda")
+    ones = torch.ones(rows, device="cuda")
+    for _ in range(16):
+        drafts = torch.stack(
+            [
+                torch.multinomial(q[i], rows, replacement=True, generator=gen)
+                for i in range(stride - 1)
+            ],
+            dim=1,
+        )
+        cand = torch.cat(
+            [torch.zeros(rows, 1, dtype=torch.int64, device="cuda"), drafts], 1
+        )
+        k, x, _ = bwr.BlockwiseRejection.execute(
+            candidates=cand,
+            target_logits=target.repeat(rows, 1),
+            draft_logits=draft.unsqueeze(0).expand(rows, -1, -1).contiguous(),
+            target_temperatures=ones,
+            draft_temperatures=ones,
+            noise=noise,
+        )
+        first = torch.where(k > 0, cand[:, 1], x)
+        counts += torch.bincount(first, minlength=vocab)
+    law = torch.softmax(target[0].double(), -1)
+    ok, detail = _chi_square_ok(counts, law, counts.sum().item())
+    assert ok, detail
+
+
+@needs_cuda
+def test_draws_depend_only_on_key_and_counter():
+    stride, vocab, rows = 6, 129280, 8
+    gen = torch.Generator(device="cuda").manual_seed(9)
+    target = torch.randn(rows * stride, vocab, device="cuda", generator=gen)
+    draft = torch.randn(rows, stride - 1, vocab, device="cuda", generator=gen)
+    cand = torch.randint(0, vocab, (rows, stride), device="cuda", generator=gen)
+    cand[:, 1:] = target.view(rows, stride, vocab)[:, :-1].argmax(-1)
+    temps = torch.ones(rows, device="cuda")
+
+    def run(noise):
+        return bwr.BlockwiseRejection.execute(
+            candidates=cand,
+            target_logits=target,
+            draft_logits=draft,
+            target_temperatures=temps,
+            draft_temperatures=temps,
+            noise=noise,
+        )
+
+    a, b = bwr.make_rejection_noise(3, "cuda"), bwr.make_rejection_noise(3, "cuda")
+    first = run(a)
+    torch.cuda.manual_seed(12345)  # torch's generator plays no part
+    second = run(b)
+    for x, y in zip(first, second):
+        assert torch.equal(x, y)
+    assert a.counter.item() == 1
+    outs = [run(a)[1] for _ in range(8)]
+    assert len({tuple(o.tolist()) for o in outs}) > 1, (
+        "the counter must change the draws"
+    )
+    assert ((first[1] >= 0) & (first[1] < vocab)).all()
+    assert (first[0] <= stride - 1).all() and (first[2] == 0).all()
+
+
+@needs_cuda
+def test_graph_replay_equals_eager_and_advances_counter():
+    stride, vocab, rows = 6, 129280, 4
+    gen = torch.Generator(device="cuda").manual_seed(4)
+    target = torch.randn(rows * stride, vocab, device="cuda", generator=gen) * 4
+    draft = target.view(rows, stride, vocab)[:, :-1].clone()
+    cand = torch.zeros(rows, stride, dtype=torch.int64, device="cuda")
+    cand[:, 1:] = draft.argmax(-1)
+    temps = torch.full((rows,), 0.8, device="cuda")
+    noise = bwr.make_rejection_noise(11, "cuda")
+
+    def run():
+        return bwr.BlockwiseRejection.execute(
+            candidates=cand,
+            target_logits=target,
+            draft_logits=draft,
+            target_temperatures=temps,
+            draft_temperatures=temps,
+            noise=noise,
+        )
+
+    run()  # compile
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        static = run()
+    for step in range(3):
+        noise.counter.fill_(100 + step)
+        ref = [t.clone() for t in run()]
+        noise.counter.fill_(100 + step)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert noise.counter.item() == 101 + step
+        for x, y in zip(static, ref):
+            assert torch.equal(x, y), step
+
+
+@needs_cuda
+def test_cutoff_caps_length_and_bonus_is_the_next_draft():
+    stride, vocab, rows = 6, 512, 64
+    target = torch.zeros(rows * stride, vocab, device="cuda")
+    cand = torch.randint(0, vocab, (rows, stride), device="cuda")
+    # Identical draft and target laws: every draft is accepted.
+    draft = target.view(rows, stride, vocab)[:, :-1].clone()
+    verify_lens = torch.randint(
+        1, stride + 1, (rows,), device="cuda", dtype=torch.int32
+    )
+    k, x, trim = bwr.BlockwiseRejection.execute(
+        candidates=cand,
+        target_logits=target,
+        draft_logits=draft,
+        target_temperatures=torch.ones(rows, device="cuda"),
+        draft_temperatures=torch.ones(rows, device="cuda"),
+        noise=bwr.make_rejection_noise(0, "cuda"),
+        cutoff_verify_lens=verify_lens,
+    )
+    expect_len = torch.minimum(
+        torch.full_like(verify_lens, stride - 1), verify_lens - 1
+    )
+    assert torch.equal(k, expect_len)
+    assert torch.equal(trim, stride - 1 - expect_len)
+    capped = k < stride - 1
+    nxt = cand.gather(1, (k.long() + 1).clamp_max(stride - 1).unsqueeze(1)).squeeze(1)
+    assert torch.equal(x[capped], nxt[capped])
+
+
+def test_routes_to_blockwise_only_with_noise(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        dspark_verify.BlockwiseRejection,
+        "execute",
+        classmethod(lambda cls, **kw: calls.append("blockwise") or (None, None, None)),
+    )
+    monkeypatch.setattr(
+        dspark_verify.AcceptSampling,
+        "execute",
+        classmethod(lambda cls, **kw: calls.append("classic") or (None, None, None)),
+    )
+    monkeypatch.setattr(dspark_verify, "_draft_probs", lambda *a: None)
+    noise = bwr.make_rejection_noise(0, "cpu")
+    block = SimpleNamespace(
+        greedy_draft=False, corrected_logits=None, temperatures=None, greedy_mask=None
+    )
+
+    def accept(info, **kw):
+        dspark_verify.accept_draft_tokens(
+            candidates=torch.zeros(1, 3, dtype=torch.int64),
+            target_logits=torch.zeros(3, 8),
+            draft_block=block,
+            sampling_info=info,
+            draft_input=None,
+            gamma=2,
+            verify_num_draft_tokens=3,
+            **kw,
+        )
+        return calls.pop()
+
+    temps = torch.ones(1, 1)
+    assert accept(_info(temps)) == "classic"
+    assert accept(_info(temps), rejection_noise=noise) == "blockwise"
+    assert (
+        accept(_info(temps, need_top_p_sampling=True), rejection_noise=noise)
+        == "classic"
+    )
+    assert (
+        accept(_info(temps, need_top_k_sampling=True), rejection_noise=noise)
+        == "classic"
+    )
+    assert (
+        accept(_info(temps), rejection_noise=noise, block_verification=True)
+        == "classic"
+    )
+
+
+def test_torch_reference_law_on_cpu():
+    stride, vocab, rows, calls = 3, 12, 4096, 16
+    target, draft, cand = _case(stride=stride, vocab=vocab, device="cpu", seed=21)
+    law = _expected_law(target, draft, cand, 1.0, 1.0, False)
+    counts = _blockwise_counts(
+        target,
+        draft,
+        cand,
+        rows=rows,
+        calls=calls,
+        t_temp=1.0,
+        d_temp=1.0,
+        one_hot=False,
+    )
+    ok, detail = _chi_square_ok(counts, law, rows * calls)
+    assert ok, detail
