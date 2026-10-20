@@ -178,6 +178,7 @@ if _is_cuda:
 
 
 logger = logging.getLogger(__name__)
+_moe_exit_logged = False
 
 
 if _is_npu:
@@ -1182,6 +1183,10 @@ class GemmaRMSNorm(BaseFusedOp):
 
             moe_exit_count(fused=(x, residual, x_fp8), stock=stock)
         fp8_handoff.offer(x, scale, x_fp8)
+        global _moe_exit_logged
+        if not _moe_exit_logged:
+            _moe_exit_logged = True
+            logger.info("SGLANG_Q35MF_DEP_MOE_EXIT engaged: %d rows", x.shape[0])
         return x, residual
 
     def forward_native(
