@@ -229,12 +229,15 @@ class PostVerifyGraph:
         if state_key not in self._states and len(self._states) >= _MAX_STATES:
             self._count_round(None)
             return None
-        self._max_top_k = uno_target_max_top_k
-        self._count_round(key + (db1,) if self._db1 or ab_variants.enabled() else key)
         from sglang.srt.speculative import eagle_utils
 
-        # Read by eagle_sample while this round's graph is warmed up or captured.
+        # Read by eagle_sample while this round's graph is warmed up or captured (or runs eagerly).
         eagle_utils._DB1 = db1
+        if self._gathers_across_nodes(batch.sampling_info, logits_output, db1, uno_target_max_top_k):
+            self._count_round(None)
+            return None
+        self._max_top_k = uno_target_max_top_k
+        self._count_round(key + (db1,) if self._db1 or ab_variants.enabled() else key)
         try:
             return self._run(
                 state_key, batch, verify_input, logits_output, num_draft_tokens
@@ -245,6 +248,25 @@ class PostVerifyGraph:
             )
             self.disabled = True
             raise
+
+    @staticmethod
+    def _gathers_across_nodes(info, logits_output, db1: bool, max_top_k) -> bool:
+        # Shard-local verify logits that this batch would gather: across nodes the logits gatherer
+        # falls back to the symmetric-memory all-gather, which cannot be captured in this graph's pool.
+        from sglang.srt.layers.logits_processor import verify_logits_on_shards
+        from sglang.srt.speculative.sharded_verify_sampling import DB1_MAX_TOP_K
+
+        return (
+            get_parallel().nnodes > 1
+            and not info.is_all_greedy
+            and (
+                info.need_top_k_sampling
+                or info.need_top_p_sampling
+                or info.need_min_p_sampling
+            )
+            and not (db1 and max_top_k is not None and max_top_k <= DB1_MAX_TOP_K)
+            and verify_logits_on_shards(logits_output.next_token_logits)
+        )
 
     def _db1_variant(self) -> bool:
         if not ab_variants.enabled():
