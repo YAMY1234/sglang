@@ -1024,14 +1024,16 @@ def _causal_conv1d_update_kernel(
 
 
 @lru_cache(maxsize=3)
-def _get_coalesced_window_kernel(batch):
+def _get_coalesced_window_kernel(batch, dim=12288, block_n=256):
     from sglang.kernels.ops.mamba.causal_conv1d_window import (
         coalesced_window_update_kernel,
     )
 
     logging.getLogger(__name__).info(
-        "Coalesced convolution window stores active: batch=%d, tokens=7, channels=12288",
+        "Coalesced convolution window stores active: batch=%d, tokens=7, channels=%d, block_n=%d",
         batch,
+        dim,
+        block_n,
     )
     return coalesced_window_update_kernel
 
@@ -1192,11 +1194,19 @@ def causal_conv1d_update(
     pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
 
     update_kernel = _causal_conv1d_update_kernel
+    tpx_window = (
+        envs.SGLANG_Q35MF_TPX_CONV_WINDOW.get()
+        and 1 <= batch <= 16
+        and dim in (3072, 6144, 12288)
+        and block_n in (128, 256)
+    )
     if (
-        envs.SGLANG_Q35MF_K4_CONV_WINDOW_STORES.get()
+        (
+            (envs.SGLANG_Q35MF_K4_CONV_WINDOW_STORES.get() and batch in (9, 12, 32) and dim == 12288)
+            or tpx_window
+        )
         and x.is_cuda
-        and batch in (9, 12, 32)
-        and (dim, seqlen) == (12288, 7)
+        and seqlen == 7
         and width == 4
         and state_len == 3
         and x.dtype == conv_state.dtype == weight.dtype == torch.bfloat16
@@ -1209,11 +1219,12 @@ def causal_conv1d_update(
         and intermediate_conv_window is not None
         and intermediate_state_indices is not None
         and intermediate_conv_window.dtype == torch.bfloat16
-        and intermediate_conv_window.shape[1:] == (7, 12288, 3)
+        and intermediate_conv_window.shape[1:] == (7, dim, 3)
         and intermediate_conv_window.stride()[1:] == (1, 9, 1)
     ):
-        update_kernel = _get_coalesced_window_kernel(batch)
+        update_kernel = _get_coalesced_window_kernel(batch, dim, block_n)
         pdl_kwargs["COALESCED_WINDOW"] = True
+        pdl_kwargs["WINDOW_FLAT"] = triton.next_power_of_2(block_n * 9)
 
     update_kernel[grid](
         # Pointers to matrices

@@ -1793,6 +1793,9 @@ class Envs:
     # Prefill gated RMSNorm writes the static-FP8 input of the GDN out_proj directly.
     SGLANG_Q35MF_GDN_PREFILL_NORM_FP8 = EnvBool(False)
     SGLANG_Q35MF_K4_CONV_WINDOW_STORES = EnvBool(False)
+    # Coalesced verify conv-window stores (as SGLANG_Q35MF_K4_CONV_WINDOW_STORES) for 1..16 requests of 7 tokens
+    # at 3072 / 6144 / 12288 channels and channel tiles of 128 or 256 (same values, contiguous stores).
+    SGLANG_Q35MF_TPX_CONV_WINDOW = EnvBool(False)
     # Run the scheduler's device-side MLP sync gather on its own stream, so it does not
     # queue behind the schedule stream's WAR barrier on the in-flight forward.
     SGLANG_Q35MF_K4_MLP_SYNC_SIDE_STREAM = EnvBool(False)
