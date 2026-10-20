@@ -21,4 +21,8 @@ def _module() -> Module:
 
 def l2_line_prefetch(weight: torch.Tensor, ctas: int = 592) -> None:
     """Prefetch a 2-D weight's bytes into L2 on the current stream (no values change)."""
-    _module().run(weight, weight.numel() * weight.element_size(), ctas)
+    # Projection weights are often stored as transposed views; the prefetch only needs the bytes.
+    if not weight.is_contiguous():
+        weight = weight.t()
+    if weight.is_contiguous():
+        _module().run(weight, weight.numel() * weight.element_size(), ctas)
