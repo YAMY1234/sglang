@@ -774,6 +774,43 @@ def _sample_on_vocab_shards(
     return argmax.reshape(candidates.shape), not greedy
 
 
+_DB1 = envs.SGLANG_Q35MF_LL16_DB1.get()
+
+
+def _db1_support_on_shards(
+    *,
+    logits: torch.Tensor,
+    sampling_info,
+    verify_input: EagleVerifyInput,
+    batch: ScheduleBatch,
+    grammar_mask: Optional[GrammarMask],
+    watermark_state: Optional[WatermarkState],
+    use_rejection_sampling: bool,
+    max_top_k: Optional[int],
+):
+    """Compact top-k support of a sampled verify built on the vocab shards: (ids [R, k], float32
+    logits [R, k], argmax [R]), or None when the batch must gather (SGLANG_Q35MF_LL16_DB1)."""
+    if not _DB1:
+        return None
+    from sglang.srt.speculative import sharded_verify_sampling
+
+    sampler = sharded_verify_sampling.get_sampler()
+    reason = sampler.db1_reason(
+        logits=logits,
+        sampling_info=sampling_info,
+        verify_input=verify_input,
+        batch=batch,
+        grammar_mask=grammar_mask,
+        watermark_state=watermark_state,
+        use_rejection_sampling=use_rejection_sampling,
+        max_top_k=max_top_k,
+    )
+    if reason is not None:
+        return None
+    sampler.count("db1", len(batch.seq_lens))
+    return sampler.sparse_support(logits=logits, max_top_k=max_top_k)
+
+
 _PACKED_VERIFY_BCAST = (
     os.environ.get("SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST", "0") == "1"
 )
@@ -984,6 +1021,8 @@ def eagle_sample(
     target_predict = None
     use_rejection_sampling = get_spec().speculative_use_rejection_sampling
     sharded_argmax, sharded_sampled = None, False
+    # Shard-built compact support (ids, float32 logits, argmax); the logits then stay on the shards.
+    db1 = None
     from sglang.srt.layers.logits_processor import verify_logits_on_shards
 
     if verify_logits_on_shards(next_token_logits):
@@ -1003,6 +1042,17 @@ def eagle_sample(
             device=device,
         )
         if sharded_argmax is None:
+            db1 = _db1_support_on_shards(
+                logits=next_token_logits,
+                sampling_info=sampling_info,
+                verify_input=verify_input,
+                batch=batch,
+                grammar_mask=grammar_mask,
+                watermark_state=watermark_state,
+                use_rejection_sampling=use_rejection_sampling,
+                max_top_k=uno_target_max_top_k,
+            )
+        if sharded_argmax is None and db1 is None:
             from sglang.srt.layers.logits_processor import gather_verify_logits
 
             next_token_logits = gather_verify_logits(next_token_logits)
@@ -1089,21 +1139,32 @@ def eagle_sample(
                 tp_group.broadcast(predict, src=0)
                 tp_group.broadcast(accept_index, src=0)
                 tp_group.broadcast(num_correct_drafts, src=0)
-    elif _can_use_sparse_uno_tree_target_sampling(
+    elif db1 is not None or _can_use_sparse_uno_tree_target_sampling(
         uno_target_max_top_k,
         sampling_info,
     ):
         from sglang.srt.speculative.uno_utils import (
+            sample_uno_tree_target_from_support,
             sample_uno_tree_target_tokens,
         )
 
-        target_predict = sample_uno_tree_target_tokens(
-            next_token_logits=next_token_logits,
-            sampling_info=sampling_info,
-            batch_size=bs,
-            verify_width=verify_input.draft_token_num,
-            max_top_k=uno_target_max_top_k,
-        )
+        if db1 is not None:
+            target_predict = sample_uno_tree_target_from_support(
+                support_ids=db1[0],
+                support_logits=db1[1],
+                sampling_info=sampling_info,
+                batch_size=bs,
+                verify_width=verify_input.draft_token_num,
+                max_top_k=uno_target_max_top_k,
+            )
+        else:
+            target_predict = sample_uno_tree_target_tokens(
+                next_token_logits=next_token_logits,
+                sampling_info=sampling_info,
+                batch_size=bs,
+                verify_width=verify_input.draft_token_num,
+                max_top_k=uno_target_max_top_k,
+            )
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
             predicts=predict,
             accept_index=accept_index,
@@ -1281,9 +1342,12 @@ def eagle_sample(
 
             # Use target argmax as the synthetic bonus for non-greedy requests.
             if target_predict is None or sparse_bonus_argmax:
-                target_predict = torch.argmax(next_token_logits, dim=-1).reshape(
-                    bs, verify_input.draft_token_num
-                )
+                if db1 is not None:
+                    target_predict = db1[2].reshape(bs, verify_input.draft_token_num)
+                else:
+                    target_predict = torch.argmax(next_token_logits, dim=-1).reshape(
+                        bs, verify_input.draft_token_num
+                    )
         if simulated_acc_len is not None:
             # Length already sampled on the host; graph-replayable form.
             accept_index = generate_simulated_accept_index_device(
