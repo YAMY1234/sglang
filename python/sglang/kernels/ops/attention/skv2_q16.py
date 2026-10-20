@@ -311,8 +311,6 @@ class Q16SplitDecode:
             for wg in cutlass.range_constexpr(2):
                 if warp // 4 == wg:
                     row = local_tid
-                    f32, dtype = cutlass.Float32, cutlass.Float8E4M3FN
-                    rows, half = self.rows, self.half
                     # Last token this row may see: inside the split and causal within the verify positions.
                     limit = length - self.qlen + row // self.heads
                     if limit > end_tok - 1:
