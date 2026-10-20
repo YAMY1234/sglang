@@ -1205,6 +1205,55 @@ def _log_splitk_engaged(layer_id: int, m: int, slices: int) -> None:
         )
 
 
+# SGLANG_Q35MF_DEP_ROUTED_PRIO_CHECK: per token count, rows checked and rows whose routed output bytes differ.
+_ROUTED_CHECK_FIELDS = ("rows", "rows_differ")
+_routed_check_counts: Optional[torch.Tensor] = None
+_routed_engaged: set[tuple[int, int]] = set()
+
+
+def routed_rerun_check(
+    block: Qwen2MoeSparseMoeBlock, hidden_states: torch.Tensor, routed: torch.Tensor
+) -> None:
+    """Debug: run the routed experts again on the current stream, after the dual-stream join, and count the rows of
+    the concurrent run's output that differ from this isolated run in any byte. Device-side counters only."""
+    global _routed_check_counts
+    m = hidden_states.shape[0]
+    if _routed_check_counts is None:
+        _routed_check_counts = torch.zeros(
+            (_DEP_MAX_TOKENS + 1, len(_ROUTED_CHECK_FIELDS)),
+            dtype=torch.int64,
+            device=hidden_states.device,
+        )
+        start_check_reporter(
+            "SGLANG_Q35MF_DEP_ROUTED_PRIO_CHECK", _routed_check_counts, _ROUTED_CHECK_FIELDS
+        )
+    if m > _DEP_MAX_TOKENS:
+        return
+    # The rerun may write the same combine buffer, so keep the concurrent run's bytes first.
+    a = routed.reshape(m, -1).clone().view(torch.uint8)
+    ref = block._forward_router_experts(hidden_states)
+    b = ref.reshape(m, -1).view(torch.uint8)
+    diff = torch.stack(
+        [
+            torch.full((), m, dtype=torch.int64, device=hidden_states.device),
+            (a != b).any(dim=1).sum(),
+        ]
+    )
+    _routed_check_counts[m].add_(diff)
+    key = (block.layer_id, m)
+    if key not in _routed_engaged:
+        _routed_engaged.add(key)
+        logger.info("SGLANG_Q35MF_DEP_ROUTED_PRIO_CHECK engaged: layer %s, %d tokens", *key)
+
+
+def log_routed_prio_engaged(layer_id: int, m: int) -> None:
+    key = (layer_id, m)
+    if key not in _routed_prio_engaged:
+        _routed_prio_engaged.add(key)
+        logger.info("SGLANG_Q35MF_DEP_ROUTED_PRIO engaged: layer %s, %d tokens", *key)
+
+
+_routed_prio_engaged: set[tuple[int, int]] = set()
 _krne_rows: dict[int, list] = {}
 _krne_done: set[int] = set()
 

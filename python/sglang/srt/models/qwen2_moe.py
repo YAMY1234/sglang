@@ -260,6 +260,19 @@ class Qwen2MoeMLP(nn.Module):
 _K4_GATE_STREAM: Optional[torch.cuda.Stream] = None
 
 
+_ROUTED_PRIO_STREAM: Optional[torch.cuda.Stream] = None
+
+
+def _routed_prio_stream() -> torch.cuda.Stream:
+    """One top-priority stream for the routed experts of the dual-stream MoE (SGLANG_Q35MF_DEP_ROUTED_PRIO)."""
+    global _ROUTED_PRIO_STREAM
+    if _ROUTED_PRIO_STREAM is None:
+        _ROUTED_PRIO_STREAM = torch.cuda.Stream(
+            priority=torch.cuda.Stream.priority_range()[1]
+        )
+    return _ROUTED_PRIO_STREAM
+
+
 def _k4_gate_stream() -> torch.cuda.Stream:
     """One top-priority stream for the shared expert's gate kernel, shared by all MoE blocks."""
     global _K4_GATE_STREAM
@@ -466,6 +479,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             if self.alt_stream is not None
             else 0
         )
+        if self.alt_stream is not None:
+            _routed_prio_stream()  # created before graph capture
         if self._k4_side_prio_max_tokens:
             _k4_gate_stream()  # created before graph capture
         self._ktp2_shared_fused_max_tokens = (
@@ -967,7 +982,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             current_stream.wait_stream(gate_stream)
             return router_output, shared_output
 
-        self.alt_stream.wait_stream(current_stream)
+        # Read per call so CUDA graph variants captured under different values each keep theirs.
+        routed_prio = envs.SGLANG_Q35MF_DEP_ROUTED_PRIO.get()
+        routed_stream = _routed_prio_stream() if routed_prio else self.alt_stream
+        if routed_prio:
+            qwen_router_front.log_routed_prio_engaged(
+                self.layer_id, hidden_states.shape[0]
+            )
+        routed_stream.wait_stream(current_stream)
         shared_output = (
             self._forward_shared_experts(
                 hidden_states.clone(), apply_gate=not use_fused_gate
@@ -992,10 +1014,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 staged = True
         # ===== END TO BE REFACTORED ====
 
-        with torch.cuda.stream(self.alt_stream):
+        with torch.cuda.stream(routed_stream):
             router_output = self._forward_router_experts(hidden_states)
 
-        current_stream.wait_stream(self.alt_stream)
+        current_stream.wait_stream(routed_stream)
+        if envs.SGLANG_Q35MF_DEP_ROUTED_PRIO_CHECK.get():
+            qwen_router_front.routed_rerun_check(self, hidden_states, router_output)
 
         if staged and unstage_shared_expert_add() is None:
             # The dispatch consumed the staging (add already enqueued); skip the caller's add.

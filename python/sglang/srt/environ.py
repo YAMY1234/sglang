@@ -1301,6 +1301,12 @@ class Envs:
     # With SGLANG_Q35MF_DEP_ROUTE_FRONT, from 17 to 64 tokens: split-K router GEMM over this many K slices (8 or 16;
     # 0 = off), fp32 partials summed by the tail; only the logits' fp32 summation order differs from cuBLAS.
     SGLANG_Q35MF_DEP_ROUTE_SPLITK = EnvInt(0)
+    # Dual-stream MoE: the routed experts on a top-priority stream instead of the shared alt stream (scheduling only;
+    # read per call at capture).
+    SGLANG_Q35MF_DEP_ROUTED_PRIO = EnvBool(False)
+    # Debug only: rerun the routed experts on the main stream after the join and count the rows whose output bytes
+    # differ from the concurrent run, logged every 20 s.
+    SGLANG_Q35MF_DEP_ROUTED_PRIO_CHECK = EnvBool(False)
     # Debug only: save up to SGLANG_Q35MF_KRNE_DUMP_ROWS rows of every target MoE layer's input to this directory
     # (global rank 0, eager forwards only).
     SGLANG_Q35MF_KRNE_DUMP_DIR = EnvStr("")
