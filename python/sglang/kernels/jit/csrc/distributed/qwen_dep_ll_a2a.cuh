@@ -25,19 +25,20 @@ inline constexpr uint32_t kDispatchStages = 2;
 inline constexpr uint32_t kCombineStages = 3;
 inline constexpr uint32_t kSpinMax = 1u << 26;
 
-/// \brief Per-call geometry of the NVFP4 dispatch line format and the BF16 combine rows.
-template <uint32_t kRanks, uint32_t kTopK, uint32_t kHidden>
+/// \brief Per-call geometry of the dispatch line format and the BF16 combine rows.
+/// \tparam kX bytes of hidden state per token (H / 2 for NVFP4, 2 H for BF16). \tparam kS scale bytes (0 for BF16).
+template <uint32_t kRanks, uint32_t kTopK, uint32_t kHidden, uint32_t kX, uint32_t kS>
 struct Geometry {
   static_assert(kRanks >= 2 && kRanks <= kMaxRanks);
   static_assert(kTopK == 10, "the combine reproduces FlashInfer's TOP_K = 10 reduction order");
-  static_assert(kHidden % 128 == 0);
-  static constexpr uint32_t kQBytes = kHidden / 2;
-  static constexpr uint32_t kSBytes = kHidden / 16;
+  static_assert(kHidden % 128 == 0 && kX % 8 == 0 && kS % 8 == 0);
+  static constexpr uint32_t kXBytes = kX;
+  static constexpr uint32_t kSBytes = kS;
   static constexpr uint32_t kIdLines = kTopK / 2;
   static constexpr uint32_t kWtLines = kTopK / 2;
-  static constexpr uint32_t kQLines = kQBytes / 8;
+  static constexpr uint32_t kXLines = kXBytes / 8;
   static constexpr uint32_t kSLines = kSBytes / 8;
-  static constexpr uint32_t kLines = kIdLines + kWtLines + kQLines + kSLines;
+  static constexpr uint32_t kLines = kIdLines + kWtLines + kXLines + kSLines;
   static constexpr uint32_t kChunks = kHidden / 8;
 
   SGL_DEVICE_HOST static constexpr uint64_t header_offset(uint32_t stage, uint32_t src) {
@@ -133,9 +134,9 @@ SGL_DEVICE bool has_sentinel(const uint4& v) {
           __vcmpeq2(v.w, 0xFFFFFFFFu)) != 0u;
 }
 
-template <uint32_t kRanks, uint32_t kTopK, uint32_t kHidden, bool kUsePDL>
+template <uint32_t kRanks, uint32_t kTopK, uint32_t kHidden, uint32_t kX, uint32_t kS, bool kUsePDL>
 __global__ __launch_bounds__(kThreads) void dispatch_kernel(const __grid_constant__ DispatchParams p) {
-  using G = Geometry<kRanks, kTopK, kHidden>;
+  using G = Geometry<kRanks, kTopK, kHidden, kX, kS>;
   __shared__ uint32_t s_mask[kMaxTokens];
   __shared__ uint32_t s_tokens[kRanks];
   const uint32_t b = blockIdx.x, grid = gridDim.x, tid = threadIdx.x;
@@ -164,12 +165,12 @@ __global__ __launch_bounds__(kThreads) void dispatch_kernel(const __grid_constan
                                 : make_uint2(static_cast<uint32_t>(p.invalid_id), static_cast<uint32_t>(p.invalid_id));
     } else if (i < G::kIdLines + G::kWtLines) {
       d = *reinterpret_cast<const uint2*>(p.wts + t * kTopK + 2 * (i - G::kIdLines));
-    } else if (i < G::kIdLines + G::kWtLines + G::kQLines) {
+    } else if (i < G::kIdLines + G::kWtLines + G::kXLines) {
       d = *reinterpret_cast<const uint2*>(
-          p.x + static_cast<uint64_t>(t) * G::kQBytes + 8 * (i - G::kIdLines - G::kWtLines));
+          p.x + static_cast<uint64_t>(t) * G::kXBytes + 8 * (i - G::kIdLines - G::kWtLines));
     } else {
       d = *reinterpret_cast<const uint2*>(
-          p.sf + static_cast<uint64_t>(t) * G::kSBytes + 8 * (i - G::kIdLines - G::kWtLines - G::kQLines));
+          p.sf + static_cast<uint64_t>(t) * G::kSBytes + 8 * (i - G::kIdLines - G::kWtLines - G::kXLines));
     }
     st_line(p.peers.base[r] + G::slot_offset(stage, p.rank, t, p.slots) + i * 16, d.x, epoch, d.y, epoch);
   }
@@ -212,19 +213,19 @@ __global__ __launch_bounds__(kThreads) void dispatch_kernel(const __grid_constan
       *reinterpret_cast<uint2*>(p.out_ids + row * kTopK + 2 * i) = d;
     } else if (i < G::kIdLines + G::kWtLines) {
       *reinterpret_cast<uint2*>(p.out_wts + row * kTopK + 2 * (i - G::kIdLines)) = d;
-    } else if (i < G::kIdLines + G::kWtLines + G::kQLines) {
-      *reinterpret_cast<uint2*>(p.out_x + row * G::kQBytes + 8 * (i - G::kIdLines - G::kWtLines)) = d;
+    } else if (i < G::kIdLines + G::kWtLines + G::kXLines) {
+      *reinterpret_cast<uint2*>(p.out_x + row * G::kXBytes + 8 * (i - G::kIdLines - G::kWtLines)) = d;
     } else {
-      *reinterpret_cast<uint2*>(p.out_sf + row * G::kSBytes + 8 * (i - G::kIdLines - G::kWtLines - G::kQLines)) = d;
+      *reinterpret_cast<uint2*>(p.out_sf + row * G::kSBytes + 8 * (i - G::kIdLines - G::kWtLines - G::kXLines)) = d;
     }
   }
   __syncthreads();
   if (tid == 0) p.ctr[b] = static_cast<int32_t>(epoch);
 }
 
-template <uint32_t kRanks, uint32_t kTopK, uint32_t kHidden, bool kUsePDL>
+template <uint32_t kRanks, uint32_t kTopK, uint32_t kHidden, uint32_t kX, uint32_t kS, bool kUsePDL>
 __global__ __launch_bounds__(kThreads) void combine_kernel(const __grid_constant__ CombineParams p) {
-  using G = Geometry<kRanks, kTopK, kHidden>;
+  using G = Geometry<kRanks, kTopK, kHidden, kX, kS>;
   __shared__ uint32_t s_tokens[kRanks];
   const uint32_t b = blockIdx.x, grid = gridDim.x, tid = threadIdx.x;
   device::PDLWaitPrimary<kUsePDL>();
@@ -328,10 +329,11 @@ __global__ __launch_bounds__(kThreads) void combine_kernel(const __grid_constant
 }
 
 /// \brief Host entry points. Peer region bases come as a CPU int64 tensor [ranks].
-/// \tparam kRanks EP ranks. \tparam kTopK experts per token. \tparam kHidden hidden size. \tparam kUsePDL PDL launch.
-template <uint32_t kRanks, uint32_t kTopK, uint32_t kHidden, bool kUsePDL>
+/// \tparam kRanks EP ranks. \tparam kTopK experts per token. \tparam kHidden hidden size.
+/// \tparam kX, kS payload bytes per token (see Geometry). \tparam kUsePDL PDL launch.
+template <uint32_t kRanks, uint32_t kTopK, uint32_t kHidden, uint32_t kX, uint32_t kS, bool kUsePDL>
 struct LlA2A {
-  using G = Geometry<kRanks, kTopK, kHidden>;
+  using G = Geometry<kRanks, kTopK, kHidden, kX, kS>;
 
   static Peers peers_from(const tvm::ffi::TensorView peers) {
     using namespace host;
@@ -367,17 +369,19 @@ struct LlA2A {
     auto C_ = SymbolicSize{"ctas"};
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
-    TensorMatcher({T_, static_cast<int64_t>(G::kQBytes)}).with_dtype<uint8_t>().with_device(device).verify(x);
-    TensorMatcher({T_, static_cast<int64_t>(G::kSBytes)}).with_dtype<uint8_t>().with_device(device).verify(sf);
+    TensorMatcher({T_, static_cast<int64_t>(G::kXBytes)}).with_dtype<uint8_t>().with_device(device).verify(x);
     TensorMatcher({T_, static_cast<int64_t>(kTopK)}).with_dtype<int32_t>().with_device(device).verify(ids);
     TensorMatcher({T_, static_cast<int64_t>(kTopK)}).with_dtype<fp32_t>().with_device(device).verify(wts);
     TensorMatcher({C_}).with_dtype<int32_t>().with_device(device).verify(ctr);
-    TensorMatcher({R_, static_cast<int64_t>(G::kQBytes)}).with_dtype<uint8_t>().with_device(device).verify(out_x);
-    TensorMatcher({R_, static_cast<int64_t>(G::kSBytes)}).with_dtype<uint8_t>().with_device(device).verify(out_sf);
+    TensorMatcher({R_, static_cast<int64_t>(G::kXBytes)}).with_dtype<uint8_t>().with_device(device).verify(out_x);
     TensorMatcher({R_, static_cast<int64_t>(kTopK)}).with_dtype<int32_t>().with_device(device).verify(out_ids);
     TensorMatcher({R_, static_cast<int64_t>(kTopK)}).with_dtype<fp32_t>().with_device(device).verify(out_wts);
     TensorMatcher({static_cast<int64_t>(kRanks)}).with_dtype<int32_t>().with_device(device).verify(recv_tokens);
     TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(err);
+    if constexpr (G::kSBytes > 0) {  // BF16 payloads carry no scales and never read sf / out_sf
+      TensorMatcher({T_, static_cast<int64_t>(G::kSBytes)}).with_dtype<uint8_t>().with_device(device).verify(sf);
+      TensorMatcher({R_, static_cast<int64_t>(G::kSBytes)}).with_dtype<uint8_t>().with_device(device).verify(out_sf);
+    }
     const int64_t tokens = T_.unwrap();
     CHECK_HOST(tokens <= tmax && tmax <= slots && slots <= kMaxTokens)
         << "ll_a2a dispatch: tokens " << tokens << " tmax " << tmax << " slots " << slots;
@@ -403,7 +407,7 @@ struct LlA2A {
     params.experts_per_rank = static_cast<uint32_t>(experts_per_rank);
     params.invalid_id = static_cast<int32_t>(invalid_id);
     LaunchKernel(static_cast<uint32_t>(C_.unwrap()), kThreads, device.unwrap())
-        .enable_pdl(kUsePDL)(dispatch_kernel<kRanks, kTopK, kHidden, kUsePDL>, params);
+        .enable_pdl(kUsePDL)(dispatch_kernel<kRanks, kTopK, kHidden, kX, kS, kUsePDL>, params);
   }
 
   static void combine(
@@ -462,7 +466,7 @@ struct LlA2A {
     params.experts_per_rank = static_cast<uint32_t>(experts_per_rank);
     params.num_experts = static_cast<uint32_t>(num_experts);
     LaunchKernel(static_cast<uint32_t>(C_.unwrap()), kThreads, device.unwrap())
-        .enable_pdl(kUsePDL)(combine_kernel<kRanks, kTopK, kHidden, kUsePDL>, params);
+        .enable_pdl(kUsePDL)(combine_kernel<kRanks, kTopK, kHidden, kX, kS, kUsePDL>, params);
   }
 };
 

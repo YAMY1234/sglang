@@ -1,4 +1,5 @@
-"""Fence-free MoE all-to-all for the FlashInfer dispatcher's NVFP4 decode path (SGLANG_Q35MF_E2X_LLA2A).
+"""Fence-free MoE all-to-all for the FlashInfer dispatcher's decode path: target NVFP4 dispatch
+(SGLANG_Q35MF_E2X_LLA2A) and draft BF16 dispatch (SGLANG_Q35MF_E2X_LLA2A_DRAFT).
 
 Rows reach the MoE runner in the shapes and dtypes FlashInfer's dispatch produces, but at fixed positions:
 source s token t is row s * tmax + t, and every row without an expert on this rank carries the invalid id.
@@ -21,14 +22,16 @@ from sglang.kernels.ops.communication.qwen_dep_ll_a2a import (
 logger = logging.getLogger(__name__)
 
 _CHECK_FIELDS = ("calls", "rows", "dispatch_rows_diff", "combine_rows_diff")
-_state: Optional[LlA2AState] = None
-_check: Optional[LlA2ACheck] = None
+# Per namespace (False = target, True = draft): one state and one checker each.
+_states: dict[bool, LlA2AState] = {}
+_checks: dict[bool, LlA2ACheck] = {}
 
 
 class LlA2AState:
     """Exchange regions (MNNVL, mapped on every EP rank), dense receive rows and per-CTA call counters.
 
-    One instance serves every target MoE layer: their calls run in the same order on every rank.
+    One instance serves every MoE layer of a namespace (target or draft): their calls run in the same order on
+    every rank. payload "nvfp4": x uint8 [tokens, H / 2] + scales uint8 [tokens, H / 16]; "bf16": x bf16 [tokens, H].
     """
 
     def __init__(
@@ -41,10 +44,15 @@ class LlA2AState:
         hidden: int,
         num_experts: int,
         slots: int,
+        payload: str,
     ) -> None:
         from flashinfer.comm.mnnvl import MnnvlMemory
 
         assert 0 < slots <= LL_A2A_MAX_TOKENS and num_experts % ep_size == 0
+        assert payload in ("nvfp4", "bf16")
+        self.payload = payload
+        self.x_bytes = hidden // 2 if payload == "nvfp4" else hidden * 2
+        self.sf_bytes = hidden // 16 if payload == "nvfp4" else 0
         self.ep_rank = ep_rank
         self.ep_size = ep_size
         self.hidden = hidden
@@ -52,7 +60,7 @@ class LlA2AState:
         self.experts_per_rank = num_experts // ep_size
         self.slots = slots
         dispatch_bytes, combine_bytes = ll_a2a_region_bytes(
-            ep_size, top_k, hidden, slots
+            ep_size, top_k, hidden, slots, self.x_bytes, self.sf_bytes
         )
         # MoeAlltoAll's constructor already initialized MNNVL and its communicator for this mapping.
         self._mem = MnnvlMemory(mapping, dispatch_bytes + combine_bytes)
@@ -76,15 +84,16 @@ class LlA2AState:
         self.combine_ctr = torch.zeros(ctas, dtype=torch.int32, device=device)
         self.err = torch.zeros(1, dtype=torch.int32, device=device)
         rows = ep_size * slots
-        self.out_x = torch.empty((rows, hidden // 2), dtype=torch.uint8, device=device)
+        self.out_x = torch.empty((rows, self.x_bytes), dtype=torch.uint8, device=device)
         self.out_sf = torch.empty(
-            (rows, hidden // 16), dtype=torch.uint8, device=device
+            (rows, self.sf_bytes), dtype=torch.uint8, device=device
         )
         self.out_ids = torch.empty((rows, top_k), dtype=torch.int32, device=device)
         self.out_wts = torch.empty((rows, top_k), dtype=torch.float32, device=device)
         self.recv_tokens = torch.zeros(ep_size, dtype=torch.int32, device=device)
         logger.info(
-            "SGLANG_Q35MF_E2X_LLA2A buffers: %d ranks, %d slots, %d + %d bytes, %d CTAs",
+            "SGLANG_Q35MF_E2X_LLA2A buffers (%s): %d ranks, %d slots, %d + %d bytes, %d CTAs",
+            payload,
             ep_size,
             slots,
             dispatch_bytes,
@@ -92,17 +101,23 @@ class LlA2AState:
             ctas,
         )
 
+    def matches(self, x: torch.Tensor, sf: Optional[torch.Tensor]) -> bool:
+        if self.payload == "nvfp4":
+            return sf is not None and x.element_size() == 1
+        return sf is None and x.dtype == torch.bfloat16
+
     def dispatch(
         self,
         *,
         x: torch.Tensor,
-        sf: torch.Tensor,
+        sf: Optional[torch.Tensor],
         ids: torch.Tensor,
         wts: torch.Tensor,
         tmax: int,
         invalid_id: int,
     ) -> list[torch.Tensor]:
-        """Returns x, sf, ids, weights as [ep_size, tmax, ...] views, like MoeAlltoAll.dispatch."""
+        """Returns the received payloads as [ep_size, tmax, ...] views in MoeAlltoAll.dispatch order:
+        x, sf, ids, weights for nvfp4; x, ids, weights for bf16."""
         rows = self.ep_size * tmax
         out = [
             self.out_x[:rows],
@@ -110,6 +125,8 @@ class LlA2AState:
             self.out_ids[:rows],
             self.out_wts[:rows],
         ]
+        if sf is None:
+            sf = x.new_empty((x.shape[0], 0), dtype=torch.uint8)
         ll_a2a_dispatch(
             self.dispatch_peers,
             x.view(torch.uint8),
@@ -125,9 +142,12 @@ class LlA2AState:
             rank=self.ep_rank,
             experts_per_rank=self.experts_per_rank,
             invalid_id=invalid_id,
+            hidden=self.hidden,
         )
         out[0] = out[0].view(x.dtype)
         out[1] = out[1].view(sf.dtype)
+        if self.payload == "bf16":
+            del out[1]
         return [t.view(self.ep_size, tmax, -1) for t in out]
 
     def combine(
@@ -151,6 +171,8 @@ class LlA2AState:
             rank=self.ep_rank,
             experts_per_rank=self.experts_per_rank,
             num_experts=self.num_experts,
+            x_bytes=self.x_bytes,
+            sf_bytes=self.sf_bytes,
         )
         return out
 
@@ -159,7 +181,7 @@ class LlA2ACheck:
     """SGLANG_Q35MF_E2X_LLA2A_CHECK: the stock FlashInfer exchange of the same rows beside the new one, in the same
     (captured) forward. Per local token count: calls, FlashInfer rows compared, dispatch and combine rows that differ."""
 
-    def __init__(self, device: torch.device) -> None:
+    def __init__(self, device: torch.device, tag: str) -> None:
         from sglang.srt.layers.moe.qwen_router_front import start_check_reporter
 
         self.counts = torch.zeros(
@@ -167,7 +189,9 @@ class LlA2ACheck:
             dtype=torch.int64,
             device=device,
         )
-        start_check_reporter("SGLANG_Q35MF_E2X_LLA2A_CHECK", self.counts, _CHECK_FIELDS)
+        start_check_reporter(
+            f"SGLANG_Q35MF_E2X_LLA2A_CHECK {tag}", self.counts, _CHECK_FIELDS
+        )
         self._rows: Optional[torch.Tensor] = None
         self._valid: Optional[torch.Tensor] = None
         self._dispatch_diff: Optional[torch.Tensor] = None
@@ -228,15 +252,13 @@ class LlA2ACheck:
         self._rows = self._valid = self._dispatch_diff = None
 
 
-def get_ll_a2a_state(**kwargs) -> LlA2AState:
-    global _state
-    if _state is None:
-        _state = LlA2AState(**kwargs)
-    return _state
+def get_ll_a2a_state(*, draft: bool, **kwargs) -> LlA2AState:
+    if draft not in _states:
+        _states[draft] = LlA2AState(**kwargs)
+    return _states[draft]
 
 
-def get_ll_a2a_check(device: torch.device) -> LlA2ACheck:
-    global _check
-    if _check is None:
-        _check = LlA2ACheck(device)
-    return _check
+def get_ll_a2a_check(device: torch.device, *, draft: bool) -> LlA2ACheck:
+    if draft not in _checks:
+        _checks[draft] = LlA2ACheck(device, "draft" if draft else "target")
+    return _checks[draft]
