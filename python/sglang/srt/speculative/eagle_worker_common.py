@@ -608,6 +608,7 @@ def run_eagle_verify(
     uno_target_max_top_k: Optional[int] = None,
     post_verify_graphs: Optional[EaglePostVerifyGraphs] = None,
     simulated_acc_len_rng: Optional[torch.Generator] = None,
+    sparse_bonus_argmax: bool = False,
 ) -> GenerationBatchResult:
     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
 
@@ -722,6 +723,7 @@ def run_eagle_verify(
             verify_input=verify_input,
             logits_output=logits_output,
             can_run_cuda_graph=can_run_cuda_graph,
+            max_top_k=uno_target_max_top_k,
         )
     )
     if post is not None:
@@ -776,6 +778,7 @@ def run_eagle_verify(
             == TreeMaskMode.FULL_MASK
         ),
         simulated_acc_len_rng=simulated_acc_len_rng,
+        sparse_bonus_argmax=sparse_bonus_argmax,
     )
     fused_commit_outputs = predict.is_cuda and not batch.forward_mode.is_idle()
     prepared_commit_steps = prepared_draft_inputs = None
