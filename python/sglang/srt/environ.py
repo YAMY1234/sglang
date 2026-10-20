@@ -1144,6 +1144,10 @@ class Envs:
     # Draft-model q1 decode with trtllm-gen's KV split and rounding plus a separate merge, from this KV length.
     SGLANG_Q35MF_MKA_Q1 = EnvBool(False)
     SGLANG_Q35MF_MKA_Q1_MIN_LENGTH = EnvInt(16384)
+    # TP2 target verify (16 query heads per KV head, 7 positions) on the q16 split-KV producer for batches of
+    # up to MAX_B requests; both are read per call, so A/B graph variants can switch them.
+    SGLANG_Q35MF_TP2_SKV2 = EnvBool(False)
+    SGLANG_Q35MF_TP2_SKV2_MAX_B = EnvInt(3)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
 
     # ===================================================================

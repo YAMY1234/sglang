@@ -392,6 +392,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             ).multi_processor_count
         )
         self._q1_plans = {}
+        self._q16_device = torch.cuda.get_device_capability()[0] == 10
+        self._q16_plans = {}
 
         # Init backend (XQA or TRTLLM-GEN)
         # We need to specify q_type and out_type for different backend
@@ -1491,6 +1493,50 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             out=out,
         )
 
+    def _run_q16(
+        self, query, kv_cache, block_tables, seq_lens, *, out, qk_scale, v_scale
+    ):
+        from sglang.kernels.ops.attention.skv2_q16 import (
+            Q16SplitPlan,
+            skv2_q16_verify,
+        )
+
+        key = (
+            query.shape,
+            kv_cache[0].shape,
+            block_tables.shape,
+            block_tables.stride(),
+            seq_lens.shape,
+        )
+        plan = self._q16_plans.get(key)
+        if plan is None:
+            # Compiles the producer; graph warmup runs this eagerly before capture.
+            # 148 // B splits per request, 128-column merge tiles: the configuration measured in T1.
+            bs = seq_lens.numel()
+            plan = Q16SplitPlan(
+                query,
+                kv_cache,
+                block_tables,
+                seq_lens,
+                splits=148 // bs,
+                merge_tile=128,
+                merge_warps=4,
+            )
+            self._q16_plans[key] = plan
+            logger.info(
+                "TP2 SKV2-Q16 verify active (bs=%d, splits=%d)", bs, plan.splits
+            )
+        return skv2_q16_verify(
+            query,
+            kv_cache,
+            block_tables,
+            seq_lens,
+            plan,
+            qk_scale=qk_scale,
+            v_scale=v_scale,
+            out=out,
+        )
+
     def _run_fixed_q_len_decode(
         self,
         query: torch.Tensor,
@@ -1511,6 +1557,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         use_paged_fp8: bool = False,
         use_skv2: bool = False,
         use_q1: bool = False,
+        use_q16: bool = False,
     ) -> torch.Tensor:
         """Run decode, optionally sorting and splitting requests by KV length."""
 
@@ -1519,6 +1566,62 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             if out_dtype is not None
             else (out.dtype if out is not None else self.q_data_type)
         )
+
+        if use_q16 and self._q16_device and envs.SGLANG_Q35MF_TP2_SKV2.get():
+            num_requests = seq_lens.numel()
+            supported = (
+                not self.is_xqa_impl
+                and get_parallel().attn_dcp_size == 1
+                and self.page_size == 64
+                and q_len_per_req == 7
+                and query.shape == (num_requests * 7, 16, 256)
+                and query.dtype == torch.float8_e4m3fn
+                and query.is_contiguous()
+                and isinstance(kv_cache, tuple)
+                and len(kv_cache) == 2
+                and all(
+                    x.dtype == query.dtype
+                    and x.ndim == 4
+                    and x.shape[1:] == (1, 64, 256)
+                    and x.is_contiguous()
+                    for x in kv_cache
+                )
+                and block_tables.dtype == torch.int32
+                and seq_lens.dtype == torch.int32
+                and resolved_out_dtype == torch.bfloat16
+                and (
+                    out is None
+                    or (
+                        out.is_contiguous()
+                        and out.shape == query.shape
+                        and out.dtype == resolved_out_dtype
+                    )
+                )
+                and isinstance(bmm1_scale, (int, float))
+                and isinstance(bmm2_scale, (int, float))
+                and window_left < 0
+                and sinks is None
+                and mask is None
+                and kv_cache_sf is None
+                and envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get()
+                in (None, 0.0)
+            )
+            if supported and num_requests <= envs.SGLANG_Q35MF_TP2_SKV2_MAX_B.get():
+                if out is None:
+                    out = torch.empty_like(query, dtype=resolved_out_dtype)
+                return self._run_q16(
+                    query,
+                    kv_cache,
+                    block_tables,
+                    seq_lens,
+                    out=out,
+                    qk_scale=float(bmm1_scale),
+                    v_scale=float(bmm2_scale),
+                )
+            if not supported:
+                logger.warning_once(
+                    "SKV2-Q16 is unsupported for this configuration; using trtllm-gen."
+                )
 
         if self._q1_enabled and use_q1:
             num_requests = seq_lens.numel()
@@ -2153,6 +2256,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                         )
                         and use_paged_fp8_attention(forward_batch)
                     ),
+                    use_q16=forward_batch.forward_mode.is_target_verify(),
                 )
         elif self.use_fmha_v2 and not cp_active:
             # CP must go through cp_strategy.run_attention (per-shard
