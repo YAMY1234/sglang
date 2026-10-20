@@ -1798,6 +1798,9 @@ class Envs:
     # Decode / verify graph replays whose metadata glue graph is captured skip the
     # replay ForwardBatch view (the graph reads slots and buffers by address).
     SGLANG_OPT_SKIP_GLUED_REPLAY_VIEW = EnvBool(False)
+    # With SGLANG_OPT_DSV41_TARGET_METADATA_EARLY: issue the stage at the decode head,
+    # before the draft graph's launch, instead of right after it.
+    SGLANG_OPT_DSV41_TARGET_METADATA_EARLY_AT_HEAD = EnvBool(False)
     # DSpark static verify: record the post-verify engram history commit in the
     # target-verify CUDA graph (epilogue) instead of launching it after the replay.
     SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH = EnvBool(False)

@@ -362,6 +362,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             and torch.device(self.device).type == "cuda"
             else None
         )
+        # Where the host issues that stage: right after the draft graph's launch
+        # (default), or at the head, before it (SGLANG_OPT_DSV41_TARGET_METADATA_EARLY_AT_HEAD).
+        self._stage_verify_metadata_at_head = (
+            envs.SGLANG_OPT_DSV41_TARGET_METADATA_EARLY_AT_HEAD.get()
+        )
         static_epilogue_supported = (
             target_is_dsv41
             and self._verify_planner.mode_value == "static"
@@ -1029,6 +1034,12 @@ class DSparkWorkerV2(BaseSpecWorker):
         if self._verify_inputs_ready is not None:
             # The verify's inputs are final here; the early metadata waits for this.
             self._verify_inputs_ready.record()
+            if self._stage_verify_metadata_at_head:
+                self._stage_target_verify_metadata(
+                    batch=batch,
+                    verify_window=verify_window,
+                    seq_lens_cpu=window_seq_lens_cpu,
+                )
 
         sampling_info = batch.sampling_info
         # Simulated acceptance overrides correct_len, so only the bonus token needs the
@@ -1057,7 +1068,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                 sampling_info=sampling_info,
                 anchor_prepared=anchor_ids is not None,
             )
-        if self._verify_inputs_ready is not None:
+        if (
+            self._verify_inputs_ready is not None
+            and not self._stage_verify_metadata_at_head
+        ):
             self._stage_target_verify_metadata(
                 batch=batch,
                 verify_window=verify_window,
