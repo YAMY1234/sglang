@@ -1321,6 +1321,9 @@ class Envs:
     SGLANG_Q35MF_KRNC_ROUTER_PF_CORE = EnvBool(False)
     # The same router weight prefetch, forked before the post-attention norm on every MoE layer (read at capture).
     SGLANG_Q35MF_KRNC_ROUTER_PF_PRE = EnvBool(False)
+    # GDN ReplaySSM compact commit without track rows: one persistent launch whose programs each walk one request's
+    # (layer, head, V block) tiles with pipelined loads; same per-tile math (read at capture).
+    SGLANG_Q35MF_KRNC_COMMIT_PERSIST = EnvBool(False)
     # In-graph shadow checks for the switches above: rows whose outputs differ in any byte, logged every 30 s.
     SGLANG_Q35MF_KRNC_PROOF = EnvBool(False)
     # FlashInfer A2A NVFP4 dispatch of target MoE layers at up to SGLANG_Q35MF_E2X_LLA2A_MAX_TOKENS tokens per rank:

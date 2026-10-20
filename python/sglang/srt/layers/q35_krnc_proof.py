@@ -4,7 +4,9 @@ h0_pf:    the GDN verify with SGLANG_Q35MF_KRNC_H0_PF against the stock verify l
 in_proj:  the GDN in_proj output after the SGLANG_Q35MF_KRNC_L2PF_LL prefetch against the same GEMM rerun;
 out_proj: the GDN out_proj output after the SGLANG_Q35MF_KRNC_OPROJ_PF prefetch against the same GEMM rerun;
 router:   the DEP router logits from the stock gate GEMM after a SGLANG_Q35MF_KRNC_ROUTER_PF_* prefetch against the
-          same GEMM rerun.
+          same GEMM rerun;
+commit:   three layers' checkpoint rows after the SGLANG_Q35MF_KRNC_COMMIT_PERSIST fold against the stock compact
+          commit kernel run on copies of the same rows.
 Each check counts rows whose outputs differ in any byte; device counters are mirrored into pinned host memory by a
 copy that is part of the check, and a thread logs them every 30 s without CUDA calls (as q35_bundle_proof).
 """
@@ -24,7 +26,7 @@ _PROOF = None
 
 class KrncProof:
     PERIOD_S = 30.0
-    KINDS = ("h0_pf", "in_proj", "out_proj", "router")
+    KINDS = ("h0_pf", "in_proj", "out_proj", "router", "commit")
 
     def __init__(self):
         # [kind][calls, rows, mismatched rows]
