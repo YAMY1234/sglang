@@ -480,3 +480,19 @@ register_kernel(
         ),
     )
 )
+
+register_kernel(
+    KernelSpec(
+        op="attention.trtllm_dep16_verify_cta8",
+        backend=KernelBackend.FLASHINFER,
+        target="sglang.kernels.ops.attention.dep16_verify_cta8:trtllm_dep16_verify_cta8",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(10, 3), max_sm=(10, 3))}
+        ),
+        format_signature=FormatSignature(
+            supported_dtypes=("float8_e4m3fn",),
+            description="FP8 Q/K/V, BF16 O, q7, Q32/KV2, H256, page64, B10..16",
+        ),
+        description="Opt-in native DEP16 verify launcher with eight KV CTAs",
+    )
+)
