@@ -82,6 +82,14 @@ def current():
     return PATTERN[(_round // BLOCK) % len(PATTERN)]
 
 
+def flag(name, default):
+    """The current variant's boolean override of env switch `name`, else `default` (measurement only)."""
+    if not VARIANTS:
+        return default
+    v = VARIANTS[current()].get(name)
+    return default if v is None else str(v).lower() in ("1", "true")
+
+
 def round_index():
     return _round
 

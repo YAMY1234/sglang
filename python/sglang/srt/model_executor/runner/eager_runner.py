@@ -182,7 +182,11 @@ class EagerRunner(BaseRunner):
         """Copy the live batch into the fixed-max eager static buffers (sliced to
         this batch's shape) — the eager counterpart of the cuda-graph runners'
         load_batch."""
-        if envs.SGLANG_EAGER_INPUT_NO_COPY.get():
+        from sglang.srt.model_executor.runner_backend import ab_variants
+
+        if ab_variants.flag(
+            "SGLANG_EAGER_INPUT_NO_COPY", envs.SGLANG_EAGER_INPUT_NO_COPY.get()
+        ):
             return replace(forward_batch)
         raw_bs = forward_batch.batch_size
         if forward_batch.input_ids is not None:

@@ -130,20 +130,20 @@ def _count_acceptance_calls():
 
 
 class _Slot:
-    def __init__(self):
+    def __init__(self, one_launch_load: bool = _ONE_LAUNCH_LOAD):
         self.graph: Optional[torch.cuda.CUDAGraph] = None
         self.commit_graph: Optional[torch.cuda.CUDAGraph] = None
         self.inputs: Dict[str, torch.Tensor] = {}
         self.outputs: Optional[Tuple] = None
         self.load_plan = (
-            SmallFieldCopyPlan(allow_pinned_src=True) if _ONE_LAUNCH_LOAD else None
+            SmallFieldCopyPlan(allow_pinned_src=True) if one_launch_load else None
         )
 
 
 class _KeyState:
-    def __init__(self):
+    def __init__(self, one_launch_load: bool = _ONE_LAUNCH_LOAD):
         self.warmups = 0
-        self.slots = [_Slot(), _Slot()]
+        self.slots = [_Slot(one_launch_load), _Slot(one_launch_load)]
         self.turn = 0
 
 
@@ -225,7 +225,9 @@ class PostVerifyGraph:
         db1 = self._db1_variant()
         # The graph reads the verify logits in place, and the verify runner may hold
         # several logits buffers per batch size, so graphs are kept per buffer.
-        state_key = (key, logits_output.next_token_logits.data_ptr(), db1)
+        # Same-service A/B harness (measurement only): N3C's one-launch load per variant (kept last: _run reads it).
+        n3c = ab_variants.flag("SGLANG_Q35MF_MKH_N3C", _ONE_LAUNCH_LOAD)
+        state_key = (key, logits_output.next_token_logits.data_ptr(), db1, n3c)
         if state_key not in self._states and len(self._states) >= _MAX_STATES:
             self._count_round(None)
             return None
@@ -387,7 +389,7 @@ class PostVerifyGraph:
     def _run(self, state_key, batch, verify_input, logits_output, num_draft_tokens):
         st = self._states.get(state_key)
         if st is None:
-            st = self._states[state_key] = _KeyState()
+            st = self._states[state_key] = _KeyState(state_key[-1])
         slot = st.slots[st.turn]
         st.turn ^= 1
         inputs = self._gather_inputs(batch, verify_input)

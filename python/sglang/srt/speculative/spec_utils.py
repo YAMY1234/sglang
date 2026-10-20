@@ -942,9 +942,15 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
             "lazy spec verify without a track plan: mamba_lazy_spec_prepare "
             "must run in prepare_for_decode for every spec decode iteration"
         )
-    if track_positions is None and _REUSE_VERIFY_TRACK_INDICES:
+    from sglang.srt.model_executor.runner_backend import ab_variants
+
+    if track_positions is None and ab_variants.flag(
+        "SGLANG_Q35MF_MKH_N3B", _REUSE_VERIFY_TRACK_INDICES
+    ):
         _set_track_indices_reusing_last(batch)
     else:
+        global _last_verify_track
+        _last_verify_track = None
         set_mamba_track_indices_from_reqs(batch, track_positions)
     batch.mamba_track_mask = None
     batch.mamba_track_seqlens = None
