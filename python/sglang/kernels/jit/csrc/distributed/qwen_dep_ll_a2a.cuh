@@ -214,14 +214,16 @@ __global__ __launch_bounds__(kThreads) void dispatch_kernel(const __grid_constan
     uint4 v;
     uint32_t spins = 0;
     uint64_t since = 0;
+    const uint8_t* line = slot + i * 16;
+    v = ld_line(line);
     if (i >= G::kIdLines) {
       // Line 0 carries the first id: the invalid id means the source sent only the id lines.
-      for (v = ld_line(slot); v.y != epoch || v.w != epoch; v = ld_line(slot))
+      uint4 v0 = ld_line(slot);
+      for (; v0.y != epoch || v0.w != epoch; v0 = ld_line(slot))
         wait_tick(spins, since, p.err, 2);
-      if (static_cast<int32_t>(v.x) == p.invalid_id) continue;
+      if (static_cast<int32_t>(v0.x) == p.invalid_id) continue;
     }
-    const uint8_t* line = slot + i * 16;
-    for (v = ld_line(line); v.y != epoch || v.w != epoch; v = ld_line(line))
+    for (; v.y != epoch || v.w != epoch; v = ld_line(line))
       wait_tick(spins, since, p.err, 2);
     const uint2 d = make_uint2(v.x, v.z);
     const uint64_t row = static_cast<uint64_t>(s) * p.tmax + t;
