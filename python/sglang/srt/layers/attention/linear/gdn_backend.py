@@ -141,6 +141,18 @@ _E2X_TP2_VERIFY_LAUNCH = {
     16: (64, 1, 2, None, 64),
 }
 
+# TP4 (4 key / 16 value heads per rank): same entry layout, chain and byte-identity gate.
+_TPX_TP4_VERIFY_LAUNCH = {
+    1: (32, 2, 3, None, 64),
+    2: (32, 2, 3, None, 128),
+    3: (32, 2, 3, None, 128),
+    4: (64, 2, 3, None, 128),
+    5: (64, 2, 2, None, 64),
+    6: (64, 2, 2, None, 64),
+    7: (64, 2, 2, None, 64),
+    8: (64, 2, 2, None, 64),
+}
+
 
 def _e2x_tp2_verify_launch(
     *,
@@ -150,12 +162,13 @@ def _e2x_tp2_verify_launch(
     draft_token_num: int,
     batch_size: int,
 ) -> Optional[Tuple[int, int, int, Optional[int], int]]:
-    """Per-batch TP2 verify launch override; None keeps the stock launch."""
-    if not envs.SGLANG_Q35MF_E2X_TP2_GDN.get():
-        return None
-    if (num_k_heads, num_v_heads, head_dim, draft_token_num) != (8, 32, 128, 7):
-        return None
-    return _E2X_TP2_VERIFY_LAUNCH.get(batch_size)
+    """Per-batch TP2 / TP4 verify launch override; None keeps the stock launch."""
+    shape = (num_k_heads, num_v_heads, head_dim, draft_token_num)
+    if shape == (8, 32, 128, 7) and envs.SGLANG_Q35MF_E2X_TP2_GDN.get():
+        return _E2X_TP2_VERIFY_LAUNCH.get(batch_size)
+    if shape == (4, 16, 128, 7) and envs.SGLANG_Q35MF_TPX_TP4_GDN.get():
+        return _TPX_TP4_VERIFY_LAUNCH.get(batch_size)
+    return None
 
 
 class GDNMISMetadata(msgspec.Struct, frozen=True):
@@ -2072,7 +2085,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ):
                     verify_options["wait_for_gate_producer"] = True
             print_info_once(
-                "E2X TP2 GDN verify launch table active: "
+                "E2X GDN verify launch table active: "
                 f"batch={query_start_loc.numel() - 1}, launch={e2x_launch}"
             )
         if wait_for_gate_producer:
