@@ -1,8 +1,10 @@
-"""SGLANG_DSPARK_DEFER_CONTEXT_KV: the staged draft context-KV commit replays exactly the
-injection the static verify graph would have run, once, and is written before any
-draft forward that would not write it itself (eager, a graph without the fork, or a
-graph whose rows miss staged ones)."""
+"""SGLANG_DSPARK_DEFER_CONTEXT_KV: the staged draft context-KV stores replay exactly the
+stores the static verify graph would have run (same projected KV, same locations from
+the same commit lengths), once, and run before any draft forward that would not run
+them itself (eager, a graph without the fork, or a graph whose rows miss staged ones);
+a static epilogue whose graph forked no projection keeps the inline commit."""
 
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -21,81 +23,98 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-MAX_BS, STRIDE, HIDDEN, VOCAB = 4, 3, 8, 32
+MAX_BS, STRIDE, KV_WIDTH, VOCAB, HIDDEN = 4, 3, 8, 32, 6
 
 
 class _Injector:
     swa_ring_size = None
 
     def __init__(self):
-        self.calls = []
+        self.stores = []
+        self.inline = []
+        pool = SimpleNamespace(set_swa_key_buffer_radix_fused_norm_rope=None)
+        self.draft_model_runner = SimpleNamespace(token_to_kv_pool=pool)
+        self.draft_model = SimpleNamespace(store_commit_kv=self._store)
+
+    def committed_swa_loc(self, *, cache_loc, cache_loc_2d, commit_lens, **_):
+        col = torch.arange(cache_loc_2d.shape[1]).view(1, -1)
+        committed = (col < commit_lens.long().view(-1, 1)).reshape(-1)
+        return torch.where(committed, cache_loc, torch.full_like(cache_loc, -1))
+
+    def _store(self, *, kvs, swa_loc, positions, pool):
+        self.stores.append(
+            dict(
+                kvs=[k.clone() for k in kvs],
+                swa_loc=swa_loc.clone(),
+                positions=positions.clone(),
+            )
+        )
 
     def inject_target_hidden(self, **kw):
-        self.calls.append(
-            {k: (v.clone() if torch.is_tensor(v) else v) for k, v in kw.items()}
-        )
+        self.inline.append(kw)
 
 
 def _commit(injector):
-    return DeferredContextCommit(
-        max_bs=MAX_BS,
-        stride=STRIDE,
-        hidden_width=HIDDEN,
-        hidden_dtype=torch.float32,
-        device="cpu",
-        kv_injector=injector,
-        with_state_slot=False,
+    commit = DeferredContextCommit(
+        max_bs=MAX_BS, stride=STRIDE, device="cpu", kv_injector=injector
     )
+    # What the forked projection leaves: per-stage KV of the verify rows.
+    commit.kvs = [torch.randn(MAX_BS * STRIDE, KV_WIDTH) for _ in range(3)]
+    return commit
 
 
-def _staged(bs):
+def _stage(commit, bs):
     n = bs * STRIDE
-    return dict(
-        target_hidden=torch.randn(n, HIDDEN),
+    lens = torch.tensor([2, 0, 3][:bs], dtype=torch.int32)
+    commit.stage(
         cache_loc=torch.arange(100, 100 + n),
         positions=torch.arange(n) + 7,
-        commit_lens=torch.tensor([2, 0, 3][:bs], dtype=torch.int32),
+        commit_lens=lens,
         state_slot=None,
     )
+    return lens
 
 
 class TestDeferredCommit(CustomTestCase):
-    def test_write_replays_the_inline_injection_once(self):
+    def test_write_runs_the_inline_stores_once(self):
         injector = _Injector()
         commit = _commit(injector)
-        x = _staged(3)
-        commit.stage(**x)
+        lens = _stage(commit, 3)
         commit.note_static_verify(3)
         commit.flush()
-        (call,) = injector.calls
-        self.assertTrue(torch.equal(call["target_hidden"][:9], x["target_hidden"]))
-        self.assertTrue(torch.equal(call["cache_loc"][:9], x["cache_loc"]))
-        self.assertTrue(torch.equal(call["positions"][:9], x["positions"]))
-        self.assertTrue(torch.equal(call["commit_lens"][:3], x["commit_lens"]))
-        # Requests past the staged ones write nothing.
-        self.assertTrue(bool((call["commit_lens"][3:] == 0).all()))
-        self.assertEqual(tuple(call["cache_loc_2d"].shape), (MAX_BS, STRIDE))
-        # Disarmed and no longer pending: a second flush writes nothing.
+        (store,) = injector.stores
+        n = MAX_BS * STRIDE
+        for got, kv in zip(store["kvs"], commit.kvs):
+            self.assertTrue(torch.equal(got, kv[:n]))
+        loc = commit.cache_loc.clone()
+        expect = injector.committed_swa_loc(
+            cache_loc=loc,
+            cache_loc_2d=loc.view(MAX_BS, STRIDE),
+            commit_lens=torch.cat([lens, torch.zeros(1, dtype=torch.int32)]),
+        )
+        self.assertTrue(torch.equal(store["swa_loc"], expect))
+        # Requests past the staged ones store nothing.
+        self.assertTrue(bool((store["swa_loc"][9:] == -1).all()))
         self.assertFalse(commit.pending)
         self.assertTrue(bool((commit.commit_lens == 0).all()))
         commit.flush()
-        self.assertEqual(len(injector.calls), 1)
+        self.assertEqual(len(injector.stores), 1)
 
     def test_flush_before_every_draft_forward_that_would_miss_it(self):
         for graph_bs, forked, staged, flushes in (
             (None, set(), 2, True),  # eager draft
             (4, set(), 2, True),  # graph captured without the fork
             (2, {2}, 3, True),  # graph rows miss staged requests
-            (4, {4}, 3, False),  # the graph writes it
+            (4, {4}, 3, False),  # the graph runs the stores
         ):
             with self.subTest(graph_bs=graph_bs, forked=forked, staged=staged):
                 injector = _Injector()
                 commit = _commit(injector)
                 commit._forked_bs = set(forked)
-                commit.stage(**_staged(3))
+                _stage(commit, 3)
                 commit.note_static_verify(staged)
                 commit.before_draft_forward(graph_bs=graph_bs)
-                self.assertEqual(len(injector.calls), int(flushes))
+                self.assertEqual(len(injector.stores), int(flushes))
                 commit.after_draft_forward(graph_ran=graph_bs is not None)
                 self.assertFalse(commit.pending)
 
@@ -117,10 +136,11 @@ class TestDeferredCommit(CustomTestCase):
                 )
 
 
-class TestEpilogueStagesInsteadOfInjecting(CustomTestCase):
-    def test_static_epilogue_stages(self):
+class TestEpilogueStagesOnlyAfterItsProjection(CustomTestCase):
+    def _run(self, projected: bool):
         injector = _Injector()
-        pool = SimpleNamespace(set_swa_key_buffer_radix_fused_norm_rope=None)
+        commit = _commit(injector)
+        commit.join_projection = lambda: projected
         epilogue = DsparkVerifyEpilogue(
             max_bs=MAX_BS,
             verify_num_draft_tokens=STRIDE,
@@ -129,11 +149,11 @@ class TestEpilogueStagesInsteadOfInjecting(CustomTestCase):
             commit_ctx=CommitInjectCtx(
                 draft_model=None,
                 block_pos_offsets=torch.arange(STRIDE),
-                resolve_pool=lambda: pool,
+                resolve_pool=lambda: injector.draft_model_runner.token_to_kv_pool,
                 resolve_req_to_token=lambda: None,
                 kv_injector=injector,
             ),
-            defer_context_kv=True,
+            deferred_commit=commit,
         )
         bs = 2
         epilogue.begin_static_step(bs, armed=True)
@@ -151,19 +171,94 @@ class TestEpilogueStagesInsteadOfInjecting(CustomTestCase):
             req_pool_indices=torch.tensor([1, 2]),
         )
         epilogue._static_epilogue(out, fb)
-        self.assertEqual(injector.calls, [])
-        commit = epilogue.deferred_commit
-        self.assertIsNotNone(commit)
-        self.assertTrue(torch.equal(commit.hidden[: bs * STRIDE], out.hidden_states))
+        return injector, commit, epilogue, bs
+
+    def test_projected_graph_stages_the_stores(self):
+        injector, commit, epilogue, bs = self._run(projected=True)
+        self.assertEqual(injector.inline, [])
         self.assertTrue(
             torch.equal(
                 commit.commit_lens[:bs],
                 epilogue.read_accept(bs).commit_lens.to(torch.int32),
             )
         )
-        epilogue.note_static_verify(bs)
-        commit.flush()
-        self.assertEqual(len(injector.calls), 1)
+        self.assertTrue(
+            torch.equal(commit.cache_loc[: bs * STRIDE], torch.arange(6) + 50)
+        )
+
+    def test_graph_without_projection_keeps_the_inline_commit(self):
+        injector, commit, _, _ = self._run(projected=False)
+        self.assertEqual(len(injector.inline), 1)
+        self.assertTrue(bool((commit.commit_lens == 0).all()))
+
+
+_TRITON_DEVICE = (
+    "cuda"
+    if torch.cuda.is_available()
+    else ("cpu" if os.environ.get("TRITON_INTERPRET") == "1" else None)
+)
+
+
+@unittest.skipIf(_TRITON_DEVICE is None, "needs CUDA or TRITON_INTERPRET=1")
+class TestOneLaunchStage(CustomTestCase):
+    def test_one_launch_writes_what_the_copies_write(self):
+        """The staging kernel leaves every staged buffer equal to the copies and the
+        zero tail, with and without state slots, at bs 1 and a partial bs."""
+        from sglang.kernels.ops.speculative.dspark.stage_commit import stage_commit
+
+        dev, max_bs, stride = _TRITON_DEVICE, 4, 6
+        rows = max_bs * stride
+        for bs in (1, 3):
+            for with_slot in (False, True):
+                with self.subTest(bs=bs, with_slot=with_slot):
+                    n = bs * stride
+                    src = dict(
+                        cache_loc=torch.arange(n, device=dev) + 100,
+                        positions=torch.arange(n, device=dev) + 7,
+                        commit_lens=torch.arange(
+                            1, bs + 1, dtype=torch.int32, device=dev
+                        ),
+                        state_slot=(torch.arange(n, device=dev) + 3)
+                        if with_slot
+                        else None,
+                    )
+
+                    def bufs():
+                        return dict(
+                            cache_loc=torch.full(
+                                (rows,), -1, dtype=torch.int64, device=dev
+                            ),
+                            positions=torch.full(
+                                (rows,), -1, dtype=torch.int64, device=dev
+                            ),
+                            commit_lens=torch.full(
+                                (max_bs,), 9, dtype=torch.int32, device=dev
+                            ),
+                            state_slot=torch.full(
+                                (rows,), -1, dtype=torch.int64, device=dev
+                            )
+                            if with_slot
+                            else None,
+                        )
+
+                    ref, got = bufs(), bufs()
+                    ref["cache_loc"][:n].copy_(src["cache_loc"])
+                    ref["positions"][:n].copy_(src["positions"])
+                    ref["commit_lens"][:bs].copy_(src["commit_lens"])
+                    ref["commit_lens"][bs:].zero_()
+                    if with_slot:
+                        ref["state_slot"][:n].copy_(src["state_slot"])
+                    stage_commit(
+                        cache_loc_dst=got["cache_loc"],
+                        positions_dst=got["positions"],
+                        commit_lens_dst=got["commit_lens"],
+                        state_slot_dst=got["state_slot"],
+                        rows=n,
+                        **src,
+                    )
+                    for name, want in ref.items():
+                        if want is not None:
+                            self.assertTrue(torch.equal(got[name], want), name)
 
 
 if __name__ == "__main__":

@@ -559,7 +559,7 @@ class DsparkVerifyEpilogue:
         fused_accept_tail: bool = False,
         accept_tail_min_bs: int = 1,
         accept_tail_max_bs: int = 0,
-        defer_context_kv: bool = False,
+        deferred_commit: Optional[DeferredContextCommit] = None,
         post_fold: bool = False,
     ) -> None:
         self.max_bs = int(max_bs)
@@ -567,10 +567,9 @@ class DsparkVerifyEpilogue:
         # and the bonus into the FutureMap's slots; built at the first warmup.
         self._post_fold = bool(post_fold)
         self.future_relay: Optional[FutureRelayBuffers] = None
-        # SGLANG_DSPARK_DEFER_CONTEXT_KV: static graphs stage the draft-KV commit into
-        # this, built at the first warmup; the next draft forward writes it.
-        self._defer_context_kv = bool(defer_context_kv)
-        self.deferred_commit: Optional[DeferredContextCommit] = None
+        # SGLANG_DSPARK_DEFER_CONTEXT_KV: static graphs join its forked projection and
+        # stage the commit's stores into it; the next draft forward runs them.
+        self.deferred_commit = deferred_commit
         # SGLANG_SIMULATE_ACC_LEN with a sampled bonus inside the graph too: the bonus
         # is drawn at the simulated correct_len from these buffers, which
         # begin_sim_bonus writes before replay (<= 0 temperature: argmax).
@@ -743,9 +742,9 @@ class DsparkVerifyEpilogue:
                 .expand(bs, self.stride)
                 .reshape(-1)
             )
-        if self._defer_context_kv:
-            self._stage_commit(
-                target_hidden=out.hidden_states,
+        commit = self.deferred_commit
+        if commit is not None and commit.join_projection():
+            commit.stage(
                 cache_loc=cache_loc,
                 positions=forward_batch.positions,
                 commit_lens=gated_commit_lens,
@@ -810,7 +809,8 @@ class DsparkVerifyEpilogue:
     def _sim_bonus_args(self, logits, bs: int) -> dict:
         return dict(
             target_logits=logits,
-            correct_len=self.simulated_correct_len.repeat(bs),
+            # One length for every request: a stride-0 view, no copy node in the graph.
+            correct_len=self.simulated_correct_len.expand(bs),
             temperatures=self.sim_temperatures_buf[:bs],
             seed=self.sim_seed_buf,
             bs=bs,
@@ -835,22 +835,6 @@ class DsparkVerifyEpilogue:
             "sim-fold" if self.simulate_fold else "argmax",
             "inputs" if bonus_in is not None else "off",
         )
-
-    def _stage_commit(self, *, target_hidden, **staged) -> None:
-        if self.deferred_commit is None:
-            assert not (
-                torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
-            ), "the deferred commit's staging is built at a warmup, before capture"
-            self.deferred_commit = DeferredContextCommit(
-                max_bs=self.max_bs,
-                stride=self.stride,
-                hidden_width=target_hidden.shape[1],
-                hidden_dtype=target_hidden.dtype,
-                device=target_hidden.device,
-                kv_injector=self.commit_ctx.kv_injector,
-                with_state_slot=staged["state_slot"] is not None,
-            )
-        self.deferred_commit.stage(target_hidden=target_hidden, **staged)
 
     def note_static_verify(self, bs: int) -> None:
         """Host, after a static verify graph replayed ``bs`` requests."""
