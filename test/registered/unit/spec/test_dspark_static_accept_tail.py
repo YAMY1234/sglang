@@ -4,6 +4,7 @@ and the gated commit lengths), for padded rows, gate 0 / 1, simulated acceptance
 off, a precomputed (in-graph simulated) bonus or its per-split maxima, and the
 argmax skipped when the length and bonus are both simulated."""
 
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -240,3 +241,34 @@ def test_triton_select_fold_matches_sim_bonus_kernel(bs, temperature):
     assert torch.equal(out.bonus[:bs], ref)
     if temperature == 0.0:
         assert bool((ref == 5).all())
+
+
+_TRITON_DEVICE = (
+    "cuda"
+    if torch.cuda.is_available()
+    else ("cpu" if os.environ.get("TRITON_INTERPRET") == "1" else None)
+)
+
+
+@pytest.mark.skipif(_TRITON_DEVICE is None, reason="needs CUDA or TRITON_INTERPRET=1")
+@pytest.mark.parametrize("bs", (1, 2, 8))
+def test_sim_bonus_partials_take_one_shared_length_as_a_stride_0_view(bs):
+    """One simulated length for every request, passed as expand(bs) of a [1] buffer
+    (no copy in the graph), gives the same partials as a [bs] tensor of it."""
+    vocab, device = 9000, _TRITON_DEVICE
+    g = torch.Generator(device=device).manual_seed(bs)
+    logits = torch.randn(bs * T, vocab, device=device, generator=g)
+    shared = torch.tensor([2], dtype=torch.int64, device=device)
+    args = dict(
+        target_logits=logits,
+        temperatures=torch.full((bs,), 1.0, device=device),
+        seed=torch.tensor([77], dtype=torch.int32, device=device),
+        bs=bs,
+        rows_per_request=T,
+    )
+    view = simulated_bonus_partials_graph(correct_len=shared.expand(bs), **args)
+    full = simulated_bonus_partials_graph(correct_len=shared.repeat(bs), **args)
+    # A view either way: stride 0 when it broadcasts, the buffer itself at bs 1.
+    assert shared.expand(bs).data_ptr() == shared.data_ptr()
+    assert bs == 1 or shared.expand(bs).stride(0) == 0
+    assert torch.equal(view[0], full[0]) and torch.equal(view[1], full[1])
