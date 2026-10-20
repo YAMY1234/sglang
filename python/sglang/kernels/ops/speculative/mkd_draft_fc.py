@@ -79,10 +79,12 @@ def mkd_hidden_partial(
     epoch_done: torch.Tensor,
     sync: torch.Tensor,
     world: int,
+    ctas: int = 0,
 ) -> None:
     """Hidden-slice fc partial [1, H] fp32 of ``h`` [1, H] (draft_fc_partial arithmetic over
     ``shard`` [H, W] at hidden-half column ``col``); the last CTA then sets ``sync[1]`` to
-    the exchange epoch ``epoch_done[0]`` (``sync[0]`` counts CTAs, zero between calls)."""
+    the exchange epoch ``epoch_done[0]`` (``sync[0]`` counts CTAs, zero between calls).
+    ``ctas`` > 0 launches that many CTAs instead of one per SM (same values)."""
     _module(h.shape[-1], world, MAX_ROWS).hidden_partial(
-        h, shard, norm_weight, out, epoch_done, sync, eps, col
+        h, shard, norm_weight, out, epoch_done, sync, eps, col, ctas
     )

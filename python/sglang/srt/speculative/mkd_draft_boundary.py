@@ -342,6 +342,7 @@ class MkdDraftBoundary:
 
     def _install_head(self, enabled: bool, dev: torch.device) -> None:
         self.head_part = None
+        self.head_part_cur = None
         self.head_pad = 0
         self.head_used = False
         self.head_stats = None
@@ -374,14 +375,23 @@ class MkdDraftBoundary:
             self.head_pad,
         )
 
+    def _partial_ctas(self) -> int:
+        """SMs left to the side-stream hidden partial on hidden ranks (SGLANG_Q35MF_LL16_DB6_SMS, read at
+        capture); 0 keeps one partial CTA per SM, queued behind the head."""
+        if not self.is_hidden_rank or self.last_step:
+            return 0
+        return max(0, min(envs.SGLANG_Q35MF_LL16_DB6_SMS.get(), self.head_part.numel() - 1))
+
     def head(self, hidden_states: torch.Tensor, lm_head) -> torch.Tensor:
         """The one-row draft logits [1, N] bf16 (the exchange then reads the per-CTA maxima)."""
         x = hidden_states.to(torch.bfloat16).contiguous()
         logits = torch.empty(1, lm_head.weight.shape[0], dtype=torch.bfloat16, device=x.device)
+        # The head's grid is the part count: with SMs left to the hidden partial it runs on the rest.
+        self.head_part_cur = self.head_part[: self.head_part.numel() - self._partial_ctas()]
         # Alternate the row walk per draft step: the next step re-reads first what is still in L2
         # (T1: -1.9 to -2.4 us per call on the TP8 shard).
         mkd_draft_head(
-            x, lm_head.weight, logits, self.head_part, reverse=self.step % 2 == 1, smem_pad=self.head_pad
+            x, lm_head.weight, logits, self.head_part_cur, reverse=self.step % 2 == 1, smem_pad=self.head_pad
         )
         self.head_used = True
         if self.head_stats is not None:
@@ -449,6 +459,7 @@ class MkdDraftBoundary:
                 self.epoch_done,
                 self.partial_sync,
                 self.world,
+                ctas=self._partial_ctas() if self.head_part is not None else 0,
             )
         self.partial_pending = True
 
@@ -513,7 +524,7 @@ class MkdDraftBoundary:
             token_only=self.last_step,
             partial_flag=partial_flag,
             scan_part=self.scan_part,
-            head_part=self.head_part if self.head_used else None,
+            head_part=self.head_part_cur if self.head_used else None,
         )
         self.head_used = False
         self.pending = not self.last_step

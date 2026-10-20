@@ -624,6 +624,9 @@ class Envs:
     SGLANG_Q35MF_MKD_HEAD_CHECK = EnvBool(False)
     # With SGLANG_Q35MF_MKD_HEAD: KB of unused dynamic smem per head CTA (above 114, one CTA per SM).
     SGLANG_Q35MF_MKD_HEAD_SMEM_PAD_KB = EnvInt(0)
+    # With SGLANG_Q35MF_MKD_HEAD: on the hidden-slice ranks, leave this many SMs to the side-stream hidden
+    # partial and run the draft head on the rest, so the partial no longer waits for head CTAs to retire.
+    SGLANG_Q35MF_LL16_DB6_SMS = EnvInt(0)
     # With SGLANG_Q35MF_MKH_HOP: one-row draft steps run the attention-output and MoE-output
     # all-reduce + residual + norm as q35 hops, bit-identical to the kernels they replace.
     SGLANG_Q35MF_MKD_HOP = EnvBool(False)

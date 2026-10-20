@@ -395,7 +395,8 @@ struct MkdFc {
       const tvm::ffi::TensorView epoch_done,
       const tvm::ffi::TensorView sync,
       double eps,
-      int64_t col) {
+      int64_t col,
+      int64_t ctas) {
     using namespace host;
     constexpr int kW = 2 * kH / kWorld;
     auto device = SymbolicDevice{};
@@ -420,7 +421,9 @@ struct MkdFc {
         .eps = static_cast<float>(eps),
         .col = static_cast<int32_t>(col),
     };
-    LaunchKernel(runtime::get_sm_count(dev.device_id), 256, dev)(mkd_hidden_partial_kernel<kH, kWorld>, params);
+    // ctas > 0: a narrower grid that runs beside an lm_head holding the other SMs (rows are per-warp, same values).
+    const uint32_t grid = ctas > 0 ? static_cast<uint32_t>(ctas) : runtime::get_sm_count(dev.device_id);
+    LaunchKernel(grid, 256, dev)(mkd_hidden_partial_kernel<kH, kWorld>, params);
   }
 };
 
