@@ -1470,6 +1470,10 @@ class Envs:
     SGLANG_Q35MF_ARRIVE_SKIP_REGATHER = EnvBool(False)
     # Decode seq_lens are gathered with index_select instead of advanced indexing.
     SGLANG_Q35MF_ARRIVE_SEQ_LENS_SELECT = EnvBool(False)
+    # Decode rounds that allocate no KV slots skip building the unused length tensors.
+    SGLANG_Q35MF_ARRIVE_DECODE_PREP = EnvBool(False)
+    # Draft cache locations and the draft-extend layout come from one JIT launch each.
+    SGLANG_Q35MF_ARRIVE_DRAFT_PREP = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
