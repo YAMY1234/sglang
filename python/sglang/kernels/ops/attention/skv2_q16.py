@@ -89,7 +89,7 @@ def load_values(
 
 class Q16SplitDecode:
     """Warps 0-7: two softmax warpgroups (thread = query row; warpgroup g owns S columns g * 64.. and O half g),
-    warp 8: both MMAs, warp 9: TMA loads."""
+    warp 8: both MMAs, warp 9: Q and K loads, warp 10: V loads."""
 
     def __init__(
         self, heads=16, qlen=7, splits=148, stages=2, batch=1, mode=0, trace=False, lazy=0.0, pdl=False, maxp=32
@@ -164,7 +164,7 @@ class Q16SplitDecode:
             q, k, v, table, lengths, partial, maxima, denom, trace, qk_scale, out_scale, kq, vp
         ).launch(
             grid=(self.splits, 1, self.batch),
-            block=(320, 1, 1),
+            block=(352, 1, 1),
             stream=stream,
             use_pdl=self.pdl,
         )
@@ -623,33 +623,39 @@ class Q16SplitDecode:
                     if begin_page + local < npages:
                         page = table[req, begin_page + local]
                 spages[local] = page
-            cute.arch.sync_warp()
-            # Every stage starts free: K and V of the first blocks go out before any wait.
+            # The value loader (warp 10) reads the page ids after this rendezvous.
+            prim.barrier_cta_sync(5, thread_count=64)
             for stage in cutlass.range_constexpr(self.stages):
                 if stage < nblk:
                     load_keys(k, spages, sk, bk + stage, stage * 2, stage, self.tile)
-            for stage in cutlass.range_constexpr(self.stages):
-                if stage < nblk:
-                    if cutlass.const_expr(self.trace):
-                        if traced:
-                            if tid == 288:
-                                trace[0 * 16 + stage] = cute.arch.clock64()
-                    load_values(v, spages, sv, bv + stage, stage * 2, stage, self.tile)
-            # Block it + stages reuses the stage of block it: K after Q K^T(it), V after P V(it).
+            # K of block it + stages reuses the stage of block it once Q K^T(it) is done.
             for it in cutlass.range(0, nblk - self.stages):
                 stage = it % self.stages
-                nxt = it + self.stages
                 cute.arch.mbarrier_wait(bkfree + stage, phase=(it // self.stages) % 2)
                 if cutlass.const_expr(self.trace):
                     if traced:
                         if tid == 288:
                             if it < 16:
                                 trace[1 * 16 + it] = cute.arch.clock64()
-                load_keys(k, spages, sk, bk + stage, nxt * 2, stage, self.tile)
+                load_keys(k, spages, sk, bk + stage, (it + self.stages) * 2, stage, self.tile)
+        elif warp == 10:
+            # A separate warp, so K issues never queue behind a V stage that P V has not released yet.
+            prim.barrier_cta_sync(5, thread_count=64)
+            for stage in cutlass.range_constexpr(self.stages):
+                if stage < nblk:
+                    if cutlass.const_expr(self.trace):
+                        if traced:
+                            if tid == 320:
+                                trace[0 * 16 + stage] = cute.arch.clock64()
+                    load_values(v, spages, sv, bv + stage, stage * 2, stage, self.tile)
+            # V of block it + stages reuses the stage of block it once P V(it) is done.
+            for it in cutlass.range(0, nblk - self.stages):
+                stage = it % self.stages
+                nxt = it + self.stages
                 cute.arch.mbarrier_wait(bvfree + stage, phase=(it // self.stages) % 2)
                 if cutlass.const_expr(self.trace):
                     if traced:
-                        if tid == 288:
+                        if tid == 320:
                             if nxt < 16:
                                 trace[0 * 16 + nxt] = cute.arch.clock64()
                 load_values(v, spages, sv, bv + stage, nxt * 2, stage, self.tile)
