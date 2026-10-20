@@ -331,6 +331,7 @@ class VpVerify:
                 argmax=argmax,
                 candidates=candidates,
                 retrieve_index=retrieve_index,
+                predict=predict,
                 accept_index=accept_index,
                 num_correct_drafts=num_correct_drafts,
                 coins=coins,
@@ -389,19 +390,29 @@ def create(
 
 class VpProof:
     """Every sampled round, pull the full rows and compare against torch.argmax and, with the same coins, the
-    accepted counts of the one-rank chunked sampler (the final token is drawn independently, so it is compared in
-    distribution only, by the T1). Counters live on the device and are mirrored into pinned host memory by a copy
-    that is part of the check, so the reporter thread makes no CUDA call."""
+    accepted counts of the one-rank chunked sampler. The final token is drawn independently, so it is checked in
+    distribution against the full row's residual (fp64 softmax without the rejected draft): zero-mass draws are
+    counted, and two randomized PITs are binned, uniform when sampling is exact. Counters live on the device and are
+    mirrored into pinned host memory by a copy that is part of the check, so the reporter thread makes no CUDA call."""
 
     PERIOD_S = 30.0
-    FIELDS = ("calls", "rows", "argmax_mismatch", "requests", "accept_mismatch")
+    FIELDS = (
+        "calls",
+        "rows",
+        "argmax_mismatch",
+        "requests",
+        "accept_mismatch",
+        "final_zero_mass",
+    )
+    PIT_BINS = 20
 
     def __init__(self):
+        n = len(self.FIELDS) + 2 * self.PIT_BINS
         self.counters = torch.zeros(
-            (len(self.FIELDS),), dtype=torch.int64, device=torch.cuda.current_device()
+            (n,), dtype=torch.int64, device=torch.cuda.current_device()
         )
         self.host_counters = torch.zeros(
-            (len(self.FIELDS),), dtype=torch.int64, device="cpu", pin_memory=True
+            (n,), dtype=torch.int64, device="cpu", pin_memory=True
         )
         logger.info("LL16 VP proof active")
         threading.Thread(target=self._report, daemon=True).start()
@@ -413,6 +424,7 @@ class VpProof:
         argmax: torch.Tensor,
         candidates: torch.Tensor,
         retrieve_index: torch.Tensor,
+        predict: torch.Tensor,
         accept_index: torch.Tensor,
         num_correct_drafts: torch.Tensor,
         coins: Optional[Tuple[torch.Tensor, torch.Tensor]],
@@ -444,14 +456,54 @@ class VpProof:
             )
             self.counters[3].add_(bs)
             self.counters[4].add_(torch.count_nonzero(ref_num != num_correct_drafts))
+            self._pit(
+                full=full,
+                candidates=candidates,
+                retrieve_index=retrieve_index,
+                predict=predict,
+                num_correct_drafts=num_correct_drafts,
+            )
         self.host_counters.copy_(self.counters, non_blocking=True)
+
+    def _pit(
+        self, *, full, candidates, retrieve_index, predict, num_correct_drafts
+    ) -> None:
+        bs, d = candidates.shape
+        k = num_correct_drafts.long()
+        rows = torch.arange(bs, device=full.device) * d + k
+        p = torch.softmax(full[rows].double(), dim=-1)
+        # The rejected draft token (none after a fully accepted chain) is not in the residual.
+        excl = candidates.gather(1, (k + 1).clamp(max=d - 1).view(bs, 1))
+        keep = (k < d - 1).view(bs, 1)
+        p = p.scatter(1, excl, torch.where(keep, 0.0, p.gather(1, excl)))
+        p = p / p.sum(dim=-1, keepdim=True)
+        last = retrieve_index.gather(1, k.view(bs, 1)).view(bs)
+        tok = predict[last].long().view(bs, 1)
+        pt = p.gather(1, tok)
+        # Token-id order catches shard / chunk selection bias; descending-probability order catches shape bias.
+        below_id = (p.cumsum(dim=-1) - p).gather(1, tok)
+        above = torch.where(p > pt, p, 0.0).sum(dim=-1, keepdim=True)
+        tied = torch.where(p == pt, p, 0.0).sum(dim=-1, keepdim=True)
+        r = torch.rand((bs, 2), dtype=torch.float64, device=full.device)
+        u = torch.cat([below_id + r[:, :1] * pt, above + r[:, 1:] * tied], dim=1)
+        # Rows with non-finite logits (graph padding) are left out.
+        ok = torch.isfinite(u).all(dim=1, keepdim=True)
+        self.counters[5].add_(torch.count_nonzero(ok & (pt == 0)))
+        bins = (torch.where(ok, u, 0.0) * self.PIT_BINS).long().clamp(
+            0, self.PIT_BINS - 1
+        ) + self.PIT_BINS * torch.arange(2, device=full.device)
+        self.counters[len(self.FIELDS) :].index_add_(
+            0, bins.view(-1), ok.expand(bs, 2).reshape(-1).long()
+        )
 
     def _report(self) -> None:
         while True:
             time.sleep(self.PERIOD_S)
+            vals = self.host_counters.tolist()
+            n, b = len(self.FIELDS), self.PIT_BINS
             logger.info(
-                "LL16 VP proof: %s",
-                " ".join(
-                    f"{k}={v}" for k, v in zip(self.FIELDS, self.host_counters.tolist())
-                ),
+                "LL16 VP proof: %s pit_id=%s pit_p=%s",
+                " ".join(f"{k}={v}" for k, v in zip(self.FIELDS, vals)),
+                ",".join(str(v) for v in vals[n : n + b]),
+                ",".join(str(v) for v in vals[n + b :]),
             )
