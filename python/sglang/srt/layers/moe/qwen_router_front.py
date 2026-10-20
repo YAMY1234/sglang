@@ -108,6 +108,7 @@ def _k3_start_dumper() -> None:
     if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
         return
     d = envs.SGLANG_Q35MF_TPX_K3_DIR.get()
+    os.makedirs(d, exist_ok=True)
 
     def loop() -> None:
         while True:
