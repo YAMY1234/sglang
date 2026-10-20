@@ -1785,6 +1785,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self._mkd_gemv = is_nextn and _is_cuda and envs.SGLANG_Q35MF_MKD_GEMV.get()
         # Host int64 site fields of the hop the draft o_proj pushes into, built on first use.
         self._mkd_hop_site = None
+        # SGLANG_Q35MF_LL16_DRAFT_QKV: this forward's attention input is not normalized yet (the qkv kernel does it).
+        self._qkv_input_raw = False
         # Packed (qkv, o_proj) weights; built on the first eager verify forward, after weight loading.
         self._mka_weights = None
         self._mka_static_ok = None
@@ -1941,7 +1943,19 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
     def forward_prepare_cuda_fused(self, positions, hidden_states, forward_batch=None):
         """Fused QK GemmaRMSNorm + NeoX RoPE + gate deinterleave."""
-        qkv, _ = self.qkv_proj(hidden_states)
+        if self._qkv_input_raw:
+            from sglang.kernels.ops.speculative.mkd_draft_qkv import mkd_draft_qkv
+
+            weight = self.qkv_proj.weight
+            qkv = mkd_draft_qkv(
+                hidden_states,
+                self.input_layernorm.weight.data,
+                self.input_layernorm.variance_epsilon,
+                weight,
+                torch.empty(1, weight.shape[0], dtype=torch.bfloat16, device=weight.device),
+            )
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
                 [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
@@ -2356,11 +2370,27 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
         **kwargs,
     ):
-        hidden_states = self.attn_boundary.prepare(
-            hidden_states,
-            forward_batch,
-            capture_gathered=captured_last_layer_outputs,
+        draft_qkv = (
+            self._mkd_gemv
+            and captured_last_layer_outputs is None
+            and int(forward_batch.input_ids.shape[0]) == 1
+            and self.qkv_proj.weight.dtype == torch.bfloat16
+            and envs.SGLANG_Q35MF_LL16_DRAFT_QKV.get()
         )
+        self.input_layernorm.defer_to_consumer = draft_qkv
+        self.input_layernorm.deferred = False
+        try:
+            hidden_states = self.attn_boundary.prepare(
+                hidden_states,
+                forward_batch,
+                capture_gathered=captured_last_layer_outputs,
+            )
+        finally:
+            self.input_layernorm.defer_to_consumer = False
+        # Only a plain norm call defers; any other read path normalized as usual.
+        self._qkv_input_raw = self.input_layernorm.deferred
+        if self._qkv_input_raw:
+            print_info_once("Draft qkv GEMV applies the input norm itself.")
 
         # fused AR+quant hands down a (fp8, scale) / (bf16, fp8, scale) tuple
         hs = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
@@ -2370,6 +2400,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
+        self._qkv_input_raw = False
 
         # Fully Connected
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)

@@ -1109,6 +1109,9 @@ class GemmaRMSNorm(BaseFusedOp):
         # If TRTLLM allreduce fusion ever provides gemma-style norm
         # natively, this can be removed.
         self.weight.weight_loader = self._weight_loader
+        # Set by a consumer that applies this norm itself; a call then returns its input and marks `deferred`.
+        self.defer_to_consumer = False
+        self.deferred = False
 
     def _weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
         assert param.size() == loaded_weight.size()
@@ -1122,6 +1125,9 @@ class GemmaRMSNorm(BaseFusedOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if self.defer_to_consumer and residual is None:
+            self.deferred = True
+            return x
         needs_reshape = x.dim() != 2 and residual is None
         if needs_reshape:
             original_shape = x.shape

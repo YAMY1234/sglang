@@ -1141,6 +1141,9 @@ class Envs:
     # The one-token draft qk norm launches as a programmatic dependent of the qkv GEMM (static operands load
     # before its wait, every other load issued right after it); same outputs.
     SGLANG_Q35MF_LL16_QKN_PDL = EnvBool(False)
+    # With SGLANG_Q35MF_MKD_GEMV: the one-token draft layer applies its input GemmaRMSNorm inside one qkv GEMV kernel
+    # that holds its weight rows in registers before its PDL wait (fp32 summation order differs from the GEMM).
+    SGLANG_Q35MF_LL16_DRAFT_QKV = EnvBool(False)
     # With SGLANG_Q35MF_MKA_FUSED and SGLANG_Q35MF_MKH_HOP: the fused o_proj pushes its partial into the
     # q35 hop mailbox, so the attention output hop only consumes.
     SGLANG_Q35MF_MKA_PUSH = EnvBool(False)
