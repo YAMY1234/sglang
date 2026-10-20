@@ -1434,7 +1434,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         plan = self._skv2_plans.get(key)
         if plan is None:
             # Compiles the producer; graph warmup runs this eagerly before capture.
-            plan = StockSplitPlan(query, kv_cache, block_tables, seq_lens)
+            plan = StockSplitPlan(
+                query,
+                kv_cache,
+                block_tables,
+                seq_lens,
+                pdl=envs.SGLANG_Q35MF_LL16_SKV2_PDL.get(),
+            )
             self._skv2_plans[key] = plan
         return skv2_split_kv(
             query,

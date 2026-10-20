@@ -308,7 +308,10 @@ def _merge_attention(
     BALANCED: tl.constexpr,
     SKIP_EMPTY: tl.constexpr,
     SHORT_MERGE: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
 ):
+    if USE_GDC:  # launched as a programmatic dependent of the split producer
+        tl.extra.cuda.gdc_wait()
     if SHORT_MERGE and not BALANCED:
         length = tl.load(Lengths + tl.program_id(2))
         if length <= 2048:

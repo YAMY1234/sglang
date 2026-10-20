@@ -36,6 +36,7 @@
 
 # Modified by NVIDIA: runtime attention scales, page-tail bounds and reusable buffers.
 # Modified by NVIDIA: stock split-KV rounding (page splits, one FP8 P rounding, bf16 partials).
+# Modified by NVIDIA: optional programmatic dependent launch with a pre-wait K/V prefetch.
 
 """Paged FP8 q7 split attention with the stock split-KV rounding structure.
 
@@ -99,7 +100,7 @@ def load_values(
 
 
 class StockSplitDecode:
-    def __init__(self, heads=4, qlen=7, splits=148, stages=2, slots=2):
+    def __init__(self, heads=4, qlen=7, splits=148, stages=2, slots=2, pdl=False, prefetch=True):
         assert stages >= 1 and slots in (2, 3, 4)
         self.heads, self.qlen, self.splits, self.stages, self.slots = (
             heads,
@@ -108,6 +109,9 @@ class StockSplitDecode:
             stages,
             slots,
         )
+        # pdl: launched as a programmatic dependent; CTAs that land while the predecessor runs set up and (prefetch)
+        # load their first K / V tiles that hold no token written by this step, then wait for the predecessor.
+        self.pdl, self.prefetch = pdl, prefetch
         self.rows = heads * qlen
         self.width = 32 if self.rows <= 32 else 64
         self.tile = 128
@@ -153,7 +157,7 @@ class StockSplitDecode:
         )
         self.kernel(
             q, k, v, table, lengths, partial, maxima, denom, qk_scale, out_scale, kq, vp
-        ).launch(grid=(self.splits, 1, 1), block=(384, 1, 1), stream=stream)
+        ).launch(grid=(self.splits, 1, 1), block=(384, 1, 1), stream=stream, use_pdl=self.pdl)
 
     @cute.experimental.kernel
     def kernel(
@@ -291,6 +295,43 @@ class StockSplitDecode:
             nblk = cute.ceil_div(end_tok - begin_tok, self.tile)
         begin_page = split * pps
         cute.arch.sync_threads()
+        # Leading tiles loaded before the dependency wait: whole tiles (2 pages) ending before the first page
+        # this step writes (the predecessor stores the new tokens' K / V at positions length - qlen and up).
+        npre = cutlass.Int32(0)
+        if cutlass.const_expr(self.pdl and self.prefetch):
+            safe_tiles = ((length - self.qlen) // 64 - begin_page) // (self.tile // 64)
+            if safe_tiles > 0:
+                npre = safe_tiles
+            if npre > self.stages:
+                npre = cutlass.Int32(self.stages)
+            if npre > nblk:
+                npre = nblk
+            if warp == 10:
+                for stage in cutlass.range_constexpr(self.stages):
+                    if stage < npre:
+                        load_keys(
+                            k,
+                            table,
+                            sk,
+                            bk + stage,
+                            begin_page + stage * (self.tile // 64),
+                            stage,
+                            self.tile,
+                            length,
+                        )
+                        load_values(
+                            v,
+                            table,
+                            sv,
+                            bv + stage,
+                            begin_page + stage * (self.tile // 64),
+                            stage,
+                            self.tile,
+                            length,
+                        )
+        if cutlass.const_expr(self.pdl):
+            cute.arch.griddepcontrol_wait()
+            cute.arch.griddepcontrol_launch_dependents()
         if warp < 4:
             scores = cute.make_rmem_tensor((width, 1), f32)
             running_m = cute.make_rmem_tensor((width // 32,), f32)
@@ -454,7 +495,7 @@ class StockSplitDecode:
                     update_expect_tx=False,
                 )
                 for stage in cutlass.range_constexpr(self.stages):
-                    if stage < nblk:
+                    if stage < nblk and stage >= npre:
                         load_keys(
                             k,
                             table,
@@ -467,19 +508,20 @@ class StockSplitDecode:
                         )
                 for it in cutlass.range(0, nblk):
                     stage = it % self.stages
-                    cute.arch.mbarrier_wait(
-                        bvfree + stage, phase=(it // self.stages + 1) % 2
-                    )
-                    load_values(
-                        v,
-                        table,
-                        sv,
-                        bv + stage,
-                        begin_page + it * (self.tile // 64),
-                        stage,
-                        self.tile,
-                        length,
-                    )
+                    if it >= npre:
+                        cute.arch.mbarrier_wait(
+                            bvfree + stage, phase=(it // self.stages + 1) % 2
+                        )
+                        load_values(
+                            v,
+                            table,
+                            sv,
+                            bv + stage,
+                            begin_page + it * (self.tile // 64),
+                            stage,
+                            self.tile,
+                            length,
+                        )
                     if it + self.stages < nblk:
                         cute.arch.mbarrier_wait(
                             bkfree + stage, phase=(it // self.stages) % 2
@@ -517,7 +559,9 @@ from sglang.kernels.ops.attention.split_kv_verify import _merge_attention
 class StockSplitPlan:
     """Reusable storage and a compiled producer for one fixed input layout; merge is the stock kernel."""
 
-    def __init__(self, query, kv, table, lengths, *, splits=148, stages=2, slots=2):
+    def __init__(
+        self, query, kv, table, lengths, *, splits=148, stages=2, slots=2, pdl=False, prefetch=True, merge_pdl=None
+    ):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "Paged split-KV storage must be prepared before graph capture"
@@ -532,8 +576,10 @@ class StockSplitPlan:
             (splits, rows), dtype=torch.float32, device=query.device
         )
         self.denom = torch.empty_like(self.maximum)
+        # merge_pdl: the merge is a programmatic dependent of the producer (waits before reading the partials).
+        self.merge_pdl = pdl if merge_pdl is None else merge_pdl
         kernel = StockSplitDecode(
-            self.heads, self.qlen, splits, stages=stages, slots=slots
+            self.heads, self.qlen, splits, stages=stages, slots=slots, pdl=pdl, prefetch=prefetch
         )
         views = self._views(query, kv, table, lengths)
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -580,8 +626,10 @@ class StockSplitPlan:
             False,
             True,
             True,
+            USE_GDC=self.merge_pdl,
             num_warps=4,
             enable_fp_fusion=False,
+            **({"launch_pdl": True} if self.merge_pdl else {}),
         )
         return out
 
