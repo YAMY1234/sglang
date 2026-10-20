@@ -101,10 +101,12 @@ def load_values(
 class Q16SplitDecode:
     """Warps 0-3: softmax + O rescale + epilogue (thread = query row); warp 4: both MMAs; warp 5: TMA loads."""
 
-    def __init__(self, heads=16, qlen=7, splits=148, stages=2, batch=1, mode=0):
+    def __init__(self, heads=16, qlen=7, splits=148, stages=2, batch=1, mode=0, trace=False):
         assert heads * qlen <= 128 and (heads * qlen) % 8 == 0 and stages in (1, 2)
         # Timing ablations only (wrong outputs): 1 no O rescale, 2 no softmax math, 4 no P V MMA, 8 no Q K MMA.
         self.mode = mode
+        # Debug: CTA (0, 0) writes clock64 stamps per role and block into the trace tensor.
+        self.trace = trace
         self.heads, self.qlen, self.splits, self.stages, self.batch = (
             heads,
             qlen,
@@ -127,6 +129,7 @@ class Q16SplitDecode:
         partial: cute.Tensor,
         maxima: cute.Tensor,
         denom: cute.Tensor,
+        trace: cute.Tensor,
         qk_scale: cutlass.Float32,
         out_scale: cutlass.Float32,
         stream: cuda.CUstream,
@@ -157,7 +160,7 @@ class Q16SplitDecode:
             )
         )
         self.kernel(
-            q, k, v, table, lengths, partial, maxima, denom, qk_scale, out_scale, kq, vp
+            q, k, v, table, lengths, partial, maxima, denom, trace, qk_scale, out_scale, kq, vp
         ).launch(grid=(self.splits, 1, self.batch), block=(192, 1, 1), stream=stream)
 
     @cute.experimental.kernel
@@ -171,6 +174,7 @@ class Q16SplitDecode:
         partial: cute.Tensor,
         maxima: cute.Tensor,
         denom: cute.Tensor,
+        trace: cute.Tensor,
         qk_scale: cutlass.Float32,
         out_scale: cutlass.Float32,
         kq: cute.TiledMma,
@@ -178,6 +182,14 @@ class Q16SplitDecode:
     ):
         tid, _, _ = cute.arch.thread_idx()
         split, _, req = cute.arch.block_idx()
+        traced = cutlass.Boolean(False)
+        if cutlass.const_expr(self.trace):
+            if split == 0:
+                if req == 0:
+                    traced = cutlass.Boolean(True)
+            if traced:
+                if tid == 0:
+                    trace[7 * 16 + 0] = cute.arch.clock64()
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         local_tid = tid % 128
         rows = self.rows
@@ -294,6 +306,11 @@ class Q16SplitDecode:
             for it in cutlass.range(0, nblk):
                 slot = it % self.slots
                 cute.arch.mbarrier_wait(bs + slot, phase=(it // self.slots) % 2)
+                if cutlass.const_expr(self.trace):
+                    if traced:
+                        if tid == 0:
+                            if it < 16:
+                                trace[4 * 16 + it] = cute.arch.clock64()
                 current_s = ts[(None, None), 0, 0, slot]
                 copy_s = tcgen05.make_tmem_copy(ld_atom, current_s).get_slice(local_tid)
                 ex.partition_and_copy(copy_s, current_s, sview)
@@ -364,12 +381,21 @@ class Q16SplitDecode:
                             ex.partition_and_copy(store_o, oview, o_plane)
                         cute.arch.fence_view_async_tmem_store()
                 cute.arch.fence_view_async_shared()
+                if cutlass.const_expr(self.trace):
+                    if traced:
+                        if tid == 0:
+                            if it < 16:
+                                trace[5 * 16 + it] = cute.arch.clock64()
                 cute.arch.mbarrier_arrive(bp + slot)
             if nblk > 0:
                 # bo completes once per block; take the last two completions in order.
                 if nblk > 1:
                     cute.arch.mbarrier_wait(bo, phase=(nblk - 2) % 2)
                 cute.arch.mbarrier_wait(bo, phase=(nblk - 1) % 2)
+                if cutlass.const_expr(self.trace):
+                    if traced:
+                        if tid == 0:
+                            trace[6 * 16 + 0] = cute.arch.clock64()
                 out16 = cute.make_rmem_tensor((128,), cutlass.BFloat16)
                 for dm in cutlass.range_constexpr(2):
                     o_plane = to[(None, None), 0, 0, dm]
@@ -383,12 +409,20 @@ class Q16SplitDecode:
                 if row < rows:
                     maxima[prow + row] = running_m
                     denom[prow + row] = running_l
+                if cutlass.const_expr(self.trace):
+                    if traced:
+                        if tid == 0:
+                            trace[6 * 16 + 1] = cute.arch.clock64()
         elif warp == 4:
             q_frag = kq.get_slice(0).partition_A(sq)
             atom_kq = cute.make_mma_atom(kq.op)
             atom_vp = cute.make_mma_atom(vp.op)
             atom_vp.set(tcgen05.Field.ACCUMULATE, True)
             cute.arch.mbarrier_wait(bq, phase=0)
+            if cutlass.const_expr(self.trace):
+                if traced:
+                    if tid == 128:
+                        trace[7 * 16 + 1] = cute.arch.clock64()
             for it in cutlass.range(0, nblk + 1):
                 if it < nblk:
                     slot, stage = it % self.slots, it % self.stages
@@ -396,6 +430,11 @@ class Q16SplitDecode:
                         bsfree + slot, phase=(it // self.slots + 1) % 2
                     )
                     cute.arch.mbarrier_wait(bk + stage, phase=(it // self.stages) % 2)
+                    if cutlass.const_expr(self.trace):
+                        if traced:
+                            if tid == 128:
+                                if it < 16:
+                                    trace[2 * 16 + it] = cute.arch.clock64()
                     ktile = cute.local_tile(sk[None, None, stage], (self.tile, 256), (0, 0))
                     k_frag = kq.get_slice(0).partition_B(ktile)
                     atom_kq.set(tcgen05.Field.ACCUMULATE, False)
@@ -417,6 +456,11 @@ class Q16SplitDecode:
                     slot, stage = prev % self.slots, prev % self.stages
                     cute.arch.mbarrier_wait(bp + slot, phase=(prev // self.slots) % 2)
                     cute.arch.mbarrier_wait(bv + stage, phase=(prev // self.stages) % 2)
+                    if cutlass.const_expr(self.trace):
+                        if traced:
+                            if tid == 128:
+                                if prev < 16:
+                                    trace[3 * 16 + prev] = cute.arch.clock64()
                     p_frag = vp.get_slice(0).partition_A(sp[None, None, slot])
                     for dm in cutlass.range_constexpr(2):
                         vtile = cute.local_tile(
@@ -464,6 +508,11 @@ class Q16SplitDecode:
                 cute.arch.mbarrier_wait(
                     bvfree + stage, phase=(it // self.stages + 1) % 2
                 )
+                if cutlass.const_expr(self.trace):
+                    if traced:
+                        if tid == 160:
+                            if it < 16:
+                                trace[0 * 16 + it] = cute.arch.clock64()
                 load_values(
                     v,
                     table,
@@ -479,6 +528,11 @@ class Q16SplitDecode:
                     cute.arch.mbarrier_wait(
                         bkfree + stage, phase=(it // self.stages) % 2
                     )
+                    if cutlass.const_expr(self.trace):
+                        if traced:
+                            if tid == 160:
+                                if it < 16:
+                                    trace[1 * 16 + it] = cute.arch.clock64()
                     load_keys(
                         k,
                         table,
@@ -502,7 +556,7 @@ from sglang.kernels.ops.attention.split_kv_verify import _merge_attention
 class Q16SplitPlan:
     """Reusable storage and a compiled producer for one fixed input layout; merge is the stock kernel."""
 
-    def __init__(self, query, kv, table, lengths, *, splits=None, stages=2, mode=0):
+    def __init__(self, query, kv, table, lengths, *, splits=None, stages=2, mode=0, trace=False):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "Paged split-KV storage must be prepared before graph capture"
@@ -521,8 +575,15 @@ class Q16SplitPlan:
             (self.batch, self.splits, self.rows), dtype=torch.float32, device=query.device
         )
         self.denom = torch.empty_like(self.maximum)
+        self.trace = torch.zeros(8 * 16, dtype=torch.int64, device=query.device)
         kernel = Q16SplitDecode(
-            self.heads, self.qlen, self.splits, stages=stages, batch=self.batch, mode=mode
+            self.heads,
+            self.qlen,
+            self.splits,
+            stages=stages,
+            batch=self.batch,
+            mode=mode,
+            trace=trace,
         )
         views = self._views(query, kv, table, lengths)
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -541,6 +602,7 @@ class Q16SplitPlan:
             self.partial.view(-1, 256),
             self.maximum.view(-1),
             self.denom.view(-1),
+            self.trace,
         )
         return tuple(from_dlpack(t) for t in tensors)
 
