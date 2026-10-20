@@ -316,6 +316,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     embed_weight=model.model.embed_tokens.weight,
                     norm=model.pre_fc_norm_embedding,
                     vocab_local=model.lm_head.weight.shape[0],
+                    full=envs.SGLANG_Q35MF_DEP_DX_MEMO_FULL.get(),
                 )
                 model._dep_dx = self._dep_draft_xchg
 

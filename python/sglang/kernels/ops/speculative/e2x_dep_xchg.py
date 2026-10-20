@@ -66,6 +66,7 @@ def e2x_dep_xchg(
     data: torch.Tensor,
     peer_data: torch.Tensor,
     fc_out: torch.Tensor,
+    memo_full: bool,
     vocab_start: int,
     torch_nan: bool,
     rank: int,
@@ -78,8 +79,9 @@ def e2x_dep_xchg(
     ties to the lowest id, NaN as torch.argmax (``torch_nan``) or as -1e30. Non-empty ``topk_p``,
     ``draft_tokens`` [rows, steps], ``positions`` [rows] and ``mrope_positions`` [3, rows] get
     k75p_topk1_postprocess's writes (topk_p = 1, column ``draft_column``, + 1) and mrope + 1. A
-    non-empty ``memo`` [V_local, H] (normalized embedding rows of this shard) sends each candidate's row
-    through ``data``; the owner writes the winner's row into ``fc_out`` [rows, H] (row stride free)."""
+    non-empty ``memo`` has normalized embedding rows: this shard's [V_local, H], sent with each candidate
+    through ``data``, or with ``memo_full`` the whole vocab [V, H], read by the owner; the owner writes
+    the winner's row into ``fc_out`` [rows, H] (row stride free)."""
     if blocks is None:
         blocks = dep_xchg_blocks(logits.shape[0])
     _module().run(
@@ -99,6 +101,7 @@ def e2x_dep_xchg(
         data,
         peer_data,
         fc_out,
+        memo_full,
         vocab_start,
         NAN_KEY_TORCH_ARGMAX if torch_nan else NAN_KEY_SPLIT_ARGMAX,
         rank,
