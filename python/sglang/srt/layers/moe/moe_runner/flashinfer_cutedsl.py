@@ -534,6 +534,9 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
     return StandardCombineInput(hidden_states=output)
 
 
+_ep_tables_engaged: set[tuple[int, int, int]] = set()
+
+
 def _experts_from_ep_tables(
     quant_info: CuteDslFp4MoeQuantInfo,
     x_fp4: torch.Tensor,
@@ -568,6 +571,10 @@ def _experts_from_ep_tables(
         moe_output,
     ]
     tactic = _choose_tactic(wrapper, inputs)
+    key = (wrapper.local_expert_offset, topk_ids.shape[0], tactic[0])
+    if key not in _ep_tables_engaged:
+        _ep_tables_engaged.add(key)
+        logger.info("SGLANG_Q35MF_DEP_EP_TABLES engaged: local offset %d, %d rows, tile %d", *key)
     bufs = ep_tables(
         topk_ids,
         topk_weights,
