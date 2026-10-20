@@ -335,6 +335,11 @@ class Q16SplitDecode:
                         copy_s = tcgen05.make_tmem_copy(ld_half, s_half).get_slice(row)
                         ex.partition_and_copy(copy_s, s_half, sview)
                         cute.arch.fence_view_async_tmem_load()
+                        if cutlass.const_expr(self.trace):
+                            if traced:
+                                if tid == 0:
+                                    if it < 16:
+                                        trace[8 * 16 + it] = cute.arch.clock64()
                         cute.arch.mbarrier_arrive(bsfree + slot)
                         last = limit - (begin_tok + it * self.tile + wg * half)
                         if last < half - 1:
@@ -352,8 +357,18 @@ class Q16SplitDecode:
                             m2 = cute.arch.fmax(m2, vals[4 * j + 2, 0])
                             m3 = cute.arch.fmax(m3, vals[4 * j + 3, 0])
                         mine = cute.arch.fmax(cute.arch.fmax(m0, m1), cute.arch.fmax(m2, m3))
+                        if cutlass.const_expr(self.trace):
+                            if traced:
+                                if tid == 0:
+                                    if it < 16:
+                                        trace[9 * 16 + it] = cute.arch.clock64()
                         xmax[row, wg, slot] = mine
                         prim.barrier_cta_sync(1, thread_count=256)
+                        if cutlass.const_expr(self.trace):
+                            if traced:
+                                if tid == 0:
+                                    if it < 16:
+                                        trace[10 * 16 + it] = cute.arch.clock64()
                         other = xmax[row, 1 - wg, slot]
                         # qk_scale > 0, so scaling the raw maximum equals the maximum of the scaled scores.
                         block_max = cute.arch.fmax(mine, other) * qk_scale
@@ -384,8 +399,23 @@ class Q16SplitDecode:
                                 vals[4 * j + 3, 0] = p3 * 256
                         running_l = running_l * alpha + ((t0 + t1) + (t2 + t3))
                         running_m = raw
+                        if cutlass.const_expr(self.trace):
+                            if traced:
+                                if tid == 0:
+                                    if it < 16:
+                                        trace[11 * 16 + it] = cute.arch.clock64()
                         packed[None, 0].store(vals[None, 0].load().to(dtype))
+                        if cutlass.const_expr(self.trace):
+                            if traced:
+                                if tid == 0:
+                                    if it < 16:
+                                        trace[12 * 16 + it] = cute.arch.clock64()
                         cute.arch.mbarrier_wait(bpfree + slot, phase=(it // self.slots + 1) % 2)
+                        if cutlass.const_expr(self.trace):
+                            if traced:
+                                if tid == 0:
+                                    if it < 16:
+                                        trace[13 * 16 + it] = cute.arch.clock64()
                         cute.autovec_copy(
                             packed[None, 0], cute.local_tile(sp[row, None, slot], (half,), (wg,))
                         )
@@ -418,6 +448,11 @@ class Q16SplitDecode:
                                     store_o = tcgen05.make_tmem_copy(st_half, o_sub).get_slice(row)
                                     ex.partition_and_copy(store_o, oview, o_sub)
                                 cute.arch.fence_view_async_tmem_store()
+                        if cutlass.const_expr(self.trace):
+                            if traced:
+                                if tid == 0:
+                                    if it < 16:
+                                        trace[14 * 16 + it] = cute.arch.clock64()
                         cute.arch.fence_view_async_shared()
                         if cutlass.const_expr(self.trace):
                             if traced:
@@ -621,7 +656,7 @@ class Q16SplitPlan:
             (self.batch, self.splits, self.rows), dtype=torch.float32, device=query.device
         )
         self.denom = torch.empty_like(self.maximum)
-        self.trace = torch.zeros(8 * 16, dtype=torch.int64, device=query.device)
+        self.trace = torch.zeros(16 * 16, dtype=torch.int64, device=query.device)
         kernel = Q16SplitDecode(
             self.heads,
             self.qlen,
