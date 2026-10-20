@@ -456,7 +456,11 @@ class FlashInferMNNVLCuteDSLARFusion:
     def _uses_hop(self, m: int) -> bool:
         # M <= 15 is where FlashInfer routes both operations to its LL kernels, which the
         # q35 hop reproduces bit for bit.
-        return self._hop is not None and m <= _Q35_HOP_MAX_M
+        return (
+            self._hop is not None
+            and m <= _Q35_HOP_MAX_M
+            and not envs.SGLANG_Q35MF_MKH_HOP_SKIP.get()
+        )
 
     def supports(self, m: int) -> bool:
         if not 1 <= int(m) <= self.max_m:
