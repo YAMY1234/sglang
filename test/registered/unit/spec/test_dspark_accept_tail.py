@@ -143,6 +143,25 @@ class _NoSiteTpSync(_RecordingTpSync):
         return False
 
 
+def _verify_out(logits):
+    # A static verify graph's output always carries the target hidden states.
+    return SimpleNamespace(
+        next_token_logits=logits, hidden_states=torch.zeros(logits.shape[0], 4)
+    )
+
+
+def _verify_batch(candidates, prefix_lens):
+    rows = candidates.numel()
+    return SimpleNamespace(
+        batch_size=BS,
+        input_ids=candidates.view(-1),
+        seq_lens=prefix_lens,
+        req_pool_indices=torch.arange(BS),
+        out_cache_loc=torch.zeros(rows, dtype=torch.int64),
+        positions=torch.zeros(rows, dtype=torch.int64),
+    )
+
+
 class TestFusedStaticAcceptTail(CustomTestCase):
     def _static_accept(self, *, fused, simulated, tp_sync):
         candidates, logits, prefix_lens = _greedy_inputs()
@@ -155,10 +174,7 @@ class TestFusedStaticAcceptTail(CustomTestCase):
             fused_accept_tail=fused,
         )
         epilogue._static_epilogue(
-            SimpleNamespace(next_token_logits=logits),
-            SimpleNamespace(
-                batch_size=BS, input_ids=candidates.view(-1), seq_lens=prefix_lens
-            ),
+            _verify_out(logits), _verify_batch(candidates, prefix_lens)
         )
         return epilogue
 
@@ -245,10 +261,7 @@ class TestFusedTailSimulateFold(CustomTestCase):
             for p in patches:
                 stack.enter_context(p)
             epilogue._static_epilogue(
-                SimpleNamespace(next_token_logits=logits),
-                SimpleNamespace(
-                    batch_size=BS, input_ids=candidates.view(-1), seq_lens=prefix_lens
-                ),
+                _verify_out(logits), _verify_batch(candidates, prefix_lens)
             )
         return epilogue
 
