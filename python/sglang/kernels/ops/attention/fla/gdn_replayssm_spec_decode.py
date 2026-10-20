@@ -46,6 +46,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.utils import is_tf32_supported
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_gfx95_supported
 
 _IS_GFX95 = is_gfx95_supported()
@@ -113,12 +114,14 @@ def gdn_replayssm_spec_circular_kernel(
     DOT_PRECISION: tl.constexpr,
     USE_GDC: tl.constexpr = False,
     WAIT_FOR_GATE_PRODUCER: tl.constexpr = False,
+    LATE_TRIGGER: tl.constexpr = False,
 ):
     i_v = tl.program_id(0)
     i_n = tl.program_id(1)
     i_hv = tl.program_id(2)
     i_h = i_hv // (HV // H)
-    if USE_GDC:
+    # LATE_TRIGGER: release the dependents only after the wait (they may read the prerequisite's outputs early).
+    if USE_GDC and not LATE_TRIGGER:
         tl.extra.cuda.gdc_launch_dependents()
 
     o_v = i_v * BV + tl.arange(0, BV)
@@ -148,16 +151,22 @@ def gdn_replayssm_spec_circular_kernel(
         if state_idx <= NULL_BLOCK_ID:
             if USE_GDC:
                 tl.extra.cuda.gdc_wait()
+                if LATE_TRIGGER:
+                    tl.extra.cuda.gdc_launch_dependents()
             return
         b_is_flush = tl.load(is_flush_flags + replay_idx) != 0
         if not b_is_flush:
             if USE_GDC:
                 tl.extra.cuda.gdc_wait()
+                if LATE_TRIGGER:
+                    tl.extra.cuda.gdc_launch_dependents()
             return
     else:
         if state_idx <= NULL_BLOCK_ID:
             if USE_GDC:
                 tl.extra.cuda.gdc_wait()
+                if LATE_TRIGGER:
+                    tl.extra.cuda.gdc_launch_dependents()
             full_mask = (o_s < spec_len)[:, None] & mask_v[None, :]
             tl.store(
                 p_o,
@@ -169,6 +178,8 @@ def gdn_replayssm_spec_circular_kernel(
         if b_is_flush:
             if USE_GDC:
                 tl.extra.cuda.gdc_wait()
+                if LATE_TRIGGER:
+                    tl.extra.cuda.gdc_launch_dependents()
             return
 
     b_write_pos = tl.load(write_pos + replay_idx).to(tl.int64)
@@ -190,6 +201,8 @@ def gdn_replayssm_spec_circular_kernel(
     dt_bias_val = tl.load(dt_bias + i_hv).to(tl.float32)
     if USE_GDC and WAIT_FOR_GATE_PRODUCER:
         tl.extra.cuda.gdc_wait()
+        if LATE_TRIGGER:
+            tl.extra.cuda.gdc_launch_dependents()
     a_s = tl.load(a + (bos + o_s_safe) * stride_a_t + i_hv, mask=mask_s, other=0.0).to(
         tl.float32
     )
@@ -237,6 +250,8 @@ def gdn_replayssm_spec_circular_kernel(
     # PTX griddepcontrol: consume convolution output only after the prerequisite.
     if USE_GDC and not WAIT_FOR_GATE_PRODUCER:
         tl.extra.cuda.gdc_wait()
+        if LATE_TRIGGER:
+            tl.extra.cuda.gdc_launch_dependents()
 
     if USE_QK_L2NORM_IN_KERNEL:
         qnorm_acc = tl.zeros([BS], dtype=tl.float32)
@@ -1154,6 +1169,9 @@ def _launch_gdn_spec(
         solve_options.update(USE_GDC=True, launch_pdl=True)
         if wait_for_gate_producer and kernel is gdn_replayssm_spec_circular_kernel:
             solve_options["WAIT_FOR_GATE_PRODUCER"] = True
+        # SGLANG_Q35MF_LL16_NORM_FOLD=2: the folded out_proj reads z before its own wait, so release it late.
+        if envs.SGLANG_Q35MF_LL16_NORM_FOLD.get() == 2:
+            solve_options["LATE_TRIGGER"] = True
     if maxnreg is not None:
         solve_options["maxnreg"] = maxnreg
     grid = (triton.cdiv(V, BV), B, HV)

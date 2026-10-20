@@ -86,6 +86,31 @@ class _OprojArgs(ctypes.Structure):
     )
 
 
+class _OprojNormArgs(ctypes.Structure):
+    _fields_ = (
+        [("site", _Site)]
+        + [(name, ctypes.c_void_p) for name in ("w", "x", "z")]
+        + [("z_tok", ctypes.c_longlong), ("z_head", ctypes.c_longlong)]
+        + [(name, ctypes.c_void_p) for name in ("nw", "sx", "sw", "out")]
+        + [("eps", ctypes.c_float), ("m", ctypes.c_int), ("nw_f32", ctypes.c_int)]
+    )
+
+
+def oproj_norm_args(x, z, norm_weight, eps, packed_w, input_scale, weight_scale, out) -> _OprojNormArgs:
+    """Kernel arguments of the folded norm + out_proj (site left empty)."""
+    assert x.dtype == torch.bfloat16 and x.is_contiguous() and x.shape[-1] == 128
+    assert z.dtype == torch.bfloat16 and z.ndim == 3 and z.shape[1] == 8 and z.shape[2] == 128 and z.stride(2) == 1
+    assert x.numel() == z.shape[0] * 1024 and packed_w.numel() == HIDDEN * 1024
+    assert norm_weight.numel() == 128 and norm_weight.dtype in (torch.bfloat16, torch.float32)
+    o = _OprojNormArgs()
+    o.w, o.x, o.z = packed_w.data_ptr(), x.data_ptr(), z.data_ptr()
+    o.z_tok, o.z_head = z.stride(0), z.stride(1)
+    o.nw, o.sx, o.sw = norm_weight.data_ptr(), input_scale.data_ptr(), weight_scale.data_ptr()
+    o.out = 0 if out is None else out.data_ptr()
+    o.eps, o.m, o.nw_f32 = float(eps), int(z.shape[0]), int(norm_weight.dtype == torch.float32)
+    return o
+
+
 def pack_out_proj(weight_nk: torch.Tensor) -> torch.Tensor:
     """[4096, K] e4m3 row-major -> mma.m16n8k32 A fragments in the out_proj kernel's order:
     [cta 128][warp 8][k-step S][block 2][lane 32][16 B], K = 8 * S * 32."""
@@ -134,6 +159,8 @@ def _build() -> ctypes.CDLL:
         raise RuntimeError("q35_hop Args layout mismatch")
     if handle.q35hop_oproj_args_size() != ctypes.sizeof(_OprojArgs):
         raise RuntimeError("q35_hop OprojArgs layout mismatch")
+    if handle.q35hop_oproj_norm_args_size() != ctypes.sizeof(_OprojNormArgs):
+        raise RuntimeError("q35_hop OprojNormArgs layout mismatch")
     return handle
 
 
@@ -272,6 +299,30 @@ class Q35Hop:
         )
         if rc != 0:
             raise RuntimeError(f"q35hop_oproj failed with {rc}")
+        self._pushed = (out.data_ptr(), out.shape)
+        return out
+
+    def out_proj_norm_push(
+        self, *, x, z, norm_weight, eps, packed_w, input_scale, weight_scale, gate_pre
+    ) -> torch.Tensor:
+        """The GDN verify gated RMSNorm + static FP8 (gdn_pdl_norm.norm) folded into out_proj_push, same bits.
+
+        x: [M * 8, 128] bf16 core output; z: [M, 8, 128] bf16 gate (strided). gate_pre: z * sigmoid(z) runs
+        before the PDL wait, so the predecessor must release its dependents only once z is complete.
+        """
+        m = int(z.shape[0])
+        if self._pushed is not None:
+            raise RuntimeError("q35_hop: a pushed partial was never consumed")
+        out = torch.empty((m, HIDDEN), dtype=torch.bfloat16, device=self.device)
+        o = oproj_norm_args(x, z, norm_weight, eps, packed_w, input_scale, weight_scale, out)
+        o.site = self._site
+        rc = self._lib.q35hop_oproj_norm(
+            1 if gate_pre else 0,
+            ctypes.byref(o),
+            ctypes.c_void_p(torch.cuda.current_stream().cuda_stream),
+        )
+        if rc != 0:
+            raise RuntimeError(f"q35hop_oproj_norm failed with {rc}")
         self._pushed = (out.data_ptr(), out.shape)
         return out
 

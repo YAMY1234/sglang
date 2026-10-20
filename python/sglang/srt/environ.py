@@ -1832,6 +1832,9 @@ class Envs:
     SGLANG_Q35MF_LL16_PREP = EnvBool(False)
     # Measurement only: with LL16_PREP, alternate the stock and the fast paths every N passes.
     SGLANG_Q35MF_LL16_PREP_AB_BLOCK = EnvInt(0)
+    # TP8 GDN verify: fold the gated RMSNorm + static FP8 into the pushing out_proj (same bits). 1: the gate
+    # z * sigmoid(z) after the PDL wait; 2: before it, with the core releasing its dependents after its own wait.
+    SGLANG_Q35MF_LL16_NORM_FOLD = EnvInt(0)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
     SGLANG_DEFAULT_THINKING = EnvBool(False)
 

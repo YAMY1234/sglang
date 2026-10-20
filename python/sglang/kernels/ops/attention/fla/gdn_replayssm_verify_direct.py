@@ -520,11 +520,15 @@ def gdn_replayssm_verify_direct_kernel(
     CHECK_EMPTY_HISTORY: tl.constexpr = False,
     HISTORY_STATS=None,
     USE_GDC: tl.constexpr = False,
+    LATE_TRIGGER: tl.constexpr = False,
 ):
     if USE_GDC:
-        tl.extra.cuda.gdc_launch_dependents()
+        if not LATE_TRIGGER:
+            tl.extra.cuda.gdc_launch_dependents()
         # Counters and compact-history writes remain after the prerequisite.
         tl.extra.cuda.gdc_wait()
+        if LATE_TRIGGER:
+            tl.extra.cuda.gdc_launch_dependents()
     if CHECK_EMPTY_HISTORY:
         row = tl.program_id(1)
         replay = tl.load(replay_indices + row * stride_replay_indices).to(tl.int64)

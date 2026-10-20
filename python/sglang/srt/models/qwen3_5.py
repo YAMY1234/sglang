@@ -1333,6 +1333,21 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 raise RuntimeError("Fused GDN projection reported a sticky error")
             buffers["checked"] = True
         z = buffers["projected"][:, 1536:].view(7, 8, 128)
+        # With the out_proj hop push active, this early return must feed the hop mailbox too.
+        hop = self._q35_push_hop(7)
+        fold = envs.SGLANG_Q35MF_LL16_NORM_FOLD.get()
+        if fold and hop is not None:
+            print_info_once(f"GDN verify: gated norm folded into the out_proj push (mode {fold})")
+            return hop.out_proj_norm_push(
+                x=core.reshape(56, 128),
+                z=z,
+                norm_weight=self.norm.weight,
+                eps=self.norm.eps,
+                packed_w=self.out_proj.q35_packed,
+                input_scale=self.out_proj.input_scale,
+                weight_scale=self.out_proj.weight_scale,
+                gate_pre=fold == 2,
+            )
         norm(
             core.reshape(56, 128),
             z,
@@ -1343,8 +1358,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             self.norm.eps,
         )
         x_fp8 = buffers["quant"].view(7, 1024)
-        # With the out_proj hop push active, this early return must feed the hop mailbox too.
-        hop = self._q35_push_hop(7)
         if hop is not None:
             return hop.out_proj_push(
                 x_fp8=x_fp8,

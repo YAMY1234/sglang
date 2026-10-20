@@ -442,7 +442,7 @@ __device__ __forceinline__ uint4 ldg_nc_v4(const uint4* q) {
   return r;
 }
 
-template <int S>
+template <int S, bool PUSH = true>
 __global__ void __launch_bounds__(256, 1) oproj_push_kernel(OprojArgs o) {
   constexpr int kK = 8 * S * 32;
   __shared__ __align__(16) float red[8][32][8];
@@ -503,7 +503,204 @@ __global__ void __launch_bounds__(256, 1) oproj_push_kernel(OprojArgs o) {
     }
     const uint4 frag = pack8(v);
     const int fr = cta * 4 + j;
-    push_frag(o.site, stage_peek(o.site), tok, fr, frag);
+    if (PUSH) push_frag(o.site, stage_peek(o.site), tok, fr, frag);
+    if (o.out != nullptr) *reinterpret_cast<uint4*>(o.out + row_elem(tok, fr)) = frag;
+  }
+  pdl_trigger();
+}
+
+// ---------------------------------------------------------------- gated RMSNorm + out_proj + push
+// The TP8 GDN verify norm (gdn_pdl_norm._gated_norm_early_kernel: per (token, head) mean square over 128 elements,
+// rstd * x * w, times z * sigmoid(z), bf16 rounding, static FP8) folded into the out_proj prologue with the norm
+// kernel's instructions. Warp w owns head w (K = 8 * 128); lane (token g, t) holds the norm kernel's lanes
+// v = 8 * step + 4 * half + t of row (g, w), so its in-lane sums, the 16 / 8 / 4 butterfly levels (here in
+// registers) and the 2 / 1 shuffles reproduce the norm's reduction tree. GATE_PRE computes z * sigmoid(z) before the
+// PDL wait: the predecessor must release its dependents only after z is complete.
+struct OprojNormArgs {
+  Site site;
+  const uint4* w;     // packed out_proj weights, S = 4
+  const uint16_t* x;  // [M, 1024] bf16 core output, head-major per token
+  const uint16_t* z;  // bf16 gate, element (token, head, j) at token * z_tok + head * z_head + j
+  long long z_tok, z_head;
+  const void* nw;     // norm weight [128], bf16 or fp32
+  const float* sx;    // out_proj input scale = the norm's static FP8 scale
+  const float* sw;    // out_proj weight scale
+  uint16_t* out;      // [M, 4096] bf16 copy of the partial, or null
+  float eps;
+  int m;
+  int nw_f32;
+};
+
+__device__ __forceinline__ float f_div_full(float a, float b) {
+  float r;
+  asm("div.full.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+  return r;
+}
+__device__ __forceinline__ float f_rsqrt_ftz(float a) {
+  float r;
+  asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(a));
+  return r;
+}
+__device__ __forceinline__ float f_ex2(float a) {
+  float r;
+  asm("ex2.approx.f32 %0, %1;" : "=f"(r) : "f"(a));
+  return r;
+}
+__device__ __forceinline__ float f_min_xorsign_abs(float a, float b) {
+  float r;
+  asm("min.xorsign.abs.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+  return r;
+}
+__device__ __forceinline__ uint32_t e4m3x2(float lo, float hi) {
+  uint16_t r;
+  asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(r) : "f"(hi), "f"(lo));
+  return r;
+}
+__device__ __forceinline__ float bf16f(uint16_t v) {
+  return __uint_as_float(static_cast<uint32_t>(v) << 16);
+}
+// z * sigmoid(z) as the norm kernel: z * (1 / (ex2(z * -log2 e) + 1)), div.full
+__device__ __forceinline__ float silu_gate(float z) {
+  const float e = f_ex2(__fmul_rn(z, __int_as_float(0xBFB8AA3B)));
+  return __fmul_rn(f_div_full(1.0f, __fadd_rn(e, 1.0f)), z);
+}
+
+template <bool GATE_PRE, bool PUSH>
+__global__ void __launch_bounds__(256, 1) oproj_norm_push_kernel(OprojNormArgs o) {
+  constexpr int S = 4, kK = 8 * S * 32;
+  __shared__ __align__(16) float red[8][32][8];
+  const int cta = blockIdx.x;
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int g = lane >> 2, t = lane & 3;
+  uint4 a[S][2];
+  {
+    const uint4* wb = o.w + (static_cast<size_t>(cta) * 8 + warp) * (S * 2 * 32) + lane;
+#pragma unroll
+    for (int st = 0; st < S; ++st)
+#pragma unroll
+      for (int b = 0; b < 2; ++b)
+        a[st][b] = ldg_nc_v4(wb + (st * 2 + b) * 32);
+  }
+  const float sx = *o.sx;
+  const float alpha = __fmul_rn(sx, *o.sw);
+  const float inv_s = f_div_full(1.0f, sx);
+  const int m = o.m;
+  const bool tok_ok = g < m;
+  // Element (st, h, j) of this lane is column 32 st + 16 h + 4 t + j of head `warp`.
+  float wn[S][2][4], gt[S][2][4];
+#pragma unroll
+  for (int st = 0; st < S; ++st)
+#pragma unroll
+    for (int h = 0; h < 2; ++h)
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const int c = 32 * st + 16 * h + 4 * t + j;
+        wn[st][h][j] = o.nw_f32 ? static_cast<const float*>(o.nw)[c] : bf16f(static_cast<const uint16_t*>(o.nw)[c]);
+      }
+  const uint16_t* zr = o.z + static_cast<long long>(tok_ok ? g : 0) * o.z_tok + static_cast<long long>(warp) * o.z_head;
+  if (GATE_PRE) {
+#pragma unroll
+    for (int st = 0; st < S; ++st)
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const uint2 zz = *reinterpret_cast<const uint2*>(zr + 32 * st + 16 * h + 4 * t);
+        gt[st][h][0] = silu_gate(bf16f(zz.x & 0xffff));
+        gt[st][h][1] = silu_gate(bf16f(zz.x >> 16));
+        gt[st][h][2] = silu_gate(bf16f(zz.y & 0xffff));
+        gt[st][h][3] = silu_gate(bf16f(zz.y >> 16));
+      }
+  }
+  pdl_wait();
+  if (!GATE_PRE) {
+#pragma unroll
+    for (int st = 0; st < S; ++st)
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const uint2 zz = *reinterpret_cast<const uint2*>(zr + 32 * st + 16 * h + 4 * t);
+        gt[st][h][0] = silu_gate(bf16f(zz.x & 0xffff));
+        gt[st][h][1] = silu_gate(bf16f(zz.x >> 16));
+        gt[st][h][2] = silu_gate(bf16f(zz.y & 0xffff));
+        gt[st][h][3] = silu_gate(bf16f(zz.y >> 16));
+      }
+  }
+  // Row (g, warp) of the core output; lanes of the padding token read token 0 and are dropped below.
+  const uint16_t* xr = o.x + static_cast<size_t>(tok_ok ? g : 0) * kK + warp * 128;
+  float xv[S][2][4], p[S][2];
+#pragma unroll
+  for (int st = 0; st < S; ++st)
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const uint2 xx = *reinterpret_cast<const uint2*>(xr + 32 * st + 16 * h + 4 * t);
+      xv[st][h][0] = bf16f(xx.x & 0xffff);
+      xv[st][h][1] = bf16f(xx.x >> 16);
+      xv[st][h][2] = bf16f(xx.y & 0xffff);
+      xv[st][h][3] = bf16f(xx.y >> 16);
+      // norm lane v = 8 st + 4 h + t: squares, then (s0 + s2) + (s1 + s3) (add.f32x2, add.f32)
+      const float s0 = __fmul_rn(xv[st][h][0], xv[st][h][0]), s1 = __fmul_rn(xv[st][h][1], xv[st][h][1]);
+      const float s2 = __fmul_rn(xv[st][h][2], xv[st][h][2]), s3 = __fmul_rn(xv[st][h][3], xv[st][h][3]);
+      p[st][h] = __fadd_rn(__fadd_rn(s0, s2), __fadd_rn(s1, s3));
+    }
+  // butterfly 16 (v, v + 16: step st, st + 2), 8 (st 0, 1), 4 (h 0, 1), then 2 and 1 across t
+  float r[2];
+#pragma unroll
+  for (int h = 0; h < 2; ++h)
+    r[h] = __fadd_rn(__fadd_rn(p[0][h], p[2][h]), __fadd_rn(p[1][h], p[3][h]));
+  float sum = __fadd_rn(r[0], r[1]);
+  sum = __fadd_rn(sum, __shfl_xor_sync(0xffffffffu, sum, 2));
+  sum = __fadd_rn(sum, __shfl_xor_sync(0xffffffffu, sum, 1));
+  const float rstd = f_rsqrt_ftz(__fadd_rn(o.eps, f_div_full(sum, 128.0f)));
+  uint32_t b0v[S], b1v[S];
+#pragma unroll
+  for (int st = 0; st < S; ++st)
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      float q[4];
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        float y = __fmul_rn(__fmul_rn(__fmul_rn(rstd, xv[st][h][j]), wn[st][h][j]), gt[st][h][j]);
+        y = __bfloat162float(__float2bfloat16_rn(y));
+        q[j] = f_min_xorsign_abs(__fmul_rn(inv_s, y), 448.0f);
+      }
+      const uint32_t word = tok_ok ? (e4m3x2(q[0], q[1]) | (e4m3x2(q[2], q[3]) << 16)) : 0u;
+      if (h == 0) b0v[st] = word; else b1v[st] = word;
+    }
+  float ch[2][2][4] = {};
+#pragma unroll
+  for (int st = 0; st < S; ++st) {
+    mma_e4m3(ch[0][st & 1], a[st][0], b0v[st], b1v[st]);
+    mma_e4m3(ch[1][st & 1], a[st][1], b0v[st], b1v[st]);
+  }
+  {
+    float4* dst = reinterpret_cast<float4*>(&red[warp][lane][0]);
+    dst[0] = make_float4(
+        __fadd_rn(ch[0][0][0], ch[0][1][0]),
+        __fadd_rn(ch[0][0][1], ch[0][1][1]),
+        __fadd_rn(ch[0][0][2], ch[0][1][2]),
+        __fadd_rn(ch[0][0][3], ch[0][1][3]));
+    dst[1] = make_float4(
+        __fadd_rn(ch[1][0][0], ch[1][1][0]),
+        __fadd_rn(ch[1][0][1], ch[1][1][1]),
+        __fadd_rn(ch[1][0][2], ch[1][1][2]),
+        __fadd_rn(ch[1][0][3], ch[1][1][3]));
+  }
+  __syncthreads();
+  const int tok = tid >> 2, j = tid & 3;
+  if (tok < m) {
+    float v[8];
+#pragma unroll
+    for (int q = 0; q < 8; ++q) {
+      const int rr = 8 * j + q;
+      const int l = (rr % 8) * 4 + tok / 2;
+      const int e = (rr / 16) * 4 + ((rr % 16) / 8) * 2 + (tok % 2);
+      float x = red[0][l][e];
+#pragma unroll
+      for (int w = 1; w < 8; ++w)
+        x = __fadd_rn(x, red[w][l][e]);
+      v[q] = __fmul_rn(x, alpha);
+    }
+    const uint4 frag = pack8(v);
+    const int fr = cta * 4 + j;
+    if (PUSH) push_frag(o.site, stage_peek(o.site), tok, fr, frag);
     if (o.out != nullptr) *reinterpret_cast<uint4*>(o.out + row_elem(tok, fr)) = frag;
   }
   pdl_trigger();
@@ -616,4 +813,50 @@ extern "C" int q35hop_args_size() {
 }
 extern "C" int q35hop_oproj_args_size() {
   return static_cast<int>(sizeof(OprojArgs));
+}
+
+// Stock out_proj (S = 4) without the hop push: single-GPU timing of the unfused chain only.
+extern "C" int q35hop_oproj_nopush(const void* args, void* stream) {
+  const OprojArgs& o = *static_cast<const OprojArgs*>(args);
+  if (o.m < 1 || o.m > 8) return -2;
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = dim3(kHidden / 32, 1, 1);
+  cfg.blockDim = dim3(256, 1, 1);
+  cfg.stream = static_cast<cudaStream_t>(stream);
+  cudaLaunchAttribute attr;
+  attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr.val.programmaticStreamSerializationAllowed = 1;
+  cfg.attrs = &attr;
+  cfg.numAttrs = 1;
+  return static_cast<int>(cudaLaunchKernelEx(&cfg, oproj_push_kernel<4, false>, o));
+}
+
+// Gated RMSNorm + out_proj (K = 1024) + push; flags bit 0: gate before the PDL wait, bit 1: no hop push.
+extern "C" int q35hop_oproj_norm(int flags, const void* args, void* stream) {
+  const OprojNormArgs& o = *static_cast<const OprojNormArgs*>(args);
+  const bool push = !(flags & 2);
+  if (o.m < 1 || o.m > 8 || (push && o.m > o.site.m_cap)) return -2;
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = dim3(kHidden / 32, 1, 1);
+  cfg.blockDim = dim3(256, 1, 1);
+  cfg.stream = static_cast<cudaStream_t>(stream);
+  cudaLaunchAttribute attr;
+  attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr.val.programmaticStreamSerializationAllowed = 1;
+  cfg.attrs = &attr;
+  cfg.numAttrs = 1;
+  switch (flags & 3) {
+    case 0:
+      return static_cast<int>(cudaLaunchKernelEx(&cfg, oproj_norm_push_kernel<false, true>, o));
+    case 1:
+      return static_cast<int>(cudaLaunchKernelEx(&cfg, oproj_norm_push_kernel<true, true>, o));
+    case 2:
+      return static_cast<int>(cudaLaunchKernelEx(&cfg, oproj_norm_push_kernel<false, false>, o));
+    default:
+      return static_cast<int>(cudaLaunchKernelEx(&cfg, oproj_norm_push_kernel<true, false>, o));
+  }
+}
+
+extern "C" int q35hop_oproj_norm_args_size() {
+  return static_cast<int>(sizeof(OprojNormArgs));
 }
