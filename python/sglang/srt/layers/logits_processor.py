@@ -614,10 +614,12 @@ class LogitsProcessor(nn.Module):
         embedding_bias: Optional[torch.Tensor],
     ) -> int:
         """Rows per rank when this target verify takes the shard exchange, else 0; the switch is read
-        at capture. The layout guard is the logits all-to-all's, so every rank makes the same choice."""
+        at capture. Only captured verify graphs take it: every rank replays the same graph (idle ranks
+        too), while an eager idle rank sees IDLE here and would pick the all-to-all."""
         if (
             self.ll16_vp is None
             or not envs.SGLANG_Q35MF_LL16_VPSAMP.get()
+            or not torch.cuda.is_current_stream_capturing()
             or not logits_metadata.forward_mode.is_target_verify()
             or embedding_bias is not None
             or not self.do_tensor_parallel_all_gather
