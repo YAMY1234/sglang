@@ -132,5 +132,59 @@ class TestAcceptTailParity(CustomTestCase):
                     self._run(simulated_correct_len, verify_lens)
 
 
+class _NoSiteTpSync(_RecordingTpSync):
+    def enabled(self, site):
+        return False
+
+
+class TestFusedStaticAcceptTail(CustomTestCase):
+    def _static_accept(self, *, fused, simulated, tp_sync):
+        candidates, logits, prefix_lens = _greedy_inputs()
+        epilogue = DsparkVerifyEpilogue(
+            max_bs=BS + 1,
+            verify_num_draft_tokens=STRIDE,
+            device="cpu",
+            tp_sync=tp_sync,
+            simulated_correct_len=simulated,
+            fused_accept_tail=fused,
+        )
+        epilogue._static_epilogue(
+            SimpleNamespace(next_token_logits=logits),
+            SimpleNamespace(
+                batch_size=BS, input_ids=candidates.view(-1), seq_lens=prefix_lens
+            ),
+        )
+        return epilogue
+
+    def test_fused_matches_separate_ops(self):
+        for simulated in (None, torch.tensor([1])):
+            with self.subTest(simulated=simulated is not None):
+                fused = self._static_accept(
+                    fused=True, simulated=simulated, tp_sync=_NoSiteTpSync()
+                )
+                self.assertTrue(fused._serves_accept_tail(BS))
+                separate = self._static_accept(
+                    fused=False, simulated=simulated, tp_sync=_NoSiteTpSync()
+                )
+                got, ref = fused.read_accept(BS), separate.read_accept(BS)
+                for field in ref.__struct_fields__:
+                    self.assertTrue(
+                        torch.equal(getattr(got, field), getattr(ref, field)), field
+                    )
+
+    def test_accept_site_broadcast_keeps_separate_ops(self):
+        # Rank 0's results are broadcast between the ops; one kernel would skip it.
+        class _AllSites(_RecordingTpSync):
+            def enabled(self, site):
+                return True
+
+        sync = _AllSites()
+        epilogue = self._static_accept(fused=True, simulated=None, tp_sync=sync)
+        self.assertFalse(epilogue._serves_accept_tail(BS))
+        self.assertEqual(
+            [site for site, _ in sync.calls], [SpecTpSyncSite.DSPARK_ACCEPT_GRAPH] * 3
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

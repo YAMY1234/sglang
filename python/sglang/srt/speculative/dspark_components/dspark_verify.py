@@ -12,6 +12,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     FinalizeAcceptLens,
     SelectMixedAccept,
     SoftmaxTemp,
+    _row_argmax,
 )
 from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     BuildCommitInjectLayout,
@@ -26,6 +27,7 @@ from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
     simulated_bonus_sample,
     simulated_bonus_sample_graph,
 )
+from sglang.kernels.ops.speculative.dspark.static_accept_tail import static_accept_tail
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
@@ -537,6 +539,9 @@ class DsparkVerifyEpilogue:
         fused_argmax: bool = False,
         simulated_correct_len: Optional[torch.Tensor] = None,
         simulate_fold: bool = False,
+        fused_accept_tail: bool = False,
+        accept_tail_min_bs: int = 1,
+        accept_tail_max_bs: int = 0,
     ) -> None:
         self.max_bs = int(max_bs)
         # SGLANG_SIMULATE_ACC_LEN with a sampled bonus inside the graph too: the bonus
@@ -575,6 +580,15 @@ class DsparkVerifyEpilogue:
         )
         self.out_tokens_buf = torch.zeros(
             (self.max_bs, self.stride), dtype=torch.int64, device=device
+        )
+        # SGLANG_DSPARK_FUSED_ACCEPT_TAIL: with the accept-site broadcast selected,
+        # rank 0's results are broadcast between the ops, so they stay separate.
+        self._fused_accept_tail = bool(fused_accept_tail) and not tp_sync.enabled(
+            SpecTpSyncSite.DSPARK_ACCEPT_GRAPH
+        )
+        self._accept_tail_bs = (int(accept_tail_min_bs), int(accept_tail_max_bs))
+        self.gated_commit_lens_buf = torch.zeros(
+            (self.max_bs,), dtype=torch.int32, device=device
         )
         # SGLANG_SIMULATE_ACC_LEN: the step's correct length, filled per step.
         self.simulated_correct_len = simulated_correct_len
@@ -641,19 +655,31 @@ class DsparkVerifyEpilogue:
         bs = forward_batch.batch_size
         verify_lens = self.verify_lens_buf[:bs]
         candidates = forward_batch.input_ids.view(bs, self.stride)
-        commit_lens = self._accept(
-            candidates=candidates,
-            logits=out.next_token_logits,
-            draft_tokens=candidates[:, 1:].contiguous(),
-            seq_lens=forward_batch.seq_lens,
-        )
-        if not self.folds_commit:
+        folds = self.folds_commit
+        if self._serves_accept_tail(bs):
+            gated_commit_lens = self._static_accept_tail(
+                candidates=candidates,
+                logits=out.next_token_logits,
+                seq_lens=forward_batch.seq_lens,
+                verify_lens=verify_lens,
+                gated=folds,
+            )
+        else:
+            commit_lens = self._accept(
+                candidates=candidates,
+                logits=out.next_token_logits,
+                draft_tokens=candidates[:, 1:].contiguous(),
+                seq_lens=forward_batch.seq_lens,
+            )
+            # Same staged locations as target verify; padded and fallback rows skip KV.
+            gated_commit_lens = (
+                torch.minimum(commit_lens, verify_lens.to(torch.int32))
+                * self.inject_gate_buf
+                if folds
+                else None
+            )
+        if not folds:
             return
-        # Same staged locations as target verify; padded and fallback rows skip KV.
-        gated_commit_lens = (
-            torch.minimum(commit_lens, verify_lens.to(torch.int32))
-            * self.inject_gate_buf
-        )
         cache_loc = forward_batch.out_cache_loc
         state_slot = None
         if self.commit_ctx.kv_injector.swa_ring_size is not None:
@@ -670,6 +696,44 @@ class DsparkVerifyEpilogue:
             commit_lens=gated_commit_lens,
             state_slot=state_slot,
         )
+
+    def _serves_accept_tail(self, bs: int) -> bool:
+        low, high = self._accept_tail_bs
+        return self._fused_accept_tail and low <= bs and (high == 0 or bs <= high)
+
+    def _static_accept_tail(
+        self, *, candidates, logits, seq_lens, verify_lens, gated: bool
+    ) -> Optional[torch.Tensor]:
+        """The greedy ``_accept`` (and the gated commit lengths) in one launch, after
+        the argmax and, under simulate_fold, the in-graph simulated bonus."""
+        bs = candidates.shape[0]
+        bonus_in = None
+        if self.simulate_fold:
+            bonus_in = simulated_bonus_sample_graph(
+                target_logits=logits,
+                correct_len=self.simulated_correct_len.repeat(bs),
+                temperatures=self.sim_temperatures_buf[:bs],
+                seed=self.sim_seed_buf,
+                bs=bs,
+                rows_per_request=self.stride,
+            )
+        static_accept_tail(
+            candidates=candidates,
+            target_predict=_row_argmax(logits, fused=self._fused_argmax).view(-1),
+            seq_lens=seq_lens,
+            verify_lens=verify_lens,
+            gate=self.inject_gate_buf,
+            correct_len_out=self.correct_len_buf,
+            bonus_out=self.bonus_buf,
+            cap_trim_lens_out=self.cap_trim_lens_buf,
+            commit_lens_out=self.commit_lens_buf,
+            new_seq_lens_out=self.new_seq_lens_buf,
+            out_tokens_out=self.out_tokens_buf,
+            simulated_correct_len=self.simulated_correct_len,
+            bonus_in=bonus_in,
+            gated_commit_lens_out=self.gated_commit_lens_buf if gated else None,
+        )
+        return self.gated_commit_lens_buf[:bs] if gated else None
 
     def read_accept(self, bs: int) -> AcceptOuts:
         return AcceptOuts(
