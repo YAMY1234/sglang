@@ -358,13 +358,8 @@ class Q16SplitDecode:
                                 cute.arch.mbarrier_arrive(bsfree + slot)
                                 last = limit - (begin_tok + it * self.tile + wg * half)
                                 if cutlass.const_expr(masked == 1 and not self.mode & 16):
-                                    # One scalar select per column; a conditional store into vals would make every
-                                    # branch carry the whole fragment.
                                     for j in cutlass.range_constexpr(half):
-                                        bias = f32(0)
-                                        if j > last:
-                                            bias = f32(-f32.inf)
-                                        vals[j, 0] = vals[j, 0] + bias
+                                        vals[j, 0] = vals[j, 0] if j <= last else -f32.inf
                                 # Raw block maximum in four independent chains, then the other warpgroup's half.
                                 m0 = vals[0, 0]
                                 m1 = vals[1, 0]
@@ -668,12 +663,26 @@ from sglang.kernels.ops.attention.split_kv_verify import _merge_attention
 class Q16SplitPlan:
     """Reusable storage and a compiled producer for one fixed input layout; merge is the stock kernel."""
 
-    def __init__(self, query, kv, table, lengths, *, splits=None, stages=2, mode=0, trace=False):
+    def __init__(
+        self,
+        query,
+        kv,
+        table,
+        lengths,
+        *,
+        splits=None,
+        stages=2,
+        mode=0,
+        trace=False,
+        merge_tile=64,
+        merge_warps=4,
+    ):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "Paged split-KV storage must be prepared before graph capture"
             )
         self.batch = lengths.numel()
+        self.merge_tile, self.merge_warps = merge_tile, merge_warps
         self.heads = query.shape[-2]
         self.qlen = query.shape[0] // self.batch
         self.splits = splits or 148 // self.batch
@@ -728,7 +737,7 @@ class Q16SplitPlan:
             cutlass.Float32(v_scale / 256.0),
             stream,
         )
-        _merge_attention[(self.rows, triton.cdiv(256, 64), self.batch)](
+        _merge_attention[(self.rows, triton.cdiv(256, self.merge_tile), self.batch)](
             self.partial,
             self.maximum,
             self.denom,
@@ -737,12 +746,12 @@ class Q16SplitPlan:
             self.rows,
             self.splits,
             triton.next_power_of_2(self.splits),
-            64,
+            self.merge_tile,
             128,
             False,
             True,
             True,
-            num_warps=4,
+            num_warps=self.merge_warps,
             enable_fp_fusion=False,
         )
         return out
