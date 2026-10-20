@@ -95,6 +95,7 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.utils import (
     is_cuda,
     is_cuda_alike,
+    is_hip,
     is_npu,
     is_pin_memory_available,
 )
@@ -105,6 +106,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_is_hip = is_hip()
 _is_npu = is_npu()
 
 
@@ -411,7 +413,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 tp_sync=self._tp_sync,
                 fused_argmax=target_is_dsv41,
                 simulated_correct_len=self._simulated_correct_len,
-                simulate_fold=envs.SGLANG_DSPARK_SIMULATE_FOLD.get(),
+                simulate_fold=_is_hip and envs.SGLANG_DSPARK_SIMULATE_FOLD.get(),
                 fused_accept_tail=envs.SGLANG_DSPARK_FUSED_ACCEPT_TAIL.get(),
                 accept_tail_min_bs=envs.SGLANG_DSPARK_ACCEPT_TAIL_MIN_BS.get(),
                 accept_tail_max_bs=envs.SGLANG_DSPARK_ACCEPT_TAIL_MAX_BS.get(),
@@ -460,7 +462,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
 
         self._simulate_acc_greedy = (
-            self._simulate_acc_len > 0 and envs.SGLANG_SIMULATE_ACC_GREEDY.get()
+            _is_hip
+            and self._simulate_acc_len > 0
+            and envs.SGLANG_SIMULATE_ACC_GREEDY.get()
         )
         if (
             self._simulate_acc_len > 0
