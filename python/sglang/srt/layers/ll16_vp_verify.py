@@ -58,6 +58,8 @@ class VpVerify:
     ):
         import torch.distributed._symmetric_memory as symm_mem
 
+        from sglang.srt.model_executor.runner_backend import ab_variants
+
         self.rank = rank
         self.world = world
         self.max_rows = max_rows
@@ -94,7 +96,13 @@ class VpVerify:
         self.meta = torch.zeros(4, dtype=torch.int32, device=device)
         self._begin = self.logits.data_ptr()
         self._end = self._begin + self.logits.numel() * self.logits.element_size()
-        self.proof = VpProof() if envs.SGLANG_Q35MF_LL16_VPSAMP_PROOF.get() else None
+        # Built when the process or any same-server A/B variant sets the proof switch; checks are
+        # captured only where the switch is on.
+        self.proof = (
+            VpProof()
+            if ab_variants.env_any("SGLANG_Q35MF_LL16_VPSAMP_PROOF", "1")
+            else None
+        )
         self._logged = False
 
     def owns(self, logits: torch.Tensor) -> bool:
@@ -235,7 +243,7 @@ class VpVerify:
             rank=self.rank,
             sample=sample,
         )
-        if self.proof is not None:
+        if self.proof is not None and envs.SGLANG_Q35MF_LL16_VPSAMP_PROOF.get():
             self.proof.check(
                 vp=self,
                 argmax=argmax,
