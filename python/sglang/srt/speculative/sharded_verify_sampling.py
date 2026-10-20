@@ -957,6 +957,85 @@ class ShardedVerifySampler:
         )
         return ids, vals, argmax
 
+    def sparse_support_dep(
+        self, *, logits: torch.Tensor, max_top_k: int, owner_rows: int, valid_vocab: int
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """DEP layout (dp attention + tp-lm-head all-to-all): logits [world * owner_rows, V / world] hold every
+        DP rank's rows on this rank's vocab shard, row block w belonging to rank w. Shard top-k and argmax of
+        every row, one all-to-all of the candidates to the row owners, then the merge: (ids [owner_rows, k]
+        int64, float32 values [owner_rows, k], argmax [owner_rows] int64) of this rank's rows, equal to
+        sparse_support on the owner's gathered rows. k must be the same on every rank; valid_vocab drops the
+        shard's padding columns."""
+        rows, _ = logits.shape
+        assert rows == self.world * owner_rows
+        dev = logits.device
+        k = int(max_top_k)
+        nchunk = triton.cdiv(valid_vocab, _DB1_CHUNK)
+        vocab_start = self.rank * logits.shape[1]
+        cmax = torch.empty((rows, nchunk), dtype=torch.int64, device=dev)
+        thr = torch.empty((rows,), dtype=torch.int64, device=dev)
+        cnt = torch.empty((rows,), dtype=torch.int32, device=dev)
+        cand = torch.empty((rows, _DB1_CAP), dtype=torch.int64, device=dev)
+        send = torch.empty((rows * k * 2,), dtype=torch.float32, device=dev)
+        _db1_chunk_max_kernel[(rows, nchunk)](
+            logits, logits.stride(0), valid_vocab, cmax, nchunk, CH=_DB1_CHUNK, num_warps=4
+        )
+        _db1_threshold_kernel[(rows,)](
+            cmax, nchunk, thr, cnt, K=k, BN=_next_pow2(nchunk), num_warps=4
+        )
+        _db1_compact_kernel[(rows, nchunk)](
+            logits,
+            logits.stride(0),
+            valid_vocab,
+            vocab_start,
+            thr,
+            cnt,
+            cand,
+            CAP=_DB1_CAP,
+            CH=_DB1_CHUNK,
+            num_warps=4,
+        )
+        # One slot per row (WORLD 1): send[r] = this shard's top-k of row r; block w goes to rank w.
+        _db1_select_kernel[(rows,)](
+            logits,
+            logits.stride(0),
+            valid_vocab,
+            vocab_start,
+            nchunk,
+            cand,
+            cnt,
+            send,
+            0,
+            rows,
+            WORLD=1,
+            K=k,
+            KP2=_next_pow2(k),
+            CAP=_DB1_CAP,
+            CH=_DB1_CHUNK,
+            num_warps=4,
+        )
+        recv = torch.empty_like(send)
+        if self.world > 1:
+            get_parallel().tp_group.all_to_all_single(recv, send)
+        else:
+            recv.copy_(send)
+        vals = torch.empty((owner_rows, k), dtype=torch.float32, device=dev)
+        ids = torch.empty((owner_rows, k), dtype=torch.int64, device=dev)
+        argmax = torch.empty((owner_rows,), dtype=torch.int64, device=dev)
+        # recv is [source rank, owner_rows, k, 2]: the merge's slot layout with WORLD = world.
+        _db1_global_merge_kernel[(owner_rows,)](
+            recv,
+            owner_rows,
+            vals,
+            ids,
+            argmax,
+            WORLD=self.world,
+            K=k,
+            BW=_next_pow2(self.world * k),
+            num_warps=4,
+        )
+        return ids, vals, argmax
+
     def count(self, kind: str, bs: int) -> None:
         if not self.logged and kind != "gathered":
             self.logged = True
