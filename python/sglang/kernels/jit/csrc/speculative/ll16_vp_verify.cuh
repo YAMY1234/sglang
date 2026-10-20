@@ -104,8 +104,10 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_shard_kernel(const Ll16VpSha
   using namespace device;
   using vec_t = AlignedVector<bf16_t, 8>;
   constexpr int kWarps = kThreads / 32;
-  __shared__ float s_m[kWarps];
-  __shared__ float s_z[kWarps];
+  // Vectors per thread per chunk: every load of the row is issued before any reduction.
+  constexpr int kPer = ll16_vp::kMaxChunk / 8 / kThreads;
+  __shared__ float s_m[ll16_vp::kChunks][kWarps];
+  __shared__ float s_z[ll16_vp::kChunks][kWarps];
   __shared__ uint32_t s_k[kWarps];
   __shared__ int32_t s_i[kWarps];
   __shared__ float s_cm[ll16_vp::kChunks];
@@ -114,22 +116,36 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_shard_kernel(const Ll16VpSha
   PDLWaitPrimary<kUsePDL>();
 
   const int g = static_cast<int>(blockIdx.x);
-  const int warp = static_cast<int>(threadIdx.x / 32);
+  const int t = static_cast<int>(threadIdx.x);
+  const int warp = t / 32;
+  const int lane = static_cast<int>(get_lane_id());
   const bf16_t* row = p.logits + static_cast<int64_t>(g) * p.ld;
+  vec_t x[ll16_vp::kChunks][kPer];
+#pragma unroll
+  for (int c = 0; c < ll16_vp::kChunks; ++c) {
+    const int lo8 = min(c * p.chunk, p.vocab) / 8;
+    const int hi8 = min(c * p.chunk + p.chunk, p.vocab) / 8;
+#pragma unroll
+    for (int i = 0; i < kPer; ++i) {
+      const int v = lo8 + t + i * kThreads;
+      if (v < hi8) x[c][i].load(row, v);
+    }
+  }
   uint32_t best = 0u;
   int32_t bidx = 0x7fffffff;
-#pragma unroll 1
+#pragma unroll
   for (int c = 0; c < ll16_vp::kChunks; ++c) {
-    const int lo = min(c * p.chunk, p.vocab);
-    const int hi = min(lo + p.chunk, p.vocab);
+    const int lo8 = min(c * p.chunk, p.vocab) / 8;
+    const int hi8 = min(c * p.chunk + p.chunk, p.vocab) / 8;
     float m = -INFINITY;
     float z = 0.f;
-    for (int v = lo / 8 + static_cast<int>(threadIdx.x); v < hi / 8; v += kThreads) {
-      vec_t x;
-      x.load(row, v);
+#pragma unroll
+    for (int i = 0; i < kPer; ++i) {
+      const int v = lo8 + t + i * kThreads;
+      if (v >= hi8) continue;
 #pragma unroll
       for (int e = 0; e < 8; ++e) {
-        const float f = cast<fp32_t>(x[e]);
+        const float f = cast<fp32_t>(x[c][i][e]);
         const uint32_t key = f == f ? ll16_vp::order_key(f) : ll16_vp::kNanKey;
         const int32_t idx = v * 8 + e;
         if (ll16_vp::better(key, idx, best, bidx)) {
@@ -154,20 +170,10 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_shard_kernel(const Ll16VpSha
       const float oz = __shfl_xor_sync(0xffffffffu, z, off);
       ll16_vp::merge(m, z, om, oz);
     }
-    if (get_lane_id() == 0) {
-      s_m[warp] = m;
-      s_z[warp] = z;
+    if (lane == 0) {
+      s_m[c][warp] = m;
+      s_z[c][warp] = z;
     }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-      float bm = s_m[0];
-      float bz = s_z[0];
-      for (int w = 1; w < kWarps; ++w)
-        ll16_vp::merge(bm, bz, s_m[w], s_z[w]);
-      s_cm[c] = bz == 0.f ? -INFINITY : bm;
-      s_cz[c] = bz;
-    }
-    __syncthreads();
   }
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1) {
@@ -178,9 +184,18 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_shard_kernel(const Ll16VpSha
       bidx = oi;
     }
   }
-  if (get_lane_id() == 0) {
+  if (lane == 0) {
     s_k[warp] = best;
     s_i[warp] = bidx;
+  }
+  __syncthreads();
+  if (t < ll16_vp::kChunks) {
+    float bm = s_m[t][0];
+    float bz = s_z[t][0];
+    for (int w = 1; w < kWarps; ++w)
+      ll16_vp::merge(bm, bz, s_m[t][w], s_z[t][w]);
+    s_cm[t] = bz == 0.f ? -INFINITY : bm;
+    s_cz[t] = bz;
   }
   __syncthreads();
 
@@ -590,6 +605,7 @@ struct Ll16VpVerify {
   static constexpr int kDecideThreads = 128;
   static constexpr int kPullThreads = 256;
   static_assert(ll16_vp::kMaxChunk % (8 * kDecideThreads) == 0, "chunk vectors split evenly over the threads");
+  static_assert(ll16_vp::kMaxChunk % (8 * kShardThreads) == 0, "chunk vectors split evenly over the threads");
 
   static void shard(
       const tvm::ffi::TensorView logits,
