@@ -1211,7 +1211,8 @@ _krne_done: set[int] = set()
 
 def krne_dump(layer_id: int, hidden_states: torch.Tensor) -> None:
     """Debug (SGLANG_Q35MF_KRNE_DUMP_DIR): collect real MoE-input rows for the router T1, skipping the first 64 rows
-    of every call; writes moe_in_L<layer>.pt once SGLANG_Q35MF_KRNE_DUMP_ROWS rows are in."""
+    and keeping at most 1024 rows of every call (several prompts per layer); writes moe_in_L<layer>.pt once
+    SGLANG_Q35MF_KRNE_DUMP_ROWS rows are in."""
     out_dir = envs.SGLANG_Q35MF_KRNE_DUMP_DIR.get()
     if (
         not out_dir
@@ -1226,7 +1227,7 @@ def krne_dump(layer_id: int, hidden_states: torch.Tensor) -> None:
     want = envs.SGLANG_Q35MF_KRNE_DUMP_ROWS.get()
     got = _krne_rows.setdefault(layer_id, [])
     have = sum(r.shape[0] for r in got)
-    got.append(rows[: want - have].to("cpu", copy=True))
+    got.append(rows[: min(want - have, 1024)].to("cpu", copy=True))
     if have + got[-1].shape[0] < want:
         return
     os.makedirs(out_dir, exist_ok=True)
