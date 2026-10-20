@@ -3,9 +3,9 @@
 Each rank computes every gathered row's logits on its vocab shard (K75P); instead of the pair
 all-gather and select, each rank sends its candidate to the row's owner, which picks the token
 with K75P's keys and ties and, in draft decode steps, also writes the topk1 finish outputs.
-With the memo (SGLANG_Q35MF_DEP_DX_MEMO) the candidate carries its row of the served pre-fc
-embedding norm and the owner writes the next step's fc input; the hidden half is normed on a
-side stream beside the lm_head, so the next step skips the embedding, both norms and the cat.
+With the memo (SGLANG_Q35MF_DEP_DX_MEMO_FULL) the owner also writes the winner's row of the served
+pre-fc embedding norm into the next step's fc input; the hidden half is normed on a side stream
+beside the lm_head, so the next step skips the embedding, both norms and the cat.
 """
 
 from __future__ import annotations
@@ -21,7 +21,6 @@ import torch.distributed as dist
 from sglang.kernels.ops.speculative.e2x_dep_xchg import (
     MAX_BLOCKS,
     SLOT_MARKER,
-    dep_data_shape,
     dep_slots_shape,
     e2x_dep_xchg,
 )
@@ -83,9 +82,6 @@ class DepDraftXchg:
         self.no_rows = torch.empty(0, dtype=torch.bfloat16, device=device)
         # Memo state (enable_memo): fc_in holds the next draft step's fc input.
         self.memo: Optional[torch.Tensor] = None
-        self.memo_full = False
-        self.data: Optional[torch.Tensor] = None
-        self.peer_data: Optional[torch.Tensor] = None
         self.fc_in: Optional[torch.Tensor] = None
         self.side_stream: Optional[torch.cuda.Stream] = None
         self._produce = False
@@ -104,51 +100,28 @@ class DepDraftXchg:
         *,
         embed_weight: torch.Tensor,
         norm: Callable[[torch.Tensor], torch.Tensor],
-        vocab_local: int,
-        full: bool,
+        vocab: int,
     ) -> None:
-        """Collective. Normalized embedding rows built with the served norm: this rank's vocab shard,
-        sent with each candidate, or (``full``) the whole vocab, read by the owner."""
-        import torch.distributed._symmetric_memory as symm_mem
-
+        """Collective (the check all-reduces). The whole vocab's rows of the served pre-fc embedding norm."""
         hidden = embed_weight.shape[1]
-        start = 0 if full else self.rank * vocab_local
-        count = self.world * vocab_local if full else vocab_local
-        if embed_weight.shape[0] < self.world * vocab_local or hidden % 8 != 0:
+        if embed_weight.shape[0] < vocab or vocab % self.world != 0 or hidden % 8 != 0:
             raise RuntimeError(
                 f"DEP-DX memo needs the full embedding table, got {tuple(embed_weight.shape)}"
             )
-        rows = embed_weight[start : start + count]
-        memo = torch.empty((count, hidden), dtype=torch.bfloat16, device=rows.device)
-        for i in range(0, count, _MEMO_BLOCK):
+        rows = embed_weight[:vocab]
+        memo = torch.empty((vocab, hidden), dtype=torch.bfloat16, device=rows.device)
+        for i in range(0, vocab, _MEMO_BLOCK):
             memo[i : i + _MEMO_BLOCK] = norm(rows[i : i + _MEMO_BLOCK].contiguous())
         self._check_memo(memo=memo, rows=rows, norm=norm)
         self.memo = memo
-        self.memo_full = full
         self.fc_in = torch.zeros(
             (self.max_rows, 2 * hidden), dtype=torch.bfloat16, device=rows.device
         )
         self.side_stream = torch.cuda.Stream(device=rows.device)
         logger.info(
-            "DEP-DX memo active (vocab rows %d:%d, %.1f MB on this rank).",
-            start,
-            start + count,
+            "DEP-DX memo active (%d rows, %.1f MB on this rank).",
+            vocab,
             memo.numel() * 2 / 2**20,
-        )
-        if full:
-            return
-        with torch.inference_mode(False), torch.no_grad():
-            data = symm_mem.empty(
-                dep_data_shape(self.world * self.max_rows, self.world, hidden),
-                dtype=torch.bfloat16,
-                device=rows.device,
-            )
-        hdl = symm_mem.rendezvous(data, group=self.device_group)
-        if int(hdl.buffer_ptrs[self.rank]) != data.data_ptr():
-            raise RuntimeError("DEP-DX memo: unexpected symmetric memory layout")
-        self.data = data
-        self.peer_data = torch.tensor(
-            [int(p) for p in hdl.buffer_ptrs], dtype=torch.int64, device=rows.device
         )
 
     def _check_memo(
@@ -261,11 +234,9 @@ class DepDraftXchg:
             if mrope is None or mrope.shape != (3, rows) or mrope.stride(1) != 1:
                 mrope = self.no_ints
             topk_p = torch.empty((rows, 1), dtype=torch.float32, device=logits.device)
-        memo = data = peer_data = fc_out = self.no_rows
+        memo = fc_out = self.no_rows
         if step is not None and self._produce:
             memo = self.memo
-            if not self.memo_full:
-                data, peer_data = self.data, self.peer_data
             fc_out = self.fc_in[:rows, : self.memo.shape[1]]
         before = None
         if self.proof is not None and step is not None:
@@ -284,10 +255,7 @@ class DepDraftXchg:
             positions=positions,
             mrope_positions=mrope,
             memo=memo,
-            data=data,
-            peer_data=peer_data,
             fc_out=fc_out,
-            memo_full=self.memo_full,
             vocab_start=self.rank * logits.shape[1],
             torch_nan=torch_nan,
             rank=self.rank,
