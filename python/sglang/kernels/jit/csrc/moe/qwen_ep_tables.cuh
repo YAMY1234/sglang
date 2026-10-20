@@ -1,8 +1,9 @@
 // Cute-DSL grouped-GEMM routing tables for the experts of one EP rank, from the top-k ids an A2A dispatch
 // received (global expert ids; padding rows carry an out-of-range id), in one single-CTA launch.
 // Same table layout as flashinfer.fused_moe.cute_dsl moe_sort: tiles in ascending local-expert order,
-// mn-limit = tile start + rows of the expert in that tile, -1 for non-local entries and for the unused rows
-// of a tile. Rows inside an expert are ranked by shared-memory atomics, as FlashInfer's routing does.
+// mn-limit = tile start + rows of the expert in that tile, -1 for non-local entries; like moe_sort, the unused
+// rows of a tile are left unwritten (the GEMMs mask them by mn-limit). Rows inside an expert are ranked by
+// shared-memory atomics, as FlashInfer's routing does.
 
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.cuh>
@@ -76,7 +77,6 @@ __global__ __launch_bounds__(kThreads, 1) void ep_tables_kernel(const __grid_con
     const int32_t limit = min(end, (tile_offset << p.tile_log2) + count);
     p.tile_idx_to_expert_idx[tile_offset + c] = static_cast<int32_t>(e);
     p.tile_idx_to_mn_limit[tile_offset + c] = limit;
-    for (int32_t r = limit; r < end; ++r) p.permuted_idx_to_expanded_idx[r] = -1;
   }
   if (e < kMaxLocalExperts) s_offset[e] = tile_offset << p.tile_log2;
   if (e == 0) {

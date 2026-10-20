@@ -1292,6 +1292,9 @@ class Envs:
     # FlashInfer A2A (EP) NVFP4 dispatch at up to 64 tokens per rank: softmax top-10 and the dispatch-side NVFP4
     # input quant in one launch, with the router GEMM in it up to 16 tokens (same logits, ids, weights and payload).
     SGLANG_Q35MF_DEP_ROUTE_FRONT = EnvBool(False)
+    # FlashInfer A2A dispatch into the cute-dsl runner: the EP rank's routing tables from one single-CTA launch over
+    # the received ids instead of moe_sort, and the finalize written straight into the combine workspace.
+    SGLANG_Q35MF_DEP_EP_TABLES = EnvBool(False)
     # Dual-stream deferred-finalize MoE at up to this many tokens (0 = off): the whole shared expert
     # on a top-priority side stream (same kernels and outputs; only scheduling changes).
     SGLANG_Q35MF_K4_SIDE_PRIO_MAX_TOKENS = EnvInt(0)

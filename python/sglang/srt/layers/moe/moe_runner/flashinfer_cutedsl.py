@@ -534,6 +534,65 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
     return StandardCombineInput(hidden_states=output)
 
 
+def _experts_from_ep_tables(
+    quant_info: CuteDslFp4MoeQuantInfo,
+    x_fp4: torch.Tensor,
+    x_sf: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    moe_output: torch.Tensor,
+) -> torch.Tensor:
+    """wrapper.run with the routing tables from one qwen_ep_tables launch instead of moe_sort, finalized
+    straight into the combine workspace (SGLANG_Q35MF_DEP_EP_TABLES; same tactic and GEMM kernels)."""
+    from flashinfer.autotuner import AutoTuner
+
+    from sglang.kernels.ops.moe.qwen_ep_tables import ep_tables
+    from sglang.srt.layers.moe.qwen_router_front import (
+        _choose_tactic,
+        _run_experts_from_tables,
+    )
+
+    wrapper = quant_info.wrapper
+    inputs = [
+        x_fp4,
+        x_sf,
+        topk_ids,
+        topk_weights,
+        quant_info.w13_weight,
+        quant_info.w13_weight_sf,
+        quant_info.w1_alpha,
+        quant_info.a2_scale,
+        quant_info.w2_weight,
+        quant_info.w2_weight_sf,
+        quant_info.w2_alpha,
+        moe_output,
+    ]
+    tactic = _choose_tactic(wrapper, inputs)
+    bufs = ep_tables(
+        topk_ids,
+        topk_weights,
+        x_fp4,
+        local_offset=wrapper.local_expert_offset,
+        num_local=wrapper.num_local_experts,
+        tile_size=tactic[0],
+    )
+    return _run_experts_from_tables(
+        wrapper=wrapper,
+        bufs=bufs,
+        x_sf=x_sf,
+        w1_weight=quant_info.w13_weight,
+        w1_weight_sf=quant_info.w13_weight_sf,
+        w1_alpha=quant_info.w1_alpha,
+        fc2_input_scale=quant_info.a2_scale,
+        w2_weight=quant_info.w2_weight,
+        w2_weight_sf=quant_info.w2_weight_sf,
+        w2_alpha=quant_info.w2_alpha,
+        tactic=tactic,
+        moe_output=moe_output,
+        use_async_memset=not AutoTuner.get().is_tuning_mode,
+    )
+
+
 @register_fused_func("flashinfer", "flashinfer_cutedsl")
 def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
     dispatch_output: FlashinferDispatchOutput,
@@ -607,6 +666,17 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
         x_sf = x_sf.view(torch.float8_e4m3fn).reshape(
             seq_len, hidden_size // _FP4_SF_VEC_SIZE
         )
+
+    if (
+        envs.SGLANG_Q35MF_DEP_EP_TABLES.get()
+        and quant_info.quant_mode == "w4a4"
+        and per_token_scale is None
+        and dispatch_output.moe_output is not None
+    ):
+        output = _experts_from_ep_tables(
+            quant_info, x_fp4, x_sf, topk_ids, topk_weights, dispatch_output.moe_output
+        )
+        return FlashinferCombineInput(hidden_states=output)
 
     output = quant_info.wrapper.run(
         x=x_fp4,
