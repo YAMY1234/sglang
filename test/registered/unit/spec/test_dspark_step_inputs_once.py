@@ -86,6 +86,7 @@ class TestAllocVerifyWindowOnce(unittest.TestCase):
 
         from sglang.kernels.ops.speculative import cache_locs
         from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+        from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
         from sglang.srt.speculative.dspark_components.dspark_planner import (
             alloc_verify_window,
         )
@@ -95,7 +96,7 @@ class TestAllocVerifyWindowOnce(unittest.TestCase):
         translator = KVIndexTranslator.__new__(KVIndexTranslator)
         translator.page_size = 1
         translator.req_to_token = torch.randperm(8 * pool_len).view(8, pool_len).to(dev)
-        translator._spaces = {}
+        translator._spaces = {IdSpaceKind.FULL: IdSpace(key="full")}
         runner = type("R", (), {"kv_index_translator": translator})()
         batch = type("B", (), {})()
         batch.seq_lens = torch.tensor([0, 5, 30, 56], device=dev)
