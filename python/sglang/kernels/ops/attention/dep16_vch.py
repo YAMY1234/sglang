@@ -133,7 +133,7 @@ def _vch_merge_kernel(q_ptr, q_stride_t, q_stride_h, k_ptr, v_ptr, kv_s_page, kv
                       pt_stride, lens_ptr, ov_ptr, lv_ptr, cs_ptr, cn_ptr, out_ptr, out_stride_t, gate_ptr,
                       gate_stride_t, gate_stride_h, scale_ptr, bmm1_log2, bmm2, QL: tl.constexpr, NH: tl.constexpr,
                       G: tl.constexpr, PG: tl.constexpr, D: tl.constexpr, ROWS_V: tl.constexpr, CB: tl.constexpr,
-                      GATE_QUANT: tl.constexpr):
+                      GATE_QUANT: tl.constexpr, USE_PDL: tl.constexpr):
     """One program per output row (request, row t, head): chunk partials merged by log2 LSE, plus the FP32
     causal tail. GATE_QUANT: bf16(o) * sigmoid(gate) -> bf16 -> / scale -> clamp +-448 -> FP8, the same
     arithmetic as fused_sigmoid_mul(static_scale=...)."""
@@ -146,6 +146,9 @@ def _vch_merge_kernel(q_ptr, q_stride_t, q_stride_h, k_ptr, v_ptr, kv_s_page, kv
     h = head % G
     rr = kvh * (QL * G) + t * G + h
     d = tl.arange(0, D)
+    if USE_PDL:
+        # Every input is upstream of the q1 prefix call, which waits on its own predecessor before it can finish.
+        tl.extra.cuda.gdc_wait()
     L = tl.load(lens_ptr + i)
     cs = tl.load(cs_ptr + i)
     cn = tl.load(cn_ptr + i)
@@ -223,6 +226,7 @@ class VchState:
         self.ov = buf("ov", (nv, self.rows_v, head_dim), torch.float16)
         self.lv = buf("lv", (nv, self.rows_v), torch.float32)
         self.workspace, self.counter = workspace, counter
+        self.use_pdl = torch.cuda.get_device_capability(device)[0] >= 9
 
     def plan(self, seq_lens: torch.Tensor, page_table: torch.Tensor):
         """Once per forward: chunk plan from the device seq_lens and the per-chunk page tables."""
@@ -260,5 +264,6 @@ class VchState:
             page_table, page_table.stride(0), seq_lens, self.ov, self.lv, self.cs, self.cn, out, out.stride(0),
             gate if gq else out, gate.stride(0) if gq else 0, gate.stride(1) if gq else 0,
             scale if gq else self.lv, float(bmm1_scale) * math.log2(math.e), float(bmm2_scale), QL=QLEN, NH=self.nh,
-            G=self.g, PG=self.pg, D=self.d, ROWS_V=self.rows_v, CB=16, GATE_QUANT=gq, num_warps=4)
+            G=self.g, PG=self.pg, D=self.d, ROWS_V=self.rows_v, CB=16, GATE_QUANT=gq, USE_PDL=self.use_pdl,
+            num_warps=4, **({"launch_pdl": True} if self.use_pdl else {}))
         return out
