@@ -302,6 +302,9 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_decide_kernel(const Ll16VpDe
   __shared__ int32_t s_ret[ll16_vp::kMaxD];
   __shared__ float s_coin[ll16_vp::kMaxD];
   __shared__ float s_coin_final;
+  __shared__ float s_q[ll16_vp::kMaxD];
+  __shared__ float s_mass[ll16_vp::kMaxD][ll16_vp::kMaxWorld];
+  __shared__ float s_cmass[ll16_vp::kMaxD][ll16_vp::kMaxWorld][ll16_vp::kChunks];
   __shared__ float s_M[ll16_vp::kMaxD];
   __shared__ float s_S[ll16_vp::kMaxD];
   __shared__ float s_xd[ll16_vp::kMaxD];
@@ -410,6 +413,28 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_decide_kernel(const Ll16VpDe
   }
   if (!p.sample) return;
   __syncthreads();
+  // Every probability the serial chain may need, in parallel: q of each draft token, and the shard and chunk
+  // masses of every row (the final row is known only after the chain).
+  if (t < p.d - 1) {
+    const float M = s_M[t];
+    const float xd = s_xd[t];
+    s_q[t] = xd > -INFINITY ? __expf(xd - (M > -INFINITY ? M : 0.f)) / s_S[t] : 0.f;
+  }
+  for (int pair = t; pair < p.d * p.world; pair += kThreads) {
+    const int r = pair / p.world;
+    const int w = pair % p.world;
+    const float M = s_M[r];
+    const float m_safe = M > -INFINITY ? M : 0.f;
+    const float S = s_S[r];
+    const float mw = s_mw[r][w];
+    s_mass[r][w] = mw > -INFINITY ? s_sw[r][w] * __expf(mw - m_safe) / S : 0.f;
+#pragma unroll
+    for (int c = 0; c < ll16_vp::kChunks; ++c) {
+      const float mc = s_cm[r][w][c];
+      s_cmass[r][w][c] = mc > -INFINITY ? s_cz[r][w][c] * __expf(mc - m_safe) / S : 0.f;
+    }
+  }
+  __syncthreads();
   ll16_vp::stamp(p.trace, b * 8 + 1);
 
   if (t == 0) {
@@ -423,11 +448,7 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_decide_kernel(const Ll16VpDe
     float q_excl = 0.f;
     for (int j = 1; j < p.d; ++j) {
       if (j >= p.accept_width) break;
-      const int r = j - 1;
-      const float M = s_M[r];
-      const float m_safe = M > -INFINITY ? M : 0.f;
-      const float xd = s_xd[r];
-      const float q = xd > -INFINITY ? __expf(xd - m_safe) / s_S[r] : 0.f;
+      const float q = s_q[j - 1];
       const int64_t dtok = s_cand[j];
       const bool acc = alive && q > 0.f && (coin < q || q >= 1.f);
       if (acc) {
@@ -448,14 +469,10 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_decide_kernel(const Ll16VpDe
 
     // Final draw from row cur_row minus the rejected draft's mass: shard, then chunk, in vocab order.
     const int r = cur_row;
-    const float M = s_M[r];
-    const float m_safe = M > -INFINITY ? M : 0.f;
-    const float S = s_S[r];
     const int excl_owner = excl >= 0 ? static_cast<int>(excl / p.vocab) : -1;
     float total = 0.f;
     for (int w = 0; w < p.world; ++w) {
-      const float mw = s_mw[r][w];
-      float mass = mw > -INFINITY ? s_sw[r][w] * __expf(mw - m_safe) / S : 0.f;
+      float mass = s_mass[r][w];
       if (w == excl_owner) mass = mass - q_excl;
       total += fmaxf(mass, 0.f);
     }
@@ -466,8 +483,7 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_decide_kernel(const Ll16VpDe
     int last_pos = 0;
     float last_mass = 0.f;
     for (int w = 0; w < p.world; ++w) {
-      const float mw = s_mw[r][w];
-      float mass = mw > -INFINITY ? s_sw[r][w] * __expf(mw - m_safe) / S : 0.f;
+      float mass = s_mass[r][w];
       if (w == excl_owner) mass = mass - q_excl;
       mass = fmaxf(mass, 0.f);
       if (sel < 0 && cum + mass > u) {
@@ -488,9 +504,7 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_decide_kernel(const Ll16VpDe
     const bool excl_here = excl >= 0 && excl_local >= 0 && excl_local < p.vocab;
     float cmass[ll16_vp::kChunks];
     for (int c = 0; c < ll16_vp::kChunks; ++c) {
-      const float mc = s_cm[r][sel][c];
-      const float zc = s_cz[r][sel][c];
-      float mass = mc > -INFINITY ? zc * __expf(mc - m_safe) / S : 0.f;
+      float mass = s_cmass[r][sel][c];
       if (excl_here && c == static_cast<int>(excl_local / p.chunk)) mass = fmaxf(mass - q_excl, 0.f);
       cmass[c] = mass;
     }
