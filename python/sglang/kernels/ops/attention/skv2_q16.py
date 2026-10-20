@@ -344,7 +344,8 @@ class Q16SplitDecode:
                         cute.arch.mbarrier_arrive(bsfree + slot)
                         last = limit - (begin_tok + it * self.tile + wg * half)
                         if cutlass.const_expr(not self.mode & 16):
-                            if last < half - 1:
+                            # Only a split's last block can hold tokens past end_tok or the causal limit (uniform test).
+                            if it == nblk - 1:
                                 # One scalar select per column; a conditional store into vals would make every
                                 # branch carry the whole fragment.
                                 for j in cutlass.range_constexpr(half):
