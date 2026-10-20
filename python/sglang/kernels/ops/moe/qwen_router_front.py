@@ -291,11 +291,9 @@ def router_splitk_front(
     weight: torch.Tensor,
     global_scale: torch.Tensor,
     slices: int,
-    multicast: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Split-K router GEMM (`slices` = 8 or 16 K slices, fp32 partials summed in increasing slice order), softmax
-    top-10 + renormalize and NVFP4 input quant (M <= 64). Same outputs as router_topk_quant. `multicast` (16 slices
-    only): the 8 expert groups of a slice share its token rows through a cluster multicast (same arithmetic)."""
+    top-10 + renormalize and NVFP4 input quant (M <= 64). Same outputs as router_topk_quant."""
     m = x.shape[0]
     logits = torch.empty((m, NUM_EXPERTS), dtype=torch.bfloat16, device=x.device)
     topk_weights = torch.empty((m, TOP_K), dtype=torch.float32, device=x.device)
@@ -313,7 +311,6 @@ def router_splitk_front(
         x_fp4,
         x_sf,
         slices,
-        int(multicast),
     )
     return logits, topk_weights, topk_ids, x_fp4, x_sf
 

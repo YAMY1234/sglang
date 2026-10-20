@@ -1371,93 +1371,6 @@ __global__ __launch_bounds__(kThreads, 1) void router_splitk_gemm_kernel(const _
   }
 }
 
-SGL_DEVICE uint32_t cluster_ctarank() {
-  uint32_t r;
-  asm volatile("mov.u32 %0, %%cluster_ctarank;" : "=r"(r));
-  return r;
-}
-
-SGL_DEVICE void cluster_sync() {
-  asm volatile("barrier.cluster.arrive.release.aligned;\nbarrier.cluster.wait.acquire.aligned;" ::: "memory");
-}
-
-SGL_DEVICE void bulk_load_multicast(uint32_t dst, const void* src, uint32_t bytes, uint32_t bar, uint16_t mask) {
-  asm volatile(
-      "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster [%0], [%1], %2, [%3], %4;" ::
-          "r"(dst),
-      "l"(src),
-      "r"(bytes),
-      "r"(bar),
-      "h"(mask)
-      : "memory");
-}
-
-// router_splitk_gemm_kernel with the token rows shared by the 8 expert groups of a K slice: the CTAs of one slice
-// form a cluster, CTA rank r loads rows r, r + 8, ... once and multicasts them to all 8 (same arithmetic).
-template <bool kUsePDL, uint32_t kSlices>
-__global__ __launch_bounds__(kThreads, 1) void router_splitk_gemm_mc_kernel(const __grid_constant__ SkParams p) {
-  using L = SkSmem<kSlices>;
-  extern __shared__ __align__(128) uint8_t smem[];
-  const uint32_t warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-  const uint32_t M = p.num_tokens;
-  const uint32_t g = blockIdx.x % kSkGroups, s = blockIdx.x / kSkGroups;
-  const uint32_t rank = cluster_ctarank();
-  const uint32_t expert0 = g * kSkExperts, k0 = s * L::kSliceK;
-  const uint32_t bar_x = smem_addr(smem + L::kBytes);
-  if (threadIdx.x == 0) mbar_init(bar_x, 1);
-  for (uint32_t i = threadIdx.x; i < kSkExperts * L::kChunks; i += kThreads) {
-    const uint32_t e = i / L::kChunks, c = i % L::kChunks;
-    cp_async16(smem_addr(smem + L::kW + e * L::kRowBytes + c * 16),
-               p.weight + static_cast<size_t>(expert0 + e) * kHidden + k0 + c * 8);
-  }
-  cp_async_commit();
-  // Every CTA's barrier is initialized before any peer multicasts into it.
-  cluster_sync();
-  device::PDLWaitPrimary<kUsePDL>();
-  device::PDLTriggerSecondary<kUsePDL>();
-  if (warp == 0) {
-    if (lane == 0) mbar_expect_tx(bar_x, M * L::kSliceK * 2);
-    for (uint32_t t = rank + kSkGroups * lane; t < M; t += kSkGroups * 32) {
-      bulk_load_multicast(smem_addr(smem + L::kX + t * L::kRowBytes), p.x + static_cast<size_t>(t) * kHidden + k0,
-                          L::kSliceK * 2, bar_x, static_cast<uint16_t>((1u << kSkGroups) - 1));
-    }
-  }
-  cp_async_wait_all();
-  mbar_wait(bar_x, 0);
-  __syncthreads();
-  const uint32_t mg = warp >> 1, nq = warp & 1;
-  const bool active = mg * 16 < M;
-  if (active) {
-    const uint32_t j = lane >> 3, r = lane & 7;
-    const uint32_t tok = mg * 16 + (j & 1) * 8 + r;
-    const uint32_t a_addr = smem_addr(smem + L::kX + (tok < M ? tok : 0) * L::kRowBytes + (j >> 1) * 16);
-    const uint32_t b_addr0 = smem_addr(smem + L::kW + (nq * 32 + (j >> 1) * 8 + r) * L::kRowBytes + (j & 1) * 16);
-    const uint32_t b_addr1 = b_addr0 + 16 * L::kRowBytes;
-    float d[4][4] = {};
-#pragma unroll 4
-    for (uint32_t step = 0; step < L::kSliceK / 16; ++step) {
-      uint32_t a[4], b0[4], b1[4];
-      ldmatrix_x4(a, a_addr + step * 32);
-      ldmatrix_x4(b0, b_addr0 + step * 32);
-      ldmatrix_x4(b1, b_addr1 + step * 32);
-      mma_bf16_16816(d[0], a[0], a[1], a[2], a[3], b0[0], b0[1]);
-      mma_bf16_16816(d[1], a[0], a[1], a[2], a[3], b0[2], b0[3]);
-      mma_bf16_16816(d[2], a[0], a[1], a[2], a[3], b1[0], b1[1]);
-      mma_bf16_16816(d[3], a[0], a[1], a[2], a[3], b1[2], b1[3]);
-    }
-    const uint32_t gr = lane >> 2, c = lane & 3;
-    const uint32_t t0 = mg * 16 + gr, t1 = t0 + 8;
-    float* base = p.part + static_cast<size_t>(s) * kSkMaxTokens * kExperts + expert0 + nq * 32 + 2 * c;
-#pragma unroll
-    for (uint32_t n = 0; n < 4; ++n) {
-      if (t0 < M) *reinterpret_cast<float2*>(base + t0 * kExperts + n * 8) = make_float2(d[n][0], d[n][1]);
-      if (t1 < M) *reinterpret_cast<float2*>(base + t1 * kExperts + n * 8) = make_float2(d[n][2], d[n][3]);
-    }
-  }
-  // No CTA leaves while a peer's multicast may still target it.
-  cluster_sync();
-}
-
 template <bool kUsePDL, uint32_t kSlices>
 __global__ __launch_bounds__(kThreads, 1) void router_splitk_tail_kernel(
     const __grid_constant__ Params p, const float* __restrict__ part) {
@@ -1832,8 +1745,7 @@ struct RouterFrontKernel {
       const tvm::ffi::TensorView topk_ids,
       const tvm::ffi::TensorView x_fp4,
       const tvm::ffi::TensorView x_sf,
-      int64_t slices,
-      int64_t multicast) {
+      int64_t slices) {
     using namespace host;
     auto M_ = SymbolicSize{"num_tokens"};
     auto device = SymbolicDevice{};
@@ -1866,13 +1778,10 @@ struct RouterFrontKernel {
     tp.x_sf = static_cast<uint8_t*>(x_sf.data_ptr());
     tp.num_tokens = M;
     tp.mode = kModeQuant | kModeTopk;
-    if (multicast) {
-      CHECK_HOST(slices == 16) << "router_splitk: multicast build is 16 slices";
-      launch_splitk<16, true>(gp, tp, device.unwrap());
-    } else if (slices == 8) {
-      launch_splitk<8, false>(gp, tp, device.unwrap());
+    if (slices == 8) {
+      launch_splitk<8>(gp, tp, device.unwrap());
     } else {
-      launch_splitk<16, false>(gp, tp, device.unwrap());
+      launch_splitk<16>(gp, tp, device.unwrap());
     }
   }
 
@@ -1926,31 +1835,18 @@ struct RouterFrontKernel {
   }
 
  private:
-  template <uint32_t kSlices, bool kMc>
+  template <uint32_t kSlices>
   static void launch_splitk(const SkParams& gp, const Params& tp, DLDevice device) {
     using namespace host;
-    if constexpr (kMc) {
-      constexpr uint32_t kSmem = SkSmem<kSlices>::kBytes + 16;  // + the token-row mbarrier
-      static const bool smem_attr_set = [] {
-        CHECK_CUDA(cudaFuncSetAttribute(
-            router_splitk_gemm_mc_kernel<kUsePDL, kSlices>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
-        return true;
-      }();
-      (void)smem_attr_set;
-      LaunchKernel(kSkGroups * kSlices, kThreads, device, kSmem)
-          .enable_pdl(kUsePDL)
-          .enable_cluster(dim3(kSkGroups, 1, 1))(router_splitk_gemm_mc_kernel<kUsePDL, kSlices>, gp);
-    } else {
-      constexpr uint32_t kSmem = SkSmem<kSlices>::kBytes;
-      static const bool smem_attr_set = [] {
-        CHECK_CUDA(cudaFuncSetAttribute(
-            router_splitk_gemm_kernel<kUsePDL, kSlices>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
-        return true;
-      }();
-      (void)smem_attr_set;
-      LaunchKernel(kSkGroups * kSlices, kThreads, device, kSmem)
-          .enable_pdl(kUsePDL)(router_splitk_gemm_kernel<kUsePDL, kSlices>, gp);
-    }
+    constexpr uint32_t kSmem = SkSmem<kSlices>::kBytes;
+    static const bool smem_attr_set = [] {
+      CHECK_CUDA(cudaFuncSetAttribute(
+          router_splitk_gemm_kernel<kUsePDL, kSlices>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
+      return true;
+    }();
+    (void)smem_attr_set;
+    LaunchKernel(kSkGroups * kSlices, kThreads, device, kSmem)
+        .enable_pdl(kUsePDL)(router_splitk_gemm_kernel<kUsePDL, kSlices>, gp);
     LaunchKernel(tp.num_tokens, kThreads, device)
         .enable_pdl(kUsePDL)(router_splitk_tail_kernel<kUsePDL, kSlices>, tp, static_cast<const float*>(gp.part));
   }
