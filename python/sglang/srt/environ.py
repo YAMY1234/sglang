@@ -577,6 +577,9 @@ class Envs:
     SGLANG_OPT_DSV41_DSPARK_POST_FOLD = EnvBool(False)
     # Test-only: spin this long (us) before the forked write, to expose a missing join.
     SGLANG_DSPARK_DEFER_CONTEXT_KV_TEST_SPIN_US = EnvInt(0)
+    # The deferred commit's staging (hidden, write locations, positions, commit lengths)
+    # in one Triton launch instead of four copies and a fill.
+    SGLANG_OPT_DSV41_DSPARK_ONE_LAUNCH_COMMIT_STAGE = EnvBool(False)
 
     # ===================================================================
     # Memory pools and KV-cache sizing
