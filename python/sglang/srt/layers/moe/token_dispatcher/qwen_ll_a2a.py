@@ -92,13 +92,6 @@ class LlA2AState:
         self.out_ids = torch.empty((rows, top_k), dtype=torch.int32, device=device)
         self.out_wts = torch.empty((rows, top_k), dtype=torch.float32, device=device)
         self.recv_tokens = torch.zeros(ep_size, dtype=torch.int32, device=device)
-        # SGLANG_Q35MF_KRNC_EPX scratch: per-expert counts, listed local entries, list length, CTA ticket.
-        self.table_scratch = (
-            torch.zeros(self.experts_per_rank, dtype=torch.int32, device=device),
-            torch.empty(2 * rows * top_k, dtype=torch.int32, device=device),
-            torch.zeros(1, dtype=torch.int32, device=device),
-            torch.zeros(1, dtype=torch.int32, device=device),
-        )
         logger.info(
             "SGLANG_Q35MF_E2X_LLA2A buffers (%s): %d ranks, %d slots, %d + %d bytes, %d CTAs",
             payload,
@@ -173,7 +166,6 @@ class LlA2AState:
             ll_a2a_dispatch_tables(
                 *args,
                 tables,
-                self.table_scratch,
                 local_offset=self.ep_rank * self.experts_per_rank,
                 num_local=self.experts_per_rank,
                 **kw,

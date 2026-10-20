@@ -18,6 +18,8 @@ if TYPE_CHECKING:
 
 # csrc kMaxTokens: tokens per source rank one exchange slot table holds.
 LL_A2A_MAX_TOKENS = 128
+# csrc kCountLines: per-expert count lines per (stage, source) behind the dispatch slots.
+LL_A2A_COUNT_LINES = 64
 
 
 def ll_a2a_region_bytes(
@@ -25,7 +27,10 @@ def ll_a2a_region_bytes(
 ) -> tuple[int, int]:
     """Bytes of the dispatch and combine regions on every rank (csrc Geometry::dispatch_bytes / combine_bytes)."""
     lines = top_k + (x_bytes + sf_bytes) // 8
-    return 2 * ranks * 16 * (1 + slots * lines), 3 * ranks * slots * hidden * 2
+    return (
+        2 * ranks * 16 * (1 + slots * lines + LL_A2A_COUNT_LINES),
+        3 * ranks * slots * hidden * 2,
+    )
 
 
 @cache_once
@@ -104,7 +109,6 @@ def ll_a2a_dispatch_tables(
     recv_tokens: torch.Tensor,
     err: torch.Tensor,
     tables,
-    scratch,
     *,
     tmax: int,
     slots: int,
@@ -116,7 +120,7 @@ def ll_a2a_dispatch_tables(
     num_local: int,
 ) -> None:
     """ll_a2a_dispatch that also fills `tables` (an EpTablesBuffers over out_ids) with this rank's routing tables;
-    scratch = (count [num_local], list [2 * rows * top_k], list_n [1], done [1]), int32, count / list_n / done zero."""
+    every rank of the exchange must take this path for the same call."""
     _jit_module(
         peers.shape[0], ids.shape[1], hidden, x.shape[1], sf.shape[1]
     ).dispatch_tables(
@@ -132,7 +136,6 @@ def ll_a2a_dispatch_tables(
         out_wts,
         recv_tokens,
         err,
-        *scratch,
         tables.tile_idx_to_expert_idx,
         tables.tile_idx_to_mn_limit,
         tables.expanded_idx_to_permuted_idx,
