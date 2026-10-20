@@ -66,11 +66,11 @@ def _merged_this_pass() -> bool:
 
 
 def _dump_switches() -> None:
+    # Append only the switches since the last dump; one JSON line per switch.
+    new, _S.switches = _S.switches, []
     out = os.environ.get("Q35MF_RT_DIR")
     if not out:
         return
-    # Append only the switches since the last dump; one JSON line per switch.
-    new, _S.switches = _S.switches, []
     try:
         with open(os.path.join(out, f"ll16-recvab-r{dist.get_rank()}.jsonl"), "a") as f:
             f.writelines(json.dumps(dict(t_ns=t, merged=m, block=_S.block)) + "\n" for t, m in new)
