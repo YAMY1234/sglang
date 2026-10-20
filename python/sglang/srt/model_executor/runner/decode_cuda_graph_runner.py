@@ -1516,7 +1516,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             padded_num_tokens=padded_num_tokens,
             pp_proxy_tensors=pp_proxy_tensors,
         )
-        if self._skip_restage:
+        from sglang.srt.model_executor.runner_backend import ab_variants
+
+        if ab_variants.flag("SGLANG_Q35MF_MKH_N3B", self._skip_restage):
             self._staged_inputs = self._staged_signature(forward_batch)
 
         if (
