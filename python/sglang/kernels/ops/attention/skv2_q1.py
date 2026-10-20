@@ -105,9 +105,12 @@ def load_values(
 
 
 class Q1SplitDecode:
-    def __init__(self, heads=4, nsplit=152, stages=2, slots=2):
+    def __init__(self, heads=4, nsplit=152, stages=2, slots=2, pdl=False, prefetch=True):
         assert stages >= 1 and slots in (2, 3, 4) and 1 <= heads <= 12
         self.heads, self.nsplit, self.stages, self.slots = heads, nsplit, stages, slots
+        # pdl: launched as a programmatic dependent; CTAs that land while the predecessor runs load their first
+        # K / V tiles that hold no token written by this step, then wait (the merge launches at this grid's exit).
+        self.pdl, self.prefetch = pdl, prefetch
         self.rows = heads
         self.width = 32
         self.tile = 128
@@ -153,7 +156,7 @@ class Q1SplitDecode:
         )
         self.kernel(
             q, k, v, table, lengths, partial, maxima, denom, qk_scale, out_scale, kq, vp
-        ).launch(grid=(self.nsplit, 1, 1), block=(384, 1, 1), stream=stream)
+        ).launch(grid=(self.nsplit, 1, 1), block=(384, 1, 1), stream=stream, use_pdl=self.pdl)
 
     @cute.experimental.kernel
     def kernel(
@@ -296,6 +299,42 @@ class Q1SplitDecode:
         npair = cute.ceil_div(nblk, 2)
         begin_page = split * spc * 4
         cute.arch.sync_threads()
+        # Leading tiles loaded before the dependency wait: whole tiles ending before the page of the token this
+        # step writes (position length - 1).
+        npre = cutlass.Int32(0)
+        if cutlass.const_expr(self.pdl and self.prefetch):
+            safe_tiles = ((length - 1) // 64 - begin_page) // (self.tile // 64)
+            if safe_tiles > 0:
+                npre = safe_tiles
+            if npre > self.stages:
+                npre = cutlass.Int32(self.stages)
+            if npre > nblk:
+                npre = nblk
+            if warp == 10:
+                for stage in cutlass.range_constexpr(self.stages):
+                    if stage < npre:
+                        load_keys(
+                            k,
+                            table,
+                            sk,
+                            bk + stage,
+                            begin_page + stage * (self.tile // 64),
+                            stage,
+                            self.tile,
+                            length,
+                        )
+                        load_values(
+                            v,
+                            table,
+                            sv,
+                            bv + stage,
+                            begin_page + stage * (self.tile // 64),
+                            stage,
+                            self.tile,
+                            length,
+                        )
+        if cutlass.const_expr(self.pdl):
+            cute.arch.griddepcontrol_wait()
         if warp < 4:
             scores = cute.make_rmem_tensor((width, 1), f32)
             running_m = cute.make_rmem_tensor((2,), f32)
@@ -484,7 +523,7 @@ class Q1SplitDecode:
                     update_expect_tx=False,
                 )
                 for stage in cutlass.range_constexpr(self.stages):
-                    if stage < nblk:
+                    if stage < nblk and stage >= npre:
                         load_keys(
                             k,
                             table,
@@ -497,19 +536,20 @@ class Q1SplitDecode:
                         )
                 for it in cutlass.range(0, nblk):
                     stage = it % self.stages
-                    cute.arch.mbarrier_wait(
-                        bvfree + stage, phase=(it // self.stages + 1) % 2
-                    )
-                    load_values(
-                        v,
-                        table,
-                        sv,
-                        bv + stage,
-                        begin_page + it * (self.tile // 64),
-                        stage,
-                        self.tile,
-                        length,
-                    )
+                    if it >= npre:
+                        cute.arch.mbarrier_wait(
+                            bvfree + stage, phase=(it // self.stages + 1) % 2
+                        )
+                        load_values(
+                            v,
+                            table,
+                            sv,
+                            bv + stage,
+                            begin_page + it * (self.tile // 64),
+                            stage,
+                            self.tile,
+                            length,
+                        )
                     if it + self.stages < nblk:
                         cute.arch.mbarrier_wait(
                             bkfree + stage, phase=(it // self.stages) % 2
@@ -566,7 +606,10 @@ def _q1_merge(
     NSPLIT: tl.constexpr,
     NP2: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
 ):
+    if USE_GDC:  # launched as a programmatic dependent of the q1 producer
+        tl.extra.cuda.gdc_wait()
     row = tl.program_id(0)
     dblk = tl.program_id(1)
     length = tl.load(lengths)
@@ -592,7 +635,7 @@ def _q1_merge(
 class Q1SplitPlan:
     """Reusable storage and a compiled producer for one fixed input layout, plus the fp32 merge."""
 
-    def __init__(self, query, kv, table, lengths, *, nsplit=None, stages=2, slots=2):
+    def __init__(self, query, kv, table, lengths, *, nsplit=None, stages=2, slots=2, pdl=False):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "Paged FP8 q1 decode storage must be prepared before graph capture"
@@ -610,7 +653,8 @@ class Q1SplitPlan:
             (self.nsplit, self.heads), dtype=torch.float32, device=query.device
         )
         self.denom = torch.empty_like(self.maximum)
-        kernel = Q1SplitDecode(self.heads, self.nsplit, stages=stages, slots=slots)
+        self.pdl = pdl
+        kernel = Q1SplitDecode(self.heads, self.nsplit, stages=stages, slots=slots, pdl=pdl)
         views = self._views(query, kv, table, lengths)
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         self.compiled = cute.compile(
@@ -650,7 +694,9 @@ class Q1SplitPlan:
             self.nsplit,
             triton.next_power_of_2(self.nsplit),
             32,
+            USE_GDC=self.pdl,
             num_warps=4,
+            **({"launch_pdl": True} if self.pdl else {}),
         )
         return out
 

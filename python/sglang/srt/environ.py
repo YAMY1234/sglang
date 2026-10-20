@@ -1128,6 +1128,9 @@ class Envs:
     # With SGLANG_Q35MF_MKA_SKV2: the split producer and its merge launch as programmatic dependents (the producer
     # prefetches K / V tiles that this step does not write before it waits); same arithmetic.
     SGLANG_Q35MF_LL16_SKV2_PDL = EnvBool(False)
+    # With SGLANG_Q35MF_MKA_Q1: the draft q1 split decode and its merge launch as programmatic dependents (the
+    # decode prefetches K / V tiles this step does not write; the one-token qk norm releases it at entry).
+    SGLANG_Q35MF_LL16_Q1_PDL = EnvBool(False)
     # With SGLANG_Q35MF_MKA_FUSED and SGLANG_Q35MF_MKH_HOP: the fused o_proj pushes its partial into the
     # q35 hop mailbox, so the attention output hop only consumes.
     SGLANG_Q35MF_MKA_PUSH = EnvBool(False)

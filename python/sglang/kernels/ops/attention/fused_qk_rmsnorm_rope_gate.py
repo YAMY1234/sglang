@@ -62,6 +62,7 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     MROPE: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
     WEIGHT_SHIFT: tl.constexpr = 1.0,
+    EARLY_TRIGGER: tl.constexpr = False,
     EXPLICIT_ROPE_FMA: tl.constexpr = False,
     v_ptr=None,
     v_cache_ptr=None,
@@ -72,6 +73,9 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     stride_v_cache_t: tl.constexpr = 0,
     FP8_CACHE: tl.constexpr = False,
 ):
+    # EARLY_TRIGGER: release the dependents at entry; they must wait before reading this kernel's outputs.
+    if ENABLE_PDL and EARLY_TRIGGER:
+        tl.extra.cuda.gdc_launch_dependents()
     token = tl.program_id(0)
     head = tl.program_id(1)
     is_k = head >= NUM_Q_HEADS
@@ -175,7 +179,7 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
 
     # PDL: signal dependent kernels (attention/allreduce) can start early.
     # Only available on NVIDIA Hopper+ (sm_90+); guarded for AMD/other backends.
-    if ENABLE_PDL:
+    if ENABLE_PDL and not EARLY_TRIGGER:
         tl.extra.cuda.gdc_launch_dependents()
 
 
@@ -199,8 +203,11 @@ def fused_qk_gemma_rmsnorm_rope_gate(
     cache_loc: Optional[torch.Tensor] = None,
     k_scale: Optional[torch.Tensor] = None,
     v_scale: Optional[torch.Tensor] = None,
+    early_trigger: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Fused QK GemmaRMSNorm + NeoX RoPE + gate deinterleave.
+
+    early_trigger: release programmatic dependents at entry (they must wait before reading the outputs).
 
     Args:
         q_gate: [T, num_q_heads * (1 + has_gate) * head_dim] — interleaved Q+Gate if has_gate
@@ -294,6 +301,7 @@ def fused_qk_gemma_rmsnorm_rope_gate(
         HAS_GATE=has_gate,
         MROPE=mrope,
         ENABLE_PDL=_ENABLE_PDL,
+        EARLY_TRIGGER=early_trigger,
         **kwargs,
     )
 

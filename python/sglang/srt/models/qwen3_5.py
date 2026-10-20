@@ -1991,6 +1991,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             self.rotary_emb.rotary_dim,
             has_gate=self.attn_output_gate,
             mrope_axis_map=(self.rotary_emb.axis_map if positions.dim() == 2 else None),
+            # SGLANG_Q35MF_LL16_Q1_PDL: the one-token draft q1 decode prefetches beside this kernel.
+            early_trigger=hidden_states.shape[0] == 1 and envs.SGLANG_Q35MF_LL16_Q1_PDL.get(),
             **cache_kwargs,
         )
         seq_len = hidden_states.shape[0]
