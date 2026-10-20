@@ -58,6 +58,11 @@ def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -
                 dst.copy_(src)
 
     if dsts and dsts[0].is_cuda:
+        if _has_foreach_copy and _one_dense_int_pair(dsts, srcs):
+            # One foreach launch already writes what the small copy would; that kernel
+            # pays off only across dtype pairs, and costs per-pair host checks.
+            torch._foreach_copy_(dsts, srcs)
+            return
         from sglang.kernels.ops.memory.small_copy import try_small_copy
 
         if try_small_copy(dsts, srcs):
@@ -72,6 +77,17 @@ def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -
         groups[key][1].append(src)
     for group_dsts, group_srcs in groups.values():
         _foreach_copy(group_dsts, group_srcs)
+
+
+def _one_dense_int_pair(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> bool:
+    # One integer / bool (dst, src) dtype pair over contiguous tensors.
+    pair = (dsts[0].dtype, srcs[0].dtype)
+    if any(dtype.is_floating_point or dtype.is_complex for dtype in pair):
+        return False
+    return all(
+        (dst.dtype, src.dtype) == pair and dst.is_contiguous() and src.is_contiguous()
+        for dst, src in zip(dsts, srcs)
+    )
 
 
 class PaddingPolicy(Enum):

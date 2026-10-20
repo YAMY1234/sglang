@@ -1544,5 +1544,24 @@ class TestComputedSlots(unittest.TestCase):
         )
 
 
+class TestOneDenseIntPair(unittest.TestCase):
+    def test_only_one_dense_integer_dtype_pair_takes_the_single_foreach_copy(self):
+        """A CUDA group of one integer (dst, src) dtype pair over dense tensors goes to
+        one foreach copy; a float, mixed or strided group keeps the small copy."""
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            _one_dense_int_pair,
+        )
+
+        i64 = torch.zeros(8, dtype=torch.int64)
+        i32 = torch.zeros(8, dtype=torch.int32)
+        self.assertTrue(_one_dense_int_pair([i64[:4], i64[4:]], [i64[:4], i64[4:]]))
+        self.assertTrue(_one_dense_int_pair([i64[:4]], [i32[:4]]))
+        self.assertFalse(_one_dense_int_pair([i64[:4], i64[4:]], [i64[:4], i32[4:]]))
+        self.assertFalse(_one_dense_int_pair([torch.zeros(4)], [torch.zeros(4)]))
+        self.assertFalse(
+            _one_dense_int_pair([i64[:4]], [torch.zeros(3, 4, dtype=torch.int64)[:, 0]])
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
