@@ -1131,6 +1131,21 @@ class LogitsProcessor(nn.Module):
         lm_head: VocabParallelEmbedding,
         embedding_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if envs.SGLANG_Q35MF_LL16_XLG_MB.get() > 0 and isinstance(
+            getattr(lm_head, "weight", None), torch.Tensor
+        ):
+            from sglang.srt.layers.l2_window import lm_head_window
+
+            with lm_head_window(lm_head.weight):
+                return self._compute_lm_head_impl(hidden_states, lm_head, embedding_bias)
+        return self._compute_lm_head_impl(hidden_states, lm_head, embedding_bias)
+
+    def _compute_lm_head_impl(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        embedding_bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         if (
             self.mkd_head is not None
             and self.mkd_head.armed

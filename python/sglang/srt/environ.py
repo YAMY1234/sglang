@@ -1141,6 +1141,9 @@ class Envs:
     # The one-token draft qk norm launches as a programmatic dependent of the qkv GEMM (static operands load
     # before its wait, every other load issued right after it); same outputs.
     SGLANG_Q35MF_LL16_QKN_PDL = EnvBool(False)
+    # MiB of the lm_head weight under a persisting-L2 access-policy window on every lm_head launch (0 = off); the
+    # persisting-L2 limit goes to the device maximum the first time it is used. Cache policy only.
+    SGLANG_Q35MF_LL16_XLG_MB = EnvInt(0)
     # With SGLANG_Q35MF_MKA_FUSED and SGLANG_Q35MF_MKH_HOP: the fused o_proj pushes its partial into the
     # q35 hop mailbox, so the attention output hop only consumes.
     SGLANG_Q35MF_MKA_PUSH = EnvBool(False)

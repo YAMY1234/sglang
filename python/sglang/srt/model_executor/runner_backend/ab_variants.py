@@ -32,6 +32,12 @@ BLOCK = int(os.environ.get("Q35MF_AB_BLOCK", "200"))
 assert all(p in VARIANTS for p in PATTERN), f"Q35MF_AB_PATTERN {PATTERN} not in {list(VARIANTS)}"
 _round = 0
 _base_env = {}
+# Called at every block boundary, e.g. to demote persisting-L2 lines one variant left behind.
+on_block_switch = []
+if any("SGLANG_Q35MF_LL16_XLG_MB" in v for v in VARIANTS.values()):
+    from sglang.srt.layers.l2_window import reset_persisting
+
+    on_block_switch.append(reset_persisting)
 
 
 def enabled():
@@ -91,3 +97,5 @@ def advance():
     _round += 1
     if _round % BLOCK == 0:
         logger.info("Q35MF A/B block %d: variant %s from round %d", _round // BLOCK, current(), _round)
+        for fn in on_block_switch:
+            fn()
