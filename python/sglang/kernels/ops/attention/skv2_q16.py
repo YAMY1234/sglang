@@ -103,8 +103,11 @@ class Q16SplitDecode:
     """Warps 0-7: two softmax warpgroups (thread = query row; warpgroup g owns S columns g * 64.. and O half g),
     warp 8: both MMAs, warp 9: TMA loads."""
 
-    def __init__(self, heads=16, qlen=7, splits=148, stages=2, batch=1, mode=0, trace=False):
+    def __init__(self, heads=16, qlen=7, splits=148, stages=2, batch=1, mode=0, trace=False, lazy=0.0):
         assert heads * qlen <= 128 and (heads * qlen) % 8 == 0 and stages in (1, 2)
+        # P x 256 must stay <= 448 (e4m3 max), so a stale reference may trail the maximum by < log2(1.75).
+        assert 0.0 <= lazy <= 0.8
+        self.lazy = lazy
         # Timing ablations only (wrong outputs): 1 no O rescale, 2 no softmax math, 4 no P V MMA, 8 no Q K MMA,
         # 16 no tail masking.
         self.mode = mode
@@ -387,6 +390,11 @@ class Q16SplitDecode:
                                 # qk_scale > 0, so scaling the raw maximum equals the maximum of the scaled scores.
                                 block_max = cute.arch.fmax(mine, other) * qk_scale
                                 raw = cute.arch.fmax(running_m, block_max)
+                                if cutlass.const_expr(self.lazy > 0.0):
+                                    # Keep the old reference while the maximum grows by at most lazy (log2 units):
+                                    # P stays <= 2^lazy, so P x 256 stays inside e4m3, and O is not rescaled.
+                                    if raw <= running_m + f32(self.lazy):
+                                        raw = running_m
                                 # Stock keeps the raw running max (-inf for a row with no valid token yet) and
                                 # exponentiates against 0 instead.
                                 safe = raw
@@ -676,6 +684,7 @@ class Q16SplitPlan:
         trace=False,
         merge_tile=64,
         merge_warps=4,
+        lazy=0.0,
     ):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
@@ -705,6 +714,7 @@ class Q16SplitPlan:
             batch=self.batch,
             mode=mode,
             trace=trace,
+            lazy=lazy,
         )
         views = self._views(query, kv, table, lengths)
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
