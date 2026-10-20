@@ -545,8 +545,8 @@ def _experts_from_ep_tables(
     topk_weights: torch.Tensor,
     moe_output: torch.Tensor,
 ) -> torch.Tensor:
-    """wrapper.run with the routing tables from one qwen_ep_tables launch instead of moe_sort, finalized
-    straight into the combine workspace (SGLANG_Q35MF_DEP_EP_TABLES; same tactic and GEMM kernels)."""
+    """wrapper.run with the routing tables from one qwen_ep_tables launch instead of moe_sort, finalized into
+    moe_output (the combine workspace when the dispatcher exposes it; SGLANG_Q35MF_DEP_EP_TABLES)."""
     from flashinfer.autotuner import AutoTuner
 
     from sglang.kernels.ops.moe.qwen_ep_tables import ep_tables
@@ -678,10 +678,16 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
         envs.SGLANG_Q35MF_DEP_EP_TABLES.get()
         and quant_info.quant_mode == "w4a4"
         and per_token_scale is None
-        and dispatch_output.moe_output is not None
     ):
+        moe_output = dispatch_output.moe_output
+        if moe_output is None:
+            moe_output = torch.empty(
+                (x_fp4.shape[0], quant_info.w2_weight.shape[1]),
+                dtype=quant_info.wrapper.output_dtype,
+                device=x_fp4.device,
+            )
         output = _experts_from_ep_tables(
-            quant_info, x_fp4, x_sf, topk_ids, topk_weights, dispatch_output.moe_output
+            quant_info, x_fp4, x_sf, topk_ids, topk_weights, moe_output
         )
         return FlashinferCombineInput(hidden_states=output)
 
