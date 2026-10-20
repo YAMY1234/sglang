@@ -599,6 +599,11 @@ class Envs:
     # With the post-verify graph: sample shard-local verify logits inside the graph (the sharded
     # sampler above) instead of gathering them; batches that return logprobs keep the eager chain.
     SGLANG_Q35MF_D2R_PVG_SHARDED = EnvBool(False)
+    # With SGLANG_Q35MF_PDDEC_SHARDED_VERIFY_SAMPLING: a sampled verify whose compact top-k support
+    # (SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING, max top_k <= 32) is built on the vocab shards: shard
+    # top-k and argmax, one small all-reduce of the candidates, and a merge that keeps the larger value
+    # first and the lower id among equals, instead of gathering the logits.
+    SGLANG_Q35MF_LL16_DB1 = EnvBool(False)
     # Row-split MTP fc for draft-width batches: each rank multiplies its input-column
     # slice (one normalized half); fp32 partials are gathered and summed in rank order.
     SGLANG_Q35MF_DRAFT_FC_SPLIT = EnvBool(False)
