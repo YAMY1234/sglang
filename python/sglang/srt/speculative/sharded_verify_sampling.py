@@ -375,6 +375,8 @@ def _commit_kernel(sel_ptr, tok_ptr, predict_ptr):
 # to +0.0, NaN above everything, as torch.argmax ranks it) and the low half the inverted global id, so a
 # descending sort puts the lower id first among equal values.
 _DB1_CHUNK = 1024
+# Candidate buffer per row; rows with more elements at or above the threshold take the exact chunked path.
+_DB1_CAP = 256
 DB1_MAX_TOP_K = 32
 _I64_MIN = tl.constexpr(-9223372036854775807 - 1)
 
@@ -395,6 +397,75 @@ def _db1_value(key):
 
 
 @triton.jit
+def _db1_chunk_max_kernel(logits_ptr, stride_row, local_vocab, cmax_ptr, nchunk, CH: tl.constexpr):
+    r = tl.program_id(0)
+    c = tl.program_id(1)
+    offs = c * CH + tl.arange(0, CH)
+    m = offs < local_vocab
+    x = tl.load(logits_ptr + r * stride_row + offs, mask=m, other=0.0).to(tl.float32)
+    tl.store(cmax_ptr + r * nchunk + c, tl.max(tl.where(m, _db1_key(x), -1), axis=0))
+
+
+@triton.jit
+def _db1_threshold_kernel(cmax_ptr, nchunk, thr_ptr, cnt_ptr, K: tl.constexpr, BN: tl.constexpr):
+    # The k-th largest chunk maximum: at least k elements of the row reach it, so the row's top-k (with
+    # every element equal to the k-th value) lies at or above it. Fewer than k chunks: no threshold.
+    r = tl.program_id(0)
+    i = tl.arange(0, BN)
+    v = tl.load(cmax_ptr + r * nchunk + i, mask=i < nchunk, other=-1)
+    srt = tl.sort(v, 0, descending=True)
+    tl.store(thr_ptr + r, tl.max(tl.where(i == K - 1, srt, -1), axis=0))
+    tl.store(cnt_ptr + r, 0)
+
+
+@triton.jit
+def _db1_compact_kernel(
+    logits_ptr,
+    stride_row,
+    local_vocab,
+    vocab_start,
+    thr_ptr,
+    cnt_ptr,
+    cand_ptr,
+    CAP: tl.constexpr,
+    CH: tl.constexpr,
+):
+    r = tl.program_id(0)
+    c = tl.program_id(1)
+    offs = c * CH + tl.arange(0, CH)
+    m = offs < local_vocab
+    x = tl.load(logits_ptr + r * stride_row + offs, mask=m, other=0.0).to(tl.float32)
+    key = _db1_key(x)
+    sel = m & (key >= tl.load(thr_ptr + r))
+    n = tl.sum(sel.to(tl.int32), axis=0)
+    if n > 0:
+        base = tl.atomic_add(cnt_ptr + r, n)
+        pos = base + tl.cumsum(sel.to(tl.int32), axis=0) - 1
+        packed = ((key - 2147483648) << 32) | (0x7FFFFFFF - (offs + vocab_start).to(tl.int64))
+        tl.store(cand_ptr + r * CAP + pos, packed, mask=sel & (pos < CAP))
+
+
+@triton.jit
+def _db1_select_kernel(
+    cand_ptr, cnt_ptr, ovf_ptr, buf_ptr, rank, rows, K: tl.constexpr, CAP: tl.constexpr
+):
+    # Rows whose candidates fit sort them; the others are flagged for the exact chunked path.
+    r = tl.program_id(0)
+    n = tl.load(cnt_ptr + r)
+    tl.store(ovf_ptr + r, (n > CAP).to(tl.int32))
+    if n <= CAP:
+        i = tl.arange(0, CAP)
+        x = tl.load(cand_ptr + r * CAP + i, mask=i < n, other=_I64_MIN)
+        srt = tl.sort(x, 0, descending=True)
+        key = (srt >> 32) + 2147483648
+        gid = 0x7FFFFFFF - (srt & 0xFFFFFFFF)
+        m = i < K
+        base = buf_ptr + (rank * rows + r) * K * 2
+        tl.store(base + 2 * i, _db1_value(key), mask=m)
+        tl.store(base + 2 * i + 1, gid.to(tl.float32), mask=m)
+
+
+@triton.jit
 def _db1_chunk_topk_kernel(
     logits_ptr,
     stride_row,
@@ -402,11 +473,14 @@ def _db1_chunk_topk_kernel(
     vocab_start,
     scratch_ptr,
     nchunk,
+    ovf_ptr,
     K: tl.constexpr,
     CH: tl.constexpr,
 ):
     r = tl.program_id(0)
     c = tl.program_id(1)
+    if tl.load(ovf_ptr + r) == 0:
+        return
     offs = c * CH + tl.arange(0, CH)
     m = offs < local_vocab
     x = tl.load(logits_ptr + r * stride_row + offs, mask=m, other=0.0).to(tl.float32)
@@ -420,9 +494,11 @@ def _db1_chunk_topk_kernel(
 
 @triton.jit
 def _db1_row_merge_kernel(
-    scratch_ptr, nchunk, buf_ptr, rank, rows, K: tl.constexpr, BM: tl.constexpr
+    scratch_ptr, nchunk, ovf_ptr, buf_ptr, rank, rows, K: tl.constexpr, BM: tl.constexpr
 ):
     r = tl.program_id(0)
+    if tl.load(ovf_ptr + r) == 0:
+        return
     i = tl.arange(0, BM)
     x = tl.load(scratch_ptr + r * nchunk * K + i, mask=i < nchunk * K, other=_I64_MIN)
     srt = tl.sort(x, 0, descending=True)
@@ -799,22 +875,51 @@ class ShardedVerifySampler:
         dev = logits.device
         k = int(max_top_k)
         nchunk = triton.cdiv(local_vocab, _DB1_CHUNK)
+        vocab_start = self.rank * local_vocab
+        cmax = torch.empty((rows, nchunk), dtype=torch.int64, device=dev)
+        thr = torch.empty((rows,), dtype=torch.int64, device=dev)
+        cnt = torch.empty((rows,), dtype=torch.int32, device=dev)
+        ovf = torch.empty((rows,), dtype=torch.int32, device=dev)
+        cand = torch.empty((rows, _DB1_CAP), dtype=torch.int64, device=dev)
         scratch = torch.empty((rows, nchunk, k), dtype=torch.int64, device=dev)
+        buf = torch.zeros((self.world * rows * k * 2,), dtype=torch.float32, device=dev)
+        _db1_chunk_max_kernel[(rows, nchunk)](
+            logits, logits.stride(0), local_vocab, cmax, nchunk, CH=_DB1_CHUNK, num_warps=4
+        )
+        _db1_threshold_kernel[(rows,)](
+            cmax, nchunk, thr, cnt, K=k, BN=_next_pow2(nchunk), num_warps=4
+        )
+        _db1_compact_kernel[(rows, nchunk)](
+            logits,
+            logits.stride(0),
+            local_vocab,
+            vocab_start,
+            thr,
+            cnt,
+            cand,
+            CAP=_DB1_CAP,
+            CH=_DB1_CHUNK,
+            num_warps=4,
+        )
+        _db1_select_kernel[(rows,)](
+            cand, cnt, ovf, buf, self.rank, rows, K=k, CAP=_DB1_CAP, num_warps=4
+        )
         _db1_chunk_topk_kernel[(rows, nchunk)](
             logits,
             logits.stride(0),
             local_vocab,
-            self.rank * local_vocab,
+            vocab_start,
             scratch,
             nchunk,
+            ovf,
             K=k,
             CH=_DB1_CHUNK,
             num_warps=4,
         )
-        buf = torch.zeros((self.world * rows * k * 2,), dtype=torch.float32, device=dev)
         _db1_row_merge_kernel[(rows,)](
             scratch,
             nchunk,
+            ovf,
             buf,
             self.rank,
             rows,
