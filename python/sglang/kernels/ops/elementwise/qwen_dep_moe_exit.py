@@ -73,7 +73,9 @@ def moe_exit(
     out_fp8 = torch.empty(routed.shape, dtype=torch.float8_e4m3fn, device=routed.device)
     if dbg_final is None:
         dbg_final = routed.new_empty((0, HIDDEN))
+    # A per-tensor input_scale parameter may be 0-d; the kernel reads it as [1].
     _jit_module().run(
-        routed, shared, gate, residual, out, out_fp8.view(torch.uint8), norm_weight, scale, dbg_final, eps, variant
+        routed, shared, gate, residual, out, out_fp8.view(torch.uint8), norm_weight, scale.reshape(1), dbg_final, eps,
+        variant,
     )
     return out, out_fp8
