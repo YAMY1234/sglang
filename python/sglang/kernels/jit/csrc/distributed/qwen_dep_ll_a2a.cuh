@@ -23,7 +23,8 @@ inline constexpr uint32_t kMaxRanks = 16;
 inline constexpr uint32_t kMaxTokens = 128;
 inline constexpr uint32_t kDispatchStages = 2;
 inline constexpr uint32_t kCombineStages = 3;
-inline constexpr uint32_t kSpinMax = 1u << 26;
+// A peer may legitimately stall for long (e.g. a JIT compile on one rank); only a wait this long is fatal.
+inline constexpr uint64_t kTimeoutNs = 300ull * 1000 * 1000 * 1000;
 
 /// \brief Per-call geometry of the dispatch line format and the BF16 combine rows.
 /// \tparam kX bytes of hidden state per token (H / 2 for NVFP4, 2 H for BF16). \tparam kS scale bytes (0 for BF16).
@@ -115,13 +116,18 @@ SGL_DEVICE uint4 ld_line(const void* addr) {
   return v;
 }
 
-/// \brief Count one more poll; past kSpinMax record `code` and give up, so a broken peer cannot hang the GPU.
-SGL_DEVICE bool give_up(uint32_t& spins, int32_t* err, int32_t code) {
-  if (++spins > kSpinMax) {
+/// \brief Called once per poll: every 64K polls, read the global timer; after kTimeoutNs of waiting, record
+/// `code` in `err` and trap. Never returns early, so a slow peer can never leave stale data in an output.
+SGL_DEVICE void wait_tick(uint32_t& spins, uint64_t& since, int32_t* err, int32_t code) {
+  if ((++spins & 0xFFFFu) != 0) return;
+  uint64_t now;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+  if (since == 0) {
+    since = now;
+  } else if (now - since > kTimeoutNs) {
     atomicExch(err, code);
-    return true;
+    __trap();
   }
-  return false;
 }
 
 SGL_DEVICE uint32_t canonical_nan2(uint32_t x) {
@@ -180,9 +186,9 @@ __global__ __launch_bounds__(kThreads) void dispatch_kernel(const __grid_constan
     const uint8_t* h = mine + G::header_offset(stage, tid);
     uint4 v;
     uint32_t spins = 0;
-    do {
-      v = ld_line(h);
-    } while ((v.y != epoch || v.w != epoch) && !give_up(spins, p.err, 1));
+    uint64_t since = 0;
+    for (v = ld_line(h); v.y != epoch || v.w != epoch; v = ld_line(h))
+      wait_tick(spins, since, p.err, 1);
     s_tokens[tid] = v.x;
     if (b == 0) p.recv_tokens[tid] = static_cast<int32_t>(v.x);
   }
@@ -204,9 +210,9 @@ __global__ __launch_bounds__(kThreads) void dispatch_kernel(const __grid_constan
     const uint8_t* line = mine + G::slot_offset(stage, s, t, p.slots) + i * 16;
     uint4 v;
     uint32_t spins = 0;
-    do {
-      v = ld_line(line);
-    } while ((v.y != epoch || v.w != epoch) && !give_up(spins, p.err, 2));
+    uint64_t since = 0;
+    for (v = ld_line(line); v.y != epoch || v.w != epoch; v = ld_line(line))
+      wait_tick(spins, since, p.err, 2);
     const uint2 d = make_uint2(v.x, v.z);
     const uint64_t row = static_cast<uint64_t>(s) * p.tmax + t;
     if (i < G::kIdLines) {
@@ -277,6 +283,7 @@ __global__ __launch_bounds__(kThreads) void combine_kernel(const __grid_constant
           src[k] >= 0 ? ld_line(mine + G::combine_offset(stage, src[k], t, p.slots) + i * 16) : make_uint4(0, 0, 0, 0);
     }
     uint32_t spins = 0;
+    uint64_t since = 0;
     bool pending = true;
     while (pending) {
       pending = false;
@@ -287,7 +294,7 @@ __global__ __launch_bounds__(kThreads) void combine_kernel(const __grid_constant
           pending = true;
         }
       }
-      if (pending && give_up(spins, p.err, 3)) break;
+      if (pending) wait_tick(spins, since, p.err, 3);
     }
     float acc[8][kTopK];
 #pragma unroll
