@@ -325,148 +325,153 @@ class Q16SplitDecode:
                     running_m = f32(-f32.inf)
                     running_l = f32(0)
                     for it in cutlass.range(0, nblk):
-                        slot = it % self.slots
-                        cute.arch.mbarrier_wait(bs + slot, phase=(it // self.slots) % 2)
-                        if cutlass.const_expr(self.trace):
-                            if traced:
-                                if tid == 0:
-                                    if it < 16:
-                                        trace[4 * 16 + it] = cute.arch.clock64()
-                        s_half = cute.local_tile(ts[(None, None), 0, 0, slot], (128, half), (0, wg))
-                        copy_s = tcgen05.make_tmem_copy(ld_half, s_half).get_slice(row)
-                        ex.partition_and_copy(copy_s, s_half, sview)
-                        cute.arch.fence_view_async_tmem_load()
-                        if cutlass.const_expr(self.trace):
-                            if traced:
-                                if tid == 0:
-                                    if it < 16:
-                                        trace[8 * 16 + it] = cute.arch.clock64()
-                        cute.arch.mbarrier_arrive(bsfree + slot)
-                        last = limit - (begin_tok + it * self.tile + wg * half)
-                        if cutlass.const_expr(not self.mode & 16):
-                            # Only a split's last block can hold tokens past end_tok or the causal limit (uniform test).
-                            if it == nblk - 1:
-                                # One scalar select per column; a conditional store into vals would make every
-                                # branch carry the whole fragment.
-                                for j in cutlass.range_constexpr(half):
-                                    bias = f32(0)
-                                    if j > last:
-                                        bias = f32(-f32.inf)
-                                    vals[j, 0] = vals[j, 0] + bias
-                        # Raw block maximum in four independent chains, then the other warpgroup's half.
-                        m0 = vals[0, 0]
-                        m1 = vals[1, 0]
-                        m2 = vals[2, 0]
-                        m3 = vals[3, 0]
-                        for j in cutlass.range_constexpr(1, half // 4):
-                            m0 = cute.arch.fmax(m0, vals[4 * j, 0])
-                            m1 = cute.arch.fmax(m1, vals[4 * j + 1, 0])
-                            m2 = cute.arch.fmax(m2, vals[4 * j + 2, 0])
-                            m3 = cute.arch.fmax(m3, vals[4 * j + 3, 0])
-                        mine = cute.arch.fmax(cute.arch.fmax(m0, m1), cute.arch.fmax(m2, m3))
-                        if cutlass.const_expr(self.trace):
-                            if traced:
-                                if tid == 0:
-                                    if it < 16:
-                                        trace[9 * 16 + it] = cute.arch.clock64()
-                        xmax[row, wg, slot] = mine
-                        prim.barrier_cta_sync(1, thread_count=256)
-                        if cutlass.const_expr(self.trace):
-                            if traced:
-                                if tid == 0:
-                                    if it < 16:
-                                        trace[10 * 16 + it] = cute.arch.clock64()
-                        other = xmax[row, 1 - wg, slot]
-                        # qk_scale > 0, so scaling the raw maximum equals the maximum of the scaled scores.
-                        block_max = cute.arch.fmax(mine, other) * qk_scale
-                        raw = cute.arch.fmax(running_m, block_max)
-                        # Stock keeps the raw running max (-inf for a row with no valid token yet) and
-                        # exponentiates against 0 instead.
-                        safe = raw
-                        if raw == -f32.inf:
-                            safe = f32(0)
-                        alpha = cute.math.exp2(running_m - safe, fastmath=True)
-                        t0 = f32(0)
-                        t1 = f32(0)
-                        t2 = f32(0)
-                        t3 = f32(0)
-                        if cutlass.const_expr(not self.mode & 2):
-                            for j in cutlass.range_constexpr(half // 4):
-                                p0 = cute.math.exp2(vals[4 * j, 0] * qk_scale - safe, fastmath=True)
-                                p1 = cute.math.exp2(vals[4 * j + 1, 0] * qk_scale - safe, fastmath=True)
-                                p2 = cute.math.exp2(vals[4 * j + 2, 0] * qk_scale - safe, fastmath=True)
-                                p3 = cute.math.exp2(vals[4 * j + 3, 0] * qk_scale - safe, fastmath=True)
-                                t0 += p0
-                                t1 += p1
-                                t2 += p2
-                                t3 += p3
-                                vals[4 * j, 0] = p0 * 256
-                                vals[4 * j + 1, 0] = p1 * 256
-                                vals[4 * j + 2, 0] = p2 * 256
-                                vals[4 * j + 3, 0] = p3 * 256
-                        running_l = running_l * alpha + ((t0 + t1) + (t2 + t3))
-                        running_m = raw
-                        if cutlass.const_expr(self.trace):
-                            if traced:
-                                if tid == 0:
-                                    if it < 16:
-                                        trace[11 * 16 + it] = cute.arch.clock64()
-                        packed[None, 0].store(vals[None, 0].load().to(dtype))
-                        if cutlass.const_expr(self.trace):
-                            if traced:
-                                if tid == 0:
-                                    if it < 16:
-                                        trace[12 * 16 + it] = cute.arch.clock64()
-                        cute.arch.mbarrier_wait(bpfree + slot, phase=(it // self.slots + 1) % 2)
-                        if cutlass.const_expr(self.trace):
-                            if traced:
-                                if tid == 0:
-                                    if it < 16:
-                                        trace[13 * 16 + it] = cute.arch.clock64()
-                        cute.autovec_copy(
-                            packed[None, 0], cute.local_tile(sp[row, None, slot], (half,), (wg,))
-                        )
-                        if it == 0:
-                            # O accumulates across blocks; start it at zero (TMEM is not initialized).
-                            for j in cutlass.range_constexpr(half):
-                                vals[j, 0] = f32(0)
-                            for h in cutlass.range_constexpr(128 // half):
-                                o_sub = cute.local_tile(o_plane, (128, half), (0, h))
-                                store_o = tcgen05.make_tmem_copy(st_half, o_sub).get_slice(row)
-                                ex.partition_and_copy(store_o, oview, o_sub)
-                            cute.arch.fence_view_async_tmem_store()
-                        else:
-                            need = cutlass.Boolean(False)
-                            if row < rows:
-                                if alpha != f32(1.0):
-                                    need = cutlass.Boolean(True)
-                            if cutlass.const_expr(self.mode & 1):
-                                need = cutlass.Boolean(False)
-                            if cute.arch.vote_any_sync(need):
-                                # The previous block's P V must have landed before the rescale.
-                                cute.arch.mbarrier_wait(bo, phase=(it - 1) % 2)
-                                for h in cutlass.range_constexpr(128 // half):
-                                    o_sub = cute.local_tile(o_plane, (128, half), (0, h))
-                                    load_o = tcgen05.make_tmem_copy(ld_half, o_sub).get_slice(row)
-                                    ex.partition_and_copy(load_o, o_sub, oview)
-                                    cute.arch.fence_view_async_tmem_load()
+                        for masked in cutlass.range_constexpr(2):
+                            # Two copies of the block body: the split's last block masks its tail, the others carry no mask code.
+                            if cutlass.const_expr(masked == 1):
+                                run = it == nblk - 1
+                            else:
+                                run = it < nblk - 1
+                            if run:
+                                slot = it % self.slots
+                                cute.arch.mbarrier_wait(bs + slot, phase=(it // self.slots) % 2)
+                                if cutlass.const_expr(self.trace):
+                                    if traced:
+                                        if tid == 0:
+                                            if it < 16:
+                                                trace[4 * 16 + it] = cute.arch.clock64()
+                                s_half = cute.local_tile(ts[(None, None), 0, 0, slot], (128, half), (0, wg))
+                                copy_s = tcgen05.make_tmem_copy(ld_half, s_half).get_slice(row)
+                                ex.partition_and_copy(copy_s, s_half, sview)
+                                cute.arch.fence_view_async_tmem_load()
+                                if cutlass.const_expr(self.trace):
+                                    if traced:
+                                        if tid == 0:
+                                            if it < 16:
+                                                trace[8 * 16 + it] = cute.arch.clock64()
+                                cute.arch.mbarrier_arrive(bsfree + slot)
+                                last = limit - (begin_tok + it * self.tile + wg * half)
+                                if cutlass.const_expr(masked == 1 and not self.mode & 16):
+                                    # One scalar select per column; a conditional store into vals would make every
+                                    # branch carry the whole fragment.
                                     for j in cutlass.range_constexpr(half):
-                                        vals[j, 0] = vals[j, 0] * alpha
-                                    store_o = tcgen05.make_tmem_copy(st_half, o_sub).get_slice(row)
-                                    ex.partition_and_copy(store_o, oview, o_sub)
-                                cute.arch.fence_view_async_tmem_store()
-                        if cutlass.const_expr(self.trace):
-                            if traced:
-                                if tid == 0:
-                                    if it < 16:
-                                        trace[14 * 16 + it] = cute.arch.clock64()
-                        cute.arch.fence_view_async_shared()
-                        if cutlass.const_expr(self.trace):
-                            if traced:
-                                if tid == 0:
-                                    if it < 16:
-                                        trace[5 * 16 + it] = cute.arch.clock64()
-                        cute.arch.mbarrier_arrive(bp + slot)
+                                        bias = f32(0)
+                                        if j > last:
+                                            bias = f32(-f32.inf)
+                                        vals[j, 0] = vals[j, 0] + bias
+                                # Raw block maximum in four independent chains, then the other warpgroup's half.
+                                m0 = vals[0, 0]
+                                m1 = vals[1, 0]
+                                m2 = vals[2, 0]
+                                m3 = vals[3, 0]
+                                for j in cutlass.range_constexpr(1, half // 4):
+                                    m0 = cute.arch.fmax(m0, vals[4 * j, 0])
+                                    m1 = cute.arch.fmax(m1, vals[4 * j + 1, 0])
+                                    m2 = cute.arch.fmax(m2, vals[4 * j + 2, 0])
+                                    m3 = cute.arch.fmax(m3, vals[4 * j + 3, 0])
+                                mine = cute.arch.fmax(cute.arch.fmax(m0, m1), cute.arch.fmax(m2, m3))
+                                if cutlass.const_expr(self.trace):
+                                    if traced:
+                                        if tid == 0:
+                                            if it < 16:
+                                                trace[9 * 16 + it] = cute.arch.clock64()
+                                xmax[row, wg, slot] = mine
+                                prim.barrier_cta_sync(1, thread_count=256)
+                                if cutlass.const_expr(self.trace):
+                                    if traced:
+                                        if tid == 0:
+                                            if it < 16:
+                                                trace[10 * 16 + it] = cute.arch.clock64()
+                                other = xmax[row, 1 - wg, slot]
+                                # qk_scale > 0, so scaling the raw maximum equals the maximum of the scaled scores.
+                                block_max = cute.arch.fmax(mine, other) * qk_scale
+                                raw = cute.arch.fmax(running_m, block_max)
+                                # Stock keeps the raw running max (-inf for a row with no valid token yet) and
+                                # exponentiates against 0 instead.
+                                safe = raw
+                                if raw == -f32.inf:
+                                    safe = f32(0)
+                                alpha = cute.math.exp2(running_m - safe, fastmath=True)
+                                t0 = f32(0)
+                                t1 = f32(0)
+                                t2 = f32(0)
+                                t3 = f32(0)
+                                if cutlass.const_expr(not self.mode & 2):
+                                    for j in cutlass.range_constexpr(half // 4):
+                                        p0 = cute.math.exp2(vals[4 * j, 0] * qk_scale - safe, fastmath=True)
+                                        p1 = cute.math.exp2(vals[4 * j + 1, 0] * qk_scale - safe, fastmath=True)
+                                        p2 = cute.math.exp2(vals[4 * j + 2, 0] * qk_scale - safe, fastmath=True)
+                                        p3 = cute.math.exp2(vals[4 * j + 3, 0] * qk_scale - safe, fastmath=True)
+                                        t0 += p0
+                                        t1 += p1
+                                        t2 += p2
+                                        t3 += p3
+                                        vals[4 * j, 0] = p0 * 256
+                                        vals[4 * j + 1, 0] = p1 * 256
+                                        vals[4 * j + 2, 0] = p2 * 256
+                                        vals[4 * j + 3, 0] = p3 * 256
+                                running_l = running_l * alpha + ((t0 + t1) + (t2 + t3))
+                                running_m = raw
+                                if cutlass.const_expr(self.trace):
+                                    if traced:
+                                        if tid == 0:
+                                            if it < 16:
+                                                trace[11 * 16 + it] = cute.arch.clock64()
+                                packed[None, 0].store(vals[None, 0].load().to(dtype))
+                                if cutlass.const_expr(self.trace):
+                                    if traced:
+                                        if tid == 0:
+                                            if it < 16:
+                                                trace[12 * 16 + it] = cute.arch.clock64()
+                                cute.arch.mbarrier_wait(bpfree + slot, phase=(it // self.slots + 1) % 2)
+                                if cutlass.const_expr(self.trace):
+                                    if traced:
+                                        if tid == 0:
+                                            if it < 16:
+                                                trace[13 * 16 + it] = cute.arch.clock64()
+                                cute.autovec_copy(
+                                    packed[None, 0], cute.local_tile(sp[row, None, slot], (half,), (wg,))
+                                )
+                                if it == 0:
+                                    # O accumulates across blocks; start it at zero (TMEM is not initialized).
+                                    for j in cutlass.range_constexpr(half):
+                                        vals[j, 0] = f32(0)
+                                    for h in cutlass.range_constexpr(128 // half):
+                                        o_sub = cute.local_tile(o_plane, (128, half), (0, h))
+                                        store_o = tcgen05.make_tmem_copy(st_half, o_sub).get_slice(row)
+                                        ex.partition_and_copy(store_o, oview, o_sub)
+                                    cute.arch.fence_view_async_tmem_store()
+                                else:
+                                    need = cutlass.Boolean(False)
+                                    if row < rows:
+                                        if alpha != f32(1.0):
+                                            need = cutlass.Boolean(True)
+                                    if cutlass.const_expr(self.mode & 1):
+                                        need = cutlass.Boolean(False)
+                                    if cute.arch.vote_any_sync(need):
+                                        # The previous block's P V must have landed before the rescale.
+                                        cute.arch.mbarrier_wait(bo, phase=(it - 1) % 2)
+                                        for h in cutlass.range_constexpr(128 // half):
+                                            o_sub = cute.local_tile(o_plane, (128, half), (0, h))
+                                            load_o = tcgen05.make_tmem_copy(ld_half, o_sub).get_slice(row)
+                                            ex.partition_and_copy(load_o, o_sub, oview)
+                                            cute.arch.fence_view_async_tmem_load()
+                                            for j in cutlass.range_constexpr(half):
+                                                vals[j, 0] = vals[j, 0] * alpha
+                                            store_o = tcgen05.make_tmem_copy(st_half, o_sub).get_slice(row)
+                                            ex.partition_and_copy(store_o, oview, o_sub)
+                                        cute.arch.fence_view_async_tmem_store()
+                                if cutlass.const_expr(self.trace):
+                                    if traced:
+                                        if tid == 0:
+                                            if it < 16:
+                                                trace[14 * 16 + it] = cute.arch.clock64()
+                                cute.arch.fence_view_async_shared()
+                                if cutlass.const_expr(self.trace):
+                                    if traced:
+                                        if tid == 0:
+                                            if it < 16:
+                                                trace[5 * 16 + it] = cute.arch.clock64()
+                                cute.arch.mbarrier_arrive(bp + slot)
                     if nblk > 0:
                         # bo completes once per block; take the last two completions in order.
                         if nblk > 1:
