@@ -1683,6 +1683,11 @@ class Envs:
     # With SGLANG_Q35MF_MKH_HOP: keep the FlashInfer LL kernels at every M (no q35 hop, no FP8 handoff).
     # Read per call, so same-server A/B graph variants can switch the hop.
     SGLANG_Q35MF_MKH_HOP_SKIP = EnvBool(False)
+    # With SGLANG_Q35MF_MKH_HOP: the largest M the hop serves (init time; sizes the mailbox). Above 15 only
+    # where the FlashInfer workspace runs its LL protocol at that M (e.g. TP2 with CUTEDSL_LL_MAX_M=96).
+    SGLANG_Q35MF_MKH_HOP_MAX_M = EnvInt(15)
+    # Per-call cap below SGLANG_Q35MF_MKH_HOP_MAX_M (0 = no extra cap), so A/B graph variants can switch it.
+    SGLANG_Q35MF_MKH_HOP_USE_MAX_M = EnvInt(0)
     # With SGLANG_Q35MF_MKH_HOP: the GatedDeltaNet out_proj (static FP8, M <= 8) runs as a q35 hop
     # launch that pushes its partial straight into the hop mailbox, so its all-reduce only consumes.
     SGLANG_Q35MF_MKH_OPROJ = EnvBool(False)
