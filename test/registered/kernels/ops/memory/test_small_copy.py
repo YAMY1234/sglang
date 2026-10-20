@@ -4,6 +4,10 @@ import unittest
 import torch
 
 from sglang.kernels.ops.memory.small_copy import _small_copy_kernel, try_small_copy
+from sglang.kernels.ops.memory.small_field_copy import (
+    SmallFieldCopyPlan,
+    small_field_copy,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -140,6 +144,133 @@ class TestSmallCopy(CustomTestCase):
                 self.assertLessEqual(specialization_count - initial_count, 16)
             elif n > 48:
                 self.assertEqual(len(kernel_cache), specialization_count)
+
+
+def _raw_bits(tensor):
+    # Same-width integer view: compares stored bits without normalizing bool or NaN payloads.
+    width = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
+    return tensor.view(width[tensor.element_size()])
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+class TestSmallFieldCopy(CustomTestCase):
+    """small_field_copy must match try_small_copy: same bytes, same refusals."""
+
+    def test_bits_match_reference_copy(self):
+        for n, strided in itertools.product((0, 1, 8, 128, 4096), (False, True)):
+            with self.subTest(n=n, strided=strided):
+                dsts, srcs, refs = [], [], []
+                for dtype in _DTYPES:
+                    source = torch.randint(
+                        0,
+                        256,
+                        (2 * n * torch.empty((), dtype=dtype).element_size(),),
+                        device="cuda",
+                        dtype=torch.uint8,
+                    ).view(dtype)
+                    src = source[::2] if strided else source[:n]
+                    dst = torch.zeros(n * 3, device="cuda", dtype=dtype)
+                    dsts.append(dst[::3] if strided else dst[:n])
+                    srcs.append(src)
+                    refs.append(torch.zeros_like(dsts[-1]))
+                for chunk in range(0, len(dsts), 5):
+                    self.assertTrue(
+                        small_field_copy(
+                            dsts[chunk : chunk + 5], srcs[chunk : chunk + 5]
+                        )
+                    )
+                    self.assertTrue(
+                        try_small_copy(refs[chunk : chunk + 5], srcs[chunk : chunk + 5])
+                    )
+                for d, r in zip(dsts, refs):
+                    self.assertTrue(torch.equal(_raw_bits(d), _raw_bits(r)))
+
+    def test_width_casts_rows_and_graph_replay(self):
+        for n in (1, 4, 128, 2048):
+            with self.subTest(n=n):
+                s0 = torch.randint(
+                    -(2**40), 2**40, (n * 2,), device="cuda", dtype=torch.int64
+                )[::2]
+                s1 = torch.arange(n * 3, device="cuda", dtype=torch.int32).reshape(3, n)
+                d0 = torch.empty(n, device="cuda", dtype=torch.int32)
+                backing = torch.full((3, n + 5), -7, device="cuda", dtype=torch.int64)
+                d1 = backing[:, :n]
+                self.assertTrue(small_field_copy([d0, d1], [s0, s1]))
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    self.assertTrue(small_field_copy([d0, d1], [s0, s1]))
+                for _ in range(3):
+                    s0.add_(17)
+                    s1.add_(13)
+                    graph.replay()
+                    self.assertTrue(torch.equal(d0, s0.int()))
+                    self.assertTrue(torch.equal(d1, s1.long()))
+                    self.assertTrue(bool((backing[:, n:] == -7).all()))
+
+    def test_refusals_leave_destinations_untouched(self):
+        x = torch.arange(17, device="cuda")
+        y = torch.full_like(x, -1)
+        self.assertFalse(small_field_copy([x[1:], y[:16]], [x[:-1], x[:16]]))
+        self.assertFalse(small_field_copy([x, y], [y, x]))
+        self.assertFalse(small_field_copy([x[:8], x[4:12]], [y[:8], y[:8]]))
+        self.assertTrue(torch.equal(x, torch.arange(17, device="cuda")))
+        self.assertTrue(bool((y == -1).all()))
+        self.assertFalse(
+            small_field_copy(
+                [torch.empty(2, dtype=torch.complex64, device="cuda")] * 2,
+                [torch.empty(2, dtype=torch.complex64, device="cuda")] * 2,
+            )
+        )
+        a = torch.empty(2)
+        self.assertFalse(small_field_copy([a, a], [a, a]))
+        self.assertTrue(small_field_copy([x, y], [x, y]))
+
+    def test_plan_refreshes_sources_and_revalidates(self):
+        """A plan copies from each call's sources, re-validates a source whose layout
+        changed, and still refuses overlaps and foreign devices without writing."""
+        plan = SmallFieldCopyPlan()
+        d0 = torch.empty(8, device="cuda", dtype=torch.int64)
+        d1 = torch.empty((2, 4), device="cuda", dtype=torch.int32)
+        for step in range(4):
+            s0 = torch.randint(
+                -(2**31), 2**31 - 1, (8,), device="cuda", dtype=torch.int32
+            )
+            s1 = torch.randint(0, 100, (2, 4), device="cuda", dtype=torch.int32)
+            if step == 2:
+                s1 = torch.randint(0, 100, (4, 4), device="cuda", dtype=torch.int32)[
+                    ::2
+                ]
+            self.assertTrue(plan([d0, d1], [s0, s1]))
+            self.assertTrue(torch.equal(d0, s0.long()))
+            self.assertTrue(torch.equal(d1, s1))
+        before0, before1 = d0.clone(), d1.clone()
+        self.assertFalse(plan([d0, d1], [d1.view(-1), s1]))
+        self.assertFalse(plan([d0, d1], [s0.cpu(), s1]))
+        self.assertTrue(torch.equal(d0, before0) and torch.equal(d1, before1))
+        self.assertTrue(plan([d0, d1], [s0, s1]))
+        self.assertTrue(torch.equal(d0, s0.long()))
+
+    def test_plan_reads_pinned_host_sources_only_when_allowed(self):
+        """The post-verify graphs stage a host-drawn scalar with their device inputs
+        in one launch: a plan that allows it reads page-locked host memory, and every
+        other host source is refused without a write."""
+        host = torch.zeros(1, dtype=torch.int64, pin_memory=True)
+        src = torch.arange(8, device="cuda")
+        d0 = torch.empty(8, device="cuda", dtype=torch.int64)
+        d1 = torch.full((1,), -1, device="cuda", dtype=torch.int64)
+        plan = SmallFieldCopyPlan(allow_pinned_src=True)
+        for value in (3, 5):
+            host[0] = value
+            self.assertTrue(plan([d0, d1], [src, host]))
+            torch.cuda.synchronize()
+            self.assertEqual((int(d1.item()), d0.tolist()), (value, src.tolist()))
+        d1.fill_(-1)
+        self.assertFalse(SmallFieldCopyPlan()([d0, d1], [src, host]))
+        pageable = torch.ones(1, dtype=torch.int64)
+        self.assertFalse(
+            SmallFieldCopyPlan(allow_pinned_src=True)([d0, d1], [src, pageable])
+        )
+        self.assertEqual(int(d1.item()), -1)
 
 
 if __name__ == "__main__":

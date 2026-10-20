@@ -74,6 +74,11 @@ _is_npu = is_npu()
 _DEBUG_ASSERT = envs.SGLANG_IS_IN_CI.get()
 
 
+def _versions(tensors: Sequence[Optional[torch.Tensor]]) -> tuple:
+    # PyTorch bumps a tensor's version on every in-place write it makes
+    return tuple(None if t is None else t._version for t in tensors)
+
+
 @torch.compile(dynamic=True, disable=_is_npu)
 def _assert_nonneg_and_invalidate(
     values: torch.Tensor, buf: torch.Tensor, indices: torch.Tensor
@@ -256,6 +261,12 @@ class FutureMap:
     """Always-on pool-indexed relay for cross-iter values. Forward writes via
     publish/stash; next iter reads via resolve_forward_inputs / resolve_seq_lens_cpu.
     """
+
+    # see enable_stash_reuse and enable_seq_lens_index_select; class defaults,
+    # since test harnesses skip __init__
+    _reuse_stash = False
+    _last_stash: Optional[tuple] = None
+    _index_select_seq_lens = False
 
     def __init__(
         self,
@@ -452,7 +463,20 @@ class FutureMap:
         # record_batch_in_overlap; record_stream here is redundant.
         if indices.device.type != "cpu":
             indices.record_stream(torch.get_device_module(self.device).current_stream())
-        if self.need_topk:
+        if self.need_topk and self._holds_last_stash(draft_input):
+            # the gather would return these very values, cast as the stash cast them
+            draft_input.bonus_tokens = draft_input.bonus_tokens.to(
+                self.output_tokens_buf.dtype
+            )
+            draft_input.topk_p = draft_input.topk_p.to(self.topk_p_buf.dtype)
+            draft_input.topk_index = draft_input.topk_index.to(
+                self.topk_index_buf.dtype
+            )
+            if self.need_hidden_states:
+                draft_input.hidden_states = draft_input.hidden_states.to(
+                    self.hidden_states_buf.dtype
+                )
+        elif self.need_topk:
             hidden_states_buf = (
                 self.hidden_states_buf if self.need_hidden_states else None
             )
@@ -495,7 +519,45 @@ class FutureMap:
     ) -> None:
         """Write only output_tokens_buf rows; for relays carrying no draft
         extras (stash() would lazy-init the spec bufs from the payload)."""
+        self._last_stash = None
         self.output_tokens_buf[indices] = bonus_tokens.to(self.output_tokens_buf.dtype)
+
+    def enable_stash_reuse(self) -> None:
+        """Let a batch resolved right after its own stash keep the draft-input
+        tensors it stashed instead of gathering the same values back."""
+        self._reuse_stash = True
+
+    def enable_seq_lens_index_select(self) -> None:
+        """Gather a decode round's seq_lens with index_select instead of advanced
+        indexing: the same values for less host work."""
+        self._index_select_seq_lens = True
+
+    def _stashed_tensors(self, source: Any) -> tuple:
+        hidden_states = source.hidden_states if self.need_hidden_states else None
+        return source.bonus_tokens, source.topk_p, source.topk_index, hidden_states
+
+    def _stash_record(self, indices: torch.Tensor, payload: RelayPayload):
+        # what a resolve of these rows may keep instead of gathering, or None
+        tensors = self._stashed_tensors(payload)
+        if (
+            not self.need_topk
+            or self.draft_probs_buf is not None
+            or payload.dsa_topk_indices is not None
+            or any(t is None for t in tensors[:3])
+            or (self.need_hidden_states and tensors[3] is None)
+        ):
+            return None
+        return indices, tensors, _versions(tensors)
+
+    def _holds_last_stash(self, draft_input: EagleDraftInput) -> bool:
+        # the very tensors the last stash wrote to these rows, unwritten since
+        last = self._last_stash
+        if last is None or draft_input.future_indices is not last[0]:
+            return False
+        tensors = self._stashed_tensors(draft_input)
+        return all(a is b for a, b in zip(tensors, last[1])) and (
+            _versions(tensors) == last[2]
+        )
 
     def resolve_mixed_spec_tails(self, batch: ScheduleBatch) -> None:
         """Late-bind a spec mixed batch's decode tails (overlap): schedule-time
@@ -567,7 +629,10 @@ class FutureMap:
                 self.publish_ready.synchronize()
             else:
                 self.publish_ready.wait()
-        batch.seq_lens = self.new_seq_lens_buf[fi]
+        if self._index_select_seq_lens and fi.device == self.new_seq_lens_buf.device:
+            batch.seq_lens = torch.index_select(self.new_seq_lens_buf, 0, fi)
+        else:
+            batch.seq_lens = self.new_seq_lens_buf[fi]
 
         if not self.needs_cpu_seq_lens:
             # GPU gather above is kept (SB.seq_lens must advance each verify);
@@ -665,3 +730,5 @@ class FutureMap:
             self.dsa_topk_indices_buf[indices] = payload.dsa_topk_indices.to(
                 self.dsa_topk_indices_buf.dtype
             )
+        if self._reuse_stash:
+            self._last_stash = self._stash_record(indices, payload)

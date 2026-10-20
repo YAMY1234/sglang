@@ -1651,6 +1651,122 @@ class TestHiSparseStagedSpecRelay(CustomTestCase):
         )
 
 
+def _gather_rows(indices, topk_p_buf, topk_index_buf, output_tokens_buf, hidden_buf):
+    rows = (topk_p_buf, topk_index_buf, output_tokens_buf, hidden_buf)
+    return tuple(None if buf is None else buf[indices] for buf in rows)
+
+
+class TestFutureMapStashReuse(CustomTestCase):
+    """A resolve may keep the draft input's own tensors instead of gathering its
+    rows back only while the gather would return exactly those values."""
+
+    def _future_map(self, reuse):
+        future_map = object.__new__(FutureMap)
+        future_map.spec_algo = SpeculativeAlgorithm.EAGLE
+        future_map.device = torch.device("cpu")
+        future_map.need_topk = future_map.need_hidden_states = True
+        future_map.topk_p_buf = torch.zeros((4, 1), dtype=torch.float32)
+        future_map.topk_index_buf = torch.zeros((4, 1), dtype=torch.int64)
+        future_map.output_tokens_buf = torch.zeros(4, dtype=torch.int64)
+        future_map.hidden_states_buf = torch.zeros((4, 2), dtype=torch.bfloat16)
+        future_map.draft_probs_buf = future_map.dsa_topk_indices_buf = None
+        if reuse:
+            future_map.enable_stash_reuse()
+        return future_map
+
+    @patch("sglang.srt.managers.overlap_utils.gather_spec_extras")
+    def test_resolve_keeps_the_stash_only_while_a_gather_would_match(self, gather):
+        gather.side_effect = _gather_rows
+
+        def rejection_sampling(fm, di):
+            fm.draft_probs_buf, di.draft_probs = torch.zeros(4, 3), torch.ones(2, 3)
+
+        def dsa_top_k(fm, di):
+            fm.req_pool_size, di.dsa_topk_indices = 4, torch.tensor([[1], [2]])
+            di.future_dsa_topk_indices_available = True
+
+        def nothing(fm, di):
+            pass
+
+        # (before the stash, after it)
+        cases = {
+            "nothing": (nothing, nothing),
+            "not enabled": (nothing, nothing),
+            "rejection sampling": (rejection_sampling, nothing),
+            "dsa top-k": (dsa_top_k, nothing),
+            "draft input written": (nothing, lambda fm, di: di.topk_p.add_(1)),
+            "bonus tokens restashed": (
+                nothing,
+                lambda fm, di: fm.stash_bonus_tokens(
+                    di.future_indices, torch.tensor([8, 9])
+                ),
+            ),
+            "other rows stashed": (
+                nothing,
+                lambda fm, di: fm.stash(
+                    torch.tensor([0]), RelayPayload(bonus_tokens=torch.tensor([7]))
+                ),
+            ),
+            "batch filtered": (
+                nothing,
+                lambda fm, di: setattr(di, "future_indices", di.future_indices[[0, 1]]),
+            ),
+        }
+        for name, (before, after) in cases.items():
+            with self.subTest(case=name):
+                future_map = self._future_map(reuse=name != "not enabled")
+                # dtypes the stash casts to the relay buffers' dtypes
+                draft_input = SimpleNamespace(
+                    future_indices=torch.tensor([2, 3]),
+                    topk_p=torch.tensor([[0.5], [0.25]], dtype=torch.float64),
+                    topk_index=torch.tensor([[11], [12]], dtype=torch.int32),
+                    bonus_tokens=torch.tensor([5, 6], dtype=torch.int32),
+                    hidden_states=torch.ones((2, 2)),
+                    dsa_topk_indices=None,
+                    future_dsa_topk_indices_available=False,
+                )
+                before(future_map, draft_input)
+                future_map.stash(
+                    draft_input.future_indices,
+                    RelayPayload.from_draft_input(draft_input),
+                )
+                after(future_map, draft_input)
+                gathers = gather.call_count
+                want = _gather_rows(
+                    draft_input.future_indices,
+                    future_map.topk_p_buf,
+                    future_map.topk_index_buf,
+                    future_map.output_tokens_buf,
+                    future_map.hidden_states_buf,
+                )
+                future_map._resolve_spec_extras(SimpleNamespace(spec_info=draft_input))
+                self.assertEqual(gather.call_count == gathers, name == "nothing")
+                got = (
+                    draft_input.topk_p,
+                    draft_input.topk_index,
+                    draft_input.bonus_tokens,
+                    draft_input.hidden_states,
+                )
+                for g, w in zip(got, want):
+                    self.assertEqual(g.dtype, w.dtype)
+                    self.assertTrue(torch.equal(g, w))
+
+
+class TestFutureMapSeqLensIndexSelect(CustomTestCase):
+    def test_index_select_gathers_the_batch_rows(self):
+        future_map = object.__new__(FutureMap)
+        future_map.new_seq_lens_buf = torch.tensor([10, 11, 12, 13])
+        future_map.publish_ready, future_map.needs_cpu_seq_lens = None, False
+        future_map.enable_seq_lens_index_select()
+        batch = SimpleNamespace(
+            spec_info=SimpleNamespace(future_indices=torch.tensor([3, 1]))
+        )
+        with patch("torch.index_select", wraps=torch.index_select) as index_select:
+            future_map.resolve_seq_lens_cpu(batch)
+        index_select.assert_called_once()
+        self.assertEqual(batch.seq_lens.tolist(), [13, 11])
+
+
 class TestMooncakePPStaging(unittest.TestCase):
     def test_staging_response_targets_requesting_pp_rank(self):
         sock = Mock()

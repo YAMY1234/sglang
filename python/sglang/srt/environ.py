@@ -1459,6 +1459,17 @@ class Envs:
     # Experimental: capture the EAGLE verify's sampling, acceptance and state commit
     # in CUDA graphs (speculative/eagle_post_verify_graphs.py).
     SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH = EnvBool(False)
+    # Q35RT: runtime switches of the Qwen3.5 2.2 tree, names kept; all off by default.
+    # Draft and draft-extend graph inputs are staged with one fused copy launch.
+    SGLANG_Q35MF_ARRIVE_DRAFT_COPY = EnvBool(False)
+    # The fused draft input copies (DRAFT_COPY) reuse one descriptor per input layout.
+    SGLANG_Q35MF_ARRIVE_COPY_PLAN = EnvBool(False)
+    # Per-round result ids are copied to reused pinned host slots.
+    SGLANG_Q35MF_ARRIVE_D2H_RING = EnvBool(False)
+    # A decode batch unchanged since its stash reuses the relayed draft inputs.
+    SGLANG_Q35MF_ARRIVE_SKIP_REGATHER = EnvBool(False)
+    # Decode seq_lens are gathered with index_select instead of advanced indexing.
+    SGLANG_Q35MF_ARRIVE_SEQ_LENS_SELECT = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)

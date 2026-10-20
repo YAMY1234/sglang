@@ -286,6 +286,7 @@ from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
+    PinnedHostRing,
     allocate_distinct_stream,
     is_health_check_generate_req,
     validate_input_length,
@@ -685,6 +686,7 @@ class Scheduler(
 
         # Init overlap schedule
         self.init_overlap()
+        self.maybe_init_result_host_ring()
 
         # Init Ngram Embedding
         self.maybe_init_ngram_embedding()
@@ -1655,6 +1657,10 @@ class Scheduler(
             needs_cpu_seq_lens=needs_cpu_seq_lens,
             needs_confidence_relay=needs_confidence_relay,
         )
+        if envs.SGLANG_Q35MF_ARRIVE_SKIP_REGATHER.get():
+            self.future_map.enable_stash_reuse()
+        if envs.SGLANG_Q35MF_ARRIVE_SEQ_LENS_SELECT.get():
+            self.future_map.enable_seq_lens_index_select()
 
         self._confidence_budget_prepare = None
         if (
@@ -1706,6 +1712,19 @@ class Scheduler(
 
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
+
+    def maybe_init_result_host_ring(self):
+        """Reused pinned host slots for each overlapped round's result ids, with
+        SGLANG_Q35MF_ARRIVE_D2H_RING; not under CC, whose copies run on a worker
+        thread."""
+        self.result_host_ring = None
+        if (
+            envs.SGLANG_Q35MF_ARRIVE_D2H_RING.get()
+            and self.enable_overlap
+            and not self.enable_async_d2h_copy
+        ):
+            # ids are read within two rounds; eight is an arbitrary margin
+            self.result_host_ring = PinnedHostRing(depth=8)
 
     def maybe_init_ngram_embedding(self):
         self.ngram_embedding_manager = (
@@ -4964,6 +4983,7 @@ class Scheduler(
             batch_result.copy_to_cpu,
             return_logprob=batch.return_logprob,
             return_hidden_states=batch.return_hidden_states,
+            host_ring=self.result_host_ring,
         )
         self.copy_stream.wait_stream(self.forward_stream)
         with self.copy_stream_ctx:

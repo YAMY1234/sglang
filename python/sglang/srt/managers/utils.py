@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import dataclasses
+import itertools
 import logging
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Union
 
 import msgspec
 import torch
@@ -46,6 +47,33 @@ def allocate_distinct_stream(device_module, avoid_streams):
         if stream.cuda_stream not in avoid:
             return stream
     raise RuntimeError("Unable to allocate a distinct stream")
+
+
+class PinnedHostRing:
+    """Pinned host slots per (dtype, shape), reused round-robin for small device to
+    host copies; a slot is rewritten after ``depth`` more copies of its shape."""
+
+    def __init__(self, depth: int):
+        self._depth = depth
+        self._slots: dict[tuple, Iterator[torch.Tensor]] = {}
+
+    def copy(self, tensor: torch.Tensor) -> torch.Tensor:
+        """async_d2h into this shape's next slot instead of a new pinned tensor."""
+        if tensor.device.type == "cpu":
+            return tensor
+        key = (tensor.dtype, tensor.shape)
+        slots = self._slots.get(key)
+        if slots is None:
+            slots = self._slots[key] = itertools.cycle(
+                [
+                    torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
+                    for _ in range(self._depth)
+                ]
+            )
+        host = next(slots)
+        host.copy_(tensor, non_blocking=True)
+        tensor.record_stream(torch.get_device_module(tensor.device).current_stream())
+        return host
 
 
 @dataclasses.dataclass
@@ -161,11 +189,22 @@ class GenerationBatchResult:
         return self.num_correct_drafts + batch_size * self.num_non_draft_tokens_per_req
 
     @torch.profiler.record_function("copy_result_to_cpu")
-    def copy_to_cpu(self, return_logprob: bool, return_hidden_states: bool = True):
+    def copy_to_cpu(
+        self,
+        return_logprob: bool,
+        return_hidden_states: bool = True,
+        host_ring: Optional[PinnedHostRing] = None,
+    ):
         """Copy tensors to CPU in overlap scheduling.
         Only the tensors which are needed for processing results are copied,
-        e.g., next_token_ids, logits outputs
+        e.g., next_token_ids, logits outputs. ``host_ring``: copy the ids into its
+        reused slots when nothing else needs a copy.
         """
+        ids_d2h = _async_d2h
+        if host_ring is not None and self._carries_ids_only(
+            return_logprob=return_logprob, return_hidden_states=return_hidden_states
+        ):
+            ids_d2h = host_ring.copy
         if return_logprob:
             if self.logits_output.next_token_logprobs is not None:
                 self.logits_output.next_token_logprobs = _async_d2h(
@@ -194,16 +233,16 @@ class GenerationBatchResult:
             self.logits_output.hidden_states = _async_d2h(
                 self.logits_output.hidden_states
             )
-        self.next_token_ids = _async_d2h(self.next_token_ids)
+        self.next_token_ids = ids_d2h(self.next_token_ids)
 
         if self.accept_lens is not None:
-            self.accept_lens = _async_d2h(self.accept_lens)
+            self.accept_lens = ids_d2h(self.accept_lens)
 
         if self.block_accept_lens is not None:
-            self.block_accept_lens = _async_d2h(self.block_accept_lens)
+            self.block_accept_lens = ids_d2h(self.block_accept_lens)
 
         if self.cap_lens is not None:
-            self.cap_lens = _async_d2h(self.cap_lens)
+            self.cap_lens = ids_d2h(self.cap_lens)
 
         # Sub-objects only declare their device fields; the single copy+safety
         # primitive (_async_d2h: pinned D2H + record_stream) is injected here so
@@ -225,6 +264,26 @@ class GenerationBatchResult:
         self.copy_auxiliary_output_to_cpu()
 
         self.copy_done.record()
+
+    def _carries_ids_only(
+        self, *, return_logprob: bool, return_hidden_states: bool
+    ) -> bool:
+        # ids only, which the scheduler has read within two rounds of the copy
+        logits_output = self.logits_output
+        return not (
+            return_logprob
+            or self.routed_experts_output is not None
+            or self.indexer_topk_output is not None
+            or self.expert_distribution_metrics is not None
+            or (
+                logits_output is not None
+                and (
+                    (return_hidden_states and logits_output.hidden_states is not None)
+                    or logits_output.sampling_mask_output is not None
+                    or logits_output.auxiliary_device_output is not None
+                )
+            )
+        )
 
     def copy_auxiliary_output_to_cpu(self) -> None:
         if self.logits_output is None or self.auxiliary_host_output is not None:
