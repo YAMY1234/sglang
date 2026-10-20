@@ -1274,15 +1274,6 @@ SGL_DEVICE void cp_async_wait_all() {
   asm volatile("cp.async.wait_all;" ::: "memory");
 }
 
-SGL_DEVICE void cp_async_commit() {
-  asm volatile("cp.async.commit_group;" ::: "memory");
-}
-
-template <int kPending>
-SGL_DEVICE void cp_async_wait_group() {
-  asm volatile("cp.async.wait_group %0;" ::"n"(kPending) : "memory");
-}
-
 struct SkParams {
   const bf16_t* x;       // [M, kHidden]
   const bf16_t* weight;  // [kExperts, kHidden]
@@ -1304,62 +1295,41 @@ __global__ __launch_bounds__(kThreads, 1) void router_splitk_gemm_kernel(const _
   const uint32_t M = p.num_tokens;
   const uint32_t g = blockIdx.x % kSkGroups, s = blockIdx.x / kSkGroups;
   const uint32_t expert0 = g * kSkExperts, k0 = s * L::kSliceK;
-  constexpr uint32_t kHalf = L::kChunks / 2;
-  // Two K halves, each its own copy group, so the MMA on the first half overlaps the second half's arrival.
   // Router weights are static: their copies go out before the wait on the producer grid.
-#pragma unroll
-  for (uint32_t h = 0; h < 2; ++h) {
-    for (uint32_t i = threadIdx.x; i < kSkExperts * kHalf; i += kThreads) {
-      const uint32_t e = i / kHalf, c = h * kHalf + i % kHalf;
-      cp_async16(smem_addr(smem + L::kW + e * L::kRowBytes + c * 16),
-                 p.weight + static_cast<size_t>(expert0 + e) * kHidden + k0 + c * 8);
-    }
-    cp_async_commit();
+  for (uint32_t i = threadIdx.x; i < kSkExperts * L::kChunks; i += kThreads) {
+    const uint32_t e = i / L::kChunks, c = i % L::kChunks;
+    cp_async16(smem_addr(smem + L::kW + e * L::kRowBytes + c * 16),
+               p.weight + static_cast<size_t>(expert0 + e) * kHidden + k0 + c * 8);
   }
   device::PDLWaitPrimary<kUsePDL>();
   // Only after our own wait: the tail quantizes x before its wait.
   device::PDLTriggerSecondary<kUsePDL>();
-#pragma unroll
-  for (uint32_t h = 0; h < 2; ++h) {
-    for (uint32_t i = threadIdx.x; i < M * kHalf; i += kThreads) {
-      const uint32_t t = i / kHalf, c = h * kHalf + i % kHalf;
-      cp_async16(smem_addr(smem + L::kX + t * L::kRowBytes + c * 16), p.x + static_cast<size_t>(t) * kHidden + k0 + c * 8);
-    }
-    cp_async_commit();
+  for (uint32_t i = threadIdx.x; i < M * L::kChunks; i += kThreads) {
+    const uint32_t t = i / L::kChunks, c = i % L::kChunks;
+    cp_async16(smem_addr(smem + L::kX + t * L::kRowBytes + c * 16), p.x + static_cast<size_t>(t) * kHidden + k0 + c * 8);
   }
+  cp_async_wait_all();
+  __syncthreads();
   // Warp w: tokens [16 * (w / 2), +16), experts [32 * (w % 2), +32) of the group (four n8 tiles).
   const uint32_t mg = warp >> 1, nq = warp & 1;
-  const bool active = mg * 16 < M;
+  if (mg * 16 >= M) return;
   const uint32_t j = lane >> 3, r = lane & 7;
   const uint32_t tok = mg * 16 + (j & 1) * 8 + r;
   const uint32_t a_addr = smem_addr(smem + L::kX + (tok < M ? tok : 0) * L::kRowBytes + (j >> 1) * 16);
   const uint32_t b_addr0 = smem_addr(smem + L::kW + (nq * 32 + (j >> 1) * 8 + r) * L::kRowBytes + (j & 1) * 16);
   const uint32_t b_addr1 = b_addr0 + 16 * L::kRowBytes;
   float d[4][4] = {};
-#pragma unroll
-  for (uint32_t h = 0; h < 2; ++h) {
-    // Groups in issue order: W0, W1, X0, X1; half 0 needs W0 and X0, so at most X1 may still be pending.
-    if (h == 0) {
-      cp_async_wait_group<1>();
-    } else {
-      cp_async_wait_group<0>();
-    }
-    __syncthreads();
-    if (active) {
 #pragma unroll 4
-      for (uint32_t step = h * (L::kSliceK / 32); step < (h + 1) * (L::kSliceK / 32); ++step) {
-        uint32_t a[4], b0[4], b1[4];
-        ldmatrix_x4(a, a_addr + step * 32);
-        ldmatrix_x4(b0, b_addr0 + step * 32);
-        ldmatrix_x4(b1, b_addr1 + step * 32);
-        mma_bf16_16816(d[0], a[0], a[1], a[2], a[3], b0[0], b0[1]);
-        mma_bf16_16816(d[1], a[0], a[1], a[2], a[3], b0[2], b0[3]);
-        mma_bf16_16816(d[2], a[0], a[1], a[2], a[3], b1[0], b1[1]);
-        mma_bf16_16816(d[3], a[0], a[1], a[2], a[3], b1[2], b1[3]);
-      }
-    }
+  for (uint32_t step = 0; step < L::kSliceK / 16; ++step) {
+    uint32_t a[4], b0[4], b1[4];
+    ldmatrix_x4(a, a_addr + step * 32);
+    ldmatrix_x4(b0, b_addr0 + step * 32);
+    ldmatrix_x4(b1, b_addr1 + step * 32);
+    mma_bf16_16816(d[0], a[0], a[1], a[2], a[3], b0[0], b0[1]);
+    mma_bf16_16816(d[1], a[0], a[1], a[2], a[3], b0[2], b0[3]);
+    mma_bf16_16816(d[2], a[0], a[1], a[2], a[3], b1[0], b1[1]);
+    mma_bf16_16816(d[3], a[0], a[1], a[2], a[3], b1[2], b1[3]);
   }
-  if (!active) return;
   // C fragment: d[n][0..1] = token row gr, experts 2c, 2c + 1 of n8 tile n; d[n][2..3] = token row gr + 8.
   const uint32_t gr = lane >> 2, c = lane & 3;
   const uint32_t t0 = mg * 16 + gr, t1 = t0 + 8;
