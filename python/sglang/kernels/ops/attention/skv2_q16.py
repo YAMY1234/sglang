@@ -103,11 +103,15 @@ class Q16SplitDecode:
     """Warps 0-7: two softmax warpgroups (thread = query row; warpgroup g owns S columns g * 64.. and O half g),
     warp 8: both MMAs, warp 9: TMA loads."""
 
-    def __init__(self, heads=16, qlen=7, splits=148, stages=2, batch=1, mode=0, trace=False, lazy=0.0):
+    def __init__(
+        self, heads=16, qlen=7, splits=148, stages=2, batch=1, mode=0, trace=False, lazy=0.0, pdl=False
+    ):
         assert heads * qlen <= 128 and (heads * qlen) % 8 == 0 and stages in (1, 2)
         # P x 256 must stay <= 448 (e4m3 max), so a stale reference may trail the maximum by < log2(1.75).
         assert 0.0 <= lazy <= 0.8
         self.lazy = lazy
+        # Programmatic dependent launch: wait for the previous grid before reading inputs, release the merge early.
+        self.pdl = pdl
         # Timing ablations only (wrong outputs): 1 no O rescale, 2 no softmax math, 4 no P V MMA, 8 no Q K MMA,
         # 16 no tail masking.
         self.mode = mode
@@ -168,7 +172,12 @@ class Q16SplitDecode:
         )
         self.kernel(
             q, k, v, table, lengths, partial, maxima, denom, trace, qk_scale, out_scale, kq, vp
-        ).launch(grid=(self.splits, 1, self.batch), block=(320, 1, 1), stream=stream)
+        ).launch(
+            grid=(self.splits, 1, self.batch),
+            block=(320, 1, 1),
+            stream=stream,
+            use_pdl=self.pdl,
+        )
 
     @cute.experimental.kernel
     def kernel(
@@ -305,6 +314,8 @@ class Q16SplitDecode:
             .partition_D(o_sub0)
             .layout
         )
+        if cutlass.const_expr(self.pdl):
+            cute.arch.griddepcontrol_wait()
         # Stock split rule: pages_per_split = cdiv(cdiv(length, 64), SPLITS); a split covers whole pages.
         length = lengths[req]
         pps = cute.ceil_div(cute.ceil_div(length, 64), self.splits)
@@ -491,6 +502,8 @@ class Q16SplitDecode:
                             if traced:
                                 if tid == 0:
                                     trace[6 * 16 + 0] = cute.arch.clock64()
+                        if cutlass.const_expr(self.pdl):
+                            cute.arch.griddepcontrol_launch_dependents()
                         if cutlass.const_expr(wg == 1):
                             xden[row] = running_l
                         prim.barrier_cta_sync(2, thread_count=256)
@@ -665,7 +678,33 @@ import torch
 import triton
 from cutlass.cute.runtime import from_dlpack
 
-from sglang.kernels.ops.attention.split_kv_verify import _merge_attention
+import triton.language as tl
+
+from sglang.kernels.ops.attention.split_kv_verify import _merge_tile
+
+
+@triton.jit
+def _q16_merge(
+    Partial,
+    Maxima,
+    Denom,
+    Lengths,
+    Out,
+    ROWS: tl.constexpr,
+    SPLITS: tl.constexpr,
+    BS: tl.constexpr,
+    BD: tl.constexpr,
+    BN: tl.constexpr,
+    USE_PDL: tl.constexpr,
+):
+    # The stock split_kv_verify merge (unbalanced, skip-empty), optionally a PDL dependent of the producer.
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+    result, dims = _merge_tile(
+        Partial, Maxima, Denom, Lengths, ROWS, SPLITS, BS, BD, BN, False, True
+    )
+    row, batch = tl.program_id(0), tl.program_id(2)
+    tl.store(Out + (batch * ROWS + row) * 256 + dims, result, dims < 256)
 
 
 class Q16SplitPlan:
@@ -685,6 +724,7 @@ class Q16SplitPlan:
         merge_tile=64,
         merge_warps=4,
         lazy=0.0,
+        pdl=False,
     ):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
@@ -715,7 +755,9 @@ class Q16SplitPlan:
             mode=mode,
             trace=trace,
             lazy=lazy,
+            pdl=pdl,
         )
+        self.pdl = pdl
         views = self._views(query, kv, table, lengths)
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         self.compiled = cute.compile(
@@ -747,7 +789,7 @@ class Q16SplitPlan:
             cutlass.Float32(v_scale / 256.0),
             stream,
         )
-        _merge_attention[(self.rows, triton.cdiv(256, self.merge_tile), self.batch)](
+        _q16_merge[(self.rows, triton.cdiv(256, self.merge_tile), self.batch)](
             self.partial,
             self.maximum,
             self.denom,
@@ -758,11 +800,10 @@ class Q16SplitPlan:
             triton.next_power_of_2(self.splits),
             self.merge_tile,
             128,
-            False,
-            True,
-            True,
+            self.pdl,
             num_warps=self.merge_warps,
             enable_fp_fusion=False,
+            **({"launch_pdl": True} if self.pdl else {}),
         )
         return out
 
