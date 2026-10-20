@@ -142,6 +142,16 @@ _E2X_TP2_VERIFY_LAUNCH = {
 }
 
 
+# Same layout for the per-rank attention-DP shape (16 / 64 heads); B1 keeps the package launch. Byte-identical to
+# the package launch (BV32, two warps, PDL, conv 128) on every output and state write, measured the same way.
+_E2X_DEP_VERIFY_LAUNCH = {
+    2: (64, 2, 2, None, 64),
+    3: (64, 2, 2, None, 64),
+    4: (64, 2, 2, None, 64),
+    **{batch: (128, 2, 2, None, 64) for batch in range(5, 17)},
+}
+
+
 def _e2x_tp2_verify_launch(
     *,
     num_k_heads: int,
@@ -150,12 +160,13 @@ def _e2x_tp2_verify_launch(
     draft_token_num: int,
     batch_size: int,
 ) -> Optional[Tuple[int, int, int, Optional[int], int]]:
-    """Per-batch TP2 verify launch override; None keeps the stock launch."""
-    if not envs.SGLANG_Q35MF_E2X_TP2_GDN.get():
-        return None
-    if (num_k_heads, num_v_heads, head_dim, draft_token_num) != (8, 32, 128, 7):
-        return None
-    return _E2X_TP2_VERIFY_LAUNCH.get(batch_size)
+    """Per-batch TP2 / attention-DP verify launch override; None keeps the stock launch."""
+    shape = (num_k_heads, num_v_heads, head_dim, draft_token_num)
+    if shape == (8, 32, 128, 7) and envs.SGLANG_Q35MF_E2X_TP2_GDN.get():
+        return _E2X_TP2_VERIFY_LAUNCH.get(batch_size)
+    if shape == (16, 64, 128, 7) and envs.SGLANG_Q35MF_E2X_DEP_GDN.get():
+        return _E2X_DEP_VERIFY_LAUNCH.get(batch_size)
+    return None
 
 
 class GDNMISMetadata(msgspec.Struct, frozen=True):
@@ -2071,8 +2082,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     or envs.SGLANG_Q35MF_MKG_TP4_MIDDLE.get()
                 ):
                     verify_options["wait_for_gate_producer"] = True
+            table_name = "TP2" if HV == 32 else "DEP"
             print_info_once(
-                "E2X TP2 GDN verify launch table active: "
+                f"E2X {table_name} GDN verify launch table active: "
                 f"batch={query_start_loc.numel() - 1}, launch={e2x_launch}"
             )
         if wait_for_gate_producer:
