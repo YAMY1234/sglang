@@ -2253,6 +2253,10 @@ class Envs:
     SGLANG_Q35MF_E2X_VCH_MIN_LEN = EnvInt(2055)
     # Smallest batch that takes VCH; native gives enough KV CTAs per request below it (measured: B1-2 +0.05 ms/round).
     SGLANG_Q35MF_E2X_VCH_MIN_BS = EnvInt(1)
+    # PD prefill_complete with GDN / mamba state pools (late binding step 1); set on both roles.
+    SGLANG_Q35MF_LB_PC_MAMBA = EnvBool(False)
+    # Prefill side: one log line per transferred request with its completion / destination / transfer times.
+    SGLANG_Q35MF_LB_TIMING = EnvBool(False)
     SGLANG_Q35MF_GDN_DIRECT_SOLVE = EnvBool(False)
     SGLANG_Q35MF_GDN_EMPTY_HISTORY = EnvBool(False)
     SGLANG_Q35MF_GDN_NORM_FP8 = EnvBool(False)

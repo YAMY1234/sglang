@@ -384,7 +384,10 @@ class CommonKVManager(BaseKVManager):
         )
         self.deferred_bootstrap = None
         if self.defer_decode_allocation:
-            if any(state != StateType.DSA for state in args.state_types):
+            allowed_states = {StateType.DSA}
+            if envs.SGLANG_Q35MF_LB_PC_MAMBA.get():
+                allowed_states.add(StateType.MAMBA)
+            if any(state not in allowed_states for state in args.state_types):
                 raise ValueError(
                     "prefill_complete currently supports full-attention and DSA KV pools only"
                 )

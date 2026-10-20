@@ -1594,6 +1594,7 @@ class Scheduler(
             self.disagg_prefill_pending_chunk_rids: Set[str] = set()
 
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+            self.lb_timing_log = envs.SGLANG_Q35MF_LB_TIMING.get()
 
         if (
             self.enable_unified_memory

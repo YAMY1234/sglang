@@ -1211,6 +1211,8 @@ class SchedulerDisaggregationPrefillMixin:
             metrics = req.time_stats.compute_and_observe_kv_transfer_metrics(
                 req.disagg_kv_sender.get_transfer_metric()
             )
+            if self.lb_timing_log:
+                self._log_lb_transfer_timing(req)
             if metrics:
                 # Update last-value for REST API
                 if "latency_ms" in metrics:
@@ -1234,6 +1236,29 @@ class SchedulerDisaggregationPrefillMixin:
         self.disagg_prefill_inflight_queue = undone_reqs
 
         return done_reqs
+
+    def _log_lb_transfer_timing(self: Scheduler, req: Req) -> None:
+        ts = req.time_stats
+        # Wall-clock seconds: prefill done (transfer queue entry), decode destinations ready, transfer done.
+        done, dst, fin = (
+            ts.prefill_transfer_queue_entry_time,
+            ts.bootstrap_done_time,
+            ts.prefill_kv_transfer_finish_time,
+        )
+        logger.info(
+            "E2X_LB transfer rid=%s isl=%d bytes=%d policy=%s done=%.6f dst=%.6f fin=%.6f "
+            "hold_ms=%.2f dst_after_done_ms=%.2f send_ms=%.2f",
+            req.rid,
+            len(req.origin_input_ids),
+            req.disagg_kv_sender.get_transfer_metric().transfer_total_bytes or 0,
+            get_disagg().disaggregation_decode_allocation_policy,
+            done,
+            dst,
+            fin,
+            (fin - done) * 1e3,
+            (dst - done) * 1e3,
+            (fin - max(dst, done)) * 1e3,
+        )
 
     def handle_inflight_transfer_failure(
         self: Scheduler, req: Req
