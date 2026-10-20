@@ -101,8 +101,10 @@ def load_values(
 class Q16SplitDecode:
     """Warps 0-3: softmax + O rescale + epilogue (thread = query row); warp 4: both MMAs; warp 5: TMA loads."""
 
-    def __init__(self, heads=16, qlen=7, splits=148, stages=2, batch=1):
+    def __init__(self, heads=16, qlen=7, splits=148, stages=2, batch=1, mode=0):
         assert heads * qlen <= 128 and (heads * qlen) % 8 == 0 and stages in (1, 2)
+        # Timing ablations only (wrong outputs): 1 no O rescale, 2 no softmax math, 4 no P V MMA, 8 no Q K MMA.
+        self.mode = mode
         self.heads, self.qlen, self.splits, self.stages, self.batch = (
             heads,
             qlen,
@@ -299,12 +301,13 @@ class Q16SplitDecode:
                 cute.arch.mbarrier_arrive(bsfree + slot)
                 last = limit - (begin_tok + it * self.tile)
                 block_max = f32(-f32.inf)
-                for j in cutlass.range_constexpr(self.tile):
-                    score = vals[j, 0] * qk_scale
-                    if j > last:
-                        score = -f32.inf
-                    vals[j, 0] = score
-                    block_max = cute.arch.fmax(block_max, score)
+                if cutlass.const_expr(not self.mode & 2):
+                    for j in cutlass.range_constexpr(self.tile):
+                        score = vals[j, 0] * qk_scale
+                        if j > last:
+                            score = -f32.inf
+                        vals[j, 0] = score
+                        block_max = cute.arch.fmax(block_max, score)
                 raw = cute.arch.fmax(running_m, block_max)
                 # Stock keeps the raw running max (-inf for a row with no valid token yet) and
                 # exponentiates against 0 instead.
@@ -313,10 +316,11 @@ class Q16SplitDecode:
                     safe = f32(0)
                 alpha = cute.math.exp2(running_m - safe, fastmath=True)
                 total = f32(0)
-                for j in cutlass.range_constexpr(self.tile):
-                    probability = cute.math.exp2(vals[j, 0] - safe, fastmath=True)
-                    total += probability
-                    vals[j, 0] = probability * 256
+                if cutlass.const_expr(not self.mode & 2):
+                    for j in cutlass.range_constexpr(self.tile):
+                        probability = cute.math.exp2(vals[j, 0] - safe, fastmath=True)
+                        total += probability
+                        vals[j, 0] = probability * 256
                 running_l = running_l * alpha + total
                 running_m = raw
                 packed[None, 0].store(vals[None, 0].load().to(dtype))
@@ -340,6 +344,8 @@ class Q16SplitDecode:
                     if row < rows:
                         if alpha != f32(1.0):
                             need = cutlass.Boolean(True)
+                    if cutlass.const_expr(self.mode & 1):
+                        need = cutlass.Boolean(False)
                     if cute.arch.vote_any_sync(need):
                         # The previous block's P V must have landed before the rescale.
                         cute.arch.mbarrier_wait(bo, phase=(it - 1) % 2)
@@ -393,7 +399,9 @@ class Q16SplitDecode:
                     ktile = cute.local_tile(sk[None, None, stage], (self.tile, 256), (0, 0))
                     k_frag = kq.get_slice(0).partition_B(ktile)
                     atom_kq.set(tcgen05.Field.ACCUMULATE, False)
-                    for kk in cutlass.range_constexpr(cute.size(k_frag, mode=[2])):
+                    for kk in cutlass.range_constexpr(
+                        0 if self.mode & 8 else cute.size(k_frag, mode=[2])
+                    ):
                         ex.dot(
                             atom_kq,
                             q_frag[None, None, kk],
@@ -415,7 +423,9 @@ class Q16SplitDecode:
                             sv[None, None, stage], (128, self.tile), (dm, 0)
                         )
                         v_frag = vp.get_slice(0).partition_B(vtile)
-                        for kk in cutlass.range_constexpr(cute.size(v_frag, mode=[2])):
+                        for kk in cutlass.range_constexpr(
+                            0 if self.mode & 4 else cute.size(v_frag, mode=[2])
+                        ):
                             ex.dot(
                                 atom_vp,
                                 p_frag[None, None, kk],
@@ -492,7 +502,7 @@ from sglang.kernels.ops.attention.split_kv_verify import _merge_attention
 class Q16SplitPlan:
     """Reusable storage and a compiled producer for one fixed input layout; merge is the stock kernel."""
 
-    def __init__(self, query, kv, table, lengths, *, splits=None, stages=2):
+    def __init__(self, query, kv, table, lengths, *, splits=None, stages=2, mode=0):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "Paged split-KV storage must be prepared before graph capture"
@@ -512,7 +522,7 @@ class Q16SplitPlan:
         )
         self.denom = torch.empty_like(self.maximum)
         kernel = Q16SplitDecode(
-            self.heads, self.qlen, self.splits, stages=stages, batch=self.batch
+            self.heads, self.qlen, self.splits, stages=stages, batch=self.batch, mode=mode
         )
         views = self._views(query, kv, table, lengths)
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
