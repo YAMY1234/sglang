@@ -22,7 +22,9 @@ namespace qwen_ep_tables {
 
 inline constexpr uint32_t kThreads = 1024;
 inline constexpr uint32_t kMaxLocalExperts = 256;
-inline constexpr uint32_t kPerThread = 6;  // up to 6144 expanded entries (614 rows x top-10)
+// Entries per thread: 6 covers DEP4 decode (448 rows x top-10); 9 covers DEP8 decode (896 rows x top-10).
+inline constexpr uint32_t kSmallPerThread = 6;
+inline constexpr uint32_t kMaxPerThread = 9;
 
 struct Params {
   const int32_t* topk_ids;               // [R * top_k], global expert ids
@@ -38,7 +40,7 @@ struct Params {
   uint32_t tile_log2;
 };
 
-template <bool kUsePDL>
+template <bool kUsePDL, uint32_t kPerThread>
 __global__ __launch_bounds__(kThreads, 1) void ep_tables_kernel(const __grid_constant__ Params p) {
   using Scan = cub::BlockScan<int32_t, kThreads>;
   __shared__ typename Scan::TempStorage scan_storage;
@@ -127,7 +129,7 @@ struct EpTables {
     TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(total_num_padded_tokens);
     TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(num_non_exiting_tiles);
     const auto expanded = static_cast<uint64_t>(R_.unwrap()) * static_cast<uint64_t>(K_.unwrap());
-    CHECK_HOST(expanded <= kThreads * kPerThread) << "ep_tables: " << expanded << " expanded entries";
+    CHECK_HOST(expanded <= kThreads * kMaxPerThread) << "ep_tables: " << expanded << " expanded entries";
     CHECK_HOST(num_local > 0 && num_local <= kMaxLocalExperts) << "ep_tables: num_local " << num_local;
     CHECK_HOST(tile_log2 >= 3 && tile_log2 <= 10) << "ep_tables: tile_log2 " << tile_log2;
     if (expanded == 0) return;
@@ -148,7 +150,11 @@ struct EpTables {
     params.local_offset = static_cast<int32_t>(local_offset);
     params.num_local = static_cast<uint32_t>(num_local);
     params.tile_log2 = static_cast<uint32_t>(tile_log2);
-    LaunchKernel(1, kThreads, device.unwrap()).enable_pdl(kUsePDL)(ep_tables_kernel<kUsePDL>, params);
+    if (expanded <= kThreads * kSmallPerThread) {
+      LaunchKernel(1, kThreads, device.unwrap()).enable_pdl(kUsePDL)(ep_tables_kernel<kUsePDL, kSmallPerThread>, params);
+    } else {
+      LaunchKernel(1, kThreads, device.unwrap()).enable_pdl(kUsePDL)(ep_tables_kernel<kUsePDL, kMaxPerThread>, params);
+    }
   }
 };
 
