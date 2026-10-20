@@ -38,11 +38,13 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--check-only", action="store_true")
     parser.add_argument("--quant-only", action="store_true")
+    parser.add_argument("--ms", default="1,2,7,14")
+    parser.add_argument("--heads", default="4,8,16")
     args = parser.parse_args()
     records = []
     torch.manual_seed(42)
-    for m in (1, 2, 7, 14):
-        for heads in (4, 8, 16):
+    for m in [int(x) for x in args.ms.split(",")]:
+        for heads in [int(x) for x in args.heads.split(",")]:
             hidden = heads * 256
             x = torch.randn(m, hidden, dtype=torch.bfloat16, device="cuda")
             gate = torch.randn(m, heads, 512, dtype=torch.bfloat16, device="cuda")[

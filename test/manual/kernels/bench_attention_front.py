@@ -114,20 +114,28 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", required=True)
     parser.add_argument("--check-only", action="store_true")
+    parser.add_argument("--ms", default="1,2,7,14")
+    parser.add_argument("--heads", default="4,8,16")
+    # KV heads per rank: 1 under attention TP, 2 under DP attention (DEP16).
+    parser.add_argument("--kv-heads", type=int, default=1)
     args = parser.parse_args()
+    kvh = args.kv_heads
     check_scale_boundaries()
     torch.manual_seed(42)
     records = []
-    for m in (1, 2, 7, 14):
-        for heads in (4, 8, 16):
+    for m in [int(x) for x in args.ms.split(",")]:
+        for heads in [int(x) for x in args.heads.split(",")]:
             for seed in range(12):
                 torch.manual_seed(seed)
                 qkv = torch.randn(
-                    m, (heads * 2 + 2) * 256, device="cuda", dtype=torch.bfloat16
+                    m,
+                    (heads * 2 + 2 * kvh) * 256,
+                    device="cuda",
+                    dtype=torch.bfloat16,
                 )
                 if seed >= 6:
                     qkv[:, ::17] *= 20
-                qg, k, v = qkv.split((heads * 512, 256, 256), -1)
+                qg, k, v = qkv.split((heads * 512, kvh * 256, kvh * 256), -1)
                 qw, kw = (
                     torch.randn(256, device="cuda", dtype=torch.bfloat16)
                     for _ in range(2)
@@ -151,13 +159,13 @@ def main():
                 stride = 512 if seed % 2 else 256
                 old_kv = tuple(
                     torch.zeros(
-                        1024, 1, stride, dtype=torch.float8_e4m3fn, device="cuda"
+                        1024, kvh, stride, dtype=torch.float8_e4m3fn, device="cuda"
                     )[:, :, :256]
                     for _ in range(2)
                 )
                 new_kv = tuple(
                     torch.zeros(
-                        1024, 1, stride, dtype=torch.float8_e4m3fn, device="cuda"
+                        1024, kvh, stride, dtype=torch.float8_e4m3fn, device="cuda"
                     )[:, :, :256]
                     for _ in range(2)
                 )
@@ -172,7 +180,7 @@ def main():
                         pos,
                         1e-6,
                         heads,
-                        1,
+                        kvh,
                         256,
                         64,
                         mrope_axis_map=axis,
@@ -190,7 +198,7 @@ def main():
                         pos,
                         1e-6,
                         heads,
-                        1,
+                        kvh,
                         256,
                         64,
                         mrope_axis_map=axis,
@@ -211,6 +219,7 @@ def main():
             row = dict(
                 m=m,
                 heads=heads,
+                kv_heads=kvh,
                 seeds=12,
                 byte_mismatches=0,
                 numerical_verdict="PASS",

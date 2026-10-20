@@ -69,6 +69,14 @@ def env(key, default=None):
     return os.environ.get(key, default)
 
 
+def switch(cached, key):
+    """A boolean switch cached at init, re-read at call time while the A/B harness is on (variants apply their
+    env during graph capture)."""
+    if not VARIANTS:
+        return cached
+    return os.environ.get(key, "0").lower() in ("1", "true")
+
+
 def env_any(key, value):
     """True when the process env or any variant sets the switch to value."""
     return os.environ.get(key) == value or any(o.get(key) == value for o in VARIANTS.values())

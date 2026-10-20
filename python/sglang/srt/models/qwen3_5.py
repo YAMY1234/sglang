@@ -111,6 +111,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.runner_backend import ab_variants
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -1948,7 +1949,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         else:
             q_gate, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         cache_kwargs = {}
-        if self._attn_front_requested and forward_batch is not None:
+        if (
+            ab_variants.switch(self._attn_front_requested, "SGLANG_Q35MF_ATTN_FRONT")
+            and forward_batch is not None
+        ):
             from sglang.srt.layers.cp.utils import is_cp_active
             from sglang.srt.model_executor.forward_context import get_attn_backend
 
@@ -2268,15 +2272,18 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
+            gate_quant_requested = ab_variants.switch(
+                self._attn_gate_quant_requested, "SGLANG_Q35MF_ATTN_GATE_QUANT"
+            )
             use_static_gate = (
-                self._attn_gate_quant_requested
+                gate_quant_requested
                 and type(self.o_proj.quant_method).__name__ == "ModelOptFp8LinearMethod"
                 and not self.o_proj.quant_method.use_marlin
                 and self.o_proj.input_scale is not None
                 and self.o_proj.input_scale.numel() == 1
                 and attn_output.dtype == torch.bfloat16
             )
-            if self._attn_gate_quant_requested and not use_static_gate:
+            if gate_quant_requested and not use_static_gate:
                 logger.warning_once(
                     "Fused static FP8 output gating is unsupported; using standard gating."
                 )
