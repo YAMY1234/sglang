@@ -58,13 +58,12 @@ __global__ void __launch_bounds__(kRows * 32, kMinBlocks) mkd_qkv_kernel(const M
   const int lane = static_cast<int>(threadIdx.x % 32);
   const int row = static_cast<int>(blockIdx.x) * kRows + warp;
   PDLTriggerSecondary<kUsePDL>();
+  // Unconditional (a tail warp re-reads the last row): a guarded load is if-converted and lands after the wait.
   uint4 wv[kVecs];
-  if (row < p.n) {
-    const uint4* wr = reinterpret_cast<const uint4*>(p.w + static_cast<int64_t>(row) * kK);
+  const uint4* wr = reinterpret_cast<const uint4*>(p.w + static_cast<int64_t>(min(row, p.n - 1)) * kK);
 #pragma unroll
-    for (int j = 0; j < kVecs; ++j)
-      wv[j] = ld_nc_v4(wr + j * 32 + lane);
-  }
+  for (int j = 0; j < kVecs; ++j)
+    wv[j] = ld_nc_v4(wr + j * 32 + lane);
 #pragma unroll
   for (int j = 0; j < kPer; ++j) {
     const int i = static_cast<int>(threadIdx.x) + j * kThreads;
