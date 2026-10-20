@@ -18,6 +18,8 @@ import torch
 from sglang.kernels.ops.speculative.k75p_argmax import k75p_select, k75p_shard_argmax
 from sglang.kernels.ops.speculative.topk1 import draft_topk1_argmax_only
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
+from sglang.srt.environ import envs
+from sglang.srt.layers.e2x_dep_draft_xchg import DepDraftXchg
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
@@ -52,6 +54,7 @@ class K75PDraftSelect:
             dtype=torch.int32,
             device=self.hidden_state.device,
         )
+        self.dep: Optional[DepDraftXchg] = None
 
     @classmethod
     def create(cls, *, max_rows: int, hidden_size: int) -> Optional[K75PDraftSelect]:
@@ -62,6 +65,15 @@ class K75PDraftSelect:
         ):
             logger.warning("K75P draft LM head disabled: no multicast on the TP group.")
             return None
+        if envs.SGLANG_Q35MF_DEP_DX_XCHG.get():
+            tp_group = get_parallel().tp_group
+            select.dep = DepDraftXchg(
+                device_group=tp_group.device_group,
+                rank=select.rank,
+                world=select.world,
+                max_rows=max_rows,
+                proof=envs.SGLANG_Q35MF_DEP_DX_PROOF.get(),
+            )
         logger.info(
             "K75P draft LM head active (tp=%d, rows/rank <= %d).",
             select.world,
@@ -90,6 +102,20 @@ class K75PDraftSelect:
         ).view(self.world * rows, self.hidden_size)
 
     def select(
+        self, *, logits: torch.Tensor, num_local_rows: int, torch_nan: bool
+    ) -> torch.Tensor:
+        if self.dep is not None:
+            return self.dep.select(
+                logits=logits,
+                num_local_rows=num_local_rows,
+                torch_nan=torch_nan,
+                stock_select=self._select_stock,
+            )
+        return self._select_stock(
+            logits=logits, num_local_rows=num_local_rows, torch_nan=torch_nan
+        )
+
+    def _select_stock(
         self, *, logits: torch.Tensor, num_local_rows: int, torch_nan: bool
     ) -> torch.Tensor:
         total_rows = logits.shape[0]

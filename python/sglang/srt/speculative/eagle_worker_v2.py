@@ -34,6 +34,7 @@ from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
 )
+from sglang.srt.layers.e2x_dep_draft_xchg import DepDraftXchg
 from sglang.srt.layers.moe.utils import (
     draft_model_build_scope,
     speculative_moe_a2a_backend_context,
@@ -200,6 +201,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self._exchange_in_draft_extend = False
         self._hot_vocab: Optional[DraftHotVocab] = None
         self._hot_token_map: Optional[torch.Tensor] = None
+        self._dep_draft_xchg: Optional[DepDraftXchg] = None
 
         # Use the same attention topology during draft construction and execution.
         self.draft_owns_attention = (
@@ -305,6 +307,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     max_rows=self._topk1_parents_prealloc.shape[0],
                     hidden_size=self.draft_runner.model_config.hidden_size,
                 )
+            select = self.draft_runner.model.logits_processor.k75p_draft_select
+            if select is not None:
+                self._dep_draft_xchg = select.dep
 
     def init_attention_backends(self):
         with (
@@ -843,6 +848,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             and topk_index.shape[0] <= self._draft_vocab_exchange.step_rows
             else None
         )
+        # The K75P select writes the topk1 finish outputs itself when it runs in a step.
+        dep_xchg = (
+            self._dep_draft_xchg
+            if exchange is None and draft_tokens_topk1 is not None
+            else None
+        )
 
         # Forward multiple steps
         scores = None
@@ -883,6 +894,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 )
                 if exchange is not None:
                     exchange.begin_step(i, topk_index.shape[0])
+                if dep_xchg is not None:
+                    dep_xchg.begin_step(
+                        positions=forward_batch.positions,
+                        draft_tokens=draft_tokens_topk1,
+                        draft_column=i + 1,
+                        mrope_positions=(
+                            forward_batch.mrope_positions
+                            if self.draft_runner.model_config.model_is_mrope
+                            else None
+                        ),
+                    )
                 with (
                     forward_context(
                         ForwardContext(
@@ -896,6 +918,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     ).logits_output
                 if exchange is not None:
                     exchange.end()
+                step_finish = dep_xchg.end_step() if dep_xchg is not None else None
                 maybe_detect_nan(
                     logits_output.next_token_logits, f"draft_forward step {i}"
                 )
@@ -924,7 +947,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         ),
                     )
                 elif self.topk == 1:
-                    if logits_output.next_token_ids is not None:
+                    if step_finish is not None:
+                        topk_p, topk_index, _ = step_finish
+                    elif logits_output.next_token_ids is not None:
                         topk_p, topk_index = k75p_topk1_postprocess(
                             next_token_ids=logits_output.next_token_ids,
                             positions=forward_batch.positions,
@@ -953,7 +978,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     )
                     topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
                     forward_batch.positions.add_(1)
-                if self.draft_runner.model_config.model_is_mrope and exchange is None:
+                if (
+                    self.draft_runner.model_config.model_is_mrope
+                    and exchange is None
+                    and not (step_finish is not None and step_finish[2])
+                ):
                     forward_batch.mrope_positions.add_(1)
                 vocab_size = (
                     self.draft_runner.model_config.vocab_size
