@@ -3,6 +3,9 @@
 Each rank computes every gathered row's logits on its vocab shard (K75P); instead of the pair
 all-gather and select, each rank sends its candidate to the row's owner, which picks the token
 with K75P's keys and ties and, in draft decode steps, also writes the topk1 finish outputs.
+With the memo (SGLANG_Q35MF_DEP_DX_MEMO) the candidate carries its row of the served pre-fc
+embedding norm and the owner writes the next step's fc input; the hidden half is normed on a
+side stream beside the lm_head, so the next step skips the embedding, both norms and the cat.
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ import torch.distributed as dist
 from sglang.kernels.ops.speculative.e2x_dep_xchg import (
     MAX_BLOCKS,
     SLOT_MARKER,
+    dep_data_shape,
     dep_slots_shape,
     e2x_dep_xchg,
 )
@@ -26,6 +30,10 @@ logger = logging.getLogger(__name__)
 
 # (topk_p [rows, 1], topk_index [rows, 1], whether mrope_positions got its + 1)
 StepFinish = Tuple[torch.Tensor, torch.Tensor, bool]
+
+# Memo rows per norm call at build time; the served norm is row-invariant across widths (checked).
+_MEMO_BLOCK = 1024
+_MEMO_CHECK_ROWS = 64
 
 
 class DepDraftXchg:
@@ -42,6 +50,8 @@ class DepDraftXchg:
 
         self.rank = rank
         self.world = world
+        self.device_group = device_group
+        self.max_rows = max_rows
         max_gathered = world * max_rows
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
         with torch.inference_mode(False), torch.no_grad():
@@ -70,11 +80,126 @@ class DepDraftXchg:
         self._step: Optional[tuple] = None
         self._finish: Optional[StepFinish] = None
         self.proof = DepDraftXchgProof() if proof else None
+        self.no_rows = torch.empty(0, dtype=torch.bfloat16, device=device)
+        # Memo state (enable_memo): fc_in holds the next draft step's fc input.
+        self.memo: Optional[torch.Tensor] = None
+        self.data: Optional[torch.Tensor] = None
+        self.peer_data: Optional[torch.Tensor] = None
+        self.fc_in: Optional[torch.Tensor] = None
+        self.side_stream: Optional[torch.cuda.Stream] = None
+        self._produce = False
+        self._embed_rows: Optional[int] = None
+        self._hidden_rows: Optional[int] = None
+        self._side_pending = False
+        self._fc_ready: Optional[int] = None
         logger.info(
             "DEP-DX draft token exchange active (tp=%d, rows/rank <= %d).",
             world,
             max_rows,
         )
+
+    def enable_memo(
+        self,
+        *,
+        embed_weight: torch.Tensor,
+        norm: Callable[[torch.Tensor], torch.Tensor],
+        vocab_local: int,
+    ) -> None:
+        """Collective. Normalized embedding rows of this rank's vocab shard, built with the served norm."""
+        import torch.distributed._symmetric_memory as symm_mem
+
+        hidden = embed_weight.shape[1]
+        start = self.rank * vocab_local
+        if embed_weight.shape[0] < self.world * vocab_local or hidden % 8 != 0:
+            raise RuntimeError(
+                f"DEP-DX memo needs the full embedding table, got {tuple(embed_weight.shape)}"
+            )
+        rows = embed_weight[start : start + vocab_local]
+        memo = torch.empty((vocab_local, hidden), dtype=torch.bfloat16, device=rows.device)
+        for i in range(0, vocab_local, _MEMO_BLOCK):
+            memo[i : i + _MEMO_BLOCK] = norm(rows[i : i + _MEMO_BLOCK].contiguous())
+        self._check_memo(memo=memo, rows=rows, norm=norm)
+        with torch.inference_mode(False), torch.no_grad():
+            data = symm_mem.empty(
+                dep_data_shape(self.world * self.max_rows, self.world, hidden),
+                dtype=torch.bfloat16,
+                device=rows.device,
+            )
+        hdl = symm_mem.rendezvous(data, group=self.device_group)
+        if int(hdl.buffer_ptrs[self.rank]) != data.data_ptr():
+            raise RuntimeError("DEP-DX memo: unexpected symmetric memory layout")
+        self.memo = memo
+        self.data = data
+        self.peer_data = torch.tensor(
+            [int(p) for p in hdl.buffer_ptrs], dtype=torch.int64, device=rows.device
+        )
+        self.fc_in = torch.zeros(
+            (self.max_rows, 2 * hidden), dtype=torch.bfloat16, device=rows.device
+        )
+        self.side_stream = torch.cuda.Stream(device=rows.device)
+        logger.info(
+            "DEP-DX memo active (vocab rows %d:%d, %.1f MB on this rank).",
+            start,
+            start + vocab_local,
+            memo.numel() * 2 / 2**20,
+        )
+
+    def _check_memo(
+        self,
+        *,
+        memo: torch.Tensor,
+        rows: torch.Tensor,
+        norm: Callable[[torch.Tensor], torch.Tensor],
+    ) -> None:
+        # Served draft steps norm 1..max_rows rows at once; check rows at every served width.
+        gen = torch.Generator(device="cpu").manual_seed(self.rank)
+        ids = torch.randint(0, rows.shape[0], (_MEMO_CHECK_ROWS,), generator=gen).to(
+            rows.device
+        )
+        bad = torch.zeros(1, dtype=torch.int64, device=rows.device)
+        for width in range(1, self.max_rows + 1):
+            for i in range(0, _MEMO_CHECK_ROWS, width):
+                sel = ids[i : i + width]
+                ref = norm(rows[sel].contiguous())
+                bad += (ref.view(torch.int16) != memo[sel].view(torch.int16)).any(dim=1).sum()
+        dist.all_reduce(bad, group=self.device_group)
+        if int(bad[0]) != 0:
+            raise RuntimeError(
+                f"DEP-DX memo differs from the served norm on {int(bad[0])} checked rows"
+            )
+
+    def begin_draft(self) -> None:
+        self._fc_ready = None
+
+    def end_draft(self) -> None:
+        # A capture must rejoin the side stream; so must eager work that reuses fc_in.
+        if self._side_pending:
+            torch.cuda.current_stream().wait_stream(self.side_stream)
+        self._side_pending = False
+        self._fc_ready = None
+
+    def hidden_half(
+        self, *, hidden_states: torch.Tensor, norm: Callable[[torch.Tensor], torch.Tensor]
+    ) -> None:
+        """The next step's normed hidden half on the side stream, beside the lm_head."""
+        if not self._produce:
+            return
+        rows = hidden_states.shape[0]
+        hidden = hidden_states.shape[1]
+        self.side_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self.side_stream):
+            self.fc_in[:rows, hidden:].copy_(norm(hidden_states))
+        self._hidden_rows = rows
+        self._side_pending = True
+
+    def take_fc_input(self, *, rows: int) -> Optional[torch.Tensor]:
+        """This step's fc input [rows, 2H] when the previous step of the same draft wrote it."""
+        if self._fc_ready != rows:
+            return None
+        self._fc_ready = None
+        torch.cuda.current_stream().wait_stream(self.side_stream)
+        self._side_pending = False
+        return self.fc_in[:rows]
 
     def begin_step(
         self,
@@ -83,15 +208,26 @@ class DepDraftXchg:
         draft_tokens: torch.Tensor,
         draft_column: int,
         mrope_positions: Optional[torch.Tensor],
+        produce_fc: bool,
     ) -> None:
         self._step = (positions, draft_tokens, draft_column, mrope_positions)
         self._finish = None
+        self._produce = produce_fc and self.memo is not None
+        self._embed_rows = None
+        self._hidden_rows = None
 
     def end_step(self) -> Optional[StepFinish]:
         """The finish outputs the step's select wrote, or None when the stock finish must run."""
         finish = self._finish
+        if (
+            self._produce
+            and self._embed_rows is not None
+            and self._embed_rows == self._hidden_rows
+        ):
+            self._fc_ready = self._embed_rows
         self._step = None
         self._finish = None
+        self._produce = False
         return finish
 
     def select(
@@ -118,6 +254,10 @@ class DepDraftXchg:
             if mrope is None or mrope.shape != (3, rows) or mrope.stride(1) != 1:
                 mrope = self.no_ints
             topk_p = torch.empty((rows, 1), dtype=torch.float32, device=logits.device)
+        memo = data = peer_data = fc_out = self.no_rows
+        if step is not None and self._produce:
+            memo, data, peer_data = self.memo, self.data, self.peer_data
+            fc_out = self.fc_in[:rows, : self.memo.shape[1]]
         before = None
         if self.proof is not None and step is not None:
             before = (positions.clone(), mrope.clone())
@@ -134,6 +274,10 @@ class DepDraftXchg:
             draft_tokens=draft_tokens,
             positions=positions,
             mrope_positions=mrope,
+            memo=memo,
+            data=data,
+            peer_data=peer_data,
+            fc_out=fc_out,
             vocab_start=self.rank * logits.shape[1],
             torch_nan=torch_nan,
             rank=self.rank,
@@ -142,6 +286,8 @@ class DepDraftXchg:
         )
         if step is not None:
             self._finish = (topk_p, tokens, mrope.numel() > 0)
+            if fc_out.numel() > 0:
+                self._embed_rows = rows
         if self.proof is not None:
             stock = stock_select(
                 logits=logits, num_local_rows=rows, torch_nan=torch_nan
@@ -162,15 +308,15 @@ class DepDraftXchgProof:
     logits, eager or in CUDA graphs; counters are mirrored to pinned memory as K75PProof does."""
 
     PERIOD_S = 30.0
-    KINDS = ("decode", "extend")
+    KINDS = ("decode", "extend", "fc")
 
     def __init__(self):
         # [kind][calls, rows, mismatched rows]
         self.counters = torch.zeros(
-            (2, 3), dtype=torch.int64, device=torch.cuda.current_device()
+            (len(self.KINDS), 3), dtype=torch.int64, device=torch.cuda.current_device()
         )
         self.host_counters = torch.zeros(
-            (2, 3), dtype=torch.int64, device="cpu", pin_memory=True
+            (len(self.KINDS), 3), dtype=torch.int64, device="cpu", pin_memory=True
         )
         logger.info("DEP-DX proof active")
         threading.Thread(target=self._report, daemon=True).start()
@@ -195,7 +341,16 @@ class DepDraftXchgProof:
             bad = bad | (draft_column != stock)
             if mrope.numel() > 0:
                 bad = bad | (mrope != mrope_before + 1).any(dim=0)
-        counters = self.counters[int(extend)]
+        self._count(kind=int(extend), bad=bad)
+
+    def check_fc(self, *, fc_input: torch.Tensor, stock: torch.Tensor) -> None:
+        """The memo-built fc input against the stock embedding + norms + cat of the same step."""
+        self._count(
+            kind=2, bad=(fc_input.view(torch.int16) != stock.view(torch.int16)).any(dim=1)
+        )
+
+    def _count(self, *, kind: int, bad: torch.Tensor) -> None:
+        counters = self.counters[kind]
         counters[0].add_(1)
         counters[1].add_(bad.numel())
         counters[2].add_(torch.count_nonzero(bad))
