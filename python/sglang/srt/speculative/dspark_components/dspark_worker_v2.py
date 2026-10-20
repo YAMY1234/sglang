@@ -1138,10 +1138,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             logits_output=logits_output,
             next_token_ids=accept.out_tokens.reshape(-1),
             accept_lens=accept.commit_lens,
-            block_accept_lens=(
-                accept.block_accept_lens
-                if accept.block_accept_lens is not None
-                else accept.commit_lens + accept.cap_trim_lens
+            block_accept_lens=self._block_accept_lens(
+                accept=accept, folded_accept=folded_accept, bs=bs
             ),
             cap_lens=(
                 layout.verify_lens.to(torch.int32) if layout is not None else None
@@ -1151,6 +1149,16 @@ class DSparkWorkerV2(BaseSpecWorker):
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=accept.new_seq_lens,
         )
+
+    def _block_accept_lens(self, *, accept, folded_accept: bool, bs: int):
+        in_graph = (
+            self._verify_epilogue.read_block_accept_lens(bs)
+            if folded_accept and self._verify_epilogue is not None
+            else None
+        )
+        if in_graph is not None:
+            return in_graph
+        return accept.commit_lens + accept.cap_trim_lens
 
     def _commit_target_mamba_states_after_verify(
         self,

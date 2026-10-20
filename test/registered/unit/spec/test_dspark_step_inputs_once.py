@@ -179,11 +179,11 @@ class TestInGraphBlockAcceptLens(unittest.TestCase):
             commit_lens=torch.zeros(bs, dtype=torch.int32),
             new_seq_lens=torch.zeros(bs, dtype=torch.int64),
             out_tokens=torch.zeros(bs, gamma + 1, dtype=torch.int64),
-            block_accept_lens=torch.full((bs,), -1, dtype=torch.int32),
         )
-        build_accept_outs(**kw, out=out)
+        block = torch.full((bs,), -1, dtype=torch.int32)
+        build_accept_outs(**kw, out=out, block_accept_lens_out=block)
         expected = eager.commit_lens + eager.cap_trim_lens
-        self.assertTrue(torch.equal(out.block_accept_lens, expected.to(torch.int32)))
+        self.assertTrue(torch.equal(block, expected.to(torch.int32)))
 
 
 if __name__ == "__main__":

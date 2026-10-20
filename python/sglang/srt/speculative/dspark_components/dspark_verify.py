@@ -528,9 +528,6 @@ class AcceptOuts(msgspec.Struct):
     commit_lens: torch.Tensor
     new_seq_lens: torch.Tensor
     out_tokens: torch.Tensor
-    # commit_lens + cap_trim_lens, written by the in-graph accept when it has a
-    # buffer for it (SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH); None otherwise.
-    block_accept_lens: Optional[torch.Tensor] = None
 
 
 class DsparkVerifyEpilogue:
@@ -716,12 +713,13 @@ class DsparkVerifyEpilogue:
             commit_lens=self.commit_lens_buf[:bs],
             new_seq_lens=self.new_seq_lens_buf[:bs],
             out_tokens=self.out_tokens_buf[:bs],
-            block_accept_lens=(
-                None
-                if self.block_accept_lens_buf is None
-                else self.block_accept_lens_buf[:bs]
-            ),
         )
+
+    def read_block_accept_lens(self, bs: int) -> Optional[torch.Tensor]:
+        """commit_lens + cap_trim_lens from the in-graph accept, or None."""
+        if self.block_accept_lens_buf is None:
+            return None
+        return self.block_accept_lens_buf[:bs]
 
     @property
     def folds_commit(self) -> bool:
@@ -839,6 +837,7 @@ class DsparkVerifyEpilogue:
             sync_site=SpecTpSyncSite.DSPARK_ACCEPT_GRAPH,
             simulated_correct_len=self.simulated_correct_len,
             out=self.read_accept(bs),
+            block_accept_lens_out=self.read_block_accept_lens(bs),
         )
         return accept.commit_lens
 
@@ -894,8 +893,10 @@ def build_accept_outs(
     target_logits: Optional[torch.Tensor] = None,
     simulate_bonus_sampling_info=None,
     out: Optional[AcceptOuts] = None,
+    block_accept_lens_out: Optional[torch.Tensor] = None,
 ) -> AcceptOuts:
-    """``out``: static buffers (the in-graph accept's) to copy the results into."""
+    """``out``: static buffers (the in-graph accept's) to copy the results into;
+    ``block_accept_lens_out`` (with ``out``) gets commit_lens + cap_trim_lens."""
     bs = correct_len.shape[0]
     if simulated_correct_len is not None:
         # The accept runs as served; only its length is replaced.
@@ -941,9 +942,9 @@ def build_accept_outs(
         out.commit_lens.copy_(accept.commit_lens)
         out.new_seq_lens.copy_(accept.new_seq_lens)
         out.out_tokens.copy_(accept.out_tokens)
-        if out.block_accept_lens is not None:
+        if block_accept_lens_out is not None:
             torch.add(
-                accept.commit_lens, accept.cap_trim_lens, out=out.block_accept_lens
+                accept.commit_lens, accept.cap_trim_lens, out=block_accept_lens_out
             )
         return out
     return accept
