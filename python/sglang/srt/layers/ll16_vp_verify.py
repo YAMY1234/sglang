@@ -162,7 +162,7 @@ class VpVerify:
         # Built when the process or any same-server A/B variant sets the proof switch; checks are
         # captured only where the switch is on.
         self.proof = (
-            VpProof()
+            VpProof(rank=rank, seed=seed)
             if ab_variants.env_any("SGLANG_Q35MF_LL16_VPSAMP_PROOF", "1")
             else None
         )
@@ -405,16 +405,40 @@ class VpProof:
         "final_zero_mass",
     )
     PIT_BINS = 20
+    EVENTS = 32
+    EVENT_FIELDS = (
+        "call",
+        "row",
+        "k_vp",
+        "k_ref",
+        "draft",
+        "coin",
+        "p64",
+        "logit",
+        "row_max",
+    )
 
-    def __init__(self):
+    def __init__(self, *, rank: int, seed: int):
+        # The stock coins and the PIT's numbers come from the default CUDA generator, seeded alike and stepped in
+        # lockstep on every rank; a per-rank seed makes the ranks' checks independent samples.
+        torch.cuda.manual_seed((seed + 1_000_003 * (rank + 1)) & ((1 << 63) - 1))
+        dev = torch.cuda.current_device()
         n = len(self.FIELDS) + 2 * self.PIT_BINS
-        self.counters = torch.zeros(
-            (n,), dtype=torch.int64, device=torch.cuda.current_device()
-        )
+        self.counters = torch.zeros((n,), dtype=torch.int64, device=dev)
         self.host_counters = torch.zeros(
             (n,), dtype=torch.int64, device="cpu", pin_memory=True
         )
-        logger.info("LL16 VP proof active")
+        # One row per accept-count mismatch; the extra last row takes the rest.
+        shape = (self.EVENTS + 1, len(self.EVENT_FIELDS))
+        self.events = torch.full(shape, -1.0, dtype=torch.float64, device=dev)
+        self.host_events = torch.full(
+            shape, -1.0, dtype=torch.float64, device="cpu", pin_memory=True
+        )
+        self._counted = 0
+        logger.info(
+            "LL16 VP proof active (default CUDA generator seed %d)",
+            torch.cuda.initial_seed(),
+        )
         threading.Thread(target=self._report, daemon=True).start()
 
     def check(
@@ -455,7 +479,16 @@ class VpProof:
                 coins=coins,
             )
             self.counters[3].add_(bs)
-            self.counters[4].add_(torch.count_nonzero(ref_num != num_correct_drafts))
+            mism = ref_num != num_correct_drafts
+            self._dump(
+                full=full,
+                candidates=candidates,
+                coins=coins,
+                num_vp=num_correct_drafts,
+                num_ref=ref_num,
+                mism=mism,
+            )
+            self.counters[4].add_(torch.count_nonzero(mism))
             self._pit(
                 full=full,
                 candidates=candidates,
@@ -464,6 +497,33 @@ class VpProof:
                 num_correct_drafts=num_correct_drafts,
             )
         self.host_counters.copy_(self.counters, non_blocking=True)
+        self.host_events.copy_(self.events, non_blocking=True)
+
+    def _dump(self, *, full, candidates, coins, num_vp, num_ref, mism) -> None:
+        bs, d = candidates.shape
+        # The first draft the two samplers decided differently, with the coin both used for it.
+        j = (torch.minimum(num_vp, num_ref).long() + 1).clamp(max=d - 1)
+        x = full[torch.arange(bs, device=full.device) * d + j - 1].double()
+        logit = x.gather(1, candidates.gather(1, j.view(bs, 1))).view(bs)
+        p64 = torch.exp(logit - torch.logsumexp(x, dim=-1))
+        coin = coins[0].gather(1, (j - 1).view(bs, 1)).view(bs).double()
+        vals = torch.stack(
+            [
+                self.counters[0].double().expand(bs),
+                torch.arange(bs, device=full.device, dtype=torch.float64),
+                num_vp.double(),
+                num_ref.double(),
+                j.double(),
+                coin,
+                p64,
+                logit,
+                x.amax(dim=-1),
+            ],
+            dim=1,
+        )
+        pos = self.counters[4] + torch.cumsum(mism.long(), 0) - 1
+        slot = torch.where(mism & (pos < self.EVENTS), pos, self.EVENTS)
+        self.events.index_copy_(0, slot, vals)
 
     def _pit(
         self, *, full, candidates, retrieve_index, predict, num_correct_drafts
@@ -497,6 +557,7 @@ class VpProof:
         )
 
     def _report(self) -> None:
+        logged = 0
         while True:
             time.sleep(self.PERIOD_S)
             vals = self.host_counters.tolist()
@@ -507,3 +568,12 @@ class VpProof:
                 ",".join(str(v) for v in vals[n : n + b]),
                 ",".join(str(v) for v in vals[n + b :]),
             )
+            # Event rows are logged one period after they were counted, when their copies have landed.
+            ready = min(self._counted, self.EVENTS)
+            for row in self.host_events[logged:ready].tolist():
+                logger.info(
+                    "LL16 VP accept mismatch: %s",
+                    " ".join(f"{k}={v:.17g}" for k, v in zip(self.EVENT_FIELDS, row)),
+                )
+            logged = max(logged, ready)
+            self._counted = vals[4]
