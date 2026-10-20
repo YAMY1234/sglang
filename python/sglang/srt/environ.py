@@ -1255,6 +1255,10 @@ class Envs:
     # "tile,g1_n,g1_cm,g1_cn,g2_n,g2_cm,g2_cn" (e.g. "128,128,1,1,256,1,2"); empty = autotune.
     SGLANG_Q35MF_EXPERT_TACTIC = EnvStr("")
     SGLANG_Q35MF_EXPERT_TACTIC_MAX_TOKENS = EnvInt(16)
+    # Same format for the all-to-all (expert parallel) path, applied to receive buffers of at most
+    # SGLANG_Q35MF_DEP_EXPERT_TACTIC_MAX_ROWS rows; read per call. Empty = autotune.
+    SGLANG_Q35MF_DEP_EXPERT_TACTIC = EnvStr("")
+    SGLANG_Q35MF_DEP_EXPERT_TACTIC_MAX_ROWS = EnvInt(512)
     # Measurement switch: with the hook installed, FlashInfer autotune lookups outside tuning
     # serve the JSON table named by SGLANG_Q35MF_TUNE_TABLE (read per call) ahead of the tuner's caches.
     SGLANG_Q35MF_TUNE_TABLE_HOOK = EnvBool(False)

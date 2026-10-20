@@ -59,6 +59,32 @@ def _small_m_tactic(num_tokens: int) -> Optional[tuple]:
     return tactic
 
 
+_dep_tactic_logged: set = set()
+
+
+def _dep_expert_tactic(num_rows: int) -> Optional[tuple]:
+    """Tactic from SGLANG_Q35MF_DEP_EXPERT_TACTIC for receive buffers <= the max rows; None keeps autotuning.
+
+    Read on every call so graphs captured under different environments can carry different tactics.
+    """
+    spec = envs.SGLANG_Q35MF_DEP_EXPERT_TACTIC.get().strip()
+    if not spec or num_rows > envs.SGLANG_Q35MF_DEP_EXPERT_TACTIC_MAX_ROWS.get():
+        return None
+    tile, g1n, g1cm, g1cn, g2n, g2cm, g2cn = (int(v) for v in spec.split(","))
+    tactic = (
+        tile,
+        ((tile, g1n), (g1cm, g1cn), False),
+        ((tile, g2n), (g2cm, g2cn), False),
+    )
+    if spec not in _dep_tactic_logged:
+        _dep_tactic_logged.add(spec)
+        log_info_on_rank0(
+            logger,
+            f"CuteDSL MoE (all-to-all path): fixed tactic {tactic} up to {envs.SGLANG_Q35MF_DEP_EXPERT_TACTIC_MAX_ROWS.get()} rows",
+        )
+    return tactic
+
+
 # ---------------------------------------------------------------------------
 # Weight / scale preparation utilities (called from modelopt_quant.py during
 # process_weights_after_loading and lazy wrapper init)
@@ -622,6 +648,7 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
         w2_weight=quant_info.w2_weight,
         w2_weight_sf=quant_info.w2_weight_sf,
         w2_alpha=quant_info.w2_alpha,
+        tactic=_dep_expert_tactic(hidden_states.shape[0]),
         per_token_scale=per_token_scale,
     )
 
