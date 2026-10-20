@@ -397,25 +397,17 @@ def _db1_value(key):
 
 
 @triton.jit
-def _db1_chunk_max_kernel(logits_ptr, stride_row, local_vocab, cmax_ptr, nchunk, CH: tl.constexpr):
+def _db1_chunk_max_kernel(
+    logits_ptr, stride_row, local_vocab, cmax_ptr, nchunk, cnt_ptr, CH: tl.constexpr
+):
     r = tl.program_id(0)
     c = tl.program_id(1)
     offs = c * CH + tl.arange(0, CH)
     m = offs < local_vocab
     x = tl.load(logits_ptr + r * stride_row + offs, mask=m, other=0.0).to(tl.float32)
     tl.store(cmax_ptr + r * nchunk + c, tl.max(tl.where(m, _db1_key(x), -1), axis=0))
-
-
-@triton.jit
-def _db1_threshold_kernel(cmax_ptr, nchunk, thr_ptr, cnt_ptr, K: tl.constexpr, BN: tl.constexpr):
-    # The k-th largest chunk maximum: at least k elements of the row reach it, so the row's top-k (with
-    # every element equal to the k-th value) lies at or above it. Fewer than k chunks: no threshold.
-    r = tl.program_id(0)
-    i = tl.arange(0, BN)
-    v = tl.load(cmax_ptr + r * nchunk + i, mask=i < nchunk, other=-1)
-    srt = tl.sort(v, 0, descending=True)
-    tl.store(thr_ptr + r, tl.max(tl.where(i == K - 1, srt, -1), axis=0))
-    tl.store(cnt_ptr + r, 0)
+    if c == 0:
+        tl.store(cnt_ptr + r, 0)
 
 
 @triton.jit
@@ -424,19 +416,27 @@ def _db1_compact_kernel(
     stride_row,
     local_vocab,
     vocab_start,
-    thr_ptr,
+    cmax_ptr,
+    nchunk,
     cnt_ptr,
     cand_ptr,
+    K: tl.constexpr,
     CAP: tl.constexpr,
     CH: tl.constexpr,
+    BN: tl.constexpr,
 ):
+    # Threshold = the k-th largest chunk maximum: at least k elements of the row reach it, so the row's
+    # top-k (with every element equal to the k-th value) lies at or above it. Fewer than k chunks: none.
     r = tl.program_id(0)
     c = tl.program_id(1)
+    i = tl.arange(0, BN)
+    v = tl.load(cmax_ptr + r * nchunk + i, mask=i < nchunk, other=-1)
+    thr = tl.max(tl.where(i == K - 1, tl.sort(v, 0, descending=True), -1), axis=0)
     offs = c * CH + tl.arange(0, CH)
     m = offs < local_vocab
     x = tl.load(logits_ptr + r * stride_row + offs, mask=m, other=0.0).to(tl.float32)
     key = _db1_key(x)
-    sel = m & (key >= tl.load(thr_ptr + r))
+    sel = m & (key >= thr)
     n = tl.sum(sel.to(tl.int32), axis=0)
     if n > 0:
         base = tl.atomic_add(cnt_ptr + r, n)
@@ -447,67 +447,89 @@ def _db1_compact_kernel(
 
 @triton.jit
 def _db1_select_kernel(
-    cand_ptr, cnt_ptr, ovf_ptr, buf_ptr, rank, rows, K: tl.constexpr, CAP: tl.constexpr
-):
-    # Rows whose candidates fit sort them; the others are flagged for the exact chunked path.
-    r = tl.program_id(0)
-    n = tl.load(cnt_ptr + r)
-    tl.store(ovf_ptr + r, (n > CAP).to(tl.int32))
-    if n <= CAP:
-        i = tl.arange(0, CAP)
-        x = tl.load(cand_ptr + r * CAP + i, mask=i < n, other=_I64_MIN)
-        srt = tl.sort(x, 0, descending=True)
-        key = (srt >> 32) + 2147483648
-        gid = 0x7FFFFFFF - (srt & 0xFFFFFFFF)
-        m = i < K
-        base = buf_ptr + (rank * rows + r) * K * 2
-        tl.store(base + 2 * i, _db1_value(key), mask=m)
-        tl.store(base + 2 * i + 1, gid.to(tl.float32), mask=m)
-
-
-@triton.jit
-def _db1_chunk_topk_kernel(
     logits_ptr,
     stride_row,
     local_vocab,
     vocab_start,
-    scratch_ptr,
     nchunk,
-    ovf_ptr,
+    cand_ptr,
+    cnt_ptr,
+    buf_ptr,
+    rank,
+    rows,
+    WORLD: tl.constexpr,
     K: tl.constexpr,
+    KP2: tl.constexpr,
+    CAP: tl.constexpr,
     CH: tl.constexpr,
 ):
+    # This rank's top-k of the row into its slot of buf and zeros into the other ranks' slots, so the
+    # all-reduce gathers. Rows whose candidates overflow CAP take an exact 8-bit radix select of the k-th
+    # key, then the keys above it and the lowest ids equal to it.
     r = tl.program_id(0)
-    c = tl.program_id(1)
-    if tl.load(ovf_ptr + r) == 0:
-        return
-    offs = c * CH + tl.arange(0, CH)
-    m = offs < local_vocab
-    x = tl.load(logits_ptr + r * stride_row + offs, mask=m, other=0.0).to(tl.float32)
-    gid = (offs + vocab_start).to(tl.int64)
-    packed = ((_db1_key(x) - 2147483648) << 32) | (0x7FFFFFFF - gid)
-    packed = tl.where(m, packed, _I64_MIN)
-    srt = tl.sort(packed, 0, descending=True)
-    k = tl.arange(0, CH)
-    tl.store(scratch_ptr + (r * nchunk + c) * K + k, srt, mask=k < K)
-
-
-@triton.jit
-def _db1_row_merge_kernel(
-    scratch_ptr, nchunk, ovf_ptr, buf_ptr, rank, rows, K: tl.constexpr, BM: tl.constexpr
-):
-    r = tl.program_id(0)
-    if tl.load(ovf_ptr + r) == 0:
-        return
-    i = tl.arange(0, BM)
-    x = tl.load(scratch_ptr + r * nchunk * K + i, mask=i < nchunk * K, other=_I64_MIN)
-    srt = tl.sort(x, 0, descending=True)
-    key = (srt >> 32) + 2147483648
-    gid = 0x7FFFFFFF - (srt & 0xFFFFFFFF)
-    m = i < K
+    jj = tl.arange(0, 2 * KP2)
+    for w in tl.static_range(WORLD):
+        tl.store(
+            buf_ptr + (w * rows + r) * K * 2 + jj, 0.0, mask=(jj < 2 * K) & (w != rank)
+        )
     base = buf_ptr + (rank * rows + r) * K * 2
-    tl.store(base + 2 * i, _db1_value(key), mask=m)
-    tl.store(base + 2 * i + 1, gid.to(tl.float32), mask=m)
+    crow = cand_ptr + r * CAP
+    n = tl.load(cnt_ptr + r)
+    if n <= CAP:
+        i = tl.arange(0, CAP)
+        x = tl.load(crow + i, mask=i < n, other=_I64_MIN)
+        srt = tl.sort(x, 0, descending=True)
+        key = (srt >> 32) + 2147483648
+        gid = 0x7FFFFFFF - (srt & 0xFFFFFFFF)
+        tl.store(base + 2 * i, _db1_value(key), mask=i < K)
+        tl.store(base + 2 * i + 1, gid.to(tl.float32), mask=i < K)
+    else:
+        row = logits_ptr + r * stride_row
+        o = tl.arange(0, CH)
+        b = tl.arange(0, 256)
+        prefix = (r * 0).to(tl.int64)
+        need = r * 0 + K
+        for s in tl.static_range(4):
+            shift = 24 - 8 * s
+            hist = tl.zeros([256], dtype=tl.int32)
+            miss = r * 0
+            for c in range(0, nchunk):
+                offs = c * CH + o
+                m = offs < local_vocab
+                key = _db1_key(tl.load(row + offs, mask=m, other=0.0).to(tl.float32))
+                match = m & ((key >> (shift + 8)) == (prefix >> (shift + 8)))
+                dig = ((key >> shift) & 255).to(tl.int32)
+                hist += tl.histogram(tl.where(match, dig, 0), 256)
+                miss += tl.sum((match == 0).to(tl.int32), axis=0)
+            hist = tl.where(b == 0, hist - miss, hist)
+            cum_ge = tl.sum(hist, axis=0) - (tl.cumsum(hist, axis=0) - hist)
+            d = tl.max(tl.where(cum_ge >= need, b, -1), axis=0)
+            need = need - tl.sum(tl.where(b > d, hist, 0), axis=0)
+            prefix = prefix | (d.to(tl.int64) << shift)
+        ngt = K - need
+        cg = r * 0
+        ce = r * 0
+        for c in range(0, nchunk):
+            offs = c * CH + o
+            m = offs < local_vocab
+            key = _db1_key(tl.load(row + offs, mask=m, other=0.0).to(tl.float32))
+            packed = ((key - 2147483648) << 32) | (0x7FFFFFFF - (offs + vocab_start).to(tl.int64))
+            gt = m & (key > prefix)
+            eq = m & (key == prefix)
+            pg = cg + tl.cumsum(gt.to(tl.int32), axis=0) - 1
+            pe = ce + tl.cumsum(eq.to(tl.int32), axis=0) - 1
+            tl.store(crow + pg, packed, mask=gt)
+            tl.store(crow + ngt + pe, packed, mask=eq & (pe < need))
+            cg += tl.sum(gt.to(tl.int32), axis=0)
+            ce += tl.sum(eq.to(tl.int32), axis=0)
+        tl.debug_barrier()
+        i = tl.arange(0, KP2)
+        x = tl.load(crow + i, mask=i < K, other=_I64_MIN)
+        srt = tl.sort(x, 0, descending=True)
+        key = (srt >> 32) + 2147483648
+        gid = 0x7FFFFFFF - (srt & 0xFFFFFFFF)
+        tl.store(base + 2 * i, _db1_value(key), mask=i < K)
+        tl.store(base + 2 * i + 1, gid.to(tl.float32), mask=i < K)
 
 
 @triton.jit
@@ -877,55 +899,44 @@ class ShardedVerifySampler:
         nchunk = triton.cdiv(local_vocab, _DB1_CHUNK)
         vocab_start = self.rank * local_vocab
         cmax = torch.empty((rows, nchunk), dtype=torch.int64, device=dev)
-        thr = torch.empty((rows,), dtype=torch.int64, device=dev)
         cnt = torch.empty((rows,), dtype=torch.int32, device=dev)
-        ovf = torch.empty((rows,), dtype=torch.int32, device=dev)
         cand = torch.empty((rows, _DB1_CAP), dtype=torch.int64, device=dev)
-        scratch = torch.empty((rows, nchunk, k), dtype=torch.int64, device=dev)
-        buf = torch.zeros((self.world * rows * k * 2,), dtype=torch.float32, device=dev)
+        buf = torch.empty((self.world * rows * k * 2,), dtype=torch.float32, device=dev)
         _db1_chunk_max_kernel[(rows, nchunk)](
-            logits, logits.stride(0), local_vocab, cmax, nchunk, CH=_DB1_CHUNK, num_warps=4
-        )
-        _db1_threshold_kernel[(rows,)](
-            cmax, nchunk, thr, cnt, K=k, BN=_next_pow2(nchunk), num_warps=4
+            logits, logits.stride(0), local_vocab, cmax, nchunk, cnt, CH=_DB1_CHUNK, num_warps=4
         )
         _db1_compact_kernel[(rows, nchunk)](
             logits,
             logits.stride(0),
             local_vocab,
             vocab_start,
-            thr,
+            cmax,
+            nchunk,
             cnt,
             cand,
+            K=k,
             CAP=_DB1_CAP,
             CH=_DB1_CHUNK,
+            BN=_next_pow2(nchunk),
             num_warps=4,
         )
         _db1_select_kernel[(rows,)](
-            cand, cnt, ovf, buf, self.rank, rows, K=k, CAP=_DB1_CAP, num_warps=4
-        )
-        _db1_chunk_topk_kernel[(rows, nchunk)](
             logits,
             logits.stride(0),
             local_vocab,
             vocab_start,
-            scratch,
             nchunk,
-            ovf,
-            K=k,
-            CH=_DB1_CHUNK,
-            num_warps=4,
-        )
-        _db1_row_merge_kernel[(rows,)](
-            scratch,
-            nchunk,
-            ovf,
+            cand,
+            cnt,
             buf,
             self.rank,
             rows,
+            WORLD=self.world,
             K=k,
-            BM=_next_pow2(nchunk * k),
-            num_warps=8,
+            KP2=_next_pow2(k),
+            CAP=_DB1_CAP,
+            CH=_DB1_CHUNK,
+            num_warps=4,
         )
         if self.world > 1:
             buf = tensor_model_parallel_all_reduce(buf)
