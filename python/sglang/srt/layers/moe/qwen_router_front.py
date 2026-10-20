@@ -1036,12 +1036,19 @@ _DEP_CHECK_FIELDS = ("rows", "logits", "logit_elems", "ids", "id_sets", "weights
 _dep_check_counts: Optional[torch.Tensor] = None
 
 
-def _dep_check_report_loop(period_s: float = 20.0) -> None:
+def start_check_reporter(tag: str, counts: torch.Tensor, fields: Tuple[str, ...]) -> None:
+    """Debug: log the non-empty rows of a device counter table (row index = token count) every 20 s."""
+    import threading
+
+    threading.Thread(target=_check_report_loop, args=(tag, counts, fields), daemon=True).start()
+
+
+def _check_report_loop(tag: str, counts: torch.Tensor, fields: Tuple[str, ...]) -> None:
     import time
 
     last = None
     while True:
-        time.sleep(period_s)
+        time.sleep(20.0)
         # A device copy from this thread during graph capture would invalidate the capture, so wait for the
         # server's READY status (serve.sh mounts the run's log dir at /logs).
         try:
@@ -1050,14 +1057,13 @@ def _dep_check_report_loop(period_s: float = 20.0) -> None:
                     continue
         except OSError:
             continue
-        counts = _dep_check_counts.cpu().tolist()
         lines = [
-            f"m={m} " + " ".join(f"{k}={v}" for k, v in zip(_DEP_CHECK_FIELDS, row))
-            for m, row in enumerate(counts)
+            f"m={m} " + " ".join(f"{k}={v}" for k, v in zip(fields, row))
+            for m, row in enumerate(counts.cpu().tolist())
             if row[0]
         ]
         if lines != last:
-            logger.info("SGLANG_Q35MF_DEP_ROUTE_FRONT_CHECK %s", " | ".join(lines))
+            logger.info("%s %s", tag, " | ".join(lines))
             last = lines
 
 
@@ -1071,8 +1077,6 @@ def _dep_check(
     """Count the rows where the fused outputs differ from the stock gate + top-k + dispatch quant on the same input.
     Device-side counters only, so it runs inside CUDA graph capture and replay."""
     global _dep_check_counts
-    import threading
-
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 
@@ -1083,7 +1087,9 @@ def _dep_check(
             dtype=torch.int64,
             device=hidden_states.device,
         )
-        threading.Thread(target=_dep_check_report_loop, daemon=True).start()
+        start_check_reporter(
+            "SGLANG_Q35MF_DEP_ROUTE_FRONT_CHECK", _dep_check_counts, _DEP_CHECK_FIELDS
+        )
     ref_logits, _ = block.gate(hidden_states)
     ref = block.topk(hidden_states, ref_logits)
     if TopKOutputChecker.format_is_bypassed(ref):
