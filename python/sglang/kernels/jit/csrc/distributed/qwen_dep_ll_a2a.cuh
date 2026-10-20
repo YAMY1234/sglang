@@ -28,6 +28,9 @@ inline constexpr uint32_t kDispatchStages = 2;
 inline constexpr uint32_t kCombineStages = 3;
 // Local experts the in-dispatch routing tables can hold: one thread of the last CTA per expert.
 inline constexpr uint32_t kMaxLocalExperts = 256;
+// Local entries one CTA can receive: 5 id lines (10 ids) per row, rows spread over the grid; kMaxTokens x kMaxRanks
+// rows over 128 CTAs is at most 160 ids per CTA.
+inline constexpr uint32_t kCtaListCap = 256;
 // A peer may legitimately stall for long (e.g. a JIT compile on one rank); only a wait this long is fatal.
 inline constexpr uint64_t kTimeoutNs = 300ull * 1000 * 1000 * 1000;
 
@@ -166,17 +169,42 @@ SGL_DEVICE bool has_sentinel(const uint4& v) {
           __vcmpeq2(v.w, 0xFFFFFFFFu)) != 0u;
 }
 
-/// \brief One received id: a local entry takes the next rank of its expert and goes on the list; any other entry
-/// (another rank's expert or the invalid id) gets permuted index -1.
-SGL_DEVICE void table_entry(const TableParams& tab, uint32_t idx, int32_t id) {
+/// \brief Per-CTA staging of the received ids: local entries are ranked per expert in shared memory and listed;
+/// any other entry (another rank's expert or the invalid id) gets permuted index -1 right away.
+static_assert(kThreads >= kMaxLocalExperts, "one thread per local expert in the table staging and build");
+
+struct CtaTables {
+  int32_t cnt[kMaxLocalExperts];
+  int32_t base[kMaxLocalExperts];
+  int32_t idx[kCtaListCap];
+  int32_t er[kCtaListCap];
+  int32_t n;
+  int32_t list_base;
+};
+
+SGL_DEVICE void table_entry(const TableParams& tab, CtaTables& ct, uint32_t idx, int32_t id) {
   const int32_t e = id - tab.local_offset;
   if (e >= 0 && e < static_cast<int32_t>(tab.num_local)) {
-    const int32_t r = atomicAdd(tab.count + e, 1);
-    const int32_t slot = atomicAdd(tab.list_n, 1);
-    tab.list[2 * slot] = static_cast<int32_t>(idx);
-    tab.list[2 * slot + 1] = (e << 16) | r;
+    const int32_t r = atomicAdd(&ct.cnt[e], 1);
+    const int32_t slot = atomicAdd(&ct.n, 1);
+    ct.idx[slot] = static_cast<int32_t>(idx);
+    ct.er[slot] = (e << 16) | r;
   } else {
     tab.expanded_idx_to_permuted_idx[idx] = -1;
+  }
+}
+
+/// \brief After the CTA's receive loop: one global add per touched expert turns the CTA ranks into expert ranks, one
+/// reservation per CTA places its entries on the global list.
+SGL_DEVICE void flush_cta_tables(const TableParams& tab, CtaTables& ct) {
+  const uint32_t tid = threadIdx.x;
+  if (tid < tab.num_local && ct.cnt[tid] > 0) ct.base[tid] = atomicAdd(tab.count + tid, ct.cnt[tid]);
+  if (tid == 0 && ct.n > 0) ct.list_base = atomicAdd(tab.list_n, ct.n);
+  __syncthreads();
+  for (int32_t j = static_cast<int32_t>(tid); j < ct.n; j += kThreads) {
+    const int32_t e = ct.er[j] >> 16;
+    tab.list[2 * (ct.list_base + j)] = ct.idx[j];
+    tab.list[2 * (ct.list_base + j) + 1] = (e << 16) | (ct.base[e] + (ct.er[j] & 0xFFFF));
   }
 }
 
@@ -224,7 +252,13 @@ __global__ __launch_bounds__(kThreads) void dispatch_kernel(const __grid_constan
   using G = Geometry<kRanks, kTopK, kHidden, kX, kS>;
   __shared__ uint32_t s_mask[kMaxTokens];
   __shared__ uint32_t s_tokens[kRanks];
+  __shared__ CtaTables ct;
   const uint32_t b = blockIdx.x, grid = gridDim.x, tid = threadIdx.x;
+  const bool tables = p.tab.count != nullptr;
+  if (tables) {
+    ct.cnt[tid] = 0;
+    if (tid == 0) ct.n = 0;
+  }
   // The counter was written by an earlier call of this kernel; only the wait orders us after it.
   device::PDLWaitPrimary<kUsePDL>();
   device::PDLTriggerSecondary<kUsePDL>();
@@ -281,7 +315,7 @@ __global__ __launch_bounds__(kThreads) void dispatch_kernel(const __grid_constan
     const uint32_t s = task / (p.tmax * kTopK), t = task / kTopK % p.tmax;
     if (t >= s_tokens[s]) {
       p.out_ids[task] = p.invalid_id;
-      if (p.tab.count != nullptr) p.tab.expanded_idx_to_permuted_idx[task] = -1;
+      if (tables) p.tab.expanded_idx_to_permuted_idx[task] = -1;
     }
   }
   uint32_t max_tokens = 0;
@@ -311,9 +345,9 @@ __global__ __launch_bounds__(kThreads) void dispatch_kernel(const __grid_constan
     const uint64_t row = static_cast<uint64_t>(s) * p.tmax + t;
     if (i < G::kIdLines) {
       *reinterpret_cast<uint2*>(p.out_ids + row * kTopK + 2 * i) = d;
-      if (p.tab.count != nullptr) {
-        table_entry(p.tab, static_cast<uint32_t>(row * kTopK + 2 * i), static_cast<int32_t>(d.x));
-        table_entry(p.tab, static_cast<uint32_t>(row * kTopK + 2 * i + 1), static_cast<int32_t>(d.y));
+      if (tables) {
+        table_entry(p.tab, ct, static_cast<uint32_t>(row * kTopK + 2 * i), static_cast<int32_t>(d.x));
+        table_entry(p.tab, ct, static_cast<uint32_t>(row * kTopK + 2 * i + 1), static_cast<int32_t>(d.y));
       }
     } else if (i < G::kIdLines + G::kWtLines) {
       *reinterpret_cast<uint2*>(p.out_wts + row * kTopK + 2 * (i - G::kIdLines)) = d;
@@ -325,8 +359,9 @@ __global__ __launch_bounds__(kThreads) void dispatch_kernel(const __grid_constan
   }
   __syncthreads();
   if (tid == 0) p.ctr[b] = static_cast<int32_t>(epoch);
-  if (p.tab.count != nullptr) {
+  if (tables) {
     __shared__ uint32_t s_last;
+    flush_cta_tables(p.tab, ct);
     __threadfence();
     __syncthreads();
     if (tid == 0) s_last = atomicAdd(p.tab.done, 1) == static_cast<int32_t>(grid - 1);
