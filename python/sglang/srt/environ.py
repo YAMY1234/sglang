@@ -586,6 +586,11 @@ class Envs:
     # Bound on captured post-verify graph sets (key x verify logits buffer); 0 keeps
     # max(16, 8 x SGLANG_Q35MF_EDGE_POST_VERIFY_MAX_BS).
     SGLANG_Q35MF_K4_PVG_MAX_STATES = EnvInt(0)
+    # With SGLANG_Q35MF_PDDEC_SHARDED_VERIFY_SAMPLING: a sampled verify whose compact top-k support
+    # (SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING, max top_k <= 32) is built on the vocab shards: shard
+    # top-k and argmax, one small all-reduce of the candidates, and a merge that keeps the larger value
+    # first and the lower id among equals, instead of gathering the logits.
+    SGLANG_Q35MF_LL16_DB1 = EnvBool(False)
     # Row-split MTP fc for draft-width batches: each rank multiplies its input-column
     # slice (one normalized half); fp32 partials are gathered and summed in rank order.
     SGLANG_Q35MF_DRAFT_FC_SPLIT = EnvBool(False)
