@@ -41,6 +41,8 @@ mask, so this kernel is valid only for linear draft chains
 
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -753,6 +755,10 @@ def gdn_replayssm_circular_commit_kernel(
         tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
 
 
+# HR-2: split the compact commit into a track-only pass and a track-free fold pass when rows track.
+_HR2_SPLIT_TRACK = os.environ.get("SGLANG_Q35MF_LL16_HR2", "0") == "1"
+
+
 @triton.jit
 def gdn_replayssm_compact_commit_kernel(
     h0,
@@ -795,6 +801,7 @@ def gdn_replayssm_compact_commit_kernel(
     NULL_BLOCK_ID: tl.constexpr,
     HAS_TRACK: tl.constexpr,
     HAS_RESIDUAL: tl.constexpr,
+    DO_FOLD: tl.constexpr = True,
 ):
     """Materialize the checkpoint directly from compact ReplaySSM D/K/G."""
     i_v = tl.program_id(0)
@@ -809,7 +816,8 @@ def gdn_replayssm_compact_commit_kernel(
     if state_idx <= NULL_BLOCK_ID:
         return
     n_history = tl.load(write_pos + replay_idx).to(tl.int32)
-    fold_active = tl.load(is_flush_flags + replay_idx) != 0
+    # DO_FOLD False: the track-only pass of a split commit (the fold pass runs after it).
+    fold_active = (tl.load(is_flush_flags + replay_idx) != 0) & DO_FOLD
     if HAS_TRACK:
         track_idx = tl.load(mamba_track_indices + i_n * stride_track).to(tl.int64)
         track_step = tl.load(mamba_steps_to_track + i_n * stride_steps).to(tl.int32)
@@ -1520,6 +1528,7 @@ def commit_gdn_replayssm_circular(
     mamba_track_indices: torch.Tensor | None = None,
     mamba_steps_to_track: torch.Tensor | None = None,
     null_block_id: int = -1,
+    split_track: bool | None = None,
 ) -> None:
     """Materialize circular history only for capacity and track rows.
 
@@ -1527,6 +1536,10 @@ def commit_gdn_replayssm_circular(
     rows update their active checkpoint and reset the ring; track rows snapshot
     the exact state at the requested accepted step without disturbing the active
     checkpoint.
+
+    split_track (default SGLANG_Q35MF_LL16_HR2): with track rows, a track-only pass (it reads the
+    pre-fold checkpoint) and then a fold pass compiled without the track branch, instead of one
+    track-compiled launch for every row; the bytes written are the same.
     """
     num_layers, _, HV, V, K = checkpoint_state.shape
     H = k_cache.shape[2]
@@ -1548,50 +1561,55 @@ def commit_gdn_replayssm_circular(
         stride_track = 0
         stride_steps = 0
     grid = (triton.cdiv(V, BV), B, HV * num_layers)
-    gdn_replayssm_compact_commit_kernel[grid](
-        checkpoint_state,
-        d_cache,
-        k_cache,
-        g_cache,
-        d_residual_buf,
-        k_residual_buf,
-        state_batch_indices,
-        replay_indices,
-        write_pos,
-        cache_base,
-        is_flush,
-        accept_lens,
-        track_indices,
-        track_steps,
-        checkpoint_state.stride(1),
-        d_cache.stride(1),
-        k_cache.stride(1),
-        g_cache.stride(1),
-        d_residual_buf.stride(1),
-        k_residual_buf.stride(1),
-        checkpoint_state.stride(0),
-        d_cache.stride(0),
-        k_cache.stride(0),
-        g_cache.stride(0),
-        d_residual_buf.stride(0),
-        k_residual_buf.stride(0),
-        state_batch_indices.stride(0),
-        replay_indices.stride(0),
-        accept_lens.stride(0),
-        stride_track,
-        stride_steps,
-        H=H,
-        HV=HV,
-        K=K,
-        V=V,
-        BV=BV,
-        MAX_CACHE_LEN=max_cache_len,
-        NULL_BLOCK_ID=null_block_id,
-        HAS_TRACK=has_track,
-        HAS_RESIDUAL=has_residual,
-        num_warps=4,
-        num_stages=2,
-    )
+    if split_track is None:
+        split_track = _HR2_SPLIT_TRACK
+    passes = [(True, False), (False, True)] if (has_track and split_track) else [(has_track, True)]
+    for pass_track, pass_fold in passes:
+        gdn_replayssm_compact_commit_kernel[grid](
+            checkpoint_state,
+            d_cache,
+            k_cache,
+            g_cache,
+            d_residual_buf,
+            k_residual_buf,
+            state_batch_indices,
+            replay_indices,
+            write_pos,
+            cache_base,
+            is_flush,
+            accept_lens,
+            track_indices,
+            track_steps,
+            checkpoint_state.stride(1),
+            d_cache.stride(1),
+            k_cache.stride(1),
+            g_cache.stride(1),
+            d_residual_buf.stride(1),
+            k_residual_buf.stride(1),
+            checkpoint_state.stride(0),
+            d_cache.stride(0),
+            k_cache.stride(0),
+            g_cache.stride(0),
+            d_residual_buf.stride(0),
+            k_residual_buf.stride(0),
+            state_batch_indices.stride(0),
+            replay_indices.stride(0),
+            accept_lens.stride(0),
+            stride_track,
+            stride_steps,
+            H=H,
+            HV=HV,
+            K=K,
+            V=V,
+            BV=BV,
+            MAX_CACHE_LEN=max_cache_len,
+            NULL_BLOCK_ID=null_block_id,
+            HAS_TRACK=pass_track,
+            HAS_RESIDUAL=has_residual,
+            DO_FOLD=pass_fold,
+            num_warps=4,
+            num_stages=2,
+        )
     block = triton.next_power_of_2(max(1, B))
     _finish_gdn_replayssm_circular_fold_kernel[(1,)](
         write_pos,
