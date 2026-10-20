@@ -482,3 +482,64 @@ def maybe_flashinfer_autotune_extend(
         # release dummy buffers before capture measures free memory
         del forward_fn, buffers
         torch.cuda.empty_cache()
+
+
+_tune_tables: dict[str, dict] = {}
+_tune_table_hits: set[tuple[str, str]] = set()
+
+
+def _tune_table(path: str) -> dict:
+    table = _tune_tables.get(path)
+    if table is None:
+        from flashinfer.autotuner.autotuner import _json_to_tactic
+
+        raw = json.loads(Path(path).read_text())
+        table = {
+            k: (v[0], _json_to_tactic(v[1]))
+            for k, v in raw.items()
+            if not k.startswith("_")
+        }
+        _tune_tables[path] = table
+        logger.info("Q35MF tune table %s: %d entries", Path(path).name, len(table))
+    return table
+
+
+# Lookups outside tuning serve the table in SGLANG_Q35MF_TUNE_TABLE ahead of the tuner's caches;
+# the path is read per call, so graphs captured under different env overrides carry different tables.
+def _install_tune_table_switch() -> None:
+    from flashinfer.autotuner import AutoTuner
+
+    search_cache = AutoTuner.search_cache
+
+    def search_cache_with_table(
+        self, custom_op, runners, input_shapes, tuning_config, inputs=None, **kwargs
+    ):
+        path = envs.SGLANG_Q35MF_TUNE_TABLE.get()
+        if path and not self.is_tuning_mode:
+            table = _tune_table(path)
+            for r_id, r in enumerate(runners):
+                extras = r.get_cache_key_extras(inputs) if inputs is not None else ()
+                key = AutoTuner._get_cache_key(
+                    custom_op, r, input_shapes, tuning_config, extras
+                )
+                hit = table.get(key.file_key)
+                if hit is not None and hit[0] == r.__class__.__name__:
+                    if (path, key.file_key) not in _tune_table_hits:
+                        _tune_table_hits.add((path, key.file_key))
+                        logger.info(
+                            "Q35MF tune table %s: %s %s -> %s",
+                            Path(path).name,
+                            custom_op,
+                            key.nearest_profile[0],
+                            hit[1],
+                        )
+                    return True, r_id, hit[1], None
+        return search_cache(
+            self, custom_op, runners, input_shapes, tuning_config, inputs, **kwargs
+        )
+
+    AutoTuner.search_cache = search_cache_with_table
+
+
+if envs.SGLANG_Q35MF_TUNE_TABLE_HOOK.get():
+    _install_tune_table_switch()
