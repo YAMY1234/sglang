@@ -111,6 +111,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.layers import q35_bundle_proof
 from sglang.srt.model_executor.runner_backend import ab_variants
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import (
@@ -386,6 +387,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        q35_bundle_proof.maybe_init()
         parallel_group = linear_attn_parallel_group()
         self.attn_tp_rank, self.attn_tp_size = resolve_linear_parallel_group(
             parallel_group
@@ -1571,6 +1573,19 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     early_dependents=hop is not None,
                     early_loads=early_loads,
                 )
+                proof = q35_bundle_proof.active() if early_loads else None
+                if proof is not None:
+                    (fp8_ref, _), _, _ = _layer_norm_fwd(
+                        core_attn_out,
+                        self.norm.weight,
+                        None,
+                        self.norm.eps,
+                        z=z,
+                        is_rms_norm=True,
+                        activation=self.norm.activation,
+                        static_quant_scale=self.out_proj.input_scale,
+                    )
+                    proof.check(1, fp8, fp8_ref)
                 fp8 = fp8.reshape(-1, nv * self.head_v_dim)
                 if hop is not None:
                     return hop.out_proj_push(

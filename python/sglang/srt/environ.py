@@ -2217,6 +2217,9 @@ class Envs:
     SGLANG_Q35MF_GDN_CONV_EARLY = EnvBool(False)
     # Verify gated RMSNorm (static FP8 out): read gate, weights and scale before the PDL wait; same values.
     SGLANG_Q35MF_GDN_NORM_EARLY = EnvBool(False)
+    # Shadow-run the served FP8 bmm kernel next to each pinned tactic and the stock gated norm next to the
+    # early-load one; count rows whose outputs differ, logged every 30 s (q35_bundle_proof).
+    SGLANG_Q35MF_BUNDLE_PROOF = EnvBool(False)
     SGLANG_Q35MF_GDN_TILED_VERIFY = EnvBool(False)
     SGLANG_Q35MF_GDN_VERIFY_BV64 = EnvBool(False)
     SGLANG_Q35MF_KGDN_VERIFY_REG168 = EnvBool(False)

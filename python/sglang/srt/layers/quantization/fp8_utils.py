@@ -29,6 +29,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers import q35_bundle_proof
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
 from sglang.srt.runtime_context import (
     get_exec,
@@ -508,9 +509,21 @@ if flashinfer_per_tensor_fp8_supported():
         tactic = _pinned_fp8_bmm_tactics().get((n, weight.shape[0], m))
         if tactic is not None:
             _log_pinned_fp8_bmm_once(n, weight.shape[0], m, tactic)
-            return _pinned_flashinfer_bmm_fp8(
+            out = _pinned_flashinfer_bmm_fp8(
                 q_input, weight, x_scale, weight_scale, out_dtype, tactic
             ).view(m, n)
+            proof = q35_bundle_proof.active()
+            if proof is not None:
+                ref = _raw_flashinfer_bmm_fp8(
+                    q_input.unsqueeze(0),
+                    weight.unsqueeze(0),
+                    x_scale.reshape(1),
+                    weight_scale.reshape(1),
+                    out_dtype,
+                    backend="cublas",
+                ).view(m, n)
+                proof.check(0, out, ref)
+            return out
         return _raw_flashinfer_bmm_fp8(
             q_input.unsqueeze(0),
             weight.unsqueeze(0),
