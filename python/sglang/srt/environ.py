@@ -588,6 +588,9 @@ class Envs:
     # top-k and argmax, one small all-reduce of the candidates, and a merge that keeps the larger value
     # first and the lower id among equals, instead of gathering the logits.
     SGLANG_Q35MF_LL16_DB1 = EnvBool(False)
+    # CUDA stream priority of the post-verify graph's side-stream state commit (0 = the default stream
+    # priority, lower = higher priority); measurement switch for the round-boundary commit.
+    SGLANG_Q35MF_LL16_COMMIT_PRIO = EnvInt(0)
     # Row-split MTP fc for draft-width batches: each rank multiplies its input-column
     # slice (one normalized half); fp32 partials are gathered and summed in rank order.
     SGLANG_Q35MF_DRAFT_FC_SPLIT = EnvBool(False)

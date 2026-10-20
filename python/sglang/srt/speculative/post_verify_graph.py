@@ -168,6 +168,10 @@ class PostVerifyGraph:
         # The mamba state commit replays on its own stream so it overlaps the draft
         # extend; join() must run before any later work that reads that state.
         self._side_stream = torch.cuda.Stream() if _SIDE_STREAM_COMMIT else None
+        # Side streams by CUDA priority for the commit replay (SGLANG_Q35MF_LL16_COMMIT_PRIO; lower is
+        # higher priority), picked per round so the same-service A/B harness can compare them.
+        self._commit_prio = envs.SGLANG_Q35MF_LL16_COMMIT_PRIO.get()
+        self._prio_streams: Dict[int, torch.cuda.Stream] = {}
         self._main_done = torch.cuda.Event() if _SIDE_STREAM_COMMIT else None
         self._commit_done = torch.cuda.Event() if _SIDE_STREAM_COMMIT else None
         self._commit_pending = False
@@ -267,6 +271,18 @@ class PostVerifyGraph:
             and not (db1 and max_top_k is not None and max_top_k <= DB1_MAX_TOP_K)
             and verify_logits_on_shards(logits_output.next_token_logits)
         )
+
+    def _commit_stream(self) -> torch.cuda.Stream:
+        prio = self._commit_prio
+        if ab_variants.enabled():
+            v = ab_variants.VARIANTS[ab_variants.current()].get("SGLANG_Q35MF_LL16_COMMIT_PRIO")
+            prio = prio if v is None else int(v)
+        if prio == 0:
+            return self._side_stream
+        stream = self._prio_streams.get(prio)
+        if stream is None:
+            stream = self._prio_streams[prio] = torch.cuda.Stream(priority=prio)
+        return stream
 
     def _db1_variant(self) -> bool:
         if not ab_variants.enabled():
@@ -440,11 +456,12 @@ class PostVerifyGraph:
             self._check_load(slot, inputs, sim_len)
         slot.graph.replay()
         if slot.commit_graph is not None:
+            side = self._commit_stream()
             self._main_done.record()
-            self._side_stream.wait_event(self._main_done)
-            with torch.cuda.stream(self._side_stream):
+            side.wait_event(self._main_done)
+            with torch.cuda.stream(side):
                 slot.commit_graph.replay()
-            self._commit_done.record(self._side_stream)
+            self._commit_done.record(side)
             self._commit_pending = True
         if self._check:
             self._compare(slot, batch, verify_input, logits_output, num_draft_tokens)
