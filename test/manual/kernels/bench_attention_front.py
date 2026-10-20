@@ -156,7 +156,8 @@ def main():
                 vscale = torch.tensor(
                     [value if seed % 6 >= 4 else value * 1.3], device="cuda"
                 )
-                stride = 512 if seed % 2 else 256
+                # A padded row stride only for one KV head; per-head views of a wider row are not a paged layout.
+                stride = 512 if seed % 2 and kvh == 1 else 256
                 old_kv = tuple(
                     torch.zeros(
                         1024, kvh, stride, dtype=torch.float8_e4m3fn, device="cuda"
