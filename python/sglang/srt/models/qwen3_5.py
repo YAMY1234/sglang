@@ -413,6 +413,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         self.conv_kernel_size = config.linear_conv_kernel_dim
         self.layer_id = layer_id
+        # [this layer's MoE gate] for SGLANG_Q35MF_KRNC_ROUTER_PF_CORE; set by Qwen3_5ForCausalLM wiring.
+        self.krnc_router_gates = None
         self.activation = config.hidden_act
         self.output_gate_type = config.output_gate_type
         self.layer_norm_epsilon = config.rms_norm_eps
@@ -1411,6 +1413,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             self._krnc_in_proj_proof(hidden_states, projected_states_qkvz)
             if envs.SGLANG_Q35MF_KRNC_OPROJ_PF.get():
                 self._fork_out_proj_prefetch()
+            if (
+                self.krnc_router_gates is not None
+                and envs.SGLANG_Q35MF_KRNC_ROUTER_PF_CORE.get()
+            ):
+                _krnc_fork_router_prefetch(self.krnc_router_gates, tag="router_core")
         middle_backend = (
             self._middle_verify_backend(
                 hidden_states, projected_states_qkvz, projected_states_ba, forward_batch
@@ -1666,6 +1673,31 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         return hop if hop is not None and self.out_proj.q35_packed is not None else None
 
 
+def _krnc_fork_router_prefetch(gates: list, tag: str) -> None:
+    # Joined once at the end of the target forward, so the router GEMM never waits on it.
+    from sglang.kernels.ops.gemm.qwen_l2_prefetch import l2_prefetch_deferred
+
+    l2_prefetch_deferred([gate.weight for gate in gates], tag=tag)
+    weight = gates[0].weight
+    print_info_once(
+        "SGLANG_Q35MF_KRNC_ROUTER_PF engaged (%s): %s %s"
+        % (tag, tuple(weight.shape), weight.dtype)
+    )
+
+
+def _krnc_router_prefetch_pre(
+    gates: Optional[list], forward_batch: ForwardBatch, *, has_core_slot: bool
+) -> None:
+    """Router weight prefetch right before the post-attention norm: SGLANG_Q35MF_KRNC_ROUTER_PF_PRE on every MoE
+    layer, SGLANG_Q35MF_KRNC_ROUTER_PF_CORE on layers whose mixer has no GDN core slot."""
+    if gates is None or not forward_batch.forward_mode.is_target_verify():
+        return
+    if envs.SGLANG_Q35MF_KRNC_ROUTER_PF_PRE.get() or (
+        not has_core_slot and envs.SGLANG_Q35MF_KRNC_ROUTER_PF_CORE.get()
+    ):
+        _krnc_fork_router_prefetch(gates, tag="router_pre")
+
+
 class Qwen3_5LinearDecoderLayer(nn.Module):
     """Qwen3.5 Decoder Layer with Linear Attention (GatedDeltaNet)."""
 
@@ -1684,6 +1716,8 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         super().__init__()
         self.config = config
         self.layer_id = layer_id
+        # [self.mlp.gate] for the SGLANG_Q35MF_KRNC_ROUTER_PF_* prefetch; set by Qwen3_5ForCausalLM wiring.
+        self.krnc_router_gates = None
 
         self.linear_attn = Qwen3_5GatedDeltaNet(
             config, layer_id, quant_config, alt_stream, prefix
@@ -1767,6 +1801,9 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        _krnc_router_prefetch_pre(
+            self.krnc_router_gates, forward_batch, has_core_slot=True
+        )
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
         with self.ffn_boundary.exit(forward_batch) as ffn_exit:
@@ -1826,6 +1863,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.rope_theta, rope_scaling = get_rope_config(config)
         self.partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
         self.layer_id = layer_id
+        # [self.mlp.gate] for the SGLANG_Q35MF_KRNC_ROUTER_PF_* prefetch; set by Qwen3_5ForCausalLM wiring.
+        self.krnc_router_gates = None
 
         # If rope_scaling doesn't specify a scaling type, treat as no scaling
         if rope_scaling and not ("rope_type" in rope_scaling or "type" in rope_scaling):
@@ -2448,6 +2487,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        _krnc_router_prefetch_pre(
+            self.krnc_router_gates, forward_batch, has_core_slot=False
+        )
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
@@ -2645,6 +2687,7 @@ class Qwen3_5ForCausalLM(nn.Module):
             self._install_draft_hop()
         if not is_nextn:
             self._wire_l2_prefetch()
+            self._wire_krnc_router_prefetch()
 
         self.layers_to_capture = []
 
@@ -2668,6 +2711,24 @@ class Qwen3_5ForCausalLM(nn.Module):
                 dispatcher.l2_prefetch_modules = [nxt.linear_attn.in_proj_qkvz]
             elif isinstance(nxt, Qwen3_5AttentionDecoderLayer):
                 dispatcher.l2_prefetch_modules = [nxt.qkv_proj]
+
+    def _wire_krnc_router_prefetch(self) -> None:
+        """Hand each FlashInfer A2A MoE layer (and its GDN mixer) its router gate, for the SGLANG_Q35MF_KRNC_ROUTER_PF_*
+        prefetch (the layers read the switches at capture)."""
+        from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+            FlashinferDispatcher,
+        )
+
+        for layer in self.layers:
+            if not isinstance(
+                layer, (Qwen3_5LinearDecoderLayer, Qwen3_5AttentionDecoderLayer)
+            ) or not isinstance(layer.mlp, Qwen2MoeSparseMoeBlock):
+                continue
+            if not isinstance(layer.mlp.experts.dispatcher, FlashinferDispatcher):
+                continue
+            layer.krnc_router_gates = [layer.mlp.gate]
+            if isinstance(layer, Qwen3_5LinearDecoderLayer):
+                layer.linear_attn.krnc_router_gates = [layer.mlp.gate]
 
     def _install_draft_hop(self) -> None:
         from sglang.srt.layers.layer_boundary.fusions.q35_draft_hop import (
@@ -2794,6 +2855,8 @@ class Qwen3_5ForCausalLM(nn.Module):
         if (
             envs.SGLANG_Q35MF_KRNC_L2PF_LL.get()
             or envs.SGLANG_Q35MF_KRNC_OPROJ_PF.get()
+            or envs.SGLANG_Q35MF_KRNC_ROUTER_PF_CORE.get()
+            or envs.SGLANG_Q35MF_KRNC_ROUTER_PF_PRE.get()
         ):
             from sglang.kernels.ops.gemm.qwen_l2_prefetch import (
                 l2_prefetch_join_deferred,

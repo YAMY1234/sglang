@@ -957,6 +957,139 @@ def gdn_replayssm_compact_commit_kernel(
 
 
 @triton.jit
+def gdn_replayssm_compact_commit_persistent_kernel(
+    h0,
+    d_cache,
+    k_cache,
+    g_cache,
+    d_residual_cache,
+    k_residual_cache,
+    ssm_state_indices,
+    replay_indices,
+    write_pos,
+    cache_base,
+    is_flush_flags,
+    stride_state_slot: tl.constexpr,
+    stride_d_slot: tl.constexpr,
+    stride_k_slot: tl.constexpr,
+    stride_g_slot: tl.constexpr,
+    stride_d_residual_slot: tl.constexpr,
+    stride_k_residual_slot: tl.constexpr,
+    stride_state_layer: tl.constexpr,
+    stride_d_layer: tl.constexpr,
+    stride_k_layer: tl.constexpr,
+    stride_g_layer: tl.constexpr,
+    stride_d_residual_layer: tl.constexpr,
+    stride_k_residual_layer: tl.constexpr,
+    stride_indices: tl.constexpr,
+    stride_replay_indices: tl.constexpr,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BV: tl.constexpr,
+    MAX_CACHE_LEN: tl.constexpr,
+    NULL_BLOCK_ID: tl.constexpr,
+    NUM_LAYERS: tl.constexpr,
+    PROGRAMS_PER_ROW: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+    HAS_RESIDUAL: tl.constexpr,
+):
+    """The compact commit's fold without track rows (SGLANG_Q35MF_KRNC_COMMIT_PERSIST): each program loads one
+    row's cursors once and walks that row's (layer, head, V block) tiles with pipelined loads; the per-tile math is
+    gdn_replayssm_compact_commit_kernel's (V % BV == 0)."""
+    i_p = tl.program_id(0)
+    i_n = tl.program_id(1)
+    state_idx = tl.load(ssm_state_indices + i_n * stride_indices).to(tl.int64)
+    replay_idx = tl.load(replay_indices + i_n * stride_replay_indices).to(tl.int64)
+    if state_idx > NULL_BLOCK_ID:
+        n_history = tl.load(write_pos + replay_idx).to(tl.int32)
+        fold_active = tl.load(is_flush_flags + replay_idx) != 0
+        if fold_active:
+            base = tl.load(cache_base + replay_idx).to(tl.int32)
+            o_t = tl.arange(0, MAX_CACHE_LEN)
+            phys = (base + o_t) & (MAX_CACHE_LEN - 1)
+            o_k = tl.arange(0, K)
+            active_mask = o_t < n_history
+            NV: tl.constexpr = V // BV
+            TILES: tl.constexpr = NUM_LAYERS * HV * NV
+            for tile in tl.range(i_p, TILES, PROGRAMS_PER_ROW, num_stages=NUM_STAGES):
+                i_v = tile % NV
+                i_hvl = tile // NV
+                i_layer = (i_hvl // HV).to(tl.int64)
+                i_hv = i_hvl % HV
+                i_h = i_hv // (HV // H)
+                o_v = i_v * BV + tl.arange(0, BV)
+                p_h0 = (
+                    h0
+                    + i_layer * stride_state_layer
+                    + state_idx * stride_state_slot
+                    + i_hv * V * K
+                    + o_v[None, :] * K
+                    + o_k[:, None]
+                )
+                old_state = tl.load(p_h0).to(tl.float32)
+                keys = tl.load(
+                    k_cache
+                    + i_layer * stride_k_layer
+                    + replay_idx * stride_k_slot
+                    + (i_h * MAX_CACHE_LEN + phys[:, None]) * K
+                    + o_k[None, :]
+                )
+                updates = tl.load(
+                    d_cache
+                    + i_layer * stride_d_layer
+                    + replay_idx * stride_d_slot
+                    + (i_hv * MAX_CACHE_LEN + phys[:, None]) * V
+                    + o_v[None, :]
+                ).to(tl.float32)
+                if HAS_RESIDUAL:
+                    key_residual = tl.load(
+                        k_residual_cache
+                        + i_layer * stride_k_residual_layer
+                        + replay_idx * stride_k_residual_slot
+                        + (i_h * MAX_CACHE_LEN + phys[:, None]) * K
+                        + o_k[None, :]
+                    )
+                    updates += tl.load(
+                        d_residual_cache
+                        + i_layer * stride_d_residual_layer
+                        + replay_idx * stride_d_residual_slot
+                        + (i_hv * MAX_CACHE_LEN + phys[:, None]) * V
+                        + o_v[None, :]
+                    ).to(tl.float32)
+                gates = tl.load(
+                    g_cache
+                    + i_layer * stride_g_layer
+                    + replay_idx * stride_g_slot
+                    + i_hv * MAX_CACHE_LEN
+                    + phys
+                ).to(tl.float32)
+                active_g = tl.where(active_mask, gates, 0.0)
+                active_prefix = tl.cumsum(active_g, axis=0)
+                active_total = tl.sum(active_g, axis=0)
+                active_decay = tl.where(
+                    active_mask, tl.exp(active_total - active_prefix), 0.0
+                )
+                active_updates = updates * active_decay[:, None]
+                active_hi = active_updates.to(k_cache.dtype.element_ty)
+                active_lo = (active_updates - active_hi.to(tl.float32)).to(
+                    k_cache.dtype.element_ty
+                )
+                active_delta = tl.dot(tl.trans(keys), active_hi)
+                active_delta += tl.dot(tl.trans(keys), active_lo)
+                if HAS_RESIDUAL:
+                    active_delta += tl.dot(tl.trans(key_residual), active_hi)
+                    active_delta += tl.dot(tl.trans(key_residual), active_lo)
+                tl.store(
+                    p_h0,
+                    (old_state * tl.exp(active_total) + active_delta).to(
+                        p_h0.dtype.element_ty
+                    ),
+                )
+
+
+@triton.jit
 def _finish_gdn_replayssm_circular_fold_kernel(
     write_pos,
     cache_base,
@@ -1574,6 +1707,34 @@ def commit_gdn_replayssm_circular(
     k_residual_buf = k_residual_cache if has_residual else k_cache
     BV = min(triton.next_power_of_2(V), 64)
     has_track = mamba_track_indices is not None and mamba_steps_to_track is not None
+    if not has_track and V % BV == 0 and _commit_persist_on():
+        rings = (d_cache, k_cache, g_cache, d_residual_buf, k_residual_buf)
+        shadow = _commit_shadow_begin(checkpoint_state, state_batch_indices)
+        _launch_commit_persistent(
+            checkpoint_state=checkpoint_state,
+            rings=rings,
+            state_batch_indices=state_batch_indices,
+            replay_indices=replay_indices,
+            cursors=(write_pos, cache_base, is_flush),
+            has_residual=has_residual,
+            block_v=BV,
+            null_block_id=null_block_id,
+        )
+        if shadow is not None:
+            _commit_shadow_check(
+                shadow=shadow,
+                checkpoint_state=checkpoint_state,
+                rings=rings,
+                replay_indices=replay_indices,
+                cursors=(write_pos, cache_base, is_flush),
+                accept_lens=accept_lens,
+                has_residual=has_residual,
+                block_v=BV,
+            )
+        _finish_circular_fold(
+            write_pos, cache_base, is_flush, state_batch_indices, replay_indices, max_cache_len, null_block_id
+        )
+        return
     if has_track:
         track_indices = mamba_track_indices
         track_steps = mamba_steps_to_track
@@ -1629,6 +1790,15 @@ def commit_gdn_replayssm_circular(
         num_warps=4,
         num_stages=2,
     )
+    _finish_circular_fold(
+        write_pos, cache_base, is_flush, state_batch_indices, replay_indices, max_cache_len, null_block_id
+    )
+
+
+def _finish_circular_fold(
+    write_pos, cache_base, is_flush, state_batch_indices, replay_indices, max_cache_len, null_block_id=-1
+) -> None:
+    B = state_batch_indices.shape[0]
     block = triton.next_power_of_2(max(1, B))
     _finish_gdn_replayssm_circular_fold_kernel[(1,)](
         write_pos,
@@ -1642,6 +1812,126 @@ def commit_gdn_replayssm_circular(
         MAX_CACHE_LEN=max_cache_len,
         BLOCK=block,
         NULL_BLOCK_ID=null_block_id,
+    )
+
+
+def _commit_persist_on() -> bool:
+    # The post-verify graph is captured lazily while serving, outside the A/B variant env, so read the current
+    # variant's override (the process env without the A/B harness).
+    from sglang.srt.model_executor.runner_backend import ab_variants
+
+    return ab_variants.env("SGLANG_Q35MF_KRNC_COMMIT_PERSIST", "0").lower() in ("1", "true")
+
+
+# Measured on GB300 (KRN-C commit T1): 2 programs per SM (234 registers), 4 pipeline stages, BV 64, 4 warps.
+_PERSIST_PROGRAMS_PER_SM = 2
+_PERSIST_STAGES = 4
+_persist_logged = False
+
+
+def _launch_commit_persistent(
+    *, checkpoint_state, rings, state_batch_indices, replay_indices, cursors, has_residual, block_v, null_block_id
+) -> None:
+    global _persist_logged
+    d_cache, k_cache, g_cache, d_residual_buf, k_residual_buf = rings
+    write_pos, cache_base, is_flush = cursors
+    num_layers, _, HV, V, K = checkpoint_state.shape
+    B = state_batch_indices.shape[0]
+    sms = torch.cuda.get_device_properties(checkpoint_state.device).multi_processor_count
+    ppr = max(1, _PERSIST_PROGRAMS_PER_SM * sms // B)
+    gdn_replayssm_compact_commit_persistent_kernel[(ppr, B)](
+        checkpoint_state,
+        d_cache,
+        k_cache,
+        g_cache,
+        d_residual_buf,
+        k_residual_buf,
+        state_batch_indices,
+        replay_indices,
+        write_pos,
+        cache_base,
+        is_flush,
+        checkpoint_state.stride(1),
+        d_cache.stride(1),
+        k_cache.stride(1),
+        g_cache.stride(1),
+        d_residual_buf.stride(1),
+        k_residual_buf.stride(1),
+        checkpoint_state.stride(0),
+        d_cache.stride(0),
+        k_cache.stride(0),
+        g_cache.stride(0),
+        d_residual_buf.stride(0),
+        k_residual_buf.stride(0),
+        state_batch_indices.stride(0),
+        replay_indices.stride(0),
+        H=k_cache.shape[2],
+        HV=HV,
+        K=K,
+        V=V,
+        BV=block_v,
+        MAX_CACHE_LEN=d_cache.shape[-2],
+        NULL_BLOCK_ID=null_block_id,
+        NUM_LAYERS=num_layers,
+        PROGRAMS_PER_ROW=ppr,
+        NUM_STAGES=_PERSIST_STAGES,
+        HAS_RESIDUAL=has_residual,
+        num_warps=4,
+    )
+    if not _persist_logged:
+        _persist_logged = True
+        import logging
+
+        logging.getLogger(__name__).info(
+            "SGLANG_Q35MF_KRNC_COMMIT_PERSIST engaged: %d layers, %d rows, %d programs per row", num_layers, B, ppr
+        )
+
+
+def _commit_shadow_begin(checkpoint_state, state_batch_indices):
+    """SGLANG_Q35MF_KRNC_PROOF: copy three layers' rows before the persistent fold, for the stock fold to redo."""
+    from sglang.srt.layers import q35_krnc_proof
+
+    proof = q35_krnc_proof.active_now()
+    if proof is None:
+        return None
+    num_layers = checkpoint_state.shape[0]
+    layers = (0, num_layers // 2, num_layers - 1)
+    valid = state_batch_indices >= 0
+    gather = torch.where(valid, state_batch_indices, 0).to(torch.int64)
+    ref = torch.stack([checkpoint_state[layer].index_select(0, gather) for layer in layers])
+    return proof, layers, valid, gather, ref
+
+
+def _commit_shadow_check(
+    *, shadow, checkpoint_state, rings, replay_indices, cursors, accept_lens, has_residual, block_v
+) -> None:
+    """The stock fold on the copied rows (same cursors, before the finish kernel), then a byte compare with the
+    persistent fold's rows; padding rows are zeroed on both sides."""
+    proof, layers, valid, gather, ref = shadow
+    d_cache, k_cache, g_cache, d_residual_buf, k_residual_buf = rings
+    write_pos, cache_base, is_flush = cursors
+    B = gather.shape[0]
+    rows = torch.where(valid, torch.arange(B, device=gather.device, dtype=torch.int32), -1)
+    for j, layer in enumerate(layers):
+        state = ref[j : j + 1]
+        HV, V, K = state.shape[2:]
+        cut = lambda t: t[layer : layer + 1]
+        d, k, g, dr, kr = (cut(t) for t in (d_cache, k_cache, g_cache, d_residual_buf, k_residual_buf))
+        gdn_replayssm_compact_commit_kernel[(triton.cdiv(V, block_v), B, HV)](
+            state, d, k, g, dr, kr, rows, replay_indices, write_pos, cache_base, is_flush, accept_lens, rows,
+            accept_lens,
+            state.stride(1), d.stride(1), k.stride(1), g.stride(1), dr.stride(1), kr.stride(1),
+            state.stride(0), d.stride(0), k.stride(0), g.stride(0), dr.stride(0), kr.stride(0),
+            rows.stride(0), replay_indices.stride(0), accept_lens.stride(0), 0, 0,
+            H=k.shape[2], HV=HV, K=K, V=V, BV=block_v, MAX_CACHE_LEN=d.shape[-2], NULL_BLOCK_ID=-1,
+            HAS_TRACK=False, HAS_RESIDUAL=has_residual, num_warps=4, num_stages=2,
+        )
+    after = torch.stack([checkpoint_state[layer].index_select(0, gather) for layer in layers])
+    keep = valid.view(1, B, 1, 1, 1)
+    proof.check(
+        "commit",
+        torch.where(keep, after, 0).reshape(-1, after.shape[-1]),
+        torch.where(keep, ref, 0).reshape(-1, ref.shape[-1]),
     )
 
 
