@@ -1822,6 +1822,11 @@ class Envs:
     SGLANG_Q35MF_BK_STASH_SCATTER = EnvBool(False)
     # Draft extend picks its top-1 token with the split argmax the draft steps use.
     SGLANG_Q35MF_BK_EXTEND_ARGMAX = EnvBool(False)
+    # Across two hosts the request broadcast size rides on the HiCache ready-count exchange,
+    # so a scheduler pass runs one cross-host CPU sync instead of two.
+    SGLANG_Q35MF_LL16_RECV_MERGE = EnvBool(False)
+    # Measurement only: with RECV_MERGE, alternate the stock and the merged path every N passes.
+    SGLANG_Q35MF_LL16_RECV_AB_BLOCK = EnvInt(0)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
     SGLANG_DEFAULT_THINKING = EnvBool(False)
 

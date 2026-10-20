@@ -34,6 +34,7 @@ from sglang.srt.managers.mm_utils import (
     has_shm_features,
     unwrap_shm_features,
 )
+from sglang.srt.managers.scheduler_components import recv_hicache_merge
 from sglang.srt.managers.scheduler_components.shm_tag_exchange import (
     ShmTagExchange,
     get_shm_exchange,
@@ -208,6 +209,9 @@ class SchedulerRequestReceiver:
                 recv_reqs = [*recv_reqs, *local_reqs]
             if get_parallel().tp_size != 1:
                 tp_group = get_parallel().tp_group
+                merged = recv_hicache_merge.broadcast(recv_reqs, tp_group=tp_group)
+                if merged is not None:
+                    return merged
                 exchange = get_shm_exchange(tp_group.cpu_group, "recv")
                 if exchange is not None:
                     recv_reqs = _broadcast_via_exchange(

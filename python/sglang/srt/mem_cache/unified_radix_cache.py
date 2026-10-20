@@ -275,6 +275,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self.tp_group = params.tp_cache_group
         self.attn_cp_group = params.attn_cp_cache_group
         self.attn_tp_group = params.attn_tp_cache_group
+        # Count rows the request broadcast exchanged this pass (SGLANG_Q35MF_LL16_RECV_MERGE).
+        self._ll16_count_rows: Optional[list[list[int]]] = None
         self.pp_group = params.pp_cache_group
         self.tp_world_size = (
             1
@@ -3272,12 +3274,39 @@ class UnifiedRadixCache(BasePrefixCache):
             ready_count += 1
         return ready_count
 
+    def _hicache_count_values(self) -> list[int]:
+        """This rank's row of the count exchange, as _sync_hicache_ready_counts sends it."""
+        cc = self.cache_controller
+        extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
+        extra_pool_names = tuple(extra_release_queues) if self.enable_storage else ()
+        storage_queue_sizes = (
+            (
+                cc.prefetch_hit_queue.qsize(),
+                cc.ack_prefetch_queue.qsize(),
+                cc.ack_backup_queue.qsize(),
+                cc.host_mem_release_queue.qsize(),
+                *(extra_release_queues[name].qsize() for name in extra_pool_names),
+            )
+            if self.enable_storage
+            else ()
+        )
+        return [
+            self._count_ready_acks(cc.ack_write_queue),
+            self._count_ready_acks(cc.ack_load_queue),
+            *storage_queue_sizes,
+            *fold_u64(self.tree_core.write_back_duplicate_reclaim_digest),
+        ]
+
     def _sync_hicache_ready_counts(
         self,
     ) -> tuple[int, int, tuple[int, ...], tuple[PoolName, ...]]:
         cc = self.cache_controller
         extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
         extra_pool_names = tuple(extra_release_queues) if self.enable_storage else ()
+        rows, self._ll16_count_rows = self._ll16_count_rows, None
+        if rows is not None:
+            # Rows already exchanged with the request broadcast earlier in this pass.
+            return self._min_count_rows(rows, extra_pool_names)
         if cc is None or (self.pp_rank > 0 and self.host_memory_mode != "buffer_only"):
             write_acks = 0
             load_acks = 0
@@ -3310,11 +3339,7 @@ class UnifiedRadixCache(BasePrefixCache):
             rows = exchange.allgather(
                 [write_acks, load_acks, *storage_queue_sizes, *fold_u64(digest)]
             )
-            assert all(row[-2:] == rows[0][-2:] for row in rows), (
-                "write_back duplicate-reclaim victims diverged across TP ranks"
-            )
-            mins = [min(col) for col in zip(*rows)]
-            return mins[0], mins[1], tuple(mins[2:-2]), extra_pool_names
+            return self._min_count_rows(rows, extra_pool_names)
         ready_counts = torch.tensor(
             [
                 write_acks,
@@ -3342,7 +3367,17 @@ class UnifiedRadixCache(BasePrefixCache):
             extra_pool_names,
         )
 
-    def _shm_count_exchange(self) -> Optional[ShmTagExchange]:
+    @staticmethod
+    def _min_count_rows(
+        rows: list[list[int]], extra_pool_names: tuple[PoolName, ...]
+    ) -> tuple[int, int, tuple[int, ...], tuple[PoolName, ...]]:
+        assert all(row[-2:] == rows[0][-2:] for row in rows), (
+            "write_back duplicate-reclaim victims diverged across TP ranks"
+        )
+        mins = [min(col) for col in zip(*rows)]
+        return mins[0], mins[1], tuple(mins[2:-2]), extra_pool_names
+
+    def _shm_count_group(self):
         # Only the single-group, single-stage layout; anything else keeps the gloo reduce.
         if self.pp_size > 1 or self.cache_controller is None:
             return None
@@ -3353,11 +3388,14 @@ class UnifiedRadixCache(BasePrefixCache):
         ]
         if len(groups) > 1:
             return None
-        group = (
-            groups[0] if groups else (self.tp_group if self.tp_world_size > 1 else None)
-        )
+        return groups[0] if groups else (self.tp_group if self.tp_world_size > 1 else None)
+
+    def _shm_count_exchange(self) -> Optional[ShmTagExchange]:
+        group = self._shm_count_group()
+        if group is None:
+            return None
         # Across hosts the leaders' all_gather beats an all-rank gloo reduce (measured at TP8);
-        # the request broadcast stays on gloo there, a one-source broadcast does not gain.
+        # the request broadcast stays on gloo there unless SGLANG_Q35MF_LL16_RECV_MERGE folds it in.
         return get_shm_exchange(group, "hicache", multihost=True)
 
     def writing_check(
