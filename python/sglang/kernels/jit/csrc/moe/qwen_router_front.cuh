@@ -462,12 +462,20 @@ SGL_DEVICE float key_value(uint32_t key) {
 // is recomputed with the full per-lane sort (exact either way). Arithmetic on
 // the selected values follows the reference kernel's operations and order.
 template <int kNT, bool kTrace>
+SGL_DEVICE void topk_tokens_fast_regs(
+    const Params& p,
+    const uint32_t (&m)[kNT],
+    const bool (&valid)[kNT],
+    const uint4 (&r)[kNT][2],
+    uint32_t* s_mask,
+    int16_t* s_ids,
+    uint64_t c0);
+
+template <int kNT, bool kTrace>
 SGL_DEVICE void topk_tokens_fast(
     const Params& p, const uint32_t (&m)[kNT], const bool (&valid)[kNT], uint32_t* s_mask, int16_t* s_ids) {
   const uint32_t lane = threadIdx.x % 32;
   const uint64_t c0 = kTrace ? clock64() : 0;
-  constexpr float kLog2e = 1.44269502162933349609375f;
-  float a[kNT][16];
   uint4 r[kNT][2];
 #pragma unroll
   for (int t = 0; t < kNT; ++t) {
@@ -475,6 +483,22 @@ SGL_DEVICE void topk_tokens_fast(
     r[t][0] = ld_produced(row + 8 * lane);
     r[t][1] = ld_produced(row + 256 + 8 * lane);
   }
+  topk_tokens_fast_regs<kNT, kTrace>(p, m, valid, r, s_mask, s_ids, c0);
+}
+
+// topk_tokens_fast after the row load: lane holds experts [8l, 8l+8) in r[t][0] and [256+8l, 256+8l+8) in r[t][1].
+template <int kNT, bool kTrace>
+SGL_DEVICE void topk_tokens_fast_regs(
+    const Params& p,
+    const uint32_t (&m)[kNT],
+    const bool (&valid)[kNT],
+    const uint4 (&r)[kNT][2],
+    uint32_t* s_mask,
+    int16_t* s_ids,
+    uint64_t c0) {
+  const uint32_t lane = threadIdx.x % 32;
+  constexpr float kLog2e = 1.44269502162933349609375f;
+  float a[kNT][16];
   if (r[0][1].w != 0x12345678u) cycle_stamp<kTrace>(p, 4, c0);
   uint32_t top[kNT][4];
 #pragma unroll
@@ -1234,13 +1258,21 @@ inline constexpr uint32_t kSkMaxTokens = 64;
 template <uint32_t kSlices>
 struct SkSmem {
   static constexpr uint32_t kSliceK = kHidden / kSlices;
+  static constexpr uint32_t kChunks = kSliceK * 2 / 16;      // 16-byte copies per row
   static constexpr uint32_t kRowBytes = kSliceK * 2 + 16;  // rows 16 B apart in bank space for ldmatrix
   static constexpr uint32_t kW = 0;
   static constexpr uint32_t kX = kW + kSkExperts * kRowBytes;
-  static constexpr uint32_t kBarW = kX + kSkMaxTokens * kRowBytes;
-  static constexpr uint32_t kBarX = kBarW + 8;
-  static constexpr uint32_t kBytes = kBarX + 8;
+  static constexpr uint32_t kBytes = kX + kSkMaxTokens * kRowBytes;
 };
+
+// 16-byte global -> shared copy through L2 only (static weights and the producer's rows alike).
+SGL_DEVICE void cp_async16(uint32_t dst, const void* src) {
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst), "l"(src) : "memory");
+}
+
+SGL_DEVICE void cp_async_wait_all() {
+  asm volatile("cp.async.wait_all;" ::: "memory");
+}
 
 struct SkParams {
   const bf16_t* x;       // [M, kHidden]
@@ -1263,32 +1295,21 @@ __global__ __launch_bounds__(kThreads, 1) void router_splitk_gemm_kernel(const _
   const uint32_t M = p.num_tokens;
   const uint32_t g = blockIdx.x % kSkGroups, s = blockIdx.x / kSkGroups;
   const uint32_t expert0 = g * kSkExperts, k0 = s * L::kSliceK;
-  const uint32_t bar_w = smem_addr(smem + L::kBarW), bar_x = smem_addr(smem + L::kBarX);
-  if (threadIdx.x == 0) {
-    mbar_init(bar_w, 1);
-    mbar_init(bar_x, 1);
-  }
-  __syncthreads();
-  // Router weights are static: their bulk copies go out before the wait on the producer grid.
-  if (warp == 0) {
-    if (lane == 0) mbar_expect_tx(bar_w, kSkExperts * L::kSliceK * 2);
-    __syncwarp();
-    for (uint32_t e = lane; e < kSkExperts; e += 32) {
-      bulk_load(smem_addr(smem + L::kW + e * L::kRowBytes), p.weight + static_cast<size_t>(expert0 + e) * kHidden + k0,
-                L::kSliceK * 2, bar_w);
-    }
+  // Router weights are static: their copies go out before the wait on the producer grid.
+  for (uint32_t i = threadIdx.x; i < kSkExperts * L::kChunks; i += kThreads) {
+    const uint32_t e = i / L::kChunks, c = i % L::kChunks;
+    cp_async16(smem_addr(smem + L::kW + e * L::kRowBytes + c * 16),
+               p.weight + static_cast<size_t>(expert0 + e) * kHidden + k0 + c * 8);
   }
   device::PDLWaitPrimary<kUsePDL>();
   // Only after our own wait: the tail quantizes x before its wait.
   device::PDLTriggerSecondary<kUsePDL>();
-  if (warp == 1) {
-    if (lane == 0) mbar_expect_tx(bar_x, M * L::kSliceK * 2);
-    __syncwarp();
-    for (uint32_t t = lane; t < M; t += 32) {
-      bulk_load(smem_addr(smem + L::kX + t * L::kRowBytes), p.x + static_cast<size_t>(t) * kHidden + k0,
-                L::kSliceK * 2, bar_x);
-    }
+  for (uint32_t i = threadIdx.x; i < M * L::kChunks; i += kThreads) {
+    const uint32_t t = i / L::kChunks, c = i % L::kChunks;
+    cp_async16(smem_addr(smem + L::kX + t * L::kRowBytes + c * 16), p.x + static_cast<size_t>(t) * kHidden + k0 + c * 8);
   }
+  cp_async_wait_all();
+  __syncthreads();
   // Warp w: tokens [16 * (w / 2), +16), experts [32 * (w % 2), +32) of the group (four n8 tiles).
   const uint32_t mg = warp >> 1, nq = warp & 1;
   if (mg * 16 >= M) return;
@@ -1298,8 +1319,6 @@ __global__ __launch_bounds__(kThreads, 1) void router_splitk_gemm_kernel(const _
   const uint32_t b_addr0 = smem_addr(smem + L::kW + (nq * 32 + (j >> 1) * 8 + r) * L::kRowBytes + (j & 1) * 16);
   const uint32_t b_addr1 = b_addr0 + 16 * L::kRowBytes;
   float d[4][4] = {};
-  mbar_wait(bar_w, 0);
-  mbar_wait(bar_x, 0);
 #pragma unroll 4
   for (uint32_t step = 0; step < L::kSliceK / 16; ++step) {
     uint32_t a[4], b0[4], b1[4];
@@ -1327,6 +1346,7 @@ __global__ __launch_bounds__(kThreads, 1) void router_splitk_tail_kernel(
     const __grid_constant__ Params p, const float* __restrict__ part) {
   __shared__ uint32_t s_mask[kExperts];
   __shared__ int16_t s_ids[kMaxTokens * kTopK];
+  __shared__ __align__(16) bf16_t s_logits[kExperts];
   const uint32_t t = blockIdx.x;
   {
     const uint32_t qk = (threadIdx.x / 32) * kKPerWarp + (threadIdx.x % 32) * kKPerLane;
@@ -1350,8 +1370,9 @@ __global__ __launch_bounds__(kThreads, 1) void router_splitk_tail_kernel(
       acc.x = __fadd_rn(acc.x, v.x);
       acc.y = __fadd_rn(acc.y, v.y);
     }
-    *reinterpret_cast<__nv_bfloat162*>(p.logits + static_cast<size_t>(t) * kExperts + e) =
-        __floats2bfloat162_rn(acc.x, acc.y);
+    const __nv_bfloat162 lg = __floats2bfloat162_rn(acc.x, acc.y);
+    *reinterpret_cast<__nv_bfloat162*>(p.logits + static_cast<size_t>(t) * kExperts + e) = lg;
+    *reinterpret_cast<__nv_bfloat162*>(s_logits + e) = lg;
   }
   __syncthreads();
   if (threadIdx.x >= 32) return;
@@ -1361,7 +1382,10 @@ __global__ __launch_bounds__(kThreads, 1) void router_splitk_tail_kernel(
   q.topk_ids = p.topk_ids + static_cast<size_t>(t) * kTopK;
   const uint32_t m1[1] = {0};
   const bool v1[1] = {true};
-  topk_tokens_fast<1, false>(q, m1, v1, s_mask, s_ids);
+  const uint32_t lane = threadIdx.x;
+  const uint4 r[1][2] = {{*reinterpret_cast<const uint4*>(s_logits + 8 * lane),
+                          *reinterpret_cast<const uint4*>(s_logits + 256 + 8 * lane)}};
+  topk_tokens_fast_regs<1, false>(q, m1, v1, r, s_mask, s_ids, 0);
 }
 
 template <uint32_t kMaxM, bool kUsePDL, bool kTrace>
