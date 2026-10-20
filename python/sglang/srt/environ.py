@@ -1138,6 +1138,9 @@ class Envs:
     # loads its input, in place of the separate gate kernel (same arithmetic); 2 = also, with
     # SGLANG_Q35MF_LL16_Q1_PDL, the q1 merge releases that o_proj at entry.
     SGLANG_Q35MF_LL16_GATE_FOLD = EnvInt(0)
+    # The one-token draft qk norm launches as a programmatic dependent of the qkv GEMM (static operands load
+    # before its wait, every other load issued right after it); same outputs.
+    SGLANG_Q35MF_LL16_QKN_PDL = EnvBool(False)
     # With SGLANG_Q35MF_MKA_FUSED and SGLANG_Q35MF_MKH_HOP: the fused o_proj pushes its partial into the
     # q35 hop mailbox, so the attention output hop only consumes.
     SGLANG_Q35MF_MKA_PUSH = EnvBool(False)

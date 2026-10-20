@@ -183,6 +183,142 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
 
+@triton.jit
+def _fused_qk_rmsnorm_rope_gate_pdl_kernel(
+    q_gate_ptr,
+    k_ptr,
+    q_out_ptr,
+    k_out_ptr,
+    gate_out_ptr,
+    q_weight_ptr,
+    k_weight_ptr,
+    cos_sin_cache_ptr,
+    positions_ptr,
+    mrope_axis_map_ptr,
+    v_ptr,
+    v_cache_ptr,
+    cache_loc_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
+    stride_qg_t,
+    stride_k_t,
+    stride_qo_t,
+    stride_ko_t,
+    stride_gate_t,
+    stride_cos_t,
+    stride_pos_axis,
+    stride_v_t: tl.constexpr,
+    stride_v_cache_t: tl.constexpr,
+    NUM_Q_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    ROTARY_DIM: tl.constexpr,
+    HALF_ROTARY: tl.constexpr,
+    HEAD_BLOCK: tl.constexpr,
+    ROT_HALF_BLOCK: tl.constexpr,
+    EPS: tl.constexpr,
+    FP16: tl.constexpr,
+    HAS_PASS: tl.constexpr,
+    MROPE: tl.constexpr,
+    EARLY_TRIGGER: tl.constexpr,
+    WEIGHT_SHIFT: tl.constexpr = 1.0,
+):
+    # The kernel above with an FP8 cache and a gate, launched as a programmatic dependent of the qkv GEMM:
+    # static operands load before griddepcontrol.wait, all other loads are issued right after it; same arithmetic.
+    if EARLY_TRIGGER:
+        tl.extra.cuda.gdc_launch_dependents()
+    token = tl.program_id(0)
+    head = tl.program_id(1)
+    is_k = head >= NUM_Q_HEADS
+    local_head = tl.where(is_k, head - NUM_Q_HEADS, head)
+    out_dtype = tl.float16 if FP16 else tl.bfloat16
+    head_offs = tl.arange(0, HEAD_BLOCK)
+    head_mask = head_offs < HEAD_DIM
+    rot_offs = tl.arange(0, ROT_HALF_BLOCK)
+    rot_mask = rot_offs < HALF_ROTARY
+
+    if is_k:
+        w_ptr = k_weight_ptr
+    else:
+        w_ptr = q_weight_ptr
+    w = tl.load(w_ptr + head_offs, mask=head_mask, other=0.0).to(tl.float32)
+    wr1 = tl.load(w_ptr + rot_offs, mask=rot_mask, other=0.0).to(tl.float32)
+    wr2 = tl.load(w_ptr + HALF_ROTARY + rot_offs, mask=rot_mask, other=0.0).to(
+        tl.float32
+    )
+    # Match the cache writer's round-to-nearest reciprocal.
+    inv_k = tl.div_rn(1.0, tl.load(k_scale_ptr).to(tl.float32))
+    inv_v = tl.div_rn(1.0, tl.load(v_scale_ptr).to(tl.float32))
+    if MROPE:
+        axis = tl.load(mrope_axis_map_ptr + rot_offs, mask=rot_mask, other=0)
+
+    tl.extra.cuda.gdc_wait()
+    slot = tl.load(cache_loc_ptr + token).to(tl.int64)
+    if MROPE:
+        pos = tl.load(
+            positions_ptr + axis * stride_pos_axis + token, mask=rot_mask, other=0
+        )
+    else:
+        pos = tl.load(positions_ptr + token)
+    if is_k:
+        in_base = k_ptr + token * stride_k_t + local_head * HEAD_DIM
+        out_base = k_out_ptr + slot * stride_ko_t + local_head * HEAD_DIM
+    else:
+        in_base = q_gate_ptr + token * stride_qg_t + local_head * 2 * HEAD_DIM
+        out_base = q_out_ptr + token * stride_qo_t + local_head * HEAD_DIM
+    x = tl.load(in_base + head_offs, mask=head_mask, other=0.0).to(tl.float32)
+    xr1 = tl.load(in_base + rot_offs, mask=rot_mask, other=0.0).to(tl.float32)
+    xr2 = tl.load(in_base + HALF_ROTARY + rot_offs, mask=rot_mask, other=0.0).to(
+        tl.float32
+    )
+    value = tl.load(
+        v_ptr + token * stride_v_t + local_head * HEAD_DIM + head_offs,
+        head_mask & is_k,
+        0.0,
+    ).to(tl.float32)
+    g = tl.load(
+        in_base + HEAD_DIM + head_offs, mask=head_mask & (head < NUM_Q_HEADS), other=0.0
+    )
+    cache_off = pos.to(tl.int64) * stride_cos_t
+    cos = tl.load(
+        cos_sin_cache_ptr + cache_off + rot_offs, mask=rot_mask, other=0.0
+    ).to(tl.float32)
+    sin = tl.load(
+        cos_sin_cache_ptr + cache_off + HALF_ROTARY + rot_offs, mask=rot_mask, other=0.0
+    ).to(tl.float32)
+
+    var = tl.sum(x * x, axis=0) / HEAD_DIM
+    inv_rms = tl.rsqrt(var + EPS)
+    x_norm = (x * inv_rms * (w + WEIGHT_SHIFT)).to(out_dtype).to(tl.float32)
+
+    if HAS_PASS:
+        pass_mask = head_mask & (head_offs >= ROTARY_DIM)
+        tail = x_norm
+        if is_k:
+            tail *= inv_k
+        tl.store(out_base + head_offs, tail, mask=pass_mask)
+
+    xr1 = (xr1 * inv_rms * (wr1 + WEIGHT_SHIFT)).to(out_dtype).to(tl.float32)
+    xr2 = (xr2 * inv_rms * (wr2 + WEIGHT_SHIFT)).to(out_dtype).to(tl.float32)
+    first = xr1 * cos - xr2 * sin
+    second = xr2 * cos + xr1 * sin
+    first = first.to(out_dtype).to(tl.float32)
+    second = second.to(out_dtype).to(tl.float32)
+    if is_k:
+        first *= inv_k
+        second *= inv_k
+    tl.store(out_base + rot_offs, first, mask=rot_mask)
+    tl.store(out_base + HALF_ROTARY + rot_offs, second, mask=rot_mask)
+
+    if is_k:
+        value_out = v_cache_ptr + slot * stride_v_cache_t + local_head * HEAD_DIM
+        tl.store(value_out + head_offs, value * inv_v, head_mask)
+    else:
+        gate_out = gate_out_ptr + token * stride_gate_t + local_head * HEAD_DIM
+        tl.store(gate_out + head_offs, g, mask=head_mask)
+    if not EARLY_TRIGGER:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
 def fused_qk_gemma_rmsnorm_rope_gate(
     q_gate: torch.Tensor,
     k: torch.Tensor,
@@ -204,10 +340,13 @@ def fused_qk_gemma_rmsnorm_rope_gate(
     k_scale: Optional[torch.Tensor] = None,
     v_scale: Optional[torch.Tensor] = None,
     early_trigger: bool = False,
+    pdl_wait: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Fused QK GemmaRMSNorm + NeoX RoPE + gate deinterleave.
 
     early_trigger: release programmatic dependents at entry (they must wait before reading the outputs).
+    pdl_wait: with an FP8 cache and a gate, launch as a programmatic dependent of the producer of q_gate / k / v
+    (static operands load before the wait); same outputs.
 
     Args:
         q_gate: [T, num_q_heads * (1 + has_gate) * head_dim] — interleaved Q+Gate if has_gate
@@ -270,6 +409,46 @@ def fused_qk_gemma_rmsnorm_rope_gate(
             stride_v_cache_t=kv_cache[1].stride(0),
             FP8_CACHE=True,
         )
+    if pdl_wait and fp8_cache and has_gate and _ENABLE_PDL:
+        _fused_qk_rmsnorm_rope_gate_pdl_kernel[grid](
+            q_gate,
+            k,
+            q_out,
+            k_out,
+            gate_out,
+            q_weight,
+            k_weight,
+            cos_sin_cache,
+            positions,
+            mrope_axis_map,
+            v,
+            kv_cache[1],
+            cache_loc,
+            k_scale,
+            v_scale,
+            q_gate.stride(0),
+            k.stride(0),
+            q_out.stride(0),
+            k_out.stride(0),
+            gate_out.stride(0),
+            cos_sin_cache.stride(0),
+            positions.stride(0),
+            v.stride(0),
+            kv_cache[1].stride(0),
+            NUM_Q_HEADS=num_q_heads,
+            HEAD_DIM=head_dim,
+            ROTARY_DIM=rotary_dim,
+            HALF_ROTARY=half_rotary,
+            HEAD_BLOCK=head_block,
+            ROT_HALF_BLOCK=rot_half_block,
+            EPS=eps,
+            FP16=q_gate.dtype == torch.float16,
+            HAS_PASS=rotary_dim < head_dim,
+            MROPE=mrope,
+            EARLY_TRIGGER=early_trigger,
+            launch_pdl=True,
+        )
+        return q_out, None, gate_out
     _fused_qk_rmsnorm_rope_gate_kernel[grid](
         q_gate,
         k,
