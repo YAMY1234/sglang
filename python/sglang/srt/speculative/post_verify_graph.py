@@ -74,10 +74,23 @@ class PostVerifySamplingView(SimpleNamespace):
     """Batch sampling info inside the post-verify graph that the sharded verify sampler accepts."""
 
 
+def _sparse_verify_on() -> bool:
+    # Same-service A/B harness (measurement only): a variant may set the compact branch on or off per round.
+    from sglang.srt.model_executor.runner_backend import ab_variants
+
+    if ab_variants.enabled():
+        v = ab_variants.VARIANTS[ab_variants.current()].get(
+            "SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING"
+        )
+        if v is not None:
+            return str(v).lower() in ("1", "true")
+    return _SPARSE_VERIFY
+
+
 def sparse_verify_max_top_k(batch) -> Optional[int]:
     """Support size for eagle_sample's compact top-k sampling branch, or None for the dense
     branch. Every request must sample with a finite top-k within the compact limit."""
-    if not _SPARSE_VERIFY or batch.forward_mode.is_idle():
+    if not _sparse_verify_on() or batch.forward_mode.is_idle():
         return None
     from sglang.srt.speculative.uno_utils import _SPARSE_TOP_K_LIMIT
 
