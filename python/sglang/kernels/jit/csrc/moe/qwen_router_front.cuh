@@ -1222,6 +1222,148 @@ __global__ __launch_bounds__(kThreads, 1) void router_wide_gemm_kernel(const __g
   }
 }
 
+// Split-K router front at up to 64 tokens (numeric class: only the fp32 summation order of the logits differs from
+// cuBLAS). GEMM CTA (g, s) owns the 64 experts of group g over K slice s, one m16n8k16 chain per logit in increasing
+// K, and writes fp32 partials [kSlices][kSkMaxTokens][kExperts]. Tail CTA t sums token t's partials in increasing s,
+// rounds to bf16 and runs router_tail_dep_kernel's top-k; its NVFP4 quantization of row t needs only x, so it runs
+// before the PDL wait.
+inline constexpr uint32_t kSkGroups = 8;
+inline constexpr uint32_t kSkExperts = kExperts / kSkGroups;
+inline constexpr uint32_t kSkMaxTokens = 64;
+
+template <uint32_t kSlices>
+struct SkSmem {
+  static constexpr uint32_t kSliceK = kHidden / kSlices;
+  static constexpr uint32_t kRowBytes = kSliceK * 2 + 16;  // rows 16 B apart in bank space for ldmatrix
+  static constexpr uint32_t kW = 0;
+  static constexpr uint32_t kX = kW + kSkExperts * kRowBytes;
+  static constexpr uint32_t kBarW = kX + kSkMaxTokens * kRowBytes;
+  static constexpr uint32_t kBarX = kBarW + 8;
+  static constexpr uint32_t kBytes = kBarX + 8;
+};
+
+struct SkParams {
+  const bf16_t* x;       // [M, kHidden]
+  const bf16_t* weight;  // [kExperts, kHidden]
+  float* part;           // [kSlices, kSkMaxTokens, kExperts]
+  uint32_t num_tokens;
+};
+
+SGL_DEVICE float2 ld_produced_f2(const float* p) {
+  float2 v;
+  asm volatile("ld.global.cg.v2.f32 {%0, %1}, [%2];" : "=f"(v.x), "=f"(v.y) : "l"(p));
+  return v;
+}
+
+template <bool kUsePDL, uint32_t kSlices>
+__global__ __launch_bounds__(kThreads, 1) void router_splitk_gemm_kernel(const __grid_constant__ SkParams p) {
+  using L = SkSmem<kSlices>;
+  extern __shared__ __align__(128) uint8_t smem[];
+  const uint32_t warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+  const uint32_t M = p.num_tokens;
+  const uint32_t g = blockIdx.x % kSkGroups, s = blockIdx.x / kSkGroups;
+  const uint32_t expert0 = g * kSkExperts, k0 = s * L::kSliceK;
+  const uint32_t bar_w = smem_addr(smem + L::kBarW), bar_x = smem_addr(smem + L::kBarX);
+  if (threadIdx.x == 0) {
+    mbar_init(bar_w, 1);
+    mbar_init(bar_x, 1);
+  }
+  __syncthreads();
+  // Router weights are static: their bulk copies go out before the wait on the producer grid.
+  if (warp == 0) {
+    if (lane == 0) mbar_expect_tx(bar_w, kSkExperts * L::kSliceK * 2);
+    __syncwarp();
+    for (uint32_t e = lane; e < kSkExperts; e += 32) {
+      bulk_load(smem_addr(smem + L::kW + e * L::kRowBytes), p.weight + static_cast<size_t>(expert0 + e) * kHidden + k0,
+                L::kSliceK * 2, bar_w);
+    }
+  }
+  device::PDLWaitPrimary<kUsePDL>();
+  // Only after our own wait: the tail quantizes x before its wait.
+  device::PDLTriggerSecondary<kUsePDL>();
+  if (warp == 1) {
+    if (lane == 0) mbar_expect_tx(bar_x, M * L::kSliceK * 2);
+    __syncwarp();
+    for (uint32_t t = lane; t < M; t += 32) {
+      bulk_load(smem_addr(smem + L::kX + t * L::kRowBytes), p.x + static_cast<size_t>(t) * kHidden + k0,
+                L::kSliceK * 2, bar_x);
+    }
+  }
+  // Warp w: tokens [16 * (w / 2), +16), experts [32 * (w % 2), +32) of the group (four n8 tiles).
+  const uint32_t mg = warp >> 1, nq = warp & 1;
+  if (mg * 16 >= M) return;
+  const uint32_t j = lane >> 3, r = lane & 7;
+  const uint32_t tok = mg * 16 + (j & 1) * 8 + r;
+  const uint32_t a_addr = smem_addr(smem + L::kX + (tok < M ? tok : 0) * L::kRowBytes + (j >> 1) * 16);
+  const uint32_t b_addr0 = smem_addr(smem + L::kW + (nq * 32 + (j >> 1) * 8 + r) * L::kRowBytes + (j & 1) * 16);
+  const uint32_t b_addr1 = b_addr0 + 16 * L::kRowBytes;
+  float d[4][4] = {};
+  mbar_wait(bar_w, 0);
+  mbar_wait(bar_x, 0);
+#pragma unroll 4
+  for (uint32_t step = 0; step < L::kSliceK / 16; ++step) {
+    uint32_t a[4], b0[4], b1[4];
+    ldmatrix_x4(a, a_addr + step * 32);
+    ldmatrix_x4(b0, b_addr0 + step * 32);
+    ldmatrix_x4(b1, b_addr1 + step * 32);
+    mma_bf16_16816(d[0], a[0], a[1], a[2], a[3], b0[0], b0[1]);
+    mma_bf16_16816(d[1], a[0], a[1], a[2], a[3], b0[2], b0[3]);
+    mma_bf16_16816(d[2], a[0], a[1], a[2], a[3], b1[0], b1[1]);
+    mma_bf16_16816(d[3], a[0], a[1], a[2], a[3], b1[2], b1[3]);
+  }
+  // C fragment: d[n][0..1] = token row gr, experts 2c, 2c + 1 of n8 tile n; d[n][2..3] = token row gr + 8.
+  const uint32_t gr = lane >> 2, c = lane & 3;
+  const uint32_t t0 = mg * 16 + gr, t1 = t0 + 8;
+  float* base = p.part + static_cast<size_t>(s) * kSkMaxTokens * kExperts + expert0 + nq * 32 + 2 * c;
+#pragma unroll
+  for (uint32_t n = 0; n < 4; ++n) {
+    if (t0 < M) *reinterpret_cast<float2*>(base + t0 * kExperts + n * 8) = make_float2(d[n][0], d[n][1]);
+    if (t1 < M) *reinterpret_cast<float2*>(base + t1 * kExperts + n * 8) = make_float2(d[n][2], d[n][3]);
+  }
+}
+
+template <bool kUsePDL, uint32_t kSlices>
+__global__ __launch_bounds__(kThreads, 1) void router_splitk_tail_kernel(
+    const __grid_constant__ Params p, const float* __restrict__ part) {
+  __shared__ uint32_t s_mask[kExperts];
+  __shared__ int16_t s_ids[kMaxTokens * kTopK];
+  const uint32_t t = blockIdx.x;
+  {
+    const uint32_t qk = (threadIdx.x / 32) * kKPerWarp + (threadIdx.x % 32) * kKPerLane;
+    const U32x8 v = ld_produced32(p.x + static_cast<size_t>(t) * kHidden + qk);
+    uint32_t sf;
+    uint2 packed;
+    quantize_block(v.lo, v.hi, p.global_scale[0], sf, packed);
+    const uint32_t blk = qk / kSfVec;
+    *reinterpret_cast<uint2*>(p.x_fp4 + static_cast<size_t>(t) * (kHidden / 2) + blk * 8) = packed;
+    p.x_sf[static_cast<size_t>(t) * kBlocksPerRow + blk] = static_cast<uint8_t>(sf);
+  }
+  device::PDLWaitPrimary<kUsePDL>();
+  device::PDLTriggerSecondary<kUsePDL>();
+  {
+    const uint32_t e = 2 * threadIdx.x;
+    const float* src = part + static_cast<size_t>(t) * kExperts + e;
+    float2 acc = ld_produced_f2(src);
+#pragma unroll
+    for (uint32_t s = 1; s < kSlices; ++s) {
+      const float2 v = ld_produced_f2(src + static_cast<size_t>(s) * kSkMaxTokens * kExperts);
+      acc.x = __fadd_rn(acc.x, v.x);
+      acc.y = __fadd_rn(acc.y, v.y);
+    }
+    *reinterpret_cast<__nv_bfloat162*>(p.logits + static_cast<size_t>(t) * kExperts + e) =
+        __floats2bfloat162_rn(acc.x, acc.y);
+  }
+  __syncthreads();
+  if (threadIdx.x >= 32) return;
+  Params q = p;
+  q.logits = p.logits + static_cast<size_t>(t) * kExperts;
+  q.topk_weights = p.topk_weights + static_cast<size_t>(t) * kTopK;
+  q.topk_ids = p.topk_ids + static_cast<size_t>(t) * kTopK;
+  const uint32_t m1[1] = {0};
+  const bool v1[1] = {true};
+  topk_tokens_fast<1, false>(q, m1, v1, s_mask, s_ids);
+}
+
 template <uint32_t kMaxM, bool kUsePDL, bool kTrace>
 struct RouterFrontKernel {
   static void
@@ -1538,6 +1680,57 @@ struct RouterFrontKernel {
     LaunchKernel(grid, kThreads, device.unwrap()).enable_pdl(kUsePDL)(router_tail_dep_kernel<kUsePDL>, params);
   }
 
+  /// \brief Split-K router GEMM + fp32 partial reduction, softmax top-k and NVFP4 input quantization (M <= 64).
+  static void run_splitk(
+      const tvm::ffi::TensorView x,
+      const tvm::ffi::TensorView weight,
+      const tvm::ffi::TensorView global_scale,
+      const tvm::ffi::TensorView part,
+      const tvm::ffi::TensorView logits,
+      const tvm::ffi::TensorView topk_weights,
+      const tvm::ffi::TensorView topk_ids,
+      const tvm::ffi::TensorView x_fp4,
+      const tvm::ffi::TensorView x_sf,
+      int64_t slices) {
+    using namespace host;
+    auto M_ = SymbolicSize{"num_tokens"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    TensorMatcher({M_, kHidden}).with_dtype<bf16_t>().with_device(device).ensure_alignment(32).verify(x);
+    TensorMatcher({kExperts, kHidden}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(weight);
+    TensorMatcher({1}).with_dtype<fp32_t>().with_device(device).verify(global_scale);
+    TensorMatcher({16 * kSkMaxTokens * kExperts}).with_dtype<fp32_t>().with_device(device).ensure_alignment(16).verify(part);
+    TensorMatcher({M_, kExperts}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(logits);
+    TensorMatcher({M_, kTopK}).with_dtype<fp32_t>().with_device(device).verify(topk_weights);
+    TensorMatcher({M_, kTopK}).with_dtype<int32_t>().with_device(device).verify(topk_ids);
+    TensorMatcher({M_, kHidden / 2}).with_dtype<uint8_t>().with_device(device).ensure_alignment(8).verify(x_fp4);
+    TensorMatcher({M_, kBlocksPerRow}).with_dtype<uint8_t>().with_device(device).verify(x_sf);
+    const auto M = static_cast<uint32_t>(M_.unwrap());
+    CHECK_HOST(M <= kSkMaxTokens) << "router_splitk: num_tokens " << M << " exceeds " << kSkMaxTokens;
+    CHECK_HOST(slices == 8 || slices == 16) << "router_splitk: slices " << slices;
+    if (M == 0) return;
+    SkParams gp{};
+    gp.x = static_cast<const bf16_t*>(x.data_ptr());
+    gp.weight = static_cast<const bf16_t*>(weight.data_ptr());
+    gp.part = static_cast<float*>(part.data_ptr());
+    gp.num_tokens = M;
+    Params tp{};
+    tp.x = gp.x;
+    tp.global_scale = static_cast<const float*>(global_scale.data_ptr());
+    tp.logits = static_cast<bf16_t*>(logits.data_ptr());
+    tp.topk_weights = static_cast<float*>(topk_weights.data_ptr());
+    tp.topk_ids = static_cast<int32_t*>(topk_ids.data_ptr());
+    tp.x_fp4 = static_cast<uint8_t*>(x_fp4.data_ptr());
+    tp.x_sf = static_cast<uint8_t*>(x_sf.data_ptr());
+    tp.num_tokens = M;
+    tp.mode = kModeQuant | kModeTopk;
+    if (slices == 8) {
+      launch_splitk<8>(gp, tp, device.unwrap());
+    } else {
+      launch_splitk<16>(gp, tp, device.unwrap());
+    }
+  }
+
   /// \brief run_gemm plus the shared-expert gate/up projection (static per-tensor FP8) in the same launch.
   static void run_gemm_shared(
       const tvm::ffi::TensorView x,
@@ -1588,6 +1781,22 @@ struct RouterFrontKernel {
   }
 
  private:
+  template <uint32_t kSlices>
+  static void launch_splitk(const SkParams& gp, const Params& tp, DLDevice device) {
+    using namespace host;
+    constexpr uint32_t kSmem = SkSmem<kSlices>::kBytes;
+    static const bool smem_attr_set = [] {
+      CHECK_CUDA(cudaFuncSetAttribute(
+          router_splitk_gemm_kernel<kUsePDL, kSlices>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
+      return true;
+    }();
+    (void)smem_attr_set;
+    LaunchKernel(kSkGroups * kSlices, kThreads, device, kSmem)
+        .enable_pdl(kUsePDL)(router_splitk_gemm_kernel<kUsePDL, kSlices>, gp);
+    LaunchKernel(tp.num_tokens, kThreads, device)
+        .enable_pdl(kUsePDL)(router_splitk_tail_kernel<kUsePDL, kSlices>, tp, static_cast<const float*>(gp.part));
+  }
+
   template <uint32_t kSplit>
   static void launch_wide(const WideParams& params, DLDevice device) {
     using namespace host;

@@ -1038,6 +1038,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
         if defer_finalize and num_tokens == 0:
             raise RuntimeError("Qwen deferred finalize does not support M=0")
+        if not self.is_nextn:
+            qwen_router_front.krne_dump(self.layer_id, hidden_states)
 
         draft_moe = self._single_token_draft_moe
         if (
