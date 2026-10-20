@@ -22,6 +22,7 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
 )
 from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
 from sglang.srt.environ import envs
+from sglang.srt.layers import q35_krnc_proof
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.gdn_prefill_graph import (
     GDNPrefillGraphMetadata,
@@ -2092,7 +2093,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         if wait_for_gate_producer:
             verify_options["wait_for_gate_producer"] = True
-        gdn_replayssm_spec_decode(
+        if verify_options.get("pdl") and envs.SGLANG_Q35MF_KRNC_H0_PF.get():
+            verify_options["prefetch_h0"] = True
+            print_info_once(
+                "SGLANG_Q35MF_KRNC_H0_PF engaged: "
+                f"batch={query_start_loc.numel() - 1}, value_heads={HV}"
+            )
+        spec_kwargs = dict(
             q=q,
             k=k,
             v=v,
@@ -2129,7 +2136,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # Capacity folds are committed once across every GDN layer after
             # acceptance; the active path is therefore a single launch/layer.
             launch_mode="verify",
-            **verify_options,
         )
+        gdn_replayssm_spec_decode(**spec_kwargs, **verify_options)
+        proof = q35_krnc_proof.active() if verify_options.get("prefetch_h0") else None
+        if proof is not None:
+            # Stock launch on the same inputs; it rewrites the same ring rows with the same values.
+            ref = torch.empty_like(out)
+            gdn_replayssm_spec_decode(
+                **{**spec_kwargs, "out": ref}, **{**verify_options, "prefetch_h0": False}
+            )
+            proof.check("h0_pf", out.view(out.shape[0], -1), ref.view(ref.shape[0], -1))
         # Match the recurrent target_verify output shape (== value.shape).
         return out.reshape(value.shape)

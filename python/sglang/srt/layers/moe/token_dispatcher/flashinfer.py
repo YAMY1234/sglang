@@ -66,6 +66,7 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 _l2_prefetch_logged = False
+_l2_prefetch_ll_logged = False
 
 # FlashInfer keys MNNVL allocations by workspace size; aligned tail padding gives
 # concurrently live paths distinct persistent workspaces without extra token work.
@@ -595,6 +596,8 @@ class FlashinferDispatcher(BaseDispatcher):
         tmax = self.runtime_max_tokens_per_rank
         partial = hidden_states.view(self.ep_size * tmax, hidden_states.shape[-1])
         # No SGLANG_Q35MF_DEP_L2_PREFETCH fork here: joined right after this short combine, it stalls the stream.
+        if self.l2_prefetch_modules and envs.SGLANG_Q35MF_KRNC_L2PF_LL.get():
+            self._fork_l2_prefetch_deferred()
         out = self.ll_a2a.combine(partial=partial, ids=topk_ids, tmax=tmax)
         if check is not None:
             check.combine(
@@ -646,6 +649,22 @@ class FlashinferDispatcher(BaseDispatcher):
         del self.runtime_max_tokens_per_rank
         del self.active_moe_a2a
         return hidden_states
+
+    def _fork_l2_prefetch_deferred(self) -> None:
+        # Joined once at the end of the target forward (Qwen3_5 model), never next to the combine.
+        from sglang.kernels.ops.gemm.qwen_l2_prefetch import l2_prefetch_deferred
+
+        l2_prefetch_deferred([m.weight for m in self.l2_prefetch_modules], tag="ll_next")
+        global _l2_prefetch_ll_logged
+        if not _l2_prefetch_ll_logged:
+            _l2_prefetch_ll_logged = True
+            weight = self.l2_prefetch_modules[0].weight
+            logger.info(
+                "SGLANG_Q35MF_KRNC_L2PF_LL engaged: %s %s, %d bytes",
+                tuple(weight.shape),
+                weight.dtype,
+                weight.numel() * weight.element_size(),
+            )
 
     def _fork_l2_prefetch(self) -> Optional[torch.cuda.Stream]:
         """Launch the L2 prefetch of the next layer's first projection weights on a side stream, so it overlaps the

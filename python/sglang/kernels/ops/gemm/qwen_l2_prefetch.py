@@ -36,3 +36,30 @@ def l2_prefetch_stream() -> torch.cuda.Stream:
     if _side_stream is None:
         _side_stream = torch.cuda.Stream()
     return _side_stream
+
+
+# Side streams by tag (SGLANG_Q35MF_KRNC_L2PF_LL / _OPROJ_PF) and the tags forked since the last join.
+_deferred: dict = {}
+_pending: set = set()
+
+
+def l2_prefetch_deferred(tensors, tag: str, ctas: int = 148) -> None:
+    """Prefetch tensors into L2 on the tag's side stream after the work already queued on the current stream, and
+    leave it unjoined: l2_prefetch_join_deferred() at the end of the forward joins it, so no kernel waits on it."""
+    side = _deferred.get(tag)
+    if side is None:
+        side = _deferred[tag] = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for tensor in tensors:
+            l2_prefetch(tensor, ctas)
+    _pending.add(tag)
+
+
+def l2_prefetch_join_deferred() -> None:
+    """Join every side stream forked by l2_prefetch_deferred since the last join (a CUDA graph capture must end with
+    all forked streams joined)."""
+    current = torch.cuda.current_stream()
+    for tag in sorted(_pending):
+        current.wait_stream(_deferred[tag])
+    _pending.clear()

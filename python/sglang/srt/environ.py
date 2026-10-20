@@ -1307,6 +1307,17 @@ class Envs:
     # FlashInfer A2A MoE: while the combine waits on the other ranks, prefetch the next layer's first projection
     # weights into L2 from a side stream (no math change; the dispatcher joins the side stream after the combine).
     SGLANG_Q35MF_DEP_L2_PREFETCH = EnvBool(False)
+    # SGLANG_Q35MF_E2X_LLA2A path: the same next-layer prefetch, forked before the short LL combine and joined only at
+    # the end of the target forward, so no kernel waits on it (read at capture).
+    SGLANG_Q35MF_KRNC_L2PF_LL = EnvBool(False)
+    # GDN target verify: L2-prefetch out_proj's weight from a side stream forked after in_proj, joined at the end of
+    # the target forward (read at capture).
+    SGLANG_Q35MF_KRNC_OPROJ_PF = EnvBool(False)
+    # GDN ReplaySSM verify: each program L2-prefetches its checkpoint rows before the PDL wait on the convolution
+    # (read at capture).
+    SGLANG_Q35MF_KRNC_H0_PF = EnvBool(False)
+    # In-graph shadow checks for the three switches above: rows whose outputs differ in any byte, logged every 30 s.
+    SGLANG_Q35MF_KRNC_PROOF = EnvBool(False)
     # FlashInfer A2A NVFP4 dispatch of target MoE layers at up to SGLANG_Q35MF_E2X_LLA2A_MAX_TOKENS tokens per rank:
     # one fence-free exchange kernel each way instead of MoeAlltoAll (same rows at fixed slots, same combine bits).
     SGLANG_Q35MF_E2X_LLA2A = EnvBool(False)

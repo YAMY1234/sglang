@@ -112,6 +112,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.layers import q35_bundle_proof
+from sglang.srt.layers import q35_krnc_proof
 from sglang.srt.model_executor.runner_backend import ab_variants
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import (
@@ -388,6 +389,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         super().__init__()
         self.config = config
         q35_bundle_proof.maybe_init()
+        q35_krnc_proof.maybe_init()
         parallel_group = linear_attn_parallel_group()
         self.attn_tp_rank, self.attn_tp_size = resolve_linear_parallel_group(
             parallel_group
@@ -1357,6 +1359,36 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
         return self.out_proj(x_fp8)[0]
 
+    def _krnc_in_proj_proof(self, hidden_states, projected_states_qkvz) -> None:
+        # SGLANG_Q35MF_KRNC_PROOF: rerun in_proj on the same input after the L2PF_LL prefetch, compare bytes.
+        proof = (
+            q35_krnc_proof.active() if envs.SGLANG_Q35MF_KRNC_L2PF_LL.get() else None
+        )
+        if proof is None or not isinstance(hidden_states, torch.Tensor):
+            return
+        ref, _ = self.in_proj_qkvz(hidden_states)
+        proof.check("in_proj", projected_states_qkvz, ref)
+
+    def _krnc_out_proj(self, fp8: torch.Tensor) -> torch.Tensor:
+        out = self.out_proj(fp8)[0]
+        proof = (
+            q35_krnc_proof.active() if envs.SGLANG_Q35MF_KRNC_OPROJ_PF.get() else None
+        )
+        if proof is not None:
+            proof.check("out_proj", out, self.out_proj(fp8)[0])
+        return out
+
+    def _fork_out_proj_prefetch(self) -> None:
+        # Starts after in_proj on the current stream, overlaps the latency-bound conv / verify / norm;
+        # joined once at the end of the target forward, so out_proj never waits on it.
+        from sglang.kernels.ops.gemm.qwen_l2_prefetch import l2_prefetch_deferred
+
+        l2_prefetch_deferred([self.out_proj.weight], tag="gdn_out_proj")
+        print_info_once(
+            "SGLANG_Q35MF_KRNC_OPROJ_PF engaged: out_proj %s %s"
+            % (tuple(self.out_proj.weight.shape), self.out_proj.weight.dtype)
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1375,6 +1407,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
             hidden_states
         )
+        if forward_batch.forward_mode.is_target_verify():
+            self._krnc_in_proj_proof(hidden_states, projected_states_qkvz)
+            if envs.SGLANG_Q35MF_KRNC_OPROJ_PF.get():
+                self._fork_out_proj_prefetch()
         middle_backend = (
             self._middle_verify_backend(
                 hidden_states, projected_states_qkvz, projected_states_ba, forward_batch
@@ -1594,7 +1630,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                         input_scale=self.out_proj.input_scale,
                         weight_scale=self.out_proj.weight_scale,
                     )
-                return self.out_proj(fp8)[0]
+                return self._krnc_out_proj(fp8)
             print_warning_once(
                 "GDN static FP8 norm is unsupported; using the original path"
             )
@@ -2754,6 +2790,16 @@ class Qwen3_5ForCausalLM(nn.Module):
                     forward_batch,
                     input_deepstack_embeds[:, sep : sep + self.hidden_size],
                 )
+
+        if (
+            envs.SGLANG_Q35MF_KRNC_L2PF_LL.get()
+            or envs.SGLANG_Q35MF_KRNC_OPROJ_PF.get()
+        ):
+            from sglang.kernels.ops.gemm.qwen_l2_prefetch import (
+                l2_prefetch_join_deferred,
+            )
+
+            l2_prefetch_join_deferred()
 
         if not self.pp_group.is_last_rank:
             return residual_batch.to_pp(hidden_states, forward_batch)

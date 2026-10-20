@@ -52,6 +52,19 @@ _IS_GFX95 = is_gfx95_supported()
 
 
 @triton.jit
+def _prefetch_l2_lines(ptrs):
+    # One L2 prefetch per pointer; no data is returned and no value changes.
+    tl.inline_asm_elementwise(
+        "prefetch.global.L2 [$1];\n\tmov.u32 $0, 0;",
+        "=r,l",
+        [ptrs.to(tl.int64)],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
 def gdn_replayssm_spec_circular_kernel(
     q,  # [total_tokens, H, K]
     k,  # [total_tokens, H, K]
@@ -113,6 +126,7 @@ def gdn_replayssm_spec_circular_kernel(
     DOT_PRECISION: tl.constexpr,
     USE_GDC: tl.constexpr = False,
     WAIT_FOR_GATE_PRODUCER: tl.constexpr = False,
+    PREFETCH_H0: tl.constexpr = False,
 ):
     i_v = tl.program_id(0)
     i_n = tl.program_id(1)
@@ -170,6 +184,20 @@ def gdn_replayssm_spec_circular_kernel(
             if USE_GDC:
                 tl.extra.cuda.gdc_wait()
             return
+
+    if PREFETCH_H0 and not IS_FLUSH:
+        # SGLANG_Q35MF_KRNC_H0_PF: pull this program's checkpoint rows into L2 while the PDL wait
+        # on the convolution is still pending; the K loop below reads the same bytes.
+        LINE: tl.constexpr = 32 if STATE_FP32 else 64
+        o_line = tl.arange(0, K // LINE) * LINE
+        o_v_pf = tl.where(mask_v, o_v, 0)
+        _prefetch_l2_lines(
+            h0
+            + state_idx * stride_state_slot
+            + i_hv * V * K
+            + o_v_pf[:, None] * K
+            + o_line[None, :]
+        )
 
     b_write_pos = tl.load(write_pos + replay_idx).to(tl.int64)
     b_cache_base = tl.load(cache_base + replay_idx).to(tl.int32)
@@ -1106,6 +1134,7 @@ def _launch_gdn_spec(
     pdl=False,
     wait_for_gate_producer=False,
     maxnreg=None,
+    prefetch_h0=False,
 ):
     num_slots, HV, V, K = checkpoint_state.shape
     H = k.shape[1]
@@ -1154,6 +1183,12 @@ def _launch_gdn_spec(
         solve_options.update(USE_GDC=True, launch_pdl=True)
         if wait_for_gate_producer and kernel is gdn_replayssm_spec_circular_kernel:
             solve_options["WAIT_FOR_GATE_PRODUCER"] = True
+    if (
+        prefetch_h0
+        and kernel is gdn_replayssm_spec_circular_kernel
+        and not is_flush_kernel
+    ):
+        solve_options["PREFETCH_H0"] = True
     if maxnreg is not None:
         solve_options["maxnreg"] = maxnreg
     grid = (triton.cdiv(V, BV), B, HV)
@@ -1327,6 +1362,7 @@ def gdn_replayssm_spec_decode(
     pdl: bool = False,
     wait_for_gate_producer: bool = False,
     maxnreg: int | None = None,
+    prefetch_h0: bool = False,
 ):
     """GDN cached speculative-decode on a CIRCULAR ring cache (split-qkv varlen).
 
@@ -1424,6 +1460,7 @@ def gdn_replayssm_spec_decode(
             pdl,
             wait_for_gate_producer,
             maxnreg,
+            prefetch_h0=prefetch_h0,
         )
     if launch_mode in ("both", "flush"):
         _launch_gdn_spec(
