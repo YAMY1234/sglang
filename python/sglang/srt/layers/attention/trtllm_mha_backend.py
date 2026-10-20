@@ -13,6 +13,7 @@ Sliding window and attention sink features are supported.
 """
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -83,6 +84,8 @@ logger = logging.getLogger(__name__)
 # shared by request length (measured on GB300 TP2; equal shares win at 1-2 requests).
 _Q1_MAX_BATCH = 8
 _Q1_BALANCED_MIN_BATCH = 3
+# SGLANG_Q35MF_TP2_SKV2_DUMP: calls saved per dumped layer (arbitrary).
+_Q16_DUMP_CALLS = 4
 _KDENSE_META_BRANCH = envs.SGLANG_Q35MF_KDENSE_DRAFT_META_BRANCH.get()
 
 if is_flashinfer_available():
@@ -394,6 +397,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self._q1_plans = {}
         self._q16_device = torch.cuda.get_device_capability()[0] == 10
         self._q16_plans = {}
+        self._q16_dump_calls = {}
 
         # Init backend (XQA or TRTLLM-GEN)
         # We need to specify q_type and out_type for different backend
@@ -1501,30 +1505,37 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             skv2_q16_verify,
         )
 
+        bs = seq_lens.numel()
+        # 148 // B splits per request, 128-column merge tiles: the configuration measured in T1.
+        splits = 148 // bs
+        if envs.SGLANG_Q35MF_TP2_SKV2_MAX_SPLITS.get() > 0:
+            splits = min(splits, envs.SGLANG_Q35MF_TP2_SKV2_MAX_SPLITS.get())
         key = (
             query.shape,
             kv_cache[0].shape,
             block_tables.shape,
             block_tables.stride(),
             seq_lens.shape,
+            splits,
         )
         plan = self._q16_plans.get(key)
         if plan is None:
             # Compiles the producer; graph warmup runs this eagerly before capture.
-            # 148 // B splits per request, 128-column merge tiles: the configuration measured in T1.
-            bs = seq_lens.numel()
             plan = Q16SplitPlan(
                 query,
                 kv_cache,
                 block_tables,
                 seq_lens,
-                splits=148 // bs,
+                splits=splits,
                 merge_tile=128,
                 merge_warps=4,
             )
             self._q16_plans[key] = plan
             logger.info(
-                "TP2 SKV2-Q16 verify active (bs=%d, splits=%d)", bs, plan.splits
+                "TP2 SKV2-Q16 verify active (bs=%d, splits=%d, partials=%s)",
+                bs,
+                plan.splits,
+                plan.partial.dtype,
             )
         return skv2_q16_verify(
             query,
@@ -1535,6 +1546,125 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             qk_scale=qk_scale,
             v_scale=v_scale,
             out=out,
+        )
+
+    def _q16_supported(
+        self,
+        query,
+        kv_cache,
+        block_tables,
+        seq_lens,
+        *,
+        q_len_per_req,
+        out,
+        out_dtype,
+        bmm1_scale,
+        bmm2_scale,
+        window_left,
+        sinks,
+        mask,
+        kv_cache_sf,
+    ) -> bool:
+        return (
+            not self.is_xqa_impl
+            and get_parallel().attn_dcp_size == 1
+            and self.page_size == 64
+            and q_len_per_req == 7
+            and query.shape == (seq_lens.numel() * 7, 16, 256)
+            and query.dtype == torch.float8_e4m3fn
+            and query.is_contiguous()
+            and isinstance(kv_cache, tuple)
+            and len(kv_cache) == 2
+            and all(
+                x.dtype == query.dtype
+                and x.ndim == 4
+                and x.shape[1:] == (1, 64, 256)
+                and x.is_contiguous()
+                for x in kv_cache
+            )
+            and block_tables.dtype == torch.int32
+            and seq_lens.dtype == torch.int32
+            and out_dtype == torch.bfloat16
+            and (
+                out is None
+                or (
+                    out.is_contiguous()
+                    and out.shape == query.shape
+                    and out.dtype == out_dtype
+                )
+            )
+            and isinstance(bmm1_scale, (int, float))
+            and isinstance(bmm2_scale, (int, float))
+            and window_left < 0
+            and sinks is None
+            and mask is None
+            and kv_cache_sf is None
+            and envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get()
+            in (None, 0.0)
+        )
+
+    def _dump_q16_inputs(
+        self,
+        dump_dir,
+        *,
+        layer_id,
+        query,
+        kv_cache,
+        block_tables,
+        seq_lens,
+        bmm1_scale,
+        bmm2_scale,
+    ):
+        """Save one eager target-verify input set for offline T1 (first, middle and last full-attention layer,
+        _Q16_DUMP_CALLS calls each); only the KV pages the block table references, with the table remapped."""
+        pool = self.token_to_kv_pool
+        if isinstance(pool, HybridLinearKVPool):
+            layer_ids = sorted(pool.full_attention_layer_id_mapping)
+        else:
+            layer_ids = list(range(pool.start_layer, pool.start_layer + pool.layer_num))
+        dumped = (layer_ids[0], layer_ids[len(layer_ids) // 2], layer_ids[-1])
+        calls = self._q16_dump_calls.get(layer_id, 0)
+        min_len = envs.SGLANG_Q35MF_TP2_SKV2_DUMP_MIN_LEN.get()
+        if (
+            layer_id not in dumped
+            or calls >= _Q16_DUMP_CALLS
+            or int(seq_lens.max()) < min_len
+        ):
+            return
+        num_pages = (seq_lens.long() + 63) // 64
+        columns = torch.arange(block_tables.shape[1], device=block_tables.device)
+        used = columns[None, :] < num_pages[:, None]
+        pages, remapped = torch.unique(block_tables[used], return_inverse=True)
+        table = torch.zeros(
+            (seq_lens.numel(), int(num_pages.max())),
+            dtype=torch.int32,
+            device=block_tables.device,
+        )
+        table[used[:, : table.shape[1]]] = remapped.to(torch.int32)
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        path = os.path.join(dump_dir, f"rank{rank}", f"L{layer_id}-call{calls}.pt")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        torch.save(
+            {
+                "q": query.cpu(),
+                "k_pages": kv_cache[0][pages].cpu(),
+                "v_pages": kv_cache[1][pages].cpu(),
+                "block_tables": table.cpu(),
+                "seq_lens": seq_lens.cpu(),
+                "bmm1_scale": float(bmm1_scale),
+                "bmm2_scale": float(bmm2_scale),
+                "max_context_len": self.max_context_len,
+                "layer_id": layer_id,
+            },
+            path,
+        )
+        self._q16_dump_calls[layer_id] = calls + 1
+        logger.info(
+            "TP2 SKV2-Q16 dump %s (bs=%d, max_len=%d, pages=%d)",
+            path,
+            seq_lens.numel(),
+            int(seq_lens.max()),
+            pages.numel(),
         )
 
     def _run_fixed_q_len_decode(
@@ -1569,42 +1699,20 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         if use_q16 and self._q16_device and envs.SGLANG_Q35MF_TP2_SKV2.get():
             num_requests = seq_lens.numel()
-            supported = (
-                not self.is_xqa_impl
-                and get_parallel().attn_dcp_size == 1
-                and self.page_size == 64
-                and q_len_per_req == 7
-                and query.shape == (num_requests * 7, 16, 256)
-                and query.dtype == torch.float8_e4m3fn
-                and query.is_contiguous()
-                and isinstance(kv_cache, tuple)
-                and len(kv_cache) == 2
-                and all(
-                    x.dtype == query.dtype
-                    and x.ndim == 4
-                    and x.shape[1:] == (1, 64, 256)
-                    and x.is_contiguous()
-                    for x in kv_cache
-                )
-                and block_tables.dtype == torch.int32
-                and seq_lens.dtype == torch.int32
-                and resolved_out_dtype == torch.bfloat16
-                and (
-                    out is None
-                    or (
-                        out.is_contiguous()
-                        and out.shape == query.shape
-                        and out.dtype == resolved_out_dtype
-                    )
-                )
-                and isinstance(bmm1_scale, (int, float))
-                and isinstance(bmm2_scale, (int, float))
-                and window_left < 0
-                and sinks is None
-                and mask is None
-                and kv_cache_sf is None
-                and envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get()
-                in (None, 0.0)
+            supported = self._q16_supported(
+                query,
+                kv_cache,
+                block_tables,
+                seq_lens,
+                q_len_per_req=q_len_per_req,
+                out=out,
+                out_dtype=resolved_out_dtype,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+                window_left=window_left,
+                sinks=sinks,
+                mask=mask,
+                kv_cache_sf=kv_cache_sf,
             )
             if supported and num_requests <= envs.SGLANG_Q35MF_TP2_SKV2_MAX_B.get():
                 if out is None:
@@ -2223,6 +2331,39 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     if self.forward_metadata.max_seq_len_q > 1
                     else None
                 )
+                dump_dir = envs.SGLANG_Q35MF_TP2_SKV2_DUMP.get()
+                if (
+                    dump_dir is not None
+                    and forward_batch.forward_mode.is_target_verify()
+                    and not torch.cuda.is_current_stream_capturing()
+                    and forward_batch.batch_size
+                    <= envs.SGLANG_Q35MF_TP2_SKV2_MAX_B.get()
+                    and self._q16_supported(
+                        q,
+                        kv_cache,
+                        page_table,
+                        self.forward_metadata.cache_seqlens_int32,
+                        q_len_per_req=self.forward_metadata.max_seq_len_q,
+                        out=native_out,
+                        out_dtype=None if uses_native_fp4 else self.q_data_type,
+                        bmm1_scale=bmm1_scale,
+                        bmm2_scale=bmm2_scale,
+                        window_left=layer.sliding_window_size,
+                        sinks=attention_sink,
+                        mask=mask,
+                        kv_cache_sf=kv_cache_block_scales,
+                    )
+                ):
+                    self._dump_q16_inputs(
+                        dump_dir,
+                        layer_id=layer.layer_id,
+                        query=q,
+                        kv_cache=kv_cache,
+                        block_tables=page_table,
+                        seq_lens=self.forward_metadata.cache_seqlens_int32,
+                        bmm1_scale=bmm1_scale,
+                        bmm2_scale=bmm2_scale,
+                    )
                 o = self._run_fixed_q_len_decode(
                     q,
                     kv_cache,

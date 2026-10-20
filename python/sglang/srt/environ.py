@@ -1148,6 +1148,12 @@ class Envs:
     # up to MAX_B requests; both are read per call, so A/B graph variants can switch them.
     SGLANG_Q35MF_TP2_SKV2 = EnvBool(False)
     SGLANG_Q35MF_TP2_SKV2_MAX_B = EnvInt(3)
+    # Splits per request for that producer (0: 148 // B), read per call.
+    SGLANG_Q35MF_TP2_SKV2_MAX_SPLITS = EnvInt(0)
+    # Debug: directory for eager target-verify inputs that pass the q16 gate (q, the referenced FP8 KV pages, a
+    # remapped block table, lengths, BMM scales) from requests of at least DUMP_MIN_LEN tokens; read per call.
+    SGLANG_Q35MF_TP2_SKV2_DUMP = EnvStr(None)
+    SGLANG_Q35MF_TP2_SKV2_DUMP_MIN_LEN = EnvInt(100000)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
 
     # ===================================================================
