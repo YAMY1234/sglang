@@ -289,6 +289,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self.tp_size = get_parallel().tp_size
         self.layer_id = layer_id
         self.alt_stream = alt_stream
+        # SGLANG_Q35MF_DEP_MOE_EXIT: set by the model when the next layer's input norm takes this layer's exit;
+        # the gate computed beside the shared expert, and (final, shared, gate, moe input, gate weight) for that norm.
+        self.moe_exit_wired = False
+        self._exit_gate: Optional[torch.Tensor] = None
+        self._exit_pending: Optional[tuple] = None
         if self.tp_size > config.num_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
@@ -851,6 +856,24 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             topk_output = self._append_shared_to_topk_output(topk_output, hidden_states)
         return self.experts(hidden_states, topk_output)
 
+    def _moe_exit_armed(self) -> bool:
+        return (
+            self.moe_exit_wired
+            and not self.reduce_results
+            and envs.SGLANG_Q35MF_DEP_MOE_EXIT.get()
+        )
+
+    def take_exit(self, x: torch.Tensor) -> Optional[tuple]:
+        """The pending (final, shared, gate, moe input, gate weight) whose gated add is still owed to `x`, or None."""
+        pending, self._exit_pending = self._exit_pending, None
+        if pending is None:
+            return None
+        if pending[0].data_ptr() != x.data_ptr() or pending[0].shape != x.shape:
+            raise RuntimeError(
+                "SGLANG_Q35MF_DEP_MOE_EXIT: the next norm got a tensor other than this layer's MoE output"
+            )
+        return pending
+
     def _gate_shared_output_out_of_place(
         self,
         hidden_states: torch.Tensor,
@@ -975,6 +998,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             if self.shared_expert is not None
             else None
         )
+        if shared_output is not None and use_fused_gate and self._moe_exit_armed():
+            from sglang.kernels.ops.elementwise.qwen_dep_moe_exit import moe_exit_gate
+
+            # Off the critical path: the main stream waits for the routed path next.
+            self._exit_gate = moe_exit_gate(
+                hidden_states, self.shared_expert_gate.weight.view(-1)
+            )
 
         # ===== TO BE REFACTORED ====
         # Shared-add overlap (SGLANG_OPT_LORA_SHARED_ADD_OVERLAP): hand the add to the LoRA
@@ -1133,7 +1163,17 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
 
         if shared_output is not None:
-            if use_fused_gate:
+            if use_fused_gate and self._exit_gate is not None:
+                gate, self._exit_gate = self._exit_gate, None
+                # The next layer's input norm applies the gated add (take_exit).
+                self._exit_pending = (
+                    final_hidden_states,
+                    shared_output,
+                    gate,
+                    hidden_states,
+                    self.shared_expert_gate.weight.squeeze(),
+                )
+            elif use_fused_gate:
                 fused_gate_sigmoid_mul_add(
                     hidden_states,
                     self.shared_expert_gate.weight.squeeze(),
