@@ -468,9 +468,10 @@ class Q16SplitDecode:
                                             need = cutlass.Boolean(True)
                                     if cutlass.const_expr(self.mode & 1):
                                         need = cutlass.Boolean(False)
+                                    # Take every bo completion in order (block it waits for P V of block it - 1), so the
+                                    # parity wait can never alias a completion two phases away.
+                                    cute.arch.mbarrier_wait(bo, phase=(it - 1) % 2)
                                     if cute.arch.vote_any_sync(need):
-                                        # The previous block's P V must have landed before the rescale.
-                                        cute.arch.mbarrier_wait(bo, phase=(it - 1) % 2)
                                         for h in cutlass.range_constexpr(128 // half):
                                             o_sub = cute.local_tile(o_plane, (128, half), (0, h))
                                             load_o = tcgen05.make_tmem_copy(ld_half, o_sub).get_slice(row)
@@ -494,9 +495,7 @@ class Q16SplitDecode:
                                                 trace[5 * 16 + it] = cute.arch.clock64()
                                 cute.arch.mbarrier_arrive(bp + slot)
                     if nblk > 0:
-                        # bo completes once per block; take the last two completions in order.
-                        if nblk > 1:
-                            cute.arch.mbarrier_wait(bo, phase=(nblk - 2) % 2)
+                        # Completions 0 .. nblk - 2 were taken in the loop; only the last block's P V is left.
                         cute.arch.mbarrier_wait(bo, phase=(nblk - 1) % 2)
                         if cutlass.const_expr(self.trace):
                             if traced:
