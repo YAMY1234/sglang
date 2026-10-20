@@ -27,6 +27,7 @@ from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
     simulated_bonus_sample,
     simulated_bonus_sample_graph,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
@@ -527,6 +528,9 @@ class AcceptOuts(msgspec.Struct):
     commit_lens: torch.Tensor
     new_seq_lens: torch.Tensor
     out_tokens: torch.Tensor
+    # commit_lens + cap_trim_lens, written by the in-graph accept when it has a
+    # buffer for it (SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH); None otherwise.
+    block_accept_lens: Optional[torch.Tensor] = None
 
 
 class DsparkVerifyEpilogue:
@@ -579,6 +583,11 @@ class DsparkVerifyEpilogue:
         )
         self.out_tokens_buf = torch.zeros(
             (self.max_bs, self.stride), dtype=torch.int64, device=device
+        )
+        self.block_accept_lens_buf = (
+            torch.zeros((self.max_bs,), dtype=torch.int32, device=device)
+            if envs.SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH.get()
+            else None
         )
         # SGLANG_SIMULATE_ACC_LEN: the step's correct length, filled per step.
         self.simulated_correct_len = simulated_correct_len
@@ -707,6 +716,11 @@ class DsparkVerifyEpilogue:
             commit_lens=self.commit_lens_buf[:bs],
             new_seq_lens=self.new_seq_lens_buf[:bs],
             out_tokens=self.out_tokens_buf[:bs],
+            block_accept_lens=(
+                None
+                if self.block_accept_lens_buf is None
+                else self.block_accept_lens_buf[:bs]
+            ),
         )
 
     @property
@@ -927,6 +941,10 @@ def build_accept_outs(
         out.commit_lens.copy_(accept.commit_lens)
         out.new_seq_lens.copy_(accept.new_seq_lens)
         out.out_tokens.copy_(accept.out_tokens)
+        if out.block_accept_lens is not None:
+            torch.add(
+                accept.commit_lens, accept.cap_trim_lens, out=out.block_accept_lens
+            )
         return out
     return accept
 

@@ -1138,7 +1138,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             logits_output=logits_output,
             next_token_ids=accept.out_tokens.reshape(-1),
             accept_lens=accept.commit_lens,
-            block_accept_lens=accept.commit_lens + accept.cap_trim_lens,
+            block_accept_lens=(
+                accept.block_accept_lens
+                if accept.block_accept_lens is not None
+                else accept.commit_lens + accept.cap_trim_lens
+            ),
             cap_lens=(
                 layout.verify_lens.to(torch.int32) if layout is not None else None
             ),
