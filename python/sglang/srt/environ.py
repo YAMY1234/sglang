@@ -569,6 +569,12 @@ class Envs:
     # Static verify graphs stage the draft context-KV commit; the next draft graph
     # writes it on a side stream forked at its head, joined at its first KV store.
     SGLANG_DSPARK_DEFER_CONTEXT_KV = EnvBool(False)
+    # DSpark draft graph: its in-graph attention-metadata prep runs on a side stream
+    # and joins at the first draft KV store, overlapping the embedding.
+    SGLANG_OPT_DSV41_DSPARK_DRAFT_PREP_FORK = EnvBool(False)
+    # DSpark static verify: the verify graph scatters new seq lens and the bonus into
+    # the FutureMap's slots; the host skips those scatters for folded accepts.
+    SGLANG_OPT_DSV41_DSPARK_POST_FOLD = EnvBool(False)
     # Test-only: spin this long (us) before the forked write, to expose a missing join.
     SGLANG_DSPARK_DEFER_CONTEXT_KV_TEST_SPIN_US = EnvInt(0)
 
