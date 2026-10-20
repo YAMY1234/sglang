@@ -494,11 +494,11 @@ def _db1_select_kernel(
             hist = tl.zeros([256], dtype=tl.int32)
             miss = r * 0
             for c in range(0, nchunk):
-                offs = c * CH + o
-                m = offs < local_vocab
-                key = _db1_key(tl.load(row + offs, mask=m, other=0.0).to(tl.float32))
-                match = m & ((key >> (shift + 8)) == (prefix >> (shift + 8)))
-                dig = ((key >> shift) & 255).to(tl.int32)
+                e_offs = c * CH + o
+                e_m = e_offs < local_vocab
+                e_key = _db1_key(tl.load(row + e_offs, mask=e_m, other=0.0).to(tl.float32))
+                match = e_m & ((e_key >> (shift + 8)) == (prefix >> (shift + 8)))
+                dig = ((e_key >> shift) & 255).to(tl.int32)
                 hist += tl.histogram(tl.where(match, dig, 0), 256)
                 miss += tl.sum((match == 0).to(tl.int32), axis=0)
             hist = tl.where(b == 0, hist - miss, hist)
@@ -510,26 +510,26 @@ def _db1_select_kernel(
         cg = r * 0
         ce = r * 0
         for c in range(0, nchunk):
-            offs = c * CH + o
-            m = offs < local_vocab
-            key = _db1_key(tl.load(row + offs, mask=m, other=0.0).to(tl.float32))
-            packed = ((key - 2147483648) << 32) | (0x7FFFFFFF - (offs + vocab_start).to(tl.int64))
-            gt = m & (key > prefix)
-            eq = m & (key == prefix)
+            e_offs = c * CH + o
+            e_m = e_offs < local_vocab
+            e_key = _db1_key(tl.load(row + e_offs, mask=e_m, other=0.0).to(tl.float32))
+            e_packed = ((e_key - 2147483648) << 32) | (0x7FFFFFFF - (e_offs + vocab_start).to(tl.int64))
+            gt = e_m & (e_key > prefix)
+            eq = e_m & (e_key == prefix)
             pg = cg + tl.cumsum(gt.to(tl.int32), axis=0) - 1
             pe = ce + tl.cumsum(eq.to(tl.int32), axis=0) - 1
-            tl.store(crow + pg, packed, mask=gt)
-            tl.store(crow + ngt + pe, packed, mask=eq & (pe < need))
+            tl.store(crow + pg, e_packed, mask=gt)
+            tl.store(crow + ngt + pe, e_packed, mask=eq & (pe < need))
             cg += tl.sum(gt.to(tl.int32), axis=0)
             ce += tl.sum(eq.to(tl.int32), axis=0)
         tl.debug_barrier()
-        i = tl.arange(0, KP2)
-        x = tl.load(crow + i, mask=i < K, other=_I64_MIN)
-        srt = tl.sort(x, 0, descending=True)
-        key = (srt >> 32) + 2147483648
-        gid = 0x7FFFFFFF - (srt & 0xFFFFFFFF)
-        tl.store(base + 2 * i, _db1_value(key), mask=i < K)
-        tl.store(base + 2 * i + 1, gid.to(tl.float32), mask=i < K)
+        e_i = tl.arange(0, KP2)
+        e_x = tl.load(crow + e_i, mask=e_i < K, other=_I64_MIN)
+        e_srt = tl.sort(e_x, 0, descending=True)
+        e_key = (e_srt >> 32) + 2147483648
+        e_gid = 0x7FFFFFFF - (e_srt & 0xFFFFFFFF)
+        tl.store(base + 2 * e_i, _db1_value(e_key), mask=e_i < K)
+        tl.store(base + 2 * e_i + 1, e_gid.to(tl.float32), mask=e_i < K)
 
 
 @triton.jit
