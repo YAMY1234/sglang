@@ -14,9 +14,9 @@ if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 HIDDEN = 4096
-# kSquareFma: the operation order that reproduced the stock chain bit for bit in the T1 equivalence search
-# (exit-r1: M 7 and 56); div.rn vs div.full for 1 / scale was not yet separated by that data.
-DEFAULT_VARIANT = 4
+# kSquareFma | kInvApprox: the operation order that reproduced the stock chain bit for bit (exit-r1: M 7 and 56),
+# with 1 / scale as div.full like Triton's static_quant_fp8; div.rn differs on 10 of the 60 checkpoint scales.
+DEFAULT_VARIANT = 12
 
 
 @cache_once
