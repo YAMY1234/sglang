@@ -29,6 +29,7 @@ import torch
 from sglang.kernels.ops.memory.small_field_copy import SmallFieldCopyPlan
 from sglang.kernels.ops.speculative.eagle import prepare_verify_commit_outputs
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.runner_backend import ab_variants
 from sglang.srt.runtime_context import get_parallel, get_spec, mamba_track_grid
 
 logger = logging.getLogger(__name__)
@@ -177,6 +178,9 @@ class PostVerifyGraph:
         self._checked = 0
         self._mismatch = 0
         self._load_mismatch = 0
+        # Shard-built compact support (eagle_utils DB1); under the same-service A/B harness each
+        # variant's SGLANG_Q35MF_LL16_DB1 picks it per round, with one graph set per value.
+        self._db1 = envs.SGLANG_Q35MF_LL16_DB1.get()
 
     def try_run(
         self,
@@ -218,14 +222,19 @@ class PostVerifyGraph:
             self._count_round(None)
             return None
         key = key + (uno_target_max_top_k,)
+        db1 = self._db1_variant()
         # The graph reads the verify logits in place, and the verify runner may hold
         # several logits buffers per batch size, so graphs are kept per buffer.
-        state_key = (key, logits_output.next_token_logits.data_ptr())
+        state_key = (key, logits_output.next_token_logits.data_ptr(), db1)
         if state_key not in self._states and len(self._states) >= _MAX_STATES:
             self._count_round(None)
             return None
         self._max_top_k = uno_target_max_top_k
-        self._count_round(key)
+        self._count_round(key + (db1,) if self._db1 or ab_variants.enabled() else key)
+        from sglang.srt.speculative import eagle_utils
+
+        # Read by eagle_sample while this round's graph is warmed up or captured.
+        eagle_utils._DB1 = db1
         try:
             return self._run(
                 state_key, batch, verify_input, logits_output, num_draft_tokens
@@ -236,6 +245,12 @@ class PostVerifyGraph:
             )
             self.disabled = True
             raise
+
+    def _db1_variant(self) -> bool:
+        if not ab_variants.enabled():
+            return self._db1
+        v = ab_variants.VARIANTS[ab_variants.current()].get("SGLANG_Q35MF_LL16_DB1")
+        return self._db1 if v is None else str(v).lower() in ("1", "true")
 
     def _count_round(self, key) -> None:
         if key is None:
