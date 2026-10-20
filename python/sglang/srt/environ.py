@@ -578,6 +578,9 @@ class Envs:
     # DSpark target verify: a pre-planned replay skips re-copying input_ids / positions
     # the plan-time load already copied from the same tensors.
     SGLANG_OPT_DSV41_DSPARK_SKIP_PREFILLED_INPUTS = EnvBool(False)
+    # DSpark: draw the simulated acceptance length (and the sim bonus seed) before the
+    # draft launch instead of between the draft and the target verify.
+    SGLANG_OPT_DSV41_DSPARK_SIM_DRAW_AHEAD = EnvBool(False)
     # Test-only: spin this long (us) before the forked write, to expose a missing join.
     SGLANG_DSPARK_DEFER_CONTEXT_KV_TEST_SPIN_US = EnvInt(0)
     # The deferred commit's staging (hidden, write locations, positions, commit lengths)
@@ -1798,6 +1801,9 @@ class Envs:
     # Decode / verify graph replays whose metadata glue graph is captured skip the
     # replay ForwardBatch view (the graph reads slots and buffers by address).
     SGLANG_OPT_SKIP_GLUED_REPLAY_VIEW = EnvBool(False)
+    # With SGLANG_OPT_DSV41_TARGET_METADATA_EARLY: issue the stage at the decode head,
+    # before the draft graph's launch, instead of right after it.
+    SGLANG_OPT_DSV41_TARGET_METADATA_EARLY_AT_HEAD = EnvBool(False)
     # DSpark static verify: record the post-verify engram history commit in the
     # target-verify CUDA graph (epilogue) instead of launching it after the replay.
     SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH = EnvBool(False)
