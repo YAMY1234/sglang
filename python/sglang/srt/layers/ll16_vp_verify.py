@@ -50,6 +50,16 @@ def built() -> bool:
     return _STATE is not None
 
 
+def _proof_on() -> bool:
+    # The post-verify graph is captured outside the A/B harness's per-variant env, so read the current
+    # variant's switch (graphs are keyed by variant).
+    from sglang.srt.model_executor.runner_backend import ab_variants
+
+    if ab_variants.enabled():
+        return ab_variants.env("SGLANG_Q35MF_LL16_VPSAMP_PROOF", "0") in ("1", "true")
+    return envs.SGLANG_Q35MF_LL16_VPSAMP_PROOF.get()
+
+
 def all_temperature_one(reqs) -> bool:
     return all(req.sampling_params.temperature == 1.0 for req in reqs)
 
@@ -315,7 +325,7 @@ class VpVerify:
             vocab_local=self.vocab_local,
             sample=sample,
         )
-        if self.proof is not None and envs.SGLANG_Q35MF_LL16_VPSAMP_PROOF.get():
+        if self.proof is not None and _proof_on():
             self.proof.check(
                 vp=self,
                 argmax=argmax,
