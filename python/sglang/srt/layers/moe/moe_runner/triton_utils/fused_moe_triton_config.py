@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import triton
 
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import get_device_name, is_hip
 
@@ -261,6 +262,26 @@ def get_default_config(
     return config
 
 
+@functools.lru_cache
+def _moe_configs_in(
+    config_dir: str,
+    E: int,
+    N: int,
+    dtype: Optional[str],
+    block_n: int,
+    block_k: int,
+    per_channel_quant: bool,
+) -> Optional[Dict[int, Any]]:
+    path = os.path.join(
+        config_dir,
+        get_config_file_name(E, N, dtype, [block_n, block_k], per_channel_quant),
+    )
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return {int(key): val for key, val in json.load(f).items()}
+
+
 def try_get_optimal_moe_config(
     w1_shape: Tuple[int, ...],
     w2_shape: Tuple[int, ...],
@@ -284,14 +305,20 @@ def try_get_optimal_moe_config(
         E, _, N = w2_shape
         block_n = block_shape[0] if block_shape else 0
         block_k = block_shape[1] if block_shape else 0
-        configs = get_moe_configs(
-            E,
-            N,
-            dtype,
-            block_n,
-            block_k,
-            per_channel_quant=per_channel_quant,
-            down_moe=False,
+        # SGLANG_Q35MF_TPX_MOE_CONFIG_DIR is read per call, so graph variants can differ in it.
+        tpx_dir = envs.SGLANG_Q35MF_TPX_MOE_CONFIG_DIR.get()
+        configs = (
+            _moe_configs_in(tpx_dir, E, N, dtype, block_n, block_k, per_channel_quant)
+            if tpx_dir
+            else get_moe_configs(
+                E,
+                N,
+                dtype,
+                block_n,
+                block_k,
+                per_channel_quant=per_channel_quant,
+                down_moe=False,
+            )
         )
 
         if configs:
