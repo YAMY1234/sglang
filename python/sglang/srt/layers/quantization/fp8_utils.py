@@ -441,10 +441,14 @@ def flashinfer_per_tensor_fp8_supported() -> bool:
     )
 
 
-@lru_cache(maxsize=1)
 def _pinned_fp8_bmm_tactics() -> dict:
-    """{(n, k, m): cuBLASLt algo index} from SGLANG_Q35MF_FP8_BMM_TACTICS."""
-    path = envs.SGLANG_Q35MF_FP8_BMM_TACTICS.get()
+    """{(n, k, m): cuBLASLt algo index} from SGLANG_Q35MF_FP8_BMM_TACTICS (read per call, so graph
+    variants captured under different values each keep their table)."""
+    return _load_fp8_bmm_tactics(envs.SGLANG_Q35MF_FP8_BMM_TACTICS.get())
+
+
+@lru_cache(maxsize=8)
+def _load_fp8_bmm_tactics(path) -> dict:
     if not path:
         return {}
     import json
