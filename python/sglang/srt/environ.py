@@ -1316,6 +1316,9 @@ class Envs:
     SGLANG_Q35MF_E2X_LLA2A_BUFFERS = EnvBool(False)
     # Tokens per source rank the SGLANG_Q35MF_E2X_LLA2A buffers hold (at most 128); larger batches use MoeAlltoAll.
     SGLANG_Q35MF_E2X_LLA2A_MAX_TOKENS = EnvInt(128)
+    # Draft layers use the exchange only up to this many tokens per rank (0 = the buffer size). Measured at DEP16:
+    # the BF16 payload doubles in the line format and loses to MoeAlltoAll above about 32 tokens.
+    SGLANG_Q35MF_E2X_LLA2A_DRAFT_MAX_TOKENS = EnvInt(0)
     # Debug only: with SGLANG_Q35MF_E2X_LLA2A, also run the stock MoeAlltoAll exchange of the same rows in the same
     # (captured) forward and log, per token count, how many dispatched and combined rows differ.
     SGLANG_Q35MF_E2X_LLA2A_CHECK = EnvBool(False)
