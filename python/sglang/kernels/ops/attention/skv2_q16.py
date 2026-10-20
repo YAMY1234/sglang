@@ -105,7 +105,8 @@ class Q16SplitDecode:
 
     def __init__(self, heads=16, qlen=7, splits=148, stages=2, batch=1, mode=0, trace=False):
         assert heads * qlen <= 128 and (heads * qlen) % 8 == 0 and stages in (1, 2)
-        # Timing ablations only (wrong outputs): 1 no O rescale, 2 no softmax math, 4 no P V MMA, 8 no Q K MMA.
+        # Timing ablations only (wrong outputs): 1 no O rescale, 2 no softmax math, 4 no P V MMA, 8 no Q K MMA,
+        # 16 no tail masking.
         self.mode = mode
         # Debug: CTA (0, 0) writes clock64 stamps per role and block into the trace tensor.
         self.trace = trace
@@ -342,10 +343,15 @@ class Q16SplitDecode:
                                         trace[8 * 16 + it] = cute.arch.clock64()
                         cute.arch.mbarrier_arrive(bsfree + slot)
                         last = limit - (begin_tok + it * self.tile + wg * half)
-                        if last < half - 1:
-                            for j in cutlass.range_constexpr(half):
-                                if j > last:
-                                    vals[j, 0] = -f32.inf
+                        if cutlass.const_expr(not self.mode & 16):
+                            if last < half - 1:
+                                # One scalar select per column; a conditional store into vals would make every
+                                # branch carry the whole fragment.
+                                for j in cutlass.range_constexpr(half):
+                                    bias = f32(0)
+                                    if j > last:
+                                        bias = f32(-f32.inf)
+                                    vals[j, 0] = vals[j, 0] + bias
                         # Raw block maximum in four independent chains, then the other warpgroup's half.
                         m0 = vals[0, 0]
                         m1 = vals[1, 0]
