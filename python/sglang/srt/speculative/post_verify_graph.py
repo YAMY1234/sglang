@@ -29,6 +29,7 @@ import torch
 from sglang.kernels.ops.memory.small_field_copy import SmallFieldCopyPlan
 from sglang.kernels.ops.speculative.eagle import prepare_verify_commit_outputs
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.runner_backend import ab_variants
 from sglang.srt.runtime_context import get_parallel, get_spec, mamba_track_grid
 
 logger = logging.getLogger(__name__)
@@ -50,7 +51,7 @@ def post_verify_graph_enabled() -> bool:
 
 
 _SPARSE_VERIFY = os.environ.get("SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING", "0") == "1"
-_SIDE_STREAM_COMMIT = os.environ.get("SGLANG_Q35MF_EDGE_SIDE_STREAM_COMMIT", "0") == "1"
+_SIDE_STREAM_COMMIT_ENV = "SGLANG_Q35MF_EDGE_SIDE_STREAM_COMMIT"
 _ONE_LAUNCH_LOAD = envs.SGLANG_Q35MF_MKH_N3C.get()
 _SHARDED_IN_GRAPH = envs.SGLANG_Q35MF_D2R_PVG_SHARDED.get()
 
@@ -166,10 +167,20 @@ class PostVerifyGraph:
         self._check = os.environ.get("SGLANG_Q35MF_EDGE_POST_VERIFY_CHECK", "0") == "1"
         # The mamba state commit replays on its own stream so it overlaps the draft
         # extend; join() must run before any later work that reads that state.
-        self._side_stream = torch.cuda.Stream() if _SIDE_STREAM_COMMIT else None
-        self._main_done = torch.cuda.Event() if _SIDE_STREAM_COMMIT else None
-        self._commit_done = torch.cuda.Event() if _SIDE_STREAM_COMMIT else None
+        # Read at capture, per A/B variant (a variant's graphs are keyed by its name).
+        side_any = ab_variants.env_any(_SIDE_STREAM_COMMIT_ENV, "1")
+        self._side_stream = torch.cuda.Stream() if side_any else None
+        self._main_done = torch.cuda.Event() if side_any else None
+        self._commit_done = torch.cuda.Event() if side_any else None
         self._commit_pending = False
+        # SGLANG_Q35MF_EDGE_SIDE_COMMIT_CHECK (debug only, host syncs): after each side-stream commit, restore
+        # the rows it wrote, rerun the commit on the main stream and count rows whose bytes differ.
+        self._side_check = (
+            os.environ.get("SGLANG_Q35MF_EDGE_SIDE_COMMIT_CHECK", "0") == "1"
+        )
+        self._side_check_pending = None
+        # [side commits checked, rows compared, rows that differ, cursor arrays that differ]
+        self._side_check_counts = [0, 0, 0, 0]
         self._max_top_k: Optional[int] = None
         # Engagement counters: replayed rounds per key and rounds left to the stock path.
         self._graph_rounds: Dict[tuple, int] = {}
@@ -221,6 +232,8 @@ class PostVerifyGraph:
         # The graph reads the verify logits in place, and the verify runner may hold
         # several logits buffers per batch size, so graphs are kept per buffer.
         state_key = (key, logits_output.next_token_logits.data_ptr())
+        if ab_variants.enabled():
+            state_key += (ab_variants.current(),)
         if state_key not in self._states and len(self._states) >= _MAX_STATES:
             self._count_round(None)
             return None
@@ -255,6 +268,60 @@ class PostVerifyGraph:
         if self._commit_pending:
             torch.cuda.current_stream().wait_event(self._commit_done)
             self._commit_pending = False
+            if self._side_check_pending is not None:
+                self._check_side_commit(*self._side_check_pending)
+                self._side_check_pending = None
+
+    def _commit_state(self, x):
+        """Rows of the batch's mamba slots, the per-slot state tensors the commit writes, and its cursors."""
+        req_pool = self.target_worker.model_runner.req_to_token_pool
+        spec = req_pool.get_speculative_mamba2_params_all_layers()
+        rows = req_pool.get_mamba_indices(x["req_pool_indices"]).long()
+        mamba_pool = req_pool.mamba_pool
+        cursors = [
+            mamba_pool.replayssm_spec_write_pos,
+            mamba_pool.replayssm_cache_base,
+            mamba_pool.replayssm_is_flush,
+        ]
+        return rows, [spec.temporal, *spec.conv], cursors
+
+    def _snapshot(self, x):
+        rows, per_slot, cursors = self._commit_state(x)
+        return (
+            rows,
+            [t.index_select(1, rows) for t in per_slot],
+            [c.clone() for c in cursors],
+        )
+
+    def _check_side_commit(self, snap, slot, batch, verify_input, num_draft_tokens):
+        rows, before, cursors_before = snap
+        _, per_slot, cursors = self._commit_state(slot.inputs)
+        side = [t.index_select(1, rows) for t in per_slot]
+        side_cursors = [c.clone() for c in cursors]
+        for t, b in zip(per_slot, before):
+            t[:, rows] = b
+        for c, b in zip(cursors, cursors_before):
+            c.copy_(b)
+        self._commit(slot.inputs, batch, verify_input, slot.outputs, num_draft_tokens)
+        differ = torch.zeros(rows.numel(), dtype=torch.bool, device=rows.device)
+        for t, sd in zip(per_slot, side):
+            ref = t.index_select(1, rows)
+            ne = ref.view(torch.uint8) != sd.view(torch.uint8)
+            differ |= ne.reshape(ne.shape[0], ne.shape[1], -1).any(-1).any(0)
+        bad_cursors = sum(
+            int(not torch.equal(c, sc)) for c, sc in zip(cursors, side_cursors)
+        )
+        counts = self._side_check_counts
+        counts[0] += 1
+        counts[1] += rows.numel()
+        counts[2] += int(differ.sum().item())
+        counts[3] += bad_cursors
+        if counts[0] % 200 == 0 or differ.any() or bad_cursors:
+            logger.info(
+                "SGLANG_Q35MF_EDGE_SIDE_COMMIT_CHECK: %d side commits, %d rows, "
+                "%d rows differ, %d cursor arrays differ",
+                *counts,
+            )
 
     @staticmethod
     def _host_hooked() -> bool:
@@ -403,6 +470,14 @@ class PostVerifyGraph:
             self._check_load(slot, inputs, sim_len)
         slot.graph.replay()
         if slot.commit_graph is not None:
+            if self._side_check:
+                self._side_check_pending = (
+                    self._snapshot(slot.inputs),
+                    slot,
+                    batch,
+                    verify_input,
+                    num_draft_tokens,
+                )
             self._main_done.record()
             self._side_stream.wait_event(self._main_done)
             with torch.cuda.stream(self._side_stream):
@@ -510,7 +585,11 @@ class PostVerifyGraph:
             self._pool = torch.cuda.graph_pool_handle()
         stream = torch.cuda.current_stream()
         graph = torch.cuda.CUDAGraph()
-        side = self._side_stream is not None and len(batch.seq_lens) <= _SIDE_MAX_BS
+        side = (
+            self._side_stream is not None
+            and ab_variants.env(_SIDE_STREAM_COMMIT_ENV, "0") == "1"
+            and len(batch.seq_lens) <= _SIDE_MAX_BS
+        )
         with _count_acceptance_calls() as acceptance_calls:
             with graph_capture(stream=stream) as ctx:
                 with torch.cuda.graph(

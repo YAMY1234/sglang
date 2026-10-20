@@ -62,6 +62,18 @@ def current():
     return PATTERN[(_round // BLOCK) % len(PATTERN)]
 
 
+def env(key, default=None):
+    """The current variant's override of an env switch, else the process env (for switches read at runtime)."""
+    if VARIANTS and key in VARIANTS[current()]:
+        return str(VARIANTS[current()][key])
+    return os.environ.get(key, default)
+
+
+def env_any(key, value):
+    """True when the process env or any variant sets the switch to value."""
+    return os.environ.get(key) == value or any(o.get(key) == value for o in VARIANTS.values())
+
+
 def round_index():
     return _round
 
