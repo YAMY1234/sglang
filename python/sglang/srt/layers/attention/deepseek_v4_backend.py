@@ -1173,6 +1173,18 @@ class DSV4RawDecodeMetadata:
         self.out_cache_loc.copy_(other.out_cache_loc)
 
 
+def _replan_topk_in_graph(metadata) -> None:
+    from sglang.kernels.ops.attention.dsv4 import plan_topk_v2
+
+    for indexer in (
+        metadata.indexer_metadata,
+        metadata.c1_indexer_metadata,
+        metadata.c2_indexer_metadata,
+    ):
+        if indexer is not None and indexer.use_topk_v2:
+            plan_topk_v2(indexer.compressed_seq_lens, out=indexer.topk_metadata)
+
+
 class _GraphBucket(enum.Enum):
     DECODE_OR_IDLE = "decode_or_idle"
     TARGET_VERIFY = "target_verify"
@@ -2477,8 +2489,11 @@ class DeepseekV4AttnBackend(
             skip_low_ratio_indexer,
         )
 
-        # Built in full by the replay prep (_install_early_verify_metadata).
+        # Built in full by the replay prep (_install_early_verify_metadata), except the
+        # indexers' top-k plans, which the verify graph records as the in-graph upgrade
+        # does: the prep's copy of them diverged at long context.
         if id(self.forward_metadata) in self._early_verify_metadata_ids:
+            _replan_topk_in_graph(self.forward_metadata)
             return
         # Upgrade Raw->Full so compress + core_attn + indexer materialization is
         # recorded inside the cuda graph.

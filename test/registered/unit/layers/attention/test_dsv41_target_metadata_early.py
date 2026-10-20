@@ -123,11 +123,37 @@ def test_every_capture_and_replay_writes_the_first_captured_early_object(monkeyp
     assert swa.tolist() == [1007, 1008]
 
 
-def test_verify_graph_records_no_prologue_for_early_metadata():
-    early = object()
-    # Any attribute the in-graph build touches would raise on this stand-in.
+def test_verify_graph_records_only_the_topk_plans_for_early_metadata(monkeypatch):
+    """The verify graph of early metadata records no Raw -> Full upgrade, only the
+    indexers' top-k v2 plans, into the very buffers the installed metadata holds."""
+    from sglang.kernels.ops.attention import dsv4 as dsv4_ops
+
+    planned = []
+    monkeypatch.setattr(
+        dsv4_ops,
+        "plan_topk_v2",
+        lambda lens, out: planned.append((lens, out)),
+    )
+
+    def indexer(v2):
+        return SimpleNamespace(
+            use_topk_v2=v2,
+            compressed_seq_lens=torch.ones(3),
+            topk_metadata=torch.zeros(4),
+        )
+
+    c4, c1, c2 = indexer(True), indexer(True), indexer(False)
+    early = SimpleNamespace(
+        indexer_metadata=c4, c1_indexer_metadata=c1, c2_indexer_metadata=c2
+    )
+    # Any other attribute the in-graph build touches would raise on these stand-ins.
     backend = SimpleNamespace(
         forward_metadata=early, _early_verify_metadata_ids={id(early)}
     )
     DeepseekV4AttnBackend.init_forward_metadata_in_graph(backend, SimpleNamespace())
     assert backend.forward_metadata is early
+    assert [
+        (lens is m.compressed_seq_lens, out is m.topk_metadata)
+        for (lens, out), m in zip(planned, (c4, c1))
+    ] == [(True, True)] * 2
+    assert len(planned) == 2  # c2 plans no top-k v2
