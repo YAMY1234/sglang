@@ -98,6 +98,23 @@ def _workspace_size_for_namespace(workspace_size: int, *, speculative: bool) -> 
 
 # One line per dispatcher so engagement can be counted per layer (target and draft).
 _midq_dispatcher_index = itertools.count(1)
+_LL_PAYLOAD = {
+    FlashinferA2ADispatchType.NVFP4: "nvfp4",
+    FlashinferA2ADispatchType.BF16: "bf16",
+}
+_ll_paths_logged: set = set()
+
+
+def _log_ll_path(draft: bool, x: torch.Tensor) -> None:
+    key = (draft, x.dtype, x.shape[0] == 0)
+    if key not in _ll_paths_logged:
+        _ll_paths_logged.add(key)
+        logger.info(
+            "SGLANG_Q35MF_E2X_LLA2A engaged: draft=%s x %s, %s tokens",
+            draft,
+            x.dtype,
+            "no" if x.shape[0] == 0 else "some",
+        )
 
 
 def _log_midq_combine(low_precision: bool, speculative: bool) -> None:
@@ -477,7 +494,7 @@ class FlashinferDispatcher(BaseDispatcher):
         # padding slots whose expert_id would otherwise route to a real expert
         # and waste downstream MoE compute. Sanitizing the padding to a
         # sentinel id is structural, not optional.
-        if self._use_ll_a2a(x, x_sf):
+        if self._use_ll_a2a(dispatch_type):
             recv_tensors = self._ll_a2a_dispatch(payloads, expert_id_payload_index)
         else:
             self._ll_call = None
@@ -519,11 +536,12 @@ class FlashinferDispatcher(BaseDispatcher):
             output_dtype,
         )
 
-    def _use_ll_a2a(self, x: torch.Tensor, x_sf: Optional[torch.Tensor]) -> bool:
+    def _use_ll_a2a(self, dispatch_type: FlashinferA2ADispatchType) -> bool:
+        # Every term is the same on all EP ranks: one rank alone on the other path would hang both exchanges.
         return (
             self.ll_a2a is not None
             and self._ll_switch.get()
-            and self.ll_a2a.matches(x, x_sf)
+            and self.ll_a2a.payload == _LL_PAYLOAD.get(dispatch_type)
             and not self.use_low_precision_combine
             and self.runtime_max_tokens_per_rank <= self.ll_a2a.slots
         )
@@ -535,6 +553,13 @@ class FlashinferDispatcher(BaseDispatcher):
         x_sf = payloads[1] if expert_id_payload_index == 2 else None
         topk_ids = payloads[expert_id_payload_index]
         topk_weights = payloads[expert_id_payload_index + 1]
+        if not self.ll_a2a.matches(x, x_sf):
+            if x.shape[0] != 0:
+                raise RuntimeError(
+                    f"SGLANG_Q35MF_E2X_LLA2A: {self.ll_a2a.payload} dispatch got x {x.dtype} {tuple(x.shape)}"
+                )
+            x, x_sf = self.ll_a2a.empty_payload(x.device)
+        _log_ll_path(self._ll_draft, x)
         recv = self.ll_a2a.dispatch(
             x=x,
             sf=x_sf,

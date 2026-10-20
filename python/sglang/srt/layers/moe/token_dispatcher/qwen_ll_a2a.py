@@ -101,6 +101,17 @@ class LlA2AState:
             ctas,
         )
 
+    def empty_payload(
+        self, device: torch.device
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """x and sf of zero tokens in this state's format (an idle rank still joins the exchange)."""
+        if self.payload == "nvfp4":
+            return (
+                torch.empty((0, self.x_bytes), dtype=torch.uint8, device=device),
+                torch.empty((0, self.sf_bytes), dtype=torch.uint8, device=device),
+            )
+        return torch.empty((0, self.hidden), dtype=torch.bfloat16, device=device), None
+
     def matches(self, x: torch.Tensor, sf: Optional[torch.Tensor]) -> bool:
         if self.payload == "nvfp4":
             return sf is not None and x.element_size() == 1
