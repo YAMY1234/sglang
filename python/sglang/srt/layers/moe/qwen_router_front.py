@@ -73,6 +73,63 @@ _tables_by_tile: Dict[Tuple[int, int], Any] = {}
 _tables_bodies: Dict[Tuple[int, int, int, bool], Tuple[torch.Tensor, ...]] = {}
 _tables_logged: set = set()
 
+# K3 measurement (SGLANG_Q35MF_TPX_K3_DIR): inside captured graphs, each target MoE layer adds one count at
+# U = number of distinct experts in its top-k ids; keyed by token count, row = layer id. A file "dump-<name>"
+# in the directory makes global rank 0 write k3-<name>.json with the cumulative counts.
+_K3_ROWS = 64
+_k3_hist: Dict[int, torch.Tensor] = {}
+_k3_layers: Dict[int, set] = {}
+_k3_one: List[torch.Tensor] = []
+
+
+def k3_record(block: Qwen2MoeSparseMoeBlock, hidden_states: torch.Tensor) -> None:
+    m, dev = hidden_states.shape[0], hidden_states.device
+    if not _k3_one:
+        _k3_one.append(torch.ones(1, device=dev))
+        _k3_start_dumper()
+    hist = _k3_hist.get(m)
+    if hist is None:
+        hist = _k3_hist[m] = torch.zeros(_K3_ROWS, _NUM_EXPERTS + 1, device=dev)
+    if not torch.cuda.is_current_stream_capturing() or block.layer_id >= _K3_ROWS:
+        return
+    _k3_layers.setdefault(m, set()).add(block.layer_id)
+    logits, _ = block.gate(hidden_states)
+    ids = torch.topk(logits, _TOP_K, dim=-1).indices.flatten()
+    used = torch.zeros(_NUM_EXPERTS, device=dev).index_fill_(0, ids, 1.0)
+    hist[block.layer_id].index_add_(0, used.sum().long().view(1), _k3_one[0])
+
+
+def _k3_start_dumper() -> None:
+    import json
+    import os
+    import threading
+    import time
+
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        return
+    d = envs.SGLANG_Q35MF_TPX_K3_DIR.get()
+
+    def loop() -> None:
+        while True:
+            time.sleep(2)
+            for f in sorted(os.listdir(d)):
+                if not f.startswith("dump-"):
+                    continue
+                out = {}
+                for m, h in list(_k3_hist.items()):
+                    rows = h.cpu()
+                    out[str(m)] = {
+                        str(l): {str(u): int(c) for u, c in enumerate(rows[l].tolist()) if c}
+                        for l in sorted(_k3_layers.get(m, ()))
+                    }
+                with open(os.path.join(d, "k3-%s.json" % f[5:]), "w") as fh:
+                    json.dump(out, fh)
+                os.remove(os.path.join(d, f))
+                logger.info("K3: wrote k3-%s.json (%d token counts)", f[5:], len(out))
+
+    threading.Thread(target=loop, name="q35mf-k3-dump", daemon=True).start()
+    logger.info("K3: distinct-expert histograms on, dump directory %s", d)
+
 
 def enabled() -> bool:
     return envs.SGLANG_Q35MF_ROUTE_FUSED.get()

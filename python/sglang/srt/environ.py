@@ -2191,6 +2191,8 @@ class Envs:
     SGLANG_Q35MF_TPX_MOE_CONFIG_DIR = EnvStr("")
     SGLANG_Q35MF_TPX_MKA_PUSH_MAX_M = EnvInt(0)
     SGLANG_Q35MF_TPX_L2PF = EnvBool(False)
+    # K3 measurement: directory for the per-layer distinct-expert histograms (qwen_router_front.k3_record).
+    SGLANG_Q35MF_TPX_K3_DIR = EnvStr("")
     SGLANG_Q35MF_GDN_DIRECT_SOLVE = EnvBool(False)
     SGLANG_Q35MF_GDN_EMPTY_HISTORY = EnvBool(False)
     SGLANG_Q35MF_GDN_NORM_FP8 = EnvBool(False)
