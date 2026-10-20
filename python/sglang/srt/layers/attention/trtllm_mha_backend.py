@@ -1604,7 +1604,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         )
         return state
 
-    def _vch_engaged(self, forward_batch, layer, q, attention_sink) -> bool:
+    def _vch_layer_ok(self, forward_batch, layer) -> bool:
         from sglang.srt.model_executor.runner_backend import ab_variants
 
         fm = forward_batch.forward_mode
@@ -1617,9 +1617,26 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             and not self.forward_metadata.is_ragged_verify
             and layer.attn_type != AttentionType.ENCODER_ONLY
             and layer.sliding_window_size in (None, -1)
+        )
+
+    def _vch_engaged(self, forward_batch, layer, q, attention_sink) -> bool:
+        return (
+            self._vch_layer_ok(forward_batch, layer)
             and attention_sink is None
             and q.dtype == torch.float8_e4m3fn
         )
+
+    def vch_prepare(self, layer, forward_batch):
+        """For the fused attention front: plan on the forward's first full-attention layer and return the state
+        whose fold buffers the front fills, or None when VCH does not run for this layer."""
+        if not self._vch_layer_ok(forward_batch, layer):
+            return None
+        if layer.layer_id == self._vch_first_layer:
+            self._vch.plan(
+                self.forward_metadata.cache_seqlens_int32,
+                self._get_layer_page_table(layer, forward_batch),
+            )
+        return self._vch
 
     def _run_vch(self, q, kv_cache, page_table, layer, bmm1_scale, bmm2_scale):
         from sglang.kernels.ops.attention import dep16_vch
@@ -1627,13 +1644,15 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         state = self._vch
         seq_lens = self.forward_metadata.cache_seqlens_int32
-        if layer.layer_id == self._vch_first_layer:
-            state.plan(seq_lens, page_table)
-            print_info_once(
-                f"E2X_VCH engaged: q7 verify / draft extend, {state.nv} chunks"
-            )
-        if not dep16_vch.take_folded():
+        folded = dep16_vch.take_folded()
+        if not folded:
+            if layer.layer_id == self._vch_first_layer:
+                state.plan(seq_lens, page_table)
             state.fold(q)
+        print_info_once(
+            f"E2X_VCH engaged: q7 verify / draft extend, {state.nv} chunks, "
+            f"fold {'in the attention front' if folded else 'standalone'}"
+        )
         state.prefix(kv_cache, bmm1_scale, bmm2_scale, self.max_context_len)
         gate = dep16_vch.take_gate()
         tokens = q.shape[0]

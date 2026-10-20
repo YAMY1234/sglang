@@ -71,6 +71,11 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     stride_v_t: tl.constexpr = 0,
     stride_v_cache_t: tl.constexpr = 0,
     FP8_CACHE: tl.constexpr = False,
+    fold_ptr=None,
+    fold_cs_ptr=None,
+    fold_cn_ptr=None,
+    FOLD: tl.constexpr = False,
+    FOLD_QL: tl.constexpr = 7,
 ):
     token = tl.program_id(0)
     head = tl.program_id(1)
@@ -156,6 +161,26 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     tl.store(out_base + rot_offs, first, mask=rot_mask)
     tl.store(out_base + HALF_ROTARY + rot_offs, second, mask=rot_mask)
 
+    # VCH (dep16_vch): the same q row bytes again in each chunk of the token's request, folded
+    # [chunk][kv head][row t][head in group] with FOLD_QL query tokens per request.
+    if FOLD:
+        if not is_k:
+            group = NUM_Q_HEADS // NUM_KV_HEADS
+            req = token // FOLD_QL
+            row = token % FOLD_QL
+            cs = tl.load(fold_cs_ptr + req)
+            cn = tl.load(fold_cn_ptr + req)
+            for c in range(0, cn):
+                fb = fold_ptr + (
+                    ((cs + c).to(tl.int64) * NUM_KV_HEADS + local_head // group) * FOLD_QL * group
+                    + row * group
+                    + local_head % group
+                ) * HEAD_DIM
+                if HAS_PASS:
+                    tl.store(fb + head_offs, x_norm, mask=head_mask & (head_offs >= ROTARY_DIM))
+                tl.store(fb + rot_offs, first, mask=rot_mask)
+                tl.store(fb + HALF_ROTARY + rot_offs, second, mask=rot_mask)
+
     if FP8_CACHE and is_k:
         value = tl.load(
             v_ptr + token * stride_v_t + local_head * HEAD_DIM + head_offs,
@@ -199,6 +224,7 @@ def fused_qk_gemma_rmsnorm_rope_gate(
     cache_loc: Optional[torch.Tensor] = None,
     k_scale: Optional[torch.Tensor] = None,
     v_scale: Optional[torch.Tensor] = None,
+    fold: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Fused QK GemmaRMSNorm + NeoX RoPE + gate deinterleave.
 
@@ -262,6 +288,11 @@ def fused_qk_gemma_rmsnorm_rope_gate(
             stride_v_t=v.stride(0),
             stride_v_cache_t=kv_cache[1].stride(0),
             FP8_CACHE=True,
+        )
+    if fold is not None:
+        assert fp8_cache, "the VCH fold copies the FP8 query rows"
+        kwargs.update(
+            fold_ptr=fold[0], fold_cs_ptr=fold[1], fold_cn_ptr=fold[2], FOLD=True
         )
     _fused_qk_rmsnorm_rope_gate_kernel[grid](
         q_gate,

@@ -2001,6 +2001,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 logger.warning_once(
                     "Fused FP8 attention preparation is unsupported; using standard preparation."
                 )
+        vch = None
+        if cache_kwargs and ab_variants.switch(self._vch_requested, "SGLANG_Q35MF_E2X_VCH"):
+            vch = backend.vch_prepare(self.attn, forward_batch)
+            if vch is not None:
+                cache_kwargs["fold"] = (vch.qf, vch.cs, vch.cn)
         q_out, k_out, gate_out = fused_qk_gemma_rmsnorm_rope_gate(
             q_gate,
             k,
@@ -2017,6 +2022,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             mrope_axis_map=(self.rotary_emb.axis_map if positions.dim() == 2 else None),
             **cache_kwargs,
         )
+        if vch is not None:
+            from sglang.kernels.ops.attention import dep16_vch
+
+            dep16_vch.mark_folded()
         seq_len = hidden_states.shape[0]
         q = q_out.view(seq_len, -1)
         k = k_out.view(seq_len, -1) if k_out is not None else None
@@ -2262,8 +2271,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
     def _vch_gate_eligible(self, gate) -> bool:
         if not (self.attn_output_gate and gate is not None):
             return False
-        if not ab_variants.switch(self._vch_requested, "SGLANG_Q35MF_E2X_VCH"):
-            return False
         if not ab_variants.switch(
             self._attn_gate_quant_requested, "SGLANG_Q35MF_ATTN_GATE_QUANT"
         ):
@@ -2308,14 +2315,17 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             forward_batch=forward_batch,
         )
 
-        vch_gate = self._vch_gate_eligible(gate)
-        if vch_gate:
+        vch_on = ab_variants.switch(self._vch_requested, "SGLANG_Q35MF_E2X_VCH")
+        if vch_on:
             from sglang.kernels.ops.attention import dep16_vch
 
-            dep16_vch.set_gate(gate, self.o_proj.input_scale)
+            if self._vch_gate_eligible(gate):
+                dep16_vch.set_gate(gate, self.o_proj.input_scale)
         attn_output = self.attn(q, k, v, forward_batch)
-        if vch_gate:
+        if vch_on:
+            # Hand-offs are per layer; drop whatever the backend did not consume.
             dep16_vch.clear_gate()
+            dep16_vch.take_folded()
 
         # VCH (E2X) returns the gated, statically FP8-quantized o_proj input itself.
         if self.attn_output_gate and attn_output.dtype != torch.float8_e4m3fn:
