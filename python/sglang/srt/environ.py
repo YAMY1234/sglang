@@ -1326,6 +1326,9 @@ class Envs:
     SGLANG_Q35MF_KRNC_COMMIT_PERSIST = EnvBool(False)
     # In-graph shadow checks for the switches above: rows whose outputs differ in any byte, logged every 30 s.
     SGLANG_Q35MF_KRNC_PROOF = EnvBool(False)
+    # SGLANG_Q35MF_E2X_LLA2A target dispatch with SGLANG_Q35MF_DEP_EP_TABLES: the routing tables are built inside the
+    # dispatch (last CTA) instead of a separate single-CTA launch after it (read at capture).
+    SGLANG_Q35MF_KRNC_EPX = EnvBool(False)
     # FlashInfer A2A NVFP4 dispatch of target MoE layers at up to SGLANG_Q35MF_E2X_LLA2A_MAX_TOKENS tokens per rank:
     # one fence-free exchange kernel each way instead of MoeAlltoAll (same rows at fixed slots, same combine bits).
     SGLANG_Q35MF_E2X_LLA2A = EnvBool(False)

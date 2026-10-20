@@ -534,7 +534,7 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
     return StandardCombineInput(hidden_states=output)
 
 
-_ep_tables_engaged: set[tuple[int, int, int]] = set()
+_ep_tables_engaged: set[tuple] = set()
 
 
 # SGLANG_Q35MF_DEP_EP_TABLES_CHECK: per received row count, calls, rows compared, rows and elements that differ.
@@ -574,12 +574,13 @@ def _experts_from_ep_tables(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
     moe_output: torch.Tensor,
+    prebuilt=None,
 ) -> torch.Tensor:
     """wrapper.run with the routing tables from one qwen_ep_tables launch instead of moe_sort, finalized into
     moe_output (the combine workspace when the dispatcher exposes it; SGLANG_Q35MF_DEP_EP_TABLES)."""
     from flashinfer.autotuner import AutoTuner
 
-    from sglang.kernels.ops.moe.qwen_ep_tables import ep_tables
+    from sglang.kernels.ops.moe.qwen_ep_tables import EP_TILE_BY_ROWS, ep_tables
     from sglang.srt.layers.moe.qwen_router_front import (
         _choose_tactic,
         _run_experts_from_tables,
@@ -605,14 +606,28 @@ def _experts_from_ep_tables(
     if key not in _ep_tables_engaged:
         _ep_tables_engaged.add(key)
         logger.info("SGLANG_Q35MF_DEP_EP_TABLES engaged: local offset %d, %d rows, tile %d", *key)
-    bufs = ep_tables(
-        topk_ids,
-        topk_weights,
-        x_fp4,
-        local_offset=wrapper.local_expert_offset,
-        num_local=wrapper.num_local_experts,
-        tile_size=tactic[0],
-    )
+    EP_TILE_BY_ROWS[topk_ids.shape[0]] = tactic[0]
+    if (
+        prebuilt is not None
+        and prebuilt.tile_size == tactic[0]
+        and prebuilt.num_tokens == topk_ids.shape[0]
+    ):
+        # SGLANG_Q35MF_KRNC_EPX: the LL dispatch already wrote the tables for these rows.
+        bufs = prebuilt
+        bufs.x_fp4 = x_fp4
+        bufs.topk_weights = topk_weights
+        if (key, "epx") not in _ep_tables_engaged:
+            _ep_tables_engaged.add((key, "epx"))
+            logger.info("SGLANG_Q35MF_KRNC_EPX engaged: local offset %d, %d rows, tile %d", *key)
+    else:
+        bufs = ep_tables(
+            topk_ids,
+            topk_weights,
+            x_fp4,
+            local_offset=wrapper.local_expert_offset,
+            num_local=wrapper.num_local_experts,
+            tile_size=tactic[0],
+        )
     return _run_experts_from_tables(
         wrapper=wrapper,
         bufs=bufs,
@@ -733,7 +748,13 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
                 w2_alpha=quant_info.w2_alpha,
             ).clone()
         output = _experts_from_ep_tables(
-            quant_info, x_fp4, x_sf, topk_ids, topk_weights, moe_output
+            quant_info,
+            x_fp4,
+            x_sf,
+            topk_ids,
+            topk_weights,
+            moe_output,
+            prebuilt=dispatch_output.ep_tables,
         )
         if ref is not None:
             _ep_tables_check(output, ref)

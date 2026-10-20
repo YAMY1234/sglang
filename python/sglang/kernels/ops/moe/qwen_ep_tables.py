@@ -13,6 +13,9 @@ if TYPE_CHECKING:
 
 # csrc kThreads x kMaxPerThread: DEP16 decode at 10 requests per rank (1120 rows x top-10) fits; prefill does not.
 EP_TABLES_MAX_EXPANDED = 1024 * 11
+# Tile size the runner's tactic used per received row count, so the dispatch can build the tables ahead of it
+# (SGLANG_Q35MF_KRNC_EPX); filled by every tables call, read by the next dispatch of that row count.
+EP_TILE_BY_ROWS: dict[int, int] = {}
 
 
 @cache_once
