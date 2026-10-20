@@ -153,7 +153,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         capture_inputs: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
-        if not ab_variants.enabled():
+        if not ab_variants.enabled() or ab_variants.SHARED_GRAPHS:
             self._capture_graph(shape_key, forward_fn, post_warmup_hook)
             return
         for name in ab_variants.names():
@@ -242,7 +242,9 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         self._outputs[key] = out
 
     def _key(self, shape_key: ShapeKey) -> Any:
-        return (ab_variants.current(), shape_key) if ab_variants.enabled() else shape_key
+        if not ab_variants.enabled() or ab_variants.SHARED_GRAPHS:
+            return shape_key
+        return (ab_variants.current(), shape_key)
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         return self._key(shape_key) in self._graphs

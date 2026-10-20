@@ -5,6 +5,8 @@ Q35MF_AB_VARIANTS  JSON object, variant name -> env overrides, e.g.
 Q35MF_AB_PATTERN   comma list of variant names, one per block, cycled (default: the variant names in order)
 Q35MF_AB_BLOCK     decode rounds per block (default 200)
 Q35MF_AB_FORCE_FILE  optional file naming one variant: every replay uses it (lockstep passes per variant)
+Q35MF_AB_SHARED_GRAPHS=1  capture the decode-phase graphs once and replay them for every variant: for
+                   switches read only at runtime (host staging, post-verify graphs), no capture-order skew
 
 FullCudaGraphBackend captures every decode-phase graph (target verify, EAGLE draft, draft extend) once per
 variant, with that variant's env applied, so a feature must read its switch at capture time. Replays use the
@@ -30,6 +32,7 @@ PATTERN = [
 ]
 BLOCK = int(os.environ.get("Q35MF_AB_BLOCK", "200"))
 assert all(p in VARIANTS for p in PATTERN), f"Q35MF_AB_PATTERN {PATTERN} not in {list(VARIANTS)}"
+SHARED_GRAPHS = os.environ.get("Q35MF_AB_SHARED_GRAPHS", "0") == "1"
 _round = 0
 _base_env = {}
 
