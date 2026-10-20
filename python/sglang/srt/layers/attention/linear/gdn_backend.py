@@ -1515,6 +1515,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     and envs.SGLANG_Q35MF_GDN_VIEWS.get()
                 ):
                     conv_block_n = e2x_launch[4]
+                    # Coalesced window stores need channel tiles of 128 or 256.
+                    if envs.SGLANG_Q35MF_TPX_CONV_WINDOW.get() and conv_block_n < 128:
+                        conv_block_n = 128
                 mixed_qkv_processed = causal_conv1d_update(
                     mixed_qkv_reshaped,
                     conv_states,

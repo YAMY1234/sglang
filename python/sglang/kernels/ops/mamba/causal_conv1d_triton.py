@@ -1053,6 +1053,16 @@ def _causal_conv1d_update_kernel(
             )
 
 
+@lru_cache(maxsize=None)
+def _log_early_conv_once(batch, dim, block_n):
+    logging.getLogger(__name__).info(
+        "GDN verify conv early state reads active: batch=%d, channels=%d, block_n=%d",
+        batch,
+        dim,
+        block_n,
+    )
+
+
 @lru_cache(maxsize=3)
 def _get_coalesced_window_kernel(batch, dim=12288, block_n=256):
     from sglang.kernels.ops.mamba.causal_conv1d_window import (
@@ -1257,6 +1267,7 @@ def causal_conv1d_update(
         pdl_kwargs["WINDOW_FLAT"] = triton.next_power_of_2(block_n * 9)
     if "USE_GDC" in pdl_kwargs and envs.SGLANG_Q35MF_GDN_CONV_EARLY.get():
         pdl_kwargs["EARLY_STATE"] = True
+        _log_early_conv_once(batch, dim, block_n)
 
     update_kernel[grid](
         # Pointers to matrices
