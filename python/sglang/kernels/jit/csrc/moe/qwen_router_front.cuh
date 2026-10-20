@@ -1081,6 +1081,147 @@ __global__ __launch_bounds__(kThreads, 1) void router_tail_dep_kernel(const __gr
   p.x_sf[static_cast<size_t>(row) * kBlocksPerRow + blk] = static_cast<uint8_t>(sf);
 }
 
+// Router GEMM alone at 17-64 tokens, for router_tail_dep_kernel to consume. cuBLAS runs this shape either as
+// split-K 2 (two K-half chains, summed) or as one chain over K, depending on M; the host passes the measured choice
+// as kSplit, and each chain is the same m16n8k16 sequence as gemv_chain, so the logits are bitwise to cuBLAS.
+// CTA = 8 experts; their weights stay in shared memory while the token rows stream through two stage buffers
+// (warp 7 loads, one warp per 16-token group and K chain computes).
+inline constexpr uint32_t kWideMinTokens = 17;
+inline constexpr uint32_t kWideMaxTokens = 64;
+inline constexpr uint32_t kWideStages = 8;
+// Bytes per token row per stage: 512 K of the one chain, or 256 K of each of the two halves.
+inline constexpr uint32_t kWideStageBytes = 1024;
+inline constexpr uint32_t kWideRowBytes = kWideStageBytes + 16;
+inline constexpr uint32_t kWideLoaderWarp = kWarps - 1;
+
+struct WideSmem {
+  static constexpr uint32_t kW = 0;
+  static constexpr uint32_t kX = kW + kExpertsPerCta * kRowBytes;
+  static constexpr uint32_t kXBuf = kWideMaxTokens * kWideRowBytes;
+  static constexpr uint32_t kPart = kX + 2 * kXBuf;  // fp32 [4][16][kExpertsPerCta], K-half 1 partials
+  static constexpr uint32_t kBarW = kPart + 4 * 16 * kExpertsPerCta * 4;
+  static constexpr uint32_t kBarFull = kBarW + 8;    // [2]
+  static constexpr uint32_t kBarEmpty = kBarFull + 16;  // [2]
+  static constexpr uint32_t kBytes = kBarEmpty + 16;
+};
+
+struct WideParams {
+  const bf16_t* x;       // [M, kHidden]
+  const bf16_t* weight;  // [kExperts, kHidden]
+  bf16_t* logits;        // [M, kExperts]
+  uint32_t num_tokens;
+};
+
+template <bool kUsePDL, uint32_t kSplit>
+__global__ __launch_bounds__(kThreads, 1) void router_wide_gemm_kernel(const __grid_constant__ WideParams p) {
+  static_assert(kSplit == 1 || kSplit == 2, "one chain or two K halves");
+  using L = WideSmem;
+  extern __shared__ __align__(128) uint8_t smem[];
+  const uint32_t warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+  const uint32_t M = p.num_tokens;
+  const uint32_t groups = (M + 15) / 16;
+  const uint32_t mma_warps = groups * kSplit;
+  const uint32_t expert0 = blockIdx.x * kExpertsPerCta;
+  const uint32_t bar_w = smem_addr(smem + L::kBarW);
+  const uint32_t bar_full = smem_addr(smem + L::kBarFull);
+  const uint32_t bar_empty = smem_addr(smem + L::kBarEmpty);
+
+  // Router weights are static: their bulk copies are issued before waiting on the producer grid.
+  if (threadIdx.x == 0) {
+    mbar_init(bar_w, 1);
+    mbar_init(bar_full, 1);
+    mbar_init(bar_full + 8, 1);
+    mbar_init(bar_empty, mma_warps);
+    mbar_init(bar_empty + 8, mma_warps);
+    mbar_expect_tx(bar_w, kExpertsPerCta * kHidden * 2);
+#pragma unroll
+    for (uint32_t e = 0; e < kExpertsPerCta; ++e) {
+      bulk_load(smem_addr(smem + L::kW + e * kRowBytes), p.weight + static_cast<size_t>(expert0 + e) * kHidden,
+                kHidden * 2, bar_w);
+    }
+  }
+  __syncthreads();
+  device::PDLWaitPrimary<kUsePDL>();
+  // The tail grid reads the logits only after its own griddepcontrol.wait.
+  device::PDLTriggerSecondary<kUsePDL>();
+
+  if (warp == kWideLoaderWarp) {
+    for (uint32_t s = 0; s < kWideStages; ++s) {
+      const uint32_t b = s & 1;
+      if (s >= 2) mbar_wait(bar_empty + 8 * b, ((s >> 1) - 1) & 1);
+      if (lane == 0) mbar_expect_tx(bar_full + 8 * b, M * kWideStageBytes);
+      __syncwarp();
+      for (uint32_t row = lane; row < M; row += 32) {
+        const uint32_t dst = smem_addr(smem + L::kX + b * L::kXBuf + row * kWideRowBytes);
+        const bf16_t* src = p.x + static_cast<size_t>(row) * kHidden;
+        if constexpr (kSplit == 1) {
+          bulk_load(dst, src + s * 512, 1024, bar_full + 8 * b);
+        } else {
+          bulk_load(dst, src + s * 256, 512, bar_full + 8 * b);
+          bulk_load(dst + 512, src + kHidden / 2 + s * 256, 512, bar_full + 8 * b);
+        }
+      }
+    }
+    return;
+  }
+  if (warp >= mma_warps) return;
+
+  const uint32_t g = warp % groups;
+  const uint32_t half = warp / groups;
+  // ldmatrix roles as in gemv_chain: A matrix j covers tokens (j & 1) * 8 + r at K offset (j >> 1) * 8,
+  // B matrix (j & 1) covers expert r at K offset (j & 1) * 8.
+  const uint32_t j = lane >> 3, r = lane & 7;
+  const uint32_t tok = g * 16 + (j & 1) * 8 + r;
+  const uint32_t a_off = (tok < M ? tok : 0) * kWideRowBytes + half * 512 + (j >> 1) * 16;
+  const uint32_t b_base = smem_addr(smem + L::kW + r * kRowBytes + (j & 1) * 16);
+  constexpr uint32_t kSteps = kSplit == 1 ? 32 : 16;  // k16 steps per stage
+  constexpr uint32_t kKPerStage = kSteps * 16;
+  mbar_wait(bar_w, 0);
+  float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  for (uint32_t s = 0; s < kWideStages; ++s) {
+    const uint32_t b = s & 1;
+    mbar_wait(bar_full + 8 * b, (s >> 1) & 1);
+    const uint32_t a_base = smem_addr(smem + L::kX + b * L::kXBuf) + a_off;
+    const uint32_t k0 = half * (kHidden / 2) + s * kKPerStage;
+#pragma unroll 8
+    for (uint32_t step = 0; step < kSteps; ++step) {
+      uint32_t a[4], w[2];
+      ldmatrix_x4(a, a_base + step * 32);
+      ldmatrix_x2(w, b_base + (k0 + step * 16) * 2);
+      mma_bf16_16816(d, a[0], a[1], a[2], a[3], w[0], w[1]);
+    }
+    __syncwarp();
+    if (lane == 0) mbar_arrive(bar_empty + 8 * b);
+  }
+
+  // C fragment: d0 / d1 = (token row gr, experts 2c, 2c + 1), d2 / d3 = token row gr + 8 of the group.
+  const uint32_t gr = lane >> 2, c = lane & 3;
+  if constexpr (kSplit == 2) {
+    float* part = reinterpret_cast<float*>(smem + L::kPart) + g * 16 * kExpertsPerCta;
+    if (half == 1) {
+      part[gr * kExpertsPerCta + 2 * c] = d[0];
+      part[gr * kExpertsPerCta + 2 * c + 1] = d[1];
+      part[(gr + 8) * kExpertsPerCta + 2 * c] = d[2];
+      part[(gr + 8) * kExpertsPerCta + 2 * c + 1] = d[3];
+    }
+    asm volatile("bar.sync 1, %0;" ::"r"(mma_warps * 32) : "memory");
+    if (half == 1) return;
+    d[0] = __fadd_rn(d[0], part[gr * kExpertsPerCta + 2 * c]);
+    d[1] = __fadd_rn(d[1], part[gr * kExpertsPerCta + 2 * c + 1]);
+    d[2] = __fadd_rn(d[2], part[(gr + 8) * kExpertsPerCta + 2 * c]);
+    d[3] = __fadd_rn(d[3], part[(gr + 8) * kExpertsPerCta + 2 * c + 1]);
+  }
+  const uint32_t t0 = g * 16 + gr, t1 = t0 + 8;
+  if (t0 < M) {
+    *reinterpret_cast<__nv_bfloat162*>(p.logits + static_cast<size_t>(t0) * kExperts + expert0 + 2 * c) =
+        __floats2bfloat162_rn(d[0], d[1]);
+  }
+  if (t1 < M) {
+    *reinterpret_cast<__nv_bfloat162*>(p.logits + static_cast<size_t>(t1) * kExperts + expert0 + 2 * c) =
+        __floats2bfloat162_rn(d[2], d[3]);
+  }
+}
+
 template <uint32_t kMaxM, bool kUsePDL, bool kTrace>
 struct RouterFrontKernel {
   static void
@@ -1334,6 +1475,32 @@ struct RouterFrontKernel {
     }
   }
 
+  /// \brief Router logits alone at 17-64 tokens (router_wide_gemm_kernel); split = 1 (one K chain) or 2 (two
+  /// K halves), the order cuBLAS uses at this M.
+  static void run_wide_gemm(
+      const tvm::ffi::TensorView x, const tvm::ffi::TensorView weight, const tvm::ffi::TensorView logits, int64_t split) {
+    using namespace host;
+    auto M_ = SymbolicSize{"num_tokens"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    TensorMatcher({M_, kHidden}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(x);
+    TensorMatcher({kExperts, kHidden}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(weight);
+    TensorMatcher({M_, kExperts}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(logits);
+    const auto M = static_cast<uint32_t>(M_.unwrap());
+    CHECK_HOST(M >= kWideMinTokens && M <= kWideMaxTokens) << "router_wide_gemm: num_tokens " << M;
+    CHECK_HOST(split == 1 || split == 2) << "router_wide_gemm: split " << split;
+    WideParams params{};
+    params.x = static_cast<const bf16_t*>(x.data_ptr());
+    params.weight = static_cast<const bf16_t*>(weight.data_ptr());
+    params.logits = static_cast<bf16_t*>(logits.data_ptr());
+    params.num_tokens = M;
+    if (split == 1) {
+      launch_wide<1>(params, device.unwrap());
+    } else {
+      launch_wide<2>(params, device.unwrap());
+    }
+  }
+
   /// \brief Softmax top-k and NVFP4 input quantization from router logits computed elsewhere, at up to 64 tokens.
   static void run_tail_dep(
       const tvm::ffi::TensorView logits,
@@ -1421,6 +1588,19 @@ struct RouterFrontKernel {
   }
 
  private:
+  template <uint32_t kSplit>
+  static void launch_wide(const WideParams& params, DLDevice device) {
+    using namespace host;
+    constexpr uint32_t kSmem = WideSmem::kBytes;
+    static const bool smem_attr_set = [] {
+      CHECK_CUDA(cudaFuncSetAttribute(
+          router_wide_gemm_kernel<kUsePDL, kSplit>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
+      return true;
+    }();
+    (void)smem_attr_set;
+    LaunchKernel(kNumCtas, kThreads, device, kSmem).enable_pdl(kUsePDL)(router_wide_gemm_kernel<kUsePDL, kSplit>, params);
+  }
+
   template <bool kT, bool kSh = false, bool kGrouped = false>
   static void launch_front(const Params& params, DLDevice device, uint32_t groups = 1) {
     using namespace host;

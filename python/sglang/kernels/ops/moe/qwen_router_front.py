@@ -47,6 +47,7 @@ def _jit_module(max_m: int, trace: bool = False) -> Module:
             ("run_topk", f"RouterFrontKernel<{args}>::run_topk"),
             ("run_topk_quant", f"RouterFrontKernel<{args}>::run_topk_quant"),
             ("run_tail_dep", f"RouterFrontKernel<{args}>::run_tail_dep"),
+            ("run_wide_gemm", f"RouterFrontKernel<{args}>::run_wide_gemm"),
         ],
         # No fast-math: the top-k and quantization arithmetic is pinned to
         # explicit instructions and must not be contracted or flushed.
@@ -267,3 +268,10 @@ def router_tail_dep(
     x_sf = torch.empty((m, HIDDEN // 16), dtype=torch.uint8, device=x.device)
     _jit_module(MAX_TOKENS).run_tail_dep(logits, x, global_scale, topk_weights, topk_ids, x_fp4, x_sf)
     return topk_weights, topk_ids, x_fp4, x_sf
+
+
+def router_wide_gemm(x: torch.Tensor, weight: torch.Tensor, split: int) -> torch.Tensor:
+    """Router logits bf16 [M, 512] for 17 <= M <= 64 with K order `split` (1: one chain, 2: two K halves summed)."""
+    logits = torch.empty((x.shape[0], NUM_EXPERTS), dtype=torch.bfloat16, device=x.device)
+    _jit_module(MAX_TOKENS).run_wide_gemm(x, weight, logits, split)
+    return logits
