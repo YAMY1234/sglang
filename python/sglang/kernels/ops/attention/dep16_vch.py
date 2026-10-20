@@ -53,55 +53,63 @@ def take_folded() -> bool:
 
 
 @triton.jit
-def _vch_plan_kernel(seq_lens_ptr, B, vreq_ptr, vstart_ptr, vnp_ptr, vlen_ptr, cs_ptr, cn_ptr,
-                     NV: tl.constexpr, BLOCK_B: tl.constexpr, PG: tl.constexpr, QL: tl.constexpr,
-                     MIN_LEN: tl.constexpr):
+def _vch_plan_kernel(seq_lens_ptr, B, cs_ptr, cn_ptr, NV: tl.constexpr, BLOCK_B: tl.constexpr, PG: tl.constexpr,
+                     QL: tl.constexpr, MIN_LEN: tl.constexpr, MAX_PAGES: tl.constexpr):
+    """Chunks per request: the smallest chunk size c (pages) whose total chunk count fits in NV, found by
+    bisection; requests shorter than MIN_LEN keep one chunk."""
     b = tl.arange(0, BLOCK_B)
     bm = b < B
     L = tl.load(seq_lens_ptr + b, mask=bm, other=0)
     e = tl.maximum(L - (QL - 1), 1)
     p = (e + PG - 1) // PG
     split = bm & (L >= MIN_LEN)
-    n = tl.where(bm, 1, 0)
-    for _ in range(NV):
-        score = tl.where(split & (n < p), (p + n - 1) // tl.maximum(n, 1), -1)
-        best = tl.max(score, axis=0)
-        j = tl.argmax(score, axis=0)
-        add = (tl.sum(n, axis=0) < NV) & (best > 0)
-        n = tl.where((b == j) & add, n + 1, n)
-    cs = tl.cumsum(n, axis=0) - n
-    tl.store(cs_ptr + b, cs, mask=bm)
+    fixed = tl.sum((bm & ~split).to(tl.int32), axis=0)
+    lo = 1
+    hi = MAX_PAGES
+    while lo < hi:
+        mid = (lo + hi) // 2
+        cnt = fixed + tl.sum(tl.where(split, (p + mid - 1) // mid, 0), axis=0)
+        if cnt <= NV:
+            hi = mid
+        else:
+            lo = mid + 1
+    n = tl.where(split, (p + lo - 1) // lo, tl.where(bm, 1, 0))
+    tl.store(cs_ptr + b, tl.cumsum(n, axis=0) - n, mask=bm)
     tl.store(cn_ptr + b, n, mask=bm)
-    nn = tl.maximum(n, 1)
-    base = p // nn
-    extra = p - base * nn
-    for v in range(NV):
-        own = bm & (cs <= v) & (v < cs + n)
-        valid = tl.sum(own.to(tl.int32), axis=0) > 0
-        i = tl.argmax(own.to(tl.int32), axis=0)
-        k = v - tl.sum(tl.where(own, cs, 0), axis=0)
-        bi = tl.sum(tl.where(own, base, 0), axis=0)
-        xi = tl.sum(tl.where(own, extra, 0), axis=0)
-        ei = tl.sum(tl.where(own, e, 0), axis=0)
-        start = k * bi + tl.minimum(k, xi)
-        npg = bi + (k < xi).to(tl.int32)
-        ln = tl.minimum((start + npg) * PG, ei) - start * PG
-        tl.store(vreq_ptr + v, tl.where(valid, i, 0))
-        tl.store(vstart_ptr + v, tl.where(valid, start, 0))
-        tl.store(vnp_ptr + v, tl.where(valid, npg, 1))
-        tl.store(vlen_ptr + v, tl.where(valid, ln, 1))
 
 
 @triton.jit
-def _vch_table_kernel(pt_ptr, pt_stride, vreq_ptr, vstart_ptr, vnp_ptr, vt_ptr, vt_stride, BLOCK: tl.constexpr):
+def _vch_table_kernel(seq_lens_ptr, B, cs_ptr, cn_ptr, pt_ptr, pt_stride, vreq_ptr, vstart_ptr, vnp_ptr, vlen_ptr,
+                      vt_ptr, vt_stride, BLOCK_B: tl.constexpr, PG: tl.constexpr, QL: tl.constexpr,
+                      BLOCK: tl.constexpr):
+    """Chunk v: its request, page range (the request's pages split as evenly as possible) and page indices;
+    chunks past the plan's total are 1-token dummies on page table entry (0, 0)."""
     v = tl.program_id(0)
     blk = tl.program_id(1)
-    i = tl.load(vreq_ptr + v)
-    s = tl.load(vstart_ptr + v)
-    npg = tl.load(vnp_ptr + v)
+    b = tl.arange(0, BLOCK_B)
+    bm = b < B
+    cs = tl.load(cs_ptr + b, mask=bm, other=0)
+    n = tl.load(cn_ptr + b, mask=bm, other=0)
+    own = bm & (cs <= v) & (v < cs + n)
+    valid = tl.sum(own.to(tl.int32), axis=0) > 0
+    i = tl.sum(tl.where(own, b, 0), axis=0)
+    L = tl.load(seq_lens_ptr + i)
+    e = tl.maximum(L - (QL - 1), 1)
+    p = (e + PG - 1) // PG
+    ni = tl.maximum(tl.sum(tl.where(own, n, 0), axis=0), 1)
+    k = v - tl.sum(tl.where(own, cs, 0), axis=0)
+    base = p // ni
+    extra = p - base * ni
+    start = tl.where(valid, k * base + tl.minimum(k, extra), 0)
+    npg = tl.where(valid, base + (k < extra).to(tl.int32), 1)
+    ln = tl.where(valid, tl.minimum((start + npg) * PG, e) - start * PG, 1)
+    if blk == 0:
+        tl.store(vreq_ptr + v, i)
+        tl.store(vstart_ptr + v, start)
+        tl.store(vnp_ptr + v, npg)
+        tl.store(vlen_ptr + v, ln)
     off = blk * BLOCK + tl.arange(0, BLOCK)
-    m = off < npg
-    pages = tl.load(pt_ptr + i.to(tl.int64) * pt_stride + s + off, mask=m, other=0)
+    pages = tl.load(pt_ptr + i.to(tl.int64) * pt_stride + start + off, mask=off < npg, other=0)
     tl.store(vt_ptr + v.to(tl.int64) * vt_stride + off, pages, mask=off < vt_stride)
 
 
@@ -220,12 +228,12 @@ class VchState:
         """Once per forward: chunk plan from the device seq_lens and the per-chunk page tables."""
         bs = seq_lens.shape[0]
         assert bs <= self.block_b and page_table.shape[1] <= self.max_pages
-        _vch_plan_kernel[(1,)](seq_lens, bs, self.vreq, self.vstart, self.vnp, self.vlen, self.cs, self.cn,
-                               NV=self.nv, BLOCK_B=self.block_b, PG=self.pg, QL=QLEN, MIN_LEN=self.min_len,
-                               num_warps=1)
+        _vch_plan_kernel[(1,)](seq_lens, bs, self.cs, self.cn, NV=self.nv, BLOCK_B=self.block_b, PG=self.pg,
+                               QL=QLEN, MIN_LEN=self.min_len, MAX_PAGES=self.max_pages, num_warps=4)
         _vch_table_kernel[(self.nv, triton.cdiv(self.max_pages, 1024))](
-            page_table, page_table.stride(0), self.vreq, self.vstart, self.vnp, self.vtab, self.vtab.stride(0),
-            BLOCK=1024, num_warps=4)
+            seq_lens, bs, self.cs, self.cn, page_table, page_table.stride(0), self.vreq, self.vstart, self.vnp,
+            self.vlen, self.vtab, self.vtab.stride(0), BLOCK_B=self.block_b, PG=self.pg, QL=QLEN, BLOCK=1024,
+            num_warps=4)
 
     def fold(self, q: torch.Tensor):
         """Standalone fold (the product folds inside the fused attention front instead)."""

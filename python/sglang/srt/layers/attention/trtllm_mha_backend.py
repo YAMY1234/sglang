@@ -1612,6 +1612,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             self._vch is not None
             and ab_variants.switch(self._vch_requested, "SGLANG_Q35MF_E2X_VCH")
             and (fm.is_target_verify() or fm.is_draft_extend_v2())
+            and forward_batch.batch_size <= self._vch.nv
             and self.forward_metadata.max_seq_len_q == 7
             and not self.forward_metadata.is_ragged_verify
             and layer.attn_type != AttentionType.ENCODER_ONLY
