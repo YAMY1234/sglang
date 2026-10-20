@@ -48,9 +48,15 @@ def _conv_silu(
     COLS: tl.constexpr,
 ):
     # Operation order of _causal_conv1d_update_kernel: activation-dtype products summed in fp32.
+    # The strided state / weight loads come first so the tile keeps the token-row load layout,
+    # which the verify kernel's q/k norm reduction tree depends on.
     s0 = tl.load(cs_row + ch * stride_cs_dim)
     s1 = tl.load(cs_row + ch * stride_cs_dim + stride_cs_tok)
     s2 = tl.load(cs_row + ch * stride_cs_dim + 2 * stride_cs_tok)
+    w0 = tl.load(conv_w + ch * stride_w_dim)
+    w1 = tl.load(conv_w + ch * stride_w_dim + stride_w_width)
+    w2 = tl.load(conv_w + ch * stride_w_dim + 2 * stride_w_width)
+    w3 = tl.load(conv_w + ch * stride_w_dim + 3 * stride_w_width)
     acc = tl.zeros([ROWS, COLS], dtype=tl.float32)
     for j in tl.static_range(4):
         src = tok + (j - 3)
@@ -60,7 +66,14 @@ def _conv_silu(
         tap = tl.where(
             src >= 0, xj, tl.where(src == -1, s2, tl.where(src == -2, s1, s0))
         )
-        w = tl.load(conv_w + ch * stride_w_dim + j * stride_w_width)
+        if j == 0:
+            w = w0
+        elif j == 1:
+            w = w1
+        elif j == 2:
+            w = w2
+        else:
+            w = w3
         acc += tap * w
     acc = acc / (1 + tl.exp(-acc))
     return acc.to(x_row.dtype.element_ty)
