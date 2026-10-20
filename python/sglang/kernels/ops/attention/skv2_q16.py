@@ -241,6 +241,13 @@ class Q16SplitDecode:
             cute.make_layout(128),
             alignment=128,
         )
+        # Epilogue staging of one 64-column piece of each O half (rows padded by 16 bytes against bank conflicts).
+        so = ex.allocate(
+            cutlass.BFloat16,
+            cutlass.AddressSpace.smem,
+            cute.make_layout((self.rows, 128), stride=(136, 1)),
+            alignment=128,
+        )
         nbar = 1 + 4 * self.stages + 4 * self.slots + 1
         barriers = ex.allocate(
             cutlass.Int64,
@@ -485,19 +492,31 @@ class Q16SplitDecode:
                             xden[row] = running_l
                         prim.barrier_cta_sync(2, thread_count=256)
                         out16 = cute.make_rmem_tensor((half,), cutlass.BFloat16)
+                        chunk = cute.make_rmem_tensor((8,), cutlass.BFloat16)
                         for h in cutlass.range_constexpr(128 // half):
                             o_sub = cute.local_tile(o_plane, (128, half), (0, h))
                             load_o = tcgen05.make_tmem_copy(ld_half, o_sub).get_slice(row)
                             ex.partition_and_copy(load_o, o_sub, oview)
                             cute.arch.fence_view_async_tmem_load()
                             out16.store((vals[None, 0].load() * out_scale).to(cutlass.BFloat16))
+                            # Rows land in SMEM first so the global stores below are 128-byte coalesced runs.
                             if row < rows:
+                                cute.autovec_copy(out16, cute.local_tile(so[row, None], (half,), (wg,)))
+                            prim.barrier_cta_sync(2, thread_count=256)
+                            for i in cutlass.range_constexpr(rows * 16 // 256):
+                                k = tid + 256 * i
+                                srow = k // 16
+                                ch = k % 16
+                                cute.autovec_copy(cute.local_tile(so[srow, None], (8,), (ch,)), chunk)
                                 cute.autovec_copy(
-                                    out16,
+                                    chunk,
                                     cute.local_tile(
-                                        partial[prow + row, None], (half,), (wg * 2 + h,)
+                                        partial[prow + srow, None],
+                                        (8,),
+                                        ((ch // 8) * 16 + h * 8 + ch % 8,),
                                     ),
                                 )
+                            prim.barrier_cta_sync(2, thread_count=256)
                         if row < rows:
                             if cutlass.const_expr(wg == 0):
                                 maxima[prow + row] = running_m
