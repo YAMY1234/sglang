@@ -9,8 +9,8 @@ own sync later in the same pass, so that sync does not exchange again.
 
 SGLANG_Q35MF_LL16_RECV_AB_BLOCK=N (measurement only) alternates the stock path and the merged
 path every N passes, starting with the stock path. Every rank counts the same passes, so all
-ranks switch together. When Q35MF_RT_DIR is set, the switch times (perf_counter_ns) are written
-to $Q35MF_RT_DIR/ll16-recvab-r<rank>.json.
+ranks switch together. When Q35MF_RT_DIR is set, the switch times (perf_counter_ns) are appended
+to $Q35MF_RT_DIR/ll16-recvab-r<rank>.jsonl.
 """
 
 from __future__ import annotations
@@ -60,7 +60,7 @@ def _merged_this_pass() -> bool:
     merged = (p // _S.block) % 2 == 1
     if p % _S.block == 0:
         _S.switches.append([time.perf_counter_ns(), int(merged)])
-        if len(_S.switches) % 8 == 0:
+        if len(_S.switches) >= 8:
             _dump_switches()
     return merged
 
@@ -69,9 +69,11 @@ def _dump_switches() -> None:
     out = os.environ.get("Q35MF_RT_DIR")
     if not out:
         return
+    # Append only the switches since the last dump; one JSON line per switch.
+    new, _S.switches = _S.switches, []
     try:
-        with open(os.path.join(out, f"ll16-recvab-r{dist.get_rank()}.json"), "w") as f:
-            json.dump(dict(block=_S.block, switches=_S.switches), f)
+        with open(os.path.join(out, f"ll16-recvab-r{dist.get_rank()}.jsonl"), "a") as f:
+            f.writelines(json.dumps(dict(t_ns=t, merged=m, block=_S.block)) + "\n" for t, m in new)
     except OSError:
         pass
 
