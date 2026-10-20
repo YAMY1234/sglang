@@ -1573,6 +1573,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         ):
             logger.warning("E2X_VCH unsupported runtime/topology; using stock")
             return None
+        self._vch_min_bs = envs.SGLANG_Q35MF_E2X_VCH_MIN_BS.get()
         pool = self.token_to_kv_pool
         if isinstance(pool, HybridLinearKVPool):
             self._vch_first_layer = min(pool.full_attention_layer_id_mapping)
@@ -1597,9 +1598,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             alloc=lambda name, make: get_buffer(f"trtllm_mha_{name}", make),
         )
         logger.info(
-            "E2X_VCH prepared: NV %d, min_len %d, first full-attention layer %d",
+            "E2X_VCH prepared: NV %d, min_len %d, min_bs %d, first full-attention layer %d",
             state.nv,
             state.min_len,
+            self._vch_min_bs,
             self._vch_first_layer,
         )
         return state
@@ -1612,7 +1614,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             self._vch is not None
             and ab_variants.switch(self._vch_requested, "SGLANG_Q35MF_E2X_VCH")
             and (fm.is_target_verify() or fm.is_draft_extend_v2())
-            and forward_batch.batch_size <= self._vch.nv
+            and self._vch_min_bs <= forward_batch.batch_size <= self._vch.nv
             and self.forward_metadata.max_seq_len_q == 7
             and not self.forward_metadata.is_ragged_verify
             and layer.attn_type != AttentionType.ENCODER_ONLY

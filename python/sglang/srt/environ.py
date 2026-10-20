@@ -2240,6 +2240,8 @@ class Envs:
     SGLANG_Q35MF_E2X_VCH_NV = EnvInt(76)
     # Requests shorter than this are one chunk (their keys are not split).
     SGLANG_Q35MF_E2X_VCH_MIN_LEN = EnvInt(2055)
+    # Smallest batch that takes VCH; native gives enough KV CTAs per request below it (measured: B1-2 +0.05 ms/round).
+    SGLANG_Q35MF_E2X_VCH_MIN_BS = EnvInt(1)
     SGLANG_Q35MF_GDN_DIRECT_SOLVE = EnvBool(False)
     SGLANG_Q35MF_GDN_EMPTY_HISTORY = EnvBool(False)
     SGLANG_Q35MF_GDN_NORM_FP8 = EnvBool(False)
