@@ -30,6 +30,7 @@ from sglang.kernels.ops.memory.small_field_copy import SmallFieldCopyPlan
 from sglang.kernels.ops.speculative.eagle import prepare_verify_commit_outputs
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel, get_spec, mamba_track_grid
+from sglang.srt.utils.q35mf_rt_toggle import rt_flag
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +78,10 @@ class PostVerifySamplingView(SimpleNamespace):
 def sparse_verify_max_top_k(batch) -> Optional[int]:
     """Support size for eagle_sample's compact top-k sampling branch, or None for the dense
     branch. Every request must sample with a finite top-k within the compact limit."""
-    if not _SPARSE_VERIFY or batch.forward_mode.is_idle():
+    if (
+        not rt_flag("EDGE_SPARSE_VERIFY_SAMPLING", _SPARSE_VERIFY)
+        or batch.forward_mode.is_idle()
+    ):
         return None
     from sglang.srt.speculative.uno_utils import _SPARSE_TOP_K_LIMIT
 
