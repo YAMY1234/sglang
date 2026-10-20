@@ -171,6 +171,39 @@ def _e2x_tp2_verify_launch(
     return None
 
 
+def _conv_fused_verify_supported(
+    *,
+    layer,
+    mixed_qkv: torch.Tensor,
+    conv_states: torch.Tensor,
+    conv_window: torch.Tensor,
+    layer_cache,
+    draft_token_num: int,
+    linear_chain: bool,
+    circular_verify: bool,
+) -> bool:
+    """Whether the conv update can run inside the ReplaySSM verify kernel."""
+    return (
+        envs.SGLANG_Q35MF_TPX_GDN_CONV_FUSED.get()
+        and not envs.SGLANG_Q35MF_GDN_DIRECT_SOLVE.get()
+        and not envs.SGLANG_Q35MF_GDN_EMPTY_HISTORY.get()
+        and is_cuda()
+        and circular_verify
+        and linear_chain
+        and draft_token_num == 7
+        and layer.head_k_dim == layer.head_v_dim == 128
+        and layer.bias is None
+        and layer.activation in ("silu", "swish")
+        and mixed_qkv.dtype == layer_cache.temporal.dtype == torch.bfloat16
+        and mixed_qkv.stride(1) == 1
+        and layer.conv_weights.stride() == (4, 1)
+        and conv_states.stride()[1:] == (3, 1)
+        # Deduplicated window: [slots, 7, dim, 3] over 9 positions per channel.
+        and conv_window.dim() == 4
+        and conv_window.stride()[1:] == (1, 9, 1)
+    )
+
+
 class GDNMISMetadata(msgspec.Struct, frozen=True):
     query_token_indices: torch.Tensor
     query_cu_seqlens: torch.Tensor
@@ -1499,6 +1532,32 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     cache_indices[:batch_size],
                     intermediate_state_indices[:batch_size],
                 )
+            elif _conv_fused_verify_supported(
+                layer=layer,
+                mixed_qkv=mixed_qkv,
+                conv_states=conv_states,
+                conv_window=intermediate_conv_window_cache,
+                layer_cache=mamba_cache_params,
+                draft_token_num=draft_token_num,
+                linear_chain=retrieve_next_token is None,
+                circular_verify=use_replayssm_spec and not use_replayssm_fold,
+            ):
+                return self._replayssm_conv_fused_verify(
+                    layer=layer,
+                    mixed_qkv=mixed_qkv,
+                    a=a,
+                    b=b,
+                    mamba_pool=mamba_pool,
+                    layer_cache=mamba_cache_params,
+                    conv_states=conv_states,
+                    conv_window=intermediate_conv_window_cache,
+                    window_indices=intermediate_state_indices[:batch_size],
+                    cache_indices=cache_indices,
+                    replay_indices=forward_batch.req_pool_indices,
+                    query_start_loc=query_start_loc,
+                    draft_token_num=draft_token_num,
+                    verify_pdl=verify_pdl,
+                )
             else:
                 mixed_qkv_reshaped = mixed_qkv.view(
                     batch_size, draft_token_num, -1
@@ -2131,3 +2190,85 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
         # Match the recurrent target_verify output shape (== value.shape).
         return out.reshape(value.shape)
+
+    def _replayssm_conv_fused_verify(
+        self,
+        *,
+        layer: RadixLinearAttention,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        mamba_pool: MambaPool,
+        layer_cache: "MambaPool.SpeculativeState",
+        conv_states: torch.Tensor,
+        conv_window: torch.Tensor,
+        window_indices: torch.Tensor,
+        cache_indices: torch.Tensor,
+        replay_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        draft_token_num: int,
+        verify_pdl: Optional[bool],
+    ) -> torch.Tensor:
+        """Conv update + ReplaySSM verify in one launch; same bytes as the two stock kernels."""
+        from sglang.kernels.ops.attention.fla.gdn_replayssm_conv_fused import (
+            gdn_replayssm_conv_fused_verify,
+        )
+
+        H, K = layer.num_k_heads, layer.head_k_dim
+        HV, V = layer.num_v_heads, layer.head_v_dim
+        seq_len = mixed_qkv.shape[0]
+        launch = _e2x_tp2_verify_launch(
+            num_k_heads=H,
+            num_v_heads=HV,
+            head_dim=K,
+            draft_token_num=draft_token_num,
+            batch_size=query_start_loc.numel() - 1,
+        )
+        block_v, _, num_stages, maxnreg, _ = launch or (32, 2, 2, None, 0)
+        # The kernel restores zeros; one buffer per layer keeps layers off each other's counters.
+        tickets = get_buffer(
+            f"gdn.verify.conv_fused_tickets.{mixed_qkv.device}.{layer.layer_id}",
+            lambda: torch.zeros(
+                self.verify_intermediate_state_indices.numel(),
+                H,
+                dtype=torch.int32,
+                device=mixed_qkv.device,
+            ),
+        )
+        use_pdl = envs.SGLANG_Q35MF_GDN_PDL.get() if verify_pdl is None else verify_pdl
+        out = mixed_qkv.new_empty(seq_len, HV, V)
+        gdn_replayssm_conv_fused_verify(
+            x=mixed_qkv,
+            conv_weight=layer.conv_weights,
+            conv_state=conv_states,
+            conv_window=conv_window,
+            window_indices=window_indices,
+            tickets=tickets,
+            a=a.reshape(seq_len, HV),
+            b=b.reshape(seq_len, HV),
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            checkpoint_state=layer_cache.temporal,
+            d_cache=layer_cache.replayssm_d,
+            k_cache=layer_cache.replayssm_k,
+            g_cache=layer_cache.replayssm_g,
+            rawv_cache=layer_cache.replayssm_rawv,
+            rawk_cache=layer_cache.replayssm_rawk,
+            beta_cache=layer_cache.replayssm_beta,
+            out=out,
+            query_start_loc=query_start_loc,
+            ssm_state_indices=cache_indices,
+            replay_indices=replay_indices,
+            write_pos=mamba_pool.replayssm_spec_write_pos,
+            cache_base=mamba_pool.replayssm_cache_base,
+            is_flush=mamba_pool.replayssm_is_flush,
+            max_cache_len=layer_cache.replayssm_d.shape[-2],
+            max_spec_len=draft_token_num,
+            scale=K**-0.5,
+            block_v=block_v,
+            num_warps=2,
+            num_stages=num_stages,
+            maxnreg=maxnreg,
+            pdl=use_pdl and is_arch_support_pdl(),
+        )
+        return out.reshape(1, seq_len, HV, V)
