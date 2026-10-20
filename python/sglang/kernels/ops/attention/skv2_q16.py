@@ -92,7 +92,7 @@ class Q16SplitDecode:
     warp 8: both MMAs, warp 9: Q and K loads, warp 10: V loads."""
 
     def __init__(
-        self, heads=16, qlen=7, splits=148, stages=2, batch=1, mode=0, trace=False, lazy=0.0, pdl=False, maxp=32
+        self, heads=16, qlen=7, splits=148, stages=2, batch=1, mode=0, trace=False, lazy=0.0, pdl=False, maxp=32, prio=0
     ):
         assert heads * qlen <= 128 and (heads * qlen) % 8 == 0 and stages in (1, 2) and maxp % 32 == 0
         # P x 256 must stay <= 448 (e4m3 max), so a stale reference may trail the maximum by < log2(1.75).
@@ -115,6 +115,8 @@ class Q16SplitDecode:
         self.rows = heads * qlen
         # Page ids staged per split; must cover 2 * blocks of the longest split (plan: cdiv(table width, splits) + 1).
         self.maxp = maxp
+        # Startup order: 0 all first stages at once; 1 V after K(0) has landed; 2 also K(1) after K(0) has landed.
+        self.prio = prio
         self.tile = 128
         self.half = 64
         self.slots = 2
@@ -627,6 +629,8 @@ class Q16SplitDecode:
             prim.barrier_cta_sync(5, thread_count=64)
             for stage in cutlass.range_constexpr(self.stages):
                 if stage < nblk:
+                    if cutlass.const_expr(stage == 1 and self.prio == 2):
+                        cute.arch.mbarrier_wait(bk, phase=0)
                     load_keys(k, spages, sk, bk + stage, stage * 2, stage, self.tile)
             # K of block it + stages reuses the stage of block it once Q K^T(it) is done.
             for it in cutlass.range(0, nblk - self.stages):
@@ -641,6 +645,9 @@ class Q16SplitDecode:
         elif warp == 10:
             # A separate warp, so K issues never queue behind a V stage that P V has not released yet.
             prim.barrier_cta_sync(5, thread_count=64)
+            if cutlass.const_expr(self.prio > 0):
+                if nblk > 0:
+                    cute.arch.mbarrier_wait(bk, phase=0)
             for stage in cutlass.range_constexpr(self.stages):
                 if stage < nblk:
                     if cutlass.const_expr(self.trace):
@@ -711,6 +718,7 @@ class Q16SplitPlan:
         merge_warps=4,
         lazy=0.0,
         pdl=False,
+        prio=0,
     ):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
@@ -745,6 +753,7 @@ class Q16SplitPlan:
             lazy=lazy,
             pdl=pdl,
             maxp=maxp,
+            prio=prio,
         )
         self.pdl = pdl
         views = self._views(query, kv, table, lengths)
