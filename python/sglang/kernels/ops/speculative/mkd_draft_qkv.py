@@ -16,8 +16,8 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _module(k: int, rows: int) -> Module:
-    args = make_cpp_args(k, rows, is_arch_support_pdl())
+def _module(k: int, warps: int, rows_per_warp: int) -> Module:
+    args = make_cpp_args(k, warps, rows_per_warp, is_arch_support_pdl())
     return load_jit(
         "mkd_draft_qkv",
         *args,
@@ -32,8 +32,10 @@ def mkd_draft_qkv(
     eps: float,
     weight: torch.Tensor,
     out: torch.Tensor,
+    warps: int = 8,
+    rows_per_warp: int = 2,
 ) -> torch.Tensor:
     """``out`` [1, N] bf16 = GemmaRMSNorm(``h`` [1, K]; ``gamma`` [K], ``eps``) @ ``weight`` [N, K]^T: the norm in fp32
-    rounded to bf16, then fp32 accumulation, one warp per row with the row held in registers before the PDL wait."""
-    _module(h.shape[-1], 4).run(h, gamma, weight, out, eps)
+    rounded to bf16, then fp32 accumulation; the weight rows are prefetched into L2 before the PDL wait."""
+    _module(h.shape[-1], warps, rows_per_warp).run(h, gamma, weight, out, eps)
     return out

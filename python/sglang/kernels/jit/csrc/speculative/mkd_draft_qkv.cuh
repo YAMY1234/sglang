@@ -1,7 +1,7 @@
 // One-row draft input norm + qkv GEMV: x = bf16(h * rsqrt(mean(h^2) + eps) * (1 + gamma)) (GemmaRMSNorm, fp32),
-// y[n] = bf16(sum_k W[n, k] * x[k]) (fp32 accumulation). One warp per row with the whole row held in registers,
-// loaded before the PDL wait together with gamma (weights are static), so the GEMV's weight stream runs under the
-// producer of h. Every CTA normalizes the full row itself (same reduction order in every CTA).
+// y[n] = bf16(sum_k W[n, k] * x[k]) (fp32 accumulation). Launched as a programmatic dependent: before its wait every
+// warp bulk-prefetches its weight rows into L2 (weights are static) and the CTA stages gamma; after it, every CTA
+// normalizes the full row itself (same reduction order in every CTA) and each warp reduces its rows from L2.
 
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
@@ -17,19 +17,6 @@
 
 namespace sglang {
 
-// Five 128-thread CTAs per SM (<= 102 registers a thread) keep all 2560 TP8 rows resident in one wave.
-constexpr int kMinBlocks = 5;
-
-// Volatile so the compiler keeps the weight loads ahead of griddepcontrol.wait (a plain __ldg is invariant and gets
-// sunk past it to its use).
-__device__ __forceinline__ uint4 ld_nc_v4(const uint4* p) {
-  uint4 r;
-  asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
-               : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w)
-               : "l"(p));
-  return r;
-}
-
 struct MkdQkvParams {
   const bf16_t* h;                   // [K], written by the previous grid
   const bf16_t* __restrict__ gamma;  // [K], raw GemmaRMSNorm weight (the kernel adds 1)
@@ -40,34 +27,35 @@ struct MkdQkvParams {
 };
 
 /**
- * \brief kRows warps per CTA; warp w of CTA c owns row kRows * c + w (the grid covers every row in one wave).
- * \tparam kK    reduction length (a multiple of 256 and of 8 * kRows * 32)
- * \tparam kRows warps per CTA
+ * \brief kWarps warps per CTA, each owning kRowsPerWarp consecutive rows; the next row is loaded while the current
+ * one is reduced.
+ * \tparam kK           reduction length (a multiple of 256 and of 8 * kWarps * 32)
+ * \tparam kWarps       warps per CTA
+ * \tparam kRowsPerWarp rows per warp
  */
-template <int kK, int kRows, bool kUsePDL>
-__global__ void __launch_bounds__(kRows * 32, kMinBlocks) mkd_qkv_kernel(const MkdQkvParams __grid_constant__ p) {
+template <int kK, int kWarps, int kRowsPerWarp, bool kUsePDL>
+__global__ void __launch_bounds__(kWarps * 32) mkd_qkv_kernel(const MkdQkvParams __grid_constant__ p) {
   using namespace device;
-  constexpr int kThreads = kRows * 32;
+  constexpr int kThreads = kWarps * 32;
   constexpr int kVecs = kK / 8 / 32;
   constexpr int kPer = kK / 8 / kThreads;
+  constexpr uint32_t kRowBytes = kK * sizeof(bf16_t);
   static_assert(kK % 256 == 0 && kK % (8 * kThreads) == 0, "K must tile the CTA");
   __shared__ alignas(16) bf16_t s_x[kK];
   __shared__ alignas(16) bf16_t s_g[kK];
-  __shared__ float s_red[kRows];
+  __shared__ float s_red[kWarps];
   const int warp = static_cast<int>(threadIdx.x / 32);
   const int lane = static_cast<int>(threadIdx.x % 32);
-  const int row = static_cast<int>(blockIdx.x) * kRows + warp;
+  const int row0 = (static_cast<int>(blockIdx.x) * kWarps + warp) * kRowsPerWarp;
   PDLTriggerSecondary<kUsePDL>();
-  // Unconditional (a tail warp re-reads the last row): a guarded load is if-converted and lands after the wait.
-  uint4 wv[kVecs];
-  const uint4* wr = reinterpret_cast<const uint4*>(p.w + static_cast<int64_t>(min(row, p.n - 1)) * kK);
-#pragma unroll
-  for (int j = 0; j < kVecs; ++j)
-    wv[j] = ld_nc_v4(wr + j * 32 + lane);
+  if (lane < kRowsPerWarp && row0 + lane < p.n) {
+    const bf16_t* src = p.w + static_cast<int64_t>(row0 + lane) * kK;
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(src), "r"(kRowBytes) : "memory");
+  }
 #pragma unroll
   for (int j = 0; j < kPer; ++j) {
     const int i = static_cast<int>(threadIdx.x) + j * kThreads;
-    reinterpret_cast<uint4*>(s_g)[i] = ld_nc_v4(reinterpret_cast<const uint4*>(p.gamma) + i);
+    reinterpret_cast<uint4*>(s_g)[i] = __ldg(reinterpret_cast<const uint4*>(p.gamma) + i);
   }
   PDLWaitPrimary<kUsePDL>();
   uint4 hv[kPer];
@@ -82,12 +70,20 @@ __global__ void __launch_bounds__(kRows * 32, kMinBlocks) mkd_qkv_kernel(const M
       ss = fmaf(f, f, ss);
     }
   }
+  // The first weight row is in flight while the norm runs.
+  uint4 wv[kVecs];
+  if (row0 < p.n) {
+    const uint4* wr = reinterpret_cast<const uint4*>(p.w + static_cast<int64_t>(row0) * kK);
+#pragma unroll
+    for (int j = 0; j < kVecs; ++j)
+      wv[j] = __ldg(wr + j * 32 + lane);
+  }
   ss = warp::reduce_sum(ss);
   if (lane == 0) s_red[warp] = ss;
   __syncthreads();
   float total = 0.0f;
 #pragma unroll
-  for (int r = 0; r < kRows; ++r)
+  for (int r = 0; r < kWarps; ++r)
     total += s_red[r];
   const float inv = rsqrtf(total / static_cast<float>(kK) + p.eps);
 #pragma unroll
@@ -104,22 +100,32 @@ __global__ void __launch_bounds__(kRows * 32, kMinBlocks) mkd_qkv_kernel(const M
     reinterpret_cast<uint4*>(s_x)[i] = xv;
   }
   __syncthreads();
-  if (row >= p.n) return;
-  float acc = 0.0f;
+#pragma unroll 1
+  for (int r = 0; r < kRowsPerWarp; ++r) {
+    const int row = row0 + r;
+    if (row >= p.n) break;
+    float acc = 0.0f;
 #pragma unroll
-  for (int j = 0; j < kVecs; ++j) {
-    const uint4 xv = reinterpret_cast<const uint4*>(s_x)[j * 32 + lane];
-    const bf16_t* a = reinterpret_cast<const bf16_t*>(&wv[j]);
-    const bf16_t* b = reinterpret_cast<const bf16_t*>(&xv);
+    for (int j = 0; j < kVecs; ++j) {
+      const uint4 xv = reinterpret_cast<const uint4*>(s_x)[j * 32 + lane];
+      const bf16_t* a = reinterpret_cast<const bf16_t*>(&wv[j]);
+      const bf16_t* b = reinterpret_cast<const bf16_t*>(&xv);
 #pragma unroll
-    for (int e = 0; e < 8; ++e)
-      acc = fmaf(cast<fp32_t>(a[e]), cast<fp32_t>(b[e]), acc);
+      for (int e = 0; e < 8; ++e)
+        acc = fmaf(cast<fp32_t>(a[e]), cast<fp32_t>(b[e]), acc);
+    }
+    if (r + 1 < kRowsPerWarp && row + 1 < p.n) {
+      const uint4* wr = reinterpret_cast<const uint4*>(p.w + static_cast<int64_t>(row + 1) * kK);
+#pragma unroll
+      for (int j = 0; j < kVecs; ++j)
+        wv[j] = __ldg(wr + j * 32 + lane);
+    }
+    acc = warp::reduce_sum(acc);
+    if (lane == 0) p.y[row] = cast<bf16_t>(acc);
   }
-  acc = warp::reduce_sum(acc);
-  if (lane == 0) p.y[row] = cast<bf16_t>(acc);
 }
 
-template <int kK, int kRows, bool kUsePDL>
+template <int kK, int kWarps, int kRowsPerWarp, bool kUsePDL>
 struct MkdQkv {
   static void
   run(const tvm::ffi::TensorView h,
@@ -144,8 +150,9 @@ struct MkdQkv {
         .eps = static_cast<float>(eps),
         .n = n,
     };
-    const auto kernel = mkd_qkv_kernel<kK, kRows, kUsePDL>;
-    LaunchKernel(static_cast<uint32_t>((n + kRows - 1) / kRows), kRows * 32, device.unwrap())
+    constexpr int kRowsPerCta = kWarps * kRowsPerWarp;
+    const auto kernel = mkd_qkv_kernel<kK, kWarps, kRowsPerWarp, kUsePDL>;
+    LaunchKernel(static_cast<uint32_t>((n + kRowsPerCta - 1) / kRowsPerCta), kWarps * 32, device.unwrap())
         .enable_pdl(kUsePDL)(kernel, params);
   }
 };
