@@ -1476,6 +1476,8 @@ class Envs:
     SGLANG_Q35MF_ARRIVE_DRAFT_PREP = EnvBool(False)
     # The draft-decode graph rebuilds every draft step's attention metadata in one launch.
     SGLANG_Q35MF_BK_DRAFT_META = EnvBool(False)
+    # The fused small-field copy gives each field its own blocks and moves aligned fields in 16 B units.
+    SGLANG_Q35MF_BK_VEC_COPY = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)

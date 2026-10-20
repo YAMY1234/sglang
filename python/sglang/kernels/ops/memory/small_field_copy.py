@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -23,9 +24,9 @@ _ENTRIES = 7
 _RAW_KIND = {1: 0, 2: 1, 4: 2, 8: 3}
 # (dst dtype, src dtype) -> width-cast kind
 _CAST_KIND = {(torch.int64, torch.int32): 4, (torch.int32, torch.int64): 5}
-# The per-element launch; the 16-byte launch with a block per field is taken only
-# with SGLANG_Q35MF_BK_VEC_COPY.
-_VEC = False
+# The 16-byte launch with a block per field (SGLANG_Q35MF_BK_VEC_COPY), else the
+# per-element launch, its bitwise reference; read once, fixed per process.
+_VEC = envs.SGLANG_Q35MF_BK_VEC_COPY.get()
 
 
 @cache_once
