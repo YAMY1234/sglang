@@ -306,6 +306,24 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_decide_kernel(const Ll16VpDe
   const int warp = t / 32;
   const int lane = static_cast<int>(get_lane_id());
   const int64_t row0 = static_cast<int64_t>(b) * p.d;
+  const int rows_pad = p.meta[0];
+  // The last d - 1 threads (no payload pairs at d * world <= kThreads - d + 1) read the draft tokens' logits
+  // from their shards while the others combine the payloads.
+  const int xl = t - (kThreads - (p.d - 1));
+  if (p.sample && xl >= 0) {
+    // Row xl verifies draft token xl + 1.
+    const int64_t tok = p.candidates[row0 + xl + 1];
+    float xd = -INFINITY;
+    if (tok >= 0 && tok < static_cast<int64_t>(p.vocab) * p.world) {
+      const int w = static_cast<int>(tok / p.vocab);
+      const int64_t g = static_cast<int64_t>(p.rank) * rows_pad + row0 + xl;
+      const bf16_t* src =
+          reinterpret_cast<const bf16_t*>(p.peer_logits[w]) + g * p.ld + (tok - static_cast<int64_t>(w) * p.vocab);
+      xd = ll16_vp::load_peer_bf16(src);
+      if (xd != xd) xd = -INFINITY;
+    }
+    s_xd[xl] = xd;
+  }
   for (int pair = t; pair < p.d * p.world; pair += kThreads) {
     const int j = pair / p.world;
     const int w = pair % p.world;
@@ -349,23 +367,6 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_decide_kernel(const Ll16VpDe
     p.argmax[row0 + t] = bid;
   }
   if (!p.sample) return;
-
-  const int rows_pad = p.meta[0];
-  const int64_t vocab_total = static_cast<int64_t>(p.vocab) * p.world;
-  if (t < p.d - 1) {
-    // Row t verifies draft token t + 1.
-    const int64_t tok = p.candidates[row0 + t + 1];
-    float xd = -INFINITY;
-    if (tok >= 0 && tok < vocab_total) {
-      const int w = static_cast<int>(tok / p.vocab);
-      const int64_t g = static_cast<int64_t>(p.rank) * rows_pad + row0 + t;
-      const bf16_t* src =
-          reinterpret_cast<const bf16_t*>(p.peer_logits[w]) + g * p.ld + (tok - static_cast<int64_t>(w) * p.vocab);
-      xd = ll16_vp::load_peer_bf16(src);
-      if (xd != xd) xd = -INFINITY;
-    }
-    s_xd[t] = xd;
-  }
   __syncthreads();
 
   if (t == 0) {
