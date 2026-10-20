@@ -2212,6 +2212,9 @@ class Envs:
     SGLANG_Q35MF_GDN_VIEWS = EnvBool(False)
     SGLANG_Q35MF_GDN_LAZY_VALID = EnvBool(False)
     SGLANG_Q35MF_GDN_CONV_TILE = EnvBool(False)
+    # Verify conv update: read the prior state rows, weights and bias before the PDL wait (only the
+    # projection output is read after it); same values and arithmetic.
+    SGLANG_Q35MF_GDN_CONV_EARLY = EnvBool(False)
     SGLANG_Q35MF_GDN_TILED_VERIFY = EnvBool(False)
     SGLANG_Q35MF_GDN_VERIFY_BV64 = EnvBool(False)
     SGLANG_Q35MF_KGDN_VERIFY_REG168 = EnvBool(False)

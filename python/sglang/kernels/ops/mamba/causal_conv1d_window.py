@@ -69,12 +69,18 @@ def coalesced_window_update_kernel(
     USE_GDC: tl.constexpr = False,
     COALESCED_WINDOW: tl.constexpr = False,
     WINDOW_FLAT: tl.constexpr = 4096,
+    EARLY_STATE: tl.constexpr = False,
 ):
+    tl.static_assert(COALESCED_WINDOW or (not EARLY_STATE))
     if USE_GDC:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
+        if not EARLY_STATE:
+            tl.extra.cuda.gdc_wait()
+            tl.extra.cuda.gdc_launch_dependents()
     idx_seq = tl.program_id(0)
     if idx_seq >= batch:
+        if USE_GDC:
+            if EARLY_STATE:
+                tl.extra.cuda.gdc_wait()
         return
     idx_feats = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
     if IS_CONTINUOUS_BATCHING:
@@ -90,6 +96,9 @@ def coalesced_window_update_kernel(
         conv_state_batch_coord = idx_seq
     if USE_PAD_SLOT:
         if conv_state_batch_coord == pad_slot_id:
+            if USE_GDC:
+                if EARLY_STATE:
+                    tl.extra.cuda.gdc_wait()
             return
     if IS_SPEC_DECODING:
         conv_state_token_offset = tl.load(num_accept_tokens_ptr + idx_seq) - 1
@@ -135,6 +144,23 @@ def coalesced_window_update_kernel(
             mask=window_mask & (window_positions < 2),
             other=0.0,
         )
+        if EARLY_STATE:
+            # Bias, weights and prior state rows do not depend on the producer; only x is read after the wait.
+            if HAS_BIAS:
+                acc_preload = tl.load(
+                    bias_ptr + idx_feats, mask=idx_feats < dim, other=0.0
+                ).to(tl.float32)
+            else:
+                acc_preload = tl.zeros((BLOCK_N,), dtype=tl.float32)
+            w_base = w_ptr + idx_feats * stride_w_dim
+            mask_w = idx_feats < dim
+            w_col0 = tl.load(w_base + 0 * stride_w_width, mask_w, other=0.0)
+            w_col1 = tl.load(w_base + 1 * stride_w_width, mask_w, other=0.0)
+            w_col2 = tl.load(w_base + 2 * stride_w_width, mask_w, other=0.0)
+            w_col3 = tl.load(w_base + 3 * stride_w_width, mask_w, other=0.0)
+            if USE_GDC:
+                tl.extra.cuda.gdc_wait()
+                tl.extra.cuda.gdc_launch_dependents()
         window_x = tl.load(
             x_ptr
             + idx_seq * stride_x_seq
@@ -182,12 +208,13 @@ def coalesced_window_update_kernel(
     )
     mask = (idx_tokens < state_len)[:, None] & (idx_feats < dim)[None, :]
     tl.store(conv_state_ptrs_target, new_conv_state, mask)
-    if HAS_BIAS:
-        bias = bias_ptr + idx_feats
-        mask_bias = idx_feats < dim
-        acc_preload = tl.load(bias, mask=mask_bias, other=0.0).to(tl.float32)
-    else:
-        acc_preload = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    if not EARLY_STATE:
+        if HAS_BIAS:
+            bias = bias_ptr + idx_feats
+            mask_bias = idx_feats < dim
+            acc_preload = tl.load(bias, mask=mask_bias, other=0.0).to(tl.float32)
+        else:
+            acc_preload = tl.zeros((BLOCK_N,), dtype=tl.float32)
     if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
         idx_tokens = tl.arange(0, NP2_SEQLEN)
         mask_retrieve = idx_tokens < seqlen
@@ -204,19 +231,20 @@ def coalesced_window_update_kernel(
         )
         retrieve_next_siblings = tl.load(retrieve_next_sibling_base, mask_retrieve)
         parent_idx_tokens = tl.zeros((NP2_SEQLEN,), dtype=tl.int32)
-    w_base = w_ptr + idx_feats * stride_w_dim
-    mask_w = idx_feats < dim
-    if KERNEL_WIDTH >= 2:
-        w_ptrs = w_base + 0 * stride_w_width
-        w_col0 = tl.load(w_ptrs, mask_w, other=0.0)
-        w_ptrs = w_base + 1 * stride_w_width
-        w_col1 = tl.load(w_ptrs, mask_w, other=0.0)
-    if KERNEL_WIDTH >= 3:
-        w_ptrs = w_base + 2 * stride_w_width
-        w_col2 = tl.load(w_ptrs, mask_w, other=0.0)
-    if KERNEL_WIDTH >= 4:
-        w_ptrs = w_base + 3 * stride_w_width
-        w_col3 = tl.load(w_ptrs, mask_w, other=0.0)
+    if not EARLY_STATE:
+        w_base = w_ptr + idx_feats * stride_w_dim
+        mask_w = idx_feats < dim
+        if KERNEL_WIDTH >= 2:
+            w_ptrs = w_base + 0 * stride_w_width
+            w_col0 = tl.load(w_ptrs, mask_w, other=0.0)
+            w_ptrs = w_base + 1 * stride_w_width
+            w_col1 = tl.load(w_ptrs, mask_w, other=0.0)
+        if KERNEL_WIDTH >= 3:
+            w_ptrs = w_base + 2 * stride_w_width
+            w_col2 = tl.load(w_ptrs, mask_w, other=0.0)
+        if KERNEL_WIDTH >= 4:
+            w_ptrs = w_base + 3 * stride_w_width
+            w_col3 = tl.load(w_ptrs, mask_w, other=0.0)
     x_base_1d = x_base
     mask_x_1d = idx_feats < dim
     for idx_token in tl.static_range(seqlen):
