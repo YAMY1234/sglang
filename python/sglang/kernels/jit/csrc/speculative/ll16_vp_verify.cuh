@@ -70,6 +70,15 @@ SGL_DEVICE float bf16_bits_to_float(uint32_t bits16) {
   return __uint_as_float(bits16 << 16);
 }
 
+// Phase stamps for the T1 harness (null trace = off).
+SGL_DEVICE void stamp(uint64_t* trace, int64_t slot) {
+  if (trace != nullptr && threadIdx.x == 0) {
+    uint64_t t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    trace[slot] = t;
+  }
+}
+
 SGL_DEVICE float load_peer_bf16(const bf16_t* ptr) {
   uint16_t raw;
   asm volatile("ld.relaxed.sys.global.b16 %0, [%1];" : "=h"(raw) : "l"(ptr) : "memory");
@@ -93,6 +102,7 @@ struct Ll16VpShardParams {
   int32_t world;
   int32_t rows;
   int32_t g_max;
+  uint64_t* trace;  // [g_max, 8] globaltimer stamps or null
 };
 
 /**
@@ -118,6 +128,7 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_shard_kernel(const Ll16VpSha
   const int g = static_cast<int>(blockIdx.x);
   const int t = static_cast<int>(threadIdx.x);
   const int warp = t / 32;
+  ll16_vp::stamp(p.trace, g * 8 + 0);
   const int lane = static_cast<int>(get_lane_id());
   const bf16_t* row = p.logits + static_cast<int64_t>(g) * p.ld;
   // Issued with the row loads so the push at the end waits on nothing.
@@ -202,6 +213,7 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_shard_kernel(const Ll16VpSha
     s_cz[t] = bz;
   }
   __syncthreads();
+  ll16_vp::stamp(p.trace, g * 8 + 1);
 
   const int64_t row_words = (static_cast<int64_t>(half) * p.g_max + g) * p.world * ll16_vp::kWords;
   if (threadIdx.x == 0) {
@@ -224,6 +236,7 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_shard_kernel(const Ll16VpSha
     ptx::st_relaxed_16B(w0, dst, 0);
     ptx::st_relaxed_16B(w1, dst, 1);
     ptx::st_relaxed_16B(w2, dst, 2);
+    ll16_vp::stamp(p.trace, g * 8 + 2);
   }
   if (owner != p.rank) {
     if (threadIdx.x == 0) p.epoch[g] = half ^ 1u;
@@ -246,11 +259,13 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_shard_kernel(const Ll16VpSha
     ptx::st_global_16B(marker, incoming, threadIdx.x);
   }
   __syncthreads();
+  ll16_vp::stamp(p.trace, g * 8 + 3);
   if (threadIdx.x == 0) {
     asm volatile("fence.acq_rel.sys;" ::: "memory");
     p.epoch[g] = half ^ 1u;
     if (j == 0) p.meta[0] = p.rows;
   }
+  ll16_vp::stamp(p.trace, g * 8 + 4);
 }
 
 struct Ll16VpDecideParams {
@@ -273,6 +288,7 @@ struct Ll16VpDecideParams {
   int32_t d;
   int32_t accept_width;
   int32_t sample;
+  uint64_t* trace;  // [bs, 8] globaltimer stamps or null
 };
 
 /**
@@ -317,6 +333,7 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_decide_kernel(const Ll16VpDe
   const int warp = t / 32;
   const int lane = static_cast<int>(get_lane_id());
   const int64_t row0 = static_cast<int64_t>(b) * p.d;
+  ll16_vp::stamp(p.trace, b * 8 + 0);
   const int rows_pad = p.meta[0];
   // The last d - 1 threads (no payload pairs at d * world <= kThreads - d + 1) read the draft tokens' logits
   // from their shards while the others combine the payloads.
@@ -394,6 +411,7 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_decide_kernel(const Ll16VpDe
   }
   if (!p.sample) return;
   __syncthreads();
+  ll16_vp::stamp(p.trace, b * 8 + 1);
 
   if (t == 0) {
     float coin = s_coin[0];
@@ -505,6 +523,7 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_decide_kernel(const Ll16VpDe
     s_last_ret = last_ret;
   }
   __syncthreads();
+  ll16_vp::stamp(p.trace, b * 8 + 2);
 
   // The drawn chunk, read from its shard: inclusive scan of q in vocab order, first index past u2.
   const int sel = s_sel;
@@ -545,6 +564,7 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_decide_kernel(const Ll16VpDe
         q[i * 8 + e] = 0.f;
     }
   }
+  ll16_vp::stamp(p.trace, b * 8 + 3);
   // Exclusive scan of the per-thread sums (threads hold consecutive ranges).
   float incl = tsum;
 #pragma unroll
@@ -589,6 +609,7 @@ __global__ void __launch_bounds__(kThreads) ll16_vp_decide_kernel(const Ll16VpDe
     }
     const int pick = f != 0x7fffffff ? f : (l >= 0 ? l : p.vocab - 1);
     p.predict[s_last_ret] = static_cast<int32_t>(static_cast<int64_t>(sel) * p.vocab + pick);
+    ll16_vp::stamp(p.trace, b * 8 + 4);
   }
 }
 
@@ -640,6 +661,7 @@ struct Ll16VpVerify {
       const tvm::ffi::TensorView epoch,
       const tvm::ffi::TensorView stats,
       const tvm::ffi::TensorView meta,
+      const tvm::ffi::TensorView trace,
       int64_t chunk,
       int64_t vocab_start,
       int64_t rank,
@@ -692,6 +714,7 @@ struct Ll16VpVerify {
         .world = static_cast<int32_t>(world),
         .rows = static_cast<int32_t>(rows),
         .g_max = static_cast<int32_t>(GM.unwrap()),
+        .trace = trace.numel() >= g * 8 ? static_cast<uint64_t*>(trace.data_ptr()) : nullptr,
     };
     LaunchKernel(dim3(static_cast<uint32_t>(g)), kShardThreads, device.unwrap())
         .enable_pdl(kUsePDL)(ll16_vp_shard_kernel<kShardThreads, kUsePDL>, params);
@@ -709,6 +732,7 @@ struct Ll16VpVerify {
       const tvm::ffi::TensorView accept_index,
       const tvm::ffi::TensorView num_correct,
       const tvm::ffi::TensorView argmax,
+      const tvm::ffi::TensorView trace,
       int64_t ld,
       int64_t vocab,
       int64_t chunk,
@@ -777,6 +801,7 @@ struct Ll16VpVerify {
         .d = static_cast<int32_t>(d),
         .accept_width = static_cast<int32_t>(accept_width),
         .sample = static_cast<int32_t>(sample != 0),
+        .trace = trace.numel() >= bs * 8 ? static_cast<uint64_t*>(trace.data_ptr()) : nullptr,
     };
     LaunchKernel(dim3(static_cast<uint32_t>(bs)), kDecideThreads, device.unwrap())
         .enable_pdl(kUsePDL)(ll16_vp_decide_kernel<kDecideThreads, kUsePDL>, params);

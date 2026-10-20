@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -37,6 +37,10 @@ def _module() -> Module:
     )
 
 
+def _no_trace(like: torch.Tensor) -> torch.Tensor:
+    return torch.empty((0,), dtype=torch.int64, device=like.device)
+
+
 def vp_chunk(vocab_local: int) -> int:
     """Elements per chunk: the shard row in CHUNKS chunks of 16-byte vectors."""
     chunk = -(-vocab_local // CHUNKS)
@@ -58,9 +62,11 @@ def vp_shard(
     vocab_start: int,
     rank: int,
     rows: int,
+    trace: Optional[torch.Tensor] = None,
 ) -> None:
     """Reduce this rank's shard ``logits`` [world * rows, V_local] of every gathered row (rank-major)
-    and exchange the payloads; this rank's rows land in ``stats`` [rows, world, WORDS]."""
+    and exchange the payloads; this rank's rows land in ``stats`` [rows, world, WORDS]. ``trace``
+    (int64 [rows * world, 8], T1 only) gets globaltimer phase stamps."""
     _module().shard(
         logits,
         slots,
@@ -68,6 +74,7 @@ def vp_shard(
         epoch,
         stats,
         meta,
+        _no_trace(logits) if trace is None else trace,
         vp_chunk(logits.shape[1]),
         vocab_start,
         rank,
@@ -92,6 +99,7 @@ def vp_decide(
     vocab_local: int,
     rank: int,
     sample: bool,
+    trace: Optional[torch.Tensor] = None,
 ) -> None:
     """Argmax of every row into ``argmax`` [bs * d]; with ``sample``, the temperature-1 chain into
     ``predict`` / ``accept_index`` / ``num_correct_drafts`` as sample_chain_full_vocab."""
@@ -107,6 +115,7 @@ def vp_decide(
         accept_index,
         num_correct_drafts,
         argmax,
+        _no_trace(argmax) if trace is None else trace,
         ld,
         vocab_local,
         vp_chunk(vocab_local),
