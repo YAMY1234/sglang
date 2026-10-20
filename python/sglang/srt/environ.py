@@ -1295,6 +1295,9 @@ class Envs:
     # With SGLANG_Q35MF_DEP_ROUTE_FRONT, from 17 to 64 tokens: the router GEMM in the same launch too, one 16-row
     # token group per grid row (bitwise to the stock router GEMM only if that keeps the 16-row order).
     SGLANG_Q35MF_DEP_ROUTE_FRONT_GROUPED = EnvBool(False)
+    # Debug only: with SGLANG_Q35MF_DEP_ROUTE_FRONT, also run the stock gate, top-k and dispatch quant in the same
+    # (captured) forward and log, per token count, how many rows of each output differ.
+    SGLANG_Q35MF_DEP_ROUTE_FRONT_CHECK = EnvBool(False)
     # FlashInfer A2A dispatch into the cute-dsl runner: the EP rank's routing tables from one single-CTA launch over
     # the received ids instead of moe_sort, and the finalize written straight into the combine workspace.
     SGLANG_Q35MF_DEP_EP_TABLES = EnvBool(False)

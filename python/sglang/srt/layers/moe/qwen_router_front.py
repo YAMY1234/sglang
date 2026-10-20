@@ -1031,6 +1031,83 @@ _DEP_FRONT_MAX_TOKENS = 16  # router GEMM in the launch; above it the stock rout
 _DEP_MAX_TOKENS = 64
 _dep_static_by_block: dict[int, bool] = {}
 _dep_engaged: set[tuple[int, int]] = set()
+# SGLANG_Q35MF_DEP_ROUTE_FRONT_CHECK: per token count, rows checked and rows that differ from the stock path.
+_DEP_CHECK_FIELDS = ("rows", "logits", "logit_elems", "ids", "id_sets", "weights", "x_fp4", "x_sf")
+_dep_check_counts: Optional[torch.Tensor] = None
+
+
+def _dep_check_report_loop(period_s: float = 20.0) -> None:
+    import time
+
+    last = None
+    while True:
+        time.sleep(period_s)
+        # A device copy from this thread during graph capture would invalidate the capture, so wait for the
+        # server's READY status (serve.sh mounts the run's log dir at /logs).
+        try:
+            with open("/logs/status") as f:
+                if not f.read().startswith("READY"):
+                    continue
+        except OSError:
+            continue
+        counts = _dep_check_counts.cpu().tolist()
+        lines = [
+            f"m={m} " + " ".join(f"{k}={v}" for k, v in zip(_DEP_CHECK_FIELDS, row))
+            for m, row in enumerate(counts)
+            if row[0]
+        ]
+        if lines != last:
+            logger.info("SGLANG_Q35MF_DEP_ROUTE_FRONT_CHECK %s", " | ".join(lines))
+            last = lines
+
+
+def _dep_check(
+    *,
+    block: Qwen2MoeSparseMoeBlock,
+    hidden_states: torch.Tensor,
+    global_scale: torch.Tensor,
+    fused: Tuple[torch.Tensor, ...],
+) -> None:
+    """Count the rows where the fused outputs differ from the stock gate + top-k + dispatch quant on the same input.
+    Device-side counters only, so it runs inside CUDA graph capture and replay."""
+    global _dep_check_counts
+    import threading
+
+    from sglang.srt.layers.moe.topk import TopKOutputChecker
+    from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
+
+    m = hidden_states.shape[0]
+    if _dep_check_counts is None:
+        _dep_check_counts = torch.zeros(
+            (_DEP_MAX_TOKENS + 1, len(_DEP_CHECK_FIELDS)),
+            dtype=torch.int64,
+            device=hidden_states.device,
+        )
+        threading.Thread(target=_dep_check_report_loop, daemon=True).start()
+    ref_logits, _ = block.gate(hidden_states)
+    ref = block.topk(hidden_states, ref_logits)
+    if TopKOutputChecker.format_is_bypassed(ref):
+        ref = ref.to_standard()
+    ref_xq, ref_xsf = fp4_quantize(hidden_states, global_scale, is_sf_swizzled_layout=False)
+    logits, topk_ids, topk_weights, x_fp4, x_sf = fused
+
+    def rows_ne(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        return (a.reshape(m, -1) != b.reshape(m, -1)).any(dim=1).sum()
+
+    ref_ids = ref.topk_ids.to(torch.int32)
+    diff = torch.stack(
+        [
+            torch.full((), m, dtype=torch.int64, device=hidden_states.device),
+            rows_ne(logits, ref_logits),
+            (logits != ref_logits).sum(),
+            rows_ne(topk_ids, ref_ids),
+            rows_ne(topk_ids.sort(dim=1).values, ref_ids.sort(dim=1).values),
+            rows_ne(topk_weights, ref.topk_weights),
+            rows_ne(x_fp4.view(torch.uint8), ref_xq.view(torch.uint8)),
+            rows_ne(x_sf.view(torch.uint8), ref_xsf.view(torch.uint8)),
+        ]
+    )
+    _dep_check_counts[m].add_(diff)
 
 
 def _dep_static_supported(block: Qwen2MoeSparseMoeBlock) -> bool:
@@ -1141,6 +1218,13 @@ def forward_routed_dep(
     build_precomputed_topk_output(
         topk_weights, topk_ids, block.topk.topk_config, block.topk.layer_id
     )
+    if envs.SGLANG_Q35MF_DEP_ROUTE_FRONT_CHECK.get():
+        _dep_check(
+            block=block,
+            hidden_states=hidden_states,
+            global_scale=global_scale,
+            fused=(logits, topk_ids, topk_weights, x_fp4, x_sf),
+        )
     disp.stage_nvfp4_input(hidden_states, x_fp4, x_sf)
     key = (block.topk.layer_id, hidden_states.shape[0])
     if key not in _dep_engaged:
