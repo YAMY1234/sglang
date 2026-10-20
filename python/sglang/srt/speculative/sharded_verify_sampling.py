@@ -397,17 +397,25 @@ def _db1_value(key):
 
 
 @triton.jit
-def _db1_chunk_max_kernel(
-    logits_ptr, stride_row, local_vocab, cmax_ptr, nchunk, cnt_ptr, CH: tl.constexpr
-):
+def _db1_chunk_max_kernel(logits_ptr, stride_row, local_vocab, cmax_ptr, nchunk, CH: tl.constexpr):
     r = tl.program_id(0)
     c = tl.program_id(1)
     offs = c * CH + tl.arange(0, CH)
     m = offs < local_vocab
     x = tl.load(logits_ptr + r * stride_row + offs, mask=m, other=0.0).to(tl.float32)
     tl.store(cmax_ptr + r * nchunk + c, tl.max(tl.where(m, _db1_key(x), -1), axis=0))
-    if c == 0:
-        tl.store(cnt_ptr + r, 0)
+
+
+@triton.jit
+def _db1_threshold_kernel(cmax_ptr, nchunk, thr_ptr, cnt_ptr, K: tl.constexpr, BN: tl.constexpr):
+    # The k-th largest chunk maximum: at least k elements of the row reach it, so the row's top-k (with
+    # every element equal to the k-th value) lies at or above it. Fewer than k chunks: no threshold.
+    r = tl.program_id(0)
+    i = tl.arange(0, BN)
+    v = tl.load(cmax_ptr + r * nchunk + i, mask=i < nchunk, other=-1)
+    srt = tl.sort(v, 0, descending=True)
+    tl.store(thr_ptr + r, tl.max(tl.where(i == K - 1, srt, -1), axis=0))
+    tl.store(cnt_ptr + r, 0)
 
 
 @triton.jit
@@ -416,27 +424,19 @@ def _db1_compact_kernel(
     stride_row,
     local_vocab,
     vocab_start,
-    cmax_ptr,
-    nchunk,
+    thr_ptr,
     cnt_ptr,
     cand_ptr,
-    K: tl.constexpr,
     CAP: tl.constexpr,
     CH: tl.constexpr,
-    BN: tl.constexpr,
 ):
-    # Threshold = the k-th largest chunk maximum: at least k elements of the row reach it, so the row's
-    # top-k (with every element equal to the k-th value) lies at or above it. Fewer than k chunks: none.
     r = tl.program_id(0)
     c = tl.program_id(1)
-    i = tl.arange(0, BN)
-    v = tl.load(cmax_ptr + r * nchunk + i, mask=i < nchunk, other=-1)
-    thr = tl.max(tl.where(i == K - 1, tl.sort(v, 0, descending=True), -1), axis=0)
     offs = c * CH + tl.arange(0, CH)
     m = offs < local_vocab
     x = tl.load(logits_ptr + r * stride_row + offs, mask=m, other=0.0).to(tl.float32)
     key = _db1_key(x)
-    sel = m & (key >= thr)
+    sel = m & (key >= tl.load(thr_ptr + r))
     n = tl.sum(sel.to(tl.int32), axis=0)
     if n > 0:
         base = tl.atomic_add(cnt_ptr + r, n)
@@ -899,25 +899,26 @@ class ShardedVerifySampler:
         nchunk = triton.cdiv(local_vocab, _DB1_CHUNK)
         vocab_start = self.rank * local_vocab
         cmax = torch.empty((rows, nchunk), dtype=torch.int64, device=dev)
+        thr = torch.empty((rows,), dtype=torch.int64, device=dev)
         cnt = torch.empty((rows,), dtype=torch.int32, device=dev)
         cand = torch.empty((rows, _DB1_CAP), dtype=torch.int64, device=dev)
         buf = torch.empty((self.world * rows * k * 2,), dtype=torch.float32, device=dev)
         _db1_chunk_max_kernel[(rows, nchunk)](
-            logits, logits.stride(0), local_vocab, cmax, nchunk, cnt, CH=_DB1_CHUNK, num_warps=4
+            logits, logits.stride(0), local_vocab, cmax, nchunk, CH=_DB1_CHUNK, num_warps=4
+        )
+        _db1_threshold_kernel[(rows,)](
+            cmax, nchunk, thr, cnt, K=k, BN=_next_pow2(nchunk), num_warps=4
         )
         _db1_compact_kernel[(rows, nchunk)](
             logits,
             logits.stride(0),
             local_vocab,
             vocab_start,
-            cmax,
-            nchunk,
+            thr,
             cnt,
             cand,
-            K=k,
             CAP=_DB1_CAP,
             CH=_DB1_CHUNK,
-            BN=_next_pow2(nchunk),
             num_warps=4,
         )
         _db1_select_kernel[(rows,)](
