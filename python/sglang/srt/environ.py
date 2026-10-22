@@ -1488,6 +1488,9 @@ class Envs:
     # takes the high priority so the commit's CTAs fill only what the draft leaves free.
     # Needs SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH (bit-identical).
     SGLANG_Q35MF_COMMIT_BEHIND_DRAFT = EnvBool(False)
+    # Overrides the forward stream's priority (A/B of the two halves above); unset keeps
+    # the highest with SGLANG_Q35MF_COMMIT_BEHIND_DRAFT, else the default 0.
+    SGLANG_Q35MF_FORWARD_STREAM_PRIORITY = EnvInt(None)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)

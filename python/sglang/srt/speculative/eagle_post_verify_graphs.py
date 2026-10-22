@@ -36,7 +36,11 @@ _COMMIT_BEHIND_DRAFT = envs.SGLANG_Q35MF_COMMIT_BEHIND_DRAFT.get()
 
 def forward_stream_priority() -> int:
     """The forward stream's priority: the highest with SGLANG_Q35MF_COMMIT_BEHIND_DRAFT
-    (the commit side stream keeps the default, lowest one), else the default."""
+    (the commit side stream keeps the default, lowest one), else the default;
+    SGLANG_Q35MF_FORWARD_STREAM_PRIORITY overrides both."""
+    priority = envs.SGLANG_Q35MF_FORWARD_STREAM_PRIORITY.get()
+    if priority is not None:
+        return priority
     if not _COMMIT_BEHIND_DRAFT or not torch.cuda.is_available():
         return 0
     return torch.cuda.Stream.priority_range()[1]
