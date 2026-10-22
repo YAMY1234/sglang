@@ -1479,6 +1479,9 @@ class Envs:
     # A sampled verify result (predict, accept_index, num_correct_drafts) is one int32
     # buffer, broadcast to the TP group once.
     SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST = EnvBool(False)
+    # The compact ReplaySSM commit of every GDN layer as one CUDA launch (one CTA per layer,
+    # request and value head); the same four high / low products, FP32 sums in another order.
+    SGLANG_Q35MF_COMMIT_CUDA = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
