@@ -1706,6 +1706,9 @@ class Envs:
     # PD request timing trace: one "L12T" log line per finished request on each P / D
     # TP0 (wall-clock stage times, keyed by bootstrap_room) and per transfer chunk on P TP0.
     SGLANG_TRTL12_TRACE = EnvBool(False)
+    # The compact ReplaySSM commit of every GDN layer as one CUDA launch (one CTA per layer,
+    # request and value head); the same four high / low products, FP32 sums in another order.
+    SGLANG_Q35MF_COMMIT_CUDA = EnvBool(False)
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)

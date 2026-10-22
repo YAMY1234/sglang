@@ -1690,6 +1690,7 @@ def commit_gdn_replayssm_circular(
     mamba_track_indices: torch.Tensor | None = None,
     mamba_steps_to_track: torch.Tensor | None = None,
     null_block_id: int = -1,
+    use_cuda: bool = False,
 ) -> None:
     """Materialize circular history only for capacity and track rows.
 
@@ -1707,6 +1708,27 @@ def commit_gdn_replayssm_circular(
     k_residual_buf = k_residual_cache if has_residual else k_cache
     BV = min(triton.next_power_of_2(V), 64)
     has_track = mamba_track_indices is not None and mamba_steps_to_track is not None
+    if use_cuda and _commit_cuda(
+        checkpoint_state=checkpoint_state,
+        d_cache=d_cache,
+        k_cache=k_cache,
+        g_cache=g_cache,
+        d_residual_cache=d_residual_cache if has_residual else None,
+        k_residual_cache=k_residual_cache if has_residual else None,
+        state_batch_indices=state_batch_indices,
+        replay_indices=replay_indices,
+        write_pos=write_pos,
+        cache_base=cache_base,
+        is_flush=is_flush,
+        accept_lens=accept_lens,
+        mamba_track_indices=mamba_track_indices if has_track else None,
+        mamba_steps_to_track=mamba_steps_to_track if has_track else None,
+        null_block_id=null_block_id,
+    ):
+        _finish_circular_fold(
+            write_pos, cache_base, is_flush, state_batch_indices, replay_indices, max_cache_len, null_block_id
+        )
+        return
     if not has_track and V % BV == 0 and _commit_persist_on():
         rings = (d_cache, k_cache, g_cache, d_residual_buf, k_residual_buf)
         shadow = _commit_shadow_begin(checkpoint_state, state_batch_indices)
@@ -1810,7 +1832,7 @@ def _finish_circular_fold(
         stride_indices=state_batch_indices.stride(0),
         stride_replay_indices=replay_indices.stride(0),
         MAX_CACHE_LEN=max_cache_len,
-        BLOCK=block,
+        BLOCK=triton.next_power_of_2(max(1, B)),
         NULL_BLOCK_ID=null_block_id,
     )
 
@@ -1963,3 +1985,11 @@ def reset_gdn_replayssm_spec_cursors(
         BLOCK=BLOCK,
         NULL_BLOCK_ID=null_block_id,
     )
+
+
+def _commit_cuda(**kw) -> bool:
+    """The compact commit as one CUDA launch when its shapes fit and it can be issued now
+    (compiled, or not under graph capture); False leaves the commit to the Triton kernel."""
+    from sglang.kernels.ops.attention.fla import gdn_replayssm_commit_cuda as cuda_commit
+
+    return cuda_commit.try_commit(**kw)
