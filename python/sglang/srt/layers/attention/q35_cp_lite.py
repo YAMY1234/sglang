@@ -374,6 +374,49 @@ def _cp_a2a_merge_ll(
     tl.store(cnt + i, e)
 
 
+@triton.jit
+def _cp_a2a_merge4_ll(po, plse, out, out_stride, peers, me, ll_off, cnt, HQ: tl.constexpr, CP: tl.constexpr,
+                      D: tl.constexpr, NWP: tl.constexpr):
+    """_cp_a2a_merge_ll for fused partials, which already hold the causal block (O = 0 / LSE = -inf where a rank
+    sees no key): push, then a base-2 online LSE merge of the CP partials only."""
+    i = tl.program_id(0)
+    e = tl.load(cnt + i) + 1
+    flag = e.to(tl.int64) << 32
+    NO: tl.constexpr = HQ * D // 2
+    hw = tl.arange(0, NO)
+    h = tl.arange(0, HQ)
+    d = tl.arange(0, D)
+    for c in tl.static_range(CP):
+        w = _ll_pack(flag, tl.load(po + (i * CP * HQ + c * HQ) * (D // 2) + hw))
+        lw = _ll_pack(flag, tl.load(plse + i * CP * HQ + c * HQ + h))
+        dst = (tl.load(peers + c) + ll_off + (i * CP + me) * NWP * 8).to(tl.pointer_type(tl.int64))
+        tl.store(dst + hw, w)
+        tl.store(dst + NO + h, lw)
+    m = tl.full([HQ], float("-inf"), tl.float32)
+    wsum = tl.zeros([HQ], dtype=tl.float32)
+    acc = tl.zeros([HQ, D], dtype=tl.float32)
+    own = tl.load(peers + me) + ll_off
+    for c in tl.static_range(CP):
+        src = (own + (i * CP + c) * NWP * 8).to(tl.pointer_type(tl.int64))
+        v = _ll_wait(src, NO, e)
+        lv = _ll_wait(src + NO, HQ, e)
+        lc = (lv & 0xFFFFFFFF).to(tl.int32).to(tl.float32, bitcast=True)
+        wd = (v & 0xFFFFFFFF).to(tl.uint32)
+        lo = (wd << 16).to(tl.float32, bitcast=True)
+        hi = (wd & 0xFFFF0000).to(tl.float32, bitcast=True)
+        oc = tl.reshape(tl.join(lo, hi), (HQ, D))
+        mn = tl.maximum(m, lc)
+        mn0 = tl.where(mn > float("-inf"), mn, 0.0)
+        a_old = tl.where(m > float("-inf"), tl.exp2(m - mn0), 0.0)
+        a_new = tl.where(lc > float("-inf"), tl.exp2(lc - mn0), 0.0)
+        acc = acc * a_old[:, None] + oc * a_new[:, None]
+        wsum = wsum * a_old + a_new
+        m = mn
+    o = acc / tl.where(wsum > 0, wsum, 1.0)[:, None]
+    tl.store(out + i * out_stride + h[:, None] * D + d[None, :], o.to(tl.bfloat16))
+    tl.store(cnt + i, e)
+
+
 class CpLite:
     """One process's exchange buffer and scratch, shared by every TRT-LLM MHA backend
     (target and draft) of the process; built collectively on the attention TP group."""
@@ -398,6 +441,13 @@ class CpLite:
         total = self.llp_off + _MAX_ROWS * cp * _LL_PWORDS * 8
         self.ll = envs.SGLANG_TRTL1_ATTN_CP_LL.get() and q_heads * HEAD_DIM // 2 + q_heads <= _LL_PWORDS
         self.cnt = torch.zeros(_KINDS, _MAX_ROWS, dtype=torch.int32, device=self.device)
+        self.sms = torch.cuda.get_device_properties(self.device).multi_processor_count
+        self.fused = self.ll and envs.SGLANG_TRTL1_ATTN_CP_FUSED.get()
+        if self.fused:
+            from sglang.srt.layers.attention import q35_cp_fused
+
+            # grid-barrier counters and workspace: persistent, allocated before any capture
+            q35_cp_fused.q35_cp_fused_prepare(self.device, self.sms)
         if symm_mem.get_backend(self.device) is None:
             symm_mem.set_backend("NCCL")
         self.buf = symm_mem.empty((total,), dtype=torch.uint8, device=self.device)
@@ -419,8 +469,8 @@ class CpLite:
         self._tabs: dict = {}
         torch.distributed.barrier(group)
         logger.info(
-            "TRT-L1 CP-lite: tp rank %d, KV group of %d (group rank %d), min batch %d",
-            tp_rank, cp, self.me, self.min_bs,
+            "TRT-L1 CP-lite: tp rank %d, KV group of %d (group rank %d), min batch %d, LL %s, fused %s",
+            tp_rank, cp, self.me, self.min_bs, self.ll, self.fused,
         )
 
     @classmethod
@@ -512,6 +562,10 @@ class CpLite:
                 q.view(torch.int32), words, self.peers, self.me, 0, self.f_off,
                 CP=self.cp, WORDS=words, num_warps=4,
             )
+        if self.fused:
+            out = self._fused(k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale)
+            if out is not None:
+                return out
         tab, lens, max_kv = self._tables(page_table, seq_lens, q_len, forward_batch, layer.layer_id)
         gh = self.cp * self.hq
         po = self.po[:rows].view(b, q_len * gh, HEAD_DIM)
@@ -545,4 +599,35 @@ class CpLite:
                 self.peers, self.me, self.p_off, self.l_off, self.f_off, _MAX_ROWS, bmm1_scale, bmm2_scale,
                 QL=q_len, HQ=self.hq, CP=self.cp, D=HEAD_DIM, PG=PAGE, num_warps=8,
             )
+        return out
+
+    def _fused(self, k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale):
+        """The fused partial (TRT-LLM's kernel) on the gathered queries, then the 4-way merge; None where the kernel
+        does not take the shape (decided by shapes only)."""
+        from sglang.srt.layers.attention import q35_cp_fused as F
+
+        if not F.q35_cp_fused_supported(q_len, self.cp, self.hq, b, self.sms):
+            return None
+        cp, hq = self.cp, self.hq
+        F.q35_cp_fused_partial(
+            self.q_all[:rows].view(rows, cp, hq, HEAD_DIM).permute(1, 0, 2, 3),
+            k_cache,
+            page_table,
+            seq_lens,
+            q_len,
+            self.me,
+            cp,
+            bmm1_scale,
+            bmm2_scale,
+            self.po[:rows].view(rows, cp, hq, HEAD_DIM).permute(1, 0, 2, 3),
+            self.plse[:rows].view(rows, cp, hq).permute(1, 0, 2),
+            sm_count=self.sms,
+            enable_pdl=False,
+            v_pool=v_cache,
+        )
+        out = torch.empty(rows, hq, HEAD_DIM, dtype=torch.bfloat16, device=self.device)
+        _cp_a2a_merge4_ll[(rows,)](
+            self.po.view(torch.int32), self.plse.view(torch.int32), out, out.stride(0), self.peers, self.me,
+            self.llp_off, self.cnt[1], HQ=hq, CP=cp, D=HEAD_DIM, NWP=_LL_PWORDS, num_warps=8,
+        )
         return out
