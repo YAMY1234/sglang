@@ -1288,6 +1288,12 @@ class Envs:
     SGLANG_TRTL1_ATTN_CP_FUSED = EnvBool(False)
     # With FUSED: the fused partial on the context prefix only, the causal block in the fp32 merge.
     SGLANG_TRTL1_ATTN_CP_EXACT = EnvBool(False)
+    # KV-length gate (LL exchanges): CP only for calls whose mean KV length per request reaches this many tokens,
+    # "<kv>" or "<b>:<kv>,..." by batch size (from b requests up); decided on the device, the stock call is captured
+    # too. Empty: no gate.
+    SGLANG_TRTL1_ATTN_CP_MIN_KV = EnvStr("")
+    # Gate on the batch's longest KV instead of the mean.
+    SGLANG_TRTL1_ATTN_CP_GATE_MAX = EnvBool(False)
     # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
     SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
     # Store DeepSeek-V4 SWA KV directly in FlashInfer's 64-token SM120 page

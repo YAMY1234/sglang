@@ -1689,6 +1689,18 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 self.workspace_buffer,
                 layer,
                 forward_batch,
+                stock=lambda seq_lens, out: self._run_fixed_q_len_decode(
+                    q,
+                    kv_cache,
+                    page_table,
+                    seq_lens,
+                    bmm1_scale=bmm1_scale,
+                    bmm2_scale=bmm2_scale,
+                    window_left=layer.sliding_window_size,
+                    sinks=None,
+                    out=out,
+                    kv_cache_sf=kv_cache_block_scales,
+                ),
             )
         if o is not None:
             return o.view(-1, layer.tp_q_head_num * layer.head_dim)
@@ -1911,6 +1923,20 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                         self.workspace_buffer,
                         layer,
                         forward_batch,
+                        stock=lambda seq_lens, out: self._run_fixed_q_len_decode(
+                            q,
+                            kv_cache,
+                            page_table,
+                            seq_lens,
+                            bmm1_scale=bmm1_scale,
+                            bmm2_scale=bmm2_scale,
+                            window_left=layer.sliding_window_size,
+                            sinks=None,
+                            out=out,
+                            kv_cache_sf=kv_cache_block_scales,
+                            q_len_per_req=self.forward_metadata.max_seq_len_q,
+                            mask=mask,
+                        ),
                     )
                 if o is None:
                     o = self._run_fixed_q_len_decode(
