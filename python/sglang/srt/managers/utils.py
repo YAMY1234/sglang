@@ -103,6 +103,10 @@ class GenerationBatchResult:
     # Next-iter seq_lens; published via on_publish.
     new_seq_lens: Optional[torch.Tensor] = None
 
+    # Device work of this forward still running on a side stream (the deferred mamba
+    # state commit); the result readback waits for it, so host processing sees it done.
+    side_done_event: Optional[torch.cuda.Event] = None
+
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[SpecInput] = None
 

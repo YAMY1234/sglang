@@ -1426,6 +1426,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            if self._post_verify_graphs is not None:
+                # a commit left running behind the last draft extend
+                self._post_verify_graphs.join()
             if not (
                 batch.is_extend_in_batch and self.enable_dp_spec_prefill_coordination
             ):
@@ -1509,8 +1512,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         batch, batch_output, kv_loc_plan=verify_input.kv_loc_plan
                     )
             if self._post_verify_graphs is not None:
-                # The mamba state commit may still run on a side stream.
-                self._post_verify_graphs.join()
+                if self._post_verify_graphs.commits_behind_draft:
+                    # The commit overlaps the next round's draft; verify joins it, and
+                    # the result readback waits for it.
+                    batch_output.side_done_event = (
+                        self._post_verify_graphs.launch_commit()
+                    )
+                else:
+                    # The mamba state commit may still run on a side stream.
+                    self._post_verify_graphs.join()
 
             if (
                 get_parallel().pp_size > 1
@@ -1981,6 +1991,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             dw._rebuild_topk1_chain_buffers()
 
     def verify(self, batch: ScheduleBatch, pp_proxy_tensors=None, grammar_barrier=None):
+        if self._post_verify_graphs is not None:
+            # the last round's mamba state commit, when it overlapped this draft
+            self._post_verify_graphs.join()
         # SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING: the compact top-k branch, when
         # every request allows it, in the post-verify graphs and the eager verify
         max_top_k = compact_verify_max_top_k(batch)

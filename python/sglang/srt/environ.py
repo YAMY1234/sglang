@@ -1483,6 +1483,11 @@ class Envs:
     # outputs in place instead of through the FutureMap stash and gather (bit-identical);
     # any other batch flushes the deferred stash first. Overlap scheduler, EAGLE topk 1.
     SGLANG_Q35MF_SPEC_RELAY_BYPASS = EnvBool(False)
+    # The post-verify mamba state commit is launched behind the draft extend and joined
+    # before the next verify, so it overlaps the next round's draft; the forward stream
+    # takes the high priority so the commit's CTAs fill only what the draft leaves free.
+    # Needs SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH (bit-identical).
+    SGLANG_Q35MF_COMMIT_BEHIND_DRAFT = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)

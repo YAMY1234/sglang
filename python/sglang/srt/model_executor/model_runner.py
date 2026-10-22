@@ -218,6 +218,7 @@ from sglang.srt.server_args import (  # noqa: F401  (re-export)
 from sglang.srt.speculative.adaptive_spec_params import (
     resolve_candidate_steps_from_config,
 )
+from sglang.srt.speculative.eagle_post_verify_graphs import forward_stream_priority
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.srt.state_capturer.base import TopkCaptureOutput
@@ -460,7 +461,9 @@ class ModelRunner:
         self.init_torch_distributed()
 
         # Init forward stream for overlap schedule
-        self.forward_stream = torch.get_device_module(self.device).Stream()
+        self.forward_stream = torch.get_device_module(self.device).Stream(
+            priority=forward_stream_priority()
+        )
 
         # Read-done mailbox: the scheduler's WAR barrier reads it from the runner
         # its worker names, and treats None as the coarse whole-forward fence.

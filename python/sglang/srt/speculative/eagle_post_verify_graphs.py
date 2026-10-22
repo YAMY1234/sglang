@@ -29,6 +29,17 @@ _SIM_ACC_LEN_DOMAIN = 0x0F3D6B8C2A915E47
 _MAX_POST_VERIFY_STATES = 64
 # SGLANG_Q35MF_MKH_N3C: a round's inputs and its forced length staged in one launch.
 _ONE_LAUNCH_LOAD = envs.SGLANG_Q35MF_MKH_N3C.get()
+# SGLANG_Q35MF_COMMIT_BEHIND_DRAFT: the commit graph replays once the worker asks
+# (behind the draft extend) and the forward stream outranks its side stream.
+_COMMIT_BEHIND_DRAFT = envs.SGLANG_Q35MF_COMMIT_BEHIND_DRAFT.get()
+
+
+def forward_stream_priority() -> int:
+    """The forward stream's priority: the highest with SGLANG_Q35MF_COMMIT_BEHIND_DRAFT
+    (the commit side stream keeps the default, lowest one), else the default."""
+    if not _COMMIT_BEHIND_DRAFT or not torch.cuda.is_available():
+        return 0
+    return torch.cuda.Stream.priority_range()[1]
 
 
 def simulated_acc_len_generator(seed: int) -> torch.Generator:
@@ -83,6 +94,15 @@ class EaglePostVerifyGraphs:
         """Order the current stream after the last side-stream mamba state commit; the
         worker calls it once the draft extend is enqueued."""
         self._graphs.join()
+
+    @property
+    def commits_behind_draft(self) -> bool:
+        return _COMMIT_BEHIND_DRAFT
+
+    def launch_commit(self) -> Optional[torch.cuda.Event]:
+        """With SGLANG_Q35MF_COMMIT_BEHIND_DRAFT: replay the last round's commit graph
+        behind the work enqueued so far; its done event, None when nothing replayed."""
+        return self._graphs.launch_commit()
 
     def _key(
         self,
@@ -265,6 +285,8 @@ class _PostVerifyGraphs:
         self._pool = None
         self._side_stream = self._main_done = self._commit_done = None
         self._commit_pending = False
+        # the slot whose commit graph waits for launch_commit (commit behind draft)
+        self._commit_slot: Optional[SimpleNamespace] = None
         # The host runs up to ~2 rounds ahead; a pinned slot is rewritten only after
         # the event behind its last copy has completed.
         self._sim_host: list[torch.Tensor] = []
@@ -306,15 +328,30 @@ class _PostVerifyGraphs:
                 return outputs[:6]
             self._capture(slot)
         slot.graph.replay()
+        if _COMMIT_BEHIND_DRAFT:
+            self._commit_slot = slot
+        else:
+            self._replay_commit(slot)
+        return slot.outputs[:6]
+
+    def _replay_commit(self, slot: SimpleNamespace) -> None:
         self._main_done.record()
         self._side_stream.wait_event(self._main_done)
         with torch.cuda.stream(self._side_stream):
             slot.commit_graph.replay()
         self._commit_done.record(self._side_stream)
         self._commit_pending = True
-        return slot.outputs[:6]
+
+    def launch_commit(self) -> Optional[torch.cuda.Event]:
+        slot, self._commit_slot = self._commit_slot, None
+        if slot is None:
+            return None
+        self._replay_commit(slot)
+        return self._commit_done
 
     def join(self) -> None:
+        if self._commit_slot is not None:
+            self.launch_commit()
         if self._commit_pending:
             torch.cuda.current_stream().wait_event(self._commit_done)
             self._commit_pending = False
