@@ -1278,6 +1278,9 @@ class Envs:
     # One preserves the default single-call path; values above one are useful
     # for batches whose KV sequence lengths have a large spread.
     SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS = EnvInt(1)
+    # TRT-L3: let the CuTe DSL fused MoE finalize take expert-parallel MoE handoffs
+    # (non-local experts' rows carry permuted index -1 and are skipped).
+    SGLANG_TRTL3_EP_DEFER_FINALIZE = EnvBool(False)
     # TRT-L1 scratch: read-split context parallelism of TRT-LLM MHA decode-kernel calls
     # (KV head replicated on TP // kv_heads ranks), from this many requests up.
     SGLANG_TRTL1_ATTN_CP = EnvBool(False)
