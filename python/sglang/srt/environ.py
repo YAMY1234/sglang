@@ -1180,6 +1180,8 @@ class Envs:
     # (KV head replicated on TP // kv_heads ranks), from this many requests up.
     SGLANG_TRTL1_ATTN_CP = EnvBool(False)
     SGLANG_TRTL1_ATTN_CP_MIN_BS = EnvInt(2)
+    # LL exchanges (epoch in each 8-byte store) instead of CAS-flag barriers.
+    SGLANG_TRTL1_ATTN_CP_LL = EnvBool(True)
     # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
     SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
     # Store DeepSeek-V4 SWA KV directly in FlashInfer's 64-token SM120 page
