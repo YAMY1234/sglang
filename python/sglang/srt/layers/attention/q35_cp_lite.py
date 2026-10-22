@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 PAGE, HEAD_DIM = 64, 256
 _MAX_ROWS = 128  # widest call: rows = requests * q_len (TP8 verify at B16: 112)
 _KINDS = 2  # flag regions: q gather, partial exchange
+_LL_PWORDS = 520  # LL words of one (row, source) partial: 4 heads x 128 bf16 pairs + 4 LSE, padded to 16 B
 
 
 @triton.jit
@@ -251,6 +252,128 @@ def _cp_a2a_merge(
     tl.store(out + i * out_stride + hd, o.to(tl.bfloat16))
 
 
+@triton.jit
+def _ll_pack(flag, w):
+    return flag | (w.to(tl.int64) & 0xFFFFFFFF)
+
+
+@triton.jit
+def _ll_wait(src, n: tl.constexpr, e):
+    """Poll n LL words (data in the low, epoch in the high half) until all carry epoch e."""
+    k = tl.arange(0, n)
+    v = tl.load(src + k, volatile=True)
+    while tl.min(((v >> 32) == e).to(tl.int32), axis=0) == 0:
+        v = tl.load(src + k, volatile=True)
+    return v
+
+
+@triton.jit
+def _cp_gather_q_ll(q, q_stride, peers, me, ll_off, q_all, cnt, CP: tl.constexpr, WORDS: tl.constexpr):
+    """LL variant of _cp_gather_q: every 4-byte word travels with the call's epoch in one 8-byte store."""
+    i = tl.program_id(0)
+    e = tl.load(cnt + i) + 1
+    flag = e.to(tl.int64) << 32
+    w = tl.arange(0, WORDS)
+    x = _ll_pack(flag, tl.load(q + i * q_stride + w))
+    for c in tl.static_range(CP):
+        dst = (tl.load(peers + c) + ll_off + (i * CP + me) * WORDS * 8).to(tl.pointer_type(tl.int64))
+        tl.store(dst + w, x)
+    own = tl.load(peers + me) + ll_off
+    for c in tl.static_range(CP):
+        v = _ll_wait((own + (i * CP + c) * WORDS * 8).to(tl.pointer_type(tl.int64)), WORDS, e)
+        tl.store(q_all + (i * CP + c) * WORDS + w, (v & 0xFFFFFFFF).to(tl.int32))
+    tl.store(cnt + i, e)
+
+
+@triton.jit
+def _cp_a2a_merge_ll(
+    po,
+    plse,
+    q,
+    q_stride,
+    k_cache,
+    v_cache,
+    kv_page_stride,
+    kv_tok_stride,
+    table,
+    t_stride,
+    seq_lens,
+    out,
+    out_stride,
+    peers,
+    me,
+    ll_off,
+    cnt,
+    bmm1,
+    bmm2,
+    QL: tl.constexpr,
+    HQ: tl.constexpr,
+    CP: tl.constexpr,
+    D: tl.constexpr,
+    PG: tl.constexpr,
+    NWP: tl.constexpr,
+):
+    """LL variant of _cp_a2a_merge; po / plse are read as int32 words. Online LSE merge of the
+    causal block and the CP partials as they arrive."""
+    i = tl.program_id(0)
+    e = tl.load(cnt + i) + 1
+    flag = e.to(tl.int64) << 32
+    NO: tl.constexpr = HQ * D // 2
+    hw = tl.arange(0, NO)
+    h = tl.arange(0, HQ)
+    d = tl.arange(0, D)
+    hd = h[:, None] * D + d[None, :]
+    for c in tl.static_range(CP):
+        w = _ll_pack(flag, tl.load(po + (i * CP * HQ + c * HQ) * (D // 2) + hw))
+        lw = _ll_pack(flag, tl.load(plse + i * CP * HQ + c * HQ + h))
+        dst = (tl.load(peers + c) + ll_off + (i * CP + me) * NWP * 8).to(tl.pointer_type(tl.int64))
+        tl.store(dst + hw, w)
+        tl.store(dst + NO + h, lw)
+    b = i // QL
+    t = i % QL
+    L = tl.load(seq_lens + b)
+    j = tl.arange(0, 8)
+    pos = L - QL + j
+    valid = (j <= t) & (pos >= 0)
+    pos = tl.maximum(pos, 0)
+    page = tl.load(table + b * t_stride + pos // PG, mask=valid, other=0)
+    koff = page.to(tl.int64) * kv_page_stride + (pos % PG) * kv_tok_stride
+    kk = tl.load(k_cache + koff[:, None] + d[None, :], mask=valid[:, None], other=0.0).to(tl.float32)
+    vv = tl.load(v_cache + koff[:, None] + d[None, :], mask=valid[:, None], other=0.0).to(tl.float32)
+    qv = tl.load(q + i * q_stride + hd).to(tl.float32)
+    s = tl.sum(qv[:, None, :] * kk[None, :, :], axis=2) * bmm1
+    s = tl.where(valid[None, :], s, float("-inf"))
+    md = tl.max(s, axis=1)
+    md0 = tl.where(md > float("-inf"), md, 0.0)
+    p = tl.exp(s - md0[:, None])
+    ld = tl.sum(p, axis=1)
+    acc = tl.sum(p[:, :, None] * vv[None, :, :], axis=1) * bmm2
+    m = tl.where(ld > 0, md0, float("-inf"))
+    wsum = ld
+    n_pages = (tl.maximum(L - QL, 0) + PG - 1) // PG
+    own = tl.load(peers + me) + ll_off
+    for c in tl.static_range(CP):
+        src = (own + (i * CP + c) * NWP * 8).to(tl.pointer_type(tl.int64))
+        v = _ll_wait(src, NO, e)
+        lv = _ll_wait(src + NO, HQ, e)
+        lc = (lv & 0xFFFFFFFF).to(tl.int32).to(tl.float32, bitcast=True) * 0.6931471805599453
+        lc = tl.where(n_pages > c, lc, float("-inf"))
+        wd = (v & 0xFFFFFFFF).to(tl.uint32)
+        lo = (wd << 16).to(tl.float32, bitcast=True)
+        hi = (wd & 0xFFFF0000).to(tl.float32, bitcast=True)
+        oc = tl.reshape(tl.join(lo, hi), (HQ, D))
+        mn = tl.maximum(m, lc)
+        mn0 = tl.where(mn > float("-inf"), mn, 0.0)
+        a_old = tl.where(m > float("-inf"), tl.exp(m - mn0), 0.0)
+        a_new = tl.where(lc > float("-inf"), tl.exp(lc - mn0), 0.0)
+        acc = acc * a_old[:, None] + oc * a_new[:, None]
+        wsum = wsum * a_old + a_new
+        m = mn
+    o = acc / tl.where(wsum > 0, wsum, 1.0)[:, None]
+    tl.store(out + i * out_stride + hd, o.to(tl.bfloat16))
+    tl.store(cnt + i, e)
+
+
 class CpLite:
     """One process's exchange buffer and scratch, shared by every TRT-LLM MHA backend
     (target and draft) of the process; built collectively on the attention TP group."""
@@ -270,7 +393,11 @@ class CpLite:
         self.l_off = self.p_off + self.p_bytes
         self.l_bytes = _MAX_ROWS * cp * q_heads * 4
         self.f_off = self.l_off + self.l_bytes
-        total = self.f_off + _KINDS * _MAX_ROWS * cp * 4
+        self.llq_off = self.f_off + _KINDS * _MAX_ROWS * cp * 4
+        self.llp_off = self.llq_off + _MAX_ROWS * cp * (q_heads * HEAD_DIM // 4) * 8
+        total = self.llp_off + _MAX_ROWS * cp * _LL_PWORDS * 8
+        self.ll = envs.SGLANG_TRTL1_ATTN_CP_LL.get() and q_heads * HEAD_DIM // 2 + q_heads <= _LL_PWORDS
+        self.cnt = torch.zeros(_KINDS, _MAX_ROWS, dtype=torch.int32, device=self.device)
         if symm_mem.get_backend(self.device) is None:
             symm_mem.set_backend("NCCL")
         self.buf = symm_mem.empty((total,), dtype=torch.uint8, device=self.device)
@@ -375,10 +502,16 @@ class CpLite:
         k_cache, v_cache = kv_cache
         q = q if q.is_contiguous() else q.contiguous()
         words = self.hq * HEAD_DIM // 4
-        _cp_gather_q[(rows,)](
-            q.view(torch.int32), words, self.peers, self.me, 0, self.f_off,
-            CP=self.cp, WORDS=words, num_warps=4,
-        )
+        if self.ll:
+            _cp_gather_q_ll[(rows,)](
+                q.view(torch.int32), words, self.peers, self.me, self.llq_off, self.q_all.view(torch.int32),
+                self.cnt[0], CP=self.cp, WORDS=words, num_warps=4,
+            )
+        else:
+            _cp_gather_q[(rows,)](
+                q.view(torch.int32), words, self.peers, self.me, 0, self.f_off,
+                CP=self.cp, WORDS=words, num_warps=4,
+            )
         tab, lens, max_kv = self._tables(page_table, seq_lens, q_len, forward_batch, layer.layer_id)
         gh = self.cp * self.hq
         po = self.po[:rows].view(b, q_len * gh, HEAD_DIM)
@@ -398,10 +531,18 @@ class CpLite:
             multi_ctas_kv_counter_buffer=self.counter,
         )
         out = torch.empty(rows, self.hq, HEAD_DIM, dtype=torch.bfloat16, device=q.device)
-        _cp_a2a_merge[(rows,)](
-            self.po, self.plse, q, q.stride(0), k_cache, v_cache, k_cache.stride(0), k_cache.stride(2),
-            page_table, page_table.stride(0), seq_lens, out, out.stride(0),
-            self.peers, self.me, self.p_off, self.l_off, self.f_off, _MAX_ROWS, bmm1_scale, bmm2_scale,
-            QL=q_len, HQ=self.hq, CP=self.cp, D=HEAD_DIM, PG=PAGE, num_warps=8,
-        )
+        if self.ll:
+            _cp_a2a_merge_ll[(rows,)](
+                self.po.view(torch.int32), self.plse.view(torch.int32), q, q.stride(0), k_cache, v_cache,
+                k_cache.stride(0), k_cache.stride(2), page_table, page_table.stride(0), seq_lens, out, out.stride(0),
+                self.peers, self.me, self.llp_off, self.cnt[1], bmm1_scale, bmm2_scale,
+                QL=q_len, HQ=self.hq, CP=self.cp, D=HEAD_DIM, PG=PAGE, NWP=_LL_PWORDS, num_warps=8,
+            )
+        else:
+            _cp_a2a_merge[(rows,)](
+                self.po, self.plse, q, q.stride(0), k_cache, v_cache, k_cache.stride(0), k_cache.stride(2),
+                page_table, page_table.stride(0), seq_lens, out, out.stride(0),
+                self.peers, self.me, self.p_off, self.l_off, self.f_off, _MAX_ROWS, bmm1_scale, bmm2_scale,
+                QL=q_len, HQ=self.hq, CP=self.cp, D=HEAD_DIM, PG=PAGE, num_warps=8,
+            )
         return out
