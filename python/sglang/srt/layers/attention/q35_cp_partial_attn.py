@@ -537,6 +537,20 @@ def _st_global_v4_u32(addr, a, b, c, d, *, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
+def _st_global_v4_f32(addr, a, b, c, d, *, loc=None, ip=None) -> None:
+    _asm(
+        None,
+        [Int64(addr).ir_value(loc=loc, ip=ip)]
+        + [Float32(v).ir_value(loc=loc, ip=ip) for v in (a, b, c, d)],
+        "st.global.v4.f32 [$0], {$1, $2, $3, $4};",
+        "l,f,f,f,f",
+        True,
+        loc,
+        ip,
+    )
+
+
+@dsl_user_op
 def _st_global_u32(addr, a, *, loc=None, ip=None) -> None:
     _asm(
         None,
@@ -692,6 +706,7 @@ class Q35CpPartialAttnKernel:
         balanced: bool = False,
         rescale_threshold: float | None = None,
         l_from_p8: bool = False,
+        o_f32: bool = False,
     ):
         assert gh == cp_size * hql, "group heads = cp_size x q heads per rank"
         self.balanced = bool(balanced)
@@ -728,6 +743,9 @@ class Q35CpPartialAttnKernel:
         self.rescale_threshold = float(rescale_threshold)
         # l_from_p8: the row sum adds the E4M3-rounded P that GEMM2 multiplies (numerator and denominator agree)
         self.l_from_p8 = bool(l_from_p8)
+        # o_f32: out_o is FP32 (the combined partial is not rounded to bf16)
+        self.o_f32 = bool(o_f32)
+        self.o_bytes = 4 if self.o_f32 else 2
         assert 32 * self.act_warps * STAGE_ROW <= KV_REGION
         if self.balanced:
             geo_b = cp_partial_balanced_geometry(self.rows, n_splits)
@@ -1374,7 +1392,7 @@ class Q35CpPartialAttnKernel:
             e0 = o_lo + gc * 8
             orow = e0 // HEAD_DIM
             dd, tok, hh = self._out_coords(orow, req)
-            addr = o_base + (dd * o_sd + tok * o_st + hh * o_sh + e0 % HEAD_DIM) * 2
+            addr = o_base + (dd * o_sd + tok * o_st + hh * o_sh + e0 % HEAD_DIM) * self.o_bytes
             if n_valid > 0:
                 lrow = s_lse + (orow - row0) * (lse_stride * 4)
                 mrow = -Float32.inf
@@ -1430,17 +1448,31 @@ class Q35CpPartialAttnKernel:
                         scl = Float32(0.0)  # a row without any visible key gives 0, not NaN
                         if den > Float32(0.0):
                             scl = sScal[0] / den
-                        w0 = _pack_bf16x2(a0 * scl, a1 * scl)
-                        w1 = _pack_bf16x2(a2 * scl, a3 * scl)
-                        w2 = _pack_bf16x2(a4 * scl, a5 * scl)
-                        w3 = _pack_bf16x2(a6 * scl, a7 * scl)
-                        if const_expr(self.o_vec16):
-                            _st_global_v4_u32(addr, w0, w1, w2, w3)
+                        if const_expr(self.o_f32):
+                            if const_expr(self.o_vec16):
+                                _st_global_v4_f32(addr, a0 * scl, a1 * scl, a2 * scl, a3 * scl)
+                                _st_global_v4_f32(addr + 16, a4 * scl, a5 * scl, a6 * scl, a7 * scl)
+                            else:
+                                _st_global_f32(addr, a0 * scl)
+                                _st_global_f32(addr + 4, a1 * scl)
+                                _st_global_f32(addr + 8, a2 * scl)
+                                _st_global_f32(addr + 12, a3 * scl)
+                                _st_global_f32(addr + 16, a4 * scl)
+                                _st_global_f32(addr + 20, a5 * scl)
+                                _st_global_f32(addr + 24, a6 * scl)
+                                _st_global_f32(addr + 28, a7 * scl)
                         else:
-                            _st_global_u32(addr, w0)
-                            _st_global_u32(addr + 4, w1)
-                            _st_global_u32(addr + 8, w2)
-                            _st_global_u32(addr + 12, w3)
+                            w0 = _pack_bf16x2(a0 * scl, a1 * scl)
+                            w1 = _pack_bf16x2(a2 * scl, a3 * scl)
+                            w2 = _pack_bf16x2(a4 * scl, a5 * scl)
+                            w3 = _pack_bf16x2(a6 * scl, a7 * scl)
+                            if const_expr(self.o_vec16):
+                                _st_global_v4_u32(addr, w0, w1, w2, w3)
+                            else:
+                                _st_global_u32(addr, w0)
+                                _st_global_u32(addr + 4, w1)
+                                _st_global_u32(addr + 8, w2)
+                                _st_global_u32(addr + 12, w3)
                         if e0 % HEAD_DIM == 0:
                             lse_out = -Float32.inf
                             if den > Float32(0.0):
@@ -1452,13 +1484,14 @@ class Q35CpPartialAttnKernel:
                 # this rank sees no key of the request: O = 0, LSE = -inf
                 if jg == 0:
                     if g < n_gran:
-                        if const_expr(self.o_vec16):
-                            _st_global_v4_u32(addr, Uint32(0), Uint32(0), Uint32(0), Uint32(0))
-                        else:
-                            _st_global_u32(addr, Uint32(0))
-                            _st_global_u32(addr + 4, Uint32(0))
-                            _st_global_u32(addr + 8, Uint32(0))
-                            _st_global_u32(addr + 12, Uint32(0))
+                        for zb in cutlass.range_constexpr(2 if self.o_f32 else 1):
+                            if const_expr(self.o_vec16):
+                                _st_global_v4_u32(addr + 16 * zb, Uint32(0), Uint32(0), Uint32(0), Uint32(0))
+                            else:
+                                _st_global_u32(addr + 16 * zb, Uint32(0))
+                                _st_global_u32(addr + 16 * zb + 4, Uint32(0))
+                                _st_global_u32(addr + 16 * zb + 8, Uint32(0))
+                                _st_global_u32(addr + 16 * zb + 12, Uint32(0))
                         if e0 % HEAD_DIM == 0:
                             _st_global_f32(
                                 l_base + (dd * l_sd + tok * l_st + hh * l_sh) * 4, -Float32.inf
@@ -2112,7 +2145,7 @@ class Q35CpPartialAttnKernel:
                     e0 = o_lo + gc * 8
                     orow = e0 // HEAD_DIM
                     dd, tok, hh = self._out_coords(orow, req)
-                    addr = o_base + (dd * o_sd + tok * o_st + hh * o_sh + e0 % HEAD_DIM) * 2
+                    addr = o_base + (dd * o_sd + tok * o_st + hh * o_sh + e0 % HEAD_DIM) * self.o_bytes
                     if n_valid > 0:
                         lrow = s_lse + (orow - row0) * (lse_stride * 4)
                         mrow = -Float32.inf
@@ -2174,17 +2207,31 @@ class Q35CpPartialAttnKernel:
                                 scl = Float32(0.0)  # a row without any visible key gives 0, not NaN
                                 if den > Float32(0.0):
                                     scl = sScal[0] / den
-                                w0 = _pack_bf16x2(a0 * scl, a1 * scl)
-                                w1 = _pack_bf16x2(a2 * scl, a3 * scl)
-                                w2 = _pack_bf16x2(a4 * scl, a5 * scl)
-                                w3 = _pack_bf16x2(a6 * scl, a7 * scl)
-                                if const_expr(self.o_vec16):
-                                    _st_global_v4_u32(addr, w0, w1, w2, w3)
+                                if const_expr(self.o_f32):
+                                    if const_expr(self.o_vec16):
+                                        _st_global_v4_f32(addr, a0 * scl, a1 * scl, a2 * scl, a3 * scl)
+                                        _st_global_v4_f32(addr + 16, a4 * scl, a5 * scl, a6 * scl, a7 * scl)
+                                    else:
+                                        _st_global_f32(addr, a0 * scl)
+                                        _st_global_f32(addr + 4, a1 * scl)
+                                        _st_global_f32(addr + 8, a2 * scl)
+                                        _st_global_f32(addr + 12, a3 * scl)
+                                        _st_global_f32(addr + 16, a4 * scl)
+                                        _st_global_f32(addr + 20, a5 * scl)
+                                        _st_global_f32(addr + 24, a6 * scl)
+                                        _st_global_f32(addr + 28, a7 * scl)
                                 else:
-                                    _st_global_u32(addr, w0)
-                                    _st_global_u32(addr + 4, w1)
-                                    _st_global_u32(addr + 8, w2)
-                                    _st_global_u32(addr + 12, w3)
+                                    w0 = _pack_bf16x2(a0 * scl, a1 * scl)
+                                    w1 = _pack_bf16x2(a2 * scl, a3 * scl)
+                                    w2 = _pack_bf16x2(a4 * scl, a5 * scl)
+                                    w3 = _pack_bf16x2(a6 * scl, a7 * scl)
+                                    if const_expr(self.o_vec16):
+                                        _st_global_v4_u32(addr, w0, w1, w2, w3)
+                                    else:
+                                        _st_global_u32(addr, w0)
+                                        _st_global_u32(addr + 4, w1)
+                                        _st_global_u32(addr + 8, w2)
+                                        _st_global_u32(addr + 12, w3)
                                 if e0 % HEAD_DIM == 0:
                                     lse_out = -Float32.inf
                                     if den > Float32(0.0):
@@ -2196,15 +2243,16 @@ class Q35CpPartialAttnKernel:
                         # this rank sees no key of the request: O = 0, LSE = -inf
                         if jg == 0:
                             if g < n_gran:
-                                if const_expr(self.o_vec16):
-                                    _st_global_v4_u32(
-                                        addr, Uint32(0), Uint32(0), Uint32(0), Uint32(0)
-                                    )
-                                else:
-                                    _st_global_u32(addr, Uint32(0))
-                                    _st_global_u32(addr + 4, Uint32(0))
-                                    _st_global_u32(addr + 8, Uint32(0))
-                                    _st_global_u32(addr + 12, Uint32(0))
+                                for zb in cutlass.range_constexpr(2 if self.o_f32 else 1):
+                                    if const_expr(self.o_vec16):
+                                        _st_global_v4_u32(
+                                            addr + 16 * zb, Uint32(0), Uint32(0), Uint32(0), Uint32(0)
+                                        )
+                                    else:
+                                        _st_global_u32(addr + 16 * zb, Uint32(0))
+                                        _st_global_u32(addr + 16 * zb + 4, Uint32(0))
+                                        _st_global_u32(addr + 16 * zb + 8, Uint32(0))
+                                        _st_global_u32(addr + 16 * zb + 12, Uint32(0))
                                 if e0 % HEAD_DIM == 0:
                                     _st_global_f32(
                                         l_base + (dd * l_sd + tok * l_st + hh * l_sh) * 4,

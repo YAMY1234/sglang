@@ -37,6 +37,7 @@ _KINDS = 2  # flag regions: q gather, partial exchange
 # row max maps to 2^8, exact in E4M3
 _EXACT_P_SHIFT, _EXACT_RESCALE_THRESHOLD = 8.0, 0.0
 _LL_PWORDS = 520  # LL words of one (row, source) partial: 4 heads x 128 bf16 pairs + 4 LSE, padded to 16 B
+_LL_PWORDS_F32 = 1032  # the same with fp32 partials (exact path, SGLANG_TRTL1_ATTN_CP_EXACT_F32): 4 x 256 + 4, padded
 
 
 @triton.jit
@@ -331,13 +332,15 @@ def _cp_a2a_merge_ll(
     D: tl.constexpr,
     PG: tl.constexpr,
     NWP: tl.constexpr,
+    PACK: tl.constexpr = 2,
 ):
     """LL variant of _cp_a2a_merge; po / plse are read as int32 words, row / member strides po_sr / po_sc (words)
-    and pl_sr / pl_sc. Online LSE merge of the causal block and the CP partials as they arrive."""
+    and pl_sr / pl_sc; PACK partial elements per word (2: bf16, 1: fp32). Online LSE merge of the causal block and
+    the CP partials as they arrive."""
     i = tl.program_id(0)
     e = tl.load(cnt + i) + 1
     flag = e.to(tl.int64) << 32
-    NO: tl.constexpr = HQ * D // 2
+    NO: tl.constexpr = HQ * D // PACK
     hw = tl.arange(0, NO)
     h = tl.arange(0, HQ)
     d = tl.arange(0, D)
@@ -378,9 +381,12 @@ def _cp_a2a_merge_ll(
         lc = (lv & 0xFFFFFFFF).to(tl.int32).to(tl.float32, bitcast=True) * 0.6931471805599453
         lc = tl.where(n_pages > c, lc, float("-inf"))
         wd = (v & 0xFFFFFFFF).to(tl.uint32)
-        lo = (wd << 16).to(tl.float32, bitcast=True)
-        hi = (wd & 0xFFFF0000).to(tl.float32, bitcast=True)
-        oc = tl.reshape(tl.join(lo, hi), (HQ, D))
+        if PACK == 1:
+            oc = tl.reshape(wd.to(tl.float32, bitcast=True), (HQ, D))
+        else:
+            lo = (wd << 16).to(tl.float32, bitcast=True)
+            hi = (wd & 0xFFFF0000).to(tl.float32, bitcast=True)
+            oc = tl.reshape(tl.join(lo, hi), (HQ, D))
         mn = tl.maximum(m, lc)
         mn0 = tl.where(mn > float("-inf"), mn, 0.0)
         a_old = tl.where(m > float("-inf"), tl.exp(m - mn0), 0.0)
@@ -457,14 +463,16 @@ class CpLite:
         self.f_off = self.l_off + self.l_bytes
         self.llq_off = self.f_off + _KINDS * _MAX_ROWS * cp * 4
         self.llp_off = self.llq_off + _MAX_ROWS * cp * (q_heads * HEAD_DIM // 4) * 8
-        total = self.llp_off + _MAX_ROWS * cp * _LL_PWORDS * 8
         self.ll = envs.SGLANG_TRTL1_ATTN_CP_LL.get() and q_heads * HEAD_DIM // 2 + q_heads <= _LL_PWORDS
         self.cnt = torch.zeros(_KINDS, _MAX_ROWS, dtype=torch.int32, device=self.device)
         self.sms = torch.cuda.get_device_properties(self.device).multi_processor_count
         self.fused = self.ll and envs.SGLANG_TRTL1_ATTN_CP_FUSED.get()
         # exact: the fused kernel on the context prefix only (q_len folded into the heads), the causal block in the
-        # fp32 merge as on the trtllm-gen path
+        # fp32 merge as on the trtllm-gen path; exact_f32: its partials stay fp32 through the LL exchange
         self.exact = self.fused and envs.SGLANG_TRTL1_ATTN_CP_EXACT.get()
+        self.exact_f32 = self.exact and envs.SGLANG_TRTL1_ATTN_CP_EXACT_F32.get()
+        self.nwp = _LL_PWORDS_F32 if self.exact_f32 else _LL_PWORDS
+        total = self.llp_off + _MAX_ROWS * cp * self.nwp * 8
         if self.fused:
             from sglang.srt.layers.attention import q35_cp_fused
 
@@ -488,6 +496,9 @@ class CpLite:
         self.counter = torch.zeros(1 << 16, dtype=torch.int32, device=self.device)
         # exact path: the fused kernel's [cp, rows, heads, D] partials and the prefix lengths the gather writes
         self.po_x = torch.empty(cp, rows, q_heads, HEAD_DIM, dtype=torch.bfloat16, device=self.device)
+        self.po_x32 = None
+        if self.exact_f32:
+            self.po_x32 = torch.empty(cp, rows, q_heads, HEAD_DIM, dtype=torch.float32, device=self.device)
         self.pl_x = torch.empty(cp, rows, q_heads, dtype=torch.float32, device=self.device)
         self.pre_lens = torch.zeros(rows, dtype=torch.int32, device=self.device)
         self._logged: set = set()
@@ -498,7 +509,10 @@ class CpLite:
             "TRT-L1 CP-lite: tp rank %d, KV group of %d (group rank %d), min batch %d, LL %s, fused %s",
             tp_rank, cp, self.me, self.min_bs, self.ll, self.fused,
         )
-        logger.info("TRT-L1 CP-lite exact (prefix-only fused partial + fp32 causal block): %s", self.exact)
+        logger.info(
+            "TRT-L1 CP-lite exact (prefix-only fused partial + fp32 causal block): %s, fp32 partials %s",
+            self.exact, self.exact_f32,
+        )
 
     @classmethod
     def maybe_create(cls, config, device) -> Optional["CpLite"]:
@@ -644,6 +658,7 @@ class CpLite:
         from sglang.srt.layers.attention import q35_cp_fused as F
 
         cp, hq = self.cp, self.hq
+        po, pack = (self.po_x32, 1) if self.exact_f32 else (self.po_x, 2)
         F.q35_cp_fused_partial(
             self.q_all[:rows].view(b, cp, q_len * hq, HEAD_DIM).permute(1, 0, 2, 3),
             k_cache,
@@ -654,7 +669,7 @@ class CpLite:
             cp,
             bmm1_scale,
             bmm2_scale,
-            self.po_x[:, :rows].view(cp, b, q_len * hq, HEAD_DIM),
+            po[:, :rows].view(cp, b, q_len * hq, HEAD_DIM),
             self.pl_x[:, :rows].view(cp, b, q_len * hq),
             sm_count=self.sms,
             enable_pdl=False,
@@ -664,11 +679,11 @@ class CpLite:
         )
         out = torch.empty(rows, hq, HEAD_DIM, dtype=torch.bfloat16, device=self.device)
         _cp_a2a_merge_ll[(rows,)](
-            self.po_x.view(torch.int32), self.pl_x.view(torch.int32), hq * HEAD_DIM // 2,
-            self.po_x.stride(0) // 2, hq, self.pl_x.stride(0), q, q.stride(0), k_cache, v_cache,
+            po.view(torch.int32), self.pl_x.view(torch.int32), hq * HEAD_DIM // pack,
+            po.stride(0) // pack, hq, self.pl_x.stride(0), q, q.stride(0), k_cache, v_cache,
             k_cache.stride(0), k_cache.stride(2), page_table, page_table.stride(0), seq_lens, out, out.stride(0),
             self.peers, self.me, self.llp_off, self.cnt[1], bmm1_scale, bmm2_scale,
-            QL=q_len, HQ=hq, CP=cp, D=HEAD_DIM, PG=PAGE, NWP=_LL_PWORDS, num_warps=8,
+            QL=q_len, HQ=hq, CP=cp, D=HEAD_DIM, PG=PAGE, NWP=self.nwp, PACK=pack, num_warps=8,
         )
         return out
 

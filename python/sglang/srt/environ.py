@@ -1186,6 +1186,8 @@ class Envs:
     SGLANG_TRTL1_ATTN_CP_FUSED = EnvBool(False)
     # With FUSED: the fused partial on the context prefix only, the causal block in the fp32 merge.
     SGLANG_TRTL1_ATTN_CP_EXACT = EnvBool(False)
+    # With EXACT: the prefix partials stay fp32 (kernel output and LL exchange) instead of bf16.
+    SGLANG_TRTL1_ATTN_CP_EXACT_F32 = EnvBool(False)
     # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
     SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
     # Store DeepSeek-V4 SWA KV directly in FlashInfer's 64-token SM120 page

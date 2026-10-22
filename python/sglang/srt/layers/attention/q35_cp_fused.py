@@ -263,6 +263,7 @@ def _compiled(
     balanced: bool = False,
     rescale_threshold: Optional[float] = None,
     l_from_p8: bool = False,
+    o_f32: bool = False,
 ):
     import cuda.bindings.driver as cuda
     import cutlass
@@ -290,6 +291,7 @@ def _compiled(
             balanced=True,
             rescale_threshold=rescale_threshold,
             l_from_p8=l_from_p8,
+            o_f32=o_f32,
         )
         assert kernel.ws_bytes == cp_partial_balanced_ws_bytes(q_len * gh, n_splits)
     else:
@@ -311,6 +313,7 @@ def _compiled(
             debug_ring=debug_ring,
             rescale_threshold=rescale_threshold,
             l_from_p8=l_from_p8,
+            o_f32=o_f32,
         )
         assert kernel.ws_req_bytes == cp_partial_geometry(q_len * gh, n_splits)["ws_req_bytes"]
     dev = torch.device("cuda")
@@ -338,7 +341,7 @@ def _compiled(
         cutlass.Float32(1.0),
         _ptr(f32, cutlass.Float32, a["bmm2"]),
         cutlass.Float32(1.0),
-        _ptr(bf, cutlass.BFloat16, 16 if o_vec16 else 4),
+        _ptr(f32 if o_f32 else bf, cutlass.Float32 if o_f32 else cutlass.BFloat16, 16 if o_vec16 else 4),
         I32(HEAD_DIM),
         I32(HEAD_DIM),
         I32(HEAD_DIM),
@@ -386,10 +389,10 @@ def q35_cp_fused_partial(
     cp * hq * D, D, 1) at a 16-byte aligned address, is read in place, any other view through a copy); kv_pool [blocks,
     1, 64, D] FP8; block_tables [>= b, 2, max_pages] int32 (K / V block ids, unit stride on pages); seq_lens [>= b]
     int32 (L incl. the q_len new tokens); bmm1_scale float (natural-log domain) or a [>= 2] FP32 tensor (raw, raw *
-    log2e); bmm2_scale float or a [>= 1] FP32 tensor. out_o [cp, rows, hq, D] bf16 (unit stride on D), out_lse [cp,
-    rows, hq] FP32 (base 2). Test hooks: debug (int64 [b * splits, 16] %globaltimer stamps; [CTAs, 16] when balanced),
-    unsafe_skip_wait (no dependency waits), n_splits (must come with its own ``counters``: every launch on a counter
-    row must use the same split count; balanced: the grid's CTAs), fresh_margin, balanced (overrides
+    log2e); bmm2_scale float or a [>= 1] FP32 tensor. out_o [cp, rows, hq, D] bf16 or fp32 (unit stride on D),
+    out_lse [cp, rows, hq] FP32 (base 2). Test hooks: debug (int64 [b * splits, 16] %globaltimer stamps; [CTAs, 16]
+    when balanced), unsafe_skip_wait (no dependency waits), n_splits (must come with its own ``counters``: every launch
+    on a counter row must use the same split count; balanced: the grid's CTAs), fresh_margin, balanced (overrides
     TRTLLM_Q35_ATTN_CP_BALANCED_SPLIT; a mode other than the module's needs its own ``counters``).
     Numerics: p_shift (E4M3 P shift, default _P_SHIFT), rescale_threshold (lazy rescale threshold in log2 units,
     default min(8, 8.75 - p_shift); 0 = exact running max), l_from_p8 (row sums from the E4M3-rounded P).
@@ -426,7 +429,7 @@ def q35_cp_fused_partial(
     assert seq_lens.dtype == torch.int32 and seq_lens.numel() >= b and seq_lens.stride(0) == 1
     assert (
         tuple(out_o.shape) == (cp, rows, hq, D)
-        and out_o.dtype == torch.bfloat16
+        and out_o.dtype in (torch.bfloat16, torch.float32)
         and out_o.stride(3) == 1
     )
     assert tuple(out_lse.shape) == (cp, rows, hq) and out_lse.dtype == torch.float32
@@ -483,6 +486,7 @@ def q35_cp_fused_partial(
         )
     if b2_ptr:
         assert bmm2_scale.numel() >= 1 and bmm2_scale.dtype == torch.float32
+    o_f32 = out_o.dtype == torch.float32
     o_vec16 = out_o.data_ptr() % 16 == 0 and all(out_o.stride(i) % 8 == 0 for i in range(3))
     assert out_o.data_ptr() % 4 == 0 and all(out_o.stride(i) % 2 == 0 for i in range(3)), (
         "out_o: 4-byte aligned rows (alltoall_merge reads it as int32)"
@@ -508,6 +512,7 @@ def q35_cp_fused_partial(
             True,
             rescale_threshold,
             bool(l_from_p8),
+            o_f32,
         )
     else:
         fn = _compiled(
@@ -529,6 +534,7 @@ def q35_cp_fused_partial(
             False,
             rescale_threshold,
             bool(l_from_p8),
+            o_f32,
         )
     fp8 = cutlass.Float8E4M3FN
     f32 = cutlass.Float32
@@ -550,7 +556,7 @@ def q35_cp_fused_partial(
         f32(0.0 if b1_ptr else float(bmm1_scale) * LOG2E),
         _ptr(bmm2_scale if b2_ptr else dummy, f32, a["bmm2"]),
         f32(0.0 if b2_ptr else float(bmm2_scale)),
-        _ptr(out_o, cutlass.BFloat16, 16 if o_vec16 else 4),
+        _ptr(out_o, cutlass.Float32 if o_f32 else cutlass.BFloat16, 16 if o_vec16 else 4),
         I32(out_o.stride(0)),
         I32(out_o.stride(1)),
         I32(out_o.stride(2)),
