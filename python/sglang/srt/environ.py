@@ -1606,6 +1606,9 @@ class Envs:
     # the host leaders meet (HierTagExchange); with two hosts, optionally over one TCP link.
     SGLANG_Q35MF_EDGE_SHM_SYNC_MULTIHOST = EnvBool(False)
     SGLANG_Q35MF_EDGE_MULTIHOST_TCP = EnvBool(False)
+    # A topk-1 chain verify's greedy check, injected acceptance and accept lengths in one
+    # Triton launch (two around a sampled verify's broadcast), bit-identical.
+    SGLANG_Q35MF_FUSED_ACCEPT = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
