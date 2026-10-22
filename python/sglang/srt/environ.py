@@ -1609,6 +1609,10 @@ class Envs:
     # A topk-1 chain verify's greedy check, injected acceptance and accept lengths in one
     # Triton launch (two around a sampled verify's broadcast), bit-identical.
     SGLANG_Q35MF_FUSED_ACCEPT = EnvBool(False)
+    # Between two decode rounds of an unchanged batch, the draft reads the draft extend's
+    # outputs in place instead of through the FutureMap stash and gather (bit-identical);
+    # any other batch flushes the deferred stash first. Overlap scheduler, EAGLE topk 1.
+    SGLANG_Q35MF_SPEC_RELAY_BYPASS = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
