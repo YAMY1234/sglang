@@ -16,9 +16,11 @@ The exchange buffer is one symmetric-memory allocation on the attention TP group
 CTA signals its peers with self-resetting CAS flags, so calls stay graph capturable.
 
 KV-length gate (SGLANG_TRTL1_ATTN_CP_MIN_KV, LL exchanges only): the call also captures the stock
-kernel, and the batch's KV lengths decide on the device which of the two runs. Below the threshold
-the CP kernels exit at entry and the stock kernel reads the full KV; above it the stock kernel is
-given q_len keys per request and the merge overwrites its output.
+kernel, and the batch's KV lengths decide on the device which of the two does the work. Below the
+threshold the CP kernels exit at entry and the stock kernel reads the full KV; above it the stock
+kernel is given q_len keys per request and the merge overwrites its output. On the exact path the
+stock kernel runs beside the gather + partial on a second stream, so the idle side costs about one
+early exit (the merge) when off and nothing when on.
 """
 
 from __future__ import annotations
@@ -125,6 +127,18 @@ def _gate_on(seq_lens, nb, thr, NB: tl.constexpr, GMAX: tl.constexpr):
         return tl.max(L, axis=0) >= thr
     else:
         return tl.sum(L, axis=0) >= thr
+
+
+@triton.jit
+def _gate_lens(seq_lens, nb, thr, stock_lens, pre_lens, QL: tl.constexpr, NB: tl.constexpr, GMAX: tl.constexpr):
+    """Once per forward: the stock call's lengths (L with the gate off, q_len keys with it on) and the exact
+    path's prefix lengths (max(L - QL, 0) on, 0 off)."""
+    k = tl.arange(0, NB)
+    m = k < nb
+    L = tl.load(seq_lens + k, mask=m, other=0)
+    on = _gate_on(seq_lens, nb, thr, NB, GMAX)
+    tl.store(stock_lens + k, tl.where(on, tl.minimum(L, QL), L), mask=m)
+    tl.store(pre_lens + k, tl.where(on, tl.maximum(L - QL, 0), 0), mask=m)
 
 
 @triton.jit
@@ -299,17 +313,17 @@ def _ll_wait(src, n: tl.constexpr, e):
 def _cp_gather_q_ll(
     q, q_stride, peers, me, ll_off, q_all, cnt, seq_lens, pre_lens, stock_lens, nb, thr,
     CP: tl.constexpr, WORDS: tl.constexpr, QL: tl.constexpr, FOLD: tl.constexpr,
-    GATE: tl.constexpr, NB: tl.constexpr, GMAX: tl.constexpr,
+    GATE: tl.constexpr, NB: tl.constexpr, GMAX: tl.constexpr, GWRITE: tl.constexpr,
 ):
     """LL variant of _cp_gather_q: every 4-byte word travels with the call's epoch in one 8-byte store.
     FOLD: q_all is written source-major per request ([B, CP, QL, heads, D]) for the prefix-only fused partial,
     and pre_lens[b] = max(L - QL, 0).
-    GATE: first writes the stock call's lengths (L with the gate off, q_len with it on) and, FOLD, pre_lens = 0 with
-    the gate off; then exits with the gate off."""
+    GATE: exits with the gate off; GWRITE: first writes the stock call's lengths (L with the gate off, q_len with it
+    on) and, FOLD, pre_lens = 0 with the gate off (else _gate_lens wrote them)."""
     i = tl.program_id(0)
     if GATE:
         on = _gate_on(seq_lens, nb, thr, NB, GMAX)
-        if i % QL == 0:
+        if GWRITE and i % QL == 0:
             Lb = tl.load(seq_lens + i // QL)
             tl.store(stock_lens + i // QL, tl.where(on, tl.minimum(Lb, QL), Lb))
             if FOLD:
@@ -551,6 +565,10 @@ class CpLite:
         self.min_kv = _parse_min_kv(envs.SGLANG_TRTL1_ATTN_CP_MIN_KV.get())
         self.gate_max = envs.SGLANG_TRTL1_ATTN_CP_GATE_MAX.get()
         self.stock_lens = torch.zeros(rows, dtype=torch.int32, device=self.device)
+        self.gate_overlap = envs.SGLANG_TRTL1_ATTN_CP_GATE_OVERLAP.get()
+        self._side = torch.cuda.Stream(device=self.device)
+        # (lengths, b, q_len, threshold) -> [(stock lengths, prefix lengths), forward, last layer id that used them]
+        self._glens: dict = {}
         self._logged: set = set()
         # (page table, lengths, q_len) -> [tables, owned lengths, forward, last layer id that used them]
         self._tabs: dict = {}
@@ -664,11 +682,14 @@ class CpLite:
         gate = dict(nb=b, thr=0 if thr is None else thr, GATE=thr is not None, NB=triton.next_power_of_2(b),
                     GMAX=self.gate_max)
         out = None
+        if thr is not None and exact and self.gate_overlap:
+            return self._exact_overlap(q, k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale,
+                                       bmm2_scale, forward_batch, layer.layer_id, stock, gate)
         if self.ll:
             _cp_gather_q_ll[(rows,)](
                 q.view(torch.int32), words, self.peers, self.me, self.llq_off, self.q_all.view(torch.int32),
                 self.cnt[0], seq_lens, self.pre_lens, self.stock_lens, **gate,
-                CP=self.cp, WORDS=words, QL=q_len, FOLD=exact, num_warps=4,
+                CP=self.cp, WORDS=words, QL=q_len, FOLD=exact, GWRITE=True, num_warps=4,
             )
             if thr is not None:
                 out = torch.empty(rows, self.hq, HEAD_DIM, dtype=torch.bfloat16, device=q.device)
@@ -731,6 +752,47 @@ class CpLite:
     def _exact(self, q, k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale, out, gate):
         """The fused partial on the context prefix (q_len folded into the heads: one query row of q_len x heads per
         request, no causal effect), then the trtllm-gen path's merge with the causal block in fp32."""
+        self._exact_partial(k_cache, v_cache, page_table, self.pre_lens, q_len, b, rows, bmm1_scale, bmm2_scale)
+        return self._exact_merge(q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale,
+                                 out, gate)
+
+    def _gate_lens_fwd(self, seq_lens, b, q_len, thr, forward_batch, layer_id):
+        """Once per forward (as _tables): the stock call's lengths and the exact path's prefix lengths."""
+        key = (seq_lens.data_ptr(), b, q_len, thr)
+        ent = self._glens.get(key)
+        if ent is not None and ent[1]() is forward_batch and layer_id > ent[2]:
+            ent[2] = layer_id
+            return ent[0]
+        if len(self._glens) > 64:
+            self._glens.clear()
+        lens = torch.empty(2, b, dtype=torch.int32, device=self.device)
+        self._glens[key] = [(lens[0], lens[1]), weakref.ref(forward_batch), layer_id]
+        _gate_lens[(1,)](seq_lens, b, thr, lens[0], lens[1], QL=q_len, NB=triton.next_power_of_2(b),
+                         GMAX=self.gate_max)
+        return lens[0], lens[1]
+
+    def _exact_overlap(self, q, k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale,
+                       forward_batch, layer_id, stock, gate):
+        """Gated exact call: stock(lengths, out) on this stream beside gather + partial on the side stream,
+        then the merge (exits with the gate off)."""
+        stock_lens, pre_lens = self._gate_lens_fwd(seq_lens, b, q_len, gate["thr"], forward_batch, layer_id)
+        out = torch.empty(rows, self.hq, HEAD_DIM, dtype=torch.bfloat16, device=self.device)
+        main = torch.cuda.current_stream()
+        self._side.wait_stream(main)
+        stock(stock_lens, out)
+        words = self.hq * HEAD_DIM // 4
+        with torch.cuda.stream(self._side):
+            _cp_gather_q_ll[(rows,)](
+                q.view(torch.int32), words, self.peers, self.me, self.llq_off, self.q_all.view(torch.int32),
+                self.cnt[0], seq_lens, pre_lens, self.stock_lens, **gate,
+                CP=self.cp, WORDS=words, QL=q_len, FOLD=True, GWRITE=False, num_warps=4,
+            )
+            self._exact_partial(k_cache, v_cache, page_table, pre_lens, q_len, b, rows, bmm1_scale, bmm2_scale)
+        main.wait_stream(self._side)
+        return self._exact_merge(q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale,
+                                 out, gate)
+
+    def _exact_partial(self, k_cache, v_cache, page_table, pre_lens, q_len, b, rows, bmm1_scale, bmm2_scale):
         from sglang.srt.layers.attention import q35_cp_fused as F
 
         cp, hq = self.cp, self.hq
@@ -738,7 +800,7 @@ class CpLite:
             self.q_all[:rows].view(b, cp, q_len * hq, HEAD_DIM).permute(1, 0, 2, 3),
             k_cache,
             page_table,
-            self.pre_lens,
+            pre_lens,
             1,
             self.me,
             cp,
@@ -752,6 +814,9 @@ class CpLite:
             p_shift=_EXACT_P_SHIFT,
             rescale_threshold=_EXACT_RESCALE_THRESHOLD,
         )
+
+    def _exact_merge(self, q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale, out, gate):
+        hq = self.hq
         if out is None:
             out = torch.empty(rows, hq, HEAD_DIM, dtype=torch.bfloat16, device=self.device)
         _cp_a2a_merge_ll[(rows,)](
@@ -759,7 +824,7 @@ class CpLite:
             self.po_x.stride(0) // 2, hq, self.pl_x.stride(0), q, q.stride(0), k_cache, v_cache,
             k_cache.stride(0), k_cache.stride(2), page_table, page_table.stride(0), seq_lens, out, out.stride(0),
             self.peers, self.me, self.llp_off, self.cnt[1], bmm1_scale, bmm2_scale, **gate,
-            QL=q_len, HQ=hq, CP=cp, D=HEAD_DIM, PG=PAGE, NWP=_LL_PWORDS, num_warps=8,
+            QL=q_len, HQ=hq, CP=self.cp, D=HEAD_DIM, PG=PAGE, NWP=_LL_PWORDS, num_warps=8,
         )
         return out
 

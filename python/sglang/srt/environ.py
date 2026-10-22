@@ -1192,6 +1192,8 @@ class Envs:
     SGLANG_TRTL1_ATTN_CP_MIN_KV = EnvStr("")
     # Gate on the batch's longest KV instead of the mean.
     SGLANG_TRTL1_ATTN_CP_GATE_MAX = EnvBool(False)
+    # Gated exact path: the stock kernel on the current stream beside the CP gather + partial on a second stream.
+    SGLANG_TRTL1_ATTN_CP_GATE_OVERLAP = EnvBool(True)
     # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
     SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
     # Store DeepSeek-V4 SWA KV directly in FlashInfer's 64-token SM120 page
