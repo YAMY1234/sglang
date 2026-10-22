@@ -162,15 +162,17 @@ def _cp_tables(
     GMAX: tl.constexpr,
 ):
     """This rank's compact page table and token count over the prefix [0, L - QL); with GATE and the gate
-    off, no owned page (one dummy key)."""
+    off, no owned page and no key."""
     b = tl.program_id(0)
     cb = tl.program_id(1)
     L = tl.load(seq_lens + b)
     prefix = tl.maximum(L - QL, 0)
     n_pages = (prefix + PG - 1) // PG
     n_own = tl.maximum((n_pages - rank + CP - 1) // CP, 0)
+    on = 1
     if GATE:
-        n_own = tl.where(_gate_on(seq_lens, nb, thr, NB, GMAX), n_own, 0)
+        on = _gate_on(seq_lens, nb, thr, NB, GMAX).to(tl.int32)
+        n_own = n_own * on
     j = cb * BLOCK + tl.arange(0, BLOCK)
     m = j < ncols
     pg = tl.load(page_table + b * pt_stride + j * CP + rank, mask=m & (j < n_own), other=0)
@@ -179,8 +181,8 @@ def _cp_tables(
         last_tok = prefix - (n_pages - 1) * PG
         tail = (n_own > 0) & ((n_own - 1) * CP + rank == n_pages - 1)
         n = n_own * PG - tl.where(tail, PG - last_tok, 0)
-        # no owned page: one dummy key, dropped by the merge
-        tl.store(lens + b, tl.maximum(n, 1))
+        # no owned page: one dummy key, dropped by the merge; gate off: no key (the merge exits)
+        tl.store(lens + b, tl.maximum(n, on))
 
 
 @triton.jit
@@ -681,7 +683,9 @@ class CpLite:
         q = q if q.is_contiguous() else q.contiguous()
         words = self.hq * HEAD_DIM // 4
         exact = self.exact and self._exact_supported(q_len, b)
-        thr = self._gate_thr(b) if stock is not None and self.ll and (exact or not self.fused) else None
+        # every path but the non-exact fused one (cpf) can be gated; exact batches above the fused kernel's
+        # limit take the trtllm-gen partial
+        thr = self._gate_thr(b) if stock is not None and self.ll and (self.exact or not self.fused) else None
         gate = dict(nb=b, thr=0 if thr is None else thr, GATE=thr is not None, NB=triton.next_power_of_2(b),
                     GMAX=self.gate_max)
         out = None
