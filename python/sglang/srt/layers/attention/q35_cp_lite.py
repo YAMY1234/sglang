@@ -19,7 +19,7 @@ CTA signals its peers with self-resetting CAS flags, so calls stay graph captura
 from __future__ import annotations
 
 import logging
-import math
+import weakref
 from typing import Optional
 
 import torch
@@ -288,6 +288,8 @@ class CpLite:
         self.plse = torch.empty(rows, cp * q_heads, dtype=torch.float32, device=self.device)
         self.counter = torch.zeros(1 << 16, dtype=torch.int32, device=self.device)
         self._logged: set = set()
+        # (page table, lengths, q_len) -> [tables, owned lengths, forward, last layer id that used them]
+        self._tabs: dict = {}
         torch.distributed.barrier(group)
         logger.info(
             "TRT-L1 CP-lite: tp rank %d, KV group of %d (group rank %d), min batch %d",
@@ -313,11 +315,21 @@ class CpLite:
         cls._instance = cls(group, rank, tp, cp, q_heads, device)
         return cls._instance
 
-    def _tables(self, page_table, seq_lens, q_len):
+    def _tables(self, page_table, seq_lens, q_len, forward_batch, layer_id):
+        """Once per forward: reused only by later layers of the same forward, so every capture and
+        every single-layer draft step computes its own."""
         b = seq_lens.shape[0]
         ncols = triton.cdiv(page_table.shape[1], self.cp)
+        key = (page_table.data_ptr(), page_table.shape, seq_lens.data_ptr(), b, q_len)
+        ent = self._tabs.get(key)
+        if ent is not None and ent[2]() is forward_batch and layer_id > ent[3]:
+            ent[3] = layer_id
+            return ent[0], ent[1], ncols * PAGE
+        if len(self._tabs) > 64:
+            self._tabs.clear()
         tab = torch.empty(b, ncols, dtype=torch.int32, device=self.device)
         lens = torch.empty(b, dtype=torch.int32, device=self.device)
+        self._tabs[key] = [tab, lens, weakref.ref(forward_batch), layer_id]
         _cp_tables[(b, triton.cdiv(ncols, 256))](
             page_table, page_table.stride(0), seq_lens, tab, tab.stride(0), lens, ncols, self.me,
             QL=q_len, CP=self.cp, PG=PAGE, BLOCK=256,
@@ -335,6 +347,7 @@ class CpLite:
         bmm2_scale,
         workspace: torch.Tensor,
         layer,
+        forward_batch,
     ) -> Optional[torch.Tensor]:
         """CP-lite attention of this rank's heads: [rows, heads, head_dim] bf16, or None
         where the call is not served (decided by shapes only, so every rank agrees)."""
@@ -366,7 +379,7 @@ class CpLite:
             q.view(torch.int32), words, self.peers, self.me, 0, self.f_off,
             CP=self.cp, WORDS=words, num_warps=4,
         )
-        tab, lens, max_kv = self._tables(page_table, seq_lens, q_len)
+        tab, lens, max_kv = self._tables(page_table, seq_lens, q_len, forward_batch, layer.layer_id)
         gh = self.cp * self.hq
         po = self.po[:rows].view(b, q_len * gh, HEAD_DIM)
         plse = self.plse[:rows].view(b, q_len * gh)

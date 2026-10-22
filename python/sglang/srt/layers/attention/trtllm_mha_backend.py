@@ -1688,6 +1688,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 bmm2_scale,
                 self.workspace_buffer,
                 layer,
+                forward_batch,
             )
         if o is not None:
             return o.view(-1, layer.tp_q_head_num * layer.head_dim)
@@ -1909,6 +1910,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                         bmm2_scale,
                         self.workspace_buffer,
                         layer,
+                        forward_batch,
                     )
                 if o is None:
                     o = self._run_fixed_q_len_decode(
