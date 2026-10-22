@@ -1485,6 +1485,9 @@ class Envs:
     # A sampled verify result (predict, accept_index, num_correct_drafts) is one int32
     # buffer, broadcast to the TP group once.
     SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST = EnvBool(False)
+    # A topk-1 chain verify's greedy check, injected acceptance and accept lengths in one
+    # Triton launch (two around a sampled verify's broadcast), bit-identical.
+    SGLANG_Q35MF_FUSED_ACCEPT = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)

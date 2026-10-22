@@ -52,6 +52,7 @@ _is_xpu = is_xpu()
 _is_cpu = is_cpu()
 _COMPACT_VERIFY_SAMPLING = envs.SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING.get()
 _PACKED_VERIFY_BCAST = envs.SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST.get()
+_FUSED_ACCEPT = envs.SGLANG_Q35MF_FUSED_ACCEPT.get()
 
 logger = logging.getLogger(__name__)
 
@@ -875,37 +876,69 @@ def eagle_sample(
 
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
     predict_shape = list(next_token_logits.shape)[:-1]
+    use_rejection_sampling = get_spec().speculative_use_rejection_sampling
+    greedy = _verify_uses_greedy(
+        is_all_greedy=sampling_info.is_all_greedy,
+        is_cpu=_is_cpu,
+        is_hip=_is_hip,
+        is_xpu=_is_xpu,
+        use_rejection_sampling=use_rejection_sampling,
+    )
+    sparse = not greedy and _can_use_sparse_uno_tree_target_sampling(
+        uno_target_max_top_k,
+        sampling_info,
+    )
+    # SGLANG_Q35MF_FUSED_ACCEPT: chain_accept writes every verify output itself
+    chain = _chain_accept_applies(
+        verify_input=verify_input,
+        logits=next_token_logits,
+        simulated_acc_len=simulated_acc_len,
+        simulate_acc_len=SIMULATE_ACC_LEN,
+        simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
+        watermark=watermark_state is not None
+        and sampling_info.has_watermark_candidates,
+    )
+    fused_verify = chain and (greedy or sparse)
     predict, accept_index, num_correct_drafts, verify_out = _verify_outputs(
         rows=math.prod(predict_shape),
         bs=bs,
         depth=verify_input.max_tree_depth,
         device=device,
         packed=_PACKED_VERIFY_BCAST,
+        init=not fused_verify,
     )
 
     # Sample tokens
     target_predict = None
-    use_rejection_sampling = get_spec().speculative_use_rejection_sampling
-    if _verify_uses_greedy(
-        is_all_greedy=sampling_info.is_all_greedy,
-        is_cpu=_is_cpu,
-        is_hip=_is_hip,
-        is_xpu=_is_xpu,
-        use_rejection_sampling=use_rejection_sampling,
-    ):
+    accept_lens = None
+    if greedy:
         target_predict = torch.argmax(next_token_logits, dim=-1)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
-        predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
-            predicts=predict,  # mutable
-            accept_index=accept_index,  # mutable
-            accept_token_num=num_correct_drafts,  # mutable
-            candidates=candidates,
-            retrieve_index=verify_input.retrieve_index,
-            retrieve_next_token=verify_input.retrieve_next_token,
-            retrieve_next_sibling=verify_input.retrieve_next_sibling,
-            target_predict=target_predict,
-            topk=verify_input.tree_topk,
-        )
+        if fused_verify:
+            accept_lens, accept_index = _chain_accept(
+                predict=predict,
+                accept_index=accept_index,
+                num_correct_drafts=num_correct_drafts,
+                candidates=candidates,
+                verify_input=verify_input,
+                target_predict=target_predict,
+                bonus_target=target_predict,
+                simulated_acc_len=simulated_acc_len if SIMULATE_ACC_LEN > 0 else None,
+                real_draft_tokens=SIMULATE_ACC_TOKEN_MODE == "real-draft-token",
+                finish=True,
+            )
+        else:
+            predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
+                predicts=predict,  # mutable
+                accept_index=accept_index,  # mutable
+                accept_token_num=num_correct_drafts,  # mutable
+                candidates=candidates,
+                retrieve_index=verify_input.retrieve_index,
+                retrieve_next_token=verify_input.retrieve_next_token,
+                retrieve_next_sibling=verify_input.retrieve_next_sibling,
+                target_predict=target_predict,
+                topk=verify_input.tree_topk,
+            )
 
         if _is_hip:
             # On ROCm, the per-rank draft tokens can differ, so ranks accept a
@@ -921,10 +954,7 @@ def eagle_sample(
                 tp_group.broadcast(predict, src=0)
                 tp_group.broadcast(accept_index, src=0)
                 tp_group.broadcast(num_correct_drafts, src=0)
-    elif _can_use_sparse_uno_tree_target_sampling(
-        uno_target_max_top_k,
-        sampling_info,
-    ):
+    elif sparse:
         from sglang.srt.speculative.uno_utils import (
             sample_uno_tree_target_tokens,
         )
@@ -936,17 +966,31 @@ def eagle_sample(
             verify_width=verify_input.draft_token_num,
             max_top_k=uno_target_max_top_k,
         )
-        predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
-            predicts=predict,
-            accept_index=accept_index,
-            accept_token_num=num_correct_drafts,
-            candidates=candidates,
-            retrieve_index=verify_input.retrieve_index,
-            retrieve_next_token=verify_input.retrieve_next_token,
-            retrieve_next_sibling=verify_input.retrieve_next_sibling,
-            target_predict=target_predict,
-            topk=verify_input.tree_topk,
-        )
+        if fused_verify:
+            _chain_accept(
+                predict=predict,
+                accept_index=accept_index,
+                num_correct_drafts=num_correct_drafts,
+                candidates=candidates,
+                verify_input=verify_input,
+                target_predict=target_predict,
+                bonus_target=None,
+                simulated_acc_len=None,
+                real_draft_tokens=False,
+                finish=False,
+            )
+        else:
+            predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
+                predicts=predict,
+                accept_index=accept_index,
+                accept_token_num=num_correct_drafts,
+                candidates=candidates,
+                retrieve_index=verify_input.retrieve_index,
+                retrieve_next_token=verify_input.retrieve_next_token,
+                retrieve_next_sibling=verify_input.retrieve_next_sibling,
+                target_predict=target_predict,
+                topk=verify_input.tree_topk,
+            )
 
         tp_group = (
             get_parallel().attn_tp_group
@@ -1093,7 +1137,7 @@ def eagle_sample(
                 tp_group.broadcast(accept_index, src=0)
                 tp_group.broadcast(num_correct_drafts, src=0)
 
-    if SIMULATE_ACC_LEN > 0:
+    if SIMULATE_ACC_LEN > 0 and accept_lens is None:
         # Do simulation. The helper builds (and returns) a replacement
         # accept_index of width spec_steps + 1, so pass max_tree_depth - 1
         # to keep the simulated width identical to the real one.
@@ -1116,7 +1160,20 @@ def eagle_sample(
                 target_predict = torch.argmax(next_token_logits, dim=-1).reshape(
                     bs, verify_input.draft_token_num
                 )
-        if simulated_acc_len is not None:
+        if chain:
+            accept_lens, accept_index = _chain_accept(
+                predict=predict,
+                accept_index=accept_index,
+                num_correct_drafts=num_correct_drafts,
+                candidates=candidates,
+                verify_input=verify_input,
+                target_predict=None,
+                bonus_target=target_predict,
+                simulated_acc_len=simulated_acc_len,
+                real_draft_tokens=SIMULATE_ACC_TOKEN_MODE == "real-draft-token",
+                finish=True,
+            )
+        elif simulated_acc_len is not None:
             accept_index = generate_simulated_accept_index_device(
                 accept_index=accept_index,
                 predict=predict,  # mutable
@@ -1145,7 +1202,8 @@ def eagle_sample(
     # `num_correct_drafts` stays drafts-only inside this function; the returned
     # tensor includes the trailing/bonus token via out-of-place +1 so the
     # name no longer flips semantics mid-function (naming doc C2).
-    accept_lens = num_correct_drafts + 1
+    if accept_lens is None:
+        accept_lens = num_correct_drafts + 1
     if watermark_state is not None and sampling_info.has_watermark_candidates:
         watermark_state.record_speculative(
             batch.req_pool_indices,
@@ -1157,22 +1215,88 @@ def eagle_sample(
     return predict, accept_lens, accept_index
 
 
+def _chain_accept_applies(
+    *,
+    verify_input: EagleVerifyInput,
+    logits: torch.Tensor,
+    simulated_acc_len: Optional[torch.Tensor],
+    simulate_acc_len: float,
+    simulate_acc_token_mode: str,
+    watermark: bool,
+) -> bool:
+    """Whether chain_accept runs eagle_sample's tail (SGLANG_Q35MF_FUSED_ACCEPT): a CUDA
+    chain draft whose tree width is the accept width, an injected length (if any)
+    already on the device, and no watermark."""
+    if not _FUSED_ACCEPT or not logits.is_cuda or _is_hip or watermark:
+        return False
+    if verify_input.tree_topk != 1:
+        return False
+    if verify_input.draft_token_num != verify_input.max_tree_depth:
+        return False
+    if simulate_acc_len > 0:
+        return simulated_acc_len is not None and simulate_acc_token_mode in (
+            "fixed",
+            "real-draft-token",
+        )
+    return True
+
+
+def _chain_accept(
+    *,
+    predict: torch.Tensor,
+    accept_index: torch.Tensor,
+    num_correct_drafts: torch.Tensor,
+    candidates: torch.Tensor,
+    verify_input: EagleVerifyInput,
+    target_predict: Optional[torch.Tensor],
+    bonus_target: Optional[torch.Tensor],
+    simulated_acc_len: Optional[torch.Tensor],
+    real_draft_tokens: bool,
+    finish: bool,
+):
+    from sglang.kernels.ops.speculative.eagle import chain_accept
+
+    return chain_accept(
+        predict=predict,
+        accept_index=accept_index,
+        num_correct_drafts=num_correct_drafts,
+        candidates=candidates,
+        retrieve_index=verify_input.retrieve_index,
+        retrieve_next_token=verify_input.retrieve_next_token,
+        retrieve_next_sibling=verify_input.retrieve_next_sibling,
+        target_predict=target_predict,
+        bonus_target=bonus_target,
+        simulated_acc_len=simulated_acc_len,
+        real_draft_tokens=real_draft_tokens,
+        verify=target_predict is not None,
+        finish=finish,
+    )
+
+
 def _verify_outputs(
-    *, rows: int, bs: int, depth: int, device, packed: bool
+    *, rows: int, bs: int, depth: int, device, packed: bool, init: bool = True
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """predict [rows] (zeros), accept_index [bs, depth] (-1) and num_correct_drafts
     [bs] int32; packed (SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST): views of one buffer,
-    returned last so a sampled result goes to the TP group in one broadcast."""
+    returned last so a sampled result goes to the TP group in one broadcast. Without
+    init they are left unset, for chain_accept to write whole."""
     if not packed:
-        predict = torch.zeros((rows,), dtype=torch.int32, device=device)
-        accept_index = torch.full((bs, depth), -1, dtype=torch.int32, device=device)
+        if not init:
+            predict = torch.empty((rows,), dtype=torch.int32, device=device)
+            accept_index = torch.empty((bs, depth), dtype=torch.int32, device=device)
+        else:
+            predict = torch.zeros((rows,), dtype=torch.int32, device=device)
+            accept_index = torch.full(
+                (bs, depth), -1, dtype=torch.int32, device=device
+            )
         num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
         return predict, accept_index, num_correct_drafts, None
     out = torch.empty((rows + bs * depth + bs,), dtype=torch.int32, device=device)
     predict = out[:rows]
-    predict.zero_()
     accept_index = out[rows : rows + bs * depth].view(bs, depth)
-    accept_index.fill_(-1)
+    if init:
+        predict.zero_()
+        accept_index.fill_(-1)
     return predict, accept_index, out[rows + bs * depth :], out
 
 
