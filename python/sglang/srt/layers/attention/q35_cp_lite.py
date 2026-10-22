@@ -38,7 +38,7 @@ from sglang.srt.environ import envs
 logger = logging.getLogger(__name__)
 
 PAGE, HEAD_DIM = 64, 256
-_MAX_ROWS = 128  # widest call: rows = requests * q_len (TP8 verify at B16: 112)
+_MAX_ROWS = 896  # widest call: rows = requests * q_len (TP8 verify at B128: 896)
 _KINDS = 2  # flag regions: q gather, partial exchange
 # exact path's fused partial: E4M3 P with shift 8 against the exact running max (lazy rescale threshold 0), so the
 # row max maps to 2^8, exact in E4M3
@@ -744,10 +744,17 @@ class CpLite:
             )
         return out
 
+    def _exact_chunk(self, b):
+        """Requests per fused-partial launch: the kernel takes at most MAX_BATCH_Q1 (its combine rows bound the
+        splits per request), so wider batches run as several launches."""
+        from sglang.srt.layers.attention import q35_cp_fused as F
+
+        return min(b, F.MAX_BATCH_Q1)
+
     def _exact_supported(self, q_len, b):
         from sglang.srt.layers.attention import q35_cp_fused as F
 
-        return F.q35_cp_fused_supported(1, self.cp, q_len * self.hq, b, self.sms)
+        return F.q35_cp_fused_supported(1, self.cp, q_len * self.hq, self._exact_chunk(b), self.sms)
 
     def _exact(self, q, k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale, out, gate):
         """The fused partial on the context prefix (q_len folded into the heads: one query row of q_len x heads per
@@ -795,25 +802,28 @@ class CpLite:
     def _exact_partial(self, k_cache, v_cache, page_table, pre_lens, q_len, b, rows, bmm1_scale, bmm2_scale):
         from sglang.srt.layers.attention import q35_cp_fused as F
 
-        cp, hq = self.cp, self.hq
-        F.q35_cp_fused_partial(
-            self.q_all[:rows].view(b, cp, q_len * hq, HEAD_DIM).permute(1, 0, 2, 3),
-            k_cache,
-            page_table,
-            pre_lens,
-            1,
-            self.me,
-            cp,
-            bmm1_scale,
-            bmm2_scale,
-            self.po_x[:, :rows].view(cp, b, q_len * hq, HEAD_DIM),
-            self.pl_x[:, :rows].view(cp, b, q_len * hq),
-            sm_count=self.sms,
-            enable_pdl=False,
-            v_pool=v_cache,
-            p_shift=_EXACT_P_SHIFT,
-            rescale_threshold=_EXACT_RESCALE_THRESHOLD,
-        )
+        cp, hq, n = self.cp, self.hq, self._exact_chunk(b)
+        for r0 in range(0, b, n):
+            r1 = min(r0 + n, b)
+            bc, t0, t1 = r1 - r0, r0 * q_len, r1 * q_len
+            F.q35_cp_fused_partial(
+                self.q_all[t0:t1].view(bc, cp, q_len * hq, HEAD_DIM).permute(1, 0, 2, 3),
+                k_cache,
+                page_table[r0:r1],
+                pre_lens[r0:r1],
+                1,
+                self.me,
+                cp,
+                bmm1_scale,
+                bmm2_scale,
+                self.po_x[:, t0:t1].view(cp, bc, q_len * hq, HEAD_DIM),
+                self.pl_x[:, t0:t1].view(cp, bc, q_len * hq),
+                sm_count=self.sms,
+                enable_pdl=False,
+                v_pool=v_cache,
+                p_shift=_EXACT_P_SHIFT,
+                rescale_threshold=_EXACT_RESCALE_THRESHOLD,
+            )
 
     def _exact_merge(self, q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale, out, gate):
         hq = self.hq
