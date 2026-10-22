@@ -1182,6 +1182,8 @@ class Envs:
     SGLANG_TRTL1_ATTN_CP_MIN_BS = EnvInt(2)
     # LL exchanges (epoch in each 8-byte store) instead of CAS-flag barriers.
     SGLANG_TRTL1_ATTN_CP_LL = EnvBool(True)
+    # TRT-LLM's fused CP partial kernel (owned pages + causal block + split combine in one launch).
+    SGLANG_TRTL1_ATTN_CP_FUSED = EnvBool(False)
     # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
     SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
     # Store DeepSeek-V4 SWA KV directly in FlashInfer's 64-token SM120 page

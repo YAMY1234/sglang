@@ -321,6 +321,7 @@ def _compiled(
         kernel,
         _ptr(u8, fp8, a["q"]),
         _ptr(u8, fp8, a["kv"]),
+        _ptr(u8, fp8, a["kv"]),
         I32(64),
         _ptr(i32, I32, a["tab"]),
         I32(2),
@@ -363,6 +364,7 @@ def q35_cp_fused_partial(
     enable_pdl: bool = False,
     *,
     debug: Optional[torch.Tensor] = None,
+    v_pool: Optional[torch.Tensor] = None,
     unsafe_skip_wait: bool = False,
     n_splits: Optional[int] = None,
     fresh_margin: Optional[int] = None,
@@ -400,7 +402,16 @@ def q35_cp_fused_partial(
         and kv_pool.shape[3] == HEAD_DIM
     )
     assert kv_pool.is_contiguous() and kv_pool.dtype in (torch.float8_e4m3fn, torch.uint8)
-    assert block_tables.dim() == 3 and block_tables.shape[0] >= b and block_tables.shape[1] == 2
+    # v_pool: V in its own pool of kv_pool's shape; block_tables [b, P] then names the same page of both
+    if v_pool is not None:
+        assert v_pool.shape == kv_pool.shape and v_pool.is_contiguous() and v_pool.dtype == kv_pool.dtype
+    if block_tables.dim() == 2:
+        assert v_pool is not None, "a [b, P] page table needs v_pool"
+        tab_sb, tab_skv = block_tables.stride(0), 0
+    else:
+        assert block_tables.dim() == 3 and block_tables.shape[1] == 2
+        tab_sb, tab_skv = block_tables.stride(0), block_tables.stride(1)
+    assert block_tables.shape[0] >= b
     assert block_tables.stride(-1) == 1 and block_tables.dtype == torch.int32
     assert seq_lens.dtype == torch.int32 and seq_lens.numel() >= b and seq_lens.stride(0) == 1
     assert (
@@ -513,10 +524,11 @@ def q35_cp_fused_partial(
     fn(
         _ptr(q_src, fp8, a["q"]),
         _ptr(kv_pool, fp8, a["kv"]),
+        _ptr(kv_pool if v_pool is None else v_pool, fp8, a["kv"]),
         I32(kv_pool.shape[0] * PAGE),
         _ptr(block_tables, I32, a["tab"]),
-        I32(block_tables.stride(0)),
-        I32(block_tables.stride(1)),
+        I32(tab_sb),
+        I32(tab_skv),
         _ptr(seq_lens, I32, a["seq"]),
         I32(cp_rank),
         _ptr(bmm1_scale if b1_ptr else dummy, f32, a["bmm1"]),

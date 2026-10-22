@@ -742,6 +742,7 @@ class Q35CpPartialAttnKernel:
         self,
         q_ptr: cute.Pointer,
         kv_ptr: cute.Pointer,
+        v_ptr: cute.Pointer,
         n_kv_rows: Int32,
         tab_ptr: cute.Pointer,
         tab_stride_b: Int32,
@@ -775,8 +776,9 @@ class Q35CpPartialAttnKernel:
         mKV = cute.make_tensor(
             kv_ptr, cute.make_layout((n_kv_rows, HEAD_DIM), stride=(HEAD_DIM, 1))
         )
+        # V may live in its own pool (SGLang: per-layer K and V buffers); tab_stride_kv 0 shares one page table
         mKVt = cute.make_tensor(
-            kv_ptr, cute.make_layout((HEAD_DIM, n_kv_rows), stride=(1, HEAD_DIM))
+            v_ptr, cute.make_layout((HEAD_DIM, n_kv_rows), stride=(1, HEAD_DIM))
         )
         mTab = cute.make_tensor(
             tab_ptr,
