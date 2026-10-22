@@ -408,6 +408,17 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             "trtllm_mha_default_kv_scale",
             lambda: torch.ones(1, dtype=torch.float32, device=self.device),
         )
+        self._cp_lite = None
+        if (
+            envs.SGLANG_TRTL1_ATTN_CP.get()
+            and not self.is_xqa_impl
+            and not self.is_nvfp4_kvcache
+            and self.data_type == torch.float8_e4m3fn
+            and self.page_size == 64
+        ):
+            from sglang.srt.layers.attention.q35_cp_lite import CpLite
+
+            self._cp_lite = CpLite.maybe_create(config, self.device)
         self.decode_seq_len_splits = envs.SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS.get()
         if self.decode_seq_len_splits < 1:
             raise ValueError(
@@ -1665,6 +1676,21 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             if self.decode_uses_native_fp4 and not self.is_xqa_impl
             else None
         )
+        o = None
+        if self._cp_lite is not None and attention_sink is None and native_out is None:
+            o = self._cp_lite.attend(
+                q,
+                kv_cache,
+                page_table,
+                self.forward_metadata.cache_seqlens_int32,
+                1,
+                bmm1_scale,
+                bmm2_scale,
+                self.workspace_buffer,
+                layer,
+            )
+        if o is not None:
+            return o.view(-1, layer.tp_q_head_num * layer.head_dim)
         o = self._run_fixed_q_len_decode(
             q,
             kv_cache,
@@ -1867,21 +1893,39 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     if self.forward_metadata.max_seq_len_q > 1
                     else None
                 )
-                o = self._run_fixed_q_len_decode(
-                    q,
-                    kv_cache,
-                    page_table,
-                    self.forward_metadata.cache_seqlens_int32,
-                    bmm1_scale=bmm1_scale,
-                    bmm2_scale=bmm2_scale,
-                    window_left=layer.sliding_window_size,
-                    sinks=attention_sink,
-                    out=native_out,
-                    out_dtype=(None if uses_native_fp4 else self.q_data_type),
-                    kv_cache_sf=kv_cache_block_scales,
-                    q_len_per_req=self.forward_metadata.max_seq_len_q,
-                    mask=mask,
-                )
+                o = None
+                if (
+                    self._cp_lite is not None
+                    and attention_sink is None
+                    and not uses_native_fp4
+                ):
+                    o = self._cp_lite.attend(
+                        q,
+                        kv_cache,
+                        page_table,
+                        self.forward_metadata.cache_seqlens_int32,
+                        self.forward_metadata.max_seq_len_q,
+                        bmm1_scale,
+                        bmm2_scale,
+                        self.workspace_buffer,
+                        layer,
+                    )
+                if o is None:
+                    o = self._run_fixed_q_len_decode(
+                        q,
+                        kv_cache,
+                        page_table,
+                        self.forward_metadata.cache_seqlens_int32,
+                        bmm1_scale=bmm1_scale,
+                        bmm2_scale=bmm2_scale,
+                        window_left=layer.sliding_window_size,
+                        sinks=attention_sink,
+                        out=native_out,
+                        out_dtype=(None if uses_native_fp4 else self.q_data_type),
+                        kv_cache_sf=kv_cache_block_scales,
+                        q_len_per_req=self.forward_metadata.max_seq_len_q,
+                        mask=mask,
+                    )
         elif self.use_fmha_v2 and not cp_active:
             # CP must go through cp_strategy.run_attention (per-shard
             # masking); the plain-causal fmha_v2 call below would be wrong.
