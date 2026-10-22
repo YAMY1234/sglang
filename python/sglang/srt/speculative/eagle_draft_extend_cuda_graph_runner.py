@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -111,6 +112,9 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # Parse args
         self.eagle_worker = eagle_worker
         self.model_runner = model_runner = eagle_worker.draft_runner
+        # The next draft reads the selected hidden rows before this runner's next replay
+        # (SGLANG_Q35MF_SPEC_RELAY_BYPASS), so they need no copy out of the graph output.
+        self.keep_hidden_in_place = envs.SGLANG_Q35MF_SPEC_RELAY_BYPASS.get()
         self.forward_mode = ForwardMode.DRAFT_EXTEND_V2
 
         # Fields the parent's capture() reads:
@@ -718,6 +722,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             ),
             # CUDA graph replay reuses its captured output storage. These states
             # survive into the next draft step, so detach them from that buffer.
-            hidden_states=out.hidden_states[:raw_bs].clone(),
+            hidden_states=(
+                out.hidden_states[:raw_bs]
+                if self.keep_hidden_in_place
+                else out.hidden_states[:raw_bs].clone()
+            ),
         )
         return out

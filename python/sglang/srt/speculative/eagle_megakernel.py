@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.megakernels.eagle_binding import (
     EagleDraftExtendIO,
     EagleDraftLoopIO,
@@ -248,11 +249,12 @@ class EagleMegakernel:
             return None
         self._served_input = (self._input_seq, _rids(batch))
         raw_bs = runner.raw_bs
+        topk_p, topk_index = graphs.out.topk_p[:raw_bs], graphs.out.topk_index[:raw_bs]
+        if envs.SGLANG_Q35MF_SPEC_RELAY_BYPASS.get():
+            # the next round's draft reads them before the next replay rewrites them
+            return topk_p, topk_index
         # the next replay rewrites the buffers before the next round reads them
-        return (
-            graphs.out.topk_p[:raw_bs].clone(),
-            graphs.out.topk_index[:raw_bs].clone(),
-        )
+        return topk_p.clone(), topk_index.clone()
 
     def begin_draft_round(
         self, *, runner: Any, batch: ScheduleBatch, draft_input: Any
