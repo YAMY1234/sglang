@@ -1479,6 +1479,10 @@ class Envs:
     # A sampled verify result (predict, accept_index, num_correct_drafts) is one int32
     # buffer, broadcast to the TP group once.
     SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST = EnvBool(False)
+    # Between two decode rounds of an unchanged batch, the draft reads the draft extend's
+    # outputs in place instead of through the FutureMap stash and gather (bit-identical);
+    # any other batch flushes the deferred stash first. Overlap scheduler, EAGLE topk 1.
+    SGLANG_Q35MF_SPEC_RELAY_BYPASS = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
