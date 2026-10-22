@@ -567,6 +567,9 @@ class CpLite:
         self.stock_lens = torch.zeros(rows, dtype=torch.int32, device=self.device)
         self.gate_overlap = envs.SGLANG_TRTL1_ATTN_CP_GATE_OVERLAP.get()
         self._side = torch.cuda.Stream(device=self.device)
+        self._ws = None
+        if self.min_kv and self.gate_overlap:
+            self._own_workspace()
         # (lengths, b, q_len, threshold) -> [(stock lengths, prefix lengths), forward, last layer id that used them]
         self._glens: dict = {}
         self._logged: set = set()
@@ -586,6 +589,8 @@ class CpLite:
     def set_gate(self, min_kv: Optional[int]):
         """Tests: one threshold for every batch size (None: no gate)."""
         self.min_kv = {} if min_kv is None else {1: int(min_kv)}
+        if self.min_kv and self.gate_overlap:
+            self._own_workspace()
 
     def _gate_thr(self, b: int) -> Optional[int]:
         """The device threshold of a b-request call (on the length sum, or with GATE_MAX on the max), or None."""
@@ -653,8 +658,6 @@ class CpLite:
         where the call is not served (decided by shapes only, so every rank agrees).
         stock(seq_lens, out): the caller's own kernel call into out; with it and a KV gate for this batch size,
         both are captured and the device picks one per call."""
-        import flashinfer
-
         rows = q.shape[0]
         b = seq_lens.shape[0]
         if (
@@ -682,9 +685,9 @@ class CpLite:
         gate = dict(nb=b, thr=0 if thr is None else thr, GATE=thr is not None, NB=triton.next_power_of_2(b),
                     GMAX=self.gate_max)
         out = None
-        if thr is not None and exact and self.gate_overlap:
-            return self._exact_overlap(q, k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale,
-                                       bmm2_scale, forward_batch, layer.layer_id, stock, gate)
+        if thr is not None and self.gate_overlap:
+            return self._gated_overlap(q, k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale,
+                                       bmm2_scale, forward_batch, layer.layer_id, stock, gate, exact)
         if self.ll:
             _cp_gather_q_ll[(rows,)](
                 q.view(torch.int32), words, self.peers, self.me, self.llq_off, self.q_all.view(torch.int32),
@@ -706,35 +709,12 @@ class CpLite:
             out = self._fused(k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale)
             if out is not None:
                 return out
-        tab, lens, max_kv = self._tables(page_table, seq_lens, q_len, forward_batch, layer.layer_id, gate)
-        gh = self.cp * self.hq
-        po = self.po[:rows].view(b, q_len * gh, HEAD_DIM)
-        plse = self.plse[:rows].view(b, q_len * gh)
-        flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-            query=self.q_all[:rows].view(b, q_len * gh, HEAD_DIM),
-            kv_cache=(k_cache, v_cache),
-            workspace_buffer=workspace,
-            block_tables=tab,
-            seq_lens=lens,
-            max_seq_len=max_kv,
-            bmm1_scale=bmm1_scale,
-            bmm2_scale=bmm2_scale,
-            out=po,
-            lse=plse,
-            q_len_per_req=1,
-            multi_ctas_kv_counter_buffer=self.counter,
-        )
+        self._fold_partial(k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale,
+                           forward_batch, layer.layer_id, gate, workspace)
         if out is None:
             out = torch.empty(rows, self.hq, HEAD_DIM, dtype=torch.bfloat16, device=q.device)
         if self.ll:
-            gh_w = self.cp * self.hq * HEAD_DIM // 2
-            _cp_a2a_merge_ll[(rows,)](
-                self.po.view(torch.int32), self.plse.view(torch.int32), gh_w, self.hq * HEAD_DIM // 2,
-                self.cp * self.hq, self.hq, q, q.stride(0), k_cache, v_cache,
-                k_cache.stride(0), k_cache.stride(2), page_table, page_table.stride(0), seq_lens, out, out.stride(0),
-                self.peers, self.me, self.llp_off, self.cnt[1], bmm1_scale, bmm2_scale, **gate,
-                QL=q_len, HQ=self.hq, CP=self.cp, D=HEAD_DIM, PG=PAGE, NWP=_LL_PWORDS, num_warps=8,
-            )
+            self._fold_merge(q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale, out, gate)
         else:
             _cp_a2a_merge[(rows,)](
                 self.po, self.plse, q, q.stride(0), k_cache, v_cache, k_cache.stride(0), k_cache.stride(2),
@@ -744,17 +724,11 @@ class CpLite:
             )
         return out
 
-    def _exact_chunk(self, b):
-        """Requests per fused-partial launch: the kernel takes at most MAX_BATCH_Q1 (its combine rows bound the
-        splits per request), so wider batches run as several launches."""
-        from sglang.srt.layers.attention import q35_cp_fused as F
-
-        return min(b, F.MAX_BATCH_Q1)
-
     def _exact_supported(self, q_len, b):
+        """The fused partial takes <= MAX_BATCH_Q1 requests; wider batches take the trtllm-gen partial."""
         from sglang.srt.layers.attention import q35_cp_fused as F
 
-        return F.q35_cp_fused_supported(1, self.cp, q_len * self.hq, self._exact_chunk(b), self.sms)
+        return F.q35_cp_fused_supported(1, self.cp, q_len * self.hq, b, self.sms)
 
     def _exact(self, q, k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale, out, gate):
         """The fused partial on the context prefix (q_len folded into the heads: one query row of q_len x heads per
@@ -778,10 +752,10 @@ class CpLite:
                          GMAX=self.gate_max)
         return lens[0], lens[1]
 
-    def _exact_overlap(self, q, k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale,
-                       forward_batch, layer_id, stock, gate):
-        """Gated exact call: stock(lengths, out) on this stream beside gather + partial on the side stream,
-        then the merge (exits with the gate off)."""
+    def _gated_overlap(self, q, k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale,
+                       forward_batch, layer_id, stock, gate, exact):
+        """Gated call: stock(lengths, out) on this stream beside gather + partial on the side stream (the
+        trtllm-gen partial with its own workspace), then the merge (exits with the gate off)."""
         stock_lens, pre_lens = self._gate_lens_fwd(seq_lens, b, q_len, gate["thr"], forward_batch, layer_id)
         out = torch.empty(rows, self.hq, HEAD_DIM, dtype=torch.bfloat16, device=self.device)
         main = torch.cuda.current_stream()
@@ -792,38 +766,79 @@ class CpLite:
             _cp_gather_q_ll[(rows,)](
                 q.view(torch.int32), words, self.peers, self.me, self.llq_off, self.q_all.view(torch.int32),
                 self.cnt[0], seq_lens, pre_lens, self.stock_lens, **gate,
-                CP=self.cp, WORDS=words, QL=q_len, FOLD=True, GWRITE=False, num_warps=4,
+                CP=self.cp, WORDS=words, QL=q_len, FOLD=exact, GWRITE=False, num_warps=4,
             )
-            self._exact_partial(k_cache, v_cache, page_table, pre_lens, q_len, b, rows, bmm1_scale, bmm2_scale)
+            if exact:
+                self._exact_partial(k_cache, v_cache, page_table, pre_lens, q_len, b, rows, bmm1_scale, bmm2_scale)
+            else:
+                self._fold_partial(k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale,
+                                   forward_batch, layer_id, gate, self._own_workspace())
         main.wait_stream(self._side)
-        return self._exact_merge(q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale,
-                                 out, gate)
+        merge = self._exact_merge if exact else self._fold_merge
+        return merge(q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale, out, gate)
+
+    def _own_workspace(self):
+        """The overlapped trtllm-gen partial's workspace (the caller's belongs to the stock call)."""
+        if self._ws is None:
+            self._ws = torch.empty(128 << 20, dtype=torch.uint8, device=self.device)
+        return self._ws
+
+    def _fold_partial(self, k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale,
+                      forward_batch, layer_id, gate, workspace):
+        """trtllm-gen over this rank's owned prefix pages for every group head, the q_len rows folded into the
+        heads (q_len_per_req 1), into po / plse with LSE."""
+        import flashinfer
+
+        tab, lens, max_kv = self._tables(page_table, seq_lens, q_len, forward_batch, layer_id, gate)
+        gh = self.cp * self.hq
+        flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+            query=self.q_all[:rows].view(b, q_len * gh, HEAD_DIM),
+            kv_cache=(k_cache, v_cache),
+            workspace_buffer=workspace,
+            block_tables=tab,
+            seq_lens=lens,
+            max_seq_len=max_kv,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            out=self.po[:rows].view(b, q_len * gh, HEAD_DIM),
+            lse=self.plse[:rows].view(b, q_len * gh),
+            q_len_per_req=1,
+            multi_ctas_kv_counter_buffer=self.counter,
+        )
+
+    def _fold_merge(self, q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale, out, gate):
+        gh_w = self.cp * self.hq * HEAD_DIM // 2
+        _cp_a2a_merge_ll[(rows,)](
+            self.po.view(torch.int32), self.plse.view(torch.int32), gh_w, self.hq * HEAD_DIM // 2,
+            self.cp * self.hq, self.hq, q, q.stride(0), k_cache, v_cache,
+            k_cache.stride(0), k_cache.stride(2), page_table, page_table.stride(0), seq_lens, out, out.stride(0),
+            self.peers, self.me, self.llp_off, self.cnt[1], bmm1_scale, bmm2_scale, **gate,
+            QL=q_len, HQ=self.hq, CP=self.cp, D=HEAD_DIM, PG=PAGE, NWP=_LL_PWORDS, num_warps=8,
+        )
+        return out
 
     def _exact_partial(self, k_cache, v_cache, page_table, pre_lens, q_len, b, rows, bmm1_scale, bmm2_scale):
         from sglang.srt.layers.attention import q35_cp_fused as F
 
-        cp, hq, n = self.cp, self.hq, self._exact_chunk(b)
-        for r0 in range(0, b, n):
-            r1 = min(r0 + n, b)
-            bc, t0, t1 = r1 - r0, r0 * q_len, r1 * q_len
-            F.q35_cp_fused_partial(
-                self.q_all[t0:t1].view(bc, cp, q_len * hq, HEAD_DIM).permute(1, 0, 2, 3),
-                k_cache,
-                page_table[r0:r1],
-                pre_lens[r0:r1],
-                1,
-                self.me,
-                cp,
-                bmm1_scale,
-                bmm2_scale,
-                self.po_x[:, t0:t1].view(cp, bc, q_len * hq, HEAD_DIM),
-                self.pl_x[:, t0:t1].view(cp, bc, q_len * hq),
-                sm_count=self.sms,
-                enable_pdl=False,
-                v_pool=v_cache,
-                p_shift=_EXACT_P_SHIFT,
-                rescale_threshold=_EXACT_RESCALE_THRESHOLD,
-            )
+        cp, hq = self.cp, self.hq
+        F.q35_cp_fused_partial(
+            self.q_all[:rows].view(b, cp, q_len * hq, HEAD_DIM).permute(1, 0, 2, 3),
+            k_cache,
+            page_table,
+            pre_lens,
+            1,
+            self.me,
+            cp,
+            bmm1_scale,
+            bmm2_scale,
+            self.po_x[:, :rows].view(cp, b, q_len * hq, HEAD_DIM),
+            self.pl_x[:, :rows].view(cp, b, q_len * hq),
+            sm_count=self.sms,
+            enable_pdl=False,
+            v_pool=v_cache,
+            p_shift=_EXACT_P_SHIFT,
+            rescale_threshold=_EXACT_RESCALE_THRESHOLD,
+        )
 
     def _exact_merge(self, q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale, out, gate):
         hq = self.hq
