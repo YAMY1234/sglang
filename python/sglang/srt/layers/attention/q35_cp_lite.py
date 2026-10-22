@@ -15,12 +15,10 @@ splits the read: page ``p`` of a request's context prefix is read by group rank
 The exchange buffer is one symmetric-memory allocation on the attention TP group; each
 CTA signals its peers with self-resetting CAS flags, so calls stay graph capturable.
 
-KV-length gate (SGLANG_TRTL1_ATTN_CP_MIN_KV, LL exchanges only): the batch's KV lengths decide on
-the device whether the call runs CP or the caller's stock kernel. Under CUDA graph capture the two
-are the bodies of two conditional (IF) nodes on a per-forward flag pair, so only one of them runs.
-Eager calls run both: below the threshold the CP kernels exit at entry and the stock kernel reads
-the full KV; above it the stock kernel is given q_len keys per request and the merge overwrites its
-output.
+KV-length gate (SGLANG_TRTL1_ATTN_CP_MIN_KV, LL exchanges only): the call also captures the stock
+kernel, and the batch's KV lengths decide on the device which of the two runs. Below the threshold
+the CP kernels exit at entry and the stock kernel reads the full KV; above it the stock kernel is
+given q_len keys per request and the merge overwrites its output.
 """
 
 from __future__ import annotations
@@ -127,14 +125,6 @@ def _gate_on(seq_lens, nb, thr, NB: tl.constexpr, GMAX: tl.constexpr):
         return tl.max(L, axis=0) >= thr
     else:
         return tl.sum(L, axis=0) >= thr
-
-
-@triton.jit
-def _gate_flags(seq_lens, nb, thr, flags, NB: tl.constexpr, GMAX: tl.constexpr):
-    """flags[0] = CP for this forward's calls, flags[1] = its negation (the two conditional nodes' predicates)."""
-    on = _gate_on(seq_lens, nb, thr, NB, GMAX).to(tl.int8)
-    tl.store(flags, on)
-    tl.store(flags + 1, 1 - on)
 
 
 @triton.jit
@@ -564,8 +554,6 @@ class CpLite:
         self._logged: set = set()
         # (page table, lengths, q_len) -> [tables, owned lengths, forward, last layer id that used them]
         self._tabs: dict = {}
-        # (lengths, b, threshold) -> [int8 flag pair, forward, last layer id that used it]
-        self._flags: dict = {}
         torch.distributed.barrier(group)
         logger.info(
             "TRT-L1 CP-lite: tp rank %d, KV group of %d (group rank %d), min batch %d, LL %s, fused %s",
@@ -642,12 +630,11 @@ class CpLite:
         layer,
         forward_batch,
         stock=None,
-        out: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         """CP-lite attention of this rank's heads: [rows, heads, head_dim] bf16, or None
         where the call is not served (decided by shapes only, so every rank agrees).
         stock(seq_lens, out): the caller's own kernel call into out; with it and a KV gate for this batch size,
-        the device picks one of the two per call. out: write the result there (ungated calls)."""
+        both are captured and the device picks one per call."""
         import flashinfer
 
         rows = q.shape[0]
@@ -674,11 +661,9 @@ class CpLite:
         words = self.hq * HEAD_DIM // 4
         exact = self.exact and self._exact_supported(q_len, b)
         thr = self._gate_thr(b) if stock is not None and self.ll and (exact or not self.fused) else None
-        if thr is not None and torch.cuda.is_current_stream_capturing():
-            return self._attend_cond(q, kv_cache, page_table, seq_lens, q_len, bmm1_scale, bmm2_scale, workspace,
-                                     layer, forward_batch, stock, thr)
         gate = dict(nb=b, thr=0 if thr is None else thr, GATE=thr is not None, NB=triton.next_power_of_2(b),
                     GMAX=self.gate_max)
+        out = None
         if self.ll:
             _cp_gather_q_ll[(rows,)](
                 q.view(torch.int32), words, self.peers, self.me, self.llq_off, self.q_all.view(torch.int32),
@@ -736,41 +721,6 @@ class CpLite:
                 self.peers, self.me, self.p_off, self.l_off, self.f_off, _MAX_ROWS, bmm1_scale, bmm2_scale,
                 QL=q_len, HQ=self.hq, CP=self.cp, D=HEAD_DIM, PG=PAGE, num_warps=8,
             )
-        return out
-
-    def _gate_preds(self, seq_lens, b, thr, forward_batch, layer_id):
-        """Once per forward (as _tables): the bool scalars CP / not CP for the conditional nodes."""
-        key = (seq_lens.data_ptr(), b, thr)
-        ent = self._flags.get(key)
-        if ent is not None and ent[1]() is forward_batch and layer_id > ent[2]:
-            ent[2] = layer_id
-            return ent[0][0], ent[0][1]
-        if len(self._flags) > 64:
-            self._flags.clear()
-        flags = torch.empty(2, dtype=torch.int8, device=self.device)
-        self._flags[key] = [flags.view(torch.bool), weakref.ref(forward_batch), layer_id]
-        _gate_flags[(1,)](seq_lens, b, thr, flags, NB=triton.next_power_of_2(b), GMAX=self.gate_max)
-        f = flags.view(torch.bool)
-        return f[0], f[1]
-
-    def _attend_cond(self, q, kv_cache, page_table, seq_lens, q_len, bmm1_scale, bmm2_scale, workspace, layer,
-                     forward_batch, stock, thr):
-        """Captured gated call: IF(CP) { the ungated CP call into out } IF(not CP) { stock(seq_lens, out) }."""
-        b = seq_lens.shape[0]
-        pred, npred = self._gate_preds(seq_lens, b, thr, forward_batch, layer.layer_id)
-        out = torch.empty(q.shape[0], self.hq, HEAD_DIM, dtype=torch.bfloat16, device=q.device)
-        graph = torch.cuda.CUDAGraph.get_currently_capturing_graph()
-        graph.begin_capture_to_if_node(pred)
-        try:
-            self.attend(q, kv_cache, page_table, seq_lens, q_len, bmm1_scale, bmm2_scale, workspace, layer,
-                        forward_batch, out=out)
-        finally:
-            graph.end_capture_to_conditional_node()
-        graph.begin_capture_to_if_node(npred)
-        try:
-            stock(seq_lens, out)
-        finally:
-            graph.end_capture_to_conditional_node()
         return out
 
     def _exact_supported(self, q_len, b):
