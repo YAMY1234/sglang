@@ -261,6 +261,8 @@ def _compiled(
     p_shift: float = 5.0,
     debug_ring: int = 0,
     balanced: bool = False,
+    rescale_threshold: Optional[float] = None,
+    l_from_p8: bool = False,
 ):
     import cuda.bindings.driver as cuda
     import cutlass
@@ -286,6 +288,8 @@ def _compiled(
             p_shift=p_shift,
             debug_ring=debug_ring,
             balanced=True,
+            rescale_threshold=rescale_threshold,
+            l_from_p8=l_from_p8,
         )
         assert kernel.ws_bytes == cp_partial_balanced_ws_bytes(q_len * gh, n_splits)
     else:
@@ -305,6 +309,8 @@ def _compiled(
             unsafe_skip_wait=unsafe_skip_wait,
             p_shift=p_shift,
             debug_ring=debug_ring,
+            rescale_threshold=rescale_threshold,
+            l_from_p8=l_from_p8,
         )
         assert kernel.ws_req_bytes == cp_partial_geometry(q_len * gh, n_splits)["ws_req_bytes"]
     dev = torch.device("cuda")
@@ -371,6 +377,8 @@ def q35_cp_fused_partial(
     counters: Optional[torch.Tensor] = None,
     p_shift: Optional[float] = None,
     balanced: Optional[bool] = None,
+    rescale_threshold: Optional[float] = None,
+    l_from_p8: bool = False,
 ) -> None:
     """This CP rank's partial attention of every group head over the pages it owns (q35_cp_fused_partial_ref).
 
@@ -383,6 +391,8 @@ def q35_cp_fused_partial(
     unsafe_skip_wait (no dependency waits), n_splits (must come with its own ``counters``: every launch on a counter
     row must use the same split count; balanced: the grid's CTAs), fresh_margin, balanced (overrides
     TRTLLM_Q35_ATTN_CP_BALANCED_SPLIT; a mode other than the module's needs its own ``counters``).
+    Numerics: p_shift (E4M3 P shift, default _P_SHIFT), rescale_threshold (lazy rescale threshold in log2 units,
+    default min(8, 8.75 - p_shift); 0 = exact running max), l_from_p8 (row sums from the E4M3-rounded P).
     """
     import cuda.bindings.driver as cuda
     import cutlass
@@ -496,6 +506,8 @@ def q35_cp_fused_partial(
             _P_SHIFT if p_shift is None else float(p_shift),
             _DBG_SLOTS if ring is not None else 0,
             True,
+            rescale_threshold,
+            bool(l_from_p8),
         )
     else:
         fn = _compiled(
@@ -514,6 +526,9 @@ def q35_cp_fused_partial(
             unsafe_skip_wait,
             _P_SHIFT if p_shift is None else float(p_shift),
             _DBG_SLOTS if ring is not None else 0,
+            False,
+            rescale_threshold,
+            bool(l_from_p8),
         )
     fp8 = cutlass.Float8E4M3FN
     f32 = cutlass.Float32

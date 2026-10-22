@@ -262,6 +262,25 @@ def _pack_e4m3x4(a, b, c, d, *, loc=None, ip=None) -> Uint32:
 
 
 @dsl_user_op
+def _e4m3x4_pair_sums(w, *, loc=None, ip=None):
+    """Four E4M3 (as packed by _pack_e4m3x4) -> FP32 (byte 0 + byte 1, byte 2 + byte 3)."""
+    out = _asm(
+        llvm.StructType.get_literal([T.f32()] * 2),
+        [Uint32(w).ir_value(loc=loc, ip=ip)],
+        "{\n\t.reg .b16 lo, hi, a0, a1, a2, a3;\n\t.reg .b32 h0, h1;\n\t.reg .f32 f0, f1, f2, f3;\n\t"
+        "mov.b32 {lo, hi}, $2;\n\tcvt.rn.f16x2.e4m3x2 h0, lo;\n\tcvt.rn.f16x2.e4m3x2 h1, hi;\n\t"
+        "mov.b32 {a0, a1}, h0;\n\tmov.b32 {a2, a3}, h1;\n\t"
+        "cvt.f32.f16 f0, a0;\n\tcvt.f32.f16 f1, a1;\n\tcvt.f32.f16 f2, a2;\n\tcvt.f32.f16 f3, a3;\n\t"
+        "add.f32 $0, f0, f1;\n\tadd.f32 $1, f2, f3;\n\t}\n",
+        "=f,=f,r",
+        False,
+        loc,
+        ip,
+    )
+    return tuple(Float32(llvm.extractvalue(T.f32(), out, [i], loc=loc, ip=ip)) for i in range(2))
+
+
+@dsl_user_op
 def _pack_f16x2(lo, hi, *, loc=None, ip=None) -> Uint32:
     """Two FP32 -> FP16x2 (round to nearest), ``lo`` in the low half."""
     return Uint32(
@@ -671,6 +690,8 @@ class Q35CpPartialAttnKernel:
         p_shift: float = 5.0,
         debug_ring: int = 0,
         balanced: bool = False,
+        rescale_threshold: float | None = None,
+        l_from_p8: bool = False,
     ):
         assert gh == cp_size * hql, "group heads = cp_size x q heads per rank"
         self.balanced = bool(balanced)
@@ -701,7 +722,12 @@ class Q35CpPartialAttnKernel:
         # P = exp2(x - m_ref + p_shift) before the E4M3 conversion (see q35_decode_attn.py): the reference max maps to
         # 2^p_shift; l carries the same factor (the LSE subtracts it); the lazy rescale threshold is P_TOP - p_shift.
         self.p_shift = float(p_shift)
-        self.rescale_threshold = min(RESCALE_THRESHOLD, P_TOP - self.p_shift)
+        if rescale_threshold is None:
+            rescale_threshold = min(RESCALE_THRESHOLD, P_TOP - self.p_shift)
+        assert 0.0 <= rescale_threshold <= P_TOP - self.p_shift
+        self.rescale_threshold = float(rescale_threshold)
+        # l_from_p8: the row sum adds the E4M3-rounded P that GEMM2 multiplies (numerator and denominator agree)
+        self.l_from_p8 = bool(l_from_p8)
         assert 32 * self.act_warps * STAGE_ROW <= KV_REGION
         if self.balanced:
             geo_b = cp_partial_balanced_geometry(self.rows, n_splits)
@@ -1104,11 +1130,16 @@ class Q35CpPartialAttnKernel:
                 p1 = _ex2(_fma(xs[c][4 * q4 + 1], scale, neg_m))
                 p2 = _ex2(_fma(xs[c][4 * q4 + 2], scale, neg_m))
                 p3 = _ex2(_fma(xs[c][4 * q4 + 3], scale, neg_m))
-                la = la + p0
-                lb = lb + p1
-                lc = lc + p2
-                ld = ld + p3
                 pw[8 * c + q4] = _pack_e4m3x4(p0, p1, p2, p3)
+                if const_expr(self.l_from_p8):
+                    s01, s23 = _e4m3x4_pair_sums(pw[8 * c + q4])
+                    la = la + s01
+                    lb = lb + s23
+                else:
+                    la = la + p0
+                    lb = lb + p1
+                    lc = lc + p2
+                    ld = ld + p3
         stt[1] = stt[1] + ((la + lb) + (lc + ld))
         pb = i % 2
         cute.arch.mbarrier_wait(p_empty + pb, ((i // 2) & 1) ^ 1)
