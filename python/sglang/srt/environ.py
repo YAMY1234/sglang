@@ -1491,10 +1491,6 @@ class Envs:
     # Overrides the forward stream's priority (A/B of the two halves above); unset keeps
     # the highest with SGLANG_Q35MF_COMMIT_BEHIND_DRAFT, else the default 0.
     SGLANG_Q35MF_FORWARD_STREAM_PRIORITY = EnvInt(None)
-    # Caps the post-verify compact state commit at about this many programs, each looping
-    # over layer x value-head items with the same math (bit-identical), so a commit
-    # behind the draft leaves SMs to it; unset or 0 keeps one program per item.
-    SGLANG_Q35MF_COMMIT_CTA_CAP = EnvInt(None)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
