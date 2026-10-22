@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 PAGE, HEAD_DIM = 64, 256
 _MAX_ROWS = 128  # widest call: rows = requests * q_len (TP8 verify at B16: 112)
 _KINDS = 2  # flag regions: q gather, partial exchange
+_EXACT_P_SHIFT = 8.0  # E4M3 P shift of the exact path's fused partial: the reference max maps to 2^8, exact in E4M3
 _LL_PWORDS = 520  # LL words of one (row, source) partial: 4 heads x 128 bf16 pairs + 4 LSE, padded to 16 B
 
 
@@ -268,8 +269,13 @@ def _ll_wait(src, n: tl.constexpr, e):
 
 
 @triton.jit
-def _cp_gather_q_ll(q, q_stride, peers, me, ll_off, q_all, cnt, CP: tl.constexpr, WORDS: tl.constexpr):
-    """LL variant of _cp_gather_q: every 4-byte word travels with the call's epoch in one 8-byte store."""
+def _cp_gather_q_ll(
+    q, q_stride, peers, me, ll_off, q_all, cnt, seq_lens, pre_lens,
+    CP: tl.constexpr, WORDS: tl.constexpr, QL: tl.constexpr, FOLD: tl.constexpr,
+):
+    """LL variant of _cp_gather_q: every 4-byte word travels with the call's epoch in one 8-byte store.
+    FOLD: q_all is written source-major per request ([B, CP, QL, heads, D]) for the prefix-only fused partial,
+    and pre_lens[b] = max(L - QL, 0)."""
     i = tl.program_id(0)
     e = tl.load(cnt + i) + 1
     flag = e.to(tl.int64) << 32
@@ -281,7 +287,14 @@ def _cp_gather_q_ll(q, q_stride, peers, me, ll_off, q_all, cnt, CP: tl.constexpr
     own = tl.load(peers + me) + ll_off
     for c in tl.static_range(CP):
         v = _ll_wait((own + (i * CP + c) * WORDS * 8).to(tl.pointer_type(tl.int64)), WORDS, e)
-        tl.store(q_all + (i * CP + c) * WORDS + w, (v & 0xFFFFFFFF).to(tl.int32))
+        if FOLD:
+            slot = ((i // QL) * CP + c) * QL + i % QL
+        else:
+            slot = i * CP + c
+        tl.store(q_all + slot * WORDS + w, (v & 0xFFFFFFFF).to(tl.int32))
+    if FOLD:
+        if i % QL == 0:
+            tl.store(pre_lens + i // QL, tl.maximum(tl.load(seq_lens + i // QL) - QL, 0))
     tl.store(cnt + i, e)
 
 
@@ -289,6 +302,10 @@ def _cp_gather_q_ll(q, q_stride, peers, me, ll_off, q_all, cnt, CP: tl.constexpr
 def _cp_a2a_merge_ll(
     po,
     plse,
+    po_sr,
+    po_sc,
+    pl_sr,
+    pl_sc,
     q,
     q_stride,
     k_cache,
@@ -313,8 +330,8 @@ def _cp_a2a_merge_ll(
     PG: tl.constexpr,
     NWP: tl.constexpr,
 ):
-    """LL variant of _cp_a2a_merge; po / plse are read as int32 words. Online LSE merge of the
-    causal block and the CP partials as they arrive."""
+    """LL variant of _cp_a2a_merge; po / plse are read as int32 words, row / member strides po_sr / po_sc (words)
+    and pl_sr / pl_sc. Online LSE merge of the causal block and the CP partials as they arrive."""
     i = tl.program_id(0)
     e = tl.load(cnt + i) + 1
     flag = e.to(tl.int64) << 32
@@ -324,8 +341,8 @@ def _cp_a2a_merge_ll(
     d = tl.arange(0, D)
     hd = h[:, None] * D + d[None, :]
     for c in tl.static_range(CP):
-        w = _ll_pack(flag, tl.load(po + (i * CP * HQ + c * HQ) * (D // 2) + hw))
-        lw = _ll_pack(flag, tl.load(plse + i * CP * HQ + c * HQ + h))
+        w = _ll_pack(flag, tl.load(po + i * po_sr + c * po_sc + hw))
+        lw = _ll_pack(flag, tl.load(plse + i * pl_sr + c * pl_sc + h))
         dst = (tl.load(peers + c) + ll_off + (i * CP + me) * NWP * 8).to(tl.pointer_type(tl.int64))
         tl.store(dst + hw, w)
         tl.store(dst + NO + h, lw)
@@ -443,6 +460,9 @@ class CpLite:
         self.cnt = torch.zeros(_KINDS, _MAX_ROWS, dtype=torch.int32, device=self.device)
         self.sms = torch.cuda.get_device_properties(self.device).multi_processor_count
         self.fused = self.ll and envs.SGLANG_TRTL1_ATTN_CP_FUSED.get()
+        # exact: the fused kernel on the context prefix only (q_len folded into the heads), the causal block in the
+        # fp32 merge as on the trtllm-gen path
+        self.exact = self.fused and envs.SGLANG_TRTL1_ATTN_CP_EXACT.get()
         if self.fused:
             from sglang.srt.layers.attention import q35_cp_fused
 
@@ -464,6 +484,10 @@ class CpLite:
         self.po = torch.empty(rows, cp * q_heads, HEAD_DIM, dtype=torch.bfloat16, device=self.device)
         self.plse = torch.empty(rows, cp * q_heads, dtype=torch.float32, device=self.device)
         self.counter = torch.zeros(1 << 16, dtype=torch.int32, device=self.device)
+        # exact path: the fused kernel's [cp, rows, heads, D] partials and the prefix lengths the gather writes
+        self.po_x = torch.empty(cp, rows, q_heads, HEAD_DIM, dtype=torch.bfloat16, device=self.device)
+        self.pl_x = torch.empty(cp, rows, q_heads, dtype=torch.float32, device=self.device)
+        self.pre_lens = torch.zeros(rows, dtype=torch.int32, device=self.device)
         self._logged: set = set()
         # (page table, lengths, q_len) -> [tables, owned lengths, forward, last layer id that used them]
         self._tabs: dict = {}
@@ -472,6 +496,7 @@ class CpLite:
             "TRT-L1 CP-lite: tp rank %d, KV group of %d (group rank %d), min batch %d, LL %s, fused %s",
             tp_rank, cp, self.me, self.min_bs, self.ll, self.fused,
         )
+        logger.info("TRT-L1 CP-lite exact (prefix-only fused partial + fp32 causal block): %s", self.exact)
 
     @classmethod
     def maybe_create(cls, config, device) -> Optional["CpLite"]:
@@ -552,17 +577,20 @@ class CpLite:
         k_cache, v_cache = kv_cache
         q = q if q.is_contiguous() else q.contiguous()
         words = self.hq * HEAD_DIM // 4
+        exact = self.exact and self._exact_supported(q_len, b)
         if self.ll:
             _cp_gather_q_ll[(rows,)](
                 q.view(torch.int32), words, self.peers, self.me, self.llq_off, self.q_all.view(torch.int32),
-                self.cnt[0], CP=self.cp, WORDS=words, num_warps=4,
+                self.cnt[0], seq_lens, self.pre_lens, CP=self.cp, WORDS=words, QL=q_len, FOLD=exact, num_warps=4,
             )
         else:
             _cp_gather_q[(rows,)](
                 q.view(torch.int32), words, self.peers, self.me, 0, self.f_off,
                 CP=self.cp, WORDS=words, num_warps=4,
             )
-        if self.fused:
+        if exact:
+            return self._exact(q, k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale)
+        if self.fused and not self.exact:
             out = self._fused(k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale)
             if out is not None:
                 return out
@@ -586,8 +614,10 @@ class CpLite:
         )
         out = torch.empty(rows, self.hq, HEAD_DIM, dtype=torch.bfloat16, device=q.device)
         if self.ll:
+            gh_w = self.cp * self.hq * HEAD_DIM // 2
             _cp_a2a_merge_ll[(rows,)](
-                self.po.view(torch.int32), self.plse.view(torch.int32), q, q.stride(0), k_cache, v_cache,
+                self.po.view(torch.int32), self.plse.view(torch.int32), gh_w, self.hq * HEAD_DIM // 2,
+                self.cp * self.hq, self.hq, q, q.stride(0), k_cache, v_cache,
                 k_cache.stride(0), k_cache.stride(2), page_table, page_table.stride(0), seq_lens, out, out.stride(0),
                 self.peers, self.me, self.llp_off, self.cnt[1], bmm1_scale, bmm2_scale,
                 QL=q_len, HQ=self.hq, CP=self.cp, D=HEAD_DIM, PG=PAGE, NWP=_LL_PWORDS, num_warps=8,
@@ -599,6 +629,44 @@ class CpLite:
                 self.peers, self.me, self.p_off, self.l_off, self.f_off, _MAX_ROWS, bmm1_scale, bmm2_scale,
                 QL=q_len, HQ=self.hq, CP=self.cp, D=HEAD_DIM, PG=PAGE, num_warps=8,
             )
+        return out
+
+    def _exact_supported(self, q_len, b):
+        from sglang.srt.layers.attention import q35_cp_fused as F
+
+        return F.q35_cp_fused_supported(1, self.cp, q_len * self.hq, b, self.sms)
+
+    def _exact(self, q, k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale):
+        """The fused partial on the context prefix (q_len folded into the heads: one query row of q_len x heads per
+        request, no causal effect), then the trtllm-gen path's merge with the causal block in fp32."""
+        from sglang.srt.layers.attention import q35_cp_fused as F
+
+        cp, hq = self.cp, self.hq
+        F.q35_cp_fused_partial(
+            self.q_all[:rows].view(b, cp, q_len * hq, HEAD_DIM).permute(1, 0, 2, 3),
+            k_cache,
+            page_table,
+            self.pre_lens,
+            1,
+            self.me,
+            cp,
+            bmm1_scale,
+            bmm2_scale,
+            self.po_x[:, :rows].view(cp, b, q_len * hq, HEAD_DIM),
+            self.pl_x[:, :rows].view(cp, b, q_len * hq),
+            sm_count=self.sms,
+            enable_pdl=False,
+            v_pool=v_cache,
+            p_shift=_EXACT_P_SHIFT,
+        )
+        out = torch.empty(rows, hq, HEAD_DIM, dtype=torch.bfloat16, device=self.device)
+        _cp_a2a_merge_ll[(rows,)](
+            self.po_x.view(torch.int32), self.pl_x.view(torch.int32), hq * HEAD_DIM // 2,
+            self.po_x.stride(0) // 2, hq, self.pl_x.stride(0), q, q.stride(0), k_cache, v_cache,
+            k_cache.stride(0), k_cache.stride(2), page_table, page_table.stride(0), seq_lens, out, out.stride(0),
+            self.peers, self.me, self.llp_off, self.cnt[1], bmm1_scale, bmm2_scale,
+            QL=q_len, HQ=hq, CP=cp, D=HEAD_DIM, PG=PAGE, NWP=_LL_PWORDS, num_warps=8,
+        )
         return out
 
     def _fused(self, k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale):
