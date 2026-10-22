@@ -14,6 +14,11 @@ splits the read: page ``p`` of a request's context prefix is read by group rank
 
 The exchange buffer is one symmetric-memory allocation on the attention TP group; each
 CTA signals its peers with self-resetting CAS flags, so calls stay graph capturable.
+
+KV-length gate (SGLANG_TRTL1_ATTN_CP_MIN_KV, LL exchanges only): the call also captures the stock
+kernel, and the batch's KV lengths decide on the device which of the two runs. Below the threshold
+the CP kernels exit at entry and the stock kernel reads the full KV; above it the stock kernel is
+given q_len keys per request and the merge overwrites its output.
 """
 
 from __future__ import annotations
@@ -111,6 +116,18 @@ def _group_barrier(peers, me, flags_off, slot, CP: tl.constexpr):
 
 
 @triton.jit
+def _gate_on(seq_lens, nb, thr, NB: tl.constexpr, GMAX: tl.constexpr):
+    """CP for this call: the sum (GMAX: the max) of the batch's KV lengths reaches thr. Every rank of the group
+    reads the same lengths, so all of them take the same branch."""
+    k = tl.arange(0, NB)
+    L = tl.load(seq_lens + k, mask=k < nb, other=0)
+    if GMAX:
+        return tl.max(L, axis=0) >= thr
+    else:
+        return tl.sum(L, axis=0) >= thr
+
+
+@triton.jit
 def _cp_tables(
     page_table,
     pt_stride,
@@ -120,18 +137,26 @@ def _cp_tables(
     lens,
     ncols,
     rank,
+    nb,
+    thr,
     QL: tl.constexpr,
     CP: tl.constexpr,
     PG: tl.constexpr,
     BLOCK: tl.constexpr,
+    GATE: tl.constexpr,
+    NB: tl.constexpr,
+    GMAX: tl.constexpr,
 ):
-    """This rank's compact page table and token count over the prefix [0, L - QL)."""
+    """This rank's compact page table and token count over the prefix [0, L - QL); with GATE and the gate
+    off, no owned page (one dummy key)."""
     b = tl.program_id(0)
     cb = tl.program_id(1)
     L = tl.load(seq_lens + b)
     prefix = tl.maximum(L - QL, 0)
     n_pages = (prefix + PG - 1) // PG
     n_own = tl.maximum((n_pages - rank + CP - 1) // CP, 0)
+    if GATE:
+        n_own = tl.where(_gate_on(seq_lens, nb, thr, NB, GMAX), n_own, 0)
     j = cb * BLOCK + tl.arange(0, BLOCK)
     m = j < ncols
     pg = tl.load(page_table + b * pt_stride + j * CP + rank, mask=m & (j < n_own), other=0)
@@ -272,13 +297,25 @@ def _ll_wait(src, n: tl.constexpr, e):
 
 @triton.jit
 def _cp_gather_q_ll(
-    q, q_stride, peers, me, ll_off, q_all, cnt, seq_lens, pre_lens,
+    q, q_stride, peers, me, ll_off, q_all, cnt, seq_lens, pre_lens, stock_lens, nb, thr,
     CP: tl.constexpr, WORDS: tl.constexpr, QL: tl.constexpr, FOLD: tl.constexpr,
+    GATE: tl.constexpr, NB: tl.constexpr, GMAX: tl.constexpr,
 ):
     """LL variant of _cp_gather_q: every 4-byte word travels with the call's epoch in one 8-byte store.
     FOLD: q_all is written source-major per request ([B, CP, QL, heads, D]) for the prefix-only fused partial,
-    and pre_lens[b] = max(L - QL, 0)."""
+    and pre_lens[b] = max(L - QL, 0).
+    GATE: first writes the stock call's lengths (L with the gate off, q_len with it on) and, FOLD, pre_lens = 0 with
+    the gate off; then exits with the gate off."""
     i = tl.program_id(0)
+    if GATE:
+        on = _gate_on(seq_lens, nb, thr, NB, GMAX)
+        if i % QL == 0:
+            Lb = tl.load(seq_lens + i // QL)
+            tl.store(stock_lens + i // QL, tl.where(on, tl.minimum(Lb, QL), Lb))
+            if FOLD:
+                tl.store(pre_lens + i // QL, tl.where(on, tl.maximum(Lb - QL, 0), 0))
+        if on.to(tl.int32) == 0:
+            return
     e = tl.load(cnt + i) + 1
     flag = e.to(tl.int64) << 32
     w = tl.arange(0, WORDS)
@@ -294,7 +331,7 @@ def _cp_gather_q_ll(
         else:
             slot = i * CP + c
         tl.store(q_all + slot * WORDS + w, (v & 0xFFFFFFFF).to(tl.int32))
-    if FOLD:
+    if FOLD and not GATE:
         if i % QL == 0:
             tl.store(pre_lens + i // QL, tl.maximum(tl.load(seq_lens + i // QL) - QL, 0))
     tl.store(cnt + i, e)
@@ -325,16 +362,25 @@ def _cp_a2a_merge_ll(
     cnt,
     bmm1,
     bmm2,
+    nb,
+    thr,
     QL: tl.constexpr,
     HQ: tl.constexpr,
     CP: tl.constexpr,
     D: tl.constexpr,
     PG: tl.constexpr,
     NWP: tl.constexpr,
+    GATE: tl.constexpr,
+    NB: tl.constexpr,
+    GMAX: tl.constexpr,
 ):
     """LL variant of _cp_a2a_merge; po / plse are read as int32 words, row / member strides po_sr / po_sc (words)
-    and pl_sr / pl_sc. Online LSE merge of the causal block and the CP partials as they arrive."""
+    and pl_sr / pl_sc. Online LSE merge of the causal block and the CP partials as they arrive.
+    GATE: exits with the gate off (out keeps the stock call's rows)."""
     i = tl.program_id(0)
+    if GATE:
+        if _gate_on(seq_lens, nb, thr, NB, GMAX).to(tl.int32) == 0:
+            return
     e = tl.load(cnt + i) + 1
     flag = e.to(tl.int64) << 32
     NO: tl.constexpr = HQ * D // 2
@@ -436,6 +482,17 @@ def _cp_a2a_merge4_ll(po, plse, out, out_stride, peers, me, ll_off, cnt, HQ: tl.
     tl.store(cnt + i, e)
 
 
+def _parse_min_kv(spec: str) -> dict:
+    """SGLANG_TRTL1_ATTN_CP_MIN_KV: "" (no gate), "<kv>" (every batch size) or "<b>:<kv>,..." (from b requests up,
+    the entry of the largest b not above the batch) -> {b: kv}."""
+    spec = spec.strip()
+    if not spec:
+        return {}
+    if ":" not in spec:
+        return {1: int(spec)}
+    return {int(b): int(kv) for b, kv in (e.split(":") for e in spec.split(","))}
+
+
 class CpLite:
     """One process's exchange buffer and scratch, shared by every TRT-LLM MHA backend
     (target and draft) of the process; built collectively on the attention TP group."""
@@ -490,6 +547,10 @@ class CpLite:
         self.po_x = torch.empty(cp, rows, q_heads, HEAD_DIM, dtype=torch.bfloat16, device=self.device)
         self.pl_x = torch.empty(cp, rows, q_heads, dtype=torch.float32, device=self.device)
         self.pre_lens = torch.zeros(rows, dtype=torch.int32, device=self.device)
+        # KV-length gate: per-request KV threshold by batch size, the stock call's lengths the gather writes
+        self.min_kv = _parse_min_kv(envs.SGLANG_TRTL1_ATTN_CP_MIN_KV.get())
+        self.gate_max = envs.SGLANG_TRTL1_ATTN_CP_GATE_MAX.get()
+        self.stock_lens = torch.zeros(rows, dtype=torch.int32, device=self.device)
         self._logged: set = set()
         # (page table, lengths, q_len) -> [tables, owned lengths, forward, last layer id that used them]
         self._tabs: dict = {}
@@ -499,6 +560,22 @@ class CpLite:
             tp_rank, cp, self.me, self.min_bs, self.ll, self.fused,
         )
         logger.info("TRT-L1 CP-lite exact (prefix-only fused partial + fp32 causal block): %s", self.exact)
+        logger.info(
+            "TRT-L1 CP-lite KV gate: min KV per request %s (%s of the batch)",
+            self.min_kv or "off", "max" if self.gate_max else "mean",
+        )
+
+    def set_gate(self, min_kv: Optional[int]):
+        """Tests: one threshold for every batch size (None: no gate)."""
+        self.min_kv = {} if min_kv is None else {1: int(min_kv)}
+
+    def _gate_thr(self, b: int) -> Optional[int]:
+        """The device threshold of a b-request call (on the length sum, or with GATE_MAX on the max), or None."""
+        keys = [k for k in self.min_kv if k <= b]
+        if not keys:
+            return None
+        t = self.min_kv[max(keys)]
+        return t if self.gate_max else t * b
 
     @classmethod
     def maybe_create(cls, config, device) -> Optional["CpLite"]:
@@ -519,12 +596,12 @@ class CpLite:
         cls._instance = cls(group, rank, tp, cp, q_heads, device)
         return cls._instance
 
-    def _tables(self, page_table, seq_lens, q_len, forward_batch, layer_id):
+    def _tables(self, page_table, seq_lens, q_len, forward_batch, layer_id, gate):
         """Once per forward: reused only by later layers of the same forward, so every capture and
         every single-layer draft step computes its own."""
         b = seq_lens.shape[0]
         ncols = triton.cdiv(page_table.shape[1], self.cp)
-        key = (page_table.data_ptr(), page_table.shape, seq_lens.data_ptr(), b, q_len)
+        key = (page_table.data_ptr(), page_table.shape, seq_lens.data_ptr(), b, q_len, gate["GATE"], gate["thr"])
         ent = self._tabs.get(key)
         if ent is not None and ent[2]() is forward_batch and layer_id > ent[3]:
             ent[3] = layer_id
@@ -535,7 +612,7 @@ class CpLite:
         lens = torch.empty(b, dtype=torch.int32, device=self.device)
         self._tabs[key] = [tab, lens, weakref.ref(forward_batch), layer_id]
         _cp_tables[(b, triton.cdiv(ncols, 256))](
-            page_table, page_table.stride(0), seq_lens, tab, tab.stride(0), lens, ncols, self.me,
+            page_table, page_table.stride(0), seq_lens, tab, tab.stride(0), lens, ncols, self.me, **gate,
             QL=q_len, CP=self.cp, PG=PAGE, BLOCK=256,
         )
         return tab, lens, ncols * PAGE
@@ -552,9 +629,12 @@ class CpLite:
         workspace: torch.Tensor,
         layer,
         forward_batch,
+        stock=None,
     ) -> Optional[torch.Tensor]:
         """CP-lite attention of this rank's heads: [rows, heads, head_dim] bf16, or None
-        where the call is not served (decided by shapes only, so every rank agrees)."""
+        where the call is not served (decided by shapes only, so every rank agrees).
+        stock(seq_lens, out): the caller's own kernel call into out; with it and a KV gate for this batch size,
+        both are captured and the device picks one per call."""
         import flashinfer
 
         rows = q.shape[0]
@@ -580,23 +660,32 @@ class CpLite:
         q = q if q.is_contiguous() else q.contiguous()
         words = self.hq * HEAD_DIM // 4
         exact = self.exact and self._exact_supported(q_len, b)
+        thr = self._gate_thr(b) if stock is not None and self.ll and (exact or not self.fused) else None
+        gate = dict(nb=b, thr=0 if thr is None else thr, GATE=thr is not None, NB=triton.next_power_of_2(b),
+                    GMAX=self.gate_max)
+        out = None
         if self.ll:
             _cp_gather_q_ll[(rows,)](
                 q.view(torch.int32), words, self.peers, self.me, self.llq_off, self.q_all.view(torch.int32),
-                self.cnt[0], seq_lens, self.pre_lens, CP=self.cp, WORDS=words, QL=q_len, FOLD=exact, num_warps=4,
+                self.cnt[0], seq_lens, self.pre_lens, self.stock_lens, **gate,
+                CP=self.cp, WORDS=words, QL=q_len, FOLD=exact, num_warps=4,
             )
+            if thr is not None:
+                out = torch.empty(rows, self.hq, HEAD_DIM, dtype=torch.bfloat16, device=q.device)
+                stock(self.stock_lens[:b], out)
         else:
             _cp_gather_q[(rows,)](
                 q.view(torch.int32), words, self.peers, self.me, 0, self.f_off,
                 CP=self.cp, WORDS=words, num_warps=4,
             )
         if exact:
-            return self._exact(q, k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale)
+            return self._exact(q, k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale,
+                               out, gate)
         if self.fused and not self.exact:
             out = self._fused(k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale)
             if out is not None:
                 return out
-        tab, lens, max_kv = self._tables(page_table, seq_lens, q_len, forward_batch, layer.layer_id)
+        tab, lens, max_kv = self._tables(page_table, seq_lens, q_len, forward_batch, layer.layer_id, gate)
         gh = self.cp * self.hq
         po = self.po[:rows].view(b, q_len * gh, HEAD_DIM)
         plse = self.plse[:rows].view(b, q_len * gh)
@@ -614,14 +703,15 @@ class CpLite:
             q_len_per_req=1,
             multi_ctas_kv_counter_buffer=self.counter,
         )
-        out = torch.empty(rows, self.hq, HEAD_DIM, dtype=torch.bfloat16, device=q.device)
+        if out is None:
+            out = torch.empty(rows, self.hq, HEAD_DIM, dtype=torch.bfloat16, device=q.device)
         if self.ll:
             gh_w = self.cp * self.hq * HEAD_DIM // 2
             _cp_a2a_merge_ll[(rows,)](
                 self.po.view(torch.int32), self.plse.view(torch.int32), gh_w, self.hq * HEAD_DIM // 2,
                 self.cp * self.hq, self.hq, q, q.stride(0), k_cache, v_cache,
                 k_cache.stride(0), k_cache.stride(2), page_table, page_table.stride(0), seq_lens, out, out.stride(0),
-                self.peers, self.me, self.llp_off, self.cnt[1], bmm1_scale, bmm2_scale,
+                self.peers, self.me, self.llp_off, self.cnt[1], bmm1_scale, bmm2_scale, **gate,
                 QL=q_len, HQ=self.hq, CP=self.cp, D=HEAD_DIM, PG=PAGE, NWP=_LL_PWORDS, num_warps=8,
             )
         else:
@@ -638,7 +728,7 @@ class CpLite:
 
         return F.q35_cp_fused_supported(1, self.cp, q_len * self.hq, b, self.sms)
 
-    def _exact(self, q, k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale):
+    def _exact(self, q, k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale, out, gate):
         """The fused partial on the context prefix (q_len folded into the heads: one query row of q_len x heads per
         request, no causal effect), then the trtllm-gen path's merge with the causal block in fp32."""
         from sglang.srt.layers.attention import q35_cp_fused as F
@@ -662,12 +752,13 @@ class CpLite:
             p_shift=_EXACT_P_SHIFT,
             rescale_threshold=_EXACT_RESCALE_THRESHOLD,
         )
-        out = torch.empty(rows, hq, HEAD_DIM, dtype=torch.bfloat16, device=self.device)
+        if out is None:
+            out = torch.empty(rows, hq, HEAD_DIM, dtype=torch.bfloat16, device=self.device)
         _cp_a2a_merge_ll[(rows,)](
             self.po_x.view(torch.int32), self.pl_x.view(torch.int32), hq * HEAD_DIM // 2,
             self.po_x.stride(0) // 2, hq, self.pl_x.stride(0), q, q.stride(0), k_cache, v_cache,
             k_cache.stride(0), k_cache.stride(2), page_table, page_table.stride(0), seq_lens, out, out.stride(0),
-            self.peers, self.me, self.llp_off, self.cnt[1], bmm1_scale, bmm2_scale,
+            self.peers, self.me, self.llp_off, self.cnt[1], bmm1_scale, bmm2_scale, **gate,
             QL=q_len, HQ=hq, CP=cp, D=HEAD_DIM, PG=PAGE, NWP=_LL_PWORDS, num_warps=8,
         )
         return out
