@@ -33,7 +33,9 @@ logger = logging.getLogger(__name__)
 PAGE, HEAD_DIM = 64, 256
 _MAX_ROWS = 128  # widest call: rows = requests * q_len (TP8 verify at B16: 112)
 _KINDS = 2  # flag regions: q gather, partial exchange
-_EXACT_P_SHIFT = 8.0  # E4M3 P shift of the exact path's fused partial: the reference max maps to 2^8, exact in E4M3
+# exact path's fused partial: E4M3 P with shift 8 against the exact running max (lazy rescale threshold 0), so the
+# row max maps to 2^8, exact in E4M3
+_EXACT_P_SHIFT, _EXACT_RESCALE_THRESHOLD = 8.0, 0.0
 _LL_PWORDS = 520  # LL words of one (row, source) partial: 4 heads x 128 bf16 pairs + 4 LSE, padded to 16 B
 
 
@@ -658,6 +660,7 @@ class CpLite:
             enable_pdl=False,
             v_pool=v_cache,
             p_shift=_EXACT_P_SHIFT,
+            rescale_threshold=_EXACT_RESCALE_THRESHOLD,
         )
         out = torch.empty(rows, hq, HEAD_DIM, dtype=torch.bfloat16, device=self.device)
         _cp_a2a_merge_ll[(rows,)](
