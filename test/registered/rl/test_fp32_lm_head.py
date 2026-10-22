@@ -241,18 +241,21 @@ class TestLMHeadFP32(CustomTestCase):
                             :, :vocab
                         ]
                         direct = use_buffer and rows == 2 and padded_vocab == vocab
-                        reference = reference.to(
-                            torch.float32
-                            if direct or processor_cls is MuseSpark1xLogitsProcessor
-                            else dtype
-                        )
+                        fp32_out = direct or processor_cls is MuseSpark1xLogitsProcessor
+                        reference = reference.to(torch.float32 if fp32_out else dtype)
+                        # A half-precision GEMM output may differ from the rounded
+                        # exact product in its last bit.
+                        if fp32_out:
+                            tol = 1e-5
+                        else:
+                            tol = 2e-3 if dtype == torch.float16 else 1.6e-2
                         if scale is not None:
                             reference *= scale
                         reference = reference.float()
                         if softcap is not None:
                             reference = softcap * torch.tanh(reference / softcap)
                         torch.testing.assert_close(
-                            logits, reference, rtol=1e-5, atol=1e-5
+                            logits, reference, rtol=tol, atol=tol
                         )
                         self.assertEqual(buffer.shape, (rows, vocab))
                         if use_buffer and rows == 2:
