@@ -1747,6 +1747,10 @@ class Envs:
     # and draft probs included, with one JIT field copy into destination views cached per
     # input layout, instead of slicing every buffer and a separate copy_ for hidden states.
     SGLANG_PERFLL_HOST_GRAPH_INPUTS = EnvBool(False)
+    # The decode round's index outputs (draft cache locations, chain-tree verify inputs,
+    # draft-extend layout) come from rings of 8 tensors per shape instead of torch.empty;
+    # each is written whole by its kernel and read within the round.
+    SGLANG_PERFLL_HOST_OUT_POOL = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
