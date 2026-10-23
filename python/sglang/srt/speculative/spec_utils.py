@@ -213,6 +213,7 @@ def sample_draft_proposal(
 SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
 SIMULATE_ACC_TOKEN_MODE = envs.SGLANG_SIMULATE_ACC_TOKEN_MODE.get()
+_COMMIT_CUDA = envs.SGLANG_Q35MF_COMMIT_CUDA.get()
 
 
 def check_simulate_acc_token_mode() -> None:
@@ -1176,6 +1177,7 @@ def commit_mamba_states_after_verify(
             mamba_track_indices=batch.mamba_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
             null_block_id=-1,
+            use_cuda=_COMMIT_CUDA,
         )
         # Roll back active conv state and snapshot its interval-crossing window.
         fused_conv_window_scatter_with_mask(
