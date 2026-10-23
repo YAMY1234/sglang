@@ -1512,6 +1512,10 @@ class Envs:
     # take a sharded argmax (bit-identical), temperature-only rows a sharded Gumbel-max
     # (same distribution); any other batch all-gathers them first, as before.
     SGLANG_Q35MF_SHARDED_VERIFY = EnvBool(False)
+    # The TRT-LLM MHA multi-step draft graph's attention metadata: one page table for every
+    # step, written once at the last step's length, and the other steps' sequence lengths in
+    # one launch (the steps read the same values). No SWA, no unified pool.
+    SGLANG_Q35MF_DRAFT_SHARED_METADATA = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
