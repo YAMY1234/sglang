@@ -2173,6 +2173,8 @@ class Scheduler(
                 self.on_idle()
                 if host_trace.ENABLED:
                     host_trace.maybe_flush()
+                if host_trace.GATED:
+                    host_trace.poll_gate()
             if host_trace.ENABLED:
                 host_trace.pass_end(keep=bool(batch) or self.last_batch is not None)
             if ls is not None:
