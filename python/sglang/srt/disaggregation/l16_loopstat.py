@@ -222,6 +222,14 @@ class LoopStat:
             self.ft.flush()
 
 
+_NO_SYNC_ENV = os.environ.get("SGLANG_TRTL16_PREALLOC_NO_SYNC", "").lower() in ("1", "true")
+
+
+def prealloc_no_sync() -> bool:
+    """SGLANG_TRTL16_PREALLOC_NO_SYNC, or its A/B window when loopstat alternates it."""
+    return _NO_SYNC_ENV or (STAT is not None and STAT.defer_on)
+
+
 def init(scheduler) -> Optional[LoopStat]:
     global STAT
     out_dir = os.environ.get("SGLANG_TRTL16_LOOPSTAT", "")
