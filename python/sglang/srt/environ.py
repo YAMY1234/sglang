@@ -1755,6 +1755,9 @@ class Envs:
     # The request poll reads each zmq socket's readiness (ZMQ_EVENTS) and calls recv only
     # when a message is waiting, instead of a NOBLOCK recv that raises on an empty socket.
     SGLANG_PERFLL_HOST_ZMQ_EVENTS = EnvBool(False)
+    # The decode result readback (next token ids, accept lengths) copies into a ring of
+    # pinned buffers kept per shape instead of a fresh pinned allocation per tensor and round.
+    SGLANG_PERFLL_HOST_D2H_RING = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
