@@ -38,7 +38,7 @@ from sglang.srt.speculative.spec_utils import (
     record_stream_each,
     record_stream_for_v2_verify,
 )
-from sglang.srt.utils import is_cpu
+from sglang.srt.utils import host_trace, is_cpu
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -646,6 +646,8 @@ def run_eagle_verify(
             ),
         )
 
+    if host_trace.ENABLED:
+        host_trace.mark(host_trace.VP1)
     # Must stay ahead of the target verify launch below.
     grammar_tree = (
         GrammarTree.from_device(
@@ -679,6 +681,8 @@ def run_eagle_verify(
         is_verify=True,
         pp_proxy_tensors=pp_proxy_tensors,
     )
+    if host_trace.ENABLED:
+        host_trace.mark(host_trace.VF1)
     logits_output = forward_batch_output.logits_output
 
     clear_unaccepted_c128 = getattr(
