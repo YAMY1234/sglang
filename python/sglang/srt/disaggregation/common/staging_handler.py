@@ -107,6 +107,7 @@ class DecodeStagingHandler:
         # submits them on the forward stream (main thread).
         self.plb_defer = envs.SGLANG_PLB_SCATTER_DEFER.get()
         self.plb_pending: collections.deque = collections.deque()
+        self.plb_flushes = 0  # plb_flush calls so far (a queued item is due at enqueue count + defer - 1)
 
     def register_wm_subscriber(self, receiver, session_id: str) -> None:
         """Register a prefill's bootstrap connection for watermark broadcasts."""
@@ -244,9 +245,11 @@ class DecodeStagingHandler:
     # ------------------------------------------------------------------
 
     def plb_flush(self, stream) -> None:
-        """SGLANG_PLB_SCATTER_DEFER: submit the queued chunk scatters on ``stream`` (main thread, before a forward)."""
-        while self.plb_pending:
-            self.submit_chunk_scatter(*self.plb_pending.popleft(), stream=stream)
+        """SGLANG_PLB_SCATTER_DEFER: submit the queued chunk scatters that are due on ``stream`` (main thread, before a
+        forward)."""
+        self.plb_flushes += 1
+        while self.plb_pending and self.plb_pending[0][0] <= self.plb_flushes:
+            self.submit_chunk_scatter(*self.plb_pending.popleft()[1], stream=stream)
 
     def submit_chunk_scatter(
         self,
@@ -333,7 +336,8 @@ class DecodeStagingHandler:
         num_writers = self.num_writers_for(receiver)
         if len(arrivals) >= num_writers:
             if self.plb_defer:
-                self.plb_pending.append((room, chunk_idx, page_start, num_pages))
+                due = self.plb_flushes + self.plb_defer
+                self.plb_pending.append((due, (room, chunk_idx, page_start, num_pages)))
             else:
                 self.submit_chunk_scatter(room, chunk_idx, page_start, num_pages)
             del room_counts[chunk_idx]
