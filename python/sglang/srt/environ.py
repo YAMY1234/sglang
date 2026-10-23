@@ -1516,6 +1516,9 @@ class Envs:
     # step, written once at the last step's length, and the other steps' sequence lengths in
     # one launch (the steps read the same values). No SWA, no unified pool.
     SGLANG_Q35MF_DRAFT_SHARED_METADATA = EnvBool(False)
+    # The Qwen3.5 MTP draft's BF16 FlashInfer TRTLLM experts may leave their finalize to
+    # the caller (the megakernel plugin's draft hop, slot draft_fin).
+    SGLANG_Q35_DRAFT_BF16_DEFERRED_FINALIZE = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
