@@ -398,7 +398,7 @@ def _cp_gather_q_ll(
     q, q_stride, peers, me, ll_off, q_all, cnt, seq_lens, pre_lens, stock_lens, nb, thr,
     CP: tl.constexpr, WORDS: tl.constexpr, QL: tl.constexpr, FOLD: tl.constexpr,
     GATE: tl.constexpr, NB: tl.constexpr, GMAX: tl.constexpr, GWRITE: tl.constexpr, TRIG: tl.constexpr = False,
-    qv=None, vstart=None, vcnt=None, CHUNK: tl.constexpr = False,
+    qv=None, vstart=None, vcnt=None, CHUNK: tl.constexpr = False, WAIT: tl.constexpr = False,
 ):
     """LL variant of _cp_gather_q: every 4-byte word travels with the call's epoch in one 8-byte store.
     FOLD: q_all is written source-major per request ([B, CP, QL, heads, D]) for the prefix-only fused partial,
@@ -406,9 +406,13 @@ def _cp_gather_q_ll(
     GATE: exits with the gate off; GWRITE: first writes the stock call's lengths (L with the gate off, q_len with it
     on) and, FOLD, pre_lens = 0 with the gate off (else _gate_lens wrote them).
     TRIG (no GWRITE): releases the dependent grid at entry; the fused partial reads only lengths, tables and prefix KV
-    before its griddepcontrol.wait, none of them written here."""
+    before its griddepcontrol.wait, none of them written here.
+    WAIT: launched as a programmatic dependent of q's writer, which writes none of what the partial reads before its
+    wait either; every access here follows the wait."""
     if TRIG:
         tl.extra.cuda.gdc_launch_dependents()
+    if WAIT:
+        _gdc_wait_clobber()
     i = tl.program_id(0)
     if GATE:
         on = _gate_on(seq_lens, nb, thr, NB, GMAX)
@@ -749,6 +753,7 @@ class CpLite:
         self.llp_off = self.llq_off + _MAX_ROWS * cp * (q_heads * HEAD_DIM // 4) * 8
         total = self.llp_off + _MAX_ROWS * cp * _LL_PWORDS * 8
         self.cp_ungated = envs.SGLANG_TRTL18_CP_UNGATED.get()
+        self.gather_pdl = self.cp_ungated and envs.SGLANG_PERFLL_CP_GATHER_PDL.get()
         self.merge_h = envs.SGLANG_TRTL18_CP_MAIN.get() and envs.SGLANG_TRTL18_CP_MERGE_H.get()
         self.llh_off = total
         self.fold_mh = envs.SGLANG_PLB_CP_FOLD_MH.get()
@@ -817,8 +822,8 @@ class CpLite:
         )
         logger.info("TRT-L1 CP-lite exact (prefix-only fused partial + fp32 causal block): %s", self.exact)
         logger.info("TRT-L18 CP-lite gated exact calls: CP on the current stream, stock after the partial: %s, PDL %s, "
-                    "per-head merge %s; ungated exact calls with PDL and the per-head merge: %s", self.cp_main,
-                    self.cp_pdl, self.merge_h, self.cp_ungated)
+                    "per-head merge %s; ungated exact calls with PDL and the per-head merge: %s (q gather as a PDL "
+                    "dependent: %s)", self.cp_main, self.cp_pdl, self.merge_h, self.cp_ungated, self.gather_pdl)
         logger.info(
             "TRT-L1 CP-lite KV gate: min KV per request %s (%s of the batch)",
             self.min_kv or "off", "max" if self.gate_max else "mean",
@@ -1084,7 +1089,8 @@ class CpLite:
         _cp_gather_q_ll[(rows,)](
             q.view(torch.int32), words, self.peers, self.me, self.llq_off, self.q_all.view(torch.int32),
             self.cnt[0], seq_lens, self.pre_lens, self.stock_lens, **gate,
-            CP=self.cp, WORDS=words, QL=q_len, FOLD=True, GWRITE=False, TRIG=True, num_warps=4,
+            CP=self.cp, WORDS=words, QL=q_len, FOLD=True, GWRITE=False, TRIG=True, WAIT=self.gather_pdl,
+            num_warps=4, launch_pdl=self.gather_pdl,
         )
         self._exact_partial(k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale,
                             pdl=True, len_sub=q_len)
