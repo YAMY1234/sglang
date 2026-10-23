@@ -37,6 +37,7 @@ from sglang.srt.managers.mm_utils import (
 from sglang.srt.managers.scheduler_components.shm_tag_exchange import (
     ShmTagExchange,
     get_shm_exchange,
+    recv_multihost_enabled,
 )
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_RECV_REQUESTS,
@@ -209,11 +210,17 @@ class SchedulerRequestReceiver:
                 recv_reqs = [*recv_reqs, *local_reqs]
             if get_parallel().tp_size != 1:
                 tp_group = get_parallel().tp_group
-                exchange = get_shm_exchange(tp_group.cpu_group, "recv")
+                exchange = get_shm_exchange(
+                    tp_group.cpu_group, "recv", multihost=recv_multihost_enabled()
+                )
                 if exchange is not None:
+                    if host_trace.ENABLED:
+                        host_trace.mark(host_trace.RECV0)
                     recv_reqs = _broadcast_via_exchange(
                         recv_reqs, exchange=exchange, tp_group=tp_group
                     )
+                    if host_trace.ENABLED:
+                        host_trace.mark(host_trace.RECV1)
                 else:
                     if host_trace.ENABLED:
                         host_trace.mark(host_trace.RECV0)
