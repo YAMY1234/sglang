@@ -20,6 +20,16 @@ import time
 from array import array
 
 ENABLED = bool(os.environ.get("SGLANG_Q35MF_HOST_TRACE", ""))
+# Optional gate file: record only while it exists (polled while the scheduler is idle).
+_GATE = None
+if ENABLED:
+    from sglang.srt.environ import envs
+
+    _GATE = envs.SGLANG_PERFLL_HOST_TRACE_GATE.get() or None
+GATED = _GATE is not None
+if GATED:
+    ENABLED = False
+_gate_poll = 0.0
 
 (
     LOOP,
@@ -147,13 +157,26 @@ def _thread_stats() -> list:
     return out
 
 
-def maybe_flush() -> None:
+def poll_gate() -> None:
+    """Call only while the scheduler is idle: recording follows the gate file."""
+    global ENABLED, _gate_poll
+    now = time.monotonic()
+    if now - _gate_poll < 0.5:
+        return
+    _gate_poll = now
+    on = os.path.exists(_GATE)
+    if ENABLED and not on:
+        maybe_flush(force=True)
+    ENABLED = on
+
+
+def maybe_flush(force: bool = False) -> None:
     """Call only while the scheduler is idle."""
     global _last_flush, _path
     if not ENABLED or (not _buf and not _events):
         return
     now = time.monotonic()
-    if now - _last_flush < 1.0:
+    if now - _last_flush < 1.0 and not force:
         return
     _last_flush = now
     if _path is None:

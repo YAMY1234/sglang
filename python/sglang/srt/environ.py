@@ -1660,6 +1660,10 @@ class Envs:
     # The Qwen3.5 MTP draft's BF16 FlashInfer TRTLLM experts may leave their finalize to
     # the caller (the megakernel plugin's draft hop, slot draft_fin).
     SGLANG_Q35_DRAFT_BF16_DEFERRED_FINALIZE = EnvBool(False)
+    # PERF-LL host loop of a small decode batch (spec v2, overlap scheduler); all off by default.
+    # Diagnostic: with SGLANG_Q35MF_HOST_TRACE set, record only while this file exists
+    # (checked while the scheduler is idle), so one boot can bench with and without the trace.
+    SGLANG_PERFLL_HOST_TRACE_GATE = EnvStr(None)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
