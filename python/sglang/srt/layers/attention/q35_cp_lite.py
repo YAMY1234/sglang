@@ -549,12 +549,16 @@ def _cp_merge_h_ll(
     t_stride, seq_lens, out, out_stride, peers, me, ll_off, cnt, bmm1, bmm2, nb, thr,
     QL: tl.constexpr, HQ: tl.constexpr, CP: tl.constexpr, D: tl.constexpr, PG: tl.constexpr, NWP: tl.constexpr,
     NB: tl.constexpr, GMAX: tl.constexpr, WAIT: tl.constexpr, EARLY: tl.constexpr = False,
+    RELEASE: tl.constexpr = False,
 ):
     """_cp_a2a_merge_ll (gated) with one program per (row, head): pushes the head's partials, computes its causal
     block, then merges the CP partials as they arrive. One epoch per (row, head) in cnt, in an LL region of its own
     (the row merge's epochs differ). WAIT: launched as a programmatic dependent. EARLY (with WAIT): the causal block
     before the wait, which then guards only the partials; its predecessor releases it only after its own wait, so the
-    step's q / K / V (written upstream of that wait) are complete."""
+    step's q / K / V (written upstream of that wait) are complete. RELEASE: releases the dependent grid at entry, whose
+    own dependency wait covers this grid's stores."""
+    if RELEASE:
+        tl.extra.cuda.gdc_launch_dependents()
     i = tl.program_id(0)
     h = tl.program_id(1)
     if WAIT and not EARLY:
@@ -642,6 +646,7 @@ class CpLite:
         self.cp_ungated = envs.SGLANG_TRTL18_CP_UNGATED.get()
         self.gather_pdl = self.cp_ungated and envs.SGLANG_PERFLL_CP_GATHER_PDL.get()
         self.early_merge = self.cp_ungated and envs.SGLANG_PERFLL_CP_EARLY_MERGE.get()
+        self.merge_release = self.cp_ungated and envs.SGLANG_PERFLL_CP_MERGE_RELEASE.get()
         self.merge_h = envs.SGLANG_TRTL18_CP_MAIN.get() and envs.SGLANG_TRTL18_CP_MERGE_H.get()
         self.llh_off = total
         if self.merge_h or self.cp_ungated:
@@ -703,8 +708,8 @@ class CpLite:
         logger.info("TRT-L1 CP-lite exact (prefix-only fused partial + fp32 causal block): %s", self.exact)
         logger.info("TRT-L18 CP-lite gated exact calls: CP on the current stream, stock after the partial: %s, PDL %s, "
                     "per-head merge %s; ungated exact calls with PDL and the per-head merge: %s (q gather as a PDL "
-                    "dependent: %s, merge released early: %s)", self.cp_main, self.cp_pdl, self.merge_h, self.cp_ungated,
-                    self.gather_pdl, self.early_merge)
+                    "dependent: %s, merge released early: %s, merge releases its dependent: %s)", self.cp_main,
+                    self.cp_pdl, self.merge_h, self.cp_ungated, self.gather_pdl, self.early_merge, self.merge_release)
         logger.info(
             "TRT-L1 CP-lite KV gate: min KV per request %s (%s of the batch)",
             self.min_kv or "off", "max" if self.gate_max else "mean",
@@ -960,11 +965,11 @@ class CpLite:
                             pdl=True, len_sub=q_len, early_trigger=self.early_merge)
         out = torch.empty(rows, self.hq, HEAD_DIM, dtype=torch.bfloat16, device=self.device)
         self._merge_h(q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale, out,
-                      dict(gate, thr=0), pdl=True, early=self.early_merge)
+                      dict(gate, thr=0), pdl=True, early=self.early_merge, release=self.merge_release)
         return out
 
     def _merge_h(self, q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale, out, gate,
-                 pdl=None, early=False):
+                 pdl=None, early=False, release=False):
         pdl = self.cp_pdl if pdl is None else pdl
         hq = self.hq
         _cp_merge_h_ll[(rows, hq)](
@@ -973,7 +978,7 @@ class CpLite:
             page_table, page_table.stride(0), seq_lens, out, out.stride(0), self.peers, self.me, self.llh_off,
             self.cnt_h, bmm1_scale, bmm2_scale, gate["nb"], gate["thr"],
             QL=q_len, HQ=hq, CP=self.cp, D=HEAD_DIM, PG=PAGE, NWP=_LL_PWORDS, NB=gate["NB"], GMAX=gate["GMAX"],
-            WAIT=pdl, EARLY=early and pdl, num_warps=4, launch_pdl=pdl,
+            WAIT=pdl, EARLY=early and pdl, RELEASE=release, num_warps=4, launch_pdl=pdl,
         )
 
     def _own_workspace(self):
