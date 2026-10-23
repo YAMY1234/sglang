@@ -23,6 +23,11 @@ from sglang.srt.mem_cache.allocation_sizing import (
     page_aligned_decode_alloc_lens,
 )
 from sglang.srt.runtime_context import get_spec
+from sglang.srt.speculative.sharded_verify import (
+    VocabShard,
+    gather_full_logits,
+    sharded_target_tokens,
+)
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -53,6 +58,7 @@ _is_cpu = is_cpu()
 _COMPACT_VERIFY_SAMPLING = envs.SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING.get()
 _PACKED_VERIFY_BCAST = envs.SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST.get()
 _FUSED_ACCEPT = envs.SGLANG_Q35MF_FUSED_ACCEPT.get()
+_SHARDED_VERIFY = envs.SGLANG_Q35MF_SHARDED_VERIFY.get()
 
 logger = logging.getLogger(__name__)
 
@@ -756,6 +762,52 @@ def compact_verify_max_top_k(batch: ScheduleBatch) -> Optional[int]:
     return max(top_ks)
 
 
+def _target_argmax(
+    logits: torch.Tensor, vocab_shard: Optional[VocabShard]
+) -> torch.Tensor:
+    if vocab_shard is None:
+        return torch.argmax(logits, dim=-1)
+    from sglang.srt.runtime_context import get_parallel
+
+    return sharded_target_tokens(logits, vocab_shard, get_parallel().tp_group)
+
+
+def _sharded_sampling_applies(
+    *,
+    verify_input: EagleVerifyInput,
+    batch: ScheduleBatch,
+    grammar_mask: Optional[GrammarMask],
+    watermark: bool,
+) -> bool:
+    """Whether the verify samples on the vocabulary shards (SGLANG_Q35MF_SHARDED_VERIFY):
+    a CUDA topk-1 chain whose rows are all greedy or temperature-only, nothing that
+    reads or edits the full logits, and standard acceptance."""
+    info = batch.sampling_info
+    spec = get_spec()
+    return (
+        _is_cuda
+        and verify_input.tree_topk == 1
+        and grammar_mask is None
+        and not watermark
+        and not batch.return_logprob
+        and info.acc_additive_penalties is None
+        and info.acc_scaling_penalties is None
+        and info.logit_bias is None
+        and info.sampling_seed is None
+        and (
+            info.is_all_greedy
+            or not (
+                info.need_top_k_sampling
+                or info.need_top_p_sampling
+                or info.need_min_p_sampling
+            )
+        )
+        and not spec.speculative_use_rejection_sampling
+        and spec.speculative_accept_threshold_single == 1.0
+        and spec.speculative_accept_threshold_acc == 1.0
+    )
+
+
 def eagle_sample(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
@@ -803,6 +855,21 @@ def eagle_sample(
     bs = len(batch.seq_lens)
     sampling_info = batch.sampling_info
     next_token_logits = logits_output.next_token_logits
+    vocab_shard = (
+        logits_output.next_token_logits_vocab_shard if _SHARDED_VERIFY else None
+    )
+    if vocab_shard is not None and not _sharded_sampling_applies(
+        verify_input=verify_input,
+        batch=batch,
+        grammar_mask=grammar_mask,
+        watermark=watermark_state is not None
+        and sampling_info.has_watermark_candidates,
+    ):
+        next_token_logits = gather_full_logits(
+            next_token_logits, vocab_shard, get_parallel().tp_group
+        )
+        logits_output.next_token_logits = next_token_logits
+        logits_output.next_token_logits_vocab_shard = vocab_shard = None
 
     sanitize_nan_logits(next_token_logits, "verify: target model logits")
 
@@ -898,7 +965,7 @@ def eagle_sample(
         watermark=watermark_state is not None
         and sampling_info.has_watermark_candidates,
     )
-    fused_verify = chain and (greedy or sparse)
+    fused_verify = chain and (greedy or sparse or vocab_shard is not None)
     predict, accept_index, num_correct_drafts, verify_out = _verify_outputs(
         rows=math.prod(predict_shape),
         bs=bs,
@@ -912,7 +979,7 @@ def eagle_sample(
     target_predict = None
     accept_lens = None
     if greedy:
-        target_predict = torch.argmax(next_token_logits, dim=-1)
+        target_predict = _target_argmax(next_token_logits, vocab_shard)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         if fused_verify:
             accept_lens, accept_index = _chain_accept(
@@ -954,6 +1021,44 @@ def eagle_sample(
                 tp_group.broadcast(predict, src=0)
                 tp_group.broadcast(accept_index, src=0)
                 tp_group.broadcast(num_correct_drafts, src=0)
+    elif vocab_shard is not None:
+        # temperature-only rows: a Gumbel-max target sample per row, then the greedy
+        # check against it (exact for a topk-1 chain, whose drafts are deterministic)
+        target_predict = sharded_target_tokens(
+            next_token_logits,
+            vocab_shard,
+            get_parallel().tp_group,
+            temperatures=torch.repeat_interleave(
+                sampling_info.temperatures.view(-1),
+                verify_input.draft_token_num,
+                dim=0,
+            ),
+        ).reshape(bs, verify_input.draft_token_num)
+        if fused_verify:
+            _chain_accept(
+                predict=predict,
+                accept_index=accept_index,
+                num_correct_drafts=num_correct_drafts,
+                candidates=candidates,
+                verify_input=verify_input,
+                target_predict=target_predict,
+                bonus_target=None,
+                simulated_acc_len=None,
+                real_draft_tokens=False,
+                finish=False,
+            )
+        else:
+            predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
+                predicts=predict,
+                accept_index=accept_index,
+                accept_token_num=num_correct_drafts,
+                candidates=candidates,
+                retrieve_index=verify_input.retrieve_index,
+                retrieve_next_token=verify_input.retrieve_next_token,
+                retrieve_next_sibling=verify_input.retrieve_next_sibling,
+                target_predict=target_predict,
+                topk=verify_input.tree_topk,
+            )
     elif sparse:
         from sglang.srt.speculative.uno_utils import (
             sample_uno_tree_target_tokens,
@@ -1156,8 +1261,8 @@ def eagle_sample(
                 )
 
             # Use target argmax as the synthetic bonus for non-greedy requests.
-            if target_predict is None or sparse_bonus_argmax:
-                target_predict = torch.argmax(next_token_logits, dim=-1).reshape(
+            if target_predict is None or sparse_bonus_argmax or vocab_shard is not None:
+                target_predict = _target_argmax(next_token_logits, vocab_shard).reshape(
                     bs, verify_input.draft_token_num
                 )
         if chain:

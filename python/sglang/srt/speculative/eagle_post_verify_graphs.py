@@ -29,6 +29,7 @@ _SIM_ACC_LEN_DOMAIN = 0x0F3D6B8C2A915E47
 _MAX_POST_VERIFY_STATES = 64
 # SGLANG_Q35MF_MKH_N3C: a round's inputs and its forced length staged in one launch.
 _ONE_LAUNCH_LOAD = envs.SGLANG_Q35MF_MKH_N3C.get()
+_SHARDED_VERIFY = envs.SGLANG_Q35MF_SHARDED_VERIFY.get()
 
 
 def simulated_acc_len_generator(seed: int) -> torch.Generator:
@@ -109,6 +110,12 @@ class EaglePostVerifyGraphs:
             or info.sampling_seed is not None
             or info.need_min_p_sampling
             or (watermark is not None and info.has_watermark_candidates)
+            # compute_spec_logprobs reads the gathered logits off logits_output
+            or (
+                _SHARDED_VERIFY
+                and batch.return_logprob
+                and logits_output.next_token_logits_vocab_shard is not None
+            )
         ):
             return None
         return (
@@ -145,6 +152,9 @@ class EaglePostVerifyGraphs:
             need_top_p=bool(info.need_top_p_sampling),
             max_top_k=max_top_k,
             logits=logits_output.next_token_logits,
+            vocab_shard=(
+                logits_output.next_token_logits_vocab_shard if _SHARDED_VERIFY else None
+            ),
             staged=staged,
             device=batch.device,
             forward_mode=batch.forward_mode,
@@ -244,7 +254,10 @@ def _sample(slot: SimpleNamespace) -> tuple:
     return eagle_sample(
         verify_view,
         batch_view,
-        SimpleNamespace(next_token_logits=slot.logits),
+        SimpleNamespace(
+            next_token_logits=slot.logits,
+            next_token_logits_vocab_shard=slot.vocab_shard,
+        ),
         uno_target_max_top_k=slot.max_top_k,
         simulated_acc_len=staged.get("sim_accept_len"),
         sparse_bonus_argmax=slot.max_top_k is not None,
