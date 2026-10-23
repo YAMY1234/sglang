@@ -109,7 +109,7 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.disaggregation import l16_loopstat
-from sglang.srt.environ import envs
+from sglang.srt.environ import envs, freeze_env_reads
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.layers.dp_attention import get_dp_tp_group
@@ -2038,6 +2038,9 @@ class Scheduler(
         perfll_pin = envs.SGLANG_PERFLL_HOST_PIN_MAIN.get()
         if perfll_pin:
             perfll_host.pin_main_thread(get_device().gpu_id)
+        if envs.SGLANG_PERFLL_HOST_ENV_FREEZE.get():
+            freeze_env_reads()
+            logger.info("PERF-LL host: ENV_FREEZE on")
         self.result_queue: Deque[
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
