@@ -1751,6 +1751,11 @@ class Envs:
     # draft-extend layout) come from rings of 8 tensors per shape instead of torch.empty;
     # each is written whole by its kernel and read within the round.
     SGLANG_PERFLL_HOST_OUT_POOL = EnvBool(False)
+    # PERF-LL GPU glue of a small decode round; all off by default.
+    # The TRTLLM MHA graph-metadata kernel rebuilds each batch row's page table with 8
+    # programs (page blocks dealt round-robin) instead of one, at the head of every
+    # verify / draft / draft-extend graph; same writes.
+    SGLANG_PERFLL_GLUE_META_SPLIT = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
