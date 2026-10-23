@@ -202,6 +202,9 @@ class SchedulePolicy:
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
         self._shortest_prefill_calls = 0
         self._waiting_prefix_refresh_calls = 0
+        self._spf_age_rounds = envs.SGLANG_PERFPF_SPF_AGE_ROUNDS.get()
+        # rid -> batch formations waited; a round count, not wall time, so every TP rank orders alike
+        self._spf_rounds: Dict[str, int] = {}
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
@@ -244,9 +247,14 @@ class SchedulePolicy:
                     waiting_queue, temporary_deprioritized, processed_tokens
                 )
             elif policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
-                SchedulePolicy._sort_by_shortest_prefill(
-                    waiting_queue, temporary_deprioritized
-                )
+                if self._spf_age_rounds > 0:
+                    self._sort_by_shortest_prefill_aged(
+                        waiting_queue, temporary_deprioritized
+                    )
+                else:
+                    SchedulePolicy._sort_by_shortest_prefill(
+                        waiting_queue, temporary_deprioritized
+                    )
                 self._shortest_prefill_calls += 1
                 if waiting_queue and self._shortest_prefill_calls % 128 == 1:
                     logger.info(
@@ -408,6 +416,27 @@ class SchedulePolicy:
                 r.rid in temporary_deprioritized,
                 SchedulePolicy._shortest_prefill_work(r),
                 r.time_stats.wait_queue_entry_time,
+            )
+        )
+
+    def _sort_by_shortest_prefill_aged(
+        self, waiting_queue: List[Req], temporary_deprioritized: Set[int]
+    ) -> None:
+        # Requests that waited more than _spf_age_rounds batch formations go first, oldest first.
+        rounds = {r.rid: self._spf_rounds.get(r.rid, 0) + 1 for r in waiting_queue}
+        self._spf_rounds = rounds
+        limit = self._spf_age_rounds
+        waiting_queue.sort(
+            key=lambda r: (
+                rounds[r.rid] <= limit,
+                r.rid in temporary_deprioritized,
+                (
+                    SchedulePolicy._shortest_prefill_work(r)
+                    if rounds[r.rid] <= limit
+                    else -rounds[r.rid]
+                ),
+                r.time_stats.wait_queue_entry_time if rounds[r.rid] <= limit else 0.0,
+                r.rid,
             )
         )
 
