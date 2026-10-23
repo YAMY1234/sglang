@@ -1332,6 +1332,10 @@ class Envs:
     # PERF-LB: chunk rows only on a ragged batch: longest owned length x B >= this x the total (one row per request
     # otherwise). 0: every batch.
     SGLANG_PLB_CP_FOLD_RAGGED = EnvFloat(1.8)
+    # PERF-LB: EAGLE v2 joins the post-verify graphs' side-stream mamba state commit before the next verify (or a
+    # prefill batch) instead of right after the draft extend, so the commit can overlap the draft extend and the next
+    # round's draft steps (the draft model has no GDN layer).
+    SGLANG_PLB_COMMIT_LATE_JOIN = EnvBool(False)
     # PERF-LB: the chunk spec for q_len 1 calls (draft steps); unset: SGLANG_PLB_CP_FOLD_CHUNK.
     SGLANG_PLB_CP_FOLD_CHUNK_Q1 = EnvStr(None)
     # PERF-LB: gated fold calls with the per-head merge fill the chunk rows' queries in the q gather and combine their

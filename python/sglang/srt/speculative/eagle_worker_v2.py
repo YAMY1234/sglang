@@ -153,6 +153,9 @@ _is_xpu = is_xpu()
 
 
 logger = logging.getLogger(__name__)
+# PERF-LB: the post-verify mamba state commit (side stream) joins the forward stream before the next verify / prefill
+# instead of right after the draft extend, so it can overlap the draft extend and the next round's draft steps.
+_PLB_LATE_JOIN = envs.SGLANG_PLB_COMMIT_LATE_JOIN.get()
 
 
 def _select_spec_graph_runner_cls(
@@ -1498,6 +1501,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            if _PLB_LATE_JOIN and self._post_verify_graphs is not None:
+                # a prefill may write a mamba slot the pending commit still folds into
+                self._post_verify_graphs.join()
             if not (
                 batch.is_extend_in_batch and self.enable_dp_spec_prefill_coordination
             ):
@@ -1592,7 +1598,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     )
                     if host_trace.ENABLED:
                         host_trace.gpu_mark(host_trace.EXT1)
-            if self._post_verify_graphs is not None:
+            if self._post_verify_graphs is not None and not _PLB_LATE_JOIN:
                 # The mamba state commit may still run on a side stream.
                 self._post_verify_graphs.join()
 
@@ -1765,7 +1771,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             spec_stage_span("draft_extend"),
         ):
             self.draft_worker._draft_extend_for_decode(batch, result)
-        if self._post_verify_graphs is not None:
+        if self._post_verify_graphs is not None and not _PLB_LATE_JOIN:
             self._post_verify_graphs.join()
         return result
 
@@ -2074,6 +2080,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING: the compact top-k branch, when
         # every request allows it, in the post-verify graphs and the eager verify
         max_top_k = compact_verify_max_top_k(batch)
+        if _PLB_LATE_JOIN and self._post_verify_graphs is not None:
+            # the verify reads the GDN checkpoint / ring / cursors the pending commit writes
+            self._post_verify_graphs.join()
         return run_eagle_verify(
             batch,
             pp_proxy_tensors=pp_proxy_tensors,
