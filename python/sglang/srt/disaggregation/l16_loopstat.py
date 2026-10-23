@@ -7,8 +7,9 @@ selected TP rank under <dir>; tools/l16_loop.py joins them offline.
 
 SGLANG_TRTL16_AB_WIN / _AB_POLL ("base,treat") / _AB_COARSE and _AB_TREAT_BS
 (bucket subsets padded to in baseline / treatment windows; unset = every captured
-bucket) alternate knobs per window of forward_ct, identical on every TP rank, so
-all ranks switch together; the row's knob bits mark the treatment.
+bucket) / _AB_DEFER=1 (deferred metadata send) alternate knobs per window of
+forward_ct, identical on every TP rank, so all ranks switch together; the row's
+knob bits mark the treatment.
 """
 
 from __future__ import annotations
@@ -83,6 +84,8 @@ class LoopStat:
         self.ab_base_bs = sorted(int(x) for x in base.split(",")) if base else None
         self.ab_treat_bs = sorted(int(x) for x in treat.split(",")) if treat else None
         self.ab_graph = self.ab_base_bs is not None or self.ab_treat_bs is not None
+        self.ab_defer = os.environ.get("SGLANG_TRTL16_AB_DEFER", "") == "1"
+        self.defer_on = False
         self.knob = 0
 
     # ---- host stage marks -------------------------------------------------
@@ -105,18 +108,26 @@ class LoopStat:
         if not self.win:
             return
         w = self.sched.forward_ct // self.win
-        k = 0
+        # Each enabled knob takes the next bit of the window index; the row's knob keeps
+        # fixed positions (bit0 poll, bit1 graph buckets, bit2 deferred metadata send).
+        k = pos = 0
         if self.ab_poll is not None:
-            b = w & 1
+            b = (w >> pos) & 1
+            pos += 1
             k |= b
             self.sched.polling_interval = self.ab_poll[b]
             if not hasattr(self.sched, "polling_count"):
                 self.sched.polling_count = 0
         if self.ab_graph:
-            b = (w >> 1) & 1 if self.ab_poll is not None else w & 1
+            b = (w >> pos) & 1
+            pos += 1
             k |= b << 1
             # Bucket subset to pad to (None = every captured bucket): treatment when the bit is set.
             COARSE_ACTIVE = self.ab_treat_bs if b else self.ab_base_bs
+        if self.ab_defer:
+            b = (w >> pos) & 1
+            k |= b << 2
+            self.defer_on = bool(b)
         self.knob = k
 
     # ---- GPU events -----------------------------------------------------------
