@@ -87,9 +87,9 @@ class LoopStat:
         self.ab_defer = os.environ.get("SGLANG_TRTL16_AB_DEFER", "") == "1"
         self.defer_on = False
         self.sync_counts = {}
+        self.knob = 0
         if os.environ.get("SGLANG_TRTL16_SYNC_DEBUG", "") == "1" and self.write:
             self._install_sync_debug()
-        self.knob = 0
 
     # ---- sync debug -----------------------------------------------------------
     def _install_sync_debug(self) -> None:
