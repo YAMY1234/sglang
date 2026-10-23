@@ -1102,7 +1102,11 @@ class SchedulerBatchResultProcessor:
                 auxiliary_output_starts,
             )
 
+        if host_trace.ENABLED:
+            host_trace.mark(host_trace.OUT0)
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
+        if host_trace.ENABLED:
+            host_trace.mark(host_trace.OUT1)
         self.token_to_kv_pool_allocator.free_group_end()
 
         self.metrics_reporter.forward_ct_decode = (
