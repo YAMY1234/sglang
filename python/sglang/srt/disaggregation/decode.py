@@ -3291,7 +3291,7 @@ class SchedulerDisaggregationDecodeMixin:
         """SGLANG_PLB_SCATTER_DEFER: the staging scatters of chunks that arrived since the last batch go onto the
         forward stream now, between the previous forward and the next one (see DecodeStagingHandler.plb_flush)."""
         handler = self.disagg_decode_transfer_queue.staging_handler
-        if handler is not None and handler.plb_pending:
+        if handler is not None and handler.plb_defer:
             handler.plb_flush(self.forward_stream)
 
     def _run_batch_prebuilt(
