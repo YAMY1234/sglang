@@ -1195,6 +1195,9 @@ class Envs:
     # Gated calls: 0 serial; 1 the stock kernel on the current stream beside the CP gather + partial on a second
     # stream, merge after the join; 2 as 1 with the merge on the second stream (stock gets no key when CP runs).
     SGLANG_TRTL1_ATTN_CP_GATE_OVERLAP = EnvInt(1)
+    # TRT-L18, gated exact calls with GATE_OVERLAP 1: the q gather, fused partial and merge stay on the current stream;
+    # the stock call gets no key when CP runs and runs on the second stream from the partial's end to the merge's.
+    SGLANG_TRTL18_CP_MAIN = EnvBool(False)
     # Timing only: decode graph padding per block of Q35MF_AB_BLOCK target-verify rounds, the labels in turn
     # ("pow2": the smallest captured power of two); model_executor/runner_backend/ab_variants.py. Empty: off.
     SGLANG_TRTL17_PAD_AB = EnvTuple(())

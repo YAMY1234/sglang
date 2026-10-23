@@ -569,6 +569,7 @@ class CpLite:
         self.gate_max = envs.SGLANG_TRTL1_ATTN_CP_GATE_MAX.get()
         self.stock_lens = torch.zeros(rows, dtype=torch.int32, device=self.device)
         self.gate_overlap = envs.SGLANG_TRTL1_ATTN_CP_GATE_OVERLAP.get()
+        self.cp_main = envs.SGLANG_TRTL18_CP_MAIN.get()
         self._side = torch.cuda.Stream(device=self.device)
         self._ws = None
         if self.min_kv and self.gate_overlap:
@@ -584,6 +585,8 @@ class CpLite:
             tp_rank, cp, self.me, self.min_bs, self.ll, self.fused,
         )
         logger.info("TRT-L1 CP-lite exact (prefix-only fused partial + fp32 causal block): %s", self.exact)
+        logger.info("TRT-L18 CP-lite gated exact calls: CP on the current stream, stock after the partial: %s",
+                    self.cp_main)
         logger.info(
             "TRT-L1 CP-lite KV gate: min KV per request %s (%s of the batch)",
             self.min_kv or "off", "max" if self.gate_max else "mean",
@@ -742,9 +745,11 @@ class CpLite:
         return self._exact_merge(q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale,
                                  out, gate)
 
-    def _gate_lens_fwd(self, seq_lens, b, q_len, thr, forward_batch, layer_id):
-        """Once per forward (as _tables): the stock call's lengths and the exact path's prefix lengths."""
-        key = (seq_lens.data_ptr(), b, q_len, thr, self.gate_overlap)
+    def _gate_lens_fwd(self, seq_lens, b, q_len, thr, forward_batch, layer_id, zero=False):
+        """Once per forward (as _tables): the stock call's lengths and the exact path's prefix lengths. zero: the
+        stock call gets no key when CP runs (as GATE_OVERLAP 2)."""
+        zero = zero or self.gate_overlap == 2
+        key = (seq_lens.data_ptr(), b, q_len, thr, zero)
         ent = self._glens.get(key)
         if ent is not None and ent[1]() is forward_batch and layer_id > ent[2]:
             ent[2] = layer_id
@@ -754,7 +759,7 @@ class CpLite:
         lens = torch.empty(2, b, dtype=torch.int32, device=self.device)
         self._glens[key] = [(lens[0], lens[1]), weakref.ref(forward_batch), layer_id]
         _gate_lens[(1,)](seq_lens, b, thr, lens[0], lens[1], QL=q_len, NB=triton.next_power_of_2(b),
-                         GMAX=self.gate_max, ZERO=self.gate_overlap == 2)
+                         GMAX=self.gate_max, ZERO=zero)
         return lens[0], lens[1]
 
     def _gated_overlap(self, q, k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale,
@@ -762,6 +767,9 @@ class CpLite:
         """Gated call: stock(lengths, out) on this stream beside gather + partial on the side stream (the
         trtllm-gen partial with its own workspace), then the merge (exits with the gate off). GATE_OVERLAP 2: the
         merge stays on the side stream too and, gate on, the stock kernel gets no key and writes nothing."""
+        if self.cp_main and exact and self.gate_overlap == 1:
+            return self._gated_main(q, k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale,
+                                    bmm2_scale, forward_batch, layer_id, stock, gate)
         stock_lens, pre_lens = self._gate_lens_fwd(seq_lens, b, q_len, gate["thr"], forward_batch, layer_id)
         out = torch.empty(rows, self.hq, HEAD_DIM, dtype=torch.bfloat16, device=self.device)
         main = torch.cuda.current_stream()
@@ -785,6 +793,28 @@ class CpLite:
         main.wait_stream(self._side)
         if self.gate_overlap != 2:
             merge(q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale, out, gate)
+        return out
+
+    def _gated_main(self, q, k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale,
+                    forward_batch, layer_id, stock, gate):
+        """Gated exact call (TRT-L18): gather, fused partial and merge (all exit with the gate off) on this stream. The
+        stock kernel would hold SMs the partial's grid barrier waits for, so it runs on the side stream after the
+        partial; it gets no key with the gate on (then writes nothing), so it and the merge write out in disjoint cases."""
+        stock_lens, pre_lens = self._gate_lens_fwd(seq_lens, b, q_len, gate["thr"], forward_batch, layer_id, zero=True)
+        out = torch.empty(rows, self.hq, HEAD_DIM, dtype=torch.bfloat16, device=self.device)
+        words = self.hq * HEAD_DIM // 4
+        _cp_gather_q_ll[(rows,)](
+            q.view(torch.int32), words, self.peers, self.me, self.llq_off, self.q_all.view(torch.int32),
+            self.cnt[0], seq_lens, pre_lens, self.stock_lens, **gate,
+            CP=self.cp, WORDS=words, QL=q_len, FOLD=True, GWRITE=False, num_warps=4,
+        )
+        self._exact_partial(k_cache, v_cache, page_table, pre_lens, q_len, b, rows, bmm1_scale, bmm2_scale)
+        main = torch.cuda.current_stream()
+        self._side.wait_stream(main)
+        with torch.cuda.stream(self._side):
+            stock(stock_lens, out)
+        self._exact_merge(q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale, out, gate)
+        main.wait_stream(self._side)
         return out
 
     def _own_workspace(self):
