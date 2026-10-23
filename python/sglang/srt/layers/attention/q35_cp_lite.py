@@ -396,6 +396,7 @@ def _cp_gather_q_ll(
     q, q_stride, peers, me, ll_off, q_all, cnt, seq_lens, pre_lens, stock_lens, nb, thr,
     CP: tl.constexpr, WORDS: tl.constexpr, QL: tl.constexpr, FOLD: tl.constexpr,
     GATE: tl.constexpr, NB: tl.constexpr, GMAX: tl.constexpr, GWRITE: tl.constexpr, TRIG: tl.constexpr = False,
+    qv=None, vstart=None, vcnt=None, CHUNK: tl.constexpr = False,
 ):
     """LL variant of _cp_gather_q: every 4-byte word travels with the call's epoch in one 8-byte store.
     FOLD: q_all is written source-major per request ([B, CP, QL, heads, D]) for the prefix-only fused partial,
@@ -430,7 +431,12 @@ def _cp_gather_q_ll(
             slot = ((i // QL) * CP + c) * QL + i % QL
         else:
             slot = i * CP + c
-        tl.store(q_all + slot * WORDS + w, (v & 0xFFFFFFFF).to(tl.int32))
+        val = (v & 0xFFFFFFFF).to(tl.int32)
+        tl.store(q_all + slot * WORDS + w, val)
+        if CHUNK:  # PERF-LB cp3: the request's chunk rows of the fold partial ([nv, QL * CP slots, WORDS])
+            v0 = tl.load(vstart + i // QL)
+            for j in range(0, tl.load(vcnt + i // QL)):
+                tl.store(qv + ((v0 + j) * (QL * CP) + (i % QL) * CP + c).to(tl.int64) * WORDS + w, val)
     if FOLD and not GATE:
         if i % QL == 0:
             tl.store(pre_lens + i // QL, tl.maximum(tl.load(seq_lens + i // QL) - QL, 0))
@@ -623,10 +629,13 @@ def _cp_merge_h_ll(
     t_stride, seq_lens, out, out_stride, peers, me, ll_off, cnt, bmm1, bmm2, nb, thr,
     QL: tl.constexpr, HQ: tl.constexpr, CP: tl.constexpr, D: tl.constexpr, PG: tl.constexpr, NWP: tl.constexpr,
     NB: tl.constexpr, GMAX: tl.constexpr, WAIT: tl.constexpr,
+    po_v=None, pl_v=None, vstart=None, vcnt=None, CHUNK: tl.constexpr = False,
 ):
     """_cp_a2a_merge_ll (gated) with one program per (row, head): pushes the head's partials, computes its causal
     block, then merges the CP partials as they arrive. One epoch per (row, head) in cnt, in an LL region of its own
-    (the row merge's epochs differ). WAIT: launched as a programmatic dependent."""
+    (the row merge's epochs differ). WAIT: launched as a programmatic dependent.
+    CHUNK (PERF-LB cp3, fold layout): a request with chunk rows sends the base-2 LSE combine of its rows' partials
+    (po_v [nv, QL * CP * HQ, D] bf16, pl_v [nv, QL * CP * HQ] fp32) instead of po / plse."""
     i = tl.program_id(0)
     h = tl.program_id(1)
     if WAIT:
@@ -638,10 +647,42 @@ def _cp_merge_h_ll(
     flag = e.to(tl.int64) << 32
     DW: tl.constexpr = D // 2
     NO: tl.constexpr = HQ * D // 2
+    H: tl.constexpr = QL * CP * HQ
     w = tl.arange(0, DW)
+    if CHUNK:
+        n_v = tl.load(vcnt + i // QL)
+        v0 = tl.load(vstart + i // QL)
     for c in tl.static_range(CP):
-        ow = _ll_pack(flag, tl.load(po + i * po_sr + c * po_sc + h * DW + w))
-        lw = _ll_pack(flag, tl.load(plse + i * pl_sr + c * pl_sc + h + one))
+        if CHUNK:
+            if n_v > 0:
+                hh = (i % QL) * (CP * HQ) + c * HQ + h
+                mx = tl.full([1], float("-inf"), tl.float32)
+                sw = tl.zeros([1], tl.float32)
+                acc_lo = tl.zeros([DW], tl.float32)
+                acc_hi = tl.zeros([DW], tl.float32)
+                for j in range(0, n_v):
+                    vr = v0 + j
+                    lj = tl.load(pl_v + vr * H + hh + one)
+                    wd = tl.load(po_v + (vr * H + hh).to(tl.int64) * DW + w).to(tl.uint32, bitcast=True)
+                    mn = tl.maximum(mx, lj)
+                    a = tl.exp2(mx - mn)
+                    b2 = tl.exp2(lj - mn)
+                    acc_lo = acc_lo * a + (wd << 16).to(tl.float32, bitcast=True) * b2
+                    acc_hi = acc_hi * a + (wd & 0xFFFF0000).to(tl.float32, bitcast=True) * b2
+                    sw = sw * a + b2
+                    mx = mn
+                inv = 1.0 / tl.where(sw > 0, sw, 1.0)
+                lo16 = (acc_lo * inv).to(tl.bfloat16).to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF
+                hi16 = (acc_hi * inv).to(tl.bfloat16).to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF
+                lse2 = tl.where(sw > 0, mx + tl.log2(tl.where(sw > 0, sw, 1.0)), float("-inf"))
+                ow = _ll_pack(flag, lo16 | (hi16 << 16))
+                lw = _ll_pack(flag, lse2.to(tl.int32, bitcast=True))
+            else:
+                ow = _ll_pack(flag, tl.load(po + i * po_sr + c * po_sc + h * DW + w))
+                lw = _ll_pack(flag, tl.load(plse + i * pl_sr + c * pl_sc + h + one))
+        else:
+            ow = _ll_pack(flag, tl.load(po + i * po_sr + c * po_sc + h * DW + w))
+            lw = _ll_pack(flag, tl.load(plse + i * pl_sr + c * pl_sc + h + one))
         dst = (tl.load(peers + c) + ll_off + (i * CP + me) * NWP * 8).to(tl.pointer_type(tl.int64))
         tl.store(dst + h * DW + w, ow)
         tl.store(dst + NO + h + one, lw)
@@ -711,6 +752,9 @@ class CpLite:
         self.fold_mh = envs.SGLANG_PLB_CP_FOLD_MH.get()
         self.fold_chunk = _parse_min_kv(envs.SGLANG_PLB_CP_FOLD_CHUNK.get())
         self.fold_ragged = envs.SGLANG_PLB_CP_FOLD_RAGGED.get()
+        q1 = envs.SGLANG_PLB_CP_FOLD_CHUNK_Q1.get()
+        self.fold_chunk_q1 = self.fold_chunk if q1 is None else _parse_min_kv(q1)
+        self.fold_fuse = envs.SGLANG_PLB_CP_FOLD_FUSE.get()
         assert all(c in (0, 32, 64, 128, 256) for c in self.fold_chunk.values()), self.fold_chunk
         if self.merge_h or self.cp_ungated or self.fold_mh:
             total += _MAX_ROWS * cp * _LL_PWORDS * 8
@@ -970,23 +1014,35 @@ class CpLite:
         self._side.wait_stream(main)
         stock(stock_lens, out)
         words = self.hq * HEAD_DIM // 4
+        fused = None
         with torch.cuda.stream(self._side):
+            if fold_mh and self.fold_fuse:  # PERF-LB cp3: chunk rows filled by the gather, combined in the merge
+                tabs = self._tables(page_table, seq_lens, q_len, forward_batch, layer_id, gate)
+                chunk = self._chunk_tables(tabs[0], tabs[1], b, forward_batch, layer_id, q_len)
+                if chunk is not None:
+                    nv, h = chunk[1].shape[0], q_len * self.cp * self.hq
+                    fused = (chunk, torch.empty(nv, h, HEAD_DIM, dtype=q.dtype, device=self.device),
+                             torch.empty(nv, h, HEAD_DIM, dtype=torch.bfloat16, device=self.device),
+                             torch.empty(nv, h, dtype=torch.float32, device=self.device), tabs)
             _cp_gather_q_ll[(rows,)](
                 q.view(torch.int32), words, self.peers, self.me, self.llq_off, self.q_all.view(torch.int32),
                 self.cnt[0], seq_lens, pre_lens, self.stock_lens, **gate,
                 CP=self.cp, WORDS=words, QL=q_len, FOLD=exact, GWRITE=False, num_warps=4,
+                **({} if fused is None else dict(qv=fused[1].view(torch.int32), vstart=fused[0][3],
+                                                 vcnt=fused[0][4], CHUNK=True)),
             )
             if exact:
                 self._exact_partial(k_cache, v_cache, page_table, pre_lens, q_len, b, rows, bmm1_scale, bmm2_scale)
             else:
                 self._fold_partial(k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale,
-                                   forward_batch, layer_id, gate, self._own_workspace())
+                                   forward_batch, layer_id, gate, self._own_workspace(), fused)
             merge = self._exact_merge if exact else (self._fold_merge_h if fold_mh else self._fold_merge)
+            mk = {} if fused is None else dict(fused=fused)
             if self.gate_overlap == 2:
-                merge(q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale, out, gate)
+                merge(q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale, out, gate, **mk)
         main.wait_stream(self._side)
         if self.gate_overlap != 2:
-            merge(q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale, out, gate)
+            merge(q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale, out, gate, **mk)
         return out
 
     def _gated_main(self, q, k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale,
@@ -1054,16 +1110,19 @@ class CpLite:
         return self._ws
 
     def _fold_partial(self, k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale,
-                      forward_batch, layer_id, gate, workspace):
+                      forward_batch, layer_id, gate, workspace, fused=None):
         """trtllm-gen over this rank's owned prefix pages for every group head, the q_len rows folded into the
         heads (q_len_per_req 1), into po / plse with LSE."""
         import flashinfer
 
-        tab, lens, max_kv = self._tables(page_table, seq_lens, q_len, forward_batch, layer_id, gate)
+        if fused is None:
+            tab, lens, max_kv = self._tables(page_table, seq_lens, q_len, forward_batch, layer_id, gate)
+        else:
+            tab, lens, max_kv = fused[4]
         h = q_len * self.cp * self.hq
         query = self.q_all[:rows].view(b, h, HEAD_DIM)
         out, lse = self.po[:rows].view(b, h, HEAD_DIM), self.plse[:rows].view(b, h)
-        chunk = self._chunk_tables(tab, lens, b, forward_batch, layer_id)
+        chunk = self._chunk_tables(tab, lens, b, forward_batch, layer_id, q_len) if fused is None else fused[0]
         flashinfer.decode.trtllm_batch_decode_with_kv_cache(
             query=query,
             kv_cache=(k_cache, v_cache),
@@ -1084,22 +1143,27 @@ class CpLite:
         _, vtab, vlens, vstart, vcnt = chunk
         nv, C = vtab.shape
         n = h * HEAD_DIM // 4
-        qv = torch.empty(nv, h, HEAD_DIM, dtype=query.dtype, device=self.device)
-        po_v = torch.empty(nv, h, HEAD_DIM, dtype=torch.bfloat16, device=self.device)
-        pl_v = torch.empty(nv, h, dtype=torch.float32, device=self.device)
-        _cp_chunk_q[(b, nv // b)](query.view(torch.int32), qv.view(torch.int32), vstart, vcnt, n, BLK=1024)
+        if fused is None:
+            qv = torch.empty(nv, h, HEAD_DIM, dtype=query.dtype, device=self.device)
+            po_v = torch.empty(nv, h, HEAD_DIM, dtype=torch.bfloat16, device=self.device)
+            pl_v = torch.empty(nv, h, dtype=torch.float32, device=self.device)
+            _cp_chunk_q[(b, nv // b)](query.view(torch.int32), qv.view(torch.int32), vstart, vcnt, n, BLK=1024)
+        else:  # the gather wrote the chunk rows' queries; the merge combines their partials
+            qv, po_v, pl_v = fused[1:4]
         flashinfer.decode.trtllm_batch_decode_with_kv_cache(
             query=qv, kv_cache=(k_cache, v_cache), workspace_buffer=self._own_workspace(), block_tables=vtab,
             seq_lens=vlens, max_seq_len=C * PAGE, bmm1_scale=bmm1_scale, bmm2_scale=bmm2_scale, out=po_v, lse=pl_v,
             q_len_per_req=1, multi_ctas_kv_counter_buffer=self.counter,
         )
-        _cp_chunk_comb[(b, triton.cdiv(h, 16))](po_v, pl_v, vstart, vcnt, out, lse, h, HB=16, D=HEAD_DIM)
+        if fused is None:
+            _cp_chunk_comb[(b, triton.cdiv(h, 16))](po_v, pl_v, vstart, vcnt, out, lse, h, HB=16, D=HEAD_DIM)
 
-    def _chunk_tables(self, tab, lens, b, forward_batch, layer_id):
-        """Once per forward (as _tables): with SGLANG_PLB_CP_FOLD_CHUNK, the one-row-per-request call's lengths (0 on a
-        ragged batch) and the chunk rows ([B * K, C] dense, K = owned table width / C), else None."""
-        keys = [k for k in self.fold_chunk if k <= b]
-        C = self.fold_chunk[max(keys)] if keys else 0
+    def _chunk_tables(self, tab, lens, b, forward_batch, layer_id, q_len=7):
+        """Once per forward (as _tables): with SGLANG_PLB_CP_FOLD_CHUNK (q_len 1: _Q1), the one-row-per-request call's
+        lengths (0 on a ragged batch) and the chunk rows ([B * K, C] dense, K = owned table width / C), else None."""
+        spec = self.fold_chunk_q1 if q_len == 1 else self.fold_chunk
+        keys = [k for k in spec if k <= b]
+        C = spec[max(keys)] if keys else 0
         ncols = tab.shape[1]
         if not C or ncols <= C or ncols % C:
             return None
@@ -1137,7 +1201,7 @@ class CpLite:
         return out
 
     def _fold_merge_h(self, q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale, out,
-                      gate):
+                      gate, fused=None):
         """_fold_merge with one program per (row, head) (L18's merge on the fold layout [rows, cp * hq, D]); plain
         launch: its inputs come over a stream join, which under PDL would be a programmatic edge."""
         hq = self.hq
@@ -1148,6 +1212,8 @@ class CpLite:
             self.cnt_h, bmm1_scale, bmm2_scale, gate["nb"], gate["thr"],
             QL=q_len, HQ=hq, CP=self.cp, D=HEAD_DIM, PG=PAGE, NWP=_LL_PWORDS, NB=gate["NB"], GMAX=gate["GMAX"],
             WAIT=False, num_warps=4,
+            **({} if fused is None else dict(po_v=fused[2].view(torch.int32), pl_v=fused[3], vstart=fused[0][3],
+                                             vcnt=fused[0][4], CHUNK=True)),
         )
         return out
 
