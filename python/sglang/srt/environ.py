@@ -1739,6 +1739,10 @@ class Envs:
     # (freeze_env_reads; set / clear / override still refresh it): dozens of os.environ
     # lookups per round.
     SGLANG_PERFLL_HOST_ENV_FREEZE = EnvBool(False)
+    # CudaGraphBufferRegistry.fill_from replays a per-shape plan (which slots reset their
+    # padding, each copy slot's destination view, the post-fill hooks) instead of walking
+    # and slicing every slot on each call.
+    SGLANG_PERFLL_HOST_FILL_PLAN = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
