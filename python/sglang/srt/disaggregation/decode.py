@@ -3423,6 +3423,7 @@ class SchedulerDisaggregationDecodeMixin:
                 self.disagg_decode_transfer_queue.extend(req_conns)
                 if ls is not None:
                     ls.add("pp", t0)
+                    ls.meta["npa"] = len(req_conns)
             t0 = l16_loopstat._now() if ls is not None else 0
             transferred_reqs = (
                 self.disagg_decode_transfer_queue.pop_transferred()
