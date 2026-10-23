@@ -827,6 +827,10 @@ class Envs:
     # instead of jumping the queue), and the in-progress chunk keeps at least this percent of the budget (0 = off)
     SGLANG_PERFPF_SPF_AGE_CAP = EnvBool(False)
     SGLANG_PERFPF_SPF_CHUNK_MIN_PCT = EnvInt(0)
+    # Text-only extend batches take their M-RoPE rows from the device positions
+    # instead of a host arange copied from pageable memory (that copy waits for
+    # the forward stream to drain). KPRE 48b721d2d8, ported for the prefill draft extend.
+    SGLANG_Q35MF_K4_MROPE_GPU = EnvBool(False)
     # PERF-PF: spread prefill KV transfers over the transfer queues by room instead of by destination sessions
     SGLANG_PERFPF_TRANSFER_SHARD_BY_ROOM = EnvBool(False)
     # PERF-PF: scheduler processes run gc.collect() + gc.freeze() right before their event loop

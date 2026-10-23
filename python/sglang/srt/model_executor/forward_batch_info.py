@@ -69,7 +69,11 @@ from sglang.srt.utils import (
     is_npu,
     support_triton,
 )
-from sglang.srt.utils.common import ceil_align, is_pin_memory_available
+from sglang.srt.utils.common import (
+    ceil_align,
+    is_pin_memory_available,
+    print_info_once,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -1635,6 +1639,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
         extend_lens = batch.extend_lens
         prefix_lens = batch.prefix_lens
+
+        if (
+            envs.SGLANG_Q35MF_K4_MROPE_GPU.get()
+            and self.positions is not None
+            and all(mm_input is None for mm_input in mm_inputs)
+        ):
+            # Text-only rows equal the per-request arange already in positions.
+            self.mrope_positions = (
+                self.positions.to(torch.int64).unsqueeze(0).repeat(3, 1)
+            )
+            print_info_once("M-RoPE extend positions from device engaged")
+            return
 
         # Optimize text-only branch with torch.arange
         mrope_positions_list = [None] * batch_size
