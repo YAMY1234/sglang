@@ -821,6 +821,8 @@ class Envs:
     SGLANG_PERFPF_STAGING_LAZY = EnvBool(False)
     # PERF-PF: shortest-prefill-first puts requests that waited more than N batch formations first
     SGLANG_PERFPF_SPF_AGE_ROUNDS = EnvInt(0)
+    # PERF-PF: shortest-prefill-first re-matches a waiting request's prefix only every N batch formations (ordering only)
+    SGLANG_PERFPF_SPF_MATCH_EVERY = EnvInt(0)
     # PERF-PF: spread prefill KV transfers over the transfer queues by room instead of by destination sessions
     SGLANG_PERFPF_TRANSFER_SHARD_BY_ROOM = EnvBool(False)
     # PERF-PF: scheduler processes run gc.collect() + gc.freeze() right before their event loop
