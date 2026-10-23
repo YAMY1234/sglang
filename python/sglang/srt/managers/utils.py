@@ -27,6 +27,7 @@ from sglang.srt.utils.common import async_d2h as _async_d2h
 from sglang.srt.utils.common import is_pin_memory_available
 
 _D2H_RING = envs.SGLANG_PERFLL_HOST_D2H_RING.get()
+_RESULT_COPY = envs.SGLANG_PERFLL_HOST_RESULT_COPY.get()
 # A ring slot is rewritten 8 readbacks later; the scheduler consumes a result one
 # pass after its copy, so a slot is always read before it comes round again.
 _D2H_RING_SLOTS = 8
@@ -199,12 +200,17 @@ class GenerationBatchResult:
     def get_num_generated_tokens(self, batch_size: int) -> int:
         return self.num_correct_drafts + batch_size * self.num_non_draft_tokens_per_req
 
-    @torch.profiler.record_function("copy_result_to_cpu")
     def copy_to_cpu(self, return_logprob: bool, return_hidden_states: bool = True):
         """Copy tensors to CPU in overlap scheduling.
         Only the tensors which are needed for processing results are copied,
         e.g., next_token_ids, logits outputs
         """
+        if _RESULT_COPY and not torch.autograd._profiler_enabled():
+            return self._copy_to_cpu(return_logprob, return_hidden_states)
+        with torch.profiler.record_function("copy_result_to_cpu"):
+            return self._copy_to_cpu(return_logprob, return_hidden_states)
+
+    def _copy_to_cpu(self, return_logprob: bool, return_hidden_states: bool):
         if return_logprob:
             if self.logits_output.next_token_logprobs is not None:
                 self.logits_output.next_token_logprobs = _async_d2h(
