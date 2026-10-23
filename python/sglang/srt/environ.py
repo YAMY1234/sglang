@@ -1671,6 +1671,9 @@ class Envs:
     # 4096 rounds, the same sequence as one torch.multinomial per round (checked against it
     # at the first draw; falls back when they differ).
     SGLANG_PERFLL_HOST_SIM_PREDRAW = EnvBool(False)
+    # The request poll reads each zmq socket's readiness (ZMQ_EVENTS) and calls recv only
+    # when a message is waiting, instead of a NOBLOCK recv that raises on an empty socket.
+    SGLANG_PERFLL_HOST_ZMQ_EVENTS = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
