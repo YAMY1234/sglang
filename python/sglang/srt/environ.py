@@ -1306,6 +1306,8 @@ class Envs:
     # TRT-L18, with CP_MAIN: the q gather releases its dependents at entry and the fused partial (and the per-head
     # merge) launch as programmatic dependents, so the partial requests its prefix KV while the queries are in flight.
     SGLANG_TRTL18_CP_PDL = EnvBool(False)
+    # TRT-L18, with CP_MAIN: the merge runs one program per (row, head), with its own LL region and epochs.
+    SGLANG_TRTL18_CP_MERGE_H = EnvBool(False)
     # Timing only: decode graph padding per block of Q35MF_AB_BLOCK target-verify rounds, the labels in turn
     # ("pow2": the smallest captured power of two); model_executor/runner_backend/ab_variants.py. Empty: off.
     SGLANG_TRTL17_PAD_AB = EnvTuple(())
