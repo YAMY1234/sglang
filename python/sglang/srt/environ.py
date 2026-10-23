@@ -1548,6 +1548,9 @@ class Envs:
     # The decode result readback (next token ids, accept lengths) copies into a ring of
     # pinned buffers kept per shape instead of a fresh pinned allocation per tensor and round.
     SGLANG_PERFLL_HOST_D2H_RING = EnvBool(False)
+    # The scheduler's main thread on two reserved cores of its NUMA node, the process's other
+    # threads off them (utils/perfll_host.py).
+    SGLANG_PERFLL_HOST_PIN_MAIN = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
