@@ -1663,6 +1663,9 @@ class Envs:
     # D2H on the schedule stream waits for the in-flight forward (the stream is fenced
     # on it) and stalls the overlap loop.
     SGLANG_TRTL16_PREALLOC_NO_SYNC = EnvBool(False)
+    # The Qwen3.5 MTP draft's BF16 FlashInfer TRTLLM experts may leave their finalize to
+    # the caller (the megakernel plugin's draft hop, slot draft_fin).
+    SGLANG_Q35_DRAFT_BF16_DEFERRED_FINALIZE = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
