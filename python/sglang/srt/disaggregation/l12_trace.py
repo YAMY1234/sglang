@@ -106,3 +106,16 @@ def log_prefill_batch(batch, t0: float, t1: float, t2: float, nwait: int, ninfl:
         nwait,
         ninfl,
     )
+
+
+def log_prefill_loop(t0: float, marks: Dict[str, float], bs: int, nwait: int, ninfl: int) -> None:
+    """Sub-phases of one prefill loop iteration that ran a batch (P TP0); now = inflight queue processed."""
+    logger.info(
+        "L12T PL t0=%.4f %s t4=%.4f bs=%d wait=%d infl=%d",
+        t0,
+        " ".join(f"{k}={v:.4f}" for k, v in marks.items()),
+        time.time(),
+        bs,
+        nwait,
+        ninfl,
+    )
