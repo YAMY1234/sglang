@@ -8,7 +8,10 @@ import torch
 
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.environ import envs
-from sglang.srt.kernel_plugins.nvidia.binding import megakernel_graph_variants
+from sglang.srt.kernel_plugins.nvidia.binding import (
+    megakernel_graph_variants,
+    megakernel_variant_sizes,
+)
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     deployment_attn_dp_size,
@@ -296,7 +299,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         self.attention_graph_variants = megakernel_graph_variants(
             model_runner.model, "draft_loop", batch_sizes=self.megakernel_served
         )
-        self.attention_variant_sizes = self.megakernel_served
+        self.attention_variant_sizes = megakernel_variant_sizes(
+            self.attention_graph_variants, self.megakernel_served
+        )
 
         self.backend = resolve_decode_backend(self)
 
