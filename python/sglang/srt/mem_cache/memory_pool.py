@@ -1154,7 +1154,11 @@ class MambaPool:
             fused_clear_conv_slots(self._conv_slot_desc, indices)
             temporal = self.mamba_cache.temporal
             if temporal.numel() > 0:
-                temporal[:, indices] = 0
+                if l16_loopstat.prealloc_no_sync():
+                    # A Python-scalar value is a pageable H2D that waits for this stream.
+                    temporal.index_fill_(1, indices.long(), 0)
+                else:
+                    temporal[:, indices] = 0
             return
         if not _is_npu:
             need_size = len(indices)
@@ -1597,11 +1601,15 @@ class HybridReqToTokenPool(ReqToTokenPool):
             fresh_indices = [
                 idx for idx, fresh in zip(select_index, fresh_req_rows) if fresh
             ]
-            if fresh_indices:
-                if no_sync:
-                    fresh_indices = async_h2d(
-                        fresh_indices, dtype=torch.int64, device=spec_write_pos.device
-                    )
+            if fresh_indices and no_sync:
+                # A Python-scalar value is a pageable H2D even with a device index.
+                fresh_rows = async_h2d(
+                    fresh_indices, dtype=torch.int64, device=spec_write_pos.device
+                )
+                spec_write_pos.index_fill_(0, fresh_rows, 0)
+                self.mamba_pool.replayssm_cache_base.index_fill_(0, fresh_rows, 0)
+                self.mamba_pool.replayssm_is_flush.index_fill_(0, fresh_rows, 0)
+            elif fresh_indices:
                 spec_write_pos[fresh_indices] = 0
                 self.mamba_pool.replayssm_cache_base[fresh_indices] = 0
                 self.mamba_pool.replayssm_is_flush[fresh_indices] = 0
@@ -1623,7 +1631,10 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 # ignores ring contents and reads only the checkpoint state
                 # (the post-prefill state that prefill wrote into this slot).
                 if self.mamba_pool.replayssm_write_pos is not None:
-                    self.mamba_pool.replayssm_write_pos[req.kv.mamba_pool_idx] = 0
+                    if no_sync:
+                        self.mamba_pool.replayssm_write_pos.index_fill_(0, mid, 0)
+                    else:
+                        self.mamba_pool.replayssm_write_pos[req.kv.mamba_pool_idx] = 0
             mamba_indices.append(req.kv.mamba_pool_idx)
             if self.enable_mamba_extra_buffer:
                 if req.kv.mamba_ping_pong_track_buffer is None:
