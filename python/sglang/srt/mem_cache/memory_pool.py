@@ -156,6 +156,49 @@ def _device_rows(rows: List[int], device) -> torch.Tensor:
     ).to(device, non_blocking=True)
 
 
+def replayssm_fold_in_verify_enabled(
+    *,
+    spec_ring: bool,
+    checkpoint_dtype: torch.dtype,
+    compact_ring: bool,
+    ring_len: int,
+    draft_tokens: Optional[int],
+) -> bool:
+    """SGLANG_PLB_GDN_FOLD_IN_VERIFY on a GDN spec verify ring that supports it: the verify
+    folds a request's ring into its checkpoint once the step's rows do not fit after it."""
+    if not (spec_ring and envs.SGLANG_PLB_GDN_FOLD_IN_VERIFY.get()):
+        return False
+    from sglang.srt.runtime_context import get_exec, get_memory
+
+    reasons = []
+    if checkpoint_dtype != torch.bfloat16:
+        reasons.append(f"{checkpoint_dtype} checkpoints")
+    if not compact_ring:
+        reasons.append("no compact (low-part) ring")
+    if (
+        draft_tokens is None
+        or not 1 <= draft_tokens <= ring_len
+        or ring_len & (ring_len - 1)
+    ):
+        reasons.append(f"{draft_tokens} rows a request on a ring of {ring_len}")
+    # Between rounds the checkpoint lags the ring; no_buffer donates it as the request's
+    # state, extra_buffer donates the commit's track snapshots instead.
+    if not (
+        get_exec().mamba.enable_mamba_extra_buffer or get_memory().disable_radix_cache
+    ):
+        reasons.append("the no_buffer radix cache donates the active checkpoint")
+    if reasons:
+        logger.warning("SGLANG_PLB_GDN_FOLD_IN_VERIFY is off: %s", "; ".join(reasons))
+        return False
+    logger.info(
+        "SGLANG_PLB_GDN_FOLD_IN_VERIFY: the GDN verify folds a full ring into the "
+        "checkpoint (ring %d, %d rows a request); the commit snapshots track rows only",
+        ring_len,
+        draft_tokens,
+    )
+    return True
+
+
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
     if isinstance(t, list):
         return sum(get_tensor_size_bytes(x) for x in t)
@@ -1056,6 +1099,14 @@ class MambaPool:
                 torch.zeros((spec_state_size + 1,), dtype=torch.int8, device=device)
                 if enable_linear_replayssm_spec and not self.replayssm_spec_fold
                 else None
+            )
+            self.replayssm_fold_in_verify = replayssm_fold_in_verify_enabled(
+                spec_ring=self.replayssm_is_flush is not None
+                and not cache_params.is_kda,
+                checkpoint_dtype=ssm_dtype,
+                compact_ring=replayssm_rawv is not None and replayssm_beta is None,
+                ring_len=linear_replayssm_cache_len,
+                draft_tokens=speculative_num_draft_tokens,
             )
             mem_usage_bytes = self.mamba_cache.mem_usage_bytes()
             if isinstance(self.mamba_cache, self.SpeculativeState):
