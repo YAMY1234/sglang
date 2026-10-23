@@ -1164,6 +1164,7 @@ def _advance_gdn_spec_cursors_kernel(
     BLOCK: tl.constexpr,
     NULL_BLOCK_ID: tl.constexpr,
     FOLD_IN_VERIFY: tl.constexpr = False,
+    DEFER_FOLD: tl.constexpr = False,
 ):
     offs = tl.arange(0, BLOCK)
     row_mask = offs < n_rows
@@ -1211,6 +1212,9 @@ def _advance_gdn_spec_cursors_kernel(
     # for more. Config enforces max_cache_len >= 2 * max_spec_len.
     if FOLD_IN_VERIFY:
         next_is_flush = tl.zeros([BLOCK], dtype=tl.int8)
+    elif DEFER_FOLD:
+        # fold (in this step's commit) only a ring the next verify's rows would overflow
+        next_is_flush = ((new_wp + MAX_SPEC_LEN) > MAX_CACHE_LEN).to(tl.int8)
     elif FOLD_EVERY_COMMIT:
         next_is_flush = (new_wp > 0).to(tl.int8)
     else:
@@ -1708,11 +1712,14 @@ def commit_gdn_replayssm_spec(
     cache_buf_len: int | None = None,
     null_block_id: int = 0,
     fold_in_verify: bool = False,
+    defer_fold: bool = False,
 ):
     """Advance request-keyed cursors once per verify step (device-only).
 
     ``fold_in_verify``: the verify folded each ring that could not take
     ``max_spec_len`` rows after its history (gdn_replayssm_spec_decode's rule).
+    ``defer_fold``: flag for this step's commit only the rings the next verify's
+    ``max_spec_len`` rows would overflow.
     """
     if cache_buf_len is None:
         cache_buf_len = max_cache_len
@@ -1734,6 +1741,7 @@ def commit_gdn_replayssm_spec(
         BLOCK=BLOCK,
         NULL_BLOCK_ID=null_block_id,
         FOLD_IN_VERIFY=fold_in_verify,
+        DEFER_FOLD=defer_fold,
     )
 
 
@@ -1755,13 +1763,15 @@ def commit_gdn_replayssm_circular(
     mamba_steps_to_track: torch.Tensor | None = None,
     null_block_id: int = -1,
     use_cuda: bool = False,
+    early_exit: bool = False,
 ) -> None:
     """Materialize circular history only for capacity and track rows.
 
     ``write_pos`` must already include this step's accepted prefix. Capacity
     rows update their active checkpoint and reset the ring; track rows snapshot
     the exact state at the requested accepted step without disturbing the active
-    checkpoint.
+    checkpoint. ``early_exit``: the CUDA commit reads the cursors before staging,
+    for steps where most rows neither fold nor track (SGLANG_PLB_GDN_DEFER_FOLD).
     """
     max_cache_len = d_cache.shape[-2]
     has_residual = d_residual_cache is not None and k_residual_cache is not None
@@ -1784,6 +1794,7 @@ def commit_gdn_replayssm_circular(
             mamba_track_indices=mamba_track_indices if has_track else None,
             mamba_steps_to_track=mamba_steps_to_track if has_track else None,
             null_block_id=null_block_id,
+            early_exit=early_exit,
         )
     ):
         V = checkpoint_state.shape[-2]

@@ -156,18 +156,26 @@ def _device_rows(rows: List[int], device) -> torch.Tensor:
     ).to(device, non_blocking=True)
 
 
-def replayssm_fold_in_verify_enabled(
+def replayssm_lagging_checkpoint_mode(
     *,
     spec_ring: bool,
     checkpoint_dtype: torch.dtype,
     compact_ring: bool,
     ring_len: int,
     draft_tokens: Optional[int],
-) -> bool:
-    """SGLANG_PLB_GDN_FOLD_IN_VERIFY on a GDN spec verify ring that supports it: the verify
-    folds a request's ring into its checkpoint once the step's rows do not fit after it."""
-    if not (spec_ring and envs.SGLANG_PLB_GDN_FOLD_IN_VERIFY.get()):
-        return False
+) -> str:
+    """"verify" (SGLANG_PLB_GDN_FOLD_IN_VERIFY: the verify folds a request's ring into its
+    checkpoint once the step's rows do not fit after it), "defer" (SGLANG_PLB_GDN_DEFER_FOLD:
+    the commit folds it once the next step's rows would not fit) or "" (fold every commit),
+    on a GDN spec verify ring that supports a checkpoint lagging the ring."""
+    if not spec_ring:
+        return ""
+    if envs.SGLANG_PLB_GDN_FOLD_IN_VERIFY.get():
+        name, mode = "SGLANG_PLB_GDN_FOLD_IN_VERIFY", "verify"
+    elif envs.SGLANG_PLB_GDN_DEFER_FOLD.get():
+        name, mode = "SGLANG_PLB_GDN_DEFER_FOLD", "defer"
+    else:
+        return ""
     from sglang.srt.runtime_context import get_exec, get_memory
 
     reasons = []
@@ -188,15 +196,18 @@ def replayssm_fold_in_verify_enabled(
     ):
         reasons.append("the no_buffer radix cache donates the active checkpoint")
     if reasons:
-        logger.warning("SGLANG_PLB_GDN_FOLD_IN_VERIFY is off: %s", "; ".join(reasons))
-        return False
+        logger.warning("%s is off: %s", name, "; ".join(reasons))
+        return ""
     logger.info(
-        "SGLANG_PLB_GDN_FOLD_IN_VERIFY: the GDN verify folds a full ring into the "
-        "checkpoint (ring %d, %d rows a request); the commit snapshots track rows only",
+        "%s: the GDN checkpoint lags the ring; it folds when %s (ring %d, %d rows a request)",
+        name,
+        "the verify's rows do not fit (the commit snapshots track rows only)"
+        if mode == "verify"
+        else "the next verify's rows would not fit (in the commit)",
         ring_len,
         draft_tokens,
     )
-    return True
+    return mode
 
 
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
@@ -1100,7 +1111,7 @@ class MambaPool:
                 if enable_linear_replayssm_spec and not self.replayssm_spec_fold
                 else None
             )
-            self.replayssm_fold_in_verify = replayssm_fold_in_verify_enabled(
+            lag_mode = replayssm_lagging_checkpoint_mode(
                 spec_ring=self.replayssm_is_flush is not None
                 and not cache_params.is_kda,
                 checkpoint_dtype=ssm_dtype,
@@ -1108,6 +1119,8 @@ class MambaPool:
                 ring_len=linear_replayssm_cache_len,
                 draft_tokens=speculative_num_draft_tokens,
             )
+            self.replayssm_fold_in_verify = lag_mode == "verify"
+            self.replayssm_defer_fold = lag_mode == "defer"
             mem_usage_bytes = self.mamba_cache.mem_usage_bytes()
             if isinstance(self.mamba_cache, self.SpeculativeState):
                 # `intermediate_conv_window` is an as_strided view whose logical
