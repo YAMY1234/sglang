@@ -15,6 +15,9 @@ import triton
 import triton.language as tl
 
 from sglang.srt.utils.common import print_info_once
+from sglang.srt.environ import envs
+
+_MC_GATHER = envs.SGLANG_PERFLL_VERIFY_MC_GATHER.get()
 
 
 class VocabShard(msgspec.Struct, frozen=True):
@@ -111,6 +114,33 @@ def keys_to_tokens(gathered: torch.Tensor, tp_size: int) -> torch.Tensor:
     return 0xFFFFFFFF - (best & 0xFFFFFFFF)
 
 
+# SGLANG_PERFLL_VERIFY_MC_GATHER: the key exchange's multimem state, built by the first
+# (eager, every rank in lockstep) call; rows of 2 int64 = 8 bf16 per rank
+_MC_MAX_ROWS = 1024
+_mc_state = None
+
+
+def _mc_gather_keys(keys: torch.Tensor, tp_group) -> torch.Tensor:
+    """[rows] int64 keys of every rank -> [rows] best key, by one multimem all-gather."""
+    global _mc_state
+    from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
+
+    world, rows = tp_group.world_size, keys.shape[0]
+    if _mc_state is None:
+        _mc_state = triton_symm_mem_ag.create_state(
+            tp_group.device_group,
+            tp_group.rank_in_group,
+            max_tokens=_MC_MAX_ROWS,
+            hidden_size=8 * world,
+            device=keys.device,
+        )
+    pair = torch.stack((keys, keys), dim=1)
+    out = triton_symm_mem_ag.all_gather_inner(
+        _mc_state, pair.view(torch.bfloat16), 8 * world, safe=False
+    )
+    return out.contiguous().view(torch.int64).view(rows, world, 2)[:, :, 0].amax(dim=1)
+
+
 def sharded_target_tokens(
     logits: torch.Tensor,
     shard: VocabShard,
@@ -129,6 +159,8 @@ def sharded_target_tokens(
             0, 2**31 - 1, (logits.shape[0],), dtype=torch.int64, device=logits.device
         )
     keys = shard_keys(logits, shard, temperatures, seeds)
+    if _MC_GATHER and 0 < keys.shape[0] <= _MC_MAX_ROWS:
+        return 0xFFFFFFFF - (_mc_gather_keys(keys, tp_group) & 0xFFFFFFFF)
     gathered = torch.empty(
         tp_group.world_size * keys.shape[0], dtype=torch.int64, device=keys.device
     )

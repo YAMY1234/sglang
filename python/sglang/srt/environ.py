@@ -1671,6 +1671,9 @@ class Envs:
     # take a sharded argmax (bit-identical), temperature-only rows a sharded Gumbel-max
     # (same distribution); any other batch all-gathers them first, as before.
     SGLANG_Q35MF_SHARDED_VERIFY = EnvBool(False)
+    # SGLANG_Q35MF_SHARDED_VERIFY's per-row key exchange as one multimem.st all-gather over a symmetric
+    # buffer (two signal-pad barriers) in place of NCCL's ring all-gather of the int64 keys.
+    SGLANG_PERFLL_VERIFY_MC_GATHER = EnvBool(False)
     # The TRT-LLM MHA multi-step draft graph's attention metadata: one page table for every
     # step, written once at the last step's length, and the other steps' sequence lengths in
     # one launch (the steps read the same values). No SWA, no unified pool.
