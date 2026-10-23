@@ -1372,6 +1372,9 @@ class Envs:
     # With CP_UNGATED: the fused partial of an ungated exact call releases the per-head merge right after its dependency
     # wait, and the merge computes its causal block before its own wait (it reads only the step's q / K / V there).
     SGLANG_PERFLL_CP_EARLY_MERGE = EnvBool(False)
+    # With CP_UNGATED: the per-head merge of an ungated exact call releases its own dependent at entry (that consumer
+    # touches the attention output only after its dependency wait, as the plugin's MKA epilogue and draft o_proj do).
+    SGLANG_PERFLL_CP_MERGE_RELEASE = EnvBool(False)
     # Timing only: decode graph padding per block of Q35MF_AB_BLOCK target-verify rounds, the labels in turn
     # ("pow2": the smallest captured power of two); model_executor/runner_backend/ab_variants.py. Empty: off.
     SGLANG_TRTL17_PAD_AB = EnvTuple(())
