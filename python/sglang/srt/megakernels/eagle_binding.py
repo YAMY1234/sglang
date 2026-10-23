@@ -99,6 +99,9 @@ class MambaPoolBuffers(msgspec.Struct, frozen=True):
     ring_write_pos: Optional[torch.Tensor]
     ring_cache_base: Optional[torch.Tensor]
     ring_is_flush: Optional[torch.Tensor]
+    # SGLANG_PLB_GDN_FOLD_IN_VERIFY: the verify folds a ring that cannot take the step's
+    # rows into the checkpoint, and the commit folds nothing
+    ring_fold_in_verify: bool = False
 
 
 class AttnStepMetadata(msgspec.Struct, frozen=True):
@@ -348,6 +351,7 @@ def mamba_pool_buffers(req_pool: Any) -> MambaPoolBuffers:
         ring_write_pos=mamba_pool.replayssm_spec_write_pos,
         ring_cache_base=mamba_pool.replayssm_cache_base,
         ring_is_flush=mamba_pool.replayssm_is_flush,
+        ring_fold_in_verify=mamba_pool.replayssm_fold_in_verify,
     )
 
 
