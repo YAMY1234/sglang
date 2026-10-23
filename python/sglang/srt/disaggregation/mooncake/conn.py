@@ -15,6 +15,7 @@ import numpy.typing as npt
 import zmq
 from prometheus_client import Counter
 
+from sglang.srt.disaggregation import l12_trace
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
     ABORT_ACK_TAG,
@@ -2444,6 +2445,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # _stopped alone can never wake a parked worker during a role switch.
                 if kv_chunk is None:
                     break
+                if l12_trace.ENABLED and not hasattr(kv_chunk, "l12_deq"):
+                    kv_chunk.l12_deq = time.time()
                 if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(
@@ -2509,6 +2512,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # When staging transfer is not yet ready (watermark/allocation pending),
                 # the chunk is re-enqueued and we break out of the req loop to retry later.
                 staging_deferred = False
+                l12_s0 = time.time() if l12_trace.ENABLED else 0.0
                 for req in reqs_to_be_processed:
                     start_ts = time.perf_counter()
                     if not req.is_dummy:
@@ -2768,7 +2772,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     )
 
                 if staging_deferred:
+                    if l12_trace.ENABLED:
+                        kv_chunk.l12_defer = getattr(kv_chunk, "l12_defer", 0) + 1
                     continue
+                if l12_trace.ENABLED and self.attn_tp_rank == 0:
+                    l12_trace.log_chunk(kv_chunk, kv_chunk.l12_deq, l12_s0, time.time())
 
                 self._staging_outstanding[kv_chunk.room] -= 1
                 if self.enable_deferred_decode_kv_release:
@@ -2980,6 +2988,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # Staging: prefill notifies a chunk written to staging buffer
                 if msg[0] == b"CHUNK_READY":
                     room = int(msg[1].decode("ascii"))
+                    if l12_trace.ENABLED and self.attn_tp_rank == 0:
+                        l12_trace.decode_chunk_arrived(room)
                     chunk_idx = int(msg[2].decode("ascii"))
                     page_start = int(msg[3].decode("ascii"))
                     num_pages = int(msg[4].decode("ascii"))
@@ -3062,19 +3072,20 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
 
-        self.transfer_queues[shard_idx].put(
-            TransferKVChunk(
-                room=bootstrap_room,
-                prefill_kv_indices=kv_indices,
-                index_slice=index_slice,
-                is_last_chunk=is_last_chunk,
-                prefill_aux_index=aux_index,
-                state_indices=state_indices,
-                num_kv_tokens=num_kv_tokens,
-                trace_ctx=trace_ctx,
-                wait_event=wait_event,
-            )
+        kv_chunk = TransferKVChunk(
+            room=bootstrap_room,
+            prefill_kv_indices=kv_indices,
+            index_slice=index_slice,
+            is_last_chunk=is_last_chunk,
+            prefill_aux_index=aux_index,
+            state_indices=state_indices,
+            num_kv_tokens=num_kv_tokens,
+            trace_ctx=trace_ctx,
+            wait_event=wait_event,
         )
+        if l12_trace.ENABLED:
+            kv_chunk.l12_enq = time.time()
+        self.transfer_queues[shard_idx].put(kv_chunk)
 
     def get_session_id(self):
         return self.engine.get_session_id()

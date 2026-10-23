@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, List, Optional
 import numpy as np
 import torch
 
+from sglang.srt.disaggregation import l12_trace
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.checksum import (
@@ -664,6 +665,7 @@ class SchedulerDisaggregationPrefillMixin:
             if self.gracefully_exit:
                 break
 
+            l12_t0 = time.time() if l12_trace.ENABLED else 0.0
             # Receive requests
             self.ingest_requests()
             if self._engine_paused:
@@ -686,10 +688,21 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Launch the current batch
             if batch:
+                l12_t1 = time.time() if l12_trace.ENABLED else 0.0
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
                 result = self.run_batch(batch)
+                l12_t2 = time.time() if l12_trace.ENABLED else 0.0
                 self.process_batch_result(batch, result)
+                if l12_trace.ENABLED and get_parallel().attn_tp_rank == 0:
+                    l12_trace.log_prefill_batch(
+                        batch,
+                        l12_t0,
+                        l12_t1,
+                        l12_t2,
+                        len(self.waiting_queue),
+                        len(self.disagg_prefill_inflight_queue),
+                    )
             else:
                 self._sched_idled = True
                 self.on_idle()
