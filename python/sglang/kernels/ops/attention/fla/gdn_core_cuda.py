@@ -7,8 +7,10 @@ in verify), which adapts TensorRT-LLM's ``q35_gdn_core`` to SGLang's ``gdn_repla
 gated RMSNorm (``layernorm_gated._layer_norm_fwd``). One CTA per (request, value head), 4 warps of 32 value columns;
 the products run as BF16 m16n8k16 MMAs with FP32 accumulation, the forward substitution, the intra-step output and
 the norm in FP32. The BF16 roundings of SGLang's kernels are kept (normalized q, key high / low, update high / low,
-the replay output before the norm, the norm output before the FP8 scale); FP32 sums run in other orders, so the
-result is numeric, not bitwise, against the Triton verify + ``_layer_norm_fwd(static_quant_scale=...)``. The ring
+the replay output before the norm, the norm output before the FP8 scale), and the q / k norms, gates and exps use
+the Triton kernels' summation order and fp32 forms, so the key and decay ring entries are bitwise the Triton
+verify's; the products and the substitution sum in other orders, so updates and output are numeric, not bitwise,
+against the Triton verify + ``_layer_norm_fwd(static_quant_scale=...)``. The ring
 entries go where the Triton verify writes them (``(cache_base + write_pos + t) mod 16`` while ``write_pos + t < 16``)
 and the cursors are only read, so ``commit_gdn_replayssm_circular`` runs unchanged.
 
@@ -101,9 +103,20 @@ __device__ __forceinline__ u32 word(const U4& v, int i) { return i == 0 ? v.x : 
 __device__ __forceinline__ U4 ld16(const void* p) { return *reinterpret_cast<const U4*>(p); }
 __device__ __forceinline__ void st16(void* p, U4 v) { *reinterpret_cast<U4*>(p) = v; }
 __device__ __forceinline__ U4 zero4() { U4 z; z.x = z.y = z.z = z.w = 0u; return z; }
-__device__ __forceinline__ float rcp_rn(float x) {
+// the Triton kernels' fp32 forms: tl.exp = ex2.approx of x log2(e), `/` = div.full, tl.sqrt = sqrt.approx
+__device__ __forceinline__ float tl_exp(float x) {
   float r;
-  asm("div.rn.f32 %0, 0f3F800000, %1;" : "=f"(r) : "f"(x));
+  asm("ex2.approx.f32 %0, %1;" : "=f"(r) : "f"(x * 1.4426950408889634f));
+  return r;
+}
+__device__ __forceinline__ float div_full(float a, float b) {
+  float r;
+  asm("div.full.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+  return r;
+}
+__device__ __forceinline__ float sqrt_approx(float x) {
+  float r;
+  asm("sqrt.approx.f32 %0, %1;" : "=f"(r) : "f"(x));
   return r;
 }
 __device__ __forceinline__ u8 f2e4m3(float x) {
@@ -200,7 +213,7 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) gdn_core(const Param
     return;
   }
   const int hist = wp;
-  const float negAexp = -__expf(load_param(p.A_log, hv, p.alog_bf16 != 0));
+  const float negAexp = -tl_exp(load_param(p.A_log, hv, p.alog_bf16 != 0));
   const float dtb = load_param(p.dt_bias, hv, p.dtb_bf16 != 0);
   float nw[MT][2];
 #pragma unroll
@@ -214,7 +227,7 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) gdn_core(const Param
       nw[m][h] = bf2f(reinterpret_cast<const u16*>(p.norm_w)[v]);
 #endif
     }
-  const float rscale = rcp_rn(p.scale[0]);
+  const float rscale = div_full(1.f, p.scale[0]);
 
   // ---------------- the wait: the step's activations from here on ----------------
   pdl_wait();
@@ -251,22 +264,39 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) gdn_core(const Param
   }
   float kmul;       // 1 / |k_r|
   {
-    float sq[4] = {0.f, 0.f, 0.f, 0.f}, sk[4] = {0.f, 0.f, 0.f, 0.f};
+    // |q|^2, |k|^2 in the Triton verify's order (bitwise its normalized q / k): per 64-wide half, 8-element blocks
+    // summed in order, then combined by lane xor 4 / 2 / 1; block 4 c + q is chunk c of lane q, so xor 4 is local
+    float sqs = 0.f, sks = 0.f;
 #pragma unroll
-    for (int c = 0; c < 4; ++c)
+    for (int hf = 0; hf < 2; ++hf) {
+      float hq[2], hk[2];
 #pragma unroll
-      for (int i = 0; i < 4; ++i) {
-        const u32 wq = word(QR[c], i), wk = word(KR[c], i);
-        sq[i] += bflo(wq) * bflo(wq) + bfhi(wq) * bfhi(wq);
-        sk[i] += bflo(wk) * bflo(wk) + bfhi(wk) * bfhi(wk);
+      for (int j = 0; j < 2; ++j) {
+        const U4 wq = QR[2 * hf + j], wk = KR[2 * hf + j];
+        float aq = bflo(wq.x) * bflo(wq.x), ak = bflo(wk.x) * bflo(wk.x);
+        aq += bfhi(wq.x) * bfhi(wq.x);
+        ak += bfhi(wk.x) * bfhi(wk.x);
+#pragma unroll
+        for (int i = 1; i < 4; ++i) {
+          const u32 xq = word(wq, i), xk = word(wk, i);
+          aq += bflo(xq) * bflo(xq);
+          ak += bflo(xk) * bflo(xk);
+          aq += bfhi(xq) * bfhi(xq);
+          ak += bfhi(xk) * bfhi(xk);
+        }
+        hq[j] = aq;
+        hk[j] = ak;
       }
-    float sqs = (sq[0] + sq[1]) + (sq[2] + sq[3]), sks = (sk[0] + sk[1]) + (sk[2] + sk[3]);
-    sqs += __shfl_xor_sync(FULL, sqs, 1);
-    sks += __shfl_xor_sync(FULL, sks, 1);
-    sqs += __shfl_xor_sync(FULL, sqs, 2);
-    sks += __shfl_xor_sync(FULL, sks, 2);
-    const float qmul = rowok ? (1.0f / sqrtf(sqs + 1e-6f)) * p.qscale : 0.f;
-    kmul = rowok ? 1.0f / sqrtf(sks + 1e-6f) : 0.f;
+      float sq = hq[0] + hq[1], sk = hk[0] + hk[1];
+      sq += __shfl_xor_sync(FULL, sq, 2);
+      sk += __shfl_xor_sync(FULL, sk, 2);
+      sq += __shfl_xor_sync(FULL, sq, 1);
+      sk += __shfl_xor_sync(FULL, sk, 1);
+      sqs += sq;
+      sks += sk;
+    }
+    const float qmul = rowok ? div_full(1.f, sqrt_approx(sqs + 1e-6f)) * p.qscale : 0.f;
+    kmul = rowok ? div_full(1.f, sqrt_approx(sks + 1e-6f)) : 0.f;
 #pragma unroll
     for (int c = 0; c < 4; ++c) {
       QN[c].x = pack2(bflo(QR[c].x) * qmul, bfhi(QR[c].x) * qmul);
@@ -280,9 +310,9 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) gdn_core(const Param
   float gl = 0.f, beta = 0.f;
   if (lane < TT) {
     const float xg = bf2f(ar) + dtb;
-    const float spl = xg <= 20.f ? __logf(1.f + __expf(xg)) : xg;
+    const float spl = xg <= 20.f ? logf(1.f + tl_exp(xg)) : xg;  // tl.log: the precise logf
     gl = negAexp * spl;
-    beta = __fdividef(1.f, 1.f + __expf(-bf2f(br_)));
+    beta = div_full(1.f, 1.f + tl_exp(-bf2f(br_)));
   }
   // the norm's gate z * sigmoid(z), here so that z arrives while the products run
   float zg[MT][4];
@@ -291,7 +321,7 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) gdn_core(const Param
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
       const float zv = bf2f(zr[m][i]);
-      zg[m][i] = zv * __fdividef(1.f, 1.f + __expf(-zv));
+      zg[m][i] = zv * div_full(1.f, 1.f + tl_exp(-zv));
     }
   float Gv = gl;
 #pragma unroll
@@ -302,7 +332,7 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) gdn_core(const Param
   const float Gt0 = __shfl_sync(FULL, Gv, t0), Gt1 = __shfl_sync(FULL, Gv, t1);
   const float bt0 = __shfl_sync(FULL, beta, t0), bt1 = __shfl_sync(FULL, beta, t1);
   const float Gr = __shfl_sync(FULL, Gv, r), br = __shfl_sync(FULL, beta, r);
-  const float eG0 = __expf(Gt0), eG1 = __expf(Gt1);
+  const float eG0 = tl_exp(Gt0), eG1 = tl_exp(Gt1);
 
   // checkpoint products (all warps): rows v, columns = tokens; the key product on raw rows, scaled by 1/|k_t|
   float HQ[MT][4], HKs[MT][4];
@@ -338,9 +368,10 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) gdn_core(const Param
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
         const u32 wk = word(KR[c], i);
-        const float k0 = bflo(wk) * kmul, k1 = bfhi(wk) * kmul;
+        const float k0 = __fmul_rn(bflo(wk), kmul), k1 = __fmul_rn(bfhi(wk), kmul);
         kh[i] = pack2(k0, k1);
-        kl[i] = pack2(k0 - bflo(kh[i]), k1 - bfhi(kh[i]));
+        // the low part from the exact product, as Triton's fused k * rnorm - high
+        kl[i] = pack2(fmaf(bflo(wk), kmul, -bflo(kh[i])), fmaf(bfhi(wk), kmul, -bfhi(kh[i])));
       }
       U4 vh, vl;
       vh.x = kh[0]; vh.y = kh[1]; vh.z = kh[2]; vh.w = kh[3];
@@ -355,13 +386,13 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) gdn_core(const Param
     float kk[4] = {0.f, 0.f, 0.f, 0.f};
     kred(kk, KR, KR);
     const float ks = kmul;  // row s = r
-    s_A[r][t0] = (r > t0 && r < TT) ? br * __expf(Gr - Gt0) * (kk[0] * ks * km0) : 0.f;
-    s_A[r][t1] = (r > t1 && r < TT) ? br * __expf(Gr - Gt1) * (kk[1] * ks * km1) : 0.f;
+    s_A[r][t0] = (r > t0 && r < TT) ? br * tl_exp(Gr - Gt0) * (kk[0] * ks * km0) : 0.f;
+    s_A[r][t1] = (r > t1 && r < TT) ? br * tl_exp(Gr - Gt1) * (kk[1] * ks * km1) : 0.f;
   } else if (warp == 1) {
     float kq[4] = {0.f, 0.f, 0.f, 0.f};
     kred(kq, KR, QN);
-    s_F[r][t0] = (r <= t0 && t0 < TT) ? __expf(Gt0 - Gr) * (kq[0] * kmul) : 0.f;
-    s_F[r][t1] = (r <= t1 && t1 < TT) ? __expf(Gt1 - Gr) * (kq[1] * kmul) : 0.f;
+    s_F[r][t0] = (r <= t0 && t0 < TT) ? tl_exp(Gt0 - Gr) * (kq[0] * kmul) : 0.f;
+    s_F[r][t1] = (r <= t1 && t1 < TT) ? tl_exp(Gt1 - Gr) * (kq[1] * kmul) : 0.f;
   } else if ((warp == 2 || warp == 3) && hist > 0) {
     // scores[j][t] = khist_j . (q_t | k_t), j = 8 jt + 2q + i (rows j >= wp zero), rounded to BF16
     U4 KHh[4];
@@ -405,9 +436,9 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) gdn_core(const Param
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
       const float pj = __shfl_sync(FULL, gj, jj[i]);
-      dec[i] = jj[i] < hist ? __expf(gtot - pj) : 0.f;
+      dec[i] = jj[i] < hist ? tl_exp(gtot - pj) : 0.f;
     }
-    const float td = __expf(gtot);
+    const float td = tl_exp(gtot);
     const u16* dp = p.ring_d + rid * p.d_slot + (long long)hv * RING * VD;
     const u32 bq0 = s_sc[0][0][lane], bq1 = s_sc[0][1][lane];
     const u32 bk0 = s_sc[1][0][lane], bk1 = s_sc[1][1][lane];
