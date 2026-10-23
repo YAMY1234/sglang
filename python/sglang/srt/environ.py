@@ -1559,6 +1559,10 @@ class Envs:
     # by spinning on a non-blocking socket, as the multi-host leader mesh does, instead of
     # sleeping in a blocking recv.
     SGLANG_PERFLL_HOST_LINK_SPIN = EnvBool(False)
+    # The run_batch forward isolation's ScheduleBatch snapshot / restore and its 2-iter
+    # keep-alive record read the field values straight from the instance dict (one cached
+    # name tuple) instead of dataclasses.fields() + getattr / setattr per field, twice.
+    SGLANG_PERFLL_HOST_SB_SNAPSHOT = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
