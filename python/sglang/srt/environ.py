@@ -1264,6 +1264,18 @@ class Envs:
     # buffer about every period (random phase per rank) on its own default-priority stream while the ctl file reads 1
     # (2: the persistent kernel of SGLANG_PLB_SCATTER_CTAS, 32 if unset). "": off.
     SGLANG_PLB_FAKE_SCATTER = EnvStr("")
+    # PERF-ST: L2 prefetch of each verify layer's routed MoE FC1 weights (first N local experts, weights + block scales)
+    # from a side stream while the attention exit runs (st_l2_prefetch.py). PRE_AR / PRE_MLP: experts prefetched at the
+    # attention exit (before its AllReduce) / before the MoE (after the AllReduce + RMSNorm), 0 = none; MODE 0 bulk
+    # (cp.async.bulk.prefetch.L2), 1 per-line prefetch.global.L2, 2 bulk + evict_last; CTL: a file "<pre_ar> <pre_mlp>
+    # [mode]" re-read every 0.5 s (one CUDA graph serves every setting).
+    SGLANG_PST_L2PF = EnvBool(False)
+    SGLANG_PST_L2PF_PRE_AR = EnvInt(0)
+    SGLANG_PST_L2PF_PRE_MLP = EnvInt(0)
+    SGLANG_PST_L2PF_MODE = EnvInt(0)
+    SGLANG_PST_L2PF_CTAS = EnvInt(32)
+    SGLANG_PST_L2PF_MIN_ROWS = EnvInt(224)
+    SGLANG_PST_L2PF_CTL = EnvStr("")
     # Timing only: decode graph padding per block of Q35MF_AB_BLOCK target-verify rounds, the labels in turn
     # ("pow2": the smallest captured power of two); model_executor/runner_backend/ab_variants.py. Empty: off.
     SGLANG_TRTL17_PAD_AB = EnvTuple(())

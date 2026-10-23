@@ -59,6 +59,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.flashinfer_comm_fusion import uses_cutedsl_ar_fusion
 from sglang.srt.layers.joint_schema_head import JointSchemaHead, JointSchemaPooler
+from sglang.srt.layers import st_l2_prefetch
 from sglang.srt.layers.layer_boundary import (
     append_stages,
     declare_attn,
@@ -1214,6 +1215,8 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 hidden_states,
                 forward_batch,
             )
+            if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
+                st_l2_prefetch.prefetch_fc1(self.mlp.experts, forward_batch, 0, hs.shape[0])
 
         # Fully Connected
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
@@ -1221,6 +1224,8 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
 
         with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
+                if hs.shape[0] > 0:
+                    st_l2_prefetch.prefetch_fc1(self.mlp.experts, forward_batch, 1, hs.shape[0])
                 hidden_states = self.mlp(
                     hidden_states,
                     forward_batch,
@@ -1640,12 +1645,16 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
+            if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
+                st_l2_prefetch.prefetch_fc1(self.mlp.experts, forward_batch, 0, hs.shape[0])
 
         # Fully Connected
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
+                if hs.shape[0] > 0:
+                    st_l2_prefetch.prefetch_fc1(self.mlp.experts, forward_batch, 1, hs.shape[0])
                 hidden_states = self.mlp(
                     hidden_states,
                     forward_batch,
@@ -1940,6 +1949,8 @@ class Qwen3_5ForCausalLM(nn.Module):
                     input_deepstack_embeds[:, sep : sep + self.hidden_size],
                 )
 
+        # The FC1 L2 prefetch side stream (SGLANG_PST_L2PF) rejoins after the last layer.
+        st_l2_prefetch.join()
         if not self.pp_group.is_last_rank:
             return residual_batch.to_pp(hidden_states, forward_batch)
 
