@@ -42,31 +42,49 @@ __device__ __forceinline__ void line_pf(const char* p) {
   asm volatile("prefetch.global.L2 [%0];" :: "l"(p) : "memory");
 }
 
-// ctl[slot]: experts to prefetch (<= 0: nothing); ctl[3]: mode. One region pair (weights, block scales).
+// ctl[slot]: experts' worth of bytes to prefetch (<= 0: nothing); ctl[3]: mode = instruction (bits 0-1: 0 bulk
+// cp.async.bulk.prefetch.L2, 1 prefetch.global.L2 per 128-byte line, 2 bulk + evict_last) | 4: the last experts instead
+// of the first | 8: spread, the same bytes as the first n / units of every expert. One region pair (weights, block scales).
+__device__ __forceinline__ void pf_range(const char* p, u64 bytes, u64 tid, u64 nth, int ins, u64 pol) {
+  if (ins == 1) {
+#pragma unroll 4
+    for (u64 off = tid * 128; off < bytes; off += nth * 128) line_pf(p + off);
+  } else {
+    const u64 chunk = 32768;
+#pragma unroll 1
+    for (u64 off = tid * chunk; off < bytes; off += nth * chunk) {
+      u64 sz = bytes - off < chunk ? bytes - off : chunk;
+      sz &= ~(u64)15;
+      if (sz == 0) continue;
+      if (ins == 2) bulk_pf_last(p + off, (unsigned)sz, pol); else bulk_pf(p + off, (unsigned)sz);
+    }
+  }
+}
+
 extern "C" __global__ void pst_l2pf(Region w, Region s, const volatile int* ctl, int slot) {
   const int n = ctl[slot];
   if (n <= 0) return;
   const int mode = ctl[3];
+  const int ins = mode & 3;
   const u64 tid = (u64)blockIdx.x * blockDim.x + threadIdx.x;
   const u64 nth = (u64)gridDim.x * blockDim.x;
   u64 pol = 0;
-  if (mode == 2) asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(pol));
+  if (ins == 2) asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(pol));
 #pragma unroll 1
   for (int r = 0; r < 2; ++r) {
     const Region& g = r == 0 ? w : s;
-    const u64 bytes = (n < (long long)g.units ? (u64)n : g.units) * g.unit;
-    if (mode == 1) {
-#pragma unroll 4
-      for (u64 off = tid * 128; off < bytes; off += nth * 128) line_pf(g.ptr + off);
-    } else {
-      const u64 chunk = 32768;
+    if (g.units == 0) continue;
+    const u64 cnt = (u64)n < g.units ? (u64)n : g.units;
+    if (mode & 8) {
+      // the first cnt / units of every expert: one range an expert, experts spread over the threads
+      const u64 per = ((g.unit * cnt / g.units) + 15) & ~(u64)15;
+      const u64 tpe = nth >= g.units ? nth / g.units : 1;  // threads an expert
 #pragma unroll 1
-      for (u64 off = tid * chunk; off < bytes; off += nth * chunk) {
-        u64 sz = bytes - off < chunk ? bytes - off : chunk;
-        sz &= ~(u64)15;
-        if (sz == 0) continue;
-        if (mode == 2) bulk_pf_last(g.ptr + off, (unsigned)sz, pol); else bulk_pf(g.ptr + off, (unsigned)sz);
-      }
+      for (u64 e = tid / tpe; e < g.units; e += (nth / tpe > 0 ? nth / tpe : 1))
+        pf_range(g.ptr + e * g.unit, per, tid % tpe, tpe, ins, pol);
+    } else {
+      const u64 first = (mode & 4) ? g.units - cnt : 0;
+      pf_range(g.ptr + first * g.unit, cnt * g.unit, tid, nth, ins, pol);
     }
   }
 }
