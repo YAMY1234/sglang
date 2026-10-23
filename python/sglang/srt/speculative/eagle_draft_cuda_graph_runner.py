@@ -14,7 +14,10 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
-from sglang.srt.megakernels.runtime import megakernel_graph_variants
+from sglang.srt.megakernels.runtime import (
+    megakernel_graph_variants,
+    megakernel_variant_sizes,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -288,7 +291,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         self.attention_graph_variants = megakernel_graph_variants(
             model_runner.model, "draft_loop", batch_sizes=self.megakernel_served
         )
-        self.attention_variant_sizes = self.megakernel_served
+        self.attention_variant_sizes = megakernel_variant_sizes(
+            self.attention_graph_variants, self.megakernel_served
+        )
 
         self.backend = resolve_decode_backend(self)
 
