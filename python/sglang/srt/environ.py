@@ -1765,6 +1765,10 @@ class Envs:
     # through a JIT small-field copy plan cached per destination layout, ahead of the Triton
     # small_copy whose per-call checks and launch cost ~100 us of host time.
     SGLANG_PERFLL_HOST_FIELD_COPY = EnvBool(False)
+    # The two-host leader link of the EDGE exchange (SGLANG_Q35MF_EDGE_MULTIHOST_TCP) receives
+    # by spinning on a non-blocking socket, as the multi-host leader mesh does, instead of
+    # sleeping in a blocking recv.
+    SGLANG_PERFLL_HOST_LINK_SPIN = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
