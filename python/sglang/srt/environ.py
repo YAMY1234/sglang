@@ -1551,6 +1551,10 @@ class Envs:
     # The scheduler's main thread on two reserved cores of its NUMA node, the process's other
     # threads off them (utils/perfll_host.py).
     SGLANG_PERFLL_HOST_PIN_MAIN = EnvBool(False)
+    # Graph-input staging (_grouped_foreach_copy_ of the decode / draft / draft-extend runners)
+    # through a JIT small-field copy plan cached per destination layout, ahead of the Triton
+    # small_copy whose per-call checks and launch cost ~100 us of host time.
+    SGLANG_PERFLL_HOST_FIELD_COPY = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
