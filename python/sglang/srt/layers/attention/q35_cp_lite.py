@@ -626,9 +626,10 @@ class CpLite:
         self.llq_off = self.f_off + _KINDS * _MAX_ROWS * cp * 4
         self.llp_off = self.llq_off + _MAX_ROWS * cp * (q_heads * HEAD_DIM // 4) * 8
         total = self.llp_off + _MAX_ROWS * cp * _LL_PWORDS * 8
+        self.cp_ungated = envs.SGLANG_TRTL18_CP_UNGATED.get()
         self.merge_h = envs.SGLANG_TRTL18_CP_MAIN.get() and envs.SGLANG_TRTL18_CP_MERGE_H.get()
         self.llh_off = total
-        if self.merge_h:
+        if self.merge_h or self.cp_ungated:
             total += _MAX_ROWS * cp * _LL_PWORDS * 8
         self.ll = envs.SGLANG_TRTL1_ATTN_CP_LL.get() and q_heads * HEAD_DIM // 2 + q_heads <= _LL_PWORDS
         self.cnt = torch.zeros(_KINDS, _MAX_ROWS, dtype=torch.int32, device=self.device)
@@ -686,7 +687,8 @@ class CpLite:
         )
         logger.info("TRT-L1 CP-lite exact (prefix-only fused partial + fp32 causal block): %s", self.exact)
         logger.info("TRT-L18 CP-lite gated exact calls: CP on the current stream, stock after the partial: %s, PDL %s, "
-                    "per-head merge %s", self.cp_main, self.cp_pdl, self.merge_h)
+                    "per-head merge %s; ungated exact calls with PDL and the per-head merge: %s", self.cp_main,
+                    self.cp_pdl, self.merge_h, self.cp_ungated)
         logger.info(
             "TRT-L1 CP-lite KV gate: min KV per request %s (%s of the batch)",
             self.min_kv or "off", "max" if self.gate_max else "mean",
@@ -796,6 +798,9 @@ class CpLite:
         if thr is not None and self.gate_overlap:
             return self._gated_overlap(q, k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale,
                                        bmm2_scale, forward_batch, layer.layer_id, stock, gate, exact)
+        if exact and thr is None and self.ll and self.cp_ungated:
+            return self._ungated_main(q, k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale,
+                                      bmm2_scale, gate)
         if self.ll:
             _cp_gather_q_ll[(rows,)](
                 q.view(torch.int32), words, self.peers, self.me, self.llq_off, self.q_all.view(torch.int32),
@@ -922,7 +927,25 @@ class CpLite:
         main.wait_stream(self._side)
         return out
 
-    def _merge_h(self, q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale, out, gate):
+    def _ungated_main(self, q, k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale, gate):
+        """Ungated exact call (TRT-L18): gather (releases at entry), fused partial as a programmatic dependent on the
+        prefix lengths it derives from seq_lens, then the per-(row, head) merge."""
+        words = self.hq * HEAD_DIM // 4
+        _cp_gather_q_ll[(rows,)](
+            q.view(torch.int32), words, self.peers, self.me, self.llq_off, self.q_all.view(torch.int32),
+            self.cnt[0], seq_lens, self.pre_lens, self.stock_lens, **gate,
+            CP=self.cp, WORDS=words, QL=q_len, FOLD=True, GWRITE=False, TRIG=True, num_warps=4,
+        )
+        self._exact_partial(k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale,
+                            pdl=True, len_sub=q_len)
+        out = torch.empty(rows, self.hq, HEAD_DIM, dtype=torch.bfloat16, device=self.device)
+        self._merge_h(q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale, out,
+                      dict(gate, thr=0), pdl=True)
+        return out
+
+    def _merge_h(self, q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale, out, gate,
+                 pdl=None):
+        pdl = self.cp_pdl if pdl is None else pdl
         hq = self.hq
         _cp_merge_h_ll[(rows, hq)](
             self.po_x.view(torch.int32), self.pl_x.view(torch.int32), hq * HEAD_DIM // 2, self.po_x.stride(0) // 2,
@@ -930,8 +953,7 @@ class CpLite:
             page_table, page_table.stride(0), seq_lens, out, out.stride(0), self.peers, self.me, self.llh_off,
             self.cnt_h, bmm1_scale, bmm2_scale, gate["nb"], gate["thr"],
             QL=q_len, HQ=hq, CP=self.cp, D=HEAD_DIM, PG=PAGE, NWP=_LL_PWORDS, NB=gate["NB"], GMAX=gate["GMAX"],
-            WAIT=self.cp_pdl, num_warps=4,
-            launch_pdl=self.cp_pdl,
+            WAIT=pdl, num_warps=4, launch_pdl=pdl,
         )
 
     def _own_workspace(self):
@@ -975,7 +997,7 @@ class CpLite:
         return out
 
     def _exact_partial(self, k_cache, v_cache, page_table, pre_lens, q_len, b, rows, bmm1_scale, bmm2_scale,
-                       pdl=False):
+                       pdl=False, len_sub=0):
         from sglang.srt.layers.attention import q35_cp_fused as F
 
         cp, hq = self.cp, self.hq
@@ -996,6 +1018,7 @@ class CpLite:
             v_pool=v_cache,
             p_shift=_EXACT_P_SHIFT,
             rescale_threshold=_EXACT_RESCALE_THRESHOLD,
+            len_sub=len_sub,
         )
 
     def _exact_merge(self, q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale, out, gate):
