@@ -38,7 +38,7 @@ from sglang.srt.speculative.spec_utils import (
     record_stream_each,
     record_stream_for_v2_verify,
 )
-from sglang.srt.utils import host_trace, is_cpu
+from sglang.srt.utils import host_trace, is_cpu, perfll_host
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -619,7 +619,7 @@ def run_eagle_verify(
         if plan_stream is not None:
             # Verify prep copies draft-produced tree metadata on the plan stream,
             # so it must not start before the draft frontier.
-            plan_stream.wait_stream(fwd_stream)
+            perfll_host.wait_stream(plan_stream, fwd_stream)
         verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
             verify_input,
             req_to_token_pool,
@@ -632,7 +632,9 @@ def run_eagle_verify(
 
     # Correct some buffers due to the overlap plan
     if plan_stream:
-        torch.get_device_module(device).current_stream().wait_stream(plan_stream)
+        perfll_host.wait_stream(
+            torch.get_device_module(device).current_stream(), plan_stream
+        )
         if host_trace.ENABLED:
             host_trace.mark(host_trace.VPD)
         if (

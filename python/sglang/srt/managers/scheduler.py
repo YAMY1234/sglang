@@ -4701,7 +4701,7 @@ class Scheduler(
                     host_trace.mark(host_trace.RB2)
 
                 with self.forward_stream_ctx:
-                    self.forward_stream.wait_stream(self.schedule_stream)
+                    perfll_host.wait_stream(self.forward_stream, self.schedule_stream)
                     if host_trace.ENABLED:
                         host_trace.mark(host_trace.RB3)
                     if gpu_only_lens:
@@ -4770,7 +4770,9 @@ class Scheduler(
                                 batch.out_cache_loc,
                             )
                         # FIXME(lsyin): maybe move this to forward_batch_generation
-                        batch_result.copy_done = self.device_module.Event()
+                        batch_result.copy_done = perfll_host.copy_done_event(
+                            self.device_module
+                        )
                         if host_trace.ENABLED:
                             host_trace.mark(host_trace.RB6)
                         if batch_result.delay_sample_func is None:
@@ -5087,7 +5089,7 @@ class Scheduler(
             return_logprob=batch.return_logprob,
             return_hidden_states=batch.return_hidden_states,
         )
-        self.copy_stream.wait_stream(self.forward_stream)
+        perfll_host.wait_stream(self.copy_stream, self.forward_stream)
         with self.copy_stream_ctx:
             if not self.enable_async_d2h_copy:
                 copy_fn()
