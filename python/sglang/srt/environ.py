@@ -1712,6 +1712,10 @@ class Envs:
     # into ~16 parts at TP8 instead of one program looping over it), and the cross-rank / cross-part max
     # with the token-id decode in one kernel after the exchange. Same tokens bit for bit.
     SGLANG_PERFLL_VERIFY_KEY_SPLIT = EnvBool(False)
+    # SGLANG_Q35MF_SHARDED_VERIFY's key exchange for <= 64 rows as one launch with no barrier: every
+    # rank folds its keys per row and multicasts them as epoch-tagged 64-bit words into three rotating
+    # slots of a symmetric buffer, then polls its own copy until every rank's words carry the epoch.
+    SGLANG_PERFLL_VERIFY_LL_KEYS = EnvBool(False)
     # The TRT-LLM MHA multi-step draft graph's attention metadata: one page table for every
     # step, written once at the last step's length, and the other steps' sequence lengths in
     # one launch (the steps read the same values). No SWA, no unified pool.
