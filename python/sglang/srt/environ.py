@@ -1230,6 +1230,9 @@ class Envs:
     # PERF-LB: chunk rows only on a ragged batch: longest owned length x B >= this x the total (one row per request
     # otherwise). 0: every batch.
     SGLANG_PLB_CP_FOLD_RAGGED = EnvFloat(1.8)
+    # With CP_UNGATED: the q gather of an ungated exact call launches as a programmatic dependent of the kernel that
+    # wrote q (it releases the fused partial, then waits), so the partial's prefix KV requests start under that kernel.
+    SGLANG_PERFLL_CP_GATHER_PDL = EnvBool(False)
     # Timing only: decode graph padding per block of Q35MF_AB_BLOCK target-verify rounds, the labels in turn
     # ("pow2": the smallest captured power of two); model_executor/runner_backend/ab_variants.py. Empty: off.
     SGLANG_TRTL17_PAD_AB = EnvTuple(())
