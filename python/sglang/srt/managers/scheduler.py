@@ -4084,6 +4084,22 @@ class Scheduler(
             dynamic_size = self.dynamic_chunk_sizer.predict(history_len)
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
+        max_prefill_tokens = self.max_prefill_tokens
+        latency_tokens = envs.SGLANG_TRTL12_SPF_LATENCY_TOKENS.get()
+        if (
+            latency_tokens > 0
+            and len(self.waiting_queue) + (self.chunked_req is not None) > 1
+            and any(
+                SchedulePolicy._shortest_prefill_work(r)
+                <= envs.SGLANG_TRTL12_SPF_SHORT_TOKENS.get()
+                for r in self.waiting_queue
+            )
+        ):
+            latency_tokens = max(
+                self.page_size, latency_tokens // self.page_size * self.page_size
+            )
+            chunked_prefill_size = min(chunked_prefill_size, latency_tokens)
+            max_prefill_tokens = min(max_prefill_tokens, latency_tokens)
 
         # Prefill policy
         # Get BLOCK_M from the backend for tile-budget admission logic
@@ -4099,7 +4115,7 @@ class Scheduler(
             self.token_to_kv_pool_allocator,
             running_batch,
             self.new_token_ratio_tracker.current,
-            self.max_prefill_tokens,
+            max_prefill_tokens,
             chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,

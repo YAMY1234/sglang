@@ -1523,6 +1523,12 @@ class Envs:
     # seconds in the prefill waiting queue goes ahead of the shortest-first order, oldest first
     # (TRT-LLM's TRTLLM_CTX_SCHED_SRPT_AGE_S). 0 disables it.
     SGLANG_TRTL12_SPF_AGE_S = EnvFloat(0.0)
+    # While a request needing at most SGLANG_TRTL12_SPF_SHORT_TOKENS of prefill waits next to
+    # other work, cap a prefill batch at this many tokens, so the short request does not ride
+    # in a full-budget chunk of a long prefill (TRT-LLM's TRTLLM_CTX_SCHED_SRPT_LATENCY_TOKENS).
+    # 0 disables it.
+    SGLANG_TRTL12_SPF_LATENCY_TOKENS = EnvInt(0)
+    SGLANG_TRTL12_SPF_SHORT_TOKENS = EnvInt(4096)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
