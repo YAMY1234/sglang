@@ -1356,6 +1356,10 @@ class Envs:
     SGLANG_PLB_STREAM_PRIORITY = EnvInt(0)
     # PERF-LB: the PD staging scatter as a persistent kernel of this many CTAs (0: one CTA per 1024 elements).
     SGLANG_PLB_SCATTER_CTAS = EnvInt(0)
+    # PERF-LB: PD staging scatters wait for the scheduler, which launches them on the forward stream right before its
+    # next batch: a rank's scatter lands between two forwards (not under another rank's collective), and ranks whose
+    # chunks arrive in the same round take the delay together.
+    SGLANG_PLB_SCATTER_DEFER = EnvBool(False)
     # PERF-LB static-bench probe: "<period_ms>:<MB>:<ctl file>": a thread per rank scatters MB from a dummy staging
     # buffer about every period (random phase per rank) on its own default-priority stream while the ctl file reads 1
     # (2: the persistent kernel of SGLANG_PLB_SCATTER_CTAS, 32 if unset). "": off.

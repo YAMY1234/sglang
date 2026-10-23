@@ -205,14 +205,16 @@ def _launch_scatter(layer_ptrs, page_idx, staging_typed, head_offsets, num_token
 
 
 _FAKE_SCATTER_ON = False
+_FAKE_SCATTER_KEEP: list = []  # the probe's buffers: the kernel only gets raw pointers, so they must outlive the thread
 
 
-def start_fake_scatter(device, gpu_id: int, tp_rank: int) -> None:
+def start_fake_scatter(device, gpu_id: int, tp_rank: int, forward_stream=None) -> None:
     """SGLANG_PLB_FAKE_SCATTER "<period_ms>:<MB>:<ctl file>" (static-bench probe of the PD staging scatter): a daemon
     thread scatters MB (15 layers x K/V, one 256-element head per token, 64-token pages) from a dummy staging buffer
-    into dummy layer buffers about every period (x U(0.5, 1.5), seeded by the TP rank) on its own default-priority
-    stream, as the decode thread does; ctl file "1": the stock kernel, "2": persistent (SGLANG_PLB_SCATTER_CTAS or
-    32), anything else / missing: idle."""
+    into dummy layer buffers once per period-long wall-clock slot, at a per-rank offset in [0, 8 ms) (seeded by slot and
+    rank: chunk arrivals reach the ranks a few ms apart). ctl file "1": stock kernel on its own default-priority stream
+    (as the decode thread does), "2": the persistent kernel (SGLANG_PLB_SCATTER_CTAS or 32) on that stream, "3": stock
+    kernel enqueued on the forward stream (between two graph replays, as SGLANG_PLB_SCATTER_DEFER), else idle."""
     import random
     import time
 
@@ -229,34 +231,53 @@ def start_fake_scatter(device, gpu_id: int, tp_rank: int) -> None:
     layer_ptrs = torch.tensor([t.data_ptr() for t in layers], dtype=torch.int64, device=device)
     pages = torch.randperm(tokens // page, device=device).to(torch.int32)
     heads = torch.zeros(1, dtype=torch.int64, device=device)
-    stream = torch.cuda.Stream(device=device)
+    _FAKE_SCATTER_KEEP.extend([staging, layers, layer_ptrs, pages, heads])
+    side = torch.cuda.Stream(device=device)
     ctas = envs.SGLANG_PLB_SCATTER_CTAS.get() or 32
-    rng = random.Random(1000 + tp_rank)
 
     def loop():
         torch.cuda.set_device(gpu_id)
         n = 0
         while True:
-            time.sleep(period * rng.uniform(0.5, 1.5))
+            slot = int(time.time() / period) + 1
+            when = slot * period + random.Random(slot * 1009 + tp_rank).uniform(0.0, 0.008)
+            time.sleep(max(0.0, when - time.time()))
             try:
                 with open(ctl) as f:
                     mode = f.read().strip()
             except OSError:
                 mode = "0"
-            if mode not in ("1", "2"):
+            if mode not in ("1", "2", "3"):
                 continue
+            stream = forward_stream if mode == "3" and forward_stream is not None else side
             with torch.cuda.stream(stream):
                 _launch_scatter(layer_ptrs, pages, staging, heads, tokens, ept, tokens * ept, ept, page, lx2, 1,
-                                0 if mode == "1" else ctas)
-            stream.synchronize()
+                                ctas if mode == "2" else 0)
+                done = torch.cuda.Event()
+                done.record(stream)
+            done.synchronize()
             n += 1
             if n % 500 == 1:
                 logger.info("PERF-LB fake scatter: %d scatters of %d tokens (%.0f MB), mode %s, tp rank %d", n,
                             tokens, tokens * lx2 * ept / 2**20, mode, tp_rank)
 
     threading.Thread(target=loop, name="plb-fake-scatter", daemon=True).start()
-    logger.info("PERF-LB fake scatter armed: every ~%.0f ms, %d tokens (%.0f MB), ctl %s, persistent CTAs %d, tp rank %d",
-                period * 1e3, tokens, tokens * lx2 * ept / 2**20, ctl, ctas, tp_rank)
+    logger.info("PERF-LB fake scatter armed: one per %.0f ms slot (+0-8 ms per rank), %d tokens (%.0f MB), ctl %s, "
+                "persistent CTAs %d, tp rank %d", period * 1e3, tokens, tokens * lx2 * ept / 2**20, ctl, ctas, tp_rank)
+
+
+_PLB_DEV_I64: dict = {}
+
+
+def _plb_dev_i64(key, values, device) -> torch.Tensor:
+    """A cached int64 device tensor of ``values`` (SGLANG_PLB_SCATTER_DEFER): the scatter then issues no pageable H2D
+    copy on the forward stream (that copy would wait for the in-flight forward). Built on a private idle stream."""
+    t = _PLB_DEV_I64.get(key)
+    if t is None:
+        with torch.cuda.stream(torch.cuda.Stream(device=device)):
+            t = torch.tensor(values, dtype=torch.int64, device=device)
+        _PLB_DEV_I64[key] = t
+    return t
 
 
 class StagingBuffer:
@@ -799,26 +820,24 @@ def _scatter_staging_to_kv_triton(
     elems_per_token = num_heads * head_dim
     per_layer_elems = num_tokens * elems_per_token
 
-    layer_ptrs = make_ptr_table(
-        [buf.data_ptr() for buf in k_buffers] + [buf.data_ptr() for buf in v_buffers],
-        device=device,
-    )
-
-    writer_head_offsets = torch.tensor(
-        [
-            compute_head_slice_params(
-                prefill_attn_tp_size,
-                decode_attn_tp_size,
-                wr,
-                dst_tp_rank,
-                total_kv_heads,
-            )[2]
-            * head_dim
-            for wr in range(num_writers)
-        ],
-        dtype=torch.int64,
-        device=device,
-    )
+    ptrs = [buf.data_ptr() for buf in k_buffers] + [buf.data_ptr() for buf in v_buffers]
+    offs = [
+        compute_head_slice_params(
+            prefill_attn_tp_size,
+            decode_attn_tp_size,
+            wr,
+            dst_tp_rank,
+            total_kv_heads,
+        )[2]
+        * head_dim
+        for wr in range(num_writers)
+    ]
+    if envs.SGLANG_PLB_SCATTER_DEFER.get():
+        layer_ptrs = _plb_dev_i64(("ptrs", *ptrs), ptrs, device)
+        writer_head_offsets = _plb_dev_i64(("offs", *offs), offs, device)
+    else:
+        layer_ptrs = make_ptr_table(ptrs, device=device)
+        writer_head_offsets = torch.tensor(offs, dtype=torch.int64, device=device)
 
     int_dtype_map = {1: torch.int8, 2: torch.int16, 4: torch.int32}
     int_dtype = int_dtype_map.get(dtype_size, torch.int16)

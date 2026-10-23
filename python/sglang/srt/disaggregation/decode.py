@@ -3333,6 +3333,7 @@ class SchedulerDisaggregationDecodeMixin:
                 batch, chunked_req=self.chunked_req
             )
             self.cur_batch_for_debug = batch
+            self._plb_flush_scatters()
 
             # Launch the current batch
             if batch:
@@ -3401,6 +3402,7 @@ class SchedulerDisaggregationDecodeMixin:
 
             if disable_overlap_for_batch and self.last_batch:
                 pop_and_process()
+            self._plb_flush_scatters()
             if ls is not None:
                 ls.mark("nb")
 
@@ -3440,6 +3442,13 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Update last_batch
             self.last_batch = batch
+
+    def _plb_flush_scatters(self: Scheduler) -> None:
+        """SGLANG_PLB_SCATTER_DEFER: the staging scatters of chunks that arrived since the last batch go onto the
+        forward stream now, between the previous forward and the next one (see DecodeStagingHandler.plb_flush)."""
+        handler = self.disagg_decode_transfer_queue.staging_handler
+        if handler is not None and handler.plb_pending:
+            handler.plb_flush(self.forward_stream)
 
     def _run_batch_prebuilt(
         self: Scheduler, batch: ScheduleBatch

@@ -8,6 +8,7 @@ protocol code is at the bottom.
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 import logging
 import struct
@@ -122,6 +123,10 @@ class DecodeStagingHandler:
         )
         self.device_module = torch.get_device_module(self.device)
         self.gpu_id = self.device.index
+        # PERF-LB (SGLANG_PLB_SCATTER_DEFER): complete chunks queue here (decode_thread) until the scheduler's plb_flush
+        # submits them on the forward stream (main thread).
+        self.plb_defer = envs.SGLANG_PLB_SCATTER_DEFER.get()
+        self.plb_pending: collections.deque = collections.deque()
 
     def register_wm_subscriber(self, receiver, session_id: str) -> None:
         """Register a prefill's bootstrap connection for watermark broadcasts."""
@@ -251,6 +256,10 @@ class DecodeStagingHandler:
         stream = self.staging_allocator._scatter_stream
         if stream is not None:
             stream.synchronize()
+        if self.plb_defer:
+            # deferred scatters ran on the forward stream (submitted on this thread, so all have their event)
+            for event, _alloc_id in decode_req._chunk_events:
+                event.synchronize()
         chunk_infos = receiver.chunk_staging_infos if receiver is not None else []
         unscattered_allocs = []
         for chunk_idx, info in enumerate(chunk_infos):
@@ -274,8 +283,18 @@ class DecodeStagingHandler:
     # Scatter submission: called from decode_thread (background)
     # ------------------------------------------------------------------
 
+    def plb_flush(self, stream) -> None:
+        """SGLANG_PLB_SCATTER_DEFER: submit the queued chunk scatters on ``stream`` (main thread, before a forward)."""
+        while self.plb_pending:
+            self.submit_chunk_scatter(*self.plb_pending.popleft(), stream=stream)
+
     def submit_chunk_scatter(
-        self, room: int, chunk_idx: int, page_start: int, num_pages: int
+        self,
+        room: int,
+        chunk_idx: int,
+        page_start: int,
+        num_pages: int,
+        stream=None,
     ) -> bool:
         """Submit scatter for an intermediate chunk whose writers all arrived.
 
@@ -307,11 +326,11 @@ class DecodeStagingHandler:
 
         try:
             ok = self._scatter_region(
-                staging_offset, page_start, num_pages, decode_req, receiver
+                staging_offset, page_start, num_pages, decode_req, receiver, stream
             )
             if ok:
                 event = create_device_event(self.device)
-                event.record(self.staging_allocator._scatter_stream)
+                event.record(stream if stream is not None else self.staging_allocator._scatter_stream)
                 # Append before zeroing so the completion check always sees either
                 # the slot or the event.
                 decode_req._chunk_events.append((event, alloc_id))
@@ -366,7 +385,10 @@ class DecodeStagingHandler:
         arrivals.append((page_start, num_pages, writer_id))
         num_writers = self.num_writers_for(receiver)
         if len(arrivals) >= num_writers:
-            self.submit_chunk_scatter(room, chunk_idx, page_start, num_pages)
+            if self.plb_defer:
+                self.plb_pending.append((room, chunk_idx, page_start, num_pages))
+            else:
+                self.submit_chunk_scatter(room, chunk_idx, page_start, num_pages)
             del room_counts[chunk_idx]
             return True
         return False
@@ -449,8 +471,9 @@ class DecodeStagingHandler:
         num_pages: int,
         decode_req: DecodeRequest,
         receiver,
+        stream=None,
     ) -> bool:
-        """Submit scatter kernels for a staging region to scatter_stream.
+        """Submit scatter kernels for a staging region to scatter_stream (``stream`` if given).
 
         May be called from the decode_thread (background).
         """
@@ -468,7 +491,7 @@ class DecodeStagingHandler:
         if self.staging_allocator._scatter_stream is None:
             self.staging_allocator._scatter_stream = create_device_stream(self.device)
 
-        scatter_stream = self.staging_allocator._scatter_stream
+        scatter_stream = stream if stream is not None else self.staging_allocator._scatter_stream
         if decode_req._req_to_token_ready is not None:
             scatter_stream.wait_event(decode_req._req_to_token_ready)
 
