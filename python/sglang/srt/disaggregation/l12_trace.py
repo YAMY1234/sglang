@@ -106,3 +106,29 @@ def log_prefill_batch(batch, t0: float, t1: float, t2: float, nwait: int, ninfl:
         nwait,
         ninfl,
     )
+
+
+def log_prefill_loop(t0: float, marks: Dict[str, float], bs: int, nwait: int, ninfl: int) -> None:
+    """Sub-phases of one prefill loop iteration that ran a batch (P TP0); now = inflight queue processed."""
+    logger.info(
+        "L12T PL t0=%.4f %s t4=%.4f bs=%d wait=%d infl=%d",
+        t0,
+        " ".join(f"{k}={v:.4f}" for k, v in marks.items()),
+        time.time(),
+        bs,
+        nwait,
+        ninfl,
+    )
+
+
+def log_dispatch(tokenized_obj) -> None:
+    """API-server side of one request: created / dispatch start / dispatch end (wall clock), keyed by bootstrap_room."""
+    ts = tokenized_obj.time_stats
+    logger.info(
+        "L12T T room=%s in=%d ct=%s d0=%s d1=%s",
+        tokenized_obj.bootstrap_room,
+        len(tokenized_obj.input_ids),
+        _w(getattr(ts, "created_time", 0.0)),
+        _w(getattr(ts, "api_server_dispatch_time", 0.0)),
+        _w(getattr(ts, "api_server_dispatch_finish_time", 0.0)),
+    )
