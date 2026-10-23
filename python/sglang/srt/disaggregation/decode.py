@@ -413,6 +413,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.gloo_group = parallel.attn_tp_group.cpu_group
         # Destinations visible to prefill but not yet on the transfer queue.
         self._num_published_destinations = 0
+        # (decode_req, host index tensors, has_state, metadata kwargs, copy-done event)
+        self._deferred_sends: deque = deque()
+        self._defer_send = envs.SGLANG_TRTL16_DEFER_METADATA_SEND.get()
         self.tp_rank = parallel.tp_rank
         self.gpu_id = gpu_id
         self.bootstrap_port = bootstrap_port
@@ -985,6 +988,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def release_memory_occupation(self):
         self._cancel_prefill_dp_rank_queries()
         self.queue.clear()
+        self._deferred_sends.clear()
         for req in self.retracted_queue:
             discard_kv_cache_backup(
                 req,
@@ -1760,6 +1764,27 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     )
                 )
             t_sd = l16_loopstat._now() if ls is not None else 0
+            if (
+                self._defer_send
+                and set(state_types) <= {StateType.MAMBA}
+                and not self.scheduler.enable_hisparse
+                and not _is_fake_transfer(decode_req.req)
+            ):
+                self._defer_kv_metadata(
+                    decode_req,
+                    kv_indices,
+                    kv_transfer_page_size,
+                    has_state=bool(state_types),
+                    metadata_kwargs={"decode_prefix_len": total_prefix_len},
+                )
+                if ls is not None:
+                    ls.add("pp_send", t_sd)
+                num_device_preallocated += 1
+                preallocated_reqs.append(decode_req)
+                indices_to_remove.add(i)
+                if self.scheduler.enable_lora:
+                    running_loras.add(decode_req.req.lora_id)
+                continue
             state_indices: Optional[List] = [
                 payloads[st]() if st in payloads else None for st in state_types
             ]
@@ -1822,6 +1847,71 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         ]
 
         return preallocated_reqs, failed_reqs
+
+    def _defer_kv_metadata(
+        self, decode_req, kv_indices, page_size, *, has_state: bool, metadata_kwargs
+    ) -> None:
+        """Start non-blocking host copies of the transfer indices; send later.
+
+        Everything else of _send_kv_metadata (metadata slot, staging registration,
+        published-destination count) happens now, so the transfer queue entry is
+        identical on every rank; only the socket send moves to a later poll.
+        """
+        decode_req.metadata_buffer_index = (
+            self.req_to_metadata_buffer_idx_allocator.alloc()
+        )
+        assert decode_req.metadata_buffer_index is not None
+        gpu = [kv_indices[::page_size] // page_size]
+        if has_state:
+            gpu.append(
+                self.req_to_token_pool.translate_mamba_indices(
+                    self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                        decode_req.req.kv.req_pool_idx
+                    ]
+                )
+            )
+        host = []
+        for t in gpu:
+            h = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+            h.copy_(t, non_blocking=True)
+            host.append(h)
+        done = torch.cuda.Event()
+        done.record()
+        if (
+            self.transfer_queue.enable_staging
+            and hasattr(decode_req.kv_receiver, "require_staging")
+            and decode_req.kv_receiver.require_staging
+        ):
+            self.transfer_queue.staging_handler.register_decode_req(
+                decode_req.req.bootstrap_room, decode_req
+            )
+        self._deferred_sends.append(
+            (decode_req, host, has_state, metadata_kwargs, done)
+        )
+        self._num_published_destinations += 1
+        decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
+
+    def flush_deferred_sends(self) -> None:
+        """Send the metadata whose host index copies have landed (FIFO, one stream)."""
+        while self._deferred_sends and self._deferred_sends[0][4].query():
+            decode_req, host, has_state, metadata_kwargs, _ = (
+                self._deferred_sends.popleft()
+            )
+            if decode_req.kv_receiver is None or isinstance(
+                decode_req.req.finished_reason, FINISH_ABORT
+            ):
+                continue
+            decode_req.kv_receiver.send_metadata(
+                host[0].numpy().astype(np.int32),
+                decode_req.metadata_buffer_index,
+                [[host[1].numpy()]] if has_state else [],
+                **metadata_kwargs,
+            )
+            if (
+                decode_req.is_rebootstrap
+                and get_disagg().disaggregation_decode_allocation_policy == "early"
+            ):
+                self._submit_prefill_recompute(decode_req)
 
     def _send_kv_metadata(
         self, decode_req, kv_indices, page_size, state_indices=None, **metadata_kwargs
@@ -3403,6 +3493,7 @@ class SchedulerDisaggregationDecodeMixin:
         # Resolve held releases every iteration (before the retraction/polling
         # gates below) so their timeouts fire under memory pressure.
         self.disagg_decode_transfer_queue.resolve_deferred_releases()
+        self.disagg_decode_prealloc_queue.flush_deferred_sends()
         if ls is not None:
             ls.add("pq_rel", t0)
             t0 = l16_loopstat._now()
