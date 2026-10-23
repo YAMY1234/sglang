@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 import os
 import random
+import time
 from collections import Counter
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -404,6 +405,24 @@ class SchedulePolicy:
         waiting_queue: List[Req], temporary_deprioritized: Set[int]
     ) -> None:
         # Prioritize short uncached prefills while deferring duplicate prefixes.
+        age_s = envs.SGLANG_TRTL12_SPF_AGE_S.get()
+        if age_s > 0:
+            # Requests that waited longer than age_s go first, oldest first, so a long
+            # prefill cannot be starved by a steady stream of shorter ones.
+            cutoff = time.perf_counter() - age_s
+            waiting_queue.sort(
+                key=lambda r: (
+                    r.time_stats.wait_queue_entry_time > cutoff,
+                    r.rid in temporary_deprioritized,
+                    (
+                        SchedulePolicy._shortest_prefill_work(r)
+                        if r.time_stats.wait_queue_entry_time > cutoff
+                        else 0
+                    ),
+                    r.time_stats.wait_queue_entry_time,
+                )
+            )
+            return
         waiting_queue.sort(
             key=lambda r: (
                 r.rid in temporary_deprioritized,
