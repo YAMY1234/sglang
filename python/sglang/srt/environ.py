@@ -868,6 +868,10 @@ class Envs:
     SGLANG_PERFPF_SPF_AGE_ROUNDS = EnvInt(0)
     # PERF-PF: spread prefill KV transfers over the transfer queues by room instead of by destination sessions
     SGLANG_PERFPF_TRANSFER_SHARD_BY_ROOM = EnvBool(False)
+    # PERF-PF: scheduler processes run gc.collect() + gc.freeze() right before their event loop
+    SGLANG_PERFPF_SCHED_GC_FREEZE = EnvBool(False)
+    # PERF-PF: API server and scheduler processes log every cyclic-GC pause of at least N ms (0 = off)
+    SGLANG_PERFPF_GC_LOG_MS = EnvInt(0)
     # TODO(yangminl): remove SGLANG_STAGING_USE_TORCH and the torch fallback in
     # staging_buffer.py once Triton kernels are fully validated in production.
     SGLANG_STAGING_USE_TORCH = EnvBool(False)

@@ -6517,6 +6517,19 @@ def run_scheduler_process(
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
 
+        if (gc_log_ms := envs.SGLANG_PERFPF_GC_LOG_MS.get()) > 0:
+            from sglang.srt.disaggregation import l12_trace
+
+            l12_trace.install_gc_log(gc_log_ms, "sched")
+        if envs.SGLANG_PERFPF_SCHED_GC_FREEZE.get():
+            # Startup objects (model, kernels, caches) leave the tracked set, so a
+            # full collection walks only what serving allocates.
+            import gc
+
+            gc.collect()
+            gc.freeze()
+            logger.info(f"PERF-PF scheduler GC frozen: {gc.get_freeze_count()} objects")
+
         # Run the event loop (blocks until a ShutdownReq sets gracefully_exit)
         scheduler.run_event_loop()
 

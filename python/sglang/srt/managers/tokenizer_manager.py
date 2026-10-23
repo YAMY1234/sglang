@@ -853,6 +853,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         if get_observability().gc_warning_threshold_secs > 0.0:
             configure_gc_warning(get_observability().gc_warning_threshold_secs)
+        if (gc_log_ms := envs.SGLANG_PERFPF_GC_LOG_MS.get()) > 0:
+            l12_trace.install_gc_log(gc_log_ms, "tm")
         self.soft_watchdog = Watchdog.create(
             debug_name="TokenizerManager",
             watchdog_timeout=get_device().soft_watchdog_timeout,
