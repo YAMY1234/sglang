@@ -1667,6 +1667,10 @@ class Envs:
     # The HiCache ready-count exchange rides the same pass's request-size exchange when that
     # pass received nothing (one cross-rank sync per pass instead of two).
     SGLANG_PERFLL_HOST_HC_PIGGYBACK = EnvBool(False)
+    # Forced acceptance lengths ("match-expected") from one block of exponential draws per
+    # 4096 rounds, the same sequence as one torch.multinomial per round (checked against it
+    # at the first draw; falls back when they differ).
+    SGLANG_PERFLL_HOST_SIM_PREDRAW = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
