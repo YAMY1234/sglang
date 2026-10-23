@@ -42,6 +42,17 @@ def _default_tree_cache_sanity_check() -> bool:
     return envs.SGLANG_IS_IN_CI.get()
 
 
+_UNREAD = object()
+# freeze_env_reads(): get() serves each field's first value read after the freeze; set,
+# clear and override drop it. A direct os.environ write after the freeze is not seen.
+_FROZEN = False
+
+
+def freeze_env_reads() -> None:
+    global _FROZEN
+    _FROZEN = True
+
+
 class EnvField:
     _allow_set_name = True
 
@@ -51,6 +62,7 @@ class EnvField:
         # whether the env var is explicitly set to None.
         self._set_to_none = False
         self.secret = secret
+        self._frozen_value = _UNREAD
 
     def __set_name__(self, owner, name):
         assert EnvField._allow_set_name, "Usage like `a = envs.A` is not allowed"
@@ -65,6 +77,14 @@ class EnvField:
         return self.default() if callable(self.default) else self.default
 
     def get(self) -> Any:
+        if _FROZEN:
+            value = self._frozen_value
+            if value is _UNREAD:
+                value = self._frozen_value = self._get()
+            return value
+        return self._get()
+
+    def _get(self) -> Any:
         value = os.getenv(self.name)
 
         # Explicitly set to None
@@ -91,6 +111,7 @@ class EnvField:
     def set(self, value: Any):
         self._set_to_none = value is None
         os.environ[self.name] = str(value)
+        self._frozen_value = _UNREAD
 
     @contextmanager
     def override(self, value: Any):
@@ -104,10 +125,12 @@ class EnvField:
         else:
             os.environ.pop(self.name, None)
         self._set_to_none = backup_set_to_none
+        self._frozen_value = _UNREAD
 
     def clear(self):
         os.environ.pop(self.name, None)
         self._set_to_none = False
+        self._frozen_value = _UNREAD
 
     def __bool__(self):
         raise RuntimeError(
@@ -170,7 +193,7 @@ class _DeprecatedEnvFallback:
         super().__init__(default, secret=secret)
         self.deprecated_name = deprecated_name
 
-    def get(self) -> Any:
+    def _get(self) -> Any:
         if os.getenv(self.name) is None:
             fallback = os.getenv(self.deprecated_name)
             if fallback is not None:
@@ -182,7 +205,7 @@ class _DeprecatedEnvFallback:
                     stacklevel=2,
                 )
                 os.environ[self.name] = fallback
-        return super().get()
+        return super()._get()
 
 
 class EnvBoolWithAlias(_DeprecatedEnvFallback, EnvBool):
@@ -1583,6 +1606,10 @@ class Envs:
     # The FutureMap's per-round seq-lens gather and publish scatter as index_select /
     # index_copy_ instead of advanced indexing (same rows, less dispatch).
     SGLANG_PERFLL_HOST_INDEX_OPS = EnvBool(False)
+    # From the scheduler event loop's start, envs.X.get() serves each variable's first read
+    # (freeze_env_reads; set / clear / override still refresh it): dozens of os.environ
+    # lookups per round.
+    SGLANG_PERFLL_HOST_ENV_FREEZE = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
