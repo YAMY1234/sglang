@@ -1195,6 +1195,9 @@ class Envs:
     # Gated calls: 0 serial; 1 the stock kernel on the current stream beside the CP gather + partial on a second
     # stream, merge after the join; 2 as 1 with the merge on the second stream (stock gets no key when CP runs).
     SGLANG_TRTL1_ATTN_CP_GATE_OVERLAP = EnvInt(1)
+    # Timing only: decode graph padding per block of Q35MF_AB_BLOCK target-verify rounds, the labels in turn
+    # ("pow2": the smallest captured power of two); model_executor/runner_backend/ab_variants.py. Empty: off.
+    SGLANG_TRTL17_PAD_AB = EnvTuple(())
     # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
     SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
     # Store DeepSeek-V4 SWA KV directly in FlashInfer's 64-token SM120 page
