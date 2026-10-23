@@ -42,8 +42,18 @@ ENABLED = bool(os.environ.get("SGLANG_Q35MF_HOST_TRACE", ""))
     EXT0,
     EXT1,
     PASS_END,
-) = range(1, 21)
-GC0, GC1, RUSAGE = 30, 31, 32
+    WRK0,
+    WRK1,
+    PD1,
+    MK1,
+    VP1,
+    VF1,
+    EP1,
+    EG1,
+    OUT0,
+    OUT1,
+) = range(1, 31)
+GC0, GC1, RUSAGE = 40, 41, 42
 GPU_MARKS = (DRAFT0, DRAFTG, DRAFT1, VERIFY0, VERIFY1, EXT1)
 
 _buf = array("q")
@@ -158,6 +168,7 @@ def maybe_flush() -> None:
                 json.dumps(
                     dict(
                         kind="meta",
+                        version=2,
                         rank=rank,
                         host=socket.gethostname(),
                         pid=os.getpid(),
