@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.distributed as dist
 
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_spec
 
 if TYPE_CHECKING:
@@ -231,17 +232,37 @@ def _retargeted_config(tp_size: int, hidden_size: int, top_k: int):
             tp_size,
         )
 
+    rms_threads = envs.SGLANG_PLB_BT_RMS_THREADS.get()
+    finalize_bt_max = envs.SGLANG_PLB_FINALIZE_BT_MAX.get()
+
+    def bt_preset(preset):
+        if not rms_threads:
+            return preset
+        return replace(
+            preset, collective=replace(preset.collective, rms_threads=rms_threads)
+        )
+
     def routes(op):
         bounds, ll, bt, _ = shipped[op]
+        if op == "finalize" and finalize_bt_max:
+            bounds = (*bounds[:2], finalize_bt_max, *bounds[3:])
         return _routes(
             bounds,
             KernelTarget(protocol=ProtocolKind.LL, preset=ll),
-            tuple(KernelTarget(protocol=ProtocolKind.BT, preset=p) for p in bt),
+            tuple(
+                KernelTarget(protocol=ProtocolKind.BT, preset=bt_preset(p)) for p in bt
+            ),
             None
             if ht[op] is None
             else KernelTarget(protocol=ProtocolKind.HT, preset=ht[op]),
         )
 
+    if rms_threads or finalize_bt_max:
+        logger.info(
+            "MNNVL CuTe DSL (PERF-LB): BT rms_threads %s, finalize BT up to %s rows",
+            rms_threads or "shipped",
+            finalize_bt_max or "shipped",
+        )
     profile = StaticProfile(
         tp_size=tp_size,
         hidden_size=hidden_size,

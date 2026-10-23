@@ -1229,6 +1229,11 @@ class Envs:
     # PERF-LB: gated fold calls with the per-head merge fill the chunk rows' queries in the q gather and combine their
     # partials in the merge (no copy / combine kernels).
     SGLANG_PLB_CP_FOLD_FUSE = EnvBool(False)
+    # PERF-LB: MNNVL CuTe DSL BT tail threads of the MaterializeRMSNorm kernel for the re-targeted (non-shipped) shapes
+    # (0: the shipped H8192 presets' 1024; 512 at H4096 is bit for bit the same output)
+    SGLANG_PLB_BT_RMS_THREADS = EnvInt(0)
+    # PERF-LB: the widest MoE finalize step on the BT route for the re-targeted shapes (0: the shipped 703 at TP8)
+    SGLANG_PLB_FINALIZE_BT_MAX = EnvInt(0)
     # Timing only: decode graph padding per block of Q35MF_AB_BLOCK target-verify rounds, the labels in turn
     # ("pow2": the smallest captured power of two); model_executor/runner_backend/ab_variants.py. Empty: off.
     SGLANG_TRTL17_PAD_AB = EnvTuple(())
