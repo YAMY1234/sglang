@@ -1233,7 +1233,8 @@ class Envs:
     # PERF-LB: priority of the decode streams (forward, schedule, copy, fwd-prepare d2h); < 0 ranks them above the PD
     # staging scatter stream (default 0, the lowest), so a scatter only takes the SMs the forward leaves free.
     SGLANG_PLB_STREAM_PRIORITY = EnvInt(0)
-    # PERF-LB: the PD staging scatter as a persistent kernel of this many CTAs (0: one CTA per 1024 elements).
+    # PERF-LB: the PD staging scatter as a persistent kernel of this many CTAs (0: one CTA per 1024 elements; -1: one CTA
+    # per page and layer K / V, the page as one tile).
     SGLANG_PLB_SCATTER_CTAS = EnvInt(0)
     # PERF-LB: PD staging scatters wait for the scheduler, which launches them on the forward stream right before its
     # next batch: a rank's scatter lands between two forwards (not under another rank's collective), and ranks whose
