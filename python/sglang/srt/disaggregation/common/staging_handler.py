@@ -8,6 +8,7 @@ protocol code is at the bottom.
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 import logging
 import struct
@@ -102,6 +103,11 @@ class DecodeStagingHandler:
         # room -> chunk_idx -> [(page_start, num_pages, writer_id)] fan-in
         # arrivals; handler-owned so room teardown can purge them.
         self._writer_counts: dict = {}
+        # PERF-LB (SGLANG_PLB_SCATTER_DEFER): complete chunks queue here (decode_thread) until the scheduler's plb_flush
+        # submits them on the forward stream (main thread).
+        self.plb_defer = envs.SGLANG_PLB_SCATTER_DEFER.get()
+        self.plb_pending: collections.deque = collections.deque()
+        self.plb_flushes = 0  # plb_flush calls so far (a queued item is due at enqueue count + defer - 1)
 
     def register_wm_subscriber(self, receiver, session_id: str) -> None:
         """Register a prefill's bootstrap connection for watermark broadcasts."""
@@ -211,6 +217,10 @@ class DecodeStagingHandler:
         stream = self.staging_allocator._scatter_stream
         if stream is not None:
             stream.synchronize()
+        if self.plb_defer:
+            # deferred scatters ran on the forward stream (submitted on this thread, so all have their event)
+            for event, _alloc_id in decode_req._chunk_events:
+                event.synchronize()
         chunk_infos = receiver.chunk_staging_infos if receiver is not None else []
         unscattered_allocs = []
         for chunk_idx, info in enumerate(chunk_infos):
@@ -234,8 +244,20 @@ class DecodeStagingHandler:
     # Scatter submission: called from decode_thread (background)
     # ------------------------------------------------------------------
 
+    def plb_flush(self, stream) -> None:
+        """SGLANG_PLB_SCATTER_DEFER: submit the queued chunk scatters that are due on ``stream`` (main thread, before a
+        forward)."""
+        self.plb_flushes += 1
+        while self.plb_pending and self.plb_pending[0][0] <= self.plb_flushes:
+            self.submit_chunk_scatter(*self.plb_pending.popleft()[1], stream=stream)
+
     def submit_chunk_scatter(
-        self, room: int, chunk_idx: int, page_start: int, num_pages: int
+        self,
+        room: int,
+        chunk_idx: int,
+        page_start: int,
+        num_pages: int,
+        stream=None,
     ) -> bool:
         """Submit scatter for an intermediate chunk whose writers all arrived.
 
@@ -261,11 +283,13 @@ class DecodeStagingHandler:
             return False
 
         ok = self._scatter_region(
-            staging_offset, page_start, num_pages, decode_req, receiver
+            staging_offset, page_start, num_pages, decode_req, receiver, stream
         )
         if ok:
             event = torch.cuda.Event()
-            event.record(self.staging_allocator._scatter_stream)
+            event.record(
+                stream if stream is not None else self.staging_allocator._scatter_stream
+            )
             # Append before zeroing so the completion check always sees either
             # the slot or the event.
             decode_req._chunk_events.append((event, alloc_id))
@@ -311,7 +335,11 @@ class DecodeStagingHandler:
         arrivals.append((page_start, num_pages, writer_id))
         num_writers = self.num_writers_for(receiver)
         if len(arrivals) >= num_writers:
-            self.submit_chunk_scatter(room, chunk_idx, page_start, num_pages)
+            if self.plb_defer:
+                due = self.plb_flushes + self.plb_defer
+                self.plb_pending.append((due, (room, chunk_idx, page_start, num_pages)))
+            else:
+                self.submit_chunk_scatter(room, chunk_idx, page_start, num_pages)
             del room_counts[chunk_idx]
             return True
         return False
@@ -394,8 +422,9 @@ class DecodeStagingHandler:
         num_pages: int,
         decode_req: DecodeRequest,
         receiver,
+        stream=None,
     ) -> bool:
-        """Submit scatter kernels for a staging region to scatter_stream.
+        """Submit scatter kernels for a staging region to scatter_stream (``stream`` if given).
 
         May be called from the decode_thread (background).  All GPU work
         runs on scatter_stream so that the decode_thread never blocks on
@@ -416,7 +445,9 @@ class DecodeStagingHandler:
         if self.staging_allocator._scatter_stream is None:
             self.staging_allocator._scatter_stream = torch.cuda.Stream(device=device)
 
-        scatter_stream = self.staging_allocator._scatter_stream
+        scatter_stream = (
+            stream if stream is not None else self.staging_allocator._scatter_stream
+        )
 
         staging_view = self.staging_allocator.buffer.buffer[staging_offset:]
 
