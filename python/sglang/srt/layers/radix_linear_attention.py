@@ -83,6 +83,7 @@ class RadixLinearAttention(nn.Module):
         mixed_qkv: torch.Tensor,
         a: torch.Tensor,
         b: torch.Tensor,
+        gdn_core=None,
     ) -> torch.Tensor:
         is_extend = forward_batch.forward_mode.is_extend()
         if is_extend and get_tc_piecewise_forward_context() is not None:
@@ -145,6 +146,8 @@ class RadixLinearAttention(nn.Module):
             mixed_qkv=mixed_qkv,
             a=a,
             b=b,
+            # SGLANG_PERFHT_GDN_CORE: a target verify may then return out_proj's FP8 input instead
+            **({} if gdn_core is None else {"gdn_core": gdn_core}),
         )
 
 

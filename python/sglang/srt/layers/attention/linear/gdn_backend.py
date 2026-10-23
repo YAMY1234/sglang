@@ -179,6 +179,81 @@ def _e2x_tp2_verify_launch(
     return None
 
 
+class GDNCoreNorm(msgspec.Struct, frozen=True):
+    """The gated RMSNorm and static FP8 quant of out_proj's input that SGLANG_PERFHT_GDN_CORE runs in the verify."""
+
+    z: torch.Tensor
+    weight: torch.Tensor
+    eps: float
+    input_scale: torch.Tensor
+
+
+def _gdn_core_target_verify(
+    *,
+    layer: RadixLinearAttention,
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    gdn_core: GDNCoreNorm,
+    mamba_pool: MambaPool,
+    layer_cache: "MambaPool.SpeculativeState",
+    cache_indices: torch.Tensor,
+    replay_indices: torch.Tensor,
+    draft_token_num: int,
+) -> Optional[torch.Tensor]:
+    """SGLANG_PERFHT_GDN_CORE: out_proj's FP8 input from the circular ReplaySSM verify and the gated norm in one
+    launch at the attention-DP shape; None keeps the Triton verify and the norm."""
+    from sglang.kernels.ops.attention.fla import gdn_core_cuda
+
+    if (
+        (layer.num_q_heads, layer.num_k_heads, layer.num_v_heads) != (16, 16, 64)
+        or (layer.head_q_dim, layer.head_k_dim, layer.head_v_dim) != (128, 128, 128)
+        or draft_token_num != 7
+        or layer_cache.temporal.dtype != torch.bfloat16
+        or layer_cache.replayssm_d.shape[-2] != 16
+        or layer_cache.replayssm_beta is not None
+        or mixed_qkv.shape[0] % draft_token_num
+    ):
+        return None
+    out = torch.empty(
+        (mixed_qkv.shape[0], layer.num_v_heads * layer.head_v_dim),
+        dtype=torch.float8_e4m3fn,
+        device=mixed_qkv.device,
+    )
+    if not gdn_core_cuda.try_core(
+        qkv=mixed_qkv,
+        z=gdn_core.z,
+        a=a,
+        b=b,
+        A_log=layer.A_log,
+        dt_bias=layer.dt_bias,
+        checkpoint=layer_cache.temporal,
+        ring_d=layer_cache.replayssm_d,
+        ring_k=layer_cache.replayssm_k,
+        ring_g=layer_cache.replayssm_g,
+        # BF16 compact update / key low parts
+        ring_dlo=layer_cache.replayssm_rawv,
+        ring_klo=layer_cache.replayssm_rawk,
+        state_indices=cache_indices,
+        replay_indices=replay_indices,
+        write_pos=mamba_pool.replayssm_spec_write_pos,
+        cache_base=mamba_pool.replayssm_cache_base,
+        is_flush=mamba_pool.replayssm_is_flush,
+        norm_weight=gdn_core.weight,
+        input_scale=gdn_core.input_scale,
+        eps=gdn_core.eps,
+        out=out,
+        rows_per_request=draft_token_num,
+        num_k_heads=layer.num_k_heads,
+    ):
+        return None
+    print_info_once(
+        f"SGLANG_PERFHT_GDN_CORE engaged: batch={mixed_qkv.shape[0] // draft_token_num}, "
+        f"value_heads={layer.num_v_heads}"
+    )
+    return out
+
+
 class GDNMISMetadata(msgspec.Struct, frozen=True):
     query_token_indices: torch.Tensor
     query_cu_seqlens: torch.Tensor
@@ -1544,6 +1619,29 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     block_n=conv_block_n,
                 )
                 mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
+                gdn_core = kwargs.get("gdn_core")
+                if (
+                    gdn_core is not None
+                    and use_replayssm_spec
+                    and not use_replayssm_fold
+                    and retrieve_parent_token is None
+                    and verify_pdl is None
+                    and not wait_for_gate_producer
+                ):
+                    fp8 = _gdn_core_target_verify(
+                        layer=layer,
+                        mixed_qkv=mixed_qkv,
+                        a=a,
+                        b=b,
+                        gdn_core=gdn_core,
+                        mamba_pool=mamba_pool,
+                        layer_cache=mamba_cache_params,
+                        cache_indices=cache_indices,
+                        replay_indices=forward_batch.req_pool_indices,
+                        draft_token_num=draft_token_num,
+                    )
+                    if fp8 is not None:
+                        return fp8
         else:
             if forward_metadata.has_mamba_track_mask:
                 mixed_qkv_to_track = mixed_qkv[

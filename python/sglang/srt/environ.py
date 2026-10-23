@@ -1725,6 +1725,9 @@ class Envs:
     SGLANG_PERFHT_DP_REQUEST_TOKENS = EnvInt(50000)
     # PERF-HT: drop the router's routed DP rank (dynamo's decode pick) and place the request by load-balance-method.
     SGLANG_PERFHT_DP_IGNORE_ROUTED = EnvBool(False)
+    # PERF-HT: the attention-DP GDN target verify (16 / 64 heads, 7 rows a request, ring 16, BF16 checkpoint) with its
+    # gated RMSNorm and out_proj's static FP8 quant as one CUDA launch (gdn_core_cuda); needs SGLANG_Q35MF_GDN_NORM_FP8.
+    SGLANG_PERFHT_GDN_CORE = EnvBool(False)
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)

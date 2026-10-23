@@ -560,6 +560,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             parallel_group=parallel_group,
             prefix=add_prefix("out_proj", prefix),
         )
+        # SGLANG_PERFHT_GDN_CORE: the verify core implements norm-before-gate SiLU over whole 128-wide heads.
+        self._gdn_core_norm_ok = (
+            _is_cuda
+            and self.head_v_dim == 128
+            and self.norm.activation in ("silu", "swish")
+            and self.norm.norm_before_gate
+            and self.norm.bias is None
+            and self.norm.group_size is None
+        )
 
         self._fused_verify_enabled = (
             _is_cuda
@@ -1510,12 +1519,21 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 wait_for_gate_producer=True,
             )
         else:
+            # Read at capture time: A/B variants capture their graphs with their own env.
+            gdn_core = (
+                self._gdn_core_norm(forward_batch, mixed_qkv, z)
+                if self._gdn_core_norm_ok and envs.SGLANG_PERFHT_GDN_CORE.get()
+                else None
+            )
             attn_result = self.attn(
                 forward_batch,
                 mixed_qkv=mixed_qkv,
                 a=a,
                 b=b,
+                gdn_core=gdn_core,
             )
+            if gdn_core is not None and attn_result.dtype == torch.float8_e4m3fn:
+                return self._krnc_out_proj(attn_result)
         if use_fused_proj_conv:
             if not isinstance(attn_result, tuple) or len(attn_result) != 2:
                 raise RuntimeError(
@@ -1663,6 +1681,31 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         output, _ = self.out_proj(core_attn_out)
         return output
+
+    def _gdn_core_norm(self, forward_batch: ForwardBatch, mixed_qkv, z):
+        """SGLANG_PERFHT_GDN_CORE: the norm operands for the target-verify core, or None for the stock verify,
+        gated norm and static FP8 quant."""
+        from sglang.srt.layers.attention.linear.gdn_backend import GDNCoreNorm
+
+        if (
+            not forward_batch.forward_mode.is_target_verify()
+            or not envs.SGLANG_Q35MF_GDN_NORM_FP8.get()
+            or not isinstance(mixed_qkv, torch.Tensor)
+            or z is None
+            or z.dim() != 3
+            or z.shape[0] != mixed_qkv.shape[0]
+            or forward_batch.spec_info.ragged_verify_layout is not None
+            or not _static_fp8_input_linear(self.out_proj)
+            or self.out_proj.input_scale.dtype != torch.float32
+            or self._q35_push_hop(mixed_qkv.shape[0]) is not None
+        ):
+            return None
+        return GDNCoreNorm(
+            z=z,
+            weight=self.norm.weight,
+            eps=self.norm.eps,
+            input_scale=self.out_proj.input_scale,
+        )
 
     def _q35_push_hop(self, m: int):
         if not (envs.SGLANG_Q35MF_MKH_OPROJ.get() and m <= 8):
