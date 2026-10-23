@@ -1577,6 +1577,9 @@ class Envs:
     # A spec decode step that needs no new KV pages (most steps at page size 64) skips the
     # length tensors and their two H2D copies, which only the allocation reads.
     SGLANG_PERFLL_HOST_DECODE_ALLOC = EnvBool(False)
+    # GenerationBatchResult.copy_to_cpu opens its profiler range only while a torch
+    # profiler runs (the record_function decorator calls into the dispatcher every round).
+    SGLANG_PERFLL_HOST_RESULT_COPY = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
