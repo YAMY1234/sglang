@@ -631,7 +631,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self._send_chunk_ready(req, chunk_idx, kv_chunk, prefill_unique_rank)
         return (ret, False)
 
-    def _prefetch_staging_reqs(self, room: int):
+    def _prefetch_staging_reqs(self, room: int, upto_tokens: Optional[int] = None):
         if not self.enable_staging or self.kv_buffer_tensors is None:
             return
 
@@ -658,6 +658,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self._staging_ctx.prefetch_requested,
             self._staging_ctx.prefetch_sockets,
             requester_pp_rank=self.pp_rank,
+            upto_tokens=upto_tokens,
         )
 
     def send_kvcache_staged(

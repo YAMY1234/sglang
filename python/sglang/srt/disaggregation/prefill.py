@@ -556,10 +556,14 @@ class SchedulerDisaggregationPrefillMixin:
         prefetch = getattr(kv_mgr, "_prefetch_staging_reqs", None)
         if prefetch is None:
             return
+        lazy = envs.SGLANG_PERFPF_STAGING_LAZY.get()
         for req in batch.reqs:
             room = getattr(req, "bootstrap_room", None)
             if room is not None and room in kv_mgr.transfer_infos:
-                prefetch(room)
+                if lazy:
+                    prefetch(room, upto_tokens=len(req.fill_ids))
+                else:
+                    prefetch(room)
 
     def checkpoint_disagg_prefill(self: Scheduler, req: Req) -> None:
         cache = self.tree_cache
