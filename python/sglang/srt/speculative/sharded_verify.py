@@ -15,6 +15,10 @@ import triton
 import triton.language as tl
 
 from sglang.srt.utils.common import print_info_once
+from sglang.srt.environ import envs
+
+_MC_GATHER = envs.SGLANG_PERFLL_VERIFY_MC_GATHER.get()
+_SPLIT = envs.SGLANG_PERFLL_VERIFY_KEY_SPLIT.get()
 
 
 class VocabShard(msgspec.Struct, frozen=True):
@@ -39,20 +43,25 @@ def _shard_key_kernel(
     start,
     valid,
     vocab_size,
+    span,
     KEY_FLOOR: tl.constexpr,
     HAS_TEMP: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
+    # program (row, part): columns [part * span, (part + 1) * span) of the row's shard
     row = tl.program_id(0).to(tl.int64)
+    part = tl.program_id(1)
+    lo = part * span
+    hi = tl.minimum(lo + span, valid)
     best = tl.full([BLOCK], KEY_FLOOR, tl.int64)
     if HAS_TEMP:
         temp = tl.load(temp_ptr + row)
         inv_t = 1.0 / tl.maximum(temp, 1e-20)
         seed = tl.load(seed_ptr + row)
-    for off in range(0, valid, BLOCK):
+    for off in range(lo, hi, BLOCK):
         cols = off + tl.arange(0, BLOCK)
         gid = start + cols
-        mask = (cols < valid) & (gid < vocab_size)
+        mask = (cols < hi) & (gid < vocab_size)
         x = tl.load(
             logits_ptr + row * stride_row + cols, mask=mask, other=float("-inf")
         )
@@ -69,7 +78,17 @@ def _shard_key_kernel(
         key = (ordered << 32) | (4294967295 - gid.to(tl.int64))
         key = tl.where(mask, key, KEY_FLOOR)
         best = tl.maximum(best, key)
-    tl.store(keys_ptr + row, tl.max(best, axis=0))
+    tl.store(keys_ptr + row * tl.num_programs(1) + part, tl.max(best, axis=0))
+
+
+_KEY_BLOCK = 2048
+
+
+def key_splits(valid: int) -> int:
+    """SGLANG_PERFLL_VERIFY_KEY_SPLIT: programs a row, one per _KEY_BLOCK columns of the
+    shard, even (a row of keys is whole 16-byte multimem chunks)."""
+    n = -(-valid // _KEY_BLOCK)
+    return n + (n & 1)
 
 
 def shard_keys(
@@ -77,18 +96,24 @@ def shard_keys(
     shard: VocabShard,
     temperatures: Optional[torch.Tensor] = None,
     seeds: Optional[torch.Tensor] = None,
+    splits: int = 1,
 ) -> torch.Tensor:
     """One int64 key per row of this rank's shard: (order-preserving FP32 bits of the
     row's best value) << 32 | (0xFFFFFFFF - token id). temperatures: [rows] float32;
     rows at T <= 0 take the plain logit, rows at T > 0 logit / T + Gumbel noise drawn
-    from seeds [rows] int64 and the global token id."""
+    from seeds [rows] int64 and the global token id. splits > 1: [rows, splits], the
+    best key of each of `splits` column ranges (the row's key is their max)."""
     assert logits.stride(-1) == 1
     rows = logits.shape[0]
-    keys = torch.empty(rows, dtype=torch.int64, device=logits.device)
+    keys = torch.empty(
+        (rows, splits) if splits > 1 else (rows,),
+        dtype=torch.int64,
+        device=logits.device,
+    )
     if rows == 0:
         return keys
     has_temp = temperatures is not None
-    _shard_key_kernel[(rows,)](
+    _shard_key_kernel[(rows, splits)](
         logits,
         logits.stride(0),
         temperatures if has_temp else keys,
@@ -97,18 +122,125 @@ def shard_keys(
         shard.start,
         shard.valid,
         shard.vocab_size,
+        -(-shard.valid // splits),
         KEY_FLOOR=_KEY_FLOOR,
         HAS_TEMP=has_temp,
-        BLOCK=2048,
+        BLOCK=_KEY_BLOCK,
         num_warps=8,
     )
     return keys
 
 
-def keys_to_tokens(gathered: torch.Tensor, tp_size: int) -> torch.Tensor:
-    """[tp * rows] keys of all ranks -> [rows] int64 token ids."""
-    best = gathered.view(tp_size, -1).amax(dim=0)
-    return 0xFFFFFFFF - (best & 0xFFFFFFFF)
+@triton.jit
+def _keys_to_tokens_kernel(
+    keys_ptr,
+    tokens_ptr,
+    stride_rank,
+    stride_row,
+    world,
+    parts,
+    KEY_FLOOR: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_P: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    r = tl.arange(0, BLOCK_R)[:, None]
+    p = tl.arange(0, BLOCK_P)[None, :]
+    k = tl.load(
+        keys_ptr + row * stride_row + r * stride_rank + p,
+        mask=(r < world) & (p < parts),
+        other=KEY_FLOOR,
+    )
+    best = tl.max(tl.max(k, axis=1), axis=0)
+    tl.store(tokens_ptr + row, 4294967295 - (best & 4294967295))
+
+
+def _reduce_keys(keys, rows, world, parts, stride_rank, stride_row) -> torch.Tensor:
+    """[rows] token ids from the keys at keys[row * stride_row + rank * stride_rank + part]
+    (int64 elements), the max over every rank and part of a row, in one launch."""
+    tokens = torch.empty(rows, dtype=torch.int64, device=keys.device)
+    if rows:
+        _keys_to_tokens_kernel[(rows,)](
+            keys,
+            tokens,
+            stride_rank,
+            stride_row,
+            world,
+            parts,
+            KEY_FLOOR=_KEY_FLOOR,
+            BLOCK_R=triton.next_power_of_2(world),
+            BLOCK_P=triton.next_power_of_2(parts),
+            num_warps=1,
+        )
+    return tokens
+
+
+def keys_to_tokens(gathered: torch.Tensor, tp_size: int, splits: int = 1) -> torch.Tensor:
+    """[tp * rows * splits] keys of all ranks (rank-major) -> [rows] int64 token ids."""
+    if splits == 1:
+        best = gathered.view(tp_size, -1).amax(dim=0)
+        return 0xFFFFFFFF - (best & 0xFFFFFFFF)
+    rows = gathered.numel() // (tp_size * splits)
+    return _reduce_keys(gathered, rows, tp_size, splits, rows * splits, splits)
+
+
+# SGLANG_PERFLL_VERIFY_MC_GATHER: the key exchange's multimem state, built by the first
+# (eager, every rank in lockstep) call; a row of a rank is `width` int64 (4 bf16 each)
+_MC_MAX_ROWS = 1024
+_mc_state = None
+_mc_width = 0
+
+
+def _mc_build(tp_group, hidden_size: int, device):
+    """The multimem state, or False (NCCL keeps the exchange) when the buffer has no
+    multicast mapping, e.g. a TP group across nodes on torch symmetric memory."""
+    from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
+
+    try:
+        state = triton_symm_mem_ag.create_state(
+            tp_group.device_group,
+            tp_group.rank_in_group,
+            max_tokens=_MC_MAX_ROWS,
+            hidden_size=hidden_size,
+            device=device,
+        )
+    except Exception as e:  # rendezvous refused: every rank sees the same failure
+        print_info_once(f"SGLANG_PERFLL_VERIFY_MC_GATHER: multimem state failed ({e}); NCCL gather")
+        return False
+    if state.symm_mem_hdl.multicast_ptr == 0:
+        print_info_once("SGLANG_PERFLL_VERIFY_MC_GATHER: no multicast mapping; NCCL gather")
+        return False
+    return state
+
+
+def _mc_gather_keys(keys: torch.Tensor, tp_group) -> Optional[torch.Tensor]:
+    """[rows] or [rows, parts] int64 keys of every rank -> [rows] token ids, by one
+    multimem all-gather (rows of at least 2 int64: a single key goes twice); None when
+    there is no multicast state."""
+    global _mc_state, _mc_width
+    from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
+
+    world, rows = tp_group.world_size, keys.shape[0]
+    if keys.dim() == 1:
+        keys = torch.stack((keys, keys), dim=1)
+    width = keys.shape[1]
+    if _mc_state is None:
+        _mc_state = _mc_build(tp_group, 4 * width * world, keys.device)
+        _mc_width = width
+    if _mc_state is False:
+        return None
+    assert width == _mc_width, (width, _mc_width)
+    out = triton_symm_mem_ag.all_gather_inner(
+        _mc_state, keys.view(torch.bfloat16), 4 * width * world, safe=False
+    )
+    if not _SPLIT:
+        return 0xFFFFFFFF - (
+            out.contiguous().view(torch.int64).view(rows, world, width)[:, :, 0].amax(dim=1)
+            & 0xFFFFFFFF
+        )
+    # rows of the symmetric buffer; rank r's keys at int64 column width * r
+    out = out.view(torch.int64)
+    return _reduce_keys(out, rows, world, width, width, out.stride(0))
 
 
 def sharded_target_tokens(
@@ -122,18 +254,25 @@ def sharded_target_tokens(
         "SGLANG_Q35MF_SHARDED_VERIFY: target "
         + ("Gumbel-max" if temperatures is not None else "argmax")
         + " on the vocabulary shards"
+        + (" (keys split, fused reduce)" if _SPLIT else "")
+        + (" (multimem key gather)" if _MC_GATHER else "")
     )
     seeds = None
     if temperatures is not None:
         seeds = torch.randint(
             0, 2**31 - 1, (logits.shape[0],), dtype=torch.int64, device=logits.device
         )
-    keys = shard_keys(logits, shard, temperatures, seeds)
+    splits = key_splits(shard.valid) if _SPLIT else 1
+    keys = shard_keys(logits, shard, temperatures, seeds, splits)
+    if _MC_GATHER and 0 < keys.shape[0] <= _MC_MAX_ROWS:
+        tokens = _mc_gather_keys(keys, tp_group)
+        if tokens is not None:
+            return tokens
     gathered = torch.empty(
-        tp_group.world_size * keys.shape[0], dtype=torch.int64, device=keys.device
+        tp_group.world_size * keys.numel(), dtype=torch.int64, device=keys.device
     )
-    tp_group.all_gather_into_tensor(gathered, keys)
-    return keys_to_tokens(gathered, tp_group.world_size)
+    tp_group.all_gather_into_tensor(gathered, keys.view(-1))
+    return keys_to_tokens(gathered, tp_group.world_size, splits)
 
 
 def gather_full_logits(

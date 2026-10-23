@@ -12,7 +12,9 @@ import torch
 
 from sglang.srt.speculative.sharded_verify import (
     VocabShard,
+    _reduce_keys,
     gather_full_logits,
+    key_splits,
     keys_to_tokens,
     shard_keys,
 )
@@ -24,15 +26,16 @@ register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
 VOCAB = 248320
 
 
-def _sharded_tokens(full, tp, temperatures=None, seeds=None):
+def _sharded_tokens(full, tp, temperatures=None, seeds=None, split=False):
     width = -(-full.shape[1] // tp)
+    splits = key_splits(width) if split else 1
     keys = []
     for rank in range(tp):
         start = rank * width
         part = full[:, start : start + width].contiguous()
         shard = VocabShard(start=start, valid=part.shape[1], vocab_size=full.shape[1])
-        keys.append(shard_keys(part, shard, temperatures, seeds))
-    return keys_to_tokens(torch.cat(keys), tp)
+        keys.append(shard_keys(part, shard, temperatures, seeds, splits).view(-1))
+    return keys_to_tokens(torch.cat(keys), tp, splits)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
@@ -51,10 +54,42 @@ class TestShardedGreedy(CustomTestCase):
                 full[2].zero_()
                 full[2, 1::2] = -0.0
             want = torch.argmax(full.float(), dim=-1)
-            for tp in (2, 4, 8):
-                with self.subTest(rows=rows, tp=tp):
-                    got = _sharded_tokens(full, tp)
-                    self.assertTrue(torch.equal(got, want))
+            for tp in (2, 4, 8, 16):
+                for split in (False, True):
+                    with self.subTest(rows=rows, tp=tp, split=split):
+                        got = _sharded_tokens(full, tp, split=split)
+                        self.assertTrue(torch.equal(got, want))
+
+    def test_split_temperature_rows_match_unsplit(self):
+        # the Gumbel noise is drawn per (seed, token id), so splitting a shard's columns
+        # into parts picks the same token as one program over the shard
+        gen = torch.Generator(device="cuda").manual_seed(2)
+        rows = 56
+        full = (torch.randn(rows, VOCAB, device="cuda", generator=gen) * 3).bfloat16()
+        temps = torch.rand(rows, device="cuda", generator=gen) + 0.3
+        temps[::5] = 0.0
+        seeds = torch.randint(0, 2**31 - 1, (rows,), device="cuda", generator=gen)
+        for tp in (1, 8, 16):
+            with self.subTest(tp=tp):
+                want = _sharded_tokens(full, tp, temps, seeds)
+                got = _sharded_tokens(full, tp, temps, seeds, split=True)
+                self.assertTrue(torch.equal(got, want))
+
+    def test_reduce_strided_rank_rows(self):
+        # the multimem exchange's layout: a buffer row per logits row, rank r's parts at
+        # column parts * r, the buffer wider than world * parts
+        gen = torch.Generator(device="cuda").manual_seed(3)
+        rows, world, parts, pad = 7, 8, 16, 32
+        keys = torch.randint(
+            -(2**62), 2**62, (world, rows, parts), device="cuda", generator=gen
+        )
+        buf = torch.zeros(rows, world * parts + pad, dtype=torch.int64, device="cuda")
+        buf[:, : world * parts] = keys.permute(1, 0, 2).reshape(rows, -1)
+        want = keys_to_tokens(keys.reshape(-1), world, parts)
+        got = _reduce_keys(buf, rows, world, parts, parts, buf.stride(0))
+        self.assertTrue(torch.equal(got, want))
+        best = keys.amax(dim=(0, 2))
+        self.assertTrue(torch.equal(got, 0xFFFFFFFF - (best & 0xFFFFFFFF)))
 
     def test_padding_columns_never_win(self):
         full = torch.zeros(3, 1024, device="cuda", dtype=torch.bfloat16)
