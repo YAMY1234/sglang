@@ -1531,6 +1531,10 @@ class Envs:
     # D2H on the schedule stream waits for the in-flight forward (the stream is fenced
     # on it) and stalls the overlap loop.
     SGLANG_TRTL16_PREALLOC_NO_SYNC = EnvBool(False)
+    # PERF-LL host loop of a small decode batch (spec v2, overlap scheduler); all off by default.
+    # Diagnostic: with SGLANG_Q35MF_HOST_TRACE set, record only while this file exists
+    # (checked while the scheduler is idle), so one boot can bench with and without the trace.
+    SGLANG_PERFLL_HOST_TRACE_GATE = EnvStr(None)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
