@@ -86,7 +86,29 @@ class LoopStat:
         self.ab_graph = self.ab_base_bs is not None or self.ab_treat_bs is not None
         self.ab_defer = os.environ.get("SGLANG_TRTL16_AB_DEFER", "") == "1"
         self.defer_on = False
+        self.sync_counts = {}
+        if os.environ.get("SGLANG_TRTL16_SYNC_DEBUG", "") == "1" and self.write:
+            self._install_sync_debug()
         self.knob = 0
+
+    # ---- sync debug -----------------------------------------------------------
+    def _install_sync_debug(self) -> None:
+        """Count synchronizing CUDA calls by Python call site (torch sync debug mode), per knob."""
+        import warnings
+
+        prev = warnings.showwarning
+
+        def show(message, category, filename, lineno, file=None, line=None):
+            text = str(message)
+            if "synchroniz" not in text:
+                return prev(message, category, filename, lineno, file, line)
+            key = (self.knob, filename.rsplit("sglang/", 1)[-1], lineno, text[:60])
+            self.sync_counts[key] = self.sync_counts.get(key, 0) + 1
+
+        warnings.showwarning = show
+        warnings.filterwarnings("always", message=".*synchroniz.*")
+        torch.cuda.set_sync_debug_mode(1)
+        self.fsync = open(self.f.name.replace(".csv", ".sync.csv"), "a")
 
     # ---- host stage marks -------------------------------------------------
     def begin(self) -> None:
@@ -197,6 +219,13 @@ class LoopStat:
         if self.grows:
             self.fg.write("\n".join(self.grows) + "\n")
             self.grows = []
+        if self.sync_counts:
+            t = (now - self.t0) / 1e6
+            self.fsync.write(
+                "".join(f"{t:.0f},{k[0]},{k[1]},{k[2]},{v},{k[3].replace(',', ';')}\n" for k, v in self.sync_counts.items())
+            )
+            self.fsync.flush()
+            self.sync_counts = {}
         self.f.flush()
         self.fg.flush()
         names = {t.native_id: t.name for t in threading.enumerate()}
