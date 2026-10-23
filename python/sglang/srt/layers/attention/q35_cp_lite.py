@@ -316,13 +316,17 @@ def _ll_wait(src, n: tl.constexpr, e):
 def _cp_gather_q_ll(
     q, q_stride, peers, me, ll_off, q_all, cnt, seq_lens, pre_lens, stock_lens, nb, thr,
     CP: tl.constexpr, WORDS: tl.constexpr, QL: tl.constexpr, FOLD: tl.constexpr,
-    GATE: tl.constexpr, NB: tl.constexpr, GMAX: tl.constexpr, GWRITE: tl.constexpr,
+    GATE: tl.constexpr, NB: tl.constexpr, GMAX: tl.constexpr, GWRITE: tl.constexpr, TRIG: tl.constexpr = False,
 ):
     """LL variant of _cp_gather_q: every 4-byte word travels with the call's epoch in one 8-byte store.
     FOLD: q_all is written source-major per request ([B, CP, QL, heads, D]) for the prefix-only fused partial,
     and pre_lens[b] = max(L - QL, 0).
     GATE: exits with the gate off; GWRITE: first writes the stock call's lengths (L with the gate off, q_len with it
-    on) and, FOLD, pre_lens = 0 with the gate off (else _gate_lens wrote them)."""
+    on) and, FOLD, pre_lens = 0 with the gate off (else _gate_lens wrote them).
+    TRIG (no GWRITE): releases the dependent grid at entry; the fused partial reads only lengths, tables and prefix KV
+    before its griddepcontrol.wait, none of them written here."""
+    if TRIG:
+        tl.extra.cuda.gdc_launch_dependents()
     i = tl.program_id(0)
     if GATE:
         on = _gate_on(seq_lens, nb, thr, NB, GMAX)
@@ -570,6 +574,7 @@ class CpLite:
         self.stock_lens = torch.zeros(rows, dtype=torch.int32, device=self.device)
         self.gate_overlap = envs.SGLANG_TRTL1_ATTN_CP_GATE_OVERLAP.get()
         self.cp_main = envs.SGLANG_TRTL18_CP_MAIN.get()
+        self.cp_pdl = self.cp_main and envs.SGLANG_TRTL18_CP_PDL.get()
         self._side = torch.cuda.Stream(device=self.device)
         self._ws = None
         if self.min_kv and self.gate_overlap:
@@ -585,8 +590,8 @@ class CpLite:
             tp_rank, cp, self.me, self.min_bs, self.ll, self.fused,
         )
         logger.info("TRT-L1 CP-lite exact (prefix-only fused partial + fp32 causal block): %s", self.exact)
-        logger.info("TRT-L18 CP-lite gated exact calls: CP on the current stream, stock after the partial: %s",
-                    self.cp_main)
+        logger.info("TRT-L18 CP-lite gated exact calls: CP on the current stream, stock after the partial: %s, PDL %s",
+                    self.cp_main, self.cp_pdl)
         logger.info(
             "TRT-L1 CP-lite KV gate: min KV per request %s (%s of the batch)",
             self.min_kv or "off", "max" if self.gate_max else "mean",
@@ -806,9 +811,10 @@ class CpLite:
         _cp_gather_q_ll[(rows,)](
             q.view(torch.int32), words, self.peers, self.me, self.llq_off, self.q_all.view(torch.int32),
             self.cnt[0], seq_lens, pre_lens, self.stock_lens, **gate,
-            CP=self.cp, WORDS=words, QL=q_len, FOLD=True, GWRITE=False, num_warps=4,
+            CP=self.cp, WORDS=words, QL=q_len, FOLD=True, GWRITE=False, TRIG=self.cp_pdl, num_warps=4,
         )
-        self._exact_partial(k_cache, v_cache, page_table, pre_lens, q_len, b, rows, bmm1_scale, bmm2_scale)
+        self._exact_partial(k_cache, v_cache, page_table, pre_lens, q_len, b, rows, bmm1_scale, bmm2_scale,
+                            pdl=self.cp_pdl)
         main = torch.cuda.current_stream()
         self._side.wait_stream(main)
         with torch.cuda.stream(self._side):
@@ -857,7 +863,8 @@ class CpLite:
         )
         return out
 
-    def _exact_partial(self, k_cache, v_cache, page_table, pre_lens, q_len, b, rows, bmm1_scale, bmm2_scale):
+    def _exact_partial(self, k_cache, v_cache, page_table, pre_lens, q_len, b, rows, bmm1_scale, bmm2_scale,
+                       pdl=False):
         from sglang.srt.layers.attention import q35_cp_fused as F
 
         cp, hq = self.cp, self.hq
@@ -874,7 +881,7 @@ class CpLite:
             self.po_x[:, :rows].view(cp, b, q_len * hq, HEAD_DIM),
             self.pl_x[:, :rows].view(cp, b, q_len * hq),
             sm_count=self.sms,
-            enable_pdl=False,
+            enable_pdl=pdl,
             v_pool=v_cache,
             p_shift=_EXACT_P_SHIFT,
             rescale_threshold=_EXACT_RESCALE_THRESHOLD,
