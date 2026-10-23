@@ -4,6 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.speculative import perfll_spec_index
 from sglang.srt.utils import is_cpu, next_power_of_2
 
 _is_cpu = is_cpu()
@@ -477,7 +478,12 @@ def prepare_draft_extend_layout(seq_lens, num_draft_tokens, with_mrope):
         if with_mrope
         else None
     )
-    if bs:
+    if bs and not (
+        perfll_spec_index.ENABLED
+        and perfll_spec_index.extend_layout(
+            seq_lens, num_draft_tokens, prefix, extend, post, positions, starts, mrope
+        )
+    ):
         _prepare_draft_extend_lengths_kernel[
             (triton.cdiv(bs * num_draft_tokens, 128),)
         ](
@@ -588,7 +594,22 @@ def build_chain_tree(
     )
     if req_to_token is not None:
         assert req_pool_indices is not None and req_pool_indices.numel() == bs
-    if bs:
+    if bs and not (
+        perfll_spec_index.ENABLED
+        and perfll_spec_index.chain_tree(
+            bonus_tokens,
+            draft_tokens,
+            seq_lens,
+            mask,
+            positions,
+            retrieve,
+            tokens,
+            req_pool_indices,
+            req_to_token,
+            out_cache_loc,
+            mrope,
+        )
+    ):
         _build_chain_tree_kernel[(triton.cdiv(bs * width * width, 128),)](
             bonus_tokens,
             draft_tokens,
