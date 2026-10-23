@@ -1567,6 +1567,10 @@ class Envs:
     # each call) through one cached event per (waiting, waited) stream pair, and the result
     # readback's copy_done events from a ring of 4.
     SGLANG_PERFLL_HOST_WAIT_EVENTS = EnvBool(False)
+    # The spec-v2 decode round's index kernels (draft cache locations, chain-tree verify
+    # inputs, draft-extend layout) from one JIT CUDA module and a cached host descriptor
+    # instead of three Triton launches; same integer results.
+    SGLANG_PERFLL_HOST_JIT_INDEX = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
