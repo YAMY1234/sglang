@@ -1303,6 +1303,9 @@ class Envs:
     # TRT-L18, gated exact calls with GATE_OVERLAP 1: the q gather, fused partial and merge stay on the current stream;
     # the stock call gets no key when CP runs and runs on the second stream from the partial's end to the merge's.
     SGLANG_TRTL18_CP_MAIN = EnvBool(False)
+    # TRT-L18, with CP_MAIN: the q gather releases its dependents at entry and the fused partial (and the per-head
+    # merge) launch as programmatic dependents, so the partial requests its prefix KV while the queries are in flight.
+    SGLANG_TRTL18_CP_PDL = EnvBool(False)
     # Timing only: decode graph padding per block of Q35MF_AB_BLOCK target-verify rounds, the labels in turn
     # ("pow2": the smallest captured power of two); model_executor/runner_backend/ab_variants.py. Empty: off.
     SGLANG_TRTL17_PAD_AB = EnvTuple(())
