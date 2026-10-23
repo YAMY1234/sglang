@@ -1508,6 +1508,13 @@ class Envs:
     # The compact ReplaySSM commit of every GDN layer as one CUDA launch (one CTA per layer,
     # request and value head); the same four high / low products, FP32 sums in another order.
     SGLANG_Q35MF_COMMIT_CUDA = EnvBool(False)
+    # Priority of the model runner's forward stream (CUDA: lower is higher; 0 = default, the
+    # lowest). Above the post-verify side stream, the extend's blocks dispatch before the
+    # pending mamba commit blocks, which then fill the SMs the extend leaves idle.
+    SGLANG_Q35MF_FORWARD_STREAM_PRIORITY = EnvInt(0)
+    # The commit's track-row conv window snapshot as one program per (request, block)
+    # looping over the layers: rows without a track step exit at once (bit-identical copy).
+    SGLANG_Q35MF_TRACK_SCATTER_ROWS = EnvBool(False)
     # TP > 1 EAGLE topk-1 verify keeps the target logits vocabulary-sharded: greedy rows
     # take a sharded argmax (bit-identical), temperature-only rows a sharded Gumbel-max
     # (same distribution); any other batch all-gathers them first, as before.

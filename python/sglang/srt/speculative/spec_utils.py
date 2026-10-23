@@ -214,6 +214,7 @@ SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
 SIMULATE_ACC_TOKEN_MODE = envs.SGLANG_SIMULATE_ACC_TOKEN_MODE.get()
 _COMMIT_CUDA = envs.SGLANG_Q35MF_COMMIT_CUDA.get()
+_TRACK_SCATTER_ROWS = envs.SGLANG_Q35MF_TRACK_SCATTER_ROWS.get()
 
 
 def check_simulate_acc_token_mode() -> None:
@@ -1129,6 +1130,7 @@ def commit_mamba_states_after_verify(
             commit_gdn_replayssm_spec,
         )
         from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+            conv_window_scatter_rows,
             fused_conv_window_scatter_with_mask,
         )
 
@@ -1188,7 +1190,11 @@ def commit_mamba_states_after_verify(
             src_indices_raw,
         )
         if batch.mamba_track_indices is not None:
-            fused_conv_window_scatter_with_mask(
+            (
+                conv_window_scatter_rows
+                if _TRACK_SCATTER_ROWS
+                else fused_conv_window_scatter_with_mask
+            )(
                 spec_state.conv[0],
                 spec_state.intermediate_conv_window[0],
                 batch.mamba_track_indices,
