@@ -635,16 +635,19 @@ def _cp_merge_h_ll(
     t_stride, seq_lens, out, out_stride, peers, me, ll_off, cnt, bmm1, bmm2, nb, thr,
     QL: tl.constexpr, HQ: tl.constexpr, CP: tl.constexpr, D: tl.constexpr, PG: tl.constexpr, NWP: tl.constexpr,
     NB: tl.constexpr, GMAX: tl.constexpr, WAIT: tl.constexpr,
-    po_v=None, pl_v=None, vstart=None, vcnt=None, CHUNK: tl.constexpr = False,
+    po_v=None, pl_v=None, vstart=None, vcnt=None, CHUNK: tl.constexpr = False, EARLY: tl.constexpr = False,
 ):
     """_cp_a2a_merge_ll (gated) with one program per (row, head): pushes the head's partials, computes its causal
     block, then merges the CP partials as they arrive. One epoch per (row, head) in cnt, in an LL region of its own
     (the row merge's epochs differ). WAIT: launched as a programmatic dependent.
     CHUNK (PERF-LB cp3, fold layout): a request with chunk rows sends the base-2 LSE combine of its rows' partials
-    (po_v [nv, QL * CP * HQ, D] bf16, pl_v [nv, QL * CP * HQ] fp32) instead of po / plse."""
+    (po_v [nv, QL * CP * HQ, D] bf16, pl_v [nv, QL * CP * HQ] fp32) instead of po / plse.
+    EARLY (with WAIT): the causal block before the wait, which then guards only the partials (and CHUNK's chunk rows);
+    its predecessor releases it only after its own wait, so the step's q / K / V (written upstream of that wait) are
+    complete."""
     i = tl.program_id(0)
     h = tl.program_id(1)
-    if WAIT:
+    if WAIT and not EARLY:
         _gdc_wait_clobber()
     if _gate_on(seq_lens, nb, thr, NB, GMAX).to(tl.int32) == 0:
         return
@@ -655,6 +658,12 @@ def _cp_merge_h_ll(
     NO: tl.constexpr = HQ * D // 2
     H: tl.constexpr = QL * CP * HQ
     w = tl.arange(0, DW)
+    L = tl.load(seq_lens + i // QL)
+    if EARLY:
+        acc, m, wsum = _causal_block_h(q, q_stride, i, h, L, k_cache, v_cache, kv_page_stride, kv_tok_stride, table,
+                                       t_stride, bmm1, bmm2, QL, D, PG)
+        if WAIT:
+            _gdc_wait_clobber()
     if CHUNK:
         n_v = tl.load(vcnt + i // QL)
         v0 = tl.load(vstart + i // QL)
@@ -692,9 +701,9 @@ def _cp_merge_h_ll(
         dst = (tl.load(peers + c) + ll_off + (i * CP + me) * NWP * 8).to(tl.pointer_type(tl.int64))
         tl.store(dst + h * DW + w, ow)
         tl.store(dst + NO + h + one, lw)
-    L = tl.load(seq_lens + i // QL)
-    acc, m, wsum = _causal_block_h(q, q_stride, i, h, L, k_cache, v_cache, kv_page_stride, kv_tok_stride, table,
-                                   t_stride, bmm1, bmm2, QL, D, PG)
+    if not EARLY:
+        acc, m, wsum = _causal_block_h(q, q_stride, i, h, L, k_cache, v_cache, kv_page_stride, kv_tok_stride, table,
+                                       t_stride, bmm1, bmm2, QL, D, PG)
     n_pages = (tl.maximum(L - QL, 0) + PG - 1) // PG
     own = tl.load(peers + me) + ll_off
     for c in tl.static_range(CP):
@@ -754,6 +763,7 @@ class CpLite:
         total = self.llp_off + _MAX_ROWS * cp * _LL_PWORDS * 8
         self.cp_ungated = envs.SGLANG_TRTL18_CP_UNGATED.get()
         self.gather_pdl = self.cp_ungated and envs.SGLANG_PERFLL_CP_GATHER_PDL.get()
+        self.early_merge = self.cp_ungated and envs.SGLANG_PERFLL_CP_EARLY_MERGE.get()
         self.merge_h = envs.SGLANG_TRTL18_CP_MAIN.get() and envs.SGLANG_TRTL18_CP_MERGE_H.get()
         self.llh_off = total
         self.fold_mh = envs.SGLANG_PLB_CP_FOLD_MH.get()
@@ -823,7 +833,8 @@ class CpLite:
         logger.info("TRT-L1 CP-lite exact (prefix-only fused partial + fp32 causal block): %s", self.exact)
         logger.info("TRT-L18 CP-lite gated exact calls: CP on the current stream, stock after the partial: %s, PDL %s, "
                     "per-head merge %s; ungated exact calls with PDL and the per-head merge: %s (q gather as a PDL "
-                    "dependent: %s)", self.cp_main, self.cp_pdl, self.merge_h, self.cp_ungated, self.gather_pdl)
+                    "dependent: %s, merge released early: %s)", self.cp_main, self.cp_pdl, self.merge_h, self.cp_ungated,
+                    self.gather_pdl, self.early_merge)
         logger.info(
             "TRT-L1 CP-lite KV gate: min KV per request %s (%s of the batch)",
             self.min_kv or "off", "max" if self.gate_max else "mean",
@@ -1093,14 +1104,14 @@ class CpLite:
             num_warps=4, launch_pdl=self.gather_pdl,
         )
         self._exact_partial(k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale,
-                            pdl=True, len_sub=q_len)
+                            pdl=True, len_sub=q_len, early_trigger=self.early_merge)
         out = torch.empty(rows, self.hq, HEAD_DIM, dtype=torch.bfloat16, device=self.device)
         self._merge_h(q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale, out,
-                      dict(gate, thr=0), pdl=True)
+                      dict(gate, thr=0), pdl=True, early=self.early_merge)
         return out
 
     def _merge_h(self, q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale, out, gate,
-                 pdl=None):
+                 pdl=None, early=False):
         pdl = self.cp_pdl if pdl is None else pdl
         hq = self.hq
         _cp_merge_h_ll[(rows, hq)](
@@ -1109,7 +1120,7 @@ class CpLite:
             page_table, page_table.stride(0), seq_lens, out, out.stride(0), self.peers, self.me, self.llh_off,
             self.cnt_h, bmm1_scale, bmm2_scale, gate["nb"], gate["thr"],
             QL=q_len, HQ=hq, CP=self.cp, D=HEAD_DIM, PG=PAGE, NWP=_LL_PWORDS, NB=gate["NB"], GMAX=gate["GMAX"],
-            WAIT=pdl, num_warps=4, launch_pdl=pdl,
+            WAIT=pdl, EARLY=early and pdl, num_warps=4, launch_pdl=pdl,
         )
 
     def _own_workspace(self):
@@ -1229,7 +1240,7 @@ class CpLite:
         return out
 
     def _exact_partial(self, k_cache, v_cache, page_table, pre_lens, q_len, b, rows, bmm1_scale, bmm2_scale,
-                       pdl=False, len_sub=0):
+                       pdl=False, len_sub=0, early_trigger=False):
         from sglang.srt.layers.attention import q35_cp_fused as F
 
         cp, hq = self.cp, self.hq
@@ -1251,6 +1262,7 @@ class CpLite:
             p_shift=_EXACT_P_SHIFT,
             rescale_threshold=_EXACT_RESCALE_THRESHOLD,
             len_sub=len_sub,
+            early_trigger=early_trigger,
         )
 
     def _exact_merge(self, q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale, out, gate):
