@@ -1188,6 +1188,9 @@ def _verify_outputs(
     return predict, accept_index, out[rows + bs * depth :], out
 
 
+_DECODE_ALLOC = envs.SGLANG_PERFLL_HOST_DECODE_ALLOC.get()
+
+
 def eagle_prepare_for_decode(batch: ScheduleBatch):
     batch.maybe_evict_swa()
 
@@ -1206,6 +1209,12 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     )
     for r in batch.reqs:
         r.decode_batch_idx += 1
+
+    if num_needed_tokens == 0 and _DECODE_ALLOC:
+        # alloc_for_spec_decode with nothing to allocate only raises the recorded lengths
+        for req, nxt_kv_len in zip(batch.reqs, nxt_kv_lens, strict=True):
+            req.kv.kv_allocated_len = max(req.kv.kv_allocated_len, nxt_kv_len)
+        return
 
     cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
     nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")
