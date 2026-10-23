@@ -263,6 +263,7 @@ def _compiled(
     balanced: bool = False,
     rescale_threshold: Optional[float] = None,
     l_from_p8: bool = False,
+    len_sub: int = 0,
 ):
     import cuda.bindings.driver as cuda
     import cutlass
@@ -290,6 +291,7 @@ def _compiled(
             balanced=True,
             rescale_threshold=rescale_threshold,
             l_from_p8=l_from_p8,
+            len_sub=len_sub,
         )
         assert kernel.ws_bytes == cp_partial_balanced_ws_bytes(q_len * gh, n_splits)
     else:
@@ -311,6 +313,7 @@ def _compiled(
             debug_ring=debug_ring,
             rescale_threshold=rescale_threshold,
             l_from_p8=l_from_p8,
+            len_sub=len_sub,
         )
         assert kernel.ws_req_bytes == cp_partial_geometry(q_len * gh, n_splits)["ws_req_bytes"]
     dev = torch.device("cuda")
@@ -379,6 +382,7 @@ def q35_cp_fused_partial(
     balanced: Optional[bool] = None,
     rescale_threshold: Optional[float] = None,
     l_from_p8: bool = False,
+    len_sub: int = 0,
 ) -> None:
     """This CP rank's partial attention of every group head over the pages it owns (q35_cp_fused_partial_ref).
 
@@ -508,6 +512,7 @@ def q35_cp_fused_partial(
             True,
             rescale_threshold,
             bool(l_from_p8),
+            int(len_sub),
         )
     else:
         fn = _compiled(
@@ -529,6 +534,7 @@ def q35_cp_fused_partial(
             False,
             rescale_threshold,
             bool(l_from_p8),
+            int(len_sub),
         )
     fp8 = cutlass.Float8E4M3FN
     f32 = cutlass.Float32
