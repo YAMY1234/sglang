@@ -21,6 +21,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_dsa
+from sglang.srt.disaggregation import l16_loopstat
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -264,8 +265,13 @@ def _all_reduce_polls(polls: List[int], group: dist.ProcessGroup) -> List[int]:
     if dist.get_world_size(group) == 1:
         return polls
 
+    ls = l16_loopstat.STAT
+    t0 = l16_loopstat._now() if ls is not None else 0
     tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
     dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=group)
+    if ls is not None:
+        ls.add("ar", t0)
+        ls.ar_n += 1
     return tensor_to_reduce.tolist()
 
 

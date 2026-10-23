@@ -1519,6 +1519,15 @@ class Envs:
     # step, written once at the last step's length, and the other steps' sequence lengths in
     # one launch (the steps read the same values). No SWA, no unified pool.
     SGLANG_Q35MF_DRAFT_SHARED_METADATA = EnvBool(False)
+    # PD request timing trace: one "L12T" log line per finished request on each P / D
+    # TP0 (wall-clock stage times, keyed by bootstrap_room) and per transfer chunk on P TP0.
+    SGLANG_TRTL12_TRACE = EnvBool(False)
+    # Request allocation without host syncs: list-indexed mamba-slot writes go through
+    # pinned non-blocking copies, and PD decode sends a preallocated request's metadata
+    # on a later poll after a non-blocking index readback. A pageable H2D or a blocking
+    # D2H on the schedule stream waits for the in-flight forward (the stream is fenced
+    # on it) and stalls the overlap loop.
+    SGLANG_TRTL16_PREALLOC_NO_SYNC = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)

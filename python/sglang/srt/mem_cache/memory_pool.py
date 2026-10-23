@@ -57,6 +57,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.disaggregation import l16_loopstat
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
@@ -92,6 +93,7 @@ from sglang.srt.utils import (
     is_xpu,
     next_power_of_2,
 )
+from sglang.srt.utils.common import async_h2d
 from sglang.srt.utils.async_probe import (
     maybe_detect_oob,
 )
@@ -1152,7 +1154,11 @@ class MambaPool:
             fused_clear_conv_slots(self._conv_slot_desc, indices)
             temporal = self.mamba_cache.temporal
             if temporal.numel() > 0:
-                temporal[:, indices] = 0
+                if l16_loopstat.prealloc_no_sync():
+                    # A Python-scalar value is a pageable H2D that waits for this stream.
+                    temporal.index_fill_(1, indices.long(), 0)
+                else:
+                    temporal[:, indices] = 0
             return
         if not _is_npu:
             need_size = len(indices)
@@ -1589,12 +1595,21 @@ class HybridReqToTokenPool(ReqToTokenPool):
         if select_index is None:
             return None
 
+        no_sync = l16_loopstat.prealloc_no_sync()
         spec_write_pos = getattr(self.mamba_pool, "replayssm_spec_write_pos", None)
         if spec_write_pos is not None:
             fresh_indices = [
                 idx for idx, fresh in zip(select_index, fresh_req_rows) if fresh
             ]
-            if fresh_indices:
+            if fresh_indices and no_sync:
+                # A Python-scalar value is a pageable H2D even with a device index.
+                fresh_rows = async_h2d(
+                    fresh_indices, dtype=torch.int64, device=spec_write_pos.device
+                )
+                spec_write_pos.index_fill_(0, fresh_rows, 0)
+                self.mamba_pool.replayssm_cache_base.index_fill_(0, fresh_rows, 0)
+                self.mamba_pool.replayssm_is_flush.index_fill_(0, fresh_rows, 0)
+            elif fresh_indices:
                 spec_write_pos[fresh_indices] = 0
                 self.mamba_pool.replayssm_cache_base[fresh_indices] = 0
                 self.mamba_pool.replayssm_is_flush[fresh_indices] = 0
@@ -1616,7 +1631,10 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 # ignores ring contents and reads only the checkpoint state
                 # (the post-prefill state that prefill wrote into this slot).
                 if self.mamba_pool.replayssm_write_pos is not None:
-                    self.mamba_pool.replayssm_write_pos[req.kv.mamba_pool_idx] = 0
+                    if no_sync:
+                        self.mamba_pool.replayssm_write_pos.index_fill_(0, mid, 0)
+                    else:
+                        self.mamba_pool.replayssm_write_pos[req.kv.mamba_pool_idx] = 0
             mamba_indices.append(req.kv.mamba_pool_idx)
             if self.enable_mamba_extra_buffer:
                 if req.kv.mamba_ping_pong_track_buffer is None:
@@ -1632,10 +1650,15 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
             )
         mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
-        self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
+        rows = (
+            async_h2d(select_index, dtype=torch.int64, device=self.device)
+            if no_sync
+            else select_index
+        )
+        self.req_index_to_mamba_index_mapping[rows] = mamba_index_tensor
         if self.enable_mamba_extra_buffer:
             ping_pong_tensor = torch.stack(mamba_ping_pong_track_buffers)
-            self.req_index_to_mamba_ping_pong_track_buffer_mapping[select_index] = (
+            self.req_index_to_mamba_ping_pong_track_buffer_mapping[rows] = (
                 ping_pong_tensor
             )
         return select_index

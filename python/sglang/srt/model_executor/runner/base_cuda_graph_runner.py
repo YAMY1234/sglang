@@ -22,6 +22,7 @@ from abc import abstractmethod
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Tuple
 
+from sglang.srt.disaggregation import l16_loopstat
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
 from sglang.srt.model_executor.runner_backend import ab_variants
@@ -181,6 +182,10 @@ class BaseCudaGraphRunner(BaseRunner):
             padded = ab_variants.pad(raw_size, buckets)
             if padded is not None:
                 return padded
+        if l16_loopstat.COARSE_ACTIVE is not None:
+            coarse = l16_loopstat.coarse_pad(raw_size, buckets)
+            if coarse is not None:
+                return coarse
         index = bisect.bisect_left(buckets, raw_size)
         return buckets[index]
 
