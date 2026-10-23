@@ -1560,7 +1560,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             not self.is_xqa_impl
             and attn_tp == 1
             and get_parallel().attn_dcp_size == 1
-            and self.decode_seq_len_splits == 1
+            and (
+                self.decode_seq_len_splits == 1
+                or envs.SGLANG_PERFHT_VCH_WITH_SPLITS.get()
+            )
             and not self.is_nvfp4_kvcache
             and vch_supported(
                 num_q_heads,
