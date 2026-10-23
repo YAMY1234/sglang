@@ -1709,6 +1709,8 @@ class Envs:
     # The compact ReplaySSM commit of every GDN layer as one CUDA launch (one CTA per layer,
     # request and value head); the same four high / low products, FP32 sums in another order.
     SGLANG_Q35MF_COMMIT_CUDA = EnvBool(False)
+    # PERF-HT: the attention-DP GDN verify launch table (SGLANG_Q35MF_E2X_DEP_GDN) extended to B17-36 (byte-identical).
+    SGLANG_PERFHT_DEP_GDN_WIDE = EnvBool(False)
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
