@@ -207,6 +207,8 @@ class SchedulePolicy:
         # rid -> batch formations waited; a round count, not wall time, so every TP rank orders alike
         self._spf_rounds: Dict[str, int] = {}
         self._spf_match_every = envs.SGLANG_PERFPF_SPF_MATCH_EVERY.get()
+        self._spf_age_cap = envs.SGLANG_PERFPF_SPF_AGE_CAP.get()
+        self._spf_chunk_min_pct = envs.SGLANG_PERFPF_SPF_CHUNK_MIN_PCT.get()
         self._spf_match_round = 0
         # rid -> round of its last prefix match in calc_priority
         self._spf_matched: Dict[str, int] = {}
@@ -451,6 +453,26 @@ class SchedulePolicy:
         rounds = {r.rid: self._spf_rounds.get(r.rid, 0) + 1 for r in waiting_queue}
         self._spf_rounds = rounds
         limit = self._spf_age_rounds
+        cap = get_schedule().chunked_prefill_size or 0
+        if self._spf_age_cap and cap > 0:
+            # An aged request sorts as if its prefill were one batch budget: after
+            # the requests that fit in a batch, before younger long ones (oldest
+            # first), so it becomes the next chunked request without blocking
+            # the short requests ahead of it.
+            def key(r):
+                work = SchedulePolicy._shortest_prefill_work(r)
+                aged = rounds[r.rid] > limit
+                return (
+                    r.rid in temporary_deprioritized,
+                    min(work, cap) if aged else work,
+                    not aged,
+                    -rounds[r.rid] if aged else 0,
+                    r.time_stats.wait_queue_entry_time,
+                    r.rid,
+                )
+
+            waiting_queue.sort(key=key)
+            return
         waiting_queue.sort(
             key=lambda r: (
                 rounds[r.rid] <= limit,
@@ -475,11 +497,17 @@ class SchedulePolicy:
         ):
             return None
         remaining = len(chunked_req.full_untruncated_fill_ids) - chunked_req.prefix_len
+        # The chunk keeps at least min_chunk tokens per batch, so it always progresses.
+        min_chunk = max(page_size, budget * self._spf_chunk_min_pct // 100)
         reserved = 0
         for req in waiting_queue:
             work = self._shortest_prefill_work(req)
             charge = _ceil_div(work, page_size) * page_size
-            if work >= remaining or reserved + charge > budget - page_size:
+            if work >= remaining:
+                if self._spf_chunk_min_pct:
+                    continue
+                break
+            if reserved + charge > budget - min_chunk:
                 break
             reserved += charge
         if not reserved:
