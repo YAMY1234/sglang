@@ -191,9 +191,32 @@ _mc_state = None
 _mc_width = 0
 
 
-def _mc_gather_keys(keys: torch.Tensor, tp_group) -> torch.Tensor:
+def _mc_build(tp_group, hidden_size: int, device):
+    """The multimem state, or False (NCCL keeps the exchange) when the buffer has no
+    multicast mapping, e.g. a TP group across nodes on torch symmetric memory."""
+    from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
+
+    try:
+        state = triton_symm_mem_ag.create_state(
+            tp_group.device_group,
+            tp_group.rank_in_group,
+            max_tokens=_MC_MAX_ROWS,
+            hidden_size=hidden_size,
+            device=device,
+        )
+    except Exception as e:  # rendezvous refused: every rank sees the same failure
+        print_info_once(f"SGLANG_PERFLL_VERIFY_MC_GATHER: multimem state failed ({e}); NCCL gather")
+        return False
+    if state.symm_mem_hdl.multicast_ptr == 0:
+        print_info_once("SGLANG_PERFLL_VERIFY_MC_GATHER: no multicast mapping; NCCL gather")
+        return False
+    return state
+
+
+def _mc_gather_keys(keys: torch.Tensor, tp_group) -> Optional[torch.Tensor]:
     """[rows] or [rows, parts] int64 keys of every rank -> [rows] token ids, by one
-    multimem all-gather (rows of at least 2 int64: a single key goes twice)."""
+    multimem all-gather (rows of at least 2 int64: a single key goes twice); None when
+    there is no multicast state."""
     global _mc_state, _mc_width
     from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 
@@ -202,14 +225,10 @@ def _mc_gather_keys(keys: torch.Tensor, tp_group) -> torch.Tensor:
         keys = torch.stack((keys, keys), dim=1)
     width = keys.shape[1]
     if _mc_state is None:
-        _mc_state = triton_symm_mem_ag.create_state(
-            tp_group.device_group,
-            tp_group.rank_in_group,
-            max_tokens=_MC_MAX_ROWS,
-            hidden_size=4 * width * world,
-            device=keys.device,
-        )
+        _mc_state = _mc_build(tp_group, 4 * width * world, keys.device)
         _mc_width = width
+    if _mc_state is False:
+        return None
     assert width == _mc_width, (width, _mc_width)
     out = triton_symm_mem_ag.all_gather_inner(
         _mc_state, keys.view(torch.bfloat16), 4 * width * world, safe=False
@@ -246,7 +265,9 @@ def sharded_target_tokens(
     splits = key_splits(shard.valid) if _SPLIT else 1
     keys = shard_keys(logits, shard, temperatures, seeds, splits)
     if _MC_GATHER and 0 < keys.shape[0] <= _MC_MAX_ROWS:
-        return _mc_gather_keys(keys, tp_group)
+        tokens = _mc_gather_keys(keys, tp_group)
+        if tokens is not None:
+            return tokens
     gathered = torch.empty(
         tp_group.world_size * keys.numel(), dtype=torch.int64, device=keys.device
     )
