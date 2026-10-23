@@ -154,13 +154,9 @@ _E2X_DEP_VERIFY_LAUNCH = {
 
 
 # SGLANG_PERFHT_DEP_GDN_WIDE: the attention-DP batches of the T5 decode role (B17-36), where the package launch
-# (BV32, two warps) is 25-36 % slower than BV128 / two warps / three stages on the 45-layer chain; byte-identical to
-# the package launch. The sixth element is the verify PDL: off from B27, where the early-launched CTAs cost more
-# than the overlap gives.
-_HT_DEP_VERIFY_LAUNCH_WIDE = {
-    **{batch: (128, 2, 3, None, 128, True) for batch in range(17, 27)},
-    **{batch: (128, 2, 3, None, 128, False) for batch in range(27, 37)},
-}
+# (BV32, two warps) is 25-31 % slower than BV128 / two warps / three stages on the 45-layer conv -> verify ->
+# gated-norm FP8 chain; byte-identical to the package launch.
+_HT_DEP_VERIFY_LAUNCH_WIDE = {batch: (128, 2, 3, None, 128) for batch in range(17, 37)}
 
 
 def _e2x_tp2_verify_launch(
@@ -170,7 +166,7 @@ def _e2x_tp2_verify_launch(
     head_dim: int,
     draft_token_num: int,
     batch_size: int,
-) -> Optional[Tuple]:
+) -> Optional[Tuple[int, int, int, Optional[int], int]]:
     """Per-batch TP2 / attention-DP verify launch override; None keeps the stock launch."""
     shape = (num_k_heads, num_v_heads, head_dim, draft_token_num)
     if shape == (8, 32, 128, 7) and envs.SGLANG_Q35MF_E2X_TP2_GDN.get():
@@ -2082,7 +2078,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             else None
         )
         if e2x_launch is not None:
-            block_v, num_warps, num_stages, maxnreg = e2x_launch[:4]
+            block_v, num_warps, num_stages, maxnreg, _ = e2x_launch
             verify_options.update(
                 block_v=block_v, num_warps=num_warps, num_stages=num_stages
             )
@@ -2092,9 +2088,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
             use_pdl = (
                 envs.SGLANG_Q35MF_GDN_PDL.get() if verify_pdl is None else verify_pdl
             )
-            if len(e2x_launch) > 5 and e2x_launch[5] is False:
-                use_pdl = False
-                verify_options.pop("pdl", None)
             if use_pdl and q.is_cuda and is_arch_support_pdl():
                 verify_options["pdl"] = True
                 if (
