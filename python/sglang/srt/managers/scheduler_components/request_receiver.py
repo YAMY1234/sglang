@@ -46,6 +46,7 @@ from sglang.srt.observability.scheduler_stage_metrics import (
 from sglang.srt.runtime_context import get_disagg, get_exec, get_parallel
 from sglang.srt.utils import (
     broadcast_pyobj,
+    host_trace,
     point_to_point_pyobj,
 )
 
@@ -214,12 +215,16 @@ class SchedulerRequestReceiver:
                         recv_reqs, exchange=exchange, tp_group=tp_group
                     )
                 else:
+                    if host_trace.ENABLED:
+                        host_trace.mark(host_trace.RECV0)
                     recv_reqs = broadcast_pyobj(
                         recv_reqs,
                         tp_group.rank,
                         tp_group.cpu_group,
                         src=tp_group.ranks[0],
                     )
+                    if host_trace.ENABLED:
+                        host_trace.mark(host_trace.RECV1)
         return recv_reqs
 
     def unwrap_pickle_wrapper(self, recv_reqs: Optional[List]) -> None:

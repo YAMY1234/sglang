@@ -124,6 +124,7 @@ from sglang.srt.runtime_context import (
     get_observability,
 )
 from sglang.srt.session.streaming_session import StreamingSession, is_virtual_node
+from sglang.srt.utils import host_trace
 from sglang.srt.utils.common import ceil_align, get_device_module
 from sglang.srt.utils.poll_timer import PollTimer
 
@@ -3526,7 +3527,11 @@ class UnifiedRadixCache(BasePrefixCache):
             # Storage adds a count per extra host pool; a row wider than the table
             # takes the gloo reduce below.
             if len(values) <= exchange.width:
+                if host_trace.ENABLED:
+                    host_trace.mark(host_trace.HC0)
                 rows = exchange.allgather(values)
+                if host_trace.ENABLED:
+                    host_trace.mark(host_trace.HC1)
                 assert all(row[-2:] == rows[0][-2:] for row in rows), (
                     "write_back duplicate-reclaim victims diverged across TP ranks"
                 )

@@ -363,6 +363,7 @@ from sglang.srt.utils import (
     suppress_other_loggers,
     triton_load_watch,
 )
+from sglang.srt.utils import host_trace
 from sglang.srt.utils.common import is_confidential_compute, is_npu
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
@@ -2071,6 +2072,7 @@ class Scheduler(
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         self.enable_skip_finishing_decode = True
+        host_trace.apply_switch_interval()
         self.result_queue: Deque[
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
@@ -2083,6 +2085,8 @@ class Scheduler(
         while True:
             if self.gracefully_exit:
                 break
+            if host_trace.ENABLED:
+                host_trace.pass_begin()
 
             # Receive requests
             self.ingest_requests()
@@ -2097,6 +2101,8 @@ class Scheduler(
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
+            if host_trace.ENABLED:
+                host_trace.mark(host_trace.NEXT1)
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(
                 batch, last_batch=self.last_batch
             )
@@ -2116,10 +2122,14 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
+                if host_trace.ENABLED:
+                    host_trace.mark(host_trace.RUN0)
                 batch_result = self.run_batch(batch)
                 # Fence result processing behind this forward's shared reads.
                 self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
+                if host_trace.ENABLED:
+                    host_trace.mark(host_trace.RUN1)
             else:
                 batch_result = None
                 self._sched_idled = True
@@ -2127,10 +2137,18 @@ class Scheduler(
             # Process the last batch
             if self.last_batch:
                 if not disable_overlap_for_batch:
+                    if host_trace.ENABLED:
+                        host_trace.mark(host_trace.PROC0)
                     pop_and_process()
+                    if host_trace.ENABLED:
+                        host_trace.mark(host_trace.PROC1)
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
+                if host_trace.ENABLED:
+                    host_trace.maybe_flush()
+            if host_trace.ENABLED:
+                host_trace.pass_end(keep=bool(batch) or self.last_batch is not None)
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.

@@ -126,6 +126,7 @@ from sglang.srt.speculative.spec_utils import (
     select_top_k_tokens,
     spec_stage_span,
 )
+from sglang.srt.utils import host_trace
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -719,6 +720,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
                     self.cuda_graph_runner.execute(forward_batch)
                 )
+                if host_trace.ENABLED:
+                    host_trace.gpu_mark(host_trace.DRAFTG)
                 if draft_probs is not None:
                     # draft_probs is the one graph output read after the target
                     # forward rather than by it, and it points into the graph's
@@ -1551,14 +1554,22 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     speculative_moe_a2a_backend_context(),
                     spec_stage_span("draft"),
                 ):
+                    if host_trace.ENABLED:
+                        host_trace.gpu_mark(host_trace.DRAFT0)
                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
+                    if host_trace.ENABLED:
+                        host_trace.gpu_mark(host_trace.DRAFT1)
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
+            if host_trace.ENABLED:
+                host_trace.gpu_mark(host_trace.VERIFY0)
             batch_output = self.verify(
                 batch,
                 pp_proxy_tensors=pp_proxy_tensors,
                 grammar_barrier=grammar_barrier,
             )
+            if host_trace.ENABLED:
+                host_trace.gpu_mark(host_trace.VERIFY1)
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
@@ -1574,9 +1585,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     speculative_moe_a2a_backend_context(),
                     spec_stage_span("draft_extend"),
                 ):
+                    if host_trace.ENABLED:
+                        host_trace.mark(host_trace.EXT0)
                     self.draft_worker._draft_extend_for_decode(
                         batch, batch_output, iteration_ids=verify_input.iteration_ids
                     )
+                    if host_trace.ENABLED:
+                        host_trace.gpu_mark(host_trace.EXT1)
             if self._post_verify_graphs is not None:
                 # The mamba state commit may still run on a side stream.
                 self._post_verify_graphs.join()
