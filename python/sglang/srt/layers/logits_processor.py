@@ -227,6 +227,9 @@ class LogitsProcessorOutput:
 
     # Original flattened token indices when only a subset of hidden rows is captured.
     hidden_states_token_indices: Optional[torch.Tensor] = None
+    # SGLANG_Q35MF_SHARDED_VERIFY: next_token_logits is this rank's [#seq, V / tp] shard
+    # of the vocabulary, laid out as this VocabShard says.
+    next_token_logits_vocab_shard: Optional[Any] = None
 
     # Post-norm last-layer hidden states of every token, kept under full capture
     # when `hidden_states` holds the aux hidden states
@@ -490,6 +493,14 @@ class LogitsProcessor(nn.Module):
         # Set before graph capture by a speculative worker that finishes the TP
         # gather itself (see finish_deferred_gather / deferred_argmax).
         self.defer_verify_gather = False
+        self.sharded_verify = (
+            envs.SGLANG_Q35MF_SHARDED_VERIFY.get()
+            and self.do_tensor_parallel_all_gather
+            and not self.use_attn_tp_group
+            and not self.do_tensor_parallel_all_gather_dp_attn
+            and not self.use_tp_lm_head_all_to_all
+            and not return_full_logits
+        )
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
         )
@@ -630,6 +641,14 @@ class LogitsProcessor(nn.Module):
         del hidden_states
 
         if not logits_metadata.extend_return_logprob:
+            vocab_shard = self._verify_vocab_shard(lm_head, logits_metadata)
+            if vocab_shard is not None:
+                return LogitsProcessorOutput(
+                    next_token_logits=self._get_shard_logits(pruned_states, lm_head),
+                    next_token_logits_vocab_shard=vocab_shard,
+                    hidden_states=hidden_states_to_store,
+                    mm_input_embeds=logits_metadata.mm_input_embeds,
+                )
             # Compute logits for both input and sampled tokens.
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
             sampled_logits = (
@@ -663,6 +682,36 @@ class LogitsProcessor(nn.Module):
         )
         logprobs_result.write_input_to(logits_output)
         return logits_output
+
+    def _verify_vocab_shard(
+        self, lm_head: VocabParallelEmbedding, logits_metadata: LogitsMetadata
+    ):
+        """The VocabShard a target verify keeps its logits in, or None for the gather."""
+        if not (
+            self.sharded_verify
+            and not self.defer_verify_gather
+            and logits_metadata.forward_mode.is_target_verify()
+            and self.final_logit_softcapping is None
+            and isinstance(lm_head, VocabParallelEmbedding)
+            and lm_head.shard_indices.num_added_elements_padded == 0
+        ):
+            return None
+        from sglang.srt.speculative.sharded_verify import VocabShard
+
+        indices = lm_head.shard_indices
+        return VocabShard(
+            start=indices.org_vocab_start_index,
+            valid=indices.num_org_elements,
+            vocab_size=self.vocab_size,
+        )
+
+    def _get_shard_logits(
+        self, hidden_states: torch.Tensor, lm_head: VocabParallelEmbedding
+    ) -> torch.Tensor:
+        logits = self._compute_lm_head(hidden_states, lm_head)
+        if self.logit_scale is not None:
+            logits.mul_(self.logit_scale)
+        return logits
 
     def _get_pruned_states(
         self,

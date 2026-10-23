@@ -1629,6 +1629,10 @@ class Envs:
     # The compact ReplaySSM commit of every GDN layer as one CUDA launch (one CTA per layer,
     # request and value head); the same four high / low products, FP32 sums in another order.
     SGLANG_Q35MF_COMMIT_CUDA = EnvBool(False)
+    # TP > 1 EAGLE topk-1 verify keeps the target logits vocabulary-sharded: greedy rows
+    # take a sharded argmax (bit-identical), temperature-only rows a sharded Gumbel-max
+    # (same distribution); any other batch all-gathers them first, as before.
+    SGLANG_Q35MF_SHARDED_VERIFY = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
