@@ -107,6 +107,7 @@ from sglang.srt.distributed.parallel_state import (
     abort_distributed_environment,
 )
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
+from sglang.srt.disaggregation import l16_loopstat
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
@@ -2015,20 +2016,31 @@ class Scheduler(
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
 
+        ls = l16_loopstat.init(self)
+
         def pop_and_process():
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
+            if ls is not None and getattr(tmp_result, "copy_done", None) is not None:
+                ls.mark("pr")
+                tmp_result.copy_done.synchronize()
+                ls.mark("prw")
             self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
             if self.gracefully_exit:
                 break
 
+            if ls is not None:
+                ls.begin()
             # Receive requests
             self.ingest_requests()
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
+            if ls is not None:
+                ls.mark("in")
+                ls.apply_knobs()
 
             # Get the next batch to run
             plan = self.get_next_batch_to_run(
@@ -2054,15 +2066,23 @@ class Scheduler(
                     except Exception:
                         pass
 
+            if ls is not None:
+                ls.mark("nb")
             # Launch the current batch
             if batch:
+                if ls is not None:
+                    ls.gpu_a(self.forward_stream)
                 batch_result = self.run_batch(batch)
                 # Fence result processing behind this forward's shared reads.
                 self._apply_war_barrier()
+                if ls is not None:
+                    ls.gpu_b(self.forward_stream)
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
                 self._sched_idled = True
+            if ls is not None:
+                ls.mark("rb")
 
             # Process the last batch
             if self.last_batch:
@@ -2071,11 +2091,18 @@ class Scheduler(
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
+            if ls is not None:
+                ls.mark("pr")
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             if self.is_generation:
                 self.launch_batch_sample_if_needed(batch_result, batch)
+            if ls is not None:
+                ls.mark("smp")
+                ls.meta["mode"] = int(batch is not None and batch.forward_mode.is_extend())
+                ls.meta["nwait"] = len(self.waiting_queue)
+                ls.end(batch)
 
             # Update last_batch
             self.last_batch = batch
