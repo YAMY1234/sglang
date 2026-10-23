@@ -214,6 +214,10 @@ SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
 SIMULATE_ACC_TOKEN_MODE = envs.SGLANG_SIMULATE_ACC_TOKEN_MODE.get()
 _COMMIT_CUDA = envs.SGLANG_Q35MF_COMMIT_CUDA.get()
+_COMMIT_INLAYER = envs.SGLANG_Q35MF_COMMIT_INLAYER.get()
+_COMMIT_INLAYER_MIN_BS = envs.SGLANG_Q35MF_COMMIT_INLAYER_MIN_BS.get()
+# The amortized in-layer fold's history bound: the verify core replays two tiles of 8 entries.
+_INLAYER_HISTORY = 16
 
 
 def check_simulate_acc_token_mode() -> None:
@@ -1146,6 +1150,14 @@ def commit_mamba_states_after_verify(
             )
         else:
             last_correct_step_indices, mamba_steps_to_track = prepared_step_indices
+        bf16 = spec_state.temporal.dtype != torch.float32
+        # SGLANG_Q35MF_COMMIT_INLAYER: flagged rows fold at the next verify instead of here.
+        defer = bf16 and _COMMIT_INLAYER != 0 and bs >= _COMMIT_INLAYER_MIN_BS
+        amortized = defer and _COMMIT_INLAYER == 2
+        if amortized and spec_state.replayssm_d.shape[-2] < _INLAYER_HISTORY + draft_token_num:
+            raise ValueError(
+                "SGLANG_Q35MF_COMMIT_INLAYER=2 needs --linear-replayssm-cache-len 32"
+            )
         # Advance the per-request circular cursors by the accepted count (incl. the
         # bonus token). max_cache_len = ring length L = replayssm_d.shape[-2].
         commit_gdn_replayssm_spec(
@@ -1156,8 +1168,9 @@ def commit_mamba_states_after_verify(
             replay_indices=replay_indices,
             max_cache_len=spec_state.replayssm_d.shape[-2],
             max_spec_len=draft_token_num,
-            fold_every_commit=spec_state.temporal.dtype != torch.float32,
+            fold_every_commit=bf16 and not amortized,
             null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
+            history_limit=_INLAYER_HISTORY if amortized else 0,
         )
         # Capacity rows fold all layers in one launch; track rows snapshot the
         # exact crossing state without disturbing the active circular history.
@@ -1178,6 +1191,7 @@ def commit_mamba_states_after_verify(
             mamba_steps_to_track=mamba_steps_to_track,
             null_block_id=-1,
             use_cuda=_COMMIT_CUDA,
+            fold=not defer,
         )
         # Roll back active conv state and snapshot its interval-crossing window.
         fused_conv_window_scatter_with_mask(

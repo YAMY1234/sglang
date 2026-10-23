@@ -71,6 +71,8 @@ _fused_decode_proj_conv_fallback_logged = False
 _fused_decode_proj_conv_layers_logged: set[int] = set()
 _fused_decode_real_tensor_verified_layers: set[int] = set()
 _fused_decode_log_layer_hits = envs.SGLANG_GDN_DECODE_FUSION_LOG_LAYER_HITS.get()
+_COMMIT_INLAYER = envs.SGLANG_Q35MF_COMMIT_INLAYER.get()
+_COMMIT_CUDA = envs.SGLANG_Q35MF_COMMIT_CUDA.get()
 _fused_decode_verify_real_tensors = (
     envs.SGLANG_GDN_DECODE_FUSION_VERIFY_REAL_TENSORS.get()
 )
@@ -1685,6 +1687,42 @@ class GDNAttnBackend(MambaAttnBackendBase):
             replayssm_beta=layer_cache.replayssm_beta,
         )
 
+    def _fold_flagged_rows(
+        self,
+        *,
+        mamba_pool: MambaPool,
+        cache_indices: torch.Tensor,
+        replay_indices: torch.Tensor,
+    ) -> None:
+        """SGLANG_Q35MF_COMMIT_INLAYER: this verify's kernel skips flagged rows and replays the
+        history of the others on BF16 high parts only, so fold every row's committed history of
+        every GDN layer first (as the commit would); padded rows point at the spare request row 0."""
+        from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode import (
+            commit_gdn_replayssm_circular,
+        )
+
+        write_pos, is_flush = mamba_pool.replayssm_spec_write_pos, mamba_pool.replayssm_is_flush
+        is_flush.index_put_(
+            (replay_indices,), (write_pos.index_select(0, replay_indices) > 0).to(is_flush.dtype)
+        )
+        spec_state = self.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+        commit_gdn_replayssm_circular(
+            checkpoint_state=spec_state.temporal,
+            d_cache=spec_state.replayssm_d,
+            k_cache=spec_state.replayssm_k,
+            g_cache=spec_state.replayssm_g,
+            d_residual_cache=spec_state.replayssm_rawv,
+            k_residual_cache=spec_state.replayssm_rawk,
+            state_batch_indices=cache_indices,
+            replay_indices=replay_indices,
+            write_pos=write_pos,
+            cache_base=mamba_pool.replayssm_cache_base,
+            is_flush=is_flush,
+            accept_lens=write_pos,
+            null_block_id=-1,
+            use_cuda=_COMMIT_CUDA,
+        )
+
     def _replayssm_target_verify(
         self,
         *,
@@ -1719,6 +1757,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
             gdn_replayssm_spec_decode,
         )
 
+        if _COMMIT_INLAYER and layer.layer_id == mamba_pool.mamba_layer_ids[0]:
+            self._fold_flagged_rows(
+                mamba_pool=mamba_pool,
+                cache_indices=cache_indices,
+                replay_indices=replay_indices,
+            )
         H, K = layer.num_k_heads, layer.head_k_dim
         HV, V = layer.num_v_heads, layer.head_v_dim
         # q/k/v may be [1, seq, *] (fallback split) or [seq, *] (fused split);
