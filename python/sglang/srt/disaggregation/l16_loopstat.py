@@ -28,7 +28,7 @@ STAT: Optional["LoopStat"] = None
 COARSE_ACTIVE: Optional[List[int]] = None
 
 _HOST_COLS = (
-    "pf", "in", "pq", "pq_rel", "pq_res", "pp", "pp_rs", "pp_hs",
+    "pf", "in", "pq", "pq_rel", "pq_res", "pp", "pp_rs", "pp_hs", "pp_alloc", "pp_send",
     "px", "px_poll", "ar", "nb", "rb", "prw", "pr", "smp",
 )
 _COLS = ("it", "t_ms", "fct", "B", "gbs", "nnew", "npa", "npre", "nxfer", "nwait", "idle", "ar_n", "knob") + _HOST_COLS

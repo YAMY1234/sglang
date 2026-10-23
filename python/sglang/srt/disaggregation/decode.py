@@ -1647,12 +1647,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self._start_hicache_prefetch(decode_req.req, prefix_match)
                 if prefix_match is not None:
                     total_prefix_len = prefix_match.decode_prefix_len
+            t_al = l16_loopstat._now() if ls is not None else 0
             dst_kv_indices = self._pre_alloc(
                 decode_req.req,
                 prefix_indices,
                 prefix_len,
                 total_prefix_len,
             )
+            if ls is not None:
+                ls.add("pp_alloc", t_al)
             decode_req.prefix_match = prefix_match
             hisparse_req_budget -= 1
             # Recompute from actual pool state for the next queue entry.
@@ -1822,6 +1825,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         prefix_len=total_prefix_len,
                     )
                 )
+            t_sd = l16_loopstat._now() if ls is not None else 0
             state_indices: Optional[List] = [
                 payloads[st]() if st in payloads else None for st in state_types
             ]
@@ -1862,6 +1866,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 state_indices,
                 **metadata_kwargs,
             )
+            if ls is not None:
+                ls.add("pp_send", t_sd)
             num_device_preallocated += 1
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
