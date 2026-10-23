@@ -1664,6 +1664,9 @@ class Envs:
     # Diagnostic: with SGLANG_Q35MF_HOST_TRACE set, record only while this file exists
     # (checked while the scheduler is idle), so one boot can bench with and without the trace.
     SGLANG_PERFLL_HOST_TRACE_GATE = EnvStr(None)
+    # The HiCache ready-count exchange rides the same pass's request-size exchange when that
+    # pass received nothing (one cross-rank sync per pass instead of two).
+    SGLANG_PERFLL_HOST_HC_PIGGYBACK = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
