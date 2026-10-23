@@ -629,7 +629,8 @@ class CpLite:
         self.cp_ungated = envs.SGLANG_TRTL18_CP_UNGATED.get()
         self.merge_h = envs.SGLANG_TRTL18_CP_MAIN.get() and envs.SGLANG_TRTL18_CP_MERGE_H.get()
         self.llh_off = total
-        if self.merge_h or self.cp_ungated:
+        self.fold_mh = envs.SGLANG_PLB_CP_FOLD_MH.get()
+        if self.merge_h or self.cp_ungated or self.fold_mh:
             total += _MAX_ROWS * cp * _LL_PWORDS * 8
         self.ll = envs.SGLANG_TRTL1_ATTN_CP_LL.get() and q_heads * HEAD_DIM // 2 + q_heads <= _LL_PWORDS
         self.cnt = torch.zeros(_KINDS, _MAX_ROWS, dtype=torch.int32, device=self.device)
@@ -826,7 +827,10 @@ class CpLite:
                            forward_batch, layer.layer_id, gate, workspace)
         if out is None:
             out = torch.empty(rows, self.hq, HEAD_DIM, dtype=torch.bfloat16, device=q.device)
-        if self.ll:
+        if self.ll and self.fold_mh:
+            self._fold_merge_h(q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale, out,
+                               gate if gate["GATE"] else dict(gate, thr=0))
+        elif self.ll:
             self._fold_merge(q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale, out, gate)
         else:
             _cp_a2a_merge[(rows,)](
@@ -875,7 +879,9 @@ class CpLite:
         if self.cp_main and exact and self.gate_overlap == 1:
             return self._gated_main(q, k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale,
                                     bmm2_scale, forward_batch, layer_id, stock, gate)
-        stock_lens, pre_lens = self._gate_lens_fwd(seq_lens, b, q_len, gate["thr"], forward_batch, layer_id)
+        fold_mh = self.fold_mh and not exact
+        stock_lens, pre_lens = self._gate_lens_fwd(seq_lens, b, q_len, gate["thr"], forward_batch, layer_id,
+                                                   zero=fold_mh)
         out = torch.empty(rows, self.hq, HEAD_DIM, dtype=torch.bfloat16, device=self.device)
         main = torch.cuda.current_stream()
         self._side.wait_stream(main)
@@ -892,7 +898,7 @@ class CpLite:
             else:
                 self._fold_partial(k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale,
                                    forward_batch, layer_id, gate, self._own_workspace())
-            merge = self._exact_merge if exact else self._fold_merge
+            merge = self._exact_merge if exact else (self._fold_merge_h if fold_mh else self._fold_merge)
             if self.gate_overlap == 2:
                 merge(q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale, out, gate)
         main.wait_stream(self._side)
@@ -993,6 +999,21 @@ class CpLite:
             k_cache.stride(0), k_cache.stride(2), page_table, page_table.stride(0), seq_lens, out, out.stride(0),
             self.peers, self.me, self.llp_off, self.cnt[1], bmm1_scale, bmm2_scale, **gate,
             QL=q_len, HQ=self.hq, CP=self.cp, D=HEAD_DIM, PG=PAGE, NWP=_LL_PWORDS, num_warps=8,
+        )
+        return out
+
+    def _fold_merge_h(self, q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale, out,
+                      gate):
+        """_fold_merge with one program per (row, head) (L18's merge on the fold layout [rows, cp * hq, D]); plain
+        launch: its inputs come over a stream join, which under PDL would be a programmatic edge."""
+        hq = self.hq
+        _cp_merge_h_ll[(rows, hq)](
+            self.po.view(torch.int32), self.plse.view(torch.int32), self.cp * hq * HEAD_DIM // 2, hq * HEAD_DIM // 2,
+            self.cp * hq, hq, q, q.stride(0), k_cache, v_cache, k_cache.stride(0), k_cache.stride(2),
+            page_table, page_table.stride(0), seq_lens, out, out.stride(0), self.peers, self.me, self.llh_off,
+            self.cnt_h, bmm1_scale, bmm2_scale, gate["nb"], gate["thr"],
+            QL=q_len, HQ=hq, CP=self.cp, D=HEAD_DIM, PG=PAGE, NWP=_LL_PWORDS, NB=gate["NB"], GMAX=gate["GMAX"],
+            WAIT=False, num_warps=4,
         )
         return out
 
