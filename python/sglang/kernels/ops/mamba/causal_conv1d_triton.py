@@ -1236,7 +1236,8 @@ def causal_conv1d_update(
     update_kernel = _causal_conv1d_update_kernel
     tpx_window = (
         envs.SGLANG_Q35MF_TPX_CONV_WINDOW.get()
-        and 1 <= batch <= 16
+        # SGLANG_PERFHT_CONV_WINDOW_WIDE: also the attention-DP batches of the T5 decode role (B17-36)
+        and 1 <= batch <= (36 if envs.SGLANG_PERFHT_CONV_WINDOW_WIDE.get() else 16)
         and dim in (3072, 6144, 12288)
         and block_n in (128, 256)
     )

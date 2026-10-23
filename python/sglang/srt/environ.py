@@ -1715,6 +1715,8 @@ class Envs:
     SGLANG_Q35MF_COMMIT_CUDA = EnvBool(False)
     # PERF-HT: the attention-DP GDN verify launch table (SGLANG_Q35MF_E2X_DEP_GDN) extended to B17-36 (byte-identical).
     SGLANG_PERFHT_DEP_GDN_WIDE = EnvBool(False)
+    # PERF-HT: SGLANG_Q35MF_TPX_CONV_WINDOW's coalesced window stores up to B36 (stock gate B16).
+    SGLANG_PERFHT_CONV_WINDOW_WIDE = EnvBool(False)
     # PERF-HT: load-balance-method total_tokens dispatches to the fewest tokens among the DP ranks below their
     # max running requests (all full: the fewest requests).
     SGLANG_PERFHT_DP_TOKENS_CAPPED = EnvBool(False)
