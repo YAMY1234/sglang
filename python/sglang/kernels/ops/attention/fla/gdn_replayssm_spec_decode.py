@@ -109,6 +109,7 @@ def gdn_replayssm_spec_circular_kernel(
     IS_FLUSH: tl.constexpr,
     NULL_BLOCK_ID: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
+    FOLD_SPEC_LEN: tl.constexpr = 0,
 ):
     i_v = tl.program_id(0)
     i_n = tl.program_id(1)
@@ -159,11 +160,17 @@ def gdn_replayssm_spec_circular_kernel(
 
     b_write_pos = tl.load(write_pos + replay_idx).to(tl.int64)
     b_cache_base = tl.load(cache_base + replay_idx).to(tl.int32)
+    if FOLD_SPEC_LEN > 0:
+        # A ring that cannot take this step's rows was folded into the checkpoint
+        # before this launch: no history, and the rows go in after it, wrapping.
+        b_hist = tl.where(b_write_pos + FOLD_SPEC_LEN > MAX_CACHE_LEN, 0, b_write_pos)
+    else:
+        b_hist = b_write_pos
 
     out_mask = mask_s[:, None] & mask_v[None, :]
 
     b_wp_i = b_write_pos.to(tl.int32)
-    cache_valid = o_c < b_write_pos
+    cache_valid = o_c < b_hist
 
     # CIRCULAR physical slots (addresses only; masks/cumsums stay logical).
     phys_c = (b_cache_base + o_c) & (MAX_CACHE_LEN - 1)  # [BC] history
@@ -347,11 +354,14 @@ def gdn_replayssm_spec_circular_kernel(
             scores_k += tl.dot(khist_tile, kT, input_precision=DOT_PRECISION)
 
         if write_k:
-            spec_kt_mask = (
-                mask_s[:, None]
-                & mask_kt[None, :]
-                & ((b_write_pos + o_s[:, None]) < MAX_CACHE_LEN)
-            )
+            if FOLD_SPEC_LEN > 0:
+                spec_kt_mask = mask_s[:, None] & mask_kt[None, :]
+            else:
+                spec_kt_mask = (
+                    mask_s[:, None]
+                    & mask_kt[None, :]
+                    & ((b_write_pos + o_s[:, None]) < MAX_CACHE_LEN)
+                )
             if STORE_EXACT_RAW or STORE_K_RESIDUAL:
                 p_cur_rawk = rawk_cache + (
                     replay_idx * stride_rawk_slot
@@ -433,8 +443,11 @@ def gdn_replayssm_spec_circular_kernel(
     # ------------------------------------------------------------------
     # write speculative d / raw-v / g / beta at circular positions (phys_spec).
     # ------------------------------------------------------------------
-    spec_pos = b_write_pos + o_s
-    spec_store_mask = mask_s & (spec_pos < MAX_CACHE_LEN)
+    if FOLD_SPEC_LEN > 0:
+        spec_store_mask = mask_s
+    else:
+        spec_pos = b_write_pos + o_s
+        spec_store_mask = mask_s & (spec_pos < MAX_CACHE_LEN)
     p_cur_d = d_cache + (
         replay_idx * stride_d_slot
         + (i_hv * MAX_CACHE_LEN + phys_spec[None, :]) * V
@@ -636,6 +649,7 @@ def gdn_replayssm_compact_commit_kernel(
     NULL_BLOCK_ID: tl.constexpr,
     HAS_TRACK: tl.constexpr,
     HAS_RESIDUAL: tl.constexpr,
+    FOLD_SPEC_LEN: tl.constexpr = 0,
 ):
     """Materialize the checkpoint directly from compact ReplaySSM D/K/G."""
     i_v = tl.program_id(0)
@@ -650,7 +664,11 @@ def gdn_replayssm_compact_commit_kernel(
     if state_idx <= NULL_BLOCK_ID:
         return
     n_history = tl.load(write_pos + replay_idx).to(tl.int32)
-    fold_active = tl.load(is_flush_flags + replay_idx) != 0
+    if FOLD_SPEC_LEN > 0:
+        # SGLANG_PLB_GDN_FOLD_IN_VERIFY: the rings that cannot take the step's rows
+        fold_active = n_history + FOLD_SPEC_LEN > MAX_CACHE_LEN
+    else:
+        fold_active = tl.load(is_flush_flags + replay_idx) != 0
     if HAS_TRACK:
         track_idx = tl.load(mamba_track_indices + i_n * stride_track).to(tl.int64)
         track_step = tl.load(mamba_steps_to_track + i_n * stride_steps).to(tl.int32)
@@ -825,6 +843,7 @@ def _advance_gdn_spec_cursors_kernel(
     FOLD_EVERY_COMMIT: tl.constexpr,
     BLOCK: tl.constexpr,
     NULL_BLOCK_ID: tl.constexpr,
+    FOLD_IN_VERIFY: tl.constexpr = False,
 ):
     offs = tl.arange(0, BLOCK)
     row_mask = offs < n_rows
@@ -843,13 +862,21 @@ def _advance_gdn_spec_cursors_kernel(
     )
 
     total_commit = num_acc
-    flush_now = (total_commit > 0) & (is_flush_cur != 0)
+    if FOLD_IN_VERIFY:
+        # The verify folded every ring that could not take its rows (the same rule)
+        # and wrote the rows after the folded history.
+        flush_now = (write_pos + MAX_SPEC_LEN) > MAX_CACHE_LEN
+        new_wp = tl.where(flush_now, total_commit, write_pos + total_commit).to(
+            tl.int32
+        )
+    else:
+        flush_now = (total_commit > 0) & (is_flush_cur != 0)
+        new_wp = tl.where(
+            is_flush_cur != 0, total_commit, write_pos + total_commit
+        ).to(tl.int32)
 
     new_base = tl.where(
         flush_now, (cache_base + write_pos) & (CACHE_BUF_LEN - 1), cache_base
-    )
-    new_wp = tl.where(is_flush_cur != 0, total_commit, write_pos + total_commit).to(
-        tl.int32
     )
     # EARLY-FLUSH (margin = 2 * max_spec_len, strict '>'): flush one window early
     # so that on every verify step write_pos + spec_len <= max_cache_len holds,
@@ -862,7 +889,9 @@ def _advance_gdn_spec_cursors_kernel(
     # flush step = max_cache_len - max_spec_len, zero headroom); usable committed
     # history is max_cache_len - 2*max_spec_len + 1; raise the cache length
     # for more. Config enforces max_cache_len >= 2 * max_spec_len.
-    if FOLD_EVERY_COMMIT:
+    if FOLD_IN_VERIFY:
+        next_is_flush = tl.zeros([BLOCK], dtype=tl.int8)
+    elif FOLD_EVERY_COMMIT:
         next_is_flush = (new_wp > 0).to(tl.int8)
     else:
         next_is_flush = ((new_wp + 2 * MAX_SPEC_LEN) > MAX_CACHE_LEN).to(tl.int8)
@@ -909,6 +938,7 @@ def _launch_gdn_spec(
     bs_min,
     null_block_id,
     dot_precision,
+    fold_spec_len=0,
 ):
     num_slots, HV, V, K = checkpoint_state.shape
     H = k.shape[1]
@@ -999,6 +1029,7 @@ def _launch_gdn_spec(
         IS_FLUSH=is_flush_kernel,
         NULL_BLOCK_ID=null_block_id,
         DOT_PRECISION=dot_precision,
+        FOLD_SPEC_LEN=fold_spec_len,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -1104,6 +1135,7 @@ def gdn_replayssm_spec_decode(
     launch_mode: str = "both",
     # Triton only accepts TF32 input precision on Ampere-or-newer NVIDIA GPUs.
     dot_precision: str = "tf32" if is_tf32_supported else "ieee",
+    fold_in_verify: bool = False,
 ):
     """GDN cached speculative-decode on a CIRCULAR ring cache (split-qkv varlen).
 
@@ -1117,6 +1149,10 @@ def gdn_replayssm_spec_decode(
          checkpoint (statically empty history).
     The circular history and cursors are request-keyed by ``replay_indices``;
     the checkpoint remains keyed by physical ``ssm_state_indices``.
+
+    ``fold_in_verify`` (SGLANG_PLB_GDN_FOLD_IN_VERIFY, verify launch only): a ring
+    that cannot take ``max_spec_len`` rows after its history is first folded into
+    the checkpoint, then the step runs on it with no history and appends its rows.
     """
     if scale is None:
         scale = checkpoint_state.shape[-1] ** -0.5
@@ -1156,6 +1192,24 @@ def gdn_replayssm_spec_decode(
             null_block_id,
             k.shape[1],
         )
+    if fold_in_verify:
+        if launch_mode != "verify":
+            raise ValueError("fold_in_verify runs the verify launch only")
+        _fold_full_rings(
+            checkpoint_state=checkpoint_state,
+            d_cache=d_cache,
+            k_cache=k_cache,
+            g_cache=g_cache,
+            d_residual_cache=rawv_cache,
+            k_residual_cache=rawk_cache,
+            state_batch_indices=ssm_state_indices,
+            replay_indices=replay_indices,
+            write_pos=write_pos,
+            cache_base=cache_base,
+            is_flush=is_flush,
+            max_spec_len=max_spec_len,
+            null_block_id=null_block_id,
+        )
     if launch_mode in ("both", "verify"):
         _launch_gdn_spec(
             q,
@@ -1191,6 +1245,7 @@ def gdn_replayssm_spec_decode(
             bs_min,
             null_block_id,
             dot_precision,
+            max_spec_len if fold_in_verify else 0,
         )
     if launch_mode in ("both", "flush"):
         _launch_gdn_spec(
@@ -1242,8 +1297,13 @@ def commit_gdn_replayssm_spec(
     fold_every_commit: bool = False,
     cache_buf_len: int | None = None,
     null_block_id: int = 0,
+    fold_in_verify: bool = False,
 ):
-    """Advance request-keyed cursors once per verify step (device-only)."""
+    """Advance request-keyed cursors once per verify step (device-only).
+
+    ``fold_in_verify``: the verify folded each ring that could not take
+    ``max_spec_len`` rows after its history (gdn_replayssm_spec_decode's rule).
+    """
     if cache_buf_len is None:
         cache_buf_len = max_cache_len
     n_rows = replay_indices.shape[0]
@@ -1263,6 +1323,7 @@ def commit_gdn_replayssm_spec(
         FOLD_EVERY_COMMIT=fold_every_commit,
         BLOCK=BLOCK,
         NULL_BLOCK_ID=null_block_id,
+        FOLD_IN_VERIFY=fold_in_verify,
     )
 
 
@@ -1292,6 +1353,163 @@ def commit_gdn_replayssm_circular(
     the exact state at the requested accepted step without disturbing the active
     checkpoint.
     """
+    max_cache_len = d_cache.shape[-2]
+    has_residual = d_residual_cache is not None and k_residual_cache is not None
+    has_track = mamba_track_indices is not None and mamba_steps_to_track is not None
+    if not (
+        use_cuda
+        and _commit_cuda(
+            checkpoint_state=checkpoint_state,
+            d_cache=d_cache,
+            k_cache=k_cache,
+            g_cache=g_cache,
+            d_residual_cache=d_residual_cache if has_residual else None,
+            k_residual_cache=k_residual_cache if has_residual else None,
+            state_batch_indices=state_batch_indices,
+            replay_indices=replay_indices,
+            write_pos=write_pos,
+            cache_base=cache_base,
+            is_flush=is_flush,
+            accept_lens=accept_lens,
+            mamba_track_indices=mamba_track_indices if has_track else None,
+            mamba_steps_to_track=mamba_steps_to_track if has_track else None,
+            null_block_id=null_block_id,
+        )
+    ):
+        _launch_compact_commit(
+            checkpoint_state=checkpoint_state,
+            d_cache=d_cache,
+            k_cache=k_cache,
+            g_cache=g_cache,
+            d_residual_cache=d_residual_cache,
+            k_residual_cache=k_residual_cache,
+            state_batch_indices=state_batch_indices,
+            replay_indices=replay_indices,
+            write_pos=write_pos,
+            cache_base=cache_base,
+            is_flush=is_flush,
+            accept_lens=accept_lens,
+            mamba_track_indices=mamba_track_indices,
+            mamba_steps_to_track=mamba_steps_to_track,
+            null_block_id=null_block_id,
+        )
+    _finish_circular_fold(
+        write_pos=write_pos,
+        cache_base=cache_base,
+        is_flush=is_flush,
+        state_batch_indices=state_batch_indices,
+        replay_indices=replay_indices,
+        max_cache_len=max_cache_len,
+        null_block_id=null_block_id,
+    )
+
+
+def track_gdn_replayssm_circular(
+    *,
+    checkpoint_state: torch.Tensor,
+    d_cache: torch.Tensor,
+    k_cache: torch.Tensor,
+    g_cache: torch.Tensor,
+    d_residual_cache: torch.Tensor | None,
+    k_residual_cache: torch.Tensor | None,
+    state_batch_indices: torch.Tensor,
+    replay_indices: torch.Tensor,
+    write_pos: torch.Tensor,
+    cache_base: torch.Tensor,
+    is_flush: torch.Tensor,
+    accept_lens: torch.Tensor,
+    mamba_track_indices: torch.Tensor,
+    mamba_steps_to_track: torch.Tensor,
+    null_block_id: int = -1,
+    use_cuda: bool = False,
+) -> None:
+    """``commit_gdn_replayssm_circular``'s track rows, for a verify that folded every
+    full ring itself (SGLANG_PLB_GDN_FOLD_IN_VERIFY): no capacity row, no cursor move.
+    ``write_pos`` must already include this step's accepted prefix."""
+    kw = dict(
+        checkpoint_state=checkpoint_state,
+        d_cache=d_cache,
+        k_cache=k_cache,
+        g_cache=g_cache,
+        d_residual_cache=d_residual_cache,
+        k_residual_cache=k_residual_cache,
+        state_batch_indices=state_batch_indices,
+        replay_indices=replay_indices,
+        write_pos=write_pos,
+        cache_base=cache_base,
+        is_flush=is_flush,
+        accept_lens=accept_lens,
+        mamba_track_indices=mamba_track_indices,
+        mamba_steps_to_track=mamba_steps_to_track,
+        null_block_id=null_block_id,
+    )
+    if use_cuda and _track_cuda(**kw):
+        return
+    # is_flush stays zero in this mode, so only the track rows do any work
+    _launch_compact_commit(**kw)
+
+
+def _fold_full_rings(
+    *,
+    checkpoint_state: torch.Tensor,
+    d_cache: torch.Tensor,
+    k_cache: torch.Tensor,
+    g_cache: torch.Tensor,
+    d_residual_cache: torch.Tensor | None,
+    k_residual_cache: torch.Tensor | None,
+    state_batch_indices: torch.Tensor,
+    replay_indices: torch.Tensor,
+    write_pos: torch.Tensor,
+    cache_base: torch.Tensor,
+    is_flush: torch.Tensor,
+    max_spec_len: int,
+    null_block_id: int,
+) -> None:
+    """One layer's compact fold of every ring that cannot take ``max_spec_len`` rows
+    after its history (the verify then runs on the folded checkpoint)."""
+    if (
+        checkpoint_state.dtype != torch.bfloat16
+        or d_residual_cache is None
+        or k_residual_cache is None
+    ):
+        raise ValueError("fold_in_verify needs BF16 checkpoints and the low-part ring")
+    _launch_compact_commit(
+        checkpoint_state=checkpoint_state.unsqueeze(0),
+        d_cache=d_cache.unsqueeze(0),
+        k_cache=k_cache.unsqueeze(0),
+        g_cache=g_cache.unsqueeze(0),
+        d_residual_cache=d_residual_cache.unsqueeze(0),
+        k_residual_cache=k_residual_cache.unsqueeze(0),
+        state_batch_indices=state_batch_indices,
+        replay_indices=replay_indices,
+        write_pos=write_pos,
+        cache_base=cache_base,
+        is_flush=is_flush,
+        accept_lens=write_pos,
+        null_block_id=null_block_id,
+        fold_spec_len=max_spec_len,
+    )
+
+
+def _launch_compact_commit(
+    *,
+    checkpoint_state: torch.Tensor,
+    d_cache: torch.Tensor,
+    k_cache: torch.Tensor,
+    g_cache: torch.Tensor,
+    d_residual_cache: torch.Tensor | None,
+    k_residual_cache: torch.Tensor | None,
+    state_batch_indices: torch.Tensor,
+    replay_indices: torch.Tensor,
+    write_pos: torch.Tensor,
+    cache_base: torch.Tensor,
+    is_flush: torch.Tensor,
+    accept_lens: torch.Tensor,
+    mamba_track_indices: torch.Tensor | None = None,
+    mamba_steps_to_track: torch.Tensor | None = None,
+    null_block_id: int = -1,
+    fold_spec_len: int = 0,
+) -> None:
     num_layers, _, HV, V, K = checkpoint_state.shape
     H = k_cache.shape[2]
     max_cache_len = d_cache.shape[-2]
@@ -1301,33 +1519,6 @@ def commit_gdn_replayssm_circular(
     k_residual_buf = k_residual_cache if has_residual else k_cache
     BV = min(triton.next_power_of_2(V), 64)
     has_track = mamba_track_indices is not None and mamba_steps_to_track is not None
-    if use_cuda and _commit_cuda(
-        checkpoint_state=checkpoint_state,
-        d_cache=d_cache,
-        k_cache=k_cache,
-        g_cache=g_cache,
-        d_residual_cache=d_residual_cache if has_residual else None,
-        k_residual_cache=k_residual_cache if has_residual else None,
-        state_batch_indices=state_batch_indices,
-        replay_indices=replay_indices,
-        write_pos=write_pos,
-        cache_base=cache_base,
-        is_flush=is_flush,
-        accept_lens=accept_lens,
-        mamba_track_indices=mamba_track_indices if has_track else None,
-        mamba_steps_to_track=mamba_steps_to_track if has_track else None,
-        null_block_id=null_block_id,
-    ):
-        _finish_circular_fold(
-            write_pos=write_pos,
-            cache_base=cache_base,
-            is_flush=is_flush,
-            state_batch_indices=state_batch_indices,
-            replay_indices=replay_indices,
-            max_cache_len=max_cache_len,
-            null_block_id=null_block_id,
-        )
-        return
     if has_track:
         track_indices = mamba_track_indices
         track_steps = mamba_steps_to_track
@@ -1380,17 +1571,9 @@ def commit_gdn_replayssm_circular(
         NULL_BLOCK_ID=null_block_id,
         HAS_TRACK=has_track,
         HAS_RESIDUAL=has_residual,
+        FOLD_SPEC_LEN=fold_spec_len,
         num_warps=4,
         num_stages=2,
-    )
-    _finish_circular_fold(
-        write_pos=write_pos,
-        cache_base=cache_base,
-        is_flush=is_flush,
-        state_batch_indices=state_batch_indices,
-        replay_indices=replay_indices,
-        max_cache_len=max_cache_len,
-        null_block_id=null_block_id,
     )
 
 
@@ -1426,3 +1609,11 @@ def _commit_cuda(**kw) -> bool:
     from sglang.kernels.ops.attention.fla import gdn_replayssm_commit_cuda as cuda_commit
 
     return cuda_commit.try_commit(**kw)
+
+
+def _track_cuda(**kw) -> bool:
+    """The track rows' snapshots as one CUDA launch (one CTA per request and value head,
+    over every layer), when it can be issued now; False leaves them to the Triton kernel."""
+    from sglang.kernels.ops.attention.fla import gdn_replayssm_commit_cuda as cuda_commit
+
+    return cuda_commit.try_track(**kw)

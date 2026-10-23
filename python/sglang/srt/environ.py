@@ -1580,6 +1580,9 @@ class Envs:
     # The compact ReplaySSM commit of every GDN layer as one CUDA launch (one CTA per layer,
     # request and value head); the same four high / low products, FP32 sums in another order.
     SGLANG_Q35MF_COMMIT_CUDA = EnvBool(False)
+    # The GDN spec verify folds a request's ring into its BF16 checkpoint when this step's rows
+    # do not fit after it (TRT-LLM's q35_gdn_core); the commit then only snapshots track rows.
+    SGLANG_PLB_GDN_FOLD_IN_VERIFY = EnvBool(False)
     # TP > 1 EAGLE topk-1 verify keeps the target logits vocabulary-sharded: greedy rows
     # take a sharded argmax (bit-identical), temperature-only rows a sharded Gumbel-max
     # (same distribution); any other batch all-gathers them first, as before.
