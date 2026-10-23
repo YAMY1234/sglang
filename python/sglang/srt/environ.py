@@ -1643,6 +1643,10 @@ class Envs:
     # PD request timing trace: one "L12T" log line per finished request on each P / D
     # TP0 (wall-clock stage times, keyed by bootstrap_room) and per transfer chunk on P TP0.
     SGLANG_TRTL12_TRACE = EnvBool(False)
+    # PD decode: copy a preallocated request's page / mamba indices to the host without
+    # blocking and send its metadata on a later poll; the blocking copy waits for the
+    # in-flight forward (schedule stream fenced on it) and stalls the overlap loop.
+    SGLANG_TRTL16_DEFER_METADATA_SEND = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
