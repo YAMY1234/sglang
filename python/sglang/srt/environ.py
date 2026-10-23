@@ -1716,6 +1716,9 @@ class Envs:
     # The GDN spec verify folds a request's ring into its BF16 checkpoint when this step's rows
     # do not fit after it (TRT-LLM's q35_gdn_core); the commit then only snapshots track rows.
     SGLANG_PLB_GDN_FOLD_IN_VERIFY = EnvBool(False)
+    # The GDN spec commit folds a request's ring only once its next verify's rows would not fit
+    # after it (else it only advances the cursors); the verify replays the history in between.
+    SGLANG_PLB_GDN_DEFER_FOLD = EnvBool(False)
     # PERF-HT: the attention-DP GDN verify launch table (SGLANG_Q35MF_E2X_DEP_GDN) extended to B17-36 (byte-identical).
     SGLANG_PERFHT_DEP_GDN_WIDE = EnvBool(False)
     # PERF-HT: SGLANG_Q35MF_TPX_CONV_WINDOW's coalesced window stores up to B36 (stock gate B16).

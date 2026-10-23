@@ -1136,6 +1136,7 @@ def commit_mamba_states_after_verify(
             fold_every_commit=spec_state.temporal.dtype != torch.float32,
             null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
             fold_in_verify=fold_in_verify,
+            defer_fold=mamba_pool.replayssm_defer_fold,
         )
         ring_commit = dict(
             checkpoint_state=spec_state.temporal,
@@ -1158,7 +1159,9 @@ def commit_mamba_states_after_verify(
         if not fold_in_verify:
             # Capacity rows fold all layers in one launch; track rows snapshot the
             # exact crossing state without disturbing the active circular history.
-            commit_gdn_replayssm_circular(**ring_commit)
+            commit_gdn_replayssm_circular(
+                **ring_commit, early_exit=mamba_pool.replayssm_defer_fold
+            )
         elif batch.mamba_track_indices is not None:
             # The verify folded every full ring; only track rows remain.
             track_gdn_replayssm_circular(**ring_commit)
