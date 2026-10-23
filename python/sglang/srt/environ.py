@@ -1519,6 +1519,9 @@ class Envs:
     # The Qwen3.5 MTP draft's BF16 FlashInfer TRTLLM experts may leave their finalize to
     # the caller (the megakernel plugin's draft hop, slot draft_fin).
     SGLANG_Q35_DRAFT_BF16_DEFERRED_FINALIZE = EnvBool(False)
+    # Q35 CP-lite LL gather / merge: the eight peers' words polled in one batch instead of one
+    # peer after another (same values).
+    SGLANG_Q35_CP_LL_BATCH_WAIT = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)

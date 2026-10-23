@@ -313,10 +313,71 @@ def _ll_wait(src, n: tl.constexpr, e):
 
 
 @triton.jit
+def _ll_at(own, i, c, CP: tl.constexpr, NW: tl.constexpr):
+    """Peer c's LL slot of row i in this rank's receive buffer."""
+    return (own + (i * CP + c) * NW * 8).to(tl.pointer_type(tl.int64))
+
+
+@triton.jit
+def _ll_on(v, e):
+    return (v >> 32) == e
+
+
+@triton.jit
+def _ll_load8(own, i, CP: tl.constexpr, NW: tl.constexpr, k, off):
+    """The first load of all eight peers' LL words (k + off of each slot), issued back to back."""
+    v0 = tl.load(_ll_at(own, i, 0, CP, NW) + off + k, volatile=True)
+    v1 = tl.load(_ll_at(own, i, 1, CP, NW) + off + k, volatile=True)
+    v2 = tl.load(_ll_at(own, i, 2, CP, NW) + off + k, volatile=True)
+    v3 = tl.load(_ll_at(own, i, 3, CP, NW) + off + k, volatile=True)
+    v4 = tl.load(_ll_at(own, i, 4, CP, NW) + off + k, volatile=True)
+    v5 = tl.load(_ll_at(own, i, 5, CP, NW) + off + k, volatile=True)
+    v6 = tl.load(_ll_at(own, i, 6, CP, NW) + off + k, volatile=True)
+    v7 = tl.load(_ll_at(own, i, 7, CP, NW) + off + k, volatile=True)
+    return v0, v1, v2, v3, v4, v5, v6, v7
+
+
+@triton.jit
+def _ll_all_on8(v0, v1, v2, v3, v4, v5, v6, v7, e):
+    ok = _ll_on(v0, e) & _ll_on(v1, e) & _ll_on(v2, e) & _ll_on(v3, e)
+    ok = ok & _ll_on(v4, e) & _ll_on(v5, e) & _ll_on(v6, e) & _ll_on(v7, e)
+    return tl.min(ok.to(tl.int32), axis=0)
+
+
+@triton.jit
+def _ll_wait8(own, i, CP: tl.constexpr, NW: tl.constexpr, k, off, n: tl.constexpr, e):
+    """BATCH_WAIT: the eight peers' LL words of row i, every word carrying epoch e. All eight loads are in flight
+    together and one reduction checks them; only if a word is still stale does it poll the peers one by one
+    (_ll_wait). Each 8-byte word holds its data and its epoch and is read whole, so no fence is needed between
+    the epoch check and the data; the values equal the serial _ll_wait's."""
+    v0, v1, v2, v3, v4, v5, v6, v7 = _ll_load8(own, i, CP, NW, k, off)
+    if _ll_all_on8(v0, v1, v2, v3, v4, v5, v6, v7, e) == 0:
+        v0 = _ll_wait(_ll_at(own, i, 0, CP, NW) + off, n, e)
+        v1 = _ll_wait(_ll_at(own, i, 1, CP, NW) + off, n, e)
+        v2 = _ll_wait(_ll_at(own, i, 2, CP, NW) + off, n, e)
+        v3 = _ll_wait(_ll_at(own, i, 3, CP, NW) + off, n, e)
+        v4 = _ll_wait(_ll_at(own, i, 4, CP, NW) + off, n, e)
+        v5 = _ll_wait(_ll_at(own, i, 5, CP, NW) + off, n, e)
+        v6 = _ll_wait(_ll_at(own, i, 6, CP, NW) + off, n, e)
+        v7 = _ll_wait(_ll_at(own, i, 7, CP, NW) + off, n, e)
+    return v0, v1, v2, v3, v4, v5, v6, v7
+
+
+@triton.jit
+def _gather_put(q_all, v, i, c, CP: tl.constexpr, WORDS: tl.constexpr, QL: tl.constexpr, FOLD: tl.constexpr, w):
+    if FOLD:
+        slot = ((i // QL) * CP + c) * QL + i % QL
+    else:
+        slot = i * CP + c
+    tl.store(q_all + slot * WORDS + w, (v & 0xFFFFFFFF).to(tl.int32))
+
+
+@triton.jit
 def _cp_gather_q_ll(
     q, q_stride, peers, me, ll_off, q_all, cnt, seq_lens, pre_lens, stock_lens, nb, thr,
     CP: tl.constexpr, WORDS: tl.constexpr, QL: tl.constexpr, FOLD: tl.constexpr,
     GATE: tl.constexpr, NB: tl.constexpr, GMAX: tl.constexpr, GWRITE: tl.constexpr,
+    BATCH_WAIT: tl.constexpr = False,
 ):
     """LL variant of _cp_gather_q: every 4-byte word travels with the call's epoch in one 8-byte store.
     FOLD: q_all is written source-major per request ([B, CP, QL, heads, D]) for the prefix-only fused partial,
@@ -341,17 +402,42 @@ def _cp_gather_q_ll(
         dst = (tl.load(peers + c) + ll_off + (i * CP + me) * WORDS * 8).to(tl.pointer_type(tl.int64))
         tl.store(dst + w, x)
     own = tl.load(peers + me) + ll_off
-    for c in tl.static_range(CP):
-        v = _ll_wait((own + (i * CP + c) * WORDS * 8).to(tl.pointer_type(tl.int64)), WORDS, e)
-        if FOLD:
-            slot = ((i // QL) * CP + c) * QL + i % QL
-        else:
-            slot = i * CP + c
-        tl.store(q_all + slot * WORDS + w, (v & 0xFFFFFFFF).to(tl.int32))
+    if BATCH_WAIT and CP == 8:
+        v0, v1, v2, v3, v4, v5, v6, v7 = _ll_wait8(own, i, CP, WORDS, w, 0, WORDS, e)
+        _gather_put(q_all, v0, i, 0, CP, WORDS, QL, FOLD, w)
+        _gather_put(q_all, v1, i, 1, CP, WORDS, QL, FOLD, w)
+        _gather_put(q_all, v2, i, 2, CP, WORDS, QL, FOLD, w)
+        _gather_put(q_all, v3, i, 3, CP, WORDS, QL, FOLD, w)
+        _gather_put(q_all, v4, i, 4, CP, WORDS, QL, FOLD, w)
+        _gather_put(q_all, v5, i, 5, CP, WORDS, QL, FOLD, w)
+        _gather_put(q_all, v6, i, 6, CP, WORDS, QL, FOLD, w)
+        _gather_put(q_all, v7, i, 7, CP, WORDS, QL, FOLD, w)
+    else:
+        for c in tl.static_range(CP):
+            v = _ll_wait((own + (i * CP + c) * WORDS * 8).to(tl.pointer_type(tl.int64)), WORDS, e)
+            _gather_put(q_all, v, i, c, CP, WORDS, QL, FOLD, w)
     if FOLD and not GATE:
         if i % QL == 0:
             tl.store(pre_lens + i // QL, tl.maximum(tl.load(seq_lens + i // QL) - QL, 0))
     tl.store(cnt + i, e)
+
+
+@triton.jit
+def _merge_step(acc, wsum, m, v, lv, c, n_pages, HQ: tl.constexpr, D: tl.constexpr):
+    """One CP partial (LL words v: bf16 pairs of O, lv: its LSE as fp32 bits, base 2) into the online LSE merge."""
+    lc = (lv & 0xFFFFFFFF).to(tl.int32).to(tl.float32, bitcast=True) * 0.6931471805599453
+    lc = tl.where(n_pages > c, lc, float("-inf"))
+    wd = (v & 0xFFFFFFFF).to(tl.uint32)
+    lo = (wd << 16).to(tl.float32, bitcast=True)
+    hi = (wd & 0xFFFF0000).to(tl.float32, bitcast=True)
+    oc = tl.reshape(tl.join(lo, hi), (HQ, D))
+    mn = tl.maximum(m, lc)
+    mn0 = tl.where(mn > float("-inf"), mn, 0.0)
+    a_old = tl.where(m > float("-inf"), tl.exp(m - mn0), 0.0)
+    a_new = tl.where(lc > float("-inf"), tl.exp(lc - mn0), 0.0)
+    acc = acc * a_old[:, None] + oc * a_new[:, None]
+    wsum = wsum * a_old + a_new
+    return acc, wsum, mn
 
 
 @triton.jit
@@ -390,6 +476,7 @@ def _cp_a2a_merge_ll(
     GATE: tl.constexpr,
     NB: tl.constexpr,
     GMAX: tl.constexpr,
+    BATCH_WAIT: tl.constexpr = False,
 ):
     """LL variant of _cp_a2a_merge; po / plse are read as int32 words, row / member strides po_sr / po_sc (words)
     and pl_sr / pl_sc. Online LSE merge of the causal block and the CP partials as they arrive.
@@ -434,23 +521,23 @@ def _cp_a2a_merge_ll(
     wsum = ld
     n_pages = (tl.maximum(L - QL, 0) + PG - 1) // PG
     own = tl.load(peers + me) + ll_off
-    for c in tl.static_range(CP):
-        src = (own + (i * CP + c) * NWP * 8).to(tl.pointer_type(tl.int64))
-        v = _ll_wait(src, NO, e)
-        lv = _ll_wait(src + NO, HQ, e)
-        lc = (lv & 0xFFFFFFFF).to(tl.int32).to(tl.float32, bitcast=True) * 0.6931471805599453
-        lc = tl.where(n_pages > c, lc, float("-inf"))
-        wd = (v & 0xFFFFFFFF).to(tl.uint32)
-        lo = (wd << 16).to(tl.float32, bitcast=True)
-        hi = (wd & 0xFFFF0000).to(tl.float32, bitcast=True)
-        oc = tl.reshape(tl.join(lo, hi), (HQ, D))
-        mn = tl.maximum(m, lc)
-        mn0 = tl.where(mn > float("-inf"), mn, 0.0)
-        a_old = tl.where(m > float("-inf"), tl.exp(m - mn0), 0.0)
-        a_new = tl.where(lc > float("-inf"), tl.exp(lc - mn0), 0.0)
-        acc = acc * a_old[:, None] + oc * a_new[:, None]
-        wsum = wsum * a_old + a_new
-        m = mn
+    if BATCH_WAIT and CP == 8:
+        v0, v1, v2, v3, v4, v5, v6, v7 = _ll_wait8(own, i, CP, NWP, hw, 0, NO, e)
+        l0, l1, l2, l3, l4, l5, l6, l7 = _ll_wait8(own, i, CP, NWP, h, NO, HQ, e)
+        acc, wsum, m = _merge_step(acc, wsum, m, v0, l0, 0, n_pages, HQ, D)
+        acc, wsum, m = _merge_step(acc, wsum, m, v1, l1, 1, n_pages, HQ, D)
+        acc, wsum, m = _merge_step(acc, wsum, m, v2, l2, 2, n_pages, HQ, D)
+        acc, wsum, m = _merge_step(acc, wsum, m, v3, l3, 3, n_pages, HQ, D)
+        acc, wsum, m = _merge_step(acc, wsum, m, v4, l4, 4, n_pages, HQ, D)
+        acc, wsum, m = _merge_step(acc, wsum, m, v5, l5, 5, n_pages, HQ, D)
+        acc, wsum, m = _merge_step(acc, wsum, m, v6, l6, 6, n_pages, HQ, D)
+        acc, wsum, m = _merge_step(acc, wsum, m, v7, l7, 7, n_pages, HQ, D)
+    else:
+        for c in tl.static_range(CP):
+            src = (own + (i * CP + c) * NWP * 8).to(tl.pointer_type(tl.int64))
+            v = _ll_wait(src, NO, e)
+            lv = _ll_wait(src + NO, HQ, e)
+            acc, wsum, m = _merge_step(acc, wsum, m, v, lv, c, n_pages, HQ, D)
     o = acc / tl.where(wsum > 0, wsum, 1.0)[:, None]
     tl.store(out + i * out_stride + hd, o.to(tl.bfloat16))
     tl.store(cnt + i, e)
@@ -539,6 +626,8 @@ class CpLite:
         # exact: the fused kernel on the context prefix only (q_len folded into the heads), the causal block in the
         # fp32 merge as on the trtllm-gen path
         self.exact = self.fused and envs.SGLANG_TRTL1_ATTN_CP_EXACT.get()
+        # LL gather / merge: the eight peers' words polled together (same values)
+        self.batch_wait = envs.SGLANG_Q35_CP_LL_BATCH_WAIT.get()
         if self.fused:
             from sglang.srt.layers.attention import q35_cp_fused
 
@@ -697,7 +786,7 @@ class CpLite:
             _cp_gather_q_ll[(rows,)](
                 q.view(torch.int32), words, self.peers, self.me, self.llq_off, self.q_all.view(torch.int32),
                 self.cnt[0], seq_lens, self.pre_lens, self.stock_lens, **gate,
-                CP=self.cp, WORDS=words, QL=q_len, FOLD=exact, GWRITE=True, num_warps=4,
+                CP=self.cp, WORDS=words, QL=q_len, FOLD=exact, GWRITE=True, BATCH_WAIT=self.batch_wait, num_warps=4,
             )
             if thr is not None:
                 out = torch.empty(rows, self.hq, HEAD_DIM, dtype=torch.bfloat16, device=q.device)
@@ -772,7 +861,7 @@ class CpLite:
             _cp_gather_q_ll[(rows,)](
                 q.view(torch.int32), words, self.peers, self.me, self.llq_off, self.q_all.view(torch.int32),
                 self.cnt[0], seq_lens, pre_lens, self.stock_lens, **gate,
-                CP=self.cp, WORDS=words, QL=q_len, FOLD=exact, GWRITE=False, num_warps=4,
+                CP=self.cp, WORDS=words, QL=q_len, FOLD=exact, GWRITE=False, BATCH_WAIT=self.batch_wait, num_warps=4,
             )
             if exact:
                 self._exact_partial(k_cache, v_cache, page_table, pre_lens, q_len, b, rows, bmm1_scale, bmm2_scale)
@@ -823,7 +912,8 @@ class CpLite:
             self.cp * self.hq, self.hq, q, q.stride(0), k_cache, v_cache,
             k_cache.stride(0), k_cache.stride(2), page_table, page_table.stride(0), seq_lens, out, out.stride(0),
             self.peers, self.me, self.llp_off, self.cnt[1], bmm1_scale, bmm2_scale, **gate,
-            QL=q_len, HQ=self.hq, CP=self.cp, D=HEAD_DIM, PG=PAGE, NWP=_LL_PWORDS, num_warps=8,
+            QL=q_len, HQ=self.hq, CP=self.cp, D=HEAD_DIM, PG=PAGE, NWP=_LL_PWORDS, BATCH_WAIT=self.batch_wait,
+            num_warps=8,
         )
         return out
 
@@ -859,7 +949,8 @@ class CpLite:
             self.po_x.stride(0) // 2, hq, self.pl_x.stride(0), q, q.stride(0), k_cache, v_cache,
             k_cache.stride(0), k_cache.stride(2), page_table, page_table.stride(0), seq_lens, out, out.stride(0),
             self.peers, self.me, self.llp_off, self.cnt[1], bmm1_scale, bmm2_scale, **gate,
-            QL=q_len, HQ=hq, CP=self.cp, D=HEAD_DIM, PG=PAGE, NWP=_LL_PWORDS, num_warps=8,
+            QL=q_len, HQ=hq, CP=self.cp, D=HEAD_DIM, PG=PAGE, NWP=_LL_PWORDS, BATCH_WAIT=self.batch_wait,
+            num_warps=8,
         )
         return out
 
