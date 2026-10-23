@@ -153,10 +153,45 @@ def _scatter_from_staging_persistent_kernel(
         tl.store(layer_ptr + dst, vals, mask=mask)
 
 
+@triton.jit
+def _scatter_pages_kernel(
+    layer_ptrs,
+    page_indices,
+    staging,
+    writer_head_offsets,
+    stride_pool_token,
+    per_layer_elems,
+    ELEMS_PER_TOKEN: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    NUM_LAYERS_X2: tl.constexpr,
+):
+    """_fused_scatter_from_staging_kernel with one program per (page, writer x layer-kv) (PERF-LB): the page index is
+    one scalar load and the page moves as one [PAGE_SIZE, ELEMS_PER_TOKEN] tile (16 B vectors)."""
+    pg = tl.program_id(0)
+    prog_id = tl.program_id(1)
+    writer_id = prog_id // NUM_LAYERS_X2
+    layer_kv_id = prog_id % NUM_LAYERS_X2
+    layer_ptr = tl.load(layer_ptrs + layer_kv_id).to(staging.dtype)
+    head_offset = tl.load(writer_head_offsets + writer_id).to(tl.int64)
+    page_val = tl.load(page_indices + pg).to(tl.int64)
+    t = tl.arange(0, PAGE_SIZE)[:, None]
+    e = tl.arange(0, ELEMS_PER_TOKEN)[None, :]
+    per_layer = per_layer_elems.to(tl.int64)
+    src = (writer_id.to(tl.int64) * NUM_LAYERS_X2 + layer_kv_id) * per_layer + (pg.to(tl.int64) * PAGE_SIZE + t) * ELEMS_PER_TOKEN + e
+    dst = (page_val * PAGE_SIZE + t) * stride_pool_token.to(tl.int64) + head_offset + e
+    tl.store(layer_ptr + dst, tl.load(staging + src))
+
+
 def _launch_scatter(layer_ptrs, page_idx, staging_typed, head_offsets, num_tokens, stride_pool_token, per_layer_elems,
                     elems_per_token, page_size, num_layers_x2, num_writers, ctas):
-    """The staging scatter: one CTA per 1024 elements, or (ctas > 0) ctas persistent CTAs of 16K-element items
-    (512 threads, 32 elements each)."""
+    """The staging scatter: one CTA per 1024 elements; (ctas > 0) ctas persistent CTAs of 16K-element items
+    (512 threads, 32 elements each); (ctas < 0, SGLANG_PLB_SCATTER_CTAS=-1) one CTA per page and writer x layer-kv."""
+    if ctas < 0 and triton.next_power_of_2(elems_per_token) == elems_per_token and num_tokens % page_size == 0:
+        _scatter_pages_kernel[(num_tokens // page_size, num_writers * num_layers_x2)](
+            layer_ptrs, page_idx, staging_typed, head_offsets, stride_pool_token, per_layer_elems,
+            ELEMS_PER_TOKEN=elems_per_token, PAGE_SIZE=page_size, NUM_LAYERS_X2=num_layers_x2, num_warps=8,
+        )
+        return
     if ctas <= 0:
         grid = (num_writers * num_layers_x2, triton.cdiv(per_layer_elems, 1024))
         _fused_scatter_from_staging_kernel[grid](
@@ -184,7 +219,8 @@ def start_fake_scatter(device, gpu_id: int, tp_rank: int, forward_stream=None) -
     into dummy layer buffers once per period-long wall-clock slot, at a per-rank offset in [0, 8 ms) (seeded by slot and
     rank: chunk arrivals reach the ranks a few ms apart). ctl file "1": stock kernel on its own default-priority stream
     (as the decode thread does), "2": the persistent kernel (SGLANG_PLB_SCATTER_CTAS or 32) on that stream, "3": stock
-    kernel enqueued on the forward stream (between two graph replays, as SGLANG_PLB_SCATTER_DEFER), else idle."""
+    kernel enqueued on the forward stream (between two graph replays, as SGLANG_PLB_SCATTER_DEFER), "4": the per-page
+    kernel (SGLANG_PLB_SCATTER_CTAS=-1) on the forward stream, else idle."""
     import random
     import time
 
@@ -217,12 +253,12 @@ def start_fake_scatter(device, gpu_id: int, tp_rank: int, forward_stream=None) -
                     mode = f.read().strip()
             except OSError:
                 mode = "0"
-            if mode not in ("1", "2", "3"):
+            if mode not in ("1", "2", "3", "4"):
                 continue
-            stream = forward_stream if mode == "3" and forward_stream is not None else side
+            stream = forward_stream if mode in ("3", "4") and forward_stream is not None else side
             with torch.cuda.stream(stream):
                 _launch_scatter(layer_ptrs, pages, staging, heads, tokens, ept, tokens * ept, ept, page, lx2, 1,
-                                ctas if mode == "2" else 0)
+                                {"2": ctas, "4": -1}.get(mode, 0))
                 done = torch.cuda.Event()
                 done.record(stream)
             done.synchronize()
