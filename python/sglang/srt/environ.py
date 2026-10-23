@@ -915,6 +915,8 @@ class Envs:
     SGLANG_PERFPF_SPF_AGE_ROUNDS = EnvInt(0)
     # PERF-PF: request decode staging only for the chunks the current prefill batch writes
     SGLANG_PERFPF_STAGING_LAZY = EnvBool(False)
+    # PERF-PF: spread prefill KV transfers over the transfer queues by room instead of by destination sessions
+    SGLANG_PERFPF_TRANSFER_SHARD_BY_ROOM = EnvBool(False)
     # TODO(yangminl): remove SGLANG_STAGING_USE_TORCH and the torch fallback in
     # staging_buffer.py once Triton kernels are fully validated in production.
     SGLANG_STAGING_USE_TORCH = EnvBool(False)
