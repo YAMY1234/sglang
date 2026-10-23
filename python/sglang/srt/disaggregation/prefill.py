@@ -661,12 +661,17 @@ class SchedulerDisaggregationPrefillMixin:
         self._process_hicache_events(
             should_retry_storage_prefetch=should_retry_storage_prefetch
         )
+        marks = getattr(self, "_l12_marks", None) if l12_trace.ENABLED else None
+        if marks is not None:
+            marks["th"] = time.time()
 
         # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
         # Otherwise, it hangs under high concurrency
         running_batch.batch_is_full = False
 
         self.resolve_waiting_queue_bootstrap()
+        if marks is not None:
+            marks["tr"] = time.time()
 
         # Skip repeated chunk processing while polling a pending batch.
         if last_batch is None or not last_batch.prefill_chunk_processed:
@@ -675,8 +680,12 @@ class SchedulerDisaggregationPrefillMixin:
             )
             if last_batch is not None:
                 last_batch.prefill_chunk_processed = True
+        if marks is not None:
+            marks["tc"] = time.time()
 
         prefill_plan = self.get_new_batch_prefill(running_batch)
+        if marks is not None:
+            marks["tg"] = time.time()
         batch = prefill_plan.batch_to_run
         running_batch = prefill_plan.running_batch
         batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
@@ -699,9 +708,13 @@ class SchedulerDisaggregationPrefillMixin:
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
+            if l12_trace.ENABLED:
+                self._l12_marks = {"ta": time.time()}
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
+            if l12_trace.ENABLED:
+                self._l12_marks["tb"] = time.time()
 
             # Get the next batch to run
             plan = self.get_next_disagg_prefill_batch_to_run(
@@ -722,6 +735,7 @@ class SchedulerDisaggregationPrefillMixin:
                 result = self.run_batch(batch)
                 l12_t2 = time.time() if l12_trace.ENABLED else 0.0
                 self.process_batch_result(batch, result)
+                l12_t3 = time.time() if l12_trace.ENABLED else 0.0
                 if l12_trace.ENABLED and get_parallel().attn_tp_rank == 0:
                     l12_trace.log_prefill_batch(
                         batch,
@@ -736,6 +750,14 @@ class SchedulerDisaggregationPrefillMixin:
                 self.on_idle()
 
             self.process_disagg_prefill_inflight_queue()
+            if batch and l12_trace.ENABLED and get_parallel().attn_tp_rank == 0:
+                l12_trace.log_prefill_loop(
+                    l12_t0,
+                    {**self._l12_marks, "t1": l12_t1, "t2": l12_t2, "t3": l12_t3},
+                    batch.batch_size(),
+                    len(self.waiting_queue),
+                    len(self.disagg_prefill_inflight_queue),
+                )
 
             # Update last_batch
             self.last_batch = batch
