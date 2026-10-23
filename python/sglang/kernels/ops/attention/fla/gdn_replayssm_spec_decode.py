@@ -636,6 +636,7 @@ def gdn_replayssm_compact_commit_kernel(
     NULL_BLOCK_ID: tl.constexpr,
     HAS_TRACK: tl.constexpr,
     HAS_RESIDUAL: tl.constexpr,
+    FOLD: tl.constexpr = True,
 ):
     """Materialize the checkpoint directly from compact ReplaySSM D/K/G."""
     i_v = tl.program_id(0)
@@ -650,7 +651,10 @@ def gdn_replayssm_compact_commit_kernel(
     if state_idx <= NULL_BLOCK_ID:
         return
     n_history = tl.load(write_pos + replay_idx).to(tl.int32)
-    fold_active = tl.load(is_flush_flags + replay_idx) != 0
+    if FOLD:
+        fold_active = tl.load(is_flush_flags + replay_idx) != 0
+    else:
+        fold_active = False
     if HAS_TRACK:
         track_idx = tl.load(mamba_track_indices + i_n * stride_track).to(tl.int64)
         track_step = tl.load(mamba_steps_to_track + i_n * stride_steps).to(tl.int32)
@@ -825,6 +829,7 @@ def _advance_gdn_spec_cursors_kernel(
     FOLD_EVERY_COMMIT: tl.constexpr,
     BLOCK: tl.constexpr,
     NULL_BLOCK_ID: tl.constexpr,
+    HISTORY_LIMIT: tl.constexpr = 0,
 ):
     offs = tl.arange(0, BLOCK)
     row_mask = offs < n_rows
@@ -864,6 +869,10 @@ def _advance_gdn_spec_cursors_kernel(
     # for more. Config enforces max_cache_len >= 2 * max_spec_len.
     if FOLD_EVERY_COMMIT:
         next_is_flush = (new_wp > 0).to(tl.int8)
+    elif HISTORY_LIMIT > 0:
+        # In-layer fold at the next verify, which writes its window after the
+        # history: fold once the history and one more window pass the limit.
+        next_is_flush = ((new_wp + MAX_SPEC_LEN) > HISTORY_LIMIT).to(tl.int8)
     else:
         next_is_flush = ((new_wp + 2 * MAX_SPEC_LEN) > MAX_CACHE_LEN).to(tl.int8)
 
@@ -1242,6 +1251,7 @@ def commit_gdn_replayssm_spec(
     fold_every_commit: bool = False,
     cache_buf_len: int | None = None,
     null_block_id: int = 0,
+    history_limit: int = 0,
 ):
     """Advance request-keyed cursors once per verify step (device-only)."""
     if cache_buf_len is None:
@@ -1263,6 +1273,7 @@ def commit_gdn_replayssm_spec(
         FOLD_EVERY_COMMIT=fold_every_commit,
         BLOCK=BLOCK,
         NULL_BLOCK_ID=null_block_id,
+        HISTORY_LIMIT=history_limit,
     )
 
 
@@ -1284,13 +1295,15 @@ def commit_gdn_replayssm_circular(
     mamba_steps_to_track: torch.Tensor | None = None,
     null_block_id: int = -1,
     use_cuda: bool = False,
+    fold: bool = True,
 ) -> None:
     """Materialize circular history only for capacity and track rows.
 
     ``write_pos`` must already include this step's accepted prefix. Capacity
     rows update their active checkpoint and reset the ring; track rows snapshot
     the exact state at the requested accepted step without disturbing the active
-    checkpoint.
+    checkpoint. ``fold=False``: the track rows only, cursors untouched (the next
+    verify folds the flagged rows, SGLANG_Q35MF_COMMIT_INLAYER).
     """
     num_layers, _, HV, V, K = checkpoint_state.shape
     H = k_cache.shape[2]
@@ -1301,6 +1314,8 @@ def commit_gdn_replayssm_circular(
     k_residual_buf = k_residual_cache if has_residual else k_cache
     BV = min(triton.next_power_of_2(V), 64)
     has_track = mamba_track_indices is not None and mamba_steps_to_track is not None
+    if not fold and not has_track:
+        return
     if use_cuda and _commit_cuda(
         checkpoint_state=checkpoint_state,
         d_cache=d_cache,
@@ -1317,7 +1332,10 @@ def commit_gdn_replayssm_circular(
         mamba_track_indices=mamba_track_indices if has_track else None,
         mamba_steps_to_track=mamba_steps_to_track if has_track else None,
         null_block_id=null_block_id,
+        **({} if fold else {"track_only": True}),
     ):
+        if not fold:
+            return
         _finish_circular_fold(
             write_pos=write_pos,
             cache_base=cache_base,
@@ -1380,9 +1398,12 @@ def commit_gdn_replayssm_circular(
         NULL_BLOCK_ID=null_block_id,
         HAS_TRACK=has_track,
         HAS_RESIDUAL=has_residual,
+        FOLD=fold,
         num_warps=4,
         num_stages=2,
     )
+    if not fold:
+        return
     _finish_circular_fold(
         write_pos=write_pos,
         cache_base=cache_base,

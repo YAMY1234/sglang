@@ -1508,6 +1508,14 @@ class Envs:
     # The compact ReplaySSM commit of every GDN layer as one CUDA launch (one CTA per layer,
     # request and value head); the same four high / low products, FP32 sums in another order.
     SGLANG_Q35MF_COMMIT_CUDA = EnvBool(False)
+    # The compact ReplaySSM fold of BF16 checkpoints moves from the commit into the next
+    # verify (the plugin's GDN core folds flagged rows in-layer; SGLang's own verify folds
+    # them before its first GDN layer): 1 = every round, 2 = once the history would pass
+    # 16 entries (needs --linear-replayssm-cache-len 32). The commit keeps the cursor
+    # advance and the track snapshots.
+    SGLANG_Q35MF_COMMIT_INLAYER = EnvInt(0)
+    # Batches of fewer requests keep the commit-time fold (the in-layer fold costs more there).
+    SGLANG_Q35MF_COMMIT_INLAYER_MIN_BS = EnvInt(1)
     # TP > 1 EAGLE topk-1 verify keeps the target logits vocabulary-sharded: greedy rows
     # take a sharded argmax (bit-identical), temperature-only rows a sharded Gumbel-max
     # (same distribution); any other batch all-gathers them first, as before.
