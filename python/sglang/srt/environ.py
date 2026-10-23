@@ -1824,6 +1824,10 @@ class Envs:
     # padding, each copy slot's destination view, the post-fill hooks) instead of walking
     # and slicing every slot on each call.
     SGLANG_PERFLL_HOST_FILL_PLAN = EnvBool(False)
+    # The draft and draft-extend graph runners stage an unpadded round's inputs, hidden states
+    # and draft probs included, with one JIT field copy into destination views cached per
+    # input layout, instead of slicing every buffer and a separate copy_ for hidden states.
+    SGLANG_PERFLL_HOST_GRAPH_INPUTS = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
