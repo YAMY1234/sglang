@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import os
 import threading
 from typing import Optional
 
@@ -46,7 +47,7 @@ struct Params {
   const void* sidx; const void* ridx; const int* write_pos; const int* cache_base;
   const signed char* is_flush; const void* acc; const void* tidx; const void* tstep;
   int sidx64, ridx64, acc64, tidx64, tstep64;
-  int B;
+  int B, total;  // total = layers x B x HV tiles; a CTA walks blockIdx.x, + gridDim.x, ...
   long long null_block;
 };
 
@@ -87,11 +88,11 @@ __device__ __forceinline__ void bulk_g2s(void* dst, const void* src, u32 bytes, 
   asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
                ::"r"(smem_u32(dst)), "l"(src), "r"(bytes), "r"(smem_u32(bar)) : "memory");
 }
-__device__ __forceinline__ void mbar_wait0(u64* bar) {
+__device__ __forceinline__ void mbar_wait(u64* bar, u32 parity) {
   u32 ready = 0;
   do {
-    asm volatile("{ .reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 p, [%1], 0; selp.u32 %0, 1, 0, p; }"
-                 : "=r"(ready) : "r"(smem_u32(bar)) : "memory");
+    asm volatile("{ .reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2; selp.u32 %0, 1, 0, p; }"
+                 : "=r"(ready) : "r"(smem_u32(bar)), "r"(parity) : "memory");
   } while (!ready);
 }
 
@@ -192,94 +193,100 @@ extern "C" __global__ void __launch_bounds__(NW * 32) gdn_replayssm_commit(const
   extern __shared__ __align__(128) unsigned char smem_raw[];
   __shared__ u64 bar;
   constexpr int GRP = HV / HK;
-  const int cta = blockIdx.x;
-  const int hv = cta % HV;
-  const int n = (cta / HV) % p.B;
-  const int layer = cta / (HV * p.B);
-  const int hk = hv / GRP;
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, r = lane >> 2, q = lane & 3;
   const int vb = warp * 32;
-
-  const long long slot = ld_idx(p.sidx, n, p.sidx64);
-  const long long rid = ld_idx(p.ridx, n, p.ridx64);
-  if (slot <= p.null_block) return;
   const bool resid = p.dr != nullptr && p.kr != nullptr;
   u16* sm = reinterpret_cast<u16*>(smem_raw);
-  // the checkpoint and the whole ring slice need only the two indices: copies first, cursors meanwhile
   if (tid == 0) {
     asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(smem_u32(&bar)) : "memory");
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
-    const u32 bytes = 2 * (VD * KD + (resid ? 4 : 2) * RING * KD);
-    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(smem_u32(&bar)), "r"(bytes)
-                 : "memory");
-    bulk_g2s(sm + SH_STATE, p.h0 + layer * p.h0_layer + slot * p.h0_slot + (long long)hv * VD * KD, 2 * VD * KD,
-             &bar);
-    bulk_g2s(sm + SH_K, p.k + layer * p.k_layer + rid * p.k_slot + (long long)hk * RING * KD, 2 * RING * KD, &bar);
-    bulk_g2s(sm + SH_D, p.d + layer * p.d_layer + rid * p.d_slot + (long long)hv * RING * VD, 2 * RING * VD, &bar);
-    if (resid) {
-      bulk_g2s(sm + SH_KR, p.kr + layer * p.kr_layer + rid * p.kr_slot + (long long)hk * RING * KD, 2 * RING * KD,
-               &bar);
-      bulk_g2s(sm + SH_DR, p.dr + layer * p.dr_layer + rid * p.dr_slot + (long long)hv * RING * VD, 2 * RING * VD,
-               &bar);
-    }
   }
-  const int n_hist = p.write_pos[rid];
-  const bool fold = p.is_flush[rid] != 0;
-  const int base = p.cache_base[rid];
-  long long tslot = p.null_block;
-  int track_len = 0;
-  if (HAS_TRACK) {
-    tslot = ld_idx(p.tidx, n, p.tidx64);
-    const long long ts = ld_idx(p.tstep, n, p.tstep64);
-    if (!(tslot > p.null_block && ts >= 0)) tslot = p.null_block;
-    track_len = n_hist - (int)ld_idx(p.acc, n, p.acc64) + (int)ts + 1;
-  }
-  const bool track = tslot > p.null_block;
-  const float gt = lane < RING ? p.g[layer * p.g_layer + rid * p.g_slot + hv * RING + ((base + lane) & (RING - 1))] : 0.f;
-  const int jj[4] = {2 * q, 2 * q + 1, 2 * q + 8, 2 * q + 9};
-  int ph[4];
-#pragma unroll
-  for (int i = 0; i < 4; ++i) ph[i] = (base + jj[i]) & (RING - 1);
   __syncthreads();  // the barrier's init before anyone waits on it
-  mbar_wait0(&bar);  // also before an early exit: no copy may land after the CTA is gone
-  if (!fold && !track) return;
-  // windows of at most 8 entries (every fold of a step of up to 8 draft rows) take the k8 products
-  const bool k16 = (fold && n_hist > 8) || (track && track_len > 8);
-
-  float u[2][2][4];  // updates (high + low, FP32): [m][half][entry jj]
-#pragma unroll
-  for (int i = 0; i < 4; ++i)
-#pragma unroll
-    for (int m = 0; m < 2; ++m)
-#pragma unroll
-      for (int h = 0; h < 2; ++h) {
-        const int v = vb + 16 * m + 8 * h + r;
-        float x = 0.f;
-        if (i < 2 || k16) {
-          x = bf2f(sm[SH_D + ph[i] * VD + v]);
-          if (resid) x += bf2f(sm[SH_DR + ph[i] * VD + v]);
-        }
-        u[m][h][i] = x;
+  u32 phase = 0;
+  // one tile (layer, request, value head) an iteration; gridDim.x < total (SGLANG_PERFHT_COMMIT_CTAS) leaves SMs to
+  // the kernels of the other streams (the side-stream commit then overlaps the draft instead of holding the GPU)
+  for (int cta = blockIdx.x; cta < p.total; cta += gridDim.x) {
+    const int hv = cta % HV;
+    const int n = (cta / HV) % p.B;
+    const int layer = cta / (HV * p.B);
+    const int hk = hv / GRP;
+    const long long slot = ld_idx(p.sidx, n, p.sidx64);
+    const long long rid = ld_idx(p.ridx, n, p.ridx64);
+    if (slot <= p.null_block) continue;  // CTA-uniform: no copy issued, the phase stays
+    // the checkpoint and the whole ring slice need only the two indices: copies first, cursors meanwhile
+    if (tid == 0) {
+      const u32 bytes = 2 * (VD * KD + (resid ? 4 : 2) * RING * KD);
+      asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(smem_u32(&bar)), "r"(bytes)
+                   : "memory");
+      bulk_g2s(sm + SH_STATE, p.h0 + layer * p.h0_layer + slot * p.h0_slot + (long long)hv * VD * KD, 2 * VD * KD,
+               &bar);
+      bulk_g2s(sm + SH_K, p.k + layer * p.k_layer + rid * p.k_slot + (long long)hk * RING * KD, 2 * RING * KD, &bar);
+      bulk_g2s(sm + SH_D, p.d + layer * p.d_layer + rid * p.d_slot + (long long)hv * RING * VD, 2 * RING * VD, &bar);
+      if (resid) {
+        bulk_g2s(sm + SH_KR, p.kr + layer * p.kr_layer + rid * p.kr_slot + (long long)hk * RING * KD, 2 * RING * KD,
+                 &bar);
+        bulk_g2s(sm + SH_DR, p.dr + layer * p.dr_layer + rid * p.dr_slot + (long long)hv * RING * VD, 2 * RING * VD,
+                 &bar);
       }
-  if (fold) {
-    float dec[4];
-    const float etot = window(gt, n_hist, lane, jj, dec);
-    u32 AH[2][4], AL[2][4];
-    a_frags(u, dec, AH, AL);
-    if (k16) fold_store<true>(sm, ph, AH, AL, etot, resid, p.h0 + layer * p.h0_layer + slot * p.h0_slot + (long long)hv * VD * KD,
-               vb, r, q);
-    else fold_store<false>(sm, ph, AH, AL, etot, resid, p.h0 + layer * p.h0_layer + slot * p.h0_slot + (long long)hv * VD * KD,
-               vb, r, q);
-  }
-  if (track) {
-    float dec[4];
-    const float etot = window(gt, track_len, lane, jj, dec);
-    u32 AH[2][4], AL[2][4];
-    a_frags(u, dec, AH, AL);
-    if (k16) fold_store<true>(sm, ph, AH, AL, etot, resid, p.h0 + layer * p.h0_layer + tslot * p.h0_slot + (long long)hv * VD * KD,
-               vb, r, q);
-    else fold_store<false>(sm, ph, AH, AL, etot, resid, p.h0 + layer * p.h0_layer + tslot * p.h0_slot + (long long)hv * VD * KD,
-               vb, r, q);
+    }
+    const int n_hist = p.write_pos[rid];
+    const bool fold = p.is_flush[rid] != 0;
+    const int base = p.cache_base[rid];
+    long long tslot = p.null_block;
+    int track_len = 0;
+    if (HAS_TRACK) {
+      tslot = ld_idx(p.tidx, n, p.tidx64);
+      const long long ts = ld_idx(p.tstep, n, p.tstep64);
+      if (!(tslot > p.null_block && ts >= 0)) tslot = p.null_block;
+      track_len = n_hist - (int)ld_idx(p.acc, n, p.acc64) + (int)ts + 1;
+    }
+    const bool track = tslot > p.null_block;
+    const float gt =
+        lane < RING ? p.g[layer * p.g_layer + rid * p.g_slot + hv * RING + ((base + lane) & (RING - 1))] : 0.f;
+    const int jj[4] = {2 * q, 2 * q + 1, 2 * q + 8, 2 * q + 9};
+    int ph[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) ph[i] = (base + jj[i]) & (RING - 1);
+    mbar_wait(&bar, phase);  // also before an early exit: no copy may land after the CTA moves on
+    phase ^= 1u;
+    if (fold || track) {
+      // windows of at most 8 entries (every fold of a step of up to 8 draft rows) take the k8 products
+      const bool k16 = (fold && n_hist > 8) || (track && track_len > 8);
+      float u[2][2][4];  // updates (high + low, FP32): [m][half][entry jj]
+#pragma unroll
+      for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int m = 0; m < 2; ++m)
+#pragma unroll
+          for (int h = 0; h < 2; ++h) {
+            const int v = vb + 16 * m + 8 * h + r;
+            float x = 0.f;
+            if (i < 2 || k16) {
+              x = bf2f(sm[SH_D + ph[i] * VD + v]);
+              if (resid) x += bf2f(sm[SH_DR + ph[i] * VD + v]);
+            }
+            u[m][h][i] = x;
+          }
+      if (fold) {
+        float dec[4];
+        const float etot = window(gt, n_hist, lane, jj, dec);
+        u32 AH[2][4], AL[2][4];
+        a_frags(u, dec, AH, AL);
+        u16* dst = p.h0 + layer * p.h0_layer + slot * p.h0_slot + (long long)hv * VD * KD;
+        if (k16) fold_store<true>(sm, ph, AH, AL, etot, resid, dst, vb, r, q);
+        else fold_store<false>(sm, ph, AH, AL, etot, resid, dst, vb, r, q);
+      }
+      if (track) {
+        float dec[4];
+        const float etot = window(gt, track_len, lane, jj, dec);
+        u32 AH[2][4], AL[2][4];
+        a_frags(u, dec, AH, AL);
+        u16* dst = p.h0 + layer * p.h0_layer + tslot * p.h0_slot + (long long)hv * VD * KD;
+        if (k16) fold_store<true>(sm, ph, AH, AL, etot, resid, dst, vb, r, q);
+        else fold_store<false>(sm, ph, AH, AL, etot, resid, dst, vb, r, q);
+      }
+    }
+    __syncthreads();  // every read of this tile's shared copies before the next tile's copies land
   }
 }
 """
@@ -298,13 +305,15 @@ class _Params(ctypes.Structure):
         ("tidx", ctypes.c_void_p), ("tstep", ctypes.c_void_p),
         ("sidx64", ctypes.c_int), ("ridx64", ctypes.c_int), ("acc64", ctypes.c_int),
         ("tidx64", ctypes.c_int), ("tstep64", ctypes.c_int),
-        ("B", ctypes.c_int),
+        ("B", ctypes.c_int), ("total", ctypes.c_int),
         ("null_block", ctypes.c_int64),
     ]
 
 
 _LOCK = threading.Lock()
 _KERNELS: dict = {}
+# SGLANG_PERFHT_COMMIT_CTAS: at most this many CTAs (each walks tiles); 0 = one CTA a tile
+_COMMIT_CTAS = int(os.environ.get("SGLANG_PERFHT_COMMIT_CTAS", "0") or 0)
 
 
 def _check(res, what):
@@ -450,12 +459,14 @@ def commit(
         ptr(mamba_track_indices), ptr(mamba_steps_to_track),
         i64(state_batch_indices), i64(replay_indices), i64(accept_lens),
         i64(mamba_track_indices), i64(mamba_steps_to_track),
-        B, null_block_id,
+        B, num_layers * B * HV, null_block_id,
     )
     device = checkpoint_state.device.index
     fn = _kernel(device, H, HV, ring, has_track)
     cfg = cu.CUlaunchConfig()
-    cfg.gridDimX, cfg.gridDimY, cfg.gridDimZ = num_layers * B * HV, 1, 1
+    total = num_layers * B * HV
+    ctas = _COMMIT_CTAS
+    cfg.gridDimX, cfg.gridDimY, cfg.gridDimZ = (min(total, ctas) if ctas > 0 else total), 1, 1
     cfg.blockDimX, cfg.blockDimY, cfg.blockDimZ = 128, 1, 1
     cfg.sharedMemBytes = _smem_bytes(ring)
     cfg.hStream = cu.CUstream(torch.cuda.current_stream(checkpoint_state.device).cuda_stream)
