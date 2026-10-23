@@ -33,7 +33,7 @@ _HOST_COLS = (
     "pf", "in", "pq", "pq_rel", "pq_res", "pp", "pp_rs", "pp_hs", "pp_alloc", "pp_send",
     "px", "px_poll", "ar", "nb", "rb", "prw", "pr", "smp",
 )
-_COLS = ("it", "t_ms", "fct", "B", "gbs", "nnew", "npa", "npre", "nxfer", "nwait", "idle", "ar_n", "knob") + _HOST_COLS
+_COLS = ("it", "t_ms", "fct", "B", "gbs", "nnew", "npa", "npre", "nxfer", "nwait", "idle", "ar_n", "knob", "mode") + _HOST_COLS
 
 
 def coarse_pad(raw_size: int, buckets) -> Optional[int]:
@@ -175,7 +175,7 @@ class LoopStat:
             r = self.row
             self.rows.append(
                 f"{self.it},{(_now() - self.t0) / 1e6:.3f},{self.sched.forward_ct},{bs},{gbs},"
-                f"{m.get('nnew', 0)},{m.get('npa', 0)},{m.get('npre', 0)},{m.get('nxfer', 0)},{m.get('nwait', 0)},{self.idle},{self.ar_n},{self.knob},"
+                f"{m.get('nnew', 0)},{m.get('npa', 0)},{m.get('npre', 0)},{m.get('nxfer', 0)},{m.get('nwait', 0)},{self.idle},{self.ar_n},{self.knob},{m.get('mode', 0)},"
                 + ",".join(str(r[k] // 1000) for k in _HOST_COLS)
             )
         for k in self.row:
