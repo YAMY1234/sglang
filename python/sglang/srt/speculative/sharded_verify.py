@@ -19,6 +19,7 @@ from sglang.srt.environ import envs
 
 _MC_GATHER = envs.SGLANG_PERFLL_VERIFY_MC_GATHER.get()
 _SPLIT = envs.SGLANG_PERFLL_VERIFY_KEY_SPLIT.get()
+_LL_KEYS = envs.SGLANG_PERFLL_VERIFY_LL_KEYS.get()
 
 
 class VocabShard(msgspec.Struct, frozen=True):
@@ -243,6 +244,175 @@ def _mc_gather_keys(keys: torch.Tensor, tp_group) -> Optional[torch.Tensor]:
     return _reduce_keys(out, rows, world, width, width, out.stride(0))
 
 
+# SGLANG_PERFLL_VERIFY_LL_KEYS: epoch-tagged exchange of one key per row (low / high 32 bits in two
+# 64-bit words whose high halves carry the epoch), three slots rotating by epoch: a slot is rewritten
+# three calls later, after two more exchanges that each needed every rank's words.
+_LL_SLOTS = 3
+_LL_MAX_ROWS = 64
+_LL_SPIN_LIMIT = 1 << 26
+_ll_state = None
+
+
+@triton.jit
+def _ll_st_b64(addr, val, mask):
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .pred %p0;
+            setp.eq.s32 %p0, $3, 1;
+            @!%p0 bra end;
+            multimem.st.relaxed.sys.global.b64 [$1], $2;
+            end:
+        }
+        """,
+        "=r,l,l,r",
+        args=[addr, val, mask.to(tl.int32)],
+        dtype=tl.uint32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _ll_ld_b64(addr, mask):
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .pred %p0;
+            setp.eq.s32 %p0, $2, 1;
+            mov.u64 $0, 0;
+            @!%p0 bra end;
+            ld.relaxed.sys.global.u64 $0, [$1];
+            end:
+        }
+        """,
+        "=l,l,r",
+        args=[addr, mask.to(tl.int32)],
+        dtype=tl.uint64,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _ll_trap():
+    tl.inline_asm_elementwise("trap;", "=r", [], dtype=tl.int32, is_pure=False, pack=1)
+
+
+@triton.jit
+def _ll_keys_kernel(
+    keys_ptr,
+    parts,
+    rows,
+    mc_addr,
+    uc_addr,
+    epoch_ptr,
+    tokens_ptr,
+    RANK: tl.constexpr,
+    WORLD: tl.constexpr,
+    MAXR: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_P: tl.constexpr,
+    KEY_FLOOR: tl.constexpr,
+    SPIN_LIMIT: tl.constexpr,
+):
+    tag = (tl.load(epoch_ptr) + 1).to(tl.uint64)
+    slot = (tag % 3).to(tl.int64)
+    r = tl.arange(0, BLOCK_R)
+    p = tl.arange(0, BLOCK_P)
+    rmask = r < rows
+    k = tl.load(
+        keys_ptr + r[:, None] * parts + p[None, :],
+        mask=rmask[:, None] & (p[None, :] < parts),
+        other=KEY_FLOOR,
+    )
+    key = tl.max(k, axis=1).to(tl.uint64, bitcast=True)
+    tagw = tag << 32
+    mc = mc_addr.to(tl.pointer_type(tl.uint64))
+    word = ((slot * WORLD + RANK) * MAXR + r) * 2
+    _ll_st_b64(mc + word, (key & 0xFFFFFFFF) | tagw, rmask)
+    _ll_st_b64(mc + word + 1, (key >> 32) | tagw, rmask)
+    s = tl.arange(0, WORLD)
+    m2 = rmask[None, :] & (s[:, None] < WORLD)
+    uc = uc_addr.to(tl.pointer_type(tl.uint64))
+    words = ((slot * WORLD + s[:, None]) * MAXR + r[None, :]) * 2
+    lo = _ll_ld_b64(uc + words, m2)
+    hi = _ll_ld_b64(uc + words + 1, m2)
+    ok = (((lo >> 32) == tag) & ((hi >> 32) == tag)) | (~m2)
+    pending = tl.sum(1 - ok.to(tl.int32))
+    spins = 0
+    while pending > 0:
+        lo = _ll_ld_b64(uc + words, m2)
+        hi = _ll_ld_b64(uc + words + 1, m2)
+        ok = (((lo >> 32) == tag) & ((hi >> 32) == tag)) | (~m2)
+        pending = tl.sum(1 - ok.to(tl.int32))
+        spins += 1
+        if spins > SPIN_LIMIT:
+            _ll_trap()
+    got = (((hi & 0xFFFFFFFF) << 32) | (lo & 0xFFFFFFFF)).to(tl.int64, bitcast=True)
+    best = tl.max(tl.where(m2, got, KEY_FLOOR), axis=0)
+    tl.store(tokens_ptr + r, 4294967295 - (best & 4294967295), mask=rmask)
+    tl.store(epoch_ptr, tag.to(tl.int32))
+
+
+def _ll_build(tp_group, device):
+    """The LL exchange's symmetric buffer (zeroed before any peer can write it) and epoch, or
+    False (the other exchanges keep the call) when it has no multicast mapping."""
+    import torch.distributed as dist
+    import torch.distributed._symmetric_memory as symm_mem
+
+    world = tp_group.world_size
+    try:
+        with torch.inference_mode(False), torch.no_grad():
+            buf = symm_mem.empty(
+                (_LL_SLOTS * world * _LL_MAX_ROWS * 2,), dtype=torch.int64, device=device
+            )
+        hdl = symm_mem.rendezvous(buf, group=tp_group.device_group)
+    except Exception as e:
+        print_info_once(f"SGLANG_PERFLL_VERIFY_LL_KEYS: symmetric buffer failed ({e}); not used")
+        return False
+    if hdl.multicast_ptr == 0:
+        print_info_once("SGLANG_PERFLL_VERIFY_LL_KEYS: no multicast mapping; not used")
+        return False
+    buf.zero_()
+    torch.cuda.synchronize(device)
+    dist.barrier(group=tp_group.cpu_group if hasattr(tp_group, "cpu_group") else tp_group.device_group)
+    epoch = torch.zeros(1, dtype=torch.int32, device=device)
+    return (buf, hdl, epoch)
+
+
+def _ll_keys(keys: torch.Tensor, tp_group) -> Optional[torch.Tensor]:
+    """[rows] or [rows, parts] int64 keys of every rank -> [rows] token ids in one launch, or None
+    when the LL exchange is unavailable."""
+    global _ll_state
+    if _ll_state is None:
+        _ll_state = _ll_build(tp_group, keys.device)
+    if _ll_state is False:
+        return None
+    buf, hdl, epoch = _ll_state
+    rows = keys.shape[0]
+    parts = keys.shape[1] if keys.dim() == 2 else 1
+    tokens = torch.empty(rows, dtype=torch.int64, device=keys.device)
+    _ll_keys_kernel[(1,)](
+        keys,
+        parts,
+        rows,
+        hdl.multicast_ptr,
+        hdl.buffer_ptrs[hdl.rank],
+        epoch,
+        tokens,
+        RANK=hdl.rank,
+        WORLD=tp_group.world_size,
+        MAXR=_LL_MAX_ROWS,
+        BLOCK_R=max(16, triton.next_power_of_2(rows)),
+        BLOCK_P=max(2, triton.next_power_of_2(parts)),
+        KEY_FLOOR=_KEY_FLOOR,
+        SPIN_LIMIT=_LL_SPIN_LIMIT,
+        num_warps=4,
+    )
+    return tokens
+
+
 def sharded_target_tokens(
     logits: torch.Tensor,
     shard: VocabShard,
@@ -256,6 +426,7 @@ def sharded_target_tokens(
         + " on the vocabulary shards"
         + (" (keys split, fused reduce)" if _SPLIT else "")
         + (" (multimem key gather)" if _MC_GATHER else "")
+        + (" (LL key exchange <= 64 rows)" if _LL_KEYS else "")
     )
     seeds = None
     if temperatures is not None:
@@ -264,6 +435,10 @@ def sharded_target_tokens(
         )
     splits = key_splits(shard.valid) if _SPLIT else 1
     keys = shard_keys(logits, shard, temperatures, seeds, splits)
+    if _LL_KEYS and 0 < keys.shape[0] <= _LL_MAX_ROWS and tp_group.world_size <= 16:
+        tokens = _ll_keys(keys, tp_group)
+        if tokens is not None:
+            return tokens
     if _MC_GATHER and 0 < keys.shape[0] <= _MC_MAX_ROWS:
         tokens = _mc_gather_keys(keys, tp_group)
         if tokens is not None:
