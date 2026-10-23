@@ -1496,6 +1496,10 @@ class Envs:
     # outputs in place instead of through the FutureMap stash and gather (bit-identical);
     # any other batch flushes the deferred stash first. Overlap scheduler, EAGLE topk 1.
     SGLANG_Q35MF_SPEC_RELAY_BYPASS = EnvBool(False)
+    # TP > 1 EAGLE topk-1 verify keeps the target logits vocabulary-sharded: greedy rows
+    # take a sharded argmax (bit-identical), temperature-only rows a sharded Gumbel-max
+    # (same distribution); any other batch all-gathers them first, as before.
+    SGLANG_Q35MF_SHARDED_VERIFY = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
