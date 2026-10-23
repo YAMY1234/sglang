@@ -37,6 +37,7 @@ import torch.distributed as dist
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.disaggregation import l16_loopstat
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import KVTransferDestination, StateType
 from sglang.srt.disaggregation.checksum import (
@@ -1371,8 +1372,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if is_pp_mode and rids_to_check is not None:
             raise ValueError("rids_to_check cannot be used in PP mode")
 
+        ls = l16_loopstat.STAT
+        t0 = l16_loopstat._now() if ls is not None else 0
         self._resolve_pending_reqs()
+        if ls is not None:
+            ls.add("pp_rs", t0)
+            t0 = l16_loopstat._now()
         self._update_handshake_waiters(rids_to_check, pp_good_rids, pp_bad_rids)
+        if ls is not None:
+            ls.add("pp_hs", t0)
         if is_pp_mode:
             rids_to_check = set(pp_good_rids) | set(pp_bad_rids)
 
@@ -2921,10 +2929,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 ]
             )
 
+        ls = l16_loopstat.STAT
+        t0 = l16_loopstat._now() if ls is not None else 0
         if self.enable_staging:
             polls = self._poll_with_staging()
         else:
             polls = self._poll_with_metadata_gate()
+        if ls is not None:
+            ls.add("px_poll", t0)
 
         transferred_reqs = []
         indices_to_remove = set()
@@ -3243,25 +3255,39 @@ class SchedulerDisaggregationDecodeMixin:
     def event_loop_overlap_disagg_decode(self: Scheduler):
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
+        ls = l16_loopstat.init(self)
 
         def pop_and_process():
             tmp_batch, tmp_result = self.result_queue.popleft()
+            if ls is not None and tmp_result.copy_done is not None:
+                ls.mark("pr")
+                tmp_result.copy_done.synchronize()
+                ls.mark("prw")
             self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
             if self.gracefully_exit:
                 break
 
+            if ls is not None:
+                ls.begin()
             # Pending rooms from the prior cycle can overlap request intake and
             # the tail of the in-flight decode graph.
             if not self._engine_paused:
                 self.disagg_decode_prealloc_queue.prefetch_prefill_dp_rank_queries()
+            if ls is not None:
+                ls.mark("pf")
             # Receive requests
             self.ingest_requests()
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
+            if ls is not None:
+                ls.mark("in")
+                ls.apply_knobs()
             self.process_decode_queue()
+            if ls is not None:
+                ls.mark("pq")
 
             # Get the next batch to run
             plan = self.get_next_disagg_decode_batch_to_run(
@@ -3280,15 +3306,23 @@ class SchedulerDisaggregationDecodeMixin:
 
             if disable_overlap_for_batch and self.last_batch:
                 pop_and_process()
+            if ls is not None:
+                ls.mark("nb")
 
             # Launch the current batch
             if batch:
+                if ls is not None:
+                    ls.gpu_a(self.forward_stream)
                 batch_result = self.run_batch(batch)
                 self._apply_war_barrier()
+                if ls is not None:
+                    ls.gpu_b(self.forward_stream)
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
                 self._sched_idled = True
+            if ls is not None:
+                ls.mark("rb")
 
             # Process the last batch
             if self.last_batch:
@@ -3296,10 +3330,18 @@ class SchedulerDisaggregationDecodeMixin:
                     pop_and_process()
             elif batch is None:
                 self.on_idle()
+            if ls is not None:
+                ls.mark("pr")
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             self.launch_batch_sample_if_needed(batch_result, batch)
+            if ls is not None:
+                ls.mark("smp")
+                ls.meta["npre"] = len(self.disagg_decode_prealloc_queue.queue)
+                ls.meta["nxfer"] = len(self.disagg_decode_transfer_queue.queue)
+                ls.meta["nwait"] = len(self.waiting_queue)
+                ls.end(batch)
 
             # Update last_batch
             self.last_batch = batch
@@ -3613,13 +3655,20 @@ class SchedulerDisaggregationDecodeMixin:
         if get_disagg().disaggregation_decode_enable_offload_kvcache:
             self.decode_offload_manager.check_offload_progress()
 
+        ls = l16_loopstat.STAT
+        t0 = l16_loopstat._now() if ls is not None else 0
         # Resolve held releases every iteration (before the retraction/polling
         # gates below) so their timeouts fire under memory pressure.
         self.disagg_decode_transfer_queue.resolve_deferred_releases()
+        if ls is not None:
+            ls.add("pq_rel", t0)
+            t0 = l16_loopstat._now()
 
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
         self.waiting_queue.extend(resumed_reqs)
+        if ls is not None:
+            ls.add("pq_res", t0)
         if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
             # if there are still retracted requests, we do not allocate new requests
             return
@@ -3632,11 +3681,18 @@ class SchedulerDisaggregationDecodeMixin:
 
         if self.polling_count % self.polling_interval == 0:
             if get_disagg().disaggregation_decode_host_receive_threshold == 1:
+                t0 = l16_loopstat._now() if ls is not None else 0
                 req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
                 self.disagg_decode_transfer_queue.extend(req_conns)
+                if ls is not None:
+                    ls.add("pp", t0)
+            t0 = l16_loopstat._now() if ls is not None else 0
             transferred_reqs = (
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
+            if ls is not None:
+                ls.add("px", t0)
+                ls.meta["nnew"] = len(transferred_reqs)
             if self.enable_hisparse:
                 for req in transferred_reqs:
                     # Direct-to-host: KV data already in host pool, skip staging
