@@ -280,19 +280,16 @@ def prepare_for_draft(
         # window in the same launch.
         window_cols = num_draft_tokens if plans_window else num_steps
         if page_size == 1 or topk == 1:
-            batch.out_cache_loc = torch.empty(
-                (bs * topk * window_cols,),
-                dtype=torch.int64,
-                device=batch.device,
+            empty = perfll_host.round_empty if perfll_host.OUT_POOL else perfll_host.torch_empty
+            batch.out_cache_loc = empty(
+                (bs * topk * window_cols,), torch.int64, batch.device
             )
             if batch.seq_lens.is_cuda and topk == 1:
-                prepared_positions = torch.empty_like(batch.seq_lens)
+                prepared_positions = empty((bs,), batch.seq_lens.dtype, batch.seq_lens.device)
                 if draft_model_runner.model_config.model_is_mrope and all(
                     x is None for x in batch.multimodal_inputs
                 ):
-                    prepared_mrope_positions = torch.empty(
-                        (3, bs), dtype=torch.int64, device=batch.device
-                    )
+                    prepared_mrope_positions = empty((3, bs), torch.int64, batch.device)
             if not (
                 perfll_spec_index.ENABLED
                 and perfll_spec_index.draft_locs(
