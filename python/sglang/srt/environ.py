@@ -1317,6 +1317,11 @@ class Envs:
     # TRT-L18: ungated exact calls (the plugin's draft steps) as gated ones with all three switches: the fused partial
     # takes the prefix lengths as seq_lens - q_len itself (PDL after the q gather), then the per-(row, head) merge.
     SGLANG_TRTL18_CP_UNGATED = EnvBool(False)
+    # PERF-LB: the fused CP-lite partial (batches <= 32) shares one CTA per SM among the requests by their owned KV
+    # (TRT's TRTLLM_Q35_ATTN_CP_BALANCED_SPLIT): no idle SMs when splits x batch < SMs, a ragged batch costs its total
+    # KV instead of its longest request's. SM_RESERVE: SMs left out of that grid.
+    SGLANG_PLB_CP_BALANCED = EnvBool(False)
+    SGLANG_PLB_CP_SM_RESERVE = EnvInt(0)
     # Timing only: decode graph padding per block of Q35MF_AB_BLOCK target-verify rounds, the labels in turn
     # ("pow2": the smallest captured power of two); model_executor/runner_backend/ab_variants.py. Empty: off.
     SGLANG_TRTL17_PAD_AB = EnvTuple(())
