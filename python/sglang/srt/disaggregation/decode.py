@@ -434,7 +434,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self._num_published_destinations = 0
         # (decode_req, host index tensors, has_state, metadata kwargs, copy-done event)
         self._deferred_sends: deque = deque()
-        self._defer_send = envs.SGLANG_TRTL16_DEFER_METADATA_SEND.get()
         self.tp_rank = parallel.tp_rank
         self.gpu_id = gpu_id
         self.bootstrap_port = bootstrap_port
@@ -1831,7 +1830,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
             t_sd = l16_loopstat._now() if ls is not None else 0
             if (
-                (self._defer_send or (ls is not None and ls.defer_on))
+                l16_loopstat.prealloc_no_sync()
                 and set(state_types) <= {StateType.MAMBA}
                 and not self.scheduler.enable_hisparse
                 and not _is_fake_transfer(decode_req.req)
