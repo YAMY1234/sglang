@@ -187,33 +187,70 @@ def _cp_tables(
 
 
 @triton.jit
-def _cp_chunk_q(q, qv, lens, vlens, N, K: tl.constexpr, C: tl.constexpr, PG: tl.constexpr, BLK: tl.constexpr):
-    """Virtual row v = r * K + j of the chunked fold partial: tokens [jC, (j+1)C) pages of request r's owned prefix
-    (its pages are row v of the table viewed as [B * K, C]); its token count, and request r's query when non-empty."""
-    v = tl.program_id(0)
-    c = tl.program_id(1)
-    n = tl.minimum(tl.maximum(tl.load(lens + v // K) - (v % K) * (C * PG), 0), C * PG)
-    if c == 0:
-        tl.store(vlens + v, n)
-    if n > 0:
-        w = c * BLK + tl.arange(0, BLK)
-        m = w < N
-        tl.store(qv + v.to(tl.int64) * N + w, tl.load(q + (v // K).to(tl.int64) * N + w, mask=m), mask=m)
+def _cp_chunk_tables(tab, tstride, lens, base_lens, vtab, vlens, vstart, vcnt, nb, nv, ragged,
+                     C: tl.constexpr, KP: tl.constexpr, NB: tl.constexpr, PG: tl.constexpr):
+    """Once per forward, program (r, j), chunked fold partial (PERF-LB cp3): with a ragged batch (longest owned length
+    x B >= ragged x the total), chunk j of request r's owned pages into dense row start_r + j of vtab ([nv, C]) and no
+    key for the one-row-per-request call; otherwise every chunk row empty and that call keeps its lengths. Row
+    r * KP + j is cleared when it lies past the last chunk."""
+    r = tl.program_id(0)
+    j = tl.program_id(1)
+    k = tl.arange(0, NB)
+    L = tl.load(lens + k, mask=k < nb, other=0)
+    pg = (L + PG - 1) // PG
+    on = (tl.max(pg, axis=0) * nb).to(tl.float32) >= ragged * tl.sum(pg, axis=0).to(tl.float32)
+    n = tl.where(on, (pg + C - 1) // C, 0)
+    start = tl.cumsum(n, axis=0) - n
+    total = tl.sum(n, axis=0)
+    my_n = tl.sum(tl.where(k == r, n, 0), axis=0)
+    my_start = tl.sum(tl.where(k == r, start, 0), axis=0)
+    my_pg = tl.sum(tl.where(k == r, pg, 0), axis=0)
+    my_L = tl.sum(tl.where(k == r, L, 0), axis=0)
+    z = r * KP + j
+    if (z < nv) & (z >= total):
+        tl.store(vlens + z, 0)
+    if j == 0:
+        tl.store(vstart + r, my_start)
+        tl.store(vcnt + r, my_n)
+        tl.store(base_lens + r, tl.where(on, 0, my_L))
+    if j < my_n:
+        v = my_start + j
+        cols = tl.arange(0, C)
+        src = j * C + cols
+        m = src < my_pg
+        tl.store(vtab + v * C + cols, tl.load(tab + r * tstride + src, mask=m, other=0), mask=m)
+        tl.store(vlens + v, tl.minimum(tl.maximum(my_L - j * (C * PG), 0), C * PG))
 
 
 @triton.jit
-def _cp_chunk_comb(po_v, pl_v, vlens, po, pl, H, K: tl.constexpr, HB: tl.constexpr, D: tl.constexpr):
-    """One partial per request from its non-empty virtual rows (trtllm-gen LSE is base 2)."""
+def _cp_chunk_q(q, qv, vstart, vcnt, N, BLK: tl.constexpr):
+    """Request r's query into its chunk rows (program (r, j): row vstart_r + j when j < vcnt_r)."""
     r = tl.program_id(0)
-    h = tl.program_id(1) * HB + tl.arange(0, HB)
-    hm = h < H
-    d = tl.arange(0, D)
-    m = tl.full([HB], float("-inf"), tl.float32)
-    s = tl.zeros([HB], tl.float32)
-    acc = tl.zeros([HB, D], tl.float32)
-    for j in tl.static_range(K):
-        v = r * K + j
-        if tl.load(vlens + v) > 0:
+    j = tl.program_id(1)
+    if j < tl.load(vcnt + r):
+        v = tl.load(vstart + r) + j
+        for c in range(0, tl.cdiv(N, BLK)):
+            w = c * BLK + tl.arange(0, BLK)
+            m = w < N
+            tl.store(qv + v.to(tl.int64) * N + w, tl.load(q + r.to(tl.int64) * N + w, mask=m), mask=m)
+
+
+@triton.jit
+def _cp_chunk_comb(po_v, pl_v, vstart, vcnt, po, pl, H, HB: tl.constexpr, D: tl.constexpr):
+    """One partial per request from its chunk rows (trtllm-gen LSE is base 2); no write for a request without chunk
+    rows (the one-row-per-request call wrote it)."""
+    r = tl.program_id(0)
+    n = tl.load(vcnt + r)
+    if n > 0:
+        h = tl.program_id(1) * HB + tl.arange(0, HB)
+        hm = h < H
+        d = tl.arange(0, D)
+        m = tl.full([HB], float("-inf"), tl.float32)
+        s = tl.zeros([HB], tl.float32)
+        acc = tl.zeros([HB, D], tl.float32)
+        v0 = tl.load(vstart + r)
+        for j in range(0, n):
+            v = v0 + j
             lj = tl.load(pl_v + v * H + h, mask=hm, other=0.0)
             oj = tl.load(po_v + (v * H + h[:, None]).to(tl.int64) * D + d[None, :], mask=hm[:, None], other=0.0)
             mn = tl.maximum(m, lj)
@@ -222,10 +259,10 @@ def _cp_chunk_comb(po_v, pl_v, vlens, po, pl, H, K: tl.constexpr, HB: tl.constex
             acc = acc * a[:, None] + oj.to(tl.float32) * w[:, None]
             s = s * a + w
             m = mn
-    ok = s > 0
-    tl.store(po + (r * H + h[:, None]).to(tl.int64) * D + d[None, :],
-             (acc / tl.where(ok, s, 1.0)[:, None]).to(tl.bfloat16), mask=hm[:, None])
-    tl.store(pl + r * H + h, tl.where(ok, m + tl.log2(tl.where(ok, s, 1.0)), float("-inf")), mask=hm)
+        ok = s > 0
+        tl.store(po + (r * H + h[:, None]).to(tl.int64) * D + d[None, :],
+                 (acc / tl.where(ok, s, 1.0)[:, None]).to(tl.bfloat16), mask=hm[:, None])
+        tl.store(pl + r * H + h, tl.where(ok, m + tl.log2(tl.where(ok, s, 1.0)), float("-inf")), mask=hm)
 
 
 @triton.jit
@@ -673,6 +710,8 @@ class CpLite:
         self.llh_off = total
         self.fold_mh = envs.SGLANG_PLB_CP_FOLD_MH.get()
         self.fold_chunk = envs.SGLANG_PLB_CP_FOLD_CHUNK.get()
+        self.fold_ragged = envs.SGLANG_PLB_CP_FOLD_RAGGED.get()
+        assert self.fold_chunk in (0, 32, 64, 128, 256), self.fold_chunk
         if self.merge_h or self.cp_ungated or self.fold_mh:
             total += _MAX_ROWS * cp * _LL_PWORDS * 8
         self.ll = envs.SGLANG_TRTL1_ATTN_CP_LL.get() and q_heads * HEAD_DIM // 2 + q_heads <= _LL_PWORDS
@@ -1008,7 +1047,9 @@ class CpLite:
     def _own_workspace(self):
         """The overlapped trtllm-gen partial's workspace (the caller's belongs to the stock call)."""
         if self._ws is None:
-            self._ws = torch.empty(128 << 20, dtype=torch.uint8, device=self.device)
+            # the chunked fold partial's workspace grows with its rows (~0.23 MiB a row at q_len 7: 225 MiB at B128)
+            mb = 384 if self.fold_chunk else 128
+            self._ws = torch.empty(mb << 20, dtype=torch.uint8, device=self.device)
         return self._ws
 
     def _fold_partial(self, k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale,
@@ -1021,29 +1062,13 @@ class CpLite:
         h = q_len * self.cp * self.hq
         query = self.q_all[:rows].view(b, h, HEAD_DIM)
         out, lse = self.po[:rows].view(b, h, HEAD_DIM), self.plse[:rows].view(b, h)
-        C = self.fold_chunk
-        if C and tab.shape[1] > C and tab.shape[1] % C == 0:
-            K = tab.shape[1] // C
-            nv, n = b * K, h * HEAD_DIM // 4
-            qv = torch.empty(nv, h, HEAD_DIM, dtype=query.dtype, device=self.device)
-            vlens = torch.empty(nv, dtype=torch.int32, device=self.device)
-            po_v = torch.empty(nv, h, HEAD_DIM, dtype=torch.bfloat16, device=self.device)
-            pl_v = torch.empty(nv, h, dtype=torch.float32, device=self.device)
-            _cp_chunk_q[(nv, triton.cdiv(n, 1024))](query.view(torch.int32), qv.view(torch.int32), lens, vlens, n,
-                                                    K=K, C=C, PG=PAGE, BLK=1024)
-            flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-                query=qv, kv_cache=(k_cache, v_cache), workspace_buffer=workspace, block_tables=tab.view(nv, C),
-                seq_lens=vlens, max_seq_len=C * PAGE, bmm1_scale=bmm1_scale, bmm2_scale=bmm2_scale, out=po_v,
-                lse=pl_v, q_len_per_req=1, multi_ctas_kv_counter_buffer=self.counter,
-            )
-            _cp_chunk_comb[(b, triton.cdiv(h, 16))](po_v, pl_v, vlens, out, lse, h, K=K, HB=16, D=HEAD_DIM)
-            return
+        chunk = self._chunk_tables(tab, lens, b, forward_batch, layer_id)
         flashinfer.decode.trtllm_batch_decode_with_kv_cache(
             query=query,
             kv_cache=(k_cache, v_cache),
             workspace_buffer=workspace,
             block_tables=tab,
-            seq_lens=lens,
+            seq_lens=lens if chunk is None else chunk[0],
             max_seq_len=max_kv,
             bmm1_scale=bmm1_scale,
             bmm2_scale=bmm2_scale,
@@ -1052,6 +1077,51 @@ class CpLite:
             q_len_per_req=1,
             multi_ctas_kv_counter_buffer=self.counter,
         )
+        if chunk is None:
+            return
+        # ragged batch: the call above got no key; the chunk rows (empty otherwise) and the combine
+        _, vtab, vlens, vstart, vcnt = chunk
+        nv, C = vtab.shape
+        n = h * HEAD_DIM // 4
+        qv = torch.empty(nv, h, HEAD_DIM, dtype=query.dtype, device=self.device)
+        po_v = torch.empty(nv, h, HEAD_DIM, dtype=torch.bfloat16, device=self.device)
+        pl_v = torch.empty(nv, h, dtype=torch.float32, device=self.device)
+        _cp_chunk_q[(b, nv // b)](query.view(torch.int32), qv.view(torch.int32), vstart, vcnt, n, BLK=1024)
+        flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+            query=qv, kv_cache=(k_cache, v_cache), workspace_buffer=self._own_workspace(), block_tables=vtab,
+            seq_lens=vlens, max_seq_len=C * PAGE, bmm1_scale=bmm1_scale, bmm2_scale=bmm2_scale, out=po_v, lse=pl_v,
+            q_len_per_req=1, multi_ctas_kv_counter_buffer=self.counter,
+        )
+        _cp_chunk_comb[(b, triton.cdiv(h, 16))](po_v, pl_v, vstart, vcnt, out, lse, h, HB=16, D=HEAD_DIM)
+
+    def _chunk_tables(self, tab, lens, b, forward_batch, layer_id):
+        """Once per forward (as _tables): with SGLANG_PLB_CP_FOLD_CHUNK, the one-row-per-request call's lengths (0 on a
+        ragged batch) and the chunk rows ([B * K, C] dense, K = owned table width / C), else None."""
+        C = self.fold_chunk
+        ncols = tab.shape[1]
+        if not C or ncols <= C or ncols % C:
+            return None
+        key = ("chunk", tab.data_ptr(), lens.data_ptr(), b)
+        ent = self._tabs.get(key)
+        if ent is not None and ent[1]() is forward_batch and layer_id > ent[2]:
+            ent[2] = layer_id
+            return ent[0]
+        K = ncols // C
+        nv = b * K
+        base_lens = torch.empty(b, dtype=torch.int32, device=self.device)
+        vtab = torch.empty(nv, C, dtype=torch.int32, device=self.device)
+        vlens = torch.empty(nv, dtype=torch.int32, device=self.device)
+        vstart = torch.empty(b, dtype=torch.int32, device=self.device)
+        vcnt = torch.empty(b, dtype=torch.int32, device=self.device)
+        _cp_chunk_tables[(b, K)](tab, tab.stride(0), lens, base_lens, vtab, vlens, vstart, vcnt, b, nv,
+                                 float(self.fold_ragged), C=C, KP=K, NB=triton.next_power_of_2(b), PG=PAGE)
+        out = (base_lens, vtab, vlens, vstart, vcnt)
+        self._tabs[key] = [out, weakref.ref(forward_batch), layer_id]
+        if (b, "chunk") not in self._logged:
+            self._logged.add((b, "chunk"))
+            logger.info("PERF-LB CP-lite fold partial: %d requests, chunk rows of %d pages (%d rows) when the longest "
+                        "owned length x B >= %.2f x the total", b, C, nv, self.fold_ragged)
+        return out
 
     def _fold_merge(self, q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale, out, gate):
         gh_w = self.cp * self.hq * HEAD_DIM // 2
