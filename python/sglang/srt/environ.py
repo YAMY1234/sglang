@@ -1215,6 +1215,21 @@ class Envs:
     # TRT-L18: ungated exact calls (the plugin's draft steps) as gated ones with all three switches: the fused partial
     # takes the prefix lengths as seq_lens - q_len itself (PDL after the q gather), then the per-(row, head) merge.
     SGLANG_TRTL18_CP_UNGATED = EnvBool(False)
+    # PERF-LB: the fused CP-lite partial (batches <= 32) shares one CTA per SM among the requests by their owned KV
+    # (TRT's TRTLLM_Q35_ATTN_CP_BALANCED_SPLIT): no idle SMs when splits x batch < SMs, a ragged batch costs its total
+    # KV instead of its longest request's. SM_RESERVE: SMs left out of that grid.
+    SGLANG_PLB_CP_BALANCED = EnvBool(False)
+    SGLANG_PLB_CP_SM_RESERVE = EnvInt(0)
+    # PERF-LB: CP-lite calls on the trtllm-gen partial (batches above the fused kernel's 32): the per-(row, head) merge
+    # (L18's, on the fold layout) instead of the per-row one, and, gated, the stock call gets no key when CP runs.
+    SGLANG_PLB_CP_FOLD_MH = EnvBool(False)
+    # PERF-LB: the trtllm-gen partial runs over chunk rows of C owned pages (each request's compact owned table cut into
+    # chunks), then a base-2 LSE combine per request: a ragged batch costs its total KV instead of its longest request's.
+    # "" off, "<C>" every batch size, or "<b>:<C>,..." (from b requests up; C in 32 / 64 / 128 / 256, 0 = off).
+    SGLANG_PLB_CP_FOLD_CHUNK = EnvStr("")
+    # PERF-LB: chunk rows only on a ragged batch: longest owned length x B >= this x the total (one row per request
+    # otherwise). 0: every batch.
+    SGLANG_PLB_CP_FOLD_RAGGED = EnvFloat(1.8)
     # Timing only: decode graph padding per block of Q35MF_AB_BLOCK target-verify rounds, the labels in turn
     # ("pow2": the smallest captured power of two); model_executor/runner_backend/ab_variants.py. Empty: off.
     SGLANG_TRTL17_PAD_AB = EnvTuple(())
