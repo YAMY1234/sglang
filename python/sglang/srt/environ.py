@@ -1563,6 +1563,10 @@ class Envs:
     # keep-alive record read the field values straight from the instance dict (one cached
     # name tuple) instead of dataclasses.fields() + getattr / setattr per field, twice.
     SGLANG_PERFLL_HOST_SB_SNAPSHOT = EnvBool(False)
+    # Per-round stream joins (Stream.wait_stream creates, records and later destroys an event
+    # each call) through one cached event per (waiting, waited) stream pair, and the result
+    # readback's copy_done events from a ring of 4.
+    SGLANG_PERFLL_HOST_WAIT_EVENTS = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
