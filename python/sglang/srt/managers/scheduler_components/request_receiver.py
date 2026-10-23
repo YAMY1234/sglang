@@ -38,6 +38,7 @@ from sglang.srt.managers.scheduler_components.shm_tag_exchange import (
     ShmTagExchange,
     get_shm_exchange,
     recv_multihost_enabled,
+    recv_piggyback,
 )
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_RECV_REQUESTS,
@@ -95,6 +96,10 @@ class SchedulerRequestReceiver:
 
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.step()
+
+        if (pig := recv_piggyback()) is not None:
+            # values ride only this pass's exchange
+            pig[1](None)
 
         if self.recv_skipper is not None:
             if not self.recv_skipper.handle(self.get_last_batch()):
@@ -367,7 +372,15 @@ def _broadcast_via_exchange(
     only a non-empty payload goes over the cpu group."""
     is_src = tp_group.rank == tp_group.ranks[0]
     payload = pickle.dumps(recv_reqs) if is_src and recv_reqs else b""
-    size = exchange.allgather([len(payload)])[0][0]
+    pig = recv_piggyback()
+    extra = pig[0]() if pig is not None else None
+    if extra is not None and 1 + len(extra) <= exchange.width:
+        rows = exchange.allgather([len(payload), *extra])
+        size = rows[0][0]
+        # usable only when nothing arrived: request handling may reap acks first
+        pig[1]([row[1:] for row in rows] if size == 0 else None)
+    else:
+        size = exchange.allgather([len(payload)])[0][0]
     if size == 0:
         return recv_reqs if is_src else []
     if is_src:

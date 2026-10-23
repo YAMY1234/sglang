@@ -372,6 +372,19 @@ class HierTagExchange:
 
 
 _EXCHANGES: Dict[tuple, object] = {}
+# (values_fn, store_fn): extra values one consumer adds to the request-size exchange
+# (SGLANG_PERFLL_HOST_HC_PIGGYBACK). values_fn returns the same-length list on every
+# rank or None; store_fn gets every rank's extra values, or None when not available.
+_RECV_PIGGYBACK: Optional[tuple] = None
+
+
+def set_recv_piggyback(values_fn, store_fn) -> None:
+    global _RECV_PIGGYBACK
+    _RECV_PIGGYBACK = (values_fn, store_fn)
+
+
+def recv_piggyback() -> Optional[tuple]:
+    return _RECV_PIGGYBACK
 
 
 def get_shm_exchange(
