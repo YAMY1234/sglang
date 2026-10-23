@@ -32,6 +32,8 @@ from typing import Dict, Optional, Union
 
 import torch
 
+from sglang.srt.environ import envs
+
 logger = logging.getLogger(__name__)
 
 PAGE = 64
@@ -42,8 +44,8 @@ MAX_ROWS = 128
 # Largest batch of one call (TRT's final TEP8 recipe: CP_FUSED_MAX_BATCH=32, CP_FUSED_MAX_BATCH_Q1=32).
 MAX_BATCH = 32
 MAX_BATCH_Q1 = 32
-# Balanced split (TRTLLM_Q35_ATTN_CP_BALANCED_SPLIT): off here; uniform static batches.
-_BALANCED = False
+# Balanced split (TRTLLM_Q35_ATTN_CP_BALANCED_SPLIT): SGLANG_PLB_CP_BALANCED, default off.
+_BALANCED = envs.SGLANG_PLB_CP_BALANCED.get()
 
 
 # Mirror of q35_cp_partial_attn.MAX_COMB_ROWS (rows one CTA's combine chunk may touch).
@@ -66,7 +68,7 @@ _P_SHIFT = 5.0
 _DBG_SLOTS = 0
 # SMs left out of the grid (default 0: one CTA per SM). The in-kernel grid barrier needs every CTA resident; a reserve
 # keeps the grid co-resident even when other kernels (e.g. a PDL neighbour still polling its peers) hold some SMs.
-_SM_RESERVE = 0
+_SM_RESERVE = envs.SGLANG_PLB_CP_SM_RESERVE.get()
 _DBG_RING_CTAS = 256
 
 # Declared alignment (bytes) of each pointer argument, used at compile and call time (make_ptr checks the address):
