@@ -2105,6 +2105,8 @@ class Scheduler(
                 if ls is not None:
                     ls.gpu_a(self.forward_stream)
                 batch_result = self.run_batch(batch)
+                if host_trace.ENABLED:
+                    host_trace.mark(host_trace.RB9)
                 # Fence result processing behind this forward's shared reads.
                 self._apply_war_barrier()
                 if ls is not None:
@@ -3904,6 +3906,8 @@ class Scheduler(
     ) -> NextBatchPlan:
         self.process_pending_chunked_abort()
         self._process_hicache_events()
+        if host_trace.ENABLED:
+            host_trace.mark(host_trace.NB1)
 
         if self.enable_fpm:
             self._fpm_batch_t0 = time.monotonic()
@@ -3976,6 +3980,8 @@ class Scheduler(
         running_batch.filter_batch()
         if running_batch.batch_size() < running_bs:
             running_batch.batch_is_full = False
+        if host_trace.ENABLED:
+            host_trace.mark(host_trace.NB2)
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
@@ -3985,6 +3991,8 @@ class Scheduler(
             prefill_plan = self.get_new_batch_prefill(running_batch)
             new_batch = prefill_plan.batch_to_run
             running_batch = prefill_plan.running_batch
+        if host_trace.ENABLED:
+            host_trace.mark(host_trace.NB3)
 
         need_mlp_sync = self.require_mlp_sync
         if (
@@ -4006,6 +4014,8 @@ class Scheduler(
             # Run decode (skip for prefill-only batches)
             if not running_batch.is_empty() and not running_batch.is_prefill_only:
                 decode_batch = self.update_running_batch(running_batch)
+                if host_trace.ENABLED:
+                    host_trace.mark(host_trace.NB4)
                 ret = (
                     decode_batch
                     if decode_batch is not None and not decode_batch.is_empty()
@@ -4672,6 +4682,8 @@ class Scheduler(
                 self.maybe_send_cached_prefix_chunk(req)
 
         # Run forward
+        if host_trace.ENABLED:
+            host_trace.mark(host_trace.RB1)
         if self.is_generation:
             if self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
@@ -4685,9 +4697,13 @@ class Scheduler(
                     self.future_map.resolve_seq_lens_cpu(batch)
                 if self._confidence_budget_prepare is not None:
                     self._confidence_budget_prepare(batch, self.future_map)
+                if host_trace.ENABLED:
+                    host_trace.mark(host_trace.RB2)
 
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)
+                    if host_trace.ENABLED:
+                        host_trace.mark(host_trace.RB3)
                     if gpu_only_lens:
                         # publish_ready was recorded on forward_stream: stream order
                         # fences the gather, no host sync / event wait needed.
@@ -4697,8 +4713,12 @@ class Scheduler(
                     # snapshot captures the post-consume state — restoring
                     # post-forward must not un-consume staging.
                     resolve_forward_inputs(batch, self.future_map)
+                    if host_trace.ENABLED:
+                        host_trace.mark(host_trace.RB4)
 
                     with self._forward_isolation(batch, overlap=True):
+                        if host_trace.ENABLED:
+                            host_trace.mark(host_trace.RB5)
                         future_indices = batch.req_pool_indices
 
                         # Spec_v2 fires on_publish mid-worker (between verify and
@@ -4751,10 +4771,14 @@ class Scheduler(
                             )
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
+                        if host_trace.ENABLED:
+                            host_trace.mark(host_trace.RB6)
                         if batch_result.delay_sample_func is None:
                             self._relay_forward_payload(
                                 batch, future_indices, batch_result
                             )
+                            if host_trace.ENABLED:
+                                host_trace.mark(host_trace.RB7)
                             if _is_hip:
                                 # Cross-stream sync costs more than the tiny D2H it
                                 # overlaps.
@@ -4764,6 +4788,8 @@ class Scheduler(
                                 )
                             else:
                                 self._copy_result_to_cpu(batch_result, batch)
+                            if host_trace.ENABLED:
+                                host_trace.mark(host_trace.RB8)
                         else:
                             batch_result.future_indices = future_indices
 

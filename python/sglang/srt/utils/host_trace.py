@@ -64,6 +64,19 @@ _gate_poll = 0.0
     OUT1,
 ) = range(1, 31)
 GC0, GC1, RUSAGE = 40, 41, 42
+# Sub-marks (SGLANG_PERFLL_HOST_* budget): run_batch, get_next_batch, verify prep,
+# post-verify, draft prep / graph, verify input, draft extend prep / graph.
+(
+    RB1, RB2, RB3, RB4, RB5, RB6, RB7, RB8, RB9,
+    NB1, NB2, NB3, NB4,
+    VPA, VPB, VPC, VPD,
+    PVA, PVB, PVC,
+    PDA, PDB,
+    DXA, DXB,
+    BVA,
+    EPA, EPB,
+    EXA, EXB,
+) = range(43, 72)  # fmt: skip
 GPU_MARKS = (DRAFT0, DRAFTG, DRAFT1, VERIFY0, VERIFY1, EXT1)
 
 _buf = array("q")

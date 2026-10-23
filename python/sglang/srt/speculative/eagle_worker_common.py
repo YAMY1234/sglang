@@ -204,6 +204,8 @@ def prepare_for_draft_extend(
         if batch.forward_mode.is_idle()
         else ForwardMode.DRAFT_EXTEND_V2
     )
+    if host_trace.ENABLED:
+        host_trace.mark(host_trace.EPA)
     forward_batch = ForwardBatch.init_new(
         batch,
         draft_model_runner,
@@ -212,6 +214,8 @@ def prepare_for_draft_extend(
         extend_position_info=extend_position_info,
         kv_loc_plan=None if widen else kv_loc_plan,
     )
+    if host_trace.ENABLED:
+        host_trace.mark(host_trace.EPB)
     # Forward sees post-write length (draft extend writes num_draft_tokens
     # slots); mutation stays on forward_batch to preserve SB.seq_lens.
     forward_batch.seq_lens = (
@@ -364,6 +368,8 @@ def prepare_for_draft(
                 page_size,
             )
 
+    if host_trace.ENABLED:
+        host_trace.mark(host_trace.PDA)
     # Get a forward batch
     # Actual width of the next draft-decode forward: topk tokens per req.
     draft_input.num_tokens_per_req = topk
@@ -387,6 +393,8 @@ def prepare_for_draft(
         kv_loc_plan=kv_loc_plan,
         write_cols=None if kv_loc_plan is None else slice(0, num_steps),
     )
+    if host_trace.ENABLED:
+        host_trace.mark(host_trace.PDB)
     can_run_decode_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
         forward_batch
     )
@@ -487,6 +495,8 @@ def build_eagle_verify_input(
         retrieve_next_sibling,
         draft_tokens,
     ) = tree_outputs
+    if host_trace.ENABLED:
+        host_trace.mark(host_trace.BVA)
 
     return EagleVerifyInput(
         draft_token=draft_tokens,
@@ -598,6 +608,8 @@ def run_eagle_verify(
     fwd_stream = torch.get_device_module(device).current_stream()
     verify_input: EagleVerifyInput = batch.spec_info
     record_stream_for_v2_verify(batch, verify_input, fwd_stream)
+    if host_trace.ENABLED:
+        host_trace.mark(host_trace.VPA)
 
     bs = len(batch.seq_lens)
 
@@ -621,6 +633,8 @@ def run_eagle_verify(
     # Correct some buffers due to the overlap plan
     if plan_stream:
         torch.get_device_module(device).current_stream().wait_stream(plan_stream)
+        if host_trace.ENABLED:
+            host_trace.mark(host_trace.VPD)
         if (
             _is_npu
             and target_worker.model_runner.model_config.model_is_mrope

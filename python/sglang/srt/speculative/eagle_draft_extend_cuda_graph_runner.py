@@ -58,6 +58,7 @@ from sglang.srt.utils import (
     require_mlp_sync,
     require_mlp_tp_gather,
 )
+from sglang.srt.utils import host_trace
 from sglang.srt.utils.device_timer import device_timer_ctx
 
 if TYPE_CHECKING:
@@ -627,6 +628,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             copy_srcs=copy_srcs,
         )
         _grouped_foreach_copy_(copy_dsts, copy_srcs)
+        if host_trace.ENABLED:
+            host_trace.mark(host_trace.EXA)
 
         # hidden_states is large + contiguous: copy_() uses the cudaMemcpyAsync
         # DMA engine; foreach would force the ~3x slower compute-kernel copy.
@@ -695,6 +698,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             spec_info=forward_batch.spec_info,
         )
         self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
+        if host_trace.ENABLED:
+            host_trace.mark(host_trace.EXB)
 
         # Draft extend is the last shared reader. UNKNOWN must discard any
         # earlier phase's event so the scheduler uses its whole-forward fence.
