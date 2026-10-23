@@ -1703,6 +1703,9 @@ class Envs:
     # SamplingBatchInfo.copy_for_forward copies the field values through the instance dict
     # instead of dataclasses.replace (no __post_init__, no init=False fields: same object).
     SGLANG_PERFLL_HOST_SAMPLING_COPY = EnvBool(False)
+    # A spec decode step that needs no new KV pages (most steps at page size 64) skips the
+    # length tensors and their two H2D copies, which only the allocation reads.
+    SGLANG_PERFLL_HOST_DECODE_ALLOC = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
