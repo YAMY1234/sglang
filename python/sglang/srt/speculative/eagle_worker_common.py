@@ -39,6 +39,7 @@ from sglang.srt.speculative.spec_utils import (
     record_stream_each,
     record_stream_for_v2_verify,
 )
+from sglang.kernels.ops.speculative import perfll_spec_index
 from sglang.srt.utils import host_trace, is_cpu, perfll_host
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
@@ -292,17 +293,32 @@ def prepare_for_draft(
                     prepared_mrope_positions = torch.empty(
                         (3, bs), dtype=torch.int64, device=batch.device
                     )
-            # TODO(lsyin): align with the default code path
-            assign_draft_cache_locs_contiguous_func(
-                batch.req_pool_indices,
-                req_to_token_pool.req_to_token,
-                batch.seq_lens,
-                batch.out_cache_loc,
-                topk,
-                window_cols,
-                positions=prepared_positions,
-                mrope=prepared_mrope_positions,
-            )
+            if not (
+                perfll_spec_index.ENABLED
+                and perfll_spec_index.draft_locs(
+                    batch.req_pool_indices,
+                    req_to_token_pool.req_to_token,
+                    batch.seq_lens,
+                    batch.out_cache_loc,
+                    req_to_token_pool.req_to_token.shape[1],
+                    topk,
+                    window_cols,
+                    bs,
+                    prepared_positions,
+                    prepared_mrope_positions,
+                )
+            ):
+                # TODO(lsyin): align with the default code path
+                assign_draft_cache_locs_contiguous_func(
+                    batch.req_pool_indices,
+                    req_to_token_pool.req_to_token,
+                    batch.seq_lens,
+                    batch.out_cache_loc,
+                    topk,
+                    window_cols,
+                    positions=prepared_positions,
+                    mrope=prepared_mrope_positions,
+                )
             if plans_window:
                 iteration_ids = target_translator.plan(
                     req_pool_indices=batch.req_pool_indices,
