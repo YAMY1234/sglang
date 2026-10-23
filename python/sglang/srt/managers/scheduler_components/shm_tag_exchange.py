@@ -37,6 +37,8 @@ from unittest.mock import patch
 import torch
 import torch.distributed as dist
 
+from sglang.srt.environ import envs
+
 logger = logging.getLogger(__name__)
 
 _TAG_BITS = 23
@@ -194,11 +196,52 @@ class _LeaderLink:
             self.sock = socket.create_connection(box[0], timeout=timeout_s)
         self.sock.settimeout(timeout_s)
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.timeout_s = timeout_s
+        # SGLANG_PERFLL_HOST_LINK_SPIN: spin on a non-blocking socket (no sleep / wakeup)
+        self.spin = envs.SGLANG_PERFLL_HOST_LINK_SPIN.get()
+        if self.spin:
+            self.sock.setblocking(False)
+            logger.info("PERF-LL host: LINK_SPIN on")
 
     def swap(self, payload: bytes) -> bytes:
-        self.sock.sendall(len(payload).to_bytes(4, "little") + payload)
+        msg = len(payload).to_bytes(4, "little") + payload
+        if self.spin:
+            return self._spin_swap(msg)
+        self.sock.sendall(msg)
         size = int.from_bytes(self._recv_exact(4), "little")
         return self._recv_exact(size)
+
+    def _spin_swap(self, msg: bytes) -> bytes:
+        deadline = time.monotonic() + self.timeout_s
+        view = memoryview(msg)
+        while view:
+            try:
+                view = view[self.sock.send(view) :]
+            except BlockingIOError:
+                self._spin_wait(deadline)
+        size = int.from_bytes(self._spin_recv(4, deadline), "little")
+        return self._spin_recv(size, deadline)
+
+    def _spin_recv(self, n: int, deadline: float) -> bytes:
+        buf = bytearray()
+        while len(buf) < n:
+            try:
+                chunk = self.sock.recv(n - len(buf))
+            except BlockingIOError:
+                self._spin_wait(deadline)
+                continue
+            if not chunk:
+                raise RuntimeError("EDGE leader link closed by the peer leader")
+            buf += chunk
+        return bytes(buf)
+
+    def _spin_wait(self, deadline: float) -> None:
+        if time.monotonic() > deadline:
+            raise RuntimeError(
+                f"EDGE leader link timed out after {self.timeout_s:.0f}s; "
+                "the peer leader's scheduler is stuck or dead"
+            )
+        os.sched_yield()
 
     def _recv_exact(self, n: int) -> bytes:
         buf = bytearray()
