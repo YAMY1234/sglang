@@ -821,8 +821,18 @@ class Envs:
     SGLANG_PERFPF_STAGING_LAZY = EnvBool(False)
     # PERF-PF: shortest-prefill-first puts requests that waited more than N batch formations first
     SGLANG_PERFPF_SPF_AGE_ROUNDS = EnvInt(0)
+    # PERF-PF: shortest-prefill-first re-matches a waiting request's prefix only every N batch formations (ordering only)
+    SGLANG_PERFPF_SPF_MATCH_EVERY = EnvInt(0)
+    # PERF-PF: aged requests sort as if their prefill were one batch budget (they pick the next chunked request
+    # instead of jumping the queue), and the in-progress chunk keeps at least this percent of the budget (0 = off)
+    SGLANG_PERFPF_SPF_AGE_CAP = EnvBool(False)
+    SGLANG_PERFPF_SPF_CHUNK_MIN_PCT = EnvInt(0)
     # PERF-PF: spread prefill KV transfers over the transfer queues by room instead of by destination sessions
     SGLANG_PERFPF_TRANSFER_SHARD_BY_ROOM = EnvBool(False)
+    # PERF-PF: scheduler processes run gc.collect() + gc.freeze() right before their event loop
+    SGLANG_PERFPF_SCHED_GC_FREEZE = EnvBool(False)
+    # PERF-PF: API server and scheduler processes log every cyclic-GC pause of at least N ms (0 = off)
+    SGLANG_PERFPF_GC_LOG_MS = EnvInt(0)
     # TODO(yangminl): remove SGLANG_STAGING_USE_TORCH and the torch fallback in
     # staging_buffer.py once Triton kernels are fully validated in production.
     SGLANG_STAGING_USE_TORCH = EnvBool(False)

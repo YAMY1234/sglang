@@ -132,3 +132,27 @@ def log_dispatch(tokenized_obj) -> None:
         _w(getattr(ts, "api_server_dispatch_time", 0.0)),
         _w(getattr(ts, "api_server_dispatch_finish_time", 0.0)),
     )
+
+
+def install_gc_log(min_ms: int, where: str) -> None:
+    """Log every cyclic-GC pause of at least min_ms in this process (t = wall-clock end of the pause)."""
+    import gc
+
+    start = [0.0]
+
+    def _cb(phase, info):
+        if phase == "start":
+            start[0] = time.perf_counter()
+            return
+        dur = time.perf_counter() - start[0]
+        if dur * 1e3 >= min_ms:
+            logger.info(
+                "L12T GC where=%s gen=%d dur=%.4f t=%.4f collected=%d",
+                where,
+                info.get("generation", -1),
+                dur,
+                time.time(),
+                info.get("collected", 0),
+            )
+
+    gc.callbacks.append(_cb)
