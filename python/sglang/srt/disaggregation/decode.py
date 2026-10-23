@@ -1765,7 +1765,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
             t_sd = l16_loopstat._now() if ls is not None else 0
             if (
-                self._defer_send
+                (self._defer_send or (ls is not None and ls.defer_on))
                 and set(state_types) <= {StateType.MAMBA}
                 and not self.scheduler.enable_hisparse
                 and not _is_fake_transfer(decode_req.req)
