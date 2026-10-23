@@ -1240,6 +1240,21 @@ class Envs:
     # PERF-LB: chunk rows only on a ragged batch: longest owned length x B >= this x the total (one row per request
     # otherwise). 0: every batch.
     SGLANG_PLB_CP_FOLD_RAGGED = EnvFloat(1.8)
+    # PERF-LB: priority of the decode streams (forward, schedule, copy, fwd-prepare d2h); < 0 ranks them above the PD
+    # staging scatter stream (default 0, the lowest), so a scatter only takes the SMs the forward leaves free.
+    SGLANG_PLB_STREAM_PRIORITY = EnvInt(0)
+    # PERF-LB: the PD staging scatter as a persistent kernel of this many CTAs (0: one CTA per 1024 elements; -1: one CTA
+    # per page and layer K / V, the page as one tile).
+    SGLANG_PLB_SCATTER_CTAS = EnvInt(0)
+    # PERF-LB: PD staging scatters wait for the scheduler, which launches them on the forward stream right before its
+    # next batch: a rank's scatter lands between two forwards (not under another rank's collective), and ranks whose
+    # chunks arrive in the same round take the delay together. 0: off; 1: on; k > 1: each scatter also waits k - 1
+    # more batches (test only: widens the window in which an abort finds it queued).
+    SGLANG_PLB_SCATTER_DEFER = EnvInt(0)
+    # PERF-LB static-bench probe: "<period_ms>:<MB>:<ctl file>": a thread per rank scatters MB from a dummy staging
+    # buffer about every period (random phase per rank) on its own default-priority stream while the ctl file reads 1
+    # (2: the persistent kernel of SGLANG_PLB_SCATTER_CTAS, 32 if unset). "": off.
+    SGLANG_PLB_FAKE_SCATTER = EnvStr("")
     # Timing only: decode graph padding per block of Q35MF_AB_BLOCK target-verify rounds, the labels in turn
     # ("pow2": the smallest captured power of two); model_executor/runner_backend/ab_variants.py. Empty: off.
     SGLANG_TRTL17_PAD_AB = EnvTuple(())
