@@ -1217,6 +1217,10 @@ class Envs:
     # PERF-LB: CP-lite calls on the trtllm-gen partial (batches above the fused kernel's 32): the per-(row, head) merge
     # (L18's, on the fold layout) instead of the per-row one, and, gated, the stock call gets no key when CP runs.
     SGLANG_PLB_CP_FOLD_MH = EnvBool(False)
+    # PERF-LB: the trtllm-gen partial runs over virtual rows of this many owned pages (each request's compact owned table
+    # cut into chunks), then a base-2 LSE combine per request: a ragged batch costs its total KV instead of its longest
+    # request's. 0: off.
+    SGLANG_PLB_CP_FOLD_CHUNK = EnvInt(0)
     # Timing only: decode graph padding per block of Q35MF_AB_BLOCK target-verify rounds, the labels in turn
     # ("pow2": the smallest captured power of two); model_executor/runner_backend/ab_variants.py. Empty: off.
     SGLANG_TRTL17_PAD_AB = EnvTuple(())
