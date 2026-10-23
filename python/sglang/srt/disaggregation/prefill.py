@@ -563,8 +563,8 @@ class SchedulerDisaggregationPrefillMixin:
         for req in batch.reqs:
             room = getattr(req, "bootstrap_room", None)
             if room is not None and room in kv_mgr.transfer_infos:
-                if lazy:
-                    prefetch(room, upto_tokens=len(req.fill_ids))
+                if lazy and req.extend_end is not None:
+                    prefetch(room, upto_tokens=req.extend_end)
                 else:
                     prefetch(room)
 
