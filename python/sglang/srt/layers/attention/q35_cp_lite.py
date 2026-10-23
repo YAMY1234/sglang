@@ -761,11 +761,14 @@ class CpLite:
         layer,
         forward_batch,
         stock=None,
+        min_bs: Optional[int] = None,
     ) -> Optional[torch.Tensor]:
         """CP-lite attention of this rank's heads: [rows, heads, head_dim] bf16, or None
         where the call is not served (decided by shapes only, so every rank agrees).
         stock(seq_lens, out): the caller's own kernel call into out; with it and a KV gate for this batch size,
-        both are captured and the device picks one per call."""
+        both are captured and the device picks one per call.
+        min_bs: the smallest batch this call serves (None: SGLANG_TRTL1_ATTN_CP_MIN_BS); a caller that picks CP by its
+        own host-side KV length (the megakernel plugin's one-request graph variant) passes 1."""
         rows = q.shape[0]
         b = seq_lens.shape[0]
         if (
@@ -776,7 +779,7 @@ class CpLite:
             or layer.tp_k_head_num != 1
             or layer.sliding_window_size not in (None, -1)
             or rows != b * q_len
-            or b < self.min_bs
+            or b < (self.min_bs if min_bs is None else min_bs)
             or rows > _MAX_ROWS
             or not isinstance(bmm1_scale, float)
             or not isinstance(bmm2_scale, float)
