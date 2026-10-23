@@ -359,7 +359,7 @@ from sglang.srt.utils import (
     suppress_other_loggers,
     triton_load_watch,
 )
-from sglang.srt.utils import host_trace
+from sglang.srt.utils import host_trace, perfll_host
 from sglang.srt.utils.common import is_confidential_compute, is_npu
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
@@ -2020,6 +2020,9 @@ class Scheduler(
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         self.enable_skip_finishing_decode = True
         host_trace.apply_switch_interval()
+        perfll_pin = envs.SGLANG_PERFLL_HOST_PIN_MAIN.get()
+        if perfll_pin:
+            perfll_host.pin_main_thread(get_device().gpu_id)
         self.result_queue: Deque[
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
@@ -2115,6 +2118,8 @@ class Scheduler(
                     host_trace.maybe_flush()
                 if host_trace.GATED:
                     host_trace.poll_gate()
+                if perfll_pin:
+                    perfll_host.maybe_repin()
             if host_trace.ENABLED:
                 host_trace.pass_end(keep=bool(batch) or self.last_batch is not None)
             if ls is not None:
