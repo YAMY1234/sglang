@@ -36,6 +36,9 @@ typedef unsigned long long u64;
 #define VD 128
 #define NW 4
 #define FULL 0xffffffffu
+#ifndef EARLY
+#define EARLY 0  // read the cursors before staging: a row that neither folds nor tracks leaves first
+#endif
 
 struct alignas(16) U4 { u32 x, y, z, w; };
 
@@ -208,6 +211,21 @@ extern "C" __global__ void __launch_bounds__(NW * 32) gdn_replayssm_commit(const
   if (slot <= p.null_block) return;
   const bool resid = p.dr != nullptr && p.kr != nullptr;
   u16* sm = reinterpret_cast<u16*>(smem_raw);
+#if EARLY
+  const int n_hist = p.write_pos[rid];
+  const bool fold = p.is_flush[rid] != 0;
+  const int base = p.cache_base[rid];
+  long long tslot = p.null_block;
+  int track_len = 0;
+  if (HAS_TRACK) {
+    tslot = ld_idx(p.tidx, n, p.tidx64);
+    const long long ts = ld_idx(p.tstep, n, p.tstep64);
+    if (!(tslot > p.null_block && ts >= 0)) tslot = p.null_block;
+    track_len = n_hist - (int)ld_idx(p.acc, n, p.acc64) + (int)ts + 1;
+  }
+  const bool track = tslot > p.null_block;
+  if (!fold && !track) return;
+#endif
   // the checkpoint and the whole ring slice need only the two indices: copies first, cursors meanwhile
   if (tid == 0) {
     asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(smem_u32(&bar)) : "memory");
@@ -226,6 +244,7 @@ extern "C" __global__ void __launch_bounds__(NW * 32) gdn_replayssm_commit(const
                &bar);
     }
   }
+#if !EARLY
   const int n_hist = p.write_pos[rid];
   const bool fold = p.is_flush[rid] != 0;
   const int base = p.cache_base[rid];
@@ -238,6 +257,7 @@ extern "C" __global__ void __launch_bounds__(NW * 32) gdn_replayssm_commit(const
     track_len = n_hist - (int)ld_idx(p.acc, n, p.acc64) + (int)ts + 1;
   }
   const bool track = tslot > p.null_block;
+#endif
   const float gt = lane < RING ? p.g[layer * p.g_layer + rid * p.g_slot + hv * RING + ((base + lane) & (RING - 1))] : 0.f;
   const int jj[4] = {2 * q, 2 * q + 1, 2 * q + 8, 2 * q + 9};
   int ph[4];
@@ -414,11 +434,14 @@ def _compile(
     has_track: bool,
     body: str = _SRC,
     symbol: str = "gdn_replayssm_commit",
+    early: bool = False,
 ):
     from cuda.bindings import driver as cu
     from cuda.bindings import nvrtc
 
     defines = dict(HK=hk, HV=hv, RING=ring, HAS_TRACK=int(has_track))
+    if early:
+        defines["EARLY"] = 1
     src = "".join(f"#define {k} {v}\n" for k, v in defines.items()) + body
     prog = _check(nvrtc.nvrtcCreateProgram(src.encode(), b"gdn_replayssm_commit.cu", 0, [], []), "create")
     major, minor = torch.cuda.get_device_capability(device)
@@ -447,14 +470,14 @@ def _smem_bytes(ring: int) -> int:
     return 2 * (128 * 128 + 4 * ring * 128)
 
 
-def _kernel(device: int, hk: int, hv: int, ring: int, has_track: bool):
-    key = (device, hk, hv, ring, has_track)
+def _kernel(device: int, hk: int, hv: int, ring: int, has_track: bool, early: bool = False):
+    key = (device, hk, hv, ring, has_track) + (("early",) if early else ())
     fn = _KERNELS.get(key)
     if fn is None:
         with _LOCK:
             fn = _KERNELS.get(key)
             if fn is None:
-                fn = _KERNELS[key] = _compile(device, hk, hv, ring, has_track)[1]
+                fn = _KERNELS[key] = _compile(device, hk, hv, ring, has_track, early=early)[1]
     return fn
 
 
@@ -498,12 +521,14 @@ def try_commit(**kw) -> bool:
     device, hk, hv, ring = st.device.index, k.shape[2], st.shape[2], d.shape[-2]
     if kw["state_batch_indices"].shape[0] == 0:
         return False
-    if any((device, hk, hv, ring, t) not in _KERNELS for t in (False, True)):
+    early = kw.get("early_exit", False)
+    tail = ("early",) if early else ()
+    if any((device, hk, hv, ring, t) + tail not in _KERNELS for t in (False, True)):
         if torch.cuda.is_current_stream_capturing():
             _log_once("capture", "SGLANG_Q35MF_COMMIT_CUDA: not compiled before graph capture, Triton commit")
             return False
         for t in (False, True):
-            _kernel(device, hk, hv, ring, t)
+            _kernel(device, hk, hv, ring, t, early)
     commit(**kw)
     _log_once(("on", st.shape[1] if st.dim() > 1 else 0), "SGLANG_Q35MF_COMMIT_CUDA: CUDA compact commit runs")
     return True
@@ -610,8 +635,10 @@ def commit(
     mamba_track_indices: Optional[torch.Tensor] = None,
     mamba_steps_to_track: Optional[torch.Tensor] = None,
     null_block_id: int = -1,
+    early_exit: bool = False,
 ) -> None:
-    """The compact-commit part of ``commit_gdn_replayssm_circular`` (not its cursor finish)."""
+    """The compact-commit part of ``commit_gdn_replayssm_circular`` (not its cursor finish);
+    ``early_exit`` reads the cursors before staging (a row that neither folds nor tracks leaves)."""
     num_layers, _, HV, V, K = checkpoint_state.shape
     H, ring = k_cache.shape[2], d_cache.shape[-2]
     B = state_batch_indices.shape[0]
@@ -634,7 +661,7 @@ def commit(
         null_block_id=null_block_id,
     )
     device = checkpoint_state.device.index
-    fn = _kernel(device, H, HV, ring, has_track)
+    fn = _kernel(device, H, HV, ring, has_track, early_exit)
     _launch(fn, num_layers * B * HV, ring, checkpoint_state.device, [p])
 
 
