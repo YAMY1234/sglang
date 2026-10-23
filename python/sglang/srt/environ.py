@@ -1209,6 +1209,9 @@ class Envs:
     # TRT-L18: ungated exact calls (the plugin's draft steps) as gated ones with all three switches: the fused partial
     # takes the prefix lengths as seq_lens - q_len itself (PDL after the q gather), then the per-(row, head) merge.
     SGLANG_TRTL18_CP_UNGATED = EnvBool(False)
+    # PERF-LB: CP-lite calls on the trtllm-gen partial (batches above the fused kernel's 32): the per-(row, head) merge
+    # (L18's, on the fold layout) instead of the per-row one, and, gated, the stock call gets no key when CP runs.
+    SGLANG_PLB_CP_FOLD_MH = EnvBool(False)
     # Timing only: decode graph padding per block of Q35MF_AB_BLOCK target-verify rounds, the labels in turn
     # ("pow2": the smallest captured power of two); model_executor/runner_backend/ab_variants.py. Empty: off.
     SGLANG_TRTL17_PAD_AB = EnvTuple(())
