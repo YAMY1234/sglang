@@ -57,6 +57,7 @@ from sglang.srt.utils import (
     require_mlp_sync,
     require_mlp_tp_gather,
 )
+from sglang.srt.utils import host_trace
 from sglang.srt.utils.async_probe import maybe_detect_nan, maybe_detect_oob
 from sglang.srt.utils.device_timer import device_timer_ctx
 
@@ -690,6 +691,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             copy_dsts.append(buffers.bootstrap_room_ids_int[:raw_bs])
             copy_srcs.append(forward_batch.bootstrap_room_ids_int)
         _grouped_foreach_copy_(copy_dsts, copy_srcs)
+        if host_trace.ENABLED:
+            host_trace.mark(host_trace.DXA)
 
         # hidden_states is large + contiguous: copy_() uses the cudaMemcpyAsync
         # DMA engine; foreach would force the ~3x slower compute-kernel copy.
@@ -772,6 +775,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         self.draft_attn_backend.init_forward_metadata_out_graph(
             SimpleNamespace(**vars(forward_batch), num_padding=bs - raw_bs)
         )
+        if host_trace.ENABLED:
+            host_trace.mark(host_trace.DXB)
         self.raw_bs = raw_bs
         self.bs = bs
 

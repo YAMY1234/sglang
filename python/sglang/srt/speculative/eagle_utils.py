@@ -40,6 +40,7 @@ from sglang.srt.utils import (
     is_hip,
     is_xpu,
 )
+from sglang.srt.utils import host_trace
 from sglang.srt.utils.async_probe import maybe_detect_oob
 
 if TYPE_CHECKING:
@@ -437,6 +438,8 @@ def eagle_prepare_for_verify(
         spec_mrope_positions=verify_input.prepared_mrope_positions,
         iteration_ids=verify_input.iteration_ids,
     )
+    if host_trace.ENABLED:
+        host_trace.mark(host_trace.VPB)
 
     # Run attention backend plan and cuda graph preparation
     can_run_cuda_graph = bool(
@@ -450,6 +453,8 @@ def eagle_prepare_for_verify(
             verify_forward_batch
         )
         verify_forward_batch.mark_forward_metadata_ready()
+        if host_trace.ENABLED:
+            host_trace.mark(host_trace.VPC)
     # Non-cuda-graph: defer init to forward_extend, which runs after
     # `_forward_raw -> prepare_mlp_sync_batch` pads the batch. Initing
     # here would use pre-pad shapes and trip DSv4 indexer shape match.

@@ -14,6 +14,7 @@ import torch
 
 from sglang.kernels.ops.memory.small_field_copy import SmallFieldCopyPlan
 from sglang.srt.environ import envs
+from sglang.srt.utils import host_trace
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -297,7 +298,11 @@ class _PostVerifyGraphs:
                 warmups=0, turn=0, slots=[None, None]
             )
         turn, state.turn = state.turn, state.turn ^ 1
+        if host_trace.ENABLED:
+            host_trace.mark(host_trace.PVA)
         sim_len, sim_turn = self._draw_sim_len(sim_max_len)
+        if host_trace.ENABLED:
+            host_trace.mark(host_trace.PVB)
         slot = state.slots[turn]
         if slot is None:
             staged = {name: src.clone() for name, src in inputs.items()}
@@ -313,6 +318,8 @@ class _PostVerifyGraphs:
         self._load(slot, inputs, sim_len)
         if sim_len is not None:
             self._record_sim_done(sim_turn)
+        if host_trace.ENABLED:
+            host_trace.mark(host_trace.PVC)
         if slot.graph is None:
             if state.warmups < _NUM_WARMUP * 2:
                 state.warmups += 1
