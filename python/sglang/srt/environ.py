@@ -1366,6 +1366,9 @@ class Envs:
     # buffer about every period (random phase per rank) on its own default-priority stream while the ctl file reads 1
     # (2: the persistent kernel of SGLANG_PLB_SCATTER_CTAS, 32 if unset). "": off.
     SGLANG_PLB_FAKE_SCATTER = EnvStr("")
+    # With CP_UNGATED: the q gather of an ungated exact call launches as a programmatic dependent of the kernel that
+    # wrote q (it releases the fused partial, then waits), so the partial's prefix KV requests start under that kernel.
+    SGLANG_PERFLL_CP_GATHER_PDL = EnvBool(False)
     # Timing only: decode graph padding per block of Q35MF_AB_BLOCK target-verify rounds, the labels in turn
     # ("pow2": the smallest captured power of two); model_executor/runner_backend/ab_variants.py. Empty: off.
     SGLANG_TRTL17_PAD_AB = EnvTuple(())
