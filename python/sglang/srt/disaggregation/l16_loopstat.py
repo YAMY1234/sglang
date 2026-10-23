@@ -102,8 +102,11 @@ class LoopStat:
             text = str(message)
             if "synchroniz" not in text:
                 return prev(message, category, filename, lineno, file, line)
-            key = (self.knob, filename.rsplit("sglang/", 1)[-1], lineno, text[:60])
-            self.sync_counts[key] = self.sync_counts.get(key, 0) + 1
+            try:
+                key = (self.knob, filename.rsplit("sglang/", 1)[-1], lineno, text[:60])
+                self.sync_counts[key] = self.sync_counts.get(key, 0) + 1
+            except Exception:
+                pass
 
         warnings.showwarning = show
         warnings.filterwarnings("always", message=".*synchroniz.*")
