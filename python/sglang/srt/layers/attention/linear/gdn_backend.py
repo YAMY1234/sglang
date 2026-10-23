@@ -2274,6 +2274,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # Capacity folds are committed once across every GDN layer after
             # acceptance; the active path is therefore a single launch/layer.
             launch_mode="verify",
+            fold_in_verify=mamba_pool.replayssm_fold_in_verify,
         )
         gdn_replayssm_spec_decode(**spec_kwargs, **verify_options)
         proof = q35_krnc_proof.active() if verify_options.get("prefetch_h0") else None

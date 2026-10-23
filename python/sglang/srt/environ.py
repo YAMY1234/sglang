@@ -1713,6 +1713,9 @@ class Envs:
     # The compact ReplaySSM commit of every GDN layer as one CUDA launch (one CTA per layer,
     # request and value head); the same four high / low products, FP32 sums in another order.
     SGLANG_Q35MF_COMMIT_CUDA = EnvBool(False)
+    # The GDN spec verify folds a request's ring into its BF16 checkpoint when this step's rows
+    # do not fit after it (TRT-LLM's q35_gdn_core); the commit then only snapshots track rows.
+    SGLANG_PLB_GDN_FOLD_IN_VERIFY = EnvBool(False)
     # PERF-HT: the attention-DP GDN verify launch table (SGLANG_Q35MF_E2X_DEP_GDN) extended to B17-36 (byte-identical).
     SGLANG_PERFHT_DEP_GDN_WIDE = EnvBool(False)
     # PERF-HT: SGLANG_Q35MF_TPX_CONV_WINDOW's coalesced window stores up to B36 (stock gate B16).
