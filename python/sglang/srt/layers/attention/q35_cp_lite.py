@@ -190,7 +190,7 @@ def _cp_tables(
 def _cp_chunk_tables(tab, tstride, lens, base_lens, vtab, vlens, vstart, vcnt, nb, nv, ragged,
                      C: tl.constexpr, KP: tl.constexpr, NB: tl.constexpr, PG: tl.constexpr):
     """Once per forward, program (r, j), chunked fold partial (PERF-LB cp3): with a ragged batch (longest owned length
-    x B >= ragged x the total), chunk j of request r's owned pages into dense row start_r + j of vtab ([nv, C]) and no
+    x B >= ragged x the total, the longest over C pages), chunk j of request r's owned pages into dense row start_r + j of vtab ([nv, C]) and no
     key for the one-row-per-request call; otherwise every chunk row empty and that call keeps its lengths. Row
     r * KP + j is cleared when it lies past the last chunk."""
     r = tl.program_id(0)
@@ -198,7 +198,9 @@ def _cp_chunk_tables(tab, tstride, lens, base_lens, vtab, vlens, vstart, vcnt, n
     k = tl.arange(0, NB)
     L = tl.load(lens + k, mask=k < nb, other=0)
     pg = (L + PG - 1) // PG
-    on = (tl.max(pg, axis=0) * nb).to(tl.float32) >= ragged * tl.sum(pg, axis=0).to(tl.float32)
+    mp = tl.max(pg, axis=0)
+    # ragged, and some request spans more than one chunk (else the chunk rows only repeat the one-row call)
+    on = ((mp * nb).to(tl.float32) >= ragged * tl.sum(pg, axis=0).to(tl.float32)) & (mp > C)
     n = tl.where(on, (pg + C - 1) // C, 0)
     start = tl.cumsum(n, axis=0) - n
     total = tl.sum(n, axis=0)
