@@ -130,14 +130,15 @@ def _gate_on(seq_lens, nb, thr, NB: tl.constexpr, GMAX: tl.constexpr):
 
 
 @triton.jit
-def _gate_lens(seq_lens, nb, thr, stock_lens, pre_lens, QL: tl.constexpr, NB: tl.constexpr, GMAX: tl.constexpr):
-    """Once per forward: the stock call's lengths (L with the gate off, q_len keys with it on) and the exact
-    path's prefix lengths (max(L - QL, 0) on, 0 off)."""
+def _gate_lens(seq_lens, nb, thr, stock_lens, pre_lens, QL: tl.constexpr, NB: tl.constexpr, GMAX: tl.constexpr,
+               ZERO: tl.constexpr):
+    """Once per forward: the stock call's lengths (L with the gate off; with it on q_len keys, or ZERO: none, so
+    the stock kernel leaves out to the merge) and the exact path's prefix lengths (max(L - QL, 0) on, 0 off)."""
     k = tl.arange(0, NB)
     m = k < nb
     L = tl.load(seq_lens + k, mask=m, other=0)
     on = _gate_on(seq_lens, nb, thr, NB, GMAX)
-    tl.store(stock_lens + k, tl.where(on, tl.minimum(L, QL), L), mask=m)
+    tl.store(stock_lens + k, tl.where(on, 0 if ZERO else tl.minimum(L, QL), L), mask=m)
     tl.store(pre_lens + k, tl.where(on, tl.maximum(L - QL, 0), 0), mask=m)
 
 
@@ -743,7 +744,7 @@ class CpLite:
 
     def _gate_lens_fwd(self, seq_lens, b, q_len, thr, forward_batch, layer_id):
         """Once per forward (as _tables): the stock call's lengths and the exact path's prefix lengths."""
-        key = (seq_lens.data_ptr(), b, q_len, thr)
+        key = (seq_lens.data_ptr(), b, q_len, thr, self.gate_overlap)
         ent = self._glens.get(key)
         if ent is not None and ent[1]() is forward_batch and layer_id > ent[2]:
             ent[2] = layer_id
@@ -753,13 +754,14 @@ class CpLite:
         lens = torch.empty(2, b, dtype=torch.int32, device=self.device)
         self._glens[key] = [(lens[0], lens[1]), weakref.ref(forward_batch), layer_id]
         _gate_lens[(1,)](seq_lens, b, thr, lens[0], lens[1], QL=q_len, NB=triton.next_power_of_2(b),
-                         GMAX=self.gate_max)
+                         GMAX=self.gate_max, ZERO=self.gate_overlap == 2)
         return lens[0], lens[1]
 
     def _gated_overlap(self, q, k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale,
                        forward_batch, layer_id, stock, gate, exact):
         """Gated call: stock(lengths, out) on this stream beside gather + partial on the side stream (the
-        trtllm-gen partial with its own workspace), then the merge (exits with the gate off)."""
+        trtllm-gen partial with its own workspace), then the merge (exits with the gate off). GATE_OVERLAP 2: the
+        merge stays on the side stream too and, gate on, the stock kernel gets no key and writes nothing."""
         stock_lens, pre_lens = self._gate_lens_fwd(seq_lens, b, q_len, gate["thr"], forward_batch, layer_id)
         out = torch.empty(rows, self.hq, HEAD_DIM, dtype=torch.bfloat16, device=self.device)
         main = torch.cuda.current_stream()
@@ -777,9 +779,13 @@ class CpLite:
             else:
                 self._fold_partial(k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale,
                                    forward_batch, layer_id, gate, self._own_workspace())
+            merge = self._exact_merge if exact else self._fold_merge
+            if self.gate_overlap == 2:
+                merge(q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale, out, gate)
         main.wait_stream(self._side)
-        merge = self._exact_merge if exact else self._fold_merge
-        return merge(q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale, out, gate)
+        if self.gate_overlap != 2:
+            merge(q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale, out, gate)
+        return out
 
     def _own_workspace(self):
         """The overlapped trtllm-gen partial's workspace (the caller's belongs to the stock call)."""
