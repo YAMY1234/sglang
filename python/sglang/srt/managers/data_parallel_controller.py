@@ -124,6 +124,9 @@ class DPBudget:
         self.total_requests = [0] * num_dp_ranks
         self.total_tokens = [0] * num_dp_ranks
         self.last_timestamp = [0.0] * num_dp_ranks
+        self.max_running = [0] * num_dp_ranks
+        self.tokens_capped = envs.SGLANG_PERFHT_DP_TOKENS_CAPPED.get()
+        self.request_weight = envs.SGLANG_PERFHT_DP_REQUEST_TOKENS.get()
 
     def update_budget(self, loads):
         """Update budget from shm snapshots, skipping stale reads."""
@@ -135,10 +138,35 @@ class DPBudget:
                 load.num_running_reqs + load.num_waiting_reqs
             )
             self.total_tokens[load.dp_rank] = load.num_total_tokens
+            self.max_running[load.dp_rank] = load.max_running_requests
 
     def dispatch(self, method: LoadBalanceMethod, estimated_tokens: int = 0):
         if method == LoadBalanceMethod.TOTAL_REQUESTS:
             target_rank = self.total_requests.index(min(self.total_requests))
+        elif method == LoadBalanceMethod.TOTAL_TOKENS and self.tokens_capped:
+            # SGLANG_PERFHT_DP_TOKENS_CAPPED: the least work (tokens + SGLANG_PERFHT_DP_REQUEST_TOKENS per request) among
+            # the ranks below their running cap (a request on a full rank waits for a slot while another rank has one);
+            # all full: the fewest requests.
+            ranks = range(self.num_dp_ranks)
+            if not getattr(self, "_ht_logged", False):
+                self._ht_logged = True
+                logger.info(
+                    "SGLANG_PERFHT_DP_TOKENS_CAPPED: request weight %d tokens, running caps %s, requests %s, tokens %s",
+                    self.request_weight, self.max_running, self.total_requests, self.total_tokens,
+                )
+            open_ranks = [i for i in ranks if self.total_requests[i] < self.max_running[i]]
+            if open_ranks:
+                target_rank = min(
+                    open_ranks,
+                    key=lambda i: (
+                        self.total_tokens[i] + self.request_weight * self.total_requests[i],
+                        self.total_requests[i],
+                    ),
+                )
+            else:
+                target_rank = min(
+                    ranks, key=lambda i: (self.total_requests[i], self.total_tokens[i])
+                )
         elif method == LoadBalanceMethod.TOTAL_TOKENS:
             # Use total_requests as a tie-breaker when total_tokens are equal
             target_rank = min(
@@ -837,6 +865,16 @@ class DataParallelController:
         sock_send(self.workers[slot], req)
 
     def maybe_external_dp_rank_routing(self, req: Req):
+        if req.routed_dp_rank is not None and envs.SGLANG_PERFHT_DP_IGNORE_ROUTED.get():
+            # The router's DP rank pick is dropped; this controller's load balance method places the request.
+            if not getattr(self, "_ht_ignore_logged", False):
+                self._ht_ignore_logged = True
+                logger.info(
+                    "SGLANG_PERFHT_DP_IGNORE_ROUTED: routed DP ranks ignored, dispatch by %s",
+                    self.load_balance_method.name,
+                )
+            req.routed_dp_rank = None
+            return False
         if req.routed_dp_rank is not None:
             rank = req.routed_dp_rank
             if (

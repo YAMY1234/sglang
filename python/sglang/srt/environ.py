@@ -1711,6 +1711,14 @@ class Envs:
     SGLANG_Q35MF_COMMIT_CUDA = EnvBool(False)
     # PERF-HT: the attention-DP GDN verify launch table (SGLANG_Q35MF_E2X_DEP_GDN) extended to B17-36 (byte-identical).
     SGLANG_PERFHT_DEP_GDN_WIDE = EnvBool(False)
+    # PERF-HT: load-balance-method total_tokens dispatches to the fewest tokens among the DP ranks below their
+    # max running requests (all full: the fewest requests).
+    SGLANG_PERFHT_DP_TOKENS_CAPPED = EnvBool(False)
+    # The per-request weight in tokens of that dispatch (the GDN / conv / commit work of a request, about 50K tokens
+    # of attention at B32 on DEP).
+    SGLANG_PERFHT_DP_REQUEST_TOKENS = EnvInt(50000)
+    # PERF-HT: drop the router's routed DP rank (dynamo's decode pick) and place the request by load-balance-method.
+    SGLANG_PERFHT_DP_IGNORE_ROUTED = EnvBool(False)
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
