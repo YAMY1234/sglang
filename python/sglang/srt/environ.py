@@ -1781,6 +1781,9 @@ class Envs:
     # inputs, draft-extend layout) from one JIT CUDA module and a cached host descriptor
     # instead of three Triton launches; same integer results.
     SGLANG_PERFLL_HOST_JIT_INDEX = EnvBool(False)
+    # SamplingBatchInfo.copy_for_forward copies the field values through the instance dict
+    # instead of dataclasses.replace (no __post_init__, no init=False fields: same object).
+    SGLANG_PERFLL_HOST_SAMPLING_COPY = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
