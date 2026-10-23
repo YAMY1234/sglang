@@ -692,8 +692,12 @@ class Q35CpPartialAttnKernel:
         balanced: bool = False,
         rescale_threshold: float | None = None,
         l_from_p8: bool = False,
+        len_sub: int = 0,
     ):
         assert gh == cp_size * hql, "group heads = cp_size x q heads per rank"
+        # L = max(seq_lens - len_sub, 0): a folded caller's prefix lengths from the batch's own lengths, so nothing
+        # written by the q all-gather is read before the dependency wait
+        self.len_sub = int(len_sub)
         self.balanced = bool(balanced)
         self.q_len = q_len
         self.gh = gh
@@ -1182,6 +1186,8 @@ class Q35CpPartialAttnKernel:
         L = Int32(0)
         if lane < batch:
             L = mSeq[lane]
+            if const_expr(self.len_sub > 0):
+                L = cutlass.max(L - self.len_sub, 0)
         # owned tiles of request `lane` on this rank (0 for lanes >= batch: L = 0)
         t = ((((L + PAGE - 1) // PAGE) - cp_rank + CP - 1) // CP + 1) // 2
         total = _redux_add_s32(t)
@@ -1536,6 +1542,8 @@ class Q35CpPartialAttnKernel:
         #      all-gather (non-PDL torch ops / kernels that completed before it); read before the dependency wait ----
         if const_expr(not BAL):
             L = mSeq[req]
+            if const_expr(self.len_sub > 0):
+                L = cutlass.max(L - self.len_sub, 0)
             n_pages = (L + PAGE - 1) // PAGE
             n_own = (
                 n_pages - cp_rank + CP - 1

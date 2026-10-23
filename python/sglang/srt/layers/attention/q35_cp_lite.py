@@ -316,13 +316,17 @@ def _ll_wait(src, n: tl.constexpr, e):
 def _cp_gather_q_ll(
     q, q_stride, peers, me, ll_off, q_all, cnt, seq_lens, pre_lens, stock_lens, nb, thr,
     CP: tl.constexpr, WORDS: tl.constexpr, QL: tl.constexpr, FOLD: tl.constexpr,
-    GATE: tl.constexpr, NB: tl.constexpr, GMAX: tl.constexpr, GWRITE: tl.constexpr,
+    GATE: tl.constexpr, NB: tl.constexpr, GMAX: tl.constexpr, GWRITE: tl.constexpr, TRIG: tl.constexpr = False,
 ):
     """LL variant of _cp_gather_q: every 4-byte word travels with the call's epoch in one 8-byte store.
     FOLD: q_all is written source-major per request ([B, CP, QL, heads, D]) for the prefix-only fused partial,
     and pre_lens[b] = max(L - QL, 0).
     GATE: exits with the gate off; GWRITE: first writes the stock call's lengths (L with the gate off, q_len with it
-    on) and, FOLD, pre_lens = 0 with the gate off (else _gate_lens wrote them)."""
+    on) and, FOLD, pre_lens = 0 with the gate off (else _gate_lens wrote them).
+    TRIG (no GWRITE): releases the dependent grid at entry; the fused partial reads only lengths, tables and prefix KV
+    before its griddepcontrol.wait, none of them written here."""
+    if TRIG:
+        tl.extra.cuda.gdc_launch_dependents()
     i = tl.program_id(0)
     if GATE:
         on = _gate_on(seq_lens, nb, thr, NB, GMAX)
@@ -499,6 +503,96 @@ def _cp_a2a_merge4_ll(po, plse, out, out_stride, peers, me, ll_off, cnt, HQ: tl.
     tl.store(cnt + i, e)
 
 
+@triton.jit
+def _gdc_wait_clobber():
+    # griddepcontrol.wait with a memory clobber: no load may be hoisted above it
+    tl.inline_asm_elementwise("griddepcontrol.wait; // dummy $0", "=r,~{memory}", [], dtype=tl.int32,
+                              is_pure=False, pack=1)
+
+
+@triton.jit
+def _causal_block_h(q, q_stride, i, h, L, k_cache, v_cache, kv_page_stride, kv_tok_stride, table, t_stride, bmm1,
+                    bmm2, QL: tl.constexpr, D: tl.constexpr, PG: tl.constexpr):
+    """Head h of row i: the fp32 causal block over this step's QL keys as _cp_a2a_merge_ll starts its merge, i.e.
+    unnormalized O (x bmm2) [D], the natural-log max [1] (-inf: no key) and the row sum [1]."""
+    b = i // QL
+    t = i % QL
+    d = tl.arange(0, D)
+    j = tl.arange(0, 8)
+    pos = L - QL + j
+    valid = (j <= t) & (pos >= 0)
+    pos = tl.maximum(pos, 0)
+    page = tl.load(table + b * t_stride + pos // PG, mask=valid, other=0)
+    koff = page.to(tl.int64) * kv_page_stride + (pos % PG) * kv_tok_stride
+    kk = tl.load(k_cache + koff[:, None] + d[None, :], mask=valid[:, None], other=0.0).to(tl.float32)
+    vv = tl.load(v_cache + koff[:, None] + d[None, :], mask=valid[:, None], other=0.0).to(tl.float32)
+    qv = tl.load(q + i * q_stride + h * D + d).to(tl.float32)
+    s = tl.sum(qv[None, :] * kk, axis=1) * bmm1
+    s = tl.where(valid, s, float("-inf"))
+    md = tl.max(s, axis=0)
+    md0 = tl.where(md > float("-inf"), md, 0.0)
+    p = tl.exp(s - md0)
+    ld = tl.sum(p, axis=0)
+    acc = tl.sum(p[:, None] * vv, axis=0) * bmm2
+    m = tl.where(ld > 0, md0, float("-inf"))
+    return acc, m + tl.zeros([1], tl.float32), ld + tl.zeros([1], tl.float32)
+
+
+@triton.jit
+def _cp_merge_h_ll(
+    po, plse, po_sr, po_sc, pl_sr, pl_sc, q, q_stride, k_cache, v_cache, kv_page_stride, kv_tok_stride, table,
+    t_stride, seq_lens, out, out_stride, peers, me, ll_off, cnt, bmm1, bmm2, nb, thr,
+    QL: tl.constexpr, HQ: tl.constexpr, CP: tl.constexpr, D: tl.constexpr, PG: tl.constexpr, NWP: tl.constexpr,
+    NB: tl.constexpr, GMAX: tl.constexpr, WAIT: tl.constexpr,
+):
+    """_cp_a2a_merge_ll (gated) with one program per (row, head): pushes the head's partials, computes its causal
+    block, then merges the CP partials as they arrive. One epoch per (row, head) in cnt, in an LL region of its own
+    (the row merge's epochs differ). WAIT: launched as a programmatic dependent."""
+    i = tl.program_id(0)
+    h = tl.program_id(1)
+    if WAIT:
+        _gdc_wait_clobber()
+    if _gate_on(seq_lens, nb, thr, NB, GMAX).to(tl.int32) == 0:
+        return
+    one = tl.arange(0, 1)
+    e = tl.load(cnt + i * HQ + h) + 1
+    flag = e.to(tl.int64) << 32
+    DW: tl.constexpr = D // 2
+    NO: tl.constexpr = HQ * D // 2
+    w = tl.arange(0, DW)
+    for c in tl.static_range(CP):
+        ow = _ll_pack(flag, tl.load(po + i * po_sr + c * po_sc + h * DW + w))
+        lw = _ll_pack(flag, tl.load(plse + i * pl_sr + c * pl_sc + h + one))
+        dst = (tl.load(peers + c) + ll_off + (i * CP + me) * NWP * 8).to(tl.pointer_type(tl.int64))
+        tl.store(dst + h * DW + w, ow)
+        tl.store(dst + NO + h + one, lw)
+    L = tl.load(seq_lens + i // QL)
+    acc, m, wsum = _causal_block_h(q, q_stride, i, h, L, k_cache, v_cache, kv_page_stride, kv_tok_stride, table,
+                                   t_stride, bmm1, bmm2, QL, D, PG)
+    n_pages = (tl.maximum(L - QL, 0) + PG - 1) // PG
+    own = tl.load(peers + me) + ll_off
+    for c in tl.static_range(CP):
+        src = (own + (i * CP + c) * NWP * 8).to(tl.pointer_type(tl.int64))
+        v = _ll_wait(src + h * DW, DW, e)
+        lv = _ll_wait(src + NO + h, 1, e)
+        lc = (lv & 0xFFFFFFFF).to(tl.int32).to(tl.float32, bitcast=True) * 0.6931471805599453
+        lc = tl.where(n_pages > c, lc, float("-inf"))
+        wd = (v & 0xFFFFFFFF).to(tl.uint32)
+        lo = (wd << 16).to(tl.float32, bitcast=True)
+        hi = (wd & 0xFFFF0000).to(tl.float32, bitcast=True)
+        oc = tl.reshape(tl.join(lo, hi), (D,))
+        mn = tl.maximum(m, lc)
+        mn0 = tl.where(mn > float("-inf"), mn, 0.0)
+        a_old = tl.where(m > float("-inf"), tl.exp(m - mn0), 0.0)
+        a_new = tl.where(lc > float("-inf"), tl.exp(lc - mn0), 0.0)
+        acc = acc * a_old + oc * a_new
+        wsum = wsum * a_old + a_new
+        m = mn
+    o = acc / tl.where(wsum > 0, wsum, 1.0)
+    tl.store(out + i * out_stride + h * D + tl.arange(0, D), o.to(tl.bfloat16))
+    tl.store(cnt + i * HQ + h + one, e)
+
+
 def _parse_min_kv(spec: str) -> dict:
     """SGLANG_TRTL1_ATTN_CP_MIN_KV: "" (no gate), "<kv>" (every batch size) or "<b>:<kv>,..." (from b requests up,
     the entry of the largest b not above the batch) -> {b: kv}."""
@@ -532,6 +626,11 @@ class CpLite:
         self.llq_off = self.f_off + _KINDS * _MAX_ROWS * cp * 4
         self.llp_off = self.llq_off + _MAX_ROWS * cp * (q_heads * HEAD_DIM // 4) * 8
         total = self.llp_off + _MAX_ROWS * cp * _LL_PWORDS * 8
+        self.cp_ungated = envs.SGLANG_TRTL18_CP_UNGATED.get()
+        self.merge_h = envs.SGLANG_TRTL18_CP_MAIN.get() and envs.SGLANG_TRTL18_CP_MERGE_H.get()
+        self.llh_off = total
+        if self.merge_h or self.cp_ungated:
+            total += _MAX_ROWS * cp * _LL_PWORDS * 8
         self.ll = envs.SGLANG_TRTL1_ATTN_CP_LL.get() and q_heads * HEAD_DIM // 2 + q_heads <= _LL_PWORDS
         self.cnt = torch.zeros(_KINDS, _MAX_ROWS, dtype=torch.int32, device=self.device)
         self.sms = torch.cuda.get_device_properties(self.device).multi_processor_count
@@ -569,6 +668,9 @@ class CpLite:
         self.gate_max = envs.SGLANG_TRTL1_ATTN_CP_GATE_MAX.get()
         self.stock_lens = torch.zeros(rows, dtype=torch.int32, device=self.device)
         self.gate_overlap = envs.SGLANG_TRTL1_ATTN_CP_GATE_OVERLAP.get()
+        self.cp_main = envs.SGLANG_TRTL18_CP_MAIN.get()
+        self.cp_pdl = self.cp_main and envs.SGLANG_TRTL18_CP_PDL.get()
+        self.cnt_h = torch.zeros(_MAX_ROWS * q_heads, dtype=torch.int32, device=self.device)
         self._side = torch.cuda.Stream(device=self.device)
         self._ws = None
         if self.min_kv and self.gate_overlap:
@@ -584,6 +686,9 @@ class CpLite:
             tp_rank, cp, self.me, self.min_bs, self.ll, self.fused,
         )
         logger.info("TRT-L1 CP-lite exact (prefix-only fused partial + fp32 causal block): %s", self.exact)
+        logger.info("TRT-L18 CP-lite gated exact calls: CP on the current stream, stock after the partial: %s, PDL %s, "
+                    "per-head merge %s; ungated exact calls with PDL and the per-head merge: %s", self.cp_main,
+                    self.cp_pdl, self.merge_h, self.cp_ungated)
         logger.info(
             "TRT-L1 CP-lite KV gate: min KV per request %s (%s of the batch)",
             self.min_kv or "off", "max" if self.gate_max else "mean",
@@ -693,6 +798,9 @@ class CpLite:
         if thr is not None and self.gate_overlap:
             return self._gated_overlap(q, k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale,
                                        bmm2_scale, forward_batch, layer.layer_id, stock, gate, exact)
+        if exact and thr is None and self.ll and self.cp_ungated:
+            return self._ungated_main(q, k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale,
+                                      bmm2_scale, gate)
         if self.ll:
             _cp_gather_q_ll[(rows,)](
                 q.view(torch.int32), words, self.peers, self.me, self.llq_off, self.q_all.view(torch.int32),
@@ -742,9 +850,11 @@ class CpLite:
         return self._exact_merge(q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale,
                                  out, gate)
 
-    def _gate_lens_fwd(self, seq_lens, b, q_len, thr, forward_batch, layer_id):
-        """Once per forward (as _tables): the stock call's lengths and the exact path's prefix lengths."""
-        key = (seq_lens.data_ptr(), b, q_len, thr, self.gate_overlap)
+    def _gate_lens_fwd(self, seq_lens, b, q_len, thr, forward_batch, layer_id, zero=False):
+        """Once per forward (as _tables): the stock call's lengths and the exact path's prefix lengths. zero: the
+        stock call gets no key when CP runs (as GATE_OVERLAP 2)."""
+        zero = zero or self.gate_overlap == 2
+        key = (seq_lens.data_ptr(), b, q_len, thr, zero)
         ent = self._glens.get(key)
         if ent is not None and ent[1]() is forward_batch and layer_id > ent[2]:
             ent[2] = layer_id
@@ -754,7 +864,7 @@ class CpLite:
         lens = torch.empty(2, b, dtype=torch.int32, device=self.device)
         self._glens[key] = [(lens[0], lens[1]), weakref.ref(forward_batch), layer_id]
         _gate_lens[(1,)](seq_lens, b, thr, lens[0], lens[1], QL=q_len, NB=triton.next_power_of_2(b),
-                         GMAX=self.gate_max, ZERO=self.gate_overlap == 2)
+                         GMAX=self.gate_max, ZERO=zero)
         return lens[0], lens[1]
 
     def _gated_overlap(self, q, k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale,
@@ -762,6 +872,9 @@ class CpLite:
         """Gated call: stock(lengths, out) on this stream beside gather + partial on the side stream (the
         trtllm-gen partial with its own workspace), then the merge (exits with the gate off). GATE_OVERLAP 2: the
         merge stays on the side stream too and, gate on, the stock kernel gets no key and writes nothing."""
+        if self.cp_main and exact and self.gate_overlap == 1:
+            return self._gated_main(q, k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale,
+                                    bmm2_scale, forward_batch, layer_id, stock, gate)
         stock_lens, pre_lens = self._gate_lens_fwd(seq_lens, b, q_len, gate["thr"], forward_batch, layer_id)
         out = torch.empty(rows, self.hq, HEAD_DIM, dtype=torch.bfloat16, device=self.device)
         main = torch.cuda.current_stream()
@@ -786,6 +899,62 @@ class CpLite:
         if self.gate_overlap != 2:
             merge(q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale, out, gate)
         return out
+
+    def _gated_main(self, q, k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale,
+                    forward_batch, layer_id, stock, gate):
+        """Gated exact call (TRT-L18): gather, fused partial and merge (all exit with the gate off) on this stream. The
+        stock kernel would hold SMs the partial's grid barrier waits for, so it runs on the side stream after the
+        partial; it gets no key with the gate on (then writes nothing), so it and the merge write out in disjoint cases."""
+        stock_lens, pre_lens = self._gate_lens_fwd(seq_lens, b, q_len, gate["thr"], forward_batch, layer_id, zero=True)
+        out = torch.empty(rows, self.hq, HEAD_DIM, dtype=torch.bfloat16, device=self.device)
+        words = self.hq * HEAD_DIM // 4
+        _cp_gather_q_ll[(rows,)](
+            q.view(torch.int32), words, self.peers, self.me, self.llq_off, self.q_all.view(torch.int32),
+            self.cnt[0], seq_lens, pre_lens, self.stock_lens, **gate,
+            CP=self.cp, WORDS=words, QL=q_len, FOLD=True, GWRITE=False, TRIG=self.cp_pdl, num_warps=4,
+        )
+        self._exact_partial(k_cache, v_cache, page_table, pre_lens, q_len, b, rows, bmm1_scale, bmm2_scale,
+                            pdl=self.cp_pdl)
+        main = torch.cuda.current_stream()
+        self._side.wait_stream(main)
+        with torch.cuda.stream(self._side):
+            stock(stock_lens, out)
+        if self.merge_h:
+            self._merge_h(q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale, out, gate)
+        else:
+            self._exact_merge(q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale, out,
+                              gate)
+        main.wait_stream(self._side)
+        return out
+
+    def _ungated_main(self, q, k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale, gate):
+        """Ungated exact call (TRT-L18): gather (releases at entry), fused partial as a programmatic dependent on the
+        prefix lengths it derives from seq_lens, then the per-(row, head) merge."""
+        words = self.hq * HEAD_DIM // 4
+        _cp_gather_q_ll[(rows,)](
+            q.view(torch.int32), words, self.peers, self.me, self.llq_off, self.q_all.view(torch.int32),
+            self.cnt[0], seq_lens, self.pre_lens, self.stock_lens, **gate,
+            CP=self.cp, WORDS=words, QL=q_len, FOLD=True, GWRITE=False, TRIG=True, num_warps=4,
+        )
+        self._exact_partial(k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale,
+                            pdl=True, len_sub=q_len)
+        out = torch.empty(rows, self.hq, HEAD_DIM, dtype=torch.bfloat16, device=self.device)
+        self._merge_h(q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale, out,
+                      dict(gate, thr=0), pdl=True)
+        return out
+
+    def _merge_h(self, q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale, out, gate,
+                 pdl=None):
+        pdl = self.cp_pdl if pdl is None else pdl
+        hq = self.hq
+        _cp_merge_h_ll[(rows, hq)](
+            self.po_x.view(torch.int32), self.pl_x.view(torch.int32), hq * HEAD_DIM // 2, self.po_x.stride(0) // 2,
+            hq, self.pl_x.stride(0), q, q.stride(0), k_cache, v_cache, k_cache.stride(0), k_cache.stride(2),
+            page_table, page_table.stride(0), seq_lens, out, out.stride(0), self.peers, self.me, self.llh_off,
+            self.cnt_h, bmm1_scale, bmm2_scale, gate["nb"], gate["thr"],
+            QL=q_len, HQ=hq, CP=self.cp, D=HEAD_DIM, PG=PAGE, NWP=_LL_PWORDS, NB=gate["NB"], GMAX=gate["GMAX"],
+            WAIT=pdl, num_warps=4, launch_pdl=pdl,
+        )
 
     def _own_workspace(self):
         """The overlapped trtllm-gen partial's workspace (the caller's belongs to the stock call)."""
@@ -827,7 +996,8 @@ class CpLite:
         )
         return out
 
-    def _exact_partial(self, k_cache, v_cache, page_table, pre_lens, q_len, b, rows, bmm1_scale, bmm2_scale):
+    def _exact_partial(self, k_cache, v_cache, page_table, pre_lens, q_len, b, rows, bmm1_scale, bmm2_scale,
+                       pdl=False, len_sub=0):
         from sglang.srt.layers.attention import q35_cp_fused as F
 
         cp, hq = self.cp, self.hq
@@ -844,10 +1014,11 @@ class CpLite:
             self.po_x[:, :rows].view(cp, b, q_len * hq, HEAD_DIM),
             self.pl_x[:, :rows].view(cp, b, q_len * hq),
             sm_count=self.sms,
-            enable_pdl=False,
+            enable_pdl=pdl,
             v_pool=v_cache,
             p_shift=_EXACT_P_SHIFT,
             rescale_threshold=_EXACT_RESCALE_THRESHOLD,
+            len_sub=len_sub,
         )
 
     def _exact_merge(self, q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale, out, gate):
