@@ -1329,6 +1329,9 @@ class Envs:
     # cut into chunks), then a base-2 LSE combine per request: a ragged batch costs its total KV instead of its longest
     # request's. 0: off.
     SGLANG_PLB_CP_FOLD_CHUNK = EnvInt(0)
+    # PERF-LB: chunk rows only on a ragged batch: longest owned length x B >= this x the total (one row per request
+    # otherwise). 0: every batch.
+    SGLANG_PLB_CP_FOLD_RAGGED = EnvFloat(1.8)
     # Timing only: decode graph padding per block of Q35MF_AB_BLOCK target-verify rounds, the labels in turn
     # ("pow2": the smallest captured power of two); model_executor/runner_backend/ab_variants.py. Empty: off.
     SGLANG_TRTL17_PAD_AB = EnvTuple(())
