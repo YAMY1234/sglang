@@ -187,6 +187,48 @@ def _cp_tables(
 
 
 @triton.jit
+def _cp_chunk_q(q, qv, lens, vlens, N, K: tl.constexpr, C: tl.constexpr, PG: tl.constexpr, BLK: tl.constexpr):
+    """Virtual row v = r * K + j of the chunked fold partial: tokens [jC, (j+1)C) pages of request r's owned prefix
+    (its pages are row v of the table viewed as [B * K, C]); its token count, and request r's query when non-empty."""
+    v = tl.program_id(0)
+    c = tl.program_id(1)
+    n = tl.minimum(tl.maximum(tl.load(lens + v // K) - (v % K) * (C * PG), 0), C * PG)
+    if c == 0:
+        tl.store(vlens + v, n)
+    if n > 0:
+        w = c * BLK + tl.arange(0, BLK)
+        m = w < N
+        tl.store(qv + v.to(tl.int64) * N + w, tl.load(q + (v // K).to(tl.int64) * N + w, mask=m), mask=m)
+
+
+@triton.jit
+def _cp_chunk_comb(po_v, pl_v, vlens, po, pl, H, K: tl.constexpr, HB: tl.constexpr, D: tl.constexpr):
+    """One partial per request from its non-empty virtual rows (trtllm-gen LSE is base 2)."""
+    r = tl.program_id(0)
+    h = tl.program_id(1) * HB + tl.arange(0, HB)
+    hm = h < H
+    d = tl.arange(0, D)
+    m = tl.full([HB], float("-inf"), tl.float32)
+    s = tl.zeros([HB], tl.float32)
+    acc = tl.zeros([HB, D], tl.float32)
+    for j in tl.static_range(K):
+        v = r * K + j
+        if tl.load(vlens + v) > 0:
+            lj = tl.load(pl_v + v * H + h, mask=hm, other=0.0)
+            oj = tl.load(po_v + (v * H + h[:, None]).to(tl.int64) * D + d[None, :], mask=hm[:, None], other=0.0)
+            mn = tl.maximum(m, lj)
+            a = tl.exp2(m - mn)
+            w = tl.exp2(lj - mn)
+            acc = acc * a[:, None] + oj.to(tl.float32) * w[:, None]
+            s = s * a + w
+            m = mn
+    ok = s > 0
+    tl.store(po + (r * H + h[:, None]).to(tl.int64) * D + d[None, :],
+             (acc / tl.where(ok, s, 1.0)[:, None]).to(tl.bfloat16), mask=hm[:, None])
+    tl.store(pl + r * H + h, tl.where(ok, m + tl.log2(tl.where(ok, s, 1.0)), float("-inf")), mask=hm)
+
+
+@triton.jit
 def _cp_gather_q(
     q,
     q_stride,
@@ -630,6 +672,7 @@ class CpLite:
         self.merge_h = envs.SGLANG_TRTL18_CP_MAIN.get() and envs.SGLANG_TRTL18_CP_MERGE_H.get()
         self.llh_off = total
         self.fold_mh = envs.SGLANG_PLB_CP_FOLD_MH.get()
+        self.fold_chunk = envs.SGLANG_PLB_CP_FOLD_CHUNK.get()
         if self.merge_h or self.cp_ungated or self.fold_mh:
             total += _MAX_ROWS * cp * _LL_PWORDS * 8
         self.ll = envs.SGLANG_TRTL1_ATTN_CP_LL.get() and q_heads * HEAD_DIM // 2 + q_heads <= _LL_PWORDS
@@ -975,9 +1018,28 @@ class CpLite:
         import flashinfer
 
         tab, lens, max_kv = self._tables(page_table, seq_lens, q_len, forward_batch, layer_id, gate)
-        gh = self.cp * self.hq
+        h = q_len * self.cp * self.hq
+        query = self.q_all[:rows].view(b, h, HEAD_DIM)
+        out, lse = self.po[:rows].view(b, h, HEAD_DIM), self.plse[:rows].view(b, h)
+        C = self.fold_chunk
+        if C and tab.shape[1] > C and tab.shape[1] % C == 0:
+            K = tab.shape[1] // C
+            nv, n = b * K, h * HEAD_DIM // 4
+            qv = torch.empty(nv, h, HEAD_DIM, dtype=query.dtype, device=self.device)
+            vlens = torch.empty(nv, dtype=torch.int32, device=self.device)
+            po_v = torch.empty(nv, h, HEAD_DIM, dtype=torch.bfloat16, device=self.device)
+            pl_v = torch.empty(nv, h, dtype=torch.float32, device=self.device)
+            _cp_chunk_q[(nv, triton.cdiv(n, 1024))](query.view(torch.int32), qv.view(torch.int32), lens, vlens, n,
+                                                    K=K, C=C, PG=PAGE, BLK=1024)
+            flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+                query=qv, kv_cache=(k_cache, v_cache), workspace_buffer=workspace, block_tables=tab.view(nv, C),
+                seq_lens=vlens, max_seq_len=C * PAGE, bmm1_scale=bmm1_scale, bmm2_scale=bmm2_scale, out=po_v,
+                lse=pl_v, q_len_per_req=1, multi_ctas_kv_counter_buffer=self.counter,
+            )
+            _cp_chunk_comb[(b, triton.cdiv(h, 16))](po_v, pl_v, vlens, out, lse, h, K=K, HB=16, D=HEAD_DIM)
+            return
         flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-            query=self.q_all[:rows].view(b, q_len * gh, HEAD_DIM),
+            query=query,
             kv_cache=(k_cache, v_cache),
             workspace_buffer=workspace,
             block_tables=tab,
@@ -985,8 +1047,8 @@ class CpLite:
             max_seq_len=max_kv,
             bmm1_scale=bmm1_scale,
             bmm2_scale=bmm2_scale,
-            out=self.po[:rows].view(b, q_len * gh, HEAD_DIM),
-            lse=self.plse[:rows].view(b, q_len * gh),
+            out=out,
+            lse=lse,
             q_len_per_req=1,
             multi_ctas_kv_counter_buffer=self.counter,
         )
