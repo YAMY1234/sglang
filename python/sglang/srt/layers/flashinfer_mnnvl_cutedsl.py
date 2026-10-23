@@ -422,11 +422,30 @@ class FlashInferMNNVLCuteDSLARFusion:
                 write_residual_output=True,
                 config=self.workspace_config,
             )
+            self._bt_tail = self._patch_bt_tail()
 
             # Publish only after the mailbox barrier; without it the ranks
             # would desynchronize their Lamport stages.
             torch.cuda.synchronize(self.device)
             dist.barrier(group=process_group)
+
+    def _patch_bt_tail(self):
+        """The PERF-LB BT MaterializeRMSNorm (plb_mnnvl_cutedsl), or None when off."""
+        lamport = envs.SGLANG_PLB_MAT_LAMPORT.get()
+        fp8_out = envs.SGLANG_PLB_AR_FP8_OUT.get()
+        if not (lamport or fp8_out):
+            return None
+        from sglang.srt.layers.plb_mnnvl_cutedsl import BTTailPatch
+
+        patch = BTTailPatch(self.workspace, lamport=lamport, fp8_out=fp8_out)
+        patch.install()
+        logger.info(
+            "MNNVL CuTe DSL (PERF-LB): BT tail lamport=%d, "
+            "E4M3 copy for the next projection=%s",
+            lamport,
+            bool(patch.fp8_tails),
+        )
+        return patch
 
     def supports(self, m: int) -> bool:
         if not 1 <= int(m) <= self.max_m:
@@ -473,6 +492,57 @@ class FlashInferMNNVLCuteDSLARFusion:
             shared_expert_output=gated_shared_output,
         )
         return norm_output, residual_output
+
+    def moe_finalize_all_reduce_rms_norm_fp8(
+        self,
+        *,
+        routed_output: torch.Tensor,
+        expert_weights: torch.Tensor,
+        permuted_indices: torch.Tensor,
+        gated_shared_output: torch.Tensor | None,
+        residual: torch.Tensor,
+        gamma: torch.Tensor,
+        input_scale: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """``moe_finalize_all_reduce_rms_norm`` plus the norm's static_quant_fp8 under
+        ``input_scale`` (SGLANG_PLB_AR_FP8_OUT); the E4M3 rows are None off the BT route."""
+        m = int(permuted_indices.shape[0])
+        if not (
+            self._bt_tail is not None
+            and self.supports(m)
+            and self._bt_tail.takes_fp8(m)
+        ):
+            return (
+                *self.moe_finalize_all_reduce_rms_norm(
+                    routed_output=routed_output,
+                    expert_weights=expert_weights,
+                    permuted_indices=permuted_indices,
+                    gated_shared_output=gated_shared_output,
+                    residual=residual,
+                    gamma=gamma,
+                ),
+                None,
+            )
+        from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
+
+        shape = (m, self.hidden_size)
+        norm_output = torch.empty(shape, dtype=torch.bfloat16, device=self.device)
+        residual_output = torch.empty(shape, dtype=torch.bfloat16, device=self.device)
+        fp8_output = torch.empty(shape, dtype=fp8_dtype, device=self.device)
+        self._bt_tail.finalize_fp8(
+            routed_output=routed_output,
+            expert_weights=expert_weights,
+            permuted_indices=permuted_indices,
+            shared_output=gated_shared_output,
+            residual_source=residual,
+            gamma=gamma,
+            norm_output=norm_output,
+            residual_output=residual_output,
+            fp8_output=fp8_output,
+            input_scale=input_scale,
+            m=m,
+        )
+        return norm_output, residual_output, fp8_output
 
     def all_reduce_residual_rms_norm(
         self,

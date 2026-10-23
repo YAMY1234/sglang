@@ -124,6 +124,25 @@ class MoeDeferredFinalize(DeferredFinalize, frozen=True):
         )
 
 
+def _static_fp8_bmm_input_scale(linear: torch.nn.Module) -> Optional[torch.Tensor]:
+    """The input scale of a ModelOpt static FP8 linear on FlashInfer's BMM (which
+    quantizes with static_quant_fp8, no repeated scale), else None."""
+    from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8LinearMethod
+
+    method = linear.quant_method
+    if not (
+        isinstance(method, ModelOptFp8LinearMethod)
+        and not method.use_marlin
+        and not method.use_sm120_fp8
+        and linear.use_flashinfer_bmm
+    ):
+        return None
+    scale = linear.input_scale
+    if scale.numel() != 1 or scale.dtype != torch.float32:
+        return None
+    return scale
+
+
 class CuteDSLWorkspace:
     def __init__(
         self,
@@ -132,6 +151,7 @@ class CuteDSLWorkspace:
         top_k: int,
         rms_epsilon: float,
         include_shared_expert: bool = True,
+        fp8_inputs: Sequence[tuple[torch.nn.Module, torch.nn.Module]] = (),
     ) -> None:
         self.include_shared_expert = include_shared_expert
         self.hidden_size = int(hidden_size)
@@ -139,6 +159,10 @@ class CuteDSLWorkspace:
         self.rms_epsilon = float(rms_epsilon)
         self.max_m: int | None = None
         self._workspace = None
+        # (input norm, the projection reading it) a layer, for SGLANG_PLB_AR_FP8_OUT;
+        # keyed by the norm's fused gamma at first use, once weights are loaded.
+        self._fp8_inputs = tuple(fp8_inputs)
+        self._fp8_input_by_gamma: dict[int, torch.nn.Module] | None = None
 
     def prepare(self, *, max_m: int) -> None:
         if self._workspace is not None:
@@ -169,6 +193,19 @@ class CuteDSLWorkspace:
         """False before prepare(), so it doubles as the readiness check."""
         return self._workspace is not None and self._workspace.supports(m)
 
+    def _fp8_input_scale(self, gamma: torch.Tensor) -> Optional[torch.Tensor]:
+        """The static input scale of the FP8 projection reading the norm with ``gamma``."""
+        if not self._fp8_inputs or torch.compiler.is_compiling():
+            return None
+        if self._fp8_input_by_gamma is None:
+            self._fp8_input_by_gamma = {
+                _fused_norm_gamma(norm).data_ptr(): linear
+                for norm, linear in self._fp8_inputs
+                if _fused_norm_gamma(norm) is not None
+            }
+        linear = self._fp8_input_by_gamma.get(gamma.data_ptr())
+        return None if linear is None else _static_fp8_bmm_input_scale(linear)
+
     def finalize(
         self,
         handoff: MoeDeferredFinalize,
@@ -176,6 +213,26 @@ class CuteDSLWorkspace:
         gamma: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert self._workspace is not None
+        input_scale = self._fp8_input_scale(gamma)
+        if input_scale is not None:
+            from sglang.kernels.ops.quantization.fp8_kernel import (
+                hand_over_static_quant_fp8,
+            )
+
+            norm, residual_out, norm_fp8 = (
+                self._workspace.moe_finalize_all_reduce_rms_norm_fp8(
+                    routed_output=handoff.routed_output,
+                    expert_weights=handoff.expert_weights,
+                    permuted_indices=handoff.permuted_indices,
+                    gated_shared_output=handoff.gated_shared_output,
+                    residual=residual,
+                    gamma=gamma,
+                    input_scale=input_scale,
+                )
+            )
+            if norm_fp8 is not None:
+                hand_over_static_quant_fp8(norm, input_scale, norm_fp8)
+            return norm, residual_out
         return self._workspace.moe_finalize_all_reduce_rms_norm(
             routed_output=handoff.routed_output,
             expert_weights=handoff.expert_weights,
@@ -373,13 +430,15 @@ def install_cutedsl_fusion(
     label: str,
     terminal_finalize: bool = False,
     include_shared_expert: bool = True,
+    fp8_input_linear: Optional[Callable[[torch.nn.Module], torch.nn.Module]] = None,
 ) -> CuteDSLWorkspace | None:
     """One shared workspace handle per fusion-enabled layer, or None.
 
     Every entry of ``layers`` carries ``attn_boundary`` and ``ffn_boundary``.
     terminal_finalize lets the last layer hand its finalize to the final norm;
     the model must then pass the returned service as
-    residual_batch.final_norm(finalize_norm=...).
+    residual_batch.final_norm(finalize_norm=...). fp8_input_linear(layer) is the
+    projection reading the layer's input norm (SGLANG_PLB_AR_FP8_OUT).
     """
     if get_flags().moe.in_speculative_scope:
         # A draft shares the target's process, which holds one workspace.
@@ -409,6 +468,14 @@ def install_cutedsl_fusion(
         top_k=top_k,
         rms_epsilon=rms_epsilon,
         include_shared_expert=include_shared_expert,
+        fp8_inputs=(
+            [
+                (layer.attn_boundary.norm, fp8_input_linear(layer))
+                for layer in fusion_layers
+            ]
+            if fp8_input_linear is not None and envs.SGLANG_PLB_AR_FP8_OUT.get()
+            else ()
+        ),
     )
     hands_off = 0
     for layer in layers:
