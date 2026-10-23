@@ -5,8 +5,9 @@ queue depths, and two forward-stream CUDA events around run_batch (GPU gap
 before the batch, span, period). Per-thread CPU time every 10 s. One CSV per
 selected TP rank under <dir>; tools/l16_loop.py joins them offline.
 
-SGLANG_TRTL16_AB_WIN / _AB_POLL ("base,treat") / _AB_COARSE (baseline bucket
-list) alternate knobs per window of forward_ct, identical on every TP rank, so
+SGLANG_TRTL16_AB_WIN / _AB_POLL ("base,treat") / _AB_COARSE and _AB_TREAT_BS
+(bucket subsets padded to in baseline / treatment windows; unset = every captured
+bucket) alternate knobs per window of forward_ct, identical on every TP rank, so
 all ranks switch together; the row's knob bits mark the treatment.
 """
 
@@ -77,8 +78,11 @@ class LoopStat:
         self.win = int(os.environ.get("SGLANG_TRTL16_AB_WIN", "0") or 0)
         poll = os.environ.get("SGLANG_TRTL16_AB_POLL", "")
         self.ab_poll = [int(x) for x in poll.split(",")] if poll else None
-        coarse = os.environ.get("SGLANG_TRTL16_AB_COARSE", "")
-        self.ab_coarse = sorted(int(x) for x in coarse.split(",")) if coarse else None
+        base = os.environ.get("SGLANG_TRTL16_AB_COARSE", "")
+        treat = os.environ.get("SGLANG_TRTL16_AB_TREAT_BS", "")
+        self.ab_base_bs = sorted(int(x) for x in base.split(",")) if base else None
+        self.ab_treat_bs = sorted(int(x) for x in treat.split(",")) if treat else None
+        self.ab_graph = self.ab_base_bs is not None or self.ab_treat_bs is not None
         self.knob = 0
 
     # ---- host stage marks -------------------------------------------------
@@ -108,11 +112,11 @@ class LoopStat:
             self.sched.polling_interval = self.ab_poll[b]
             if not hasattr(self.sched, "polling_count"):
                 self.sched.polling_count = 0
-        if self.ab_coarse is not None:
+        if self.ab_graph:
             b = (w >> 1) & 1 if self.ab_poll is not None else w & 1
             k |= b << 1
-            # Bit set = treatment (all captured buckets); clear = the coarse baseline list.
-            COARSE_ACTIVE = None if b else self.ab_coarse
+            # Bucket subset to pad to (None = every captured bucket): treatment when the bit is set.
+            COARSE_ACTIVE = self.ab_treat_bs if b else self.ab_base_bs
         self.knob = k
 
     # ---- GPU events -----------------------------------------------------------
