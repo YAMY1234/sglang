@@ -200,6 +200,7 @@ def _gdn_core_target_verify(
     cache_indices: torch.Tensor,
     replay_indices: torch.Tensor,
     draft_token_num: int,
+    conv: Optional[dict] = None,
 ) -> Optional[torch.Tensor]:
     """SGLANG_PERFHT_GDN_CORE: out_proj's FP8 input from the circular ReplaySSM verify and the gated norm in one
     launch at the attention-DP shape; None keeps the Triton verify and the norm."""
@@ -245,6 +246,7 @@ def _gdn_core_target_verify(
         out=out,
         rows_per_request=draft_token_num,
         num_k_heads=layer.num_k_heads,
+        **(conv or {}),
     ):
         return None
     print_info_once(
@@ -1583,6 +1585,43 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     intermediate_state_indices[:batch_size],
                 )
             else:
+                gdn_core = kwargs.get("gdn_core")
+                core_ok = (
+                    gdn_core is not None
+                    and use_replayssm_spec
+                    and not use_replayssm_fold
+                    and retrieve_parent_token is None
+                    and verify_pdl is None
+                    and not wait_for_gate_producer
+                )
+                if (
+                    core_ok
+                    and envs.SGLANG_PST_GDN_CONV_CORE.get()
+                    and layer.bias is None
+                    and layer.activation in ("silu", "swish")
+                ):
+                    # SGLANG_PST_GDN_CONV_CORE: the core convolves the raw rows itself
+                    fp8 = _gdn_core_target_verify(
+                        layer=layer,
+                        mixed_qkv=mixed_qkv,
+                        a=a,
+                        b=b,
+                        gdn_core=gdn_core,
+                        mamba_pool=mamba_pool,
+                        layer_cache=mamba_cache_params,
+                        cache_indices=cache_indices,
+                        replay_indices=forward_batch.req_pool_indices,
+                        draft_token_num=draft_token_num,
+                        conv=dict(
+                            conv_weight=layer.conv_weights,
+                            conv_state=conv_states,
+                            conv_windows=intermediate_conv_window_cache,
+                            inter_indices=intermediate_state_indices[:batch_size],
+                        ),
+                    )
+                    if fp8 is not None:
+                        print_info_once("SGLANG_PST_GDN_CONV_CORE engaged: the GDN core runs the conv update")
+                        return fp8
                 mixed_qkv_reshaped = mixed_qkv.view(
                     batch_size, draft_token_num, -1
                 ).transpose(1, 2)
@@ -1619,15 +1658,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     block_n=conv_block_n,
                 )
                 mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
-                gdn_core = kwargs.get("gdn_core")
-                if (
-                    gdn_core is not None
-                    and use_replayssm_spec
-                    and not use_replayssm_fold
-                    and retrieve_parent_token is None
-                    and verify_pdl is None
-                    and not wait_for_gate_producer
-                ):
+                if core_ok:
                     fp8 = _gdn_core_target_verify(
                         layer=layer,
                         mixed_qkv=mixed_qkv,

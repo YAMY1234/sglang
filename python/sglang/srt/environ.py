@@ -1728,6 +1728,9 @@ class Envs:
     # PERF-HT: the attention-DP GDN target verify (16 / 64 heads, 7 rows a request, ring 16, BF16 checkpoint) with its
     # gated RMSNorm and out_proj's static FP8 quant as one CUDA launch (gdn_core_cuda); needs SGLANG_Q35MF_GDN_NORM_FP8.
     SGLANG_PERFHT_GDN_CORE = EnvBool(False)
+    # PERF-ST: with SGLANG_PERFHT_GDN_CORE the core also runs the step's causal conv update on the raw in_proj rows
+    # (bit for bit causal_conv1d_update's output and windows); the separate conv launch goes away.
+    SGLANG_PST_GDN_CONV_CORE = EnvBool(False)
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)

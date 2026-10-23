@@ -42,6 +42,10 @@ typedef unsigned int u32;
 #define RING 16
 #define MT (VD / (16 * NW))
 #define FULL 0xffffffffu
+#ifndef CONV
+#define CONV 0
+#endif
+#define CCH (2 * KD + VD)  // CONV: the CTA's channels: its key head's q, k, then its value head's v
 
 struct alignas(16) U4 { u32 x, y, z, w; };
 
@@ -83,6 +87,18 @@ struct Params {
   u8* y;                 // FP8 out_proj input [rows, HV * V]
   long long y_stride;
   u16* o_out;            // [rows, HV, V] replay output (STORE_O, checks only)
+  const u16* conv_w;     // CONV: [channels, 4] weights
+  long long cw_ch;
+  long long cw_tap;
+  const u16* conv_state; // CONV: [slots, channels, 3] by state index (read only)
+  long long cs_slot;
+  long long cs_ch;
+  long long cs_tap;
+  u16* conv_win;         // CONV: deduplicated windows [window slots, channels, >= TT + 2]
+  long long win_slot;
+  long long win_ch;
+  const void* inter_indices;  // CONV: window slot of each request
+  int inter_index64;
 };
 
 __device__ __forceinline__ float bflo(u32 x) { return __int_as_float(x << 16); }
@@ -155,6 +171,58 @@ __device__ __forceinline__ float load_param(const void* p, int i, bool bf16) {
   return bf16 ? bf2f(reinterpret_cast<const u16*>(p)[i]) : reinterpret_cast<const float*>(p)[i];
 }
 
+#if CONV
+#define CPT ((CCH + NW * 32 - 1) / (NW * 32))  // channels a thread
+// global channel of the CTA's local channel lch: q | k of key head hk, then v of value head hv
+__device__ __forceinline__ long long conv_channel(int lch, int hk, int hv) {
+  return lch < KD ? (long long)hk * KD + lch
+                  : lch < 2 * KD ? (long long)HK * KD + hk * KD + (lch - KD)
+                                 : (long long)2 * HK * KD + (long long)hv * VD + (lch - 2 * KD);
+}
+// The causal conv update of this thread's channels, as causal_conv1d_update computes it: acc = 0; acc += bf16(seq[t + i]
+// w_i) for i < 4 over seq = (old state, raw rows); out = bf16(acc / (1 + tl.exp(-acc))); with s_x, the outputs into
+// s_x[t][lch]; the deduplicated window row (state 1, state 2, raw rows) of the channels this CTA owns.
+__device__ __forceinline__ void conv_stage(const Params& p, long long row0, int hk, int hv, int tid, long long wslot,
+                                           const u16 (&cw)[CPT][4], const u16 (&cs)[CPT][3], u16 (*s_x)[CCH + 8]) {
+  constexpr int GRP = HV / HK;
+#pragma unroll
+  for (int i = 0; i < CPT; ++i) {
+    const int lch = tid + i * NW * 32;
+    if (lch >= CCH) break;
+    const long long gch = conv_channel(lch, hk, hv);
+    u16 xs[TT];
+#pragma unroll
+    for (int t = 0; t < TT; ++t) xs[t] = p.x[(row0 + t) * p.x_stride + gch];
+    if (s_x) {
+      float seq[TT + 3];
+      seq[0] = bf2f(cs[i][0]);
+      seq[1] = bf2f(cs[i][1]);
+      seq[2] = bf2f(cs[i][2]);
+#pragma unroll
+      for (int t = 0; t < TT; ++t) seq[t + 3] = bf2f(xs[t]);
+      const float w0 = bf2f(cw[i][0]), w1 = bf2f(cw[i][1]), w2 = bf2f(cw[i][2]), w3 = bf2f(cw[i][3]);
+#pragma unroll
+      for (int t = 0; t < TT; ++t) {
+        float acc = 0.f;
+        acc += bfround(seq[t] * w0);
+        acc += bfround(seq[t + 1] * w1);
+        acc += bfround(seq[t + 2] * w2);
+        acc += bfround(seq[t + 3] * w3);
+        acc = div_full(acc, 1.f + tl_exp(-acc));
+        s_x[t][lch] = f2bf(acc);
+      }
+    }
+    if (lch >= 2 * KD || hv % GRP == 0) {
+      u16* wr = p.conv_win + wslot * p.win_slot + gch * p.win_ch;
+      wr[0] = cs[i][1];
+      wr[1] = cs[i][2];
+#pragma unroll
+      for (int t = 0; t < TT; ++t) wr[2 + t] = xs[t];
+    }
+  }
+}
+#endif
+
 // MINB 3: three CTAs an SM (168 registers, no spill), for grids past two waves of two an SM
 extern "C" __global__ void __launch_bounds__(NW * 32, MINB) gdn_core(const Params p) {
   constexpr int GRP = HV / HK;
@@ -183,6 +251,26 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) gdn_core(const Param
   // ---------------- before the wait: earlier-step and static data ----------------
   const long long slot = load_index(p.state_indices, n, p.state_index64 != 0);
   bool live = slot >= 0;
+#if CONV
+  // the conv weights and the old conv state of this thread's channels (earlier-step / static data)
+  u16 cw[CPT][4], cs[CPT][3];
+  long long wslot = 0;
+  if (live) {
+    wslot = load_index(p.inter_indices, n, p.inter_index64 != 0);
+#pragma unroll
+    for (int i = 0; i < CPT; ++i) {
+      const int lch = tid + i * NW * 32;
+      if (lch < CCH) {
+        const long long gch = conv_channel(lch, hk, hv);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) cw[i][j] = p.conv_w[gch * p.cw_ch + j * p.cw_tap];
+#pragma unroll
+        for (int j = 0; j < 3; ++j) cs[i][j] = p.conv_state[slot * p.cs_slot + gch * p.cs_ch + j * p.cs_tap];
+      }
+    }
+  }
+  __shared__ __align__(16) u16 s_x[TT][CCH + 8];  // the step's convolved q | k | v rows of this CTA
+#endif
   // the checkpoint rows first: they depend on the state index only
   const u16* sp = p.state + (live ? slot : 0) * p.state_slot + (long long)hv * VD * KD;
   U4 H[MT][2][4];  // checkpoint rows v = vb + 16 m + 8 h + r: [m-tile][half][chunk]
@@ -204,6 +292,9 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) gdn_core(const Param
   if (!live) {
     // padding (or a flush row, which the verify never sees): zeros for out_proj
     pdl_wait();
+#if CONV
+    if (slot >= 0) conv_stage(p, row0, hk, hv, tid, wslot, cw, cs, nullptr);
+#endif
     for (int t = 0; t < TT && tid < VD; ++t) {
       p.y[(row0 + t) * p.y_stride + hv * VD + tid] = 0;
 #if STORE_O
@@ -232,9 +323,39 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) gdn_core(const Param
   // ---------------- the wait: the step's activations from here on ----------------
   pdl_wait();
 
-  const u16* xr = p.x + (row0 + (r < TT ? r : 0)) * p.x_stride;
   const bool rowok = r < TT;
   const bool ok0 = t0 < TT, ok1 = t1 < TT;
+#if CONV
+  // z first, then the conv of this CTA's channels into s_x
+  u16 zr[MT][4];
+#pragma unroll
+  for (int m = 0; m < MT; ++m)
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const u16* zv = p.z + hv * VD + vb + 16 * m + 8 * h + r;
+      zr[m][2 * h] = ok0 ? zv[(row0 + t0) * p.z_stride] : (u16)0;
+      zr[m][2 * h + 1] = ok1 ? zv[(row0 + t1) * p.z_stride] : (u16)0;
+    }
+  conv_stage(p, row0, hk, hv, tid, wslot, cw, cs, s_x);
+  __syncthreads();
+  U4 QN[4], KR[4];  // normalized q (BF16) and convolved k rows; rows r >= TT zero
+  U4 QR[4];
+#pragma unroll
+  for (int c = 0; c < 4; ++c) {
+    QR[c] = rowok ? ld16(&s_x[r][32 * c + 8 * q]) : zero4();
+    KR[c] = rowok ? ld16(&s_x[r][KD + 32 * c + 8 * q]) : zero4();
+  }
+  u16 vr[MT][4];
+#pragma unroll
+  for (int m = 0; m < MT; ++m)
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const int v = 2 * KD + vb + 16 * m + 8 * h + r;
+      vr[m][2 * h] = ok0 ? s_x[t0][v] : (u16)0;
+      vr[m][2 * h + 1] = ok1 ? s_x[t1][v] : (u16)0;
+    }
+#else
+  const u16* xr = p.x + (row0 + (r < TT ? r : 0)) * p.x_stride;
   // every activation load is issued here, right after the wait
   U4 QN[4], KR[4];  // normalized q (BF16) and raw k rows; rows r >= TT zero
   U4 QR[4];
@@ -257,6 +378,7 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) gdn_core(const Param
       zr[m][2 * h] = ok0 ? zv[(row0 + t0) * p.z_stride] : (u16)0;
       zr[m][2 * h + 1] = ok1 ? zv[(row0 + t1) * p.z_stride] : (u16)0;
     }
+#endif
   u16 ar = 0, br_ = 0;
   if (lane < TT) {
     ar = p.a[(row0 + lane) * p.ab_stride + hv];
@@ -636,6 +758,11 @@ class _Params(ctypes.Structure):
         ("eps", ctypes.c_float), ("qscale", ctypes.c_float),
         ("y", ctypes.c_void_p), ("y_stride", ctypes.c_int64),
         ("o_out", ctypes.c_void_p),
+        ("conv_w", ctypes.c_void_p), ("cw_ch", ctypes.c_int64), ("cw_tap", ctypes.c_int64),
+        ("conv_state", ctypes.c_void_p), ("cs_slot", ctypes.c_int64), ("cs_ch", ctypes.c_int64),
+        ("cs_tap", ctypes.c_int64),
+        ("conv_win", ctypes.c_void_p), ("win_slot", ctypes.c_int64), ("win_ch", ctypes.c_int64),
+        ("inter_indices", ctypes.c_void_p), ("inter_index64", ctypes.c_int),
     ]
 
 
@@ -656,10 +783,10 @@ def _compile(key: tuple) -> tuple:
     from cuda.bindings import driver as cu
     from cuda.bindings import nvrtc
 
-    device, rows, hk, hv, norm_f32, trigger, store_o, warps, min_blocks = key
+    device, rows, hk, hv, norm_f32, trigger, store_o, warps, conv, min_blocks = key
     defines = dict(
         TT=rows, HK=hk, HV=hv, NORM_F32=int(norm_f32), TRIGGER=trigger, STORE_O=int(store_o), NW=warps,
-        MINB=min_blocks,
+        MINB=min_blocks, CONV=int(conv),
     )
     src = "".join(f"#define {k} {v}\n" for k, v in defines.items()) + _SRC
     prog = _check(nvrtc.nvrtcCreateProgram(src.encode(), b"gdn_core.cu", 0, [], []), "create")
@@ -692,11 +819,12 @@ def _min_blocks(device: int, ctas: int) -> int:
 
 
 def _key(
-    *, qkv, checkpoint, norm_weight, rows_per_request, num_k_heads, min_blocks, o_out=None, warps=_WARPS, **_
+    *, qkv, checkpoint, norm_weight, rows_per_request, num_k_heads, min_blocks, o_out=None, warps=_WARPS,
+    conv_weight=None, **_
 ) -> tuple:
     return (
         qkv.device.index, rows_per_request, num_k_heads, checkpoint.shape[1],
-        norm_weight.dtype == torch.float32, 0, o_out is not None, warps, min_blocks,
+        norm_weight.dtype == torch.float32, 0, o_out is not None, warps, conv_weight is not None, min_blocks,
     )
 
 
@@ -790,6 +918,28 @@ def _unsupported(
         return "norm weight"
     if not norm_weight.is_contiguous() or input_scale.dtype != torch.float32 or input_scale.numel() != 1:
         return "norm weight / FP8 scale"
+    conv_weight = _.get("conv_weight")
+    if conv_weight is not None:
+        cs, win, inter = _.get("conv_state"), _.get("conv_windows"), _.get("inter_indices")
+        C = (2 * H + HV) * K
+        st = win.stride() if win is not None else ()
+        if (
+            conv_weight.dtype != torch.bfloat16
+            or conv_weight.dim() != 2
+            or conv_weight.shape[1] != 4
+            or conv_weight.shape[0] < C
+            or cs is None
+            or cs.dtype != torch.bfloat16
+            or tuple(cs.shape[1:]) != (conv_weight.shape[0], 3)
+            or win is None
+            or win.dtype != torch.bfloat16
+            or win.dim() != 4
+            or not (st[1] == 1 and st[3] == 1 and st[2] >= T + 2)
+            or inter is None
+            or inter.dtype not in (torch.int32, torch.int64)
+            or inter.numel() < rows // T
+        ):
+            return "conv operands (width-4 BF16 conv, deduplicated windows)"
     return None
 
 
@@ -800,7 +950,7 @@ def try_core(**kw) -> bool:
         _log_once(("shape", reason), f"SGLANG_PERFHT_GDN_CORE: unsupported {reason}, Triton verify + gated norm")
         return False
     family = _key(**{**kw, "min_blocks": 0})
-    keys = [family[:-1] + (mb,) for mb in (1, 3)]
+    keys = [family[:-1] + (mb,) for mb in (1, 3)]  # conv flag stays in the family
     if any(k not in _KERNELS for k in keys):
         if torch.cuda.is_current_stream_capturing():
             _log_once("capture", "SGLANG_PERFHT_GDN_CORE: not compiled before graph capture, Triton verify + norm")
@@ -854,6 +1004,10 @@ def core(
     o_out: Optional[torch.Tensor] = None,
     warps: int = _WARPS,
     min_blocks: Optional[int] = None,
+    conv_weight: Optional[torch.Tensor] = None,
+    conv_state: Optional[torch.Tensor] = None,
+    conv_windows: Optional[torch.Tensor] = None,
+    inter_indices: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Write the gated RMSNorm of the verify output as static FP8 into ``out`` [rows, HV * V].
 
@@ -874,8 +1028,9 @@ def core(
         min_blocks = _min_blocks(device, n * HV)
     key = _key(
         qkv=qkv, checkpoint=checkpoint, norm_weight=norm_weight, rows_per_request=T, num_k_heads=num_k_heads,
-        min_blocks=min_blocks, o_out=o_out, warps=warps,
+        min_blocks=min_blocks, o_out=o_out, warps=warps, conv_weight=conv_weight,
     )
+    conv = conv_weight is not None
     if key not in _KERNELS:
         _ensure(key)
     p = _Params(
@@ -897,6 +1052,11 @@ def core(
         float(eps), K**-0.5,
         out.data_ptr(), out.stride(0),
         _ptr(o_out),
+        _ptr(conv_weight), conv_weight.stride(0) if conv else 0, conv_weight.stride(1) if conv else 0,
+        _ptr(conv_state), conv_state.stride(0) if conv else 0, conv_state.stride(1) if conv else 0,
+        conv_state.stride(2) if conv else 0,
+        _ptr(conv_windows), conv_windows.stride(0) if conv else 0, conv_windows.stride(2) if conv else 0,
+        _ptr(inter_indices), int(conv and inter_indices.dtype == torch.int64),
     )
     cfg = cu.CUlaunchConfig()
     cfg.gridDimX, cfg.gridDimY, cfg.gridDimZ = n * HV, 1, 1
