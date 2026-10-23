@@ -466,7 +466,9 @@ class ModelRunner:
         if envs.SGLANG_PLB_FAKE_SCATTER.get():
             from sglang.srt.disaggregation.common.staging_buffer import start_fake_scatter
 
-            start_fake_scatter(self.device, self.gpu_id, get_parallel().tp_rank)
+            start_fake_scatter(
+                self.device, self.gpu_id, get_parallel().tp_rank, self.forward_stream
+            )
 
         # Read-done mailbox: the scheduler's WAR barrier reads it from the runner
         # its worker names, and treats None as the coarse whole-forward fence.
