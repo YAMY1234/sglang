@@ -12,6 +12,9 @@ the same four products (key high / low x update high / low): ``m16n8k8`` when th
 Compiled with NVRTC (both track variants) on the first eager call; a call under CUDA-graph capture before that
 returns False from ``try_commit`` and the Triton kernel runs instead. The finish kernel (cursor advance) stays
 SGLang's: inside a CUDA graph it costs no measurable time.
+
+``try_track`` runs the track rows alone (SGLANG_PLB_GDN_FOLD_IN_VERIFY, where the verify folds every full ring):
+one CTA per (request, value head) that leaves at once unless its request tracks, then snapshots every layer in turn.
 """
 
 from __future__ import annotations
@@ -292,6 +295,95 @@ extern "C" __global__ void __launch_bounds__(NW * 32) gdn_replayssm_commit(const
 """
 
 
+_TRACK_SRC = r"""
+__device__ __forceinline__ void mbar_wait(u64* bar, u32 parity) {
+  u32 ready = 0;
+  do {
+    asm volatile("{ .reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2; selp.u32 %0, 1, 0, p; }"
+                 : "=r"(ready) : "r"(smem_u32(bar)), "r"(parity) : "memory");
+  } while (!ready);
+}
+
+// gdn_replayssm_commit's track snapshots without its fold: grid (request, value head), layers in turn
+extern "C" __global__ void __launch_bounds__(NW * 32) gdn_replayssm_track(const Params p, const int layers) {
+  extern __shared__ __align__(128) unsigned char smem_raw[];
+  __shared__ u64 bar;
+  constexpr int GRP = HV / HK;
+  const int hv = blockIdx.x % HV;
+  const int n = blockIdx.x / HV;
+  const int hk = hv / GRP;
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, r = lane >> 2, q = lane & 3;
+  const int vb = warp * 32;
+
+  const long long slot = ld_idx(p.sidx, n, p.sidx64);
+  const long long tslot = ld_idx(p.tidx, n, p.tidx64);
+  const long long ts = ld_idx(p.tstep, n, p.tstep64);
+  if (slot <= p.null_block || tslot <= p.null_block || ts < 0) return;
+  const long long rid = ld_idx(p.ridx, n, p.ridx64);
+  const int n_hist = p.write_pos[rid];
+  const int base = p.cache_base[rid];
+  const int track_len = n_hist - (int)ld_idx(p.acc, n, p.acc64) + (int)ts + 1;
+  const bool resid = p.dr != nullptr && p.kr != nullptr;
+  const bool k16 = track_len > 8;
+  u16* sm = reinterpret_cast<u16*>(smem_raw);
+  if (tid == 0) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(smem_u32(&bar)) : "memory");
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  }
+  __syncthreads();
+  const int jj[4] = {2 * q, 2 * q + 1, 2 * q + 8, 2 * q + 9};
+  int ph[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) ph[i] = (base + jj[i]) & (RING - 1);
+  for (int layer = 0; layer < layers; ++layer) {
+    if (tid == 0) {
+      // the previous layer's reads of the stage (ordered by the barrier below) before these copies
+      asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+      const u32 bytes = 2 * (VD * KD + (resid ? 4 : 2) * RING * KD);
+      asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(smem_u32(&bar)), "r"(bytes)
+                   : "memory");
+      bulk_g2s(sm + SH_STATE, p.h0 + layer * p.h0_layer + slot * p.h0_slot + (long long)hv * VD * KD, 2 * VD * KD,
+               &bar);
+      bulk_g2s(sm + SH_K, p.k + layer * p.k_layer + rid * p.k_slot + (long long)hk * RING * KD, 2 * RING * KD, &bar);
+      bulk_g2s(sm + SH_D, p.d + layer * p.d_layer + rid * p.d_slot + (long long)hv * RING * VD, 2 * RING * VD, &bar);
+      if (resid) {
+        bulk_g2s(sm + SH_KR, p.kr + layer * p.kr_layer + rid * p.kr_slot + (long long)hk * RING * KD,
+                 2 * RING * KD, &bar);
+        bulk_g2s(sm + SH_DR, p.dr + layer * p.dr_layer + rid * p.dr_slot + (long long)hv * RING * VD,
+                 2 * RING * VD, &bar);
+      }
+    }
+    const float gt =
+        lane < RING ? p.g[layer * p.g_layer + rid * p.g_slot + hv * RING + ((base + lane) & (RING - 1))] : 0.f;
+    mbar_wait(&bar, (u32)(layer & 1));
+    float u[2][2][4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+      for (int m = 0; m < 2; ++m)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+          const int v = vb + 16 * m + 8 * h + r;
+          float x = 0.f;
+          if (i < 2 || k16) {
+            x = bf2f(sm[SH_D + ph[i] * VD + v]);
+            if (resid) x += bf2f(sm[SH_DR + ph[i] * VD + v]);
+          }
+          u[m][h][i] = x;
+        }
+    float dec[4];
+    const float etot = window(gt, track_len, lane, jj, dec);
+    u32 AH[2][4], AL[2][4];
+    a_frags(u, dec, AH, AL);
+    u16* dst = p.h0 + layer * p.h0_layer + tslot * p.h0_slot + (long long)hv * VD * KD;
+    if (k16) fold_store<true>(sm, ph, AH, AL, etot, resid, dst, vb, r, q);
+    else fold_store<false>(sm, ph, AH, AL, etot, resid, dst, vb, r, q);
+    __syncthreads();
+  }
+}
+"""
+
+
 class _Params(ctypes.Structure):
     _fields_ = [
         ("h0", ctypes.c_void_p), ("h0_layer", ctypes.c_int64), ("h0_slot", ctypes.c_int64),
@@ -323,12 +415,20 @@ def _check(res, what):
     return res[1] if len(res) == 2 else res[1:]
 
 
-def _compile(device: int, hk: int, hv: int, ring: int, has_track: bool):
+def _compile(
+    device: int,
+    hk: int,
+    hv: int,
+    ring: int,
+    has_track: bool,
+    body: str = _SRC,
+    symbol: str = "gdn_replayssm_commit",
+):
     from cuda.bindings import driver as cu
     from cuda.bindings import nvrtc
 
     defines = dict(HK=hk, HV=hv, RING=ring, HAS_TRACK=int(has_track))
-    src = "".join(f"#define {k} {v}\n" for k, v in defines.items()) + _SRC
+    src = "".join(f"#define {k} {v}\n" for k, v in defines.items()) + body
     prog = _check(nvrtc.nvrtcCreateProgram(src.encode(), b"gdn_replayssm_commit.cu", 0, [], []), "create")
     major, minor = torch.cuda.get_device_capability(device)
     opts = [f"--gpu-architecture=sm_{major}{minor}".encode(), b"-std=c++17", b"-default-device"]
@@ -341,7 +441,7 @@ def _compile(device: int, hk: int, hv: int, ring: int, has_track: bool):
     _check(nvrtc.nvrtcGetCUBIN(prog, cubin), "cubin")
     nvrtc.nvrtcDestroyProgram(prog)
     module = _check(cu.cuModuleLoadData(cubin), "module")
-    fn = _check(cu.cuModuleGetFunction(module, b"gdn_replayssm_commit"), "function")
+    fn = _check(cu.cuModuleGetFunction(module, symbol.encode()), "function")
     _check(
         cu.cuFuncSetAttribute(
             fn, cu.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, _smem_bytes(ring)
@@ -364,6 +464,19 @@ def _kernel(device: int, hk: int, hv: int, ring: int, has_track: bool):
             fn = _KERNELS.get(key)
             if fn is None:
                 fn = _KERNELS[key] = _compile(device, hk, hv, ring, has_track)[1]
+    return fn
+
+
+def _track_kernel(device: int, hk: int, hv: int, ring: int):
+    key = (device, hk, hv, ring, "track")
+    fn = _KERNELS.get(key)
+    if fn is None:
+        with _LOCK:
+            fn = _KERNELS.get(key)
+            if fn is None:
+                fn = _KERNELS[key] = _compile(
+                    device, hk, hv, ring, True, _SRC + _TRACK_SRC, "gdn_replayssm_track"
+                )[1]
     return fn
 
 
@@ -405,6 +518,25 @@ def try_commit(**kw) -> bool:
     return True
 
 
+def try_track(**kw) -> bool:
+    """``track(**kw)`` when the shapes fit and the kernel is compiled or compilable now; else False."""
+    st, d, k = kw["checkpoint_state"], kw["d_cache"], kw["k_cache"]
+    if not supported(st, d, k):
+        _log_once("track-shape", "SGLANG_PLB_GDN_FOLD_IN_VERIFY: unsupported ring / checkpoint shapes, Triton track")
+        return False
+    device, hk, hv, ring = st.device.index, k.shape[2], st.shape[2], d.shape[-2]
+    if kw["state_batch_indices"].shape[0] == 0:
+        return False
+    if (device, hk, hv, ring, "track") not in _KERNELS:
+        if torch.cuda.is_current_stream_capturing():
+            _log_once("track-capture", "SGLANG_PLB_GDN_FOLD_IN_VERIFY: track kernel not compiled before graph capture, Triton track")
+            return False
+        _track_kernel(device, hk, hv, ring)
+    track(**kw)
+    _log_once("track-on", "SGLANG_PLB_GDN_FOLD_IN_VERIFY: CUDA track snapshots run")
+    return True
+
+
 def _log_once(key, msg: str) -> None:
     if key not in _LOGGED:
         _LOGGED.add(key)
@@ -413,6 +545,62 @@ def _log_once(key, msg: str) -> None:
 
 def _strides(t: Optional[torch.Tensor]):
     return (0, 0) if t is None else (t.stride(0), t.stride(1))
+
+
+def _params(
+    *,
+    checkpoint_state: torch.Tensor,
+    d_cache: torch.Tensor,
+    k_cache: torch.Tensor,
+    g_cache: torch.Tensor,
+    d_residual_cache: Optional[torch.Tensor],
+    k_residual_cache: Optional[torch.Tensor],
+    state_batch_indices: torch.Tensor,
+    replay_indices: torch.Tensor,
+    write_pos: torch.Tensor,
+    cache_base: torch.Tensor,
+    is_flush: torch.Tensor,
+    accept_lens: torch.Tensor,
+    mamba_track_indices: Optional[torch.Tensor] = None,
+    mamba_steps_to_track: Optional[torch.Tensor] = None,
+    null_block_id: int = -1,
+) -> _Params:
+    B = state_batch_indices.shape[0]
+    total = checkpoint_state.shape[0] * B * checkpoint_state.shape[2]  # layers x requests x value heads
+    resid = d_residual_cache is not None and k_residual_cache is not None
+    assert write_pos.dtype == torch.int32 and cache_base.dtype == torch.int32
+    assert is_flush.dtype == torch.int8
+    for t in (state_batch_indices, replay_indices, accept_lens, mamba_track_indices, mamba_steps_to_track):
+        assert t is None or (t.is_contiguous() and t.dtype in (torch.int32, torch.int64))
+    i64 = lambda t: int(t is not None and t.dtype == torch.int64)  # noqa: E731
+    ptr = lambda t: 0 if t is None else t.data_ptr()  # noqa: E731
+    return _Params(
+        checkpoint_state.data_ptr(), *_strides(checkpoint_state),
+        d_cache.data_ptr(), *_strides(d_cache),
+        k_cache.data_ptr(), *_strides(k_cache),
+        g_cache.data_ptr(), *_strides(g_cache),
+        ptr(d_residual_cache) if resid else 0, *(_strides(d_residual_cache) if resid else (0, 0)),
+        ptr(k_residual_cache) if resid else 0, *(_strides(k_residual_cache) if resid else (0, 0)),
+        state_batch_indices.data_ptr(), replay_indices.data_ptr(), write_pos.data_ptr(),
+        cache_base.data_ptr(), is_flush.data_ptr(), accept_lens.data_ptr(),
+        ptr(mamba_track_indices), ptr(mamba_steps_to_track),
+        i64(state_batch_indices), i64(replay_indices), i64(accept_lens),
+        i64(mamba_track_indices), i64(mamba_steps_to_track),
+        B, total, null_block_id,
+    )
+
+
+def _launch(fn, grid: int, ring: int, device: torch.device, args) -> None:
+    from cuda.bindings import driver as cu
+
+    cfg = cu.CUlaunchConfig()
+    cfg.gridDimX, cfg.gridDimY, cfg.gridDimZ = grid, 1, 1
+    cfg.blockDimX, cfg.blockDimY, cfg.blockDimZ = 128, 1, 1
+    cfg.sharedMemBytes = _smem_bytes(ring)
+    cfg.hStream = cu.CUstream(torch.cuda.current_stream(device).cuda_stream)
+    cfg.attrs, cfg.numAttrs = [], 0
+    addresses = (ctypes.c_void_p * len(args))(*[ctypes.addressof(a) for a in args])
+    _check(cu.cuLaunchKernelEx(cfg, fn, ctypes.addressof(addresses), 0), "launch")
 
 
 def commit(
@@ -434,42 +622,71 @@ def commit(
     null_block_id: int = -1,
 ) -> None:
     """The compact-commit part of ``commit_gdn_replayssm_circular`` (not its cursor finish)."""
-    from cuda.bindings import driver as cu
-
     num_layers, _, HV, V, K = checkpoint_state.shape
     H, ring = k_cache.shape[2], d_cache.shape[-2]
     B = state_batch_indices.shape[0]
     has_track = mamba_track_indices is not None and mamba_steps_to_track is not None
-    resid = d_residual_cache is not None and k_residual_cache is not None
-    assert write_pos.dtype == torch.int32 and cache_base.dtype == torch.int32
-    assert is_flush.dtype == torch.int8
-    for t in (state_batch_indices, replay_indices, accept_lens, mamba_track_indices, mamba_steps_to_track):
-        assert t is None or (t.is_contiguous() and t.dtype in (torch.int32, torch.int64))
-    i64 = lambda t: int(t is not None and t.dtype == torch.int64)  # noqa: E731
-    ptr = lambda t: 0 if t is None else t.data_ptr()  # noqa: E731
-    p = _Params(
-        checkpoint_state.data_ptr(), *_strides(checkpoint_state),
-        d_cache.data_ptr(), *_strides(d_cache),
-        k_cache.data_ptr(), *_strides(k_cache),
-        g_cache.data_ptr(), *_strides(g_cache),
-        ptr(d_residual_cache) if resid else 0, *(_strides(d_residual_cache) if resid else (0, 0)),
-        ptr(k_residual_cache) if resid else 0, *(_strides(k_residual_cache) if resid else (0, 0)),
-        state_batch_indices.data_ptr(), replay_indices.data_ptr(), write_pos.data_ptr(),
-        cache_base.data_ptr(), is_flush.data_ptr(), accept_lens.data_ptr(),
-        ptr(mamba_track_indices), ptr(mamba_steps_to_track),
-        i64(state_batch_indices), i64(replay_indices), i64(accept_lens),
-        i64(mamba_track_indices), i64(mamba_steps_to_track),
-        B, num_layers * B * HV, null_block_id,
+    p = _params(
+        checkpoint_state=checkpoint_state,
+        d_cache=d_cache,
+        k_cache=k_cache,
+        g_cache=g_cache,
+        d_residual_cache=d_residual_cache,
+        k_residual_cache=k_residual_cache,
+        state_batch_indices=state_batch_indices,
+        replay_indices=replay_indices,
+        write_pos=write_pos,
+        cache_base=cache_base,
+        is_flush=is_flush,
+        accept_lens=accept_lens,
+        mamba_track_indices=mamba_track_indices,
+        mamba_steps_to_track=mamba_steps_to_track,
+        null_block_id=null_block_id,
     )
     device = checkpoint_state.device.index
     fn = _kernel(device, H, HV, ring, has_track)
-    cfg = cu.CUlaunchConfig()
     total = num_layers * B * HV
-    ctas = _COMMIT_CTAS
-    cfg.gridDimX, cfg.gridDimY, cfg.gridDimZ = (min(total, ctas) if ctas > 0 else total), 1, 1
-    cfg.blockDimX, cfg.blockDimY, cfg.blockDimZ = 128, 1, 1
-    cfg.sharedMemBytes = _smem_bytes(ring)
-    cfg.hStream = cu.CUstream(torch.cuda.current_stream(checkpoint_state.device).cuda_stream)
-    cfg.attrs, cfg.numAttrs = [], 0
-    args = (ctypes.c_void_p * 1)(ctypes.addressof(p))
-    _check(cu.cuLaunchKernelEx(cfg, fn, ctypes.addressof(args), 0), "launch")
+    _launch(fn, min(total, _COMMIT_CTAS) if _COMMIT_CTAS > 0 else total, ring, checkpoint_state.device, [p])
+
+
+def track(
+    *,
+    checkpoint_state: torch.Tensor,
+    d_cache: torch.Tensor,
+    k_cache: torch.Tensor,
+    g_cache: torch.Tensor,
+    d_residual_cache: Optional[torch.Tensor],
+    k_residual_cache: Optional[torch.Tensor],
+    state_batch_indices: torch.Tensor,
+    replay_indices: torch.Tensor,
+    write_pos: torch.Tensor,
+    cache_base: torch.Tensor,
+    is_flush: torch.Tensor,
+    accept_lens: torch.Tensor,
+    mamba_track_indices: torch.Tensor,
+    mamba_steps_to_track: torch.Tensor,
+    null_block_id: int = -1,
+) -> None:
+    """The track snapshots of every layer (no fold, no cursor change)."""
+    num_layers, _, HV, V, K = checkpoint_state.shape
+    H, ring = k_cache.shape[2], d_cache.shape[-2]
+    B = state_batch_indices.shape[0]
+    p = _params(
+        checkpoint_state=checkpoint_state,
+        d_cache=d_cache,
+        k_cache=k_cache,
+        g_cache=g_cache,
+        d_residual_cache=d_residual_cache,
+        k_residual_cache=k_residual_cache,
+        state_batch_indices=state_batch_indices,
+        replay_indices=replay_indices,
+        write_pos=write_pos,
+        cache_base=cache_base,
+        is_flush=is_flush,
+        accept_lens=accept_lens,
+        mamba_track_indices=mamba_track_indices,
+        mamba_steps_to_track=mamba_steps_to_track,
+        null_block_id=null_block_id,
+    )
+    fn = _track_kernel(checkpoint_state.device.index, H, HV, ring)
+    _launch(fn, B * HV, ring, checkpoint_state.device, [p, ctypes.c_int(num_layers)])
