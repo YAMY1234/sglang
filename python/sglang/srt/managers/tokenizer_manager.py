@@ -62,6 +62,7 @@ from sglang.srt.beam_search.output import (
 )
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.disaggregation import l12_trace
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.elastic_ep.topology import (
@@ -1794,6 +1795,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 dispatch_ready.set()
             tokenized_obj.time_stats = time_stats
             tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
+            if l12_trace.ENABLED and isinstance(tokenized_obj, TokenizedGenerateReqInput):
+                l12_trace.log_dispatch(tokenized_obj)
         finally:
             if not dispatched:
                 self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)
