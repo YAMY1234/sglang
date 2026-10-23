@@ -1217,10 +1217,10 @@ class Envs:
     # PERF-LB: CP-lite calls on the trtllm-gen partial (batches above the fused kernel's 32): the per-(row, head) merge
     # (L18's, on the fold layout) instead of the per-row one, and, gated, the stock call gets no key when CP runs.
     SGLANG_PLB_CP_FOLD_MH = EnvBool(False)
-    # PERF-LB: the trtllm-gen partial runs over virtual rows of this many owned pages (each request's compact owned table
-    # cut into chunks), then a base-2 LSE combine per request: a ragged batch costs its total KV instead of its longest
-    # request's. 0: off.
-    SGLANG_PLB_CP_FOLD_CHUNK = EnvInt(0)
+    # PERF-LB: the trtllm-gen partial runs over chunk rows of C owned pages (each request's compact owned table cut into
+    # chunks), then a base-2 LSE combine per request: a ragged batch costs its total KV instead of its longest request's.
+    # "" off, "<C>" every batch size, or "<b>:<C>,..." (from b requests up; C in 32 / 64 / 128 / 256, 0 = off).
+    SGLANG_PLB_CP_FOLD_CHUNK = EnvStr("")
     # PERF-LB: chunk rows only on a ragged batch: longest owned length x B >= this x the total (one row per request
     # otherwise). 0: every batch.
     SGLANG_PLB_CP_FOLD_RAGGED = EnvFloat(1.8)

@@ -709,9 +709,9 @@ class CpLite:
         self.merge_h = envs.SGLANG_TRTL18_CP_MAIN.get() and envs.SGLANG_TRTL18_CP_MERGE_H.get()
         self.llh_off = total
         self.fold_mh = envs.SGLANG_PLB_CP_FOLD_MH.get()
-        self.fold_chunk = envs.SGLANG_PLB_CP_FOLD_CHUNK.get()
+        self.fold_chunk = _parse_min_kv(envs.SGLANG_PLB_CP_FOLD_CHUNK.get())
         self.fold_ragged = envs.SGLANG_PLB_CP_FOLD_RAGGED.get()
-        assert self.fold_chunk in (0, 32, 64, 128, 256), self.fold_chunk
+        assert all(c in (0, 32, 64, 128, 256) for c in self.fold_chunk.values()), self.fold_chunk
         if self.merge_h or self.cp_ungated or self.fold_mh:
             total += _MAX_ROWS * cp * _LL_PWORDS * 8
         self.ll = envs.SGLANG_TRTL1_ATTN_CP_LL.get() and q_heads * HEAD_DIM // 2 + q_heads <= _LL_PWORDS
@@ -741,7 +741,8 @@ class CpLite:
         rows = _MAX_ROWS
         self.po = torch.empty(rows, cp * q_heads, HEAD_DIM, dtype=torch.bfloat16, device=self.device)
         self.plse = torch.empty(rows, cp * q_heads, dtype=torch.float32, device=self.device)
-        self.counter = torch.zeros(1 << 16, dtype=torch.int32, device=self.device)
+        # multi-CTA counters of the trtllm-gen calls: rows x heads (the chunk rows: up to 8 B x 112 at q_len 7)
+        self.counter = torch.zeros(1 << 20 if self.fold_chunk else 1 << 16, dtype=torch.int32, device=self.device)
         # exact path: the fused kernel's [cp, rows, heads, D] partials and the prefix lengths the gather writes
         self.po_x = torch.empty(cp, rows, q_heads, HEAD_DIM, dtype=torch.bfloat16, device=self.device)
         self.pl_x = torch.empty(cp, rows, q_heads, dtype=torch.float32, device=self.device)
@@ -1097,7 +1098,8 @@ class CpLite:
     def _chunk_tables(self, tab, lens, b, forward_batch, layer_id):
         """Once per forward (as _tables): with SGLANG_PLB_CP_FOLD_CHUNK, the one-row-per-request call's lengths (0 on a
         ragged batch) and the chunk rows ([B * K, C] dense, K = owned table width / C), else None."""
-        C = self.fold_chunk
+        keys = [k for k in self.fold_chunk if k <= b]
+        C = self.fold_chunk[max(keys)] if keys else 0
         ncols = tab.shape[1]
         if not C or ncols <= C or ncols % C:
             return None
