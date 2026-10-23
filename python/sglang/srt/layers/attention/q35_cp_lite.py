@@ -130,8 +130,15 @@ def _gate_on(seq_lens, nb, thr, NB: tl.constexpr, GMAX: tl.constexpr):
 
 
 @triton.jit
+def _stat_add(stats, on):
+    """SGLANG_PLB_LOG_CP_GATE_STATS: one call into its counter, a single 64-bit add of (1 << 32) + on (calls in the
+    high half, gate on in the low half; _GateStats unpacks them)."""
+    tl.atomic_add(stats, tl.full([], 1 << 32, tl.int64) + on, sem="relaxed")
+
+
+@triton.jit
 def _gate_lens(seq_lens, nb, thr, stock_lens, pre_lens, QL: tl.constexpr, NB: tl.constexpr, GMAX: tl.constexpr,
-               ZERO: tl.constexpr):
+               ZERO: tl.constexpr, stats=None, STATS: tl.constexpr = False):
     """Once per forward: the stock call's lengths (L with the gate off; with it on q_len keys, or ZERO: none, so
     the stock kernel leaves out to the merge) and the exact path's prefix lengths (max(L - QL, 0) on, 0 off)."""
     k = tl.arange(0, NB)
@@ -140,6 +147,8 @@ def _gate_lens(seq_lens, nb, thr, stock_lens, pre_lens, QL: tl.constexpr, NB: tl
     on = _gate_on(seq_lens, nb, thr, NB, GMAX)
     tl.store(stock_lens + k, tl.where(on, 0 if ZERO else tl.minimum(L, QL), L), mask=m)
     tl.store(pre_lens + k, tl.where(on, tl.maximum(L - QL, 0), 0), mask=m)
+    if STATS:
+        _stat_add(stats, on.to(tl.int64))
 
 
 @triton.jit
@@ -161,6 +170,8 @@ def _cp_tables(
     GATE: tl.constexpr,
     NB: tl.constexpr,
     GMAX: tl.constexpr,
+    stats=None,
+    STATS: tl.constexpr = False,
 ):
     """This rank's compact page table and token count over the prefix [0, L - QL); with GATE and the gate
     off, no owned page and no key."""
@@ -184,11 +195,15 @@ def _cp_tables(
         n = n_own * PG - tl.where(tail, PG - last_tok, 0)
         # no owned page: one dummy key, dropped by the merge; gate off: no key (the merge exits)
         tl.store(lens + b, tl.maximum(n, on))
+        if STATS:
+            if b == 0:
+                _stat_add(stats, on)
 
 
 @triton.jit
 def _cp_chunk_tables(tab, tstride, lens, base_lens, vtab, vlens, vstart, vcnt, nb, nv, ragged,
-                     C: tl.constexpr, KP: tl.constexpr, NB: tl.constexpr, PG: tl.constexpr):
+                     C: tl.constexpr, KP: tl.constexpr, NB: tl.constexpr, PG: tl.constexpr,
+                     stats=None, STATS: tl.constexpr = False):
     """Once per forward, program (r, j), chunked fold partial (PERF-LB cp3): with a ragged batch (longest owned length
     x B >= ragged x the total, the longest over C pages), chunk j of request r's owned pages into dense row start_r + j of vtab ([nv, C]) and no
     key for the one-row-per-request call; otherwise every chunk row empty and that call keeps its lengths. Row
@@ -215,6 +230,9 @@ def _cp_chunk_tables(tab, tstride, lens, base_lens, vtab, vlens, vstart, vcnt, n
         tl.store(vstart + r, my_start)
         tl.store(vcnt + r, my_n)
         tl.store(base_lens + r, tl.where(on, 0, my_L))
+        if STATS:
+            if r == 0:
+                _stat_add(stats, on.to(tl.int64))
     if j < my_n:
         v = my_start + j
         cols = tl.arange(0, C)
@@ -726,6 +744,66 @@ def _parse_min_kv(spec: str) -> dict:
     return {int(b): int(kv) for b, kv in (e.split(":") for e in spec.split(","))}
 
 
+class _GateStats:
+    """SGLANG_PLB_LOG_CP_GATE_STATS = N: one device counter per (call kind, batch bucket, gate kernel) that _stat_add
+    adds to, and rank 0's log of their change every N decode forwards from a pinned copy (no host sync)."""
+
+    # _gate_lens: the KV gate; _cp_tables: fold path (on: the KV gate, always for ungated calls);
+    # _cp_chunk_tables: the ragged gate
+    SITES = ("kv", "fold", "chunk")
+    BUCKETS = ("B1-32", "B33-64", "B65-96", "B97+")
+    QLS = 8  # q_len 1..8 (the merges' causal block is 8 keys wide)
+
+    def __init__(self, every: int, device, log: bool):
+        self.every, self.log = every, log
+        # rows (gated: the call has a stock kernel, q_len, batch bucket) x SITES, packed (calls << 32) + on
+        self.dev = torch.zeros(2 * self.QLS * len(self.BUCKETS) * len(self.SITES), dtype=torch.int64, device=device)
+        self.host = torch.zeros(self.dev.numel(), dtype=torch.int64, pin_memory=True)
+        self.stream = torch.cuda.Stream(device=device)
+        self.event = torch.cuda.Event()
+        self.base = None
+        self.ticks = self.snap_tick = self.window = 0
+        self.pending = False
+
+    def _index(self, gated: bool, q_len: int, bucket: int) -> int:
+        return ((int(gated) * self.QLS + q_len - 1) * len(self.BUCKETS) + bucket) * len(self.SITES)
+
+    def kwargs(self, gated: bool, q_len: int, b: int, site: str) -> dict:
+        i = self._index(gated, q_len, min((b - 1) // 32, len(self.BUCKETS) - 1)) + self.SITES.index(site)
+        return dict(stats=self.dev[i:], STATS=True)
+
+    def tick(self):
+        """One decode forward, before it launches anything: log a landed copy; every N forwards, copy again."""
+        if not self.log:
+            return
+        self.ticks += 1
+        if self.pending and self.event.query():
+            self.pending = False
+            cur = self.host.tolist()
+            if self.base is not None:
+                logger.info("PLB CP gate stats, last %d decode forwards (calls/on): %s", self.window, self._fmt(cur))
+            self.base = cur
+        if not self.pending and (self.base is None or self.ticks - self.snap_tick >= self.every):
+            # after the earlier forwards' kernels, on a side stream: the forward stream never waits for the copy
+            self.stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self.stream):
+                self.host.copy_(self.dev, non_blocking=True)
+                self.event.record()
+            self.window, self.snap_tick, self.pending = self.ticks - self.snap_tick, self.ticks, True
+
+    def _fmt(self, cur: list) -> str:
+        rows = []
+        for gated in (True, False):
+            for q_len in range(1, self.QLS + 1):
+                for bucket, name in enumerate(self.BUCKETS):
+                    i = self._index(gated, q_len, bucket)
+                    d = [cur[i + s] - self.base[i + s] for s in range(len(self.SITES))]
+                    if any(d):
+                        sites = " ".join(f"{site}={x >> 32}/{x & 0xFFFFFFFF}" for site, x in zip(self.SITES, d) if x)
+                        rows.append(f"q{q_len}.{'gated' if gated else 'ungated'}.{name} {sites}")
+        return "; ".join(rows) or "none"
+
+
 class CpLite:
     """One process's exchange buffer and scratch, shared by every TRT-LLM MHA backend
     (target and draft) of the process; built collectively on the attention TP group."""
@@ -810,6 +888,10 @@ class CpLite:
         self._logged: set = set()
         # (page table, lengths, q_len) -> [tables, owned lengths, forward, last layer id that used them]
         self._tabs: dict = {}
+        every = envs.SGLANG_PLB_LOG_CP_GATE_STATS.get()
+        self.gate_stats = _GateStats(every, self.device, log=tp_rank == 0) if every > 0 else None
+        if self.gate_stats is not None:
+            logger.info("PERF-LB CP-lite gate stats: rank 0 logs them every %d decode forwards", every)
         torch.distributed.barrier(group)
         logger.info(
             "TRT-L1 CP-lite: tp rank %d, KV group of %d (group rank %d), min batch %d, LL %s, fused %s",
@@ -857,6 +939,19 @@ class CpLite:
         cls._instance = cls(group, rank, tp, cp, q_heads, device)
         return cls._instance
 
+    @classmethod
+    def tick_gate_stats(cls, forward_mode):
+        """SGLANG_PLB_LOG_CP_GATE_STATS: the target model runner starts a forward (outside any graph)."""
+        inst = cls._instance
+        if inst is not None and inst.gate_stats is not None and (
+            forward_mode.is_decode() or forward_mode.is_target_verify()
+        ):
+            inst.gate_stats.tick()
+
+    def _stats(self, gated, q_len, b, site):
+        """Launch kwargs that count this call (none with the stats off: the kernels compile as without them)."""
+        return {} if self.gate_stats is None else self.gate_stats.kwargs(gated, q_len, b, site)
+
     def _tables(self, page_table, seq_lens, q_len, forward_batch, layer_id, gate):
         """Once per forward: reused only by later layers of the same forward, so every capture and
         every single-layer draft step computes its own."""
@@ -874,7 +969,7 @@ class CpLite:
         self._tabs[key] = [tab, lens, weakref.ref(forward_batch), layer_id]
         _cp_tables[(b, triton.cdiv(ncols, 256))](
             page_table, page_table.stride(0), seq_lens, tab, tab.stride(0), lens, ncols, self.me, **gate,
-            QL=q_len, CP=self.cp, PG=PAGE, BLOCK=256,
+            QL=q_len, CP=self.cp, PG=PAGE, BLOCK=256, **self._stats(gate["GATE"], q_len, b, "fold"),
         )
         return tab, lens, ncols * PAGE
 
@@ -997,7 +1092,7 @@ class CpLite:
         lens = torch.empty(2, b, dtype=torch.int32, device=self.device)
         self._glens[key] = [(lens[0], lens[1]), weakref.ref(forward_batch), layer_id]
         _gate_lens[(1,)](seq_lens, b, thr, lens[0], lens[1], QL=q_len, NB=triton.next_power_of_2(b),
-                         GMAX=self.gate_max, ZERO=zero)
+                         GMAX=self.gate_max, ZERO=zero, **self._stats(True, q_len, b, "kv"))
         return lens[0], lens[1]
 
     def _gated_overlap(self, q, k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale,
@@ -1020,7 +1115,7 @@ class CpLite:
         with torch.cuda.stream(self._side):
             if fold_mh and self.fold_fuse:  # PERF-LB cp3: chunk rows filled by the gather, combined in the merge
                 tabs = self._tables(page_table, seq_lens, q_len, forward_batch, layer_id, gate)
-                chunk = self._chunk_tables(tabs[0], tabs[1], b, forward_batch, layer_id, q_len)
+                chunk = self._chunk_tables(tabs[0], tabs[1], b, forward_batch, layer_id, q_len, gate["GATE"])
                 if chunk is not None:
                     nv, h = chunk[1].shape[0], q_len * self.cp * self.hq
                     fused = (chunk, torch.empty(nv, h, HEAD_DIM, dtype=q.dtype, device=self.device),
@@ -1124,7 +1219,10 @@ class CpLite:
         h = q_len * self.cp * self.hq
         query = self.q_all[:rows].view(b, h, HEAD_DIM)
         out, lse = self.po[:rows].view(b, h, HEAD_DIM), self.plse[:rows].view(b, h)
-        chunk = self._chunk_tables(tab, lens, b, forward_batch, layer_id, q_len) if fused is None else fused[0]
+        if fused is None:
+            chunk = self._chunk_tables(tab, lens, b, forward_batch, layer_id, q_len, gate["GATE"])
+        else:
+            chunk = fused[0]
         flashinfer.decode.trtllm_batch_decode_with_kv_cache(
             query=query,
             kv_cache=(k_cache, v_cache),
@@ -1160,7 +1258,7 @@ class CpLite:
         if fused is None:
             _cp_chunk_comb[(b, triton.cdiv(h, 16))](po_v, pl_v, vstart, vcnt, out, lse, h, HB=16, D=HEAD_DIM)
 
-    def _chunk_tables(self, tab, lens, b, forward_batch, layer_id, q_len=7):
+    def _chunk_tables(self, tab, lens, b, forward_batch, layer_id, q_len, gated):
         """Once per forward (as _tables): with SGLANG_PLB_CP_FOLD_CHUNK (q_len 1: _Q1), the one-row-per-request call's
         lengths (0 on a ragged batch) and the chunk rows ([B * K, C] dense, K = owned table width / C), else None."""
         spec = self.fold_chunk_q1 if q_len == 1 else self.fold_chunk
@@ -1182,7 +1280,8 @@ class CpLite:
         vstart = torch.empty(b, dtype=torch.int32, device=self.device)
         vcnt = torch.empty(b, dtype=torch.int32, device=self.device)
         _cp_chunk_tables[(b, K)](tab, tab.stride(0), lens, base_lens, vtab, vlens, vstart, vcnt, b, nv,
-                                 float(self.fold_ragged), C=C, KP=K, NB=triton.next_power_of_2(b), PG=PAGE)
+                                 float(self.fold_ragged), C=C, KP=K, NB=triton.next_power_of_2(b), PG=PAGE,
+                                 **self._stats(gated, q_len, b, "chunk"))
         out = (base_lens, vtab, vlens, vstart, vcnt)
         self._tabs[key] = [out, weakref.ref(forward_batch), layer_id]
         if (b, "chunk") not in self._logged:
