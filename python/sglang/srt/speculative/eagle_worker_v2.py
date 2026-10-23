@@ -126,7 +126,7 @@ from sglang.srt.speculative.spec_utils import (
     select_top_k_tokens,
     spec_stage_span,
 )
-from sglang.srt.utils import host_trace
+from sglang.srt.utils import host_trace, perfll_host
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -1197,8 +1197,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         # Prepare for draft extend in a separate stream
         if self.plan_stream:
-            self.plan_stream.wait_stream(
-                torch.get_device_module(self.device).current_stream()
+            perfll_host.wait_stream(
+                self.plan_stream, torch.get_device_module(self.device).current_stream()
             )
         with self.plan_stream_ctx:
             forward_batch = prepare_for_draft_extend(
@@ -1213,8 +1213,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
 
         if self.plan_stream:
-            torch.get_device_module(self.device).current_stream().wait_stream(
-                self.plan_stream
+            perfll_host.wait_stream(
+                torch.get_device_module(self.device).current_stream(),
+                self.plan_stream,
             )
         if host_trace.ENABLED:
             host_trace.mark(host_trace.EP1)
