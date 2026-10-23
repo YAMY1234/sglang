@@ -72,6 +72,7 @@ _is_npu = is_npu()
 # write -1 back. Catches "gather without intermediate stash" bugs. CI enables
 # via the existing SGLANG_IS_IN_CI; off in production.
 _DEBUG_ASSERT = envs.SGLANG_IS_IN_CI.get()
+_INDEX_OPS = envs.SGLANG_PERFLL_HOST_INDEX_OPS.get()
 
 
 @torch.compile(dynamic=True, disable=_is_npu)
@@ -614,7 +615,10 @@ class FutureMap:
                 self.publish_ready.synchronize()
             else:
                 self.publish_ready.wait()
-        batch.seq_lens = self.new_seq_lens_buf[fi]
+        if _INDEX_OPS and fi.dtype is torch.int64:
+            batch.seq_lens = torch.index_select(self.new_seq_lens_buf, 0, fi)
+        else:
+            batch.seq_lens = self.new_seq_lens_buf[fi]
 
         if not self.needs_cpu_seq_lens:
             # GPU gather above is kept (SB.seq_lens must advance each verify);
@@ -659,7 +663,13 @@ class FutureMap:
         indices = future_indices
         if indices.shape[0] == 0:
             return  # DP idle
-        self.new_seq_lens_buf[indices] = new_seq_lens.to(self.new_seq_lens_buf.dtype)
+        if _INDEX_OPS and indices.dtype is torch.int64:
+            # req pool indices are distinct, so the copy order does not matter
+            self.new_seq_lens_buf.index_copy_(
+                0, indices, new_seq_lens.to(self.new_seq_lens_buf.dtype)
+            )
+        else:
+            self.new_seq_lens_buf[indices] = new_seq_lens.to(self.new_seq_lens_buf.dtype)
         publish_confidence = self.needs_confidence_relay and confidence is not None
         if publish_confidence:
             self.confidence_relay.scatter(indices, confidence)
