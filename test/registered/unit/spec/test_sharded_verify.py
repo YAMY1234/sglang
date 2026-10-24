@@ -487,16 +487,19 @@ class TestFusedTail(CustomTestCase):
                 self.assertEqual(bool(((plain >> 32) == tag).all()), bool(i % 2))
 
     def test_every_launch_writes_the_stock_outputs(self):
-        """Launch after launch, at bs 8 / 9, with canonical chains and with a tree that is not
-        one, the tail stores the exchanged tokens and writes every output the per-request
-        stock tail writes. Keys reduced in a [rank, request, node] layout once stored wrong
-        tokens for requests 4-7 in about 2-9% of bs-8 launches."""
+        """Launch after launch, each followed at once by another kernel, with no host sync, at
+        bs 8 / 9, over canonical chains and over a tree that is not one: the tail stores the
+        exchanged tokens and writes every output the stock tail writes. All warps must use the
+        same epoch: when one warp finished polling and advanced the epoch before another
+        warp had read it, that warp polled another slot and took its stale words (wrong
+        tokens for its rows in 3-30% of launches)."""
         from sglang.kernels.ops.speculative.eagle import chain_accept
 
         gen = torch.Generator(device="cuda").manual_seed(13)
         width, parts = 7, 2
         maxr = 2 * sharded_verify._TAIL_ROWS
         channel = _unicast_channel()
+        launches = []
         for i in range(600):
             bs = 9 if i % 5 == 4 else 8
             rows = bs * width
@@ -510,7 +513,7 @@ class TestFusedTail(CustomTestCase):
             out = _outputs(bs, width)
             ref = _outputs(bs, width)
             tokens = torch.full((rows,), 7 + i, dtype=torch.int64, device="cuda")
-            lens = torch.empty(bs, dtype=torch.int32, device="cuda")
+            out["accept_lens"] = torch.empty(bs, dtype=torch.int32, device="cuda")
             sharded_verify._ll_accept_kernel[(1,)](
                 keys,
                 keys,
@@ -523,7 +526,7 @@ class TestFusedTail(CustomTestCase):
                 out["predict"],
                 out["accept_index"],
                 out["num_correct_drafts"],
-                lens,
+                out["accept_lens"],
                 out["accept_index"],
                 *tree,
                 channel.epoch,
@@ -545,7 +548,7 @@ class TestFusedTail(CustomTestCase):
                 MULTICAST=False,
                 num_warps=4,
             )
-            ref_lens, _ = chain_accept(
+            ref["accept_lens"], _ = chain_accept(
                 **ref,
                 **_tree_args(tree),
                 target_predict=target,
@@ -555,11 +558,14 @@ class TestFusedTail(CustomTestCase):
                 verify=True,
                 finish=True,
             )
+            launches.append((i, bs, target, tokens, out, ref))
+        torch.cuda.synchronize()
+        for i, bs, target, tokens, out, ref in launches:
             with self.subTest(launch=i, bs=bs):
                 self.assertTrue(torch.equal(tokens.view(bs, width), target))
                 for name in ref:
                     self.assertTrue(torch.equal(out[name], ref[name]), name)
-                self.assertTrue(torch.equal(lens, ref_lens))
+        self.assertEqual(int(channel.epoch), 600)
 
     def test_a_late_rank_only_delays_the_tail(self):
         # two ranks on one GPU: rank 1's words land ~1 ms after the tail starts polling

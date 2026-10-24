@@ -577,6 +577,10 @@ def _ll_accept_kernel(
 
     tag = (tl.load(epoch_ptr) + 1).to(tl.uint64)
     slot = (tag % 3).to(tl.int64)
+    # every warp has read the epoch before any warp can advance it below: a warp whose
+    # poll needs only its own words may finish first, and a later reader would take a
+    # slot of stale words
+    tl.debug_barrier()
     r = tl.arange(0, BLOCK_R)
     rmask = r < bs * WIDTH
     p = tl.arange(0, BLOCK_P)
@@ -609,9 +613,9 @@ def _ll_accept_kernel(
     tl.store(tokens_ptr + r, _tail_tokens(lo, hi, mw, KEY_FLOOR), mask=rmask)
     if PLAIN:
         tl.store(bonus_tokens_ptr + r, _tail_tokens(lo_p, hi_p, mw, KEY_FLOOR), mask=rmask)
-    tl.store(epoch_ptr, tag.to(tl.int32))
-    # the accept reads the tokens back from the stores above (every CTA thread made some)
+    # every warp is done polling, and the accept below reads back every warp's tokens
     tl.debug_barrier()
+    tl.store(epoch_ptr, tag.to(tl.int32))
 
     # _chain_is_canonical per request: node i is row base + i, its only child node i + 1
     want = tl.where(w < WIDTH - 1, w + 1, -1)
