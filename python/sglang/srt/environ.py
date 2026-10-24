@@ -1431,6 +1431,9 @@ class Envs:
     # "<fc1>,<fc2>": the activation amax the draft experts' static NVFP4 input global scales are built for (TRT's
     # TRTLLM_Q35_MTP_MOE_NVFP4_AMAX; "" = TRT's calibrated defaults 256,2048).
     SGLANG_PERFLP_DRAFT_MOE_NVFP4_AMAX = EnvStr("")
+    # With SGLANG_Q35MF_MIDQ_FP8_COMBINE: calls the decode LL all-to-all serves keep it (and its BF16 combine); only the
+    # FlashInfer MoeAlltoAll path takes the E4M3 combine.
+    SGLANG_PERFLP_FP8_COMBINE_KEEP_LL = EnvBool(False)
     # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
     SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
     # Store DeepSeek-V4 SWA KV directly in FlashInfer's 64-token SM120 page
