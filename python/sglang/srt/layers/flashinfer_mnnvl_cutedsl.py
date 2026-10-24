@@ -423,6 +423,7 @@ class FlashInferMNNVLCuteDSLARFusion:
                 config=self.workspace_config,
             )
             self._bt_tail = self._patch_bt_tail()
+            self._e4m3 = self._install_e4m3_payload()
 
             # Publish only after the mailbox barrier; without it the ranks
             # would desynchronize their Lamport stages.
@@ -446,6 +447,36 @@ class FlashInferMNNVLCuteDSLARFusion:
             bool(patch.fp8_tails),
         )
         return patch
+
+    def _install_e4m3_payload(self):
+        """The PERF-LP E4M3 payload of the BT route (plb_mnnvl_cutedsl.e4m3_payload),
+        or None when off. Collective: every rank sees the same switch and shape."""
+        if not envs.SGLANG_PERFLP_AR_FP8_PAYLOAD.get():
+            return None
+        from sglang.srt.layers.plb_mnnvl_cutedsl.e4m3_payload import (
+            E4M3Payload,
+            e4m3_payload_unsupported,
+        )
+
+        reason = e4m3_payload_unsupported(self.workspace)
+        if reason is not None:
+            logger.warning("PERF-LP AR FP8 payload requested but off: %s", reason)
+            return None
+        payload = E4M3Payload(
+            self.workspace,
+            max_tokens=envs.SGLANG_PERFLP_AR_FP8_PAYLOAD_MAX_TOKENS.get(),
+            lamport=envs.SGLANG_PLB_MAT_LAMPORT.get(),
+            fp8_out=self._bt_tail is not None and bool(self._bt_tail.fp8_tails),
+        )
+        logger.info(
+            "PERF-LP AR FP8 payload (E4M3 + FP32 scale per 256) active, max tokens "
+            "%d: %s; lamport %d, E4M3 copy for the next projection %s",
+            payload.max_tokens,
+            payload.describe(),
+            payload.lamport,
+            bool(payload.fp8_norms),
+        )
+        return payload
 
     def supports(self, m: int) -> bool:
         if not 1 <= int(m) <= self.max_m:
@@ -473,6 +504,19 @@ class FlashInferMNNVLCuteDSLARFusion:
         shape = (m, self.hidden_size)
         norm_output = torch.empty(shape, dtype=torch.bfloat16, device=self.device)
         residual_output = torch.empty(shape, dtype=torch.bfloat16, device=self.device)
+        if self._e4m3 is not None and self._e4m3.takes_finalize(m):
+            self._e4m3.finalize(
+                routed_output=routed_output,
+                expert_weights=expert_weights,
+                permuted_indices=permuted_indices,
+                shared_output=gated_shared_output,
+                residual_source=residual,
+                gamma=gamma,
+                norm_output=norm_output,
+                residual_output=residual_output,
+                m=m,
+            )
+            return norm_output, residual_output
 
         pattern = self._patterns.kMoEFinalizeARResidualRMSNorm
         self._allreduce_fusion(
@@ -529,7 +573,12 @@ class FlashInferMNNVLCuteDSLARFusion:
         norm_output = torch.empty(shape, dtype=torch.bfloat16, device=self.device)
         residual_output = torch.empty(shape, dtype=torch.bfloat16, device=self.device)
         fp8_output = torch.empty(shape, dtype=fp8_dtype, device=self.device)
-        self._bt_tail.finalize_fp8(
+        finalize_fp8 = (
+            self._e4m3.finalize
+            if self._e4m3 is not None and self._e4m3.takes_finalize(m)
+            else self._bt_tail.finalize_fp8
+        )
+        finalize_fp8(
             routed_output=routed_output,
             expert_weights=expert_weights,
             permuted_indices=permuted_indices,
@@ -556,6 +605,16 @@ class FlashInferMNNVLCuteDSLARFusion:
             raise ValueError(f"workspace does not support M={m}")
         norm_output = torch.empty_like(local_contribution)
         residual_output = torch.empty_like(local_contribution)
+        if self._e4m3 is not None and self._e4m3.takes_all_reduce(m):
+            self._e4m3.all_reduce(
+                local_contribution=local_contribution,
+                residual_source=residual,
+                gamma=gamma,
+                norm_output=norm_output,
+                residual_output=residual_output,
+                m=m,
+            )
+            return norm_output, residual_output
 
         pattern = self._patterns.kARResidualRMSNorm
         self._allreduce_fusion(
