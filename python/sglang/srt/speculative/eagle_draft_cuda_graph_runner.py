@@ -585,22 +585,32 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         )
         return parent_list, top_scores_index, draft_tokens, draft_probs
 
-    def _copy_planned_inputs(self, forward_batch: ForwardBatch, *, raw_bs: int) -> bool:
+    def _copy_planned_inputs(
+        self, forward_batch: ForwardBatch, *, raw_bs: int, inputs_staged: bool = False
+    ) -> bool:
         """SGLANG_PERFLL_HOST_GRAPH_INPUTS: an unpadded round's input copies (the
         default path's fields, draft probs and hidden states) as one field-copy launch
-        into views cached per input layout; False leaves them all to the default path."""
+        into views cached per input layout; False leaves them all to the default path.
+        ``inputs_staged``: the lengths, write slots and positions are in the buffers
+        already (SGLANG_PERFLL_STEP2=3), so they are not copied."""
         buffers = self.buffers
         spec_info = forward_batch.spec_info
         srcs = [
-            forward_batch.seq_lens,
-            forward_batch.out_cache_loc,
-            forward_batch.positions,
             spec_info.topk_p,
             spec_info.topk_index,
             forward_batch.req_pool_indices,
         ]
         mask = 0
-        if self.model_runner.model_config.model_is_mrope:
+        if inputs_staged:
+            mask |= 32
+        else:
+            srcs = [
+                forward_batch.seq_lens,
+                forward_batch.out_cache_loc,
+                forward_batch.positions,
+                *srcs,
+            ]
+        if self.model_runner.model_config.model_is_mrope and not inputs_staged:
             if forward_batch.mrope_positions is None:
                 return False
             srcs.append(forward_batch.mrope_positions)
@@ -638,13 +648,17 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         buffers = self.buffers
         raw_num_token = raw_bs * self.captured_req_width
         dsts = [
-            buffers.seq_lens[:raw_bs],
-            buffers.out_cache_loc[: raw_num_token * self.speculative_num_steps],
-            buffers.positions[:raw_num_token],
             buffers.topk_p[:raw_bs],
             buffers.topk_index[:raw_bs],
             buffers.req_pool_indices[:raw_bs],
         ]
+        if not mask & 32:
+            dsts = [
+                buffers.seq_lens[:raw_bs],
+                buffers.out_cache_loc[: raw_num_token * self.speculative_num_steps],
+                buffers.positions[:raw_num_token],
+                *dsts,
+            ]
         if mask & 1:
             dsts.append(buffers.mrope_positions[:, :raw_num_token])
         if mask & 2:
@@ -660,7 +674,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     # -----------------------------------------------------------------
     # Replay
     # -----------------------------------------------------------------
-    def execute(self, forward_batch: ForwardBatch):
+    def execute(self, forward_batch: ForwardBatch, inputs_staged: bool = False):
+        """``inputs_staged``: the previous post-verify graph wrote this round's lengths,
+        write slots and positions into the buffers (SGLANG_PERFLL_STEP2=3)."""
         assert forward_batch.out_cache_loc is not None
         self.deepep_adapter.replay()
         buffers = self.buffers
@@ -713,10 +729,13 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             f"{self.model_runner.model_config.vocab_size}",
         )
 
+        inputs_staged = inputs_staged and bs == raw_bs
         staged = (
             _GRAPH_INPUTS
             and bs == raw_bs
-            and self._copy_planned_inputs(forward_batch, raw_bs=raw_bs)
+            and self._copy_planned_inputs(
+                forward_batch, raw_bs=raw_bs, inputs_staged=inputs_staged
+            )
         )
         if not staged:
             # Common inputs — batch the small per-field device copies into a grouped
@@ -724,22 +743,27 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             # hidden_states is handled separately below (see note), and seq_lens_cpu
             # is handled further down since it lives on host.
             copy_dsts = [
-                buffers.seq_lens[:raw_bs],
-                buffers.out_cache_loc[: raw_num_token * self.speculative_num_steps],
-                buffers.positions[:raw_num_token],
                 buffers.topk_p[:raw_bs],
                 buffers.topk_index[:raw_bs],
                 buffers.req_pool_indices[:raw_bs],
             ]
             copy_srcs = [
-                forward_batch.seq_lens,
-                forward_batch.out_cache_loc,
-                forward_batch.positions,
                 forward_batch.spec_info.topk_p,
                 forward_batch.spec_info.topk_index,
                 forward_batch.req_pool_indices,
             ]
-            if self.model_runner.model_config.model_is_mrope:
+            if not inputs_staged:
+                copy_dsts += [
+                    buffers.seq_lens[:raw_bs],
+                    buffers.out_cache_loc[: raw_num_token * self.speculative_num_steps],
+                    buffers.positions[:raw_num_token],
+                ]
+                copy_srcs += [
+                    forward_batch.seq_lens,
+                    forward_batch.out_cache_loc,
+                    forward_batch.positions,
+                ]
+            if self.model_runner.model_config.model_is_mrope and not inputs_staged:
                 if bs != raw_bs or forward_batch.mrope_positions is None:
                     buffers.mrope_positions.zero_()
                 if forward_batch.mrope_positions is not None:

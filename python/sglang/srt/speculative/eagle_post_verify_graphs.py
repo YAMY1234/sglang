@@ -72,13 +72,17 @@ class EaglePostVerifyGraphs:
         seq_len_fill_value: int,
         mrope: bool,
         req_to_token: torch.Tensor,
+        runner_buffers: Any = None,
     ) -> None:
+        """``runner_buffers``: the draft graph runner's static inputs, which the staging
+        then writes in place (mode 3)."""
         self._step2 = SimpleNamespace(
             num_steps=num_steps,
             window=window,
             seq_len_fill_value=seq_len_fill_value,
             mrope=mrope,
             req_to_token=req_to_token,
+            runner_buffers=runner_buffers,
         )
 
     def run(
@@ -187,6 +191,7 @@ class EaglePostVerifyGraphs:
                     window=step2.window,
                     mrope=step2.mrope,
                     device=batch.device,
+                    runner_buffers=step2.runner_buffers,
                 )
             ),
             num_requests=len(batch.seq_lens),

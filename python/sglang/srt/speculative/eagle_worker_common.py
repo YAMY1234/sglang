@@ -265,11 +265,14 @@ def prepare_for_draft(
     *,
     target_translator: Optional[KVIndexTranslator] = None,
     num_draft_tokens: Optional[int] = None,
+    staged: Any = None,
 ) -> tuple[ForwardBatch, bool, Optional[KVLocPlan]]:
     """The draft-decode batch. With ``target_translator``, a chain draft plans
     the iteration's whole write window (the ``num_draft_tokens`` slots past
     ``seq_lens`` that verify and draft extend also write) and writes its first
-    ``num_steps`` columns; that plan is returned, else None."""
+    ``num_steps`` columns; that plan is returned, else None. ``staged``: those
+    slots and positions as the previous post-verify graph wrote them
+    (perfll_step2.NextDraft, SGLANG_PERFLL_STEP2=3), taken instead of a launch."""
     prepared_positions = None
     prepared_mrope_positions = None
     kv_loc_plan = None
@@ -288,7 +291,26 @@ def prepare_for_draft(
         # A chain draft's slots lead the iteration's window: gather the whole
         # window in the same launch.
         window_cols = num_draft_tokens if plans_window else num_steps
-        if page_size == 1 or topk == 1:
+        with_mrope = draft_model_runner.model_config.model_is_mrope and all(
+            x is None for x in batch.multimodal_inputs
+        )
+        if (
+            staged is not None
+            and plans_window
+            and staged.num_requests == bs
+            and (staged.mrope is not None) == with_mrope
+        ):
+            batch.out_cache_loc = staged.window
+            prepared_positions = staged.positions
+            prepared_mrope_positions = staged.mrope
+            kv_loc_plan = target_translator.plan(
+                req_pool_indices=batch.req_pool_indices,
+                seq_lens=batch.seq_lens,
+                seq_lens_cpu=batch.seq_lens_cpu,
+                write_virtual=batch.out_cache_loc,
+                read_extent=num_draft_tokens,
+            )
+        elif page_size == 1 or topk == 1:
             empty = perfll_host.round_empty if perfll_host.OUT_POOL else perfll_host.torch_empty
             batch.out_cache_loc = empty(
                 (bs * topk * window_cols,), torch.int64, batch.device
