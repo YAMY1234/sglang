@@ -315,7 +315,19 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             config.shared_expert_intermediate_size > 0
             and not self.enable_shared_expert_fusion
         )
-        self.experts = get_moe_impl_class(quant_config)(
+        experts_quant_config = quant_config
+        if (
+            is_nextn
+            and quant_config is None
+            and envs.SGLANG_PERFLP_DRAFT_MOE_NVFP4.get()
+        ):
+            # PERF-LP: only the BF16 draft's routed experts go NVFP4 (TRT-LLM's MTP_MOE_QUANT=nvfp4).
+            from sglang.srt.layers.quantization.perflp_draft_nvfp4 import (
+                PerfLpDraftNvFp4Config,
+            )
+
+            experts_quant_config = PerfLpDraftNvFp4Config()
+        self.experts = get_moe_impl_class(experts_quant_config)(
             layer_id=self.layer_id,
             top_k=(
                 config.num_experts_per_tok
@@ -331,7 +343,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             ),
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
-            quant_config=quant_config,
+            quant_config=experts_quant_config,
             prefix=add_prefix("experts", prefix),
             routing_method_type=RoutingMethodType.RenormalizeNaive,
             num_fused_shared_experts=self.num_fused_shared_experts,
