@@ -1225,13 +1225,17 @@ class Envs:
     # TRT-L18: ungated exact calls (the plugin's draft steps) as gated ones with all three switches: the fused partial
     # takes the prefix lengths as seq_lens - q_len itself (PDL after the q gather), then the per-(row, head) merge.
     SGLANG_TRTL18_CP_UNGATED = EnvBool(False)
-    # PERF-LB: the fused CP-lite partial (batches <= 32) shares one CTA per SM among the requests by their owned KV
+    # PERF-LB: the fused CP-lite partial shares one CTA per SM among the requests by their owned KV
     # (TRT's TRTLLM_Q35_ATTN_CP_BALANCED_SPLIT): no idle SMs when splits x batch < SMs, a ragged batch costs its total
     # KV instead of its longest request's. SM_RESERVE: SMs left out of that grid.
     SGLANG_PLB_CP_BALANCED = EnvBool(False)
     SGLANG_PLB_CP_SM_RESERVE = EnvInt(0)
-    # PERF-LB: CP-lite calls on the trtllm-gen partial (batches above the fused kernel's 32): the per-(row, head) merge
-    # (L18's, on the fold layout) instead of the per-row one, and, gated, the stock call gets no key when CP runs.
+    # PERF-LB: the fused partial's largest batch (TRT's TRTLLM_Q35_ATTN_CP_FUSED_MAX_BATCH[_Q1]), verify / q_len 1
+    # (draft) calls; above 32 only with SGLANG_PLB_CP_BALANCED (TRT r3's wide-plan and two-slot kernels, <= 128).
+    SGLANG_PLB_CP_FUSED_MAX_BATCH = EnvInt(32)
+    SGLANG_PLB_CP_FUSED_MAX_BATCH_Q1 = EnvInt(32)
+    # PERF-LB: CP-lite calls on the trtllm-gen partial (batches above the fused kernel's bound): the per-(row, head)
+    # merge (L18's, on the fold layout) instead of the per-row one, and, gated, the stock call gets no key when CP runs.
     SGLANG_PLB_CP_FOLD_MH = EnvBool(False)
     # PERF-LB: the trtllm-gen partial runs over chunk rows of C owned pages (each request's compact owned table cut into
     # chunks), then a base-2 LSE combine per request: a ragged batch costs its total KV instead of its longest request's.
