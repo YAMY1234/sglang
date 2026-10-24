@@ -6,9 +6,14 @@ Temperature rows: the Gumbel-max sample has the distribution softmax(logits / T)
 whole or split into shards (chi-square against the exact probabilities). The
 fallback gather rebuilds the stock gathered FP32 logits exactly. The LL key exchange
 (SGLANG_PERFLL_VERIFY_LL_KEYS) returns every row's max over all ranks' keys, launch after
-launch, whether the other ranks' words are already there or land while it polls."""
+launch, whether the other ranks' words are already there or land while it polls. The fused tail
+(SGLANG_PERFLL_VERIFY_FUSED_TAIL) writes every output the stock tail writes, greedy
+and Gumbel-max, with the argmax bonus of an injected acceptance, over trees that are
+and are not canonical chains; its channel rotates its slots by epoch, and a rank whose
+words arrive late only delays it."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -17,8 +22,10 @@ import triton.language as tl
 
 from sglang.srt.speculative import sharded_verify
 from sglang.srt.speculative.sharded_verify import (
+    TailChannel,
     VocabShard,
     _reduce_keys,
+    fused_verify_tail,
     gather_full_logits,
     key_splits,
     keys_to_tokens,
@@ -209,6 +216,360 @@ class TestLLKeys(CustomTestCase):
                     for late in (False, True) if world > 1 else (False,):
                         with self.subTest(world=world, rows=rows, late=late):
                             self._check(world, rows, late)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+class TestShardKeysPlain(CustomTestCase):
+    def test_one_pass_keys_match_two_launches(self):
+        # the fused tail's key pass: Gumbel keys at one temperature per request and the
+        # argmax keys of the same columns, bit for bit as two launches give
+        gen = torch.Generator(device="cuda").manual_seed(5)
+        width = 7
+        for rows, cols in ((7, 31040), (56, 31040), (896, 31040), (28, 4100)):
+            logits = (
+                torch.randn(rows, cols, device="cuda", generator=gen) * 4
+            ).bfloat16()
+            temps = torch.rand(rows // width, device="cuda", generator=gen) + 0.3
+            temps[::3] = 0.0
+            seeds = torch.randint(0, 2**31 - 1, (rows,), device="cuda", generator=gen)
+            shard = VocabShard(start=3 * cols, valid=cols, vocab_size=8 * cols - 5)
+            for split in (False, True):
+                splits = key_splits(cols) if split else 1
+                want = shard_keys(
+                    logits, shard, torch.repeat_interleave(temps, width), seeds, splits
+                ).view(rows, splits)
+                want_plain = shard_keys(logits, shard, splits=splits).view(rows, splits)
+                got = torch.empty((rows, splits), dtype=torch.int64, device="cuda")
+                got_plain = torch.empty_like(got)
+                sharded_verify._shard_key_kernel[(rows, splits)](
+                    logits,
+                    logits.stride(0),
+                    temps,
+                    seeds,
+                    got,
+                    shard.start,
+                    shard.valid,
+                    shard.vocab_size,
+                    -(-shard.valid // splits),
+                    KEY_FLOOR=sharded_verify._KEY_FLOOR,
+                    HAS_TEMP=True,
+                    BLOCK=sharded_verify._KEY_BLOCK,
+                    plain_keys_ptr=got_plain,
+                    PLAIN=True,
+                    TEMP_GROUP=width,
+                    num_warps=8,
+                )
+                with self.subTest(rows=rows, split=split):
+                    self.assertTrue(torch.equal(got, want))
+                    self.assertTrue(torch.equal(got_plain, want_plain))
+
+
+def _unicast_channel(world=1, epoch=0):
+    """A one-GPU tail channel: plain stores into its own buffer, as rank 0."""
+    rows = 2 * sharded_verify._TAIL_ROWS
+    buffer = torch.zeros(
+        sharded_verify._LL_SLOTS * world * rows * 2, dtype=torch.int64, device="cuda"
+    )
+    return TailChannel(
+        buffer=buffer,
+        epoch=torch.tensor([epoch], dtype=torch.int32, device="cuda"),
+        mc_addr=buffer.data_ptr(),
+        uc_addr=buffer.data_ptr(),
+        rank=0,
+        multicast=False,
+    )
+
+
+def _tokens(logits, shard, splits, temps=None, seeds=None):
+    keys = shard_keys(logits, shard, temps, seeds, splits)
+    return keys_to_tokens(keys.view(-1), 1, splits)
+
+
+def _trees(bs, width, target, gen, other_tree):
+    """Chains whose drafts follow `target` [bs, width] for prefixes of every length;
+    with other_tree, request 1 (width >= 4) is a tree that is not a canonical chain."""
+    cand = torch.randint(0, 1000, (bs, width), device="cuda", generator=gen)
+    for b in range(bs):
+        k = (3 * b) % width
+        cand[b, 1 : k + 1] = target[b, :k]
+        if k + 1 < width:
+            cand[b, k + 1] = target[b, k] + 1
+    ridx = torch.arange(bs * width, device="cuda").view(bs, width)
+    col = torch.arange(width, device="cuda").expand(bs, width)
+    rnext = torch.where(col < width - 1, col + 1, -1).contiguous()
+    rsib = torch.full_like(rnext, -1)
+    if other_tree and bs > 1 and width >= 4:
+        rnext[1, 1], rsib[1, 1] = 3, 2
+    return cand, ridx, rnext, rsib
+
+
+def _outputs(bs, width):
+    return dict(
+        predict=torch.full((bs * width,), -7, dtype=torch.int32, device="cuda"),
+        accept_index=torch.full((bs, width), -7, dtype=torch.int32, device="cuda"),
+        num_correct_drafts=torch.full((bs,), -7, dtype=torch.int32, device="cuda"),
+    )
+
+
+def _tree_args(tree):
+    cand, ridx, rnext, rsib = tree
+    return dict(
+        candidates=cand,
+        retrieve_index=ridx,
+        retrieve_next_token=rnext,
+        retrieve_next_sibling=rsib,
+    )
+
+
+def _stock_tail(logits, shard, splits, temps, width, tree, sim_len, token_mode, seed):
+    """eagle_sample's sharded tail on one rank: greedy, or a Gumbel-max target and then
+    the injected acceptance with its bonus (the argmax for real draft tokens)."""
+    from sglang.kernels.ops.speculative.eagle import chain_accept
+
+    bs = tree[0].shape[0]
+    out = _outputs(bs, width)
+    real_draft = token_mode == "real-draft-token"
+    common = dict(out, **_tree_args(tree))
+    if temps is None:
+        target = _tokens(logits, shard, splits).view(bs, width)
+        lens, index = chain_accept(
+            **common,
+            target_predict=target,
+            bonus_target=target,
+            simulated_acc_len=sim_len,
+            real_draft_tokens=real_draft,
+            verify=True,
+            finish=True,
+        )
+        return dict(out, accept_lens=lens, returned_index=index)
+    torch.cuda.manual_seed(seed)
+    seeds = torch.randint(0, 2**31 - 1, (bs * width,), dtype=torch.int64, device="cuda")
+    temps_rows = torch.repeat_interleave(temps, width)
+    target = _tokens(logits, shard, splits, temps_rows, seeds).view(bs, width)
+    chain_accept(
+        **common,
+        target_predict=target,
+        bonus_target=None,
+        simulated_acc_len=None,
+        real_draft_tokens=False,
+        verify=True,
+        finish=False,
+    )
+    if sim_len is None:
+        return dict(
+            out,
+            accept_lens=out["num_correct_drafts"] + 1,
+            returned_index=out["accept_index"],
+        )
+    bonus = _tokens(logits, shard, splits).view(bs, width) if real_draft else target
+    lens, index = chain_accept(
+        **common,
+        target_predict=None,
+        bonus_target=bonus,
+        simulated_acc_len=sim_len,
+        real_draft_tokens=real_draft,
+        verify=False,
+        finish=True,
+    )
+    return dict(out, accept_lens=lens, returned_index=index)
+
+
+def _fused_tail(logits, shard, temps, width, tree, sim_len, token_mode, seed):
+    out = _outputs(tree[0].shape[0], width)
+    real_draft = token_mode == "real-draft-token"
+    torch.cuda.manual_seed(seed)
+    lens, index = fused_verify_tail(
+        logits=logits,
+        shard=shard,
+        tp_group=SimpleNamespace(world_size=1),
+        temperatures=temps,
+        plain_bonus=temps is not None and sim_len is not None and real_draft,
+        simulated_acc_len=sim_len,
+        real_draft_tokens=real_draft,
+        **out,
+        **_tree_args(tree),
+    )
+    return dict(out, accept_lens=lens, returned_index=index)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+class TestFusedTail(CustomTestCase):
+    def setUp(self):
+        self.channel = _unicast_channel()
+        patcher = patch.object(sharded_verify, "_tail_state", self.channel)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _round(self, *, bs, width, cols, sampled, sim, token_mode, split, other, gen):
+        rows = bs * width
+        logits = (torch.randn(rows, cols, device="cuda", generator=gen) * 3).bfloat16()
+        # a tie inside a row: the smaller token id wins on both paths
+        logits[0, 7] = logits[0, cols - 2] = logits[0].float().max() + 1
+        shard = VocabShard(start=cols, valid=cols, vocab_size=2 * cols)
+        splits = key_splits(cols) if split else 1
+        seed = 1000 + rows
+        temps = None
+        if sampled:
+            temps = torch.rand(bs, device="cuda", generator=gen) + 0.5
+            temps[1::4] = 0.0
+            torch.cuda.manual_seed(seed)
+            seeds = torch.randint(
+                0, 2**31 - 1, (rows,), dtype=torch.int64, device="cuda"
+            )
+            walk = _tokens(
+                logits, shard, splits, torch.repeat_interleave(temps, width), seeds
+            )
+        else:
+            walk = _tokens(logits, shard, splits)
+        tree = _trees(bs, width, walk.view(bs, width), gen, other)
+        sim_len = torch.tensor([sim], device="cuda") if sim else None
+        args = (temps, width, tree, sim_len, token_mode, seed)
+        with patch.object(sharded_verify, "_SPLIT", split):
+            want = _stock_tail(logits, shard, splits, *args)
+            got = _fused_tail(logits, shard, *args)
+        return want, got
+
+    def _assert_same(self, want, got):
+        for name, w in want.items():
+            self.assertEqual(got[name].dtype, w.dtype, name)
+            self.assertTrue(torch.equal(got[name], w), name)
+
+    def test_matches_the_stock_tail(self):
+        gen = torch.Generator(device="cuda").manual_seed(7)
+        shapes = ((1, 7), (2, 7), (4, 7), (8, 7), (9, 7), (8, 8), (3, 2), (5, 4))
+        modes = ((0, "fixed"), (1, "fixed"), (4, "real-draft-token"))
+        for bs, width in shapes:
+            for sampled in (False, True):
+                for sim, token_mode in modes + ((width, "real-draft-token"),):
+                    for split, other in ((False, False), (True, True)):
+                        want, got = self._round(
+                            bs=bs,
+                            width=width,
+                            cols=31040 if bs == 4 else 2100,
+                            sampled=sampled,
+                            sim=sim,
+                            token_mode=token_mode,
+                            split=split,
+                            other=other,
+                            gen=gen,
+                        )
+                        with self.subTest(
+                            bs=bs, width=width, sampled=sampled, sim=sim, mode=token_mode, split=split
+                        ):
+                            self._assert_same(want, got)
+
+    def test_epochs_rotate_the_slots_across_greedy_and_sampled_rounds(self):
+        # greedy rounds and sampled rounds with the argmax bonus alternate on one channel:
+        # each round advances the epoch once and tags its words in slot (epoch % 3)
+        gen = torch.Generator(device="cuda").manual_seed(9)
+        maxr = 2 * sharded_verify._TAIL_ROWS
+        for i in range(7):
+            bs = 2 if i % 2 else 9
+            want, got = self._round(
+                bs=bs,
+                width=7,
+                cols=2100,
+                sampled=bool(i % 2),
+                sim=4,
+                token_mode="real-draft-token",
+                split=True,
+                other=False,
+                gen=gen,
+            )
+            torch.cuda.synchronize()
+            tag = i + 1
+            words = self.channel.buffer.view(3, maxr, 2)[tag % 3]
+            with self.subTest(round=i):
+                self._assert_same(want, got)
+                self.assertEqual(int(self.channel.epoch), tag)
+                self.assertTrue(bool(((words[: bs * 7] >> 32) == tag).all()))
+                plain = words[maxr // 2 : maxr // 2 + bs * 7]
+                self.assertEqual(bool(((plain >> 32) == tag).all()), bool(i % 2))
+
+    def test_a_late_rank_only_delays_the_tail(self):
+        # two ranks on one GPU: rank 1's words land ~1 ms after the tail starts polling
+        from sglang.kernels.ops.speculative.eagle import chain_accept
+
+        gen = torch.Generator(device="cuda").manual_seed(11)
+        bs, width, parts, world = 3, 7, 4, 2
+        rows, maxr = bs * width, 2 * sharded_verify._TAIL_ROWS
+        keys = torch.randint(
+            -(2**62), 2**62, (world, rows, parts), device="cuda", generator=gen
+        )
+        best = keys.amax(dim=(0, 2))
+        target = (0xFFFFFFFF - (best & 0xFFFFFFFF)).view(bs, width)
+        tree = _trees(bs, width, target, gen, other=False)
+        channel = _unicast_channel(world=world, epoch=4)
+        tag = 5
+        late = keys[1].amax(dim=1)
+        at = ((tag % 3 * world + 1) * maxr + torch.arange(rows, device="cuda")) * 2
+        out = _outputs(bs, width)
+        tokens = torch.empty(rows, dtype=torch.int64, device="cuda")
+        lens = torch.empty(bs, dtype=torch.int32, device="cuda")
+        sim_index = torch.empty_like(out["accept_index"])
+        sim_len = torch.tensor([5], device="cuda")
+        polling, writer = torch.cuda.Stream(), torch.cuda.Stream()
+        start, done = (torch.cuda.Event(enable_timing=True) for _ in range(2))
+        torch.cuda.synchronize()
+        with torch.cuda.stream(polling):
+            sharded_verify._ll_accept_kernel[(1,)](
+                keys[0],
+                keys[0],
+                parts,
+                channel.mc_addr,
+                channel.uc_addr,
+                channel.epoch,
+                tokens,
+                tokens,
+                out["predict"],
+                out["accept_index"],
+                out["num_correct_drafts"],
+                lens,
+                sim_index,
+                *tree,
+                sim_len,
+                bs,
+                RANK=0,
+                WORLD=world,
+                MAXR=maxr,
+                PLAIN_ROW=sharded_verify._TAIL_ROWS,
+                WIDTH=width,
+                BLOCK_B=4,
+                BLOCK_W=8,
+                BLOCK_P=4,
+                KEY_FLOOR=sharded_verify._KEY_FLOOR,
+                SPIN_LIMIT=sharded_verify._LL_SPIN_LIMIT,
+                PLAIN=False,
+                SIMULATE=True,
+                REAL_DRAFT_TOKENS=True,
+                MULTICAST=False,
+                num_warps=4,
+            )
+            done.record()
+        with torch.cuda.stream(writer):
+            start.record()
+            torch.cuda._sleep(2_000_000)
+            channel.buffer[at] = (late & 0xFFFFFFFF) | (tag << 32)
+            channel.buffer[at + 1] = ((late >> 32) & 0xFFFFFFFF) | (tag << 32)
+        torch.cuda.synchronize()
+        self.assertGreater(start.elapsed_time(done), 0.2)  # it waited for rank 1
+        ref = _outputs(bs, width)
+        ref_lens, ref_index = chain_accept(
+            **ref,
+            **_tree_args(tree),
+            target_predict=target,
+            bonus_target=target,
+            simulated_acc_len=sim_len,
+            real_draft_tokens=True,
+            verify=True,
+            finish=True,
+        )
+        self.assertTrue(torch.equal(tokens.view(bs, width), target))
+        for name in ref:
+            self.assertTrue(torch.equal(out[name], ref[name]), name)
+        self.assertTrue(torch.equal(lens, ref_lens))
+        self.assertTrue(torch.equal(sim_index, ref_index))
+        self.assertEqual(int(channel.epoch), tag)
 
 
 class _FakeGroup:

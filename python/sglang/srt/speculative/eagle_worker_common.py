@@ -743,6 +743,8 @@ def run_eagle_verify(
     # eagle_prepare_for_verify marked the batch in exactly that case; the
     # non-cuda-graph path stays unmarked and gets forward_extend's init
     # (post-pad).
+    if post_verify_graphs is not None:
+        post_verify_graphs.mark_inputs_ready()
     forward_batch_output = target_worker.forward_batch_generation(
         batch=None,
         forward_batch=verify_forward_batch,
@@ -750,7 +752,8 @@ def run_eagle_verify(
         pp_proxy_tensors=pp_proxy_tensors,
     )
     if host_trace.ENABLED:
-        host_trace.mark(host_trace.VF1)
+        # a GPU mark: VF1 -> VERIFY1 is the post-verify section on the device
+        host_trace.gpu_mark(host_trace.VF1)
     logits_output = forward_batch_output.logits_output
 
     clear_unaccepted_c128 = getattr(

@@ -25,6 +25,7 @@ from sglang.srt.mem_cache.allocation_sizing import (
 from sglang.srt.runtime_context import get_exec, get_spec
 from sglang.srt.speculative.sharded_verify import (
     VocabShard,
+    fused_verify_tail,
     gather_full_logits,
     sharded_target_tokens,
 )
@@ -60,6 +61,7 @@ _COMPACT_VERIFY_SAMPLING = envs.SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING.get()
 _PACKED_VERIFY_BCAST = envs.SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST.get()
 _FUSED_ACCEPT = envs.SGLANG_Q35MF_FUSED_ACCEPT.get()
 _SHARDED_VERIFY = envs.SGLANG_Q35MF_SHARDED_VERIFY.get()
+_FUSED_TAIL = envs.SGLANG_PERFLL_VERIFY_FUSED_TAIL.get()
 
 logger = logging.getLogger(__name__)
 
@@ -983,7 +985,24 @@ def eagle_sample(
     # Sample tokens
     target_predict = None
     accept_lens = None
-    if greedy:
+    tail = (
+        _fused_verify_tail(
+            logits=next_token_logits,
+            vocab_shard=vocab_shard,
+            temperatures=None if greedy else sampling_info.temperatures.view(-1),
+            verify_input=verify_input,
+            candidates=candidates,
+            predict=predict,
+            accept_index=accept_index,
+            num_correct_drafts=num_correct_drafts,
+            simulated_acc_len=simulated_acc_len,
+        )
+        if _FUSED_TAIL and fused_verify and vocab_shard is not None
+        else None
+    )
+    if tail is not None:
+        accept_lens, accept_index = tail
+    elif greedy:
         target_predict = _target_argmax(next_token_logits, vocab_shard)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         if fused_verify:
@@ -1380,6 +1399,48 @@ def _chain_accept(
         real_draft_tokens=real_draft_tokens,
         verify=target_predict is not None,
         finish=finish,
+    )
+
+
+def _fused_verify_tail(
+    *,
+    logits: torch.Tensor,
+    vocab_shard: VocabShard,
+    temperatures: Optional[torch.Tensor],
+    verify_input: EagleVerifyInput,
+    candidates: torch.Tensor,
+    predict: torch.Tensor,
+    accept_index: torch.Tensor,
+    num_correct_drafts: torch.Tensor,
+    simulated_acc_len: Optional[torch.Tensor],
+) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    """(accept_lens, accept_index) of the sharded target pick and the chain tail
+    (SGLANG_PERFLL_VERIFY_FUSED_TAIL), every output as the stock tail writes it, greedy or
+    at temperatures [bs]; None when it does not apply (the stock tail runs)."""
+    from sglang.srt.runtime_context import get_parallel
+    from sglang.srt.speculative.spec_utils import (
+        SIMULATE_ACC_LEN,
+        SIMULATE_ACC_TOKEN_MODE,
+    )
+
+    simulate = SIMULATE_ACC_LEN > 0
+    real_draft_tokens = SIMULATE_ACC_TOKEN_MODE == "real-draft-token"
+    return fused_verify_tail(
+        logits=logits,
+        shard=vocab_shard,
+        tp_group=get_parallel().tp_group,
+        temperatures=temperatures,
+        # a sampled target's injected bonus is the argmax (eagle_sample's simulation block)
+        plain_bonus=temperatures is not None and simulate and real_draft_tokens,
+        predict=predict,
+        accept_index=accept_index,
+        num_correct_drafts=num_correct_drafts,
+        candidates=candidates,
+        retrieve_index=verify_input.retrieve_index,
+        retrieve_next_token=verify_input.retrieve_next_token,
+        retrieve_next_sibling=verify_input.retrieve_next_sibling,
+        simulated_acc_len=simulated_acc_len if simulate else None,
+        real_draft_tokens=real_draft_tokens,
     )
 
 
