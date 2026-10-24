@@ -104,15 +104,19 @@ class EaglePostVerifyGraphs:
         published_seq_lens: torch.Tensor,
     ) -> None:
         """SGLANG_PERFLL_RS_D1: for a batch size the draft extend graph ``runner`` captured as
-        it is, the graph also writes that runner's static inputs (the hidden rows on a branch
-        beside the accept chain) and publishes the new lengths to ``published_seq_lens``."""
+        it is (up to SGLANG_PERFLL_RS_D1_MAX_BS), the graph also writes that runner's static
+        inputs (the hidden rows on a branch beside the accept chain) and publishes the new lengths
+        to ``published_seq_lens``."""
+        max_bs = envs.SGLANG_PERFLL_RS_D1_MAX_BS.get()
         self._rs_d1 = SimpleNamespace(
             buffers=runner.buffers,
-            batch_sizes=frozenset(runner.capture_bs),
+            batch_sizes=frozenset(
+                bs for bs in runner.capture_bs if max_bs <= 0 or bs <= max_bs
+            ),
             width=runner.captured_req_width,
             req_to_token=req_to_token,
             published_seq_lens=published_seq_lens,
-            hidden_stream=torch.cuda.Stream(),
+            hidden_stream=None,
         )
 
     def run(
@@ -300,6 +304,8 @@ class EaglePostVerifyGraphs:
         extend = slot.extend_inputs
         if extend is not None:
             # the hidden rows do not wait for the acceptance: a branch beside the accept chain
+            if self._rs_d1.hidden_stream is None:
+                self._rs_d1.hidden_stream = torch.cuda.Stream()
             main, hidden_stream = torch.cuda.current_stream(), self._rs_d1.hidden_stream
             hidden_stream.wait_stream(main)
             with torch.cuda.stream(hidden_stream):
