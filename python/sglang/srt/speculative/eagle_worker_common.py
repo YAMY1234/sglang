@@ -23,6 +23,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.runtime_context import mamba_track_grid
+from sglang.srt.speculative import perfll_step2
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
@@ -294,11 +295,8 @@ def prepare_for_draft(
         with_mrope = draft_model_runner.model_config.model_is_mrope and all(
             x is None for x in batch.multimodal_inputs
         )
-        if (
-            staged is not None
-            and plans_window
-            and staged.num_requests == bs
-            and (staged.mrope is not None) == with_mrope
+        if staged is not None and perfll_step2.takes_staging(
+            staged, num_requests=bs, plans_window=plans_window, with_mrope=with_mrope
         ):
             batch.out_cache_loc = staged.window
             prepared_positions = staged.positions

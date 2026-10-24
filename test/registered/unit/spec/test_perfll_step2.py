@@ -13,7 +13,12 @@ from sglang.srt.mem_cache.allocation_sizing import (
 )
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.speculative.perfll_step2 import NextDraft, Step2Check, Step2Counter
+from sglang.srt.speculative.perfll_step2 import (
+    NextDraft,
+    Step2Check,
+    Step2Counter,
+    takes_staging,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -114,6 +119,23 @@ class TestPerfllStep2(CustomTestCase):
         # the first difference: the window's last slot in the second comparison
         self.assertEqual(check.first.tolist(), [4, 5, 2, 202, 7])
         self.assertIn("first difference window[5] at B2: staged 202, eager 7", check.summary())
+
+    def test_a_draft_declines_a_staging_of_another_size_plan_or_mrope_choice(self):
+        """Mode 3 takes, and mode 2 compares, only a staging the eager path would match: a batch
+        with multimodal inputs computes M-RoPE rows with per-request offsets the staging lacks."""
+        rows = torch.zeros(2, dtype=torch.int64)
+        staged = NextDraft(
+            num_requests=2,
+            seq_lens=rows,
+            positions=rows,
+            mrope=torch.zeros(3, 2, dtype=torch.int64),
+            draft_out_cache_loc=rows,
+            window=rows,
+        )
+        take = dict(num_requests=2, plans_window=True, with_mrope=True)
+        self.assertTrue(takes_staging(staged, **take))
+        for field, value in (("num_requests", 3), ("plans_window", False), ("with_mrope", False)):
+            self.assertFalse(takes_staging(staged, **{**take, field: value}), field)
 
     def test_the_switch_reserves_three_windows(self):
         with (
