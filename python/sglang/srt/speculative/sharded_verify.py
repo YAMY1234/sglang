@@ -342,6 +342,9 @@ def _ll_keys_kernel(
     pending = tl.sum(1 - ok.to(tl.int32))
     spins = 0
     while pending > 0:
+        # every warp has read the last count before any warp reduces the next one: without
+        # it some warps left the poll on a stale count and took words a slot held before
+        tl.debug_barrier()
         lo = _ll_ld_b64(uc + words, m2)
         hi = _ll_ld_b64(uc + words + 1, m2)
         ok = (((lo >> 32) == tag) & ((hi >> 32) == tag)) | (~m2)
