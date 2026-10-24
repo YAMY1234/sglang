@@ -393,6 +393,14 @@ class _PostVerifyGraphs:
             self._pool = torch.cuda.graph_pool_handle()
             self._side_stream = torch.cuda.Stream()
             self._main_done, self._commit_done = torch.cuda.Event(), torch.cuda.Event()
+            logger.info(
+                "Post-verify commit: side stream priority %d, launching stream priority %d, "
+                "late join %s, resident commit CTAs %d",
+                self._side_stream.priority,
+                torch.cuda.current_stream().priority,
+                envs.SGLANG_PLB_COMMIT_LATE_JOIN.get(),
+                envs.SGLANG_PERFLL_COMMIT_CTAS.get(),
+            )
         graph = torch.cuda.CUDAGraph()
         with graph_capture(stream=torch.cuda.current_stream()) as ctx:
             with torch.cuda.graph(
