@@ -14,6 +14,7 @@ from sglang.kernels.ops.speculative.eagle import (
     prepare_draft_extend_lengths,
     prepare_verify_commit_outputs,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -51,6 +52,8 @@ from sglang.srt.utils.common import is_npu
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
+# SGLANG_PERFLL_STEP5A_DRAFT_LOCS: a staged draft's write slots are the staged buffer itself
+_STAGED_DRAFT_LOCS = envs.SGLANG_PERFLL_STEP5A_DRAFT_LOCS.get()
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -299,13 +302,18 @@ def prepare_for_draft(
             batch.out_cache_loc = staged.window
             prepared_positions = staged.positions
             prepared_mrope_positions = staged.mrope
-            kv_loc_plan = target_translator.plan(
+            iteration_ids = target_translator.plan(
                 req_pool_indices=batch.req_pool_indices,
                 seq_lens=batch.seq_lens,
                 seq_lens_cpu=batch.seq_lens_cpu,
                 write_virtual=batch.out_cache_loc,
                 read_extent=num_draft_tokens,
             )
+            if _STAGED_DRAFT_LOCS:
+                # the same launch wrote them from the same slots as the window's first columns
+                iteration_ids.take_staged_cols(
+                    slice(0, num_steps), staged.draft_out_cache_loc
+                )
         elif page_size == 1 or topk == 1:
             empty = perfll_host.round_empty if perfll_host.OUT_POOL else perfll_host.torch_empty
             batch.out_cache_loc = empty(
