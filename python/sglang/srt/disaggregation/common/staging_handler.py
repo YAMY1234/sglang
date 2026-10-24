@@ -376,6 +376,23 @@ class DecodeStagingHandler:
         """Return True if staging completion timed out for this request."""
         return decode_req._staging_failed
 
+    def plb_all_submitted(self, decode_req: DecodeRequest) -> bool:
+        """SGLANG_PLB_DECODE_POLL_EARLY=2: all ranks reported Success and every chunk's scatter is on a stream; a batch
+        launched after this point reads the room behind those scatters (forward stream under SGLANG_PLB_SCATTER_DEFER).
+        """
+        if not decode_req._staging_all_success:
+            return False
+        receiver = self._room_to_receiver.get(decode_req.req.bootstrap_room)
+        chunk_infos = receiver.chunk_staging_infos if receiver is not None else []
+        return not any(info[0] >= 0 for info in chunk_infos)
+
+    def plb_finish_scatter(self, decode_req: DecodeRequest) -> None:
+        """Block on the room's outstanding scatter events, then complete it (after an all-ranks Success vote taken
+        with plb_all_submitted; the events sit right behind the batch in flight)."""
+        for event, _alloc_id in decode_req._chunk_events:
+            event.synchronize()
+        self.advance_scatter(decode_req)
+
     def advance_scatter(self, decode_req: DecodeRequest) -> None:
         """Poll scatter events, free completed allocations, detect completion.
 

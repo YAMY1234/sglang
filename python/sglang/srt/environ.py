@@ -1275,7 +1275,8 @@ class Envs:
     SGLANG_PLB_SCATTER_DEFER = EnvInt(0)
     # PERF-LB: the overlap PD decode loop polls the KV transfers (and their gloo all-reduce) right after it launches a
     # batch, while the previous batch still runs, instead of in process_decode_queue; the polled requests wait in the
-    # waiting queue for the next batch. 0: off; 1: on.
+    # waiting queue for the next batch. 0: off; 1: on; 2: on, and a staged room whose chunks are all on the forward
+    # stream (SGLANG_PLB_SCATTER_DEFER) votes ready, the host waiting for its scatter events after the vote.
     SGLANG_PLB_DECODE_POLL_EARLY = EnvInt(0)
     # PERF-LP (precision-lowered line, TRT's TRTLLM_Q35_MTP_MOE_QUANT=nvfp4): the MTP draft's routed experts become NVFP4
     # at load time with TRT's ModelOpt recipe and run on the target's NVFP4 MoE path. The target is untouched.

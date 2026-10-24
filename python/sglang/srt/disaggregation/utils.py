@@ -310,8 +310,13 @@ def poll_and_all_reduce_with_staging(
     gloo_group: dist.ProcessGroup,
     metadata_buffers: Optional[MetadataBuffers] = None,
     pollers=None,
+    done_on_submit: bool = False,
 ):
-    """Staging-aware polling: advance scatter, demote incomplete transfers, all_reduce."""
+    """Staging-aware polling: advance scatter, demote incomplete transfers, all_reduce.
+
+    done_on_submit (SGLANG_PLB_DECODE_POLL_EARLY=2): a room whose chunks are all on the forward stream votes Success
+    before its scatter events fire; after an all-ranks Success the host waits for those events here.
+    """
     for decode_req in decode_reqs:
         if decode_req.kv_receiver.require_staging and not staging_handler.is_done(
             decode_req
@@ -331,14 +336,27 @@ def poll_and_all_reduce_with_staging(
             raw_polls[i] = int(KVPoll.Failed)
             continue
         if raw_polls[i] == int(KVPoll.Success):
-            if decode_req.kv_receiver.require_staging and not staging_handler.is_done(
-                decode_req
+            if (
+                decode_req.kv_receiver.require_staging
+                and not staging_handler.is_done(decode_req)
+                and not (
+                    done_on_submit and staging_handler.plb_all_submitted(decode_req)
+                )
             ):
                 raw_polls[i] = int(KVPoll.Transferring)
     # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
     if metadata_buffers is not None:
         _apply_metadata_gate(raw_polls, decode_reqs, metadata_buffers)
-    return _all_reduce_polls(raw_polls, gloo_group)
+    polls = _all_reduce_polls(raw_polls, gloo_group)
+    if done_on_submit:
+        for decode_req, poll in zip(decode_reqs, polls):
+            if (
+                poll == int(KVPoll.Success)
+                and decode_req.kv_receiver.require_staging
+                and not staging_handler.is_done(decode_req)
+            ):
+                staging_handler.plb_finish_scatter(decode_req)
+    return polls
 
 
 #########################

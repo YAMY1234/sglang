@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, Mock, patch
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.common.conn import KVTransferError
+from sglang.srt.disaggregation.common.staging_handler import DecodeStagingHandler
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
@@ -816,6 +817,7 @@ class TestPlbDecodePollEarly(CustomTestCase):
         for mode, expected in (
             (0, ["in", "pp", "px", "nb", "rb", "pr"]),
             (1, ["in", "pp", "nb", "rb", "px", "pr"]),
+            (2, ["in", "pp", "nb", "rb", "px", "pr"]),
         ):
             with self.subTest(mode=mode):
                 log, _ = self.run_loop(mode)
@@ -858,6 +860,131 @@ class TestPlbDecodePollEarly(CustomTestCase):
         log, launched = self.run_loop(1, background=False, ready_after=(1, "in"))
         self.assertEqual(self.stages(log, 1), ["in", "pp", "nb", "px"])
         self.assertEqual(launched, {2: ["new"], 3: ["new"], 4: ["new"]})
+
+
+class _FakeScatterEvent:
+    def __init__(self):
+        self.fired = False
+        self.synchronized = False
+
+    def record(self, stream=None):
+        pass
+
+    def query(self):
+        return self.fired
+
+    def synchronize(self):
+        self.synchronized = True
+        self.fired = True
+
+
+class TestPlbStagingDoneOnSubmit(CustomTestCase):
+    """SGLANG_PLB_DECODE_POLL_EARLY=2: a staged room whose chunks are all on the forward stream votes Success, and
+    the host waits for its scatter events only after every rank voted Success."""
+
+    def make_room(self, *, last_success=True):
+        self.freed, self.events = [], []
+        allocator = SimpleNamespace(
+            free=self.freed.append, get_watermark=lambda: (0, 0), _scatter_stream=None
+        )
+        kv_manager = SimpleNamespace(
+            pp_size=1,
+            _staging_ctx=SimpleNamespace(room_receivers={}, room_bootstrap={}),
+        )
+        with envs.SGLANG_PLB_SCATTER_DEFER.override(1):
+            handler = DecodeStagingHandler(
+                kv_manager=kv_manager,
+                staging_allocator=allocator,
+                kv_buffer_info={"page_size": 64},
+                decode_tp=8,
+                total_kv_heads=2,
+                tp_rank=0,
+                scheduler=None,
+            )
+        handler._scatter_region = lambda *args, **kwargs: True
+        receiver = SimpleNamespace(
+            prefill_info=SimpleNamespace(attn_tp_size=2, pp_size=1),
+            bootstrap_infos=[],
+            chunk_staging_infos=[(7, 0, 0, -1, 0), (8, 4096, 0, -1, 0)],
+            require_staging=True,
+            poll=lambda: KVPoll.Success,
+        )
+        decode_req = SimpleNamespace(
+            req=SimpleNamespace(
+                bootstrap_room=5, kv=SimpleNamespace(cache_protected_len=0)
+            ),
+            kv_receiver=receiver,
+        )
+        handler.register_decode_req(5, decode_req)
+        handler.handle_chunk_arrived(5, 0, 0, 4, "w0")
+        if last_success:
+            handler.submit_last_scatter_async(5)
+        return handler, decode_req
+
+    def flush(self, handler):
+        def new_event():
+            self.events.append(_FakeScatterEvent())
+            return self.events[-1]
+
+        with patch("torch.cuda.Event", side_effect=new_event):
+            handler.plb_flush(stream="forward")
+
+    def poll(self, handler, decode_req, *, done_on_submit, peer=KVPoll.Success):
+        with patch(
+            "sglang.srt.disaggregation.utils._all_reduce_polls",
+            side_effect=lambda polls, group: [min(p, int(peer)) for p in polls],
+        ):
+            return poll_and_all_reduce_with_staging(
+                [decode_req],
+                staging_handler=handler,
+                gloo_group=MagicMock(),
+                done_on_submit=done_on_submit,
+            )
+
+    def test_submitted_room_votes_ready_and_waits_after_the_vote(self):
+        handler, decode_req = self.make_room()
+        handler.handle_chunk_arrived(5, 1, 4, 4, "w0")
+        self.flush(handler)
+        self.assertEqual(len(self.events), 2)
+        self.assertEqual(
+            self.poll(handler, decode_req, done_on_submit=False),
+            [KVPoll.Transferring],
+        )
+        self.assertFalse(any(e.synchronized for e in self.events))
+        self.assertEqual(
+            self.poll(handler, decode_req, done_on_submit=True), [KVPoll.Success]
+        )
+        self.assertTrue(all(e.synchronized for e in self.events))
+        self.assertEqual(sorted(self.freed), [7, 8])
+        self.assertTrue(handler.is_done(decode_req))
+
+    def test_room_is_not_ready_until_every_chunk_is_submitted(self):
+        handler, decode_req = self.make_room()
+        self.flush(handler)
+        # The second chunk arrives after the flush, so its scatter is still queued.
+        handler.handle_chunk_arrived(5, 1, 4, 4, "w0")
+        self.assertEqual(
+            self.poll(handler, decode_req, done_on_submit=True),
+            [KVPoll.Transferring],
+        )
+        self.assertFalse(any(e.synchronized for e in self.events))
+        self.flush(handler)
+        self.assertEqual(
+            self.poll(handler, decode_req, done_on_submit=True), [KVPoll.Success]
+        )
+
+    def test_no_wait_without_an_all_ranks_success(self):
+        for last_success, peer in ((True, KVPoll.Transferring), (False, KVPoll.Success)):
+            with self.subTest(last_success=last_success, peer=peer):
+                handler, decode_req = self.make_room(last_success=last_success)
+                handler.handle_chunk_arrived(5, 1, 4, 4, "w0")
+                self.flush(handler)
+                self.assertEqual(
+                    self.poll(handler, decode_req, done_on_submit=True, peer=peer),
+                    [KVPoll.Transferring],
+                )
+                self.assertFalse(any(e.synchronized for e in self.events))
+                self.assertEqual(self.freed, [])
 
 
 if __name__ == "__main__":

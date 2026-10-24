@@ -2612,6 +2612,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.spec_algorithm = scheduler.spec_algorithm
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.staging_handler = None
+        # SGLANG_PLB_DECODE_POLL_EARLY=2 (set by the overlap decode loop): staged rooms vote on submitted scatters.
+        self.plb_done_on_submit = False
         self.enable_deferred_kv_release = (
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
         )
@@ -2827,6 +2829,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             self.gloo_group,
             metadata_buffers=self.metadata_buffers,
             pollers=self._pollers(),
+            done_on_submit=self.plb_done_on_submit,
         )
 
     def _init_staging_handler(self, kv_manager):
@@ -3314,9 +3317,15 @@ class SchedulerDisaggregationDecodeMixin:
             and not self.enable_hisparse
         )
         self._plb_poll_early = supported
+        transfer_queue = self.disagg_decode_transfer_queue
+        handler = transfer_queue.staging_handler
+        transfer_queue.plb_done_on_submit = (
+            supported and mode == 2 and handler is not None and bool(handler.plb_defer)
+        )
         logger.info(
             f"SGLANG_PLB_DECODE_POLL_EARLY={mode}: early transfer poll "
-            f"{'on' if supported else 'off (host receive / decode HiCache / HiSparse)'} "
+            f"{'on' if supported else 'off (host receive / decode HiCache / HiSparse)'}, "
+            f"staged rooms vote on submit {transfer_queue.plb_done_on_submit} "
             f"(tp_rank {get_parallel().tp_rank})"
         )
 
