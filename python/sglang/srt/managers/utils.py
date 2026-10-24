@@ -55,9 +55,11 @@ def install_default_stream_priority(default_priority: int) -> None:
     stream_new = torch.cuda.Stream.__new__
 
     def _new(cls, device=None, priority=None, **kwargs):
-        return stream_new(
-            cls, device, default_priority if priority is None else priority, **kwargs
-        )
+        # kwargs (stream_id / stream_ptr / device_index / device_type) wrap an existing stream,
+        # which refuses a nonzero priority
+        if priority is None:
+            priority = 0 if kwargs else default_priority
+        return stream_new(cls, device, priority, **kwargs)
 
     torch.cuda.Stream.__new__ = staticmethod(_new)
     logger.info("CUDA streams created without a priority get %d", default_priority)
