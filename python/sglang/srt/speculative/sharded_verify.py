@@ -577,10 +577,6 @@ def _ll_accept_kernel(
 
     tag = (tl.load(epoch_ptr) + 1).to(tl.uint64)
     slot = (tag % 3).to(tl.int64)
-    # every warp has read the epoch before any warp can advance it below: a warp whose
-    # poll needs only its own words may finish first, and a later reader would take a
-    # slot of stale words
-    tl.debug_barrier()
     r = tl.arange(0, BLOCK_R)
     rmask = r < bs * WIDTH
     p = tl.arange(0, BLOCK_P)
@@ -597,12 +593,16 @@ def _ll_accept_kernel(
     s = tl.arange(0, WORLD)
     mw = rmask[None, :] & (s[:, None] < WORLD)
     words = ((slot * WORLD + s[:, None]) * MAXR + r[None, :]) * 2
+    tl.debug_barrier()
     lo, hi, pending = _tail_pending(uc, words, tag, mw)
     if PLAIN:
         lo_p, hi_p, pending_p = _tail_pending(uc, words + 2 * PLAIN_ROW, tag, mw)
         pending += pending_p
     spins = 0
     while pending > 0:
+        # every warp has read the last count before any warp reduces the next one: without
+        # it some warps left the poll on a stale count and took words a slot held before
+        tl.debug_barrier()
         lo, hi, pending = _tail_pending(uc, words, tag, mw)
         if PLAIN:
             lo_p, hi_p, pending_p = _tail_pending(uc, words + 2 * PLAIN_ROW, tag, mw)
@@ -613,7 +613,8 @@ def _ll_accept_kernel(
     tl.store(tokens_ptr + r, _tail_tokens(lo, hi, mw, KEY_FLOOR), mask=rmask)
     if PLAIN:
         tl.store(bonus_tokens_ptr + r, _tail_tokens(lo_p, hi_p, mw, KEY_FLOOR), mask=rmask)
-    # every warp is done polling, and the accept below reads back every warp's tokens
+    # every warp has read the epoch and is done polling before it advances, and the accept
+    # below reads back every warp's tokens
     tl.debug_barrier()
     tl.store(epoch_ptr, tag.to(tl.int32))
 
