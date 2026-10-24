@@ -140,7 +140,7 @@ class Step2Counter:
         reqs = batch.reqs
         need = 3 * self.width
         self.noted = (
-            tuple(r.req_pool_idx for r in reqs),
+            tuple(r.kv.req_pool_idx for r in reqs),
             len(reqs) in self.graph_sizes,
             all(r.kv.kv_allocated_len >= r.kv.kv_committed_len + need for r in reqs),
             next_draft,
@@ -157,7 +157,7 @@ class Step2Counter:
         staged = None
         if noted is None:
             reason = "no_previous_decode"
-        elif noted[0] != tuple(r.req_pool_idx for r in batch.reqs):
+        elif noted[0] != tuple(r.kv.req_pool_idx for r in batch.reqs):
             reason = "batch_changed"
         elif not noted[1]:
             reason = "padded"
