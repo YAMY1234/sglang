@@ -150,11 +150,20 @@ def prepare_draft_window(
     rows = req_pool_indices.numel()
     if rows == 0:
         return
-    assert num_steps <= window
+    assert num_steps <= window and seq_lens.numel() >= rows
     assert req_pool_indices.is_contiguous() and seq_lens.is_contiguous()
-    for t in (seq_lens_out, positions, draft_out_cache_loc, write_virtual):
-        assert t is None or (t.dtype == torch.int64 and t.is_contiguous())
-    assert mrope is None or (mrope.dtype == torch.int64 and mrope.stride(1) == 1)
+    for t, n in (
+        (seq_lens_out, rows),
+        (positions, rows),
+        (draft_out_cache_loc, rows * num_steps),
+        (write_virtual, rows * window),
+    ):
+        assert t is None or (
+            t.dtype == torch.int64 and t.is_contiguous() and t.numel() >= n
+        ), "prepare_draft_window: an output smaller than the launch's rows"
+    assert mrope is None or (
+        mrope.dtype == torch.int64 and mrope.stride(1) == 1 and mrope.shape[1] >= rows
+    )
     _prepare_draft_window_kernel[(rows,)](
         req_pool_indices,
         req_to_token,
