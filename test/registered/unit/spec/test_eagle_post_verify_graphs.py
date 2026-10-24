@@ -476,6 +476,87 @@ class TestPostVerifyGraphs(CustomTestCase):
                     self.assertTrue(torch.equal(staged[name], src), name)
                 self.assertEqual(int(staged["sim_accept_len"]), 3)
 
+    def test_lengths_taken_from_a_slot_outlive_the_next_round(self):
+        """SGLANG_PERFLL_STEP5A_SEQ_LENS: a staged pass's batch.seq_lens is the previous round's
+        new_seq_lens, a graph slot's output read through the whole next round. The slots
+        alternate: round N's lengths are intact after round N+1 and rewritten only by round
+        N+2, whose own input is round N+1's; a batch still holding round N's lengths at N+2
+        is refused. CPU: a replay rewrites the slot's outputs in place, as a graph does."""
+        graphs = _staged_length_graphs("cpu")
+        with patch.object(torch.cuda, "stream", lambda stream: nullcontext()):
+            _check_staged_lengths(self, graphs, device="cpu")
+
+
+def _staged_length_graphs(device):
+    """_PostVerifyGraphs whose body only moves the lengths (+3), and on a CPU host a capture
+    that keeps the first outputs and rewrites them in place on each replay."""
+
+    def body(slot):
+        new_seq_lens = slot.staged["seq_lens"] + 3
+        return (None, None, None, new_seq_lens, None, None, None)
+
+    def commit(slot, outputs):
+        # the side-stream graph needs some work of its own to capture
+        slot.commit_ct.add_(1)
+
+    graphs = eagle_post_verify_graphs._PostVerifyGraphs(
+        body=body, commit=commit, sim_rng=None
+    )
+    if device == "cpu":
+
+        def capture(slot):
+            graphs._main_done = graphs._commit_done = MagicMock()
+            graphs._side_stream = MagicMock()
+            outputs = body(slot)
+
+            def replay():
+                outputs[3].copy_(body(slot)[3])
+
+            slot.graph = SimpleNamespace(replay=replay)
+            slot.commit_graph = SimpleNamespace(replay=lambda: None)
+            slot.outputs = outputs
+
+        graphs._capture = capture
+    return graphs
+
+
+def _check_staged_lengths(test, graphs, *, device):
+    def run(seq_lens):
+        inputs = {
+            "seq_lens": seq_lens,
+            "req_pool_indices": torch.arange(2, device=device),
+        }
+        return graphs.run(
+            key=0,
+            inputs=inputs,
+            make_slot=lambda staged: SimpleNamespace(
+                num_requests=2,
+                commit_ct=torch.zeros(1, dtype=torch.int64, device=device),
+            ),
+            sim_max_len=7,
+        )
+
+    with (
+        patch.object(eagle_post_verify_graphs, "_STAGED_SEQ_LENS", True),
+        patch.object(spec_utils, "SIMULATE_ACC_LEN", -1.0),
+    ):
+        lengths = torch.tensor([100, 200], device=device)
+        # eager warm-ups, then each slot's capture: every round takes the last one's lengths
+        for _ in range(2 * eagle_post_verify_graphs._NUM_WARMUP + 2):
+            lengths = run(lengths)[3]
+        round_n = run(lengths)[3]
+        want_n = round_n.clone()
+        round_n1 = run(round_n)[3]
+        test.assertTrue(
+            torch.equal(round_n, want_n), "round N's lengths changed in N+1"
+        )
+        test.assertNotEqual(round_n1.data_ptr(), round_n.data_ptr())
+        round_n2 = run(round_n1)[3]
+        test.assertEqual(round_n2.data_ptr(), round_n.data_ptr())
+        test.assertTrue(torch.equal(round_n2, want_n + 6))
+        with test.assertRaisesRegex(RuntimeError, "holds this batch's lengths"):
+            run(round_n1)  # round N+1's slot is next: a batch still on its lengths
+
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
 class TestPostVerifyGraphsMatchEager(CustomTestCase):
@@ -561,6 +642,18 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
 
     def test_fused_accept_forced_acceptance(self):
         self._check(sim_acc_len=4.8, fused=True)
+
+    def test_lengths_taken_from_a_slot_outlive_the_next_round(self):
+        """As the CPU test, with captured CUDA graphs replaying into the slots' outputs."""
+        graphs = _staged_length_graphs("cuda")
+        stream = torch.cuda.Stream()
+        with (
+            torch.cuda.stream(stream),
+            patch(
+                "sglang.srt.distributed.parallel_state.graph_capture", _graph_capture
+            ),
+        ):
+            _check_staged_lengths(self, graphs, device="cuda")
 
     def test_the_bonus_in_int64_is_the_int32_bonus_cast(self):
         """SGLANG_PERFLL_STEP5A_BONUS_I64: the commit-outputs launch writes the bonus as int64,
