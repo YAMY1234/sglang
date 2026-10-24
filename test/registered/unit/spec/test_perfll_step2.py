@@ -103,13 +103,17 @@ class TestPerfllStep2(CustomTestCase):
         seq_lens = torch.tensor([10, 20], dtype=torch.int32)
         window = i64(100, 101, 102, 200, 201, 202)
         check.compare(staged, seq_lens=seq_lens, positions=i64(10, 20), mrope=None, window=window, num_steps=2)
-        self.assertEqual(check.mismatch.tolist(), [0, 0, 0, 0, 0])
+        self.assertEqual(check.mismatch_by_bs[2].tolist(), [0, 0, 0, 0, 0])
+        self.assertEqual(check.first.tolist()[0], -1)
         window[5] = 7  # past the draft steps' columns: only the window differs
         check.compare(staged, seq_lens=seq_lens, positions=i64(10, 20), mrope=None, window=window, num_steps=2)
         window[3] = 7  # a draft step's slot: both differ
         check.compare(staged, seq_lens=seq_lens, positions=i64(11, 20), mrope=None, window=window, num_steps=2)
-        self.assertEqual(check.mismatch.tolist(), [0, 1, 0, 1, 2])
-        self.assertEqual(check.check_ct, 3)
+        self.assertEqual(check.mismatch_by_bs[2].tolist(), [0, 1, 0, 1, 2])
+        self.assertEqual(check.check_ct_by_bs[2], 3)
+        # the first difference: the window's last slot in the second comparison
+        self.assertEqual(check.first.tolist(), [4, 5, 2, 202, 7])
+        self.assertIn("first difference window[5] at B2: staged 202, eager 7", check.summary())
 
     def test_the_switch_reserves_three_windows(self):
         with (
