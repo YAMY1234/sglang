@@ -388,16 +388,21 @@ class _PostVerifyGraphs:
 
     def _capture(self, slot: SimpleNamespace) -> None:
         from sglang.srt.distributed.parallel_state import graph_capture
+        from sglang.srt.model_executor.runner_utils.pool import (
+            get_or_create_global_graph_capture_stream,
+        )
 
         if self._pool is None:
             self._pool = torch.cuda.graph_pool_handle()
-            self._side_stream = torch.cuda.Stream()
+            # 0, the lowest: under SGLANG_PST_DEFAULT_STREAM_PRIORITY the commit yields to the graphs
+            self._side_stream = torch.cuda.Stream(priority=0)
             self._main_done, self._commit_done = torch.cuda.Event(), torch.cuda.Event()
             logger.info(
                 "Post-verify commit: side stream priority %d, launching stream priority %d, "
-                "late join %s, resident commit CTAs %d",
+                "graph capture stream priority %d, late join %s, resident commit CTAs %d",
                 self._side_stream.priority,
                 torch.cuda.current_stream().priority,
+                get_or_create_global_graph_capture_stream().priority,
                 envs.SGLANG_PLB_COMMIT_LATE_JOIN.get(),
                 envs.SGLANG_PERFLL_COMMIT_CTAS.get(),
             )

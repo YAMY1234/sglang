@@ -42,10 +42,25 @@ def allocate_distinct_stream(device_module, avoid_streams):
     """
     avoid = {stream.cuda_stream for stream in avoid_streams}
     for _ in range(65):
-        stream = device_module.Stream(priority=0)
+        stream = device_module.Stream()
         if stream.cuda_stream not in avoid:
             return stream
     raise RuntimeError("Unable to allocate a distinct stream")
+
+
+def install_default_stream_priority(default_priority: int) -> None:
+    """CUDA streams created without a priority get ``default_priority`` (SGLANG_PST_DEFAULT_STREAM_PRIORITY)."""
+    if default_priority == 0:
+        return
+    stream_new = torch.cuda.Stream.__new__
+
+    def _new(cls, device=None, priority=None, **kwargs):
+        return stream_new(
+            cls, device, default_priority if priority is None else priority, **kwargs
+        )
+
+    torch.cuda.Stream.__new__ = staticmethod(_new)
+    logger.info("CUDA streams created without a priority get %d", default_priority)
 
 
 @dataclasses.dataclass

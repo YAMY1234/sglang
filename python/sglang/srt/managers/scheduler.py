@@ -288,6 +288,7 @@ from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
     allocate_distinct_stream,
+    install_default_stream_priority,
     is_health_check_generate_req,
     validate_input_length,
 )
@@ -6249,6 +6250,7 @@ def run_scheduler_process(
     display_dp_rank: Optional[int] = None,
     display_moe_ep_rank: Optional[int] = None,
 ):
+    install_default_stream_priority(envs.SGLANG_PST_DEFAULT_STREAM_PRIORITY.get())
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
     dp_rank = resolve_spawn_dp_rank(dp_rank)
