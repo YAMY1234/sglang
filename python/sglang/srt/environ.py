@@ -1824,6 +1824,12 @@ class Envs:
     # instead of breaking at every GDN layer (layers/attention/linear/
     # gdn_prefill_graph.py).
     SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND = EnvBool(False)
+    # PERF-PF: with the FlashInfer GDN prefill kernel, the captured GDN extend runs the FlashInfer core
+    # (CP kernel for one-sequence batches, non-CP kernel for the rest) instead of breaking at every layer.
+    SGLANG_PERFPF_GDN_GRAPH_FLASHINFER = EnvBool(False)
+    # Static sequence count of the captured non-CP FlashInfer path; each unused row costs ~10 us per layer
+    # (measured on GB300), and batches with more sequences run eagerly.
+    SGLANG_PERFPF_GDN_GRAPH_FI_MAX_SEQS = EnvInt(8)
 
     # ===================================================================
     # Tokenizer, request state, embeddings, and reasoning controls
