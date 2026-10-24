@@ -384,12 +384,31 @@ def _ll_pack(flag, w):
 
 
 @triton.jit
+def _ll_spin(addr, e):
+    # one thread per word: volatile reads until the word's high half is e
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .pred %p;
+            .reg .b32 %lo, %hi;
+            spin:
+            ld.volatile.global.b64 $0, [$1];
+            mov.b64 {%lo, %hi}, $0;
+            setp.ne.b32 %p, %hi, $2;
+            @%p bra spin;
+        }
+        """,
+        "=l,l,r", args=[addr, e], dtype=tl.int64, is_pure=False, pack=1)
+
+
+@triton.jit
 def _ll_wait(src, n: tl.constexpr, e):
     """Poll n LL words (data in the low, epoch in the high half) until all carry epoch e."""
-    k = tl.arange(0, n)
-    v = tl.load(src + k, volatile=True)
-    while tl.min(((v >> 32) == e).to(tl.int32), axis=0) == 0:
-        v = tl.load(src + k, volatile=True)
+    # each thread waits for the words it returns: with a block-wide count, a warp could leave holding a stale copy of
+    # a word another warp also held (polls narrower than the CTA); the barrier keeps every warp before the epoch store
+    v = _ll_spin(src + tl.arange(0, n), e)
+    if n > 32:
+        tl.debug_barrier()
     return v
 
 
