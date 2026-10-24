@@ -553,7 +553,11 @@ class FlashinferDispatcher(BaseDispatcher):
             self.ll_a2a is not None
             and self._ll_switch.get()
             and self.ll_a2a.payload == _LL_PAYLOAD.get(dispatch_type)
-            and not self.use_low_precision_combine
+            # PERF-LP: SGLANG_PERFLP_FP8_COMBINE_KEEP_LL keeps the LL exchange (BF16 combine) where it serves.
+            and (
+                not self.use_low_precision_combine
+                or envs.SGLANG_PERFLP_FP8_COMBINE_KEEP_LL.get()
+            )
             and self.runtime_max_tokens_per_rank <= self._ll_max_tokens()
         )
 
