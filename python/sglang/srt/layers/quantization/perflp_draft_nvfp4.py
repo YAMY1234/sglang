@@ -110,6 +110,29 @@ def dequantize_nvfp4(
     return (val.view(n, k // NVFP4_BLOCK, NVFP4_BLOCK) * scale[..., None]).view(n, k)
 
 
+def _keep_bf16_slice(
+    layer: torch.nn.Module,
+    loaded_weight: torch.Tensor,
+    shard_id: str,
+    expert_id: int,
+) -> None:
+    """Copy this TP rank's slice of one full BF16 expert tensor (w1 / w3 [I, H], w2 [H, I]) into the BF16 twin."""
+    local = layer._map_global_expert_id_to_local_expert_id(expert_id)
+    if local < 0:
+        return
+    inter = layer.perflp_bf16_w2.shape[-1]
+    start = layer.moe_tp_rank * inter
+    w = loaded_weight.to(device=layer.perflp_bf16_w13.device, dtype=torch.bfloat16)
+    with torch.no_grad():
+        if shard_id == "w2":
+            layer.perflp_bf16_w2[local].copy_(w[:, start : start + inter])
+        else:
+            row0 = 0 if shard_id == "w1" else inter
+            layer.perflp_bf16_w13[local, row0 : row0 + inter].copy_(
+                w[start : start + inter]
+            )
+
+
 # FusedMoE's weight loader takes the ModelOpt branch on "ModelOpt" in the method's class name.
 class ModelOptNvFp4PerfLpDraftMoEMethod(ModelOptNvFp4OnlineFusedMoEMethod):
     """The draft experts' NVFP4 method: the online loader with TRT-LLM's quantizer, and TRT-LLM's static input
@@ -117,6 +140,41 @@ class ModelOptNvFp4PerfLpDraftMoEMethod(ModelOptNvFp4OnlineFusedMoEMethod):
 
     _quantize_weight_nvfp4 = staticmethod(quantize_nvfp4_trt)
     _logged = False
+
+    def create_weights(self, layer: torch.nn.Module, **kwargs) -> None:
+        # SGLANG_PERFLP_DRAFT_MOE_KEEP_BF16: the BF16 experts in checkpoint order ([gate rows | up rows], this TP rank's
+        # slice) for the megakernel plugin's single-launch draft MoE, which serves the draft steps of <= 2 tokens.
+        # Set before the parent builds the weight loader (prepare_weight_loader reads it).
+        layer.perflp_bf16_w13 = None
+        layer.perflp_bf16_w2 = None
+        if envs.SGLANG_PERFLP_DRAFT_MOE_KEEP_BF16.get() and layer.moe_ep_size == 1:
+            inter = kwargs["intermediate_size_per_partition"]
+            hidden = kwargs["hidden_size"]
+            layer.perflp_bf16_w13 = torch.empty(
+                kwargs["num_experts"], 2 * inter, hidden, dtype=torch.bfloat16
+            )
+            layer.perflp_bf16_w2 = torch.empty(
+                kwargs["num_experts"], hidden, inter, dtype=torch.bfloat16
+            )
+        super().create_weights(layer, **kwargs)
+
+    def prepare_weight_loader(self, layer, weight_loader):
+        quantizing_loader = super().prepare_weight_loader(layer, weight_loader)
+        if layer.perflp_bf16_w13 is None:
+            return quantizing_loader
+
+        def loader(param, loaded_weight, weight_name, shard_id, expert_id):
+            if shard_id in ("w1", "w2", "w3") and loaded_weight.is_floating_point():
+                _keep_bf16_slice(layer, loaded_weight, shard_id, expert_id)
+            return quantizing_loader(
+                param,
+                loaded_weight,
+                weight_name=weight_name,
+                shard_id=shard_id,
+                expert_id=expert_id,
+            )
+
+        return loader
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         fc1_amax, fc2_amax = draft_act_amax()
