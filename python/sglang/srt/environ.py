@@ -1750,6 +1750,9 @@ class Envs:
     # PERF-LL step 5a: the megakernel's draft extend writes its top-1 and hidden rows straight
     # into the draft graph runner's input buffers, so the next draft does not copy them.
     SGLANG_PERFLL_STEP5A = EnvBool(False)
+    # PERF-LL step 5a (4): the post-verify graph writes the bonus tokens as int64, the dtype the
+    # relay and the next draft read, so the deferred relay does not cast them.
+    SGLANG_PERFLL_STEP5A_BONUS_I64 = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
