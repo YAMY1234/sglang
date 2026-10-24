@@ -58,6 +58,7 @@ from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.model_executor.runner_backend import ab_variants
 from sglang.srt.model_loader.weight_utils import get_pp_stage_load_group
 from sglang.srt.runtime_context import (
     get_context,
@@ -104,7 +105,12 @@ from sglang.srt.speculative.eagle_utils import (
     per_step_draft_out_cache_loc,
 )
 from sglang.srt.speculative import perfll_step2
-from sglang.srt.speculative.perfll_step2 import Step2Check, Step2Counter
+from sglang.srt.speculative.perfll_step2 import (
+    DraftExtendInputs,
+    DraftExtendInputsCheck,
+    Step2Check,
+    Step2Counter,
+)
 from sglang.srt.speculative.eagle_worker_common import (
     build_eagle_verify_input,
     prepare_for_draft,
@@ -167,6 +173,21 @@ def _qsa_index_share_requested(hf_config) -> bool:
             getattr(hf_config, "index_share_for_mtp_iteration", False),
         )
     )
+
+
+def _takes_prepared_layout(
+    batch: ScheduleBatch, prepared_layout: Optional[tuple], *, model_is_mrope: bool
+) -> bool:
+    """Whether prepare_for_draft_extend lays the draft extend out from the post-verify graph's
+    layout (its GPU-only path, M-RoPE rows matching the batch's)."""
+    if (
+        prepared_layout is None
+        or batch.seq_lens_cpu is not None
+        or not batch.seq_lens.is_cuda
+    ):
+        return False
+    with_mrope = model_is_mrope and all(x is None for x in batch.multimodal_inputs)
+    return (prepared_layout[3][2] is not None) == with_mrope
 
 
 class EagleDraftWorker(EagleDraftWorkerBase):
@@ -1125,7 +1146,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         batch_result: GenerationBatchResult,
         *,
         kv_loc_plan: Optional[KVLocPlan] = None,
+        staged_inputs: Optional[DraftExtendInputs] = None,
+        check: Optional[DraftExtendInputsCheck] = None,
     ):
+        """``staged_inputs`` (SGLANG_PERFLL_RS_D1): this round's inputs the post-verify graph
+        wrote into the draft extend graph runner, taken when the graph lays the batch out from
+        the post-verify layout; ``check`` compares them with the eager path's while active."""
         if self.megakernel is not None:
             self.megakernel.note_draft_extend()
         # Cast to int64 before entering plan stream to avoid cross-stream
@@ -1173,6 +1199,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # not num_steps + 1, so DP MLP-sync padding stays consistent for topk > 1.
             num_tokens_per_req=self.speculative_num_draft_tokens,
             num_tokens_for_logprob_per_req=self.speculative_num_draft_tokens,
+        )
+        takes_layout = _takes_prepared_layout(
+            batch,
+            prepared_layout,
+            model_is_mrope=self.draft_runner.model_config.model_is_mrope,
         )
         # Prepare for draft extend in a separate stream
         if self.plan_stream:
@@ -1224,10 +1255,26 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             if (c := self.draft_runner.canary_manager) is not None
             else contextlib.nullcontext()
         )
+        inputs_staged = (
+            staged_inputs is not None and can_run_decode_cuda_graph and takes_layout
+        )
+        if inputs_staged and check is not None and check.active:
+            perfll_step2.check_draft_extend_inputs(
+                check,
+                staged=staged_inputs,
+                width=self.speculative_num_draft_tokens,
+                seq_lens=batch.seq_lens,
+                req_pool_indices=batch.req_pool_indices,
+                accept_lens=batch_result.accept_lens,
+                predict=batch_result.next_token_ids,
+                out_cache_loc=forward_batch.out_cache_loc,
+                mamba_track_indices=batch.mamba_track_indices,
+                hidden_states=batch_result.logits_output.hidden_states,
+            )
         with canary_ctx:
             if can_run_decode_cuda_graph:
                 draft_logits_output = self.cuda_graph_runner_for_draft_extend.execute(
-                    forward_batch, select_index
+                    forward_batch, select_index, inputs_staged=inputs_staged
                 )
                 if host_trace.ENABLED:
                     host_trace.mark(host_trace.EG1)
@@ -1337,6 +1384,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
     # SGLANG_PERFLL_STEP2: counts the decode passes whose draft inputs could be staged
     _step2: Optional[Step2Counter] = None
     _step2_uses_staged = False
+    # SGLANG_PERFLL_RS_D1 (bind_perfll_publish): the FutureMap buffer the post-verify graph
+    # publishes the new lengths to, and the gated comparison with the eager path
+    _rs_d1_published: Optional[torch.Tensor] = None
+    _rs_d1_check: Optional[DraftExtendInputsCheck] = None
 
     def __init__(
         self,
@@ -1477,6 +1528,70 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if not self._step2_uses_staged or not batch.forward_mode.is_decode():
             return None
         return self._step2.take_seq_lens(batch, sched_idle=batch.perfll_sched_idle)
+
+    def bind_perfll_publish(self, *, new_seq_lens_buf: torch.Tensor) -> None:
+        """SGLANG_PERFLL_RS_D1, once the scheduler's FutureMap exists: the post-verify graph
+        writes the draft extend runner's inputs and publishes the new lengths to this buffer."""
+        refusal = self._rs_d1_refusal()
+        if refusal is not None:
+            logger.warning("PERF-LL rs-d1 is off: %s", refusal)
+            return
+        draft = self._draft_worker
+        self._post_verify_graphs.enable_rs_d1(
+            runner=draft.cuda_graph_runner_for_draft_extend,
+            req_to_token=self.req_to_token_pool.req_to_token,
+            published_seq_lens=new_seq_lens_buf,
+        )
+        self._rs_d1_published = new_seq_lens_buf
+        gate = envs.SGLANG_DEBUG_PERFLL_RS_D1_CHECK_GATE.get()
+        if gate:
+            self._rs_d1_check = DraftExtendInputsCheck(self.device, gate)
+        logger.info(
+            "PERF-LL rs-d1: the post-verify graph writes the draft extend's inputs and "
+            "publishes the new lengths%s",
+            "" if gate is None else f" (check gate {gate})",
+        )
+
+    def _rs_d1_refusal(self) -> Optional[str]:
+        draft = self._draft_worker
+        if self._post_verify_graphs is None or draft is None:
+            return "no post-verify graphs"
+        if not envs.SGLANG_PST_SPEC_EXTEND_LAYOUT.get():
+            return "it needs SGLANG_PST_SPEC_EXTEND_LAYOUT"
+        runner = draft.cuda_graph_runner_for_draft_extend
+        if runner is None:
+            return "no draft extend graph runner"
+        if runner.require_mlp_tp_gather:
+            return "the draft extend graph pads gathered batches"
+        if draft.draft_runner.kv_index_translator.is_translating:
+            # the window is read as virtual KV ids; a translating draft pool indexes physical ones
+            return "the draft's KV ids are translated"
+        return None
+
+    def _rs_d1_written(self, batch_output) -> Optional[DraftExtendInputs]:
+        """The draft extend inputs this round's post-verify graph wrote (after the commit
+        outputs' layout in its draft-extend outputs), when the round takes them; the
+        same-service A/B label "rsoff" keeps the eager publish and copy."""
+        if self._rs_d1_published is None:
+            return None
+        if self._rs_d1_check is not None:
+            self._rs_d1_check.poll_gate()
+        prepared = batch_output.prepared_draft_extend_inputs
+        if prepared is None or len(prepared) < 5:
+            return None
+        if ab_variants.ACTIVE and ab_variants.current() == "rsoff":
+            return None
+        return prepared[4]
+
+    def _rs_d1_check_published(self, batch: ScheduleBatch, batch_output) -> None:
+        check = self._rs_d1_check
+        if check is None or not check.active:
+            return
+        check.compare(
+            "published",
+            self._rs_d1_published.index_select(0, batch.req_pool_indices),
+            batch_output.new_seq_lens,
+        )
 
     def _init_post_verify_graphs(self) -> None:
         # A key is captured at its first rounds, which attention-DP ranks do not reach
@@ -1619,8 +1734,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
             if host_trace.ENABLED:
                 host_trace.gpu_mark(host_trace.VERIFY1)
             # Publish before draft_extend so the fence is at verify-end.
-            if on_publish is not None:
+            written = self._rs_d1_written(batch_output)
+            if on_publish is not None and written is None:
                 on_publish(batch_output.new_seq_lens)
+            elif on_publish is not None:
+                on_publish(batch_output.new_seq_lens, written=True)
+                self._rs_d1_check_published(batch, batch_output)
             if (
                 self.speculative_num_steps == 0
                 and envs.SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND.get()
@@ -1636,7 +1755,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     if host_trace.ENABLED:
                         host_trace.mark(host_trace.EXT0)
                     self.draft_worker._draft_extend_for_decode(
-                        batch, batch_output, kv_loc_plan=verify_input.kv_loc_plan
+                        batch,
+                        batch_output,
+                        kv_loc_plan=verify_input.kv_loc_plan,
+                        staged_inputs=written,
+                        check=self._rs_d1_check,
                     )
                     if host_trace.ENABLED:
                         host_trace.gpu_mark(host_trace.EXT1)
