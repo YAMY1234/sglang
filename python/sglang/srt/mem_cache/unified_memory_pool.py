@@ -1117,6 +1117,8 @@ class UnifiedMambaPool(MambaPool):
         self.replayssm_spec_fold = False
         self.replayssm_cache_base = None
         self.replayssm_is_flush = None
+        self.replayssm_fold_in_verify = False
+        self.replayssm_defer_fold = False
         self.debug_memory_pool = False
         self.conv_shard_groups = None
         self.conv_slice_axis = spec.conv_slice_axis

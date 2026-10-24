@@ -1127,6 +1127,7 @@ def commit_mamba_states_after_verify(
         from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode import (
             commit_gdn_replayssm_circular,
             commit_gdn_replayssm_spec,
+            track_gdn_replayssm_circular,
         )
         from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
             fused_conv_window_scatter_with_mask,
@@ -1146,6 +1147,7 @@ def commit_mamba_states_after_verify(
             )
         else:
             last_correct_step_indices, mamba_steps_to_track = prepared_step_indices
+        fold_in_verify = mamba_pool.replayssm_fold_in_verify
         # Advance the per-request circular cursors by the accepted count (incl. the
         # bonus token). max_cache_len = ring length L = replayssm_d.shape[-2].
         commit_gdn_replayssm_spec(
@@ -1158,10 +1160,10 @@ def commit_mamba_states_after_verify(
             max_spec_len=draft_token_num,
             fold_every_commit=spec_state.temporal.dtype != torch.float32,
             null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
+            fold_in_verify=fold_in_verify,
+            defer_fold=mamba_pool.replayssm_defer_fold,
         )
-        # Capacity rows fold all layers in one launch; track rows snapshot the
-        # exact crossing state without disturbing the active circular history.
-        commit_gdn_replayssm_circular(
+        ring_commit = dict(
             checkpoint_state=spec_state.temporal,
             d_cache=spec_state.replayssm_d,
             k_cache=spec_state.replayssm_k,
@@ -1179,6 +1181,15 @@ def commit_mamba_states_after_verify(
             null_block_id=-1,
             use_cuda=_COMMIT_CUDA,
         )
+        if not fold_in_verify:
+            # Capacity rows fold all layers in one launch; track rows snapshot the
+            # exact crossing state without disturbing the active circular history.
+            commit_gdn_replayssm_circular(
+                **ring_commit, early_exit=mamba_pool.replayssm_defer_fold
+            )
+        elif batch.mamba_track_indices is not None:
+            # The verify folded every full ring; only track rows remain.
+            track_gdn_replayssm_circular(**ring_commit)
         # Roll back active conv state and snapshot its interval-crossing window.
         fused_conv_window_scatter_with_mask(
             spec_state.conv[0],
