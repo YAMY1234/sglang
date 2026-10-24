@@ -62,11 +62,13 @@ def buckets_keep_chunk_o_block_size(capture_num_tokens: list[int]) -> bool:
 
 class GDNFlashInferGraphTables(msgspec.Struct, frozen=True):
     """Static tables of the captured FlashInfer GDN core. A one-sequence batch
-    runs on the CP kernel (``cp_*``), a larger one on the non-CP kernel
-    (``ncp_*``, ``max_seqs`` rows); the idle kernel gets an empty batch. Empty
-    rows read and write the dummy state slot 0."""
+    runs on the CP kernel (``cp_*``) when ``cp_single``, any other batch on the
+    non-CP kernel (``ncp_*``, ``max_seqs`` rows); the idle kernel gets an empty
+    batch. Empty rows read and write the dummy state slot 0."""
 
     max_seqs: int
+    # FlashInfer's own split for one sequence; when off the CP kernel is not captured.
+    cp_single: bool
     # int64, the kernels' cu_seqlens dtype; one copy per fill.
     packed64: torch.Tensor
     cp_cu_seqlens: torch.Tensor  # [2]
@@ -88,7 +90,7 @@ class GDNFlashInferGraphTables(msgspec.Struct, frozen=True):
 
     @classmethod
     def allocate(
-        cls, *, max_seqs: int, device: torch.device
+        cls, *, max_seqs: int, cp_single: bool, device: torch.device
     ) -> GDNFlashInferGraphTables:
         sizes64 = [2, max_seqs + 1]
         sizes32 = [2, max_seqs + 1, max_seqs, max_seqs, max_seqs]
@@ -98,6 +100,7 @@ class GDNFlashInferGraphTables(msgspec.Struct, frozen=True):
         v32 = torch.split(packed32, sizes32)
         return cls(
             max_seqs=max_seqs,
+            cp_single=cp_single,
             packed64=packed64,
             cp_cu_seqlens=v64[0],
             ncp_cu_seqlens=v64[1],
@@ -121,7 +124,7 @@ class GDNFlashInferGraphTables(msgspec.Struct, frozen=True):
         track_rows: Optional[KDAPrefillTrackRows],
     ) -> None:
         bs = lens.shape[0]
-        single = bs == 1
+        single = bs == 1 and self.cp_single
         # Checkpoint j of a sequence is its state after (j + 1) * 64 tokens.
         n_ckpt = lens // GDN_CHUNK_SIZE
         cp_cu = self.host64[:2]
@@ -210,6 +213,7 @@ class GDNPrefillGraphMetadata(msgspec.Struct, frozen=True):
         cache_index_dtype: torch.dtype,
         device: torch.device,
         flashinfer: bool = False,
+        flashinfer_cp_single: bool = True,
     ) -> GDNPrefillGraphMetadata:
         max_seqs = max(1, min(num_tokens, max_seqs_cap))
         max_chunks = triton.cdiv(num_tokens, GDN_CHUNK_SIZE) + max_seqs
@@ -248,7 +252,9 @@ class GDNPrefillGraphMetadata(msgspec.Struct, frozen=True):
             has_initial_state=torch.zeros(max_seqs, dtype=torch.bool, device=device),
             track_dst=torch.zeros(max_seqs, dtype=torch.int64, device=device),
             flashinfer=(
-                GDNFlashInferGraphTables.allocate(max_seqs=max_seqs, device=device)
+                GDNFlashInferGraphTables.allocate(
+                    max_seqs=max_seqs, cp_single=flashinfer_cp_single, device=device
+                )
                 if flashinfer
                 else None
             ),
