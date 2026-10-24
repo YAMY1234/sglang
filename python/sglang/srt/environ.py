@@ -1248,6 +1248,9 @@ class Envs:
     # TRT-L18: ungated exact calls (the plugin's draft steps) as gated ones with all three switches: the fused partial
     # takes the prefix lengths as seq_lens - q_len itself (PDL after the q gather), then the per-(row, head) merge.
     SGLANG_TRTL18_CP_UNGATED = EnvBool(False)
+    # An ungated exact CP-lite call writes the caller's attention output gate and o_proj's static FP8 input
+    # quantization in its per-head merge (CpLite.offer_gate_epilogue), bit for bit the separate launch.
+    SGLANG_PSM_CP_GATE_EPILOGUE = EnvBool(False)
     # PERF-LB: the fused CP-lite partial (batches <= 32) shares one CTA per SM among the requests by their owned KV
     # (TRT's TRTLLM_Q35_ATTN_CP_BALANCED_SPLIT): no idle SMs when splits x batch < SMs, a ragged batch costs its total
     # KV instead of its longest request's. SM_RESERVE: SMs left out of that grid.
