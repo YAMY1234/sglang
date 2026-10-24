@@ -613,8 +613,8 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         checkpoint_every_n_tokens: int,
     ) -> Optional[torch.Tensor]:
         """The prefill core of a captured GDN extend on the bucket's static tables:
-        the CP kernel takes a one-sequence batch, the non-CP kernel a larger one,
-        and both update the pool in place by slot. ``output`` is [tokens, HV, V];
+        the CP kernel takes a one-sequence batch (if ``tables.cp_single``), the
+        non-CP kernel any other, and both update the pool in place by slot. ``output`` is [tokens, HV, V];
         returns the [1, checkpoint_rows, HV, V, K] state checkpoints, if any."""
         from sglang.kernels.ops.attention.fla.l2norm import (
             gdn_prefill_qkv_prepare_fwd,
@@ -649,15 +649,16 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             )
 
-        # max_seqlen bounds the CP launch grid; the bucket bounds any sequence.
-        self._prefill_fn(
-            **common,
-            cu_seqlens=tables.cp_cu_seqlens,
-            state_indices=tables.cp_state_indices,
-            use_cp=True,
-            max_seqlen=q_fi.shape[0],
-            **checkpoint_args(tables.cp_checkpoint_cu),
-        )
+        if tables.cp_single:
+            # max_seqlen bounds the CP launch grid; the bucket bounds any sequence.
+            self._prefill_fn(
+                **common,
+                cu_seqlens=tables.cp_cu_seqlens,
+                state_indices=tables.cp_state_indices,
+                use_cp=True,
+                max_seqlen=q_fi.shape[0],
+                **checkpoint_args(tables.cp_checkpoint_cu),
+            )
         self._prefill_fn(
             **common,
             cu_seqlens=tables.ncp_cu_seqlens,
