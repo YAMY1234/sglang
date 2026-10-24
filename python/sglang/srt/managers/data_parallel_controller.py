@@ -220,6 +220,18 @@ class DataParallelController:
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
+        # PERF-HT placement counts, logged once a minute: placed here vs sent to the router's DP rank.
+        self._ht_placed = [0] * get_parallel().num_dp_ranks
+        self._ht_followed = 0
+        self._ht_ignored = 0
+        self._ht_log_t = time.monotonic()
+        logger.info(
+            "PERFHT DP placement: method %s, tokens_capped %s, request_tokens %d, ignore_routed %s",
+            self.load_balance_method.name,
+            envs.SGLANG_PERFHT_DP_TOKENS_CAPPED.get(),
+            envs.SGLANG_PERFHT_DP_REQUEST_TOKENS.get(),
+            envs.SGLANG_PERFHT_DP_IGNORE_ROUTED.get(),
+        )
         self.refresh_load_budget_on_dispatch = self.load_balance_method in (
             LoadBalanceMethod.TOTAL_REQUESTS,
             LoadBalanceMethod.TOTAL_TOKENS,
@@ -404,6 +416,15 @@ class DataParallelController:
             self.dispatch_health_check(req)
         else:
             self.dispatching(req)
+            if time.monotonic() - self._ht_log_t >= 60:
+                self._ht_log_t = time.monotonic()
+                logger.info(
+                    "PERFHT DP placement counts: placed %d %s, routed ignored %d, followed route %d",
+                    sum(self._ht_placed),
+                    self._ht_placed,
+                    self._ht_ignored,
+                    self._ht_followed,
+                )
         req.time_stats = time_stats
         req.time_stats.set_dp_dispatch_finish_time()
 
@@ -874,8 +895,10 @@ class DataParallelController:
                     self.load_balance_method.name,
                 )
             req.routed_dp_rank = None
+            self._ht_ignored += 1
             return False
         if req.routed_dp_rank is not None:
+            self._ht_followed += 1
             rank = req.routed_dp_rank
             if (
                 rank < 0
@@ -934,6 +957,7 @@ class DataParallelController:
         target_worker = self.dp_budget.dispatch(
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
         )
+        self._ht_placed[target_worker] += 1
         sock_send(self.workers[target_worker], req)
 
     def event_loop(self):
