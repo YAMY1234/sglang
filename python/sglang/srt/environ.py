@@ -1304,6 +1304,11 @@ class Envs:
     # _MAX_TOKENS rows with tp 2 / 4 / 8 and hidden % 1024 == 0 (plb_mnnvl_cutedsl/e4m3_payload.py). Lowers precision.
     SGLANG_PERFLP_AR_FP8_PAYLOAD = EnvBool(False)
     SGLANG_PERFLP_AR_FP8_PAYLOAD_MAX_TOKENS = EnvInt(1024)
+    # PERF-LB: BT route calls (all-reduce and MoE finalize) of at least this many rows reduce on NVLS: multimem.ld_reduce
+    # with FP32 accumulation through the BT prenorm mailbox's multicast mapping instead of Publish + OwnerReduce, so the
+    # prenorm is BF16(BF16(sum) + residual), the unfused path's rounding (plb_bt_nvls.py); ahead of the E4M3 payload.
+    # 0: off
+    SGLANG_PLB_BT_NVLS = EnvInt(0)
     # Timing only: decode graph padding per block of Q35MF_AB_BLOCK target-verify rounds, the labels in turn
     # ("pow2": the smallest captured power of two); model_executor/runner_backend/ab_variants.py. Empty: off.
     SGLANG_TRTL17_PAD_AB = EnvTuple(())
