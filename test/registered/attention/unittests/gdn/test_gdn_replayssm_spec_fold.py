@@ -364,14 +364,15 @@ class TestGdnReplayssmCommitCuda(CustomTestCase):
 
 @unittest.skipUnless(_cuda_commit_available(), "needs SM90+ and cuda.bindings")
 class TestGdnCoreCudaTrtFold(CustomTestCase):
-    """SGLANG_PST_GDN_TRT_FOLD: gdn_core_cuda fold 2 / 3 on two 16-entry history buffers (a ring of 32)
+    """SGLANG_PST_GDN_TRT_FOLD: gdn_core_cuda fold 2 / 3 / 4 on two 16-entry history buffers (a ring of 32)
     against fold 0 on the active buffer and the CUDA commit of the history, bit for bit. A step whose rows
-    do not fit after its history folds it into the checkpoint and writes its rows from entry 0 of the other
-    buffer; fold 2 replays the history for its outputs, fold 3 runs on the folded checkpoint."""
+    do not fit after its history (fold 4: any history) folds it into the checkpoint and writes its rows from
+    entry 0 of the other buffer; fold 2 replays the history for its outputs, fold 3 / 4 run on the folded
+    checkpoint."""
 
     H, HV, T, RING = 2, 4, 7, 32
 
-    def _inputs(self, gen):
+    def _inputs(self, gen, histories):
         h, hv, t, d = self.H, self.HV, self.T, 128
         n, slots = 6, 9
 
@@ -401,7 +402,7 @@ class TestGdnCoreCudaTrtFold(CustomTestCase):
         states = torch.tensor([4, 0, 7, -1, 2, 5], dtype=torch.int32, device=DEVICE)
         replay = torch.tensor([3, 8, 1, 6, 0, 5], dtype=torch.int32, device=DEVICE)
         wp = torch.zeros(slots, dtype=torch.int32, device=DEVICE)
-        wp[replay.long()] = torch.tensor([0, 5, 9, 12, 10, 16], device=DEVICE).int()
+        wp[replay.long()] = torch.tensor(histories, device=DEVICE).int()
         base = torch.zeros(slots, dtype=torch.int32, device=DEVICE)
         base[replay.long()] = torch.tensor([16, 0, 16, 0, 0, 16], device=DEVICE).int()
         return x, state, ring, states, replay, wp, base
@@ -442,8 +443,10 @@ class TestGdnCoreCudaTrtFold(CustomTestCase):
         from sglang.kernels.ops.attention.fla import gdn_replayssm_commit_cuda
 
         gen = torch.Generator(device=DEVICE).manual_seed(11 + fold)
-        x, state, ring, states, replay, wp, base = self._inputs(gen)
-        folds = (wp + self.T > 16).to(torch.int8)
+        cap = self.T if fold == 4 else 16  # fold 4 folds every history (at most one step's rows)
+        histories = [0, 5, 3, 7, 1, 6] if fold == 4 else [0, 5, 9, 12, 10, 16]
+        x, state, ring, states, replay, wp, base = self._inputs(gen, histories)
+        folds = (wp + self.T > cap).to(torch.int8)
         got_state, got_ring = state.clone(), [r.clone() for r in ring]
         y, o = self._core(x, got_state, got_ring, states, replay, wp, base, fold)
 
@@ -466,13 +469,13 @@ class TestGdnCoreCudaTrtFold(CustomTestCase):
             null_block_id=-1,
         )
         committed = committed.squeeze(0)
-        wp_ref = torch.where(folds.bool(), torch.zeros_like(wp), wp) if fold == 3 else wp
+        wp_ref = torch.where(folds.bool(), torch.zeros_like(wp), wp) if fold >= 3 else wp
         active = [torch.zeros_like(r[:, :, :16]) for r in ring]
         for rid in range(wp.numel()):
             b0 = int(base[rid])
             for r16, r32 in zip(active, ring):
                 r16[rid] = r32[rid, :, b0 : b0 + 16]
-        ref_state = committed.clone() if fold == 3 else state.clone()
+        ref_state = committed.clone() if fold >= 3 else state.clone()
         y_ref, o_ref = self._core(
             x, ref_state, active, states, replay, wp_ref, torch.zeros_like(base), 0
         )
@@ -507,6 +510,9 @@ class TestGdnCoreCudaTrtFold(CustomTestCase):
 
     def test_fold3_runs_on_the_committed_checkpoint(self):
         self._check(3)
+
+    def test_fold4_folds_every_history(self):
+        self._check(4)
 
 
 if __name__ == "__main__":

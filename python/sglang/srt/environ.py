@@ -1726,6 +1726,9 @@ class Envs:
     # With SGLANG_PST_GDN_TRT_FOLD: the folded checkpoint stays in the core's registers and a folding
     # step runs on it without history (no shared-memory staging).
     SGLANG_PST_GDN_TRT_FOLD_REG = EnvBool(False)
+    # With SGLANG_PST_GDN_TRT_FOLD: every verify with a history folds it (fold capacity = the
+    # draft rows), so no verify replays one and attention-DP ranks do the same work each round.
+    SGLANG_PST_GDN_TRT_FOLD_EVERY = EnvBool(False)
     # PERF-HT: the attention-DP GDN verify launch table (SGLANG_Q35MF_E2X_DEP_GDN) extended to B17-36 (byte-identical).
     SGLANG_PERFHT_DEP_GDN_WIDE = EnvBool(False)
     # PERF-HT: SGLANG_Q35MF_TPX_CONV_WINDOW's coalesced window stores up to B36 (stock gate B16).

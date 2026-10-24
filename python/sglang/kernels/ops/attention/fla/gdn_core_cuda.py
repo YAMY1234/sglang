@@ -38,6 +38,10 @@ before the wait. Outputs equal ``fold=0``'s on the same history; the checkpoint 
 ``fold=3`` (SGLANG_PST_GDN_TRT_FOLD_REG): the same two buffers and fold products, but the folded checkpoint replaces
 the CTA's checkpoint rows in registers (no shared-memory staging) and a folding step runs on it with no history, as
 the served commit-then-verify does; the rows still go to the other buffer.
+
+``fold=4`` (SGLANG_PST_GDN_TRT_FOLD_EVERY): as fold 3, but every step with a history (at most one step's accepted
+rows) folds it, with the commit's k8 products, so no step replays a history and every request does the same work
+every round (attention-DP ranks stay level); the ring alternates buffers every round.
 """
 
 from __future__ import annotations
@@ -68,13 +72,19 @@ typedef unsigned int u32;
 #ifndef FOLD
 // 1: SGLANG_PLB_GDN_FOLD_IN_VERIFY (folds a full ring, launched in clusters of a key head's CTAs);
 // 2: SGLANG_PST_GDN_TRT_FOLD (TensorRT-LLM's two history buffers); 3: the same buffers, the folded checkpoint kept in
-// registers and the step run on it without history (SGLANG_PST_GDN_TRT_FOLD_REG)
+// registers and the step run on it without history (SGLANG_PST_GDN_TRT_FOLD_REG); 4: as 3, folding every step that
+// has a history (SGLANG_PST_GDN_TRT_FOLD_EVERY), so a step never replays one
 #define FOLD 0
 #endif
 #if FOLD >= 2
 #define RING 32  // ring entries a slot: two buffers of HIST
 #else
 #define RING 16
+#endif
+#if FOLD == 4
+#define FOLD_CAP TT  // a step folds when its rows do not fit after this many history entries
+#else
+#define FOLD_CAP HIST
 #endif
 #define CCH (2 * KD + VD)  // CONV: the CTA's channels: its key head's q, k, then its value head's v
 
@@ -176,6 +186,11 @@ __device__ __forceinline__ float pick8(const float (&a)[8], int i) {
 #pragma unroll
   for (int k = 1; k < 8; ++k) r = (i == k) ? a[k] : r;
   return r;
+}
+__device__ __forceinline__ void mma1688(float (&d)[4], u32 a0, u32 a1, u32 b0) {
+  asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};"
+               : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+               : "r"(a0), "r"(a1), "r"(b0));
 }
 __device__ __forceinline__ void mma16816(float (&d)[4], u32 a0, u32 a1, u32 a2, u32 a3, u32 b0, u32 b1) {
   asm volatile(
@@ -524,8 +539,8 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) gdn_core(const Param
   // FOLD 2: the history (wp <= HIST entries from cache_base, one buffer) is replayed whether or not it folds; a fold
   // also writes the checkpoint after it. FOLD 3: a fold replaces the checkpoint rows H in place and the step runs on
   // them with no history. Either way this step's rows go to the other buffer from its entry 0
-  const bool fold = wp + TT > HIST;
-  const int hist = (FOLD == 3 && fold) ? 0 : wp;  // entries the step replays
+  const bool fold = wp + TT > FOLD_CAP;
+  const int hist = FOLD == 4 ? 0 : ((FOLD == 3 && fold) ? 0 : wp);  // entries the step replays
   const int wb = fold ? (base ^ HIST) : base + wp;  // this step's first ring entry
   // the history (keys of this key head, updates and log-decays of this value head; rows in history order) staged
   // by async copies, read by the fold before the wait and by the replay after it
@@ -582,8 +597,14 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) gdn_core(const Param
 #pragma unroll
         for (int m = 0; m < MT; ++m) {
           float a[4] = {0.f, 0.f, 0.f, 0.f};
+#if FOLD == 4
+          // at most TT <= 8 entries: the commit's k8 products (fold_store<false>)
+          mma1688(a, AH[m][0], AH[m][1], b0);
+          mma1688(a, AL[m][0], AL[m][1], b0);
+#else
           mma16816(a, AH[m][0], AH[m][1], AH[m][2], AH[m][3], b0, b1);
           mma16816(a, AL[m][0], AL[m][1], AL[m][2], AL[m][3], b0, b1);
+#endif
           const u32 w0 = word(H[m][0][c], e), w1 = word(H[m][1][c], e);
           out[m][0][e] = pack2(fmaf(bflo(w0), td, a[0]), fmaf(bfhi(w0), td, a[1]));
           out[m][1][e] = pack2(fmaf(bflo(w1), td, a[2]), fmaf(bfhi(w1), td, a[3]));
@@ -1121,7 +1142,7 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) gdn_core(const Param
 
 K = V = 128
 RING = 16
-TRT_RING = 32  # fold 2 / 3 (SGLANG_PST_GDN_TRT_FOLD): two history buffers of 16 entries
+TRT_RING = 32  # fold 2 / 3 / 4 (SGLANG_PST_GDN_TRT_FOLD): two history buffers of 16 entries
 MAX_ROWS_PER_REQUEST = 8
 # 4 warps of 32 value columns (warps 2 / 3 also write the key / decay ring entries, so at least 4)
 _WARPS = 4
