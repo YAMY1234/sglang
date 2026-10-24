@@ -808,7 +808,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
         )
 
-    def _forward_input_proj(self, hidden_states: torch.Tensor):
+    def _forward_input_proj(
+        self, hidden_states: torch.Tensor, defer_ba_join: bool = False
+    ):
+        # defer_ba_join (SGLANG_PLB_GDN_BA_LATE_JOIN): (qkvz, ba, join), ba unjoined on
+        # the alt stream; call join() before ba's first reader (None: already ordered).
+        if defer_ba_join and (_use_aiter or self._fused_in_proj_weight is not None):
+            return (*self._forward_input_proj(hidden_states), None)
         if _use_aiter and self._fused_in_proj_weight is not None:
             # Unquantized BF16 projections consume the bf16 side of the fused
             # AR+RMSNorm tuple; one aiter GEMM replaces the two separate
@@ -891,6 +897,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
             with torch.cuda.stream(self.alt_stream):
                 projected_states_ba, _ = self.in_proj_ba(hidden_states)
+            if defer_ba_join:
+                ba_done = self.alt_stream.record_event()
+                return (
+                    projected_states_qkvz,
+                    projected_states_ba,
+                    lambda: torch.cuda.current_stream().wait_event(ba_done),
+                )
             current_stream.wait_stream(self.alt_stream)
         elif self._fused_input_proj_cpu_enabled.value:
             projected_states_qkvz, projected_states_ba = (
@@ -904,6 +917,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         else:
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
             projected_states_ba, _ = self.in_proj_ba(hidden_states)
+        if defer_ba_join:
+            return projected_states_qkvz, projected_states_ba, None
         return projected_states_qkvz, projected_states_ba
 
     def _forward_input_proj_fused_quant_amd(self, hidden_states):

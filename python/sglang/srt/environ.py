@@ -1299,6 +1299,10 @@ class Envs:
     # PERF-LB: the MoE finalize's BT MaterializeRMSNorm also writes the static per-tensor E4M3 input of the next layer's
     # in_proj_qkvz / qkv_proj, whose quantize kernel then does not run; byte for byte SGLang's quantization
     SGLANG_PLB_AR_FP8_OUT = EnvBool(False)
+    # PERF-LB (TensorRT-LLM r3's TRTLLM_Q35_GDN_BA_LATE_JOIN): the megakernel plugin's GDN verify step, on the projection
+    # views, joins in_proj_ba's alt stream right before b / a's first reader (after the conv, which reads q / k / v
+    # only) instead of right after in_proj_qkvz (_forward_input_proj(defer_ba_join=True)). Stream order only.
+    SGLANG_PLB_GDN_BA_LATE_JOIN = EnvBool(False)
     # PERF-LP: TensorRT-LLM's TRTLLM_MNNVL_TWOSHOT_FP8 on the MNNVL CuTe DSL BT route: both Lamport stages carry E4M3
     # with an FP32 scale per 256 elements, the owner sums in FP32 (its own row exact) and re-quantizes; calls of at most
     # _MAX_TOKENS rows with tp 2 / 4 / 8 and hidden % 1024 == 0 (plb_mnnvl_cutedsl/e4m3_payload.py). Lowers precision.
