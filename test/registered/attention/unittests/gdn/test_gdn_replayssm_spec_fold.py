@@ -361,6 +361,72 @@ class TestGdnReplayssmCommitCuda(CustomTestCase):
         untouched = [s for s in range(slots) if s not in written]
         self.assertTrue(torch.equal(got[:, untouched], state[:, untouched]))
 
+    def test_cuda_track_on_the_trt_fold_ring_matches_triton(self):
+        """SGLANG_PST_GDN_TRT_FOLD: the track snapshots on the two-buffer ring of 32 (cache_base 0 /
+        16, histories of at most 16 entries, no low parts): the CUDA track against the Triton
+        one, numeric (one BF16 ulp); the active checkpoints and untracked slots stay exact."""
+        from sglang.kernels.ops.attention.fla import gdn_replayssm_commit_cuda
+        from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode import (
+            track_gdn_replayssm_circular,
+        )
+
+        layers, slots, h, hv, d, ring = 2, 12, 2, 8, 128, 32
+        gen = torch.Generator(device=DEVICE).manual_seed(5)
+
+        def rand(*shape, scale):
+            x = torch.randn(*shape, device=DEVICE, generator=gen) * scale
+            return x.to(torch.bfloat16)
+
+        state = rand(layers, slots, hv, d, d, scale=0.05)
+        caches = dict(
+            d_cache=rand(layers, slots, hv, ring, d, scale=0.05),
+            k_cache=rand(layers, slots, h, ring, d, scale=0.09),
+            g_cache=-torch.rand(layers, slots, hv, ring, device=DEVICE, generator=gen)
+            * 0.5,
+            d_residual_cache=None,
+            k_residual_cache=None,
+        )
+        state_rows = torch.tensor([3, 7, -1, 1], dtype=torch.int32, device=DEVICE)
+        replay_rows = torch.tensor([0, 5, 9, 2], dtype=torch.int64, device=DEVICE)
+        accept_lens = torch.tensor([3, 7, 2, 1], dtype=torch.int32, device=DEVICE)
+        write_pos = torch.zeros(slots, dtype=torch.int32, device=DEVICE)
+        write_pos[replay_rows] = torch.tensor([3, 16, 2, 9], device=DEVICE).int()
+        cache_base = torch.zeros(slots, dtype=torch.int32, device=DEVICE)
+        cache_base[replay_rows] = torch.tensor([16, 0, 16, 16], device=DEVICE).int()
+        is_flush = torch.zeros(slots, dtype=torch.int8, device=DEVICE)
+        track_rows = torch.tensor([10, 11, -1, 4], dtype=torch.int64, device=DEVICE)
+        track_steps = torch.tensor([1, 6, -1, 0], dtype=torch.int32, device=DEVICE)
+
+        outs = []
+        for use_cuda in (False, True):
+            out = state.clone()
+            track_gdn_replayssm_circular(
+                checkpoint_state=out,
+                **caches,
+                state_batch_indices=state_rows,
+                replay_indices=replay_rows,
+                write_pos=write_pos,
+                cache_base=cache_base,
+                is_flush=is_flush,
+                accept_lens=accept_lens,
+                mamba_track_indices=track_rows,
+                mamba_steps_to_track=track_steps,
+                null_block_id=-1,
+                use_cuda=use_cuda,
+            )
+            outs.append(out)
+        self.assertTrue(
+            any(key[3] == ring for key in gdn_replayssm_commit_cuda._KERNELS)
+        )
+        want, got = outs
+        tracked = [10, 11, 4]
+        torch.testing.assert_close(
+            got[:, tracked].float(), want[:, tracked].float(), rtol=2**-7, atol=1e-6
+        )
+        self.assertFalse(torch.equal(want[:, tracked], state[:, tracked]))
+        untouched = [s for s in range(slots) if s not in tracked]
+        self.assertTrue(torch.equal(got[:, untouched], state[:, untouched]))
+
 
 @unittest.skipUnless(_cuda_commit_available(), "needs SM90+ and cuda.bindings")
 class TestGdnCoreCudaTrtFold(CustomTestCase):
