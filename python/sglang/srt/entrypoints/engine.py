@@ -1972,14 +1972,12 @@ def _set_envs_and_config(server_args: ServerArgs):
 
 def _apply_main_gc_mode(mode: str) -> None:
     """SGLANG_PERFHT_MAIN_GC for this (main) process: a gen-1 collection over a few hundred thousand request objects
-    pauses every output stream of the server for 0.4-0.75 s."""
+    pauses every output stream of the server for 0.4-0.75 s. With a mode set, RSS is logged every 5 min."""
     if not mode:
         return
     if mode == "disable":
         gc.disable()
-        logger.info("SGLANG_PERFHT_MAIN_GC: cyclic GC disabled in the main process")
-        return
-    if mode.startswith("freeze:"):
+    elif mode.startswith("freeze:"):
         period = float(mode.split(":", 1)[1])
 
         def _freezer():
@@ -1989,9 +1987,23 @@ def _apply_main_gc_mode(mode: str) -> None:
                 time.sleep(period)
 
         threading.Thread(target=_freezer, name="perfht-gc-freeze", daemon=True).start()
-        logger.info("SGLANG_PERFHT_MAIN_GC: gc.freeze() every %.0f s in the main process", period)
-        return
-    raise ValueError(f"SGLANG_PERFHT_MAIN_GC={mode!r}: expected disable or freeze:<seconds>")
+    else:
+        raise ValueError(f"SGLANG_PERFHT_MAIN_GC={mode!r}: expected disable or freeze:<seconds>")
+    pid = os.getpid()
+    logger.info("PERFHT MAIN_GC=%s (pid %d)", mode, pid)
+
+    def _rss_log():
+        page_mb = os.sysconf("SC_PAGE_SIZE") / 2**20
+        while True:
+            time.sleep(300)
+            try:
+                with open("/proc/self/statm") as f:
+                    rss_mb = int(f.read().split()[1]) * page_mb
+            except OSError:
+                return
+            logger.info("PERFHT MAIN_GC rss %.0f MB (pid %d, gc counts %s)", rss_mb, pid, gc.get_count())
+
+    threading.Thread(target=_rss_log, name="perfht-gc-rss", daemon=True).start()
 
 
 def _scheduler_died_error(rank: int, proc) -> RuntimeError:
