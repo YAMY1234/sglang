@@ -747,6 +747,17 @@ def _cp_merge_h_ll(
     tl.store(cnt + i * HQ + h + one, e)
 
 
+def _check_ll_polls(q_heads: int, q_chunks: int) -> None:
+    # every LL poll needs a thread per word: a narrower one keeps a word in two warps and its block-wide count can let
+    # one leave with the previous call's copy; the gather polls this many words over 128 threads, the 8-warp merges 2x
+    words = q_heads * HEAD_DIM // 4 // q_chunks
+    if words < 128:
+        raise ValueError(
+            f"CP-lite LL: a q gather poll of {words} words is narrower than its 128-thread CTA and can return a stale "
+            f"word (polling race, see ll/notes/polling-audit.md); SGLANG_PSM_CP_GATHER_CHUNKS={q_chunks}"
+        )
+
+
 def _parse_min_kv(spec: str) -> dict:
     """SGLANG_TRTL1_ATTN_CP_MIN_KV: "" (no gate), "<kv>" (every batch size) or "<b>:<kv>,..." (from b requests up,
     the entry of the largest b not above the batch) -> {b: kv}."""
@@ -807,6 +818,8 @@ class CpLite:
         if self.q_chunks > 1:
             total += _MAX_ROWS * cp * (q_heads * HEAD_DIM // 4) * 8
         self.ll = envs.SGLANG_TRTL1_ATTN_CP_LL.get() and q_heads * HEAD_DIM // 2 + q_heads <= _LL_PWORDS
+        if self.ll:
+            _check_ll_polls(q_heads, self.q_chunks)
         self.cnt = torch.zeros(_KINDS, _MAX_ROWS, dtype=torch.int32, device=self.device)
         self.cnt_q2 = torch.zeros(_MAX_ROWS * self.q_chunks, dtype=torch.int32, device=self.device)
         self.sms = torch.cuda.get_device_properties(self.device).multi_processor_count
