@@ -66,6 +66,9 @@ MAX_BATCH = max(
 )
 # Same bound for single-token (MTP draft) calls.
 MAX_BATCH_Q1 = max(1, min(MAX_BATCH, envs.SGLANG_PLB_CP_FUSED_MAX_BATCH_Q1.get()))
+# Smallest batch on the two-slot plan (TRT r3: 65). The one-slot plans hold every request to whole CTAs, so a ragged
+# batch's short requests idle part of the grid (AgentX B64 snapshot: 121 tiles per CTA where two-slot needs 100).
+_TWO_SLOT_MIN_BATCH = max(1, envs.SGLANG_PLB_CP_TWO_SLOT_MIN_BATCH.get())
 
 
 # Mirror of q35_cp_partial_attn.MAX_COMB_ROWS (rows one CTA's combine chunk may touch).
@@ -249,7 +252,7 @@ class _DeviceState:
             need = max(
                 need,
                 cp_partial_balanced_ws_bytes(
-                    MAX_ROWS, _num_ctas(sm_count), 2 if MAX_BATCH > _WIDE_PLAN_MAX_BATCH else 1
+                    MAX_ROWS, _num_ctas(sm_count), 2 if MAX_BATCH >= _TWO_SLOT_MIN_BATCH else 1
                 ),
             )
             logger.info(
@@ -535,11 +538,13 @@ def q35_cp_fused_partial(
     state = _state(device, sms)
     bal = _BALANCED if balanced is None else bool(balanced)
     assert bal or b <= _LANE_PLAN_MAX_BATCH, "the equal split handles <= 32 requests"
-    # plan variant: lane (<= 32 requests), wide (33..64), two-slot (65..128); `plan` overrides it in tests (also
-    # "quad": the one-slot plan for 65..128)
+    # plan variant: lane (<= 32 requests), wide (33..64), two-slot (from _TWO_SLOT_MIN_BATCH, 65 by default, to 128);
+    # `plan` overrides it in tests (also "quad": the one-slot plan for 65..128)
     if plan is None:
         plan = (
-            "two" if b > _WIDE_PLAN_MAX_BATCH else ("wide" if b > _LANE_PLAN_MAX_BATCH else "lane")
+            "two"
+            if b >= _TWO_SLOT_MIN_BATCH
+            else ("wide" if b > _LANE_PLAN_MAX_BATCH else "lane")
         )
     assert bal or plan == "lane", "plan variants are balanced-split plans"
     assert (
