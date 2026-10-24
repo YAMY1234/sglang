@@ -1440,6 +1440,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # the staging writes virtual KV ids; a translating draft pool indexes physical ones
             logger.warning("PERF-LL step2: the draft's KV ids are translated; counting only")
             mode = 1
+        if mode >= 2 and draft_runner.require_mlp_tp_gather:
+            # a gathered batch can pad past the staged rows, whose fill would clear the staging
+            logger.warning(
+                "PERF-LL step2: the draft graph pads gathered batches; counting only"
+            )
+            mode = 1
         stages = mode >= 2 and self._post_verify_graphs is not None
         self._step2 = Step2Counter(
             width=self.speculative_num_draft_tokens,
@@ -1458,6 +1464,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
             if mode == 2:
                 self._step2.check = Step2Check(self.device)
         self._step2_uses_staged = stages and mode >= 3
+
+    def take_staged_seq_lens(self, batch: ScheduleBatch) -> Optional[torch.Tensor]:
+        """SGLANG_PERFLL_STEP5A_SEQ_LENS, before the scheduler resolves a decode pass's lengths:
+        for a pass that takes its staged draft inputs (STEP2=3), the lengths the previous pass
+        published, which its post-verify graph wrote; None otherwise."""
+        if not self._step2_uses_staged:
+            return None
+        return self._step2.take_seq_lens(batch, sched_idle=batch.perfll_sched_idle)
 
     def _init_post_verify_graphs(self) -> None:
         # A key is captured at its first rounds, which attention-DP ranks do not reach
@@ -1629,6 +1643,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                                 if self._post_verify_graphs is None
                                 else self._post_verify_graphs.next_draft
                             ),
+                            new_seq_lens=batch_output.new_seq_lens,
                         )
             if self._post_verify_graphs is not None and not _PLB_LATE_JOIN:
                 # The mamba state commit may still run on a side stream.
