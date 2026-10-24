@@ -168,6 +168,9 @@ def can_fuse_shared_expert(
     return True
 
 
+_SILU_FP8_LOGGED = False
+
+
 class Qwen2MoeMLP(nn.Module):
     def __init__(
         self,
@@ -212,6 +215,10 @@ class Qwen2MoeMLP(nn.Module):
         # Lazily derived after weight load (input_scale_inv does not exist yet
         # at construction time); the fused kernel requires a 1-D global scale.
         self._down_input_scale_inv_1d = None
+        # SGLANG_PST_SE_SILU_FP8: decided on the first forward, after weight load.
+        self._silu_fp8_quant_fusion = (
+            None if envs.SGLANG_PST_SE_SILU_FP8.get() else False
+        )
 
     def _silu_fp4_quant_fused(self, gate_up: torch.Tensor) -> tuple:
         from flashinfer import silu_and_mul_scaled_nvfp4_experts_quantize
@@ -239,6 +246,29 @@ class Qwen2MoeMLP(nn.Module):
         y_sf = y_sf.view(torch.uint8).permute(2, 4, 0, 1, 3, 5).reshape(m_padded, -1)
         return y_fp4, y_sf
 
+    def _down_takes_static_fp8(self) -> bool:
+        from sglang.srt.layers.quantization.modelopt_quant import (
+            ModelOptFp8LinearMethod,
+        )
+
+        down = self.down_proj
+        method = down.quant_method
+        ok = (
+            isinstance(method, ModelOptFp8LinearMethod)
+            and not method.use_marlin
+            and not method.use_sm120_fp8
+            and down.weight.dtype == torch.float8_e4m3fn
+            and down.input_scale.numel() == 1
+        )
+        global _SILU_FP8_LOGGED
+        if ok and not _SILU_FP8_LOGGED:
+            _SILU_FP8_LOGGED = True
+            logger.info(
+                "SGLANG_PST_SE_SILU_FP8: shared expert SiLU-and-mul + static FP8 quant "
+                "in one launch"
+            )
+        return ok
+
     def forward(
         self,
         x,
@@ -246,6 +276,17 @@ class Qwen2MoeMLP(nn.Module):
         gate_up, _ = self.gate_up_proj(x)
         if self._enable_silu_fp4_quant_fusion and not isinstance(gate_up, tuple):
             x, _ = self.down_proj(self._silu_fp4_quant_fused(gate_up))
+            return x
+        if self._silu_fp8_quant_fusion is None:
+            self._silu_fp8_quant_fusion = self._down_takes_static_fp8()
+        if self._silu_fp8_quant_fusion and gate_up.dtype == torch.bfloat16:
+            from sglang.kernels.ops.quantization.fp8_kernel import (
+                silu_and_mul_static_quant_fp8,
+            )
+
+            x, _ = self.down_proj(
+                silu_and_mul_static_quant_fp8(gate_up, self.down_proj.input_scale)
+            )
             return x
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
