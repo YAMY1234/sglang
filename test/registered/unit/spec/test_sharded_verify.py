@@ -134,12 +134,10 @@ class TestLLKeys(CustomTestCase):
     one), the other ranks' words written by the test. Each launch is followed at once by
     another kernel and nothing syncs the host until the end. Every row must get the max over
     all ranks' keys. A warp once left the poll on a stale block-wide count and took words a
-    slot held from an earlier launch: wrong tokens for a block of rows (168 of 600 launches
-    at 56 rows on one rank)."""
+    slot held from an earlier launch: wrong tokens for a block of rows (14-16% of launches at
+    56 / 63 rows on one rank, where the poll's layout repeats every element)."""
 
-    LAUNCHES = 600
-
-    def _check(self, world, rows, late):
+    def _check(self, world, rows, late, launches):
         maxr = sharded_verify._LL_MAX_ROWS
         gen = torch.Generator(device="cuda").manual_seed(world * 100 + rows)
         buf = torch.zeros(
@@ -150,33 +148,34 @@ class TestLLKeys(CustomTestCase):
         # load the writer's kernels now: lazy loading them would wait for a spinning poll
         torch.cuda._sleep(1)
         torch.empty_like(buf)[torch.arange(2, device="cuda")] = 0
-        launches = []
-        for i in range(self.LAUNCHES):
+        results = []
+        for i in range(launches):
             keys = torch.randint(
                 -(2**62), 2**62, (world, rows, 2), device="cuda", generator=gen
             )
             want = 0xFFFFFFFF - (keys.amax(dim=(0, 2)) & 0xFFFFFFFF)
             tag, slot = i + 1, (i + 1) % 3
-            at = torch.cat(
-                [
-                    ((slot * world + q) * maxr + torch.arange(rows, device="cuda")) * 2
-                    for q in range(1, world)
-                ]
-                or [torch.empty(0, dtype=torch.int64, device="cuda")]
-            )
-            others = keys[1:].amax(dim=2).reshape(-1)
-            lo = (others & 0xFFFFFFFF) | (tag << 32)
-            hi = ((others >> 32) & 0xFFFFFFFF) | (tag << 32)
-            if late:
-                # the other ranks' words land ~10 us after this launch begins to poll
-                writer.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(writer):
-                    torch.cuda._sleep(20_000)
+            if world > 1:
+                at = torch.cat(
+                    [
+                        ((slot * world + q) * maxr + torch.arange(rows, device="cuda"))
+                        * 2
+                        for q in range(1, world)
+                    ]
+                )
+                others = keys[1:].amax(dim=2).reshape(-1)
+                lo = (others & 0xFFFFFFFF) | (tag << 32)
+                hi = ((others >> 32) & 0xFFFFFFFF) | (tag << 32)
+                if late:
+                    # the other ranks' words land ~10 us after this launch begins to poll
+                    writer.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(writer):
+                        torch.cuda._sleep(20_000)
+                        buf[at] = lo
+                        buf[at + 1] = hi
+                else:
                     buf[at] = lo
                     buf[at + 1] = hi
-            else:
-                buf[at] = lo
-                buf[at + 1] = hi
             tokens = torch.full((rows,), -5, dtype=torch.int64, device="cuda")
             sharded_verify._ll_keys_kernel[(1,)](
                 keys[0].contiguous(),
@@ -192,23 +191,25 @@ class TestLLKeys(CustomTestCase):
                 BLOCK_R=max(16, triton.next_power_of_2(rows)),
                 BLOCK_P=2,
                 KEY_FLOOR=sharded_verify._KEY_FLOOR,
-                SPIN_LIMIT=1 << 22,
+                SPIN_LIMIT=1 << 24,
                 num_warps=4,
             )
             torch.empty(rows, dtype=torch.int32, device="cuda").fill_(3)
-            launches.append((tokens, want))
+            results.append((tokens, want))
         torch.cuda.synchronize()
-        wrong = sum(not torch.equal(t, w) for t, w in launches)
-        self.assertEqual(wrong, 0, f"{wrong} of {self.LAUNCHES} launches")
-        self.assertEqual(int(epoch), self.LAUNCHES)
+        wrong = sum(not torch.equal(t, w) for t, w in results)
+        self.assertEqual(wrong, 0, f"{wrong} of {launches} launches")
+        self.assertEqual(int(epoch), launches)
 
     def test_every_row_gets_every_ranks_max(self):
         with patch.object(sharded_verify, "_ll_st_b64", _plain_st_b64):
             for world in (1, 2, 8):
                 for rows in (7, 28, 56, 63):
                     for late in (False, True) if world > 1 else (False,):
+                        # one rank at 56 / 63 rows is where the stale count showed
+                        launches = 3000 if world == 1 and rows >= 56 else 600
                         with self.subTest(world=world, rows=rows, late=late):
-                            self._check(world, rows, late)
+                            self._check(world, rows, late, launches)
 
 
 class _FakeGroup:
