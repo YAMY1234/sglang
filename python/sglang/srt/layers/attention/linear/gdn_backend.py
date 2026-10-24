@@ -246,12 +246,11 @@ def _gdn_core_target_verify(
         out=out,
         rows_per_request=draft_token_num,
         num_k_heads=layer.num_k_heads,
-        # SGLANG_PLB_GDN_FOLD_IN_VERIFY (1) / SGLANG_PST_GDN_TRT_FOLD (2): the core folds a full ring
-        # itself (the cursor advance assumes it)
+        # SGLANG_PLB_GDN_FOLD_IN_VERIFY (1) / SGLANG_PST_GDN_TRT_FOLD (2, _REG 3): the core folds a full
+        # ring itself (the cursor advance assumes it)
         fold=(
-            2
-            if mamba_pool.replayssm_trt_fold
-            else int(mamba_pool.replayssm_fold_in_verify)
+            mamba_pool.replayssm_trt_fold_mode
+            or int(mamba_pool.replayssm_fold_in_verify)
         ),
         **(conv or {}),
     ):
@@ -259,7 +258,7 @@ def _gdn_core_target_verify(
     print_info_once(
         f"SGLANG_PERFHT_GDN_CORE engaged: batch={mixed_qkv.shape[0] // draft_token_num}, "
         f"value_heads={layer.num_v_heads}, fold_in_verify={int(mamba_pool.replayssm_fold_in_verify)}, "
-        f"trt_fold={int(mamba_pool.replayssm_trt_fold)}"
+        f"trt_fold={mamba_pool.replayssm_trt_fold_mode}"
     )
     return out
 

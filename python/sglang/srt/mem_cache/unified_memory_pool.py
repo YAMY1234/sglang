@@ -1036,6 +1036,7 @@ class UnifiedMambaPool(MambaPool):
         self.replayssm_fold_in_verify = False
         self.replayssm_defer_fold = False
         self.replayssm_trt_fold = False
+        self.replayssm_trt_fold_mode = 0
         self.replayssm_ring_capacity = 16
         self.debug_memory_pool = False
         self.conv_shard_groups = None
