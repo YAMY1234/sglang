@@ -303,6 +303,128 @@ def test_draft_cache_positions_graph(bs, steps, dtype, mrope):
             )
 
 
+@pytest.mark.parametrize("bs", [1, 3, 128])
+@pytest.mark.parametrize("steps,window", [(1, 1), (3, 4), (6, 7)])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("mrope", [False, True])
+def test_prepare_draft_window_matches_draft_locs(bs, steps, window, dtype, mrope):
+    from sglang.kernels.ops.speculative import perfll_spec_index
+    from sglang.kernels.ops.speculative.cache_locs import (
+        assign_draft_cache_locs_contiguous,
+        prepare_draft_window,
+    )
+
+    table = torch.arange((bs + 3) * 64, dtype=torch.int32, device="cuda").reshape(
+        bs + 3, 64
+    )
+    requests = torch.arange(bs, device="cuda")
+    seq = (torch.arange(bs, device="cuda", dtype=dtype) % 48) + 1
+    ref_cache = torch.empty((bs * window,), device="cuda", dtype=torch.int64)
+    ref_pos = torch.empty_like(seq)
+    ref_rope = torch.empty((3, bs), device="cuda", dtype=torch.int64) if mrope else None
+    window_locs = torch.empty((bs * window,), device="cuda", dtype=torch.int64)
+    draft_locs = torch.empty((bs * steps,), device="cuda", dtype=torch.int64)
+    seq_out = torch.empty((bs,), device="cuda", dtype=torch.int64)
+    pos = torch.empty((bs,), device="cuda", dtype=torch.int64)
+    rope = torch.empty((3, bs + 5), device="cuda", dtype=torch.int64) if mrope else None
+
+    def run():
+        prepare_draft_window(
+            requests,
+            seq,
+            table,
+            num_steps=steps,
+            window=window,
+            seq_len_fill_value=1,
+            seq_lens_out=seq_out,
+            positions=pos,
+            mrope=rope,
+            draft_out_cache_loc=draft_locs,
+            write_virtual=window_locs,
+        )
+
+    def check():
+        assign_draft_cache_locs_contiguous[(bs,)](
+            requests,
+            table,
+            seq,
+            ref_cache,
+            64,
+            1,
+            window,
+            positions=ref_pos,
+            mrope=ref_rope,
+            BS=bs,
+            WRITE_POSITIONS=True,
+            WRITE_MROPE=mrope,
+        )
+        assert torch.equal(window_locs, ref_cache)
+        assert torch.equal(draft_locs, ref_cache.view(bs, window)[:, :steps].flatten())
+        assert torch.equal(seq_out, seq.long()) and torch.equal(pos, ref_pos.long())
+        if mrope:
+            assert torch.equal(rope[:, :bs], ref_rope)
+        jit = torch.empty_like(ref_cache)
+        if perfll_spec_index.draft_locs(
+            requests, table, seq, jit, 64, 1, window, bs, None, None
+        ):
+            assert torch.equal(window_locs, jit)
+
+    run()
+    check()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for _ in range(3):
+        requests.add_(1).remainder_(bs + 3)
+        seq.add_(5).remainder_(48).add_(1)
+        table.add_(17)
+        graph.replay()
+        check()
+
+
+def test_prepare_draft_window_pads_rows_it_cannot_serve():
+    from sglang.kernels.ops.speculative.cache_locs import prepare_draft_window
+
+    pool_len, window, steps, fill = 64, 7, 6, 3
+    table = torch.arange(8 * pool_len, dtype=torch.int32, device="cuda").reshape(
+        8, pool_len
+    )
+    # rows: served, negative request, length 0, window past the row, served
+    requests = torch.tensor([2, -1, 3, 4, 5], device="cuda")
+    seq = torch.tensor(
+        [10, 10, 0, pool_len - window + 1, pool_len - window], device="cuda"
+    )
+    rows = requests.numel()
+    window_locs = torch.full((rows * window,), -9, device="cuda", dtype=torch.int64)
+    draft_locs = torch.full((rows * steps,), -9, device="cuda", dtype=torch.int64)
+    seq_out = torch.full((rows,), -9, device="cuda", dtype=torch.int64)
+    pos = torch.full((rows,), -9, device="cuda", dtype=torch.int64)
+    rope = torch.full((3, rows), -9, device="cuda", dtype=torch.int64)
+    prepare_draft_window(
+        requests,
+        seq,
+        table,
+        num_steps=steps,
+        window=window,
+        seq_len_fill_value=fill,
+        seq_lens_out=seq_out,
+        positions=pos,
+        mrope=rope,
+        draft_out_cache_loc=draft_locs,
+        write_virtual=window_locs,
+    )
+    served = torch.tensor([True, False, False, False, True], device="cuda")
+    span = torch.arange(window, device="cuda")
+    cols = (seq[:, None] + span).clamp(max=pool_len - 1)
+    want = torch.where(served[:, None], table[requests.clamp(min=0)[:, None], cols], 0)
+    want = want.long()
+    assert torch.equal(window_locs.view(rows, window), want)
+    assert torch.equal(draft_locs.view(rows, steps), want[:, :steps])
+    assert torch.equal(seq_out, torch.where(served, seq, fill))
+    assert torch.equal(pos, torch.where(served, seq, 0))
+    assert torch.equal(rope, torch.where(served, seq, 0)[None, :].repeat(3, 1))
+
+
 @pytest.mark.parametrize("bs", [0, 1, 7, 128, 257])
 @pytest.mark.parametrize("width", [1, 4, 7])
 @pytest.mark.parametrize("interval", [0, 16, 512])
