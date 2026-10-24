@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.allocation_sizing import (
     get_alloc_len_per_decode,
     get_alloc_reserve_per_decode,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative import eagle_utils
@@ -266,12 +267,17 @@ class TestPerfllStep5aSeqLens(CustomTestCase):
 
     def test_the_worker_hands_over_lengths_only_when_its_draft_takes_the_staging(self):
         """SGLANG_PERFLL_STEP5A_SEQ_LENS rides on STEP2=3: below it the worker returns None and
-        the scheduler gathers as before."""
+        the scheduler gathers as before; so does a prefill that reuses the last decode pass's
+        request slots, which matches that pass's note."""
         whole = 100 + 21
         batch = _batch([5, 9], [whole, whole])
         batch.perfll_sched_idle = True
         published = torch.tensor([104, 105])
-        for uses_staged in (False, True):
+        for uses_staged, mode in (
+            (False, ForwardMode.DECODE),
+            (True, ForwardMode.DECODE),
+            (True, ForwardMode.EXTEND),
+        ):
             worker = EAGLEWorkerV2.__new__(EAGLEWorkerV2)
             worker._step2 = Step2Counter(
                 width=7, graph_sizes=[2], needs_next_draft=True
@@ -280,9 +286,11 @@ class TestPerfllStep5aSeqLens(CustomTestCase):
             worker._step2.note_extend(
                 batch, next_draft=object(), new_seq_lens=published
             )
-            with self.subTest(uses_staged=uses_staged):
+            batch.forward_mode = mode
+            with self.subTest(uses_staged=uses_staged, mode=mode.name):
                 got = worker.take_staged_seq_lens(batch)
-                self.assertIs(got, published if uses_staged else None)
+                want = uses_staged and mode == ForwardMode.DECODE
+                self.assertIs(got, published if want else None)
 
     def test_the_scheduler_asks_for_staged_lengths_only_with_the_switch(self):
         """Item 2 turns off alone: without SGLANG_PERFLL_STEP5A_SEQ_LENS the scheduler never asks
