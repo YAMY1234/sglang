@@ -158,13 +158,16 @@ def replayssm_lagging_checkpoint_mode(
     ring_len: int,
     draft_tokens: Optional[int],
 ) -> str:
-    """"verify" (SGLANG_PLB_GDN_FOLD_IN_VERIFY: the verify folds a request's ring into its
-    checkpoint once the step's rows do not fit after it), "defer" (SGLANG_PLB_GDN_DEFER_FOLD:
-    the commit folds it once the next step's rows would not fit) or "" (fold every commit),
-    on a GDN spec verify ring that supports a checkpoint lagging the ring."""
+    """"verify" (SGLANG_PLB_GDN_FOLD_IN_VERIFY or SGLANG_PST_GDN_TRT_FOLD: the verify folds a
+    request's ring into its checkpoint once the step's rows do not fit after it), "defer"
+    (SGLANG_PLB_GDN_DEFER_FOLD: the commit folds it once the next step's rows would not fit) or
+    "" (fold every commit), on a GDN spec verify ring that supports a checkpoint lagging the ring."""
     if not spec_ring:
         return ""
-    if envs.SGLANG_PLB_GDN_FOLD_IN_VERIFY.get():
+    trt = envs.SGLANG_PST_GDN_TRT_FOLD.get()
+    if trt:
+        name, mode = "SGLANG_PST_GDN_TRT_FOLD", "verify"
+    elif envs.SGLANG_PLB_GDN_FOLD_IN_VERIFY.get():
         name, mode = "SGLANG_PLB_GDN_FOLD_IN_VERIFY", "verify"
     elif envs.SGLANG_PLB_GDN_DEFER_FOLD.get():
         name, mode = "SGLANG_PLB_GDN_DEFER_FOLD", "defer"
@@ -175,7 +178,8 @@ def replayssm_lagging_checkpoint_mode(
     reasons = []
     if checkpoint_dtype != torch.bfloat16:
         reasons.append(f"{checkpoint_dtype} checkpoints")
-    if not compact_ring:
+    # TRT's history keeps no low parts (unless SGLANG_PST_GDN_TRT_FOLD_LO)
+    if not compact_ring and not (trt and not envs.SGLANG_PST_GDN_TRT_FOLD_LO.get()):
         reasons.append("no compact (low-part) ring")
     if (
         draft_tokens is None
@@ -730,6 +734,15 @@ class MambaPool:
             enable_linear_replayssm_spec and cache_params.is_kda
         )
         _replayssm_on = enable_linear_replayssm or enable_linear_replayssm_spec
+        # SGLANG_PST_GDN_TRT_FOLD: TRT-LLM's two history buffers a request, one ring of twice
+        # the history length without low parts; the history (and fold) capacity stays L.
+        trt_fold_ring = bool(
+            enable_linear_replayssm_spec
+            and not cache_params.is_kda
+            and envs.SGLANG_PST_GDN_TRT_FOLD.get()
+        )
+        trt_fold_lo = trt_fold_ring and envs.SGLANG_PST_GDN_TRT_FOLD_LO.get()
+        self.replayssm_ring_capacity = linear_replayssm_cache_len
 
         # for disagg with nvlink
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
@@ -816,7 +829,7 @@ class MambaPool:
             if _replayssm_on:
                 hv, v_dim, k_dim = temporal_state_shape
                 h_k = getattr(cache_params.shape, "num_k_heads_per_tp", hv)
-                L = linear_replayssm_cache_len
+                L = linear_replayssm_cache_len * (2 if trt_fold_ring else 1)
                 # GDN speculative replay is request-lifetime scratch. Size it by
                 # active requests instead of every persistent radix-cache slot.
                 num_slots = (
@@ -900,7 +913,11 @@ class MambaPool:
                         dtype=torch.float32,
                         device=device,
                     )
-                elif enable_linear_replayssm_spec and ring_dtype != torch.float32:
+                elif (
+                    enable_linear_replayssm_spec
+                    and ring_dtype != torch.float32
+                    and not (trt_fold_ring and not trt_fold_lo)
+                ):
                     # Low parts of compact D and normalized K. The rings follow
                     # the activation dtype regardless of checkpoint dtype, so
                     # materialization always needs both parts.
@@ -1115,6 +1132,14 @@ class MambaPool:
             )
             self.replayssm_fold_in_verify = lag_mode == "verify"
             self.replayssm_defer_fold = lag_mode == "defer"
+            self.replayssm_trt_fold = trt_fold_ring and self.replayssm_fold_in_verify
+            self.replayssm_trt_fold_lo = trt_fold_lo and self.replayssm_trt_fold
+            if trt_fold_ring and not self.replayssm_trt_fold:
+                # The ring is already sized and laid out for it.
+                raise ValueError(
+                    "SGLANG_PST_GDN_TRT_FOLD: this GDN spec ring cannot lag its checkpoint "
+                    "(see the warning above)"
+                )
             mem_usage_bytes = self.mamba_cache.mem_usage_bytes()
             if isinstance(self.mamba_cache, self.SpeculativeState):
                 # `intermediate_conv_window` is an as_strided view whose logical

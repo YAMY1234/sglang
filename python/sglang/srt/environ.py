@@ -1626,6 +1626,13 @@ class Envs:
     # The GDN spec commit folds a request's ring only once its next verify's rows would not fit
     # after it (else it only advances the cursors); the verify replays the history in between.
     SGLANG_PLB_GDN_DEFER_FOLD = EnvBool(False)
+    # The GDN spec verify keeps TRT-LLM's two 16-entry history buffers a request (a ring of 32): a
+    # step whose rows do not fit after its history folds that history into the BF16 checkpoint
+    # and writes its rows to the other buffer; needs a verify core that folds (gdn_core_cuda's fold 2 / 3).
+    SGLANG_PST_GDN_TRT_FOLD = EnvBool(False)
+    # With SGLANG_PST_GDN_TRT_FOLD: the ring keeps the update / key low parts and the core folds with
+    # them (the commit's fold, bit for bit), for the plugin's TEP8 verify core.
+    SGLANG_PST_GDN_TRT_FOLD_LO = EnvBool(False)
     # A shared expert whose down_proj takes a static per-tensor FP8 input runs its
     # SiLU-and-mul and that input's quantization in one launch (bit-identical to the two).
     SGLANG_PST_SE_SILU_FP8 = EnvBool(False)
