@@ -1266,6 +1266,9 @@ class Envs:
     # "<fc1>,<fc2>": the activation amax the draft experts' static NVFP4 input global scales are built for (TRT's
     # TRTLLM_Q35_MTP_MOE_NVFP4_AMAX; "" = TRT's calibrated defaults 256,2048).
     SGLANG_PERFLP_DRAFT_MOE_NVFP4_AMAX = EnvStr("")
+    # With DRAFT_MOE_NVFP4 and no expert parallelism: also keep the BF16 experts (checkpoint order, this rank's slice)
+    # for the megakernel plugin's single-launch draft MoE (draft steps of <= 2 tokens stay BF16).
+    SGLANG_PERFLP_DRAFT_MOE_KEEP_BF16 = EnvBool(False)
     # PERF-LB static-bench probe: "<period_ms>:<MB>:<ctl file>": a thread per rank scatters MB from a dummy staging
     # buffer about every period (random phase per rank) on its own default-priority stream while the ctl file reads 1
     # (2: the persistent kernel of SGLANG_PLB_SCATTER_CTAS, 32 if unset). "": off.
