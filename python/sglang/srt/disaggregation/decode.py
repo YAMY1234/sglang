@@ -126,6 +126,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
 )
 from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu
+from sglang.srt.utils import perfll_host
 from sglang.srt.utils.common import async_h2d
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -3193,6 +3194,7 @@ class SchedulerDisaggregationDecodeMixin:
 
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
+        perfll_pin = self._perfll_host_loop_start()
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
         ls = l16_loopstat.init(self)
@@ -3271,6 +3273,8 @@ class SchedulerDisaggregationDecodeMixin:
                     pop_and_process()
             elif batch is None:
                 self.on_idle()
+                if perfll_pin:
+                    perfll_host.maybe_repin()
             if ls is not None:
                 ls.mark("pr")
 

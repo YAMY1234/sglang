@@ -2030,17 +2030,23 @@ class Scheduler(
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
 
+    def _perfll_host_loop_start(self) -> bool:
+        """SGLANG_PERFLL_HOST_PIN_MAIN / _ENV_FREEZE at an overlap event loop's start;
+        True when the main thread was pinned (the idle branch then calls maybe_repin)."""
+        pin = envs.SGLANG_PERFLL_HOST_PIN_MAIN.get()
+        if pin:
+            perfll_host.pin_main_thread(get_device().gpu_id)
+        if envs.SGLANG_PERFLL_HOST_ENV_FREEZE.get():
+            freeze_env_reads()
+            logger.info("PERF-LL host: ENV_FREEZE on")
+        return pin
+
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         self.enable_skip_finishing_decode = True
         host_trace.apply_switch_interval()
-        perfll_pin = envs.SGLANG_PERFLL_HOST_PIN_MAIN.get()
-        if perfll_pin:
-            perfll_host.pin_main_thread(get_device().gpu_id)
-        if envs.SGLANG_PERFLL_HOST_ENV_FREEZE.get():
-            freeze_env_reads()
-            logger.info("PERF-LL host: ENV_FREEZE on")
+        perfll_pin = self._perfll_host_loop_start()
         self.result_queue: Deque[
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
