@@ -167,9 +167,9 @@ class GenerationBatchResult:
     # Every stage holds the KV for its own layers, so every stage has to compact
     # that path into its committed prefix; only the last stage can compute it.
     accept_index: Optional[torch.Tensor] = None
-    prepared_draft_extend_inputs: Optional[
-        tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-    ] = None
+    # (num_correct_drafts, select_index, next_token_ids[, extend layout]); the layout is
+    # prepare_draft_extend_layout's outputs (SGLANG_PST_SPEC_EXTEND_LAYOUT)
+    prepared_draft_extend_inputs: Optional[tuple] = None
 
     # Refs the worker wants scheduler to keep alive for the same 2-iter window
     # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec
