@@ -48,6 +48,11 @@ class EaglePostVerifyGraphs:
 
     def __init__(self, *, target_worker: Any, simulated_acc_len_rng: torch.Generator):
         self._target_worker = target_worker
+        # SGLANG_PST_SPEC_EXTEND_LAYOUT: the draft extend's layout in the commit-outputs launch
+        self._extend_layout = envs.SGLANG_PST_SPEC_EXTEND_LAYOUT.get()
+        self._extend_mrope = (
+            self._extend_layout and target_worker.model_runner.model_config.model_is_mrope
+        )
         self._graphs = _PostVerifyGraphs(
             body=self._body,
             commit=self._commit,
@@ -182,6 +187,8 @@ class EaglePostVerifyGraphs:
                 slot.staged["seq_lens"],
                 num_draft_tokens=slot.tokens_per_request,
                 mamba_track_interval=slot.track_interval,
+                extend_layout=self._extend_layout,
+                extend_mrope=self._extend_mrope,
             )
         )
         return (
