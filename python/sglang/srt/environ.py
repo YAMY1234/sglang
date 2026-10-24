@@ -1253,6 +1253,9 @@ class Envs:
     # "<fc1>,<fc2>": the activation amax the draft experts' static NVFP4 input global scales are built for (TRT's
     # TRTLLM_Q35_MTP_MOE_NVFP4_AMAX; "" = TRT's calibrated defaults 256,2048).
     SGLANG_PERFLP_DRAFT_MOE_NVFP4_AMAX = EnvStr("")
+    # With DRAFT_MOE_NVFP4 and no expert parallelism: also keep the BF16 experts (checkpoint order, this rank's slice)
+    # for the megakernel plugin's single-launch draft MoE (draft steps of <= 2 tokens stay BF16).
+    SGLANG_PERFLP_DRAFT_MOE_KEEP_BF16 = EnvBool(False)
     # Timing only: decode graph padding per block of Q35MF_AB_BLOCK target-verify rounds, the labels in turn
     # ("pow2": the smallest captured power of two); model_executor/runner_backend/ab_variants.py. Empty: off.
     SGLANG_TRTL17_PAD_AB = EnvTuple(())
