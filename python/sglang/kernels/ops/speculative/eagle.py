@@ -4,7 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import is_cpu, next_power_of_2
+from sglang.kernels.ops.speculative import perfll_spec_index
+from sglang.srt.utils import is_cpu, next_power_of_2, perfll_host
 
 _is_cpu = is_cpu()
 
@@ -463,21 +464,20 @@ def prepare_draft_extend_lengths(seq_lens, num_draft_tokens, front_offset):
 
 def prepare_draft_extend_layout(seq_lens, num_draft_tokens, with_mrope):
     bs = seq_lens.numel()
-    prefix = torch.empty((bs,), dtype=torch.int32, device=seq_lens.device)
-    extend = torch.empty_like(prefix)
-    post = torch.empty((bs,), dtype=seq_lens.dtype, device=seq_lens.device)
-    positions = torch.empty(
-        (bs * num_draft_tokens,), dtype=torch.int64, device=seq_lens.device
-    )
-    starts = torch.empty_like(prefix)
-    mrope = (
-        torch.empty(
-            (3, bs * num_draft_tokens), dtype=torch.int64, device=seq_lens.device
+    device = seq_lens.device
+    empty = perfll_host.round_empty if perfll_host.OUT_POOL else perfll_host.torch_empty
+    prefix = empty((bs,), torch.int32, device)
+    extend = empty((bs,), torch.int32, device)
+    post = empty((bs,), seq_lens.dtype, device)
+    positions = empty((bs * num_draft_tokens,), torch.int64, device)
+    starts = empty((bs,), torch.int32, device)
+    mrope = empty((3, bs * num_draft_tokens), torch.int64, device) if with_mrope else None
+    if bs and not (
+        perfll_spec_index.ENABLED
+        and perfll_spec_index.extend_layout(
+            seq_lens, num_draft_tokens, prefix, extend, post, positions, starts, mrope
         )
-        if with_mrope
-        else None
-    )
-    if bs:
+    ):
         _prepare_draft_extend_lengths_kernel[
             (triton.cdiv(bs * num_draft_tokens, 128),)
         ](
@@ -567,28 +567,41 @@ def build_chain_tree(
     bs, depth = draft_tokens.shape
     width = depth + 1
     assert bonus_tokens.numel() == seq_lens.numel() == bs
+    device = seq_lens.device
+    empty = perfll_host.round_empty if perfll_host.OUT_POOL else perfll_host.torch_empty
     mask = tree_mask_buf
     if mask is None:
-        mask = torch.empty(
-            (bs * width * width,), dtype=torch.bool, device=seq_lens.device
-        )
+        mask = empty((bs * width * width,), torch.bool, device)
     assert mask.is_contiguous() and mask.numel() >= bs * width * width
-    positions = torch.empty((bs * width,), dtype=torch.int64, device=seq_lens.device)
-    retrieve = torch.empty((3, bs, width), dtype=torch.int64, device=seq_lens.device)
-    tokens = torch.empty(
+    positions = empty((bs * width,), torch.int64, device)
+    retrieve = empty((3, bs, width), torch.int64, device)
+    tokens = empty(
         (bs * width,),
-        dtype=torch.promote_types(bonus_tokens.dtype, draft_tokens.dtype),
-        device=seq_lens.device,
+        torch.promote_types(bonus_tokens.dtype, draft_tokens.dtype),
+        device,
     )
-    out_cache_loc = torch.empty_like(positions) if req_to_token is not None else None
-    mrope = (
-        torch.empty((3, bs * width), dtype=torch.int64, device=seq_lens.device)
-        if with_mrope
-        else None
+    out_cache_loc = (
+        empty((bs * width,), torch.int64, device) if req_to_token is not None else None
     )
+    mrope = empty((3, bs * width), torch.int64, device) if with_mrope else None
     if req_to_token is not None:
         assert req_pool_indices is not None and req_pool_indices.numel() == bs
-    if bs:
+    if bs and not (
+        perfll_spec_index.ENABLED
+        and perfll_spec_index.chain_tree(
+            bonus_tokens,
+            draft_tokens,
+            seq_lens,
+            mask,
+            positions,
+            retrieve,
+            tokens,
+            req_pool_indices,
+            req_to_token,
+            out_cache_loc,
+            mrope,
+        )
+    ):
         _build_chain_tree_kernel[(triton.cdiv(bs * width * width, 128),)](
             bonus_tokens,
             draft_tokens,

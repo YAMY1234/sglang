@@ -20,6 +20,16 @@ import time
 from array import array
 
 ENABLED = bool(os.environ.get("SGLANG_Q35MF_HOST_TRACE", ""))
+# Optional gate file: record only while it exists (polled while the scheduler is idle).
+_GATE = None
+if ENABLED:
+    from sglang.srt.environ import envs
+
+    _GATE = envs.SGLANG_PERFLL_HOST_TRACE_GATE.get() or None
+GATED = _GATE is not None
+if GATED:
+    ENABLED = False
+_gate_poll = 0.0
 
 (
     LOOP,
@@ -42,8 +52,31 @@ ENABLED = bool(os.environ.get("SGLANG_Q35MF_HOST_TRACE", ""))
     EXT0,
     EXT1,
     PASS_END,
-) = range(1, 21)
-GC0, GC1, RUSAGE = 30, 31, 32
+    WRK0,
+    WRK1,
+    PD1,
+    MK1,
+    VP1,
+    VF1,
+    EP1,
+    EG1,
+    OUT0,
+    OUT1,
+) = range(1, 31)
+GC0, GC1, RUSAGE = 40, 41, 42
+# Sub-marks (SGLANG_PERFLL_HOST_* budget): run_batch, get_next_batch, verify prep,
+# post-verify, draft prep / graph, verify input, draft extend prep / graph.
+(
+    RB1, RB2, RB3, RB4, RB5, RB6, RB7, RB8, RB9,
+    NB1, NB2, NB3, NB4,
+    VPA, VPB, VPC, VPD,
+    PVA, PVB, PVC,
+    PDA, PDB,
+    DXA, DXB,
+    BVA,
+    EPA, EPB,
+    EXA, EXB,
+) = range(43, 72)  # fmt: skip
 GPU_MARKS = (DRAFT0, DRAFTG, DRAFT1, VERIFY0, VERIFY1, EXT1)
 
 _buf = array("q")
@@ -137,13 +170,26 @@ def _thread_stats() -> list:
     return out
 
 
-def maybe_flush() -> None:
+def poll_gate() -> None:
+    """Call only while the scheduler is idle: recording follows the gate file."""
+    global ENABLED, _gate_poll
+    now = time.monotonic()
+    if now - _gate_poll < 0.5:
+        return
+    _gate_poll = now
+    on = os.path.exists(_GATE)
+    if ENABLED and not on:
+        maybe_flush(force=True)
+    ENABLED = on
+
+
+def maybe_flush(force: bool = False) -> None:
     """Call only while the scheduler is idle."""
     global _last_flush, _path
     if not ENABLED or (not _buf and not _events):
         return
     now = time.monotonic()
-    if now - _last_flush < 1.0:
+    if now - _last_flush < 1.0 and not force:
         return
     _last_flush = now
     if _path is None:
@@ -158,6 +204,7 @@ def maybe_flush() -> None:
                 json.dumps(
                     dict(
                         kind="meta",
+                        version=2,
                         rank=rank,
                         host=socket.gethostname(),
                         pid=os.getpid(),

@@ -14,6 +14,7 @@
 """A scheduler that manages a tensor parallel GPU worker."""
 
 import dataclasses
+import operator
 import faulthandler
 import logging
 import math
@@ -108,7 +109,7 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.disaggregation import l16_loopstat
-from sglang.srt.environ import envs
+from sglang.srt.environ import envs, freeze_env_reads
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.layers.dp_attention import get_dp_tp_group
@@ -359,7 +360,7 @@ from sglang.srt.utils import (
     suppress_other_loggers,
     triton_load_watch,
 )
-from sglang.srt.utils import host_trace
+from sglang.srt.utils import host_trace, perfll_host
 from sglang.srt.utils.common import is_confidential_compute, is_npu
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
@@ -386,6 +387,20 @@ else:
 
 
 logger = logging.getLogger(__name__)
+
+_PERFLL_SB_SNAPSHOT = envs.SGLANG_PERFLL_HOST_SB_SNAPSHOT.get()
+_SB_FIELD_GETTERS: dict = {}
+
+
+def _sb_field_getter(cls) -> tuple:
+    """(field names, itemgetter over an instance __dict__) of a dataclass, built once.
+    Plain dataclass fields live in the instance dict, so reading / updating it is
+    getattr / setattr without the per-field Python calls."""
+    entry = _SB_FIELD_GETTERS.get(cls)
+    if entry is None:
+        names = tuple(f.name for f in dataclasses.fields(cls))
+        entry = _SB_FIELD_GETTERS[cls] = (names, operator.itemgetter(*names))
+    return entry
 
 
 def _prewarm_hccl_group(device, group, device_module):
@@ -2020,6 +2035,12 @@ class Scheduler(
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         self.enable_skip_finishing_decode = True
         host_trace.apply_switch_interval()
+        perfll_pin = envs.SGLANG_PERFLL_HOST_PIN_MAIN.get()
+        if perfll_pin:
+            perfll_host.pin_main_thread(get_device().gpu_id)
+        if envs.SGLANG_PERFLL_HOST_ENV_FREEZE.get():
+            freeze_env_reads()
+            logger.info("PERF-LL host: ENV_FREEZE on")
         self.result_queue: Deque[
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
@@ -2087,6 +2108,8 @@ class Scheduler(
                 if ls is not None:
                     ls.gpu_a(self.forward_stream)
                 batch_result = self.run_batch(batch)
+                if host_trace.ENABLED:
+                    host_trace.mark(host_trace.RB9)
                 # Fence result processing behind this forward's shared reads.
                 self._apply_war_barrier()
                 if ls is not None:
@@ -2113,6 +2136,10 @@ class Scheduler(
                 self.on_idle()
                 if host_trace.ENABLED:
                     host_trace.maybe_flush()
+                if host_trace.GATED:
+                    host_trace.poll_gate()
+                if perfll_pin:
+                    perfll_host.maybe_repin()
             if host_trace.ENABLED:
                 host_trace.pass_end(keep=bool(batch) or self.last_batch is not None)
             if ls is not None:
@@ -3882,6 +3909,8 @@ class Scheduler(
     ) -> NextBatchPlan:
         self.process_pending_chunked_abort()
         self._process_hicache_events()
+        if host_trace.ENABLED:
+            host_trace.mark(host_trace.NB1)
 
         if self.enable_fpm:
             self._fpm_batch_t0 = time.monotonic()
@@ -3954,6 +3983,8 @@ class Scheduler(
         running_batch.filter_batch()
         if running_batch.batch_size() < running_bs:
             running_batch.batch_is_full = False
+        if host_trace.ENABLED:
+            host_trace.mark(host_trace.NB2)
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
@@ -3963,6 +3994,8 @@ class Scheduler(
             prefill_plan = self.get_new_batch_prefill(running_batch)
             new_batch = prefill_plan.batch_to_run
             running_batch = prefill_plan.running_batch
+        if host_trace.ENABLED:
+            host_trace.mark(host_trace.NB3)
 
         need_mlp_sync = self.require_mlp_sync
         if (
@@ -3984,6 +4017,8 @@ class Scheduler(
             # Run decode (skip for prefill-only batches)
             if not running_batch.is_empty() and not running_batch.is_prefill_only:
                 decode_batch = self.update_running_batch(running_batch)
+                if host_trace.ENABLED:
+                    host_trace.mark(host_trace.NB4)
                 ret = (
                     decode_batch
                     if decode_batch is not None and not decode_batch.is_empty()
@@ -4548,9 +4583,12 @@ class Scheduler(
         #       - for all non-future tensors (produced only by schedule stream),
         #       we shall keep its reference not being release during all the forwarding pass
         # Snapshot all fields: spec V2 rebinds seq_lens / spec_info mid-forward.
-        attr_snapshot = [
-            getattr(batch, f.name, None) for f in dataclasses.fields(batch)
-        ]
+        if _PERFLL_SB_SNAPSHOT:
+            attr_snapshot = list(_sb_field_getter(type(batch))[1](batch.__dict__))
+        else:
+            attr_snapshot = [
+                getattr(batch, f.name, None) for f in dataclasses.fields(batch)
+            ]
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
         # List (not tuple) so that workers can register additional refs via
         # GenerationBatchResult.extra_keep_alive_refs after forward returns.
@@ -4576,11 +4614,15 @@ class Scheduler(
         """
         # 1. snapshot
         snapshot_v2_full = not batch.spec_algorithm.is_none()
-        sched_snapshot = (
-            {f.name: getattr(batch, f.name) for f in dataclasses.fields(batch)}
-            if snapshot_v2_full
-            else None
-        )
+        if _PERFLL_SB_SNAPSHOT and snapshot_v2_full:
+            names, getter = _sb_field_getter(type(batch))
+            sched_snapshot = dict(zip(names, getter(batch.__dict__)))
+        else:
+            sched_snapshot = (
+                {f.name: getattr(batch, f.name) for f in dataclasses.fields(batch)}
+                if snapshot_v2_full
+                else None
+            )
         sched_sampling_info = batch.sampling_info
 
         # 2. sampling_info substitute
@@ -4594,7 +4636,9 @@ class Scheduler(
         try:
             yield
         finally:
-            if snapshot_v2_full:
+            if snapshot_v2_full and _PERFLL_SB_SNAPSHOT:
+                batch.__dict__.update(sched_snapshot)
+            elif snapshot_v2_full:
                 for name, value in sched_snapshot.items():
                     setattr(batch, name, value)
             else:
@@ -4641,6 +4685,8 @@ class Scheduler(
                 self.maybe_send_cached_prefix_chunk(req)
 
         # Run forward
+        if host_trace.ENABLED:
+            host_trace.mark(host_trace.RB1)
         if self.is_generation:
             if self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
@@ -4654,9 +4700,13 @@ class Scheduler(
                     self.future_map.resolve_seq_lens_cpu(batch)
                 if self._confidence_budget_prepare is not None:
                     self._confidence_budget_prepare(batch, self.future_map)
+                if host_trace.ENABLED:
+                    host_trace.mark(host_trace.RB2)
 
                 with self.forward_stream_ctx:
-                    self.forward_stream.wait_stream(self.schedule_stream)
+                    perfll_host.wait_stream(self.forward_stream, self.schedule_stream)
+                    if host_trace.ENABLED:
+                        host_trace.mark(host_trace.RB3)
                     if gpu_only_lens:
                         # publish_ready was recorded on forward_stream: stream order
                         # fences the gather, no host sync / event wait needed.
@@ -4666,8 +4716,12 @@ class Scheduler(
                     # snapshot captures the post-consume state — restoring
                     # post-forward must not un-consume staging.
                     resolve_forward_inputs(batch, self.future_map)
+                    if host_trace.ENABLED:
+                        host_trace.mark(host_trace.RB4)
 
                     with self._forward_isolation(batch, overlap=True):
+                        if host_trace.ENABLED:
+                            host_trace.mark(host_trace.RB5)
                         future_indices = batch.req_pool_indices
 
                         # Spec_v2 fires on_publish mid-worker (between verify and
@@ -4688,9 +4742,13 @@ class Scheduler(
                                 )
 
                         # FIXME: pp is not compatible with overlap
+                        if host_trace.ENABLED:
+                            host_trace.mark(host_trace.WRK0)
                         batch_result = self.model_worker.forward_batch_generation(
                             batch, **fwd_kwargs
                         )
+                        if host_trace.ENABLED:
+                            host_trace.mark(host_trace.WRK1)
                         if batch.spec_algorithm.is_none():
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
                         # Park any refs the worker wants kept alive 2 iters
@@ -4715,11 +4773,17 @@ class Scheduler(
                                 batch.out_cache_loc,
                             )
                         # FIXME(lsyin): maybe move this to forward_batch_generation
-                        batch_result.copy_done = self.device_module.Event()
+                        batch_result.copy_done = perfll_host.copy_done_event(
+                            self.device_module
+                        )
+                        if host_trace.ENABLED:
+                            host_trace.mark(host_trace.RB6)
                         if batch_result.delay_sample_func is None:
                             self._relay_forward_payload(
                                 batch, future_indices, batch_result
                             )
+                            if host_trace.ENABLED:
+                                host_trace.mark(host_trace.RB7)
                             if _is_hip:
                                 # Cross-stream sync costs more than the tiny D2H it
                                 # overlaps.
@@ -4729,6 +4793,8 @@ class Scheduler(
                                 )
                             else:
                                 self._copy_result_to_cpu(batch_result, batch)
+                            if host_trace.ENABLED:
+                                host_trace.mark(host_trace.RB8)
                         else:
                             batch_result.future_indices = future_indices
 
@@ -5026,7 +5092,7 @@ class Scheduler(
             return_logprob=batch.return_logprob,
             return_hidden_states=batch.return_hidden_states,
         )
-        self.copy_stream.wait_stream(self.forward_stream)
+        perfll_host.wait_stream(self.copy_stream, self.forward_stream)
         with self.copy_stream_ctx:
             if not self.enable_async_d2h_copy:
                 copy_fn()

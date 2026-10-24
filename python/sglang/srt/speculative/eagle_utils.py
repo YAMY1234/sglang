@@ -36,6 +36,7 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
 )
+from sglang.srt.utils import host_trace
 from sglang.srt.utils.async_probe import maybe_detect_oob
 
 if TYPE_CHECKING:
@@ -622,6 +623,8 @@ def eagle_prepare_for_verify(
         spec_mrope_positions=verify_input.prepared_mrope_positions,
         kv_loc_plan=verify_input.kv_loc_plan,
     )
+    if host_trace.ENABLED:
+        host_trace.mark(host_trace.VPB)
 
     # Run attention backend plan and cuda graph preparation
     can_run_cuda_graph = bool(
@@ -635,6 +638,8 @@ def eagle_prepare_for_verify(
             verify_forward_batch
         )
         verify_forward_batch.mark_forward_metadata_ready()
+        if host_trace.ENABLED:
+            host_trace.mark(host_trace.VPC)
     # Non-cuda-graph: defer init to forward_extend, which runs after
     # `_forward_raw -> prepare_mlp_sync_batch` pads the batch. Initing
     # here would use pre-pad shapes and trip DSv4 indexer shape match.
@@ -1405,6 +1410,9 @@ def _verify_outputs(
     return predict, accept_index, out[rows + bs * depth :], out
 
 
+_DECODE_ALLOC = envs.SGLANG_PERFLL_HOST_DECODE_ALLOC.get()
+
+
 def eagle_prepare_for_decode(batch: ScheduleBatch):
     batch.maybe_evict_swa()
 
@@ -1423,6 +1431,12 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     )
     for r in batch.reqs:
         r.decode_batch_idx += 1
+
+    if num_needed_tokens == 0 and _DECODE_ALLOC:
+        # alloc_for_spec_decode with nothing to allocate only raises the recorded lengths
+        for req, nxt_kv_len in zip(batch.reqs, nxt_kv_lens, strict=True):
+            req.kv.kv_allocated_len = max(req.kv.kv_allocated_len, nxt_kv_len)
+        return
 
     cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
     nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")

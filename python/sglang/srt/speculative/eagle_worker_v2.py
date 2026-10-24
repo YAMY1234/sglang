@@ -122,7 +122,7 @@ from sglang.srt.speculative.spec_utils import (
     select_top_k_tokens,
     spec_stage_span,
 )
-from sglang.srt.utils import host_trace
+from sglang.srt.utils import host_trace, perfll_host
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -641,6 +641,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             target_translator=self.target_worker.model_runner.kv_index_translator,
             num_draft_tokens=self.speculative_num_draft_tokens,
         )
+        if host_trace.ENABLED:
+            host_trace.mark(host_trace.PD1)
         if (
             can_run_decode_cuda_graph
             and not forward_batch.forward_mode.is_idle()
@@ -656,6 +658,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.megakernel.begin_draft_round(
                 runner=self.cuda_graph_runner, batch=batch, draft_input=draft_input
             )
+        if host_trace.ENABLED:
+            host_trace.mark(host_trace.MK1)
 
         n_inner = self.speculative_num_steps - 1
         canary_outside_ctx = (
@@ -1133,8 +1137,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         # Prepare for draft extend in a separate stream
         if self.plan_stream:
-            self.plan_stream.wait_stream(
-                torch.get_device_module(self.device).current_stream()
+            perfll_host.wait_stream(
+                self.plan_stream, torch.get_device_module(self.device).current_stream()
             )
         with self.plan_stream_ctx:
             forward_batch = prepare_for_draft_extend(
@@ -1149,9 +1153,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
 
         if self.plan_stream:
-            torch.get_device_module(self.device).current_stream().wait_stream(
-                self.plan_stream
+            perfll_host.wait_stream(
+                torch.get_device_module(self.device).current_stream(),
+                self.plan_stream,
             )
+        if host_trace.ENABLED:
+            host_trace.mark(host_trace.EP1)
 
         # Run draft extend batch in the main compute stream
         can_run_decode_cuda_graph = (
@@ -1182,6 +1189,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 draft_logits_output = self.cuda_graph_runner_for_draft_extend.execute(
                     forward_batch, select_index
                 )
+                if host_trace.ENABLED:
+                    host_trace.mark(host_trace.EG1)
             else:
                 draft_logits_output = self.draft_runner.forward(
                     forward_batch

@@ -14,6 +14,7 @@ import torch
 
 from sglang.kernels.ops.memory.small_field_copy import SmallFieldCopyPlan
 from sglang.srt.environ import envs
+from sglang.srt.utils import host_trace
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -30,6 +31,7 @@ _MAX_POST_VERIFY_STATES = 64
 # SGLANG_Q35MF_MKH_N3C: a round's inputs and its forced length staged in one launch.
 _ONE_LAUNCH_LOAD = envs.SGLANG_Q35MF_MKH_N3C.get()
 _SHARDED_VERIFY = envs.SGLANG_Q35MF_SHARDED_VERIFY.get()
+_SIM_PREDRAW = envs.SGLANG_PERFLL_HOST_SIM_PREDRAW.get()
 
 
 def simulated_acc_len_generator(seed: int) -> torch.Generator:
@@ -281,6 +283,7 @@ class _PostVerifyGraphs:
         # The host runs up to ~2 rounds ahead; a pinned slot is rewritten only after
         # the event behind its last copy has completed.
         self._sim_host: list[torch.Tensor] = []
+        self._sim_np = None
         self._sim_done: list[Optional[torch.cuda.Event]] = []
         self._sim_turn = 0
 
@@ -295,7 +298,11 @@ class _PostVerifyGraphs:
                 warmups=0, turn=0, slots=[None, None]
             )
         turn, state.turn = state.turn, state.turn ^ 1
+        if host_trace.ENABLED:
+            host_trace.mark(host_trace.PVA)
         sim_len, sim_turn = self._draw_sim_len(sim_max_len)
+        if host_trace.ENABLED:
+            host_trace.mark(host_trace.PVB)
         slot = state.slots[turn]
         if slot is None:
             staged = {name: src.clone() for name, src in inputs.items()}
@@ -311,6 +318,8 @@ class _PostVerifyGraphs:
         self._load(slot, inputs, sim_len)
         if sim_len is not None:
             self._record_sim_done(sim_turn)
+        if host_trace.ENABLED:
+            host_trace.mark(host_trace.PVC)
         if slot.graph is None:
             if state.warmups < _NUM_WARMUP * 2:
                 state.warmups += 1
@@ -370,15 +379,21 @@ class _PostVerifyGraphs:
                 torch.zeros((1,), dtype=torch.int64, pin_memory=True) for _ in range(4)
             ]
             self._sim_done = [None] * len(self._sim_host)
+            # numpy views of the pinned slots: a store without a torch dispatch
+            self._sim_np = [h.numpy() for h in self._sim_host] if _SIM_PREDRAW else None
         turn = self._sim_turn
         self._sim_turn = (turn + 1) % len(self._sim_host)
         done = self._sim_done[turn]
         if done is not None and not done.query():
             done.synchronize()
         host = self._sim_host[turn]
-        host[0] = sample_simulated_acc_len(
+        value = sample_simulated_acc_len(
             SIMULATE_ACC_LEN, SIMULATE_ACC_METHOD, max_len, generator=self._sim_rng
         )
+        if self._sim_np is not None:
+            self._sim_np[turn][0] = value
+        else:
+            host[0] = value
         return host, turn
 
     def _record_sim_done(self, turn: int) -> None:

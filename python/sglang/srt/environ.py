@@ -42,6 +42,17 @@ def _default_tree_cache_sanity_check() -> bool:
     return envs.SGLANG_IS_IN_CI.get()
 
 
+_UNREAD = object()
+# freeze_env_reads(): get() serves each field's first value read after the freeze; set,
+# clear and override drop it. A direct os.environ write after the freeze is not seen.
+_FROZEN = False
+
+
+def freeze_env_reads() -> None:
+    global _FROZEN
+    _FROZEN = True
+
+
 class EnvField:
     _allow_set_name = True
 
@@ -51,6 +62,7 @@ class EnvField:
         # whether the env var is explicitly set to None.
         self._set_to_none = False
         self.secret = secret
+        self._frozen_value = _UNREAD
 
     def __set_name__(self, owner, name):
         assert EnvField._allow_set_name, "Usage like `a = envs.A` is not allowed"
@@ -65,6 +77,14 @@ class EnvField:
         return self.default() if callable(self.default) else self.default
 
     def get(self) -> Any:
+        if _FROZEN:
+            value = self._frozen_value
+            if value is _UNREAD:
+                value = self._frozen_value = self._get()
+            return value
+        return self._get()
+
+    def _get(self) -> Any:
         value = os.getenv(self.name)
 
         # Explicitly set to None
@@ -91,6 +111,7 @@ class EnvField:
     def set(self, value: Any):
         self._set_to_none = value is None
         os.environ[self.name] = str(value)
+        self._frozen_value = _UNREAD
 
     @contextmanager
     def override(self, value: Any):
@@ -104,10 +125,12 @@ class EnvField:
         else:
             os.environ.pop(self.name, None)
         self._set_to_none = backup_set_to_none
+        self._frozen_value = _UNREAD
 
     def clear(self):
         os.environ.pop(self.name, None)
         self._set_to_none = False
+        self._frozen_value = _UNREAD
 
     def __bool__(self):
         raise RuntimeError(
@@ -170,7 +193,7 @@ class _DeprecatedEnvFallback:
         super().__init__(default, secret=secret)
         self.deprecated_name = deprecated_name
 
-    def get(self) -> Any:
+    def _get(self) -> Any:
         if os.getenv(self.name) is None:
             fallback = os.getenv(self.deprecated_name)
             if fallback is not None:
@@ -182,7 +205,7 @@ class _DeprecatedEnvFallback:
                     stacklevel=2,
                 )
                 os.environ[self.name] = fallback
-        return super().get()
+        return super()._get()
 
 
 class EnvBoolWithAlias(_DeprecatedEnvFallback, EnvBool):
@@ -1620,6 +1643,79 @@ class Envs:
     # The Qwen3.5 MTP draft's BF16 FlashInfer TRTLLM experts may leave their finalize to
     # the caller (the megakernel plugin's draft hop, slot draft_fin).
     SGLANG_Q35_DRAFT_BF16_DEFERRED_FINALIZE = EnvBool(False)
+    # PERF-LL host loop of a small decode batch (spec v2, overlap scheduler); all off by default.
+    # Diagnostic: with SGLANG_Q35MF_HOST_TRACE set, record only while this file exists
+    # (checked while the scheduler is idle), so one boot can bench with and without the trace.
+    SGLANG_PERFLL_HOST_TRACE_GATE = EnvStr(None)
+    # The HiCache ready-count exchange rides the same pass's request-size exchange when that
+    # pass received nothing (one cross-rank sync per pass instead of two).
+    SGLANG_PERFLL_HOST_HC_PIGGYBACK = EnvBool(False)
+    # Forced acceptance lengths ("match-expected") from one block of exponential draws per
+    # 4096 rounds, the same sequence as one torch.multinomial per round (checked against it
+    # at the first draw; falls back when they differ).
+    SGLANG_PERFLL_HOST_SIM_PREDRAW = EnvBool(False)
+    # The request poll reads each zmq socket's readiness (ZMQ_EVENTS) and calls recv only
+    # when a message is waiting, instead of a NOBLOCK recv that raises on an empty socket.
+    SGLANG_PERFLL_HOST_ZMQ_EVENTS = EnvBool(False)
+    # The decode result readback (next token ids, accept lengths) copies into a ring of
+    # pinned buffers kept per shape instead of a fresh pinned allocation per tensor and round.
+    SGLANG_PERFLL_HOST_D2H_RING = EnvBool(False)
+    # The scheduler's main thread on two reserved cores of its NUMA node, the process's other
+    # threads off them (utils/perfll_host.py).
+    SGLANG_PERFLL_HOST_PIN_MAIN = EnvBool(False)
+    # Graph-input staging (_grouped_foreach_copy_ of the decode / draft / draft-extend runners)
+    # through a JIT small-field copy plan cached per destination layout, ahead of the Triton
+    # small_copy whose per-call checks and launch cost ~100 us of host time.
+    SGLANG_PERFLL_HOST_FIELD_COPY = EnvBool(False)
+    # The two-host leader link of the EDGE exchange (SGLANG_Q35MF_EDGE_MULTIHOST_TCP) receives
+    # by spinning on a non-blocking socket, as the multi-host leader mesh does, instead of
+    # sleeping in a blocking recv.
+    SGLANG_PERFLL_HOST_LINK_SPIN = EnvBool(False)
+    # The run_batch forward isolation's ScheduleBatch snapshot / restore and its 2-iter
+    # keep-alive record read the field values straight from the instance dict (one cached
+    # name tuple) instead of dataclasses.fields() + getattr / setattr per field, twice.
+    SGLANG_PERFLL_HOST_SB_SNAPSHOT = EnvBool(False)
+    # Per-round stream joins (Stream.wait_stream creates, records and later destroys an event
+    # each call) through one cached event per (waiting, waited) stream pair, and the result
+    # readback's copy_done events from a ring of 4.
+    SGLANG_PERFLL_HOST_WAIT_EVENTS = EnvBool(False)
+    # The spec-v2 decode round's index kernels (draft cache locations, chain-tree verify
+    # inputs, draft-extend layout) from one JIT CUDA module and a cached host descriptor
+    # instead of three Triton launches; same integer results.
+    SGLANG_PERFLL_HOST_JIT_INDEX = EnvBool(False)
+    # SamplingBatchInfo.copy_for_forward copies the field values through the instance dict
+    # instead of dataclasses.replace (no __post_init__, no init=False fields: same object).
+    SGLANG_PERFLL_HOST_SAMPLING_COPY = EnvBool(False)
+    # A spec decode step that needs no new KV pages (most steps at page size 64) skips the
+    # length tensors and their two H2D copies, which only the allocation reads.
+    SGLANG_PERFLL_HOST_DECODE_ALLOC = EnvBool(False)
+    # GenerationBatchResult.copy_to_cpu opens its profiler range only while a torch
+    # profiler runs (the record_function decorator calls into the dispatcher every round).
+    SGLANG_PERFLL_HOST_RESULT_COPY = EnvBool(False)
+    # The FutureMap's per-round seq-lens gather and publish scatter as index_select /
+    # index_copy_ instead of advanced indexing (same rows, less dispatch).
+    SGLANG_PERFLL_HOST_INDEX_OPS = EnvBool(False)
+    # From the scheduler event loop's start, envs.X.get() serves each variable's first read
+    # (freeze_env_reads; set / clear / override still refresh it): dozens of os.environ
+    # lookups per round.
+    SGLANG_PERFLL_HOST_ENV_FREEZE = EnvBool(False)
+    # CudaGraphBufferRegistry.fill_from replays a per-shape plan (which slots reset their
+    # padding, each copy slot's destination view, the post-fill hooks) instead of walking
+    # and slicing every slot on each call.
+    SGLANG_PERFLL_HOST_FILL_PLAN = EnvBool(False)
+    # The draft and draft-extend graph runners stage an unpadded round's inputs, hidden states
+    # and draft probs included, with one JIT field copy into destination views cached per
+    # input layout, instead of slicing every buffer and a separate copy_ for hidden states.
+    SGLANG_PERFLL_HOST_GRAPH_INPUTS = EnvBool(False)
+    # The decode round's index outputs (draft cache locations, chain-tree verify inputs,
+    # draft-extend layout) come from rings of 8 tensors per shape instead of torch.empty;
+    # each is written whole by its kernel and read within the round.
+    SGLANG_PERFLL_HOST_OUT_POOL = EnvBool(False)
+    # PERF-LL GPU glue of a small decode round; all off by default.
+    # The TRTLLM MHA graph-metadata kernel rebuilds each batch row's page table with 8
+    # programs (page blocks dealt round-robin) instead of one, at the head of every
+    # verify / draft / draft-extend graph; same writes.
+    SGLANG_PERFLL_GLUE_META_SPLIT = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
