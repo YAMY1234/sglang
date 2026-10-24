@@ -301,6 +301,12 @@ class FlashinferDispatcher(BaseDispatcher):
         # the switch is read per dispatch so A/B variants can flip it.
         self.ll_a2a = None
         self._ll_draft = is_speculative_model
+        # PERF-LP: NVFP4 draft experts (SGLANG_PERFLP_DRAFT_MOE_NVFP4) dispatch NVFP4 like the target.
+        draft_nvfp4_dispatch = (
+            is_speculative_model
+            and envs.SGLANG_PERFLP_DRAFT_MOE_NVFP4.get()
+            and self.dispatch_type == FlashinferA2ADispatchType.NVFP4
+        )
         self._ll_switch = (
             envs.SGLANG_Q35MF_E2X_LLA2A_DRAFT
             if is_speculative_model
@@ -319,7 +325,11 @@ class FlashinferDispatcher(BaseDispatcher):
                 hidden=hidden_size,
                 num_experts=num_experts,
                 slots=envs.SGLANG_Q35MF_E2X_LLA2A_MAX_TOKENS.get(),
-                payload="bf16" if is_speculative_model else "nvfp4",
+                payload=(
+                    "bf16"
+                    if is_speculative_model and not draft_nvfp4_dispatch
+                    else "nvfp4"
+                ),
             )
         # (own top-k ids, check) of a dispatch that went through ll_a2a, for the matching combine.
         self._ll_call: Optional[tuple] = None
