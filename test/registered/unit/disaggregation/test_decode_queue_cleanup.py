@@ -1,7 +1,7 @@
 import unittest
 from concurrent.futures import Future
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.common.conn import KVTransferError
@@ -18,15 +18,17 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     poll_and_all_reduce_with_staging,
 )
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.separate_buffer_allocator_double import (
     bind_separate_buffer_capacity,
 )
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -688,6 +690,174 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
         self.assertEqual(queue.queue, [decode_req])
         mock_prepare_abort.assert_not_called()
         mock_release_kv_cache.assert_not_called()
+
+
+class _LoopBatch(SimpleNamespace):
+    def copy(self):
+        return self
+
+
+class TestPlbDecodePollEarly(CustomTestCase):
+    """SGLANG_PLB_DECODE_POLL_EARLY: process_decode_queue still decides whether an iteration polls the transfers,
+    and the overlap loop runs that poll right after its launch, before it waits for the previous batch."""
+
+    def run_loop(
+        self,
+        mode,
+        *,
+        iterations=4,
+        ready_after=None,
+        background=True,
+        polling_interval=1,
+        retracted_iters=(),
+        paused_iters=(),
+        overlap=True,
+    ):
+        enter_scope(
+            self,
+            published_topology(
+                role="scheduler",
+                disaggregation_decode_polling_interval=polling_interval,
+            ),
+        )
+        log, launched, popped = [], {}, []
+        state = SimpleNamespace(it=0)
+        new_req = SimpleNamespace(rid="new")
+        sched = Scheduler.__new__(Scheduler)
+        sched.gracefully_exit = False
+        sched._engine_paused = False
+        sched.enable_decode_hicache = False
+        sched.enable_hisparse = False
+        sched.scheduler_stage_metrics = None
+        sched.chunked_req = None
+        sched.forward_stream = None
+        sched.waiting_queue = []
+        sched.running_batch = SimpleNamespace(
+            reqs=[SimpleNamespace(rid="bg")] if background else []
+        )
+
+        def ingest_requests():
+            if state.it == iterations:
+                raise StopIteration
+            state.it += 1
+            sched._engine_paused = state.it in paused_iters
+            prealloc.retracted_queue = ["r"] if state.it in retracted_iters else []
+            log.append((state.it, "in"))
+
+        def pop_preallocated():
+            log.append((state.it, "pp"))
+            return [], []
+
+        def pop_transferred():
+            log.append((state.it, "px"))
+            if ready_after in log and not popped:
+                popped.append(new_req)
+                return [new_req]
+            return []
+
+        def next_batch(running_batch):
+            log.append((state.it, "nb"))
+            running_batch.reqs = running_batch.reqs + sched.waiting_queue
+            sched.waiting_queue = []
+            batch = _LoopBatch(reqs=running_batch.reqs) if running_batch.reqs else None
+            return SimpleNamespace(running_batch=running_batch, batch_to_run=batch)
+
+        def run_batch(batch):
+            log.append((state.it, "rb"))
+            launched[state.it] = [r.rid for r in batch.reqs]
+            return GenerationBatchResult()
+
+        prealloc = SimpleNamespace(
+            prefetch_prefill_dp_rank_queries=Mock(),
+            flush_deferred_sends=Mock(),
+            resume_retracted_reqs=Mock(return_value=[]),
+            retracted_queue=[],
+            pop_preallocated=pop_preallocated,
+        )
+        sched.disagg_decode_prealloc_queue = prealloc
+        sched.disagg_decode_transfer_queue = SimpleNamespace(
+            resolve_deferred_releases=Mock(),
+            extend=Mock(),
+            pop_transferred=pop_transferred,
+            staging_handler=None,
+            plb_done_on_submit=False,
+        )
+        sched.ingest_requests = ingest_requests
+        sched._record_scheduler_state_for_paused_engine = Mock()
+        sched.get_next_disagg_decode_batch_to_run = next_batch
+        sched.ngram_embedding_manager = SimpleNamespace(
+            prepare_for_forward=lambda batch, chunked_req: batch
+        )
+        sched.is_disable_overlap_for_batch = Mock(return_value=False)
+        sched._apply_war_barrier = Mock()
+        sched.run_batch = run_batch
+        sched.process_batch_result = lambda batch, result: log.append(
+            (state.it, "pr")
+        )
+        sched.launch_batch_sample_if_needed = Mock()
+        sched.on_idle = Mock()
+        loop = (
+            Scheduler.event_loop_overlap_disagg_decode
+            if overlap
+            else Scheduler.event_loop_normal_disagg_decode
+        )
+        with (
+            envs.SGLANG_PLB_DECODE_POLL_EARLY.override(mode),
+            self.assertRaises(StopIteration),
+        ):
+            loop(sched)
+        return log, launched
+
+    @staticmethod
+    def stages(log, it):
+        return [name for i, name in log if i == it]
+
+    def test_poll_runs_after_the_launch(self):
+        for mode, expected in (
+            (0, ["in", "pp", "px", "nb", "rb", "pr"]),
+            (1, ["in", "pp", "nb", "rb", "px", "pr"]),
+        ):
+            with self.subTest(mode=mode):
+                log, _ = self.run_loop(mode)
+                for it in range(2, 5):
+                    self.assertEqual(self.stages(log, it), expected)
+        # The normal loop keeps the poll in process_decode_queue.
+        log, _ = self.run_loop(1, overlap=False)
+        self.assertEqual(self.stages(log, 2), ["in", "pp", "px", "nb", "rb", "pr"])
+
+    def test_completion_in_the_wait_window_joins_one_batch_later(self):
+        # (completion point, first batch with the request when off, when on): only a transfer that completes
+        # between the early poll and the next process_decode_queue poll waits one more batch.
+        cases = [
+            ((2, "in"), 2, 3),
+            ((2, "pp"), 2, 3),
+            ((2, "nb"), 3, 3),
+            ((2, "rb"), 3, 3),
+            ((2, "pr"), 3, 4),
+            ((3, "in"), 3, 4),
+        ]
+        for ready_after, first_off, first_on in cases:
+            with self.subTest(ready_after=ready_after):
+                for mode, first in ((0, first_off), (1, first_on)):
+                    _, launched = self.run_loop(mode, ready_after=ready_after)
+                    joined = [it for it, rids in launched.items() if "new" in rids]
+                    self.assertEqual(min(joined), first, f"mode {mode}")
+
+    def test_polling_gates_are_unchanged(self):
+        for kwargs, expected in (
+            (dict(polling_interval=3, iterations=7), [3, 6]),
+            (dict(retracted_iters=(2, 3)), [1, 4]),
+            (dict(paused_iters=(2,)), [1, 3, 4]),
+        ):
+            with self.subTest(**kwargs):
+                for mode in (0, 1):
+                    log, _ = self.run_loop(mode, **kwargs)
+                    self.assertEqual([it for it, name in log if name == "px"], expected)
+
+    def test_idle_iteration_still_polls(self):
+        log, launched = self.run_loop(1, background=False, ready_after=(1, "in"))
+        self.assertEqual(self.stages(log, 1), ["in", "pp", "nb", "px"])
+        self.assertEqual(launched, {2: ["new"], 3: ["new"], 4: ["new"]})
 
 
 if __name__ == "__main__":

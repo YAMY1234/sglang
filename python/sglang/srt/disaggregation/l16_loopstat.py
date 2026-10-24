@@ -44,10 +44,12 @@ def coarse_pad(raw_size: int, buckets) -> Optional[int]:
 
 
 class LoopStat:
-    def __init__(self, scheduler, out_dir: str):
+    def __init__(self, scheduler, out_dir: str, extra_cols=()):
         from sglang.srt.runtime_context import get_parallel
 
         self.sched = scheduler
+        # Extra host stages go after the fixed ones, so a run without them writes the same CSV.
+        self.host_cols = _HOST_COLS + tuple(extra_cols)
         self.tp_rank = get_parallel().tp_rank
         self.write = self.tp_rank % 4 == 0
         os.makedirs(out_dir, exist_ok=True)
@@ -56,13 +58,13 @@ class LoopStat:
         self.fg = open(base + ".gpu.csv", "a", buffering=1 << 20) if self.write else None
         self.ft = open(base + ".thr.csv", "a") if self.write else None
         if self.write:
-            self.f.write(",".join(_COLS) + "\n")
+            self.f.write(",".join(_COLS + tuple(extra_cols)) + "\n")
             self.fg.write("fct,gap_us,span_us,period_us\n")
             self.ft.write("t_ms,tid,name,cpu_s\n")
         self.t0 = _now()
         self.it = 0
         self.idle = 0
-        self.row = dict.fromkeys(_HOST_COLS, 0)
+        self.row = dict.fromkeys(self.host_cols, 0)
         self.meta = {}
         self.ar_n = 0
         self.last = 0
@@ -201,7 +203,7 @@ class LoopStat:
             self.rows.append(
                 f"{self.it},{(_now() - self.t0) / 1e6:.3f},{self.sched.forward_ct},{bs},{gbs},"
                 f"{m.get('nnew', 0)},{m.get('npa', 0)},{m.get('npre', 0)},{m.get('nxfer', 0)},{m.get('nwait', 0)},{self.idle},{self.ar_n},{self.knob},{m.get('mode', 0)},"
-                + ",".join(str(r[k] // 1000) for k in _HOST_COLS)
+                + ",".join(str(r[k] // 1000) for k in self.host_cols)
             )
         for k in self.row:
             self.row[k] = 0
@@ -262,10 +264,10 @@ def prealloc_no_sync() -> bool:
     return _NO_SYNC_ENV or (STAT is not None and STAT.defer_on)
 
 
-def init(scheduler) -> Optional[LoopStat]:
+def init(scheduler, extra_cols=()) -> Optional[LoopStat]:
     global STAT
     out_dir = os.environ.get("SGLANG_TRTL16_LOOPSTAT", "")
     if not out_dir:
         return None
-    STAT = LoopStat(scheduler, out_dir)
+    STAT = LoopStat(scheduler, out_dir, extra_cols)
     return STAT

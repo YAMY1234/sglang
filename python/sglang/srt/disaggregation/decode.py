@@ -3151,6 +3151,8 @@ class SchedulerDisaggregationDecodeMixin:
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
+        self._plb_poll_early = False
+        self._plb_px_due = False
 
         while True:
             if self.gracefully_exit:
@@ -3195,7 +3197,10 @@ class SchedulerDisaggregationDecodeMixin:
     def event_loop_overlap_disagg_decode(self: Scheduler):
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
-        ls = l16_loopstat.init(self)
+        self._plb_init_poll_early()
+        ls = l16_loopstat.init(
+            self, extra_cols=("pxe",) if self._plb_poll_early else ()
+        )
 
         def pop_and_process():
             tmp_batch, tmp_result = self.result_queue.popleft()
@@ -3265,6 +3270,13 @@ class SchedulerDisaggregationDecodeMixin:
             if ls is not None:
                 ls.mark("rb")
 
+            if self._plb_px_due:
+                # Every rank reaches this point once per iteration, so the poll's all-reduce keeps its order.
+                self._plb_px_due = False
+                self._plb_pop_transferred()
+                if ls is not None:
+                    ls.mark("pxe")
+
             # Process the last batch
             if self.last_batch:
                 if not disable_overlap_for_batch:
@@ -3286,6 +3298,42 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Update last_batch
             self.last_batch = batch
+
+    def _plb_init_poll_early(self: Scheduler) -> None:
+        """SGLANG_PLB_DECODE_POLL_EARLY: process_decode_queue only marks the transfer poll due, and the overlap loop
+        runs it right after launching the batch; device receive path only (no host receive, decode HiCache, HiSparse).
+        """
+        mode = envs.SGLANG_PLB_DECODE_POLL_EARLY.get()
+        self._plb_poll_early = False
+        self._plb_px_due = False
+        if not mode:
+            return
+        supported = (
+            get_disagg().disaggregation_decode_host_receive_threshold == 1
+            and not self.enable_decode_hicache
+            and not self.enable_hisparse
+        )
+        self._plb_poll_early = supported
+        logger.info(
+            f"SGLANG_PLB_DECODE_POLL_EARLY={mode}: early transfer poll "
+            f"{'on' if supported else 'off (host receive / decode HiCache / HiSparse)'} "
+            f"(tp_rank {get_parallel().tp_rank})"
+        )
+
+    def _plb_pop_transferred(self: Scheduler) -> None:
+        ls = l16_loopstat.STAT
+        t0 = l16_loopstat._now() if ls is not None else 0
+        transferred_reqs = (
+            self.disagg_decode_transfer_queue.pop_transferred()
+        )  # the requests which kv has arrived
+        if ls is not None:
+            ls.add("px", t0)
+            ls.meta["nnew"] = len(transferred_reqs)
+        if self.enable_hisparse:
+            for req in transferred_reqs:
+                # Direct-to-host: KV data already in host pool, skip staging
+                self.hisparse_coordinator.admit_request_direct(req)
+        self.waiting_queue.extend(transferred_reqs)
 
     def _plb_flush_scatters(self: Scheduler) -> None:
         """SGLANG_PLB_SCATTER_DEFER: the staging scatters of chunks that arrived since the last batch go onto the
@@ -3529,18 +3577,11 @@ class SchedulerDisaggregationDecodeMixin:
                 if ls is not None:
                     ls.add("pp", t0)
                     ls.meta["npa"] = len(req_conns)
-            t0 = l16_loopstat._now() if ls is not None else 0
-            transferred_reqs = (
-                self.disagg_decode_transfer_queue.pop_transferred()
-            )  # the requests which kv has arrived
-            if ls is not None:
-                ls.add("px", t0)
-                ls.meta["nnew"] = len(transferred_reqs)
-            if self.enable_hisparse:
-                for req in transferred_reqs:
-                    # Direct-to-host: KV data already in host pool, skip staging
-                    self.hisparse_coordinator.admit_request_direct(req)
-            self.waiting_queue.extend(transferred_reqs)
+            if self._plb_poll_early:
+                # The overlap loop polls after this iteration's launch; its requests join the next batch.
+                self._plb_px_due = True
+            else:
+                self._plb_pop_transferred()
             if get_disagg().disaggregation_decode_host_receive_threshold < 1:
                 # Give completed host transfers device space before new arrivals.
                 req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
