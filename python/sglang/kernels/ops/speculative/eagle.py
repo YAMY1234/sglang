@@ -122,7 +122,7 @@ def _verify_commit_outputs_kernel(
     TRACK_INTERVAL: tl.constexpr,
     prefix=None,
     extend=None,
-    post=None,
+    post_lens=None,
     positions=None,
     start_locs=None,
     mrope=None,
@@ -168,7 +168,7 @@ def _verify_commit_outputs_kernel(
         # prepare_draft_extend_layout of the pre-verify lengths (the draft extend's window)
         tl.store(prefix + row, tl.maximum(length, 0), valid)
         tl.store(extend + row, DRAFT_WIDTH, valid)
-        tl.store(post + row, length + DRAFT_WIDTH, valid)
+        tl.store(post_lens + row, length + DRAFT_WIDTH, valid)
         tl.store(start_locs + row, row * DRAFT_WIDTH, valid)
         tokens = row < BS * DRAFT_WIDTH
         base = tl.load(seq_lens + (row // DRAFT_WIDTH) * SEQ_STRIDE, tokens, other=0)
@@ -261,7 +261,7 @@ def prepare_verify_commit_outputs(
                 dict(
                     prefix=layout[0],
                     extend=layout[1],
-                    post=layout[2],
+                    post_lens=layout[2],
                     positions=layout[3][0],
                     start_locs=layout[3][1],
                     mrope=layout[3][2],
