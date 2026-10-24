@@ -1871,12 +1871,23 @@ class Envs:
     # PERF-LL step 5a: the megakernel's draft extend writes its top-1 and hidden rows straight
     # into the draft graph runner's input buffers, so the next draft does not copy them.
     SGLANG_PERFLL_STEP5A = EnvBool(False)
+    # PERF-LL step 5a (2), with STEP2=3: a staged decode pass takes batch.seq_lens from the previous
+    # post-verify graph's new lengths instead of gathering them on the schedule stream, and its
+    # forward waits for the schedule stream (and the WAR barrier queued there) only when this
+    # pass's decode preparation launched work on it (a KV allocation).
+    SGLANG_PERFLL_STEP5A_SEQ_LENS = EnvBool(False)
     # PERF-LL step 5a (3), with STEP2=3: a staged draft takes the draft steps' write slots the
     # post-verify graph staged instead of copying the plan's first columns out of the window.
     SGLANG_PERFLL_STEP5A_DRAFT_LOCS = EnvBool(False)
     # PERF-LL step 5a (4): the post-verify graph writes the bonus tokens as int64, the dtype the
     # relay and the next draft read, so the deferred relay does not cast them.
     SGLANG_PERFLL_STEP5A_BONUS_I64 = EnvBool(False)
+    # Debug for SGLANG_PERFLL_STEP5A_SEQ_LENS: a staged pass also gathers its lengths the old way
+    # on the schedule stream and counts the passes where they differ (the forward then waits).
+    SGLANG_DEBUG_PERFLL_STEP5A_SEQ_LENS_CHECK = EnvBool(False)
+    # The same check, run only while this file exists (polled while the scheduler is idle), so
+    # one boot can time a workload and then check it.
+    SGLANG_DEBUG_PERFLL_STEP5A_SEQ_LENS_CHECK_GATE = EnvStr(None)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)

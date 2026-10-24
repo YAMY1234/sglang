@@ -27,7 +27,18 @@ from collections import deque
 from contextlib import ExitStack, contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Deque,
+    Dict,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
 from sglang.srt.runtime_context import (
     SpawnRanks,
@@ -482,6 +493,8 @@ class Scheduler(
     kv_checksum_computer: Optional[KvChecksumComputer] = None
     # Allocate per instance only when a consumer first defers a response.
     _deferred_responses: Optional[Dict[str, Tuple[Req, ResponseCompletion]]] = None
+    # SGLANG_PERFLL_STEP5A_SEQ_LENS (init_overlap); a class default for harnesses without it
+    _perfll_staged_seq_lens: Optional[Callable] = None
 
     def __init__(
         self,
@@ -1716,6 +1729,8 @@ class Scheduler(
             needs_confidence_relay=needs_confidence_relay,
         )
 
+        self.init_perfll_staged_seq_lens()
+
         self._confidence_budget_prepare = None
         if (
             needs_confidence_relay
@@ -2055,6 +2070,26 @@ class Scheduler(
         else:
             self.schedule_stream.wait_stream(self.forward_stream)
 
+    def init_perfll_staged_seq_lens(self):
+        """SGLANG_PERFLL_STEP5A_SEQ_LENS: a staged pass's lengths from the post-verify graph."""
+        self._perfll_staged_seq_lens = (
+            getattr(self.draft_worker, "take_staged_seq_lens", None)
+            if envs.SGLANG_PERFLL_STEP5A_SEQ_LENS.get()
+            else None
+        )
+
+    def _join_schedule_stream(self, batch: ScheduleBatch, staged_seq_lens) -> None:
+        """Order the forward after the schedule stream's work since the last join, and with it
+        after the WAR barrier queued there. SGLANG_PERFLL_STEP5A_SEQ_LENS: a pass whose lengths
+        come from the post-verify graph and whose decode preparation launched nothing on the
+        schedule stream (no KV allocation) has nothing there to wait for."""
+        if staged_seq_lens is not None:
+            sched_idle, batch.perfll_sched_idle = batch.perfll_sched_idle, False
+            check = self.future_map.seq_lens_check
+            if sched_idle and (check is None or not check.active):
+                return
+        perfll_host.wait_stream(self.forward_stream, self.schedule_stream)
+
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
@@ -2204,6 +2239,8 @@ class Scheduler(
                     host_trace.maybe_flush()
                 if host_trace.GATED:
                     host_trace.poll_gate()
+                if self.future_map.seq_lens_check is not None:
+                    self.future_map.seq_lens_check.poll_gate()
                 if perfll_pin:
                     perfll_host.maybe_repin()
             if host_trace.ENABLED:
@@ -4844,15 +4881,22 @@ class Scheduler(
                     and self._confidence_budget_prepare is None
                     and not getattr(self.future_map, "needs_cpu_seq_lens", True)
                 )
+                staged_seq_lens = (
+                    self._perfll_staged_seq_lens(batch)
+                    if self._perfll_staged_seq_lens is not None and not gpu_only_lens
+                    else None
+                )
                 if not gpu_only_lens:
-                    self.future_map.resolve_seq_lens_cpu(batch)
+                    self.future_map.resolve_seq_lens_cpu(
+                        batch, staged_seq_lens=staged_seq_lens
+                    )
                 if self._confidence_budget_prepare is not None:
                     self._confidence_budget_prepare(batch, self.future_map)
                 if host_trace.ENABLED:
                     host_trace.mark(host_trace.RB2)
 
                 with self.forward_stream_ctx:
-                    perfll_host.wait_stream(self.forward_stream, self.schedule_stream)
+                    self._join_schedule_stream(batch, staged_seq_lens)
                     if host_trace.ENABLED:
                         host_trace.mark(host_trace.RB3)
                     if gpu_only_lens:
