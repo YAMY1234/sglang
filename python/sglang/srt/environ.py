@@ -1629,6 +1629,9 @@ class Envs:
     # A shared expert whose down_proj takes a static per-tensor FP8 input runs its
     # SiLU-and-mul and that input's quantization in one launch (bit-identical to the two).
     SGLANG_PST_SE_SILU_FP8 = EnvBool(False)
+    # The commit's track-row conv window snapshot as one program per (request, block)
+    # looping over the layers: rows without a track step exit at once (bit-identical copy).
+    SGLANG_Q35MF_TRACK_SCATTER_ROWS = EnvBool(False)
     # TP > 1 EAGLE topk-1 verify keeps the target logits vocabulary-sharded: greedy rows
     # take a sharded argmax (bit-identical), temperature-only rows a sharded Gumbel-max
     # (same distribution); any other batch all-gathers them first, as before.

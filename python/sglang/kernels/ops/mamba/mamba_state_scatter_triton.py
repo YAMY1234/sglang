@@ -488,6 +488,114 @@ def fused_conv_window_scatter_with_mask(
     )
 
 
+@triton.jit
+def _conv_window_scatter_rows_kernel(
+    src_ptr,
+    dst_ptr,
+    dst_indices_ptr,  # [total_requests], int32 or int64
+    step_indices_ptr,  # [total_requests], entry >= 0 means valid
+    src_indices_ptr,  # [total_requests] (HAS_SRC_ROWS), else the request's own row
+    num_layers,
+    elem_per_entry: tl.constexpr,
+    KM1: tl.constexpr,
+    src_layer_stride,
+    src_req_stride,
+    src_step_stride,
+    src_dim_stride,
+    src_win_stride,
+    dst_layer_stride,
+    dst_req_stride,
+    src_req_size,
+    src_step_size,
+    dst_req_size,
+    HAS_SRC_ROWS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """``_fused_conv_window_scatter_with_mask_kernel``'s copy with the layers looped in one
+    program per (request, block), so a request without a valid step costs one load."""
+    pid_req = tl.program_id(0)
+    pid_block = tl.program_id(1).to(tl.int64)
+    step_idx = tl.load(step_indices_ptr + pid_req).to(tl.int64)
+    if step_idx < 0:
+        return
+    dst_idx = tl.load(dst_indices_ptr + pid_req).to(tl.int64)
+    if HAS_SRC_ROWS:
+        src_idx = tl.load(src_indices_ptr + pid_req).to(tl.int64)
+    else:
+        src_idx = pid_req.to(tl.int64)
+    if not (
+        (dst_idx >= 0)
+        & (dst_idx < dst_req_size)
+        & (src_idx < src_req_size)
+        & (step_idx < src_step_size)
+    ):
+        return
+    e = pid_block * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = e < elem_per_entry
+    d = e // KM1
+    w = e % KM1
+    src_off = src_idx * src_req_stride + step_idx * src_step_stride + d * src_dim_stride + w * src_win_stride
+    dst_off = dst_idx * dst_req_stride + e
+    for layer in range(num_layers):
+        data = tl.load(src_ptr + layer * src_layer_stride + src_off, mask=mask, other=0.0)
+        tl.store(dst_ptr + layer * dst_layer_stride + dst_off, data, mask=mask)
+
+
+def _index_rows(t: torch.Tensor) -> torch.Tensor:
+    if t.dtype not in (torch.int32, torch.int64):
+        t = t.to(torch.int64)
+    return t.contiguous()
+
+
+def conv_window_scatter_rows(
+    dst: torch.Tensor,  # conv_states [num_layers, cache_size, dim, K-1] (contiguous)
+    src: torch.Tensor,  # deduped conv-window view [num_layers, spec_size, draft_tokens, dim, K-1]
+    dst_indices_raw: torch.Tensor,  # [total_requests]
+    step_indices_raw: torch.Tensor,  # [total_requests], entry >= 0 means valid
+    src_indices_raw: torch.Tensor | None = None,  # [total_requests]
+):
+    """:func:`fused_conv_window_scatter_with_mask` for sparse valid rows (track snapshots):
+    the same copies, without the index casts, one program per (request, block)."""
+    total_requests = step_indices_raw.shape[0]
+    if total_requests == 0:
+        return
+    if dst.ndim != 4 or src.ndim != 5 or dst.shape[0] != src.shape[0] or dst.shape[2:] != src.shape[3:]:
+        raise ValueError(f"conv window shapes {tuple(dst.shape)} / {tuple(src.shape)}")
+    if dst_indices_raw.shape != step_indices_raw.shape or (
+        src_indices_raw is not None and src_indices_raw.shape != step_indices_raw.shape
+    ):
+        raise ValueError("indices length mismatch")
+    _require_entry_contiguous_dst(dst, 2, "conv_window_scatter_rows")
+    dst_indices_raw, step_indices_raw = _index_rows(dst_indices_raw), _index_rows(step_indices_raw)
+    if src_indices_raw is not None:
+        src_indices_raw = _index_rows(src_indices_raw)
+    elem_per_entry = dst.shape[2] * dst.shape[3]
+    BLOCK_SIZE = 1024
+    grid = (total_requests, triton.cdiv(elem_per_entry, BLOCK_SIZE))
+    _conv_window_scatter_rows_kernel[grid](
+        src,
+        dst,
+        dst_indices_raw,
+        step_indices_raw,
+        step_indices_raw if src_indices_raw is None else src_indices_raw,
+        dst.shape[0],
+        elem_per_entry,
+        dst.shape[3],
+        src.stride(0),
+        src.stride(1),
+        src.stride(2),
+        src.stride(3),
+        src.stride(4),
+        dst.stride(0),
+        dst.stride(1),
+        src.shape[1],
+        src.shape[2],
+        dst.shape[1],
+        HAS_SRC_ROWS=src_indices_raw is not None,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+
+
 _CONV_MULTI_MAX_TYPES = 8
 _CONV_MULTI_META_COLS = 12
 _conv_multi_meta_cache: dict = {}

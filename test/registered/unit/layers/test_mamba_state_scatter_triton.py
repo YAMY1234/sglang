@@ -19,6 +19,7 @@ try:
     from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
         _conv_multi_eligible,
         _require_entry_contiguous_dst,
+        conv_window_scatter_rows,
         fused_conv_window_scatter_multi,
         fused_conv_window_scatter_with_mask,
         fused_mamba_state_scatter_with_mask,
@@ -27,6 +28,7 @@ try:
     _FUSED_IMPORT_ERROR = None
 except Exception as e:  # pragma: no cover
     _require_entry_contiguous_dst = None
+    conv_window_scatter_rows = None
     fused_conv_window_scatter_multi = None
     fused_conv_window_scatter_with_mask = None
     fused_mamba_state_scatter_with_mask = None
@@ -537,6 +539,39 @@ class TestFusedConvWindowScatterMulti(CustomTestCase):
 
     def test_multi_type_with_track_set(self):
         self._run(num_types=2, n2=4)
+
+
+
+@unittest.skipUnless(
+    DEVICE is not None,
+    f"the per-row conv window scatter needs one of {TRITON_DEVICES}",
+)
+class TestConvWindowScatterRows(CustomTestCase):
+    """The per-row (track) scatter must copy exactly what the masked scatter copies,
+    from the deduplicated overlapping window view."""
+
+    def test_matches_masked_scatter(self):
+        torch.manual_seed(3)
+        dev = DEVICE
+        layers, slots, spec, draft, dim, km1 = 3, 12, 6, 4, 400, 3
+        shared = torch.randn(
+            (layers, spec, dim, draft + km1 - 1), dtype=torch.bfloat16, device=dev
+        )
+        st = shared.stride()
+        src = shared.as_strided(
+            (layers, spec, draft, dim, km1), (st[0], st[1], st[3], st[2], st[3])
+        )
+        dst = torch.randn((layers, slots, dim, km1), dtype=torch.bfloat16, device=dev)
+        rows = torch.randperm(slots, device=dev)[:spec]
+        steps = torch.randint(0, draft, (spec,), device=dev)
+        steps[::2] = -1
+        for src_rows in (None, torch.randperm(spec, device=dev)):
+            ref, got = dst.clone(), dst.clone()
+            fused_conv_window_scatter_with_mask(ref, src, rows, steps, src_rows)
+            conv_window_scatter_rows(got, src, rows, steps, src_rows)
+            get_device_module().synchronize()
+            self.assertTrue(torch.equal(ref, got))
+            self.assertFalse(torch.equal(ref, dst))
 
 
 if __name__ == "__main__":  # pragma: no cover
