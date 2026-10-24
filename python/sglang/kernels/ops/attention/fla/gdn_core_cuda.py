@@ -546,7 +546,10 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) gdn_core(const Param
   cp_async_wait_all();
   __syncthreads();  // the staged history
 #if FOLD == 2
-  __shared__ U4 s_hc[VD][17];  // the folded checkpoint rows until after the wait (row v, 16-byte chunk 4 c + q)
+  // the folded checkpoint rows until after the wait (row v, 16-byte chunk 4 c + q), dynamic shared memory: with the
+  // staged history and the conv rows the static part would pass 48 KB
+  extern __shared__ __align__(16) unsigned char s_dyn[];
+  U4 (*s_hc)[17] = reinterpret_cast<U4 (*)[17]>(s_dyn);
 #endif
   if (fold) {
     // h = bf16(h e^{g_total} + K^T U) with U's bf16 high / low parts and the BF16 keys: gdn_replayssm_commit's
@@ -1191,7 +1194,15 @@ def _compile(key: tuple) -> tuple:
     with torch.cuda.device(device):
         module = _check(cu.cuModuleLoadData(cubin), "module")
         fn = _check(cu.cuModuleGetFunction(module, b"gdn_core"), "function")
+        if _dynamic_smem(fold):
+            attr = cu.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
+            _check(cu.cuFuncSetAttribute(fn, attr, _dynamic_smem(fold)), "smem attribute")
     return module, fn
+
+
+def _dynamic_smem(fold: int) -> int:
+    # fold 2: the folded checkpoint staged until after the wait, [V][17] 16-byte chunks
+    return V * 17 * 16 if fold == 2 else 0
 
 
 @functools.cache
@@ -1453,7 +1464,7 @@ def core(
     cfg = cu.CUlaunchConfig()
     cfg.gridDimX, cfg.gridDimY, cfg.gridDimZ = n * HV, 1, 1
     cfg.blockDimX, cfg.blockDimY, cfg.blockDimZ = 32 * warps, 1, 1
-    cfg.sharedMemBytes = 0
+    cfg.sharedMemBytes = _dynamic_smem(fold)
     cfg.hStream = cu.CUstream(torch.cuda.current_stream(qkv.device).cuda_stream)
     attr = cu.CUlaunchAttribute()
     attr.id = cu.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION
