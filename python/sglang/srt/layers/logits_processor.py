@@ -450,6 +450,8 @@ class LogitsMetadata:
 
 # The processor whose target-verify logits were last returned on the vocab shards.
 _VERIFY_SHARD_SOURCE: Optional["LogitsProcessor"] = None
+_LMHEAD_A2A_FUSED_COPY = envs.SGLANG_PERFHT_LMHEAD_A2A_FUSED_COPY.get()
+_LMHEAD_A2A_FUSED_LOGGED = False
 
 
 def verify_logits_on_shards(logits: torch.Tensor) -> bool:
@@ -1068,6 +1070,15 @@ class LogitsProcessor(nn.Module):
             elif self._can_use_tp_lm_head_all_to_all(
                 logits, local_hidden_states, lm_head, logits_metadata
             ):
+                fused = (
+                    self._tp_lm_head_all_to_all_into_buffer(logits, logits_metadata)
+                    if use_logits_buffer
+                    and _LMHEAD_A2A_FUSED_COPY
+                    and self.final_logit_softcapping is None
+                    else None
+                )
+                if fused is not None:
+                    return fused
                 logits = self._tp_lm_head_all_to_all(logits)
                 used_tp_lm_head_all_to_all = True
             else:
@@ -1281,6 +1292,40 @@ class LogitsProcessor(nn.Module):
 
         local_rows = local_hidden_states.shape[0]
         return local_rows > 0 and logits.shape[0] == local_rows * tp_size
+
+    def _tp_lm_head_all_to_all_into_buffer(
+        self, logits: torch.Tensor, logits_metadata: LogitsMetadata
+    ) -> Optional[torch.Tensor]:
+        """The all-to-all, then one strided cast copy into the FP32 logits buffer (same values as the reassembly
+        plus _copy_logits_to_buffer); None when the buffer does not fit, so the caller takes the stock path."""
+        buffer = logits_metadata.next_token_logits_buffer
+        tp_size = get_parallel().tp_size
+        rows, shard = logits.shape[0] // tp_size, logits.shape[1]
+        if (
+            buffer is None
+            or buffer.dtype != torch.float32
+            or tp_size * shard != self.vocab_size
+            or tuple(buffer.shape) != (rows, tp_size * shard)
+        ):
+            return None
+        logits = logits.contiguous()
+        all_to_all_output = torch.empty_like(logits)
+        get_parallel().tp_group.all_to_all_single(
+            all_to_all_output.view(-1), logits.view(-1)
+        )
+        buffer.view(rows, tp_size, shard).copy_(
+            all_to_all_output.view(tp_size, rows, shard).permute(1, 0, 2)
+        )
+        global _LMHEAD_A2A_FUSED_LOGGED
+        if not _LMHEAD_A2A_FUSED_LOGGED:
+            _LMHEAD_A2A_FUSED_LOGGED = True
+            logger.info(
+                "SGLANG_PERFHT_LMHEAD_A2A_FUSED_COPY engaged: rows %d, vocab %d x %d",
+                rows,
+                tp_size,
+                shard,
+            )
+        return buffer
 
     def _tp_lm_head_all_to_all(self, logits: torch.Tensor) -> torch.Tensor:
         """Exchange only the row block owned by each destination DP rank."""

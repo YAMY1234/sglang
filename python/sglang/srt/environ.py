@@ -2302,6 +2302,9 @@ class Envs:
     # Let VCH run the q7 verify / draft extend when SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS > 1; the splits then apply
     # only to the q1 draft decode.
     SGLANG_PERFHT_VCH_WITH_SPLITS = EnvBool(False)
+    # TP lm_head all-to-all (attention DP): reassemble the vocab shards straight into the FP32 logits buffer with one
+    # strided cast copy instead of a BF16 reassembly copy plus a cast copy.
+    SGLANG_PERFHT_LMHEAD_A2A_FUSED_COPY = EnvBool(False)
     SGLANG_Q35MF_GDN_DIRECT_SOLVE = EnvBool(False)
     SGLANG_Q35MF_GDN_EMPTY_HISTORY = EnvBool(False)
     SGLANG_Q35MF_GDN_NORM_FP8 = EnvBool(False)
