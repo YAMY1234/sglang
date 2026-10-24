@@ -79,6 +79,22 @@ max(t_r, T)) (requests in order) and CTA i the range [i * T, (i + 1) * T), so a 
 two requests (slot 0, then slot 1, through one K / V ring and one O accumulator). Each request keeps the layout above
 with c_r = the CTAs meeting its tiles; its workspace slots start at the exclusive prefix sum of c_r (sum <= 2 n_ctas,
 twice the slots); the grid barrier and the combine run once per slot.
+
+Packed two-slot plan (``two_slot_pack``, SGLANG_PLB_CP_TWO_SLOT_PACK): above, every request takes at least T virtual
+tiles, the empty requests of a padded CUDA graph too, so ragged batches near n_ctas requests raise T (AgentX B113-128:
+about 1.3x the total / n_ctas). Packed, the requests are placed in order at a running position V, p = V mod T: at a CTA
+boundary (p = 0) request r takes max(t_r, 1) tiles, inside a CTA's range (p > 0) max(t_r, T - p), so a request that
+would end inside the range it started in pads to the next boundary. At most one request starts inside each range: a
+CTA still meets at most two (slots, c_r, workspace, barrier and combine as above; kernel_two unchanged); an empty
+request is written (O = 0, LSE = -inf) by the CTA holding V_r. T must satisfy end <= n_ctas * T, which is not monotone
+in T: T = the smallest feasible value in [lo, lo + 31] (lo = ceil(sum_r max(t_r, 1) / n_ctas)), one candidate per plan
+lane; else the first feasible of 32 candidates lo + 32 + k s (the last one hi = the plan above's T, always feasible:
+every packed share is <= max(t_r, T)), then the smallest feasible of the min(s - 1, 32) values below it, or it (host
+mirror: q35_cp_fused._two_slot_pack_T). Each lane scans the requests for its candidate (max(t_r, 1) from SMEM, the
+quotient by a scaled reciprocal off the dependency chain, one branch-free step per request, the start of every request
+stored in the lane's SMEM row), so the winning lane's row gives the starts without another scan; hi is only searched
+when [lo, lo + 31] has no feasible T. Tile counts must stay below 2^15. SGLANG_PLB_CP_TWO_SLOT_PACK=N packs the calls
+of N requests and more (q35_cp_fused); the packed and unpacked kernels are separate builds.
 """
 
 from __future__ import annotations
@@ -124,6 +140,13 @@ COMB_LSE_OFF = (
     96 * 1024
 )  # balanced split: byte offset of the combine's LSE buffer in the K / V ring region
 PLAN_WORDS = 8  # balanced split: per-CTA plan in SMEM (request, index, CTAs, first tile, tiles, first CTA, L, valid)
+# packed two-slot plan: scratch at the start of the K ring (free until the first TMA load). max(t_r, 1) of the requests
+# (+ the word the scan reads ahead), then two regions of one row per plan lane with each request's start; 129-word rows
+# put the 32 lanes' stores for one request in different banks.
+PACK_TT_BYTES = 1024
+PACK_ROW_BYTES = 129 * 4
+PACK_REGION_BYTES = 32 * PACK_ROW_BYTES
+assert PACK_TT_BYTES + 2 * PACK_REGION_BYTES <= KV_STAGES * TILE_KEYS * HEAD_DIM
 
 
 def cp_partial_geometry(rows: int, n_splits: int) -> dict:
@@ -479,6 +502,60 @@ def _div_floor_s32(a, b, *, loc=None, ip=None) -> Int32:
 
 
 @dsl_user_op
+def _rcp_up_f32(b, *, loc=None, ip=None) -> Float32:
+    """1 / b scaled up by 2^-16 (b >= 1): _div_rcp_s32(a, _rcp_up_f32(b)) = floor(a / b) for 0 <= a < 2^15 (the scale
+    exceeds the rcp.approx / mul rounding, and a * 2^-16 stays below the 1 / b margin to the next integer)."""
+    return Float32(
+        _asm(
+            T.f32(),
+            [Int32(b).ir_value(loc=loc, ip=ip)],
+            "{\n\t.reg .f32 f;\n\tcvt.rn.f32.s32 f, $1;\n\trcp.approx.ftz.f32 f, f;\n\t"
+            "mul.rn.f32 $0, f, 0f3F800080;\n\t}\n",
+            "=f,r",
+            False,
+            loc,
+            ip,
+        )
+    )
+
+
+@dsl_user_op
+def _div_rcp_s32(a, rb, *, loc=None, ip=None) -> Int32:
+    """floor(a * rb) for a >= 0: the quotient when rb = _rcp_up_f32(b) (three instructions, no correction step)."""
+    return Int32(
+        _asm(
+            T.i32(),
+            [Int32(a).ir_value(loc=loc, ip=ip), Float32(rb).ir_value(loc=loc, ip=ip)],
+            "{\n\t.reg .f32 f;\n\tcvt.rn.f32.s32 f, $1;\n\tmul.rn.f32 f, f, $2;\n\tcvt.rzi.s32.f32 $0, f;\n\t}\n",
+            "=r,r,f",
+            False,
+            loc,
+            ip,
+        )
+    )
+
+
+@dsl_user_op
+def _pack_step(p, k, q, m, b, *, loc=None, ip=None):
+    """One request of the packed placement (position k * b + p, 0 <= p < b; the request takes max(t, 1) = q * b + m
+    tiles): p + m wraps into the next range, or with p > 0 and q = 0 a short request pads to it. Returns (p', k')
+    without branches (the plan lanes scan different b)."""
+    out = _asm(
+        llvm.StructType.get_literal([T.i32()] * 2),
+        [Int32(v).ir_value(loc=loc, ip=ip) for v in (p, k, q, m, b)],
+        "{\n\t.reg .pred c, a;\n\t.reg .s32 u, w, x, y, z;\n\t"
+        "add.s32 u, $2, $5;\n\tsetp.ge.s32 c, u, $6;\n\tsetp.gt.s32 a, $2, 0;\n\tsetp.eq.and.s32 a, $4, 0, a;\n\t"
+        "sub.s32 w, u, $6;\n\tselp.s32 x, 0, u, a;\n\tor.pred a, a, c;\n\tselp.s32 y, 1, 0, a;\n\t"
+        "add.s32 z, $3, $4;\n\tadd.s32 $1, z, y;\n\tselp.s32 $0, w, x, c;\n\t}\n",
+        "=r,=r,r,r,r,r,r",
+        False,
+        loc,
+        ip,
+    )
+    return tuple(Int32(llvm.extractvalue(T.i32(), out, [i], loc=loc, ip=ip)) for i in range(2))
+
+
+@dsl_user_op
 def _st_shared_v4(addr, a, b, c, d, *, loc=None, ip=None) -> None:
     _asm(
         None,
@@ -527,6 +604,34 @@ def _ld_shared_f32(addr, *, loc=None, ip=None) -> Float32:
             [Int32(addr).ir_value(loc=loc, ip=ip)],
             "ld.shared.f32 $0, [$1];",
             "=f,r",
+            True,
+            loc,
+            ip,
+        )
+    )
+
+
+@dsl_user_op
+def _st_shared_s32(addr, v, *, loc=None, ip=None) -> None:
+    _asm(
+        None,
+        [Int32(addr).ir_value(loc=loc, ip=ip), Int32(v).ir_value(loc=loc, ip=ip)],
+        "st.shared.b32 [$0], $1;",
+        "r,r",
+        True,
+        loc,
+        ip,
+    )
+
+
+@dsl_user_op
+def _ld_shared_s32(addr, *, loc=None, ip=None) -> Int32:
+    return Int32(
+        _asm(
+            T.i32(),
+            [Int32(addr).ir_value(loc=loc, ip=ip)],
+            "ld.shared.b32 $0, [$1];",
+            "=r,r",
             True,
             loc,
             ip,
@@ -661,6 +766,11 @@ def _globaltimer(*, loc=None, ip=None) -> Int64:
     return Int64(_asm(T.i64(), [], "mov.u64 $0, %globaltimer;", "=l", True, loc, ip))
 
 
+@dsl_user_op
+def _clock64(*, loc=None, ip=None) -> Int64:
+    return Int64(_asm(T.i64(), [], "mov.u64 $0, %clock64;", "=l", True, loc, ip))
+
+
 # --------------------------------------------------------------------------------------------------------------------
 # kernel
 # --------------------------------------------------------------------------------------------------------------------
@@ -680,6 +790,7 @@ class Q35CpPartialAttnKernel:
                      calls on wide_plan.
     two_slot:        the two-slot plan (module docstring; kernel_two, _plan_two, up to 128 requests): the host's
                      default above 64 requests.
+    two_slot_pack:   the packed two-slot plan (module docstring; _plan_pack).
     bmm1_from_ptr:   read the log2-domain QK scale from ``bmm1_ptr[1]`` (trtllm-gen [raw, raw * log2e] layout) after the
                      dependency wait, else use ``bmm1_log2``. Same for ``bmm2`` (``bmm2_ptr[0]``).
     o_vec16:         out_o rows are 16-byte aligned (8-element vector stores), else 4-byte stores.
@@ -716,6 +827,7 @@ class Q35CpPartialAttnKernel:
         wide_plan: bool = False,
         quad_plan: bool = False,
         two_slot: bool = False,
+        two_slot_pack: bool = False,
     ):
         assert gh == cp_size * hql, "group heads = cp_size x q heads per rank"
         # L = max(seq_lens - len_sub, 0): a folded caller's prefix lengths from the batch's own lengths, so nothing
@@ -725,6 +837,8 @@ class Q35CpPartialAttnKernel:
         self.wide_plan = bool(wide_plan)
         self.quad_plan = bool(quad_plan)
         self.two_slot = bool(two_slot)
+        self.two_slot_pack = bool(two_slot_pack)
+        assert self.two_slot or not self.two_slot_pack, "the packed plan is a two-slot plan"
         assert self.balanced or not (self.wide_plan or self.quad_plan or self.two_slot), (
             "balanced-split plans"
         )
@@ -1561,7 +1675,13 @@ class Q35CpPartialAttnKernel:
 
     @cute.jit
     def _plan_two(
-        self, mSeq: cute.Tensor, cp_rank: Int32, cta: Int32, lane: Int32, sPlan: cute.Tensor
+        self,
+        mSeq: cute.Tensor,
+        cp_rank: Int32,
+        cta: Int32,
+        lane: Int32,
+        sPlan: cute.Tensor,
+        scr: Int32,
     ):
         """Two-slot plan (two_slot, up to 128 requests; lanes plan requests r, r + 32, r + 64, r + 96). T = the smallest
         tile count with sum_r max(t_r, T) <= NC * T. Request r occupies the virtual tile range [V_r, V_r + max(t_r, T))
@@ -1569,7 +1689,8 @@ class Q35CpPartialAttnKernel:
         at least T long), slot 0 = the request whose range holds the CTA's first position, slot 1 = the request that
         starts inside it. The CTAs of request r are those meeting its real tiles [V_r, V_r + t_r) (the one holding V_r
         when t_r = 0; it writes O = 0 / LSE = -inf). sPlan[8 k + w], slot k: (request or -1 for none, index among the
-        request's CTAs, its CTAs, first tile, tiles, first workspace slot, L, CTAs with work). Host mirror:
+        request's CTAs, its CTAs, first tile, tiles, first workspace slot, L, CTAs with work). two_slot_pack: T and
+        V_r of the packed plan (_plan_pack, scratch SMEM at scr). Returns T. Host mirror:
         q35_cp_fused.balanced_split_plan_two."""
         CP: cutlass.Constexpr = self.cp
         NC: cutlass.Constexpr = self.n_splits
@@ -1608,59 +1729,44 @@ class Q35CpPartialAttnKernel:
         td = ((((Ld + PAGE - 1) // PAGE) - cp_rank + CP - 1) // CP + 1) // 2
         total = _redux_add_s32(ta + tb + tc + td)
         tmax = _redux_max_s32(cutlass.max(cutlass.max(ta, tb), cutlass.max(tc, td)))
-        # smallest T with sum max(t_r, T) <= NC * T (the left side grows by at most batch < NC per step of T)
-        lo = cutlass.max((total + NC - 1) // NC, 1)
-        hi = cutlass.max(tmax, lo)
-        while lo < hi:
-            mid = (lo + hi) // 2
-            need = Int32(0)
+        if const_expr(self.two_slot_pack):
+            T, Va, Vb, Vc, Vd = self._plan_pack(batch, lane, ta, tb, tc, td, total, tmax, scr)
+        else:
+            T = self._plan_two_T(batch, lane, ta, tb, tc, td, total, tmax)
+            # virtual lengths, then their exclusive prefix sums V in request order (quarters a, b, c, d)
+            va = Int32(0)
+            vb = Int32(0)
+            vc = Int32(0)
+            vd = Int32(0)
             if lane < batch:
-                need = cutlass.max(ta, mid)
+                va = cutlass.max(ta, T)
             if lane_b < batch:
-                need = need + cutlass.max(tb, mid)
+                vb = cutlass.max(tb, T)
             if lane_c < batch:
-                need = need + cutlass.max(tc, mid)
+                vc = cutlass.max(tc, T)
             if lane_d < batch:
-                need = need + cutlass.max(td, mid)
-            if _redux_add_s32(need) <= NC * mid:
-                hi = mid
-            else:
-                lo = mid + 1
-        T = lo
-        # virtual lengths, then their exclusive prefix sums V in request order (quarters a, b, c, d)
-        va = Int32(0)
-        vb = Int32(0)
-        vc = Int32(0)
-        vd = Int32(0)
-        if lane < batch:
-            va = cutlass.max(ta, T)
-        if lane_b < batch:
-            vb = cutlass.max(tb, T)
-        if lane_c < batch:
-            vc = cutlass.max(tc, T)
-        if lane_d < batch:
-            vd = cutlass.max(td, T)
-        iva = va
-        ivb = vb
-        ivc = vc
-        ivd = vd
-        for k in cutlass.range_constexpr(5):
-            ua = _shfl_up_s32(iva, 1 << k)
-            ub = _shfl_up_s32(ivb, 1 << k)
-            uc = _shfl_up_s32(ivc, 1 << k)
-            ud = _shfl_up_s32(ivd, 1 << k)
-            if lane >= (1 << k):
-                iva = iva + ua
-                ivb = ivb + ub
-                ivc = ivc + uc
-                ivd = ivd + ud
-        sva = _redux_add_s32(va)
-        svb = _redux_add_s32(vb)
-        svc = _redux_add_s32(vc)
-        Va = iva - va
-        Vb = ivb + sva - vb
-        Vc = ivc + sva + svb - vc
-        Vd = ivd + sva + svb + svc - vd
+                vd = cutlass.max(td, T)
+            iva = va
+            ivb = vb
+            ivc = vc
+            ivd = vd
+            for k in cutlass.range_constexpr(5):
+                ua = _shfl_up_s32(iva, 1 << k)
+                ub = _shfl_up_s32(ivb, 1 << k)
+                uc = _shfl_up_s32(ivc, 1 << k)
+                ud = _shfl_up_s32(ivd, 1 << k)
+                if lane >= (1 << k):
+                    iva = iva + ua
+                    ivb = ivb + ub
+                    ivc = ivc + uc
+                    ivd = ivd + ud
+            sva = _redux_add_s32(va)
+            svb = _redux_add_s32(vb)
+            svc = _redux_add_s32(vc)
+            Va = iva - va
+            Vb = ivb + sva - vb
+            Vc = ivc + sva + svb - vc
+            Vd = ivd + sva + svb + svc - vd
         # first / last CTA meeting the real tiles (one position when t = 0) and the request's CTA count
         fa = _div_floor_s32(Va, T)
         fb = _div_floor_s32(Vb, T)
@@ -1708,6 +1814,171 @@ class Q35CpPartialAttnKernel:
             self._plan_two_store(sPlan, cta, T, lane_c, Vc, tc, fc, cc, Sc, Lc)
         if lane_d < batch:
             self._plan_two_store(sPlan, cta, T, lane_d, Vd, td, fd, cd, Sd, Ld)
+        return T
+
+    @cute.jit
+    def _plan_two_T(
+        self,
+        batch: Int32,
+        lane: Int32,
+        ta: Int32,
+        tb: Int32,
+        tc: Int32,
+        td: Int32,
+        total: Int32,
+        tmax: Int32,
+    ):
+        """The two-slot plan's T (_plan_two): binary search over the warp's four requests per lane."""
+        NC: cutlass.Constexpr = self.n_splits
+        lane_b = lane + 32
+        lane_c = lane + 64
+        lane_d = lane + 96
+        # smallest T with sum max(t_r, T) <= NC * T (the left side grows by at most batch < NC per step of T)
+        lo = cutlass.max((total + NC - 1) // NC, 1)
+        hi = cutlass.max(tmax, lo)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            need = Int32(0)
+            if lane < batch:
+                need = cutlass.max(ta, mid)
+            if lane_b < batch:
+                need = need + cutlass.max(tb, mid)
+            if lane_c < batch:
+                need = need + cutlass.max(tc, mid)
+            if lane_d < batch:
+                need = need + cutlass.max(td, mid)
+            if _redux_add_s32(need) <= NC * mid:
+                hi = mid
+            else:
+                lo = mid + 1
+        return lo
+
+    @cute.jit
+    def _plan_pack(
+        self,
+        batch: Int32,
+        lane: Int32,
+        ta: Int32,
+        tb: Int32,
+        tc: Int32,
+        td: Int32,
+        total: Int32,
+        tmax: Int32,
+        scr: Int32,
+    ):
+        """Packed two-slot plan (two_slot_pack, module docstring): (T, V_r of requests lane, lane + 32, lane + 64, lane
+        + 96; 0 past the batch). Round 0 scans T = lo + k, round 1 (only when round 0 found none) lo + 32 + k s up to hi,
+        round 2 the m values below round 1's pick; lane l scans k = 31 - l, so the highest feasible lane holds the
+        smallest feasible T. The rounds share one scan site: the plan's code precedes the hot loops and costs time even
+        unexecuted (three inlined scans in the unpacked build: +8-9 us per call at B68-128, 120K). SMEM scratch at scr
+        (PACK_* layout). Host mirror: q35_cp_fused._two_slot_pack_T / _two_slot_pack_starts."""
+        NC: cutlass.Constexpr = self.n_splits
+        lane_b = lane + 32
+        lane_c = lane + 64
+        lane_d = lane + 96
+        tta = Int32(0)
+        ttb = Int32(0)
+        ttc = Int32(0)
+        ttd = Int32(0)
+        if lane < batch:
+            tta = cutlass.max(ta, 1)
+        if lane_b < batch:
+            ttb = cutlass.max(tb, 1)
+        if lane_c < batch:
+            ttc = cutlass.max(tc, 1)
+        if lane_d < batch:
+            ttd = cutlass.max(td, 1)
+        _st_shared_s32(scr + 4 * lane, tta)
+        _st_shared_s32(scr + 4 * lane_b, ttb)
+        _st_shared_s32(scr + 4 * lane_c, ttc)
+        _st_shared_s32(scr + 4 * lane_d, ttd)
+        cute.arch.sync_warp()
+        lo = cutlass.max((_redux_add_s32(tta + ttb + ttc + ttd) + NC - 1) // NC, 1)
+        k = 31 - lane
+        rows_a = scr + PACK_TT_BYTES
+        rows_b = rows_a + PACK_REGION_BYTES
+        lo2 = lo + 32
+        T = lo
+        row = rows_a
+        c1 = Int32(0)
+        s = Int32(1)
+        m = Int32(0)
+        hi = Int32(0)
+        rnd = Int32(0)
+        while rnd < 3:
+            if rnd == 1:
+                # nothing feasible in [lo, lo + 31] (then hi > lo + 31): strided candidates up to hi (k = 0 is hi)
+                hi = self._plan_two_T(batch, lane, ta, tb, tc, td, total, tmax)
+                s = cutlass.max((hi - lo2 + 30) // 31, 1)
+            cand = lo + k
+            base = rows_a
+            act = Int32(1)
+            if rnd == 1:
+                cand = cutlass.min(lo2 + k * s, hi)
+                base = rows_b
+            if rnd == 2:
+                # the m values below round 1's pick (lanes k >= m rescan T - 1, not counted)
+                cand = c1 - m + cutlass.min(k, m - 1)
+                if k >= m:
+                    act = Int32(0)
+            end = self._pack_scan(batch, cand, scr, base + lane * PACK_ROW_BYTES)
+            ok = Int32(0)
+            if end <= NC * cand:
+                ok = act
+            win = _ballot_top(ok)
+            if rnd == 0:
+                rnd = Int32(1)
+                if win >= 0:
+                    T = lo + 31 - win
+                    row = rows_a + win * PACK_ROW_BYTES
+                    rnd = Int32(3)
+            else:
+                if rnd == 1:
+                    c1 = cutlass.min(lo2 + (31 - win) * s, hi)
+                    T = c1
+                    row = rows_b + win * PACK_ROW_BYTES
+                    m = cutlass.min(s - 1, 32)
+                    rnd = Int32(3)
+                    if m > 0:
+                        rnd = Int32(2)
+                else:
+                    if win >= 0:
+                        T = c1 - m + 31 - win
+                        row = rows_a + win * PACK_ROW_BYTES
+                    rnd = Int32(3)
+        cute.arch.sync_warp()
+        Va = Int32(0)
+        Vb = Int32(0)
+        Vc = Int32(0)
+        Vd = Int32(0)
+        if lane < batch:
+            Va = _ld_shared_s32(row + 4 * lane)
+        if lane_b < batch:
+            Vb = _ld_shared_s32(row + 4 * lane_b)
+        if lane_c < batch:
+            Vc = _ld_shared_s32(row + 4 * lane_c)
+        if lane_d < batch:
+            Vd = _ld_shared_s32(row + 4 * lane_d)
+        # the K ring's TMA loads (async proxy) follow the CTA barrier after the plan
+        cute.arch.fence_proxy("async.shared", space="cta")
+        return T, Va, Vb, Vc, Vd
+
+    @cute.jit
+    def _pack_scan(self, batch: Int32, T: Int32, tt: Int32, row: Int32):
+        """Packed placement for T over the batch's max(t_r, 1) at SMEM tt: stores each request's start at row + 4 r and
+        returns the end position (k T + p). One request per iteration, its max(t, 1) loaded one iteration ahead (the tt
+        area holds the word past the batch); the quotient is off the _pack_step dependency chain."""
+        rb = _rcp_up_f32(T)
+        k = Int32(0)
+        p = Int32(0)
+        x = _ld_shared_s32(tt)
+        for r in cutlass.range(batch):
+            xr = x
+            x = _ld_shared_s32(tt + 4 * r + 4)
+            q = _div_rcp_s32(xr, rb)
+            _st_shared_s32(row + 4 * r, k * T + p)
+            p, k = _pack_step(p, k, q, xr - q * T, T)
+        return k * T + p
 
     @cute.jit
     def _plan_two_store(
@@ -2883,7 +3154,20 @@ class Q35CpPartialAttnKernel:
         sP_base = sP.iterator.toint()
         sPlan = smem.allocate_tensor(Int32, cute.make_layout((2 * PLAN_WORDS,)), 16)
         if warp == 2:
-            self._plan_two(mSeq, cp_rank, cta, lane, sPlan)
+            if const_expr(self.debug_ts):
+                # the plan's cost: %globaltimer before / after (19, 20), %clock64 cycles (21), its T (22)
+                t_plan = _globaltimer()
+                c_plan = _clock64()
+                T_plan = self._plan_two(mSeq, cp_rank, cta, lane, sPlan, kv_base)
+                cute.arch.sync_warp()
+                c_plan = _clock64() - c_plan
+                if lane == 0:
+                    mDbg[dbg_row, 19] = t_plan
+                    mDbg[dbg_row, 20] = _globaltimer()
+                    mDbg[dbg_row, 21] = c_plan
+                    mDbg[dbg_row, 22] = Int64(T_plan)
+            else:
+                self._plan_two(mSeq, cp_rank, cta, lane, sPlan, kv_base)
 
         if warp == 0:
             cpasync.prefetch_descriptor(tma_k)

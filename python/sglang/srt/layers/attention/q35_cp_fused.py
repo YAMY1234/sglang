@@ -66,6 +66,9 @@ MAX_BATCH = max(
 )
 # Same bound for single-token (MTP draft) calls.
 MAX_BATCH_Q1 = max(1, min(MAX_BATCH, envs.SGLANG_PLB_CP_FUSED_MAX_BATCH_Q1.get()))
+# Two-slot calls with at least this many requests take the packed plan (balanced_split_plan_two(pack=True)), 0: none;
+# its own compiled kernel, so the other calls keep the unpacked kernel's code. Read at every call, tests may change it.
+_TWO_SLOT_PACK = envs.SGLANG_PLB_CP_TWO_SLOT_PACK.get()
 
 
 # Mirror of q35_cp_partial_attn.MAX_COMB_ROWS (rows one CTA's combine chunk may touch).
@@ -157,14 +160,45 @@ def balanced_split_plan(seq_lens, cp_rank: int, cp_size: int, n_ctas: int):
     return lo, c, ctas
 
 
-def balanced_split_plan_two(seq_lens, cp_rank: int, cp_size: int, n_ctas: int):
+def _two_slot_pack_starts(t, T: int):
+    """Packed two-slot placement for T: request r starts at V_r; at a CTA boundary it takes max(t_r, 1) virtual
+    tiles, at offset p inside a CTA's range max(t_r, T - p). Returns (starts, end)."""
+    starts, V = [], 0
+    for x in t:
+        starts.append(V)
+        p = V % T
+        V += max(x, 1) if p == 0 else max(x, T - p)
+    return starts, V
+
+
+def _two_slot_pack_T(t, n_ctas: int, hi: int) -> int:
+    """T of the packed plan (q35_cp_partial_attn.Q35CpPartialAttnKernel._plan_pack): feasible = end <= n_ctas * T,
+    not monotone in T; hi (the unpacked plan's T) always is. The smallest feasible T in [lo, lo + 31], lo = ceil(sum
+    max(t_r, 1) / n_ctas); else the smallest feasible of 32 candidates from lo + 32 to hi in steps of s, then the
+    smallest feasible of the min(s - 1, 32) values below it (or it)."""
+    lo = max(-(-sum(max(x, 1) for x in t) // n_ctas), 1)
+
+    def ok(T):
+        return _two_slot_pack_starts(t, T)[1] <= n_ctas * T
+
+    for T in range(lo, lo + 32):
+        if ok(T):
+            return T
+    lo2 = lo + 32
+    s = max(-(-(hi - lo2) // 31), 1)
+    c1 = next(T for T in (min(lo2 + k * s, hi) for k in range(32)) if ok(T))
+    return next((T for T in range(c1 - min(s - 1, 32), c1) if ok(T)), c1)
+
+
+def balanced_split_plan_two(seq_lens, cp_rank: int, cp_size: int, n_ctas: int, pack: bool = False):
     """Host mirror of the two-slot plan (q35_cp_partial_attn.Q35CpPartialAttnKernel._plan_two).
 
     T = the smallest tile count with sum_r max(t_r, T) <= n_ctas * T; request r takes the virtual tile range [V_r, V_r
     + max(t_r, T)) (requests in order), CTA i the range [i * T, (i + 1) * T). Returns (T, slots): slots[i] = [slot 0,
     slot 1] of CTA i, each None or (request, index among the request's CTAs, its CTAs, first workspace slot, first
     tile, tiles, CTAs with work); slot 0 is the request holding the CTA's first position, slot 1 the one starting
-    inside its range.
+    inside its range. pack (SGLANG_PLB_CP_TWO_SLOT_PACK): the requests' positions and T of _two_slot_pack_starts /
+    _two_slot_pack_T instead.
     """
     t = [
         ((((int(L) + PAGE - 1) // PAGE) - cp_rank + cp_size - 1) // cp_size + 1) // 2
@@ -182,9 +216,18 @@ def balanced_split_plan_two(seq_lens, cp_rank: int, cp_size: int, n_ctas: int):
         else:
             lo = mid + 1
     T = lo
+    if pack:
+        T = _two_slot_pack_T(t, n_ctas, T)
+        starts, end = _two_slot_pack_starts(t, T)
+    else:
+        starts = [0]
+        for x in t:
+            starts.append(starts[-1] + max(x, T))
+        end = starts.pop()
     slots = [[None, None] for _ in range(n_ctas)]
-    V = s0 = 0
+    s0 = 0
     for r, x in enumerate(t):
+        V = starts[r]
         te = max(x, 1)
         f, last = V // T, (V + te - 1) // T
         c = last - f + 1
@@ -196,8 +239,7 @@ def balanced_split_plan_two(seq_lens, cp_rank: int, cp_size: int, n_ctas: int):
             assert slots[i][k] is None
             slots[i][k] = slot
         s0 += c
-        V += max(x, T)
-    assert V <= n_ctas * T and s0 <= 2 * n_ctas
+    assert end <= n_ctas * T and s0 <= 2 * n_ctas
     return T, slots
 
 
@@ -252,16 +294,23 @@ class _DeviceState:
                     MAX_ROWS, _num_ctas(sm_count), 2 if MAX_BATCH > _WIDE_PLAN_MAX_BATCH else 1
                 ),
             )
+            pack_from = max(_TWO_SLOT_PACK, _WIDE_PLAN_MAX_BATCH + 1)
+            packed = (
+                f"; two-slot plan packed from {pack_from} requests (SGLANG_PLB_CP_TWO_SLOT_PACK={_TWO_SLOT_PACK})"
+                if _TWO_SLOT_PACK > 0 and MAX_BATCH >= pack_from
+                else ""
+            )
             logger.info(
                 f"TRTLLM_Q35_ATTN_CP_BALANCED_SPLIT=1: CP-lite fused partial attention shares "
                 f"{_num_ctas(sm_count)} CTAs among the requests by their KV length (device {device}; batch bound "
-                f"{MAX_BATCH}, q_len 1 {MAX_BATCH_Q1})"
+                f"{MAX_BATCH}, q_len 1 {MAX_BATCH_Q1}{packed})"
             )
         self.workspace = torch.empty(need // 4 + 64, dtype=torch.float32, device=device)
         self.ws_balanced = None  # test calls that override the split mode (_balanced_workspace)
         self.balanced_logged = False  # runtime evidence: one INFO line at the first balanced call
         self.wide_logged = False  # ... and one at the first call above 32 requests (wide-plan variant)
         self.quad_logged = False  # ... and one at the first call above 64 requests (two-slot / quad-plan variant)
+        self.pack_logged = False  # ... and one at the first two-slot call on the packed plan
         self.counters = torch.zeros(MAX_BATCH + 1, MAX_BATCH, dtype=torch.int64, device=device)
         self.dbg_ring = None
         if _DBG_SLOTS > 0:
@@ -350,6 +399,7 @@ def _compiled(
     wide_plan: bool = False,
     quad_plan: bool = False,
     two_slot: bool = False,
+    two_slot_pack: bool = False,
 ):
     import cuda.bindings.driver as cuda
     import cutlass
@@ -381,6 +431,7 @@ def _compiled(
             wide_plan=wide_plan,
             quad_plan=quad_plan,
             two_slot=two_slot,
+            two_slot_pack=two_slot_pack,
         )
         assert kernel.ws_bytes == cp_partial_balanced_ws_bytes(
             q_len * gh, n_splits, 2 if two_slot else 1
@@ -475,6 +526,7 @@ def q35_cp_fused_partial(
     l_from_p8: bool = False,
     len_sub: int = 0,
     plan: Optional[str] = None,
+    pack: Optional[bool] = None,
 ) -> None:
     """This CP rank's partial attention of every group head over the pages it owns (q35_cp_fused_partial_ref).
 
@@ -489,7 +541,7 @@ def q35_cp_fused_partial(
     TRTLLM_Q35_ATTN_CP_BALANCED_SPLIT; a mode other than the module's needs its own ``counters``), plan ("lane",
     "wide", "quad" or "two": the balanced split's plan variant instead of the one the batch selects; lane / wide / quad
     cover up to 32 / 64 / 128 requests and compute the same one-slot plan, "two" (up to 128) the two-slot plan, with
-    [CTAs, 24] debug rows).
+    [CTAs, 24] debug rows), pack (the two-slot plan packed or not instead of the SGLANG_PLB_CP_TWO_SLOT_PACK bound).
     Numerics: p_shift (E4M3 P shift, default _P_SHIFT), rescale_threshold (lazy rescale threshold in log2 units,
     default min(8, 8.75 - p_shift); 0 = exact running max), l_from_p8 (row sums from the E4M3-rounded P).
     """
@@ -554,6 +606,7 @@ def q35_cp_fused_partial(
     wide = bal and plan == "wide"
     quad = bal and plan == "quad"
     two = bal and plan == "two"
+    two_pack = two and (0 < _TWO_SLOT_PACK <= b if pack is None else bool(pack))
     if two and debug is not None:
         assert debug.shape[-1] >= 24, (
             "the two-slot kernel's debug rows hold 24 words (both slots' plans)"
@@ -595,6 +648,12 @@ def q35_cp_fused_partial(
                 f"TRTLLM_Q35_ATTN_CP_BALANCED_SPLIT=1: first call above {_WIDE_PLAN_MAX_BATCH} requests on the "
                 f"{'two-slot' if two else 'quad-plan'} kernel (q_len {q_len}, batch {b}, cp_rank {cp_rank}, "
                 f"{splits} CTAs)"
+            )
+        if two_pack and balanced is None and not state.pack_logged:
+            state.pack_logged = True
+            logger.info(
+                f"SGLANG_PLB_CP_TWO_SLOT_PACK={_TWO_SLOT_PACK}: first two-slot call on the packed plan (q_len {q_len}, "
+                f"batch {b}, cp_rank {cp_rank}, {splits} CTAs)"
             )
     else:
         need = b * cp_partial_geometry(R, splits)["ws_req_bytes"]
@@ -648,6 +707,7 @@ def q35_cp_fused_partial(
             wide,
             quad,
             two,
+            two_pack,
         )
     else:
         fn = _compiled(
