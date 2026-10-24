@@ -616,17 +616,22 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         the CP kernel takes a one-sequence batch (if ``tables.cp_single``), the
         non-CP kernel any other, and both update the pool in place by slot. ``output`` is [tokens, HV, V];
         returns the [1, checkpoint_rows, HV, V, K] state checkpoints, if any."""
+        from sglang.kernels.ops.attention.fla.gdn_prefill_graph_track import (
+            gdn_cp_tail_neutralize,
+        )
         from sglang.kernels.ops.attention.fla.l2norm import (
             gdn_prefill_qkv_prepare_fwd,
         )
 
         q_fi, k_fi, v_fi = gdn_prefill_qkv_prepare_fwd(q[0], k[0], v[0])
+        alpha = torch.exp(g[0].to(torch.float32))
+        beta_fi = beta[0].to(torch.float32)
         common = dict(
             q=q_fi,
             k=k_fi,
             v=v_fi,
-            g=torch.exp(g[0].to(torch.float32)),
-            beta=beta[0].to(torch.float32),
+            g=alpha,
+            beta=beta_fi,
             scale=None,
             initial_state=ssm_states,
             output_final_state=True,
@@ -650,6 +655,10 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             )
 
         if tables.cp_single:
+            # Rows past T are bucket padding (stale graph-pool memory, possibly not finite).
+            gdn_cp_tail_neutralize(
+                q_fi, k_fi, v_fi, alpha, beta_fi, tables.cp_cu_seqlens
+            )
             # max_seqlen bounds the CP launch grid; the bucket bounds any sequence.
             self._prefill_fn(
                 **common,
