@@ -793,6 +793,8 @@ def _build_chain_tree_kernel(
     vr_seq=None,
     VR_MROPE_ROW: tl.constexpr = 0,
     STAGE: tl.constexpr = False,
+    vr_loc_src=None,
+    LOC_SRC: tl.constexpr = False,
 ):
     offset = (tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
     row = offset // WIDTH
@@ -817,6 +819,8 @@ def _build_chain_tree_kernel(
         )
         tl.store(out_cache_loc + offset, loc, valid)
         if STAGE:
+            if LOC_SRC:
+                loc = tl.load(vr_loc_src + offset, valid, other=0)
             tl.store(vr_loc + offset, loc.to(tl.int64), valid)
             tl.store(vr_req + row, req, valid & (col == 0))
     if WRITE_MROPE:
@@ -843,10 +847,12 @@ def build_chain_tree(
     req_to_token=None,
     with_mrope=False,
     verify_runner_inputs=None,
+    verify_runner_locs=None,
 ):
     """``verify_runner_inputs``: the target verify runner's (input_ids, positions, out_cache_loc,
     mrope_positions, req_pool_indices, seq_lens) views of this batch, int64, written as well
-    (SGLANG_PERFLL_RS_T); needs ``req_to_token`` and ``with_mrope``."""
+    (SGLANG_PERFLL_RS_T); needs ``req_to_token`` and ``with_mrope``. ``verify_runner_locs``: the
+    verify's int64 write slots (a planned window) its out_cache_loc takes in place of the table's."""
     bs, depth = draft_tokens.shape
     width = depth + 1
     assert bonus_tokens.numel() == seq_lens.numel() == bs
@@ -874,6 +880,10 @@ def build_chain_tree(
         assert req_to_token is not None and with_mrope
         assert all(t.dtype == torch.int64 for t in stage)
         assert stage[0].numel() == bs * width and stage[4].numel() == bs
+        if verify_runner_locs is not None:
+            assert verify_runner_locs.dtype == torch.int64
+            assert verify_runner_locs.is_contiguous()
+            assert verify_runner_locs.numel() == bs * width
     if bs and not (
         perfll_spec_index.ENABLED
         and perfll_spec_index.chain_tree(
@@ -889,6 +899,7 @@ def build_chain_tree(
             out_cache_loc,
             mrope,
             stage=stage,
+            stage_locs=verify_runner_locs,
         )
     ):
         _build_chain_tree_kernel[(triton.cdiv(bs * width * width, 128),)](
@@ -929,6 +940,8 @@ def build_chain_tree(
                     "vr_seq": stage[5],
                     "VR_MROPE_ROW": stage[3].stride(0),
                     "STAGE": True,
+                    "vr_loc_src": verify_runner_locs,
+                    "LOC_SRC": verify_runner_locs is not None,
                 }
             ),
         )

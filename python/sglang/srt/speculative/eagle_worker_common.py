@@ -468,6 +468,7 @@ def build_eagle_verify_input(
     tree_mask_mode: TreeMaskMode,
     device: str,
     verify_runner_inputs: Optional[tuple] = None,
+    verify_runner_locs: Optional[torch.Tensor] = None,
 ) -> EagleVerifyInput:
     """Shared draft() tail: idle input, tree-mask build, EagleVerifyInput assembly.
 
@@ -475,7 +476,8 @@ def build_eagle_verify_input(
     eagle: this round's draft_forward output; multi-layer eagle: the ones the
     draft input carried). ``verify_runner_inputs``: the target verify runner's
     views (DecodeCudaGraphRunner.verify_staging_views) a chain tree also writes
-    (SGLANG_PERFLL_RS_T).
+    (SGLANG_PERFLL_RS_T); ``verify_runner_locs``: the planned window the verify
+    then writes (KVLocPlan.write_virtual), else the chain tree's slots.
     """
     if batch.forward_mode.is_idle():
         return EagleVerifyInput.create_idle_input(
@@ -528,12 +530,21 @@ def build_eagle_verify_input(
             req_to_token=batch.req_to_token_pool.req_to_token,
             with_mrope=with_mrope,
             verify_runner_inputs=stage,
+            verify_runner_locs=(
+                None if verify_runner_locs is None else verify_runner_locs.view(-1)
+            ),
         )
         prepared_out_cache_loc, prepared_mrope_positions = tree_outputs[6:]
         tree_outputs = tree_outputs[:6]
         if stage is not None:
             target_worker.model_runner.decode_cuda_graph_runner.note_staged_inputs(
-                tree_outputs[5], bs
+                tree_outputs[5],
+                (
+                    prepared_out_cache_loc
+                    if verify_runner_locs is None
+                    else verify_runner_locs
+                ),
+                bs,
             )
     else:
         tree_outputs = build_tree_kernel_efficient(

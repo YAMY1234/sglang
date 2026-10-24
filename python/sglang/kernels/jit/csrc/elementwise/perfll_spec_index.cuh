@@ -54,6 +54,8 @@ struct PerfllChainTreeParams {
   int64_t* vr_req;
   int64_t* vr_seq;
   int64_t vr_mrope_row;
+  // the verify's write slots when it takes a plan's window (null: the table's, as out_cache_loc)
+  const int64_t* vr_loc_src;
 };
 
 // build_chain_tree's _build_chain_tree_kernel, one thread per offset.
@@ -74,7 +76,7 @@ __global__ void perfll_chain_tree_kernel(const __grid_constant__ PerfllChainTree
       const int64_t loc = perfll_ld(p.table, req * p.table_row + (length + col) * p.table_col, p.table_is64);
       p.out_cache_loc[offset] = loc;
       if (p.vr_tokens != nullptr) {
-        p.vr_loc[offset] = loc;
+        p.vr_loc[offset] = p.vr_loc_src != nullptr ? p.vr_loc_src[offset] : loc;
         if (col == 0) {
           p.vr_req[row] = req;
           p.vr_seq[row] = length;
@@ -174,7 +176,7 @@ struct PerfllSpecIndex {
   /// \param anchor Any CUDA tensor on the target device; selects the device and its stream.
   /// \param desc Host int64 descriptor, layout per entry point below.
   static int64_t chain_tree(tvm::ffi::TensorView anchor, tvm::ffi::TensorView desc) {
-    const int64_t* d = host_desc(desc, 34);
+    const int64_t* d = host_desc(desc, 35);
     PerfllChainTreeParams p{};
     p.bonus = ptr(d[0]);
     p.draft = ptr(d[1]);
@@ -211,6 +213,7 @@ struct PerfllSpecIndex {
     p.vr_req = static_cast<int64_t*>(ptr(d[31]));
     p.vr_seq = static_cast<int64_t*>(ptr(d[32]));
     p.vr_mrope_row = d[33];
+    p.vr_loc_src = static_cast<const int64_t*>(ptr(d[34]));
     const int64_t total = p.bs * p.width * p.width;
     if (total == 0) return 0;
     host::LaunchKernel(dim3(static_cast<uint32_t>(host::div_ceil(total, kBlock))), static_cast<uint32_t>(kBlock), device(anchor))(

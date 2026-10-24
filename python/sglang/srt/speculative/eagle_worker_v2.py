@@ -755,6 +755,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     self.draft_forward(forward_batch)
                 )
 
+        planned_locs = None if kv_loc_plan is None else kv_loc_plan.write_virtual
         verify_input = build_eagle_verify_input(
             batch,
             draft_input,
@@ -768,7 +769,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             num_draft_tokens=self.speculative_num_draft_tokens,
             tree_mask_mode=self.tree_mask_mode,
             device=self.device,
-            verify_runner_inputs=self._rs_t_views(batch, kv_loc_plan),
+            verify_runner_inputs=self._rs_t_views(batch),
+            verify_runner_locs=planned_locs,
         )
         if kv_loc_plan is not None:
             # Verify and draft extend write the window the draft planned.
@@ -781,15 +783,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             return verify_input, parent_list, top_scores_index
         return verify_input
 
-    def _rs_t_views(self, batch: ScheduleBatch, kv_loc_plan) -> Optional[tuple]:
+    def _rs_t_views(self, batch: ScheduleBatch) -> Optional[tuple]:
         """The target verify runner's inputs the chain tree may write this round
         (SGLANG_PERFLL_RS_T), or None: the verify then copies them as before."""
-        if (
-            not perfll_rs.T
-            or perfll_rs.ab_off("t")
-            or kv_loc_plan is not None
-            or batch.forward_mode.is_idle()
-        ):
+        if not perfll_rs.T or perfll_rs.ab_off("t") or batch.forward_mode.is_idle():
             return None
         runner = self.target_worker.model_runner.decode_cuda_graph_runner
         return (

@@ -248,7 +248,10 @@ def test_chain_tree_prepared_outputs_graph(bs, depth, mrope):
 @pytest.mark.parametrize("depth", [1, 5])
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("jit", [False, True])
-def test_chain_tree_writes_the_verify_runner_inputs(bs, depth, dtype, jit, monkeypatch):
+@pytest.mark.parametrize("planned", [False, True])
+def test_chain_tree_writes_the_verify_runner_inputs(
+    bs, depth, dtype, jit, planned, monkeypatch
+):
     # SGLANG_PERFLL_RS_T: the verify's load_batch skips these copies, so the runner's rows must
     # be what it would have copied, and nothing past them may change.
     from sglang.kernels.ops.speculative import eagle, perfll_spec_index
@@ -277,6 +280,10 @@ def test_chain_tree_writes_the_verify_runner_inputs(bs, depth, dtype, jit, monke
         buffers[4][:bs],
         buffers[5][:bs],
     )
+    # a planned window (KVLocPlan.write_virtual) the verify writes in place of the table's slots
+    window = (
+        torch.arange(n, device="cuda", dtype=torch.int64) * 3 + 5 if planned else None
+    )
     out = eagle.build_chain_tree(
         bonus,
         draft,
@@ -285,12 +292,13 @@ def test_chain_tree_writes_the_verify_runner_inputs(bs, depth, dtype, jit, monke
         req_to_token=table,
         with_mrope=True,
         verify_runner_inputs=views,
+        verify_runner_locs=window,
     )
     torch.cuda.synchronize()
     expect = (
         out[5].long(),
         out[1],
-        out[6],
+        out[6] if window is None else window,
         out[7],
         requests.long(),
         seq.long(),

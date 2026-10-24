@@ -51,9 +51,11 @@ def chain_tree(
     out_cache_loc,
     mrope,
     stage=None,
+    stage_locs=None,
 ) -> bool:
     """``stage``: the target verify runner's (input_ids, positions, out_cache_loc,
-    mrope_positions, req_pool_indices, seq_lens) views, int64, also written (SGLANG_PERFLL_RS_T)."""
+    mrope_positions, req_pool_indices, seq_lens) views, int64, also written (SGLANG_PERFLL_RS_T);
+    ``stage_locs``: the int64 write slots its out_cache_loc takes in place of the table's."""
     if not (
         bonus.dtype in _INT
         and draft.dtype in _INT
@@ -64,7 +66,7 @@ def chain_tree(
     ):
         return False
     bs, depth = draft.shape
-    tensor, d = _view("chain_tree", 34)
+    tensor, d = _view("chain_tree", 35)
     d[0] = bonus.data_ptr()
     d[1] = draft.data_ptr()
     d[2] = seq.data_ptr()
@@ -92,6 +94,7 @@ def chain_tree(
     d[24] = bs
     d[25] = depth + 1
     d[26] = (table is not None) | ((mrope is not None) << 1)
+    d[34] = stage_locs.data_ptr() if stage_locs is not None else 0
     if stage is None:
         d[27:34] = 0
     else:
