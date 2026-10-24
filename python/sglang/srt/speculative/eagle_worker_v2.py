@@ -1455,7 +1455,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 req_to_token=self.req_to_token_pool.req_to_token,
                 runner_buffers=draft_runner.buffers if mode >= 3 else None,
             )
-            if mode == 2:
+            if mode == 2 and envs.SGLANG_DEBUG_PERFLL_STEP2_PROBE.get() == 0:
                 self._step2.check = Step2Check(self.device)
         self._step2_uses_staged = stages and mode >= 3
 

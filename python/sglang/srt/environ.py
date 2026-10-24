@@ -1729,6 +1729,9 @@ class Envs:
     # (same batch in the same order, an unpadded graph size, every window allocated), and decode
     # reserves three verify windows a request instead of two.
     SGLANG_PERFLL_STEP2 = EnvInt(0)
+    # Debug probe for step 2's mode 2: 1 skips the comparison; 2 also skips the staging launch
+    # (the slots keep their buffers).
+    SGLANG_DEBUG_PERFLL_STEP2_PROBE = EnvInt(0)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)

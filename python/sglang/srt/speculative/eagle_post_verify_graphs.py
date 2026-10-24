@@ -234,7 +234,7 @@ class EaglePostVerifyGraphs:
                 extend_mrope=self._extend_mrope,
             )
         )
-        if slot.next_draft is not None:
+        if slot.next_draft is not None and envs.SGLANG_DEBUG_PERFLL_STEP2_PROBE.get() < 2:
             step2 = self._step2
             perfll_step2.stage_next_draft(
                 slot.next_draft,
