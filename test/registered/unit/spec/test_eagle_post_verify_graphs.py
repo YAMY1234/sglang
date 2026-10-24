@@ -490,6 +490,46 @@ class TestPostVerifyGraphs(CustomTestCase):
         with patch.object(torch.cuda, "stream", lambda stream: nullcontext()):
             _check_staged_lengths(self, graphs, device="cpu")
 
+    def test_the_batch_cap_leaves_larger_sizes_to_the_runner(self):
+        """SGLANG_PERFLL_RS_D1_MAX_BS: a post-verify graph writes the draft extend's inputs only
+        for batch sizes up to the cap; larger ones keep the runner's copy and the eager publish."""
+        buffers = SimpleNamespace(
+            input_ids=torch.zeros(16 * TOKENS, dtype=torch.int64),
+            seq_lens=torch.zeros(16, dtype=torch.int64),
+            positions=torch.zeros(16 * TOKENS, dtype=torch.int64),
+            mrope_positions=torch.zeros(3, 16 * TOKENS, dtype=torch.int64),
+            out_cache_loc=torch.zeros(16 * TOKENS, dtype=torch.int64),
+            req_pool_indices=torch.zeros(16, dtype=torch.int64),
+            extend_seq_lens=torch.zeros(16, dtype=torch.int32),
+            num_correct_drafts=torch.zeros(16, dtype=torch.int32),
+            num_accept_tokens=torch.zeros(16, dtype=torch.int32),
+            select_index=torch.zeros(16, dtype=torch.int64),
+            mamba_track_indices=None,
+            hidden_states=torch.zeros(16 * TOKENS, 8),
+        )
+        runner = SimpleNamespace(
+            buffers=buffers, capture_bs=list(range(1, 17)), captured_req_width=TOKENS
+        )
+        for cap, served in ((0, (1, 4, 8, 16)), (4, (1, 4))):
+            graphs = EaglePostVerifyGraphs(
+                target_worker=_target_worker(), simulated_acc_len_rng=None
+            )
+            with envs.SGLANG_PERFLL_RS_D1_MAX_BS.override(cap):
+                graphs.enable_rs_d1(
+                    runner=runner,
+                    req_to_token=torch.zeros(4, 64, dtype=torch.int32),
+                    published_seq_lens=torch.zeros(4, dtype=torch.int64),
+                )
+            for bs in (1, 4, 8, 16):
+                views = graphs._extend_inputs_for(
+                    num_requests=bs,
+                    width=TOKENS,
+                    hidden=torch.zeros(bs * TOKENS, 8),
+                    tracked=False,
+                )
+                with self.subTest(cap=cap, bs=bs):
+                    self.assertEqual(views is not None, bs in served)
+
 
 def _staged_length_graphs(device):
     """_PostVerifyGraphs whose body only moves the lengths (+3), and on a CPU host a capture
