@@ -822,6 +822,8 @@ class Envs:
     # PERF-PF: the prefill staging gather waits on an event recorded when its chunk is sent, not on
     # the whole default stream (which holds the next prefill forward)
     SGLANG_PERFPF_STAGING_GATHER_EVENT = EnvBool(False)
+    # PERF-PF debug: every Nth staging gather is re-read after a device sync and compared bytewise (0 = off)
+    SGLANG_PERFPF_STAGING_GATHER_VERIFY = EnvInt(0)
     # PERF-PF: shortest-prefill-first puts requests that waited more than N batch formations first
     SGLANG_PERFPF_SPF_AGE_ROUNDS = EnvInt(0)
     # PERF-PF: shortest-prefill-first re-matches a waiting request's prefix only every N batch formations (ordering only)
