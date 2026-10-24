@@ -107,6 +107,7 @@ from sglang.srt.speculative.eagle_utils import (
     organize_draft_results,
     per_step_draft_out_cache_loc,
 )
+from sglang.srt.speculative import perfll_step2
 from sglang.srt.speculative.perfll_step2 import Step2Check, Step2Counter
 from sglang.srt.speculative.eagle_worker_common import (
     build_eagle_verify_input,
@@ -704,16 +705,27 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if host_trace.ENABLED:
             host_trace.mark(host_trace.PD1)
         if self.step2_check is not None:
-            check, staged = self.step2_check
+            check, staged_for_check = self.step2_check
             self.step2_check = None
-            check.compare(
-                staged,
-                seq_lens=forward_batch.seq_lens,
-                positions=draft_input.positions,
-                mrope=forward_batch.mrope_positions,
-                window=batch.out_cache_loc if kv_loc_plan is not None else None,
-                num_steps=self.speculative_num_steps,
+            with_mrope = self.draft_runner.model_config.model_is_mrope and all(
+                x is None for x in batch.multimodal_inputs
             )
+            if perfll_step2.takes_staging(
+                staged_for_check,
+                num_requests=len(batch.seq_lens),
+                plans_window=kv_loc_plan is not None,
+                with_mrope=with_mrope,
+            ):
+                check.compare(
+                    staged_for_check,
+                    seq_lens=forward_batch.seq_lens,
+                    positions=draft_input.positions,
+                    mrope=forward_batch.mrope_positions,
+                    window=batch.out_cache_loc,
+                    num_steps=self.speculative_num_steps,
+                )
+            else:
+                check.declined_ct += 1
         if (
             can_run_decode_cuda_graph
             and not forward_batch.forward_mode.is_idle()
