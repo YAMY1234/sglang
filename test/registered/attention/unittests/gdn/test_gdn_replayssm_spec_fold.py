@@ -364,11 +364,12 @@ class TestGdnReplayssmCommitCuda(CustomTestCase):
     def test_resident_ctas_leave_every_byte_as_it_was(self):
         """SGLANG_PERFLL_COMMIT_CTAS: n resident CTAs looping over the (layer, request,
         value head) items write every checkpoint and track slot byte for byte as one CTA
-        per item does, with a padded request among B real ones."""
+        per item does, with a padded request among B real ones; also with the early exit
+        of SGLANG_PLB_GDN_DEFER_FOLD, where rows that neither fold nor track issue no copies."""
         from sglang.kernels.ops.attention.fla import gdn_replayssm_commit_cuda
 
         layers, h, hv, d, ring = 6, 2, 8, 128, 16
-        for bs in (1, 2, 4, 8):
+        for bs, early in [(b, e) for b in (1, 2, 4, 8, 24) for e in (False, True)]:
             gen = torch.Generator(device=DEVICE).manual_seed(10 + bs)
             rows, slots = bs + 1, 3 * (bs + 1)
 
@@ -398,6 +399,8 @@ class TestGdnReplayssmCommitCuda(CustomTestCase):
             ).int()
             cache_base = torch.randint(0, ring, (slots,), device=DEVICE, generator=gen).int()
             is_flush = torch.ones(slots, dtype=torch.int8, device=DEVICE)
+            if early:  # about half the rows fold, the rest only track or leave
+                is_flush = torch.randint(0, 2, (slots,), device=DEVICE, generator=gen).to(torch.int8)
             track_steps = (accept_lens - 1).clone()
             want = state.clone()
             gdn_replayssm_commit_cuda.commit(
@@ -411,6 +414,7 @@ class TestGdnReplayssmCommitCuda(CustomTestCase):
                 accept_lens=accept_lens,
                 mamba_track_indices=track_rows,
                 mamba_steps_to_track=track_steps,
+                early_exit=early,
                 ctas=0,
             )
             self.assertFalse(torch.equal(want, state))
@@ -427,11 +431,12 @@ class TestGdnReplayssmCommitCuda(CustomTestCase):
                     accept_lens=accept_lens,
                     mamba_track_indices=track_rows,
                     mamba_steps_to_track=track_steps,
+                    early_exit=early,
                     ctas=ctas,
                 )
                 self.assertTrue(
                     torch.equal(got.view(torch.int16), want.view(torch.int16)),
-                    f"B{bs} ctas={ctas}",
+                    f"B{bs} early={early} ctas={ctas}",
                 )
 
 
