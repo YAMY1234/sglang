@@ -1218,6 +1218,10 @@ class Envs:
     # (draft) calls; above 32 only with SGLANG_PLB_CP_BALANCED (TRT r3's wide-plan and two-slot kernels, <= 128).
     SGLANG_PLB_CP_FUSED_MAX_BATCH = EnvInt(32)
     SGLANG_PLB_CP_FUSED_MAX_BATCH_Q1 = EnvInt(32)
+    # PERF-LB: two-slot calls (65..128 requests) with at least this many requests pack the requests: one starting at a CTA
+    # boundary takes only its own tiles (an empty one one tile), one starting inside a CTA's range pads to the next
+    # boundary. 0: off (TRT r3's plan); 1: every two-slot call.
+    SGLANG_PLB_CP_TWO_SLOT_PACK = EnvInt(0)
     # PERF-LB: CP-lite calls on the trtllm-gen partial (batches above the fused kernel's bound): the per-(row, head)
     # merge (L18's, on the fold layout) instead of the per-row one, and, gated, the stock call gets no key when CP runs.
     SGLANG_PLB_CP_FOLD_MH = EnvBool(False)
