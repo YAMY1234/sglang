@@ -1747,6 +1747,9 @@ class Envs:
     # (same batch in the same order, an unpadded graph size, every window allocated), and decode
     # reserves three verify windows a request instead of two.
     SGLANG_PERFLL_STEP2 = EnvInt(0)
+    # PERF-LL step 5a: the megakernel's draft extend writes its top-1 and hidden rows straight
+    # into the draft graph runner's input buffers, so the next draft does not copy them.
+    SGLANG_PERFLL_STEP5A = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
