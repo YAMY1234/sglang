@@ -211,7 +211,8 @@ class TestPostVerifyGraphs(CustomTestCase):
     def test_a_kv_pool_that_clears_c128_draft_states_keeps_the_eager_verify(self):
         """The post-verify graphs skip the eager verify's cleanup of rejected c128
         draft states (DeepSeek-V4), so a KV pool that has one never reaches them;
-        any other pool hands the round to them."""
+        any other pool hands the round to them. The inputs are marked ready for
+        their load (SGLANG_PERFLL_PV_EARLY_LOAD) before the verify forward launches."""
 
         class _EagerSample(Exception):
             pass
@@ -220,7 +221,11 @@ class TestPostVerifyGraphs(CustomTestCase):
             kvcache = SimpleNamespace()
             if clears_c128:
                 kvcache.clear_unaccepted_c128_draft_states = print
-            graphs = SimpleNamespace(run=MagicMock(return_value=None))
+            calls = []
+            graphs = SimpleNamespace(
+                run=MagicMock(return_value=None),
+                mark_inputs_ready=lambda: calls.append("mark"),
+            )
             batch = SimpleNamespace(
                 spec_info=SimpleNamespace(),
                 seq_lens=torch.zeros(1),
@@ -229,7 +234,8 @@ class TestPostVerifyGraphs(CustomTestCase):
                 has_grammar=False,
             )
             target_worker = SimpleNamespace(
-                forward_batch_generation=lambda **_: SimpleNamespace(
+                forward_batch_generation=lambda **_: calls.append("forward")
+                or SimpleNamespace(
                     logits_output=SimpleNamespace(next_token_logits=torch.zeros(7, 8))
                 ),
                 model_runner=SimpleNamespace(
@@ -268,6 +274,7 @@ class TestPostVerifyGraphs(CustomTestCase):
                     post_verify_graphs=graphs,
                 )
             self.assertEqual(graphs.run.called, not clears_c128)
+            self.assertEqual(calls, ["mark", "forward"])
 
     def test_only_batches_a_graph_can_replay_take_the_post_verify_graphs(self):
         """A batch whose sampling a captured graph cannot reproduce (grammar, penalties,
@@ -1117,6 +1124,8 @@ def _dense(batch):
     info = SimpleNamespace(**vars(batch.sampling_info))
     info.is_all_greedy = False
     info.temperatures = torch.ones((bs, 1), device="cuda")
+    info.top_ks = torch.full((bs,), 1 << 30, dtype=torch.int32, device="cuda")
+    info.top_ps = torch.ones((bs,), device="cuda")
     return SimpleNamespace(**{**vars(batch), "sampling_info": info})
 
 

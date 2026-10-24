@@ -530,14 +530,68 @@ def _chain_accept_kernel(
                 WIDTH,
                 BLOCK,
             )
-        tl.store(accept_index + base + cols, acc.to(tl.int32), mask=in_row)
-        if not (FINISH and SIMULATE):
-            tl.store(predict + base + cols, pred.to(tl.int32), mask=in_row)
-            tl.store(num_correct_drafts + b, num.to(tl.int32))
     else:
         pred = tl.load(predict + base + cols, mask=in_row, other=0).to(tl.int64)
         first = tl.load(accept_index + base).to(tl.int64)
         num = tl.load(num_correct_drafts + b).to(tl.int64)
+        acc = pred
+    _chain_finish(
+        predict,
+        accept_index,
+        num_correct_drafts,
+        accept_lens,
+        sim_accept_index,
+        candidates,
+        bonus_target,
+        simulated_acc_len,
+        b,
+        base,
+        cols,
+        first,
+        acc,
+        pred,
+        num,
+        WIDTH,
+        BLOCK,
+        VERIFY,
+        FINISH,
+        SIMULATE,
+        REAL_DRAFT_TOKENS,
+    )
+
+
+@triton.jit
+def _chain_finish(
+    predict,
+    accept_index,
+    num_correct_drafts,
+    accept_lens,
+    sim_accept_index,
+    candidates,
+    bonus_target,
+    simulated_acc_len,
+    b,
+    base,
+    cols,
+    first,
+    acc,
+    pred,
+    num,
+    WIDTH: tl.constexpr,
+    BLOCK: tl.constexpr,
+    VERIFY: tl.constexpr,
+    FINISH: tl.constexpr,
+    SIMULATE: tl.constexpr,
+    REAL_DRAFT_TOKENS: tl.constexpr,
+):
+    # _chain_accept_kernel's writes for request b from its verify result (VERIFY) or the
+    # result a verify-only launch wrote
+    in_row = cols < WIDTH
+    if VERIFY:
+        tl.store(accept_index + base + cols, acc.to(tl.int32), mask=in_row)
+        if not (FINISH and SIMULATE):
+            tl.store(predict + base + cols, pred.to(tl.int32), mask=in_row)
+            tl.store(num_correct_drafts + b, num.to(tl.int32))
     if FINISH:
         if SIMULATE:
             # spec_utils.generate_simulated_accept_index_device for a length on the device

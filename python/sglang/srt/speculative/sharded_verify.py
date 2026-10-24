@@ -14,7 +14,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.speculative.eagle import _chain_walk
+from sglang.kernels.ops.speculative.eagle import _chain_finish, _chain_walk
 from sglang.srt.utils.common import print_info_once
 from sglang.srt.environ import envs
 
@@ -618,44 +618,110 @@ def _ll_accept_kernel(
         bonus = tgt
     tl.store(epoch_ptr, tag.to(tl.int32))
 
-    # canonical chains: the walk's result from one vector compare (_chain_linear)
+    if tl.sum(((~canon) & (rb < bs)).to(tl.int32)) > 0:
+        # a tree that is not a canonical chain: _chain_accept_kernel's walk and writes for
+        # every request, on the tokens stored above
+        tl.debug_barrier()
+        cols = tl.arange(0, BLOCK_W)
+        for i in range(0, bs):
+            b_i = i.to(tl.int64)
+            first_i, acc_i, pred_i, num_i = _chain_walk(
+                retrieve_index,
+                retrieve_next_token,
+                retrieve_next_sibling,
+                candidates,
+                tokens_ptr,
+                b_i * WIDTH,
+                cols,
+                WIDTH,
+                BLOCK_W,
+            )
+            _chain_finish(
+                predict,
+                accept_index,
+                num_correct_drafts,
+                accept_lens,
+                sim_accept_index,
+                candidates,
+                bonus_tokens_ptr,
+                simulated_acc_len,
+                b_i,
+                b_i * WIDTH,
+                cols,
+                first_i,
+                acc_i,
+                pred_i,
+                num_i,
+                WIDTH,
+                BLOCK_W,
+                True,
+                True,
+                SIMULATE,
+                REAL_DRAFT_TOKENS,
+            )
+    else:
+        _chain_linear_finish(
+            predict,
+            accept_index,
+            num_correct_drafts,
+            accept_lens,
+            sim_accept_index,
+            candidates,
+            simulated_acc_len,
+            tgt,
+            bonus,
+            drf,
+            rb,
+            w,
+            row,
+            m2,
+            bs,
+            WIDTH,
+            BLOCK_B,
+            BLOCK_W,
+            SIMULATE,
+            REAL_DRAFT_TOKENS,
+        )
+
+
+@triton.jit
+def _chain_linear_finish(
+    predict,
+    accept_index,
+    num_correct_drafts,
+    accept_lens,
+    sim_accept_index,
+    candidates,
+    simulated_acc_len,
+    tgt,
+    bonus,
+    drf,
+    rb,
+    w,
+    row,
+    m2,
+    bs,
+    WIDTH: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+    SIMULATE: tl.constexpr,
+    REAL_DRAFT_TOKENS: tl.constexpr,
+):
+    # _chain_linear and _chain_finish(VERIFY, FINISH) for [BLOCK_B] canonical chains at once
     hit = (w < WIDTH - 1) & (drf.to(tl.int64) == tgt)
     num = tl.min(tl.where(hit, WIDTH - 1, w), axis=1).to(tl.int64)
     acc = tl.where(w <= num[:, None], row, -1)
     pred = tl.where(w <= num[:, None], tgt, 0)
-    first = rb.to(tl.int64) * WIDTH
-    other = (~canon) & (rb < bs)
-    if tl.sum(other.to(tl.int32)) > 0:
-        # any other tree: the walk on the stored tokens, as _chain_accept_kernel runs it
-        tl.debug_barrier()
-        cols = tl.arange(0, BLOCK_W)
-        for i in range(0, bs):
-            if tl.sum((other & (rb == i)).to(tl.int32)) > 0:
-                first_i, acc_i, pred_i, num_i = _chain_walk(
-                    retrieve_index,
-                    retrieve_next_token,
-                    retrieve_next_sibling,
-                    candidates,
-                    tokens_ptr,
-                    i.to(tl.int64) * WIDTH,
-                    cols,
-                    WIDTH,
-                    BLOCK_W,
-                )
-                sel = rb == i
-                first = tl.where(sel, first_i, first)
-                num = tl.where(sel, num_i, num)
-                acc = tl.where(sel[:, None], acc_i[None, :], acc)
-                pred = tl.where(sel[:, None], pred_i[None, :], pred)
     tl.store(accept_index + row, acc.to(tl.int32), mask=m2)
     if SIMULATE:
-        # spec_utils.generate_simulated_accept_index_device for a length on the device
         length = tl.load(simulated_acc_len).to(tl.int64)
-        sim = tl.where(w < length, first[:, None] + w, -1)
+        first = rb[:, None].to(tl.int64) * WIDTH
+        sim = tl.where(w < length, first + w, -1)
         tl.store(sim_accept_index + row, sim.to(tl.int32), mask=m2)
         num = tl.zeros([BLOCK_B], dtype=tl.int64) + (length - 1)
         if REAL_DRAFT_TOKENS:
-            drafted = tl.load(candidates + base + tl.minimum(w + 1, WIDTH - 1), mask=m2, other=0)
+            nxt = tl.minimum(w + 1, WIDTH - 1)
+            drafted = tl.load(candidates + row - w + nxt, mask=m2, other=0)
             pred = tl.where(
                 w < length - 1,
                 drafted.to(tl.int32).to(tl.int64),
