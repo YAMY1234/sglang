@@ -1767,6 +1767,15 @@ class Envs:
     # The same check, run only while this file exists (polled while the scheduler is idle), so
     # one boot can time a workload and then check it.
     SGLANG_DEBUG_PERFLL_STEP5A_SEQ_LENS_CHECK_GATE = EnvStr(None)
+    # PERF-LL remove-stages D1, with SGLANG_PST_SPEC_EXTEND_LAYOUT: the post-verify graph's
+    # commit-outputs launch also writes the draft extend runner's inputs in place (the hidden
+    # rows copied on a branch beside the accept chain) and the FutureMap's new lengths, so
+    # neither the extend's input copy nor the publish launches after the graph.
+    SGLANG_PERFLL_RS_D1 = EnvBool(False)
+    # Debug for SGLANG_PERFLL_RS_D1, run only while this file exists (polled while the scheduler
+    # is idle): a pass that takes the written inputs also builds them the old way and counts
+    # the passes where the extend runner's inputs or the published lengths differ.
+    SGLANG_DEBUG_PERFLL_RS_D1_CHECK_GATE = EnvStr(None)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
