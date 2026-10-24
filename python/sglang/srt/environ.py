@@ -1425,6 +1425,12 @@ class Envs:
     # With the split hoist and four splits: run the four native length groups
     # concurrently on their own streams, with private scratch.
     SGLANG_Q35MF_K4_ATTN_GROUP_STREAMS = EnvBool(False)
+    # PERF-LP (precision-lowered line, TRT's TRTLLM_Q35_MTP_MOE_QUANT=nvfp4): the MTP draft's routed experts become NVFP4
+    # at load time with TRT's ModelOpt recipe and run on the target's NVFP4 MoE path. The target is untouched.
+    SGLANG_PERFLP_DRAFT_MOE_NVFP4 = EnvBool(False)
+    # "<fc1>,<fc2>": the activation amax the draft experts' static NVFP4 input global scales are built for (TRT's
+    # TRTLLM_Q35_MTP_MOE_NVFP4_AMAX; "" = TRT's calibrated defaults 256,2048).
+    SGLANG_PERFLP_DRAFT_MOE_NVFP4_AMAX = EnvStr("")
     # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
     SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
     # Store DeepSeek-V4 SWA KV directly in FlashInfer's 64-token SM120 page
