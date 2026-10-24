@@ -104,7 +104,7 @@ from sglang.srt.speculative.eagle_utils import (
     organize_draft_results,
     per_step_draft_out_cache_loc,
 )
-from sglang.srt.speculative import perfll_step2
+from sglang.srt.speculative import perfll_rs, perfll_step2
 from sglang.srt.speculative.perfll_step2 import (
     DraftExtendInputs,
     DraftExtendInputsCheck,
@@ -768,6 +768,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             num_draft_tokens=self.speculative_num_draft_tokens,
             tree_mask_mode=self.tree_mask_mode,
             device=self.device,
+            verify_runner_inputs=self._rs_t_views(batch, kv_loc_plan),
         )
         if kv_loc_plan is not None:
             # Verify and draft extend write the window the draft planned.
@@ -779,6 +780,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # Returned rather than stashed on self so the caller owns lifetime.
             return verify_input, parent_list, top_scores_index
         return verify_input
+
+    def _rs_t_views(self, batch: ScheduleBatch, kv_loc_plan) -> Optional[tuple]:
+        """The target verify runner's inputs the chain tree may write this round
+        (SGLANG_PERFLL_RS_T), or None: the verify then copies them as before."""
+        if (
+            not perfll_rs.T
+            or perfll_rs.ab_off("t")
+            or kv_loc_plan is not None
+            or batch.forward_mode.is_idle()
+        ):
+            return None
+        runner = self.target_worker.model_runner.decode_cuda_graph_runner
+        return (
+            None if runner is None else runner.verify_staging_views(len(batch.seq_lens))
+        )
 
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args

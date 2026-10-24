@@ -244,6 +244,67 @@ def test_chain_tree_prepared_outputs_graph(bs, depth, mrope):
             assert out[7] is None
 
 
+@pytest.mark.parametrize("bs", [1, 3, 16])
+@pytest.mark.parametrize("depth", [1, 5])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("jit", [False, True])
+def test_chain_tree_writes_the_verify_runner_inputs(bs, depth, dtype, jit, monkeypatch):
+    # SGLANG_PERFLL_RS_T: the verify's load_batch skips these copies, so the runner's rows must
+    # be what it would have copied, and nothing past them may change.
+    from sglang.kernels.ops.speculative import eagle, perfll_spec_index
+
+    monkeypatch.setattr(perfll_spec_index, "ENABLED", jit)
+    width = depth + 1
+    n, spare = bs * width, 32
+    table = torch.arange((bs + 3) * 128, dtype=torch.int32, device="cuda").reshape(
+        bs + 3, 128
+    )[:, ::2]
+    requests = (torch.arange(bs, device="cuda", dtype=dtype) * 2) % (bs + 3)
+    seq = (torch.arange(bs, device="cuda", dtype=dtype) * 5) % 48
+    bonus = torch.arange(bs, device="cuda", dtype=dtype) + 100
+    draft = torch.arange(bs * depth, device="cuda", dtype=dtype).reshape(bs, depth)
+
+    def full(*shape):
+        return torch.full(shape, -7, dtype=torch.int64, device="cuda")
+
+    buffers = tuple(full(n + spare) for _ in range(3)) + (
+        full(3, n + spare),
+        full(bs + 4),
+        full(bs + 4),
+    )
+    views = tuple(b[:n] for b in buffers[:3]) + (
+        buffers[3][:, :n],
+        buffers[4][:bs],
+        buffers[5][:bs],
+    )
+    out = eagle.build_chain_tree(
+        bonus,
+        draft,
+        seq,
+        req_pool_indices=requests,
+        req_to_token=table,
+        with_mrope=True,
+        verify_runner_inputs=views,
+    )
+    torch.cuda.synchronize()
+    expect = (
+        out[5].long(),
+        out[1],
+        out[6],
+        out[7],
+        requests.long(),
+        seq.long(),
+    )
+    for name, view, want in zip(
+        ("ids", "positions", "locs", "mrope", "requests", "lengths"), views, expect
+    ):
+        assert torch.equal(view, want), name
+    for b in buffers[:3]:
+        assert bool((b[n:] == -7).all())
+    assert bool((buffers[3][:, n:] == -7).all())
+    assert bool((buffers[4][bs:] == -7).all()) and bool((buffers[5][bs:] == -7).all())
+
+
 @pytest.mark.parametrize("bs", [1, 3, 128])
 @pytest.mark.parametrize("steps", [1, 3, 7])
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])

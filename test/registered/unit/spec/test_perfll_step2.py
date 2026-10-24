@@ -602,6 +602,45 @@ class TestPerfllRsD1(CustomTestCase):
         self.assertIsNone(worker._rs_d1_written(written))
         self.assertIs(eagle_worker_v2.ab_variants, ab_variants)
 
+    def test_the_chain_tree_writes_the_verify_inputs_except_in_toff_blocks(self):
+        """SGLANG_PERFLL_RS_T: the draft worker asks the target verify runner for its input views
+        only with the switch, outside the A/B's "toff" rounds, without a KV location plan, and
+        not for an idle batch."""
+        from sglang.srt.model_executor.runner_backend import ab_variants
+        from sglang.srt.speculative import perfll_rs
+        from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+
+        views = object()
+        runner = SimpleNamespace(verify_staging_views=lambda bs: (views, bs))
+        worker = SimpleNamespace(
+            target_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(decode_cuda_graph_runner=runner)
+            )
+        )
+        batch = SimpleNamespace(
+            seq_lens=torch.zeros(3), forward_mode=SimpleNamespace(is_idle=lambda: False)
+        )
+        idle = SimpleNamespace(
+            seq_lens=torch.zeros(0), forward_mode=SimpleNamespace(is_idle=lambda: True)
+        )
+        labels = {"v3off+toff": frozenset({"v3", "t"}), "on": frozenset()}
+        with (
+            patch.object(perfll_rs, "T", True),
+            patch.object(perfll_rs, "_AB_OFF", labels),
+            patch.object(perfll_rs, "_AB_LABELS", frozenset({"v3off", "toff"})),
+        ):
+            for label, plan, b, want in (
+                ("on", None, batch, (views, 3)),
+                ("v3off+toff", None, batch, None),
+                ("on", object(), batch, None),
+                ("on", None, idle, None),
+            ):
+                with patch.object(ab_variants, "current", return_value=label):
+                    got = EagleDraftWorker._rs_t_views(worker, b, plan)
+                    self.assertEqual(got, want, (label, plan is None))
+        with patch.object(perfll_rs, "T", False):
+            self.assertIsNone(EagleDraftWorker._rs_t_views(worker, batch, None))
+
     def test_the_check_counts_each_field_and_keeps_the_first_difference(self):
         import os
         import tempfile

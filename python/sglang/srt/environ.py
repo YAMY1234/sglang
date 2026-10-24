@@ -1788,6 +1788,10 @@ class Envs:
     # (the vocabulary shards gathered once before graph capture), so no all-reduce follows it.
     # Bitwise the rows the all-reduce gives (layers/vocab_parallel_embedding.py).
     SGLANG_PERFLL_RS_V3 = EnvBool(False)
+    # PERF-LL remove-stages T: the chain tree that builds the verify inputs also writes the target
+    # verify runner's six graph inputs, so the verify's load_batch copies none of them (one launch
+    # less between the draft and verify graphs). Same values (speculative/eagle_worker_v2.py).
+    SGLANG_PERFLL_RS_T = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)

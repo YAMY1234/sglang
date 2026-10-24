@@ -45,6 +45,15 @@ struct PerfllChainTreeParams {
   int64_t req_is64, req_stride;
   int64_t table_is64, table_row, table_col;
   int64_t bs, width, write_cache, write_mrope;
+  // SGLANG_PERFLL_RS_T: the target verify runner's static inputs, written as well (null: not staged);
+  // vr_mrope rows are vr_mrope_row apart
+  int64_t* vr_tokens;
+  int64_t* vr_positions;
+  int64_t* vr_loc;
+  int64_t* vr_mrope;
+  int64_t* vr_req;
+  int64_t* vr_seq;
+  int64_t vr_mrope_row;
 };
 
 // build_chain_tree's _build_chain_tree_kernel, one thread per offset.
@@ -62,12 +71,27 @@ __global__ void perfll_chain_tree_kernel(const __grid_constant__ PerfllChainTree
     p.positions[offset] = length + col;
     if (p.write_cache) {
       const int64_t req = perfll_ld(p.req, row * p.req_stride, p.req_is64);
-      p.out_cache_loc[offset] = perfll_ld(p.table, req * p.table_row + (length + col) * p.table_col, p.table_is64);
+      const int64_t loc = perfll_ld(p.table, req * p.table_row + (length + col) * p.table_col, p.table_is64);
+      p.out_cache_loc[offset] = loc;
+      if (p.vr_tokens != nullptr) {
+        p.vr_loc[offset] = loc;
+        if (col == 0) {
+          p.vr_req[row] = req;
+          p.vr_seq[row] = length;
+        }
+      }
     }
     if (p.write_mrope) {
       for (int axis = 0; axis < 3; ++axis) {
         p.mrope[axis * n + offset] = length + col;
+        if (p.vr_tokens != nullptr) {
+          p.vr_mrope[axis * p.vr_mrope_row + offset] = length + col;
+        }
       }
+    }
+    if (p.vr_tokens != nullptr) {
+      p.vr_tokens[offset] = token;
+      p.vr_positions[offset] = length + col;
     }
     p.retrieve[offset] = offset;
     p.retrieve[n + offset] = col + 1 < width ? col + 1 : -1;
@@ -150,7 +174,7 @@ struct PerfllSpecIndex {
   /// \param anchor Any CUDA tensor on the target device; selects the device and its stream.
   /// \param desc Host int64 descriptor, layout per entry point below.
   static int64_t chain_tree(tvm::ffi::TensorView anchor, tvm::ffi::TensorView desc) {
-    const int64_t* d = host_desc(desc, 27);
+    const int64_t* d = host_desc(desc, 34);
     PerfllChainTreeParams p{};
     p.bonus = ptr(d[0]);
     p.draft = ptr(d[1]);
@@ -180,6 +204,13 @@ struct PerfllSpecIndex {
     p.width = d[25];
     p.write_cache = d[26] & 1;
     p.write_mrope = (d[26] >> 1) & 1;
+    p.vr_tokens = static_cast<int64_t*>(ptr(d[27]));
+    p.vr_positions = static_cast<int64_t*>(ptr(d[28]));
+    p.vr_loc = static_cast<int64_t*>(ptr(d[29]));
+    p.vr_mrope = static_cast<int64_t*>(ptr(d[30]));
+    p.vr_req = static_cast<int64_t*>(ptr(d[31]));
+    p.vr_seq = static_cast<int64_t*>(ptr(d[32]));
+    p.vr_mrope_row = d[33];
     const int64_t total = p.bs * p.width * p.width;
     if (total == 0) return 0;
     host::LaunchKernel(dim3(static_cast<uint32_t>(host::div_ceil(total, kBlock))), static_cast<uint32_t>(kBlock), device(anchor))(

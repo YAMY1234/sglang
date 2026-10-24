@@ -7,9 +7,10 @@ stream joins that branch where the metadata is first read: a field read of the A
 megakernel binding hands out (eagle_binding.attn_step_metadata), the TRT-LLM MHA backend's forward, or else
 the end of the body. Same kernels and values; only the order between them changes.
 
-V3 (SGLANG_PERFLL_RS_V3) and the same-service A/B of the remove-stages features: a label
-"<feature>off" of SGLANG_TRTL17_PAD_AB turns the feature off for its rounds; a graph runner whose
-graphs take the feature also captures each of them with it off ("perfll-<feature>off").
+V3 (SGLANG_PERFLL_RS_V3), T (SGLANG_PERFLL_RS_T) and the same-service A/B of the remove-stages
+features: a label of SGLANG_TRTL17_PAD_AB holding "<feature>off" ("+"-joined, e.g. "v3off+toff")
+turns those features off for its rounds; a graph runner whose graphs take a feature the labels
+turn off also captures each of them with it off ("perfll-<feature>off").
 """
 
 from __future__ import annotations
@@ -35,7 +36,13 @@ _pending: Optional[tuple] = None
 _joined_at: dict[str, str] = {}
 
 V3 = envs.SGLANG_PERFLL_RS_V3.get()
-_AB_LABELS = frozenset(envs.SGLANG_TRTL17_PAD_AB.get())
+T = envs.SGLANG_PERFLL_RS_T.get()
+# the features each A/B label turns off
+_AB_OFF = {
+    label: frozenset(p[: -len("off")] for p in label.split("+") if p.endswith("off"))
+    for label in envs.SGLANG_TRTL17_PAD_AB.get()
+}
+_AB_LABELS = frozenset(p for off in _AB_OFF.values() for p in (f"{f}off" for f in off))
 # the feature the target verify graphs take and the A/B turns off: they are also captured without it
 AB_VERIFY_FEATURE: Optional[str] = "v3" if V3 and "v3off" in _AB_LABELS else None
 # the features the graph being captured leaves off; None outside capture_variant
@@ -93,7 +100,7 @@ def ab_off(feature: str) -> bool:
         return False
     from sglang.srt.model_executor.runner_backend import ab_variants
 
-    return ab_variants.current() == f"{feature}off"
+    return feature in _AB_OFF.get(ab_variants.current(), frozenset())
 
 
 def off_label(feature: str) -> str:
