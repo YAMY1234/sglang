@@ -106,6 +106,18 @@ def _topk_in_place(spec_info, buffers) -> bool:
 _STAGED_INPUTS = frozenset({"seq_lens", "out_cache_loc", "positions", "mrope_positions"})
 
 
+def _private_inputs() -> frozenset:
+    """The draft inputs written outside this runner's own fill, kept out of the shared pool:
+    SGLANG_PERFLL_STEP2=3's staged inputs and the request slots a staged round keeps, and
+    SGLANG_PERFLL_STEP5A's top-1 / hidden rows that draft_extend writes in place."""
+    private = set()
+    if envs.SGLANG_PERFLL_STEP2.get() >= 3:
+        private |= _STAGED_INPUTS | {"req_pool_indices"}
+    if envs.SGLANG_PERFLL_STEP5A.get():
+        private |= {"topk_p", "topk_index", "hidden_states"}
+    return frozenset(private)
+
+
 class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     """EAGLE draft cuda-graph runner.
 
@@ -298,12 +310,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
             dsa_seed_topk=dsa_seed_topk,
         )
-        # Inputs the previous post-verify graph writes (SGLANG_PERFLL_STEP2=3) stay private: the
-        # process-wide pool would alias them to the draft extend's same-named buffers, which its
-        # replay refills in between.
-        self.buffers.share_buffers(
-            exclude=_STAGED_INPUTS if envs.SGLANG_PERFLL_STEP2.get() >= 3 else ()
-        )
+        # Inputs written outside this runner's fill stay private: the process-wide pool would
+        # alias them to the draft extend's same-named buffers, which its replay refills in between.
+        self.buffers.share_buffers(exclude=_private_inputs())
         # (raw_bs, field mask) -> (destination views, copy plan); None once refused.
         self._planned_inputs = {}
         # the batch sizes whose graphs run the draft megakernel's draft_loop, captured
