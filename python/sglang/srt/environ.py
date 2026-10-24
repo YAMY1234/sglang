@@ -1242,6 +1242,11 @@ class Envs:
     # PERF-LB: the MoE finalize's BT MaterializeRMSNorm also writes the static per-tensor E4M3 input of the next layer's
     # in_proj_qkvz / qkv_proj, whose quantize kernel then does not run; byte for byte SGLang's quantization
     SGLANG_PLB_AR_FP8_OUT = EnvBool(False)
+    # PERF-LP: TensorRT-LLM's TRTLLM_MNNVL_TWOSHOT_FP8 on the MNNVL CuTe DSL BT route: both Lamport stages carry E4M3
+    # with an FP32 scale per 256 elements, the owner sums in FP32 (its own row exact) and re-quantizes; calls of at most
+    # _MAX_TOKENS rows with tp 2 / 4 / 8 and hidden % 1024 == 0 (plb_mnnvl_cutedsl/e4m3_payload.py). Lowers precision.
+    SGLANG_PERFLP_AR_FP8_PAYLOAD = EnvBool(False)
+    SGLANG_PERFLP_AR_FP8_PAYLOAD_MAX_TOKENS = EnvInt(1024)
     # Timing only: decode graph padding per block of Q35MF_AB_BLOCK target-verify rounds, the labels in turn
     # ("pow2": the smallest captured power of two); model_executor/runner_backend/ab_variants.py. Empty: off.
     SGLANG_TRTL17_PAD_AB = EnvTuple(())
