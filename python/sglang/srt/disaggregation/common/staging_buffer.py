@@ -28,6 +28,9 @@ logger = logging.getLogger(__name__)
 # TODO(yangminl): remove torch fallback implementations once the Triton kernels
 # have been validated in production across all configurations.
 _USE_TRITON_STAGING = not envs.SGLANG_STAGING_USE_TORCH.get()
+_GATHER_VERIFY_EVERY = envs.SGLANG_PERFPF_STAGING_GATHER_VERIFY.get()
+_gather_verify_lock = threading.Lock()
+_gather_verify_counts = [0, 0, 0]  # gathers seen, verified, mismatched
 
 
 @triton.jit
@@ -494,18 +497,10 @@ def gather_all_layers_to_staging(
     Returns total bytes written.
     Dispatches to Triton fused kernel when available, falls back to torch.gather.
     """
-    if _USE_TRITON_STAGING:
-        return _gather_all_layers_triton(
-            k_buffers,
-            v_buffers,
-            page_indices_np,
-            staging_buffer,
-            src_head_start,
-            num_heads,
-            page_size,
-            gpu_id,
-        )
-    return _gather_all_layers_torch(
+    gather = (
+        _gather_all_layers_triton if _USE_TRITON_STAGING else _gather_all_layers_torch
+    )
+    total_bytes = gather(
         k_buffers,
         v_buffers,
         page_indices_np,
@@ -515,6 +510,69 @@ def gather_all_layers_to_staging(
         page_size,
         gpu_id,
     )
+    if _GATHER_VERIFY_EVERY > 0:
+        with _gather_verify_lock:
+            _gather_verify_counts[0] += 1
+            due = _gather_verify_counts[0] % _GATHER_VERIFY_EVERY == 0
+        if due:
+            _verify_staged_gather(
+                k_buffers=k_buffers,
+                v_buffers=v_buffers,
+                page_indices_np=page_indices_np,
+                staging_buffer=staging_buffer,
+                src_head_start=src_head_start,
+                num_heads=num_heads,
+                page_size=page_size,
+                gpu_id=gpu_id,
+            )
+    return total_bytes
+
+
+def _verify_staged_gather(
+    *,
+    k_buffers: list,
+    v_buffers: list,
+    page_indices_np,
+    staging_buffer: StagingBuffer,
+    src_head_start: int,
+    num_heads: int,
+    page_size: int,
+    gpu_id: int,
+) -> None:
+    """Debug: re-read the gathered pages after a full device sync and compare bytes per layer."""
+    import numpy as np
+
+    device = torch.device(f"cuda:{gpu_id}")
+    torch.cuda.synchronize(device)
+    pages = torch.from_numpy(page_indices_np.astype(np.int64)).to(device)
+    tokens = (
+        pages.unsqueeze(1) * page_size + torch.arange(page_size, device=device)
+    ).reshape(-1)
+    bad, offset = 0, 0
+    for buf in list(k_buffers) + list(v_buffers):
+        ref = buf[tokens, src_head_start : src_head_start + num_heads, :].contiguous()
+        ref = ref.view(torch.uint8).reshape(-1)
+        got = staging_buffer.buffer[offset : offset + ref.numel()]
+        bad += int(not torch.equal(ref, got))
+        offset += ref.numel()
+    with _gather_verify_lock:
+        _gather_verify_counts[1] += 1
+        _gather_verify_counts[2] += int(bad > 0)
+        seen, checked, mismatched = _gather_verify_counts
+    if bad:
+        logger.warning(
+            "PERF-PF staging gather verify MISMATCH: %d of %d layers differ (%d pages)",
+            bad,
+            2 * len(k_buffers),
+            len(page_indices_np),
+        )
+    if bad or checked % 50 == 0:
+        logger.info(
+            "PERF-PF staging gather verify: gathers %d, verified %d, mismatched %d",
+            seen,
+            checked,
+            mismatched,
+        )
 
 
 def _scatter_staging_to_kv_torch(
