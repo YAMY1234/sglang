@@ -3,13 +3,15 @@
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocation_sizing import (
     get_alloc_len_per_decode,
     get_alloc_reserve_per_decode,
 )
 from sglang.srt.runtime_context import get_context, get_parallel
-from sglang.srt.speculative.perfll_step2 import Step2Counter
+from sglang.srt.speculative.perfll_step2 import NextDraft, Step2Check, Step2Counter
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -55,6 +57,45 @@ class TestPerfllStep2(CustomTestCase):
             },
         )
         self.assertEqual(counter.decode_pass_ct, 8)
+
+    def test_mode_two_hands_over_only_inputs_a_post_verify_graph_staged(self):
+        counter = Step2Counter(width=7, graph_sizes=[2], needs_next_draft=True)
+        whole = 100 + 21
+        staged = object()
+        counter.note_extend(_batch([5, 9], [whole, whole]), next_draft=staged)
+        self.assertIs(counter.count_draft(_batch([5, 9], [whole, whole])), staged)
+        counter.note_extend(_batch([5, 9], [whole, whole]), next_draft=None)
+        self.assertIsNone(counter.count_draft(_batch([5, 9], [whole, whole])))
+        counter.note_extend(_batch([5, 9], [whole, whole]), next_draft=staged)
+        self.assertIsNone(counter.count_draft(_batch([9, 5], [whole, whole])))
+        self.assertEqual(
+            dict(counter.counts),
+            {"staged": 1, "not_staged_by_post_verify_graph": 1, "batch_changed": 1},
+        )
+
+    def test_the_check_compares_the_draft_slots_with_the_windows_first_columns(self):
+        def i64(*v):
+            return torch.tensor(v, dtype=torch.int64)
+
+        staged = NextDraft(
+            num_requests=2,
+            seq_lens=i64(10, 20),
+            positions=i64(10, 20),
+            mrope=None,
+            draft_out_cache_loc=i64(100, 101, 200, 201),
+            window=i64(100, 101, 102, 200, 201, 202),
+        )
+        check = Step2Check(device="cpu")
+        seq_lens = torch.tensor([10, 20], dtype=torch.int32)
+        window = i64(100, 101, 102, 200, 201, 202)
+        check.compare(staged, seq_lens=seq_lens, positions=i64(10, 20), mrope=None, window=window, num_steps=2)
+        self.assertEqual(check.mismatch.tolist(), [0, 0, 0, 0, 0])
+        window[5] = 7  # past the draft steps' columns: only the window differs
+        check.compare(staged, seq_lens=seq_lens, positions=i64(10, 20), mrope=None, window=window, num_steps=2)
+        window[3] = 7  # a draft step's slot: both differ
+        check.compare(staged, seq_lens=seq_lens, positions=i64(11, 20), mrope=None, window=window, num_steps=2)
+        self.assertEqual(check.mismatch.tolist(), [0, 1, 0, 1, 2])
+        self.assertEqual(check.check_ct, 3)
 
     def test_the_switch_reserves_three_windows(self):
         with (

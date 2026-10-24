@@ -14,6 +14,7 @@ import torch
 
 from sglang.kernels.ops.memory.small_field_copy import SmallFieldCopyPlan
 from sglang.srt.environ import envs
+from sglang.srt.speculative import perfll_step2
 from sglang.srt.utils import host_trace
 
 if TYPE_CHECKING:
@@ -58,6 +59,27 @@ class EaglePostVerifyGraphs:
             commit=self._commit,
             sim_rng=simulated_acc_len_rng,
         )
+        # SGLANG_PERFLL_STEP2 >= 2: the post-verify graph also stages the next round's draft
+        # inputs (enable_step2); next_draft is the staging of the last round run here
+        self._step2: Optional[SimpleNamespace] = None
+        self.next_draft = None
+
+    def enable_step2(
+        self,
+        *,
+        num_steps: int,
+        window: int,
+        seq_len_fill_value: int,
+        mrope: bool,
+        req_to_token: torch.Tensor,
+    ) -> None:
+        self._step2 = SimpleNamespace(
+            num_steps=num_steps,
+            window=window,
+            seq_len_fill_value=seq_len_fill_value,
+            mrope=mrope,
+            req_to_token=req_to_token,
+        )
 
     def run(
         self,
@@ -73,12 +95,13 @@ class EaglePostVerifyGraphs:
         sampling and commit run eagerly. max_top_k: the compact top-k branch's
         support (compact_verify_max_top_k), None for the dense branch."""
         self.join()
+        self.next_draft = None
         key = self._key(
             batch, verify_input, logits_output, can_run_cuda_graph, max_top_k
         )
         if key is None:
             return None
-        return self._graphs.run(
+        outputs = self._graphs.run(
             key=key,
             inputs=_post_verify_inputs(batch, verify_input),
             make_slot=lambda staged: self._make_slot(
@@ -86,6 +109,9 @@ class EaglePostVerifyGraphs:
             ),
             sim_max_len=verify_input.max_tree_depth,
         )
+        if outputs is not None:
+            self.next_draft = self._graphs.last_slot.next_draft
+        return outputs
 
     def join(self) -> None:
         """Order the current stream after the last side-stream mamba state commit; the
@@ -150,7 +176,19 @@ class EaglePostVerifyGraphs:
         from sglang.srt.runtime_context import mamba_track_grid
 
         info = batch.sampling_info
+        step2 = self._step2
         return SimpleNamespace(
+            next_draft=(
+                None
+                if step2 is None
+                else perfll_step2.make_next_draft(
+                    num_requests=len(batch.seq_lens),
+                    num_steps=step2.num_steps,
+                    window=step2.window,
+                    mrope=step2.mrope,
+                    device=batch.device,
+                )
+            ),
             num_requests=len(batch.seq_lens),
             tokens_per_request=verify_input.draft_token_num,
             max_tree_depth=verify_input.max_tree_depth,
@@ -191,6 +229,17 @@ class EaglePostVerifyGraphs:
                 extend_mrope=self._extend_mrope,
             )
         )
+        if slot.next_draft is not None:
+            step2 = self._step2
+            perfll_step2.stage_next_draft(
+                slot.next_draft,
+                req_pool_indices=slot.staged["req_pool_indices"],
+                new_seq_lens=new_seq_lens,
+                req_to_token=step2.req_to_token,
+                num_steps=step2.num_steps,
+                window=step2.window,
+                seq_len_fill_value=step2.seq_len_fill_value,
+            )
         return (
             predict,
             accept_lens,
@@ -293,6 +342,8 @@ class _PostVerifyGraphs:
         self._sim_np = None
         self._sim_done: list[Optional[torch.cuda.Event]] = []
         self._sim_turn = 0
+        # the slot of the last run that returned outputs
+        self.last_slot: Optional[SimpleNamespace] = None
 
     def run(
         self, *, key: tuple, inputs: dict, make_slot: Callable, sim_max_len: int
@@ -327,6 +378,7 @@ class _PostVerifyGraphs:
             self._record_sim_done(sim_turn)
         if host_trace.ENABLED:
             host_trace.mark(host_trace.PVC)
+        self.last_slot = slot
         if slot.graph is None:
             if state.warmups < _NUM_WARMUP * 2:
                 state.warmups += 1
