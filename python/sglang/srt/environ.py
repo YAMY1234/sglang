@@ -1738,6 +1738,10 @@ class Envs:
     # against the targets in one vector compare instead of walking the tree node by node;
     # other trees take the walk. Same outputs.
     SGLANG_PERFLL_GLUE_LINEAR_ACCEPT = EnvBool(False)
+    # PERF-ST: the post-verify graph's commit-outputs launch also writes the draft extend's
+    # layout (prepare_draft_extend_layout's prefix / extend / post lengths, positions, starts,
+    # mrope), so the draft extend does not launch it eagerly.
+    SGLANG_PST_SPEC_EXTEND_LAYOUT = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
