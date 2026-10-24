@@ -108,6 +108,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
 from sglang.srt.model_executor.runner_utils.shared_read_event import make_external_event
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.runtime_context import get_exec, get_flags, get_parallel, get_spec
+from sglang.srt.speculative import perfll_rs
 from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import (
     empty_context,
@@ -228,6 +229,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     _restage_skip = False
     _staged_inputs = None
+    # the remove-stages feature the A/B turns off, whose graphs are also captured without it
+    _perfll_ab: Optional[str] = None
     dllm_input_preparation = None
     dllm_attention = None
     # The attention variants, captured at attention_variant_sizes (None: every batch
@@ -643,6 +646,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return self.attention_graph_variants is not None and (
             sizes is None or bs in sizes
         )
+
+    def _resolve_variant_label(self, forward_batch: ForwardBatch):
+        if self._perfll_ab is not None and perfll_rs.ab_off(self._perfll_ab):
+            return perfll_rs.off_label(self._perfll_ab)
+        return self._resolve_lora_variant(forward_batch)
 
     def _resolve_lora_variant(self, forward_batch: ForwardBatch):
         if not self.record_nolora_graph:
@@ -1218,6 +1226,29 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if self.record_nolora_graph
             else [(None, None)]
         )
+        self._perfll_ab = (
+            perfll_rs.AB_VERIFY_FEATURE
+            if perfll_rs.AB_VERIFY_FEATURE is not None
+            and not self.record_nolora_graph
+            and self.capture_forward_mode.is_target_verify()
+            and not self.model_runner.is_draft_worker
+            else None
+        )
+        # (graph variant label, features the capture leaves off); None: as the switches say
+        perfll_variants = (
+            ((None, None),)
+            if self._perfll_ab is None
+            else (
+                (None, frozenset()),
+                (perfll_rs.off_label(self._perfll_ab), frozenset({self._perfll_ab})),
+            )
+        )
+        if self._perfll_ab is not None:
+            logger.info(
+                "PERF-LL rs-ab: every graph is also captured with %s off (%s)",
+                self._perfll_ab,
+                perfll_rs.off_label(self._perfll_ab),
+            )
         for bs in capture_range:
             attention_variants = (
                 self.attention_graph_variants.capture_labels
@@ -1238,22 +1269,29 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 _set_capture_lora_variant(variant_label)
                 for attention_variant in attention_variants:
                     _set_capture_attention_variant(attention_variant)
-                    self._set_profile_trace_tag(
-                        bs, stream_idx, variant_label, attention_variant
-                    )
-                    with torch_compile_decoration.patch_model(
-                        self.model_runner.model,
-                        bs in self.compile_bs,
-                        num_tokens=bs * self.captured_req_width,
-                        tp_group=get_parallel().tp_group,
-                    ) as forward:
-                        self.capture_one_shape(
-                            bs,
-                            forward,
-                            stream_idx,
-                            variant_label,
-                            attention_variant,
+                    for perfll_label, perfll_off in perfll_variants:
+                        label = perfll_label or variant_label
+                        self._set_profile_trace_tag(
+                            bs, stream_idx, label, attention_variant
                         )
+                        with (
+                            contextlib.nullcontext()
+                            if perfll_off is None
+                            else perfll_rs.capture_variant(perfll_off),
+                            torch_compile_decoration.patch_model(
+                                self.model_runner.model,
+                                bs in self.compile_bs,
+                                num_tokens=bs * self.captured_req_width,
+                                tp_group=get_parallel().tp_group,
+                            ) as forward,
+                        ):
+                            self.capture_one_shape(
+                                bs,
+                                forward,
+                                stream_idx,
+                                label,
+                                attention_variant,
+                            )
         _set_capture_attention_variant(None)
 
     def capture_one_shape(
@@ -1475,7 +1513,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.buffers.input_embeds[: self.raw_num_token].copy_(
                     forward_batch.input_embeds
                 )
-            variant_label = self._resolve_lora_variant(forward_batch)
+            variant_label = self._resolve_variant_label(forward_batch)
             attention_variant = self._resolve_attention_variant(forward_batch, self.bs)
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
             self._replay_graph_key = self._make_graph_key(
@@ -1613,7 +1651,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.model_runner.hisparse_coordinator is not None:
             self.model_runner.hisparse_coordinator.num_real_reqs.fill_(raw_bs)
 
-        variant_label = self._resolve_lora_variant(forward_batch)
+        variant_label = self._resolve_variant_label(forward_batch)
         attention_variant = self._resolve_attention_variant(forward_batch, bs)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         self._replay_graph_key = self._make_graph_key(
