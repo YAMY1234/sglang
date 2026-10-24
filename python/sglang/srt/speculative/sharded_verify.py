@@ -550,6 +550,7 @@ def _ll_accept_kernel(
     MAXR: tl.constexpr,
     PLAIN_ROW: tl.constexpr,
     WIDTH: tl.constexpr,
+    BLOCK_R: tl.constexpr,
     BLOCK_B: tl.constexpr,
     BLOCK_W: tl.constexpr,
     BLOCK_P: tl.constexpr,
@@ -560,68 +561,65 @@ def _ll_accept_kernel(
     REAL_DRAFT_TOKENS: tl.constexpr,
     MULTICAST: tl.constexpr,
 ):
-    # One CTA: the _ll_keys_kernel exchange of every row's key (and plain key), then
-    # _chain_accept_kernel(VERIFY, FINISH) for every request; request b's verify rows are
-    # [b * WIDTH, (b + 1) * WIDTH) of the keys, candidates and retrieve_*.
-    tag = (tl.load(epoch_ptr) + 1).to(tl.uint64)
-    slot = (tag % 3).to(tl.int64)
+    # One CTA: _ll_keys_kernel's exchange of every row's key (and plain key) into the token
+    # buffers, then _chain_accept_kernel(VERIFY, FINISH) for every request on the tokens read
+    # back; request b's verify rows are [b * WIDTH, (b + 1) * WIDTH) of every row input.
     rb = tl.arange(0, BLOCK_B)
     b = rb[:, None].to(tl.int64)
     w = tl.arange(0, BLOCK_W)[None, :]
-    in_req = b < bs
-    m2 = in_req & (w < WIDTH)
-    base = b * WIDTH
-    row = base + w
-    # the request trees (staged ahead of this graph), independent of the exchange
+    m2 = (b < bs) & (w < WIDTH)
+    row = b * WIDTH + w
+    # the request trees (staged ahead of this graph), loaded ahead of the exchange
     nxt = tl.load(retrieve_next_token + row, mask=m2, other=-1).to(tl.int64)
     sib = tl.load(retrieve_next_sibling + row, mask=m2, other=-1).to(tl.int64)
     idx = tl.load(retrieve_index + row, mask=m2, other=0).to(tl.int64)
-    drf = tl.load(candidates + row + 1, mask=in_req & (w < WIDTH - 1), other=0)
-    # _chain_is_canonical per request: node i is row base + i, its only child node i + 1
-    want = tl.where(w < WIDTH - 1, w + 1, -1)
-    bad = m2 & ((nxt != want) | (sib != -1) | (idx != row))
-    canon = tl.sum(bad.to(tl.int32), axis=1) == 0
+    drf = tl.load(candidates + row + 1, mask=(b < bs) & (w < WIDTH - 1), other=0)
 
-    p = tl.arange(0, BLOCK_P)[None, None, :]
-    kmask = m2[:, :, None] & (p < parts)
-    kaddr = row[:, :, None] * parts + p
-    key = tl.max(tl.load(keys_ptr + kaddr, mask=kmask, other=KEY_FLOOR), axis=2)
+    tag = (tl.load(epoch_ptr) + 1).to(tl.uint64)
+    slot = (tag % 3).to(tl.int64)
+    r = tl.arange(0, BLOCK_R)
+    rmask = r < bs * WIDTH
+    p = tl.arange(0, BLOCK_P)
+    kaddr = r[:, None] * parts + p[None, :]
+    kmask = rmask[:, None] & (p[None, :] < parts)
+    key = tl.max(tl.load(keys_ptr + kaddr, mask=kmask, other=KEY_FLOOR), axis=1)
     tagw = tag << 32
     mc = mc_addr.to(tl.pointer_type(tl.uint64))
     uc = uc_addr.to(tl.pointer_type(tl.uint64))
-    _tail_push(mc, key, row, slot, tagw, m2, RANK, WORLD, MAXR, MULTICAST)
+    _tail_push(mc, key, r, slot, tagw, rmask, RANK, WORLD, MAXR, MULTICAST)
     if PLAIN:
-        plain = tl.max(tl.load(plain_keys_ptr + kaddr, mask=kmask, other=KEY_FLOOR), axis=2)
-        _tail_push(mc, plain, row + PLAIN_ROW, slot, tagw, m2, RANK, WORLD, MAXR, MULTICAST)
-    s = tl.arange(0, WORLD)[:, None, None]
-    m3 = m2[None, :, :] & (s < WORLD)
-    words = ((slot * WORLD + s) * MAXR + row[None, :, :]) * 2
-    lo, hi, pending = _tail_pending(uc, words, tag, m3)
+        plain = tl.max(tl.load(plain_keys_ptr + kaddr, mask=kmask, other=KEY_FLOOR), axis=1)
+        _tail_push(mc, plain, r + PLAIN_ROW, slot, tagw, rmask, RANK, WORLD, MAXR, MULTICAST)
+    s = tl.arange(0, WORLD)
+    mw = rmask[None, :] & (s[:, None] < WORLD)
+    words = ((slot * WORLD + s[:, None]) * MAXR + r[None, :]) * 2
+    lo, hi, pending = _tail_pending(uc, words, tag, mw)
     if PLAIN:
-        lo_p, hi_p, pending_p = _tail_pending(uc, words + 2 * PLAIN_ROW, tag, m3)
+        lo_p, hi_p, pending_p = _tail_pending(uc, words + 2 * PLAIN_ROW, tag, mw)
         pending += pending_p
     spins = 0
     while pending > 0:
-        lo, hi, pending = _tail_pending(uc, words, tag, m3)
+        lo, hi, pending = _tail_pending(uc, words, tag, mw)
         if PLAIN:
-            lo_p, hi_p, pending_p = _tail_pending(uc, words + 2 * PLAIN_ROW, tag, m3)
+            lo_p, hi_p, pending_p = _tail_pending(uc, words + 2 * PLAIN_ROW, tag, mw)
             pending += pending_p
         spins += 1
         if spins > SPIN_LIMIT:
             _ll_trap()
-    tgt = _tail_tokens(lo, hi, m3, KEY_FLOOR)
-    tl.store(tokens_ptr + row, tgt, mask=m2)
+    tl.store(tokens_ptr + r, _tail_tokens(lo, hi, mw, KEY_FLOOR), mask=rmask)
     if PLAIN:
-        bonus = _tail_tokens(lo_p, hi_p, m3, KEY_FLOOR)
-        tl.store(bonus_tokens_ptr + row, bonus, mask=m2)
-    else:
-        bonus = tgt
+        tl.store(bonus_tokens_ptr + r, _tail_tokens(lo_p, hi_p, mw, KEY_FLOOR), mask=rmask)
     tl.store(epoch_ptr, tag.to(tl.int32))
+    # the accept reads the tokens back from the stores above (every CTA thread made some)
+    tl.debug_barrier()
 
+    # _chain_is_canonical per request: node i is row base + i, its only child node i + 1
+    want = tl.where(w < WIDTH - 1, w + 1, -1)
+    bad = m2 & ((nxt != want) | (sib != -1) | (idx != row))
+    canon = tl.sum(bad.to(tl.int32), axis=1) == 0
     if tl.sum(((~canon) & (rb < bs)).to(tl.int32)) > 0:
         # a tree that is not a canonical chain: _chain_accept_kernel's walk and writes for
-        # every request, on the tokens stored above
-        tl.debug_barrier()
+        # every request
         cols = tl.arange(0, BLOCK_W)
         for i in range(0, bs):
             b_i = i.to(tl.int64)
@@ -668,8 +666,8 @@ def _ll_accept_kernel(
             sim_accept_index,
             candidates,
             simulated_acc_len,
-            tgt,
-            bonus,
+            tl.load(tokens_ptr + row, mask=m2, other=0),
+            tl.load(bonus_tokens_ptr + row, mask=m2, other=0),
             drf,
             rb,
             w,
@@ -845,6 +843,7 @@ def fused_verify_tail(
         MAXR=2 * _TAIL_ROWS,
         PLAIN_ROW=_TAIL_ROWS,
         WIDTH=width,
+        BLOCK_R=max(16, triton.next_power_of_2(rows)),
         BLOCK_B=max(2, triton.next_power_of_2(bs)),
         BLOCK_W=max(2, triton.next_power_of_2(width)),
         BLOCK_P=max(2, triton.next_power_of_2(splits)),
