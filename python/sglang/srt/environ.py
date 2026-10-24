@@ -2318,6 +2318,10 @@ class Envs:
     # its own rows (no logits all-to-all); the MTP draft keeps a vocab-parallel head on a slice view of that weight,
     # so K75P stays on.
     SGLANG_PERFHT_DRAFT_HEAD_TP_SLICE = EnvBool(False)
+    # Main-process (TokenizerManager / serving handler) GC: "disable" turns the cyclic collector off (TRT's
+    # TRTLLM_SERVER_DISABLE_GC), "freeze:<s>" moves every live object to the permanent generation every <s> seconds
+    # after a warm-up; unset keeps --gc-threshold only.
+    SGLANG_PERFHT_MAIN_GC = EnvStr("")
     SGLANG_Q35MF_GDN_DIRECT_SOLVE = EnvBool(False)
     SGLANG_Q35MF_GDN_EMPTY_HISTORY = EnvBool(False)
     SGLANG_Q35MF_GDN_NORM_FP8 = EnvBool(False)
