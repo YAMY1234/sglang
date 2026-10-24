@@ -12,6 +12,7 @@ Usage:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import threading
 from typing import List, Optional, Tuple
@@ -521,18 +522,29 @@ def _gather_all_layers_torch(
 
     device = f"cuda:{gpu_id}"
     torch.cuda.set_device(gpu_id)
-    page_idx_tensor = torch.from_numpy(page_indices_np.astype(np.int64)).to(device)
-
-    if page_size == 1:
-        token_indices = page_idx_tensor
-    else:
-        offsets = torch.arange(page_size, device=device)
-        token_indices = (page_idx_tensor.unsqueeze(1) * page_size + offsets).reshape(-1)
-
-    gather_idx = token_indices.view(-1, 1, 1).expand(num_tokens, num_heads, head_dim)
-
     gather_stream = staging_buffer.get_gather_stream()
-    gather_stream.wait_stream(torch.cuda.default_stream(torch.device(device)))
+    fenced = envs.SGLANG_PERFPF_STAGING_GATHER_EVENT.get()
+    # Fenced: the transfer worker synchronized on the chunk's own event, so nothing
+    # here may queue behind the prefill forward on the default stream.
+    with torch.cuda.stream(gather_stream) if fenced else contextlib.nullcontext():
+        page_idx_tensor = torch.from_numpy(page_indices_np.astype(np.int64)).to(
+            device
+        )
+
+        if page_size == 1:
+            token_indices = page_idx_tensor
+        else:
+            offsets = torch.arange(page_size, device=device)
+            token_indices = (
+                page_idx_tensor.unsqueeze(1) * page_size + offsets
+            ).reshape(-1)
+
+        gather_idx = token_indices.view(-1, 1, 1).expand(
+            num_tokens, num_heads, head_dim
+        )
+
+    if not fenced:
+        gather_stream.wait_stream(torch.cuda.default_stream(torch.device(device)))
 
     staging_view = staging_buffer.buffer
     offset = 0
@@ -595,20 +607,27 @@ def _gather_all_layers_triton(
 
     device = f"cuda:{gpu_id}"
     torch.cuda.set_device(gpu_id)
-    page_idx_tensor = torch.from_numpy(page_indices_np.astype(np.int64)).to(device)
+    gather_stream = staging_buffer.get_gather_stream()
+    fenced = envs.SGLANG_PERFPF_STAGING_GATHER_EVENT.get()
+    # Fenced: see _gather_all_layers_torch.
+    with torch.cuda.stream(gather_stream) if fenced else contextlib.nullcontext():
+        page_idx_tensor = torch.from_numpy(page_indices_np.astype(np.int64)).to(
+            device
+        )
 
-    layer_ptrs = torch.tensor(
-        [buf.data_ptr() for buf in k_buffers] + [buf.data_ptr() for buf in v_buffers],
-        dtype=torch.int64,
-        device=device,
-    )
+        layer_ptrs = torch.tensor(
+            [buf.data_ptr() for buf in k_buffers]
+            + [buf.data_ptr() for buf in v_buffers],
+            dtype=torch.int64,
+            device=device,
+        )
     # Use integer dtype matching element size for bit-preserving copy
     int_dtype_map = {1: torch.int8, 2: torch.int16, 4: torch.int32}
     int_dtype = int_dtype_map.get(dtype_size, torch.int16)
     staging_typed = staging_buffer.buffer[:total_bytes].view(int_dtype)
 
-    gather_stream = staging_buffer.get_gather_stream()
-    gather_stream.wait_stream(torch.cuda.default_stream(torch.device(device)))
+    if not fenced:
+        gather_stream.wait_stream(torch.cuda.default_stream(torch.device(device)))
 
     BLOCK_SIZE = 1024
     grid = (2 * num_layers, triton.cdiv(per_layer_elems, BLOCK_SIZE))
