@@ -1632,6 +1632,8 @@ class Envs:
     # The Qwen3.5 MTP draft's layer boundaries also take the FlashInfer MNNVL CuTe DSL fusion
     # (all-reduce + residual + RMSNorm in one launch), on the target's workspace (one a process).
     SGLANG_PST_DRAFT_CUTEDSL_FUSION = EnvBool(False)
+    # Log each distinct CuTe DSL fusion eligibility decision (draft / target, mode, rows, failing checks) once.
+    SGLANG_PST_FUSION_TRACE = EnvBool(False)
     # TP > 1 EAGLE topk-1 verify keeps the target logits vocabulary-sharded: greedy rows
     # take a sharded argmax (bit-identical), temperature-only rows a sharded Gumbel-max
     # (same distribution); any other batch all-gathers them first, as before.

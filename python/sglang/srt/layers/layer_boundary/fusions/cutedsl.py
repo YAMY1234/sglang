@@ -414,6 +414,8 @@ class CuteDSLFusion:
 
     def _eligible(self, plan, forward_batch: ForwardBatch, m: int) -> bool:
         parallel = get_parallel()
+        if _TRACE:
+            _trace_eligible(self, plan, forward_batch, m)
         return bool(
             self.service is not None
             and _is_supported_forward_mode(forward_batch.forward_mode)
@@ -427,6 +429,34 @@ class CuteDSLFusion:
             and parallel.tp_size > 1
             # The FFN runs on the full rows, not each rank's own slice.
             and TokenAxis.ATTN_TP not in plan.fused_input_rows(forward_batch).sharded
+        )
+
+
+_TRACE = envs.SGLANG_PST_FUSION_TRACE.get()
+_TRACED: set = set()
+
+
+def _trace_eligible(fusion: "CuteDSLFusion", plan, forward_batch: ForwardBatch, m: int) -> None:
+    parallel = get_parallel()
+    service = fusion.service
+    conds = (
+        ("service", service is not None),
+        ("mode", _is_supported_forward_mode(forward_batch.forward_mode)),
+        ("supports_m", service is not None and service.supports(m)),
+        ("no_dp_attn", not is_dp_attention_enabled()),
+        ("cp1", parallel.attn_cp_size == 1),
+        ("not_scattered", not get_attn_tp_context().input_scattered),
+        ("no_a2a", get_moe_a2a_backend().is_none()),
+        ("tp_gt1", parallel.tp_size > 1),
+        ("rows_full", TokenAxis.ATTN_TP not in plan.fused_input_rows(forward_batch).sharded),
+    )
+    key = (service.shared if service is not None else None, forward_batch.forward_mode, m, conds)
+    if key not in _TRACED:
+        _TRACED.add(key)
+        logger.info(
+            "PST fusion trace: draft=%s mode=%s m=%d eligible=%s failing=%s",
+            key[0], forward_batch.forward_mode.name, m, all(v for _, v in conds),
+            [n for n, v in conds if not v],
         )
 
 
