@@ -9,8 +9,9 @@ have come from there (``staged``) or why not, in one log line every LOG_EVERY pa
 
 Mode 2 also stages them: the post-verify graph ends in PERF-ST's E2 (prepare_draft_window),
 which writes the next round's draft inputs and write window from this round's new lengths
-into its slot's NextDraft buffers; a staged pass compares them with what its eager path
-computes (device-side mismatch counts, read only when the line is logged).
+into its slot's NextDraft buffers; a staged pass that mode 3 would take (takes_staging)
+compares them with what its eager path computes (device-side mismatch counts, read only when
+the line is logged); the others count as declined.
 
 Mode 3 uses them: E2 writes the draft fields straight into the draft graph runner's static
 inputs (the window stays in the slot, whose buffers alternate per round), and a staged pass
@@ -106,6 +107,19 @@ def stage_next_draft(
     )
 
 
+def takes_staging(
+    staged: NextDraft, *, num_requests: int, plans_window: bool, with_mrope: bool
+) -> bool:
+    """Whether a draft takes this staging (mode 3) instead of launching its own slots and
+    positions: the staging is this batch's size, the iteration plans its window, and the
+    M-RoPE choice matches (a batch with multimodal inputs computes its M-RoPE rows itself)."""
+    return (
+        plans_window
+        and staged.num_requests == num_requests
+        and (staged.mrope is not None) == with_mrope
+    )
+
+
 class Step2Check:
     """Device-side counts of staged passes whose staged inputs differ from the eager ones, per
     field and per batch size, and the first difference seen (field, row-major position, batch
@@ -117,6 +131,8 @@ class Step2Check:
         self.device = device
         self.mismatch_by_bs: dict[int, torch.Tensor] = {}
         self.check_ct_by_bs: collections.Counter = collections.Counter()
+        # staged passes a draft would not take (takes_staging), not compared
+        self.declined_ct = 0
         self.shape_mismatch_ct = 0
         # field, position, batch size, staged value, eager value; field -1: none yet
         self.first = torch.tensor([-1, -1, 0, 0, 0], dtype=torch.int64, device=device)
@@ -179,7 +195,10 @@ class Step2Check:
             if field < 0
             else f"{self.FIELDS[field]}[{pos}] at B{bs}: staged {mine}, eager {eager}"
         )
-        return "; ".join(parts) + f"; shape {self.shape_mismatch_ct}; first difference {first}"
+        return (
+            "; ".join(parts)
+            + f"; declined {self.declined_ct}; shape {self.shape_mismatch_ct}; first difference {first}"
+        )
 
 
 class Step2Counter:
