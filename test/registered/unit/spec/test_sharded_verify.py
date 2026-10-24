@@ -378,6 +378,77 @@ class TestFusedTail(CustomTestCase):
                 plain = words[maxr // 2 : maxr // 2 + bs * 7]
                 self.assertEqual(bool(((plain >> 32) == tag).all()), bool(i % 2))
 
+    def test_trees_that_are_not_chains_take_the_walk_every_launch(self):
+        """A batch holding a tree that is not a canonical chain gets every output of the
+        per-request tree walk, launch after launch. Merging one request's walk result into
+        the batch's vector-compare result once left that request's predict and accept index
+        wrong in 27 of 300 launches while its counts were right."""
+        from sglang.kernels.ops.speculative.eagle import chain_accept
+
+        gen = torch.Generator(device="cuda").manual_seed(13)
+        bs, width, parts = 8, 7, 2
+        rows, maxr = bs * width, 2 * sharded_verify._TAIL_ROWS
+        channel = _unicast_channel()
+        for i in range(300):
+            keys = torch.randint(
+                -(2**62), 2**62, (rows, parts), device="cuda", generator=gen
+            )
+            target = (0xFFFFFFFF - (keys.amax(dim=1) & 0xFFFFFFFF)).view(bs, width)
+            tree = _trees(bs, width, target, gen, other_tree=True)
+            if i % 2:  # the walk goes on from node 1 to node 3
+                tree[0][1, 3] = target[1, 1]
+            out = _outputs(bs, width)
+            ref = _outputs(bs, width)
+            tokens = torch.full((rows,), 7 + i, dtype=torch.int64, device="cuda")
+            lens = torch.empty(bs, dtype=torch.int32, device="cuda")
+            sharded_verify._ll_accept_kernel[(1,)](
+                keys,
+                keys,
+                parts,
+                channel.mc_addr,
+                channel.uc_addr,
+                channel.epoch,
+                tokens,
+                tokens,
+                out["predict"],
+                out["accept_index"],
+                out["num_correct_drafts"],
+                lens,
+                out["accept_index"],
+                *tree,
+                channel.epoch,
+                bs,
+                RANK=0,
+                WORLD=1,
+                MAXR=maxr,
+                PLAIN_ROW=sharded_verify._TAIL_ROWS,
+                WIDTH=width,
+                BLOCK_B=8,
+                BLOCK_W=8,
+                BLOCK_P=2,
+                KEY_FLOOR=sharded_verify._KEY_FLOOR,
+                SPIN_LIMIT=1 << 22,
+                PLAIN=False,
+                SIMULATE=False,
+                REAL_DRAFT_TOKENS=False,
+                MULTICAST=False,
+                num_warps=4,
+            )
+            ref_lens, _ = chain_accept(
+                **ref,
+                **_tree_args(tree),
+                target_predict=target,
+                bonus_target=target,
+                simulated_acc_len=None,
+                real_draft_tokens=False,
+                verify=True,
+                finish=True,
+            )
+            with self.subTest(launch=i):
+                for name in ref:
+                    self.assertTrue(torch.equal(out[name], ref[name]), name)
+                self.assertTrue(torch.equal(lens, ref_lens))
+
     def test_a_late_rank_only_delays_the_tail(self):
         # two ranks on one GPU: rank 1's words land ~1 ms after the tail starts polling
         from sglang.kernels.ops.speculative.eagle import chain_accept
@@ -390,11 +461,16 @@ class TestFusedTail(CustomTestCase):
         )
         best = keys.amax(dim=(0, 2))
         target = (0xFFFFFFFF - (best & 0xFFFFFFFF)).view(bs, width)
-        tree = _trees(bs, width, target, gen, other=False)
+        tree = _trees(bs, width, target, gen, other_tree=False)
         channel = _unicast_channel(world=world, epoch=4)
         tag = 5
         late = keys[1].amax(dim=1)
         at = ((tag % 3 * world + 1) * maxr + torch.arange(rows, device="cuda")) * 2
+        lo = (late & 0xFFFFFFFF) | (tag << 32)
+        hi = ((late >> 32) & 0xFFFFFFFF) | (tag << 32)
+        # load the writer's kernels now: lazy loading them would wait for the spinning tail
+        torch.empty_like(channel.buffer)[at] = lo
+        torch.cuda._sleep(1)
         out = _outputs(bs, width)
         tokens = torch.empty(rows, dtype=torch.int64, device="cuda")
         lens = torch.empty(bs, dtype=torch.int32, device="cuda")
@@ -430,7 +506,7 @@ class TestFusedTail(CustomTestCase):
                 BLOCK_W=8,
                 BLOCK_P=4,
                 KEY_FLOOR=sharded_verify._KEY_FLOOR,
-                SPIN_LIMIT=sharded_verify._LL_SPIN_LIMIT,
+                SPIN_LIMIT=1 << 22,
                 PLAIN=False,
                 SIMULATE=True,
                 REAL_DRAFT_TOKENS=True,
@@ -441,8 +517,8 @@ class TestFusedTail(CustomTestCase):
         with torch.cuda.stream(writer):
             start.record()
             torch.cuda._sleep(2_000_000)
-            channel.buffer[at] = (late & 0xFFFFFFFF) | (tag << 32)
-            channel.buffer[at + 1] = ((late >> 32) & 0xFFFFFFFF) | (tag << 32)
+            channel.buffer[at] = lo
+            channel.buffer[at + 1] = hi
         torch.cuda.synchronize()
         self.assertGreater(start.elapsed_time(done), 0.2)  # it waited for rank 1
         ref = _outputs(bs, width)
