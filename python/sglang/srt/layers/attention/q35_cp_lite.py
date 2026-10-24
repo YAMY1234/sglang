@@ -781,6 +781,7 @@ class CpLite:
         self.llp_off = self.llq_off + _MAX_ROWS * cp * (q_heads * HEAD_DIM // 4) * 8
         total = self.llp_off + _MAX_ROWS * cp * _LL_PWORDS * 8
         self.cp_ungated = envs.SGLANG_TRTL18_CP_UNGATED.get()
+        self._path_counts = {}  # (path, batch, rows) -> host calls (_note_path)
         self.gather_pdl = self.cp_ungated and envs.SGLANG_PERFLL_CP_GATHER_PDL.get()
         self.early_merge = self.cp_ungated and envs.SGLANG_PERFLL_CP_EARLY_MERGE.get()
         self.merge_release = self.cp_ungated and envs.SGLANG_PERFLL_CP_MERGE_RELEASE.get()
@@ -989,6 +990,13 @@ class CpLite:
                     GMAX=self.gate_max)
         out = None
         if thr is not None and self.gate_overlap:
+            path = "gated-overlap"
+        elif exact and thr is None and self.ll and self.cp_ungated:
+            path = "ungated"
+        else:
+            path = "gated" if thr is not None else "plain"
+        self._note_path(path, b, q_len, layer.layer_id)
+        if thr is not None and self.gate_overlap:
             return self._gated_overlap(q, k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale,
                                        bmm2_scale, forward_batch, layer.layer_id, stock, gate, exact)
         if exact and thr is None and self.ll and self.cp_ungated:
@@ -1165,6 +1173,22 @@ class CpLite:
                 logger.info("PERF-SM CP-lite: the merge writes the attention gate and o_proj's FP8 input at %d rows",
                             rows)
         return out
+
+    def _note_path(self, path, b, q_len, layer_id):
+        """Engage log of the CP-lite call paths (no switch): one line the first time a (path, batch, rows) shows up and a
+        tally every 256 calls. Host calls are graph captures plus eager steps, not replays. SGLANG_PERFLL_CP_GATHER_PDL /
+        EARLY_MERGE / MERGE_RELEASE act on the ungated path only; the gated one (a KV gate for the batch size) ignores them."""
+        on = path == "ungated"
+        key = (path, b, q_len)
+        self._path_counts[key] = self._path_counts.get(key, 0) + 1
+        total = sum(self._path_counts.values())
+        if self._path_counts[key] == 1 or total % 256 == 0:
+            logger.info(
+                "TRT-L1 CP-lite path: %s, %d requests x %d rows (layer %d); PERFLL gather_pdl %s, early_merge %s, "
+                "merge_release %s; calls by path: %s",
+                path, b, q_len, layer_id, on and self.gather_pdl, on and self.early_merge, on and self.merge_release,
+                ", ".join(f"{p} b{bb} q{ql}: {n}" for (p, bb, ql), n in sorted(self._path_counts.items())),
+            )
 
     def _merge_h(self, q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale, out, gate,
                  pdl=None, early=False, release=False, epi=None):
