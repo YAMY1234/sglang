@@ -686,16 +686,20 @@ class FutureMap:
         future_indices: torch.Tensor,
         new_seq_lens: torch.Tensor,
         confidence: Optional[torch.Tensor] = None,
+        *,
+        written: bool = False,
     ) -> None:
+        """``written`` (SGLANG_PERFLL_RS_D1): the post-verify graph already stored the lengths
+        in new_seq_lens_buf, ahead of this call on the same stream."""
         indices = future_indices
         if indices.shape[0] == 0:
             return  # DP idle
-        if _INDEX_OPS and indices.dtype is torch.int64:
+        if not written and _INDEX_OPS and indices.dtype is torch.int64:
             # req pool indices are distinct, so the copy order does not matter
             self.new_seq_lens_buf.index_copy_(
                 0, indices, new_seq_lens.to(self.new_seq_lens_buf.dtype)
             )
-        else:
+        elif not written:
             self.new_seq_lens_buf[indices] = new_seq_lens.to(self.new_seq_lens_buf.dtype)
         publish_confidence = self.needs_confidence_relay and confidence is not None
         if publish_confidence:

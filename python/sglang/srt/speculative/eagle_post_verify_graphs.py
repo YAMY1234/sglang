@@ -67,6 +67,9 @@ class EaglePostVerifyGraphs:
         # inputs (enable_step2); next_draft is the staging of the last round run here
         self._step2: Optional[SimpleNamespace] = None
         self.next_draft = None
+        # SGLANG_PERFLL_RS_D1 (enable_rs_d1): the graph also writes the draft extend runner's
+        # inputs, which then ride at the end of the draft-extend outputs
+        self._rs_d1: Optional[SimpleNamespace] = None
         if _BONUS_DTYPE is torch.int64:
             logger.info(
                 "PERF-LL step5a: the post-verify graph writes the bonus tokens as int64"
@@ -91,6 +94,25 @@ class EaglePostVerifyGraphs:
             mrope=mrope,
             req_to_token=req_to_token,
             runner_buffers=runner_buffers,
+        )
+
+    def enable_rs_d1(
+        self,
+        *,
+        runner: Any,
+        req_to_token: torch.Tensor,
+        published_seq_lens: torch.Tensor,
+    ) -> None:
+        """SGLANG_PERFLL_RS_D1: for a batch size the draft extend graph ``runner`` captured as
+        it is, the graph also writes that runner's static inputs (the hidden rows on a branch
+        beside the accept chain) and publishes the new lengths to ``published_seq_lens``."""
+        self._rs_d1 = SimpleNamespace(
+            buffers=runner.buffers,
+            batch_sizes=frozenset(runner.capture_bs),
+            width=runner.captured_req_width,
+            req_to_token=req_to_token,
+            published_seq_lens=published_seq_lens,
+            hidden_stream=torch.cuda.Stream(),
         )
 
     def run(
@@ -175,6 +197,12 @@ class EaglePostVerifyGraphs:
             verify_input.max_tree_depth,
             # the graphs read the verify logits in place; a runner may own several
             logits_output.next_token_logits.data_ptr(),
+            # and with SGLANG_PERFLL_RS_D1 its hidden rows
+            (
+                logits_output.hidden_states.data_ptr()
+                if self._rs_d1 is not None and logits_output.hidden_states is not None
+                else 0
+            ),
         )
 
     def _make_slot(
@@ -222,6 +250,46 @@ class EaglePostVerifyGraphs:
                 if batch.mamba_track_indices is not None
                 else 0
             ),
+            extend_inputs=(
+                None
+                if self._rs_d1 is None
+                else self._extend_inputs_for(
+                    num_requests=len(batch.seq_lens),
+                    width=verify_input.draft_token_num,
+                    hidden=logits_output.hidden_states,
+                    tracked=batch.mamba_track_indices is not None,
+                )
+            ),
+            hidden=None if self._rs_d1 is None else logits_output.hidden_states,
+        )
+
+    def _extend_inputs_for(
+        self, *, num_requests: int, width: int, hidden: Any, tracked: bool
+    ) -> Optional[perfll_step2.DraftExtendInputs]:
+        """The draft extend runner's input views this key's graph writes (SGLANG_PERFLL_RS_D1),
+        or None: only for a size the runner replays unpadded, with every input it copies."""
+        rs = self._rs_d1
+        if (
+            num_requests not in rs.batch_sizes
+            or width != rs.width
+            or hidden is None
+            or rs.buffers.hidden_states is None
+            or hidden.shape != (num_requests * width, rs.buffers.hidden_states.shape[1])
+            or hidden.dtype != rs.buffers.hidden_states.dtype
+            or tracked != (rs.buffers.mamba_track_indices is not None)
+        ):
+            logger.info(
+                "PERF-LL rs-d1: the post-verify graph for %d requests leaves the draft "
+                "extend's inputs to its runner",
+                num_requests,
+            )
+            return None
+        return perfll_step2.make_draft_extend_inputs(
+            runner_buffers=rs.buffers,
+            num_requests=num_requests,
+            width=width,
+            mrope=self._extend_mrope,
+            published_seq_lens=rs.published_seq_lens,
         )
 
     def _body(self, slot: SimpleNamespace) -> tuple:
@@ -229,6 +297,13 @@ class EaglePostVerifyGraphs:
         post-verify graph."""
         from sglang.kernels.ops.speculative.eagle import prepare_verify_commit_outputs
 
+        extend = slot.extend_inputs
+        if extend is not None:
+            # the hidden rows do not wait for the acceptance: a branch beside the accept chain
+            main, hidden_stream = torch.cuda.current_stream(), self._rs_d1.hidden_stream
+            hidden_stream.wait_stream(main)
+            with torch.cuda.stream(hidden_stream):
+                extend.hidden_states.copy_(slot.hidden)
         predict, accept_lens, accept_index = _sample(slot)
         new_seq_lens, bonus_tokens, commit_steps, draft_extend_inputs = (
             prepare_verify_commit_outputs(
@@ -241,6 +316,16 @@ class EaglePostVerifyGraphs:
                 extend_layout=self._extend_layout,
                 extend_mrope=self._extend_mrope,
                 bonus_dtype=_BONUS_DTYPE,
+                **(
+                    {}
+                    if extend is None
+                    else dict(
+                        runner_inputs=extend,
+                        req_pool_indices=slot.staged["req_pool_indices"],
+                        track_indices=slot.staged.get("track_indices"),
+                        req_to_token=self._rs_d1.req_to_token,
+                    )
+                ),
             )
         )
         if slot.next_draft is not None:
@@ -254,6 +339,9 @@ class EaglePostVerifyGraphs:
                 window=step2.window,
                 seq_len_fill_value=step2.seq_len_fill_value,
             )
+        if extend is not None:
+            main.wait_stream(hidden_stream)
+            draft_extend_inputs = (*draft_extend_inputs, extend)
         return (
             predict,
             accept_lens,

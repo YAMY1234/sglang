@@ -87,6 +87,75 @@ def make_next_draft(
     )
 
 
+class DraftExtendInputs(msgspec.Struct, frozen=True):
+    """SGLANG_PERFLL_RS_D1: views of the draft extend graph runner's static inputs for one batch
+    size (``num_tokens`` = rows x width), which the post-verify graph writes in place, and the
+    FutureMap's new-lengths buffer (int64, by request slot) it publishes to."""
+
+    input_ids: torch.Tensor
+    seq_lens: torch.Tensor
+    positions: torch.Tensor
+    mrope_positions: Optional[torch.Tensor]
+    out_cache_loc: torch.Tensor
+    req_pool_indices: torch.Tensor
+    extend_seq_lens: torch.Tensor
+    num_correct_drafts: torch.Tensor
+    num_accept_tokens: torch.Tensor
+    select_index: torch.Tensor
+    mamba_track_indices: Optional[torch.Tensor]
+    hidden_states: torch.Tensor
+    published_seq_lens: torch.Tensor
+
+
+# the draft extend runner's inputs the post-verify graph writes (SGLANG_PERFLL_RS_D1), kept out of
+# the shared input pool
+DRAFT_EXTEND_STAGED_INPUTS = frozenset(
+    {
+        "input_ids",
+        "seq_lens",
+        "positions",
+        "mrope_positions",
+        "out_cache_loc",
+        "req_pool_indices",
+        "extend_seq_lens",
+        "num_correct_drafts",
+        "num_accept_tokens",
+        "mamba_track_indices",
+        "hidden_states",
+    }
+)
+
+
+def make_draft_extend_inputs(
+    *,
+    runner_buffers,
+    num_requests: int,
+    width: int,
+    mrope: bool,
+    published_seq_lens: torch.Tensor,
+) -> DraftExtendInputs:
+    rb, num_tokens = runner_buffers, num_requests * width
+    return DraftExtendInputs(
+        input_ids=rb.input_ids[:num_tokens],
+        seq_lens=rb.seq_lens[:num_requests],
+        positions=rb.positions[:num_tokens],
+        mrope_positions=rb.mrope_positions[:, :num_tokens] if mrope else None,
+        out_cache_loc=rb.out_cache_loc[:num_tokens],
+        req_pool_indices=rb.req_pool_indices[:num_requests],
+        extend_seq_lens=rb.extend_seq_lens[:num_requests],
+        num_correct_drafts=rb.num_correct_drafts[:num_requests],
+        num_accept_tokens=rb.num_accept_tokens[:num_requests],
+        select_index=rb.select_index[:num_requests],
+        mamba_track_indices=(
+            None
+            if rb.mamba_track_indices is None
+            else rb.mamba_track_indices[:num_requests]
+        ),
+        hidden_states=rb.hidden_states[:num_tokens],
+        published_seq_lens=published_seq_lens,
+    )
+
+
 def stage_next_draft(
     next_draft: NextDraft,
     *,
@@ -308,6 +377,126 @@ class SeqLensCheck:
             + f"; shape {self.shape_mismatch_ct}; first difference {first}"
             + f"; overwritten before the next resolve {int(self.overwritten)} of {self.retire_ct}"
         )
+
+
+class DraftExtendInputsCheck:
+    """SGLANG_DEBUG_PERFLL_RS_D1_CHECK_GATE: while the gate file exists, a pass whose draft extend
+    takes the post-verify graph's inputs compares every one of them, and the lengths it
+    published, with what the eager path builds; device-side counts per field, read when logged."""
+
+    FIELDS = (
+        "input_ids",
+        "seq_lens",
+        "positions",
+        "mrope_positions",
+        "out_cache_loc",
+        "req_pool_indices",
+        "extend_seq_lens",
+        "num_correct_drafts",
+        "num_accept_tokens",
+        "select_index",
+        "mamba_track_indices",
+        "hidden_states",
+        "published",
+    )
+
+    def __init__(self, device, gate: str):
+        self.device = device
+        self.gate = gate
+        self.active = False
+        self.pass_ct = 0
+        self.compare_ct = 0
+        self.mismatch = torch.zeros(len(self.FIELDS), dtype=torch.int64, device=device)
+        # field index, batch size, row; -1: none yet
+        self.first = torch.tensor([-1, 0, 0], dtype=torch.int64, device=device)
+
+    def poll_gate(self) -> None:
+        """Every 256th pass: follow the gate file (one stat per poll)."""
+        self.pass_ct += 1
+        if self.pass_ct % 256:
+            return
+        on = os.path.exists(self.gate)
+        if self.active and not on:
+            logger.info("PERF-LL rs-d1 check (gate closed): %s", self.summary())
+        self.active = on
+
+    def compare(self, field: str, staged: torch.Tensor, built: torch.Tensor) -> None:
+        index = self.FIELDS.index(field)
+        if staged.shape != built.shape:
+            self.mismatch[index] += 1
+            return
+        diff = (
+            (staged != built.to(staged.dtype)).reshape(staged.shape[0], -1).any(dim=1)
+        )
+        any_diff = diff.any()
+        self.mismatch[index] += any_diff
+        row = torch.argmax(diff.to(torch.int8)).view(1)
+        record = torch.cat(
+            [torch.full_like(row, index), torch.full_like(row, staged.shape[0]), row]
+        )
+        self.first.copy_(
+            torch.where(any_diff & (self.first[0] < 0), record, self.first)
+        )
+
+    def counted(self) -> None:
+        self.compare_ct += 1
+        if self.compare_ct % LOG_EVERY == 0:
+            logger.info("PERF-LL rs-d1 check: %s", self.summary())
+
+    def summary(self) -> str:
+        counts = ", ".join(
+            f"{name} {int(n)}" for name, n in zip(self.FIELDS, self.mismatch.tolist())
+        )
+        index, bs, row = self.first.tolist()
+        first = "none" if index < 0 else f"{self.FIELDS[index]} row {row} at {bs} rows"
+        return f"passes compared {self.compare_ct}; mismatching {counts}; first difference {first}"
+
+
+def check_draft_extend_inputs(
+    check: DraftExtendInputsCheck,
+    *,
+    staged: DraftExtendInputs,
+    width: int,
+    seq_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    accept_lens: torch.Tensor,
+    predict: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    mamba_track_indices: Optional[torch.Tensor],
+    hidden_states: torch.Tensor,
+) -> None:
+    """The eager path's draft extend inputs for this batch, built again from the round's
+    tensors and compared with what the post-verify graph wrote (``staged``)."""
+    from sglang.kernels.ops.speculative.eagle import (
+        prepare_draft_extend_inputs,
+        prepare_draft_extend_layout,
+    )
+
+    correct, select, ids = prepare_draft_extend_inputs(accept_lens, predict, width)
+    _, extend, post, (positions, _, mrope) = prepare_draft_extend_layout(
+        seq_lens, width, staged.mrope_positions is not None
+    )
+    pairs = [
+        ("input_ids", staged.input_ids, ids),
+        ("seq_lens", staged.seq_lens, post),
+        ("positions", staged.positions, positions),
+        ("out_cache_loc", staged.out_cache_loc, out_cache_loc),
+        ("req_pool_indices", staged.req_pool_indices, req_pool_indices),
+        ("extend_seq_lens", staged.extend_seq_lens, extend),
+        ("num_correct_drafts", staged.num_correct_drafts, correct),
+        ("num_accept_tokens", staged.num_accept_tokens, accept_lens),
+        ("select_index", staged.select_index, select),
+        ("hidden_states", staged.hidden_states, hidden_states),
+    ]
+    if staged.mrope_positions is not None:
+        pairs.append(("mrope_positions", staged.mrope_positions, mrope))
+    if staged.mamba_track_indices is not None:
+        pairs.append(
+            ("mamba_track_indices", staged.mamba_track_indices, mamba_track_indices)
+        )
+    for field, mine, built in pairs:
+        check.compare(field, mine, built)
+    check.counted()
 
 
 class Step2Counter:

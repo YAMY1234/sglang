@@ -25,10 +25,12 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative import eagle_utils
 from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
 from sglang.srt.speculative.perfll_step2 import (
+    DraftExtendInputsCheck,
     NextDraft,
     SeqLensCheck,
     Step2Check,
     Step2Counter,
+    make_draft_extend_inputs,
     takes_staging,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -491,6 +493,150 @@ class TestPerfllStep5aSeqLens(CustomTestCase):
             staged=torch.tensor([1], dtype=torch.int32), gathered=torch.tensor([1])
         )
         self.assertEqual((check.shape_mismatch_ct, check.compare_ct), (2, 0))
+
+
+def _extend_runner_buffers(max_bs=4, width=7, hidden=8):
+    rows = max_bs * width
+    return SimpleNamespace(
+        input_ids=torch.zeros(rows, dtype=torch.int64),
+        seq_lens=torch.zeros(max_bs, dtype=torch.int64),
+        positions=torch.zeros(rows, dtype=torch.int64),
+        mrope_positions=torch.zeros((3, rows), dtype=torch.int64),
+        out_cache_loc=torch.zeros(rows, dtype=torch.int64),
+        req_pool_indices=torch.zeros(max_bs, dtype=torch.int64),
+        extend_seq_lens=torch.zeros(max_bs, dtype=torch.int32),
+        num_correct_drafts=torch.zeros(max_bs, dtype=torch.int32),
+        num_accept_tokens=torch.zeros(max_bs, dtype=torch.int32),
+        select_index=torch.zeros(max_bs, dtype=torch.int64),
+        mamba_track_indices=None,
+        hidden_states=torch.zeros(rows, hidden, dtype=torch.bfloat16),
+    )
+
+
+class TestPerfllRsD1(CustomTestCase):
+    def test_the_views_are_the_runner_inputs_of_one_batch_size(self):
+        rb = _extend_runner_buffers()
+        published = torch.zeros(8, dtype=torch.int64)
+        views = make_draft_extend_inputs(
+            runner_buffers=rb,
+            num_requests=2,
+            width=7,
+            mrope=True,
+            published_seq_lens=published,
+        )
+        self.assertEqual(views.input_ids.data_ptr(), rb.input_ids.data_ptr())
+        self.assertEqual(views.input_ids.shape, (14,))
+        self.assertEqual(views.seq_lens.shape, (2,))
+        self.assertEqual(views.mrope_positions.shape, (3, 14))
+        self.assertEqual(views.mrope_positions.stride(0), 28)
+        self.assertEqual(views.hidden_states.shape, (14, 8))
+        self.assertIs(views.published_seq_lens, published)
+        no_mrope = make_draft_extend_inputs(
+            runner_buffers=rb,
+            num_requests=2,
+            width=7,
+            mrope=False,
+            published_seq_lens=published,
+        )
+        self.assertIsNone(no_mrope.mrope_positions)
+
+    def test_the_scheduler_binds_the_future_map_only_with_the_switch(self):
+        """SGLANG_PERFLL_RS_D1: the scheduler hands the worker its FutureMap's lengths buffer once."""
+        for switch in (False, True):
+            worker = SimpleNamespace(
+                bind_perfll_publish=Mock(), take_staged_seq_lens=Mock()
+            )
+            scheduler = Scheduler.__new__(Scheduler)
+            scheduler.draft_worker = worker
+            scheduler.future_map = SimpleNamespace(new_seq_lens_buf=torch.zeros(4))
+            with self.subTest(switch=switch):
+                with envs.SGLANG_PERFLL_RS_D1.override(switch):
+                    scheduler.init_perfll_staged_seq_lens()
+                if switch:
+                    worker.bind_perfll_publish.assert_called_once_with(
+                        new_seq_lens_buf=scheduler.future_map.new_seq_lens_buf
+                    )
+                else:
+                    worker.bind_perfll_publish.assert_not_called()
+
+    def test_a_written_publish_only_records_the_event(self):
+        """FutureMap.publish(written=True): the post-verify graph stored the lengths; the call
+        keeps the event that gates their copy to the host and stores nothing."""
+        pool = SimpleNamespace(req_to_token=torch.zeros((8, 16), dtype=torch.int32))
+        with patch.object(overlap_utils, "_is_cuda", False):
+            fm = FutureMap(torch.device("cpu"), SpeculativeAlgorithm.EAGLE, pool)
+        fm.new_seq_lens_buf.fill_(-1)
+        rows = torch.tensor([3, 1])
+        recorded = []
+        with patch.object(
+            torch.get_device_module(torch.device("cpu")),
+            "Event",
+            return_value=SimpleNamespace(record=lambda: recorded.append(1)),
+            create=True,
+        ):
+            fm.publish(rows, torch.tensor([30, 10]), written=True)
+        self.assertTrue(bool((fm.new_seq_lens_buf == -1).all()))
+        self.assertEqual(recorded, [1])
+        self.assertTrue(fm._publish_fresh)
+
+    def test_a_round_takes_the_written_inputs_except_in_rsoff_blocks(self):
+        """The worker takes the views that ride after the layout, unless the same-service A/B
+        label of the round is "rsoff" or the post-verify graph did not write them."""
+        from sglang.srt.model_executor.runner_backend import ab_variants
+        from sglang.srt.speculative import eagle_worker_v2
+
+        worker = EAGLEWorkerV2.__new__(EAGLEWorkerV2)
+        worker._rs_d1_published = torch.zeros(4, dtype=torch.int64)
+        views = object()
+        written = SimpleNamespace(prepared_draft_extend_inputs=(1, 2, 3, 4, views))
+        unwritten = SimpleNamespace(prepared_draft_extend_inputs=(1, 2, 3, 4))
+        self.assertIs(worker._rs_d1_written(written), views)
+        self.assertIsNone(worker._rs_d1_written(unwritten))
+        for label, want in (("rsoff", None), ("rson", views)):
+            with (
+                patch.object(ab_variants, "ACTIVE", True),
+                patch.object(ab_variants, "current", return_value=label),
+            ):
+                self.assertIs(worker._rs_d1_written(written), want)
+        worker._rs_d1_published = None
+        self.assertIsNone(worker._rs_d1_written(written))
+        self.assertIs(eagle_worker_v2.ab_variants, ab_variants)
+
+    def test_the_check_counts_each_field_and_keeps_the_first_difference(self):
+        import os
+        import tempfile
+
+        gate = os.path.join(tempfile.mkdtemp(), "check.on")
+        check = DraftExtendInputsCheck(device="cpu", gate=gate)
+        self.assertFalse(check.active)
+        open(gate, "w").close()
+        for _ in range(256):
+            check.poll_gate()
+        self.assertTrue(check.active)
+        check.compare("input_ids", torch.tensor([1, 2, 3]), torch.tensor([1, 2, 3]))
+        check.compare(
+            "out_cache_loc",
+            torch.tensor([5, 6]),
+            torch.tensor([5, 9], dtype=torch.int32),
+        )
+        check.compare("hidden_states", torch.zeros(2, 4), torch.zeros(2, 4))
+        check.compare("published", torch.tensor([1]), torch.tensor([1, 2]))
+        check.counted()
+        counts = dict(zip(check.FIELDS, check.mismatch.tolist()))
+        self.assertEqual(
+            (
+                counts["input_ids"],
+                counts["out_cache_loc"],
+                counts["hidden_states"],
+                counts["published"],
+            ),
+            (0, 1, 0, 1),
+        )
+        self.assertIn("first difference out_cache_loc row 1 at 2 rows", check.summary())
+        os.remove(gate)
+        for _ in range(256):
+            check.poll_gate()
+        self.assertFalse(check.active)
 
 
 if __name__ == "__main__":

@@ -129,6 +129,17 @@ def _verify_commit_outputs_kernel(
     MROPE_STRIDE=0,
     EXTEND_LAYOUT: tl.constexpr = False,
     EXTEND_MROPE: tl.constexpr = False,
+    req_pool_indices=None,
+    req_to_token=None,
+    track_indices=None,
+    num_accept_tokens=None,
+    runner_req_pool_indices=None,
+    runner_out_cache_loc=None,
+    runner_track_indices=None,
+    published_seq_lens=None,
+    POOL_LEN: tl.constexpr = 0,
+    RUNNER_INPUTS: tl.constexpr = False,
+    RUNNER_TRACK: tl.constexpr = False,
 ):
     row = (tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
     valid = row < BS
@@ -179,6 +190,37 @@ def _verify_commit_outputs_kernel(
         if EXTEND_MROPE:
             for axis in tl.static_range(3):
                 tl.store(mrope + axis * MROPE_STRIDE + row, position.to(tl.int64), tokens)
+    if RUNNER_INPUTS:
+        # the draft extend runner's other inputs and the FutureMap entries (SGLANG_PERFLL_RS_D1)
+        req = tl.load(req_pool_indices + row, valid, other=0).to(tl.int64)
+        tl.store(num_accept_tokens + row, accepted, valid)
+        tl.store(runner_req_pool_indices + row, req, valid)
+        tl.store(published_seq_lens + req, length + accepted, valid)
+        if RUNNER_TRACK:
+            tl.store(
+                runner_track_indices + row,
+                tl.load(track_indices + row, valid, other=0),
+                valid,
+            )
+        # the iteration's write window at the pre-verify lengths, as prepare_draft_window stages it
+        tokens = row < BS * DRAFT_WIDTH
+        owner = row // DRAFT_WIDTH
+        owner_req = tl.load(req_pool_indices + owner, tokens, other=-1).to(tl.int64)
+        owner_length = tl.load(seq_lens + owner * SEQ_STRIDE, tokens, other=0).to(
+            tl.int64
+        )
+        live = (
+            tokens
+            & (owner_req >= 0)
+            & (owner_length > 0)
+            & (owner_length + DRAFT_WIDTH <= POOL_LEN)
+        )
+        loc = tl.load(
+            req_to_token + owner_req * POOL_LEN + owner_length + row % DRAFT_WIDTH,
+            live,
+            other=0,
+        ).to(tl.int64)
+        tl.store(runner_out_cache_loc + row, loc, tokens)
     idx = tl.where(idx < 0, idx + PREDICT_SIZE, idx)
     token = tl.load(predict + idx * PREDICT_STRIDE, valid, other=0)
     tl.store(new_seq_lens + row, length + accepted, valid)
@@ -195,12 +237,26 @@ def prepare_verify_commit_outputs(
     extend_layout=False,
     extend_mrope=False,
     bonus_dtype=torch.int32,
+    runner_inputs=None,
+    req_pool_indices=None,
+    track_indices=None,
+    req_to_token=None,
 ):
     """``extend_layout`` (SGLANG_PST_SPEC_EXTEND_LAYOUT, with ``num_draft_tokens``): the same
     launch also writes ``prepare_draft_extend_layout(seq_lens, num_draft_tokens, extend_mrope)``,
     appended to the draft-extend inputs. ``bonus_dtype``: int64 for SGLANG_PERFLL_STEP5A_BONUS_I64,
-    the dtype the relay and the next draft read."""
+    the dtype the relay and the next draft read. ``runner_inputs`` (SGLANG_PERFLL_RS_D1, with
+    ``extend_layout``): a perfll_step2.DraftExtendInputs, whose views of the draft extend runner's
+    static inputs the launch writes in place of fresh outputs, with the write window read from
+    ``req_to_token`` at ``req_pool_indices`` / ``seq_lens``, and the new lengths published to
+    its FutureMap buffer at ``req_pool_indices``."""
     bs = accept_lens.numel()
+    assert runner_inputs is None or (
+        num_draft_tokens
+        and extend_layout
+        and req_pool_indices is not None
+        and req_to_token is not None
+    )
     new_seq_lens = torch.empty(
         (bs,),
         device=seq_lens.device,
@@ -212,24 +268,50 @@ def prepare_verify_commit_outputs(
         last_steps = torch.empty((bs,), device=seq_lens.device, dtype=torch.int64)
         if mamba_track_interval:
             track_steps = torch.empty_like(last_steps)
-        correct = torch.empty_like(accept_lens, memory_format=torch.contiguous_format)
-        select = torch.empty_like(last_steps)
-        ids = torch.empty((predict.numel(),), device=predict.device, dtype=torch.int64)
+        if runner_inputs is None:
+            correct = torch.empty_like(
+                accept_lens, memory_format=torch.contiguous_format
+            )
+            select = torch.empty_like(last_steps)
+            ids = torch.empty(
+                (predict.numel(),), device=predict.device, dtype=torch.int64
+            )
+        else:
+            correct = runner_inputs.num_correct_drafts
+            select = runner_inputs.select_index
+            ids = runner_inputs.input_ids
     layout = None
     if num_draft_tokens and extend_layout:
         tokens = bs * num_draft_tokens
         device = seq_lens.device
+        runner = runner_inputs
         layout = (
             torch.empty((bs,), dtype=torch.int32, device=device),
-            torch.empty((bs,), dtype=torch.int32, device=device),
-            torch.empty((bs,), dtype=seq_lens.dtype, device=device),
             (
-                torch.empty((tokens,), dtype=torch.int64, device=device),
+                torch.empty((bs,), dtype=torch.int32, device=device)
+                if runner is None
+                else runner.extend_seq_lens
+            ),
+            (
+                torch.empty((bs,), dtype=seq_lens.dtype, device=device)
+                if runner is None
+                else runner.seq_lens
+            ),
+            (
+                (
+                    torch.empty((tokens,), dtype=torch.int64, device=device)
+                    if runner is None
+                    else runner.positions
+                ),
                 torch.empty((bs,), dtype=torch.int32, device=device),
                 (
-                    torch.empty((3, tokens), dtype=torch.int64, device=device)
-                    if extend_mrope
-                    else None
+                    None
+                    if not extend_mrope
+                    else (
+                        torch.empty((3, tokens), dtype=torch.int64, device=device)
+                        if runner is None
+                        else runner.mrope_positions
+                    )
                 ),
             ),
         )
@@ -267,11 +349,32 @@ def prepare_verify_commit_outputs(
                     positions=layout[3][0],
                     start_locs=layout[3][1],
                     mrope=layout[3][2],
-                    MROPE_STRIDE=bs * num_draft_tokens,
+                    MROPE_STRIDE=(
+                        bs * num_draft_tokens
+                        if layout[3][2] is None
+                        else layout[3][2].stride(0)
+                    ),
                     EXTEND_LAYOUT=True,
                     EXTEND_MROPE=layout[3][2] is not None,
                 )
                 if layout is not None
+                else {}
+            ),
+            **(
+                dict(
+                    req_pool_indices=req_pool_indices,
+                    req_to_token=req_to_token,
+                    track_indices=track_indices,
+                    num_accept_tokens=runner_inputs.num_accept_tokens,
+                    runner_req_pool_indices=runner_inputs.req_pool_indices,
+                    runner_out_cache_loc=runner_inputs.out_cache_loc,
+                    runner_track_indices=runner_inputs.mamba_track_indices,
+                    published_seq_lens=runner_inputs.published_seq_lens,
+                    POOL_LEN=req_to_token.shape[1],
+                    RUNNER_INPUTS=True,
+                    RUNNER_TRACK=runner_inputs.mamba_track_indices is not None,
+                )
+                if runner_inputs is not None
                 else {}
             ),
         )

@@ -36,6 +36,10 @@ from sglang.srt.speculative.eagle_post_verify_graphs import (
     EaglePostVerifyGraphs,
     simulated_acc_len_generator,
 )
+from sglang.srt.speculative.perfll_step2 import (
+    DraftExtendInputs,
+    make_draft_extend_inputs,
+)
 from sglang.srt.speculative.eagle_utils import compact_verify_max_top_k, eagle_sample
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -558,6 +562,80 @@ def _check_staged_lengths(test, graphs, *, device):
             run(round_n1)  # round N+1's slot is next: a batch still on its lengths
 
 
+HIDDEN = 64
+POOL_LEN = 1024
+
+
+def _draft_extend_runner(max_bs):
+    """A draft extend graph runner's static inputs (rows past a round stay at their fill) for
+    batch sizes BATCH_SIZES, M-RoPE rows wider than any round's."""
+    rows = max_bs * TOKENS
+
+    def full(n, value, dtype=torch.int64):
+        return torch.full((n,), value, dtype=dtype, device="cuda")
+
+    buffers = SimpleNamespace(
+        input_ids=full(rows, -7),
+        seq_lens=full(max_bs, -7),
+        positions=full(rows, -7),
+        mrope_positions=torch.full((3, rows + 5), -7, device="cuda"),
+        out_cache_loc=full(rows, -7),
+        req_pool_indices=full(max_bs, -7),
+        extend_seq_lens=full(max_bs, -7, torch.int32),
+        num_correct_drafts=full(max_bs, -7, torch.int32),
+        num_accept_tokens=full(max_bs, -7, torch.int32),
+        select_index=full(max_bs, -7),
+        mamba_track_indices=None,
+        hidden_states=torch.zeros(rows, HIDDEN, dtype=torch.bfloat16, device="cuda"),
+    )
+    return SimpleNamespace(
+        buffers=buffers, capture_bs=BATCH_SIZES, captured_req_width=TOKENS
+    )
+
+
+def _window(batch, req_to_token):
+    """The round's write window, as prepare_draft_window stages it from the lengths."""
+    cols = torch.arange(TOKENS, device="cuda")
+    rows = req_to_token[batch.req_pool_indices.long()]
+    return rows.gather(1, batch.seq_lens.long()[:, None] + cols).flatten().long()
+
+
+def _check_extend_inputs(
+    test, views, *, batch, accept_lens, predict, req_to_token, published, hidden
+):
+    """The draft extend inputs a graph wrote, against the eager path's (prepare_draft_extend_*)."""
+    from sglang.kernels.ops.speculative.eagle import (
+        prepare_draft_extend_inputs,
+        prepare_draft_extend_layout,
+    )
+
+    correct, select, ids = prepare_draft_extend_inputs(accept_lens, predict, TOKENS)
+    _, extend, post, (positions, _, mrope) = prepare_draft_extend_layout(
+        batch.seq_lens, TOKENS, views.mrope_positions is not None
+    )
+    want = dict(
+        input_ids=ids,
+        seq_lens=post,
+        positions=positions,
+        out_cache_loc=_window(batch, req_to_token),
+        req_pool_indices=batch.req_pool_indices,
+        extend_seq_lens=extend,
+        num_correct_drafts=correct,
+        num_accept_tokens=accept_lens,
+        select_index=select,
+        hidden_states=hidden,
+    )
+    if views.mrope_positions is not None:
+        want["mrope_positions"] = mrope
+    for name, value in want.items():
+        got = getattr(views, name)
+        test.assertTrue(torch.equal(got, value.to(got.dtype)), name)
+    new_seq_lens = batch.seq_lens + accept_lens
+    test.assertTrue(
+        torch.equal(published[batch.req_pool_indices.long()], new_seq_lens), "published"
+    )
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
 class TestPostVerifyGraphsMatchEager(CustomTestCase):
     def setUp(self):
@@ -682,6 +760,131 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
                 self.assertIs(wide.to(torch.int64), wide)
                 for a, b in zip(outputs[torch.int32][0:1], outputs[torch.int64][0:1]):
                     self.assertTrue(torch.equal(a, b))
+
+    def test_commit_outputs_write_the_draft_extend_runner_inputs(self):
+        """SGLANG_PERFLL_RS_D1: the commit-outputs launch writes the draft extend runner's
+        inputs in place, every value the eager path copies, and publishes the new lengths."""
+        generator = torch.Generator(device="cuda").manual_seed(3)
+        req_to_token = torch.arange(
+            64 * POOL_LEN, dtype=torch.int32, device="cuda"
+        ).view(64, POOL_LEN)
+        runner = _draft_extend_runner(max(BATCH_SIZES))
+        for bs in BATCH_SIZES:
+            for mrope in (False, True):
+                batch, verify_input, logits = _round(bs, generator)
+                predict, accept_lens, accept_index, _, _ = _eager(
+                    batch, verify_input, logits, simulated_acc_len_generator(0)
+                )
+                published = torch.full((64,), -1, dtype=torch.int64, device="cuda")
+                views = make_draft_extend_inputs(
+                    runner_buffers=runner.buffers,
+                    num_requests=bs,
+                    width=TOKENS,
+                    mrope=mrope,
+                    published_seq_lens=published,
+                )
+                hidden = torch.randn(bs * TOKENS, HIDDEN, device="cuda").to(
+                    torch.bfloat16
+                )
+                views.hidden_states.copy_(hidden)
+                new_seq_lens, _, _, draft = prepare_verify_commit_outputs(
+                    predict,
+                    accept_index,
+                    accept_lens,
+                    batch.seq_lens,
+                    num_draft_tokens=TOKENS,
+                    extend_layout=True,
+                    extend_mrope=mrope,
+                    runner_inputs=views,
+                    req_pool_indices=batch.req_pool_indices,
+                    req_to_token=req_to_token,
+                )
+                with self.subTest(bs=bs, mrope=mrope):
+                    _check_extend_inputs(
+                        self,
+                        views,
+                        batch=batch,
+                        accept_lens=accept_lens,
+                        predict=predict,
+                        req_to_token=req_to_token,
+                        published=published,
+                        hidden=hidden,
+                    )
+                    # the draft-extend outputs are the runner's views
+                    self.assertIs(draft[2], views.input_ids)
+                    self.assertIs(draft[3][2], views.seq_lens)
+                    others = torch.ones(64, dtype=torch.bool, device="cuda")
+                    others[batch.req_pool_indices.long()] = False
+                    self.assertTrue(bool((published[others] == -1).all()))
+                    self.assertTrue(
+                        torch.equal(new_seq_lens, batch.seq_lens + accept_lens)
+                    )
+
+    def test_graphs_write_the_draft_extend_inputs_every_round(self):
+        """SGLANG_PERFLL_RS_D1 through the post-verify graphs: warm-ups, both slots' captures
+        and replays write the runner's inputs and the hidden rows the verify left, and hand the
+        views to the draft extend after the layout."""
+        generator = torch.Generator(device="cuda").manual_seed(4)
+        req_to_token = torch.arange(
+            64 * POOL_LEN, dtype=torch.int32, device="cuda"
+        ).view(64, POOL_LEN)
+        runner = _draft_extend_runner(max(BATCH_SIZES))
+        published = torch.full((64,), -1, dtype=torch.int64, device="cuda")
+        target = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                watermark_state=None, model_config=SimpleNamespace(model_is_mrope=True)
+            )
+        )
+        with envs.SGLANG_PST_SPEC_EXTEND_LAYOUT.override(True):
+            graphs = EaglePostVerifyGraphs(
+                target_worker=target,
+                simulated_acc_len_rng=simulated_acc_len_generator(0),
+            )
+        graphs.enable_rs_d1(
+            runner=runner, req_to_token=req_to_token, published_seq_lens=published
+        )
+        stream = torch.cuda.Stream()
+        with (
+            torch.cuda.stream(stream),
+            patch.object(spec_utils, "SIMULATE_ACC_LEN", -1.0),
+            patch.object(spec_utils, "commit_mamba_states_after_verify"),
+            patch(
+                "sglang.srt.distributed.parallel_state.graph_capture", _graph_capture
+            ),
+        ):
+            for bs in BATCH_SIZES:
+                logits_buf = torch.empty(bs * TOKENS, VOCAB, device="cuda")
+                hidden_buf = torch.empty(
+                    bs * TOKENS, HIDDEN, dtype=torch.bfloat16, device="cuda"
+                )
+                for i in range(ROUNDS):
+                    batch, verify_input, logits = _round(bs, generator)
+                    logits_buf.copy_(logits)
+                    hidden_buf.copy_(torch.randn(bs * TOKENS, HIDDEN, device="cuda"))
+                    got = graphs.run(
+                        batch=batch,
+                        verify_input=verify_input,
+                        logits_output=SimpleNamespace(
+                            next_token_logits=logits_buf, hidden_states=hidden_buf
+                        ),
+                        can_run_cuda_graph=True,
+                    )
+                    graphs.join()
+                    torch.cuda.synchronize()
+                    with self.subTest(bs=bs, round=i):
+                        views = got[5][4]
+                        self.assertIsInstance(views, DraftExtendInputs)
+                        self.assertIs(got[5][2], views.input_ids)
+                        _check_extend_inputs(
+                            self,
+                            views,
+                            batch=batch,
+                            accept_lens=got[1],
+                            predict=got[0],
+                            req_to_token=req_to_token,
+                            published=published,
+                            hidden=hidden_buf,
+                        )
 
 
 def _sampled(batch, *, generator):
