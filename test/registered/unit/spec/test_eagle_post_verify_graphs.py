@@ -565,6 +565,34 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
     def test_fused_accept_forced_acceptance(self):
         self._check(sim_acc_len=4.8, fused=True)
 
+    def test_the_bonus_in_int64_is_the_int32_bonus_cast(self):
+        """SGLANG_PERFLL_STEP5A_BONUS_I64: the commit-outputs launch writes the bonus as int64,
+        every value the int32 launch writes, so the relay's cast becomes the identity."""
+        generator = torch.Generator(device="cuda").manual_seed(2)
+        for bs in BATCH_SIZES:
+            batch, verify_input, logits = _round(bs, generator)
+            predict, accept_lens, accept_index, _, _ = _eager(
+                batch, verify_input, logits, simulated_acc_len_generator(0)
+            )
+            outputs = {
+                dtype: prepare_verify_commit_outputs(
+                    predict,
+                    accept_index,
+                    accept_lens,
+                    batch.seq_lens,
+                    num_draft_tokens=TOKENS,
+                    bonus_dtype=dtype,
+                )
+                for dtype in (torch.int32, torch.int64)
+            }
+            with self.subTest(bs=bs):
+                narrow, wide = outputs[torch.int32][1], outputs[torch.int64][1]
+                self.assertEqual(wide.dtype, torch.int64)
+                self.assertTrue(torch.equal(wide, narrow.to(torch.int64)))
+                self.assertIs(wide.to(torch.int64), wide)
+                for a, b in zip(outputs[torch.int32][0:1], outputs[torch.int64][0:1]):
+                    self.assertTrue(torch.equal(a, b))
+
 
 def _sampled(batch, *, generator):
     """The round's batch with T0.6 / top-k / top-p sampling on every request."""
