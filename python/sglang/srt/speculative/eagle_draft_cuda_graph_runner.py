@@ -601,7 +601,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         already (SGLANG_PERFLL_STEP2=3), so they are not copied."""
         buffers = self.buffers
         spec_info = forward_batch.spec_info
-        srcs = [forward_batch.req_pool_indices]
+        # a staged round's batch is the previous round's, whose request slots are in place
+        srcs = [] if inputs_staged else [forward_batch.req_pool_indices]
         mask = 0
         if _same_storage(spec_info.topk_index, buffers.topk_index):
             mask |= 64
@@ -646,7 +647,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             entry = self._planned_inputs[key] = self._plan_inputs(
                 raw_bs=raw_bs, mask=mask
             )
-        if entry is not None and entry[1](entry[0], srcs):
+        if entry is not None and (not srcs or entry[1](entry[0], srcs)):
             return True
         # A refused layout keeps the default path from then on.
         self._planned_inputs[key] = None
@@ -657,7 +658,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
         buffers = self.buffers
         raw_num_token = raw_bs * self.captured_req_width
-        dsts = [buffers.req_pool_indices[:raw_bs]]
+        dsts = [] if mask & 32 else [buffers.req_pool_indices[:raw_bs]]
         if not mask & 64:
             dsts = [buffers.topk_p[:raw_bs], buffers.topk_index[:raw_bs], *dsts]
         if not mask & 32:
@@ -760,8 +761,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             # foreach copy (one foreach call per dtype pair) to cut launch overhead.
             # hidden_states is handled separately below (see note), and seq_lens_cpu
             # is handled further down since it lives on host.
-            copy_dsts = [buffers.req_pool_indices[:raw_bs]]
-            copy_srcs = [forward_batch.req_pool_indices]
+            copy_dsts = [] if inputs_staged else [buffers.req_pool_indices[:raw_bs]]
+            copy_srcs = [] if inputs_staged else [forward_batch.req_pool_indices]
             if not _same_storage(forward_batch.spec_info.topk_index, buffers.topk_index):
                 copy_dsts += [buffers.topk_p[:raw_bs], buffers.topk_index[:raw_bs]]
                 copy_srcs += [
