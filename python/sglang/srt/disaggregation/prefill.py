@@ -1781,6 +1781,7 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             segments = [(start_idx, end_idx)]
 
+        fence_pending = envs.SGLANG_PERFPF_STAGING_GATHER_EVENT.get()
         for seg_start, seg_end in segments:
             is_final_segment = seg_end == end_idx
             raw_kv_indices = self.req_to_token_pool.req_to_token[
@@ -1817,6 +1818,9 @@ class SchedulerDisaggregationPrefillMixin:
             if not sender.should_send_kv_chunk(len(page_indices), segment_is_last):
                 continue
             send_state_indices = state_indices if segment_is_last else None
+            if fence_pending:
+                fence_pending = False
+                self._fence_kv_send(req)
             if indices_event is not None:
                 sender.send(
                     page_indices,
@@ -1837,6 +1841,15 @@ class SchedulerDisaggregationPrefillMixin:
             self.disagg_prefill_pending_chunk_rids.discard(req.rid)
         else:
             self.disagg_prefill_pending_chunk_rids.add(req.rid)
+
+    def _fence_kv_send(self: Scheduler, req: Req) -> None:
+        # The staging gather fences on this event instead of the whole default stream;
+        # the room's later segments follow it in its transfer queue. Fresh per call.
+        ev = torch.cuda.Event()
+        ev.record(
+            self.forward_stream if self.enable_overlap else torch.cuda.current_stream()
+        )
+        req.disagg_kv_sender._early_send_wait_event = ev
 
     def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:
         """Release KV cache and requeue an optimistic prefill request."""
