@@ -1247,6 +1247,12 @@ class Envs:
     # _MAX_TOKENS rows with tp 2 / 4 / 8 and hidden % 1024 == 0 (plb_mnnvl_cutedsl/e4m3_payload.py). Lowers precision.
     SGLANG_PERFLP_AR_FP8_PAYLOAD = EnvBool(False)
     SGLANG_PERFLP_AR_FP8_PAYLOAD_MAX_TOKENS = EnvInt(1024)
+    # PERF-LP (precision-lowered line, TRT's TRTLLM_Q35_MTP_MOE_QUANT=nvfp4): the MTP draft's routed experts become NVFP4
+    # at load time with TRT's ModelOpt recipe and run on the target's NVFP4 MoE path. The target is untouched.
+    SGLANG_PERFLP_DRAFT_MOE_NVFP4 = EnvBool(False)
+    # "<fc1>,<fc2>": the activation amax the draft experts' static NVFP4 input global scales are built for (TRT's
+    # TRTLLM_Q35_MTP_MOE_NVFP4_AMAX; "" = TRT's calibrated defaults 256,2048).
+    SGLANG_PERFLP_DRAFT_MOE_NVFP4_AMAX = EnvStr("")
     # Timing only: decode graph padding per block of Q35MF_AB_BLOCK target-verify rounds, the labels in turn
     # ("pow2": the smallest captured power of two); model_executor/runner_backend/ab_variants.py. Empty: off.
     SGLANG_TRTL17_PAD_AB = EnvTuple(())
