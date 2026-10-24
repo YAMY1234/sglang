@@ -11,6 +11,10 @@ Mode 2 also stages them: the post-verify graph ends in PERF-ST's E2 (prepare_dra
 which writes the next round's draft inputs and write window from this round's new lengths
 into its slot's NextDraft buffers; a staged pass compares them with what its eager path
 computes (device-side mismatch counts, read only when the line is logged).
+
+Mode 3 uses them: E2 writes the draft fields straight into the draft graph runner's static
+inputs (the window stays in the slot, whose buffers alternate per round), and a staged pass
+skips prepare_for_draft's slot / position launch and the runner's copies of those fields.
 """
 
 from __future__ import annotations
@@ -41,17 +45,36 @@ class NextDraft(msgspec.Struct):
 
 
 def make_next_draft(
-    *, num_requests: int, num_steps: int, window: int, mrope: bool, device
+    *,
+    num_requests: int,
+    num_steps: int,
+    window: int,
+    mrope: bool,
+    device,
+    runner_buffers=None,
 ) -> NextDraft:
+    """Own buffers (mode 2), or with ``runner_buffers`` (mode 3) views of the draft graph
+    runner's static inputs for the draft fields; the window is always the slot's own."""
+
     def zeros(*shape):
         return torch.zeros(shape, dtype=torch.int64, device=device)
 
+    if runner_buffers is None:
+        return NextDraft(
+            num_requests=num_requests,
+            seq_lens=zeros(num_requests),
+            positions=zeros(num_requests),
+            mrope=zeros(3, num_requests) if mrope else None,
+            draft_out_cache_loc=zeros(num_requests * num_steps),
+            window=zeros(num_requests * window),
+        )
+    rb = runner_buffers
     return NextDraft(
         num_requests=num_requests,
-        seq_lens=zeros(num_requests),
-        positions=zeros(num_requests),
-        mrope=zeros(3, num_requests) if mrope else None,
-        draft_out_cache_loc=zeros(num_requests * num_steps),
+        seq_lens=rb.seq_lens[:num_requests],
+        positions=rb.positions[:num_requests],
+        mrope=rb.mrope_positions[:, :num_requests] if mrope else None,
+        draft_out_cache_loc=rb.out_cache_loc[: num_requests * num_steps],
         window=zeros(num_requests * window),
     )
 
