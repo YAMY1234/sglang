@@ -842,6 +842,9 @@ class Envs:
     SGLANG_DISAGG_STAGING_POOL_SIZE_MB = EnvInt(4096)
     # PERF-PF: request decode staging only for the chunks the current prefill batch writes
     SGLANG_PERFPF_STAGING_LAZY = EnvBool(False)
+    # PERF-PF: the prefill staging gather waits on an event recorded when its chunk is sent, not on
+    # the whole default stream (which holds the next prefill forward)
+    SGLANG_PERFPF_STAGING_GATHER_EVENT = EnvBool(False)
     # PERF-PF: shortest-prefill-first puts requests that waited more than N batch formations first
     SGLANG_PERFPF_SPF_AGE_ROUNDS = EnvInt(0)
     # PERF-PF: shortest-prefill-first re-matches a waiting request's prefix only every N batch formations (ordering only)
