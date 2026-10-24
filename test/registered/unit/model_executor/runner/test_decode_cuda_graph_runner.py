@@ -435,6 +435,72 @@ class TestAttentionVariantSizes(CustomTestCase):
                     self.assertEqual(replayed, label, bs)
 
 
+class TestPerfllAbVariants(CustomTestCase):
+    """Under a "v3off" / "v3on" A/B, the target verify graphs are captured twice per batch
+    size (V3 on, then off) and a "v3off" round replays the second."""
+
+    def _capture(self, *, is_draft_worker):
+        import contextlib
+
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.runner_backend import ab_variants
+        from sglang.srt.speculative import perfll_rs
+
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.capture_bs, runner.compile_bs = [1, 2], []
+        runner.captured_req_width, runner.record_nolora_graph = 7, False
+        runner.capture_forward_mode = ForwardMode.TARGET_VERIFY
+        runner.model_runner = SimpleNamespace(
+            model=None, device="cpu", gpu_id=0, is_draft_worker=is_draft_worker
+        )
+        captured = {}
+
+        def capture_one_shape(bs, forward, stream_idx, label, attention_variant):
+            captured.setdefault(bs, []).append((label, perfll_rs.feature_on("v3")))
+
+        runner.capture_one_shape = capture_one_shape
+        with (
+            mock.patch.object(perfll_rs, "AB_VERIFY_FEATURE", "v3"),
+            mock.patch.object(perfll_rs, "_AB_LABELS", frozenset({"v3off", "v3on"})),
+            # a capture ignores the round's label; outside the A/B'd runner it is read
+            mock.patch.object(ab_variants, "current", return_value="v3off"),
+            mock.patch.object(
+                mod,
+                "get_parallel",
+                return_value=SimpleNamespace(tp_rank=1, tp_group=None),
+            ),
+            mock.patch.object(mod, "get_available_gpu_memory", return_value=0),
+            mock.patch.object(
+                mod.torch_compile_decoration,
+                "patch_model",
+                side_effect=lambda *a, **k: contextlib.nullcontext(),
+            ),
+        ):
+            runner._capture_one_stream()
+        return runner, captured
+
+    def test_the_target_verify_graphs_are_captured_with_and_without_v3(self):
+        _, captured = self._capture(is_draft_worker=False)
+        both = [(None, True), ("perfll-v3off", False)]
+        self.assertEqual(captured, {1: both, 2: both})
+        _, captured = self._capture(is_draft_worker=True)
+        self.assertEqual(captured, {1: [(None, False)], 2: [(None, False)]})
+
+    def test_a_v3off_round_replays_the_graphs_captured_without_v3(self):
+        from sglang.srt.model_executor.runner_backend import ab_variants
+        from sglang.srt.speculative import perfll_rs
+
+        runner, _ = self._capture(is_draft_worker=False)
+        for label, variant in (("v3off", "perfll-v3off"), ("v3on", None)):
+            with (
+                mock.patch.object(
+                    perfll_rs, "_AB_LABELS", frozenset({"v3off", "v3on"})
+                ),
+                mock.patch.object(ab_variants, "current", return_value=label),
+            ):
+                self.assertEqual(runner._resolve_variant_label(None), variant)
+
+
 class TestRaggedVerifyLayoutPerTier(CustomTestCase):
     """Every graph variant of a token tier must replay the staged live layout."""
 

@@ -1859,6 +1859,27 @@ class Qwen3_5ForCausalLM(nn.Module):
             logger.info(
                 "Packed BF16/FP8 GDN input projection enabled for %d layers", packed
             )
+        if (
+            envs.SGLANG_PERFLL_RS_V3.get()
+            and not model_runner.is_draft_worker
+            and self.pp_group.is_first_rank
+        ):
+            self._attach_full_embedding_table()
+
+    def _attach_full_embedding_table(self) -> None:
+        refusal = self.embed_tokens.full_table_refusal()
+        if refusal is not None:
+            logger.warning("PERF-LL rs-v3 refused: %s", refusal)
+            return
+        self.embed_tokens.attach_full_table()
+        table = self.embed_tokens.full_table
+        logger.info(
+            "PERF-LL rs-v3: the target embedding gathers from the full table [%d, %d] "
+            "on every rank (%.2f GB), with no all-reduce after it",
+            table.shape[0],
+            table.shape[1],
+            table.numel() * table.element_size() / 2**30,
+        )
 
     def set_dflash_layers_to_capture(self, layers_to_capture: list[int]):
         self.layers_to_capture = layers_to_capture

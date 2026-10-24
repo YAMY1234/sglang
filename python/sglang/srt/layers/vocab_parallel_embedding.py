@@ -19,6 +19,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.dp_attention import (
@@ -36,6 +37,7 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.speculative import perfll_rs
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_compiler_backend,
@@ -348,6 +350,8 @@ class VocabParallelEmbedding(torch.nn.Module):
             params_dtype=params_dtype,
             weight_loader=self.weight_loader,
         )
+        # [tp_size * shard rows, hidden]: every rank's shard, rank-major (SGLANG_PERFLL_RS_V3)
+        self.full_table: Optional[torch.Tensor] = None
 
     @classmethod
     def _get_indices(
@@ -512,12 +516,59 @@ class VocabParallelEmbedding(torch.nn.Module):
         output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
         return output_parallel
 
+    def full_table_refusal(self) -> Optional[str]:
+        """Why this embedding cannot gather from a full table, else None; the same on every
+        rank (from the sizes and the weight only)."""
+        if self.tp_size == 1 or not isinstance(self.tp_group, GroupCoordinator):
+            return "not split over a tensor-parallel group"
+        if self.num_added_embeddings != 0:
+            # added rows sit after each shard's padding, so a token's row is not its id
+            return "added vocabulary"
+        if not isinstance(self.quant_method, UnquantizedEmbeddingMethod):
+            return "a quantized table"
+        weight = self.weight
+        if (
+            not weight.is_cuda
+            or not weight.is_contiguous()
+            or weight.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+        ):
+            return f"a {weight.dtype} table on {weight.device} the kernel cannot read"
+        return None
+
+    def attach_full_table(self) -> None:
+        """Gather every rank's shard into ``full_table`` (collective on the TP group)."""
+        rows = self.weight.data.clone()
+        # the all-reduce adds the owner's -0.0 to the other ranks' +0.0 and returns +0.0
+        rows.masked_fill_(rows == 0, 0)
+        full = torch.empty(
+            (self.tp_size * rows.shape[0], rows.shape[1]),
+            dtype=rows.dtype,
+            device=rows.device,
+        )
+        self.tp_group.all_gather_into_tensor(full, rows)
+        self.full_table = full
+
+    def _embed_full_table(self, input_: torch.Tensor) -> torch.Tensor:
+        # the full table's row is the token id (no added vocabulary), so no all-reduce follows
+        output = fused_vocab_parallel_embedding(
+            input_, self.full_table, 0, self.full_table.shape[0], 0, 0, 0
+        )
+        if self.output_dtype is not None:
+            output = output.to(self.output_dtype)
+        return output
+
     def forward(self, input_):
         # Surface a bad token id (>= vocab_size, or a negative / unmasked sentinel) as a
         # located async assert instead of a silent OOB embedding gather (tp=1 does not mask).
         maybe_detect_oob(
             input_, 0, self.num_embeddings, "VocabParallelEmbedding input id"
         )
+        if (
+            self.full_table is not None
+            and self._use_triton_embedding(input_)
+            and perfll_rs.feature_on("v3")
+        ):
+            return self._embed_full_table(input_)
         output_parallel = self._embed_local_shard(input_)
         # Replicated attention-TP peers have matching shapes, so all of them
         # can skip the collective for an empty idle batch.

@@ -1775,6 +1775,10 @@ class Envs:
     # attention metadata update on a side stream forked at the start of the captured body, joined
     # where the metadata is first read (speculative/perfll_rs.py). Same values, other order.
     SGLANG_PERFLL_RS_D2 = EnvTuple(())
+    # PERF-LL remove-stages V3: the target's token embedding reads a full table every rank holds
+    # (the vocabulary shards gathered once before graph capture), so no all-reduce follows it.
+    # Bitwise the rows the all-reduce gives (layers/vocab_parallel_embedding.py).
+    SGLANG_PERFLL_RS_V3 = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
