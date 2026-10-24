@@ -579,6 +579,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # [max bucket, HV, V] output rows shared by every captured bucket and layer.
         self._fi_graph_output: Optional[torch.Tensor] = None
         self._fi_graph_output_dtype = model_runner.dtype
+        self._fi_graph_cp_single = True
         self._fi_graph_layers: dict[int, int] = {}
         self._fi_graph_engage_logged = False
         self._fi_graph_eager_batches = 0
@@ -630,8 +631,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
             else:
                 self._enable_flashinfer_graph(capture_tokens)
             how = (
-                "on (FlashInfer core: CP kernel for one-sequence batches, non-CP "
-                f"for up to {self.prefill_graph_max_seqs}; larger batches run eagerly)"
+                "on (FlashInfer core: "
+                + (
+                    "CP kernel for one-sequence batches, non-CP "
+                    if self._fi_graph_cp_single
+                    else "non-CP kernel, one-sequence batches included, "
+                )
+                + f"for up to {self.prefill_graph_max_seqs}; larger batches run eagerly)"
             )
         else:
             supported = False
@@ -674,6 +680,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
         num_v_heads, head_v_dim = (
             self.req_to_token_pool.mamba_pool.mamba_cache.temporal.shape[-3:-1]
         )
+        # FlashInfer's own split on SM100: CP only while sequences x heads x 4 < SMs, so
+        # with 64 heads per rank (TP1) one sequence runs faster on the non-CP kernel.
+        self._fi_graph_cp_single = (
+            num_v_heads * 4
+            < torch.cuda.get_device_properties(self.device).multi_processor_count
+        )
         # Rows past a batch keep the last finite values written there.
         self._fi_graph_output = torch.zeros(
             (max(capture_tokens), num_v_heads, head_v_dim),
@@ -697,6 +709,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             cache_index_dtype=cache_indices.dtype,
             device=self.device,
             flashinfer=self.prefill_graph_flashinfer,
+            flashinfer_cp_single=self._fi_graph_cp_single,
         )
         self._fill_prefill_graph_metadata(
             meta=meta, forward_batch=forward_batch, cache_indices=cache_indices
@@ -714,7 +727,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 f"GDN extend graph: flashinfer captured "
                 f"{counts[0] if len(counts) == 1 else counts} layers "
                 f"({len(self._fi_graph_layers)} buckets, non-CP rows "
-                f"{self.prefill_graph_max_seqs})"
+                f"{self.prefill_graph_max_seqs}"
+                f"{'' if self._fi_graph_cp_single else ', no CP kernel'})"
             )
         self._fill_prefill_graph_metadata(
             meta=meta,
