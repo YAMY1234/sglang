@@ -223,16 +223,47 @@ __device__ __forceinline__ float window(float gt, int len, int lane, const int (
 }
 #endif
 #if FOLD >= 2
-// earlier-step loads pinned before griddepcontrol.wait (ptxas may sink plain read-only loads past it)
-__device__ __forceinline__ u16 ld_pin_u16(const u16* p) {
-  u16 r;
-  asm volatile("ld.global.L1::no_allocate.b16 %0, [%1];" : "=h"(r) : "l"(p));
-  return r;
+__device__ __forceinline__ void cp_async4(void* dst, const void* src) {
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" ::"r"((u32)__cvta_generic_to_shared(dst)), "l"(src)
+               : "memory");
 }
-__device__ __forceinline__ float ld_pin_f32(const float* p) {
-  float r;
-  asm volatile("ld.global.L1::no_allocate.f32 %0, [%1];" : "=f"(r) : "l"(p));
-  return r;
+// From the history staged in shared memory (rows in history order, entries j >= n zero): the decayed updates
+// d_j[v] e^{g_total - G_j} of this lane's A fragments (rows v = vb + 16 m + 8 h + r, entries j = 2q, 2q + 1 | 2q + 8,
+// 2q + 9) with the verify's decays; returns e^{g_total}
+__device__ __forceinline__ float hist_updates(const u16 (*s_d)[VD + 8], const float* s_g, int n, int lane, int q,
+                                              int vb, int r, float (&uu)[MT][2][4]) {
+  const int jj[4] = {2 * q, 2 * q + 1, 2 * q + 8, 2 * q + 9};
+  float gj = lane < n ? s_g[lane] : 0.f;
+#pragma unroll
+  for (int d = 1; d < 32; d <<= 1) {
+    const float o = __shfl_up_sync(FULL, gj, d);
+    if (lane >= d) gj += o;
+  }
+  const float gtot = __shfl_sync(FULL, gj, 31);
+  float dec[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const float pj = __shfl_sync(FULL, gj, jj[i]);
+    dec[i] = jj[i] < n ? tl_exp(gtot - pj) : 0.f;
+  }
+#pragma unroll
+  for (int m = 0; m < MT; ++m)
+#pragma unroll
+    for (int h = 0; h < 2; ++h)
+#pragma unroll
+      for (int i = 0; i < 4; ++i)
+        uu[m][h][i] = jj[i] < n ? bf2f(s_d[jj[i]][vb + 16 * m + 8 * h + r]) * dec[i] : 0.f;
+  return tl_exp(gtot);
+}
+// A fragments a0..a3 = (half 0, j 2q..), (half 1, j 2q..), (half 0, j 2q + 8..), (half 1, j 2q + 8..): bf16 high parts
+__device__ __forceinline__ void hist_frags(const float (&uu)[MT][2][4], u32 (&AH)[MT][4]) {
+#pragma unroll
+  for (int m = 0; m < MT; ++m) {
+    AH[m][0] = pack2(uu[m][0][0], uu[m][0][1]);
+    AH[m][1] = pack2(uu[m][1][0], uu[m][1][1]);
+    AH[m][2] = pack2(uu[m][0][2], uu[m][0][3]);
+    AH[m][3] = pack2(uu[m][1][2], uu[m][1][3]);
+  }
 }
 #endif
 __device__ __forceinline__ long long load_index(const void* p, int i, bool i64) {
@@ -496,77 +527,35 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) gdn_core(const Param
   const bool fold = wp + TT > HIST;
   const int hist = (FOLD == 3 && fold) ? 0 : wp;  // entries the step replays
   const int wb = fold ? (base ^ HIST) : base + wp;  // this step's first ring entry
-  // the history's keys (high parts) of this key head in history order, by 16-byte async copies
+  // the history (keys of this key head, updates and log-decays of this value head; rows in history order) staged
+  // by async copies, read by the fold before the wait and by the replay after it
   __shared__ __align__(16) u16 s_key[HIST][KP];
+  __shared__ __align__(16) u16 s_d[HIST][VD + 8];
+  __shared__ float s_g[HIST];
   {
     const u16* kp = p.ring_k + rid * p.k_slot + (long long)hk * RING * KD;
-    for (int i = tid; i < wp * (KD / 8); i += NW * 32) {
-      const int j = i >> 4, col = (i & 15) * 8;
-      cp_async16(&s_key[j][col], kp + ((base + j) & (RING - 1)) * KD + col);
-    }
-  }
-  // the replay's decays and A fragments bf16(d_j e^{g_total - G_j}) (rows v, entries j = 2q, 2q + 1 | 2q + 8, 2q + 9),
-  // which the fold's products take as their high parts
-  const int jj[4] = {2 * q, 2 * q + 1, 2 * q + 8, 2 * q + 9};
-  float uu[MT][2][4];  // d_j[v] e^{g_total - G_j}: [m-tile][half][j index]
-  float td = 1.f;      // e^{g_total}
-  if (wp > 0) {
-    float gj = lane < wp ? ld_pin_f32(p.ring_g + rid * p.g_slot + hv * RING + ((base + lane) & (RING - 1))) : 0.f;
     const u16* dp = p.ring_d + rid * p.d_slot + (long long)hv * RING * VD;
-    u16 du[MT][2][4];
-#pragma unroll
-    for (int m = 0; m < MT; ++m)
-#pragma unroll
-      for (int h = 0; h < 2; ++h)
-#pragma unroll
-        for (int i = 0; i < 4; ++i)
-          du[m][h][i] =
-              jj[i] < wp ? ld_pin_u16(dp + ((base + jj[i]) & (RING - 1)) * VD + vb + 16 * m + 8 * h + r) : (u16)0;
-#pragma unroll
-    for (int d = 1; d < 32; d <<= 1) {
-      const float o = __shfl_up_sync(FULL, gj, d);
-      if (lane >= d) gj += o;
+    for (int i = tid; i < wp * (KD / 8); i += NW * 32) {
+      const int j = i >> 4, col = (i & 15) * 8, pos = (base + j) & (RING - 1);
+      cp_async16(&s_key[j][col], kp + pos * KD + col);
+      cp_async16(&s_d[j][col], dp + pos * VD + col);
     }
-    const float gtot = __shfl_sync(FULL, gj, 31);
-    float dec[4];
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      const float pj = __shfl_sync(FULL, gj, jj[i]);
-      dec[i] = jj[i] < wp ? tl_exp(gtot - pj) : 0.f;
-    }
-    td = tl_exp(gtot);
-#pragma unroll
-    for (int m = 0; m < MT; ++m)
-#pragma unroll
-      for (int h = 0; h < 2; ++h)
-#pragma unroll
-        for (int i = 0; i < 4; ++i) uu[m][h][i] = jj[i] < wp ? bf2f(du[m][h][i]) * dec[i] : 0.f;
-  } else {
-#pragma unroll
-    for (int m = 0; m < MT; ++m)
-#pragma unroll
-      for (int h = 0; h < 2; ++h)
-#pragma unroll
-        for (int i = 0; i < 4; ++i) uu[m][h][i] = 0.f;
+    if (tid < wp) cp_async4(&s_g[tid], p.ring_g + rid * p.g_slot + hv * RING + ((base + tid) & (RING - 1)));
   }
-  u32 AH[MT][4];  // a0..a3: (half 0, j 2q..), (half 1, j 2q..), (half 0, j 2q + 8..), (half 1, j 2q + 8..)
-#pragma unroll
-  for (int m = 0; m < MT; ++m) {
-    AH[m][0] = pack2(uu[m][0][0], uu[m][0][1]);
-    AH[m][1] = pack2(uu[m][1][0], uu[m][1][1]);
-    AH[m][2] = pack2(uu[m][0][2], uu[m][0][3]);
-    AH[m][3] = pack2(uu[m][1][2], uu[m][1][3]);
-  }
+  const int jj[4] = {2 * q, 2 * q + 1, 2 * q + 8, 2 * q + 9};
   cp_async_wait_all();
-  __syncthreads();  // the staged keys
+  __syncthreads();  // the staged history
 #if FOLD == 2
   __shared__ U4 s_hc[VD][17];  // the folded checkpoint rows until after the wait (row v, 16-byte chunk 4 c + q)
 #endif
   if (fold) {
     // h = bf16(h e^{g_total} + K^T U) with U's bf16 high / low parts and the BF16 keys: gdn_replayssm_commit's
     // fold_store<true> without key low parts. B column n = r holds k = 32 c + 8 (r >> 1) + 2 e + (r & 1), so the
-    // C fragment of lane q is word e of its chunk c; entries j >= hist (keys not staged) are masked to zero
-    u32 AL[MT][4];
+    // C fragment of lane q is word e of its chunk c; entries j >= wp (keys not staged) are masked to zero
+    float uu[MT][2][4];
+    const float td = hist_updates(s_d, s_g, wp, lane, q, vb, r, uu);
+    u32 AH[MT][4], AL[MT][4];
+    hist_frags(uu, AH);
 #pragma unroll
     for (int m = 0; m < MT; ++m) {
       AL[m][0] = pack2(uu[m][0][0] - bflo(AH[m][0]), uu[m][0][1] - bfhi(AH[m][0]));
@@ -919,8 +908,11 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) gdn_core(const Param
 
 #if FOLD >= 2
   if (hist > 0) {
-    // committed history: hw = e^{g_total} hw + bf16(d_j e^{g_total - G_j}) . bf16(scores), A fragments from before
-    // the wait
+    // committed history: hw = e^{g_total} hw + bf16(d_j e^{g_total - G_j}) . bf16(scores), from the staged history
+    float uu[MT][2][4];
+    const float td = hist_updates(s_d, s_g, hist, lane, q, vb, r, uu);
+    u32 AH[MT][4];
+    hist_frags(uu, AH);
     const u32 bq0 = s_sc[0][0][lane], bq1 = s_sc[0][1][lane];
     const u32 bk0 = s_sc[1][0][lane], bk1 = s_sc[1][1][lane];
 #pragma unroll
