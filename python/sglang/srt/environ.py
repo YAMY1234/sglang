@@ -1597,6 +1597,9 @@ class Envs:
     # The GDN spec commit folds a request's ring only once its next verify's rows would not fit
     # after it (else it only advances the cursors); the verify replays the history in between.
     SGLANG_PLB_GDN_DEFER_FOLD = EnvBool(False)
+    # A shared expert whose down_proj takes a static per-tensor FP8 input runs its
+    # SiLU-and-mul and that input's quantization in one launch (bit-identical to the two).
+    SGLANG_PST_SE_SILU_FP8 = EnvBool(False)
     # TP > 1 EAGLE topk-1 verify keeps the target logits vocabulary-sharded: greedy rows
     # take a sharded argmax (bit-identical), temperature-only rows a sharded Gumbel-max
     # (same distribution); any other batch all-gathers them first, as before.
