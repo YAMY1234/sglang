@@ -110,7 +110,8 @@ def dequantize_nvfp4(
     return (val.view(n, k // NVFP4_BLOCK, NVFP4_BLOCK) * scale[..., None]).view(n, k)
 
 
-class PerfLpDraftNvFp4MoEMethod(ModelOptNvFp4OnlineFusedMoEMethod):
+# FusedMoE's weight loader takes the ModelOpt branch on "ModelOpt" in the method's class name.
+class ModelOptNvFp4PerfLpDraftMoEMethod(ModelOptNvFp4OnlineFusedMoEMethod):
     """The draft experts' NVFP4 method: the online loader with TRT-LLM's quantizer, and TRT-LLM's static input
     scales."""
 
@@ -124,8 +125,8 @@ class PerfLpDraftNvFp4MoEMethod(ModelOptNvFp4OnlineFusedMoEMethod):
             layer.w13_input_scale.fill_(fc1_amax / _NVFP4_RANGE)
             layer.w2_input_scale.fill_(fc2_amax / _NVFP4_RANGE)
         super().process_weights_after_loading(layer)
-        if not PerfLpDraftNvFp4MoEMethod._logged:
-            PerfLpDraftNvFp4MoEMethod._logged = True
+        if not ModelOptNvFp4PerfLpDraftMoEMethod._logged:
+            ModelOptNvFp4PerfLpDraftMoEMethod._logged = True
             logger.info(
                 "PERF-LP draft MoE NVFP4 (%s): %d local experts quantized at load time, "
                 "TRT recipe, input amax fc1 %.1f fc2 %.1f",
@@ -143,5 +144,5 @@ class PerfLpDraftNvFp4Config(_ModelOptFp4OnlineConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, FusedMoE):
-            return PerfLpDraftNvFp4MoEMethod(self, prefix)
+            return ModelOptNvFp4PerfLpDraftMoEMethod(self, prefix)
         return None
