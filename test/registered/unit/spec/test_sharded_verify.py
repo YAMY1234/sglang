@@ -4,12 +4,18 @@ Greedy: the per-shard keys reduced across shards pick exactly torch.argmax over 
 gathered FP32 logits, ties to the smaller token id included, at TP 2 / 4 / 8.
 Temperature rows: the Gumbel-max sample has the distribution softmax(logits / T),
 whole or split into shards (chi-square against the exact probabilities). The
-fallback gather rebuilds the stock gathered FP32 logits exactly."""
+fallback gather rebuilds the stock gathered FP32 logits exactly. The LL key exchange
+(SGLANG_PERFLL_VERIFY_LL_KEYS) returns every row's max over all ranks' keys, launch after
+launch, whether the other ranks' words are already there or land while it polls."""
 
 import unittest
+from unittest.mock import patch
 
 import torch
+import triton
+import triton.language as tl
 
+from sglang.srt.speculative import sharded_verify
 from sglang.srt.speculative.sharded_verify import (
     VocabShard,
     _reduce_keys,
@@ -99,6 +105,110 @@ class TestShardedGreedy(CustomTestCase):
         self.assertTrue(
             torch.equal(got, torch.zeros(3, dtype=torch.int64, device="cuda"))
         )
+
+
+@triton.jit
+def _plain_st_b64(addr, val, mask):
+    # _ll_st_b64 on one GPU: a plain store into this rank's own buffer
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .pred %p0;
+            setp.eq.s32 %p0, $3, 1;
+            @!%p0 bra end;
+            st.relaxed.sys.global.b64 [$1], $2;
+            end:
+        }
+        """,
+        "=r,l,l,r",
+        args=[addr, val, mask.to(tl.int32)],
+        dtype=tl.uint32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+class TestLLKeys(CustomTestCase):
+    """_ll_keys_kernel as rank 0 of WORLD ranks on one GPU (its multimem store made a plain
+    one), the other ranks' words written by the test. Each launch is followed at once by
+    another kernel and nothing syncs the host until the end. Every row must get the max over
+    all ranks' keys. A warp once left the poll on a stale block-wide count and took words a
+    slot held from an earlier launch: wrong tokens for a block of rows (168 of 600 launches
+    at 56 rows on one rank)."""
+
+    LAUNCHES = 600
+
+    def _check(self, world, rows, late):
+        maxr = sharded_verify._LL_MAX_ROWS
+        gen = torch.Generator(device="cuda").manual_seed(world * 100 + rows)
+        buf = torch.zeros(
+            sharded_verify._LL_SLOTS * world * maxr * 2, dtype=torch.int64, device="cuda"
+        )
+        epoch = torch.zeros(1, dtype=torch.int32, device="cuda")
+        writer = torch.cuda.Stream()
+        # load the writer's kernels now: lazy loading them would wait for a spinning poll
+        torch.cuda._sleep(1)
+        torch.empty_like(buf)[torch.arange(2, device="cuda")] = 0
+        launches = []
+        for i in range(self.LAUNCHES):
+            keys = torch.randint(
+                -(2**62), 2**62, (world, rows, 2), device="cuda", generator=gen
+            )
+            want = 0xFFFFFFFF - (keys.amax(dim=(0, 2)) & 0xFFFFFFFF)
+            tag, slot = i + 1, (i + 1) % 3
+            at = torch.cat(
+                [
+                    ((slot * world + q) * maxr + torch.arange(rows, device="cuda")) * 2
+                    for q in range(1, world)
+                ]
+                or [torch.empty(0, dtype=torch.int64, device="cuda")]
+            )
+            others = keys[1:].amax(dim=2).reshape(-1)
+            lo = (others & 0xFFFFFFFF) | (tag << 32)
+            hi = ((others >> 32) & 0xFFFFFFFF) | (tag << 32)
+            if late:
+                # the other ranks' words land ~10 us after this launch begins to poll
+                writer.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(writer):
+                    torch.cuda._sleep(20_000)
+                    buf[at] = lo
+                    buf[at + 1] = hi
+            else:
+                buf[at] = lo
+                buf[at + 1] = hi
+            tokens = torch.full((rows,), -5, dtype=torch.int64, device="cuda")
+            sharded_verify._ll_keys_kernel[(1,)](
+                keys[0].contiguous(),
+                2,
+                rows,
+                buf.data_ptr(),
+                buf.data_ptr(),
+                epoch,
+                tokens,
+                RANK=0,
+                WORLD=world,
+                MAXR=maxr,
+                BLOCK_R=max(16, triton.next_power_of_2(rows)),
+                BLOCK_P=2,
+                KEY_FLOOR=sharded_verify._KEY_FLOOR,
+                SPIN_LIMIT=1 << 22,
+                num_warps=4,
+            )
+            torch.empty(rows, dtype=torch.int32, device="cuda").fill_(3)
+            launches.append((tokens, want))
+        torch.cuda.synchronize()
+        wrong = sum(not torch.equal(t, w) for t, w in launches)
+        self.assertEqual(wrong, 0, f"{wrong} of {self.LAUNCHES} launches")
+        self.assertEqual(int(epoch), self.LAUNCHES)
+
+    def test_every_row_gets_every_ranks_max(self):
+        with patch.object(sharded_verify, "_ll_st_b64", _plain_st_b64):
+            for world in (1, 2, 8):
+                for rows in (7, 28, 56, 63):
+                    for late in (False, True) if world > 1 else (False,):
+                        with self.subTest(world=world, rows=rows, late=late):
+                            self._check(world, rows, late)
 
 
 class _FakeGroup:
