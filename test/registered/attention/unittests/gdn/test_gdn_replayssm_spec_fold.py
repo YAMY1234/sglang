@@ -20,7 +20,7 @@ from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=90, stage="base-b", runner_config="1-gpu-large")
 
 B, T = 3, 4
 H, HV = 4, 8
@@ -360,6 +360,153 @@ class TestGdnReplayssmCommitCuda(CustomTestCase):
         self.assertFalse(torch.equal(want[:, written], state[:, written]))
         untouched = [s for s in range(slots) if s not in written]
         self.assertTrue(torch.equal(got[:, untouched], state[:, untouched]))
+
+
+@unittest.skipUnless(_cuda_commit_available(), "needs SM90+ and cuda.bindings")
+class TestGdnCoreCudaTrtFold(CustomTestCase):
+    """SGLANG_PST_GDN_TRT_FOLD: gdn_core_cuda fold 2 / 3 on two 16-entry history buffers (a ring of 32)
+    against fold 0 on the active buffer and the CUDA commit of the history, bit for bit. A step whose rows
+    do not fit after its history folds it into the checkpoint and writes its rows from entry 0 of the other
+    buffer; fold 2 replays the history for its outputs, fold 3 runs on the folded checkpoint."""
+
+    H, HV, T, RING = 2, 4, 7, 32
+
+    def _inputs(self, gen):
+        h, hv, t, d = self.H, self.HV, self.T, 128
+        n, slots = 6, 9
+
+        def rand(*shape, scale=1.0):
+            return (torch.randn(*shape, device=DEVICE, generator=gen) * scale).to(
+                torch.bfloat16
+            )
+
+        rows = n * t
+        ab = rand(rows, 2 * hv)
+        x = dict(
+            qkv=rand(rows, (2 * h + hv) * d),
+            z=rand(rows, hv, d),
+            a=ab[:, :hv],
+            b=ab[:, hv:],
+            A_log=torch.rand(hv, device=DEVICE, generator=gen),
+            dt_bias=torch.rand(hv, device=DEVICE, generator=gen),
+            norm_weight=rand(d),
+            input_scale=torch.tensor([0.02], device=DEVICE),
+        )
+        state = rand(slots, hv, d, d, scale=0.05)
+        ring = [
+            rand(slots, hv, self.RING, d, scale=0.05),
+            rand(slots, h, self.RING, d, scale=0.09),
+            -torch.rand(slots, hv, self.RING, device=DEVICE, generator=gen) * 0.5,
+        ]
+        states = torch.tensor([4, 0, 7, -1, 2, 5], dtype=torch.int32, device=DEVICE)
+        replay = torch.tensor([3, 8, 1, 6, 0, 5], dtype=torch.int32, device=DEVICE)
+        wp = torch.zeros(slots, dtype=torch.int32, device=DEVICE)
+        wp[replay.long()] = torch.tensor([0, 5, 9, 12, 10, 16], device=DEVICE).int()
+        base = torch.zeros(slots, dtype=torch.int32, device=DEVICE)
+        base[replay.long()] = torch.tensor([16, 0, 16, 0, 0, 16], device=DEVICE).int()
+        return x, state, ring, states, replay, wp, base
+
+    def _core(self, x, state, ring, states, replay, wp, base, fold):
+        from sglang.kernels.ops.attention.fla import gdn_core_cuda
+
+        rows = x["qkv"].shape[0]
+        y = torch.empty(
+            rows, self.HV * 128, dtype=torch.float8_e4m3fn, device=DEVICE
+        )
+        o = torch.zeros(rows, self.HV, 128, dtype=torch.bfloat16, device=DEVICE)
+        self.assertTrue(
+            gdn_core_cuda.try_core(
+                **x,
+                checkpoint=state,
+                ring_d=ring[0],
+                ring_k=ring[1],
+                ring_g=ring[2],
+                ring_dlo=None,
+                ring_klo=None,
+                state_indices=states,
+                replay_indices=replay,
+                write_pos=wp,
+                cache_base=base,
+                is_flush=torch.zeros_like(wp, dtype=torch.int8),
+                eps=1e-6,
+                out=y,
+                rows_per_request=self.T,
+                num_k_heads=self.H,
+                o_out=o,
+                fold=fold,
+            )
+        )
+        return y, o
+
+    def _check(self, fold):
+        from sglang.kernels.ops.attention.fla import gdn_replayssm_commit_cuda
+
+        gen = torch.Generator(device=DEVICE).manual_seed(11 + fold)
+        x, state, ring, states, replay, wp, base = self._inputs(gen)
+        folds = (wp + self.T > 16).to(torch.int8)
+        got_state, got_ring = state.clone(), [r.clone() for r in ring]
+        y, o = self._core(x, got_state, got_ring, states, replay, wp, base, fold)
+
+        # want: the commit of each folding history, then fold 0 on the active buffer (fold 3: a folding
+        # row on the committed checkpoint with no history)
+        committed = state.clone().unsqueeze(0)
+        gdn_replayssm_commit_cuda.commit(
+            checkpoint_state=committed,
+            d_cache=ring[0].unsqueeze(0),
+            k_cache=ring[1].unsqueeze(0),
+            g_cache=ring[2].unsqueeze(0),
+            d_residual_cache=None,
+            k_residual_cache=None,
+            state_batch_indices=states,
+            replay_indices=replay,
+            write_pos=wp,
+            cache_base=base,
+            is_flush=folds,
+            accept_lens=wp[: states.numel()].contiguous(),
+            null_block_id=-1,
+        )
+        committed = committed.squeeze(0)
+        wp_ref = torch.where(folds.bool(), torch.zeros_like(wp), wp) if fold == 3 else wp
+        active = [torch.zeros_like(r[:, :, :16]) for r in ring]
+        for rid in range(wp.numel()):
+            b0 = int(base[rid])
+            for r16, r32 in zip(active, ring):
+                r16[rid] = r32[rid, :, b0 : b0 + 16]
+        ref_state = committed.clone() if fold == 3 else state.clone()
+        y_ref, o_ref = self._core(
+            x, ref_state, active, states, replay, wp_ref, torch.zeros_like(base), 0
+        )
+        torch.cuda.synchronize()
+
+        live = (states >= 0).repeat_interleave(self.T)
+        self.assertTrue(torch.equal(o[live], o_ref[live]))
+        self.assertTrue(torch.equal(y.view(torch.uint8)[live], y_ref.view(torch.uint8)[live]))
+        self.assertFalse(y[~live].float().any())
+        self.assertTrue(torch.equal(got_state, committed))
+        want_ring = [r.clone() for r in ring]
+        for n in range(states.numel()):
+            if int(states[n]) < 0:
+                continue
+            rid = int(replay[n])
+            w, b0, f = int(wp[rid]), int(base[rid]), bool(folds[rid])
+            first = (b0 ^ 16) if f else b0 + w
+            for t in range(self.T):
+                src = int(wp_ref[rid]) + t
+                if src >= 16:
+                    # fold 2's reference (fold 0, ring of 16) drops a folding row's late entries
+                    for want, got in zip(want_ring, got_ring):
+                        want[rid, :, first + t] = got[rid, :, first + t]
+                    continue
+                for want, act in zip(want_ring, active):
+                    want[rid, :, first + t] = act[rid, :, src]
+        for want, got in zip(want_ring, got_ring):
+            self.assertTrue(torch.equal(want, got))
+
+    def test_fold2_replays_history_and_commits_into_the_other_buffer(self):
+        self._check(2)
+
+    def test_fold3_runs_on_the_committed_checkpoint(self):
+        self._check(3)
 
 
 if __name__ == "__main__":
