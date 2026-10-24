@@ -466,16 +466,17 @@ def check_draft_extend_inputs(
     hidden_states: torch.Tensor,
 ) -> None:
     """The eager path's draft extend inputs for this batch, built again from the round's
-    tensors and compared with what the post-verify graph wrote (``staged``)."""
-    from sglang.kernels.ops.speculative.eagle import (
-        prepare_draft_extend_inputs,
-        prepare_draft_extend_layout,
-    )
+    tensors and compared with what the post-verify graph wrote (``staged``). The layout is
+    recomputed with torch ops into fresh tensors: prepare_draft_extend_layout's outputs come
+    from SGLANG_PERFLL_HOST_OUT_POOL's rings, whose depth this extra use would outrun."""
+    from sglang.kernels.ops.speculative.eagle import prepare_draft_extend_inputs
 
     correct, select, ids = prepare_draft_extend_inputs(accept_lens, predict, width)
-    _, extend, post, (positions, _, mrope) = prepare_draft_extend_layout(
-        seq_lens, width, staged.mrope_positions is not None
-    )
+    extend = torch.full_like(seq_lens, width, dtype=torch.int32)
+    post = seq_lens + width
+    cols = torch.arange(width, device=seq_lens.device, dtype=torch.int64)
+    positions = (seq_lens.clamp(min=0).to(torch.int64)[:, None] + cols).reshape(-1)
+    mrope = positions.expand(3, -1)
     pairs = [
         ("input_ids", staged.input_ids, ids),
         ("seq_lens", staged.seq_lens, post),
