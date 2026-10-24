@@ -1719,6 +1719,10 @@ class Envs:
     # The GDN spec commit folds a request's ring only once its next verify's rows would not fit
     # after it (else it only advances the cursors); the verify replays the history in between.
     SGLANG_PLB_GDN_DEFER_FOLD = EnvBool(False)
+    # The GDN spec verify keeps TRT-LLM's two 16-entry history buffers a request (a ring of 32): a
+    # step whose rows do not fit after its history folds that history into the BF16 checkpoint
+    # (BF16 keys, no low parts) and writes its rows to the other buffer; needs gdn_core_cuda.
+    SGLANG_PST_GDN_TRT_FOLD = EnvBool(False)
     # PERF-HT: the attention-DP GDN verify launch table (SGLANG_Q35MF_E2X_DEP_GDN) extended to B17-36 (byte-identical).
     SGLANG_PERFHT_DEP_GDN_WIDE = EnvBool(False)
     # PERF-HT: SGLANG_Q35MF_TPX_CONV_WINDOW's coalesced window stores up to B36 (stock gate B16).

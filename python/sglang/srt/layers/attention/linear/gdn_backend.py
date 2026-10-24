@@ -211,7 +211,7 @@ def _gdn_core_target_verify(
         or (layer.head_q_dim, layer.head_k_dim, layer.head_v_dim) != (128, 128, 128)
         or draft_token_num != 7
         or layer_cache.temporal.dtype != torch.bfloat16
-        or layer_cache.replayssm_d.shape[-2] != 16
+        or layer_cache.replayssm_d.shape[-2] != (32 if mamba_pool.replayssm_trt_fold else 16)
         or layer_cache.replayssm_beta is not None
         or mixed_qkv.shape[0] % draft_token_num
     ):
@@ -246,14 +246,20 @@ def _gdn_core_target_verify(
         out=out,
         rows_per_request=draft_token_num,
         num_k_heads=layer.num_k_heads,
-        # SGLANG_PLB_GDN_FOLD_IN_VERIFY: the core folds a full ring itself (the cursor advance assumes it)
-        fold=mamba_pool.replayssm_fold_in_verify,
+        # SGLANG_PLB_GDN_FOLD_IN_VERIFY (1) / SGLANG_PST_GDN_TRT_FOLD (2): the core folds a full ring
+        # itself (the cursor advance assumes it)
+        fold=(
+            2
+            if mamba_pool.replayssm_trt_fold
+            else int(mamba_pool.replayssm_fold_in_verify)
+        ),
         **(conv or {}),
     ):
         return None
     print_info_once(
         f"SGLANG_PERFHT_GDN_CORE engaged: batch={mixed_qkv.shape[0] // draft_token_num}, "
-        f"value_heads={layer.num_v_heads}, fold_in_verify={int(mamba_pool.replayssm_fold_in_verify)}"
+        f"value_heads={layer.num_v_heads}, fold_in_verify={int(mamba_pool.replayssm_fold_in_verify)}, "
+        f"trt_fold={int(mamba_pool.replayssm_trt_fold)}"
     )
     return out
 
@@ -1675,6 +1681,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     )
                     if fp8 is not None:
                         return fp8
+                if use_replayssm_spec and getattr(mamba_pool, "replayssm_trt_fold", False):
+                    # The Triton verify knows neither the two history buffers nor this fold rule.
+                    raise RuntimeError(
+                        "SGLANG_PST_GDN_TRT_FOLD needs the CUDA verify core "
+                        "(SGLANG_PERFHT_GDN_CORE, a linear chain, its shapes); it did not run"
+                    )
         else:
             if forward_metadata.has_mamba_track_mask:
                 mixed_qkv_to_track = mixed_qkv[

@@ -1165,6 +1165,7 @@ def _advance_gdn_spec_cursors_kernel(
     NULL_BLOCK_ID: tl.constexpr,
     FOLD_IN_VERIFY: tl.constexpr = False,
     DEFER_FOLD: tl.constexpr = False,
+    FOLD_SWAP: tl.constexpr = False,
 ):
     offs = tl.arange(0, BLOCK)
     row_mask = offs < n_rows
@@ -1196,9 +1197,16 @@ def _advance_gdn_spec_cursors_kernel(
             is_flush_cur != 0, total_commit, write_pos + total_commit
         ).to(tl.int32)
 
-    new_base = tl.where(
-        flush_now, (cache_base + write_pos) & (CACHE_BUF_LEN - 1), cache_base
-    )
+    if FOLD_SWAP:
+        # SGLANG_PST_GDN_TRT_FOLD: a folding verify wrote its rows from entry 0 of the other
+        # MAX_CACHE_LEN-entry buffer
+        new_base = tl.where(
+            flush_now, (cache_base + MAX_CACHE_LEN) & (CACHE_BUF_LEN - 1), cache_base
+        )
+    else:
+        new_base = tl.where(
+            flush_now, (cache_base + write_pos) & (CACHE_BUF_LEN - 1), cache_base
+        )
     # EARLY-FLUSH (margin = 2 * max_spec_len, strict '>'): flush one window early
     # so that on every verify step write_pos + spec_len <= max_cache_len holds,
     # i.e. the spec window NEVER overflows the circular cache. This is required
@@ -1713,6 +1721,7 @@ def commit_gdn_replayssm_spec(
     null_block_id: int = 0,
     fold_in_verify: bool = False,
     defer_fold: bool = False,
+    fold_swap: bool = False,
 ):
     """Advance request-keyed cursors once per verify step (device-only).
 
@@ -1720,6 +1729,9 @@ def commit_gdn_replayssm_spec(
     ``max_spec_len`` rows after its history (gdn_replayssm_spec_decode's rule).
     ``defer_fold``: flag for this step's commit only the rings the next verify's
     ``max_spec_len`` rows would overflow.
+    ``fold_swap`` (with ``fold_in_verify``, SGLANG_PST_GDN_TRT_FOLD): the ring is two
+    ``max_cache_len``-entry buffers (``cache_buf_len`` = 2 ``max_cache_len``) and a folding
+    verify wrote its rows from entry 0 of the other one.
     """
     if cache_buf_len is None:
         cache_buf_len = max_cache_len
@@ -1742,6 +1754,7 @@ def commit_gdn_replayssm_spec(
         NULL_BLOCK_ID=null_block_id,
         FOLD_IN_VERIFY=fold_in_verify,
         DEFER_FOLD=defer_fold,
+        FOLD_SWAP=fold_swap,
     )
 
 

@@ -497,17 +497,21 @@ def _track_kernel(device: int, hk: int, hv: int, ring: int):
     return fn
 
 
-def supported(checkpoint_state: torch.Tensor, d_cache: torch.Tensor, k_cache: torch.Tensor) -> bool:
-    """Shapes the CUDA commit handles: BF16 [layers, slots, HV, 128, 128] checkpoints, a BF16 ring of 16."""
+def supported(
+    checkpoint_state: torch.Tensor, d_cache: torch.Tensor, k_cache: torch.Tensor, rings: tuple = (16,)
+) -> bool:
+    """Shapes the CUDA commit handles: BF16 [layers, slots, HV, 128, 128] checkpoints, a BF16 ring of 16 (``rings``:
+    the track also takes SGLANG_PST_GDN_TRT_FOLD's 32, whose windows stay within 16 entries)."""
+    ring = d_cache.shape[-2]
     return (
         checkpoint_state.dtype == torch.bfloat16
         and tuple(checkpoint_state.shape[-2:]) == (128, 128)
         and checkpoint_state.stride()[2:] == (128 * 128, 128, 1)
         and d_cache.dtype == torch.bfloat16
         and k_cache.dtype == torch.bfloat16
-        and d_cache.shape[-2] == 16
-        and d_cache.stride()[2:] == (16 * 128, 128, 1)
-        and k_cache.stride()[2:] == (16 * 128, 128, 1)
+        and ring in rings
+        and d_cache.stride()[2:] == (ring * 128, 128, 1)
+        and k_cache.stride()[2:] == (ring * 128, 128, 1)
         and checkpoint_state.shape[2] % k_cache.shape[2] == 0
     )
 
@@ -540,7 +544,7 @@ def try_commit(**kw) -> bool:
 def try_track(**kw) -> bool:
     """``track(**kw)`` when the shapes fit and the kernel is compiled or compilable now; else False."""
     st, d, k = kw["checkpoint_state"], kw["d_cache"], kw["k_cache"]
-    if not supported(st, d, k):
+    if not supported(st, d, k, rings=(16, 32)):
         _log_once("track-shape", "SGLANG_PLB_GDN_FOLD_IN_VERIFY: unsupported ring / checkpoint shapes, Triton track")
         return False
     device, hk, hv, ring = st.device.index, k.shape[2], st.shape[2], d.shape[-2]
