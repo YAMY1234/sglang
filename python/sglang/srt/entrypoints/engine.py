@@ -1967,6 +1967,31 @@ def _set_envs_and_config(server_args: ServerArgs):
     # Set gc threshold
     if gc_threshold := cfg.gc_threshold:
         gc.set_threshold(*gc_threshold)
+    _apply_main_gc_mode(envs.SGLANG_PERFHT_MAIN_GC.get())
+
+
+def _apply_main_gc_mode(mode: str) -> None:
+    """SGLANG_PERFHT_MAIN_GC for this (main) process: a gen-1 collection over a few hundred thousand request objects
+    pauses every output stream of the server for 0.4-0.75 s."""
+    if not mode:
+        return
+    if mode == "disable":
+        gc.disable()
+        logger.info("SGLANG_PERFHT_MAIN_GC: cyclic GC disabled in the main process")
+        return
+    if mode.startswith("freeze:"):
+        period = float(mode.split(":", 1)[1])
+
+        def _freezer():
+            time.sleep(max(period, 60.0))
+            while True:
+                gc.freeze()
+                time.sleep(period)
+
+        threading.Thread(target=_freezer, name="perfht-gc-freeze", daemon=True).start()
+        logger.info("SGLANG_PERFHT_MAIN_GC: gc.freeze() every %.0f s in the main process", period)
+        return
+    raise ValueError(f"SGLANG_PERFHT_MAIN_GC={mode!r}: expected disable or freeze:<seconds>")
 
 
 def _scheduler_died_error(rank: int, proc) -> RuntimeError:
