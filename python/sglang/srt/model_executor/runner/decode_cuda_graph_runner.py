@@ -149,6 +149,10 @@ VERIFY_STAGED_SLOTS = frozenset(
 )
 
 
+# the batch sizes whose first staged verify logged its engagement
+_T_ENGAGED: set = set()
+
+
 def ragged_verify_compact_graphs_enabled(spec_algorithm: SpeculativeAlgorithm) -> bool:
     if not spec_algorithm.supports_ragged_verify():
         return False
@@ -703,6 +707,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             or staged[2] != raw_bs
         ):
             return frozenset()
+        if raw_bs not in _T_ENGAGED:
+            _T_ENGAGED.add(raw_bs)
+            logger.info(
+                "PERF-LL rs-t: a verify of %d requests takes the chain tree's inputs, no copy",
+                raw_bs,
+            )
         return VERIFY_STAGED_SLOTS
 
     def _resolve_variant_label(self, forward_batch: ForwardBatch):
