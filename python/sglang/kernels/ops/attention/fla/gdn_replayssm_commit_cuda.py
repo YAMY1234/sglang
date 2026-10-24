@@ -310,14 +310,6 @@ extern "C" __global__ void __launch_bounds__(NW * 32) gdn_replayssm_commit(const
 
 
 _TRACK_SRC = r"""
-__device__ __forceinline__ void mbar_wait(u64* bar, u32 parity) {
-  u32 ready = 0;
-  do {
-    asm volatile("{ .reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2; selp.u32 %0, 1, 0, p; }"
-                 : "=r"(ready) : "r"(smem_u32(bar)), "r"(parity) : "memory");
-  } while (!ready);
-}
-
 // gdn_replayssm_commit's track snapshots without its fold: grid (request, value head), layers in turn
 extern "C" __global__ void __launch_bounds__(NW * 32) gdn_replayssm_track(const Params p, const int layers) {
   extern __shared__ __align__(128) unsigned char smem_raw[];
