@@ -103,6 +103,7 @@ from sglang.srt.speculative.eagle_utils import (
     organize_draft_results,
     per_step_draft_out_cache_loc,
 )
+from sglang.srt.speculative.perfll_step2 import Step2Counter
 from sglang.srt.speculative.eagle_worker_common import (
     build_eagle_verify_input,
     prepare_for_draft,
@@ -1299,6 +1300,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
     # class defaults, since unit-test harnesses build workers without __init__.
     _post_verify_graphs: Optional[EaglePostVerifyGraphs] = None
     _simulated_acc_len_rng: Optional[torch.Generator] = None
+    # SGLANG_PERFLL_STEP2: counts the decode passes whose draft inputs could be staged
+    _step2: Optional[Step2Counter] = None
 
     def __init__(
         self,
@@ -1411,6 +1414,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
     def init_cuda_graphs(self):
         super().init_cuda_graphs()
+        draft_runner = self._draft_worker.cuda_graph_runner
+        if envs.SGLANG_PERFLL_STEP2.get() == 1 and draft_runner is not None:
+            self._step2 = Step2Counter(
+                width=self.speculative_num_draft_tokens,
+                graph_sizes=draft_runner.capture_bs,
+            )
         # Build adaptive runtime states after target and draft backends exist.
         if self.adaptive_controller is not None:
             with (
@@ -1446,6 +1455,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            if self._step2 is not None:
+                self._step2.forget()
             if _PLB_LATE_JOIN and self._post_verify_graphs is not None:
                 # a prefill may write a mamba slot the pending commit still folds into
                 self._post_verify_graphs.join()
@@ -1507,6 +1518,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ):
                     if host_trace.ENABLED:
                         host_trace.gpu_mark(host_trace.DRAFT0)
+                    if self._step2 is not None:
+                        self._step2.count_draft(batch)
                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
                     if host_trace.ENABLED:
                         host_trace.gpu_mark(host_trace.DRAFT1)
@@ -1543,6 +1556,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     )
                     if host_trace.ENABLED:
                         host_trace.gpu_mark(host_trace.EXT1)
+                    if self._step2 is not None:
+                        self._step2.note_extend(batch)
             if self._post_verify_graphs is not None and not _PLB_LATE_JOIN:
                 # The mamba state commit may still run on a side stream.
                 self._post_verify_graphs.join()
