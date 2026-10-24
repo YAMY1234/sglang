@@ -845,6 +845,7 @@ def _advance_gdn_spec_cursors_kernel(
     NULL_BLOCK_ID: tl.constexpr,
     FOLD_IN_VERIFY: tl.constexpr = False,
     DEFER_FOLD: tl.constexpr = False,
+    FOLD_ROWS: tl.constexpr = 0,
 ):
     offs = tl.arange(0, BLOCK)
     row_mask = offs < n_rows
@@ -866,7 +867,7 @@ def _advance_gdn_spec_cursors_kernel(
     if FOLD_IN_VERIFY:
         # The verify folded every ring that could not take its rows (the same rule)
         # and wrote the rows after the folded history.
-        flush_now = (write_pos + MAX_SPEC_LEN) > MAX_CACHE_LEN
+        flush_now = (write_pos + FOLD_ROWS) > MAX_CACHE_LEN
         new_wp = tl.where(flush_now, total_commit, write_pos + total_commit).to(
             tl.int32
         )
@@ -1140,6 +1141,7 @@ def gdn_replayssm_spec_decode(
     # Triton only accepts TF32 input precision on Ampere-or-newer NVIDIA GPUs.
     dot_precision: str = "tf32" if is_tf32_supported else "ieee",
     fold_in_verify: bool = False,
+    fold_rows: int = 0,
 ):
     """GDN cached speculative-decode on a CIRCULAR ring cache (split-qkv varlen).
 
@@ -1155,8 +1157,9 @@ def gdn_replayssm_spec_decode(
     the checkpoint remains keyed by physical ``ssm_state_indices``.
 
     ``fold_in_verify`` (SGLANG_PLB_GDN_FOLD_IN_VERIFY, verify launch only): a ring
-    that cannot take ``max_spec_len`` rows after its history is first folded into
-    the checkpoint, then the step runs on it with no history and appends its rows.
+    that cannot take ``fold_rows`` (default ``max_spec_len``) rows after its history
+    is first folded into the checkpoint, then the step runs on it with no history and
+    appends its rows.
     """
     if scale is None:
         scale = checkpoint_state.shape[-1] ** -0.5
@@ -1211,7 +1214,7 @@ def gdn_replayssm_spec_decode(
             write_pos=write_pos,
             cache_base=cache_base,
             is_flush=is_flush,
-            max_spec_len=max_spec_len,
+            max_spec_len=fold_rows or max_spec_len,
             null_block_id=null_block_id,
         )
     if launch_mode in ("both", "verify"):
@@ -1249,7 +1252,7 @@ def gdn_replayssm_spec_decode(
             bs_min,
             null_block_id,
             dot_precision,
-            max_spec_len if fold_in_verify else 0,
+            (fold_rows or max_spec_len) if fold_in_verify else 0,
         )
     if launch_mode in ("both", "flush"):
         _launch_gdn_spec(
@@ -1303,11 +1306,13 @@ def commit_gdn_replayssm_spec(
     null_block_id: int = 0,
     fold_in_verify: bool = False,
     defer_fold: bool = False,
+    fold_rows: int = 0,
 ):
     """Advance request-keyed cursors once per verify step (device-only).
 
     ``fold_in_verify``: the verify folded each ring that could not take
-    ``max_spec_len`` rows after its history (gdn_replayssm_spec_decode's rule).
+    ``fold_rows`` (default ``max_spec_len``) rows after its history
+    (gdn_replayssm_spec_decode's rule).
     ``defer_fold``: flag for this step's commit only the rings the next verify's
     ``max_spec_len`` rows would overflow.
     """
@@ -1332,6 +1337,7 @@ def commit_gdn_replayssm_spec(
         NULL_BLOCK_ID=null_block_id,
         FOLD_IN_VERIFY=fold_in_verify,
         DEFER_FOLD=defer_fold,
+        FOLD_ROWS=fold_rows or max_spec_len,
     )
 
 

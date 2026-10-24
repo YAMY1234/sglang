@@ -1586,6 +1586,9 @@ class Envs:
     # The GDN spec commit folds a request's ring only once its next verify's rows would not fit
     # after it (else it only advances the cursors); the verify replays the history in between.
     SGLANG_PLB_GDN_DEFER_FOLD = EnvBool(False)
+    # With SGLANG_PLB_GDN_FOLD_IN_VERIFY: the verify folds every ring that holds history (the
+    # previous step's accepted rows), so every step runs on a checkpoint with no history.
+    SGLANG_PST_GDN_FOLD_EVERY = EnvBool(False)
     # TP > 1 EAGLE topk-1 verify keeps the target logits vocabulary-sharded: greedy rows
     # take a sharded argmax (bit-identical), temperature-only rows a sharded Gumbel-max
     # (same distribution); any other batch all-gathers them first, as before.

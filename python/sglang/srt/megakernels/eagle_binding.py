@@ -102,6 +102,9 @@ class MambaPoolBuffers(msgspec.Struct, frozen=True):
     # SGLANG_PLB_GDN_FOLD_IN_VERIFY: the verify folds a ring that cannot take the step's
     # rows into the checkpoint, and the commit folds nothing
     ring_fold_in_verify: bool = False
+    # its rule's rows: a ring folds once write_pos + rows > ring (SGLANG_PST_GDN_FOLD_EVERY:
+    # the ring length, every ring with history)
+    ring_fold_rows: int = 0
 
 
 class AttnStepMetadata(msgspec.Struct, frozen=True):
@@ -352,6 +355,7 @@ def mamba_pool_buffers(req_pool: Any) -> MambaPoolBuffers:
         ring_cache_base=mamba_pool.replayssm_cache_base,
         ring_is_flush=mamba_pool.replayssm_is_flush,
         ring_fold_in_verify=mamba_pool.replayssm_fold_in_verify,
+        ring_fold_rows=mamba_pool.replayssm_fold_rows,
     )
 
 

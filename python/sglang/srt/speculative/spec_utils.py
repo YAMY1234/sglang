@@ -1162,6 +1162,7 @@ def commit_mamba_states_after_verify(
             null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
             fold_in_verify=fold_in_verify,
             defer_fold=mamba_pool.replayssm_defer_fold,
+            fold_rows=mamba_pool.replayssm_fold_rows,
         )
         ring_commit = dict(
             checkpoint_state=spec_state.temporal,

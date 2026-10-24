@@ -1115,6 +1115,18 @@ class MambaPool:
             )
             self.replayssm_fold_in_verify = lag_mode == "verify"
             self.replayssm_defer_fold = lag_mode == "defer"
+            # the verify folds a ring once write_pos + fold_rows > ring: the step's rows, or
+            # with SGLANG_PST_GDN_FOLD_EVERY the ring length (any history folds)
+            self.replayssm_fold_rows = 0
+            if self.replayssm_fold_in_verify:
+                self.replayssm_fold_rows = speculative_num_draft_tokens
+                if envs.SGLANG_PST_GDN_FOLD_EVERY.get():
+                    self.replayssm_fold_rows = linear_replayssm_cache_len
+                    logger.info(
+                        "SGLANG_PST_GDN_FOLD_EVERY: the GDN verify folds every ring "
+                        "with history (ring %d)",
+                        linear_replayssm_cache_len,
+                    )
             mem_usage_bytes = self.mamba_cache.mem_usage_bytes()
             if isinstance(self.mamba_cache, self.SpeculativeState):
                 # `intermediate_conv_window` is an as_strided view whose logical

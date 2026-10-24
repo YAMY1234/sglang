@@ -1770,6 +1770,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # acceptance; the active path is therefore a single launch/layer.
             launch_mode="verify",
             fold_in_verify=mamba_pool.replayssm_fold_in_verify,
+            fold_rows=mamba_pool.replayssm_fold_rows,
         )
         # Match the recurrent target_verify output shape (== value.shape).
         return out.reshape(value.shape)
