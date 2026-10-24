@@ -59,6 +59,7 @@ from sglang.srt.runtime_context import (
     max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
 )
+from sglang.srt.speculative import perfll_rs
 from sglang.srt.speculative.ragged_verify import (
     build_ragged_target_verify_geometry,
     resolve_ragged_verify_layout,
@@ -1592,6 +1593,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         **kwargs,
     ) -> torch.Tensor:
         """Run forward for decode using TRTLLM MHA kernel."""
+        # SGLANG_PERFLL_RS_D2: a captured draft graph's metadata update may still be on its branch
+        perfll_rs.join_metadata("the TRT-LLM MHA decode forward")
 
         use_fused_fp8_path = self._should_use_fused_fp8_path(
             save_kv_cache, k, forward_batch
@@ -1720,6 +1723,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         save_kv_cache=True,
         **kwargs,
     ):
+        # SGLANG_PERFLL_RS_D2: a captured draft extend graph's metadata update may still be on its branch
+        perfll_rs.join_metadata("the TRT-LLM MHA extend forward")
         cp_active = is_cp_active(forward_batch)
         uses_native_fp4 = self._forward_extend_uses_native_fp4(forward_batch)
         if uses_native_fp4 and cp_active:

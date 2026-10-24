@@ -51,6 +51,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.speculative.draft_checkpoint import refresh_track_indices, track_indices
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
+from sglang.srt.speculative import perfll_rs
 from sglang.srt.speculative.perfll_step2 import DRAFT_EXTEND_STAGED_INPUTS
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.srt.utils import (
@@ -497,8 +498,16 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         served = bs in self.megakernel_served
 
         def run_once():
-            self.draft_extend_attn_backend.init_forward_metadata_in_graph(forward_batch)
+            return perfll_rs.run_with_metadata_branch(
+                "extend",
+                metadata=lambda: self.draft_extend_attn_backend.init_forward_metadata_in_graph(
+                    forward_batch
+                ),
+                body=run_body,
+                what=f"draft extend graph of {bs} requests",
+            )
 
+        def run_body():
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
             set_dp_buffer_len(

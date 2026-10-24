@@ -318,6 +318,32 @@ class TestEagleBinding(CustomTestCase):
                 forward_batch = _decode_forward_batch(committed, seq_lens)
                 self.assertEqual(forward_batch.attention_kv_len_lower_bound, bound)
 
+    def test_an_open_metadata_branch_joins_at_the_first_device_field_read(self):
+        """SGLANG_PERFLL_RS_D2: while a graph's metadata update runs on a branch, the step
+        metadata joins it on each read of a field the update writes (the first one joins; the
+        host max_seq_len_q does not)."""
+        from sglang.srt.speculative import perfll_rs
+
+        backend = _trtllm(KvPool())
+        plain = eb.attn_step_metadata(backend)
+        self.assertIs(type(plain), eb.AttnStepMetadata)
+        joins = []
+        with (
+            patch.object(perfll_rs, "_pending", ("stream", "graph")),
+            patch.object(perfll_rs, "join_metadata", side_effect=joins.append),
+        ):
+            meta = eb.attn_step_metadata(backend)
+            self.assertIsInstance(meta, eb.AttnStepMetadata)
+            self.assertEqual(meta.max_seq_len_q, 7)  # a host value: no join
+            self.assertEqual(joins, [])
+            self.assertIs(
+                meta.cache_seqlens, backend.forward_metadata.cache_seqlens_int32
+            )
+            self.assertIs(meta.page_table, backend.forward_metadata.page_table)
+        self.assertEqual(
+            joins, ["its first read of cache_seqlens", "its first read of page_table"]
+        )
+
     def test_entry_structs_carry_data_only(self):
         structs = {
             cls

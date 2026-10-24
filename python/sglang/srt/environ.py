@@ -1771,6 +1771,10 @@ class Envs:
     # is idle): a pass that takes the written inputs also builds them the old way and counts
     # the passes where the extend runner's inputs or the published lengths differ.
     SGLANG_DEBUG_PERFLL_RS_D1_CHECK_GATE = EnvStr(None)
+    # PERF-LL remove-stages D2: the graphs named here ("extend": draft extend, "draft") run their
+    # attention metadata update on a side stream forked at the start of the captured body, joined
+    # where the metadata is first read (speculative/perfll_rs.py). Same values, other order.
+    SGLANG_PERFLL_RS_D2 = EnvTuple(())
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
