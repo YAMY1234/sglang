@@ -387,9 +387,18 @@ def _ll_pack(flag, w):
 def _ll_wait(src, n: tl.constexpr, e):
     """Poll n LL words (data in the low, epoch in the high half) until all carry epoch e."""
     k = tl.arange(0, n)
+    # a CTA barrier before each block-wide count and after the last: without them a warp could leave on a stale count
+    # (a faster warp had reused the reduction's scratch) holding a word of the previous call; n <= 32 stays in one warp
+    SYNC: tl.constexpr = n > 32
+    if SYNC:
+        tl.debug_barrier()
     v = tl.load(src + k, volatile=True)
     while tl.min(((v >> 32) == e).to(tl.int32), axis=0) == 0:
+        if SYNC:
+            tl.debug_barrier()
         v = tl.load(src + k, volatile=True)
+    if SYNC:
+        tl.debug_barrier()
     return v
 
 
