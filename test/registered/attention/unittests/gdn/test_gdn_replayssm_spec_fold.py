@@ -361,6 +361,79 @@ class TestGdnReplayssmCommitCuda(CustomTestCase):
         untouched = [s for s in range(slots) if s not in written]
         self.assertTrue(torch.equal(got[:, untouched], state[:, untouched]))
 
+    def test_resident_ctas_leave_every_byte_as_it_was(self):
+        """SGLANG_PERFLL_COMMIT_CTAS: n resident CTAs looping over the (layer, request,
+        value head) items write every checkpoint and track slot byte for byte as one CTA
+        per item does, with a padded request among B real ones."""
+        from sglang.kernels.ops.attention.fla import gdn_replayssm_commit_cuda
+
+        layers, h, hv, d, ring = 6, 2, 8, 128, 16
+        for bs in (1, 2, 4, 8):
+            gen = torch.Generator(device=DEVICE).manual_seed(10 + bs)
+            rows, slots = bs + 1, 3 * (bs + 1)
+
+            def rand(*shape, scale):
+                x = torch.randn(*shape, device=DEVICE, generator=gen) * scale
+                return x.to(torch.bfloat16)
+
+            state = rand(layers, slots, hv, d, d, scale=0.05)
+            caches = dict(
+                d_cache=rand(layers, slots, hv, ring, d, scale=0.05),
+                k_cache=rand(layers, slots, h, ring, d, scale=0.09),
+                g_cache=-torch.rand(layers, slots, hv, ring, device=DEVICE, generator=gen)
+                * 0.5,
+                d_residual_cache=rand(layers, slots, hv, ring, d, scale=1e-4),
+                k_residual_cache=rand(layers, slots, h, ring, d, scale=1e-4),
+            )
+            perm = torch.randperm(slots, device=DEVICE, generator=gen)
+            state_rows = perm[:rows].to(torch.int32)
+            state_rows[-1] = -1
+            replay_rows = perm[rows : 2 * rows].clone()
+            track_rows = perm[2 * rows : 3 * rows].clone()
+            track_rows[::2] = -1
+            accept_lens = torch.randint(1, 8, (rows,), device=DEVICE, generator=gen).int()
+            write_pos = torch.zeros(slots, dtype=torch.int32, device=DEVICE)
+            write_pos[replay_rows] = torch.randint(
+                1, ring, (rows,), device=DEVICE, generator=gen
+            ).int()
+            cache_base = torch.randint(0, ring, (slots,), device=DEVICE, generator=gen).int()
+            is_flush = torch.ones(slots, dtype=torch.int8, device=DEVICE)
+            track_steps = (accept_lens - 1).clone()
+            want = state.clone()
+            gdn_replayssm_commit_cuda.commit(
+                checkpoint_state=want,
+                **caches,
+                state_batch_indices=state_rows,
+                replay_indices=replay_rows,
+                write_pos=write_pos,
+                cache_base=cache_base,
+                is_flush=is_flush,
+                accept_lens=accept_lens,
+                mamba_track_indices=track_rows,
+                mamba_steps_to_track=track_steps,
+                ctas=0,
+            )
+            self.assertFalse(torch.equal(want, state))
+            for ctas in (16, 32, 64):
+                got = state.clone()
+                gdn_replayssm_commit_cuda.commit(
+                    checkpoint_state=got,
+                    **caches,
+                    state_batch_indices=state_rows,
+                    replay_indices=replay_rows,
+                    write_pos=write_pos,
+                    cache_base=cache_base,
+                    is_flush=is_flush,
+                    accept_lens=accept_lens,
+                    mamba_track_indices=track_rows,
+                    mamba_steps_to_track=track_steps,
+                    ctas=ctas,
+                )
+                self.assertTrue(
+                    torch.equal(got.view(torch.int16), want.view(torch.int16)),
+                    f"B{bs} ctas={ctas}",
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
