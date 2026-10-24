@@ -64,6 +64,30 @@ class TestSiluAndMulStaticQuantFP8(unittest.TestCase):
             want, _ = static_quant_fp8(silu_and_mul(x), s)
             self.assertTrue(torch.equal(out.view(torch.uint8), want.view(torch.uint8)))
 
+    def test_down_proj_gemm_takes_the_quantized_rows(self):
+        if not _is_cuda or torch.cuda.get_device_capability()[0] < 9:
+            return
+        from sglang.srt.layers.quantization.fp8_utils import (
+            apply_fp8_linear_bmm_flashinfer,
+        )
+
+        g = torch.Generator(device="cuda").manual_seed(1)
+        rows, inter, hidden = 224, 128, 4096
+        x = (torch.randn(rows, 2 * inter, device="cuda", generator=g) * 2).to(
+            torch.bfloat16
+        )
+        w = (torch.randn(hidden, inter, device="cuda", generator=g) * 0.05).to(
+            torch.float8_e4m3fn
+        )
+        w_s = torch.tensor([0.01], device="cuda")
+        s = torch.tensor([0.02], device="cuda")
+        want = apply_fp8_linear_bmm_flashinfer(silu_and_mul(x), w.t(), w_s, s)
+        got = apply_fp8_linear_bmm_flashinfer(
+            silu_and_mul_static_quant_fp8(x, s), w.t(), w_s, s
+        )
+        self.assertEqual(got.dtype, torch.bfloat16)
+        self.assertTrue(torch.equal(got.view(torch.int16), want.view(torch.int16)))
+
 
 if __name__ == "__main__":
     unittest.main()
