@@ -1741,6 +1741,9 @@ class Envs:
     # PERF-LL step 5a: the megakernel's draft extend writes its top-1 and hidden rows straight
     # into the draft graph runner's input buffers, so the next draft does not copy them.
     SGLANG_PERFLL_STEP5A = EnvBool(False)
+    # PERF-LL step 5a (3), with STEP2=3: a staged draft takes the draft steps' write slots the
+    # post-verify graph staged instead of copying the plan's first columns out of the window.
+    SGLANG_PERFLL_STEP5A_DRAFT_LOCS = EnvBool(False)
     # PERF-LL step 5a (4): the post-verify graph writes the bonus tokens as int64, the dtype the
     # relay and the next draft read, so the deferred relay does not cast them.
     SGLANG_PERFLL_STEP5A_BONUS_I64 = EnvBool(False)
