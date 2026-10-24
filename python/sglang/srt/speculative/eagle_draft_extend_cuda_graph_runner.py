@@ -51,6 +51,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.speculative.draft_checkpoint import refresh_track_indices, track_indices
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
+from sglang.srt.speculative.perfll_step2 import DRAFT_EXTEND_STAGED_INPUTS
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.srt.utils import (
     require_attn_tp_gather,
@@ -65,6 +66,10 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 
 _GRAPH_INPUTS = envs.SGLANG_PERFLL_HOST_GRAPH_INPUTS.get()
+# the inputs the post-verify graph writes in place (SGLANG_PERFLL_RS_D1) stay out of the shared pool
+_PRIVATE_INPUTS = frozenset({"select_index"}) | (
+    DRAFT_EXTEND_STAGED_INPUTS if envs.SGLANG_PERFLL_RS_D1.get() else frozenset()
+)
 
 
 def resolve_draft_extend_seq_len_fill_value(
@@ -304,7 +309,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # decoding owns multiple runners whose select_index buffers all have
         # shape [max_bs]. Sharing by field name and shape would alias those
         # width-specific indices and can make a narrower graph gather OOB.
-        self.buffers.share_buffers(exclude={"select_index"})
+        self.buffers.share_buffers(exclude=_PRIVATE_INPUTS)
         # (raw_bs, field mask) -> (destination views, copy plan); None once refused.
         self._planned_inputs = {}
         # the batch sizes whose graphs run the draft megakernel's draft_extend,
@@ -640,7 +645,15 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             dsts.append(buffers.hidden_states[:num_tokens])
         return dsts, SmallFieldCopyPlan()
 
-    def execute(self, forward_batch: ForwardBatch, select_index: torch.Tensor):
+    def execute(
+        self,
+        forward_batch: ForwardBatch,
+        select_index: torch.Tensor,
+        *,
+        inputs_staged: bool = False,
+    ):
+        """``inputs_staged`` (SGLANG_PERFLL_RS_D1): the post-verify graph already wrote this
+        unpadded batch's inputs, hidden rows included, into the static buffers."""
         assert forward_batch.out_cache_loc is not None
         self.deepep_adapter.replay()
         buffers = self.buffers
@@ -658,6 +671,12 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         else:
             bs = self._pad_to_bucket(raw_bs, self.capture_bs)
 
+        unpadded = bs == raw_bs and bs * self.captured_req_width == num_tokens
+        if inputs_staged and not unpadded:
+            # the padding fill below would clear inputs that this batch's own fields alias
+            raise RuntimeError(
+                "PERF-LL rs-d1: staged draft extend inputs for a padded batch"
+            )
         if bs * self.captured_req_width != num_tokens:
             buffers.seq_lens.fill_(self.seq_len_fill_value)
             buffers.out_cache_loc.zero_()
@@ -669,10 +688,9 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             buffers.num_accept_tokens.fill_(self.captured_req_width)
             buffers.extend_seq_lens.fill_(self.captured_req_width)
 
-        staged = (
+        staged = inputs_staged or (
             _GRAPH_INPUTS
-            and bs == raw_bs
-            and bs * self.captured_req_width == num_tokens
+            and unpadded
             and self._copy_planned_inputs(
                 forward_batch, select_index=select_index, raw_bs=raw_bs
             )

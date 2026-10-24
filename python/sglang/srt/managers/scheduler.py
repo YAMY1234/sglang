@@ -2071,12 +2071,20 @@ class Scheduler(
             self.schedule_stream.wait_stream(self.forward_stream)
 
     def init_perfll_staged_seq_lens(self):
-        """SGLANG_PERFLL_STEP5A_SEQ_LENS: a staged pass's lengths from the post-verify graph."""
+        """SGLANG_PERFLL_STEP5A_SEQ_LENS: a staged pass's lengths from the post-verify graph;
+        SGLANG_PERFLL_RS_D1: the FutureMap buffer the post-verify graph publishes them to."""
         self._perfll_staged_seq_lens = (
             getattr(self.draft_worker, "take_staged_seq_lens", None)
             if envs.SGLANG_PERFLL_STEP5A_SEQ_LENS.get()
             else None
         )
+        bind_publish = (
+            getattr(self.draft_worker, "bind_perfll_publish", None)
+            if envs.SGLANG_PERFLL_RS_D1.get()
+            else None
+        )
+        if bind_publish is not None:
+            bind_publish(new_seq_lens_buf=self.future_map.new_seq_lens_buf)
 
     def _join_schedule_stream(self, batch: ScheduleBatch, staged_seq_lens) -> None:
         """Order the forward after the schedule stream's work since the last join, and with it
