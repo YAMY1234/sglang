@@ -1538,7 +1538,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
         """SGLANG_PERFLL_STEP5A_SEQ_LENS, before the scheduler resolves a decode pass's lengths:
         for a pass that takes its staged draft inputs (STEP2=3), the lengths the previous pass
         published, which its post-verify graph wrote; None otherwise."""
-        if not self._step2_uses_staged:
+        # a prefill reusing the last decode pass's request slots matches its note too
+        if not self._step2_uses_staged or not batch.forward_mode.is_decode():
             return None
         return self._step2.take_seq_lens(batch, sched_idle=batch.perfll_sched_idle)
 
