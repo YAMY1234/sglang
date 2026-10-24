@@ -1436,6 +1436,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
         draft_runner = self._draft_worker.cuda_graph_runner
         if mode < 1 or draft_runner is None:
             return
+        if mode >= 2 and self._draft_worker.draft_runner.kv_index_translator.is_translating:
+            # the staging writes virtual KV ids; a translating draft pool indexes physical ones
+            logger.warning("PERF-LL step2: the draft's KV ids are translated; counting only")
+            mode = 1
         stages = mode >= 2 and self._post_verify_graphs is not None
         self._step2 = Step2Counter(
             width=self.speculative_num_draft_tokens,
