@@ -6,11 +6,13 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocation_sizing import (
     get_alloc_len_per_decode,
     get_alloc_reserve_per_decode,
 )
 from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.perfll_step2 import NextDraft, Step2Check, Step2Counter
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -18,14 +20,24 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
+def _req(slot: int, allocated: int, committed: int) -> Req:
+    sp = SamplingParams(max_new_tokens=16, temperature=0)
+    sp.normalize(None)
+    req = Req(
+        rid=f"r{slot}",
+        origin_input_text="",
+        origin_input_ids=[1, 2, 3],
+        sampling_params=sp,
+    )
+    req.kv.req_pool_idx = slot
+    req.kv.kv_committed_len = committed
+    req.kv.kv_allocated_len = allocated
+    return req
+
+
 def _batch(slots, allocated, committed=100):
-    reqs = [
-        SimpleNamespace(
-            req_pool_idx=slot,
-            kv=SimpleNamespace(kv_allocated_len=alloc, kv_committed_len=committed),
-        )
-        for slot, alloc in zip(slots, allocated)
-    ]
+    """A decode batch of real Req objects (the scheduler's request type)."""
+    reqs = [_req(slot, alloc, committed) for slot, alloc in zip(slots, allocated)]
     return SimpleNamespace(reqs=reqs)
 
 
@@ -35,6 +47,8 @@ class TestPerfllStep2(CustomTestCase):
         counter.note_extend(batch)
 
     def test_a_decode_pass_is_staged_only_after_the_same_unpadded_allocated_batch(self):
+        """On the scheduler's Req (slot and lengths under req.kv); reading a field Req does not
+        have crashed every rank of the first serving run."""
         counter = Step2Counter(width=7, graph_sizes=[1, 2, 4])
         whole = 100 + 21  # committed + three windows
         self._pass(counter, _batch([5, 9], [whole, whole]))
