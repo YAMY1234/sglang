@@ -632,12 +632,15 @@ def _cp_merge_h_ll(
     QL: tl.constexpr, HQ: tl.constexpr, CP: tl.constexpr, D: tl.constexpr, PG: tl.constexpr, NWP: tl.constexpr,
     NB: tl.constexpr, GMAX: tl.constexpr, WAIT: tl.constexpr,
     po_v=None, pl_v=None, vstart=None, vcnt=None, CHUNK: tl.constexpr = False,
+    gate=None, g_stride=0, scale=None, out8=None, o8_stride=0, EPI: tl.constexpr = False,
 ):
     """_cp_a2a_merge_ll (gated) with one program per (row, head): pushes the head's partials, computes its causal
     block, then merges the CP partials as they arrive. One epoch per (row, head) in cnt, in an LL region of its own
     (the row merge's epochs differ). WAIT: launched as a programmatic dependent.
     CHUNK (PERF-LB cp3, fold layout): a request with chunk rows sends the base-2 LSE combine of its rows' partials
-    (po_v [nv, QL * CP * HQ, D] bf16, pl_v [nv, QL * CP * HQ] fp32) instead of po / plse."""
+    (po_v [nv, QL * CP * HQ, D] bf16, pl_v [nv, QL * CP * HQ] fp32) instead of po / plse.
+    EPI: also out8 = fp8(bf16(out * sigmoid(gate)) / scale), the attention output gate and o_proj's static FP8
+    input quantization as the separate gate_quant launch computes them."""
     i = tl.program_id(0)
     h = tl.program_id(1)
     if WAIT:
@@ -711,7 +714,14 @@ def _cp_merge_h_ll(
         wsum = wsum * a_old + a_new
         m = mn
     o = acc / tl.where(wsum > 0, wsum, 1.0)
-    tl.store(out + i * out_stride + h * D + tl.arange(0, D), o.to(tl.bfloat16))
+    ob = o.to(tl.bfloat16)
+    tl.store(out + i * out_stride + h * D + tl.arange(0, D), ob)
+    if EPI:
+        dd = tl.arange(0, D)
+        g = tl.load(gate + i * g_stride + h * D + dd).to(tl.float32)
+        y = (ob.to(tl.float32) * tl.sigmoid(g)).to(tl.bfloat16).to(tl.float32)
+        s_inv = 1.0 / tl.load(scale).to(tl.float32)
+        tl.store(out8 + i * o8_stride + h * D + dd, tl.clamp(y * s_inv, -448.0, 448.0).to(tl.float8e4nv))
     tl.store(cnt + i * HQ + h + one, e)
 
 
@@ -749,6 +759,10 @@ class CpLite:
         self.llp_off = self.llq_off + _MAX_ROWS * cp * (q_heads * HEAD_DIM // 4) * 8
         total = self.llp_off + _MAX_ROWS * cp * _LL_PWORDS * 8
         self.cp_ungated = envs.SGLANG_TRTL18_CP_UNGATED.get()
+        # SGLANG_PSM_CP_GATE_EPILOGUE: (gate, scale, out8) the caller offered for its next call; whether it was written
+        self.gate_epi = envs.SGLANG_PSM_CP_GATE_EPILOGUE.get()
+        self._epi = None
+        self._epi_done = False
         self.merge_h = envs.SGLANG_TRTL18_CP_MAIN.get() and envs.SGLANG_TRTL18_CP_MERGE_H.get()
         self.llh_off = total
         self.fold_mh = envs.SGLANG_PLB_CP_FOLD_MH.get()
@@ -823,6 +837,19 @@ class CpLite:
             "TRT-L1 CP-lite KV gate: min KV per request %s (%s of the batch)",
             self.min_kv or "off", "max" if self.gate_max else "mean",
         )
+
+    def offer_gate_epilogue(self, gate: torch.Tensor, scale: torch.Tensor, out8: torch.Tensor) -> None:
+        """SGLANG_PSM_CP_GATE_EPILOGUE: the caller's attention output gate [rows, heads * D] (bf16, rows contiguous)
+        and o_proj's static FP8 input scale; the next call, if it is an ungated exact one, also writes
+        out8 = fp8(bf16(out * sigmoid(gate)) / scale) in its merge. take_gate_epilogue() tells whether it did."""
+        self._epi = (gate, scale, out8) if self.gate_epi else None
+        self._epi_done = False
+
+    def take_gate_epilogue(self) -> bool:
+        """Whether the last call wrote the offered gate epilogue (then the caller skips its own launch)."""
+        done = self._epi_done
+        self._epi, self._epi_done = None, False
+        return done
 
     def set_gate(self, min_kv: Optional[int]):
         """Tests: one threshold for every batch size (None: no gate)."""
@@ -1086,21 +1113,33 @@ class CpLite:
         self._exact_partial(k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale,
                             pdl=True, len_sub=q_len)
         out = torch.empty(rows, self.hq, HEAD_DIM, dtype=torch.bfloat16, device=self.device)
+        epi = self._epi
+        if epi is not None and not (epi[0].shape[0] == rows and epi[0].shape[1] == self.hq * HEAD_DIM
+                                    and epi[0].stride(1) == 1 and epi[2].stride(1) == 1):
+            epi = None
         self._merge_h(q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale, out,
-                      dict(gate, thr=0), pdl=True)
+                      dict(gate, thr=0), pdl=True, epi=epi)
+        if epi is not None:
+            self._epi_done = True
+            if ("epi", rows) not in self._logged:
+                self._logged.add(("epi", rows))
+                logger.info("PERF-SM CP-lite: the merge writes the attention gate and o_proj's FP8 input at %d rows",
+                            rows)
         return out
 
     def _merge_h(self, q, k_cache, v_cache, page_table, seq_lens, q_len, rows, bmm1_scale, bmm2_scale, out, gate,
-                 pdl=None):
+                 pdl=None, epi=None):
         pdl = self.cp_pdl if pdl is None else pdl
         hq = self.hq
+        ek = {} if epi is None else dict(gate=epi[0], g_stride=epi[0].stride(0), scale=epi[1], out8=epi[2],
+                                         o8_stride=epi[2].stride(0), EPI=True)
         _cp_merge_h_ll[(rows, hq)](
             self.po_x.view(torch.int32), self.pl_x.view(torch.int32), hq * HEAD_DIM // 2, self.po_x.stride(0) // 2,
             hq, self.pl_x.stride(0), q, q.stride(0), k_cache, v_cache, k_cache.stride(0), k_cache.stride(2),
             page_table, page_table.stride(0), seq_lens, out, out.stride(0), self.peers, self.me, self.llh_off,
             self.cnt_h, bmm1_scale, bmm2_scale, gate["nb"], gate["thr"],
             QL=q_len, HQ=hq, CP=self.cp, D=HEAD_DIM, PG=PAGE, NWP=_LL_PWORDS, NB=gate["NB"], GMAX=gate["GMAX"],
-            WAIT=pdl, num_warps=4, launch_pdl=pdl,
+            WAIT=pdl, num_warps=4, launch_pdl=pdl, **ek,
         )
 
     def _own_workspace(self):
