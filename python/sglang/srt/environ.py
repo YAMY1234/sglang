@@ -1772,6 +1772,10 @@ class Envs:
     # rows copied on a branch beside the accept chain) and the FutureMap's new lengths, so
     # neither the extend's input copy nor the publish launches after the graph.
     SGLANG_PERFLL_RS_D1 = EnvBool(False)
+    # The largest batch size SGLANG_PERFLL_RS_D1 serves (0: every size the draft extend graph
+    # replays unpadded). Above it the extend starts no earlier than today: at B8 an earlier start
+    # only overlaps more of the side-stream mamba commit (perfll-rsd1 368968).
+    SGLANG_PERFLL_RS_D1_MAX_BS = EnvInt(0)
     # Debug for SGLANG_PERFLL_RS_D1, run only while this file exists (polled while the scheduler
     # is idle): a pass that takes the written inputs also builds them the old way and counts
     # the passes where the extend runner's inputs or the published lengths differ.
