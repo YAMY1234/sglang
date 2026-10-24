@@ -126,6 +126,8 @@ class DPBudget:
         self.last_timestamp = [0.0] * num_dp_ranks
         self.max_running = [0] * num_dp_ranks
         self.tokens_capped = envs.SGLANG_PERFHT_DP_TOKENS_CAPPED.get()
+        self.cap_running_only = envs.SGLANG_PERFHT_DP_CAP_RUNNING_ONLY.get()
+        self.running = [0] * num_dp_ranks
         self.request_weight = envs.SGLANG_PERFHT_DP_REQUEST_TOKENS.get()
 
     def update_budget(self, loads):
@@ -134,6 +136,7 @@ class DPBudget:
             if load.timestamp == self.last_timestamp[load.dp_rank]:
                 continue
             self.last_timestamp[load.dp_rank] = load.timestamp
+            self.running[load.dp_rank] = load.num_running_reqs
             self.total_requests[load.dp_rank] = (
                 load.num_running_reqs + load.num_waiting_reqs
             )
@@ -154,7 +157,8 @@ class DPBudget:
                     "SGLANG_PERFHT_DP_TOKENS_CAPPED: request weight %d tokens, running caps %s, requests %s, tokens %s",
                     self.request_weight, self.max_running, self.total_requests, self.total_tokens,
                 )
-            open_ranks = [i for i in ranks if self.total_requests[i] < self.max_running[i]]
+            occupied = self.running if self.cap_running_only else self.total_requests
+            open_ranks = [i for i in ranks if occupied[i] < self.max_running[i]]
             if open_ranks:
                 target_rank = min(
                     open_ranks,
@@ -232,6 +236,8 @@ class DataParallelController:
             envs.SGLANG_PERFHT_DP_REQUEST_TOKENS.get(),
             envs.SGLANG_PERFHT_DP_IGNORE_ROUTED.get(),
         )
+        if envs.SGLANG_PERFHT_DP_CAP_RUNNING_ONLY.get():
+            logger.info("PERFHT DP placement: the running cap counts running requests only")
         self.refresh_load_budget_on_dispatch = self.load_balance_method in (
             LoadBalanceMethod.TOTAL_REQUESTS,
             LoadBalanceMethod.TOTAL_TOKENS,
