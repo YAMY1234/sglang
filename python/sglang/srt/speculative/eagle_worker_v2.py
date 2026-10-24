@@ -1464,6 +1464,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
             if mode == 2:
                 self._step2.check = Step2Check(self.device)
         self._step2_uses_staged = stages and mode >= 3
+        if self._step2_uses_staged and envs.SGLANG_PERFLL_STEP5A_SEQ_LENS.get():
+            logger.info("PERF-LL step5a: a staged pass takes the post-verify graph's lengths")
+        if self._step2_uses_staged and envs.SGLANG_PERFLL_STEP5A_DRAFT_LOCS.get():
+            logger.info("PERF-LL step5a: a staged draft takes the staged draft write slots")
 
     def take_staged_seq_lens(self, batch: ScheduleBatch) -> Optional[torch.Tensor]:
         """SGLANG_PERFLL_STEP5A_SEQ_LENS, before the scheduler resolves a decode pass's lengths:
