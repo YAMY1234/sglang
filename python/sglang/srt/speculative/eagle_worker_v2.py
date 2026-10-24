@@ -169,8 +169,10 @@ def _qsa_index_share_requested(hf_config) -> bool:
 
 
 class EagleDraftWorker(EagleDraftWorkerBase):
-    # SGLANG_PERFLL_STEP2 >= 2: (check, staged inputs) for the next draft to compare with
+    # SGLANG_PERFLL_STEP2 >= 2: (check, staged inputs) for the next draft to compare with;
+    # 3: the staged inputs the next draft takes
     step2_check = None
+    step2_staged = None
 
     # SGLang's side of the megakernel's EAGLE entries when it offers one
     # (init_attention_backends sets it); a class default, since unit-test harnesses
@@ -634,6 +636,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
     def draft(self, batch: ScheduleBatch, *, with_topology: bool = False):
         draft_input: EagleDraftInput = batch.spec_info
+        staged, self.step2_staged = self.step2_staged, None
         forward_batch, can_run_decode_cuda_graph, kv_loc_plan = prepare_for_draft(
             draft_input,
             self.req_to_token_pool,
@@ -644,7 +647,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.speculative_num_steps,
             target_translator=self.target_worker.model_runner.kv_index_translator,
             num_draft_tokens=self.speculative_num_draft_tokens,
+            staged=staged,
         )
+        # prepare_for_draft took the staging only when it still fits this batch
+        staged = staged if staged is not None and batch.out_cache_loc is staged.window else None
         if host_trace.ENABLED:
             host_trace.mark(host_trace.PD1)
         if self.step2_check is not None:
@@ -690,7 +696,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # Run draft
             if can_run_decode_cuda_graph:
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
-                    self.cuda_graph_runner.execute(forward_batch)
+                    self.cuda_graph_runner.execute(forward_batch, inputs_staged=True)
+                    if staged is not None
+                    else self.cuda_graph_runner.execute(forward_batch)
                 )
                 if host_trace.ENABLED:
                     host_trace.gpu_mark(host_trace.DRAFTG)
@@ -1316,6 +1324,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
     _simulated_acc_len_rng: Optional[torch.Generator] = None
     # SGLANG_PERFLL_STEP2: counts the decode passes whose draft inputs could be staged
     _step2: Optional[Step2Counter] = None
+    _step2_uses_staged = False
 
     def __init__(
         self,
@@ -1428,8 +1437,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 seq_len_fill_value=draft_runner.seq_len_fill_value,
                 mrope=self._draft_worker.draft_runner.model_config.model_is_mrope,
                 req_to_token=self.req_to_token_pool.req_to_token,
+                runner_buffers=draft_runner.buffers if mode >= 3 else None,
             )
-            self._step2.check = Step2Check(self.device)
+            if mode == 2:
+                self._step2.check = Step2Check(self.device)
+        self._step2_uses_staged = stages and mode >= 3
 
     def _init_post_verify_graphs(self) -> None:
         # A key is captured at its first rounds, which attention-DP ranks do not reach
@@ -1555,6 +1567,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         staged = self._step2.count_draft(batch)
                         if staged is not None and self._step2.check is not None:
                             self.draft_worker.step2_check = (self._step2.check, staged)
+                        if staged is not None and self._step2_uses_staged:
+                            self.draft_worker.step2_staged = staged
                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
                     if host_trace.ENABLED:
                         host_trace.gpu_mark(host_trace.DRAFT1)
