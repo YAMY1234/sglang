@@ -35,6 +35,8 @@ _SHARDED_VERIFY = envs.SGLANG_Q35MF_SHARDED_VERIFY.get()
 _SIM_PREDRAW = envs.SGLANG_PERFLL_HOST_SIM_PREDRAW.get()
 # SGLANG_PERFLL_STEP5A_BONUS_I64: the bonus tokens in the dtype the relay and the next draft read
 _BONUS_DTYPE = torch.int64 if envs.SGLANG_PERFLL_STEP5A_BONUS_I64.get() else torch.int32
+# SGLANG_PERFLL_STEP5A_SEQ_LENS: a batch's lengths may be a slot's new_seq_lens output
+_STAGED_SEQ_LENS = envs.SGLANG_PERFLL_STEP5A_SEQ_LENS.get()
 
 
 def simulated_acc_len_generator(seed: int) -> torch.Generator:
@@ -370,6 +372,8 @@ class _PostVerifyGraphs:
         if host_trace.ENABLED:
             host_trace.mark(host_trace.PVB)
         slot = state.slots[turn]
+        if _STAGED_SEQ_LENS and slot is not None and slot.graph is not None:
+            _check_lengths_outlive(slot, inputs["seq_lens"])
         if slot is None:
             staged = {name: src.clone() for name, src in inputs.items()}
             if sim_len is not None:
@@ -499,6 +503,17 @@ class _PostVerifyGraphs:
         logger.info(
             "Captured the EAGLE post-verify graphs for batch size %d",
             slot.num_requests,
+        )
+
+
+def _check_lengths_outlive(slot: SimpleNamespace, seq_lens: torch.Tensor) -> None:
+    """A batch's lengths taken from a slot's new_seq_lens (SGLANG_PERFLL_STEP5A_SEQ_LENS) are
+    read through the whole next round, so that slot's replay must not be the one about to run:
+    the slots alternate, and the lengths are retaken from the other slot every round."""
+    if seq_lens.data_ptr() == slot.outputs[3].data_ptr():
+        raise RuntimeError(
+            "PERF-LL step5a: the post-verify slot about to replay holds this batch's "
+            "lengths; its readers in this round would see the overwrite"
         )
 
 
