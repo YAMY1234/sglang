@@ -14,6 +14,7 @@ from sglang.kernels.ops.speculative.eagle import (
     prepare_draft_extend_lengths,
     prepare_verify_commit_outputs,
 )
+from sglang.srt.disaggregation import l16_loopstat
 from sglang.srt.environ import envs
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -657,6 +658,8 @@ def run_eagle_verify(
       the front of each per-req block for topk > 1; multi-layer has never run
       this compaction.
     """
+    sub = l16_loopstat.SUB
+    t0 = l16_loopstat._now() if sub is not None else 0
     fwd_stream = torch.get_device_module(device).current_stream()
     verify_input: EagleVerifyInput = batch.spec_info
     record_stream_for_v2_verify(batch, verify_input, fwd_stream)
@@ -738,6 +741,9 @@ def run_eagle_verify(
         if not _is_npu or can_run_cuda_graph:
             verify_forward_batch.mark_forward_metadata_ready()
 
+    if sub is not None:
+        sub.add("rb_vp", t0)
+        t0 = l16_loopstat._now()
     # Run target verify batch in the main compute stream (GPU compute).
     # Metadata init is skipped iff cuda-graph already ran load_batch —
     # eagle_prepare_for_verify marked the batch in exactly that case; the
@@ -751,6 +757,9 @@ def run_eagle_verify(
     )
     if host_trace.ENABLED:
         host_trace.mark(host_trace.VF1)
+    if sub is not None:
+        sub.add("rb_vf", t0)
+        t0 = l16_loopstat._now()
     logits_output = forward_batch_output.logits_output
 
     clear_unaccepted_c128 = getattr(
@@ -777,6 +786,8 @@ def run_eagle_verify(
             compute_spec_logprobs(
                 batch, logits_output, predict, accept_index=accept_index
             )
+        if sub is not None:
+            sub.add("rb_pv", t0)
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=predict,
@@ -914,6 +925,8 @@ def run_eagle_verify(
         )
 
     next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
+    if sub is not None:
+        sub.add("rb_pv", t0)
 
     # verify_forward_batch transitively holds verify-time GPU tensors
     # (draft_token / out_cache_loc / ...) that must outlive the imminent

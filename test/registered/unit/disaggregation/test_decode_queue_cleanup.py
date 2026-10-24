@@ -1,8 +1,12 @@
+import gc
+import os
+import tempfile
 import unittest
 from concurrent.futures import Future
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
+from sglang.srt.disaggregation import l16_loopstat
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.common.conn import KVTransferError
 from sglang.srt.disaggregation.decode import (
@@ -18,15 +22,17 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     poll_and_all_reduce_with_staging,
 )
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.separate_buffer_allocator_double import (
     bind_separate_buffer_capacity,
 )
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -688,6 +694,255 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
         self.assertEqual(queue.queue, [decode_req])
         mock_prepare_abort.assert_not_called()
         mock_release_kv_cache.assert_not_called()
+
+
+class _VirtualClock:
+    """perf_counter_ns for the loopstat tests: the mocked stages advance it; a read moves it by tick_us."""
+
+    def __init__(self):
+        self.ns = 10**9
+        self.tick_us = 0
+
+    def __call__(self):
+        self.ns += self.tick_us * 1000
+        return self.ns
+
+    def step(self, us):
+        self.ns += us * 1000
+
+
+class _SplitReq(SimpleNamespace):
+    def finished(self):
+        return self.done
+
+
+class _SplitBatch:
+    def __init__(self, clock, reqs):
+        self.clock, self.reqs, self.batch_is_full = clock, list(reqs), False
+
+    def batch_size(self):
+        return len(self.reqs)
+
+    def is_empty(self):
+        return not self.reqs
+
+    def copy(self):
+        return self
+
+    def process_prebuilt(self, future_map):
+        self.clock.step(200)
+
+    def filter_batch(self, reqs_to_exclude=None):
+        # update_running_batch's filter costs 30 us, the prebuilt batch's own filter nothing
+        if reqs_to_exclude is not None:
+            self.clock.step(30)
+        self.reqs = [r for r in self.reqs if not r.finished()]
+
+    def merge_batch(self, other):
+        self.clock.step(40)
+        self.reqs = self.reqs + other.reqs
+
+    def check_decode_mem(self):
+        self.clock.step(20)
+        return True
+
+    def prepare_for_decode(self):
+        self.clock.step(100)
+
+
+class _NoCudaEvent:
+    def record(self, stream=None):
+        pass
+
+    def query(self):
+        return True
+
+    def elapsed_time(self, other):
+        return 1.0
+
+
+class TestPlbLoopstatSplit(CustomTestCase):
+    """SGLANG_PLB_LOOPSTAT_SPLIT: the loopstat CSV keeps its fixed columns (offline tools read them by name); on,
+    each row appends the nb / rb sub-stages, whose remainders close each stage, and an idle iteration drops them."""
+
+    FIXED = (
+        "it,t_ms,fct,B,gbs,nnew,npa,npre,nxfer,nwait,idle,ar_n,knob,mode,pf,in,pq,pq_rel,pq_res,pp,pp_rs,pp_hs,"
+        "pp_alloc,pp_send,px,px_poll,ar,nb,rb,prw,pr,smp"
+    )
+    SPLIT = (
+        "nadm,nflt,pvm,nb_new,nb_pb,nb_res,nb_mrg,nb_flt,nb_mem,nb_pfd,nb_fl,nb_oth,rb_sl,rb_fi,rb_dp,rb_dg,rb_vp,"
+        "rb_vf,rb_pv,rb_ex,rb_out,rb_oth,nb_cpu,rb_cpu,gc"
+    )
+
+    def _open_stat(self, split, clock):
+        # a split LoopStat registers a GC callback for the process lifetime
+        self.addCleanup(gc.callbacks.__delitem__, slice(len(gc.callbacks), None))
+        out_dir = enter_scope(self, tempfile.TemporaryDirectory())
+        for scope in (
+            published_topology(role="scheduler"),
+            patch.dict(os.environ, {"SGLANG_TRTL16_LOOPSTAT": out_dir}),
+            envs.SGLANG_PLB_LOOPSTAT_SPLIT.override(split),
+            patch.object(l16_loopstat, "_now", clock),
+            patch.object(l16_loopstat, "STAT", None),
+            patch.object(l16_loopstat, "SUB", None),
+            patch.object(l16_loopstat.LoopStat, "_ev", lambda self: _NoCudaEvent()),
+        ):
+            enter_scope(self, scope)
+
+    def _rows(self, stat, clock):
+        stat._flush(clock.ns)
+        for f in (stat.f, stat.fg, stat.ft):
+            f.close()
+        with open(stat.f.name) as f:
+            return f.read().splitlines()
+
+    def run_loop(self, split):
+        """The real overlap loop with nb, update_running_batch and process_decode_queue: iteration 1 is idle, 2 admits
+        a and b, 3 drops the finished a, 4 admits c. Every mocked step advances the virtual clock by a fixed cost."""
+        clock = _VirtualClock()
+        self._open_stat(split, clock)
+        state = SimpleNamespace(it=0)
+        reqs = {rid: _SplitReq(rid=rid, done=False) for rid in "abc"}
+        arrivals = {2: "ab", 4: "c"}
+
+        def ingest_requests():
+            if state.it == 4:
+                raise StopIteration
+            state.it += 1
+            reqs["a"].done = state.it >= 3
+
+        def new_prebuilt_batch(running_batch):
+            if not sched.waiting_queue:
+                clock.step(10)
+                return None
+            clock.step(300)
+            batch, sched.waiting_queue = _SplitBatch(clock, sched.waiting_queue), []
+            return batch
+
+        def run_batch(batch):
+            sched.forward_ct += 1
+            clock.step(5000)
+            return GenerationBatchResult()
+
+        sched = Scheduler.__new__(Scheduler)
+        sched.gracefully_exit = False
+        sched._engine_paused = False
+        sched.enable_decode_hicache = False
+        sched.enable_hisparse = False
+        sched.enable_skip_finishing_decode = False
+        sched.scheduler_stage_metrics = None
+        sched.chunked_req = None
+        sched.kv_checksum_computer = None
+        sched.future_map = None
+        sched.forward_stream = None
+        sched.forward_ct = 0
+        sched.server_args = SimpleNamespace(cuda_graph_bs_decode=[1, 2, 4, 8])
+        sched.waiting_queue = []
+        sched.running_batch = _SplitBatch(clock, [])
+        sched.disagg_decode_prealloc_queue = SimpleNamespace(
+            prefetch_prefill_dp_rank_queries=Mock(),
+            flush_deferred_sends=Mock(),
+            resume_retracted_reqs=Mock(return_value=[]),
+            retracted_queue=[],
+            pop_preallocated=Mock(return_value=([], [])),
+            queue=[],
+        )
+        sched.disagg_decode_transfer_queue = SimpleNamespace(
+            resolve_deferred_releases=Mock(),
+            extend=Mock(),
+            pop_transferred=lambda: [reqs[r] for r in arrivals.get(state.it, "")],
+            staging_handler=SimpleNamespace(
+                plb_defer=True, plb_flush=lambda stream: clock.step(70)
+            ),
+            queue=[],
+        )
+        sched.ingest_requests = ingest_requests
+        sched._record_scheduler_state_for_paused_engine = Mock()
+        sched._get_new_prebuilt_batch = new_prebuilt_batch
+        sched.batch_result_processor = SimpleNamespace(
+            process_batch_result_prebuilt=lambda batch: clock.step(50)
+        )
+        sched.new_token_ratio_tracker = SimpleNamespace(decay_step=Mock())
+        sched.dp_attn_adapter = SimpleNamespace(
+            maybe_prepare_mlp_sync_batch=lambda batch: batch
+        )
+        sched.ngram_embedding_manager = SimpleNamespace(
+            prepare_for_forward=lambda batch, chunked_req: batch
+        )
+        sched.is_disable_overlap_for_batch = lambda batch, last_batch: bool(
+            clock.step(5)
+        )
+        sched._apply_war_barrier = lambda: clock.step(15)
+        sched.run_batch = run_batch
+        sched.process_batch_result = lambda batch, result: clock.step(400)
+        sched.launch_batch_sample_if_needed = Mock()
+        sched.on_idle = Mock()
+        with self.assertRaises(StopIteration):
+            Scheduler.event_loop_overlap_disagg_decode(sched)
+        return self._rows(l16_loopstat.STAT, clock)
+
+    def test_split_columns_follow_the_fixed_ones(self):
+        off, on = self.run_loop(False), self.run_loop(True)
+        n = len(self.FIXED.split(","))
+        self.assertEqual(off[0], self.FIXED)
+        self.assertEqual(on[0], self.FIXED + "," + self.SPLIT)
+        # the switch leaves every fixed field of every row as it was
+        self.assertEqual(
+            [r.split(",") for r in off[1:]], [r.split(",")[:n] for r in on[1:]]
+        )
+        fixed = [dict(zip(self.FIXED.split(","), r.split(","))) for r in off[1:]]
+        self.assertEqual(
+            [
+                tuple(int(d[k]) for k in ("B", "nnew", "idle", "nb", "rb", "pr"))
+                for d in fixed
+            ],
+            [
+                (2, 2, 1, 775, 5015, 0),
+                (1, 0, 0, 235, 5015, 400),
+                (2, 1, 0, 815, 5015, 400),
+            ],
+        )
+        split = [
+            dict(zip(self.SPLIT.split(","), map(int, r.split(",")[n:]))) for r in on[1:]
+        ]
+        for row in split:
+            self.assertGreaterEqual(row.pop("nb_cpu"), 0)
+            self.assertGreaterEqual(row.pop("rb_cpu"), 0)
+        same = dict.fromkeys(
+            "rb_sl rb_fi rb_dp rb_dg rb_vp rb_vf rb_pv rb_ex".split(), 0
+        )
+        same.update(nb_flt=30, nb_mem=20, nb_pfd=100, nb_fl=70, nb_oth=5)
+        same.update(rb_out=15, rb_oth=5000, gc=0, pvm=0)
+        # the idle iteration's nb_new (10) and nb_fl (70) must not reach the next row
+        self.assertEqual(
+            split,
+            [
+                dict(same, nadm=2, nflt=0, nb_new=300, nb_pb=200, nb_res=50, nb_mrg=0),
+                dict(same, nadm=0, nflt=1, nb_new=10, nb_pb=0, nb_res=0, nb_mrg=0),
+                dict(same, nadm=1, nflt=0, nb_new=300, nb_pb=200, nb_res=50, nb_mrg=40),
+            ],
+        )
+
+    def test_gc_pause_lands_in_its_row(self):
+        """A collection during a row counts in that row's gc column; an idle iteration drops its own."""
+        clock = _VirtualClock()
+        self._open_stat(True, clock)
+        sched = SimpleNamespace(
+            server_args=SimpleNamespace(cuda_graph_bs_decode=[1, 2]), forward_ct=0
+        )
+        stat = l16_loopstat.init(sched)
+        batch = _SplitBatch(clock, [_SplitReq(rid="a", done=False)])
+        for collect, idle in ((True, False), (True, True), (False, False)):
+            stat.begin()
+            if collect:
+                # each clock read inside the collection (its start and stop) moves 3 us
+                clock.tick_us = 3
+                gc.collect()
+                clock.tick_us = 0
+            stat.mark("pf")
+            stat.end(None if idle else batch)
+        rows = self._rows(stat, clock)
+        self.assertEqual([int(r.split(",")[-1]) for r in rows[1:]], [3, 0])
 
 
 if __name__ == "__main__":

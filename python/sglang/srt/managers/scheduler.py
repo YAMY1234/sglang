@@ -4526,10 +4526,15 @@ class Scheduler(
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the running decoding batch in place; None skips decode this step."""
+        sub = l16_loopstat.SUB
+        t0 = l16_loopstat._now() if sub is not None else 0
         initial_bs = batch.batch_size()
 
         finishing_reqs = self._reqs_finishing_inflight(batch)
         batch.filter_batch(reqs_to_exclude=finishing_reqs)
+        if sub is not None:
+            sub.add("nb_flt", t0)
+            t0 = l16_loopstat._now()
         if batch.is_empty():
             batch.batch_is_full = False
             return batch
@@ -4615,8 +4620,13 @@ class Scheduler(
         if batch.is_empty():
             return batch
 
+        if sub is not None:
+            sub.add("nb_mem", t0)
+            t0 = l16_loopstat._now()
         # Update batch tensors
         batch.prepare_for_decode()
+        if sub is not None:
+            sub.add("nb_pfd", t0)
         return batch
 
     def record_batch_in_overlap(self, batch: ScheduleBatch):
@@ -4739,6 +4749,8 @@ class Scheduler(
                     and self._confidence_budget_prepare is None
                     and not getattr(self.future_map, "needs_cpu_seq_lens", True)
                 )
+                sub = l16_loopstat.SUB
+                t0 = l16_loopstat._now() if sub is not None else 0
                 staged_seq_lens = (
                     self._perfll_staged_seq_lens(batch)
                     if self._perfll_staged_seq_lens is not None and not gpu_only_lens
@@ -4752,6 +4764,9 @@ class Scheduler(
                     self._confidence_budget_prepare(batch, self.future_map)
                 if host_trace.ENABLED:
                     host_trace.mark(host_trace.RB2)
+                if sub is not None:
+                    sub.add("rb_sl", t0)
+                    t0 = l16_loopstat._now()
 
                 with self.forward_stream_ctx:
                     self._join_schedule_stream(batch, staged_seq_lens)
@@ -4772,6 +4787,8 @@ class Scheduler(
                     with self._forward_isolation(batch, overlap=True):
                         if host_trace.ENABLED:
                             host_trace.mark(host_trace.RB5)
+                        if sub is not None:
+                            sub.add("rb_fi", t0)
                         future_indices = batch.req_pool_indices
 
                         # Spec_v2 fires on_publish mid-worker (between verify and
@@ -4799,6 +4816,7 @@ class Scheduler(
                         )
                         if host_trace.ENABLED:
                             host_trace.mark(host_trace.WRK1)
+                        t0 = l16_loopstat._now() if sub is not None else 0
                         if batch.spec_algorithm.is_none():
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
                         # Park any refs the worker wants kept alive 2 iters
@@ -4857,6 +4875,8 @@ class Scheduler(
                         batch.spec_info.dsa_topk_indices is not None
                     )
                     batch.spec_info.future_indices = future_indices
+                if sub is not None:
+                    sub.add("rb_out", t0)
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 resolve_forward_inputs(batch, self.future_map)
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)

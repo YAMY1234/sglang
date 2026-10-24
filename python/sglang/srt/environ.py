@@ -1658,6 +1658,9 @@ class Envs:
     # D2H on the schedule stream waits for the in-flight forward (the stream is fenced
     # on it) and stalls the overlap loop.
     SGLANG_TRTL16_PREALLOC_NO_SYNC = EnvBool(False)
+    # PERF-LB: with SGLANG_TRTL16_LOOPSTAT, append nb / rb sub-stage columns (host clock only), the requests
+    # admitted / dropped and the post-verify graph mode to each loopstat row. Off, the CSV is unchanged.
+    SGLANG_PLB_LOOPSTAT_SPLIT = EnvBool(False)
     # The Qwen3.5 MTP draft's BF16 FlashInfer TRTLLM experts may leave their finalize to
     # the caller (the megakernel plugin's draft hop, slot draft_fin).
     SGLANG_Q35_DRAFT_BF16_DEFERRED_FINALIZE = EnvBool(False)

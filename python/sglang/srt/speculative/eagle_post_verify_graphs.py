@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 import torch
 
 from sglang.kernels.ops.memory.small_field_copy import SmallFieldCopyPlan
+from sglang.srt.disaggregation import l16_loopstat
 from sglang.srt.environ import envs
 from sglang.srt.speculative import perfll_step2
 from sglang.srt.utils import host_trace
@@ -362,9 +363,12 @@ class _PostVerifyGraphs:
     def run(
         self, *, key: tuple, inputs: dict, make_slot: Callable, sim_max_len: int
     ) -> Optional[tuple]:
+        sub = l16_loopstat.SUB
         state = self._states.get(key)
         if state is None:
             if len(self._states) >= _MAX_POST_VERIFY_STATES:
+                if sub is not None:
+                    sub.meta["pvm"] = 4
                 return None
             state = self._states[key] = SimpleNamespace(
                 warmups=0, turn=0, slots=[None, None]
@@ -400,8 +404,14 @@ class _PostVerifyGraphs:
                 state.warmups += 1
                 outputs = self._body(slot)
                 self._commit(slot, outputs)
+                if sub is not None:
+                    sub.meta["pvm"] = 2
                 return outputs[:6]
             self._capture(slot)
+            if sub is not None:
+                sub.meta["pvm"] = 3
+        elif sub is not None:
+            sub.meta["pvm"] = 1
         slot.graph.replay()
         self._main_done.record()
         self._side_stream.wait_event(self._main_done)
