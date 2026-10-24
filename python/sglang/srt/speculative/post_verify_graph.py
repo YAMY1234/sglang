@@ -156,10 +156,14 @@ class PostVerifyGraph:
         self.disabled = False
         self._states: Dict[tuple, _KeyState] = {}
         self._pool = None
+        from sglang.srt.speculative.spec_utils import SIMULATE_ACC_PER_REQUEST
+
+        self._sim_len_rows = _MAX_BS if SIMULATE_ACC_PER_REQUEST else 1
         # The host runs up to ~2 rounds ahead of the device; a pinned slot is
         # rewritten only after the event behind its last async copy has completed.
         self._sim_len_host = [
-            torch.zeros((1,), dtype=torch.int64, pin_memory=True) for _ in range(4)
+            torch.zeros((self._sim_len_rows,), dtype=torch.int64, pin_memory=True)
+            for _ in range(4)
         ]
         self._sim_len_done: list = [None] * len(self._sim_len_host)
         self._sim_len_turn = 0
@@ -409,11 +413,12 @@ class PostVerifyGraph:
             x["mamba_track_indices"] = batch.mamba_track_indices
         return x
 
-    def _sim_len(self, max_len: int) -> Optional[torch.Tensor]:
+    def _sim_len(self, max_len: int, bs: int) -> Optional[torch.Tensor]:
         from sglang.srt.speculative.spec_utils import (
             SIMULATE_ACC_LEN,
             SIMULATE_ACC_METHOD,
             sample_simulated_acc_len,
+            sample_simulated_acc_lens,
         )
 
         if SIMULATE_ACC_LEN <= 0:
@@ -431,9 +436,14 @@ class PostVerifyGraph:
                 )
             done.synchronize()
         host = self._sim_len_host[turn]
-        host[0] = sample_simulated_acc_len(
-            SIMULATE_ACC_LEN, SIMULATE_ACC_METHOD, max_len
-        )
+        if self._sim_len_rows > 1:
+            host = sample_simulated_acc_lens(
+                SIMULATE_ACC_LEN, SIMULATE_ACC_METHOD, max_len, host[:bs]
+            )
+        else:
+            host[0] = sample_simulated_acc_len(
+                SIMULATE_ACC_LEN, SIMULATE_ACC_METHOD, max_len
+            )
         self._sim_len_slot = turn
         return host
 
@@ -444,12 +454,15 @@ class PostVerifyGraph:
         slot = st.slots[st.turn]
         st.turn ^= 1
         inputs = self._gather_inputs(batch, verify_input)
-        sim_len = self._sim_len(verify_input.max_tree_depth)
+        bs = len(batch.seq_lens)
+        sim_len = self._sim_len(verify_input.max_tree_depth, bs)
         if slot.graph is None:
             if not slot.inputs:
                 slot.inputs = {k: v.clone() for k, v in inputs.items()}
                 slot.inputs["sim_len"] = torch.zeros(
-                    (1,), dtype=torch.int64, device=self.device
+                    (bs if self._sim_len_rows > 1 else 1,),
+                    dtype=torch.int64,
+                    device=self.device,
                 )
             self._load(slot, inputs, sim_len)
             if st.warmups < _NUM_WARMUP * 2:

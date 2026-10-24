@@ -17,7 +17,7 @@ from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
-from sglang.srt.speculative import post_verify_graph
+from sglang.srt.speculative import post_verify_graph, spec_utils
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
 from sglang.srt.speculative.draft_vocab_exchange import DraftVocabExchange
 from sglang.srt.speculative.eagle_info import EagleVerifyInput
@@ -563,6 +563,94 @@ class TestPostVerifyGraphShardedLogits(CustomTestCase):
                         PostVerifyGraph(device=torch.device("cpu"), target_worker=None)
                 else:
                     post_verify_graph._check_sharded_sampling_config()
+
+
+class TestSimulatedAcceptPerRequest(CustomTestCase):
+    """SGLANG_SIMULATE_ACC_PER_REQUEST: each request draws its own simulated length;
+    one length on every row must still give exactly the shared draw's outputs."""
+
+    WIDTH = 7
+
+    def _run_device(self, lens, token_mode="real-draft-token"):
+        bs = 5
+        accept_index = (
+            torch.arange(bs * self.WIDTH, dtype=torch.int32, device=DEVICE).view(bs, -1)
+            * 3
+        )
+        predict = torch.full((bs * self.WIDTH,), -7, dtype=torch.int32, device=DEVICE)
+        num_correct_drafts = torch.zeros(bs, dtype=torch.int32, device=DEVICE)
+        candidates = torch.arange(bs * self.WIDTH, device=DEVICE).view(bs, -1) + 1000
+        target_predict = (
+            torch.arange(bs * self.WIDTH, device=DEVICE).view(bs, -1) + 2000
+        )
+        index = spec_utils.generate_simulated_accept_index_device(
+            accept_index=accept_index,
+            predict=predict,
+            num_correct_drafts=num_correct_drafts,
+            candidates=candidates,
+            target_predict=target_predict,
+            bs=bs,
+            spec_steps=self.WIDTH - 1,
+            simulate_acc_len=torch.tensor(lens, dtype=torch.int64, device=DEVICE),
+            simulate_acc_token_mode=token_mode,
+        )
+        return index, num_correct_drafts, predict
+
+    def test_equal_rows_match_the_shared_draw(self):
+        for length in range(1, self.WIDTH + 1):
+            for token_mode in ("fixed", "real-draft-token"):
+                with self.subTest(length=length, token_mode=token_mode):
+                    shared = self._run_device([length], token_mode)
+                    per_row = self._run_device([length] * 5, token_mode)
+                    for a, b in zip(shared, per_row):
+                        self.assertTrue(torch.equal(a, b))
+
+    def test_each_row_keeps_its_own_length(self):
+        lens = [1, 3, 7, 2, 5]
+        index, num_correct_drafts, predict = self._run_device(lens)
+        self.assertEqual(num_correct_drafts.tolist(), [n - 1 for n in lens])
+        for row, n in enumerate(lens):
+            want = [
+                3 * row * self.WIDTH + j if j < n else -1 for j in range(self.WIDTH)
+            ]
+            self.assertEqual(index[row].tolist(), want)
+            got = predict.view(5, -1)[row].tolist()
+            for j in range(self.WIDTH):
+                if j < n - 1:
+                    self.assertEqual(got[j], 1000 + row * self.WIDTH + j + 1)
+                elif j == n - 1:
+                    self.assertEqual(got[j], 2000 + row * self.WIDTH + j)
+                else:
+                    self.assertEqual(got[j], -7)
+
+    def test_draws_keep_the_expected_mean(self):
+        out = torch.empty(20000, dtype=torch.int64)
+        spec_utils.sample_simulated_acc_lens(4.8, "match-expected", self.WIDTH, out)
+        self.assertEqual(set(out.tolist()), {4, 5})
+        self.assertAlmostEqual(out.double().mean().item(), 4.8, delta=0.02)
+        spec_utils.sample_simulated_acc_lens(4.8, "multinomial", self.WIDTH, out)
+        self.assertGreaterEqual(out.min().item(), 1)
+        self.assertLessEqual(out.max().item(), self.WIDTH)
+
+    def test_eager_path_draws_per_request(self):
+        bs = 64
+        num_correct_drafts = torch.zeros(bs, dtype=torch.int32, device=DEVICE)
+        with patch.object(spec_utils, "SIMULATE_ACC_PER_REQUEST", True):
+            spec_utils.generate_simulated_accept_index(
+                accept_index=torch.zeros(
+                    bs, self.WIDTH, dtype=torch.int32, device=DEVICE
+                ),
+                predict=torch.zeros(bs * self.WIDTH, dtype=torch.int32, device=DEVICE),
+                num_correct_drafts=num_correct_drafts,
+                candidates=None,
+                target_predict=None,
+                bs=bs,
+                spec_steps=self.WIDTH - 1,
+                simulate_acc_len=4.5,
+                simulate_acc_method="match-expected",
+                simulate_acc_token_mode="fixed",
+            )
+        self.assertEqual(set(num_correct_drafts.tolist()), {3, 4})
 
 
 if __name__ == "__main__":

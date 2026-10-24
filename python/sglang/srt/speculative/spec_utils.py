@@ -210,6 +210,8 @@ def sample_draft_proposal(
 SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
 SIMULATE_ACC_TOKEN_MODE = envs.SGLANG_SIMULATE_ACC_TOKEN_MODE.get()
+SIMULATE_ACC_PER_REQUEST = envs.SGLANG_SIMULATE_ACC_PER_REQUEST.get()
+_SIMULATE_ACC_PER_REQUEST_LOGGED = False
 _COMMIT_CUDA = envs.SGLANG_Q35MF_COMMIT_CUDA.get()
 
 
@@ -473,6 +475,36 @@ def sample_simulated_acc_len(
     return int(simulate_acc_len)
 
 
+def sample_simulated_acc_lens(
+    simulate_acc_len: float,
+    simulate_acc_method: str,
+    max_len: int,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """One sample_simulated_acc_len draw for each row of host int64 ``out``."""
+    global _SIMULATE_ACC_PER_REQUEST_LOGGED
+    n = out.numel()
+    if simulate_acc_method == "multinomial":
+        lens = torch.normal(mean=simulate_acc_len, std=1.0, size=(n,), device="cpu")
+        lens = torch.clamp(lens, min=1.0, max=max_len).round()
+    elif simulate_acc_method == "match-expected":
+        mean = max(1.0, min(max_len, simulate_acc_len))
+        lower = int(mean // 1)
+        lens = torch.full((n,), float(lower))
+        if lower < max_len:
+            lens += torch.rand(n) < (mean - lower)
+    else:
+        raise ValueError(f"Invalid simulate_acc_method: {simulate_acc_method}")
+    out.copy_(lens)
+    if not _SIMULATE_ACC_PER_REQUEST_LOGGED:
+        _SIMULATE_ACC_PER_REQUEST_LOGGED = True
+        logger.info(
+            "SGLANG_SIMULATE_ACC_PER_REQUEST: simulated acceptance drawn per request "
+            f"({simulate_acc_method}, mean {simulate_acc_len}, max {max_len})"
+        )
+    return out
+
+
 def generate_simulated_accept_index(
     accept_index,
     predict,
@@ -488,6 +520,22 @@ def generate_simulated_accept_index(
     use_real_draft_tokens = simulate_acc_token_mode == "real-draft-token"
 
     assert simulate_acc_len > 0.0
+    if SIMULATE_ACC_PER_REQUEST:
+        lens = torch.empty((bs,), dtype=torch.int64)
+        sample_simulated_acc_lens(
+            simulate_acc_len, simulate_acc_method, spec_steps + 1, lens
+        )
+        return generate_simulated_accept_index_device(
+            accept_index=accept_index,
+            predict=predict,
+            num_correct_drafts=num_correct_drafts,
+            candidates=candidates,
+            target_predict=target_predict,
+            bs=bs,
+            spec_steps=spec_steps,
+            simulate_acc_len=lens.to(accept_index.device),
+            simulate_acc_token_mode=simulate_acc_token_mode,
+        )
     simulate_acc_len = sample_simulated_acc_len(
         simulate_acc_len, simulate_acc_method, spec_steps + 1
     )
@@ -530,17 +578,19 @@ def generate_simulated_accept_index_device(
     simulate_acc_token_mode: str = SIMULATE_ACC_TOKEN_MODE,
 ) -> torch.Tensor:
     """generate_simulated_accept_index with the sampled length already on the
-    device (int64 [1]); static shapes, so it can run inside a CUDA graph.
-    Writes the same values as the host-length version for the same length."""
+    device (int64 [1], or [bs] for SGLANG_SIMULATE_ACC_PER_REQUEST); static shapes,
+    so it can run inside a CUDA graph. Writes the same values as the host-length
+    version for the same length."""
     width = spec_steps + 1
     steps = torch.arange(width, device=accept_index.device, dtype=accept_index.dtype)
+    simulate_acc_len = simulate_acc_len.view(-1, 1)
     accepted = steps.view(1, width) < simulate_acc_len
     sim_accept_index = torch.where(
         accepted,
         accept_index[:, :1] + steps.view(1, width),
         torch.full_like(steps, -1).view(1, width),
     )
-    num_correct_drafts.copy_((simulate_acc_len - 1).expand(bs))
+    num_correct_drafts.copy_((simulate_acc_len - 1).view(-1).expand(bs))
     if simulate_acc_token_mode != "real-draft-token":
         predict.fill_(100)  # some legit token id
         return sim_accept_index

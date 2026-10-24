@@ -515,6 +515,9 @@ class Envs:
     # ===================================================================
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
     SGLANG_SIMULATE_ACC_METHOD = EnvStr("match-expected")
+    # Draw the simulated length per request, not once per batch per round;
+    # one shared draw moves every request's spec ring cursors in lockstep.
+    SGLANG_SIMULATE_ACC_PER_REQUEST = EnvBool(False)
     SGLANG_SIMULATE_ACC_TOKEN_MODE = EnvStr("fixed")
     # DSpark on HIP: with SGLANG_SIMULATE_ACC_LEN set, temperature-only sampling requests
     # run the greedy draft/accept path and only the bonus token is temperature-sampled.
