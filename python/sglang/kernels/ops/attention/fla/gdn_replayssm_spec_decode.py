@@ -1199,10 +1199,8 @@ def _advance_gdn_spec_cursors_kernel(
 
     if FOLD_SWAP:
         # SGLANG_PST_GDN_TRT_FOLD: a folding verify wrote its rows from entry 0 of the other
-        # MAX_CACHE_LEN-entry buffer
-        new_base = tl.where(
-            flush_now, (cache_base + MAX_CACHE_LEN) & (CACHE_BUF_LEN - 1), cache_base
-        )
+        # half of the ring
+        new_base = tl.where(flush_now, cache_base ^ (CACHE_BUF_LEN // 2), cache_base)
     else:
         new_base = tl.where(
             flush_now, (cache_base + write_pos) & (CACHE_BUF_LEN - 1), cache_base
@@ -1729,9 +1727,10 @@ def commit_gdn_replayssm_spec(
     ``max_spec_len`` rows after its history (gdn_replayssm_spec_decode's rule).
     ``defer_fold``: flag for this step's commit only the rings the next verify's
     ``max_spec_len`` rows would overflow.
-    ``fold_swap`` (with ``fold_in_verify``, SGLANG_PST_GDN_TRT_FOLD): the ring is two
-    ``max_cache_len``-entry buffers (``cache_buf_len`` = 2 ``max_cache_len``) and a folding
-    verify wrote its rows from entry 0 of the other one.
+    ``fold_swap`` (with ``fold_in_verify``, SGLANG_PST_GDN_TRT_FOLD): the ring is two buffers
+    of ``cache_buf_len`` / 2 entries and a verify folded each history that could not take
+    ``max_spec_len`` rows after ``max_cache_len`` entries, writing its rows from entry 0 of
+    the other buffer.
     """
     if cache_buf_len is None:
         cache_buf_len = max_cache_len

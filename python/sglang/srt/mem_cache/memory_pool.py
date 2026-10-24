@@ -1138,12 +1138,17 @@ class MambaPool:
             self.replayssm_fold_in_verify = lag_mode == "verify"
             self.replayssm_defer_fold = lag_mode == "defer"
             self.replayssm_trt_fold = trt_fold_ring and self.replayssm_fold_in_verify
-            # gdn_core_cuda's fold variant: 2 = TRT's (staged in shared memory), 3 = in registers
-            self.replayssm_trt_fold_mode = (
-                (3 if envs.SGLANG_PST_GDN_TRT_FOLD_REG.get() else 2)
-                if self.replayssm_trt_fold
-                else 0
-            )
+            # gdn_core_cuda's fold variant: 2 = TRT's (staged in shared memory), 3 = in registers,
+            # 4 = in registers every verify with a history (fold capacity = the draft rows)
+            if not self.replayssm_trt_fold:
+                self.replayssm_trt_fold_mode = 0
+            elif envs.SGLANG_PST_GDN_TRT_FOLD_EVERY.get():
+                self.replayssm_trt_fold_mode = 4
+                self.replayssm_ring_capacity = speculative_num_draft_tokens
+            else:
+                self.replayssm_trt_fold_mode = (
+                    3 if envs.SGLANG_PST_GDN_TRT_FOLD_REG.get() else 2
+                )
             if trt_fold_ring and not self.replayssm_trt_fold:
                 # The ring is already sized and laid out for it.
                 raise ValueError(
