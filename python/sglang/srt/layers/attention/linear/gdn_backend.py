@@ -246,12 +246,14 @@ def _gdn_core_target_verify(
         out=out,
         rows_per_request=draft_token_num,
         num_k_heads=layer.num_k_heads,
+        # SGLANG_PLB_GDN_FOLD_IN_VERIFY: the core folds a full ring itself (the cursor advance assumes it)
+        fold=mamba_pool.replayssm_fold_in_verify,
         **(conv or {}),
     ):
         return None
     print_info_once(
         f"SGLANG_PERFHT_GDN_CORE engaged: batch={mixed_qkv.shape[0] // draft_token_num}, "
-        f"value_heads={layer.num_v_heads}"
+        f"value_heads={layer.num_v_heads}, fold_in_verify={int(mamba_pool.replayssm_fold_in_verify)}"
     )
     return out
 
