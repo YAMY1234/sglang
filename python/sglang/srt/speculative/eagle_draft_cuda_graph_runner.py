@@ -96,6 +96,13 @@ def _same_storage(src: Optional[torch.Tensor], buf: torch.Tensor) -> bool:
     return src is not None and src.data_ptr() == buf.data_ptr()
 
 
+def _topk_in_place(spec_info, buffers) -> bool:
+    """Whether both top-1 inputs are the runner's buffers already (they are copied together)."""
+    return _same_storage(spec_info.topk_index, buffers.topk_index) and _same_storage(
+        spec_info.topk_p, buffers.topk_p
+    )
+
+
 class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     """EAGLE draft cuda-graph runner.
 
@@ -621,7 +628,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         # a staged round's batch is the previous round's, whose request slots are in place
         srcs = [] if inputs_staged else [forward_batch.req_pool_indices]
         mask = 0
-        if _same_storage(spec_info.topk_index, buffers.topk_index):
+        if _topk_in_place(spec_info, buffers):
             mask |= 64
         else:
             srcs = [spec_info.topk_p, spec_info.topk_index, *srcs]
@@ -780,7 +787,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             # is handled further down since it lives on host.
             copy_dsts = [] if inputs_staged else [buffers.req_pool_indices[:raw_bs]]
             copy_srcs = [] if inputs_staged else [forward_batch.req_pool_indices]
-            if not _same_storage(forward_batch.spec_info.topk_index, buffers.topk_index):
+            if not _topk_in_place(forward_batch.spec_info, buffers):
                 copy_dsts += [buffers.topk_p[:raw_bs], buffers.topk_index[:raw_bs]]
                 copy_srcs += [
                     forward_batch.spec_info.topk_p,
