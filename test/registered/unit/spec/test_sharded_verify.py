@@ -131,11 +131,12 @@ def _plain_st_b64(addr, val, mask):
 @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
 class TestLLKeys(CustomTestCase):
     """_ll_keys_kernel as rank 0 of WORLD ranks on one GPU (its multimem store made a plain
-    one), the other ranks' words written by the test. Each launch is followed at once by
-    another kernel and nothing syncs the host until the end. Every row must get the max over
-    all ranks' keys. A warp once left the poll on a stale block-wide count and took words a
-    slot held from an earlier launch: wrong tokens for a block of rows (14-16% of launches at
-    56 / 63 rows on one rank, where the poll's layout repeats every element)."""
+    one), the other ranks' words written by the test. All launches run back to back from one
+    CUDA graph, each followed at once by another kernel, as decode replays them. Every row
+    must get the max over all ranks' keys. A warp once left the poll on a stale block-wide
+    count and took words a slot held from an earlier launch: wrong tokens for a block of rows
+    (about a quarter of the launches at 56 / 63 rows on one rank, where the poll's layout
+    repeats every element; issued from the host one by one, some runs missed it)."""
 
     def _check(self, world, rows, late, launches):
         maxr = sharded_verify._LL_MAX_ROWS
@@ -144,47 +145,45 @@ class TestLLKeys(CustomTestCase):
             sharded_verify._LL_SLOTS * world * maxr * 2, dtype=torch.int64, device="cuda"
         )
         epoch = torch.zeros(1, dtype=torch.int32, device="cuda")
-        writer = torch.cuda.Stream()
-        # load the writer's kernels now: lazy loading them would wait for a spinning poll
-        torch.cuda._sleep(1)
-        torch.empty_like(buf)[torch.arange(2, device="cuda")] = 0
-        results = []
-        for i in range(launches):
-            keys = torch.randint(
-                -(2**62), 2**62, (world, rows, 2), device="cuda", generator=gen
-            )
-            want = 0xFFFFFFFF - (keys.amax(dim=(0, 2)) & 0xFFFFFFFF)
-            tag, slot = i + 1, (i + 1) % 3
-            if world > 1:
-                at = torch.cat(
+        keys = torch.randint(
+            -(2**62), 2**62, (launches, world, rows, 2), device="cuda", generator=gen
+        )
+        want = 0xFFFFFFFF - (keys.amax(dim=(1, 3)) & 0xFFFFFFFF)
+        # an even row count keeps every launch's tokens 16-byte aligned (one specialization)
+        tokens = torch.full(
+            (launches, rows + rows % 2), -5, dtype=torch.int64, device="cuda"
+        )
+        if world > 1:
+            tag = torch.arange(1, launches + 1, device="cuda")[:, None] << 32
+            others = keys[:, 1:].amax(dim=3).reshape(launches, -1)
+            lo = (others & 0xFFFFFFFF) | tag
+            hi = ((others >> 32) & 0xFFFFFFFF) | tag
+            at = [
+                torch.cat(
                     [
                         ((slot * world + q) * maxr + torch.arange(rows, device="cuda"))
                         * 2
                         for q in range(1, world)
                     ]
                 )
-                others = keys[1:].amax(dim=2).reshape(-1)
-                lo = (others & 0xFFFFFFFF) | (tag << 32)
-                hi = ((others >> 32) & 0xFFFFFFFF) | (tag << 32)
-                if late:
-                    # the other ranks' words land ~10 us after this launch begins to poll
-                    writer.wait_stream(torch.cuda.current_stream())
-                    with torch.cuda.stream(writer):
-                        torch.cuda._sleep(20_000)
-                        buf[at] = lo
-                        buf[at + 1] = hi
-                else:
-                    buf[at] = lo
-                    buf[at + 1] = hi
-            tokens = torch.full((rows,), -5, dtype=torch.int64, device="cuda")
+                for slot in range(3)
+            ]
+            at1 = [a + 1 for a in at]
+
+        def put(i):
+            if world > 1:
+                buf.index_copy_(0, at[(i + 1) % 3], lo[i])
+                buf.index_copy_(0, at1[(i + 1) % 3], hi[i])
+
+        def launch(i):
             sharded_verify._ll_keys_kernel[(1,)](
-                keys[0].contiguous(),
+                keys[i, 0],
                 2,
                 rows,
                 buf.data_ptr(),
                 buf.data_ptr(),
                 epoch,
-                tokens,
+                tokens[i],
                 RANK=0,
                 WORLD=world,
                 MAXR=maxr,
@@ -194,10 +193,34 @@ class TestLLKeys(CustomTestCase):
                 SPIN_LIMIT=1 << 24,
                 num_warps=4,
             )
-            torch.empty(rows, dtype=torch.int32, device="cuda").fill_(3)
-            results.append((tokens, want))
+
+        put(0)
+        launch(0)  # compiles outside the capture
         torch.cuda.synchronize()
-        wrong = sum(not torch.equal(t, w) for t, w in results)
+        buf.zero_()
+        epoch.zero_()
+        tokens.fill_(-5)
+        after = torch.empty(rows, dtype=torch.int32, device="cuda")
+        writer = torch.cuda.Stream()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            main = torch.cuda.current_stream()
+            for i in range(launches):
+                if late:
+                    # the other ranks' words land ~10 us after this launch begins to poll
+                    writer.wait_stream(main)
+                    with torch.cuda.stream(writer):
+                        torch.cuda._sleep(20_000)
+                        put(i)
+                else:
+                    put(i)
+                launch(i)
+                if late:
+                    main.wait_stream(writer)
+                after.fill_(3)
+        graph.replay()
+        torch.cuda.synchronize()
+        wrong = int((tokens[:, :rows] != want).any(1).sum())
         self.assertEqual(wrong, 0, f"{wrong} of {launches} launches")
         self.assertEqual(int(epoch), launches)
 
