@@ -19,13 +19,18 @@
 
 """The BT tail (reduce + MaterializeRMSNorm), bit for bit FlashInfer's outputs.
 
-``early_trigger`` (reduce): the CTA lets the norm kernel launch right after its own
-grid-dependency wait instead of after the multicast. Norm: ``early_dependents`` lets
-the dependents launch at entry; ``poll_before_wait`` polls the prenorm mailbox before
-the grid-dependency wait, which moves to just before the sentinel reset (both:
-TensorRT-LLM's rmsNormLamport order).
-``fp8_out`` (norm): the norm rows are also written as E4M3 under a static per-tensor
-scale, byte for byte SGLang's ``static_quant_fp8`` of them.
+Reduce: ``early_trigger`` lets the norm kernel launch right after the grid-dependency
+wait instead of after the multicast; ``reset_previous`` writes the -0 sentinel back
+into the previous call's prenorm rows (this rank's copy), which the norm kernel then
+leaves dirty (``reset_own=False``). Norm: ``early_dependents`` lets the dependents
+launch at entry; ``poll_before_wait`` polls the prenorm mailbox before the
+grid-dependency wait, which moves to just before the reset (both: TensorRT-LLM's
+rmsNormLamport order); ``reset_previous`` resets the previous call's prenorm rows
+before the grid-dependency wait instead of its own after it; ``rows`` (1 or 2) rows a
+CTA; ``fp8_out`` also writes the norm rows as E4M3 under a static per-tensor scale,
+byte for byte SGLang's ``static_quant_fp8`` of them. ``cta_stage`` (both): one thread a
+CTA loads the stage words and shares them, instead of every warp hitting the same L2
+line.
 """
 
 from __future__ import annotations
@@ -49,6 +54,7 @@ from flashinfer.comm.mnnvl_cutedsl.cute_dsl_primitives import (
     sanitize_negative_zero_u32x4,
     stmc_bf16x8,
     store_global_u32,
+    store_global_u32_address,
     store_global_u32x2,
     store_global_u32x4,
     store_lamport_sentinel_u32x4,
@@ -64,6 +70,23 @@ from flashinfer.comm.mnnvl_cutedsl.kernel_bt.device_kernels import (
 E4M3_MAX = 448.0
 _E4M3_MAX_PTX = "0f43E00000"
 _E4M3_MIN_PTX = "0fC3E00000"
+
+
+@dsl_user_op
+def _load_volatile_u32_address(address: Int64, *, loc=None, ip=None) -> Uint32:
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [address.ir_value(loc=loc, ip=ip)],
+            "ld.volatile.global.u32 $0, [$1];",
+            "=r,l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op
@@ -148,7 +171,8 @@ def _bf16x4_to_e4m3x4(
 
 
 class PlbOwnerReduceMulticastDeviceKernel:
-    """FlashInfer's call signature (it takes the place of the tail's reduce)."""
+    """FlashInfer's _OwnerReduceMulticastDeviceKernel, plus the local prenorm mailbox
+    and the rows-per-generation words (both unused unless ``reset_previous``)."""
 
     def __init__(
         self,
@@ -162,6 +186,8 @@ class PlbOwnerReduceMulticastDeviceKernel:
         add_residual: bool,
         enable_pdl: bool,
         early_trigger: bool = False,
+        reset_previous: bool = False,
+        cta_stage: bool = False,
     ) -> None:
         self.hidden_size = hidden_size
         self.tp_size = tp_size
@@ -172,6 +198,8 @@ class PlbOwnerReduceMulticastDeviceKernel:
         self.add_residual = add_residual
         self.enable_pdl = enable_pdl
         self.early_trigger = early_trigger
+        self.reset_previous = reset_previous
+        self.cta_stage = cta_stage
         self.fragments = hidden_size // VEC_BF16
         self.ctas_per_token = math.ceil(self.fragments / threads)
 
@@ -182,6 +210,8 @@ class PlbOwnerReduceMulticastDeviceKernel:
         residual_source: cute.Tensor,
         stage_state: cute.Tensor,
         prenorm_mailbox_multicast_address: Int64,
+        prenorm_mailbox_address: Int64,
+        rows_state_address: Int64,
         m: Int32,
         stream: cuda.CUstream,
     ) -> None:
@@ -191,10 +221,13 @@ class PlbOwnerReduceMulticastDeviceKernel:
             residual_source,
             stage_state,
             prenorm_mailbox_multicast_address,
+            prenorm_mailbox_address,
+            rows_state_address,
             m,
         ).launch(
             grid=(local_tokens * self.ctas_per_token, 1, 1),
             block=(self.threads, 1, 1),
+            smem=16 if self.cta_stage else 0,
             stream=stream,
             use_pdl=self.enable_pdl,
         )
@@ -206,6 +239,8 @@ class PlbOwnerReduceMulticastDeviceKernel:
         residual_source: cute.Tensor,
         stage_state: cute.Tensor,
         prenorm_mailbox_multicast_address: Int64,
+        prenorm_mailbox_address: Int64,
+        rows_state_address: Int64,
         m: Int32,
     ) -> None:
         block, _, _ = cute.arch.block_idx()
@@ -242,7 +277,58 @@ class PlbOwnerReduceMulticastDeviceKernel:
                 # kernel reads nothing else of this grid but the polled mailbox rows.
                 cute.arch.griddepcontrol_launch_dependents()
 
-        stage = load_volatile_u32(stage_state.iterator + ACTIVE_STAGE)
+        if cutlass.const_expr(self.cta_stage):
+            shared = cutlass.utils.SmemAllocator().allocate_array(Uint32, 4)
+            if tidx == 0:
+                loaded = load_volatile_u32(stage_state.iterator + ACTIVE_STAGE)
+                cute.arch.store(shared.llvm_ptr, loaded)
+                if cutlass.const_expr(self.reset_previous):
+                    cute.arch.store(
+                        (shared + 1).llvm_ptr,
+                        _load_volatile_u32_address(
+                            rows_state_address
+                            + Int64(
+                                (loaded + Uint32(LAMPORT_GENERATIONS - 1))
+                                % Uint32(LAMPORT_GENERATIONS)
+                            )
+                            * 4
+                        ),
+                    )
+            cute.arch.barrier()
+            stage = cute.arch.load(shared.llvm_ptr, Uint32)
+        else:
+            stage = load_volatile_u32(stage_state.iterator + ACTIVE_STAGE)
+        if cutlass.const_expr(self.reset_previous):
+            # The previous call's norm kernel has completed (every kernel since waited);
+            # the generation is written again only by the call after next.
+            previous = (stage + Uint32(LAMPORT_GENERATIONS - 1)) % Uint32(
+                LAMPORT_GENERATIONS
+            )
+            if cutlass.const_expr(self.cta_stage):
+                previous_rows = Int32(cute.arch.load((shared + 1).llvm_ptr, Uint32))
+            else:
+                previous_rows = Int32(
+                    _load_volatile_u32_address(
+                        rows_state_address + Int64(previous) * 4
+                    )
+                )
+            if fragment < self.fragments:
+                row_stride = (
+                    (m + Int32(self.tp_size - 1)) // Int32(self.tp_size)
+                ) * Int32(self.tp_size)
+                row = Int32(local_token) * Int32(self.tp_size)
+                while row < previous_rows:
+                    for lane_row in cutlass.range_constexpr(self.tp_size):
+                        if row + lane_row < previous_rows:
+                            reset_offset = (
+                                Int64(previous) * self.capacity_m
+                                + Int64(row + lane_row)
+                            ) * self.hidden_size + Int64(fragment) * VEC_BF16
+                            store_lamport_sentinel_u32x4(
+                                prenorm_mailbox_address + reset_offset * 2
+                            )
+                    row = row + row_stride
+
         rank_values = cute.make_rmem_tensor(
             cute.make_layout((self.tp_size, 4)),
             Uint32,
@@ -297,6 +383,11 @@ class PlbOwnerReduceMulticastDeviceKernel:
                 stage_state.iterator + NEXT_STAGE,
                 (stage + Uint32(1)) % Uint32(LAMPORT_GENERATIONS),
             )
+            if cutlass.const_expr(self.reset_previous):
+                # Read by the next call's reduce kernel, after this grid completes.
+                store_global_u32_address(
+                    rows_state_address + Int64(stage) * 4, Uint32(m)
+                )
         cute.arch.barrier()
         if cutlass.const_expr(self.enable_pdl and not self.early_trigger):
             cute.arch.griddepcontrol_launch_dependents()
@@ -313,7 +404,8 @@ class PlbOwnerReduceMulticastDeviceKernel:
 
 
 class PlbMaterializeRMSNormDeviceKernel:
-    """FlashInfer's call signature (it takes the place of the tail's rms_norm)."""
+    """FlashInfer's _MaterializeRMSNormDeviceKernel, plus the E4M3 rows' and the
+    scale's addresses (unused unless ``fp8_out``) and m."""
 
     def __init__(
         self,
@@ -328,10 +420,18 @@ class PlbMaterializeRMSNormDeviceKernel:
         apply_rms_norm: bool = True,
         early_dependents: bool = False,
         poll_before_wait: bool = False,
+        reset_own: bool = True,
+        reset_previous: bool = False,
+        rows: int = 1,
         fp8_out: bool = False,
+        cta_stage: bool = False,
     ) -> None:
         if fp8_out and not apply_rms_norm:
             raise ValueError("the E4M3 copy is of the norm, which is compiled out")
+        if rows not in (1, 2):
+            raise ValueError("a CTA takes 1 or 2 rows")
+        if reset_own and reset_previous:
+            raise ValueError("a generation is reset by its own norm kernel or the next one")
         self.hidden_size = hidden_size
         self.capacity_m = capacity_m
         self.threads = threads
@@ -342,7 +442,11 @@ class PlbMaterializeRMSNormDeviceKernel:
         self.apply_rms_norm = apply_rms_norm
         self.early_dependents = early_dependents
         self.poll_before_wait = poll_before_wait
+        self.reset_own = reset_own
+        self.reset_previous = reset_previous
+        self.rows = rows
         self.fp8_out = fp8_out
+        self.cta_stage = cta_stage
         self.fragments = hidden_size // VEC_BF16
         self.trips = math.ceil(self.fragments / threads)
         self.warps = threads // WARP_SIZE
@@ -355,6 +459,9 @@ class PlbMaterializeRMSNormDeviceKernel:
         norm_output: cute.Tensor,
         gamma: cute.Tensor,
         stage_state: cute.Tensor,
+        fp8_output: Int64,
+        fp8_scale: Int64,
+        rows_state_address: Int64,
         m: Int32,
         stream: cuda.CUstream,
     ) -> None:
@@ -364,15 +471,48 @@ class PlbMaterializeRMSNormDeviceKernel:
             norm_output,
             gamma,
             stage_state,
-            Int64(0),
-            Int64(0),
+            fp8_output,
+            fp8_scale,
+            rows_state_address,
+            m,
         ).launch(
-            grid=(m, 1, 1),
+            grid=((m + Int32(self.rows - 1)) // Int32(self.rows), 1, 1),
             block=(self.threads, 1, 1),
-            smem=self.warps * 4,
+            smem=16 + self.warps * 4 * self.rows,
             stream=stream,
             use_pdl=self.enable_pdl,
         )
+
+    def _mailbox_pointer(self, prenorm_mailbox, stage, token, fragment):
+        offset = (
+            Int64(stage) * self.capacity_m + Int64(token)
+        ) * self.hidden_size + Int64(fragment) * VEC_BF16
+        return cute.make_ptr(
+            BFloat16,
+            (prenorm_mailbox.iterator + offset).llvm_ptr,
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
+
+    def _store_norm(
+        self, norm_output, fp8_output, inverse_scale, token, fragment, result
+    ):
+        output_offset = Int64(token) * self.hidden_size + Int64(fragment) * VEC_BF16
+        packed_result = bf16x8_to_packed_u32x4(result)
+        store_global_u32x4(
+            Int64((norm_output.iterator + output_offset).toint()),
+            packed_result,
+        )
+        if cutlass.const_expr(self.fp8_out):
+            quantized = cute.make_rmem_tensor(cute.make_layout((2,)), Uint32)
+            quantized[0] = _bf16x4_to_e4m3x4(
+                packed_result[0], packed_result[1], inverse_scale
+            )
+            quantized[1] = _bf16x4_to_e4m3x4(
+                packed_result[2], packed_result[3], inverse_scale
+            )
+            # one byte an element
+            store_global_u32x2(fp8_output + output_offset, quantized.load())
 
     @cute.kernel
     def kernel(
@@ -384,13 +524,24 @@ class PlbMaterializeRMSNormDeviceKernel:
         stage_state: cute.Tensor,
         fp8_output: Int64,
         fp8_scale: Int64,
+        rows_state_address: Int64,
+        m: Int32,
     ) -> None:
         tidx, _, _ = cute.arch.thread_idx()
-        token, _, _ = cute.arch.block_idx()
+        block, _, _ = cute.arch.block_idx()
+        token = block * Int32(self.rows)
+        second = token + 1
+        has_second = second < m
 
         if cutlass.const_expr(self.enable_pdl and self.early_dependents):
             # Dependents may launch now; their own wait still covers this grid.
             cute.arch.griddepcontrol_launch_dependents()
+
+        smem = cutlass.utils.SmemAllocator()
+        shared = smem.allocate_array(Uint32, 4)
+        warp_sums = smem.allocate_array(Float32, self.warps)
+        if cutlass.const_expr(self.rows == 2):
+            second_warp_sums = smem.allocate_array(Float32, self.warps)
 
         gamma_fragments = cute.make_rmem_tensor(
             cute.make_layout(
@@ -408,6 +559,15 @@ class PlbMaterializeRMSNormDeviceKernel:
         )
         gamma_fragments.fill(BFloat16(0.0))
         prenorm_fragments.fill(BFloat16(0.0))
+        if cutlass.const_expr(self.rows == 2):
+            second_fragments = cute.make_rmem_tensor(
+                cute.make_layout(
+                    (self.trips, VEC_BF16),
+                    stride=(VEC_BF16, 1),
+                ),
+                BFloat16,
+            )
+            second_fragments.fill(BFloat16(0.0))
         if cutlass.const_expr(self.apply_rms_norm):
             for trip in cutlass.range_constexpr(self.trips):
                 fragment = tidx + trip * self.threads
@@ -426,27 +586,95 @@ class PlbMaterializeRMSNormDeviceKernel:
         if cutlass.const_expr(self.fp8_out):
             inverse_scale = _reciprocal_div_full(_load_global_f32(fp8_scale))
 
+        if cutlass.const_expr(self.reset_previous):
+            # Before the wait: the reduce kernel let this grid launch after its own wait,
+            # so the publish kernel (ACTIVE_STAGE) and the previous norm kernel have
+            # completed; the previous generation is written again only by the call after next.
+            if cutlass.const_expr(self.cta_stage):
+                if tidx == 0:
+                    loaded = load_volatile_u32(stage_state.iterator + ACTIVE_STAGE)
+                    cute.arch.store(shared.llvm_ptr, loaded)
+                    cute.arch.store(
+                        (shared + 1).llvm_ptr,
+                        _load_volatile_u32_address(
+                            rows_state_address
+                            + Int64(
+                                (loaded + Uint32(LAMPORT_GENERATIONS - 1))
+                                % Uint32(LAMPORT_GENERATIONS)
+                            )
+                            * 4
+                        ),
+                    )
+                cute.arch.barrier()
+                current = cute.arch.load(shared.llvm_ptr, Uint32)
+            else:
+                current = load_volatile_u32(stage_state.iterator + ACTIVE_STAGE)
+            previous = (current + Uint32(LAMPORT_GENERATIONS - 1)) % Uint32(
+                LAMPORT_GENERATIONS
+            )
+            if cutlass.const_expr(self.cta_stage):
+                previous_rows = Int32(cute.arch.load((shared + 1).llvm_ptr, Uint32))
+            else:
+                previous_rows = Int32(
+                    _load_volatile_u32_address(
+                        rows_state_address + Int64(previous) * 4
+                    )
+                )
+            grid_rows = (m + Int32(self.rows - 1)) // Int32(self.rows)
+            for trip in cutlass.range_constexpr(self.trips):
+                fragment = tidx + trip * self.threads
+                if fragment < self.fragments:
+                    row = block
+                    while row < previous_rows:
+                        store_lamport_sentinel_u32x4(
+                            Int64(
+                                self._mailbox_pointer(
+                                    prenorm_mailbox, previous, row, fragment
+                                ).toint()
+                            )
+                        )
+                        row = row + grid_rows
+            if block == 0 and tidx == 0:
+                # Read by the next call's norm kernel, after this grid completes.
+                store_global_u32_address(
+                    rows_state_address + Int64(current) * 4, Uint32(m)
+                )
+
         if cutlass.const_expr(self.enable_pdl and not self.poll_before_wait):
             cute.arch.griddepcontrol_wait()
 
         # poll_before_wait: the publish kernel that wrote ACTIVE_STAGE completed before
         # the reduce kernel let this grid launch; a mailbox row is final once no word
         # holds the -0 sentinel.
-        stage = load_volatile_u32(stage_state.iterator + ACTIVE_STAGE)
+        if cutlass.const_expr(self.cta_stage and self.reset_previous):
+            stage = current
+        elif cutlass.const_expr(self.cta_stage):
+            if tidx == 0:
+                cute.arch.store(
+                    shared.llvm_ptr,
+                    load_volatile_u32(stage_state.iterator + ACTIVE_STAGE),
+                )
+            cute.arch.barrier()
+            stage = cute.arch.load(shared.llvm_ptr, Uint32)
+        else:
+            stage = load_volatile_u32(stage_state.iterator + ACTIVE_STAGE)
         thread_sum = Float32(0.0)
+        second_sum = Float32(0.0)
         for trip in cutlass.range_constexpr(self.trips):
             fragment = tidx + trip * self.threads
             if fragment < self.fragments:
-                mailbox_offset = (
-                    Int64(stage) * self.capacity_m + Int64(token)
-                ) * self.hidden_size + Int64(fragment) * VEC_BF16
-                mailbox_pointer = cute.make_ptr(
-                    BFloat16,
-                    (prenorm_mailbox.iterator + mailbox_offset).llvm_ptr,
-                    cute.AddressSpace.gmem,
-                    assumed_align=16,
+                mailbox_pointer = self._mailbox_pointer(
+                    prenorm_mailbox, stage, token, fragment
                 )
                 packed = load_global_u32x4(mailbox_pointer, volatile=True)
+                if cutlass.const_expr(self.rows == 2):
+                    # Both rows' loads in flight before either poll.
+                    second_pointer = self._mailbox_pointer(
+                        prenorm_mailbox, stage, second, fragment
+                    )
+                    second_packed = load_global_u32x4(
+                        second_pointer, Int32(has_second), volatile=True
+                    )
                 while fragment_has_negative_zero(packed):
                     packed = load_global_u32x4(mailbox_pointer, volatile=True)
                 prenorm = packed_u32x4_to_bf16x8(packed)
@@ -470,14 +698,48 @@ class PlbMaterializeRMSNormDeviceKernel:
                         reduction_profile=0,
                     )
 
-        smem = cutlass.utils.SmemAllocator()
-        warp_sums = smem.allocate_array(Float32, self.warps)
+                if cutlass.const_expr(self.rows == 2):
+                    # A missing second row loads zeros, which add +0.0.
+                    while fragment_has_negative_zero(second_packed):
+                        second_packed = load_global_u32x4(
+                            second_pointer, Int32(has_second), volatile=True
+                        )
+                    second_prenorm = packed_u32x4_to_bf16x8(second_packed)
+                    if cutlass.const_expr(self.apply_rms_norm):
+                        second_fragments[trip, None].store(second_prenorm)
+                    if cutlass.const_expr(self.write_residual_output):
+                        if has_second:
+                            second_offset = (
+                                Int64(second) * self.hidden_size
+                                + Int64(fragment) * VEC_BF16
+                            )
+                            store_global_u32x4(
+                                Int64(
+                                    (residual_output.iterator + second_offset).toint()
+                                ),
+                                second_packed,
+                            )
+                    if cutlass.const_expr(self.apply_rms_norm):
+                        second_values = second_prenorm.to(Float32)
+                        second_sum = second_sum + (second_values * second_values).reduce(
+                            cute.ReductionOp.ADD,
+                            init_val=Float32(0.0),
+                            reduction_profile=0,
+                        )
+
         if cutlass.const_expr(self.apply_rms_norm):
             full_sum = _block_sum(thread_sum, warp_sums, self.warps)
             inverse_rms = cute.math.rsqrt(
                 full_sum / Float32(self.hidden_size) + Float32(self.rms_epsilon),
                 fastmath=True,
             )
+            if cutlass.const_expr(self.rows == 2):
+                second_full_sum = _block_sum(second_sum, second_warp_sums, self.warps)
+                second_inverse_rms = cute.math.rsqrt(
+                    second_full_sum / Float32(self.hidden_size)
+                    + Float32(self.rms_epsilon),
+                    fastmath=True,
+                )
             for trip in cutlass.range_constexpr(self.trips):
                 fragment = tidx + trip * self.threads
                 if fragment < self.fragments:
@@ -489,26 +751,24 @@ class PlbMaterializeRMSNormDeviceKernel:
                         * inverse_rms
                         * gamma_value
                     ).to(BFloat16)
-                    output_offset = (
-                        Int64(token) * self.hidden_size + Int64(fragment) * VEC_BF16
+                    self._store_norm(
+                        norm_output, fp8_output, inverse_scale, token, fragment, result
                     )
-                    packed_result = bf16x8_to_packed_u32x4(result)
-                    store_global_u32x4(
-                        Int64((norm_output.iterator + output_offset).toint()),
-                        packed_result,
-                    )
-                    if cutlass.const_expr(self.fp8_out):
-                        quantized = cute.make_rmem_tensor(
-                            cute.make_layout((2,)), Uint32
-                        )
-                        quantized[0] = _bf16x4_to_e4m3x4(
-                            packed_result[0], packed_result[1], inverse_scale
-                        )
-                        quantized[1] = _bf16x4_to_e4m3x4(
-                            packed_result[2], packed_result[3], inverse_scale
-                        )
-                        # one byte an element
-                        store_global_u32x2(fp8_output + output_offset, quantized.load())
+                    if cutlass.const_expr(self.rows == 2):
+                        if has_second:
+                            second_result = (
+                                second_fragments[trip, None].load().to(Float32)
+                                * second_inverse_rms
+                                * gamma_value
+                            ).to(BFloat16)
+                            self._store_norm(
+                                norm_output,
+                                fp8_output,
+                                inverse_scale,
+                                second,
+                                fragment,
+                                second_result,
+                            )
 
         if cutlass.const_expr(self.enable_pdl and self.poll_before_wait):
             # The reduce kernel (and so everything before it) completes before the
@@ -519,48 +779,23 @@ class PlbMaterializeRMSNormDeviceKernel:
             if cutlass.const_expr(self.enable_pdl):
                 cute.arch.griddepcontrol_launch_dependents()
 
-        for trip in cutlass.range_constexpr(self.trips):
-            fragment = tidx + trip * self.threads
-            if fragment < self.fragments:
-                mailbox_offset = (
-                    Int64(stage) * self.capacity_m + Int64(token)
-                ) * self.hidden_size + Int64(fragment) * VEC_BF16
-                store_lamport_sentinel_u32x4(
-                    Int64((prenorm_mailbox.iterator + mailbox_offset).toint())
-                )
-
-
-class PlbMaterializeRMSNormFp8DeviceKernel(PlbMaterializeRMSNormDeviceKernel):
-    """With the E4M3 rows' address and the scale's address (an fp32 scalar)."""
-
-    def __init__(self, **kwargs) -> None:
-        super().__init__(**kwargs, fp8_out=True)
-
-    @cute.jit
-    def __call__(
-        self,
-        prenorm_mailbox: cute.Tensor,
-        residual_output: cute.Tensor,
-        norm_output: cute.Tensor,
-        gamma: cute.Tensor,
-        stage_state: cute.Tensor,
-        fp8_output: Int64,
-        fp8_scale: Int64,
-        m: Int32,
-        stream: cuda.CUstream,
-    ) -> None:
-        self.kernel(
-            prenorm_mailbox,
-            residual_output,
-            norm_output,
-            gamma,
-            stage_state,
-            fp8_output,
-            fp8_scale,
-        ).launch(
-            grid=(m, 1, 1),
-            block=(self.threads, 1, 1),
-            smem=self.warps * 4,
-            stream=stream,
-            use_pdl=self.enable_pdl,
-        )
+        if cutlass.const_expr(self.reset_own):
+            for trip in cutlass.range_constexpr(self.trips):
+                fragment = tidx + trip * self.threads
+                if fragment < self.fragments:
+                    store_lamport_sentinel_u32x4(
+                        Int64(
+                            self._mailbox_pointer(
+                                prenorm_mailbox, stage, token, fragment
+                            ).toint()
+                        )
+                    )
+                    if cutlass.const_expr(self.rows == 2):
+                        if has_second:
+                            store_lamport_sentinel_u32x4(
+                                Int64(
+                                    self._mailbox_pointer(
+                                        prenorm_mailbox, stage, second, fragment
+                                    ).toint()
+                                )
+                            )

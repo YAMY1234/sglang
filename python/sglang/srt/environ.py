@@ -1239,6 +1239,14 @@ class Envs:
     # wait; 2: also the OwnerReduceMulticast lets it launch right after its own wait (TensorRT-LLM's twoshot +
     # rmsNormLamport order)
     SGLANG_PLB_MAT_LAMPORT = EnvInt(0)
+    # PERF-LB: the BT OwnerReduceMulticast writes the -0 sentinel back into the previous call's prenorm rows, so the
+    # MaterializeRMSNorm no longer resets its own rows; bit for bit the same outputs
+    SGLANG_PLB_MAT_RESET_IN_OR = EnvBool(False)
+    # PERF-LB: the BT MaterializeRMSNorm resets the previous call's prenorm rows before its grid-dependency wait instead
+    # of its own after the norm; bit for bit the same outputs
+    SGLANG_PLB_MAT_RESET_EARLY = EnvBool(False)
+    # PERF-LB: above this many rows the BT MaterializeRMSNorm takes 2 rows a CTA (0: never); bit for bit the same
+    SGLANG_PLB_MAT_ROWS2_MIN = EnvInt(0)
     # PERF-LB: the MoE finalize's BT MaterializeRMSNorm also writes the static per-tensor E4M3 input of the next layer's
     # in_proj_qkvz / qkv_proj, whose quantize kernel then does not run; byte for byte SGLang's quantization
     SGLANG_PLB_AR_FP8_OUT = EnvBool(False)

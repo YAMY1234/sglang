@@ -433,16 +433,30 @@ class FlashInferMNNVLCuteDSLARFusion:
         """The PERF-LB BT MaterializeRMSNorm (plb_mnnvl_cutedsl), or None when off."""
         lamport = envs.SGLANG_PLB_MAT_LAMPORT.get()
         fp8_out = envs.SGLANG_PLB_AR_FP8_OUT.get()
-        if not (lamport or fp8_out):
+        reset_in_or = envs.SGLANG_PLB_MAT_RESET_IN_OR.get()
+        reset_early = envs.SGLANG_PLB_MAT_RESET_EARLY.get()
+        rows2_min = envs.SGLANG_PLB_MAT_ROWS2_MIN.get()
+        if not (lamport or fp8_out or reset_in_or or reset_early or rows2_min):
             return None
         from sglang.srt.layers.plb_mnnvl_cutedsl import BTTailPatch
 
-        patch = BTTailPatch(self.workspace, lamport=lamport, fp8_out=fp8_out)
+        patch = BTTailPatch(
+            self.workspace,
+            lamport=lamport,
+            fp8_out=fp8_out,
+            reset_in_or=reset_in_or,
+            reset_early=reset_early,
+            rows2_min=rows2_min,
+        )
         patch.install()
         logger.info(
-            "MNNVL CuTe DSL (PERF-LB): BT tail lamport=%d, "
+            "MNNVL CuTe DSL (PERF-LB): BT tail lamport=%d, reset in reduce=%s, "
+            "early reset in norm=%s, 2 rows a CTA above %d rows, "
             "E4M3 copy for the next projection=%s",
             lamport,
+            reset_in_or,
+            reset_early,
+            rows2_min,
             bool(patch.fp8_tails),
         )
         return patch
