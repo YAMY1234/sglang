@@ -107,14 +107,19 @@ def stage_next_draft(
 
 
 class Step2Check:
-    """Device-side counts of staged passes whose staged inputs differ from the eager ones."""
+    """Device-side counts of staged passes whose staged inputs differ from the eager ones, per
+    field and per batch size, and the first difference seen (field, row-major position, batch
+    size, staged value, eager value); read only when summarized."""
 
     FIELDS = ("seq_lens", "positions", "mrope", "draft_out_cache_loc", "window")
 
     def __init__(self, device):
-        self.mismatch = torch.zeros(len(self.FIELDS), dtype=torch.int64, device=device)
-        self.check_ct = 0
+        self.device = device
+        self.mismatch_by_bs: dict[int, torch.Tensor] = {}
+        self.check_ct_by_bs: collections.Counter = collections.Counter()
         self.shape_mismatch_ct = 0
+        # field, position, batch size, staged value, eager value; field -1: none yet
+        self.first = torch.tensor([-1, -1, 0, 0, 0], dtype=torch.int64, device=device)
 
     def compare(
         self,
@@ -127,6 +132,11 @@ class Step2Check:
         num_steps: int,
     ) -> None:
         bs = staged.num_requests
+        counts = self.mismatch_by_bs.get(bs)
+        if counts is None:
+            counts = self.mismatch_by_bs[bs] = torch.zeros(
+                len(self.FIELDS), dtype=torch.int64, device=self.device
+            )
         draft_locs = None
         if window is not None and window.numel() % bs == 0:
             draft_locs = window.view(bs, -1)[:, :num_steps].reshape(-1)
@@ -138,14 +148,38 @@ class Step2Check:
             if a.shape != b.shape:
                 self.shape_mismatch_ct += 1
                 continue
-            self.mismatch[i] += (a != b.to(a.dtype)).any()
-        self.check_ct += 1
+            a, b = a.reshape(-1), b.reshape(-1).to(a.dtype)
+            diff = a != b
+            any_diff = diff.any()
+            counts[i] += any_diff
+            pos = torch.argmax(diff.to(torch.int8)).view(1)
+            record = torch.cat(
+                [
+                    torch.full_like(pos, i),
+                    pos,
+                    torch.full_like(pos, bs),
+                    a.index_select(0, pos),
+                    b.index_select(0, pos),
+                ]
+            )
+            self.first.copy_(torch.where(any_diff & (self.first[0] < 0), record, self.first))
+        self.check_ct_by_bs[bs] += 1
 
     def summary(self) -> str:
-        counts = self.mismatch.tolist()
-        return f"compared {self.check_ct}, mismatching " + ", ".join(
-            f"{name} {n}" for name, n in zip(self.FIELDS, counts)
-        ) + f", shape {self.shape_mismatch_ct}"
+        parts = []
+        for bs in sorted(self.mismatch_by_bs):
+            counts = self.mismatch_by_bs[bs].tolist()
+            parts.append(
+                f"B{bs}: compared {self.check_ct_by_bs[bs]}, mismatching "
+                + " ".join(f"{name} {n}" for name, n in zip(self.FIELDS, counts))
+            )
+        field, pos, bs, mine, eager = self.first.tolist()
+        first = (
+            "none"
+            if field < 0
+            else f"{self.FIELDS[field]}[{pos}] at B{bs}: staged {mine}, eager {eager}"
+        )
+        return "; ".join(parts) + f"; shape {self.shape_mismatch_ct}; first difference {first}"
 
 
 class Step2Counter:
