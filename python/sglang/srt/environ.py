@@ -1353,6 +1353,9 @@ class Envs:
     # An ungated exact CP-lite call writes the caller's attention output gate and o_proj's static FP8 input
     # quantization in its per-head merge (CpLite.offer_gate_epilogue), bit for bit the separate launch.
     SGLANG_PSM_CP_GATE_EPILOGUE = EnvBool(False)
+    # An ungated exact CP-lite call's q exchange in this many programs per row (1: one, as before), on an LL region and
+    # epoch counters of its own (TRT-LLM's _ll_group moves 256-word blocks, one per program).
+    SGLANG_PSM_CP_GATHER_CHUNKS = EnvInt(1)
     # PERF-LB: the fused CP-lite partial (batches <= 32) shares one CTA per SM among the requests by their owned KV
     # (TRT's TRTLLM_Q35_ATTN_CP_BALANCED_SPLIT): no idle SMs when splits x batch < SMs, a ragged batch costs its total
     # KV instead of its longest request's. SM_RESERVE: SMs left out of that grid.

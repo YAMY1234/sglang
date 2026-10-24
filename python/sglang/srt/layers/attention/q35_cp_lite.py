@@ -399,6 +399,7 @@ def _cp_gather_q_ll(
     CP: tl.constexpr, WORDS: tl.constexpr, QL: tl.constexpr, FOLD: tl.constexpr,
     GATE: tl.constexpr, NB: tl.constexpr, GMAX: tl.constexpr, GWRITE: tl.constexpr, TRIG: tl.constexpr = False,
     qv=None, vstart=None, vcnt=None, CHUNK: tl.constexpr = False, WAIT: tl.constexpr = False,
+    NCH: tl.constexpr = 1,
 ):
     """LL variant of _cp_gather_q: every 4-byte word travels with the call's epoch in one 8-byte store.
     FOLD: q_all is written source-major per request ([B, CP, QL, heads, D]) for the prefix-only fused partial,
@@ -408,31 +409,36 @@ def _cp_gather_q_ll(
     TRIG (no GWRITE): releases the dependent grid at entry; the fused partial reads only lengths, tables and prefix KV
     before its griddepcontrol.wait, none of them written here.
     WAIT: launched as a programmatic dependent of q's writer, which writes none of what the partial reads before its
-    wait either; every access here follows the wait."""
+    wait either; every access here follows the wait.
+    NCH > 1 (ungated FOLD calls only): rows * NCH programs, program p moves words [(p % NCH) * WORDS / NCH, ...) of row
+    p // NCH with its own epoch cnt[p] (the caller passes an LL region and counters only these calls use)."""
     if TRIG:
         tl.extra.cuda.gdc_launch_dependents()
     if WAIT:
         _gdc_wait_clobber()
-    i = tl.program_id(0)
+    pid = tl.program_id(0)
+    i = pid // NCH
+    jc = pid % NCH
+    CW: tl.constexpr = WORDS // NCH
     if GATE:
         on = _gate_on(seq_lens, nb, thr, NB, GMAX)
-        if GWRITE and i % QL == 0:
+        if GWRITE and i % QL == 0 and jc == 0:
             Lb = tl.load(seq_lens + i // QL)
             tl.store(stock_lens + i // QL, tl.where(on, tl.minimum(Lb, QL), Lb))
             if FOLD:
                 tl.store(pre_lens + i // QL, tl.where(on, tl.maximum(Lb - QL, 0), 0))
         if on.to(tl.int32) == 0:
             return
-    e = tl.load(cnt + i) + 1
+    e = tl.load(cnt + pid) + 1
     flag = e.to(tl.int64) << 32
-    w = tl.arange(0, WORDS)
+    w = jc * CW + tl.arange(0, CW)
     x = _ll_pack(flag, tl.load(q + i * q_stride + w))
     for c in tl.static_range(CP):
         dst = (tl.load(peers + c) + ll_off + (i * CP + me) * WORDS * 8).to(tl.pointer_type(tl.int64))
         tl.store(dst + w, x)
     own = tl.load(peers + me) + ll_off
     for c in tl.static_range(CP):
-        v = _ll_wait((own + (i * CP + c) * WORDS * 8).to(tl.pointer_type(tl.int64)), WORDS, e)
+        v = _ll_wait((own + (i * CP + c) * WORDS * 8).to(tl.pointer_type(tl.int64)) + jc * CW, CW, e)
         if FOLD:
             slot = ((i // QL) * CP + c) * QL + i % QL
         else:
@@ -444,9 +450,9 @@ def _cp_gather_q_ll(
             for j in range(0, tl.load(vcnt + i // QL)):
                 tl.store(qv + ((v0 + j) * (QL * CP) + (i % QL) * CP + c).to(tl.int64) * WORDS + w, val)
     if FOLD and not GATE:
-        if i % QL == 0:
+        if i % QL == 0 and jc == 0:
             tl.store(pre_lens + i // QL, tl.maximum(tl.load(seq_lens + i // QL) - QL, 0))
-    tl.store(cnt + i, e)
+    tl.store(cnt + pid, e)
 
 
 @triton.jit
@@ -793,8 +799,15 @@ class CpLite:
         assert all(c in (0, 32, 64, 128, 256) for c in self.fold_chunk.values()), self.fold_chunk
         if self.merge_h or self.cp_ungated or self.fold_mh:
             total += _MAX_ROWS * cp * _LL_PWORDS * 8
+        # SGLANG_PSM_CP_GATHER_CHUNKS: the chunked q exchange of ungated calls, on its own LL region and counters
+        self.q_chunks = envs.SGLANG_PSM_CP_GATHER_CHUNKS.get() if self.cp_ungated else 1
+        assert (q_heads * HEAD_DIM // 4) % self.q_chunks == 0, self.q_chunks
+        self.llq2_off = total
+        if self.q_chunks > 1:
+            total += _MAX_ROWS * cp * (q_heads * HEAD_DIM // 4) * 8
         self.ll = envs.SGLANG_TRTL1_ATTN_CP_LL.get() and q_heads * HEAD_DIM // 2 + q_heads <= _LL_PWORDS
         self.cnt = torch.zeros(_KINDS, _MAX_ROWS, dtype=torch.int32, device=self.device)
+        self.cnt_q2 = torch.zeros(_MAX_ROWS * self.q_chunks, dtype=torch.int32, device=self.device)
         self.sms = torch.cuda.get_device_properties(self.device).multi_processor_count
         self.fused = self.ll and envs.SGLANG_TRTL1_ATTN_CP_FUSED.get()
         # exact: the fused kernel on the context prefix only (q_len folded into the heads), the causal block in the
@@ -1128,10 +1141,12 @@ class CpLite:
         """Ungated exact call (TRT-L18): gather (releases at entry), fused partial as a programmatic dependent on the
         prefix lengths it derives from seq_lens, then the per-(row, head) merge."""
         words = self.hq * HEAD_DIM // 4
-        _cp_gather_q_ll[(rows,)](
-            q.view(torch.int32), words, self.peers, self.me, self.llq_off, self.q_all.view(torch.int32),
-            self.cnt[0], seq_lens, self.pre_lens, self.stock_lens, **gate,
-            CP=self.cp, WORDS=words, QL=q_len, FOLD=True, GWRITE=False, TRIG=True, WAIT=self.gather_pdl,
+        nch = self.q_chunks
+        _cp_gather_q_ll[(rows * nch,)](
+            q.view(torch.int32), words, self.peers, self.me, self.llq_off if nch == 1 else self.llq2_off,
+            self.q_all.view(torch.int32), self.cnt[0] if nch == 1 else self.cnt_q2, seq_lens, self.pre_lens,
+            self.stock_lens, **gate,
+            CP=self.cp, WORDS=words, QL=q_len, FOLD=True, GWRITE=False, TRIG=True, WAIT=self.gather_pdl, NCH=nch,
             num_warps=4, launch_pdl=self.gather_pdl,
         )
         self._exact_partial(k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale,
