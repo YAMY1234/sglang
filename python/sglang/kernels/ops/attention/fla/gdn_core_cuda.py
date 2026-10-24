@@ -25,6 +25,15 @@ wait, ``gdn_replayssm_commit_cuda``'s products on those entries (bit for bit its
 folded checkpoint is stored, the step runs on it with no history and its rows go in after the folded entries,
 wrapping. The value heads of one key head launch as one cluster: a cluster barrier orders the group's reads of the
 shared key ring (staged in shared memory before the wait) before its writer CTA overwrites folded entries.
+
+``fold=2`` (SGLANG_PST_GDN_TRT_FOLD, TensorRT-LLM's ``q35_gdn_core`` checkpoint): the ring is two buffers of 16
+entries (``cache_base`` 0 or 16); a request whose step rows do not fit after its history folds that history into
+its checkpoint before the wait (bf16 high / low updates times the BF16 keys, two products; the result staged in
+shared memory and stored after the wait), still replays the history for this step's outputs, and writes its rows to
+the other buffer from entry 0, so no CTA overwrites an entry another one reads and no cluster is needed. Every
+earlier-step read (cursors, checkpoint rows, history decays / updates, keys staged in shared memory) is issued
+before the wait. Outputs equal ``fold=0``'s on the same history; the checkpoint equals
+``gdn_replayssm_commit_cuda``'s fold of the history without low parts.
 """
 
 from __future__ import annotations
@@ -46,14 +55,21 @@ typedef unsigned int u32;
 
 #define KD 128
 #define VD 128
-#define RING 16
+#define HIST 16  // history capacity: the ring, or one of FOLD 2's two buffers
 #define MT (VD / (16 * NW))
 #define FULL 0xffffffffu
 #ifndef CONV
 #define CONV 0
 #endif
 #ifndef FOLD
-#define FOLD 0  // SGLANG_PLB_GDN_FOLD_IN_VERIFY: the core folds a full ring (launched in clusters of a key head's CTAs)
+// 1: SGLANG_PLB_GDN_FOLD_IN_VERIFY (folds a full ring, launched in clusters of a key head's CTAs);
+// 2: SGLANG_PST_GDN_TRT_FOLD (TensorRT-LLM's two history buffers)
+#define FOLD 0
+#endif
+#if FOLD == 2
+#define RING 32  // ring entries a slot: two buffers of HIST
+#else
+#define RING 16
 #endif
 #define CCH (2 * KD + VD)  // CONV: the CTA's channels: its key head's q, k, then its value head's v
 
@@ -201,6 +217,19 @@ __device__ __forceinline__ float window(float gt, int len, int lane, const int (
   return __expf(tot);
 }
 #endif
+#if FOLD == 2
+// earlier-step loads pinned before griddepcontrol.wait (ptxas may sink plain read-only loads past it)
+__device__ __forceinline__ u16 ld_pin_u16(const u16* p) {
+  u16 r;
+  asm volatile("ld.global.L1::no_allocate.b16 %0, [%1];" : "=h"(r) : "l"(p));
+  return r;
+}
+__device__ __forceinline__ float ld_pin_f32(const float* p) {
+  float r;
+  asm volatile("ld.global.L1::no_allocate.f32 %0, [%1];" : "=f"(r) : "l"(p));
+  return r;
+}
+#endif
 __device__ __forceinline__ long long load_index(const void* p, int i, bool i64) {
   return i64 ? reinterpret_cast<const long long*>(p)[i] : (long long)reinterpret_cast<const int*>(p)[i];
 }
@@ -322,7 +351,7 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) gdn_core(const Param
 #pragma unroll
       for (int c = 0; c < 4; ++c)
         H[m][h][c] = live ? ld16(sp + (vb + 16 * m + 8 * h + r) * KD + 32 * c + 8 * q) : zero4();
-#if FOLD
+#if FOLD == 1
   // the ring's keys (high, low) of this key head, staged by 16-byte async copies on the replay row alone (the
   // history scores read them too); with them in flight the cursors arrive, then the fold's decays and updates
   __shared__ __align__(16) u16 s_key[2][RING][KP];
@@ -361,6 +390,7 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) gdn_core(const Param
   // cluster, one request, decides alike)
   const bool fold = wp + TT > RING;
   const int hist = fold ? 0 : wp;
+  const int wb = base + wp;  // this step's first ring entry (mod RING)
   u32 AH[MT][4], AL[MT][4];  // the fold's A fragments: bf16 high / low of (update_j e^{g_total - G_j})
   float etot = 1.f;
   if (fold) {
@@ -431,6 +461,147 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) gdn_core(const Param
         }
     }
   }
+#elif FOLD == 2
+  long long rid = 0;
+  int wp = 0, base = 0;
+  if (live) {
+    rid = rid0;
+    wp = p.write_pos[rid];
+    base = p.cache_base[rid];
+    live = p.is_flush[rid] == 0;
+  }
+  if (!live) {
+    // padding (or a flush row, which the verify never sees): zeros for out_proj
+    pdl_wait();
+#if CONV
+    if (slot >= 0) conv_stage(p, row0, hk, hv, tid, wslot, cw, cs, nullptr);
+#endif
+    for (int t = 0; t < TT && tid < VD; ++t) {
+      p.y[(row0 + t) * p.y_stride + hv * VD + tid] = 0;
+#if STORE_O
+      p.o_out[((row0 + t) * HV + hv) * VD + tid] = 0;
+#endif
+    }
+    return;
+  }
+  static_assert(TT <= 8, "a fold covers more than 8 entries: the commit's m16n8k16 products");
+  // the history (wp <= HIST entries from cache_base, one buffer) is replayed whether or not it folds; a fold also
+  // writes the checkpoint after it, and this step's rows go to the other buffer from its entry 0
+  const int hist = wp;
+  const bool fold = wp + TT > HIST;
+  const int wb = fold ? (base ^ HIST) : base + wp;  // this step's first ring entry
+  // the history's keys (high parts) of this key head in history order, by 16-byte async copies
+  __shared__ __align__(16) u16 s_key[HIST][KP];
+  {
+    const u16* kp = p.ring_k + rid * p.k_slot + (long long)hk * RING * KD;
+    for (int i = tid; i < hist * (KD / 8); i += NW * 32) {
+      const int j = i >> 4, col = (i & 15) * 8;
+      cp_async16(&s_key[j][col], kp + ((base + j) & (RING - 1)) * KD + col);
+    }
+  }
+  // the replay's decays and A fragments bf16(d_j e^{g_total - G_j}) (rows v, entries j = 2q, 2q + 1 | 2q + 8, 2q + 9),
+  // which the fold's products take as their high parts
+  const int jj[4] = {2 * q, 2 * q + 1, 2 * q + 8, 2 * q + 9};
+  float uu[MT][2][4];  // d_j[v] e^{g_total - G_j}: [m-tile][half][j index]
+  float td = 1.f;      // e^{g_total}
+  if (hist > 0) {
+    float gj = lane < hist ? ld_pin_f32(p.ring_g + rid * p.g_slot + hv * RING + ((base + lane) & (RING - 1))) : 0.f;
+    const u16* dp = p.ring_d + rid * p.d_slot + (long long)hv * RING * VD;
+    u16 du[MT][2][4];
+#pragma unroll
+    for (int m = 0; m < MT; ++m)
+#pragma unroll
+      for (int h = 0; h < 2; ++h)
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+          du[m][h][i] =
+              jj[i] < hist ? ld_pin_u16(dp + ((base + jj[i]) & (RING - 1)) * VD + vb + 16 * m + 8 * h + r) : (u16)0;
+#pragma unroll
+    for (int d = 1; d < 32; d <<= 1) {
+      const float o = __shfl_up_sync(FULL, gj, d);
+      if (lane >= d) gj += o;
+    }
+    const float gtot = __shfl_sync(FULL, gj, 31);
+    float dec[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const float pj = __shfl_sync(FULL, gj, jj[i]);
+      dec[i] = jj[i] < hist ? tl_exp(gtot - pj) : 0.f;
+    }
+    td = tl_exp(gtot);
+#pragma unroll
+    for (int m = 0; m < MT; ++m)
+#pragma unroll
+      for (int h = 0; h < 2; ++h)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) uu[m][h][i] = jj[i] < hist ? bf2f(du[m][h][i]) * dec[i] : 0.f;
+  } else {
+#pragma unroll
+    for (int m = 0; m < MT; ++m)
+#pragma unroll
+      for (int h = 0; h < 2; ++h)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) uu[m][h][i] = 0.f;
+  }
+  u32 AH[MT][4];  // a0..a3: (half 0, j 2q..), (half 1, j 2q..), (half 0, j 2q + 8..), (half 1, j 2q + 8..)
+#pragma unroll
+  for (int m = 0; m < MT; ++m) {
+    AH[m][0] = pack2(uu[m][0][0], uu[m][0][1]);
+    AH[m][1] = pack2(uu[m][1][0], uu[m][1][1]);
+    AH[m][2] = pack2(uu[m][0][2], uu[m][0][3]);
+    AH[m][3] = pack2(uu[m][1][2], uu[m][1][3]);
+  }
+  cp_async_wait_all();
+  __syncthreads();  // the staged keys
+  __shared__ U4 s_hc[VD][17];  // the folded checkpoint rows until after the wait (row v, 16-byte chunk 4 c + q)
+  if (fold) {
+    // h = bf16(h e^{g_total} + K^T U) with U's bf16 high / low parts and the BF16 keys: gdn_replayssm_commit's
+    // fold_store<true> without key low parts. B column n = r holds k = 32 c + 8 (r >> 1) + 2 e + (r & 1), so the
+    // C fragment of lane q is word e of its chunk c; entries j >= hist (keys not staged) are masked to zero
+    u32 AL[MT][4];
+#pragma unroll
+    for (int m = 0; m < MT; ++m) {
+      AL[m][0] = pack2(uu[m][0][0] - bflo(AH[m][0]), uu[m][0][1] - bfhi(AH[m][0]));
+      AL[m][1] = pack2(uu[m][1][0] - bflo(AH[m][1]), uu[m][1][1] - bfhi(AH[m][1]));
+      AL[m][2] = pack2(uu[m][0][2] - bflo(AH[m][2]), uu[m][0][3] - bfhi(AH[m][2]));
+      AL[m][3] = pack2(uu[m][1][2] - bflo(AH[m][3]), uu[m][1][3] - bfhi(AH[m][3]));
+    }
+    const u32 sel = (r & 1) ? 0x7632u : 0x5410u;
+    const u32 m01 = (jj[0] < hist ? 0xffffu : 0u) | (jj[1] < hist ? 0xffff0000u : 0u);
+    const u32 m23 = (jj[2] < hist ? 0xffffu : 0u) | (jj[3] < hist ? 0xffff0000u : 0u);
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+      U4 kh[4];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) kh[i] = ld16(&s_key[jj[i]][32 * c + 8 * (r >> 1)]);
+      u32 out[MT][2][4];
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        const u32 b0 = __byte_perm(word(kh[0], e), word(kh[1], e), sel) & m01;
+        const u32 b1 = __byte_perm(word(kh[2], e), word(kh[3], e), sel) & m23;
+#pragma unroll
+        for (int m = 0; m < MT; ++m) {
+          float a[4] = {0.f, 0.f, 0.f, 0.f};
+          mma16816(a, AH[m][0], AH[m][1], AH[m][2], AH[m][3], b0, b1);
+          mma16816(a, AL[m][0], AL[m][1], AL[m][2], AL[m][3], b0, b1);
+          const u32 w0 = word(H[m][0][c], e), w1 = word(H[m][1][c], e);
+          out[m][0][e] = pack2(fmaf(bflo(w0), td, a[0]), fmaf(bfhi(w0), td, a[1]));
+          out[m][1][e] = pack2(fmaf(bflo(w1), td, a[2]), fmaf(bfhi(w1), td, a[3]));
+        }
+      }
+#pragma unroll
+      for (int m = 0; m < MT; ++m)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+          U4 v4;
+          v4.x = out[m][h][0];
+          v4.y = out[m][h][1];
+          v4.z = out[m][h][2];
+          v4.w = out[m][h][3];
+          s_hc[vb + 16 * m + 8 * h + r][4 * c + q] = v4;
+        }
+    }
+  }
 #else
   long long rid = 0;
   int wp = 0, base = 0;
@@ -455,6 +626,7 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) gdn_core(const Param
     return;
   }
   const int hist = wp;
+  const int wb = base + wp;  // this step's first ring entry
 #endif
   const float negAexp = -tl_exp(load_param(p.A_log, hv, p.alog_bf16 != 0));
   const float dtb = load_param(p.dt_bias, hv, p.dtb_bf16 != 0);
@@ -536,7 +708,7 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) gdn_core(const Param
     ar = p.a[(row0 + lane) * p.ab_stride + hv];
     br_ = p.b[(row0 + lane) * p.ab_stride + hv];
   }
-#if FOLD
+#if FOLD == 1
   if (fold) {
     u16* spw = const_cast<u16*>(sp);
 #pragma unroll
@@ -545,6 +717,20 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) gdn_core(const Param
       for (int h = 0; h < 2; ++h)
 #pragma unroll
         for (int c = 0; c < 4; ++c) st16(spw + (vb + 16 * m + 8 * h + r) * KD + 32 * c + 8 * q, H[m][h][c]);
+  }
+#elif FOLD == 2
+  if (fold) {
+    // the folded checkpoint, staged by this lane before the wait
+    u16* spw = const_cast<u16*>(sp);
+#pragma unroll
+    for (int m = 0; m < MT; ++m)
+#pragma unroll
+      for (int h = 0; h < 2; ++h)
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+          const int v = vb + 16 * m + 8 * h + r;
+          st16(spw + v * KD + 32 * c + 8 * q, s_hc[v][4 * c + q]);
+        }
   }
 #endif
   float kmul;       // 1 / |k_r|
@@ -639,15 +825,15 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) gdn_core(const Param
     HKs[m][2] *= km0;
     HKs[m][3] *= km1;
   }
-  // this step's ring entries at (base + wp + t) mod RING, t < TT, wp + t < RING: keys (warp 2) and
+  // this step's ring entries at (wb + t) mod RING, t < TT (FOLD 0: wp + t < RING): keys (warp 2) and
   // log-decays (warp 3) now, while warps 0 / 1 finish the head-common products; updates at the end
-#if FOLD
+#if FOLD == 1
   if (fold) cluster_wait();  // every CTA of the key group has read the folded keys
 #endif
   if (warp == 3 && lane < TT && (FOLD || wp + lane < RING))
-    p.ring_g[rid * p.g_slot + hv * RING + ((base + wp + lane) & (RING - 1))] = gl;
+    p.ring_g[rid * p.g_slot + hv * RING + ((wb + lane) & (RING - 1))] = gl;
   if (warp == 2 && hv % GRP == 0 && r < TT && (FOLD || wp + r < RING)) {
-    const long long off = ((long long)hk * RING + ((base + wp + r) & (RING - 1))) * KD;
+    const long long off = ((long long)hk * RING + ((wb + r) & (RING - 1))) * KD;
     u16* kp = p.ring_k + rid * p.k_slot + off;
     u16* klp = p.ring_klo ? p.ring_klo + rid * p.klo_slot + off : nullptr;
 #pragma unroll
@@ -687,8 +873,10 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) gdn_core(const Param
 #pragma unroll
     for (int jt = 0; jt < 2; ++jt) {
       const int j = 8 * jt + r;
-#if FOLD
+#if FOLD == 1
       const u16* kh = &s_key[0][(base + j) & (RING - 1)][0];  // staged before the wait
+#elif FOLD == 2
+      const u16* kh = &s_key[j][0];  // staged before the wait, in history order
 #else
       const u16* kh = p.ring_k + rid * p.k_slot + ((long long)hk * RING + ((base + j) & (RING - 1))) * KD;
 #endif
@@ -713,6 +901,24 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) gdn_core(const Param
   }
   __syncthreads();
 
+#if FOLD == 2
+  if (hist > 0) {
+    // committed history: hw = e^{g_total} hw + bf16(d_j e^{g_total - G_j}) . bf16(scores), A fragments from before
+    // the wait
+    const u32 bq0 = s_sc[0][0][lane], bq1 = s_sc[0][1][lane];
+    const u32 bk0 = s_sc[1][0][lane], bk1 = s_sc[1][1][lane];
+#pragma unroll
+    for (int m = 0; m < MT; ++m) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        HQ[m][i] *= td;
+        HKs[m][i] *= td;
+      }
+      mma16816(HQ[m], AH[m][0], AH[m][1], AH[m][2], AH[m][3], bq0, bq1);
+      mma16816(HKs[m], AH[m][0], AH[m][1], AH[m][2], AH[m][3], bk0, bk1);
+    }
+  }
+#else
   if (hist > 0) {
     // committed history: hw = e^{g_total} hw + bf16(d_j e^{g_total - G_j}) . bf16(scores)
     float gj = 0.f;
@@ -755,6 +961,7 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) gdn_core(const Param
       mma16816(HKs[m], a0, a1, a2, a3, bk0, bk1);
     }
   }
+#endif
 
   // rhs = beta (v - e^G hw_k); forward substitution (I + A) U = rhs per value column, every lane of a quad
   // solving the quad's four columns after an all-gather
@@ -802,7 +1009,7 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) gdn_core(const Param
     u16* dp = p.ring_d + rid * p.d_slot + (long long)hv * RING * VD;
     u16* dlp = p.ring_dlo ? p.ring_dlo + rid * p.dlo_slot + (long long)hv * RING * VD : nullptr;
     const bool w0 = ok0 && (FOLD || wp + t0 < RING), w1 = ok1 && (FOLD || wp + t1 < RING);
-    const int ph0 = (base + wp + t0) & (RING - 1), ph1 = (base + wp + t1) & (RING - 1);
+    const int ph0 = (wb + t0) & (RING - 1), ph1 = (wb + t1) & (RING - 1);
 #pragma unroll
     for (int col = 0; col < 2 * MT; ++col) {
       const int v = vb + 16 * (col >> 1) + 8 * (col & 1) + r;
@@ -903,6 +1110,7 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) gdn_core(const Param
 
 K = V = 128
 RING = 16
+TRT_RING = 32  # fold=2 (SGLANG_PST_GDN_TRT_FOLD): two history buffers of 16 entries
 MAX_ROWS_PER_REQUEST = 8
 # 4 warps of 32 value columns (warps 2 / 3 also write the key / decay ring entries, so at least 4)
 _WARPS = 4
@@ -994,7 +1202,7 @@ def _key(
 ) -> tuple:
     return (
         qkv.device.index, rows_per_request, num_k_heads, checkpoint.shape[1],
-        norm_weight.dtype == torch.float32, 0, o_out is not None, warps, conv_weight is not None, bool(fold),
+        norm_weight.dtype == torch.float32, 0, o_out is not None, warps, conv_weight is not None, int(fold),
         min_blocks,
     )
 
@@ -1005,11 +1213,11 @@ def _ensure(key: tuple) -> None:
             _KERNELS[key] = _compile(key)
 
 
-def _ring_ok(t: Optional[torch.Tensor], heads: int) -> bool:
+def _ring_ok(t: Optional[torch.Tensor], heads: int, ring: int = RING) -> bool:
     return t is None or (
         t.dtype == torch.bfloat16
-        and tuple(t.shape[1:]) == (heads, RING, K)
-        and t.stride()[1:] == (RING * K, K, 1)
+        and tuple(t.shape[1:]) == (heads, ring, K)
+        and t.stride()[1:] == (ring * K, K, 1)
     )
 
 
@@ -1046,14 +1254,16 @@ def _unsupported(
         or checkpoint.data_ptr() % 16
     ):
         return "checkpoint"
-    if not (_ring_ok(ring_d, HV) and ring_d is not None and _ring_ok(ring_dlo, HV)):
+    fold = int(_.get("fold") or 0)
+    ring = TRT_RING if fold == 2 else RING
+    if not (_ring_ok(ring_d, HV, ring) and ring_d is not None and _ring_ok(ring_dlo, HV, ring)):
         return "update ring"
     # keys move as 16-byte rows
-    if not (_ring_ok(ring_k, H) and ring_k is not None and _ring_ok(ring_klo, H)) or any(
+    if not (_ring_ok(ring_k, H, ring) and ring_k is not None and _ring_ok(ring_klo, H, ring)) or any(
         t is not None and (t.stride(0) % 8 or t.data_ptr() % 16) for t in (ring_k, ring_klo)
     ):
         return "key ring"
-    if ring_g.dtype != torch.float32 or tuple(ring_g.shape[1:]) != (HV, RING) or ring_g.stride()[1:] != (RING, 1):
+    if ring_g.dtype != torch.float32 or tuple(ring_g.shape[1:]) != (HV, ring) or ring_g.stride()[1:] != (ring, 1):
         return "decay ring"
     if z.dtype != torch.bfloat16 or tuple(z.shape) != (rows, HV, V) or z.stride(2) != 1 or z.stride(1) != V:
         return "z"
@@ -1089,7 +1299,7 @@ def _unsupported(
         return "norm weight"
     if not norm_weight.is_contiguous() or input_scale.dtype != torch.float32 or input_scale.numel() != 1:
         return "norm weight / FP8 scale"
-    if _.get("fold") and (ring_dlo is None or ring_klo is None or HV // H > 8 or rows_per_request > 8):
+    if fold == 1 and (ring_dlo is None or ring_klo is None or HV // H > 8 or rows_per_request > 8):
         return "fold (SGLANG_PLB_GDN_FOLD_IN_VERIFY) needs the low-part ring, <= 8 value heads a key head, <= 8 rows"
     conv_weight = _.get("conv_weight")
     if conv_weight is not None:
@@ -1181,13 +1391,13 @@ def core(
     conv_state: Optional[torch.Tensor] = None,
     conv_windows: Optional[torch.Tensor] = None,
     inter_indices: Optional[torch.Tensor] = None,
-    fold: bool = False,
+    fold: int = 0,
 ) -> torch.Tensor:
     """Write the gated RMSNorm of the verify output as static FP8 into ``out`` [rows, HV * V].
 
     ``qkv`` [rows, >= (2 H + HV) * 128] BF16 convolved q | k | v rows; ``z`` [rows, HV, V]; ``a`` / ``b`` [rows, HV]
     views with one row stride; ``checkpoint`` [slots, HV, V, K] BF16 keyed by ``state_indices`` (negative: padding,
-    zero rows out); the ring [slots, HV | H, 16, V | K] (low parts optional) and its cursors keyed by
+    zero rows out); the ring [slots, HV | H, 16 (fold 2: 32), V | K] (low parts optional) and its cursors keyed by
     ``replay_indices``; ``rows_per_request`` rows per request. ``o_out`` [rows, HV, V] BF16 also receives the replay
     output; ``warps`` (>= 4) and ``min_blocks`` override the launch (checks and timing only). Callers go through
     ``try_core`` (shape checks, compile before capture)."""
@@ -1241,7 +1451,7 @@ def core(
     attr.id = cu.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION
     attr.value.programmaticStreamSerializationAllowed = 1
     attrs = [attr]
-    if fold:
+    if fold == 1:
         # SGLANG_PLB_GDN_FOLD_IN_VERIFY: the value heads of one key head (one request) as one cluster
         cl = cu.CUlaunchAttribute()
         cl.id = cu.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION

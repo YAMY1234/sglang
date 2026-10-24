@@ -1123,20 +1123,28 @@ def commit_mamba_states_after_verify(
         else:
             last_correct_step_indices, mamba_steps_to_track = prepared_step_indices
         fold_in_verify = mamba_pool.replayssm_fold_in_verify
+        trt_fold = mamba_pool.replayssm_trt_fold
         # Advance the per-request circular cursors by the accepted count (incl. the
-        # bonus token). max_cache_len = ring length L = replayssm_d.shape[-2].
+        # bonus token). max_cache_len = ring length L = replayssm_d.shape[-2], except
+        # SGLANG_PST_GDN_TRT_FOLD's two buffers of L in one ring of 2 L.
         commit_gdn_replayssm_spec(
             write_pos=mamba_pool.replayssm_spec_write_pos,
             cache_base=mamba_pool.replayssm_cache_base,
             is_flush=mamba_pool.replayssm_is_flush,
             num_accepted=accept_lens,  # [bs], includes the bonus token
             replay_indices=replay_indices,
-            max_cache_len=spec_state.replayssm_d.shape[-2],
+            max_cache_len=(
+                mamba_pool.replayssm_ring_capacity
+                if trt_fold
+                else spec_state.replayssm_d.shape[-2]
+            ),
             max_spec_len=draft_token_num,
             fold_every_commit=spec_state.temporal.dtype != torch.float32,
+            cache_buf_len=spec_state.replayssm_d.shape[-2],
             null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
             fold_in_verify=fold_in_verify,
             defer_fold=mamba_pool.replayssm_defer_fold,
+            fold_swap=trt_fold,
         )
         ring_commit = dict(
             checkpoint_state=spec_state.temporal,
