@@ -248,8 +248,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     _staged_inputs = None
     # the remove-stages feature the A/B turns off, whose graphs are also captured without it
     _perfll_ab: Optional[str] = None
-    # SGLANG_PERFLL_RS_T: (verify input_ids tensor, its version, batch size) of a chain tree
-    # that wrote this runner's inputs, taken by the next load_batch
+    # SGLANG_PERFLL_RS_T: (verify input_ids, out_cache_loc, their versions, batch size) of a
+    # chain tree that wrote this runner's inputs, taken by the next load_batch
     _t_staged: Optional[tuple] = None
     dllm_input_preparation = None
     dllm_attention = None
@@ -693,9 +693,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             b.seq_lens[:raw_bs],
         )
 
-    def note_staged_inputs(self, input_ids: torch.Tensor, raw_bs: int) -> None:
-        """A chain tree wrote this runner's inputs for the verify whose ids are ``input_ids``."""
-        self._t_staged = (input_ids, input_ids._version, raw_bs)
+    def note_staged_inputs(
+        self, input_ids: torch.Tensor, out_cache_loc: torch.Tensor, raw_bs: int
+    ) -> None:
+        """A chain tree wrote this runner's inputs for the verify whose ids are ``input_ids``
+        and whose write slots are ``out_cache_loc``."""
+        self._t_staged = (
+            input_ids,
+            out_cache_loc,
+            (input_ids._version, out_cache_loc._version),
+            raw_bs,
+        )
 
     def _take_staged_slots(self, forward_batch: ForwardBatch, raw_bs: int, bs: int):
         staged, self._t_staged = self._t_staged, None
@@ -703,10 +711,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             staged is None
             or raw_bs != bs
             or forward_batch.input_ids is not staged[0]
-            or staged[0]._version != staged[1]
-            or staged[2] != raw_bs
+            or staged[0]._version != staged[2][0]
+            or staged[3] != raw_bs
         ):
             return frozenset()
+        if (
+            forward_batch.out_cache_loc is not staged[1]
+            or staged[1]._version != staged[2][1]
+        ):
+            # the verify writes other slots (a translated plan): those are copied as before
+            return VERIFY_STAGED_SLOTS - {"out_cache_loc"}
         if raw_bs not in _T_ENGAGED:
             _T_ENGAGED.add(raw_bs)
             logger.info(

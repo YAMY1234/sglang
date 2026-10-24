@@ -544,22 +544,30 @@ class TestVerifyStagedInputs(CustomTestCase):
 
         runner = self._runner()
         ids = torch.zeros(12, dtype=torch.int64)
-        batch = SimpleNamespace(input_ids=ids)
-        runner.note_staged_inputs(ids, 2)
+        locs = torch.zeros(12, dtype=torch.int64)
+        batch = SimpleNamespace(input_ids=ids, out_cache_loc=locs)
+        runner.note_staged_inputs(ids, locs, 2)
         self.assertEqual(
             runner._take_staged_slots(batch, raw_bs=2, bs=2), mod.VERIFY_STAGED_SLOTS
         )
         # taken once
         self.assertEqual(runner._take_staged_slots(batch, raw_bs=2, bs=2), frozenset())
         for other, raw_bs, bs in (
-            (SimpleNamespace(input_ids=ids.clone()), 2, 2),  # another verify's ids
+            (SimpleNamespace(input_ids=ids.clone(), out_cache_loc=locs), 2, 2),
             (batch, 2, 4),  # padded
         ):
-            runner.note_staged_inputs(ids, 2)
+            runner.note_staged_inputs(ids, locs, 2)
             self.assertEqual(runner._take_staged_slots(other, raw_bs, bs), frozenset())
-        runner.note_staged_inputs(ids, 2)
+        runner.note_staged_inputs(ids, locs, 2)
         ids.add_(1)  # written after the chain tree
         self.assertEqual(runner._take_staged_slots(batch, raw_bs=2, bs=2), frozenset())
+        # write slots other than the staged ones (a translated plan) are still copied
+        runner.note_staged_inputs(ids, locs, 2)
+        translated = SimpleNamespace(input_ids=ids, out_cache_loc=locs.clone())
+        self.assertEqual(
+            runner._take_staged_slots(translated, raw_bs=2, bs=2),
+            mod.VERIFY_STAGED_SLOTS - {"out_cache_loc"},
+        )
 
 
 class TestRaggedVerifyLayoutPerTier(CustomTestCase):

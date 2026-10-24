@@ -604,8 +604,7 @@ class TestPerfllRsD1(CustomTestCase):
 
     def test_the_chain_tree_writes_the_verify_inputs_except_in_toff_blocks(self):
         """SGLANG_PERFLL_RS_T: the draft worker asks the target verify runner for its input views
-        only with the switch, outside the A/B's "toff" rounds, without a KV location plan, and
-        not for an idle batch."""
+        only with the switch, outside the A/B's "toff" rounds, and not for an idle batch."""
         from sglang.srt.model_executor.runner_backend import ab_variants
         from sglang.srt.speculative import perfll_rs
         from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
@@ -629,17 +628,16 @@ class TestPerfllRsD1(CustomTestCase):
             patch.object(perfll_rs, "_AB_OFF", labels),
             patch.object(perfll_rs, "_AB_LABELS", frozenset({"v3off", "toff"})),
         ):
-            for label, plan, b, want in (
-                ("on", None, batch, (views, 3)),
-                ("v3off+toff", None, batch, None),
-                ("on", object(), batch, None),
-                ("on", None, idle, None),
+            for label, b, want in (
+                ("on", batch, (views, 3)),
+                ("v3off+toff", batch, None),
+                ("on", idle, None),
             ):
                 with patch.object(ab_variants, "current", return_value=label):
-                    got = EagleDraftWorker._rs_t_views(worker, b, plan)
-                    self.assertEqual(got, want, (label, plan is None))
+                    got = EagleDraftWorker._rs_t_views(worker, b)
+                    self.assertEqual(got, want, label)
         with patch.object(perfll_rs, "T", False):
-            self.assertIsNone(EagleDraftWorker._rs_t_views(worker, batch, None))
+            self.assertIsNone(EagleDraftWorker._rs_t_views(worker, batch))
 
     def test_the_check_counts_each_field_and_keeps_the_first_difference(self):
         import os
