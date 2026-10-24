@@ -1627,6 +1627,10 @@ class Envs:
     # programs (page blocks dealt round-robin) instead of one, at the head of every
     # verify / draft / draft-extend graph; same writes.
     SGLANG_PERFLL_GLUE_META_SPLIT = EnvBool(False)
+    # The fused chain accept (SGLANG_Q35MF_FUSED_ACCEPT) matches a canonical chain's drafts
+    # against the targets in one vector compare instead of walking the tree node by node;
+    # other trees take the walk. Same outputs.
+    SGLANG_PERFLL_GLUE_LINEAR_ACCEPT = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
