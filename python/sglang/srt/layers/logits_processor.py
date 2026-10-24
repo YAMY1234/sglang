@@ -474,13 +474,23 @@ class LogitsProcessor(nn.Module):
         skip_all_gather: bool = False,
         logit_scale: Optional[float] = None,
         return_full_logits: bool = False,
+        use_attn_tp_group: Optional[bool] = None,
+        use_tp_lm_head_all_to_all: Optional[bool] = None,
     ):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
         self.logit_scale = logit_scale
-        self.use_attn_tp_group = get_parallel().enable_dp_lm_head
-        self.use_tp_lm_head_all_to_all = get_parallel().enable_tp_lm_head_all_to_all
+        self.use_attn_tp_group = (
+            get_parallel().enable_dp_lm_head
+            if use_attn_tp_group is None
+            else use_attn_tp_group
+        )
+        self.use_tp_lm_head_all_to_all = (
+            get_parallel().enable_tp_lm_head_all_to_all
+            if use_tp_lm_head_all_to_all is None
+            else use_tp_lm_head_all_to_all
+        )
         self.use_fp32_lm_head = get_exec().features.enable_fp32_lm_head or getattr(
             config, "enable_lm_head_fp32", False
         )

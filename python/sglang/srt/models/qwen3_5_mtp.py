@@ -193,7 +193,15 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                     prefix=add_prefix("lm_head", prefix),
                 )
 
-        self.logits_processor = LogitsProcessor(config)
+        # SGLANG_PERFHT_DRAFT_HEAD_TP_SLICE: the draft head stays vocab-parallel under --enable-dp-lm-head.
+        self._head_tp_slice = (
+            envs.SGLANG_PERFHT_DRAFT_HEAD_TP_SLICE.get() and get_parallel().enable_dp_lm_head
+        )
+        self.logits_processor = LogitsProcessor(
+            config,
+            use_attn_tp_group=False if self._head_tp_slice else None,
+            use_tp_lm_head_all_to_all=True if self._head_tp_slice else None,
+        )
         if self.model.draft_hop is not None:
             self.model.draft_hop.head_follows = self._mkd_head_follows
         # Input embedding handed over by the previous greedy draft step, if any.
@@ -317,13 +325,19 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             del self.model.embed_tokens.weight
             self.model.embed_tokens.weight = embed
         if head is not None and not self.config.tie_word_embeddings:
+            if self._head_tp_slice:
+                # The target head is replicated (full vocab); this rank's vocab-parallel shard is a view of it.
+                shard = self.lm_head.num_embeddings_per_partition
+                start = self.lm_head.shard_indices.org_vocab_start_index
+                head = head[start : start + shard]
+                assert head.shape[0] == shard, (head.shape, shard)
             del self.lm_head.weight
             self.lm_head.weight = head
         current_platform.empty_cache()
         current_platform.synchronize()
 
     def set_lm_head_from_target(self, target_lm_head):
-        if self.config.tie_word_embeddings:
+        if self.config.tie_word_embeddings or self._head_tp_slice:
             return
 
         self.lm_head = target_lm_head

@@ -2305,6 +2305,10 @@ class Envs:
     # TP lm_head all-to-all (attention DP): reassemble the vocab shards straight into the FP32 logits buffer with one
     # strided cast copy instead of a BF16 reassembly copy plus a cast copy.
     SGLANG_PERFHT_LMHEAD_A2A_FUSED_COPY = EnvBool(False)
+    # With --enable-dp-lm-head under attention DP (TRT's layout): the target verify reads the replicated lm_head on
+    # its own rows (no logits all-to-all); the MTP draft keeps a vocab-parallel head on a slice view of that weight,
+    # so K75P stays on.
+    SGLANG_PERFHT_DRAFT_HEAD_TP_SLICE = EnvBool(False)
     SGLANG_Q35MF_GDN_DIRECT_SOLVE = EnvBool(False)
     SGLANG_Q35MF_GDN_EMPTY_HISTORY = EnvBool(False)
     SGLANG_Q35MF_GDN_NORM_FP8 = EnvBool(False)
