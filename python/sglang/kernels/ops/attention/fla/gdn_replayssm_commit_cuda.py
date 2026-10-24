@@ -23,6 +23,8 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.environ import envs
+
 logger = logging.getLogger(__name__)
 
 _SRC = r"""
@@ -48,6 +50,7 @@ struct Params {
   int sidx64, ridx64, acc64, tidx64, tstep64;
   int B;
   long long null_block;
+  int layers;
 };
 
 // shared memory: the checkpoint [V][K], then the ring's keys, key low parts, updates, update low parts
@@ -87,11 +90,11 @@ __device__ __forceinline__ void bulk_g2s(void* dst, const void* src, u32 bytes, 
   asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
                ::"r"(smem_u32(dst)), "l"(src), "r"(bytes), "r"(smem_u32(bar)) : "memory");
 }
-__device__ __forceinline__ void mbar_wait0(u64* bar) {
+__device__ __forceinline__ void mbar_wait(u64* bar, u32 parity) {
   u32 ready = 0;
   do {
-    asm volatile("{ .reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 p, [%1], 0; selp.u32 %0, 1, 0, p; }"
-                 : "=r"(ready) : "r"(smem_u32(bar)) : "memory");
+    asm volatile("{ .reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2; selp.u32 %0, 1, 0, p; }"
+                 : "=r"(ready) : "r"(smem_u32(bar)), "r"(parity) : "memory");
   } while (!ready);
 }
 
@@ -188,11 +191,12 @@ __device__ __forceinline__ float window(float gt, int len, int lane, const int (
   return __expf(tot);
 }
 
-extern "C" __global__ void __launch_bounds__(NW * 32) gdn_replayssm_commit(const Params p) {
-  extern __shared__ __align__(128) unsigned char smem_raw[];
-  __shared__ u64 bar;
+// One (layer, request, value head); returns whether it issued copies (and so used up a phase of the barrier).
+// RESIDENT: the barrier was initialized once and its phases alternate from item to item.
+template <bool RESIDENT>
+__device__ __forceinline__ bool commit_item(const Params& p, const int cta, unsigned char* smem_raw, u64& bar,
+                                            const u32 parity) {
   constexpr int GRP = HV / HK;
-  const int cta = blockIdx.x;
   const int hv = cta % HV;
   const int n = (cta / HV) % p.B;
   const int layer = cta / (HV * p.B);
@@ -202,13 +206,15 @@ extern "C" __global__ void __launch_bounds__(NW * 32) gdn_replayssm_commit(const
 
   const long long slot = ld_idx(p.sidx, n, p.sidx64);
   const long long rid = ld_idx(p.ridx, n, p.ridx64);
-  if (slot <= p.null_block) return;
+  if (slot <= p.null_block) return false;
   const bool resid = p.dr != nullptr && p.kr != nullptr;
   u16* sm = reinterpret_cast<u16*>(smem_raw);
   // the checkpoint and the whole ring slice need only the two indices: copies first, cursors meanwhile
   if (tid == 0) {
-    asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(smem_u32(&bar)) : "memory");
-    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    if (!RESIDENT) {
+      asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(smem_u32(&bar)) : "memory");
+      asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    }
     const u32 bytes = 2 * (VD * KD + (resid ? 4 : 2) * RING * KD);
     asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(smem_u32(&bar)), "r"(bytes)
                  : "memory");
@@ -240,9 +246,9 @@ extern "C" __global__ void __launch_bounds__(NW * 32) gdn_replayssm_commit(const
   int ph[4];
 #pragma unroll
   for (int i = 0; i < 4; ++i) ph[i] = (base + jj[i]) & (RING - 1);
-  __syncthreads();  // the barrier's init before anyone waits on it
-  mbar_wait0(&bar);  // also before an early exit: no copy may land after the CTA is gone
-  if (!fold && !track) return;
+  if (!RESIDENT) __syncthreads();  // the barrier's init before anyone waits on it
+  mbar_wait(&bar, parity);  // also before an early exit: no copy may land after the CTA is gone
+  if (!fold && !track) return true;
   // windows of at most 8 entries (every fold of a step of up to 8 draft rows) take the k8 products
   const bool k16 = (fold && n_hist > 8) || (track && track_len > 8);
 
@@ -281,6 +287,26 @@ extern "C" __global__ void __launch_bounds__(NW * 32) gdn_replayssm_commit(const
     else fold_store<false>(sm, ph, AH, AL, etot, resid, p.h0 + layer * p.h0_layer + tslot * p.h0_slot + (long long)hv * VD * KD,
                vb, r, q);
   }
+  return true;
+}
+
+extern "C" __global__ void __launch_bounds__(NW * 32) gdn_replayssm_commit(const Params p) {
+  extern __shared__ __align__(128) unsigned char smem_raw[];
+  __shared__ u64 bar;
+#if PERSIST
+  if (threadIdx.x == 0) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(smem_u32(&bar)) : "memory");
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  }
+  __syncthreads();
+  u32 parity = 0;
+  for (int item = blockIdx.x; item < p.layers * p.B * HV; item += gridDim.x) {
+    if (commit_item<true>(p, item, smem_raw, bar, parity)) parity ^= 1;
+    __syncthreads();  // every read of this item's shared memory before the next item's copies land
+  }
+#else
+  commit_item<false>(p, blockIdx.x, smem_raw, bar, 0);
+#endif
 }
 """
 
@@ -300,10 +326,13 @@ class _Params(ctypes.Structure):
         ("tidx64", ctypes.c_int), ("tstep64", ctypes.c_int),
         ("B", ctypes.c_int),
         ("null_block", ctypes.c_int64),
+        ("layers", ctypes.c_int),
     ]
 
 
 _LOCK = threading.Lock()
+# SGLANG_PERFLL_COMMIT_CTAS: resident CTAs looping over the (layer, request, value head) items; 0: one CTA each
+_CTAS = envs.SGLANG_PERFLL_COMMIT_CTAS.get()
 _KERNELS: dict = {}
 
 
@@ -314,11 +343,11 @@ def _check(res, what):
     return res[1] if len(res) == 2 else res[1:]
 
 
-def _compile(device: int, hk: int, hv: int, ring: int, has_track: bool):
+def _compile(device: int, hk: int, hv: int, ring: int, has_track: bool, persist: bool):
     from cuda.bindings import driver as cu
     from cuda.bindings import nvrtc
 
-    defines = dict(HK=hk, HV=hv, RING=ring, HAS_TRACK=int(has_track))
+    defines = dict(HK=hk, HV=hv, RING=ring, HAS_TRACK=int(has_track), PERSIST=int(persist))
     src = "".join(f"#define {k} {v}\n" for k, v in defines.items()) + _SRC
     prog = _check(nvrtc.nvrtcCreateProgram(src.encode(), b"gdn_replayssm_commit.cu", 0, [], []), "create")
     major, minor = torch.cuda.get_device_capability(device)
@@ -347,14 +376,14 @@ def _smem_bytes(ring: int) -> int:
     return 2 * (128 * 128 + 4 * ring * 128)
 
 
-def _kernel(device: int, hk: int, hv: int, ring: int, has_track: bool):
-    key = (device, hk, hv, ring, has_track)
+def _kernel(device: int, hk: int, hv: int, ring: int, has_track: bool, persist: bool):
+    key = (device, hk, hv, ring, has_track, persist)
     fn = _KERNELS.get(key)
     if fn is None:
         with _LOCK:
             fn = _KERNELS.get(key)
             if fn is None:
-                fn = _KERNELS[key] = _compile(device, hk, hv, ring, has_track)[1]
+                fn = _KERNELS[key] = _compile(device, hk, hv, ring, has_track, persist)[1]
     return fn
 
 
@@ -385,12 +414,13 @@ def try_commit(**kw) -> bool:
     device, hk, hv, ring = st.device.index, k.shape[2], st.shape[2], d.shape[-2]
     if kw["state_batch_indices"].shape[0] == 0:
         return False
-    if any((device, hk, hv, ring, t) not in _KERNELS for t in (False, True)):
+    persist = _CTAS > 0
+    if any((device, hk, hv, ring, t, persist) not in _KERNELS for t in (False, True)):
         if torch.cuda.is_current_stream_capturing():
             _log_once("capture", "SGLANG_Q35MF_COMMIT_CUDA: not compiled before graph capture, Triton commit")
             return False
         for t in (False, True):
-            _kernel(device, hk, hv, ring, t)
+            _kernel(device, hk, hv, ring, t, persist)
     commit(**kw)
     _log_once(("on", st.shape[1] if st.dim() > 1 else 0), "SGLANG_Q35MF_COMMIT_CUDA: CUDA compact commit runs")
     return True
@@ -423,6 +453,7 @@ def commit(
     mamba_track_indices: Optional[torch.Tensor] = None,
     mamba_steps_to_track: Optional[torch.Tensor] = None,
     null_block_id: int = -1,
+    ctas: Optional[int] = None,
 ) -> None:
     """The compact-commit part of ``commit_gdn_replayssm_circular`` (not its cursor finish)."""
     from cuda.bindings import driver as cu
@@ -450,12 +481,14 @@ def commit(
         ptr(mamba_track_indices), ptr(mamba_steps_to_track),
         i64(state_batch_indices), i64(replay_indices), i64(accept_lens),
         i64(mamba_track_indices), i64(mamba_steps_to_track),
-        B, null_block_id,
+        B, null_block_id, num_layers,
     )
     device = checkpoint_state.device.index
-    fn = _kernel(device, H, HV, ring, has_track)
+    ctas = _CTAS if ctas is None else ctas
+    items = num_layers * B * HV
+    fn = _kernel(device, H, HV, ring, has_track, ctas > 0)
     cfg = cu.CUlaunchConfig()
-    cfg.gridDimX, cfg.gridDimY, cfg.gridDimZ = num_layers * B * HV, 1, 1
+    cfg.gridDimX, cfg.gridDimY, cfg.gridDimZ = min(items, ctas) if ctas > 0 else items, 1, 1
     cfg.blockDimX, cfg.blockDimY, cfg.blockDimZ = 128, 1, 1
     cfg.sharedMemBytes = _smem_bytes(ring)
     cfg.hStream = cu.CUstream(torch.cuda.current_stream(checkpoint_state.device).cuda_stream)

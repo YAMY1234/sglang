@@ -1276,6 +1276,9 @@ class Envs:
     # prefill batch) instead of right after the draft extend, so the commit can overlap the draft extend and the next
     # round's draft steps (the draft model has no GDN layer).
     SGLANG_PLB_COMMIT_LATE_JOIN = EnvBool(False)
+    # PERF-LL: the CUDA compact commit runs on this many resident CTAs that loop over every (layer, request, value
+    # head), so it leaves the other SMs to the draft extend; 0: one CTA per (layer, request, value head).
+    SGLANG_PERFLL_COMMIT_CTAS = EnvInt(0)
     # PERF-LB: the chunk spec for q_len 1 calls (draft steps); unset: SGLANG_PLB_CP_FOLD_CHUNK.
     SGLANG_PLB_CP_FOLD_CHUNK_Q1 = EnvStr(None)
     # PERF-LB: gated fold calls with the per-head merge fill the chunk rows' queries in the q gather and combine their
