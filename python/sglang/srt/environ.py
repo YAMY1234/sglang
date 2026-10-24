@@ -1283,6 +1283,15 @@ class Envs:
     # chunks arrive in the same round take the delay together. 0: off; 1: on; k > 1: each scatter also waits k - 1
     # more batches (test only: widens the window in which an abort finds it queued).
     SGLANG_PLB_SCATTER_DEFER = EnvInt(0)
+    # PERF-LP (precision-lowered line, TRT's TRTLLM_Q35_MTP_MOE_QUANT=nvfp4): the MTP draft's routed experts become NVFP4
+    # at load time with TRT's ModelOpt recipe and run on the target's NVFP4 MoE path. The target is untouched.
+    SGLANG_PERFLP_DRAFT_MOE_NVFP4 = EnvBool(False)
+    # "<fc1>,<fc2>": the activation amax the draft experts' static NVFP4 input global scales are built for (TRT's
+    # TRTLLM_Q35_MTP_MOE_NVFP4_AMAX; "" = TRT's calibrated defaults 256,2048).
+    SGLANG_PERFLP_DRAFT_MOE_NVFP4_AMAX = EnvStr("")
+    # With DRAFT_MOE_NVFP4 and no expert parallelism: also keep the BF16 experts (checkpoint order, this rank's slice)
+    # for the megakernel plugin's single-launch draft MoE (draft steps of <= 2 tokens stay BF16).
+    SGLANG_PERFLP_DRAFT_MOE_KEEP_BF16 = EnvBool(False)
     # PERF-LB static-bench probe: "<period_ms>:<MB>:<ctl file>": a thread per rank scatters MB from a dummy staging
     # buffer about every period (random phase per rank) on its own default-priority stream while the ctl file reads 1
     # (2: the persistent kernel of SGLANG_PLB_SCATTER_CTAS, 32 if unset). "": off.
