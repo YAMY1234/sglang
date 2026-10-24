@@ -182,7 +182,7 @@ def _verify_commit_outputs_kernel(
     idx = tl.where(idx < 0, idx + PREDICT_SIZE, idx)
     token = tl.load(predict + idx * PREDICT_STRIDE, valid, other=0)
     tl.store(new_seq_lens + row, length + accepted, valid)
-    tl.store(bonus + row, token, valid)
+    tl.store(bonus + row, token.to(bonus.dtype.element_ty), valid)
 
 
 def prepare_verify_commit_outputs(
@@ -194,17 +194,19 @@ def prepare_verify_commit_outputs(
     mamba_track_interval=0,
     extend_layout=False,
     extend_mrope=False,
+    bonus_dtype=torch.int32,
 ):
     """``extend_layout`` (SGLANG_PST_SPEC_EXTEND_LAYOUT, with ``num_draft_tokens``): the same
     launch also writes ``prepare_draft_extend_layout(seq_lens, num_draft_tokens, extend_mrope)``,
-    appended to the draft-extend inputs."""
+    appended to the draft-extend inputs. ``bonus_dtype``: int64 for SGLANG_PERFLL_STEP5A_BONUS_I64,
+    the dtype the relay and the next draft read."""
     bs = accept_lens.numel()
     new_seq_lens = torch.empty(
         (bs,),
         device=seq_lens.device,
         dtype=torch.promote_types(seq_lens.dtype, accept_lens.dtype),
     )
-    bonus = torch.empty((bs,), device=predict.device, dtype=torch.int32)
+    bonus = torch.empty((bs,), device=predict.device, dtype=bonus_dtype)
     last_steps = track_steps = correct = select = ids = None
     if num_draft_tokens:
         last_steps = torch.empty((bs,), device=seq_lens.device, dtype=torch.int64)

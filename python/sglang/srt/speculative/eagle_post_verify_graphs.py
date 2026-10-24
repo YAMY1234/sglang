@@ -33,6 +33,8 @@ _MAX_POST_VERIFY_STATES = 64
 _ONE_LAUNCH_LOAD = envs.SGLANG_Q35MF_MKH_N3C.get()
 _SHARDED_VERIFY = envs.SGLANG_Q35MF_SHARDED_VERIFY.get()
 _SIM_PREDRAW = envs.SGLANG_PERFLL_HOST_SIM_PREDRAW.get()
+# SGLANG_PERFLL_STEP5A_BONUS_I64: the bonus tokens in the dtype the relay and the next draft read
+_BONUS_DTYPE = torch.int64 if envs.SGLANG_PERFLL_STEP5A_BONUS_I64.get() else torch.int32
 
 
 def simulated_acc_len_generator(seed: int) -> torch.Generator:
@@ -232,6 +234,7 @@ class EaglePostVerifyGraphs:
                 mamba_track_interval=slot.track_interval,
                 extend_layout=self._extend_layout,
                 extend_mrope=self._extend_mrope,
+                bonus_dtype=_BONUS_DTYPE,
             )
         )
         if slot.next_draft is not None:
