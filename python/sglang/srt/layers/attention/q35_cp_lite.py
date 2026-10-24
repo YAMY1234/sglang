@@ -1066,10 +1066,12 @@ class CpLite:
         return out
 
     def _exact_supported(self, q_len, b):
-        """The fused partial takes <= MAX_BATCH_Q1 requests; wider batches take the trtllm-gen partial."""
+        """The fused partial (q_len folded into the heads) takes <= MAX_BATCH verify / MAX_BATCH_Q1 draft requests;
+        wider batches take the trtllm-gen partial."""
         from sglang.srt.layers.attention import q35_cp_fused as F
 
-        return F.q35_cp_fused_supported(1, self.cp, q_len * self.hq, b, self.sms)
+        return F.q35_cp_fused_supported(1, self.cp, q_len * self.hq, b, self.sms,
+                                        max_batch=F.MAX_BATCH if q_len > 1 else F.MAX_BATCH_Q1)
 
     def _exact(self, q, k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale, out, gate):
         """The fused partial on the context prefix (q_len folded into the heads: one query row of q_len x heads per
