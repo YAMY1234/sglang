@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 import torch
 
 from sglang.kernels.ops.memory.small_field_copy import SmallFieldCopyPlan
+from sglang.srt.disaggregation import l16_loopstat
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
@@ -305,6 +306,7 @@ class _PostVerifyGraphs:
                 self._rounds,
                 _MAX_POST_VERIFY_STATES,
             )
+        sub = l16_loopstat.SUB
         state = self._states.get(key)
         if state is None:
             if len(self._states) >= _MAX_POST_VERIFY_STATES:
@@ -316,6 +318,8 @@ class _PostVerifyGraphs:
                         key[0],
                     )
                 self._at_bound += 1
+                if sub is not None:
+                    sub.meta["pvm"] = 4
                 return None
             state = self._states[key] = SimpleNamespace(
                 warmups=0, turn=0, slots=[None, None]
@@ -342,8 +346,14 @@ class _PostVerifyGraphs:
                 state.warmups += 1
                 outputs = self._body(slot)
                 self._commit(slot, outputs)
+                if sub is not None:
+                    sub.meta["pvm"] = 2
                 return outputs[:6]
             self._capture(slot)
+            if sub is not None:
+                sub.meta["pvm"] = 3
+        elif sub is not None:
+            sub.meta["pvm"] = 1
         slot.graph.replay()
         self._main_done.record()
         self._side_stream.wait_event(self._main_done)

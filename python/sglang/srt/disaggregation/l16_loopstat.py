@@ -10,11 +10,20 @@ SGLANG_TRTL16_AB_WIN / _AB_POLL ("base,treat") / _AB_COARSE and _AB_TREAT_BS
 bucket) / _AB_DEFER=1 (deferred metadata send) alternate knobs per window of
 forward_ct, identical on every TP rank, so all ranks switch together; the row's
 knob bits mark the treatment.
+
+SGLANG_PLB_LOOPSTAT_SPLIT=1 appends _SPLIT_COLS after the fixed columns (host
+clock only, no CUDA call): nadm requests merged into the running batch by this
+row's nb, nflt requests update_running_batch removed, pvm the post-verify graph
+mode (0 SGLang eager path, 1 replay, 2 warmup, 3 captured, 4 eager at the bound),
+the nb / rb sub-stages and what they leave (nb_oth / rb_oth), the scheduler
+thread's CPU time in nb / rb, and GC pauses (any thread) during the row; times in us.
 """
 
 from __future__ import annotations
 
 import bisect
+import gc
+import logging
 import os
 import socket
 import threading
@@ -23,9 +32,16 @@ from typing import List, Optional
 
 import torch
 
+from sglang.srt.environ import envs
+
+logger = logging.getLogger(__name__)
+
 _now = time.perf_counter_ns
+_cpu_now = time.thread_time_ns
 
 STAT: Optional["LoopStat"] = None
+# The LoopStat while SGLANG_PLB_LOOPSTAT_SPLIT is on, else None: sub-stage timers check it.
+SUB: Optional[LoopStat] = None
 # Coarse padding list while the coarse window is active (read by _pad_to_bucket).
 COARSE_ACTIVE: Optional[List[int]] = None
 
@@ -34,6 +50,13 @@ _HOST_COLS = (
     "px", "px_poll", "ar", "nb", "rb", "prw", "pr", "smp",
 )
 _COLS = ("it", "t_ms", "fct", "B", "gbs", "nnew", "npa", "npre", "nxfer", "nwait", "idle", "ar_n", "knob", "mode") + _HOST_COLS
+# nb: new prebuilt batch, process_prebuilt, its first-token results, filter + merge, then update_running_batch's
+# filter / memory check (+ retraction) / prepare_for_decode, and the staging scatter flush.
+_SPLIT_NB = ("nb_new", "nb_pb", "nb_res", "nb_mrg", "nb_flt", "nb_mem", "nb_pfd", "nb_fl")
+# rb: seq-lens resolve (waits for the previous verify's publish), input resolve + isolation, draft prep / launch,
+# verify prep / target forward / post-verify, draft extend, then the result relay, D2H issue and batch copy.
+_SPLIT_RB = ("rb_sl", "rb_fi", "rb_dp", "rb_dg", "rb_vp", "rb_vf", "rb_pv", "rb_ex", "rb_out")
+_SPLIT_COLS = ("nadm", "nflt", "pvm") + _SPLIT_NB + ("nb_oth",) + _SPLIT_RB + ("rb_oth", "nb_cpu", "rb_cpu", "gc")
 
 
 def coarse_pad(raw_size: int, buckets) -> Optional[int]:
@@ -44,10 +67,11 @@ def coarse_pad(raw_size: int, buckets) -> Optional[int]:
 
 
 class LoopStat:
-    def __init__(self, scheduler, out_dir: str):
+    def __init__(self, scheduler, out_dir: str, split: bool = False):
         from sglang.srt.runtime_context import get_parallel
 
         self.sched = scheduler
+        self.split = split
         self.tp_rank = get_parallel().tp_rank
         self.write = self.tp_rank % 4 == 0
         os.makedirs(out_dir, exist_ok=True)
@@ -56,13 +80,23 @@ class LoopStat:
         self.fg = open(base + ".gpu.csv", "a", buffering=1 << 20) if self.write else None
         self.ft = open(base + ".thr.csv", "a") if self.write else None
         if self.write:
-            self.f.write(",".join(_COLS) + "\n")
+            self.f.write(",".join(_COLS + (_SPLIT_COLS if split else ())) + "\n")
             self.fg.write("fct,gap_us,span_us,period_us\n")
             self.ft.write("t_ms,tid,name,cpu_s\n")
         self.t0 = _now()
         self.it = 0
         self.idle = 0
-        self.row = dict.fromkeys(_HOST_COLS, 0)
+        self.row = dict.fromkeys(_HOST_COLS + (_SPLIT_NB + _SPLIT_RB if split else ()), 0)
+        self.cpu = {"nb": 0, "rb": 0}
+        self.cpu_last = 0
+        self.gc_ns = 0
+        self.gc_t0 = 0
+        if split:
+            gc.callbacks.append(self._gc_cb)
+            logger.info(
+                f"SGLANG_PLB_LOOPSTAT_SPLIT: loopstat nb / rb sub-stage columns on "
+                f"({len(_SPLIT_COLS)} after the {len(_COLS)} fixed ones, tp_rank {self.tp_rank})"
+            )
         self.meta = {}
         self.ar_n = 0
         self.last = 0
@@ -117,14 +151,28 @@ class LoopStat:
     def begin(self) -> None:
         self.last = _now()
         self.ar_n = 0
+        if self.split:
+            self.cpu_last = _cpu_now()
 
     def mark(self, key: str) -> None:
         t = _now()
         self.row[key] += t - self.last
         self.last = t
+        if self.split:
+            c = _cpu_now()
+            if key in self.cpu:
+                self.cpu[key] += c - self.cpu_last
+            self.cpu_last = c
 
     def add(self, key: str, t0: int) -> None:
         self.row[key] += _now() - t0
+
+    def _gc_cb(self, phase: str, info: dict) -> None:
+        if phase == "start":
+            self.gc_t0 = _now()
+        elif self.gc_t0:
+            self.gc_ns += _now() - self.gc_t0
+            self.gc_t0 = 0
 
     # ---- knobs --------------------------------------------------------------
     def apply_knobs(self) -> None:
@@ -188,6 +236,8 @@ class LoopStat:
             self.idle += 1
             for k in self.row:
                 self.row[k] = 0
+            if self.split:
+                self._reset_split()
             return
         self.it += 1
         if self.write:
@@ -198,20 +248,41 @@ class LoopStat:
                 lst = COARSE_ACTIVE or self.graph_bs
                 gbs = lst[bisect.bisect_left(lst, bs)] if bs <= lst[-1] else self.graph_bs[bisect.bisect_left(self.graph_bs, bs)]
             r = self.row
-            self.rows.append(
+            line = (
                 f"{self.it},{(_now() - self.t0) / 1e6:.3f},{self.sched.forward_ct},{bs},{gbs},"
                 f"{m.get('nnew', 0)},{m.get('npa', 0)},{m.get('npre', 0)},{m.get('nxfer', 0)},{m.get('nwait', 0)},{self.idle},{self.ar_n},{self.knob},{m.get('mode', 0)},"
                 + ",".join(str(r[k] // 1000) for k in _HOST_COLS)
             )
+            if self.split:
+                line += "," + self._split_fields(r, m)
+            self.rows.append(line)
         for k in self.row:
             self.row[k] = 0
         self.meta = {}
         self.idle = 0
+        if self.split:
+            self._reset_split()
         self._harvest()
         now = _now()
         if now - self.last_flush > 10_000_000_000:
             self.last_flush = now
             self._flush(now)
+
+    def _split_fields(self, r: dict, m: dict) -> str:
+        nb_oth = r["nb"] - sum(r[k] for k in _SPLIT_NB)
+        rb_oth = r["rb"] - sum(r[k] for k in _SPLIT_RB)
+        vals = [m.get("nadm", 0), m.get("nflt", 0), m.get("pvm", 0)]
+        vals += [r[k] // 1000 for k in _SPLIT_NB] + [nb_oth // 1000]
+        vals += [r[k] // 1000 for k in _SPLIT_RB] + [rb_oth // 1000]
+        vals += [self.cpu["nb"] // 1000, self.cpu["rb"] // 1000, self.gc_ns // 1000]
+        return ",".join(map(str, vals))
+
+    def _reset_split(self) -> None:
+        self.cpu["nb"] = self.cpu["rb"] = 0
+        self.gc_ns = 0
+        # meta survives idle iterations for the fixed columns; the split ones belong to one row
+        for k in ("nadm", "nflt", "pvm"):
+            self.meta.pop(k, None)
 
     def _flush(self, now: int) -> None:
         if not self.write:
@@ -263,9 +334,10 @@ def prealloc_no_sync() -> bool:
 
 
 def init(scheduler) -> Optional[LoopStat]:
-    global STAT
+    global STAT, SUB
     out_dir = os.environ.get("SGLANG_TRTL16_LOOPSTAT", "")
     if not out_dir:
         return None
-    STAT = LoopStat(scheduler, out_dir)
+    STAT = LoopStat(scheduler, out_dir, split=envs.SGLANG_PLB_LOOPSTAT_SPLIT.get())
+    SUB = STAT if STAT.split else None
     return STAT

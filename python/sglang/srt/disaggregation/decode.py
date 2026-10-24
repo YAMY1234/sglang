@@ -3196,6 +3196,7 @@ class SchedulerDisaggregationDecodeMixin:
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
         ls = l16_loopstat.init(self)
+        sub = l16_loopstat.SUB
 
         def pop_and_process():
             tmp_batch, tmp_result = self.result_queue.popleft()
@@ -3246,7 +3247,10 @@ class SchedulerDisaggregationDecodeMixin:
 
             if disable_overlap_for_batch and self.last_batch:
                 pop_and_process()
+            t0 = l16_loopstat._now() if sub is not None else 0
             self._plb_flush_scatters()
+            if sub is not None:
+                sub.add("nb_fl", t0)
             if ls is not None:
                 ls.mark("nb")
 
@@ -3255,10 +3259,13 @@ class SchedulerDisaggregationDecodeMixin:
                 if ls is not None:
                     ls.gpu_a(self.forward_stream)
                 batch_result = self.run_batch(batch)
+                t0 = l16_loopstat._now() if sub is not None else 0
                 self._apply_war_barrier()
                 if ls is not None:
                     ls.gpu_b(self.forward_stream)
                 self.result_queue.append((batch.copy(), batch_result))
+                if sub is not None:
+                    sub.add("rb_out", t0)
             else:
                 batch_result = None
                 self._sched_idled = True
@@ -3312,11 +3319,16 @@ class SchedulerDisaggregationDecodeMixin:
         """Process prebuilt batch and schedule the next decode batch."""
         # Process pending prebuilt batch: output processing + filter + merge
         new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
+        sub = l16_loopstat.SUB
         if new_prebuilt_batch:
             assert self.chunked_req is None
+            t0 = l16_loopstat._now() if sub is not None else 0
             self.batch_result_processor.process_batch_result_prebuilt(
                 new_prebuilt_batch
             )
+            if sub is not None:
+                sub.add("nb_res", t0)
+                t0 = l16_loopstat._now()
             new_prebuilt_batch.filter_batch()
             if not new_prebuilt_batch.is_empty():
                 if running_batch.is_empty():
@@ -3325,12 +3337,18 @@ class SchedulerDisaggregationDecodeMixin:
                         running_batch.hisparse_coordinator = self.hisparse_coordinator
                 else:
                     running_batch.merge_batch(new_prebuilt_batch)
+            if sub is not None:
+                sub.add("nb_mrg", t0)
+                sub.meta["nadm"] = len(new_prebuilt_batch.reqs)
 
         # Schedule decode batch
         if running_batch.is_empty():
             ret = None
         else:
+            bs0 = running_batch.batch_size() if sub is not None else 0
             running_batch = self.update_running_batch(running_batch)
+            if sub is not None:
+                sub.meta["nflt"] = bs0 - running_batch.batch_size()
             ret = running_batch if not running_batch.is_empty() else None
 
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret)
@@ -3341,17 +3359,24 @@ class SchedulerDisaggregationDecodeMixin:
     def get_new_prebuilt_batch(
         self, running_batch: ScheduleBatch
     ) -> Optional[ScheduleBatch]:
+        sub = l16_loopstat.SUB
+        t0 = l16_loopstat._now() if sub is not None else 0
         batch = self._get_new_prebuilt_batch(running_batch)
+        if sub is not None:
+            sub.add("nb_new", t0)
         if batch is None:
             return None
         # Verify after host restore and before process_prebuilt caches any KV.
         self._verify_kv_checksums(batch)
         if batch.is_empty():
             return None
+        t0 = l16_loopstat._now() if sub is not None else 0
         self.ngram_embedding_manager.prepare_for_forward(
             batch, chunked_req=self.chunked_req
         )
         batch.process_prebuilt(self.future_map)
+        if sub is not None:
+            sub.add("nb_pb", t0)
         return batch
 
     def _verify_kv_checksums(self, batch: ScheduleBatch) -> None:

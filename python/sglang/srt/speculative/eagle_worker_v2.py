@@ -10,6 +10,7 @@ from sglang.kernels.ops.speculative.topk1 import (
     draft_topk1_postprocess,
 )
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
+from sglang.srt.disaggregation import l16_loopstat
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
     EAGLEDraftExtendNpuGraphRunner,
@@ -629,6 +630,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
 
     def draft(self, batch: ScheduleBatch, *, with_topology: bool = False):
+        sub = l16_loopstat.SUB
+        t0 = l16_loopstat._now() if sub is not None else 0
         draft_input: EagleDraftInput = batch.spec_info
         forward_batch, can_run_decode_cuda_graph, kv_loc_plan = prepare_for_draft(
             draft_input,
@@ -666,6 +669,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             if (c := self.draft_runner.canary_manager) is not None
             else contextlib.nullcontext()
         )
+        if sub is not None:
+            sub.add("rb_dp", t0)
+            t0 = l16_loopstat._now()
 
         with canary_outside_ctx:
             # Run draft
@@ -694,6 +700,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
                     self.draft_forward(forward_batch)
                 )
+        if sub is not None:
+            sub.add("rb_dg", t0)
+            t0 = l16_loopstat._now()
 
         verify_input = build_eagle_verify_input(
             batch,
@@ -713,6 +722,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # Verify and draft extend write the window the draft planned.
             verify_input.kv_loc_plan = kv_loc_plan
             verify_input.prepared_out_cache_loc = kv_loc_plan.write_virtual
+        if sub is not None:
+            sub.add("rb_vp", t0)
         if with_topology:
             # PP+spec relays the tree so every stage rebuilds the same verify
             # input; the mask build needs the topology this one was built from.
@@ -1524,9 +1535,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ):
                     if host_trace.ENABLED:
                         host_trace.mark(host_trace.EXT0)
+                    sub = l16_loopstat.SUB
+                    t0 = l16_loopstat._now() if sub is not None else 0
                     self.draft_worker._draft_extend_for_decode(
                         batch, batch_output, kv_loc_plan=verify_input.kv_loc_plan
                     )
+                    if sub is not None:
+                        sub.add("rb_ex", t0)
                     if host_trace.ENABLED:
                         host_trace.gpu_mark(host_trace.EXT1)
             if self._post_verify_graphs is not None and not _PLB_LATE_JOIN:
