@@ -1284,6 +1284,14 @@ class Envs:
     SGLANG_PLB_BT_RMS_THREADS = EnvInt(0)
     # PERF-LB: the widest MoE finalize step on the BT route for the re-targeted shapes (0: the shipped 703 at TP8)
     SGLANG_PLB_FINALIZE_BT_MAX = EnvInt(0)
+    # PERF-LB: the BT tail's launch order, bit for bit the same outputs (plb_mnnvl_cutedsl.LAMPORT_LEVELS). 1: the
+    # MaterializeRMSNorm lets its dependents launch at entry and polls the prenorm mailbox before its grid-dependency
+    # wait; 2: also the OwnerReduceMulticast lets it launch right after its own wait (TensorRT-LLM's twoshot +
+    # rmsNormLamport order)
+    SGLANG_PLB_MAT_LAMPORT = EnvInt(0)
+    # PERF-LB: the MoE finalize's BT MaterializeRMSNorm also writes the static per-tensor E4M3 input of the next layer's
+    # in_proj_qkvz / qkv_proj, whose quantize kernel then does not run; byte for byte SGLang's quantization
+    SGLANG_PLB_AR_FP8_OUT = EnvBool(False)
     # Timing only: decode graph padding per block of Q35MF_AB_BLOCK target-verify rounds, the labels in turn
     # ("pow2": the smallest captured power of two); model_executor/runner_backend/ab_variants.py. Empty: off.
     SGLANG_TRTL17_PAD_AB = EnvTuple(())
