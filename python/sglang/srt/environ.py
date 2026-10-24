@@ -1580,6 +1580,9 @@ class Envs:
     # The compact ReplaySSM commit of every GDN layer as one CUDA launch (one CTA per layer,
     # request and value head); the same four high / low products, FP32 sums in another order.
     SGLANG_Q35MF_COMMIT_CUDA = EnvBool(False)
+    # A shared expert whose down_proj takes a static per-tensor FP8 input runs its
+    # SiLU-and-mul and that input's quantization in one launch (bit-identical to the two).
+    SGLANG_PST_SE_SILU_FP8 = EnvBool(False)
     # TP > 1 EAGLE topk-1 verify keeps the target logits vocabulary-sharded: greedy rows
     # take a sharded argmax (bit-identical), temperature-only rows a sharded Gumbel-max
     # (same distribution); any other batch all-gathers them first, as before.

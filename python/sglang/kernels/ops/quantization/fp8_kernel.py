@@ -769,6 +769,60 @@ def static_quant_fp8(
     return x_q, x_s
 
 
+@triton.jit
+def _silu_and_mul_static_quant_fp8(
+    x_ptr,
+    y_q_ptr,
+    y_s_ptr,
+    D,
+    fp8_min,
+    fp8_max,
+    BLOCK: tl.constexpr,
+    FP8_DTYPE: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
+):
+    # Bit-exact with silu_and_mul (BF16 product) followed by _static_quant_fp8.
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < D
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+    gate = tl.load(x_ptr + row * 2 * D + cols, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(x_ptr + row * 2 * D + D + cols, mask=mask, other=0.0).to(tl.float32)
+    y_s = tl.load(y_s_ptr).to(tl.float32)
+    if USE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+    y = (gate / (1.0 + tl.exp(-gate)) * up).to(tl.bfloat16).to(tl.float32)
+    y_q = tl.clamp(y * (1.0 / y_s), fp8_min, fp8_max).to(FP8_DTYPE)
+    tl.store(y_q_ptr + row * D + cols, y_q.to(tl.uint8, bitcast=True), mask=mask)
+
+
+def silu_and_mul_static_quant_fp8(x: torch.Tensor, x_s: torch.Tensor) -> torch.Tensor:
+    """``static_quant_fp8(silu_and_mul(x), x_s)`` in one launch: BF16 ``x`` [..., 2 * D]
+    (gate | up) to FP8 [..., D] with the per-tensor static scale ``x_s``."""
+    assert x.dtype == torch.bfloat16 and x.is_contiguous() and x.shape[-1] % 2 == 0
+    assert x_s.numel() == 1, "only supports per-tensor scale"
+    d = x.shape[-1] // 2
+    y_q = torch.empty((*x.shape[:-1], d), device=x.device, dtype=fp8_dtype)
+    rows = x.numel() // x.shape[-1]
+    BLOCK = triton.next_power_of_2(d)
+    pdl_kwargs = {"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    _silu_and_mul_static_quant_fp8[(rows,)](
+        x,
+        y_q.view(torch.uint8),
+        x_s,
+        d,
+        fp8_min=fp8_min,
+        fp8_max=fp8_max,
+        BLOCK=BLOCK,
+        FP8_DTYPE=fp8_dtype_to_triton(fp8_dtype),
+        num_warps=min(max(BLOCK // 256, 1), 8),
+        num_stages=1,
+        **pdl_kwargs,
+    )
+    return y_q
+
+
 # universal entry point, for testing purposes
 
 
