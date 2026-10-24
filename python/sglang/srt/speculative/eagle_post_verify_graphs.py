@@ -67,6 +67,10 @@ class EaglePostVerifyGraphs:
         # inputs (enable_step2); next_draft is the staging of the last round run here
         self._step2: Optional[SimpleNamespace] = None
         self.next_draft = None
+        if _BONUS_DTYPE is torch.int64:
+            logger.info(
+                "PERF-LL step5a: the post-verify graph writes the bonus tokens as int64"
+            )
 
     def enable_step2(
         self,
