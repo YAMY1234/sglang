@@ -136,6 +136,19 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
+# the verify inputs a chain tree writes itself under SGLANG_PERFLL_RS_T (verify_staging_views)
+VERIFY_STAGED_SLOTS = frozenset(
+    {
+        "input_ids",
+        "positions",
+        "out_cache_loc",
+        "mrope_positions",
+        "req_pool_indices",
+        "seq_lens",
+    }
+)
+
+
 def ragged_verify_compact_graphs_enabled(spec_algorithm: SpeculativeAlgorithm) -> bool:
     if not spec_algorithm.supports_ragged_verify():
         return False
@@ -231,6 +244,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     _staged_inputs = None
     # the remove-stages feature the A/B turns off, whose graphs are also captured without it
     _perfll_ab: Optional[str] = None
+    # SGLANG_PERFLL_RS_T: (verify input_ids tensor, its version, batch size) of a chain tree
+    # that wrote this runner's inputs, taken by the next load_batch
+    _t_staged: Optional[tuple] = None
     dllm_input_preparation = None
     dllm_attention = None
     # The attention variants, captured at attention_variant_sizes (None: every batch
@@ -646,6 +662,48 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return self.attention_graph_variants is not None and (
             sizes is None or bs in sizes
         )
+
+    def verify_staging_views(self, raw_bs: int) -> Optional[tuple]:
+        """The (input_ids, positions, out_cache_loc, mrope_positions, req_pool_indices,
+        seq_lens) views a chain tree may write for a target verify of ``raw_bs`` requests
+        that replays its own graph unpadded through the full load_batch, else None."""
+        if (
+            not self.capture_forward_mode.is_target_verify()
+            or self.model_runner.is_draft_worker
+            or self.ragged_verify_mode
+            or self.enable_two_batch_overlap
+            or self.enable_pdmux
+            or self.is_dllm
+            or self.record_nolora_graph
+            or self.require_mlp_tp_gather
+            or raw_bs not in self.capture_bs
+        ):
+            return None
+        n, b = raw_bs * self.captured_req_width, self.buffers
+        return (
+            b.input_ids[:n],
+            b.positions[:n],
+            b.out_cache_loc[:n],
+            b.mrope_positions[:, :n],
+            b.req_pool_indices[:raw_bs],
+            b.seq_lens[:raw_bs],
+        )
+
+    def note_staged_inputs(self, input_ids: torch.Tensor, raw_bs: int) -> None:
+        """A chain tree wrote this runner's inputs for the verify whose ids are ``input_ids``."""
+        self._t_staged = (input_ids, input_ids._version, raw_bs)
+
+    def _take_staged_slots(self, forward_batch: ForwardBatch, raw_bs: int, bs: int):
+        staged, self._t_staged = self._t_staged, None
+        if (
+            staged is None
+            or raw_bs != bs
+            or forward_batch.input_ids is not staged[0]
+            or staged[0]._version != staged[1]
+            or staged[2] != raw_bs
+        ):
+            return frozenset()
+        return VERIFY_STAGED_SLOTS
 
     def _resolve_variant_label(self, forward_batch: ForwardBatch):
         if self._perfll_ab is not None and perfll_rs.ab_off(self._perfll_ab):
@@ -1561,6 +1619,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             raw_num_tokens=raw_num_token,
             padded_num_tokens=padded_num_tokens,
             pp_proxy_tensors=pp_proxy_tensors,
+            skip=(
+                frozenset()
+                if self._t_staged is None
+                else self._take_staged_slots(forward_batch, raw_bs, bs)
+            ),
         )
         if self._restage_skip:
             self._staged_inputs = self._staged_signature(forward_batch)

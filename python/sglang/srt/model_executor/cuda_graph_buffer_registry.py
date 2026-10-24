@@ -406,6 +406,7 @@ class CudaGraphBufferRegistry:
         raw_num_tokens: int,
         padded_num_tokens: int,
         pp_proxy_tensors: Optional[Any] = None,
+        skip: frozenset = frozenset(),
     ) -> None:
         """Copy FB → registry buffers.
 
@@ -421,7 +422,8 @@ class CudaGraphBufferRegistry:
 
         Slots whose FB attribute (or ``source_fn`` result) is ``None`` are
         silently skipped (the FB doesn't carry that field for the current
-        request).
+        request). Slots named in ``skip`` hold their rows already (written by
+        their producer) and are not copied.
         """
         ctx = FillContext(
             raw_bs=raw_bs,
@@ -437,10 +439,11 @@ class CudaGraphBufferRegistry:
                 raw_num_tokens,
                 padded_num_tokens,
                 tuple(s.enabled for s in self._slots.values()),
+                skip,
             )
             plan = self._fill_plans.get(key)
             if plan is None:
-                plan = self._fill_plans[key] = self._build_fill_plan(ctx)
+                plan = self._fill_plans[key] = self._build_fill_plan(ctx, skip)
             self._fill_with_plan(plan, forward_batch, ctx)
             return
 
@@ -458,7 +461,12 @@ class CudaGraphBufferRegistry:
         cpu_dsts: List[torch.Tensor] = []
         cpu_srcs: List[torch.Tensor] = []
         for slot in self._slots.values():
-            if not slot.enabled or slot.buffer is None or not slot.copy_from_fb:
+            if (
+                not slot.enabled
+                or slot.buffer is None
+                or not slot.copy_from_fb
+                or slot.name in skip
+            ):
                 continue
             if slot.source_fn is not None:
                 # Structured / side-sourced slot: source comes from a nested FB
@@ -502,7 +510,7 @@ class CudaGraphBufferRegistry:
                 continue
             slot.post_fill(slot.buffer, forward_batch, ctx)
 
-    def _build_fill_plan(self, ctx: FillContext) -> tuple:
+    def _build_fill_plan(self, ctx: FillContext, skip: frozenset) -> tuple:
         """fill_from's per-shape decisions: (slots to reset with their raw / padded
         lengths, copy entries, post-fill slots), in fill_from's slot order."""
         resets, copies, post_fills = [], [], []
@@ -513,7 +521,7 @@ class CudaGraphBufferRegistry:
             padded_n = slot._padded_n(ctx.padded_bs, ctx.padded_num_tokens)
             if raw_n < padded_n:
                 resets.append((slot, raw_n, padded_n))
-            if slot.copy_from_fb:
+            if slot.copy_from_fb and slot.name not in skip:
                 if slot.source_fn is not None:
                     copies.append((slot, None))
                 else:

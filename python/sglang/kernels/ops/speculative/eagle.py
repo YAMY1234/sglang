@@ -785,6 +785,14 @@ def _build_chain_tree_kernel(
     TABLE_COL: tl.constexpr,
     WRITE_CACHE: tl.constexpr,
     WRITE_MROPE: tl.constexpr,
+    vr_ids=None,
+    vr_positions=None,
+    vr_loc=None,
+    vr_mrope=None,
+    vr_req=None,
+    vr_seq=None,
+    VR_MROPE_ROW: tl.constexpr = 0,
+    STAGE: tl.constexpr = False,
 ):
     offset = (tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
     row = offset // WIDTH
@@ -794,18 +802,28 @@ def _build_chain_tree_kernel(
     rest = tl.load(
         draft + row * DRAFT_ROW + (col - 1) * DRAFT_COL, valid & (col > 0), other=0
     )
-    tl.store(tokens + offset, tl.where(col == 0, first, rest), valid)
+    token = tl.where(col == 0, first, rest)
+    tl.store(tokens + offset, token, valid)
     length = tl.load(seq + row * SEQ_STRIDE, valid, other=0).to(tl.int64)
     tl.store(positions + offset, length + col, valid)
+    if STAGE:
+        tl.store(vr_ids + offset, token.to(tl.int64), valid)
+        tl.store(vr_positions + offset, length + col, valid)
+        tl.store(vr_seq + row, length, valid & (col == 0))
     if WRITE_CACHE:
         req = tl.load(req_indices + row * REQ_STRIDE, valid, other=0).to(tl.int64)
         loc = tl.load(
             req_to_token + req * TABLE_ROW + (length + col) * TABLE_COL, valid, other=0
         )
         tl.store(out_cache_loc + offset, loc, valid)
+        if STAGE:
+            tl.store(vr_loc + offset, loc.to(tl.int64), valid)
+            tl.store(vr_req + row, req, valid & (col == 0))
     if WRITE_MROPE:
         for axis in tl.static_range(3):
             tl.store(mrope + axis * BS * WIDTH + offset, length + col, valid)
+            if STAGE:
+                tl.store(vr_mrope + axis * VR_MROPE_ROW + offset, length + col, valid)
     tl.store(retrieve + offset, offset, valid)
     tl.store(
         retrieve + BS * WIDTH + offset, tl.where(col + 1 < WIDTH, col + 1, -1), valid
@@ -824,7 +842,11 @@ def build_chain_tree(
     req_pool_indices=None,
     req_to_token=None,
     with_mrope=False,
+    verify_runner_inputs=None,
 ):
+    """``verify_runner_inputs``: the target verify runner's (input_ids, positions, out_cache_loc,
+    mrope_positions, req_pool_indices, seq_lens) views of this batch, int64, written as well
+    (SGLANG_PERFLL_RS_T); needs ``req_to_token`` and ``with_mrope``."""
     bs, depth = draft_tokens.shape
     width = depth + 1
     assert bonus_tokens.numel() == seq_lens.numel() == bs
@@ -847,6 +869,11 @@ def build_chain_tree(
     mrope = empty((3, bs * width), torch.int64, device) if with_mrope else None
     if req_to_token is not None:
         assert req_pool_indices is not None and req_pool_indices.numel() == bs
+    stage = verify_runner_inputs
+    if stage is not None:
+        assert req_to_token is not None and with_mrope
+        assert all(t.dtype == torch.int64 for t in stage)
+        assert stage[0].numel() == bs * width and stage[4].numel() == bs
     if bs and not (
         perfll_spec_index.ENABLED
         and perfll_spec_index.chain_tree(
@@ -861,6 +888,7 @@ def build_chain_tree(
             req_to_token,
             out_cache_loc,
             mrope,
+            stage=stage,
         )
     ):
         _build_chain_tree_kernel[(triton.cdiv(bs * width * width, 128),)](
@@ -889,6 +917,20 @@ def build_chain_tree(
             TABLE_COL=req_to_token.stride(1) if req_to_token is not None else 0,
             WRITE_CACHE=req_to_token is not None,
             WRITE_MROPE=with_mrope,
+            **(
+                {}
+                if stage is None
+                else {
+                    "vr_ids": stage[0],
+                    "vr_positions": stage[1],
+                    "vr_loc": stage[2],
+                    "vr_mrope": stage[3],
+                    "vr_req": stage[4],
+                    "vr_seq": stage[5],
+                    "VR_MROPE_ROW": stage[3].stride(0),
+                    "STAGE": True,
+                }
+            ),
         )
     return (
         mask,

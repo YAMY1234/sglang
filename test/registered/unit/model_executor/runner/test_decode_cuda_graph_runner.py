@@ -435,6 +435,10 @@ class TestAttentionVariantSizes(CustomTestCase):
                     self.assertEqual(replayed, label, bs)
 
 
+# the features each A/B label of SGLANG_TRTL17_PAD_AB=v3off,v3on turns off
+_V3_AB = {"v3off": frozenset({"v3"}), "v3on": frozenset()}
+
+
 class TestPerfllAbVariants(CustomTestCase):
     """Under a "v3off" / "v3on" A/B, the target verify graphs are captured twice per batch
     size (V3 on, then off) and a "v3off" round replays the second."""
@@ -461,7 +465,8 @@ class TestPerfllAbVariants(CustomTestCase):
         runner.capture_one_shape = capture_one_shape
         with (
             mock.patch.object(perfll_rs, "AB_VERIFY_FEATURE", "v3"),
-            mock.patch.object(perfll_rs, "_AB_LABELS", frozenset({"v3off", "v3on"})),
+            mock.patch.object(perfll_rs, "_AB_LABELS", frozenset({"v3off"})),
+            mock.patch.object(perfll_rs, "_AB_OFF", _V3_AB),
             # a capture ignores the round's label; outside the A/B'd runner it is read
             mock.patch.object(ab_variants, "current", return_value="v3off"),
             mock.patch.object(
@@ -493,12 +498,68 @@ class TestPerfllAbVariants(CustomTestCase):
         runner, _ = self._capture(is_draft_worker=False)
         for label, variant in (("v3off", "perfll-v3off"), ("v3on", None)):
             with (
-                mock.patch.object(
-                    perfll_rs, "_AB_LABELS", frozenset({"v3off", "v3on"})
-                ),
+                mock.patch.object(perfll_rs, "_AB_LABELS", frozenset({"v3off"})),
+                mock.patch.object(perfll_rs, "_AB_OFF", _V3_AB),
                 mock.patch.object(ab_variants, "current", return_value=label),
             ):
                 self.assertEqual(runner._resolve_variant_label(None), variant)
+
+
+class TestVerifyStagedInputs(CustomTestCase):
+    """SGLANG_PERFLL_RS_T: a chain tree that wrote the verify runner's inputs lets only the next
+    load_batch of that same verify (its ids, unpadded) skip copying them."""
+
+    def _runner(self):
+        import torch
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.capture_forward_mode = ForwardMode.TARGET_VERIFY
+        runner.model_runner = SimpleNamespace(is_draft_worker=False)
+        runner.ragged_verify_mode = runner.enable_two_batch_overlap = False
+        runner.enable_pdmux = runner.is_dllm = runner.record_nolora_graph = False
+        runner.require_mlp_tp_gather = False
+        runner.capture_bs, runner.captured_req_width = [1, 2, 4], 6
+        runner.buffers = SimpleNamespace(
+            input_ids=torch.zeros(24, dtype=torch.int64),
+            positions=torch.zeros(24, dtype=torch.int64),
+            out_cache_loc=torch.zeros(24, dtype=torch.int64),
+            mrope_positions=torch.zeros(3, 24, dtype=torch.int64),
+            req_pool_indices=torch.zeros(4, dtype=torch.int64),
+            seq_lens=torch.zeros(4, dtype=torch.int64),
+        )
+        return runner
+
+    def test_views_only_for_a_batch_size_its_graphs_replay_unpadded(self):
+        runner = self._runner()
+        views = runner.verify_staging_views(2)
+        self.assertEqual([v.shape[-1] for v in views], [12, 12, 12, 12, 2, 2])
+        self.assertEqual(views[3].shape, (3, 12))
+        self.assertIsNone(runner.verify_staging_views(3))
+        runner.model_runner = SimpleNamespace(is_draft_worker=True)
+        self.assertIsNone(runner.verify_staging_views(2))
+
+    def test_only_the_staged_verify_skips_the_copies(self):
+        import torch
+
+        runner = self._runner()
+        ids = torch.zeros(12, dtype=torch.int64)
+        batch = SimpleNamespace(input_ids=ids)
+        runner.note_staged_inputs(ids, 2)
+        self.assertEqual(
+            runner._take_staged_slots(batch, raw_bs=2, bs=2), mod.VERIFY_STAGED_SLOTS
+        )
+        # taken once
+        self.assertEqual(runner._take_staged_slots(batch, raw_bs=2, bs=2), frozenset())
+        for other, raw_bs, bs in (
+            (SimpleNamespace(input_ids=ids.clone()), 2, 2),  # another verify's ids
+            (batch, 2, 4),  # padded
+        ):
+            runner.note_staged_inputs(ids, 2)
+            self.assertEqual(runner._take_staged_slots(other, raw_bs, bs), frozenset())
+        runner.note_staged_inputs(ids, 2)
+        ids.add_(1)  # written after the chain tree
+        self.assertEqual(runner._take_staged_slots(batch, raw_bs=2, bs=2), frozenset())
 
 
 class TestRaggedVerifyLayoutPerTier(CustomTestCase):

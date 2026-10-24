@@ -39,8 +39,21 @@ def _view(name: str, n: int):
 
 
 def chain_tree(
-    bonus, draft, seq, mask, positions, retrieve, tokens, req, table, out_cache_loc, mrope
+    bonus,
+    draft,
+    seq,
+    mask,
+    positions,
+    retrieve,
+    tokens,
+    req,
+    table,
+    out_cache_loc,
+    mrope,
+    stage=None,
 ) -> bool:
+    """``stage``: the target verify runner's (input_ids, positions, out_cache_loc,
+    mrope_positions, req_pool_indices, seq_lens) views, int64, also written (SGLANG_PERFLL_RS_T)."""
     if not (
         bonus.dtype in _INT
         and draft.dtype in _INT
@@ -51,7 +64,7 @@ def chain_tree(
     ):
         return False
     bs, depth = draft.shape
-    tensor, d = _view("chain_tree", 27)
+    tensor, d = _view("chain_tree", 34)
     d[0] = bonus.data_ptr()
     d[1] = draft.data_ptr()
     d[2] = seq.data_ptr()
@@ -79,6 +92,17 @@ def chain_tree(
     d[24] = bs
     d[25] = depth + 1
     d[26] = (table is not None) | ((mrope is not None) << 1)
+    if stage is None:
+        d[27:34] = 0
+    else:
+        vr_ids, vr_pos, vr_loc, vr_mrope, vr_req, vr_seq = stage
+        d[27] = vr_ids.data_ptr()
+        d[28] = vr_pos.data_ptr()
+        d[29] = vr_loc.data_ptr()
+        d[30] = vr_mrope.data_ptr()
+        d[31] = vr_req.data_ptr()
+        d[32] = vr_seq.data_ptr()
+        d[33] = vr_mrope.stride(0)
     _module().chain_tree(seq, tensor)
     return True
 

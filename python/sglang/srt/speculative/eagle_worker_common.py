@@ -467,12 +467,15 @@ def build_eagle_verify_input(
     num_draft_tokens: int,
     tree_mask_mode: TreeMaskMode,
     device: str,
+    verify_runner_inputs: Optional[tuple] = None,
 ) -> EagleVerifyInput:
     """Shared draft() tail: idle input, tree-mask build, EagleVerifyInput assembly.
 
     ``draft_probs`` is the caller's source of draft distributions (single-layer
     eagle: this round's draft_forward output; multi-layer eagle: the ones the
-    draft input carried).
+    draft input carried). ``verify_runner_inputs``: the target verify runner's
+    views (DecodeCudaGraphRunner.verify_staging_views) a chain tree also writes
+    (SGLANG_PERFLL_RS_T).
     """
     if batch.forward_mode.is_idle():
         return EagleVerifyInput.create_idle_input(
@@ -512,6 +515,10 @@ def build_eagle_verify_input(
         and draft_tokens.shape == (bs, num_steps)
         and mask_mode == TreeMaskMode.QLEN_ONLY
     ):
+        with_mrope = target_worker.model_runner.model_config.model_is_mrope and all(
+            x is None for x in batch.multimodal_inputs
+        )
+        stage = verify_runner_inputs if with_mrope else None
         tree_outputs = build_chain_tree(
             draft_input.bonus_tokens,
             draft_tokens,
@@ -519,11 +526,15 @@ def build_eagle_verify_input(
             tree_mask_buf,
             req_pool_indices=batch.req_pool_indices,
             req_to_token=batch.req_to_token_pool.req_to_token,
-            with_mrope=target_worker.model_runner.model_config.model_is_mrope
-            and all(x is None for x in batch.multimodal_inputs),
+            with_mrope=with_mrope,
+            verify_runner_inputs=stage,
         )
         prepared_out_cache_loc, prepared_mrope_positions = tree_outputs[6:]
         tree_outputs = tree_outputs[:6]
+        if stage is not None:
+            target_worker.model_runner.decode_cuda_graph_runner.note_staged_inputs(
+                tree_outputs[5], bs
+            )
     else:
         tree_outputs = build_tree_kernel_efficient(
             draft_input.bonus_tokens,

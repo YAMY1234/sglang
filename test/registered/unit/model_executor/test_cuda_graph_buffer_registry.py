@@ -17,6 +17,7 @@ context.
 import dataclasses
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 from typing import Optional
 
 import torch
@@ -339,6 +340,44 @@ class TestFillFromAndExtract(unittest.TestCase):
         # Template itself NOT mutated (replace returns a new instance).
         self.assertEqual(fb.batch_size, 2)
         self.assertIsNot(fb_view, fb)
+
+    def test_skipped_slots_keep_what_their_producer_wrote(self):
+        # SGLANG_PERFLL_RS_T: a chain tree wrote these rows already; the fill must not copy them
+        from sglang.srt.model_executor import cuda_graph_buffer_registry as mod
+
+        fb = _MiniForwardBatch(
+            batch_size=2,
+            input_ids=torch.arange(4, dtype=torch.int64),
+            req_pool_indices=torch.tensor([3, 1], dtype=torch.int64),
+            seq_lens=torch.tensor([10, 11], dtype=torch.int32),
+            out_cache_loc=torch.arange(4, dtype=torch.int64) + 100,
+            positions=torch.arange(4, dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([10, 11], dtype=torch.int32),
+        )
+        skip = frozenset({"input_ids", "positions", "req_pool_indices"})
+        for plan in (False, True):
+            with self.subTest(plan=plan), mock.patch.object(mod, "_FILL_PLAN", plan):
+                r = self._build_registry()
+                for name in skip:
+                    r.get_slot(name).buffer.fill_(77)
+                r.fill_from(
+                    fb,
+                    raw_bs=2,
+                    padded_bs=2,
+                    raw_num_tokens=4,
+                    padded_num_tokens=4,
+                    skip=skip,
+                )
+                for name in skip:
+                    self.assertTrue(bool((r.get_slot(name).buffer == 77).all()), name)
+                self.assertTrue(
+                    torch.equal(
+                        r.get_slot("out_cache_loc").buffer[:4], fb.out_cache_loc
+                    )
+                )
+                self.assertTrue(
+                    torch.equal(r.get_slot("seq_lens").buffer[:2], fb.seq_lens)
+                )
 
 
 class TestMissingAndOptionalSlots(unittest.TestCase):
