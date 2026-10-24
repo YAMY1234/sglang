@@ -215,6 +215,17 @@ SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
 SIMULATE_ACC_TOKEN_MODE = envs.SGLANG_SIMULATE_ACC_TOKEN_MODE.get()
 _COMMIT_CUDA = envs.SGLANG_Q35MF_COMMIT_CUDA.get()
 _TRACK_SCATTER_ROWS = envs.SGLANG_Q35MF_TRACK_SCATTER_ROWS.get()
+_track_scatter_rows_logged = False
+
+
+def _log_track_scatter_rows() -> None:
+    global _track_scatter_rows_logged
+    if not _track_scatter_rows_logged:
+        _track_scatter_rows_logged = True
+        logger.info(
+            "SGLANG_Q35MF_TRACK_SCATTER_ROWS: the tracked rows' conv windows roll back "
+            "with conv_window_scatter_rows"
+        )
 
 
 def check_simulate_acc_token_mode() -> None:
@@ -1201,6 +1212,8 @@ def commit_mamba_states_after_verify(
             src_indices_raw,
         )
         if batch.mamba_track_indices is not None:
+            if _TRACK_SCATTER_ROWS:
+                _log_track_scatter_rows()
             (
                 conv_window_scatter_rows
                 if _TRACK_SCATTER_ROWS
