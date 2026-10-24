@@ -24,9 +24,11 @@ logger = logging.getLogger(__name__)
 _NUM_WARMUP = 2
 # XORed into the server seed so these draws differ from other samplers'.
 _SIM_ACC_LEN_DOMAIN = 0x0F3D6B8C2A915E47
-# Arbitrary bound on post-verify graph sets (key x verify logits buffer); a batch
-# past it runs SGLang's eager path.
-_MAX_POST_VERIFY_STATES = 64
+# Bound on post-verify graph sets (key x verify logits buffer); a batch past it runs
+# SGLang's eager path (SGLANG_PSM_POST_VERIFY_MAX_STATES).
+_MAX_POST_VERIFY_STATES = envs.SGLANG_PSM_POST_VERIFY_MAX_STATES.get()
+# Rounds between the counters' log lines (sets captured, rounds eager at the bound).
+_STATS_EVERY = 2000
 # SGLANG_Q35MF_MKH_N3C: a round's inputs and its forced length staged in one launch.
 _ONE_LAUNCH_LOAD = envs.SGLANG_Q35MF_MKH_N3C.get()
 _SHARDED_VERIFY = envs.SGLANG_Q35MF_SHARDED_VERIFY.get()
@@ -283,13 +285,37 @@ class _PostVerifyGraphs:
         self._sim_host: list[torch.Tensor] = []
         self._sim_done: list[Optional[torch.cuda.Event]] = []
         self._sim_turn = 0
+        self._rounds = self._at_bound = self._captured = 0
 
     def run(
         self, *, key: tuple, inputs: dict, make_slot: Callable, sim_max_len: int
     ) -> Optional[tuple]:
+        if self._rounds == 0:
+            logger.info(
+                "EAGLE post-verify graphs: at most %d graph sets", _MAX_POST_VERIFY_STATES
+            )
+        self._rounds += 1
+        if self._rounds % _STATS_EVERY == 0:
+            logger.info(
+                "EAGLE post-verify graphs: %d sets (keys), %d slot graphs captured, %d of %d "
+                "rounds eager at the bound of %d sets",
+                len(self._states),
+                self._captured,
+                self._at_bound,
+                self._rounds,
+                _MAX_POST_VERIFY_STATES,
+            )
         state = self._states.get(key)
         if state is None:
             if len(self._states) >= _MAX_POST_VERIFY_STATES:
+                if self._at_bound == 0:
+                    logger.warning(
+                        "EAGLE post-verify graphs: the bound of %d sets is reached; "
+                        "new keys (first: batch size %d) run SGLang's eager path",
+                        _MAX_POST_VERIFY_STATES,
+                        key[0],
+                    )
+                self._at_bound += 1
                 return None
             state = self._states[key] = SimpleNamespace(
                 warmups=0, turn=0, slots=[None, None]
@@ -414,9 +440,15 @@ class _PostVerifyGraphs:
             self._commit(slot, outputs)
         torch.cuda.current_stream().wait_stream(self._side_stream)
         slot.graph, slot.commit_graph, slot.outputs = graph, commit_graph, outputs
+        self._captured += 1
         logger.info(
-            "Captured the EAGLE post-verify graphs for batch size %d",
+            "Captured the EAGLE post-verify graphs for batch size %d (greedy %s, top-k %s, "
+            "top-p %s; %d sets)",
             slot.num_requests,
+            slot.is_all_greedy,
+            slot.need_top_k,
+            slot.need_top_p,
+            len(self._states),
         )
 
 
