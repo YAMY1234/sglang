@@ -22,7 +22,8 @@ from __future__ import annotations
 
 import collections
 import logging
-from typing import Optional
+from types import SimpleNamespace
+from typing import Any, Callable, Optional
 
 import msgspec
 import torch
@@ -201,6 +202,38 @@ class Step2Check:
         )
 
 
+def fixed_draft_variant(
+    select: Optional[Callable], *, batch_size: int, committed_len: Optional[int], window: int
+) -> tuple[bool, Optional[str]]:
+    """Whether the next round's draft graph variant is already fixed, and which one
+    (SGLANG_PERFLL_STEP5B runs that draft a round early). The variant follows
+    ForwardBatch.attention_kv_len_lower_bound, the host's committed length at batch size 1,
+    which the next round can raise by at most one verify window; None elsewhere."""
+    if select is None:
+        return True, None
+
+    def pick(length):
+        return select(
+            SimpleNamespace(
+                batch_size=batch_size, attention_kv_len_lower_bound=length, seq_lens_cpu=None
+            )
+        )
+
+    if batch_size != 1 or committed_len is None:
+        return True, pick(None)
+    low, high = pick(committed_len), pick(committed_len + window)
+    return (True, low) if low == high else (False, None)
+
+
+class TailDraft(msgspec.Struct):
+    """A draft run one round early (SGLANG_PERFLL_STEP5B): the batch it is for (request slots
+    in order), its graph variant, and its outputs."""
+
+    slots: tuple
+    variant: Optional[str]
+    outputs: Any
+
+
 class Step2Counter:
     def __init__(self, width: int, graph_sizes, needs_next_draft: bool = False):
         self.width = width
@@ -208,8 +241,27 @@ class Step2Counter:
         self.needs_next_draft = needs_next_draft
         self.check: Optional[Step2Check] = None
         self.noted = None
+        # SGLANG_PERFLL_STEP5B: the draft this pass ran for the next one, and the one the
+        # current pass takes (set by count_draft)
+        self.tail: Optional[TailDraft] = None
+        self.tail_taken: Optional[TailDraft] = None
         self.counts = collections.Counter()
         self.decode_pass_ct = 0
+
+    def can_stage(self, batch) -> bool:
+        """Whether the next pass could take inputs staged now, if its batch is this one: an
+        unpadded graph size and every request's next window allocated."""
+        reqs = batch.reqs
+        need = 3 * self.width
+        return len(reqs) in self.graph_sizes and all(
+            r.kv.kv_allocated_len >= r.kv.kv_committed_len + need for r in reqs
+        )
+
+    def note_tail(self, batch, *, variant: Optional[str], outputs: Any) -> None:
+        """This pass ran the next pass's draft (SGLANG_PERFLL_STEP5B)."""
+        self.tail = TailDraft(
+            slots=tuple(r.kv.req_pool_idx for r in batch.reqs), variant=variant, outputs=outputs
+        )
 
     def note_extend(self, batch, next_draft: Optional[NextDraft] = None) -> None:
         """At a decode pass's end: what staging the next pass's draft inputs would rest on."""
@@ -225,11 +277,14 @@ class Step2Counter:
     def forget(self) -> None:
         """A pass that is not a decode round (prefill, mixed): nothing is staged from it."""
         self.noted = None
+        self.tail = None
 
     def count_draft(self, batch) -> Optional[NextDraft]:
         """At a decode pass's start: the inputs the previous pass staged for it when they hold
         (counted ``staged``), else None, counting the first reason they do not."""
         noted, self.noted = self.noted, None
+        tail, self.tail = self.tail, None
+        self.tail_taken = None
         staged = None
         if noted is None:
             reason = "no_previous_decode"
@@ -244,6 +299,12 @@ class Step2Counter:
         else:
             reason = "staged"
             staged = noted[3]
+            # a draft run one round early is this batch's only if its slots are the same
+            if tail is not None and tail.slots == noted[0]:
+                self.tail_taken = tail
+                self.counts["tail_taken"] += 1
+        if tail is not None and self.tail_taken is None:
+            self.counts["tail_dropped"] += 1
         self.counts[reason] += 1
         self.decode_pass_ct += 1
         if self.decode_pass_ct % LOG_EVERY == 0:

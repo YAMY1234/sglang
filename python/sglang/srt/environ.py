@@ -1741,6 +1741,9 @@ class Envs:
     # PERF-LL step 5a: the megakernel's draft extend writes its top-1 and hidden rows straight
     # into the draft graph runner's input buffers, so the next draft does not copy them.
     SGLANG_PERFLL_STEP5A = EnvBool(False)
+    # PERF-LL step 5b (with STEP2=3 and STEP5A): the next round's draft and chain tree run in
+    # this round's draft-extend graph; the next round takes them when its batch is unchanged.
+    SGLANG_PERFLL_STEP5B = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)

@@ -17,6 +17,7 @@ from sglang.srt.speculative.perfll_step2 import (
     NextDraft,
     Step2Check,
     Step2Counter,
+    fixed_draft_variant,
     takes_staging,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -136,6 +137,55 @@ class TestPerfllStep2(CustomTestCase):
         self.assertTrue(takes_staging(staged, **take))
         for field, value in (("num_requests", 3), ("plans_window", False), ("with_mrope", False)):
             self.assertFalse(takes_staging(staged, **{**take, field: value}), field)
+
+    def test_a_draft_variant_is_fixed_a_round_early_only_when_one_window_cannot_cross_a_threshold(
+        self,
+    ):
+        """SGLANG_PERFLL_STEP5B runs the next round's draft a round early: its graph variant must be
+        the one the next round would pick, whose host length may be up to one window longer."""
+
+        def select(fb):  # the plugin's Q1Variants shape: by length at batch size 1 only
+            if fb.batch_size != 1 or fb.attention_kv_len_lower_bound is None:
+                return "stock"
+            return "long" if fb.attention_kv_len_lower_bound >= 16384 else "stock"
+
+        def fixed(bs, length):
+            return fixed_draft_variant(select, batch_size=bs, committed_len=length, window=7)
+
+        self.assertEqual(fixed(1, 16000), (True, "stock"))
+        self.assertEqual(fixed(1, 16376), (True, "stock"))  # 16376 + 7 stays below the threshold
+        self.assertEqual(fixed(1, 16377), (False, None))  # 16377 + 7 reaches it
+        self.assertEqual(fixed(1, 16384), (True, "long"))
+        self.assertEqual(fixed(4, 16380), (True, "stock"))  # lengths do not pick at B > 1
+        self.assertEqual(fixed_draft_variant(None, batch_size=1, committed_len=1, window=7), (True, None))
+
+    def test_a_draft_run_a_round_early_is_taken_only_by_the_same_staged_batch(self):
+        """SGLANG_PERFLL_STEP5B: the next pass takes the early draft only when it is staged and
+        its request slots are the ones the draft ran for; a changed or padded batch drops it."""
+        counter = Step2Counter(width=7, graph_sizes=[1, 2, 4], needs_next_draft=True)
+        whole = 100 + 21
+        staged = object()
+
+        def run_pass(slots, allocated, next_slots=None, tail=True):
+            batch = _batch(slots, allocated)
+            counter.count_draft(batch)
+            taken = counter.tail_taken
+            if tail and counter.can_stage(batch):
+                counter.note_tail(batch, variant="stock", outputs=("tail", tuple(slots)))
+            counter.note_extend(batch, next_draft=staged)
+            return taken
+
+        self.assertIsNone(run_pass([5, 9], [whole, whole]))  # no previous pass
+        self.assertEqual(run_pass([5, 9], [whole, whole]).outputs, ("tail", (5, 9)))
+        self.assertIsNone(run_pass([9, 5], [whole, whole]))  # order changed: dropped
+        self.assertIsNone(run_pass([9, 5, 3], [whole] * 3))  # batch changed; 3 pads to 4: no tail
+        self.assertIsNone(run_pass([9, 5, 3], [whole] * 3))  # padded: not staged, no tail to take
+        self.assertEqual(run_pass([9, 5, 3, 1], [whole] * 4, tail=True), None)  # batch changed
+        self.assertEqual(run_pass([9, 5, 3, 1], [whole] * 4).outputs, ("tail", (9, 5, 3, 1)))
+        counter.forget()
+        self.assertIsNone(run_pass([9, 5, 3, 1], [whole] * 4))  # a prefill pass in between
+        self.assertEqual(counter.counts["tail_taken"], 2)
+        self.assertEqual(counter.counts["tail_dropped"], 2)
 
     def test_the_switch_reserves_three_windows(self):
         with (
