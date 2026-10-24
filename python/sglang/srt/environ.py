@@ -1577,6 +1577,9 @@ class Envs:
     # Experimental: capture the EAGLE verify's sampling, acceptance and state commit
     # in CUDA graphs (speculative/eagle_post_verify_graphs.py).
     SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH = EnvBool(False)
+    # Post-verify graph sets (one per key: batch size, sampling mode, ...) before new keys
+    # fall back to the eager path; 64 leaves the batches past about 62 requests eager.
+    SGLANG_PSM_POST_VERIFY_MAX_STATES = EnvInt(64)
     # Runtime switches named as on SGLang branch nvidia/qwen35-agentx-gb300; all off by default.
     # The fused small-field copy gives each field its own blocks and moves aligned fields in 16 B units.
     SGLANG_Q35MF_BK_VEC_COPY = EnvBool(False)
