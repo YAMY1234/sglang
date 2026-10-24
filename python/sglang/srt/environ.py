@@ -1249,6 +1249,9 @@ class Envs:
     # PERF-LB: gated fold calls with the per-head merge fill the chunk rows' queries in the q gather and combine their
     # partials in the merge (no copy / combine kernels).
     SGLANG_PLB_CP_FOLD_FUSE = EnvBool(False)
+    # PERF-LB: N > 0: the CP-lite once-per-forward gate kernels count every call and its gate decision on the device,
+    # and attention TP rank 0 logs the counts every N decode forwards (no host sync). 0: off, kernels unchanged.
+    SGLANG_PLB_LOG_CP_GATE_STATS = EnvInt(0)
     # PERF-LB: priority of the decode streams (forward, schedule, copy, fwd-prepare d2h); < 0 ranks them above the PD
     # staging scatter stream (default 0, the lowest), so a scatter only takes the SMs the forward leaves free.
     SGLANG_PLB_STREAM_PRIORITY = EnvInt(0)

@@ -258,6 +258,7 @@ from sglang.srt.utils.weight_checker import WeightChecker
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu_arm64 = is_host_cpu_arm64()
+_plb_cp_gate_stats = envs.SGLANG_PLB_LOG_CP_GATE_STATS.get() > 0
 
 if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
@@ -1824,6 +1825,10 @@ class ModelRunner:
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
 
         self.forward_pass_id += 1
+        if _plb_cp_gate_stats and not self.is_draft_worker:
+            from sglang.srt.layers.attention.q35_cp_lite import CpLite
+
+            CpLite.tick_gate_stats(forward_batch.forward_mode)
 
         # Try msprob debugger
         if self.msprobe_debugger is not None:
