@@ -422,11 +422,35 @@ class FlashInferMNNVLCuteDSLARFusion:
                 write_residual_output=True,
                 config=self.workspace_config,
             )
+            self._nvls = self._install_bt_nvls(
+                early_loads=get_spec().speculative_algorithm is None
+            )
 
             # Publish only after the mailbox barrier; without it the ranks
             # would desynchronize their Lamport stages.
             torch.cuda.synchronize(self.device)
             dist.barrier(group=process_group)
+
+    def _install_bt_nvls(self, *, early_loads: bool):
+        """The PERF-LB NVLS reduction of the BT route (plb_bt_nvls), or None when off."""
+        min_rows = envs.SGLANG_PLB_BT_NVLS.get()
+        if not min_rows:
+            return None
+        from sglang.srt.layers.plb_bt_nvls import BTNvls, bt_nvls_unsupported
+
+        reason = bt_nvls_unsupported(self.workspace, lamport=0, fp8_out=False)
+        if reason is not None:
+            logger.warning("SGLANG_PLB_BT_NVLS=%d requested but off: %s", min_rows, reason)
+            return None
+        nvls = BTNvls(self.workspace, min_rows=min_rows, early_loads=early_loads)
+        logger.info(
+            "SGLANG_PLB_BT_NVLS=%d: BT all-reduce / MoE finalize on NVLS multimem.ld_reduce "
+            "(acc f32) from %d rows: %s",
+            min_rows,
+            min_rows,
+            nvls.describe(),
+        )
+        return nvls
 
     def supports(self, m: int) -> bool:
         if not 1 <= int(m) <= self.max_m:
@@ -454,6 +478,19 @@ class FlashInferMNNVLCuteDSLARFusion:
         shape = (m, self.hidden_size)
         norm_output = torch.empty(shape, dtype=torch.bfloat16, device=self.device)
         residual_output = torch.empty(shape, dtype=torch.bfloat16, device=self.device)
+        if self._nvls is not None and self._nvls.takes_finalize(m):
+            self._nvls.finalize(
+                routed_output=routed_output,
+                expert_weights=expert_weights,
+                permuted_indices=permuted_indices,
+                shared_output=gated_shared_output,
+                residual_source=residual,
+                gamma=gamma,
+                norm_output=norm_output,
+                residual_output=residual_output,
+                m=m,
+            )
+            return norm_output, residual_output
 
         pattern = self._patterns.kMoEFinalizeARResidualRMSNorm
         self._allreduce_fusion(
@@ -486,6 +523,16 @@ class FlashInferMNNVLCuteDSLARFusion:
             raise ValueError(f"workspace does not support M={m}")
         norm_output = torch.empty_like(local_contribution)
         residual_output = torch.empty_like(local_contribution)
+        if self._nvls is not None and self._nvls.takes_all_reduce(m):
+            self._nvls.all_reduce(
+                local_contribution=local_contribution,
+                residual_source=residual,
+                gamma=gamma,
+                norm_output=norm_output,
+                residual_output=residual_output,
+                m=m,
+            )
+            return norm_output, residual_output
 
         pattern = self._patterns.kARResidualRMSNorm
         self._allreduce_fusion(
