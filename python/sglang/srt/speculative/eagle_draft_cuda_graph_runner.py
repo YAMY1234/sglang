@@ -48,6 +48,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
+from sglang.srt.speculative import perfll_rs
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
@@ -547,8 +548,16 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         served = num_seqs in self.megakernel_served
 
         def run_once():
-            self.draft_attn_backend.init_forward_metadata_in_graph(forward_batch)
+            return perfll_rs.run_with_metadata_branch(
+                "draft",
+                metadata=lambda: self.draft_attn_backend.init_forward_metadata_in_graph(
+                    forward_batch
+                ),
+                body=run_body,
+                what=f"draft graph of {num_seqs} requests",
+            )
 
+        def run_body():
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
             set_dp_buffer_len(
                 global_dp_buffer_len,

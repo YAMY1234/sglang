@@ -38,6 +38,7 @@ import torch
 
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_parallel, get_schedule, get_spec
+from sglang.srt.speculative import perfll_rs
 
 # Called by a megakernel beyond the data below (its contract test pins the list).
 TOLERATED_CALLABLES = (
@@ -109,6 +110,20 @@ class AttnStepMetadata(msgspec.Struct, frozen=True):
     cu_seqlens_q: Optional[torch.Tensor]  # [bs + 1] int32
     cu_seqlens_k: Optional[torch.Tensor]  # [bs + 1] int32
     max_seq_len_q: int
+
+
+class _JoinOnRead(AttnStepMetadata, frozen=True):
+    """AttnStepMetadata of a graph whose metadata update runs on a branch (SGLANG_PERFLL_RS_D2): the
+    first field read, right before the megakernel launches what reads it, joins the branch."""
+
+    def __getattribute__(self, name):
+        if name in _STEP_FIELDS:
+            perfll_rs.join_metadata(f"its first read of {name}")
+        return super().__getattribute__(name)
+
+
+# the device fields the update writes (max_seq_len_q is a host value fixed at capture)
+_STEP_FIELDS = frozenset({"page_table", "cache_seqlens", "cu_seqlens_q", "cu_seqlens_k"})
 
 
 class GdnStepMetadata(msgspec.Struct, frozen=True):
@@ -273,7 +288,8 @@ def attn_step_metadata(backend: Any) -> AttnStepMetadata:
     """The step metadata of a TRT-LLM MHA backend, or of a hybrid's full-attention
     one."""
     metadata = split_backend(backend)[0].forward_metadata
-    return AttnStepMetadata(
+    struct = _JoinOnRead if perfll_rs.branch_open() else AttnStepMetadata
+    return struct(
         page_table=metadata.page_table,
         cache_seqlens=metadata.cache_seqlens_int32,
         cu_seqlens_q=metadata.cu_seqlens_q,

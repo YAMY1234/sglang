@@ -927,6 +927,70 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
                         )
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
+class TestMetadataBranch(CustomTestCase):
+    """SGLANG_PERFLL_RS_D2: a captured graph's metadata update on a forked branch is joined before
+    the first read through the megakernel binding's step metadata, however late the update runs."""
+
+    def _run(self, *, read: bool):
+        from sglang.srt.megakernels import eagle_binding
+        from sglang.srt.speculative import perfll_rs
+
+        meta = SimpleNamespace(
+            page_table=torch.zeros(1, 4, dtype=torch.int32, device="cuda"),
+            cache_seqlens_int32=torch.zeros(1, dtype=torch.int32, device="cuda"),
+            cu_seqlens_q=None,
+            cu_seqlens_k=torch.zeros(2, dtype=torch.int32, device="cuda"),
+            max_seq_len_q=7,
+        )
+        backend = SimpleNamespace(forward_metadata=meta)
+        want = torch.tensor([1234567], dtype=torch.int32, device="cuda")
+        out = torch.zeros(1, dtype=torch.int32, device="cuda")
+        busy = torch.zeros(1, device="cuda")
+
+        def metadata():
+            torch.cuda._sleep(
+                200_000
+            )  # a late update: a reader that skips the join reads 0
+            meta.cache_seqlens_int32.copy_(want)
+
+        def body():
+            busy.add_(1.0)  # main-branch work that does not read the metadata
+            if read:
+                out.copy_(eagle_binding.attn_step_metadata(backend).cache_seqlens)
+
+        def run_once():
+            return perfll_rs.run_with_metadata_branch(
+                "extend", metadata=metadata, body=body, what="test graph"
+            )
+
+        with patch.object(perfll_rs, "_GRAPHS", frozenset({"extend"})):
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                run_once()  # eager
+            torch.cuda.current_stream().wait_stream(stream)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run_once()
+            self.assertFalse(perfll_rs.branch_open())
+            for _ in range(3):
+                meta.cache_seqlens_int32.zero_()
+                out.zero_()
+                graph.replay()
+                torch.cuda.synchronize()
+                self.assertTrue(torch.equal(meta.cache_seqlens_int32, want))
+                if read:
+                    self.assertTrue(torch.equal(out, want), "read before the update")
+
+    def test_a_late_update_is_joined_before_the_first_read(self):
+        self._run(read=True)
+
+    def test_a_body_that_reads_nothing_joins_at_its_end(self):
+        self._run(read=False)
+
+
 def _sampled(batch, *, generator):
     """The round's batch with T0.6 / top-k / top-p sampling on every request."""
     bs = len(batch.seq_lens)
