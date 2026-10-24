@@ -1724,6 +1724,11 @@ class Envs:
     # layout (prepare_draft_extend_layout's prefix / extend / post lengths, positions, starts,
     # mrope), so the draft extend does not launch it eagerly.
     SGLANG_PST_SPEC_EXTEND_LAYOUT = EnvBool(False)
+    # PERF-LL step 2 (the next round's draft inputs staged at the draft extend's tail). 1: count
+    # only -- each decode pass logs whether the previous pass could have staged its draft inputs
+    # (same batch in the same order, an unpadded graph size, every window allocated), and decode
+    # reserves three verify windows a request instead of two.
+    SGLANG_PERFLL_STEP2 = EnvInt(0)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
