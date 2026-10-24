@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+import triton
 
 from sglang.srt.speculative import sharded_verify
 from sglang.srt.speculative.sharded_verify import (
@@ -378,24 +379,26 @@ class TestFusedTail(CustomTestCase):
                 plain = words[maxr // 2 : maxr // 2 + bs * 7]
                 self.assertEqual(bool(((plain >> 32) == tag).all()), bool(i % 2))
 
-    def test_trees_that_are_not_chains_take_the_walk_every_launch(self):
-        """A batch holding a tree that is not a canonical chain gets every output of the
-        per-request tree walk, launch after launch. Merging one request's walk result into
-        the batch's vector-compare result once left that request's predict and accept index
-        wrong in 27 of 300 launches while its counts were right."""
+    def test_every_launch_writes_the_stock_outputs(self):
+        """Launch after launch, at bs 8 / 9, with canonical chains and with a tree that is not
+        one, the tail stores the exchanged tokens and writes every output the per-request
+        stock tail writes. Keys reduced in a [rank, request, node] layout once stored wrong
+        tokens for requests 4-7 in about 2-9% of bs-8 launches."""
         from sglang.kernels.ops.speculative.eagle import chain_accept
 
         gen = torch.Generator(device="cuda").manual_seed(13)
-        bs, width, parts = 8, 7, 2
-        rows, maxr = bs * width, 2 * sharded_verify._TAIL_ROWS
+        width, parts = 7, 2
+        maxr = 2 * sharded_verify._TAIL_ROWS
         channel = _unicast_channel()
-        for i in range(300):
+        for i in range(600):
+            bs = 9 if i % 5 == 4 else 8
+            rows = bs * width
             keys = torch.randint(
                 -(2**62), 2**62, (rows, parts), device="cuda", generator=gen
             )
             target = (0xFFFFFFFF - (keys.amax(dim=1) & 0xFFFFFFFF)).view(bs, width)
-            tree = _trees(bs, width, target, gen, other_tree=True)
-            if i % 2:  # the walk goes on from node 1 to node 3
+            tree = _trees(bs, width, target, gen, other_tree=bool(i % 3))
+            if i % 3 == 2:  # the walk goes on from node 1 to node 3
                 tree[0][1, 3] = target[1, 1]
             out = _outputs(bs, width)
             ref = _outputs(bs, width)
@@ -423,7 +426,8 @@ class TestFusedTail(CustomTestCase):
                 MAXR=maxr,
                 PLAIN_ROW=sharded_verify._TAIL_ROWS,
                 WIDTH=width,
-                BLOCK_B=8,
+                BLOCK_R=triton.next_power_of_2(rows),
+                BLOCK_B=triton.next_power_of_2(bs),
                 BLOCK_W=8,
                 BLOCK_P=2,
                 KEY_FLOOR=sharded_verify._KEY_FLOOR,
@@ -444,7 +448,8 @@ class TestFusedTail(CustomTestCase):
                 verify=True,
                 finish=True,
             )
-            with self.subTest(launch=i):
+            with self.subTest(launch=i, bs=bs):
+                self.assertTrue(torch.equal(tokens.view(bs, width), target))
                 for name in ref:
                     self.assertTrue(torch.equal(out[name], ref[name]), name)
                 self.assertTrue(torch.equal(lens, ref_lens))
@@ -502,6 +507,7 @@ class TestFusedTail(CustomTestCase):
                 MAXR=maxr,
                 PLAIN_ROW=sharded_verify._TAIL_ROWS,
                 WIDTH=width,
+                BLOCK_R=32,
                 BLOCK_B=4,
                 BLOCK_W=8,
                 BLOCK_P=4,
