@@ -259,6 +259,7 @@ _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu_arm64 = is_host_cpu_arm64()
 _plb_cp_gate_stats = envs.SGLANG_PLB_LOG_CP_GATE_STATS.get() > 0
+_plb_kv_page_stats = envs.SGLANG_PLB_LOG_KV_PAGE_STATS.get() > 0
 
 if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
@@ -1829,6 +1830,16 @@ class ModelRunner:
             from sglang.srt.layers.attention.q35_cp_lite import CpLite
 
             CpLite.tick_gate_stats(forward_batch.forward_mode)
+        if _plb_kv_page_stats and not self.is_draft_worker:
+            from sglang.srt.mem_cache.kv_page_layout_stats import tick_kv_page_stats
+
+            tick_kv_page_stats(
+                forward_mode=forward_batch.forward_mode,
+                req_to_token=self.req_to_token_pool.req_to_token,
+                req_pool_indices=forward_batch.req_pool_indices,
+                seq_lens=forward_batch.seq_lens,
+                page_size=self.page_size,
+            )
 
         # Try msprob debugger
         if self.msprobe_debugger is not None:

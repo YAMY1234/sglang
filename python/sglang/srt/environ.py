@@ -1236,6 +1236,9 @@ class Envs:
     # PERF-LB: N > 0: the CP-lite once-per-forward gate kernels count every call and its gate decision on the device,
     # and attention TP rank 0 logs the counts every N decode forwards (no host sync). 0: off, kernels unchanged.
     SGLANG_PLB_LOG_CP_GATE_STATS = EnvInt(0)
+    # PERF-LB: N > 0: every N decode forwards attention TP rank 0 samples the batch's KV page ids (req_to_token at page
+    # starts) on a side stream and logs their contiguity once the copy lands (no host sync). 0: off.
+    SGLANG_PLB_LOG_KV_PAGE_STATS = EnvInt(0)
     # PERF-LB: priority of the decode streams (forward, schedule, copy, fwd-prepare d2h); < 0 ranks them above the PD
     # staging scatter stream (default 0, the lowest), so a scatter only takes the SMs the forward leaves free.
     SGLANG_PLB_STREAM_PRIORITY = EnvInt(0)
