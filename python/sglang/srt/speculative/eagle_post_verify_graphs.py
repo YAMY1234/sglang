@@ -37,6 +37,7 @@ _SIM_PREDRAW = envs.SGLANG_PERFLL_HOST_SIM_PREDRAW.get()
 _BONUS_DTYPE = torch.int64 if envs.SGLANG_PERFLL_STEP5A_BONUS_I64.get() else torch.int32
 # SGLANG_PERFLL_STEP5A_SEQ_LENS: a batch's lengths may be a slot's new_seq_lens output
 _STAGED_SEQ_LENS = envs.SGLANG_PERFLL_STEP5A_SEQ_LENS.get()
+_EARLY_LOAD = envs.SGLANG_PERFLL_PV_EARLY_LOAD.get()
 
 
 def simulated_acc_len_generator(seed: int) -> torch.Generator:
@@ -129,6 +130,11 @@ class EaglePostVerifyGraphs:
         """Order the current stream after the last side-stream mamba state commit; the
         worker calls it once the draft extend is enqueued."""
         self._graphs.join()
+
+    def mark_inputs_ready(self) -> None:
+        """SGLANG_PERFLL_PV_EARLY_LOAD: the current stream has enqueued every write of the next
+        run()'s inputs; the worker calls it right before it launches the verify forward."""
+        self._graphs.mark_inputs_ready()
 
     def _key(
         self,
@@ -358,10 +364,14 @@ class _PostVerifyGraphs:
         self._sim_turn = 0
         # the slot of the last run that returned outputs
         self.last_slot: Optional[SimpleNamespace] = None
+        # SGLANG_PERFLL_PV_EARLY_LOAD: the load's side stream and its two events
+        self._load_stream = self._inputs_ready = self._loaded = None
+        self._inputs_marked = False
 
     def run(
         self, *, key: tuple, inputs: dict, make_slot: Callable, sim_max_len: int
     ) -> Optional[tuple]:
+        marked, self._inputs_marked = self._inputs_marked, False
         state = self._states.get(key)
         if state is None:
             if len(self._states) >= _MAX_POST_VERIFY_STATES:
@@ -378,6 +388,8 @@ class _PostVerifyGraphs:
         slot = state.slots[turn]
         if _STAGED_SEQ_LENS and slot is not None and slot.graph is not None:
             _check_lengths_outlive(slot, inputs["seq_lens"])
+        # a slot's first round stages on the current stream, after its buffers are made
+        early = marked and slot is not None
         if slot is None:
             staged = {name: src.clone() for name, src in inputs.items()}
             if sim_len is not None:
@@ -389,9 +401,12 @@ class _PostVerifyGraphs:
             slot.load_plan = (
                 SmallFieldCopyPlan(allow_pinned_src=True) if _ONE_LAUNCH_LOAD else None
             )
-        self._load(slot, inputs, sim_len)
-        if sim_len is not None:
-            self._record_sim_done(sim_turn)
+        if early:
+            self._load_early(slot, inputs, sim_len, sim_turn)
+        else:
+            self._load(slot, inputs, sim_len)
+            if sim_len is not None:
+                self._record_sim_done(sim_turn)
         if host_trace.ENABLED:
             host_trace.mark(host_trace.PVC)
         self.last_slot = slot
@@ -415,6 +430,28 @@ class _PostVerifyGraphs:
         if self._commit_pending:
             torch.cuda.current_stream().wait_event(self._commit_done)
             self._commit_pending = False
+
+    def mark_inputs_ready(self) -> None:
+        if not _EARLY_LOAD:
+            return
+        if self._load_stream is None:
+            self._load_stream = torch.cuda.Stream()
+            self._inputs_ready, self._loaded = torch.cuda.Event(), torch.cuda.Event()
+        self._inputs_ready.record()
+        self._inputs_marked = True
+
+    def _load_early(
+        self, slot: SimpleNamespace, inputs: dict, sim_len, sim_turn: Optional[int]
+    ) -> None:
+        # The slot's last readers (its graphs two rounds ago, the commit joined since) and
+        # every input's writer precede the mark, so the copy overlaps the verify forward.
+        self._load_stream.wait_event(self._inputs_ready)
+        with torch.cuda.stream(self._load_stream):
+            self._load(slot, inputs, sim_len)
+            if sim_len is not None:
+                self._record_sim_done(sim_turn)
+            self._loaded.record()
+        torch.cuda.current_stream().wait_event(self._loaded)
 
     @staticmethod
     def _load(slot: SimpleNamespace, inputs: dict, sim_len) -> None:

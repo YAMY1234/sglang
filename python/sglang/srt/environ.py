@@ -1602,6 +1602,9 @@ class Envs:
     # reads the injected acceptance length from its pinned host slot (bit-identical); needs
     # SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.
     SGLANG_Q35MF_MKH_N3C = EnvBool(False)
+    # That load on a side stream that waits only for the verify forward's launch point, so it
+    # overlaps the forward instead of running between the verify and post-verify graphs.
+    SGLANG_PERFLL_PV_EARLY_LOAD = EnvBool(False)
     # A topk-1 chain against TRT-LLM MHA, which masks the draft window itself, is built
     # with build_chain_tree instead of a full-context tree mask.
     SGLANG_Q35MF_EDGE_CHAIN_TREE = EnvBool(False)
@@ -1636,6 +1639,10 @@ class Envs:
     # rank folds its keys per row and multicasts them as epoch-tagged 64-bit words into three rotating
     # slots of a symmetric buffer, then polls its own copy until every rank's words carry the epoch.
     SGLANG_PERFLL_VERIFY_LL_KEYS = EnvBool(False)
+    # SGLANG_Q35MF_SHARDED_VERIFY's tail for <= 64 rows in two launches: the shard keys (with the
+    # argmax keys of an injected bonus in the same pass), then one CTA exchanging them on an LL
+    # channel of its own and writing every chain-accept output.
+    SGLANG_PERFLL_VERIFY_FUSED_TAIL = EnvBool(False)
     # The TRT-LLM MHA multi-step draft graph's attention metadata: one page table for every
     # step, written once at the last step's length, and the other steps' sequence lengths in
     # one launch (the steps read the same values). No SWA, no unified pool.

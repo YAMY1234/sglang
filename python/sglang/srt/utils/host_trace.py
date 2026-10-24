@@ -77,7 +77,7 @@ GC0, GC1, RUSAGE = 40, 41, 42
     EPA, EPB,
     EXA, EXB,
 ) = range(43, 72)  # fmt: skip
-GPU_MARKS = (DRAFT0, DRAFTG, DRAFT1, VERIFY0, VERIFY1, EXT1)
+GPU_MARKS = (DRAFT0, DRAFTG, DRAFT1, VERIFY0, VF1, VERIFY1, EXT1)
 
 _buf = array("q")
 _pass_start = 0

@@ -7,13 +7,14 @@ Gumbel-max sample, the same distribution as softmax(logits / T)."""
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 import msgspec
 import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.speculative.eagle import _chain_walk
 from sglang.srt.utils.common import print_info_once
 from sglang.srt.environ import envs
 
@@ -35,6 +36,16 @@ _KEY_FLOOR = -2139095041 << 32
 
 
 @triton.jit
+def _plain_key(x, gid, mask, KEY_FLOOR: tl.constexpr):
+    # the argmax key of FP32 values x, as _shard_key_kernel builds it without temperatures
+    x = tl.where(x == x, x, float("-inf")) + 0.0
+    bits = x.to(tl.int32, bitcast=True)
+    ordered = tl.where(bits < 0, bits ^ 0x7FFFFFFF, bits).to(tl.int64)
+    key = (ordered << 32) | (4294967295 - gid.to(tl.int64))
+    return tl.where(mask, key, KEY_FLOOR)
+
+
+@triton.jit
 def _shard_key_kernel(
     logits_ptr,
     stride_row,
@@ -48,6 +59,9 @@ def _shard_key_kernel(
     KEY_FLOOR: tl.constexpr,
     HAS_TEMP: tl.constexpr,
     BLOCK: tl.constexpr,
+    plain_keys_ptr=None,
+    PLAIN: tl.constexpr = False,
+    TEMP_GROUP: tl.constexpr = 1,
 ):
     # program (row, part): columns [part * span, (part + 1) * span) of the row's shard
     row = tl.program_id(0).to(tl.int64)
@@ -55,8 +69,15 @@ def _shard_key_kernel(
     lo = part * span
     hi = tl.minimum(lo + span, valid)
     best = tl.full([BLOCK], KEY_FLOOR, tl.int64)
+    # PLAIN: the argmax keys too, from the same loads (before the Gumbel noise)
+    if PLAIN:
+        best_plain = tl.full([BLOCK], KEY_FLOOR, tl.int64)
     if HAS_TEMP:
-        temp = tl.load(temp_ptr + row)
+        # TEMP_GROUP > 1: one temperature per TEMP_GROUP consecutive rows (a request's verify rows)
+        if TEMP_GROUP > 1:
+            temp = tl.load(temp_ptr + row // TEMP_GROUP)
+        else:
+            temp = tl.load(temp_ptr + row)
         inv_t = 1.0 / tl.maximum(temp, 1e-20)
         seed = tl.load(seed_ptr + row)
     for off in range(lo, hi, BLOCK):
@@ -67,6 +88,8 @@ def _shard_key_kernel(
             logits_ptr + row * stride_row + cols, mask=mask, other=float("-inf")
         )
         x = x.to(tl.float32)
+        if PLAIN:
+            best_plain = tl.maximum(best_plain, _plain_key(x, gid, mask, KEY_FLOOR))
         if HAS_TEMP:
             if temp > 0.0:
                 u = tl.rand(seed, gid)
@@ -80,6 +103,10 @@ def _shard_key_kernel(
         key = tl.where(mask, key, KEY_FLOOR)
         best = tl.maximum(best, key)
     tl.store(keys_ptr + row * tl.num_programs(1) + part, tl.max(best, axis=0))
+    if PLAIN:
+        tl.store(
+            plain_keys_ptr + row * tl.num_programs(1) + part, tl.max(best_plain, axis=0)
+        )
 
 
 _KEY_BLOCK = 2048
@@ -355,7 +382,9 @@ def _ll_keys_kernel(
     tl.store(epoch_ptr, tag.to(tl.int32))
 
 
-def _ll_build(tp_group, device):
+def _ll_build(
+    tp_group, device, max_rows: int = _LL_MAX_ROWS, name: str = "SGLANG_PERFLL_VERIFY_LL_KEYS"
+):
     """The LL exchange's symmetric buffer (zeroed before any peer can write it) and epoch, or
     False (the other exchanges keep the call) when it has no multicast mapping."""
     import torch.distributed as dist
@@ -365,14 +394,14 @@ def _ll_build(tp_group, device):
     try:
         with torch.inference_mode(False), torch.no_grad():
             buf = symm_mem.empty(
-                (_LL_SLOTS * world * _LL_MAX_ROWS * 2,), dtype=torch.int64, device=device
+                (_LL_SLOTS * world * max_rows * 2,), dtype=torch.int64, device=device
             )
         hdl = symm_mem.rendezvous(buf, group=tp_group.device_group)
     except Exception as e:
-        print_info_once(f"SGLANG_PERFLL_VERIFY_LL_KEYS: symmetric buffer failed ({e}); not used")
+        print_info_once(f"{name}: symmetric buffer failed ({e}); not used")
         return False
     if hdl.multicast_ptr == 0:
-        print_info_once("SGLANG_PERFLL_VERIFY_LL_KEYS: no multicast mapping; not used")
+        print_info_once(f"{name}: no multicast mapping; not used")
         return False
     buf.zero_()
     torch.cuda.synchronize(device)
@@ -411,6 +440,353 @@ def _ll_keys(keys: torch.Tensor, tp_group) -> Optional[torch.Tensor]:
         num_warps=4,
     )
     return tokens
+
+
+# SGLANG_PERFLL_VERIFY_FUSED_TAIL: the LL exchange of one or two keys per row fused with the chain
+# accept, on a channel (buffer, epoch) of its own: the layout is fixed per channel (key k of row r at
+# virtual row _TAIL_ROWS * k + r), as a slow rank may still poll words of the previous call.
+_TAIL_ROWS = 64
+_tail_state = None
+
+
+class TailChannel(msgspec.Struct, frozen=True):
+    """The fused tail's exchange state: `buffer` (int64 words) at `uc_addr`, written through
+    `mc_addr` (multicast; a plain store when `multicast` is False, a one-rank channel)."""
+
+    buffer: Any
+    epoch: Any
+    mc_addr: int
+    uc_addr: int
+    rank: int
+    multicast: bool
+
+
+@triton.jit
+def _tail_st_b64(addr, val, mask, MULTICAST: tl.constexpr):
+    if MULTICAST:
+        return _ll_st_b64(addr, val, mask)
+    else:
+        return tl.inline_asm_elementwise(
+            """
+            {
+                .reg .pred %p0;
+                setp.eq.s32 %p0, $3, 1;
+                @!%p0 bra end;
+                st.relaxed.sys.global.b64 [$1], $2;
+                end:
+            }
+            """,
+            "=r,l,l,r",
+            args=[addr, val, mask.to(tl.int32)],
+            dtype=tl.uint32,
+            is_pure=False,
+            pack=1,
+        )
+
+
+@triton.jit
+def _tail_push(
+    mc,
+    key,
+    vrow,
+    slot,
+    tagw,
+    mask,
+    RANK: tl.constexpr,
+    WORLD: tl.constexpr,
+    MAXR: tl.constexpr,
+    MULTICAST: tl.constexpr,
+):
+    # this rank's words of virtual rows vrow, the _ll_keys_kernel words
+    key = key.to(tl.uint64, bitcast=True)
+    word = ((slot * WORLD + RANK) * MAXR + vrow) * 2
+    _tail_st_b64(mc + word, (key & 0xFFFFFFFF) | tagw, mask, MULTICAST)
+    _tail_st_b64(mc + word + 1, (key >> 32) | tagw, mask, MULTICAST)
+
+
+@triton.jit
+def _tail_pending(uc, words, tag, mask):
+    lo = _ll_ld_b64(uc + words, mask)
+    hi = _ll_ld_b64(uc + words + 1, mask)
+    ok = (((lo >> 32) == tag) & ((hi >> 32) == tag)) | (~mask)
+    return lo, hi, tl.sum(1 - ok.to(tl.int32))
+
+
+@triton.jit
+def _tail_tokens(lo, hi, mask, KEY_FLOOR: tl.constexpr):
+    # the max over the ranks (axis 0) of the exchanged keys -> token ids
+    got = (((hi & 0xFFFFFFFF) << 32) | (lo & 0xFFFFFFFF)).to(tl.int64, bitcast=True)
+    best = tl.max(tl.where(mask, got, KEY_FLOOR), axis=0)
+    return 4294967295 - (best & 4294967295)
+
+
+@triton.jit
+def _ll_accept_kernel(
+    keys_ptr,
+    plain_keys_ptr,
+    parts,
+    mc_addr,
+    uc_addr,
+    epoch_ptr,
+    tokens_ptr,
+    bonus_tokens_ptr,
+    predict,
+    accept_index,
+    num_correct_drafts,
+    accept_lens,
+    sim_accept_index,
+    candidates,
+    retrieve_index,
+    retrieve_next_token,
+    retrieve_next_sibling,
+    simulated_acc_len,
+    bs,
+    RANK: tl.constexpr,
+    WORLD: tl.constexpr,
+    MAXR: tl.constexpr,
+    PLAIN_ROW: tl.constexpr,
+    WIDTH: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+    BLOCK_P: tl.constexpr,
+    KEY_FLOOR: tl.constexpr,
+    SPIN_LIMIT: tl.constexpr,
+    PLAIN: tl.constexpr,
+    SIMULATE: tl.constexpr,
+    REAL_DRAFT_TOKENS: tl.constexpr,
+    MULTICAST: tl.constexpr,
+):
+    # One CTA: the _ll_keys_kernel exchange of every row's key (and plain key), then
+    # _chain_accept_kernel(VERIFY, FINISH) for every request; request b's verify rows are
+    # [b * WIDTH, (b + 1) * WIDTH) of the keys, candidates and retrieve_*.
+    tag = (tl.load(epoch_ptr) + 1).to(tl.uint64)
+    slot = (tag % 3).to(tl.int64)
+    rb = tl.arange(0, BLOCK_B)
+    b = rb[:, None].to(tl.int64)
+    w = tl.arange(0, BLOCK_W)[None, :]
+    in_req = b < bs
+    m2 = in_req & (w < WIDTH)
+    base = b * WIDTH
+    row = base + w
+    # the request trees (staged ahead of this graph), independent of the exchange
+    nxt = tl.load(retrieve_next_token + row, mask=m2, other=-1).to(tl.int64)
+    sib = tl.load(retrieve_next_sibling + row, mask=m2, other=-1).to(tl.int64)
+    idx = tl.load(retrieve_index + row, mask=m2, other=0).to(tl.int64)
+    drf = tl.load(candidates + row + 1, mask=in_req & (w < WIDTH - 1), other=0)
+    # _chain_is_canonical per request: node i is row base + i, its only child node i + 1
+    want = tl.where(w < WIDTH - 1, w + 1, -1)
+    bad = m2 & ((nxt != want) | (sib != -1) | (idx != row))
+    canon = tl.sum(bad.to(tl.int32), axis=1) == 0
+
+    p = tl.arange(0, BLOCK_P)[None, None, :]
+    kmask = m2[:, :, None] & (p < parts)
+    kaddr = row[:, :, None] * parts + p
+    key = tl.max(tl.load(keys_ptr + kaddr, mask=kmask, other=KEY_FLOOR), axis=2)
+    tagw = tag << 32
+    mc = mc_addr.to(tl.pointer_type(tl.uint64))
+    uc = uc_addr.to(tl.pointer_type(tl.uint64))
+    _tail_push(mc, key, row, slot, tagw, m2, RANK, WORLD, MAXR, MULTICAST)
+    if PLAIN:
+        plain = tl.max(tl.load(plain_keys_ptr + kaddr, mask=kmask, other=KEY_FLOOR), axis=2)
+        _tail_push(mc, plain, row + PLAIN_ROW, slot, tagw, m2, RANK, WORLD, MAXR, MULTICAST)
+    s = tl.arange(0, WORLD)[:, None, None]
+    m3 = m2[None, :, :] & (s < WORLD)
+    words = ((slot * WORLD + s) * MAXR + row[None, :, :]) * 2
+    lo, hi, pending = _tail_pending(uc, words, tag, m3)
+    if PLAIN:
+        lo_p, hi_p, pending_p = _tail_pending(uc, words + 2 * PLAIN_ROW, tag, m3)
+        pending += pending_p
+    spins = 0
+    while pending > 0:
+        lo, hi, pending = _tail_pending(uc, words, tag, m3)
+        if PLAIN:
+            lo_p, hi_p, pending_p = _tail_pending(uc, words + 2 * PLAIN_ROW, tag, m3)
+            pending += pending_p
+        spins += 1
+        if spins > SPIN_LIMIT:
+            _ll_trap()
+    tgt = _tail_tokens(lo, hi, m3, KEY_FLOOR)
+    tl.store(tokens_ptr + row, tgt, mask=m2)
+    if PLAIN:
+        bonus = _tail_tokens(lo_p, hi_p, m3, KEY_FLOOR)
+        tl.store(bonus_tokens_ptr + row, bonus, mask=m2)
+    else:
+        bonus = tgt
+    tl.store(epoch_ptr, tag.to(tl.int32))
+
+    # canonical chains: the walk's result from one vector compare (_chain_linear)
+    hit = (w < WIDTH - 1) & (drf.to(tl.int64) == tgt)
+    num = tl.min(tl.where(hit, WIDTH - 1, w), axis=1).to(tl.int64)
+    acc = tl.where(w <= num[:, None], row, -1)
+    pred = tl.where(w <= num[:, None], tgt, 0)
+    first = rb.to(tl.int64) * WIDTH
+    other = (~canon) & (rb < bs)
+    if tl.sum(other.to(tl.int32)) > 0:
+        # any other tree: the walk on the stored tokens, as _chain_accept_kernel runs it
+        tl.debug_barrier()
+        cols = tl.arange(0, BLOCK_W)
+        for i in range(0, bs):
+            if tl.sum((other & (rb == i)).to(tl.int32)) > 0:
+                first_i, acc_i, pred_i, num_i = _chain_walk(
+                    retrieve_index,
+                    retrieve_next_token,
+                    retrieve_next_sibling,
+                    candidates,
+                    tokens_ptr,
+                    i.to(tl.int64) * WIDTH,
+                    cols,
+                    WIDTH,
+                    BLOCK_W,
+                )
+                sel = rb == i
+                first = tl.where(sel, first_i, first)
+                num = tl.where(sel, num_i, num)
+                acc = tl.where(sel[:, None], acc_i[None, :], acc)
+                pred = tl.where(sel[:, None], pred_i[None, :], pred)
+    tl.store(accept_index + row, acc.to(tl.int32), mask=m2)
+    if SIMULATE:
+        # spec_utils.generate_simulated_accept_index_device for a length on the device
+        length = tl.load(simulated_acc_len).to(tl.int64)
+        sim = tl.where(w < length, first[:, None] + w, -1)
+        tl.store(sim_accept_index + row, sim.to(tl.int32), mask=m2)
+        num = tl.zeros([BLOCK_B], dtype=tl.int64) + (length - 1)
+        if REAL_DRAFT_TOKENS:
+            drafted = tl.load(candidates + base + tl.minimum(w + 1, WIDTH - 1), mask=m2, other=0)
+            pred = tl.where(
+                w < length - 1,
+                drafted.to(tl.int32).to(tl.int64),
+                tl.where(w == length - 1, bonus.to(tl.int32).to(tl.int64), pred),
+            )
+        else:
+            pred = tl.full([BLOCK_B, BLOCK_W], 100, dtype=tl.int64)
+    tl.store(predict + row, pred.to(tl.int32), mask=m2)
+    tl.store(num_correct_drafts + rb, num.to(tl.int32), mask=rb < bs)
+    tl.store(accept_lens + rb, (num + 1).to(tl.int32), mask=rb < bs)
+
+
+def _tail_channel(tp_group, device) -> Optional[TailChannel]:
+    global _tail_state
+    if _tail_state is None:
+        built = _ll_build(
+            tp_group, device, 2 * _TAIL_ROWS, name="SGLANG_PERFLL_VERIFY_FUSED_TAIL"
+        )
+        _tail_state = built and TailChannel(
+            buffer=built[0],
+            epoch=built[2],
+            mc_addr=built[1].multicast_ptr,
+            uc_addr=built[1].buffer_ptrs[built[1].rank],
+            rank=built[1].rank,
+            multicast=True,
+        )
+    return _tail_state or None
+
+
+def fused_verify_tail(
+    *,
+    logits: torch.Tensor,
+    shard: VocabShard,
+    tp_group,
+    temperatures: Optional[torch.Tensor],
+    plain_bonus: bool,
+    predict: torch.Tensor,
+    accept_index: torch.Tensor,
+    num_correct_drafts: torch.Tensor,
+    candidates: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
+    simulated_acc_len: Optional[torch.Tensor],
+    real_draft_tokens: bool,
+) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    """SGLANG_PERFLL_VERIFY_FUSED_TAIL: sharded_target_tokens then chain_accept(verify, finish), in
+    two launches, with every output chain_accept writes; returns (accept_lens, accept_index) as it
+    does. temperatures: [bs] float32 for a Gumbel-max target (None: greedy); plain_bonus: the
+    injected acceptance's bonus is the argmax, exchanged with the Gumbel keys. None when the tail's
+    channel is unavailable or the batch too large: the caller runs the stock tail."""
+    bs, width = accept_index.shape
+    rows = logits.shape[0]
+    if not 0 < rows <= _TAIL_ROWS or tp_group.world_size > 16:
+        return None
+    channel = _tail_channel(tp_group, logits.device)
+    if channel is None:
+        return None
+    print_info_once(
+        "SGLANG_PERFLL_VERIFY_FUSED_TAIL: target "
+        + ("Gumbel-max" if temperatures is not None else "argmax")
+        + (" with the argmax bonus" if plain_bonus else "")
+        + " and the chain accept in two launches"
+    )
+    device = logits.device
+    has_temp = temperatures is not None
+    # the same draw as sharded_target_tokens makes, so the Gumbel noise is unchanged
+    seeds = (
+        torch.randint(0, 2**31 - 1, (rows,), dtype=torch.int64, device=device)
+        if has_temp
+        else None
+    )
+    splits = key_splits(shard.valid) if _SPLIT else 1
+    keys = torch.empty((rows, splits), dtype=torch.int64, device=device)
+    plain = torch.empty_like(keys) if plain_bonus else keys
+    _shard_key_kernel[(rows, splits)](
+        logits,
+        logits.stride(0),
+        temperatures if has_temp else keys,
+        seeds if has_temp else keys,
+        keys,
+        shard.start,
+        shard.valid,
+        shard.vocab_size,
+        -(-shard.valid // splits),
+        KEY_FLOOR=_KEY_FLOOR,
+        HAS_TEMP=has_temp,
+        BLOCK=_KEY_BLOCK,
+        plain_keys_ptr=plain,
+        PLAIN=plain_bonus,
+        TEMP_GROUP=width,
+        num_warps=8,
+    )
+    tokens = torch.empty(rows, dtype=torch.int64, device=device)
+    bonus_tokens = torch.empty_like(tokens) if plain_bonus else tokens
+    accept_lens = torch.empty((bs,), dtype=torch.int32, device=device)
+    simulate = simulated_acc_len is not None
+    sim_accept_index = torch.empty_like(accept_index) if simulate else None
+    _ll_accept_kernel[(1,)](
+        keys,
+        plain,
+        splits,
+        channel.mc_addr,
+        channel.uc_addr,
+        channel.epoch,
+        tokens,
+        bonus_tokens,
+        predict,
+        accept_index,
+        num_correct_drafts,
+        accept_lens,
+        sim_accept_index if simulate else accept_index,
+        candidates,
+        retrieve_index,
+        retrieve_next_token,
+        retrieve_next_sibling,
+        simulated_acc_len if simulate else channel.epoch,
+        bs,
+        RANK=channel.rank,
+        WORLD=tp_group.world_size,
+        MAXR=2 * _TAIL_ROWS,
+        PLAIN_ROW=_TAIL_ROWS,
+        WIDTH=width,
+        BLOCK_B=max(2, triton.next_power_of_2(bs)),
+        BLOCK_W=max(2, triton.next_power_of_2(width)),
+        BLOCK_P=max(2, triton.next_power_of_2(splits)),
+        KEY_FLOOR=_KEY_FLOOR,
+        SPIN_LIMIT=_LL_SPIN_LIMIT,
+        PLAIN=plain_bonus,
+        SIMULATE=simulate,
+        REAL_DRAFT_TOKENS=real_draft_tokens,
+        MULTICAST=channel.multicast,
+        num_warps=4,
+    )
+    return accept_lens, (accept_index if sim_accept_index is None else sim_accept_index)
 
 
 def sharded_target_tokens(

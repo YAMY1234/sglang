@@ -30,6 +30,7 @@ from sglang.srt.speculative import (
     eagle_utils,
     eagle_worker_common,
     eagle_worker_v2,
+    sharded_verify,
     spec_utils,
 )
 from sglang.srt.speculative.eagle_post_verify_graphs import (
@@ -37,6 +38,7 @@ from sglang.srt.speculative.eagle_post_verify_graphs import (
     simulated_acc_len_generator,
 )
 from sglang.srt.speculative.eagle_utils import compact_verify_max_top_k, eagle_sample
+from sglang.srt.speculative.sharded_verify import TailChannel, VocabShard
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -564,7 +566,7 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
         publish(ServerArgs(model_path="dummy"), role="test")
         self.addCleanup(reset_context)
 
-    def _check(self, *, sim_acc_len, fused=False):
+    def _check(self, *, sim_acc_len, fused=False, early_load=False):
         # the worker's forced lengths, drawn by its graphs and its eager rounds alike;
         # the all-eager reference draws the same stream from its own generator
         worker_rng = simulated_acc_len_generator(0)
@@ -587,6 +589,7 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
                 "sglang.srt.distributed.parallel_state.graph_capture", _graph_capture
             ),
             patch.object(eagle_utils, "_FUSED_ACCEPT", fused),
+            patch.object(eagle_post_verify_graphs, "_EARLY_LOAD", early_load),
         ):
             for bs in BATCH_SIZES:
                 # the verify graph's logits buffer: one per batch size, refilled
@@ -599,6 +602,8 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
                     with patch.object(eagle_utils, "_FUSED_ACCEPT", False):
                         want = _eager(batch, verify_input, logits, reference_rng)
                     graphed = i % 3 != 2
+                    # the worker marks the inputs ready right before the verify forward
+                    graphs.mark_inputs_ready()
                     got = graphs.run(
                         batch=batch,
                         verify_input=verify_input,
@@ -639,6 +644,67 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
 
     def test_fused_accept_greedy(self):
         self._check(sim_acc_len=-1.0, fused=True)
+
+    def test_forced_acceptance_with_an_early_load(self):
+        # SGLANG_PERFLL_PV_EARLY_LOAD: the one-launch load, pinned forced length included,
+        # on the side stream; the pinned slot is reused only once that copy has read it
+        with patch.object(eagle_post_verify_graphs, "_ONE_LAUNCH_LOAD", True):
+            self._check(sim_acc_len=4.8, early_load=True)
+
+    def test_an_early_load_waits_for_the_inputs_and_the_slot_readers(self):
+        """SGLANG_PERFLL_PV_EARLY_LOAD: a round's staging copy runs on a side stream from the
+        mark recorded before the verify forward. It must read inputs a slow kernel wrote just
+        before the mark, and must leave a slot's staged inputs to its commit graph two rounds
+        back, which reads them after a long sleep into a per-round snapshot. Nothing syncs
+        the host until the end, so it runs rounds ahead of the device."""
+        rounds = 2 * eagle_post_verify_graphs._NUM_WARMUP + 8
+        sleep = 200_000
+        snaps = torch.zeros(rounds, 2, dtype=torch.int64, device="cuda")
+        count = torch.zeros(1, dtype=torch.int64, device="cuda")
+        pool = torch.arange(2, device="cuda")
+
+        def body(slot):
+            out = slot.staged["seq_lens"] * 2 + slot.staged["req_pool_indices"]
+            return (None, None, None, out, None, None, None)
+
+        def commit(slot, outputs):
+            torch.cuda._sleep(sleep)
+            snaps.index_copy_(0, count, slot.staged["seq_lens"].view(1, 2))
+            count.add_(1)
+
+        graphs = eagle_post_verify_graphs._PostVerifyGraphs(
+            body=body, commit=commit, sim_rng=None
+        )
+        stream = torch.cuda.Stream()
+        outs = []
+        with (
+            torch.cuda.stream(stream),
+            patch.object(eagle_post_verify_graphs, "_EARLY_LOAD", True),
+            patch.object(spec_utils, "SIMULATE_ACC_LEN", -1.0),
+            patch(
+                "sglang.srt.distributed.parallel_state.graph_capture", _graph_capture
+            ),
+        ):
+            for i in range(rounds):
+                graphs.join()
+                torch.cuda._sleep(sleep)  # the draft, then its outputs
+                seq_lens = torch.full((2,), 100 + i, dtype=torch.int64, device="cuda")
+                graphs.mark_inputs_ready()
+                torch.cuda._sleep(sleep)  # the verify forward
+                got = graphs.run(
+                    key=0,
+                    inputs={"seq_lens": seq_lens, "req_pool_indices": pool},
+                    make_slot=lambda staged: SimpleNamespace(num_requests=2),
+                    sim_max_len=7,
+                )
+                outs.append(got[3].clone())
+            graphs.join()
+        torch.cuda.synchronize()
+        self.assertEqual(int(count), rounds)
+        for i, out in enumerate(outs):
+            with self.subTest(round=i):
+                self.assertEqual(out.tolist(), [2 * (100 + i), 2 * (100 + i) + 1])
+                self.assertEqual(snaps[i].tolist(), [100 + i, 100 + i])
 
     def test_fused_accept_forced_acceptance(self):
         self._check(sim_acc_len=4.8, fused=True)
@@ -793,6 +859,145 @@ class TestFusedAcceptMatchesUnfused(CustomTestCase):
 
     def test_forced_acceptance_of_fixed_tokens(self):
         self._compare(sim_acc_len=4.8, token_mode="fixed", packed=True)
+
+
+class _OneRankGroup:
+    world_size = 1
+
+    def all_gather_into_tensor(self, output, input):
+        output.copy_(input.reshape(-1))
+
+
+def _dense(batch):
+    """The round's batch at temperature 1.0 with no top-k / top-p (the AgentX formal)."""
+    bs = len(batch.seq_lens)
+    info = SimpleNamespace(**vars(batch.sampling_info))
+    info.is_all_greedy = False
+    info.temperatures = torch.ones((bs, 1), device="cuda")
+    return SimpleNamespace(**{**vars(batch), "sampling_info": info})
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
+class TestFusedTailMatchesStockTail(CustomTestCase):
+    """SGLANG_PERFLL_VERIFY_FUSED_TAIL: eagle_sample on vocabulary shards leaves every output
+    (and the commit outputs built on it) as the stock sharded tail does, greedy and at
+    temperature 1.0 with the injected acceptance's argmax bonus, eagerly and replayed from
+    the post-verify graphs."""
+
+    def setUp(self):
+        publish(ServerArgs(model_path="dummy"), role="test")
+        self.addCleanup(reset_context)
+        maxr = 2 * sharded_verify._TAIL_ROWS
+        buffer = torch.zeros(sharded_verify._LL_SLOTS * maxr * 2, dtype=torch.int64, device="cuda")
+        channel = TailChannel(
+            buffer=buffer,
+            epoch=torch.zeros(1, dtype=torch.int32, device="cuda"),
+            mc_addr=buffer.data_ptr(),
+            uc_addr=buffer.data_ptr(),
+            rank=0,
+            multicast=False,
+        )
+        parallel = SimpleNamespace(tp_group=_OneRankGroup(), attn_tp_group=_OneRankGroup())
+        for patcher in (
+            patch.object(sharded_verify, "_tail_state", channel),
+            patch.object(sharded_verify, "_SPLIT", True),
+            patch.object(eagle_utils, "_SHARDED_VERIFY", True),
+            patch.object(eagle_post_verify_graphs, "_SHARDED_VERIFY", True),
+            patch.object(eagle_utils, "_FUSED_ACCEPT", True),
+            patch("sglang.srt.runtime_context.get_parallel", return_value=parallel),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _logits_output(logits):
+        shard = VocabShard(start=0, valid=logits.shape[1], vocab_size=logits.shape[1])
+        return SimpleNamespace(
+            next_token_logits=logits, next_token_logits_vocab_shard=shard
+        )
+
+    def _eager(self, batch, verify_input, logits, *, fused, sim_len, seed):
+        torch.cuda.manual_seed(seed)
+        with patch.object(eagle_utils, "_FUSED_TAIL", fused):
+            predict, accept_lens, accept_index = eagle_sample(
+                verify_input,
+                batch,
+                self._logits_output(logits.clone()),
+                simulated_acc_len=sim_len,
+            )
+        new_seq_lens, bonus, _, extend_inputs = prepare_verify_commit_outputs(
+            predict, accept_index, accept_lens, batch.seq_lens, num_draft_tokens=TOKENS
+        )
+        return [predict, accept_lens, accept_index, new_seq_lens, bonus, *extend_inputs]
+
+    def test_eager(self):
+        generator = torch.Generator(device="cuda").manual_seed(3)
+        for sim_acc_len, mode in ((-1.0, "fixed"), (4.8, "fixed"), (4.8, "real-draft-token")):
+            with (
+                patch.object(spec_utils, "SIMULATE_ACC_LEN", sim_acc_len),
+                patch.object(spec_utils, "SIMULATE_ACC_TOKEN_MODE", mode),
+            ):
+                for bs in (1, 4, 9):
+                    for sampling in ("greedy", "dense"):
+                        batch, verify_input, logits = _round(bs, generator, vocab=SAMPLED_VOCAB)
+                        if sampling == "dense":
+                            batch = _dense(batch)
+                        sim_len = torch.tensor([3], device="cuda") if sim_acc_len > 0 else None
+                        kw = dict(sim_len=sim_len, seed=bs)
+                        want = self._eager(batch, verify_input, logits, fused=False, **kw)
+                        got = self._eager(batch, verify_input, logits, fused=True, **kw)
+                        with self.subTest(sim=sim_acc_len, mode=mode, bs=bs, sampling=sampling):
+                            for i, (g, w) in enumerate(zip(got, want)):
+                                self.assertEqual(g.dtype, w.dtype, i)
+                                self.assertTrue(torch.equal(g, w), i)
+
+    def test_graphs(self):
+        # graph replays of the fused tail against the stock tail run eagerly, the Philox
+        # state reset before each so a temperature-1.0 round draws the same seeds
+        generator = torch.Generator(device="cuda").manual_seed(4)
+        graphs = EaglePostVerifyGraphs(
+            target_worker=SimpleNamespace(model_runner=SimpleNamespace(watermark_state=None)),
+            simulated_acc_len_rng=simulated_acc_len_generator(0),
+        )
+        reference_rng = simulated_acc_len_generator(0)
+        stream = torch.cuda.Stream()
+        with (
+            torch.cuda.stream(stream),
+            patch.object(spec_utils, "SIMULATE_ACC_LEN", 4.8),
+            patch.object(spec_utils, "SIMULATE_ACC_METHOD", "match-expected"),
+            patch.object(spec_utils, "SIMULATE_ACC_TOKEN_MODE", "real-draft-token"),
+            patch.object(spec_utils, "commit_mamba_states_after_verify"),
+            patch("sglang.srt.distributed.parallel_state.graph_capture", _graph_capture),
+            patch.object(eagle_utils, "_FUSED_TAIL", True),
+        ):
+            for bs in (1, 4):
+                for sampling in ("greedy", "dense"):
+                    logits_buf = torch.empty(bs * TOKENS, SAMPLED_VOCAB, device="cuda")
+                    for i in range(ROUNDS):
+                        batch, verify_input, logits = _round(bs, generator, vocab=SAMPLED_VOCAB)
+                        if sampling == "dense":
+                            batch = _dense(batch)
+                        logits_buf.copy_(logits)
+                        length = spec_utils.sample_simulated_acc_len(
+                            4.8, "match-expected", TOKENS, generator=reference_rng
+                        )
+                        sim_len = torch.tensor([length], device="cuda")
+                        with patch.object(eagle_utils, "_FUSED_TAIL", False):
+                            want = self._eager(
+                                batch, verify_input, logits, fused=False, sim_len=sim_len, seed=i
+                            )
+                        torch.cuda.manual_seed(i)
+                        got = graphs.run(
+                            batch=batch,
+                            verify_input=verify_input,
+                            logits_output=self._logits_output(logits_buf),
+                            can_run_cuda_graph=True,
+                        )
+                        graphs.join()
+                        with self.subTest(bs=bs, sampling=sampling, round=i):
+                            self.assertIsNotNone(got)
+                            for j, (g, w) in enumerate(zip(got[:5], want[:5])):
+                                self.assertTrue(torch.equal(g, w), j)
 
 
 if __name__ == "__main__":
