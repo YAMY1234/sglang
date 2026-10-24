@@ -336,12 +336,16 @@ def _ll_keys_kernel(
     m2 = rmask[None, :] & (s[:, None] < WORLD)
     uc = uc_addr.to(tl.pointer_type(tl.uint64))
     words = ((slot * WORLD + s[:, None]) * MAXR + r[None, :]) * 2
+    # a CTA barrier before each block-wide count of the poll: without them some warps left it
+    # on a stale count and took words a slot held from an earlier launch
+    tl.debug_barrier()
     lo = _ll_ld_b64(uc + words, m2)
     hi = _ll_ld_b64(uc + words + 1, m2)
     ok = (((lo >> 32) == tag) & ((hi >> 32) == tag)) | (~m2)
     pending = tl.sum(1 - ok.to(tl.int32))
     spins = 0
     while pending > 0:
+        tl.debug_barrier()
         lo = _ll_ld_b64(uc + words, m2)
         hi = _ll_ld_b64(uc + words + 1, m2)
         ok = (((lo >> 32) == tag) & ((hi >> 32) == tag)) | (~m2)
