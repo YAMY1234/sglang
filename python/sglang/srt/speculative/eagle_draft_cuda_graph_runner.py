@@ -89,6 +89,10 @@ class EagleDraftInputBuffers(ForwardInputBuffers):
     dsa_seed_topk: Optional[torch.Tensor] = None
 
 
+# the draft inputs a staged round takes from the previous post-verify graph (SGLANG_PERFLL_STEP2=3)
+_STAGED_INPUTS = frozenset({"seq_lens", "out_cache_loc", "positions", "mrope_positions"})
+
+
 class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     """EAGLE draft cuda-graph runner.
 
@@ -281,7 +285,12 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
             dsa_seed_topk=dsa_seed_topk,
         )
-        self.buffers.share_buffers()
+        # Inputs the previous post-verify graph writes (SGLANG_PERFLL_STEP2=3) stay private: the
+        # process-wide pool would alias them to the draft extend's same-named buffers, which its
+        # replay refills in between.
+        self.buffers.share_buffers(
+            exclude=_STAGED_INPUTS if envs.SGLANG_PERFLL_STEP2.get() >= 3 else ()
+        )
         # (raw_bs, field mask) -> (destination views, copy plan); None once refused.
         self._planned_inputs = {}
         # the batch sizes whose graphs run the draft megakernel's draft_loop, captured
