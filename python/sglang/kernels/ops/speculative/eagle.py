@@ -5,9 +5,12 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.speculative import perfll_spec_index
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_cpu, next_power_of_2, perfll_host
 
 _is_cpu = is_cpu()
+# SGLANG_PERFLL_GLUE_LINEAR_ACCEPT, read once
+_LINEAR_ACCEPT = envs.SGLANG_PERFLL_GLUE_LINEAR_ACCEPT.get()
 
 if _is_cpu:
     from sgl_kernel import fill_accept_out_cache_loc_cpu, fill_bonus_tokens_cpu
@@ -212,6 +215,87 @@ def prepare_verify_commit_outputs(
 
 
 @triton.jit
+def _chain_walk(
+    retrieve_index,
+    retrieve_next_token,
+    retrieve_next_sibling,
+    candidates,
+    target_predict,
+    base,
+    cols,
+    WIDTH: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # VerifyTreeGreedy over the request's tree, in registers
+    last = tl.load(retrieve_index + base).to(tl.int64)
+    first = last
+    acc = tl.where(cols == 0, last, -1)
+    pred = tl.zeros([BLOCK], dtype=tl.int64)
+    num = last * 0
+    cur = last * 0
+    done = last != last
+    for _ in tl.static_range(1, WIDTH):
+        active = ~done
+        cur = tl.load(retrieve_next_token + base + cur, mask=active, other=-1)
+        cur = cur.to(tl.int64)
+        target = tl.load(target_predict + last).to(tl.int64)
+        matched = last != last
+        for _ in tl.static_range(WIDTH):
+            searching = active & (cur != -1) & ~matched
+            node = tl.load(retrieve_index + base + cur, mask=searching, other=0)
+            draft = tl.load(candidates + base + cur, mask=searching, other=0)
+            hit = searching & (draft.to(tl.int64) == target)
+            pred = tl.where(hit & (cols == last - base), target, pred)
+            num = num + hit.to(tl.int64)
+            acc = tl.where(hit & (cols == num), node.to(tl.int64), acc)
+            last = tl.where(hit, node.to(tl.int64), last)
+            matched = matched | hit
+            sibling = tl.load(
+                retrieve_next_sibling + base + cur, mask=searching & ~hit, other=-1
+            )
+            cur = tl.where(searching & ~hit, sibling.to(tl.int64), cur)
+        done = done | (active & ~matched)
+    target = tl.load(target_predict + last).to(tl.int64)
+    pred = tl.where(cols == last - base, target, pred)
+    return first, acc, pred, num
+
+
+@triton.jit
+def _chain_linear(candidates, target_predict, base, cols, WIDTH: tl.constexpr):
+    # The walk's result on a canonical chain: the longest prefix of drafts that equal the
+    # previous node's target, from one vector compare.
+    in_row = cols < WIDTH
+    tgt = tl.load(target_predict + base + cols, mask=in_row, other=0).to(tl.int64)
+    drf = tl.load(candidates + base + cols + 1, mask=cols < WIDTH - 1, other=0)
+    hit = (cols < WIDTH - 1) & (drf.to(tl.int64) == tgt)
+    num = tl.min(tl.where(hit, WIDTH - 1, cols), axis=0).to(tl.int64)
+    acc = tl.where(cols <= num, base + cols, -1)
+    pred = tl.where(cols <= num, tgt, 0)
+    return base, acc, pred, num
+
+
+@triton.jit
+def _chain_is_canonical(
+    retrieve_index,
+    retrieve_next_token,
+    retrieve_next_sibling,
+    base,
+    cols,
+    WIDTH: tl.constexpr,
+):
+    # node i is row base + i, its only child node i + 1 (none for the last)
+    in_row = cols < WIDTH
+    nxt = tl.load(retrieve_next_token + base + cols, mask=in_row, other=-1).to(tl.int64)
+    sib = tl.load(retrieve_next_sibling + base + cols, mask=in_row, other=-1).to(
+        tl.int64
+    )
+    idx = tl.load(retrieve_index + base + cols, mask=in_row, other=0).to(tl.int64)
+    want = tl.where(cols < WIDTH - 1, cols + 1, -1)
+    bad = in_row & ((nxt != want) | (sib != -1) | (idx != base + cols))
+    return tl.sum(bad.to(tl.int32), axis=0) == 0
+
+
+@triton.jit
 def _chain_accept_kernel(
     predict,
     accept_index,
@@ -231,6 +315,7 @@ def _chain_accept_kernel(
     FINISH: tl.constexpr,
     SIMULATE: tl.constexpr,
     REAL_DRAFT_TOKENS: tl.constexpr,
+    LINEAR: tl.constexpr = False,
 ):
     # One program per request; its WIDTH nodes are rows [b * WIDTH, (b + 1) * WIDTH) of
     # predict / candidates / retrieve_*, and accept_index is [bs, WIDTH].
@@ -239,37 +324,42 @@ def _chain_accept_kernel(
     cols = tl.arange(0, BLOCK)
     in_row = cols < WIDTH
     if VERIFY:
-        # VerifyTreeGreedy over the request's tree, in registers
-        last = tl.load(retrieve_index + base).to(tl.int64)
-        first = last
-        acc = tl.where(cols == 0, last, -1)
-        pred = tl.zeros([BLOCK], dtype=tl.int64)
-        num = last * 0
-        cur = last * 0
-        done = last != last
-        for _ in tl.static_range(1, WIDTH):
-            active = ~done
-            cur = tl.load(retrieve_next_token + base + cur, mask=active, other=-1)
-            cur = cur.to(tl.int64)
-            target = tl.load(target_predict + last).to(tl.int64)
-            matched = last != last
-            for _ in tl.static_range(WIDTH):
-                searching = active & (cur != -1) & ~matched
-                node = tl.load(retrieve_index + base + cur, mask=searching, other=0)
-                draft = tl.load(candidates + base + cur, mask=searching, other=0)
-                hit = searching & (draft.to(tl.int64) == target)
-                pred = tl.where(hit & (cols == last - base), target, pred)
-                num = num + hit.to(tl.int64)
-                acc = tl.where(hit & (cols == num), node.to(tl.int64), acc)
-                last = tl.where(hit, node.to(tl.int64), last)
-                matched = matched | hit
-                sibling = tl.load(
-                    retrieve_next_sibling + base + cur, mask=searching & ~hit, other=-1
+        if LINEAR:
+            if _chain_is_canonical(
+                retrieve_index,
+                retrieve_next_token,
+                retrieve_next_sibling,
+                base,
+                cols,
+                WIDTH,
+            ):
+                first, acc, pred, num = _chain_linear(
+                    candidates, target_predict, base, cols, WIDTH
                 )
-                cur = tl.where(searching & ~hit, sibling.to(tl.int64), cur)
-            done = done | (active & ~matched)
-        target = tl.load(target_predict + last).to(tl.int64)
-        pred = tl.where(cols == last - base, target, pred)
+            else:
+                first, acc, pred, num = _chain_walk(
+                    retrieve_index,
+                    retrieve_next_token,
+                    retrieve_next_sibling,
+                    candidates,
+                    target_predict,
+                    base,
+                    cols,
+                    WIDTH,
+                    BLOCK,
+                )
+        else:
+            first, acc, pred, num = _chain_walk(
+                retrieve_index,
+                retrieve_next_token,
+                retrieve_next_sibling,
+                candidates,
+                target_predict,
+                base,
+                cols,
+                WIDTH,
+                BLOCK,
+            )
         tl.store(accept_index + base + cols, acc.to(tl.int32), mask=in_row)
         if not (FINISH and SIMULATE):
             tl.store(predict + base + cols, pred.to(tl.int32), mask=in_row)
@@ -348,6 +438,7 @@ def chain_accept(
             FINISH=finish,
             SIMULATE=simulated_acc_len is not None,
             REAL_DRAFT_TOKENS=real_draft_tokens,
+            LINEAR=_LINEAR_ACCEPT,
             num_warps=1,
         )
     if not finish:
