@@ -239,7 +239,7 @@ def _maybe_enable_silu_fp4_quant_fusion(mlp: nn.Module) -> None:
 
 def _use_mnnvl_cutedsl_fusion(config: Qwen3_5TextConfig, is_nextn: bool) -> bool:
     return bool(
-        not is_nextn
+        (not is_nextn or envs.SGLANG_PST_DRAFT_CUTEDSL_FUSION.get())
         and config.model_type == "qwen3_5_moe_text"
         and uses_cutedsl_ar_fusion()
     )
@@ -1811,7 +1811,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 if not isinstance(layer.mlp, Qwen2MoeSparseMoeBlock)
                 or not layer.mlp.supports_deferred_finalize
             ]
-            if unsupported_layers:
+            if unsupported_layers and not is_nextn:
                 raise RuntimeError(
                     "Qwen3.5 FlashInfer MNNVL CuTe DSL fusion currently "
                     "requires block-FP8 MoE weights with FlashInfer TRTLLM "
@@ -1828,11 +1828,12 @@ class Qwen3_5ForCausalLM(nn.Module):
                 hidden_size=config.hidden_size,
                 top_k=config.num_experts_per_tok,
                 rms_epsilon=config.rms_norm_eps,
-                # Every layer was checked above.
-                can_defer_finalize=lambda layer: True,
-                label="Qwen3.5",
+                # Every target layer was checked above; a draft's (SGLANG_PST_DRAFT_CUTEDSL_FUSION)
+                # defers only where its MoE can.
+                can_defer_finalize=lambda layer: layer.layer_id not in unsupported_layers,
+                label="Qwen3.5 MTP" if is_nextn else "Qwen3.5",
                 # The final GemmaRMSNorm consumes a finalize handoff.
-                terminal_finalize=True,
+                terminal_finalize=not unsupported_layers,
                 fp8_input_linear=_layer_input_projection,
             )
 

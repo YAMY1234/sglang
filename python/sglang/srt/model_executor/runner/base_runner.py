@@ -304,8 +304,8 @@ class BaseRunner(ABC):
         if uses_cutedsl_ar_fusion():
             # Nothing else resolves the configured backend, so check the platform.
             resolve_flashinfer_allreduce_fusion_backend()
-            if not mr.is_draft_worker:
-                # A draft installs no CuTe DSL fusion.
+            if not mr.is_draft_worker or envs.SGLANG_PST_DRAFT_CUTEDSL_FUSION.get():
+                # A draft installs no CuTe DSL fusion unless it shares the target's workspace.
                 from sglang.srt.layers.layer_boundary.fusions.cutedsl import (
                     prepare_cutedsl_fusion,
                 )

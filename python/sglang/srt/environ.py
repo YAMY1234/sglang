@@ -1629,6 +1629,9 @@ class Envs:
     # A shared expert whose down_proj takes a static per-tensor FP8 input runs its
     # SiLU-and-mul and that input's quantization in one launch (bit-identical to the two).
     SGLANG_PST_SE_SILU_FP8 = EnvBool(False)
+    # The Qwen3.5 MTP draft's layer boundaries also take the FlashInfer MNNVL CuTe DSL fusion
+    # (all-reduce + residual + RMSNorm in one launch), on the target's workspace (one a process).
+    SGLANG_PST_DRAFT_CUTEDSL_FUSION = EnvBool(False)
     # TP > 1 EAGLE topk-1 verify keeps the target logits vocabulary-sharded: greedy rows
     # take a sharded argmax (bit-identical), temperature-only rows a sharded Gumbel-max
     # (same distribution); any other batch all-gathers them first, as before.

@@ -152,7 +152,10 @@ class CuteDSLWorkspace:
         rms_epsilon: float,
         include_shared_expert: bool = True,
         fp8_inputs: Sequence[tuple[torch.nn.Module, torch.nn.Module]] = (),
+        shared: bool = False,
     ) -> None:
+        # shared: a draft's handle on the target's workspace (one a process), built by the target's prepare()
+        self.shared = shared
         self.include_shared_expert = include_shared_expert
         self.hidden_size = int(hidden_size)
         self.top_k = int(top_k)
@@ -172,6 +175,18 @@ class CuteDSLWorkspace:
                     f"fusion workspace is already prepared for M_max={self.max_m}; "
                     f"refusing M_max={max_m}"
                 )
+            return
+        if self.shared:
+            from sglang.srt.layers import flashinfer_mnnvl_cutedsl
+
+            workspace = flashinfer_mnnvl_cutedsl._WORKSPACE
+            if workspace is None:
+                raise RuntimeError(
+                    "SGLANG_PST_DRAFT_CUTEDSL_FUSION: the draft shares the target's MNNVL CuTe DSL "
+                    "workspace, which the target has not built"
+                )
+            self._workspace = workspace
+            self.max_m = workspace.max_m
             return
         from sglang.srt.layers.flashinfer_mnnvl_cutedsl import (
             get_flashinfer_mnnvl_cutedsl_ar_fusion,
@@ -440,7 +455,8 @@ def install_cutedsl_fusion(
     residual_batch.final_norm(finalize_norm=...). fp8_input_linear(layer) is the
     projection reading the layer's input norm (SGLANG_PLB_AR_FP8_OUT).
     """
-    if get_flags().moe.in_speculative_scope:
+    draft = get_flags().moe.in_speculative_scope
+    if draft and not envs.SGLANG_PST_DRAFT_CUTEDSL_FUSION.get():
         # A draft shares the target's process, which holds one workspace.
         return None
 
@@ -473,9 +489,10 @@ def install_cutedsl_fusion(
                 (layer.attn_boundary.norm, fp8_input_linear(layer))
                 for layer in fusion_layers
             ]
-            if fp8_input_linear is not None and envs.SGLANG_PLB_AR_FP8_OUT.get()
+            if fp8_input_linear is not None and envs.SGLANG_PLB_AR_FP8_OUT.get() and not draft
             else ()
         ),
+        shared=draft,
     )
     hands_off = 0
     for layer in layers:
