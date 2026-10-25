@@ -21,6 +21,7 @@ from sglang.srt.disaggregation.common.staging_handler import (
     handle_staging_req,
     handle_staging_rsp,
 )
+from sglang.srt.disaggregation.common.utils import pack_int_lists
 from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVManager,
     MooncakeKVSender,
@@ -158,8 +159,9 @@ class TestMooncakeOptimisticStaging(CustomTestCase):
         )
         allocator = Mock()
         allocator.assign.return_value = (0, 0, 0)
+        page_size = self.manager.kv_args.page_size
         decode_args = SimpleNamespace(
-            page_size=256, kv_item_lens=[256 * 16, 256 * 16],
+            page_size=page_size, kv_item_lens=[page_size * 16, page_size * 16],
             total_kv_head_num=8, engine_rank=0,
         )
         for msg in self.messages:
@@ -272,6 +274,125 @@ class TestMooncakeOptimisticStaging(CustomTestCase):
         self.manager.add_transfer_request(self.room, [0], slice(0, 1), False)
         self.assertEqual(self.messages, [])
         self.assertTrue(self.manager.transfer_queues[0].empty())
+
+    def exercise_bootstrap_session_race(self, input_ids, during_check=False):
+        """Replay the c1 failure's room/shape with a real bootstrap writer.
+
+        The socket boundary deterministically lets the production bootstrap
+        thread publish the second session while the scheduler is prefetching.
+        """
+        self.room = 4277104121686068312
+        manager = self.manager
+        # Actual failed B uses page size 64 and a 16384-token prefill grid.
+        page_size, chunk_tokens = 64, 16384
+        enter_scope(self, get_context().override_server_args(chunked_prefill_size=chunk_tokens))
+        manager.kv_args.page_size = page_size
+        manager.kv_buffer_tensors["page_size"] = page_size
+        self.scheduler.token_to_kv_pool_allocator.page_size = page_size
+        manager.request_status = {self.room: KVPoll.Bootstrapping}
+        self.sender = MooncakeKVSender(manager, "127.0.0.1:8998", self.room)
+        req = self.request(input_ids)
+        second = "127.0.0.1:10001"
+        manager.decode_kv_args_table[second] = SimpleNamespace(dst_attn_tp_size=8)
+        inbox = SimpleQueue()
+        ready = threading.Event()
+        first_received = threading.Event()
+        previous_ack = None
+
+        def receive():
+            nonlocal previous_ack
+            if previous_ack is not None:
+                previous_ack.set()
+            message, previous_ack = inbox.get()
+            return message
+
+        manager._make_worker_recv = lambda socket: receive
+        manager.server_socket = object()
+        manager._stopped = False
+        manager._worker_threads = []
+        manager._handle_abort_notification = lambda message: False
+        manager.resolve_kv_replica_factor = Mock()
+        update_status = manager.update_status
+
+        def publish_status(room, status):
+            update_status(room, status)
+            if status == KVPoll.WaitingForInput:
+                ready.set()
+
+        manager.update_status = publish_status
+        manager.start_prefill_thread()
+
+        def stop_writer():
+            manager._stopped = True
+            inbox.put((None, None))
+            for thread in manager._worker_threads:
+                thread.join(5)
+                self.assertFalse(thread.is_alive(), "bootstrap test writer leaked")
+
+        self.addCleanup(stop_writer)
+
+        def wire(session):
+            pages = (len(input_ids) + page_size - 1) // page_size
+            return [str(self.room).encode(), b"127.0.0.1", session.rsplit(":", 1)[1].encode(),
+                    session.encode(), np.arange(pages, dtype=np.int32).tobytes(),
+                    b"3", pack_int_lists([], "i"), b"2", b"0"]
+
+        inbox.put((wire(self.session), first_received))
+        self.assertTrue(first_received.wait(5), "first bootstrap session absent")
+        self.assertEqual(manager.check_status(self.room), KVPoll.Bootstrapping)
+        published_second = False
+
+        def late_session():
+            nonlocal published_second
+            if not published_second:
+                published_second = True
+                inbox.put((wire(second), None))
+                self.assertTrue(ready.wait(5), "late bootstrap session absent")
+
+        def send(message):
+            self.messages.append(message)
+            if not during_check:
+                late_session()
+
+        for port in (10000, 10001):
+            manager._staging_ctx.prefetch_sockets[f"tcp://127.0.0.1:{port}"] = SimpleNamespace(send_multipart=send)
+        if during_check:
+            class RegistrationTable(dict):
+                def get(table, key, default=None):
+                    if not published_second:
+                        late_session()
+                        return None  # No usable peer in the first snapshot.
+                    return super().get(key, default)
+            manager.decode_kv_args_table = RegistrationTable(manager.decode_kv_args_table)
+
+        self.scheduler.maybe_prefetch_staging_for_batch(SimpleNamespace(reqs=[req]))
+        expected_chunks = (len(input_ids) + chunk_tokens - 1) // chunk_tokens
+        self.assertTrue(published_second)
+        self.assertEqual(len(self.messages), 0 if during_check else expected_chunks)
+        self.assertEqual(len(manager.transfer_infos[self.room]), 2)
+        self.assertTrue(self.scheduler.handle_pending_bootstrap(req, KVPoll.WaitingForInput))
+        self.scheduler.send_kv_chunk(req, last_chunk=True)
+        chunk = manager.transfer_queues[0].get_nowait()
+        keys = [(int(message[2]), message[4].decode()) for message in self.messages]
+        self.assertEqual(len(keys), len(set(keys)))
+        self.assertEqual(set(keys), {(i, session) for i in range(expected_chunks)
+                                     for session in (self.session, second)})
+        before = list(self.messages)
+        manager._prefetch_staging_reqs(self.room, upto_tokens=len(input_ids))
+        self.assertEqual(self.messages, before)
+        self.assertEqual(chunk.num_kv_tokens, len(input_ids))
+        first_info = manager.transfer_infos[self.room][self.session]
+        self.complete_staging(first_info, chunk)
+        strategy = PrefillStagingStrategy(manager, object())
+        self.assertTrue(strategy.check_ready(manager.transfer_infos[self.room][second],
+                                             chunk.index_slice.start, len(chunk.prefill_kv_indices))[0])
+        return req, chunk
+
+    def test_session_arrives_during_prefetch_send(self):
+        self.exercise_bootstrap_session_race(list(range(980)))
+
+    def test_session_arrives_during_staging_check(self):
+        self.exercise_bootstrap_session_race(list(range(980)), during_check=True)
 
 
 if __name__ == "__main__":

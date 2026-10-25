@@ -635,7 +635,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if not self.enable_staging or self.kv_buffer_tensors is None:
             return
 
-        room_infos = self.transfer_infos.get(room, {})
+        # Bootstrap can add sessions while optimistic prefill requests slots.
+        # Use one snapshot for the check and sends; send-time prefetch covers
+        # sessions that arrive after this snapshot.
+        room_infos = self.transfer_infos.get(room, {}).copy()
         needs_staging = any(
             not tinfo.is_dummy
             and self.decode_kv_args_table.get(tinfo.mooncake_session_id) is not None
@@ -652,7 +655,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         prefetch_staging_reqs(
             room,
-            self.transfer_infos,
+            {room: room_infos},
             self.kv_buffer_tensors,
             get_schedule().chunked_prefill_size,
             self._staging_ctx.prefetch_requested,
