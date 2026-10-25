@@ -3065,6 +3065,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             # add further chunks into the transfer queue.
             return
 
+        # Optimistic prefill can finish before bootstrap, so the pre-forward
+        # staging prefetch may have had no destination metadata. Request the
+        # slots before enqueueing; the prefetch helper deduplicates requests.
+        if self.enable_staging:
+            upto_tokens = (
+                index_slice.stop * self.kv_args.page_size
+                if envs.SGLANG_PERFPF_STAGING_LAZY.get()
+                else None
+            )
+            self._prefetch_staging_reqs(bootstrap_room, upto_tokens=upto_tokens)
+
         # NOTE(shangming): sharding according to the dst_infos to make sure
         # requests with the same dst_sessions will be added into the same
         # queue, which enables early abort with failed sessions.

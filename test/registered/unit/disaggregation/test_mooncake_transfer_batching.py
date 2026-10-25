@@ -446,6 +446,7 @@ class TestMooncakeEarlySend(unittest.TestCase):
         ready = MagicMock()
         manager = SimpleNamespace(
             disaggregation_mode=DisaggregationMode.PREFILL,
+            enable_staging=False,
             request_status={1: KVPoll.WaitingForInput},
             check_status=lambda room: KVPoll.WaitingForInput,
             transfer_infos={1: {"127.0.0.1:80": object()}},
