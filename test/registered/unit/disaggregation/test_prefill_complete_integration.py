@@ -1,5 +1,7 @@
 """Exercise the allocation policy through production transport and queue methods."""
 
+import inspect
+import textwrap
 import threading
 import time
 import unittest
@@ -7,6 +9,8 @@ from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
+
+import numpy as np
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
@@ -21,7 +25,10 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVReceiver,
     MooncakeKVSender,
 )
-from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from sglang.srt.disaggregation.prefill import (
+    PrefillBootstrapQueue,
+    SchedulerDisaggregationPrefillMixin,
+)
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import get_context, publish, reset_context
@@ -616,26 +623,72 @@ class TestAllocationIntegration(CustomTestCase):
             pending_bootstrap=True,
             prefill_attempt_count=1,
             skip_radix_cache_insert=False,
+            metadata_buffer_index=3,
+            origin_input_ids=list(range(19)),
+            time_stats=Mock(),
         )
         scheduler = self.inflight_scheduler([req])
         scheduler.req_to_token_pool = SimpleNamespace(available_size=lambda: 0)
+        scheduler.token_to_kv_pool_allocator = SimpleNamespace(page_size=4)
         scheduler.waiting_queue = [Mock()]
+        bootstrap_queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
+        bootstrap_queue.scheduler = scheduler
+        scheduler.disagg_prefill_bootstrap_queue = bootstrap_queue
+        self.prefill.enable_all_cp_ranks_for_transfer = False
+        self.prefill.add_transfer_request = Mock()
+        pages = np.array([20, 21, 22], dtype=np.int32)
+        state_indices = [np.array([7], dtype=np.int32)]
 
-        def finalize(r):
-            r.pending_bootstrap = False
-            return True
+        def send_kv_chunk(r, last_chunk):
+            self.assertIs(r, req)
+            self.assertTrue(last_chunk)
+            self.assertFalse(r.pending_bootstrap)
+            self.assertEqual(r.start_send_idx, 8)
+            self.assertEqual(r.disagg_decode_prefix_len, 8)
+            sender.send(pages, state_indices, num_kv_tokens=11)
 
-        scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
-            finalize_bootstrap=Mock(side_effect=finalize)
-        )
+        scheduler.send_kv_chunk.side_effect = send_kv_chunk
         self.assertEqual(scheduler.process_disagg_prefill_inflight_queue(), [])
         self.assertEqual(scheduler.disagg_prefill_inflight_queue, [req])
         scheduler.send_kv_chunk.assert_not_called()
+        self.assertFalse(hasattr(sender, "num_kv_indices"))
         # This is the existing metadata-received transition, not readiness.
+        self.prefill.req_to_decode_prefix_len[1] = 8
         self.prefill.update_status(1, KVPoll.WaitingForInput)
         self.assertEqual(scheduler.process_disagg_prefill_inflight_queue(), [])
         scheduler.send_kv_chunk.assert_called_once_with(req, last_chunk=True)
         self.assertFalse(req.pending_bootstrap)
+        self.assertEqual(sender.num_kv_indices, 3)
+        self.assertEqual(sender.curr_idx, 3)
+        self.assertEqual(sender.aux_index, 3)
+        self.prefill.add_transfer_request.assert_called_once()
+        transfer = self.prefill.add_transfer_request.call_args
+        self.assertEqual(transfer.args[0], 1)
+        np.testing.assert_array_equal(transfer.args[1], pages)
+        self.assertEqual(transfer.args[2:], (slice(0, 3), True))
+        self.assertEqual(transfer.kwargs["aux_index"], 3)
+        self.assertIs(transfer.kwargs["state_indices"], state_indices)
+        self.assertEqual(transfer.kwargs["num_kv_tokens"], 11)
+
+    def test_optimized_python_initializes_parked_sender(self):
+        # Compile the production method as -O would, even when the test
+        # runner itself has assertions enabled. Sender initialization must not
+        # be lost with assert statements.
+        method = SchedulerDisaggregationPrefillMixin.handle_pending_bootstrap
+        source = "from __future__ import annotations\n" + textwrap.dedent(
+            inspect.getsource(method)
+        )
+        namespace = dict(method.__globals__)
+        exec(
+            compile(source, method.__code__.co_filename, "exec", optimize=1),
+            namespace,
+        )
+        with patch.object(
+            SchedulerDisaggregationPrefillMixin,
+            "handle_pending_bootstrap",
+            namespace[method.__name__],
+        ):
+            self.test_completed_prefill_parks_until_normal_pointer_handshake()
 
     def test_parked_prefill_reclaims_only_one_slot(self):
         reqs = [Req(str(i), "", [1], SamplingParams()) for i in range(2)]
