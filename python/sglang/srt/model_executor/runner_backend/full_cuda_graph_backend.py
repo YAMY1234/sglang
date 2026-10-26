@@ -163,8 +163,9 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
                     self._graphs[(name, shape_key)] = self._graphs[source_key]
                     self._outputs[(name, shape_key)] = self._outputs[source_key]
                 logger.info(
-                    "Q35MF bench-only graph aliases: source=%s labels=%s shape=%s",
-                    alias_source, ab_variants.names(), shape_key,
+                    "Q35MF bench-only graph aliases: source=%s labels=%s runner=%s shape=%s",
+                    alias_source, ab_variants.names(),
+                    type(self._cuda_graph_runner).__name__, shape_key,
                 )
                 return
             for name in ab_variants.names():

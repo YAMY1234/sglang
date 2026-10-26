@@ -58,6 +58,7 @@ class Graph:
 class Recorder:
     def __init__(self):
         self._graphs, self._outputs = {}, {}
+        self._cuda_graph_runner = object()
         self._output_buffer, self._pool = object(), object()
         self.calls = []
 
