@@ -3225,6 +3225,7 @@ class SchedulerDisaggregationDecodeMixin:
                 batch, chunked_req=self.chunked_req
             )
             self.cur_batch_for_debug = batch
+            self._flush_staging_scatters()
 
             # Launch the current batch
             if batch:
@@ -3279,6 +3280,7 @@ class SchedulerDisaggregationDecodeMixin:
 
             if disable_overlap_for_batch and self.last_batch:
                 pop_and_process()
+            self._flush_staging_scatters()
 
             # Launch the current batch
             if batch:
@@ -3302,6 +3304,11 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Update last_batch
             self.last_batch = batch
+
+    def _flush_staging_scatters(self: Scheduler) -> None:
+        handler = self.disagg_decode_transfer_queue.staging_handler
+        if handler is not None:
+            handler.flush_pending_scatters(self.forward_stream)
 
     def _run_batch_prebuilt(
         self: Scheduler, batch: ScheduleBatch
