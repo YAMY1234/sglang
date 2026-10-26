@@ -567,14 +567,14 @@ _fused_all_reduce_comm = None
 
 def register_fused_all_reduce_comm(
     *, max_push_size: Optional[int] = None, max_push_blocks: Optional[int] = None
-) -> None:
+) -> Optional[object]:
     """Hand a push plane to the fusion kernels, once per process: the TP group's
     own, or with ``max_push_size`` a dedicated push-only plane of that slot size
     and ``max_push_blocks`` row counters. Must run before graph capture;
     unregistered means everything runs unfused."""
     global _fused_all_reduce_comm
     if _fused_all_reduce_comm is not None:
-        return
+        return _fused_all_reduce_comm
     from sglang.kernels.ops.communication import all_reduce_fusion
     from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
         CustomAllReduceV2,
@@ -606,6 +606,7 @@ def register_fused_all_reduce_comm(
             "Fused MoE finalize: TP group has no "
             "CustomAllReduceV2 push plane; keeping the unfused finalize path",
         )
+    return _fused_all_reduce_comm
 
 
 def can_fuse_all_reduce(num_tokens: int, hidden_dim: int) -> bool:

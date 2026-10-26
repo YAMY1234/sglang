@@ -29,6 +29,7 @@ from sglang.srt.layers.layer_boundary.fusions.allreduce import (
     fused_ffn_input,
 )
 from sglang.srt.layers.layer_boundary.fusions.cutedsl import (
+    CuteDSLWorkspace,
     CuteDSLFusion,
     install_cutedsl_fusion,
     prepare_cutedsl_fusion,
@@ -330,6 +331,70 @@ def test_wrapper_passes_no_routed_scaling_factor_to_the_kernel():
 
     assert [call["pattern"] for call in calls] == [7, 1]
     assert all("routed_scaling_factor" not in call for call in calls)
+
+
+def test_r13_wide_rows_use_one_custom_two_shot_kernel_and_small_rows_do_not():
+    """The R13 experiment is shape-isolated from the established small routes."""
+    hidden, top_k, wide = 8, 2, 448
+    service = CuteDSLWorkspace(
+        hidden_size=hidden,
+        top_k=top_k,
+        rms_epsilon=1e-6,
+    )
+    baseline = MagicMock()
+    baseline.moe_finalize_all_reduce_rms_norm.return_value = ("base", "base-res")
+    service._workspace = baseline
+    service.max_m = 1024
+    service._r13_custom_comm = SimpleNamespace(
+        config=SimpleNamespace(num_push_blocks=1024),
+        max_push_size=1024 * hidden * 2,
+    )
+    handoff = MoeDeferredFinalize(
+        routed_output=torch.zeros(wide * top_k, hidden, dtype=torch.bfloat16),
+        expert_weights=torch.zeros(wide, top_k, dtype=torch.bfloat16),
+        permuted_indices=torch.zeros(wide, top_k, dtype=torch.int32),
+        gated_shared_output=torch.zeros(wide, hidden, dtype=torch.bfloat16),
+        m=wide,
+        finish=MagicMock(),
+    )
+    residual = torch.zeros(wide, hidden, dtype=torch.bfloat16)
+    gamma = torch.ones(hidden, dtype=torch.bfloat16)
+    custom_result = (torch.ones_like(residual), torch.full_like(residual, 2))
+
+    with (
+        patch(
+            "sglang.kernels.ops.communication.all_reduce_fusion."
+            "moe_finalize_all_reduce_residual_norm",
+            return_value=custom_result,
+        ) as custom,
+        patch(f"{_MODULE}.get_parallel", return_value=SimpleNamespace(tp_size=8)),
+    ):
+        assert service.finalize(handoff, residual, gamma) == custom_result
+
+    custom.assert_called_once()
+    kwargs = dict(custom.call_args.kwargs)
+    residual_out = kwargs.pop("residual_out")
+    assert tuple(residual_out.shape) == tuple(residual.shape)
+    assert residual_out.data_ptr() != residual.data_ptr()
+    assert kwargs == {
+        "world_size": 8,
+        "hidden_dim": hidden,
+        "two_shot": True,
+        "cluster_size": 1,
+        "vecs_per_thread": 2,
+    }
+    baseline.moe_finalize_all_reduce_rms_norm.assert_not_called()
+
+    small = handoff.__class__(
+        routed_output=handoff.routed_output[: 384 * top_k],
+        expert_weights=handoff.expert_weights[:384],
+        permuted_indices=handoff.permuted_indices[:384],
+        gated_shared_output=handoff.gated_shared_output[:384],
+        m=384,
+        finish=handoff.finish,
+    )
+    assert service.finalize(small, residual[:384], gamma) == ("base", "base-res")
+    baseline.moe_finalize_all_reduce_rms_norm.assert_called_once()
 
 
 def test_the_handoff_views_the_producer_storage():

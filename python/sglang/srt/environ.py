@@ -1313,6 +1313,16 @@ class Envs:
     # deliberately corrupts model semantics and must never be used for accuracy
     # or serving.
     SGLANG_R13_T4COMM_SKIP_VERIFY_AR_TIMING_ONLY = EnvBool(False)
+    # R13-T4COMM: replace wide target-verify FlashInfer BT's publish + owner
+    # reduce + materialize sequence with one BF16 CustomAllReduceV2 two-shot
+    # kernel. Unlike SGLANG_PERFLP_AR_FP8_PAYLOAD this does not lower payload
+    # precision. The row gate keeps the existing small/decode routes unchanged.
+    SGLANG_R13_T4COMM_CUSTOM_AR = EnvBool(False)
+    SGLANG_R13_T4COMM_CUSTOM_AR_MIN_TOKENS = EnvInt(385)
+    SGLANG_R13_T4COMM_CUSTOM_AR_MAX_TOKENS = EnvInt(1024)
+    SGLANG_R13_T4COMM_CUSTOM_AR_CLUSTER_SIZE = EnvInt(1)
+    SGLANG_R13_T4COMM_CUSTOM_AR_VECS_PER_THREAD = EnvInt(2)
+    SGLANG_R13_T4COMM_CUSTOM_AR_TWO_SHOT = EnvBool(True)
     # Timing only: decode graph padding per block of Q35MF_AB_BLOCK target-verify rounds, the labels in turn
     # ("pow2": the smallest captured power of two); model_executor/runner_backend/ab_variants.py. Empty: off.
     SGLANG_TRTL17_PAD_AB = EnvTuple(())

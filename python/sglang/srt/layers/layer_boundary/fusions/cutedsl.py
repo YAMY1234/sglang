@@ -116,6 +116,7 @@ class CuteDSLWorkspace:
         self.rms_epsilon = float(rms_epsilon)
         self.max_m: int | None = None
         self._workspace = None
+        self._r13_custom_comm = None
         # (input norm, the projection reading it) a layer, for SGLANG_PLB_AR_FP8_OUT;
         # keyed by the norm's fused gamma at first use, once weights are loaded.
         self._fp8_inputs = tuple(fp8_inputs)
@@ -145,10 +146,62 @@ class CuteDSLWorkspace:
         )
         self._workspace = workspace
         self.max_m = workspace.max_m
+        if envs.SGLANG_R13_T4COMM_CUSTOM_AR.get():
+            from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
+                register_fused_all_reduce_comm,
+            )
+
+            max_tokens = min(
+                int(self.max_m),
+                envs.SGLANG_R13_T4COMM_CUSTOM_AR_MAX_TOKENS.get(),
+            )
+            if max_tokens < envs.SGLANG_R13_T4COMM_CUSTOM_AR_MIN_TOKENS.get():
+                raise RuntimeError(
+                    "R13-T4COMM custom AR has no eligible rows: "
+                    f"workspace M_max={self.max_m}, configured max={max_tokens}"
+                )
+            self._r13_custom_comm = register_fused_all_reduce_comm(
+                max_push_size=max_tokens * self.hidden_size * 2,
+                max_push_blocks=max_tokens,
+            )
+            if self._r13_custom_comm is None:
+                raise RuntimeError(
+                    "R13-T4COMM custom AR requested but the TP group has no "
+                    "usable CustomAllReduceV2 push plane"
+                )
+            logger.info(
+                "R13-T4COMM custom BF16 AR active for M=%d..%d: two_shot=%d, "
+                "cluster=%d, vecs/thread=%d (wide target-verify only)",
+                envs.SGLANG_R13_T4COMM_CUSTOM_AR_MIN_TOKENS.get(),
+                max_tokens,
+                envs.SGLANG_R13_T4COMM_CUSTOM_AR_TWO_SHOT.get(),
+                envs.SGLANG_R13_T4COMM_CUSTOM_AR_CLUSTER_SIZE.get(),
+                envs.SGLANG_R13_T4COMM_CUSTOM_AR_VECS_PER_THREAD.get(),
+            )
 
     def supports(self, m: int) -> bool:
         """False before prepare(), so it doubles as the readiness check."""
         return self._workspace is not None and self._workspace.supports(m)
+
+    def _r13_custom_takes(self, m: int) -> bool:
+        if self._r13_custom_comm is None:
+            return False
+        min_tokens = envs.SGLANG_R13_T4COMM_CUSTOM_AR_MIN_TOKENS.get()
+        max_tokens = envs.SGLANG_R13_T4COMM_CUSTOM_AR_MAX_TOKENS.get()
+        return bool(
+            min_tokens <= int(m) <= max_tokens
+            and int(m) <= self._r13_custom_comm.config.num_push_blocks
+            and int(m) * self.hidden_size * 2
+            <= self._r13_custom_comm.max_push_size
+        )
+
+    @staticmethod
+    def _r13_custom_launch() -> dict[str, int | bool]:
+        return {
+            "two_shot": envs.SGLANG_R13_T4COMM_CUSTOM_AR_TWO_SHOT.get(),
+            "cluster_size": envs.SGLANG_R13_T4COMM_CUSTOM_AR_CLUSTER_SIZE.get(),
+            "vecs_per_thread": envs.SGLANG_R13_T4COMM_CUSTOM_AR_VECS_PER_THREAD.get(),
+        }
 
     def _fp8_input_scale(self, gamma: torch.Tensor) -> Optional[torch.Tensor]:
         """The static input scale of the FP8 projection reading the norm with ``gamma``."""
@@ -156,9 +209,9 @@ class CuteDSLWorkspace:
             return None
         if self._fp8_input_by_gamma is None:
             self._fp8_input_by_gamma = {
-                _fused_norm_gamma(norm).data_ptr(): linear
+                fused_norm_gamma(norm).data_ptr(): linear
                 for norm, linear in self._fp8_inputs
-                if _fused_norm_gamma(norm) is not None
+                if fused_norm_gamma(norm) is not None
             }
         linear = self._fp8_input_by_gamma.get(gamma.data_ptr())
         return None if linear is None else _static_fp8_bmm_input_scale(linear)
@@ -170,6 +223,25 @@ class CuteDSLWorkspace:
         gamma: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert self._workspace is not None
+        if self._r13_custom_takes(handoff.m):
+            from sglang.kernels.ops.communication.all_reduce_fusion import (
+                moe_finalize_all_reduce_residual_norm,
+            )
+
+            return moe_finalize_all_reduce_residual_norm(
+                handoff.routed_output,
+                handoff.permuted_indices.reshape(-1),
+                handoff.expert_weights,
+                self.top_k,
+                handoff.gated_shared_output,
+                residual,
+                gamma,
+                self.rms_epsilon,
+                world_size=get_parallel().tp_size,
+                hidden_dim=self.hidden_size,
+                residual_out=torch.empty_like(residual),
+                **self._r13_custom_launch(),
+            )
         input_scale = self._fp8_input_scale(gamma)
         if input_scale is not None:
             from sglang.kernels.ops.quantization.fp8_kernel import (
@@ -206,6 +278,22 @@ class CuteDSLWorkspace:
         gamma: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert self._workspace is not None
+        if self._r13_custom_takes(int(local_contribution.shape[0])):
+            from sglang.kernels.ops.communication.all_reduce_fusion import (
+                all_reduce_residual_norm,
+            )
+
+            normed, residual_out = all_reduce_residual_norm(
+                local_contribution,
+                residual,
+                gamma,
+                self.rms_epsilon,
+                world_size=get_parallel().tp_size,
+                residual_out=torch.empty_like(residual),
+                **self._r13_custom_launch(),
+            )
+            assert residual_out is not None
+            return normed, residual_out
         return self._workspace.all_reduce_residual_rms_norm(
             local_contribution=local_contribution,
             residual=residual,
