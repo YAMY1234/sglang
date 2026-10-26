@@ -28,7 +28,8 @@ import weakref
 import torch
 import triton
 import triton.language as tl
-from sglang.srt.environ import envs
+
+from sglang.srt.kernel_plugins.nvidia.policy import megakernel_slot_requested
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +44,7 @@ _CP_LITE_SLOTS = frozenset({"skv2_cp", "draft_q1_cp", "draft_skv2_cp"})
 
 
 def cp_lite_requested() -> bool:
-    return bool(_CP_LITE_SLOTS.intersection(envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.get()))
+    return any(megakernel_slot_requested(slot) for slot in _CP_LITE_SLOTS)
 
 
 @triton.jit

@@ -9,7 +9,11 @@ from typing import TYPE_CHECKING
 import torch
 import torch.distributed as dist
 
-from sglang.srt.runtime_context import get_spec
+from sglang.srt.kernel_plugins.nvidia.policy import (
+    FUSED_FINALIZE_SLOT,
+    megakernel_slot_requested,
+)
+from sglang.srt.runtime_context import get_parallel, get_spec
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -231,12 +235,27 @@ def _retargeted_config(tp_size: int, hidden_size: int, top_k: int):
             tp_size,
         )
 
+    qwen35_ep_policy = (
+        (tp_size, hidden_size, top_k) == (8, 4096, 10)
+        and megakernel_slot_requested(FUSED_FINALIZE_SLOT)
+        and get_parallel().moe_ep_size > 1
+    )
+
+    def bt_preset(preset):
+        if not qwen35_ep_policy:
+            return preset
+        return replace(preset, collective=replace(preset.collective, rms_threads=512))
+
     def routes(op):
         bounds, ll, bt, _ = shipped[op]
+        if op == "finalize" and qwen35_ep_policy:
+            bounds = (*bounds[:2], 1024, *bounds[3:])
         return _routes(
             bounds,
             KernelTarget(protocol=ProtocolKind.LL, preset=ll),
-            tuple(KernelTarget(protocol=ProtocolKind.BT, preset=p) for p in bt),
+            tuple(
+                KernelTarget(protocol=ProtocolKind.BT, preset=bt_preset(p)) for p in bt
+            ),
             None
             if ht[op] is None
             else KernelTarget(protocol=ProtocolKind.HT, preset=ht[op]),

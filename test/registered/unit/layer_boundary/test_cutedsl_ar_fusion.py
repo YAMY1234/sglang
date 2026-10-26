@@ -126,6 +126,20 @@ def eligible():
         yield
 
 
+def test_ep_finalize_requires_the_fused_finalize_slot(eligible):
+    fusion = CuteDSLFusion()
+    with (
+        patch(f"{_MODULE}.get_parallel", return_value=SimpleNamespace(moe_ep_size=2)),
+        patch(f"{_MODULE}.megakernel_slot_requested", return_value=False),
+    ):
+        assert not fusion._finalize_eligible(None, _DECODE, 8)
+    with (
+        patch(f"{_MODULE}.get_parallel", return_value=SimpleNamespace(moe_ep_size=2)),
+        patch(f"{_MODULE}.megakernel_slot_requested", return_value=True),
+    ):
+        assert fusion._finalize_eligible(None, _DECODE, 8)
+
+
 def test_last_layer_consumes_but_does_not_skip_the_pending_all_reduce(eligible):
     """The last layer must fuse the reduction its predecessor skipped, or the
     unreduced output reaches the final norm; it must not skip its own."""
@@ -555,6 +569,23 @@ def test_retargeted_profiles_cover_capacity_and_pass_flashinfer_validation(
             _flashinfer_accepts(
                 preset, hidden_size=hidden_size, top_k=routed_top_k, tp_size=tp_size
             )
+
+
+def test_qwen35_ep_profile_uses_the_validated_bt_policy():
+    from flashinfer.comm.mnnvl_cutedsl import ProtocolKind
+
+    module = "sglang.srt.layers.flashinfer_mnnvl_cutedsl"
+    with (
+        patch(f"{module}.megakernel_slot_requested", return_value=True),
+        patch(f"{module}.get_parallel", return_value=SimpleNamespace(moe_ep_size=8)),
+    ):
+        profile = _retargeted_config(8, 4096, 10).profiles[0]
+
+    assert profile.finalize_routes.upper_bounds[2] == 1024
+    for routes in (profile.finalize_routes, profile.all_reduce_routes):
+        bt = [target for target in routes.targets if target.protocol is ProtocolKind.BT]
+        assert bt
+        assert all(target.preset.collective.rms_threads == 512 for target in bt)
 
 
 class TestDeferredLoraAllReduce(unittest.TestCase):
