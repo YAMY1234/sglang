@@ -1308,9 +1308,10 @@ class Envs:
     # _MAX_TOKENS rows with tp 2 / 4 / 8 and hidden % 1024 == 0 (plb_mnnvl_cutedsl/e4m3_payload.py). Lowers precision.
     SGLANG_PERFLP_AR_FP8_PAYLOAD = EnvBool(False)
     SGLANG_PERFLP_AR_FP8_PAYLOAD_MAX_TOKENS = EnvInt(1024)
-    # R13-T4COMM diagnostic only: for TARGET_VERIFY, replace each fused target
-    # AR + residual + RMSNorm with two local BF16 copies. This deliberately
-    # corrupts model semantics and must never be used for accuracy or serving.
+    # R13-T4COMM diagnostic only: for TARGET_VERIFY, remove each fused target
+    # AR + residual + RMSNorm and alias the residual as both outputs. This
+    # deliberately corrupts model semantics and must never be used for accuracy
+    # or serving.
     SGLANG_R13_T4COMM_SKIP_VERIFY_AR_TIMING_ONLY = EnvBool(False)
     # Timing only: decode graph padding per block of Q35MF_AB_BLOCK target-verify rounds, the labels in turn
     # ("pow2": the smallest captured power of two); model_executor/runner_backend/ab_variants.py. Empty: off.

@@ -60,15 +60,15 @@ def _is_supported_forward_mode(forward_mode: ForwardMode) -> bool:
 def _timing_only_verify_ar_replacement(
     forward_batch: ForwardBatch, residual: torch.Tensor
 ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
-    """Local-copy upper bound for R13-T4COMM; intentionally not model-correct."""
+    """Zero-kernel upper bound for R13-T4COMM; intentionally not model-correct."""
     if not (
         envs.SGLANG_R13_T4COMM_SKIP_VERIFY_AR_TIMING_ONLY.get()
         and forward_batch.forward_mode == ForwardMode.TARGET_VERIFY
     ):
         return None
-    # Keep two distinct, initialized outputs with the same shape/dtype as the
-    # real norm and residual outputs. Upstream GEMM/MoE work remains unchanged.
-    return residual.clone(), residual.clone()
+    # Enqueue no replacement kernel: this is the strict upper bound requested
+    # by the timing experiment. Upstream GEMM/MoE work remains unchanged.
+    return residual, residual
 
 
 def _resolve_max_m(*, max_running_requests: int | None) -> int:
@@ -509,7 +509,7 @@ def install_cutedsl_fusion(
     if envs.SGLANG_R13_T4COMM_SKIP_VERIFY_AR_TIMING_ONLY.get():
         logger.warning(
             "R13-T4COMM TIMING ONLY: TARGET_VERIFY fused AR + residual + RMSNorm "
-            "will be replaced by two local BF16 copies; outputs are not "
+            "will be removed (residual aliases both outputs); outputs are not "
             "model-correct and this process must not serve accuracy traffic"
         )
     hands_off = 0
