@@ -91,7 +91,6 @@ class TestGDNPrefillGraphExtend(CustomTestCase):
         cuda=True,
         enable_mis=False,
         draft=False,
-        megakernel=False,
         flashinfer=False,
     ):
         """A target's GDN backend on a setup the graph-safe chain supports, unless
@@ -136,10 +135,6 @@ class TestGDNPrefillGraphExtend(CustomTestCase):
             ),
             patch.object(gdn_backend, "get_exec", return_value=execution),
             patch.object(gdn_backend, "mamba_cache_chunk_size", return_value=64),
-            patch(
-                "sglang.srt.kernel_plugins.nvidia.binding.megakernel_enabled",
-                return_value=megakernel,
-            ),
             patch.object(torch.cuda, "get_device_capability", return_value=(10, 0)),
             patch.object(
                 torch.cuda,
@@ -161,7 +156,6 @@ class TestGDNPrefillGraphExtend(CustomTestCase):
         for switch, setup, captured in (
             (False, {}, False),
             (True, {}, True),
-            (False, dict(megakernel=True), True),
             (True, dict(cuda=False), False),
             (True, dict(enable_mis=True), False),
             (True, dict(draft=True), False),
@@ -173,10 +167,10 @@ class TestGDNPrefillGraphExtend(CustomTestCase):
             ):
                 self.assertEqual(backend.supports_prefill_graph_extend(), captured)
 
-    def test_megakernel_captures_supported_flashinfer_prefill(self):
+    def test_the_switch_captures_supported_flashinfer_prefill(self):
         with (
-            envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.override(False),
-            self._setup(megakernel=True, flashinfer=True) as backend,
+            envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.override(True),
+            self._setup(flashinfer=True) as backend,
         ):
             self.assertTrue(backend.supports_prefill_graph_extend())
             self.assertTrue(backend.prefill_graph_flashinfer)
