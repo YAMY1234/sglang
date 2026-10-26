@@ -1323,6 +1323,13 @@ class Envs:
     SGLANG_R13_T4COMM_CUSTOM_AR_CLUSTER_SIZE = EnvInt(1)
     SGLANG_R13_T4COMM_CUSTOM_AR_VECS_PER_THREAD = EnvInt(2)
     SGLANG_R13_T4COMM_CUSTOM_AR_TWO_SHOT = EnvBool(True)
+    # R13-T4COMM: on wide target-verify rows, split an eligible FP8 attention/GDN
+    # output projection in half and overlap the first half's existing E4M3 BT
+    # all-reduce + residual + RMSNorm with the second half GEMM. This preserves
+    # the R11 payload and arithmetic formats; off by default.
+    SGLANG_R13_T4COMM_OVERLAP = EnvBool(False)
+    SGLANG_R13_T4COMM_OVERLAP_MIN_TOKENS = EnvInt(385)
+    SGLANG_R13_T4COMM_OVERLAP_MAX_TOKENS = EnvInt(1024)
     # Timing only: decode graph padding per block of Q35MF_AB_BLOCK target-verify rounds, the labels in turn
     # ("pow2": the smallest captured power of two); model_executor/runner_backend/ab_variants.py. Empty: off.
     SGLANG_TRTL17_PAD_AB = EnvTuple(())
