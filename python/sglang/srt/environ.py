@@ -1325,6 +1325,11 @@ class Envs:
     # R14-KSMALL: capture one complete EAGLE decode round as a single replay.
     # Q35MF_AB_VARIANTS may change this at replay-block boundaries.
     SGLANG_R14_KSMALL_SINGLE_REPLAY = EnvBool(False)
+    # R14-KSMALL exact-CP: replace the node-local CP group's four peer stores in
+    # the LL query gather with one NVLS multicast store. Epochs, polling and
+    # attention arithmetic are unchanged. Q35MF_AB_VARIANTS may change this
+    # while decode graph variants are captured.
+    SGLANG_R14_KSMALL_CP_MC_GATHER = EnvBool(False)
     # With CP_UNGATED: the q gather of an ungated exact call launches as a programmatic dependent of the kernel that
     # wrote q (it releases the fused partial, then waits), so the partial's prefix KV requests start under that kernel.
     SGLANG_PERFLL_CP_GATHER_PDL = EnvBool(False)

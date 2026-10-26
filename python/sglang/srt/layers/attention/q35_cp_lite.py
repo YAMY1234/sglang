@@ -44,6 +44,7 @@ _KINDS = 2  # flag regions: q gather, partial exchange
 # row max maps to 2^8, exact in E4M3
 _EXACT_P_SHIFT, _EXACT_RESCALE_THRESHOLD = 8.0, 0.0
 _LL_PWORDS = 520  # LL words of one (row, source) partial: 4 heads x 128 bf16 pairs + 4 LSE, padded to 16 B
+_R14_CP_MC_GATHER_ENV = "SGLANG_R14_KSMALL_CP_MC_GATHER"
 
 
 @triton.jit
@@ -384,6 +385,18 @@ def _ll_pack(flag, w):
 
 
 @triton.jit
+def _multimem_st_b64(addr, val):
+    return tl.inline_asm_elementwise(
+        "multimem.st.relaxed.sys.global.b64 [$1], $2;",
+        "=r,l,l",
+        args=[addr, val],
+        dtype=tl.uint32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
 def _ll_wait(src, n: tl.constexpr, e):
     """Poll n LL words (data in the low, epoch in the high half) until all carry epoch e."""
     k = tl.arange(0, n)
@@ -399,7 +412,7 @@ def _cp_gather_q_ll(
     CP: tl.constexpr, WORDS: tl.constexpr, QL: tl.constexpr, FOLD: tl.constexpr,
     GATE: tl.constexpr, NB: tl.constexpr, GMAX: tl.constexpr, GWRITE: tl.constexpr, TRIG: tl.constexpr = False,
     qv=None, vstart=None, vcnt=None, CHUNK: tl.constexpr = False, WAIT: tl.constexpr = False,
-    NCH: tl.constexpr = 1,
+    NCH: tl.constexpr = 1, mc_addr=0, uc_addr=0, MC: tl.constexpr = False,
 ):
     """LL variant of _cp_gather_q: every 4-byte word travels with the call's epoch in one 8-byte store.
     FOLD: q_all is written source-major per request ([B, CP, QL, heads, D]) for the prefix-only fused partial,
@@ -433,10 +446,15 @@ def _cp_gather_q_ll(
     flag = e.to(tl.int64) << 32
     w = jc * CW + tl.arange(0, CW)
     x = _ll_pack(flag, tl.load(q + i * q_stride + w))
-    for c in tl.static_range(CP):
-        dst = (tl.load(peers + c) + ll_off + (i * CP + me) * WORDS * 8).to(tl.pointer_type(tl.int64))
-        tl.store(dst + w, x)
-    own = tl.load(peers + me) + ll_off
+    if MC:
+        dst = mc_addr.to(tl.pointer_type(tl.int64)) + (i * CP + me) * WORDS
+        _multimem_st_b64(dst + w, x)
+        own = uc_addr
+    else:
+        for c in tl.static_range(CP):
+            dst = (tl.load(peers + c) + ll_off + (i * CP + me) * WORDS * 8).to(tl.pointer_type(tl.int64))
+            tl.store(dst + w, x)
+        own = tl.load(peers + me) + ll_off
     for c in tl.static_range(CP):
         v = _ll_wait((own + (i * CP + c) * WORDS * 8).to(tl.pointer_type(tl.int64)) + jc * CW, CW, e)
         if FOLD:
@@ -781,6 +799,16 @@ class CpLite:
         self.cp, self.hq, self.device = cp, q_heads, torch.device(device)
         self.me = tp_rank % cp
         g0 = tp_rank - self.me
+        from sglang.srt.model_executor.runner_backend import ab_variants
+
+        self.mc_q_default = envs.SGLANG_R14_KSMALL_CP_MC_GATHER.get()
+        self.mc_q_requested = self.mc_q_default or ab_variants.env_any(
+            _R14_CP_MC_GATHER_ENV, "1"
+        )
+        self.mc_q_buf = None
+        self.mc_q_handle = None
+        self.mc_q_groups = None
+        self._mc_q_logged = False
         self.min_bs = envs.SGLANG_TRTL1_ATTN_CP_MIN_BS.get()
         self.q_bytes = _MAX_ROWS * cp * q_heads * HEAD_DIM  # fp8
         self.p_off = self.q_bytes
@@ -843,6 +871,39 @@ class CpLite:
             [int(p) for p in handle.buffer_ptrs[g0 : g0 + cp]], dtype=torch.int64, device=self.device
         )
         self._handle = handle
+        if self.mc_q_requested:
+            import torch.distributed as dist
+
+            global_ranks = dist.get_process_group_ranks(group)
+            assert len(global_ranks) == tp_size, (global_ranks, tp_size)
+            rank_groups = [
+                global_ranks[start : start + cp]
+                for start in range(0, tp_size, cp)
+            ]
+            # Every TP rank creates every subgroup in the same order. Each
+            # rank then rendezvous only within its node-local CP group.
+            self.mc_q_groups = [
+                dist.new_group(ranks=ranks, backend="nccl") for ranks in rank_groups
+            ]
+            mc_group = self.mc_q_groups[tp_rank // cp]
+            words = q_heads * HEAD_DIM // 4
+            self.mc_q_buf = symm_mem.empty(
+                (_MAX_ROWS * cp * words,),
+                dtype=torch.int64,
+                device=self.device,
+            )
+            self.mc_q_buf.zero_()
+            torch.cuda.synchronize(self.device)
+            self.mc_q_handle = symm_mem.rendezvous(self.mc_q_buf, mc_group)
+            assert self.mc_q_handle.rank == self.me, (
+                self.mc_q_handle.rank,
+                self.me,
+            )
+            if self.mc_q_handle.multicast_ptr == 0:
+                raise RuntimeError(
+                    "R14-KSMALL CP multicast gather requested but the node-local "
+                    "CP group has no multicast mapping"
+                )
         self.q_all = self.buf[: self.q_bytes].view(torch.float8_e4m3fn).view(_MAX_ROWS, cp * q_heads, HEAD_DIM)
         rows = _MAX_ROWS
         self.po = torch.empty(rows, cp * q_heads, HEAD_DIM, dtype=torch.bfloat16, device=self.device)
@@ -883,6 +944,29 @@ class CpLite:
         logger.info(
             "TRT-L1 CP-lite KV gate: min KV per request %s (%s of the batch)",
             self.min_kv or "off", "max" if self.gate_max else "mean",
+        )
+
+    def _mc_q_args(self):
+        from sglang.srt.model_executor.runner_backend import ab_variants
+
+        enabled = ab_variants.switch(
+            self.mc_q_default, _R14_CP_MC_GATHER_ENV
+        )
+        if not enabled:
+            return dict(MC=False, mc_addr=0, uc_addr=0)
+        if self.mc_q_handle is None:
+            raise RuntimeError("R14-KSMALL CP multicast gather was not prepared")
+        if not self._mc_q_logged:
+            self._mc_q_logged = True
+            logger.info(
+                "R14-KSMALL exact-CP query gather uses one node-local "
+                "multicast store for %d CP ranks",
+                self.cp,
+            )
+        return dict(
+            MC=True,
+            mc_addr=int(self.mc_q_handle.multicast_ptr),
+            uc_addr=int(self.mc_q_handle.buffer_ptrs[self.mc_q_handle.rank]),
         )
 
     def offer_gate_epilogue(self, gate: torch.Tensor, scale: torch.Tensor, out8: torch.Tensor) -> None:
@@ -1020,6 +1104,7 @@ class CpLite:
                 q.view(torch.int32), words, self.peers, self.me, self.llq_off, self.q_all.view(torch.int32),
                 self.cnt[0], seq_lens, self.pre_lens, self.stock_lens, **gate,
                 CP=self.cp, WORDS=words, QL=q_len, FOLD=exact, GWRITE=True, num_warps=4,
+                **self._mc_q_args(),
             )
             if thr is not None:
                 out = torch.empty(rows, self.hq, HEAD_DIM, dtype=torch.bfloat16, device=q.device)
@@ -1114,6 +1199,7 @@ class CpLite:
                 q.view(torch.int32), words, self.peers, self.me, self.llq_off, self.q_all.view(torch.int32),
                 self.cnt[0], seq_lens, pre_lens, self.stock_lens, **gate,
                 CP=self.cp, WORDS=words, QL=q_len, FOLD=exact, GWRITE=False, num_warps=4,
+                **self._mc_q_args(),
                 **({} if fused is None else dict(qv=fused[1].view(torch.int32), vstart=fused[0][3],
                                                  vcnt=fused[0][4], CHUNK=True)),
             )
@@ -1143,6 +1229,7 @@ class CpLite:
             q.view(torch.int32), words, self.peers, self.me, self.llq_off, self.q_all.view(torch.int32),
             self.cnt[0], seq_lens, pre_lens, self.stock_lens, **gate,
             CP=self.cp, WORDS=words, QL=q_len, FOLD=True, GWRITE=False, TRIG=self.cp_pdl, num_warps=4,
+            **self._mc_q_args(),
         )
         self._exact_partial(k_cache, v_cache, page_table, pre_lens, q_len, b, rows, bmm1_scale, bmm2_scale,
                             pdl=self.cp_pdl)
@@ -1168,7 +1255,7 @@ class CpLite:
             self.q_all.view(torch.int32), self.cnt[0] if nch == 1 else self.cnt_q2, seq_lens, self.pre_lens,
             self.stock_lens, **gate,
             CP=self.cp, WORDS=words, QL=q_len, FOLD=True, GWRITE=False, TRIG=True, WAIT=self.gather_pdl, NCH=nch,
-            num_warps=4, launch_pdl=self.gather_pdl,
+            num_warps=4, launch_pdl=self.gather_pdl, **self._mc_q_args(),
         )
         self._exact_partial(k_cache, v_cache, page_table, seq_lens, q_len, b, rows, bmm1_scale, bmm2_scale,
                             pdl=True, len_sub=q_len, early_trigger=self.early_merge)
