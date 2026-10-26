@@ -59,7 +59,7 @@ def _offer_variants(runner, served):
     runner.attention_variant_sizes = frozenset(served)
 
 
-def _extend_runner(raw_bs):
+def _extend_runner(raw_bs, *, keep_hidden_in_place=False):
     """A bare draft-extend runner of capture sizes 1 and 2, as execute() reads it, and
     a forward batch of raw_bs requests three rows wide."""
     width = 3
@@ -81,6 +81,7 @@ def _extend_runner(raw_bs):
         seq_lens_cpu=torch.zeros(2, dtype=torch.int64),
     )
     runner.require_mlp_tp_gather = runner.require_gathered_buffer = False
+    runner.keep_hidden_in_place = keep_hidden_in_place
     runner.captured_req_width, runner.capture_bs = width, [1, 2]
     runner.seq_len_fill_value = 1
     runner.extend_seq_lens_cpu = [width] * 2
@@ -257,6 +258,30 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
                 forward_batch.attention_kv_len_lower_bound = bound
                 runner.execute(forward_batch, select_index)
                 self.assertEqual(keys[0].attention_variant, label)
+
+    def test_draft_extend_relay_keeps_hidden_rows_in_graph_storage(self):
+        for keep_hidden_in_place in (False, True):
+            with self.subTest(keep_hidden_in_place=keep_hidden_in_place):
+                runner, forward_batch, select_index = _extend_runner(
+                    1, keep_hidden_in_place=keep_hidden_in_place
+                )
+                graph_hidden = torch.arange(4, dtype=torch.float32).view(2, 2)
+                runner._replay_graph = lambda key, fb: SimpleNamespace(
+                    next_token_logits=torch.zeros((2, 4)),
+                    hidden_states=graph_hidden,
+                )
+
+                output = runner.execute(forward_batch, select_index)
+
+                if keep_hidden_in_place:
+                    self.assertEqual(
+                        output.hidden_states.data_ptr(), graph_hidden.data_ptr()
+                    )
+                else:
+                    self.assertNotEqual(
+                        output.hidden_states.data_ptr(), graph_hidden.data_ptr()
+                    )
+                self.assertTrue(torch.equal(output.hidden_states, graph_hidden[:1]))
 
     def test_padded_replay_keeps_seq_lens_sum_consistent(self):
         # raw_bs=2 < CAPTURE_BS=4: the batch is padded with fake rows of length
