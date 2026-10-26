@@ -586,7 +586,7 @@ def register_fused_all_reduce_comm(
         and not comm.disabled
         and max_push_size is not None
     ):
-        from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
+        from sglang.kernels.ops.communication.mp import register_comm_cleanup
 
         comm = CustomAllReduceV2(
             comm.group,

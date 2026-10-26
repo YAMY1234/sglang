@@ -17,7 +17,7 @@ import torch.distributed as dist
 import sglang.srt.distributed.parallel_state as ps
 from sglang.kernels.jit.utils import cache_once
 from sglang.kernels.ops.communication import all_reduce_fusion
-from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
+from sglang.kernels.ops.communication.mp import register_comm_cleanup
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
