@@ -21,6 +21,7 @@ import torch
 from sglang.kernels.ops.attention.trtllm_mha_graph_metadata import (
     Q_MODE_NONE,
     Q_MODE_STRIDED,
+    update_draft_step_seqlens,
     update_trtllm_mha_graph_metadata,
 )
 from sglang.kernels.ops.attention.trtllm_mha_page_table import (
@@ -2153,6 +2154,19 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
                 kv_last_page_len_buf=self.kv_last_page_len,
                 speculative_step_id=i,
             )
+        from sglang.srt.kernel_plugins.nvidia.binding import megakernel_enabled
+
+        steps = self.speculative_num_steps - 1
+        self._share_draft_metadata = (
+            megakernel_enabled()
+            and steps > 1
+            and all(
+                not backend.use_sliding_window_kv_pool
+                and not backend.kv_index_translator.is_translating
+                for backend in self.attn_backends[:steps]
+            )
+        )
+        self._shared_draft_metadata = None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         for i in range(self.speculative_num_steps - 1):
@@ -2161,6 +2175,19 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_cuda_graph_state(max_bs, max_num_tokens)
+        self._shared_draft_metadata = None
+        steps = self.speculative_num_steps - 1
+        if not self._share_draft_metadata:
+            return
+        device = self.attn_backends[0].device
+        lens = torch.zeros(steps, max_bs, dtype=torch.int32, device=device)
+        cu_lens = torch.zeros(steps, max_bs + 1, dtype=torch.int32, device=device)
+        last = self.attn_backends[steps - 1].decode_cuda_graph_metadata
+        for i in range(steps):
+            m = self.attn_backends[i].decode_cuda_graph_metadata
+            m["cache_seqlens"], m["cu_seqlens_k"] = lens[i], cu_lens[i]
+            m["page_table_draft_decode"] = last["page_table_draft_decode"]
+        self._shared_draft_metadata = (lens, cu_lens)
 
     def init_forward_metadata_out_graph(
         self,
@@ -2197,5 +2224,24 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
             forward_mode=ForwardMode.DECODE,
             encoder_lens=forward_batch.encoder_lens,
         )
-        for i in range(self.speculative_num_steps - 1):
-            self.attn_backends[i].init_forward_metadata_in_graph(inner_fb)
+        steps = self.speculative_num_steps - 1
+        if self._shared_draft_metadata is None:
+            for i in range(steps):
+                self.attn_backends[i].init_forward_metadata_in_graph(inner_fb)
+            return
+        # The last step's update writes the shared page table at the longest length (each
+        # step reads only its own live prefix); one launch writes the other steps' lengths.
+        self.attn_backends[steps - 1].init_forward_metadata_in_graph(inner_fb)
+        lens, cu_lens = self._shared_draft_metadata
+        bs = forward_batch.batch_size
+        update_draft_step_seqlens(
+            seq_lens=inner_fb.seq_lens,
+            cache_seqlens=lens,
+            cu_seqlens_k=cu_lens,
+            bs=bs,
+            steps=steps - 1,
+            first_offset=1,
+        )
+        for i in range(steps - 1):
+            b = self.attn_backends[i]
+            b.forward_metadata = b.decode_cuda_graph_metadata[bs]
