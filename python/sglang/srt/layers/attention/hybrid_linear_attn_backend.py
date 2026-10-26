@@ -59,6 +59,23 @@ _validate_mamba_replay_state_indices = (
 class MambaAttnBackendBase(AttentionBackend):
     supports_mis: bool = False
 
+    def out_graph_metadata_capturable(self, forward_mode: ForwardMode) -> bool:
+        """Whether the fixed-width topk-1 verify replay prep is graph-safe.
+
+        The R14 whole-step graph encloses the ordinary CUDA-graph replay path,
+        including this backend's out-of-graph metadata refresh.  That refresh is
+        one fused device kernel only when state-index translation is fusible and
+        the decode ReplaySSM cursor machinery is disabled.  Keep every broader
+        shape/mode on the established per-stage fallback.
+        """
+        return (
+            forward_mode.is_target_verify()
+            and self.topk == 1
+            and self._fused_state_indices_ok
+            and not self._replayssm_enabled()
+            and not _validate_mamba_replay_state_indices
+        )
+
     @classmethod
     def validate_mis_support(cls, server_args) -> None:
         if server_args.enable_mis and not cls.supports_mis:
@@ -1263,6 +1280,21 @@ class HybridLinearAttnBackend(AttentionBackend):
             attn_backend.init_forward_metadata_out_graph(
                 forward_batch, in_capture=in_capture
             )
+
+    def out_graph_metadata_capturable(self, forward_mode: ForwardMode) -> bool:
+        # DRAFT_EXTEND_V2 deliberately initializes only the full-attention
+        # child (see init_forward_metadata below).  Other modes must be safe in
+        # both children before the enclosing whole-step graph may capture their
+        # replay-time metadata preparation.
+        children = (
+            (self.full_attn_backend,)
+            if forward_mode.is_draft_extend_v2()
+            else self.attn_backend_list
+        )
+        return all(
+            backend.out_graph_metadata_capturable(forward_mode)
+            for backend in children
+        )
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         return SharedReadEnds.max_of(
