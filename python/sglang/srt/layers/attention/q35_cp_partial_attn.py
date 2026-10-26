@@ -685,6 +685,8 @@ class Q35CpPartialAttnKernel:
                      dependency wait, else use ``bmm1_log2``. Same for ``bmm2`` (``bmm2_ptr[0]``).
     o_vec16:         out_o rows are 16-byte aligned (8-element vector stores), else 4-byte stores.
     use_pdl:         launched as a programmatic dependent (waits, releases its dependents at the end).
+    early_trigger:   with use_pdl, also release the dependents right after the dependency wait (warp 3), so a dependent
+                     that waits before touching this kernel's outputs launches under it.
     kv_pre_wait:     request the prefix pages below the fresh margin before griddepcontrol.wait.
     fresh_margin_pages: prefix pages just below the new tokens' first page that are read only after the wait.
     debug_ts / unsafe_skip_wait: test hooks (%globaltimer stamps per CTA; no dependency waits = positive control of the
@@ -713,8 +715,14 @@ class Q35CpPartialAttnKernel:
         balanced: bool = False,
         rescale_threshold: float | None = None,
         l_from_p8: bool = False,
+        len_sub: int = 0,
+        early_trigger: bool = False,
     ):
         assert gh == cp_size * hql, "group heads = cp_size x q heads per rank"
+        self.early_trigger = bool(early_trigger) and use_pdl
+        # L = max(seq_lens - len_sub, 0): a folded caller's prefix lengths from the batch's own lengths, so nothing
+        # written by the q all-gather is read before the dependency wait
+        self.len_sub = int(len_sub)
         self.balanced = bool(balanced)
         self.q_len = q_len
         self.gh = gh
@@ -1241,6 +1249,8 @@ class Q35CpPartialAttnKernel:
         L = Int32(0)
         if lane < batch:
             L = mSeq[lane]
+            if const_expr(self.len_sub > 0):
+                L = cutlass.max(L - self.len_sub, 0)
         # owned tiles of request `lane` on this rank (0 for lanes >= batch: L = 0)
         t = ((((L + PAGE - 1) // PAGE) - cp_rank + CP - 1) // CP + 1) // 2
         total = _redux_add_s32(t)
@@ -1609,6 +1619,8 @@ class Q35CpPartialAttnKernel:
         #      all-gather (non-PDL torch ops / kernels that completed before it); read before the dependency wait ----
         if const_expr(not BAL):
             L = mSeq[req]
+            if const_expr(self.len_sub > 0):
+                L = cutlass.max(L - self.len_sub, 0)
             n_pages = (L + PAGE - 1) // PAGE
             n_own = (
                 n_pages - cp_rank + CP - 1
@@ -2076,6 +2088,9 @@ class Q35CpPartialAttnKernel:
             # q is the all-gather output: requested right after the dependency wait
             if const_expr(self.use_pdl and not self.unsafe_skip_wait):
                 _griddep_wait()
+            if const_expr(self.early_trigger):
+                if lane == 0:
+                    _griddep_launch()
             if n_t > 0:
                 gQ = cute.local_tile(
                     gQ_tma,
