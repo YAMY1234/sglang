@@ -12,6 +12,10 @@ from sglang.srt.kernel_plugins.nvidia import binding
 from sglang.srt.kernel_plugins.nvidia.binding import (
     megakernel_disable_reasons,
 )
+from sglang.srt.layers.attention.linear.gdn_replayssm_spec_decode import (
+    GDN_COMMIT_SLOT,
+    gdn_commit_cuda_requested,
+)
 from sglang.srt.layers.attention.q35_cp_lite import cp_lite_requested
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -61,6 +65,18 @@ class TestMegakernelGuards(CustomTestCase):
         for slot in ("skv2_cp", "draft_q1_cp", "draft_skv2_cp"):
             with envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override((slot,)):
                 self.assertTrue(cp_lite_requested())
+
+    def test_gdn_cuda_commit_requires_megakernel_and_slot(self):
+        with (
+            patch.object(binding, "megakernel_enabled", return_value=False),
+            envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override((GDN_COMMIT_SLOT,)),
+        ):
+            self.assertFalse(gdn_commit_cuda_requested())
+        with patch.object(binding, "megakernel_enabled", return_value=True):
+            with envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override(()):
+                self.assertFalse(gdn_commit_cuda_requested())
+            with envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override((GDN_COMMIT_SLOT,)):
+                self.assertTrue(gdn_commit_cuda_requested())
 
 
 if __name__ == "__main__":

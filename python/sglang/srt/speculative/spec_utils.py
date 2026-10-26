@@ -1187,6 +1187,7 @@ def commit_mamba_states_after_verify(
         from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode import (
             commit_gdn_replayssm_circular,
             commit_gdn_replayssm_spec,
+            gdn_commit_cuda_requested,
         )
         from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
             fused_conv_window_scatter_with_mask,
@@ -1237,6 +1238,7 @@ def commit_mamba_states_after_verify(
             mamba_track_indices=batch.mamba_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
             null_block_id=-1,
+            use_cuda_commit=gdn_commit_cuda_requested(),
         )
         # Roll back active conv state and snapshot its interval-crossing window.
         fused_conv_window_scatter_with_mask(
