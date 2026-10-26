@@ -1729,12 +1729,9 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             segments = [(start_idx, end_idx)]
 
-        if self.enable_staging:
-            from sglang.srt.kernel_plugins.nvidia.binding import megakernel_enabled
-
-            fence_staging_gather = megakernel_enabled()
-        else:
-            fence_staging_gather = False
+        # A PD prefill server does not load the decode megakernel plugin. Fence
+        # staging gathers on the exact producer stream whenever staging is on.
+        fence_staging_gather = self.enable_staging
         for seg_start, seg_end in segments:
             is_final_segment = seg_end == end_idx
             raw_kv_indices = self.req_to_token_pool.req_to_token[

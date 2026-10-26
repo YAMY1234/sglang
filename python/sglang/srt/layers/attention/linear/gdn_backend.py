@@ -583,14 +583,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self._flashinfer_graph_cp_single = True
 
     def supports_prefill_graph_extend(self) -> bool:
-        from sglang.srt.kernel_plugins.nvidia.binding import megakernel_enabled
-
-        use_megakernel = megakernel_enabled()
         return (
-            (envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.get() or use_megakernel)
+            envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.get()
             # drafts keep their eager GDN extend; only the target's is captured
             and not self.is_draft_worker
-            and self._prefill_graph_extend_supported(enable_flashinfer=use_megakernel)
+            and self._prefill_graph_extend_supported(enable_flashinfer=True)
         )
 
     def _prefill_graph_extend_supported(

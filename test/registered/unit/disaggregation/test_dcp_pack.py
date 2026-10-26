@@ -129,7 +129,7 @@ class TestDcpCachedPrefixSend(CustomTestCase):
                 )
                 self.assertEqual(int(calls[-1].kwargs["state_indices"][0][0]), 17)
 
-    def test_megakernel_fences_only_the_first_staging_segment(self):
+    def test_staging_fences_only_the_first_segment(self):
         class Sender:
             supports_host_tensor_indices = False
 
@@ -175,10 +175,6 @@ class TestDcpCachedPrefixSend(CustomTestCase):
             patch(
                 "sglang.srt.disaggregation.prefill.get_schedule",
                 return_value=SimpleNamespace(chunked_prefill_size=2),
-            ),
-            patch(
-                "sglang.srt.kernel_plugins.nvidia.binding.megakernel_enabled",
-                return_value=True,
             ),
             patch.object(torch.cuda, "Event", return_value=event),
             patch.object(torch.cuda, "current_stream", return_value=current_stream),
