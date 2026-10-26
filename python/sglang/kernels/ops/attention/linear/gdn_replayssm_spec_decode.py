@@ -44,7 +44,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.utils import is_tf32_supported
-from sglang.srt.environ import envs
+from sglang.srt.kernel_plugins.nvidia.policy import megakernel_slot_requested
 from sglang.srt.utils import is_gfx95_supported
 
 _IS_GFX95 = is_gfx95_supported()
@@ -53,12 +53,7 @@ GDN_COMMIT_SLOT = "gdn_commit"
 
 def gdn_commit_cuda_requested() -> bool:
     """Whether the numeric CUDA commit was explicitly selected for a megakernel."""
-    from sglang.srt.kernel_plugins.nvidia.binding import megakernel_enabled
-
-    return (
-        megakernel_enabled()
-        and GDN_COMMIT_SLOT in envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.get()
-    )
+    return megakernel_slot_requested(GDN_COMMIT_SLOT)
 
 
 @triton.jit

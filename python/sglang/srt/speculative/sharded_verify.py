@@ -17,7 +17,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.environ import envs
+from sglang.srt.kernel_plugins.nvidia.policy import megakernel_slot_requested
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +26,7 @@ SHARDED_GUMBEL_SLOT = "sharded_gumbel"
 
 def sharded_gumbel_requested() -> bool:
     """Whether distribution-equivalent Gumbel sampling is explicitly requested."""
-    return SHARDED_GUMBEL_SLOT in envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.get()
+    return megakernel_slot_requested(SHARDED_GUMBEL_SLOT)
 
 
 class VocabShard(msgspec.Struct, frozen=True):

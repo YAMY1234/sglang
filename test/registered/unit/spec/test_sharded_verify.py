@@ -78,12 +78,16 @@ class TestShardedPolicy(CustomTestCase):
             )
 
     def test_greedy_is_automatic_but_gumbel_is_opt_in(self):
-        with envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override(()):
-            self.assertTrue(self._applies(greedy=True))
-            self.assertFalse(self._applies(greedy=False))
-        with envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override((SHARDED_GUMBEL_SLOT,)):
-            self.assertTrue(self._applies(greedy=False))
-            self.assertFalse(self._applies(greedy=False, top_k=True))
+        with patch(
+            "sglang.srt.kernel_plugins.nvidia.binding.megakernel_enabled",
+            return_value=True,
+        ):
+            with envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override(()):
+                self.assertTrue(self._applies(greedy=True))
+                self.assertFalse(self._applies(greedy=False))
+            with envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override((SHARDED_GUMBEL_SLOT,)):
+                self.assertTrue(self._applies(greedy=False))
+                self.assertFalse(self._applies(greedy=False, top_k=True))
 
 
 def _sharded_tokens(full, tp, temperatures=None, seeds=None, split=False):
