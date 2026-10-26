@@ -16,6 +16,7 @@ from sglang.srt.layers.attention.linear.gdn_backend import (
     validate_gdn_mis_backend,
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+    FlashInferGDNKernel,
     maybe_build_flashinfer_checkpoint_plan,
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
@@ -84,22 +85,48 @@ def make_runner(
 
 class TestGDNPrefillGraphExtend(CustomTestCase):
     @contextmanager
-    def _setup(self, *, cuda=True, enable_mis=False, draft=False):
+    def _setup(
+        self,
+        *,
+        cuda=True,
+        enable_mis=False,
+        draft=False,
+        megakernel=False,
+        flashinfer=False,
+    ):
         """A target's GDN backend on a setup the graph-safe chain supports, unless
         cuda, enable_mis or draft say otherwise."""
         backend = GDNAttnBackend.__new__(GDNAttnBackend)
         backend.is_draft_worker = draft
         backend.enable_mis = enable_mis
         backend._mamba_chunk_size = 64
-        backend.kernel_dispatcher = SimpleNamespace(
-            extend_kernel=TritonGDNKernel.__new__(TritonGDNKernel)
+        extend_kernel = (
+            FlashInferGDNKernel.__new__(FlashInferGDNKernel)
+            if flashinfer
+            else TritonGDNKernel.__new__(TritonGDNKernel)
         )
-        cache = SimpleNamespace(conv=[torch.zeros(2, 3)], temporal=torch.zeros(2, 3))
+        backend.kernel_dispatcher = SimpleNamespace(extend_kernel=extend_kernel)
+        temporal = (
+            torch.zeros(2, 16, 4, 128, 128, dtype=torch.bfloat16)
+            if flashinfer
+            else torch.zeros(2, 3)
+        )
+        cache = SimpleNamespace(conv=[torch.zeros(2, 3)], temporal=temporal)
         backend.req_to_token_pool = SimpleNamespace(
-            mamba_pool=SimpleNamespace(mamba_cache=cache)
+            size=16, mamba_pool=SimpleNamespace(mamba_cache=cache)
         )
+        backend.device = torch.device("cpu")
+        backend.prefill_graph_max_seqs = 16
+        backend.prefill_graph_flashinfer = False
+        backend._flashinfer_graph_output = None
+        backend._flashinfer_graph_output_dtype = torch.bfloat16
+        backend._flashinfer_graph_cp_single = True
         graph = SimpleNamespace(
             cuda_graph_config=SimpleNamespace(prefill=SimpleNamespace(bs=[512]))
+        )
+        execution = SimpleNamespace(
+            graph=graph,
+            mamba=SimpleNamespace(enable_mamba_extra_buffer=True),
         )
         with (
             patch.object(gdn_backend, "is_cuda", return_value=cuda),
@@ -107,8 +134,17 @@ class TestGDNPrefillGraphExtend(CustomTestCase):
             patch.object(
                 gdn_backend, "buckets_keep_chunk_o_block_size", return_value=True
             ),
+            patch.object(gdn_backend, "get_exec", return_value=execution),
+            patch.object(gdn_backend, "mamba_cache_chunk_size", return_value=64),
+            patch(
+                "sglang.srt.kernel_plugins.nvidia.binding.megakernel_enabled",
+                return_value=megakernel,
+            ),
+            patch.object(torch.cuda, "get_device_capability", return_value=(10, 0)),
             patch.object(
-                gdn_backend, "get_exec", return_value=SimpleNamespace(graph=graph)
+                torch.cuda,
+                "get_device_properties",
+                return_value=SimpleNamespace(multi_processor_count=132),
             ),
             patch(
                 "sglang.srt.model_executor.runner.prefill_cuda_graph_runner."
@@ -125,6 +161,7 @@ class TestGDNPrefillGraphExtend(CustomTestCase):
         for switch, setup, captured in (
             (False, {}, False),
             (True, {}, True),
+            (False, dict(megakernel=True), True),
             (True, dict(cuda=False), False),
             (True, dict(enable_mis=True), False),
             (True, dict(draft=True), False),
@@ -135,6 +172,18 @@ class TestGDNPrefillGraphExtend(CustomTestCase):
                 self._setup(**setup) as backend,
             ):
                 self.assertEqual(backend.supports_prefill_graph_extend(), captured)
+
+    def test_megakernel_captures_supported_flashinfer_prefill(self):
+        with (
+            envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.override(False),
+            self._setup(megakernel=True, flashinfer=True) as backend,
+        ):
+            self.assertTrue(backend.supports_prefill_graph_extend())
+            self.assertTrue(backend.prefill_graph_flashinfer)
+            self.assertEqual(backend.prefill_graph_max_seqs, 8)
+            self.assertEqual(
+                tuple(backend._flashinfer_graph_output.shape), (512, 4, 128)
+            )
 
 
 class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
