@@ -48,6 +48,7 @@ import copy
 import dataclasses
 import gc
 import logging
+import os
 import time
 from collections import Counter
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -1005,12 +1006,34 @@ class EagleStepCudaGraphRunner:
                     capture_error_mode="thread_local",
                 ),
             ):
-                result = self.worker.forward_batch_generation(
-                    capture_batch,
-                    on_publish=None,
-                    grammar_barrier=None,
-                    pp_proxy_tensors=None,
+                forward = self.worker.forward_batch_generation
+                # The out-of-tree round-timer wraps this method and records
+                # CUDA events around every call.  This call is recursive: it
+                # supplies the body of the enclosing step graph.  Recording
+                # the observer here would put its event nodes in only the
+                # single-replay arm and leave its pending capture row ahead of
+                # all later replay samples.  Keep the observer around the
+                # outer live call, but bypass it for this graph-body call.
+                unwrapped = (
+                    getattr(forward, "__wrapped__", None)
+                    if os.environ.get("Q35MF_ROUNDTIMER_DIR")
+                    else None
                 )
+                if unwrapped is not None:
+                    result = unwrapped(
+                        self.worker,
+                        capture_batch,
+                        on_publish=None,
+                        grammar_barrier=None,
+                        pp_proxy_tensors=None,
+                    )
+                else:
+                    result = forward(
+                        capture_batch,
+                        on_publish=None,
+                        grammar_barrier=None,
+                        pp_proxy_tensors=None,
+                    )
                 ring_next_token_ids.index_copy_(
                     0, ring_slot, result.next_token_ids[None]
                 )
