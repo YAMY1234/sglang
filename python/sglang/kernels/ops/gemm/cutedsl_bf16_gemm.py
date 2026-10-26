@@ -7,11 +7,15 @@
 # You may obtain a copy of the License at
 #
 #   http://www.apache.org/licenses/LICENSE-2.0
-"""CuTe DSL TGV BF16 GEMM (low-latency SM10x GEMM).
+"""CuTe DSL TGV GEMM (low-latency SM10x GEMM).
 
 Computes ``out[M, N] = x[M, K] @ weight[N, K].T (+ bias[N])`` for bf16 inputs,
 fp32 accumulation, bf16 output. The kernel writes M-contiguous output, so the
 runner swaps A and B (``gemm_fn(b.t(), a.t(), ...)``) to land row-major (M, N).
+
+R13-T4EPI also exposes a deliberately narrow E4M3 x E4M3 -> BF16 entry point
+for output-projection experiments. It uses the same FP32 accumulator and applies
+the two per-tensor scales in the epilogue before the sole BF16 conversion.
 
 Toggled by ``use_2cta`` in the constructor:
   use_2cta=False -> 1x1 cluster, 1-CTA tcgen05.mma, cta_n in [8, 256] step 8
@@ -47,6 +51,7 @@ from sglang.srt.utils.common import direct_register_custom_op
 # Tactic 1 (1-CTA 64×8 stages=8) is the default.
 _TGV_CUTE_EXT_CTA_K: int = 128
 _TGV_CUTE_EXT_DEFAULT_TACTIC: int = 1
+_T4EPI_FP8_DEFAULT_TACTIC: int = 15
 _TGV_CUTE_EXT_TACTIC_CONFIGS: List[Tuple[int, int, int, bool]] = [
     # 1-CTA configs
     (64, 8, 6, False),  # 0
@@ -112,6 +117,7 @@ class TgvGemmCuteExtKernel:
         pdl_count: int = -1,
         has_bias: bool = False,
         out_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
+        scaled: bool = False,
     ):
         self.acc_dtype = acc_dtype
         self.out_dtype = out_dtype
@@ -128,6 +134,10 @@ class TgvGemmCuteExtKernel:
         # adds it to the accumulator before the bf16 cast. When False, all
         # bias-related code is elided via cutlass.const_expr.
         self.has_bias = has_bias
+        # R13-T4EPI reuses this TGV mainloop for per-tensor E4M3 output
+        # projections.  ``scaled`` is compile-time, so the ordinary BF16 path
+        # neither loads nor multiplies the two dummy scale tensors.
+        self.scaled = scaled
 
         # 1-CTA: cta_n ∈ [8, 256] step 8 (bf16 tcgen05.mma atom limit).
         # 2-CTA: cta_n ∈ [16, 256] step 16 (bf16 K-major cluster mma).
@@ -159,6 +169,7 @@ class TgvGemmCuteExtKernel:
             f"_2cta{int(self.use_2cta)}_pdl{int(self.use_pdl)}"
             f"_bias{int(self.has_bias)}"
             f"_out{self.out_dtype.__name__.lower()}"
+            f"_scaled{int(self.scaled)}"
         )
 
     @cute.experimental.jit
@@ -168,6 +179,8 @@ class TgvGemmCuteExtKernel:
         b: cute.Tensor,  # (Gemm_N, Gemm_K, Gemm_L), K-major
         c: cute.Tensor,  # (Gemm_M, Gemm_N, Gemm_L), M-major
         bias: cute.Tensor,  # (Gemm_M, Gemm_N, Gemm_L):(1,0,0) — unused when has_bias=False
+        scale_a: cute.Tensor,  # one FP32 scalar; unused when scaled=False
+        scale_b: cute.Tensor,  # one FP32 scalar; unused when scaled=False
         stream: cuda.CUstream,
     ):
         # Each CTA processes one (CTA_M, CTA_N) output tile, no persistence.
@@ -183,7 +196,7 @@ class TgvGemmCuteExtKernel:
             ),
             self.cluster_shape,
         )
-        self.kernel(a, b, c, bias).launch(
+        self.kernel(a, b, c, bias, scale_a, scale_b).launch(
             grid=grid,
             block=(self.threads_per_cta, 1, 1),
             cluster=self.cluster_shape,
@@ -199,6 +212,8 @@ class TgvGemmCuteExtKernel:
         mB: cute.Tensor,  # (Gemm_N, Gemm_K, Gemm_L), K-major
         mC: cute.Tensor,  # (Gemm_M, Gemm_N, Gemm_L), M-major
         mBias: cute.Tensor,  # (Gemm_M, Gemm_N, Gemm_L):(1,0,0) — unused when has_bias=False
+        mScaleA: cute.Tensor,  # one FP32 scalar; unused when scaled=False
+        mScaleB: cute.Tensor,  # one FP32 scalar; unused when scaled=False
     ):
         """
         Device-side dispatcher: build MMA descriptor, allocate SMEM/TMEM/
@@ -483,6 +498,8 @@ class TgvGemmCuteExtKernel:
                 epi_tid,
                 c_dtype,
                 d_layout,
+                mScaleA,
+                mScaleB,
             )
 
         if cutlass.const_expr(self.use_2cta):
@@ -788,6 +805,8 @@ class TgvGemmCuteExtKernel:
         epi_tid: cutlass.Int32,  # 0..127 within the 4 EPILOG warps
         c_dtype: cutlass.Constexpr,
         d_layout: cutlass.Constexpr,
+        mScaleA: cute.Tensor,
+        mScaleB: cute.Tensor,
     ):
         # Sync with MMA's alloc_tmem (phase 0 of bar_tmem_alloc): 128 arrivals
         # from this warp + 32 from MMA = 160. tmem_base_ptr is uninitialized
@@ -929,6 +948,13 @@ class TgvGemmCuteExtKernel:
         if cutlass.const_expr(self.has_bias):
             rAcc.store(rAcc.load() + rBiasAcc.load())
 
+        # FlashInfer's per-tensor FP8 BMM applies both checkpoint scales in
+        # the FP32 epilogue before the one BF16 rounding.  Keep this separate
+        # from the BF16 path at compile time.
+        if cutlass.const_expr(self.scaled):
+            alpha = mScaleA[0].to(cutlass.Float32) * mScaleB[0].to(cutlass.Float32)
+            rAcc.store(rAcc.load() * alpha)
+
         # fp32 → bf16 cast in RMEM.
         rD.store(rAcc.load().to(c_dtype))
 
@@ -967,6 +993,8 @@ def _bmm_no_bias(
     a: cute.Tensor,  # (L, M, K) from PyTorch
     b: cute.Tensor,  # (L, K, N) from PyTorch (permuted)
     c: cute.Tensor,  # (L, M, N) from PyTorch (permuted)
+    scale_a: cute.Tensor,  # one FP32 scalar when gemm_op.scaled
+    scale_b: cute.Tensor,  # one FP32 scalar when gemm_op.scaled
     stream: cuda.CUstream,
 ):
     a = cute.make_tensor(a.iterator, cute.select(a.layout, mode=[1, 2, 0]))
@@ -974,7 +1002,7 @@ def _bmm_no_bias(
     c = cute.make_tensor(c.iterator, cute.select(c.layout, mode=[1, 2, 0]))
     # Dummy bias aliasing C — never dereferenced when has_bias=False.
     bias = cute.make_tensor(c.iterator, cute.select(c.layout, mode=[0, 1, 2]))
-    gemm_op(a, b, c, bias, stream)
+    gemm_op(a, b, c, bias, scale_a, scale_b, stream)
 
 
 @cute.experimental.jit
@@ -984,6 +1012,8 @@ def _bmm_bias(
     b: cute.Tensor,  # (L, K, N) from PyTorch (permuted)
     c: cute.Tensor,  # (L, M, N) from PyTorch (permuted)
     bias: cute.Tensor,  # (L, M, N):(0,1,0) — M-broadcast via as_strided
+    scale_a: cute.Tensor,  # dummy when gemm_op.scaled=False
+    scale_b: cute.Tensor,  # dummy when gemm_op.scaled=False
     stream: cuda.CUstream,
 ):
     a = cute.make_tensor(a.iterator, cute.select(a.layout, mode=[1, 2, 0]))
@@ -991,7 +1021,7 @@ def _bmm_bias(
     c = cute.make_tensor(c.iterator, cute.select(c.layout, mode=[1, 2, 0]))
     # After [1,2,0] permute: (M, N, L):(1, 0, 0) — matches C++ make_layout_Bias.
     bias = cute.make_tensor(bias.iterator, cute.select(bias.layout, mode=[1, 2, 0]))
-    gemm_op(a, b, c, bias, stream)
+    gemm_op(a, b, c, bias, scale_a, scale_b, stream)
 
 
 # =====================================================================
@@ -1003,6 +1033,7 @@ def _bmm_bias(
 # =====================================================================
 _TORCH_TO_CUTLASS_DTYPE = {
     torch.bfloat16: cutlass.BFloat16,
+    torch.float8_e4m3fn: cutlass.Float8E4M3FN,
 }
 
 _TORCH_TO_CUTLASS_OUT_DTYPE = {
@@ -1047,6 +1078,7 @@ def _make_compile_repr_tensors(
     dtype: torch.dtype,
     c_dtype: torch.dtype,
     has_bias: bool,
+    scaled: bool,
     a_leading: int,
     b_leading: int,
     c_leading: int,
@@ -1078,15 +1110,26 @@ def _make_compile_repr_tensors(
     b_ = from_dlpack(B_t, assumed_align=32).mark_layout_dynamic(leading_dim=b_leading)
     c_ = from_dlpack(C_t, assumed_align=32).mark_layout_dynamic(leading_dim=c_leading)
 
+    if scaled:
+        scale_a_t = torch.ones((1,), dtype=torch.float32, device="cuda")
+        scale_b_t = torch.ones((1,), dtype=torch.float32, device="cuda")
+        scale_a_ = from_dlpack(scale_a_t, assumed_align=4)
+        scale_b_ = from_dlpack(scale_b_t, assumed_align=4)
+    else:
+        # The compile-time branch removes every access to these arguments.
+        # Reuse existing tensors so the established BF16 path allocates no
+        # extra device storage and retains graph-capture behavior.
+        scale_a_, scale_b_ = a_, b_
+
     if not has_bias:
-        return a_, b_, c_, None
+        return a_, b_, c_, None, scale_a_, scale_b_
 
     # bias is per-output-feature in PyTorch terms; after the A↔B swap that
     # maps to broadcast over the kernel's N axis and L (stride (0, 1, 0)).
     bias_t = torch.empty((N,), dtype=dtype, device="cuda")
     bias_3d = bias_t.as_strided(size=(L, N, M), stride=(0, 1, 0))
     bias_ = from_dlpack(bias_3d, assumed_align=2).mark_layout_dynamic(leading_dim=1)
-    return a_, b_, c_, bias_
+    return a_, b_, c_, bias_, scale_a_, scale_b_
 
 
 def _get_compiled_cute_ext_kernel(
@@ -1099,13 +1142,14 @@ def _get_compiled_cute_ext_kernel(
     use_2cta: bool,
     use_pdl: bool,
     has_bias: bool,
+    scaled: bool,
     a_leading: int,
     b_leading: int,
     c_leading: int,
 ):
     """Compile (or fetch from cache) a TgvGemmCuteExtKernel for the given
     config + layout pattern. Returns a callable with signature
-        compiled(a_, b_, c_, [bias_,] stream)
+        compiled(a_, b_, c_, [bias_,] scale_a_, scale_b_, stream)
     accepting cute.Tensors. The same compiled binary handles any
     (M, N, K, L) consistent with the (a, b, c)_leading layout pattern
     thanks to ``mark_layout_dynamic``.
@@ -1120,6 +1164,7 @@ def _get_compiled_cute_ext_kernel(
         bool(use_2cta),
         bool(use_pdl),
         bool(has_bias),
+        bool(scaled),
         a_leading,
         b_leading,
         c_leading,
@@ -1148,12 +1193,14 @@ def _get_compiled_cute_ext_kernel(
         use_pdl=use_pdl,
         has_bias=has_bias,
         out_dtype=_TORCH_TO_CUTLASS_OUT_DTYPE[c_dtype],
+        scaled=scaled,
     )
 
-    a_, b_, c_, bias_ = _make_compile_repr_tensors(
+    a_, b_, c_, bias_, scale_a_, scale_b_ = _make_compile_repr_tensors(
         dtype,
         c_dtype,
         has_bias,
+        scaled,
         a_leading,
         b_leading,
         c_leading,
@@ -1161,9 +1208,28 @@ def _get_compiled_cute_ext_kernel(
     fake_stream = make_fake_stream()
 
     if has_bias:
-        compiled = cute_ext.compile(_bmm_bias, gemm, a_, b_, c_, bias_, fake_stream)
+        compiled = cute_ext.compile(
+            _bmm_bias,
+            gemm,
+            a_,
+            b_,
+            c_,
+            bias_,
+            scale_a_,
+            scale_b_,
+            fake_stream,
+        )
     else:
-        compiled = cute_ext.compile(_bmm_no_bias, gemm, a_, b_, c_, fake_stream)
+        compiled = cute_ext.compile(
+            _bmm_no_bias,
+            gemm,
+            a_,
+            b_,
+            c_,
+            scale_a_,
+            scale_b_,
+            fake_stream,
+        )
 
     _TGV_CUTE_EXT_COMPILE_CACHE[key] = compiled
     return compiled
@@ -1258,10 +1324,15 @@ def _run_tgv(
     out: torch.Tensor,
     pdl: bool,
     tactic: int,
+    scale_a: Optional[torch.Tensor] = None,
+    scale_b: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Dispatch one TGV GEMM: a (M, K) @ b (K, N) -> out (M, N), bias (N,)."""
     cta_m, cta_n, num_ab_stage, use_2cta = _resolve_tactic(tactic)
     has_bias = bias is not None
+    scaled = scale_a is not None or scale_b is not None
+    if scaled and (scale_a is None or scale_b is None):
+        raise ValueError("scale_a and scale_b must be provided together")
 
     a_, b_, c_, bias_, (a_leading, b_leading, c_leading) = _to_cute_swap(
         a,
@@ -1280,6 +1351,7 @@ def _run_tgv(
         use_2cta=use_2cta,
         use_pdl=bool(pdl),
         has_bias=has_bias,
+        scaled=scaled,
         a_leading=a_leading,
         b_leading=b_leading,
         c_leading=c_leading,
@@ -1287,10 +1359,17 @@ def _run_tgv(
 
     stream = cuda.CUstream(torch.cuda.current_stream(a.device).cuda_stream)
 
-    if has_bias:
-        compiled(a_, b_, c_, bias_, stream)
+    if scaled:
+        scale_a_ = from_dlpack(scale_a.reshape(1), assumed_align=4)
+        scale_b_ = from_dlpack(scale_b.reshape(1), assumed_align=4)
     else:
-        compiled(a_, b_, c_, stream)
+        # These are compile-time dead arguments in the BF16 specialization.
+        scale_a_, scale_b_ = a_, b_
+
+    if has_bias:
+        compiled(a_, b_, c_, bias_, scale_a_, scale_b_, stream)
+    else:
+        compiled(a_, b_, c_, scale_a_, scale_b_, stream)
     return out
 
 
@@ -1467,6 +1546,66 @@ def _tgv_bf16_gemm_out_fake(
     return None
 
 
+def _t4epi_fp8_gemm_out_run(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out: torch.Tensor,
+    tactic: int = -1,
+) -> None:
+    """Experimental R13 producer GEMM: [M,K] @ [K,N] -> BF16 [M,N]."""
+    if not is_sm100_supported():
+        raise RuntimeError("cutedsl_t4epi_fp8_gemm_out requires an SM10x GPU")
+    if x.device.type != "cuda" or any(
+        tensor.device != x.device for tensor in (weight, x_scale, weight_scale, out)
+    ):
+        raise ValueError("all T4EPI GEMM tensors must be on one CUDA device")
+    if x.dtype != torch.float8_e4m3fn or weight.dtype != torch.float8_e4m3fn:
+        raise ValueError("x and weight must use torch.float8_e4m3fn")
+    if x_scale.dtype != torch.float32 or weight_scale.dtype != torch.float32:
+        raise ValueError("x_scale and weight_scale must use torch.float32")
+    if out.dtype != torch.bfloat16:
+        raise ValueError("out must use torch.bfloat16")
+    if x.ndim != 2 or weight.ndim != 2 or out.ndim != 2:
+        raise ValueError("x, weight, and out must be 2-D")
+    if x_scale.numel() != 1 or weight_scale.numel() != 1:
+        raise ValueError("T4EPI supports per-tensor scalar scales only")
+    if x.stride(1) != 1 or weight.stride(1) != 1 or not out.is_contiguous():
+        raise ValueError("x, weight, and out must be row-major contiguous")
+    m, k = x.shape
+    if weight.shape[0] != k or out.shape != (m, weight.shape[1]):
+        raise ValueError("expected x[M,K], weight[K,N], and out[M,N]")
+    if m == 0:
+        return None
+    if k % _TGV_CUTE_EXT_CTA_K or weight.shape[1] % 128:
+        raise ValueError("K and N must be multiples of 128")
+    if tactic < 0:
+        tactic = _T4EPI_FP8_DEFAULT_TACTIC
+    _run_tgv(
+        x,
+        weight,
+        None,
+        out,
+        pdl=True,
+        tactic=tactic,
+        scale_a=x_scale,
+        scale_b=weight_scale,
+    )
+    return None
+
+
+def _t4epi_fp8_gemm_out_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out: torch.Tensor,
+    tactic: int = -1,
+) -> None:
+    return None
+
+
 direct_register_custom_op(
     op_name="cutedsl_tgv_bf16_gemm",
     op_func=_tgv_bf16_gemm_run,
@@ -1479,6 +1618,13 @@ direct_register_custom_op(
     op_func=_tgv_bf16_gemm_out_run,
     mutates_args=["out"],
     fake_impl=_tgv_bf16_gemm_out_fake,
+)
+
+direct_register_custom_op(
+    op_name="cutedsl_t4epi_fp8_gemm_out",
+    op_func=_t4epi_fp8_gemm_out_run,
+    mutates_args=["out"],
+    fake_impl=_t4epi_fp8_gemm_out_fake,
 )
 
 
@@ -1501,4 +1647,30 @@ def cutedsl_bf16_gemm_out(
 ) -> torch.Tensor:
     """Write the BF16 GEMM directly into a caller-owned contiguous tensor."""
     torch.ops.sglang.cutedsl_tgv_bf16_gemm_out(x, weight, out, bias)
+    return out
+
+
+@debug_kernel_api
+def cutedsl_t4epi_fp8_gemm_out(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out: torch.Tensor,
+    tactic: int = -1,
+) -> torch.Tensor:
+    """Testing/tuning entry point for the R13 E4M3 output projection.
+
+    ``weight`` follows FlashInfer's static-FP8 convention: it is row-major
+    ``[K, N]``, unlike :func:`cutedsl_bf16_gemm`'s ``[N, K]`` weight.
+    Production routing remains unchanged until the overlap gate passes.
+    """
+    torch.ops.sglang.cutedsl_t4epi_fp8_gemm_out(
+        x,
+        weight,
+        x_scale,
+        weight_scale,
+        out,
+        tactic,
+    )
     return out
