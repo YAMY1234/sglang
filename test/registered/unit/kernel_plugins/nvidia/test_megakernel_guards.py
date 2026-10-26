@@ -7,15 +7,17 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.kernels.plugin_kernels.nvidia import spec as registry
+from sglang.srt.environ import envs
 from sglang.srt.kernel_plugins.nvidia import binding
 from sglang.srt.kernel_plugins.nvidia.binding import (
     megakernel_disable_reasons,
 )
+from sglang.srt.layers.attention.q35_cp_lite import cp_lite_requested
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _fakes import ARCH, ISA, server_args  # noqa: E402
+from _fakes import ARCH, ISA, server_args
 
 register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
 
@@ -50,6 +52,15 @@ class TestMegakernelGuards(CustomTestCase):
 
         self.assertTrue(tp_reasons("_fakes:SPEC"))
         self.assertEqual(tp_reasons("_fakes:ANY_TP"), [])
+
+    def test_cp_lite_requires_a_cp_slot(self):
+        with envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override(()):
+            self.assertFalse(cp_lite_requested())
+        with envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override(("mka",)):
+            self.assertFalse(cp_lite_requested())
+        for slot in ("skv2_cp", "draft_q1_cp", "draft_skv2_cp"):
+            with envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override((slot,)):
+                self.assertTrue(cp_lite_requested())
 
 
 if __name__ == "__main__":

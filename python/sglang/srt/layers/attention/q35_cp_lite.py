@@ -1,0 +1,968 @@
+"""Read-split context parallelism ("CP-lite") for TRT-LLM MHA decode-kernel attention.
+
+When the TP size exceeds the KV head count, each KV head is replicated on the ``cp``
+ranks of its KV group (``cp = tp // kv_heads``) and every rank reads the whole KV of its
+head. CP-lite keeps the KV cache as it is (every rank still writes every token) and
+splits the read: page ``p`` of a request's context prefix is read by group rank
+``p % cp`` only, for every query head of the group. Per call:
+
+1. ``_cp_gather_q``: all-gather of the group's FP8 queries through peer stores.
+2. TRT-LLM GenMHA (FlashInfer) over the owned prefix pages, the ``q_len`` rows folded
+   with the group heads into one query row (no causal effect on the prefix), with LSE.
+3. ``_cp_a2a_merge``: each rank pushes every owner its heads' partials, then merges its
+   own heads' partials with the causal ``q_len x q_len`` block of this step's rows.
+
+The exchange buffer is one symmetric-memory allocation on the attention TP group; each
+CTA signals its peers with self-resetting CAS flags, so calls stay graph capturable.
+"""
+
+from __future__ import annotations
+
+import logging
+import weakref
+
+import torch
+import triton
+import triton.language as tl
+from sglang.srt.environ import envs
+
+logger = logging.getLogger(__name__)
+
+PAGE, HEAD_DIM = 64, 256
+_MAX_ROWS = 128  # widest call: rows = requests * q_len (TP8 verify at B16: 112)
+_KINDS = 2  # flag regions: q gather, partial exchange
+# exact path's fused partial: E4M3 P with shift 8 against the exact running max (lazy rescale threshold 0), so the
+# row max maps to 2^8, exact in E4M3
+_EXACT_P_SHIFT, _EXACT_RESCALE_THRESHOLD = 8.0, 0.0
+_LL_PWORDS = 520  # LL words of one (row, source) partial: 4 heads x 128 bf16 pairs + 4 LSE, padded to 16 B
+_CP_LITE_SLOTS = frozenset({"skv2_cp", "draft_q1_cp", "draft_skv2_cp"})
+
+
+def cp_lite_requested() -> bool:
+    return bool(_CP_LITE_SLOTS.intersection(envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.get()))
+
+
+@triton.jit
+def _flat_tid():
+    return tl.inline_asm_elementwise(
+        "mov.u32 $0, %tid.x;", "=r", [], dtype=tl.uint32, is_pure=True, pack=1
+    )
+
+
+@triton.jit
+def _sync_threads():
+    tl.inline_asm_elementwise(
+        "bar.sync 0;", "=r", [], dtype=tl.int32, is_pure=False, pack=1
+    )
+
+
+@triton.jit
+def _send_release(addrs):
+    # set the peer's flag 0 -> 1 once its previous signal is consumed
+    tl.inline_asm_elementwise(
+        """
+        {
+            .reg .u32 %t;
+            .reg .pred %p;
+            send:
+                atom.global.release.sys.cas.b32 %t, [$1], 0, 1;
+                setp.eq.u32 %p, %t, 0;
+                @!%p bra send;
+        }
+        """,
+        "=r, l",
+        [addrs],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _wait_acquire(addrs):
+    # consume this rank's flag 1 -> 0
+    tl.inline_asm_elementwise(
+        """
+        {
+            .reg .u32 %t;
+            .reg .pred %p;
+            wait:
+                atom.global.sys.acquire.cas.b32 %t, [$1], 1, 0;
+                setp.eq.u32 %p, %t, 1;
+                @!%p bra wait;
+        }
+        """,
+        "=r, l",
+        [addrs],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _group_barrier(peers, me, flags_off, slot, CP: tl.constexpr):
+    """CTA-level release / acquire with the same CTA of every group rank."""
+    c = tl.arange(0, CP)
+    peer = tl.load(peers + c)
+    own = tl.load(peers + me)
+    send = (peer + flags_off + (slot * CP + me) * 4).to(tl.pointer_type(tl.uint32))
+    wait = (own + flags_off + (slot * CP + c) * 4).to(tl.pointer_type(tl.uint32))
+    if _flat_tid() < CP:
+        _send_release(send)
+        _wait_acquire(wait)
+
+
+@triton.jit
+def _cp_tables(
+    page_table,
+    pt_stride,
+    seq_lens,
+    tab,
+    tab_stride,
+    lens,
+    ncols,
+    rank,
+    QL: tl.constexpr,
+    CP: tl.constexpr,
+    PG: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """This rank's compact page table and token count over the prefix [0, L - QL)."""
+    b = tl.program_id(0)
+    cb = tl.program_id(1)
+    L = tl.load(seq_lens + b)
+    prefix = tl.maximum(L - QL, 0)
+    n_pages = (prefix + PG - 1) // PG
+    n_own = tl.maximum((n_pages - rank + CP - 1) // CP, 0)
+    j = cb * BLOCK + tl.arange(0, BLOCK)
+    m = j < ncols
+    pg = tl.load(
+        page_table + b * pt_stride + j * CP + rank, mask=m & (j < n_own), other=0
+    )
+    tl.store(tab + b * tab_stride + j, pg, mask=m)
+    if cb == 0:
+        last_tok = prefix - (n_pages - 1) * PG
+        tail = (n_own > 0) & ((n_own - 1) * CP + rank == n_pages - 1)
+        n = n_own * PG - tl.where(tail, PG - last_tok, 0)
+        # no owned page: one dummy key, dropped by the merge
+        tl.store(lens + b, tl.maximum(n, 1))
+
+
+@triton.jit
+def _cp_gather_q(
+    q,
+    q_stride,
+    peers,
+    me,
+    q_off,
+    flags_off,
+    CP: tl.constexpr,
+    WORDS: tl.constexpr,
+):
+    """Row i of this rank's queries into row i, slot me of every group rank's buffer."""
+    i = tl.program_id(0)
+    w = tl.arange(0, WORDS)
+    x = tl.load(q + i * q_stride + w)
+    for c in tl.static_range(CP):
+        base = tl.load(peers + c) + q_off + (i * CP + me) * WORDS * 4
+        tl.store(base.to(tl.pointer_type(tl.int32)) + w, x)
+    _sync_threads()
+    _group_barrier(peers, me, flags_off, i, CP)
+
+
+@triton.jit
+def _cp_a2a_merge(
+    po,
+    plse,
+    q,
+    q_stride,
+    k_cache,
+    v_cache,
+    kv_page_stride,
+    kv_tok_stride,
+    table,
+    t_stride,
+    seq_lens,
+    out,
+    out_stride,
+    peers,
+    me,
+    p_off,
+    l_off,
+    flags_off,
+    slot0,
+    bmm1,
+    bmm2,
+    QL: tl.constexpr,
+    HQ: tl.constexpr,
+    CP: tl.constexpr,
+    D: tl.constexpr,
+    PG: tl.constexpr,
+):
+    i = tl.program_id(0)
+    h = tl.arange(0, HQ)
+    d = tl.arange(0, D)
+    hd = h[:, None] * D + d[None, :]
+    # push owner c its heads' partial O (bf16) and LSE (fp32, base 2)
+    for c in tl.static_range(CP):
+        x = tl.load(po + (i * CP * HQ + c * HQ) * D + hd)
+        lse = tl.load(plse + i * CP * HQ + c * HQ + h)
+        base = tl.load(peers + c)
+        dst = (base + p_off).to(tl.pointer_type(tl.bfloat16)) + (i * CP + me) * HQ * D
+        tl.store(dst + hd, x)
+        ldst = (base + l_off).to(tl.pointer_type(tl.float32)) + (i * CP + me) * HQ
+        tl.store(ldst + h, lse)
+    _sync_threads()
+    _group_barrier(peers, me, flags_off, slot0 + i, CP)
+    _sync_threads()
+    own = tl.load(peers + me)
+    own_p = (own + p_off).to(tl.pointer_type(tl.bfloat16)) + i * CP * HQ * D
+    own_l = (own + l_off).to(tl.pointer_type(tl.float32)) + i * CP * HQ
+    b = i // QL
+    t = i % QL
+    L = tl.load(seq_lens + b)
+    # the causal block of this step's rows, for this rank's heads
+    j = tl.arange(0, 8)
+    pos = L - QL + j
+    valid = (j <= t) & (pos >= 0)
+    pos = tl.maximum(pos, 0)
+    page = tl.load(table + b * t_stride + pos // PG, mask=valid, other=0)
+    koff = page.to(tl.int64) * kv_page_stride + (pos % PG) * kv_tok_stride
+    kk = tl.load(
+        k_cache + koff[:, None] + d[None, :], mask=valid[:, None], other=0.0
+    ).to(tl.float32)
+    vv = tl.load(
+        v_cache + koff[:, None] + d[None, :], mask=valid[:, None], other=0.0
+    ).to(tl.float32)
+    qv = tl.load(q + i * q_stride + hd).to(tl.float32)
+    s = tl.sum(qv[:, None, :] * kk[None, :, :], axis=2) * bmm1
+    s = tl.where(valid[None, :], s, float("-inf"))
+    md = tl.max(s, axis=1)
+    md0 = tl.where(md > float("-inf"), md, 0.0)
+    p = tl.exp(s - md0[:, None])
+    ld = tl.sum(p, axis=1)
+    od = (
+        tl.sum(p[:, :, None] * vv[None, :, :], axis=1)
+        / tl.maximum(ld, 1e-30)[:, None]
+        * bmm2
+    )
+    lse_d = tl.where(ld > 0, md0 + tl.log(ld), float("-inf"))
+    # rank c owns a prefix page iff the prefix has more than c pages
+    n_pages = (tl.maximum(L - QL, 0) + PG - 1) // PG
+    m = lse_d
+    for c in tl.static_range(CP):
+        lc = tl.load(own_l + c * HQ + h, cache_modifier=".cg") * 0.6931471805599453
+        lc = tl.where(n_pages > c, lc, float("-inf"))
+        m = tl.maximum(m, lc)
+    m0 = tl.where(m > float("-inf"), m, 0.0)
+    w = tl.where(lse_d > float("-inf"), tl.exp(lse_d - m0), 0.0)
+    acc = od * w[:, None]
+    for c in tl.static_range(CP):
+        lc = tl.load(own_l + c * HQ + h, cache_modifier=".cg") * 0.6931471805599453
+        wc = tl.where(n_pages > c, tl.exp(lc - m0), 0.0)
+        oc = tl.load(own_p + c * HQ * D + hd, cache_modifier=".cg").to(tl.float32)
+        acc += oc * wc[:, None]
+        w += wc
+    o = acc / tl.where(w > 0, w, 1.0)[:, None]
+    tl.store(out + i * out_stride + hd, o.to(tl.bfloat16))
+
+
+@triton.jit
+def _ll_pack(flag, w):
+    return flag | (w.to(tl.int64) & 0xFFFFFFFF)
+
+
+@triton.jit
+def _ll_spin(addr, e):
+    # one thread per word: volatile reads until the word's high half is e
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .pred %p;
+            .reg .b32 %lo, %hi;
+            spin:
+            ld.volatile.global.b64 $0, [$1];
+            mov.b64 {%lo, %hi}, $0;
+            setp.ne.b32 %p, %hi, $2;
+            @%p bra spin;
+        }
+        """,
+        "=l,l,r",
+        args=[addr, e],
+        dtype=tl.int64,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _ll_wait(src, n: tl.constexpr, e):
+    """Poll n LL words (data in the low, epoch in the high half) until all carry epoch e."""
+    # each thread waits for the words it returns: with a block-wide count, a warp could leave holding a stale copy of
+    # a word another warp also held (polls narrower than the CTA); the barrier keeps every warp before the epoch store
+    v = _ll_spin(src + tl.arange(0, n), e)
+    if n > 32:
+        tl.debug_barrier()
+    return v
+
+
+@triton.jit
+def _cp_gather_q_ll(
+    q,
+    q_stride,
+    peers,
+    me,
+    ll_off,
+    q_all,
+    cnt,
+    seq_lens,
+    pre_lens,
+    CP: tl.constexpr,
+    WORDS: tl.constexpr,
+    QL: tl.constexpr,
+    FOLD: tl.constexpr,
+):
+    """LL variant of _cp_gather_q: every 4-byte word travels with the call's epoch in one 8-byte store.
+    FOLD: q_all is written source-major per request ([B, CP, QL, heads, D]) for the prefix-only fused partial,
+    and pre_lens[b] = max(L - QL, 0)."""
+    i = tl.program_id(0)
+    e = tl.load(cnt + i) + 1
+    flag = e.to(tl.int64) << 32
+    w = tl.arange(0, WORDS)
+    x = _ll_pack(flag, tl.load(q + i * q_stride + w))
+    for c in tl.static_range(CP):
+        dst = (tl.load(peers + c) + ll_off + (i * CP + me) * WORDS * 8).to(
+            tl.pointer_type(tl.int64)
+        )
+        tl.store(dst + w, x)
+    own = tl.load(peers + me) + ll_off
+    for c in tl.static_range(CP):
+        v = _ll_wait(
+            (own + (i * CP + c) * WORDS * 8).to(tl.pointer_type(tl.int64)), WORDS, e
+        )
+        if FOLD:
+            slot = ((i // QL) * CP + c) * QL + i % QL
+        else:
+            slot = i * CP + c
+        tl.store(q_all + slot * WORDS + w, (v & 0xFFFFFFFF).to(tl.int32))
+    if FOLD:  # noqa: SIM102
+        if i % QL == 0:
+            tl.store(
+                pre_lens + i // QL, tl.maximum(tl.load(seq_lens + i // QL) - QL, 0)
+            )
+    tl.store(cnt + i, e)
+
+
+@triton.jit
+def _cp_a2a_merge_ll(
+    po,
+    plse,
+    po_sr,
+    po_sc,
+    pl_sr,
+    pl_sc,
+    q,
+    q_stride,
+    k_cache,
+    v_cache,
+    kv_page_stride,
+    kv_tok_stride,
+    table,
+    t_stride,
+    seq_lens,
+    out,
+    out_stride,
+    peers,
+    me,
+    ll_off,
+    cnt,
+    bmm1,
+    bmm2,
+    QL: tl.constexpr,
+    HQ: tl.constexpr,
+    CP: tl.constexpr,
+    D: tl.constexpr,
+    PG: tl.constexpr,
+    NWP: tl.constexpr,
+):
+    """LL variant of _cp_a2a_merge; po / plse are read as int32 words, row / member strides po_sr / po_sc (words)
+    and pl_sr / pl_sc. Online LSE merge of the causal block and the CP partials as they arrive."""
+    i = tl.program_id(0)
+    e = tl.load(cnt + i) + 1
+    flag = e.to(tl.int64) << 32
+    NO: tl.constexpr = HQ * D // 2
+    hw = tl.arange(0, NO)
+    h = tl.arange(0, HQ)
+    d = tl.arange(0, D)
+    hd = h[:, None] * D + d[None, :]
+    for c in tl.static_range(CP):
+        w = _ll_pack(flag, tl.load(po + i * po_sr + c * po_sc + hw))
+        lw = _ll_pack(flag, tl.load(plse + i * pl_sr + c * pl_sc + h))
+        dst = (tl.load(peers + c) + ll_off + (i * CP + me) * NWP * 8).to(
+            tl.pointer_type(tl.int64)
+        )
+        tl.store(dst + hw, w)
+        tl.store(dst + NO + h, lw)
+    b = i // QL
+    t = i % QL
+    L = tl.load(seq_lens + b)
+    j = tl.arange(0, 8)
+    pos = L - QL + j
+    valid = (j <= t) & (pos >= 0)
+    pos = tl.maximum(pos, 0)
+    page = tl.load(table + b * t_stride + pos // PG, mask=valid, other=0)
+    koff = page.to(tl.int64) * kv_page_stride + (pos % PG) * kv_tok_stride
+    kk = tl.load(
+        k_cache + koff[:, None] + d[None, :], mask=valid[:, None], other=0.0
+    ).to(tl.float32)
+    vv = tl.load(
+        v_cache + koff[:, None] + d[None, :], mask=valid[:, None], other=0.0
+    ).to(tl.float32)
+    qv = tl.load(q + i * q_stride + hd).to(tl.float32)
+    s = tl.sum(qv[:, None, :] * kk[None, :, :], axis=2) * bmm1
+    s = tl.where(valid[None, :], s, float("-inf"))
+    md = tl.max(s, axis=1)
+    md0 = tl.where(md > float("-inf"), md, 0.0)
+    p = tl.exp(s - md0[:, None])
+    ld = tl.sum(p, axis=1)
+    acc = tl.sum(p[:, :, None] * vv[None, :, :], axis=1) * bmm2
+    m = tl.where(ld > 0, md0, float("-inf"))
+    wsum = ld
+    n_pages = (tl.maximum(L - QL, 0) + PG - 1) // PG
+    own = tl.load(peers + me) + ll_off
+    for c in tl.static_range(CP):
+        src = (own + (i * CP + c) * NWP * 8).to(tl.pointer_type(tl.int64))
+        v = _ll_wait(src, NO, e)
+        lv = _ll_wait(src + NO, HQ, e)
+        lc = (lv & 0xFFFFFFFF).to(tl.int32).to(
+            tl.float32, bitcast=True
+        ) * 0.6931471805599453
+        lc = tl.where(n_pages > c, lc, float("-inf"))
+        wd = (v & 0xFFFFFFFF).to(tl.uint32)
+        lo = (wd << 16).to(tl.float32, bitcast=True)
+        hi = (wd & 0xFFFF0000).to(tl.float32, bitcast=True)
+        oc = tl.reshape(tl.join(lo, hi), (HQ, D))
+        mn = tl.maximum(m, lc)
+        mn0 = tl.where(mn > float("-inf"), mn, 0.0)
+        a_old = tl.where(m > float("-inf"), tl.exp(m - mn0), 0.0)
+        a_new = tl.where(lc > float("-inf"), tl.exp(lc - mn0), 0.0)
+        acc = acc * a_old[:, None] + oc * a_new[:, None]
+        wsum = wsum * a_old + a_new
+        m = mn
+    o = acc / tl.where(wsum > 0, wsum, 1.0)[:, None]
+    tl.store(out + i * out_stride + hd, o.to(tl.bfloat16))
+    tl.store(cnt + i, e)
+
+
+@triton.jit
+def _cp_a2a_merge4_ll(
+    po,
+    plse,
+    out,
+    out_stride,
+    peers,
+    me,
+    ll_off,
+    cnt,
+    HQ: tl.constexpr,
+    CP: tl.constexpr,
+    D: tl.constexpr,
+    NWP: tl.constexpr,
+):
+    """_cp_a2a_merge_ll for fused partials, which already hold the causal block (O = 0 / LSE = -inf where a rank
+    sees no key): push, then a base-2 online LSE merge of the CP partials only."""
+    i = tl.program_id(0)
+    e = tl.load(cnt + i) + 1
+    flag = e.to(tl.int64) << 32
+    NO: tl.constexpr = HQ * D // 2
+    hw = tl.arange(0, NO)
+    h = tl.arange(0, HQ)
+    d = tl.arange(0, D)
+    for c in tl.static_range(CP):
+        w = _ll_pack(flag, tl.load(po + (i * CP * HQ + c * HQ) * (D // 2) + hw))
+        lw = _ll_pack(flag, tl.load(plse + i * CP * HQ + c * HQ + h))
+        dst = (tl.load(peers + c) + ll_off + (i * CP + me) * NWP * 8).to(
+            tl.pointer_type(tl.int64)
+        )
+        tl.store(dst + hw, w)
+        tl.store(dst + NO + h, lw)
+    m = tl.full([HQ], float("-inf"), tl.float32)
+    wsum = tl.zeros([HQ], dtype=tl.float32)
+    acc = tl.zeros([HQ, D], dtype=tl.float32)
+    own = tl.load(peers + me) + ll_off
+    for c in tl.static_range(CP):
+        src = (own + (i * CP + c) * NWP * 8).to(tl.pointer_type(tl.int64))
+        v = _ll_wait(src, NO, e)
+        lv = _ll_wait(src + NO, HQ, e)
+        lc = (lv & 0xFFFFFFFF).to(tl.int32).to(tl.float32, bitcast=True)
+        wd = (v & 0xFFFFFFFF).to(tl.uint32)
+        lo = (wd << 16).to(tl.float32, bitcast=True)
+        hi = (wd & 0xFFFF0000).to(tl.float32, bitcast=True)
+        oc = tl.reshape(tl.join(lo, hi), (HQ, D))
+        mn = tl.maximum(m, lc)
+        mn0 = tl.where(mn > float("-inf"), mn, 0.0)
+        a_old = tl.where(m > float("-inf"), tl.exp2(m - mn0), 0.0)
+        a_new = tl.where(lc > float("-inf"), tl.exp2(lc - mn0), 0.0)
+        acc = acc * a_old[:, None] + oc * a_new[:, None]
+        wsum = wsum * a_old + a_new
+        m = mn
+    o = acc / tl.where(wsum > 0, wsum, 1.0)[:, None]
+    tl.store(out + i * out_stride + h[:, None] * D + d[None, :], o.to(tl.bfloat16))
+    tl.store(cnt + i, e)
+
+
+class CpLite:
+    """One process's exchange buffer and scratch, shared by every TRT-LLM MHA backend
+    (target and draft) of the process; built collectively on the attention TP group."""
+
+    _instance: CpLite | None = None
+
+    def __init__(
+        self, group, tp_rank: int, tp_size: int, cp: int, q_heads: int, device
+    ):
+        import torch.distributed._symmetric_memory as symm_mem
+
+        self.cp, self.hq, self.device = cp, q_heads, torch.device(device)
+        self.me = tp_rank % cp
+        g0 = tp_rank - self.me
+        self.min_bs = 2
+        self.q_bytes = _MAX_ROWS * cp * q_heads * HEAD_DIM  # fp8
+        self.p_off = self.q_bytes
+        self.p_bytes = _MAX_ROWS * cp * q_heads * HEAD_DIM * 2  # bf16
+        self.l_off = self.p_off + self.p_bytes
+        self.l_bytes = _MAX_ROWS * cp * q_heads * 4
+        self.f_off = self.l_off + self.l_bytes
+        self.llq_off = self.f_off + _KINDS * _MAX_ROWS * cp * 4
+        self.llp_off = self.llq_off + _MAX_ROWS * cp * (q_heads * HEAD_DIM // 4) * 8
+        total = self.llp_off + _MAX_ROWS * cp * _LL_PWORDS * 8
+        self.ll = q_heads * HEAD_DIM // 2 + q_heads <= _LL_PWORDS
+        self.cnt = torch.zeros(_KINDS, _MAX_ROWS, dtype=torch.int32, device=self.device)
+        self.sms = torch.cuda.get_device_properties(self.device).multi_processor_count
+        self.fused = self.ll
+        self.exact = self.fused
+        if self.fused:
+            from sglang.srt.layers.attention import q35_cp_fused
+
+            # grid-barrier counters and workspace: persistent, allocated before any capture
+            q35_cp_fused.q35_cp_fused_prepare(self.device, self.sms)
+        if symm_mem.get_backend(self.device) is None:
+            symm_mem.set_backend("NCCL")
+        self.buf = symm_mem.empty((total,), dtype=torch.uint8, device=self.device)
+        self.buf.zero_()
+        torch.cuda.synchronize(self.device)
+        handle = symm_mem.rendezvous(self.buf, group)
+        assert handle.rank == tp_rank, (handle.rank, tp_rank)
+        self.peers = torch.tensor(
+            [int(p) for p in handle.buffer_ptrs[g0 : g0 + cp]],
+            dtype=torch.int64,
+            device=self.device,
+        )
+        self._handle = handle
+        self.q_all = (
+            self.buf[: self.q_bytes]
+            .view(torch.float8_e4m3fn)
+            .view(_MAX_ROWS, cp * q_heads, HEAD_DIM)
+        )
+        rows = _MAX_ROWS
+        self.po = torch.empty(
+            rows, cp * q_heads, HEAD_DIM, dtype=torch.bfloat16, device=self.device
+        )
+        self.plse = torch.empty(
+            rows, cp * q_heads, dtype=torch.float32, device=self.device
+        )
+        self.counter = torch.zeros(1 << 16, dtype=torch.int32, device=self.device)
+        # exact path: the fused kernel's [cp, rows, heads, D] partials and the prefix lengths the gather writes
+        self.po_x = torch.empty(
+            cp, rows, q_heads, HEAD_DIM, dtype=torch.bfloat16, device=self.device
+        )
+        self.pl_x = torch.empty(
+            cp, rows, q_heads, dtype=torch.float32, device=self.device
+        )
+        self.pre_lens = torch.zeros(rows, dtype=torch.int32, device=self.device)
+        self._logged: set = set()
+        # (page table, lengths, q_len) -> [tables, owned lengths, forward, last layer id that used them]
+        self._tabs: dict = {}
+        torch.distributed.barrier(group)
+        logger.info(
+            "TRT-L1 CP-lite: tp rank %d, KV group of %d (group rank %d), min batch %d, LL %s, fused %s",
+            tp_rank,
+            cp,
+            self.me,
+            self.min_bs,
+            self.ll,
+            self.fused,
+        )
+        logger.info(
+            "TRT-L1 CP-lite exact (prefix-only fused partial + fp32 causal block): %s",
+            self.exact,
+        )
+
+    @classmethod
+    def maybe_create(cls, config, device) -> CpLite | None:
+        from sglang.srt.runtime_context import get_parallel
+
+        if cls._instance is not None:
+            return cls._instance
+        par = get_parallel()
+        tp, rank = par.attn_tp_size, par.attn_tp_rank
+        kv = config.get_total_num_kv_heads()
+        if tp <= kv or tp % kv or config.head_dim != HEAD_DIM:
+            return None
+        cp = tp // kv
+        q_heads = config.num_attention_heads // tp
+        if cp not in (2, 4, 8) or q_heads * cp > 16:
+            return None
+        group = par.attn_tp_group.device_group
+        cls._instance = cls(group, rank, tp, cp, q_heads, device)
+        return cls._instance
+
+    def _tables(self, page_table, seq_lens, q_len, forward_batch, layer_id):
+        """Once per forward: reused only by later layers of the same forward, so every capture and
+        every single-layer draft step computes its own."""
+        b = seq_lens.shape[0]
+        ncols = triton.cdiv(page_table.shape[1], self.cp)
+        key = (page_table.data_ptr(), page_table.shape, seq_lens.data_ptr(), b, q_len)
+        ent = self._tabs.get(key)
+        if ent is not None and ent[2]() is forward_batch and layer_id > ent[3]:
+            ent[3] = layer_id
+            return ent[0], ent[1], ncols * PAGE
+        if len(self._tabs) > 64:
+            self._tabs.clear()
+        tab = torch.empty(b, ncols, dtype=torch.int32, device=self.device)
+        lens = torch.empty(b, dtype=torch.int32, device=self.device)
+        self._tabs[key] = [tab, lens, weakref.ref(forward_batch), layer_id]
+        _cp_tables[(b, triton.cdiv(ncols, 256))](
+            page_table,
+            page_table.stride(0),
+            seq_lens,
+            tab,
+            tab.stride(0),
+            lens,
+            ncols,
+            self.me,
+            QL=q_len,
+            CP=self.cp,
+            PG=PAGE,
+            BLOCK=256,
+        )
+        return tab, lens, ncols * PAGE
+
+    def attend(
+        self,
+        q: torch.Tensor,
+        kv_cache,
+        page_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        q_len: int,
+        bmm1_scale,
+        bmm2_scale,
+        workspace: torch.Tensor,
+        layer,
+        forward_batch,
+    ) -> torch.Tensor | None:
+        """CP-lite attention of this rank's heads: [rows, heads, head_dim] bf16, or None
+        where the call is not served (decided by shapes only, so every rank agrees)."""
+        import flashinfer
+
+        rows = q.shape[0]
+        b = seq_lens.shape[0]
+        if (
+            q.dtype != torch.float8_e4m3fn
+            or q.dim() != 3
+            or q.shape[1] != self.hq
+            or q.shape[2] != HEAD_DIM
+            or layer.tp_k_head_num != 1
+            or layer.sliding_window_size not in (None, -1)
+            or rows != b * q_len
+            or b < self.min_bs
+            or rows > _MAX_ROWS
+            or not isinstance(bmm1_scale, float)
+            or not isinstance(bmm2_scale, float)
+        ):
+            return None
+        if (b, q_len) not in self._logged:
+            self._logged.add((b, q_len))
+            logger.info(
+                "TRT-L1 CP-lite engaged: %d requests x %d rows (layer %d)",
+                b,
+                q_len,
+                layer.layer_id,
+            )
+        k_cache, v_cache = kv_cache
+        q = q if q.is_contiguous() else q.contiguous()
+        words = self.hq * HEAD_DIM // 4
+        exact = self.exact and self._exact_supported(q_len, b)
+        if self.ll:
+            _cp_gather_q_ll[(rows,)](
+                q.view(torch.int32),
+                words,
+                self.peers,
+                self.me,
+                self.llq_off,
+                self.q_all.view(torch.int32),
+                self.cnt[0],
+                seq_lens,
+                self.pre_lens,
+                CP=self.cp,
+                WORDS=words,
+                QL=q_len,
+                FOLD=exact,
+                num_warps=4,
+            )
+        else:
+            _cp_gather_q[(rows,)](
+                q.view(torch.int32),
+                words,
+                self.peers,
+                self.me,
+                0,
+                self.f_off,
+                CP=self.cp,
+                WORDS=words,
+                num_warps=4,
+            )
+        if exact:
+            return self._exact(
+                q,
+                k_cache,
+                v_cache,
+                page_table,
+                seq_lens,
+                q_len,
+                b,
+                rows,
+                bmm1_scale,
+                bmm2_scale,
+            )
+        if self.fused and not self.exact:
+            out = self._fused(
+                k_cache,
+                v_cache,
+                page_table,
+                seq_lens,
+                q_len,
+                b,
+                rows,
+                bmm1_scale,
+                bmm2_scale,
+            )
+            if out is not None:
+                return out
+        tab, lens, max_kv = self._tables(
+            page_table, seq_lens, q_len, forward_batch, layer.layer_id
+        )
+        gh = self.cp * self.hq
+        po = self.po[:rows].view(b, q_len * gh, HEAD_DIM)
+        plse = self.plse[:rows].view(b, q_len * gh)
+        flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+            query=self.q_all[:rows].view(b, q_len * gh, HEAD_DIM),
+            kv_cache=(k_cache, v_cache),
+            workspace_buffer=workspace,
+            block_tables=tab,
+            seq_lens=lens,
+            max_seq_len=max_kv,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            out=po,
+            lse=plse,
+            q_len_per_req=1,
+            multi_ctas_kv_counter_buffer=self.counter,
+        )
+        out = torch.empty(
+            rows, self.hq, HEAD_DIM, dtype=torch.bfloat16, device=q.device
+        )
+        if self.ll:
+            gh_w = self.cp * self.hq * HEAD_DIM // 2
+            _cp_a2a_merge_ll[(rows,)](
+                self.po.view(torch.int32),
+                self.plse.view(torch.int32),
+                gh_w,
+                self.hq * HEAD_DIM // 2,
+                self.cp * self.hq,
+                self.hq,
+                q,
+                q.stride(0),
+                k_cache,
+                v_cache,
+                k_cache.stride(0),
+                k_cache.stride(2),
+                page_table,
+                page_table.stride(0),
+                seq_lens,
+                out,
+                out.stride(0),
+                self.peers,
+                self.me,
+                self.llp_off,
+                self.cnt[1],
+                bmm1_scale,
+                bmm2_scale,
+                QL=q_len,
+                HQ=self.hq,
+                CP=self.cp,
+                D=HEAD_DIM,
+                PG=PAGE,
+                NWP=_LL_PWORDS,
+                num_warps=8,
+            )
+        else:
+            _cp_a2a_merge[(rows,)](
+                self.po,
+                self.plse,
+                q,
+                q.stride(0),
+                k_cache,
+                v_cache,
+                k_cache.stride(0),
+                k_cache.stride(2),
+                page_table,
+                page_table.stride(0),
+                seq_lens,
+                out,
+                out.stride(0),
+                self.peers,
+                self.me,
+                self.p_off,
+                self.l_off,
+                self.f_off,
+                _MAX_ROWS,
+                bmm1_scale,
+                bmm2_scale,
+                QL=q_len,
+                HQ=self.hq,
+                CP=self.cp,
+                D=HEAD_DIM,
+                PG=PAGE,
+                num_warps=8,
+            )
+        return out
+
+    def _exact_supported(self, q_len, b):
+        from sglang.srt.layers.attention import q35_cp_fused as F
+
+        return F.q35_cp_fused_supported(1, self.cp, q_len * self.hq, b, self.sms)
+
+    def _exact(
+        self,
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        seq_lens,
+        q_len,
+        b,
+        rows,
+        bmm1_scale,
+        bmm2_scale,
+    ):
+        """The fused partial on the context prefix (q_len folded into the heads: one query row of q_len x heads per
+        request, no causal effect), then the trtllm-gen path's merge with the causal block in fp32."""
+        from sglang.srt.layers.attention import q35_cp_fused as F
+
+        cp, hq = self.cp, self.hq
+        F.q35_cp_fused_partial(
+            self.q_all[:rows].view(b, cp, q_len * hq, HEAD_DIM).permute(1, 0, 2, 3),
+            k_cache,
+            page_table,
+            self.pre_lens,
+            1,
+            self.me,
+            cp,
+            bmm1_scale,
+            bmm2_scale,
+            self.po_x[:, :rows].view(cp, b, q_len * hq, HEAD_DIM),
+            self.pl_x[:, :rows].view(cp, b, q_len * hq),
+            sm_count=self.sms,
+            enable_pdl=False,
+            v_pool=v_cache,
+            p_shift=_EXACT_P_SHIFT,
+            rescale_threshold=_EXACT_RESCALE_THRESHOLD,
+        )
+        out = torch.empty(rows, hq, HEAD_DIM, dtype=torch.bfloat16, device=self.device)
+        _cp_a2a_merge_ll[(rows,)](
+            self.po_x.view(torch.int32),
+            self.pl_x.view(torch.int32),
+            hq * HEAD_DIM // 2,
+            self.po_x.stride(0) // 2,
+            hq,
+            self.pl_x.stride(0),
+            q,
+            q.stride(0),
+            k_cache,
+            v_cache,
+            k_cache.stride(0),
+            k_cache.stride(2),
+            page_table,
+            page_table.stride(0),
+            seq_lens,
+            out,
+            out.stride(0),
+            self.peers,
+            self.me,
+            self.llp_off,
+            self.cnt[1],
+            bmm1_scale,
+            bmm2_scale,
+            QL=q_len,
+            HQ=hq,
+            CP=cp,
+            D=HEAD_DIM,
+            PG=PAGE,
+            NWP=_LL_PWORDS,
+            num_warps=8,
+        )
+        return out
+
+    def _fused(
+        self,
+        k_cache,
+        v_cache,
+        page_table,
+        seq_lens,
+        q_len,
+        b,
+        rows,
+        bmm1_scale,
+        bmm2_scale,
+    ):
+        """The fused partial (TRT-LLM's kernel) on the gathered queries, then the 4-way merge; None where the kernel
+        does not take the shape (decided by shapes only)."""
+        from sglang.srt.layers.attention import q35_cp_fused as F
+
+        if not F.q35_cp_fused_supported(q_len, self.cp, self.hq, b, self.sms):
+            return None
+        cp, hq = self.cp, self.hq
+        F.q35_cp_fused_partial(
+            self.q_all[:rows].view(rows, cp, hq, HEAD_DIM).permute(1, 0, 2, 3),
+            k_cache,
+            page_table,
+            seq_lens,
+            q_len,
+            self.me,
+            cp,
+            bmm1_scale,
+            bmm2_scale,
+            self.po[:rows].view(rows, cp, hq, HEAD_DIM).permute(1, 0, 2, 3),
+            self.plse[:rows].view(rows, cp, hq).permute(1, 0, 2),
+            sm_count=self.sms,
+            enable_pdl=False,
+            v_pool=v_cache,
+        )
+        out = torch.empty(rows, hq, HEAD_DIM, dtype=torch.bfloat16, device=self.device)
+        _cp_a2a_merge4_ll[(rows,)](
+            self.po.view(torch.int32),
+            self.plse.view(torch.int32),
+            out,
+            out.stride(0),
+            self.peers,
+            self.me,
+            self.llp_off,
+            self.cnt[1],
+            HQ=hq,
+            CP=cp,
+            D=HEAD_DIM,
+            NWP=_LL_PWORDS,
+            num_warps=8,
+        )
+        return out
