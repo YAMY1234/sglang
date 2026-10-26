@@ -24,7 +24,9 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.runner_backend import ab_variants
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )
@@ -98,9 +100,16 @@ def resolve_decode_backend(
     if full_backend_cls is None:
         full_backend_cls = FullCudaGraphBackend
 
+    kwargs = {}
+    if (
+        envs.SGLANG_R14_KSMALL_SINGLE_REPLAY.get()
+        or ab_variants.env_any("SGLANG_R14_KSMALL_SINGLE_REPLAY", "1")
+    ) and issubclass(full_backend_cls, FullCudaGraphBackend):
+        kwargs["keep_raw_graph"] = True
     return full_backend_cls(
         cuda_graph_runner,
         enable_memory_saver=enable_memory_saver,
+        **kwargs,
     )
 
 

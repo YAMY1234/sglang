@@ -38,6 +38,10 @@ from typing import Any, Dict, List
 
 import torch
 
+from sglang.srt.model_executor.runner_backend_utils.child_graph_capture import (
+    current_child_graph_capture,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -65,6 +69,13 @@ class MetadataGlueGraph:
     def run(self, attn_backend, fb_view, key) -> None:
         """Run ``init_forward_metadata_out_graph`` for this replay, through the
         captured glue graph once it is ready."""
+        capture = current_child_graph_capture()
+        if capture is not None and capture.splice:
+            # The enclosing step graph records these device-only ops directly;
+            # replaying this helper graph inside that capture would freeze its
+            # Python-installed metadata object.
+            attn_backend.init_forward_metadata_out_graph(fb_view)
+            return
         st = self._states.get(key)
         if st is None:
             st = {"warmups": 0, "graph": None, "meta": None}

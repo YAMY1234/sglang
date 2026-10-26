@@ -161,6 +161,19 @@ logger = logging.getLogger(__name__)
 # instead of right after the draft extend, so it can overlap the draft extend and the next round's draft steps.
 _PLB_LATE_JOIN = envs.SGLANG_PLB_COMMIT_LATE_JOIN.get()
 
+_R14_SINGLE_REPLAY_ENV = "SGLANG_R14_KSMALL_SINGLE_REPLAY"
+
+
+def _r14_single_replay_requested() -> bool:
+    return envs.SGLANG_R14_KSMALL_SINGLE_REPLAY.get() or ab_variants.env_any(
+        _R14_SINGLE_REPLAY_ENV, "1"
+    )
+
+
+def _r14_single_replay_active() -> bool:
+    default = "1" if envs.SGLANG_R14_KSMALL_SINGLE_REPLAY.get() else "0"
+    return ab_variants.env(_R14_SINGLE_REPLAY_ENV, default).lower() in ("1", "true")
+
 
 def _qsa_index_share_requested(hf_config) -> bool:
     """--json-model-override-args writes top-level hf_config attributes, while
@@ -1388,6 +1401,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
     # publishes the new lengths to, and the gated comparison with the eager path
     _rs_d1_published: Optional[torch.Tensor] = None
     _rs_d1_check: Optional[DraftExtendInputsCheck] = None
+    step_cuda_graph_runner = None
 
     def __init__(
         self,
@@ -1615,6 +1629,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def init_cuda_graphs(self):
         super().init_cuda_graphs()
         self._init_step2()
+        if _r14_single_replay_requested() and self._hosts_draft:
+            from sglang.srt.speculative.eagle_step_cuda_graph_runner import (
+                EagleStepCudaGraphRunner,
+            )
+
+            self.step_cuda_graph_runner = EagleStepCudaGraphRunner(self)
         # Build adaptive runtime states after target and draft backends exist.
         if self.adaptive_controller is not None:
             with (
@@ -1677,6 +1697,18 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     )
         else:
             self.activate_step_by_batch(batch.seq_lens.shape[0])
+
+            if (
+                _r14_single_replay_active()
+                and self.step_cuda_graph_runner is not None
+            ):
+                batch_output = self.step_cuda_graph_runner.try_replay(
+                    batch, on_publish, grammar_barrier, pp_proxy_tensors
+                )
+                if batch_output is not None:
+                    if ab_variants.enabled():
+                        ab_variants.advance()
+                    return batch_output
 
             if batch.spec_info is None:
                 capture_mode = (

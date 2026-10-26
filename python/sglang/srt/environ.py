@@ -1322,6 +1322,9 @@ class Envs:
     # grid-dependency wait but before reading/materializing the mailbox. This is intentionally distinct from the
     # previously killed PLB Lamport entry-trigger/poll-before-wait ordering.
     SGLANG_R14_KSMALL_E6V2 = EnvBool(False)
+    # R14-KSMALL: capture one complete EAGLE decode round as a single replay.
+    # Q35MF_AB_VARIANTS may change this at replay-block boundaries.
+    SGLANG_R14_KSMALL_SINGLE_REPLAY = EnvBool(False)
     # With CP_UNGATED: the q gather of an ungated exact call launches as a programmatic dependent of the kernel that
     # wrote q (it releases the fused partial, then waits), so the partial's prefix KV requests start under that kernel.
     SGLANG_PERFLL_CP_GATHER_PDL = EnvBool(False)

@@ -14,6 +14,11 @@ import torch
 
 from sglang.kernels.ops.memory.small_field_copy import SmallFieldCopyPlan
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.runner_backend import ab_variants
+from sglang.srt.model_executor.runner_backend_utils.child_graph_capture import (
+    capture_override,
+    current_child_graph_capture,
+)
 from sglang.srt.speculative import perfll_step2
 from sglang.srt.utils import host_trace
 
@@ -455,6 +460,16 @@ class _PostVerifyGraphs:
         self._sim_turn = 0
         # the slot of the last run that returned outputs
         self.last_slot: Optional[SimpleNamespace] = None
+        if (
+            envs.SGLANG_R14_KSMALL_SINGLE_REPLAY.get()
+            or ab_variants.env_any("SGLANG_R14_KSMALL_SINGLE_REPLAY", "1")
+        ):
+            self._ensure_streams()
+
+    def _ensure_streams(self) -> None:
+        if self._side_stream is None:
+            self._side_stream = torch.cuda.Stream()
+            self._main_done, self._commit_done = torch.cuda.Event(), torch.cuda.Event()
 
     def run(
         self, *, key: tuple, inputs: dict, make_slot: Callable, sim_max_len: int
@@ -473,7 +488,14 @@ class _PostVerifyGraphs:
         if host_trace.ENABLED:
             host_trace.mark(host_trace.PVB)
         slot = state.slots[turn]
-        if _STAGED_SEQ_LENS and slot is not None and slot.graph is not None:
+        capture = current_child_graph_capture()
+        enclosing = capture is not None and capture.splice
+        if (
+            _STAGED_SEQ_LENS
+            and not enclosing
+            and slot is not None
+            and slot.graph is not None
+        ):
             _check_lengths_outlive(slot, inputs["seq_lens"])
         if slot is None:
             staged = {name: src.clone() for name, src in inputs.items()}
@@ -487,11 +509,22 @@ class _PostVerifyGraphs:
                 SmallFieldCopyPlan(allow_pinned_src=True) if _ONE_LAUNCH_LOAD else None
             )
         self._load(slot, inputs, sim_len)
-        if sim_len is not None:
+        if sim_len is not None and sim_turn is not None:
             self._record_sim_done(sim_turn)
         if host_trace.ENABLED:
             host_trace.mark(host_trace.PVC)
         self.last_slot = slot
+        if enclosing:
+            if self._side_stream is None:
+                raise RuntimeError("single-replay post-verify streams were not initialized")
+            outputs = self._body(slot)
+            self._main_done.record()
+            self._side_stream.wait_event(self._main_done)
+            with torch.cuda.stream(self._side_stream):
+                self._commit(slot, outputs)
+            self._commit_done.record(self._side_stream)
+            self._commit_pending = True
+            return outputs[:6]
         if slot.graph is None:
             if state.warmups < _NUM_WARMUP * 2:
                 state.warmups += 1
@@ -535,6 +568,7 @@ class _PostVerifyGraphs:
         if sim_len is not None:
             staged["sim_accept_len"].copy_(sim_len, non_blocking=True)
 
+    @capture_override("post_verify_sim_len")
     def _draw_sim_len(
         self, max_len: int
     ) -> tuple[Optional[torch.Tensor], Optional[int]]:
@@ -578,8 +612,7 @@ class _PostVerifyGraphs:
 
         if self._pool is None:
             self._pool = torch.cuda.graph_pool_handle()
-            self._side_stream = torch.cuda.Stream()
-            self._main_done, self._commit_done = torch.cuda.Event(), torch.cuda.Event()
+        self._ensure_streams()
         graph = torch.cuda.CUDAGraph()
         with graph_capture(stream=torch.cuda.current_stream()) as ctx:
             with torch.cuda.graph(

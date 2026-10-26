@@ -183,6 +183,19 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
     supports_ragged_verify_graph: bool = True
 
+    def out_graph_metadata_capturable(self, forward_mode: ForwardMode) -> bool:
+        # R14-KSMALL's exact topk-1 fixed-width path builds these tables only
+        # from device tensors. Unified/translated pools still run their
+        # replay-time copies outside the enclosing graph and are declined.
+        return (
+            not self.kv_index_translator.is_translating
+            and (
+                forward_mode.is_decode()
+                or forward_mode.is_target_verify()
+                or forward_mode.is_draft_extend_v2()
+            )
+        )
+
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         # Prefill metadata init snapshots all scheduler-shared inputs pre-replay.
         if fm == ForwardMode.EXTEND:
@@ -2078,6 +2091,12 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
     # Per-step backends build the page table on-device (sync-free); mirror that so
     # decide_needs_cpu_seq_lens sees a consistent target + draft value.
     needs_cpu_seq_lens: bool = False
+
+    def out_graph_metadata_capturable(self, forward_mode: ForwardMode) -> bool:
+        return all(
+            backend.out_graph_metadata_capturable(forward_mode)
+            for backend in self.attn_backends
+        )
 
     def __init__(
         self, model_runner: ModelRunner, topk: int, speculative_num_steps: int

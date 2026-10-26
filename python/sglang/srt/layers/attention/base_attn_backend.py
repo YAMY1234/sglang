@@ -140,6 +140,10 @@ class AttentionBackend(ABC):
 
     supports_draft_extend_metadata_staging: bool = False
 
+    def out_graph_metadata_capturable(self, forward_mode: ForwardMode) -> bool:
+        """Whether replay-time metadata preparation may be enclosed in another graph."""
+        return False
+
     def draft_extend_metadata_captured_in_graph(self) -> bool:
         """True when :py:meth:`init_forward_metadata_in_graph` fully rebuilds
         this backend's DRAFT_EXTEND_V2 replay metadata inside the captured
