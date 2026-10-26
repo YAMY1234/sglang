@@ -199,6 +199,125 @@ def _cp_tables(
 
 
 @triton.jit
+def _cp_chunk_tables(
+    tab,
+    tstride,
+    lens,
+    base_lens,
+    vtab,
+    vlens,
+    vstart,
+    vcnt,
+    nb,
+    nv,
+    ragged,
+    C: tl.constexpr,
+    KP: tl.constexpr,
+    NB: tl.constexpr,
+    PG: tl.constexpr,
+):
+    """Once per forward, program (r, j), chunked fold partial: with a ragged batch (longest owned length
+    x B >= ragged x the total, and the longest over C pages), chunk j of request r's owned pages into dense row
+    start_r + j of vtab ([nv, C]) and no key for the one-row-per-request call; otherwise every chunk row empty and that
+    call keeps its lengths. Row r * KP + j is cleared when it lies past the last chunk."""
+    r = tl.program_id(0)
+    j = tl.program_id(1)
+    k = tl.arange(0, NB)
+    L = tl.load(lens + k, mask=k < nb, other=0)
+    pg = (L + PG - 1) // PG
+    mp = tl.max(pg, axis=0)
+    # Chunk rows should not merely repeat a one-row call.
+    on = ((mp * nb).to(tl.float32) >= ragged * tl.sum(pg, axis=0).to(tl.float32)) & (
+        mp > C
+    )
+    n = tl.where(on, (pg + C - 1) // C, 0)
+    start = tl.cumsum(n, axis=0) - n
+    total = tl.sum(n, axis=0)
+    my_n = tl.sum(tl.where(k == r, n, 0), axis=0)
+    my_start = tl.sum(tl.where(k == r, start, 0), axis=0)
+    my_pg = tl.sum(tl.where(k == r, pg, 0), axis=0)
+    my_L = tl.sum(tl.where(k == r, L, 0), axis=0)
+    z = r * KP + j
+    if (z < nv) & (z >= total):
+        tl.store(vlens + z, 0)
+    if j == 0:
+        tl.store(vstart + r, my_start)
+        tl.store(vcnt + r, my_n)
+        tl.store(base_lens + r, tl.where(on, 0, my_L))
+    if j < my_n:
+        v = my_start + j
+        cols = tl.arange(0, C)
+        src = j * C + cols
+        m = src < my_pg
+        tl.store(
+            vtab + v * C + cols,
+            tl.load(tab + r * tstride + src, mask=m, other=0),
+            mask=m,
+        )
+        tl.store(vlens + v, tl.minimum(tl.maximum(my_L - j * (C * PG), 0), C * PG))
+
+
+@triton.jit
+def _cp_chunk_q(q, qv, vstart, vcnt, N, BLK: tl.constexpr):
+    """Request r's query into its chunk rows (program (r, j): row vstart_r + j when j < vcnt_r)."""
+    r = tl.program_id(0)
+    j = tl.program_id(1)
+    if j < tl.load(vcnt + r):
+        v = tl.load(vstart + r) + j
+        for c in range(tl.cdiv(N, BLK)):
+            w = c * BLK + tl.arange(0, BLK)
+            m = w < N
+            tl.store(
+                qv + v.to(tl.int64) * N + w,
+                tl.load(q + r.to(tl.int64) * N + w, mask=m),
+                mask=m,
+            )
+
+
+@triton.jit
+def _cp_chunk_comb(
+    po_v, pl_v, vstart, vcnt, po, pl, H, HB: tl.constexpr, D: tl.constexpr
+):
+    """One partial per request from its chunk rows (trtllm-gen LSE is base 2); no write for a request without chunk
+    rows (the one-row-per-request call wrote it)."""
+    r = tl.program_id(0)
+    n = tl.load(vcnt + r)
+    if n > 0:
+        h = tl.program_id(1) * HB + tl.arange(0, HB)
+        hm = h < H
+        d = tl.arange(0, D)
+        m = tl.full([HB], float("-inf"), tl.float32)
+        s = tl.zeros([HB], tl.float32)
+        acc = tl.zeros([HB, D], tl.float32)
+        v0 = tl.load(vstart + r)
+        for j in range(n):
+            v = v0 + j
+            lj = tl.load(pl_v + v * H + h, mask=hm, other=0.0)
+            oj = tl.load(
+                po_v + (v * H + h[:, None]).to(tl.int64) * D + d[None, :],
+                mask=hm[:, None],
+                other=0.0,
+            )
+            mn = tl.maximum(m, lj)
+            a = tl.exp2(m - mn)
+            w = tl.exp2(lj - mn)
+            acc = acc * a[:, None] + oj.to(tl.float32) * w[:, None]
+            s = s * a + w
+            m = mn
+        ok = s > 0
+        tl.store(
+            po + (r * H + h[:, None]).to(tl.int64) * D + d[None, :],
+            (acc / tl.where(ok, s, 1.0)[:, None]).to(tl.bfloat16),
+            mask=hm[:, None],
+        )
+        tl.store(
+            pl + r * H + h,
+            tl.where(ok, m + tl.log2(tl.where(ok, s, 1.0)), float("-inf")),
+            mask=hm,
+        )
+
+
+@triton.jit
 def _cp_gather_q(
     q,
     q_stride,
@@ -380,6 +499,10 @@ def _cp_gather_q_ll(
     GWRITE: tl.constexpr,
     TRIG: tl.constexpr = False,
     WAIT: tl.constexpr = False,
+    qv=None,
+    vstart=None,
+    vcnt=None,
+    CHUNK: tl.constexpr = False,
 ):
     """LL variant of _cp_gather_q: every 4-byte word travels with the call's epoch in one 8-byte store.
     FOLD: q_all is written source-major per request ([B, CP, QL, heads, D]) for the prefix-only fused partial,
@@ -422,7 +545,17 @@ def _cp_gather_q_ll(
             slot = ((i // QL) * CP + c) * QL + i % QL
         else:
             slot = i * CP + c
-        tl.store(q_all + slot * WORDS + w, (v & 0xFFFFFFFF).to(tl.int32))
+        val = (v & 0xFFFFFFFF).to(tl.int32)
+        tl.store(q_all + slot * WORDS + w, val)
+        if CHUNK:
+            v0 = tl.load(vstart + i // QL)
+            for j in range(tl.load(vcnt + i // QL)):
+                tl.store(
+                    qv
+                    + ((v0 + j) * (QL * CP) + (i % QL) * CP + c).to(tl.int64) * WORDS
+                    + w,
+                    val,
+                )
     if FOLD:  # noqa: SIM102
         if not GATE:  # noqa: SIM102
             if i % QL == 0:
@@ -698,13 +831,20 @@ def _cp_merge_h_ll(
     GMAX: tl.constexpr,
     WAIT: tl.constexpr,
     EARLY: tl.constexpr = False,
+    po_v=None,
+    pl_v=None,
+    vstart=None,
+    vcnt=None,
+    CHUNK: tl.constexpr = False,
 ):
     """_cp_a2a_merge_ll (gated) with one program per (row, head): pushes the head's partials, computes its causal
     block, then merges the CP partials as they arrive. One epoch per (row, head) in cnt, in an LL region of its own
     (the row merge's epochs differ). WAIT: launched as a programmatic dependent.
     EARLY (with WAIT): the causal block before the wait, which then guards only the partials;
     its predecessor releases it only after its own wait, so the step's q / K / V (written upstream of that wait) are
-    complete."""
+    complete.
+    CHUNK (fold layout): a request with chunk rows sends the base-2 LSE combine of its rows' partials
+    (po_v [nv, QL * CP * HQ, D] bf16, pl_v [nv, QL * CP * HQ] fp32) instead of po / plse."""
     i = tl.program_id(0)
     h = tl.program_id(1)
     if WAIT and not EARLY:
@@ -716,6 +856,7 @@ def _cp_merge_h_ll(
     flag = e.to(tl.int64) << 32
     DW: tl.constexpr = D // 2
     NO: tl.constexpr = HQ * D // 2
+    H: tl.constexpr = QL * CP * HQ
     w = tl.arange(0, DW)
     L = tl.load(seq_lens + i // QL)
     if EARLY:
@@ -739,9 +880,52 @@ def _cp_merge_h_ll(
         )
         if WAIT:
             _gdc_wait_clobber()
+    if CHUNK:
+        n_v = tl.load(vcnt + i // QL)
+        v0 = tl.load(vstart + i // QL)
     for c in tl.static_range(CP):
-        ow = _ll_pack(flag, tl.load(po + i * po_sr + c * po_sc + h * DW + w))
-        lw = _ll_pack(flag, tl.load(plse + i * pl_sr + c * pl_sc + h + one))
+        if CHUNK:
+            if n_v > 0:
+                hh = (i % QL) * (CP * HQ) + c * HQ + h
+                mx = tl.full([1], float("-inf"), tl.float32)
+                sw = tl.zeros([1], tl.float32)
+                acc_lo = tl.zeros([DW], tl.float32)
+                acc_hi = tl.zeros([DW], tl.float32)
+                for j in range(n_v):
+                    vr = v0 + j
+                    lj = tl.load(pl_v + vr * H + hh + one)
+                    wd = tl.load(po_v + (vr * H + hh).to(tl.int64) * DW + w).to(
+                        tl.uint32, bitcast=True
+                    )
+                    mn = tl.maximum(mx, lj)
+                    a = tl.exp2(mx - mn)
+                    b2 = tl.exp2(lj - mn)
+                    acc_lo = acc_lo * a + (wd << 16).to(tl.float32, bitcast=True) * b2
+                    acc_hi = (
+                        acc_hi * a + (wd & 0xFFFF0000).to(tl.float32, bitcast=True) * b2
+                    )
+                    sw = sw * a + b2
+                    mx = mn
+                inv = 1.0 / tl.where(sw > 0, sw, 1.0)
+                lo16 = (acc_lo * inv).to(tl.bfloat16).to(tl.int16, bitcast=True).to(
+                    tl.int32
+                ) & 0xFFFF
+                hi16 = (acc_hi * inv).to(tl.bfloat16).to(tl.int16, bitcast=True).to(
+                    tl.int32
+                ) & 0xFFFF
+                lse2 = tl.where(
+                    sw > 0,
+                    mx + tl.log2(tl.where(sw > 0, sw, 1.0)),
+                    float("-inf"),
+                )
+                ow = _ll_pack(flag, lo16 | (hi16 << 16))
+                lw = _ll_pack(flag, lse2.to(tl.int32, bitcast=True))
+            else:
+                ow = _ll_pack(flag, tl.load(po + i * po_sr + c * po_sc + h * DW + w))
+                lw = _ll_pack(flag, tl.load(plse + i * pl_sr + c * pl_sc + h + one))
+        else:
+            ow = _ll_pack(flag, tl.load(po + i * po_sr + c * po_sc + h * DW + w))
+            lw = _ll_pack(flag, tl.load(plse + i * pl_sr + c * pl_sc + h + one))
         dst = (tl.load(peers + c) + ll_off + (i * CP + me) * NWP * 8).to(
             tl.pointer_type(tl.int64)
         )
@@ -820,6 +1004,11 @@ class CpLite:
         self.gather_pdl = self.cp_ungated
         self.early_merge = self.cp_ungated
         self.merge_h = True
+        self.fold_mh = True
+        self.fold_chunk = {33: 128, 41: 64, 65: 128}
+        self.fold_chunk_q1 = {65: 128}
+        self.fold_ragged = 1.8
+        self.fold_fuse = True
         self.llh_off = total
         total += _MAX_ROWS * cp * _LL_PWORDS * 8
         self.ll = q_heads * HEAD_DIM // 2 + q_heads <= _LL_PWORDS
@@ -857,7 +1046,8 @@ class CpLite:
         self.plse = torch.empty(
             rows, cp * q_heads, dtype=torch.float32, device=self.device
         )
-        self.counter = torch.zeros(1 << 16, dtype=torch.int32, device=self.device)
+        # multi-CTA counters of the trtllm-gen calls: rows x heads (the chunk rows: up to 8 B x 112 at q_len 7)
+        self.counter = torch.zeros(1 << 20, dtype=torch.int32, device=self.device)
         # exact path: the fused kernel's [cp, rows, heads, D] partials and the prefix lengths the gather writes
         self.po_x = torch.empty(
             cp, rows, q_heads, HEAD_DIM, dtype=torch.bfloat16, device=self.device
@@ -1159,7 +1349,22 @@ class CpLite:
             out = torch.empty(
                 rows, self.hq, HEAD_DIM, dtype=torch.bfloat16, device=q.device
             )
-        if self.ll:
+        if self.ll and self.fold_mh:
+            fold_gate = gate if gate["GATE"] else {**gate, "thr": 0}
+            self._fold_merge_h(
+                q,
+                k_cache,
+                v_cache,
+                page_table,
+                seq_lens,
+                q_len,
+                rows,
+                bmm1_scale,
+                bmm2_scale,
+                out,
+                fold_gate,
+            )
+        elif self.ll:
             self._fold_merge(
                 q,
                 k_cache,
@@ -1206,10 +1411,18 @@ class CpLite:
         return out
 
     def _exact_supported(self, q_len, b):
-        """The fused partial takes <= MAX_BATCH_Q1 requests; wider batches take the trtllm-gen partial."""
+        """The fused partial (q_len folded into the heads) takes <= MAX_BATCH verify / MAX_BATCH_Q1 draft requests;
+        wider batches take the trtllm-gen partial."""
         from sglang.srt.layers.attention import q35_cp_fused as F
 
-        return F.q35_cp_fused_supported(1, self.cp, q_len * self.hq, b, self.sms)
+        return F.q35_cp_fused_supported(
+            1,
+            self.cp,
+            q_len * self.hq,
+            b,
+            self.sms,
+            max_batch=F.MAX_BATCH if q_len > 1 else F.MAX_BATCH_Q1,
+        )
 
     def _exact(
         self,
@@ -1319,8 +1532,15 @@ class CpLite:
                 stock,
                 gate,
             )
+        fold_mh = self.fold_mh and not exact
         stock_lens, pre_lens = self._gate_lens_fwd(
-            seq_lens, b, q_len, gate["thr"], forward_batch, layer_id
+            seq_lens,
+            b,
+            q_len,
+            gate["thr"],
+            forward_batch,
+            layer_id,
+            zero=fold_mh,
         )
         out = torch.empty(
             rows, self.hq, HEAD_DIM, dtype=torch.bfloat16, device=self.device
@@ -1329,7 +1549,36 @@ class CpLite:
         self._side.wait_stream(main)
         stock(stock_lens, out)
         words = self.hq * HEAD_DIM // 4
+        fused = None
         with torch.cuda.stream(self._side):
+            if fold_mh and self.fold_fuse:
+                # Fill chunk-row queries in the gather and combine them in the merge.
+                tabs = self._tables(
+                    page_table,
+                    seq_lens,
+                    q_len,
+                    forward_batch,
+                    layer_id,
+                    gate,
+                )
+                chunk = self._chunk_tables(
+                    tabs[0], tabs[1], b, forward_batch, layer_id, q_len
+                )
+                if chunk is not None:
+                    nv, h = chunk[1].shape[0], q_len * self.cp * self.hq
+                    fused = (
+                        chunk,
+                        torch.empty(nv, h, HEAD_DIM, dtype=q.dtype, device=self.device),
+                        torch.empty(
+                            nv,
+                            h,
+                            HEAD_DIM,
+                            dtype=torch.bfloat16,
+                            device=self.device,
+                        ),
+                        torch.empty(nv, h, dtype=torch.float32, device=self.device),
+                        tabs,
+                    )
             _cp_gather_q_ll[(rows,)](
                 q.view(torch.int32),
                 words,
@@ -1348,6 +1597,16 @@ class CpLite:
                 FOLD=exact,
                 GWRITE=False,
                 num_warps=4,
+                **(
+                    {}
+                    if fused is None
+                    else {
+                        "qv": fused[1].view(torch.int32),
+                        "vstart": fused[0][3],
+                        "vcnt": fused[0][4],
+                        "CHUNK": True,
+                    }
+                ),
             )
             if exact:
                 self._exact_partial(
@@ -1376,10 +1635,15 @@ class CpLite:
                     layer_id,
                     gate,
                     self._own_workspace(),
+                    fused,
                 )
         main.wait_stream(self._side)
-        merge = self._exact_merge if exact else self._fold_merge
-        return merge(
+        merge = (
+            self._exact_merge
+            if exact
+            else (self._fold_merge_h if fold_mh else self._fold_merge)
+        )
+        merge_args = (
             q,
             k_cache,
             v_cache,
@@ -1392,6 +1656,9 @@ class CpLite:
             out,
             gate,
         )
+        if fused is None:
+            return merge(*merge_args)
+        return merge(*merge_args, fused=fused)
 
     def _gated_main(
         self,
@@ -1620,7 +1887,9 @@ class CpLite:
     def _own_workspace(self):
         """The overlapped trtllm-gen partial's workspace (the caller's belongs to the stock call)."""
         if self._ws is None:
-            self._ws = torch.empty(128 << 20, dtype=torch.uint8, device=self.device)
+            # the chunked fold partial's workspace grows with its rows (~0.23 MiB a row at q_len 7: 225 MiB at B128)
+            mb = 384 if self.fold_chunk else 128
+            self._ws = torch.empty(mb << 20, dtype=torch.uint8, device=self.device)
         return self._ws
 
     def _fold_partial(
@@ -1638,29 +1907,136 @@ class CpLite:
         layer_id,
         gate,
         workspace,
+        fused=None,
     ):
         """trtllm-gen over this rank's owned prefix pages for every group head, the q_len rows folded into the
         heads (q_len_per_req 1), into po / plse with LSE."""
         import flashinfer
 
-        tab, lens, max_kv = self._tables(
-            page_table, seq_lens, q_len, forward_batch, layer_id, gate
+        if fused is None:
+            tab, lens, max_kv = self._tables(
+                page_table, seq_lens, q_len, forward_batch, layer_id, gate
+            )
+        else:
+            tab, lens, max_kv = fused[4]
+        h = q_len * self.cp * self.hq
+        query = self.q_all[:rows].view(b, h, HEAD_DIM)
+        out = self.po[:rows].view(b, h, HEAD_DIM)
+        lse = self.plse[:rows].view(b, h)
+        chunk = (
+            self._chunk_tables(tab, lens, b, forward_batch, layer_id, q_len)
+            if fused is None
+            else fused[0]
         )
-        gh = self.cp * self.hq
         flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-            query=self.q_all[:rows].view(b, q_len * gh, HEAD_DIM),
+            query=query,
             kv_cache=(k_cache, v_cache),
             workspace_buffer=workspace,
             block_tables=tab,
-            seq_lens=lens,
+            seq_lens=lens if chunk is None else chunk[0],
             max_seq_len=max_kv,
             bmm1_scale=bmm1_scale,
             bmm2_scale=bmm2_scale,
-            out=self.po[:rows].view(b, q_len * gh, HEAD_DIM),
-            lse=self.plse[:rows].view(b, q_len * gh),
+            out=out,
+            lse=lse,
             q_len_per_req=1,
             multi_ctas_kv_counter_buffer=self.counter,
         )
+        if chunk is None:
+            return
+        # ragged batch: the call above got no key; the chunk rows (empty otherwise) and the combine
+        _, vtab, vlens, vstart, vcnt = chunk
+        nv, C = vtab.shape
+        n = h * HEAD_DIM // 4
+        if fused is None:
+            qv = torch.empty(nv, h, HEAD_DIM, dtype=query.dtype, device=self.device)
+            po_v = torch.empty(
+                nv, h, HEAD_DIM, dtype=torch.bfloat16, device=self.device
+            )
+            pl_v = torch.empty(nv, h, dtype=torch.float32, device=self.device)
+            _cp_chunk_q[(b, nv // b)](
+                query.view(torch.int32),
+                qv.view(torch.int32),
+                vstart,
+                vcnt,
+                n,
+                BLK=1024,
+            )
+        else:  # the gather wrote the chunk rows' queries; the merge combines their partials
+            qv, po_v, pl_v = fused[1:4]
+        flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+            query=qv,
+            kv_cache=(k_cache, v_cache),
+            workspace_buffer=self._own_workspace(),
+            block_tables=vtab,
+            seq_lens=vlens,
+            max_seq_len=C * PAGE,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            out=po_v,
+            lse=pl_v,
+            q_len_per_req=1,
+            multi_ctas_kv_counter_buffer=self.counter,
+        )
+        if fused is None:
+            _cp_chunk_comb[(b, triton.cdiv(h, 16))](
+                po_v, pl_v, vstart, vcnt, out, lse, h, HB=16, D=HEAD_DIM
+            )
+
+    def _chunk_tables(self, tab, lens, b, forward_batch, layer_id, q_len=7):
+        """Build the one-row and chunk-row tables once per forward.
+
+        Draft calls use their own chunk policy. Ragged batches clear the one-row
+        lengths and use dense ``[B * K, C]`` chunk rows instead.
+        """
+        spec = self.fold_chunk_q1 if q_len == 1 else self.fold_chunk
+        keys = [k for k in spec if k <= b]
+        C = spec[max(keys)] if keys else 0
+        ncols = tab.shape[1]
+        if not C or ncols <= C or ncols % C:
+            return None
+        key = ("chunk", tab.data_ptr(), lens.data_ptr(), b)
+        ent = self._tabs.get(key)
+        if ent is not None and ent[1]() is forward_batch and layer_id > ent[2]:
+            ent[2] = layer_id
+            return ent[0]
+        K = ncols // C
+        nv = b * K
+        base_lens = torch.empty(b, dtype=torch.int32, device=self.device)
+        vtab = torch.empty(nv, C, dtype=torch.int32, device=self.device)
+        vlens = torch.empty(nv, dtype=torch.int32, device=self.device)
+        vstart = torch.empty(b, dtype=torch.int32, device=self.device)
+        vcnt = torch.empty(b, dtype=torch.int32, device=self.device)
+        _cp_chunk_tables[(b, K)](
+            tab,
+            tab.stride(0),
+            lens,
+            base_lens,
+            vtab,
+            vlens,
+            vstart,
+            vcnt,
+            b,
+            nv,
+            float(self.fold_ragged),
+            C=C,
+            KP=K,
+            NB=triton.next_power_of_2(b),
+            PG=PAGE,
+        )
+        out = (base_lens, vtab, vlens, vstart, vcnt)
+        self._tabs[key] = [out, weakref.ref(forward_batch), layer_id]
+        if (b, "chunk") not in self._logged:
+            self._logged.add((b, "chunk"))
+            logger.info(
+                "CP-lite fold partial: %d requests, chunk rows of %d pages (%d rows) when the longest "
+                "owned length x B >= %.2f x the total",
+                b,
+                C,
+                nv,
+                self.fold_ragged,
+            )
+        return out
 
     def _fold_merge(
         self,
@@ -1709,6 +2085,73 @@ class CpLite:
             PG=PAGE,
             NWP=_LL_PWORDS,
             num_warps=8,
+        )
+        return out
+
+    def _fold_merge_h(
+        self,
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        seq_lens,
+        q_len,
+        rows,
+        bmm1_scale,
+        bmm2_scale,
+        out,
+        gate,
+        fused=None,
+    ):
+        """Merge the fold layout with one program per row and query head."""
+        hq = self.hq
+        _cp_merge_h_ll[(rows, hq)](
+            self.po.view(torch.int32),
+            self.plse.view(torch.int32),
+            self.cp * hq * HEAD_DIM // 2,
+            hq * HEAD_DIM // 2,
+            self.cp * hq,
+            hq,
+            q,
+            q.stride(0),
+            k_cache,
+            v_cache,
+            k_cache.stride(0),
+            k_cache.stride(2),
+            page_table,
+            page_table.stride(0),
+            seq_lens,
+            out,
+            out.stride(0),
+            self.peers,
+            self.me,
+            self.llh_off,
+            self.cnt_h,
+            bmm1_scale,
+            bmm2_scale,
+            gate["nb"],
+            gate["thr"],
+            QL=q_len,
+            HQ=hq,
+            CP=self.cp,
+            D=HEAD_DIM,
+            PG=PAGE,
+            NWP=_LL_PWORDS,
+            NB=gate["NB"],
+            GMAX=gate["GMAX"],
+            WAIT=False,
+            num_warps=4,
+            **(
+                {}
+                if fused is None
+                else {
+                    "po_v": fused[2].view(torch.int32),
+                    "pl_v": fused[3],
+                    "vstart": fused[0][3],
+                    "vcnt": fused[0][4],
+                    "CHUNK": True,
+                }
+            ),
         )
         return out
 
