@@ -130,14 +130,13 @@ def _verify_commit_outputs_kernel(
     EXTEND_LAYOUT: tl.constexpr = False,
     EXTEND_MROPE: tl.constexpr = False,
     req_pool_indices=None,
-    req_to_token=None,
+    runner_write_window=None,
     track_indices=None,
     num_accept_tokens=None,
     runner_req_pool_indices=None,
     runner_out_cache_loc=None,
     runner_track_indices=None,
     published_seq_lens=None,
-    POOL_LEN: tl.constexpr = 0,
     RUNNER_INPUTS: tl.constexpr = False,
     RUNNER_TRACK: tl.constexpr = False,
 ):
@@ -202,24 +201,10 @@ def _verify_commit_outputs_kernel(
                 tl.load(track_indices + row, valid, other=0),
                 valid,
             )
-        # the iteration's write window at the pre-verify lengths, as prepare_draft_window stages it
+        # Copy the immutable write window from this iteration's KVLocPlan. Re-indexing
+        # the mutable global req_to_token table here can select a different allocation.
         tokens = row < BS * DRAFT_WIDTH
-        owner = row // DRAFT_WIDTH
-        owner_req = tl.load(req_pool_indices + owner, tokens, other=-1).to(tl.int64)
-        owner_length = tl.load(seq_lens + owner * SEQ_STRIDE, tokens, other=0).to(
-            tl.int64
-        )
-        live = (
-            tokens
-            & (owner_req >= 0)
-            & (owner_length > 0)
-            & (owner_length + DRAFT_WIDTH <= POOL_LEN)
-        )
-        loc = tl.load(
-            req_to_token + owner_req * POOL_LEN + owner_length + row % DRAFT_WIDTH,
-            live,
-            other=0,
-        ).to(tl.int64)
+        loc = tl.load(runner_write_window + row, tokens, other=0).to(tl.int64)
         tl.store(runner_out_cache_loc + row, loc, tokens)
     idx = tl.where(idx < 0, idx + PREDICT_SIZE, idx)
     token = tl.load(predict + idx * PREDICT_STRIDE, valid, other=0)
@@ -240,22 +225,23 @@ def prepare_verify_commit_outputs(
     runner_inputs=None,
     req_pool_indices=None,
     track_indices=None,
-    req_to_token=None,
+    runner_write_window=None,
 ):
     """``extend_layout`` (SGLANG_PST_SPEC_EXTEND_LAYOUT, with ``num_draft_tokens``): the same
     launch also writes ``prepare_draft_extend_layout(seq_lens, num_draft_tokens, extend_mrope)``,
     appended to the draft-extend inputs. ``bonus_dtype``: int64 for SGLANG_PERFLL_STEP5A_BONUS_I64,
     the dtype the relay and the next draft read. ``runner_inputs`` (SGLANG_PERFLL_RS_D1, with
     ``extend_layout``): a perfll_step2.DraftExtendInputs, whose views of the draft extend runner's
-    static inputs the launch writes in place of fresh outputs, with the write window read from
-    ``req_to_token`` at ``req_pool_indices`` / ``seq_lens``, and the new lengths published to
-    its FutureMap buffer at ``req_pool_indices``."""
+    static inputs the launch writes in place of fresh outputs, with the exact immutable
+    ``runner_write_window`` from this iteration's KVLocPlan, and the new lengths published
+    to its FutureMap buffer at ``req_pool_indices``."""
     bs = accept_lens.numel()
     assert runner_inputs is None or (
         num_draft_tokens
         and extend_layout
         and req_pool_indices is not None
-        and req_to_token is not None
+        and runner_write_window is not None
+        and runner_write_window.numel() == bs * num_draft_tokens
     )
     new_seq_lens = torch.empty(
         (bs,),
@@ -363,14 +349,13 @@ def prepare_verify_commit_outputs(
             **(
                 dict(
                     req_pool_indices=req_pool_indices,
-                    req_to_token=req_to_token,
+                    runner_write_window=runner_write_window,
                     track_indices=track_indices,
                     num_accept_tokens=runner_inputs.num_accept_tokens,
                     runner_req_pool_indices=runner_inputs.req_pool_indices,
                     runner_out_cache_loc=runner_inputs.out_cache_loc,
                     runner_track_indices=runner_inputs.mamba_track_indices,
                     published_seq_lens=runner_inputs.published_seq_lens,
-                    POOL_LEN=req_to_token.shape[1],
                     RUNNER_INPUTS=True,
                     RUNNER_TRACK=runner_inputs.mamba_track_indices is not None,
                 )

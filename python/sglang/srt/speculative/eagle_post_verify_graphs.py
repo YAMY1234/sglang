@@ -199,6 +199,9 @@ class EaglePostVerifyGraphs:
             batch.mamba_track_indices is not None,
             verify_input.draft_token_num,
             verify_input.max_tree_depth,
+            # A slot that stages the immutable write window cannot be reused by a
+            # path without that input (or vice versa).
+            verify_input.prepared_out_cache_loc is not None,
             # the graphs read the verify logits in place; a runner may own several
             logits_output.next_token_logits.data_ptr(),
             # and with SGLANG_PERFLL_RS_D1 its hidden rows
@@ -256,7 +259,7 @@ class EaglePostVerifyGraphs:
             ),
             extend_inputs=(
                 None
-                if self._rs_d1 is None
+                if self._rs_d1 is None or "write_window" not in staged
                 else self._extend_inputs_for(
                     num_requests=len(batch.seq_lens),
                     width=verify_input.draft_token_num,
@@ -329,7 +332,7 @@ class EaglePostVerifyGraphs:
                         runner_inputs=extend,
                         req_pool_indices=slot.staged["req_pool_indices"],
                         track_indices=slot.staged.get("track_indices"),
-                        req_to_token=self._rs_d1.req_to_token,
+                        runner_write_window=slot.staged["write_window"],
                     )
                 ),
             )
@@ -634,4 +637,6 @@ def _post_verify_inputs(
         )
     if batch.mamba_track_indices is not None:
         inputs["track_indices"] = batch.mamba_track_indices
+    if verify_input.prepared_out_cache_loc is not None:
+        inputs["write_window"] = verify_input.prepared_out_cache_loc
     return inputs
