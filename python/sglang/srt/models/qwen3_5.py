@@ -1661,6 +1661,14 @@ ALL_DECODER_LAYER_TYPES = {
     "linear_attention": Qwen3_5LinearDecoderLayer,
 }
 
+
+def _layer_input_projection(layer: nn.Module) -> nn.Module:
+    """The projection that reads a decoder layer's input norm."""
+    if isinstance(layer, Qwen3_5LinearDecoderLayer):
+        return layer.linear_attn.in_proj_qkvz
+    return layer.qkv_proj
+
+
 # ModelOpt FP4 checkpoints bake the per-layer KV-cache scales under the HF
 # attention projections; in sglang they live on RadixAttention. Apply this to the
 # weight stream at the top of load_weights(), before ".self_attn" is stripped and
@@ -1825,6 +1833,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 label="Qwen3.5",
                 # The final GemmaRMSNorm consumes a finalize handoff.
                 terminal_finalize=True,
+                fp8_input_linear=_layer_input_projection,
             )
 
         # Final normalization

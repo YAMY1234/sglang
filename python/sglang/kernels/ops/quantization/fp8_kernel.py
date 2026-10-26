@@ -710,6 +710,40 @@ def _static_quant_fp8(
         tl.store(y_s_repeat_ptr, y_s)
 
 
+# PERF-LB (SGLANG_PLB_AR_FP8_OUT): (x, x_s, x_q) with x_q already written by a fused producer,
+# byte for byte this function's quantization of x; the next call on those rows and scale returns it.
+_handed_over: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
+_took_rows: set = set()
+
+
+def hand_over_static_quant_fp8(
+    x: torch.Tensor, x_s: torch.Tensor, x_q: torch.Tensor
+) -> None:
+    global _handed_over
+    _handed_over = (x, x_s, x_q)
+
+
+def _take_handed_over(x: torch.Tensor, x_s: torch.Tensor) -> Optional[torch.Tensor]:
+    global _handed_over
+    held = _handed_over
+    # Holding x keeps its storage, so a matching pointer is a view of the same rows.
+    if (
+        held is None
+        or held[1] is not x_s
+        or held[0].data_ptr() != x.data_ptr()
+        or held[0].shape != x.shape
+        or held[0].stride() != x.stride()
+    ):
+        return None
+    _handed_over = None
+    if x.shape[0] not in _took_rows:
+        _took_rows.add(x.shape[0])
+        logger.info(
+            "static_quant_fp8 (PERF-LB): %d rows take the fused E4M3 input", x.shape[0]
+        )
+    return held[2]
+
+
 def static_quant_fp8(
     x: torch.Tensor,
     x_s: torch.Tensor,
@@ -731,6 +765,10 @@ def static_quant_fp8(
     """
     assert x.is_contiguous(), "`x` is not contiguous"
     assert x_s.numel() == 1, "only supports per-tensor scale"
+    if _handed_over is not None and not repeat_scale:
+        x_q = _take_handed_over(x, x_s)
+        if x_q is not None:
+            return x_q, x_s
 
     x_q = torch.empty_like(x, device=x.device, dtype=fp8_dtype)
     M = x.numel() // x.shape[-1]

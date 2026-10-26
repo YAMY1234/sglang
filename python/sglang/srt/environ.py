@@ -1305,6 +1305,23 @@ class Envs:
     # buffer about every period (random phase per rank) on its own default-priority stream while the ctl file reads 1
     # (2: the persistent kernel of SGLANG_PLB_SCATTER_CTAS, 32 if unset). "": off.
     SGLANG_PLB_FAKE_SCATTER = EnvStr("")
+    # PERF-LB: MNNVL CuTe DSL BT tail threads of the MaterializeRMSNorm kernel for the re-targeted (non-shipped) shapes
+    # (0: the shipped H8192 presets' 1024; 512 at H4096 is bit for bit the same output)
+    SGLANG_PLB_BT_RMS_THREADS = EnvInt(0)
+    # PERF-LB: the widest MoE finalize step on the BT route for the re-targeted shapes (0: the shipped 703 at TP8)
+    SGLANG_PLB_FINALIZE_BT_MAX = EnvInt(0)
+    # PERF-LB: the BT tail's launch order, bit for bit the same outputs (plb_mnnvl_cutedsl.LAMPORT_LEVELS). 1: the
+    # MaterializeRMSNorm lets its dependents launch at entry and polls the prenorm mailbox before its grid-dependency
+    # wait; 2: also the OwnerReduceMulticast lets it launch right after its own wait (TensorRT-LLM's twoshot +
+    # rmsNormLamport order)
+    SGLANG_PLB_MAT_LAMPORT = EnvInt(0)
+    # PERF-LB: the MoE finalize's BT MaterializeRMSNorm also writes the static per-tensor E4M3 input of the next layer's
+    # in_proj_qkvz / qkv_proj, whose quantize kernel then does not run; byte for byte SGLang's quantization
+    SGLANG_PLB_AR_FP8_OUT = EnvBool(False)
+    # R14-KSMALL E6v2: write that exact E4M3 input in the BT materializer and launch dependents after this kernel's
+    # grid-dependency wait but before reading/materializing the mailbox. This is intentionally distinct from the
+    # previously killed PLB Lamport entry-trigger/poll-before-wait ordering.
+    SGLANG_R14_KSMALL_E6V2 = EnvBool(False)
     # With CP_UNGATED: the q gather of an ungated exact call launches as a programmatic dependent of the kernel that
     # wrote q (it releases the fused partial, then waits), so the partial's prefix KV requests start under that kernel.
     SGLANG_PERFLL_CP_GATHER_PDL = EnvBool(False)

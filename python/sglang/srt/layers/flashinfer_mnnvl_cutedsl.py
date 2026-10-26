@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.distributed as dist
 
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_spec
 
 if TYPE_CHECKING:
@@ -231,17 +232,37 @@ def _retargeted_config(tp_size: int, hidden_size: int, top_k: int):
             tp_size,
         )
 
+    rms_threads = envs.SGLANG_PLB_BT_RMS_THREADS.get()
+    finalize_bt_max = envs.SGLANG_PLB_FINALIZE_BT_MAX.get()
+
+    def bt_preset(preset):
+        if not rms_threads:
+            return preset
+        return replace(
+            preset, collective=replace(preset.collective, rms_threads=rms_threads)
+        )
+
     def routes(op):
         bounds, ll, bt, _ = shipped[op]
+        if op == "finalize" and finalize_bt_max:
+            bounds = (*bounds[:2], finalize_bt_max, *bounds[3:])
         return _routes(
             bounds,
             KernelTarget(protocol=ProtocolKind.LL, preset=ll),
-            tuple(KernelTarget(protocol=ProtocolKind.BT, preset=p) for p in bt),
+            tuple(
+                KernelTarget(protocol=ProtocolKind.BT, preset=bt_preset(p)) for p in bt
+            ),
             None
             if ht[op] is None
             else KernelTarget(protocol=ProtocolKind.HT, preset=ht[op]),
         )
 
+    if rms_threads or finalize_bt_max:
+        logger.info(
+            "MNNVL CuTe DSL (PERF-LB): BT rms_threads %s, finalize BT up to %s rows",
+            rms_threads or "shipped",
+            finalize_bt_max or "shipped",
+        )
     profile = StaticProfile(
         tp_size=tp_size,
         hidden_size=hidden_size,
@@ -401,11 +422,37 @@ class FlashInferMNNVLCuteDSLARFusion:
                 write_residual_output=True,
                 config=self.workspace_config,
             )
+            self._bt_tail = self._patch_bt_tail()
 
             # Publish only after the mailbox barrier; without it the ranks
             # would desynchronize their Lamport stages.
             torch.cuda.synchronize(self.device)
             dist.barrier(group=process_group)
+
+    def _patch_bt_tail(self):
+        """The PERF-LB BT MaterializeRMSNorm (plb_mnnvl_cutedsl), or None when off."""
+        lamport = envs.SGLANG_PLB_MAT_LAMPORT.get()
+        e6v2 = envs.SGLANG_R14_KSMALL_E6V2.get()
+        fp8_out = envs.SGLANG_PLB_AR_FP8_OUT.get() or e6v2
+        if not (lamport or fp8_out):
+            return None
+        from sglang.srt.layers.plb_mnnvl_cutedsl import BTTailPatch
+
+        patch = BTTailPatch(
+            self.workspace,
+            lamport=lamport,
+            fp8_out=fp8_out,
+            after_wait_dependents=e6v2,
+        )
+        patch.install()
+        logger.info(
+            "MNNVL CuTe DSL (PERF-LB): BT tail lamport=%d, E6v2=%s, "
+            "E4M3 copy for the next projection=%s",
+            lamport,
+            e6v2,
+            bool(patch.fp8_tails),
+        )
+        return patch
 
     def supports(self, m: int) -> bool:
         if not 1 <= int(m) <= self.max_m:
@@ -452,6 +499,57 @@ class FlashInferMNNVLCuteDSLARFusion:
             shared_expert_output=gated_shared_output,
         )
         return norm_output, residual_output
+
+    def moe_finalize_all_reduce_rms_norm_fp8(
+        self,
+        *,
+        routed_output: torch.Tensor,
+        expert_weights: torch.Tensor,
+        permuted_indices: torch.Tensor,
+        gated_shared_output: torch.Tensor | None,
+        residual: torch.Tensor,
+        gamma: torch.Tensor,
+        input_scale: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """``moe_finalize_all_reduce_rms_norm`` plus the norm's static_quant_fp8 under
+        ``input_scale`` (SGLANG_PLB_AR_FP8_OUT); the E4M3 rows are None off the BT route."""
+        m = int(permuted_indices.shape[0])
+        if not (
+            self._bt_tail is not None
+            and self.supports(m)
+            and self._bt_tail.takes_fp8(m)
+        ):
+            return (
+                *self.moe_finalize_all_reduce_rms_norm(
+                    routed_output=routed_output,
+                    expert_weights=expert_weights,
+                    permuted_indices=permuted_indices,
+                    gated_shared_output=gated_shared_output,
+                    residual=residual,
+                    gamma=gamma,
+                ),
+                None,
+            )
+        from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
+
+        shape = (m, self.hidden_size)
+        norm_output = torch.empty(shape, dtype=torch.bfloat16, device=self.device)
+        residual_output = torch.empty(shape, dtype=torch.bfloat16, device=self.device)
+        fp8_output = torch.empty(shape, dtype=fp8_dtype, device=self.device)
+        self._bt_tail.finalize_fp8(
+            routed_output=routed_output,
+            expert_weights=expert_weights,
+            permuted_indices=permuted_indices,
+            shared_output=gated_shared_output,
+            residual_source=residual,
+            gamma=gamma,
+            norm_output=norm_output,
+            residual_output=residual_output,
+            fp8_output=fp8_output,
+            input_scale=input_scale,
+            m=m,
+        )
+        return norm_output, residual_output, fp8_output
 
     def all_reduce_residual_rms_norm(
         self,
