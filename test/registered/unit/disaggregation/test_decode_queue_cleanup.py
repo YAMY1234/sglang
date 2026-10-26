@@ -1,7 +1,11 @@
 import unittest
+from collections import deque
 from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import numpy as np
+import torch
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.common.conn import KVTransferError
@@ -100,6 +104,79 @@ class TestDecodeQueueCleanup(CustomTestCase):
         first.kv_receiver.init.assert_called_once_with(1)
         tail.kv_receiver.init.assert_called_once_with(2)
         self.assertEqual(queue.pending_reqs, [])
+
+
+class TestDeferredPreallocMetadata(CustomTestCase):
+    def test_metadata_send_waits_for_nonblocking_index_copies(self):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.req_to_metadata_buffer_idx_allocator = MagicMock()
+        queue.req_to_metadata_buffer_idx_allocator.alloc.return_value = 7
+        queue.req_to_token_pool = SimpleNamespace(
+            req_index_to_mamba_index_mapping=torch.tensor(
+                [[9], [11], [13]], dtype=torch.int32
+            ),
+            translate_mamba_indices=lambda indices: indices,
+        )
+        queue.transfer_queue = SimpleNamespace(enable_staging=False)
+        queue._deferred_sends = deque()
+        queue._num_published_destinations = 0
+
+        receiver = SimpleNamespace(require_staging=False, send_metadata=MagicMock())
+        decode_req = SimpleNamespace(
+            req=SimpleNamespace(
+                bootstrap_room=3,
+                finished_reason=None,
+                kv=SimpleNamespace(req_pool_idx=1),
+                time_stats=MagicMock(),
+            ),
+            kv_receiver=receiver,
+            metadata_buffer_index=-1,
+            is_rebootstrap=False,
+        )
+        kv_indices = torch.arange(16, 24, dtype=torch.int64)
+        event = MagicMock()
+        event.query.return_value = False
+        torch_empty = torch.empty
+
+        def unpinned_empty(shape, *, dtype, pin_memory):
+            self.assertTrue(pin_memory)
+            return torch_empty(shape, dtype=dtype)
+
+        with (
+            patch(
+                "sglang.srt.disaggregation.decode.torch.empty",
+                side_effect=unpinned_empty,
+            ),
+            patch(
+                "sglang.srt.disaggregation.decode.torch.cuda.Event",
+                return_value=event,
+            ),
+        ):
+            queue._defer_kv_metadata(
+                decode_req,
+                kv_indices,
+                4,
+                has_state=True,
+                metadata_kwargs={"decode_prefix_len": 5},
+            )
+
+        self.assertEqual(decode_req.metadata_buffer_index, 7)
+        self.assertEqual(queue._num_published_destinations, 1)
+        decode_req.req.time_stats.set_decode_transfer_queue_entry_time.assert_called_once()
+        event.record.assert_called_once()
+
+        queue.flush_deferred_sends()
+        receiver.send_metadata.assert_not_called()
+        self.assertEqual(len(queue._deferred_sends), 1)
+
+        event.query.return_value = True
+        queue.flush_deferred_sends()
+        self.assertEqual(len(queue._deferred_sends), 0)
+        args, kwargs = receiver.send_metadata.call_args
+        np.testing.assert_array_equal(args[0], np.array([4, 5], dtype=np.int32))
+        self.assertEqual(args[1], 7)
+        np.testing.assert_array_equal(args[2][0][0], np.array([11], dtype=np.int32))
+        self.assertEqual(kwargs, {"decode_prefix_len": 5})
 
 
 class _GateReceiver:
