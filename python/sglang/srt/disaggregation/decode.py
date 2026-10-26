@@ -153,6 +153,12 @@ if TYPE_CHECKING:
 CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 
 
+def _nvidia_megakernel_enabled() -> bool:
+    from sglang.srt.kernel_plugins.nvidia.binding import megakernel_enabled
+
+    return megakernel_enabled()
+
+
 def _bootstrap_addr(req: Req) -> str:
     # FIXME: make a property of a req
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
@@ -424,6 +430,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.gloo_group = parallel.attn_tp_group.cpu_group
         # Destinations visible to prefill but not yet on the transfer queue.
         self._num_published_destinations = 0
+        # Metadata waiting for non-blocking device-to-host index copies.
+        self._deferred_sends: deque = deque()
         self.tp_rank = parallel.tp_rank
         self.gpu_id = gpu_id
         self.bootstrap_port = bootstrap_port
@@ -1007,6 +1015,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def release_memory_occupation(self):
         self._cancel_prefill_dp_rank_queries()
         self.queue.clear()
+        self._deferred_sends.clear()
         for req in self.retracted_queue:
             discard_kv_cache_backup(
                 req,
@@ -1783,6 +1792,25 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         prefix_len=total_prefix_len,
                     )
                 )
+            if (
+                _nvidia_megakernel_enabled()
+                and set(state_types) <= {StateType.MAMBA}
+                and not self.scheduler.enable_hisparse
+                and not _is_fake_transfer(decode_req.req)
+            ):
+                self._defer_kv_metadata(
+                    decode_req,
+                    kv_indices,
+                    kv_transfer_page_size,
+                    has_state=bool(state_types),
+                    metadata_kwargs={"decode_prefix_len": total_prefix_len},
+                )
+                num_device_preallocated += 1
+                preallocated_reqs.append(decode_req)
+                indices_to_remove.add(i)
+                if self.scheduler.enable_lora:
+                    running_loras.add(decode_req.req.lora_id)
+                continue
             state_indices: Optional[List] = [
                 payloads[st]() if st in payloads else None for st in state_types
             ]
@@ -1843,6 +1871,69 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         ]
 
         return preallocated_reqs, failed_reqs
+
+    def _defer_kv_metadata(
+        self, decode_req, kv_indices, page_size, *, has_state: bool, metadata_kwargs
+    ) -> None:
+        """Stage transfer indices in pinned memory and send them after the copy."""
+        decode_req.metadata_buffer_index = (
+            self.req_to_metadata_buffer_idx_allocator.alloc()
+        )
+        assert decode_req.metadata_buffer_index is not None
+
+        device_indices = [kv_indices[::page_size] // page_size]
+        if has_state:
+            device_indices.append(
+                self.req_to_token_pool.translate_mamba_indices(
+                    self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                        decode_req.req.kv.req_pool_idx
+                    ]
+                )
+            )
+        host_indices = []
+        for device_tensor in device_indices:
+            host_tensor = torch.empty(
+                device_tensor.shape, dtype=device_tensor.dtype, pin_memory=True
+            )
+            host_tensor.copy_(device_tensor, non_blocking=True)
+            host_indices.append(host_tensor)
+
+        copy_done = torch.cuda.Event()
+        copy_done.record()
+        if (
+            self.transfer_queue.enable_staging
+            and decode_req.kv_receiver.require_staging
+        ):
+            self.transfer_queue.staging_handler.register_decode_req(
+                decode_req.req.bootstrap_room, decode_req
+            )
+        self._deferred_sends.append(
+            (decode_req, host_indices, has_state, metadata_kwargs, copy_done)
+        )
+        self._num_published_destinations += 1
+        decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
+
+    def flush_deferred_sends(self) -> None:
+        """Send completed index copies in their allocation order."""
+        while self._deferred_sends and self._deferred_sends[0][4].query():
+            decode_req, host_indices, has_state, metadata_kwargs, _ = (
+                self._deferred_sends.popleft()
+            )
+            if decode_req.kv_receiver is None or isinstance(
+                decode_req.req.finished_reason, FINISH_ABORT
+            ):
+                continue
+            decode_req.kv_receiver.send_metadata(
+                host_indices[0].numpy().astype(np.int32),
+                decode_req.metadata_buffer_index,
+                [[host_indices[1].numpy()]] if has_state else [],
+                **metadata_kwargs,
+            )
+            if (
+                decode_req.is_rebootstrap
+                and get_disagg().disaggregation_decode_allocation_policy == "early"
+            ):
+                self._submit_prefill_recompute(decode_req)
 
     def _send_kv_metadata(
         self, decode_req, kv_indices, page_size, state_indices=None, **metadata_kwargs
@@ -3541,6 +3632,7 @@ class SchedulerDisaggregationDecodeMixin:
         # Resolve held releases every iteration (before the retraction/polling
         # gates below) so their timeouts fire under memory pressure.
         self.disagg_decode_transfer_queue.resolve_deferred_releases()
+        self.disagg_decode_prealloc_queue.flush_deferred_sends()
 
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
