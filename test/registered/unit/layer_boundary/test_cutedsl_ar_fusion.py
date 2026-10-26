@@ -9,6 +9,7 @@ import torch
 from sglang.srt.layers.flashinfer_mnnvl_cutedsl import (
     FlashInferMNNVLCuteDSLARFusion,
     _retargeted_config,
+    _run_r13_split_overlap,
     _with_early_finalize_shared_load,
 )
 from sglang.srt.layers.layer_boundary import (
@@ -30,6 +31,7 @@ from sglang.srt.layers.layer_boundary.fusions.allreduce import (
 )
 from sglang.srt.layers.layer_boundary.fusions.cutedsl import (
     CuteDSLFusion,
+    CuteDSLWorkspace,
     MoeDeferredFinalize,
     install_cutedsl_fusion,
     prepare_cutedsl_fusion,
@@ -86,6 +88,101 @@ def _communicator():
 def _bound(entry):
     """What an entry runs and the layer it is bound to."""
     return entry.func, entry.args
+
+
+def test_r13_split_overlap_has_the_required_cross_stream_dependencies():
+    """CPU proof of the exact launch/event order used by the CUDA path."""
+    log = []
+
+    class Stream:
+        def __init__(self, name):
+            self.name = name
+
+        def wait_event(self, event):
+            log.append((self.name, "wait", event.name))
+
+    class Event:
+        def __init__(self, name):
+            self.name = name
+
+        def record(self, stream):
+            log.append((self.name, "record", stream.name))
+
+    class StreamContext:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            log.append((self.stream.name, "enter"))
+
+        def __exit__(self, *exc):
+            log.append((self.stream.name, "exit"))
+
+    main, comm = Stream("main"), Stream("comm")
+    first, second, done = Event("first"), Event("second"), Event("done")
+    with patch("torch.cuda.stream", side_effect=StreamContext):
+        _run_r13_split_overlap(
+            main_stream=main,
+            comm_stream=comm,
+            first_ready=first,
+            second_ready=second,
+            done=done,
+            launch_first_bmm=lambda: log.append(("bmm", 0)),
+            launch_second_bmm=lambda: log.append(("bmm", 1)),
+            launch_first_all_reduce=lambda: log.append(("ar", 0)),
+            launch_second_all_reduce=lambda: log.append(("ar", 1)),
+        )
+
+    assert log == [
+        ("bmm", 0),
+        ("first", "record", "main"),
+        ("comm", "wait", "first"),
+        ("comm", "enter"),
+        ("ar", 0),
+        ("comm", "exit"),
+        ("bmm", 1),
+        ("second", "record", "main"),
+        ("comm", "wait", "second"),
+        ("comm", "enter"),
+        ("ar", 1),
+        ("done", "record", "comm"),
+        ("comm", "exit"),
+        ("main", "wait", "done"),
+    ]
+
+
+def test_r13_overlap_handoff_is_single_use_and_identity_checked():
+    service = CuteDSLWorkspace(hidden_size=8, top_k=2, rms_epsilon=1e-6)
+    partial = torch.zeros(4, 8)
+    residual = torch.ones(4, 8)
+    gamma = torch.ones(8)
+    norm = torch.full((4, 8), 2.0)
+    residual_out = torch.full((4, 8), 3.0)
+    service._r13_overlap_pending = (
+        partial,
+        residual,
+        gamma,
+        norm,
+        residual_out,
+    )
+    taken = service.take_r13_overlap(partial=partial, residual=residual, gamma=gamma)
+    assert taken is not None and taken[0] is norm and taken[1] is residual_out
+    assert (
+        service.take_r13_overlap(partial=partial, residual=residual, gamma=gamma)
+        is None
+    )
+
+    service._r13_overlap_pending = (
+        partial,
+        residual,
+        gamma,
+        norm,
+        residual_out,
+    )
+    with pytest.raises(RuntimeError, match="does not match"):
+        service.take_r13_overlap(
+            partial=partial.clone(), residual=residual, gamma=gamma
+        )
 
 
 def _test_layer(**kwargs):

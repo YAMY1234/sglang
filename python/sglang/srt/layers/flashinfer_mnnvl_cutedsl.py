@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import torch
 import torch.distributed as dist
@@ -43,6 +43,44 @@ _HT_NON_REDUCTION_WARPS = 2
 _HT_REDUCTION_WARP_CHOICES = (1, 2, 4, 8)
 
 SUPPORTED_TP_SIZES = (2, 4, 8, 16)
+
+
+def _run_r13_split_overlap(
+    *,
+    main_stream,
+    comm_stream,
+    first_ready,
+    second_ready,
+    done,
+    launch_first_bmm: Callable[[], None],
+    launch_second_bmm: Callable[[], None],
+    launch_first_all_reduce: Callable[[], None],
+    launch_second_all_reduce: Callable[[], None],
+) -> None:
+    """Order two GEMM halves against two AR halves on a side stream.
+
+    The first AR is released as soon as the first GEMM half is ready. The main
+    stream then computes the second half while the communication stream runs
+    the first half's unchanged fused AR + residual + RMSNorm. Both streams join
+    before the projection is returned to the layer boundary.
+
+    Kept as a small scheduling primitive so the dependency graph can be tested
+    without CUDA; the callables enqueue the real kernels in production.
+    """
+    launch_first_bmm()
+    first_ready.record(main_stream)
+    comm_stream.wait_event(first_ready)
+    with torch.cuda.stream(comm_stream):
+        launch_first_all_reduce()
+
+    launch_second_bmm()
+    second_ready.record(main_stream)
+    comm_stream.wait_event(second_ready)
+    with torch.cuda.stream(comm_stream):
+        launch_second_all_reduce()
+        done.record(comm_stream)
+
+    main_stream.wait_event(done)
 
 
 def _ht_shard_split(
@@ -424,6 +462,22 @@ class FlashInferMNNVLCuteDSLARFusion:
             )
             self._bt_tail = self._patch_bt_tail()
             self._e4m3 = self._install_e4m3_payload()
+            self._r13_overlap_stream = None
+            if envs.SGLANG_R13_T4COMM_OVERLAP.get():
+                if self._e4m3 is None:
+                    raise RuntimeError(
+                        "R13-T4COMM overlap requires the existing "
+                        "SGLANG_PERFLP_AR_FP8_PAYLOAD route"
+                    )
+                self._r13_overlap_stream = torch.cuda.Stream(
+                    device=self.device, priority=0
+                )
+                logger.info(
+                    "R13-T4COMM split projection/AR overlap active for "
+                    "M=%d..%d (TARGET_VERIFY only; existing E4M3 payload)",
+                    envs.SGLANG_R13_T4COMM_OVERLAP_MIN_TOKENS.get(),
+                    envs.SGLANG_R13_T4COMM_OVERLAP_MAX_TOKENS.get(),
+                )
 
             # Publish only after the mailbox barrier; without it the ranks
             # would desynchronize their Lamport stages.
@@ -487,6 +541,120 @@ class FlashInferMNNVLCuteDSLARFusion:
             hidden_dim=self.hidden_size,
             dtype=torch.bfloat16,
         )
+
+    def r13_overlap_split(self, m: int) -> int | None:
+        """The equal, TP-aligned split for the R13 overlap experiment."""
+        if self._r13_overlap_stream is None or self._e4m3 is None:
+            return None
+        m = int(m)
+        if not (
+            envs.SGLANG_R13_T4COMM_OVERLAP_MIN_TOKENS.get()
+            <= m
+            <= envs.SGLANG_R13_T4COMM_OVERLAP_MAX_TOKENS.get()
+            and m % (2 * self.tp_size) == 0
+            and self.supports(m)
+            # Keep this an ordering change to the R11 path, not a route change.
+            and self._e4m3.takes_all_reduce(m)
+        ):
+            return None
+        split = m // 2
+        if not (
+            self.supports(split)
+            and self.supports(m - split)
+            and self._e4m3.takes_all_reduce(split)
+            and self._e4m3.takes_all_reduce(m - split)
+        ):
+            return None
+        return split
+
+    def r13_overlap_fp8_projection(
+        self,
+        *,
+        q_input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        out_dtype: torch.dtype,
+        residual: torch.Tensor,
+        gamma: torch.Tensor,
+        events: tuple,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Split one FP8 output GEMM and overlap its first half with E4M3 AR.
+
+        Returns ``(local_partial, norm_output, residual_output)``. The first
+        element still flows through the ordinary layer-boundary handoff, whose
+        consumer exchanges it for the two already-computed outputs.
+        """
+        m = int(q_input.shape[0])
+        split = self.r13_overlap_split(m)
+        if split is None:
+            return None
+        if not (
+            q_input.ndim == 2
+            and weight.ndim == 2
+            and q_input.shape[1] == weight.shape[0]
+            and residual.shape == (m, self.hidden_size)
+            and weight.shape[1] == self.hidden_size
+            and out_dtype == torch.bfloat16
+            and input_scale.numel() == 1
+            and weight_scale.numel() == 1
+            and len(events) == 3
+        ):
+            return None
+
+        from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+            use_symmetric_memory,
+        )
+        from sglang.srt.layers.dp_attention import is_allocation_symmetric
+        from sglang.srt.layers.quantization.fp8_utils import bmm_fp8
+        from sglang.srt.runtime_context import get_parallel
+
+        # Match RowParallelLinear's allocation contract for the TP partial.
+        with use_symmetric_memory(
+            get_parallel().tp_group, disabled=not is_allocation_symmetric()
+        ):
+            partial = torch.empty(
+                (m, self.hidden_size), dtype=out_dtype, device=q_input.device
+            )
+        norm_output = torch.empty_like(partial)
+        residual_output = torch.empty_like(partial)
+
+        def bmm_rows(begin: int, end: int) -> None:
+            bmm_fp8(
+                q_input[begin:end].unsqueeze(0),
+                weight.unsqueeze(0),
+                input_scale.reshape(1),
+                weight_scale.reshape(1),
+                out_dtype,
+                out=partial[begin:end].unsqueeze(0),
+            )
+
+        def reduce_rows(begin: int, end: int) -> None:
+            assert self._e4m3 is not None
+            self._e4m3.all_reduce(
+                local_contribution=partial[begin:end],
+                residual_source=residual[begin:end],
+                gamma=gamma,
+                norm_output=norm_output[begin:end],
+                residual_output=residual_output[begin:end],
+                m=end - begin,
+            )
+
+        assert self._r13_overlap_stream is not None
+        main_stream = torch.cuda.current_stream(self.device)
+        first_ready, second_ready, done = events
+        _run_r13_split_overlap(
+            main_stream=main_stream,
+            comm_stream=self._r13_overlap_stream,
+            first_ready=first_ready,
+            second_ready=second_ready,
+            done=done,
+            launch_first_bmm=lambda: bmm_rows(0, split),
+            launch_second_bmm=lambda: bmm_rows(split, m),
+            launch_first_all_reduce=lambda: reduce_rows(0, split),
+            launch_second_all_reduce=lambda: reduce_rows(split, m),
+        )
+        return partial, norm_output, residual_output
 
     def moe_finalize_all_reduce_rms_norm(
         self,

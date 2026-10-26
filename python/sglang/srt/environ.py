@@ -1308,6 +1308,13 @@ class Envs:
     # _MAX_TOKENS rows with tp 2 / 4 / 8 and hidden % 1024 == 0 (plb_mnnvl_cutedsl/e4m3_payload.py). Lowers precision.
     SGLANG_PERFLP_AR_FP8_PAYLOAD = EnvBool(False)
     SGLANG_PERFLP_AR_FP8_PAYLOAD_MAX_TOKENS = EnvInt(1024)
+    # R13-T4COMM: on wide target-verify rows, split an eligible FP8 attention/GDN
+    # output projection in half and overlap the first half's existing E4M3 BT
+    # all-reduce + residual + RMSNorm with the second half GEMM. This preserves
+    # the R11 payload and arithmetic formats; off by default.
+    SGLANG_R13_T4COMM_OVERLAP = EnvBool(False)
+    SGLANG_R13_T4COMM_OVERLAP_MIN_TOKENS = EnvInt(385)
+    SGLANG_R13_T4COMM_OVERLAP_MAX_TOKENS = EnvInt(1024)
     # Timing only: decode graph padding per block of Q35MF_AB_BLOCK target-verify rounds, the labels in turn
     # ("pow2": the smallest captured power of two); model_executor/runner_backend/ab_variants.py. Empty: off.
     SGLANG_TRTL17_PAD_AB = EnvTuple(())

@@ -57,6 +57,51 @@ def _is_supported_forward_mode(forward_mode: ForwardMode) -> bool:
     )
 
 
+class _R13OverlapSite:
+    """One registered attention/GDN output projection and its graph events."""
+
+    __slots__ = ("events", "fusion", "linear", "plan", "service")
+
+    def __init__(self, service, fusion, plan, linear) -> None:
+        self.service = service
+        self.fusion = fusion
+        self.plan = plan
+        self.linear = linear
+        self.events = None
+
+
+# The megakernel plugin reaches the boundary service from the exact RowParallelLinear
+# object it is replacing. Keep a strong reference and verify identity on lookup so a
+# recycled Python id can never select a stale site.
+_R13_OVERLAP_SITES: dict[int, _R13OverlapSite] = {}
+
+
+def try_r13_t4comm_overlap_output_projection(
+    *,
+    linear: torch.nn.Module,
+    q_input: torch.Tensor,
+    out_dtype: torch.dtype,
+    forward_batch: ForwardBatch,
+) -> Optional[torch.Tensor]:
+    """Run the R13 split projection/AR experiment for a registered output.
+
+    ``None`` declines without changing work. A returned tensor is the same TP
+    partial the ordinary boundary expects; its fused AR outputs are retained by
+    the service until that boundary immediately consumes the partial.
+    """
+    if not envs.SGLANG_R13_T4COMM_OVERLAP.get() or torch.compiler.is_compiling():
+        return None
+    site = _R13_OVERLAP_SITES.get(id(linear))
+    if site is None or site.linear is not linear:
+        return None
+    return site.service.try_r13_overlap_output_projection(
+        site=site,
+        q_input=q_input,
+        out_dtype=out_dtype,
+        forward_batch=forward_batch,
+    )
+
+
 def _resolve_max_m(*, max_running_requests: int | None) -> int:
     decode_config = get_exec().graph.cuda_graph_config.decode
     prefill_config = get_exec().graph.cuda_graph_config.prefill
@@ -163,6 +208,8 @@ class CuteDSLWorkspace:
         # keyed by the norm's fused gamma at first use, once weights are loaded.
         self._fp8_inputs = tuple(fp8_inputs)
         self._fp8_input_by_gamma: dict[int, torch.nn.Module] | None = None
+        self._r13_overlap_sites: list[_R13OverlapSite] = []
+        self._r13_overlap_pending = None
 
     def prepare(self, *, max_m: int) -> None:
         if self._workspace is not None:
@@ -188,6 +235,108 @@ class CuteDSLWorkspace:
         )
         self._workspace = workspace
         self.max_m = workspace.max_m
+        if envs.SGLANG_R13_T4COMM_OVERLAP.get():
+            if not envs.SGLANG_PERFLP_AR_FP8_PAYLOAD.get():
+                raise RuntimeError(
+                    "R13-T4COMM overlap requires the unchanged R11 E4M3 payload"
+                )
+            if not self._r13_overlap_sites:
+                raise RuntimeError(
+                    "R13-T4COMM overlap requested without registered output projections"
+                )
+            for site in self._r13_overlap_sites:
+                site.events = tuple(torch.cuda.Event() for _ in range(3))
+            logger.info(
+                "R13-T4COMM prepared %d registered output projections for "
+                "split GEMM/AR overlap",
+                len(self._r13_overlap_sites),
+            )
+
+    def register_r13_overlap_output(self, fusion, plan, linear) -> None:
+        if not envs.SGLANG_R13_T4COMM_OVERLAP.get():
+            return
+        if self._workspace is not None:
+            raise RuntimeError("register R13 overlap outputs before prepare()")
+        site = _R13OverlapSite(self, fusion, plan, linear)
+        old = _R13_OVERLAP_SITES.get(id(linear))
+        if old is not None and old.linear is linear:
+            raise RuntimeError("R13 overlap output projection registered twice")
+        _R13_OVERLAP_SITES[id(linear)] = site
+        self._r13_overlap_sites.append(site)
+
+    def try_r13_overlap_output_projection(
+        self,
+        *,
+        site: _R13OverlapSite,
+        q_input: torch.Tensor,
+        out_dtype: torch.dtype,
+        forward_batch: ForwardBatch,
+    ) -> Optional[torch.Tensor]:
+        if not (
+            forward_batch.forward_mode == ForwardMode.TARGET_VERIFY
+            and q_input.ndim == 2
+            and out_dtype == torch.bfloat16
+            and site.events is not None
+            and self._workspace is not None
+            and site.fusion._eligible(site.plan, forward_batch, int(q_input.shape[0]))
+            and not get_exec().comm.enable_quant_communications
+        ):
+            return None
+        from sglang.srt.layers.layer_boundary.residual.batch import stream_of
+
+        stream = stream_of(forward_batch)
+        residual = stream.residual
+        gamma = _fused_norm_gamma(site.plan.norm)
+        # During attention/mixer compute the input boundary has already written
+        # the residual and no producer contribution has yet been recorded.
+        if stream.pending is not None or residual is None or gamma is None:
+            return None
+        if self._r13_overlap_pending is not None:
+            raise RuntimeError(
+                "R13 overlap output reached the next projection before its "
+                "layer boundary consumed the previous result"
+            )
+        result = self._workspace.r13_overlap_fp8_projection(
+            q_input=q_input,
+            weight=site.linear.weight,
+            input_scale=site.linear.input_scale,
+            weight_scale=site.linear.weight_scale,
+            out_dtype=out_dtype,
+            residual=residual,
+            gamma=gamma,
+            events=site.events,
+        )
+        if result is None:
+            return None
+        partial, norm_output, residual_output = result
+        self._r13_overlap_pending = (
+            partial,
+            residual,
+            gamma,
+            norm_output,
+            residual_output,
+        )
+        return partial
+
+    def take_r13_overlap(
+        self,
+        *,
+        partial: torch.Tensor,
+        residual: torch.Tensor,
+        gamma: torch.Tensor,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        pending = self._r13_overlap_pending
+        if pending is None:
+            return None
+        if not (
+            pending[0] is partial and pending[1] is residual and pending[2] is gamma
+        ):
+            raise RuntimeError(
+                "R13 overlap result does not match the immediately following "
+                "layer-boundary consumer"
+            )
+        self._r13_overlap_pending = None
+        return pending[3], pending[4]
 
     def supports(self, m: int) -> bool:
         """False before prepare(), so it doubles as the readiness check."""
@@ -357,10 +506,18 @@ class CuteDSLFusion:
         ):
             return None
         assert self.service is not None
+        gamma = _fused_norm_gamma(plan.norm)
+        overlapped = self.service.take_r13_overlap(
+            partial=hidden_states,
+            residual=residual,
+            gamma=gamma,
+        )
+        if overlapped is not None:
+            return overlapped
         return self.service.all_reduce_residual_rms_norm(
             local_contribution=hidden_states,
             residual=residual,
-            gamma=_fused_norm_gamma(plan.norm),
+            gamma=gamma,
         )
 
     def _finalize_eligible(self, plan, forward_batch: ForwardBatch, m: int) -> bool:
@@ -431,6 +588,9 @@ def install_cutedsl_fusion(
     terminal_finalize: bool = False,
     include_shared_expert: bool = True,
     fp8_input_linear: Optional[Callable[[torch.nn.Module], torch.nn.Module]] = None,
+    overlap_output_linear: Optional[
+        Callable[[torch.nn.Module], torch.nn.Module]
+    ] = None,
 ) -> CuteDSLWorkspace | None:
     """One shared workspace handle per fusion-enabled layer, or None.
 
@@ -439,6 +599,8 @@ def install_cutedsl_fusion(
     the model must then pass the returned service as
     residual_batch.final_norm(finalize_norm=...). fp8_input_linear(layer) is the
     projection reading the layer's input norm (SGLANG_PLB_AR_FP8_OUT).
+    overlap_output_linear(layer) identifies the attention/GDN output projection
+    whose target-verify GEMM may feed the R13 split overlap experiment.
     """
     if get_flags().moe.in_speculative_scope:
         # A draft shares the target's process, which holds one workspace.
@@ -489,6 +651,12 @@ def install_cutedsl_fusion(
             defers_finalize=defers_finalize,
             terminal_finalize=terminal_finalize,
         )
+        if overlap_output_linear is not None and envs.SGLANG_R13_T4COMM_OVERLAP.get():
+            service.register_r13_overlap_output(
+                fusion,
+                layer.ffn_boundary.plan,
+                overlap_output_linear(layer),
+            )
     logger.info(
         "Installed one %s FlashInfer MNNVL CuTe DSL fusion handle for %d of %d layers "
         "(%d can defer the MoE finalize)",
