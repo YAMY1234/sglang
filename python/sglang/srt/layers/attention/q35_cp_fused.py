@@ -12,8 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# Adapted from TensorRT-LLM 4d09932ca7 (Apache-2.0): tensorrt_llm/_torch/attention_backend/fmha/q35_cp_fused.py;
-# switches are constants here (no q35_env), the debug ring is dropped, the kernel import points at this package.
+# Adapted from TensorRT-LLM 4d09932ca7 + 7df45abe5c's plans above 32 requests (Apache-2.0):
+# tensorrt_llm/_torch/attention_backend/fmha/q35_cp_fused.py; switches are constants here, the debug ring is dropped,
+# and the kernel import points at this package.
 """Host side of the Qwen3.5 fused CP-lite partial decode attention.
 
 One launch replaces the preparation, FMHA, LSE, and partial-output launches. Each CP
@@ -33,11 +34,26 @@ logger = logging.getLogger(__name__)
 PAGE = 64
 HEAD_DIM = 256
 MAX_ROWS = 128
+# Batch bound of the plan: one request per lane of the plan warp up to 32; above that the wide-plan kernel variant
+# (two requests per lane, q35_cp_partial_attn.Q35CpPartialAttnKernel._plan_wide) up to 64, and the quad-plan variant
+# (four per lane, _plan_quad) up to 128. The equal split stays <= 32.
+_QUAD_PLAN_MAX_BATCH = 128
+# Above 64 requests the calls take the two-slot kernel (kernel_two / _plan_two, four requests per plan-warp lane): a
+# CTA computes up to two requests, so no request is held to whole CTAs. The plans above give every request at least one
+# of the SMs' CTAs; past ~SMs / 2 uniform long requests then get exactly one each and the slowest CTA runs a whole
+# request (64k contexts, b96: 128 tiles where 81 would balance), which the two-slot plan's per-CTA share removes.
+_TWO_SLOT_MAX_BATCH = 128
+_WIDE_PLAN_MAX_BATCH = 64
+_LANE_PLAN_MAX_BATCH = 32
 
 
-MAX_BATCH = 32
-MAX_BATCH_Q1 = 32
-_BALANCED = False
+# Verify calls use the wide and two-slot plans through 128 requests; draft calls use
+# the wide plan through 64. Batches at or below 32 keep the equal split, so the
+# separate balanced-split optimization remains disabled.
+MAX_BATCH = 128
+MAX_BATCH_Q1 = 64
+# Pack every two-slot call; the unpacked form remains available as a test hook.
+_TWO_SLOT_PACK = True
 
 
 # Mirror of q35_cp_partial_attn.MAX_COMB_ROWS (rows one CTA's combine chunk may touch).
@@ -93,17 +109,17 @@ def cp_partial_geometry(rows: int, n_splits: int) -> dict:
     }
 
 
-def cp_partial_balanced_ws_bytes(rows: int, n_ctas: int) -> int:
+def cp_partial_balanced_ws_bytes(rows: int, n_ctas: int, slots: int = 1) -> int:
     """Mirror of q35_cp_partial_attn.cp_partial_balanced_geometry()["ws_bytes"]: per CTA one O slot (the largest
     per-split share n_chunks(c) * chunk_pad(c) of a request's partials over c = 1..n_ctas, FP16) and 16 * rows bytes
-    of LSE space."""
+    of LSE space; ``slots`` slots per CTA (2 for the two-slot plan)."""
     total = rows * HEAD_DIM
     slot_o = 0
     for c in range(1, n_ctas + 1):
         chunk = 8 * ((total + 8 * c - 1) // (8 * c))
         chunk_pad = chunk + (8 if (chunk // 8) % 2 == 0 else 0)
         slot_o = max(slot_o, ((total + chunk - 1) // chunk) * chunk_pad * 2)
-    return n_ctas * (16 * ((slot_o + 15) // 16) + 16 * rows)
+    return slots * n_ctas * (16 * ((slot_o + 15) // 16) + 16 * rows)
 
 
 def balanced_split_plan(seq_lens, cp_rank: int, cp_size: int, n_ctas: int):
@@ -117,7 +133,7 @@ def balanced_split_plan(seq_lens, cp_rank: int, cp_size: int, n_ctas: int):
         for L in seq_lens
     ]
     b = len(t)
-    assert 1 <= b < n_ctas and b <= 32
+    assert 1 <= b < n_ctas and b <= _QUAD_PLAN_MAX_BATCH
     total, tmax = sum(t), max(t)
     lo = max(-(-total // n_ctas), 1)
     hi = max(min(tmax, -(-total // (n_ctas - b))), lo)
@@ -138,6 +154,98 @@ def balanced_split_plan(seq_lens, cp_rank: int, cp_size: int, n_ctas: int):
     return lo, c, ctas
 
 
+def _two_slot_pack_starts(t, T: int):
+    """Packed two-slot placement for T: request r starts at V_r; at a CTA boundary it takes max(t_r, 1) virtual
+    tiles, at offset p inside a CTA's range max(t_r, T - p). Returns (starts, end)."""
+    starts, V = [], 0
+    for x in t:
+        starts.append(V)
+        p = V % T
+        V += max(x, 1) if p == 0 else max(x, T - p)
+    return starts, V
+
+
+def _two_slot_pack_T(t, n_ctas: int, hi: int) -> int:
+    """T of the packed plan (q35_cp_partial_attn.Q35CpPartialAttnKernel._plan_pack): feasible = end <= n_ctas * T,
+    not monotone in T; hi (the unpacked plan's T) always is. The smallest feasible T in [lo, lo + 31], lo = ceil(sum
+    max(t_r, 1) / n_ctas); else the smallest feasible of 32 candidates from lo + 32 to hi in steps of s, then the
+    smallest feasible of the min(s - 1, 32) values below it (or it)."""
+    lo = max(-(-sum(max(x, 1) for x in t) // n_ctas), 1)
+
+    def ok(T):
+        return _two_slot_pack_starts(t, T)[1] <= n_ctas * T
+
+    for T in range(lo, lo + 32):
+        if ok(T):
+            return T
+    lo2 = lo + 32
+    s = max(-(-(hi - lo2) // 31), 1)
+    c1 = next(T for T in (min(lo2 + k * s, hi) for k in range(32)) if ok(T))
+    return next((T for T in range(c1 - min(s - 1, 32), c1) if ok(T)), c1)
+
+
+def balanced_split_plan_two(
+    seq_lens, cp_rank: int, cp_size: int, n_ctas: int, pack: bool = False
+):
+    """Host mirror of the two-slot plan (q35_cp_partial_attn.Q35CpPartialAttnKernel._plan_two).
+
+    T = the smallest tile count with sum_r max(t_r, T) <= n_ctas * T; request r takes the virtual tile range [V_r, V_r
+    + max(t_r, T)) (requests in order), CTA i the range [i * T, (i + 1) * T). Returns (T, slots): slots[i] = [slot 0,
+    slot 1] of CTA i, each None or (request, index among the request's CTAs, its CTAs, first workspace slot, first
+    tile, tiles, CTAs with work); slot 0 is the request holding the CTA's first position, slot 1 the one starting
+    inside its range. With ``pack``, use the request positions and T from _two_slot_pack_starts / _two_slot_pack_T.
+    """
+    t = [
+        ((((int(L) + PAGE - 1) // PAGE) - cp_rank + cp_size - 1) // cp_size + 1) // 2
+        for L in seq_lens
+    ]
+    b = len(t)
+    assert 1 <= b < n_ctas and b <= _TWO_SLOT_MAX_BATCH
+    total, tmax = sum(t), max(t)
+    lo = max(-(-total // n_ctas), 1)
+    hi = max(tmax, lo)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if sum(max(x, mid) for x in t) <= n_ctas * mid:
+            hi = mid
+        else:
+            lo = mid + 1
+    T = lo
+    if pack:
+        T = _two_slot_pack_T(t, n_ctas, T)
+        starts, end = _two_slot_pack_starts(t, T)
+    else:
+        starts = [0]
+        for x in t:
+            starts.append(starts[-1] + max(x, T))
+        end = starts.pop()
+    slots = [[None, None] for _ in range(n_ctas)]
+    s0 = 0
+    for r, x in enumerate(t):
+        V = starts[r]
+        te = max(x, 1)
+        f, last = V // T, (V + te - 1) // T
+        c = last - f + 1
+        for j in range(c):
+            i = f + j
+            lo_t, hi_t = max(V, i * T) - V, min(V + te, (i + 1) * T) - V
+            slot = (
+                r,
+                j,
+                c,
+                s0,
+                lo_t if x else 0,
+                hi_t - lo_t if x else 0,
+                c if x else 0,
+            )
+            k = 0 if V <= i * T else 1
+            assert slots[i][k] is None
+            slots[i][k] = slot
+        s0 += c
+    assert end <= n_ctas * T and s0 <= 2 * n_ctas
+    return T, slots
+
+
 def _num_splits(batch: int, sm_count: int) -> int:
     return max((sm_count - _SM_RESERVE) // batch, 1)
 
@@ -148,17 +256,29 @@ def _num_ctas(sm_count: int) -> int:
 
 
 def q35_cp_fused_supported(
-    q_len: int, cp_size: int, hq: int, batch: int, sm_count: int
+    q_len: int,
+    cp_size: int,
+    hq: int,
+    batch: int,
+    sm_count: int,
+    max_batch: int | None = None,
 ) -> bool:
-    """Shapes the kernel handles (D 256, FP8 q / KV and 64-token pages are checked by the caller)."""
+    """Shapes the kernel handles (D 256, FP8 q / KV and 64-token pages are checked by the caller). max_batch: the
+    batch bound (default MAX_BATCH, or MAX_BATCH_Q1 at q_len 1; a caller that folds q_len into the heads passes its
+    own)."""
     rows = q_len * cp_size * hq
-    max_batch = MAX_BATCH if q_len > 1 else MAX_BATCH_Q1
-    if not (1 <= rows <= MAX_ROWS and 1 <= batch <= max_batch and batch <= sm_count):
+    if max_batch is None:
+        max_batch = MAX_BATCH if q_len > 1 else MAX_BATCH_Q1
+    if not (
+        1 <= rows <= MAX_ROWS
+        and 1 <= batch <= min(max_batch, MAX_BATCH)
+        and batch <= sm_count
+    ):
         return False
-    if _BALANCED:
+    if batch > _LANE_PLAN_MAX_BATCH:
         return batch < _num_ctas(
             sm_count
-        )  # the plan gives every request a CTA; one warp plans <= 32 requests
+        )  # the plan gives every request a CTA; it plans <= 128 requests
     return (
         cp_partial_geometry(rows, _num_splits(batch, sm_count))["max_cov_rows"]
         <= _MAX_COMB_ROWS
@@ -181,20 +301,23 @@ class _DeviceState:
                         "ws_req_bytes"
                     ],
                 )
-        if _BALANCED:
-            need = max(
-                need, cp_partial_balanced_ws_bytes(MAX_ROWS, _num_ctas(sm_count))
-            )
-            logger.info(
-                f"TRTLLM_Q35_ATTN_CP_BALANCED_SPLIT=1: CP-lite fused partial attention shares "
-                f"{_num_ctas(sm_count)} CTAs among the requests by their KV length (device {device})"
-            )
+        need = max(
+            need,
+            cp_partial_balanced_ws_bytes(MAX_ROWS, _num_ctas(sm_count), slots=2),
+        )
         self.workspace = torch.empty(need // 4 + 64, dtype=torch.float32, device=device)
         self.ws_balanced = (
             None  # test calls that override the split mode (_balanced_workspace)
         )
         self.balanced_logged = (
             False  # runtime evidence: one INFO line at the first balanced call
+        )
+        self.wide_logged = (
+            False  # ... and one at the first call above 32 requests (wide-plan variant)
+        )
+        self.quad_logged = False  # ... and one at the first call above 64 requests (two-slot / quad-plan variant)
+        self.pack_logged = (
+            False  # ... and one at the first two-slot call on the packed plan
         )
         self.counters = torch.zeros(
             MAX_BATCH + 1, MAX_BATCH, dtype=torch.int64, device=device
@@ -253,8 +376,7 @@ def _ptr(t: torch.Tensor, dtype, align: int):
 
 
 def _balanced_workspace(state: "_DeviceState", need: int) -> torch.Tensor:
-    """Workspace of a balanced-split call: the device workspace (sized for it under TRTLLM_Q35_ATTN_CP_BALANCED_SPLIT)
-    or, for test calls that override the mode, a separate one allocated on first use."""
+    """Workspace for a wide-plan call or a test that overrides the split mode."""
     if state.workspace.numel() * 4 >= need:
         return state.workspace
     if state.ws_balanced is None or state.ws_balanced.numel() * 4 < need:
@@ -290,10 +412,15 @@ def _compiled(
     l_from_p8: bool = False,
     len_sub: int = 0,
     early_trigger: bool = False,
+    wide_plan: bool = False,
+    quad_plan: bool = False,
+    two_slot: bool = False,
+    two_slot_pack: bool = False,
 ):
     import cuda.bindings.driver as cuda
     import cutlass
     from cutlass import cute
+
     from sglang.srt.layers.attention.q35_cp_partial_attn import Q35CpPartialAttnKernel
 
     if balanced:
@@ -318,8 +445,14 @@ def _compiled(
             l_from_p8=l_from_p8,
             len_sub=len_sub,
             early_trigger=early_trigger,
+            wide_plan=wide_plan,
+            quad_plan=quad_plan,
+            two_slot=two_slot,
+            two_slot_pack=two_slot_pack,
         )
-        assert kernel.ws_bytes == cp_partial_balanced_ws_bytes(q_len * gh, n_splits)
+        assert kernel.ws_bytes == cp_partial_balanced_ws_bytes(
+            q_len * gh, n_splits, 2 if two_slot else 1
+        )
     else:
         kernel = Q35CpPartialAttnKernel(
             q_len=q_len,
@@ -414,6 +547,8 @@ def q35_cp_fused_partial(
     l_from_p8: bool = False,
     len_sub: int = 0,
     early_trigger: bool = False,
+    plan: str | None = None,
+    pack: bool | None = None,
 ) -> None:
     """This CP rank's partial attention of every group head over the pages it owns (q35_cp_fused_partial_ref).
 
@@ -424,8 +559,11 @@ def q35_cp_fused_partial(
     log2e); bmm2_scale float or a [>= 1] FP32 tensor. out_o [cp, rows, hq, D] bf16 (unit stride on D), out_lse [cp,
     rows, hq] FP32 (base 2). Test hooks: debug (int64 [b * splits, 16] %globaltimer stamps; [CTAs, 16] when balanced),
     unsafe_skip_wait (no dependency waits), n_splits (must come with its own ``counters``: every launch on a counter
-    row must use the same split count; balanced: the grid's CTAs), fresh_margin, balanced (overrides
-    TRTLLM_Q35_ATTN_CP_BALANCED_SPLIT; a mode other than the module's needs its own ``counters``).
+    row must use the same split count; balanced: the grid's CTAs), fresh_margin, balanced (a test override of the
+    split mode; the wide runtime path selects it automatically and an override needs its own ``counters``), plan
+    ("lane", "wide", "quad" or "two": the wide split's plan variant instead of the one the batch selects; lane / wide
+    / quad cover up to 32 / 64 / 128 requests and compute the same one-slot plan, "two" (up to 128) the two-slot plan,
+    with [CTAs, 24] debug rows), pack (a test override of the packed two-slot plan).
     Numerics: p_shift (E4M3 P shift, default _P_SHIFT), rescale_threshold (lazy rescale threshold in log2 units,
     default min(8, 8.75 - p_shift); 0 = exact running max), l_from_p8 (row sums from the E4M3-rounded P).
     """
@@ -480,7 +618,34 @@ def q35_cp_fused_partial(
     device = q_all.device
     sms = sm_count or _sm_count(device)
     state = _state(device, sms)
-    bal = _BALANCED if balanced is None else bool(balanced)
+    bal = b > _LANE_PLAN_MAX_BATCH if balanced is None else bool(balanced)
+    assert bal or b <= _LANE_PLAN_MAX_BATCH, "the equal split handles <= 32 requests"
+    # plan variant: lane (<= 32 requests), wide (33..64), two-slot (65..128); `plan` overrides it in tests (also
+    # "quad": the one-slot plan for 65..128)
+    if plan is None:
+        plan = (
+            "two"
+            if b > _WIDE_PLAN_MAX_BATCH
+            else ("wide" if b > _LANE_PLAN_MAX_BATCH else "lane")
+        )
+    assert bal or plan == "lane", "plan variants are balanced-split plans"
+    assert (
+        b
+        <= {
+            "lane": _LANE_PLAN_MAX_BATCH,
+            "wide": _WIDE_PLAN_MAX_BATCH,
+            "quad": _QUAD_PLAN_MAX_BATCH,
+            "two": _TWO_SLOT_MAX_BATCH,
+        }[plan]
+    )
+    wide = bal and plan == "wide"
+    quad = bal and plan == "quad"
+    two = bal and plan == "two"
+    two_pack = two and (_TWO_SLOT_PACK if pack is None else bool(pack))
+    if two and debug is not None:
+        assert debug.shape[-1] >= 24, (
+            "the two-slot kernel's debug rows hold 24 words (both slots' plans)"
+        )
     if bal:
         splits = n_splits if n_splits else _num_ctas(sms)
         assert b < splits <= sms, (
@@ -491,7 +656,7 @@ def q35_cp_fused_partial(
         assert splits * b <= sms, (
             "the in-kernel grid barrier needs every CTA co-resident (one per SM)"
         )
-    if n_splits or bal != _BALANCED:
+    if n_splits or balanced is not None:
         assert counters is not None, (
             "a split-count or split-mode override needs its own counters tensor"
         )
@@ -504,12 +669,33 @@ def q35_cp_fused_partial(
     )
     assert cnt.is_contiguous()
     if bal:
-        ws = _balanced_workspace(state, cp_partial_balanced_ws_bytes(R, splits))
+        ws = _balanced_workspace(
+            state, cp_partial_balanced_ws_bytes(R, splits, 2 if two else 1)
+        )
         if balanced is None and not state.balanced_logged:
             state.balanced_logged = True
             logger.info(
-                f"TRTLLM_Q35_ATTN_CP_BALANCED_SPLIT=1: first balanced call (q_len {q_len}, batch {b}, cp_rank "
-                f"{cp_rank}, {splits} CTAs)"
+                f"CP-lite first wide-plan call (q_len {q_len}, batch {b}, "
+                f"cp_rank {cp_rank}, {splits} CTAs)"
+            )
+        if wide and balanced is None and not state.wide_logged:
+            state.wide_logged = True
+            logger.info(
+                f"CP-lite first call above {_LANE_PLAN_MAX_BATCH} requests on the wide-plan kernel "
+                f"(q_len {q_len}, batch {b}, cp_rank {cp_rank}, {splits} CTAs)"
+            )
+        if (quad or two) and balanced is None and not state.quad_logged:
+            state.quad_logged = True
+            logger.info(
+                f"CP-lite first call above {_WIDE_PLAN_MAX_BATCH} requests on the "
+                f"{'two-slot' if two else 'quad-plan'} kernel (q_len {q_len}, "
+                f"batch {b}, cp_rank {cp_rank}, {splits} CTAs)"
+            )
+        if two_pack and balanced is None and not state.pack_logged:
+            state.pack_logged = True
+            logger.info(
+                f"CP-lite first two-slot call on the packed plan (q_len {q_len}, "
+                f"batch {b}, cp_rank {cp_rank}, {splits} CTAs)"
             )
     else:
         need = b * cp_partial_geometry(R, splits)["ws_req_bytes"]
@@ -557,12 +743,16 @@ def q35_cp_fused_partial(
             debug is not None,
             unsafe_skip_wait,
             _P_SHIFT if p_shift is None else float(p_shift),
-            _DBG_SLOTS if ring is not None else 0,
+            _DBG_SLOTS if (ring is not None and not two) else 0,
             True,
             rescale_threshold,
             bool(l_from_p8),
             int(len_sub),
             bool(early_trigger),
+            wide,
+            quad,
+            two,
+            two_pack,
         )
     else:
         fn = _compiled(
