@@ -8,8 +8,8 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
-
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.runner_backend import ab_variants
 from sglang.srt.runtime_context import get_spec
 
 if TYPE_CHECKING:
@@ -432,7 +432,9 @@ class FlashInferMNNVLCuteDSLARFusion:
     def _patch_bt_tail(self):
         """The PERF-LB BT MaterializeRMSNorm (plb_mnnvl_cutedsl), or None when off."""
         lamport = envs.SGLANG_PLB_MAT_LAMPORT.get()
-        e6v2 = envs.SGLANG_R14_KSMALL_E6V2.get()
+        e6v2 = envs.SGLANG_R14_KSMALL_E6V2.get() or ab_variants.env_any(
+            "SGLANG_R14_KSMALL_E6V2", "1"
+        )
         fp8_out = envs.SGLANG_PLB_AR_FP8_OUT.get() or e6v2
         if not (lamport or fp8_out):
             return None

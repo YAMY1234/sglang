@@ -13,7 +13,6 @@ from functools import partial
 from typing import Callable, Optional, Sequence
 
 import torch
-
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
@@ -27,6 +26,7 @@ from sglang.srt.layers.layer_boundary import (
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.runner_backend import ab_variants
 from sglang.srt.runtime_context import (
     cutedsl_moe_max_num_tokens,
     get_disagg,
@@ -196,6 +196,14 @@ class CuteDSLWorkspace:
     def _fp8_input_scale(self, gamma: torch.Tensor) -> Optional[torch.Tensor]:
         """The static input scale of the FP8 projection reading the norm with ``gamma``."""
         if not self._fp8_inputs or torch.compiler.is_compiling():
+            return None
+        if not (
+            envs.SGLANG_PLB_AR_FP8_OUT.get()
+            or ab_variants.switch(
+                envs.SGLANG_R14_KSMALL_E6V2.get(),
+                "SGLANG_R14_KSMALL_E6V2",
+            )
+        ):
             return None
         if self._fp8_input_by_gamma is None:
             self._fp8_input_by_gamma = {
@@ -477,6 +485,7 @@ def install_cutedsl_fusion(
             and (
                 envs.SGLANG_PLB_AR_FP8_OUT.get()
                 or envs.SGLANG_R14_KSMALL_E6V2.get()
+                or ab_variants.env_any("SGLANG_R14_KSMALL_E6V2", "1")
             )
             else ()
         ),
