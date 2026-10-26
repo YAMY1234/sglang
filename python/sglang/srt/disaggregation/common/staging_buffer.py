@@ -23,6 +23,7 @@ import triton.language as tl
 from sglang.kernels.ops.memory.ptr_table import make_ptr_table
 from sglang.srt.environ import envs
 from sglang.srt.utils import create_device_stream, device_stream_context
+from sglang.srt.utils.common import async_h2d
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +144,54 @@ def _fused_scatter_from_staging_kernel(
         pool_token * stride_pool_token.to(tl.int64) + head_offset.to(tl.int64) + e_idx
     )
     tl.store(layer_ptr + dst_offsets, vals, mask=mask)
+
+
+@triton.jit
+def _scatter_staging_pages_kernel(
+    layer_ptrs,
+    page_indices,
+    staging,
+    writer_head_offsets,
+    stride_pool_token,
+    per_layer_elems,
+    ELEMS_PER_TOKEN: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    NUM_LAYERS_X2: tl.constexpr,
+):
+    """Move one page for one writer and layer K/V per program."""
+    page_id = tl.program_id(0)
+    program_id = tl.program_id(1)
+    writer_id = program_id // NUM_LAYERS_X2
+    layer_kv_id = program_id % NUM_LAYERS_X2
+
+    layer_ptr = tl.load(layer_ptrs + layer_kv_id).to(staging.dtype)
+    head_offset = tl.load(writer_head_offsets + writer_id).to(tl.int64)
+    page = tl.load(page_indices + page_id).to(tl.int64)
+    token_offset = tl.arange(0, PAGE_SIZE)[:, None]
+    element_offset = tl.arange(0, ELEMS_PER_TOKEN)[None, :]
+    source = (
+        (writer_id.to(tl.int64) * NUM_LAYERS_X2 + layer_kv_id)
+        * per_layer_elems.to(tl.int64)
+        + (page_id.to(tl.int64) * PAGE_SIZE + token_offset) * ELEMS_PER_TOKEN
+        + element_offset
+    )
+    destination = (
+        (page * PAGE_SIZE + token_offset) * stride_pool_token.to(tl.int64)
+        + head_offset
+        + element_offset
+    )
+    tl.store(layer_ptr + destination, tl.load(staging + source))
+
+
+_DEVICE_I64_CACHE: dict[tuple, torch.Tensor] = {}
+
+
+def _cached_device_i64(key: tuple, values: list[int], device) -> torch.Tensor:
+    tensor = _DEVICE_I64_CACHE.get(key)
+    if tensor is None:
+        tensor = async_h2d(values, dtype=torch.int64, device=device)
+        _DEVICE_I64_CACHE[key] = tensor
+    return tensor
 
 
 class StagingBuffer:
@@ -660,6 +709,7 @@ def _scatter_staging_to_kv_triton(
     decode_attn_tp_size: int,
     dst_tp_rank: int,
     total_kv_heads: int,
+    use_page_tiles: bool = False,
 ) -> None:
     """Triton fused kernel path for scatter."""
     num_layers = len(k_buffers)
@@ -685,26 +735,35 @@ def _scatter_staging_to_kv_triton(
     elems_per_token = num_heads * head_dim
     per_layer_elems = num_tokens * elems_per_token
 
-    layer_ptrs = make_ptr_table(
-        [buf.data_ptr() for buf in k_buffers] + [buf.data_ptr() for buf in v_buffers],
-        device=device,
-    )
-
-    writer_head_offsets = torch.tensor(
-        [
-            compute_head_slice_params(
-                prefill_attn_tp_size,
-                decode_attn_tp_size,
-                wr,
-                dst_tp_rank,
-                total_kv_heads,
-            )[2]
-            * head_dim
-            for wr in range(num_writers)
-        ],
-        dtype=torch.int64,
-        device=device,
-    )
+    pointers = [buf.data_ptr() for buf in k_buffers] + [
+        buf.data_ptr() for buf in v_buffers
+    ]
+    head_offsets = [
+        compute_head_slice_params(
+            prefill_attn_tp_size,
+            decode_attn_tp_size,
+            writer_rank,
+            dst_tp_rank,
+            total_kv_heads,
+        )[2]
+        * head_dim
+        for writer_rank in range(num_writers)
+    ]
+    if use_page_tiles:
+        device_key = (device.type, device.index)
+        layer_ptrs = _cached_device_i64(
+            ("staging-pointers", device_key, *pointers), pointers, device
+        )
+        writer_head_offsets = _cached_device_i64(
+            ("staging-head-offsets", device_key, *head_offsets),
+            head_offsets,
+            device,
+        )
+    else:
+        layer_ptrs = make_ptr_table(pointers, device=device)
+        writer_head_offsets = torch.tensor(
+            head_offsets, dtype=torch.int64, device=device
+        )
 
     int_dtype_map = {1: torch.int8, 2: torch.int16, 4: torch.int32}
     int_dtype = int_dtype_map.get(dtype_size, torch.int16)
@@ -713,8 +772,25 @@ def _scatter_staging_to_kv_triton(
     )
     staging_typed = staging_buffer_view[:total_staging_bytes].view(int_dtype)
 
-    BLOCK_SIZE = 1024
     num_layers_x2 = 2 * num_layers
+    if use_page_tiles and triton.next_power_of_2(elems_per_token) == elems_per_token:
+        _scatter_staging_pages_kernel[
+            (num_tokens // page_size, num_writers * num_layers_x2)
+        ](
+            layer_ptrs,
+            page_idx_tensor,
+            staging_typed,
+            writer_head_offsets,
+            total_heads * head_dim,
+            per_layer_elems,
+            ELEMS_PER_TOKEN=elems_per_token,
+            PAGE_SIZE=page_size,
+            NUM_LAYERS_X2=num_layers_x2,
+            num_warps=8,
+        )
+        return
+
+    BLOCK_SIZE = 1024
     grid = (num_writers * num_layers_x2, triton.cdiv(per_layer_elems, BLOCK_SIZE))
 
     _fused_scatter_from_staging_kernel[grid](
@@ -742,6 +818,7 @@ def scatter_staging_to_kv(
     decode_attn_tp_size: int,
     dst_tp_rank: int,
     total_kv_heads: int,
+    use_page_tiles: bool = False,
 ) -> None:
     """Scatter data from a contiguous staging region into KV cache buffers."""
     _check_kv_on_staging_device(k_buffers, v_buffers, staging_buffer_view.device)
@@ -756,6 +833,7 @@ def scatter_staging_to_kv(
             decode_attn_tp_size,
             dst_tp_rank,
             total_kv_heads,
+            use_page_tiles,
         )
     return _scatter_staging_to_kv_torch(
         staging_buffer_view,
