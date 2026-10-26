@@ -1729,6 +1729,9 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             segments = [(start_idx, end_idx)]
 
+        # A PD prefill server does not load the decode megakernel plugin. Fence
+        # staging gathers on the exact producer stream whenever staging is on.
+        fence_staging_gather = self.enable_staging
         for seg_start, seg_end in segments:
             is_final_segment = seg_end == end_idx
             raw_kv_indices = self.req_to_token_pool.req_to_token[
@@ -1765,6 +1768,15 @@ class SchedulerDisaggregationPrefillMixin:
             if not sender.should_send_kv_chunk(len(page_indices), segment_is_last):
                 continue
             send_state_indices = state_indices if segment_is_last else None
+            if fence_staging_gather:
+                fence_staging_gather = False
+                event = torch.cuda.Event()
+                event.record(
+                    self.forward_stream
+                    if self.enable_overlap
+                    else torch.cuda.current_stream()
+                )
+                sender._early_send_wait_event = event
             if indices_event is not None:
                 sender.send(
                     page_indices,

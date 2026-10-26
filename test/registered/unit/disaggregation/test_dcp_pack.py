@@ -129,6 +129,63 @@ class TestDcpCachedPrefixSend(CustomTestCase):
                 )
                 self.assertEqual(int(calls[-1].kwargs["state_indices"][0][0]), 17)
 
+    def test_staging_fences_only_the_first_segment(self):
+        class Sender:
+            supports_host_tensor_indices = False
+
+            def __init__(self):
+                self._early_send_wait_event = None
+                self.events = []
+
+            def get_max_transfer_tokens(self):
+                return None
+
+            def should_send_kv_chunk(self, num_pages, last_chunk):
+                return num_pages > 0 or last_chunk
+
+            def send(self, *args, **kwargs):
+                self.events.append(self._early_send_wait_event)
+                self._early_send_wait_event = None
+
+        event = Mock()
+        sender = Sender()
+        req = SimpleNamespace(
+            rid="staging-fence",
+            kv=SimpleNamespace(req_pool_idx=0),
+            origin_input_ids=[0] * 4,
+            extend_end=4,
+            start_send_idx=0,
+            disagg_decode_prefix_len=0,
+            disagg_kv_sender=sender,
+        )
+        scheduler = SimpleNamespace(
+            enable_staging=True,
+            enable_overlap=False,
+            token_to_kv_pool_allocator=SimpleNamespace(
+                page_size=1,
+                translate_kv_indices_for_transfer=lambda indices: indices,
+            ),
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.arange(4).reshape(1, -1)
+            ),
+            disagg_prefill_pending_chunk_rids=set(),
+        )
+        current_stream = Mock()
+        with (
+            patch(
+                "sglang.srt.disaggregation.prefill.get_schedule",
+                return_value=SimpleNamespace(chunked_prefill_size=2),
+            ),
+            patch.object(torch.cuda, "Event", return_value=event),
+            patch.object(torch.cuda, "current_stream", return_value=current_stream),
+        ):
+            SchedulerDisaggregationPrefillMixin._send_kv_chunk(
+                scheduler, req, last_chunk=False, end_idx=4
+            )
+
+        self.assertEqual(sender.events, [event, None])
+        event.record.assert_called_once_with(current_stream)
+
 
 class TestDcpPackBufferBytes(CustomTestCase):
     def test_sizes_fixed_regions_for_each_dcp_rank(self):
