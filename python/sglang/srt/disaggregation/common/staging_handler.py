@@ -13,6 +13,7 @@ import logging
 import struct
 import threading
 import time
+from collections import deque
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -112,6 +113,10 @@ class DecodeStagingHandler:
         self._inflight_submits: dict[object, int] = {}
         self._claimed_chunks: set[tuple[object, int]] = set()
         self._closing_rooms: set[int] = set()
+        from sglang.srt.kernel_plugins.nvidia.binding import megakernel_enabled
+
+        self._defer_scatter = megakernel_enabled()
+        self._pending_scatters: deque[tuple[int, int, int, int]] = deque()
 
         k_buffers = kv_buffer_info["k_buffers"]
         assert k_buffers, "k_buffers must not be empty"
@@ -251,6 +256,9 @@ class DecodeStagingHandler:
         stream = self.staging_allocator._scatter_stream
         if stream is not None:
             stream.synchronize()
+        if self._defer_scatter:
+            for event, _ in decode_req._chunk_events:
+                event.synchronize()
         chunk_infos = receiver.chunk_staging_infos if receiver is not None else []
         unscattered_allocs = []
         for chunk_idx, info in enumerate(chunk_infos):
@@ -271,11 +279,21 @@ class DecodeStagingHandler:
         decode_req._chunk_events.clear()
 
     # ------------------------------------------------------------------
-    # Scatter submission: called from decode_thread (background)
+    # Scatter submission: arrivals come from the background decode thread.
     # ------------------------------------------------------------------
 
+    def flush_pending_scatters(self, stream) -> None:
+        """Submit ready chunks between consecutive forwards on ``stream``."""
+        while self._pending_scatters:
+            self.submit_chunk_scatter(*self._pending_scatters.popleft(), stream=stream)
+
     def submit_chunk_scatter(
-        self, room: int, chunk_idx: int, page_start: int, num_pages: int
+        self,
+        room: int,
+        chunk_idx: int,
+        page_start: int,
+        num_pages: int,
+        stream=None,
     ) -> bool:
         """Submit scatter for an intermediate chunk whose writers all arrived.
 
@@ -307,11 +325,15 @@ class DecodeStagingHandler:
 
         try:
             ok = self._scatter_region(
-                staging_offset, page_start, num_pages, decode_req, receiver
+                staging_offset, page_start, num_pages, decode_req, receiver, stream
             )
             if ok:
                 event = create_device_event(self.device)
-                event.record(self.staging_allocator._scatter_stream)
+                event.record(
+                    stream
+                    if stream is not None
+                    else self.staging_allocator._scatter_stream
+                )
                 # Append before zeroing so the completion check always sees either
                 # the slot or the event.
                 decode_req._chunk_events.append((event, alloc_id))
@@ -348,8 +370,8 @@ class DecodeStagingHandler:
     ) -> bool:
         """Process a staging chunk arrival reported by a ZMQ CHUNK_READY message.
 
-        Accumulates writer arrivals and submits scatter once all writers for
-        this chunk have reported in. Returns True if scatter was submitted.
+        Accumulates writer arrivals and makes the scatter ready once all writers
+        for this chunk have reported in.
         """
         # Read from the stash, not decode_req.kv_receiver: a concurrent teardown
         # nulls the latter before unregister removes the room.
@@ -366,7 +388,10 @@ class DecodeStagingHandler:
         arrivals.append((page_start, num_pages, writer_id))
         num_writers = self.num_writers_for(receiver)
         if len(arrivals) >= num_writers:
-            self.submit_chunk_scatter(room, chunk_idx, page_start, num_pages)
+            if self._defer_scatter:
+                self._pending_scatters.append((room, chunk_idx, page_start, num_pages))
+            else:
+                self.submit_chunk_scatter(room, chunk_idx, page_start, num_pages)
             del room_counts[chunk_idx]
             return True
         return False
@@ -449,10 +474,12 @@ class DecodeStagingHandler:
         num_pages: int,
         decode_req: DecodeRequest,
         receiver,
+        stream=None,
     ) -> bool:
-        """Submit scatter kernels for a staging region to scatter_stream.
+        """Submit scatter kernels for a staging region.
 
-        May be called from the decode_thread (background).
+        Immediate scatters use the private scatter stream. Deferred scatters run
+        on the scheduler's forward stream between batches.
         """
         from sglang.srt.disaggregation.common.staging_buffer import (
             scatter_staging_to_kv,
@@ -465,10 +492,14 @@ class DecodeStagingHandler:
 
         self.device_module.set_device(self.gpu_id)
 
-        if self.staging_allocator._scatter_stream is None:
-            self.staging_allocator._scatter_stream = create_device_stream(self.device)
-
-        scatter_stream = self.staging_allocator._scatter_stream
+        if stream is None:
+            if self.staging_allocator._scatter_stream is None:
+                self.staging_allocator._scatter_stream = create_device_stream(
+                    self.device
+                )
+            scatter_stream = self.staging_allocator._scatter_stream
+        else:
+            scatter_stream = stream
         if decode_req._req_to_token_ready is not None:
             scatter_stream.wait_event(decode_req._req_to_token_ready)
 
@@ -501,6 +532,7 @@ class DecodeStagingHandler:
                 self.decode_tp,
                 dst_tp_rank,
                 self.total_kv_heads,
+                use_page_tiles=self._defer_scatter,
             )
 
         return True

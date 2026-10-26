@@ -1,7 +1,7 @@
 import concurrent.futures
 import threading
 import unittest
-from collections import defaultdict
+from collections import defaultdict, deque
 from types import SimpleNamespace
 from unittest.mock import ANY, Mock, call, patch
 
@@ -1453,6 +1453,56 @@ class TestStagingWatermark(unittest.TestCase):
         sock.send_multipart.assert_called_once_with(
             [b"WATERMARK", b"3", b"0", b"session-new"]
         )
+
+
+class TestDeferredStagingScatter(unittest.TestCase):
+    def test_complete_arrival_waits_for_scheduler_flush(self):
+        receiver = SimpleNamespace()
+        handler = object.__new__(DecodeStagingHandler)
+        handler._room_to_receiver = {7: receiver}
+        handler._writer_counts = {}
+        handler._defer_scatter = True
+        handler._pending_scatters = deque()
+        handler.num_writers_for = Mock(return_value=1)
+        handler.submit_chunk_scatter = Mock(return_value=True)
+
+        self.assertTrue(handler.handle_chunk_arrived(7, 2, 11, 3, "writer"))
+        handler.submit_chunk_scatter.assert_not_called()
+        self.assertEqual(list(handler._pending_scatters), [(7, 2, 11, 3)])
+
+        stream = object()
+        handler.flush_pending_scatters(stream)
+        handler.submit_chunk_scatter.assert_called_once_with(7, 2, 11, 3, stream=stream)
+        self.assertFalse(handler._pending_scatters)
+
+    @patch("sglang.srt.disaggregation.common.staging_handler.create_device_event")
+    def test_deferred_scatter_event_is_recorded_on_forward_stream(self, make_event):
+        stream = object()
+        event = make_event.return_value
+        decode_req = SimpleNamespace(_chunk_events=[])
+        receiver = SimpleNamespace(chunk_staging_infos=[(5, 4096, 0, 0, 0)])
+        handler = object.__new__(DecodeStagingHandler)
+        handler._room_to_decode_req = {7: decode_req}
+        handler._room_to_receiver = {7: receiver}
+        handler._staging_lifecycle = threading.Condition()
+        token = object()
+        handler._room_tokens = {7: token}
+        handler._inflight_submits = {}
+        handler._claimed_chunks = set()
+        handler._closing_rooms = set()
+        handler.staging_allocator = SimpleNamespace(_scatter_stream=object())
+        handler.device = torch.device("cpu")
+        handler.tp_rank = 0
+        handler._scatter_region = Mock(return_value=True)
+
+        self.assertTrue(handler.submit_chunk_scatter(7, 0, 11, 3, stream=stream))
+
+        handler._scatter_region.assert_called_once_with(
+            4096, 11, 3, decode_req, receiver, stream
+        )
+        event.record.assert_called_once_with(stream)
+        self.assertEqual(decode_req._chunk_events, [(event, 5)])
+        self.assertEqual(receiver.chunk_staging_infos[0], (-1, -1, 0, -1, 0))
 
 
 class TestStagingScatterLifecycle(CustomTestCase):
