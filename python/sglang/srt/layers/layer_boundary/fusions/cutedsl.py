@@ -57,6 +57,20 @@ def _is_supported_forward_mode(forward_mode: ForwardMode) -> bool:
     )
 
 
+def _timing_only_verify_ar_replacement(
+    forward_batch: ForwardBatch, residual: torch.Tensor
+) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    """Local-copy upper bound for R13-T4COMM; intentionally not model-correct."""
+    if not (
+        envs.SGLANG_R13_T4COMM_SKIP_VERIFY_AR_TIMING_ONLY.get()
+        and forward_batch.forward_mode == ForwardMode.TARGET_VERIFY
+    ):
+        return None
+    # Keep two distinct, initialized outputs with the same shape/dtype as the
+    # real norm and residual outputs. Upstream GEMM/MoE work remains unchanged.
+    return residual.clone(), residual.clone()
+
+
 def _resolve_max_m(*, max_running_requests: int | None) -> int:
     decode_config = get_exec().graph.cuda_graph_config.decode
     prefill_config = get_exec().graph.cuda_graph_config.prefill
@@ -324,6 +338,11 @@ class CuteDSLFusion:
             return None
         if post_residual_addition is not None:
             residual = residual + post_residual_addition
+        timing_replacement = _timing_only_verify_ar_replacement(
+            forward_batch, residual
+        )
+        if timing_replacement is not None:
+            return timing_replacement
         assert self.service is not None
         return self.service.finalize(handoff=owed, residual=residual, gamma=gamma)
 
@@ -338,6 +357,11 @@ class CuteDSLFusion:
             return None
         if post_residual_addition is not None:
             residual = residual + post_residual_addition
+        timing_replacement = _timing_only_verify_ar_replacement(
+            forward_batch, residual
+        )
+        if timing_replacement is not None:
+            return timing_replacement
         assert self.service is not None
         return self.service.all_reduce_residual_rms_norm(
             local_contribution=owed.partial,
@@ -356,6 +380,11 @@ class CuteDSLFusion:
             and not get_exec().comm.enable_quant_communications
         ):
             return None
+        timing_replacement = _timing_only_verify_ar_replacement(
+            forward_batch, residual
+        )
+        if timing_replacement is not None:
+            return timing_replacement
         assert self.service is not None
         return self.service.all_reduce_residual_rms_norm(
             local_contribution=hidden_states,
@@ -477,6 +506,12 @@ def install_cutedsl_fusion(
             else ()
         ),
     )
+    if envs.SGLANG_R13_T4COMM_SKIP_VERIFY_AR_TIMING_ONLY.get():
+        logger.warning(
+            "R13-T4COMM TIMING ONLY: TARGET_VERIFY fused AR + residual + RMSNorm "
+            "will be replaced by two local BF16 copies; outputs are not "
+            "model-correct and this process must not serve accuracy traffic"
+        )
     hands_off = 0
     for layer in layers:
         fusion = _fusion_of(layer)
