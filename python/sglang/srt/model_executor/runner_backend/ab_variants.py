@@ -4,6 +4,7 @@ Q35MF_AB_VARIANTS  JSON object, variant name -> env overrides. Empty: off.
 Q35MF_AB_PATTERN   comma list of variant names, one per block, cycled.
 Q35MF_AB_BLOCK     target-verify rounds per block (default 200).
 Q35MF_AB_PIN_FILE  optional file naming one pinned variant.
+Q35MF_AB_BENCH_ALIAS_GRAPH  bench-only: identical all-off labels share one graph.
 
 FullCudaGraphBackend captures every decode-phase graph once per variant while
 that variant's environment is active. Features under test therefore must read
@@ -41,6 +42,7 @@ assert all(item in VARIANTS for item in PATTERN), (
 )
 _round = 0
 _base_env: dict[str, str | None] = {}
+_BENCH_ALIAS_GRAPH = os.environ.get("Q35MF_AB_BENCH_ALIAS_GRAPH", "0") == "1"
 
 # Legacy graph-padding A/B. Keep ACTIVE limited to this mode: the generic
 # backend owns its own replay counter and must not also take the old tick().
@@ -55,6 +57,25 @@ def enabled() -> bool:
 
 def names() -> list[str]:
     return list(VARIANTS)
+
+
+def bench_alias_source() -> str | None:
+    """Null diagnostic only: one capture, identical declared all-off switches.
+
+    This removes independent graph identity from a label/replay timing test.
+    It is not a candidate optimization or an independent-capture control.
+    """
+    if not _BENCH_ALIAS_GRAPH:
+        return None
+    if not VARIANTS:
+        raise ValueError("bench graph aliases require Q35MF_AB_VARIANTS")
+    first = next(iter(VARIANTS))
+    baseline = VARIANTS[first]
+    if not baseline or any(str(value) != "0" for value in baseline.values()):
+        raise ValueError("bench graph aliases require explicit all-off overrides")
+    if any(overrides != baseline for overrides in VARIANTS.values()):
+        raise ValueError("bench graph aliases require identical overrides")
+    return first
 
 
 def activate(name: str) -> None:

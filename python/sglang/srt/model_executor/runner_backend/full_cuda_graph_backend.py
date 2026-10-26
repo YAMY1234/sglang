@@ -17,6 +17,7 @@ torch.cuda.CUDAGraph per shape.
 
 from __future__ import annotations
 
+import logging
 from contextlib import AbstractContextManager, contextmanager
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
@@ -39,6 +40,8 @@ from sglang.srt.model_executor.runner_utils.pool import (
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -147,10 +150,23 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         capture_inputs: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
+        alias_source = ab_variants.bench_alias_source()
         if not ab_variants.enabled():
             self._capture_graph(shape_key, forward_fn, post_warmup_hook)
             return
         try:
+            if alias_source is not None:
+                ab_variants.activate(alias_source)
+                source_key = (alias_source, shape_key)
+                self._capture_graph(source_key, forward_fn, post_warmup_hook)
+                for name in ab_variants.names():
+                    self._graphs[(name, shape_key)] = self._graphs[source_key]
+                    self._outputs[(name, shape_key)] = self._outputs[source_key]
+                logger.info(
+                    "Q35MF bench-only graph aliases: source=%s labels=%s shape=%s",
+                    alias_source, ab_variants.names(), shape_key,
+                )
+                return
             for name in ab_variants.names():
                 ab_variants.activate(name)
                 self._capture_graph((name, shape_key), forward_fn, post_warmup_hook)
@@ -263,7 +279,8 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         return self._outputs[key]
 
     def cleanup(self) -> None:
-        for graph in self._graphs.values():
+        # The bench-only null can give several labels the same graph object.
+        for graph in {id(g): g for g in self._graphs.values()}.values():
             graph.reset()
         self._graphs.clear()
         self._outputs.clear()
