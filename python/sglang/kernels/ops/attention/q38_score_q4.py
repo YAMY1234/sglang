@@ -5,10 +5,13 @@ short/mixed rows retain the native 256-CTA-per-row calculation in the same grid.
 No PDL trigger: the top-k consumer waits for this kernel's full completion.
 """
 import math
+import os
 
 import torch
 import tilelang
 from tilelang import language as T
+
+_Q38C_SCORE_Q4_N16 = os.environ.get("SGLANG_Q38C_SCORE_Q4_N16", "0") == "1"
 
 
 @tilelang.jit(
@@ -99,6 +102,13 @@ def _score_q4_kernel(min_scored_len: int = 512, request_dtype: str = "int32"):
 
 def score_q4(q, k_cache, page_table, lengths, max_model_len, req_pool_indices,
              score_scale=None, min_scored_len=512):
+    if _Q38C_SCORE_Q4_N16:
+        from sglang.kernels.ops.attention.q38_score_q4_n16 import score_q4_n16
+
+        return score_q4_n16(
+            q, k_cache, page_table, lengths, max_model_len, req_pool_indices,
+            score_scale=score_scale, min_scored_len=min_scored_len,
+        )
     logits = torch.empty((4, max_model_len), dtype=torch.float32, device=q.device)
     request_dtype = {torch.int32: "int32", torch.int64: "int64"}[req_pool_indices.dtype]
     _score_q4_kernel(min_scored_len=min_scored_len, request_dtype=request_dtype)(
