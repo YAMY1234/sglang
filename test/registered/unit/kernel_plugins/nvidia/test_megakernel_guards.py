@@ -68,6 +68,15 @@ class TestMegakernelGuards(CustomTestCase):
                 with envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override((slot,)):
                     self.assertTrue(cp_lite_requested())
 
+    def test_cp_lite_accepts_the_startup_flag_before_config_is_published(self):
+        with (
+            patch.object(binding, "megakernel_enabled", return_value=False),
+            envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override(("skv2_cp",)),
+        ):
+            self.assertFalse(cp_lite_requested())
+            self.assertFalse(cp_lite_requested(enabled=False))
+            self.assertTrue(cp_lite_requested(enabled=True))
+
     def test_slots_are_inert_without_the_megakernel(self):
         with (
             patch.object(binding, "megakernel_enabled", return_value=False),

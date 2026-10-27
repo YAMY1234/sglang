@@ -411,13 +411,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             "trtllm_mha_default_kv_scale",
             lambda: torch.ones(1, dtype=torch.float32, device=self.device),
         )
-        from sglang.srt.kernel_plugins.nvidia.binding import megakernel_enabled
         from sglang.srt.layers.attention.q35_cp_lite import cp_lite_requested
 
         self._cp_lite = None
         if (
-            megakernel_enabled()
-            and cp_lite_requested()
+            cp_lite_requested(enabled=model_runner.server_args.enable_nvidia_megakernel)
             and not self.is_xqa_impl
             and not self.is_nvfp4_kvcache
             and self.data_type == torch.float8_e4m3fn
@@ -2154,11 +2152,9 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
                 kv_last_page_len_buf=self.kv_last_page_len,
                 speculative_step_id=i,
             )
-        from sglang.srt.kernel_plugins.nvidia.binding import megakernel_enabled
-
         steps = self.speculative_num_steps - 1
         self._share_draft_metadata = (
-            megakernel_enabled()
+            model_runner.server_args.enable_nvidia_megakernel
             and steps > 1
             and all(
                 not backend.use_sliding_window_kv_pool
