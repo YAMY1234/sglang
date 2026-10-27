@@ -110,6 +110,8 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
 # bound and serializing them on one stream is faster than contending.
 _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD = 1024
+_Q38_QSA_EARLY_INDEXER = get_bool_env_var("Q38_QSA_EARLY_INDEXER", "False")
+_Q38_QSA_PDL_INDEX = get_bool_env_var("Q38_QSA_PDL_INDEX", "False")
 
 
 def _ple_table_is_fp8(
@@ -1891,6 +1893,8 @@ class Qwen4ExpAttentionDecoderLayer(
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        *,
+        projected_qk: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if is_in_breakable_cuda_graph() and forward_batch.forward_mode.is_extend():
             rows = hidden_states.shape[0]
@@ -1916,6 +1920,7 @@ class Qwen4ExpAttentionDecoderLayer(
             hidden_states=hidden_states,
             positions=positions,
             forward_batch=forward_batch,
+            projected_qk=projected_qk,
         )
 
     def _compute_qsa_topk_indices_eager(
@@ -1923,6 +1928,8 @@ class Qwen4ExpAttentionDecoderLayer(
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        *,
+        projected_qk: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.qsa.glue import (
             get_qsa_indexer_metadata,
@@ -1942,6 +1949,8 @@ class Qwen4ExpAttentionDecoderLayer(
             backend, self.layer_id, forward_batch
         )
         indexer_kwargs = {}
+        if projected_qk is not None:
+            indexer_kwargs["projected_qk"] = projected_qk
         if _shards_rows_over_cp(forward_batch):
             # Prefill CP: this rank's rows select against the index keys of the
             # whole sequence, gathered in token order with the RoPE positions
@@ -1981,12 +1990,74 @@ class Qwen4ExpAttentionDecoderLayer(
             and not is_in_breakable_cuda_graph()
             and hidden_states.shape[0] < _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD
         )
+        early_indexer = (
+            overlap_indexer
+            and _Q38_QSA_EARLY_INDEXER
+            and self.attn_output_gate
+            and hidden_states.is_cuda
+            and hidden_states.dtype == torch.bfloat16
+            and self.indexer._use_fused_prep(hidden_states)
+        )
         attention_kwargs = {}
+        projected_qk = None
+        projection_nodes = None
         if overlap_indexer:
             # Safe to overlap: the indexer reads only hidden_states/positions,
             # and writes QSA-private pool buffers.
             current_stream = torch.cuda.current_stream()
-            self.alt_stream.wait_stream(current_stream)
+            if (
+                _Q38_QSA_PDL_INDEX
+                and self.attn_output_gate
+                and hidden_states.is_cuda
+                and hidden_states.dtype == torch.bfloat16
+                and (
+                    forward_batch.forward_mode.is_target_verify()
+                    or forward_batch.forward_mode.is_draft_extend_v2()
+                )
+            ):
+                from sglang.srt.layers.attention.qsa.glue import get_qsa_indexer_metadata
+                from sglang.srt.layers.quantization.unquant import (
+                    UnquantizedLinearMethod,
+                    get_bf16_gemm_backend,
+                    should_enable_bf16_splitk_gemm,
+                    use_bf16_splitk_gemm,
+                )
+
+                metadata = get_qsa_indexer_metadata(
+                    get_attn_backend(), self.layer_id, forward_batch
+                )
+                rows = metadata.get_token_to_batch_idx().numel()
+                projection = self.indexer.index_qk_proj
+                if (
+                    0 < rows <= 16
+                    and rows <= hidden_states.shape[0]
+                    and self.indexer._use_fused_prep(hidden_states)
+                    and isinstance(projection.quant_method, UnquantizedLinearMethod)
+                    and projection.weight.dtype == torch.bfloat16
+                    and tuple(projection.weight.shape) == (640, 2560)
+                    and should_enable_bf16_splitk_gemm(get_bf16_gemm_backend())
+                    and use_bf16_splitk_gemm(rows, 640, 2560)
+                ):
+                    # Native BF16 SplitK already waits for its HC-mix producer
+                    # and triggers dependents from the weight-loader warp.
+                    # Keep it directly on this stream before main QKV, then
+                    # fork only Qprep/compress/score/top-k to the side stream.
+                    projected_qk, _ = projection(hidden_states[:rows])
+                    from sglang.srt.layers.attention.qsa.capture_fork import projection_frontier
+
+                    projection_nodes = projection_frontier(current_stream)
+            if projected_qk is None:
+                self.alt_stream.wait_stream(current_stream)
+            if early_indexer and projected_qk is None:
+                # Independent index Q/K projection reads the already-prepared
+                # HC/PLE hidden state, positions and QSA-private metadata/cache.
+                # Main QKV does not produce any of those inputs. Enqueue first
+                # to test SM scheduling order, without synchronously joining.
+                with torch.cuda.stream(self.alt_stream):
+                    topk_indices = self._compute_qsa_topk_indices(
+                        hidden_states, positions, forward_batch,
+                        projected_qk=projected_qk,
+                    )
 
         q, k, v, gate = self._prepare_qkv_gate(
             positions=positions,
@@ -1995,10 +2066,29 @@ class Qwen4ExpAttentionDecoderLayer(
         )
 
         if overlap_indexer:
-            with torch.cuda.stream(self.alt_stream):
-                topk_indices = self._compute_qsa_topk_indices(
-                    hidden_states, positions, forward_batch
-                )
+            if projected_qk is not None:
+                # There is no ordinary event between native index projection
+                # and QKV: their same-stream PDL chain stays intact. Join the
+                # capture here, then give the side stream a full projection
+                # completion edge instead of the temporary QKV event edge.
+                # Outside capture, the full QKV wait is a safe warmup path.
+                self.alt_stream.wait_stream(current_stream)
+                if projection_nodes is not None:
+                    from sglang.srt.layers.attention.qsa.capture_fork import fork_after_projection
+
+                    fork_after_projection(self.alt_stream, projection_nodes)
+                with torch.cuda.stream(self.alt_stream):
+                    topk_indices = self._compute_qsa_topk_indices(
+                        hidden_states, positions, forward_batch,
+                        projected_qk=projected_qk,
+                    )
+                projected_qk.record_stream(self.alt_stream)
+            if not early_indexer and projected_qk is None:
+                with torch.cuda.stream(self.alt_stream):
+                    topk_indices = self._compute_qsa_topk_indices(
+                        hidden_states, positions, forward_batch
+                    )
+            # Preserve all QSA state/store/top-k work before KV preparation.
             current_stream.wait_stream(self.alt_stream)
             # Allocated on alt_stream, consumed by attention on the current
             # stream; tell the caching allocator before alt_stream is reused.
