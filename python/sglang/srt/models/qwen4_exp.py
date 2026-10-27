@@ -1535,6 +1535,7 @@ class Qwen4ExpLayerExtensionMixin:
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         linear_attention: bool = False,
+        is_nextn: bool = False,
     ) -> None:
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size
@@ -1542,6 +1543,23 @@ class Qwen4ExpLayerExtensionMixin:
         self._ple_forward_batch = None
         self._ple_batch = None
         self._hc_norms = None
+        self._q38_l2pf = None
+        if (
+            envs.SGLANG_Q38C_L2PF_OPROJ.get()
+            and not is_nextn
+            and self.hidden_size == 2560
+            and self.hc_count == 4
+        ):
+            projection = self.linear_attn.out_proj if linear_attention else self.o_proj
+            tp_size = (
+                self.linear_attn.attn_tp_size if linear_attention else self.attn_tp_size
+            )
+            if tp_size == 1:
+                from sglang.kernels.ops.memory.q38_oproj_l2_prefetch import (
+                    OProjL2Prefetch,
+                )
+
+                self._q38_l2pf = OProjL2Prefetch(projection)
 
         # The gated reads normalize the streams themselves, so these layers
         # have neither of the norms their base class builds.
@@ -1749,6 +1767,8 @@ class Qwen4ExpLayerExtensionMixin:
     ) -> torch.Tensor:
         # The read runs inside prepare and reaches the PLE batch through the
         # layer for the duration of that call.
+        if self._q38_l2pf is not None:
+            self._q38_l2pf.begin(hidden_states, forward_batch)
         if self.ple is None:
             return self.attn_boundary.prepare(hidden_states, forward_batch)
         self._ple_forward_batch, self._ple_batch = forward_batch, ple_batch
@@ -1812,7 +1832,8 @@ class Qwen4ExpLinearDecoderLayer(
             build_stages=False,
         )
         self._init_qwen4_exp_layer_extensions(
-            config, layer_id, quant_config, prefix, linear_attention=True
+            config, layer_id, quant_config, prefix, linear_attention=True,
+            is_nextn=is_nextn,
         )
 
     def forward(
@@ -1830,7 +1851,10 @@ class Qwen4ExpLinearDecoderLayer(
             hidden_states = self.linear_attn(hidden_states, forward_batch)
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
-        return self._run_ffn_stage(hidden_states, forward_batch)
+        hidden_states = self._run_ffn_stage(hidden_states, forward_batch)
+        if self._q38_l2pf is not None:
+            self._q38_l2pf.join()
+        return hidden_states
 
 
 class Qwen4ExpAttentionDecoderLayer(
@@ -1868,7 +1892,9 @@ class Qwen4ExpAttentionDecoderLayer(
                 prefix=f"{prefix}.indexer" if prefix else "indexer",
                 rotary_emb=self.rotary_emb,
             )
-        self._init_qwen4_exp_layer_extensions(config, layer_id, quant_config, prefix)
+        self._init_qwen4_exp_layer_extensions(
+            config, layer_id, quant_config, prefix, is_nextn=is_nextn
+        )
 
     def _compute_qsa_topk_indices(
         self,
@@ -2113,7 +2139,10 @@ class Qwen4ExpAttentionDecoderLayer(
             )
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
-        return self._run_ffn_stage(hidden_states, forward_batch)
+        hidden_states = self._run_ffn_stage(hidden_states, forward_batch)
+        if self._q38_l2pf is not None:
+            self._q38_l2pf.join()
+        return hidden_states
 
 
 ALL_DECODER_LAYER_TYPES = {
