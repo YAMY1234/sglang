@@ -6,6 +6,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode import (
+    GDN_COMMIT_SLOT,
+    gdn_commit_cuda_requested,
+)
 from sglang.kernels.plugin_kernels.nvidia import spec as registry
 from sglang.srt.environ import envs
 from sglang.srt.kernel_plugins.nvidia import binding
@@ -13,10 +17,6 @@ from sglang.srt.kernel_plugins.nvidia.binding import (
     megakernel_disable_reasons,
 )
 from sglang.srt.kernel_plugins.nvidia.policy import megakernel_slot_requested
-from sglang.srt.layers.attention.linear.gdn_replayssm_spec_decode import (
-    GDN_COMMIT_SLOT,
-    gdn_commit_cuda_requested,
-)
 from sglang.srt.layers.attention.q35_cp_lite import cp_lite_requested
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
