@@ -47,8 +47,12 @@ def _draft_topk1_finalize_kernel(
     draft_tokens,
     draft_tokens_stride,
     draft_token_column,
+    mrope,
+    mrope_axis_stride,
+    mrope_row_stride,
     num_splits: tl.constexpr,
     WRITE_DRAFT_TOKEN: tl.constexpr,
+    WRITE_MROPE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -69,6 +73,10 @@ def _draft_topk1_finalize_kernel(
 
     position = tl.load(positions + row)
     tl.store(positions + row, position + 1)
+    if WRITE_MROPE:
+        for axis in tl.static_range(3):
+            ptr = mrope + axis * mrope_axis_stride + row * mrope_row_stride
+            tl.store(ptr, tl.load(ptr) + 1)
 
 
 def draft_topk1_postprocess(
@@ -76,6 +84,7 @@ def draft_topk1_postprocess(
     positions: torch.Tensor,
     draft_tokens: torch.Tensor | None = None,
     draft_token_column: int = 0,
+    mrope_positions: torch.Tensor | None = None,
 ):
     """Argmax draft logits for topk=1 and advance positions.
 
@@ -142,8 +151,12 @@ def draft_topk1_postprocess(
         draft_tokens if write_draft_token else topk_index,
         draft_tokens.stride(0) if write_draft_token else 0,
         draft_token_column,
+        mrope_positions,
+        mrope_positions.stride(0) if mrope_positions is not None else 0,
+        mrope_positions.stride(1) if mrope_positions is not None else 0,
         num_splits,
         WRITE_DRAFT_TOKEN=write_draft_token,
+        WRITE_MROPE=mrope_positions is not None,
         BLOCK=triton.next_power_of_2(num_splits),
         num_warps=1,
     )

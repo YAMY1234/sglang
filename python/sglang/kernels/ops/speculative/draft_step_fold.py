@@ -86,7 +86,11 @@ def _finalize_and_embed(
     weight,
     embedding,
     weight_stride,
+    mrope,
+    mrope_axis_stride,
+    mrope_row_stride,
     num_splits: tl.constexpr,
+    WRITE_MROPE: tl.constexpr,
     HIDDEN: tl.constexpr,
     REDUCE_BLOCK: tl.constexpr,
     EMBED_BLOCK: tl.constexpr,
@@ -106,13 +110,19 @@ def _finalize_and_embed(
     tl.store(draft_tokens + row * draft_tokens_stride + draft_token_column, index)
     position = tl.load(positions + row)
     tl.store(positions + row, position + 1)
+    if WRITE_MROPE:
+        for axis in tl.static_range(3):
+            ptr = mrope + axis * mrope_axis_stride + row * mrope_row_stride
+            tl.store(ptr, tl.load(ptr) + 1)
 
     col = tl.arange(0, EMBED_BLOCK)
     value = tl.load(weight + index * weight_stride + col, col < HIDDEN, other=0)
     tl.store(embedding + row * HIDDEN + col, value, col < HIDDEN)
 
 
-def finalize_next_input(logits, positions, draft_tokens, column, slot):
+def finalize_next_input(
+    logits, positions, draft_tokens, column, slot, mrope_positions=None
+):
     """Original partial argmax plus finalization/gather into a capture-owned slot."""
     bs, vocab = logits.shape
     splits = slot.partial_values.shape[1]
@@ -141,7 +151,11 @@ def finalize_next_input(logits, positions, draft_tokens, column, slot):
         slot.weight,
         slot.embedding,
         slot.weight.stride(0),
+        mrope_positions,
+        mrope_positions.stride(0) if mrope_positions is not None else 0,
+        mrope_positions.stride(1) if mrope_positions is not None else 0,
         splits,
+        WRITE_MROPE=mrope_positions is not None,
         HIDDEN=2560,
         REDUCE_BLOCK=triton.next_power_of_2(splits),
         EMBED_BLOCK=4096,

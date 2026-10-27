@@ -359,6 +359,9 @@ class LogitsMetadata:
     # DRAFT_EXTEND_V2: when set, lm_head and LAST hidden capture use only these
     # rows (see EagleDraftExtendInput.select_index).
     draft_extend_select_index: Optional[torch.Tensor] = None
+    # The FN native top-1 consumer widens BF16 logits to FP32 at each load.
+    # Keeping the head's unchanged BF16 output avoids a separate full-vocab copy.
+    q38c_native_top1: bool = False
 
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
@@ -401,6 +404,7 @@ class LogitsMetadata:
             forward_mode=forward_mode,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
             next_token_logits_buffer=forward_batch.next_token_logits_buffer,
+            q38c_native_top1=getattr(forward_batch, "_q38c_native_top1", False),
             extend_return_logprob=extend_return_logprob,
             extend_return_top_logprob=extend_return_top_logprob,
             extend_token_ids_logprob=extend_token_ids_logprob,
@@ -1395,6 +1399,13 @@ class LogitsProcessor(nn.Module):
         if logits.shape[-1] > self.vocab_size:
             logits = logits[:, : self.vocab_size]
         logits_width = logits.shape[-1]
+        if (
+            logits_metadata.q38c_native_top1
+            and logits_metadata.forward_mode.is_decode()
+            and logits.dtype == torch.bfloat16
+            and softcap is None
+        ):
+            return logits
         if softcap is not None:
             if logits_buffer is None or tuple(logits_buffer.shape) != tuple(
                 logits.shape
