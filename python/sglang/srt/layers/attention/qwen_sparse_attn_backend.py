@@ -1360,7 +1360,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             self.qsa_profile.budget,
         )
 
-    def _try_fused_kv_attention(self, q, k, v, layer, forward_batch, indices):
+    def _try_fused_kv_attention(self, q, k, v, layer, forward_batch, indices, output_gate=None):
         if not self._fused_kv_pool_eligible or not q.is_cuda or k is None or v is None:
             return None
         mode = forward_batch.forward_mode
@@ -1443,6 +1443,11 @@ class QwenSparseAttnBackend(AttentionBackend):
             if row_requests is None:
                 row_requests = forward_batch.req_pool_indices
             if row_requests.numel() == rows:
+                gate_kwargs = {}
+                if output_gate is not None:
+                    from sglang.kernels.ops.attention.qsa_gate_epilogue_v2 import run_gated
+                    run = run_gated
+                    gate_kwargs["gate"] = output_gate
                 output = run(
                     q.reshape(rows, layer.tp_q_head_num, layer.head_dim),
                     kc, vc, k, v, loc,
@@ -1453,7 +1458,10 @@ class QwenSparseAttnBackend(AttentionBackend):
                     indexer.decode_logical_positions,
                     layer.scaling,
                     width=width,
+                    **gate_kwargs,
                 )
+                if output_gate is not None:
+                    return output.reshape(rows, -1), True
                 return output.reshape(rows, -1)
         return self._forward_trtllm_sparse(
             q.reshape(rows, layer.tp_q_head_num, layer.head_dim),
@@ -1488,7 +1496,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
         if save_kv_cache:
             fused_output = self._try_fused_kv_attention(
-                q, k, v, layer, forward_batch, topk_indices
+                q, k, v, layer, forward_batch, topk_indices,
+                output_gate=kwargs.get("q38_output_gate"),
             )
             if fused_output is not None:
                 return fused_output
