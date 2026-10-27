@@ -1489,9 +1489,12 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         k = k_by_head.view(k.shape)
         return q, k
 
-    def forward_prepare_cuda_fused(self, positions, hidden_states):
+    def forward_prepare_cuda_fused(self, positions, hidden_states, projected_qkv=None):
         """Fused QK GemmaRMSNorm + NeoX RoPE + gate deinterleave."""
-        qkv, _ = self.qkv_proj(hidden_states)
+        if projected_qkv is None:
+            qkv, _ = self.qkv_proj(hidden_states)
+        else:
+            qkv = projected_qkv
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
                 [self.q_size * 2, self.kv_size, self.kv_size], dim=-1

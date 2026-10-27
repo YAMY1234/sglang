@@ -108,6 +108,7 @@ _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD = 1024
 _Q38_QSA_EARLY_INDEXER = get_bool_env_var("Q38_QSA_EARLY_INDEXER", "False")
 _Q38_ATTN_GATE_V2 = get_bool_env_var("Q38_ATTN_GATE_V2", "False")
 _Q38_QSA_PDL_INDEX = get_bool_env_var("Q38_QSA_PDL_INDEX", "False")
+_Q38C_QKV104 = get_bool_env_var("SGLANG_Q38C_QKV104", "False")
 
 
 def _ple_table_is_fp8(
@@ -1869,6 +1870,41 @@ class Qwen4ExpAttentionDecoderLayer(
                 rotary_emb=self.rotary_emb,
             )
         self._init_qwen4_exp_layer_extensions(config, layer_id, quant_config, prefix)
+
+    def _prepare_qkv_gate(self, positions, hidden_states, forward_batch):
+        if (
+            _Q38C_QKV104
+            and forward_batch.forward_mode.is_target_verify()
+            and self.attn_tp_size == 1
+            and self.attn_output_gate
+            and hidden_states.is_cuda
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.ndim == 2
+            and hidden_states.shape[0] in (4, 8, 12)
+            and hidden_states.shape[1] == 2560
+            and hidden_states.stride(-1) == 1
+        ):
+            from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+            from sglang.srt.utils import is_sm100_supported
+
+            projection = self.qkv_proj
+            if (
+                is_sm100_supported()
+                and isinstance(projection.quant_method, UnquantizedLinearMethod)
+                and projection.bias is None
+                and projection.weight.dtype == torch.bfloat16
+                and tuple(projection.weight.shape) == (13312, 2560)
+                and projection.weight.stride(-1) == 1
+            ):
+                from sglang.kernels.ops.attention.q38_qkv104 import qkv104
+
+                # Keep the existing index-projection fork, full-K BF16 output
+                # boundary, and native Q/K norm/RoPE/gate deinterleave.
+                projected_qkv = qkv104(hidden_states, projection.weight)
+                return self.forward_prepare_cuda_fused(
+                    positions, hidden_states, projected_qkv=projected_qkv
+                )
+        return super()._prepare_qkv_gate(positions, hidden_states, forward_batch)
 
     def _compute_qsa_topk_indices(
         self,
