@@ -572,7 +572,7 @@ def verify(
             "USE_GDC": True,
             "launch_pdl": True,
             "WAIT_FOR_GATE_PRODUCER": wait_for_gate_producer,
-            "PREFETCH_CHECKPOINT": False,
+            "PREFETCH_CHECKPOINT": os.environ.get("Q38_GDN_STATE_PREFETCH") == "1",
         }
         if pdl
         else {}
