@@ -97,6 +97,8 @@ def _chain_accept_commit_next_kernel(
         EXTEND_MROPE=EXTEND_MROPE,
         LINEAR=LINEAR,
     )
+    # The scalar length store may be lane0-only; order it before all-lane reloads.
+    tl.debug_barrier()
     _prepare_draft_window_kernel(
         next_req_pool_indices,
         next_req_to_token,
