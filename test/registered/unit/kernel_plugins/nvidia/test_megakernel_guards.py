@@ -105,6 +105,43 @@ class TestMegakernelGuards(CustomTestCase):
         self.assertIs(got, built)
         create.assert_called_once_with(config=config, device="cuda")
 
+    def test_cp_lite_request_does_not_restore_a_length_gate(self):
+        """A requested multi-request CP path must remain active at short KV lengths."""
+        import torch.distributed._symmetric_memory as symm_mem
+
+        original_empty = torch.empty
+        handle = SimpleNamespace(rank=0, buffer_ptrs=[0, 0])
+
+        def empty_cpu(shape, *, dtype, device):
+            del device
+            return original_empty(shape, dtype=dtype)
+
+        with (
+            patch.object(torch.cuda, "get_device_properties") as properties,
+            patch.object(torch.cuda, "synchronize"),
+            patch.object(torch.cuda, "Stream", return_value=object()),
+            patch.object(torch.distributed, "barrier"),
+            patch.object(symm_mem, "get_backend", return_value=object()),
+            patch.object(symm_mem, "empty", side_effect=empty_cpu),
+            patch.object(symm_mem, "rendezvous", return_value=handle),
+            patch(
+                "sglang.srt.layers.attention.q35_cp_fused.q35_cp_fused_prepare"
+            ),
+        ):
+            properties.return_value = SimpleNamespace(multi_processor_count=148)
+            cp_lite = CpLite(
+                group=object(),
+                tp_rank=0,
+                tp_size=8,
+                cp=2,
+                q_heads=8,
+                device="cpu",
+            )
+
+        self.assertIsNone(cp_lite._gate_thr(2))
+        self.assertIsNone(cp_lite._gate_thr(4))
+        self.assertIsNone(cp_lite._gate_thr(16))
+
     def test_slots_are_inert_without_the_megakernel(self):
         with (
             patch.object(binding, "megakernel_enabled", return_value=False),

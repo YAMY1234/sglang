@@ -1080,7 +1080,7 @@ class CpLite:
             cp, rows, q_heads, dtype=torch.float32, device=self.device
         )
         self.pre_lens = torch.zeros(rows, dtype=torch.int32, device=self.device)
-        self.min_kv = {2: 12288, 4: 10240, 16: 6144}
+        self.min_kv = {}
         self.gate_max = False
         self.stock_lens = torch.zeros(rows, dtype=torch.int32, device=self.device)
         self.gate_overlap = 1
