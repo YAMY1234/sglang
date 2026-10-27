@@ -1708,9 +1708,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
             return
         # one stream of forced acceptance lengths, from which the post-verify
         # graphs and the eager verify both draw; the global CPU RNG otherwise
-        self._simulated_acc_len_rng = simulated_acc_len_generator(
-            self.target_worker.random_seed
-        )
+        # Match the native OFF path's implicit global CPU RNG for forced AL.
+        # This isolated v3 recipe disables HOST_SIM_PREDRAW: pre-drawing a shared
+        # global stream could advance it ahead of unrelated CPU RNG consumers.
+        self._simulated_acc_len_rng = torch.default_generator
         self._post_verify_graphs = EaglePostVerifyGraphs(
             target_worker=self.target_worker,
             simulated_acc_len_rng=self._simulated_acc_len_rng,
