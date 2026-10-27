@@ -3,16 +3,24 @@
 QK/PV and FP32 PART/MAX/SUM unchanged. Preserve BF16 rounding before gate.
 Native TGV o_proj remains the same consumer, with its activation PDL wait.
 """
+import os
+
 import torch
 import triton
 import triton.language as tl
 from sglang.kernels.ops.attention.qsa_tcgen05_v1 import _store, partial_tcgen05
 
+_Q38C_QSA_PDL_FIX = os.environ.get("SGLANG_Q38C_QSA_PDL_FIX", "0") == "1"
+
 @triton.jit
-def _merge_gate_pdl_v2(P, MAX, SUM, OUT, GATE, GS: tl.constexpr, GH: tl.constexpr, NT: tl.constexpr, ST: tl.constexpr):
+def _merge_gate_pdl_v2(P, MAX, SUM, OUT, GATE, GS: tl.constexpr, GH: tl.constexpr, NT: tl.constexpr, ST: tl.constexpr, WAIT_PRIMARY: tl.constexpr = False):
     # Release native o_proj weight DMA before reduction/gate; activation DMA
     # keeps its original griddepcontrol.wait until this entire producer ends.
     tl.extra.cuda.gdc_launch_dependents()
+    if WAIT_PRIMARY:
+        # The entry trigger releases only the consumer's independent work.
+        # Our partial states must be ready before any reduction reads them.
+        tl.extra.cuda.gdc_wait()
     row, head, dim_tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     t = tl.arange(0, ST)
     d = dim_tile * 64 + tl.arange(0, 64)
@@ -75,7 +83,7 @@ def run_gated(q, k_pool, v_pool, k_new, v_new, loc, req_to_token, row_requests,
         num_warps=4,
     )
     _merge_gate_pdl_v2[(m, nh, triton.cdiv(d, 64))](
-        partial, maximum, sums, output, gate, gate.stride(0), gate.stride(1) if gate.ndim == 3 else 256, nt, triton.next_power_of_2(nt), num_warps=4, launch_pdl=True,
+        partial, maximum, sums, output, gate, gate.stride(0), gate.stride(1) if gate.ndim == 3 else 256, nt, triton.next_power_of_2(nt), WAIT_PRIMARY=_Q38C_QSA_PDL_FIX, num_warps=4, launch_pdl=True,
     )
     return output
 
