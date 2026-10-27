@@ -3,11 +3,14 @@ the torch implementations are the fallback and the reference."""
 
 import functools
 import math
+import os
 from typing import Optional
 
 import torch
 
-from sglang.srt.utils.common import is_hip
+from sglang.srt.utils.common import is_hip, is_sm100_supported
+
+_Q38C_SCORE_SKIP_EMPTY = os.environ.get("SGLANG_Q38C_SCORE_SKIP_EMPTY", "0") == "1"
 
 try:
     import flashinfer.comm  # noqa: F401
@@ -230,6 +233,7 @@ if HAS_TILELANG:
         min_scored_len: int = 0,
         threads: int = 128,
         dtype: str = "bfloat16",
+        skip_empty_cta: bool = False,
     ):
         # The MMA layout needs 64 GEMM rows; a compressed page has full_page // ratio,
         # so pages are packed as sub-pages of one 64-row tile.
@@ -253,51 +257,58 @@ if HAS_TILELANG:
             # A fixed number of CTAs per row strides over that row's groups, so the
             # grid no longer scales with the page-table width (the max context).
             with T.Kernel(batch, ctas_per_row, threads=threads) as (bx, cta):
-                q_shared = T.alloc_shared([heads, head_dim], dtype)
-                k_shared = T.alloc_shared([GROUP, head_dim], dtype)
-                scores = T.alloc_fragment([GROUP, heads], T.float32)
-                reduced = T.alloc_fragment([GROUP], T.float32)
                 context_len = T.alloc_var(T.int32)
                 context_len = ContextLens[bx]
                 num_groups = T.ceildiv(context_len, GROUP)
 
-                # Rows at or below min_scored_len select every block, so their
-                # scores are never read.
-                if context_len > min_scored_len:
-                    T.copy(Q[bx, 0, :, :], q_shared)
-                    for step in T.serial(T.ceildiv(num_groups, ctas_per_row)):
-                        group = step * ctas_per_row + cta
-                        if group < num_groups:
-                            # TileLang's pipeliner rejects dynamic loops around smem
-                            # copies; unroll the sub-pages at the Python level.
-                            for sp in range(sub_pages):
-                                if (group * sub_pages + sp) * page_size < context_len:
-                                    T.copy(
-                                        KCache[
-                                            PageTable[bx, group * sub_pages + sp],
-                                            :,
-                                            0,
-                                            :,
-                                        ],
-                                        k_shared[
-                                            sp * page_size : (sp + 1) * page_size, :
-                                        ],
-                                    )
-                            T.gemm(
-                                k_shared,
-                                q_shared,
-                                scores,
-                                transpose_B=True,
-                                clear_accum=True,
-                                policy=T.GemmWarpPolicy.FullCol,
-                            )
-                            for token, head in T.Parallel(GROUP, heads):
-                                scores[token, head] = T.max(scores[token, head], 0.0)
-                            T.reduce_sum(scores, reduced, dim=1, clear=True)
-                            for token in T.Parallel(GROUP):
-                                position = group * GROUP + token
-                                if position < context_len:
-                                    Logits[bx, position] = reduced[token] / Scale
+                # Uniform CTA guard: an empty CTA exits after the length read.
+                # The launch still reserves static shared memory per CTA, but
+                # empty CTAs do not initialize/use the buffers or copy Q.
+                if not skip_empty_cta or (
+                    context_len > min_scored_len and cta < num_groups
+                ):
+                    q_shared = T.alloc_shared([heads, head_dim], dtype)
+                    k_shared = T.alloc_shared([GROUP, head_dim], dtype)
+                    scores = T.alloc_fragment([GROUP, heads], T.float32)
+                    reduced = T.alloc_fragment([GROUP], T.float32)
+
+                    # Rows at or below min_scored_len select every block, so their
+                    # scores are never read.
+                    if context_len > min_scored_len:
+                        T.copy(Q[bx, 0, :, :], q_shared)
+                        for step in T.serial(T.ceildiv(num_groups, ctas_per_row)):
+                            group = step * ctas_per_row + cta
+                            if group < num_groups:
+                                # TileLang's pipeliner rejects dynamic loops around smem
+                                # copies; unroll the sub-pages at the Python level.
+                                for sp in range(sub_pages):
+                                    if (group * sub_pages + sp) * page_size < context_len:
+                                        T.copy(
+                                            KCache[
+                                                PageTable[bx, group * sub_pages + sp],
+                                                :,
+                                                0,
+                                                :,
+                                            ],
+                                            k_shared[
+                                                sp * page_size : (sp + 1) * page_size, :
+                                            ],
+                                        )
+                                T.gemm(
+                                    k_shared,
+                                    q_shared,
+                                    scores,
+                                    transpose_B=True,
+                                    clear_accum=True,
+                                    policy=T.GemmWarpPolicy.FullCol,
+                                )
+                                for token, head in T.Parallel(GROUP, heads):
+                                    scores[token, head] = T.max(scores[token, head], 0.0)
+                                T.reduce_sum(scores, reduced, dim=1, clear=True)
+                                for token in T.Parallel(GROUP):
+                                    position = group * GROUP + token
+                                    if position < context_len:
+                                        Logits[bx, position] = reduced[token] / Scale
 
         return kernel
 
@@ -439,6 +450,14 @@ def tilelang_qsa_mqa_decode(
         ctas_per_row=_decode_ctas_per_row(q.shape[0], q.device),
         min_scored_len=min_scored_len,
         dtype=_TILELANG_DTYPES[scoring_dtype],
+        skip_empty_cta=(
+            _Q38C_SCORE_SKIP_EMPTY
+            and is_sm100_supported()
+            and scoring_dtype == torch.bfloat16
+            and head_dim == 128
+            and page_size == 16
+            and q.shape[0] in (4, 8, 12)
+        ),
     )(
         q_kernel.unsqueeze(1).contiguous(),
         k_cache.to(scoring_dtype).contiguous(),
