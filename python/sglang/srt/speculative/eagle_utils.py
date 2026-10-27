@@ -825,6 +825,7 @@ def eagle_sample(
     simulated_acc_len: Optional[torch.Tensor] = None,
     simulated_acc_len_rng: Optional[torch.Generator] = None,
     sparse_bonus_argmax: bool = False,
+    chain_commit_context=None,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
@@ -998,6 +999,7 @@ def eagle_sample(
                 simulated_acc_len=simulated_acc_len if SIMULATE_ACC_LEN > 0 else None,
                 real_draft_tokens=SIMULATE_ACC_TOKEN_MODE == "real-draft-token",
                 finish=True,
+                chain_commit_context=chain_commit_context,
             )
         else:
             predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
@@ -1282,6 +1284,7 @@ def eagle_sample(
                 simulated_acc_len=simulated_acc_len,
                 real_draft_tokens=SIMULATE_ACC_TOKEN_MODE == "real-draft-token",
                 finish=True,
+                chain_commit_context=chain_commit_context,
             )
         elif simulated_acc_len is not None:
             accept_index = generate_simulated_accept_index_device(
@@ -1363,8 +1366,29 @@ def _chain_accept(
     simulated_acc_len: Optional[torch.Tensor],
     real_draft_tokens: bool,
     finish: bool,
+    chain_commit_context=None,
 ):
     from sglang.kernels.ops.speculative.eagle import chain_accept
+
+    if finish and chain_commit_context is not None:
+        from sglang.kernels.ops.speculative.chain_commit import try_chain_accept_commit
+
+        result = try_chain_accept_commit(
+            chain_commit_context,
+            predict=predict,
+            accept_index=accept_index,
+            num_correct_drafts=num_correct_drafts,
+            candidates=candidates,
+            retrieve_index=verify_input.retrieve_index,
+            retrieve_next_token=verify_input.retrieve_next_token,
+            retrieve_next_sibling=verify_input.retrieve_next_sibling,
+            target_predict=target_predict,
+            bonus_target=bonus_target,
+            simulated_acc_len=simulated_acc_len,
+            real_draft_tokens=real_draft_tokens,
+        )
+        if result is not None:
+            return result
 
     return chain_accept(
         predict=predict,

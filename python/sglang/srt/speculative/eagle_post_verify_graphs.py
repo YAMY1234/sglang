@@ -7,6 +7,7 @@ reproduce; any other batch runs SGLang's eager path."""
 from __future__ import annotations
 
 import logging
+import os
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
@@ -37,6 +38,7 @@ _SIM_PREDRAW = envs.SGLANG_PERFLL_HOST_SIM_PREDRAW.get()
 _BONUS_DTYPE = torch.int64 if envs.SGLANG_PERFLL_STEP5A_BONUS_I64.get() else torch.int32
 # SGLANG_PERFLL_STEP5A_SEQ_LENS: a batch's lengths may be a slot's new_seq_lens output
 _STAGED_SEQ_LENS = envs.SGLANG_PERFLL_STEP5A_SEQ_LENS.get()
+_CHAIN_COMMIT_KEY = "q35fly-chain-accept-commit"
 
 
 def simulated_acc_len_generator(seed: int) -> torch.Generator:
@@ -56,7 +58,8 @@ class EaglePostVerifyGraphs:
         # SGLANG_PST_SPEC_EXTEND_LAYOUT: the draft extend's layout in the commit-outputs launch
         self._extend_layout = envs.SGLANG_PST_SPEC_EXTEND_LAYOUT.get()
         self._extend_mrope = (
-            self._extend_layout and target_worker.model_runner.model_config.model_is_mrope
+            self._extend_layout
+            and target_worker.model_runner.model_config.model_is_mrope
         )
         self._graphs = _PostVerifyGraphs(
             body=self._body,
@@ -143,7 +146,12 @@ class EaglePostVerifyGraphs:
             key=key,
             inputs=_post_verify_inputs(batch, verify_input),
             make_slot=lambda staged: self._make_slot(
-                staged, batch, verify_input, logits_output, max_top_k
+                staged,
+                batch,
+                verify_input,
+                logits_output,
+                max_top_k,
+                chain_commit=key[-1] == _CHAIN_COMMIT_KEY,
             ),
             sim_max_len=verify_input.max_tree_depth,
         )
@@ -189,7 +197,7 @@ class EaglePostVerifyGraphs:
             )
         ):
             return None
-        return (
+        key = (
             len(batch.seq_lens),
             bool(info.is_all_greedy),
             bool(info.need_top_k_sampling),
@@ -212,6 +220,14 @@ class EaglePostVerifyGraphs:
             ),
         )
 
+        if os.environ.get(
+            "SGLANG_Q35FLY_CHAIN_ACCEPT_COMMIT", "0"
+        ) == "1" and _chain_commit_key_enabled(
+            batch, verify_input, logits_output, self._rs_d1
+        ):
+            return (*key, _CHAIN_COMMIT_KEY)
+        return key
+
     def _make_slot(
         self,
         staged: dict[str, torch.Tensor],
@@ -219,12 +235,15 @@ class EaglePostVerifyGraphs:
         verify_input: Any,
         logits_output: Any,
         max_top_k: Optional[int] = None,
+        *,
+        chain_commit: bool = False,
     ) -> SimpleNamespace:
         from sglang.srt.runtime_context import mamba_track_grid
 
         info = batch.sampling_info
         step2 = self._step2
         return SimpleNamespace(
+            chain_commit=chain_commit,
             next_draft=(
                 None
                 if step2 is None
@@ -313,30 +332,49 @@ class EaglePostVerifyGraphs:
             hidden_stream.wait_stream(main)
             with torch.cuda.stream(hidden_stream):
                 extend.hidden_states.copy_(slot.hidden)
-        predict, accept_lens, accept_index = _sample(slot)
-        new_seq_lens, bonus_tokens, commit_steps, draft_extend_inputs = (
-            prepare_verify_commit_outputs(
-                predict,
-                accept_index,
-                accept_lens,
+        chain_commit_context = None
+        if slot.chain_commit:
+            from sglang.kernels.ops.speculative.chain_commit import ChainCommitContext
+
+            chain_commit_context = ChainCommitContext(
                 slot.staged["seq_lens"],
-                num_draft_tokens=slot.tokens_per_request,
-                mamba_track_interval=slot.track_interval,
-                extend_layout=self._extend_layout,
-                extend_mrope=self._extend_mrope,
-                bonus_dtype=_BONUS_DTYPE,
-                **(
-                    {}
-                    if extend is None
-                    else dict(
-                        runner_inputs=extend,
-                        req_pool_indices=slot.staged["req_pool_indices"],
-                        track_indices=slot.staged.get("track_indices"),
-                        runner_write_window=slot.staged["write_window"],
-                    )
-                ),
+                slot.track_interval,
+                self._extend_layout,
+                self._extend_mrope,
+                _BONUS_DTYPE,
             )
-        )
+        predict, accept_lens, accept_index = _sample(slot, chain_commit_context)
+        if (
+            chain_commit_context is not None
+            and chain_commit_context.outputs is not None
+        ):
+            new_seq_lens, bonus_tokens, commit_steps, draft_extend_inputs = (
+                chain_commit_context.outputs
+            )
+        else:
+            new_seq_lens, bonus_tokens, commit_steps, draft_extend_inputs = (
+                prepare_verify_commit_outputs(
+                    predict,
+                    accept_index,
+                    accept_lens,
+                    slot.staged["seq_lens"],
+                    num_draft_tokens=slot.tokens_per_request,
+                    mamba_track_interval=slot.track_interval,
+                    extend_layout=self._extend_layout,
+                    extend_mrope=self._extend_mrope,
+                    bonus_dtype=_BONUS_DTYPE,
+                    **(
+                        {}
+                        if extend is None
+                        else dict(
+                            runner_inputs=extend,
+                            req_pool_indices=slot.staged["req_pool_indices"],
+                            track_indices=slot.staged.get("track_indices"),
+                            runner_write_window=slot.staged["write_window"],
+                        )
+                    ),
+                )
+            )
         if slot.next_draft is not None:
             step2 = self._step2
             perfll_step2.stage_next_draft(
@@ -382,7 +420,45 @@ class EaglePostVerifyGraphs:
         )
 
 
-def _sample(slot: SimpleNamespace) -> tuple:
+def _chain_commit_key_enabled(batch, verify_input, logits_output, rs_d1) -> bool:
+    # Called only after the live flag check. The resolved selection travels with
+    # this graph slot; replay never reinterprets a captured entry.
+    from sglang.kernels.ops.speculative.chain_commit import (
+        chain_commit_inputs_supported,
+    )
+    from sglang.srt.speculative.eagle_utils import _FUSED_ACCEPT, _is_hip
+    from sglang.srt.speculative.spec_utils import (
+        SIMULATE_ACC_LEN,
+        SIMULATE_ACC_TOKEN_MODE,
+    )
+
+    return (
+        _FUSED_ACCEPT
+        and not _is_hip
+        and rs_d1 is None
+        and logits_output.next_token_logits.is_cuda
+        and logits_output.next_token_logits.ndim == 2
+        and logits_output.next_token_logits.shape[0] == 7
+        and len(batch.seq_lens) == 1
+        and verify_input.topk == 1
+        and verify_input.draft_token_num == 7
+        and verify_input.max_tree_depth == 7
+        and (batch.sampling_info.is_all_greedy or SIMULATE_ACC_LEN > 0)
+        and (
+            SIMULATE_ACC_LEN <= 0
+            or SIMULATE_ACC_TOKEN_MODE in ("fixed", "real-draft-token")
+        )
+        and chain_commit_inputs_supported(
+            batch.seq_lens,
+            verify_input.draft_token,
+            verify_input.retrieve_index,
+            verify_input.retrieve_next_token,
+            verify_input.retrieve_next_sibling,
+        )
+    )
+
+
+def _sample(slot: SimpleNamespace, chain_commit_context=None) -> tuple:
     """SGLang's eagle_sample over the slot's staged copies, with the injected
     acceptance length read on the device."""
     from sglang.srt.speculative.eagle_utils import eagle_sample
@@ -430,6 +506,7 @@ def _sample(slot: SimpleNamespace) -> tuple:
         uno_target_max_top_k=slot.max_top_k,
         simulated_acc_len=staged.get("sim_accept_len"),
         sparse_bonus_argmax=slot.max_top_k is not None,
+        chain_commit_context=chain_commit_context,
     )
 
 
