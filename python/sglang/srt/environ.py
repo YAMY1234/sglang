@@ -331,6 +331,7 @@ class Envs:
     SGLANG_Q38_ROUTER_FRONT = EnvBool(False)
     SGLANG_Q38_ROUTER_HYBRID = EnvBool(False)
     SGLANG_Q38_ROUTER_NATIVE_REDUCE = EnvBool(False)
+    SGLANG_Q38C_ROUTE_TAIL = EnvBool(False)
     # --ple-offload-backend file: where the sparse, file-backed PLE table lives
     # (deterministic name, reused across restarts), whether prefill-sized
     # gathers hint the page cache first, and an escape hatch for the device
