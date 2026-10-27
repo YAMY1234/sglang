@@ -276,7 +276,7 @@ void hc_combine_norm_decode_kernel_cluster2(const HcCombineNormDecodeParams __gr
   }
 }
 
-template <int kParts>
+template <int kParts, bool kClusterM4Only = false>
 struct HcCombineNormDecode {
   static void
   run(tvm::ffi::TensorView block,
@@ -308,12 +308,18 @@ struct HcCombineNormDecode {
         static_cast<bf16_t*>(combined.data_ptr()),
         static_cast<bf16_t*>(normalized.data_ptr()),
         eps};
-    LaunchKernel(m.unwrap() * 4 * 2, 96, dev.unwrap())
-        .config({.use_pdl = true, .cluster_dim = dim3{2, 1, 1}})(hc_combine_norm_decode_kernel_cluster2<false>, p);
+    // Gate on actual tensor rows, including overlapping AgentX requests.
+    if (!kClusterM4Only || m.unwrap() == 4) {
+      LaunchKernel(m.unwrap() * 4 * 2, 96, dev.unwrap())
+          .config({.use_pdl = true, .cluster_dim = dim3{2, 1, 1}})(hc_combine_norm_decode_kernel_cluster2<false>, p);
+    } else {
+      LaunchKernel(m.unwrap() * 4 * kParts, 160, dev.unwrap())
+          .enable_pdl(true)(hc_combine_norm_decode_kernel<kParts>, p);
+    }
   }
 };
 
-template <int kParts>
+template <int kParts, bool kClusterM4Only = false>
 struct HcSharedCombineNormDecode {
   static void run(tvm::ffi::TensorView hidden,
       tvm::ffi::TensorView shared,
@@ -347,8 +353,13 @@ struct HcSharedCombineNormDecode {
         static_cast<const bf16_t*>(shared.data_ptr()),
         static_cast<const bf16_t*>(hidden.data_ptr()),
         static_cast<const bf16_t*>(shared_weight.data_ptr())};
-    LaunchKernel(m.unwrap() * 4 * 2, 96, dev.unwrap())
-        .config({.use_pdl = true, .cluster_dim = dim3{2, 1, 1}})(hc_combine_norm_decode_kernel_cluster2<true>, p);
+    if (!kClusterM4Only || m.unwrap() == 4) {
+      LaunchKernel(m.unwrap() * 4 * 2, 96, dev.unwrap())
+          .config({.use_pdl = true, .cluster_dim = dim3{2, 1, 1}})(hc_combine_norm_decode_kernel_cluster2<true>, p);
+    } else {
+      LaunchKernel(m.unwrap() * 4 * kParts, 160, dev.unwrap())
+          .enable_pdl(true)(hc_combine_norm_decode_kernel<kParts, true>, p);
+    }
   }
 };
 }  // namespace sglang
