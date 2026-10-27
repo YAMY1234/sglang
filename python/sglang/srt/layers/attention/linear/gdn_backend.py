@@ -1,3 +1,5 @@
+import logging
+import os
 from typing import Optional, Tuple, Union
 
 import msgspec
@@ -67,6 +69,8 @@ if is_cuda() or is_hip() or is_xpu():
     )
 
 MAX_FUSED_QKV_SPLIT_DIM = 8192
+logger = logging.getLogger(__name__)
+_q38_front_engaged: set[int] = set()
 _fused_decode_proj_conv_logged = False
 _fused_decode_proj_conv_fallback_logged = False
 _fused_decode_proj_conv_layers_logged: set[int] = set()
@@ -1365,6 +1369,34 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         return output.view(1, num_tokens, *output.shape[1:])
 
+    def q38_inproj_conv_supported(self, forward_batch):
+        meta = self.forward_metadata
+        return (not pp_spec_stable_rows_enabled() and self.mis_metadata is None
+                and forward_batch.spec_info.draft_token_num == 4
+                and meta.query_start_loc.shape[0] == 2
+                and meta.retrieve_next_token is None
+                and meta.retrieve_next_sibling is None
+                and meta.retrieve_parent_token is None)
+
+    def forward_inproj_conv(self, layer, forward_batch, x, weight):
+        from sglang.srt.q38.gdn_inproj_conv import run
+        from sglang.kernels.ops.mamba.causal_conv1d_triton import PAD_SLOT_ID
+        meta = self.forward_metadata
+        params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        packed, convolved = run(
+            x, weight, layer.conv_weights, layer.bias,
+            params.conv[0], meta.mamba_cache_indices[:1],
+            params.intermediate_conv_window[0],
+            self.verify_intermediate_state_indices[:1], pad_slot=PAD_SLOT_ID,
+        )
+        z = packed[:, 10240:16384].view(4, 48, 128)
+        b = packed[:, 16384:16432]
+        a = packed[:, 16432:16480]
+        core = self.forward_extend(
+            layer, forward_batch, convolved, a, b, q38_conv_applied=True
+        )
+        return core, z
+
     def forward_extend(
         self,
         layer: RadixLinearAttention,
@@ -1375,6 +1407,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         **kwargs,
     ):
         assert isinstance(mixed_qkv, torch.Tensor)
+        q38_conv_applied = kwargs.get("q38_conv_applied", False)
         seq_len = mixed_qkv.shape[0]
 
         if _is_hip and seq_len == 0:
@@ -1462,13 +1495,23 @@ class GDNAttnBackend(MambaAttnBackendBase):
             ssm_states_contig = ssm_states
             state_cache_indices = cache_indices
 
-        if is_target_verify:
+        if is_target_verify and not q38_conv_applied:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
             mixed_qkv_reshaped = mixed_qkv.view(
                 batch_size, draft_token_num, -1
             ).transpose(1, 2)
-            mixed_qkv_processed = causal_conv1d_update(
+            conv_update = causal_conv1d_update
+            front_kwargs = {}
+            if os.environ.get("Q38_GDN_FRONT") == "1":
+                from sglang.kernels.ops.attention.q38_gdn_front.conv import conv_update as q35_conv_update
+                assert retrieve_next_token is None and retrieve_next_sibling is None and retrieve_parent_token is None
+                conv_update = q35_conv_update
+                front_kwargs = dict(block_n=128, token_major_out=True, num_warps=2)
+                if layer.layer_id not in _q38_front_engaged:
+                    _q38_front_engaged.add(layer.layer_id)
+                    logger.info("Q38_GDN_FRONT layer=%d heads=%d/%d draft=%d views=1 conv_tile=128 verify_tile=64/w1 source=Q35_plugin pdl=%s", layer.layer_id, layer.num_k_heads, layer.num_v_heads, draft_token_num, os.environ.get("Q38_GDN_PDL", "0"))
+            mixed_qkv_processed = conv_update(
                 mixed_qkv_reshaped,
                 conv_states,
                 layer.conv_weights,
@@ -1477,12 +1520,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 conv_state_indices=cache_indices[:batch_size],
                 intermediate_conv_window=intermediate_conv_window_cache,
                 intermediate_state_indices=intermediate_state_indices[:batch_size],
-                retrieve_next_token=retrieve_next_token,
-                retrieve_next_sibling=retrieve_next_sibling,
-                retrieve_parent_token=retrieve_parent_token,
+                **(front_kwargs if front_kwargs else dict(
+                    retrieve_next_token=retrieve_next_token,
+                    retrieve_next_sibling=retrieve_next_sibling,
+                    retrieve_parent_token=retrieve_parent_token,
+                )),
             )
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
-        else:
+        elif not is_target_verify:
             if forward_metadata.has_mamba_track_mask:
                 mixed_qkv_to_track = mixed_qkv[
                     forward_metadata.track_conv_indices
@@ -1505,6 +1550,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             (is_cuda() or is_hip() or is_xpu())
             and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM
             and not self._use_strided_target_verify_qkv
+            and not (is_target_verify and os.environ.get("Q38_GDN_FRONT") == "1")
         ):
             query, key, value = fused_qkv_split_gdn_prefill(
                 mixed_qkv,
@@ -1557,6 +1603,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     replay_indices=forward_batch.req_pool_indices,
                     query_start_loc=query_start_loc,
                     draft_token_num=forward_batch.spec_info.draft_token_num,
+                    wait_for_gate_producer=q38_conv_applied,
                 )
             else:
                 # The recurrent fallback needs the per-draft snapshots, which
@@ -1877,6 +1924,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         replay_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         draft_token_num: int,
+        wait_for_gate_producer: bool = False,
     ) -> torch.Tensor:
         """ReplaySSM GDN spec-verify (Part B of #28511).
 
@@ -1895,6 +1943,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode import (
             gdn_replayssm_spec_decode,
         )
+
+        if os.environ.get("Q38_GDN_PDL") == "1":
+            from sglang.kernels.ops.attention.q38_gdn_front.replayssm_pdl import (
+                gdn_replayssm_spec_decode,
+            )
 
         H, K = layer.num_k_heads, layer.head_k_dim
         HV, V = layer.num_v_heads, layer.head_v_dim
@@ -1946,6 +1999,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # Capacity folds are committed once across every GDN layer after
             # acceptance; the active path is therefore a single launch/layer.
             launch_mode="verify",
+            block_v=64,
+            num_warps=1,
+            **({"wait_for_gate_producer": True} if wait_for_gate_producer else {}),
         )
         # Match the recurrent target_verify output shape (== value.shape).
         return out.reshape(value.shape)
