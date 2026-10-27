@@ -1444,9 +1444,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
             intermediate_conv_window_cache = (
                 mamba_cache_params.intermediate_conv_window[0]
             )
-            # PP-off selects the fixed table; do not evaluate its unused mask.
+            # The diagnostic switch restores only the original compare/call;
+            # it does not enable PP speculation or change its row selector.
             intermediate_state_indices = self.verify_intermediate_state_indices
-            if pp_spec_stable_rows_enabled():
+            if pp_spec_stable_rows_enabled() or os.environ.get(
+                "SGLANG_Q38C_GDN_RESTORE_COMPARE", "0"
+            ) == "1":
                 intermediate_state_indices = select_verify_intermediate_state_indices(
                     self.verify_intermediate_state_indices,
                     forward_batch.req_pool_indices,
