@@ -776,6 +776,16 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         *,
         defer_finalize: bool = False,
     ):
+        if (
+            envs.SGLANG_Q38C_ROUTE_TAIL.get()
+            and self._q38_router_front
+            and hidden_states.shape[0] in (4, 8, 12)
+            and not torch.compiler.is_compiling()
+            and not is_in_tc_piecewise_cuda_graph()
+        ):
+            from sglang.kernels.ops.moe.q38_route_tail import routed
+
+            return routed(self, hidden_states, defer_finalize=defer_finalize)
         if _use_aiter and self.enable_shared_expert_fusion and not defer_finalize:
             from sglang.kernels.ops.moe.smallm_router_gfx950 import qwen_moe_topk_output
 
