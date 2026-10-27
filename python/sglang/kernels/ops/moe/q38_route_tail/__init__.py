@@ -49,6 +49,8 @@ def _native_kwargs(mlp, front, defer_finalize):
 def routed(mlp, x, *, defer_finalize=False):
     from .front import Front
 
+    if x.shape[0] != 4:
+        raise ValueError("ROUTE_TAIL v2 is M4 only; M8/M12 use the parent path")
     experts = mlp.experts
     if experts.trtllm_padded_hidden_size is not None:
         raise ValueError("ROUTE_TAIL keeps the original unpadded H2560 prepared weights")

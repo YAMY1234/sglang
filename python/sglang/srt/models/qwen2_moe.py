@@ -779,7 +779,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if (
             envs.SGLANG_Q38C_ROUTE_TAIL.get()
             and self._q38_router_front
-            and hidden_states.shape[0] in (4, 8, 12)
+            and hidden_states.shape[0] == 4
             and not torch.compiler.is_compiling()
             and not is_in_tc_piecewise_cuda_graph()
         ):
