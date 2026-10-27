@@ -62,6 +62,8 @@ template <int kParts, bool kShared = false>
 __global__
 __launch_bounds__(160) void hc_combine_norm_decode_kernel(const HcCombineNormDecodeParams __grid_constant__ params) {
   using namespace device;
+  // Prefetch native HC static weights before producer completion; keep input wait.
+  PDLTriggerSecondary<true>();
   using BFloat16x2 = packed_t<bf16_t>;
   using Storage = AlignedVector<BFloat16x2, 8>;
   constexpr uint32_t kThreads = 160;
@@ -153,7 +155,6 @@ __launch_bounds__(160) void hc_combine_norm_decode_kernel(const HcCombineNormDec
     gmem.store(params.combined + (row * 4 + branch) * 2560, combined, 0);
     gmem.store(params.normalized + (row * 4 + branch) * 2560, normalized, 0);
   }
-  PDLTriggerSecondary<true>();
 }
 
 
