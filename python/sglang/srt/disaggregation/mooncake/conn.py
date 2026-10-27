@@ -3088,12 +3088,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             # add further chunks into the transfer queue.
             return
 
-        # NOTE(shangming): sharding according to the dst_infos to make sure
-        # requests with the same dst_sessions will be added into the same
-        # queue, which enables early abort with failed sessions.
-        dst_infos = self.transfer_infos[bootstrap_room].keys()
-        session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
-        shard_idx = session_port_sum % len(self.transfer_queues)
+        # A decode worker gives every room the same destination sessions. Shard
+        # by room so those transfers use all workers while every chunk of one
+        # room stays ordered on a single queue. Low room bits may encode the
+        # decode DP rank, so use the request portion above them.
+        shard_idx = (bootstrap_room >> 16) % len(self.transfer_queues)
 
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
