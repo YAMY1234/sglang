@@ -804,6 +804,10 @@ class TestInklingCheckpointIndices(CustomTestCase):
             else eagle.EAGLEDraftExtendCudaGraphRunner
         )
         runner = cls.__new__(cls)
+        # This fixture intentionally bypasses the production constructor.  The
+        # checkpoint replay under test uses the stock copy path, so initialize
+        # the optional NVIDIA planned-copy gate explicitly.
+        runner._nvidia_decode_fast_path = False
         runner.megakernel = None
         runner.megakernel_served = frozenset()
         runner.buffers = buffers
