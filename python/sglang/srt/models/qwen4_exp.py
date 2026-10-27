@@ -2096,9 +2096,9 @@ class Qwen4ExpAttentionDecoderLayer(
             and forward_batch.forward_mode.is_decode()
             and not gate_applied
             and gate is not None
-            and gate.shape == (1, 24, 256)
-            and gate.stride(2) == 1
-            and gate.stride(1) % 8 == 0
+            and gate.shape in ((1, 6144), (1, 24, 256))
+            and gate.stride(-1) == 1
+            and gate.stride(-2) % 8 == 0
             and gate.dtype == attn_output.dtype == torch.bfloat16
             and attn_output.is_cuda
             and attn_output.shape == (1, 6144)
