@@ -16,6 +16,7 @@ from sglang.srt.disaggregation.common.staging_buffer import (
 )
 from sglang.srt.disaggregation.common.staging_handler import (
     DecodeStagingHandler,
+    _deferred_scatter_enabled,
     handle_staging_req,
 )
 from sglang.srt.disaggregation.common.utils import (
@@ -1456,6 +1457,25 @@ class TestStagingWatermark(unittest.TestCase):
 
 
 class TestDeferredStagingScatter(unittest.TestCase):
+    def test_defer_is_limited_to_expert_parallel_megakernels(self):
+        for megakernel, ep_size, expected in (
+            (False, 8, False),
+            (True, 1, False),
+            (True, 8, True),
+        ):
+            with (
+                self.subTest(megakernel=megakernel, ep_size=ep_size),
+                patch(
+                    "sglang.srt.kernel_plugins.nvidia.binding.megakernel_enabled",
+                    return_value=megakernel,
+                ),
+                patch(
+                    "sglang.srt.disaggregation.common.staging_handler.get_parallel",
+                    return_value=SimpleNamespace(moe_ep_size=ep_size),
+                ),
+            ):
+                self.assertEqual(_deferred_scatter_enabled(), expected)
+
     def test_complete_arrival_waits_for_scheduler_flush(self):
         receiver = SimpleNamespace()
         handler = object.__new__(DecodeStagingHandler)
