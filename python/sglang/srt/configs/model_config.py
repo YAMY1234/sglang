@@ -1976,6 +1976,7 @@ class ModelConfig:
             "modelopt_fp8",
             "modelopt_fp4",
             "nvfp4_online",
+            "qwen3_5_mtp_nvfp4",
             "modelopt_mixed",
         ]
         modelopt_quantization_specified = (
@@ -2021,6 +2022,7 @@ class ModelConfig:
             "modelopt_fp4",
             "modelopt_mixed",
             "nvfp4_online",
+            "qwen3_5_mtp_nvfp4",
             "gptq_marlin_24",
             "gptq_marlin",
             "awq_marlin",
@@ -2046,6 +2048,12 @@ class ModelConfig:
             "modelopt_fp4": ["modelopt", "fp8"],
             "modelopt_mixed": ["modelopt"],
             "nvfp4_online": ["fp8", "modelopt_fp8"],
+            "qwen3_5_mtp_nvfp4": [
+                "fp8",
+                "modelopt_fp8",
+                "modelopt_fp4",
+                "modelopt_mixed",
+            ],
             # Resolved by the MiniMax override from the MoE fields.
             "minimax_m3_nvfp4": ["mxfp8"],
             "petit_nvfp4": ["modelopt"],
@@ -2084,7 +2092,7 @@ class ModelConfig:
             # The online loader rejects already-packed weights at load time.
             preserve_online_draft_quantization = (
                 self.is_draft_model
-                and self.quantization == "nvfp4_online"
+                and self.quantization in ("nvfp4_online", "qwen3_5_mtp_nvfp4")
                 and quant_method in ("modelopt_fp4", "modelopt_mixed")
             )
             # An explicit online-requantization request (e.g. quark_mxfp4 on top
