@@ -1042,7 +1042,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
         threading.Thread(target=decode_listener_thread, daemon=True).start()
 
-    def _prefetch_staging_reqs(self, room: int):
+    def _prefetch_staging_reqs(self, room: int, upto_tokens: Optional[int] = None):
         """Send STAGING_REQ for all chunks before the prefill forward starts.
 
         Idempotent per room: the first call for a given room does the full
@@ -1051,7 +1051,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         """
         if not self.enable_staging or self.kv_buffer_tensors is None:
             return
-        if room in self._staging_ctx.prefetched_rooms:
+        if upto_tokens is None and room in self._staging_ctx.prefetched_rooms:
             return
 
         room_infos = self.transfer_infos.get(room, {})
@@ -1078,8 +1078,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             get_schedule().chunked_prefill_size,
             self._staging_ctx.prefetch_requested,
             self._staging_ctx.prefetch_sockets,
+            upto_tokens=upto_tokens,
         )
-        self._staging_ctx.prefetched_rooms.add(room)
+        if upto_tokens is None:
+            self._staging_ctx.prefetched_rooms.add(room)
 
     def check_status(self, bootstrap_room: int):
         return self.request_status.get(bootstrap_room, KVPoll.WaitingForInput)

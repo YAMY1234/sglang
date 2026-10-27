@@ -40,6 +40,27 @@ from sglang.test.test_utils import CustomTestCase, published_topology
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
+class TestStagingPrefetch(unittest.TestCase):
+    def test_prefetch_is_bounded_by_the_current_chunk(self):
+        prefetch = Mock()
+        manager = SimpleNamespace(
+            _prefetch_staging_reqs=prefetch,
+            transfer_infos={7: object()},
+        )
+        scheduler = SimpleNamespace(
+            disagg_prefill_bootstrap_queue=SimpleNamespace(kv_manager=manager)
+        )
+        batch = SimpleNamespace(
+            reqs=[SimpleNamespace(bootstrap_room=7, extend_end=123)]
+        )
+
+        SchedulerDisaggregationPrefillMixin.maybe_prefetch_staging_for_batch(
+            scheduler, batch
+        )
+
+        prefetch.assert_called_once_with(7, upto_tokens=123)
+
+
 class _StopLoop(Exception):
     pass
 
