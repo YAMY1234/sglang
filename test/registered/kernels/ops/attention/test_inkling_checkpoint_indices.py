@@ -745,6 +745,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
                     capture=SimpleNamespace(enable_torch_compile=False)
                 ),
                 "get_spec": SimpleNamespace(speculative_num_steps=1),
+                "spec_relay_bypass_enabled": False,
                 "get_batch_sizes_to_capture": ([4], []),
                 "resolve_num_tokens_per_req": 4,
                 "get_draft_input_from_target_hidden_dim": 64,
