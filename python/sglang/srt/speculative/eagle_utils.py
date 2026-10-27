@@ -1115,7 +1115,10 @@ def _chain_accept_applies(
     """Whether chain_accept runs eagle_sample's tail (SGLANG_Q35MF_FUSED_ACCEPT): a CUDA
     chain draft whose tree width is the accept width, an injected length (if any)
     already on the device, and no watermark."""
-    if not _FUSED_ACCEPT or not logits.is_cuda or _is_hip or watermark:
+    fused = _FUSED_ACCEPT or getattr(
+        verify_input, "_q38_postverify_fused_accept", False
+    )
+    if not fused or not logits.is_cuda or _is_hip or watermark:
         return False
     if verify_input.tree_topk != 1:
         return False
