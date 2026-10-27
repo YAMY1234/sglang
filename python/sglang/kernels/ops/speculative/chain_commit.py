@@ -196,7 +196,14 @@ class ChainCommitContext:
     """One _body invocation; outputs is set only by the selected final entry."""
 
     def __init__(
-        self, seq_lens, track_interval, extend_layout, extend_mrope, bonus_dtype
+        self,
+        seq_lens,
+        track_interval,
+        extend_layout,
+        extend_mrope,
+        bonus_dtype,
+        *,
+        next_stage=None,
     ):
         self.seq_lens = seq_lens
         self.track_interval = track_interval
@@ -204,6 +211,8 @@ class ChainCommitContext:
         self.extend_mrope = extend_mrope
         self.bonus_dtype = bonus_dtype
         self.outputs = None
+        self.next_stage = next_stage
+        self.next_staged = False
 
 
 def try_chain_accept_commit(
@@ -224,6 +233,14 @@ def try_chain_accept_commit(
     """Return the original (lens, index) tuple, or None for the old entry."""
     if context.outputs is not None:
         raise RuntimeError("chain commit context already consumed")
+    next_stage = context.next_stage
+    if next_stage is not None:
+        from sglang.kernels.ops.speculative.chain_commit_next import (
+            chain_commit_next_inputs_supported,
+        )
+
+        if not chain_commit_next_inputs_supported(context.seq_lens, next_stage):
+            return None
     verify = target_predict is not None
     simulate = simulated_acc_len is not None
     tensors = (predict, accept_index, num_correct_drafts)
@@ -297,7 +314,29 @@ def try_chain_accept_commit(
                 else None,
             ),
         )
-    _chain_accept_commit_kernel[(1,)](
+    kernel = _chain_accept_commit_kernel
+    next_args = {}
+    if next_stage is not None:
+        from sglang.kernels.ops.speculative.chain_commit_next import (
+            _chain_accept_commit_next_kernel,
+        )
+
+        nxt = next_stage.next_draft
+        kernel = _chain_accept_commit_next_kernel
+        next_args = dict(
+            next_req_pool_indices=next_stage.req_pool_indices,
+            next_req_to_token=next_stage.req_to_token,
+            next_seq_lens=nxt.seq_lens,
+            next_positions=nxt.positions,
+            next_mrope=nxt.mrope,
+            next_draft_locs=nxt.draft_out_cache_loc,
+            next_window_locs=nxt.window,
+            next_mrope_stride=nxt.mrope.stride(0) if nxt.mrope is not None else 0,
+            next_fill_seq_len=next_stage.seq_len_fill_value,
+            NEXT_POOL_LEN=next_stage.req_to_token.shape[1],
+            NEXT_MROPE=nxt.mrope is not None,
+        )
+    kernel[(1,)](
         predict,
         accept_index,
         num_correct_drafts,
@@ -329,6 +368,7 @@ def try_chain_accept_commit(
         EXTEND_MROPE=context.extend_layout and context.extend_mrope,
         LINEAR=_LINEAR_ACCEPT,
         num_warps=1,
+        **next_args,
     )
     context.outputs = (
         new_seq_lens,
@@ -336,4 +376,5 @@ def try_chain_accept_commit(
         (last_steps, track_steps),
         (correct, select, ids) + (() if layout is None else (layout,)),
     )
+    context.next_staged = next_stage is not None
     return accept_lens, (sim_accept_index if simulate else accept_index)

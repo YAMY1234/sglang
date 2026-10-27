@@ -39,6 +39,7 @@ _BONUS_DTYPE = torch.int64 if envs.SGLANG_PERFLL_STEP5A_BONUS_I64.get() else tor
 # SGLANG_PERFLL_STEP5A_SEQ_LENS: a batch's lengths may be a slot's new_seq_lens output
 _STAGED_SEQ_LENS = envs.SGLANG_PERFLL_STEP5A_SEQ_LENS.get()
 _CHAIN_COMMIT_KEY = "q35fly-chain-accept-commit"
+_CHAIN_COMMIT_NEXT_KEY = "q35fly-chain-accept-commit-next"
 
 
 def simulated_acc_len_generator(seed: int) -> torch.Generator:
@@ -151,7 +152,8 @@ class EaglePostVerifyGraphs:
                 verify_input,
                 logits_output,
                 max_top_k,
-                chain_commit=key[-1] == _CHAIN_COMMIT_KEY,
+                chain_commit=key[-1] in (_CHAIN_COMMIT_KEY, _CHAIN_COMMIT_NEXT_KEY),
+                chain_commit_next=key[-1] == _CHAIN_COMMIT_NEXT_KEY,
             ),
             sim_max_len=verify_input.max_tree_depth,
         )
@@ -221,6 +223,12 @@ class EaglePostVerifyGraphs:
         )
 
         if os.environ.get(
+            "SGLANG_Q35FLY_CHAIN_ACCEPT_COMMIT_NEXT", "0"
+        ) == "1" and _chain_commit_next_key_enabled(
+            batch, verify_input, logits_output, self._rs_d1, self._step2
+        ):
+            return (*key, _CHAIN_COMMIT_NEXT_KEY)
+        if os.environ.get(
             "SGLANG_Q35FLY_CHAIN_ACCEPT_COMMIT", "0"
         ) == "1" and _chain_commit_key_enabled(
             batch, verify_input, logits_output, self._rs_d1
@@ -237,6 +245,7 @@ class EaglePostVerifyGraphs:
         max_top_k: Optional[int] = None,
         *,
         chain_commit: bool = False,
+        chain_commit_next: bool = False,
     ) -> SimpleNamespace:
         from sglang.srt.runtime_context import mamba_track_grid
 
@@ -244,6 +253,7 @@ class EaglePostVerifyGraphs:
         step2 = self._step2
         return SimpleNamespace(
             chain_commit=chain_commit,
+            chain_commit_next=chain_commit_next,
             next_draft=(
                 None
                 if step2 is None
@@ -342,6 +352,18 @@ class EaglePostVerifyGraphs:
                 self._extend_layout,
                 self._extend_mrope,
                 _BONUS_DTYPE,
+                next_stage=(
+                    SimpleNamespace(
+                        next_draft=slot.next_draft,
+                        req_pool_indices=slot.staged["req_pool_indices"],
+                        req_to_token=self._step2.req_to_token,
+                        num_steps=self._step2.num_steps,
+                        window=self._step2.window,
+                        seq_len_fill_value=self._step2.seq_len_fill_value,
+                    )
+                    if slot.chain_commit_next
+                    else None
+                ),
             )
         predict, accept_lens, accept_index = _sample(slot, chain_commit_context)
         if (
@@ -375,7 +397,9 @@ class EaglePostVerifyGraphs:
                     ),
                 )
             )
-        if slot.next_draft is not None:
+        if slot.next_draft is not None and not (
+            chain_commit_context is not None and chain_commit_context.next_staged
+        ):
             step2 = self._step2
             perfll_step2.stage_next_draft(
                 slot.next_draft,
@@ -455,6 +479,26 @@ def _chain_commit_key_enabled(batch, verify_input, logits_output, rs_d1) -> bool
             verify_input.retrieve_next_token,
             verify_input.retrieve_next_sibling,
         )
+    )
+
+
+def _chain_commit_next_key_enabled(
+    batch, verify_input, logits_output, rs_d1, step2
+) -> bool:
+    if step2 is None or not _chain_commit_key_enabled(
+        batch, verify_input, logits_output, rs_d1
+    ):
+        return False
+    from sglang.kernels.ops.speculative.chain_commit_next import (
+        chain_commit_next_sources_supported,
+    )
+
+    return chain_commit_next_sources_supported(
+        batch.seq_lens,
+        batch.req_pool_indices,
+        step2.req_to_token,
+        step2.num_steps,
+        step2.window,
     )
 
 
