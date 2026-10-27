@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
+from sglang.kernels.ops.speculative import speculative_index
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_draft_cache_locs_contiguous_func,
 )
@@ -24,6 +25,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.runtime_context import mamba_track_grid
+from sglang.srt.speculative import prepared_next_draft
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
@@ -40,6 +42,7 @@ from sglang.srt.speculative.spec_utils import (
     record_stream_for_v2_verify,
 )
 from sglang.srt.utils import is_cpu
+from sglang.srt.utils import speculative_decode_resources as spec_decode_resources
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -123,6 +126,7 @@ def prepare_for_draft_extend(
     widened_out_cache_loc: Optional[torch.Tensor] = None,
     widened_positions: Optional[torch.Tensor] = None,
     kv_loc_plan: Optional[KVLocPlan] = None,
+    prepared_layout: Optional[tuple] = None,
 ):
     """``kv_loc_plan``: the iteration's plan, whose window the draft extend
     writes again (the verify window); a widened window plans its own."""
@@ -169,13 +173,20 @@ def prepare_for_draft_extend(
     fused_lengths = gpu_only and batch.seq_lens.is_cuda
     extend_position_info = None
     if fused_lengths and not widen and draft_extend_input.positions is None:
-        batch.prefix_lens, batch.extend_lens, post_seq_lens, extend_position_info = (
-            prepare_draft_extend_layout(
-                batch.seq_lens,
-                num_draft_tokens,
-                draft_model_runner.model_config.model_is_mrope
-                and all(x is None for x in batch.multimodal_inputs),
+        with_mrope = draft_model_runner.model_config.model_is_mrope and all(
+            x is None for x in batch.multimodal_inputs
+        )
+        if (
+            prepared_layout is not None
+            and (prepared_layout[3][2] is not None) == with_mrope
+        ):
+            layout = prepared_layout
+        else:
+            layout = prepare_draft_extend_layout(
+                batch.seq_lens, num_draft_tokens, with_mrope
             )
+        batch.prefix_lens, batch.extend_lens, post_seq_lens, extend_position_info = (
+            layout
         )
     elif fused_lengths:
         batch.prefix_lens, batch.extend_lens, post_seq_lens = (
@@ -251,11 +262,13 @@ def prepare_for_draft(
     *,
     target_translator: Optional[KVIndexTranslator] = None,
     num_draft_tokens: Optional[int] = None,
+    prepared: Any = None,
 ) -> tuple[ForwardBatch, bool, Optional[KVLocPlan]]:
     """The draft-decode batch. With ``target_translator``, a chain draft plans
     the iteration's whole write window (the ``num_draft_tokens`` slots past
     ``seq_lens`` that verify and draft extend also write) and writes its first
-    ``num_steps`` columns; that plan is returned, else None."""
+    ``num_steps`` columns; that plan is returned, else None. ``prepared`` carries
+    those slots and positions when the preceding post-verify graph produced them."""
     prepared_positions = None
     prepared_mrope_positions = None
     kv_loc_plan = None
@@ -274,31 +287,70 @@ def prepare_for_draft(
         # A chain draft's slots lead the iteration's window: gather the whole
         # window in the same launch.
         window_cols = num_draft_tokens if plans_window else num_steps
-        if page_size == 1 or topk == 1:
-            batch.out_cache_loc = torch.empty(
-                (bs * topk * window_cols,),
-                dtype=torch.int64,
-                device=batch.device,
+        with_mrope = draft_model_runner.model_config.model_is_mrope and all(
+            x is None for x in batch.multimodal_inputs
+        )
+        if (
+            prepared is not None
+            and prepared_next_draft.can_use_prepared_next_draft_inputs(
+                prepared,
+                num_requests=bs,
+                plans_window=plans_window,
+                with_mrope=with_mrope,
+            )
+        ):
+            batch.out_cache_loc = prepared.write_window
+            prepared_positions = prepared.positions
+            prepared_mrope_positions = prepared.mrope_positions
+            kv_loc_plan = target_translator.plan(
+                req_pool_indices=batch.req_pool_indices,
+                seq_lens=batch.seq_lens,
+                seq_lens_cpu=batch.seq_lens_cpu,
+                write_virtual=batch.out_cache_loc,
+                read_extent=num_draft_tokens,
+            )
+            # The same launch wrote these from the write window's first columns.
+            kv_loc_plan.use_prepared_cols(
+                slice(0, num_steps), prepared.draft_out_cache_loc
+            )
+        elif page_size == 1 or topk == 1:
+            batch.out_cache_loc = spec_decode_resources.empty(
+                (bs * topk * window_cols,), dtype=torch.int64, device=batch.device
             )
             if batch.seq_lens.is_cuda and topk == 1:
-                prepared_positions = torch.empty_like(batch.seq_lens)
+                prepared_positions = spec_decode_resources.empty(
+                    (bs,), dtype=batch.seq_lens.dtype, device=batch.seq_lens.device
+                )
                 if draft_model_runner.model_config.model_is_mrope and all(
                     x is None for x in batch.multimodal_inputs
                 ):
-                    prepared_mrope_positions = torch.empty(
+                    prepared_mrope_positions = spec_decode_resources.empty(
                         (3, bs), dtype=torch.int64, device=batch.device
                     )
-            # TODO(lsyin): align with the default code path
-            assign_draft_cache_locs_contiguous_func(
-                batch.req_pool_indices,
-                req_to_token_pool.req_to_token,
-                batch.seq_lens,
-                batch.out_cache_loc,
-                topk,
-                window_cols,
-                positions=prepared_positions,
-                mrope=prepared_mrope_positions,
-            )
+            if not (
+                speculative_index.draft_locs(
+                    req=batch.req_pool_indices,
+                    table=req_to_token_pool.req_to_token,
+                    seq=batch.seq_lens,
+                    out_cache_loc=batch.out_cache_loc,
+                    pool_len=req_to_token_pool.req_to_token.shape[1],
+                    topk=topk,
+                    steps=window_cols,
+                    batch_size=bs,
+                    positions=prepared_positions,
+                    mrope=prepared_mrope_positions,
+                )
+            ):
+                assign_draft_cache_locs_contiguous_func(
+                    batch.req_pool_indices,
+                    req_to_token_pool.req_to_token,
+                    batch.seq_lens,
+                    batch.out_cache_loc,
+                    topk,
+                    window_cols,
+                    positions=prepared_positions,
+                    mrope=prepared_mrope_positions,
+                )
             if plans_window:
                 kv_loc_plan = target_translator.plan(
                     req_pool_indices=batch.req_pool_indices,
@@ -590,7 +642,7 @@ def run_eagle_verify(
         if plan_stream is not None:
             # Verify prep copies draft-produced tree metadata on the plan stream,
             # so it must not start before the draft frontier.
-            plan_stream.wait_stream(fwd_stream)
+            spec_decode_resources.wait_stream(plan_stream, fwd_stream)
         verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
             verify_input,
             req_to_token_pool,
@@ -603,7 +655,9 @@ def run_eagle_verify(
 
     # Correct some buffers due to the overlap plan
     if plan_stream:
-        torch.get_device_module(device).current_stream().wait_stream(plan_stream)
+        spec_decode_resources.wait_stream(
+            torch.get_device_module(device).current_stream(), plan_stream
+        )
         if (
             _is_npu
             and target_worker.model_runner.model_config.model_is_mrope
