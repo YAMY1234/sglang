@@ -170,6 +170,18 @@ def _select_spec_graph_runner_cls(
     return oot_runner_cls()
 
 
+def _flashmla_graph_backend_type(draft_extend_attn_backend) -> type | None:
+    if (
+        getattr(draft_extend_attn_backend, "prefill_attention_backend_str", None)
+        != "flashmla"
+    ):
+        return None
+
+    from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
+
+    return FlashMLABackend
+
+
 def _qsa_index_share_requested(hf_config) -> bool:
     """--json-model-override-args writes top-level hf_config attributes, while
     checkpoint configs carry the flag on the nested text_config; read both."""
@@ -618,11 +630,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
 
             graph_supported_backend_types.append(FlashAttentionBackend)
-            # FlashMLA is CUDA-only; import lazily so CPU builds don't pull
-            # FlashMLA at import time.
-            from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
-
-            graph_supported_backend_types.append(FlashMLABackend)
+            flashmla_backend_type = _flashmla_graph_backend_type(
+                self.draft_extend_attn_backend
+            )
+            if flashmla_backend_type is not None:
+                graph_supported_backend_types.append(flashmla_backend_type)
 
         graph_supported_backend = isinstance(
             self.draft_extend_attn_backend,
