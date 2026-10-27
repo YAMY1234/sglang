@@ -82,10 +82,12 @@ class TestShardedPolicy(CustomTestCase):
             "sglang.srt.kernel_plugins.nvidia.binding.megakernel_enabled",
             return_value=True,
         ):
-            with envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override(()):
+            with envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override(""):
                 self.assertTrue(self._applies(greedy=True))
                 self.assertFalse(self._applies(greedy=False))
-            with envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override((SHARDED_GUMBEL_SLOT,)):
+            with envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override(
+                SHARDED_GUMBEL_SLOT
+            ):
                 self.assertTrue(self._applies(greedy=False))
                 self.assertFalse(self._applies(greedy=False, top_k=True))
 

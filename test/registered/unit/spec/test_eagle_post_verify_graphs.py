@@ -296,7 +296,11 @@ class TestPostVerifyGraphs(CustomTestCase):
                 need_top_k_sampling=True,
                 need_top_p_sampling=True,
             )
-            fields = dict(has_grammar=False, hisparse_coordinator=None)
+            fields = dict(
+                has_grammar=False,
+                hisparse_coordinator=None,
+                return_logprob=False,
+            )
             for name, value in changes.items():
                 (info if name in info else fields)[name] = value
             batch = SimpleNamespace(
@@ -429,6 +433,7 @@ class TestPostVerifyGraphs(CustomTestCase):
             mamba_track_indices=None,
             has_grammar=False,
             hisparse_coordinator=None,
+            return_logprob=False,
         )
         verify_input = SimpleNamespace(
             topk=1, draft_probs=None, draft_token_num=7, max_tree_depth=7
