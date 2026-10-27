@@ -17,6 +17,7 @@ import torch.multiprocessing
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_components import shm_tag_exchange
 from sglang.srt.managers.scheduler_components.request_receiver import (
+    SchedulerRequestReceiver,
     _broadcast_via_exchange,
 )
 from sglang.srt.managers.scheduler_components.shm_tag_exchange import ShmTagExchange
@@ -143,6 +144,42 @@ def _exchange_rounds(rank: int, init_file: str) -> None:
 
 
 class TestShmTagExchange(CustomTestCase):
+    def test_request_receiver_opts_into_multihost_exchange(self):
+        """A TP group spanning hosts must not silently fall back to gloo."""
+        cpu_group = object()
+        tp_group = SimpleNamespace(cpu_group=cpu_group, rank=0, ranks=list(range(8)))
+        parallel = SimpleNamespace(
+            attn_dp_enabled=False,
+            tp_size=8,
+            tp_group=tp_group,
+        )
+        exchange = object()
+        requests = [{"rid": "a"}]
+
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.request_receiver.get_parallel",
+                return_value=parallel,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.request_receiver.get_shm_exchange",
+                return_value=exchange,
+            ) as get_exchange,
+            patch(
+                "sglang.srt.managers.scheduler_components.request_receiver._broadcast_via_exchange",
+                return_value=requests,
+            ) as broadcast,
+        ):
+            got = SchedulerRequestReceiver._broadcast_reqs_across_ranks(None, requests)
+
+        self.assertEqual(got, requests)
+        get_exchange.assert_called_once_with(
+            group=cpu_group, kind="recv", multihost=True
+        )
+        broadcast.assert_called_once_with(
+            requests, exchange=exchange, tp_group=tp_group
+        )
+
     def test_rounds_and_request_broadcast_match_on_every_rank(self):
         """Every rank reads every rank's values of each call, through repeated reuse
         of both table halves with one rank late, and the request broadcast hands
