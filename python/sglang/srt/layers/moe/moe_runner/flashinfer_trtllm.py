@@ -1458,6 +1458,12 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
 
     # Quantize hidden states to FP4
     hidden_states_scale = dispatch_output.hidden_states_scale
+    router_pre_quant = dispatch_output.hidden_states_pre_quant
+    if router_pre_quant is not None:
+        from sglang.kernels.ops.moe.q38_router_front import Nvfp4RouterInput
+
+        if not isinstance(router_pre_quant, Nvfp4RouterInput):
+            router_pre_quant = None
     per_token_scale = None
     unpadded_hidden_size = hidden_states.shape[-1]
     hidden_pad = 0
@@ -1468,7 +1474,11 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         )
         hidden_pad = quant_info.padded_hidden_size - unpadded_hidden_size
         hidden_states = torch.nn.functional.pad(hidden_states, (0, hidden_pad))
-    if hidden_states_scale is not None:
+    if router_pre_quant is not None:
+        assert hidden_pad == 0 and not quant_info.use_per_token_activation
+        assert hidden_states_scale is None
+        hs_fp4, hs_scale_linear = router_pre_quant
+    elif hidden_states_scale is not None:
         # NVFP4 dispatch (flashinfer a2a): inputs are already FP4-quantized by
         # the dispatcher, so pass them through unchanged.
         hs_fp4 = hidden_states

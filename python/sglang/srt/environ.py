@@ -327,6 +327,10 @@ class Envs:
     SGLANG_Q38_HC_SMALLM4 = EnvBool(False)
     SGLANG_Q38_HC_SMALLM16 = EnvBool(False)
     SGLANG_Q38_HC_COMBINE_PARTS = EnvInt(2)
+    # Experimental FN target router + input NVFP4 quantization, SM103 TP1/EP1.
+    SGLANG_Q38_ROUTER_FRONT = EnvBool(False)
+    SGLANG_Q38_ROUTER_HYBRID = EnvBool(False)
+    SGLANG_Q38_ROUTER_NATIVE_REDUCE = EnvBool(False)
     # --ple-offload-backend file: where the sparse, file-backed PLE table lives
     # (deterministic name, reused across restarts), whether prefill-sized
     # gathers hint the page cache first, and an escape hatch for the device
