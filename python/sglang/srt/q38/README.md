@@ -29,3 +29,10 @@ including MoE pin helper environment. serve-base-r11.json additionally applies
 the lead-validated best-plus-r11native.overlay.json (including HOST_SIM_PREDRAW=1
 and removal of RS_D1/MAX_BS), and is the parent recipe for subsequent lanes.
 The base equivalence pool uses only serve-base.json and the best engine.
+
+SGLANG_Q38C_HC_CLUSTER_M4ONLY defaults to 0: both ordinary and shared HC
+retain the frozen cluster2 path at every admitted row count. With 1, actual
+M4 uses cluster2 while M8/M12 and all other admitted non-M4 rows use the native
+160-thread single-CTA-per-part implementation. The gate is resolved once into
+the JIT specialization; it does not add per-forward environment reads.
+serve-base.json sets 0 for equivalence and serve-base-r11.json sets 1.
