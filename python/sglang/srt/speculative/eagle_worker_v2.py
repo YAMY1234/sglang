@@ -1,5 +1,6 @@
 import contextlib
 import logging
+import os
 import time
 from typing import List, Optional
 
@@ -157,6 +158,7 @@ _is_xpu = is_xpu()
 
 
 logger = logging.getLogger(__name__)
+_Q38C_LOOP_GLUE = os.environ.get("SGLANG_Q38C_LOOP_GLUE", "0") == "1"
 # PERF-LB: the post-verify mamba state commit (side stream) joins the forward stream before the next verify / prefill
 # instead of right after the draft extend, so it can overlap the draft extend and the next round's draft steps.
 _PLB_LATE_JOIN = envs.SGLANG_PLB_COMMIT_LATE_JOIN.get()
@@ -848,6 +850,26 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if draft_tokens_topk1 is None or forward_batch.mm_input_embeds is not None:
             fold_slots = None
         forward_batch._q38_step_fold_embedding = None
+        # FoldSlot is only built for FN HC4/TP1/K3 and the native top-1 path.
+        native_top1 = (
+            _Q38C_LOOP_GLUE
+            and fold_slots is not None
+            and not needs_draft_probs
+            and not forward_batch.return_logprob
+        )
+        mrope = (
+            forward_batch.mrope_positions
+            if native_top1 and self.draft_runner.model_config.model_is_mrope
+            else None
+        )
+        if mrope is not None and (
+            mrope.shape != (3, forward_batch.positions.numel())
+            or mrope.dtype != forward_batch.positions.dtype
+            or mrope.untyped_storage().data_ptr()
+            == forward_batch.positions.untyped_storage().data_ptr()
+        ):
+            # Preserve the original sequential updates when the operands alias.
+            mrope = None
 
         # Forward multiple steps
         scores = None
@@ -894,9 +916,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     ),
                     canary_index_ctx,
                 ):
-                    logits_output = self.draft_runner.forward(
-                        forward_batch
-                    ).logits_output
+                    old_native_top1 = getattr(forward_batch, "_q38c_native_top1", False)
+                    forward_batch._q38c_native_top1 = native_top1
+                    try:
+                        logits_output = self.draft_runner.forward(
+                            forward_batch
+                        ).logits_output
+                    finally:
+                        forward_batch._q38c_native_top1 = old_native_top1
                 maybe_detect_nan(
                     logits_output.next_token_logits, f"draft_forward step {i}"
                 )
@@ -925,6 +952,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                                 draft_tokens_topk1,
                                 i + 1,
                                 slot,
+                                mrope_positions=mrope,
                             )
                             forward_batch._q38_step_fold_embedding = slot.embedding
                         else:
@@ -933,6 +961,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                                 forward_batch.positions,
                                 draft_tokens_topk1,
                                 i + 1,
+                                mrope_positions=mrope,
                             )
                     else:
                         topk_index = torch.argmax(
@@ -948,7 +977,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     )
                     topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
                     forward_batch.positions.add_(1)
-                if self.draft_runner.model_config.model_is_mrope:
+                if self.draft_runner.model_config.model_is_mrope and mrope is None:
                     forward_batch.mrope_positions.add_(1)
                 maybe_detect_oob(
                     topk_index,
