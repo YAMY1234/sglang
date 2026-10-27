@@ -26,7 +26,18 @@ from collections import deque
 from contextlib import ExitStack, contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Deque,
+    Dict,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
 from sglang.srt.runtime_context import (
     SpawnRanks,
@@ -356,6 +367,9 @@ from sglang.srt.utils import (
     require_mlp_sync,
     set_gpu_proc_affinity,
     set_random_seed,
+)
+from sglang.srt.utils import speculative_decode_resources as spec_decode_resources
+from sglang.srt.utils import (
     suppress_other_loggers,
     triton_load_watch,
 )
@@ -459,6 +473,10 @@ class Scheduler(
     # overrides init_load_publisher (which would otherwise not set it).
     _last_stall_publish_ts: float = float("-inf")
     kv_checksum_computer: Optional[KvChecksumComputer] = None
+    # A class default for unit-test harnesses that bypass overlap initialization.
+    _prepared_spec_seq_lens: Optional[
+        Callable[[ScheduleBatch], Optional[torch.Tensor]]
+    ] = None
 
     def __init__(
         self,
@@ -1683,6 +1701,8 @@ class Scheduler(
             needs_confidence_relay=needs_confidence_relay,
         )
 
+        self.init_prepared_spec_seq_lens()
+
         self._confidence_budget_prepare = None
         if (
             needs_confidence_relay
@@ -2016,6 +2036,27 @@ class Scheduler(
             self.schedule_stream.wait_event(ev)
         else:
             self.schedule_stream.wait_stream(self.forward_stream)
+
+    def init_prepared_spec_seq_lens(self) -> None:
+        """Find a speculative worker that can provide prepared sequence lengths."""
+        self._prepared_spec_seq_lens = (
+            self.draft_worker.take_prepared_seq_lens
+            if self.draft_worker is not None and spec_decode_resources.enabled()
+            else None
+        )
+
+    def _join_schedule_stream(
+        self,
+        batch: ScheduleBatch,
+        prepared_seq_lens: Optional[torch.Tensor],
+    ) -> None:
+        """Skip the join when this prepared decode launched no schedule-stream work."""
+        if prepared_seq_lens is not None:
+            schedule_stream_idle = batch.spec_decode_schedule_stream_idle
+            batch.spec_decode_schedule_stream_idle = False
+            if schedule_stream_idle:
+                return
+        spec_decode_resources.wait_stream(self.forward_stream, self.schedule_stream)
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -4655,13 +4696,20 @@ class Scheduler(
                     and self._confidence_budget_prepare is None
                     and not getattr(self.future_map, "needs_cpu_seq_lens", True)
                 )
+                prepared_seq_lens = (
+                    self._prepared_spec_seq_lens(batch)
+                    if self._prepared_spec_seq_lens is not None and not gpu_only_lens
+                    else None
+                )
                 if not gpu_only_lens:
-                    self.future_map.resolve_seq_lens_cpu(batch)
+                    self.future_map.resolve_seq_lens_cpu(
+                        batch, prepared_seq_lens=prepared_seq_lens
+                    )
                 if self._confidence_budget_prepare is not None:
                     self._confidence_budget_prepare(batch, self.future_map)
 
                 with self.forward_stream_ctx:
-                    self.forward_stream.wait_stream(self.schedule_stream)
+                    self._join_schedule_stream(batch, prepared_seq_lens)
                     if gpu_only_lens:
                         # publish_ready was recorded on forward_stream: stream order
                         # fences the gather, no host sync / event wait needed.
@@ -4720,7 +4768,9 @@ class Scheduler(
                                 batch.out_cache_loc,
                             )
                         # FIXME(lsyin): maybe move this to forward_batch_generation
-                        batch_result.copy_done = self.device_module.Event()
+                        batch_result.copy_done = spec_decode_resources.copy_done_event(
+                            self.device_module
+                        )
                         if batch_result.delay_sample_func is None:
                             self._relay_forward_payload(
                                 batch, future_indices, batch_result
@@ -5031,7 +5081,7 @@ class Scheduler(
             return_logprob=batch.return_logprob,
             return_hidden_states=batch.return_hidden_states,
         )
-        self.copy_stream.wait_stream(self.forward_stream)
+        spec_decode_resources.wait_stream(self.copy_stream, self.forward_stream)
         with self.copy_stream_ctx:
             if not self.enable_async_d2h_copy:
                 copy_fn()
