@@ -61,6 +61,7 @@ logger = logging.getLogger(__name__)
 
 _TRTLLM_SPARSE_PAGE_SIZE = 64
 _Q38_ATTN_CORE_V1 = os.environ.get("Q38_ATTN_CORE_V1", "0") == "1"
+_Q38C_WIDE_ATTN = os.environ.get("SGLANG_Q38C_WIDE_ATTN", "0") == "1"
 
 
 @lru_cache(maxsize=1)
@@ -1424,11 +1425,15 @@ class QwenSparseAttnBackend(AttentionBackend):
             and is_sm100_supported()
             and mode.is_target_verify()
             and int(getattr(forward_batch.spec_info, "topk", 1) or 1) == 1
-            and rows == width == 4
+            and width == 4
+            and (
+                rows == 4
+                or (_Q38C_WIDE_ATTN and rows in (8, 12) and output_gate is not None)
+            )
             and metadata.is_cuda_graph
             and self.compress_ratio == 4
             and self._uses_block_indices(indices)
-            and indices.shape == (4, 512)
+            and indices.shape == (rows, 512)
             and layer.tp_q_head_num == 24
             and layer.head_dim == 256
             and kc.shape[1] == 2
@@ -1445,8 +1450,14 @@ class QwenSparseAttnBackend(AttentionBackend):
             if row_requests.numel() == rows:
                 gate_kwargs = {}
                 if output_gate is not None:
-                    from sglang.kernels.ops.attention.qsa_gate_epilogue_v2 import run_gated
-                    run = run_gated
+                    if _Q38C_WIDE_ATTN and rows in (8, 12):
+                        from sglang.kernels.ops.attention.q38_wide_attn import run_gated_wide
+
+                        run = run_gated_wide
+                    else:
+                        from sglang.kernels.ops.attention.qsa_gate_epilogue_v2 import run_gated
+
+                        run = run_gated
                     gate_kwargs["gate"] = output_gate
                 output = run(
                     q.reshape(rows, layer.tp_q_head_num, layer.head_dim),

@@ -107,6 +107,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD = 1024
 _Q38_QSA_EARLY_INDEXER = get_bool_env_var("Q38_QSA_EARLY_INDEXER", "False")
 _Q38_ATTN_GATE_V2 = get_bool_env_var("Q38_ATTN_GATE_V2", "False")
+_Q38C_WIDE_ATTN = get_bool_env_var("SGLANG_Q38C_WIDE_ATTN", "False")
 _Q38_QSA_PDL_INDEX = get_bool_env_var("Q38_QSA_PDL_INDEX", "False")
 
 
@@ -2073,10 +2074,11 @@ class Qwen4ExpAttentionDecoderLayer(
                 hidden_states, positions, forward_batch
             )
 
-        # Request only the original BF16 M4 chain-verify core. Backend confirms
+        # Request the BF16 chain-verify core. Backend confirms
         # actual fusion with a Python bool; fallback still receives native gate.
         if (_Q38_ATTN_GATE_V2 and gate is not None and self.is_qsa
-            and q.is_cuda and q.dtype == torch.bfloat16 and q.shape[0] == 4
+            and q.is_cuda and q.dtype == torch.bfloat16
+            and (q.shape[0] == 4 or (_Q38C_WIDE_ATTN and q.shape[0] in (8, 12)))
             and forward_batch.forward_mode.is_target_verify()):
             attention_kwargs["q38_output_gate"] = gate
         attn_output = self.attn(q, k, v, forward_batch, **attention_kwargs)
