@@ -39,6 +39,8 @@ mask, so this kernel is valid only for linear draft chains
 
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -47,6 +49,7 @@ from sglang.kernels.ops.attention.fla.utils import is_tf32_supported
 from sglang.srt.utils import is_gfx95_supported
 
 _IS_GFX95 = is_gfx95_supported()
+_Q38_GDN_COMMIT_BV32 = os.environ.get("Q38_GDN_COMMIT_BV32", "0") == "1"
 
 
 @triton.jit
@@ -1299,7 +1302,7 @@ def commit_gdn_replayssm_circular(
     has_residual = d_residual_cache is not None and k_residual_cache is not None
     d_residual_buf = d_residual_cache if has_residual else d_cache
     k_residual_buf = k_residual_cache if has_residual else k_cache
-    BV = min(triton.next_power_of_2(V), 64)
+    BV = min(triton.next_power_of_2(V), 32 if _Q38_GDN_COMMIT_BV32 else 64)
     has_track = mamba_track_indices is not None and mamba_steps_to_track is not None
     if use_cuda and _commit_cuda(
         checkpoint_state=checkpoint_state,

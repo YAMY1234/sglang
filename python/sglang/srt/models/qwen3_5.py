@@ -984,6 +984,25 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         2. Core attention (custom op)
         3. Output projection
         """
+        if (os.environ.get("Q38_GDN_INPROJ_CONV") == "1"
+            and forward_batch.forward_mode.is_target_verify()
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.ndim == 2 and tuple(hidden_states.shape) == (4, 2560)
+            and self.attn_tp_size == 1 and self._fused_in_proj_weight is not None
+            and tuple(self._fused_in_proj_weight.shape) == (16480, 2560)
+            and self._fused_in_proj_weight.dtype == torch.bfloat16
+            and self.activation in ("silu", "swish")):
+            from sglang.srt.model_executor.forward_context import get_attn_backend
+            backend = get_attn_backend()
+            backend = getattr(backend, "linear_attn_backend", backend)
+            if backend.q38_inproj_conv_supported(forward_batch):
+                core_attn_out, z = backend.forward_inproj_conv(
+                    self.attn, forward_batch, hidden_states, self._fused_in_proj_weight
+                )
+                core_attn_out = self.norm(core_attn_out.reshape(-1, 128), z)
+                projected_input = core_attn_out.reshape(4, 6144)
+                return self.out_proj(projected_input)[0]
+
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
             hidden_states
         )
@@ -1033,7 +1052,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             # run the decode kernels, so pick the layout from the logical mode.
             use_strided_prefill_z = (
                 _is_cuda
-                and forward_batch.logical_forward_mode.is_extend_without_speculative()
+                and (
+                    forward_batch.logical_forward_mode.is_extend_without_speculative()
+                    or (os.environ.get("Q38_GDN_FRONT") == "1"
+                        and forward_batch.forward_mode.is_target_verify())
+                )
             )
             split_fn = (
                 qwen3_5_gdn_prefill_projection_views
