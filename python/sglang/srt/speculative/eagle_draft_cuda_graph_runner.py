@@ -323,6 +323,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         self.buffers.share_buffers(exclude=_private_inputs())
         # (raw_bs, field mask) -> (destination views, copy plan); None once refused.
         self._planned_inputs = {}
+        # Capture-owned storage: no reuse across graph variants or requests.
+        self._q38_step_fold_slots = {}
         # the batch sizes whose graphs run the draft megakernel's draft_loop, captured
         # once per label of the graph variants it offers this runner
         self.megakernel = eagle_worker.megakernel
@@ -558,6 +560,15 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             ),
         )
         self.model_runner.runner_ids.bind_runner_slots(forward_batch)
+        from sglang.kernels.ops.speculative.draft_step_fold import make_fold_slots
+
+        fold_slots = (
+            make_fold_slots(self.model_runner.model, num_seqs, self.speculative_num_steps)
+            if self.topk == 1 and self.captured_req_width == 1
+            else None
+        )
+        self._q38_step_fold_slots[(size, stream_idx, variant_label, attention_variant)] = fold_slots
+        forward_batch._q38_step_fold_slots = fold_slots
         served = num_seqs in self.megakernel_served
 
         def run_once():

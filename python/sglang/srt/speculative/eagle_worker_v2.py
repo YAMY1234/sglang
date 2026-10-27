@@ -889,6 +889,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
             draft_tokens_topk1[:, :1].copy_(topk_index)
 
+        fold_slots = getattr(forward_batch, "_q38_step_fold_slots", None)
+        if draft_tokens_topk1 is None or forward_batch.mm_input_embeds is not None:
+            fold_slots = None
+        forward_batch._q38_step_fold_embedding = None
+
         # Forward multiple steps
         scores = None
         with IndexTopKShareState.mtp_iteration(
@@ -957,12 +962,27 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     forward_batch.positions.add_(1)
                 elif self.topk == 1:
                     if _is_cuda or _is_hip:
-                        topk_p, topk_index = draft_topk1_postprocess(
-                            logits_output.next_token_logits,
-                            forward_batch.positions,
-                            draft_tokens_topk1,
-                            i + 1,
-                        )
+                        if fold_slots is not None and i < len(fold_slots):
+                            from sglang.kernels.ops.speculative.draft_step_fold import (
+                                finalize_next_input,
+                            )
+
+                            slot = fold_slots[i]
+                            topk_p, topk_index = finalize_next_input(
+                                logits_output.next_token_logits,
+                                forward_batch.positions,
+                                draft_tokens_topk1,
+                                i + 1,
+                                slot,
+                            )
+                            forward_batch._q38_step_fold_embedding = slot.embedding
+                        else:
+                            topk_p, topk_index = draft_topk1_postprocess(
+                                logits_output.next_token_logits,
+                                forward_batch.positions,
+                                draft_tokens_topk1,
+                                i + 1,
+                            )
                     else:
                         topk_index = torch.argmax(
                             logits_output.next_token_logits, dim=-1, keepdim=True
