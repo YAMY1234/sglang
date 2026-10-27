@@ -69,6 +69,10 @@ def build(nvrtc,includes):
     body='.reg .b32 %q38_smem;\n'+body.replace('q38_arena','%q38_smem')
     body=re.sub(r'(\.reg \.b64[^;]+;)',r'\1\nmov.u32 %q38_smem,Q38_OPERAND_1;',body,count=1)
     body=body.replace('ret;','bra Q38_TAIL_END;')+'\nQ38_TAIL_END:\n'
+    # LLVM substitutes $0/$1 with outer %rdN/%rN registers. NVRTC's
+    # generic register names must not shadow those operands inside this scope.
+    body=re.sub(r"%((?:rd|rs|r|p|f))(?=[<\d])", r"%q38_tail_\1", body)
+    body=body.replace("$L__BB", "Q38_TAIL_BB")
     body=body.replace('$','$$')
     for k in (0,1):body=body.replace('Q38_OPERAND_'+str(k),'$'+str(k))
     (HERE/'tail_inline.ptx').write_text('{\n'+body+'\n}\n')
