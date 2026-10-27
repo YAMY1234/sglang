@@ -183,8 +183,12 @@ class Qwen3_5MtpNvFp4Config(_ModelOptFp4OnlineConfig):
         return "qwen3_5_mtp_nvfp4"
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
+        from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
+        if isinstance(layer, LinearBase):
+            return UnquantizedLinearMethod()
         if isinstance(layer, FusedMoE):
             return ModelOptQwen3_5MtpNvFp4FusedMoEMethod(self, prefix)
         return None
