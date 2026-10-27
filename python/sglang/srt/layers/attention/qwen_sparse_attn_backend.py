@@ -34,6 +34,7 @@ from sglang.srt.layers.attention.qsa.metadata import (
     build_rope_position_matrix,
     compressed_decode_view,
 )
+from sglang.srt.layers.attention.qsa.mtp_lookup import DeferredMtpSparseIndices
 from sglang.srt.layers.attention.qsa.sparse_attn import (
     pack_qsa_prefill_kv,
     qwen_sparse_fa2_cu_seqlens_triton,
@@ -54,7 +55,7 @@ from sglang.srt.layers.cp.utils import (
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import get_spec, get_stream
+from sglang.srt.runtime_context import get_parallel, get_spec, get_stream
 from sglang.srt.utils import is_hip, is_sm100_supported, is_sm120
 
 logger = logging.getLogger(__name__)
@@ -236,6 +237,16 @@ class QwenSparseAttnBackend(AttentionBackend):
         if config is None:
             config = getattr(model_config, "hf_config", None)
         self.qsa_profile = parse_qsa_profile(config)
+        self._q38c_lookup_native = (
+            os.environ.get("SGLANG_Q38C_LOOKUP_NATIVE", "0") == "1"
+            and getattr(config, "hidden_size", None) == 2560
+            and getattr(config, "hc_count", None) == 4
+            and get_parallel().tp_size == 1
+            and get_spec().speculative_num_steps == 3
+            and get_spec().speculative_eagle_topk == 1
+            and self._fused_kv_pool_eligible
+            and is_sm100_supported()
+        )
         self.max_context_len = int(getattr(model_config, "context_len", 0))
         self.compress_ratio = (
             self.qsa_profile.compress_ratio
@@ -1318,6 +1329,21 @@ class QwenSparseAttnBackend(AttentionBackend):
         logical_positions = metadata.decode_logical_positions
         if logical_positions is None:
             logical_positions = metadata.get_seqlens_expanded() - 1
+        if (
+            self._q38c_lookup_native
+            and forward_batch.forward_mode.is_decode()
+            and forward_batch.req_pool_indices.numel() == 1
+            and logical_positions.numel() == 1
+        ):
+            state = self._mtp_shared_sparse_indices
+            slot = state.layer_slots[int(layer_id)]
+            return DeferredMtpSparseIndices(
+                state.indices[slot],
+                state.captured_len[slot],
+                forward_batch.req_pool_indices,
+                logical_positions,
+                state._tail_offsets,
+            )
         return self._mtp_shared_sparse_indices.lookup(
             forward_batch.req_pool_indices,
             logical_positions,
@@ -1501,7 +1527,11 @@ class QwenSparseAttnBackend(AttentionBackend):
             layer,
             forward_batch,
             metadata,
-            indices.to(torch.int32).contiguous(),
+            (
+                indices
+                if isinstance(indices, DeferredMtpSparseIndices)
+                else indices.to(torch.int32).contiguous()
+            ),
             trtllm_decode,
             new_kv=(k, v, loc, width),
         )
@@ -1963,6 +1993,8 @@ class QwenSparseAttnBackend(AttentionBackend):
                 layer, forward_batch.out_cache_loc, k, v
             )
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
+        if isinstance(topk_indices, DeferredMtpSparseIndices):
+            topk_indices = topk_indices.materialize()
         return self._forward_paged_attention(q, layer, forward_batch, topk_indices)
 
     def _forward_paged_attention(
