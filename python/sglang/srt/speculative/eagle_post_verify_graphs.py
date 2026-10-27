@@ -7,6 +7,7 @@ reproduce; any other batch runs SGLang's eager path."""
 from __future__ import annotations
 
 import logging
+import os
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
@@ -24,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 # Eager rounds per post-verify key before its graphs are captured.
 _NUM_WARMUP = 2
+_FUSED_BS1_ACCEPT = os.environ.get("Q38_MTP_POSTVERIFY_FUSED_ACCEPT", "0") == "1"
 # XORed into the server seed so these draws differ from other samplers'.
 _SIM_ACC_LEN_DOMAIN = 0x0F3D6B8C2A915E47
 # Arbitrary bound on post-verify graph sets (key x verify logits buffer); a batch
@@ -418,6 +420,11 @@ def _sample(slot: SimpleNamespace) -> tuple:
         retrieve_next_token=staged["retrieve_next_token"],
         retrieve_next_sibling=staged["retrieve_next_sibling"],
         tree_topk=1,
+        # Scoped opt-in to the existing native chain_accept implementation.
+        # Other sampling modes/batch sizes keep the original native path.
+        _q38_postverify_fused_accept=(
+            _FUSED_BS1_ACCEPT and slot.num_requests == 1 and slot.is_all_greedy
+        ),
         draft_probs=None,
     )
     return eagle_sample(
@@ -499,6 +506,13 @@ class _PostVerifyGraphs:
                 self._commit(slot, outputs)
                 return outputs[:6]
             self._capture(slot)
+        if not getattr(slot, "replay_attested", False):
+            logger.info(
+                "Q38_MTP_GRAPH_REPLAY bs=%d width=%d track=%s one_launch_load=%s",
+                slot.num_requests, slot.tokens_per_request,
+                "track_indices" in slot.staged, slot.load_plan is not None,
+            )
+            slot.replay_attested = True
         slot.graph.replay()
         self._main_done.record()
         self._side_stream.wait_event(self._main_done)
