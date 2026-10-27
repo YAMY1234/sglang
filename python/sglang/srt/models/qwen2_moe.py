@@ -92,6 +92,9 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import (
     get_exec,
@@ -413,6 +416,56 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
             self.top_k = config.num_experts_per_tok
         self.is_nextn = is_nextn
+        self._q38_router_hybrid = envs.SGLANG_Q38_ROUTER_NATIVE_REDUCE.get()
+        if envs.SGLANG_Q38_ROUTER_HYBRID.get():
+            raise ValueError("Use isolated native-reduce switch in this source")
+        self._q38_router_hybrid_splits = {}
+        if self._q38_router_hybrid and envs.SGLANG_Q38_ROUTER_FRONT.get():
+            raise ValueError("Choose original Q38 router or isolated hybrid, not both")
+        self._q38_router_front = (
+            (envs.SGLANG_Q38_ROUTER_FRONT.get() or self._q38_router_hybrid)
+            and config.model_type == "qwen4_exp_text"
+            and not is_nextn
+        )
+        if self._q38_router_front:
+            from sglang.srt.layers.moe.utils import get_moe_runner_backend
+            from sglang.srt.layers.quantization.modelopt_quant import (
+                ModelOptNvFp4FusedMoEMethod,
+            )
+
+            if not (
+                _is_cuda
+                and torch.cuda.get_device_capability() == (10, 3)
+                and self.tp_size == 1
+                and get_parallel().moe_ep_size == 1
+                and get_moe_a2a_backend().is_none()
+                and get_moe_runner_backend().is_flashinfer_trtllm()
+                and config.hidden_size == 2560
+                and config.num_experts == 512
+                and not self.enable_shared_expert_fusion
+                and isinstance(self.experts.quant_method, ModelOptNvFp4FusedMoEMethod)
+                and not self.experts.quant_method.quant_config.use_per_token_activation
+            ):
+                raise ValueError(
+                    "Q38 router front requires native FN NVFP4, SM103, TP1/EP1, "
+                    "TRTLLM and separate shared experts"
+                )
+            if self._q38_router_hybrid:
+                from sglang.kernels.ops.moe.q38_router_native_policy import select_ksplit
+                from sglang.srt.layers.quantization import unquant
+                from sglang.kernels.ops.moe.q38_router_native_reduce import verify_installed_source
+
+                verify_installed_source()
+
+                self._q38_router_hybrid_splits = {
+                    rows: split
+                    for rows in (4, 8, 16)
+                    if (split := select_ksplit(unquant, (rows, 512, 2560))) is not None
+                }
+            logger.info(
+                "Q38 native-reduce target layer %s; enabled=%s, dispatch=%s",
+                layer_id, self._q38_router_hybrid, self._q38_router_hybrid_splits,
+            )
         self._use_mega_moe = get_moe_a2a_backend().is_megamoe()
         self._mega_top_k = config.num_experts_per_tok + self.num_fused_shared_experts
         self._mega_intermediate_size = config.moe_intermediate_size
@@ -728,8 +781,35 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
             if (topk_output := qwen_moe_topk_output(self, hidden_states)) is not None:
                 return self.experts(hidden_states, topk_output)
-        # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
+        # Keep the BF16 input for shared experts and original-width dispatch.
+        pre_quant_input = None
+        if (
+            self._q38_router_front
+            and (
+                hidden_states.shape[0] in self._q38_router_hybrid_splits
+                if self._q38_router_hybrid
+                else 1 <= hidden_states.shape[0] <= 16
+            )
+            and not torch.compiler.is_compiling()
+            and not is_in_tc_piecewise_cuda_graph()
+        ):
+            from sglang.kernels.ops.moe.q38_router_front import (
+                Nvfp4RouterInput,
+            )
+
+            from sglang.kernels.ops.moe.q38_router_native_reduce import router_gemm_quant
+
+            if self.experts.trtllm_padded_hidden_size is not None:
+                raise ValueError("Q38 router front requires unpadded H2560 expert weights")
+            router_logits, packed, scales = router_gemm_quant(
+                hidden_states,
+                self.gate.weight,
+                self.experts.w13_input_scale_quant.reshape(1),
+                ksplit=self._q38_router_hybrid_splits.get(hidden_states.shape[0], 2),
+            )
+            pre_quant_input = Nvfp4RouterInput(packed, scales)
+        else:
+            router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
         if defer_finalize:
             if not self.supports_deferred_finalize:
@@ -741,12 +821,18 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 raise RuntimeError(
                     "Qwen deferred finalize requires logits-based bypassed TopK"
                 )
-            return self.experts.forward_deferred_finalize(hidden_states, topk_output)
+            if pre_quant_input is None:
+                return self.experts.forward_deferred_finalize(hidden_states, topk_output)
+            return self.experts.forward_deferred_finalize(
+                hidden_states, topk_output, pre_quant_input=pre_quant_input
+            )
         if self.enable_shared_expert_fusion and TopKOutputChecker.format_is_standard(
             topk_output
         ):
             topk_output = self._append_shared_to_topk_output(topk_output, hidden_states)
-        return self.experts(hidden_states, topk_output)
+        if pre_quant_input is None:
+            return self.experts(hidden_states, topk_output)
+        return self.experts(hidden_states, topk_output, pre_quant_input=pre_quant_input)
 
     def _gate_shared_output_out_of_place(
         self,
