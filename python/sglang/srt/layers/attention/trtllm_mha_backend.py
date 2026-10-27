@@ -13,6 +13,7 @@ Sliding window and attention sink features are supported.
 """
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -938,6 +939,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         out_cache_loc: Optional[torch.Tensor] = None,
+        draft_shared_lens=None,
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
@@ -1024,6 +1026,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             q_stride=q_stride,
             q_mode=q_mode,
             skip_page_table=unified,
+            draft_shared_lens=draft_shared_lens,
         )
 
         if self._needs_encoder_only_expand(forward_mode, metadata):
@@ -1217,7 +1220,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     )
                 )
 
-    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+    def init_forward_metadata_in_graph(
+        self, forward_batch: ForwardBatch, *, draft_shared_lens=None
+    ):
         self._apply_cuda_graph_metadata(
             bs=forward_batch.batch_size,
             req_pool_indices=forward_batch.req_pool_indices,
@@ -1225,6 +1230,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             forward_mode=forward_batch.forward_mode,
             spec_info=forward_batch.spec_info,
             out_cache_loc=forward_batch.out_cache_loc,
+            draft_shared_lens=draft_shared_lens,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -2167,17 +2173,27 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
             return
         # The last step's update writes the shared page table at the longest length (each
         # step reads only its own live prefix); one launch writes the other steps' lengths.
-        self.attn_backends[steps - 1].init_forward_metadata_in_graph(inner_fb)
         lens, cu_lens = self._shared_lens
         bs = forward_batch.batch_size
-        update_draft_step_seqlens(
-            seq_lens=inner_fb.seq_lens,
-            cache_seqlens=lens,
-            cu_seqlens_k=cu_lens,
-            bs=bs,
-            steps=steps - 1,
-            first_offset=1,
+        # Read at capture time so independent graph variants can select the path.
+        fused = (
+            bs == 1
+            and steps == 5
+            and self.topk == 1
+            and os.environ.get("SGLANG_Q35FLY_DRAFT_METADATA_FUSE", "0") == "1"
         )
+        self.attn_backends[steps - 1].init_forward_metadata_in_graph(
+            inner_fb, draft_shared_lens=self._shared_lens if fused else None
+        )
+        if not fused:
+            update_draft_step_seqlens(
+                seq_lens=inner_fb.seq_lens,
+                cache_seqlens=lens,
+                cu_seqlens_k=cu_lens,
+                bs=bs,
+                steps=steps - 1,
+                first_offset=1,
+            )
         for i in range(steps - 1):
             b = self.attn_backends[i]
             b.forward_metadata = b.decode_cuda_graph_metadata[bs]
