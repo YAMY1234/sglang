@@ -13,7 +13,7 @@ from sglang.srt.kernel_plugins.nvidia.binding import (
     megakernel_disable_reasons,
 )
 from sglang.srt.kernel_plugins.nvidia.policy import megakernel_slot_requested
-from sglang.srt.layers.attention.linear.gdn_replayssm_spec_decode import (
+from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode import (
     GDN_COMMIT_SLOT,
     gdn_commit_cuda_requested,
 )
