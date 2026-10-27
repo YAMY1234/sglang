@@ -98,7 +98,7 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     make_ple_file_rss_trimmer,
 )
 from sglang.srt.runtime_context import get_parallel, linear_attn_parallel_group
-from sglang.srt.utils import get_bool_env_var, is_hip, logger
+from sglang.srt.utils import get_bool_env_var, is_hip, is_sm100_supported, logger
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
@@ -108,6 +108,7 @@ _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD = 1024
 _Q38_QSA_EARLY_INDEXER = get_bool_env_var("Q38_QSA_EARLY_INDEXER", "False")
 _Q38_ATTN_GATE_V2 = get_bool_env_var("Q38_ATTN_GATE_V2", "False")
 _Q38_QSA_PDL_INDEX = get_bool_env_var("Q38_QSA_PDL_INDEX", "False")
+_Q38C_GATED_OPROJ = get_bool_env_var("SGLANG_Q38C_GATED_OPROJ", "False")
 
 
 def _ple_table_is_fp8(
@@ -1860,6 +1861,13 @@ class Qwen4ExpAttentionDecoderLayer(
 
         self.is_qsa = is_qwen_qsa(config)
         self._qsa_prefill_topk_bridge = None
+        self._q38c_gated_oproj = (
+            _Q38C_GATED_OPROJ
+            and is_nextn
+            and config.hidden_size == 2560
+            and get_parallel().tp_size == 1
+            and is_sm100_supported()
+        )
         if self.is_qsa:
             self.indexer = build_qsa_indexer(
                 config=config,
@@ -2083,6 +2091,27 @@ class Qwen4ExpAttentionDecoderLayer(
         gate_applied = False
         if isinstance(attn_output, tuple):
             attn_output, gate_applied = attn_output
+        if (
+            self._q38c_gated_oproj
+            and forward_batch.forward_mode.is_decode()
+            and not gate_applied
+            and gate is not None
+            and gate.shape == (1, 24, 256)
+            and gate.stride(2) == 1
+            and gate.stride(1) % 8 == 0
+            and gate.dtype == attn_output.dtype == torch.bfloat16
+            and attn_output.is_cuda
+            and attn_output.shape == (1, 6144)
+            and attn_output.is_contiguous()
+            and self.o_proj.weight.shape == (2560, 6144)
+            and self.o_proj.weight.dtype == torch.bfloat16
+            and self.o_proj.weight.is_contiguous()
+        ):
+            from sglang.kernels.ops.elementwise.q38c_mtp_gated_oproj import (
+                mtp_gated_oproj,
+            )
+
+            return mtp_gated_oproj(attn_output, gate, self.o_proj.weight)
         if gate is not None and not gate_applied:
             if attn_output.is_cuda:
                 # The strided 3D gate view feeds the kernel directly, so the
