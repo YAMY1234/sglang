@@ -860,6 +860,12 @@ def _cp_merge_h_ll(
     vstart=None,
     vcnt=None,
     CHUNK: tl.constexpr = False,
+    gate=None,
+    gate_stride=0,
+    o_proj_input_scale=None,
+    o_proj_input=None,
+    o_proj_input_stride=0,
+    GATE_EPILOGUE: tl.constexpr = False,
 ):
     """_cp_a2a_merge_ll (gated) with one program per (row, head): pushes the head's partials, computes its causal
     block, then merges the CP partials as they arrive. One epoch per (row, head) in cnt, in an LL region of its own
@@ -868,7 +874,8 @@ def _cp_merge_h_ll(
     its predecessor releases it only after its own wait, so the step's q / K / V (written upstream of that wait) are
     complete.
     CHUNK (fold layout): a request with chunk rows sends the base-2 LSE combine of its rows' partials
-    (po_v [nv, QL * CP * HQ, D] bf16, pl_v [nv, QL * CP * HQ] fp32) instead of po / plse."""
+    (po_v [nv, QL * CP * HQ, D] bf16, pl_v [nv, QL * CP * HQ] fp32) instead of po / plse.
+    GATE_EPILOGUE also writes the gated, statically scaled FP8 input of o_proj."""
     i = tl.program_id(0)
     h = tl.program_id(1)
     if WAIT and not EARLY:
@@ -995,8 +1002,17 @@ def _cp_merge_h_ll(
         acc = acc * a_old + oc * a_new
         wsum = wsum * a_old + a_new
         m = mn
-    o = acc / tl.where(wsum > 0, wsum, 1.0)
-    tl.store(out + i * out_stride + h * D + tl.arange(0, D), o.to(tl.bfloat16))
+    o = (acc / tl.where(wsum > 0, wsum, 1.0)).to(tl.bfloat16)
+    d = tl.arange(0, D)
+    tl.store(out + i * out_stride + h * D + d, o)
+    if GATE_EPILOGUE:
+        g = tl.load(gate + i * gate_stride + h * D + d).to(tl.float32)
+        gated = (o.to(tl.float32) * tl.sigmoid(g)).to(tl.bfloat16).to(tl.float32)
+        scale_inv = 1.0 / tl.load(o_proj_input_scale).to(tl.float32)
+        tl.store(
+            o_proj_input + i * o_proj_input_stride + h * D + d,
+            tl.clamp(gated * scale_inv, -448.0, 448.0).to(tl.float8e4nv),
+        )
     tl.store(cnt + i * HQ + h + one, e)
 
 
@@ -1086,6 +1102,8 @@ class CpLite:
         self.gate_overlap = 1
         self.cp_main = True
         self.cp_pdl = self.cp_main
+        self._gate_epilogue = None
+        self._gate_epilogue_done = False
         self.cnt_h = torch.zeros(
             _MAX_ROWS * q_heads, dtype=torch.int32, device=self.device
         )
@@ -1124,6 +1142,20 @@ class CpLite:
         logger.info(
             "TRT-L1 CP-lite KV gate: minimum mean KV per request %s", self.min_kv
         )
+
+    def offer_gate_epilogue(
+        self, gate: torch.Tensor, scale: torch.Tensor, out: torch.Tensor
+    ) -> None:
+        """Offer the next exact CP-lite call the attention gate and FP8 o_proj input."""
+        self._gate_epilogue = (gate, scale, out)
+        self._gate_epilogue_done = False
+
+    def take_gate_epilogue(self) -> bool:
+        """Return whether the last CP-lite call wrote the offered o_proj input."""
+        done = self._gate_epilogue_done
+        self._gate_epilogue = None
+        self._gate_epilogue_done = False
+        return done
 
     def _gate_thr(self, b: int) -> int | None:
         """The device threshold of a b-request call (on the length sum, or with GATE_MAX on the max), or None."""
@@ -1833,6 +1865,14 @@ class CpLite:
         out = torch.empty(
             rows, self.hq, HEAD_DIM, dtype=torch.bfloat16, device=self.device
         )
+        epilogue = self._gate_epilogue
+        if epilogue is not None and not (
+            tuple(epilogue[0].shape) == (rows, self.hq * HEAD_DIM)
+            and epilogue[0].stride(1) == 1
+            and tuple(epilogue[2].shape) == (rows, self.hq * HEAD_DIM)
+            and epilogue[2].stride(1) == 1
+        ):
+            epilogue = None
         self._merge_h(
             q,
             k_cache,
@@ -1847,7 +1887,16 @@ class CpLite:
             {**gate, "thr": 0},
             pdl=True,
             early=self.early_merge,
+            gate_epilogue=epilogue,
         )
+        if epilogue is not None:
+            self._gate_epilogue_done = True
+            if ("gate_epilogue", rows) not in self._logged:
+                self._logged.add(("gate_epilogue", rows))
+                logger.info(
+                    "TRT-L1 CP-lite merge writes the gated FP8 o_proj input at %d rows",
+                    rows,
+                )
         return out
 
     def _merge_h(
@@ -1865,9 +1914,22 @@ class CpLite:
         gate,
         pdl=None,
         early=False,
+        gate_epilogue=None,
     ):
         pdl = self.cp_pdl if pdl is None else pdl
         hq = self.hq
+        epilogue_args = (
+            {}
+            if gate_epilogue is None
+            else {
+                "gate": gate_epilogue[0],
+                "gate_stride": gate_epilogue[0].stride(0),
+                "o_proj_input_scale": gate_epilogue[1],
+                "o_proj_input": gate_epilogue[2],
+                "o_proj_input_stride": gate_epilogue[2].stride(0),
+                "GATE_EPILOGUE": True,
+            }
+        )
         _cp_merge_h_ll[(rows, hq)](
             self.po_x.view(torch.int32),
             self.pl_x.view(torch.int32),
@@ -1906,6 +1968,7 @@ class CpLite:
             EARLY=early and pdl,
             num_warps=4,
             launch_pdl=pdl,
+            **epilogue_args,
         )
 
     def _own_workspace(self):
