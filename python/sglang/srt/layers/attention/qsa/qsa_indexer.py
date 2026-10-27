@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -35,10 +36,12 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.utils import is_sm100_supported
 
 # Cap on the fp32 [query_rows, compressed_keys] prefill logits workspace;
 # top-k is per row, so tiling rows does not change the selection.
 _QSA_PREFILL_LOGITS_BUDGET_BYTES = 128 * 1024 * 1024
+_Q38C_SCORE_Q4 = os.environ.get("SGLANG_Q38C_SCORE_Q4", "0") == "1"
 
 
 def _qsa_prefill_row_chunk_size(rows: int, keys: int, heads: int) -> int:
@@ -549,6 +552,7 @@ class QSAIndexer(MultiPlatformOp):
         query_positions: torch.Tensor,
         sequence_lengths: torch.Tensor,
         defer_expansion: bool = False,
+        score_q4_requests: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # fast_topk (k = 512) writes 0..length-1 for rows that fit k without reading
         # their scores, and never reads past a row's length.
@@ -557,14 +561,22 @@ class QSAIndexer(MultiPlatformOp):
             and self.block_topk == 512
             and not is_batch_invariant_mode_enabled()
         )
-        logits = qsa_mqa_decode(
-            q,
-            compressed_cache,
-            compressed_page_table,
-            compressed_lengths,
-            max_model_len,
-            min_scored_len=self.block_topk if use_fast_topk else 0,
-        )
+        if score_q4_requests is not None and not is_batch_invariant_mode_enabled():
+            from sglang.kernels.ops.attention.q38_score_q4 import score_q4
+
+            logits = score_q4(
+                q, compressed_cache, compressed_page_table, compressed_lengths,
+                max_model_len, score_q4_requests, min_scored_len=self.block_topk,
+            )
+        else:
+            logits = qsa_mqa_decode(
+                q,
+                compressed_cache,
+                compressed_page_table,
+                compressed_lengths,
+                max_model_len,
+                min_scored_len=self.block_topk if use_fast_topk else 0,
+            )
         if use_fast_topk:
             # Decode rows start at zero, so compressed lengths double as row lengths;
             # skip the generic zero-fill + subtract.
@@ -782,6 +794,25 @@ class QSAIndexer(MultiPlatformOp):
             compressed_cache, page_table, compressed_lengths, max_model_len = (
                 indexer_metadata.get_decode_mqa_inputs(self.layer_id)
             )
+            score_q4_requests = None
+            if (
+                _Q38C_SCORE_Q4
+                and (is_target_verify or is_draft_extend)
+                and indexer_metadata.is_cuda_graph
+                and q.is_cuda
+                and is_sm100_supported()
+                and q.shape == (4, 8, 128)
+                and q.dtype == torch.bfloat16
+                and compressed_cache.dtype == torch.bfloat16
+                and compressed_cache.shape[1:3] == (16, 1)
+                and self.index_n_heads == 4
+                and self.block_topk == 512
+                and self.compress_ratio == 4
+                and forward_batch.req_pool_indices.numel() == 1
+                and indexer_metadata.req_pool_indices is not None
+                and indexer_metadata.req_pool_indices.numel() == 4
+            ):
+                score_q4_requests = indexer_metadata.req_pool_indices
             return self.select_decode_tokens(
                 q,
                 compressed_cache,
@@ -791,6 +822,7 @@ class QSAIndexer(MultiPlatformOp):
                 logical_positions,
                 indexer_metadata.get_seqlens_int32(),
                 defer_expansion=q.is_cuda and indexer_metadata.defer_block_expansion,
+                score_q4_requests=score_q4_requests,
             )
 
         compressed_keys, row_starts, row_ends, sequence_lengths = (
