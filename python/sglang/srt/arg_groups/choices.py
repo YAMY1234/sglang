@@ -43,6 +43,7 @@ QUANTIZATION_CHOICES = [
     "modelopt_fp8",
     "modelopt_fp4",
     "nvfp4_online",
+    "qwen3_5_mtp_nvfp4",
     "modelopt_mixed",
     "petit_nvfp4",
     "w8a8_int8",  # mentioned in quantization.md documentation, supporting compressed-tensors quant_method.
