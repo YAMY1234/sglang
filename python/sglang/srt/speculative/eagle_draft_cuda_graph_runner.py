@@ -317,6 +317,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         self._planned_inputs = {}
         # Capture-owned storage: no reuse across graph variants or requests.
         self._q38_step_fold_slots = {}
+        self._q38_full_frames = {}
         # the batch sizes whose graphs run the draft megakernel's draft_loop, captured
         # once per label of the graph variants it offers this runner
         self.megakernel = eagle_worker.megakernel
@@ -385,6 +386,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     # can_run_graph
     # -----------------------------------------------------------------
     def can_run_graph(self, forward_batch: ForwardBatch):
+        if self._q38_full_frames and forward_batch.mm_input_embeds is not None:
+            return False
         # Uniform-width replay invariant: the batch's actual per-request width
         # must match this runner's capture width; anything else falls back to
         # eager. (Unset widths pass: not every path fills the field yet.)
@@ -439,6 +442,21 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     ):
         num_seqs = size  # EAGLE legacy name
         buffers = self.buffers
+        from sglang.kernels.ops.speculative.draft_full_inputs import make_frame
+
+        frame = make_frame(
+            self.model_runner.model, buffers, self.speculative_num_steps,
+            eligible=(size == 1 and self.topk == 1 and self.captured_req_width == 1
+                      and not get_spec().speculative_use_rejection_sampling
+                      and not self.require_gathered_buffer
+                      and self.eagle_worker.hot_token_id is None
+                      and size not in self.megakernel_served),
+        )
+        if frame is not None:
+            buffers = frame.buffers
+            self._q38_full_frames[self._make_graph_key(
+                size, variant_label=variant_label, attention_variant=attention_variant
+            )] = frame
         num_tokens = num_seqs * self.captured_req_width
 
         # Graph inputs
@@ -502,8 +520,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             hidden_states=hidden_states,
             capture_hidden_mode=capture_mode,
         )
-        if self.buffers.dsa_seed_topk is not None:
-            spec_info.dsa_topk_indices = self.buffers.dsa_seed_topk[:num_seqs]
+        if buffers.dsa_seed_topk is not None:
+            spec_info.dsa_topk_indices = buffers.dsa_seed_topk[:num_seqs]
 
         sampling_info = SamplingBatchInfo(
             temperatures=self.temperatures[:num_seqs],
@@ -555,6 +573,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         )
         self._q38_step_fold_slots[(size, stream_idx, variant_label, attention_variant)] = fold_slots
         forward_batch._q38_step_fold_slots = fold_slots
+        forward_batch._q38_full_frame = frame
         served = num_seqs in self.megakernel_served
 
         def run_once():
@@ -742,6 +761,32 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         else:
             bs = self._pad_to_bucket(raw_bs, self.capture_bs)
 
+        shape_key = self._make_graph_key(
+            bs, variant_label=self._sampling_variant(forward_batch),
+            attention_variant=self._resolve_attention_variant(forward_batch, bs),
+        )
+        frame = self._q38_full_frames.get(shape_key) if raw_bs == bs == 1 else None
+        full_prepared = False
+        if frame is not None:
+            from sglang.kernels.ops.speculative.draft_full_inputs import publish
+
+            # Only native STEP2's actual row/order validation permits the tail
+            # frame. A new/filtered/merged batch always loads current tensors.
+            prepared = getattr(forward_batch.spec_info, "q38_prepared_frames", None)
+            full_prepared = inputs_staged and prepared is not None and any(
+                f is frame for f in prepared
+            )
+            if not full_prepared:
+                source = self.buffers if inputs_staged else forward_batch
+                publish(
+                    frame, token=forward_batch.spec_info.topk_index,
+                    hidden=forward_batch.spec_info.hidden_states,
+                    seed=forward_batch.spec_info.dsa_topk_indices, source=source,
+                    request_slots=forward_batch.req_pool_indices,
+                )
+            forward_batch.spec_info.q38_prepared_frames = None
+            buffers = frame.buffers
+
         if bs != raw_bs:
             buffers.seq_lens.fill_(self.seq_len_fill_value)
             buffers.out_cache_loc.zero_()
@@ -785,7 +830,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         )
 
         inputs_staged = inputs_staged and bs == raw_bs
-        staged = (
+        staged = frame is not None or (
             _GRAPH_INPUTS
             and bs == raw_bs
             and self._copy_planned_inputs(
@@ -853,7 +898,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 buffers.hidden_states[:raw_bs].copy_(
                     forward_batch.spec_info.hidden_states
                 )
-        if buffers.dsa_seed_topk is not None:
+        if frame is None and buffers.dsa_seed_topk is not None:
             seed = forward_batch.spec_info.dsa_topk_indices
             if seed is not None:
                 buffers.dsa_seed_topk[:raw_bs].copy_(seed)

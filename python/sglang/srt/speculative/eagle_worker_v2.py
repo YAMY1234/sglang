@@ -832,12 +832,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             and self.hot_token_id is None
             and not needs_draft_probs
         ):
-            draft_tokens_topk1 = torch.empty(
-                (topk_index.shape[0], self.speculative_num_steps),
-                dtype=topk_index.dtype,
-                device=topk_index.device,
-            )
-            draft_tokens_topk1[:, :1].copy_(topk_index)
+            frame = getattr(forward_batch, "_q38_full_frame", None)
+            if frame is not None:
+                draft_tokens_topk1 = frame.tokens
+                forward_batch._q38_full_first_embedding = frame.embedding
+            else:
+                draft_tokens_topk1 = torch.empty(
+                    (topk_index.shape[0], self.speculative_num_steps),
+                    dtype=topk_index.dtype,
+                    device=topk_index.device,
+                )
+                draft_tokens_topk1[:, :1].copy_(topk_index)
 
         fold_slots = getattr(forward_batch, "_q38_step_fold_slots", None)
         if draft_tokens_topk1 is None or forward_batch.mm_input_embeds is not None:
@@ -1314,8 +1319,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Gather the per-request last-position indexer top-k as the next loop's
         # seed (select_index already picks the last accepted position per req).
+        full_frames = getattr(draft_logits_output, "q38_prepared_frames", None)
+        full_frame = full_frames[0] if full_frames else None
         dsa_seed_topk_indices = None
-        if self.seed_dsa_topk_from_draft_extend:
+        if full_frame is not None:
+            if self.seed_dsa_topk_from_draft_extend:
+                dsa_seed_topk_indices = full_frame.buffers.dsa_seed_topk[:1]
+        elif self.seed_dsa_topk_from_draft_extend:
             if can_run_decode_cuda_graph:
                 dsa_extend_topk_capture = self.cuda_graph_runner_for_draft_extend.buffers.dsa_seed_topk_capture
             else:
@@ -1343,7 +1353,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         # Selected-row top-k remains worker-owned for both graph and eager
         # paths; the graph runner only moves the row selection before lm_head.
-        if served_top1 is not None:
+        if full_frame is not None:
+            ret_topk_p = full_frame.buffers.topk_p[:1]
+            ret_topk_index = full_frame.buffers.topk_index[:1]
+            ret_draft_probs = None
+        elif served_top1 is not None:
             ret_topk_p, ret_topk_index = served_top1
             ret_draft_probs = None
         elif get_spec().speculative_use_rejection_sampling:
@@ -1377,6 +1391,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Construct the return values
         next_draft_input = batch_result.next_draft_input
+        next_draft_input.q38_prepared_frames = full_frames
         (
             next_draft_input.topk_p,
             next_draft_input.topk_index,
