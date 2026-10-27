@@ -580,7 +580,7 @@ class SchedulerDisaggregationPrefillMixin:
         for req in batch.reqs:
             room = getattr(req, "bootstrap_room", None)
             if room is not None and room in kv_mgr.transfer_infos:
-                prefetch(room)
+                prefetch(room, upto_tokens=req.extend_end)
 
     def checkpoint_disagg_prefill(self: Scheduler, req: Req) -> None:
         cache = self.tree_cache
