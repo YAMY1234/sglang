@@ -1,6 +1,11 @@
 import unittest
 
+from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.quantization.quark.utils import should_ignore_layer
+from sglang.srt.layers.quantization.qwen3_5_mtp_nvfp4 import (
+    Qwen3_5MtpNvFp4Config,
+)
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM
 from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP, _mtp_quant_config
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -43,6 +48,16 @@ class _FakeQuantConfig:
 
 
 class TestQwen3_5MTPQuantConfig(CustomTestCase):
+    def test_nvfp4_expert_config_keeps_dense_layers_unquantized(self):
+        """The expert-only config must still construct draft attention linears."""
+        layer = object.__new__(LinearBase)
+
+        method = Qwen3_5MtpNvFp4Config().get_quant_method(
+            layer, "mtp.layers.0.self_attn.qkv_proj"
+        )
+
+        self.assertIsInstance(method, UnquantizedLinearMethod)
+
     def test_mixed_quark_checkpoint_keeps_quantization(self):
         """Routed experts stay MXFP4, so the draft must stay quantized."""
         quant_config = _FakeQuantConfig("quark", _MIXED_EXCLUDES)
