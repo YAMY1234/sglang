@@ -52,6 +52,24 @@ def cp_lite_requested(*, enabled: bool | None = None) -> bool:
     return any(megakernel_slot_requested(slot) for slot in _CP_LITE_SLOTS)
 
 
+def maybe_prebuild_cp_lite(
+    *, enabled: bool, config, device, kv_cache_dtype: torch.dtype, page_size: int
+) -> CpLite | None:
+    """Build CP-lite before a requested megakernel variant validates it."""
+    from sglang.srt.runtime_context import get_platform
+
+    platform = get_platform()
+    if (
+        not cp_lite_requested(enabled=enabled)
+        or platform.is_sm90
+        or platform.is_sm120
+        or kv_cache_dtype != torch.float8_e4m3fn
+        or page_size != PAGE
+    ):
+        return None
+    return CpLite.maybe_create(config=config, device=device)
+
+
 @triton.jit
 def _flat_tid():
     return tl.inline_asm_elementwise(
