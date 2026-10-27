@@ -996,6 +996,9 @@ class ReqKvInfo:
     # Mamba state: an independent resource; whether it is held is `holds_mamba`.
     mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
     mamba_ping_pong_track_buffer: Optional[torch.Tensor] = None  # shape (2)
+    # Scheduler-owned occupancy; slot numbers remain device tensors. Enabled
+    # only by SGLANG_Q38C_MAMBA_SLOT_NOSYNC for lazy tracking pools.
+    mamba_ping_pong_slot_valid: Optional[List[bool]] = None
     mamba_next_track_idx: Optional[int] = None  # 0 or 1
     mamba_last_track_idx: Optional[int] = None  # 0 or 1
     # Seq len of the last cached mamba state
@@ -2073,6 +2076,7 @@ class Req(ReqDllmMixin):
         self.inflight_middle_chunks = 0
         self.kv.mamba_pool_idx = None
         self.kv.mamba_ping_pong_track_buffer = None
+        self.kv.mamba_ping_pong_slot_valid = None
         self.kv.mamba_next_track_idx = None
         self.kv.mamba_last_track_idx = None
         self.kv.mamba_last_track_seqlen = None
@@ -3589,7 +3593,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if self.seq_lens_cpu[i].item() % mamba_track_interval != 0:
                 continue
             other_idx = 1 - req.kv.mamba_next_track_idx
-            if buf[other_idx].item() != -1:
+            slot_valid = req.kv.mamba_ping_pong_slot_valid
+            if (
+                slot_valid[other_idx]
+                if slot_valid is not None
+                else buf[other_idx].item() != -1
+            ):
                 # With overlap the previous forward's post-processing
                 # (which frees this slot) hasn't run yet. Skip.
                 continue
@@ -3630,7 +3639,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 track_positions.append(req.kv.mamba_next_track_idx)
                 continue
             other_idx = 1 - req.kv.mamba_next_track_idx
-            has_pending = buf[other_idx].item() != -1
+            slot_valid = req.kv.mamba_ping_pong_slot_valid
+            has_pending = (
+                slot_valid[other_idx]
+                if slot_valid is not None
+                else buf[other_idx].item() != -1
+            )
             if not has_pending:
                 if envs.SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL.get():
                     new_slot = None
