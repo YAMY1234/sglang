@@ -133,6 +133,50 @@ def _plan(src, rows, seq_lens, *, write_virtual=None, read_extent=0):
     )
 
 
+class TestPreparedColumns(unittest.TestCase):
+    def setUp(self):
+        _publish()
+        self.addCleanup(reset_context)
+
+    def test_a_staged_draft_binds_the_staged_slots_for_its_columns(self):
+        """Prepared draft slots bind without a second copy while every other
+        column still resolves from the complete write window."""
+        from sglang.srt.mem_cache.kv_loc_plan import window_read_extent
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        src = KVIndexTranslator(
+            req_to_token=torch.zeros((4, 16), dtype=torch.int64),
+            token_to_kv_pool_allocator=SimpleNamespace(),
+            token_to_kv_pool=SimpleNamespace(),
+            page_size=1,
+            device=_DEV,
+        )
+        rows = torch.tensor([2, 0])
+        window = torch.arange(100, 114, dtype=torch.int64)  # [2 rows, 7 columns]
+        staged = window.view(2, 7)[:, :6].reshape(-1).clone()
+        plan = _plan(
+            src, rows, torch.tensor([5, 3]), write_virtual=window, read_extent=7
+        )
+        copied = plan.write_ids(src, cols=slice(0, 6))
+        self.assertTrue(torch.equal(copied, staged))
+        plan.use_prepared_cols(slice(0, 6), staged)
+        batch = SimpleNamespace()
+        plan.bind(batch, src, cols=slice(0, 6))
+        self.assertIs(batch.out_cache_loc, staged)
+        self.assertIsNone(batch.out_cache_loc_virtual)
+        extent = window_read_extent(
+            ForwardMode.DECODE, object(), batch.out_cache_loc, 2
+        )
+        self.assertEqual(extent, 6)
+        self.assertTrue(
+            torch.equal(
+                plan.write_ids(src, cols=slice(0, 3)),
+                window.view(2, 7)[:, :3].reshape(-1),
+            )
+        )
+        self.assertIs(plan.write_ids(src), window)
+
+
 def _alloc_and_fill(allocator, ps, lens):
     """Allocate per-request virtual runs and write them into a fake
     req_to_token."""

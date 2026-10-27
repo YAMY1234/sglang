@@ -491,6 +491,84 @@ class TestPostVerifyGraphs(CustomTestCase):
                     self.assertTrue(torch.equal(staged[name], src), name)
                 self.assertEqual(int(staged["sim_accept_len"]), 3)
 
+    def test_lengths_taken_from_a_slot_outlive_the_next_round(self):
+        """Prepared lengths remain live for the next round; replaying their
+        slot before that round finishes is rejected."""
+        graphs = _prepared_length_graphs("cpu")
+        with patch.object(torch.cuda, "stream", lambda stream: nullcontext()):
+            _check_prepared_lengths(self, graphs, device="cpu")
+
+
+def _prepared_length_graphs(device):
+    """_PostVerifyGraphs whose body only moves the lengths (+3), and on a CPU host a capture
+    that keeps the first outputs and rewrites them in place on each replay."""
+
+    def body(slot):
+        new_seq_lens = slot.staged["seq_lens"] + 3
+        return (None, None, None, new_seq_lens, None, None, None)
+
+    def commit(slot, outputs):
+        # the side-stream graph needs some work of its own to capture
+        slot.commit_ct.add_(1)
+
+    graphs = eagle_post_verify_graphs._PostVerifyGraphs(
+        body=body,
+        commit=commit,
+        sim_rng=None,
+        protect_prepared_seq_lens=True,
+    )
+    if device == "cpu":
+
+        def capture(slot):
+            graphs._main_done = graphs._commit_done = MagicMock()
+            graphs._side_stream = MagicMock()
+            outputs = body(slot)
+
+            def replay():
+                outputs[3].copy_(body(slot)[3])
+
+            slot.graph = SimpleNamespace(replay=replay)
+            slot.commit_graph = SimpleNamespace(replay=lambda: None)
+            slot.outputs = outputs
+
+        graphs._capture = capture
+    return graphs
+
+
+def _check_prepared_lengths(test, graphs, *, device):
+    def run(seq_lens):
+        inputs = {
+            "seq_lens": seq_lens,
+            "req_pool_indices": torch.arange(2, device=device),
+        }
+        return graphs.run(
+            key=0,
+            inputs=inputs,
+            make_slot=lambda staged: SimpleNamespace(
+                num_requests=2,
+                commit_ct=torch.zeros(1, dtype=torch.int64, device=device),
+            ),
+            sim_max_len=7,
+        )
+
+    with patch.object(spec_utils, "SIMULATE_ACC_LEN", -1.0):
+        lengths = torch.tensor([100, 200], device=device)
+        # eager warm-ups, then each slot's capture: every round takes the last one's lengths
+        for _ in range(2 * eagle_post_verify_graphs._NUM_WARMUP + 2):
+            lengths = run(lengths)[3]
+        round_n = run(lengths)[3]
+        want_n = round_n.clone()
+        round_n1 = run(round_n)[3]
+        test.assertTrue(
+            torch.equal(round_n, want_n), "round N's lengths changed in N+1"
+        )
+        test.assertNotEqual(round_n1.data_ptr(), round_n.data_ptr())
+        round_n2 = run(round_n1)[3]
+        test.assertEqual(round_n2.data_ptr(), round_n.data_ptr())
+        test.assertTrue(torch.equal(round_n2, want_n + 6))
+        with test.assertRaisesRegex(RuntimeError, "holds this batch's lengths"):
+            run(round_n1)  # round N+1's slot is next: a batch still on its lengths
+
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
 class TestPostVerifyGraphsMatchEager(CustomTestCase):
@@ -581,6 +659,46 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
 
     def test_fused_accept_forced_acceptance(self):
         self._check(sim_acc_len=4.8, fused=True)
+
+    def test_lengths_taken_from_a_slot_outlive_the_next_round(self):
+        """As the CPU test, with captured CUDA graphs replaying into the slots' outputs."""
+        graphs = _prepared_length_graphs("cuda")
+        stream = torch.cuda.Stream()
+        with (
+            torch.cuda.stream(stream),
+            patch(
+                "sglang.srt.distributed.parallel_state.graph_capture", _graph_capture
+            ),
+        ):
+            _check_prepared_lengths(self, graphs, device="cuda")
+
+    def test_the_bonus_in_int64_is_the_int32_bonus_cast(self):
+        """The prepared path writes the bonus in its consumer's int64 dtype
+        without changing any value from the regular int32 output."""
+        generator = torch.Generator(device="cuda").manual_seed(2)
+        for bs in BATCH_SIZES:
+            batch, verify_input, logits = _round(bs, generator)
+            predict, accept_lens, accept_index, _, _ = _eager(
+                batch, verify_input, logits, simulated_acc_len_generator(0)
+            )
+            outputs = {
+                dtype: prepare_verify_commit_outputs(
+                    predict,
+                    accept_index,
+                    accept_lens,
+                    batch.seq_lens,
+                    num_draft_tokens=TOKENS,
+                    bonus_dtype=dtype,
+                )
+                for dtype in (torch.int32, torch.int64)
+            }
+            with self.subTest(bs=bs):
+                narrow, wide = outputs[torch.int32][1], outputs[torch.int64][1]
+                self.assertEqual(wide.dtype, torch.int64)
+                self.assertTrue(torch.equal(wide, narrow.to(torch.int64)))
+                self.assertIs(wide.to(torch.int64), wide)
+                for a, b in zip(outputs[torch.int32][0:1], outputs[torch.int64][0:1]):
+                    self.assertTrue(torch.equal(a, b))
 
 
 def _sampled(batch, *, generator):
