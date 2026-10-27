@@ -1575,6 +1575,7 @@ class TestHiSparseStagedSpecRelay(CustomTestCase):
         future_map = object.__new__(FutureMap)
         future_map.spec_algo = SpeculativeAlgorithm.EAGLE
         future_map.dsa_topk_indices_buf = None
+        future_map._deferred_relay = None
         future_indices = torch.tensor([2, 5], device="cpu")
 
         spec_input = future_map.make_staged_spec_input(future_indices)
@@ -1595,6 +1596,7 @@ class TestHiSparseStagedSpecRelay(CustomTestCase):
         future_map.hidden_states_buf = None
         future_map.draft_probs_buf = torch.arange(12, dtype=torch.float32).view(4, 3)
         future_map.dsa_topk_indices_buf = None
+        future_map._deferred_relay = None
         future_indices = torch.tensor([2, 3], dtype=torch.int64)
         spec_input = future_map.make_staged_spec_input(future_indices)
         gather_spec_extras.return_value = (
