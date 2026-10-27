@@ -1595,6 +1595,18 @@ class Qwen4ExpLayerExtensionMixin:
             linear_attention=linear_attention,
         )
 
+        import os
+        self._shared_out_on = (
+            os.environ.get("Q38_SHARED_OUT", "0") == "1"
+            and isinstance(self.mlp, Qwen2MoeSparseMoeBlock)
+            and get_parallel().tp_size == 1
+            and get_parallel().moe_ep_size == 1
+            and self.hc_count == 4 and self.hidden_size == 2560
+        )
+        if self._shared_out_on:
+            self.mlp._q38_push_shared = True
+            self.mlp._q38_shared_pending = None
+
         from sglang.srt.layers.moe.qwen4_decode import prepare_qwen4_decode_comm
 
         self._decode_moe_comm = (
@@ -1663,6 +1675,39 @@ class Qwen4ExpLayerExtensionMixin:
         )
 
     def _ffn_combine(self, hidden_states, residuals):
+        if self._shared_out_on and self.mlp._q38_shared_pending is not None:
+            hidden, shared = self.mlp._q38_shared_pending
+            self.mlp._q38_shared_pending = None
+            res, _, partials = residuals
+            if partials is not None:
+                # _ffn_mix returns the native tuple unchanged: a non-None
+                # partial tensor is the native side-stream producer's result.
+                current = torch.cuda.current_stream()
+                current.wait_stream(self.mlp_hyper_connection._gate_stream)
+                partials.record_stream(current)
+                next_norm = self._hc_norms.next_norm if self._hc_norms is not None else None
+                if (next_norm is not None
+                    and next_norm.group_size == self.hidden_size
+                    and next_norm.weight.dtype == torch.bfloat16
+                    and hidden_states.dtype == torch.bfloat16):
+                    from sglang.kernels.ops.elementwise.hc_combine_decode import hc_shared_combine_apply_norm
+                    combined, self._hc_norms.output = hc_shared_combine_apply_norm(
+                        hidden, shared, hidden_states, res, partials,
+                        self.mlp.shared_expert_gate.weight.squeeze(), next_norm.weight,
+                        next_norm.variance_epsilon,
+                        parts=4,
+                    )
+                    return combined
+                # PLE/absent context forbids carrying the next HC norm.
+                from sglang.kernels.ops.elementwise.q38_shared_hc import shared_hc
+                if self._hc_norms is not None:
+                    self._hc_norms.output = None
+                return shared_hc(hidden, self.mlp.shared_expert_gate.weight.squeeze(),
+                                 shared, hidden_states, res, partials, self.layer_id)
+            # No native side partials: retain the native gate/add and HC path.
+            from sglang.kernels.ops.elementwise.elementwise import fused_gate_sigmoid_mul_add
+            fused_gate_sigmoid_mul_add(hidden, self.mlp.shared_expert_gate.weight.squeeze(),
+                                       shared, hidden_states)
         if self._hc_norms is None:
             return self.mlp_hyper_connection.combine(hidden_states, residuals)
         hidden_states, self._hc_norms.output = (
