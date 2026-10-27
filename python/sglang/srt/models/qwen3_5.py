@@ -1025,6 +1025,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 )
                 core_attn_out = self.norm(core_attn_out.reshape(-1, 128), z)
                 projected_input = core_attn_out.reshape(4, 6144)
+                if (os.environ.get("Q38_GDN_OUTPROJ_BATCHSPLIT") == "1"
+                    and tuple(self.out_proj.weight.shape) == (2560, 6144)
+                    and self.out_proj.weight.dtype == torch.bfloat16
+                    and projected_input.dtype == torch.bfloat16
+                    and projected_input.stride(-1) == 1
+                    and self.out_proj.weight.stride(-1) == 1
+                    and getattr(self.out_proj, "bias", None) is None):
+                    from sglang.kernels.ops.attention.q38_gdn_front.outproj_batchsplit import gdn_outproj_batchsplit
+                    return gdn_outproj_batchsplit(projected_input, self.out_proj.weight)
                 return self.out_proj(projected_input)[0]
 
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
