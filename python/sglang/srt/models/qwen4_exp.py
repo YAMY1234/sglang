@@ -1453,6 +1453,7 @@ class _HCNorms:
     attn_input: Optional[torch.Tensor]
     next_norm: Optional[GroupedGemmaRMSNorm]
     ffn_input: Optional[torch.Tensor] = None
+    producer_stats: Optional[list] = None
     output: Optional[torch.Tensor] = None
 
 
@@ -1542,6 +1543,11 @@ class Qwen4ExpLayerExtensionMixin:
         self._ple_forward_batch = None
         self._ple_batch = None
         self._hc_norms = None
+        self._hc_prodstats_on = (
+            envs.SGLANG_Q38C_HC_PRODSTATS.get()
+            and linear_attention and self.hc_count == 4 and self.hidden_size == 2560
+            and get_parallel().tp_size == 1
+        )
 
         # The gated reads normalize the streams themselves, so these layers
         # have neither of the norms their base class builds.
@@ -1655,11 +1661,25 @@ class Qwen4ExpLayerExtensionMixin:
             if self._hc_norms is not None and self.ple is None
             else None
         )
-        return self.attn_hyper_connection.mix(
+        result = self.attn_hyper_connection.mix(
             residual, normalized_input=normalized_input
         )
+        if (self._hc_prodstats_on and self._hc_norms is not None
+            and residual.shape == (4, 10240) and residual.is_contiguous()
+            and residual.dtype == torch.bfloat16 and result[1][2] is not None
+            and self.mlp_hyper_connection.hc_norm.weight.dtype == torch.bfloat16):
+            # This packet lives for this layer invocation only. The existing
+            # K3 path appends its two explicit outputs after launching TGV.
+            self._hc_norms.producer_stats = [
+                result[1][0], result[1][2], self.attn_hyper_connection._gate_stream
+            ]
+        return result
 
     def _attn_combine(self, hidden_states, residuals):
+        if (self._hc_norms is not None
+            and self._hc_norms.producer_stats is not None
+            and len(self._hc_norms.producer_stats) == 5):
+            return self._hc_norms.producer_stats[3]
         if self._hc_norms is None:
             return self.attn_hyper_connection.combine(hidden_states, residuals)
         hidden_states, self._hc_norms.ffn_input = (
@@ -1673,8 +1693,15 @@ class Qwen4ExpLayerExtensionMixin:
         normalized_input = (
             self._hc_norms.ffn_input if self._hc_norms is not None else None
         )
+        norm_stats = None
+        if (self._hc_norms is not None
+            and self._hc_norms.producer_stats is not None
+            and len(self._hc_norms.producer_stats) == 5):
+            norm = self.mlp_hyper_connection.hc_norm
+            norm_stats = (self._hc_norms.producer_stats[4], norm.weight,
+                          norm.variance_epsilon)
         return self.mlp_hyper_connection.mix(
-            residual, normalized_input=normalized_input
+            residual, normalized_input=normalized_input, norm_stats=norm_stats
         )
 
     def _ffn_combine(self, hidden_states, residuals):
@@ -1827,7 +1854,13 @@ class Qwen4ExpLinearDecoderLayer(
         )
 
         if not forward_batch.forward_mode.is_idle():
-            hidden_states = self.linear_attn(hidden_states, forward_batch)
+            packet = self._hc_norms.producer_stats if self._hc_norms is not None else None
+            if packet is not None:
+                hidden_states = self.linear_attn(
+                    hidden_states, forward_batch, hc_prodstats=packet
+                )
+            else:
+                hidden_states = self.linear_attn(hidden_states, forward_batch)
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         return self._run_ffn_stage(hidden_states, forward_batch)

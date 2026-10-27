@@ -327,6 +327,7 @@ class Envs:
     SGLANG_Q38_HC_COMBINE_PARTS = EnvInt(2)
     # Keep the frozen cluster path by default; opt in to native rows except M4.
     SGLANG_Q38C_HC_CLUSTER_M4ONLY = EnvBool(False)
+    SGLANG_Q38C_HC_PRODSTATS = EnvBool(False)
     # Experimental FN target router + input NVFP4 quantization, SM103 TP1/EP1.
     SGLANG_Q38_ROUTER_FRONT = EnvBool(False)
     SGLANG_Q38_ROUTER_HYBRID = EnvBool(False)

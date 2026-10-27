@@ -246,35 +246,13 @@ class GatedResidual(HyperConnectionBase):
         self._mix_compute = torch.compile(_mix_compute)
         self._combine_compute = torch.compile(_combine_compute)
 
-    def mix(
-        self,
-        hyper_input: torch.Tensor,
-        normalized_input: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]]:
-        assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
-        if hyper_input.shape[0] == 0:
-            mixed_input = hyper_input.new_empty(
-                (*hyper_input.shape[:-1], self.hidden_size), dtype=self.params_dtype
-            )
-            return mixed_input, (hyper_input, hyper_input, None)
-
-        if normalized_input is not None:
-            assert self.config.hc_per_branch_norm
-            assert normalized_input.shape == hyper_input.shape
-            hyper_input_normed = normalized_input
-        elif self.config.hc_per_branch_norm:
-            hyper_input_normed = self.hc_norm(hyper_input)
-        else:
-            hyper_input_normed = self.hc_norm(
-                hyper_input.unflatten(-1, (self.hc_count, self.hidden_size))
-            ).flatten(-2)
-        # Prepare independent gate partials while native HC mix GEMMs run.
+    def _prepare_gate_partials(self, hyper_input_normed):
         partials = None
         stream = self._gate_stream
         if (
             stream is not None
-            and 0 < hyper_input.shape[0] <= self._gate_max_rows
-            and hyper_input.dtype == torch.bfloat16
+            and 0 < hyper_input_normed.shape[0] <= self._gate_max_rows
+            and hyper_input_normed.dtype == torch.bfloat16
             and not torch.compiler.is_compiling()
         ):
             from sglang.kernels.ops.elementwise.hc_combine_decode import hc_combine_gate
@@ -285,6 +263,38 @@ class GatedResidual(HyperConnectionBase):
                     hyper_input_normed, self.block_inject_weight.weight
                 )
             hyper_input_normed.record_stream(stream)
+        return partials
+
+    def mix(
+        self,
+        hyper_input: torch.Tensor,
+        normalized_input: Optional[torch.Tensor] = None,
+        norm_stats=None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]]:
+        assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
+        if hyper_input.shape[0] == 0:
+            mixed_input = hyper_input.new_empty(
+                (*hyper_input.shape[:-1], self.hidden_size), dtype=self.params_dtype
+            )
+            return mixed_input, (hyper_input, hyper_input, None)
+
+        if norm_stats is not None:
+            # The down producer fills this normalized tensor before native up
+            # reads it. Its side gate starts after that main-stream launch.
+            hyper_input_normed = torch.empty_like(hyper_input)
+        elif normalized_input is not None:
+            assert self.config.hc_per_branch_norm
+            assert normalized_input.shape == hyper_input.shape
+            hyper_input_normed = normalized_input
+        elif self.config.hc_per_branch_norm:
+            hyper_input_normed = self.hc_norm(hyper_input)
+        else:
+            hyper_input_normed = self.hc_norm(
+                hyper_input.unflatten(-1, (self.hc_count, self.hidden_size))
+            ).flatten(-2)
+        partials = (
+            self._prepare_gate_partials(hyper_input_normed) if norm_stats is None else None
+        )
         if (
             self._jit_mix_ok
             and hyper_input_normed.is_cuda
@@ -306,6 +316,8 @@ class GatedResidual(HyperConnectionBase):
                 self._mix_up_weight_padded,
                 self.hc_count,
                 self.hidden_size,
+                combined_input=hyper_input if norm_stats is not None else None,
+                norm_stats=norm_stats,
             ).to(self.params_dtype)
         elif fused_hc_mix_supported(
             hyper_input_normed,
@@ -327,6 +339,8 @@ class GatedResidual(HyperConnectionBase):
                 self.hc_count,
                 self.hidden_size,
             ).to(self.params_dtype)
+        if norm_stats is not None:
+            partials = self._prepare_gate_partials(hyper_input_normed)
         return mixed_input, (hyper_input, hyper_input_normed, partials)
 
     def combine_and_normalize(

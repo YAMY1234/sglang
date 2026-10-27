@@ -977,6 +977,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        hc_prodstats=None,
     ):
         """
         Forward pass with three parts:
@@ -1009,7 +1010,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     and self.out_proj.weight.stride(-1) == 1
                     and getattr(self.out_proj, "bias", None) is None):
                     from sglang.kernels.ops.attention.q38_gdn_front.outproj_batchsplit import gdn_outproj_batchsplit
-                    return gdn_outproj_batchsplit(projected_input, self.out_proj.weight)
+                    return gdn_outproj_batchsplit(projected_input, self.out_proj.weight, hc_prodstats)
                 return self.out_proj(projected_input)[0]
 
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(

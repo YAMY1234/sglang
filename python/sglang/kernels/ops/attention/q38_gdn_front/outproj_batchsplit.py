@@ -20,7 +20,7 @@ def _sum_three(partial, output, ELEMENTS: tl.constexpr, BLOCK: tl.constexpr):
     tl.store(output + index, total.to(tl.bfloat16), valid)
 
 
-def gdn_outproj_batchsplit(x, weight):
+def gdn_outproj_batchsplit(x, weight, hc_prodstats=None):
     # Caller guards exactly M4 and BF16 [N2560,K6144], no bias/TP slicing.
     # Zero-copy views: each batch spans a distinct contiguous K segment
     # inside every original row, not a copied/padded weight matrix.
@@ -33,8 +33,20 @@ def gdn_outproj_batchsplit(x, weight):
     # Same mature CTA64x16x128 / 2CTA / stage12 tactic18. L=3 supplies
     # 3 independent K slices:40CTAs each,120 total; no DSMEM splitK sum.
     _run_tgv(xs, ws.transpose(-2, -1), None, partial, True, 18)
-    _sum_three[(triton.cdiv(4 * 2560, 256),)](
-        partial, output, 4 * 2560, BLOCK=256,
-        num_warps=4, enable_fp_fusion=False, launch_pdl=True,
-    )
+    if hc_prodstats is not None:
+        from sglang.kernels.ops.elementwise.hc_prodstats import combine_stats
+
+        # Join only after TGV has launched so its static-weight prefetch remains
+        # independent. The reducer must see the previous mix's gate partials.
+        current = torch.cuda.current_stream()
+        current.wait_stream(hc_prodstats[2])
+        residual, gates, _ = hc_prodstats
+        gates.record_stream(current)
+        combined, stats = combine_stats(partial, output, residual, gates)
+        hc_prodstats.extend((combined, stats))
+    else:
+        _sum_three[(triton.cdiv(4 * 2560, 256),)](
+            partial, output, 4 * 2560, BLOCK=256,
+            num_warps=4, enable_fp_fusion=False, launch_pdl=True,
+        )
     return output

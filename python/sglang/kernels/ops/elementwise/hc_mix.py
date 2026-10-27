@@ -64,6 +64,9 @@ def hc_mix(
     w_up_permuted_padded: torch.Tensor,
     hc_count: int,
     hidden_size: int,
+    *,
+    combined_input=None,
+    norm_stats=None,
 ) -> torch.Tensor:
     from sglang.kernels.ops.gemm.dense_bf16_gemm_sm100_splitk_epilogue import (
         run_splitk_dense_gate,
@@ -82,6 +85,16 @@ def hc_mix(
         return out
     inv_hc = 1.0 / hc_count
     t_pad = _get_scratch(lowrank, hyper_input_normed.dtype, hyper_input_normed.device)
+    if norm_stats is not None:
+        from sglang.kernels.ops.elementwise.hc_prodstats import run_prodstats_down
+
+        run_prodstats_down(combined_input, w_down, t_pad[:rows, :lowrank],
+                           hyper_input_normed, norm_stats)
+        run_splitk_dense_gate(
+            t_pad[:rows], w_up_permuted_padded.T, hyper_input_normed, out, True,
+            _get_tactic(rows, k, kpad), inv_hc, hc_count,
+        )
+        return out
     for row_start in range(0, rows, _MAX_ROWS):
         row_end = min(row_start + _MAX_ROWS, rows)
         m = row_end - row_start
