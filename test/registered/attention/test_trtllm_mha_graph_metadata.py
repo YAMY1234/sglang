@@ -85,6 +85,7 @@ def make_xqa_backend(monkeypatch):
             max_running_requests=4,
             model=SimpleNamespace(modules=lambda: []),
             is_draft_worker=False,
+            server_args=SimpleNamespace(enable_nvidia_megakernel=False),
         )
         return TRTLLMHAAttnBackend(runner)
 
