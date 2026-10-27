@@ -545,6 +545,9 @@ class FutureMap:
             if not draft_input.future_dsa_topk_indices_available:
                 draft_input.dsa_topk_indices = None
             return
+        # A gathered FutureMap payload is not the capture-owned producer frame.
+        # Only the identity-checked deferred branch above can preserve it.
+        draft_input.q38_prepared_frames = None
         self.flush_deferred_relay()
         # FIXME: indices = batch.req_pool_indices, pinned 2 iters via
         # record_batch_in_overlap; record_stream here is redundant.

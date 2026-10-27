@@ -126,6 +126,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # The next draft reads the selected hidden rows before this runner's next replay
         # (SGLANG_Q35MF_SPEC_RELAY_BYPASS), so they need no copy out of the graph output.
         self.keep_hidden_in_place = envs.SGLANG_Q35MF_SPEC_RELAY_BYPASS.get()
+        self._q38_full_tails = {}
+        self._q38_full_tail_tokens = {}
         self.forward_mode = ForwardMode.DRAFT_EXTEND_V2
 
         # Fields the parent's capture() reads:
@@ -496,6 +498,14 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 :num_tokens
             ]
         served = bs in self.megakernel_served
+        draft_graph = self.eagle_worker.cuda_graph_runner
+        full_frames = tuple(getattr(draft_graph, "_q38_full_frames", {}).values()) if bs == 1 and not served else ()
+        forward_batch._q38_full_tail = bool(full_frames)
+        full_topki = torch.empty((1, 1), dtype=torch.int64, device=input_ids.device) if full_frames else None
+        if full_frames:
+            key = self._make_graph_key(bs, attention_variant=attention_variant)
+            self._q38_full_tails[key] = full_frames
+            self._q38_full_tail_tokens[key] = full_topki
 
         def run_once():
             self.draft_extend_attn_backend.init_forward_metadata_in_graph(forward_batch)
@@ -523,6 +533,18 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 forward_batch,
             )
 
+            if full_frames:
+                from sglang.kernels.ops.speculative.draft_full_inputs import publish
+
+                torch.argmax(ret.next_token_logits, dim=-1, keepdim=True, out=full_topki)
+                for frame in full_frames:
+                    publish(
+                        frame, token=full_topki, hidden=ret.hidden_states,
+                        seed=forward_batch.spec_info.dsa_seed_topk_capture,
+                        source=draft_graph.buffers, select=forward_batch.spec_info.select_index,
+                        request_slots=forward_batch.req_pool_indices,
+                    )
+                ret.hidden_states = full_frames[0].buffers.hidden_states[:1]
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
             return ret
@@ -841,6 +863,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         if shared_read_ends in (SharedReadEnds.IN_REPLAY, SharedReadEnds.POST_REPLAY):
             self._publish_read_done(in_graph=False)
 
+        full_frames = self._q38_full_tails.get(shape_key) if raw_bs == bs == 1 else None
         out = LogitsProcessorOutput(
             # None when the megakernel's draft_extend kept the logits
             next_token_logits=(
@@ -852,8 +875,9 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             # survive into the next draft step, so detach them from that buffer.
             hidden_states=(
                 out.hidden_states[:raw_bs]
-                if self.keep_hidden_in_place
+                if self.keep_hidden_in_place or full_frames
                 else out.hidden_states[:raw_bs].clone()
             ),
         )
+        out.q38_prepared_frames = full_frames
         return out
