@@ -2177,6 +2177,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         forward_batch: ForwardBatch,
         inputs_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        normalized_input: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], PPProxyTensors]:
         if self.pp_group.is_first_rank:
             if inputs_embeds is not None:
@@ -2221,7 +2222,6 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 ngram_eos_token_id=self.ple_ngram_eos_token_id,
             )
         aux_hidden_states = AuxHiddenStateList()
-        normalized_input = None
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             if i + 1 < self.end_layer:

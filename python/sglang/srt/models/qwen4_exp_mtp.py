@@ -2,6 +2,7 @@
 
 import copy
 import logging
+import os
 from contextlib import ExitStack
 from typing import Optional
 
@@ -19,7 +20,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP, _mtp_quant_config
 from sglang.srt.models.qwen4_exp import Qwen4ExpModel
 from sglang.srt.runtime_context import get_model, get_parallel
-from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.utils import add_prefix, is_npu, is_sm100_supported
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,13 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         # Register the replay slot at HC width, not the token embedding width.
         self.input_embeds_hidden_size = self.hidden_size * self.hc_count
         self._mtp_input_fusion = self._init_mtp_input_fusion(config)
+        self._q38c_input_add_norm = (
+            os.environ.get("SGLANG_Q38C_INPUT_ADD_NORM", "0") == "1"
+            and self.hc_count == 4
+            and self.hidden_size == 2560
+            and get_parallel().tp_size == 1
+            and is_sm100_supported()
+        )
 
         self.model = Qwen4ExpModel(
             config,
@@ -104,8 +112,12 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         return self._fuse_residual_linear_shared
 
     def _fuse_residual_linear_shared(
-        self, input_embeds: torch.Tensor, hidden_states: torch.Tensor
-    ) -> torch.Tensor:
+        self,
+        input_embeds: torch.Tensor,
+        hidden_states: torch.Tensor,
+        *,
+        normalize_output: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         input_embeds = self.fc_embedding(self.pre_fc_norm_embedding(input_embeds))
         orig_shape = hidden_states.shape
         hidden_states = self.pre_fc_norm_hidden(hidden_states)
@@ -113,6 +125,17 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
             *hidden_states.shape[:-1], self.hc_count, self.hidden_size
         )
         encoder_inputs = self.fc_hidden(decoder_view)
+        if normalize_output:
+            from sglang.kernels.ops.elementwise.q38c_mtp_input_add_norm import (
+                mtp_input_add_norm,
+            )
+
+            norm = self.model.layers[
+                self.model.start_layer
+            ].attn_hyper_connection.hc_norm
+            return mtp_input_add_norm(
+                input_embeds, encoder_inputs, norm.weight, norm.variance_epsilon
+            )
         return (input_embeds.unsqueeze(-2) + encoder_inputs).view(orig_shape)
 
     def _fuse_standard(
@@ -210,8 +233,23 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
                 input_ids, forward_batch, input_embeds
             )
             hidden_states = forward_batch.spec_info.hidden_states
+            normalized_input = None
             if not forward_batch.forward_mode.is_idle():
-                hidden_states = self._mtp_input_fusion(input_embeds, hidden_states)
+                if (
+                    self._q38c_input_add_norm
+                    and input_embeds.is_cuda
+                    and input_embeds.dtype == hidden_states.dtype == torch.bfloat16
+                    and input_embeds.shape[0] in (1, 2, 3, 4, 8, 12)
+                    and (
+                        forward_batch.forward_mode.is_decode()
+                        or forward_batch.forward_mode.is_draft_extend_v2()
+                    )
+                ):
+                    hidden_states, normalized_input = self._fuse_residual_linear_shared(
+                        input_embeds, hidden_states, normalize_output=True
+                    )
+                else:
+                    hidden_states = self._mtp_input_fusion(input_embeds, hidden_states)
 
             with get_global_expert_distribution_recorder().disable_this_region():
                 model_output = self.model(
@@ -219,6 +257,7 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
                     positions,
                     forward_batch,
                     hidden_states,
+                    normalized_input=normalized_input,
                 )
 
             hc_hidden_states = None
