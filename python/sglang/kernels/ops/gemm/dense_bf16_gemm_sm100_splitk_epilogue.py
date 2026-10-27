@@ -319,6 +319,9 @@ class SplitKDenseGemmKernel:
         self.epilogue_mode = epilogue_mode
         self.epilogue_scale = epilogue_scale
         self.epilogue_group = epilogue_group
+        # Only the HC split-up subclass supplies FP32 down partials instead
+        # of a global BF16 activation. The ordinary specialization is unchanged.
+        self.hc_splitup = False
 
         if epilogue_mode not in _EPILOGUE_MODES:
             raise ValueError(f"unsupported epilogue_mode={epilogue_mode}")
@@ -548,17 +551,18 @@ class SplitKDenseGemmKernel:
                 True,
             )
         elif warp_idx == 1:
-            self.dma_warp(
-                bar_full,
-                bar_empty,
-                bar_tma_epilog,
-                cute.local_tile(mB, (self.cta_n, self.cta_k), (n_idx, None, l_idx)),
-                sB,
-                cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B"),
-                k_tile_start,
-                k_tile_count,
-                False,
-            )
+            if cutlass.const_expr(not self.hc_splitup):
+                self.dma_warp(
+                    bar_full,
+                    bar_empty,
+                    bar_tma_epilog,
+                    cute.local_tile(mB, (self.cta_n, self.cta_k), (n_idx, None, l_idx)),
+                    sB,
+                    cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B"),
+                    k_tile_start,
+                    k_tile_count,
+                    False,
+                )
         elif warp_idx == 2:
             self.mma_warp(
                 bar_full,
@@ -574,6 +578,11 @@ class SplitKDenseGemmKernel:
                 k_tile_count,
             )
         elif warp_idx >= 4:
+            if cutlass.const_expr(self.hc_splitup):
+                self.reduce_partial_activation(mBias, sB, bar_full, n_idx)
+                epilogue_bias = mC
+            else:
+                epilogue_bias = mBias
             self.epilog_warp(
                 bar_tma_epilog,
                 bar_mma_epilog,
@@ -581,7 +590,7 @@ class SplitKDenseGemmKernel:
                 tmem_base_ptr,
                 acc_layout,
                 cute.local_tile(mC, c_tiler_mn, (bidx, n_idx, l_idx)),
-                cute.local_tile(mBias, c_tiler_mn, (bidx, n_idx, l_idx)),
+                cute.local_tile(epilogue_bias, c_tiler_mn, (bidx, n_idx, l_idx)),
                 cute.arch.thread_idx()[0] - 128,
                 mC.element_type,
                 utils.LayoutEnum.from_tensor(mC),

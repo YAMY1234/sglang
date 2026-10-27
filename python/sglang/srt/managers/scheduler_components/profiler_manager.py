@@ -391,6 +391,10 @@ class SchedulerProfilerManager:
         if "CUDA_PROFILER" in self.profiler_activities:
             if get_device().gpu_id == get_device().base_gpu_id:
                 torch.cuda.cudart().cudaProfilerStop()
+                if trace_file := envs.SGLANG_Q38C_HC_SPLITUP_TRACE_FILE.get():
+                    from sglang.kernels.ops.elementwise.hc_splitup import dump_splitup_trace
+
+                    dump_splitup_trace(trace_file)
 
         merge_message = self._merge_profile_traces()
 

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import torch
 
+from sglang.srt.environ import envs
+
 _MAX_ROWS = 32
 _KPAD_ALIGN = 128
 
@@ -82,6 +84,18 @@ def hc_mix(
         return out
     inv_hc = 1.0 / hc_count
     t_pad = _get_scratch(lowrank, hyper_input_normed.dtype, hyper_input_normed.device)
+    if (
+        envs.SGLANG_Q38C_HC_SPLITUP.get()
+        and 0 < rows <= 16
+        and (k, lowrank, hc_count, hidden_size, kpad) == (10240, 320, 4, 2560, 384)
+        and hyper_input_normed.dtype == torch.bfloat16
+        and hyper_input_normed.is_contiguous()
+        and w_down.is_contiguous()
+        and w_up_permuted_padded.is_contiguous()
+    ):
+        from sglang.kernels.ops.elementwise.hc_splitup import hc_splitup
+
+        return hc_splitup(hyper_input_normed, w_down, w_up_permuted_padded, out, t_pad)
     for row_start in range(0, rows, _MAX_ROWS):
         row_end = min(row_start + _MAX_ROWS, rows)
         m = row_end - row_start

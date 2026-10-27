@@ -325,6 +325,8 @@ class Envs:
     SGLANG_Q38_HC_SMALLM4 = EnvBool(False)
     SGLANG_Q38_HC_SMALLM16 = EnvBool(False)
     SGLANG_Q38_HC_COMBINE_PARTS = EnvInt(2)
+    SGLANG_Q38C_HC_SPLITUP = EnvBool(False)
+    SGLANG_Q38C_HC_SPLITUP_TRACE_FILE = EnvStr("")
     # Experimental FN target router + input NVFP4 quantization, SM103 TP1/EP1.
     SGLANG_Q38_ROUTER_FRONT = EnvBool(False)
     SGLANG_Q38_ROUTER_HYBRID = EnvBool(False)
