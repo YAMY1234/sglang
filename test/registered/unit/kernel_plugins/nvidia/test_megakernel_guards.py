@@ -6,6 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+
 from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode import (
     GDN_COMMIT_SLOT,
     gdn_commit_cuda_requested,
@@ -17,7 +19,11 @@ from sglang.srt.kernel_plugins.nvidia.binding import (
     megakernel_disable_reasons,
 )
 from sglang.srt.kernel_plugins.nvidia.policy import megakernel_slot_requested
-from sglang.srt.layers.attention.q35_cp_lite import cp_lite_requested
+from sglang.srt.layers.attention.q35_cp_lite import (
+    CpLite,
+    cp_lite_requested,
+    maybe_prebuild_cp_lite,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -76,6 +82,28 @@ class TestMegakernelGuards(CustomTestCase):
             self.assertFalse(cp_lite_requested())
             self.assertFalse(cp_lite_requested(enabled=False))
             self.assertTrue(cp_lite_requested(enabled=True))
+
+    def test_cp_lite_is_built_before_the_plugin_validates_its_variant(self):
+        """A requested CP graph variant must exist before attention backends build."""
+        config = object()
+        built = object()
+        with (
+            envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override("skv2_cp"),
+            patch(
+                "sglang.srt.runtime_context.get_platform",
+                return_value=SimpleNamespace(is_sm90=False, is_sm120=False),
+            ),
+            patch.object(CpLite, "maybe_create", return_value=built) as create,
+        ):
+            got = maybe_prebuild_cp_lite(
+                enabled=True,
+                config=config,
+                device="cuda",
+                kv_cache_dtype=torch.float8_e4m3fn,
+                page_size=64,
+            )
+        self.assertIs(got, built)
+        create.assert_called_once_with(config=config, device="cuda")
 
     def test_slots_are_inert_without_the_megakernel(self):
         with (

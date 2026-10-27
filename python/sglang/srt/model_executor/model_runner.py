@@ -762,12 +762,27 @@ class ModelRunner:
         self.maybe_init_lora_manager()
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
+        self.maybe_init_nvidia_megakernel_cp_lite()
         # after every post-load change to the model, before the KV cache is sized
         install_megakernel(
             model=self.model,
             hf_config=self.model_config.hf_config,
             capture_tail_hooks=self.capture_tail_hooks,
             is_draft=self.is_draft_worker,
+        )
+
+    def maybe_init_nvidia_megakernel_cp_lite(self):
+        """Build requested CP-lite state before the plugin validates its variants."""
+        if not self.server_args.enable_nvidia_megakernel:
+            return
+        from sglang.srt.layers.attention.q35_cp_lite import maybe_prebuild_cp_lite
+
+        maybe_prebuild_cp_lite(
+            enabled=True,
+            config=self.model_config,
+            device=self.device,
+            kv_cache_dtype=self.kv_cache_dtype,
+            page_size=self.page_size,
         )
 
     def init_memory_saver_adapter(self):
