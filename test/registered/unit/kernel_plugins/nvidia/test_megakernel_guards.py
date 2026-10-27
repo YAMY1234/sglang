@@ -124,9 +124,7 @@ class TestMegakernelGuards(CustomTestCase):
             patch.object(symm_mem, "get_backend", return_value=object()),
             patch.object(symm_mem, "empty", side_effect=empty_cpu),
             patch.object(symm_mem, "rendezvous", return_value=handle),
-            patch(
-                "sglang.srt.layers.attention.q35_cp_fused.q35_cp_fused_prepare"
-            ),
+            patch("sglang.srt.layers.attention.q35_cp_fused.q35_cp_fused_prepare"),
         ):
             properties.return_value = SimpleNamespace(multi_processor_count=148)
             cp_lite = CpLite(
@@ -141,6 +139,22 @@ class TestMegakernelGuards(CustomTestCase):
         self.assertIsNone(cp_lite._gate_thr(2))
         self.assertIsNone(cp_lite._gate_thr(4))
         self.assertIsNone(cp_lite._gate_thr(16))
+
+    def test_cp_lite_gate_epilogue_offer_is_consumed_once(self):
+        cp_lite = CpLite.__new__(CpLite)
+        cp_lite._gate_epilogue = None
+        cp_lite._gate_epilogue_done = False
+        gate, scale, out = object(), object(), object()
+
+        cp_lite.offer_gate_epilogue(gate, scale, out)
+        self.assertEqual(cp_lite._gate_epilogue, (gate, scale, out))
+        self.assertFalse(cp_lite.take_gate_epilogue())
+        self.assertIsNone(cp_lite._gate_epilogue)
+
+        cp_lite.offer_gate_epilogue(gate, scale, out)
+        cp_lite._gate_epilogue_done = True
+        self.assertTrue(cp_lite.take_gate_epilogue())
+        self.assertFalse(cp_lite.take_gate_epilogue())
 
     def test_slots_are_inert_without_the_megakernel(self):
         with (
