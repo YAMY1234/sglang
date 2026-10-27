@@ -1596,9 +1596,13 @@ class SchedulerBatchResultProcessor:
             other_idx = 1 - req.kv.mamba_next_track_idx
             # Recompute the in-flight verify's plan (kv_committed_len is
             # frozen since its prepare, so the recompute is exact).
-            keep_may_be_written_in_flight = req.kv.mamba_ping_pong_track_buffer[
-                other_idx
-            ].item() == -1 and mamba_lazy_spec_in_window(
+            slot_valid = req.kv.mamba_ping_pong_slot_valid
+            other_empty = (
+                not slot_valid[other_idx]
+                if slot_valid is not None
+                else req.kv.mamba_ping_pong_track_buffer[other_idx].item() == -1
+            )
+            keep_may_be_written_in_flight = other_empty and mamba_lazy_spec_in_window(
                 req,
                 mamba_track_grid(self.tree_cache.page_size),
                 max_speculative_num_draft_tokens(),
@@ -1683,8 +1687,13 @@ class SchedulerBatchResultProcessor:
         req.kv.mamba_last_track_idx = track_idx
         req.kv.mamba_next_track_idx = track_idx
         other_idx = 1 - track_idx
-        other_val = req.kv.mamba_ping_pong_track_buffer[other_idx].item()
-        if other_val != -1:
+        slot_valid = req.kv.mamba_ping_pong_slot_valid
+        other_valid = (
+            slot_valid[other_idx]
+            if slot_valid is not None
+            else req.kv.mamba_ping_pong_track_buffer[other_idx].item() != -1
+        )
+        if other_valid:
             pool = batch.req_to_token_pool
             pool.mamba_allocator.free(
                 req.kv.mamba_ping_pong_track_buffer[other_idx].unsqueeze(0)

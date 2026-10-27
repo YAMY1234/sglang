@@ -112,6 +112,9 @@ logger = logging.getLogger(__name__)
 # the scheduler under load. Off by default; set SGLANG_MAMBA_DEBUG_ASSERTS=1 to
 # re-enable for debugging.
 _MAMBA_DEBUG_ASSERTS = os.environ.get("SGLANG_MAMBA_DEBUG_ASSERTS", "0") == "1"
+_Q38C_MAMBA_SLOT_NOSYNC = (
+    os.environ.get("SGLANG_Q38C_MAMBA_SLOT_NOSYNC", "0") == "1"
+)
 
 GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
@@ -1802,6 +1805,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
         )
         buf[:n] = slots
         req.kv.mamba_ping_pong_track_buffer = buf
+        req.kv.mamba_ping_pong_slot_valid = (
+            [i < n for i in range(self.mamba_ping_pong_track_buffer_size)]
+            if _Q38C_MAMBA_SLOT_NOSYNC and self.enable_mamba_extra_buffer_lazy
+            else None
+        )
         req.kv.mamba_prev_track_seqlen = None
         req.kv.mamba_next_track_idx = 0
         req.kv.mamba_last_track_idx = (
@@ -1817,7 +1825,17 @@ class HybridReqToTokenPool(ReqToTokenPool):
         req_index_to_mamba_ping_pong_track_buffer_mapping in sync so that
         set_mamba_track_indices_from_reqs reads correct slot indices.
         """
-        req.kv.mamba_ping_pong_track_buffer[idx] = value
+        slot_valid = req.kv.mamba_ping_pong_slot_valid
+        if slot_valid is not None:
+            # Allocation returns a nonnegative device slot. Invalidation uses
+            # host -1; fill_ emits a device fill instead of a pageable H2D copy.
+            slot_valid[idx] = isinstance(value, torch.Tensor) or value != -1
+            if isinstance(value, int):
+                req.kv.mamba_ping_pong_track_buffer[idx : idx + 1].fill_(value)
+            else:
+                req.kv.mamba_ping_pong_track_buffer[idx] = value
+        else:
+            req.kv.mamba_ping_pong_track_buffer[idx] = value
         self.req_index_to_mamba_ping_pong_track_buffer_mapping[req.kv.req_pool_idx] = (
             req.kv.mamba_ping_pong_track_buffer
         )
@@ -1900,6 +1918,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             # and skip allocation (which would silently reuse a freed
             # tensor on the req side while the new pool slot leaks).
             req.kv.mamba_ping_pong_track_buffer = None
+            req.kv.mamba_ping_pong_slot_valid = None
             req.kv.mamba_next_track_idx = None
             req.kv.mamba_last_track_idx = None
             req.kv.mamba_last_track_seqlen = None
