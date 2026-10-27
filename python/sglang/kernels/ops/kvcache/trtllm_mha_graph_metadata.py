@@ -197,6 +197,98 @@ def update_trtllm_mha_graph_metadata_kernel(
                 tl.store(swa_out_cache_loc_ptr + out_idx, translated, mask=in_range)
 
 
+@triton.jit
+def _draft_shared_metadata_kernel(
+    req_pool_indices_ptr,
+    seq_lens_ptr,
+    req_to_token_ptr,
+    swa_mapping_ptr,
+    out_cache_loc_ptr,
+    qlens_ptr,
+    cache_seqlens_ptr,
+    cu_seqlens_k_ptr,
+    cu_seqlens_q_ptr,
+    page_table_ptr,
+    swa_page_table_ptr,
+    swa_out_cache_loc_ptr,
+    bs,
+    seqlen_offset,
+    max_seq_pages,
+    q_stride,
+    num_out_tokens,
+    swa_out_len,
+    req_to_token_stride,
+    page_table_stride,
+    swa_page_table_stride,
+    shared_cache_seqlens_ptr,
+    shared_cu_seqlens_k_ptr,
+    shared_cache_seqlens_stride,
+    shared_cu_seqlens_k_stride,
+    METADATA_GRID: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    HAS_SWA: tl.constexpr,
+    HAS_SWA_OUT: tl.constexpr,
+    Q_MODE: tl.constexpr,
+    PAGE_BLOCK: tl.constexpr,
+    BS_BLOCK: tl.constexpr,
+    SKIP_PAGE_TABLE: tl.constexpr,
+    ROW_SPLIT: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    if pid < METADATA_GRID:
+        # Preserve the original programs and their program IDs. They write the
+        # final step's lengths and the page table shared by all five steps.
+        update_trtllm_mha_graph_metadata_kernel(
+            req_pool_indices_ptr,
+            seq_lens_ptr,
+            req_to_token_ptr,
+            swa_mapping_ptr,
+            out_cache_loc_ptr,
+            qlens_ptr,
+            cache_seqlens_ptr,
+            cu_seqlens_k_ptr,
+            cu_seqlens_q_ptr,
+            page_table_ptr,
+            swa_page_table_ptr,
+            swa_out_cache_loc_ptr,
+            bs,
+            seqlen_offset,
+            max_seq_pages,
+            q_stride,
+            num_out_tokens,
+            swa_out_len,
+            req_to_token_stride,
+            page_table_stride,
+            swa_page_table_stride,
+            PAGE_SIZE,
+            HAS_SWA,
+            HAS_SWA_OUT,
+            Q_MODE,
+            PAGE_BLOCK,
+            BS_BLOCK,
+            SKIP_PAGE_TABLE,
+            ROW_SPLIT,
+        )
+    else:
+        # The four appended programs write disjoint rows, directly from seq_lens.
+        # Their step IDs are local to this appended range, not global program IDs.
+        s = pid - METADATA_GRID
+        offs = tl.arange(0, BS_BLOCK)
+        mask = offs < bs
+        seqlens = tl.load(seq_lens_ptr + offs, mask=mask, other=0).to(tl.int32)
+        seqlens = tl.where(mask, seqlens + 1 + s, 0)
+        tl.store(
+            shared_cache_seqlens_ptr + s * shared_cache_seqlens_stride + offs,
+            seqlens,
+            mask=mask,
+        )
+        tl.store(
+            shared_cu_seqlens_k_ptr + s * shared_cu_seqlens_k_stride + 1 + offs,
+            tl.cumsum(seqlens, axis=0),
+            mask=mask,
+        )
+
+
 def update_trtllm_mha_graph_metadata(
     *,
     req_pool_indices,
@@ -218,6 +310,7 @@ def update_trtllm_mha_graph_metadata(
     q_stride: int = 0,
     q_mode: int = Q_MODE_NONE,
     skip_page_table: bool = False,
+    draft_shared_lens=None,
 ):
     """Launch the fused metadata update (one kernel for the whole replay init).
 
@@ -258,7 +351,25 @@ def update_trtllm_mha_graph_metadata(
     row_split = 1 if skip_page_table else _ROW_SPLIT
     grid = (bs * row_split + 1 + grid_extra,)
 
-    update_trtllm_mha_graph_metadata_kernel[grid](
+    kernel = update_trtllm_mha_graph_metadata_kernel
+    extra = {}
+    if draft_shared_lens is not None:
+        # Only the existing B1, five-step shared-table draft layout opts in.
+        assert bs == 1 and seqlen_offset == 5 and q_mode == Q_MODE_NONE
+        assert not (skip_page_table or has_swa or has_swa_out)
+        lens, cu_lens = draft_shared_lens
+        assert lens.shape[0] == cu_lens.shape[0] == 5
+        kernel = _draft_shared_metadata_kernel
+        extra = dict(
+            shared_cache_seqlens_ptr=lens,
+            shared_cu_seqlens_k_ptr=cu_lens,
+            shared_cache_seqlens_stride=lens.stride(0),
+            shared_cu_seqlens_k_stride=cu_lens.stride(0),
+            METADATA_GRID=grid[0],
+        )
+        grid = (grid[0] + 4,)
+
+    kernel[grid](
         req_pool_indices,
         seq_lens,
         req_to_token,
@@ -288,6 +399,7 @@ def update_trtllm_mha_graph_metadata(
         BS_BLOCK=triton.next_power_of_2(bs),
         SKIP_PAGE_TABLE=1 if skip_page_table else 0,
         ROW_SPLIT=row_split,
+        **extra,
     )
 
 
