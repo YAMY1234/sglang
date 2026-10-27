@@ -884,6 +884,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 reduce=sum_post_experts_output,
             )
 
+        if (getattr(self, "_q38_push_shared", False)
+            and 1 < num_tokens <= 16 and shared_output is not None
+            and use_fused_gate and not self.reduce_results):
+            assert self._q38_shared_pending is None
+            self._q38_shared_pending = (hidden_states, shared_output)
+            return final_hidden_states.view(num_tokens, hidden_dim)
+
         if shared_output is not None:
             if use_fused_gate:
                 fused_gate_sigmoid_mul_add(
