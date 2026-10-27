@@ -164,8 +164,12 @@ class QSAIndexer(MultiPlatformOp):
         pool=None,
         cache_loc: torch.Tensor | None = None,
         q_heads_padded: int | None = None,
+        projected_qk: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, bool]:
-        qk, _ = self.index_qk_proj(hidden_states)
+        if projected_qk is None:
+            qk, _ = self.index_qk_proj(hidden_states)
+        else:
+            qk = projected_qk
         token_k = qk[:, self.index_n_heads * self.index_head_dim :].reshape(
             -1, self.index_kv_heads, self.index_head_dim
         )
@@ -626,6 +630,7 @@ class QSAIndexer(MultiPlatformOp):
         forward_batch,
         indexer_metadata,
         cp_global_rope_positions: torch.Tensor | None = None,
+        projected_qk: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Portable orchestration shared by different platforms.
         Fast paths are gated per platforms inside kernel calls.
@@ -703,6 +708,7 @@ class QSAIndexer(MultiPlatformOp):
                 if (forward_mode.is_decode() or is_target_verify or is_draft_extend)
                 else None
             ),
+            projected_qk=projected_qk,
         )
         self.update_key_state_and_compress(
             token_k,
@@ -750,6 +756,7 @@ class QSAIndexer(MultiPlatformOp):
         forward_batch,
         indexer_metadata,
         cp_global_rope_positions: torch.Tensor | None = None,
+        projected_qk: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self._forward_impl(
             hidden_states,
@@ -757,6 +764,7 @@ class QSAIndexer(MultiPlatformOp):
             forward_batch,
             indexer_metadata,
             cp_global_rope_positions,
+            projected_qk=projected_qk,
         )
 
     def forward_xpu(
