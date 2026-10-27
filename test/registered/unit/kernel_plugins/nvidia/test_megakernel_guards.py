@@ -60,18 +60,18 @@ class TestMegakernelGuards(CustomTestCase):
 
     def test_cp_lite_requires_a_cp_slot(self):
         with patch.object(binding, "megakernel_enabled", return_value=True):
-            with envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override(()):
+            with envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override(""):
                 self.assertFalse(cp_lite_requested())
-            with envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override(("mka",)):
+            with envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override("mka"):
                 self.assertFalse(cp_lite_requested())
             for slot in ("skv2_cp", "draft_q1_cp", "draft_skv2_cp"):
-                with envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override((slot,)):
+                with envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override(slot):
                     self.assertTrue(cp_lite_requested())
 
     def test_cp_lite_accepts_the_startup_flag_before_config_is_published(self):
         with (
             patch.object(binding, "megakernel_enabled", return_value=False),
-            envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override(("skv2_cp",)),
+            envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override("skv2_cp"),
         ):
             self.assertFalse(cp_lite_requested())
             self.assertFalse(cp_lite_requested(enabled=False))
@@ -80,20 +80,20 @@ class TestMegakernelGuards(CustomTestCase):
     def test_slots_are_inert_without_the_megakernel(self):
         with (
             patch.object(binding, "megakernel_enabled", return_value=False),
-            envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override(("draft_fin",)),
+            envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override("draft_fin"),
         ):
             self.assertFalse(megakernel_slot_requested("draft_fin"))
 
     def test_gdn_cuda_commit_requires_megakernel_and_slot(self):
         with (
             patch.object(binding, "megakernel_enabled", return_value=False),
-            envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override((GDN_COMMIT_SLOT,)),
+            envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override(GDN_COMMIT_SLOT),
         ):
             self.assertFalse(gdn_commit_cuda_requested())
         with patch.object(binding, "megakernel_enabled", return_value=True):
-            with envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override(()):
+            with envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override(""):
                 self.assertFalse(gdn_commit_cuda_requested())
-            with envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override((GDN_COMMIT_SLOT,)):
+            with envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override(GDN_COMMIT_SLOT):
                 self.assertTrue(gdn_commit_cuda_requested())
 
 
