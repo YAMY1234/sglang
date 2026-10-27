@@ -18,9 +18,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.runtime_context import (
-    get_schedule,
-)
+from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.utils import (
     create_device_event,
     create_device_stream,
@@ -35,6 +33,13 @@ STAGING_WATERMARK_WAIT_S = 0.001
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode import DecodeRequest
+
+
+def _deferred_scatter_enabled() -> bool:
+    """Defer staging scatters only on the validated expert-parallel path."""
+    from sglang.srt.kernel_plugins.nvidia.binding import megakernel_enabled
+
+    return megakernel_enabled() and get_parallel().moe_ep_size > 1
 
 
 # ======================================================================
@@ -113,9 +118,7 @@ class DecodeStagingHandler:
         self._inflight_submits: dict[object, int] = {}
         self._claimed_chunks: set[tuple[object, int]] = set()
         self._closing_rooms: set[int] = set()
-        from sglang.srt.kernel_plugins.nvidia.binding import megakernel_enabled
-
-        self._defer_scatter = megakernel_enabled()
+        self._defer_scatter = _deferred_scatter_enabled()
         self._pending_scatters: deque[tuple[int, int, int, int]] = deque()
 
         k_buffers = kv_buffer_info["k_buffers"]
