@@ -6,6 +6,8 @@ native path otherwise. This module owns no weights or state copies.
 """
 from __future__ import annotations
 
+import os
+
 import cuda.bindings.driver as cuda
 import cutlass
 import torch
@@ -14,6 +16,7 @@ from cutlass.cute.runtime import from_dlpack
 from .gdn_inproj_conv_core import TgvGemmCuteExtKernel
 
 _CACHE = {}
+_FRONT_STAGES = 12 if os.environ.get("SGLANG_Q38C_GDN_FRONT12", "0") == "1" else 8
 
 
 def _view(t, align=2):
@@ -59,7 +62,7 @@ def run(x, packed_weight, conv_weight, conv_bias, conv_state, state_indices,
     compiled = _CACHE.get(key)
     if compiled is None:
         op = TgvGemmCuteExtKernel(
-            cta_m=64, cta_n=8, cta_k=128, num_ab_stage=8,
+            cta_m=64, cta_n=8, cta_k=128, num_ab_stage=_FRONT_STAGES,
             use_2cta=False, use_pdl=True, has_bias=False,
             out_dtype=cutlass.BFloat16)
         op.conv_has_bias = conv_bias is not None
