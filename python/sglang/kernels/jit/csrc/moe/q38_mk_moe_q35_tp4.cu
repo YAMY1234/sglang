@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // Fused small-M NVFP4 MoE expert phase for Qwen3.5 TP4 decode verify (M <= 7 tokens, top-10, 512 experts,
-// hidden 4096, intermediate 256 per rank): the top-10 of the router logits in the trtllm-gen routing's order and
+// hidden 2560, intermediate 192 per rank): the top-10 of the router logits in the trtllm-gen routing's order and
 // weights, FC1, SwiGLU, the NVFP4 requantization and FC2 in one launch over the trtllm-gen weight layout. Writes the
 // deferred-finalize rows (row t * 10 + k, identity permutation) and the expert weights.
 //
@@ -174,15 +174,15 @@ namespace qwen_mkm_moe_tp4 {
 using namespace qwen35;
 
 
-constexpr int kH = 4096, kE = 512, kTopK = 10, kMaxTok = 7;
-constexpr int kI = 256;             // intermediates per expert per rank (TP4)
+constexpr int kH = 2560, kE = 512, kTopK = 10, kMaxTok = 7;
+constexpr int kI = 192;             // intermediates per expert per rank (TP4)
 constexpr int kN1 = 2 * kI;         // W13 rows per expert (gate + up)
 constexpr int kStageBytes = 36864;  // 32 KB weights + 4 KB scale factors
 constexpr int kStages = 5;
-constexpr int kN1c = 256;           // W13 rows per CTA (row split)
+constexpr int kN1c = kI;            // 192 W13 rows = 96 intermediates per CTA
 constexpr int kW13BoxRows = 128;    // rows of one W13 TMA box; the host tensor map must use the same
-constexpr int kFc1Stages = 16;      // 4 k-blocks each (full K = 4096): 2 TMA boxes of 128 rows x 128 B (same K range)
-constexpr int kFc2Stages = 8;       // one tile of 256 W2 rows x 128 B each
+constexpr int kFc1Stages = kH / 256;      // 4 K64 blocks each (full K = 2560); two original 128-row TMA boxes
+constexpr int kFc2Stages = kH / 512;       // one tile of 256 W2 rows x 128 B each
 constexpr int kTotStages = kFc1Stages + kFc2Stages;
 constexpr int kThreads = 256;
 // TMEM columns. FC1: accumulator [0,256), x SFA ring [256,320) (16 slots x 4), SFB ring [384,512) (16 slots x 8).
@@ -219,13 +219,13 @@ struct Params {
   const uint16_t* logits;    // [M, 512] bf16 router logits (router_gemm_quant output)
   uint16_t* expert_weights;  // [M, 10] bf16 out: DynBlock softmax-over-top-10 weights (CTA 0 writes)
   int32_t* topk_ids;         // [M, 10] out (CTA 0 writes)
-  const uint8_t* x_sf;       // [M, 256] linear e4m3
-  const uint8_t* w13_sf;     // [E, 4 row blocks x 64 k blocks x 512 B] (128x4 interleaved)
-  const uint8_t* w2_sf;      // [E, 32 row blocks x 4 k blocks x 512 B]
+  const uint8_t* x_sf;       // [M, 160] linear e4m3
+  const uint8_t* w13_sf;     // [E, 3 row blocks x 40 K-scale atoms x 512 B] (128x4 interleaved)
+  const uint8_t* w2_sf;      // [E, 20 row blocks x 3 K-scale atoms x 512 B]
   const float* g1_alpha;     // [E] gate dequant
   const float* g1_scale_c;   // [E] up dequant * FC2 input quant scale
   const float* g2_alpha;     // [E]
-  __nv_bfloat16* out;        // [M * 10, 4096]
+  __nv_bfloat16* out;        // [M * 10, 2560]
   long long* trace;          // optional [grid, 16] %globaltimer stamps
   int num_tokens;
 };
@@ -601,8 +601,8 @@ __device__ __forceinline__ void fc2_drain(const Params& p, Smem& s, uint32_t tm,
   tc_fence_after();
   if (q == 0 && half == 0 && lane == 0) stamp(p, 7);
   const int row = q * 32 + lane, tile = row / 8, t = row % 8;
-  const bool valid = t < p.num_tokens && ((s.tokmask >> t) & 1u);
-  __nv_bfloat16* orow = p.out + (size_t)(t * kTopK + s.kslot[t]) * kH + rank * 2048 + tile * 256 + half * 128;
+  const bool valid = tile < kFc2Stages && t < p.num_tokens && ((s.tokmask >> t) & 1u);
+  __nv_bfloat16* orow = p.out + (size_t)(t * kTopK + s.kslot[t]) * kH + rank * (kH / 2) + tile * 256 + half * 128;
 #pragma unroll 1
   for (int c = 0; c < 2; ++c) {
     uint32_t r[64];
@@ -649,7 +649,7 @@ q35_mkm_moe_tp4(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
     mbar_init(&s.h_ready, 4);
     mbar_init(&s.fc2_done, 1);
     mbar_init(&s.route_done, 1);
-    mbar_expect_tx(&s.h_peer, 32 * 16 + 16 * 4);  // the peer's half of h (8 rows x 64 B) and its 16 scale words
+    mbar_expect_tx(&s.h_peer, 24 * 16 + 16 * 4);  // peer h: 8 rows x 48 B; SF: 8 rows x 8 B
     fence_mbar_init();
   }
   if (warp == 2) { tmem_alloc(&s.tmem, 512); tmem_relinquish(); tc_fence_before(); }
@@ -667,21 +667,24 @@ q35_mkm_moe_tp4(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
   }
   auto issue_stage = [&](int st, int e, uint64_t pol) {
     const int b = st % kStages;
-    mbar_expect_tx(&s.full[b], kStageBytes);
+    // Shape-only tail: FC2 has three K64 SF atoms, while the TMA box
+    // still fills the original 256x128B SW128 shared-memory footprint.
+    mbar_expect_tx(&s.full[b], st < kFc1Stages ? kStageBytes : 32768 + 3072);
     uint8_t* dst = s.ring[b];
     if (st < kFc1Stages) {
-      // rows [256 r, 256 r + 256) of this expert as two boxes of 128 rows, K bytes [128 st, 128 st + 128)
+      // Useful rows [192r,192r+192), in the original two 128-row boxes.
+      // The last 64 loaded rows are unused by the N192 MMA.
       tma_load_2d_w(dst, &tm13, &s.full[b], st * 128, e * kN1 + (int)rank * kN1c, pol);
       tma_load_2d_w(dst + 16384, &tm13, &s.full[b], st * 128, e * kN1 + (int)rank * kN1c + 128, pol);
-      // scale atoms of row blocks 2 r and 2 r + 1, k-blocks [4 st, 4 st + 4)
+      // Native SF row atoms r and r+1, K-scale atoms [4st,4st+4).
       const uint8_t* sf = p.w13_sf + (size_t)e * (kN1 * kH / 16);
-      bulk_load_w(dst + 32768, sf + (size_t)(2 * (int)rank * 64 + st * 4) * 512, 2048, &s.full[b], pol);
-      bulk_load_w(dst + 32768 + 2048, sf + (size_t)((2 * (int)rank + 1) * 64 + st * 4) * 512, 2048, &s.full[b], pol);
+      bulk_load_w(dst + 32768, sf + (size_t)((int)rank * (kH / 64) + st * 4) * 512, 2048, &s.full[b], pol);
+      bulk_load_w(dst + 32768 + 2048, sf + (size_t)(((int)rank + 1) * (kH / 64) + st * 4) * 512, 2048, &s.full[b], pol);
     } else {
       const int j = st - kFc1Stages;
-      const int row0 = (int)rank * 2048 + j * 256;
+      const int row0 = (int)rank * (kH / 2) + j * 256;
       tma_load_2d_w(dst, &tm2, &s.full[b], 0, e * kH + row0, pol);
-      bulk_load_w(dst + 32768, p.w2_sf + (size_t)e * (kH * 16) + (size_t)(row0 / 128) * 4 * 512, 4096, &s.full[b], pol);
+      bulk_load_w(dst + 32768, p.w2_sf + (size_t)e * (kH * kI / 16) + (size_t)(row0 / 128) * 3 * 512, 3072, &s.full[b], pol);
     }
   };
   // routing: warps 0, 2..7 take tokens 0..6 (DynBlock-exact top-10 + softmax); warp 1 recomputes token my_t's top-10
@@ -691,11 +694,11 @@ q35_mkm_moe_tp4(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
   asm volatile("griddepcontrol.wait;" ::: "memory");
   if (threadIdx.x == 32) stamp(p, 10);
   if (warp == 3 && lane == 0) {
-    // x (8 atoms of this CTA's K half, rows >= M zero-filled) and its scale bytes; independent of the routing
-    mbar_expect_tx(&s.x_full, 16 * 1024 + p.num_tokens * 256);
+    // Full x (10 atoms, rows >= M zero-filled) and SF; independent of routing
+    mbar_expect_tx(&s.x_full, (kH / 256) * 1024 + p.num_tokens * (kH / 16));
 #pragma unroll
-    for (int a = 0; a < 16; ++a) tma_load_2d(s.xa + a * 1024, &tmx, &s.x_full, a * 128, 0);
-    for (int t = 0; t < p.num_tokens; ++t) bulk_load(s.xsf[t], p.x_sf + (size_t)t * (kH / 16), 256, &s.x_full);
+    for (int a = 0; a < kH / 256; ++a) tma_load_2d(s.xa + a * 1024, &tmx, &s.x_full, a * 128, 0);
+    for (int t = 0; t < p.num_tokens; ++t) bulk_load(s.xsf[t], p.x_sf + (size_t)t * (kH / 16), kH / 16, &s.x_full);
   }
   if (rtok < p.num_tokens) {
     const uint4* src = reinterpret_cast<const uint4*>(p.logits + (size_t)rtok * kE + lane * 16);
@@ -790,7 +793,8 @@ q35_mkm_moe_tp4(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
   } else if (warp == 2) {
     if (lane == 0) {
       // ---------------- MMA issuer (tensor pipe: MMAs only)
-      const uint32_t idesc = make_idesc_nvf4(128u, 256u);
+      const uint32_t idesc = make_idesc_nvf4(128u, kN1c);
+      const uint32_t idesc2 = make_idesc_nvf4(128u, 256u);
       mbar_wait(&s.x_full, 0);
       tc_fence_after();
       int n = 0;
@@ -822,11 +826,11 @@ q35_mkm_moe_tp4(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
         if (DIAG_NO_MMA) { tc_commit(&s.empty[b]); continue; }
         const int j = st - kFc1Stages;
 #pragma unroll
-        for (int kb = 0; kb < 4; ++kb) {
-          const int n2 = 64 + j * 4 + kb;  // scale-factor slot, numbered on from FC1's 64 k-blocks
+        for (int kb = 0; kb < kI / 64; ++kb) {
+          const int n2 = kFc1Stages * 4 + j * (kI / 64) + kb;  // SF ring slots continue after FC1's 40 K64 blocks
           umma_nvf4(tm, make_sdesc(smem_u32(s.ha) + kb * 32, 0, 0, 2),
-                    make_sdesc(smem_u32(s.ring[b]) + kb * 32, 0, 1024, 2), idesc,
-                    tm + kColSfa + (uint32_t)(j * 4 + kb) * 4, tm + kColSfb + (uint32_t)(n2 % kSfbSlots) * 8, (j | kb) != 0);
+                    make_sdesc(smem_u32(s.ring[b]) + kb * 32, 0, 1024, 2), idesc2,
+                    tm + kColSfa + (uint32_t)(j * (kI / 64) + kb) * 4, tm + kColSfb + (uint32_t)(n2 % kSfbSlots) * 8, (j | kb) != 0);
         }
         tc_commit(&s.empty[b]);
       }
@@ -870,9 +874,18 @@ q35_mkm_moe_tp4(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
       const uint8_t* sf = s.ring[b] + 32768;
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
-        const uint4 v0 = *reinterpret_cast<const uint4*>(sf + i * 512 + lane * 16);
-        const uint4 v1 = *reinterpret_cast<const uint4*>(sf + 2048 + i * 512 + lane * 16);
-        const uint32_t r[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+        // A 96-intermediate half starts at physical W13 row 192*rank.
+        // Rank 1 therefore starts halfway through a 128-row SF atom. Gather
+        // each local SF row from the two native atoms; rows >=192 are padding.
+        uint32_t r[8];
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+          const int local_row = lane + 32 * w;
+          const int native_row = (int)rank * kN1c + local_row;
+          const int atom = native_row / 128 - (int)rank;
+          const int offset = atom * 2048 + i * 512 + (native_row % 32) * 16 + ((native_row % 128) / 32) * 4;
+          r[w] = local_row < kN1c ? *reinterpret_cast<const uint32_t*>(sf + offset) : 0u;
+        }
         tmem_st_x8(tm + lane_addr + kColSfb + (uint32_t)((st * 4 + i) % kSfbSlots) * 8, r);
       }
       uint32_t xr[16];
@@ -908,8 +921,8 @@ q35_mkm_moe_tp4(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
     }
     // FC2 scale factors of the first two FC2 stages while h is computed (all FC1 MMAs are done)
     if (FC2SF_PRE) {
-      stage_sf(kFc1Stages, 64, 4, 0, 2048);
-      stage_sf(kFc1Stages + 1, 68, 4, 0, 2048);
+      stage_sf(kFc1Stages, kFc1Stages * 4, 3, 0, 1536);
+      stage_sf(kFc1Stages + 1, kFc1Stages * 4 + 3, 3, 0, 1536);
     }
     if (threadIdx.x == 128) stamp(p, 15);
     tc_fence_before();
@@ -918,10 +931,11 @@ q35_mkm_moe_tp4(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
     if (threadIdx.x == 128) stamp(p, 5);
     if (!HOIST_SCALES) { ag = p.g1_alpha[e]; sc = p.g1_scale_c[e]; }
     {
-      // this CTA's 128 intermediates: (token row, 16-wide block, half). Accumulator columns of each 32-block:
+      // this CTA's 96 intermediates: (token row, 16-wide block, half). Accumulator columns of each 32-block:
       // [0, 8) up 2m, [8, 16) gate 2m, [16, 24) up 2m + 1, [24, 32) gate 2m + 1 (m = 0..7 within the 16 indices)
       const int it = threadIdx.x - 128;  // 0..127
-      const int row = it / 16, blk = (it / 2) % 8, hf = it % 2;
+      const int row = it / 12, blk = (it / 2) % 6, hf = it % 2;
+      if (row < 8) {  // 8 rows x 96 intermediates; remaining warp stays in every original barrier
       const float4* ar = reinterpret_cast<const float4*>(s.acc1 + row * kARow + 32 * blk + 4 * hf);
       const float4 u_even = ar[0], g_even = ar[2], u_odd = ar[4], g_odd = ar[6];
       const float ga[8] = {g_even.x, g_odd.x, g_even.y, g_odd.y, g_even.z, g_odd.z, g_even.w, g_odd.w};
@@ -948,20 +962,25 @@ q35_mkm_moe_tp4(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
 #pragma unroll
       for (int i = 0; i < 8; ++i) qv[i] = mul_ftz(h[i], osc) * sc;
       const uint32_t packed = cvt_e2m1x8(qv);
-      const int gblk = 8 * (int)rank + blk;  // 16-wide block over the 256 intermediates; k-blocks 2 r, 2 r + 1
+      const int gblk = 6 * (int)rank + blk;  // 16-wide block over the 192 intermediates
       const int chunk = gblk / 2;
       *reinterpret_cast<uint32_t*>(s.ha + row * 128 + ((chunk ^ row) * 16) + (gblk % 2) * 8 + hf * 4) = packed;
-      if (hf == 0) reinterpret_cast<uint8_t*>(&s.hsf[row][gblk / 4])[gblk % 4] = (uint8_t)sf;
+      // Each CTA owns an aligned 8-byte metadata half containing six SF
+      // bytes. This avoids two CTAs writing halves of the same uint32 word.
+      if (hf == 0) reinterpret_cast<uint8_t*>(&s.hsf[row][2 * rank])[blk] = (uint8_t)sf;
+      }
     }
     named_bar(1, 128);
     if (q == 0) {
-      // send this CTA's k-block of h (8 rows x two 16-B chunks) and its scale words into the peer's buffers
+      // Send the 96-wide h half (3 chunks/row) and its aligned SF half to the peer.
       cluster_wait();  // phase 1: the peer's barriers are initialized
       const uint32_t pbar = mapa(smem_u32(&s.h_peer), rank ^ 1u);
       {
-        const int row = lane / 4, chunk = 4 * (int)rank + lane % 4;
-        const uint32_t off = (uint32_t)(row * 128 + ((chunk ^ row) * 16));
-        st_async_v4(mapa(smem_u32(s.ha + off), rank ^ 1u), *reinterpret_cast<const uint4*>(s.ha + off), pbar);
+        if (lane < 24) {  // eight token rows x three 16-byte chunks per 96-wide half
+          const int row = lane / 3, chunk = 3 * (int)rank + lane % 3;
+          const uint32_t off = (uint32_t)(row * 128 + ((chunk ^ row) * 16));
+          st_async_v4(mapa(smem_u32(s.ha + off), rank ^ 1u), *reinterpret_cast<const uint4*>(s.ha + off), pbar);
+        }
       }
       if (lane < 16) {
         const int row = lane / 2, w = 2 * (int)rank + lane % 2;
@@ -971,17 +990,25 @@ q35_mkm_moe_tp4(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
     }
     mbar_wait(&s.h_peer, 0);  // the peer's half of h and its scale words
     if (threadIdx.x == 128) stamp(p, 5);
-    // h scale factors: 32 atoms (tile jt, k-block kb) of 4 columns; row m = 32 c + lane is nonzero only in its tile
+    // h SF: 5 output tiles x 3 K64 atoms. Retain the original TMEM staging
+    // footprint, zeroing the unused atoms; each live tile owns eight TMEM rows.
     {
       uint32_t r[32];
 #pragma unroll 1
       for (int half = 0; half < 4; ++half) {
 #pragma unroll
         for (int i = 0; i < 32; ++i) {
-          const int a = half * 8 + i / 4, col = i % 4;  // atom a = 4 jt + kb
-          const int jt = a / 4, kb = a % 4;
+          const int a = half * 8 + i / 4, col = i % 4;  // atom a = 3 jt + kb
+          const int jt = a / 3, kb = a % 3;
           const int row = 32 * col + lane;
-          r[i] = (row / 8 == jt) ? s.hsf[row % 8][kb] : 0u;
+          uint32_t sfword = 0;
+#pragma unroll
+          for (int b = 0; b < 4; ++b) {
+            const int group = 4 * kb + b;
+            const auto* half_sf = reinterpret_cast<const uint8_t*>(&s.hsf[row % 8][2 * (group / 6)]);
+            sfword |= (uint32_t)half_sf[group % 6] << (8 * b);
+          }
+          r[i] = (jt < kFc2Stages && row / 8 == jt) ? sfword : 0u;
         }
         tmem_st_x32(tm + lane_addr + kColSfa + half * 32, r);
       }
@@ -993,7 +1020,7 @@ q35_mkm_moe_tp4(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
     if (lane == 0) mbar_arrive(&s.h_ready);
     // FC2 weight scale factors (the MMA issuer waits for each stage's)
     for (int st = kFc1Stages + (FC2SF_PRE ? 2 : 0); st < kTotStages; ++st)
-      stage_sf(st, 64 + (st - kFc1Stages) * 4, 4, 0, 2048);
+      stage_sf(st, kFc1Stages * 4 + (st - kFc1Stages) * 3, 3, 0, 1536);
 
     if (q < 2) fc2_drain(p, s, tm, q, lane, 0, a2, rank, e);
   }
