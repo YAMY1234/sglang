@@ -31,7 +31,7 @@ What a megakernel may write (everything else it only reads):
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 import msgspec
 import torch
@@ -39,6 +39,9 @@ import torch
 from sglang.srt.mem_cache.kv.router import STATE_PART
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_parallel, get_schedule, get_spec
+
+if TYPE_CHECKING:
+    from sglang.srt.kernel_plugins.nvidia.binding import ForwardView, KvPoolView
 
 # Called by a megakernel beyond the data below (its contract test pins the list).
 TOLERATED_CALLABLES = (
@@ -136,7 +139,7 @@ class EagleDraftLoopIO(msgspec.Struct, frozen=True):
     num_requests: int
     num_steps: int
     topk_index: torch.Tensor  # [bs, 1] int64, the round's first draft token
-    hidden_states: torch.Tensor  # [bs, H] the round's input hidden state
+    hidden_states: torch.Tensor  # [bs, input_embeds_hidden_size] the round's input hidden state
     # draft step i runs at positions + i (and mrope_positions + i); an entry that
     # advances them in place restores them before it returns
     positions: torch.Tensor  # [bs] int64
@@ -144,8 +147,8 @@ class EagleDraftLoopIO(msgspec.Struct, frozen=True):
     out_cache_loc: torch.Tensor  # [bs * num_steps] int64, request-major; step i: col i
     req_pool_indices: torch.Tensor  # [bs] int64
     seq_lens: torch.Tensor  # [bs]
-    steps: tuple[AttnStepMetadata, ...]  # draft step i's attention metadata
-    kv: KvPoolBuffers  # the draft's
+    steps: tuple[Union[AttnStepMetadata, "ForwardView"], ...]  # draft step i's attention metadata
+    kv: Union[KvPoolBuffers, "KvPoolView"]  # the draft's
     # [bs, num_steps] int64, SGLang-owned: column 0 is topk_index, column i + 1
     # draft step i's token, identical on every rank
     draft_tokens_out: torch.Tensor
@@ -157,19 +160,23 @@ class EagleDraftExtendIO(msgspec.Struct, frozen=True):
     input_ids: torch.Tensor  # [bs * tokens] int64
     positions: torch.Tensor  # [bs * tokens] int64
     mrope_positions: Optional[torch.Tensor]  # [3, bs * tokens] int64
-    hidden_states: torch.Tensor  # [bs * tokens, H] the verify's hidden states
+    hidden_states: torch.Tensor  # [bs * tokens, input_embeds_hidden_size] the verify's hidden states
     out_cache_loc: torch.Tensor  # [bs * tokens] int64
     req_pool_indices: torch.Tensor  # [bs] int64
     seq_lens: torch.Tensor  # [bs]
     select_index: torch.Tensor  # [bs] int64, the row whose outputs are kept
     num_accept_tokens: torch.Tensor  # [bs] int32
-    attn: AttnStepMetadata
-    kv: KvPoolBuffers  # the draft's
+    attn: Union[AttnStepMetadata, "ForwardView"]
+    kv: Union[KvPoolBuffers, "KvPoolView"]  # the draft's
     # SGLang-owned outputs of the selected rows: top-1 as torch.argmax picks it,
     # 1.0, and the hidden state
     topk_index_out: torch.Tensor  # [bs, 1] int64
     topk_p_out: torch.Tensor  # [bs, 1] float32
-    hidden_out: torch.Tensor  # [bs, H]
+    hidden_out: torch.Tensor  # [bs, input_embeds_hidden_size], H when unspecified
+    # Generic views use the captured GPU lengths and the original front-row count.
+    # None preserves the dense entry protocol and its existing consumers.
+    extend_seq_lens: Optional[torch.Tensor] = None
+    num_front_tokens: Optional[int] = None
 
 
 class EagleDraftRoundIO(msgspec.Struct, frozen=True):

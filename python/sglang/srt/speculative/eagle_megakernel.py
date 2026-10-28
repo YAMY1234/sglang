@@ -13,6 +13,8 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.kernel_plugins.nvidia.binding import (
+    ForwardView,
+    KvPoolView,
     megakernel_agree,
     megakernel_enabled,
     megakernel_entry,
@@ -157,7 +159,7 @@ class EagleMegakernel:
                 req_pool_indices=forward_batch.req_pool_indices,
                 seq_lens=forward_batch.seq_lens,
                 steps=tuple(
-                    map(attn_step_metadata, runner.draft_attn_backend.attn_backends)
+                    map(_draft_step_view, runner.draft_attn_backend.attn_backends)
                 ),
                 kv=self._kv(),
                 draft_tokens_out=draft_tokens,
@@ -187,7 +189,14 @@ class EagleMegakernel:
                     (runner.max_bs, 1), dtype=torch.float32, device=runner.device
                 ),
                 hidden=torch.zeros(
-                    (runner.max_bs, self._draft_config.hidden_size),
+                    (
+                        runner.max_bs,
+                        getattr(
+                            self._draft_runner.model,
+                            "input_embeds_hidden_size",
+                            self._draft_config.hidden_size,
+                        ),
+                    ),
                     dtype=self._draft_config.dtype,
                     device=runner.device,
                 ),
@@ -261,7 +270,7 @@ class EagleMegakernel:
                 seq_lens=forward_batch.seq_lens,
                 select_index=spec_info.select_index,
                 num_accept_tokens=spec_info.num_accept_tokens,
-                attn=attn_step_metadata(get_attn_backend()),
+                **_draft_extend_view(get_attn_backend(), forward_batch),
                 kv=self._kv(),
                 topk_index_out=out.topk_index[:bs],
                 topk_p_out=out.topk_p[:bs],
@@ -323,12 +332,55 @@ class EagleMegakernel:
         # the draft's pool, allocated before any draft graph is captured
         if self._draft_kv is None:
             runner = self._draft_runner
-            self._draft_kv = kv_pool_buffers(
-                pool=runner.token_to_kv_pool,
-                backend=split_backend(runner.attn_backend)[0],
-                model=runner.model,
-            )
+            backend = split_backend(runner.attn_backend)[0]
+            if _dense_draft_backend(backend):
+                self._draft_kv = kv_pool_buffers(
+                    pool=runner.token_to_kv_pool,
+                    backend=backend,
+                    model=runner.model,
+                )
+            else:
+                self._draft_kv = KvPoolView(runner.token_to_kv_pool)
+        elif isinstance(self._draft_kv, KvPoolView):
+            if self._draft_kv.pool is not self._draft_runner.token_to_kv_pool:
+                raise RuntimeError("draft KV pool was reallocated after its first read")
         return self._draft_kv
+
+
+def _dense_draft_backend(backend: Any) -> bool:
+    from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
+
+    return isinstance(backend, TRTLLMHAAttnBackend) or isinstance(
+        getattr(backend, "full_attn_backend", None), TRTLLMHAAttnBackend
+    )
+
+
+def _generic_draft_backend(backend: Any) -> bool:
+    # The same capabilities ForwardView consumes; metadata may legitimately be None.
+    return (
+        hasattr(backend, "forward_metadata")
+        and getattr(backend, "token_to_kv_pool", None) is not None
+        and callable(getattr(backend, "forward", None))
+    )
+
+
+def _draft_step_view(backend: Any) -> Any:
+    if _dense_draft_backend(backend):
+        return attn_step_metadata(backend)
+    return ForwardView(backend)
+
+
+def _draft_extend_view(backend: Any, batch: ForwardBatch) -> dict:
+    if _dense_draft_backend(backend):
+        return {"attn": attn_step_metadata(backend)}
+    lengths = getattr(batch.spec_info, "extend_seq_lens_tensor", None)
+    if lengths is None:
+        lengths = batch.extend_seq_lens
+    return {
+        "attn": ForwardView(backend),
+        "extend_seq_lens": lengths,
+        "num_front_tokens": batch.spec_info.num_front_tokens,
+    }
 
 
 def _served(
@@ -353,21 +405,27 @@ def _backend_reasons(*, target: Any, draft: tuple) -> list[str]:
     reasons = []
     if (
         not isinstance(target, HybridLinearAttnBackend)
-        or not isinstance(target.full_attn_backend, TRTLLMHAAttnBackend)
+        or not (
+            isinstance(target.full_attn_backend, TRTLLMHAAttnBackend)
+            or _generic_draft_backend(target.full_attn_backend)
+        )
         or not isinstance(target.linear_attn_backend, GDNAttnBackend)
     ):
         reasons.append(
-            "the target must run GDN and trtllm_mha under a hybrid linear-attention "
+            "the target must run GDN and a dense or generic-view full-attention "
             f"backend, not {type(target).__name__}"
         )
-    elif target.full_attn_backend.use_sliding_window_kv_pool:
+    elif getattr(target.full_attn_backend, "use_sliding_window_kv_pool", False):
         # every full-attention layer writes its KV at out_cache_loc
         reasons.append("the target's full attention must not use a sliding-window pool")
     for backend in draft:
         backend = split_backend(backend)[0]
-        if not isinstance(backend, TRTLLMHAAttnBackend):
+        if not isinstance(backend, TRTLLMHAAttnBackend) and not _generic_draft_backend(
+            backend
+        ):
             reasons.append(
-                f"the draft must run trtllm_mha, not {type(backend).__name__}"
+                "the draft backend must offer dense metadata or a generic forward view, "
+                f"not {type(backend).__name__}"
             )
     return reasons
 
