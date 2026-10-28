@@ -294,12 +294,90 @@ class TestEagleBinding(CustomTestCase):
         # a plugin pins these names: a rename here must fail first
         members = {
             "EagleBinding": set(dir(eb.EagleBinding)),
-            "ForwardBatch": set(ForwardBatch.__dataclass_fields__),
+            "ForwardBatch": set(ForwardBatch.__dataclass_fields__)
+            | set(dir(ForwardBatch)),
         }
         for name in eb.TOLERATED_CALLABLES + eb.TOLERATED_READS:
             owner, _, attr = name.partition(".")
             if owner in members:
                 self.assertIn(attr, members[owner], name)
+
+    def test_prefill_view_uses_committed_state_without_speculative_buffers(self):
+        from sglang.srt.layers.attention.linear.kernels.gdn_triton import (
+            TritonGDNKernel,
+        )
+        from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
+
+        backend = _hybrid()
+        linear = backend.linear_attn_backend
+        state = SimpleNamespace(
+            conv=[torch.zeros(2, 4, 3)], temporal=torch.zeros(2, 4, 8)
+        )
+        backend.req_to_token_pool = SimpleNamespace(
+            mamba_map={4: 0, 6: 1},
+            mamba_pool=SimpleNamespace(mamba_cache=state),
+            get_speculative_mamba2_params_all_layers=MagicMock(
+                side_effect=AssertionError("prefill must not read speculative scratch")
+            ),
+        )
+        meta = ForwardMetadata(
+            query_start_loc=torch.tensor([0, 3, 5], dtype=torch.int32),
+            mamba_cache_indices=torch.tensor([1, 2], dtype=torch.int32),
+        )
+        linear.forward_metadata = meta
+        linear.kernel_dispatcher = SimpleNamespace(extend_kernel=TritonGDNKernel())
+        linear.requires_contiguous_prefill_state = True
+        binding = eb.EagleBinding(model=torch.nn.Module())
+        with patch.object(eb, "get_attn_backend", return_value=backend):
+            view = binding.prefill_view()
+            self.assertIs(view.query_start_loc, meta.query_start_loc)
+            self.assertIs(view.state_indices, meta.mamba_cache_indices)
+            self.assertEqual(view.state.layer_ids, (4, 6))
+            self.assertIs(view.state.conv[0], state.conv[0])
+            self.assertIs(view.state.temporal, state.temporal)
+            self.assertEqual(view.kernel_id, 1)
+            self.assertFalse(view.has_track)
+            # Per-forward metadata changes while the committed pool stays sealed.
+            linear.forward_metadata = ForwardMetadata(
+                query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+                mamba_cache_indices=torch.tensor([3], dtype=torch.int32),
+            )
+            next_view = binding.prefill_view()
+            self.assertIs(next_view.state, view.state)
+            self.assertIs(
+                next_view.query_start_loc, linear.forward_metadata.query_start_loc
+            )
+            binding.assert_live()
+            state.temporal = torch.zeros_like(state.temporal)
+            with self.assertRaisesRegex(RuntimeError, "prefill was reallocated"):
+                binding.assert_live()
+
+    def test_existing_forward_wrapper_selects_the_prefill_data_view(self):
+        from sglang.kernels.plugin_kernels.nvidia.spec import Step
+
+        views = SimpleNamespace(
+            forward_view=MagicMock(return_value="decode view"),
+            prefill_view=MagicMock(return_value="prefill view"),
+        )
+        got = []
+        mode = "prefill"
+        built = SimpleNamespace(
+            plan=lambda *a, **k: Step(mode=mode, rows=5),
+            forward=lambda step, original, *a, **k: got.append(step.view) or "output",
+        )
+        wrapped = runtime._Dispatch(
+            built=built, original=lambda *a, **k: "stock", binding=views
+        ).wrapped()
+        batch = SimpleNamespace(batch_size=1)
+        with patch.object(
+            torch.cuda, "is_current_stream_capturing", return_value=False
+        ):
+            self.assertEqual(wrapped(torch.zeros(5), None, batch), "output")
+            self.assertEqual(got, ["prefill view"])
+            views.forward_view.assert_not_called()
+            mode = "target_verify"
+            wrapped(torch.zeros(5), None, batch)
+            self.assertEqual(got[-1], "decode view")
 
     def test_a_reallocated_pool_fails_assert_live_by_name(self):
         backend = _hybrid()

@@ -692,7 +692,14 @@ class _Dispatch:
                     input_ids, positions, forward_batch, *args, **kwargs
                 )
             return self.built.forward(
-                msgspec.structs.replace(step, view=self.binding.forward_view()),
+                msgspec.structs.replace(
+                    step,
+                    view=(
+                        self.binding.prefill_view()
+                        if step.mode == "prefill"
+                        else self.binding.forward_view()
+                    ),
+                ),
                 self.original,
                 input_ids,
                 positions,
