@@ -182,7 +182,7 @@ constexpr int kStageBytes = 36864;  // 32 KB weights + 4 KB scale factors
 #define Q38_FN_STAGES 5
 #endif
 #ifndef Q38_FN_CLUSTERS
-#define Q38_FN_CLUSTERS 32
+#define Q38_FN_CLUSTERS 40
 #endif
 constexpr int kStages = Q38_FN_STAGES;
 constexpr int kN1c = kI;            // 192 W13 rows = 96 intermediates per CTA
@@ -634,6 +634,16 @@ __device__ __forceinline__ void fc2_drain(const Params& p, Smem& s, uint32_t tm,
   }
 }
 
+__device__ __forceinline__ void init_task_smem(Smem& s) {
+  for (int i = 0; i < kStages; ++i) {
+    mbar_init(&s.full[i], 1); mbar_init(&s.empty[i], 1); mbar_init(&s.sf_full[i], 4);
+  }
+  mbar_init(&s.x_full, 1); mbar_init(&s.fc1_done, 1);
+  mbar_init(&s.h_peer, 1); mbar_init(&s.h_ready, 4); mbar_init(&s.fc2_done, 1);
+  mbar_expect_tx(&s.h_peer, 24 * 16 + 16 * 4);
+  fence_mbar_init();
+}
+
 extern "C" __global__ void __cluster_dims__(2, 1, 1) __launch_bounds__(kThreads, 1)
 q38_fn_moe_tp4(const __grid_constant__ CUtensorMap tm13,
                const __grid_constant__ CUtensorMap tm13tail,
@@ -646,6 +656,7 @@ q38_fn_moe_tp4(const __grid_constant__ CUtensorMap tm13,
   const int pair = blockIdx.x / 2;
   if (threadIdx.x == 0) {
     stamp(p, 0);
+    init_task_smem(s);
     mbar_init(&s.route_done, 1);
     if (rank == 1) mbar_expect_tx(&s.route_done, 1344 + 4);
     fence_mbar_init();
@@ -653,7 +664,15 @@ q38_fn_moe_tp4(const __grid_constant__ CUtensorMap tm13,
   if (warp == 1 && lane == 0) {
     prefetch_tmap(&tm13); prefetch_tmap(&tm13tail); prefetch_tmap(&tm2); prefetch_tmap(&tmx);
   }
+  if (warp == 2) {
+    if (lane == 0) stamp(p, 16);
+    tmem_alloc(&s.tmem, 512);
+    if (lane == 0) stamp(p, 17);
+    tmem_relinquish(); tc_fence_before();
+  }
   __syncthreads();
+  tc_fence_after();
+  const uint32_t tm = s.tmem;
   cluster_arrive();
   cluster_wait();
   asm volatile("griddepcontrol.wait;" ::: "memory");
@@ -686,18 +705,24 @@ q38_fn_moe_tp4(const __grid_constant__ CUtensorMap tm13,
     __syncthreads();
     if (warp == 0) {
       uint32_t* unique = &s.cand[0][0];
+      uint32_t* seen = &s.cand[7][0];  // 512-bit set, disjoint from <=70 unique ordinals
+      if (lane < 16) seen[lane] = 0;
+      __syncwarp();
       int total = 0;
       for (int base = 0; base < p.num_tokens * kTopK; base += 32) {
         const int i = base + lane;
-        bool first = i < p.num_tokens * kTopK;
+        const bool valid = i < p.num_tokens * kTopK;
+        const uint32_t expert = valid ? (uint32_t)s.ids[i / kTopK][i % kTopK] : 512u;
+        const uint32_t matches = __match_any_sync(0xffffffffu, expert);
+        bool first = valid && lane == __ffs(matches) - 1;
         if (first) {
-          const int expert = s.ids[i / kTopK][i % kTopK];
-          for (int j = 0; j < i; ++j)
-            if (s.ids[j / kTopK][j % kTopK] == expert) first = false;
+          const uint32_t bit = 1u << (expert & 31);
+          first = (atomicOr(seen + expert / 32, bit) & bit) == 0;
         }
         const uint32_t mask = __ballot_sync(0xffffffffu, first);
         if (first) unique[total + __popc(mask & ((1u << lane) - 1u))] = i;
         total += __popc(mask);
+        __syncwarp();  // all bits from this ordered chunk precede the next chunk
       }
       if (lane == 0) s.expert = total;
     }
@@ -718,21 +743,16 @@ q38_fn_moe_tp4(const __grid_constant__ CUtensorMap tm13,
     if (p.trace) { p.trace[blockIdx.x * 32 + 30] = num_unique; p.trace[blockIdx.x * 32 + 31] = pair < num_unique ? 2 : 0; }
   }
   if (pair >= num_unique) {
-    // No TMEM, expert TMA or X TMA was issued by an inactive cluster. Join
-    // the metadata DSMEM transfer before the source CTA may retire.
+    // No expert/X loads from inactive clusters. Metadata DSMEM completes
+    // before either peer retires; release the early TMEM allocation as well.
     cluster_arrive_relaxed(); cluster_wait();
-    if (threadIdx.x == 0) stamp(p, 24);
+    if (warp == 2) {
+      if (lane == 0) stamp(p, 23);
+      tmem_dealloc(tm, 512);
+      if (lane == 0) stamp(p, 24);
+    }
     return;
   }
-  if (warp == 2) {
-    if (lane == 0) stamp(p, 16);
-    tmem_alloc(&s.tmem, 512);
-    if (lane == 0) stamp(p, 17);
-    tmem_relinquish(); tc_fence_before();
-  }
-  __syncthreads();
-  tc_fence_after();
-  const uint32_t tm = s.tmem;
   auto issue_stage = [&](int st, int e, uint64_t pol) {
     const int b = st % kStages;
     // Shape-only tail: FC2 has three K64 SF atoms, while the TMA box
@@ -757,13 +777,7 @@ q38_fn_moe_tp4(const __grid_constant__ CUtensorMap tm13,
   };
   for (int task = pair; task < num_unique; task += Q38_FN_CLUSTERS) {
     if (threadIdx.x == 0) {
-      for (int i = 0; i < kStages; ++i) {
-        mbar_init(&s.full[i], 1); mbar_init(&s.empty[i], 1); mbar_init(&s.sf_full[i], 4);
-      }
-      mbar_init(&s.x_full, 1); mbar_init(&s.fc1_done, 1);
-      mbar_init(&s.h_peer, 1); mbar_init(&s.h_ready, 4); mbar_init(&s.fc2_done, 1);
-      mbar_expect_tx(&s.h_peer, 24 * 16 + 16 * 4);
-      fence_mbar_init();
+      if (task != pair) init_task_smem(s);
       const int ordinal = (&s.cand[0][0])[task];
       s.expert = s.ids[ordinal / kTopK][ordinal % kTopK];
       if (p.trace) p.trace[blockIdx.x * 32 + 26] = task / Q38_FN_CLUSTERS + 1;
@@ -783,7 +797,9 @@ q38_fn_moe_tp4(const __grid_constant__ CUtensorMap tm13,
       if (lane == 0) s.tokmask = mask;
     }
     __syncthreads();
-    cluster_arrive(); cluster_wait();
+    // First task's barriers were initialized before routing and the initial
+    // cluster rendezvous. Later tasks reset after the prior DSMEM completion.
+    if (task != pair) { cluster_arrive(); cluster_wait(); }
     if (warp == 3 && lane == 0) {
       mbar_expect_tx(&s.x_full, (kH / 256) * 1024 + p.num_tokens * (kH / 16));
 #pragma unroll

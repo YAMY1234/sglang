@@ -107,8 +107,8 @@ def _fn_v2_bundle(device_index):
     assert manifest['source_sha256'] == hashlib.sha256(source.read_bytes()).hexdigest()
     assert manifest['base_manifest_sha256'] == hashlib.sha256(
         (Path(os.environ['SGLANG_Q38C_MK_MOE_AOT']) / 'manifest.json').read_bytes()).hexdigest()
-    variant = manifest['variants']['fn32s5']
-    assert variant['grid'] == 64 and variant['shared'] == SHARED and variant['pdl_trigger'] == 0
+    variant = manifest['variants']['fn40s5']
+    assert variant['grid'] == 80 and variant['shared'] == SHARED and variant['pdl_trigger'] == 0
     cubin = root / variant['cubin']
     assert variant['sha256'] == hashlib.sha256(cubin.read_bytes()).hexdigest()
     return (jit.load(cubin.read_bytes(), 'q38_fn_moe_tp4', (THREADS, 1, 1), SHARED),
@@ -126,7 +126,7 @@ def run_fn(kernel, tensor_maps, logits, weights, ids, xsf, layer, out):
                layer['gemm2_weights_scale'], layer['output1_scale_gate_scalar'],
                layer['output1_scale_scalar'], layer['output2_scale_scalar'], out)
     params = Params(*(t.data_ptr() for t in tensors), 0, logits.shape[0])
-    jit.launch(kernel, (64, 1, 1), [*tensor_maps, params],
+    jit.launch(kernel, (20 if logits.shape[0] == 1 else 80, 1, 1), [*tensor_maps, params],
                torch.cuda.current_stream().cuda_stream, cluster=(CLUSTER, 1, 1))
 
 
@@ -196,7 +196,7 @@ def maybe_run_service(kwargs):
     if signature not in _seen:
         _seen.add(signature)
         logger.info('Q38C_MK_MOE_ACTIVE M=%d I=192 capture=%s finalize=%s grid=%d cluster=2 sf_pack=%s fn_v2=%s',
-                    m, capturing, kwargs['do_finalize'], 64 if fn_v2 else GRID, sf_pack, fn_v2)
+                    m, capturing, kwargs['do_finalize'], (20 if m == 1 else 80) if fn_v2 else GRID, sf_pack, fn_v2)
     if not kwargs['do_finalize']:
         return rows.view(m * TOPK, H), weights, permutation
     output = kwargs.get('output')
