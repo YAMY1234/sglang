@@ -18,6 +18,7 @@ H, I, E, TOPK, MAX_M = 2560, 192, 512, 10, 7
 GRID, CLUSTER, THREADS, SHARED = 140, 2, 256, 216064
 logger = logging.getLogger(__name__)
 _seen = set()
+_MOE_PDL = os.environ.get('SGLANG_Q38C_MOE_PDL', '0') == '1'
 
 
 class Params(ctypes.Structure):
@@ -55,16 +56,23 @@ def run(kernel, tensor_maps, logits, weights, ids, xsf, layer, out):
 
 
 @cache
-def _bundle(device_index):
+def _bundle(device_index, use_pdl=False):
     """Load CPU-built artifacts once; content hashes reject stale source/binaries."""
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError('Q38 MK MoE AOT bundle must load during eager graph warmup')
-    root = Path(os.environ['SGLANG_Q38C_MK_MOE_AOT'])
+    root = Path(os.environ['SGLANG_Q38C_MOE_PDL_AOT'] if use_pdl
+                else os.environ['SGLANG_Q38C_MK_MOE_AOT'])
     manifest = json.loads((root / 'manifest.json').read_text())
     source = Path(__file__).resolve().parents[2] / 'jit/csrc/moe/q38_mk_moe_q35_tp4.cu'
     finalize_source = Path(__file__).with_name('q38_mk_finalize.py')
     assert manifest['source_sha256'] == hashlib.sha256(source.read_bytes()).hexdigest()
     assert manifest['finalize_source_sha256'] == hashlib.sha256(finalize_source.read_bytes()).hexdigest()
+    if use_pdl:
+        pdl_source = Path(__file__).with_name('q38_mk_finalize_pdl.py')
+        assert manifest['finalize_pdl_source_sha256'] == hashlib.sha256(pdl_source.read_bytes()).hexdigest()
+        assert manifest['pdl_trigger'] == 1 and manifest['finalize']['use_pdl'] is True
+    else:
+        assert manifest.get('pdl_trigger', 0) == 0
     assert manifest['shape'] == [H, I, E, TOPK, GRID, CLUSTER, SHARED]
     assert torch.cuda.get_device_capability(device_index) == (10, 3)
     for name in ('q35-port.cubin', 'finalize.cubin'):
@@ -77,7 +85,7 @@ def _bundle(device_index):
 
 
 def _finalize(kernel, metadata, rows, weights, output):
-    # Same MTP ordered body, ordinary stream launch: it has no PDL wait.
+    # Ordinary and PDL cubins preserve the same MTP ordered arithmetic.
     cu = jit.driver()
     values = [ctypes.c_void_p(t.data_ptr()) for t in (rows, weights, output)]
     values += [ctypes.c_void_p(0) for _ in range(metadata['params'] - 3)]
@@ -87,7 +95,13 @@ def _finalize(kernel, metadata, rows, weights, output):
     config.blockDimX, config.blockDimY, config.blockDimZ = 128, 1, 1
     config.sharedMemBytes = metadata['shared']
     config.hStream = cu.CUstream(torch.cuda.current_stream().cuda_stream)
-    config.attrs, config.numAttrs = [], 0
+    if metadata.get('use_pdl', False):
+        attr = cu.CUlaunchAttribute()
+        attr.id = cu.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION
+        attr.value.programmaticStreamSerializationAllowed = 1
+        config.attrs, config.numAttrs = [attr], 1
+    else:
+        config.attrs, config.numAttrs = [], 0
     jit.check(cu.cuLaunchKernelEx(config, kernel.function, ctypes.addressof(pointers), 0),
               'Q38 ordered local MoE finalize')
 
@@ -103,7 +117,8 @@ def maybe_run_service(kwargs):
     """Native FI-compatible local output; native shared, AR and HC remain outside.
 
     Deferred mode exposes complete BF16 expert rows with identity permutation to
-    the existing consumer. No expert partial publishes readiness; PDL_TRIGGER=0.
+    the existing consumer, retaining PDL_TRIGGER=0 in deferred mode. The optional
+    ordinary-finalize pair uses trigger1 with its matching waiting consumer.
     Fresh outputs follow the original Q35 ownership through capture and replay.
     """
     xq = kwargs['hidden_states']
@@ -120,7 +135,10 @@ def maybe_run_service(kwargs):
             or kwargs['gemm1_alpha'] is not None or kwargs['gemm1_beta'] is not None
             or kwargs['gemm1_clamp_limit'] is not None):
         return None
-    kernel, finalize_kernel, final_metadata = _bundle(xq.device.index)
+    # Deferred consumers retain the qualified trigger0 kernel and original ABI.
+    # Only the paired ordinary finalize has the wait required by an early MKM.
+    use_pdl = _MOE_PDL and bool(kwargs['do_finalize'])
+    kernel, finalize_kernel, final_metadata = _bundle(xq.device.index, use_pdl)
     layer = dict(gemm1_weights=kwargs['gemm1_weights'], gemm2_weights=kwargs['gemm2_weights'],
                  gemm1_weights_scale=kwargs['gemm1_weights_scale'], gemm2_weights_scale=kwargs['gemm2_weights_scale'],
                  output1_scale_gate_scalar=kwargs['output1_scale_gate_scalar'],
@@ -143,4 +161,7 @@ def maybe_run_service(kwargs):
     if output is None:
         output = torch.empty((m, H), dtype=torch.bfloat16, device=xq.device)
     _finalize(finalize_kernel, final_metadata, rows, weights, output)
+    if use_pdl and ('pdl', m, capturing) not in _seen:
+        _seen.add(('pdl', m, capturing))
+        logger.info('Q38C_MOE_PDL_ACTIVE M=%d capture=%s trigger=1 finalize_wait=1', m, capturing)
     return (output,)
