@@ -161,7 +161,7 @@ __launch_bounds__(160) void hc_combine_norm_decode_kernel(const HcCombineNormDec
 
 // One row is genuinely partitioned over two CTAs, preserving the five stock
 // warp input slices and both stock BF16 materialization boundaries.
-template <bool kShared>
+template <bool kShared, int kNormPrefetch = 0>
 __global__ __launch_bounds__(96)
 void hc_combine_norm_decode_kernel_cluster2(const HcCombineNormDecodeParams __grid_constant__ params) {
   using namespace device;
@@ -186,6 +186,15 @@ void hc_combine_norm_decode_kernel_cluster2(const HcCombineNormDecodeParams __gr
   // Keep the existing early dependent trigger. Establish all DSMEM lifetimes
   // before any remote store, while the original producer may still be running.
   PDLTriggerSecondary<true>();
+  Storage weight_values;
+  if constexpr (kNormPrefetch == 1) {
+    if (active) weight_values = gmem.load(params.weight + branch * 2560);
+  } else if constexpr (kNormPrefetch == 2) {
+    if (active && lane % 4 == 0) {
+      const auto* addr = params.weight + branch * 2560 + original_tid * 16;
+      asm volatile("prefetch.global.L2 [%0];" :: "l"(addr) : "memory");
+    }
+  }
   cluster.sync();
   PDLWaitPrimary<true>();
   float total = 0.0f;
@@ -193,11 +202,12 @@ void hc_combine_norm_decode_kernel_cluster2(const HcCombineNormDecodeParams __gr
   for (uint32_t split = 0; split < 8; ++split)
     total += params.partials[(row * 8 + split) * 4 + branch];
   const float gate = 2.0f / (1.0f + math::exp(-total / 4));
-  Storage residual_values, block_values, weight_values, gated_block;
+  Storage residual_values, block_values, gated_block;
   if (active) {
     residual_values = gmem.load(params.residual + (row * 4 + branch) * 2560);
     block_values = gmem.load(params.block + row * 2560);
-    weight_values = gmem.load(params.weight + branch * 2560);
+    if constexpr (kNormPrefetch != 1)
+      weight_values = gmem.load(params.weight + branch * 2560);
     gated_block = block_values;
   }
   if constexpr (kShared) {
@@ -276,7 +286,7 @@ void hc_combine_norm_decode_kernel_cluster2(const HcCombineNormDecodeParams __gr
   }
 }
 
-template <int kParts, bool kClusterM4Only = false>
+template <int kParts, bool kClusterM4Only = false, int kNormPrefetch = 0>
 struct HcCombineNormDecode {
   static void
   run(tvm::ffi::TensorView block,
@@ -311,7 +321,7 @@ struct HcCombineNormDecode {
     // Gate on actual tensor rows, including overlapping AgentX requests.
     if (!kClusterM4Only || m.unwrap() == 4) {
       LaunchKernel(m.unwrap() * 4 * 2, 96, dev.unwrap())
-          .config({.use_pdl = true, .cluster_dim = dim3{2, 1, 1}})(hc_combine_norm_decode_kernel_cluster2<false>, p);
+          .config({.use_pdl = true, .cluster_dim = dim3{2, 1, 1}})(hc_combine_norm_decode_kernel_cluster2<false, kNormPrefetch>, p);
     } else {
       LaunchKernel(m.unwrap() * 4 * kParts, 160, dev.unwrap())
           .enable_pdl(true)(hc_combine_norm_decode_kernel<kParts>, p);
