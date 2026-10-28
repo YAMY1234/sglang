@@ -80,6 +80,27 @@ class TestShardedPolicy(CustomTestCase):
         self.assertFalse(self._applies(greedy=False, top_k=True))
 
 
+class TestShardedReducerContract(CustomTestCase):
+    def test_rejects_noncanonical_provider_keys_before_exchange(self):
+        group = SimpleNamespace(world_size=2)
+        with self.assertRaisesRegex(TypeError, "torch.int64"):
+            reduce_sharded_token_keys(torch.zeros(2), group, splits=1)
+        with self.assertRaisesRegex(ValueError, "contiguous"):
+            reduce_sharded_token_keys(
+                torch.arange(8, dtype=torch.int64).view(2, 4)[:, ::2],
+                group,
+                splits=2,
+            )
+        with self.assertRaisesRegex(ValueError, "one split"):
+            reduce_sharded_token_keys(
+                torch.zeros((2, 1), dtype=torch.int64), group, splits=1
+            )
+        with self.assertRaisesRegex(ValueError, "incompatible"):
+            reduce_sharded_token_keys(
+                torch.zeros(2, dtype=torch.int64), group, splits=2
+            )
+
+
 def _sharded_tokens(full, tp, split=False):
     width = -(-full.shape[1] // tp)
     splits = key_splits(width) if split else 1
@@ -165,10 +186,28 @@ class TestShardedGreedy(CustomTestCase):
         self.assertTrue(torch.equal(got, torch.argmax(full.float(), dim=-1)))
 
     def test_provider_keys_reuse_the_generic_exchange(self):
+        def encoded(score, token):
+            return (score << 32) | (0xFFFFFFFF - token)
+
         keys = torch.tensor(
-            [[11, 7], [5, 13], [3, 2]], dtype=torch.int64, device="cuda"
+            [
+                [encoded(10, 5), encoded(8, 1)],
+                [encoded(3, 7), encoded(11, 9)],
+                [encoded(6, 2), encoded(6, 4)],
+            ],
+            dtype=torch.int64,
+            device="cuda",
         )
-        gathered = torch.cat((keys.reshape(-1), (keys + 100).reshape(-1)))
+        other = torch.tensor(
+            [
+                [encoded(12, 30), encoded(7, 0)],
+                [encoded(10, 3), encoded(9, 2)],
+                [encoded(6, 1), encoded(4, 0)],
+            ],
+            dtype=torch.int64,
+            device="cuda",
+        )
+        gathered = torch.cat((keys.reshape(-1), other.reshape(-1)))
         group = SimpleNamespace(world_size=2)
         group.all_gather_into_tensor = lambda output, _input: output.copy_(gathered)
         with (
@@ -176,7 +215,7 @@ class TestShardedGreedy(CustomTestCase):
             patch.object(sharded_verify, "_mc_gather_keys", return_value=None),
         ):
             got = reduce_sharded_token_keys(keys, group, splits=2)
-        want = keys_to_tokens(gathered, tp_size=2, splits=2)
+        want = torch.tensor([30, 9, 1], dtype=torch.int64, device="cuda")
         self.assertTrue(torch.equal(got, want))
 
 

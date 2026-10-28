@@ -412,17 +412,24 @@ def reduce_sharded_token_keys(
 ) -> torch.Tensor:
     """Reduce provider-neutral local token keys to one global token per row.
 
-    ``keys`` has shape ``[rows, splits]`` (or ``[rows]`` for one split), with
-    larger int64 keys winning.  Runtime owns the LL/multimem/NCCL exchange while
-    callers own the numeric policy that produced each local key.
+    ``keys`` is contiguous int64 with shape ``[rows, splits]`` (or ``[rows]``
+    for one split). Larger keys win. Their high 32 bits encode a monotone score;
+    their low 32 bits are ``0xffffffff - global_token_id``, so ties pick the
+    smaller token exactly as ``torch.argmax`` does. Runtime owns the
+    LL/multimem/NCCL exchange while callers own the numeric policy that produced
+    each local key.
     """
     if splits <= 0:
         raise ValueError(f"splits must be positive, got {splits}")
-    if keys.ndim not in (1, 2) or (keys.ndim == 1 and splits != 1):
+    if keys.dtype != torch.int64:
+        raise TypeError(f"keys must have dtype torch.int64, got {keys.dtype}")
+    if not keys.is_contiguous():
+        raise ValueError("keys must be contiguous")
+    if splits == 1 and keys.ndim != 1:
         raise ValueError(
-            f"keys shape {tuple(keys.shape)} is incompatible with splits={splits}"
+            f"one split requires keys shape [rows], got {tuple(keys.shape)}"
         )
-    if keys.ndim == 2 and keys.shape[1] != splits:
+    if splits > 1 and (keys.ndim != 2 or keys.shape[1] != splits):
         raise ValueError(
             f"keys shape {tuple(keys.shape)} is incompatible with splits={splits}"
         )
