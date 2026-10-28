@@ -367,8 +367,10 @@ class TestPDDecRuntimeSwitch(CustomTestCase):
                     and isinstance(value.func.value.value, ast.Name)
                     and value.func.value.value.id == "envs"
                 }
-                if shared in reads:
-                    self.assertIn(component, reads, (relative, node.lineno))
+                # Other runtime sections share these files and the master switch.
+                # Count this component's five readers without gating ARRIVE.
+                if component in reads:
+                    self.assertIn(shared, reads, (relative, node.lineno))
                     self.assertIsInstance(node.op, ast.And)
                     predicates.append(
                         (relative, compile(ast.Expression(node), relative, "eval"))
