@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 
 from sglang.srt.speculative.prepared_next_draft import (
-    nvidia_eagle_decode_fast_path_enabled,
+    prepared_next_draft_enabled,
 )
 from sglang.srt.utils.common import async_d2h, is_pin_memory_available
 
@@ -20,7 +20,7 @@ _host_tensor_rings: dict[tuple, list] = {}
 
 
 def enabled() -> bool:
-    return nvidia_eagle_decode_fast_path_enabled()
+    return prepared_next_draft_enabled()
 
 
 def wait_stream(waiting_stream, source_stream) -> None:

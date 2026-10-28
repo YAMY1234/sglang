@@ -42,6 +42,13 @@ def _descriptor(name: str, num_entries: int):
     return entry
 
 
+def _same_cuda_device(anchor: torch.Tensor, *others: torch.Tensor | None) -> bool:
+    """Raw pointers below are launched on ``anchor``'s CUDA device."""
+    return anchor.is_cuda and all(
+        tensor is None or tensor.device == anchor.device for tensor in others
+    )
+
+
 def chain_tree(
     *,
     bonus,
@@ -56,17 +63,67 @@ def chain_tree(
     out_cache_loc,
     mrope,
 ) -> bool:
-    if not _is_cuda or not _runtime_optimization_enabled() or not (
-        bonus.is_cuda
+    if not _is_cuda or not _runtime_optimization_enabled():
+        return False
+    required = (bonus, draft, seq, mask, positions, retrieve, tokens)
+    if not all(isinstance(tensor, torch.Tensor) for tensor in required):
+        return False
+    cache_tensors = (req, table, out_cache_loc)
+    if any(tensor is None for tensor in cache_tensors) != all(
+        tensor is None for tensor in cache_tensors
+    ):
+        return False
+    optional = cache_tensors + (mrope,)
+    if not all(
+        tensor is None or isinstance(tensor, torch.Tensor) for tensor in optional
+    ) or not _same_cuda_device(seq, *required, *optional):
+        return False
+    if draft.ndim != 2:
+        return False
+    batch_size, depth = draft.shape
+    width = depth + 1
+    num_tokens = batch_size * width
+    if not (
+        bonus.ndim == seq.ndim == 1
+        and bonus.numel() == seq.numel() == batch_size
         and bonus.dtype in _INDEX_DTYPES
         and draft.dtype in _INDEX_DTYPES
         and seq.dtype in _INDEX_DTYPES
+        and mask.dtype is torch.bool
+        and mask.is_contiguous()
+        and mask.numel() >= batch_size * width * width
+        and positions.dtype is torch.int64
+        and positions.is_contiguous()
+        and positions.shape == (num_tokens,)
+        and retrieve.dtype is torch.int64
+        and retrieve.is_contiguous()
+        and retrieve.shape == (3, batch_size, width)
         and tokens.dtype in _INDEX_DTYPES
-        and (req is None or req.dtype in _INDEX_DTYPES)
-        and (table is None or table.dtype in _INDEX_DTYPES)
+        and tokens.is_contiguous()
+        and tokens.shape == (num_tokens,)
+        and (
+            req is None
+            or (
+                req.ndim == 1
+                and req.numel() == batch_size
+                and req.dtype in _INDEX_DTYPES
+                and table.ndim == 2
+                and table.dtype in _INDEX_DTYPES
+                and out_cache_loc.dtype is torch.int64
+                and out_cache_loc.is_contiguous()
+                and out_cache_loc.shape == (num_tokens,)
+            )
+        )
+        and (
+            mrope is None
+            or (
+                mrope.dtype is torch.int64
+                and mrope.is_contiguous()
+                and mrope.shape == (3, num_tokens)
+            )
+        )
     ):
         return False
-    batch_size, depth = draft.shape
     descriptor, values = _descriptor("chain_tree", 27)
     values[0] = bonus.data_ptr()
     values[1] = draft.data_ptr()
@@ -93,7 +150,7 @@ def chain_tree(
     values[22] = table.stride(0) if table is not None else 0
     values[23] = table.stride(1) if table is not None else 0
     values[24] = batch_size
-    values[25] = depth + 1
+    values[25] = width
     values[26] = (table is not None) | ((mrope is not None) << 1)
     _module().chain_tree(seq, descriptor)
     return True
@@ -102,11 +159,44 @@ def chain_tree(
 def extend_layout(
     *, seq, width, prefix, extend, post, positions, starts, mrope
 ) -> bool:
-    if (
-        not _is_cuda
-        or not _runtime_optimization_enabled()
-        or not seq.is_cuda
-        or seq.dtype not in _INDEX_DTYPES
+    if not _is_cuda or not _runtime_optimization_enabled():
+        return False
+    required = (seq, prefix, extend, post, positions, starts)
+    if not all(isinstance(tensor, torch.Tensor) for tensor in required) or not (
+        mrope is None or isinstance(mrope, torch.Tensor)
+    ):
+        return False
+    if not _same_cuda_device(seq, *required, mrope) or not (
+        isinstance(width, int) and width > 0 and seq.ndim == 1
+    ):
+        return False
+    batch_size = seq.numel()
+    num_tokens = batch_size * width
+    if not (
+        seq.dtype in _INDEX_DTYPES
+        and prefix.dtype is torch.int32
+        and prefix.is_contiguous()
+        and prefix.shape == (batch_size,)
+        and extend.dtype is torch.int32
+        and extend.is_contiguous()
+        and extend.shape == (batch_size,)
+        and post.dtype is seq.dtype
+        and post.is_contiguous()
+        and post.shape == (batch_size,)
+        and positions.dtype is torch.int64
+        and positions.is_contiguous()
+        and positions.shape == (num_tokens,)
+        and starts.dtype is torch.int32
+        and starts.is_contiguous()
+        and starts.shape == (batch_size,)
+        and (
+            mrope is None
+            or (
+                mrope.dtype is torch.int64
+                and mrope.is_contiguous()
+                and mrope.shape == (3, num_tokens)
+            )
+        )
     ):
         return False
     descriptor, values = _descriptor("extend_layout", 13)
@@ -120,7 +210,7 @@ def extend_layout(
     values[7] = seq.dtype is torch.int64
     values[8] = seq.stride(0)
     values[9] = post.dtype is torch.int64
-    values[10] = seq.numel()
+    values[10] = batch_size
     values[11] = width
     values[12] = mrope is not None
     _module().extend_layout(seq, descriptor)
@@ -140,16 +230,58 @@ def draft_locs(
     positions,
     mrope,
 ) -> bool:
-    if not _is_cuda or not _runtime_optimization_enabled() or not (
-        req.is_cuda
-        and req.dtype in _INDEX_DTYPES
-        and table.dtype in _INDEX_DTYPES
-        and seq.dtype in _INDEX_DTYPES
-        and out_cache_loc.dtype is torch.int64
-        and (positions is None or positions.dtype in _INDEX_DTYPES)
-        and (mrope is None or mrope.dtype in _INDEX_DTYPES)
+    if not _is_cuda or not _runtime_optimization_enabled():
+        return False
+    required = (req, table, seq, out_cache_loc)
+    optional = (positions, mrope)
+    if not all(isinstance(tensor, torch.Tensor) for tensor in required) or not all(
+        tensor is None or isinstance(tensor, torch.Tensor) for tensor in optional
+    ):
+        return False
+    if not _same_cuda_device(seq, *required, *optional) or not (
+        isinstance(pool_len, int)
+        and isinstance(topk, int)
+        and isinstance(steps, int)
+        and isinstance(batch_size, int)
+        and pool_len > 0
+        and topk > 0
+        and steps > 0
+        and batch_size >= 0
+    ):
+        return False
+    num_positions = batch_size * topk
+    num_cache_locs = num_positions * steps
+    if not (
+        req.dtype in _INDEX_DTYPES
         and req.is_contiguous()
+        and req.shape == (batch_size,)
+        and table.dtype in _INDEX_DTYPES
+        and table.ndim == 2
+        and table.is_contiguous()
+        and table.shape[1] == pool_len
+        and seq.dtype in _INDEX_DTYPES
         and seq.is_contiguous()
+        and seq.shape == (batch_size,)
+        and out_cache_loc.dtype is torch.int64
+        and out_cache_loc.is_contiguous()
+        and out_cache_loc.shape == (num_cache_locs,)
+        and (
+            positions is None
+            or (
+                positions.dtype in _INDEX_DTYPES
+                and positions.is_contiguous()
+                and positions.shape == (num_positions,)
+            )
+        )
+        and (
+            mrope is None
+            or (
+                positions is not None
+                and mrope.dtype in _INDEX_DTYPES
+                and mrope.is_contiguous()
+                and mrope.shape == (3, num_positions)
+            )
+        )
     ):
         return False
     descriptor, values = _descriptor("draft_locs", 17)

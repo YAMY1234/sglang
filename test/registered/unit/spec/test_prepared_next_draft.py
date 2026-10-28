@@ -22,6 +22,7 @@ from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
 from sglang.srt.speculative.prepared_next_draft import (
     NextDraftInputStager,
     PreparedNextDraftInputs,
+    PreparedNextDraftProducer,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -52,13 +53,28 @@ def _batch(slots, allocated, *, mode=ForwardMode.DECODE):
             for slot, alloc in zip(slots, allocated, strict=True)
         ],
         forward_mode=mode,
+        multimodal_inputs=[None] * len(slots),
+    )
+
+
+def _pool(size: int = 32):
+    return SimpleNamespace(req_generation=torch.ones(size, dtype=torch.int64))
+
+
+def _stager(pool=None, *, graph_sizes=(2, 4), with_mrope=False):
+    return NextDraftInputStager(
+        req_to_token_pool=_pool() if pool is None else pool,
+        window_size=7,
+        graph_sizes=graph_sizes,
+        with_mrope=with_mrope,
     )
 
 
 def _prepared(num_requests: int = 2) -> PreparedNextDraftInputs:
     return PreparedNextDraftInputs(
         num_requests=num_requests,
-        seq_lens=torch.zeros(num_requests, dtype=torch.int64),
+        runner_request_pool_indices=torch.zeros(num_requests, dtype=torch.int64),
+        runner_sequence_lengths=torch.zeros(num_requests, dtype=torch.int64),
         positions=torch.zeros(num_requests, dtype=torch.int64),
         mrope_positions=None,
         draft_out_cache_loc=torch.zeros(num_requests * 6, dtype=torch.int64),
@@ -88,14 +104,18 @@ class TestPreparedNextDraft(CustomTestCase):
     def test_inputs_survive_the_length_read_and_are_consumed_once(self):
         """The scheduler may read prepared lengths before the worker consumes the
         matching buffers; reordered, padded, or under-reserved batches must decline."""
-        stager = NextDraftInputStager(window_size=7, graph_sizes=[2, 4])
+        pool = _pool()
+        stager = _stager(pool)
         inputs = _prepared()
         seq_lens = torch.tensor([104, 105])
         batch = _batch([5, 9], [121, 121])
 
         stager.note_decode(batch, prepared=inputs, new_seq_lens=seq_lens)
-        self.assertIs(stager.take_seq_lens(batch), seq_lens)
-        self.assertIs(stager.take_seq_lens(batch), seq_lens)
+        self.assertIs(stager.take_scheduler_sequence_lengths(batch), seq_lens)
+        # Freshness is resolved exactly once; scheduler rereads and the worker
+        # consume the same lease, rather than independently rebinding it.
+        pool.req_generation[5] += 1
+        self.assertIs(stager.take_scheduler_sequence_lengths(batch), seq_lens)
         self.assertIs(stager.take_inputs(batch), inputs)
         self.assertIsNone(stager.take_inputs(batch))
 
@@ -106,13 +126,48 @@ class TestPreparedNextDraft(CustomTestCase):
         ):
             with self.subTest(slots=[req.kv.req_pool_idx for req in current.reqs]):
                 stager.note_decode(previous, prepared=inputs, new_seq_lens=seq_lens)
-                self.assertIsNone(stager.take_seq_lens(current))
+                self.assertIsNone(stager.take_scheduler_sequence_lengths(current))
                 self.assertIsNone(stager.take_inputs(current))
+
+    def test_generation_reuse_and_sequence_alias_fail_closed(self):
+        """The same row after free/realloc is an ABA miss, and the scheduler's
+        accepted lengths may never alias the draft runner's static input."""
+        pool = _pool()
+        stager = _stager(pool)
+        batch = _batch([5, 9], [121, 121])
+        prepared = _prepared()
+        scheduler_sequence_lengths = torch.tensor([104, 105])
+
+        stager.note_decode(
+            batch,
+            prepared=prepared,
+            new_seq_lens=scheduler_sequence_lengths,
+        )
+        pool.req_generation[9] += 1
+        self.assertIsNone(stager.take_scheduler_sequence_lengths(batch))
+        self.assertIsNone(stager.take_inputs(batch))
+
+        stager.note_decode(
+            batch,
+            prepared=prepared,
+            new_seq_lens=prepared.runner_sequence_lengths,
+        )
+        self.assertIsNone(stager.take_scheduler_sequence_lengths(batch))
+        self.assertIsNone(stager.take_inputs(batch))
+
+        stager.note_decode(
+            batch,
+            prepared=prepared,
+            new_seq_lens=scheduler_sequence_lengths,
+        )
+        batch.reqs[0].kv.kv_allocated_len -= 1
+        self.assertIsNone(stager.take_scheduler_sequence_lengths(batch))
+        self.assertIsNone(stager.take_inputs(batch))
 
     def test_only_decode_can_take_prepared_lengths(self):
         """A prefill reusing the same request slots cannot consume decode lengths."""
         worker = EAGLEWorkerV2.__new__(EAGLEWorkerV2)
-        worker._next_draft_stager = NextDraftInputStager(window_size=7, graph_sizes=[2])
+        worker._next_draft_stager = _stager(graph_sizes=(2,))
         seq_lens = torch.tensor([104, 105])
         decode = _batch([5, 9], [121, 121])
         worker._next_draft_stager.note_decode(
@@ -121,6 +176,180 @@ class TestPreparedNextDraft(CustomTestCase):
         self.assertIs(worker.take_prepared_seq_lens(decode), seq_lens)
         decode.forward_mode = ForwardMode.EXTEND
         self.assertIsNone(worker.take_prepared_seq_lens(decode))
+
+    def test_adaptive_states_keep_prepared_next_disabled(self):
+        """Adaptive transitions replace runner buffers, so their rounds stay stock."""
+        worker = EAGLEWorkerV2.__new__(EAGLEWorkerV2)
+        worker._draft_worker = object()
+        worker.adaptive_controller = object()
+        worker._next_draft_stager = None
+
+        worker._init_prepared_next_draft_inputs()
+
+        self.assertIsNone(worker._next_draft_stager)
+
+    def test_graph_and_eager_use_one_mapping_and_eager_reuses_a_ring(self):
+        """Captured and eager misses bind the same six runner outputs; eager
+        rounds reuse two write windows without overwriting the preceding one."""
+        runner_buffers = SimpleNamespace(
+            req_pool_indices=torch.zeros(4, dtype=torch.int64),
+            seq_lens=torch.zeros(4, dtype=torch.int64),
+            positions=torch.zeros(4, dtype=torch.int64),
+            mrope_positions=torch.zeros((3, 4), dtype=torch.int64),
+            out_cache_loc=torch.zeros(24, dtype=torch.int64),
+        )
+        token_map = torch.zeros((16, 128), dtype=torch.int32)
+        producer = PreparedNextDraftProducer(
+            num_steps=6,
+            window_size=7,
+            seq_len_fill_value=1,
+            with_mrope=False,
+            req_to_token=token_map,
+            runner_buffers=runner_buffers,
+            capture_sizes=(2,),
+        )
+        request_indices = torch.tensor([5, 9])
+        scheduler_sequence_lengths = torch.tensor([104, 105])
+        graph_inputs = producer.allocate(num_requests=2, device="cpu")
+
+        def publish(prepared, **_):
+            return prepared
+
+        with patch(
+            "sglang.srt.speculative.prepared_next_draft.prepare_next_draft_inputs",
+            side_effect=publish,
+        ) as prepare:
+            graph = producer.prepare(
+                graph_inputs,
+                req_pool_indices=request_indices,
+                scheduler_sequence_lengths=scheduler_sequence_lengths,
+            )
+            eager0 = producer.prepare_eager(
+                req_pool_indices=request_indices,
+                scheduler_sequence_lengths=scheduler_sequence_lengths,
+            )
+            eager1 = producer.prepare_eager(
+                req_pool_indices=request_indices,
+                scheduler_sequence_lengths=scheduler_sequence_lengths,
+            )
+            eager2 = producer.prepare_eager(
+                req_pool_indices=request_indices,
+                scheduler_sequence_lengths=scheduler_sequence_lengths,
+            )
+
+        self.assertEqual(prepare.call_count, 4)
+        for call in prepare.call_args_list:
+            self.assertIs(call.kwargs["req_pool_indices"], request_indices)
+            self.assertIs(call.kwargs["new_seq_lens"], scheduler_sequence_lengths)
+            self.assertIs(call.kwargs["req_to_token"], token_map)
+            self.assertEqual(call.kwargs["num_steps"], 6)
+            self.assertEqual(call.kwargs["window_size"], 7)
+        for prepared in (graph, eager0, eager1, eager2):
+            self.assertEqual(
+                prepared.runner_request_pool_indices.data_ptr(),
+                runner_buffers.req_pool_indices.data_ptr(),
+            )
+            self.assertEqual(
+                prepared.runner_sequence_lengths.data_ptr(),
+                runner_buffers.seq_lens.data_ptr(),
+            )
+            self.assertNotEqual(
+                prepared.runner_sequence_lengths.data_ptr(),
+                scheduler_sequence_lengths.data_ptr(),
+            )
+        self.assertNotEqual(
+            eager0.write_window.data_ptr(), eager1.write_window.data_ptr()
+        )
+        self.assertEqual(eager0.write_window.data_ptr(), eager2.write_window.data_ptr())
+        self.assertIsNone(producer.allocate(num_requests=3, device="cpu"))
+
+    def test_eager_producer_rebinds_request_rows_after_a_draft_graph_miss(self):
+        """A prior eager draft leaves the graph runner's request-row buffer stale.
+        The eager post-verify producer must refresh it before publishing a lease."""
+        runner_buffers = SimpleNamespace(
+            req_pool_indices=torch.tensor([1, 2], dtype=torch.int64),
+            seq_lens=torch.zeros(2, dtype=torch.int64),
+            positions=torch.zeros(2, dtype=torch.int64),
+            mrope_positions=torch.zeros((3, 2), dtype=torch.int64),
+            out_cache_loc=torch.zeros(12, dtype=torch.int64),
+        )
+        producer = PreparedNextDraftProducer(
+            num_steps=6,
+            window_size=7,
+            seq_len_fill_value=1,
+            with_mrope=False,
+            req_to_token=torch.zeros((16, 128), dtype=torch.int32),
+            runner_buffers=runner_buffers,
+            capture_sizes=(2,),
+        )
+        request_indices = torch.tensor([5, 9], dtype=torch.int64)
+        scheduler_sequence_lengths = torch.tensor([104, 105], dtype=torch.int64)
+
+        def fake_prepare_draft_window(req_pool_indices, _seq_lens, _table, **kwargs):
+            kwargs["req_pool_indices_out"].copy_(req_pool_indices)
+
+        with (
+            patch(
+                "sglang.srt.speculative.prepared_next_draft."
+                "can_prepare_next_draft_inputs",
+                return_value=True,
+            ),
+            patch(
+                "sglang.kernels.ops.speculative.cache_locs.prepare_draft_window",
+                side_effect=fake_prepare_draft_window,
+            ) as kernel,
+        ):
+            prepared = producer.prepare_eager(
+                req_pool_indices=request_indices,
+                scheduler_sequence_lengths=scheduler_sequence_lengths,
+            )
+
+        kernel.assert_called_once()
+        self.assertIsNotNone(prepared)
+        self.assertEqual(
+            prepared.runner_request_pool_indices.data_ptr(),
+            runner_buffers.req_pool_indices.data_ptr(),
+        )
+        self.assertEqual(runner_buffers.req_pool_indices.tolist(), [5, 9])
+
+        stager = _stager(graph_sizes=(2,))
+        batch = _batch([5, 9], [121, 121])
+        stager.note_decode(
+            batch,
+            prepared=prepared,
+            new_seq_lens=scheduler_sequence_lengths,
+        )
+        self.assertIs(stager.take_inputs(batch), prepared)
+
+    def test_unsupported_producer_declines_before_the_kernel(self):
+        runner_buffers = SimpleNamespace(
+            req_pool_indices=torch.zeros(2, dtype=torch.int64),
+            seq_lens=torch.zeros(2, dtype=torch.int64),
+            positions=torch.zeros(2, dtype=torch.int64),
+            mrope_positions=torch.zeros((3, 2), dtype=torch.int64),
+            out_cache_loc=torch.zeros(12, dtype=torch.int64),
+        )
+        producer = PreparedNextDraftProducer(
+            num_steps=6,
+            window_size=7,
+            seq_len_fill_value=1,
+            with_mrope=False,
+            req_to_token=torch.zeros((16, 128), dtype=torch.int32),
+            runner_buffers=runner_buffers,
+            capture_sizes=(2,),
+        )
+        prepared = producer.allocate(num_requests=2, device="cpu")
+        with patch(
+            "sglang.kernels.ops.speculative.cache_locs.prepare_draft_window"
+        ) as kernel:
+            self.assertIsNone(
+                producer.prepare(
+                    prepared,
+                    req_pool_indices=torch.tensor([5, 9]),
+                    scheduler_sequence_lengths=torch.tensor([104, 105]),
+                )
+            )
+        kernel.assert_not_called()
 
     def test_fast_path_reserves_three_decode_windows(self):
         """Prepared inputs remain valid through the two overlap buffers plus the
@@ -137,7 +366,7 @@ class TestPreparedNextDraft(CustomTestCase):
             envs.SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.override(True),
             patch(
                 "sglang.srt.speculative.prepared_next_draft."
-                "nvidia_eagle_decode_fast_path_enabled",
+                "prepared_next_draft_enabled",
                 return_value=True,
             ),
         ):
@@ -155,7 +384,7 @@ class TestPreparedNextDraft(CustomTestCase):
             envs.SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.override(False),
             patch(
                 "sglang.srt.speculative.prepared_next_draft."
-                "nvidia_eagle_decode_fast_path_enabled",
+                "prepared_next_draft_enabled",
                 return_value=True,
             ),
         ):
@@ -172,7 +401,7 @@ class TestPreparedNextDraft(CustomTestCase):
             ),
             patch(
                 "sglang.srt.speculative.prepared_next_draft."
-                "nvidia_eagle_decode_fast_path_enabled",
+                "prepared_next_draft_enabled",
                 return_value=True,
             ),
         ):
@@ -239,7 +468,7 @@ class TestPreparedNextDraft(CustomTestCase):
                 ),
                 patch.object(
                     eagle_utils,
-                    "nvidia_eagle_decode_fast_path_enabled",
+                    "prepared_next_draft_enabled",
                     return_value=True,
                 ),
                 patch.object(

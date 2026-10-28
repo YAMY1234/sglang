@@ -128,6 +128,7 @@ def _prepare_draft_window_kernel(
     req_pool_indices,
     req_to_token,
     seq_lens,
+    req_pool_indices_out,
     seq_lens_out,
     positions,
     mrope,
@@ -139,6 +140,7 @@ def _prepare_draft_window_kernel(
     STEPS: tl.constexpr,
     WINDOW: tl.constexpr,
     BLOCK: tl.constexpr,
+    WRITE_REQ_POOL_INDICES: tl.constexpr,
     WRITE_SEQ_LENS: tl.constexpr,
     WRITE_POSITIONS: tl.constexpr,
     WRITE_MROPE: tl.constexpr,
@@ -161,6 +163,10 @@ def _prepare_draft_window_kernel(
     if WRITE_DRAFT:
         tl.store(draft_locs + row * STEPS + cols, locs, cols < STEPS)
     position = tl.where(valid, length, 0)
+    if WRITE_REQ_POOL_INDICES:
+        # Invalid/padded rows must point at the reserved sink row, matching the
+        # draft graph runner's ordinary padding path.
+        tl.store(req_pool_indices_out + row, tl.where(valid, req, 0))
     if WRITE_SEQ_LENS:
         tl.store(seq_lens_out + row, tl.where(valid, length, fill_seq_len))
     if WRITE_POSITIONS:
@@ -178,6 +184,7 @@ def prepare_draft_window(
     num_steps: int,
     window: int,
     seq_len_fill_value: int,
+    req_pool_indices_out: Optional[torch.Tensor] = None,
     seq_lens_out: Optional[torch.Tensor] = None,
     positions: Optional[torch.Tensor] = None,
     mrope: Optional[torch.Tensor] = None,
@@ -187,22 +194,31 @@ def prepare_draft_window(
     """The next draft's inputs and the iteration's write window in one launch over every
     row of ``req_pool_indices`` (a graph's static batch): ``write_virtual`` [rows * window]
     gets each row's ``window`` req_to_token slots from its length, ``draft_out_cache_loc``
-    [rows * num_steps] their first ``num_steps``, ``seq_lens_out`` / ``positions`` / the
-    three ``mrope`` rows (int64 [3, stride]) the length. Rows with a negative request,
-    a length <= 0 or a window past req_to_token's row are padding: ``seq_len_fill_value``
-    and zeros, nothing read. Same values as assign_draft_cache_locs_contiguous (topk 1)."""
+    [rows * num_steps] their first ``num_steps``; ``req_pool_indices_out`` gets the
+    request row; ``seq_lens_out`` / ``positions`` / the three ``mrope`` rows (int64
+    [3, stride]) get the length. Rows with a negative request, a length <= 0 or a
+    window past req_to_token's row are padding: request row 0,
+    ``seq_len_fill_value`` and zeros, nothing read. Same values as
+    assign_draft_cache_locs_contiguous (topk 1)."""
     rows = req_pool_indices.numel()
     if rows == 0:
         return
     assert num_steps <= window
     assert req_pool_indices.is_contiguous() and seq_lens.is_contiguous()
-    for t in (seq_lens_out, positions, draft_out_cache_loc, write_virtual):
+    for t in (
+        req_pool_indices_out,
+        seq_lens_out,
+        positions,
+        draft_out_cache_loc,
+        write_virtual,
+    ):
         assert t is None or (t.dtype == torch.int64 and t.is_contiguous())
     assert mrope is None or (mrope.dtype == torch.int64 and mrope.stride(1) == 1)
     _prepare_draft_window_kernel[(rows,)](
         req_pool_indices,
         req_to_token,
         seq_lens,
+        req_pool_indices_out,
         seq_lens_out,
         positions,
         mrope,
@@ -214,6 +230,7 @@ def prepare_draft_window(
         STEPS=num_steps,
         WINDOW=window,
         BLOCK=next_power_of_2(window),
+        WRITE_REQ_POOL_INDICES=req_pool_indices_out is not None,
         WRITE_SEQ_LENS=seq_lens_out is not None,
         WRITE_POSITIONS=positions is not None,
         WRITE_MROPE=mrope is not None,

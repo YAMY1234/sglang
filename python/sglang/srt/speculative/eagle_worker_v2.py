@@ -1468,12 +1468,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
             self._init_post_verify_graphs()
 
     def _init_prepared_next_draft_inputs(self) -> None:
-        """Connect compatible TP megakernel post-verify and draft graphs."""
+        """Connect compatible generic post-verify and draft runtime buffers."""
         if (
             self._draft_worker is None
-            or self._draft_worker.megakernel is None
-            or not prepared_next_draft.nvidia_eagle_decode_fast_path_enabled()
+            or self.adaptive_controller is not None
+            or not prepared_next_draft.prepared_next_draft_enabled()
             or self._post_verify_graphs is None
+            or self.speculative_num_steps <= 0
+            or self.speculative_num_steps >= self.speculative_num_draft_tokens
         ):
             return
         draft_runner = self._draft_worker.cuda_graph_runner
@@ -1485,8 +1487,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
         ):
             return
         self._next_draft_stager = NextDraftInputStager(
+            req_to_token_pool=self.req_to_token_pool,
             window_size=self.speculative_num_draft_tokens,
             graph_sizes=draft_runner.capture_bs,
+            with_mrope=self._draft_worker.draft_runner.model_config.model_is_mrope,
         )
         self._post_verify_graphs.enable_prepared_next_draft(
             num_steps=self.speculative_num_steps,
@@ -1495,12 +1499,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
             mrope=self._draft_worker.draft_runner.model_config.model_is_mrope,
             req_to_token=self.req_to_token_pool.req_to_token,
             runner_buffers=draft_runner.buffers,
+            capture_sizes=draft_runner.capture_bs,
         )
 
     def take_prepared_seq_lens(self, batch: ScheduleBatch) -> Optional[torch.Tensor]:
         if self._next_draft_stager is None or not batch.forward_mode.is_decode():
             return None
-        return self._next_draft_stager.take_seq_lens(batch)
+        return self._next_draft_stager.take_scheduler_sequence_lengths(batch)
 
     def _init_post_verify_graphs(self) -> None:
         # A key is captured at its first rounds, which attention-DP ranks do not reach
@@ -1583,6 +1588,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     )
         else:
             self.activate_step_by_batch(batch.seq_lens.shape[0])
+            stage_prepared_next = False
 
             if batch.spec_info is None:
                 capture_mode = (
@@ -1615,6 +1621,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 # runs, keeping draft KV warm for when the batch shrinks.
                 verify_input = self._build_trivial_verify_input(batch)
             else:
+                # PP immediately tail-drafts the next chain below, so no lease
+                # may survive for the scheduler/worker to consume next round.
+                stage_prepared_next = get_parallel().pp_size == 1
                 with (
                     draft_tp_context(self.draft_worker.parallel_layout),
                     speculative_moe_backend_context(),
@@ -1651,7 +1660,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     self.draft_worker._draft_extend_for_decode(
                         batch, batch_output, kv_loc_plan=verify_input.kv_loc_plan
                     )
-                    if self._next_draft_stager is not None:
+                    if self._next_draft_stager is not None and stage_prepared_next:
                         self._next_draft_stager.note_decode(
                             batch,
                             prepared=(
@@ -1661,6 +1670,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                             ),
                             new_seq_lens=batch_output.new_seq_lens,
                         )
+                    elif self._next_draft_stager is not None:
+                        self._next_draft_stager.forget()
             if self._post_verify_graphs is not None:
                 # The mamba state commit may still run on a side stream.
                 self._post_verify_graphs.join()

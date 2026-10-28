@@ -46,9 +46,7 @@ class EaglePostVerifyGraphs:
 
     def __init__(self, *, target_worker: Any, simulated_acc_len_rng: torch.Generator):
         self._target_worker = target_worker
-        self._prepare_next_draft = (
-            prepared_next_draft.nvidia_eagle_decode_fast_path_enabled()
-        )
+        self._prepare_next_draft = prepared_next_draft.prepared_next_draft_enabled()
         # Preparing the next draft also lets this launch produce the draft-extend
         # layout and the bonus token in the dtype its next consumers read.
         self._extend_layout = self._prepare_next_draft
@@ -63,7 +61,9 @@ class EaglePostVerifyGraphs:
             sim_rng=simulated_acc_len_rng,
             protect_prepared_seq_lens=self._prepare_next_draft,
         )
-        self._next_draft_config: Optional[SimpleNamespace] = None
+        self._next_draft_producer: Optional[
+            prepared_next_draft.PreparedNextDraftProducer
+        ] = None
         self.prepared_next_draft = None
 
     def enable_prepared_next_draft(
@@ -75,18 +75,35 @@ class EaglePostVerifyGraphs:
         mrope: bool,
         req_to_token: torch.Tensor,
         runner_buffers: Any,
+        capture_sizes,
     ) -> None:
-        """Bind staged fields to the draft graph runner's static inputs."""
+        """Bind one producer shared by graph replays and eager verify rounds."""
         if not self._prepare_next_draft:
             return
-        self._next_draft_config = SimpleNamespace(
+        self._next_draft_producer = prepared_next_draft.PreparedNextDraftProducer(
             num_steps=num_steps,
-            window=window,
+            window_size=window,
             seq_len_fill_value=seq_len_fill_value,
-            mrope=mrope,
+            with_mrope=mrope,
             req_to_token=req_to_token,
             runner_buffers=runner_buffers,
+            capture_sizes=capture_sizes,
         )
+
+    def prepare_next_eager(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        scheduler_sequence_lengths: torch.Tensor,
+    ) -> None:
+        """Publish the eager equivalent of the captured next-round producer."""
+        self.prepared_next_draft = None
+        producer = self._next_draft_producer
+        if producer is not None:
+            self.prepared_next_draft = producer.prepare_eager(
+                req_pool_indices=req_pool_indices,
+                scheduler_sequence_lengths=scheduler_sequence_lengths,
+            )
 
     def run(
         self,
@@ -182,18 +199,14 @@ class EaglePostVerifyGraphs:
         from sglang.srt.runtime_context import mamba_track_grid
 
         info = batch.sampling_info
-        config = self._next_draft_config
+        producer = self._next_draft_producer
         return SimpleNamespace(
             prepared_next_draft=(
                 None
-                if config is None
-                else prepared_next_draft.allocate_prepared_next_draft_inputs(
+                if producer is None
+                else producer.allocate(
                     num_requests=len(batch.seq_lens),
-                    num_steps=config.num_steps,
-                    window_size=config.window,
-                    with_mrope=config.mrope,
                     device=batch.device,
-                    runner_buffers=config.runner_buffers,
                 )
             ),
             num_requests=len(batch.seq_lens),
@@ -236,15 +249,11 @@ class EaglePostVerifyGraphs:
             )
         )
         if slot.prepared_next_draft is not None:
-            config = self._next_draft_config
-            prepared_next_draft.prepare_next_draft_inputs(
+            producer = self._next_draft_producer
+            slot.prepared_next_draft = producer.prepare(
                 slot.prepared_next_draft,
                 req_pool_indices=slot.staged["req_pool_indices"],
-                new_seq_lens=new_seq_lens,
-                req_to_token=config.req_to_token,
-                num_steps=config.num_steps,
-                window_size=config.window,
-                seq_len_fill_value=config.seq_len_fill_value,
+                scheduler_sequence_lengths=new_seq_lens,
             )
         return (
             predict,

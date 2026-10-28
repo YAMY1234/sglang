@@ -32,7 +32,7 @@ from sglang.srt.mem_cache.allocation_sizing import (
 )
 from sglang.srt.runtime_context import get_exec, get_spec
 from sglang.srt.speculative.prepared_next_draft import (
-    nvidia_eagle_decode_fast_path_enabled,
+    prepared_next_draft_enabled,
 )
 from sglang.srt.speculative.sharded_verify import (
     VocabShard,
@@ -1140,7 +1140,7 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     for r in batch.reqs:
         r.decode_batch_idx += 1
 
-    if num_needed_tokens == 0 and nvidia_eagle_decode_fast_path_enabled():
+    if num_needed_tokens == 0 and prepared_next_draft_enabled():
         # No device allocation is needed; settle only the host-side watermark.
         update_spec_decode_allocated_lens(batch.reqs, nxt_kv_lens)
         batch.spec_decode_schedule_stream_idle = not (

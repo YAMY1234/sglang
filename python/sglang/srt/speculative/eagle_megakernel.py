@@ -27,7 +27,7 @@ from sglang.srt.kernel_plugins.nvidia.eagle_binding import (
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.prepared_next_draft import (
-    nvidia_eagle_decode_fast_path_enabled,
+    prepared_next_draft_enabled,
 )
 
 if TYPE_CHECKING:
@@ -208,7 +208,7 @@ class EagleMegakernel:
 
     def _draft_inputs_as_extend_outputs(self, max_bs: int) -> Optional[SimpleNamespace]:
         """Alias compatible draft-extend outputs to the next draft's inputs."""
-        if not nvidia_eagle_decode_fast_path_enabled():
+        if not prepared_next_draft_enabled():
             return None
         draft_runner = self._draft_worker.cuda_graph_runner
         if draft_runner is None:

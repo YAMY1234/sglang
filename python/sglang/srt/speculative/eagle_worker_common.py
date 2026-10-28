@@ -811,6 +811,14 @@ def run_eagle_verify(
         )
     else:
         new_seq_lens = batch.seq_lens + accept_lens
+    if post_verify_graphs is not None:
+        # A graph miss (grammar, sampling metadata, target graph miss, ...) uses
+        # the same bound producer as a captured post-verify round.  Unsupported
+        # dtype/shape/device combinations simply publish no prepared inputs.
+        post_verify_graphs.prepare_next_eager(
+            req_pool_indices=batch.req_pool_indices,
+            scheduler_sequence_lengths=new_seq_lens,
+        )
     if batch.hisparse_coordinator is not None:
         batch.hisparse_coordinator.commit_spec_accept_tokens(
             batch=batch,

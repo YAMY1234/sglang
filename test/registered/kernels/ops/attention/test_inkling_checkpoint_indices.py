@@ -806,8 +806,8 @@ class TestInklingCheckpointIndices(CustomTestCase):
         runner = cls.__new__(cls)
         # This fixture intentionally bypasses the production constructor.  The
         # checkpoint replay under test uses the stock copy path, so initialize
-        # the optional NVIDIA planned-copy gate explicitly.
-        runner._nvidia_decode_fast_path = False
+        # the optional prepared-next planned-copy gate explicitly.
+        runner._prepared_next_draft = False
         runner.keep_hidden_in_place = False
         runner.megakernel = None
         runner.megakernel_served = frozenset()

@@ -48,7 +48,7 @@ from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
 from sglang.srt.speculative.prepared_next_draft import (
-    nvidia_eagle_decode_fast_path_enabled,
+    prepared_next_draft_enabled,
 )
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.srt.utils import (
@@ -163,10 +163,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             else speculative_num_steps
         )
         self.topk = get_spec().speculative_eagle_topk
-        self._nvidia_decode_fast_path = (
-            nvidia_eagle_decode_fast_path_enabled()
-            and eagle_worker.megakernel is not None
-        )
+        self._prepared_next_draft = prepared_next_draft_enabled()
         self.draft_attn_backend = draft_attn_backend or model_runner.draft_attn_backend
 
         # Patch_model in parent's capture() needs an attn_backend reference.
@@ -319,9 +316,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         )
         # Inputs written outside this runner's fill stay private: the process-wide pool would
         # alias them to the draft extend's same-named buffers, which its replay refills in between.
-        self.buffers.share_buffers(
-            exclude=_private_inputs(self._nvidia_decode_fast_path)
-        )
+        self.buffers.share_buffers(exclude=_private_inputs(self._prepared_next_draft))
         # (raw_bs, field mask) -> (destination views, copy plan); None once refused.
         self._planned_inputs = {}
         # the batch sizes whose graphs run the draft megakernel's draft_loop, captured
@@ -789,7 +784,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
         inputs_prepared = inputs_prepared and bs == raw_bs
         copied_with_plan = (
-            self._nvidia_decode_fast_path
+            self._prepared_next_draft
             and bs == raw_bs
             and self._copy_planned_inputs(
                 forward_batch,

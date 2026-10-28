@@ -49,7 +49,7 @@ from sglang.srt.speculative.draft_checkpoint import refresh_track_indices, track
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.speculative.prepared_next_draft import (
-    nvidia_eagle_decode_fast_path_enabled,
+    prepared_next_draft_enabled,
 )
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.srt.utils import (
@@ -115,12 +115,9 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # Parse args
         self.eagle_worker = eagle_worker
         self.model_runner = model_runner = eagle_worker.draft_runner
-        self._nvidia_decode_fast_path = (
-            nvidia_eagle_decode_fast_path_enabled()
-            and eagle_worker.megakernel is not None
-        )
+        self._prepared_next_draft = prepared_next_draft_enabled()
         # An unchanged top-k-1 batch reads these rows before this runner's next
-        # replay, so the NVIDIA megakernel path need not copy them out.
+        # replay, so the generic relay lease need not copy them out.
         self.keep_hidden_in_place = spec_relay_bypass_enabled()
         self.forward_mode = ForwardMode.DRAFT_EXTEND_V2
 
@@ -667,7 +664,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             buffers.extend_seq_lens.fill_(self.captured_req_width)
 
         copied_with_plan = (
-            self._nvidia_decode_fast_path
+            self._prepared_next_draft
             and bs == raw_bs
             and bs * self.captured_req_width == num_tokens
             and self._copy_planned_inputs(

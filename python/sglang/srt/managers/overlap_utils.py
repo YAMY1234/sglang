@@ -325,10 +325,10 @@ class FutureMap:
         self.needs_cpu_seq_lens = needs_cpu_seq_lens
         self.needs_confidence_relay = needs_confidence_relay
         from sglang.srt.speculative.prepared_next_draft import (
-            nvidia_eagle_decode_fast_path_enabled,
+            prepared_next_draft_enabled,
         )
 
-        self._use_spec_index_ops = nvidia_eagle_decode_fast_path_enabled()
+        self._use_spec_index_ops = prepared_next_draft_enabled()
         self.req_pool_size = req_to_token_pool.req_to_token.shape[0]
         # Kept for the mixed-tail late binding (reserved-slot gather).
         self.req_to_token = req_to_token_pool.req_to_token

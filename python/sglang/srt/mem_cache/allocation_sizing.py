@@ -70,12 +70,12 @@ def get_alloc_reserve_per_decode() -> int:
     """
     from sglang.srt.environ import envs
     from sglang.srt.speculative.prepared_next_draft import (
-        nvidia_eagle_decode_fast_path_enabled,
+        prepared_next_draft_enabled,
     )
 
     prepares_next_round = (
         envs.SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.get()
-        and nvidia_eagle_decode_fast_path_enabled()
+        and prepared_next_draft_enabled()
     )
     windows = 3 if prepares_next_round else 2
     return windows * get_alloc_len_per_decode()

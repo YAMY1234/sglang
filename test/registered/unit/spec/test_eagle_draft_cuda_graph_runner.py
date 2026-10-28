@@ -82,7 +82,7 @@ def _extend_runner(raw_bs, *, keep_hidden_in_place=False):
     )
     runner.require_mlp_tp_gather = runner.require_gathered_buffer = False
     runner.keep_hidden_in_place = keep_hidden_in_place
-    runner._nvidia_decode_fast_path = False
+    runner._prepared_next_draft = False
     runner._planned_inputs = {}
     runner.captured_req_width, runner.capture_bs = width, [1, 2]
     runner.seq_len_fill_value = 1
@@ -178,7 +178,7 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
         runner.seq_len_fill_value = SEQ_LEN_FILL_VALUE
         runner.require_mlp_tp_gather = False
         runner.require_gathered_buffer = False
-        runner._nvidia_decode_fast_path = False
+        runner._prepared_next_draft = False
         runner._planned_inputs = {}
         runner.model_runner = SimpleNamespace(
             model_config=SimpleNamespace(vocab_size=8, model_is_mrope=False),
