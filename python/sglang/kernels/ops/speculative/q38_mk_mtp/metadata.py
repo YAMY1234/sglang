@@ -77,6 +77,7 @@ def try_prepare_verify_layout(input_ids, forward_batch, mode, pool, *,
         return None
     from sglang.srt.layers.cp.utils import is_cp_active
     from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+    from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
     from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
         is_in_breakable_cuda_graph,
     )
@@ -94,7 +95,7 @@ def try_prepare_verify_layout(input_ids, forward_batch, mode, pool, *,
         and forward_batch.spec_info.draft_token_num == 4
         and ngram_size == 3 and ngram_eos_token_id is not None
         and type(pool) is HybridReqToTokenPool
-        and pool.layer_transfer_counter is None
+        and get_token_to_kv_pool().layer_transfer_counter is None
     ):
         return None
     requests = forward_batch.req_pool_indices
