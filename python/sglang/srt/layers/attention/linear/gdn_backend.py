@@ -1370,27 +1370,45 @@ class GDNAttnBackend(MambaAttnBackendBase):
         meta = self.forward_metadata
         return (not pp_spec_stable_rows_enabled() and self.mis_metadata is None
                 and forward_batch.spec_info.draft_token_num == 4
-                and meta.query_start_loc.shape[0] == 2
+                and (meta.query_start_loc.shape[0] == 2 or (
+                    os.environ.get("SGLANG_Q38C_MK_GDN", "0") == "1"
+                    and meta.query_start_loc.shape[0] in (3, 4)))
                 and meta.retrieve_next_token is None
                 and meta.retrieve_next_sibling is None
                 and meta.retrieve_parent_token is None)
 
-    def forward_inproj_conv(self, layer, forward_batch, x, weight):
-        from sglang.srt.q38.gdn_inproj_conv import run
+    def forward_inproj_conv(self, layer, forward_batch, x, weight, *, norm_weight=None, norm_eps=1e-6):
+        if os.environ.get("SGLANG_Q38C_MK_GDN", "0") == "1":
+            from sglang.srt.q38.q38_mkgdn_front import run
+        else:
+            from sglang.srt.q38.gdn_inproj_conv import run
         from sglang.kernels.ops.mamba.causal_conv1d_triton import PAD_SLOT_ID
         meta = self.forward_metadata
         params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        rows, batch = x.shape[0], x.shape[0] // 4
+        if norm_weight is not None:
+            pool = self.req_to_token_pool.mamba_pool
+            if (params.temporal.dtype != torch.bfloat16
+                or params.replayssm_d is None
+                or getattr(pool, "replayssm_cache_base", None) is None
+                or getattr(pool, "replayssm_spec_fold", False)
+                or getattr(pool, "replayssm_is_kda", False)):
+                raise ValueError("MK_GDN fused norm requires the BF16 circular ReplaySSM path")
         packed, convolved = run(
             x, weight, layer.conv_weights, layer.bias,
-            params.conv[0], meta.mamba_cache_indices[:1],
+            params.conv[0], meta.mamba_cache_indices[:batch],
             params.intermediate_conv_window[0],
-            self.verify_intermediate_state_indices[:1], pad_slot=PAD_SLOT_ID,
+            self.verify_intermediate_state_indices[:batch], pad_slot=PAD_SLOT_ID,
         )
-        z = packed[:, 10240:16384].view(4, 48, 128)
-        b = packed[:, 16384:16432]
-        a = packed[:, 16432:16480]
+        qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
+        z_end = qkv_dim + layer.v_dim
+        z = packed[:, qkv_dim:z_end].view(rows, layer.num_v_heads, 128)
+        b = packed[:, z_end:z_end + layer.num_v_heads]
+        a = packed[:, z_end + layer.num_v_heads:]
         core = self.forward_extend(
-            layer, forward_batch, convolved, a, b, q38_conv_applied=True
+            layer, forward_batch, convolved, a, b, q38_conv_applied=True,
+            q38_mk_z=z if norm_weight is not None else None,
+            q38_mk_norm_weight=norm_weight, q38_mk_norm_eps=norm_eps,
         )
         return core, z
 
@@ -1604,6 +1622,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     query_start_loc=query_start_loc,
                     draft_token_num=forward_batch.spec_info.draft_token_num,
                     wait_for_gate_producer=q38_conv_applied,
+                    packed_qkv=mixed_qkv,
+                    norm_z=kwargs.get("q38_mk_z"),
+                    norm_weight=kwargs.get("q38_mk_norm_weight"),
+                    norm_eps=kwargs.get("q38_mk_norm_eps", 1e-6),
                 )
             else:
                 # The recurrent fallback needs the per-draft snapshots, which
@@ -1925,6 +1947,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         query_start_loc: torch.Tensor,
         draft_token_num: int,
         wait_for_gate_producer: bool = False,
+        packed_qkv: Optional[torch.Tensor] = None,
+        norm_z: Optional[torch.Tensor] = None,
+        norm_weight: Optional[torch.Tensor] = None,
+        norm_eps: float = 1e-6,
     ) -> torch.Tensor:
         """ReplaySSM GDN spec-verify (Part B of #28511).
 
@@ -1962,6 +1988,26 @@ class GDNAttnBackend(MambaAttnBackendBase):
         d_cache = layer_cache.replayssm_d  # [slots, HV, L, V]
         max_cache_len = d_cache.shape[-2]  # ring length L
         out = q.new_empty(seq_len, HV, V)
+        if (
+            os.environ.get("SGLANG_Q38C_MK_GDN", "0") == "1"
+            and draft_token_num == 4 and seq_len in (4, 8, 12)
+            and (H, HV, K, V) in ((4, 12, 128, 128), (16, 48, 128, 128))
+            and layer_cache.temporal.dtype == torch.bfloat16
+            and max_cache_len == 16 and packed_qkv is not None
+        ):
+            from sglang.kernels.ops.attention.q38_mkgdn import core
+
+            normalized = torch.empty_like(out) if norm_weight is not None else None
+            result = core(
+                packed_qkv, a, b, layer.A_log, layer.dt_bias,
+                layer_cache.temporal, d_cache, layer_cache.replayssm_k,
+                layer_cache.replayssm_g, layer_cache.replayssm_rawv,
+                layer_cache.replayssm_rawk, cache_indices, replay_indices,
+                mamba_pool.replayssm_spec_write_pos, mamba_pool.replayssm_cache_base,
+                mamba_pool.replayssm_is_flush, out,
+                z=norm_z, norm_weight=norm_weight, normalized=normalized, eps=norm_eps,
+            )
+            return result.reshape(value.shape)
         gdn_replayssm_spec_decode(
             q=q,
             k=k,
