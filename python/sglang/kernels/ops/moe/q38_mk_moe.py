@@ -53,14 +53,14 @@ class Params(ctypes.Structure):
 
 
 @cache
-def kernel(device: int, intermediate: int = 640, pipeline: bool = False):
+def kernel(device: int, intermediate: int = 640, pipeline: bool = False, instrumented: bool = False):
     major, minor = torch.cuda.get_device_capability(device)
     name = "q38_mk_moe_pipeline" if pipeline else "q38_mk_moe"
     shared = pipeline_smem_bytes(intermediate) if pipeline else smem_bytes(intermediate)
     cubin = jit.compile_source(
         (ROOT / (name + ".cu")).read_text(), name, f"sm_{major}{minor}a",
         ("-std=c++17", "-default-device", "--generate-line-info", f"-DQ38_MK_I={intermediate}",
-         f"-DQ38_MK_SMEM_BYTES={shared}"),
+         f"-DQ38_MK_SMEM_BYTES={shared}", f"-DQ38_MK_TRACE={int(instrumented)}"),
         {"q38_mk_moe_primitives.cuh": (ROOT / "q38_mk_moe_primitives.cuh").read_text()},
     )
     return jit.load(cubin, name, (256, 1, 1), shared)
@@ -90,7 +90,7 @@ def weight_maps(w13, w2):
     )
 
 
-def run(maps, x, xsf, sf13, sf2, g1, g1c, g2, ids, unique_ids, num_unique, out, intermediate=640, pipeline=False):
+def run(maps, x, xsf, sf13, sf2, g1, g1c, g2, ids, unique_ids, num_unique, out, intermediate=640, pipeline=False, trace=None):
     m = x.shape[0]
     if not 1 <= m <= 16:
         raise ValueError("FN prototype supports M1..16")
@@ -99,6 +99,9 @@ def run(maps, x, xsf, sf13, sf2, g1, g1c, g2, ids, unique_ids, num_unique, out, 
     )), m)
     cluster_size = 5 if intermediate == 640 else 3
     clusters = torch.cuda.get_device_properties(x.device).multi_processor_count // cluster_size if pipeline else 30
-    jit.launch(kernel(x.device.index, intermediate, pipeline), (clusters * cluster_size, 1, 1), [*maps, p],
+    args = [*maps, p]
+    if pipeline and trace is not None:
+        args.append(ctypes.c_void_p(trace.data_ptr()))
+    jit.launch(kernel(x.device.index, intermediate, pipeline, trace is not None), (clusters * cluster_size, 1, 1), args,
                torch.cuda.current_stream().cuda_stream, cluster=(cluster_size, 1, 1))
     return out

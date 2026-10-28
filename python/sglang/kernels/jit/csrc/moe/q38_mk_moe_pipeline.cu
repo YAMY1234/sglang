@@ -8,6 +8,9 @@ using namespace q38_mk;
 #ifndef Q38_MK_I
 #define Q38_MK_I 192
 #endif
+#ifndef Q38_MK_TRACE
+#define Q38_MK_TRACE 0
+#endif
 constexpr int H=2560,I=Q38_MK_I,K=10,Rows=16,Threads=256;
 constexpr int TileI=I==640?128:64, C=I/TileI, N1=2*TileI, Nk=TileI/64;
 constexpr int Stages=I==640?2:5, StageBytes=N1*144, SfOffset=N1*128;
@@ -61,9 +64,25 @@ __device__ __forceinline__ void ld64(uint32_t addr,uint32_t (&r)[64]){
 template<int N> __device__ __forceinline__ void drain(uint32_t addr,uint32_t (&r)[N]){
  if constexpr(N==32)ld32(addr,r);else ld64(addr,r);
 }
+// Diagnostic-only; no trace argument or stores in the ordinary specialization.
+#if Q38_MK_TRACE
+__device__ __forceinline__ void stamp(uint64_t* trace,int item,int rank,int slot){
+ if((threadIdx.x&31)==0){
+  uint64_t now;asm volatile("mov.u64 %0, %%globaltimer;":"=l"(now)::"memory");
+  trace[((size_t)item*C+rank)*128+slot]=now;
+ }
+}
+#define Q38_MARK(slot) stamp(trace,item,rank,slot)
+#else
+#define Q38_MARK(slot) ((void)0)
+#endif
 extern "C" __global__ __cluster_dims__(C,1,1) __launch_bounds__(Threads,1)
 void q38_mk_moe_pipeline(const __grid_constant__ CUtensorMap w13,
-                       const __grid_constant__ CUtensorMap w2,const Params p){
+                       const __grid_constant__ CUtensorMap w2,const Params p
+#if Q38_MK_TRACE
+                       ,uint64_t* trace
+#endif
+                       ){
  extern __shared__ __align__(1024) uint8_t raw[];
  Smem& s=*reinterpret_cast<Smem*>((reinterpret_cast<uintptr_t>(raw)+1023)&~uintptr_t(1023));
  const int tid=threadIdx.x,warp=tid/32,lane=tid%32,rank=cluster_rank(),cluster=blockIdx.x/C;
@@ -77,6 +96,7 @@ void q38_mk_moe_pipeline(const __grid_constant__ CUtensorMap w13,
  for(int item=cluster;item<*p.num_unique;item+=gridDim.x/C){
   const int e=p.unique_ids[item];
   if(tid==0){
+   Q38_MARK(0);
    for(int b=0;b<Stages;++b){mbar_init(&s.full[b],1);mbar_init(&s.empty[b],1);mbar_init(&s.sf_ready[b],4);}
    mbar_init(&s.fc1_done,1);mbar_init(&s.h_ready,4);mbar_init(&s.tile_done,1);mbar_init(&s.tile_free,4);
    for(int tile=0;tile<10;++tile){
@@ -94,6 +114,7 @@ void q38_mk_moe_pipeline(const __grid_constant__ CUtensorMap w13,
   for(int j=tid;j<sizeof(s.h)/16;j+=Threads)reinterpret_cast<uint4*>(s.h)[j]=make_uint4(0,0,0,0);
   if(tid<Rows){int slot=-1;if(tid<p.m)for(int k=0;k<K;++k)if(p.ids[tid*K+k]==e)slot=k;s.slots[tid]=slot;}
   __syncthreads();cluster_sync();fence_proxy_async_smem();
+  if(tid==0)Q38_MARK(1);
   const float ag=p.g1[e],sc=p.g1c[e],a2=p.g2[e];
   // Warp0: stream every FC1 stage and FC2 output tile through the TMA ring.
   if(warp==0){
@@ -128,9 +149,12 @@ void q38_mk_moe_pipeline(const __grid_constant__ CUtensorMap w13,
      for(int k=0;k<4;++k)umma_nvf4(tm,
       make_sdesc(smem_u32(s.x[g])+k*32,0,1024,2),make_sdesc(smem_u32(s.ring[b])+k*32,0,1024,2),idesc1,
       tm+256+b*16+k*4,tm+384+b*SfStride+k*(N1/32),(g|k)!=0);
+     Q38_MARK(48+g);
      tc_commit(&s.empty[b]);
     }
+    Q38_MARK(2);
     tc_commit(&s.fc1_done);mbar_wait(&s.h_ready,0);tc_fence_after();
+    Q38_MARK(6);
     for(int tile=0;tile<10;++tile){
      if(tile)mbar_wait(&s.tile_free,(tile-1)&1);
      const int g=10+tile,b=g%Stages;
@@ -138,6 +162,7 @@ void q38_mk_moe_pipeline(const __grid_constant__ CUtensorMap w13,
      for(int k=0;k<Nk;++k)umma_nvf4(tm,
       make_sdesc(smem_u32(s.h)+k*32,0,1024,2),make_sdesc(smem_u32(s.ring[b])+k*32,0,Sbo2,Sw2),idesc2,
       tm+256+b*16+k*4,tm+384+b*SfStride+k*8,k!=0);
+     Q38_MARK(58+tile);
      tc_commit(&s.empty[b]);tc_commit(&s.tile_done);
     }
    }
@@ -149,6 +174,7 @@ void q38_mk_moe_pipeline(const __grid_constant__ CUtensorMap w13,
    auto stage_sf=[&](int g){
     const int b=g%Stages,nk=g<10?4:Nk;
     mbar_wait(&s.full[b],(g/Stages)&1);
+    if(q==0)Q38_MARK(8+g);
     for(int k=0;k<nk;++k){
      const uint8_t* src=s.ring[b]+SfOffset+k*512+lane*16;
      const uint4 u=*reinterpret_cast<const uint4*>(src);
@@ -162,10 +188,12 @@ void q38_mk_moe_pipeline(const __grid_constant__ CUtensorMap w13,
     uint32_t xa[16]={};
     for(int k=0;k<(g<10?4:Nk);++k)if(lane<Rows)xa[k*4]=g<10?s.xsf[lane][g*4+k]:s.hsf[lane][k];
     tmem_st_x16(tm+la+256+b*16,xa);tmem_st_wait();tc_fence_before();__syncwarp();
+    if(q==0)Q38_MARK(28+g);
     if(lane==0)mbar_arrive(&s.sf_ready[b]);
    };
    for(int g=0;g<10;++g)stage_sf(g);
    mbar_wait(&s.fc1_done,0);tc_fence_after();
+   if(q==0)Q38_MARK(3);
    // Only quarter0 can read token rows0..15. Other warps cannot use a row0
    // address to access quarter0: TMEM load access is restricted by warp id.
    if(q==0)for(int col=0;col<N1;col+=64){
@@ -173,6 +201,7 @@ void q38_mk_moe_pipeline(const __grid_constant__ CUtensorMap w13,
     if(lane<Rows)for(int j=0;j<64;j+=4)
      *reinterpret_cast<uint4*>(&s.acc[lane][col+j])=make_uint4(v[j],v[j+1],v[j+2],v[j+3]);
    }
+   if(q==0)Q38_MARK(4);
    wg_sync();
    const int et=q*32+lane;
    for(int task=et;task<Rows*(TileI/8);task+=128){
@@ -192,15 +221,18 @@ void q38_mk_moe_pipeline(const __grid_constant__ CUtensorMap w13,
     if(hf==0)reinterpret_cast<uint8_t*>(&s.hsf[row][blk/4])[blk%4]=sf;
    }
    wg_sync();fence_proxy_async_smem();tc_fence_before();__syncwarp();
+   if(q==0)Q38_MARK(5);
    if(lane==0)mbar_arrive(&s.h_ready);
    stage_sf(10);
    for(int tile=0;tile<10;++tile){
     mbar_wait(&s.tile_done,tile&1);tc_fence_after();
+    if(q==0)Q38_MARK(68+tile);
     if(q==0)for(int col=0;col<256;col+=64){
      uint32_t v[64];ld64(tm+col,v);tmem_ld_wait();
      if(lane<p.m)for(int j=0;j<64;j+=4)
       *reinterpret_cast<uint4*>(&s.partial[rank][lane][col+j])=make_uint4(v[j],v[j+1],v[j+2],v[j+3]);
     }
+    if(q==0)Q38_MARK(78+tile);
     tc_fence_before();__syncwarp();if(lane==0)mbar_arrive(&s.tile_free);
     wg_sync();
     // The next MMA can run during this tile's DSMEM transfer/reduction. Its
@@ -208,11 +240,13 @@ void q38_mk_moe_pipeline(const __grid_constant__ CUtensorMap w13,
     if(tile+1<10)stage_sf(11+tile);
     const int owner=tile%C;
     if(q==0)fence_proxy_async_smem();
+    if(q==0)Q38_MARK(108+tile);
     if(q==0&&lane==0&&rank!=owner)copy_peer(
      mapa(smem_u32(s.partial[rank]),owner),smem_u32(s.partial[rank]),partial_bytes,
      mapa(smem_u32(&s.reduce_ready[tile]),owner));
     if(rank==owner){
      mbar_wait(&s.reduce_ready[tile],0);
+     if(q==0)Q38_MARK(88+tile);
      for(int task=et;task<p.m*256;task+=128){
       const int row=task/256,col=task%256;
       if(s.slots[row]>=0){
@@ -225,11 +259,14 @@ void q38_mk_moe_pipeline(const __grid_constant__ CUtensorMap w13,
      wg_sync();
      if(q==0&&lane==0)for(int peer=0;peer<C;++peer)arrive_peer(mapa(smem_u32(&s.reduce_ack[tile]),peer));
     }
-    mbar_wait(&s.reduce_ack[tile],0);wg_sync();
+    mbar_wait(&s.reduce_ack[tile],0);
+    if(q==0)Q38_MARK(98+tile);
+    wg_sync();
    }
   }
   // Warps2/3 have no cross-warp spin work. They join only at the expert boundary.
   tc_fence_before();__syncthreads();cluster_sync();
+  if(tid==0)Q38_MARK(7);
  }
  tc_fence_before();if(warp==1)tmem_dealloc(tm,512);__syncthreads();
  asm volatile("griddepcontrol.launch_dependents;":::"memory");
