@@ -5,10 +5,13 @@ short/mixed rows retain the native 256-CTA-per-row calculation in the same grid.
 No PDL trigger: the top-k consumer waits for this kernel's full completion.
 """
 import math
+import os
 
 import torch
 import tilelang
 from tilelang import language as T
+
+_Q38C_SCORE_Q4_CTA1024 = os.environ.get("SGLANG_Q38C_SCORE_Q4_CTA1024", "0") == "1"
 
 
 @tilelang.jit(
@@ -17,7 +20,7 @@ from tilelang import language as T
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
     }
 )
-def _score_q4_n16_kernel(min_scored_len: int = 512, request_dtype: str = "int32"):
+def _score_q4_n16_kernel(min_scored_len: int = 512, request_dtype: str = "int32", long_ctas: int = 512):
     pages = T.dynamic("pages")
     max_pages = T.dynamic("max_pages")
     capacity = T.dynamic("capacity")
@@ -50,7 +53,7 @@ def _score_q4_n16_kernel(min_scored_len: int = 512, request_dtype: str = "int32"
             if (longest > 8192 and Request[0] != 0
                     and Request[0] == Request[1] and Request[0] == Request[2]
                     and Request[0] == Request[3]):
-                if block < 512:
+                if block < long_ctas:
                     q_shared = T.alloc_shared([16, 128], T.bfloat16)
                     scores = T.alloc_fragment([64, 16], T.float32)
                     scores_shared = T.alloc_shared([64, 16], T.float32)
@@ -61,8 +64,8 @@ def _score_q4_n16_kernel(min_scored_len: int = 512, request_dtype: str = "int32"
                     T.annotate_layout({grouped: head_sum_layout})
                     for row, head, dim in T.Parallel(4, 4, 128):
                         q_shared[row * 4 + head, dim] = Q[row, head, dim]
-                    for step in T.serial(T.ceildiv(T.ceildiv(longest, 64), 512)):
-                        group = step * 512 + block
+                    for step in T.serial(T.ceildiv(T.ceildiv(longest, 64), long_ctas)):
+                        group = step * long_ctas + block
                         if group * 64 < longest:
                             for sp in range(4):
                                 if (group * 4 + sp) * 16 < longest:
@@ -115,7 +118,10 @@ def score_q4_n16(q, k_cache, page_table, lengths, max_model_len, req_pool_indice
              score_scale=None, min_scored_len=512):
     logits = torch.empty((4, max_model_len), dtype=torch.float32, device=q.device)
     request_dtype = {torch.int32: "int32", torch.int64: "int64"}[req_pool_indices.dtype]
-    _score_q4_n16_kernel(min_scored_len=min_scored_len, request_dtype=request_dtype)(
+    _score_q4_n16_kernel(
+        min_scored_len=min_scored_len, request_dtype=request_dtype,
+        long_ctas=1024 if _Q38C_SCORE_Q4_CTA1024 else 512,
+    )(
         q.contiguous(), k_cache.contiguous(), page_table.to(torch.int32).contiguous(),
         lengths.to(torch.int32).contiguous(), req_pool_indices.contiguous(), logits,
         float(score_scale or math.sqrt(128)),
