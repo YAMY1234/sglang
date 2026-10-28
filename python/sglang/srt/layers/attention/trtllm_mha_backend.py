@@ -2153,16 +2153,28 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
                 speculative_step_id=i,
             )
         steps = self.speculative_num_steps - 1
-        self._share_draft_metadata = (
-            model_runner.server_args.enable_nvidia_megakernel
+        self._share_draft_metadata = self._can_share_draft_metadata(
+            self.attn_backends, steps
+        )
+        self._shared_draft_metadata = None
+
+    @staticmethod
+    def _can_share_draft_metadata(attn_backends, steps: int) -> bool:
+        # Import lazily: the NVIDIA binding imports runtime modules that reach
+        # attention backends during startup.
+        from sglang.srt.kernel_plugins.nvidia.binding import (
+            nv_mega_runtime_optimization_enabled,
+        )
+
+        return (
+            nv_mega_runtime_optimization_enabled()
             and steps > 1
             and all(
                 not backend.use_sliding_window_kv_pool
                 and not backend.kv_index_translator.is_translating
-                for backend in self.attn_backends[:steps]
+                for backend in attn_backends[:steps]
             )
         )
-        self._shared_draft_metadata = None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         for i in range(self.speculative_num_steps - 1):

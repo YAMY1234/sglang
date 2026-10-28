@@ -583,11 +583,24 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self._flashinfer_graph_cp_single = True
 
     def supports_prefill_graph_extend(self) -> bool:
+        # Keep the pre-existing explicit Triton graph switch independent. The
+        # runtime-wide optimization switch additionally enables the graph and is
+        # required for the FlashInfer extension introduced by this path.
+        from sglang.srt.kernel_plugins.nvidia.binding import (
+            nv_mega_runtime_optimization_enabled,
+        )
+
+        runtime_optimization = nv_mega_runtime_optimization_enabled()
         return (
-            envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.get()
+            (
+                envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.get()
+                or runtime_optimization
+            )
             # drafts keep their eager GDN extend; only the target's is captured
             and not self.is_draft_worker
-            and self._prefill_graph_extend_supported(enable_flashinfer=True)
+            and self._prefill_graph_extend_supported(
+                enable_flashinfer=runtime_optimization
+            )
         )
 
     def _prefill_graph_extend_supported(

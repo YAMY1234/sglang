@@ -208,8 +208,14 @@ class SchedulerRequestReceiver:
                 recv_reqs = [*recv_reqs, *local_reqs]
             if get_parallel().tp_size != 1:
                 tp_group = get_parallel().tp_group
+                from sglang.srt.kernel_plugins.nvidia.binding import (
+                    nv_mega_runtime_optimization_enabled,
+                )
+
                 exchange = get_shm_exchange(
-                    group=tp_group.cpu_group, kind="recv", multihost=True
+                    group=tp_group.cpu_group,
+                    kind="recv",
+                    multihost=nv_mega_runtime_optimization_enabled(),
                 )
                 if exchange is not None:
                     recv_reqs = _broadcast_via_exchange(

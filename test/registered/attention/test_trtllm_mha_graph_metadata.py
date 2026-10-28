@@ -1432,6 +1432,46 @@ def test_shared_draft_metadata_reads_what_each_step_writes(bs):
             assert torch.equal(table[row, :live], want_table[row, :live])
 
 
+@pytest.mark.parametrize(
+    "runtime_optimization,steps,swa,translating,expected",
+    [
+        (False, 3, False, False, False),
+        (True, 1, False, False, False),
+        (True, 3, True, False, False),
+        (True, 3, False, True, False),
+        (True, 3, False, False, True),
+    ],
+)
+def test_shared_draft_metadata_policy_is_runtime_only_and_safe(
+    monkeypatch, runtime_optimization, steps, swa, translating, expected
+):
+    """The generic runtime switch, never plugin presence, owns metadata sharing."""
+    from sglang.srt.kernel_plugins.nvidia import binding
+    from sglang.srt.layers.attention.trtllm_mha_backend import (
+        TRTLLMHAAttnMultiStepDraftBackend,
+    )
+
+    monkeypatch.setattr(
+        binding,
+        "nv_mega_runtime_optimization_enabled",
+        lambda: runtime_optimization,
+        raising=False,
+    )
+    backends = [
+        SimpleNamespace(
+            use_sliding_window_kv_pool=swa,
+            kv_index_translator=SimpleNamespace(is_translating=translating),
+        )
+        for _ in range(max(steps, 1))
+    ]
+    assert (
+        TRTLLMHAAttnMultiStepDraftBackend._can_share_draft_metadata(
+            backends, steps
+        )
+        is expected
+    )
+
+
 def test_shared_draft_metadata_binds_one_table_and_one_update(monkeypatch):
     """The draft backend binds one table and updates every step's lengths once."""
     from sglang.srt.layers.attention.trtllm_mha_backend import (
