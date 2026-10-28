@@ -713,7 +713,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             buffers.extend_seq_lens.fill_(self.captured_req_width)
 
         copied_with_plan = (
-            self._prepared_next_draft
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
             and bs == raw_bs
             and bs * self.captured_req_width == num_tokens
             and self._copy_planned_inputs(

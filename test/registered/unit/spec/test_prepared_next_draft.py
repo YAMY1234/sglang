@@ -167,6 +167,57 @@ class TestPreparedNextDraft(CustomTestCase):
             self.assertEqual(get_alloc_reserve_per_decode(), 2 * window)
         prepared_next_draft.prepared_next_draft_enabled.cache_clear()
 
+    def test_cuda_index_plans_leave_cpu_preparation_to_the_stock_path(self):
+        from sglang.kernels.ops.speculative import speculative_index
+
+        seq = torch.tensor([10])
+        with (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+            patch.object(speculative_index, "_module") as load,
+        ):
+            self.assertFalse(
+                speculative_index.extend_layout(
+                    seq=seq,
+                    width=3,
+                    prefix=None,
+                    extend=None,
+                    post=None,
+                    positions=None,
+                    starts=None,
+                    mrope=None,
+                )
+            )
+            self.assertFalse(
+                speculative_index.draft_locs(
+                    req=None,
+                    table=None,
+                    seq=seq,
+                    out_cache_loc=None,
+                    pool_len=32,
+                    topk=1,
+                    steps=3,
+                    batch_size=1,
+                    positions=None,
+                    mrope=None,
+                )
+            )
+            self.assertFalse(
+                speculative_index.chain_tree(
+                    bonus=None,
+                    draft=None,
+                    seq=seq,
+                    mask=None,
+                    positions=None,
+                    retrieve=None,
+                    tokens=None,
+                    req=None,
+                    table=None,
+                    out_cache_loc=None,
+                    mrope=None,
+                )
+            )
+        load.assert_not_called()
+
     def test_inputs_survive_the_length_read_and_are_consumed_once(self):
         """The scheduler may read prepared lengths before the worker consumes the
         matching buffers; reordered, padded, or under-reserved batches must decline."""
@@ -581,9 +632,7 @@ class TestPreparedNextDraft(CustomTestCase):
             req = _req(5, allocated=allocated)
             batch = _decode_prepare_batch([req], penalized=penalized)
             with (
-                self.subTest(
-                    allocated=allocated, penalized=penalized, enabled=enabled
-                ),
+                self.subTest(allocated=allocated, penalized=penalized, enabled=enabled),
                 patch.object(
                     eagle_utils,
                     "get_alloc_reserve_per_decode",
