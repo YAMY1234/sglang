@@ -33,8 +33,15 @@ def _q38_mk_mtp_fc1_act(
                      (n < I)[:, None] & (kk < H)[None, :], 0.0).to(tl.float32)
         wu = tl.load(Up + (expert * I + n[:, None]) * H + kk[None, :],
                      (n < I)[:, None] & (kk < H)[None, :], 0.0).to(tl.float32)
-        gs = tl.load(GateSF + sf_off, (n < I)[:, None] & (kk < H)[None, :], 0).to(tl.float32)
-        us = tl.load(UpSF + sf_off, (n < I)[:, None] & (kk < H)[None, :], 0).to(tl.float32)
+        if TILE_K == 128:
+            # One scale per output row and K block. Do not stage the same
+            # FP32 scale 128 times alongside the FP8 weight tile.
+            sf_row = (expert * triton.cdiv(I + I_SHIFT, 128) + (n + I_SHIFT) // 128) * triton.cdiv(H, 128) + start
+            gs = tl.load(GateSF + sf_row, n < I, 0).to(tl.float32)[:, None]
+            us = tl.load(UpSF + sf_row, n < I, 0).to(tl.float32)[:, None]
+        else:
+            gs = tl.load(GateSF + sf_off, (n < I)[:, None] & (kk < H)[None, :], 0).to(tl.float32)
+            us = tl.load(UpSF + sf_off, (n < I)[:, None] & (kk < H)[None, :], 0).to(tl.float32)
         wg = (wg * gs).to(tl.bfloat16)
         wu = (wu * us).to(tl.bfloat16)
         x = tl.load(X + row * H + kk[None, :] + tl.zeros((16, 1), tl.int32),
@@ -123,8 +130,13 @@ def _q38_mk_mtp_fc1_split(
         mask = (n < I)[:, None] & valid_k[None, :]
         wg = tl.load(Gate + (expert * I + n[:, None]) * H + kk[None, :], mask, 0.0).to(tl.float32)
         wu = tl.load(Up + (expert * I + n[:, None]) * H + kk[None, :], mask, 0.0).to(tl.float32)
-        gs = tl.load(GateSF + sf_off, mask, 0).to(tl.float32)
-        us = tl.load(UpSF + sf_off, mask, 0).to(tl.float32)
+        if TILE_K == 128:
+            sf_row = (expert * triton.cdiv(I + I_SHIFT, 128) + (n + I_SHIFT) // 128) * triton.cdiv(H, 128) + (split * slice_k + chunk * TILE_K) // 128
+            gs = tl.load(GateSF + sf_row, n < I, 0).to(tl.float32)[:, None]
+            us = tl.load(UpSF + sf_row, n < I, 0).to(tl.float32)[:, None]
+        else:
+            gs = tl.load(GateSF + sf_off, mask, 0).to(tl.float32)
+            us = tl.load(UpSF + sf_off, mask, 0).to(tl.float32)
         x = tl.load(X + row * H + kk[None, :] + tl.zeros((16, 1), tl.int32),
                     (m == 0)[:, None] & valid_k[None, :], 0)
         gate_acc = tl.dot(x, tl.trans((wg * gs).to(tl.bfloat16)), gate_acc)
@@ -178,7 +190,7 @@ def _q38_mk_mtp_fc2_partial_act(
 def streaming_experts(x, gate, up, down, gate_sf, up_sf, down_sf, ids, weights,
                       *, tile_i=32, fc1_k=256, tile_n=16, fc2_k=1024,
                       intermediate_offset=0, parallel_fc2=False, return_expert_rows=False,
-                      fc1_splits=1):
+                      fc1_splits=1, fc1_stages=3):
     """Prototype canonical expert layout; not yet wired into the model loader.
 
     Wg/Wu [E,I,H], Wd [E,H,I] FP8; corresponding block128 scale matrices
@@ -198,7 +210,8 @@ def streaming_experts(x, gate, up, down, gate_sf, up_sf, down_sf, ids, weights,
         _q38_mk_mtp_fc1_split[(triton.cdiv(inter, tile_i), m * topk, fc1_splits)](
             x, gate, up, gate_sf, up_sf, ids, partials[0], partials[1],
             H=h, I=inter, TOPK=topk, TILE_I=tile_i, TILE_K=fc1_k,
-            I_SHIFT=intermediate_offset % 128, SPLITS=fc1_splits, num_warps=4)
+            I_SHIFT=intermediate_offset % 128, SPLITS=fc1_splits,
+            num_warps=4, num_stages=fc1_stages)
         _q38_mk_mtp_fc2_partial_act[(triton.cdiv(h, tile_n), m * topk)](
             partials[0], partials[1], down, down_sf, ids, expert_rows, hidden,
             H=h, I=inter, TOPK=topk, TILE_N=tile_n, TILE_K=fc2_k,
@@ -211,7 +224,7 @@ def streaming_experts(x, gate, up, down, gate_sf, up_sf, down_sf, ids, weights,
     _q38_mk_mtp_fc1_act[(triton.cdiv(inter, tile_i), m, topk)](
         x, gate, up, gate_sf, up_sf, ids, hidden,
         H=h, I=inter, TOPK=topk, TILE_I=tile_i, TILE_K=fc1_k,
-        I_SHIFT=intermediate_offset % 128, num_warps=4,
+        I_SHIFT=intermediate_offset % 128, num_warps=4, num_stages=fc1_stages,
     )
     _q38_mk_mtp_fc2_finalize[(triton.cdiv(h, tile_n), m, topk if parallel_fc2 else 1)](
         hidden, down, down_sf, ids, weights, expert_rows,
