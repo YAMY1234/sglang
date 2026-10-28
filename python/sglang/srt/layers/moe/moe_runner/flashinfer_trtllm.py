@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextvars
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Generator, Optional, cast
@@ -41,6 +42,7 @@ from sglang.srt.utils.common import (
 )
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+_Q38C_MK_MOE_ENABLED = os.environ.get("SGLANG_Q38C_MK_MOE", "0") == "1"
 
 logger = __import__("logging").getLogger(__name__)
 
@@ -1655,7 +1657,13 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         if not defer_finalize:
             moe_kwargs["output"] = symm_output
 
-        result = trtllm_fp4_block_scale_moe(**moe_kwargs)
+        result = None
+        if _Q38C_MK_MOE_ENABLED:
+            from sglang.kernels.ops.moe.q38_mk_q35 import maybe_run_service
+
+            result = maybe_run_service(moe_kwargs)
+        if result is None:
+            result = trtllm_fp4_block_scale_moe(**moe_kwargs)
         if defer_finalize:
             result = _make_deferred_finalize_output(result, top_k=topk_config.top_k)
         else:
