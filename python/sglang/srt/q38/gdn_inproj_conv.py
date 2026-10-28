@@ -17,6 +17,9 @@ from .gdn_inproj_conv_core import TgvGemmCuteExtKernel
 
 _CACHE = {}
 _FRONT_STAGES = 12 if os.environ.get("SGLANG_Q38C_GDN_FRONT12", "0") == "1" else 8
+_FRONT_OCC = int(os.environ.get("SGLANG_Q38C_GDN_FRONT_OCC", "0"))
+if _FRONT_OCC:
+    _FRONT_STAGES = {1: 6, 2: 5, 3: 4}[_FRONT_OCC]
 
 
 def _view(t, align=2):
@@ -54,7 +57,7 @@ def run(x, packed_weight, conv_weight, conv_bias, conv_state, state_indices,
     bias = conv_weight[:, 0] if conv_bias is None else conv_bias
     tensors = (a, b, c, c, conv_weight, bias, conv_state,
                state_indices, window, intermediate_indices, conv_out)
-    key = (x.device.index, conv_bias is not None, int(pad_slot),
+    key = (x.device.index, conv_bias is not None, int(pad_slot), _FRONT_OCC,
            tuple((tuple(t.shape), tuple(t.stride()), t.dtype) for t in tensors))
     args = tuple(_view(t, 16 if i in (0, 1, 2, 3) else 2)
                  for i, t in enumerate(tensors))
@@ -64,7 +67,7 @@ def run(x, packed_weight, conv_weight, conv_bias, conv_state, state_indices,
         op = TgvGemmCuteExtKernel(
             cta_m=64, cta_n=8, cta_k=128, num_ab_stage=_FRONT_STAGES,
             use_2cta=False, use_pdl=True, has_bias=False,
-            out_dtype=cutlass.BFloat16)
+            out_dtype=cutlass.BFloat16, exact_smem=bool(_FRONT_OCC))
         op.conv_has_bias = conv_bias is not None
         op.pad_slot = int(pad_slot)
         compiled = cute_ext.compile(op, *args, stream)

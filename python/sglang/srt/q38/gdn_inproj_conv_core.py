@@ -141,6 +141,7 @@ class TgvGemmCuteExtKernel:
         pdl_count: int = -1,
         has_bias: bool = False,
         out_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
+        exact_smem: bool = False,
     ):
         self.acc_dtype = acc_dtype
         self.out_dtype = out_dtype
@@ -152,6 +153,7 @@ class TgvGemmCuteExtKernel:
         self.use_pdl = use_pdl
         self.pdl_launch = pdl_launch if pdl_launch is not None else use_pdl
         self.pdl_count = pdl_count
+        self.exact_smem = exact_smem
         # has_bias: when True, kernel reads a (Gemm_M, Gemm_N, Gemm_L):(1,0,0)
         # bias tensor (M-broadcast over N,L), converts it to fp32 in RMEM, and
         # adds it to the accumulator before the bf16 cast. When False, all
@@ -188,6 +190,7 @@ class TgvGemmCuteExtKernel:
             f"_2cta{int(self.use_2cta)}_pdl{int(self.use_pdl)}"
             f"_bias{int(self.has_bias)}"
             f"_out{self.out_dtype.__name__.lower()}"
+            + (f"_s{self.num_ab_stage}_exactsmem" if self.exact_smem else "")
         )
 
     @cute.experimental.jit
@@ -223,7 +226,7 @@ class TgvGemmCuteExtKernel:
             grid=grid,
             block=(self.threads_per_cta, 1, 1),
             cluster=self.cluster_shape,
-            smem=cute.Int64(utils.get_smem_capacity_in_bytes("sm_100")),
+            smem=None if self.exact_smem else cute.Int64(utils.get_smem_capacity_in_bytes("sm_100")),
             stream=stream,
             use_pdl=self.pdl_launch,
         )
