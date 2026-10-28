@@ -108,10 +108,14 @@ def test_spec_mrope_positions_graph(dtype, mixed):
 @pytest.mark.parametrize("bs", [0, 1, 3, 129])
 @pytest.mark.parametrize("width", [1, 4, 7])
 @pytest.mark.parametrize("mrope", [False, True])
-def test_draft_extend_layout_graph(bs, width, mrope):
+def test_draft_extend_layout_graph(bs, width, mrope, monkeypatch):
     from sglang.kernels.ops.attention.position import compute_position_triton
+    from sglang.kernels.ops.speculative import speculative_index
     from sglang.kernels.ops.speculative.eagle import prepare_draft_extend_layout
 
+    monkeypatch.setattr(
+        speculative_index, "_runtime_optimization_enabled", lambda: True
+    )
     seq = torch.arange(bs * 2, device="cuda", dtype=torch.int64)[::2]
     prepare_draft_extend_layout(seq, width, mrope)
     graph = torch.cuda.CUDAGraph()
@@ -144,11 +148,16 @@ def test_draft_extend_layout_graph(bs, width, mrope):
 @pytest.mark.parametrize("bs", [1, 3, 128, 256])
 @pytest.mark.parametrize("depth", [1, 3, 7])
 @pytest.mark.parametrize("preallocated", [False, True])
-def test_chain_tree_graph(bs, depth, preallocated):
+def test_chain_tree_graph(bs, depth, preallocated, monkeypatch):
+    from sglang.kernels.ops.speculative import speculative_index
     from sglang.kernels.ops.speculative.eagle import build_chain_tree
     from sglang.srt.speculative.eagle_utils import (
         TreeMaskMode,
         build_tree_kernel_efficient,
+    )
+
+    monkeypatch.setattr(
+        speculative_index, "_runtime_optimization_enabled", lambda: True
     )
 
     bonus = torch.arange(bs * 2, device="cuda", dtype=torch.int32)[::2]
@@ -202,9 +211,13 @@ def test_chain_tree_graph(bs, depth, preallocated):
 @pytest.mark.parametrize("bs", [0, 1, 3, 128])
 @pytest.mark.parametrize("depth", [1, 3, 7])
 @pytest.mark.parametrize("mrope", [False, True])
-def test_chain_tree_prepared_outputs_graph(bs, depth, mrope):
+def test_chain_tree_prepared_outputs_graph(bs, depth, mrope, monkeypatch):
+    from sglang.kernels.ops.speculative import speculative_index
     from sglang.kernels.ops.speculative.eagle import build_chain_tree
 
+    monkeypatch.setattr(
+        speculative_index, "_runtime_optimization_enabled", lambda: True
+    )
     table = torch.arange((bs + 3) * 128, dtype=torch.int32, device="cuda").reshape(
         bs + 3, 128
     )[:, ::2]
@@ -306,7 +319,7 @@ def test_prepare_draft_window_matches_draft_locs(
 
     monkeypatch.setattr(
         speculative_index,
-        "nvidia_eagle_decode_fast_path_enabled",
+        "_runtime_optimization_enabled",
         lambda: True,
     )
 

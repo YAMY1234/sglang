@@ -5,12 +5,18 @@ from __future__ import annotations
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit
-from sglang.srt.speculative.prepared_next_draft import (
-    nvidia_eagle_decode_fast_path_enabled,
-)
 
 _INDEX_DTYPES = (torch.int32, torch.int64)
 _descriptors: dict[str, tuple[torch.Tensor, object]] = {}
+
+
+def _runtime_optimization_enabled() -> bool:
+    """Keep the generic index kernels behind the runtime master switch."""
+    from sglang.srt.kernel_plugins.nvidia.binding import (
+        nv_mega_runtime_optimization_enabled,
+    )
+
+    return nv_mega_runtime_optimization_enabled()
 
 
 @cache_once
@@ -48,7 +54,7 @@ def chain_tree(
     out_cache_loc,
     mrope,
 ) -> bool:
-    if not nvidia_eagle_decode_fast_path_enabled() or not (
+    if not _runtime_optimization_enabled() or not (
         bonus.dtype in _INDEX_DTYPES
         and draft.dtype in _INDEX_DTYPES
         and seq.dtype in _INDEX_DTYPES
@@ -93,7 +99,7 @@ def chain_tree(
 def extend_layout(
     *, seq, width, prefix, extend, post, positions, starts, mrope
 ) -> bool:
-    if not nvidia_eagle_decode_fast_path_enabled() or seq.dtype not in _INDEX_DTYPES:
+    if not _runtime_optimization_enabled() or seq.dtype not in _INDEX_DTYPES:
         return False
     descriptor, values = _descriptor("extend_layout", 13)
     values[0] = seq.data_ptr()
@@ -126,7 +132,7 @@ def draft_locs(
     positions,
     mrope,
 ) -> bool:
-    if not nvidia_eagle_decode_fast_path_enabled() or not (
+    if not _runtime_optimization_enabled() or not (
         req.dtype in _INDEX_DTYPES
         and table.dtype in _INDEX_DTYPES
         and seq.dtype in _INDEX_DTYPES
