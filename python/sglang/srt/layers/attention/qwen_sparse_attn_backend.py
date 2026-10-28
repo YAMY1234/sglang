@@ -224,7 +224,11 @@ class QwenSparseAttnBackend(AttentionBackend):
             os.environ.get("SGLANG_Q38C_LOOKUP_NATIVE", "0") == "1"
             and getattr(config, "hidden_size", None) == 2560
             and getattr(config, "hc_count", None) == 4
-            and get_parallel().tp_size == 1
+            and (
+                get_parallel().tp_size == 1
+                or (get_parallel().tp_size == 4
+                    and os.environ.get("SGLANG_Q38C_MK_MTP", "0") == "1")
+            )
             and get_spec().speculative_num_steps == 3
             and get_spec().speculative_eagle_topk == 1
             and self._fused_kv_pool_eligible
@@ -1386,6 +1390,55 @@ class QwenSparseAttnBackend(AttentionBackend):
             self.qsa_profile.budget,
         )
 
+    def get_mtp_front_plan(self, layer, forward_batch, indices):
+        """M1 TP4-only plan; no projection or KV mutation on fallback."""
+        if not (
+            self._fused_kv_pool_eligible
+            and forward_batch.forward_mode.is_decode()
+            and isinstance(indices, DeferredMtpSparseIndices)
+            and indices.shape == (1, self.token_to_kv_pool.qsa_token_topk
+                                      + self.compress_ratio - 1 + indices.tail_width)
+            and self.token_to_kv_pool.qsa_token_topk == 2048
+            and self.compress_ratio == 4 and indices.tail_width == 4
+            and layer.tp_q_head_num == 6 and layer.tp_k_head_num == 1
+            and layer.head_dim == 256
+            and forward_batch.req_pool_indices.numel() == 1
+            and forward_batch.out_cache_loc.numel() == 1
+            and is_sm100_supported()
+            and _resolve_trtllm_sparse_decode() is not None
+        ):
+            return None
+        kc = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        vc = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        if not (kc.dtype == vc.dtype == torch.bfloat16
+                and kc.shape == vc.shape and kc.shape[1:] == (1, 256)
+                and kc.is_contiguous() and vc.is_contiguous()):
+            return None
+        metadata = self._resolve_metadata(forward_batch)
+        if metadata.sequence_lengths.numel() != 1:
+            return None
+        if metadata.is_cuda_graph:
+            counts = metadata.fa2_valid_counts
+            if counts is None:
+                return None
+        else:
+            counts = torch.empty(1, dtype=torch.int32, device=kc.device)
+        stride = (indices.shape[1] + _TRTLLM_SPARSE_PAGE_SIZE - 1) // _TRTLLM_SPARSE_PAGE_SIZE * _TRTLLM_SPARSE_PAGE_SIZE
+        capacity = self._cuda_graph_max_tokens if metadata.is_cuda_graph else 1
+        pk, pv = self._get_fa2_scratch(capacity * stride, 1, 256, kc.dtype, kc.device)
+        if not getattr(self, "_q38_mtp_front_logged", False):
+            logger.info("Q38C MK MTP front active: M1 Q6/KV1 BF16 Deferred T=%s stride=%s",
+                        indices.shape[1], stride)
+            self._q38_mtp_front_logged = True
+        from sglang.kernels.ops.speculative.q38_mk_mtp.front import MtpFrontPlan
+
+        return MtpFrontPlan(
+            kc, vc, forward_batch.out_cache_loc, self.req_to_token_pool.req_to_token,
+            metadata.row_req_pool_indices if metadata.row_req_pool_indices is not None
+            else forward_batch.req_pool_indices,
+            indices, metadata.sequence_lengths, counts, pk[:stride], pv[:stride],
+        )
+
     def _try_fused_kv_attention(self, q, k, v, layer, forward_batch, indices, output_gate=None):
         if not self._fused_kv_pool_eligible or not q.is_cuda or k is None or v is None:
             return None
@@ -1769,6 +1822,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         topk_indices: torch.Tensor,
         trtllm_decode,
         new_kv=None,
+        prepared_kv=None,
     ) -> torch.Tensor:
         """Pack selected KV at page-aligned row strides for FlashInfer's paged decode,
         driven by a static arange block table and the per-row valid counts."""
@@ -1806,7 +1860,9 @@ class QwenSparseAttnBackend(AttentionBackend):
             packed_dtype,
             k_buffer.device,
         )
-        if new_kv is not None:
+        if prepared_kv is not None:
+            valid_counts, packed_k, packed_v = prepared_kv
+        elif new_kv is not None:
             k, v, loc, width = new_kv
             row_requests = metadata.row_req_pool_indices
             if row_requests is None:
@@ -1911,6 +1967,17 @@ class QwenSparseAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         if topk_indices is None:
             raise ValueError("QSA sparse attention requires topk_indices")
+        prepared = kwargs.get("q38_mtp_prepared")
+        if prepared is not None:
+            # The fused front already persisted current KV and packed selection.
+            # Keep native FMHA, workspace, counters and ordinary completion.
+            return self._forward_trtllm_sparse(
+                q.reshape(-1, layer.tp_q_head_num, layer.head_dim),
+                self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                layer, forward_batch, self._resolve_metadata(forward_batch),
+                topk_indices, _resolve_trtllm_sparse_decode(), prepared_kv=prepared,
+            )
         if save_kv_cache:
             fused_output = self._try_fused_kv_attention(
                 q, k, v, layer, forward_batch, topk_indices
