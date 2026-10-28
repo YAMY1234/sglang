@@ -503,7 +503,7 @@ class TestPrePlannedReplayRestage(CustomTestCase):
         runner._resolve_lora_variant = lambda _: None
         runner._resolve_attention_variant = lambda *_: None
         runner._make_graph_key = lambda *key: key
-        # SGLANG_Q35MF_MKH_N3B on
+        # Redundant input staging is disabled.
         runner._restage_skip, runner._staged_inputs = True, None
         return runner
 
