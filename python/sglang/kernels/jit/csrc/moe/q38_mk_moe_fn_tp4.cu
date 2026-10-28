@@ -647,7 +647,7 @@ q38_fn_moe_tp4(const __grid_constant__ CUtensorMap tm13,
   if (threadIdx.x == 0) {
     stamp(p, 0);
     mbar_init(&s.route_done, 1);
-    if (rank == 1) mbar_expect_tx(&s.route_done, 1280 + 4);
+    if (rank == 1) mbar_expect_tx(&s.route_done, 1344 + 4);
     fence_mbar_init();
   }
   if (warp == 1 && lane == 0) {
@@ -705,7 +705,7 @@ q38_fn_moe_tp4(const __grid_constant__ CUtensorMap tm13,
     fence_proxy_async_smem();
     if (warp == 0 && lane == 0) {
       const uint32_t bar = mapa(smem_u32(&s.route_done), 1);
-      bulk_s2s(mapa(smem_u32(&s.cand[0][0]), 1), smem_u32(&s.cand[0][0]), 1280, bar);
+      bulk_s2s(mapa(smem_u32(&s.cand[0][0]), 1), smem_u32(&s.cand[0][0]), 1344, bar);
       st_async_b32(mapa(smem_u32(&s.expert), 1), (uint32_t)s.expert, bar);
     }
   } else {
@@ -1046,7 +1046,7 @@ q38_fn_moe_tp4(const __grid_constant__ CUtensorMap tm13,
 }
 
 static_assert(sizeof(Smem) + 1024 == Q35_MKM_SMEM_BYTES, "the launcher's dynamic shared memory size");
-static_assert(sizeof(((Smem*)0)->cand) + sizeof(((Smem*)0)->ids) == 1280, "metadata copy");
+static_assert(sizeof(((Smem*)0)->cand) + sizeof(((Smem*)0)->ids) == 1344, "metadata copy");
 
 }  // namespace qwen_mkm_moe_tp4
 }  // namespace sglang
