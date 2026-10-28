@@ -1773,11 +1773,11 @@ class SchedulerDisaggregationPrefillMixin:
             send_state_indices = state_indices if segment_is_last else None
             if fence_staging_gather:
                 fence_staging_gather = False
-                event = torch.cuda.Event()
+                event = self.device_module.Event()
                 event.record(
                     self.forward_stream
                     if self.enable_overlap
-                    else torch.cuda.current_stream()
+                    else self.device_module.current_stream()
                 )
                 sender._early_send_wait_event = event
             if indices_event is not None:

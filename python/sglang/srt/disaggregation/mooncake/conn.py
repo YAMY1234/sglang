@@ -3122,9 +3122,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         # A decode worker gives every room the same destination sessions. Shard
         # by room so those transfers use all workers while every chunk of one
-        # room stays ordered on a single queue. Low room bits may encode the
-        # decode DP rank, so use the request portion above them.
-        shard_idx = (bootstrap_room >> 16) % len(self.transfer_queues)
+        # room stays ordered on a single queue. Some routers encode a request
+        # id above a 16-bit DP-rank suffix, while the public API also permits
+        # ordinary consecutive room ids; fold both halves so either form fans
+        # out across the queues.
+        shard_key = (bootstrap_room >> 16) + (bootstrap_room & 0xFFFF)
+        shard_idx = shard_key % len(self.transfer_queues)
 
         if trace_ctx is None:
             trace_ctx = TraceNullContext()

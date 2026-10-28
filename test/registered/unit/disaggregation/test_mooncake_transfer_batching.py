@@ -473,7 +473,7 @@ class TestMooncakeEarlySend(CustomTestCase):
         ready.synchronize.assert_not_called()
         indices_ready.synchronize.assert_not_called()
 
-    def test_manager_shards_transfers_by_bootstrap_room(self):
+    def test_manager_shards_encoded_bootstrap_rooms(self):
         queues = [SimpleQueue() for _ in range(3)]
         rooms = [(1 << 16) + 7, (2 << 16) + 7]
         manager = SimpleNamespace(
@@ -489,9 +489,29 @@ class TestMooncakeEarlySend(CustomTestCase):
                 manager, room, [0], slice(0, 1), False
             )
 
-        self.assertTrue(queues[0].empty())
-        self.assertEqual(queues[1].get_nowait().room, rooms[0])
-        self.assertEqual(queues[2].get_nowait().room, rooms[1])
+        self.assertEqual(queues[2].get_nowait().room, rooms[0])
+        self.assertEqual(queues[0].get_nowait().room, rooms[1])
+        self.assertTrue(queues[1].empty())
+
+    def test_manager_shards_consecutive_bootstrap_rooms(self):
+        queues = [SimpleQueue() for _ in range(3)]
+        rooms = [7, 8, 9]
+        manager = SimpleNamespace(
+            disaggregation_mode=DisaggregationMode.PREFILL,
+            request_status={room: KVPoll.WaitingForInput for room in rooms},
+            check_status=lambda room: KVPoll.WaitingForInput,
+            transfer_infos={room: {"127.0.0.1:80": object()} for room in rooms},
+            transfer_queues=queues,
+        )
+
+        for room in rooms:
+            MooncakeKVManager.add_transfer_request(
+                manager, room, [0], slice(0, 1), False
+            )
+
+        self.assertEqual(queues[1].get_nowait().room, 7)
+        self.assertEqual(queues[2].get_nowait().room, 8)
+        self.assertEqual(queues[0].get_nowait().room, 9)
 
     def _worker(self, event):
         chunk = TransferKVChunk(

@@ -171,19 +171,24 @@ class TestDcpCachedPrefixSend(CustomTestCase):
             disagg_prefill_pending_chunk_rids=set(),
         )
         current_stream = Mock()
+        device_module = SimpleNamespace(
+            Event=Mock(return_value=event),
+            current_stream=Mock(return_value=current_stream),
+        )
+        scheduler.device_module = device_module
         with (
             patch(
                 "sglang.srt.disaggregation.prefill.get_schedule",
                 return_value=SimpleNamespace(chunked_prefill_size=2),
             ),
-            patch.object(torch.cuda, "Event", return_value=event),
-            patch.object(torch.cuda, "current_stream", return_value=current_stream),
         ):
             SchedulerDisaggregationPrefillMixin._send_kv_chunk(
                 scheduler, req, last_chunk=False, end_idx=4
             )
 
         self.assertEqual(sender.events, [event, None])
+        device_module.Event.assert_called_once_with()
+        device_module.current_stream.assert_called_once_with()
         event.record.assert_called_once_with(current_stream)
 
 

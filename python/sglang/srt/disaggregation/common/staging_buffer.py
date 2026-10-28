@@ -186,6 +186,19 @@ def _scatter_staging_pages_kernel(
 _DEVICE_I64_CACHE: dict[tuple, torch.Tensor] = {}
 
 
+def _page_tile_scatter_eligible(
+    requested: bool, page_size: int, elems_per_token: int
+) -> bool:
+    """Whether both compile-time arange dimensions are valid Triton blocks."""
+    return (
+        requested
+        and page_size > 0
+        and page_size & (page_size - 1) == 0
+        and elems_per_token > 0
+        and elems_per_token & (elems_per_token - 1) == 0
+    )
+
+
 def _cached_device_i64(key: tuple, values: list[int], device) -> torch.Tensor:
     tensor = _DEVICE_I64_CACHE.get(key)
     if tensor is None:
@@ -734,6 +747,9 @@ def _scatter_staging_to_kv_triton(
     )
     elems_per_token = num_heads * head_dim
     per_layer_elems = num_tokens * elems_per_token
+    use_page_tiles = _page_tile_scatter_eligible(
+        use_page_tiles, page_size, elems_per_token
+    )
 
     pointers = [buf.data_ptr() for buf in k_buffers] + [
         buf.data_ptr() for buf in v_buffers
@@ -773,7 +789,7 @@ def _scatter_staging_to_kv_triton(
     staging_typed = staging_buffer_view[:total_staging_bytes].view(int_dtype)
 
     num_layers_x2 = 2 * num_layers
-    if use_page_tiles and triton.next_power_of_2(elems_per_token) == elems_per_token:
+    if use_page_tiles:
         _scatter_staging_pages_kernel[
             (num_tokens // page_size, num_writers * num_layers_x2)
         ](

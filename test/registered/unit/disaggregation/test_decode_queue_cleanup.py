@@ -122,6 +122,15 @@ class TestDeferredPreallocMetadata(CustomTestCase):
         queue.transfer_queue = SimpleNamespace(enable_staging=False)
         queue._deferred_sends = deque()
         queue._num_published_destinations = 0
+        event = MagicMock()
+        event.query.return_value = False
+        current_stream = object()
+        queue.scheduler = SimpleNamespace(
+            device_module=SimpleNamespace(
+                Event=MagicMock(return_value=event),
+                current_stream=MagicMock(return_value=current_stream),
+            )
+        )
 
         receiver = SimpleNamespace(require_staging=False, send_metadata=MagicMock())
         decode_req = SimpleNamespace(
@@ -136,24 +145,10 @@ class TestDeferredPreallocMetadata(CustomTestCase):
             is_rebootstrap=False,
         )
         kv_indices = torch.arange(16, 24, dtype=torch.int64)
-        event = MagicMock()
-        event.query.return_value = False
-        torch_empty = torch.empty
-
-        def unpinned_empty(shape, *, dtype, pin_memory):
-            self.assertTrue(pin_memory)
-            return torch_empty(shape, dtype=dtype)
-
-        with (
-            patch(
-                "sglang.srt.disaggregation.decode.torch.empty",
-                side_effect=unpinned_empty,
-            ),
-            patch(
-                "sglang.srt.disaggregation.decode.torch.cuda.Event",
-                return_value=event,
-            ),
-        ):
+        with patch(
+            "sglang.srt.disaggregation.decode.async_d2h",
+            side_effect=lambda tensor: tensor.cpu(),
+        ) as copy_to_host:
             queue._defer_kv_metadata(
                 decode_req,
                 kv_indices,
@@ -165,7 +160,10 @@ class TestDeferredPreallocMetadata(CustomTestCase):
         self.assertEqual(decode_req.metadata_buffer_index, 7)
         self.assertEqual(queue._num_published_destinations, 1)
         decode_req.req.time_stats.set_decode_transfer_queue_entry_time.assert_called_once()
-        event.record.assert_called_once()
+        self.assertEqual(copy_to_host.call_count, 2)
+        queue.scheduler.device_module.Event.assert_called_once_with()
+        queue.scheduler.device_module.current_stream.assert_called_once_with()
+        event.record.assert_called_once_with(current_stream)
 
         queue.flush_deferred_sends()
         receiver.send_metadata.assert_not_called()

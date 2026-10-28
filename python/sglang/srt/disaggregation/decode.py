@@ -137,7 +137,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
 )
 from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu
-from sglang.srt.utils.common import async_h2d
+from sglang.srt.utils.common import async_d2h, async_h2d
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import is_in_ci
@@ -1890,16 +1890,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     ]
                 )
             )
-        host_indices = []
-        for device_tensor in device_indices:
-            host_tensor = torch.empty(
-                device_tensor.shape, dtype=device_tensor.dtype, pin_memory=True
-            )
-            host_tensor.copy_(device_tensor, non_blocking=True)
-            host_indices.append(host_tensor)
-
-        copy_done = torch.cuda.Event()
-        copy_done.record()
+        # Keep this path backend-neutral: async_d2h uses pinned memory when the
+        # active accelerator supports it and falls back to a synchronous host
+        # copy otherwise.  The scheduler's device module supplies the matching
+        # event/stream implementation for CUDA, ROCm, XPU, and NPU.
+        host_indices = [async_d2h(device_tensor) for device_tensor in device_indices]
+        device_module = self.scheduler.device_module
+        copy_done = device_module.Event()
+        copy_done.record(device_module.current_stream())
         if (
             self.transfer_queue.enable_staging
             and decode_req.kv_receiver.require_staging

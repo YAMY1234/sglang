@@ -13,6 +13,7 @@ from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import AckTarget, CommonKVManager
 from sglang.srt.disaggregation.common.staging_buffer import (
     StagingAllocator,
+    _page_tile_scatter_eligible,
 )
 from sglang.srt.disaggregation.common.staging_handler import (
     DecodeStagingHandler,
@@ -1467,6 +1468,14 @@ class TestDeferredStagingScatter(unittest.TestCase):
                 ),
             ):
                 self.assertEqual(_deferred_scatter_enabled(), expected)
+
+    def test_page_tile_scatter_requires_power_of_two_dimensions(self):
+        self.assertTrue(_page_tile_scatter_eligible(True, 64, 128))
+        for page_size in (3, 48):
+            with self.subTest(page_size=page_size):
+                self.assertFalse(_page_tile_scatter_eligible(True, page_size, 128))
+        self.assertFalse(_page_tile_scatter_eligible(True, 64, 96))
+        self.assertFalse(_page_tile_scatter_eligible(False, 64, 128))
 
     def test_complete_arrival_waits_for_scheduler_flush(self):
         receiver = SimpleNamespace()
