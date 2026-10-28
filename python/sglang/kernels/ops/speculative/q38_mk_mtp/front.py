@@ -5,12 +5,41 @@ pack CTA independently transforms the current K, so it never consumes another
 CTA's newly written cache entry. Static selection, dynamic tail, LOC0, counts
 and BF16 cache boundaries follow qsa.fused_kv. No indexer is recomputed.
 """
+from dataclasses import dataclass
+
 import torch
 import triton
 import triton.language as tl
 
 from sglang.srt.layers.attention.qsa.fused_kv import _mtp_lookup_positions
 from sglang.srt.layers.attention.qsa.mtp_lookup import DeferredMtpSparseIndices
+
+
+@dataclass(frozen=True)
+class MtpFrontPlan:
+    key_cache: torch.Tensor
+    value_cache: torch.Tensor
+    locations: torch.Tensor
+    req_to_token: torch.Tensor
+    row_requests: torch.Tensor
+    indices: DeferredMtpSparseIndices
+    lengths: torch.Tensor
+    counts: torch.Tensor
+    packed_k: torch.Tensor
+    packed_v: torch.Tensor
+
+    @property
+    def prepared_kv(self):
+        return self.counts, self.packed_k, self.packed_v
+
+    def prepare(self, q_gate, k, v, q_gamma, k_gamma, cos_sin, positions,
+                axis_map, *, eps):
+        return prepare_front(
+            q_gate, k, v, q_gamma, k_gamma, cos_sin, positions, axis_map,
+            self.key_cache, self.value_cache, self.locations, self.req_to_token,
+            self.row_requests, self.indices, self.lengths, self.counts,
+            self.packed_k, self.packed_v, eps=eps,
+        )
 
 
 @triton.jit

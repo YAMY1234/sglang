@@ -1880,6 +1880,7 @@ class Qwen4ExpAttentionDecoderLayer(
         from sglang.srt.layers.attention.qsa.glue import build_qsa_indexer
 
         self.is_qsa = is_qwen_qsa(config)
+        self._q38_mtp_is_nextn = is_nextn
         self._qsa_prefill_topk_bridge = None
         if self.is_qsa:
             self.indexer = build_qsa_indexer(
@@ -1971,12 +1972,54 @@ class Qwen4ExpAttentionDecoderLayer(
             )
         return topk_indices
 
+    def _try_mk_mtp_self_attention(self, positions, hidden_states, forward_batch):
+        if not (
+            self._q38_mtp_is_nextn and self.is_qsa and self.attn_output_gate
+            and forward_batch.forward_mode.is_decode()
+            and hidden_states.is_cuda and hidden_states.dtype == torch.bfloat16
+            and hidden_states.shape == (1, 2560)
+            and self.num_heads == 6 and self.num_kv_heads == 1
+            and self.head_dim == 256 and self.rotary_emb.rotary_dim == 64
+            and not is_in_breakable_cuda_graph()
+        ):
+            return None
+        from sglang.srt.layers.attention.qsa.glue import resolve_qsa_sparse_backend
+
+        backend = resolve_qsa_sparse_backend(get_attn_backend())
+        make_plan = getattr(backend, "get_mtp_front_plan", None)
+        if (make_plan is None or not backend._q38c_lookup_native
+                or not backend.should_reuse_mtp_sparse_indices(forward_batch)):
+            return None
+        indices = backend.lookup_mtp_sparse_indices(forward_batch, self.layer_id)
+        plan = make_plan(self.attn, forward_batch, indices)
+        if plan is None:
+            return None
+        qkv, _ = self.qkv_proj(hidden_states)
+        q_gate, k, v = qkv.split([self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
+        q, gate = plan.prepare(
+            q_gate, k, v, self.q_norm.weight.data, self.k_norm.weight.data,
+            self.rotary_emb.cos_sin_cache, positions,
+            self.rotary_emb.axis_map if positions.dim() == 2 else None,
+            eps=self.q_norm.variance_epsilon,
+        )
+        output = self.attn(
+            q.reshape(1, -1), None, None, forward_batch, save_kv_cache=False,
+            topk_indices=indices, q38_mtp_prepared=plan.prepared_kv,
+        )
+        output = fused_sigmoid_mul(output, gate, inplace=True)
+        output, _ = self.o_proj(output)
+        return output
+
     def self_attention(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        if _Q38_MK_MTP:
+            output = self._try_mk_mtp_self_attention(positions, hidden_states, forward_batch)
+            if output is not None:
+                return output
         overlap_indexer = (
             self.is_qsa
             and self.alt_stream is not None
