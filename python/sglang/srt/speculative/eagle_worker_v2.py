@@ -1472,9 +1472,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             self.target_worker, supports_sharded_verify=True
         )
         # not in __init__, which the standalone and frozen-KV workers do not run
-        if (
-            self._draft_worker is not None
-            and envs.SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.get()
+        if self._draft_worker is not None and (
+            envs.SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.get()
+            or envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
         ):
             self._init_post_verify_graphs()
 
@@ -2163,7 +2163,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             dw._rebuild_topk1_chain_buffers()
 
     def verify(self, batch: ScheduleBatch, pp_proxy_tensors=None, grammar_barrier=None):
-        # SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING: the compact top-k branch, when
+        # The compact top-k branch, when
         # every request allows it, in the post-verify graphs and the eager verify
         max_top_k = compact_verify_max_top_k(batch)
         return run_eagle_verify(

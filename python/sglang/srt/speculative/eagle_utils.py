@@ -33,9 +33,6 @@ from sglang.srt.mem_cache.allocation_sizing import (
     page_aligned_decode_alloc_lens,
 )
 from sglang.srt.runtime_context import get_exec, get_spec
-from sglang.srt.speculative.prepared_next_draft import (
-    prepared_next_draft_enabled,
-)
 from sglang.srt.speculative.sharded_verify import (
     VocabShard,
     gather_full_logits,
@@ -66,8 +63,6 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
 _is_cpu = is_cpu()
-_COMPACT_VERIFY_SAMPLING = envs.SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING.get()
-_PACKED_VERIFY_BCAST = envs.SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST.get()
 
 # The binding defaults probe this explicit capability once instead of relying on
 # exception handling in the hot path.  Runtime itself remains independent of the
@@ -582,10 +577,12 @@ def _can_use_sparse_uno_tree_target_sampling(
 
 
 def compact_verify_max_top_k(batch: ScheduleBatch) -> Optional[int]:
-    """The support for eagle_sample's compact top-k branch under
-    SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING, or None for the dense branch: every
-    request must sample with a finite top-k within the compact limit."""
-    if not _COMPACT_VERIFY_SAMPLING or batch.forward_mode.is_idle():
+    """Compact top-k support, or None for the dense branch: every request must
+    sample with a finite top-k within the compact limit."""
+    if (
+        not envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+        or batch.forward_mode.is_idle()
+    ):
         return None
     from sglang.srt.speculative.uno_utils import _SPARSE_TOP_K_LIMIT
 
@@ -924,7 +921,7 @@ def eagle_sample(
         bs=bs,
         depth=verify_input.max_tree_depth,
         device=device,
-        packed=_PACKED_VERIFY_BCAST,
+        packed=envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get(),
         init=not fused_verify,
     )
 
@@ -1313,7 +1310,7 @@ def _verify_outputs(
     *, rows: int, bs: int, depth: int, device, packed: bool, init: bool = True
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """predict [rows] (zeros), accept_index [bs, depth] (-1) and num_correct_drafts
-    [bs] int32; packed (SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST): views of one buffer,
+    [bs] int32; packed: views of one buffer,
     returned last so a sampled result goes to the TP group in one broadcast. Without
     init they are left unset, for chain_accept to write whole."""
     if not packed:
@@ -1354,7 +1351,7 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     for r in batch.reqs:
         r.decode_batch_idx += 1
 
-    if num_needed_tokens == 0 and prepared_next_draft_enabled():
+    if num_needed_tokens == 0 and envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
         # No device allocation is needed; settle only the host-side watermark.
         update_spec_decode_allocated_lens(batch.reqs, nxt_kv_lens)
         batch.spec_decode_schedule_stream_idle = not (
