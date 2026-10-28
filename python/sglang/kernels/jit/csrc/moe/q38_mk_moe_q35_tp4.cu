@@ -874,18 +874,14 @@ q35_mkm_moe_tp4(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
       const uint8_t* sf = s.ring[b] + 32768;
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
-        // A 96-intermediate half starts at physical W13 row 192*rank.
-        // Rank 1 therefore starts halfway through a 128-row SF atom. Gather
-        // each local SF row from the two native atoms; rows >=192 are padding.
-        uint32_t r[8];
-#pragma unroll
-        for (int w = 0; w < 8; ++w) {
-          const int local_row = lane + 32 * w;
-          const int native_row = (int)rank * kN1c + local_row;
-          const int atom = native_row / 128 - (int)rank;
-          const int offset = atom * 2048 + i * 512 + (native_row % 32) * 16 + ((native_row % 128) / 32) * 4;
-          r[w] = local_row < kN1c ? *reinterpret_cast<const uint32_t*>(sf + offset) : 0u;
-        }
+        // Same six native words as the I192 scalar gather. Rank 1 begins
+        // halfway through the first atom; retain Q35's vector atom loads.
+        const uint4 v0 = *reinterpret_cast<const uint4*>(sf + i * 512 + lane * 16);
+        const uint4 v1 = *reinterpret_cast<const uint4*>(sf + 2048 + i * 512 + lane * 16);
+        const uint32_t r[8] = {
+            rank ? v0.z : v0.x, rank ? v0.w : v0.y,
+            rank ? v1.x : v0.z, rank ? v1.y : v0.w,
+            rank ? v1.z : v1.x, rank ? v1.w : v1.y, 0u, 0u};
         tmem_st_x8(tm + lane_addr + kColSfb + (uint32_t)((st * 4 + i) % kSfbSlots) * 8, r);
       }
       uint32_t xr[16];
@@ -1002,13 +998,15 @@ q35_mkm_moe_tp4(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
           const int jt = a / 3, kb = a % 3;
           const int row = 32 * col + lane;
           uint32_t sfword = 0;
+          if (jt < kFc2Stages && row / 8 == jt) {
 #pragma unroll
-          for (int b = 0; b < 4; ++b) {
-            const int group = 4 * kb + b;
-            const auto* half_sf = reinterpret_cast<const uint8_t*>(&s.hsf[row % 8][2 * (group / 6)]);
-            sfword |= (uint32_t)half_sf[group % 6] << (8 * b);
+            for (int b = 0; b < 4; ++b) {
+              const int group = 4 * kb + b;
+              const auto* half_sf = reinterpret_cast<const uint8_t*>(&s.hsf[row % 8][2 * (group / 6)]);
+              sfword |= (uint32_t)half_sf[group % 6] << (8 * b);
+            }
           }
-          r[i] = (jt < kFc2Stages && row / 8 == jt) ? sfword : 0u;
+          r[i] = sfword;
         }
         tmem_st_x32(tm + lane_addr + kColSfa + half * 32, r);
       }
