@@ -435,6 +435,31 @@ def sharded_target_tokens(
         )
     splits = key_splits(shard.valid)
     keys = shard_keys(logits, shard, temperatures, seeds, splits)
+    return reduce_sharded_token_keys(keys, tp_group, splits=splits)
+
+
+def reduce_sharded_token_keys(
+    keys: torch.Tensor,
+    tp_group,
+    *,
+    splits: int,
+) -> torch.Tensor:
+    """Reduce provider-neutral local token keys to one global token per row.
+
+    ``keys`` has shape ``[rows, splits]`` (or ``[rows]`` for one split), with
+    larger int64 keys winning.  Runtime owns the LL/multimem/NCCL exchange while
+    callers own the numeric policy that produced each local key.
+    """
+    if splits <= 0:
+        raise ValueError(f"splits must be positive, got {splits}")
+    if keys.ndim not in (1, 2) or (keys.ndim == 1 and splits != 1):
+        raise ValueError(
+            f"keys shape {tuple(keys.shape)} is incompatible with splits={splits}"
+        )
+    if keys.ndim == 2 and keys.shape[1] != splits:
+        raise ValueError(
+            f"keys shape {tuple(keys.shape)} is incompatible with splits={splits}"
+        )
     if 0 < keys.shape[0] <= _LL_MAX_ROWS and tp_group.world_size <= 16:
         tokens = _ll_keys(keys, tp_group)
         if tokens is not None:

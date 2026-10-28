@@ -25,6 +25,7 @@ from sglang.srt.speculative.sharded_verify import (
     gather_full_logits,
     key_splits,
     keys_to_tokens,
+    reduce_sharded_token_keys,
     shard_keys,
     sharded_target_tokens,
 )
@@ -188,6 +189,21 @@ class TestShardedGreedy(CustomTestCase):
         ll.assert_called_once()
         mc.assert_called_once()
         self.assertTrue(torch.equal(got, torch.argmax(full.float(), dim=-1)))
+
+    def test_provider_keys_reuse_the_generic_exchange(self):
+        keys = torch.tensor(
+            [[11, 7], [5, 13], [3, 2]], dtype=torch.int64, device="cuda"
+        )
+        gathered = torch.cat((keys.reshape(-1), (keys + 100).reshape(-1)))
+        group = SimpleNamespace(world_size=2)
+        group.all_gather_into_tensor = lambda output, _input: output.copy_(gathered)
+        with (
+            patch.object(sharded_verify, "_ll_keys", return_value=None),
+            patch.object(sharded_verify, "_mc_gather_keys", return_value=None),
+        ):
+            got = reduce_sharded_token_keys(keys, group, splits=2)
+        want = keys_to_tokens(gathered, tp_size=2, splits=2)
+        self.assertTrue(torch.equal(got, want))
 
 
 @triton.jit
