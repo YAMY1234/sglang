@@ -76,6 +76,25 @@ def _bundle(device_index):
     return expert, finalize_kernel, final
 
 
+@cache
+def _sf_pack_bundle(device_index):
+    """Load the independently built SF-pack expert; retain qualified finalize."""
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError('Q38 SF-pack AOT bundle must load during eager graph warmup')
+    _, finalize_kernel, final = _bundle(device_index)
+    root = Path(os.environ['SGLANG_Q38C_MK_MOE_SF_PACK_AOT'])
+    manifest = json.loads((root / 'manifest.json').read_text())
+    source = Path(__file__).resolve().parents[2] / 'jit/csrc/moe/q38_mk_moe_q35_sf_pack_tp4.cu'
+    baseline = Path(os.environ['SGLANG_Q38C_MK_MOE_AOT']) / 'manifest.json'
+    assert manifest['source_sha256'] == hashlib.sha256(source.read_bytes()).hexdigest()
+    assert manifest['base_manifest_sha256'] == hashlib.sha256(baseline.read_bytes()).hexdigest()
+    assert manifest['shape'] == [H, I, E, TOPK, GRID, CLUSTER, SHARED]
+    assert manifest['pdl_trigger'] == 0
+    cubin = root / 'q35-sf-pack.cubin'
+    assert manifest['cubin_sha256'] == hashlib.sha256(cubin.read_bytes()).hexdigest()
+    return load(cubin), finalize_kernel, final
+
+
 def _finalize(kernel, metadata, rows, weights, output):
     # Same MTP ordered body, ordinary stream launch: it has no PDL wait.
     cu = jit.driver()
@@ -120,7 +139,10 @@ def maybe_run_service(kwargs):
             or kwargs['gemm1_alpha'] is not None or kwargs['gemm1_beta'] is not None
             or kwargs['gemm1_clamp_limit'] is not None):
         return None
-    kernel, finalize_kernel, final_metadata = _bundle(xq.device.index)
+    sf_pack = os.environ.get('SGLANG_Q38C_MK_MOE_SF_PACK', '0') == '1' and m in (1, 4)
+    kernel, finalize_kernel, final_metadata = (
+        _sf_pack_bundle(xq.device.index) if sf_pack else _bundle(xq.device.index)
+    )
     layer = dict(gemm1_weights=kwargs['gemm1_weights'], gemm2_weights=kwargs['gemm2_weights'],
                  gemm1_weights_scale=kwargs['gemm1_weights_scale'], gemm2_weights_scale=kwargs['gemm2_weights_scale'],
                  output1_scale_gate_scalar=kwargs['output1_scale_gate_scalar'],
@@ -132,11 +154,11 @@ def maybe_run_service(kwargs):
     run(kernel, maps(layer['gemm1_weights'], layer['gemm2_weights'], xq),
         kwargs['routing_logits'], weights, ids, kwargs['hidden_states_scale'], layer, rows)
     capturing = torch.cuda.is_current_stream_capturing()
-    signature = m, capturing, kwargs['do_finalize']
+    signature = m, capturing, kwargs['do_finalize'], sf_pack
     if signature not in _seen:
         _seen.add(signature)
-        logger.info('Q38C_MK_MOE_ACTIVE M=%d I=192 capture=%s finalize=%s grid=140 cluster=2',
-                    m, capturing, kwargs['do_finalize'])
+        logger.info('Q38C_MK_MOE_ACTIVE M=%d I=192 capture=%s finalize=%s grid=140 cluster=2 sf_pack=%s',
+                    m, capturing, kwargs['do_finalize'], sf_pack)
     if not kwargs['do_finalize']:
         return rows.view(m * TOPK, H), weights, permutation
     output = kwargs.get('output')
