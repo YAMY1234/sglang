@@ -19,6 +19,7 @@
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 
 import logging
+import os
 from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -467,6 +468,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 layer_id, self._q38_router_hybrid, self._q38_router_hybrid_splits,
             )
         self._use_mega_moe = get_moe_a2a_backend().is_megamoe()
+        self._q38c_router_fused = (
+            os.getenv("SGLANG_Q38C_ROUTER_FUSED", "0") == "1" and not is_nextn
+        )
+        if self._q38c_router_fused:
+            from sglang.kernels.ops.moe.q38_router_fused import initialize
+
+            if not _is_cuda or not get_moe_a2a_backend().is_none():
+                raise ValueError("Q38C fused router requires CUDA and native MoE dispatch")
+            initialize(self, config)
         self._mega_top_k = config.num_experts_per_tok + self.num_fused_shared_experts
         self._mega_intermediate_size = config.moe_intermediate_size
         self._mega_hidden_size = config.hidden_size
@@ -775,6 +785,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         *,
         defer_finalize: bool = False,
+        precomputed_router=None,
     ):
         if _use_aiter and self.enable_shared_expert_fusion and not defer_finalize:
             from sglang.kernels.ops.moe.smallm_router_gfx950 import qwen_moe_topk_output
@@ -783,7 +794,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 return self.experts(hidden_states, topk_output)
         # Keep the BF16 input for shared experts and original-width dispatch.
         pre_quant_input = None
-        if (
+        if precomputed_router is not None:
+            router_logits, pre_quant_input = precomputed_router
+        elif (
             self._q38_router_front
             and (
                 hidden_states.shape[0] in self._q38_router_hybrid_splits
@@ -852,6 +865,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         use_fused_gate: bool = False,
         defer_finalize: bool = False,
+        precomputed_router=None,
     ) -> torch.Tensor:
         current_stream = torch.cuda.current_stream()
 
@@ -860,7 +874,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # the shared branch reads the same input and writes a separate output.
             self.alt_stream.wait_stream(current_stream)
             router_output = self._forward_router_experts(
-                hidden_states, defer_finalize=True
+                hidden_states,
+                defer_finalize=True,
+                precomputed_router=precomputed_router,
             )
             with torch.cuda.stream(self.alt_stream):
                 shared_output = self._forward_shared_experts(
@@ -899,7 +915,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # ===== END TO BE REFACTORED ====
 
         with torch.cuda.stream(self.alt_stream):
-            router_output = self._forward_router_experts(hidden_states)
+            router_output = self._forward_router_experts(
+                hidden_states, precomputed_router=precomputed_router
+            )
 
         current_stream.wait_stream(self.alt_stream)
 
@@ -937,6 +955,19 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             and not is_npu()
         )
 
+        precomputed_router = None
+        if (
+            self._q38c_router_fused
+            and num_tokens in (1, 4)
+            and not torch.compiler.is_compiling()
+            and not is_in_tc_piecewise_cuda_graph()
+        ):
+            from sglang.kernels.ops.moe.q38_router_fused import produce
+
+            # Static router weights may load during the previous main-stream
+            # kernel. Keep the real alt-stream event and all shared/gate joins.
+            precomputed_router = produce(self, hidden_states)
+
         if hidden_states.shape[0] == 0:
             # M=0 guard for idle DP ranks: skip shared_experts and gate
             # (which crash on empty tensors in FP4 GEMM), but still call
@@ -958,6 +989,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 hidden_states,
                 use_fused_gate=use_fused_gate,
                 defer_finalize=defer_finalize,
+                precomputed_router=precomputed_router,
             )
         else:
             shared_output = self._forward_shared_experts(
@@ -968,7 +1000,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     hidden_states, shared_output
                 )
             final_hidden_states = self._forward_router_experts(
-                hidden_states, defer_finalize=defer_finalize
+                hidden_states,
+                defer_finalize=defer_finalize,
+                precomputed_router=precomputed_router,
             )
 
         if defer_finalize:
