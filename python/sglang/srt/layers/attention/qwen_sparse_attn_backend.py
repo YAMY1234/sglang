@@ -63,6 +63,7 @@ logger = logging.getLogger(__name__)
 _TRTLLM_SPARSE_PAGE_SIZE = 64
 _Q38_ATTN_CORE_V1 = os.environ.get("Q38_ATTN_CORE_V1", "0") == "1"
 _Q38C_ATTN_CORE_TP4 = os.environ.get("SGLANG_Q38C_ATTN_CORE_TP4", "0") == "1"
+_Q38C_GLUE_MERGE = os.environ.get("SGLANG_Q38C_GLUE_MERGE", "0") == "1"
 
 
 @lru_cache(maxsize=1)
@@ -1270,6 +1271,27 @@ class QwenSparseAttnBackend(AttentionBackend):
         bs = int(forward_batch.batch_size)
         if bs == 0 or forward_batch.req_pool_indices.numel() < bs:
             return
+        if (
+            _Q38C_GLUE_MERGE
+            and bs == 1
+            and getattr(forward_batch.spec_info, "num_accept_tokens", None) is not None
+        ):
+            from sglang.kernels.ops.speculative.mtp_capture_metadata import (
+                try_capture_metadata,
+            )
+
+            if try_capture_metadata(
+                topk_indices,
+                self._capture_extend_seq_lens(forward_batch)[:bs],
+                forward_batch.spec_info.num_accept_tokens[:bs],
+                forward_batch.req_pool_indices[:bs],
+                metadata.get_seqlens_expanded(),
+                state.indices[state.layer_slots[int(layer_id)]],
+                state.captured_len[state.layer_slots[int(layer_id)]],
+                forward_batch.spec_info.num_front_tokens,
+                state.trash_row,
+            ):
+                return
         request_extend_lens = self._capture_extend_seq_lens(forward_batch)[:bs].long()
         block_ends = request_extend_lens.cumsum(0) - 1
         spec_info = forward_batch.spec_info
