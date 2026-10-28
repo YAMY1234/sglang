@@ -29,6 +29,9 @@ typedef unsigned char u8;
 typedef unsigned short u16;
 typedef unsigned int u32;
 
+#ifndef MK_GDN2
+#define MK_GDN2 0
+#endif
 #define KD 128
 #define VD 128
 #define RING 16
@@ -92,6 +95,20 @@ struct Params {
   long long y_stride;
   u16* o_out;            // [rows, HV, V] replay output (STORE_O)
   long long* prof;       // PROF: clock64 stamps [cta][warp][8]
+#if MK_GDN2
+  const float* partial;  // fixed K2 projection, part0 + part1 then BF16
+  long long part_stride, packed_stride;
+  const u16* conv_state;  // read-only until the original accepted-window commit
+  long long conv_slot, conv_channel, conv_element;
+  const u16* conv_weight;
+  long long conv_weight_channel, conv_weight_element;
+  const u16* conv_bias;
+  long long conv_bias_stride;
+  u16* conv_window;
+  long long window_slot, window_step, window_channel, window_element;
+  const void* intermediate_indices;
+  int intermediate_index64;
+#endif
 };
 
 __device__ __forceinline__ float bflo(u32 x) { return __int_as_float(x << 16); }
@@ -122,6 +139,50 @@ __device__ __forceinline__ u8 f2e4m3(float x) {
   asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(r) : "f"(x));
   return (u8)(r & 0xff);
 }
+#if MK_GDN2
+__device__ __forceinline__ float add_rn(float a, float b) {
+  float y; asm("add.rn.f32 %0, %1, %2;" : "=f"(y) : "f"(a), "f"(b)); return y;
+}
+__device__ __forceinline__ float mul_rn(float a, float b) {
+  float y; asm("mul.rn.f32 %0, %1, %2;" : "=f"(y) : "f"(a), "f"(b)); return y;
+}
+__device__ __forceinline__ u16 projection(const Params& p, long long row, int feature) {
+  const long long off = row * p.packed_stride + feature;
+  return f2bf(add_rn(p.partial[off], p.partial[p.part_stride + off]));
+}
+__device__ __forceinline__ float native_silu(float x) {
+  float y;
+  asm("{ .reg .f32 e,d; mul.rn.f32 e,%1,-1.4426950408889634; ex2.approx.f32 e,e; add.rn.f32 d,e,1.0; div.full.f32 %0,%1,d; }"
+      : "=f"(y) : "f"(x));
+  return y;
+}
+__device__ __forceinline__ void conv4(const Params& p, long long row0, long long slot,
+                                     long long inter, int channel, bool owner,
+                                     u16* shared, int shared_stride, int shared_channel) {
+  const u16* state = p.conv_state + slot * p.conv_slot + channel * p.conv_channel;
+  u16 h0=state[0], h1=state[p.conv_element], h2=state[2*p.conv_element];
+  const u16* weight = p.conv_weight + channel * p.conv_weight_channel;
+  const float w0=bf2f(weight[0]), w1=bf2f(weight[p.conv_weight_element]);
+  const float w2=bf2f(weight[2*p.conv_weight_element]), w3=bf2f(weight[3*p.conv_weight_element]);
+  const float bias=p.conv_bias ? bf2f(p.conv_bias[channel*p.conv_bias_stride]) : 0.f;
+#pragma unroll
+  for(int t=0;t<4;++t) {
+    const u16 x=projection(p,row0+t,channel);
+    float acc=add_rn(bias,bfround(mul_rn(bf2f(h0),w0)));
+    acc=add_rn(acc,bfround(mul_rn(bf2f(h1),w1)));
+    acc=add_rn(acc,bfround(mul_rn(bf2f(h2),w2)));
+    acc=add_rn(acc,bfround(mul_rn(bf2f(x),w3)));
+    h0=h1; h1=h2; h2=x;
+    shared[t*shared_stride+shared_channel]=f2bf(native_silu(acc));
+    if(owner) {
+      u16* window=p.conv_window+inter*p.window_slot+t*p.window_step+channel*p.window_channel;
+      window[0]=h0; window[p.window_element]=h1; window[2*p.window_element]=h2;
+    }
+  }
+  // Never write active history: all three V-head CTAs may still be reading it.
+}
+#endif
+
 __device__ __forceinline__ float pick8(const float (&a)[8], int i) {
   float r = a[0];
 #pragma unroll
@@ -190,7 +251,12 @@ __device__ __forceinline__ long long prof_time_after(float dep) {
 #endif
 
 // MINB 3: three CTAs an SM (168 registers, no spill), for grids past two waves of two an SM
-extern "C" __global__ void __launch_bounds__(NW * 32, MINB) q38_mkgdn_core(const Params p) {
+#if MK_GDN2
+#define Q38_CORE_NAME q38_mkgdn2_core
+#else
+#define Q38_CORE_NAME q38_mkgdn_core
+#endif
+extern "C" __global__ void __launch_bounds__(NW * 32, MINB) Q38_CORE_NAME(const Params p) {
   constexpr int GRP = HV / HK;
   const int cta = blockIdx.x;
   const int slice = cta % (VD / VROWS);
@@ -350,7 +416,22 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) q38_mkgdn_core(const
   pdl_wait();
   STAMP(2, 0.f);
 
+#if MK_GDN2
+  __shared__ __align__(16) u16 conv_qk[4][256];
+  __shared__ __align__(16) u16 conv_v[4][128];
+  const long long inter=load_index(p.intermediate_indices,n,p.intermediate_index64!=0);
+  if(tid<256) {
+    const int channel=(tid<128 ? hk*128+tid : HK*128+hk*128+tid-128);
+    conv4(p,row0,slot,inter,channel,hv%GRP==0,&conv_qk[0][0],256,tid);
+  }
+  if(tid<128)
+    conv4(p,row0,slot,inter,2*HK*128+hv*128+tid,true,&conv_v[0][0],128,tid);
+  __syncthreads();
+#endif
+
+#if !MK_GDN2
   const u16* xr = p.x + (row0 + (r < TT ? r : 0)) * p.x_stride;
+#endif
   const bool rowok = r < TT;
   const bool ok0 = t0 < TT, ok1 = t1 < TT;
   // every activation load is issued here, right after the wait
@@ -358,8 +439,13 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) q38_mkgdn_core(const
   U4 QR[4];
 #pragma unroll
   for (int c = 0; c < 4; ++c) {
+#if MK_GDN2
+    QR[c] = rowok ? ld16(&conv_qk[r][32*c+8*q]) : zero4();
+    KR[c] = rowok ? ld16(&conv_qk[r][128+32*c+8*q]) : zero4();
+#else
     QR[c] = rowok ? ld16(xr + hk * KD + 32 * c + 8 * q) : zero4();
     KR[c] = rowok ? ld16(xr + HK * KD + hk * KD + 32 * c + 8 * q) : zero4();
+#endif
   }
   // v / z of this lane's (v, t): [m][(h, t)] = (h0, t0), (h0, t1), (h1, t0), (h1, t1)
   u16 vr[MT][4], zr[MT][4];
@@ -368,20 +454,40 @@ extern "C" __global__ void __launch_bounds__(NW * 32, MINB) q38_mkgdn_core(const
 #pragma unroll
     for (int h = 0; h < 2; ++h) {
       const int v = vb + 16 * m + 8 * h + r;
+#if !MK_GDN2
       const u16* xv = p.x + 2 * HK * KD + hv * VD + v;
+#endif
 
+#if MK_GDN2
+      vr[m][2*h]=ok0 ? conv_v[t0][v] : (u16)0;
+      vr[m][2*h+1]=ok1 ? conv_v[t1][v] : (u16)0;
+#else
       vr[m][2 * h] = ok0 ? xv[(row0 + t0) * p.x_stride] : (u16)0;
       vr[m][2 * h + 1] = ok1 ? xv[(row0 + t1) * p.x_stride] : (u16)0;
+#endif
 #if FUSED_NORM
+#if !MK_GDN2
       const u16* zv = p.z + hv * VD + v;
+#endif
+#if MK_GDN2
+      zr[m][2*h]=ok0 ? projection(p,row0+t0,(2*HK+HV)*128+hv*128+v) : (u16)0;
+      zr[m][2*h+1]=ok1 ? projection(p,row0+t1,(2*HK+HV)*128+hv*128+v) : (u16)0;
+#else
       zr[m][2 * h] = ok0 ? zv[(row0 + t0) * p.z_stride] : (u16)0;
       zr[m][2 * h + 1] = ok1 ? zv[(row0 + t1) * p.z_stride] : (u16)0;
+#endif
 #endif
     }
   u16 ar = 0, br_ = 0;
   if (lane < TT) {
+#if MK_GDN2
+    constexpr int BA=(2*HK+2*HV)*128;
+    ar=projection(p,row0+lane,BA+HV+hv);
+    br_=projection(p,row0+lane,BA+hv);
+#else
     ar = p.a[(row0 + lane) * p.ab_stride + hv];
     br_ = p.b[(row0 + lane) * p.ab_stride + hv];
+#endif
   }
   float kmul;       // 1 / |k_r|
   {

@@ -146,9 +146,11 @@ class MkGdnFront:
         pdl_count: int = -1,
         has_bias: bool = False,
         out_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
+        fuse_conv: bool = True,
     ):
         self.acc_dtype = acc_dtype
         self.out_dtype = out_dtype
+        self.fuse_conv = fuse_conv
         self.cta_m = cta_m
         self.cta_n = cta_n
         self.cta_k = cta_k
@@ -1016,46 +1018,47 @@ class MkGdnFront:
         # needed; the explicit `predicated_tensor_origin` marker isn't either.
         cute_ext.partition_and_copy(thr_t2r, rD, gD_epi[None, None, 0, 0])
 
-        feature_base = cute.arch.block_idx()[0] * 64
-        if feature_base < self.qkv_channels:
-            # All producers are these same 128 epilogue threads. No cross-CTA
-            # publication/spin or dependency on a later-scheduled CTA.
-            cute_ext.partition_and_copy(thr_t2r, rD, sE)
-            cute.arch.barrier(barrier_id=1, number_of_threads=128)
-            for local_request in cutlass.range_constexpr(self.cta_n // 4):
-                request = cute.arch.block_idx()[1] * (self.cta_n // 4) + local_request
-                if request < self.verify_rows // 4:
-                    if epi_tid < 64:
-                        channel = feature_base + epi_tid
-                        slot = cutlass.Int64(state_indices[request])
-                        if slot != self.pad_slot:
-                            inter = cutlass.Int64(intermediate_indices[request])
-                            c0 = conv_state[slot, channel, 0]
-                            c1 = conv_state[slot, channel, 1]
-                            c2 = conv_state[slot, channel, 2]
-                            w0 = conv_weight[channel, 0]
-                            w1 = conv_weight[channel, 1]
-                            w2 = conv_weight[channel, 2]
-                            w3 = conv_weight[channel, 3]
-                            bias_value = cutlass.Float32(0.0)
-                            if cutlass.const_expr(self.conv_has_bias):
-                                bias_value = cutlass.Float32(conv_bias[channel])
-                            for token in cutlass.range_constexpr(4):
-                                xt = sE[epi_tid, local_request * 4 + token]
-                                # Native Triton BF16*BF16 products round to BF16 before
-                                # accumulation into its FP32 accumulator (no FMA).
-                                acc = _add_product(bias_value, c0, w0)
-                                acc = _add_product(acc, c1, w1)
-                                acc = _add_product(acc, c2, w2)
-                                acc = _add_product(acc, xt, w3)
-                                c0 = c1
-                                c1 = c2
-                                c2 = xt
-                                window[inter, token, channel, 0] = c0
-                                window[inter, token, channel, 1] = c1
-                                window[inter, token, channel, 2] = c2
-                                conv_out[request * 4 + token, channel] = cutlass.BFloat16(_silu(acc))
-                            # effective state_len=3; no acceptance-offset/tree path.
-                            conv_state[slot, channel, 0] = c0
-                            conv_state[slot, channel, 1] = c1
-                            conv_state[slot, channel, 2] = c2
+        if cutlass.const_expr(self.fuse_conv):
+            feature_base = cute.arch.block_idx()[0] * 64
+            if feature_base < self.qkv_channels:
+                # All producers are these same 128 epilogue threads. No cross-CTA
+                # publication/spin or dependency on a later-scheduled CTA.
+                cute_ext.partition_and_copy(thr_t2r, rD, sE)
+                cute.arch.barrier(barrier_id=1, number_of_threads=128)
+                for local_request in cutlass.range_constexpr(self.cta_n // 4):
+                    request = cute.arch.block_idx()[1] * (self.cta_n // 4) + local_request
+                    if request < self.verify_rows // 4:
+                        if epi_tid < 64:
+                            channel = feature_base + epi_tid
+                            slot = cutlass.Int64(state_indices[request])
+                            if slot != self.pad_slot:
+                                inter = cutlass.Int64(intermediate_indices[request])
+                                c0 = conv_state[slot, channel, 0]
+                                c1 = conv_state[slot, channel, 1]
+                                c2 = conv_state[slot, channel, 2]
+                                w0 = conv_weight[channel, 0]
+                                w1 = conv_weight[channel, 1]
+                                w2 = conv_weight[channel, 2]
+                                w3 = conv_weight[channel, 3]
+                                bias_value = cutlass.Float32(0.0)
+                                if cutlass.const_expr(self.conv_has_bias):
+                                    bias_value = cutlass.Float32(conv_bias[channel])
+                                for token in cutlass.range_constexpr(4):
+                                    xt = sE[epi_tid, local_request * 4 + token]
+                                    # Native Triton BF16*BF16 products round to BF16 before
+                                    # accumulation into its FP32 accumulator (no FMA).
+                                    acc = _add_product(bias_value, c0, w0)
+                                    acc = _add_product(acc, c1, w1)
+                                    acc = _add_product(acc, c2, w2)
+                                    acc = _add_product(acc, xt, w3)
+                                    c0 = c1
+                                    c1 = c2
+                                    c2 = xt
+                                    window[inter, token, channel, 0] = c0
+                                    window[inter, token, channel, 1] = c1
+                                    window[inter, token, channel, 2] = c2
+                                    conv_out[request * 4 + token, channel] = cutlass.BFloat16(_silu(acc))
+                                # effective state_len=3; no acceptance-offset/tree path.
+                                conv_state[slot, channel, 0] = c0
+                                conv_state[slot, channel, 1] = c1
+                                conv_state[slot, channel, 2] = c2

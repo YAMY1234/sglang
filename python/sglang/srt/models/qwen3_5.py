@@ -999,6 +999,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             backend = get_attn_backend()
             backend = getattr(backend, "linear_attn_backend", backend)
             if backend.q38_inproj_conv_supported(forward_batch):
+                if os.environ.get("SGLANG_Q38C_MK_GDN2", "0") == "1" and self.attn_tp_size == 4:
+                    normalized = backend.forward_mkgdn2(
+                        self.attn, forward_batch, hidden_states, self._fused_in_proj_weight,
+                        norm_weight=self.norm.weight, norm_eps=self.norm.eps,
+                    )
+                    return self.out_proj(normalized.reshape(hidden_states.shape[0], -1))[0]
                 normalized, _ = backend.forward_inproj_conv(
                     self.attn, forward_batch, hidden_states, self._fused_in_proj_weight,
                     norm_weight=self.norm.weight, norm_eps=self.norm.eps,

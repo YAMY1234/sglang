@@ -1377,6 +1377,35 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 and meta.retrieve_next_sibling is None
                 and meta.retrieve_parent_token is None)
 
+    def forward_mkgdn2(self, layer, forward_batch, x, weight, *, norm_weight, norm_eps):
+        from sglang.kernels.ops.attention.q38_mkgdn2 import core
+        from sglang.srt.q38.q38_mkgdn2_front import project_splitk
+
+        meta = self.forward_metadata
+        params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        pool = self.req_to_token_pool.mamba_pool
+        if (params.temporal.dtype != torch.bfloat16 or params.replayssm_d is None
+            or getattr(pool, "replayssm_cache_base", None) is None
+            or getattr(pool, "replayssm_spec_fold", False)
+            or getattr(pool, "replayssm_is_kda", False)):
+            raise ValueError("MK_GDN2 requires the native BF16 circular ReplaySSM path")
+        batch = x.shape[0] // 4
+        partial = project_splitk(x, weight)
+        normalized = core(
+            partial, layer.conv_weights, layer.bias, params.conv[0],
+            params.intermediate_conv_window[0], self.verify_intermediate_state_indices[:batch],
+            layer.A_log, layer.dt_bias, params.temporal,
+            params.replayssm_d, params.replayssm_k, params.replayssm_g,
+            params.replayssm_rawv, params.replayssm_rawk,
+            meta.mamba_cache_indices[:batch], forward_batch.req_pool_indices[:batch],
+            pool.replayssm_spec_write_pos, pool.replayssm_cache_base, pool.replayssm_is_flush,
+            norm_weight, eps=norm_eps,
+        )
+        if not getattr(self, "_q38_mkgdn2_logged", False):
+            logger.info("Q38C_MK_GDN2_READY layer=%d heads=4/12 Kparts=2 warps=8 defer_active_conv=1", layer.layer_id)
+            self._q38_mkgdn2_logged = True
+        return normalized
+
     def forward_inproj_conv(self, layer, forward_batch, x, weight, *, norm_weight=None, norm_eps=1e-6):
         if os.environ.get("SGLANG_Q38C_MK_GDN", "0") == "1":
             from sglang.srt.q38.q38_mkgdn_front import run
