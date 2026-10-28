@@ -165,12 +165,11 @@ void q38_mk_moe_pipeline(const __grid_constant__ CUtensorMap w13,
    };
    for(int g=0;g<10;++g)stage_sf(g);
    mbar_wait(&s.fc1_done,0);tc_fence_after();
-   // All four warps read the valid TMEM row quarter, disjoint column ranges.
-   {
-    uint32_t v[N1/4];const int col=q*(N1/4);
-    drain<N1/4>(tm+col,v);
-    tmem_ld_wait();
-    if(lane<Rows)for(int j=0;j<N1/4;j+=4)
+   // Only quarter0 can read token rows0..15. Other warps cannot use a row0
+   // address to access quarter0: TMEM load access is restricted by warp id.
+   if(q==0)for(int col=0;col<N1;col+=64){
+    uint32_t v[64];ld64(tm+col,v);tmem_ld_wait();
+    if(lane<Rows)for(int j=0;j<64;j+=4)
      *reinterpret_cast<uint4*>(&s.acc[lane][col+j])=make_uint4(v[j],v[j+1],v[j+2],v[j+3]);
    }
    wg_sync();
@@ -196,8 +195,8 @@ void q38_mk_moe_pipeline(const __grid_constant__ CUtensorMap w13,
    for(int tile=0;tile<10;++tile){
     stage_sf(10+tile);
     mbar_wait(&s.tile_done,tile&1);tc_fence_after();
-    {
-     uint32_t v[64];const int col=q*64;ld64(tm+col,v);tmem_ld_wait();
+    if(q==0)for(int col=0;col<256;col+=64){
+     uint32_t v[64];ld64(tm+col,v);tmem_ld_wait();
      if(lane<Rows)for(int j=0;j<64;j+=4)
       *reinterpret_cast<uint4*>(&s.partial[rank][lane][col+j])=make_uint4(v[j],v[j+1],v[j+2],v[j+3]);
     }
