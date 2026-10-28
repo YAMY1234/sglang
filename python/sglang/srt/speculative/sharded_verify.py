@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Target sampling of an EAGLE verify on vocabulary-sharded LM-head output.
+"""Greedy target sampling on vocabulary-sharded LM-head output.
 
 Each rank reduces its ``[rows, V / tp]`` shard to int64 keys. A small cross-rank
-exchange then picks the winning token. Greedy rows match ``torch.argmax`` over the
-gathered FP32 logits bit for bit. The opt-in temperature path uses Gumbel-max and
-therefore preserves the softmax distribution, but not the stock sampler's RNG stream.
+exchange then picks the winning token, matching ``torch.argmax`` over gathered FP32
+logits bit for bit. Alternate numeric policies can produce compatible local keys and
+reuse :func:`reduce_sharded_token_keys` without owning the collective.
 """
 
 from __future__ import annotations
@@ -17,16 +17,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.kernel_plugins.nvidia.policy import megakernel_slot_requested
-
 logger = logging.getLogger(__name__)
-
-SHARDED_GUMBEL_SLOT = "sharded_gumbel"
-
-
-def sharded_gumbel_requested() -> bool:
-    """Whether distribution-equivalent Gumbel sampling is explicitly requested."""
-    return megakernel_slot_requested(SHARDED_GUMBEL_SLOT)
 
 
 class VocabShard(msgspec.Struct, frozen=True):
@@ -45,15 +36,12 @@ _KEY_FLOOR = -2139095041 << 32
 def _shard_key_kernel(
     logits_ptr,
     stride_row,
-    temp_ptr,
-    seed_ptr,
     keys_ptr,
     start,
     valid,
     vocab_size,
     span,
     KEY_FLOOR: tl.constexpr,
-    HAS_TEMP: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     # program (row, part): columns [part * span, (part + 1) * span) of the row's shard
@@ -62,10 +50,6 @@ def _shard_key_kernel(
     lo = part * span
     hi = tl.minimum(lo + span, valid)
     best = tl.full([BLOCK], KEY_FLOOR, tl.int64)
-    if HAS_TEMP:
-        temp = tl.load(temp_ptr + row)
-        inv_t = 1.0 / tl.maximum(temp, 1e-20)
-        seed = tl.load(seed_ptr + row)
     for off in range(lo, hi, BLOCK):
         cols = off + tl.arange(0, BLOCK)
         gid = start + cols
@@ -74,10 +58,6 @@ def _shard_key_kernel(
             logits_ptr + row * stride_row + cols, mask=mask, other=float("-inf")
         )
         x = x.to(tl.float32)
-        if HAS_TEMP:
-            if temp > 0.0:
-                u = tl.rand(seed, gid)
-                x = x * inv_t - tl.log(-tl.log(u))
         # NaN never wins, as after sanitize_nan_logits; -0.0 ties +0.0 as in torch.argmax
         x = tl.where(x == x, x, float("-inf")) + 0.0
         bits = x.to(tl.int32, bitcast=True)
@@ -101,15 +81,11 @@ def key_splits(valid: int) -> int:
 def shard_keys(
     logits: torch.Tensor,
     shard: VocabShard,
-    temperatures: Optional[torch.Tensor] = None,
-    seeds: Optional[torch.Tensor] = None,
     splits: int = 1,
 ) -> torch.Tensor:
     """One int64 key per row of this rank's shard: (order-preserving FP32 bits of the
-    row's best value) << 32 | (0xFFFFFFFF - token id). temperatures: [rows] float32;
-    rows at T <= 0 take the plain logit, rows at T > 0 logit / T + Gumbel noise drawn
-    from seeds [rows] int64 and the global token id. splits > 1: [rows, splits], the
-    best key of each of `splits` column ranges (the row's key is their max)."""
+    row's best value) << 32 | (0xFFFFFFFF - token id). ``splits > 1`` returns
+    ``[rows, splits]``, the best key from each column range."""
     assert logits.stride(-1) == 1
     rows = logits.shape[0]
     keys = torch.empty(
@@ -119,19 +95,15 @@ def shard_keys(
     )
     if rows == 0:
         return keys
-    has_temp = temperatures is not None
     _shard_key_kernel[(rows, splits)](
         logits,
         logits.stride(0),
-        temperatures if has_temp else keys,
-        seeds if has_temp else keys,
         keys,
         shard.start,
         shard.valid,
         shard.vocab_size,
         -(-shard.valid // splits),
         KEY_FLOOR=_KEY_FLOOR,
-        HAS_TEMP=has_temp,
         BLOCK=_KEY_BLOCK,
         num_warps=8,
     )
@@ -425,16 +397,10 @@ def sharded_target_tokens(
     logits: torch.Tensor,
     shard: VocabShard,
     tp_group,
-    temperatures: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """[rows] token ids over the whole vocabulary from every rank's logits shard."""
-    seeds = None
-    if temperatures is not None:
-        seeds = torch.randint(
-            0, 2**31 - 1, (logits.shape[0],), dtype=torch.int64, device=logits.device
-        )
     splits = key_splits(shard.valid)
-    keys = shard_keys(logits, shard, temperatures, seeds, splits)
+    keys = shard_keys(logits, shard, splits)
     return reduce_sharded_token_keys(keys, tp_group, splits=splits)
 
 

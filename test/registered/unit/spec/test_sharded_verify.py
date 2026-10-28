@@ -1,12 +1,10 @@
 """Target sampling on vocabulary shards.
 
-Greedy: the per-shard keys reduced across shards pick exactly torch.argmax over the
-gathered FP32 logits, ties to the smaller token id included, at TP 2 / 4 / 8.
-Temperature rows: the Gumbel-max sample has the distribution softmax(logits / T),
-whole or split into shards (chi-square against the exact probabilities). The
-fallback gather rebuilds the stock gathered FP32 logits exactly. The LL key exchange
-returns every row's max over all ranks' keys, launch after launch, whether the other
-ranks' words are already there or land while it polls."""
+The per-shard keys reduced across shards pick exactly torch.argmax over the gathered
+FP32 logits, ties to the smaller token id included, at TP 2 / 4 / 8. The fallback
+gather rebuilds the stock gathered FP32 logits exactly. The LL key exchange returns
+every row's max over all ranks' keys, launch after launch, whether the other ranks'
+words are already there or land while it polls."""
 
 import unittest
 from types import SimpleNamespace
@@ -16,10 +14,8 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.environ import envs
 from sglang.srt.speculative import eagle_utils, sharded_verify
 from sglang.srt.speculative.sharded_verify import (
-    SHARDED_GUMBEL_SLOT,
     VocabShard,
     _reduce_keys,
     gather_full_logits,
@@ -78,20 +74,13 @@ class TestShardedPolicy(CustomTestCase):
                 watermark=False,
             )
 
-    def test_greedy_is_automatic_but_gumbel_is_opt_in(self):
-        with patch(
-            "sglang.srt.kernel_plugins.nvidia.binding.megakernel_enabled",
-            return_value=True,
-        ):
-            with envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override(""):
-                self.assertTrue(self._applies(greedy=True))
-                self.assertFalse(self._applies(greedy=False))
-            with envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override(SHARDED_GUMBEL_SLOT):
-                self.assertTrue(self._applies(greedy=False))
-                self.assertFalse(self._applies(greedy=False, top_k=True))
+    def test_only_greedy_rows_stay_sharded(self):
+        self.assertTrue(self._applies(greedy=True))
+        self.assertFalse(self._applies(greedy=False))
+        self.assertFalse(self._applies(greedy=False, top_k=True))
 
 
-def _sharded_tokens(full, tp, temperatures=None, seeds=None, split=False):
+def _sharded_tokens(full, tp, split=False):
     width = -(-full.shape[1] // tp)
     splits = key_splits(width) if split else 1
     keys = []
@@ -99,7 +88,7 @@ def _sharded_tokens(full, tp, temperatures=None, seeds=None, split=False):
         start = rank * width
         part = full[:, start : start + width].contiguous()
         shard = VocabShard(start=start, valid=part.shape[1], vocab_size=full.shape[1])
-        keys.append(shard_keys(part, shard, temperatures, seeds, splits).view(-1))
+        keys.append(shard_keys(part, shard, splits).view(-1))
     return keys_to_tokens(torch.cat(keys), tp, splits)
 
 
@@ -124,21 +113,6 @@ class TestShardedGreedy(CustomTestCase):
                     with self.subTest(rows=rows, tp=tp, split=split):
                         got = _sharded_tokens(full, tp, split=split)
                         self.assertTrue(torch.equal(got, want))
-
-    def test_split_temperature_rows_match_unsplit(self):
-        # the Gumbel noise is drawn per (seed, token id), so splitting a shard's columns
-        # into parts picks the same token as one program over the shard
-        gen = torch.Generator(device="cuda").manual_seed(2)
-        rows = 56
-        full = (torch.randn(rows, VOCAB, device="cuda", generator=gen) * 3).bfloat16()
-        temps = torch.rand(rows, device="cuda", generator=gen) + 0.3
-        temps[::5] = 0.0
-        seeds = torch.randint(0, 2**31 - 1, (rows,), device="cuda", generator=gen)
-        for tp in (1, 8, 16):
-            with self.subTest(tp=tp):
-                want = _sharded_tokens(full, tp, temps, seeds)
-                got = _sharded_tokens(full, tp, temps, seeds, split=True)
-                self.assertTrue(torch.equal(got, want))
 
     def test_reduce_strided_rank_rows(self):
         # the multimem exchange's layout: a buffer row per logits row, rank r's parts at
@@ -326,45 +300,6 @@ class TestGatherFullLogits(CustomTestCase):
                 shard = VocabShard(start=0, valid=width, vocab_size=1000)
                 got = gather_full_logits(shards[0], shard, _FakeGroup(shards))
                 self.assertTrue(torch.equal(got, full.float()))
-
-
-@unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
-class TestShardedGumbel(CustomTestCase):
-    def _check(self, logits, temperature, tp, samples=200_000):
-        from scipy.stats import chi2
-
-        # one logits row repeated with stride 0; every row draws its own noise
-        full = logits.view(1, -1).expand(samples, -1)
-        temps = torch.full((samples,), temperature, device="cuda")
-        seeds = torch.arange(samples, device="cuda", dtype=torch.int64) * 7919 + 1
-        width = -(-logits.numel() // tp)
-        keys = []
-        for rank in range(tp):
-            start = rank * width
-            part = full[:, start : start + width]
-            shard = VocabShard(
-                start=start, valid=part.shape[1], vocab_size=logits.numel()
-            )
-            keys.append(shard_keys(part, shard, temps, seeds))
-        tokens = keys_to_tokens(torch.cat(keys), tp)
-        counts = torch.bincount(tokens, minlength=logits.numel()).double()
-        probs = torch.softmax(logits.double() / temperature, dim=-1)
-        expected = probs * samples
-        # pool the tail so every bin expects at least 5 draws
-        big = expected >= 5
-        obs = torch.cat([counts[big], counts[~big].sum().view(1)])
-        exp = torch.cat([expected[big], expected[~big].sum().view(1)])
-        stat = ((obs - exp) ** 2 / exp.clamp_min(1e-12)).sum().item()
-        p_value = chi2.sf(stat, obs.numel() - 1)
-        self.assertGreater(p_value, 1e-4, f"chi2 {stat:.1f} over {obs.numel()} bins")
-
-    def test_distribution(self):
-        gen = torch.Generator(device="cuda").manual_seed(1)
-        logits = (torch.randn(4096, device="cuda", generator=gen) * 3).bfloat16()
-        for temperature in (1.0, 0.6):
-            for tp in (1, 8):
-                with self.subTest(temperature=temperature, tp=tp):
-                    self._check(logits, temperature, tp)
 
 
 if __name__ == "__main__":

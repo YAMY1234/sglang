@@ -37,7 +37,6 @@ from sglang.srt.speculative.prepared_next_draft import (
 from sglang.srt.speculative.sharded_verify import (
     VocabShard,
     gather_full_logits,
-    sharded_gumbel_requested,
     sharded_target_tokens,
 )
 from sglang.srt.utils import (
@@ -576,9 +575,9 @@ def _sharded_sampling_applies(
 ) -> bool:
     """Whether this verify can consume vocabulary-sharded logits directly.
 
-    Greedy rows are bitwise-preserving and dispatch automatically. Temperature-only
-    Gumbel-max sampling is distribution-equivalent and requires its numeric slot.
-    Anything that reads or edits full logits stays on the stock gathered path.
+    Greedy rows are bitwise-preserving and dispatch automatically. Anything that
+    reads, edits or samples full logits stays on the stock gathered path; alternate
+    numeric sampling policies belong behind the post-verify hook boundary.
     """
     info = batch.sampling_info
     spec = get_spec()
@@ -592,17 +591,7 @@ def _sharded_sampling_applies(
         and info.acc_scaling_penalties is None
         and info.logit_bias is None
         and info.sampling_seed is None
-        and (
-            info.is_all_greedy
-            or (
-                sharded_gumbel_requested()
-                and not (
-                    info.need_top_k_sampling
-                    or info.need_top_p_sampling
-                    or info.need_min_p_sampling
-                )
-            )
-        )
+        and info.is_all_greedy
         and not spec.speculative_use_rejection_sampling
         and spec.speculative_accept_threshold_single == 1.0
         and spec.speculative_accept_threshold_acc == 1.0
@@ -820,44 +809,6 @@ def eagle_sample(
                 tp_group.broadcast(predict, src=0)
                 tp_group.broadcast(accept_index, src=0)
                 tp_group.broadcast(num_correct_drafts, src=0)
-    elif vocab_shard is not None:
-        # temperature-only rows: a Gumbel-max target sample per row, then the greedy
-        # check against it (exact for a topk-1 chain, whose drafts are deterministic)
-        target_predict = sharded_target_tokens(
-            next_token_logits,
-            vocab_shard,
-            get_parallel().tp_group,
-            temperatures=torch.repeat_interleave(
-                sampling_info.temperatures.view(-1),
-                verify_input.draft_token_num,
-                dim=0,
-            ),
-        ).reshape(bs, verify_input.draft_token_num)
-        if fused_verify:
-            _chain_accept(
-                predict=predict,
-                accept_index=accept_index,
-                num_correct_drafts=num_correct_drafts,
-                candidates=candidates,
-                verify_input=verify_input,
-                target_predict=target_predict,
-                bonus_target=None,
-                simulated_acc_len=None,
-                real_draft_tokens=False,
-                finish=False,
-            )
-        else:
-            predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
-                predicts=predict,
-                accept_index=accept_index,
-                accept_token_num=num_correct_drafts,
-                candidates=candidates,
-                retrieve_index=verify_input.retrieve_index,
-                retrieve_next_token=verify_input.retrieve_next_token,
-                retrieve_next_sibling=verify_input.retrieve_next_sibling,
-                target_predict=target_predict,
-                topk=verify_input.tree_topk,
-            )
     elif sparse:
         from sglang.srt.speculative.uno_utils import (
             sample_uno_tree_target_tokens,
