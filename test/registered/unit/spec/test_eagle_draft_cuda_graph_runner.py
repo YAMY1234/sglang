@@ -16,9 +16,11 @@ the raw value must be restored once replay finishes.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
@@ -233,6 +235,44 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
             ["metadata_build", "graph_replay"],
         )
         return backend, forward_batch
+
+    def test_generic_copy_plans_keep_cpu_and_padding_fallbacks(self):
+        # These bare runners have no model plugin. A refused CPU layout must
+        # still copy every field, while padded batches keep the normal staging.
+        for enabled in (False, True):
+            for raw_bs in (1, 2):
+                with (
+                    self.subTest(enabled=enabled, raw_bs=raw_bs),
+                    envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(enabled),
+                ):
+                    runner = self._build_runner(_RecordingDraftBackend())
+                    batch = self._build_forward_batch([10] * raw_bs, 10 * raw_bs)
+                    with patch.object(
+                        runner,
+                        "_copy_planned_inputs",
+                        wraps=runner._copy_planned_inputs,
+                    ) as copy:
+                        runner.execute(batch)
+                    self.assertEqual(copy.call_count, int(enabled and raw_bs == 1))
+                    self.assertTrue(
+                        torch.equal(runner.buffers.seq_lens[:raw_bs], batch.seq_lens)
+                    )
+
+                    runner, batch, select = _extend_runner(raw_bs)
+                    runner._replay_graph = lambda key, fb: SimpleNamespace(
+                        next_token_logits=torch.zeros((2, 4)),
+                        hidden_states=torch.zeros((2, 2)),
+                    )
+                    with patch.object(
+                        runner,
+                        "_copy_planned_inputs",
+                        wraps=runner._copy_planned_inputs,
+                    ) as copy:
+                        runner.execute(batch, select)
+                    self.assertEqual(copy.call_count, int(enabled))
+                    self.assertTrue(
+                        torch.equal(runner.buffers.seq_lens[:raw_bs], batch.seq_lens)
+                    )
 
     def test_replay_keys_the_graph_select_picks_where_the_megakernel_serves(self):
         """A batch size the draft megakernel serves captures one graph per label of
