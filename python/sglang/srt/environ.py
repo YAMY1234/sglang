@@ -1572,6 +1572,8 @@ class Envs:
     SGLANG_NVIDIA_MEGAKERNEL_SLOTS = EnvTuple(())
     # Generic scheduling and metadata optimizations; independent of model/plugin.
     SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION = EnvBool(False)
+    # PD decode optimizations follow the shared switch unless explicitly disabled.
+    SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION = EnvBool(True)
     # Runtime switches named as on SGLang branch nvidia/qwen35-agentx-gb300; all off by default.
     # The fused small-field copy gives each field its own blocks and moves aligned fields in 16 B units.
     SGLANG_Q35MF_BK_VEC_COPY = EnvBool(False)
