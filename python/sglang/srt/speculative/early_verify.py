@@ -6,6 +6,7 @@ token values. The target model and its state readers still run after draft.
 
 import logging
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import torch
 import triton
@@ -28,6 +29,37 @@ class EarlyVerify:
     verify_input: object
     prepared_forward: tuple
     target_input_ids: torch.Tensor
+    counters: object
+
+
+def _audit_private_buffers(worker, runner, qsa_backend):
+    """Once per worker: inspect device storage identities, never their values."""
+    for name in (
+        "seq_lens", "req_pool_indices", "positions", "mrope_positions", "out_cache_loc"
+    ):
+        target = getattr(runner.buffers, name)
+        draft = getattr(worker.cuda_graph_runner.buffers, name)
+        if target.untyped_storage().data_ptr() == draft.untyped_storage().data_ptr():
+            raise RuntimeError(f"early verify aliases a draft index input: {name}")
+    names = (
+        "_graph_seq_lens", "_graph_prefix_lengths", "_graph_compressed_lengths",
+        "_graph_compressed_page_table", "_graph_logical_positions",
+        "_graph_state_slots", "_graph_ring_group_locs",
+    )
+    target_storage = {
+        getattr(qsa_backend, name).untyped_storage().data_ptr() for name in names
+    }
+    backends = list(worker.draft_attn_backend.attn_backends)
+    if worker.draft_extend_attn_backend is not None:
+        backends.append(worker.draft_extend_attn_backend)
+    for backend in backends:
+        backend = getattr(backend, "full_attn_backend", backend)
+        for name in names:
+            tensor = getattr(backend, name, None)
+            if tensor is not None and tensor.numel():
+                if tensor.untyped_storage().data_ptr() in target_storage:
+                    raise RuntimeError(f"early verify aliases draft QSA metadata: {name}")
+    return len(names)
 
 
 @triton.jit
@@ -65,6 +97,7 @@ def prepare_early_verify(
     """Return None without changing the batch when this fixed-shape path misses."""
     target = worker.target_worker.model_runner
     runner = target.decode_cuda_graph_runner
+    qsa_backend = getattr(target.attn_backend, "full_attn_backend", target.attn_backend)
     parallel = get_parallel()
     if (
         not can_run_decode_cuda_graph
@@ -93,7 +126,7 @@ def prepare_early_verify(
         or parallel.attn_dp_enabled
         or parallel.dp_size != 1
         or parallel.moe_ep_size != 1
-        or not isinstance(target.attn_backend, QwenSparseAttnBackend)
+        or not isinstance(qsa_backend, QwenSparseAttnBackend)
         or runner is None
         or 1 not in runner.capture_bs
         or runner.require_mlp_tp_gather
@@ -107,6 +140,16 @@ def prepare_early_verify(
         or kv_loc_plan.is_translated_for(target.kv_index_translator)
     ):
         return None
+
+    counters = getattr(worker, "_q38c_early_verify_counters", None)
+    if counters is None:
+        checked = _audit_private_buffers(worker, runner, qsa_backend)
+        counters = SimpleNamespace(prepared=0, publisher_enqueues=0, target_replays=0)
+        worker._q38c_early_verify_counters = counters
+        logger.info(
+            "Q38C_EARLY_VERIFY_PRIVATE index_inputs_disjoint=1 "
+            "qsa_metadata_disjoint=1 metadata_fields=%d", checked,
+        )
 
     placeholder = getattr(worker, "_q38c_verify_placeholder", None)
     if placeholder is None:
@@ -145,6 +188,8 @@ def prepare_early_verify(
     target_ids = (
         runner.buffers.input_ids[:4] if prepared[1] else verify_input.draft_token
     )
+    counters.prepared += 1
+    prepared[0]._q38c_early_verify_counters = counters
     if not getattr(worker, "_q38c_early_verify_logged", False):
         logger.info(
             "Q38C_EARLY_VERIFY_READY tp=4 bs=1 width=4 graph=%s "
@@ -152,7 +197,7 @@ def prepare_early_verify(
             prepared[1],
         )
         worker._q38c_early_verify_logged = True
-    return EarlyVerify(verify_input, prepared, target_ids)
+    return EarlyVerify(verify_input, prepared, target_ids, counters)
 
 
 def publish_early_verify(early, bonus_tokens, draft_tokens):
@@ -169,5 +214,6 @@ def publish_early_verify(early, bonus_tokens, draft_tokens):
         enable_fp_fusion=False,
         launch_pdl=False,
     )
+    early.counters.publisher_enqueues += 1
     early.verify_input._q38c_prepared_verify = early.prepared_forward
     return early.verify_input

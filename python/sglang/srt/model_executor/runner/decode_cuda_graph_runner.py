@@ -129,6 +129,7 @@ except ImportError:
     KTRANSFORMERS_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+_Q38C_EARLY_VERIFY = os.environ.get("SGLANG_Q38C_EARLY_VERIFY", "0") == "1"
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -1680,6 +1681,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self._publish_read_done(in_graph=False)
 
             output = self.backend.replay(self._replay_graph_key, forward_batch)
+            if _Q38C_EARLY_VERIFY:
+                counters = getattr(forward_batch, "_q38c_early_verify_counters", None)
+                if counters is not None:
+                    counters.target_replays += 1
+                    if counters.target_replays == 1 or counters.target_replays % 128 == 0:
+                        logger.info(
+                            "Q38C_EARLY_VERIFY_COUNTS prepared=%d "
+                            "publisher_enqueues=%d target_replays=%d bs=%d tokens=%d",
+                            counters.prepared,
+                            counters.publisher_enqueues,
+                            counters.target_replays,
+                            forward_batch.batch_size,
+                            self.raw_num_token,
+                        )
 
             if shared_read_ends is SharedReadEnds.IN_REPLAY:
                 self._publish_read_done(in_graph=True)
