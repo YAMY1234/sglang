@@ -66,13 +66,13 @@ template<int N> __device__ __forceinline__ void drain(uint32_t addr,uint32_t (&r
 }
 // Diagnostic-only; no trace argument or stores in the ordinary specialization.
 #if Q38_MK_TRACE
-__device__ __forceinline__ void stamp(uint64_t* trace,int item,int rank,int slot){
+__device__ __forceinline__ void stamp(uint64_t* trace_local,int slot){
  if((threadIdx.x&31)==0){
   uint64_t now;asm volatile("mov.u64 %0, %%globaltimer;":"=l"(now)::"memory");
-  trace[((size_t)item*C+rank)*128+slot]=now;
+  trace_local[slot]=now;
  }
 }
-#define Q38_MARK(slot) stamp(trace,item,rank,slot)
+#define Q38_MARK(slot) stamp(trace_local,slot)
 #else
 #define Q38_MARK(slot) ((void)0)
 #endif
@@ -84,6 +84,9 @@ void q38_mk_moe_pipeline(const __grid_constant__ CUtensorMap w13,
 #endif
                        ){
  extern __shared__ __align__(1024) uint8_t raw[];
+#if Q38_MK_TRACE
+ __shared__ uint64_t trace_local[128];
+#endif
  Smem& s=*reinterpret_cast<Smem*>((reinterpret_cast<uintptr_t>(raw)+1023)&~uintptr_t(1023));
  const int tid=threadIdx.x,warp=tid/32,lane=tid%32,rank=cluster_rank(),cluster=blockIdx.x/C;
  const uint32_t partial_bytes=p.m*PartStride*4;
@@ -95,6 +98,9 @@ void q38_mk_moe_pipeline(const __grid_constant__ CUtensorMap w13,
  const uint32_t tm=s.tmem,idesc1=make_idesc_nvf4(128,N1),idesc2=make_idesc_nvf4(128,256);
  for(int item=cluster;item<*p.num_unique;item+=gridDim.x/C){
   const int e=p.unique_ids[item];
+#if Q38_MK_TRACE
+  if(tid<128)trace_local[tid]=0;
+#endif
   if(tid==0){
    Q38_MARK(0);
    for(int b=0;b<Stages;++b){mbar_init(&s.full[b],1);mbar_init(&s.empty[b],1);mbar_init(&s.sf_ready[b],4);}
@@ -267,6 +273,11 @@ void q38_mk_moe_pipeline(const __grid_constant__ CUtensorMap w13,
   // Warps2/3 have no cross-warp spin work. They join only at the expert boundary.
   tc_fence_before();__syncthreads();cluster_sync();
   if(tid==0)Q38_MARK(7);
+#if Q38_MK_TRACE
+  __syncthreads();
+  if(tid<128)trace[((size_t)item*C+rank)*128+tid]=trace_local[tid];
+  __syncthreads();
+#endif
  }
  tc_fence_before();if(warp==1)tmem_dealloc(tm,512);__syncthreads();
  asm volatile("griddepcontrol.launch_dependents;":::"memory");
