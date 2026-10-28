@@ -1776,7 +1776,7 @@ class SchedulerDisaggregationPrefillMixin:
                 event = self.device_module.Event()
                 event.record(
                     self.forward_stream
-                    if self.enable_overlap
+                    if self.enable_overlap or get_parallel().pp_size > 1
                     else self.device_module.current_stream()
                 )
                 sender._early_send_wait_event = event

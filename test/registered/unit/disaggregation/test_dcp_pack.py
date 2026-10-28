@@ -147,49 +147,67 @@ class TestDcpCachedPrefixSend(CustomTestCase):
                 self.events.append(self._early_send_wait_event)
                 self._early_send_wait_event = None
 
-        event = Mock()
-        sender = Sender()
-        req = SimpleNamespace(
-            rid="staging-fence",
-            kv=SimpleNamespace(req_pool_idx=0),
-            origin_input_ids=[0] * 4,
-            extend_end=4,
-            start_send_idx=0,
-            disagg_decode_prefix_len=0,
-            disagg_kv_sender=sender,
-        )
-        scheduler = SimpleNamespace(
-            enable_staging=True,
-            enable_overlap=False,
-            token_to_kv_pool_allocator=SimpleNamespace(
-                page_size=1,
-                translate_kv_indices_for_transfer=lambda indices: indices,
-            ),
-            req_to_token_pool=SimpleNamespace(
-                req_to_token=torch.arange(4).reshape(1, -1)
-            ),
-            disagg_prefill_pending_chunk_rids=set(),
-        )
-        current_stream = Mock()
-        device_module = SimpleNamespace(
-            Event=Mock(return_value=event),
-            current_stream=Mock(return_value=current_stream),
-        )
-        scheduler.device_module = device_module
-        with (
-            patch(
-                "sglang.srt.disaggregation.prefill.get_schedule",
-                return_value=SimpleNamespace(chunked_prefill_size=2),
-            ),
+        for enable_overlap, pp_size, use_forward_stream in (
+            (False, 1, False),
+            (False, 2, True),
+            (True, 1, True),
         ):
-            SchedulerDisaggregationPrefillMixin._send_kv_chunk(
-                scheduler, req, last_chunk=False, end_idx=4
-            )
+            with self.subTest(enable_overlap=enable_overlap, pp_size=pp_size):
+                event = Mock()
+                sender = Sender()
+                req = SimpleNamespace(
+                    rid="staging-fence",
+                    kv=SimpleNamespace(req_pool_idx=0),
+                    origin_input_ids=[0] * 4,
+                    extend_end=4,
+                    start_send_idx=0,
+                    disagg_decode_prefix_len=0,
+                    disagg_kv_sender=sender,
+                )
+                current_stream = Mock()
+                forward_stream = Mock()
+                device_module = SimpleNamespace(
+                    Event=Mock(return_value=event),
+                    current_stream=Mock(return_value=current_stream),
+                )
+                scheduler = SimpleNamespace(
+                    enable_staging=True,
+                    enable_overlap=enable_overlap,
+                    forward_stream=forward_stream,
+                    device_module=device_module,
+                    token_to_kv_pool_allocator=SimpleNamespace(
+                        page_size=1,
+                        translate_kv_indices_for_transfer=lambda indices: indices,
+                    ),
+                    req_to_token_pool=SimpleNamespace(
+                        req_to_token=torch.arange(4).reshape(1, -1)
+                    ),
+                    disagg_prefill_pending_chunk_rids=set(),
+                )
+                with (
+                    patch(
+                        "sglang.srt.disaggregation.prefill.get_schedule",
+                        return_value=SimpleNamespace(chunked_prefill_size=2),
+                    ),
+                    patch(
+                        "sglang.srt.disaggregation.prefill.get_parallel",
+                        return_value=SimpleNamespace(pp_size=pp_size),
+                    ),
+                ):
+                    SchedulerDisaggregationPrefillMixin._send_kv_chunk(
+                        scheduler, req, last_chunk=False, end_idx=4
+                    )
 
-        self.assertEqual(sender.events, [event, None])
-        device_module.Event.assert_called_once_with()
-        device_module.current_stream.assert_called_once_with()
-        event.record.assert_called_once_with(current_stream)
+                self.assertEqual(sender.events, [event, None])
+                device_module.Event.assert_called_once_with()
+                expected_stream = (
+                    forward_stream if use_forward_stream else current_stream
+                )
+                event.record.assert_called_once_with(expected_stream)
+                if use_forward_stream:
+                    device_module.current_stream.assert_not_called()
+                else:
+                    device_module.current_stream.assert_called_once_with()
 
 
 class TestDcpPackBufferBytes(CustomTestCase):

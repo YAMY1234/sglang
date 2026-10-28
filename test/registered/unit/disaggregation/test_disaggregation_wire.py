@@ -13,6 +13,7 @@ from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import AckTarget, CommonKVManager
 from sglang.srt.disaggregation.common.staging_buffer import (
     StagingAllocator,
+    _cached_device_i64,
     _page_tile_scatter_eligible,
 )
 from sglang.srt.disaggregation.common.staging_handler import (
@@ -1476,6 +1477,14 @@ class TestDeferredStagingScatter(unittest.TestCase):
                 self.assertFalse(_page_tile_scatter_eligible(True, page_size, 128))
         self.assertFalse(_page_tile_scatter_eligible(True, 64, 96))
         self.assertFalse(_page_tile_scatter_eligible(False, 64, 128))
+
+    def test_cached_page_tile_table_preserves_xpu_high_pointer_bit(self):
+        table = _cached_device_i64(
+            ("test-xpu-high-pointer",), [1 << 63, 7], torch.device("cpu")
+        )
+
+        self.assertEqual(table.dtype, torch.int64)
+        self.assertEqual(table.tolist(), [-(1 << 63), 7])
 
     def test_complete_arrival_waits_for_scheduler_flush(self):
         receiver = SimpleNamespace()

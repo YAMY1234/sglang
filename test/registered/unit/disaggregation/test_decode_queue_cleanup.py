@@ -109,6 +109,36 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
 
 class TestDeferredPreallocMetadata(CustomTestCase):
+    def test_memory_release_waits_for_deferred_metadata_copies(self):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue._cancel_prefill_dp_rank_queries = MagicMock()
+        queue.queue = [object()]
+        queue.retracted_queue = []
+        queue.kv_manager = SimpleNamespace()
+
+        first_done = MagicMock()
+        second_done = MagicMock()
+        queue._deferred_sends = deque(
+            [
+                (object(), [torch.tensor([1])], False, {}, first_done),
+                (object(), [torch.tensor([2])], False, {}, second_done),
+            ]
+        )
+        first_done.synchronize.side_effect = lambda: self.assertEqual(
+            len(queue._deferred_sends), 2
+        )
+        second_done.synchronize.side_effect = lambda: self.assertEqual(
+            len(queue._deferred_sends), 2
+        )
+
+        queue.release_memory_occupation()
+
+        queue._cancel_prefill_dp_rank_queries.assert_called_once_with()
+        first_done.synchronize.assert_called_once_with()
+        second_done.synchronize.assert_called_once_with()
+        self.assertEqual(queue.queue, [])
+        self.assertEqual(queue._deferred_sends, deque())
+
     def test_metadata_send_waits_for_nonblocking_index_copies(self):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.req_to_metadata_buffer_idx_allocator = MagicMock()

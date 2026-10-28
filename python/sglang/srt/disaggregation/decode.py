@@ -1014,6 +1014,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def release_memory_occupation(self):
         self._cancel_prefill_dp_rank_queries()
         self.queue.clear()
+        # Keep the pinned metadata buffers alive until their nonblocking
+        # device-to-host copies finish.  Clearing the deque first can release
+        # those buffers while the copy is still in flight.
+        for _, _, _, _, copy_done in self._deferred_sends:
+            copy_done.synchronize()
         self._deferred_sends.clear()
         for req in self.retracted_queue:
             discard_kv_cache_backup(

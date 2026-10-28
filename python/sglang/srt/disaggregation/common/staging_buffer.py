@@ -23,7 +23,6 @@ import triton.language as tl
 from sglang.kernels.ops.memory.ptr_table import make_ptr_table
 from sglang.srt.environ import envs
 from sglang.srt.utils import create_device_stream, device_stream_context
-from sglang.srt.utils.common import async_h2d
 
 logger = logging.getLogger(__name__)
 
@@ -202,7 +201,10 @@ def _page_tile_scatter_eligible(
 def _cached_device_i64(key: tuple, values: list[int], device) -> torch.Tensor:
     tensor = _DEVICE_I64_CACHE.get(key)
     if tensor is None:
-        tensor = async_h2d(values, dtype=torch.int64, device=device)
+        # Pack through uint64 before viewing as int64.  XPU kernel-space
+        # pointers can set bit 63 and cannot be constructed as signed Python
+        # integers; ordinary nonnegative offsets retain the same bit pattern.
+        tensor = make_ptr_table(values, device=device)
         _DEVICE_I64_CACHE[key] = tensor
     return tensor
 
