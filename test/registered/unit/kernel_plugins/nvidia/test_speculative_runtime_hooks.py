@@ -363,6 +363,43 @@ class TestSpeculativeRuntimeHooks(CustomTestCase):
         self.assertEqual(tuple(seen[0].shape), (2,))
         self.assertNotEqual(seen[0].shape[0], 6)
 
+    def test_provider_splits_use_rank_uniform_padded_width(self):
+        from sglang.srt.speculative import eagle_utils
+
+        logits = torch.empty((2, 4104))
+        shard = spec.VocabShardView(start=7 * 4104, valid=4041, vocab_size=32769)
+        group = SimpleNamespace(world_size=8)
+        tokens = torch.empty(2, dtype=torch.int64)
+        seen = []
+
+        def local_keys(view):
+            seen.append(view.splits)
+            return torch.empty((2, view.splits), dtype=torch.int64)
+
+        with (
+            patch(
+                "sglang.srt.runtime_context.get_parallel",
+                return_value=SimpleNamespace(tp_group=group),
+            ),
+            patch.object(
+                eagle_utils,
+                "reduce_sharded_token_keys",
+                return_value=tokens,
+            ) as reduce,
+        ):
+            got = eagle_utils._sharded_tokens(
+                logits,
+                shard,
+                local_keys=local_keys,
+            )
+
+        self.assertIs(got, tokens)
+        self.assertEqual(seen, [4])
+        reduce.assert_called_once()
+        keys = reduce.call_args.args[0]
+        self.assertEqual(tuple(keys.shape), (2, 4))
+        self.assertEqual(reduce.call_args.kwargs, {"splits": 4})
+
     def test_default_local_keys_serves_greedy_and_declines_all_temperature(self):
         from sglang.srt.speculative import sharded_verify
 

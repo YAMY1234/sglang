@@ -401,7 +401,11 @@ def sharded_target_tokens(
     tp_group,
 ) -> torch.Tensor:
     """[rows] token ids over the whole vocabulary from every rank's logits shard."""
-    splits = key_splits(shard.valid)
+    # The final TP rank may have fewer valid vocabulary columns than its padded
+    # local LM-head output.  Every rank must nevertheless enter the collective
+    # with the same key shape, so derive the split count from the rank-uniform
+    # padded local width; ``shard.valid`` still masks the kernel's tail.
+    splits = key_splits(logits.shape[-1])
     keys = shard_keys(logits, shard, splits)
     return reduce_sharded_token_keys(keys, tp_group, splits=splits)
 

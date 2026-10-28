@@ -581,7 +581,10 @@ def _sharded_tokens(
             return None
         return sharded_target_tokens(logits, vocab_shard, tp_group)
 
-    splits = key_splits(vocab_shard.valid)
+    # Runtime selects a rank-uniform collective shape.  The final TP rank may
+    # have a shorter valid vocabulary tail, while its padded local logits width
+    # remains identical to every other rank.
+    splits = key_splits(logits.shape[-1])
     keys = local_keys(
         ShardedLogitsView(
             values=logits,
