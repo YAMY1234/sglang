@@ -483,7 +483,7 @@ class TestPostVerifyGraphs(CustomTestCase):
         self.assertEqual(offset, buffer.numel())
 
     def test_one_launch_load_stages_what_the_per_dtype_copies_stage(self):
-        """With SGLANG_Q35MF_MKH_N3C a round's inputs and its forced length go to
+        """A round's inputs and its forced length go to
         one copy plan; without it, or when the plan refuses the layout, the
         per-dtype copies stage the same values."""
         inputs = {
@@ -672,7 +672,7 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
         self._check(sim_acc_len=4.8)
 
     def test_forced_acceptance_with_one_launch_load(self):
-        # SGLANG_Q35MF_MKH_N3C: inputs and the pinned forced length in one launch
+        # Inputs and the pinned forced length in one launch.
         with patch.object(eagle_post_verify_graphs, "_ONE_LAUNCH_LOAD", True):
             self._check(sim_acc_len=4.8)
 

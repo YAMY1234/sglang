@@ -577,9 +577,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self._metadata_glue = (
             MetadataGlueGraph(self.device) if enable_metadata_glue else None
         )
-        # SGLANG_Q35MF_MKH_N3B: a pre-planned replay skips copying input_ids and
+        # A pre-planned replay skips copying input_ids and
         # positions again when the full load_batch copied them (_restage_is_redundant)
-        self._restage_skip = envs.SGLANG_Q35MF_MKH_N3B.get()
+        self._restage_skip = envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
         self._staged_inputs: Optional[tuple] = None
         # The DSpark draft runner's prep has no host-fed plan, so the guard above does
         # not apply where its backend says so.

@@ -1060,9 +1060,11 @@ def _versions(*tensors: torch.Tensor) -> Optional[tuple[int, ...]]:
     return tuple(t._version for t in tensors)
 
 
-# SGLANG_Q35MF_MKH_N3B: the verify rounds of this process reuse the last indices.
+# Verify rounds reuse the last indices while their inputs remain unchanged.
 _VERIFY_TRACK_INDICES: Optional[VerifyTrackIndices] = (
-    VerifyTrackIndices() if envs.SGLANG_Q35MF_MKH_N3B.get() else None
+    VerifyTrackIndices()
+    if envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+    else None
 )
 
 
