@@ -100,13 +100,90 @@ def _q38_mk_mtp_finalize(ExpertRows, Weights, Out,
     tl.store(Out + row * H + col, total.to(tl.bfloat16), col < H)
 
 
+@triton.jit
+def _q38_mk_mtp_fc1_split(
+    X, Gate, Up, GateSF, UpSF, Ids, GatePartial, UpPartial,
+    H: tl.constexpr, I: tl.constexpr, TOPK: tl.constexpr,
+    TILE_I: tl.constexpr, TILE_K: tl.constexpr, I_SHIFT: tl.constexpr,
+    SPLITS: tl.constexpr,
+):
+    tile, work, split = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    row, slot = work // TOPK, work % TOPK
+    expert = tl.load(Ids + work).to(tl.int64)
+    n = tile * TILE_I + tl.arange(0, TILE_I)
+    k = tl.arange(0, TILE_K)
+    m = tl.arange(0, 16)
+    gate_acc = tl.full((16, TILE_I), 0, tl.float32)
+    up_acc = tl.full((16, TILE_I), 0, tl.float32)
+    slice_k: tl.constexpr = H // SPLITS
+    for chunk in range(triton.cdiv(slice_k, TILE_K)):
+        kk = split * slice_k + chunk * TILE_K + k
+        valid_k = (kk < H) & (kk < (split + 1) * slice_k)
+        sf_off = (expert * triton.cdiv(I + I_SHIFT, 128) + (n[:, None] + I_SHIFT) // 128) * triton.cdiv(H, 128) + kk[None, :] // 128
+        mask = (n < I)[:, None] & valid_k[None, :]
+        wg = tl.load(Gate + (expert * I + n[:, None]) * H + kk[None, :], mask, 0.0).to(tl.float32)
+        wu = tl.load(Up + (expert * I + n[:, None]) * H + kk[None, :], mask, 0.0).to(tl.float32)
+        gs = tl.load(GateSF + sf_off, mask, 0).to(tl.float32)
+        us = tl.load(UpSF + sf_off, mask, 0).to(tl.float32)
+        x = tl.load(X + row * H + kk[None, :] + tl.zeros((16, 1), tl.int32),
+                    (m == 0)[:, None] & valid_k[None, :], 0)
+        gate_acc = tl.dot(x, tl.trans((wg * gs).to(tl.bfloat16)), gate_acc)
+        up_acc = tl.dot(x, tl.trans((wu * us).to(tl.bfloat16)), up_acc)
+    off = (work * SPLITS + split) * I + n[None, :] + tl.zeros((16, 1), tl.int32)
+    valid_out = (m == 0)[:, None] & (n < I)[None, :]
+    tl.store(GatePartial + off, gate_acc, valid_out)
+    tl.store(UpPartial + off, up_acc, valid_out)
+
+
+@triton.jit
+def _q38_mk_mtp_fc2_partial_act(
+    GatePartial, UpPartial, Down, DownSF, Ids, ExpertRows, Hidden,
+    H: tl.constexpr, I: tl.constexpr, TOPK: tl.constexpr,
+    TILE_N: tl.constexpr, TILE_K: tl.constexpr, I_SHIFT: tl.constexpr,
+    SPLITS: tl.constexpr,
+):
+    tile, work = tl.program_id(0), tl.program_id(1)
+    expert = tl.load(Ids + work).to(tl.int64)
+    n = tile * TILE_N + tl.arange(0, TILE_N)
+    k = tl.arange(0, TILE_K)
+    m = tl.arange(0, 16)
+    acc = tl.full((16, TILE_N), 0, tl.float32)
+    for chunk in range(triton.cdiv(I, TILE_K)):
+        kk = chunk * TILE_K + k
+        g = tl.full((TILE_K,), 0, tl.float32)
+        u = tl.full((TILE_K,), 0, tl.float32)
+        # Split-K changes the FP32 accumulation tree; round both FC1 results
+        # once, after the ordered FP32 sum, before BF16 SwiGLU.
+        for split in tl.static_range(SPLITS):
+            off = (work * SPLITS + split) * I + kk
+            g = g + tl.load(GatePartial + off, kk < I, 0)
+            u = u + tl.load(UpPartial + off, kk < I, 0)
+        g = g.to(tl.bfloat16).to(tl.float32)
+        u = u.to(tl.bfloat16).to(tl.float32)
+        act = (g / (1 + tl.exp(-g)) * u).to(tl.bfloat16)
+        if tile == 0:
+            # Unique owner, for component parity. Other CTAs consume their
+            # private register result, never this concurrently written tensor.
+            tl.store(Hidden + work * I + kk, act, kk < I)
+        sf_off = (expert * triton.cdiv(H, 128) + n[:, None] // 128) * triton.cdiv(I + I_SHIFT, 128) + (kk[None, :] + I_SHIFT) // 128
+        mask = (n < H)[:, None] & (kk < I)[None, :]
+        w = tl.load(Down + (expert * H + n[:, None]) * I + kk[None, :], mask, 0.0).to(tl.float32)
+        sf = tl.load(DownSF + sf_off, mask, 0).to(tl.float32)
+        a = tl.where((m == 0)[:, None], act[None, :], 0).to(tl.bfloat16)
+        acc = tl.dot(a, tl.trans((w * sf).to(tl.bfloat16)), acc)
+    tl.store(ExpertRows + work * H + n[None, :] + tl.zeros((16, 1), tl.int32),
+             acc.to(tl.bfloat16), (m == 0)[:, None] & (n < H)[None, :])
+
+
 def streaming_experts(x, gate, up, down, gate_sf, up_sf, down_sf, ids, weights,
                       *, tile_i=32, fc1_k=256, tile_n=16, fc2_k=1024,
-                      intermediate_offset=0, parallel_fc2=False, return_expert_rows=False):
+                      intermediate_offset=0, parallel_fc2=False, return_expert_rows=False,
+                      fc1_splits=1):
     """Prototype canonical expert layout; not yet wired into the model loader.
 
     Wg/Wu [E,I,H], Wd [E,H,I] FP8; corresponding block128 scale matrices
-    BF16. intermediate_offset preserves checkpoint scale-block boundaries when
+    BF16 checkpoint values or the stock loader's exact-valued FP32 buffers.
+    intermediate_offset preserves checkpoint scale-block boundaries when
     TP shards start at 160/320/480 (mod128 = 32/64/96). Returns rank-local
     routed BF16[M,H], BEFORE TP all-reduce, shared/HC combination.
     """
@@ -115,6 +192,22 @@ def streaming_experts(x, gate, up, down, gate_sf, up_sf, down_sf, ids, weights,
     hidden = torch.empty((m, topk, inter), device=x.device, dtype=torch.bfloat16)
     out = torch.empty((m, h), device=x.device, dtype=torch.bfloat16)
     expert_rows = torch.empty((m, topk, h), device=x.device, dtype=torch.bfloat16) if parallel_fc2 else out
+    if fc1_splits != 1:
+        assert fc1_splits in (2, 4) and h % fc1_splits == 0 and parallel_fc2
+        partials = torch.empty((2, m, topk, fc1_splits, inter), device=x.device, dtype=torch.float32)
+        _q38_mk_mtp_fc1_split[(triton.cdiv(inter, tile_i), m * topk, fc1_splits)](
+            x, gate, up, gate_sf, up_sf, ids, partials[0], partials[1],
+            H=h, I=inter, TOPK=topk, TILE_I=tile_i, TILE_K=fc1_k,
+            I_SHIFT=intermediate_offset % 128, SPLITS=fc1_splits, num_warps=4)
+        _q38_mk_mtp_fc2_partial_act[(triton.cdiv(h, tile_n), m * topk)](
+            partials[0], partials[1], down, down_sf, ids, expert_rows, hidden,
+            H=h, I=inter, TOPK=topk, TILE_N=tile_n, TILE_K=fc2_k,
+            I_SHIFT=intermediate_offset % 128, SPLITS=fc1_splits,
+            num_warps=4, enable_fp_fusion=False)
+        _q38_mk_mtp_finalize[(triton.cdiv(h, 256), m)](
+            expert_rows, weights, out, H=h, TOPK=topk, BLOCK=256,
+            num_warps=4, enable_fp_fusion=False)
+        return (out, hidden, expert_rows) if return_expert_rows else (out, hidden)
     _q38_mk_mtp_fc1_act[(triton.cdiv(inter, tile_i), m, topk)](
         x, gate, up, gate_sf, up_sf, ids, hidden,
         H=h, I=inter, TOPK=topk, TILE_I=tile_i, TILE_K=fc1_k,
