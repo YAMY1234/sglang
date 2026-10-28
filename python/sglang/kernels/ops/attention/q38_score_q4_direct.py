@@ -65,10 +65,13 @@ def _score_q4_direct_kernel(min_scored_len: int = 512, request_dtype: str = "int
                             T.gemm(k_shared, q_shared, scores, transpose_B=True,
                                    clear_accum=True, policy=T.GemmWarpPolicy.FullCol)
                             for token, row, pair in T.Parallel(64, 4, 2):
-                                pairs[token, row, pair] = (
-                                    (T.float32(0.0) + T.max(scores[token, row * 4 + pair * 2], 0.0))
-                                    + T.max(scores[token, row * 4 + pair * 2 + 1], 0.0)
-                                ) + T.float32(0.0)
+                                pairs[token, row, pair] = T.float32(0.0) + T.max(
+                                    scores[token, row * 4 + pair * 2], 0.0)
+                            for token, row, pair in T.Parallel(64, 4, 2):
+                                pairs[token, row, pair] = pairs[token, row, pair] + T.max(
+                                    scores[token, row * 4 + pair * 2 + 1], 0.0)
+                            for token, row, pair in T.Parallel(64, 4, 2):
+                                pairs[token, row, pair] = pairs[token, row, pair] + T.float32(0.0)
                             T.reduce_sum(pairs, reduced, dim=2, clear=True)
                             for token, row in T.Parallel(64, 4):
                                 position = group * 64 + token
