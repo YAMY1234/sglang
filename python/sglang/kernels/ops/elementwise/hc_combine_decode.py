@@ -4,12 +4,17 @@ The decode specialization accepts four branches of 2560 BF16 values. Gate
 partials belong to each invocation, so overlapping sublayers never reuse them.
 """
 
+import os
+
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit
 from sglang.srt.environ import envs
 
 _HC_CLUSTER_M4ONLY = envs.SGLANG_Q38C_HC_CLUSTER_M4ONLY.get()
+_HC_M4_VARIANT = int(os.environ.get("SGLANG_Q38C_HC_M4_COMBINE", "0"))
+if _HC_M4_VARIANT not in (0, 1, 2, 3):
+    raise ValueError("HC M4 combine variant must be 0, 1, 2 or 3")
 
 
 @cache_once
@@ -18,12 +23,12 @@ def _jit_module(parts: int = 2):
         raise ValueError("HC combine parts must be 1, 2 or 4")
     m4only = str(_HC_CLUSTER_M4ONLY).lower()
     return load_jit(
-        f"hc_combine_decode_p{parts}_m4only{int(_HC_CLUSTER_M4ONLY)}",
+        f"hc_combine_decode_p{parts}_m4only{int(_HC_CLUSTER_M4ONLY)}_v{_HC_M4_VARIANT}",
         cuda_files=["elementwise/hc_combine_decode.cuh"],
         cuda_wrappers=[
             ("gate", "HcCombineDecode::gate"),
             ("apply", "HcCombineDecode::apply"),
-            ("apply_norm", f"HcCombineNormDecode<{parts}, {m4only}>::run"),
+            ("apply_norm", f"HcCombineNormDecode<{parts}, {m4only}, {_HC_M4_VARIANT}>::run"),
             ("shared_apply_norm", f"HcSharedCombineNormDecode<{parts}, {m4only}>::run"),
         ],
     )
