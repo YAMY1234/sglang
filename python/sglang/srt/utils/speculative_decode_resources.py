@@ -1,12 +1,10 @@
-"""Reusable transient resources for NVIDIA EAGLE decode rounds."""
+"""Reusable transient tensors, host buffers, and stream events for decode rounds."""
 
 from __future__ import annotations
 
 import torch
 
-from sglang.srt.speculative.prepared_next_draft import (
-    nvidia_eagle_decode_fast_path_enabled,
-)
+from sglang.srt.environ import envs
 from sglang.srt.utils.common import async_d2h, is_pin_memory_available
 
 _ROUND_RING_DEPTH = 8
@@ -20,7 +18,7 @@ _host_tensor_rings: dict[tuple, list] = {}
 
 
 def enabled() -> bool:
-    return nvidia_eagle_decode_fast_path_enabled()
+    return envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
 
 
 def wait_stream(waiting_stream, source_stream) -> None:

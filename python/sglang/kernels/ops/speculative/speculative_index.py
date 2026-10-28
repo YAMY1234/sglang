@@ -5,9 +5,7 @@ from __future__ import annotations
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit
-from sglang.srt.speculative.prepared_next_draft import (
-    nvidia_eagle_decode_fast_path_enabled,
-)
+from sglang.srt.environ import envs
 
 _INDEX_DTYPES = (torch.int32, torch.int64)
 _descriptors: dict[str, tuple[torch.Tensor, object]] = {}
@@ -48,7 +46,9 @@ def chain_tree(
     out_cache_loc,
     mrope,
 ) -> bool:
-    if not nvidia_eagle_decode_fast_path_enabled() or not (
+    if not (
+        envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get() and seq.is_cuda
+    ) or not (
         bonus.dtype in _INDEX_DTYPES
         and draft.dtype in _INDEX_DTYPES
         and seq.dtype in _INDEX_DTYPES
@@ -93,7 +93,11 @@ def chain_tree(
 def extend_layout(
     *, seq, width, prefix, extend, post, positions, starts, mrope
 ) -> bool:
-    if not nvidia_eagle_decode_fast_path_enabled() or seq.dtype not in _INDEX_DTYPES:
+    if (
+        not envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+        or not seq.is_cuda
+        or seq.dtype not in _INDEX_DTYPES
+    ):
         return False
     descriptor, values = _descriptor("extend_layout", 13)
     values[0] = seq.data_ptr()
@@ -126,7 +130,9 @@ def draft_locs(
     positions,
     mrope,
 ) -> bool:
-    if not nvidia_eagle_decode_fast_path_enabled() or not (
+    if not (
+        envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get() and seq.is_cuda
+    ) or not (
         req.dtype in _INDEX_DTYPES
         and table.dtype in _INDEX_DTYPES
         and seq.dtype in _INDEX_DTYPES

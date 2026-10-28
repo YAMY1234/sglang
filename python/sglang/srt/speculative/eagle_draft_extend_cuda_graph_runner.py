@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.environ import envs
 from sglang.srt.kernel_plugins.nvidia.binding import megakernel_graph_variants
@@ -716,7 +717,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             buffers.extend_seq_lens.fill_(self.captured_req_width)
 
         copied_with_plan = (
-            self._nvidia_decode_fast_path
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
             and bs == raw_bs
             and bs * self.captured_req_width == num_tokens
             and self._copy_planned_inputs(

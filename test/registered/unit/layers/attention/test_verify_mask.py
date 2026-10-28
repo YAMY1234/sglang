@@ -188,12 +188,10 @@ class TestHybridAttnBackendHandsOutSelectedChildMask(CustomTestCase):
 
 
 class TestTrtllmMhaVerifyMask(CustomTestCase):
-    """TRT-LLM MHA's target verify reads no tree mask. With
-    SGLANG_Q35MF_EDGE_CHAIN_TREE, a topk-1 target declares an unread mask, which
-    builds the chain without one; a tree, a draft runner, or a server without the
-    switch keeps SGLang's default."""
+    """TRT-LLM MHA's topk-1 target needs no tree mask; trees and draft runners
+    keep their normal mask layout."""
 
-    def _mask(self, *, topk=1, chain_tree=True, draft=False):
+    def _mask(self, *, topk=1, runtime_optimization=True, draft=False):
         backend = trtllm_mha_backend.TRTLLMHAAttnBackend.__new__(
             trtllm_mha_backend.TRTLLMHAAttnBackend
         )
@@ -205,16 +203,18 @@ class TestTrtllmMhaVerifyMask(CustomTestCase):
             speculative_num_draft_tokens=_DRAFT,
             device="cpu",
         )
-        with envs.SGLANG_Q35MF_EDGE_CHAIN_TREE.override(chain_tree):
+        with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(
+            runtime_optimization
+        ):
             return backend._unread_verify_mask(_MAX_BS)
 
-    def test_only_a_topk1_target_with_the_switch_declares_an_unread_mask(self):
+    def test_only_a_topk1_target_declares_an_unread_mask(self):
         mask = self._mask()
         self.assertEqual(
             (mask.mode, mask.is_read, mask.max_bs),
             (TreeMaskMode.QLEN_ONLY, False, _MAX_BS),
         )
-        for case in (dict(topk=2), dict(chain_tree=False), dict(draft=True)):
+        for case in (dict(topk=2), dict(runtime_optimization=False), dict(draft=True)):
             with self.subTest(**case):
                 self.assertIsNone(self._mask(**case))
 

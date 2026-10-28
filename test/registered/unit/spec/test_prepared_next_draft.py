@@ -24,6 +24,7 @@ from sglang.srt.speculative.prepared_next_draft import (
     PreparedNextDraftInputs,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils import speculative_decode_resources as decode_resources
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -85,6 +86,57 @@ def _decode_prepare_batch(reqs, *, penalized=False):
 
 
 class TestPreparedNextDraft(CustomTestCase):
+    def test_cuda_index_plans_leave_cpu_preparation_to_the_stock_path(self):
+        from sglang.kernels.ops.speculative import speculative_index
+
+        seq = torch.tensor([10])
+        with (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+            patch.object(speculative_index, "_module") as load,
+        ):
+            self.assertFalse(
+                speculative_index.extend_layout(
+                    seq=seq,
+                    width=3,
+                    prefix=None,
+                    extend=None,
+                    post=None,
+                    positions=None,
+                    starts=None,
+                    mrope=None,
+                )
+            )
+            self.assertFalse(
+                speculative_index.draft_locs(
+                    req=None,
+                    table=None,
+                    seq=seq,
+                    out_cache_loc=None,
+                    pool_len=32,
+                    topk=1,
+                    steps=3,
+                    batch_size=1,
+                    positions=None,
+                    mrope=None,
+                )
+            )
+            self.assertFalse(
+                speculative_index.chain_tree(
+                    bonus=None,
+                    draft=None,
+                    seq=seq,
+                    mask=None,
+                    positions=None,
+                    retrieve=None,
+                    tokens=None,
+                    req=None,
+                    table=None,
+                    out_cache_loc=None,
+                    mrope=None,
+                )
+            )
+        load.assert_not_called()
+
     def test_inputs_survive_the_length_read_and_are_consumed_once(self):
         """The scheduler may read prepared lengths before the worker consumes the
         matching buffers; reordered, padded, or under-reserved batches must decline."""
@@ -170,11 +222,7 @@ class TestPreparedNextDraft(CustomTestCase):
             patch.object(
                 overlap_utils, "spec_relay_bypass_enabled", return_value=False
             ),
-            patch(
-                "sglang.srt.speculative.prepared_next_draft."
-                "nvidia_eagle_decode_fast_path_enabled",
-                return_value=True,
-            ),
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
         ):
             future_map = FutureMap(
                 torch.device("cpu"), SpeculativeAlgorithm.EAGLE, pool
@@ -192,6 +240,64 @@ class TestPreparedNextDraft(CustomTestCase):
         self.assertIs(batch.seq_lens, prepared)
         self.assertEqual(batch.seq_lens_cpu.tolist(), [30, 10])
         future_map.publish_ready.wait.assert_not_called()
+
+    def test_future_map_index_select_preserves_reordered_and_repeated_rows(self):
+        pool = SimpleNamespace(req_to_token=torch.zeros((8, 16), dtype=torch.int32))
+        indices = torch.tensor([3, 1, 3])
+        for enabled in (False, True):
+            with (
+                self.subTest(enabled=enabled),
+                envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(enabled),
+                patch.object(overlap_utils, "_is_cuda", False),
+                patch.object(overlap_utils, "_DEBUG_ASSERT", False),
+                patch.object(
+                    overlap_utils, "spec_relay_bypass_enabled", return_value=False
+                ),
+            ):
+                future_map = FutureMap(
+                    torch.device("cpu"), SpeculativeAlgorithm.EAGLE, pool
+                )
+                future_map.new_seq_lens_buf.copy_(torch.arange(8) * 10)
+                batch = SimpleNamespace(
+                    spec_info=SimpleNamespace(future_indices=indices),
+                    req_pool_indices_cpu=indices,
+                )
+                with patch.object(
+                    torch, "index_select", wraps=torch.index_select
+                ) as index_select:
+                    future_map.resolve_seq_lens_cpu(batch)
+                self.assertEqual(batch.seq_lens.tolist(), [30, 10, 30])
+                self.assertEqual(batch.seq_lens_cpu.tolist(), [30, 10, 30])
+                self.assertEqual(index_select.call_count, int(enabled))
+
+    def test_runtime_tensor_pool_reuses_only_after_eight_allocations(self):
+        for enabled in (False, True):
+            with (
+                self.subTest(enabled=enabled),
+                envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(enabled),
+                patch.object(decode_resources, "_round_tensor_rings", {}),
+            ):
+                slots = [
+                    decode_resources.empty((2,), dtype=torch.int64, device="cpu")
+                    for _ in range(9)
+                ]
+                self.assertEqual(len({slot.data_ptr() for slot in slots[:8]}), 8)
+                self.assertEqual(slots[0] is slots[8], enabled)
+
+    def test_runtime_stream_events_are_reused_per_stream_pair(self):
+        waiting = SimpleNamespace(cuda_stream=1, wait_event=Mock())
+        source = SimpleNamespace(cuda_stream=2)
+        event = Mock()
+        with (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+            patch.object(decode_resources, "_join_events", {}),
+            patch.object(torch.cuda, "Event", return_value=event) as create_event,
+        ):
+            decode_resources.wait_stream(waiting, source)
+            decode_resources.wait_stream(waiting, source)
+        create_event.assert_called_once_with()
+        self.assertEqual(event.record.call_args_list, [((source,),), ((source,),)])
+        self.assertEqual(waiting.wait_event.call_count, 2)
 
     def test_schedule_stream_join_is_skipped_only_after_idle_preparation(self):
         """Prepared lengths alone do not waive a schedule-stream join when KV
@@ -223,25 +329,22 @@ class TestPreparedNextDraft(CustomTestCase):
         stream idle only when penalty and cache bookkeeping also launch no work."""
         reserve = 21
         rounds = (
-            (121, False, True),
-            (121, True, False),
-            (120, False, False),
+            (121, False, True, True),
+            (121, True, True, False),
+            (120, False, True, False),
+            (121, False, False, False),
         )
-        for allocated, penalized, idle in rounds:
+        for allocated, penalized, enabled, idle in rounds:
             req = _req(5, allocated=allocated)
             batch = _decode_prepare_batch([req], penalized=penalized)
             with (
-                self.subTest(allocated=allocated, penalized=penalized),
+                self.subTest(allocated=allocated, penalized=penalized, enabled=enabled),
                 patch.object(
                     eagle_utils,
                     "get_alloc_reserve_per_decode",
                     return_value=reserve,
                 ),
-                patch.object(
-                    eagle_utils,
-                    "nvidia_eagle_decode_fast_path_enabled",
-                    return_value=True,
-                ),
+                envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(enabled),
                 patch.object(
                     eagle_utils,
                     "get_exec",
@@ -256,7 +359,7 @@ class TestPreparedNextDraft(CustomTestCase):
             ):
                 eagle_utils.eagle_prepare_for_decode(batch)
                 self.assertEqual(batch.spec_decode_schedule_stream_idle, idle)
-                if allocated == 121:
+                if allocated == 121 and enabled:
                     update.assert_called_once_with([req], [121])
                     allocate.assert_not_called()
                 else:

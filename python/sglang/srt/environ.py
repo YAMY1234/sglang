@@ -1572,33 +1572,6 @@ class Envs:
     SGLANG_NVIDIA_MEGAKERNEL_SLOTS = EnvTuple(())
     # Generic scheduling and metadata optimizations; independent of model/plugin.
     SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION = EnvBool(False)
-    # Runtime switches named as on SGLang branch nvidia/qwen35-agentx-gb300; all off by default.
-    # The fused small-field copy gives each field its own blocks and moves aligned fields in 16 B units.
-    SGLANG_Q35MF_BK_VEC_COPY = EnvBool(False)
-    # Verify input staging, bit-identical: reuse last round's mamba track indices while their
-    # inputs are unchanged, and skip the replay-time input_ids / positions copies that the
-    # same-stream pre-planned load_batch already made.
-    SGLANG_Q35MF_MKH_N3B = EnvBool(False)
-    # The post-verify graphs' per-round input load as one small_field_copy launch that also
-    # reads the injected acceptance length from its pinned host slot (bit-identical); needs
-    # SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.
-    SGLANG_Q35MF_MKH_N3C = EnvBool(False)
-    # A topk-1 chain against TRT-LLM MHA, which masks the draft window itself, is built
-    # with build_chain_tree instead of a full-context tree mask.
-    SGLANG_Q35MF_EDGE_CHAIN_TREE = EnvBool(False)
-    # A verify whose requests all sample with a finite top-k within the compact limit
-    # samples on that support (eagle_sample's compact branch), graphed or eager.
-    SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING = EnvBool(False)
-    # A sampled verify result (predict, accept_index, num_correct_drafts) is one int32
-    # buffer, broadcast to the TP group once.
-    SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST = EnvBool(False)
-    # The scheduler's per-pass TP syncs (request broadcast size, HiCache ready counts)
-    # through a shared-memory table when the group shares a host (shm_tag_exchange.py).
-    SGLANG_Q35MF_EDGE_SHM_SYNC = EnvBool(False)
-    # With SGLANG_Q35MF_EDGE_SHM_SYNC, a group across hosts exchanges per host and only
-    # the host leaders meet (HierTagExchange); with two hosts, optionally over one TCP link.
-    SGLANG_Q35MF_EDGE_SHM_SYNC_MULTIHOST = EnvBool(False)
-    SGLANG_Q35MF_EDGE_MULTIHOST_TCP = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
