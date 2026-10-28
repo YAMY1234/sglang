@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import os
+
 import torch
 
 _MAX_ROWS = 32
 _KPAD_ALIGN = 128
+_M4_TACTIC = int(os.environ.get("SGLANG_Q38C_HC_M4_MIX_TACTIC", "0"))
+if _M4_TACTIC not in (0, 1, 2, 3, 4):
+    raise ValueError("SGLANG_Q38C_HC_M4_MIX_TACTIC must be 0..4")
 
 
 def pad_lowrank(lowrank: int) -> int:
@@ -46,7 +51,21 @@ def _get_tactic(m: int, n: int, k: int):
             validate_tactic,
         )
 
-        if n <= 512 and k % (128 * 16) == 0:
+        if m == 4 and (n, k) == (320, 10240) and _M4_TACTIC in (1, 4):
+            tactic = (
+                SplitKTactic(64, 8, 8, 6)
+                if _M4_TACTIC == 1
+                else SplitKTactic(64, 8, 16, 4)
+            )
+            validate_tactic(tactic, m, n, k)
+        elif m == 4 and (n, k) == (10240, 384) and _M4_TACTIC in (2, 3):
+            tactic = (
+                SplitKTactic(64, 8, 1, 6)
+                if _M4_TACTIC == 2
+                else SplitKTactic(128, 8, 1, 3)
+            )
+            validate_tactic(tactic, m, n, k)
+        elif n <= 512 and k % (128 * 16) == 0:
             tactic = SplitKTactic(mma_m=64, mma_n=8, split_k=16, ab_stages=6)
             try:
                 validate_tactic(tactic, m, n, k)
