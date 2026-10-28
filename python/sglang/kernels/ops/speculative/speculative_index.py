@@ -5,8 +5,10 @@ from __future__ import annotations
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit
+from sglang.srt.utils.common import is_cuda
 
 _INDEX_DTYPES = (torch.int32, torch.int64)
+_is_cuda = is_cuda()
 _descriptors: dict[str, tuple[torch.Tensor, object]] = {}
 
 
@@ -54,8 +56,9 @@ def chain_tree(
     out_cache_loc,
     mrope,
 ) -> bool:
-    if not _runtime_optimization_enabled() or not (
-        bonus.dtype in _INDEX_DTYPES
+    if not _is_cuda or not _runtime_optimization_enabled() or not (
+        bonus.is_cuda
+        and bonus.dtype in _INDEX_DTYPES
         and draft.dtype in _INDEX_DTYPES
         and seq.dtype in _INDEX_DTYPES
         and tokens.dtype in _INDEX_DTYPES
@@ -99,7 +102,12 @@ def chain_tree(
 def extend_layout(
     *, seq, width, prefix, extend, post, positions, starts, mrope
 ) -> bool:
-    if not _runtime_optimization_enabled() or seq.dtype not in _INDEX_DTYPES:
+    if (
+        not _is_cuda
+        or not _runtime_optimization_enabled()
+        or not seq.is_cuda
+        or seq.dtype not in _INDEX_DTYPES
+    ):
         return False
     descriptor, values = _descriptor("extend_layout", 13)
     values[0] = seq.data_ptr()
@@ -132,8 +140,9 @@ def draft_locs(
     positions,
     mrope,
 ) -> bool:
-    if not _runtime_optimization_enabled() or not (
-        req.dtype in _INDEX_DTYPES
+    if not _is_cuda or not _runtime_optimization_enabled() or not (
+        req.is_cuda
+        and req.dtype in _INDEX_DTYPES
         and table.dtype in _INDEX_DTYPES
         and seq.dtype in _INDEX_DTYPES
         and out_cache_loc.dtype is torch.int64

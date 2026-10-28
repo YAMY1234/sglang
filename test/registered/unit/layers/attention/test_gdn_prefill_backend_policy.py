@@ -92,7 +92,6 @@ class TestGDNPrefillGraphExtend(CustomTestCase):
         enable_mis=False,
         draft=False,
         flashinfer=False,
-        runtime_optimization=False,
     ):
         """A target's GDN backend on a setup the graph-safe chain supports, unless
         cuda, enable_mis or draft say otherwise."""
@@ -136,12 +135,6 @@ class TestGDNPrefillGraphExtend(CustomTestCase):
             ),
             patch.object(gdn_backend, "get_exec", return_value=execution),
             patch.object(gdn_backend, "mamba_cache_chunk_size", return_value=64),
-            patch(
-                "sglang.srt.kernel_plugins.nvidia.binding."
-                "nv_mega_runtime_optimization_enabled",
-                return_value=runtime_optimization,
-                create=True,
-            ),
             patch.object(torch.cuda, "get_device_capability", return_value=(10, 0)),
             patch.object(
                 torch.cuda,
@@ -163,7 +156,6 @@ class TestGDNPrefillGraphExtend(CustomTestCase):
         for switch, setup, captured in (
             (False, {}, False),
             (True, {}, True),
-            (False, dict(runtime_optimization=True), True),
             (True, dict(cuda=False), False),
             (True, dict(enable_mis=True), False),
             (True, dict(draft=True), False),
@@ -175,18 +167,17 @@ class TestGDNPrefillGraphExtend(CustomTestCase):
             ):
                 self.assertEqual(backend.supports_prefill_graph_extend(), captured)
 
-    def test_flashinfer_capture_requires_the_runtime_optimization_switch(self):
+    def test_the_switch_captures_supported_flashinfer_prefill(self):
         with (
             envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.override(True),
+            envs.ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(False),
             self._setup(flashinfer=True) as backend,
         ):
             self.assertFalse(backend.supports_prefill_graph_extend())
-            self.assertFalse(backend.prefill_graph_flashinfer)
-            self.assertIsNone(backend._flashinfer_graph_output)
-
         with (
-            envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.override(False),
-            self._setup(flashinfer=True, runtime_optimization=True) as backend,
+            envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.override(True),
+            envs.ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+            self._setup(flashinfer=True) as backend,
         ):
             self.assertTrue(backend.supports_prefill_graph_extend())
             self.assertTrue(backend.prefill_graph_flashinfer)
@@ -194,16 +185,6 @@ class TestGDNPrefillGraphExtend(CustomTestCase):
             self.assertEqual(
                 tuple(backend._flashinfer_graph_output.shape), (512, 4, 128)
             )
-
-        with (
-            envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.override(False),
-            self._setup(
-                cuda=False, flashinfer=True, runtime_optimization=True
-            ) as backend,
-        ):
-            self.assertFalse(backend.supports_prefill_graph_extend())
-            self.assertFalse(backend.prefill_graph_flashinfer)
-            self.assertIsNone(backend._flashinfer_graph_output)
 
 
 class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):

@@ -81,8 +81,15 @@ def spec_relay_bypass_enabled(
 
     ``spec_algo`` is omitted by the EAGLE-only draft-extend runner.
     """
+    # Import lazily because the NVIDIA binding reaches runtime modules during
+    # startup.  Relay ownership is a provider-neutral runtime optimization and
+    # must not depend on whether a megakernel was installed.
+    from sglang.srt.kernel_plugins.nvidia.binding import (
+        nv_mega_runtime_optimization_enabled,
+    )
+
     return (
-        get_exec().kernel.enable_nvidia_megakernel
+        nv_mega_runtime_optimization_enabled()
         and (get_spec().speculative_eagle_topk or 1) == 1
         and (spec_algo is None or spec_algo.is_eagle() or spec_algo.is_standalone())
     )
