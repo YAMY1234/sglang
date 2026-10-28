@@ -1570,6 +1570,8 @@ class Envs:
     SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH = EnvBool(False)
     # Kernel groups requested from the NVIDIA megakernel plugin.
     SGLANG_NVIDIA_MEGAKERNEL_SLOTS = EnvTuple(())
+    # Generic scheduling and metadata optimizations; independent of model/plugin.
+    SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION = EnvBool(False)
     # Runtime switches named as on SGLang branch nvidia/qwen35-agentx-gb300; all off by default.
     # The fused small-field copy gives each field its own blocks and moves aligned fields in 16 B units.
     SGLANG_Q35MF_BK_VEC_COPY = EnvBool(False)

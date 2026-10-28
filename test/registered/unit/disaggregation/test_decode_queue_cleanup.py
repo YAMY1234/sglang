@@ -1,3 +1,4 @@
+import contextlib
 import unittest
 from collections import deque
 from concurrent.futures import Future
@@ -13,10 +14,12 @@ from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
     HiCacheRestoreResult,
+    SchedulerDisaggregationDecodeMixin,
 )
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -295,6 +298,161 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
         self.assertEqual(queue.queue, [decode_req])
         mock_prepare_abort.assert_not_called()
         mock_release_kv_cache.assert_not_called()
+
+
+def _queue_scheduler():
+    scheduler = SimpleNamespace(
+        scheduler_stage_metrics=None,
+        enable_decode_hicache=False,
+        enable_hisparse=False,
+        waiting_queue=[],
+        polling_count=0,
+        polling_interval=1,
+        disagg_decode_transfer_queue=SimpleNamespace(
+            resolve_deferred_releases=MagicMock(),
+            pop_transferred=MagicMock(return_value=[]),
+            extend=MagicMock(),
+        ),
+        disagg_decode_prealloc_queue=SimpleNamespace(
+            flush_deferred_sends=MagicMock(),
+            resume_retracted_reqs=MagicMock(return_value=[]),
+            retracted_queue=[],
+            pop_preallocated=MagicMock(return_value=([], [])),
+        ),
+    )
+    scheduler._preallocate_new_requests = lambda: (
+        SchedulerDisaggregationDecodeMixin._preallocate_new_requests(scheduler)
+    )
+    return scheduler
+
+
+def _admit_req(**overrides):
+    fields = dict(
+        grammar=None,
+        output_dsa_topk_indices=None,
+        kv=SimpleNamespace(retraction_backup=None),
+        hidden_states_tensor=object(),
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+class TestAdmissionOverlap(CustomTestCase):
+    def test_scope_uses_admitted_requests_and_keeps_host_read_paths_stock(self):
+        scheduler = SimpleNamespace(
+            enable_overlap=True,
+            spec_algorithm=SimpleNamespace(is_eagle=lambda: True),
+            enable_hisparse=False,
+        )
+        disagg = SimpleNamespace(
+            disaggregation_decode_host_receive_threshold=1,
+            disaggregation_decode_enable_radix_cache=False,
+        )
+
+        def scope(reqs):
+            return SchedulerDisaggregationDecodeMixin._nonblocking_admit_in_scope(
+                scheduler, SimpleNamespace(reqs=reqs)
+            )
+
+        with patch("sglang.srt.disaggregation.decode.get_disagg", return_value=disagg):
+            with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(False):
+                self.assertFalse(scope([_admit_req()]))
+            with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True):
+                self.assertTrue(scope([_admit_req()]))
+                disagg.disaggregation_decode_enable_radix_cache = True
+                self.assertFalse(scope([_admit_req()]))
+                disagg.disaggregation_decode_enable_radix_cache = False
+                for req in (
+                    _admit_req(grammar=object()),
+                    _admit_req(output_dsa_topk_indices=object()),
+                    _admit_req(kv=SimpleNamespace(retraction_backup=object())),
+                    _admit_req(hidden_states_tensor=None),
+                ):
+                    self.assertFalse(scope([req]))
+                scheduler.enable_hisparse = True
+                self.assertFalse(scope([_admit_req()]))
+                scheduler.enable_hisparse = False
+                scheduler.enable_overlap = False
+                self.assertFalse(scope([_admit_req()]))
+
+    def test_seed_is_ordered_on_forward_stream_without_schedule_wait(self):
+        for nonblocking in (False, True):
+            batch = MagicMock()
+            batch.is_empty.return_value = False
+            calls = []
+
+            @contextlib.contextmanager
+            def forward_context():
+                calls.append("enter_forward")
+                yield
+                calls.append("leave_forward")
+
+            scheduler = SimpleNamespace(
+                _get_new_prebuilt_batch=lambda _: batch,
+                _nonblocking_admit_in_scope=lambda _: nonblocking,
+                _verify_kv_checksums=lambda _: calls.append("verify"),
+                ngram_embedding_manager=MagicMock(),
+                chunked_req=None,
+                future_map=object(),
+                enable_overlap=True,
+                schedule_stream=MagicMock(),
+                forward_stream=MagicMock(),
+                forward_stream_ctx=forward_context(),
+            )
+            batch.process_prebuilt.side_effect = lambda _: calls.append("seed")
+            result = SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(
+                scheduler, object()
+            )
+            self.assertIs(result, batch)
+            if nonblocking:
+                self.assertEqual(
+                    calls, ["verify", "enter_forward", "seed", "leave_forward"]
+                )
+                scheduler.schedule_stream.wait_stream.assert_not_called()
+                scheduler.forward_stream.wait_stream.assert_called_once_with(
+                    scheduler.schedule_stream
+                )
+                batch.req_pool_indices.record_stream.assert_called_once_with(
+                    scheduler.forward_stream
+                )
+                batch.seq_lens.record_stream.assert_called_once_with(
+                    scheduler.forward_stream
+                )
+            else:
+                self.assertEqual(calls, ["verify", "seed"])
+                scheduler.schedule_stream.wait_stream.assert_called_once_with(
+                    scheduler.forward_stream
+                )
+                scheduler.forward_stream.wait_stream.assert_not_called()
+
+    def test_deferred_prealloc_polls_and_flushes_once_and_preserves_retraction(self):
+        disagg = SimpleNamespace(
+            disaggregation_decode_enable_offload_kvcache=False,
+            disaggregation_decode_host_receive_threshold=1,
+            disaggregation_decode_polling_interval=1,
+        )
+        with patch("sglang.srt.disaggregation.decode.get_disagg", return_value=disagg):
+            for defer in (False, True):
+                scheduler = _queue_scheduler()
+                deferred = SchedulerDisaggregationDecodeMixin.process_decode_queue(
+                    scheduler, defer_prealloc=defer
+                )
+                self.assertEqual(deferred, defer)
+                queue = scheduler.disagg_decode_prealloc_queue
+                queue.flush_deferred_sends.assert_called_once()
+                scheduler.disagg_decode_transfer_queue.pop_transferred.assert_called_once()
+                self.assertEqual(queue.pop_preallocated.call_count, int(not defer))
+                if deferred:
+                    scheduler._preallocate_new_requests()
+                queue.pop_preallocated.assert_called_once()
+            scheduler = _queue_scheduler()
+            scheduler.disagg_decode_prealloc_queue.retracted_queue.append(object())
+            self.assertFalse(
+                SchedulerDisaggregationDecodeMixin.process_decode_queue(
+                    scheduler, defer_prealloc=True
+                )
+            )
+            scheduler.disagg_decode_prealloc_queue.pop_preallocated.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -39,6 +39,9 @@ class MambaFullCacheDonor(Protocol):
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
+    # Whether freed pages can wait for in-flight KV writes before PD reuse.
+    supports_reuse_guard = False
+
     @abc.abstractmethod
     def __init__(
         self,
