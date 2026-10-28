@@ -94,11 +94,13 @@ _UNQUANTIZED_LM_HEAD_METHODS = {
 _autotune_run_lm_head: Optional[bool] = None
 
 
-def _nvidia_megakernel_enabled() -> bool:
+def _runtime_optimized_vocab_shards_enabled() -> bool:
     # Imported lazily because the NVIDIA binding reaches model modules at startup.
-    from sglang.srt.kernel_plugins.nvidia.binding import megakernel_enabled
+    from sglang.srt.kernel_plugins.nvidia.binding import (
+        nv_mega_runtime_optimization_enabled,
+    )
 
-    return megakernel_enabled()
+    return nv_mega_runtime_optimization_enabled()
 
 
 class SamplingMaskStatus(IntEnum):
@@ -501,7 +503,7 @@ class LogitsProcessor(nn.Module):
         # gather itself (see finish_deferred_gather / deferred_argmax).
         self.defer_verify_gather = False
         self.sharded_verify = (
-            _nvidia_megakernel_enabled()
+            _runtime_optimized_vocab_shards_enabled()
             and self.do_tensor_parallel_all_gather
             and not self.use_attn_tp_group
             and not self.do_tensor_parallel_all_gather_dp_attn

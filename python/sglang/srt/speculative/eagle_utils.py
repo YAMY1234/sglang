@@ -72,9 +72,11 @@ logger = logging.getLogger(__name__)
 def _fused_accept_enabled() -> bool:
     # Import lazily: the NVIDIA binding imports runtime modules that eventually
     # reach speculative decoding during startup.
-    from sglang.srt.kernel_plugins.nvidia.binding import megakernel_enabled
+    from sglang.srt.kernel_plugins.nvidia.binding import (
+        nv_mega_runtime_optimization_enabled,
+    )
 
-    return megakernel_enabled()
+    return nv_mega_runtime_optimization_enabled()
 
 
 def per_step_draft_out_cache_loc(
