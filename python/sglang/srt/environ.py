@@ -1572,6 +1572,8 @@ class Envs:
     SGLANG_NVIDIA_MEGAKERNEL_SLOTS = EnvTuple(())
     # Generic scheduling and metadata optimizations; independent of model/plugin.
     SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION = EnvBool(False)
+    # PD decode optimizations follow the shared switch unless explicitly disabled.
+    SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION = EnvBool(True)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
