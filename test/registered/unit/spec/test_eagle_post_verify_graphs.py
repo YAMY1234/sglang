@@ -64,7 +64,9 @@ def _target_worker():
     )
 
 
-def _worker(*, switch, cuda=True, topk=1, dp_attention=False):
+def _worker(
+    *, switch, runtime_optimization=False, cuda=True, topk=1, dp_attention=False
+):
     """An EAGLE worker after init_attention_backends, with
     SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH set to switch, on a CUDA host with a
     chain draft and no DP attention unless the arguments say otherwise."""
@@ -84,6 +86,7 @@ def _worker(*, switch, cuda=True, topk=1, dp_attention=False):
     parallel = SimpleNamespace(attn_dp_enabled=dp_attention)
     with (
         envs.SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.override(switch),
+        envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(runtime_optimization),
         patch.object(eagle_worker_v2, "_is_cuda", cuda),
         patch.object(eagle_worker_v2, "get_parallel", return_value=parallel),
     ):
@@ -200,11 +203,17 @@ class TestPostVerifyGraphs(CustomTestCase):
         on = _worker(switch=True)
         self.assertIsInstance(on._post_verify_graphs, EaglePostVerifyGraphs)
         self.assertIs(_verify_kwargs(on)["post_verify_graphs"], on._post_verify_graphs)
+        runtime_on = _worker(switch=False, runtime_optimization=True)
+        self.assertIsInstance(runtime_on._post_verify_graphs, EaglePostVerifyGraphs)
         for setup in (dict(cuda=False), dict(topk=2), dict(dp_attention=True)):
             with self.subTest(**setup):
                 worker = _worker(switch=True, **setup)
                 self.assertIsNone(worker._post_verify_graphs)
                 self.assertIsNone(worker._simulated_acc_len_rng)
+                runtime_worker = _worker(
+                    switch=False, runtime_optimization=True, **setup
+                )
+                self.assertIsNone(runtime_worker._post_verify_graphs)
 
     def test_a_kv_pool_that_clears_c128_draft_states_keeps_the_eager_verify(self):
         """The post-verify graphs skip the eager verify's cleanup of rejected c128
@@ -382,10 +391,10 @@ class TestPostVerifyGraphs(CustomTestCase):
         self.assertTrue(torch.equal(torch.get_rng_state(), state))
 
     def test_compact_top_k_sampling_takes_only_batches_of_finite_top_k(self):
-        """With SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING a verify samples on the
+        """A verify samples on the
         top-k support when every request has a finite top-k within the compact
         limit, in the post-verify graphs (keyed apart from the dense branch, whose
-        sampling differs) and the eager verify alike; without it nothing changes."""
+        sampling differs) and the eager verify alike."""
 
         def batch(*top_ks):
             reqs = [
@@ -402,13 +411,19 @@ class TestPostVerifyGraphs(CustomTestCase):
             return kwargs["uno_target_max_top_k"], kwargs["sparse_bonus_argmax"]
 
         limit = SimpleNamespace(_SPARSE_TOP_K_LIMIT=128)
-        with patch.dict("sys.modules", {"sglang.srt.speculative.uno_utils": limit}):
-            with patch.object(eagle_utils, "_COMPACT_VERIFY_SAMPLING", True):
-                self.assertEqual(compact_verify_max_top_k(batch(20, 64)), 64)
-                for dense in ((20, 1 << 30), (20, 1), (129,), ()):
-                    with self.subTest(top_ks=dense):
-                        self.assertIsNone(compact_verify_max_top_k(batch(*dense)))
-                self.assertEqual(verify_kwargs(batch(20)), (20, True))
+        with (
+            patch.dict("sys.modules", {"sglang.srt.speculative.uno_utils": limit}),
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+        ):
+            self.assertEqual(compact_verify_max_top_k(batch(20, 64)), 64)
+            for dense in ((20, 1 << 30), (20, 1), (129,), ()):
+                with self.subTest(top_ks=dense):
+                    self.assertIsNone(compact_verify_max_top_k(batch(*dense)))
+            self.assertEqual(verify_kwargs(batch(20)), (20, True))
+            idle = batch(20)
+            idle.forward_mode = ForwardMode.IDLE
+            self.assertIsNone(compact_verify_max_top_k(idle))
+        with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(False):
             self.assertIsNone(compact_verify_max_top_k(batch(20, 64)))
             self.assertEqual(verify_kwargs(batch(20)), (None, False))
 
@@ -449,7 +464,7 @@ class TestPostVerifyGraphs(CustomTestCase):
         self.assertEqual(len(keys), 2)
 
     def test_a_packed_verify_result_is_one_buffer_holding_the_stock_values(self):
-        """With SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST a sampled verify result goes to
+        """A sampled verify result goes to
         the TP group in one broadcast: predict, accept_index and num_correct_drafts
         must be views of one buffer, in order, starting from the values the
         unpacked tensors start from."""
@@ -776,7 +791,7 @@ class TestFusedAcceptMatchesUnfused(CustomTestCase):
         with (
             patch.object(spec_utils, "SIMULATE_ACC_LEN", sim_acc_len),
             patch.object(spec_utils, "SIMULATE_ACC_TOKEN_MODE", token_mode),
-            patch.object(eagle_utils, "_PACKED_VERIFY_BCAST", packed),
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(packed),
             patch("sglang.srt.runtime_context.get_parallel", return_value=parallel),
         ):
             for bs in FUSED_BATCH_SIZES:

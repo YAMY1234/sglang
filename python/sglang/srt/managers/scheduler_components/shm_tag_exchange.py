@@ -13,10 +13,9 @@ loads and stores. The table is double-buffered by sequence parity: a rank can
 reuse a slot only after every rank has published the next call, which a rank
 does only after it has finished reading the previous call.
 
-Enabled by SGLANG_Q35MF_EDGE_SHM_SYNC=1 (default off). Groups that span hosts
-keep the stock gloo path unless SGLANG_Q35MF_EDGE_SHM_SYNC_MULTIHOST=1 is also
-set: then each host exchanges through shared memory and only the host leaders
-meet in one small gloo all_gather (HierTagExchange).
+Groups that span hosts can exchange hierarchically: each host uses shared memory
+and only the host leaders communicate, over one TCP connection for two hosts or
+one small gloo all_gather for larger groups (HierTagExchange).
 """
 
 from __future__ import annotations
@@ -223,11 +222,7 @@ class HierTagExchange:
         )
         # Two hosts: the leaders swap rows over one TCP connection instead of a gloo all_gather.
         self.link = None
-        if (
-            self.is_leader
-            and len(self.members) == 2
-            and envs.SGLANG_Q35MF_EDGE_MULTIHOST_TCP.get()
-        ):
+        if self.is_leader and len(self.members) == 2:
             self.link = _LeaderLink(self.leaders, host == 0, self.local.timeout_s)
 
     def allgather(self, values: Sequence[int]) -> List[List[int]]:
@@ -270,8 +265,8 @@ def get_shm_exchange(
     key = (id(group), kind)
     if key not in _EXCHANGES:
         if (
-            not envs.SGLANG_Q35MF_EDGE_SHM_SYNC.get()
-            # an idle rank 0 sleeps in its poller; the waiting ranks would spin meanwhile
+            not envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+            # An idle rank 0 sleeps in its poller; the waiting ranks would spin meanwhile.
             or get_device().sleep_on_idle
             or dist.get_world_size(group) <= 1
         ):
@@ -287,11 +282,7 @@ def get_shm_exchange(
                     kind,
                     dist.get_world_size(group),
                 )
-            elif (
-                multihost
-                and envs.SGLANG_Q35MF_EDGE_SHM_SYNC_MULTIHOST.get()
-                and dist.get_world_size() == dist.get_world_size(group)
-            ):
+            elif multihost and dist.get_world_size() == dist.get_world_size(group):
                 # Only when this group is the whole default group, so the subgroup
                 # creation inside is collective over exactly these ranks.
                 _EXCHANGES[key] = HierTagExchange(group, kind)
