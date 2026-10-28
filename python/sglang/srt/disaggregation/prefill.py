@@ -1729,8 +1729,8 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             segments = [(start_idx, end_idx)]
 
-        # A PD prefill server does not load the decode megakernel plugin. Fence
-        # staging gathers on the exact producer stream whenever staging is on.
+        # Fence staging gathers on the exact producer stream whenever staging
+        # is enabled.
         fence_staging_gather = self.enable_staging
         for seg_start, seg_end in segments:
             is_final_segment = seg_end == end_idx

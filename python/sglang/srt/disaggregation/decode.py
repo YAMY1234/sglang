@@ -153,12 +153,6 @@ if TYPE_CHECKING:
 CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 
 
-def _nvidia_megakernel_enabled() -> bool:
-    from sglang.srt.kernel_plugins.nvidia.binding import megakernel_enabled
-
-    return megakernel_enabled()
-
-
 def _bootstrap_addr(req: Req) -> str:
     # FIXME: make a property of a req
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
@@ -1793,8 +1787,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     )
                 )
             if (
-                _nvidia_megakernel_enabled()
-                and set(state_types) <= {StateType.MAMBA}
+                set(state_types) <= {StateType.MAMBA}
                 and not self.scheduler.enable_hisparse
                 and not _is_fake_transfer(decode_req.req)
             ):

@@ -1457,18 +1457,10 @@ class TestStagingWatermark(unittest.TestCase):
 
 
 class TestDeferredStagingScatter(unittest.TestCase):
-    def test_defer_is_limited_to_expert_parallel_megakernels(self):
-        for megakernel, ep_size, expected in (
-            (False, 8, False),
-            (True, 1, False),
-            (True, 8, True),
-        ):
+    def test_defer_is_limited_to_expert_parallel(self):
+        for ep_size, expected in ((1, False), (8, True)):
             with (
-                self.subTest(megakernel=megakernel, ep_size=ep_size),
-                patch(
-                    "sglang.srt.kernel_plugins.nvidia.binding.megakernel_enabled",
-                    return_value=megakernel,
-                ),
+                self.subTest(ep_size=ep_size),
                 patch(
                     "sglang.srt.disaggregation.common.staging_handler.get_parallel",
                     return_value=SimpleNamespace(moe_ep_size=ep_size),

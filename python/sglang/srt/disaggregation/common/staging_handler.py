@@ -37,9 +37,7 @@ if TYPE_CHECKING:
 
 def _deferred_scatter_enabled() -> bool:
     """Defer staging scatters only on the validated expert-parallel path."""
-    from sglang.srt.kernel_plugins.nvidia.binding import megakernel_enabled
-
-    return megakernel_enabled() and get_parallel().moe_ep_size > 1
+    return get_parallel().moe_ep_size > 1
 
 
 # ======================================================================
