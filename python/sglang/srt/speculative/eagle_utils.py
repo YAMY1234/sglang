@@ -34,9 +34,6 @@ from sglang.srt.mem_cache.allocation_sizing import (
     page_aligned_decode_alloc_lens,
 )
 from sglang.srt.runtime_context import get_exec, get_spec
-from sglang.srt.speculative.prepared_next_draft import (
-    prepared_next_draft_enabled,
-)
 from sglang.srt.speculative.sharded_verify import (
     VocabShard,
     gather_full_logits,
@@ -588,7 +585,7 @@ def compact_verify_max_top_k(batch: ScheduleBatch) -> Optional[int]:
     """The support for eagle_sample's compact top-k branch under
     SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING, or None for the dense branch: every
     request must sample with a finite top-k within the compact limit."""
-    if not _COMPACT_VERIFY_SAMPLING or batch.forward_mode.is_idle():
+    if not envs.SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING.get() or batch.forward_mode.is_idle():
         return None
     from sglang.srt.speculative.uno_utils import _SPARSE_TOP_K_LIMIT
 
@@ -907,7 +904,7 @@ def eagle_sample(
         bs=bs,
         depth=verify_input.max_tree_depth,
         device=device,
-        packed=_PACKED_VERIFY_BCAST,
+        packed=envs.SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST.get(),
         init=not fused_verify,
     )
 
@@ -1337,7 +1334,7 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     for r in batch.reqs:
         r.decode_batch_idx += 1
 
-    if num_needed_tokens == 0 and prepared_next_draft_enabled():
+    if num_needed_tokens == 0 and envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
         # No device allocation is needed; settle only the host-side watermark.
         update_spec_decode_allocated_lens(batch.reqs, nxt_kv_lens)
         batch.spec_decode_schedule_stream_idle = not (

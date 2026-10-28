@@ -1,4 +1,4 @@
-"""Reusable transient resources for NVIDIA EAGLE decode rounds."""
+"""Reusable transient tensors, host buffers, and stream events for decode rounds."""
 
 from __future__ import annotations
 
@@ -6,9 +6,7 @@ import math
 
 import torch
 
-from sglang.srt.speculative.prepared_next_draft import (
-    prepared_next_draft_enabled,
-)
+from sglang.srt.environ import envs
 from sglang.srt.utils.common import async_d2h, is_pin_memory_available
 
 _ROUND_RING_DEPTH = 8
@@ -25,7 +23,7 @@ _round_contexts: dict[torch.device, list] = {}
 
 
 def enabled() -> bool:
-    return prepared_next_draft_enabled()
+    return envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
 
 
 def _device_key(device) -> torch.device:
