@@ -224,7 +224,11 @@ class QwenSparseAttnBackend(AttentionBackend):
             os.environ.get("SGLANG_Q38C_LOOKUP_NATIVE", "0") == "1"
             and getattr(config, "hidden_size", None) == 2560
             and getattr(config, "hc_count", None) == 4
-            and get_parallel().tp_size == 1
+            and (
+                get_parallel().tp_size == 1
+                or (get_parallel().tp_size == 4
+                    and os.environ.get("SGLANG_Q38C_MK_MTP", "0") == "1")
+            )
             and get_spec().speculative_num_steps == 3
             and get_spec().speculative_eagle_topk == 1
             and self._fused_kv_pool_eligible
