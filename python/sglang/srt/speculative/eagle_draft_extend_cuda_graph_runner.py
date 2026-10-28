@@ -322,6 +322,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.in_graph_metadata_prep_done: Optional[torch.cuda.Event] = None
         self._runtime_optimization = (
             envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+            and envs.SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION.get()
         )
         allocator = self.model_runner.token_to_kv_pool_allocator
         # A PD transfer can overwrite a freed page before the replay's KV

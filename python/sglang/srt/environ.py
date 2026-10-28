@@ -1603,6 +1603,8 @@ class Envs:
     # Runtime switches named as on SGLang branch nvidia/qwen35-agentx-gb300.
     # Kernel groups requested from the NVIDIA megakernel plugin.
     SGLANG_NVIDIA_MEGAKERNEL_SLOTS = EnvTuple(())
+    # PD decode optimizations follow the shared switch unless explicitly disabled.
+    SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION = EnvBool(True)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)

@@ -191,6 +191,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         if (
             fm.is_draft_extend_v2()
             and envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+            and envs.SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION.get()
         ):
             return SharedReadEnds.IN_REPLAY
         return super().shared_read_ends(fm)
@@ -426,6 +427,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.decode_split_hoist = (
             self.decode_seq_len_splits > 1
             and envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+            and envs.SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION.get()
         )
         self._decode_group_plans = (
             DecodeGroupPlans() if self.decode_split_hoist else None

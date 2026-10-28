@@ -1,6 +1,9 @@
+import ast
 import contextlib
+import os
 import unittest
 from concurrent.futures import Future
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -258,6 +261,72 @@ def _admit_req(**overrides):
     )
     fields.update(overrides)
     return SimpleNamespace(**fields)
+
+
+class TestPDDecRuntimeSwitch(CustomTestCase):
+    def test_all_five_readers_follow_shared_and_component_switches(self):
+        # Evaluate the production predicates without constructing CUDA backends
+        # or entering the scheduler's event loop.
+        runtime = Path(__file__).resolve().parents[4] / "python/sglang/srt"
+        shared = "SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION"
+        component = "SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION"
+        predicates = []
+        for relative in (
+            "disaggregation/decode.py",
+            "layers/attention/trtllm_mha_backend.py",
+            "speculative/eagle_draft_extend_cuda_graph_runner.py",
+        ):
+            tree = ast.parse((runtime / relative).read_text())
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.BoolOp):
+                    continue
+                reads = {
+                    value.func.value.attr
+                    for value in node.values
+                    if isinstance(value, ast.Call)
+                    and isinstance(value.func, ast.Attribute)
+                    and value.func.attr == "get"
+                    and isinstance(value.func.value, ast.Attribute)
+                    and isinstance(value.func.value.value, ast.Name)
+                    and value.func.value.value.id == "envs"
+                }
+                if shared in reads:
+                    self.assertIn(component, reads, (relative, node.lineno))
+                    self.assertIsInstance(node.op, ast.And)
+                    predicates.append(
+                        (relative, compile(ast.Expression(node), relative, "eval"))
+                    )
+        self.assertEqual(len(predicates), 5)
+        scheduler = SimpleNamespace(
+            enable_overlap=True,
+            spec_algorithm=SimpleNamespace(is_eagle=lambda: True),
+            enable_hisparse=False,
+            decode_seq_len_splits=4,
+        )
+        context = dict(
+            envs=envs,
+            self=scheduler,
+            fm=SimpleNamespace(is_draft_extend_v2=lambda: True),
+            batch=SimpleNamespace(reqs=[_admit_req()]),
+            get_disagg=lambda: SimpleNamespace(
+                disaggregation_decode_enable_radix_cache=False,
+                disaggregation_decode_host_receive_threshold=1,
+            ),
+        )
+        for master in (False, True):
+            for override in (None, "0", "1"):
+                with self.subTest(master=master, component=override):
+                    with patch.dict(os.environ), getattr(envs, shared).override(master):
+                        os.environ.pop(component, None)
+                        if override is not None:
+                            os.environ[component] = override
+                        expected = master and override != "0"
+                        for relative, predicate in predicates:
+                            self.assertEqual(
+                                eval(predicate, context), expected, relative
+                            )
+                        # Arrive and other components still read the shared switch.
+                        self.assertEqual(getattr(envs, shared).get(), master)
 
 
 class TestAdmissionOverlap(CustomTestCase):
