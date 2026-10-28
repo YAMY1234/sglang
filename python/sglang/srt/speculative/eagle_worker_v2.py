@@ -4,7 +4,6 @@ import time
 from typing import Callable, List, Optional
 
 import torch
-
 from sglang.kernels.ops.speculative.topk1 import (
     draft_topk1_argmax_only,
     draft_topk1_postprocess,
@@ -69,7 +68,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative import eagle_megakernel
+from sglang.srt.speculative import eagle_megakernel, prepared_next_draft
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
     SpecRuntimeState,
@@ -108,12 +107,15 @@ from sglang.srt.speculative.eagle_utils import (
     per_step_draft_out_cache_loc,
 )
 from sglang.srt.speculative.eagle_worker_common import (
+    STOCK_SPECULATIVE_RUNTIME_HOOKS,
+    bind_eagle_runtime_hooks,
     build_eagle_verify_input,
     prepare_for_draft,
     prepare_for_draft_extend,
     run_eagle_verify,
 )
 from sglang.srt.speculative.pp_draft_embedding import resolve_draft_embed_and_head
+from sglang.srt.speculative.prepared_next_draft import NextDraftInputStager
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_pp_context,
@@ -126,6 +128,7 @@ from sglang.srt.speculative.spec_utils import (
     select_top_k_tokens,
     spec_stage_span,
 )
+from sglang.srt.utils import speculative_decode_resources as spec_decode_resources
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -181,10 +184,14 @@ def _qsa_index_share_requested(hf_config) -> bool:
 
 
 class EagleDraftWorker(EagleDraftWorkerBase):
-    # SGLang's side of the megakernel's EAGLE entries when it offers one
-    # (init_attention_backends sets it); a class default, since unit-test harnesses
-    # build workers without __init__.
-    megakernel: Optional[eagle_megakernel.EagleMegakernel] = None
+    # Set for a round whose inputs were prepared by the preceding post-verify graph.
+    prepared_next_draft = None
+
+    # Always-present draft dispatch. init_attention_backends resolves it before
+    # graph capture; the class default keeps __new__-based test harnesses on stock.
+    draft_runtime: eagle_megakernel.EagleDraftRuntime = (
+        eagle_megakernel.STOCK_EAGLE_DRAFT_RUNTIME
+    )
 
     def __init__(
         self,
@@ -294,7 +301,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_worker.init_attention_backends()
             self.init_attention_backend()
         # the pools and both attention backends exist, no graph is captured yet
-        self.megakernel = eagle_megakernel.init_eagle_megakernel(draft_worker=self)
+        self.draft_runtime = eagle_megakernel.init_eagle_draft_runtime(
+            draft_worker=self
+        )
 
     def init_cuda_graphs(self):
         with (
@@ -676,6 +685,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
     def draft(self, batch: ScheduleBatch, *, with_topology: bool = False):
         draft_input: EagleDraftInput = batch.spec_info
+        prepared, self.prepared_next_draft = self.prepared_next_draft, None
         forward_batch, can_run_decode_cuda_graph, iteration_ids = prepare_for_draft(
             draft_input,
             self.req_to_token_pool,
@@ -686,6 +696,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.speculative_num_steps,
             target_translator=self.target_worker.model_runner.runner_ids,
             num_draft_tokens=self.speculative_num_draft_tokens,
+            prepared=prepared,
+        )
+        prepared = (
+            prepared
+            if prepared is not None and batch.out_cache_loc is prepared.write_window
+            else None
         )
         if (
             can_run_decode_cuda_graph
@@ -694,14 +710,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             and draft_input.dsa_topk_indices is None
         ):
             can_run_decode_cuda_graph = False
-        if (
-            self.megakernel is not None
-            and can_run_decode_cuda_graph
-            and not forward_batch.forward_mode.is_idle()
-        ):
-            self.megakernel.begin_draft_round(
-                runner=self.cuda_graph_runner, batch=batch, draft_input=draft_input
-            )
+        self.draft_runtime.begin_draft_round(
+            runner=self.cuda_graph_runner,
+            batch=batch,
+            draft_input=draft_input,
+            active=(
+                can_run_decode_cuda_graph and not forward_batch.forward_mode.is_idle()
+            ),
+        )
 
         n_inner = self.speculative_num_steps - 1
         canary_outside_ctx = (
@@ -717,7 +733,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # Run draft
             if can_run_decode_cuda_graph:
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
-                    self.cuda_graph_runner.execute(forward_batch)
+                    self.cuda_graph_runner.execute(forward_batch, inputs_prepared=True)
+                    if prepared is not None
+                    else self.cuda_graph_runner.execute(forward_batch)
                 )
                 if draft_probs is not None:
                     # draft_probs is the one graph output read after the target
@@ -1001,8 +1019,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             iteration_ids: The target prefill's plan; the draft writes the same
                 slots.
         """
-        if self.megakernel is not None:
-            self.megakernel.note_draft_extend()
+        self.draft_runtime.note_draft_extend()
         # Construct input_ids
         if not batch.forward_mode.is_idle():
             # Chunked-prefill-aware tail tokens (see PR #26329).
@@ -1141,14 +1158,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         *,
         iteration_ids: Optional[IterationIds] = None,
     ):
-        if self.megakernel is not None:
-            self.megakernel.note_draft_extend()
+        self.draft_runtime.note_draft_extend()
         # Cast to int64 before entering plan stream to avoid cross-stream
         # synchronization issues with .to() inside the plan stream context.
+        prepared_layout = None
         if batch_result.prepared_draft_extend_inputs is not None:
             num_correct_drafts, select_index, next_token_ids = (
-                batch_result.prepared_draft_extend_inputs
+                batch_result.prepared_draft_extend_inputs[:3]
             )
+            if len(batch_result.prepared_draft_extend_inputs) > 3:
+                prepared_layout = batch_result.prepared_draft_extend_inputs[3]
         elif batch_result.accept_lens.is_cuda:
             from sglang.kernels.ops.speculative.eagle import prepare_draft_extend_inputs
 
@@ -1187,8 +1206,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         # Prepare for draft extend in a separate stream
         if self.plan_stream:
-            self.plan_stream.wait_stream(
-                torch.get_device_module(self.device).current_stream()
+            spec_decode_resources.wait_stream(
+                self.plan_stream, torch.get_device_module(self.device).current_stream()
             )
         with self.plan_stream_ctx:
             forward_batch = prepare_for_draft_extend(
@@ -1200,11 +1219,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.cuda_graph_runner_for_draft_extend,
                 return_hidden_states_before_norm=False,
                 iteration_ids=iteration_ids,
+                prepared_layout=prepared_layout,
             )
 
         if self.plan_stream:
-            torch.get_device_module(self.device).current_stream().wait_stream(
-                self.plan_stream
+            spec_decode_resources.wait_stream(
+                torch.get_device_module(self.device).current_stream(),
+                self.plan_stream,
             )
 
         # Run draft extend batch in the main compute stream
@@ -1270,49 +1291,44 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 draft_logits_output.hidden_states = draft_logits_output.hidden_states[
                     select_index
                 ]
-        # A graph whose draft extend the megakernel's draft_extend ran kept its own
-        # top-1
-        served_top1 = (
-            self.megakernel.extend_tokens(
-                runner=self.cuda_graph_runner_for_draft_extend, batch=batch
-            )
-            if self.megakernel is not None and can_run_decode_cuda_graph
-            else None
+
+        # The always-present runtime strategy either returns its captured
+        # top-1 or invokes this unchanged selected-row stock sampler.
+        def stock_extend_tokens():
+            if get_spec().speculative_use_rejection_sampling:
+                return sample_draft_proposal(
+                    draft_logits_output.next_token_logits,
+                    batch.sampling_info.temperatures,
+                    batch.sampling_info.top_ks,
+                    sampling_seed=batch.sampling_info.sampling_seed,
+                    positions=batch_result.new_seq_lens,
+                )
+            if self.topk == 1 and _is_hip:
+                ret_topk_p, ret_topk_index = draft_topk1_argmax_only(
+                    draft_logits_output.next_token_logits
+                )
+            elif self.topk == 1:
+                # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
+                # MTP draft selection on FP8 logits.
+                ret_topk_index = torch.argmax(
+                    draft_logits_output.next_token_logits, dim=-1, keepdim=True
+                )
+                ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
+            else:
+                probs = renorm_draft_probs(
+                    draft_logits_output.next_token_logits,
+                    batch.sampling_info,
+                    get_spec().speculative_use_rejection_sampling,
+                )
+                ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
+            return None, ret_topk_p, ret_topk_index
+
+        ret_draft_probs, ret_topk_p, ret_topk_index = self.draft_runtime.extend_tokens(
+            runner=self.cuda_graph_runner_for_draft_extend,
+            batch=batch,
+            stock=stock_extend_tokens,
+            active=can_run_decode_cuda_graph,
         )
-        # Selected-row top-k remains worker-owned for both graph and eager
-        # paths; the graph runner only moves the row selection before lm_head.
-        if served_top1 is not None:
-            ret_topk_p, ret_topk_index = served_top1
-            ret_draft_probs = None
-        elif get_spec().speculative_use_rejection_sampling:
-            ret_draft_probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
-                draft_logits_output.next_token_logits,
-                batch.sampling_info.temperatures,
-                batch.sampling_info.top_ks,
-                sampling_seed=batch.sampling_info.sampling_seed,
-                positions=batch_result.new_seq_lens,
-            )
-        elif self.topk == 1 and _is_hip:
-            ret_topk_p, ret_topk_index = draft_topk1_argmax_only(
-                draft_logits_output.next_token_logits
-            )
-            ret_draft_probs = None
-        elif self.topk == 1 and not _is_hip:
-            # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
-            # MTP draft selection on FP8 logits.
-            ret_topk_index = torch.argmax(
-                draft_logits_output.next_token_logits, dim=-1, keepdim=True
-            )
-            ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
-            ret_draft_probs = None
-        else:
-            probs = renorm_draft_probs(
-                draft_logits_output.next_token_logits,
-                batch.sampling_info,
-                get_spec().speculative_use_rejection_sampling,
-            )
-            ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
-            ret_draft_probs = None
         ret_hidden_states = draft_logits_output.hidden_states
 
         # Construct the return values
@@ -1340,6 +1356,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
     # harnesses construct workers without __init__.
     _post_verify_graphs: Optional[EaglePostVerifyGraphs] = None
     _simulated_acc_len_rng: Optional[torch.Generator] = None
+    _next_draft_stager: Optional[NextDraftInputStager] = None
+    _speculative_runtime_hooks = STOCK_SPECULATIVE_RUNTIME_HOOKS
 
     @property
     def draft_parallel_layout(self):
@@ -1432,12 +1450,57 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
     def init_attention_backends(self):
         super().init_attention_backends()
+        # The target and draft backends now exist and no EAGLE graph has been
+        # captured. Resolve one immutable bundle shared by eager and graph paths.
+        self._speculative_runtime_hooks = bind_eagle_runtime_hooks(
+            self.target_worker, supports_sharded_verify=True
+        )
         # not in __init__, which the standalone and frozen-KV workers do not run
         if (
             self._draft_worker is not None
             and envs.SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.get()
         ):
             self._init_post_verify_graphs()
+
+    def _init_prepared_next_draft_inputs(self) -> None:
+        """Connect compatible generic post-verify and draft runtime buffers."""
+        if (
+            self._draft_worker is None
+            or self.adaptive_controller is not None
+            or not prepared_next_draft.prepared_next_draft_enabled()
+            or self._post_verify_graphs is None
+            or self.speculative_num_steps <= 0
+            or self.speculative_num_steps >= self.speculative_num_draft_tokens
+        ):
+            return
+        draft_runner = self._draft_worker.cuda_graph_runner
+        if draft_runner is None:
+            return
+        if (
+            self._draft_worker.draft_runner.runner_ids.is_translating
+            or draft_runner.require_mlp_tp_gather
+        ):
+            return
+        self._next_draft_stager = NextDraftInputStager(
+            req_to_token_pool=self.req_to_token_pool,
+            window_size=self.speculative_num_draft_tokens,
+            graph_sizes=draft_runner.capture_bs,
+            with_mrope=self._draft_worker.draft_runner.model_config.model_is_mrope,
+        )
+        self._post_verify_graphs.enable_prepared_next_draft(
+            num_steps=self.speculative_num_steps,
+            window=self.speculative_num_draft_tokens,
+            seq_len_fill_value=draft_runner.seq_len_fill_value,
+            mrope=self._draft_worker.draft_runner.model_config.model_is_mrope,
+            req_to_token=self.req_to_token_pool.req_to_token,
+            runner_buffers=draft_runner.buffers,
+            capture_sizes=draft_runner.capture_bs,
+        )
+
+    def take_prepared_seq_lens(self, batch: ScheduleBatch) -> Optional[torch.Tensor]:
+        if self._next_draft_stager is None or not batch.forward_mode.is_decode():
+            return None
+        return self._next_draft_stager.take_scheduler_sequence_lengths(batch)
 
     def _init_post_verify_graphs(self) -> None:
         # A key is captured at its first rounds, which attention-DP ranks do not reach
@@ -1456,10 +1519,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self._post_verify_graphs = EaglePostVerifyGraphs(
             target_worker=self.target_worker,
             simulated_acc_len_rng=self._simulated_acc_len_rng,
+            speculative_runtime_hooks=self._speculative_runtime_hooks,
         )
 
     def init_cuda_graphs(self):
         super().init_cuda_graphs()
+        self._init_prepared_next_draft_inputs()
         # Build adaptive runtime states after target and draft backends exist.
         if self.adaptive_controller is not None:
             with (
@@ -1495,6 +1560,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            if self._next_draft_stager is not None:
+                self._next_draft_stager.forget()
             if not (
                 batch.is_extend_in_batch and self.enable_dp_spec_prefill_coordination
             ):
@@ -1517,6 +1584,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     )
         else:
             self.activate_step_by_batch(batch.seq_lens.shape[0])
+            stage_prepared_next = False
 
             if batch.spec_info is None:
                 capture_mode = (
@@ -1539,18 +1607,29 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 # PP+spec: the scheduler pre-built this round's verify input
                 # from relayed per-req chains — it must match what earlier
                 # stages already ran, so do not re-draft here.
+                if self._next_draft_stager is not None:
+                    self._next_draft_stager.forget()
                 verify_input = batch.spec_info
             elif self.speculative_num_steps == 0:
+                if self._next_draft_stager is not None:
+                    self._next_draft_stager.forget()
                 # Drafting disabled (high batch size). _draft_extend below still
                 # runs, keeping draft KV warm for when the batch shrinks.
                 verify_input = self._build_trivial_verify_input(batch)
             else:
+                # PP immediately tail-drafts the next chain below, so no lease
+                # may survive for the scheduler/worker to consume next round.
+                stage_prepared_next = get_parallel().pp_size == 1
                 with (
                     draft_tp_context(self.draft_worker.parallel_layout),
                     speculative_moe_backend_context(),
                     speculative_moe_a2a_backend_context(),
                     spec_stage_span("draft"),
                 ):
+                    if self._next_draft_stager is not None:
+                        self.draft_worker.prepared_next_draft = (
+                            self._next_draft_stager.take_inputs(batch)
+                        )
                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
@@ -1577,6 +1656,18 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     self.draft_worker._draft_extend_for_decode(
                         batch, batch_output, iteration_ids=verify_input.iteration_ids
                     )
+                    if self._next_draft_stager is not None and stage_prepared_next:
+                        self._next_draft_stager.note_decode(
+                            batch,
+                            prepared=(
+                                None
+                                if self._post_verify_graphs is None
+                                else self._post_verify_graphs.prepared_next_draft
+                            ),
+                            new_seq_lens=batch_output.new_seq_lens,
+                        )
+                    elif self._next_draft_stager is not None:
+                        self._next_draft_stager.forget()
             if self._post_verify_graphs is not None:
                 # The mamba state commit may still run on a side stream.
                 self._post_verify_graphs.join()
@@ -2061,6 +2152,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         max_top_k = compact_verify_max_top_k(batch)
         return run_eagle_verify(
             batch,
+            speculative_runtime_hooks=self._speculative_runtime_hooks,
             pp_proxy_tensors=pp_proxy_tensors,
             target_worker=self.target_worker,
             req_to_token_pool=self.req_to_token_pool,

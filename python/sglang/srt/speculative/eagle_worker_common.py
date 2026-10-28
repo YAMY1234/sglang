@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
-
+from sglang.kernels.ops.speculative import speculative_index
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_draft_cache_locs_contiguous_func,
 )
@@ -13,6 +13,12 @@ from sglang.kernels.ops.speculative.eagle import (
     prepare_draft_extend_layout,
     prepare_draft_extend_lengths,
     prepare_verify_commit_outputs,
+)
+from sglang.kernels.plugin_kernels.nvidia.spec import (
+    PostVerifyIO,
+    SpeculativeRuntimeHooks,
+    VerifySamplingView,
+    VerifyTreeView,
 )
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -24,12 +30,12 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.runtime_context import mamba_track_grid
+from sglang.srt.speculative import prepared_next_draft
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
     build_tree_kernel_efficient,
     eagle_prepare_for_verify,
-    eagle_sample,
 )
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
@@ -40,6 +46,7 @@ from sglang.srt.speculative.spec_utils import (
     record_stream_for_v2_verify,
 )
 from sglang.srt.utils import is_cpu
+from sglang.srt.utils import speculative_decode_resources as spec_decode_resources
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -49,6 +56,113 @@ from sglang.srt.utils.common import is_npu
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
+
+
+def stock_speculative_runtime_hooks() -> SpeculativeRuntimeHooks:
+    """The always-callable verification bundle used before binding."""
+    from sglang.srt.kernel_plugins.nvidia.speculative_runtime import (
+        default_speculative_runtime_hooks,
+    )
+
+    return default_speculative_runtime_hooks()
+
+
+STOCK_SPECULATIVE_RUNTIME_HOOKS = stock_speculative_runtime_hooks()
+
+
+def bind_eagle_runtime_hooks(
+    target_worker: TpModelWorker,
+    *,
+    supports_sharded_verify: bool,
+) -> SpeculativeRuntimeHooks:
+    """Bind once after target initialization and before any EAGLE graph capture."""
+    from sglang.srt.kernel_plugins.nvidia.binding import (
+        bind_speculative_runtime_hooks,
+    )
+
+    # A few narrow unit harnesses use ``__new__`` and intentionally omit a model;
+    # their class-level stock bundle still exercises the exact runtime path.
+    model = getattr(target_worker.model_runner, "model", None)
+    if model is None:
+        return STOCK_SPECULATIVE_RUNTIME_HOOKS
+    from sglang.srt.layers.logits_processor import LogitsProcessor
+
+    processors = [
+        module for module in model.modules() if isinstance(module, LogitsProcessor)
+    ]
+    if supports_sharded_verify and len(processors) == 1:
+        # Only callers whose post-verify consumer understands the shard marker
+        # opt in. UNO shares this hook binder but deliberately passes False.
+        processors[0].enable_sharded_verify()
+    return bind_speculative_runtime_hooks(model, STOCK_SPECULATIVE_RUNTIME_HOOKS)
+
+
+def make_post_verify_io(
+    *,
+    verify_input: Any,
+    sampling_info: Any,
+    sequence_lengths: torch.Tensor,
+    request_pool_indices: torch.Tensor,
+    device: str | torch.device,
+    logits_output: Any,
+    grammar_mask: Any,
+    watermark: Any,
+    watermark_full_mask: bool,
+    return_logprob: bool,
+    is_idle: bool,
+    simulated_accept_length: Optional[torch.Tensor] = None,
+    simulated_accept_length_rng: Optional[torch.Generator] = None,
+    sparse_target_max_top_k: Optional[int] = None,
+    sparse_bonus_argmax: bool = False,
+) -> PostVerifyIO:
+    """Build the immutable, borrowed view shared by eager and captured verify."""
+    return PostVerifyIO(
+        logits=logits_output,
+        verify_tree=VerifyTreeView(
+            draft_tokens=verify_input.draft_token,
+            draft_probabilities=getattr(verify_input, "draft_probs", None),
+            retrieve_index=verify_input.retrieve_index,
+            next_child=verify_input.retrieve_next_token,
+            next_sibling=verify_input.retrieve_next_sibling,
+            custom_mask=verify_input.custom_mask,
+            positions=verify_input.positions,
+            tokens_per_request=verify_input.draft_token_num,
+            max_depth=verify_input.max_tree_depth,
+            topk=verify_input.tree_topk,
+        ),
+        sampling=VerifySamplingView(
+            sequence_lengths=sequence_lengths,
+            temperatures=sampling_info.temperatures,
+            top_ks=sampling_info.top_ks,
+            top_ps=sampling_info.top_ps,
+            min_ps=sampling_info.min_ps,
+            additive_penalties=sampling_info.acc_additive_penalties,
+            scaling_penalties=sampling_info.acc_scaling_penalties,
+            logit_bias=sampling_info.logit_bias,
+            sampling_seed=sampling_info.sampling_seed,
+            is_all_greedy=bool(sampling_info.is_all_greedy),
+            need_top_k_sampling=bool(sampling_info.need_top_k_sampling),
+            need_top_p_sampling=bool(sampling_info.need_top_p_sampling),
+            need_min_p_sampling=bool(sampling_info.need_min_p_sampling),
+            watermark_keys=sampling_info.watermark_keys,
+            watermark_context_windows=sampling_info.watermark_context_windows,
+            watermark_enabled=sampling_info.watermark_enabled,
+            has_watermark_candidates=bool(sampling_info.has_watermark_candidates),
+            max_top_k=sampling_info.max_top_k,
+            device=torch.device(device),
+        ),
+        grammar_mask=grammar_mask,
+        watermark=watermark,
+        watermark_full_mask=watermark_full_mask,
+        request_pool_indices=request_pool_indices,
+        return_logprob=return_logprob,
+        is_idle=is_idle,
+        simulated_accept_length=simulated_accept_length,
+        simulated_accept_length_rng=simulated_accept_length_rng,
+        sparse_target_max_top_k=sparse_target_max_top_k,
+        sparse_bonus_argmax=sparse_bonus_argmax,
+    )
+
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -123,6 +237,7 @@ def prepare_for_draft_extend(
     widened_out_cache_loc: Optional[torch.Tensor] = None,
     widened_positions: Optional[torch.Tensor] = None,
     iteration_ids: Optional[IterationIds] = None,
+    prepared_layout: Optional[tuple] = None,
 ):
     """``iteration_ids``: the iteration's plan, whose window the draft extend
     writes again (the verify window); a widened window plans its own."""
@@ -169,13 +284,20 @@ def prepare_for_draft_extend(
     fused_lengths = gpu_only and batch.seq_lens.is_cuda
     extend_position_info = None
     if fused_lengths and not widen and draft_extend_input.positions is None:
-        batch.prefix_lens, batch.extend_lens, post_seq_lens, extend_position_info = (
-            prepare_draft_extend_layout(
-                batch.seq_lens,
-                num_draft_tokens,
-                draft_model_runner.model_config.model_is_mrope
-                and all(x is None for x in batch.multimodal_inputs),
+        with_mrope = draft_model_runner.model_config.model_is_mrope and all(
+            x is None for x in batch.multimodal_inputs
+        )
+        if (
+            prepared_layout is not None
+            and (prepared_layout[3][2] is not None) == with_mrope
+        ):
+            layout = prepared_layout
+        else:
+            layout = prepare_draft_extend_layout(
+                batch.seq_lens, num_draft_tokens, with_mrope
             )
+        batch.prefix_lens, batch.extend_lens, post_seq_lens, extend_position_info = (
+            layout
         )
     elif fused_lengths:
         batch.prefix_lens, batch.extend_lens, post_seq_lens = (
@@ -251,11 +373,13 @@ def prepare_for_draft(
     *,
     target_translator: Optional[RunnerIds] = None,
     num_draft_tokens: Optional[int] = None,
+    prepared: Any = None,
 ) -> tuple[ForwardBatch, bool, Optional[IterationIds]]:
     """The draft-decode batch. With ``target_translator``, a chain draft plans
     the iteration's whole write window (the ``num_draft_tokens`` slots past
     ``seq_lens`` that verify and draft extend also write) and writes its first
-    ``num_steps`` columns; that plan is returned, else None."""
+    ``num_steps`` columns; that plan is returned, else None. ``prepared`` carries
+    those slots and positions when the preceding post-verify graph produced them."""
     prepared_positions = None
     prepared_mrope_positions = None
     iteration_ids = None
@@ -274,31 +398,70 @@ def prepare_for_draft(
         # A chain draft's slots lead the iteration's window: gather the whole
         # window in the same launch.
         window_cols = num_draft_tokens if plans_window else num_steps
-        if page_size == 1 or topk == 1:
-            batch.out_cache_loc = torch.empty(
-                (bs * topk * window_cols,),
-                dtype=torch.int64,
-                device=batch.device,
+        with_mrope = draft_model_runner.model_config.model_is_mrope and all(
+            x is None for x in batch.multimodal_inputs
+        )
+        if (
+            prepared is not None
+            and prepared_next_draft.can_use_prepared_next_draft_inputs(
+                prepared,
+                num_requests=bs,
+                plans_window=plans_window,
+                with_mrope=with_mrope,
+            )
+        ):
+            batch.out_cache_loc = prepared.write_window
+            prepared_positions = prepared.positions
+            prepared_mrope_positions = prepared.mrope_positions
+            iteration_ids = target_translator.plan(
+                req_pool_indices=batch.req_pool_indices,
+                seq_lens=batch.seq_lens,
+                seq_lens_cpu=batch.seq_lens_cpu,
+                write_virtual=batch.out_cache_loc,
+                read_extent=num_draft_tokens,
+            )
+            # The same launch wrote these from the write window's first columns.
+            iteration_ids.use_prepared_cols(
+                slice(0, num_steps), prepared.draft_out_cache_loc
+            )
+        elif page_size == 1 or topk == 1:
+            batch.out_cache_loc = spec_decode_resources.empty(
+                (bs * topk * window_cols,), dtype=torch.int64, device=batch.device
             )
             if batch.seq_lens.is_cuda and topk == 1:
-                prepared_positions = torch.empty_like(batch.seq_lens)
+                prepared_positions = spec_decode_resources.empty(
+                    (bs,), dtype=batch.seq_lens.dtype, device=batch.seq_lens.device
+                )
                 if draft_model_runner.model_config.model_is_mrope and all(
                     x is None for x in batch.multimodal_inputs
                 ):
-                    prepared_mrope_positions = torch.empty(
+                    prepared_mrope_positions = spec_decode_resources.empty(
                         (3, bs), dtype=torch.int64, device=batch.device
                     )
-            # TODO(lsyin): align with the default code path
-            assign_draft_cache_locs_contiguous_func(
-                batch.req_pool_indices,
-                req_to_token_pool.req_to_token,
-                batch.seq_lens,
-                batch.out_cache_loc,
-                topk,
-                window_cols,
-                positions=prepared_positions,
-                mrope=prepared_mrope_positions,
-            )
+            if not (
+                speculative_index.draft_locs(
+                    req=batch.req_pool_indices,
+                    table=req_to_token_pool.req_to_token,
+                    seq=batch.seq_lens,
+                    out_cache_loc=batch.out_cache_loc,
+                    pool_len=req_to_token_pool.req_to_token.shape[1],
+                    topk=topk,
+                    steps=window_cols,
+                    batch_size=bs,
+                    positions=prepared_positions,
+                    mrope=prepared_mrope_positions,
+                )
+            ):
+                assign_draft_cache_locs_contiguous_func(
+                    batch.req_pool_indices,
+                    req_to_token_pool.req_to_token,
+                    batch.seq_lens,
+                    batch.out_cache_loc,
+                    topk,
+                    window_cols,
+                    positions=prepared_positions,
+                    mrope=prepared_mrope_positions,
+                )
             if plans_window:
                 iteration_ids = target_translator.plan(
                     req_pool_indices=batch.req_pool_indices,
@@ -549,6 +712,7 @@ def _compact_accept_to_front(
 def run_eagle_verify(
     batch: ScheduleBatch,
     *,
+    speculative_runtime_hooks: SpeculativeRuntimeHooks,
     target_worker: TpModelWorker,
     req_to_token_pool: ReqToTokenPool,
     token_to_kv_pool_allocator: Any,
@@ -590,7 +754,7 @@ def run_eagle_verify(
         if plan_stream is not None:
             # Verify prep copies draft-produced tree metadata on the plan stream,
             # so it must not start before the draft frontier.
-            plan_stream.wait_stream(fwd_stream)
+            spec_decode_resources.wait_stream(plan_stream, fwd_stream)
         verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
             verify_input,
             req_to_token_pool,
@@ -603,7 +767,9 @@ def run_eagle_verify(
 
     # Correct some buffers due to the overlap plan
     if plan_stream:
-        torch.get_device_module(device).current_stream().wait_stream(plan_stream)
+        spec_decode_resources.wait_stream(
+            torch.get_device_module(device).current_stream(), plan_stream
+        )
         if (
             _is_npu
             and target_worker.model_runner.model_config.model_is_mrope
@@ -714,25 +880,32 @@ def run_eagle_verify(
     # Sample
     maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
     maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
-    (
-        predict,
-        accept_lens,
-        accept_index,
-    ) = eagle_sample(
-        verify_input,
-        batch,
-        logits_output,
-        grammar_mask,
-        uno_target_max_top_k=uno_target_max_top_k,
-        watermark_state=target_worker.model_runner.watermark_state,
-        watermark_full_mask=(
-            target_worker.model_runner.attn_backend.verify_mask is None
-            or target_worker.model_runner.attn_backend.verify_mask.mode
-            == TreeMaskMode.FULL_MASK
-        ),
-        simulated_acc_len_rng=simulated_acc_len_rng,
-        sparse_bonus_argmax=sparse_bonus_argmax,
+    watermark_full_mask = (
+        target_worker.model_runner.attn_backend.verify_mask is None
+        or target_worker.model_runner.attn_backend.verify_mask.mode
+        == TreeMaskMode.FULL_MASK
     )
+    post_verify_output = speculative_runtime_hooks.post_verify(
+        make_post_verify_io(
+            verify_input=verify_input,
+            sampling_info=batch.sampling_info,
+            sequence_lengths=batch.seq_lens,
+            request_pool_indices=batch.req_pool_indices,
+            device=batch.device,
+            logits_output=logits_output,
+            grammar_mask=grammar_mask,
+            watermark=target_worker.model_runner.watermark_state,
+            watermark_full_mask=watermark_full_mask,
+            return_logprob=batch.return_logprob,
+            is_idle=batch.forward_mode.is_idle(),
+            simulated_accept_length_rng=simulated_acc_len_rng,
+            sparse_target_max_top_k=uno_target_max_top_k,
+            sparse_bonus_argmax=sparse_bonus_argmax,
+        )
+    )
+    predict = post_verify_output.token_ids
+    accept_lens = post_verify_output.accepted_lengths
+    accept_index = post_verify_output.accepted_indices
     fused_commit_outputs = predict.is_cuda and not batch.forward_mode.is_idle()
     prepared_commit_steps = prepared_draft_inputs = None
     if fused_commit_outputs and topk == 1:
@@ -757,6 +930,14 @@ def run_eagle_verify(
         )
     else:
         new_seq_lens = batch.seq_lens + accept_lens
+    if post_verify_graphs is not None:
+        # A graph miss (grammar, sampling metadata, target graph miss, ...) uses
+        # the same bound producer as a captured post-verify round.  Unsupported
+        # dtype/shape/device combinations simply publish no prepared inputs.
+        post_verify_graphs.prepare_next_eager(
+            req_pool_indices=batch.req_pool_indices,
+            scheduler_sequence_lengths=new_seq_lens,
+        )
     if batch.hisparse_coordinator is not None:
         batch.hisparse_coordinator.commit_spec_accept_tokens(
             batch=batch,
