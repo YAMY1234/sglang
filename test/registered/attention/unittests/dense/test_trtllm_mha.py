@@ -571,6 +571,81 @@ class TestTRTLLMMHADecodeGroupHoist(CustomTestCase):
                     with self.subTest(q_len=q_len, out=use_out, mask=use_mask):
                         self.assertTrue(torch.equal(results[0], results[1]))
 
+    def test_shared_draft_metadata_resets_every_steps_group_plan(self):
+        # Warmup and capture both call this metadata entry. The shared-page-table
+        # path still needs to record each step's sort/gathers inside capture.
+        steps, bs = 5, 32
+        lens = torch.zeros((steps, bs), dtype=torch.int32)
+        cu_lens = torch.zeros((steps, bs + 1), dtype=torch.int32)
+        tables = torch.arange(bs * 3, dtype=torch.int32).view(bs, 3)
+        backends = []
+        for i in range(steps):
+            backend = types.SimpleNamespace(
+                decode_split_hoist=True,
+                _decode_group_plans=DecodeGroupPlans(),
+                decode_cuda_graph_metadata={
+                    bs: types.SimpleNamespace(
+                        cache_seqlens_int32=lens[i], page_table=tables
+                    )
+                },
+            )
+            backend._apply_cuda_graph_metadata = lambda **kw: None
+            backend.init_forward_metadata_in_graph = lambda batch, backend=backend: (
+                trtllm_mha_backend.TRTLLMHAAttnBackend.init_forward_metadata_in_graph(
+                    backend, batch
+                )
+            )
+            backends.append(backend)
+        multi = types.SimpleNamespace(
+            speculative_num_steps=steps + 1,
+            attn_backends=backends,
+            _shared_draft_metadata=(lens, cu_lens),
+        )
+        batch = types.SimpleNamespace(
+            batch_size=bs,
+            spec_info=types.SimpleNamespace(is_draft_input=lambda: True),
+            encoder_lens=None,
+            seq_lens=torch.arange(bs, dtype=torch.int32),
+            req_pool_indices=torch.arange(bs),
+            forward_mode=types.SimpleNamespace(DECODE=True),
+            out_cache_loc=None,
+        )
+
+        def update(**kwargs):
+            for i in range(steps):
+                lens[i].copy_(kwargs["seq_lens"] + i + 1)
+
+        def initialize():
+            trtllm_mha_backend.TRTLLMHAAttnMultiStepDraftBackend.init_forward_metadata_in_graph(
+                multi, batch
+            )
+
+        with (
+            mock.patch(
+                "sglang.srt.model_executor.forward_batch_info.build_inner_fb_view",
+                side_effect=lambda batch, **kwargs: batch,
+            ),
+            mock.patch.object(
+                trtllm_mha_backend, "update_draft_step_seqlens", side_effect=update
+            ),
+        ):
+            initialize()
+            warmup = [
+                b._decode_group_plans.get(block_tables=tables, seq_lens=lens[i])
+                for i, b in enumerate(backends)
+            ]
+            batch.seq_lens.add_(100)
+            initialize()
+            for i, backend in enumerate(backends):
+                captured = backend._decode_group_plans.get(
+                    block_tables=tables, seq_lens=lens[i]
+                )
+                with self.subTest(step=i):
+                    self.assertIsNot(captured, warmup[i])
+                    self.assertTrue(
+                        torch.equal(captured.seq_lens, torch.sort(lens[i]).values)
+                    )
+
     def test_plan_reuse_and_reset_with_mutated_metadata(self):
         plans = DecodeGroupPlans()
         tables = torch.arange(12, dtype=torch.int32).view(4, 3)

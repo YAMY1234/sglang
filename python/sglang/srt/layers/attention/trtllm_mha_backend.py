@@ -2277,6 +2277,10 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
             steps=steps - 1,
             first_offset=1,
         )
+        # These steps skip their own metadata init; discard eager warmup plans
+        # so each graph records its own grouping tensors.
         for i in range(steps - 1):
             b = self.attn_backends[i]
+            if b.decode_split_hoist:
+                b._decode_group_plans.reset()
             b.forward_metadata = b.decode_cuda_graph_metadata[bs]
