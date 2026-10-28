@@ -640,9 +640,8 @@ __device__ __forceinline__ void fc2_drain(const Params& p, Smem& s, uint32_t tm,
   }
 }
 
-__device__ __forceinline__ void routed_body(const __grid_constant__ CUtensorMap tm13, const __grid_constant__ CUtensorMap tm2,
-          const __grid_constant__ CUtensorMap tmx, const Params p) {
-  extern __shared__ __align__(1024) uint8_t raw[];
+__device__ __forceinline__ void routed_body(const CUtensorMap& tm13, const CUtensorMap& tm2,
+          const CUtensorMap& tmx, const Params& p, uint8_t* raw) {
   Smem& s = *reinterpret_cast<Smem*>((reinterpret_cast<uintptr_t>(raw) + 1023) & ~uintptr_t(1023));
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   const uint32_t rank = cluster_rank();
@@ -1167,7 +1166,7 @@ q38_mkm_shared_tp4(const __grid_constant__ CUtensorMap tm13,
                    const __grid_constant__ CUtensorMap tm2,
                    const __grid_constant__ CUtensorMap tmx,const Params p) {
   extern __shared__ __align__(1024) uint8_t raw[];
-  if(blockIdx.x<140) routed_body(tm13,tm2,tmx,p);
+  if(blockIdx.x<140) routed_body(tm13,tm2,tmx,p,raw);
   else {asm volatile("griddepcontrol.wait;" ::: "memory");shared_task(p,raw);}
   finish_shared(p,raw);
 }
