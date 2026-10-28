@@ -625,45 +625,21 @@ def _compact_accept_to_front(
     return out
 
 
-def run_eagle_verify(
+def prepare_eagle_verify_forward(
     batch: ScheduleBatch,
     *,
     target_worker: TpModelWorker,
     req_to_token_pool: ReqToTokenPool,
-    token_to_kv_pool_allocator: Any,
     plan_stream: Any,
     plan_stream_ctx: Any,
-    topk: int,
-    num_draft_tokens: int,
     device: str,
-    metadata_ready_pre_pad: bool,
-    finalize_tree_path: bool,
-    pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    grammar_barrier=None,
-    uno_target_max_top_k: Optional[int] = None,
-    post_verify_graphs: Optional[EaglePostVerifyGraphs] = None,
-    simulated_acc_len_rng: Optional[torch.Generator] = None,
-    sparse_bonus_argmax: bool = False,
-) -> GenerationBatchResult:
-    """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
-
-    The single-layer eagle verify body is the source of truth (superset). Two
-    switches encode the multi-layer worker's preserved-verbatim differences:
-
-    - ``metadata_ready_pre_pad``: multi-layer marks forward metadata ready
-      pre-pad unconditionally; single-layer relies on eagle_prepare_for_verify
-      marking it only when the cuda-graph path ran.
-    - ``finalize_tree_path``: single-layer compacts the accepted tree path to
-      the front of each per-req block for topk > 1; multi-layer has never run
-      this compaction.
-    """
+):
+    """Plan verify without executing the target model or sampling it."""
     fwd_stream = torch.get_device_module(device).current_stream()
     verify_input: EagleVerifyInput = batch.spec_info
     record_stream_for_v2_verify(batch, verify_input, fwd_stream)
     if host_trace.ENABLED:
         host_trace.mark(host_trace.VPA)
-
-    bs = len(batch.seq_lens)
 
     # Batch 1: Target verify
     # Prepare for target verify in a separate stream
@@ -716,6 +692,56 @@ def run_eagle_verify(
 
     if host_trace.ENABLED:
         host_trace.mark(host_trace.VP1)
+    return verify_forward_batch, can_run_cuda_graph
+
+
+def run_eagle_verify(
+    batch: ScheduleBatch,
+    *,
+    target_worker: TpModelWorker,
+    req_to_token_pool: ReqToTokenPool,
+    token_to_kv_pool_allocator: Any,
+    plan_stream: Any,
+    plan_stream_ctx: Any,
+    topk: int,
+    num_draft_tokens: int,
+    device: str,
+    metadata_ready_pre_pad: bool,
+    finalize_tree_path: bool,
+    pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    grammar_barrier=None,
+    uno_target_max_top_k: Optional[int] = None,
+    post_verify_graphs: Optional[EaglePostVerifyGraphs] = None,
+    simulated_acc_len_rng: Optional[torch.Generator] = None,
+    sparse_bonus_argmax: bool = False,
+    prepared_verify: Optional[tuple] = None,
+) -> GenerationBatchResult:
+    """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
+
+    The single-layer eagle verify body is the source of truth (superset). Two
+    switches encode the multi-layer worker's preserved-verbatim differences:
+
+    - ``metadata_ready_pre_pad``: multi-layer marks forward metadata ready
+      pre-pad unconditionally; single-layer relies on eagle_prepare_for_verify
+      marking it only when the cuda-graph path ran.
+    - ``finalize_tree_path``: single-layer compacts the accepted tree path to
+      the front of each per-req block for topk > 1; multi-layer has never run
+      this compaction.
+    """
+    verify_input: EagleVerifyInput = batch.spec_info
+    bs = len(batch.seq_lens)
+    if prepared_verify is None:
+        verify_forward_batch, can_run_cuda_graph = prepare_eagle_verify_forward(
+            batch,
+            target_worker=target_worker,
+            req_to_token_pool=req_to_token_pool,
+            plan_stream=plan_stream,
+            plan_stream_ctx=plan_stream_ctx,
+            device=device,
+        )
+    else:
+        verify_forward_batch, can_run_cuda_graph = prepared_verify
+
     # Must stay ahead of the target verify launch below.
     grammar_tree = (
         GrammarTree.from_device(
