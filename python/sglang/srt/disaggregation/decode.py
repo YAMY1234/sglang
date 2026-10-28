@@ -367,6 +367,11 @@ class DecodeRequest:
     kv_receiver: CommonKVReceiver
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
+    # Deferred index copies can outlive the preallocation queue entry.  Track
+    # whether metadata is still waiting to be sent, and whether an abort won
+    # that race before any destination was published.
+    metadata_send_pending: bool = False
+    metadata_send_cancelled: bool = False
     is_rebootstrap: bool = False
     host_staged: bool = False
 
@@ -1869,10 +1874,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self, decode_req, kv_indices, page_size, *, has_state: bool, metadata_kwargs
     ) -> None:
         """Stage transfer indices in pinned memory and send them after the copy."""
+        decode_req.metadata_send_cancelled = False
         decode_req.metadata_buffer_index = (
             self.req_to_metadata_buffer_idx_allocator.alloc()
         )
         assert decode_req.metadata_buffer_index is not None
+        decode_req.metadata_send_pending = True
 
         device_indices = [kv_indices[::page_size] // page_size]
         if has_state:
@@ -1908,20 +1915,45 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def flush_deferred_sends(self) -> None:
         """Send completed index copies in their allocation order."""
+        # Observe aborts even while the head copy is still in flight.  The
+        # pinned buffers remain owned by the deque until their events complete,
+        # but transfer-queue cleanup no longer waits for an impossible drain ACK.
+        for decode_req, _, _, _, _ in self._deferred_sends:
+            receiver = decode_req.kv_receiver
+            if (
+                receiver is None
+                or getattr(receiver, "conclude_state", None) == KVPoll.Failed
+                or isinstance(decode_req.req.finished_reason, FINISH_ABORT)
+            ):
+                decode_req.metadata_send_cancelled = True
+
         while self._deferred_sends and self._deferred_sends[0][4].query():
             decode_req, host_indices, has_state, metadata_kwargs, _ = (
                 self._deferred_sends.popleft()
             )
-            if decode_req.kv_receiver is None or isinstance(
-                decode_req.req.finished_reason, FINISH_ABORT
+            receiver = decode_req.kv_receiver
+            if (
+                decode_req.metadata_send_cancelled
+                or receiver is None
+                or getattr(receiver, "conclude_state", None) == KVPoll.Failed
+                or isinstance(decode_req.req.finished_reason, FINISH_ABORT)
             ):
+                # The request may already be on the transfer queue.  Mark this
+                # distinct from a partial send so its normal failure cleanup can
+                # release immediately without waiting for drain ACKs that can
+                # never exist (metadata was never published).
+                decode_req.metadata_send_pending = False
+                decode_req.metadata_send_cancelled = True
                 continue
-            decode_req.kv_receiver.send_metadata(
-                host_indices[0].numpy().astype(np.int32),
-                decode_req.metadata_buffer_index,
-                [[host_indices[1].numpy()]] if has_state else [],
-                **metadata_kwargs,
-            )
+            try:
+                receiver.send_metadata(
+                    host_indices[0].numpy().astype(np.int32),
+                    decode_req.metadata_buffer_index,
+                    [[host_indices[1].numpy()]] if has_state else [],
+                    **metadata_kwargs,
+                )
+            finally:
+                decode_req.metadata_send_pending = False
             if (
                 decode_req.is_rebootstrap
                 and get_disagg().disaggregation_decode_allocation_policy == "early"
@@ -2979,9 +3011,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     decode_req.req.return_logprob,
                 )
                 requires_host_drain = self._is_host_destination(decode_req)
+                metadata_send_cancelled = getattr(
+                    decode_req, "metadata_send_cancelled", False
+                )
                 deferrable = (
                     self.enable_deferred_kv_release
                     and decode_req.kv_receiver.kv_mgr.enable_deferred_decode_kv_release
+                    and not metadata_send_cancelled
                 )
                 if deferrable and not decode_req.kv_receiver.abort_notified:
                     # A failure decode did not initiate (prefill fault, transport
@@ -3089,6 +3125,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         required_acks = (
             0
             if self._is_host_destination(decode_req)
+            or getattr(decode_req, "metadata_send_cancelled", False)
             or not decode_req.kv_receiver.abort_notified
             else len(decode_req.kv_receiver.bootstrap_infos)
         )
@@ -3318,7 +3355,16 @@ class SchedulerDisaggregationDecodeMixin:
     def _flush_staging_scatters(self: Scheduler) -> None:
         handler = self.disagg_decode_transfer_queue.staging_handler
         if handler is not None:
-            handler.flush_pending_scatters(self.forward_stream)
+            # As in run_batch and _start_host_restores: PP and overlap execute
+            # forwards on forward_stream; plain non-overlap executes them on the
+            # scheduler's current schedule_stream.  The scatter must share that
+            # stream so it is ordered between the adjacent forwards.
+            stream = (
+                self.forward_stream
+                if self.enable_overlap or get_parallel().pp_size > 1
+                else self.schedule_stream
+            )
+            handler.flush_pending_scatters(stream)
 
     def _run_batch_prebuilt(
         self: Scheduler, batch: ScheduleBatch

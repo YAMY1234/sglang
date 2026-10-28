@@ -51,14 +51,20 @@ class TestStagingPrefetch(unittest.TestCase):
             disagg_prefill_bootstrap_queue=SimpleNamespace(kv_manager=manager)
         )
         batch = SimpleNamespace(
-            reqs=[SimpleNamespace(bootstrap_room=7, extend_end=123)]
+            reqs=[
+                SimpleNamespace(
+                    bootstrap_room=7,
+                    extend_end=123,
+                    disagg_decode_prefix_len=23,
+                )
+            ]
         )
 
         SchedulerDisaggregationPrefillMixin.maybe_prefetch_staging_for_batch(
             scheduler, batch
         )
 
-        prefetch.assert_called_once_with(7, upto_tokens=123)
+        prefetch.assert_called_once_with(7, upto_tokens=100)
 
 
 class _StopLoop(Exception):

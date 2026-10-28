@@ -428,6 +428,23 @@ class TestNixlTransferWorker(CustomTestCase):
         self.assertIn(room, mgr.req_to_decode_prefix_len)
         mgr.send_kvcache.assert_called_once()
 
+    def test_source_event_is_waited_before_kv_read(self):
+        room = 26
+        mgr = self._make_manager(room)
+        order = []
+        event = MagicMock()
+        event.synchronize.side_effect = lambda: order.append("ready")
+        mgr.send_kvcache = MagicMock(
+            side_effect=lambda *_args, **_kwargs: order.append("send") or "kv_handle"
+        )
+        chunk = self._make_chunk(room, [1], is_last_chunk=False)
+        chunk.wait_event = event
+
+        self._run_worker_once(mgr, chunk)
+
+        self.assertEqual(order[:2], ["ready", "send"])
+        self.assertIsNone(chunk.wait_event)
+
     def test_dcp_destinations_use_disjoint_pack_regions_before_chunk_barrier(self):
         room = 23
         mgr = self._make_manager(room)
@@ -755,6 +772,26 @@ class TestNixlStaging(CustomTestCase):
         )
         mgr.server_args = SimpleNamespace(chunked_prefill_size=4)
         return mgr
+
+    def test_add_transfer_request_keeps_event_and_prefetches_only_current_slice(self):
+        mgr = self._make_manager()
+        mgr.disaggregation_mode = DisaggregationMode.PREFILL
+        mgr.enable_staging = True
+        mgr.transfer_infos = {7: {"peer": SimpleNamespace(dst_port=5000)}}
+        mgr.transfer_queues = [FakeQueue()]
+        mgr._prefetch_staging_reqs = MagicMock()
+        event = object()
+
+        mgr.add_transfer_request(
+            7,
+            np.array([10, 11, 12], dtype=np.int32),
+            slice(2, 5),
+            False,
+            wait_event=event,
+        )
+
+        mgr._prefetch_staging_reqs.assert_called_once_with(7, upto_tokens=10)
+        self.assertIs(mgr.transfer_queues[0].items[0].wait_event, event)
 
     def test_do_staging_transfer_requeues_when_allocation_not_ready(self):
         mgr = self._make_manager()

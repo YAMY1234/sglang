@@ -1633,6 +1633,14 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     self._staging_outstanding[room] += 1
                     kv_chunk.staging_counted = True
 
+                # Cached-prefix sends can be enqueued before the producing
+                # prefill forward has completed.  Fence the source read on the
+                # worker so the scheduler remains asynchronous.
+                if kv_chunk.wait_event is not None:
+                    if self.check_status(room) != KVPoll.Failed:
+                        kv_chunk.wait_event.synchronize()
+                    kv_chunk.wait_event = None
+
                 if self.check_status(room) == KVPoll.Failed:
                     self._staging_outstanding.pop(room, None)
                     if self.enable_deferred_decode_kv_release:
@@ -3277,12 +3285,19 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
 
-        # Prefetch STAGING_REQ to decode before enqueueing so decode has
-        # already allocated staging by the time the worker picks up the
-        # chunk. Internally a no-op when staging is disabled or no peer
-        # in this room needs heterogeneous-TP staging.
+        # Prefetch through this suffix-relative page slice before enqueueing so
+        # decode has allocated the current chunk by the time the worker picks
+        # it up.  Keeping the fallback bounded preserves the scheduler's lazy
+        # prefetch instead of expanding it to every chunk in the room.
         if self.enable_staging:
-            self._prefetch_staging_reqs(bootstrap_room)
+            if isinstance(index_slice, slice):
+                upto_pages = index_slice.stop or 0
+            else:
+                upto_pages = int(index_slice[-1]) + 1 if len(index_slice) else 0
+            self._prefetch_staging_reqs(
+                bootstrap_room,
+                upto_tokens=upto_pages * self.kv_args.page_size,
+            )
 
         if bootstrap_room not in self.transfer_infos:
             # Dummy rank or already cleared; nothing to enqueue.
@@ -3303,6 +3318,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
+                wait_event=wait_event,
             )
         )
         return None

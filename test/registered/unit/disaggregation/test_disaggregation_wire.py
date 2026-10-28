@@ -1475,17 +1475,63 @@ class TestDeferredStagingScatter(unittest.TestCase):
         handler._writer_counts = {}
         handler._defer_scatter = True
         handler._pending_scatters = deque()
+        handler._staging_lifecycle = threading.Condition()
+        token = object()
+        handler._room_tokens = {7: token}
         handler.num_writers_for = Mock(return_value=1)
         handler.submit_chunk_scatter = Mock(return_value=True)
 
         self.assertTrue(handler.handle_chunk_arrived(7, 2, 11, 3, "writer"))
         handler.submit_chunk_scatter.assert_not_called()
-        self.assertEqual(list(handler._pending_scatters), [(7, 2, 11, 3)])
+        self.assertEqual(list(handler._pending_scatters), [(token, 7, 2, 11, 3)])
 
         stream = object()
         handler.flush_pending_scatters(stream)
-        handler.submit_chunk_scatter.assert_called_once_with(7, 2, 11, 3, stream=stream)
+        handler.submit_chunk_scatter.assert_called_once_with(
+            7, 2, 11, 3, stream=stream, room_token=token
+        )
         self.assertFalse(handler._pending_scatters)
+
+    def test_flush_drops_scatter_from_an_older_room_generation(self):
+        old_token = object()
+        handler = object.__new__(DecodeStagingHandler)
+        handler._staging_lifecycle = threading.Condition()
+        handler._room_tokens = {7: object()}
+        handler._pending_scatters = deque([(old_token, 7, 2, 11, 3)])
+        handler.submit_chunk_scatter = Mock()
+
+        handler.flush_pending_scatters(object())
+
+        handler.submit_chunk_scatter.assert_not_called()
+        self.assertFalse(handler._pending_scatters)
+
+    def test_unregister_purges_queued_room_generation(self):
+        room = 7
+        token = object()
+        other_token = object()
+        decode_req = SimpleNamespace()
+        receiver = SimpleNamespace()
+        context = SimpleNamespace(
+            room_receivers={room: receiver}, room_bootstrap={room: object()}
+        )
+        handler = object.__new__(DecodeStagingHandler)
+        handler.kv_manager = SimpleNamespace(_staging_ctx=context)
+        handler._staging_lifecycle = threading.Condition()
+        handler._closing_rooms = set()
+        handler._room_tokens = {room: token}
+        handler._room_to_decode_req = {room: decode_req}
+        handler._room_to_receiver = {room: receiver}
+        handler._writer_counts = {room: {2: []}}
+        handler._inflight_submits = {}
+        handler._pending_scatters = deque(
+            [(token, room, 2, 11, 3), (other_token, 8, 0, 0, 1)]
+        )
+        handler.release_room = Mock()
+
+        handler.unregister_decode_req(room)
+
+        handler.release_room.assert_called_once_with(room, decode_req, receiver)
+        self.assertEqual(list(handler._pending_scatters), [(other_token, 8, 0, 0, 1)])
 
     @patch("sglang.srt.disaggregation.common.staging_handler.create_device_event")
     def test_deferred_scatter_event_is_recorded_on_forward_stream(self, make_event):
@@ -1543,6 +1589,7 @@ class TestStagingScatterLifecycle(CustomTestCase):
         handler._inflight_submits = {}
         handler._claimed_chunks = set()
         handler._closing_rooms = set()
+        handler._pending_scatters = deque()
         handler._free_and_send_watermark = Mock()
 
         scatter_started = threading.Event()

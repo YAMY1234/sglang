@@ -13,10 +13,12 @@ from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
     HiCacheRestoreResult,
+    SchedulerDisaggregationDecodeMixin,
 )
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
 )
+from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -172,11 +174,95 @@ class TestDeferredPreallocMetadata(CustomTestCase):
         event.query.return_value = True
         queue.flush_deferred_sends()
         self.assertEqual(len(queue._deferred_sends), 0)
+        self.assertFalse(decode_req.metadata_send_pending)
+        self.assertFalse(decode_req.metadata_send_cancelled)
         args, kwargs = receiver.send_metadata.call_args
         np.testing.assert_array_equal(args[0], np.array([4, 5], dtype=np.int32))
         self.assertEqual(args[1], 7)
         np.testing.assert_array_equal(args[2][0][0], np.array([11], dtype=np.int32))
         self.assertEqual(kwargs, {"decode_prefix_len": 5})
+
+    def test_abort_before_copy_completion_cancels_metadata_send(self):
+        event = MagicMock()
+        event.query.return_value = False
+        receiver = SimpleNamespace(
+            conclude_state=KVPoll.Failed,
+            send_metadata=MagicMock(),
+        )
+        decode_req = SimpleNamespace(
+            req=SimpleNamespace(finished_reason=None),
+            kv_receiver=receiver,
+            metadata_buffer_index=7,
+            metadata_send_pending=True,
+            metadata_send_cancelled=False,
+            is_rebootstrap=False,
+        )
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue._deferred_sends = deque(
+            [(decode_req, [torch.tensor([4, 5])], False, {}, event)]
+        )
+
+        queue.flush_deferred_sends()
+
+        receiver.send_metadata.assert_not_called()
+        self.assertEqual(len(queue._deferred_sends), 1)
+        self.assertTrue(decode_req.metadata_send_pending)
+        self.assertTrue(decode_req.metadata_send_cancelled)
+
+        event.query.return_value = True
+        queue.flush_deferred_sends()
+
+        receiver.send_metadata.assert_not_called()
+        self.assertFalse(queue._deferred_sends)
+        self.assertFalse(decode_req.metadata_send_pending)
+        self.assertTrue(decode_req.metadata_send_cancelled)
+
+
+class TestDeferredPdWorkScheduling(unittest.TestCase):
+    def test_pp_drains_deferred_work_before_transfer_poll(self):
+        order = []
+        scheduler = SchedulerPPMixin()
+        scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
+            flush_deferred_sends=lambda: order.append("metadata")
+        )
+        scheduler._flush_staging_scatters = lambda: order.append("scatter")
+        scheduler.pp_group = SimpleNamespace(is_first_rank=True)
+        scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
+
+        def get_rids(*_args, **_kwargs):
+            order.append("poll")
+            return []
+
+        scheduler.get_rids = get_rids
+
+        self.assertEqual(scheduler._pp_pd_get_decode_transferred_ids(), [])
+        self.assertEqual(order, ["metadata", "scatter", "poll"])
+
+    def test_staging_scatter_uses_the_stream_that_runs_the_forward(self):
+        cases = (
+            (False, 1, "schedule"),
+            (True, 1, "forward"),
+            (False, 2, "forward"),
+        )
+        for enable_overlap, pp_size, expected in cases:
+            with self.subTest(enable_overlap=enable_overlap, pp_size=pp_size):
+                handler = MagicMock()
+                scheduler = SimpleNamespace(
+                    enable_overlap=enable_overlap,
+                    forward_stream="forward",
+                    schedule_stream="schedule",
+                    disagg_decode_transfer_queue=SimpleNamespace(
+                        staging_handler=handler
+                    ),
+                )
+                with patch(
+                    "sglang.srt.disaggregation.decode.get_parallel",
+                    return_value=SimpleNamespace(pp_size=pp_size),
+                ):
+                    SchedulerDisaggregationDecodeMixin._flush_staging_scatters(
+                        scheduler
+                    )
+                handler.flush_pending_scatters.assert_called_once_with(expected)
 
 
 class _GateReceiver:
@@ -227,6 +313,76 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
             with self.subTest(poll=poll, status=status):
                 gated = HiCacheRestoreGatedKVReceiver(_gated_decode_req(poll, status))
                 self.assertEqual(gated.poll(), expected)
+
+    @patch("sglang.srt.disaggregation.decode.prepare_abort")
+    def test_cancelled_deferred_metadata_releases_without_drain_wait(
+        self, _prepare_abort
+    ):
+        receiver = MagicMock()
+        receiver.failure_exception.side_effect = KVTransferError(
+            7, "aborted before metadata send", False
+        )
+        receiver.kv_mgr.enable_deferred_decode_kv_release = True
+        receiver.abort_notified = True
+        decode_req = SimpleNamespace(
+            req=SimpleNamespace(
+                rid="cancelled",
+                bootstrap_room=7,
+                return_logprob=False,
+            ),
+            kv_receiver=receiver,
+            metadata_buffer_index=3,
+            metadata_send_cancelled=True,
+            hicache_restore_status=HiCacheRestoreResult.PENDING,
+            host_staged=False,
+        )
+
+        queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        queue.queue = [decode_req]
+        queue.enable_staging = False
+        queue.enable_host_receive = False
+        queue.enable_deferred_kv_release = True
+        queue.gloo_group = MagicMock()
+        queue.tp_rank = 0
+        queue.req_to_metadata_buffer_idx_allocator = MagicMock()
+        queue.metadata_buffers = MagicMock()
+        queue._poll_with_metadata_gate = MagicMock(return_value=[KVPoll.Failed])
+        queue._clean_hicache_prefetch_resources = MagicMock()
+        queue._record_transfer_failure = MagicMock()
+        queue._release_request = MagicMock()
+        queue._defer_release = MagicMock()
+        queue.scheduler = SimpleNamespace(
+            enable_decode_hicache=False,
+            enable_hisparse=False,
+            output_streamer=MagicMock(),
+        )
+
+        self.assertEqual(queue.pop_transferred(), [])
+
+        queue._defer_release.assert_not_called()
+        queue._release_request.assert_called_once_with(decode_req)
+        receiver.clear.assert_called_once()
+        queue.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(3)
+        self.assertEqual(queue.queue, [])
+
+    def test_peer_held_cancelled_metadata_requires_no_abort_ack(self):
+        receiver = SimpleNamespace(
+            abort_notified=True,
+            bootstrap_infos=[object(), object()],
+        )
+        decode_req = SimpleNamespace(
+            kv_receiver=receiver,
+            metadata_buffer_index=3,
+            metadata_send_cancelled=True,
+        )
+        queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        queue.deferred_kv_release_timeout = 30
+        queue._deferred_releases = []
+        queue._is_host_destination = MagicMock(return_value=False)
+
+        queue._defer_release(decode_req)
+
+        self.assertEqual(queue._deferred_releases[0][4], 0)
 
     @patch("sglang.srt.disaggregation.decode.release_kv_cache")
     @patch("sglang.srt.disaggregation.decode.prepare_abort")

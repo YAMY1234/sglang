@@ -1768,6 +1768,13 @@ class SchedulerPPMixin:
         return good_rids, bad_rids
 
     def _pp_pd_get_decode_transferred_ids(self: Scheduler):
+        # Deferred metadata copies and EP staging arrivals are produced outside
+        # the PP poll path.  Drain both on every stage before sampling receiver
+        # state for consensus; otherwise PP can wait forever on work that no
+        # event loop ever submits.
+        self.disagg_decode_prealloc_queue.flush_deferred_sends()
+        self._flush_staging_scatters()
+
         # get the current stage transfer success
         if self.pp_group.is_first_rank:
             transferred_rids = self.get_rids(

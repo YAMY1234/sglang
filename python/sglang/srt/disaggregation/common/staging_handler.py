@@ -117,7 +117,10 @@ class DecodeStagingHandler:
         self._claimed_chunks: set[tuple[object, int]] = set()
         self._closing_rooms: set[int] = set()
         self._defer_scatter = _deferred_scatter_enabled()
-        self._pending_scatters: deque[tuple[int, int, int, int]] = deque()
+        # (room generation, room, chunk_idx, page_start, num_pages).  The
+        # generation prevents a deferred entry from scattering into a later
+        # request that reuses the same bootstrap room.
+        self._pending_scatters: deque[tuple[object, int, int, int, int]] = deque()
 
         k_buffers = kv_buffer_info["k_buffers"]
         assert k_buffers, "k_buffers must not be empty"
@@ -236,6 +239,12 @@ class DecodeStagingHandler:
             decode_req = self._room_to_decode_req.pop(room, None)
             receiver = self._room_to_receiver.pop(room, None)
             self._writer_counts.pop(room, None)
+            # Entries already popped by flush_pending_scatters are rejected by
+            # submit_chunk_scatter's room-token check; purge everything still
+            # queued so teardown also releases references promptly.
+            self._pending_scatters = deque(
+                entry for entry in self._pending_scatters if entry[1] != room
+            )
             while token is not None and self._inflight_submits.get(token, 0):
                 self._staging_lifecycle.wait()
 
@@ -285,8 +294,23 @@ class DecodeStagingHandler:
 
     def flush_pending_scatters(self, stream) -> None:
         """Submit ready chunks between consecutive forwards on ``stream``."""
-        while self._pending_scatters:
-            self.submit_chunk_scatter(*self._pending_scatters.popleft(), stream=stream)
+        while True:
+            with self._staging_lifecycle:
+                if not self._pending_scatters:
+                    return
+                room_token, room, chunk_idx, page_start, num_pages = (
+                    self._pending_scatters.popleft()
+                )
+                if self._room_tokens.get(room) is not room_token:
+                    continue
+            self.submit_chunk_scatter(
+                room,
+                chunk_idx,
+                page_start,
+                num_pages,
+                stream=stream,
+                room_token=room_token,
+            )
 
     def submit_chunk_scatter(
         self,
@@ -295,6 +319,7 @@ class DecodeStagingHandler:
         page_start: int,
         num_pages: int,
         stream=None,
+        room_token: object | None = None,
     ) -> bool:
         """Submit scatter for an intermediate chunk whose writers all arrived.
 
@@ -315,7 +340,11 @@ class DecodeStagingHandler:
             receiver = self._room_to_receiver.get(room)
             token = self._room_tokens.get(room)
             chunk_infos = receiver.chunk_staging_infos if receiver is not None else []
-            if token is None or chunk_idx >= len(chunk_infos):
+            if (
+                token is None
+                or (room_token is not None and token is not room_token)
+                or chunk_idx >= len(chunk_infos)
+            ):
                 return False
             alloc_id, staging_offset, _, _, _ = chunk_infos[chunk_idx]
             claim = (token, chunk_idx)
@@ -374,28 +403,42 @@ class DecodeStagingHandler:
         Accumulates writer arrivals and makes the scatter ready once all writers
         for this chunk have reported in.
         """
-        # Read from the stash, not decode_req.kv_receiver: a concurrent teardown
-        # nulls the latter before unregister removes the room.
-        receiver = self._room_to_receiver.get(room)
-        if receiver is None:
-            logger.warning(
-                "Staging chunk arrived for unregistered room=%s chunk=%d, skipping",
+        submit_now = False
+        with self._staging_lifecycle:
+            # Read from the stash, not decode_req.kv_receiver: a concurrent
+            # teardown nulls the latter before unregister removes the room.
+            receiver = self._room_to_receiver.get(room)
+            room_token = self._room_tokens.get(room)
+            if receiver is None or room_token is None:
+                logger.warning(
+                    "Staging chunk arrived for unregistered room=%s chunk=%d, skipping",
+                    room,
+                    chunk_idx,
+                )
+                return False
+            room_counts = self._writer_counts.setdefault(room, {})
+            arrivals = room_counts.setdefault(chunk_idx, [])
+            arrivals.append((page_start, num_pages, writer_id))
+            num_writers = self.num_writers_for(receiver)
+            if len(arrivals) < num_writers:
+                return False
+            if self._defer_scatter:
+                self._pending_scatters.append(
+                    (room_token, room, chunk_idx, page_start, num_pages)
+                )
+            else:
+                submit_now = True
+            del room_counts[chunk_idx]
+
+        if submit_now:
+            self.submit_chunk_scatter(
                 room,
                 chunk_idx,
+                page_start,
+                num_pages,
+                room_token=room_token,
             )
-            return False
-        room_counts = self._writer_counts.setdefault(room, {})
-        arrivals = room_counts.setdefault(chunk_idx, [])
-        arrivals.append((page_start, num_pages, writer_id))
-        num_writers = self.num_writers_for(receiver)
-        if len(arrivals) >= num_writers:
-            if self._defer_scatter:
-                self._pending_scatters.append((room, chunk_idx, page_start, num_pages))
-            else:
-                self.submit_chunk_scatter(room, chunk_idx, page_start, num_pages)
-            del room_counts[chunk_idx]
-            return True
-        return False
+        return True
 
     def submit_last_scatter_async(self, room: int) -> bool:
         """Record all-ranks Success. Scatter is fully arrival-driven (every
