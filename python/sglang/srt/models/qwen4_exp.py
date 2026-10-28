@@ -113,6 +113,7 @@ _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD = 1024
 _Q38_QSA_EARLY_INDEXER = get_bool_env_var("Q38_QSA_EARLY_INDEXER", "False")
 _Q38_ATTN_GATE_V2 = get_bool_env_var("Q38_ATTN_GATE_V2", "False")
 _Q38_QSA_PDL_INDEX = get_bool_env_var("Q38_QSA_PDL_INDEX", "False")
+_Q38_MK_MTP = get_bool_env_var("SGLANG_Q38C_MK_MTP", "False")
 
 
 def _ple_table_is_fp8(
@@ -281,6 +282,26 @@ def _prepare_ple_batch(
     physical_tokens = input_ids.shape[0]
     processed_tokens = _get_processed_token_count(forward_batch, physical_tokens)
     tokens = input_ids[:processed_tokens]
+    if _Q38_MK_MTP:
+        from sglang.kernels.ops.speculative.q38_mk_mtp.metadata import (
+            try_prepare_verify_layout,
+        )
+
+        mk_layout = try_prepare_verify_layout(
+            input_ids, forward_batch, mode, get_req_to_token_pool(),
+            ngram_size=ngram_size, ngram_eos_token_id=ngram_eos_token_id,
+            processed_tokens=processed_tokens,
+        )
+        if mk_layout is not None:
+            return _PLEBatch(
+                mode=mode, use_decode_fast_path=False,
+                physical_tokens=physical_tokens, processed_tokens=processed_tokens,
+                lengths=mk_layout.lengths, row_width=4,
+                req_indices=mk_layout.req_indices, token_offsets=mk_layout.token_offsets,
+                valid_tokens=mk_layout.valid_tokens, state_indices=mk_layout.state_indices,
+                ngram_context=mk_layout.ngram_context,
+                ngram_eos_token_id=ngram_eos_token_id,
+            )
     positions = torch.arange(processed_tokens, device=tokens.device, dtype=torch.long)
 
     if mode.is_target_verify():
@@ -1877,6 +1898,7 @@ class Qwen4ExpAttentionDecoderLayer(
         from sglang.srt.layers.attention.qsa.glue import build_qsa_indexer
 
         self.is_qsa = is_qwen_qsa(config)
+        self._q38_mtp_is_nextn = is_nextn
         # The prefill graphs' top-k bridges, newest first. Buckets share the newest.
         self._qsa_prefill_topk_bridges: list = []
         if self.is_qsa:
@@ -1977,12 +1999,54 @@ class Qwen4ExpAttentionDecoderLayer(
             )
         return topk_indices
 
+    def _try_mk_mtp_self_attention(self, positions, hidden_states, forward_batch):
+        if not (
+            self._q38_mtp_is_nextn and self.is_qsa and self.attn_output_gate
+            and forward_batch.forward_mode.is_decode()
+            and hidden_states.is_cuda and hidden_states.dtype == torch.bfloat16
+            and hidden_states.shape == (1, 2560)
+            and self.num_heads == 6 and self.num_kv_heads == 1
+            and self.head_dim == 256 and self.rotary_emb.rotary_dim == 64
+            and not is_in_breakable_cuda_graph()
+        ):
+            return None
+        from sglang.srt.layers.attention.qsa.glue import resolve_qsa_sparse_backend
+
+        backend = resolve_qsa_sparse_backend(get_attn_backend())
+        make_plan = getattr(backend, "get_mtp_front_plan", None)
+        if (make_plan is None or not backend._q38c_lookup_native
+                or not backend.should_reuse_mtp_sparse_indices(forward_batch)):
+            return None
+        indices = backend.lookup_mtp_sparse_indices(forward_batch, self.layer_id)
+        plan = make_plan(self.attn, forward_batch, indices)
+        if plan is None:
+            return None
+        qkv, _ = self.qkv_proj(hidden_states)
+        q_gate, k, v = qkv.split([self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
+        q, gate = plan.prepare(
+            q_gate, k, v, self.q_norm.weight.data, self.k_norm.weight.data,
+            self.rotary_emb.cos_sin_cache, positions,
+            self.rotary_emb.axis_map if positions.dim() == 2 else None,
+            eps=self.q_norm.variance_epsilon,
+        )
+        output = self.attn(
+            q.reshape(1, -1), None, None, forward_batch, save_kv_cache=False,
+            topk_indices=indices, q38_mtp_prepared=plan.prepared_kv,
+        )
+        output = fused_sigmoid_mul(output, gate, inplace=True)
+        output, _ = self.o_proj(output)
+        return output
+
     def self_attention(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        if _Q38_MK_MTP:
+            output = self._try_mk_mtp_self_attention(positions, hidden_states, forward_batch)
+            if output is not None:
+                return output
         overlap_indexer = (
             self.is_qsa
             and self.alt_stream is not None
