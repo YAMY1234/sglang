@@ -789,7 +789,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
         inputs_prepared = inputs_prepared and bs == raw_bs
         copied_with_plan = (
-            self._nvidia_decode_fast_path
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
             and bs == raw_bs
             and self._copy_planned_inputs(
                 forward_batch,

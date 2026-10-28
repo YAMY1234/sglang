@@ -304,11 +304,7 @@ def test_prepare_draft_window_matches_draft_locs(
         prepare_draft_window,
     )
 
-    monkeypatch.setattr(
-        speculative_index,
-        "nvidia_eagle_decode_fast_path_enabled",
-        lambda: True,
-    )
+    monkeypatch.setenv("SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION", "1")
 
     table = torch.arange((bs + 3) * 64, dtype=torch.int32, device="cuda").reshape(
         bs + 3, 64
