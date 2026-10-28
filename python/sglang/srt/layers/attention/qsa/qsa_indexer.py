@@ -42,6 +42,7 @@ from sglang.srt.utils import is_sm100_supported
 # top-k is per row, so tiling rows does not change the selection.
 _QSA_PREFILL_LOGITS_BUDGET_BYTES = 128 * 1024 * 1024
 _Q38C_SCORE_Q4 = os.environ.get("SGLANG_Q38C_SCORE_Q4", "0") == "1"
+_Q38C_MK_QSA = os.environ.get("SGLANG_Q38C_MK_QSA", "0") == "1"
 
 
 def _qsa_prefill_row_chunk_size(rows: int, keys: int, heads: int) -> int:
@@ -561,8 +562,12 @@ class QSAIndexer(MultiPlatformOp):
             and self.block_topk == 512
             and not is_batch_invariant_mode_enabled()
         )
+        use_mk = _Q38C_MK_QSA and score_q4_requests is not None and not is_batch_invariant_mode_enabled()
         if score_q4_requests is not None and not is_batch_invariant_mode_enabled():
-            from sglang.kernels.ops.attention.q38_score_q4 import score_q4
+            if use_mk:
+                from sglang.kernels.ops.attention.q38_mk_score import score_mk as score_q4
+            else:
+                from sglang.kernels.ops.attention.q38_score_q4 import score_q4
 
             logits = score_q4(
                 q, compressed_cache, compressed_page_table, compressed_lengths,
@@ -580,7 +585,10 @@ class QSAIndexer(MultiPlatformOp):
         if use_fast_topk:
             # Decode rows start at zero, so compressed lengths double as row lengths;
             # skip the generic zero-fill + subtract.
-            from sglang.kernels.ops.attention.fast_topk import fast_topk
+            if use_mk:
+                from sglang.kernels.ops.attention.q38_mk_topk import topk_mk as fast_topk
+            else:
+                from sglang.kernels.ops.attention.fast_topk import fast_topk
 
             block_indices = fast_topk(
                 logits,
@@ -796,7 +804,7 @@ class QSAIndexer(MultiPlatformOp):
             )
             score_q4_requests = None
             if (
-                _Q38C_SCORE_Q4
+                (_Q38C_SCORE_Q4 or _Q38C_MK_QSA)
                 and (is_target_verify or is_draft_extend)
                 and indexer_metadata.is_cuda_graph
                 and q.is_cuda
