@@ -616,7 +616,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         the CP kernel takes a one-sequence batch (if ``tables.cp_single``), the
         non-CP kernel any other, and both update the pool in place by slot. ``output`` is [tokens, HV, V];
         returns the [1, checkpoint_rows, HV, V, K] state checkpoints, if any."""
-        from sglang.kernels.ops.attention.fla.gdn_prefill_graph_track import (
+        from sglang.kernels.ops.mamba.gdn_prefill_track import (
             gdn_cp_tail_neutralize,
         )
         from sglang.kernels.ops.attention.fla.l2norm import (

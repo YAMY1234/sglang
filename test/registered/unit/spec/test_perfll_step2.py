@@ -221,6 +221,7 @@ def _decode_batch(reqs, *, penalized=False, sched_idle=True):
         tree_cache=SimpleNamespace(supports_swa=lambda: False),
         req_to_token_pool=SimpleNamespace(),
         req_pool_indices=torch.tensor([r.kv.req_pool_idx for r in reqs]),
+        seq_lens_cpu=torch.tensor([r.kv.kv_committed_len for r in reqs]),
         device="cpu",
         perfll_sched_idle=sched_idle,
     )

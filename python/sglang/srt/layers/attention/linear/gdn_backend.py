@@ -1387,10 +1387,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
             from sglang.srt.q38.gdn_inproj_conv import run
         from sglang.kernels.ops.mamba.causal_conv1d_triton import PAD_SLOT_ID
         meta = self.forward_metadata
-        params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        params = self.state_layer_cache(layer.layer_id)
         rows, batch = x.shape[0], x.shape[0] // 4
         if norm_weight is not None:
-            pool = self.req_to_token_pool.mamba_pool
+            pool = self.state_pool
             if (params.temporal.dtype != torch.bfloat16
                 or params.replayssm_d is None
                 or getattr(pool, "replayssm_cache_base", None) is None

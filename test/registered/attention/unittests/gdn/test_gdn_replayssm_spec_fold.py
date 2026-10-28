@@ -297,7 +297,7 @@ class TestGdnReplayssmCommitCuda(CustomTestCase):
 
     def test_cuda_commit_matches_triton(self):
         from sglang.kernels.ops.attention.fla import gdn_replayssm_commit_cuda
-        from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode import (
+        from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode import (
             commit_gdn_replayssm_circular,
         )
 
