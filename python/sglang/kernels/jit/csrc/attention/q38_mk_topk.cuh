@@ -2,6 +2,8 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 #include <sgl_kernel/utils.cuh>
+#include <sgl_kernel/runtime.cuh>
+#include "q38_mk_topk_short512.cuh"
 #include <cooperative_groups.h>
 #include <cub/block/block_radix_sort.cuh>
 #include <cub/block/block_scan.cuh>
@@ -19,7 +21,7 @@ __device__ __forceinline__ uint32_t q38_mk_ordered_key(float value) {
   return result;
 }
 
-template <int kItems, int kCluster, bool kPDL, bool kLinear, int kNarrow>
+template <int kItems, int kCluster, bool kPDL, bool kLinear, int kNarrow, bool kSingleLaunch = false>
 __global__ __launch_bounds__(512) void q38_mk_topk_kernel(
     const float* scores, const int32_t* lengths, const int32_t* starts,
     int32_t* output, int64_t stride) {
@@ -32,8 +34,19 @@ __global__ __launch_bounds__(512) void q38_mk_topk_kernel(
   const int tid = threadIdx.x;
   device::PDLWaitPrimary<kPDL>();
   const int length = lengths[row];
-  // Complementary to the native short kernel: never overwrite its rows.
   if (length <= 4096) {
+    if constexpr (kSingleLaunch) {
+      // The branch is uniform within a cluster. Other CTAs can exit because
+      // the owner short path has no DSMEM accesses or cluster barriers.
+      if (rank == 0) {
+        int32_t* indices = output + row * 512;
+        if (length <= 512)
+          q38_mk_short512_detail::naive_topk<512>(indices, length);
+        else
+          q38_mk_short512_detail::radix_select_topk<512>(
+              scores + row * stride, indices, starts ? starts[row] : 0, length);
+      }
+    }
     device::PDLTriggerSecondary<kPDL>();
     return;
   }
@@ -286,7 +299,7 @@ __global__ __launch_bounds__(512) void q38_mk_topk_kernel(
   device::PDLTriggerSecondary<kPDL>();
 }
 
-template <int kItems, int kCluster, bool kPDL, bool kLinear, int kNarrow>
+template <int kItems, int kCluster, bool kPDL, bool kLinear, int kNarrow, bool kSingleLaunch = false>
 void q38_mk_topk(tvm::ffi::TensorView scores, tvm::ffi::TensorView lengths,
                  tvm::ffi::Optional<tvm::ffi::TensorView> starts, tvm::ffi::TensorView output) {
   using namespace host;
@@ -302,9 +315,17 @@ void q38_mk_topk(tvm::ffi::TensorView scores, tvm::ffi::TensorView lengths,
     ptr = static_cast<const int32_t*>(starts.value().data_ptr());
   }
   CHECK_HOST(scores.size(1) <= int64_t(kItems) * 512 * kCluster);
-  LaunchKernel(uint32_t(rows.unwrap()) * kCluster, 512, device.unwrap())
+  constexpr std::size_t dynamic_smem = kSingleLaunch ? q38_mk_short512_detail::kSmemBytes : 0;
+  if constexpr (kSingleLaunch) {
+    // Combined static + native short stash exceeds the48KiB default. Set
+    // the per-device opt-in once before capture, without a device sync.
+    runtime::set_max_dynamic_smem_per_device<
+        q38_mk_topk_kernel<kItems, kCluster, kPDL, kLinear, kNarrow, kSingleLaunch>>(
+            device.unwrap(), dynamic_smem);
+  }
+  LaunchKernel(uint32_t(rows.unwrap()) * kCluster, 512, device.unwrap(), dynamic_smem)
       .enable_cluster(dim3(kCluster, 1, 1)).enable_pdl(kPDL)(
-          q38_mk_topk_kernel<kItems, kCluster, kPDL, kLinear, kNarrow>, static_cast<const float*>(scores.data_ptr()),
+          q38_mk_topk_kernel<kItems, kCluster, kPDL, kLinear, kNarrow, kSingleLaunch>, static_cast<const float*>(scores.data_ptr()),
           static_cast<const int32_t*>(lengths.data_ptr()), ptr,
           static_cast<int32_t*>(output.data_ptr()), scores.stride(0));
 }
