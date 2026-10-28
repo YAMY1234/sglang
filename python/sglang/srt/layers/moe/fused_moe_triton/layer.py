@@ -21,10 +21,6 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
-from sglang.srt.kernel_plugins.nvidia.policy import (
-    FUSED_FINALIZE_SLOT,
-    megakernel_slot_requested,
-)
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
     MoeRunnerConfig,
@@ -108,26 +104,6 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # layers can resolve to different quant methods, so print_info_once (keyed on the
 # full message) would otherwise fire once per distinct quant method.
 _deferred_finalize_info_logged = False
-
-
-def _qwen35_draft_bf16_deferred_finalize(
-    *,
-    is_draft: bool,
-    quant_method: FusedMoEMethodBase,
-    params_dtype: torch.dtype,
-    hidden_size: int,
-    num_experts: int,
-    top_k: Optional[int],
-) -> bool:
-    return (
-        is_draft
-        and megakernel_slot_requested(FUSED_FINALIZE_SLOT)
-        and isinstance(quant_method, UnquantizedFusedMoEMethod)
-        and params_dtype == torch.bfloat16
-        and hidden_size == 4096
-        and num_experts == 512
-        and top_k == 10
-    )
 
 
 def _fuses_routed_scaling_factor_in_topk(quant_method, runner_backend) -> bool:
@@ -580,14 +556,6 @@ class FusedMoE(torch.nn.Module):
             and num_experts == 512
             and top_k == 10
         )
-        qwen35_draft_bf16_deferred = _qwen35_draft_bf16_deferred_finalize(
-            is_draft=self.is_draft,
-            quant_method=self.quant_method,
-            params_dtype=params_dtype,
-            hidden_size=hidden_size,
-            num_experts=num_experts,
-            top_k=top_k,
-        )
         self.supports_deferred_finalize = False
 
         self.quant_method.create_weights(
@@ -612,12 +580,7 @@ class FusedMoE(torch.nn.Module):
         self.supports_deferred_finalize = (
             self.runner_backend is not None
             and self.runner_backend.is_flashinfer_trtllm()
-            and (
-                nvfp4_deferred
-                or qwen35_fp8_deferred
-                or qwen4_bf16_deferred
-                or qwen35_draft_bf16_deferred
-            )
+            and (nvfp4_deferred or qwen35_fp8_deferred or qwen4_bf16_deferred)
         ) or packed_nvfp4_routed_deferred
         global _deferred_finalize_info_logged
         if not _deferred_finalize_info_logged:

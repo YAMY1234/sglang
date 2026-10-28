@@ -158,9 +158,9 @@ class TestMegakernelGuards(CustomTestCase):
     def test_slots_are_inert_without_the_megakernel(self):
         with (
             patch.object(binding, "megakernel_enabled", return_value=False),
-            envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override("draft_fin"),
+            envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override("fake_slot"),
         ):
-            self.assertFalse(megakernel_slot_requested("draft_fin"))
+            self.assertFalse(megakernel_slot_requested("fake_slot"))
 
     def test_gdn_cuda_commit_uses_only_the_runtime_master_switch(self):
         with patch.object(

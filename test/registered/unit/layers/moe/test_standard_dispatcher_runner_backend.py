@@ -22,7 +22,6 @@ from sglang.srt.layers.moe.utils import (
     MoeRunnerBackend,
     RoutingMethodType,
 )
-from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -124,27 +123,6 @@ def test_aiter_flag_follows_effective_backend(ep2_rank0, monkeypatch):
     ep2_rank0.runner_backend = MoeRunnerBackend.AUTO
     dispatcher = standard.StandardDispatcher(_config(MoeRunnerBackend.TRITON))
     assert not dispatcher.use_aiter_moe_runner
-
-
-def test_qwen35_draft_bf16_finalize_requires_exact_shape_and_slot():
-    from sglang.srt.layers.moe.fused_moe_triton import layer as fused_moe_layer
-
-    method = object.__new__(UnquantizedFusedMoEMethod)
-    predicate = fused_moe_layer._qwen35_draft_bf16_deferred_finalize
-    args = dict(
-        is_draft=True,
-        quant_method=method,
-        params_dtype=torch.bfloat16,
-        hidden_size=4096,
-        num_experts=512,
-        top_k=10,
-    )
-    with patch.object(fused_moe_layer, "megakernel_slot_requested", return_value=False):
-        assert not predicate(**args)
-    with patch.object(fused_moe_layer, "megakernel_slot_requested", return_value=True):
-        assert predicate(**args)
-        assert not predicate(**(args | {"is_draft": False}))
-        assert not predicate(**(args | {"hidden_size": 8192}))
 
 
 def test_lora_with_ep_is_rejected_on_a_remapped_layer(cutlass_pin, monkeypatch):

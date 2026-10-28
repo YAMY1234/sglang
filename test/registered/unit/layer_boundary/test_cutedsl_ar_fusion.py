@@ -125,20 +125,6 @@ def eligible():
         yield
 
 
-def test_ep_finalize_requires_the_fused_finalize_slot(eligible):
-    fusion = CuteDSLFusion()
-    with (
-        patch(f"{_MODULE}.get_parallel", return_value=SimpleNamespace(moe_ep_size=2)),
-        patch(f"{_MODULE}.megakernel_slot_requested", return_value=False),
-    ):
-        assert not fusion._finalize_eligible(None, _DECODE, 8)
-    with (
-        patch(f"{_MODULE}.get_parallel", return_value=SimpleNamespace(moe_ep_size=2)),
-        patch(f"{_MODULE}.megakernel_slot_requested", return_value=True),
-    ):
-        assert fusion._finalize_eligible(None, _DECODE, 8)
-
-
 def test_last_layer_consumes_but_does_not_skip_the_pending_all_reduce(eligible):
     """The last layer must fuse the reduction its predecessor skipped, or the
     unreduced output reaches the final norm; it must not skip its own."""
