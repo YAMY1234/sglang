@@ -11,7 +11,7 @@ using namespace q38_mk;
 constexpr int H=2560,I=Q38_MK_I,K=10,Rows=16,Threads=256;
 constexpr int TileI=I==640?128:64, C=I/TileI, N1=2*TileI, Nk=TileI/64;
 constexpr int Stages=I==640?2:5, StageBytes=N1*144, SfOffset=N1*128;
-constexpr int SfStride=N1==128?16:32, PartStride=260, PartBytes=Rows*PartStride*4;
+constexpr int SfStride=N1==128?16:32, PartStride=260;
 constexpr int Sw2=TileI==128?4:6, Sbo2=TileI*4;
 struct Params {
  const uint8_t *x,*xsf,*sf13,*sf2;
@@ -67,6 +67,7 @@ void q38_mk_moe_pipeline(const __grid_constant__ CUtensorMap w13,
  extern __shared__ __align__(1024) uint8_t raw[];
  Smem& s=*reinterpret_cast<Smem*>((reinterpret_cast<uintptr_t>(raw)+1023)&~uintptr_t(1023));
  const int tid=threadIdx.x,warp=tid/32,lane=tid%32,rank=cluster_rank(),cluster=blockIdx.x/C;
+ const uint32_t partial_bytes=p.m*PartStride*4;
  if(tid==0){prefetch_tmap(&w13);prefetch_tmap(&w2);}
  asm volatile("griddepcontrol.wait;":::"memory");
  if(cluster>=*p.num_unique){asm volatile("griddepcontrol.launch_dependents;":::"memory");return;}
@@ -80,7 +81,7 @@ void q38_mk_moe_pipeline(const __grid_constant__ CUtensorMap w13,
    mbar_init(&s.fc1_done,1);mbar_init(&s.h_ready,4);mbar_init(&s.tile_done,1);mbar_init(&s.tile_free,4);
    for(int tile=0;tile<10;++tile){
     mbar_init(&s.reduce_ready[tile],1);mbar_init(&s.reduce_ack[tile],1);
-    if(tile%C==rank)mbar_expect_tx(&s.reduce_ready[tile],(C-1)*PartBytes);
+    if(tile%C==rank)mbar_expect_tx(&s.reduce_ready[tile],(C-1)*partial_bytes);
    }
    fence_mbar_init();
   }
@@ -192,20 +193,23 @@ void q38_mk_moe_pipeline(const __grid_constant__ CUtensorMap w13,
    }
    wg_sync();fence_proxy_async_smem();tc_fence_before();__syncwarp();
    if(lane==0)mbar_arrive(&s.h_ready);
+   stage_sf(10);
    for(int tile=0;tile<10;++tile){
-    stage_sf(10+tile);
     mbar_wait(&s.tile_done,tile&1);tc_fence_after();
     if(q==0)for(int col=0;col<256;col+=64){
      uint32_t v[64];ld64(tm+col,v);tmem_ld_wait();
-     if(lane<Rows)for(int j=0;j<64;j+=4)
+     if(lane<p.m)for(int j=0;j<64;j+=4)
       *reinterpret_cast<uint4*>(&s.partial[rank][lane][col+j])=make_uint4(v[j],v[j+1],v[j+2],v[j+3]);
     }
     tc_fence_before();__syncwarp();if(lane==0)mbar_arrive(&s.tile_free);
     wg_sync();
+    // The next MMA can run during this tile's DSMEM transfer/reduction. Its
+    // accumulator is not drained until the current partial buffer is ACKed.
+    if(tile+1<10)stage_sf(11+tile);
     const int owner=tile%C;
     if(q==0)fence_proxy_async_smem();
     if(q==0&&lane==0&&rank!=owner)copy_peer(
-     mapa(smem_u32(s.partial[rank]),owner),smem_u32(s.partial[rank]),PartBytes,
+     mapa(smem_u32(s.partial[rank]),owner),smem_u32(s.partial[rank]),partial_bytes,
      mapa(smem_u32(&s.reduce_ready[tile]),owner));
     if(rank==owner){
      mbar_wait(&s.reduce_ready[tile],0);
