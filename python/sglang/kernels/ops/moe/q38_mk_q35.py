@@ -95,6 +95,41 @@ def _sf_pack_bundle(device_index):
     return load(cubin), finalize_kernel, final
 
 
+@cache
+def _fn_v2_bundle(device_index):
+    """Experimental FN scheduling; precompiled, with the original finalizer."""
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError('Q38 FN-v2 bundle must load during eager graph warmup')
+    _, finalize_kernel, final = _bundle(device_index)
+    root = Path(os.environ['SGLANG_Q38C_MK_MOE_FN_V2_AOT'])
+    manifest = json.loads((root / 'manifest.json').read_text())
+    source = Path(__file__).resolve().parents[2] / 'jit/csrc/moe/q38_mk_moe_fn_tp4.cu'
+    assert manifest['source_sha256'] == hashlib.sha256(source.read_bytes()).hexdigest()
+    assert manifest['base_manifest_sha256'] == hashlib.sha256(
+        (Path(os.environ['SGLANG_Q38C_MK_MOE_AOT']) / 'manifest.json').read_bytes()).hexdigest()
+    variant = manifest['variants']['fn32s5']
+    assert variant['grid'] == 64 and variant['shared'] == SHARED and variant['pdl_trigger'] == 0
+    cubin = root / variant['cubin']
+    assert variant['sha256'] == hashlib.sha256(cubin.read_bytes()).hexdigest()
+    return (jit.load(cubin.read_bytes(), 'q38_fn_moe_tp4', (THREADS, 1, 1), SHARED),
+            finalize_kernel, final)
+
+
+def maps_fn(w13, w2, xq):
+    sw = jit.driver().CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_128B
+    old = maps(w13, w2, xq)
+    return (old[0], tensor_map(w13, E * 2 * I, H // 2, 128, 64, sw), old[1], old[2])
+
+
+def run_fn(kernel, tensor_maps, logits, weights, ids, xsf, layer, out):
+    tensors = (logits, weights, ids, xsf, layer['gemm1_weights_scale'],
+               layer['gemm2_weights_scale'], layer['output1_scale_gate_scalar'],
+               layer['output1_scale_scalar'], layer['output2_scale_scalar'], out)
+    params = Params(*(t.data_ptr() for t in tensors), 0, logits.shape[0])
+    jit.launch(kernel, (64, 1, 1), [*tensor_maps, params],
+               torch.cuda.current_stream().cuda_stream, cluster=(CLUSTER, 1, 1))
+
+
 def _finalize(kernel, metadata, rows, weights, output):
     # Same MTP ordered body, ordinary stream launch: it has no PDL wait.
     cu = jit.driver()
@@ -139,8 +174,10 @@ def maybe_run_service(kwargs):
             or kwargs['gemm1_alpha'] is not None or kwargs['gemm1_beta'] is not None
             or kwargs['gemm1_clamp_limit'] is not None):
         return None
+    fn_v2 = os.environ.get('SGLANG_Q38C_MK_MOE_FN_V2', '0') == '1' and m in (1, 4)
     sf_pack = os.environ.get('SGLANG_Q38C_MK_MOE_SF_PACK', '0') == '1' and m in (1, 4)
     kernel, finalize_kernel, final_metadata = (
+        _fn_v2_bundle(xq.device.index) if fn_v2 else
         _sf_pack_bundle(xq.device.index) if sf_pack else _bundle(xq.device.index)
     )
     layer = dict(gemm1_weights=kwargs['gemm1_weights'], gemm2_weights=kwargs['gemm2_weights'],
@@ -151,14 +188,15 @@ def maybe_run_service(kwargs):
     weights = torch.empty((m, TOPK), dtype=torch.bfloat16, device=xq.device)
     ids = torch.empty((m, TOPK), dtype=torch.int32, device=xq.device)
     permutation = _identity(xq.device.index, m) if not kwargs['do_finalize'] else None
-    run(kernel, maps(layer['gemm1_weights'], layer['gemm2_weights'], xq),
+    runner, mapper = (run_fn, maps_fn) if fn_v2 else (run, maps)
+    runner(kernel, mapper(layer['gemm1_weights'], layer['gemm2_weights'], xq),
         kwargs['routing_logits'], weights, ids, kwargs['hidden_states_scale'], layer, rows)
     capturing = torch.cuda.is_current_stream_capturing()
-    signature = m, capturing, kwargs['do_finalize'], sf_pack
+    signature = m, capturing, kwargs['do_finalize'], sf_pack, fn_v2
     if signature not in _seen:
         _seen.add(signature)
-        logger.info('Q38C_MK_MOE_ACTIVE M=%d I=192 capture=%s finalize=%s grid=140 cluster=2 sf_pack=%s',
-                    m, capturing, kwargs['do_finalize'], sf_pack)
+        logger.info('Q38C_MK_MOE_ACTIVE M=%d I=192 capture=%s finalize=%s grid=%d cluster=2 sf_pack=%s fn_v2=%s',
+                    m, capturing, kwargs['do_finalize'], 64 if fn_v2 else GRID, sf_pack, fn_v2)
     if not kwargs['do_finalize']:
         return rows.view(m * TOPK, H), weights, permutation
     output = kwargs.get('output')
