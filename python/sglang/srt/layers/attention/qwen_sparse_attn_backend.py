@@ -63,6 +63,7 @@ logger = logging.getLogger(__name__)
 
 _TRTLLM_SPARSE_PAGE_SIZE = 64
 _Q38_ATTN_CORE_V1 = os.environ.get("Q38_ATTN_CORE_V1", "0") == "1"
+_Q38C_ATTN_CORE_TP4 = os.environ.get("SGLANG_Q38C_ATTN_CORE_TP4", "0") == "1"
 
 
 @lru_cache(maxsize=1)
@@ -1529,6 +1530,39 @@ class QwenSparseAttnBackend(AttentionBackend):
         # current-KV persistence and chain fresh/tail semantics from v11.
         # Other modes/shapes/precisions retain the frozen405 implementation.
         indexer = metadata.indexer_metadata
+        if (
+            _Q38C_ATTN_CORE_TP4
+            and is_sm100_supported()
+            and mode.is_target_verify()
+            and int(getattr(forward_batch.spec_info, "topk", 1) or 1) == 1
+            and rows == width == 4
+            and metadata.is_cuda_graph
+            and self.compress_ratio == 4
+            and self._uses_block_indices(indices)
+            and indices.shape == (4, 512)
+            and layer.tp_q_head_num == 6
+            and layer.head_dim == 256
+            and kc.shape[1] == 1
+            and kc.dtype == vc.dtype == torch.bfloat16
+            and output_gate is not None
+            and output_gate.dtype == torch.bfloat16
+            and indexer is not None
+            and indexer.decode_logical_positions is not None
+        ):
+            row_requests = metadata.row_req_pool_indices
+            if row_requests is None:
+                row_requests = forward_batch.req_pool_indices
+            if row_requests.numel() == rows:
+                from sglang.kernels.ops.attention.q38c_attn_core_tp4 import run_gated
+
+                output = run_gated(
+                    q.reshape(rows, 6, 256), kc, vc, k, v, loc,
+                    self.req_to_token_pool.req_to_token, row_requests,
+                    indices.to(torch.int32).contiguous(), metadata.sequence_lengths,
+                    indexer.decode_logical_positions, layer.scaling,
+                    gate=output_gate, width=width,
+                )
+                return output.reshape(rows, -1), True
         if (
             _Q38_ATTN_CORE_V1
             and is_sm100_supported()
