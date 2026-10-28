@@ -108,6 +108,7 @@ _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD = 1024
 _Q38_QSA_EARLY_INDEXER = get_bool_env_var("Q38_QSA_EARLY_INDEXER", "False")
 _Q38_ATTN_GATE_V2 = get_bool_env_var("Q38_ATTN_GATE_V2", "False")
 _Q38_QSA_PDL_INDEX = get_bool_env_var("Q38_QSA_PDL_INDEX", "False")
+_Q38_MK_MTP = get_bool_env_var("SGLANG_Q38C_MK_MTP", "False")
 
 
 def _ple_table_is_fp8(
@@ -274,6 +275,26 @@ def _prepare_ple_batch(
     physical_tokens = input_ids.shape[0]
     processed_tokens = _get_processed_token_count(forward_batch, physical_tokens)
     tokens = input_ids[:processed_tokens]
+    if _Q38_MK_MTP:
+        from sglang.kernels.ops.speculative.q38_mk_mtp.metadata import (
+            try_prepare_verify_layout,
+        )
+
+        mk_layout = try_prepare_verify_layout(
+            input_ids, forward_batch, mode, get_req_to_token_pool(),
+            ngram_size=ngram_size, ngram_eos_token_id=ngram_eos_token_id,
+            processed_tokens=processed_tokens,
+        )
+        if mk_layout is not None:
+            return _PLEBatch(
+                mode=mode, use_decode_fast_path=False,
+                physical_tokens=physical_tokens, processed_tokens=processed_tokens,
+                lengths=mk_layout.lengths, row_width=4,
+                req_indices=mk_layout.req_indices, token_offsets=mk_layout.token_offsets,
+                valid_tokens=mk_layout.valid_tokens, state_indices=mk_layout.state_indices,
+                ngram_context=mk_layout.ngram_context,
+                ngram_eos_token_id=ngram_eos_token_id,
+            )
     positions = torch.arange(processed_tokens, device=tokens.device, dtype=torch.long)
 
     if mode.is_target_verify():
