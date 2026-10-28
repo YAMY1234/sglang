@@ -12,6 +12,7 @@ import tilelang
 from tilelang import language as T
 
 _Q38C_SCORE_Q4_CTA1024 = os.environ.get("SGLANG_Q38C_SCORE_Q4_CTA1024", "0") == "1"
+_Q38C_SCORE_Q4_DIRECT = os.environ.get("SGLANG_Q38C_SCORE_Q4_DIRECT", "0") == "1"
 
 
 @tilelang.jit(
@@ -116,6 +117,14 @@ def _score_q4_n16_kernel(min_scored_len: int = 512, request_dtype: str = "int32"
 
 def score_q4_n16(q, k_cache, page_table, lengths, max_model_len, req_pool_indices,
              score_scale=None, min_scored_len=512):
+    if _Q38C_SCORE_Q4_DIRECT:
+        from sglang.kernels.ops.attention.q38_score_q4_direct import score_q4_direct
+
+        return score_q4_direct(
+            q, k_cache, page_table, lengths, max_model_len, req_pool_indices,
+            score_scale=score_scale, min_scored_len=min_scored_len,
+            long_ctas=1024 if _Q38C_SCORE_Q4_CTA1024 else 512,
+        )
     logits = torch.empty((4, max_model_len), dtype=torch.float32, device=q.device)
     request_dtype = {torch.int32: "int32", torch.int64: "int64"}[req_pool_indices.dtype]
     _score_q4_n16_kernel(
