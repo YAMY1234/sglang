@@ -10,13 +10,13 @@ exact.
 import unittest
 
 import torch
-
 from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
 from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_fold import (
     commit_gdn_replayssm_fold_all_layers,
 )
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -290,9 +290,9 @@ def _cuda_commit_available() -> bool:
 
 @unittest.skipUnless(_cuda_commit_available(), "needs SM90+ and cuda.bindings")
 class TestGdnReplayssmCommitCuda(CustomTestCase):
-    """Compare the CUDA compact commit with Triton on production TP8 shapes."""
+    """Compare the tolerance-equivalent CUDA commit with stock Triton."""
 
-    def test_cuda_commit_matches_triton(self):
+    def test_cuda_commit_is_tolerance_equivalent_to_triton(self):
         from sglang.kernels.ops.attention.linear import gdn_replayssm_commit_cuda
         from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode import (
             commit_gdn_replayssm_circular,
@@ -326,24 +326,53 @@ class TestGdnReplayssmCommitCuda(CustomTestCase):
         track_rows = torch.tensor([10, 11, -1, 4], dtype=torch.int64, device=DEVICE)
         track_steps = torch.tensor([1, 6, -1, 0], dtype=torch.int32, device=DEVICE)
 
+        capability_inputs = dict(
+            d_cache=caches["d_cache"],
+            k_cache=caches["k_cache"],
+            g_cache=caches["g_cache"],
+            d_residual_cache=caches["d_residual_cache"],
+            k_residual_cache=caches["k_residual_cache"],
+            state_batch_indices=state_rows,
+            replay_indices=replay_rows,
+            write_pos=write_pos,
+            cache_base=cache_base,
+            is_flush=is_flush,
+            accept_lens=accept_lens,
+            mamba_track_indices=track_rows,
+            mamba_steps_to_track=track_steps,
+        )
+        self.assertTrue(
+            gdn_replayssm_commit_cuda._supported(
+                checkpoint_state=state, **capability_inputs
+            )
+        )
+        # Precision gate: FP32 checkpoints retain the stock, bitwise path.
+        self.assertFalse(
+            gdn_replayssm_commit_cuda._supported(
+                checkpoint_state=state.float(), **capability_inputs
+            )
+        )
+
         outs = []
-        for use_cuda_commit in (False, True):
+        for runtime_optimization in (False, True):
             cursors = [t.clone() for t in (write_pos, cache_base, is_flush)]
             out = state.clone()
-            commit_gdn_replayssm_circular(
-                checkpoint_state=out,
-                **caches,
-                state_batch_indices=state_rows,
-                replay_indices=replay_rows,
-                write_pos=cursors[0],
-                cache_base=cursors[1],
-                is_flush=cursors[2],
-                accept_lens=accept_lens,
-                mamba_track_indices=track_rows,
-                mamba_steps_to_track=track_steps,
-                null_block_id=-1,
-                use_cuda_commit=use_cuda_commit,
-            )
+            with envs.ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(
+                runtime_optimization
+            ):
+                commit_gdn_replayssm_circular(
+                    checkpoint_state=out,
+                    **caches,
+                    state_batch_indices=state_rows,
+                    replay_indices=replay_rows,
+                    write_pos=cursors[0],
+                    cache_base=cursors[1],
+                    is_flush=cursors[2],
+                    accept_lens=accept_lens,
+                    mamba_track_indices=track_rows,
+                    mamba_steps_to_track=track_steps,
+                    null_block_id=-1,
+                )
             outs.append((out, cursors))
         self.assertTrue(gdn_replayssm_commit_cuda._KERNELS)
 
@@ -351,9 +380,16 @@ class TestGdnReplayssmCommitCuda(CustomTestCase):
         for a, b in zip(want_cursors, got_cursors):
             self.assertTrue(torch.equal(a, b))
         written = [3, 7, 1, 10, 11, 4]
+        self.assertEqual(gdn_replayssm_commit_cuda.CUDA_COMMIT_RTOL, 2**-7)
+        self.assertEqual(gdn_replayssm_commit_cuda.CUDA_COMMIT_ATOL, 1e-6)
         torch.testing.assert_close(
-            got[:, written].float(), want[:, written].float(), rtol=2**-7, atol=1e-6
+            got[:, written].float(),
+            want[:, written].float(),
+            rtol=gdn_replayssm_commit_cuda.CUDA_COMMIT_RTOL,
+            atol=gdn_replayssm_commit_cuda.CUDA_COMMIT_ATOL,
         )
+        # This deliberately does not assert equality: CUDA and Triton accumulate
+        # FP32 terms in different orders, so bitwise parity is not the contract.
         self.assertFalse(torch.equal(want[:, written], state[:, written]))
         untouched = [s for s in range(slots) if s not in written]
         self.assertTrue(torch.equal(got[:, untouched], state[:, untouched]))

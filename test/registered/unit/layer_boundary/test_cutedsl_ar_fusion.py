@@ -5,7 +5,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-
 from sglang.srt.layers.flashinfer_mnnvl_cutedsl import (
     FlashInferMNNVLCuteDSLARFusion,
     _retargeted_config,
@@ -571,21 +570,42 @@ def test_retargeted_profiles_cover_capacity_and_pass_flashinfer_validation(
             )
 
 
-def test_qwen35_ep_profile_uses_the_validated_bt_policy():
+@pytest.mark.parametrize(
+    ("enabled", "tp_size", "hidden_size", "top_k", "ep_size", "tuned"),
+    [
+        (True, 8, 4096, 10, 8, True),
+        (False, 8, 4096, 10, 8, False),
+        (True, 16, 4096, 10, 8, False),
+        (True, 8, 8192, 10, 8, False),
+        (True, 8, 4096, 8, 8, False),
+        (True, 8, 4096, 10, 1, False),
+    ],
+)
+def test_ep_shape_profile_uses_runtime_tuning_only_at_its_capability_boundary(
+    enabled, tp_size, hidden_size, top_k, ep_size, tuned
+):
     from flashinfer.comm.mnnvl_cutedsl import ProtocolKind
 
     module = "sglang.srt.layers.flashinfer_mnnvl_cutedsl"
     with (
-        patch(f"{module}.megakernel_slot_requested", return_value=True),
-        patch(f"{module}.get_parallel", return_value=SimpleNamespace(moe_ep_size=8)),
+        patch(f"{module}.nv_mega_runtime_optimization_enabled", return_value=enabled),
+        patch(
+            f"{module}.get_parallel", return_value=SimpleNamespace(moe_ep_size=ep_size)
+        ) as get_parallel,
     ):
-        profile = _retargeted_config(8, 4096, 10).profiles[0]
+        profile = _retargeted_config(tp_size, hidden_size, top_k).profiles[0]
 
-    assert profile.finalize_routes.upper_bounds[2] == 1024
+    expect_ep_probe = enabled and (tp_size, hidden_size, top_k) == (8, 4096, 10)
+    assert get_parallel.called is expect_ep_probe
+
+    assert profile.finalize_routes.upper_bounds[2] == (1024 if tuned else 703)
     for routes in (profile.finalize_routes, profile.all_reduce_routes):
         bt = [target for target in routes.targets if target.protocol is ProtocolKind.BT]
         assert bt
-        assert all(target.preset.collective.rms_threads == 512 for target in bt)
+        expected_threads = 512 if tuned else 1024
+        assert all(
+            target.preset.collective.rms_threads == expected_threads for target in bt
+        )
 
 
 class TestDeferredLoraAllReduce(unittest.TestCase):

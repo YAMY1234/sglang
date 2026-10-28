@@ -415,6 +415,32 @@ class FutureMap:
         self.flush_deferred_relay()
         self._deferred_relay = (future_indices, payload, draft_input)
 
+    def relay(
+        self,
+        future_indices: torch.Tensor,
+        payload: RelayPayload,
+        *,
+        draft_input: EagleDraftInput | None,
+        accepted_lengths: torch.Tensor | None,
+        allow_defer: bool = True,
+    ) -> None:
+        """Apply the resolved relay policy behind one unconditional API.
+
+        With relay reuse disabled this is exactly ``stash``.  Keeping the
+        policy here prevents scheduler call sites from branching on an
+        optimization capability.
+        """
+        if (
+            allow_defer
+            and self.relay_bypass
+            and draft_input is not None
+            and accepted_lengths is not None
+            and future_indices.shape[0] > 0
+        ):
+            self.defer_relay(future_indices, payload, draft_input)
+            return
+        self.stash(future_indices, payload)
+
     def takes_deferred_relay(self, batch: ScheduleBatch) -> bool:
         """The batch is the deferred round's own, with its rows unchanged."""
         relay = self._deferred_relay

@@ -20,7 +20,6 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
-
 from sglang.kernels.ops.speculative.eagle import prepare_verify_commit_outputs
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -214,6 +213,11 @@ class TestPostVerifyGraphs(CustomTestCase):
         class _EagerSample(Exception):
             pass
 
+        class _EagerHooks:
+            @property
+            def post_verify(self):
+                raise _EagerSample
+
         for clears_c128 in (False, True):
             kvcache = (
                 object.__new__(DeepSeekV4TokenToKVPool)
@@ -249,13 +253,11 @@ class TestPostVerifyGraphs(CustomTestCase):
                     "eagle_prepare_for_verify",
                     return_value=(SimpleNamespace(), True),
                 ),
-                patch.object(
-                    eagle_worker_common, "eagle_sample", side_effect=_EagerSample
-                ),
                 self.assertRaises(_EagerSample),
             ):
                 eagle_worker_common.run_eagle_verify(
                     batch,
+                    speculative_runtime_hooks=_EagerHooks(),
                     target_worker=target_worker,
                     req_to_token_pool=None,
                     token_to_kv_pool_allocator=SimpleNamespace(

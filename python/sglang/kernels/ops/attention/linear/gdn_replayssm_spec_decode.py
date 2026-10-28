@@ -44,16 +44,9 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.utils import is_tf32_supported
-from sglang.srt.kernel_plugins.nvidia.policy import megakernel_slot_requested
 from sglang.srt.utils import is_gfx95_supported
 
 _IS_GFX95 = is_gfx95_supported()
-GDN_COMMIT_SLOT = "gdn_commit"
-
-
-def gdn_commit_cuda_requested() -> bool:
-    """Whether the numeric CUDA commit was explicitly selected for a megakernel."""
-    return megakernel_slot_requested(GDN_COMMIT_SLOT)
 
 
 @triton.jit
@@ -1290,7 +1283,6 @@ def commit_gdn_replayssm_circular(
     mamba_track_indices: torch.Tensor | None = None,
     mamba_steps_to_track: torch.Tensor | None = None,
     null_block_id: int = -1,
-    use_cuda_commit: bool = False,
 ) -> None:
     """Materialize circular history only for capacity and track rows.
 
@@ -1308,7 +1300,7 @@ def commit_gdn_replayssm_circular(
     k_residual_buf = k_residual_cache if has_residual else k_cache
     BV = min(triton.next_power_of_2(V), 64)
     has_track = mamba_track_indices is not None and mamba_steps_to_track is not None
-    if use_cuda_commit and _commit_cuda(
+    if _try_runtime_cuda_commit(
         checkpoint_state=checkpoint_state,
         d_cache=d_cache,
         k_cache=k_cache,
@@ -1427,8 +1419,20 @@ def _finish_circular_fold(
     )
 
 
-def _commit_cuda(**kw) -> bool:
-    """Try one CUDA launch, falling back when its shapes or capture state require it."""
+def _try_runtime_cuda_commit(**kw) -> bool:
+    """Try the generic one-launch commit behind the runtime optimization switch.
+
+    The master switch is the only policy gate. ``try_commit`` owns the BF16,
+    shape, layout and CUDA-ISA capability checks; returning ``False`` preserves
+    the stock Triton commit below. The CUDA kernel changes FP32 accumulation
+    order, so its contract is tolerance-equivalent rather than bitwise.
+    """
+    from sglang.srt.kernel_plugins.nvidia.binding import (
+        nv_mega_runtime_optimization_enabled,
+    )
+
+    if not nv_mega_runtime_optimization_enabled():
+        return False
     from sglang.kernels.ops.attention.linear import (
         gdn_replayssm_commit_cuda as cuda_commit,
     )

@@ -8,10 +8,8 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
-
-from sglang.srt.kernel_plugins.nvidia.policy import (
-    FUSED_FINALIZE_SLOT,
-    megakernel_slot_requested,
+from sglang.srt.kernel_plugins.nvidia.binding import (
+    nv_mega_runtime_optimization_enabled,
 )
 from sglang.srt.runtime_context import get_parallel, get_spec
 
@@ -235,20 +233,20 @@ def _retargeted_config(tp_size: int, hidden_size: int, top_k: int):
             tp_size,
         )
 
-    qwen35_ep_policy = (
-        (tp_size, hidden_size, top_k) == (8, 4096, 10)
-        and megakernel_slot_requested(FUSED_FINALIZE_SLOT)
+    ep_shape_tuning = (
+        nv_mega_runtime_optimization_enabled()
+        and (tp_size, hidden_size, top_k) == (8, 4096, 10)
         and get_parallel().moe_ep_size > 1
     )
 
     def bt_preset(preset):
-        if not qwen35_ep_policy:
+        if not ep_shape_tuning:
             return preset
         return replace(preset, collective=replace(preset.collective, rms_threads=512))
 
     def routes(op):
         bounds, ll, bt, _ = shipped[op]
-        if op == "finalize" and qwen35_ep_policy:
+        if op == "finalize" and ep_shape_tuning:
             bounds = (*bounds[:2], 1024, *bounds[3:])
         return _routes(
             bounds,
