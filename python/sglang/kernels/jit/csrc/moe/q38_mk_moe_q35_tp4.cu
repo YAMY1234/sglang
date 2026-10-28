@@ -827,10 +827,10 @@ q35_mkm_moe_tp4(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
         const int j = st - kFc1Stages;
 #pragma unroll
         for (int kb = 0; kb < kI / 64; ++kb) {
-          const int n2 = kFc1Stages * 4 + j * (kI / 64) + kb;  // SF ring slots continue after FC1's 40 K64 blocks
+          const int n2 = kFc1Stages * 4 + j * 4 + kb;  // original four-slot layout; the I192 fourth slot is unused
           umma_nvf4(tm, make_sdesc(smem_u32(s.ha) + kb * 32, 0, 0, 2),
                     make_sdesc(smem_u32(s.ring[b]) + kb * 32, 0, 1024, 2), idesc2,
-                    tm + kColSfa + (uint32_t)(j * (kI / 64) + kb) * 4, tm + kColSfb + (uint32_t)(n2 % kSfbSlots) * 8, (j | kb) != 0);
+                    tm + kColSfa + (uint32_t)(j * 4 + kb) * 4, tm + kColSfb + (uint32_t)(n2 % kSfbSlots) * 8, (j | kb) != 0);
         }
         tc_commit(&s.empty[b]);
       }
@@ -918,7 +918,7 @@ q35_mkm_moe_tp4(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
     // FC2 scale factors of the first two FC2 stages while h is computed (all FC1 MMAs are done)
     if (FC2SF_PRE) {
       stage_sf(kFc1Stages, kFc1Stages * 4, 3, 0, 1536);
-      stage_sf(kFc1Stages + 1, kFc1Stages * 4 + 3, 3, 0, 1536);
+      stage_sf(kFc1Stages + 1, kFc1Stages * 4 + 4, 3, 0, 1536);
     }
     if (threadIdx.x == 128) stamp(p, 15);
     tc_fence_before();
@@ -986,27 +986,23 @@ q35_mkm_moe_tp4(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
     }
     mbar_wait(&s.h_peer, 0);  // the peer's half of h and its scale words
     if (threadIdx.x == 128) stamp(p, 5);
-    // h SF: 5 output tiles x 3 K64 atoms. Retain the original TMEM staging
-    // footprint, zeroing the unused atoms; each live tile owns eight TMEM rows.
+    // Pack the two aligned six-byte halves into the original four-slot SF
+    // tile layout. Read only live SF bytes, once per lane; the fourth atom is zero.
     {
+      const uint32_t* hs = s.hsf[lane % 8];
+      const uint32_t lo = hs[0], hi = hs[2];
+      const uint32_t mid = *reinterpret_cast<const uint16_t*>(hs + 1);
+      const uint32_t end = *reinterpret_cast<const uint16_t*>(hs + 3);
+      const uint32_t words[4] = {lo, mid | (hi << 16), (hi >> 16) | (end << 16), 0u};
       uint32_t r[32];
 #pragma unroll 1
       for (int half = 0; half < 4; ++half) {
 #pragma unroll
         for (int i = 0; i < 32; ++i) {
-          const int a = half * 8 + i / 4, col = i % 4;  // atom a = 3 jt + kb
-          const int jt = a / 3, kb = a % 3;
+          const int a = half * 8 + i / 4, col = i % 4;  // atom a = 4 jt + kb
+          const int jt = a / 4, kb = a % 4;
           const int row = 32 * col + lane;
-          uint32_t sfword = 0;
-          if (jt < kFc2Stages && row / 8 == jt) {
-#pragma unroll
-            for (int b = 0; b < 4; ++b) {
-              const int group = 4 * kb + b;
-              const auto* half_sf = reinterpret_cast<const uint8_t*>(&s.hsf[row % 8][2 * (group / 6)]);
-              sfword |= (uint32_t)half_sf[group % 6] << (8 * b);
-            }
-          }
-          r[i] = sfword;
+          r[i] = (jt < kFc2Stages && row / 8 == jt) ? words[kb] : 0u;
         }
         tmem_st_x32(tm + lane_addr + kColSfa + half * 32, r);
       }
@@ -1018,7 +1014,7 @@ q35_mkm_moe_tp4(const __grid_constant__ CUtensorMap tm13, const __grid_constant_
     if (lane == 0) mbar_arrive(&s.h_ready);
     // FC2 weight scale factors (the MMA issuer waits for each stage's)
     for (int st = kFc1Stages + (FC2SF_PRE ? 2 : 0); st < kTotStages; ++st)
-      stage_sf(st, kFc1Stages * 4 + (st - kFc1Stages) * 3, 3, 0, 1536);
+      stage_sf(st, kFc1Stages * 4 + (st - kFc1Stages) * 4, 3, 0, 1536);
 
     if (q < 2) fc2_drain(p, s, tm, q, lane, 0, a2, rank, e);
   }
