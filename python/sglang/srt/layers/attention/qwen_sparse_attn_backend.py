@@ -1396,7 +1396,10 @@ class QwenSparseAttnBackend(AttentionBackend):
             self._fused_kv_pool_eligible
             and forward_batch.forward_mode.is_decode()
             and isinstance(indices, DeferredMtpSparseIndices)
-            and indices.shape == (1, 2048) and indices.tail_width == 4
+            and indices.shape == (1, self.token_to_kv_pool.qsa_token_topk
+                                      + self.compress_ratio - 1 + indices.tail_width)
+            and self.token_to_kv_pool.qsa_token_topk == 2048
+            and self.compress_ratio == 4 and indices.tail_width == 4
             and layer.tp_q_head_num == 6 and layer.tp_k_head_num == 1
             and layer.head_dim == 256
             and forward_batch.req_pool_indices.numel() == 1
@@ -1420,11 +1423,12 @@ class QwenSparseAttnBackend(AttentionBackend):
                 return None
         else:
             counts = torch.empty(1, dtype=torch.int32, device=kc.device)
-        stride = (2048 + _TRTLLM_SPARSE_PAGE_SIZE - 1) // _TRTLLM_SPARSE_PAGE_SIZE * _TRTLLM_SPARSE_PAGE_SIZE
+        stride = (indices.shape[1] + _TRTLLM_SPARSE_PAGE_SIZE - 1) // _TRTLLM_SPARSE_PAGE_SIZE * _TRTLLM_SPARSE_PAGE_SIZE
         capacity = self._cuda_graph_max_tokens if metadata.is_cuda_graph else 1
         pk, pv = self._get_fa2_scratch(capacity * stride, 1, 256, kc.dtype, kc.device)
         if not getattr(self, "_q38_mtp_front_logged", False):
-            logger.info("Q38C MK MTP front active: M1 Q6/KV1 BF16 Deferred2048")
+            logger.info("Q38C MK MTP front active: M1 Q6/KV1 BF16 Deferred T=%s stride=%s",
+                        indices.shape[1], stride)
             self._q38_mtp_front_logged = True
         from sglang.kernels.ops.speculative.q38_mk_mtp.front import MtpFrontPlan
 
