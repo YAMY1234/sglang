@@ -159,6 +159,7 @@ _is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
 _Q38C_LOOP_GLUE = os.environ.get("SGLANG_Q38C_LOOP_GLUE", "0") == "1"
+_Q38C_EARLY_VERIFY = os.environ.get("SGLANG_Q38C_EARLY_VERIFY", "0") == "1"
 # PERF-LB: the post-verify mamba state commit (side stream) joins the forward stream before the next verify / prefill
 # instead of right after the draft extend, so it can overlap the draft extend and the next round's draft steps.
 _PLB_LATE_JOIN = envs.SGLANG_PLB_COMMIT_LATE_JOIN.get()
@@ -727,6 +728,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             else contextlib.nullcontext()
         )
 
+        early_verify = None
+        if _Q38C_EARLY_VERIFY and not with_topology:
+            from sglang.srt.speculative.early_verify import prepare_early_verify
+
+            early_verify = prepare_early_verify(
+                self,
+                batch,
+                draft_input,
+                forward_batch,
+                kv_loc_plan,
+                can_run_decode_cuda_graph=can_run_decode_cuda_graph,
+                late_commit_join=_PLB_LATE_JOIN,
+            )
+
         with canary_outside_ctx:
             # Run draft
             if can_run_decode_cuda_graph:
@@ -757,20 +772,27 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     self.draft_forward(forward_batch)
                 )
 
-        verify_input = build_eagle_verify_input(
-            batch,
-            draft_input,
-            parent_list,
-            top_scores_index,
-            draft_tokens,
-            draft_probs,
-            target_worker=self.target_worker,
-            topk=self.topk,
-            num_steps=self.speculative_num_steps,
-            num_draft_tokens=self.speculative_num_draft_tokens,
-            tree_mask_mode=self.tree_mask_mode,
-            device=self.device,
-        )
+        if early_verify is not None:
+            from sglang.srt.speculative.early_verify import publish_early_verify
+
+            verify_input = publish_early_verify(
+                early_verify, draft_input.bonus_tokens, draft_tokens
+            )
+        else:
+            verify_input = build_eagle_verify_input(
+                batch,
+                draft_input,
+                parent_list,
+                top_scores_index,
+                draft_tokens,
+                draft_probs,
+                target_worker=self.target_worker,
+                topk=self.topk,
+                num_steps=self.speculative_num_steps,
+                num_draft_tokens=self.speculative_num_draft_tokens,
+                tree_mask_mode=self.tree_mask_mode,
+                device=self.device,
+            )
         if kv_loc_plan is not None:
             # Verify and draft extend write the window the draft planned.
             verify_input.kv_loc_plan = kv_loc_plan
@@ -2317,6 +2339,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if _PLB_LATE_JOIN and self._post_verify_graphs is not None:
             # the verify reads the GDN checkpoint / ring / cursors the pending commit writes
             self._post_verify_graphs.join()
+        prepared_verify = None
+        if _Q38C_EARLY_VERIFY:
+            prepared_verify = getattr(batch.spec_info, "_q38c_prepared_verify", None)
+            if prepared_verify is not None:
+                # The FB owns spec_info; remove its back-reference after one use.
+                del batch.spec_info._q38c_prepared_verify
         return run_eagle_verify(
             batch,
             pp_proxy_tensors=pp_proxy_tensors,
@@ -2335,4 +2363,5 @@ class EAGLEWorkerV2(BaseSpecWorker):
             post_verify_graphs=self._post_verify_graphs,
             simulated_acc_len_rng=self._simulated_acc_len_rng,
             sparse_bonus_argmax=max_top_k is not None,
+            prepared_verify=prepared_verify,
         )
