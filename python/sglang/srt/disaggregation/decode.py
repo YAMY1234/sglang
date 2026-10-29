@@ -3355,6 +3355,11 @@ class SchedulerDisaggregationDecodeMixin:
         self.ngram_embedding_manager.prepare_for_forward(
             batch, chunked_req=self.chunked_req
         )
+        # PREBUILT reseeds the request without entering the worker's prefill
+        # path. Discard its previous decode staging, including same-Req resume.
+        step2 = getattr(self.draft_worker, "_step2", None)
+        if step2 is not None:
+            step2.forget()
         batch.process_prebuilt(self.future_map)
         return batch
 

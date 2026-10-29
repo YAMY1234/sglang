@@ -235,6 +235,77 @@ def _scheduler(seq_lens_check=None):
     return scheduler
 
 
+class TestPerfllStep2PrebuiltLifecycle(CustomTestCase):
+    """Exercise the real PREBUILT entry; only the GPU seed/embedding work is mocked."""
+
+    @staticmethod
+    def _request():
+        # Only these host fields are read by Step2Counter; no tokenizer or GPU state.
+        return SimpleNamespace(
+            rid="same-rid", kv=SimpleNamespace(
+                req_pool_idx=7, kv_committed_len=100, kv_allocated_len=121
+            )
+        )
+
+    def _scheduler(self, counter, prebuilt):
+        return SimpleNamespace(
+            _get_new_prebuilt_batch=Mock(return_value=prebuilt),
+            _verify_kv_checksums=Mock(),
+            ngram_embedding_manager=SimpleNamespace(prepare_for_forward=Mock()),
+            chunked_req=None,
+            draft_worker=SimpleNamespace(_step2=counter),
+            future_map=object(),
+        )
+
+    def test_nonempty_prebuilt_discards_old_lengths_and_next_draft_before_seed(self):
+        for same_request in (False, True):
+            with self.subTest(same_request=same_request):
+                old_req = self._request()
+                new_req = old_req if same_request else self._request()
+                old_batch = SimpleNamespace(reqs=[old_req])
+                counter = Step2Counter(width=7, graph_sizes=[1], needs_next_draft=True)
+                published, staged = object(), object()
+                counter.note_extend(old_batch, next_draft=staged, new_seq_lens=published)
+                observed_at_seed = []
+                prebuilt = SimpleNamespace(
+                    reqs=[new_req], is_empty=lambda: False,
+                    process_prebuilt=Mock(
+                        side_effect=lambda _: observed_at_seed.append(counter.noted)
+                    ),
+                )
+                scheduler = self._scheduler(counter, prebuilt)
+                self.assertIs(Scheduler.get_new_prebuilt_batch(scheduler, old_batch), prebuilt)
+                prebuilt.process_prebuilt.assert_called_once_with(scheduler.future_map)
+                next_batch = SimpleNamespace(reqs=[new_req])
+                got_lengths = counter.take_seq_lens(next_batch, sched_idle=True)
+                got_draft = counter.count_draft(next_batch)
+                self.assertEqual((observed_at_seed, got_lengths, got_draft), ([None], None, None))
+                self.assertIsNone(counter.count_draft(next_batch))
+
+    def test_no_prebuilt_seed_preserves_continuous_decode_and_consume_once(self):
+        for empty in (False, True):
+            with self.subTest(empty_prebuilt=empty):
+                req = self._request()
+                batch = SimpleNamespace(reqs=[req])
+                counter = Step2Counter(width=7, graph_sizes=[1], needs_next_draft=True)
+                published, staged = object(), object()
+                counter.note_extend(batch, next_draft=staged, new_seq_lens=published)
+                prebuilt = (
+                    SimpleNamespace(is_empty=lambda: True, process_prebuilt=Mock())
+                    if empty else None
+                )
+                scheduler = self._scheduler(counter, prebuilt)
+                self.assertIsNone(Scheduler.get_new_prebuilt_batch(scheduler, batch))
+                scheduler.ngram_embedding_manager.prepare_for_forward.assert_not_called()
+                if prebuilt is not None:
+                    prebuilt.process_prebuilt.assert_not_called()
+                next_batch = SimpleNamespace(reqs=[req])
+                self.assertIs(counter.take_seq_lens(next_batch, sched_idle=True), published)
+                self.assertIs(counter.count_draft(next_batch), staged)
+                self.assertIsNone(counter.take_seq_lens(next_batch, sched_idle=True))
+                self.assertIsNone(counter.count_draft(next_batch))
+
+
 class TestPerfllStep5aSeqLens(CustomTestCase):
     def test_a_staged_pass_takes_the_lengths_its_previous_pass_published(self):
         """Only a pass count_draft calls staged takes them, and taking them consumes nothing:
