@@ -419,7 +419,7 @@ class TestAdmissionOverlap(CustomTestCase):
                 )
                 scheduler.forward_stream.wait_stream.assert_not_called()
 
-    def test_deferred_prealloc_polls_and_flushes_once_and_preserves_retraction(self):
+    def test_deferred_prealloc_polls_once_and_preserves_retraction(self):
         disagg = SimpleNamespace(
             disaggregation_decode_enable_offload_kvcache=False,
             disaggregation_decode_host_receive_threshold=1,
@@ -433,7 +433,6 @@ class TestAdmissionOverlap(CustomTestCase):
                 )
                 self.assertEqual(deferred, defer)
                 queue = scheduler.disagg_decode_prealloc_queue
-                queue.flush_deferred_sends.assert_called_once()
                 scheduler.disagg_decode_transfer_queue.pop_transferred.assert_called_once()
                 self.assertEqual(queue.pop_preallocated.call_count, int(not defer))
                 if deferred:

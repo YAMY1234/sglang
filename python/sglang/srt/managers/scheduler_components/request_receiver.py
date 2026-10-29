@@ -211,7 +211,7 @@ class SchedulerRequestReceiver:
                 exchange = get_shm_exchange(
                     group=tp_group.cpu_group,
                     kind="recv",
-                    multihost=envs.SGLANG_Q35MF_EDGE_SHM_SYNC_MULTIHOST.get(),
+                    multihost=envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get(),
                 )
                 if exchange is not None:
                     recv_reqs = _broadcast_via_exchange(

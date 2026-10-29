@@ -180,9 +180,6 @@ class TestShmTagExchange(CustomTestCase):
                     return_value=requests,
                 ) as broadcast,
                 envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(
-                    not runtime_optimization
-                ),
-                envs.SGLANG_Q35MF_EDGE_SHM_SYNC_MULTIHOST.override(
                     runtime_optimization
                 ),
             ):
