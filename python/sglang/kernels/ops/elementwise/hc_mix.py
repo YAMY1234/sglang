@@ -36,8 +36,9 @@ def _get_scratch(lowrank: int, dtype: torch.dtype, device: torch.device):
     return buf
 
 
-def _get_tactic(m: int, n: int, k: int):
-    key = (m, n, k)
+def _get_tactic(m: int, n: int, k: int, wide_rows: bool = False):
+    wide32 = wide_rows and m == 32
+    key = (m, n, k, True) if wide32 else (m, n, k)
     tactic = _tactic_cache.get(key)
     if tactic is None:
         from sglang.kernels.ops.gemm.dense_bf16_gemm_sm100_splitk_epilogue import (
@@ -46,7 +47,15 @@ def _get_tactic(m: int, n: int, k: int):
             validate_tactic,
         )
 
-        if n <= 512 and k % (128 * 16) == 0:
+        if wide32:
+            if (n, k) == (320, 10240):
+                tactic = SplitKTactic(mma_m=64, mma_n=16, split_k=16, ab_stages=6)
+            elif (n, k) == (10240, 384):
+                tactic = SplitKTactic(mma_m=128, mma_n=32, split_k=1, ab_stages=5)
+            else:
+                raise ValueError("HC M32 tactic requires HC4/H2560/rank320")
+            validate_tactic(tactic, m, n, k)
+        elif n <= 512 and k % (128 * 16) == 0:
             tactic = SplitKTactic(mma_m=64, mma_n=8, split_k=16, ab_stages=6)
             try:
                 validate_tactic(tactic, m, n, k)
@@ -64,6 +73,8 @@ def hc_mix(
     w_up_permuted_padded: torch.Tensor,
     hc_count: int,
     hidden_size: int,
+    *,
+    wide_rows: bool = False,
 ) -> torch.Tensor:
     from sglang.kernels.ops.gemm.dense_bf16_gemm_sm100_splitk_epilogue import (
         run_splitk_dense_gate,
@@ -91,7 +102,7 @@ def hc_mix(
             w_down.T,
             t_pad[:m, :lowrank],
             True,
-            _get_tactic(m, lowrank, k),
+            _get_tactic(m, lowrank, k, wide_rows),
             inv_hc,
         )
         run_splitk_dense_gate(
@@ -100,7 +111,7 @@ def hc_mix(
             chunk,
             out[row_start:row_end],
             True,
-            _get_tactic(m, k, kpad),
+            _get_tactic(m, k, kpad, wide_rows),
             inv_hc,
             hc_count,
         )

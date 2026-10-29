@@ -276,7 +276,7 @@ void hc_combine_norm_decode_kernel_cluster2(const HcCombineNormDecodeParams __gr
   }
 }
 
-template <int kParts, bool kClusterM4Only = false>
+template <int kParts, bool kClusterM4Only = false, bool kWideRows = false>
 struct HcCombineNormDecode {
   static void
   run(tvm::ffi::TensorView block,
@@ -299,7 +299,8 @@ struct HcCombineNormDecode {
         .verify(normalized);
     TensorMatcher({10240}).with_dtype<bf16_t>().with_device(dev).verify(weight);
     TensorMatcher({m, 8, 4}).with_dtype<fp32_t>().with_device(dev).verify(partials);
-    CHECK_HOST(m.unwrap() > 0 && m.unwrap() <= 16);
+    CHECK_HOST(m.unwrap() > 0 &&
+        (m.unwrap() <= 16 || (kWideRows && (m.unwrap() == 24 || m.unwrap() == 32))));
     const HcCombineNormDecodeParams p{
         static_cast<const bf16_t*>(block.data_ptr()),
         static_cast<const bf16_t*>(residual.data_ptr()),
@@ -309,7 +310,7 @@ struct HcCombineNormDecode {
         static_cast<bf16_t*>(normalized.data_ptr()),
         eps};
     // Gate on actual tensor rows, including overlapping AgentX requests.
-    if (!kClusterM4Only || m.unwrap() == 4) {
+    if ((!kWideRows || m.unwrap() <= 16) && (!kClusterM4Only || m.unwrap() == 4)) {
       LaunchKernel(m.unwrap() * 4 * 2, 96, dev.unwrap())
           .config({.use_pdl = true, .cluster_dim = dim3{2, 1, 1}})(hc_combine_norm_decode_kernel_cluster2<false>, p);
     } else {

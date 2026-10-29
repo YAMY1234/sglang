@@ -13,17 +13,23 @@ _HC_CLUSTER_M4ONLY = envs.SGLANG_Q38C_HC_CLUSTER_M4ONLY.get()
 
 
 @cache_once
-def _jit_module(parts: int = 2):
+def _jit_module(parts: int = 2, wide_rows: bool = False):
     if parts not in (1, 2, 4):
         raise ValueError("HC combine parts must be 1, 2 or 4")
     m4only = str(_HC_CLUSTER_M4ONLY).lower()
     return load_jit(
-        f"hc_combine_decode_p{parts}_m4only{int(_HC_CLUSTER_M4ONLY)}",
+        f"hc_combine_decode_p{parts}_m4only{int(_HC_CLUSTER_M4ONLY)}"
+        + ("_wide32" if wide_rows else ""),
         cuda_files=["elementwise/hc_combine_decode.cuh"],
         cuda_wrappers=[
             ("gate", "HcCombineDecode::gate"),
             ("apply", "HcCombineDecode::apply"),
-            ("apply_norm", f"HcCombineNormDecode<{parts}, {m4only}>::run"),
+            (
+                "apply_norm",
+                f"HcCombineNormDecode<{parts}, {m4only}, true>::run"
+                if wide_rows
+                else f"HcCombineNormDecode<{parts}, {m4only}>::run",
+            ),
             ("shared_apply_norm", f"HcSharedCombineNormDecode<{parts}, {m4only}>::run"),
         ],
     )
@@ -52,10 +58,15 @@ def hc_combine_apply_norm(
     weight: torch.Tensor,
     eps: float,
     parts: int = 2,
+    wide_rows: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     combined = torch.empty_like(residual)
     normalized = torch.empty_like(residual)
-    _jit_module(parts).apply_norm(
+    if wide_rows:
+        if block.shape[0] not in (24, 32):
+            raise ValueError("wide HC combine/norm only accepts M24/M32")
+        parts = 2
+    _jit_module(parts, wide_rows).apply_norm(
         block, residual, partials, weight, combined, normalized, eps
     )
     return combined, normalized

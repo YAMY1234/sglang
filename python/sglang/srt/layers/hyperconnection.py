@@ -167,6 +167,7 @@ class GatedResidual(HyperConnectionBase):
             self._mix_up_weight_padded = None
 
         self._gate_stream = None
+        self._hc_wide_rows = envs.SGLANG_Q38C_HC_M32.get()
         # The existing BF16 combine/next-norm kernel admits at most four rows.
         # Resolve once before graph capture; the default retains the M=1 path.
         self._gate_max_rows = (
@@ -273,7 +274,10 @@ class GatedResidual(HyperConnectionBase):
         stream = self._gate_stream
         if (
             stream is not None
-            and 0 < hyper_input.shape[0] <= self._gate_max_rows
+            and (
+                0 < hyper_input.shape[0] <= self._gate_max_rows
+                or (self._hc_wide_rows and hyper_input.shape[0] in (24, 32))
+            )
             and hyper_input.dtype == torch.bfloat16
             and not torch.compiler.is_compiling()
         ):
@@ -289,7 +293,10 @@ class GatedResidual(HyperConnectionBase):
             self._jit_mix_ok
             and hyper_input_normed.is_cuda
             and hyper_input_normed.dtype in (torch.bfloat16, torch.float16)
-            and hyper_input_normed.shape[0] <= 24
+            and (
+                hyper_input_normed.shape[0] <= 24
+                or (self._hc_wide_rows and hyper_input_normed.shape[0] == 32)
+            )
         ):
             from sglang.kernels.ops.elementwise.hc_mix import (
                 hc_mix,
@@ -306,6 +313,7 @@ class GatedResidual(HyperConnectionBase):
                 self._mix_up_weight_padded,
                 self.hc_count,
                 self.hidden_size,
+                wide_rows=self._hc_wide_rows,
             ).to(self.params_dtype)
         elif fused_hc_mix_supported(
             hyper_input_normed,
@@ -362,6 +370,7 @@ class GatedResidual(HyperConnectionBase):
                 next_norm.weight,
                 next_norm.variance_epsilon,
                 parts=self._hc_combine_parts,
+                wide_rows=self._hc_wide_rows and block_output.shape[0] in (24, 32),
             )
         return self.combine(block_output, residuals), None
 
