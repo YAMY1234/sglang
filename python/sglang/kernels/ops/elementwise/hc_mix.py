@@ -2,6 +2,13 @@ from __future__ import annotations
 
 import torch
 
+from sglang.srt.environ import envs
+
+_DOWN_TRIGGER = envs.SGLANG_Q38C_HC_DOWN_TRIGGER.get()
+_UP_TRIGGER = envs.SGLANG_Q38C_HC_UP_TRIGGER.get()
+if _DOWN_TRIGGER not in (0, 1, 2) or _UP_TRIGGER not in (0, 1, 2):
+    raise ValueError("HC trigger policies must be 0, 1, or 2")
+
 _MAX_ROWS = 32
 _KPAD_ALIGN = 128
 
@@ -93,6 +100,7 @@ def hc_mix(
             True,
             _get_tactic(m, lowrank, k),
             inv_hc,
+            hc_pdl_trigger_mode=_DOWN_TRIGGER,
         )
         run_splitk_dense_gate(
             t_pad[:m],
@@ -103,5 +111,6 @@ def hc_mix(
             _get_tactic(m, k, kpad),
             inv_hc,
             hc_count,
+            hc_pdl_trigger_mode=_UP_TRIGGER,
         )
     return out

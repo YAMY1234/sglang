@@ -37,6 +37,7 @@ class GroupedGemmaRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
         self.group_size = group_size
+        self._hc_early_trigger = envs.SGLANG_Q38C_HC_PLAIN_NORM_TRIGGER.get()
         self.weight.weight_loader = self._weight_loader
         # The JIT kernel requires group_size to be a multiple of 512; this is
         # init-static, so resolve it once here (device/dtype stay per-call).
@@ -60,7 +61,11 @@ class GroupedGemmaRMSNorm(nn.Module):
             )
 
             return grouped_gemma_rmsnorm(
-                x, self.weight, self._jit_group_size, self.variance_epsilon
+                x,
+                self.weight,
+                self._jit_group_size,
+                self.variance_epsilon,
+                hc_early_trigger=self._hc_early_trigger,
             )
         input_dtype = x.dtype
         x_float = x.float()

@@ -307,6 +307,7 @@ class SplitKDenseGemmKernel:
         epilogue_mode: str = "none",
         epilogue_scale: float = 1.0,
         epilogue_group: int = 1,
+        hc_pdl_trigger_mode: int = 0,
     ) -> None:
         self.acc_dtype = cutlass.Float32
         self.cta_m = tactic.mma_m
@@ -315,6 +316,9 @@ class SplitKDenseGemmKernel:
         self.num_ab_stage = tactic.ab_stages
         self.split_k = tactic.split_k
         self.use_pdl = use_pdl
+        if hc_pdl_trigger_mode not in (0, 1, 2):
+            raise ValueError("HC trigger policy must be 0, 1, or 2")
+        self.hc_pdl_trigger_mode = hc_pdl_trigger_mode
         self.has_bias = has_bias
         self.epilogue_mode = epilogue_mode
         self.epilogue_scale = epilogue_scale
@@ -612,8 +616,35 @@ class SplitKDenseGemmKernel:
         if cutlass.const_expr(not is_a and self.use_pdl):
             cute.arch.griddepcontrol_wait()
 
+        if cutlass.const_expr(is_a and self.use_pdl and self.hc_pdl_trigger_mode == 1):
+            cute.arch.griddepcontrol_launch_dependents()
+
         empty_phase = cutlass.Int32(1)
-        for k_tile in cutlass.range(k_tile_count, unroll=1):
+        if cutlass.const_expr(is_a and self.use_pdl and self.hc_pdl_trigger_mode == 2):
+            cute.arch.mbarrier_wait(bar_empty, empty_phase)
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive_and_expect_tx(
+                    bar_full,
+                    cute.size_in_bytes(
+                        s_tile.element_type,
+                        cute.slice_(s_tile.layout, (None, None, None, 0)),
+                    ),
+                )
+            cute_ext.tma_load(
+                g_tile[None, None, k_tile_start],
+                s_tile[None, None, None, 0],
+                bar_full.value,
+                cta_v_map=cta_v_map,
+                tma_operation_type=self.tma_op,
+                update_expect_tx=False,
+            )
+            if cutlass.const_expr(stages == 1):
+                empty_phase = empty_phase ^ 1
+            cute.arch.griddepcontrol_launch_dependents()
+            first_tile = 1
+        else:
+            first_tile = 0
+        for k_tile in cutlass.range(first_tile, k_tile_count, unroll=1):
             stage = k_tile % stages
             cute.arch.mbarrier_wait(bar_empty + stage, empty_phase)
             with cute.arch.elect_one():
@@ -635,7 +666,7 @@ class SplitKDenseGemmKernel:
             if stage == stages - 1:
                 empty_phase = empty_phase ^ 1
 
-        if cutlass.const_expr(is_a and self.use_pdl):
+        if cutlass.const_expr(is_a and self.use_pdl and self.hc_pdl_trigger_mode == 0):
             cute.arch.griddepcontrol_launch_dependents()
         if cutlass.const_expr(not is_a and self.has_bias):
             cute.arch.mbarrier_arrive(bar_tma_epilog)
@@ -1061,6 +1092,7 @@ def _get_compiled_splitk_kernel(
     epilogue_mode: str = "none",
     epilogue_scale: float = 1.0,
     epilogue_group: int = 1,
+    hc_pdl_trigger_mode: int = 0,
 ):
     key = (
         dtype,
@@ -1072,6 +1104,8 @@ def _get_compiled_splitk_kernel(
         epilogue_group,
         *leading_dims,
     )
+    if hc_pdl_trigger_mode:
+        key += ("hc_trigger", hc_pdl_trigger_mode)
     cached = _SPLITK_COMPILE_CACHE.get(key)
     if cached is not None:
         return cached
@@ -1088,6 +1122,7 @@ def _get_compiled_splitk_kernel(
         epilogue_mode=epilogue_mode,
         epilogue_scale=epilogue_scale,
         epilogue_group=epilogue_group,
+        hc_pdl_trigger_mode=hc_pdl_trigger_mode,
     )
     compile_tensors = _make_compile_repr_tensors(
         dtype, has_bias, *leading_dims, epilogue_mode=epilogue_mode
@@ -1183,6 +1218,8 @@ def run_splitk_dense_silu(
     pdl: bool,
     tactic: SplitKTactic,
     scale: float,
+    *,
+    hc_pdl_trigger_mode: int = 0,
 ):
     """Run ``bf16(silu(scale * (A[M,K] @ B[K,N])))``."""
     validate_tactic(tactic, *_validate_runtime_tensors(a, b, None, out))
@@ -1195,6 +1232,7 @@ def run_splitk_dense_silu(
         leading_dims=cute_tensors[4],
         epilogue_mode="silu",
         epilogue_scale=scale,
+        hc_pdl_trigger_mode=hc_pdl_trigger_mode,
     )
     stream = _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream)
     compiled(*cute_tensors[:3], stream)
@@ -1210,6 +1248,8 @@ def run_splitk_dense_gate(
     tactic: SplitKTactic,
     scale: float,
     group: int,
+    *,
+    hc_pdl_trigger_mode: int = 0,
 ):
     """Fused ``logits = A @ B`` (B pre-permuted so ``n = j*group + g``) with
     ``out[m, j] = bf16(scale * sum_g sigmoid(logits[m, j*group+g]) *
@@ -1248,6 +1288,7 @@ def run_splitk_dense_gate(
         epilogue_mode="gate",
         epilogue_scale=scale,
         epilogue_group=group,
+        hc_pdl_trigger_mode=hc_pdl_trigger_mode,
     )
     stream = _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream)
     compiled(
