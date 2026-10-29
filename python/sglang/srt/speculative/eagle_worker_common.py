@@ -125,6 +125,7 @@ def prepare_for_draft_extend(
     widened_out_cache_loc: Optional[torch.Tensor] = None,
     widened_positions: Optional[torch.Tensor] = None,
     iteration_ids: Optional[IterationIds] = None,
+    prepared_layout: Optional[tuple] = None,
 ):
     """``iteration_ids``: the iteration's plan, whose window the draft extend
     writes again (the verify window); a widened window plans its own."""
@@ -171,13 +172,20 @@ def prepare_for_draft_extend(
     fused_lengths = gpu_only and batch.seq_lens.is_cuda
     extend_position_info = None
     if fused_lengths and not widen and draft_extend_input.positions is None:
-        batch.prefix_lens, batch.extend_lens, post_seq_lens, extend_position_info = (
-            prepare_draft_extend_layout(
-                batch.seq_lens,
-                num_draft_tokens,
-                draft_model_runner.model_config.model_is_mrope
-                and all(x is None for x in batch.multimodal_inputs),
+        with_mrope = draft_model_runner.model_config.model_is_mrope and all(
+            x is None for x in batch.multimodal_inputs
+        )
+        if (
+            prepared_layout is not None
+            and (prepared_layout[3][2] is not None) == with_mrope
+        ):
+            layout = prepared_layout
+        else:
+            layout = prepare_draft_extend_layout(
+                batch.seq_lens, num_draft_tokens, with_mrope
             )
+        batch.prefix_lens, batch.extend_lens, post_seq_lens, extend_position_info = (
+            layout
         )
     elif fused_lengths:
         batch.prefix_lens, batch.extend_lens, post_seq_lens = (

@@ -47,6 +47,14 @@ class EaglePostVerifyGraphs:
     def __init__(self, *, target_worker: Any, simulated_acc_len_rng: torch.Generator):
         self._target_worker = target_worker
         self._prepare_next_draft = prepared_next_draft.prepared_next_draft_enabled()
+        # Preparing the next draft also lets this graph produce the draft-extend
+        # layout and the bonus token in the dtype their consumers read.
+        self._extend_layout = self._prepare_next_draft
+        self._extend_mrope = (
+            self._extend_layout
+            and target_worker.model_runner.model_config.model_is_mrope
+        )
+        self._bonus_dtype = torch.int64 if self._prepare_next_draft else torch.int32
         self._graphs = _PostVerifyGraphs(
             body=self._body,
             commit=self._commit,
@@ -235,6 +243,9 @@ class EaglePostVerifyGraphs:
                 slot.staged["seq_lens"],
                 num_draft_tokens=slot.tokens_per_request,
                 mamba_track_interval=slot.track_interval,
+                extend_layout=self._extend_layout,
+                extend_mrope=self._extend_mrope,
+                bonus_dtype=self._bonus_dtype,
             )
         )
         if slot.prepared_next_draft is not None:

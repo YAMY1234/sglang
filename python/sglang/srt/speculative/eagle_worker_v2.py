@@ -1158,10 +1158,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.megakernel.note_draft_extend()
         # Cast to int64 before entering plan stream to avoid cross-stream
         # synchronization issues with .to() inside the plan stream context.
+        prepared_layout = None
         if batch_result.prepared_draft_extend_inputs is not None:
             num_correct_drafts, select_index, next_token_ids = (
                 batch_result.prepared_draft_extend_inputs[:3]
             )
+            if len(batch_result.prepared_draft_extend_inputs) > 3:
+                prepared_layout = batch_result.prepared_draft_extend_inputs[3]
         elif batch_result.accept_lens.is_cuda:
             from sglang.kernels.ops.speculative.eagle import prepare_draft_extend_inputs
 
@@ -1213,6 +1216,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.cuda_graph_runner_for_draft_extend,
                 return_hidden_states_before_norm=False,
                 iteration_ids=iteration_ids,
+                prepared_layout=prepared_layout,
             )
 
         if self.plan_stream:
