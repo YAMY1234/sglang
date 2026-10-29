@@ -65,9 +65,20 @@ def get_alloc_reserve_per_decode() -> int:
     """KV length reserved per request at each decode step.
 
     The 2x is a double-buffer that absorbs the kv_committed_len lag in overlap
-    mode; see eagle_utils.eagle_prepare_for_decode.
+    mode; see eagle_utils.eagle_prepare_for_decode. Preparing the subsequent
+    NVIDIA EAGLE round reserves a third window.
     """
-    return 2 * get_alloc_len_per_decode()
+    from sglang.srt.environ import envs
+    from sglang.srt.speculative.prepared_next_draft import (
+        prepared_next_draft_enabled,
+    )
+
+    prepares_next_round = (
+        envs.SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.get()
+        and prepared_next_draft_enabled()
+    )
+    windows = 3 if prepares_next_round else 2
+    return windows * get_alloc_len_per_decode()
 
 
 def page_aligned_decode_alloc_lens(
