@@ -129,6 +129,7 @@ from sglang.srt.speculative.spec_utils import (
     select_top_k_tokens,
     spec_stage_span,
 )
+from sglang.srt.utils import speculative_decode_resources as spec_decode_resources
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -168,6 +169,18 @@ def _select_spec_graph_runner_cls(
     if not current_platform.capabilities.graph_capture:
         return None
     return oot_runner_cls()
+
+
+def _flashmla_graph_backend_type(draft_extend_attn_backend) -> type | None:
+    if (
+        getattr(draft_extend_attn_backend, "prefill_attention_backend_str", None)
+        != "flashmla"
+    ):
+        return None
+
+    from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
+
+    return FlashMLABackend
 
 
 def _qsa_index_share_requested(hf_config) -> bool:
@@ -615,11 +628,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
 
             graph_supported_backend_types.append(FlashAttentionBackend)
-            # FlashMLA is CUDA-only; import lazily so CPU builds don't pull
-            # FlashMLA at import time.
-            from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
-
-            graph_supported_backend_types.append(FlashMLABackend)
+            flashmla_backend_type = _flashmla_graph_backend_type(
+                self.draft_extend_attn_backend
+            )
+            if flashmla_backend_type is not None:
+                graph_supported_backend_types.append(flashmla_backend_type)
 
         graph_supported_backend = isinstance(
             self.draft_extend_attn_backend,
@@ -1205,8 +1218,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         # Prepare for draft extend in a separate stream
         if self.plan_stream:
-            self.plan_stream.wait_stream(
-                torch.get_device_module(self.device).current_stream()
+            spec_decode_resources.wait_stream(
+                self.plan_stream, torch.get_device_module(self.device).current_stream()
             )
         with self.plan_stream_ctx:
             forward_batch = prepare_for_draft_extend(
@@ -1222,8 +1235,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
 
         if self.plan_stream:
-            torch.get_device_module(self.device).current_stream().wait_stream(
-                self.plan_stream
+            spec_decode_resources.wait_stream(
+                torch.get_device_module(self.device).current_stream(),
+                self.plan_stream,
             )
 
         # Run draft extend batch in the main compute stream
@@ -1479,7 +1493,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if draft_runner is None:
             return
         if (
-            self._draft_worker.draft_runner.kv_index_translator.is_translating
+            self._draft_worker.draft_runner.runner_ids.is_translating
             or draft_runner.require_mlp_tp_gather
         ):
             return
