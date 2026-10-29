@@ -108,6 +108,8 @@ from sglang.srt.speculative.eagle_utils import (
     per_step_draft_out_cache_loc,
 )
 from sglang.srt.speculative.eagle_worker_common import (
+    STOCK_SPECULATIVE_RUNTIME_HOOKS,
+    bind_eagle_runtime_hooks,
     build_eagle_verify_input,
     prepare_for_draft,
     prepare_for_draft_extend,
@@ -1158,10 +1160,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.megakernel.note_draft_extend()
         # Cast to int64 before entering plan stream to avoid cross-stream
         # synchronization issues with .to() inside the plan stream context.
+        prepared_layout = None
         if batch_result.prepared_draft_extend_inputs is not None:
             num_correct_drafts, select_index, next_token_ids = (
                 batch_result.prepared_draft_extend_inputs[:3]
             )
+            if len(batch_result.prepared_draft_extend_inputs) > 3:
+                prepared_layout = batch_result.prepared_draft_extend_inputs[3]
         elif batch_result.accept_lens.is_cuda:
             from sglang.kernels.ops.speculative.eagle import prepare_draft_extend_inputs
 
@@ -1213,6 +1218,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.cuda_graph_runner_for_draft_extend,
                 return_hidden_states_before_norm=False,
                 iteration_ids=iteration_ids,
+                prepared_layout=prepared_layout,
             )
 
         if self.plan_stream:
@@ -1354,6 +1360,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
     _post_verify_graphs: Optional[EaglePostVerifyGraphs] = None
     _simulated_acc_len_rng: Optional[torch.Generator] = None
     _next_draft_stager: Optional[NextDraftInputStager] = None
+    _speculative_runtime_hooks = STOCK_SPECULATIVE_RUNTIME_HOOKS
 
     @property
     def draft_parallel_layout(self):
@@ -1446,6 +1453,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
     def init_attention_backends(self):
         super().init_attention_backends()
+        # Resolve once before any eager or captured post-verify path runs.
+        self._speculative_runtime_hooks = bind_eagle_runtime_hooks(
+            self.target_worker, supports_sharded_verify=True
+        )
         # not in __init__, which the standalone and frozen-KV workers do not run
         if (
             self._draft_worker is not None
@@ -1510,6 +1521,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self._post_verify_graphs = EaglePostVerifyGraphs(
             target_worker=self.target_worker,
             simulated_acc_len_rng=self._simulated_acc_len_rng,
+            speculative_runtime_hooks=self._speculative_runtime_hooks,
         )
 
     def init_cuda_graphs(self):
@@ -2142,6 +2154,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         max_top_k = compact_verify_max_top_k(batch)
         return run_eagle_verify(
             batch,
+            speculative_runtime_hooks=self._speculative_runtime_hooks,
             pp_proxy_tensors=pp_proxy_tensors,
             target_worker=self.target_worker,
             req_to_token_pool=self.req_to_token_pool,
