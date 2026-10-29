@@ -21,7 +21,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _fakes import ARCH, ISA, server_args  # noqa: E402
+from _fakes import ARCH, ISA, server_args
 
 register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
 
@@ -64,6 +64,7 @@ class TestMegakernelGuards(CustomTestCase):
             with (
                 envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(False),
                 patch.object(binding, "megakernel_enabled", return_value=True),
+                envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override("unrelated_slot"),
             ):
                 self.assertFalse(
                     gdn_replayssm_spec_decode._try_runtime_cuda_commit(probe=True)
@@ -74,6 +75,7 @@ class TestMegakernelGuards(CustomTestCase):
             with (
                 envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
                 patch.object(binding, "megakernel_enabled", return_value=False),
+                envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override(""),
             ):
                 self.assertTrue(
                     gdn_replayssm_spec_decode._try_runtime_cuda_commit(probe=True)

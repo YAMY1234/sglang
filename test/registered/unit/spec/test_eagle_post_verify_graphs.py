@@ -213,6 +213,11 @@ class TestPostVerifyGraphs(CustomTestCase):
         class _EagerSample(Exception):
             pass
 
+        class _EagerHooks:
+            @property
+            def post_verify(self):
+                raise _EagerSample
+
         for clears_c128 in (False, True):
             kvcache = (
                 object.__new__(DeepSeekV4TokenToKVPool)
@@ -248,13 +253,11 @@ class TestPostVerifyGraphs(CustomTestCase):
                     "eagle_prepare_for_verify",
                     return_value=(SimpleNamespace(), True),
                 ),
-                patch.object(
-                    eagle_worker_common, "eagle_sample", side_effect=_EagerSample
-                ),
                 self.assertRaises(_EagerSample),
             ):
                 eagle_worker_common.run_eagle_verify(
                     batch,
+                    speculative_runtime_hooks=_EagerHooks(),
                     target_worker=target_worker,
                     req_to_token_pool=None,
                     token_to_kv_pool_allocator=SimpleNamespace(
@@ -504,13 +507,15 @@ class TestPostVerifyGraphs(CustomTestCase):
 
 
 def _prepared_length_graphs(device):
-    """A graph body that advances lengths while preserving its last slot."""
+    """_PostVerifyGraphs whose body only moves the lengths (+3), and on a CPU host a capture
+    that keeps the first outputs and rewrites them in place on each replay."""
 
     def body(slot):
         new_seq_lens = slot.staged["seq_lens"] + 3
         return (None, None, None, new_seq_lens, None, None, None)
 
     def commit(slot, outputs):
+        # the side-stream graph needs some work of its own to capture
         slot.commit_ct.add_(1)
 
     graphs = eagle_post_verify_graphs._PostVerifyGraphs(
@@ -555,18 +560,21 @@ def _check_prepared_lengths(test, graphs, *, device):
 
     with patch.object(spec_utils, "SIMULATE_ACC_LEN", -1.0):
         lengths = torch.tensor([100, 200], device=device)
+        # eager warm-ups, then each slot's capture: every round takes the last one's lengths
         for _ in range(2 * eagle_post_verify_graphs._NUM_WARMUP + 2):
             lengths = run(lengths)[3]
         round_n = run(lengths)[3]
         want_n = round_n.clone()
         round_n1 = run(round_n)[3]
-        test.assertTrue(torch.equal(round_n, want_n))
+        test.assertTrue(
+            torch.equal(round_n, want_n), "round N's lengths changed in N+1"
+        )
         test.assertNotEqual(round_n1.data_ptr(), round_n.data_ptr())
         round_n2 = run(round_n1)[3]
         test.assertEqual(round_n2.data_ptr(), round_n.data_ptr())
         test.assertTrue(torch.equal(round_n2, want_n + 6))
         with test.assertRaisesRegex(RuntimeError, "holds this batch's lengths"):
-            run(round_n1)
+            run(round_n1)  # round N+1's slot is next: a batch still on its lengths
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
@@ -731,7 +739,10 @@ class TestFusedAcceptMatchesUnfused(CustomTestCase):
             predict, accept_lens, accept_index = eagle_sample(
                 verify_input,
                 batch,
-                SimpleNamespace(next_token_logits=logits.clone()),
+                SimpleNamespace(
+                    next_token_logits=logits.clone(),
+                    next_token_logits_vocab_shard=None,
+                ),
                 uno_target_max_top_k=max_top_k,
                 simulated_acc_len=sim_len,
                 sparse_bonus_argmax=max_top_k is not None,

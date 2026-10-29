@@ -100,6 +100,26 @@ class TestShardedReducerContract(CustomTestCase):
                 torch.zeros(2, dtype=torch.int64), group, splits=2
             )
 
+    def test_target_uses_rank_uniform_padded_width_for_splits(self):
+        """The last vocab rank's shorter valid tail cannot change collective shape."""
+        logits = torch.empty((3, 4104))
+        shard = VocabShard(start=7 * 4104, valid=4041, vocab_size=32769)
+        expected_splits = key_splits(logits.shape[-1])
+        self.assertNotEqual(expected_splits, key_splits(shard.valid))
+        keys = torch.empty((3, expected_splits), dtype=torch.int64)
+        tokens = torch.empty(3, dtype=torch.int64)
+        group = SimpleNamespace(world_size=8)
+        with (
+            patch.object(sharded_verify, "shard_keys", return_value=keys) as encode,
+            patch.object(
+                sharded_verify, "reduce_sharded_token_keys", return_value=tokens
+            ) as reduce,
+        ):
+            got = sharded_target_tokens(logits, shard, group)
+        self.assertIs(got, tokens)
+        encode.assert_called_once_with(logits, shard, expected_splits)
+        reduce.assert_called_once_with(keys, group, splits=expected_splits)
+
 
 def _sharded_tokens(full, tp, split=False):
     width = -(-full.shape[1] // tp)

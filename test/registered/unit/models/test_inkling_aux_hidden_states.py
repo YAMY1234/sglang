@@ -7,14 +7,15 @@ from unittest.mock import patch
 
 import pytest
 import torch
-
 from sglang.srt.arg_groups.layernorm_sp_hook import validate_layernorm_sp
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import (
     LogitsMetadata,
     LogitsProcessor,
     LogitsProcessorOutput,
 )
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import published_topology
 
@@ -166,6 +167,55 @@ def test_sharded_verify_preserves_stock_hidden_state_outputs():
     torch.testing.assert_close(sharded.hidden_states, stock.hidden_states)
     torch.testing.assert_close(sharded.last_hidden_states, stock.last_hidden_states)
     assert sharded.mm_input_embeds is stock.mm_input_embeds
+
+
+def test_unbound_verify_keeps_full_vocab_with_master_on():
+    parallel = SimpleNamespace(
+        enable_dp_lm_head=False,
+        enable_tp_lm_head_all_to_all=False,
+        tp_size=2,
+        attn_dp_size=1,
+        tp_group=SimpleNamespace(cpu_group=None),
+    )
+    metadata = LogitsMetadata(
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        capture_hidden_mode=CaptureHiddenMode.NULL,
+    )
+    full_logits = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    with (
+        envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+        # DSpark and out-of-tree consumers never opt in to shard outputs. UNO's
+        # explicit ``supports_sharded_verify=False`` binding has its own test.
+        published_topology(),
+        # MultimemAllGatherer resolves TP independently of the module-local
+        # topology fake; this CPU test never invokes the gather.
+        get_parallel().override(tp_group=SimpleNamespace(world_size=1, cpu_group=None)),
+        patch(
+            "sglang.srt.layers.logits_processor.get_parallel",
+            return_value=parallel,
+        ),
+    ):
+        processor = LogitsProcessor(SimpleNamespace(vocab_size=3))
+        assert processor._sharded_verify_eligible
+        assert not processor.sharded_verify
+        assert processor._verify_vocab_shard(None, metadata) is None
+        with (
+            patch.object(processor, "_get_logits", return_value=full_logits),
+            patch.object(
+                processor,
+                "_get_shard_logits",
+                side_effect=AssertionError("unbound consumer received a shard"),
+            ),
+        ):
+            output = processor(
+                torch.zeros(2, dtype=torch.long),
+                torch.ones((2, 4)),
+                None,
+                metadata,
+            )
+
+    assert output.next_token_logits_vocab_shard is None
+    torch.testing.assert_close(output.next_token_logits, full_logits)
 
 
 def test_inkling_rejects_sequence_sharded_layernorm():

@@ -12,20 +12,16 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-import msgspec
 import torch
 import triton
 import triton.language as tl
+from sglang.kernels.plugin_kernels.nvidia.spec import VocabShardView
 
 logger = logging.getLogger(__name__)
 
 
-class VocabShard(msgspec.Struct, frozen=True):
-    """Columns [0, valid) of this rank's logits are global token ids start + j."""
-
-    start: int
-    valid: int
-    vocab_size: int
+# Backward-compatible import name; the ABI has one vocabulary-shard view type.
+VocabShard = VocabShardView
 
 
 # key of (-inf, token id 0xFFFFFFFF): below every real column's key
@@ -82,10 +78,16 @@ def shard_keys(
     logits: torch.Tensor,
     shard: VocabShard,
     splits: int = 1,
+    *,
+    temperatures: Optional[torch.Tensor] = None,
+    seeds: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """One int64 key per row of this rank's shard: (order-preserving FP32 bits of the
     row's best value) << 32 | (0xFFFFFFFF - token id). ``splits > 1`` returns
-    ``[rows, splits]``, the best key from each column range."""
+    ``[rows, splits]``, the best key from each column range. Greedy ignores existing
+    per-request seed material; numeric temperature policies use the local-key seam."""
+    if temperatures is not None:
+        raise ValueError("runtime shard_keys is greedy-only")
     assert logits.stride(-1) == 1
     rows = logits.shape[0]
     keys = torch.empty(
@@ -399,7 +401,11 @@ def sharded_target_tokens(
     tp_group,
 ) -> torch.Tensor:
     """[rows] token ids over the whole vocabulary from every rank's logits shard."""
-    splits = key_splits(shard.valid)
+    # The final TP rank may have fewer valid vocabulary columns than its padded
+    # local LM-head output.  Every rank must nevertheless enter the collective
+    # with the same key shape, so derive the split count from the rank-uniform
+    # padded local width; ``shard.valid`` still masks the kernel's tail.
+    splits = key_splits(logits.shape[-1])
     keys = shard_keys(logits, shard, splits)
     return reduce_sharded_token_keys(keys, tp_group, splits=splits)
 
@@ -427,7 +433,7 @@ def reduce_sharded_token_keys(
         raise ValueError("keys must be contiguous")
     if splits == 1 and keys.ndim != 1:
         raise ValueError(
-            f"one split requires keys shape [rows], got {tuple(keys.shape)}"
+            f"one split: keys shape {tuple(keys.shape)} is incompatible with splits=1"
         )
     if splits > 1 and (keys.ndim != 2 or keys.shape[1] != splits):
         raise ValueError(

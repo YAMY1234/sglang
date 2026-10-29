@@ -497,7 +497,7 @@ class LogitsProcessor(nn.Module):
         # Set before graph capture by a speculative worker that finishes the TP
         # gather itself (see finish_deferred_gather / deferred_argmax).
         self.defer_verify_gather = False
-        self.sharded_verify = (
+        self._sharded_verify_eligible = (
             _runtime_optimized_vocab_shards_enabled()
             and self.do_tensor_parallel_all_gather
             and not self.use_attn_tp_group
@@ -505,6 +505,11 @@ class LogitsProcessor(nn.Module):
             and not self.use_tp_lm_head_all_to_all
             and not return_full_logits
         )
+        # A speculative worker must explicitly opt in after establishing that
+        # its verify consumer understands ``next_token_logits_vocab_shard``.
+        # UNO, DSpark, and out-of-tree consumers otherwise retain the stock
+        # full-vocabulary gather even when the runtime master switch is on.
+        self.sharded_verify = False
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
         )
@@ -550,6 +555,10 @@ class LogitsProcessor(nn.Module):
         self.input_logprob_processor = InputLogprobProcessor(
             self.vocab_size, chunking_group=chunking_group
         )
+
+    def enable_sharded_verify(self) -> None:
+        """Opt in a verify consumer that understands vocab-shard outputs."""
+        self.sharded_verify = self._sharded_verify_eligible
 
     def forward(
         self,

@@ -22,7 +22,6 @@ from typing import TYPE_CHECKING, Any, Callable, Collection, Mapping, Optional
 import msgspec
 import torch
 import torch.distributed as dist
-
 from sglang.kernels.plugin_kernels.nvidia.spec import (
     ENTRIES,
     ENTRY_POINT,
@@ -32,6 +31,8 @@ from sglang.kernels.plugin_kernels.nvidia.spec import (
     BuiltMegakernel,
     Feature,
     MegakernelSpec,
+    PostVerifyStrategy,
+    SpeculativeRuntimeHooks,
     Step,
     find_spec,
     registered_architectures,
@@ -51,13 +52,12 @@ from sglang.srt.runtime_context import (
 )
 
 if TYPE_CHECKING:
-    from transformers import PretrainedConfig
-
     from sglang.srt.layers.attention.graph_variants import AttentionGraphVariants
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
         DecodeCudaGraphRunner,
     )
+    from transformers import PretrainedConfig
 
 logger = logging.getLogger(__name__)
 
@@ -496,6 +496,45 @@ def install_megakernel(
 def built_megakernel(model: torch.nn.Module) -> Optional[BuiltMegakernel]:
     """The object the spec built for this model, or None."""
     return model.__dict__.get("_megakernel")
+
+
+def bind_speculative_runtime_hooks(
+    model: torch.nn.Module,
+    defaults: SpeculativeRuntimeHooks,
+) -> SpeculativeRuntimeHooks:
+    """Resolve target-side speculative strategies once at the binding boundary.
+
+    The caller's stock strategies are returned by identity when the runtime master
+    switch is off or the built provider has no factory. Provider presence must agree
+    across ranks before any rank can call it. The provider may change the local key
+    builder, but the runtime-owned verification runner cannot be replaced.
+    """
+    if not envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
+        return defaults
+
+    built = built_megakernel(model)
+    factory = (
+        None if built is None else getattr(built, "speculative_runtime_hooks", None)
+    )
+    megakernel_agree(
+        factory is not None,
+        what="speculative runtime hooks factory presence",
+    )
+    if factory is None:
+        return defaults
+
+    hooks = factory(defaults)
+    if not isinstance(hooks, SpeculativeRuntimeHooks):
+        raise TypeError(
+            "speculative runtime hooks factory must return SpeculativeRuntimeHooks"
+        )
+    if not isinstance(hooks.post_verify, PostVerifyStrategy):
+        raise TypeError("post_verify must be a PostVerifyStrategy")
+    if hooks.post_verify.run is not defaults.post_verify.run:
+        raise ValueError("a provider cannot replace the runtime post-verify runner")
+    if not callable(hooks.post_verify.local_keys):
+        raise TypeError("post_verify.local_keys must be callable")
+    return hooks
 
 
 def megakernel_agree(value: Any, *, what: str, group: Any = None) -> None:
