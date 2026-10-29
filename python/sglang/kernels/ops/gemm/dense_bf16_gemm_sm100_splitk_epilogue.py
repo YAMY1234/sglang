@@ -316,8 +316,8 @@ class SplitKDenseGemmKernel:
         self.num_ab_stage = tactic.ab_stages
         self.split_k = tactic.split_k
         self.use_pdl = use_pdl
-        if hc_pdl_trigger_mode not in (0, 1, 2):
-            raise ValueError("HC trigger policy must be 0, 1, or 2")
+        if hc_pdl_trigger_mode not in (0, 1, 2, 3):
+            raise ValueError("HC trigger policy must be 0, 1, 2, or 3")
         self.hc_pdl_trigger_mode = hc_pdl_trigger_mode
         self.has_bias = has_bias
         self.epilogue_mode = epilogue_mode
@@ -615,6 +615,9 @@ class SplitKDenseGemmKernel:
         stages = self.num_ab_stage
         if cutlass.const_expr(not is_a and self.use_pdl):
             cute.arch.griddepcontrol_wait()
+            if cutlass.const_expr(self.hc_pdl_trigger_mode == 3):
+                # Bound lookahead to a grid whose own dependency has completed.
+                cute.arch.griddepcontrol_launch_dependents()
 
         if cutlass.const_expr(is_a and self.use_pdl and self.hc_pdl_trigger_mode == 1):
             cute.arch.griddepcontrol_launch_dependents()

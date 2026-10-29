@@ -18,7 +18,7 @@ namespace sglang {
  * \tparam kUsePDL    Whether to emit the PDL wait/trigger pair.
  * \tparam Float      Element type: bf16_t | fp16_t.
  */
-template <int64_t kGroupSize, bool kUsePDL, typename Float>
+template <int64_t kGroupSize, bool kUsePDL, typename Float, int kTriggerPolicy = 1>
 __global__ __launch_bounds__(kGroupSize / 16) void hc_grouped_gemma_rmsnorm_entry_kernel(
     const GroupedGemmaRMSNormParams __grid_constant__ params) {
   using namespace device;
@@ -43,12 +43,18 @@ __global__ __launch_bounds__(kGroupSize / 16) void hc_grouped_gemma_rmsnorm_entr
   // so this must hold kWarpThreads entries, not kNumWarps.
   __shared__ float smem[kWarpThreads];
 
-  PDLTriggerSecondary<kUsePDL>();
+  const auto weight_ptr = pointer::offset<Float>(params.weight, static_cast<int64_t>(group) * kGroupSize);
+  if constexpr (kTriggerPolicy == 3) {
+    // Only immutable gamma is prefetched. Dynamic input remains below wait.
+    const auto prefetch_ptr = weight_ptr + static_cast<int64_t>(threadIdx.x) * 16;
+    asm volatile("prefetch.global.L2 [%0];" : : "l"(prefetch_ptr) : "memory");
+  }
+  if constexpr (kTriggerPolicy == 1) PDLTriggerSecondary<kUsePDL>();
   PDLWaitPrimary<kUsePDL>();
+  if constexpr (kTriggerPolicy >= 2) PDLTriggerSecondary<kUsePDL>();
 
   const auto input_ptr = pointer::offset<Float>(params.input, static_cast<int64_t>(bid) * kGroupSize);
   const auto output_ptr = pointer::offset<Float>(params.output, static_cast<int64_t>(bid) * kGroupSize);
-  const auto weight_ptr = pointer::offset<Float>(params.weight, static_cast<int64_t>(group) * kGroupSize);
 
   Storage input_vec[kNumLoads];
   Storage weight_vec[kNumLoads];
@@ -100,11 +106,11 @@ __global__ __launch_bounds__(kGroupSize / 16) void hc_grouped_gemma_rmsnorm_entr
 
 }
 
-template <int64_t kGroupSize, bool kUsePDL, typename DType>
+template <int64_t kGroupSize, bool kUsePDL, typename DType, int kTriggerPolicy = 1>
 struct HcGroupedGemmaRMSNormEntryKernel {
   static_assert(sizeof(DType) == 2, "GroupedGemmaRMSNorm only supports 2-byte dtypes");
   static_assert(kGroupSize % 512 == 0, "kGroupSize must be a multiple of 512");
-  static constexpr auto kernel = hc_grouped_gemma_rmsnorm_entry_kernel<kGroupSize, kUsePDL, DType>;
+  static constexpr auto kernel = hc_grouped_gemma_rmsnorm_entry_kernel<kGroupSize, kUsePDL, DType, kTriggerPolicy>;
   static constexpr auto kBlockSize = static_cast<uint32_t>(kGroupSize / 16);
 
   /**

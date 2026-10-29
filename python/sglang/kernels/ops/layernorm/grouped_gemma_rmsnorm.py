@@ -38,11 +38,13 @@ def _jit_grouped_gemma_rmsnorm_module(group_size: int, dtype: torch.dtype) -> Mo
 
 
 @cache_once
-def _jit_hc_entry_rmsnorm_module(group_size: int, dtype: torch.dtype) -> Module:
+def _jit_hc_entry_rmsnorm_module(group_size: int, dtype: torch.dtype, policy: int) -> Module:
     # Reuse the parent validation, but keep the HC policy out of the PLE caller.
     if dtype not in (torch.bfloat16, torch.float16) or group_size <= 0 or group_size % 512:
         raise RuntimeError("Unsupported HC grouped norm shape or dtype")
-    args = make_cpp_args(group_size, is_arch_support_pdl(), dtype)
+    if policy not in (1, 2, 3):
+        raise ValueError("HC norm policy must be 1, 2, or 3")
+    args = make_cpp_args(group_size, is_arch_support_pdl(), dtype, policy)
     return load_jit(
         "hc_grouped_gemma_rmsnorm_entry",
         *args,
@@ -60,7 +62,7 @@ def grouped_gemma_rmsnorm(
     eps: float = 1e-6,
     out: Optional[torch.Tensor] = None,
     *,
-    hc_early_trigger: bool = False,
+    hc_trigger_policy: int = 0,
 ) -> torch.Tensor:
     """
     Grouped Gemma-style RMSNorm: out = x * rsqrt(mean(x^2) + eps) * (1 + weight).
@@ -90,8 +92,8 @@ def grouped_gemma_rmsnorm(
     else:
         out = out.reshape(-1, hidden_size)
 
-    if hc_early_trigger:
-        module = _jit_hc_entry_rmsnorm_module(group_size, input.dtype)
+    if hc_trigger_policy:
+        module = _jit_hc_entry_rmsnorm_module(group_size, input.dtype, hc_trigger_policy)
     else:
         module = _jit_grouped_gemma_rmsnorm_module(group_size, input.dtype)
     module.grouped_gemma_rmsnorm(x, weight, out, eps)

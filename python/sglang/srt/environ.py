@@ -324,10 +324,10 @@ class Envs:
     # Opt-in HC gate overlap and combine/next-norm for two to four decode rows.
     SGLANG_Q38_HC_SMALLM4 = EnvBool(False)
     SGLANG_Q38_HC_SMALLM16 = EnvBool(False)
-    # HC-only compile-time PDL scheduling: 0=parent, 1=entry, 2=first weight TMA.
+    # HC-only compile-time PDL: 0=parent, 1/2=controls, 3=after own wait.
     SGLANG_Q38C_HC_DOWN_TRIGGER = EnvInt(0)
     SGLANG_Q38C_HC_UP_TRIGGER = EnvInt(0)
-    SGLANG_Q38C_HC_PLAIN_NORM_TRIGGER = EnvBool(False)
+    SGLANG_Q38C_HC_PLAIN_NORM_TRIGGER = EnvInt(0)
     SGLANG_Q38_HC_COMBINE_PARTS = EnvInt(2)
     # Keep the frozen cluster path by default; opt in to native rows except M4.
     SGLANG_Q38C_HC_CLUSTER_M4ONLY = EnvBool(False)

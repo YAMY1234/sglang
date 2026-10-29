@@ -6,8 +6,8 @@ from sglang.srt.environ import envs
 
 _DOWN_TRIGGER = envs.SGLANG_Q38C_HC_DOWN_TRIGGER.get()
 _UP_TRIGGER = envs.SGLANG_Q38C_HC_UP_TRIGGER.get()
-if _DOWN_TRIGGER not in (0, 1, 2) or _UP_TRIGGER not in (0, 1, 2):
-    raise ValueError("HC trigger policies must be 0, 1, or 2")
+if _DOWN_TRIGGER not in (0, 1, 2, 3) or _UP_TRIGGER not in (0, 1, 2, 3):
+    raise ValueError("HC trigger policies must be 0, 1, 2, or 3")
 
 _MAX_ROWS = 32
 _KPAD_ALIGN = 128
