@@ -240,6 +240,47 @@ def test_finalize_handoff_is_a_producer_capability(eligible):
         assert fusion.can_defer_finalize(comm, _DECODE)
 
 
+@pytest.mark.parametrize(
+    ("master", "explicit_child", "ep_size", "expected"),
+    [
+        (False, None, 4, False),
+        (True, None, 4, True),
+        (True, False, 4, False),
+        (False, True, 4, True),
+        (False, None, 1, True),
+    ],
+)
+def test_ep_finalize_inherits_runtime_master_with_explicit_override(
+    eligible, master, explicit_child, ep_size, expected
+):
+    fusion = CuteDSLFusion()
+    child = envs.SGLANG_TRTL3_EP_DEFER_FINALIZE
+    with (
+        envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(master),
+        patch(
+            f"{_MODULE}.get_parallel",
+            return_value=SimpleNamespace(moe_ep_size=ep_size),
+        ),
+    ):
+        if explicit_child is None:
+            actual = fusion._finalize_eligible(object(), _DECODE, 8)
+        else:
+            with child.override(explicit_child):
+                actual = fusion._finalize_eligible(object(), _DECODE, 8)
+
+    assert actual is expected
+
+
+def test_ep_finalize_switch_does_not_bypass_runtime_capability_gate():
+    fusion = CuteDSLFusion()
+    with (
+        envs.SGLANG_TRTL3_EP_DEFER_FINALIZE.override(True),
+        patch.object(CuteDSLFusion, "_eligible", return_value=False),
+        patch(f"{_MODULE}.get_parallel", return_value=SimpleNamespace(moe_ep_size=4)),
+    ):
+        assert not fusion._finalize_eligible(object(), _DECODE, 8)
+
+
 def test_install_does_not_require_a_fused_successor():
     reset_context()
     publish(ServerArgs(model_path="dummy"), role="test")
