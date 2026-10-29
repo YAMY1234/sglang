@@ -13,7 +13,6 @@ from unittest.mock import MagicMock, call, patch
 import msgspec
 import torch
 from sglang.srt.environ import envs
-
 from sglang.srt.kernel_plugins.nvidia import binding as runtime
 from sglang.srt.kernel_plugins.nvidia import eagle_binding as eb
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
@@ -21,6 +20,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 )
 from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
+from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.managers import overlap_utils
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -32,7 +32,12 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative import eagle_megakernel, eagle_worker_v2
+from sglang.srt.speculative import (
+    eagle_megakernel,
+    eagle_worker_common,
+    eagle_worker_v2,
+    uno_worker_v2,
+)
 from sglang.srt.speculative.eagle_megakernel import EagleMegakernel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -406,6 +411,28 @@ class TestEagleBinding(CustomTestCase):
 
 
 class TestEagleEntries(CustomTestCase):
+    def test_always_present_dispatch_preserves_the_stock_path(self):
+        stock_result = object()
+        with patch.object(eagle_megakernel, "init_eagle_megakernel", return_value=None):
+            dispatch = eagle_megakernel.init_eagle_draft_runtime(draft_worker=object())
+        self.assertIs(dispatch, eagle_megakernel.STOCK_EAGLE_DRAFT_RUNTIME)
+        self.assertIs(
+            dispatch.run_draft_loop(
+                runner=object(),
+                forward_batch=object(),
+                stock=lambda: stock_result,
+            ),
+            stock_result,
+        )
+        self.assertIs(
+            _megakernel().run_draft_loop(
+                runner=object(),
+                forward_batch=SimpleNamespace(batch_size=1),
+                stock=lambda: stock_result,
+            ),
+            stock_result,
+        )
+
     def test_without_the_flag_or_an_offered_entry_sglang_keeps_its_own_path(self):
         self.assertIsNone(_init())
         self.assertIsNone(_init(draft={"draft_loop": print}, enabled=False))
@@ -486,7 +513,7 @@ class TestEagleEntries(CustomTestCase):
                 call.init_eagle_megakernel(draft_worker=worker),
             ],
         )
-        self.assertIs(worker.megakernel, order.init_eagle_megakernel.return_value)
+        self.assertIs(worker.draft_runtime, order.init_eagle_megakernel.return_value)
 
     def test_each_factory_runs_once_and_serves_only_what_every_rank_serves(self):
         """A rank on SGLang's code at a batch size would wait in collectives the
@@ -551,7 +578,11 @@ class TestEagleEntries(CustomTestCase):
         def served_extend(*rids):
             mk.note_draft_extend()
             extend_runner.bs = extend_runner.raw_bs = len(rids)
-            return mk.extend_tokens(runner=extend_runner, batch=_batch(*rids))
+            return mk.extend_tokens(
+                runner=extend_runner,
+                batch=_batch(*rids),
+                stock=lambda: (None, None, None),
+            )
 
         def begin(*rids):
             mk.begin_draft_round(
@@ -560,7 +591,7 @@ class TestEagleEntries(CustomTestCase):
             return rounds[-1].from_served_extend
 
         outs["topk_index"][0] = 5  # what the extend's replay wrote
-        _, topk_index = served_extend("a")
+        _, _, topk_index = served_extend("a")
         self.assertEqual(topk_index.data_ptr(), outs["topk_index"].data_ptr())
         self.assertEqual(topk_index.tolist(), [[5]])
         draft_input.topk_index = topk_index
@@ -577,7 +608,69 @@ class TestEagleEntries(CustomTestCase):
         calls = len(rounds)
         begin("a", "b")
         self.assertEqual(len(rounds), calls)  # batch size 2 is not served
-        self.assertIsNone(served_extend("a", "b"))  # SGLang's top-1 there
+        self.assertEqual(
+            served_extend("a", "b"), (None, None, None)
+        )  # SGLang's stock sampler there
+
+
+class TestShardedVerifyConsumerBinding(CustomTestCase):
+    def test_eagle_binding_explicitly_opts_in_the_logits_consumer(self):
+        for supports_sharded_verify in (False, True):
+            for eligible in (False, True):
+                with self.subTest(
+                    supports_sharded_verify=supports_sharded_verify,
+                    eligible=eligible,
+                ):
+                    self._assert_consumer_binding(
+                        supports_sharded_verify=supports_sharded_verify,
+                        eligible=eligible,
+                    )
+
+    def _assert_consumer_binding(self, *, supports_sharded_verify, eligible):
+        processor = LogitsProcessor.__new__(LogitsProcessor)
+        torch.nn.Module.__init__(processor)
+        processor._sharded_verify_eligible = eligible
+        processor.sharded_verify = False
+        model = torch.nn.Module()
+        model.logits_processor = processor
+        worker = SimpleNamespace(model_runner=SimpleNamespace(model=model))
+        hooks = object()
+        with patch(
+            "sglang.srt.kernel_plugins.nvidia.binding.bind_speculative_runtime_hooks",
+            return_value=hooks,
+        ) as bind:
+            self.assertIs(
+                eagle_worker_common.bind_eagle_runtime_hooks(
+                    worker,
+                    supports_sharded_verify=supports_sharded_verify,
+                ),
+                hooks,
+            )
+        self.assertIs(
+            processor.sharded_verify,
+            supports_sharded_verify and eligible,
+        )
+        bind.assert_called_once_with(
+            model, eagle_worker_common.STOCK_SPECULATIVE_RUNTIME_HOOKS
+        )
+
+    def test_uno_binding_keeps_full_vocab_verify(self):
+        worker = uno_worker_v2.UnoWorkerV2.__new__(uno_worker_v2.UnoWorkerV2)
+        worker.tree_mode = False
+        worker._target_worker = object()
+        hooks = object()
+        with patch.object(
+            uno_worker_v2,
+            "bind_eagle_runtime_hooks",
+            return_value=hooks,
+        ) as bind:
+            worker.init_attention_backends()
+
+        self.assertIs(worker._speculative_runtime_hooks, hooks)
+        bind.assert_called_once_with(
+            worker.target_worker,
+            supports_sharded_verify=False,
+        )
 
 
 class TestSpecRelayBypass(CustomTestCase):
