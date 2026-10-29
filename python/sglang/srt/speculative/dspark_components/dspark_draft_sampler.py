@@ -1,16 +1,13 @@
 from __future__ import annotations
 
 import logging
-from typing import Callable, Optional
+from typing import Optional
 
 import torch
-
 from sglang.srt.environ import envs
-from sglang.srt.kernel_plugins.nvidia.binding import (
-    megakernel_agree,
-    megakernel_draft_sampler,
+from sglang.srt.kernel_plugins.nvidia.dspark_binding import (
+    bind_dspark_draft_strategy,
 )
-from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftNoise,
     DraftParams,
@@ -43,7 +40,6 @@ class DsparkDraftSampler:
         tp_sync: SpecTpSync,
         greedy_draft: bool,
         out=None,
-        megakernel_sampler: Optional[Callable] = None,
     ):
         self.model = model
         self.markov_head = model.markov_head
@@ -89,38 +85,26 @@ class DsparkDraftSampler:
                 (self.max_bs,), dtype=torch.float32, device=device
             ),
         )
-        # [max_bs, gamma, vocab] step logits for the sampling accept, sized on
-        # the first call; a greedy draft keeps none.
-        self.step_logits: Optional[torch.Tensor] = None
-        self._megakernel_steps = None
-        if megakernel_sampler is not None:
-            self._megakernel_steps = self._build_megakernel_steps(megakernel_sampler)
-
-    def _build_megakernel_steps(self, megakernel_sampler: Callable):
-        if not self.greedy_draft:
-            # The megakernel leaves temperature-0 rows' logits unwritten; a mixed accept
-            # still reads them.
-            self.step_logits = torch.zeros(
-                (self.max_bs, self.gamma, _step_logits_width(self.model)),
-                dtype=self.markov_head.step_logits_dtype(torch.bfloat16),
-                device=self.out.device,
-            )
-        steps = megakernel_sampler(
+        # [max_bs, gamma, vocab] step logits for sampling accept. The stock path
+        # sizes it on first use; a bound specialized path may allocate it now.
+        bound_strategy = bind_dspark_draft_strategy(
+            draft_model=self.model,
             gamma=self.gamma,
             max_bs=self.max_bs,
             greedy_draft=self.greedy_draft,
             noise=self._noise,
             draft_tokens=self.out,
-            step_logits=self.step_logits,
             step_temperatures=self.params.step_temperatures,
+            # Temperature-0 rows may be left unwritten, while mixed accept still
+            # reads the entire buffer.
+            allocate_step_logits=lambda: torch.zeros(
+                (self.max_bs, self.gamma, _step_logits_width(self.model)),
+                dtype=self.markov_head.step_logits_dtype(torch.bfloat16),
+                device=self.out.device,
+            ),
         )
-        # A rank on SGLang's block would wait in its per-step token sync (this group),
-        # which the megakernel's step skips.
-        served = tuple(bs for bs in range(1, self.max_bs + 1) if steps(bs) is not None)
-        megakernel_agree(
-            served, what="draft sampler batch sizes", group=get_dp_tp_group()
-        )
-        return steps
+        self._draft_strategy = bound_strategy.strategy
+        self.step_logits = bound_strategy.step_logits
 
     def _step_logits(self, base_logits: torch.Tensor) -> torch.Tensor:
         if self.step_logits is None:
@@ -155,13 +139,13 @@ class DsparkDraftSampler:
                 gamma=self.gamma,
             )
         anchor = input_ids.view(bs, self.query_token_num)[:, 0]
-        step = None if self._megakernel_steps is None else self._megakernel_steps(bs)
-        if step is not None:
-            draft_tokens, confidence_features = step(model_hidden, anchor)
-        else:
-            draft_tokens, confidence_features = self._markov_block(
-                model_hidden, sample_hidden, anchor, bs
-            )
+        draft_tokens, confidence_features = self._draft_strategy.run(
+            model_hidden=model_hidden,
+            sample_hidden=sample_hidden,
+            anchor_tokens=anchor,
+            batch_size=bs,
+            stock=self._markov_block,
+        )
         if self.confidence_out is not None:
             confidence, confidence_raw = self.model.compute_confidence(
                 anchor_tokens=anchor,
@@ -226,14 +210,7 @@ def maybe_build_draft_sampler(
         return _eager("gamma<=0")
     if draft_model.markov_head is None:
         return _eager("no markov head")
-    megakernel_sampler = megakernel_draft_sampler(draft_model)
-    if tp_rank == 0:
-        logger.info(
-            "DSpark draft proposal (%s) folded into the draft cuda graph%s.",
-            "greedy draft" if greedy_draft else "sampling",
-            "; the NVIDIA megakernel may run it" if megakernel_sampler else "",
-        )
-    return DsparkDraftSampler(
+    sampler = DsparkDraftSampler(
         model=draft_model,
         gamma=gamma,
         max_bs=max_bs,
@@ -242,5 +219,11 @@ def maybe_build_draft_sampler(
         tp_sync=tp_sync,
         greedy_draft=greedy_draft,
         out=out,
-        megakernel_sampler=megakernel_sampler,
     )
+    if tp_rank == 0:
+        logger.info(
+            "DSpark draft proposal (%s) folded into the draft cuda graph%s.",
+            "greedy draft" if greedy_draft else "sampling",
+            sampler._draft_strategy.log_suffix,
+        )
+    return sampler
