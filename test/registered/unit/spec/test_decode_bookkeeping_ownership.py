@@ -78,7 +78,7 @@ _OWNER_SITES = {
     ("mem_cache/allocation.py", "alloc_for_decode_default", "allocate_decode"): 1,
     # spec v2: no pre-claim; resolve commits the full accepted run uniformly.
     # kv_allocated_len for spec v2 draft decode (eagle + dflash) is settled
-    # inside the owned-kv alloc_for_spec_decode function (op42).
+    # inside the owned-kv update_spec_decode_allocated_lens function (op42).
     (*_EAGLE_DECODE, "decode_batch_idx"): 1,
     (*_EAGLE_DECODE, "evict"): 1,
     # DFlash uses its stateful scheduler-side preparation instead of
@@ -90,7 +90,7 @@ _OWNER_SITES = {
     (*_UNO_DECODE, "evict"): 1,
     (
         "mem_cache/allocation.py",
-        "alloc_for_spec_decode",
+        "update_spec_decode_allocated_lens",
         "allocate_spec_decode",
     ): 1,
     (*_RESOLVE, "commit_decode"): 1,

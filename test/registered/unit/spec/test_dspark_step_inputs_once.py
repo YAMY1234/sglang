@@ -208,6 +208,8 @@ class TestPostFoldRelay(unittest.TestCase):
         self.assertIs(overlap_utils._offered_relay, relay)
 
         fm = overlap_utils.FutureMap.__new__(overlap_utils.FutureMap)
+        # __new__-only fixture: __init__ resolves the spec-index path in production.
+        fm._use_spec_index_ops = False
         fm.needs_confidence_relay = False
         fm.spec_algo = SimpleNamespace(is_some=lambda: False, is_ngram=lambda: False)
         fm._adopt_relay(relay)
