@@ -1161,6 +1161,36 @@ def _verify_commit_step_indices(
     return last_correct_step_indices, mamba_steps_to_track
 
 
+def prebuild_mamba_commit_after_verify(model_runner) -> None:
+    """Build the verify commit's runtime kernel before graph capture.
+
+    Runs only for the pool ``commit_mamba_states_after_verify`` commits through
+    ``commit_gdn_replayssm_circular``; a failed build keeps the stock commit.
+    """
+    if mambaish_config(model_runner.model_config) is None:
+        return
+    mamba_pool = model_runner.token_to_kv_pool.layer_router.part_view(STATE_PART)
+    if (
+        mamba_pool is None
+        or mamba_pool.replayssm_cache_base is None
+        or mamba_pool.replayssm_is_kda
+    ):
+        return
+    from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode import (
+        prebuild_gdn_replayssm_circular_commit,
+    )
+
+    spec_state = mamba_pool.get_speculative_mamba2_params_all_layers()
+    prebuild_gdn_replayssm_circular_commit(
+        checkpoint_state=spec_state.temporal,
+        d_cache=spec_state.replayssm_d,
+        k_cache=spec_state.replayssm_k,
+        g_cache=spec_state.replayssm_g,
+        d_residual_cache=spec_state.replayssm_rawv,
+        k_residual_cache=spec_state.replayssm_rawk,
+    )
+
+
 def commit_mamba_states_after_verify(
     target_worker: TpModelWorker,
     batch: ScheduleBatch,

@@ -1149,6 +1149,12 @@ class Scheduler(
         self.tp_worker.init_attention_backends()
         if self.draft_worker is not None:
             self.draft_worker.init_attention_backends()
+        if not self.spec_algorithm.is_none():
+            from sglang.srt.speculative.spec_utils import (
+                prebuild_mamba_commit_after_verify,
+            )
+
+            prebuild_mamba_commit_after_verify(self.tp_worker.model_runner)
 
     # Not DynamicGradMode: tensors created under inference mode here could not
     # be written in place by the no_grad disagg event loops.
