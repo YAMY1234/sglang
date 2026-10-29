@@ -676,6 +676,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
         from sglang.srt.speculative import (
             multi_layer_eagle_draft_extend_cuda_graph_runner as multi,
         )
+        from sglang.srt.speculative.eagle_megakernel import STOCK_EAGLE_DRAFT_RUNTIME
 
         model_runner = SimpleNamespace(
             device="cuda",
@@ -695,7 +696,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
             speculative_algorithm=SimpleNamespace(is_standalone=lambda: False),
             seed_dsa_topk_from_draft_extend=False,
             mtp_model_runner=lambda step: model_runner,
-            megakernel=None,
+            draft_runtime=STOCK_EAGLE_DRAFT_RUNTIME,
         )
         runtime = SimpleNamespace(
             mamba=SimpleNamespace(enable_mamba_extra_buffer=tracking),
