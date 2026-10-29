@@ -4,23 +4,33 @@ eager GDNAttnBackend.forward_extend.
 One bucket is captured once, then replayed for batches of different shapes:
 several sequences, cached prefixes, padding past the batch, chunk-aligned and
 unaligned prefix-cache snapshots, and a batch without tracking. Each replay must
-match the eager path bit for bit on the output, the conv / SSM state pools and
-the track slots, for FP32 and BF16 SSM states.
+match the eager path on the output, the conv / SSM state pools and the track
+slots. The Triton path is bitwise for FP32 and BF16 SSM states; the SM100
+FlashInfer path is compared numerically for BF16 states because its CP and
+non-CP kernels may use a different floating-point operation order.
 """
 
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import torch
 
+from sglang.kernels.ops.mamba.gdn_prefill_track import (
+    TRACK_CHUNK_STATE,
+    TRACK_FINAL_STATE,
+    gdn_cp_tail_neutralize,
+)
 from sglang.srt.layers.attention.linear.gdn_backend import (
     GDNAttnBackend,
     GDNKernelDispatcher,
 )
 from sglang.srt.layers.attention.linear.gdn_prefill_graph import (
+    GDNFlashInferGraphTables,
     GDNPrefillGraphMetadata,
 )
+from sglang.srt.layers.attention.linear.kda_prefill_graph import KDAPrefillTrackRows
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
 from sglang.srt.mem_cache.kv.router import STATE_PART, KVLayerRouter
@@ -29,6 +39,9 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+# The FlashInfer graph kernel is SM10x-only, and the CI pool has no 1-GPU B200
+# runner. The test itself uses only cuda:0.
+register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 HEADS, V_HEADS, HEAD_DIM, CONV = 2, 4, 128, 4
 DIM = (2 * HEADS + V_HEADS) * HEAD_DIM
@@ -62,7 +75,11 @@ def _layer():
     )
 
 
-def _backend(conv_pool, ssm_pool):
+def _backend(
+    conv_pool,
+    ssm_pool,
+    prefill_backend=LinearAttnKernelBackend.TRITON,
+):
     """The production backend on test pools: slot of request i is i + 1."""
     backend = GDNAttnBackend.__new__(GDNAttnBackend)
     cache = SimpleNamespace(conv=[conv_pool], temporal=ssm_pool)
@@ -88,8 +105,19 @@ def _backend(conv_pool, ssm_pool):
     backend.prefill_graph_metadata = None
     backend.kernel_dispatcher = GDNKernelDispatcher(
         LinearAttnKernelBackend.TRITON,
+        prefill_backend,
         LinearAttnKernelBackend.TRITON,
-        LinearAttnKernelBackend.TRITON,
+    )
+    backend._flashinfer_graph_output = (
+        torch.zeros(
+            BUCKET,
+            V_HEADS,
+            HEAD_DIM,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        if prefill_backend == LinearAttnKernelBackend.FLASHINFER
+        else None
     )
     return backend
 
@@ -141,8 +169,82 @@ def _batch(extend_lens, prefix_lens, track=None):
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
 class TestGDNPrefillGraph(CustomTestCase):
-    def _setup(self, ssm_dtype):
+    def test_flashinfer_cp_tail_matches_out_of_bounds_inputs(self):
+        rows = 160
+        q = torch.ones(rows, HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+        k = q.clone()
+        v = torch.ones(rows, V_HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+        alpha = torch.full((rows, V_HEADS), 2.0, device="cuda")
+        beta = torch.ones(rows, V_HEADS, device="cuda")
+        gdn_cp_tail_neutralize(
+            q,
+            k,
+            v,
+            alpha,
+            beta,
+            torch.tensor([0, 65], dtype=torch.int64, device="cuda"),
+        )
+        torch.cuda.synchronize()
+
+        for tensor in (q, k, v, beta):
+            self.assertTrue(bool((tensor[65:128] == 0).all()))
+            self.assertTrue(bool((tensor[:65] == 1).all()))
+            self.assertTrue(bool((tensor[128:] == 1).all()))
+        self.assertTrue(bool((alpha[65:128] == 1).all()))
+        self.assertTrue(bool((alpha[:65] == 2).all()))
+        self.assertTrue(bool((alpha[128:] == 2).all()))
+
+    def test_flashinfer_tables_route_single_and_multi_sequence_batches(self):
+        tables = GDNFlashInferGraphTables.allocate(
+            max_seqs=4, cp_single=True, device=torch.device("cuda")
+        )
+        single_track = KDAPrefillTrackRows(
+            chunk_rows=[(0, 0)],
+            final_rows=[],
+            conv_rows=[],
+            conv_len=3,
+            dst=torch.tensor([12], device="cuda"),
+        )
+        tables.fill(
+            lens=np.array([130], dtype=np.int64),
+            cache_indices=torch.tensor([5], dtype=torch.int32, device="cuda"),
+            track_rows=single_track,
+        )
+        torch.cuda.synchronize()
+        self.assertEqual(tables.cp_cu_seqlens.tolist(), [0, 130])
+        self.assertEqual(tables.cp_checkpoint_cu.tolist(), [0, 2])
+        self.assertEqual(tables.cp_state_indices.tolist(), [5])
+        self.assertEqual(tables.pre_track_mode[0].item(), TRACK_FINAL_STATE)
+
+        multi_track = KDAPrefillTrackRows(
+            chunk_rows=[(0, 2)],
+            final_rows=[1],
+            conv_rows=[],
+            conv_len=3,
+            dst=torch.tensor([12, 13], device="cuda"),
+        )
+        tables.fill(
+            lens=np.array([130, 64], dtype=np.int64),
+            cache_indices=torch.tensor([-1, 7], dtype=torch.int32, device="cuda"),
+            track_rows=multi_track,
+        )
+        torch.cuda.synchronize()
+        self.assertEqual(tables.cp_cu_seqlens.tolist(), [0, 0])
+        self.assertEqual(tables.non_cp_cu_seqlens.tolist(), [0, 130, 194, 194, 194])
+        self.assertEqual(tables.non_cp_checkpoint_cu.tolist(), [0, 2, 3, 3, 3])
+        self.assertEqual(tables.non_cp_state_indices.tolist(), [0, 7, 0, 0])
+        self.assertEqual(
+            tables.track_mode[:2].tolist(), [TRACK_CHUNK_STATE, TRACK_FINAL_STATE]
+        )
+        self.assertEqual(tables.track_h_row[0].item(), 1)
+
+    def _setup(
+        self,
+        ssm_dtype,
+        prefill_backend=LinearAttnKernelBackend.TRITON,
+    ):
         self.layer = _layer()
+        self.prefill_backend = prefill_backend
         g = torch.Generator(device="cuda").manual_seed(11)
         self.conv_pool = (
             torch.randn(NUM_SLOTS, DIM, CONV - 1, generator=g, device="cuda") * 0.3
@@ -153,7 +255,11 @@ class TestGDNPrefillGraph(CustomTestCase):
             )
             * 0.05
         ).to(ssm_dtype)
-        self.backend = _backend(self.conv_pool, self.ssm_pool)
+        self.backend = _backend(
+            self.conv_pool,
+            self.ssm_pool,
+            prefill_backend=self.prefill_backend,
+        )
         # Static inputs the captured graph reads.
         self.mixed = torch.zeros(BUCKET, DIM, device="cuda", dtype=torch.bfloat16)
         self.a = torch.zeros(BUCKET, V_HEADS, device="cuda", dtype=torch.bfloat16)
@@ -177,6 +283,8 @@ class TestGDNPrefillGraph(CustomTestCase):
             track=True,
             cache_index_dtype=torch.int32,
             device=torch.device("cuda"),
+            flashinfer=self.prefill_backend == LinearAttnKernelBackend.FLASHINFER,
+            flashinfer_cp_single=True,
         )
         capture_batch = _batch([BUCKET], [0])
         self._fill(meta, capture_batch)
@@ -216,9 +324,17 @@ class TestGDNPrefillGraph(CustomTestCase):
 
         # Eager reference on cloned pools.
         ref_conv, ref_ssm = self.conv_pool.clone(), self.ssm_pool.clone()
-        ref_backend = _backend(ref_conv, ref_ssm)
+        ref_backend = _backend(
+            ref_conv,
+            ref_ssm,
+            prefill_backend=self.prefill_backend,
+        )
         ref_batch = _batch(lens, prefixes, track=track)
-        ref_backend.init_forward_metadata(ref_batch)
+        with patch(
+            "sglang.srt.layers.attention.linear.kernels.gdn_flashinfer.mamba_cache_chunk_size",
+            return_value=CHUNK,
+        ):
+            ref_backend.init_forward_metadata(ref_batch)
         ref_out = ref_backend.forward_extend(
             self.layer,
             ref_batch,
@@ -231,10 +347,36 @@ class TestGDNPrefillGraph(CustomTestCase):
         graph.replay()
         torch.cuda.synchronize()
 
-        self.assertTrue(torch.equal(out[:, :total], ref_out[:, :total]))
-        self.assertTrue(bool((out[:, total:] == 0).all()), "padded rows not zeroed")
+        if self.prefill_backend == LinearAttnKernelBackend.FLASHINFER:
+            # Captured FlashInfer writes by state_indices; eager gathers/scatters.
+            # Their CP/non-CP schedules use the established GDN tolerance of 3e-2.
+            torch.testing.assert_close(
+                out[:, :total], ref_out[:, :total], rtol=3e-2, atol=3e-2
+            )
+            touched = set(range(1, len(lens) + 1))
+            touched.update(NUM_SLOTS // 2 + row for row in (track or {}))
+            untouched = [slot for slot in range(NUM_SLOTS) if slot not in touched]
+            touched = sorted(touched)
+            torch.testing.assert_close(
+                self.ssm_pool[touched],
+                ref_ssm[touched],
+                rtol=3e-2,
+                atol=3e-2,
+            )
+            self.assertTrue(
+                torch.equal(self.ssm_pool[untouched], ref_ssm[untouched]),
+                "FlashInfer changed an unowned state slot",
+            )
+            # FlashInfer writes only rows owned by a sequence, so rows past the
+            # batch keep an earlier replay's output.
+            self.assertTrue(
+                bool(torch.isfinite(out[:, total:]).all()), "padded rows not finite"
+            )
+        else:
+            self.assertTrue(torch.equal(out[:, :total], ref_out[:, :total]))
+            self.assertTrue(torch.equal(self.ssm_pool, ref_ssm), "ssm pool differs")
+            self.assertTrue(bool((out[:, total:] == 0).all()), "padded rows not zeroed")
         self.assertTrue(torch.equal(self.conv_pool, ref_conv), "conv pool differs")
-        self.assertTrue(torch.equal(self.ssm_pool, ref_ssm), "ssm pool differs")
 
     def test_replays_match_eager(self):
         cases = [
@@ -265,6 +407,49 @@ class TestGDNPrefillGraph(CustomTestCase):
                         track=track,
                         seed=100 + i,
                     )
+
+    def test_flashinfer_replays_match_eager(self):
+        """Captured CP/non-CP plans must match eager while only updating owned
+        state slots."""
+        if torch.cuda.get_device_capability()[0] != 10:
+            self.skipTest("FlashInfer GDN prefill graphs require SM100/SM103")
+        from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+            is_flashinfer_gdn_cp_prefill_available,
+            is_flashinfer_gdn_prefill_available,
+        )
+
+        if not (
+            is_flashinfer_gdn_prefill_available()
+            and is_flashinfer_gdn_cp_prefill_available()
+        ):
+            self.skipTest("FlashInfer GDN prefill graph kernels are unavailable")
+
+        self._setup(
+            torch.bfloat16,
+            prefill_backend=LinearAttnKernelBackend.FLASHINFER,
+        )
+        meta, graph, out = self._capture()
+        cases = [
+            # Multi-sequence non-CP plan with both chunk and final track rows.
+            ([37, 100, 5, 192], [0, 64, 130, 0], {1: 70, 3: 192}),
+            # Single-sequence CP plan with an unaligned tracked checkpoint.
+            ([BUCKET], [256], {0: 300}),
+            # Padded non-CP table rows must own no state when tracking is off.
+            ([200, 11], [0, 0], None),
+            # CP tail neutralization must leave the result equal to eager.
+            ([1], [900], None),
+        ]
+        for i, (lens, prefixes, track) in enumerate(cases):
+            with self.subTest(case=i):
+                self._check_replay(
+                    meta,
+                    graph,
+                    out,
+                    lens=lens,
+                    prefixes=prefixes,
+                    track=track,
+                    seed=500 + i,
+                )
 
 
 if __name__ == "__main__":
