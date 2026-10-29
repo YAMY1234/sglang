@@ -134,11 +134,18 @@ struct MultiCastImpl {
   V* m_multicast_ptr;
 };
 
+#ifndef Q38CC_AR_TRIGGER_STAGE
+#define Q38CC_AR_TRIGGER_STAGE 0
+#endif
+static_assert(Q38CC_AR_TRIGGER_STAGE >= 0 && Q38CC_AR_TRIGGER_STAGE <= 2);
+
 #define ALL_REDUCE_KERNEL __global__ __launch_bounds__(1024, 1)
 
 template <typename T, uint32_t kWorldSize, bool kUsePDL>
 ALL_REDUCE_KERNEL void all_reduce_1shot_push_kernel(const __grid_constant__ AllReducePushParams<kWorldSize> params) {
   using namespace device;
+  constexpr bool kQ38Eligible = kUsePDL && kWorldSize == 4 && std::is_same_v<T, __nv_bfloat16>;
+  if constexpr (kQ38Eligible && Q38CC_AR_TRIGGER_STAGE == 1) PDLTriggerSecondary<kUsePDL>();
   constexpr uint32_t kVecSize = 16 / (sizeof(T) * 2);
   using vec_t = AlignedVector<packed_t<T>, kVecSize>;
   using Lamport = distributed::LamportTrait<T, kVecSize * 2, /*kAtom=*/4>;
@@ -175,6 +182,8 @@ ALL_REDUCE_KERNEL void all_reduce_1shot_push_kernel(const __grid_constant__ AllR
     }
   }
 
+  if constexpr (kQ38Eligible && Q38CC_AR_TRIGGER_STAGE == 2) PDLTriggerSecondary<kUsePDL>();
+
   // poll from local
   void* poll_ptrs[kWorldSize];
 #pragma unroll
@@ -206,7 +215,7 @@ ALL_REDUCE_KERNEL void all_reduce_1shot_push_kernel(const __grid_constant__ AllR
     }
   }
 
-  PDLTriggerSecondary<kUsePDL>();
+  if constexpr (!kQ38Eligible || Q38CC_AR_TRIGGER_STAGE == 0) PDLTriggerSecondary<kUsePDL>();
   __syncthreads();
   epoch.flip();
 }

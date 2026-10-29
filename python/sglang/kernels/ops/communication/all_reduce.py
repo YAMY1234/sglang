@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import enum
+import os
 from typing import TYPE_CHECKING, List, Tuple
 
 import torch
@@ -206,12 +207,23 @@ class IPCManager(tvm_ffi.Object):
         self.__ffi_init__()
 
 
+_Q38_CA_ENTRY = os.getenv("Q38_SHARED_CA_TRIGGER_ENTRY", "0") == "1"
+_Q38_CA_POST_PUSH = os.getenv("Q38_SHARED_CA_TRIGGER_POST_PUSH", "0") == "1"
+if _Q38_CA_ENTRY and _Q38_CA_POST_PUSH:
+    raise ValueError("shared CA trigger placements are mutually exclusive")
+_Q38_CA_TRIGGER_STAGE = 1 if _Q38_CA_ENTRY else 2 if _Q38_CA_POST_PUSH else 0
+
+
 @cache_once
 def get_all_reduce_module(dtype: torch.dtype, world_size: int) -> Module:
     args = make_cpp_args(dtype, world_size, is_arch_support_pdl())
+    options = {}
+    if _Q38_CA_TRIGGER_STAGE and dtype == torch.bfloat16 and world_size == 4:
+        options["extra_cuda_cflags"] = [f"-DQ38CC_AR_TRIGGER_STAGE={_Q38_CA_TRIGGER_STAGE}"]
     return load_jit(
         "custom_all_reduce",
         *args,
+        **options,
         cuda_files=["distributed/custom_all_reduce.cuh"],
         cuda_wrappers=[("all_reduce", f"AllReduceKernel<{args}>::run")],
     )

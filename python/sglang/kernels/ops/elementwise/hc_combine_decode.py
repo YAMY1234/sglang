@@ -10,6 +10,7 @@ from sglang.kernels.jit.utils import cache_once, load_jit
 from sglang.srt.environ import envs
 
 _HC_CLUSTER_M4ONLY = envs.SGLANG_Q38C_HC_CLUSTER_M4ONLY.get()
+_HC_CN_PRE = envs.SGLANG_Q38C_HC_CN_PRE.get()
 
 
 @cache_once
@@ -32,6 +33,18 @@ def _jit_module(parts: int = 2, wide_rows: bool = False):
             ),
             ("shared_apply_norm", f"HcSharedCombineNormDecode<{parts}, {m4only}>::run"),
         ],
+    )
+
+
+@cache_once
+def _jit_cn_pre_module(parts: int):
+    if parts not in (1, 2, 4):
+        raise ValueError("HC combine parts must be 1, 2 or 4")
+    m4only = str(_HC_CLUSTER_M4ONLY).lower()
+    return load_jit(
+        f"hc_cn_pre_p{parts}_m4only{int(_HC_CLUSTER_M4ONLY)}_s3",
+        cuda_files=["elementwise/hc_combine_norm_pre.cuh"],
+        cuda_wrappers=[("apply_norm", f"HcCombineNormPre<{parts}, {m4only}, 3>::run")],
     )
 
 
@@ -66,7 +79,12 @@ def hc_combine_apply_norm(
         if block.shape[0] not in (24, 32):
             raise ValueError("wide HC combine/norm only accepts M24/M32")
         parts = 2
-    _jit_module(parts, wide_rows).apply_norm(
+    module = (
+        _jit_cn_pre_module(parts)
+        if _HC_CN_PRE and not wide_rows and 0 < block.shape[0] <= 16
+        else _jit_module(parts, wide_rows)
+    )
+    module.apply_norm(
         block, residual, partials, weight, combined, normalized, eps
     )
     return combined, normalized

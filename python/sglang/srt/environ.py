@@ -326,6 +326,8 @@ class Envs:
     SGLANG_Q38_HC_SMALLM16 = EnvBool(False)
     # Extra HC specialization for M24/M32; narrower rows retain their path.
     SGLANG_Q38C_HC_M32 = EnvBool(False)
+    # AR/HC scheduling pair; static residual/gamma prefetch, bounded release.
+    SGLANG_Q38C_HC_CN_PRE = EnvBool(False)
     SGLANG_Q38_HC_COMBINE_PARTS = EnvInt(2)
     # Keep the frozen cluster path by default; opt in to native rows except M4.
     SGLANG_Q38C_HC_CLUSTER_M4ONLY = EnvBool(False)
