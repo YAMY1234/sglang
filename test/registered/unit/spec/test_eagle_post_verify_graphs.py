@@ -19,6 +19,7 @@ import torch
 
 from sglang.kernels.ops.speculative.eagle import prepare_verify_commit_outputs
 from sglang.srt.environ import envs
+from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
@@ -169,7 +170,9 @@ def _eager(batch, verify_input, logits, sim_rng):
     predict, accept_lens, accept_index = eagle_sample(
         verify_input,
         batch,
-        SimpleNamespace(next_token_logits=logits.clone()),
+        SimpleNamespace(
+            next_token_logits=logits.clone(), next_token_logits_vocab_shard=None
+        ),
         simulated_acc_len_rng=sim_rng,
     )
     new_seq_lens, bonus_tokens, _, _ = prepare_verify_commit_outputs(
@@ -220,7 +223,10 @@ class TestPostVerifyGraphs(CustomTestCase):
             )
             target_worker = SimpleNamespace(
                 forward_batch_generation=lambda **_: SimpleNamespace(
-                    logits_output=SimpleNamespace(next_token_logits=torch.zeros(7, 8))
+                    logits_output=SimpleNamespace(
+                        next_token_logits=torch.zeros(7, 8),
+                        next_token_logits_vocab_shard=None,
+                    )
                 ),
                 model_runner=SimpleNamespace(
                     watermark_state=None,
@@ -266,7 +272,10 @@ class TestPostVerifyGraphs(CustomTestCase):
             target_worker=_target_worker(),
             simulated_acc_len_rng=simulated_acc_len_generator(0),
         )
-        logits_output = SimpleNamespace(next_token_logits=torch.zeros((7, 8)))
+        logits_output = SimpleNamespace(
+            next_token_logits=torch.zeros((7, 8)),
+            next_token_logits_vocab_shard=None,
+        )
 
         def key(can_run_cuda_graph=True, topk=1, **changes):
             info = dict(
@@ -280,7 +289,11 @@ class TestPostVerifyGraphs(CustomTestCase):
                 need_top_k_sampling=True,
                 need_top_p_sampling=True,
             )
-            fields = dict(has_grammar=False, hisparse_coordinator=None)
+            fields = dict(
+                has_grammar=False,
+                hisparse_coordinator=None,
+                return_logprob=False,
+            )
             for name, value in changes.items():
                 (info if name in info else fields)[name] = value
             batch = SimpleNamespace(
@@ -413,16 +426,30 @@ class TestPostVerifyGraphs(CustomTestCase):
             mamba_track_indices=None,
             has_grammar=False,
             hisparse_coordinator=None,
+            return_logprob=False,
         )
         verify_input = SimpleNamespace(
             topk=1, draft_probs=None, draft_token_num=7, max_tree_depth=7
         )
-        logits = SimpleNamespace(next_token_logits=torch.zeros((7, 8)))
+        logits = SimpleNamespace(
+            next_token_logits=torch.zeros((7, 8)),
+            next_token_logits_vocab_shard=None,
+        )
         keys = {
             graphs._key(verify_batch, verify_input, logits, True, max_top_k)
             for max_top_k in (20, None)
         }
         self.assertEqual(len(keys), 2)
+
+        # a per-batch logits format: shards reuse the full logits' storage
+        shards = SimpleNamespace(
+            next_token_logits=logits.next_token_logits,
+            next_token_logits_vocab_shard=object(),
+        )
+        self.assertNotEqual(
+            graphs._key(verify_batch, verify_input, logits, True, 20),
+            graphs._key(verify_batch, verify_input, shards, True, 20),
+        )
 
     def test_a_packed_verify_result_is_one_buffer_holding_the_stock_values(self):
         """With SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST a sampled verify result goes to
@@ -515,7 +542,10 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
                     got = graphs.run(
                         batch=batch,
                         verify_input=verify_input,
-                        logits_output=SimpleNamespace(next_token_logits=logits_buf),
+                        logits_output=SimpleNamespace(
+                            next_token_logits=logits_buf,
+                            next_token_logits_vocab_shard=None,
+                        ),
                         can_run_cuda_graph=graphed,
                     )
                     graphs.join()
@@ -549,6 +579,107 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
         # SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD: inputs and the pinned forced length in one launch
         with patch.object(eagle_post_verify_graphs, "_ONE_LAUNCH_LOAD", True):
             self._check(sim_acc_len=4.8)
+
+
+def _worker_with_model_class(model_class):
+    processor = LogitsProcessor.__new__(LogitsProcessor)
+    torch.nn.Module.__init__(processor)
+    processor._sharded_verify_eligible = True
+    processor.sharded_verify = False
+    model = type(model_class, (torch.nn.Module,), {})()
+    model.logits_processor = processor
+    worker = SimpleNamespace(model_runner=SimpleNamespace(model=model))
+    return worker, model, processor
+
+
+class TestRuntimeHookExecution(CustomTestCase):
+    def _assert_worker_sharded_verify_support(
+        self,
+        *,
+        module_name,
+        worker_name,
+        topk,
+        expected,
+    ):
+        from importlib import import_module
+
+        module = import_module(module_name)
+        worker = getattr(module, worker_name).__new__(getattr(module, worker_name))
+        worker.topk = topk
+        worker._target_worker = SimpleNamespace()
+        worker._draft_worker = None
+
+        with (
+            patch(
+                "sglang.srt.speculative.base_spec_worker.BaseSpecWorker.init_attention_backends"
+            ),
+            patch.object(module, "bind_eagle_runtime_hooks") as bind,
+        ):
+            worker.init_attention_backends()
+
+        bind.assert_called_once_with(
+            worker.target_worker,
+            supports_sharded_verify=expected,
+        )
+
+    def test_only_chain_eagle_workers_opt_in_to_sharded_verify(self):
+        for module_name, worker_name, topk, expected in (
+            ("eagle_worker_v2", "EAGLEWorkerV2", 1, True),
+            ("eagle_worker_v2", "EAGLEWorkerV2", 2, False),
+            ("multi_layer_eagle_worker_v2", "MultiLayerEagleWorkerV2", 1, True),
+            ("multi_layer_eagle_worker_v2", "MultiLayerEagleWorkerV2", 2, False),
+        ):
+            with self.subTest(worker=worker_name, topk=topk):
+                self._assert_worker_sharded_verify_support(
+                    module_name=f"sglang.srt.speculative.{module_name}",
+                    worker_name=worker_name,
+                    topk=topk,
+                    expected=expected,
+                )
+
+    def test_sharded_verify_opts_in_only_for_validated_qwen35_models(self):
+        validated_model_classes = (
+            "Qwen3_5ForCausalLM",
+            "Qwen3_5MoeForCausalLM",
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForConditionalGeneration",
+        )
+
+        for model_class in validated_model_classes:
+            with self.subTest(model_class=model_class):
+                worker, _, processor = _worker_with_model_class(model_class)
+
+                eagle_worker_common.bind_eagle_runtime_hooks(
+                    worker, supports_sharded_verify=True
+                )
+
+                self.assertTrue(processor.sharded_verify)
+                self.assertFalse(processor._sharded_verify_temperature_keys)
+
+    def test_unvalidated_models_keep_full_vocab(self):
+        unvalidated_model_classes = (
+            "Gemma4UnifiedForConditionalGeneration",
+            "UnknownForCausalLM",
+            "Qwen3_5ForCausalLMMTP",
+        )
+
+        for model_class in unvalidated_model_classes:
+            with self.subTest(model_class=model_class):
+                worker, _, processor = _worker_with_model_class(model_class)
+
+                eagle_worker_common.bind_eagle_runtime_hooks(
+                    worker, supports_sharded_verify=True
+                )
+
+                self.assertFalse(processor.sharded_verify)
+
+    def test_unsupported_consumer_keeps_full_vocab(self):
+        worker, _, processor = _worker_with_model_class("Qwen3_5ForCausalLM")
+
+        eagle_worker_common.bind_eagle_runtime_hooks(
+            worker, supports_sharded_verify=False
+        )
+        self.assertFalse(processor.sharded_verify)
 
 
 if __name__ == "__main__":
