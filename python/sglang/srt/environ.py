@@ -328,6 +328,8 @@ class Envs:
     SGLANG_Q38C_HC_DOWN_TRIGGER = EnvInt(0)
     SGLANG_Q38C_HC_UP_TRIGGER = EnvInt(0)
     SGLANG_Q38C_HC_PLAIN_NORM_TRIGGER = EnvInt(0)
+    # 1=combine/norm bounded trigger, 2=also prefetch static gamma to L2.
+    SGLANG_Q38C_HC_COMBINE_SCHEDULE = EnvInt(0)
     SGLANG_Q38_HC_COMBINE_PARTS = EnvInt(2)
     # Keep the frozen cluster path by default; opt in to native rows except M4.
     SGLANG_Q38C_HC_CLUSTER_M4ONLY = EnvBool(False)
