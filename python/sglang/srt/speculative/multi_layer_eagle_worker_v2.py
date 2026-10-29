@@ -62,6 +62,7 @@ from sglang.srt.speculative.eagle_utils import (
     organize_draft_results,
 )
 from sglang.srt.speculative.eagle_worker_common import (
+    STOCK_SPECULATIVE_RUNTIME_HOOKS,
     bind_eagle_runtime_hooks,
     build_eagle_verify_input,
     prepare_for_draft,
@@ -1051,6 +1052,8 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
 
 
 class MultiLayerEagleWorkerV2(BaseSpecWorker):
+    _speculative_runtime_hooks = STOCK_SPECULATIVE_RUNTIME_HOOKS
+
     def weight_update_runners(self) -> List[Tuple[str, ModelRunner]]:
         return [
             (f"draft_step_{i}", r)
@@ -1098,7 +1101,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
 
     def init_attention_backends(self):
         super().init_attention_backends()
-        bind_eagle_runtime_hooks(
+        self._speculative_runtime_hooks = bind_eagle_runtime_hooks(
             self.target_worker, supports_sharded_verify=self.topk == 1
         )
 
@@ -1214,6 +1217,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
     def verify(self, batch: ScheduleBatch, grammar_barrier=None):
         return run_eagle_verify(
             batch,
+            speculative_runtime_hooks=self._speculative_runtime_hooks,
             target_worker=self.target_worker,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
