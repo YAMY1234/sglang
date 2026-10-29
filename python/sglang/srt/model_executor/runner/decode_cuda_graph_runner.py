@@ -61,7 +61,13 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import (
+    VERIFY_FULL_LOGITS,
+    VERIFY_LOGITS_VARIANTS,
+    VERIFY_VOCAB_SHARDS,
+    LogitsProcessor,
+    LogitsProcessorOutput,
+)
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     GraphSlot,
@@ -102,8 +108,10 @@ from sglang.srt.model_executor.runner_backend_utils import CUDA_GRAPH_CAPTURE_FA
 from sglang.srt.model_executor.runner_utils.buffers import DecodeInputBuffers
 from sglang.srt.model_executor.runner_utils.capture_mode import (
     _set_capture_attention_variant,
+    capture_logits_variant,
     capture_lora_variant,
     get_capture_attention_variant,
+    get_capture_logits_variant,
     model_capture_mode,
 )
 from sglang.srt.model_executor.runner_utils.deepep_adapter import (
@@ -149,6 +157,16 @@ def _attention_variant_during_prep(attention_variant):
         yield
     finally:
         _set_capture_attention_variant(before)
+
+
+def _sharded_verify_logits_processor(model) -> Optional[LogitsProcessor]:
+    processors = [
+        module
+        for module in model.modules()
+        if isinstance(module, LogitsProcessor)
+        and getattr(module, "sharded_verify", False)
+    ]
+    return processors[0] if len(processors) == 1 else None
 
 
 # Draft metadata glue: steps between two "draft glue" tally lines per rank
@@ -271,6 +289,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     # size); class defaults, since runners built without __init__ set neither
     attention_graph_variants: Optional[AttentionGraphVariants] = None
     attention_variant_sizes: Optional[frozenset[int]] = None
+    # The target-verify logits formats, (None,) unless the target shards its verify
+    logits_graph_variants: tuple = (None,)
+    _verify_logits_processor: Optional[LogitsProcessor] = None
     # Set in __init__: which DSpark runner's prep the glue graph serves past the guard.
     _draft_metadata_glue = False
     _target_metadata_glue = False
@@ -418,6 +439,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     tokens_per_request=self.captured_req_width,
                 )
             )
+        # A sharded-verify target captures both logits formats; each batch picks one.
+        self._verify_logits_processor = (
+            _sharded_verify_logits_processor(model_runner.model)
+            if self.capture_forward_mode == ForwardMode.TARGET_VERIFY
+            and not model_runner.is_draft_worker
+            else None
+        )
+        self.logits_graph_variants = (
+            VERIFY_LOGITS_VARIANTS
+            if self._verify_logits_processor is not None
+            else (None,)
+        )
 
         self.ragged_verify_mode = (
             ragged_verify_compact_graphs_enabled(self.model_runner.spec_algorithm)
@@ -766,6 +799,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             attention_variant=attention_variant,
         )
 
+    def _with_logits_variant(self, key, logits_variant: Optional[str]):
+        if logits_variant is None:
+            return key
+        return dataclasses.replace(key, logits_variant=logits_variant)
+
+    def _resolve_logits_variant(self, forward_batch: ForwardBatch) -> Optional[str]:
+        processor = self._verify_logits_processor
+        if processor is None:
+            return None
+        if processor.verify_uses_vocab_shards(forward_batch):
+            return VERIFY_VOCAB_SHARDS
+        return VERIFY_FULL_LOGITS
+
     def _capture_graph_size(self, *, bs: int, num_tokens: int) -> int:
         return num_tokens if self.ragged_verify_mode else bs
 
@@ -908,15 +954,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         else:
             cuda_graph_bs = forward_batch.batch_size
 
-        graph_key = self._make_graph_key(
-            cuda_graph_bs,
-            stream_idx=get_current_stream_idx() if self.enable_pdmux else None,
-            variant_label=self._resolve_lora_variant(forward_batch),
-            attention_variant=(
-                self._resolve_attention_variant(forward_batch, cuda_graph_bs)
-                if self.disable_padding
-                else None
+        graph_key = self._with_logits_variant(
+            self._make_graph_key(
+                cuda_graph_bs,
+                stream_idx=get_current_stream_idx() if self.enable_pdmux else None,
+                variant_label=self._resolve_lora_variant(forward_batch),
+                attention_variant=(
+                    self._resolve_attention_variant(forward_batch, cuda_graph_bs)
+                    if self.disable_padding
+                    else None
+                ),
             ),
+            self._resolve_logits_variant(forward_batch),
         )
 
         is_bs_supported = (
@@ -1007,6 +1056,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         stream_idx: Optional[int],
         variant_label: Optional[str],
         attention_variant: Optional[str],
+        logits_variant: Optional[str] = None,
     ) -> None:
         """Name the trace for one capture. bs alone is not unique: the capture
         loop multiplies it by the lora and attention variants (DSA captures
@@ -1018,6 +1068,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         parts = [f"bs_{bs}"]
         if attention_variant is not None:
             parts.append(attention_variant)
+        if logits_variant is not None:
+            parts.append(logits_variant)
         if variant_label is not None:
             parts.append(variant_label)
         if stream_idx is not None:
@@ -1387,22 +1439,30 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 with capture_lora_variant(variant_label):
                     for attention_variant in attention_variants:
                         _set_capture_attention_variant(attention_variant)
-                        self._set_profile_trace_tag(
-                            bs, stream_idx, variant_label, attention_variant
-                        )
-                        with torch_compile_decoration.patch_model(
-                            self.model_runner.model,
-                            bs in self.compile_bs,
-                            num_tokens=bs * self.captured_req_width,
-                            tp_group=get_parallel().tp_group,
-                        ) as forward:
-                            self.capture_one_shape(
+                        for logits_variant in self.logits_graph_variants:
+                            self._set_profile_trace_tag(
                                 bs,
-                                forward,
                                 stream_idx,
                                 variant_label,
                                 attention_variant,
+                                logits_variant,
                             )
+                            with (
+                                capture_logits_variant(logits_variant),
+                                torch_compile_decoration.patch_model(
+                                    self.model_runner.model,
+                                    bs in self.compile_bs,
+                                    num_tokens=bs * self.captured_req_width,
+                                    tp_group=get_parallel().tp_group,
+                                ) as forward,
+                            ):
+                                self.capture_one_shape(
+                                    bs,
+                                    forward,
+                                    stream_idx,
+                                    variant_label,
+                                    attention_variant,
+                                )
         _set_capture_attention_variant(None)
 
     def capture_one_shape(
@@ -1518,11 +1578,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
 
             with canary_ctx:
-                shape_key = self._make_graph_key(
-                    self._capture_graph_size(bs=bs, num_tokens=num_tokens),
-                    stream_idx,
-                    variant_label,
-                    attention_variant,
+                shape_key = self._with_logits_variant(
+                    self._make_graph_key(
+                        self._capture_graph_size(bs=bs, num_tokens=num_tokens),
+                        stream_idx,
+                        variant_label,
+                        attention_variant,
+                    ),
+                    get_capture_logits_variant(),
                 )
                 # Adaptive runners may own a different backend than model_runner.
                 post_warmup_hook = getattr(
@@ -1633,8 +1696,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             variant_label = self._resolve_lora_variant(forward_batch)
             attention_variant = self._resolve_attention_variant(forward_batch, self.bs)
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
-            self._replay_graph_key = self._make_graph_key(
-                graph_size_key, stream_idx, variant_label, attention_variant
+            self._replay_graph_key = self._with_logits_variant(
+                self._make_graph_key(
+                    graph_size_key, stream_idx, variant_label, attention_variant
+                ),
+                self._resolve_logits_variant(forward_batch),
             )
             return
 
@@ -1747,8 +1813,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 attention_variant, taken=early_staged
             )
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
-        self._replay_graph_key = self._make_graph_key(
-            graph_size_key, stream_idx, variant_label, attention_variant
+        self._replay_graph_key = self._with_logits_variant(
+            self._make_graph_key(
+                graph_size_key, stream_idx, variant_label, attention_variant
+            ),
+            self._resolve_logits_variant(forward_batch),
         )
 
     def _staged_signature(self, forward_batch: ForwardBatch) -> Optional[tuple]:
