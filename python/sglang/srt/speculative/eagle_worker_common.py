@@ -115,6 +115,16 @@ def stock_speculative_runtime_hooks() -> Any:
 STOCK_SPECULATIVE_RUNTIME_HOOKS = stock_speculative_runtime_hooks()
 
 
+_SHARDED_VERIFY_TARGET_MODEL_CLASSES = frozenset(
+    {
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+    }
+)
+
+
 def bind_eagle_runtime_hooks(
     target_worker: Any,
     *,
@@ -131,9 +141,14 @@ def bind_eagle_runtime_hooks(
     processors = [
         module for module in model.modules() if isinstance(module, LogitsProcessor)
     ]
-    if supports_sharded_verify and len(processors) == 1:
+    if (
+        supports_sharded_verify
+        and type(model).__name__ in _SHARDED_VERIFY_TARGET_MODEL_CLASSES
+        and len(processors) == 1
+    ):
         # Only callers whose post-verify consumer understands the shard marker
-        # opt in. UNO shares this hook binder but deliberately passes False.
+        # and validated outer target models opt in. Exact class-name matching
+        # deliberately excludes MTP draft models and unvalidated subclasses.
         enable = getattr(processors[0], "enable_sharded_verify", None)
         if callable(enable):
             enable()

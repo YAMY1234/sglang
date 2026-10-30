@@ -2,7 +2,7 @@
 
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -81,6 +81,17 @@ def _verify_logits():
             [0.0, 1.0, 2.0, 3.0, 4.0],
         ]
     )
+
+
+def _worker_with_model_class(model_class):
+    processor = LogitsProcessor.__new__(LogitsProcessor)
+    torch.nn.Module.__init__(processor)
+    processor._sharded_verify_eligible = True
+    processor.sharded_verify = False
+    model = type(model_class, (torch.nn.Module,), {})()
+    model.logits_processor = processor
+    worker = SimpleNamespace(model_runner=SimpleNamespace(model=model))
+    return worker, model, processor
 
 
 class _PostVerify:
@@ -164,14 +175,59 @@ class TestRuntimeHookExecution(CustomTestCase):
                     tree_mode=tree_mode,
                 )
 
-    def test_runtime_alone_binds_stock_and_opts_in_supported_consumer(self):
-        processor = LogitsProcessor.__new__(LogitsProcessor)
-        torch.nn.Module.__init__(processor)
-        processor._sharded_verify_eligible = True
-        processor.sharded_verify = False
-        model = torch.nn.Module()
-        model.logits_processor = processor
-        worker = SimpleNamespace(model_runner=SimpleNamespace(model=model))
+    def test_sharded_verify_opts_in_only_for_validated_qwen35_models(self):
+        validated_model_classes = (
+            "Qwen3_5ForCausalLM",
+            "Qwen3_5MoeForCausalLM",
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForConditionalGeneration",
+        )
+
+        for model_class in validated_model_classes:
+            with self.subTest(model_class=model_class):
+                worker, _, processor = _worker_with_model_class(model_class)
+
+                selected = eagle_worker_common.bind_eagle_runtime_hooks(
+                    worker, supports_sharded_verify=True
+                )
+
+                self.assertTrue(processor.sharded_verify)
+                self.assertIs(
+                    selected, eagle_worker_common.STOCK_SPECULATIVE_RUNTIME_HOOKS
+                )
+
+    def test_unvalidated_models_keep_full_vocab_and_still_bind_provider(self):
+        unvalidated_model_classes = (
+            "Gemma4UnifiedForConditionalGeneration",
+            "UnknownForCausalLM",
+            "Qwen3_5ForCausalLMMTP",
+        )
+
+        for model_class in unvalidated_model_classes:
+            with self.subTest(model_class=model_class):
+                worker, model, processor = _worker_with_model_class(model_class)
+                provider_hooks = object()
+                bind_provider = Mock(return_value=provider_hooks)
+
+                with patch.object(
+                    eagle_worker_common,
+                    "import_module",
+                    return_value=SimpleNamespace(
+                        bind_speculative_runtime_hooks=bind_provider
+                    ),
+                ):
+                    selected = eagle_worker_common.bind_eagle_runtime_hooks(
+                        worker, supports_sharded_verify=True
+                    )
+
+                self.assertFalse(processor.sharded_verify)
+                bind_provider.assert_called_once_with(
+                    model, eagle_worker_common.STOCK_SPECULATIVE_RUNTIME_HOOKS
+                )
+                self.assertIs(selected, provider_hooks)
+
+    def test_runtime_alone_binds_stock_for_supported_model_with_master_off(self):
+        worker, _, processor = _worker_with_model_class("Qwen3_5ForCausalLM")
 
         with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(False):
             selected = eagle_worker_common.bind_eagle_runtime_hooks(
@@ -184,13 +240,7 @@ class TestRuntimeHookExecution(CustomTestCase):
         )
 
     def test_unsupported_consumer_keeps_full_vocab(self):
-        processor = LogitsProcessor.__new__(LogitsProcessor)
-        torch.nn.Module.__init__(processor)
-        processor._sharded_verify_eligible = True
-        processor.sharded_verify = False
-        model = torch.nn.Module()
-        model.logits_processor = processor
-        worker = SimpleNamespace(model_runner=SimpleNamespace(model=model))
+        worker, _, processor = _worker_with_model_class("Qwen3_5ForCausalLM")
 
         eagle_worker_common.bind_eagle_runtime_hooks(
             worker, supports_sharded_verify=False
