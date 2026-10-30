@@ -189,9 +189,27 @@ _mc_state = None
 _mc_width = 0
 
 
+def _tp_group_spans_nodes(tp_group) -> bool:
+    """Whether this TP group cannot use node-local multicast mappings."""
+    if tp_group.world_size <= 1:
+        return False
+    from sglang.srt.distributed.parallel_state import in_the_same_node_as
+    from sglang.srt.runtime_context import get_parallel
+
+    return get_parallel().nnodes > 1 and not all(
+        in_the_same_node_as(tp_group.cpu_group, source_rank=0)
+    )
+
+
 def _mc_build(tp_group, hidden_size: int, device):
     """The multimem state, or False (NCCL keeps the exchange) when the buffer has no
     multicast mapping, e.g. a TP group across nodes on torch symmetric memory."""
+    if _tp_group_spans_nodes(tp_group):
+        logger.warning(
+            "Sharded verify multimem disabled because the TP group spans nodes; "
+            "using NCCL"
+        )
+        return False
     from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 
     try:
@@ -361,6 +379,11 @@ def _ll_keys_kernel(
 def _ll_build(tp_group, device):
     """The LL exchange's symmetric buffer (zeroed before any peer can write it) and epoch, or
     False (the other exchanges keep the call) when it has no multicast mapping."""
+    if _tp_group_spans_nodes(tp_group):
+        logger.warning(
+            "Sharded verify LL disabled because the TP group spans nodes; using NCCL"
+        )
+        return False
     import torch.distributed as dist
     import torch.distributed._symmetric_memory as symm_mem
 

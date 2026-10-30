@@ -513,6 +513,47 @@ class TestShardedPolicy(CustomTestCase):
 
 
 class TestShardedReducerContract(CustomTestCase):
+    def test_multinode_tp_rejects_both_multimem_builders(self):
+        group = SimpleNamespace(world_size=8, cpu_group=object())
+        with patch.object(
+            sharded_verify, "_tp_group_spans_nodes", return_value=True
+        ) as spans_nodes:
+            self.assertIs(sharded_verify._ll_build(group, torch.device("cpu")), False)
+            self.assertIs(
+                sharded_verify._mc_build(group, hidden_size=64, device="cpu"), False
+            )
+        self.assertEqual(spans_nodes.call_count, 2)
+
+    def test_multinode_tp_uses_the_same_topology_check_as_all_gatherer(self):
+        group = SimpleNamespace(world_size=8, cpu_group=object())
+        with (
+            patch(
+                "sglang.srt.runtime_context.get_parallel",
+                return_value=SimpleNamespace(nnodes=2),
+            ),
+            patch(
+                "sglang.srt.distributed.parallel_state.in_the_same_node_as",
+                return_value=[True] * 4 + [False] * 4,
+            ) as colocated,
+        ):
+            self.assertTrue(sharded_verify._tp_group_spans_nodes(group))
+        colocated.assert_called_once_with(group.cpu_group, source_rank=0)
+
+        with (
+            patch(
+                "sglang.srt.runtime_context.get_parallel",
+                return_value=SimpleNamespace(nnodes=1),
+            ),
+            patch(
+                "sglang.srt.distributed.parallel_state.in_the_same_node_as",
+                side_effect=AssertionError(
+                    "single-node TP must not run a topology vote"
+                ),
+            ) as colocated,
+        ):
+            self.assertFalse(sharded_verify._tp_group_spans_nodes(group))
+        colocated.assert_not_called()
+
     def test_shard_logits_borrow_one_static_buffer_across_shapes(self):
         processor = LogitsProcessor.__new__(LogitsProcessor)
         torch.nn.Module.__init__(processor)
