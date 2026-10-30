@@ -13,10 +13,11 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.allocation_sizing import (
     get_alloc_len_per_decode,
     get_alloc_reserve_per_decode,
+    get_req_to_token_extra_context_len,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.platforms.rocm import RocmSRTPlatform
-from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel, get_resources
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative import eagle_utils, prepared_next_draft
 from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
@@ -250,9 +251,69 @@ class TestPreparedNextDraft(CustomTestCase):
         worker.adaptive_controller = object()
         worker._next_draft_stager = None
 
-        worker._init_prepared_next_draft_inputs()
+        with get_resources().override(prepared_next_draft_reserve_enabled=True):
+            worker._init_prepared_next_draft_inputs()
+            self.assertFalse(
+                prepared_next_draft.prepared_next_draft_reserve_enabled()
+            )
 
         self.assertIsNone(worker._next_draft_stager)
+
+    def test_three_window_reserve_tracks_constructed_stager(self):
+        """Only a constructed, PP-local stager may reserve the third KV window."""
+        draft_model_runner = SimpleNamespace(
+            runner_ids=SimpleNamespace(is_translating=False),
+            model_config=SimpleNamespace(model_is_mrope=False),
+        )
+        draft_graph_runner = SimpleNamespace(
+            require_mlp_tp_gather=False,
+            capture_bs=(2,),
+            seq_len_fill_value=1,
+            buffers=SimpleNamespace(),
+        )
+        worker = EAGLEWorkerV2.__new__(EAGLEWorkerV2)
+        worker._draft_worker = SimpleNamespace(
+            cuda_graph_runner=draft_graph_runner,
+            draft_runner=draft_model_runner,
+        )
+        worker.adaptive_controller = None
+        worker._post_verify_graphs = Mock()
+        worker.speculative_num_steps = 3
+        worker.speculative_num_draft_tokens = 4
+        worker.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.zeros((4, 80), dtype=torch.int32)
+        )
+
+        with (
+            get_context().override_server_args(
+                speculative_algorithm="EAGLE",
+                speculative_num_steps=3,
+                speculative_eagle_topk=1,
+                speculative_num_draft_tokens=4,
+                page_size=1,
+            ),
+            get_parallel().override(attn_dcp_size=1, pp_size=1),
+            envs.SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.override(True),
+            get_resources().override(prepared_next_draft_reserve_enabled=None),
+            patch.object(
+                prepared_next_draft, "prepared_next_draft_enabled", return_value=True
+            ),
+        ):
+            worker._init_prepared_next_draft_inputs()
+            self.assertIsNotNone(worker._next_draft_stager)
+            self.assertTrue(
+                prepared_next_draft.prepared_next_draft_reserve_enabled()
+            )
+            self.assertEqual(get_alloc_reserve_per_decode(), 3 * 4)
+
+            worker._next_draft_stager = None
+            with get_parallel().override(pp_size=2):
+                worker._init_prepared_next_draft_inputs()
+            self.assertIsNone(worker._next_draft_stager)
+            self.assertFalse(
+                prepared_next_draft.prepared_next_draft_reserve_enabled()
+            )
+            self.assertEqual(get_alloc_reserve_per_decode(), 2 * 4)
 
     def test_graph_and_eager_use_one_mapping_and_eager_reuses_a_ring(self):
         """Captured and eager misses bind the same six runner outputs; eager
@@ -430,11 +491,7 @@ class TestPreparedNextDraft(CustomTestCase):
             ),
             get_parallel().override(attn_dcp_size=1),
             envs.SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.override(True),
-            patch(
-                "sglang.srt.speculative.prepared_next_draft."
-                "prepared_next_draft_enabled",
-                return_value=True,
-            ),
+            get_resources().override(prepared_next_draft_reserve_enabled=True),
         ):
             window = get_alloc_len_per_decode()
             self.assertEqual(get_alloc_reserve_per_decode(), 3 * window)
@@ -448,13 +505,71 @@ class TestPreparedNextDraft(CustomTestCase):
             ),
             get_parallel().override(attn_dcp_size=1),
             envs.SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.override(False),
+            get_resources().override(prepared_next_draft_reserve_enabled=False),
+        ):
+            self.assertEqual(get_alloc_reserve_per_decode(), 2 * window)
+
+    def test_three_window_page_one_row_does_not_overwrite_next_request(self):
+        """The third W=4 window must fit at the page-size-one context edge."""
+        context_len = 64
+        sentinel = -1
+        with (
+            get_context().override_server_args(
+                speculative_algorithm="EAGLE",
+                speculative_num_steps=3,
+                speculative_eagle_topk=1,
+                speculative_num_draft_tokens=4,
+                page_size=1,
+            ),
+            get_parallel().override(attn_dcp_size=1),
+            envs.SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.override(True),
+            get_resources().override(prepared_next_draft_reserve_enabled=None),
             patch(
                 "sglang.srt.speculative.prepared_next_draft."
                 "prepared_next_draft_enabled",
                 return_value=True,
             ),
         ):
-            self.assertEqual(get_alloc_reserve_per_decode(), 2 * window)
+            self.assertIsNone(
+                get_resources().prepared_next_draft_reserve_enabled
+            )
+            self.assertTrue(
+                prepared_next_draft.prepared_next_draft_reserve_configured()
+            )
+            reserve = get_alloc_reserve_per_decode()
+            extra = get_req_to_token_extra_context_len()
+            row_width = context_len + extra
+
+        committed = context_len - 3
+        table = torch.full((2, row_width), sentinel, dtype=torch.int64)
+        table.view(-1)[committed : committed + reserve] = torch.arange(reserve)
+
+        self.assertEqual(reserve, 3 * 4)
+        self.assertEqual(extra, reserve)
+        self.assertEqual(table[1, 0].item(), sentinel)
+
+    def test_single_step_configuration_keeps_two_window_row(self):
+        """A single draft step has no draft graph, so it cannot arm 3W sizing."""
+        with (
+            get_context().override_server_args(
+                speculative_algorithm="EAGLE",
+                speculative_num_steps=1,
+                speculative_eagle_topk=1,
+                speculative_num_draft_tokens=4,
+                page_size=1,
+            ),
+            get_parallel().override(attn_dcp_size=1),
+            envs.SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.override(True),
+            get_resources().override(prepared_next_draft_reserve_enabled=None),
+            patch.object(
+                prepared_next_draft, "prepared_next_draft_enabled", return_value=True
+            ),
+        ):
+            self.assertFalse(
+                prepared_next_draft.prepared_next_draft_reserve_configured()
+            )
+            self.assertEqual(get_alloc_reserve_per_decode(), 2 * 4)
+            self.assertEqual(get_req_to_token_extra_context_len(), 4 + 4)
 
     def test_future_map_uses_prepared_lengths_without_waiting_for_the_relay(self):
         """An unchanged batch must not wait for or gather the relay that the

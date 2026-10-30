@@ -10,7 +10,15 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel, get_schedule, get_spec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_memory,
+    get_model,
+    get_parallel,
+    get_resources,
+    get_schedule,
+    get_spec,
+)
 
 
 @cache
@@ -23,6 +31,23 @@ def prepared_next_draft_enabled() -> bool:
         and (get_spec().speculative_eagle_topk or 1) == 1
         and not get_schedule().disable_overlap_schedule
         and get_parallel().moe_ep_size == 1
+    )
+
+
+def prepared_next_draft_reserve_configured() -> bool:
+    """Safe pre-pool upper bound; graph initialization may only narrow it."""
+    spec = get_spec()
+    return (
+        prepared_next_draft_enabled()
+        and not spec.speculative_adaptive
+        and get_parallel().pp_size == 1
+        and not get_parallel().attn_dp_enabled
+        and (spec.speculative_num_steps or 0) > 1
+        and (spec.speculative_num_steps or 0)
+        < (spec.speculative_num_draft_tokens or 0)
+        and not get_exec().graph.disable_cuda_graph
+        and not get_memory().enable_unified_memory
+        and get_model().model_impl != "mindspore"
     )
 
 
@@ -389,6 +414,22 @@ class NextDraftInputStager:
         prepared = None if lease is None else lease.prepared
         self.forget()
         return prepared
+
+
+def set_prepared_next_draft_reserve_enabled(enabled: bool) -> None:
+    """Resolve the pre-pool upper bound to the graph initialization result."""
+    assert not enabled or prepared_next_draft_reserve_configured()
+    get_resources().prepared_next_draft_reserve_enabled = enabled
+
+
+def prepared_next_draft_reserve_enabled() -> bool:
+    """Whether row sizing or live allocation needs the third KV window."""
+    resolved = get_resources().prepared_next_draft_reserve_enabled
+    return (
+        prepared_next_draft_reserve_configured()
+        if resolved is None
+        else resolved
+    )
 
 
 class PreparedNextDraftProducer:

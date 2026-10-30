@@ -1480,12 +1480,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
     def _init_prepared_next_draft_inputs(self) -> None:
         """Connect compatible generic post-verify and draft runtime buffers."""
+        self._next_draft_stager = None
+        prepared_next_draft.set_prepared_next_draft_reserve_enabled(False)
         if (
             self._draft_worker is None
             or self.adaptive_controller is not None
-            or not prepared_next_draft.prepared_next_draft_enabled()
+            or not prepared_next_draft.prepared_next_draft_reserve_configured()
             or self._post_verify_graphs is None
-            or self.speculative_num_steps <= 0
+            or self.speculative_num_steps <= 1
             or self.speculative_num_steps >= self.speculative_num_draft_tokens
         ):
             return
@@ -1512,6 +1514,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             runner_buffers=draft_runner.buffers,
             capture_sizes=draft_runner.capture_bs,
         )
+        prepared_next_draft.set_prepared_next_draft_reserve_enabled(True)
 
     def take_prepared_seq_lens(self, batch: ScheduleBatch) -> Optional[torch.Tensor]:
         if self._next_draft_stager is None or not batch.forward_mode.is_decode():
