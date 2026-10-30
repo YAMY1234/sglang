@@ -237,7 +237,8 @@ def _mc_gather_keys(keys: torch.Tensor, tp_group) -> Optional[torch.Tensor]:
 
 
 # Epoch-tagged exchange of one key per row. The low/high halves use two 64-bit
-# words whose high halves carry the epoch; three slots rotate by epoch.
+# words whose high halves carry a nonzero 32-bit tag.  A separate cursor rotates
+# the three slots, so wrapping the wire tag never reuses the preceding slot.
 _LL_SLOTS = 3
 _LL_MAX_ROWS = 64
 _LL_SPIN_LIMIT = 1 << 26
@@ -307,8 +308,14 @@ def _ll_keys_kernel(
     KEY_FLOOR: tl.constexpr,
     SPIN_LIMIT: tl.constexpr,
 ):
-    tag = (tl.load(epoch_ptr) + 1).to(tl.uint64)
-    slot = (tag % 3).to(tl.int64)
+    # The wire format has exactly 32 tag bits.  Reinterpret the signed storage
+    # before widening, skip zero (the buffer's initial value), and keep slot
+    # rotation independent from tag wrap.  Both counters stay device-owned so
+    # CUDA graph replay never introduces a host synchronization.
+    last_tag = tl.load(epoch_ptr).to(tl.uint32, bitcast=True).to(tl.uint64)
+    tag = last_tag + 1
+    tag = tl.where(tag == 4294967296, 1, tag)
+    slot = ((tl.load(epoch_ptr + 1) + 1) % 3).to(tl.int64)
     r = tl.arange(0, BLOCK_R)
     p = tl.arange(0, BLOCK_P)
     rmask = r < rows
@@ -347,7 +354,8 @@ def _ll_keys_kernel(
     got = (((hi & 0xFFFFFFFF) << 32) | (lo & 0xFFFFFFFF)).to(tl.int64, bitcast=True)
     best = tl.max(tl.where(m2, got, KEY_FLOOR), axis=0)
     tl.store(tokens_ptr + r, 4294967295 - (best & 4294967295), mask=rmask)
-    tl.store(epoch_ptr, tag.to(tl.int32))
+    tl.store(epoch_ptr, tag.to(tl.uint32).to(tl.int32, bitcast=True))
+    tl.store(epoch_ptr + 1, slot.to(tl.int32))
 
 
 def _ll_build(tp_group, device):
@@ -374,7 +382,8 @@ def _ll_build(tp_group, device):
     buf.zero_()
     torch.cuda.synchronize(device)
     dist.barrier(group=tp_group.cpu_group)
-    epoch = torch.zeros(1, dtype=torch.int32, device=device)
+    # [last nonzero wire tag bits, independent slot cursor]
+    epoch = torch.zeros(2, dtype=torch.int32, device=device)
     return (buf, hdl, epoch)
 
 

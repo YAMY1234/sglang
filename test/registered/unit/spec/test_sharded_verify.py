@@ -725,7 +725,7 @@ class TestLLKeys(CustomTestCase):
             dtype=torch.int64,
             device="cuda",
         )
-        epoch = torch.zeros(1, dtype=torch.int32, device="cuda")
+        epoch = torch.zeros(2, dtype=torch.int32, device="cuda")
         writer = torch.cuda.Stream()
         # load the writer's kernels now: lazy loading them would wait for a spinning poll
         torch.cuda._sleep(1)
@@ -780,7 +780,72 @@ class TestLLKeys(CustomTestCase):
         torch.cuda.synchronize()
         wrong = sum(not torch.equal(t, w) for t, w in launches)
         self.assertEqual(wrong, 0, f"{wrong} of {self.LAUNCHES} launches")
-        self.assertEqual(int(epoch), self.LAUNCHES)
+        self.assertEqual(int(epoch[0]), self.LAUNCHES)
+        self.assertEqual(int(epoch[1]), self.LAUNCHES % sharded_verify._LL_SLOTS)
+
+    def _check_epoch_wrap(self, last_tag):
+        rows, parts = 7, 2
+        maxr = sharded_verify._LL_MAX_ROWS
+        buf = torch.zeros(
+            sharded_verify._LL_SLOTS * maxr * 2,
+            dtype=torch.int64,
+            device="cuda",
+        )
+        state = torch.tensor(
+            [
+                last_tag if last_tag < 2**31 else last_tag - 2**32,
+                last_tag % sharded_verify._LL_SLOTS,
+            ],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        launches = []
+        gen = torch.Generator(device="cuda").manual_seed(last_tag)
+        for _ in range(4):
+            logits = torch.randn(
+                (rows, 257), device="cuda", dtype=torch.bfloat16, generator=gen
+            )
+            want = torch.argmax(logits.float(), dim=-1)
+            keys = shard_keys(
+                logits,
+                VocabShard(start=0, valid=257, vocab_size=257),
+                splits=parts,
+            )
+            tokens = torch.full((rows,), -5, dtype=torch.int64, device="cuda")
+            sharded_verify._ll_keys_kernel[(1,)](
+                keys,
+                parts,
+                rows,
+                buf.data_ptr(),
+                buf.data_ptr(),
+                state,
+                tokens,
+                RANK=0,
+                WORLD=1,
+                MAXR=maxr,
+                BLOCK_R=16,
+                BLOCK_P=2,
+                KEY_FLOOR=sharded_verify._KEY_FLOOR,
+                SPIN_LIMIT=1 << 10,
+                num_warps=4,
+            )
+            launches.append((tokens, want))
+
+        # Do not synchronize between launches: the epoch is device-owned and this
+        # path must remain capturable without a GPU-to-CPU round trip.
+        torch.cuda.synchronize()
+        for got, want in launches:
+            self.assertTrue(torch.equal(got, want))
+        expected_tag = last_tag
+        for _ in range(4):
+            expected_tag = (expected_tag + 1) & 0xFFFFFFFF
+            if expected_tag == 0:
+                expected_tag = 1
+        self.assertEqual(int(state[0]) & 0xFFFFFFFF, expected_tag)
+        self.assertEqual(
+            int(state[1]),
+            (last_tag % sharded_verify._LL_SLOTS + 4) % sharded_verify._LL_SLOTS,
+        )
 
     def test_every_row_gets_every_ranks_max(self):
         with patch.object(sharded_verify, "_ll_st_b64", _plain_st_b64):
@@ -789,6 +854,12 @@ class TestLLKeys(CustomTestCase):
                     for late in (False, True) if world > 1 else (False,):
                         with self.subTest(world=world, rows=rows, late=late):
                             self._check(world, rows, late)
+
+    def test_epoch_wrap_keeps_tags_nonzero_and_slots_independent(self):
+        with patch.object(sharded_verify, "_ll_st_b64", _plain_st_b64):
+            for last_tag in (2**31 - 2, 0xFFFFFFFE):
+                with self.subTest(last_tag=hex(last_tag)):
+                    self._check_epoch_wrap(last_tag)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
