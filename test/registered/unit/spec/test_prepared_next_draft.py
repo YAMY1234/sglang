@@ -49,6 +49,7 @@ def _req(slot: int, *, allocated: int, committed: int = 100) -> Req:
 
 
 def _batch(slots, allocated, *, mode=ForwardMode.DECODE):
+    slots = tuple(slots)
     return SimpleNamespace(
         reqs=[
             _req(slot, allocated=alloc)
@@ -56,6 +57,7 @@ def _batch(slots, allocated, *, mode=ForwardMode.DECODE):
         ],
         forward_mode=mode,
         multimodal_inputs=[None] * len(slots),
+        req_pool_indices_cpu=torch.tensor(slots, dtype=torch.int64),
     )
 
 

@@ -574,8 +574,24 @@ def _check_prepared_lengths(test, graphs, *, device):
         round_n2 = run(round_n1)[3]
         test.assertEqual(round_n2.data_ptr(), round_n.data_ptr())
         test.assertTrue(torch.equal(round_n2, want_n + 6))
-        with test.assertRaisesRegex(RuntimeError, "holds this batch's lengths"):
-            run(round_n1)  # round N+1's slot is next: a batch still on its lengths
+        # Round N+1's slot is next, but this batch still reads its lengths. The
+        # graph must decline before advancing its slot or forced-acceptance RNG.
+        state = graphs._states[0]
+        turn = state.turn
+        snapshot = round_n1.clone()
+        with patch.object(
+            graphs, "_draw_sim_len", wraps=graphs._draw_sim_len
+        ) as draw_sim_len:
+            test.assertIsNone(run(round_n1))
+        draw_sim_len.assert_not_called()
+        test.assertEqual(state.turn, turn)
+        test.assertTrue(torch.equal(round_n1, snapshot))
+
+        # Eager verify owns a distinct lengths tensor; the same graph slot can
+        # then resume without retaining a permanent failure state.
+        resumed = run(round_n1.clone())
+        test.assertIsNotNone(resumed)
+        test.assertTrue(torch.equal(resumed[3], snapshot + 3))
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")

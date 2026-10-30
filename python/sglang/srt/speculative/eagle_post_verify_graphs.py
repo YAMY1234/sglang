@@ -407,15 +407,17 @@ class _PostVerifyGraphs:
             state = self._states[key] = SimpleNamespace(
                 warmups=0, turn=0, slots=[None, None]
             )
-        turn, state.turn = state.turn, state.turn ^ 1
-        sim_len, sim_turn = self._draw_sim_len(sim_max_len)
+        turn = state.turn
         slot = state.slots[turn]
         if (
             self._protect_prepared_seq_lens
             and slot is not None
             and slot.graph is not None
+            and not _check_lengths_outlive(slot, inputs["seq_lens"])
         ):
-            _check_lengths_outlive(slot, inputs["seq_lens"])
+            return None
+        state.turn ^= 1
+        sim_len, sim_turn = self._draw_sim_len(sim_max_len)
         if slot is None:
             staged = {name: src.clone() for name, src in inputs.items()}
             if sim_len is not None:
@@ -540,13 +542,9 @@ class _PostVerifyGraphs:
         )
 
 
-def _check_lengths_outlive(slot: SimpleNamespace, seq_lens: torch.Tensor) -> None:
-    """Reject replaying the slot whose lengths the current round still reads."""
-    if seq_lens.data_ptr() == slot.outputs[3].data_ptr():
-        raise RuntimeError(
-            "The post-verify slot about to replay holds this batch's lengths; "
-            "its readers in this round would see the overwrite"
-        )
+def _check_lengths_outlive(slot: SimpleNamespace, seq_lens: torch.Tensor) -> bool:
+    """Whether replay can overwrite this slot without aliasing its live lengths."""
+    return seq_lens.data_ptr() != slot.outputs[3].data_ptr()
 
 
 def _post_verify_inputs(

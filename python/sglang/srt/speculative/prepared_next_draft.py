@@ -342,23 +342,26 @@ class NextDraftInputStager:
         self._resolution_attempted = False
 
     def _batch_key(self, batch) -> Optional[PreparedRoundKey]:
-        generations = getattr(self.req_to_token_pool, "req_generation", None)
+        generations = self.req_to_token_pool.req_generation
+        slots_tensor = batch.req_pool_indices_cpu
         if (
             not isinstance(generations, torch.Tensor)
             or generations.device.type != "cpu"
             or generations.ndim != 1
             or generations.dtype not in (torch.int32, torch.int64)
+            or not isinstance(slots_tensor, torch.Tensor)
+            or slots_tensor.device.type != "cpu"
+            or slots_tensor.ndim != 1
+            or slots_tensor.dtype not in (torch.int32, torch.int64)
+            or slots_tensor.numel() != len(batch.reqs)
         ):
             return None
-        try:
-            slots = tuple(int(req.kv.req_pool_idx) for req in batch.reqs)
-        except (TypeError, ValueError):
-            return None
+        slots = tuple(slots_tensor.tolist())
         if any(slot < 0 or slot >= generations.numel() for slot in slots):
             return None
         return PreparedRoundKey(
             request_slots=slots,
-            request_generations=tuple(int(generations[slot]) for slot in slots),
+            request_generations=tuple(generations[slots_tensor].tolist()),
         )
 
     def _batch_uses_mrope(self, batch) -> bool:
