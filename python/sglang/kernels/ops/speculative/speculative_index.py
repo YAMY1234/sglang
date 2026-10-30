@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit
@@ -11,6 +13,9 @@ from sglang.srt.utils.common import is_cuda
 _INDEX_DTYPES = (torch.int32, torch.int64)
 _is_cuda = is_cuda()
 _descriptors: dict[str, tuple[torch.Tensor, object]] = {}
+_module_available: bool | None = None
+
+logger = logging.getLogger(__name__)
 
 
 def _runtime_optimization_enabled() -> bool:
@@ -29,6 +34,27 @@ def _module():
             ("draft_locs", "SpeculativeIndex::draft_locs"),
         ],
     )
+
+
+def precompile() -> bool:
+    """Compile once during worker initialization and cache capability rejection."""
+    global _module_available
+    if _module_available is not None:
+        return _module_available
+    if not _is_cuda or not _runtime_optimization_enabled():
+        _module_available = False
+        return False
+    try:
+        _module()
+    except Exception as exc:
+        logger.warning(
+            "Speculative index kernels could not be compiled; using stock kernels: %s",
+            exc,
+        )
+        _module_available = False
+    else:
+        _module_available = True
+    return _module_available
 
 
 def _descriptor(name: str, num_entries: int):
@@ -60,7 +86,11 @@ def chain_tree(
     out_cache_loc,
     mrope,
 ) -> bool:
-    if not _is_cuda or not _runtime_optimization_enabled():
+    if (
+        not _is_cuda
+        or not _runtime_optimization_enabled()
+        or _module_available is not True
+    ):
         return False
     required = (bonus, draft, seq, mask, positions, retrieve, tokens)
     if not all(isinstance(tensor, torch.Tensor) for tensor in required):
@@ -156,7 +186,11 @@ def chain_tree(
 def extend_layout(
     *, seq, width, prefix, extend, post, positions, starts, mrope
 ) -> bool:
-    if not _is_cuda or not _runtime_optimization_enabled():
+    if (
+        not _is_cuda
+        or not _runtime_optimization_enabled()
+        or _module_available is not True
+    ):
         return False
     required = (seq, prefix, extend, post, positions, starts)
     if not all(isinstance(tensor, torch.Tensor) for tensor in required) or not (
@@ -227,7 +261,11 @@ def draft_locs(
     positions,
     mrope,
 ) -> bool:
-    if not _is_cuda or not _runtime_optimization_enabled():
+    if (
+        not _is_cuda
+        or not _runtime_optimization_enabled()
+        or _module_available is not True
+    ):
         return False
     required = (req, table, seq, out_cache_loc)
     optional = (positions, mrope)

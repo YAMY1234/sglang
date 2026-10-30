@@ -231,6 +231,8 @@ def test_draft_extend_layout_graph(bs, width, mrope, monkeypatch):
     monkeypatch.setattr(
         speculative_index, "_runtime_optimization_enabled", lambda: True
     )
+    monkeypatch.setattr(speculative_index, "_module_available", None)
+    assert speculative_index.precompile()
     original_extend_layout = speculative_index.extend_layout
     fast_path_calls = 0
 
@@ -286,6 +288,8 @@ def test_chain_tree_graph(bs, depth, preallocated, monkeypatch):
     monkeypatch.setattr(
         speculative_index, "_runtime_optimization_enabled", lambda: True
     )
+    monkeypatch.setattr(speculative_index, "_module_available", None)
+    assert speculative_index.precompile()
     original_chain_tree = speculative_index.chain_tree
     fast_path_calls = 0
 
@@ -357,6 +361,8 @@ def test_chain_tree_prepared_outputs_graph(bs, depth, mrope, monkeypatch):
     monkeypatch.setattr(
         speculative_index, "_runtime_optimization_enabled", lambda: True
     )
+    monkeypatch.setattr(speculative_index, "_module_available", None)
+    assert speculative_index.precompile()
     original_chain_tree = speculative_index.chain_tree
     fast_path_calls = 0
 
@@ -421,6 +427,8 @@ def test_draft_cache_positions_graph(bs, steps, mrope, optimized, monkeypatch):
     monkeypatch.setattr(
         speculative_index, "_runtime_optimization_enabled", lambda: True
     )
+    monkeypatch.setattr(speculative_index, "_module_available", None)
+    assert speculative_index.precompile()
     table = torch.arange((bs + 3) * 64, dtype=torch.int32, device="cuda").reshape(
         bs + 3, 64
     )
@@ -528,12 +536,74 @@ def test_speculative_index_master_off_uses_stock(monkeypatch):
     )
 
 
+def test_speculative_index_compile_failure_is_cached(monkeypatch, caplog):
+    from sglang.kernels.ops.speculative import speculative_index
+
+    attempts = 0
+
+    def failed_module():
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("read-only JIT cache")
+
+    monkeypatch.setattr(speculative_index, "_is_cuda", True)
+    monkeypatch.setattr(
+        speculative_index, "_runtime_optimization_enabled", lambda: True
+    )
+    monkeypatch.setattr(speculative_index, "_module_available", None)
+    monkeypatch.setattr(speculative_index, "_module", failed_module)
+
+    with caplog.at_level("WARNING"):
+        assert not speculative_index.precompile()
+        assert not speculative_index.precompile()
+
+    assert attempts == 1
+    assert "using stock kernels" in caplog.text
+    assert not speculative_index.chain_tree(
+        bonus=None,
+        draft=None,
+        seq=None,
+        mask=None,
+        positions=None,
+        retrieve=None,
+        tokens=None,
+        req=None,
+        table=None,
+        out_cache_loc=None,
+        mrope=None,
+    )
+    assert not speculative_index.extend_layout(
+        seq=None,
+        width=1,
+        prefix=None,
+        extend=None,
+        post=None,
+        positions=None,
+        starts=None,
+        mrope=None,
+    )
+    assert not speculative_index.draft_locs(
+        req=None,
+        table=None,
+        seq=None,
+        out_cache_loc=None,
+        pool_len=1,
+        topk=1,
+        steps=1,
+        batch_size=1,
+        positions=None,
+        mrope=None,
+    )
+    assert attempts == 1
+
+
 def test_speculative_index_rejects_unsupported_contracts(monkeypatch):
     from sglang.kernels.ops.speculative import speculative_index
 
     monkeypatch.setattr(
         speculative_index, "_runtime_optimization_enabled", lambda: True
     )
+    monkeypatch.setattr(speculative_index, "_module_available", True)
 
     def forbidden_module():
         raise AssertionError("unsupported inputs must not load the JIT module")
@@ -612,6 +682,8 @@ def test_prepare_draft_window_matches_draft_locs(
         "_runtime_optimization_enabled",
         lambda: True,
     )
+    monkeypatch.setattr(speculative_index, "_module_available", None)
+    assert speculative_index.precompile()
 
     table = torch.arange((bs + 3) * 64, dtype=torch.int32, device="cuda").reshape(
         bs + 3, 64
