@@ -511,6 +511,30 @@ class TestShardedPolicy(CustomTestCase):
 
 
 class TestShardedReducerContract(CustomTestCase):
+    def test_non_power_of_two_world_uses_portable_collective(self):
+        keys = torch.tensor([5, 9], dtype=torch.int64)
+        gathered = keys.repeat(6)
+        group = SimpleNamespace(world_size=6)
+        group.all_gather_into_tensor = lambda output, _input: output.copy_(gathered)
+
+        with (
+            patch.object(
+                sharded_verify,
+                "_ll_keys",
+                side_effect=AssertionError("LL requires a power-of-two world"),
+            ) as ll,
+            patch.object(
+                sharded_verify,
+                "_mc_gather_keys",
+                side_effect=AssertionError("multimem requires a power-of-two world"),
+            ) as mc,
+        ):
+            got = reduce_sharded_token_keys(keys, group, splits=1)
+
+        ll.assert_not_called()
+        mc.assert_not_called()
+        self.assertTrue(torch.equal(got, keys_to_tokens(gathered, 6)))
+
     def test_rejects_noncanonical_provider_keys_before_exchange(self):
         group = SimpleNamespace(world_size=2)
         with self.assertRaisesRegex(TypeError, "torch.int64"):

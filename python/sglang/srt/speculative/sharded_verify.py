@@ -463,19 +463,25 @@ def reduce_sharded_token_keys(
         raise ValueError(
             f"keys shape {tuple(keys.shape)} is incompatible with splits={splits}"
         )
-    if 0 < keys.shape[0] <= _LL_MAX_ROWS and tp_group.world_size <= 16:
+    world = tp_group.world_size
+    power_of_two_world = world > 0 and (world & (world - 1)) == 0
+    if (
+        0 < keys.shape[0] <= _LL_MAX_ROWS
+        and world <= 16
+        and power_of_two_world
+    ):
         tokens = _ll_keys(keys, tp_group)
         if tokens is not None:
             return tokens
-    if 0 < keys.shape[0] <= _MC_MAX_ROWS:
+    if 0 < keys.shape[0] <= _MC_MAX_ROWS and power_of_two_world:
         tokens = _mc_gather_keys(keys, tp_group)
         if tokens is not None:
             return tokens
     gathered = torch.empty(
-        tp_group.world_size * keys.numel(), dtype=torch.int64, device=keys.device
+        world * keys.numel(), dtype=torch.int64, device=keys.device
     )
     tp_group.all_gather_into_tensor(gathered, keys.view(-1))
-    return keys_to_tokens(gathered, tp_group.world_size, splits)
+    return keys_to_tokens(gathered, world, splits)
 
 
 def gather_full_logits(
