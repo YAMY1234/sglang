@@ -513,46 +513,74 @@ class TestShardedPolicy(CustomTestCase):
 
 
 class TestShardedReducerContract(CustomTestCase):
-    def test_multinode_tp_rejects_both_multimem_builders(self):
+    def test_cross_domain_tp_rejects_both_multimem_builders(self):
         group = SimpleNamespace(world_size=8, cpu_group=object())
         with patch.object(
-            sharded_verify, "_tp_group_spans_nodes", return_value=True
-        ) as spans_nodes:
+            sharded_verify, "_tp_group_in_one_nvlink_domain", return_value=False
+        ) as in_domain:
             self.assertIs(sharded_verify._ll_build(group, torch.device("cpu")), False)
             self.assertIs(
                 sharded_verify._mc_build(group, hidden_size=64, device="cpu"), False
             )
-        self.assertEqual(spans_nodes.call_count, 2)
+        self.assertEqual(in_domain.call_count, 2)
 
-    def test_multinode_tp_uses_the_same_topology_check_as_all_gatherer(self):
+    def test_tp_uses_nvlink_domain_instead_of_host_boundary(self):
         group = SimpleNamespace(world_size=8, cpu_group=object())
-        with (
-            patch(
-                "sglang.srt.runtime_context.get_parallel",
-                return_value=SimpleNamespace(nnodes=2),
-            ),
-            patch(
-                "sglang.srt.distributed.parallel_state.in_the_same_node_as",
-                return_value=[True] * 4 + [False] * 4,
-            ) as colocated,
-        ):
-            self.assertTrue(sharded_verify._tp_group_spans_nodes(group))
-        colocated.assert_called_once_with(group.cpu_group, source_rank=0)
+        with patch(
+            "sglang.srt.distributed.device_communicators.custom_all_reduce_utils.in_one_nvlink_domain",
+            return_value=True,
+        ) as in_domain:
+            self.assertTrue(
+                sharded_verify._tp_group_in_one_nvlink_domain(group, "cuda:0")
+            )
+        in_domain.assert_called_once_with(group.cpu_group, torch.device("cuda:0"))
 
+    def test_multinode_one_nvlink_domain_keeps_both_multimem_builders(self):
+        cpu_group = object()
+        device_group = object()
+        group = SimpleNamespace(
+            world_size=8,
+            cpu_group=cpu_group,
+            device_group=device_group,
+            rank_in_group=0,
+        )
+        mc_state = SimpleNamespace(
+            symm_mem_hdl=SimpleNamespace(multicast_ptr=1),
+        )
+        ll_buffer = torch.zeros(1, dtype=torch.int64)
+        ll_handle = SimpleNamespace(multicast_ptr=1)
         with (
+            patch.object(
+                sharded_verify, "_tp_group_in_one_nvlink_domain", return_value=True
+            ) as in_domain,
             patch(
-                "sglang.srt.runtime_context.get_parallel",
-                return_value=SimpleNamespace(nnodes=1),
+                "sglang.srt.distributed.device_communicators.triton_symm_mem_ag.create_state",
+                return_value=mc_state,
+            ) as create_state,
+            patch("torch.distributed._symmetric_memory.empty", return_value=ll_buffer),
+            patch(
+                "torch.distributed._symmetric_memory.rendezvous",
+                return_value=ll_handle,
             ),
-            patch(
-                "sglang.srt.distributed.parallel_state.in_the_same_node_as",
-                side_effect=AssertionError(
-                    "single-node TP must not run a topology vote"
-                ),
-            ) as colocated,
+            patch("torch.cuda.synchronize"),
+            patch("torch.distributed.barrier"),
         ):
-            self.assertFalse(sharded_verify._tp_group_spans_nodes(group))
-        colocated.assert_not_called()
+            self.assertIs(
+                sharded_verify._mc_build(group, hidden_size=64, device="cpu"),
+                mc_state,
+            )
+            ll_state = sharded_verify._ll_build(group, torch.device("cpu"))
+
+        self.assertIs(ll_state[0], ll_buffer)
+        self.assertIs(ll_state[1], ll_handle)
+        self.assertEqual(in_domain.call_count, 2)
+        create_state.assert_called_once_with(
+            device_group,
+            0,
+            max_tokens=sharded_verify._MC_MAX_ROWS,
+            hidden_size=64,
+            device="cpu",
+        )
 
     def test_shard_logits_borrow_one_static_buffer_across_shapes(self):
         processor = LogitsProcessor.__new__(LogitsProcessor)

@@ -189,25 +189,31 @@ _mc_state = None
 _mc_width = 0
 
 
-def _tp_group_spans_nodes(tp_group) -> bool:
-    """Whether this TP group cannot use node-local multicast mappings."""
+def _tp_group_in_one_nvlink_domain(tp_group, device) -> bool:
+    """Whether every TP rank shares one NVLink address space.
+
+    A GB200/GB300 NVL72 fabric spans multiple hosts, so host co-location is not
+    the capability boundary.  Reuse the custom-all-reduce topology probe: it
+    checks full NVLink connectivity on one host and the NVML fabric clique for
+    a multi-host group.  The builders below still require symmetric-memory
+    rendezvous and a nonzero multicast pointer before engaging the fast path.
+    """
     if tp_group.world_size <= 1:
         return False
-    from sglang.srt.distributed.parallel_state import in_the_same_node_as
-    from sglang.srt.runtime_context import get_parallel
-
-    return get_parallel().nnodes > 1 and not all(
-        in_the_same_node_as(tp_group.cpu_group, source_rank=0)
+    from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
+        in_one_nvlink_domain,
     )
+
+    return in_one_nvlink_domain(tp_group.cpu_group, torch.device(device))
 
 
 def _mc_build(tp_group, hidden_size: int, device):
     """The multimem state, or False (NCCL keeps the exchange) when the buffer has no
-    multicast mapping, e.g. a TP group across nodes on torch symmetric memory."""
-    if _tp_group_spans_nodes(tp_group):
+    multicast mapping, e.g. a TP group spanning distinct NVLink fabric domains."""
+    if not _tp_group_in_one_nvlink_domain(tp_group, device):
         logger.warning(
-            "Sharded verify multimem disabled because the TP group spans nodes; "
-            "using NCCL"
+            "Sharded verify multimem disabled because the TP group is outside "
+            "one NVLink fabric domain; using NCCL"
         )
         return False
     from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
@@ -226,6 +232,10 @@ def _mc_build(tp_group, hidden_size: int, device):
     if state.symm_mem_hdl.multicast_ptr == 0:
         logger.warning("Sharded verify has no multicast mapping; using NCCL")
         return False
+    logger.info(
+        "Sharded verify MC multimem exchange enabled (world_size=%d)",
+        tp_group.world_size,
+    )
     return state
 
 
@@ -379,9 +389,10 @@ def _ll_keys_kernel(
 def _ll_build(tp_group, device):
     """The LL exchange's symmetric buffer (zeroed before any peer can write it) and epoch, or
     False (the other exchanges keep the call) when it has no multicast mapping."""
-    if _tp_group_spans_nodes(tp_group):
+    if not _tp_group_in_one_nvlink_domain(tp_group, device):
         logger.warning(
-            "Sharded verify LL disabled because the TP group spans nodes; using NCCL"
+            "Sharded verify LL disabled because the TP group is outside one "
+            "NVLink fabric domain; using NCCL"
         )
         return False
     import torch.distributed as dist
@@ -407,6 +418,10 @@ def _ll_build(tp_group, device):
     dist.barrier(group=tp_group.cpu_group)
     # [last nonzero wire tag bits, independent slot cursor]
     epoch = torch.zeros(2, dtype=torch.int32, device=device)
+    logger.info(
+        "Sharded verify LL multimem exchange enabled (world_size=%d)",
+        tp_group.world_size,
+    )
     return (buf, hdl, epoch)
 
 
