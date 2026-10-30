@@ -1469,7 +1469,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         super().init_attention_backends()
         # Resolve once before any eager or captured post-verify path runs.
         self._speculative_runtime_hooks = bind_eagle_runtime_hooks(
-            self.target_worker, supports_sharded_verify=True
+            self.target_worker, supports_sharded_verify=self.topk == 1
         )
         # not in __init__, which the standalone and frozen-KV workers do not run
         if (

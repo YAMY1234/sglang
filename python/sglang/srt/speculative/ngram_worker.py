@@ -160,7 +160,7 @@ class NGRAMWorker(BaseSpecWorker):
     def init_attention_backends(self):
         super().init_attention_backends()
         self._speculative_runtime_hooks = bind_eagle_runtime_hooks(
-            self.target_worker, supports_sharded_verify=True
+            self.target_worker, supports_sharded_verify=False
         )
 
     def add_external_corpus(self, corpus_id: str, token_chunks: list[list[int]]) -> int:

@@ -94,6 +94,76 @@ class _PostVerify:
 
 
 class TestRuntimeHookExecution(CustomTestCase):
+    def _assert_worker_sharded_verify_support(
+        self,
+        *,
+        module_name,
+        worker_name,
+        topk,
+        expected,
+        tree_mode=None,
+    ):
+        from importlib import import_module
+
+        module = import_module(module_name)
+        worker = getattr(module, worker_name).__new__(getattr(module, worker_name))
+        worker.topk = topk
+        worker._target_worker = SimpleNamespace()
+        worker._draft_worker = None
+        if tree_mode is not None:
+            worker.tree_mode = tree_mode
+
+        hooks = object()
+        with (
+            patch(
+                "sglang.srt.speculative.base_spec_worker.BaseSpecWorker.init_attention_backends"
+            ),
+            patch.object(
+                module, "bind_eagle_runtime_hooks", return_value=hooks
+            ) as bind,
+        ):
+            worker.init_attention_backends()
+
+        bind.assert_called_once_with(
+            worker.target_worker,
+            supports_sharded_verify=expected,
+        )
+        self.assertIs(worker._speculative_runtime_hooks, hooks)
+
+    def test_eagle_sharded_verify_opt_in_requires_topk_one(self):
+        for topk, expected in ((1, True), (2, False)):
+            with self.subTest(topk=topk):
+                self._assert_worker_sharded_verify_support(
+                    module_name="sglang.srt.speculative.eagle_worker_v2",
+                    worker_name="EAGLEWorkerV2",
+                    topk=topk,
+                    expected=expected,
+                )
+
+    def test_multi_layer_eagle_sharded_verify_opt_in_requires_topk_one(self):
+        for topk, expected in ((1, True), (2, False)):
+            with self.subTest(topk=topk):
+                self._assert_worker_sharded_verify_support(
+                    module_name="sglang.srt.speculative.multi_layer_eagle_worker_v2",
+                    worker_name="MultiLayerEagleWorkerV2",
+                    topk=topk,
+                    expected=expected,
+                )
+
+    def test_ngram_and_uno_keep_full_vocab(self):
+        for module_name, worker_name, tree_mode in (
+            ("sglang.srt.speculative.ngram_worker", "NGRAMWorker", None),
+            ("sglang.srt.speculative.uno_worker_v2", "UnoWorkerV2", False),
+        ):
+            with self.subTest(worker=worker_name):
+                self._assert_worker_sharded_verify_support(
+                    module_name=module_name,
+                    worker_name=worker_name,
+                    topk=1,
+                    expected=False,
+                    tree_mode=tree_mode,
+                )
+
     def test_runtime_alone_binds_stock_and_opts_in_supported_consumer(self):
         processor = LogitsProcessor.__new__(LogitsProcessor)
         torch.nn.Module.__init__(processor)

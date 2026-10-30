@@ -1104,7 +1104,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
     def init_attention_backends(self):
         super().init_attention_backends()
         self._speculative_runtime_hooks = bind_eagle_runtime_hooks(
-            self.target_worker, supports_sharded_verify=True
+            self.target_worker, supports_sharded_verify=self.topk == 1
         )
 
     @property
