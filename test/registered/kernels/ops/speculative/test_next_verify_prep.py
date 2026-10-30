@@ -67,7 +67,7 @@ def test_speculative_round_arena_is_bounded_and_reuse_is_explicit(monkeypatch):
         allocated_growth = torch.cuda.memory_allocated() - before_allocated
         reserved_growth = torch.cuda.memory_reserved() - before_reserved
         assert allocated_growth < 4 << 20, allocated_growth
-        # The allocator may reserve a slab larger than the live 560 KiB arena.
+        # The allocator may reserve a slab larger than the live 688 KiB arena.
         assert reserved_growth < 32 << 20, reserved_growth
         assert len(resources._round_tensor_rings) == 4
 
