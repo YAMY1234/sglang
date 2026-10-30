@@ -1,3 +1,4 @@
+import sys
 import unittest
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -96,6 +97,7 @@ class TestGDNPrefillGraphExtend(CustomTestCase):
         enable_mis=False,
         draft=False,
         flashinfer=False,
+        sm_count=132,
     ):
         """A target's GDN backend on a setup the graph-safe chain supports, unless
         cuda, enable_mis or draft say otherwise."""
@@ -139,10 +141,11 @@ class TestGDNPrefillGraphExtend(CustomTestCase):
             patch.object(gdn_backend, "get_exec", return_value=execution),
             patch.object(gdn_backend, "mamba_cache_chunk_size", return_value=64),
             patch.object(torch.cuda, "get_device_capability", return_value=(10, 0)),
+            patch.object(torch.version, "cuda", "13.0"),
             patch.object(
                 torch.cuda,
                 "get_device_properties",
-                return_value=SimpleNamespace(multi_processor_count=132),
+                return_value=SimpleNamespace(multi_processor_count=sm_count),
             ),
             patch(
                 "sglang.srt.model_executor.runner.prefill_cuda_graph_runner."
@@ -190,6 +193,25 @@ class TestGDNPrefillGraphExtend(CustomTestCase):
             self._setup(flashinfer=True) as backend,
         ):
             self.assertFalse(backend.supports_prefill_graph_extend())
+
+    def test_flashinfer_graph_requires_cp_only_for_cp_shape(self):
+        with patch.dict(sys.modules, {"flashinfer.gdn_kernels": None}):
+            with (
+                envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.override(True),
+                self._setup(flashinfer=True) as backend,
+            ):
+                self.assertFalse(backend.supports_prefill_graph_extend())
+                self.assertFalse(backend.prefill_graph_flashinfer)
+
+            # A shape that dispatches only the non-CP graph does not need the
+            # missing CP DSL kernel.
+            with (
+                envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.override(True),
+                self._setup(flashinfer=True, sm_count=8) as backend,
+            ):
+                self.assertTrue(backend.supports_prefill_graph_extend())
+                self.assertTrue(backend.prefill_graph_flashinfer)
+                self.assertFalse(backend._flashinfer_graph_cp_single)
 
 
 class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):

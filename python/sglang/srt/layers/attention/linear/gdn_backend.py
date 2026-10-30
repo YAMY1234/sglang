@@ -640,6 +640,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
     ) -> Optional[str]:
         from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
             FlashInferGDNKernel,
+            is_flashinfer_gdn_cp_prefill_available,
         )
 
         extend_kernel = self.kernel_dispatcher.extend_kernel
@@ -660,6 +661,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
             return "prefix-cache checkpoints do not use 64-token chunks"
         if not capture_tokens:
             return "no prefill capture sizes"
+        num_v_heads = temporal.shape[-3]
+        cp_single = num_v_heads * 4 < torch.cuda.get_device_properties(
+            self.device
+        ).multi_processor_count
+        if cp_single and not is_flashinfer_gdn_cp_prefill_available():
+            return "FlashInfer CP prefill kernel is unavailable"
         return None
 
     def _enable_flashinfer_graph(self, capture_tokens: list[int]) -> None:

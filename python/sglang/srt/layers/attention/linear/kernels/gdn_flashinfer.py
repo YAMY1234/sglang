@@ -173,6 +173,18 @@ def is_flashinfer_gdn_prefill_available() -> bool:
     return bool(available and prefill_fn is not None)
 
 
+def is_flashinfer_gdn_cp_prefill_available() -> bool:
+    """Return whether FlashInfer can run its SM100 CP prefill path."""
+    cuda_version = torch.version.cuda
+    if cuda_version is None or int(cuda_version.split(".", 1)[0]) < 13:
+        return False
+    try:
+        from flashinfer.gdn_kernels import cp_delta_rule_dsl_sm100
+    except (ImportError, RuntimeError):
+        return False
+    return cp_delta_rule_dsl_sm100 is not None
+
+
 # ---------------------------------------------------------------------------
 # Kernel implementation
 # ---------------------------------------------------------------------------
