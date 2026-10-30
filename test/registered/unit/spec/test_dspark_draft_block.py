@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
+
 from sglang.srt.kernel_plugins.nvidia import dspark_binding
 from sglang.srt.models.dspark import (
     GatedMarkovHead,

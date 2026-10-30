@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, Callable, Collection, Mapping, Optional
 import msgspec
 import torch
 import torch.distributed as dist
+
 from sglang.kernels.plugin_kernels.nvidia.spec import (
     ENTRIES,
     ENTRY_POINT,
@@ -53,12 +54,13 @@ from sglang.srt.runtime_context import (
 )
 
 if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+
     from sglang.srt.layers.attention.graph_variants import AttentionGraphVariants
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
         DecodeCudaGraphRunner,
     )
-    from transformers import PretrainedConfig
 
 logger = logging.getLogger(__name__)
 

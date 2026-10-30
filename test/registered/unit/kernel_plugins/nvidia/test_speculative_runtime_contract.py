@@ -4,6 +4,7 @@ import dataclasses
 import typing
 
 import torch
+
 from sglang.kernels.plugin_kernels.nvidia import spec
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
+
 from sglang.srt.kernel_plugins.nvidia.binding import (
     megakernel_agree,
     megakernel_draft_sampler,
