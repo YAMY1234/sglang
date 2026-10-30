@@ -213,15 +213,15 @@ class GenerationBatchResult:
             self.logits_output.hidden_states = _async_d2h(
                 self.logits_output.hidden_states
             )
-        d2h = (
-            spec_decode_resources.copy_to_host
-            if self.accept_lens is not None
-            else _async_d2h
-        )
-        self.next_token_ids = d2h(self.next_token_ids)
-
         if self.accept_lens is not None:
-            self.accept_lens = d2h(self.accept_lens)
+            self.next_token_ids = spec_decode_resources.copy_to_host(
+                self.next_token_ids, tag="next_token_ids"
+            )
+            self.accept_lens = spec_decode_resources.copy_to_host(
+                self.accept_lens, tag="accept_lens"
+            )
+        else:
+            self.next_token_ids = _async_d2h(self.next_token_ids)
 
         if self.block_accept_lens is not None:
             self.block_accept_lens = _async_d2h(self.block_accept_lens)

@@ -530,16 +530,48 @@ def prepare_draft_extend_lengths(seq_lens, num_draft_tokens, front_offset):
 def prepare_draft_extend_layout(seq_lens, num_draft_tokens, with_mrope):
     bs = seq_lens.numel()
     device = seq_lens.device
-    prefix = spec_decode_resources.empty((bs,), dtype=torch.int32, device=device)
-    extend = spec_decode_resources.empty((bs,), dtype=torch.int32, device=device)
-    post = spec_decode_resources.empty((bs,), dtype=seq_lens.dtype, device=device)
-    positions = spec_decode_resources.empty(
-        (bs * num_draft_tokens,), dtype=torch.int64, device=device
+    prefix = spec_decode_resources.empty(
+        (bs,),
+        tag="extend_prefix_lens",
+        per_request_numel=1,
+        dtype=torch.int32,
+        device=device,
     )
-    starts = spec_decode_resources.empty((bs,), dtype=torch.int32, device=device)
+    extend = spec_decode_resources.empty(
+        (bs,),
+        tag="extend_lens",
+        per_request_numel=1,
+        dtype=torch.int32,
+        device=device,
+    )
+    post = spec_decode_resources.empty(
+        (bs,),
+        tag="extend_post_lens",
+        per_request_numel=1,
+        dtype=seq_lens.dtype,
+        device=device,
+    )
+    positions = spec_decode_resources.empty(
+        (bs * num_draft_tokens,),
+        tag="extend_positions",
+        per_request_numel=num_draft_tokens,
+        dtype=torch.int64,
+        device=device,
+    )
+    starts = spec_decode_resources.empty(
+        (bs,),
+        tag="extend_start_locs",
+        per_request_numel=1,
+        dtype=torch.int32,
+        device=device,
+    )
     mrope = (
         spec_decode_resources.empty(
-            (3, bs * num_draft_tokens), dtype=torch.int64, device=device
+            (3, bs * num_draft_tokens),
+            tag="extend_mrope",
+            per_request_numel=3 * num_draft_tokens,
+            dtype=torch.int64,
+            device=device,
         )
         if with_mrope
         else None
@@ -649,27 +681,53 @@ def build_chain_tree(
     mask = tree_mask_buf
     if mask is None:
         mask = spec_decode_resources.empty(
-            (bs * width * width,), dtype=torch.bool, device=device
+            (bs * width * width,),
+            tag="chain_mask",
+            per_request_numel=width * width,
+            dtype=torch.bool,
+            device=device,
         )
     assert mask.is_contiguous() and mask.numel() >= bs * width * width
     positions = spec_decode_resources.empty(
-        (bs * width,), dtype=torch.int64, device=device
+        (bs * width,),
+        tag="chain_positions",
+        per_request_numel=width,
+        dtype=torch.int64,
+        device=device,
     )
     retrieve = spec_decode_resources.empty(
-        (3, bs, width), dtype=torch.int64, device=device
+        (3, bs, width),
+        tag="chain_retrieve",
+        per_request_numel=3 * width,
+        dtype=torch.int64,
+        device=device,
     )
     tokens = spec_decode_resources.empty(
         (bs * width,),
+        tag="chain_tokens",
+        per_request_numel=width,
         dtype=torch.promote_types(bonus_tokens.dtype, draft_tokens.dtype),
         device=device,
     )
     out_cache_loc = (
-        spec_decode_resources.empty((bs * width,), dtype=torch.int64, device=device)
+        spec_decode_resources.empty(
+            (bs * width,),
+            tag="chain_cache_locs",
+            per_request_numel=width,
+            dtype=torch.int64,
+            device=device,
+        )
         if req_to_token is not None
         else None
     )
     mrope = (
-        spec_decode_resources.empty((3, bs * width), dtype=torch.int64, device=device)
+        spec_decode_resources.empty(
+            (3, bs * width),
+            tag="chain_mrope",
+            per_request_numel=3 * width,
+            dtype=torch.int64,
+            device=device,
+        )
         if with_mrope
         else None
     )

@@ -500,17 +500,29 @@ def prepare_for_draft(
             )
         elif page_size == 1 or topk == 1:
             batch.out_cache_loc = spec_decode_resources.empty(
-                (bs * topk * window_cols,), dtype=torch.int64, device=batch.device
+                (bs * topk * window_cols,),
+                tag="draft_write_window",
+                per_request_numel=topk * window_cols,
+                dtype=torch.int64,
+                device=batch.device,
             )
             if batch.seq_lens.is_cuda and topk == 1:
                 prepared_positions = spec_decode_resources.empty(
-                    (bs,), dtype=batch.seq_lens.dtype, device=batch.seq_lens.device
+                    (bs,),
+                    tag="draft_positions",
+                    per_request_numel=1,
+                    dtype=batch.seq_lens.dtype,
+                    device=batch.seq_lens.device,
                 )
                 if draft_model_runner.model_config.model_is_mrope and all(
                     x is None for x in batch.multimodal_inputs
                 ):
                     prepared_mrope_positions = spec_decode_resources.empty(
-                        (3, bs), dtype=torch.int64, device=batch.device
+                        (3, bs),
+                        tag="draft_mrope_positions",
+                        per_request_numel=3,
+                        dtype=torch.int64,
+                        device=batch.device,
                     )
             if not (
                 speculative_index.draft_locs(

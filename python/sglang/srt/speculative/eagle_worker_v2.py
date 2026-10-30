@@ -1575,6 +1575,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
         grammar_barrier=None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
+        if spec_decode_resources.enabled():
+            spec_decode_resources.begin_round(self.req_to_token_pool.size, self.device)
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             if self._next_draft_stager is not None:
                 self._next_draft_stager.forget()
@@ -1710,6 +1712,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 # per round (TODO: async or upper-bound estimate).
                 batch.seq_lens_cpu = batch_output.new_seq_lens.to("cpu")
                 batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+                # Pipeline tail-draft is the next logical speculative round.
+                if spec_decode_resources.enabled():
+                    spec_decode_resources.begin_round(
+                        self.req_to_token_pool.size, self.device
+                    )
                 with (
                     draft_tp_context(self.draft_worker.parallel_layout),
                     speculative_moe_backend_context(),
