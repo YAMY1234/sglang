@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import msgspec
 import torch
 
 from sglang.srt.kernel_plugins.nvidia.binding import (
@@ -66,8 +66,7 @@ class _SpecializedDsparkDraftStrategy(DsparkDraftStrategy):
         return step(model_hidden, anchor_tokens)
 
 
-@dataclass(frozen=True)
-class BoundDsparkDraftStrategy:
+class BoundDsparkDraftStrategy(msgspec.Struct, frozen=True):
     strategy: DsparkDraftStrategy
     step_logits: torch.Tensor | None
 

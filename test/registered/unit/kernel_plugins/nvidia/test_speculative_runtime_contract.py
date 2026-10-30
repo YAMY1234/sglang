@@ -1,8 +1,8 @@
 """CPU contracts for provider-neutral speculative runtime strategies."""
 
-import dataclasses
 import typing
 
+import msgspec
 import torch
 
 from sglang.kernels.plugin_kernels.nvidia import spec
@@ -81,10 +81,12 @@ class TestSpeculativeRuntimeContract(CustomTestCase):
         }
         for contract, fields in expected.items():
             with self.subTest(contract=contract.__name__):
+                self.assertTrue(issubclass(contract, msgspec.Struct))
                 self.assertEqual(
-                    tuple(field.name for field in dataclasses.fields(contract)), fields
+                    tuple(field.name for field in msgspec.structs.fields(contract)),
+                    fields,
                 )
-                self.assertTrue(contract.__dataclass_params__.frozen)
+                self.assertTrue(contract.__struct_config__.frozen)
 
     def test_frozen_contract_field_types_resolve_exactly_without_any(self):
         tensor = torch.Tensor
@@ -209,6 +211,10 @@ class TestSpeculativeRuntimeContract(CustomTestCase):
             "one split returns ``[rows]``",
             "``[rows, splits]``",
             "``splits`` must be used unchanged",
+            "identical on every TP rank",
+            "rank-uniform predicates",
+            "``shard.start``/``shard.valid`` alone",
+            "collectively establish the complete descriptor",
         ):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, key_contract)

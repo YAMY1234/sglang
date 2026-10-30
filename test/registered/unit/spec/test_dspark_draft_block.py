@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import msgspec
 import torch
 
 from sglang.srt.kernel_plugins.nvidia import dspark_binding
@@ -165,6 +166,15 @@ def _build(model, *, greedy_draft, factory=None, agree=None):
 
 
 class TestMegakernelDraftSampler(CustomTestCase):
+    def test_bound_strategy_is_a_frozen_struct(self):
+        fields = msgspec.structs.fields(dspark_binding.BoundDsparkDraftStrategy)
+        self.assertEqual(
+            tuple(field.name for field in fields), ("strategy", "step_logits")
+        )
+        self.assertTrue(
+            dspark_binding.BoundDsparkDraftStrategy.__struct_config__.frozen
+        )
+
     def test_the_megakernel_step_runs_only_on_the_batch_sizes_every_rank_serves(self):
         """A served batch size runs the megakernel's step in place of the base
         logits and the Markov block, writing SGLang's buffers; every other size runs

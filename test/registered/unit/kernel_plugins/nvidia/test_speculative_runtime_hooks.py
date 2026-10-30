@@ -1,10 +1,10 @@
 """CPU tests for resolving speculative provider hooks at the binding boundary."""
 
-import dataclasses
 import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import msgspec
 import torch
 
 from sglang.kernels.plugin_kernels.nvidia import spec
@@ -102,9 +102,9 @@ class TestSpeculativeRuntimeHooks(CustomTestCase):
         defaults = _defaults()
 
         def factory(stock):
-            return dataclasses.replace(
+            return msgspec.structs.replace(
                 stock,
-                post_verify=dataclasses.replace(
+                post_verify=msgspec.structs.replace(
                     stock.post_verify,
                     run=lambda io, local_keys: stock.post_verify(io),
                 ),
@@ -125,9 +125,9 @@ class TestSpeculativeRuntimeHooks(CustomTestCase):
         defaults = _defaults()
 
         def factory(stock):
-            return dataclasses.replace(
+            return msgspec.structs.replace(
                 stock,
-                post_verify=dataclasses.replace(stock.post_verify, local_keys=None),
+                post_verify=msgspec.structs.replace(stock.post_verify, local_keys=None),
             )
 
         model = torch.nn.Module()
@@ -206,14 +206,17 @@ class TestSpeculativeRuntimeHooks(CustomTestCase):
             ) as sample,
         ):
             output = runtime.default_post_verify(io, lambda view: None)
-        self.assertEqual(sample.call_args.kwargs, {
-            "uno_target_max_top_k": None,
-            "watermark_state": None,
-            "watermark_full_mask": True,
-            "simulated_acc_len": None,
-            "simulated_acc_len_rng": None,
-            "sparse_bonus_argmax": False,
-        })
+        self.assertEqual(
+            sample.call_args.kwargs,
+            {
+                "uno_target_max_top_k": None,
+                "watermark_state": None,
+                "watermark_full_mask": True,
+                "simulated_acc_len": None,
+                "simulated_acc_len_rng": None,
+                "sparse_bonus_argmax": False,
+            },
+        )
         self.assertTrue(torch.equal(output.token_ids, expected[0]))
 
 

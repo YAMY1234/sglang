@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import enum
 import importlib
-from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 
 import msgspec
@@ -95,8 +94,7 @@ class Step(msgspec.Struct, frozen=True):
     view: Any = None
 
 
-@dataclass(frozen=True)
-class VocabShardView:
+class VocabShardView(msgspec.Struct, frozen=True):
     """The valid global-vocabulary columns stored on this rank."""
 
     start: int
@@ -104,8 +102,7 @@ class VocabShardView:
     vocab_size: int
 
 
-@dataclass(frozen=True)
-class ShardedLogitsView:
+class ShardedLogitsView(msgspec.Struct, frozen=True):
     """Borrowed local logits used to build provider-neutral reduction keys.
 
     ``values`` is floating ``[rows, local_cols]`` on one device with unit last
@@ -113,6 +110,15 @@ class ShardedLogitsView:
     ``start + valid <= vocab_size``. ``temperatures`` is ``None`` for greedy,
     otherwise contiguous float32 ``[rows]`` on the same device. ``splits`` is the
     positive runtime-selected number of column partitions and must not be changed.
+
+    The choice between returning keys and returning ``None`` must be identical on
+    every TP rank. Applicability checks may use only rank-uniform predicates, such
+    as ``values.shape`` and dtype, whether ``temperatures`` or ``seeds`` is
+    ``None``, and ``splits``. They must not make a rank-local refusal from logits
+    contents or ``shard.start``/``shard.valid`` alone. A provider that uses
+    rank-local shard metadata must collectively establish the complete descriptor
+    at bind time and still derive the same choice on every rank; otherwise ranks
+    can enter different collective sequences.
 
     A local policy returns contiguous int64 keys on ``values.device`` without any
     collective, or ``None`` before consuming RNG when it cannot serve the view.
@@ -155,8 +161,7 @@ class GrammarMaskView(Protocol):
         """Mask ``logits`` in place."""
 
 
-@dataclass(frozen=True)
-class VerifyTreeView:
+class VerifyTreeView(msgspec.Struct, frozen=True):
     """Borrowed tree topology and proposal tensors for one verify."""
 
     draft_tokens: torch.Tensor
@@ -201,8 +206,7 @@ class VerifyTreeView:
         return self.topk
 
 
-@dataclass(frozen=True)
-class VerifySamplingView:
+class VerifySamplingView(msgspec.Struct, frozen=True):
     """Borrowed model-independent sampling tensors and resolved host flags."""
 
     sequence_lengths: torch.Tensor
@@ -282,8 +286,7 @@ class WatermarkStateView(Protocol):
     ) -> None: ...
 
 
-@dataclass(frozen=True)
-class PostVerifyIO:
+class PostVerifyIO(msgspec.Struct, frozen=True):
     """Borrowed inputs for target-side speculative acceptance and sampling.
 
     The runtime owns every object in this view. A hook may use them for the current
@@ -322,8 +325,7 @@ class PostVerifyIO:
         return self.sampling.device
 
 
-@dataclass(frozen=True)
-class PostVerifyOutput:
+class PostVerifyOutput(msgspec.Struct, frozen=True):
     """Runtime-consumed results valid until this round's graph slot is reused."""
 
     token_ids: torch.Tensor
@@ -334,8 +336,7 @@ class PostVerifyOutput:
 VerifyRunner = Callable[[PostVerifyIO, LocalKeysFn], PostVerifyOutput]
 
 
-@dataclass(frozen=True)
-class PostVerifyStrategy:
+class PostVerifyStrategy(msgspec.Struct, frozen=True):
     """Runtime verifier plus the provider-replaceable local key builder."""
 
     run: VerifyRunner
@@ -345,8 +346,7 @@ class PostVerifyStrategy:
         return self.run(io, self.local_keys)
 
 
-@dataclass(frozen=True)
-class SpeculativeRuntimeHooks:
+class SpeculativeRuntimeHooks(msgspec.Struct, frozen=True):
     """The provider-adjustable strategy around speculative verification."""
 
     post_verify: PostVerifyStrategy
