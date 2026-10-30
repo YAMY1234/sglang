@@ -12,8 +12,8 @@ from unittest.mock import MagicMock, call, patch
 
 import msgspec
 import torch
-from sglang.srt.environ import envs
 
+from sglang.srt.environ import envs
 from sglang.srt.kernel_plugins.nvidia import binding as runtime
 from sglang.srt.kernel_plugins.nvidia import eagle_binding as eb
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
+
 from sglang.kernels.ops.speculative import speculative_index
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_draft_cache_locs_contiguous_func,

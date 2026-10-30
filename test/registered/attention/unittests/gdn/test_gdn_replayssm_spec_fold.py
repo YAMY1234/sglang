@@ -10,6 +10,7 @@ exact.
 import unittest
 
 import torch
+
 from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )

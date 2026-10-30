@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+
 from sglang.kernels.ops.attention.linear import (
     gdn_replayssm_commit_cuda,
     gdn_replayssm_spec_decode,
