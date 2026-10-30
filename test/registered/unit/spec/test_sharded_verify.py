@@ -14,6 +14,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.speculative import eagle_utils, sharded_verify
 from sglang.srt.speculative.sharded_verify import (
     VocabShard,
@@ -511,6 +513,36 @@ class TestShardedPolicy(CustomTestCase):
 
 
 class TestShardedReducerContract(CustomTestCase):
+    def test_shard_logits_borrow_one_static_buffer_across_shapes(self):
+        processor = LogitsProcessor.__new__(LogitsProcessor)
+        torch.nn.Module.__init__(processor)
+        processor.logit_scale = None
+        processor.use_fp32_lm_head = False
+        processor.use_fp32_lm_head_output = False
+        processor.rl_on_policy_target = None
+        weight = torch.arange(28, dtype=torch.bfloat16).view(7, 4) / 16
+        head = SimpleNamespace(weight=weight, quant_method=None)
+        backing = torch.empty((256, 64), dtype=torch.float32)
+        pointer = backing.untyped_storage().data_ptr()
+
+        for rows in (256, 64, 1):
+            hidden = torch.arange(rows * 4, dtype=torch.bfloat16).view(rows, 4) / 32
+            metadata = LogitsMetadata(
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                next_token_logits_buffer=backing[:rows],
+            )
+            got = processor._get_shard_logits(hidden, head, metadata)
+
+            self.assertEqual(got.untyped_storage().data_ptr(), pointer)
+            self.assertTrue(got.is_contiguous())
+            self.assertEqual(got.dtype, torch.bfloat16)
+            torch.testing.assert_close(got, hidden @ weight.T, rtol=0, atol=0)
+
+        metadata.next_token_logits_buffer = None
+        allocated = processor._get_shard_logits(hidden, head, metadata)
+        self.assertNotEqual(allocated.untyped_storage().data_ptr(), pointer)
+        torch.testing.assert_close(allocated, hidden @ weight.T, rtol=0, atol=0)
+
     def test_non_power_of_two_world_uses_portable_collective(self):
         keys = torch.tensor([5, 9], dtype=torch.int64)
         gathered = keys.repeat(6)

@@ -672,7 +672,9 @@ class LogitsProcessor(nn.Module):
             vocab_shard = self._verify_vocab_shard(lm_head, logits_metadata)
             if vocab_shard is not None:
                 return LogitsProcessorOutput(
-                    next_token_logits=self._get_shard_logits(pruned_states, lm_head),
+                    next_token_logits=self._get_shard_logits(
+                        pruned_states, lm_head, logits_metadata
+                    ),
                     next_token_logits_vocab_shard=vocab_shard,
                     hidden_states=hidden_states_to_store,
                     last_hidden_states=last_hidden_states_to_store,
@@ -735,12 +737,44 @@ class LogitsProcessor(nn.Module):
         )
 
     def _get_shard_logits(
-        self, hidden_states: torch.Tensor, lm_head: VocabParallelEmbedding
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
     ) -> torch.Tensor:
-        logits = self._compute_lm_head(hidden_states, lm_head)
+        out = self._borrow_shard_logits_buffer(
+            hidden_states, lm_head, logits_metadata.next_token_logits_buffer
+        )
+        logits = self._compute_lm_head(hidden_states, lm_head, out=out)
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
         return logits
+
+    def _borrow_shard_logits_buffer(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        backing: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """Borrow the graph's otherwise-unused full-vocabulary logits storage."""
+        if (
+            backing is None
+            or not backing.is_contiguous()
+            or backing.device != hidden_states.device
+            or not hasattr(lm_head, "weight")
+        ):
+            return None
+        output_dtype = (
+            torch.float32
+            if self.use_fp32_lm_head or self.use_fp32_lm_head_output
+            else lm_head.weight.dtype
+        )
+        flat = backing.view(output_dtype).reshape(-1)
+        shape = (hidden_states.shape[0], lm_head.weight.shape[0])
+        numel = shape[0] * shape[1]
+        if flat.numel() < numel:
+            return None
+        return flat[:numel].view(shape)
 
     def _get_pruned_states(
         self,
@@ -1276,9 +1310,11 @@ class LogitsProcessor(nn.Module):
             elif _aiter_lm_head_ok(hidden_states, lm_head.weight):
                 logits = tgemm.mm(hidden_states, lm_head.weight)
             else:
-                logits = torch.matmul(
-                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
-                )
+                lhs = hidden_states.to(lm_head.weight.dtype)
+                if out is not None and out.dtype == lm_head.weight.dtype:
+                    logits = torch.matmul(lhs, lm_head.weight.T, out=out)
+                else:
+                    logits = torch.matmul(lhs, lm_head.weight.T)
         else:
             # GGUF models
             # TODO: use weight_packed_linear for GGUF models
