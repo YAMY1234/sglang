@@ -355,6 +355,37 @@ def test_build_directory_entries_are_dropped(tmp_path):
     assert [entry.relpath for entry in entries] == [str(outside)]
 
 
+def test_a_build_under_a_symlinked_cache_root_is_reused(tmp_path):
+    """A cache root reached through a symlink still yields one build per variant.
+
+    The depfile names the generated unit relative to the staging directory. Kept
+    as a dependency, it would point into a staging path that no longer exists
+    once the build is published, so every later lookup -- the other ranks
+    waiting on the lock included -- would miss and compile again.
+    """
+    real = tmp_path / "real"
+    real.mkdir()
+    (tmp_path / "alias").symlink_to(real)
+    scope = tmp_path / "alias" / "scope"
+    staging = scope / ".staging-x"
+    source = _write(tmp_path / "src" / "a.cuh", "// a")
+    spec = _spec(cuda_files=(str(source),))
+    _write(staging / "cuda.cu", "// generated")
+    (staging / f"{spec.module_name}.so").write_bytes(b"")
+
+    library = cache.commit_build(
+        spec,
+        scope=scope,
+        staging=staging,
+        dependencies=[pathlib.Path("cuda.cu"), source],
+    )
+    assert library is not None
+    # Looked up as another rank would: the builder's own digest memo still
+    # answers for the vanished staging path.
+    cache.clear_digest_cache()
+    assert cache.find_prebuilt(scope=scope, module_name=spec.module_name) == library
+
+
 def test_publish_loses_the_race_gracefully(tmp_path):
     """Two processes building identical content: the loser adopts the winner's leaf."""
     winner = tmp_path / "leaf"
