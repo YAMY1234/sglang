@@ -239,6 +239,25 @@ class TestRuntimeHookExecution(CustomTestCase):
             selected, eagle_worker_common.STOCK_SPECULATIVE_RUNTIME_HOOKS
         )
 
+    def test_only_a_provider_key_policy_shards_temperature_batches(self):
+        stock = eagle_worker_common.STOCK_SPECULATIVE_RUNTIME_HOOKS
+        provider = SimpleNamespace(post_verify=SimpleNamespace(local_keys=Mock()))
+        for hooks, expected in ((stock, False), (provider, True)):
+            with self.subTest(provider=hooks is provider):
+                worker, _, processor = _worker_with_model_class("Qwen3_5ForCausalLM")
+                with patch.object(
+                    eagle_worker_common,
+                    "import_module",
+                    return_value=SimpleNamespace(
+                        bind_speculative_runtime_hooks=Mock(return_value=hooks)
+                    ),
+                ):
+                    eagle_worker_common.bind_eagle_runtime_hooks(
+                        worker, supports_sharded_verify=True
+                    )
+                self.assertTrue(processor.sharded_verify)
+                self.assertIs(processor._sharded_verify_temperature_keys, expected)
+
     def test_unsupported_consumer_keeps_full_vocab(self):
         worker, _, processor = _worker_with_model_class("Qwen3_5ForCausalLM")
 

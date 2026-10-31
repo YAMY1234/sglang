@@ -7,6 +7,7 @@ every row's max over all ranks' keys, launch after launch, whether the other ran
 words are already there or land while it polls."""
 
 import ast
+import itertools
 import os
 import subprocess
 import sys
@@ -1227,6 +1228,207 @@ class TestGatherFullLogits(CustomTestCase):
                 shard = VocabShard(start=0, valid=width, vocab_size=1000)
                 got = gather_full_logits(shards[0], shard, _FakeGroup(shards))
                 self.assertTrue(torch.equal(got, full.float()))
+
+
+def _sharded_processor(*, temperature_keys: bool = False):
+    processor = LogitsProcessor.__new__(LogitsProcessor)
+    torch.nn.Module.__init__(processor)
+    processor._sharded_verify_eligible = True
+    processor.defer_verify_gather = False
+    processor.final_logit_softcapping = None
+    processor.vocab_size = VOCAB
+    processor.enable_sharded_verify(temperature_keys=temperature_keys)
+    return processor
+
+
+def _verify_forward_batch(
+    *, mode=ForwardMode.TARGET_VERIFY, return_logprob=False, **sampling
+):
+    # flags only: the decision must not read per-rank tensors
+    info = dict(
+        is_all_greedy=True,
+        need_top_k_sampling=False,
+        need_top_p_sampling=False,
+        need_min_p_sampling=False,
+        acc_additive_penalties=None,
+        acc_scaling_penalties=None,
+        logit_bias=None,
+        sampling_seed=None,
+        grammars=None,
+        has_watermark_candidates=False,
+    )
+    info.update(sampling)
+    return SimpleNamespace(
+        forward_mode=mode,
+        return_logprob=return_logprob,
+        sampling_info=SimpleNamespace(**info),
+    )
+
+
+_TEMPERATURE_ONLY = dict(is_all_greedy=False)
+_AGENTX_SAMPLING = dict(
+    is_all_greedy=False, need_top_k_sampling=True, need_top_p_sampling=True
+)
+
+
+class TestPerBatchVocabShards(CustomTestCase):
+    def _uses(self, processor, spec=None, **batch):
+        with patch(
+            "sglang.srt.layers.logits_processor.get_spec",
+            return_value=spec or _runtime_spec(),
+        ):
+            return processor.verify_uses_vocab_shards(_verify_forward_batch(**batch))
+
+    def test_only_batches_the_consumer_can_sample_produce_shards(self):
+        stock, provider = (
+            _sharded_processor(),
+            _sharded_processor(temperature_keys=True),
+        )
+        for processor in (stock, provider):
+            self.assertTrue(self._uses(processor))
+            self.assertFalse(self._uses(processor, **_AGENTX_SAMPLING))
+        self.assertFalse(self._uses(stock, **_TEMPERATURE_ONLY))
+        self.assertTrue(self._uses(provider, **_TEMPERATURE_ONLY))
+        self.assertFalse(
+            self._uses(provider, sampling_seed=torch.zeros(2), **_TEMPERATURE_ONLY)
+        )
+        self.assertTrue(self._uses(stock, grammars=[None, None]))
+        for change in (
+            dict(return_logprob=True),
+            dict(grammars=[None, object()]),
+            dict(has_watermark_candidates=True),
+            dict(acc_additive_penalties=torch.zeros(1)),
+            dict(acc_scaling_penalties=torch.zeros(1)),
+            dict(logit_bias=torch.zeros(1)),
+            dict(mode=ForwardMode.DECODE),
+        ):
+            with self.subTest(change=sorted(change)):
+                self.assertFalse(self._uses(provider, **change))
+        rejection = SimpleNamespace(
+            **{**vars(_runtime_spec()), "speculative_use_rejection_sampling": True}
+        )
+        self.assertFalse(self._uses(provider, spec=rejection))
+
+        unbound = _sharded_processor()
+        unbound.sharded_verify = False
+        self.assertFalse(self._uses(unbound))
+
+    def test_every_produced_shard_is_consumed_without_a_gather(self):
+        for greedy, top_k, top_p, min_p, seeded, logprob, keys in itertools.product(
+            (True, False), repeat=7
+        ):
+            batch = dict(
+                return_logprob=logprob,
+                is_all_greedy=greedy,
+                need_top_k_sampling=top_k,
+                need_top_p_sampling=top_p,
+                need_min_p_sampling=min_p,
+                sampling_seed=torch.zeros(2) if seeded else None,
+            )
+            if not self._uses(_sharded_processor(temperature_keys=keys), **batch):
+                continue
+            with (
+                patch.object(eagle_utils, "_is_cuda", True),
+                patch.object(eagle_utils, "get_spec", return_value=_runtime_spec()),
+            ):
+                self.assertTrue(
+                    eagle_utils._sharded_sampling_applies(
+                        verify_input=SimpleNamespace(tree_topk=1),
+                        batch=_verify_forward_batch(**batch),
+                        grammar_mask=None,
+                        watermark=False,
+                        has_local_keys=True,
+                    )
+                )
+
+    def test_capture_records_the_runner_named_format(self):
+        from sglang.srt.layers.logits_processor import (
+            VERIFY_FULL_LOGITS,
+            VERIFY_VOCAB_SHARDS,
+        )
+        from sglang.srt.model_executor.runner_utils import capture_mode
+
+        processor = _sharded_processor()
+        # a capture batch carries no real sampling parameters
+        dummy = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY, sampling_info=None
+        )
+        with patch.object(capture_mode, "is_capture_mode", True):
+            for variant, expected in (
+                (VERIFY_VOCAB_SHARDS, True),
+                (VERIFY_FULL_LOGITS, False),
+                (None, False),
+            ):
+                with capture_mode.capture_logits_variant(variant):
+                    self.assertIs(processor._batch_vocab_shards(dummy), expected)
+        self.assertFalse(processor._batch_vocab_shards(dummy))
+
+    def test_a_full_logits_batch_takes_the_stock_gather(self):
+        from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+
+        processor = _sharded_processor()
+        head = VocabParallelEmbedding.__new__(VocabParallelEmbedding)
+        head.shard_indices = SimpleNamespace(
+            num_added_elements_padded=0,
+            org_vocab_start_index=VOCAB // 2,
+            num_org_elements=VOCAB // 2,
+        )
+        metadata = LogitsMetadata(forward_mode=ForwardMode.TARGET_VERIFY)
+        self.assertIsNone(processor._verify_vocab_shard(head, metadata))
+        metadata.verify_vocab_shards = True
+        shard = processor._verify_vocab_shard(head, metadata)
+        self.assertEqual(
+            (shard.start, shard.valid, shard.vocab_size),
+            (VOCAB // 2, VOCAB // 2, VOCAB),
+        )
+
+    def test_runner_keys_each_logits_format_and_selects_per_batch(self):
+        from sglang.srt.layers.logits_processor import (
+            VERIFY_FULL_LOGITS,
+            VERIFY_VOCAB_SHARDS,
+        )
+        from sglang.srt.model_executor.runner import decode_cuda_graph_runner as dcg
+
+        runner = dcg.DecodeCudaGraphRunner.__new__(dcg.DecodeCudaGraphRunner)
+        key = runner._make_graph_key(8, None, None, "megakernel")
+        self.assertIs(runner._with_logits_variant(key, None), key)
+        shards = runner._with_logits_variant(key, VERIFY_VOCAB_SHARDS)
+        full = runner._with_logits_variant(key, VERIFY_FULL_LOGITS)
+        self.assertEqual(len({key, shards, full}), 3)
+        self.assertEqual(shards.attention_variant, "megakernel")
+
+        greedy, agentx = (
+            _verify_forward_batch(),
+            _verify_forward_batch(**_AGENTX_SAMPLING),
+        )
+        self.assertIsNone(runner._resolve_logits_variant(greedy))
+        runner._verify_logits_processor = _sharded_processor()
+        with patch(
+            "sglang.srt.layers.logits_processor.get_spec",
+            return_value=_runtime_spec(),
+        ):
+            self.assertEqual(
+                runner._resolve_logits_variant(greedy), VERIFY_VOCAB_SHARDS
+            )
+            self.assertEqual(runner._resolve_logits_variant(agentx), VERIFY_FULL_LOGITS)
+
+    def test_runner_captures_both_formats_only_for_the_opted_in_processor(self):
+        from sglang.srt.model_executor.runner import decode_cuda_graph_runner as dcg
+
+        def model(*enabled):
+            root = torch.nn.Module()
+            for i, on in enumerate(enabled):
+                processor = _sharded_processor()
+                processor.sharded_verify = on
+                root.add_module(f"logits_{i}", processor)
+            return root
+
+        found = model(False, True)
+        self.assertIs(
+            dcg._sharded_verify_logits_processor(found), found.get_submodule("logits_1")
+        )
+        self.assertIsNone(dcg._sharded_verify_logits_processor(model(False)))
+        self.assertIsNone(dcg._sharded_verify_logits_processor(model(True, True)))
 
 
 if __name__ == "__main__":

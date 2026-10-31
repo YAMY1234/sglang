@@ -67,6 +67,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_forward,
     get_parallel,
+    get_spec,
 )
 from sglang.srt.utils.common import (
     async_d2h,
@@ -112,6 +113,12 @@ _autotune_run_lm_head: Optional[bool] = None
 
 def _runtime_optimized_vocab_shards_enabled() -> bool:
     return envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+
+
+# Target-verify logits formats a graph runner captures for a sharded-verify processor.
+VERIFY_VOCAB_SHARDS = "vocab_shards"
+VERIFY_FULL_LOGITS = "full_logits"
+VERIFY_LOGITS_VARIANTS = (VERIFY_VOCAB_SHARDS, VERIFY_FULL_LOGITS)
 
 
 class SamplingMaskStatus(IntEnum):
@@ -419,6 +426,9 @@ class LogitsMetadata:
     # rows (see EagleDraftExtendInput.select_index).
     draft_extend_select_index: Optional[torch.Tensor] = None
 
+    # TARGET_VERIFY: keep this batch's logits as vocabulary shards.
+    verify_vocab_shards: bool = False
+
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
         # MLP-sync may turn an idle rank into a dummy EXTEND for DP prefill
@@ -565,6 +575,7 @@ class LogitsProcessor(nn.Module):
         # UNO, DSpark, and out-of-tree consumers otherwise retain the stock
         # full-vocabulary gather even when the runtime master switch is on.
         self.sharded_verify = False
+        self._sharded_verify_temperature_keys = False
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
         )
@@ -611,9 +622,59 @@ class LogitsProcessor(nn.Module):
             self.vocab_size, chunking_group=chunking_group
         )
 
-    def enable_sharded_verify(self) -> None:
-        """Opt in a verify consumer that understands vocab-shard outputs."""
+    def enable_sharded_verify(self, *, temperature_keys: bool = False) -> None:
+        """Opt in a verify consumer that understands vocab-shard outputs.
+
+        temperature_keys: the bound local key policy may serve temperature rows;
+        the stock policy serves greedy rows only.
+        """
         self.sharded_verify = self._sharded_verify_eligible
+        self._sharded_verify_temperature_keys = temperature_keys
+
+    def verify_uses_vocab_shards(self, forward_batch: ForwardBatch) -> bool:
+        """Whether this target verify keeps its logits as vocabulary shards.
+
+        Every TP rank must take the same LM-head collective, so this reads only
+        batch sampling parameters that every rank receives identically.
+        """
+        if not (self.sharded_verify and forward_batch.forward_mode.is_target_verify()):
+            return False
+        info = forward_batch.sampling_info
+        if info is None:
+            return False
+        from sglang.srt.speculative.sharded_verify import (
+            sampling_allows_vocab_shards,
+            spec_allows_vocab_shards,
+        )
+
+        return (
+            not (info.grammars and any(g is not None for g in info.grammars))
+            and not info.has_watermark_candidates
+            and sampling_allows_vocab_shards(
+                info,
+                return_logprob=forward_batch.return_logprob,
+                # request seeds stay on stock seeded sampling
+                has_local_keys=self._sharded_verify_temperature_keys
+                and info.sampling_seed is None,
+            )
+            and spec_allows_vocab_shards(get_spec())
+        )
+
+    def _batch_vocab_shards(self, forward_batch: ForwardBatch) -> bool:
+        if not self.sharded_verify:
+            return False
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_capture_logits_variant,
+            get_is_capture_mode,
+        )
+
+        if get_is_capture_mode():
+            # A runner capturing both formats names the one it is recording.
+            return (
+                forward_batch.forward_mode.is_target_verify()
+                and get_capture_logits_variant() == VERIFY_VOCAB_SHARDS
+            )
+        return self.verify_uses_vocab_shards(forward_batch)
 
     def forward(
         self,
@@ -630,7 +691,9 @@ class LogitsProcessor(nn.Module):
         if isinstance(logits_metadata, ForwardBatch):
             multi_item_delimiter_indices = logits_metadata.multi_item_delimiter_indices
             token_indices_to_pool = logits_metadata.token_indices_to_pool
+            verify_vocab_shards = self._batch_vocab_shards(logits_metadata)
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
+            logits_metadata.verify_vocab_shards = verify_vocab_shards
 
         # Autotune dummy run discards this output. `is False` not `not`: None
         # means no autotune pass, which must not skip. Placed before the MIS /
@@ -760,6 +823,7 @@ class LogitsProcessor(nn.Module):
         """The VocabShard a target verify keeps its logits in, or None for the gather."""
         if not (
             self.sharded_verify
+            and logits_metadata.verify_vocab_shards
             and not self.defer_verify_gather
             and logits_metadata.forward_mode.is_target_verify()
             and self.final_logit_softcapping is None

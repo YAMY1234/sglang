@@ -205,6 +205,8 @@ class EaglePostVerifyGraphs:
             verify_input.max_tree_depth,
             # the graphs read the verify logits in place; a runner may own several
             logits_output.next_token_logits.data_ptr(),
+            # shards borrow the full logits storage, so the pointer alone is ambiguous
+            logits_output.next_token_logits_vocab_shard is not None,
         )
 
     def _make_slot(

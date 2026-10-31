@@ -512,6 +512,16 @@ class TestPostVerifyGraphs(CustomTestCase):
         }
         self.assertEqual(len(keys), 2)
 
+        # a per-batch logits format: shards reuse the full logits' storage
+        shards = SimpleNamespace(
+            next_token_logits=logits.next_token_logits,
+            next_token_logits_vocab_shard=object(),
+        )
+        self.assertNotEqual(
+            graphs._key(verify_batch, verify_input, logits, True, 20),
+            graphs._key(verify_batch, verify_input, shards, True, 20),
+        )
+
     def test_a_packed_verify_result_is_one_buffer_holding_the_stock_values(self):
         """With SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST a sampled verify result goes to
         the TP group in one broadcast: predict, accept_index and num_correct_drafts
