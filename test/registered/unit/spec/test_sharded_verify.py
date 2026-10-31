@@ -6,6 +6,13 @@ gather rebuilds the stock gathered FP32 logits exactly. The LL key exchange retu
 every row's max over all ranks' keys, launch after launch, whether the other ranks'
 words are already there or land while it polls."""
 
+import ast
+import os
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -619,6 +626,7 @@ class TestShardedReducerContract(CustomTestCase):
         )
         ll_buffer = torch.zeros(1, dtype=torch.int64)
         ll_handle = SimpleNamespace(multicast_ptr=1)
+        ll_diag = torch.zeros(2 * sharded_verify._LL_RECORD, dtype=torch.int64)
         with (
             patch.object(
                 sharded_verify, "_tp_group_in_one_nvlink_domain", return_value=True
@@ -634,6 +642,7 @@ class TestShardedReducerContract(CustomTestCase):
             ),
             patch("torch.cuda.synchronize"),
             patch("torch.distributed.barrier"),
+            patch.object(sharded_verify, "_ll_watch", return_value=ll_diag) as watch,
         ):
             self.assertIs(
                 sharded_verify._mc_build(group, hidden_size=64, device="cpu"),
@@ -643,6 +652,8 @@ class TestShardedReducerContract(CustomTestCase):
 
         self.assertIs(ll_state[0], ll_buffer)
         self.assertIs(ll_state[1], ll_handle)
+        self.assertIs(ll_state[3], ll_diag)
+        watch.assert_called_once_with(8)
         self.assertEqual(in_domain.call_count, 2)
         create_state.assert_called_once_with(
             device_group,
@@ -901,6 +912,12 @@ def _plain_st_b64(addr, val, mask):
     )
 
 
+def _ll_diag():
+    return torch.zeros(
+        2 * sharded_verify._LL_RECORD, dtype=torch.int64, pin_memory=True
+    )
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
 class TestLLKeys(CustomTestCase):
     """_ll_keys_kernel as rank 0 of WORLD ranks on one GPU (its multimem store made a plain
@@ -921,6 +938,7 @@ class TestLLKeys(CustomTestCase):
             device="cuda",
         )
         epoch = torch.zeros(2, dtype=torch.int32, device="cuda")
+        diag = _ll_diag()
         writer = torch.cuda.Stream()
         # load the writer's kernels now: lazy loading them would wait for a spinning poll
         torch.cuda._sleep(1)
@@ -961,13 +979,17 @@ class TestLLKeys(CustomTestCase):
                 buf.data_ptr(),
                 epoch,
                 tokens,
+                diag.data_ptr(),
+                sharded_verify._LL_WARN_NS,
+                10**10,
                 RANK=0,
                 WORLD=world,
                 MAXR=maxr,
                 BLOCK_R=max(16, triton.next_power_of_2(rows)),
                 BLOCK_P=2,
                 KEY_FLOOR=sharded_verify._KEY_FLOOR,
-                SPIN_LIMIT=1 << 22,
+                TIME_CHECK_SPINS=sharded_verify._LL_TIME_CHECK_SPINS,
+                TRAP_GRACE_NS=0,
                 num_warps=4,
             )
             torch.empty(rows, dtype=torch.int32, device="cuda").fill_(3)
@@ -994,6 +1016,7 @@ class TestLLKeys(CustomTestCase):
             dtype=torch.int32,
             device="cuda",
         )
+        diag = _ll_diag()
         launches = []
         gen = torch.Generator(device="cuda").manual_seed(last_tag)
         for _ in range(4):
@@ -1015,13 +1038,17 @@ class TestLLKeys(CustomTestCase):
                 buf.data_ptr(),
                 state,
                 tokens,
+                diag.data_ptr(),
+                sharded_verify._LL_WARN_NS,
+                10**9,
                 RANK=0,
                 WORLD=1,
                 MAXR=maxr,
                 BLOCK_R=16,
                 BLOCK_P=2,
                 KEY_FLOOR=sharded_verify._KEY_FLOOR,
-                SPIN_LIMIT=1 << 10,
+                TIME_CHECK_SPINS=sharded_verify._LL_TIME_CHECK_SPINS,
+                TRAP_GRACE_NS=0,
                 num_warps=4,
             )
             launches.append((tokens, want))
@@ -1055,6 +1082,162 @@ class TestLLKeys(CustomTestCase):
             for last_tag in (2**31 - 2, 0xFFFFFFFE):
                 with self.subTest(last_tag=hex(last_tag)):
                     self._check_epoch_wrap(last_tag)
+
+    def test_slow_peer_is_reported_then_served(self):
+        # The peer arrives far past the warning and far inside the deadline: the
+        # poll records who it waits for and still returns the exact tokens.
+        world, rows, parts = 2, 7, 2
+        maxr = sharded_verify._LL_MAX_ROWS
+        buf = torch.zeros(
+            sharded_verify._LL_SLOTS * world * maxr * 2,
+            dtype=torch.int64,
+            device="cuda",
+        )
+        epoch = torch.zeros(2, dtype=torch.int32, device="cuda")
+        diag = _ll_diag()
+        keys = torch.randint(-(2**62), 2**62, (world, rows, parts), device="cuda")
+        want = 0xFFFFFFFF - (keys.amax(dim=(0, 2)) & 0xFFFFFFFF)
+        tag, slot = 1, 1
+        at = ((slot * world + 1) * maxr + torch.arange(rows, device="cuda")) * 2
+        peer = keys[1].amax(dim=1)
+        lo = (peer & 0xFFFFFFFF) | (tag << 32)
+        hi = ((peer >> 32) & 0xFFFFFFFF) | (tag << 32)
+        torch.cuda._sleep(1)
+        torch.empty_like(buf)[torch.arange(2, device="cuda")] = 0
+        writer = torch.cuda.Stream()
+        writer.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(writer):
+            torch.cuda._sleep(10**9)
+            buf[at] = lo
+            buf[at + 1] = hi
+        tokens = torch.full((rows,), -5, dtype=torch.int64, device="cuda")
+        with patch.object(sharded_verify, "_ll_st_b64", _plain_st_b64):
+            sharded_verify._ll_keys_kernel[(1,)](
+                keys[0].contiguous(),
+                parts,
+                rows,
+                buf.data_ptr(),
+                buf.data_ptr(),
+                epoch,
+                tokens,
+                diag.data_ptr(),
+                10**7,
+                60 * 10**9,
+                RANK=0,
+                WORLD=world,
+                MAXR=maxr,
+                BLOCK_R=16,
+                BLOCK_P=2,
+                KEY_FLOOR=sharded_verify._KEY_FLOOR,
+                TIME_CHECK_SPINS=sharded_verify._LL_TIME_CHECK_SPINS,
+                TRAP_GRACE_NS=0,
+                num_warps=4,
+            )
+        torch.cuda.synchronize()
+        self.assertTrue(torch.equal(tokens, want))
+        warning = diag[: sharded_verify._LL_RECORD].tolist()
+        self.assertEqual(warning[:7], [1, 0, tag, slot, rows, parts, 0b10])
+        self.assertGreater(warning[7], 10**7)
+        self.assertEqual(diag[sharded_verify._LL_RECORD :].tolist(), [0] * 8)
+
+    def test_timeout_records_missing_peers_before_trapping(self):
+        # A trap ends the CUDA context, so the launch runs in its own process.
+        script = textwrap.dedent(
+            """
+            import os, time
+            import torch, triton, triton.language as tl
+            from sglang.srt.speculative import sharded_verify
+
+            @triton.jit
+            def plain_st_b64(addr, val, mask):
+                return tl.inline_asm_elementwise(
+                    '''
+                    {
+                        .reg .pred %p0;
+                        setp.eq.s32 %p0, $3, 1;
+                        @!%p0 bra end;
+                        st.relaxed.sys.global.b64 [$1], $2;
+                        end:
+                    }
+                    ''',
+                    "=r,l,l,r",
+                    args=[addr, val, mask.to(tl.int32)],
+                    dtype=tl.uint32,
+                    is_pure=False,
+                    pack=1,
+                )
+
+            sharded_verify._ll_st_b64 = plain_st_b64
+            world, rows, parts = 2, 7, 2
+            maxr = sharded_verify._LL_MAX_ROWS
+            buf = torch.zeros(
+                sharded_verify._LL_SLOTS * world * maxr * 2,
+                dtype=torch.int64,
+                device="cuda",
+            )
+            epoch = torch.zeros(2, dtype=torch.int32, device="cuda")
+            diag = sharded_verify._ll_watch(world, poll_s=0.02)
+            keys = torch.ones((rows, parts), dtype=torch.int64, device="cuda")
+            tokens = torch.empty(rows, dtype=torch.int64, device="cuda")
+            sharded_verify._ll_keys_kernel[(1,)](
+                keys, parts, rows, buf.data_ptr(), buf.data_ptr(), epoch, tokens,
+                diag.data_ptr(), 10**7, 2 * 10**8,
+                RANK=0, WORLD=world, MAXR=maxr, BLOCK_R=16, BLOCK_P=2,
+                KEY_FLOOR=sharded_verify._KEY_FLOOR,
+                TIME_CHECK_SPINS=sharded_verify._LL_TIME_CHECK_SPINS,
+                TRAP_GRACE_NS=5 * 10**8,
+                num_warps=4,
+            )
+            try:
+                torch.cuda.synchronize()
+                print("COMPLETED", flush=True)
+            except Exception as e:
+                print("CUDA-ERROR", type(e).__name__, flush=True)
+            time.sleep(0.2)
+            print("RECORD", diag.tolist(), flush=True)
+            os._exit(0)
+            """
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "ll_timeout.py")
+            with open(path, "w") as f:
+                f.write(script)
+            run = subprocess.run(
+                [sys.executable, path], capture_output=True, text=True, timeout=600
+            )
+        self.assertIn("CUDA-ERROR", run.stdout, run.stdout + run.stderr)
+        record = ast.literal_eval(run.stdout.split("RECORD", 1)[1].strip())
+        timeout = record[sharded_verify._LL_RECORD :]
+        self.assertEqual(timeout[:7], [2, 0, 1, 1, 7, 2, 0b10])
+        self.assertGreater(timeout[7], 2 * 10**8)
+        self.assertEqual(record[0], 1)
+        self.assertIn(
+            "Sharded verify LL exchange timed out: TP rank 0 waited", run.stderr
+        )
+        self.assertIn("for ranks [1] (tag=1, slot=1, rows=7, parts=2)", run.stderr)
+
+    def test_watcher_logs_each_wait_and_the_timeout(self):
+        record = sharded_verify._LL_RECORD
+        with self.assertLogs(sharded_verify.logger, "WARNING") as logs:
+            diag = sharded_verify._ll_watch(4, poll_s=0.01)
+            diag[1:record] = torch.tensor([3, 9, 0, 5, 2, 0b0101, 6 * 10**9])
+            diag[0] = 1
+            time.sleep(0.3)
+            diag[record + 1 :] = torch.tensor([3, 10, 1, 5, 2, 0b0001, 6 * 10**11])
+            diag[record] = 2
+            time.sleep(0.3)
+        output = "\n".join(logs.output)
+        self.assertEqual(len(logs.output), 2, output)
+        self.assertIn(
+            "waiting: TP rank 3 waited 6.0 s for ranks [0, 2] "
+            "(tag=9, slot=0, rows=5, parts=2)",
+            logs.output[0],
+        )
+        self.assertIn(
+            "timed out: TP rank 3 waited 600.0 s for ranks [0] "
+            "(tag=10, slot=1, rows=5, parts=2)",
+            logs.output[1],
+        )
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")

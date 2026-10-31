@@ -269,7 +269,16 @@ def _mc_gather_keys(keys: torch.Tensor, tp_group) -> Optional[torch.Tensor]:
 # the three slots, so wrapping the wire tag never reuses the preceding slot.
 _LL_SLOTS = 3
 _LL_MAX_ROWS = 64
-_LL_SPIN_LIMIT = 1 << 26
+# Ranks may legitimately reach an exchange seconds apart (an eager round's first
+# use of a lazily built module), so the poll is bounded by wall time on the scale
+# of a process-group timeout (torch's default) rather than by a spin count.
+_LL_TIMEOUT_NS = 600 * 10**9
+_LL_WARN_NS = 5 * 10**9
+_LL_TRAP_GRACE_NS = 10**9
+_LL_TIME_CHECK_SPINS = 1024
+# Host-mapped records the poll writes for the watcher: [warning, timeout] of
+# [state, rank, tag, slot, rows, parts, missing-rank bitmask, waited ns].
+_LL_RECORD = 8
 _ll_state = None
 
 
@@ -320,6 +329,39 @@ def _ll_trap():
 
 
 @triton.jit
+def _ll_now():
+    return tl.inline_asm_elementwise(
+        "mov.u64 $0, %globaltimer;", "=l", [], dtype=tl.int64, is_pure=False, pack=1
+    )
+
+
+@triton.jit
+def _ll_fence():
+    tl.inline_asm_elementwise(
+        "fence.sc.sys;", "=r", [], dtype=tl.int32, is_pure=False, pack=1
+    )
+
+
+@triton.jit
+def _ll_record(diag_addr, base, state, rank, tag, slot, rows, parts, missing, waited):
+    # fields first, then the state word the watcher polls
+    d = diag_addr.to(tl.pointer_type(tl.int64)) + base
+    i = tl.arange(0, 8)
+    v = tl.zeros([8], tl.int64)
+    v = tl.where(i == 1, rank, v)
+    v = tl.where(i == 2, tag.to(tl.int64), v)
+    v = tl.where(i == 3, slot, v)
+    v = tl.where(i == 4, rows, v)
+    v = tl.where(i == 5, parts, v)
+    v = tl.where(i == 6, missing, v)
+    v = tl.where(i == 7, waited, v)
+    tl.store(d + i, v, mask=i > 0)
+    _ll_fence()
+    tl.store(d + i, tl.full([8], state, tl.int64), mask=i == 0)
+    _ll_fence()
+
+
+@triton.jit
 def _ll_keys_kernel(
     keys_ptr,
     parts,
@@ -328,13 +370,17 @@ def _ll_keys_kernel(
     uc_addr,
     epoch_ptr,
     tokens_ptr,
+    diag_addr,
+    warn_ns,
+    timeout_ns,
     RANK: tl.constexpr,
     WORLD: tl.constexpr,
     MAXR: tl.constexpr,
     BLOCK_R: tl.constexpr,
     BLOCK_P: tl.constexpr,
     KEY_FLOOR: tl.constexpr,
-    SPIN_LIMIT: tl.constexpr,
+    TIME_CHECK_SPINS: tl.constexpr,
+    TRAP_GRACE_NS: tl.constexpr,
 ):
     # The wire format has exactly 32 tag bits.  Reinterpret the signed storage
     # before widening, skip zero (the buffer's initial value), and keep slot
@@ -370,6 +416,8 @@ def _ll_keys_kernel(
     ok = (((lo >> 32) == tag) & ((hi >> 32) == tag)) | (~m2)
     pending = tl.sum(1 - ok.to(tl.int32))
     spins = 0
+    warned = 0
+    start = _ll_now()
     while pending > 0:
         tl.debug_barrier()
         lo = _ll_ld_b64(uc + words, m2)
@@ -377,8 +425,34 @@ def _ll_keys_kernel(
         ok = (((lo >> 32) == tag) & ((hi >> 32) == tag)) | (~m2)
         pending = tl.sum(1 - ok.to(tl.int32))
         spins += 1
-        if spins > SPIN_LIMIT:
-            _ll_trap()
+        if (pending > 0) & (spins % TIME_CHECK_SPINS == 0):
+            # one thread's clock, so every warp takes the same branch
+            waited = tl.max(tl.where(r == 0, _ll_now() - start, 0), axis=0)
+            late = tl.sum(1 - ok.to(tl.int32), axis=1)
+            missing = tl.sum(tl.where(late > 0, 1 << s, 0).to(tl.int64), axis=0)
+            if (warned == 0) & (waited > warn_ns):
+                _ll_record(
+                    diag_addr, 0, 1, RANK, tag, slot, rows, parts, missing, waited
+                )
+                warned = 1
+            if waited > timeout_ns:
+                _ll_record(
+                    diag_addr,
+                    8,
+                    2,
+                    RANK,
+                    tag,
+                    slot,
+                    rows,
+                    parts,
+                    missing,
+                    waited,
+                )
+                # let the host watcher log the record before the context dies
+                held = _ll_now()
+                while _ll_now() - held < TRAP_GRACE_NS:
+                    spins += 1
+                _ll_trap()
     got = (((hi & 0xFFFFFFFF) << 32) | (lo & 0xFFFFFFFF)).to(tl.int64, bitcast=True)
     best = tl.max(tl.where(m2, got, KEY_FLOOR), axis=0)
     tl.store(tokens_ptr + r, 4294967295 - (best & 4294967295), mask=rmask)
@@ -418,11 +492,55 @@ def _ll_build(tp_group, device):
     dist.barrier(group=tp_group.cpu_group)
     # [last nonzero wire tag bits, independent slot cursor]
     epoch = torch.zeros(2, dtype=torch.int32, device=device)
+    diag = _ll_watch(world)
     logger.info(
         "Sharded verify LL multimem exchange enabled (world_size=%d)",
         tp_group.world_size,
     )
-    return (buf, hdl, epoch)
+    return (buf, hdl, epoch, diag)
+
+
+def _ll_describe(record, world: int) -> str:
+    _, rank, tag, slot, rows, parts, missing, waited = record
+    peers = [peer for peer in range(world) if missing >> peer & 1]
+    return (
+        f"TP rank {rank} waited {waited / 1e9:.1f} s for ranks {peers} "
+        f"(tag={tag}, slot={slot}, rows={rows}, parts={parts})"
+    )
+
+
+def _ll_watch(world: int, poll_s: float = 0.1) -> torch.Tensor:
+    """Pinned records the LL poll writes, and a daemon thread that logs them.
+
+    The host reads them without touching the GPU stream, so neither the eager
+    path nor a captured graph gains a synchronization, and a timeout record is
+    still readable after the poll traps the context."""
+    import threading
+    import time
+
+    diag = torch.zeros(2 * _LL_RECORD, dtype=torch.int64, pin_memory=True)
+
+    def watch():
+        warned = None
+        while True:
+            time.sleep(poll_s)
+            warning, timeout = diag[:_LL_RECORD].tolist(), diag[_LL_RECORD:].tolist()
+            if timeout[0]:
+                logger.error(
+                    "Sharded verify LL exchange timed out: %s. The ranks reached "
+                    "this exchange out of step; the poll traps the CUDA context.",
+                    _ll_describe(timeout, world),
+                )
+                return
+            if warning[0] and warning[2] != warned:
+                warned = warning[2]
+                logger.warning(
+                    "Sharded verify LL exchange is waiting: %s",
+                    _ll_describe(warning, world),
+                )
+
+    threading.Thread(target=watch, name="sharded-verify-ll-watch", daemon=True).start()
+    return diag
 
 
 def _ll_keys(keys: torch.Tensor, tp_group) -> Optional[torch.Tensor]:
@@ -433,7 +551,7 @@ def _ll_keys(keys: torch.Tensor, tp_group) -> Optional[torch.Tensor]:
         _ll_state = _ll_build(tp_group, keys.device)
     if _ll_state is False:
         return None
-    buf, hdl, epoch = _ll_state
+    buf, hdl, epoch, diag = _ll_state
     rows = keys.shape[0]
     parts = keys.shape[1] if keys.dim() == 2 else 1
     tokens = torch.empty(rows, dtype=torch.int64, device=keys.device)
@@ -445,13 +563,17 @@ def _ll_keys(keys: torch.Tensor, tp_group) -> Optional[torch.Tensor]:
         hdl.buffer_ptrs[hdl.rank],
         epoch,
         tokens,
+        diag.data_ptr(),
+        _LL_WARN_NS,
+        _LL_TIMEOUT_NS,
         RANK=hdl.rank,
         WORLD=tp_group.world_size,
         MAXR=_LL_MAX_ROWS,
         BLOCK_R=max(16, triton.next_power_of_2(rows)),
         BLOCK_P=max(2, triton.next_power_of_2(parts)),
         KEY_FLOOR=_KEY_FLOOR,
-        SPIN_LIMIT=_LL_SPIN_LIMIT,
+        TIME_CHECK_SPINS=_LL_TIME_CHECK_SPINS,
+        TRAP_GRACE_NS=_LL_TRAP_GRACE_NS,
         num_warps=4,
     )
     return tokens
