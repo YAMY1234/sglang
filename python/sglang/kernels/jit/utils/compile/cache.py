@@ -490,6 +490,10 @@ def _to_entries(
     their paths are unstable, and their contents are already a function of
     inputs ``build_key`` covers.
     """
+    # Resolved like the paths it is compared with: under a symlinked cache root
+    # nothing would fall inside it, and the generated units recorded instead
+    # vanish once the build is published, so no other process could hit the leaf.
+    build_root = build_dir.resolve()
     seen: Dict[Tuple[str, str], _DepEntry] = {}
     for candidate in dependencies:
         path = (
@@ -497,7 +501,7 @@ def _to_entries(
             if candidate.is_absolute()
             else (build_dir / candidate).resolve()
         )
-        if path.is_relative_to(build_dir) or not path.is_file():
+        if path.is_relative_to(build_root) or not path.is_file():
             continue
         digest = _file_digest(path)
         if digest is None:
