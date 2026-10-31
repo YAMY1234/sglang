@@ -512,6 +512,76 @@ class TestShardedPolicy(CustomTestCase):
         self.assertTrue(torch.equal(simulated_targets[0], greedy_bonus.reshape(2, 3)))
 
 
+class TestTreeKernelPrecompile(CustomTestCase):
+    @staticmethod
+    def _processor(eligible):
+        processor = LogitsProcessor.__new__(LogitsProcessor)
+        torch.nn.Module.__init__(processor)
+        processor._sharded_verify_eligible = eligible
+        processor.sharded_verify = False
+        return processor
+
+    def test_compile_failure_is_cached_and_keeps_the_gather(self):
+        from sglang.kernels.ops.speculative import tree
+
+        attempts = 0
+
+        def failed_module():
+            nonlocal attempts
+            attempts += 1
+            raise RuntimeError("read-only JIT cache")
+
+        processor = self._processor(eligible=True)
+        with (
+            patch.object(tree, "_module_available", None),
+            patch.object(tree, "_jit_tree_module", failed_module),
+            self.assertLogs(tree.logger, "WARNING") as logs,
+        ):
+            processor.enable_sharded_verify()
+            self.assertFalse(tree.precompile())
+            processor.enable_sharded_verify()
+
+        self.assertEqual(attempts, 1)
+        self.assertFalse(processor.sharded_verify)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("keeps the gathered stock path", logs.output[0])
+
+    def test_ineligible_processor_never_compiles(self):
+        from sglang.kernels.ops.speculative import tree
+
+        def forbidden_module():
+            raise AssertionError("an ineligible processor must not build kernels")
+
+        processor = self._processor(eligible=False)
+        with (
+            patch.object(tree, "_module_available", None),
+            patch.object(tree, "_jit_tree_module", forbidden_module),
+        ):
+            processor.enable_sharded_verify()
+            self.assertIsNone(tree._module_available)
+        self.assertFalse(processor.sharded_verify)
+
+    def test_successful_compile_enables_shards_once(self):
+        from sglang.kernels.ops.speculative import tree
+
+        attempts = 0
+
+        def module():
+            nonlocal attempts
+            attempts += 1
+            return object()
+
+        processor = self._processor(eligible=True)
+        with (
+            patch.object(tree, "_module_available", None),
+            patch.object(tree, "_jit_tree_module", module),
+        ):
+            processor.enable_sharded_verify()
+            processor.enable_sharded_verify()
+        self.assertTrue(processor.sharded_verify)
+        self.assertEqual(attempts, 1)
+
+
 class TestShardedReducerContract(CustomTestCase):
     def test_cross_domain_tp_rejects_both_multimem_builders(self):
         group = SimpleNamespace(world_size=8, cpu_group=object())

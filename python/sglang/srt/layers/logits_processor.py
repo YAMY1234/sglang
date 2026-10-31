@@ -612,8 +612,16 @@ class LogitsProcessor(nn.Module):
         )
 
     def enable_sharded_verify(self) -> None:
-        """Opt in a verify consumer that understands vocab-shard outputs."""
-        self.sharded_verify = self._sharded_verify_eligible
+        """Opt in a verify consumer that understands vocab-shard outputs.
+
+        An eager verify on shards runs the stock tree kernels between key
+        exchanges, so they are built now; a build failure keeps the gather."""
+        if not self._sharded_verify_eligible:
+            self.sharded_verify = False
+            return
+        from sglang.kernels.ops.speculative import tree
+
+        self.sharded_verify = tree.precompile()
 
     def forward(
         self,

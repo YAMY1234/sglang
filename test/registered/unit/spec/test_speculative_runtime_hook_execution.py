@@ -105,6 +105,15 @@ class _PostVerify:
 
 
 class TestRuntimeHookExecution(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        # opting in builds the tree kernels, which a CPU runner cannot compile
+        precompile = patch(
+            "sglang.kernels.ops.speculative.tree.precompile", return_value=True
+        )
+        precompile.start()
+        self.addCleanup(precompile.stop)
+
     def _assert_worker_sharded_verify_support(
         self,
         *,

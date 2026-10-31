@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 from sglang.kernels.jit.utils import cache_once, load_jit
@@ -8,6 +9,9 @@ from sglang.kernels.kernel_api_logging import debug_kernel_api
 if TYPE_CHECKING:
     import torch
     from tvm_ffi.module import Module
+
+logger = logging.getLogger(__name__)
+_module_available: bool | None = None
 
 
 @cache_once
@@ -24,6 +28,27 @@ def _jit_tree_module() -> Module:
             ),
         ],
     )
+
+
+def precompile() -> bool:
+    """Compile once during worker initialization and cache the rejection.
+
+    A first build takes seconds per rank and is serialized across a node's
+    ranks, so it must not start between two rank-lockstep collectives."""
+    global _module_available
+    if _module_available is None:
+        try:
+            _jit_tree_module()
+        except Exception as exc:
+            logger.warning(
+                "Speculative tree kernels could not be precompiled; "
+                "vocabulary-sharded verify keeps the gathered stock path: %s",
+                exc,
+            )
+            _module_available = False
+        else:
+            _module_available = True
+    return _module_available
 
 
 @debug_kernel_api
