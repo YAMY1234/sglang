@@ -1332,6 +1332,45 @@ class TestPerBatchVocabShards(CustomTestCase):
             )
             self.assertEqual(runner._resolve_logits_variant(agentx), VERIFY_FULL_LOGITS)
 
+    def test_runner_keeps_shards_for_padded_replays(self):
+        from sglang.srt.layers.logits_processor import (
+            VERIFY_FULL_LOGITS,
+            VERIFY_VOCAB_SHARDS,
+        )
+        from sglang.srt.model_executor.runner import decode_cuda_graph_runner as dcg
+
+        runner = dcg.DecodeCudaGraphRunner.__new__(dcg.DecodeCudaGraphRunner)
+        runner.require_mlp_tp_gather = False
+        self.assertTrue(runner._replay_pads_rows(raw_bs=32, bs=64, is_ragged=False))
+        self.assertFalse(runner._replay_pads_rows(raw_bs=64, bs=64, is_ragged=False))
+        self.assertFalse(runner._replay_pads_rows(raw_bs=32, bs=64, is_ragged=True))
+        runner.require_mlp_tp_gather = True
+        self.assertFalse(runner._replay_pads_rows(raw_bs=32, bs=64, is_ragged=False))
+
+        greedy, agentx = (
+            _verify_forward_batch(),
+            _verify_forward_batch(**_AGENTX_SAMPLING),
+        )
+        runner._verify_logits_processor = None
+        self.assertIsNone(runner._resolve_logits_variant(agentx, padded=True))
+        runner._verify_logits_processor = _sharded_processor()
+        with patch(
+            "sglang.srt.layers.logits_processor.get_spec",
+            return_value=_runtime_spec(),
+        ):
+            self.assertEqual(
+                runner._resolve_logits_variant(agentx, padded=True),
+                VERIFY_VOCAB_SHARDS,
+            )
+            self.assertEqual(
+                runner._resolve_logits_variant(agentx, padded=False),
+                VERIFY_FULL_LOGITS,
+            )
+            self.assertEqual(
+                runner._resolve_logits_variant(greedy, padded=True),
+                VERIFY_VOCAB_SHARDS,
+            )
+
     def test_runner_captures_both_formats_only_for_the_opted_in_processor(self):
         from sglang.srt.model_executor.runner import decode_cuda_graph_runner as dcg
 

@@ -804,13 +804,23 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return key
         return dataclasses.replace(key, logits_variant=logits_variant)
 
-    def _resolve_logits_variant(self, forward_batch: ForwardBatch) -> Optional[str]:
+    def _resolve_logits_variant(
+        self, forward_batch: ForwardBatch, *, padded: bool = False
+    ) -> Optional[str]:
         processor = self._verify_logits_processor
         if processor is None:
             return None
-        if processor.verify_uses_vocab_shards(forward_batch):
+        # The full-logits graph gathers the vocabulary of every padding row too;
+        # a padded replay keeps shards so the consumer gathers only real rows.
+        if padded or processor.verify_uses_vocab_shards(forward_batch):
             return VERIFY_VOCAB_SHARDS
         return VERIFY_FULL_LOGITS
+
+    def _replay_pads_rows(self, *, raw_bs: int, bs: int, is_ragged: bool) -> bool:
+        # Every TP rank sees the same raw_bs and bucket list, hence the same
+        # choice. Under MLP TP gather the bucket follows the largest DP batch,
+        # so padding differs per rank and only the sampling decides there.
+        return not is_ragged and not self.require_mlp_tp_gather and bs != raw_bs
 
     def _capture_graph_size(self, *, bs: int, num_tokens: int) -> int:
         return num_tokens if self.ragged_verify_mode else bs
@@ -1700,7 +1710,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self._make_graph_key(
                     graph_size_key, stream_idx, variant_label, attention_variant
                 ),
-                self._resolve_logits_variant(forward_batch),
+                self._resolve_logits_variant(
+                    forward_batch,
+                    padded=self._replay_pads_rows(
+                        raw_bs=self.raw_bs, bs=self.bs, is_ragged=is_ragged
+                    ),
+                ),
             )
             return
 
@@ -1817,7 +1832,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self._make_graph_key(
                 graph_size_key, stream_idx, variant_label, attention_variant
             ),
-            self._resolve_logits_variant(forward_batch),
+            self._resolve_logits_variant(
+                forward_batch,
+                padded=self._replay_pads_rows(
+                    raw_bs=raw_bs, bs=bs, is_ragged=is_ragged
+                ),
+            ),
         )
 
     def _staged_signature(self, forward_batch: ForwardBatch) -> Optional[tuple]:
