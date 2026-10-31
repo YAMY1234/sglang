@@ -8,7 +8,8 @@ identity.
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+import dataclasses
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -19,7 +20,23 @@ from sglang.kernels.plugin_kernels.nvidia.spec import (
     PostVerifyStrategy,
     ShardedLogitsView,
     SpeculativeRuntimeHooks,
+    VerifySamplingView,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class StockVerifyBatch:
+    """The ScheduleBatch fields eagle_sample reads, and no others."""
+
+    device: torch.device
+    forward_mode: ForwardMode
+    seq_lens: torch.Tensor
+    sampling_info: VerifySamplingView
+    req_pool_indices: torch.Tensor
+    return_logprob: bool
 
 
 def default_local_keys(view: ShardedLogitsView) -> torch.Tensor | None:
@@ -52,11 +69,12 @@ def default_post_verify(
     local_keys: LocalKeysFn,
 ) -> PostVerifyOutput:
     """Run the existing verifier and preserve its outputs and mutation order."""
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
     from sglang.srt.speculative import eagle_utils
 
-    batch = SimpleNamespace(
+    batch = StockVerifyBatch(
         device=io.device,
-        forward_mode=SimpleNamespace(is_idle=lambda: io.is_idle),
+        forward_mode=ForwardMode.IDLE if io.is_idle else ForwardMode.TARGET_VERIFY,
         seq_lens=io.seq_lens,
         sampling_info=io.sampling_info,
         req_pool_indices=io.req_pool_indices,

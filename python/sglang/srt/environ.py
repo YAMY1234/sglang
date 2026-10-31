@@ -1650,8 +1650,6 @@ class Envs:
     )
     # Runtime optimizations that follow SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION. Each
     # still accepts its former name (deprecated_name) until the alias is removed.
-    # Kernel groups requested from the NVIDIA megakernel plugin.
-    SGLANG_NVIDIA_MEGAKERNEL_SLOTS = EnvTuple(())
     # The fused small-field copy gives each field its own blocks and moves aligned fields in 16 B units.
     SGLANG_OPT_SMALL_FIELD_COPY_VECTORIZED = EnvBoolWithAlias(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get,
@@ -2328,6 +2326,9 @@ class Envs:
     # ===================================================================
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")
+    # Read by the NVIDIA megakernel plugin, not by SGLang: a comma-separated
+    # slot list that replaces the plugin's default. Empty runs the stock paths.
+    SGLANG_NVIDIA_MEGAKERNEL_SLOTS = EnvTuple(())
 
     # ===================================================================
     # KV-Canary and Token-Oracle (testing only)
