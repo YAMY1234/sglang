@@ -4,7 +4,12 @@ first read and checked after capture; the structs carry data only and the tolera
 lists name real members; offered entries run only at the batch sizes every rank
 serves, an unservable setup is refused, and without an offer SGLang's path runs."""
 
+import ast
 import contextlib
+import dataclasses
+import inspect
+import sys
+import textwrap
 import typing
 import unittest
 from types import SimpleNamespace
@@ -13,9 +18,11 @@ from unittest.mock import MagicMock, call, patch
 import msgspec
 import torch
 
+from sglang.kernels.plugin_kernels.nvidia import spec
 from sglang.srt.environ import envs
 from sglang.srt.kernel_plugins.nvidia import binding as runtime
 from sglang.srt.kernel_plugins.nvidia import eagle_binding as eb
+from sglang.srt.kernel_plugins.nvidia import speculative_runtime
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
 )
@@ -780,6 +787,426 @@ class TestSpecRelayBypass(CustomTestCase):
 
         future_map._stash.assert_called_once_with(indices, payload)
         self.assertIsNone(future_map._deferred_relay)
+
+
+class TestSpeculativeRuntimeContract(CustomTestCase):
+    def test_frozen_field_lists(self):
+        expected = {
+            spec.VocabShardView: ("start", "valid", "vocab_size"),
+            spec.ShardedLogitsView: (
+                "values",
+                "shard",
+                "temperatures",
+                "seeds",
+                "splits",
+            ),
+            spec.VerifyTreeView: (
+                "draft_tokens",
+                "draft_probabilities",
+                "retrieve_index",
+                "next_child",
+                "next_sibling",
+                "custom_mask",
+                "positions",
+                "tokens_per_request",
+                "max_depth",
+                "topk",
+            ),
+            spec.VerifySamplingView: (
+                "sequence_lengths",
+                "temperatures",
+                "top_ks",
+                "top_ps",
+                "min_ps",
+                "additive_penalties",
+                "scaling_penalties",
+                "logit_bias",
+                "sampling_seed",
+                "is_all_greedy",
+                "need_top_k_sampling",
+                "need_top_p_sampling",
+                "need_min_p_sampling",
+                "watermark_keys",
+                "watermark_context_windows",
+                "watermark_enabled",
+                "has_watermark_candidates",
+                "max_top_k",
+                "device",
+            ),
+            spec.PostVerifyIO: (
+                "logits",
+                "verify_tree",
+                "sampling",
+                "grammar_mask",
+                "watermark",
+                "watermark_full_mask",
+                "request_pool_indices",
+                "return_logprob",
+                "is_idle",
+                "simulated_accept_length",
+                "simulated_accept_length_rng",
+                "sparse_target_max_top_k",
+                "sparse_bonus_argmax",
+            ),
+            spec.PostVerifyOutput: (
+                "token_ids",
+                "accepted_lengths",
+                "accepted_indices",
+            ),
+            spec.PostVerifyStrategy: ("run", "local_keys"),
+            spec.SpeculativeRuntimeHooks: ("post_verify",),
+        }
+        for contract, fields in expected.items():
+            with self.subTest(contract=contract.__name__):
+                self.assertTrue(issubclass(contract, msgspec.Struct))
+                self.assertEqual(
+                    tuple(field.name for field in msgspec.structs.fields(contract)),
+                    fields,
+                )
+                self.assertTrue(contract.__struct_config__.frozen)
+
+    def test_frozen_contract_field_types_resolve_exactly_without_any(self):
+        tensor = torch.Tensor
+        optional = typing.Optional
+        expected = {
+            spec.VocabShardView: {"start": int, "valid": int, "vocab_size": int},
+            spec.ShardedLogitsView: {
+                "values": tensor,
+                "shard": spec.VocabShardView,
+                "temperatures": optional[tensor],
+                "seeds": optional[tensor],
+                "splits": int,
+            },
+            spec.VerifyTreeView: {
+                "draft_tokens": tensor,
+                "draft_probabilities": optional[tensor],
+                "retrieve_index": tensor,
+                "next_child": tensor,
+                "next_sibling": tensor,
+                "custom_mask": optional[tensor],
+                "positions": optional[tensor],
+                "tokens_per_request": int,
+                "max_depth": int,
+                "topk": int,
+            },
+            spec.VerifySamplingView: {
+                "sequence_lengths": tensor,
+                "temperatures": tensor,
+                "top_ks": tensor,
+                "top_ps": tensor,
+                "min_ps": tensor,
+                "additive_penalties": optional[tensor],
+                "scaling_penalties": optional[tensor],
+                "logit_bias": optional[tensor],
+                "sampling_seed": optional[tensor],
+                "is_all_greedy": bool,
+                "need_top_k_sampling": bool,
+                "need_top_p_sampling": bool,
+                "need_min_p_sampling": bool,
+                "watermark_keys": optional[tensor],
+                "watermark_context_windows": optional[tensor],
+                "watermark_enabled": optional[tensor],
+                "has_watermark_candidates": bool,
+                "max_top_k": optional[int],
+                "device": torch.device,
+            },
+            spec.PostVerifyIO: {
+                "logits": spec.VerifyLogitsView,
+                "verify_tree": spec.VerifyTreeView,
+                "sampling": spec.VerifySamplingView,
+                "grammar_mask": optional[spec.GrammarMaskView],
+                "watermark": optional[spec.WatermarkStateView],
+                "watermark_full_mask": bool,
+                "request_pool_indices": tensor,
+                "return_logprob": bool,
+                "is_idle": bool,
+                "simulated_accept_length": optional[tensor],
+                "simulated_accept_length_rng": optional[torch.Generator],
+                "sparse_target_max_top_k": optional[int],
+                "sparse_bonus_argmax": bool,
+            },
+            spec.PostVerifyOutput: {
+                "token_ids": tensor,
+                "accepted_lengths": tensor,
+                "accepted_indices": tensor,
+            },
+            spec.PostVerifyStrategy: {
+                "run": spec.VerifyRunner,
+                "local_keys": spec.LocalKeysFn,
+            },
+            spec.SpeculativeRuntimeHooks: {
+                "post_verify": spec.PostVerifyStrategy,
+            },
+        }
+        for contract, types in expected.items():
+            with self.subTest(contract=contract.__name__):
+                resolved = typing.get_type_hints(contract)
+                self.assertEqual(resolved, types)
+                self.assertNotIn("typing.Any", repr(resolved))
+
+        self.assertEqual(
+            typing.get_type_hints(spec.VerifyLogitsView),
+            {
+                "next_token_logits": tensor,
+                "next_token_logits_vocab_shard": optional[spec.VocabShardView],
+            },
+        )
+
+        self.assertEqual(
+            spec.LocalKeysFn,
+            typing.Callable[[spec.ShardedLogitsView], typing.Optional[torch.Tensor]],
+        )
+        self.assertEqual(
+            spec.HooksFactory,
+            typing.Callable[
+                [spec.SpeculativeRuntimeHooks], spec.SpeculativeRuntimeHooks
+            ],
+        )
+
+    def test_the_runtime_vocab_shard_is_the_abi_type(self):
+        # The runtime PR owns ``sharded_verify``.  When both PRs are present its
+        # public alias must still resolve to this one canonical ABI type; the
+        # standalone binding PR can validate the provider contract by itself.
+        try:
+            from sglang.srt.speculative.sharded_verify import VocabShard
+        except ModuleNotFoundError as exc:
+            if exc.name != "sglang.srt.speculative.sharded_verify":
+                raise
+        else:
+            self.assertIs(VocabShard, spec.VocabShardView)
+
+    def test_strategy_passes_the_local_policy_to_runtime(self):
+        output = spec.PostVerifyOutput(
+            token_ids=torch.tensor([1]),
+            accepted_lengths=torch.tensor([1]),
+            accepted_indices=torch.tensor([0]),
+        )
+        local_keys = lambda view: view.values.argmax(-1)
+        calls = []
+
+        def run(io, policy):
+            calls.append((io, policy))
+            return output
+
+        io = object()
+        strategy = spec.PostVerifyStrategy(run=run, local_keys=local_keys)
+        self.assertIs(strategy(io), output)
+        self.assertEqual(calls, [(io, local_keys)])
+
+    def test_built_provider_exposes_optional_factory(self):
+        hints = typing.get_type_hints(spec.BuiltMegakernel)
+        self.assertEqual(
+            hints["speculative_runtime_hooks"], typing.Optional[spec.HooksFactory]
+        )
+
+
+def _defaults() -> spec.SpeculativeRuntimeHooks:
+    return speculative_runtime.default_speculative_runtime_hooks()
+
+
+class TestSpeculativeRuntimeHooks(CustomTestCase):
+    def test_switch_off_returns_stock_identity_without_provider_work(self):
+        defaults = _defaults()
+        model = torch.nn.Module()
+        model.__dict__["_megakernel"] = SimpleNamespace(
+            speculative_runtime_hooks=lambda _: (_ for _ in ()).throw(
+                AssertionError("factory must not run")
+            )
+        )
+        with (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(False),
+            patch.object(
+                runtime,
+                "built_megakernel",
+                side_effect=AssertionError("off must not inspect a provider"),
+            ),
+            patch.object(runtime, "megakernel_agree") as agree,
+        ):
+            selected = runtime.bind_speculative_runtime_hooks(model, defaults)
+        self.assertIs(selected, defaults)
+        agree.assert_not_called()
+
+    def test_missing_provider_keeps_exact_defaults(self):
+        defaults = _defaults()
+        models = (torch.nn.Module(), torch.nn.Module())
+        models[1].__dict__["_megakernel"] = SimpleNamespace(widths=())
+        for model in models:
+            with (
+                self.subTest(has_built=runtime.built_megakernel(model) is not None),
+                envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+                patch.object(runtime, "_gather_tp", return_value=[False]),
+            ):
+                selected = runtime.bind_speculative_runtime_hooks(model, defaults)
+            self.assertIs(selected, defaults)
+
+    def test_factory_wraps_defaults_and_changes_only_local_keys(self):
+        defaults = _defaults()
+        custom_keys = lambda view: torch.zeros(
+            view.values.shape[0], dtype=torch.int64, device=view.values.device
+        )
+
+        def factory(stock):
+            return spec.SpeculativeRuntimeHooks(
+                post_verify=spec.PostVerifyStrategy(
+                    run=stock.post_verify.run,
+                    local_keys=custom_keys,
+                )
+            )
+
+        model = torch.nn.Module()
+        model.__dict__["_megakernel"] = SimpleNamespace(
+            speculative_runtime_hooks=factory
+        )
+        with (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+            patch.object(runtime, "_gather_tp", return_value=[True]),
+        ):
+            selected = runtime.bind_speculative_runtime_hooks(model, defaults)
+        self.assertIs(selected.post_verify.run, defaults.post_verify.run)
+        self.assertIs(selected.post_verify.local_keys, custom_keys)
+
+    def test_factory_cannot_replace_the_runtime_runner(self):
+        defaults = _defaults()
+
+        def factory(stock):
+            return msgspec.structs.replace(
+                stock,
+                post_verify=msgspec.structs.replace(
+                    stock.post_verify,
+                    run=lambda io, local_keys: stock.post_verify(io),
+                ),
+            )
+
+        model = torch.nn.Module()
+        model.__dict__["_megakernel"] = SimpleNamespace(
+            speculative_runtime_hooks=factory
+        )
+        with (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+            patch.object(runtime, "_gather_tp", return_value=[True]),
+            self.assertRaisesRegex(ValueError, "cannot replace.*runner"),
+        ):
+            runtime.bind_speculative_runtime_hooks(model, defaults)
+
+    def test_factory_must_return_a_callable_local_key_policy(self):
+        defaults = _defaults()
+
+        def factory(stock):
+            return msgspec.structs.replace(
+                stock,
+                post_verify=msgspec.structs.replace(stock.post_verify, local_keys=None),
+            )
+
+        model = torch.nn.Module()
+        model.__dict__["_megakernel"] = SimpleNamespace(
+            speculative_runtime_hooks=factory
+        )
+        with (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+            patch.object(runtime, "_gather_tp", return_value=[True]),
+            self.assertRaisesRegex(TypeError, "local_keys must be callable"),
+        ):
+            runtime.bind_speculative_runtime_hooks(model, defaults)
+
+    def test_provider_presence_must_agree_across_ranks(self):
+        defaults = _defaults()
+        model = torch.nn.Module()
+        model.__dict__["_megakernel"] = SimpleNamespace(
+            speculative_runtime_hooks=lambda stock: stock
+        )
+        with (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+            patch.object(runtime, "_gather_tp", return_value=[True, False]),
+            self.assertRaisesRegex(RuntimeError, "factory presence differ"),
+        ):
+            runtime.bind_speculative_runtime_hooks(model, defaults)
+
+    def test_defaults_are_safe_before_the_sharded_runtime_lands(self):
+        defaults = _defaults()
+        view = spec.ShardedLogitsView(
+            values=torch.ones((2, 4)),
+            shard=spec.VocabShardView(start=0, valid=4, vocab_size=4),
+            temperatures=None,
+            seeds=None,
+            splits=1,
+        )
+        # Exercise the standalone binding tree even when this test is also run
+        # against a composed runtime+binding checkout.
+        with patch.dict(
+            sys.modules,
+            {"sglang.srt.speculative.sharded_verify": None},
+        ):
+            self.assertIsNone(defaults.post_verify.local_keys(view))
+
+    def test_default_post_verify_uses_the_stock_signature(self):
+        io = SimpleNamespace(
+            device=torch.device("cpu"),
+            is_idle=False,
+            seq_lens=torch.tensor([3]),
+            sampling_info=SimpleNamespace(),
+            req_pool_indices=torch.tensor([0]),
+            return_logprob=False,
+            verify_tree=object(),
+            logits=object(),
+            grammar_mask=None,
+            sparse_target_max_top_k=None,
+            watermark=None,
+            watermark_full_mask=True,
+            simulated_accept_length=None,
+            simulated_accept_length_rng=None,
+            sparse_bonus_argmax=False,
+        )
+        expected = (
+            torch.tensor([1]),
+            torch.tensor([0]),
+            torch.tensor([0]),
+        )
+        with (
+            patch(
+                "sglang.srt.speculative.eagle_utils.LOCAL_KEYS_SUPPORTED",
+                False,
+                create=True,
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_utils.eagle_sample",
+                return_value=expected,
+            ) as sample,
+        ):
+            output = speculative_runtime.default_post_verify(io, lambda view: None)
+        self.assertEqual(
+            sample.call_args.kwargs,
+            {
+                "uno_target_max_top_k": None,
+                "watermark_state": None,
+                "watermark_full_mask": True,
+                "simulated_acc_len": None,
+                "simulated_acc_len_rng": None,
+                "sparse_bonus_argmax": False,
+            },
+        )
+        self.assertTrue(torch.equal(output.token_ids, expected[0]))
+        batch = sample.call_args.args[1]
+        self.assertIsInstance(batch, speculative_runtime.StockVerifyBatch)
+        self.assertIs(batch.forward_mode, ForwardMode.TARGET_VERIFY)
+        self.assertIs(batch.sampling_info, io.sampling_info)
+        self.assertIs(batch.req_pool_indices, io.req_pool_indices)
+
+    def test_stock_verify_batch_covers_every_eagle_sample_batch_read(self):
+        from sglang.srt.speculative import eagle_utils
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(eagle_utils.eagle_sample)))
+        reads = {
+            node.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "batch"
+        }
+        fields = {
+            field.name
+            for field in dataclasses.fields(speculative_runtime.StockVerifyBatch)
+        }
+        self.assertEqual(reads, fields)
 
 
 if __name__ == "__main__":
