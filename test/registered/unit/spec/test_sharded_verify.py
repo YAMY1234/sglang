@@ -1146,13 +1146,6 @@ class TestLLKeys(CustomTestCase):
         # poll records who it waits for and still returns the exact tokens.
         world, rows, parts = 2, 7, 2
         maxr = sharded_verify._LL_MAX_ROWS
-        buf = torch.zeros(
-            sharded_verify._LL_SLOTS * world * maxr * 2,
-            dtype=torch.int64,
-            device="cuda",
-        )
-        epoch = torch.zeros(2, dtype=torch.int32, device="cuda")
-        diag = _ll_diag()
         keys = torch.randint(-(2**62), 2**62, (world, rows, parts), device="cuda")
         want = 0xFFFFFFFF - (keys.amax(dim=(0, 2)) & 0xFFFFFFFF)
         tag, slot = 1, 1
@@ -1160,8 +1153,47 @@ class TestLLKeys(CustomTestCase):
         peer = keys[1].amax(dim=1)
         lo = (peer & 0xFFFFFFFF) | (tag << 32)
         hi = ((peer >> 32) & 0xFFFFFFFF) | (tag << 32)
-        torch.cuda._sleep(1)
-        torch.empty_like(buf)[torch.arange(2, device="cuda")] = 0
+
+        def launch(buf, diag, tokens):
+            epoch = torch.zeros(2, dtype=torch.int32, device="cuda")
+            with patch.object(sharded_verify, "_ll_st_b64", _plain_st_b64):
+                sharded_verify._ll_keys_kernel[(1,)](
+                    keys[0].contiguous(),
+                    parts,
+                    rows,
+                    buf.data_ptr(),
+                    buf.data_ptr(),
+                    epoch,
+                    tokens,
+                    diag.data_ptr(),
+                    10**7,
+                    60 * 10**9,
+                    RANK=0,
+                    WORLD=world,
+                    MAXR=maxr,
+                    BLOCK_R=16,
+                    BLOCK_P=2,
+                    KEY_FLOOR=sharded_verify._KEY_FLOOR,
+                    TIME_CHECK_SPINS=sharded_verify._LL_TIME_CHECK_SPINS,
+                    TRAP_GRACE_NS=0,
+                    num_warps=4,
+                )
+
+        def zeroed():
+            return torch.zeros(
+                sharded_verify._LL_SLOTS * world * maxr * 2,
+                dtype=torch.int64,
+                device="cuda",
+            )
+
+        # Compiling on the first launch takes longer than the peer's delay, so
+        # build the kernel on a buffer the peer has already written.
+        ready = zeroed()
+        ready[at], ready[at + 1] = lo, hi
+        launch(ready, _ll_diag(), torch.empty(rows, dtype=torch.int64, device="cuda"))
+        torch.cuda.synchronize()
+
+        buf, diag = zeroed(), _ll_diag()
         writer = torch.cuda.Stream()
         writer.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(writer):
@@ -1169,28 +1201,7 @@ class TestLLKeys(CustomTestCase):
             buf[at] = lo
             buf[at + 1] = hi
         tokens = torch.full((rows,), -5, dtype=torch.int64, device="cuda")
-        with patch.object(sharded_verify, "_ll_st_b64", _plain_st_b64):
-            sharded_verify._ll_keys_kernel[(1,)](
-                keys[0].contiguous(),
-                parts,
-                rows,
-                buf.data_ptr(),
-                buf.data_ptr(),
-                epoch,
-                tokens,
-                diag.data_ptr(),
-                10**7,
-                60 * 10**9,
-                RANK=0,
-                WORLD=world,
-                MAXR=maxr,
-                BLOCK_R=16,
-                BLOCK_P=2,
-                KEY_FLOOR=sharded_verify._KEY_FLOOR,
-                TIME_CHECK_SPINS=sharded_verify._LL_TIME_CHECK_SPINS,
-                TRAP_GRACE_NS=0,
-                num_warps=4,
-            )
+        launch(buf, diag, tokens)
         torch.cuda.synchronize()
         self.assertTrue(torch.equal(tokens, want))
         warning = diag[: sharded_verify._LL_RECORD].tolist()
