@@ -138,6 +138,16 @@ def bind_eagle_runtime_hooks(
         return STOCK_SPECULATIVE_RUNTIME_HOOKS
     from sglang.srt.layers.logits_processor import LogitsProcessor
 
+    # ``binding.py`` exists on main, but this provider hook is introduced by a
+    # separate PR.  Runtime-alone selects its exact stock facade.
+    provider_binding = import_module("sglang.srt.kernel_plugins.nvidia.binding")
+    bind = getattr(provider_binding, "bind_speculative_runtime_hooks", None)
+    hooks = (
+        STOCK_SPECULATIVE_RUNTIME_HOOKS
+        if bind is None
+        else bind(model, STOCK_SPECULATIVE_RUNTIME_HOOKS)
+    )
+
     processors = [
         module for module in model.modules() if isinstance(module, LogitsProcessor)
     ]
@@ -151,15 +161,15 @@ def bind_eagle_runtime_hooks(
         # deliberately excludes MTP draft models and unvalidated subclasses.
         enable = getattr(processors[0], "enable_sharded_verify", None)
         if callable(enable):
-            enable()
-
-    # ``binding.py`` exists on main, but this provider hook is introduced by a
-    # separate PR.  Runtime-alone selects its exact stock facade.
-    provider_binding = import_module("sglang.srt.kernel_plugins.nvidia.binding")
-    bind = getattr(provider_binding, "bind_speculative_runtime_hooks", None)
-    if bind is None:
-        return STOCK_SPECULATIVE_RUNTIME_HOOKS
-    return bind(model, STOCK_SPECULATIVE_RUNTIME_HOOKS)
+            stock_keys = getattr(
+                STOCK_SPECULATIVE_RUNTIME_HOOKS.post_verify, "local_keys", None
+            )
+            local_keys = getattr(hooks.post_verify, "local_keys", None)
+            # The stock policy declines every temperature row.
+            enable(
+                temperature_keys=local_keys is not None and local_keys is not stock_keys
+            )
+    return hooks
 
 
 def make_post_verify_io(

@@ -18,6 +18,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
+
 logger = logging.getLogger(__name__)
 
 
@@ -37,6 +39,48 @@ else:
     # shard-view type.  Runtime-only builds retain the structurally identical
     # local type above and never import a binding-only symbol eagerly.
     VocabShard = _provider_vocab_shard
+
+
+def spec_allows_vocab_shards(spec) -> bool:
+    """Whether the server's verify rule can accept or reject on shard keys."""
+    return (
+        not spec.speculative_use_rejection_sampling
+        and spec.speculative_accept_threshold_single == 1.0
+        and spec.speculative_accept_threshold_acc == 1.0
+    )
+
+
+def sampling_allows_vocab_shards(
+    info, *, return_logprob: bool, has_local_keys: bool
+) -> bool:
+    """Whether a verify batch's sampling parameters can consume vocabulary shards.
+
+    Greedy rows are bitwise-preserving. Temperature-only rows need a local key
+    policy. Anything that reads or edits full logits needs the gathered logits.
+    """
+    return (
+        # A provider may decline after seeing its local shard.  Sanitizing that
+        # low-precision shard before the decline is not stock-equivalent: stock
+        # gathers to FP32 first, then sanitizes.  This diagnostic mode is rare,
+        # so keep its exact mutation order by entering the gathered path before
+        # invoking any optional local-key policy.
+        not (has_local_keys and envs.SGLANG_SANITIZE_NAN_LOGITS.get())
+        and not return_logprob
+        and info.acc_additive_penalties is None
+        and info.acc_scaling_penalties is None
+        and info.logit_bias is None
+        and (
+            info.is_all_greedy
+            or (
+                has_local_keys
+                and not (
+                    info.need_top_k_sampling
+                    or info.need_top_p_sampling
+                    or info.need_min_p_sampling
+                )
+            )
+        )
+    )
 
 
 # key of (-inf, token id 0xFFFFFFFF): below every real column's key

@@ -42,7 +42,9 @@ from sglang.srt.speculative.sharded_verify import (
     gather_full_logits,
     key_splits,
     reduce_sharded_token_keys,
+    sampling_allows_vocab_shards,
     sharded_target_tokens,
+    spec_allows_vocab_shards,
 )
 from sglang.srt.utils import (
     is_cpu,
@@ -700,37 +702,17 @@ def _sharded_sampling_applies(
     gathered path before sampling. Anything that reads or edits full logits also
     stays on the stock gathered path.
     """
-    info = batch.sampling_info
-    spec = get_spec()
     return (
         _is_cuda
         and verify_input.tree_topk == 1
         and grammar_mask is None
         and not watermark
-        # A provider may decline after seeing its local shard.  Sanitizing that
-        # low-precision shard before the decline is not stock-equivalent: stock
-        # gathers to FP32 first, then sanitizes.  This diagnostic mode is rare,
-        # so keep its exact mutation order by entering the gathered path before
-        # invoking any optional local-key policy.
-        and not (has_local_keys and envs.SGLANG_SANITIZE_NAN_LOGITS.get())
-        and not batch.return_logprob
-        and info.acc_additive_penalties is None
-        and info.acc_scaling_penalties is None
-        and info.logit_bias is None
-        and (
-            info.is_all_greedy
-            or (
-                has_local_keys
-                and not (
-                    info.need_top_k_sampling
-                    or info.need_top_p_sampling
-                    or info.need_min_p_sampling
-                )
-            )
+        and sampling_allows_vocab_shards(
+            batch.sampling_info,
+            return_logprob=batch.return_logprob,
+            has_local_keys=has_local_keys,
         )
-        and not spec.speculative_use_rejection_sampling
-        and spec.speculative_accept_threshold_single == 1.0
-        and spec.speculative_accept_threshold_acc == 1.0
+        and spec_allows_vocab_shards(get_spec())
     )
 
 
