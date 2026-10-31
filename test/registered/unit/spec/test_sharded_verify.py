@@ -518,6 +518,64 @@ class TestShardedPolicy(CustomTestCase):
         self.assertEqual(len(simulated_targets), 1)
         self.assertTrue(torch.equal(simulated_targets[0], greedy_bonus.reshape(2, 3)))
 
+    def test_greedy_real_draft_bonus_reuses_the_sharded_target(self):
+        # One key exchange per eager greedy round: ranks need not stay in step
+        # across the tree verify that separates the target from the bonus.
+        from sglang.srt.speculative import spec_utils
+
+        logits = SimpleNamespace(
+            next_token_logits=_verify_logits().clone(),
+            next_token_logits_vocab_shard=VocabShard(start=0, valid=5, vocab_size=5),
+        )
+        target = torch.tensor([0, 1, 2, 2, 3, 4], dtype=torch.int64)
+        simulated_targets = []
+
+        def greedy_check(**kwargs):
+            self.assertTrue(torch.equal(kwargs["target_predict"], target.reshape(2, 3)))
+            return (
+                kwargs["predicts"],
+                kwargs["accept_index"],
+                kwargs["accept_token_num"],
+            )
+
+        def simulate(**kwargs):
+            simulated_targets.append(kwargs["target_predict"].clone())
+            return kwargs["accept_index"]
+
+        with (
+            patch.object(eagle_utils, "_is_cuda", True),
+            patch.object(eagle_utils, "_is_cpu", False),
+            patch.object(eagle_utils, "_is_hip", False),
+            patch.object(eagle_utils, "_is_xpu", False),
+            patch.object(eagle_utils, "get_spec", return_value=_runtime_spec()),
+            patch.object(
+                eagle_utils, "_sharded_tokens", return_value=target
+            ) as sharded_tokens,
+            patch.object(
+                eagle_utils, "verify_tree_greedy_func", side_effect=greedy_check
+            ),
+            patch.object(
+                spec_utils,
+                "generate_simulated_accept_index_device",
+                side_effect=simulate,
+            ),
+            patch.object(spec_utils, "SIMULATE_ACC_LEN", 1.0),
+            patch.object(spec_utils, "SIMULATE_ACC_TOKEN_MODE", "real-draft-token"),
+        ):
+            eagle_utils.eagle_sample(
+                _verify_tree(),
+                _verify_batch(_sampling_info(greedy=True)),
+                logits,
+                simulated_acc_len=torch.tensor([1]),
+                local_keys=lambda _view: None,
+            )
+
+        sharded_tokens.assert_called_once()
+        self.assertIsNone(sharded_tokens.call_args.kwargs["temperatures"])
+        self.assertEqual(len(simulated_targets), 1)
+        self.assertTrue(torch.equal(simulated_targets[0], target.reshape(2, 3)))
+        self.assertIsNotNone(logits.next_token_logits_vocab_shard)
+
 
 class TestTreeKernelPrecompile(CustomTestCase):
     @staticmethod

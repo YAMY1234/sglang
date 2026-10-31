@@ -1174,8 +1174,13 @@ def eagle_sample(
                     "requires speculative_eagle_topk=1."
                 )
 
-            # Use target argmax as the synthetic bonus for non-greedy requests.
-            if target_predict is None or sparse_bonus_argmax or vocab_shard is not None:
+            # Use target argmax as the synthetic bonus for non-greedy requests. A
+            # greedy target already is that argmax, so shards are not reduced again.
+            if (
+                target_predict is None
+                or sparse_bonus_argmax
+                or (vocab_shard is not None and not greedy)
+            ):
                 bonus_predict = None
                 if vocab_shard is not None:
                     bonus_predict = _sharded_tokens(
