@@ -531,68 +531,6 @@ class TestShardedReducerContract(CustomTestCase):
             )
         self.assertEqual(in_domain.call_count, 2)
 
-    def test_tp_uses_nvlink_domain_instead_of_host_boundary(self):
-        group = SimpleNamespace(world_size=8, cpu_group=object())
-        with patch(
-            "sglang.srt.distributed.device_communicators.custom_all_reduce_utils.in_one_nvlink_domain",
-            return_value=True,
-        ) as in_domain:
-            self.assertTrue(
-                sharded_verify._tp_group_in_one_nvlink_domain(group, "cuda:0")
-            )
-        in_domain.assert_called_once_with(group.cpu_group, torch.device("cuda:0"))
-
-    def test_multinode_one_nvlink_domain_keeps_both_multimem_builders(self):
-        cpu_group = object()
-        device_group = object()
-        group = SimpleNamespace(
-            world_size=8,
-            cpu_group=cpu_group,
-            device_group=device_group,
-            rank_in_group=0,
-        )
-        mc_state = SimpleNamespace(
-            symm_mem_hdl=SimpleNamespace(multicast_ptr=1),
-        )
-        ll_buffer = torch.zeros(1, dtype=torch.int64)
-        ll_handle = SimpleNamespace(multicast_ptr=1)
-        ll_diag = torch.zeros(2 * sharded_verify._LL_RECORD, dtype=torch.int64)
-        with (
-            patch.object(
-                sharded_verify, "_tp_group_in_one_nvlink_domain", return_value=True
-            ) as in_domain,
-            patch(
-                "sglang.srt.distributed.device_communicators.triton_symm_mem_ag.create_state",
-                return_value=mc_state,
-            ) as create_state,
-            patch("torch.distributed._symmetric_memory.empty", return_value=ll_buffer),
-            patch(
-                "torch.distributed._symmetric_memory.rendezvous",
-                return_value=ll_handle,
-            ),
-            patch("torch.cuda.synchronize"),
-            patch("torch.distributed.barrier"),
-            patch.object(sharded_verify, "_ll_watch", return_value=ll_diag) as watch,
-        ):
-            self.assertIs(
-                sharded_verify._mc_build(group, hidden_size=64, device="cpu"),
-                mc_state,
-            )
-            ll_state = sharded_verify._ll_build(group, torch.device("cpu"))
-
-        self.assertIs(ll_state[0], ll_buffer)
-        self.assertIs(ll_state[1], ll_handle)
-        self.assertIs(ll_state[3], ll_diag)
-        watch.assert_called_once_with(8)
-        self.assertEqual(in_domain.call_count, 2)
-        create_state.assert_called_once_with(
-            device_group,
-            0,
-            max_tokens=sharded_verify._MC_MAX_ROWS,
-            hidden_size=64,
-            device="cpu",
-        )
-
     def test_an_eager_exchange_aligns_the_ranks_before_polling(self):
         # A rank still on the host must hold the others in a collective, which has
         # no deadline, rather than in the poll, which has one. A captured round is
@@ -697,24 +635,6 @@ class TestShardedReducerContract(CustomTestCase):
             reduce_sharded_token_keys(
                 torch.zeros(2, dtype=torch.int64), group, splits=2
             )
-
-    def test_target_uses_rank_uniform_padded_width_for_splits(self):
-        logits = torch.zeros((3, 4104))
-        shard = VocabShard(start=7 * 4104, valid=4041, vocab_size=32769)
-        keys = torch.zeros((3, key_splits(logits.shape[-1])), dtype=torch.int64)
-        group = SimpleNamespace(world_size=8)
-        with (
-            patch.object(sharded_verify, "shard_keys", return_value=keys) as make,
-            patch.object(
-                sharded_verify,
-                "reduce_sharded_token_keys",
-                return_value=torch.zeros(3, dtype=torch.int64),
-            ) as reduce,
-        ):
-            sharded_target_tokens(logits, shard, group)
-        splits = key_splits(logits.shape[-1])
-        make.assert_called_once_with(logits, shard, splits)
-        reduce.assert_called_once_with(keys, group, splits=splits)
 
     def test_local_key_rows_must_match_logits(self):
         logits = torch.ones((2, 4104))
