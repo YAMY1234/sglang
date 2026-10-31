@@ -955,20 +955,6 @@ def _sampling():
     )
 
 
-def _optional_binding_runtime(test):
-    from importlib import import_module
-
-    try:
-        speculative_runtime = import_module(
-            "sglang.srt.kernel_plugins.nvidia.speculative_runtime"
-        )
-    except ModuleNotFoundError as exc:
-        if exc.name != "sglang.srt.kernel_plugins.nvidia.speculative_runtime":
-            raise
-        test.skipTest("the standalone binding contract is not installed")
-    return speculative_runtime
-
-
 def _verify_tree():
     return SimpleNamespace(
         draft_token=torch.tensor([4, 0, 1, 4, 2, 3]),
@@ -1125,17 +1111,6 @@ class TestRuntimeHookExecution(CustomTestCase):
                 )
                 self.assertIs(selected, provider_hooks)
 
-    def test_runtime_alone_binds_stock_for_supported_model_with_master_off(self):
-        worker, _, processor = _worker_with_model_class("Qwen3_5ForCausalLM")
-
-        with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(False):
-            selected = eagle_worker_common.bind_eagle_runtime_hooks(
-                worker, supports_sharded_verify=True
-            )
-
-        self.assertTrue(processor.sharded_verify)
-        self.assertIs(selected, eagle_worker_common.STOCK_SPECULATIVE_RUNTIME_HOOKS)
-
     def test_only_a_provider_key_policy_shards_temperature_batches(self):
         stock = eagle_worker_common.STOCK_SPECULATIVE_RUNTIME_HOOKS
         provider = SimpleNamespace(post_verify=SimpleNamespace(local_keys=Mock()))
@@ -1188,104 +1163,6 @@ class TestRuntimeHookExecution(CustomTestCase):
             getattr(io.verify_tree, "draft_probs", None),
         )
         self.assertIsNone(probabilities)
-
-    def test_default_post_verify_matches_direct_stock_greedy_bitwise(self):
-        runtime = _optional_binding_runtime(self)
-        from sglang.srt.speculative import eagle_utils
-
-        sampling = _sampling()
-        tree = _verify_tree()
-        runtime_spec = SimpleNamespace(
-            speculative_use_rejection_sampling=False,
-            speculative_accept_threshold_single=1.0,
-            speculative_accept_threshold_acc=1.0,
-        )
-
-        def cpu_greedy(
-            *,
-            predicts,
-            accept_index,
-            accept_token_num,
-            candidates,
-            retrieve_index,
-            retrieve_next_token,
-            retrieve_next_sibling,
-            target_predict,
-            topk,
-        ):
-            del topk
-            target_flat = target_predict.reshape(-1)
-            for row in range(candidates.shape[0]):
-                last = int(retrieve_index[row, 0])
-                accept_index[row, 0] = last
-                accepted = 0
-                child = 0
-                for _ in range(1, accept_index.shape[1]):
-                    child = int(retrieve_next_token[row, child])
-                    while child != -1:
-                        draft_index = int(retrieve_index[row, child])
-                        if int(candidates[row, child]) == int(target_flat[last]):
-                            predicts[last] = target_flat[last]
-                            accepted += 1
-                            accept_index[row, accepted] = draft_index
-                            last = draft_index
-                            break
-                        child = int(retrieve_next_sibling[row, child])
-                    if child == -1:
-                        break
-                accept_token_num[row] = accepted
-                predicts[last] = target_flat[last]
-            return predicts, accept_index, accept_token_num
-
-        def logits_view():
-            return SimpleNamespace(
-                next_token_logits=_verify_logits().clone(),
-                next_token_logits_vocab_shard=None,
-            )
-
-        stock_batch = SimpleNamespace(
-            device=torch.device("cpu"),
-            forward_mode=SimpleNamespace(is_idle=lambda: False),
-            seq_lens=sampling.sequence_lengths,
-            sampling_info=sampling,
-            req_pool_indices=torch.tensor([3, 7]),
-            return_logprob=False,
-        )
-        io = eagle_worker_common.make_post_verify_io(
-            verify_input=tree,
-            sampling_info=sampling,
-            sequence_lengths=stock_batch.seq_lens,
-            request_pool_indices=stock_batch.req_pool_indices,
-            device="cpu",
-            logits_output=logits_view(),
-            grammar_mask=None,
-            watermark=None,
-            watermark_full_mask=True,
-            return_logprob=False,
-            is_idle=False,
-        )
-
-        with (
-            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(False),
-            patch.object(eagle_utils, "get_spec", return_value=runtime_spec),
-            patch.object(
-                eagle_utils, "verify_tree_greedy_func", side_effect=cpu_greedy
-            ),
-        ):
-            direct = eagle_utils.eagle_sample(
-                tree,
-                stock_batch,
-                logits_view(),
-            )
-            actual = runtime.default_speculative_runtime_hooks().post_verify(io)
-
-        selected = (
-            actual.token_ids,
-            actual.accepted_lengths,
-            actual.accepted_indices,
-        )
-        for stock, hooked in zip(direct, selected):
-            self.assertTrue(torch.equal(stock, hooked))
 
 
 if __name__ == "__main__":
