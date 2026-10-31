@@ -148,6 +148,14 @@ class EaglePostVerifyGraphs:
             self.prepared_next_draft = self._graphs.last_slot.prepared_next_draft
         return outputs
 
+    def eager_simulated_accept_length(
+        self, *, max_tree_depth: int, device: torch.device
+    ) -> Optional[torch.Tensor]:
+        """A forced acceptance length (SGLANG_SIMULATE_ACC_LEN) for a round these graphs
+        do not replay, drawn from their stream and staged on the device as a replay
+        would, so the eager verify takes the same fused chain; None when off."""
+        return self._graphs.draw_sim_len_on(max_tree_depth, device)
+
     def join(self) -> None:
         """Order the current stream after the last side-stream mamba state commit; the
         worker calls it once the draft extend is enqueued."""
@@ -502,6 +510,16 @@ class _PostVerifyGraphs:
             SIMULATE_ACC_LEN, SIMULATE_ACC_METHOD, max_len, generator=self._sim_rng
         )
         return host, turn
+
+    def draw_sim_len_on(
+        self, max_len: int, device: torch.device
+    ) -> Optional[torch.Tensor]:
+        sim_len, turn = self._draw_sim_len(max_len)
+        if sim_len is None:
+            return None
+        staged = sim_len.to(device, non_blocking=True)
+        self._record_sim_done(turn)
+        return staged
 
     def _record_sim_done(self, turn: int) -> None:
         if self._sim_done[turn] is None:

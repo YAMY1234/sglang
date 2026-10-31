@@ -996,6 +996,13 @@ def run_eagle_verify(
         or target_worker.model_runner.attn_backend.verify_mask.mode
         == TreeMaskMode.FULL_MASK
     )
+    # Without its forced length on the device, eagle_sample would leave the fused
+    # chain for the tree kernels and draw the length on the host instead.
+    simulated_accept_length = None
+    if post_verify_graphs is not None and not batch.forward_mode.is_idle():
+        simulated_accept_length = post_verify_graphs.eager_simulated_accept_length(
+            max_tree_depth=verify_input.max_tree_depth, device=batch.device
+        )
     post_verify_output = speculative_runtime_hooks.post_verify(
         make_post_verify_io(
             verify_input=verify_input,
@@ -1009,6 +1016,7 @@ def run_eagle_verify(
             watermark_full_mask=watermark_full_mask,
             return_logprob=batch.return_logprob,
             is_idle=batch.forward_mode.is_idle(),
+            simulated_accept_length=simulated_accept_length,
             simulated_accept_length_rng=simulated_acc_len_rng,
             sparse_target_max_top_k=uno_target_max_top_k,
             sparse_bonus_argmax=sparse_bonus_argmax,
