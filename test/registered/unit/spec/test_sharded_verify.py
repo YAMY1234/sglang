@@ -15,7 +15,7 @@ import textwrap
 import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 import triton
@@ -720,6 +720,38 @@ class TestShardedReducerContract(CustomTestCase):
             hidden_size=64,
             device="cpu",
         )
+
+    def test_an_eager_exchange_aligns_the_ranks_before_polling(self):
+        # A rank still on the host must hold the others in a collective, which has
+        # no deadline, rather than in the poll, which has one. A captured round is
+        # already aligned by its own all-reduce and gains nothing.
+        calls = []
+        align = torch.zeros(1, dtype=torch.float32)
+        group = SimpleNamespace(
+            world_size=2, all_reduce=lambda t: calls.append(("align", t))
+        )
+        kernel = MagicMock()
+        kernel.__getitem__.return_value = lambda *a, **k: calls.append(("poll", None))
+        state = (
+            torch.zeros(1, dtype=torch.int64),
+            SimpleNamespace(multicast_ptr=1, buffer_ptrs=[2], rank=0),
+            torch.zeros(2, dtype=torch.int32),
+            torch.zeros(2 * sharded_verify._LL_RECORD, dtype=torch.int64),
+            align,
+        )
+        keys = torch.zeros(3, 2, dtype=torch.int64)
+        for capturing, want in ((False, ["align", "poll"]), (True, ["poll"])):
+            calls.clear()
+            with (
+                patch.object(sharded_verify, "_ll_state", state),
+                patch.object(sharded_verify, "_ll_keys_kernel", kernel),
+                patch("torch.cuda.is_current_stream_capturing", return_value=capturing),
+            ):
+                sharded_verify._ll_keys(keys, group)
+            with self.subTest(capturing=capturing):
+                self.assertEqual([name for name, _ in calls], want)
+                if not capturing:
+                    self.assertIs(calls[0][1], align)
 
     def test_shard_logits_borrow_one_static_buffer_across_shapes(self):
         processor = LogitsProcessor.__new__(LogitsProcessor)

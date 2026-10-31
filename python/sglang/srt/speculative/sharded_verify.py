@@ -269,9 +269,9 @@ def _mc_gather_keys(keys: torch.Tensor, tp_group) -> Optional[torch.Tensor]:
 # the three slots, so wrapping the wire tag never reuses the preceding slot.
 _LL_SLOTS = 3
 _LL_MAX_ROWS = 64
-# Ranks may legitimately reach an exchange seconds apart (an eager round's first
-# use of a lazily built module), so the poll is bounded by wall time on the scale
-# of a process-group timeout (torch's default) rather than by a spin count.
+# Ranks are aligned before the poll (a collective, eager or captured), so a long wait
+# means a peer that is slow or gone. It is bounded by wall time on the scale of a
+# process-group timeout (torch's default) rather than by a spin count, and reported.
 _LL_TIMEOUT_NS = 600 * 10**9
 _LL_WARN_NS = 5 * 10**9
 _LL_TRAP_GRACE_NS = 10**9
@@ -493,11 +493,13 @@ def _ll_build(tp_group, device):
     # [last nonzero wire tag bits, independent slot cursor]
     epoch = torch.zeros(2, dtype=torch.int32, device=device)
     diag = _ll_watch(world)
+    # stays zero: summed only to align the ranks before an eager poll
+    align = torch.zeros(1, dtype=torch.float32, device=device)
     logger.info(
         "Sharded verify LL multimem exchange enabled (world_size=%d)",
         tp_group.world_size,
     )
-    return (buf, hdl, epoch, diag)
+    return (buf, hdl, epoch, diag, align)
 
 
 def _ll_describe(record, world: int) -> str:
@@ -527,8 +529,8 @@ def _ll_watch(world: int, poll_s: float = 0.1) -> torch.Tensor:
             warning, timeout = diag[:_LL_RECORD].tolist(), diag[_LL_RECORD:].tolist()
             if timeout[0]:
                 logger.error(
-                    "Sharded verify LL exchange timed out: %s. The ranks reached "
-                    "this exchange out of step; the poll traps the CUDA context.",
+                    "Sharded verify LL exchange timed out: %s. Those ranks never "
+                    "reached this exchange; the poll traps the CUDA context.",
                     _ll_describe(timeout, world),
                 )
                 return
@@ -551,7 +553,13 @@ def _ll_keys(keys: torch.Tensor, tp_group) -> Optional[torch.Tensor]:
         _ll_state = _ll_build(tp_group, keys.device)
     if _ll_state is False:
         return None
-    buf, hdl, epoch, diag = _ll_state
+    buf, hdl, epoch, diag, align = _ll_state
+    if not torch.cuda.is_current_stream_capturing():
+        # Out of a graph nothing lines the ranks up before the poll, and one still
+        # on the host (a first-use build, a slow step) would run its clock out. A
+        # collective parks the early ranks' streams instead, with no deadline; a
+        # captured round's earlier all-reduce already does this.
+        tp_group.all_reduce(align)
     rows = keys.shape[0]
     parts = keys.shape[1] if keys.dim() == 2 else 1
     tokens = torch.empty(rows, dtype=torch.int64, device=keys.device)
