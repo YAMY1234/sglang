@@ -8,9 +8,9 @@ identity.
 
 from __future__ import annotations
 
-import dataclasses
 from typing import TYPE_CHECKING
 
+import msgspec
 import torch
 
 from sglang.kernels.plugin_kernels.nvidia.spec import (
@@ -27,8 +27,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
-class StockVerifyBatch:
+class StockVerifyBatch(msgspec.Struct, frozen=True):
     """The ScheduleBatch fields eagle_sample reads, and no others."""
 
     device: torch.device
