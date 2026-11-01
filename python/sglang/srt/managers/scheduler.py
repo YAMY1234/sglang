@@ -398,6 +398,7 @@ from sglang.srt.utils import (
     set_gpu_proc_affinity,
     set_random_seed,
 )
+from sglang.srt.utils import speculative_decode_resources as spec_decode_resources
 from sglang.srt.utils import (
     suppress_other_loggers,
     triton_load_watch,
@@ -2113,13 +2114,9 @@ class Scheduler(
 
     def init_prepared_spec_seq_lens(self) -> None:
         """Find a speculative worker that can provide prepared sequence lengths."""
-        from sglang.srt.speculative.prepared_next_draft import (
-            prepared_next_draft_enabled,
-        )
-
         self._prepared_spec_seq_lens = (
             self.draft_worker.take_prepared_seq_lens
-            if self.draft_worker is not None and prepared_next_draft_enabled()
+            if self.draft_worker is not None and spec_decode_resources.enabled()
             else None
         )
 
@@ -2134,7 +2131,7 @@ class Scheduler(
             batch.spec_decode_schedule_stream_idle = False
             if schedule_stream_idle:
                 return
-        self.forward_stream.wait_stream(self.schedule_stream)
+        spec_decode_resources.wait_stream(self.forward_stream, self.schedule_stream)
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -5143,7 +5140,9 @@ class Scheduler(
                                 batch.out_cache_loc,
                             )
                         # FIXME(lsyin): maybe move this to forward_batch_generation
-                        batch_result.copy_done = self.device_module.Event()
+                        batch_result.copy_done = spec_decode_resources.copy_done_event(
+                            self.device_module
+                        )
                         if batch_result.delay_sample_func is None:
                             self._relay_forward_payload(
                                 batch, future_indices, batch_result
@@ -5455,7 +5454,7 @@ class Scheduler(
             return_logprob=batch.return_logprob,
             return_hidden_states=batch.return_hidden_states,
         )
-        self.copy_stream.wait_stream(self.forward_stream)
+        spec_decode_resources.wait_stream(self.copy_stream, self.forward_stream)
         with self.copy_stream_ctx:
             if not self.enable_async_d2h_copy:
                 copy_fn()
