@@ -129,6 +129,7 @@ from sglang.srt.speculative.spec_utils import (
     select_top_k_tokens,
     spec_stage_span,
 )
+from sglang.srt.utils import speculative_decode_resources as spec_decode_resources
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -1205,8 +1206,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         # Prepare for draft extend in a separate stream
         if self.plan_stream:
-            self.plan_stream.wait_stream(
-                torch.get_device_module(self.device).current_stream()
+            spec_decode_resources.wait_stream(
+                self.plan_stream, torch.get_device_module(self.device).current_stream()
             )
         with self.plan_stream_ctx:
             forward_batch = prepare_for_draft_extend(
@@ -1222,8 +1223,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
 
         if self.plan_stream:
-            torch.get_device_module(self.device).current_stream().wait_stream(
-                self.plan_stream
+            spec_decode_resources.wait_stream(
+                torch.get_device_module(self.device).current_stream(),
+                self.plan_stream,
             )
 
         # Run draft extend batch in the main compute stream
@@ -1564,6 +1566,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
         grammar_barrier=None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
+        if spec_decode_resources.enabled():
+            spec_decode_resources.begin_round(self.req_to_token_pool.size, self.device)
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             if self._next_draft_stager is not None:
                 self._next_draft_stager.forget()
@@ -1699,6 +1703,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 # per round (TODO: async or upper-bound estimate).
                 batch.seq_lens_cpu = batch_output.new_seq_lens.to("cpu")
                 batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+                # Pipeline tail-draft is the next logical speculative round.
+                if spec_decode_resources.enabled():
+                    spec_decode_resources.begin_round(
+                        self.req_to_token_pool.size, self.device
+                    )
                 with (
                     draft_tp_context(self.draft_worker.parallel_layout),
                     speculative_moe_backend_context(),
