@@ -81,6 +81,8 @@ def _extend_runner(raw_bs):
         seq_lens_cpu=torch.zeros(2, dtype=torch.int64),
     )
     runner.require_mlp_tp_gather = runner.require_gathered_buffer = False
+    runner._prepared_next_draft = runner._copy_plans = False
+    runner._planned_inputs = {}
     runner.captured_req_width, runner.capture_bs = width, [1, 2]
     runner.seq_len_fill_value = 1
     runner.extend_seq_lens_cpu = [width] * 2
@@ -175,6 +177,8 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
         runner.seq_len_fill_value = SEQ_LEN_FILL_VALUE
         runner.require_mlp_tp_gather = False
         runner.require_gathered_buffer = False
+        runner._prepared_next_draft = runner._copy_plans = False
+        runner._planned_inputs = {}
         runner.model_runner = SimpleNamespace(
             model_config=SimpleNamespace(vocab_size=8, model_is_mrope=False),
             server_args=SimpleNamespace(speculative_use_rejection_sampling=False),
