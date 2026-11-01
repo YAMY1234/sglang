@@ -6,7 +6,6 @@ serves, an unservable setup is refused, and without an offer SGLang's path runs.
 
 import ast
 import contextlib
-import dataclasses
 import inspect
 import sys
 import textwrap
@@ -1202,11 +1201,9 @@ class TestSpeculativeRuntimeHooks(CustomTestCase):
             and isinstance(node.value, ast.Name)
             and node.value.id == "batch"
         }
-        fields = {
-            field.name
-            for field in dataclasses.fields(speculative_runtime.StockVerifyBatch)
-        }
-        self.assertEqual(reads, fields)
+        self.assertEqual(
+            reads, set(speculative_runtime.StockVerifyBatch.__struct_fields__)
+        )
 
 
 if __name__ == "__main__":
