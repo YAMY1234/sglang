@@ -571,6 +571,9 @@ class TestPreparedNextDraft(CustomTestCase):
         pool = SimpleNamespace(req_to_token=torch.zeros((8, 16), dtype=torch.int32))
         with (
             patch.object(overlap_utils, "_is_cuda", False),
+            patch.object(
+                overlap_utils, "spec_relay_bypass_enabled", return_value=False
+            ),
             patch(
                 "sglang.srt.speculative.prepared_next_draft."
                 "prepared_next_draft_enabled",

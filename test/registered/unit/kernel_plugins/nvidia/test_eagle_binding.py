@@ -27,7 +27,9 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 )
 from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
+from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.managers import overlap_utils
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.kv.router import STATE_PART, KVLayerRouter, PlainPoolRouter
 from sglang.srt.model_executor.forward_batch_info import (
@@ -37,7 +39,12 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative import eagle_megakernel, eagle_worker_v2
+from sglang.srt.speculative import (
+    eagle_megakernel,
+    eagle_worker_common,
+    eagle_worker_v2,
+    uno_worker_v2,
+)
 from sglang.srt.speculative.eagle_megakernel import EagleMegakernel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -549,7 +556,7 @@ class TestEagleEntries(CustomTestCase):
         """The megakernel may reuse what its draft extend left behind only when that
         extend produced this round's input: not after another extend, not for other
         requests (a PD decode instance's first round), and only once. The extend's
-        tokens are SGLang's own copy, which the next replay leaves alone."""
+        tokens remain graph-owned until the unchanged next round consumes them."""
         rounds, outs = [], {}
 
         def draft_extend(**buffers):
@@ -592,9 +599,13 @@ class TestEagleEntries(CustomTestCase):
 
         outs["topk_index"][0] = 5  # what the extend's replay wrote
         _, _, topk_index = served_extend("a")
-        outs["topk_index"].zero_()  # the next replay rewrites it
+        self.assertEqual(topk_index.data_ptr(), outs["topk_index"].data_ptr())
         self.assertEqual(topk_index.tolist(), [[5]])
+        draft_input.topk_index = topk_index
         self.assertTrue(begin("a"))
+        self.assertIs(rounds[-1].topk_index, topk_index)
+        outs["topk_index"].zero_()  # a later replay rewrites the shared view
+        self.assertEqual(topk_index.tolist(), [[0]])
         self.assertFalse(begin("a"))
         served_extend("a")
         mk.note_draft_extend()  # an extend the megakernel did not serve
@@ -607,6 +618,175 @@ class TestEagleEntries(CustomTestCase):
         self.assertEqual(
             served_extend("a", "b"), (None, None, None)
         )  # SGLang's stock sampler there
+
+
+class TestShardedVerifyConsumerBinding(CustomTestCase):
+    def test_eagle_binding_explicitly_opts_in_the_logits_consumer(self):
+        for supports_sharded_verify in (False, True):
+            for eligible in (False, True):
+                with self.subTest(
+                    supports_sharded_verify=supports_sharded_verify,
+                    eligible=eligible,
+                ):
+                    self._assert_consumer_binding(
+                        supports_sharded_verify=supports_sharded_verify,
+                        eligible=eligible,
+                    )
+
+    def _assert_consumer_binding(self, *, supports_sharded_verify, eligible):
+        processor = LogitsProcessor.__new__(LogitsProcessor)
+        torch.nn.Module.__init__(processor)
+        processor._sharded_verify_eligible = eligible
+        processor.sharded_verify = False
+        # the binding opts in only exact validated target class names
+        model = type("Qwen3_5MoeForConditionalGeneration", (torch.nn.Module,), {})()
+        model.logits_processor = processor
+        worker = SimpleNamespace(model_runner=SimpleNamespace(model=model))
+        hooks = SimpleNamespace(post_verify=SimpleNamespace())
+        with patch(
+            "sglang.srt.kernel_plugins.nvidia.binding.bind_speculative_runtime_hooks",
+            return_value=hooks,
+        ) as bind:
+            self.assertIs(
+                eagle_worker_common.bind_eagle_runtime_hooks(
+                    worker,
+                    supports_sharded_verify=supports_sharded_verify,
+                ),
+                hooks,
+            )
+        self.assertIs(
+            processor.sharded_verify,
+            supports_sharded_verify and eligible,
+        )
+        bind.assert_called_once_with(
+            model, eagle_worker_common.STOCK_SPECULATIVE_RUNTIME_HOOKS
+        )
+
+    def test_uno_binding_keeps_full_vocab_verify(self):
+        worker = uno_worker_v2.UnoWorkerV2.__new__(uno_worker_v2.UnoWorkerV2)
+        worker.tree_mode = False
+        worker._target_worker = object()
+        hooks = object()
+        with patch.object(
+            uno_worker_v2,
+            "bind_eagle_runtime_hooks",
+            return_value=hooks,
+        ) as bind:
+            worker.init_attention_backends()
+
+        self.assertIs(worker._speculative_runtime_hooks, hooks)
+        bind.assert_called_once_with(
+            worker.target_worker,
+            supports_sharded_verify=False,
+        )
+
+
+class TestSpecRelayBypass(CustomTestCase):
+    def test_policy_is_runtime_switch_topk1_eagle_only(self):
+        eagle = SimpleNamespace(is_eagle=lambda: True, is_standalone=lambda: False)
+        standalone = SimpleNamespace(is_eagle=lambda: False, is_standalone=lambda: True)
+        other = SimpleNamespace(is_eagle=lambda: False, is_standalone=lambda: False)
+        for enabled, topk, algo, expected in (
+            (True, 1, eagle, True),
+            (True, None, standalone, True),
+            (True, 1, None, True),  # the EAGLE-only draft-extend runner
+            (False, 1, eagle, False),
+            (True, 2, eagle, False),
+            (True, 1, other, False),
+        ):
+            with (
+                self.subTest(enabled=enabled, topk=topk, algo=algo),
+                envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(enabled),
+                patch.object(
+                    overlap_utils,
+                    "get_spec",
+                    return_value=SimpleNamespace(speculative_eagle_topk=topk),
+                ),
+            ):
+                self.assertEqual(
+                    overlap_utils.spec_relay_bypass_enabled(algo), expected
+                )
+        with (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+            envs.SGLANG_OPT_SPEC_RELAY_IN_PLACE.override(False),
+            patch.object(
+                overlap_utils,
+                "get_spec",
+                return_value=SimpleNamespace(speculative_eagle_topk=1),
+            ),
+        ):
+            self.assertFalse(overlap_utils.spec_relay_bypass_enabled(eagle))
+
+    @staticmethod
+    def _future_map():
+        future_map = overlap_utils.FutureMap.__new__(overlap_utils.FutureMap)
+        future_map._deferred_relay = None
+        future_map.output_tokens_buf = torch.empty(8, dtype=torch.int64)
+        future_map.spec_algo = SimpleNamespace(is_ngram=lambda: False)
+        return future_map
+
+    @staticmethod
+    def _draft_input(indices):
+        return SimpleNamespace(
+            future_indices=indices,
+            bonus_tokens=torch.tensor([7, 8], dtype=torch.int32),
+            topk_p=torch.tensor([[0.7], [0.8]]),
+            topk_index=torch.tensor([[3], [4]]),
+            hidden_states=torch.arange(8, dtype=torch.float32).view(2, 4),
+            draft_probs=None,
+            dsa_topk_indices=None,
+            future_dsa_topk_indices_available=False,
+        )
+
+    def test_unchanged_batch_consumes_the_draft_input_in_place(self):
+        future_map = self._future_map()
+        future_map._stash = MagicMock()
+        indices = torch.tensor([2, 5])
+        draft_input = self._draft_input(indices)
+        payload = overlap_utils.RelayPayload.from_draft_input(draft_input)
+        topk_p, topk_index, hidden = (
+            draft_input.topk_p,
+            draft_input.topk_index,
+            draft_input.hidden_states,
+        )
+        future_map.defer_relay(indices, payload, draft_input)
+        batch = SimpleNamespace(
+            spec_info=draft_input,
+            prefill_input_ids_cpu=None,
+            input_ids=torch.tensor([0]),
+            enable_overlap=True,
+            spec_algorithm=SimpleNamespace(is_none=lambda: False),
+        )
+
+        overlap_utils.resolve_forward_inputs(batch, future_map)
+
+        future_map._stash.assert_not_called()
+        self.assertIsNone(future_map._deferred_relay)
+        self.assertIs(draft_input.topk_p, topk_p)
+        self.assertIs(draft_input.topk_index, topk_index)
+        self.assertIs(draft_input.hidden_states, hidden)
+        self.assertEqual(draft_input.bonus_tokens.dtype, torch.int64)
+        self.assertEqual(draft_input.bonus_tokens.tolist(), [7, 8])
+
+    def test_changed_batch_flushes_before_it_can_overwrite_the_outputs(self):
+        future_map = self._future_map()
+        future_map._stash = MagicMock()
+        indices = torch.tensor([2, 5])
+        draft_input = self._draft_input(indices)
+        payload = overlap_utils.RelayPayload.from_draft_input(draft_input)
+        future_map.defer_relay(indices, payload, draft_input)
+        other = self._draft_input(indices.clone())
+        batch = SimpleNamespace(
+            spec_info=other,
+            prefill_input_ids_cpu=None,
+            input_ids=torch.tensor([0]),
+            enable_overlap=False,
+        )
+
+        overlap_utils.resolve_forward_inputs(batch, future_map)
+
+        future_map._stash.assert_called_once_with(indices, payload)
+        self.assertIsNone(future_map._deferred_relay)
 
 
 class TestSpeculativeRuntimeContract(CustomTestCase):
