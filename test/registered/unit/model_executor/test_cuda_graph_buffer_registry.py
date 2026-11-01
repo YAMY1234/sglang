@@ -18,16 +18,19 @@ import dataclasses
 import unittest
 from types import SimpleNamespace
 from typing import Optional
+from unittest.mock import patch
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.model_executor import cuda_graph_buffer_registry as registry_module
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     GraphSlot,
     PaddingPolicy,
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
+from sglang.srt.model_executor.runner_utils import buffers as buffers_module
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
@@ -292,6 +295,27 @@ class TestFillFromAndExtract(unittest.TestCase):
             self.assertEqual(
                 slots("out_cache_loc"), [100, 101, 102, 103, 104, 105, 0, 0]
             )
+
+    def test_fill_fast_path_off_disables_plans_and_cached_copy(self):
+        """An explicit FILL_FAST_PATH=0 turns the arena's fill plans and both grouped
+        copies' cached small-field copy off too."""
+        from sglang.kernels.ops.memory import small_copy, small_field_copy
+
+        dsts = [SimpleNamespace(is_cuda=True)]
+        with (
+            patch.object(
+                registry_module.spec_decode_resources, "enabled", return_value=True
+            ),
+            patch.object(small_field_copy, "cached_small_field_copy") as cached,
+            patch.object(small_copy, "try_small_copy", return_value=True),
+        ):
+            with envs.SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH.override(False):
+                self.assertFalse(self._build_registry()._use_fill_plans)
+                registry_module._grouped_foreach_copy_(dsts, [object()])
+                buffers_module._grouped_foreach_copy_(dsts, [object()])
+                cached.assert_not_called()
+            with envs.SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH.override(True):
+                self.assertTrue(self._build_registry()._use_fill_plans)
 
     def test_keep_pad_preserves_padded_tail(self):
         r = _make_registry(max_bs=4, max_num_tokens=8)
@@ -1484,6 +1508,64 @@ class TestFillOncePolicy(unittest.TestCase):
         # Head copied; tail NOT reset (FILL_ONCE skips the per-iter reset).
         self.assertTrue(torch.equal(buf[:2], torch.tensor([1, 2], dtype=torch.int32)))
         self.assertTrue(torch.equal(buf[2:], torch.tensor([99, 99], dtype=torch.int32)))
+
+
+class TestReusableFillPlan(unittest.TestCase):
+    def test_replay_runs_padding_copy_and_post_fill(self):
+        """A reused fill plan must repeat all three fill phases rather than
+        retaining a stale padding tail, source tensor, or computed slot."""
+        with (
+            patch.object(
+                registry_module.spec_decode_resources, "enabled", return_value=True
+            ),
+            envs.SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH.override(True),
+        ):
+            reg = CudaGraphBufferRegistry(
+                device=torch.device("cpu"), max_bs=4, max_num_tokens=4
+            )
+        reg.register_slot(
+            GraphSlot(
+                "seq_lens",
+                lambda bs, mt: (bs,),
+                torch.int64,
+                axis="bs",
+                padding_policy=PaddingPolicy.FILL_SENTINEL,
+                pad_value=9,
+            )
+        )
+        reg.register_slot(
+            GraphSlot(
+                "global_num_tokens_gpu",
+                lambda bs, mt: (1,),
+                torch.int32,
+                axis="none",
+                copy_from_fb=False,
+                post_fill=lambda buffer, batch, _ctx: buffer.copy_(
+                    batch.global_num_tokens_gpu
+                ),
+            )
+        )
+
+        first = _MiniForwardBatch(
+            seq_lens=torch.tensor([1, 2]),
+            global_num_tokens_gpu=torch.tensor([4], dtype=torch.int32),
+        )
+        reg.fill_from(
+            first, raw_bs=2, padded_bs=4, raw_num_tokens=2, padded_num_tokens=4
+        )
+        seq_buffer = reg.get_slot("seq_lens").buffer
+        seq_buffer[2:].fill_(77)
+        second = _MiniForwardBatch(
+            seq_lens=torch.tensor([5, 6]),
+            global_num_tokens_gpu=torch.tensor([8], dtype=torch.int32),
+        )
+        reg.fill_from(
+            second, raw_bs=2, padded_bs=4, raw_num_tokens=2, padded_num_tokens=4
+        )
+
+        self.assertEqual(len(reg._fill_plans), 1)
+        self.assertEqual(seq_buffer.tolist(), [5, 6, 9, 9])
+        self.assertEqual(reg.get_slot("global_num_tokens_gpu").buffer.item(), 8)
 
 
 class TestComputedSlots(unittest.TestCase):
