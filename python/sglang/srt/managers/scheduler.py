@@ -5191,7 +5191,13 @@ class Scheduler(
             # The worker sliced the tail off before sampling, so sampled tokens
             # cover only the reqs-aligned rows; the coordinator relays the rest.
             future_indices = future_indices[: batch.beam_tail.num_base_rows]
-        self.future_map.stash(future_indices, payload)
+        self.future_map.relay(
+            future_indices,
+            payload,
+            draft_input=batch_result.next_draft_input,
+            accepted_lengths=batch_result.accept_lens,
+            allow_defer=batch.beam_tail is None,
+        )
         self.beam_coordinator.maybe_select_and_relay(
             batch, batch_result, chunked_req=self.chunked_req
         )

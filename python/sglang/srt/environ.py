@@ -1615,6 +1615,11 @@ class Envs:
     SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # Let an unchanged top-k-1 EAGLE round read the previous round's top-1 and hidden
+    # rows where the draft-extend graph left them instead of relaying copies.
+    SGLANG_OPT_SPEC_RELAY_IN_PLACE = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     # Runtime switches named as on SGLang branch nvidia/qwen35-agentx-gb300.
     # The fused small-field copy gives each field its own blocks and moves aligned fields in 16 B units.
     SGLANG_Q35MF_BK_VEC_COPY = EnvBool(SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get)
