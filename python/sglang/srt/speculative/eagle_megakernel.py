@@ -341,12 +341,8 @@ class EagleMegakernel(EagleDraftRuntime):
             return stock()
         self._served_input = (self._input_seq, _rids(batch))
         raw_bs = runner.raw_bs
-        # the next replay rewrites the buffers before the next round reads them
-        return (
-            None,
-            graphs.out.topk_p[:raw_bs].clone(),
-            graphs.out.topk_index[:raw_bs].clone(),
-        )
+        # FutureMap owns a relay copy only when the next batch changes.
+        return None, graphs.out.topk_p[:raw_bs], graphs.out.topk_index[:raw_bs]
 
     def begin_draft_round(
         self,
