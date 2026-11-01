@@ -1800,8 +1800,9 @@ class Envs:
     # Guards CUDA graph executable dedup via cudaGraphExecUpdate.
     SGLANG_ENABLE_CUDA_GRAPH_DEDUP = EnvBool(False)
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
-    # Graph-input fill fast paths: skip the padding reset of an unpadded replay and copy
-    # one dense integer dtype pair with a single foreach launch.
+    # Graph-input fill fast paths: skip the padding reset of an unpadded replay, copy
+    # one dense integer dtype pair with a single foreach launch, and, with the
+    # speculative decode arena, reuse per-shape fill and copy plans.
     SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
