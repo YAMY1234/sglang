@@ -6,7 +6,7 @@ import math
 
 import torch
 
-from sglang.srt.speculative.prepared_next_draft import spec_round_reuse_enabled
+from sglang.srt.speculative.prepared_next_draft import prepared_next_draft_enabled, spec_round_reuse_enabled
 from sglang.srt.utils.common import async_d2h, is_pin_memory_available
 
 _ROUND_RING_DEPTH = 8
@@ -23,7 +23,7 @@ _round_contexts: dict[torch.device, list] = {}
 
 
 def enabled() -> bool:
-    return spec_round_reuse_enabled()
+    return prepared_next_draft_enabled()
 
 
 def _device_key(device) -> torch.device:
