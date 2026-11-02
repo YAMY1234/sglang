@@ -367,7 +367,8 @@ class TestEagleBinding(CustomTestCase):
         # a plugin pins these names: a rename here must fail first
         members = {
             "EagleBinding": set(dir(eb.EagleBinding)),
-            "ForwardBatch": set(ForwardBatch.__dataclass_fields__),
+            "ForwardBatch": set(ForwardBatch.__dataclass_fields__)
+            | set(dir(ForwardBatch)),
         }
         for name in eb.TOLERATED_CALLABLES + eb.TOLERATED_READS:
             owner, _, attr = name.partition(".")
@@ -410,6 +411,121 @@ class TestEagleBinding(CustomTestCase):
                 for index, layer_id in enumerate(layer_ids):
                     self.assertIs(view.k[index], expected_keys[layer_id])
                     self.assertIs(view.v[index], expected_values[layer_id])
+
+    def test_prefill_view_uses_committed_state_without_speculative_buffers(self):
+        from sglang.srt.layers.attention.linear.kernels.gdn_triton import (
+            TritonGDNKernel,
+        )
+        from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
+
+        backend = _hybrid()
+        linear = backend.linear_attn_backend
+        state = SimpleNamespace(
+            conv=[torch.zeros(2, 4, 3)], temporal=torch.zeros(2, 4, 8)
+        )
+        backend.req_to_token_pool = SimpleNamespace(
+            mamba_map={4: 0, 6: 1},
+            mamba_pool=SimpleNamespace(mamba_cache=state),
+            get_speculative_mamba2_params_all_layers=MagicMock(
+                side_effect=AssertionError("prefill must not read speculative scratch")
+            ),
+        )
+        meta = ForwardMetadata(
+            query_start_loc=torch.tensor([0, 3, 5], dtype=torch.int32),
+            mamba_cache_indices=torch.tensor([1, 2], dtype=torch.int32),
+        )
+        linear.forward_metadata = meta
+        linear.kernel_dispatcher = SimpleNamespace(extend_kernel=TritonGDNKernel())
+        linear.requires_contiguous_prefill_state = True
+        binding = eb.EagleBinding(model=torch.nn.Module())
+        with patch.object(eb, "get_attn_backend", return_value=backend):
+            view = binding.prefill_view()
+            self.assertIs(view.query_start_loc, meta.query_start_loc)
+            self.assertIs(view.state_indices, meta.mamba_cache_indices)
+            self.assertEqual(view.state.layer_ids, (4, 6))
+            self.assertIs(view.state.conv[0], state.conv[0])
+            self.assertIs(view.state.temporal, state.temporal)
+            self.assertEqual(view.kernel_id, 1)
+            self.assertFalse(view.has_track)
+            # Per-forward metadata changes while the committed pool stays sealed.
+            linear.forward_metadata = ForwardMetadata(
+                query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+                mamba_cache_indices=torch.tensor([3], dtype=torch.int32),
+            )
+            next_view = binding.prefill_view()
+            self.assertIs(next_view.state, view.state)
+            self.assertIs(
+                next_view.query_start_loc, linear.forward_metadata.query_start_loc
+            )
+            binding.assert_live()
+            state.temporal = torch.zeros_like(state.temporal)
+            with self.assertRaisesRegex(RuntimeError, "prefill was reallocated"):
+                binding.assert_live()
+
+    def test_existing_forward_wrapper_selects_the_prefill_data_view(self):
+        views = SimpleNamespace(
+            forward_view=MagicMock(return_value="decode view"),
+            prefill_view=MagicMock(return_value="prefill view"),
+        )
+        built = SimpleNamespace(
+            plan=lambda *a, **k: Step(mode=mode, rows=5),
+            forward=lambda step, original, *a, **k: step.view,
+        )
+        wrapped = runtime._Dispatch(
+            built=built, original=lambda *a, **k: "stock", binding=views
+        ).wrapped()
+        batch = SimpleNamespace(batch_size=5)
+        for capturing in (False, True):
+            views.forward_view.reset_mock()
+            views.prefill_view.reset_mock()
+            with patch.object(
+                torch.cuda, "is_current_stream_capturing", return_value=capturing
+            ):
+                mode = "prefill"
+                self.assertEqual(wrapped(torch.zeros(5), None, batch), "prefill view")
+                views.prefill_view.assert_called_once_with()
+                views.forward_view.assert_not_called()
+                mode = "decode"
+                self.assertEqual(wrapped(torch.zeros(5), None, batch), "decode view")
+                views.forward_view.assert_called_once_with()
+
+    def test_generic_dispatch_keeps_main_view_and_capture_seal(self):
+        binding = runtime.MegakernelBinding(model=torch.nn.Module())
+        batch = SimpleNamespace(batch_size=5)
+        for mode in ("prefill", "decode"):
+            for capturing in (False, True):
+                with self.subTest(mode=mode, capturing=capturing):
+                    step = Step(mode=mode, rows=5)
+                    view = object()
+                    built = SimpleNamespace(
+                        plan=MagicMock(return_value=step),
+                        forward=lambda offered, *a, **k: offered.view,
+                    )
+                    dispatch = runtime._Dispatch(
+                        built=built, original=MagicMock(), binding=binding
+                    )
+                    with (
+                        patch.object(
+                            binding, "forward_view", return_value=view
+                        ) as forward,
+                        patch.object(binding, "seal_capture_view") as seal,
+                        patch.object(
+                            torch.cuda,
+                            "is_current_stream_capturing",
+                            return_value=capturing,
+                        ),
+                    ):
+                        self.assertIs(
+                            dispatch.wrapped()(torch.zeros(5), None, batch), view
+                        )
+                        forward.assert_called_once_with(batch)
+                        if capturing:
+                            seal.assert_called_once_with(batch, view)
+                            self.assertIs(dispatch.captured[5], step)
+                        else:
+                            seal.assert_not_called()
+                    built.plan.assert_called_once()
+                    dispatch.original.assert_not_called()
 
     def test_a_reallocated_pool_fails_assert_live_by_name(self):
         backend = _hybrid()
