@@ -21,16 +21,31 @@ from sglang.srt.runtime_context import (
 )
 
 
-@cache
-def prepared_next_draft_enabled() -> bool:
-    """Whether generic next-round EAGLE runtime plumbing is safe to construct."""
+def spec_round_reuse_enabled() -> bool:
+    """Whether generic EAGLE round resources can be reused on this rank."""
     return (
         current_platform.is_cuda()
         and envs.SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.get()
         and (get_spec().speculative_algorithm or "").upper() == "EAGLE"
         and (get_spec().speculative_eagle_topk or 1) == 1
         and not get_schedule().disable_overlap_schedule
-        and get_parallel().moe_ep_size == 1
+    )
+
+
+@cache
+def prepared_next_draft_enabled() -> bool:
+    """Whether next-draft staging is safe, including its EP-1 requirement."""
+    return spec_round_reuse_enabled() and get_parallel().moe_ep_size == 1
+
+
+def log_spec_round_reuse_config(logger) -> None:
+    """Report the rank-local startup policy once from EAGLE initialization."""
+    logger.info(
+        "EAGLE runtime reuse: moe_ep_size=%s, spec_round_reuse_enabled=%s, "
+        "prepared_next_draft_enabled=%s",
+        get_parallel().moe_ep_size,
+        "on" if spec_round_reuse_enabled() else "off",
+        "on" if prepared_next_draft_enabled() else "off",
     )
 
 
