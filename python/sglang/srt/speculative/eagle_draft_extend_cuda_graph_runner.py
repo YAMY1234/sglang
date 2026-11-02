@@ -326,7 +326,11 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
             and envs.SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION.get()
         )
-        allocator = self.model_runner.token_to_kv_pool_allocator
+        allocator = (
+            self.model_runner.token_to_kv_pool_allocator
+            if self._runtime_optimization
+            else None
+        )
         # A PD transfer can overwrite a freed page before the replay's KV
         # writes finish. Only expose an early read fence with guarded reuse.
         self.kv_reuse_guard = (
