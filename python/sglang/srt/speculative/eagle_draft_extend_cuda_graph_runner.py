@@ -321,31 +321,6 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         )
         self.attention_variant_sizes = self.specialized_batches
 
-        self.in_graph_metadata_prep_done: Optional[torch.cuda.Event] = None
-        self._runtime_optimization = (
-            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
-            and envs.SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION.get()
-        )
-        allocator = (
-            self.model_runner.token_to_kv_pool_allocator
-            if self._runtime_optimization
-            else None
-        )
-        # A PD transfer can overwrite a freed page before the replay's KV
-        # writes finish. Only expose an early read fence with guarded reuse.
-        self.kv_reuse_guard = (
-            allocator
-            if self._runtime_optimization
-            and allocator.need_sort
-            and allocator.supports_reuse_guard
-            else None
-        )
-        self._pd_reuse_needs_full_replay = (
-            self._runtime_optimization
-            and allocator.need_sort
-            and self.kv_reuse_guard is None
-        )
-
         try:
             with model_capture_mode():
                 self.capture()
@@ -357,27 +332,6 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
     def _replay_graph(self, shape_key, forward_batch):
         with self.model_context():
             return self.backend.replay(shape_key, forward_batch)
-
-    def _draft_extend_shared_read_ends(self) -> SharedReadEnds:
-        shared_read_ends = self._resolve_shared_read_ends(
-            self.draft_extend_attn_backend, self.forward_mode
-        )
-        if self._pd_reuse_needs_full_replay and shared_read_ends in (
-            SharedReadEnds.PRE_REPLAY,
-            SharedReadEnds.IN_REPLAY,
-        ):
-            return SharedReadEnds.POST_REPLAY
-        return shared_read_ends
-
-    def _kv_writes_done_event(self, shared_read_ends: SharedReadEnds):
-        if shared_read_ends not in (
-            SharedReadEnds.PRE_REPLAY,
-            SharedReadEnds.IN_REPLAY,
-        ):
-            return None
-        event = self.device_module.Event()
-        event.record()
-        return event
 
     def _cache_loc_dtype(self):
         return self.backend.cache_loc_dtype
@@ -547,13 +501,6 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         def run_once():
             self.draft_extend_attn_backend.init_forward_metadata_in_graph(forward_batch)
-            if (
-                self._runtime_optimization
-                and self.draft_extend_attn_backend.shared_read_ends(self.forward_mode)
-                is SharedReadEnds.IN_REPLAY
-                and not self._pd_reuse_needs_full_replay
-            ):
-                self._record_in_graph_metadata_prep_done()
 
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
@@ -847,7 +794,9 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # Draft extend is the last shared reader. UNKNOWN must discard any
         # earlier phase's event so the scheduler uses its whole-forward fence.
         self.model_runner.shared_read_done_event = None
-        shared_read_ends = self._draft_extend_shared_read_ends()
+        shared_read_ends = self.draft_extend_attn_backend.shared_read_ends(
+            self.forward_mode
+        )
         if shared_read_ends is SharedReadEnds.PRE_REPLAY:
             self._publish_read_done(in_graph=False)
 
@@ -859,16 +808,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         with device_timer_ctx(self.model_runner.device_timer, "eagle_draft_extend"):
             out = self._replay_graph(shape_key, forward_batch)
 
-        # The backend declaration covers every child, including hybrid linear
-        # attention. UNKNOWN keeps the scheduler's whole-forward fallback.
+        # This runner has no in-graph read-done marker. A later event is safe;
+        # an event before replay cannot cover metadata reads inside the graph.
         if shared_read_ends in (SharedReadEnds.IN_REPLAY, SharedReadEnds.POST_REPLAY):
-            self._publish_read_done(
-                in_graph=shared_read_ends is SharedReadEnds.IN_REPLAY
-            )
-        if self.kv_reuse_guard is not None:
-            self.kv_reuse_guard.set_reuse_guard_event(
-                self._kv_writes_done_event(shared_read_ends)
-            )
+            self._publish_read_done(in_graph=False)
 
         out = LogitsProcessorOutput(
             # None when the megakernel's draft_extend kept the logits
