@@ -17,6 +17,7 @@ import torch.multiprocessing
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_components import shm_tag_exchange
 from sglang.srt.managers.scheduler_components.request_receiver import (
+    SchedulerRequestReceiver,
     _broadcast_via_exchange,
 )
 from sglang.srt.managers.scheduler_components.shm_tag_exchange import ShmTagExchange
