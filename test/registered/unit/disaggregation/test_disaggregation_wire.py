@@ -58,6 +58,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import should_use_dsa_fused_topk
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -1926,6 +1927,55 @@ class TestStagingScatterLifecycle(CustomTestCase):
                         scheduler
                     )
                 handler.flush_pending_scatters.assert_called_once_with(expected)
+
+    @patch("sglang.srt.disaggregation.common.staging_handler.create_device_event")
+    def test_pp_idle_iteration_drains_scatters_before_waiting_for_a_batch(self, _event):
+        handler, request, receiver = self.make_deferred_handler()
+        handler.num_writers_for.return_value = 1
+        handler.handle_chunk_arrived(7, 0, 0, 3, "writer")
+        scheduler = SimpleNamespace(
+            init_pp_loop_state=Mock(),
+            pp_loop_size=1,
+            running_mbs=[None],
+            last_mbs=[None],
+            mbs=[None],
+            increment_scheduler_iterations=Mock(),
+            ingest_requests=Mock(return_value=[]),
+            pp_group=SimpleNamespace(is_last_rank=True),
+            _pp_pd_get_retract_ids=Mock(return_value=[]),
+            _pp_pd_get_prealloc_ids=Mock(return_value=[]),
+            _pp_pd_get_decode_transferred_ids=Mock(return_value=[]),
+            _pp_commit_comm_work=Mock(),
+            get_next_disagg_decode_batch_to_run=Mock(
+                return_value=SimpleNamespace(running_batch=None, batch_to_run=None)
+            ),
+            disagg_decode_transfer_queue=SimpleNamespace(staging_handler=handler),
+            enable_overlap=False,
+            schedule_stream=Mock(),
+            forward_stream=Mock(),
+        )
+
+        def flush_and_stop():
+            SchedulerDisaggregationDecodeMixin._flush_staging_scatters(scheduler)
+            raise StopIteration
+
+        scheduler._flush_staging_scatters = flush_and_stop
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_pp_mixin.get_parallel",
+                return_value=SimpleNamespace(pp_size=2),
+            ),
+            patch(
+                "sglang.srt.disaggregation.decode.get_parallel",
+                return_value=SimpleNamespace(pp_size=2),
+            ),
+            self.assertRaises(StopIteration),
+        ):
+            SchedulerPPMixin.event_loop_pp_disagg_decode(scheduler)
+        self.assertFalse(handler._pending_scatters)
+        handler._scatter_region.assert_called_once_with(
+            4096, 0, 3, request, receiver, scheduler.forward_stream
+        )
 
     def test_scatter_launch_modes_preserve_default_and_bound_ctas(self):
         for ctas, page_size, selected, grid in [
