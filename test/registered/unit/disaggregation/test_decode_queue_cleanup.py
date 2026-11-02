@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import KVTransferError
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
@@ -471,6 +472,124 @@ class TestDeferredDestinationPublish(CustomTestCase):
         self.assertEqual(kwargs, {"decode_prefix_len": 0})
         self.assertEqual(decode_req.metadata_buffer_index, 0)
         self.assertTrue(queue.has_published_destinations)
+
+    def test_staging_readback_preserves_payload_and_waits_for_both_events(self):
+        original_empty = torch.empty
+        original_copy = torch.Tensor.copy_
+        results = {}
+        for staging in (False, True):
+            for overlap in (False, True):
+                with self.subTest(staging=staging, overlap=overlap):
+                    receiver = _PollingReceiver()
+                    receiver.require_staging = True
+                    entry = self._decode_req(receiver)
+                    entry.req.bootstrap_room = 17
+                    entry.req.bootstrap_host = "127.0.0.1"
+                    queue = self._deferring_queue([entry])
+                    queue._defer_publish = False
+                    queue.scheduler.enable_overlap = overlap
+                    queue.scheduler.forward_stream = object()
+                    queue.transfer_queue.enable_staging = staging
+                    registered = []
+                    queue.transfer_queue.staging_handler = SimpleNamespace(
+                        register_decode_req=lambda room, req: registered.append(
+                            (room, req)
+                        )
+                    )
+                    queue.token_to_kv_pool_allocator.page_size = 2
+                    queue.token_to_kv_pool_allocator.state_ids = lambda _: (
+                        SimpleNamespace(ids=lambda indices: indices + 100)
+                    )
+                    queue.req_to_token_pool.req_index_to_mamba_index_mapping = (
+                        torch.arange(4).reshape(4, 1)
+                    )
+                    queue.kv_manager.kv_args.state_types = [StateType.MAMBA]
+                    forward_done = MagicMock()
+                    readback_done = MagicMock()
+                    readback_done.query.return_value = False
+                    forward_done.query.return_value = False
+                    queue.scheduler.device_module = SimpleNamespace(
+                        Event=lambda: forward_done
+                    )
+                    copies = []
+
+                    def pinned_empty(shape, *, dtype, pin_memory):
+                        self.assertTrue(pin_memory)
+                        return original_empty(shape, dtype=dtype)
+
+                    def copy(host, device, *, non_blocking):
+                        self.assertTrue(non_blocking)
+                        copies.append(device.clone())
+                        return original_copy(host, device)
+
+                    with (
+                        patch(
+                            "sglang.srt.disaggregation.decode.torch.cuda.is_available",
+                            return_value=True,
+                        ),
+                        patch(
+                            "sglang.srt.disaggregation.decode.torch.cuda.Event",
+                            return_value=readback_done,
+                        ),
+                        patch(
+                            "sglang.srt.disaggregation.decode.torch.empty",
+                            side_effect=pinned_empty,
+                        ),
+                        patch.object(torch.Tensor, "copy_", copy),
+                    ):
+                        queue.pop_preallocated()
+                    if staging:
+                        self.assertEqual(registered, [(17, entry)])
+                        self.assertEqual(len(copies), 2)
+                        self.assertEqual(copies[0].dtype, torch.int32)
+                        readback_done.record.assert_called_once_with()
+                        if overlap:
+                            forward_done.record.assert_called_once_with(
+                                stream=queue.scheduler.forward_stream
+                            )
+                            torch.cuda.current_stream().wait_event.assert_called_once_with(
+                                forward_done
+                            )
+                        else:
+                            forward_done.record.assert_not_called()
+                        self.assertIs(entry.pending_metadata[0], readback_done)
+                    else:
+                        self.assertEqual(registered, [])
+                        self.assertEqual(copies, [])
+                    transfer = DecodeTransferQueue.__new__(DecodeTransferQueue)
+                    transfer.queue = [entry]
+                    transfer.gloo_group = object()
+                    with patch(
+                        "sglang.srt.disaggregation.decode.all_reduce_flags",
+                        side_effect=_local_reduce,
+                    ):
+                        if staging or overlap:
+                            transfer.publish_pending_metadata()
+                            receiver.send_metadata.assert_not_called()
+                        readback_done.query.return_value = True
+                        forward_done.query.return_value = True
+                        transfer.publish_pending_metadata()
+                        transfer.publish_pending_metadata()
+                    receiver.send_metadata.assert_called_once()
+                    pages, slot, states = receiver.send_metadata.call_args.args
+                    results[staging, overlap] = (
+                        pages.tolist(),
+                        str(pages.dtype),
+                        slot,
+                        [
+                            [indices.tolist() for indices in payload]
+                            for payload in states
+                        ],
+                        receiver.send_metadata.call_args.kwargs,
+                    )
+                    self.assertIsNone(entry.pending_metadata)
+                    torch.cuda.current_stream().wait_event.reset_mock()
+        self.assertEqual(results[True, False], results[False, False])
+        self.assertEqual(results[True, True], results[False, True])
+        self.assertEqual(
+            results[True, True],
+            ([4, 5, 6], "int32", 0, [[[101]]], {"decode_prefix_len": 0}),
+        )
 
     def test_recompute_waits_for_held_metadata_to_be_sent(self):
         receiver = _PollingReceiver()
