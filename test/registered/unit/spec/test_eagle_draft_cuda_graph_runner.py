@@ -16,9 +16,11 @@ the raw value must be restored once replay finishes.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
@@ -83,6 +85,10 @@ def _extend_runner(raw_bs, *, keep_hidden_in_place=False):
     runner.require_mlp_tp_gather = runner.require_gathered_buffer = False
     runner.keep_hidden_in_place = keep_hidden_in_place
     runner._prepared_next_draft = runner._copy_plans = False
+    runner.in_graph_metadata_prep_done = None
+    runner.kv_reuse_guard = None
+    runner._runtime_optimization = False
+    runner._pd_reuse_needs_full_replay = False
     runner._planned_inputs = {}
     runner.captured_req_width, runner.capture_bs = width, [1, 2]
     runner.seq_len_fill_value = 1
@@ -230,6 +236,50 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
         )
         return backend, forward_batch
 
+    def test_generic_copy_plans_keep_cpu_and_padding_fallbacks(self):
+        # These bare runners have no model plugin. A refused CPU layout must
+        # still copy every field, while padded batches keep the normal staging.
+        for enabled in (False, True):
+            for raw_bs in (1, 2):
+                with (
+                    self.subTest(enabled=enabled, raw_bs=raw_bs),
+                    envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+                    envs.SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH.override(enabled),
+                ):
+                    runner = self._build_runner(_RecordingDraftBackend())
+                    # __new__ fixtures supply the cached C2 constructor decision.
+                    runner._prepared_next_draft = True
+                    runner._copy_plans = enabled
+                    batch = self._build_forward_batch([10] * raw_bs, 10 * raw_bs)
+                    with patch.object(
+                        runner,
+                        "_copy_planned_inputs",
+                        wraps=runner._copy_planned_inputs,
+                    ) as copy:
+                        runner.execute(batch)
+                    self.assertEqual(copy.call_count, int(enabled and raw_bs == 1))
+                    self.assertTrue(
+                        torch.equal(runner.buffers.seq_lens[:raw_bs], batch.seq_lens)
+                    )
+
+                    runner, batch, select = _extend_runner(raw_bs)
+                    runner._prepared_next_draft = True
+                    runner._copy_plans = enabled
+                    runner._replay_graph = lambda key, fb: SimpleNamespace(
+                        next_token_logits=torch.zeros((2, 4)),
+                        hidden_states=torch.zeros((2, 2)),
+                    )
+                    with patch.object(
+                        runner,
+                        "_copy_planned_inputs",
+                        wraps=runner._copy_planned_inputs,
+                    ) as copy:
+                        runner.execute(batch, select)
+                    self.assertEqual(copy.call_count, int(enabled))
+                    self.assertTrue(
+                        torch.equal(runner.buffers.seq_lens[:raw_bs], batch.seq_lens)
+                    )
+
     def test_replay_keys_the_graph_select_picks_where_the_megakernel_serves(self):
         """A batch size the draft megakernel serves captures one graph per label of
         its draft_loop variants; a replay must ask for the one select picks, and for
@@ -286,6 +336,65 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
                         output.hidden_states.data_ptr(), graph_hidden.data_ptr()
                     )
                 self.assertTrue(torch.equal(output.hidden_states, graph_hidden[:1]))
+
+    def test_draft_extend_shared_read_fence_and_kv_reuse(self):
+        cases = (
+            # External markers let shared reads finish before KV writes.
+            (SharedReadEnds.IN_REPLAY, True, False, True, "marker", True),
+            # Devices without external events wait until replay completes.
+            (SharedReadEnds.IN_REPLAY, False, False, True, "event", False),
+            (SharedReadEnds.PRE_REPLAY, False, False, True, "event", True),
+            # An allocator without guarded reuse cannot release the WAR fence early.
+            (SharedReadEnds.IN_REPLAY, True, True, False, "event", False),
+            (SharedReadEnds.PRE_REPLAY, False, True, False, "event", False),
+            # UNKNOWN includes a hybrid backend with an unaudited GDN child.
+            (SharedReadEnds.UNKNOWN, True, False, True, None, False),
+        )
+        for declared, marker, full_replay, guarded, published, kv_pending in cases:
+            with self.subTest(
+                declared=declared, marker=marker, full_replay=full_replay
+            ):
+                runner, forward_batch, select_index = _extend_runner(1)
+                runner._runtime_optimization = True
+                runner._pd_reuse_needs_full_replay = full_replay
+                marker_event = object() if marker else None
+                runner.in_graph_metadata_prep_done = marker_event
+                runner.model_runner.shared_read_done_event = object()
+                runner.draft_extend_attn_backend.shared_read_ends = lambda fm: declared
+                order, guards = [], []
+
+                def new_event():
+                    return SimpleNamespace(record=lambda: order.append("event"))
+
+                runner.device_module = SimpleNamespace(Event=new_event)
+                runner.kv_reuse_guard = (
+                    SimpleNamespace(set_reuse_guard_event=guards.append)
+                    if guarded
+                    else None
+                )
+                out = SimpleNamespace(
+                    next_token_logits=torch.zeros((2, 4)),
+                    hidden_states=torch.zeros((2, 2)),
+                )
+                runner._replay_graph = lambda key, fb: order.append("replay") or out
+                runner.execute(forward_batch, select_index)
+                read_done = runner.model_runner.shared_read_done_event
+                if published is None:
+                    self.assertIsNone(read_done)
+                elif published == "marker":
+                    self.assertIs(read_done, marker_event)
+                else:
+                    self.assertIsNotNone(read_done)
+                    self.assertIsNot(read_done, marker_event)
+                if guarded:
+                    self.assertEqual(len(guards), 1)
+                    self.assertEqual(guards[0] is not None, kv_pending)
+                if declared is SharedReadEnds.PRE_REPLAY and not full_replay:
+                    self.assertEqual(order, ["event", "replay", "event"])
+                elif published == "event" or kv_pending:
+                    self.assertEqual(order, ["replay", "event"])
+                else:
+                    self.assertEqual(order, ["replay"])
 
     def test_padded_replay_keeps_seq_lens_sum_consistent(self):
         # raw_bs=2 < CAPTURE_BS=4: the batch is padded with fake rows of length
