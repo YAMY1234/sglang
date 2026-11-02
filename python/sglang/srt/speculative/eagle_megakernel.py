@@ -42,7 +42,12 @@ logger = logging.getLogger(__name__)
 
 
 class EagleDraftRuntime:
-    """Always-present dispatch for draft workers and their graph runners."""
+    """Always-present dispatch used by the draft worker and graph runners.
+
+    The stock instance owns no state and simply invokes the stock callbacks.  A
+    specialized implementation overrides the same methods.  This keeps provider
+    discovery and presence checks out of the worker and graph-runner call sites.
+    """
 
     def bind_draft_graphs(self, runner: Any) -> frozenset[int]:
         return frozenset()
@@ -153,7 +158,7 @@ def init_eagle_megakernel(*, draft_worker: Any) -> Optional[EagleMegakernel]:
 
 
 def init_eagle_draft_runtime(*, draft_worker: Any) -> EagleDraftRuntime:
-    """Resolve draft dispatch once and always return a strategy."""
+    """Resolve the worker's draft dispatch once and always return a strategy."""
     specialized = init_eagle_megakernel(draft_worker=draft_worker)
     return STOCK_EAGLE_DRAFT_RUNTIME if specialized is None else specialized
 
@@ -374,7 +379,7 @@ class EagleMegakernel(EagleDraftRuntime):
         stock: Callable[[], tuple],
         active: bool = True,
     ) -> tuple:
-        """Return the final draft proposal, falling back to stock when unserved."""
+        """Return the final draft proposal, using stock for an unserved replay."""
         graphs = self._extend_graphs.get(id(runner))
         if not active or graphs is None or runner.bs not in graphs.steps:
             return stock()

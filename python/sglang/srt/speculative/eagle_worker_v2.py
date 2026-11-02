@@ -1298,8 +1298,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     select_index
                 ]
 
-        # The always-present strategy returns captured top-1 or invokes this
-        # unchanged selected-row stock sampler.
+        # The always-present runtime strategy either returns its captured
+        # top-1 or invokes this unchanged selected-row stock sampler.
         def stock_extend_tokens():
             if get_spec().speculative_use_rejection_sampling:
                 return sample_draft_proposal(
@@ -1456,7 +1456,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
     def init_attention_backends(self):
         super().init_attention_backends()
-        # Resolve once before any eager or captured post-verify path runs.
+        # The target and draft backends now exist and no EAGLE graph has been
+        # captured. Resolve one immutable bundle shared by eager and graph paths.
         self._speculative_runtime_hooks = bind_eagle_runtime_hooks(
             self.target_worker, supports_sharded_verify=self.topk == 1
         )
