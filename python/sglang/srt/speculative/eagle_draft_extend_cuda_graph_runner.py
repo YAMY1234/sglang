@@ -295,8 +295,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # shape [max_bs]. Sharing by field name and shape would alias those
         # width-specific indices and can make a narrower graph gather OOB.
         self.buffers.share_buffers(exclude={"select_index"})
-        # Resolve the always-present graph dispatch before capture. Specialized
-        # batch sizes are used only to select compatible graph variants.
+        # Resolve the always-present graph dispatch before capture. It reports the
+        # specialized batch sizes used only to select compatible graph variants.
         self.draft_runtime = self.eagle_worker.draft_runtime
         self.specialized_batches = self.draft_runtime.bind_extend_graphs(self)
         self.attention_graph_variants = self.draft_runtime.graph_variants(
