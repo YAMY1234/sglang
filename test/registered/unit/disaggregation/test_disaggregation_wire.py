@@ -4,7 +4,8 @@ import dataclasses
 import os
 import threading
 import unittest
-from collections import defaultdict
+from collections import defaultdict, deque
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import ANY, Mock, call, patch
 
@@ -13,6 +14,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
+from sglang.srt.disaggregation.common import staging_buffer
 from sglang.srt.disaggregation.common.conn import AckTarget, CommonKVManager
 from sglang.srt.disaggregation.common.staging_buffer import (
     StagingAllocator,
@@ -26,7 +28,11 @@ from sglang.srt.disaggregation.common.utils import (
     TransferKVChunk,
     group_concurrent_contiguous,
 )
-from sglang.srt.disaggregation.decode import DecodeRequest, DecodeTransferQueue
+from sglang.srt.disaggregation.decode import (
+    DecodeRequest,
+    DecodeTransferQueue,
+    SchedulerDisaggregationDecodeMixin,
+)
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
@@ -55,6 +61,7 @@ from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     CompressStatePool,
     c4_state_transfer_indices,
@@ -1689,6 +1696,8 @@ class TestStagingScatterLifecycle(CustomTestCase):
         handler._room_tokens = {room: object()}
         handler._inflight_submits = {}
         handler._claimed_chunks = set()
+        handler._defer_scatter = False
+        handler._pending_scatters = deque()
         handler._scatter_region = Mock(return_value=True)
         self.assertTrue(handler.submit_chunk_scatter(room, 0, 0, 3))
 
@@ -1734,6 +1743,8 @@ class TestStagingScatterLifecycle(CustomTestCase):
         handler._inflight_submits = {}
         handler._claimed_chunks = set()
         handler._closing_rooms = set()
+        handler._defer_scatter = False
+        handler._pending_scatters = deque()
         handler._free_and_send_watermark = Mock()
 
         scatter_started = threading.Event()
@@ -1772,6 +1783,238 @@ class TestStagingScatterLifecycle(CustomTestCase):
         handler._free_and_send_watermark.assert_called_once_with(alloc_id, decode_req)
         self.assertNotIn(room, context.room_receivers)
         self.assertNotIn(room, context.room_bootstrap)
+
+    def make_deferred_handler(self, defer=True):
+        room = 7
+        receiver = SimpleNamespace(chunk_staging_infos=[(5, 4096, 0, 8192, 3)])
+        request = SimpleNamespace(_chunk_events=[], _staging_all_success=False)
+        handler = object.__new__(DecodeStagingHandler)
+        handler.device = torch.device("cpu")
+        handler.tp_rank = 0
+        handler.staging_allocator = SimpleNamespace(_scatter_stream=Mock())
+        handler.kv_manager = SimpleNamespace(
+            _staging_ctx=SimpleNamespace(
+                room_receivers={room: receiver}, room_bootstrap={room: object()}
+            )
+        )
+        handler._staging_lifecycle = threading.Condition()
+        handler._room_to_decode_req = {room: request}
+        handler._room_to_receiver = {room: receiver}
+        handler._room_tokens = {room: object()}
+        handler._writer_counts = {}
+        handler._inflight_submits = {}
+        handler._claimed_chunks = set()
+        handler._closing_rooms = set()
+        handler._defer_scatter = defer
+        handler._pending_scatters = deque()
+        handler._scatter_region = Mock(return_value=True)
+        handler._free_and_send_watermark = Mock()
+        handler.num_writers_for = Mock(return_value=2)
+        return handler, request, receiver
+
+    def test_scatter_controls_are_typed_and_disabled_by_default(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(envs.SGLANG_PLB_SCATTER_DEFER.get())
+            self.assertEqual(envs.SGLANG_PLB_STREAM_PRIORITY.get(), 0)
+            self.assertEqual(envs.SGLANG_PLB_SCATTER_CTAS.get(), 0)
+        with patch.dict(
+            os.environ,
+            SGLANG_PLB_SCATTER_DEFER="1",
+            SGLANG_PLB_STREAM_PRIORITY="-1",
+            SGLANG_PLB_SCATTER_CTAS="32",
+        ):
+            self.assertTrue(envs.SGLANG_PLB_SCATTER_DEFER.get())
+            self.assertEqual(envs.SGLANG_PLB_STREAM_PRIORITY.get(), -1)
+            self.assertEqual(envs.SGLANG_PLB_SCATTER_CTAS.get(), 32)
+
+    @patch("sglang.srt.disaggregation.common.staging_handler.create_device_event")
+    def test_deferred_registration_records_request_row_dependency(self, make_event):
+        handler, request, receiver = self.make_deferred_handler()
+        handler.device = torch.device("cuda:0")
+        handler.scheduler = SimpleNamespace(schedule_stream=Mock())
+        handler.kv_buffer_info = {"page_size": 64}
+        request.req = SimpleNamespace(kv=SimpleNamespace(cache_protected_len=0))
+        request.kv_receiver = receiver
+        handler.register_decode_req(8, request)
+        self.assertIs(request._req_to_token_ready, make_event.return_value)
+        make_event.return_value.record.assert_called_once_with(
+            handler.scheduler.schedule_stream
+        )
+
+    @patch("sglang.srt.disaggregation.common.staging_handler.create_device_event")
+    def test_deferred_fanin_uses_forward_stream_and_waits_before_free(self, make_event):
+        handler, request, receiver = self.make_deferred_handler()
+        self.assertFalse(handler.handle_chunk_arrived(7, 0, 0, 3, "writer-0"))
+        self.assertTrue(handler.handle_chunk_arrived(7, 0, 0, 3, "writer-1"))
+        handler._scatter_region.assert_not_called()
+        stream = Mock()
+        handler.flush_pending_scatters(stream)
+        handler._scatter_region.assert_called_once_with(
+            4096, 0, 3, request, receiver, stream
+        )
+        event = make_event.return_value
+        event.record.assert_called_once_with(stream)
+        self.assertEqual(
+            receiver.chunk_staging_infos[0][1], StagingAllocator.CHUNK_SCATTERED
+        )
+        event.query.return_value = False
+        handler.advance_scatter(request)
+        handler._free_and_send_watermark.assert_not_called()
+        order = Mock()
+        order.attach_mock(event.synchronize, "wait")
+        order.attach_mock(handler._free_and_send_watermark, "free")
+        handler.release_room(7, request, receiver)
+        self.assertEqual(order.mock_calls, [call.wait(), call.free(5, request)])
+
+    def test_abort_purges_deferred_chunks(self):
+        handler, request, receiver = self.make_deferred_handler()
+        handler.num_writers_for.return_value = 1
+        self.assertTrue(handler.handle_chunk_arrived(7, 0, 0, 3, "writer"))
+        handler.unregister_decode_req(7)
+        handler.flush_pending_scatters(Mock())
+        handler._scatter_region.assert_not_called()
+        handler._free_and_send_watermark.assert_called_once_with(5, request)
+        self.assertFalse(handler._pending_scatters)
+
+    def test_reused_room_rejects_queued_and_already_popped_generations(self):
+        handler, request, _ = self.make_deferred_handler()
+        old_token = handler._room_tokens[7]
+        handler._pending_scatters.append((old_token, 7, 0, 0, 3))
+        handler._room_tokens[7] = object()
+        handler.flush_pending_scatters(Mock())
+        self.assertFalse(
+            handler.submit_chunk_scatter(
+                7, 0, 0, 3, stream=Mock(), room_token=old_token
+            )
+        )
+        handler._scatter_region.assert_not_called()
+        self.assertFalse(request._chunk_events)
+
+    @patch("sglang.srt.disaggregation.common.staging_handler.create_device_event")
+    def test_disabled_scatter_submits_on_background_stream(self, make_event):
+        handler, _, _ = self.make_deferred_handler(defer=False)
+        handler.num_writers_for.return_value = 1
+        self.assertTrue(handler.handle_chunk_arrived(7, 0, 0, 3, "writer"))
+        handler._scatter_region.assert_called_once()
+        make_event.return_value.record.assert_called_once_with(
+            handler.staging_allocator._scatter_stream
+        )
+        self.assertFalse(handler._pending_scatters)
+
+    def test_scheduler_uses_the_stream_that_runs_forwards(self):
+        for overlap, pp_size, expected in [
+            (False, 1, "schedule"),
+            (True, 1, "forward"),
+            (False, 2, "forward"),
+        ]:
+            with self.subTest(overlap=overlap, pp_size=pp_size):
+                handler = SimpleNamespace(
+                    _defer_scatter=True, flush_pending_scatters=Mock()
+                )
+                scheduler = SimpleNamespace(
+                    disagg_decode_transfer_queue=SimpleNamespace(
+                        staging_handler=handler
+                    ),
+                    enable_overlap=overlap,
+                    schedule_stream="schedule",
+                    forward_stream="forward",
+                )
+                with patch(
+                    "sglang.srt.disaggregation.decode.get_parallel",
+                    return_value=SimpleNamespace(pp_size=pp_size),
+                ):
+                    SchedulerDisaggregationDecodeMixin._flush_staging_scatters(
+                        scheduler
+                    )
+                handler.flush_pending_scatters.assert_called_once_with(expected)
+
+    @patch("sglang.srt.disaggregation.common.staging_handler.create_device_event")
+    def test_pp_idle_iteration_drains_scatters_before_waiting_for_a_batch(self, _event):
+        handler, request, receiver = self.make_deferred_handler()
+        handler.num_writers_for.return_value = 1
+        handler.handle_chunk_arrived(7, 0, 0, 3, "writer")
+        scheduler = SimpleNamespace(
+            init_pp_loop_state=Mock(),
+            pp_loop_size=1,
+            running_mbs=[None],
+            last_mbs=[None],
+            mbs=[None],
+            increment_scheduler_iterations=Mock(),
+            ingest_requests=Mock(return_value=[]),
+            pp_group=SimpleNamespace(is_last_rank=True),
+            _pp_pd_get_retract_ids=Mock(return_value=[]),
+            _pp_pd_get_prealloc_ids=Mock(return_value=[]),
+            _pp_pd_get_decode_transferred_ids=Mock(return_value=[]),
+            _pp_commit_comm_work=Mock(),
+            get_next_disagg_decode_batch_to_run=Mock(
+                return_value=SimpleNamespace(running_batch=None, batch_to_run=None)
+            ),
+            disagg_decode_transfer_queue=SimpleNamespace(staging_handler=handler),
+            enable_overlap=False,
+            schedule_stream=Mock(),
+            forward_stream=Mock(),
+        )
+
+        def flush_and_stop():
+            SchedulerDisaggregationDecodeMixin._flush_staging_scatters(scheduler)
+            raise StopIteration
+
+        scheduler._flush_staging_scatters = flush_and_stop
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_pp_mixin.get_parallel",
+                return_value=SimpleNamespace(pp_size=2),
+            ),
+            patch(
+                "sglang.srt.disaggregation.decode.get_parallel",
+                return_value=SimpleNamespace(pp_size=2),
+            ),
+            self.assertRaises(StopIteration),
+        ):
+            SchedulerPPMixin.event_loop_pp_disagg_decode(scheduler)
+        self.assertFalse(handler._pending_scatters)
+        handler._scatter_region.assert_called_once_with(
+            4096, 0, 3, request, receiver, scheduler.forward_stream
+        )
+
+    def test_scatter_launch_modes_preserve_default_and_bound_ctas(self):
+        for ctas, page_size, selected, grid in [
+            (0, 64, "_fused_scatter_from_staging_kernel", (16, 32)),
+            (3, 64, "_scatter_from_staging_persistent_kernel", (3,)),
+            (99, 64, "_scatter_from_staging_persistent_kernel", (32,)),
+            (-1, 64, "_scatter_staging_pages_kernel", (2, 16)),
+            (-1, 3, "_fused_scatter_from_staging_kernel", (16, 32)),
+        ]:
+            with (
+                self.subTest(ctas=ctas, page_size=page_size),
+                patch.object(staging_buffer, selected) as kernel,
+            ):
+                staging_buffer._launch_scatter(
+                    None, None, None, None, 128, 512, 32768, 256, page_size, 8, 2, ctas
+                )
+                kernel.__getitem__.assert_called_once_with(grid)
+
+    def test_pointer_table_is_cached_on_an_independent_stream(self):
+        with (
+            patch.dict(staging_buffer._SCATTER_I64_CACHE, {}, clear=True),
+            patch.object(staging_buffer, "create_device_stream") as create,
+            patch.object(
+                staging_buffer,
+                "device_stream_context",
+                side_effect=lambda _: nullcontext(),
+            ) as context,
+            patch.object(staging_buffer, "make_ptr_table") as pack,
+        ):
+            first = staging_buffer._cached_scatter_i64(
+                ("cpu", 0, 9), [9], torch.device("cpu")
+            )
+            second = staging_buffer._cached_scatter_i64(
+                ("cpu", 0, 9), [9], torch.device("cpu")
+            )
+            self.assertIs(first, second)
+            create.assert_called_once_with(torch.device("cpu"))
+            context.assert_called_once_with(create.return_value)
+            pack.assert_called_once_with([9], device=torch.device("cpu"))
 
 
 class TestMooncakeHiSparseSpecIndices(CustomTestCase):
