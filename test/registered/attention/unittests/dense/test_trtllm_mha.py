@@ -1,9 +1,13 @@
+import contextlib
+import types
 import unittest
 from unittest import mock
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention import trtllm_mha_backend
+from sglang.srt.layers.attention.trtllm_mha_decode_groups import DecodeGroupPlans
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.common import (
@@ -480,6 +484,185 @@ class TestTRTLLMMHAPage128TrtllmGen(CustomTestCase):
                 hidden_size=self.HIDDEN_SIZE,
                 max_context_len=self.MAX_CONTEXT_LEN,
             )
+
+
+class TestTRTLLMMHADecodeGroupHoist(CustomTestCase):
+    """Per-call length groups vs groups built once per forward, with a fake FMHA whose
+    output depends on each request's inputs and on its group's size and slot."""
+
+    @staticmethod
+    def _fake_decode(
+        *, query, block_tables, seq_lens, out=None, out_dtype=None, **kwargs
+    ):
+        n = seq_lens.shape[0]
+        rows = query.float().view(n, -1, *query.shape[1:])
+        slot = torch.arange(n, dtype=torch.float32).view(n, 1, 1, 1)
+        value = (
+            rows * (n + 1)
+            + seq_lens.float().view(n, 1, 1, 1)
+            + block_tables[:, :1].float().view(n, 1, 1, 1) / 8
+            + slot / 4
+        )
+        if kwargs.get("mask") is not None:
+            value = value + kwargs["mask"].float().sum() / 16
+        value = value.view(query.shape)
+        if out is None:
+            return value.to(out_dtype)
+        out.copy_(value)
+        return out
+
+    def _run(self, *, hoist, query, block_tables, seq_lens, q_len, out, mask):
+        backend = types.SimpleNamespace(
+            q_data_type=torch.bfloat16,
+            workspace_buffer=None,
+            max_context_len=4096,
+            _multi_ctas_kv_counter_buffer=None,
+            decode_seq_len_splits=4,
+            decode_split_hoist=hoist,
+            _split_kv_enabled=False,
+            _decode_group_plans=DecodeGroupPlans(),
+        )
+        fake_flashinfer = types.SimpleNamespace(
+            decode=types.SimpleNamespace(
+                trtllm_batch_decode_with_kv_cache=self._fake_decode
+            )
+        )
+        with mock.patch.object(
+            trtllm_mha_backend, "flashinfer", fake_flashinfer, create=True
+        ):
+            return trtllm_mha_backend.TRTLLMHAAttnBackend._run_fixed_q_len_decode(
+                backend,
+                query,
+                None,
+                block_tables,
+                seq_lens,
+                bmm1_scale=1.0,
+                bmm2_scale=1.0,
+                window_left=-1,
+                sinks=None,
+                q_len_per_req=q_len,
+                out=out,
+                mask=mask,
+            )
+
+    def test_hoisted_groups_match_per_call_groups(self):
+        # 7 requests in 4 groups (2, 2, 2, 1), with tied lengths across a group edge.
+        seq_lens = torch.tensor([5, 3, 5, 9, 1, 3, 7], dtype=torch.int32)
+        block_tables = torch.arange(7 * 3, dtype=torch.int32).view(7, 3) * 5 % 17
+        for q_len in (1, 7):
+            for use_out in (False, True):
+                for use_mask in (False, True):
+                    query = torch.randn(7 * q_len, 2, 8).to(torch.bfloat16)
+                    mask = torch.ones(7, q_len, dtype=torch.int32) if use_mask else None
+                    results = []
+                    for hoist in (False, True):
+                        out = torch.zeros_like(query) if use_out else None
+                        result = self._run(
+                            hoist=hoist,
+                            query=query,
+                            block_tables=block_tables,
+                            seq_lens=seq_lens,
+                            q_len=q_len,
+                            out=out,
+                            mask=mask,
+                        )
+                        if use_out:
+                            self.assertEqual(result.data_ptr(), out.data_ptr())
+                        results.append(result)
+                    with self.subTest(q_len=q_len, out=use_out, mask=use_mask):
+                        self.assertTrue(torch.equal(results[0], results[1]))
+
+    def test_shared_draft_metadata_resets_every_steps_group_plan(self):
+        # Warmup and capture both call this metadata entry. The shared-page-table
+        # path still needs to record each step's sort/gathers inside capture.
+        steps, bs = 5, 32
+        lens = torch.zeros((steps, bs), dtype=torch.int32)
+        cu_lens = torch.zeros((steps, bs + 1), dtype=torch.int32)
+        tables = torch.arange(bs * 3, dtype=torch.int32).view(bs, 3)
+        backends = []
+        for i in range(steps):
+            backend = types.SimpleNamespace(
+                decode_split_hoist=True,
+                _decode_group_plans=DecodeGroupPlans(),
+                decode_cuda_graph_metadata={
+                    bs: types.SimpleNamespace(
+                        cache_seqlens_int32=lens[i], page_table=tables
+                    )
+                },
+            )
+            backend._apply_cuda_graph_metadata = lambda **kw: None
+            backend.init_forward_metadata_in_graph = lambda batch, backend=backend: (
+                trtllm_mha_backend.TRTLLMHAAttnBackend.init_forward_metadata_in_graph(
+                    backend, batch
+                )
+            )
+            backends.append(backend)
+        multi = types.SimpleNamespace(
+            speculative_num_steps=steps + 1,
+            attn_backends=backends,
+            _shared_draft_metadata=(lens, cu_lens),
+            _step_writes=lambda batch, step: contextlib.nullcontext(),
+        )
+        batch = types.SimpleNamespace(
+            batch_size=bs,
+            spec_info=types.SimpleNamespace(is_draft_input=lambda: True),
+            encoder_lens=None,
+            seq_lens=torch.arange(bs, dtype=torch.int32),
+            req_pool_indices=torch.arange(bs),
+            forward_mode=types.SimpleNamespace(DECODE=True),
+            out_cache_loc=None,
+            ragged_verify_layout=None,
+        )
+
+        def update(**kwargs):
+            for i in range(steps):
+                lens[i].copy_(kwargs["seq_lens"] + i + 1)
+
+        def initialize():
+            trtllm_mha_backend.TRTLLMHAAttnMultiStepDraftBackend.init_forward_metadata_in_graph(
+                multi, batch
+            )
+
+        with (
+            mock.patch(
+                "sglang.srt.model_executor.forward_batch_info.build_inner_fb_view",
+                side_effect=lambda batch, **kwargs: batch,
+            ),
+            mock.patch.object(
+                trtllm_mha_backend, "update_draft_step_seqlens", side_effect=update
+            ),
+        ):
+            initialize()
+            warmup = [
+                b._decode_group_plans.get(block_tables=tables, seq_lens=lens[i])
+                for i, b in enumerate(backends)
+            ]
+            batch.seq_lens.add_(100)
+            initialize()
+            for i, backend in enumerate(backends):
+                captured = backend._decode_group_plans.get(
+                    block_tables=tables, seq_lens=lens[i]
+                )
+                with self.subTest(step=i):
+                    self.assertIsNot(captured, warmup[i])
+                    self.assertTrue(
+                        torch.equal(captured.seq_lens, torch.sort(lens[i]).values)
+                    )
+
+    def test_plan_reuse_and_reset_with_mutated_metadata(self):
+        plans = DecodeGroupPlans()
+        tables = torch.arange(12, dtype=torch.int32).view(4, 3)
+        lengths = torch.tensor([4, 1, 2, 3], dtype=torch.int32)
+        first = plans.get(block_tables=tables, seq_lens=lengths)
+        self.assertIs(first, plans.get(block_tables=tables, seq_lens=lengths))
+        lengths.copy_(torch.tensor([1, 4, 3, 2], dtype=torch.int32))
+        tables.add_(20)
+        plans.reset()
+        second = plans.get(block_tables=tables, seq_lens=lengths)
+        self.assertIsNot(first, second)
+        self.assertTrue(torch.equal(second.order, torch.argsort(lengths)))
+        self.assertTrue(torch.equal(second.block_tables, tables[second.order]))
+        self.assertTrue(torch.equal(second.seq_lens, lengths[second.order]))
 
 
 if __name__ == "__main__":
