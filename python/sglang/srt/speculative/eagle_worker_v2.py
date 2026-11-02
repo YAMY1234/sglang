@@ -1265,8 +1265,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     select_index
                 ]
 
-        # The always-present strategy returns captured top-1 or invokes this
-        # unchanged selected-row stock sampler.
+        # The always-present runtime strategy either returns its captured
+        # top-1 or invokes this unchanged selected-row stock sampler.
         def stock_extend_tokens():
             if get_spec().speculative_use_rejection_sampling:
                 return sample_draft_proposal(
