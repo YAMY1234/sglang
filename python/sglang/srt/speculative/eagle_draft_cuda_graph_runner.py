@@ -46,7 +46,9 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
-from sglang.srt.speculative.prepared_next_draft import prepared_next_draft_enabled
+from sglang.srt.speculative.prepared_next_draft import (
+    prepared_next_draft_enabled,
+)
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.srt.utils import (
     require_attn_tp_gather,
@@ -303,8 +305,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         )
         # (raw_bs, field mask) -> (destination views, copy plan); None once refused.
         self._planned_inputs = {}
-        # Resolve the always-present graph dispatch before capture. Specialized
-        # batch sizes are used only to select compatible graph variants.
+        # Resolve the always-present graph dispatch before capture. It reports the
+        # specialized batch sizes used only to select compatible graph variants.
         self.draft_runtime = eagle_worker.draft_runtime
         self.specialized_batches = self.draft_runtime.bind_draft_graphs(self)
         self.attention_graph_variants = self.draft_runtime.graph_variants(

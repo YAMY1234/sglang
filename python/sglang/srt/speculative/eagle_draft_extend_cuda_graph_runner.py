@@ -306,8 +306,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.buffers.share_buffers(exclude={"select_index"})
         # (raw_bs, field mask) -> (destination views, copy plan); None once refused.
         self._planned_inputs = {}
-        # Resolve the always-present graph dispatch before capture. Specialized
-        # batch sizes are used only to select compatible graph variants.
+        # Resolve the always-present graph dispatch before capture. It reports the
+        # specialized batch sizes used only to select compatible graph variants.
         self.draft_runtime = self.eagle_worker.draft_runtime
         self.specialized_batches = self.draft_runtime.bind_extend_graphs(self)
         self.attention_graph_variants = self.draft_runtime.graph_variants(
