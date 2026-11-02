@@ -28,9 +28,6 @@ logger = logging.getLogger(__name__)
 _NUM_WARMUP = 2
 # XORed into the server seed so these draws differ from other samplers'.
 _SIM_ACC_LEN_DOMAIN = 0x0F3D6B8C2A915E47
-# Arbitrary bound on post-verify graph sets (key x verify logits buffer); a batch
-# past it runs SGLang's eager path.
-_MAX_POST_VERIFY_STATES = 64
 # SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD: a round's inputs and its forced length staged in one launch.
 _ONE_LAUNCH_LOAD = envs.SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD.get()
 
@@ -102,6 +99,18 @@ class EaglePostVerifyGraphs:
         """Order the current stream after the last side-stream mamba state commit; the
         worker calls it once the draft extend is enqueued."""
         self._graphs.join()
+
+    def log_stats(self) -> str:
+        """Cumulative keys, captured slot pairs and calls rejected at the key bound.
+
+        Each captured slot pair holds a sampling graph and a commit graph; a key
+        has two alternating slots. Read only when formatting decode statistics.
+        """
+        return (
+            f"post-verify graphs: keys={len(self._graphs._states)}, "
+            f"captured={self._graphs._num_captured}, "
+            f"eager-at-bound={self._graphs._eager_at_bound}"
+        )
 
     def _key(
         self,
@@ -310,7 +319,10 @@ class _PostVerifyGraphs:
         # forced acceptance lengths: the worker's one stream, from which SGLang's eager
         # verify draws too; once per round, whatever else uses the global RNG
         self._sim_rng = sim_rng
+        self._max_states = envs.SGLANG_POST_VERIFY_MAX_STATES.get()
         self._states: dict[tuple, SimpleNamespace] = {}
+        self._num_captured = 0
+        self._eager_at_bound = 0
         self._pool = None
         self._side_stream = self._main_done = self._commit_done = None
         self._commit_pending = False
@@ -325,7 +337,8 @@ class _PostVerifyGraphs:
     ) -> Optional[tuple]:
         state = self._states.get(key)
         if state is None:
-            if len(self._states) >= _MAX_POST_VERIFY_STATES:
+            if len(self._states) >= self._max_states:
+                self._eager_at_bound += 1
                 return None
             state = self._states[key] = SimpleNamespace(
                 warmups=0, turn=0, slots=[None, None]
@@ -460,6 +473,7 @@ class _PostVerifyGraphs:
             self._commit(slot, outputs)
         torch.cuda.current_stream().wait_stream(self._side_stream)
         slot.graph, slot.commit_graph, slot.outputs = graph, commit_graph, outputs
+        self._num_captured += 1
         logger.info(
             "Captured the EAGLE post-verify graphs for batch size %d",
             slot.num_requests,

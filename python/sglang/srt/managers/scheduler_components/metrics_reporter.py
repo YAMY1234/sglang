@@ -1004,6 +1004,11 @@ class SchedulerMetricsReporter:
                 msg += f"cap len: {spec_cap_length:.2f}, "
             if spec_block_accept_length > 0:
                 msg += f"block accept len: {spec_block_accept_length:.2f}, "
+            post_verify_graphs = getattr(
+                self.scheduler.draft_worker, "_post_verify_graphs", None
+            )
+            if post_verify_graphs is not None:
+                msg += f"{post_verify_graphs.log_stats()}, "
             if self.scheduler.spec_algorithm.is_dspark():
                 draft_worker = self.scheduler.draft_worker
                 if draft_worker is not None:
