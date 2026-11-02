@@ -37,6 +37,10 @@ from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferAttnBackend,
     FlashInferMultiStepDraftBackend,
 )
+from sglang.srt.layers.attention.trtllm_mha_decode_groups import (
+    DecodeGroupPlans,
+    run_planned_groups,
+)
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     make_persistent_multi_ctas_kv_counter_buffer,
 )
@@ -412,6 +416,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 "SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS must be at least 1, "
                 f"got {self.decode_seq_len_splits}"
             )
+        self.decode_split_hoist = (
+            self.decode_seq_len_splits > 1
+            and envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+            and envs.SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION.get()
+        )
+        self._decode_group_plans = (
+            DecodeGroupPlans() if self.decode_split_hoist else None
+        )
         self._xqa_spec_dec_mask = None
         if self.is_xqa_impl and self.speculative_num_draft_tokens:
             draft_len = self.speculative_num_draft_tokens
@@ -1115,6 +1127,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        if self.decode_split_hoist:
+            self._decode_group_plans.reset()
         bs = forward_batch.batch_size
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
@@ -1241,6 +1255,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        if self.decode_split_hoist:
+            self._decode_group_plans.reset()
         self._apply_cuda_graph_metadata(
             bs=forward_batch.batch_size,
             req_pool_indices=forward_batch.req_pool_indices,
@@ -1253,6 +1269,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
+
+        if self.decode_split_hoist:
+            self._decode_group_plans.reset()
 
         metadata = TRTLLMMHAMetadata()
         seqlens_in_batch = forward_batch.seq_lens
@@ -1546,6 +1565,20 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         num_splits = min(self.decode_seq_len_splits, num_requests)
         if num_splits == 1:
             return run_group(query, block_tables, seq_lens, out)
+
+        if self.decode_split_hoist:
+            plan = self._decode_group_plans.get(
+                block_tables=block_tables, seq_lens=seq_lens
+            )
+            return run_planned_groups(
+                query=query,
+                plan=plan,
+                num_splits=num_splits,
+                q_len_per_req=q_len_per_req,
+                out=out,
+                out_dtype=resolved_out_dtype,
+                run_group=run_group,
+            )
 
         order = torch.argsort(seq_lens)
         query_by_request = query.view(
