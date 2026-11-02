@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -171,6 +172,12 @@ class TestPreparedNextDraft(CustomTestCase):
             self.assertEqual(get_alloc_reserve_per_decode(), 2 * window)
         prepared_next_draft.prepared_next_draft_enabled.cache_clear()
 
+    @unittest.skipUnless(
+        (Path(prepared_next_draft.__file__).resolve().parents[2]
+         / "kernels/ops/speculative/speculative_index.py").is_file(),
+        "mkp withdrew R2; CPU producer refusal is covered by "
+        "test_unsupported_producer_declines_before_the_kernel",
+    )
     def test_cuda_index_plans_leave_cpu_preparation_to_the_stock_path(self):
         from sglang.kernels.ops.speculative import speculative_index
 
@@ -680,13 +687,20 @@ class TestPreparedNextDraft(CustomTestCase):
                 self.subTest(enabled=enabled),
                 envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(enabled),
                 patch.object(decode_resources, "_round_tensor_rings", {}),
+                patch.object(decode_resources, "_round_contexts", {}),
             ):
-                slots = [
-                    decode_resources.empty((2,), dtype=torch.int64, device="cpu")
-                    for _ in range(9)
-                ]
+                slots = []
+                for _ in range(9):
+                    decode_resources.begin_round(max_batch_size=1, device="cpu")
+                    slots.append(
+                        decode_resources.empty(
+                            (2,), tag="test_round", per_request_numel=2,
+                            dtype=torch.int64, device="cpu",
+                        )
+                    )
                 self.assertEqual(len({slot.data_ptr() for slot in slots[:8]}), 8)
-                self.assertEqual(slots[0] is slots[8], enabled)
+                # C1 returns fresh shape views; storage survives eight rounds.
+                self.assertEqual(slots[0].data_ptr() == slots[8].data_ptr(), enabled)
 
     def test_runtime_stream_events_are_reused_per_stream_pair(self):
         waiting = SimpleNamespace(cuda_stream=1, wait_event=Mock())

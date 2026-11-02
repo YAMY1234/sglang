@@ -557,7 +557,7 @@ def _queue_scheduler():
             extend=MagicMock(),
         ),
         disagg_decode_prealloc_queue=SimpleNamespace(
-            flush_deferred_sends=MagicMock(),
+            publish_pending_destinations=MagicMock(),
             resume_retracted_reqs=MagicMock(return_value=[]),
             retracted_queue=[],
             pop_preallocated=MagicMock(return_value=([], [])),
@@ -750,6 +750,7 @@ class TestAdmissionOverlap(CustomTestCase):
                 )
                 self.assertEqual(deferred, defer)
                 queue = scheduler.disagg_decode_prealloc_queue
+                queue.publish_pending_destinations.assert_called_once()
                 scheduler.disagg_decode_transfer_queue.pop_transferred.assert_called_once()
                 self.assertEqual(queue.pop_preallocated.call_count, int(not defer))
                 if deferred:

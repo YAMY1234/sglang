@@ -243,9 +243,13 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
             for raw_bs in (1, 2):
                 with (
                     self.subTest(enabled=enabled, raw_bs=raw_bs),
-                    envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(enabled),
+                    envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+                    envs.SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH.override(enabled),
                 ):
                     runner = self._build_runner(_RecordingDraftBackend())
+                    # __new__ fixtures supply the cached C2 constructor decision.
+                    runner._prepared_next_draft = True
+                    runner._copy_plans = enabled
                     batch = self._build_forward_batch([10] * raw_bs, 10 * raw_bs)
                     with patch.object(
                         runner,
@@ -259,6 +263,8 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
                     )
 
                     runner, batch, select = _extend_runner(raw_bs)
+                    runner._prepared_next_draft = True
+                    runner._copy_plans = enabled
                     runner._replay_graph = lambda key, fb: SimpleNamespace(
                         next_token_logits=torch.zeros((2, 4)),
                         hidden_states=torch.zeros((2, 2)),
