@@ -547,12 +547,14 @@ def _queue_scheduler():
     scheduler = SimpleNamespace(
         scheduler_stage_metrics=None,
         enable_decode_hicache=False,
+        tree_cache=SimpleNamespace(linker=None),
         enable_hisparse=False,
         waiting_queue=[],
         polling_count=0,
         polling_interval=1,
         disagg_decode_transfer_queue=SimpleNamespace(
             resolve_deferred_releases=MagicMock(),
+            publish_pending_metadata=MagicMock(),
             pop_transferred=MagicMock(return_value=[]),
             extend=MagicMock(),
         ),
