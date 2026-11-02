@@ -14,6 +14,7 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
+from sglang.srt.managers.overlap_utils import spec_relay_bypass_enabled
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -94,6 +95,12 @@ def _topk_in_place(spec_info, buffers) -> bool:
     return _same_storage(spec_info.topk_index, buffers.topk_index) and _same_storage(
         spec_info.topk_p, buffers.topk_p
     )
+
+
+def _relay_private_inputs() -> frozenset[str]:
+    if spec_relay_bypass_enabled() and get_parallel().moe_ep_size == 1:
+        return frozenset({"topk_p", "topk_index", "hidden_states"})
+    return frozenset()
 
 
 class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
@@ -297,7 +304,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
             dsa_seed_topk=dsa_seed_topk,
         )
-        self.buffers.share_buffers()
+        # Relay outputs survive other runners until the next draft consumes them.
+        self.buffers.share_buffers(exclude=_relay_private_inputs())
         # Resolve the always-present graph dispatch before capture. Specialized
         # batch sizes are used only to select compatible graph variants.
         self.draft_runtime = eagle_worker.draft_runtime

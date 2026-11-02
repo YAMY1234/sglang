@@ -15,6 +15,8 @@ the raw value must be restored once replay finishes.
 """
 
 import unittest
+from dataclasses import fields
+from unittest.mock import patch
 from types import SimpleNamespace
 
 import torch
@@ -23,6 +25,7 @@ from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative import eagle_draft_cuda_graph_runner as draft_graph
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
@@ -147,6 +150,38 @@ class _RecordingDraftBackend:
 
 
 class TestEagleDraftCudaGraphRunner(CustomTestCase):
+    def test_relay_outputs_survive_other_runners_sharing_input_buffers(self):
+        from sglang.srt.model_executor import input_buffers
+
+        def buffers():
+            values = dict.fromkeys(
+                f.name for f in fields(draft_graph.EagleDraftInputBuffers)
+            )
+            values.update(
+                topk_index=torch.zeros((4, 1), dtype=torch.int64),
+                topk_p=torch.ones((4, 1)),
+                hidden_states=torch.zeros((4, 8)),
+            )
+            return draft_graph.EagleDraftInputBuffers(**values)
+
+        with (
+            patch.object(input_buffers, "_forward_input_buffer_pool", {}),
+            patch.object(draft_graph, "spec_relay_bypass_enabled", return_value=True),
+            patch.object(
+                draft_graph, "get_parallel", return_value=SimpleNamespace(moe_ep_size=1)
+            ),
+        ):
+            relay = buffers()
+            relay.share_buffers(exclude=draft_graph._relay_private_inputs())
+            other = buffers()
+            other.share_buffers()
+            for name in ("topk_index", "topk_p", "hidden_states"):
+                source, target = getattr(relay, name), getattr(other, name)
+                source.fill_(7)
+                target.zero_()
+                self.assertTrue(torch.all(source == 7), name)
+                self.assertNotEqual(source.data_ptr(), target.data_ptr(), name)
+
     def setUp(self):
         # The code under test reads its config from the bags.
         reset_context()

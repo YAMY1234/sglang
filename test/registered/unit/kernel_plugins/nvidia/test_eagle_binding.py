@@ -158,10 +158,11 @@ def _megakernel(**entries):
     """SGLang's side of a draft offering these entries."""
     return EagleMegakernel(
         draft_worker=SimpleNamespace(
+            cuda_graph_runner=None,
             draft_runner=SimpleNamespace(
                 model=_model(**entries),
                 model_config=SimpleNamespace(hidden_size=4, dtype=torch.float32),
-            )
+            ),
         ),
     )
 
@@ -706,6 +707,56 @@ class TestEagleEntries(CustomTestCase):
             self.assertRaisesRegex(RuntimeError, "draft_loop batch sizes differ"),
         ):
             mk.bind_draft_graphs(draft_runner)
+
+    def test_relay_outputs_alias_private_draft_inputs_without_prepared_next(self):
+        outputs = {}
+
+        def factory(**buffers):
+            outputs.update(buffers)
+            return lambda bs: print
+
+        mk = _megakernel(draft_extend=factory)
+        b = SimpleNamespace(
+            topk_index=torch.zeros((4, 1), dtype=torch.int64),
+            topk_p=torch.ones((4, 1), dtype=torch.float32),
+            hidden_states=torch.zeros((4, 4)),
+        )
+        mk._draft_worker.cuda_graph_runner = SimpleNamespace(buffers=b)
+        runner = SimpleNamespace(
+            max_bs=4, captured_req_width=7, device="cpu", capture_bs=[1, 2, 4]
+        )
+        with (
+            patch.object(overlap_utils, "spec_relay_bypass_enabled", return_value=True),
+            patch.object(
+                eagle_megakernel,
+                "get_parallel",
+                return_value=SimpleNamespace(moe_ep_size=1),
+            ),
+            _ranks(),
+        ):
+            mk.bind_extend_graphs(runner)
+        for output, source in (
+            ("topk_index", b.topk_index),
+            ("topk_p", b.topk_p),
+            ("hidden", b.hidden_states),
+        ):
+            self.assertEqual(outputs[output].data_ptr(), source.data_ptr())
+            outputs[output].fill_(7)
+            self.assertTrue(torch.all(source == 7))
+
+        for enabled, ep, max_bs in ((False, 1, 4), (True, 4, 4), (True, 1, 8)):
+            with (
+                self.subTest(enabled=enabled, ep=ep, max_bs=max_bs),
+                patch.object(
+                    overlap_utils, "spec_relay_bypass_enabled", return_value=enabled
+                ),
+                patch.object(
+                    eagle_megakernel,
+                    "get_parallel",
+                    return_value=SimpleNamespace(moe_ep_size=ep),
+                ),
+            ):
+                self.assertIsNone(mk._draft_inputs_as_extend_outputs(max_bs))
 
     def test_a_draft_round_reuses_a_served_extend_only_for_the_input_it_made(self):
         """The megakernel may reuse what its draft extend left behind only when that
