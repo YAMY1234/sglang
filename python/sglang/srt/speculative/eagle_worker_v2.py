@@ -1395,6 +1395,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.device = get_device().device
         self._target_worker = target_worker
         self.page_size = get_schedule().page_size
+        prepared_next_draft.log_spec_round_reuse_config(logger)
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             get_spec().speculative_algorithm
         )
