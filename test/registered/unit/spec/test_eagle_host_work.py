@@ -62,6 +62,42 @@ class TestEagleHostWork(unittest.TestCase):
             batch.maybe_evict_swa.assert_called_once()
             self.assertEqual((req.decode_batch_idx, batch.max_seq_len_host), (1, 64))
 
+    def test_join_and_copy_events_reuse_only_when_enabled(self):
+        for enabled in (False, True):
+            join_events, copy_events = (
+                Mock(side_effect=lambda: Mock()),
+                Mock(side_effect=lambda: Mock()),
+            )
+            ns = dict(
+                _ENABLED=enabled,
+                _JOIN_EVENTS={},
+                _COPY_DONE_RING=[],
+                _COPY_DONE_POS=0,
+                torch=NS(cuda=NS(Event=join_events)),
+            )
+            path = "utils/nv_megakernel_host.py"
+            wait = load_function(path, "wait_stream", ns)
+            copy_done = load_function(path, "copy_done_event", ns)
+            dst, src = Mock(cuda_stream=1), Mock(cuda_stream=2)
+            wait(dst, src)
+            wait(dst, src)
+            events = [copy_done(NS(Event=copy_events)) for _ in range(5)]
+            self.assertEqual(join_events.call_count, 1 if enabled else 0)
+            self.assertEqual(copy_events.call_count, 4 if enabled else 5)
+            if enabled:
+                self.assertIs(events[0], events[4])
+                event = dst.wait_event.call_args.args[0]
+                self.assertEqual(event.record.call_count, 2)
+                event.record.assert_called_with(src)
+                self.assertIs(
+                    dst.wait_event.call_args_list[0].args[0],
+                    dst.wait_event.call_args_list[1].args[0],
+                )
+                dst.wait_stream.assert_not_called()
+            else:
+                self.assertIsNot(events[0], events[4])
+                self.assertEqual(dst.wait_stream.call_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

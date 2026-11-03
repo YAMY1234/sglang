@@ -58,6 +58,7 @@ from sglang.srt.runtime_context import (
     spawn_world_rank,
 )
 
+from sglang.srt.utils import nv_megakernel_host
 from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
 
 suppress_noisy_warnings()
@@ -4978,7 +4979,9 @@ class Scheduler(
                     self._confidence_budget_prepare(batch, self.future_map)
 
                 with self.forward_stream_ctx:
-                    self.forward_stream.wait_stream(self.schedule_stream)
+                    nv_megakernel_host.wait_stream(
+                        self.forward_stream, self.schedule_stream
+                    )
                     if gpu_only_lens:
                         # publish_ready was recorded on forward_stream: stream order
                         # fences the gather, no host sync / event wait needed.
@@ -5043,7 +5046,9 @@ class Scheduler(
                                 batch.out_cache_loc,
                             )
                         # FIXME(lsyin): maybe move this to forward_batch_generation
-                        batch_result.copy_done = self.device_module.Event()
+                        batch_result.copy_done = nv_megakernel_host.copy_done_event(
+                            self.device_module
+                        )
                         if batch_result.delay_sample_func is None:
                             self._relay_forward_payload(
                                 batch, future_indices, batch_result
@@ -5358,7 +5363,7 @@ class Scheduler(
             return_logprob=batch.return_logprob,
             return_hidden_states=batch.return_hidden_states,
         )
-        self.copy_stream.wait_stream(self.forward_stream)
+        nv_megakernel_host.wait_stream(self.copy_stream, self.forward_stream)
         with self.copy_stream_ctx:
             if not self.enable_async_d2h_copy:
                 copy_fn()
