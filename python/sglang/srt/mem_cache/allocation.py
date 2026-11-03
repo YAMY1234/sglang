@@ -814,6 +814,7 @@ def alloc_for_spec_decode(
     nxt_kv_lens_cpu: torch.Tensor,
     num_needed_tokens: int,
     batch: Optional[ScheduleBatch] = None,
+    nxt_kv_lens_list: Optional[list[int]] = None,
 ) -> None:
     if num_needed_tokens > 0:
         if tree_cache.token_to_kv_pool_allocator.page_size == 1:
@@ -868,6 +869,7 @@ def alloc_for_spec_decode(
             len(reqs),
         )
 
-    nxt_kv_lens_list = nxt_kv_lens_cpu.tolist()
+    if nxt_kv_lens_list is None:
+        nxt_kv_lens_list = nxt_kv_lens_cpu.tolist()
     for req, nxt_kv_len in zip(reqs, nxt_kv_lens_list, strict=True):
         req.kv.allocate_spec_decode(nxt_kv_len)

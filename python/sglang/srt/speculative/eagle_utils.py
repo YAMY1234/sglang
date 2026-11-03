@@ -1328,6 +1328,26 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     for r in batch.reqs:
         r.decode_batch_idx += 1
 
+    if num_needed_tokens == 0 and _fused_accept_enabled():
+        if batch.seq_lens_cpu is None:
+            batch.max_seq_len_host = max(cur_kv_lens)
+        # The owned allocator still advances the host watermarks; no device
+        # lengths are consumed when this round needs no additional KV slots.
+        alloc_for_spec_decode(
+            batch.tree_cache,
+            batch.req_to_token_pool,
+            reqs=batch.reqs,
+            req_pool_indices=None,
+            cur_kv_lens=None,
+            cur_kv_lens_cpu=None,
+            nxt_kv_lens=None,
+            nxt_kv_lens_cpu=None,
+            num_needed_tokens=0,
+            batch=batch,
+            nxt_kv_lens_list=nxt_kv_lens,
+        )
+        return
+
     cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
     nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")
 
