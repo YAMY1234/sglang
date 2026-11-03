@@ -581,6 +581,9 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.chunked_req = None
         scheduler.waiting_queue = []
         scheduler.disagg_prefill_transfer_queue = []
+        scheduler.disagg_decode_transfer_queue = SimpleNamespace(
+            queue=[], staging_handler=None
+        )
         scheduler.enable_staging = False
         scheduler.request_receiver = SimpleNamespace(
             recv_requests=Mock(side_effect=[[]] * len(schedule) + [StopIteration])
@@ -641,7 +644,9 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
             maybe_prepare_mlp_sync_batch=lambda batch: batch
         )
         scheduler.disagg_prefill_transfer_queue = []
-        scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
+        scheduler.disagg_decode_transfer_queue = SimpleNamespace(
+            queue=[], staging_handler=None
+        )
 
 
 if __name__ == "__main__":
