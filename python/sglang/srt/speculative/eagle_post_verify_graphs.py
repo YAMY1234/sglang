@@ -231,6 +231,9 @@ class EaglePostVerifyGraphs:
             outputs[2],
             slot.tokens_per_request,
             prepared_step_indices=outputs[6],
+            checkpoint_commit=getattr(
+                self._speculative_runtime_hooks, "checkpoint_commit", None
+            ),
         )
 
 

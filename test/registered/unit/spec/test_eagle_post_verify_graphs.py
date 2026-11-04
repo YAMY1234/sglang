@@ -541,6 +541,36 @@ class TestPostVerifyGraphs(CustomTestCase):
                 self.assertEqual(int(staged["sim_accept_len"]), 3)
 
 
+class TestCheckpointHookGraphWiring(CustomTestCase):
+    def test_graph_commit_forwards_the_bound_callback(self):
+        callback = lambda view: True
+        graphs = EaglePostVerifyGraphs.__new__(EaglePostVerifyGraphs)
+        graphs._target_worker = object()
+        graphs._speculative_runtime_hooks = SimpleNamespace(checkpoint_commit=callback)
+        slot = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            staged={
+                "seq_lens": torch.tensor([5]),
+                "req_pool_indices": torch.tensor([0]),
+            },
+            tree_cache=None,
+            tokens_per_request=7,
+        )
+        outputs = (
+            None,
+            torch.tensor([2]),
+            torch.tensor([[0, 1]]),
+            None,
+            None,
+            None,
+            (None, None),
+        )
+        with patch.object(spec_utils, "commit_mamba_states_after_verify") as commit:
+            graphs._commit(slot, outputs)
+        self.assertIs(commit.call_args.kwargs["checkpoint_commit"], callback)
+        self.assertIs(commit.call_args.kwargs["prepared_step_indices"], outputs[6])
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
 class TestPostVerifyGraphsMatchEager(CustomTestCase):
     def setUp(self):
