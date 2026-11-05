@@ -65,12 +65,9 @@ def hc_mix(
     w_up_permuted_padded: torch.Tensor,
     hc_count: int,
     hidden_size: int,
+    *,
+    numeric_variant: int = 0,
 ) -> torch.Tensor:
-    from sglang.kernels.ops.gemm.dense_bf16_gemm_sm100_splitk_epilogue import (
-        run_splitk_dense_gate,
-        run_splitk_dense_silu,
-    )
-
     rows, k = hyper_input_normed.shape
     lowrank = w_down.shape[0]
     kpad = w_up_permuted_padded.shape[1]
@@ -83,6 +80,62 @@ def hc_mix(
         return out
     inv_hc = 1.0 / hc_count
     t_pad = _get_scratch(lowrank, hyper_input_normed.dtype, hyper_input_normed.device)
+    from sglang.kernels.plugin_kernels.nvidia.numeric import (
+        HcMixIO,
+        HcSignature,
+        NumericOperation,
+        ScalarType,
+    )
+    from sglang.srt.kernel_plugins.nvidia.numeric_binding import numeric_operator
+
+    run = numeric_operator(
+        HcSignature(
+            NumericOperation.HC_MIX,
+            rows,
+            hc_count,
+            hidden_size,
+            ScalarType.BF16,
+            lowrank=lowrank,
+            variant=numeric_variant,
+        ),
+        prepared=(
+            hyper_input_normed.is_cuda
+            and hyper_input_normed.dtype
+            == w_down.dtype
+            == w_up_permuted_padded.dtype
+            == torch.bfloat16
+            and k == hc_count * hidden_size
+            and w_down.shape == (lowrank, k)
+            and w_up_permuted_padded.shape == (k, pad_lowrank(lowrank))
+            and all(
+                t.device == hyper_input_normed.device
+                for t in (w_down, w_up_permuted_padded)
+            )
+            and all(
+                t.is_contiguous()
+                for t in (hyper_input_normed, w_down, w_up_permuted_padded)
+            )
+        ),
+    )
+    if run is not None:
+        run(
+            HcMixIO(
+                hyper_input_normed,
+                w_down,
+                w_up_permuted_padded,
+                hc_count,
+                hidden_size,
+                out,
+                t_pad[: min(rows, _MAX_ROWS)],
+            )
+        )
+        return out
+
+    from sglang.kernels.ops.gemm.dense_bf16_gemm_sm100_splitk_epilogue import (
+        run_splitk_dense_gate,
+        run_splitk_dense_silu,
+    )
+
     for row_start in range(0, rows, _MAX_ROWS):
         row_end = min(row_start + _MAX_ROWS, rows)
         m = row_end - row_start

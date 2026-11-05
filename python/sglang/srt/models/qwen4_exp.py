@@ -1555,6 +1555,10 @@ class _HCNorms:
     next_norm: Optional[GroupedGemmaRMSNorm]
     ffn_input: Optional[torch.Tensor] = None
     output: Optional[torch.Tensor] = None
+    attn_partials: Optional[torch.Tensor] = None
+    ffn_partials: Optional[torch.Tensor] = None
+    output_partials: Optional[torch.Tensor] = None
+    next_inject_weight: Optional[torch.Tensor] = None
 
 
 def _has_ple(layer_id, config) -> bool:
@@ -1712,8 +1716,15 @@ class Qwen4ExpLayerExtensionMixin:
         self._decode_moe_comm = _prepare_decode_moe_comm(self.mlp)
 
     @contextmanager
-    def hc_norms(self, normalized_input, next_norm):
-        norms = _HCNorms(normalized_input, next_norm)
+    def hc_norms(
+        self, normalized_input, next_norm, partials=None, next_inject_weight=None
+    ):
+        norms = _HCNorms(
+            normalized_input,
+            next_norm,
+            attn_partials=partials if normalized_input is not None else None,
+            next_inject_weight=next_inject_weight,
+        )
         # A prepared norm can only follow its residual without row movement.
         self._hc_norms = (
             norms
@@ -1749,15 +1760,24 @@ class Qwen4ExpLayerExtensionMixin:
             else None
         )
         return self.attn_hyper_connection.mix(
-            residual, normalized_input=normalized_input
+            residual,
+            normalized_input=normalized_input,
+            partials=(
+                self._hc_norms.attn_partials
+                if self._hc_norms is not None and self.ple is None
+                else None
+            ),
         )
 
     def _attn_combine(self, hidden_states, residuals):
         if self._hc_norms is None:
             return self.attn_hyper_connection.combine(hidden_states, residuals)
-        hidden_states, self._hc_norms.ffn_input = (
-            self.attn_hyper_connection.combine_and_normalize(
-                hidden_states, residuals, self.mlp_hyper_connection.hc_norm
+        hidden_states, self._hc_norms.ffn_input, self._hc_norms.ffn_partials = (
+            self.attn_hyper_connection.combine_normalize_and_gate(
+                hidden_states,
+                residuals,
+                self.mlp_hyper_connection.hc_norm,
+                self.mlp_hyper_connection.block_inject_weight.weight,
             )
         )
         return hidden_states
@@ -1767,15 +1787,22 @@ class Qwen4ExpLayerExtensionMixin:
             self._hc_norms.ffn_input if self._hc_norms is not None else None
         )
         return self.mlp_hyper_connection.mix(
-            residual, normalized_input=normalized_input
+            residual,
+            normalized_input=normalized_input,
+            partials=self._hc_norms.ffn_partials
+            if self._hc_norms is not None
+            else None,
         )
 
     def _ffn_combine(self, hidden_states, residuals):
         if self._hc_norms is None:
             return self.mlp_hyper_connection.combine(hidden_states, residuals)
-        hidden_states, self._hc_norms.output = (
-            self.mlp_hyper_connection.combine_and_normalize(
-                hidden_states, residuals, self._hc_norms.next_norm
+        hidden_states, self._hc_norms.output, self._hc_norms.output_partials = (
+            self.mlp_hyper_connection.combine_normalize_and_gate(
+                hidden_states,
+                residuals,
+                self._hc_norms.next_norm,
+                self._hc_norms.next_inject_weight,
             )
         )
         return hidden_states
@@ -1896,6 +1923,7 @@ class Qwen4ExpLinearDecoderLayer(
 class Qwen4ExpAttentionDecoderLayer(
     Qwen4ExpLayerExtensionMixin, Qwen3_5AttentionDecoderLayer
 ):
+
     def __init__(
         self,
         config: Qwen4ExpTextConfig,
@@ -2064,8 +2092,21 @@ class Qwen4ExpAttentionDecoderLayer(
                 hidden_states, positions, forward_batch
             )
 
+        if (
+            self.is_qsa
+            and gate is not None
+            and q.is_cuda
+            and q.shape[0] == 4
+            and forward_batch.forward_mode.is_target_verify()
+            and get_bool_env_var("SGLANG_Q38_ATTN_CORE_TP4", "False")
+            and get_bool_env_var("Q38_ATTN_GATE_V2", "False")
+        ):
+            attention_kwargs["numeric_output_gate"] = gate
         attn_output = self.attn(q, k, v, forward_batch, **attention_kwargs)
-        if gate is not None:
+        gate_applied = False
+        if isinstance(attn_output, tuple):
+            attn_output, gate_applied = attn_output
+        if gate is not None and not gate_applied:
             if attn_output.is_cuda:
                 # The strided 3D gate view feeds the kernel directly, so the
                 # gate reshape copy disappears along with the sigmoid + mul.
@@ -2206,6 +2247,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             )
         aux_hidden_states = AuxHiddenStateList()
         normalized_input = None
+        gate_partials = None
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             if i + 1 < self.end_layer:
@@ -2218,15 +2260,24 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                             batch=ple_batch, forward_batch=forward_batch
                         )
             next_norm = None
+            next_inject_weight = None
             if i + 1 < self.end_layer:
                 next_layer = self.layers[i + 1]
                 if next_layer.ple is None:
                     next_norm = next_layer.attn_hyper_connection.hc_norm
+                    next_inject_weight = (
+                        next_layer.attn_hyper_connection.block_inject_weight.weight
+                    )
             elif self.pp_group.is_last_rank:
                 next_norm = self.hyper_connection_mixer.hc_norm
             with (
                 get_global_expert_distribution_recorder().with_current_layer(i),
-                layer.hc_norms(normalized_input, next_norm) as norms,
+                layer.hc_norms(
+                    normalized_input,
+                    next_norm,
+                    gate_partials,
+                    next_inject_weight,
+                ) as norms,
             ):
                 hidden_states = layer(
                     positions=positions,
@@ -2241,6 +2292,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 )
 
             normalized_input = norms.output
+            gate_partials = norms.output_partials
 
         if breakable_ple:
             _breakable_commit_ple_batch(batch=ple_batch)
