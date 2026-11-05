@@ -284,6 +284,25 @@ class Envs:
     SGLANG_ENABLE_TORCH_INFERENCE_MODE = EnvBool(False)
     # Explicit child values override this default for megakernel runtime optimizations.
     SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION = EnvBool(False)
+    SGLANG_HC_MACRO = EnvBool(True)
+    SGLANG_HC_MACRO_MIN_ROWS = EnvInt(2)
+    SGLANG_QSA_NUMERIC_SCORE = EnvBool(False)
+    SGLANG_QSA_Q4_SCORE = EnvBool(False)
+    SGLANG_QSA_SCORER_V2 = EnvBool(True)
+    SGLANG_QSA_SCORER_V2_ROWS = EnvBool(False)
+    SGLANG_QSA_SCORER_V2_VER = EnvInt(7)
+    SGLANG_QSA_SCORER_V2_TARGET = EnvInt(4096)
+    SGLANG_QSA_SCORER_V2_C = EnvInt(None)
+    SGLANG_QSA_SCORER_V2_NT = EnvInt(1)
+    SGLANG_QSA_SCORER_V2_GUARD = EnvBool(False)
+    SGLANG_QSA_SCORER_V2_PEEL = EnvBool(False)
+    SGLANG_QSA_TOPK_THREADS = EnvInt(None)
+    SGLANG_QSA_TOPK_CLUSTER = EnvInt(None)
+    SGLANG_QSA_MK_SCORE = EnvBool(False)
+    SGLANG_QSA_MK_SCORE_SHORT32 = EnvBool(False)
+    SGLANG_QSA_GROUPED_SCORE = EnvBool(True)
+    SGLANG_QSA_SPLIT_TOPK = EnvBool(True)
+    SGLANG_HC_GATE_MAX_ROWS = EnvInt(1)
 
     # ===================================================================
     # Model configuration, discovery, and weight loading

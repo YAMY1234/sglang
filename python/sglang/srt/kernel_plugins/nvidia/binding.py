@@ -45,6 +45,7 @@ from sglang.srt.arg_groups.model_override_base import model_config_of, resolving
 from sglang.srt.environ import envs
 from sglang.srt.kernel_plugins.amd.binding import msa_serves
 from sglang.srt.kernel_plugins.nvidia.eagle_binding import EagleBinding
+from sglang.srt.kernel_plugins.nvidia.numeric_binding import collect_numeric_signatures
 from sglang.srt.mem_cache.layout.paged_view import paged_row_view
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.plugins import GENERAL_PLUGINS_GROUP
@@ -241,6 +242,7 @@ class PreparationView(msgspec.Struct, frozen=True):
     """Runtime resources offered to an optional pre-capture preparation hook."""
 
     hybrid: Optional[HybridPoolView] = None
+    numeric_signatures: tuple = ()
 
 
 class MlaStepView(msgspec.Struct, frozen=True):
@@ -347,6 +349,7 @@ class MegakernelBinding:
 
     def __init__(self, *, model: torch.nn.Module):
         self._model = model
+        self._numeric_spec = None
         self._cache_sources: dict[int, tuple] = {}
         self._sealed: dict[str, _SealedSource] = {}
         self._preparation: Optional[PreparationView] = None
@@ -362,7 +365,34 @@ class MegakernelBinding:
             return self._preparation
 
         hybrid = self._prepare_hybrid(model_runner)
-        self._preparation = PreparationView(hybrid=hybrid)
+        numeric_signatures = []
+        for producer in self._model.modules():
+            producer._numeric_capability_spec = self._numeric_spec
+            prepare_state = getattr(
+                producer, "numeric_state_preparation_signatures", None
+            )
+            if callable(prepare_state):
+                numeric_signatures.extend(prepare_state(model_runner))
+        prepare_numeric = tuple(
+            producer.numeric_preparation_signatures
+            for producer in self._model.modules()
+            if callable(getattr(producer, "numeric_preparation_signatures", None))
+        )
+        if prepare_numeric:
+            pool = getattr(model_runner, "token_to_kv_pool", None)
+            page_size = getattr(pool, "qsa_compressed_page_size", 0)
+            if not page_size:
+                page_size = getattr(
+                    getattr(pool, "full_kv_pool", None), "qsa_compressed_page_size", 0
+                )
+            context_len = getattr(
+                getattr(model_runner, "model_config", None), "context_len", 0
+            )
+            for prepare in prepare_numeric:
+                numeric_signatures.extend(prepare(context_len, page_size))
+        self._preparation = PreparationView(
+            hybrid=hybrid, numeric_signatures=tuple(dict.fromkeys(numeric_signatures))
+        )
         return self._preparation
 
     def forward_view(self, forward_batch: Optional[ForwardBatch] = None) -> ForwardView:
@@ -1201,11 +1231,23 @@ def install_megakernel(
 
     tokens = _tokens_per_request()
     binding = _binding_class(hf_config.architectures)(model=model)
+    binding._numeric_spec = spec
+    numeric_signatures = (
+        collect_numeric_signatures(
+            tuple(model.modules()),
+            tuple(range(1, spec.numeric_max_rows + 1)),
+            tokens,
+            capability_spec=spec,
+        )
+        if spec.numeric_max_rows > 0
+        else ()
+    )
     context = BuildContext(
         widths=tuple(range(tokens, spec.max_rows + 1, tokens)),
         tokens_per_request=tokens,
         deadline_s=deadline_s(get_device().watchdog_timeout),
         binding=binding,
+        numeric_signatures=numeric_signatures,
     )
     start, free_before = time.perf_counter(), torch.cuda.mem_get_info()[0]
     built = spec.build(model, hf_config, context)
@@ -1356,10 +1398,18 @@ def megakernel_graph_variants(
         "NVIDIA megakernel: the %s graphs of batch sizes %s capture the attention "
         "variants %s",
         runner,
-        sorted(batch_sizes),
+        sorted(megakernel_variant_sizes(variants, batch_sizes)),
         list(variants.capture_labels),
     )
     return variants
+
+
+def megakernel_variant_sizes(
+    variants: Optional[AttentionGraphVariants], batch_sizes: Collection[int]
+) -> frozenset[int]:
+    """The sizes whose graphs capture every label, up to an optional size cap."""
+    limit = getattr(variants, "max_batch_size", None)
+    return frozenset(bs for bs in batch_sizes if limit is None or bs <= limit)
 
 
 def megakernel_verify_variants(
@@ -1373,7 +1423,9 @@ def megakernel_verify_variants(
         bs for bs in capture_bs if bs * tokens_per_request in built.widths
     )
     variants = megakernel_graph_variants(model, "target_verify", batch_sizes=sizes)
-    return (None, None) if variants is None else (variants, sizes)
+    if variants is None:
+        return None, None
+    return variants, megakernel_variant_sizes(variants, sizes)
 
 
 def _entries(built: BuiltMegakernel) -> Mapping[str, Optional[Callable]]:

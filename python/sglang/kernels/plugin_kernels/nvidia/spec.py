@@ -19,6 +19,11 @@ from typing import (
 import msgspec
 import torch
 
+from sglang.kernels.plugin_kernels.nvidia.numeric import (
+    NumericCapabilityQuery,
+    OperatorSignature,
+)
+
 if TYPE_CHECKING:
     from sglang.srt.kernel_plugins.nvidia.binding import PreparationView
 
@@ -95,6 +100,8 @@ class BuildContext(msgspec.Struct, frozen=True):
     deadline_s: float  # every cross-GPU wait's deadline, below --watchdog-timeout
     # SGLang's runtime state for this model (sglang.srt.kernel_plugins.nvidia.binding)
     binding: Any = None
+    # Finite declarations prepared by the framework, independent of covered forwards.
+    numeric_signatures: tuple[OperatorSignature, ...] = ()
 
 
 class Step(msgspec.Struct, frozen=True):
@@ -406,7 +413,9 @@ class BuiltMegakernel(Protocol):
     capture_mode.get_capture_attention_variant() during the capture, and replays the
     one select picks. select reads host state only, such as
     ForwardBatch.attention_kv_len_lower_bound, and picks alike on every rank. Other
-    runners and batch sizes capture as they would without these variants.
+    runners and batch sizes capture as they would without these variants. An
+    optional max_batch_size caps the sizes capturing every label; larger sizes
+    capture one graph, whose label select must choose uniformly on every rank.
 
     Every built object must define ``speculative_runtime_hooks``, with ``None``
     when it provides no factory. A target's factory receives SGLang's stock bundle
@@ -579,6 +588,10 @@ class MegakernelSpec(msgspec.Struct, frozen=True):
     tensor_verify_build: Optional[Callable[[Any, float], BuiltMegakernel]] = None
     # Pool preparation after allocation and before any forward or graph capture.
     prepare: Optional[Callable[[BuiltMegakernel, PreparationView], None]] = None
+    # A numeric-only provider may keep max_rows=0 and plan no whole forwards.
+    numeric_max_rows: int = 0
+    # Pure host-data admission before exact signatures are registered.
+    numeric_capability: Optional[Callable[[NumericCapabilityQuery], bool]] = None
 
 
 # HF architecture -> the "module:attribute" path of its spec
