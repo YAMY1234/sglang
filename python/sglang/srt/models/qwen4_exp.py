@@ -1923,6 +1923,58 @@ class Qwen4ExpLinearDecoderLayer(
 class Qwen4ExpAttentionDecoderLayer(
     Qwen4ExpLayerExtensionMixin, Qwen3_5AttentionDecoderLayer
 ):
+    def numeric_signatures(self, widths, tokens_per_request):
+        from sglang.kernels.plugin_kernels.nvidia.numeric import (
+            NumericOperation,
+            NumericSignature,
+            ScalarType,
+        )
+
+        if not self.is_qsa:
+            return ()
+        signatures = []
+        if get_bool_env_var("SGLANG_Q38_ATTN_CORE_TP4", "False"):
+            signatures.extend(
+                NumericSignature(
+                    NumericOperation.DIRECT_POOL_ATTENTION,
+                    rows,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    self.indexer.block_topk,
+                    self.indexer.compress_ratio,
+                    ScalarType.BF16,
+                )
+                for rows in widths
+                if rows > 0
+            )
+        from sglang.srt.kernel_plugins.nvidia.pool_attention import pool_signatures
+
+        signatures.extend(
+            pool_signatures(
+                widths,
+                tp_size=get_parallel().tp_size,
+                query_heads=self.num_heads,
+                kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+                selected_count=self.indexer.block_topk,
+                compress_ratio=self.indexer.compress_ratio,
+                spec=getattr(self, "_numeric_capability_spec", None),
+            )
+        )
+        from sglang.srt.kernel_plugins.nvidia.numeric_binding import (
+            signature_capability_supported,
+        )
+
+        return tuple(
+            s
+            for s in signatures
+            if signature_capability_supported(
+                s,
+                spec=getattr(self, "_numeric_capability_spec", None),
+                tp_size=get_parallel().tp_size,
+            )
+        )
 
     def __init__(
         self,

@@ -105,6 +105,15 @@ class AttentionBackend(ABC):
     those must migrate to ``init_forward_metadata_out_graph(fb, in_capture)``.
     """
 
+    def sparse_decode_kernel(self):
+        """Optional paged sparse-decode entry used after framework KV preparation."""
+        return None
+
+    @property
+    def sparse_decode_page_size(self):
+        """Packed sparse-decode page width, or None for another backend protocol."""
+        return None
+
     # Resolved per-mode backend names, stamped by ModelRunner.init_attention_backend
     prefill_attention_backend_str: Optional[str] = None
     decode_attention_backend_str: Optional[str] = None

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import math
 from typing import Optional, Tuple
 
 import torch
 
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.qsa.kernel import (
     average_pool_qsa_keys,
     expand_qsa_block_indices,
@@ -34,6 +36,9 @@ from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
+from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import is_sm100_supported
 
 # Cap on the fp32 [query_rows, compressed_keys] prefill logits workspace;
 # top-k is per row, so tiling rows does not change the selection.
@@ -92,6 +97,390 @@ class QSAIndexer(MultiPlatformOp):
             self.index_head_dim, eps=getattr(config, "rms_norm_eps", 1e-6)
         )
         self._rope_axis_map_cache = None
+
+    def numeric_signatures(self, widths, tokens_per_request):
+        self._numeric_split_select_widths = tuple(
+            rows for rows in widths if type(rows) is int and rows > 0
+        )
+        self._numeric_mtp_tokens_per_request = tokens_per_request
+        self._numeric_mtp_deferred_widths = tuple(
+            rows for rows in widths if type(rows) is int and rows > 0
+        )
+        self._numeric_mtp_capture_widths = self._numeric_mtp_deferred_widths
+        return ()
+
+    def numeric_state_preparation_signatures(self, model_runner):
+        from sglang.srt.kernel_plugins.nvidia.mtp_capture_seed import prepare
+        from sglang.srt.kernel_plugins.nvidia.mtp_deferred_kv import (
+            prepare as prepare_kv,
+        )
+
+        return prepare(self, model_runner) + prepare_kv(self, model_runner)
+
+    def numeric_preparation_signatures(self, context_len: int, page_size: int):
+        """Describe actual scorer/select geometry; provider admission is separate."""
+        self._numeric_score_capacity = 0
+        self._numeric_page_size = page_size
+        self._numeric_prepared_sparse = frozenset()
+        widths = getattr(self, "_numeric_split_select_widths", ())
+        if not (
+            (
+                envs.SGLANG_QSA_MK_SCORE.get()
+                or envs.SGLANG_QSA_NUMERIC_SCORE.get()
+                or envs.SGLANG_QSA_SPLIT_TOPK.get()
+            )
+            and type(context_len) is int
+            and context_len > 0
+            and type(page_size) is int
+            and page_size > 0
+            and self.index_n_heads > 0
+            and self.index_kv_heads > 0
+            and self.index_head_dim > 0
+            and self.compress_ratio > 0
+        ):
+            return ()
+        from sglang.kernels.plugin_kernels.nvidia.numeric import (
+            NumericOperation,
+            NumericSignature,
+            ScalarType,
+        )
+        from sglang.srt.kernel_plugins.nvidia.numeric_binding import (
+            signature_capability_supported,
+        )
+
+        blocks = (context_len + self.compress_ratio - 1) // self.compress_ratio
+        capacity = ((blocks + page_size - 1) // page_size) * page_size
+        query_heads = ((self.index_n_heads + 7) // 8) * 8
+        context = dict(
+            tp_size=get_parallel().tp_size,
+            sm100_supported=int(is_sm100_supported()),
+            page_size=page_size,
+            unpadded_query_heads=self.index_n_heads,
+        )
+
+        def admitted(operation, rows, scalar_type, variant):
+            signature = NumericSignature(
+                operation,
+                rows,
+                query_heads,
+                self.index_kv_heads,
+                self.index_head_dim,
+                self.block_topk,
+                self.compress_ratio,
+                scalar_type,
+                context_bound=capacity,
+                variant=variant,
+            )
+            return (
+                signature
+                if signature_capability_supported(
+                    signature,
+                    spec=getattr(self, "_numeric_capability_spec", None),
+                    **context,
+                )
+                else None
+            )
+
+        signatures = []
+        split_select = self._split_select_source_enabled()
+        for rows in widths:
+            if envs.SGLANG_QSA_MK_SCORE.get():
+                for operation, scalar_type, variant in (
+                    (
+                        NumericOperation.SPARSE_SCORE,
+                        ScalarType.BF16,
+                        3 if envs.SGLANG_QSA_MK_SCORE_SHORT32.get() else 0,
+                    ),
+                    (NumericOperation.SPARSE_SELECT, ScalarType.FP32, 0),
+                ):
+                    if (
+                        signature := admitted(operation, rows, scalar_type, variant)
+                    ) is not None:
+                        signatures.append(signature)
+            if envs.SGLANG_QSA_NUMERIC_SCORE.get():
+                if self._split_score_preset(rows, capacity):
+                    if (
+                        signature := admitted(
+                            NumericOperation.SPARSE_SELECT, rows, ScalarType.FP32, 1
+                        )
+                    ) is not None:
+                        signatures.append(signature)
+                    for group_rows, variant in ((1, 5), (4, 4)):
+                        if self._native_score_preset(rows, group_rows):
+                            if (
+                                signature := admitted(
+                                    NumericOperation.SPARSE_SCORE,
+                                    rows,
+                                    ScalarType.BF16,
+                                    variant,
+                                )
+                            ) is not None:
+                                signatures.append(signature)
+            if split_select:
+                if (
+                    signature := admitted(
+                        NumericOperation.SPARSE_SELECT, rows, ScalarType.FP32, 1
+                    )
+                ) is not None:
+                    signatures.append(signature)
+        declared = tuple(dict.fromkeys(signatures))
+        if declared:
+            self._numeric_score_capacity = capacity
+            self._numeric_prepared_sparse = frozenset(declared)
+        return declared
+
+    @staticmethod
+    def _split_select_source_enabled():
+        return (
+            envs.SGLANG_QSA_SPLIT_TOPK.get()
+            and get_parallel().tp_size == 1
+            and is_sm100_supported()
+            and envs.SGLANG_QSA_TOPK_THREADS.get() in (None, 1024)
+            and envs.SGLANG_QSA_TOPK_CLUSTER.get() is None
+        )
+
+    def _numeric_split_select(self, scores, lengths):
+        from sglang.kernels.plugin_kernels.nvidia.numeric import (
+            NumericOperation,
+            NumericSignature,
+            ScalarType,
+            SparseSelectIO,
+        )
+        from sglang.srt.kernel_plugins.nvidia.numeric_binding import numeric_operator
+
+        if not (
+            scores.ndim == 2
+            and scores.is_cuda
+            and scores.dtype == torch.float32
+            and scores.shape[0] in getattr(self, "_numeric_split_select_widths", ())
+            and scores.shape[1] > 0
+            and scores.shape[1] == getattr(self, "_numeric_score_capacity", 0)
+            and scores.is_contiguous()
+            and lengths.shape == (scores.shape[0],)
+            and lengths.dtype in (torch.int32, torch.int64)
+            and lengths.device == scores.device
+            and lengths.is_contiguous()
+            and self._split_select_source_enabled()
+        ):
+            return None
+        rows, capacity = scores.shape
+        signature = NumericSignature(
+            NumericOperation.SPARSE_SELECT,
+            rows,
+            ((self.index_n_heads + 7) // 8) * 8,
+            self.index_kv_heads,
+            self.index_head_dim,
+            self.block_topk,
+            self.compress_ratio,
+            ScalarType.FP32,
+            context_bound=capacity,
+            variant=1,
+        )
+        if signature not in getattr(self, "_numeric_prepared_sparse", ()):
+            return None
+        run = numeric_operator(signature, prepared=True)
+        if run is None:
+            return None
+        output = torch.empty(
+            (rows, self.block_topk), dtype=torch.int32, device=scores.device
+        )
+        run(
+            SparseSelectIO(
+                scores,
+                lengths.to(torch.int32),
+                self.block_topk,
+                output,
+                None,
+                torch.empty(0, dtype=torch.uint8, device=scores.device),
+            )
+        )
+        return output
+
+    @staticmethod
+    def _split_score_preset(rows, capacity):
+        # With the source's default 1024 threads and adaptive 1..16 cluster,
+        # every admitted width fits <=8 float4 iterations. Overrides stay stock.
+        return (
+            rows > 0
+            and capacity > 0
+            and envs.SGLANG_QSA_SPLIT_TOPK.get()
+            and envs.SGLANG_QSA_TOPK_THREADS.get() is None
+            and envs.SGLANG_QSA_TOPK_CLUSTER.get() is None
+        )
+
+    @staticmethod
+    def _native_score_preset(rows, group_rows):
+        if group_rows == 1:
+            return not (
+                envs.SGLANG_QSA_SCORER_V2.get() and envs.SGLANG_QSA_SCORER_V2_ROWS.get()
+            )
+        return (
+            group_rows == 4
+            and rows > 0
+            and rows % 4 == 0
+            and envs.SGLANG_QSA_SCORER_V2.get()
+            and envs.SGLANG_QSA_SCORER_V2_VER.get() == 7
+            and envs.SGLANG_QSA_SCORER_V2_TARGET.get() == 4096
+            and envs.SGLANG_QSA_SCORER_V2_C.get() is None
+            and envs.SGLANG_QSA_SCORER_V2_NT.get() == 1
+            and not envs.SGLANG_QSA_SCORER_V2_GUARD.get()
+            and not envs.SGLANG_QSA_SCORER_V2_PEEL.get()
+        )
+
+    def _score_requests(self, q, cache, metadata, forward_batch, target, draft):
+        # Preserve the source's single-request graph-only M4 entry policy.
+        if (
+            (envs.SGLANG_QSA_MK_SCORE.get() or envs.SGLANG_QSA_Q4_SCORE.get())
+            and (target or draft)
+            and (
+                draft
+                or get_parallel().tp_size != 1
+                or not envs.SGLANG_QSA_GROUPED_SCORE.get()
+            )
+            and metadata.is_cuda_graph
+            and q.is_cuda
+            and is_sm100_supported()
+            and q.ndim == 3
+            and q.shape[1:]
+            == (((self.index_n_heads + 7) // 8) * 8, self.index_head_dim)
+            and q.dtype == torch.bfloat16
+            and cache.dtype == torch.bfloat16
+            and cache.shape[1:3]
+            == (
+                getattr(self, "_numeric_page_size", cache.shape[1]),
+                self.index_kv_heads,
+            )
+            and q.shape[0]
+            in {
+                sig.rows
+                for sig in getattr(self, "_numeric_prepared_sparse", ())
+                if sig.operation.name == "SPARSE_SCORE" and sig.variant in (0, 3)
+            }
+            and forward_batch.req_pool_indices.numel() == 1
+            and metadata.req_pool_indices is not None
+            and metadata.req_pool_indices.numel() == q.shape[0]
+        ):
+            return metadata.req_pool_indices
+        return None
+
+    def _numeric_score_select(
+        self, q, cache, table, lengths, capacity, requests, rows_per_group=1
+    ):
+        from sglang.kernels.plugin_kernels.nvidia.numeric import (
+            NumericOperation,
+            NumericSignature,
+            ScalarType,
+            SparseScoreIO,
+            SparseSelectIO,
+        )
+        from sglang.srt.kernel_plugins.nvidia.numeric_binding import numeric_operator
+
+        rows = q.shape[0]
+        query_heads = ((self.index_n_heads + 7) // 8) * 8
+        if not (
+            (envs.SGLANG_QSA_MK_SCORE.get() or envs.SGLANG_QSA_NUMERIC_SCORE.get())
+            and q.is_cuda
+            and is_sm100_supported()
+            and not is_batch_invariant_mode_enabled()
+            and q.shape == (rows, query_heads, self.index_head_dim)
+            and q.dtype == torch.bfloat16
+            and cache.ndim == 4
+            and cache.shape[1:]
+            == (
+                getattr(self, "_numeric_page_size", cache.shape[1]),
+                self.index_kv_heads,
+                self.index_head_dim,
+            )
+            and cache.dtype == torch.bfloat16
+            and table.shape == (rows, (capacity + cache.shape[1] - 1) // cache.shape[1])
+            and table.dtype in (torch.int32, torch.int64)
+            and lengths.shape == (rows,)
+            and lengths.dtype in (torch.int32, torch.int64)
+            and q.device == cache.device == table.device == lengths.device
+            and capacity == getattr(self, "_numeric_score_capacity", 0)
+            and capacity > 0
+        ):
+            return None
+        tp1 = get_parallel().tp_size == 1
+        split = tp1 and self._split_score_preset(rows, capacity)
+        if split and not envs.SGLANG_QSA_NUMERIC_SCORE.get():
+            return None
+        # A nondefault split policy may still take precedence in the source.
+        if tp1 and envs.SGLANG_QSA_SPLIT_TOPK.get() and not split:
+            return None
+        if requests is not None:
+            if not (
+                envs.SGLANG_QSA_MK_SCORE.get()
+                and requests.shape == (rows,)
+                and requests.dtype in (torch.int32, torch.int64)
+                and requests.device == q.device
+            ):
+                return None  # unsupported non-MK Q4/N16 route is not per-row
+            score_variant = 3 if envs.SGLANG_QSA_MK_SCORE_SHORT32.get() else 0
+        else:
+            if not envs.SGLANG_QSA_NUMERIC_SCORE.get() or not split:
+                return None
+            if not self._native_score_preset(rows, rows_per_group):
+                return None
+            score_variant = 4 if rows_per_group == 4 else 5
+        if not split and requests is None:
+            return None
+        score_sig = NumericSignature(
+            NumericOperation.SPARSE_SCORE,
+            rows,
+            query_heads,
+            self.index_kv_heads,
+            self.index_head_dim,
+            self.block_topk,
+            self.compress_ratio,
+            ScalarType.BF16,
+            context_bound=capacity,
+            variant=score_variant,
+        )
+        select_sig = NumericSignature(
+            NumericOperation.SPARSE_SELECT,
+            rows,
+            query_heads,
+            self.index_kv_heads,
+            self.index_head_dim,
+            self.block_topk,
+            self.compress_ratio,
+            ScalarType.FP32,
+            context_bound=capacity,
+            variant=1 if split else 0,
+        )
+        declared = getattr(self, "_numeric_prepared_sparse", ())
+        if score_sig not in declared or select_sig not in declared:
+            return None
+        score = numeric_operator(score_sig, prepared=True)
+        select = numeric_operator(select_sig, prepared=True)
+        if score is None or select is None:
+            return None
+        table = table.to(torch.int32).contiguous()
+        lengths = lengths.to(torch.int32).contiguous()
+        requests = requests.contiguous() if requests is not None else None
+        scores = torch.empty((rows, capacity), dtype=torch.float32, device=q.device)
+        indices = torch.empty(
+            (rows, self.block_topk), dtype=torch.int32, device=q.device
+        )
+        scratch = torch.empty(0, dtype=torch.uint8, device=q.device)
+        score(
+            SparseScoreIO(
+                q.contiguous(),
+                cache.contiguous(),
+                table,
+                lengths,
+                requests,
+                None,
+                cache.shape[1],
+                self.compress_ratio,
+                math.sqrt(self.index_head_dim),
+                scores,
+                scratch,
+            )
+        )
+        select(SparseSelectIO(scores, lengths, self.block_topk, indices, None, scratch))
+        return indices
 
     @staticmethod
     def _validate_config(config) -> None:
@@ -527,7 +916,41 @@ class QSAIndexer(MultiPlatformOp):
         query_positions: torch.Tensor,
         sequence_lengths: torch.Tensor,
         defer_expansion: bool = False,
+        score_q4_requests: torch.Tensor | None = None,
+        rows_per_group: int = 1,
     ) -> torch.Tensor:
+        if not (
+            rows_per_group > 1
+            and get_parallel().tp_size == 1
+            and is_sm100_supported()
+            and q.shape[0] % rows_per_group == 0
+            and 1 <= q.shape[0] // rows_per_group <= 16
+            and envs.SGLANG_QSA_GROUPED_SCORE.get()
+        ):
+            rows_per_group = 1
+        selected = (
+            self._numeric_score_select(
+                q,
+                compressed_cache,
+                compressed_page_table,
+                compressed_lengths,
+                max_model_len,
+                score_q4_requests,
+                rows_per_group,
+            )
+            if (score_q4_requests is not None or envs.SGLANG_QSA_NUMERIC_SCORE.get())
+            else None
+        )
+        if selected is not None:
+            if defer_expansion:
+                return selected
+            return expand_qsa_block_indices(
+                selected,
+                query_positions,
+                sequence_lengths,
+                compress_ratio=self.compress_ratio,
+                token_topk=self.token_topk,
+            )
         # fast_topk (k = 512) writes 0..length-1 for rows that fit k without reading
         # their scores, and never reads past a row's length.
         use_fast_topk = (
@@ -548,12 +971,14 @@ class QSAIndexer(MultiPlatformOp):
             # skip the generic zero-fill + subtract.
             from sglang.kernels.ops.attention.fast_topk import fast_topk
 
-            block_indices = fast_topk(
-                logits,
-                compressed_lengths.to(torch.int32),
-                topk=self.block_topk,
-                row_starts=None,
-            )
+            block_indices = self._numeric_split_select(logits, compressed_lengths)
+            if block_indices is None:
+                block_indices = fast_topk(
+                    logits,
+                    compressed_lengths.to(torch.int32),
+                    topk=self.block_topk,
+                    row_starts=None,
+                )
         else:
             row_starts = torch.zeros_like(compressed_lengths, dtype=torch.int32)
             block_indices = qsa_fast_topk(
@@ -755,6 +1180,15 @@ class QSAIndexer(MultiPlatformOp):
             compressed_cache, page_table, compressed_lengths, max_model_len = (
                 indexer_metadata.get_decode_mqa_inputs(self.layer_id)
             )
+            rows_per_group = 1
+            if (
+                envs.SGLANG_QSA_NUMERIC_SCORE.get()
+                and is_target_verify
+                and get_parallel().tp_size == 1
+            ):
+                width = int(getattr(forward_batch.spec_info, "draft_token_num", 1) or 1)
+                if width > 1 and num_valid_tokens % width == 0:
+                    rows_per_group = width
             return self.select_decode_tokens(
                 q,
                 compressed_cache,
@@ -764,6 +1198,17 @@ class QSAIndexer(MultiPlatformOp):
                 logical_positions,
                 indexer_metadata.get_seqlens_int32(),
                 defer_expansion=q.is_cuda and indexer_metadata.defer_block_expansion,
+                score_q4_requests=self._score_requests(
+                    q,
+                    compressed_cache,
+                    indexer_metadata,
+                    forward_batch,
+                    is_target_verify,
+                    is_draft_extend,
+                )
+                if (envs.SGLANG_QSA_MK_SCORE.get() or envs.SGLANG_QSA_Q4_SCORE.get())
+                else None,
+                rows_per_group=rows_per_group,
             )
 
         compressed_keys, row_starts, row_ends, sequence_lengths = (

@@ -1,0 +1,523 @@
+"""Installed TP1 producer tests; CPU tensors and explicit CUDA/provider doubles."""
+
+from contextlib import ExitStack
+from types import SimpleNamespace as NS
+from unittest.mock import patch
+
+import pytest
+import torch
+
+from sglang.kernels.plugin_kernels.nvidia import numeric as api
+from sglang.srt.environ import envs
+from sglang.srt.kernel_plugins.nvidia import binding, numeric_binding
+from sglang.srt.kernel_plugins.nvidia import pool_attention as policy
+from sglang.srt.layers.attention import qwen_sparse_attn_backend as backend
+from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.models import qwen4_exp as model
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
+
+
+class DeviceMetadata(torch.Tensor):
+    @property
+    def is_cuda(self):
+        return True
+
+
+@pytest.fixture(autouse=True)
+def runtime(monkeypatch):
+    monkeypatch.delenv("SGLANG_QSA_POOL_DECODE", raising=False)
+    monkeypatch.delenv("Q38_ATTN_CORE_V1", raising=False)
+    monkeypatch.delenv("SGLANG_Q38_ATTN_CORE_TP4", raising=False)
+    policy.pool_decode_enabled.cache_clear()
+    policy.pool_device_sms.cache_clear()
+    with ExitStack() as stack:
+        stack.enter_context(
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True)
+        )
+        stack.enter_context(
+            patch.object(model, "get_parallel", return_value=NS(tp_size=1))
+        )
+        stack.enter_context(
+            patch.object(backend, "is_sm100_supported", return_value=True)
+        )
+        stack.enter_context(
+            patch.object(binding, "megakernel_enabled", return_value=True)
+        )
+        stack.enter_context(
+            patch.object(
+                policy.torch.cuda, "is_current_stream_capturing", return_value=False
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                policy.torch.cuda,
+                "get_device_properties",
+                return_value=NS(multi_processor_count=148),
+            )
+        )
+        yield
+    policy.pool_decode_enabled.cache_clear()
+    policy.pool_device_sms.cache_clear()
+
+
+def attention():
+    obj = object.__new__(model.Qwen4ExpAttentionDecoderLayer)
+    torch.nn.Module.__init__(obj)
+    from capability_fixtures import contract_spec
+
+    obj._numeric_capability_spec = contract_spec()
+    obj.is_qsa = True
+    obj.num_heads, obj.num_kv_heads, obj.head_dim = 24, 2, 256
+    obj.rotary_emb = NS(rotary_dim=64)
+    obj.indexer = NS(block_topk=512, compress_ratio=4)
+    return obj
+
+
+def state(rows=32, width=4):
+    obj = object.__new__(backend.QwenSparseAttnBackend)
+    obj._fused_kv_pool_eligible = True
+    obj.compress_ratio = 4
+    obj.qsa_profile = NS(block_topk=512)
+    q = torch.zeros((rows, 24, 256), dtype=torch.bfloat16).as_subclass(DeviceMetadata)
+    packed = torch.zeros((rows, 4, 256), dtype=torch.bfloat16)
+    k, v = packed[:, :2], packed[:, 2:]
+    kp = torch.zeros((max(128, rows + 1), 2, 256), dtype=torch.bfloat16)
+    vp = torch.zeros_like(kp)
+    indices = torch.zeros((rows, 512), dtype=torch.int64)
+    loc = torch.arange(rows, dtype=torch.int64)
+    requests = torch.arange(rows // width, dtype=torch.int64)
+    row_requests = requests.repeat_interleave(width)
+    lengths = torch.full((rows,), 4097, dtype=torch.int32)
+    positions = torch.arange(rows, dtype=torch.int64)
+    slots = torch.zeros((max(1, rows // width), 8192), dtype=torch.int64)
+    obj.req_to_token_pool = NS(req_to_token=slots)
+    obj.token_to_kv_pool = NS(
+        layer_router=NS(read=lambda layer_id: NS(key=lambda: kp, value=lambda: vp))
+    )
+    metadata = NS(
+        indexer_metadata=NS(decode_logical_positions=positions),
+        row_req_pool_indices=row_requests,
+        sequence_lengths=lengths,
+        is_cuda_graph=True,
+    )
+    obj._resolve_metadata = lambda batch: metadata
+    mode = ForwardMode.TARGET_VERIFY if width == 4 else ForwardMode.DECODE
+    batch = NS(
+        forward_mode=mode,
+        spec_info=NS(draft_token_num=width, topk=1),
+        req_pool_indices=requests,
+        out_cache_loc=loc,
+    )
+    layer = NS(tp_q_head_num=24, head_dim=256, scaling=0.0625, layer_id=0)
+    args = [q, k, v, layer, batch, indices, kp, vp, loc, width, metadata]
+    return obj, args
+
+
+def install(rows, width, run):
+    registry = api.NumericRegistry()
+    signatures = numeric_binding.collect_numeric_signatures(
+        (attention(),), (rows,), width
+    )
+    signature = next(
+        s
+        for s in signatures
+        if s.operation == api.NumericOperation.DIRECT_POOL_ATTENTION
+        and s.variant == (1 if width == 4 else 2)
+    )
+    registry.register(api.NumericOffer(signature, run))
+    return patch.object(numeric_binding, "numeric_registry", registry), signature
+
+
+@pytest.mark.parametrize(
+    "width,expected", [(4, (4, 8, 32, 64)), (1, (1, 4, 8, 32, 64))]
+)
+def test_installed_startup_declares_only_finite_source_rows(width, expected):
+    declarations = numeric_binding.collect_numeric_signatures(
+        (attention(),), (0, 1, 4, 8, 32, 64, 65, 1024), width
+    )
+    selected = [
+        s
+        for s in declarations
+        if s.operation == api.NumericOperation.DIRECT_POOL_ATTENTION
+        and s.variant == (1 if width == 4 else 2)
+    ]
+    assert tuple(s.rows for s in selected) == expected
+    assert all(
+        (
+            s.query_heads,
+            s.kv_heads,
+            s.head_dim,
+            s.selected_count,
+            s.compress_ratio,
+            s.scalar_type,
+            s.rotary_dim,
+            s.context_bound,
+            s.variant,
+        )
+        == (24, 2, 256, 512, 4, 1, 0, 0, 1 if width == 4 else 2)
+        for s in selected
+    )
+
+
+@pytest.mark.parametrize("value", ["0", "false", " FALSE ", "no", "off", ""])
+def test_source_explicit_off_never_declares_or_queries(value, monkeypatch):
+    monkeypatch.setenv("SGLANG_QSA_POOL_DECODE", value)
+    obj, args = state()
+    assert not [
+        s
+        for s in attention().numeric_signatures((32,), 4)
+        if s.operation == api.NumericOperation.DIRECT_POOL_ATTENTION
+    ]
+    with patch.object(numeric_binding, "numeric_operator") as get:
+        assert obj._try_numeric_pool_attention(*args) is None
+        get.assert_not_called()
+
+
+@pytest.mark.parametrize("server_tokens", [1, 2, 3, 4, 8])
+def test_server_tokens_are_not_a_model_role_or_runtime_phase(server_tokens):
+    selected = [
+        s
+        for s in attention().numeric_signatures((1, 4, 7, 8, 32, 64, 65), server_tokens)
+        if s.operation == api.NumericOperation.DIRECT_POOL_ATTENTION
+    ]
+    assert {(s.rows, s.variant) for s in selected} == {
+        (1, 2),
+        (4, 2),
+        (4, 1),
+        (7, 2),
+        (8, 2),
+        (8, 1),
+        (32, 2),
+        (32, 1),
+        (64, 2),
+        (64, 1),
+    }
+
+
+@pytest.mark.parametrize(
+    "field,value", [("num_heads", 6), ("num_kv_heads", 1), ("head_dim", 128)]
+)
+def test_wrong_startup_geometry_not_published(field, value):
+    obj = attention()
+    setattr(obj, field, value)
+    assert not [
+        s
+        for s in obj.numeric_signatures((4, 32), 4)
+        if s.operation == api.NumericOperation.DIRECT_POOL_ATTENTION
+    ]
+
+
+@pytest.mark.parametrize(
+    "width,rows", [(4, 4), (4, 8), (4, 32), (4, 64), (1, 1), (1, 8), (1, 32), (1, 64)]
+)
+def test_startup_registry_facade_caller_buffer_and_original_metadata(width, rows):
+    obj, args = state(rows, width)
+    seen = []
+
+    def run(io):
+        seen.append(io)
+        io.output.fill_(7)
+
+    guard, sig = install(rows, width, run)
+    with guard:
+        output = obj._try_numeric_pool_attention(*args)
+    assert len(seen) == 1 and torch.equal(
+        output, torch.full((rows, 6144), 7, dtype=torch.bfloat16)
+    )
+    io = seen[0]
+    assert io.gate is None and io.query_width == width and io.store_new_kv
+    assert io.new_k is args[1] and io.new_v is args[2]
+    assert io.new_k.stride() == io.new_v.stride() == (1024, 256, 1)
+    assert io.selection.full_slot_map is obj.req_to_token_pool.req_to_token
+    assert io.selection.row_requests is args[-1].row_req_pool_indices
+    assert io.selection.sequence_lengths is args[-1].sequence_lengths
+    assert (
+        io.selection.query_positions
+        is args[-1].indexer_metadata.decode_logical_positions
+    )
+    assert io.out_cache_loc is args[8] and io.scale == args[3].scaling
+    assert (
+        io.selection.selected_indices.dtype == torch.int32
+        and io.selection.selected_indices.is_contiguous()
+    )
+    assert torch.equal(io.selection.selected_indices, args[5].int())
+    assert io.output.data_ptr() == output.data_ptr()
+    assert io.scratch_out.numel() == policy.pool_scratch_elements(
+        rows,
+        148,
+        kv_heads=2,
+        head_dim=256,
+        query_heads=24,
+        selected_count=512,
+        compress_ratio=4,
+    )
+    assert io.scratch_out.dtype == torch.float32 and io.scratch_out.is_contiguous()
+    assert io.kv.k is args[6] and io.kv.v is args[7] and io.kv.page_size == 1
+    assert sig.variant == (1 if width == 4 else 2)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "master",
+        "tp",
+        "arch",
+        "fullpool",
+        "positions",
+        "rowsmeta",
+        "slotmap",
+        "float_indices",
+        "kv_dtype",
+        "k_stride",
+        "q_stride",
+        "ratio",
+        "phase",
+    ],
+)
+def test_ineligible_never_queries_or_writes(case):
+    obj, args = state()
+    with ExitStack() as stack:
+        if case == "master":
+            stack.enter_context(
+                envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(False)
+            )
+        elif case == "arch":
+            stack.enter_context(
+                patch.object(backend, "is_sm100_supported", return_value=False)
+            )
+        elif case == "fullpool":
+            obj._fused_kv_pool_eligible = False
+        elif case == "positions":
+            args[-1].indexer_metadata.decode_logical_positions = None
+        elif case == "rowsmeta":
+            args[-1].row_req_pool_indices = torch.zeros(1, dtype=torch.int64)
+        elif case == "slotmap":
+            obj.req_to_token_pool.req_to_token = None
+        elif case == "float_indices":
+            args[5] = args[5].float()
+        elif case == "kv_dtype":
+            args[6] = args[6].float()
+        elif case == "k_stride":
+            args[1] = args[1].transpose(1, 2)
+        elif case == "q_stride":
+            args[0] = args[0].transpose(1, 2)
+        elif case == "ratio":
+            obj.compress_ratio = 8
+        elif case == "phase":
+            args[4].forward_mode = ForwardMode.EXTEND
+        if case in ("tp", "ratio"):
+            source = attention()
+            if case == "ratio":
+                source.indexer.compress_ratio = 8
+            if case == "tp":
+                stack.enter_context(
+                    patch.object(model, "get_parallel", return_value=NS(tp_size=4))
+                )
+            assert source.numeric_signatures((32,), 4) == ()
+            with patch.object(
+                numeric_binding, "numeric_registry", api.NumericRegistry()
+            ):
+                assert obj._try_numeric_pool_attention(*args) is None
+        else:
+            with patch.object(numeric_binding, "numeric_operator") as lookup:
+                assert obj._try_numeric_pool_attention(*args) is None
+                lookup.assert_not_called()
+
+
+def test_no_offer_and_unprepared_exact_signature_do_not_write():
+    obj, args = state()
+    calls = []
+    guard, _ = install(4, 4, lambda io: calls.append(io))
+    with (
+        guard,
+        patch.object(
+            torch,
+            "empty",
+            side_effect=AssertionError("no caller allocation before an exact offer"),
+        ),
+    ):
+        assert obj._try_numeric_pool_attention(*args) is None
+    assert calls == []
+
+
+def test_prestore_and_real_row_map_fallback_preserve_identity():
+    # Source fallback is legal for decode, where requests already have one row.
+    obj, args = state(8, 1)
+    args[-1].row_req_pool_indices = None
+    seen = []
+    guard, _ = install(8, 1, lambda io: seen.append(io))
+    with guard:
+        obj._try_numeric_pool_attention(*args, kv_prestored=True)
+    assert seen[0].selection.row_requests is args[4].req_pool_indices
+    assert seen[0].store_new_kv is False
+
+
+def test_source_m4_tcgen_flag_does_not_veto_the_pool_offer(monkeypatch):
+    # The source TCGEN05 M4 core has no provider; its flag must not leave M4 stock.
+    monkeypatch.setenv("Q38_ATTN_CORE_V1", "1")
+    obj, args = state(4, 4)
+    for graph in (True, False):
+        args[-1].is_cuda_graph = graph
+        with patch.object(
+            numeric_binding, "numeric_operator", return_value=None
+        ) as lookup:
+            assert obj._try_numeric_pool_attention(*args) is None
+            lookup.assert_called_once()
+
+
+def test_failure_after_provider_write_propagates_without_stock_retry():
+    obj, args = state()
+    stock = []
+    obj._forward_trtllm_sparse = lambda *a, **kw: stock.append(True)
+
+    def run(io):
+        io.kv.k.fill_(1)
+        raise RuntimeError("after first KV write")
+
+    guard, _ = install(32, 4, run)
+    with (
+        guard,
+        patch.object(backend, "_resolve_trtllm_sparse_decode", return_value=object()),
+    ):
+        with pytest.raises(RuntimeError, match="after first KV write"):
+            obj._try_fused_kv_attention(*args[:6])
+    assert stock == [] and torch.all(args[6] == 1)
+
+
+def test_backend_complete_dispatch_preserves_external_gate_and_stock_fallback():
+    obj, args = state()
+    seen = []
+    stock = []
+    obj._forward_trtllm_sparse = lambda *a, **kw: stock.append((a, kw)) or "stock"
+    gate = torch.zeros_like(args[0])
+    guard, _ = install(32, 4, lambda io: seen.append(io))
+    with (
+        guard,
+        patch.object(backend, "_resolve_trtllm_sparse_decode", return_value=object()),
+    ):
+        result, gate_applied = obj._try_fused_kv_attention(*args[:6], output_gate=gate)
+    assert (
+        result.shape == (32, 6144)
+        and gate_applied is False
+        and seen[0].gate is None
+        and stock == []
+    )
+    with (
+        patch.object(numeric_binding, "numeric_registry", api.NumericRegistry()),
+        patch.object(backend, "_resolve_trtllm_sparse_decode", return_value=object()),
+    ):
+        assert obj._try_fused_kv_attention(*args[:6]) == "stock"
+    assert len(stock) == 1
+
+
+def test_tp4_specialized_success_precedes_pool_and_fallback():
+    obj, args = state(4, 4)
+    chosen = object()
+    obj._try_numeric_direct_attention = lambda *a: chosen
+    obj._try_numeric_pool_attention = lambda *a, **kw: pytest.fail(
+        "pool must not precede specialized core"
+    )
+    with patch.object(backend, "_resolve_trtllm_sparse_decode", return_value=object()):
+        result, applied = obj._try_fused_kv_attention(
+            *args[:6], output_gate=torch.zeros_like(args[0])
+        )
+    assert result is chosen and applied is True
+
+
+@pytest.mark.parametrize("rows", range(1, 65))
+def test_workspace_matches_original_source_choose_config(rows):
+    for sms in (1, 80, 132, 148, 256):
+        # Literal source arithmetic, replacing only triton.cdiv with integer cdiv.
+        cdiv = lambda a, b: (a + b - 1) // b
+        rh = rows * 2
+        bn = 32 if rh >= 32 else 64
+        waves = 3.0 if rh >= 32 else 1.0
+        splits = max(1, round(waves * sms / rh))
+        chunk = cdiv(cdiv(2051, splits), bn) * bn
+        splits = cdiv(2051, chunk)
+        assert policy.pool_scratch_elements(
+            rows,
+            sms,
+            kv_heads=2,
+            head_dim=256,
+            query_heads=24,
+            selected_count=512,
+            compress_ratio=4,
+        ) == rows * 2 * splits * 16 * (256 + 2)
+
+
+def test_sms_only_eager_read_and_capture_cache_hit_or_cold_refusal():
+    device = torch.device("cpu")
+    with patch.object(
+        torch.cuda, "get_device_properties", return_value=NS(multi_processor_count=148)
+    ) as read:
+        assert policy.pool_device_sms(device) == 148
+        with patch.object(torch.cuda, "is_current_stream_capturing", return_value=True):
+            assert policy.pool_device_sms(device) == 148
+            with pytest.raises(RuntimeError, match="before capture"):
+                policy.pool_device_sms(torch.device("cuda", 1))
+        assert read.call_count == 1
+
+
+@pytest.mark.parametrize("width", [2, 3])
+def test_actual_verify_width_two_or_three_retains_stock(width):
+    obj, args = state(12, 4)
+    args[4].spec_info.draft_token_num = width
+    args[4].req_pool_indices = torch.zeros(12 // width, dtype=torch.int64)
+    args[-2] = width
+    with patch.object(numeric_binding, "numeric_operator") as lookup:
+        assert obj._try_numeric_pool_attention(*args) is None
+        lookup.assert_not_called()
+
+
+@pytest.mark.parametrize("length", [499, 512, 513, 4096, 4097, 8192, 8193])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_lengths_positions_maps_are_original_uncompressed_metadata(length, dtype):
+    obj, args = state(8, 1)
+    meta = args[-1]
+    obj.req_to_token_pool.req_to_token = obj.req_to_token_pool.req_to_token.to(dtype)
+    meta.row_req_pool_indices = meta.row_req_pool_indices.to(dtype)
+    meta.sequence_lengths = torch.full((8,), length, dtype=dtype)
+    meta.indexer_metadata.decode_logical_positions = torch.full(
+        (8,), length - 1, dtype=dtype
+    )
+    seen = []
+    guard, _ = install(8, 1, seen.append)
+    with guard:
+        obj._try_numeric_pool_attention(*args)
+    assert seen[0].selection.sequence_lengths is meta.sequence_lengths
+    assert (
+        seen[0].selection.query_positions
+        is meta.indexer_metadata.decode_logical_positions
+    )
+    assert torch.equal(
+        seen[0].selection.sequence_lengths, torch.full((8,), length, dtype=dtype)
+    )
+
+
+def test_capture_storage_metadata_cache_miss_refuses_before_any_write():
+    obj, args = state()
+    guard, _ = install(32, 4, lambda io: pytest.fail("cold SM metadata must not run"))
+    with (
+        guard,
+        patch.object(torch.cuda, "is_current_stream_capturing", return_value=True),
+    ):
+        with pytest.raises(RuntimeError, match="before capture"):
+            obj._try_numeric_pool_attention(*args)
+
+
+def test_runtime_loader_and_master_gate_do_not_execute_an_offer():
+    obj, args = state()
+    calls = []
+    guard, _ = install(32, 4, calls.append)
+    with guard, patch.object(binding, "megakernel_enabled", return_value=False):
+        assert obj._try_numeric_pool_attention(*args) is None
+    assert calls == []
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__, "-v"]))
