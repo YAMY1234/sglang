@@ -15,6 +15,7 @@
 """Inference-only Qwen3.5 model and Qwen3.5 MoE model compatible with HuggingFace weights."""
 
 import logging
+import os
 from functools import lru_cache
 from typing import Iterable, Optional, Set, Tuple, Union
 
@@ -338,6 +339,296 @@ if _is_npu:
 
 
 class Qwen3_5GatedDeltaNet(nn.Module):
+    def numeric_signatures(self, widths, tokens_per_request):
+        # Pool dtype and optional ring storage do not exist at model build time.
+        self.attn._numeric_tokens_per_request = tokens_per_request
+        self._numeric_native_pdl_widths = (
+            tuple(
+                rows for rows in widths if rows > 0 and rows % tokens_per_request == 0
+            )
+            if tokens_per_request > 0 and os.environ.get("Q38_GDN_PDL") == "1"
+            else ()
+        )
+        from sglang.kernels.plugin_kernels.nvidia.numeric import (
+            GdnFrontVariant,
+            GdnSignature,
+            NumericOperation,
+            ScalarType,
+        )
+        from sglang.srt.kernel_plugins.nvidia.numeric_binding import (
+            signature_capability_supported,
+        )
+
+        override = os.environ.get("Q38_GDNPROJ_FRONT_STAGES")
+        try:
+            requested_stages = 0 if override is None else int(override)
+        except ValueError:
+            requested_stages = -1
+        facts = dict(
+            tp_size=self.attn_tp_size,
+            hidden_size=self.hidden_size,
+            wide_enabled=int(os.environ.get("SGLANG_Q38_MK_GDN_WIDE", "0") == "1"),
+            m32_norm_enabled=int(
+                os.environ.get("SGLANG_Q38_MK_GDN_M32_NORM", "0") == "1"
+            ),
+            projection_norm_available=int(self._numeric_gdn_norm_supported()),
+            m32_norm_available=int(self._numeric_gdn_m32_norm_supported()),
+            requested_front_stages=requested_stages,
+            front_stages_specified=int(override is not None),
+        )
+        spec = getattr(self, "_numeric_capability_spec", None)
+        signatures, standalone_norm = [], []
+
+        def admit(
+            operation,
+            rows,
+            variant=0,
+            gate_type=ScalarType.BF16,
+            normalization_program=0,
+        ):
+            signature = GdnSignature(
+                operation,
+                rows,
+                self.attn.num_k_heads,
+                self.attn.num_v_heads,
+                self.head_k_dim,
+                self.head_v_dim,
+                tokens_per_request,
+                ScalarType.BF16,
+                variant=variant,
+                gate_scalar_type=gate_type,
+            )
+            program = (
+                {"normalization_program": normalization_program}
+                if operation == NumericOperation.GDN_CORE
+                else {}
+            )
+            if signature_capability_supported(signature, spec=spec, **facts, **program):
+                signatures.append(signature)
+                if (
+                    operation == NumericOperation.GDN_CORE
+                    and normalization_program == 2
+                ):
+                    standalone_norm.append(signature)
+
+        for rows in widths:
+            if rows <= 0 or tokens_per_request <= 0 or rows % tokens_per_request:
+                continue
+            if get_bool_env_var("SGLANG_Q38_MK_GDN", "False"):
+                for gate_type in (ScalarType.BF16, ScalarType.FP32):
+                    admit(NumericOperation.GDN_CORE, rows, gate_type=gate_type)
+                admit(
+                    NumericOperation.GDN_CORE, rows, variant=1, normalization_program=1
+                )
+                admit(
+                    NumericOperation.GDN_CORE, rows, variant=1, normalization_program=2
+                )
+                # Enum variants describe launch configurations, not model names.
+                for variant in (
+                    GdnFrontVariant.MK_STAGES_6,
+                    GdnFrontVariant.MK_STAGES_12,
+                ):
+                    admit(
+                        NumericOperation.GDN_FRONT,
+                        rows,
+                        variant=variant,
+                        gate_type=ScalarType.FP32,
+                    )
+            if self._numeric_gdn_glue_layer_supported() and not _fp8_tuple_input(
+                self.out_proj, rows
+            ):
+                admit(NumericOperation.GDN_VERIFY_GLUE, rows)
+        self._numeric_gdn_signatures = frozenset(signatures)
+        self.attn._numeric_gdn_signatures = self._numeric_gdn_signatures
+        self._numeric_gdn_standalone_norm_signatures = frozenset(standalone_norm)
+        self.attn._numeric_gdn_standalone_norm_signatures = (
+            self._numeric_gdn_standalone_norm_signatures
+        )
+        return tuple(signatures)
+
+    def numeric_state_preparation_signatures(self, model_runner):
+        """Publish only actual post-pool native state, before graph warmup."""
+        self.attn._numeric_capability_spec = getattr(
+            self, "_numeric_capability_spec", None
+        )
+        self.attn._numeric_native_pdl_signatures = ()
+        widths = getattr(self, "_numeric_native_pdl_widths", ())
+        if not widths or os.environ.get("Q38_GDN_PDL") != "1":
+            return ()
+        backend = model_runner.attn_backend
+        backend = getattr(backend, "linear_attn_backend", backend)
+        prepare = getattr(backend, "numeric_native_pdl_signatures", None)
+        if prepare is None:
+            return ()
+        signatures = prepare(self.attn, widths)
+        self.attn._numeric_native_pdl_signatures = signatures
+        return signatures
+
+    def _numeric_gdn_glue_layer_supported(self):
+        return (
+            _is_cuda
+            and os.environ.get("SGLANG_GDN_FUSED_VERIFY_GLUE", "0") == "1"
+            and self._fused_in_proj_weight is not None
+            and self._fused_in_proj_weight.dtype == torch.bfloat16
+            and self.num_v_heads // self.num_k_heads in _GDN_FUSED_QKVZBA_RATIOS
+            and self.norm.group_size is None
+            and self.norm.norm_before_gate
+            and self.norm.bias is None
+            and self.norm.weight.dtype == torch.bfloat16
+            and self.norm.activation in ("silu", "swish", "sigmoid")
+        )
+
+    def _try_numeric_gdn_verify_glue(
+        self,
+        hidden_states,
+        forward_batch,
+        mixed_qkvz,
+        mixed_ba,
+    ):
+        if not isinstance(hidden_states, torch.Tensor):
+            return None
+        if not self._numeric_gdn_glue_layer_supported():
+            return None
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        backend = get_attn_backend()
+        backend = getattr(backend, "linear_attn_backend", backend)
+        if not self._numeric_gdn_glue_eligible(hidden_states, forward_batch, backend):
+            return None
+        run = getattr(backend, "forward_numeric_verify_glue", None)
+        if run is None:
+            return None
+        normalized = run(
+            layer=self.attn,
+            forward_batch=forward_batch,
+            mixed_qkvz=mixed_qkvz,
+            mixed_ba=mixed_ba,
+            norm_weight=self.norm.weight,
+            norm_eps=self.norm.eps,
+            norm_activation=self.norm.activation,
+        )
+        if normalized is None:
+            return None
+        return self.out_proj(normalized)[0]
+
+    def _numeric_gdn_norm_supported(self):
+        weight = self._fused_in_proj_weight
+        return (
+            _is_cuda
+            and os.environ.get("SGLANG_Q38_MK_GDN", "0") == "1"
+            and weight is not None
+            and weight.dtype == torch.bfloat16
+            and self.activation in ("silu", "swish")
+            and self.norm.activation == "sigmoid"
+            and self.norm.group_size is None
+            and self.norm.norm_before_gate
+            and self.norm.bias is None
+            and self.norm.weight.shape == (self.head_v_dim,)
+            and self.norm.weight.dtype == torch.bfloat16
+        )
+
+    def _numeric_gdn_m32_norm_supported(self):
+        return (
+            _is_cuda
+            and os.environ.get("SGLANG_Q38_MK_GDN", "0") == "1"
+            and os.environ.get("SGLANG_Q38_MK_GDN_M32_NORM", "0") == "1"
+            and self.norm.weight.shape == (self.head_v_dim,)
+            and self.norm.weight.dtype == torch.bfloat16
+            and self.norm.activation == "sigmoid"
+            and self.norm.group_size is None
+            and self.norm.norm_before_gate
+            and self.norm.bias is None
+        )
+
+    def _numeric_gdn_glue_eligible(self, hidden_states, forward_batch, backend):
+        if not (
+            _is_cuda
+            and os.environ.get("SGLANG_GDN_FUSED_VERIFY_GLUE", "0") == "1"
+            and forward_batch.forward_mode.is_target_verify()
+            and hidden_states.ndim == 2
+            and hidden_states.dtype == torch.bfloat16
+            and self._fused_in_proj_weight is not None
+            and self._fused_in_proj_weight.dtype == torch.bfloat16
+            and self.num_v_heads // self.num_k_heads in _GDN_FUSED_QKVZBA_RATIOS
+            and self.norm.group_size is None
+            and self.norm.norm_before_gate
+            and self.norm.bias is None
+        ):
+            return False
+        from sglang.kernels.plugin_kernels.nvidia.numeric import NumericOperation
+
+        declared = any(
+            s.operation == NumericOperation.GDN_VERIFY_GLUE
+            and s.rows == hidden_states.shape[0]
+            for s in getattr(self, "_numeric_gdn_signatures", ())
+        )
+        supported = getattr(backend, "numeric_verify_glue_supported", None)
+        return (
+            declared
+            and supported is not None
+            and not getattr(backend, "supports_packed_verify", False)
+            and not _fp8_tuple_input(self.out_proj, hidden_states.shape[0])
+            and supported(
+                self.attn,
+                forward_batch,
+                hidden_states.shape[0],
+                hidden_states.dtype,
+                self.norm.weight,
+                self.norm.activation,
+                source_enabled=True,
+            )
+        )
+
+    def _try_numeric_gdn_front(self, hidden_states, forward_batch):
+        if not self._numeric_gdn_norm_supported():
+            return None
+        if not isinstance(hidden_states, torch.Tensor) or hidden_states.ndim != 2:
+            return None
+        from sglang.kernels.plugin_kernels.nvidia.numeric import NumericOperation
+        from sglang.srt.kernel_plugins.nvidia.gdn import gdn_front_launch_config
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        backend = get_attn_backend()
+        backend = getattr(backend, "linear_attn_backend", backend)
+        if (
+            not forward_batch.forward_mode.is_target_verify()
+            or self._numeric_gdn_glue_eligible(hidden_states, forward_batch, backend)
+            or hidden_states.dtype != torch.bfloat16
+            or hidden_states.shape[1] != self.hidden_size
+        ):
+            return None
+        signature = next(
+            (
+                s
+                for s in getattr(self, "_numeric_gdn_signatures", ())
+                if s.operation == NumericOperation.GDN_FRONT
+                and s.rows == hidden_states.shape[0]
+            ),
+            None,
+        )
+        run = getattr(backend, "forward_numeric_inproj_conv", None)
+        if (
+            signature is None
+            or run is None
+            or hidden_states.shape[0]
+            != signature.tokens_per_request * forward_batch.batch_size
+        ):
+            return None
+        variant, config = signature.variant, gdn_front_launch_config(signature.variant)
+        normalized = run(
+            self.attn,
+            forward_batch,
+            hidden_states,
+            self._fused_in_proj_weight,
+            norm_weight=self.norm.weight,
+            norm_eps=self.norm.eps,
+            front_variant=variant,
+            front_launch=config,
+        )
+        if normalized is None:
+            return None
+        return self.out_proj(normalized.reshape(hidden_states.shape[0], -1))[0]
+
     def __init__(
         self,
         config: Qwen3_5TextConfig,
@@ -964,9 +1255,20 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         2. Core attention (custom op)
         3. Output projection
         """
+        numeric_output = self._try_numeric_gdn_front(hidden_states, forward_batch)
+        if numeric_output is not None:
+            return numeric_output
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
             hidden_states
         )
+        glue_output = self._try_numeric_gdn_verify_glue(
+            hidden_states,
+            forward_batch,
+            projected_states_qkvz,
+            projected_states_ba,
+        )
+        if glue_output is not None:
+            return glue_output
 
         use_strided_prefill_z = False
         packed_verify = False
@@ -1002,9 +1304,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 num_v_heads_tp = triton.cdiv(self.num_v_heads, self.attn_tp_size)
             # The strided views feed only prefill GDN; DP-relabeled decode rows
             # run the decode kernels, so pick the layout from the logical mode.
-            use_strided_prefill_z = (
-                _is_cuda
-                and forward_batch.logical_forward_mode.is_extend_without_speculative()
+            use_strided_prefill_z = _is_cuda and (
+                forward_batch.logical_forward_mode.is_extend_without_speculative()
+                or (
+                    os.environ.get("Q38_GDN_FRONT") == "1"
+                    and forward_batch.forward_mode.is_target_verify()
+                )
             )
             split_fn = (
                 qwen3_5_gdn_prefill_projection_views
@@ -1031,12 +1336,52 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
             mixed_qkv = torch.cat((query, key, value), dim=-1)
 
-        attn_result = self.attn(
-            forward_batch,
-            mixed_qkv=mixed_qkv,
-            a=a,
-            b=b,
-        )
+        from sglang.kernels.plugin_kernels.nvidia.numeric import NumericOperation
+
+        if (
+            isinstance(hidden_states, torch.Tensor)
+            and any(
+                s.operation == NumericOperation.GDN_CORE
+                and s.variant == 1
+                and s.rows == hidden_states.shape[0]
+                for s in getattr(self, "_numeric_gdn_standalone_norm_signatures", ())
+            )
+            and self._numeric_gdn_m32_norm_supported()
+            and forward_batch.forward_mode.is_target_verify()
+            and not use_fused_proj_conv
+            and z is not None
+            and hidden_states.dtype == z.dtype == torch.bfloat16
+        ):
+            from sglang.srt.model_executor.forward_context import get_attn_backend
+
+            # Target verify reaches this same backend through RadixLinearAttention.
+            # Conv runs once; only a successful normalized result skips outer norm.
+            attn_result = get_attn_backend().forward(
+                layer=self.attn,
+                forward_batch=forward_batch,
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+                q38_mk_z=z,
+                q38_mk_norm_weight=self.norm.weight,
+                q38_mk_norm_eps=self.norm.eps,
+                q38_m32_return_normalized=True,
+            )
+            if (
+                isinstance(attn_result, tuple)
+                and len(attn_result) == 2
+                and attn_result[1] is True
+            ):
+                return self.out_proj(
+                    attn_result[0].reshape(hidden_states.shape[0], -1)
+                )[0]
+        else:
+            attn_result = self.attn(
+                forward_batch,
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+            )
         if use_fused_proj_conv:
             if not isinstance(attn_result, tuple) or len(attn_result) != 2:
                 raise RuntimeError(

@@ -1,3 +1,4 @@
+import os
 from typing import Optional, Tuple, Union
 
 import msgspec
@@ -1351,12 +1352,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
             intermediate_conv_window_cache = (
                 mamba_cache_params.intermediate_conv_window[0]
             )
-            intermediate_state_indices = select_verify_intermediate_state_indices(
-                self.verify_intermediate_state_indices,
-                forward_batch.req_pool_indices,
-                cache_indices[: query_start_loc.shape[0] - 1] >= 0,
-                self.req_to_token_pool.size,
-            )
+            # PP-off selects the fixed table; do not evaluate its unused mask.
+            intermediate_state_indices = self.verify_intermediate_state_indices
+            if pp_spec_stable_rows_enabled():
+                intermediate_state_indices = select_verify_intermediate_state_indices(
+                    self.verify_intermediate_state_indices,
+                    forward_batch.req_pool_indices,
+                    cache_indices[: query_start_loc.shape[0] - 1] >= 0,
+                    self.req_to_token_pool.size,
+                )
             mamba_pool = self.state_pool
             use_replayssm_fold = (
                 mamba_cache_params.replayssm_rawv is not None
@@ -1494,6 +1498,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     replay_indices=forward_batch.req_pool_indices,
                     query_start_loc=query_start_loc,
                     draft_token_num=forward_batch.spec_info.draft_token_num,
+                    packed_qkv=mixed_qkv,
+                    norm_z=kwargs.get("q38_mk_z"),
+                    norm_weight=kwargs.get("q38_mk_norm_weight"),
+                    norm_eps=kwargs.get("q38_mk_norm_eps", 1e-6),
+                    return_normalized=kwargs.get("q38_m32_return_normalized", False),
+                    native_pdl_eligible=(
+                        self.mis_metadata is None
+                        and retrieve_next_token is None
+                        and retrieve_next_sibling is None
+                        and retrieve_parent_token is None
+                    ),
                 )
             else:
                 # The recurrent fallback needs the per-draft snapshots, which
@@ -1811,6 +1826,563 @@ class GDNAttnBackend(MambaAttnBackendBase):
             replayssm_beta=layer_cache.replayssm_beta,
         )
 
+    def numeric_verify_glue_supported(
+        self,
+        layer,
+        forward_batch,
+        tokens,
+        input_dtype,
+        norm_weight,
+        norm_activation,
+        source_enabled=False,
+    ):
+        """FN TP1 dispatch precheck; b1 retains its in-projection/Conv path."""
+        if not source_enabled:
+            return False
+        if not (
+            forward_batch.forward_mode.is_target_verify()
+            and forward_batch.logical_forward_mode.is_target_verify()
+        ):
+            return False
+        if self.mis_metadata is not None:
+            return False
+        metadata = self.forward_metadata
+        if (
+            metadata.retrieve_next_token is not None
+            or metadata.retrieve_next_sibling is not None
+            or metadata.retrieve_parent_token is not None
+        ):
+            # Tree verify (topk > 1): the conv walks parent links.
+            return False
+        mamba_pool = self.state_pool
+        if getattr(mamba_pool, "replayssm_is_kda", False) or getattr(
+            mamba_pool, "replayssm_spec_fold", False
+        ):
+            return False
+        if getattr(mamba_pool, "replayssm_cache_base", None) is None:
+            return False
+        layer_cache = self.state_layer_cache(layer.layer_id)
+        if not isinstance(layer_cache, MambaPool.SpeculativeState):
+            return False
+        if layer_cache.replayssm_d is None:
+            return False
+
+        H, K = layer.num_k_heads, layer.head_k_dim
+        HV, V = layer.num_v_heads, layer.head_v_dim
+        draft_token_num = forward_batch.spec_info.draft_token_num
+        conv_state = layer_cache.conv[0]
+        window = layer_cache.intermediate_conv_window[0]
+        qkv_dim = 2 * H * K + HV * V
+        if (
+            layer.num_q_heads != H
+            or layer.head_q_dim != K
+            or K != V
+            or HV % H != 0
+            or draft_token_num <= 0
+            or tokens % draft_token_num != 0
+            or input_dtype != torch.bfloat16
+            or conv_state.dtype != input_dtype
+            or window.dtype != input_dtype
+            or layer.activation not in ("silu", "swish")
+            or layer_cache.temporal.dtype != torch.bfloat16
+            or layer.bias is not None
+            or layer.conv_weights.dim() != 2
+            or layer.conv_weights.shape != (qkv_dim, 4)
+            or conv_state.dim() != 3
+            or conv_state.shape[1:] != (qkv_dim, 3)
+            or window.dim() != 4
+            or window.shape[1:] != (draft_token_num, qkv_dim, 3)
+            or norm_activation not in ("swish", "silu", "sigmoid")
+            or norm_weight.shape != (V,)
+        ):
+            return False
+
+        return True
+
+    def forward_numeric_verify_glue(
+        self,
+        *,
+        layer,
+        forward_batch,
+        mixed_qkvz,
+        mixed_ba,
+        norm_weight,
+        norm_eps,
+        norm_activation,
+    ):
+        """Source glue alternative; missing views/offers leave stock untouched."""
+        from sglang.kernels.plugin_kernels.nvidia.numeric import (
+            GdnActivation,
+            GdnLaunchConfig,
+            GdnRingIO,
+            GdnSignature,
+            GdnVerifyGlueIO,
+            NumericOperation,
+            ScalarType,
+        )
+        from sglang.srt.kernel_plugins.nvidia.numeric_binding import numeric_operator
+
+        if not self.numeric_verify_glue_supported(
+            layer,
+            forward_batch,
+            mixed_qkvz.shape[0],
+            mixed_qkvz.dtype,
+            norm_weight,
+            norm_activation,
+            source_enabled=os.environ.get("SGLANG_GDN_FUSED_VERIFY_GLUE", "0") == "1",
+        ):
+            return None
+        H, HV, K, V = (
+            layer.num_k_heads,
+            layer.num_v_heads,
+            layer.head_k_dim,
+            layer.head_v_dim,
+        )
+        rows = mixed_qkvz.shape[0]
+        channels = (2 * H + HV) * K
+        params = self.state_layer_cache(layer.layer_id)
+        pool, meta = self.state_pool, self.forward_metadata
+        conv_state, window = params.conv[0], params.intermediate_conv_window[0]
+        capacity = params.replayssm_d.shape[-2]
+        tokens = forward_batch.spec_info.draft_token_num
+        batch = rows // tokens
+        if not (
+            K == V
+            and mixed_qkvz.is_cuda
+            and mixed_qkvz.ndim == mixed_ba.ndim == 2
+            and mixed_qkvz.shape[1] >= channels + HV * V
+            and mixed_ba.shape[0] == rows
+            and mixed_ba.shape[1] >= 2 * HV
+            and mixed_qkvz.stride(-1) == mixed_ba.stride(-1) == 1
+            and mixed_qkvz.dtype == mixed_ba.dtype == torch.bfloat16
+            and norm_weight.dtype == torch.bfloat16
+            and norm_weight.is_contiguous()
+            and layer.conv_weights.dtype == torch.bfloat16
+            and layer.conv_weights.is_contiguous()
+            and params.temporal.ndim == 4
+            and params.temporal.shape[1:] == (HV, V, K)
+            and capacity > 0
+            and not capacity & (capacity - 1)
+            and meta.mamba_cache_indices.numel() >= batch
+            and forward_batch.req_pool_indices.numel() >= batch
+            and self.verify_intermediate_state_indices.numel() >= batch
+            and layer.A_log.shape == layer.dt_bias.shape == (HV,)
+            and layer.A_log.dtype == torch.float32
+            and layer.dt_bias.dtype in (torch.bfloat16, torch.float32)
+            and all(
+                t.device == mixed_qkvz.device
+                for t in (
+                    mixed_ba,
+                    conv_state,
+                    layer.conv_weights,
+                    window,
+                    norm_weight,
+                    layer.A_log,
+                    layer.dt_bias,
+                    params.temporal,
+                )
+            )
+        ):
+            return None
+        for tensor, tail in (
+            (params.replayssm_d, (HV, capacity, V)),
+            (params.replayssm_k, (H, capacity, K)),
+            (params.replayssm_g, (HV, capacity)),
+        ):
+            if (
+                tensor is None
+                or tensor.shape[1:] != tail
+                or not tensor.is_contiguous()
+                or tensor.device != mixed_qkvz.device
+            ):
+                return None
+        for tensor, tail in (
+            (params.replayssm_rawv, (HV, capacity, V)),
+            (params.replayssm_rawk, (H, capacity, K)),
+            (params.replayssm_beta, (HV, capacity)),
+        ):
+            if tensor is not None and (
+                tensor.shape[1:] != tail
+                or not tensor.is_contiguous()
+                or tensor.device != mixed_qkvz.device
+            ):
+                return None
+        for tensor, dtypes in (
+            (meta.mamba_cache_indices, (torch.int32, torch.int64)),
+            (self.verify_intermediate_state_indices, (torch.int32, torch.int64)),
+            (forward_batch.req_pool_indices, (torch.int32, torch.int64)),
+            (pool.replayssm_spec_write_pos, (torch.int32,)),
+            (pool.replayssm_cache_base, (torch.int32,)),
+            (pool.replayssm_is_flush, (torch.int8,)),
+        ):
+            if (
+                tensor is None
+                or tensor.ndim != 1
+                or not tensor.is_contiguous()
+                or tensor.dtype not in dtypes
+                or tensor.device != mixed_qkvz.device
+            ):
+                return None
+        signature = GdnSignature(
+            NumericOperation.GDN_VERIFY_GLUE,
+            rows,
+            H,
+            HV,
+            K,
+            V,
+            tokens,
+            ScalarType.BF16,
+            gate_scalar_type=ScalarType.BF16,
+        )
+        if signature not in getattr(layer, "_numeric_gdn_signatures", ()):
+            return None
+        run = numeric_operator(signature, prepared=True)
+        if run is None:
+            return None
+        intermediate_indices = self.verify_intermediate_state_indices
+        if pp_spec_stable_rows_enabled():
+            intermediate_indices = select_verify_intermediate_state_indices(
+                intermediate_indices,
+                forward_batch.req_pool_indices,
+                meta.mamba_cache_indices[:batch] >= 0,
+                self.req_to_token_pool.size,
+            )
+        out = mixed_qkvz.new_empty(rows, HV * V)
+        ring = GdnRingIO(
+            params.replayssm_d,
+            params.replayssm_k,
+            params.replayssm_g,
+            params.replayssm_rawv,
+            params.replayssm_rawk,
+            params.replayssm_beta,
+            params.replayssm_rawv,
+            params.replayssm_rawk,
+            meta.mamba_cache_indices,
+            forward_batch.req_pool_indices,
+            pool.replayssm_spec_write_pos,
+            pool.replayssm_cache_base,
+            pool.replayssm_is_flush,
+        )
+        run(
+            GdnVerifyGlueIO(
+                mixed_qkvz=mixed_qkvz,
+                mixed_ba=mixed_ba,
+                conv_state=conv_state,
+                conv_weight=layer.conv_weights,
+                conv_bias=None,
+                intermediate_indices=intermediate_indices,
+                a_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                norm_weight=norm_weight,
+                norm_epsilon=norm_eps,
+                checkpoint=params.temporal,
+                ring=ring,
+                key_heads=H,
+                key_dim=K,
+                tokens_per_request=tokens,
+                null_slot=-1,
+                conv_activation=GdnActivation.SILU,
+                norm_activation=(
+                    GdnActivation.SIGMOID
+                    if norm_activation == "sigmoid"
+                    else GdnActivation.SILU
+                ),
+                launch=GdnLaunchConfig(0, 4, 1, False, 0, True, 1, True, True),
+                output=out,
+                intermediate_conv_window_out=window,
+            )
+        )
+        return out
+
+    def forward_numeric_inproj_conv(
+        self,
+        layer,
+        forward_batch,
+        x,
+        packed_weight,
+        *,
+        norm_weight,
+        norm_eps,
+        front_variant,
+        front_launch,
+    ):
+        """Source MK front and fused norm; refuse the whole route before writes."""
+        from sglang.kernels.ops.mamba.causal_conv1d_triton import PAD_SLOT_ID
+        from sglang.kernels.plugin_kernels.nvidia.numeric import (
+            GdnActivation,
+            GdnFrontIO,
+            GdnFrontVariant,
+            GdnRingIO,
+            GdnSignature,
+            NumericOperation,
+            ScalarType,
+        )
+        from sglang.srt.kernel_plugins.nvidia.gdn import (
+            bind_gdn_core,
+            gdn_front_launch_config,
+            gdn_front_metadata_supported,
+        )
+        from sglang.srt.kernel_plugins.nvidia.numeric_binding import numeric_operator
+
+        if front_variant not in (
+            GdnFrontVariant.MK_STAGES_6,
+            GdnFrontVariant.MK_STAGES_12,
+        ):
+            return None
+        rows, width = x.shape
+        meta = self.forward_metadata
+        if not gdn_front_metadata_supported(
+            stable_rows=pp_spec_stable_rows_enabled(),
+            has_mis_metadata=self.mis_metadata is not None,
+            tokens_per_request=forward_batch.spec_info.draft_token_num,
+            query_start_count=meta.query_start_loc.numel(),
+            batch_size=forward_batch.batch_size,
+            mk_enabled=True,
+            wide_enabled=os.environ.get("SGLANG_Q38_MK_GDN_WIDE", "0") == "1",
+            has_next_token=meta.retrieve_next_token is not None,
+            has_next_sibling=meta.retrieve_next_sibling is not None,
+            has_parent_token=meta.retrieve_parent_token is not None,
+        ):
+            return None
+        if not forward_batch.forward_mode.is_target_verify():
+            return None
+        params = self.state_layer_cache(layer.layer_id)
+        pool = self.state_pool
+        if (
+            not isinstance(params, MambaPool.SpeculativeState)
+            or params.temporal.dtype != torch.bfloat16
+            or params.replayssm_d is None
+            or params.replayssm_rawv is None
+            or params.replayssm_rawk is None
+            or getattr(pool, "replayssm_cache_base", None) is None
+            or getattr(pool, "replayssm_spec_fold", False)
+            or getattr(pool, "replayssm_is_kda", False)
+        ):
+            return None
+        H, HV, K, V = (
+            layer.num_k_heads,
+            layer.num_v_heads,
+            layer.head_k_dim,
+            layer.head_v_dim,
+        )
+        channels = layer.q_dim + layer.k_dim + layer.v_dim
+        if front_launch != gdn_front_launch_config(front_variant):
+            return None
+        tokens = forward_batch.spec_info.draft_token_num
+        batch = rows // tokens
+        packed_width = channels + HV * V + 2 * HV
+        conv_state = params.conv[0]
+        window = params.intermediate_conv_window[0]
+        if not (
+            K == V
+            and layer.num_q_heads == H
+            and layer.head_q_dim == K
+            and layer.activation in ("silu", "swish")
+            and channels == (2 * H + HV) * K
+            and x.is_cuda
+            and x.dtype == torch.bfloat16
+            and packed_weight.shape == (packed_width, width)
+            and packed_weight.dtype == torch.bfloat16
+            and layer.conv_weights.shape == (channels, window.shape[1])
+            and layer.conv_weights.dtype == torch.bfloat16
+            and conv_state.ndim == 3
+            and conv_state.shape[1] == channels
+            and conv_state.shape[2] >= 3
+            and conv_state.dtype == torch.bfloat16
+            and window.ndim == 4
+            and window.shape[1:] == (tokens, channels, conv_state.shape[2])
+            and window.dtype == torch.bfloat16
+            and norm_weight.shape == (V,)
+            and norm_weight.dtype == torch.bfloat16
+            and norm_weight.is_contiguous()
+            and params.temporal.ndim == 4
+            and params.temporal.shape[1:] == (HV, V, K)
+            and meta.query_start_loc.numel() == batch + 1
+            and meta.mamba_cache_indices.numel() >= batch
+            and self.verify_intermediate_state_indices.numel() >= batch
+            and forward_batch.req_pool_indices.numel() >= batch
+            and params.replayssm_d.shape[-2] == 16
+            and all(
+                t.device == x.device
+                for t in (
+                    packed_weight,
+                    layer.conv_weights,
+                    conv_state,
+                    window,
+                    norm_weight,
+                    params.temporal,
+                    params.replayssm_d,
+                )
+            )
+            and (
+                layer.bias is None
+                or (
+                    layer.bias.shape == (channels,)
+                    and layer.bias.dtype == torch.bfloat16
+                    and layer.bias.device == x.device
+                )
+            )
+        ):
+            return None
+        # Raw pointers use BF16 D/K/low rings, FP32 scalar gates and typed
+        # request cursors. Validate them before the front mutates Conv state.
+        for tensor, tail, dtype in (
+            (params.replayssm_d, (HV, 16, V), torch.bfloat16),
+            (params.replayssm_k, (H, 16, K), torch.bfloat16),
+            (params.replayssm_g, (HV, 16), torch.float32),
+            (params.replayssm_rawv, (HV, 16, V), torch.bfloat16),
+            (params.replayssm_rawk, (H, 16, K), torch.bfloat16),
+        ):
+            if (
+                tensor is None
+                or tensor.shape[1:] != tail
+                or tensor.dtype != dtype
+                or tensor.device != x.device
+            ):
+                return None
+        for tensor, dtypes in (
+            (meta.mamba_cache_indices, (torch.int32, torch.int64)),
+            (self.verify_intermediate_state_indices, (torch.int32, torch.int64)),
+            (forward_batch.req_pool_indices, (torch.int32, torch.int64)),
+            (pool.replayssm_spec_write_pos, (torch.int32,)),
+            (pool.replayssm_cache_base, (torch.int32,)),
+            (pool.replayssm_is_flush, (torch.int8,)),
+        ):
+            if (
+                tensor is None
+                or tensor.ndim != 1
+                or not tensor.is_contiguous()
+                or tensor.dtype not in dtypes
+                or tensor.device != x.device
+            ):
+                return None
+        if not (
+            layer.A_log.shape == layer.dt_bias.shape == (HV,)
+            and layer.A_log.dtype == torch.float32
+            and layer.dt_bias.dtype in (torch.bfloat16, torch.float32)
+            and layer.A_log.device == layer.dt_bias.device == x.device
+        ):
+            return None
+        front_signature = GdnSignature(
+            NumericOperation.GDN_FRONT,
+            rows,
+            H,
+            HV,
+            K,
+            V,
+            tokens,
+            ScalarType.BF16,
+            variant=front_variant,
+            gate_scalar_type=3,
+        )
+        if front_signature not in getattr(layer, "_numeric_gdn_signatures", ()):
+            return None
+        front = numeric_operator(front_signature, prepared=True)
+        if front is None:
+            return None
+        # Only framework allocations/views; every capability is resolved before
+        # the first state/window-writing launch. Never retry stock after writes.
+        packed = torch.empty((rows, packed_width), dtype=x.dtype, device=x.device)
+        convolved = torch.empty((rows, channels), dtype=x.dtype, device=x.device)
+        out = torch.empty((rows, HV, V), dtype=x.dtype, device=x.device)
+        normalized = torch.empty_like(out)
+        z_end = channels + HV * V
+        z = packed[:, channels:z_end].view(rows, HV, V)
+        b = packed[:, z_end : z_end + HV]
+        a = packed[:, z_end + HV :]
+        ring = GdnRingIO(
+            params.replayssm_d,
+            params.replayssm_k,
+            params.replayssm_g,
+            params.replayssm_rawv,
+            params.replayssm_rawk,
+            params.replayssm_beta,
+            params.replayssm_rawv,
+            params.replayssm_rawk,
+            meta.mamba_cache_indices,
+            forward_batch.req_pool_indices,
+            pool.replayssm_spec_write_pos,
+            pool.replayssm_cache_base,
+            pool.replayssm_is_flush,
+        )
+        bound = bind_gdn_core(
+            qkv=convolved,
+            a=a,
+            b=b,
+            a_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            checkpoint=params.temporal,
+            ring=ring,
+            key_heads=H,
+            value_heads=HV,
+            key_dim=K,
+            value_dim=V,
+            tokens_per_request=tokens,
+            raw_out=out,
+            z=z,
+            norm_weight=norm_weight,
+            normalized_out=normalized,
+            epsilon=norm_eps,
+        )
+        if bound is None:
+            return None
+        front_io = GdnFrontIO(
+            x=x,
+            packed_weight=packed_weight,
+            conv_state=conv_state,
+            conv_weight=layer.conv_weights,
+            conv_bias=layer.bias,
+            state_indices=meta.mamba_cache_indices[:batch],
+            intermediate_indices=self.verify_intermediate_state_indices[:batch],
+            activation=GdnActivation.SILU,
+            token_major_out=True,
+            window_mode=0,
+            launch=front_launch,
+            convolved_out=convolved,
+            intermediate_conv_window_out=window,
+            packed_out=packed,
+            pad_slot=PAD_SLOT_ID,
+        )
+        core, core_io = bound
+        front(front_io)
+        core(core_io)
+        return normalized
+
+    def numeric_native_pdl_signatures(self, layer, widths):
+        """Actual state dtype/storage become available only after pool creation."""
+        if os.environ.get("Q38_GDN_PDL") != "1" or self.mis_metadata is not None:
+            return ()
+        from sglang.kernels.ops.attention.fla.utils import is_tf32_supported
+        from sglang.srt.kernel_plugins.nvidia.native_gdn_pdl import state_signature
+        from sglang.srt.kernel_plugins.nvidia.numeric_binding import (
+            signature_capability_supported,
+        )
+
+        params = self.state_layer_cache(layer.layer_id)
+        if not isinstance(params, MambaPool.SpeculativeState):
+            return ()
+        prefetch = int(os.environ.get("Q38_GDN_STATE_PREFETCH") == "1")
+        precision = 0 if is_tf32_supported else 2
+        return tuple(
+            signature
+            for rows in widths
+            if (
+                signature := state_signature(
+                    layer,
+                    params,
+                    self.state_pool,
+                    rows,
+                    prefetch=prefetch,
+                    precision=precision,
+                )
+            )
+            is not None
+            and signature_capability_supported(
+                signature,
+                spec=getattr(layer, "_numeric_capability_spec", None),
+            )
+        )
+
     def _replayssm_target_verify(
         self,
         *,
@@ -1826,6 +2398,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
         replay_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         draft_token_num: int,
+        packed_qkv: Optional[torch.Tensor] = None,
+        norm_z: Optional[torch.Tensor] = None,
+        norm_weight: Optional[torch.Tensor] = None,
+        norm_eps: float = 1e-6,
+        return_normalized: bool = False,
+        native_pdl_eligible: bool = False,
     ) -> torch.Tensor:
         """ReplaySSM GDN spec-verify (Part B of #28511).
 
@@ -1857,7 +2435,222 @@ class GDNAttnBackend(MambaAttnBackendBase):
         b = b.reshape(seq_len, HV)
         d_cache = layer_cache.replayssm_d  # [slots, HV, L, V]
         max_cache_len = d_cache.shape[-2]  # ring length L
+        from sglang.kernels.plugin_kernels.nvidia.numeric import (
+            GdnCoreIO,
+            GdnRingIO,
+            GdnSignature,
+            NumericOperation,
+            ScalarType,
+        )
+        from sglang.srt.kernel_plugins.nvidia.numeric_binding import numeric_operator
+
         out = q.new_empty(seq_len, HV, V)
+        if (
+            return_normalized
+            and os.environ.get("SGLANG_Q38_MK_GDN", "0") == "1"
+            and os.environ.get("SGLANG_Q38_MK_GDN_M32_NORM", "0") == "1"
+            and draft_token_num > 0
+            and max_cache_len == 16
+            and norm_z is not None
+            and norm_weight is not None
+            and packed_qkv is not None
+            and layer_cache.temporal.dtype == torch.bfloat16
+            and layer_cache.temporal.shape[1:] == (HV, V, K)
+            and cache_indices.numel() >= seq_len // draft_token_num
+            and replay_indices.numel() >= seq_len // draft_token_num
+            and query_start_loc.numel() == seq_len // draft_token_num + 1
+            and GdnSignature(
+                NumericOperation.GDN_CORE,
+                seq_len,
+                H,
+                HV,
+                K,
+                V,
+                draft_token_num,
+                ScalarType.BF16,
+                variant=1,
+                gate_scalar_type=ScalarType.BF16,
+            )
+            in getattr(layer, "_numeric_gdn_standalone_norm_signatures", ())
+        ):
+            from sglang.srt.kernel_plugins.nvidia.gdn import bind_gdn_core
+
+            metadata_ready = True
+            for tensor, tail, dtype in (
+                (d_cache, (HV, 16, V), torch.bfloat16),
+                (layer_cache.replayssm_k, (H, 16, K), torch.bfloat16),
+                (layer_cache.replayssm_g, (HV, 16), torch.float32),
+                (layer_cache.replayssm_rawv, (HV, 16, V), torch.bfloat16),
+                (layer_cache.replayssm_rawk, (H, 16, K), torch.bfloat16),
+            ):
+                if (
+                    tensor is None
+                    or tensor.shape[1:] != tail
+                    or tensor.dtype != dtype
+                    or tensor.device != packed_qkv.device
+                    or not tensor.is_contiguous()
+                ):
+                    metadata_ready = False
+            for tensor, dtypes in (
+                (cache_indices, (torch.int32, torch.int64)),
+                (replay_indices, (torch.int32, torch.int64)),
+                (mamba_pool.replayssm_spec_write_pos, (torch.int32,)),
+                (mamba_pool.replayssm_cache_base, (torch.int32,)),
+                (mamba_pool.replayssm_is_flush, (torch.int8,)),
+            ):
+                if (
+                    tensor is None
+                    or tensor.ndim != 1
+                    or not tensor.is_contiguous()
+                    or tensor.dtype not in dtypes
+                    or tensor.device != packed_qkv.device
+                ):
+                    metadata_ready = False
+            metadata_ready = metadata_ready and (
+                layer.A_log.shape == layer.dt_bias.shape == (HV,)
+                and layer.A_log.dtype == torch.float32
+                and layer.dt_bias.dtype in (torch.bfloat16, torch.float32)
+                and layer.A_log.device == layer.dt_bias.device == packed_qkv.device
+                and layer_cache.temporal.device == packed_qkv.device
+            )
+            if metadata_ready:
+                normalized = torch.empty_like(out)
+                ring = GdnRingIO(
+                    d_cache,
+                    layer_cache.replayssm_k,
+                    layer_cache.replayssm_g,
+                    layer_cache.replayssm_rawv,
+                    layer_cache.replayssm_rawk,
+                    layer_cache.replayssm_beta,
+                    layer_cache.replayssm_rawv,
+                    layer_cache.replayssm_rawk,
+                    cache_indices,
+                    replay_indices,
+                    mamba_pool.replayssm_spec_write_pos,
+                    mamba_pool.replayssm_cache_base,
+                    mamba_pool.replayssm_is_flush,
+                )
+                bound = bind_gdn_core(
+                    qkv=packed_qkv,
+                    a=a,
+                    b=b,
+                    a_log=layer.A_log,
+                    dt_bias=layer.dt_bias,
+                    checkpoint=layer_cache.temporal,
+                    ring=ring,
+                    key_heads=H,
+                    value_heads=HV,
+                    key_dim=K,
+                    value_dim=V,
+                    tokens_per_request=draft_token_num,
+                    raw_out=out,
+                    z=norm_z,
+                    norm_weight=norm_weight,
+                    normalized_out=normalized,
+                    epsilon=norm_eps,
+                )
+                if bound is not None:
+                    core, core_io = bound
+                    core(core_io)
+                    return normalized.reshape(value.shape), True
+        raw_signature = GdnSignature(
+            NumericOperation.GDN_CORE,
+            seq_len,
+            H,
+            HV,
+            K,
+            V,
+            draft_token_num,
+            ScalarType.BF16,
+            gate_scalar_type=(
+                ScalarType.BF16 if a.dtype == torch.bfloat16 else ScalarType.FP32
+            ),
+        )
+        run = None
+        if raw_signature in getattr(layer, "_numeric_gdn_signatures", ()):
+            run = numeric_operator(
+                raw_signature,
+                prepared=(
+                    raw_signature in getattr(layer, "_numeric_gdn_signatures", ())
+                    and packed_qkv is not None
+                    and packed_qkv.is_cuda
+                    and packed_qkv.dtype == layer_cache.temporal.dtype == torch.bfloat16
+                    and packed_qkv.shape == (seq_len, (2 * H + HV) * K)
+                    and packed_qkv.stride(1) == 1
+                    and packed_qkv.stride(0) % 8 == 0
+                    and packed_qkv.data_ptr() % 16 == 0
+                    and a.dtype == b.dtype
+                    and a.dtype in (torch.bfloat16, torch.float32)
+                    and a.stride(0) == b.stride(0)
+                    and a.stride(1) == b.stride(1) == 1
+                    and draft_token_num > 0
+                    and max_cache_len == 16
+                    and K == V
+                    and layer_cache.replayssm_rawv is not None
+                    and layer_cache.replayssm_rawk is not None
+                ),
+            )
+        if run is not None:
+            ring = GdnRingIO(
+                d_cache,
+                layer_cache.replayssm_k,
+                layer_cache.replayssm_g,
+                layer_cache.replayssm_rawv,
+                layer_cache.replayssm_rawk,
+                layer_cache.replayssm_beta,
+                layer_cache.replayssm_rawv,
+                layer_cache.replayssm_rawk,
+                cache_indices,
+                replay_indices,
+                mamba_pool.replayssm_spec_write_pos,
+                mamba_pool.replayssm_cache_base,
+                mamba_pool.replayssm_is_flush,
+            )
+            run(
+                GdnCoreIO(
+                    packed_qkv,
+                    a,
+                    b,
+                    a.stride(0),
+                    b.stride(0),
+                    layer.A_log,
+                    layer.dt_bias,
+                    layer_cache.temporal,
+                    ring,
+                    None,
+                    None,
+                    1e-6,
+                    V,
+                    out,
+                    None,
+                )
+            )
+            return out.reshape(value.shape)
+        # The native Conv stage has already run once. It does not write a/b,
+        # unlike the selected fused front, which returns before this fallback.
+        if native_pdl_eligible and draft_token_num == 4:
+            from sglang.srt.kernel_plugins.nvidia.native_gdn_pdl import (
+                bind_native_gdn_pdl,
+            )
+
+            bound = bind_native_gdn_pdl(
+                layer,
+                layer_cache,
+                mamba_pool,
+                q=q,
+                k=k,
+                v=v,
+                a=a,
+                b=b,
+                out=out,
+                query_start_loc=query_start_loc,
+                state_indices=cache_indices,
+                replay_indices=replay_indices,
+            )
+            if bound is not None:
+                run, io = bound
+                run(io)
+                return out.reshape(value.shape)
         gdn_replayssm_spec_decode(
             q=q,
             k=k,
