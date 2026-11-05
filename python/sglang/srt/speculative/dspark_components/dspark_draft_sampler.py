@@ -90,7 +90,7 @@ class DsparkDraftSampler:
         )
         # [max_bs, gamma, vocab] step logits for sampling accept. The stock path
         # sizes it on first use; a bound specialized path may allocate it now.
-        bound_strategy = bind_dspark_draft_strategy(
+        self._draft_steps, self.step_logits = bind_dspark_draft_strategy(
             draft_model=self.model,
             gamma=self.gamma,
             max_bs=self.max_bs,
@@ -110,8 +110,6 @@ class DsparkDraftSampler:
                 device=self.out.device,
             ),
         )
-        self._draft_strategy = bound_strategy.strategy
-        self.step_logits = bound_strategy.step_logits
 
     def _step_logits(self, base_logits: torch.Tensor) -> torch.Tensor:
         if self.step_logits is None:
@@ -147,13 +145,13 @@ class DsparkDraftSampler:
                 gamma=self.gamma,
             )
         anchor = input_ids.view(bs, self.query_token_num)[:, 0]
-        draft_tokens, confidence_features = self._draft_strategy.run(
-            model_hidden=model_hidden,
-            sample_hidden=sample_hidden,
-            anchor_tokens=anchor,
-            batch_size=bs,
-            stock=self._markov_block,
-        )
+        step = None if self._draft_steps is None else self._draft_steps(bs)
+        if step is None:
+            draft_tokens, confidence_features = self._markov_block(
+                model_hidden, sample_hidden, anchor, bs
+            )
+        else:
+            draft_tokens, confidence_features = step(model_hidden, anchor)
         if self.confidence_out is not None:
             confidence, confidence_raw = self.model.compute_confidence(
                 anchor_tokens=anchor,
@@ -237,6 +235,8 @@ def maybe_build_draft_sampler(
         logger.info(
             "DSpark draft proposal (%s) folded into the draft cuda graph%s.",
             "greedy draft" if greedy_draft else "sampling",
-            sampler._draft_strategy.log_suffix,
+            "; the NVIDIA megakernel may run it"
+            if sampler._draft_steps is not None
+            else "",
         )
     return sampler
