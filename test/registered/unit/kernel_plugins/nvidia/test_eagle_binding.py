@@ -436,6 +436,7 @@ class TestEagleBinding(CustomTestCase):
         linear.forward_metadata = meta
         linear.kernel_dispatcher = SimpleNamespace(extend_kernel=TritonGDNKernel())
         linear.requires_contiguous_prefill_state = True
+        linear.mis_metadata = None
         binding = eb.EagleBinding(model=torch.nn.Module())
         with patch.object(eb, "get_attn_backend", return_value=backend):
             view = binding.prefill_view()
