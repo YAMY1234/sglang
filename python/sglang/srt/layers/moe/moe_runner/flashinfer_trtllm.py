@@ -38,6 +38,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerConfig,
     register_fused_func,
 )
+from sglang.srt.layers.moe.quantized_input import Nvfp4RoutedInputPreQuant
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.runtime_context import (
     get_context,
@@ -166,8 +167,6 @@ def round_up_to_multiple(x: int, m: int) -> int:
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
-        FlashinferCombineInput,
-        FlashinferDispatchOutput,
         StandardCombineInput,
         StandardDispatchOutput,
     )
@@ -1891,6 +1890,38 @@ def quantize_hidden_states_fp4(
     return hs_fp4, hs_sf
 
 
+def _validate_nvfp4_pre_quantized_input(
+    pre_quant: Nvfp4RoutedInputPreQuant,
+    hidden_states: torch.Tensor,
+    hidden_states_scale: Optional[torch.Tensor],
+    quant_info: FlashInferTrtllmFp4MoeQuantInfo,
+) -> None:
+    """Check metadata only; do not quantize, copy, allocate or read GPU values."""
+    if (
+        hidden_states_scale is not None
+        or quant_info.padded_hidden_size is not None
+        or quant_info.use_per_token_activation
+    ):
+        raise ValueError("Typed NVFP4 input requires unpadded per-tensor BF16 dispatch")
+    rows, hidden = hidden_states.shape
+    packed, scales = pre_quant.x_fp4, pre_quant.x_sf
+    if (
+        hidden_states.dtype != torch.bfloat16
+        or hidden % 16
+        or packed.dtype != torch.uint8
+        or packed.shape != (rows, hidden // 2)
+        or scales.dtype != torch.float8_e4m3fn
+        or scales.shape != (rows, hidden // 16)
+        or packed.device != hidden_states.device
+        or scales.device != hidden_states.device
+        or not packed.is_contiguous()
+        or not scales.is_contiguous()
+    ):
+        raise ValueError(
+            "Typed NVFP4 input has incompatible packed/linear-scale metadata"
+        )
+
+
 def _get_fp4_moe_output_buffer(
     num_tokens: int,
     hidden_size: int,
@@ -1950,6 +1981,11 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
 
     # Quantize hidden states to FP4
     hidden_states_scale = dispatch_output.hidden_states_scale
+    pre_quant = dispatch_output.hidden_states_pre_quant
+    if isinstance(pre_quant, Nvfp4RoutedInputPreQuant):
+        _validate_nvfp4_pre_quantized_input(
+            pre_quant, hidden_states, hidden_states_scale, quant_info
+        )
     per_token_scale = None
     unpadded_hidden_size = hidden_states.shape[-1]
     hidden_pad = 0
@@ -1960,7 +1996,11 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         )
         hidden_pad = quant_info.padded_hidden_size - unpadded_hidden_size
         hidden_states = torch.nn.functional.pad(hidden_states, (0, hidden_pad))
-    if hidden_states_scale is not None:
+    if isinstance(pre_quant, Nvfp4RoutedInputPreQuant):
+        hs_fp4, hs_scale_linear = pre_quant.x_fp4, pre_quant.x_sf
+        if pre_quant.ready is not None:
+            torch.cuda.current_stream().wait_event(pre_quant.ready)
+    elif hidden_states_scale is not None:
         # NVFP4 dispatch (flashinfer a2a): inputs are already FP4-quantized by
         # the dispatcher, so pass them through unchanged.
         hs_fp4 = hidden_states
@@ -2164,7 +2204,13 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         if not defer_finalize:
             moe_kwargs["output"] = symm_output
 
-        result = trtllm_fp4_block_scale_moe(**moe_kwargs)
+        from sglang.srt.kernel_plugins.nvidia.local_experts import (
+            try_numeric_local_experts,
+        )
+
+        result = try_numeric_local_experts(moe_kwargs)
+        if result is None:
+            result = trtllm_fp4_block_scale_moe(**moe_kwargs)
         if defer_finalize:
             result = _make_deferred_finalize_output(result, top_k=topk_config.top_k)
         else:

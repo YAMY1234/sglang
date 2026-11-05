@@ -348,6 +348,66 @@ def _validate_deepep_v2_quant_method(quant_method) -> None:
 
 
 class FusedMoE(torch.nn.Module):
+    def numeric_signatures(self, widths, tokens_per_request):
+        from sglang.kernels.plugin_kernels.nvidia.numeric import (
+            ExpertSignature,
+            NumericOperation,
+            ScalarType,
+        )
+        from sglang.srt.kernel_plugins.nvidia.local_experts import (
+            local_expert_source_context,
+        )
+        from sglang.srt.kernel_plugins.nvidia.numeric_binding import (
+            signature_capability_supported,
+        )
+        from sglang.srt.utils import get_bool_env_var
+
+        if not get_bool_env_var("SGLANG_Q38_MK_MOE", "False"):
+            return ()
+        signatures = []
+        for rows in widths:
+            if type(rows) is not int or rows <= 0 or tokens_per_request <= 0:
+                continue
+            accepted = False
+            for variant in (0, 1, 2):
+                signature = ExpertSignature(
+                    NumericOperation.LOCAL_EXPERTS,
+                    rows,
+                    self.hidden_size,
+                    self.intermediate_size_per_partition,
+                    self.num_experts,
+                    self.top_k,
+                    ScalarType.PACKED_FP4,
+                    variant=variant,
+                )
+                if signature_capability_supported(
+                    signature,
+                    spec=getattr(self, "_numeric_capability_spec", None),
+                    **local_expert_source_context(
+                        rows,
+                        tokens_per_request,
+                        is_target_verify=tokens_per_request > 1,
+                        batch_size=rows // tokens_per_request,
+                    ),
+                ):
+                    signatures.append(signature)
+                    accepted = True
+            if accepted and get_bool_env_var("SGLANG_Q38_FINALIZE_SHARED", "False"):
+                signature = ExpertSignature(
+                    NumericOperation.FINALIZE_SHARED,
+                    rows,
+                    self.hidden_size,
+                    self.intermediate_size_per_partition,
+                    self.num_experts,
+                    self.top_k,
+                    ScalarType.BF16,
+                )
+                if signature_capability_supported(
+                    signature, spec=getattr(self, "_numeric_capability_spec", None)
+                ):
+                    signatures.append(signature)
+        return tuple(signatures)
+
     """FusedMoE layer for MoE models.
 
     This layer contains both MergedColumnParallel weights (gate_up_proj /
