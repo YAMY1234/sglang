@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.speculative import uno_utils
 from sglang.srt.speculative.eagle_utils import (
     _can_use_sparse_uno_tree_target_sampling,
 )
@@ -99,6 +100,36 @@ class TestUnoTreeSparseSampling(CustomTestCase):
             forward_width=3,
             max_top_k=2,
         )
+
+    def test_support_top_k_avoids_racy_clusters_backend(self):
+        """FlashInfer's non-deterministic top_k (the SM100 clusters kernel) can
+        return out-of-vocab ids; the compact support must request the
+        deterministic one."""
+        logits = torch.randn(6, 100)
+
+        def fake_top_k(input, k, sorted, deterministic):
+            values, indices = torch.topk(input, k, dim=-1, sorted=sorted)
+            return values, indices
+
+        with patch(
+            "sglang.srt.speculative.uno_utils._flashinfer_top_k",
+            side_effect=fake_top_k,
+        ) as top_k:
+            support_ids, support_probs = (
+                uno_utils._build_sparse_target_support_tensors._torchdynamo_orig_callable(
+                    logits,
+                    torch.ones(2, 1),
+                    torch.tensor([4, 2]),
+                    None,
+                    2,
+                    3,
+                    4,
+                )
+            )
+
+        self.assertTrue(top_k.call_args.kwargs["deterministic"])
+        self.assertTrue(torch.equal(support_ids.flatten(0, 1), logits.topk(4).indices))
+        self.assertEqual(support_probs.shape, (2, 3, 4))
 
 
 if __name__ == "__main__":

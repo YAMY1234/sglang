@@ -142,11 +142,14 @@ def _build_sparse_target_support_tensors(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build compact support using the fastest available top-k primitive."""
     rows = batch_size * forward_width
+    # deterministic=False routes SM100 to the clusters top-k, which in FlashInfer
+    # < 0.7.3 races at 128 <= rows < 256 and can return out-of-vocab ids
+    # (flashinfer-ai/flashinfer#6399).
     topk_logits, topk_ids = _flashinfer_top_k(
         next_token_logits.contiguous(),
         max_top_k,
         sorted=True,
-        deterministic=False,
+        deterministic=True,
     )
 
     expanded_temperatures = torch.repeat_interleave(
