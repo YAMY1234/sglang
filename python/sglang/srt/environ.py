@@ -341,6 +341,11 @@ class Envs:
     SGLANG_OPT_HICACHE_GROUPED_DEVICE_FREES = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # GDN prefill: bound the conv-state track indices on the device and build the
+    # FlashInfer checkpoint plan from the batch's host lists (no D2H reads).
+    SGLANG_OPT_GDN_PREFILL_SYNC_FREE_METADATA = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Model configuration, discovery, and weight loading

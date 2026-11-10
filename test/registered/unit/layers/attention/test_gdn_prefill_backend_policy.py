@@ -391,6 +391,77 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
         self.assertEqual(metadata.num_state_checkpoints, 7)
         self.assertEqual(metadata.state_checkpoint_every_n_tokens, 64)
 
+    def test_sync_free_checkpoint_plan_reads_the_host_lists(self):
+        def device_only():
+            # Stands for a CUDA tensor: reading it back is the sync being removed.
+            tensor = MagicMock()
+            tensor.to.side_effect = AssertionError("device tensor read back")
+            return tensor
+
+        host_lists = dict(
+            extend_seq_lens_cpu=[63, 64, 65, 127, 128, 129],
+            mamba_prefill_track_mask_cpu=[False, True, True, True, True, True],
+            mamba_track_seqlens_cpu=[63, 64, 65, 127, 65, 129],
+            extend_prefix_lens_cpu=[0] * 6,
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=6,
+            extend_seq_lens=device_only(),
+            mamba_track_mask=device_only(),
+            mamba_track_seqlens=device_only(),
+            extend_prefix_lens=device_only(),
+            **host_lists,
+        )
+        metadata = SimpleNamespace(
+            track_ssm_h_src=torch.empty(4),
+            track_ssm_h_dst=torch.empty(4),
+        )
+        override = get_context().override_server_args(_mamba_cache_chunk_size=64)
+        override.install()
+        self.addCleanup(override.restore)
+        with (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+            envs.SGLANG_OPT_GDN_PREFILL_SYNC_FREE_METADATA.override(True),
+        ):
+            maybe_build_flashinfer_checkpoint_plan(forward_batch, metadata, "cpu")
+
+        torch.testing.assert_close(
+            metadata.state_checkpoint_cu_starts,
+            torch.tensor([0, 0, 1, 2, 3, 5, 7]),
+        )
+        torch.testing.assert_close(metadata.track_ssm_h_src, torch.tensor([1, 2, 3, 6]))
+        self.assertEqual(metadata.num_state_checkpoints, 7)
+
+        # A host list that does not cover the batch leaves the device read.
+        forward_batch.mamba_track_seqlens_cpu = None
+        metadata.track_ssm_h_src = torch.empty(4)
+        with (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+            envs.SGLANG_OPT_GDN_PREFILL_SYNC_FREE_METADATA.override(True),
+            self.assertRaisesRegex(AssertionError, "read back"),
+        ):
+            maybe_build_flashinfer_checkpoint_plan(forward_batch, metadata, "cpu")
+
+    def test_sync_free_track_conv_indices_match_the_clamp(self):
+        backend = object.__new__(MambaAttnBackendBase)
+        backend.device = "cpu"
+        backend.conv_states_shape = (8, 64, 3)
+        query_start_loc = torch.tensor([0, 2, 70, 135])
+        forward_batch = SimpleNamespace(
+            mamba_track_aligned_lens=lambda: torch.tensor([0, 64, 64]),
+            mamba_track_mask=torch.tensor([True, True, True]),
+        )
+        expected = backend._init_track_conv_indices(query_start_loc, forward_batch)
+        with (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+            envs.SGLANG_OPT_GDN_PREFILL_SYNC_FREE_METADATA.override(True),
+        ):
+            got = backend._init_track_conv_indices(query_start_loc, forward_batch)
+        torch.testing.assert_close(got, expected)
+        # The first row starts before token 0 and is clamped.
+        torch.testing.assert_close(expected[0], torch.tensor([0, 0, 0]))
+
     def test_decode_tracking_without_h_source_skips_checkpoint_plan(self):
         backend = object.__new__(GDNAttnBackend)
         backend.device = "cpu"

@@ -498,6 +498,10 @@ class MambaAttnBackendBase(AttentionBackend):
             dtype=start_indices.dtype,
         )
 
+        if envs.SGLANG_OPT_GDN_PREFILL_SYNC_FREE_METADATA.get():
+            # clamp(0, <0-d CUDA tensor>) takes the Scalar overload, a D2H read;
+            # min(max(x, 0), total - 1) is clamp's definition, kept on the device.
+            return torch.minimum(indices.clamp_(min=0), query_start_loc[-1] - 1)
         return indices.clamp(0, query_start_loc[-1] - 1)
 
     def _init_track_ssm_indices(

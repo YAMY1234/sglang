@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
@@ -26,7 +27,7 @@ from sglang.srt.layers.attention.linear.kernels.state_pool_io import (
 from sglang.srt.runtime_context import (
     mamba_cache_chunk_size,
 )
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
@@ -94,11 +95,28 @@ def maybe_build_flashinfer_checkpoint_plan(
         return
 
     checkpoint_every_n_tokens = mamba_cache_chunk_size()
-    extend_seq_lens = forward_batch.extend_seq_lens.to(device="cpu", dtype=torch.int64)
-    track_mask = forward_batch.mamba_track_mask.to(device="cpu", dtype=torch.bool)
-    relative_track_lens = forward_batch.mamba_track_seqlens.to(
-        device="cpu", dtype=torch.int64
-    ) - forward_batch.extend_prefix_lens.to(device="cpu", dtype=torch.int64)
+    host_lists = (
+        _host_track_lists(forward_batch)
+        if envs.SGLANG_OPT_GDN_PREFILL_SYNC_FREE_METADATA.get()
+        else None
+    )
+    if host_lists is not None:
+        # The device tensors are H2D copies of these lists; reading them back
+        # waits for the stream.
+        seq_lens, mask, track_seqlens, prefix_lens = host_lists
+        extend_seq_lens = torch.tensor(seq_lens, dtype=torch.int64)
+        track_mask = torch.tensor(mask, dtype=torch.bool)
+        relative_track_lens = torch.tensor(
+            track_seqlens, dtype=torch.int64
+        ) - torch.tensor(prefix_lens, dtype=torch.int64)
+    else:
+        extend_seq_lens = forward_batch.extend_seq_lens.to(
+            device="cpu", dtype=torch.int64
+        )
+        track_mask = forward_batch.mamba_track_mask.to(device="cpu", dtype=torch.bool)
+        relative_track_lens = forward_batch.mamba_track_seqlens.to(
+            device="cpu", dtype=torch.int64
+        ) - forward_batch.extend_prefix_lens.to(device="cpu", dtype=torch.int64)
 
     checkpoint_counts = extend_seq_lens // checkpoint_every_n_tokens
     checkpoint_cu_starts = torch.zeros(checkpoint_counts.numel() + 1, dtype=torch.int64)
@@ -112,6 +130,10 @@ def maybe_build_flashinfer_checkpoint_plan(
         raise ValueError("Tracked GDN state precedes the first FlashInfer checkpoint.")
     assert track_checkpoint_src.numel() == forward_metadata.track_ssm_h_dst.numel()
 
+    if host_lists is not None and is_pin_memory_available():
+        # A pageable H2D copy may wait for the stream; a pinned one is only queued.
+        track_checkpoint_src = track_checkpoint_src.pin_memory()
+        checkpoint_cu_starts = checkpoint_cu_starts.pin_memory()
     forward_metadata.track_ssm_h_src = track_checkpoint_src.to(
         device, non_blocking=True
     )
@@ -120,6 +142,23 @@ def maybe_build_flashinfer_checkpoint_plan(
     )
     forward_metadata.num_state_checkpoints = int(checkpoint_cu_starts[-1])
     forward_metadata.state_checkpoint_every_n_tokens = checkpoint_every_n_tokens
+
+
+def _host_track_lists(forward_batch: ForwardBatch) -> Optional[tuple]:
+    """(extend_seq_lens, track mask, track seqlens, extend_prefix_lens) as host
+    lists when all of them cover an extend batch, else None."""
+    mode = forward_batch.forward_mode
+    if not mode.is_extend() or mode.is_target_verify():
+        return None
+    lists = (
+        forward_batch.extend_seq_lens_cpu,
+        forward_batch.mamba_prefill_track_mask_cpu,
+        forward_batch.mamba_track_seqlens_cpu,
+        forward_batch.extend_prefix_lens_cpu,
+    )
+    if any(v is None or len(v) != forward_batch.batch_size for v in lists):
+        return None
+    return lists
 
 
 def _get_flashinfer_gdn_kernels():
