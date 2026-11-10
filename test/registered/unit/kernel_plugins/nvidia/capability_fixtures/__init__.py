@@ -129,6 +129,7 @@ def contract_geometry(s):
                 == (1, 128, 512, 4, 0)
                 and 0 < s.context_bound <= 131072
                 and s.query_heads in (8, 16)
+                and (s.ctas_per_group > 0) == (s.variant in (6, 7))
                 and (
                     (
                         s.operation == Op.SPARSE_SELECT
@@ -145,6 +146,12 @@ def contract_geometry(s):
                             (s.variant in (0, 3) and s.rows == 4 and s.query_heads == 8)
                             or (s.variant == 4 and s.rows <= 64 and s.rows % 4 == 0)
                             or (s.variant == 5 and s.rows <= 64)
+                            or (
+                                s.variant in (6, 7)
+                                and 64 < s.rows <= 576
+                                and s.rows % 4 == 0
+                                and s.query_heads == 8
+                            )
                         )
                     )
                 )
@@ -440,11 +447,11 @@ def _source_supported(s, actual):
         if not 0 < heads <= 16 or s.query_heads != ((heads + 7) // 8) * 8:
             return False
         if (
-            (op == NumericOperation.SPARSE_SCORE and s.variant in (0, 3))
+            (op == NumericOperation.SPARSE_SCORE and s.variant in (0, 3, 6, 7))
             or (op == NumericOperation.SPARSE_SELECT and s.variant == 0)
         ) and heads != 4:
             return False
-        if (op == NumericOperation.SPARSE_SCORE and s.variant in (4, 5)) or (
+        if (op == NumericOperation.SPARSE_SCORE and s.variant in (4, 5, 6, 7)) or (
             op == NumericOperation.SPARSE_SELECT and s.variant == 1
         ):
             return actual["tp_size"] == 1

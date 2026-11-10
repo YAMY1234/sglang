@@ -91,8 +91,11 @@ class NumericSignature:
     rotary_dim: int = 0
     context_bound: int = 0
     # Sparse score: 0=MK, 3=MK short32, 4=grouped V7/W4 defaults,
-    # 5=per-row defaults. Sparse select: 0=MK, 1=split defaults.
+    # 5=per-row defaults, 6=grouped4 chain, 7=grouped4 chain with a two-stage
+    # key pipeline. Sparse select: 0=MK, 1=split defaults.
     variant: int = 0
+    # Grid CTAs per four-row request group of sparse score 6/7; 0 elsewhere.
+    ctas_per_group: int = 0
 
 
 @dataclass(frozen=True, slots=True)

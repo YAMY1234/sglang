@@ -123,11 +123,13 @@ class QSAIndexer(MultiPlatformOp):
         self._numeric_page_size = page_size
         self._numeric_prepared_sparse = frozenset()
         widths = getattr(self, "_numeric_split_select_widths", ())
+        grouped4 = self._grouped4_score_variant()
         if not (
             (
                 envs.SGLANG_QSA_MK_SCORE.get()
                 or envs.SGLANG_QSA_NUMERIC_SCORE.get()
                 or envs.SGLANG_QSA_SPLIT_TOPK.get()
+                or grouped4 is not None
             )
             and type(context_len) is int
             and context_len > 0
@@ -158,7 +160,7 @@ class QSAIndexer(MultiPlatformOp):
             unpadded_query_heads=self.index_n_heads,
         )
 
-        def admitted(operation, rows, scalar_type, variant):
+        def admitted(operation, rows, scalar_type, variant, ctas_per_group=0):
             signature = NumericSignature(
                 operation,
                 rows,
@@ -170,6 +172,7 @@ class QSAIndexer(MultiPlatformOp):
                 scalar_type,
                 context_bound=capacity,
                 variant=variant,
+                ctas_per_group=ctas_per_group,
             )
             return (
                 signature
@@ -183,6 +186,9 @@ class QSAIndexer(MultiPlatformOp):
 
         signatures = []
         split_select = self._split_select_source_enabled()
+        # The source validated grouped4 bit-identical on SM107 only.
+        if grouped4 is not None and torch.cuda.get_device_capability() != (10, 7):
+            grouped4 = None
         for rows in widths:
             if envs.SGLANG_QSA_MK_SCORE.get():
                 for operation, scalar_type, variant in (
@@ -223,11 +229,38 @@ class QSAIndexer(MultiPlatformOp):
                     )
                 ) is not None:
                     signatures.append(signature)
+            if (
+                grouped4 is not None
+                and rows % 4 == 0
+                and 16 < rows // 4 <= envs.SGLANG_QSA_GROUPED_SCORE_MAX_REQUESTS.get()
+                and rows <= 576
+            ):
+                if (
+                    signature := admitted(
+                        NumericOperation.SPARSE_SCORE,
+                        rows,
+                        ScalarType.BF16,
+                        grouped4,
+                        envs.SGLANG_QSA_GROUPED4_VERIFY_CHAIN_CTAS.get(),
+                    )
+                ) is not None:
+                    signatures.append(signature)
         declared = tuple(dict.fromkeys(signatures))
         if declared:
             self._numeric_score_capacity = capacity
             self._numeric_prepared_sparse = frozenset(declared)
         return declared
+
+    @staticmethod
+    def _grouped4_score_variant():
+        """Source grouped4 verify scorer: 6 = chain, 7 = two-stage key pipeline."""
+        if not (
+            envs.SGLANG_ENABLE_QSA_GROUPED4_VERIFY.get()
+            and envs.SGLANG_ENABLE_QSA_GROUPED4_VERIFY_CHAIN.get()
+            and envs.SGLANG_QSA_GROUPED_SCORE.get()
+        ):
+            return None
+        return {0: 6, 2: 7}.get(envs.SGLANG_QSA_GROUPED4_VERIFY_PIPELINE_STAGES.get())
 
     @staticmethod
     def _split_select_source_enabled():
@@ -481,6 +514,77 @@ class QSAIndexer(MultiPlatformOp):
         )
         select(SparseSelectIO(scores, lengths, self.block_topk, indices, None, scratch))
         return indices
+
+    def _numeric_grouped4_score(self, q, cache, table, lengths, capacity):
+        """Scores of one target-verify grouped4 launch, or None for stock."""
+        from sglang.kernels.plugin_kernels.nvidia.numeric import (
+            NumericOperation,
+            NumericSignature,
+            ScalarType,
+            SparseScoreIO,
+        )
+        from sglang.srt.kernel_plugins.nvidia.numeric_binding import numeric_operator
+
+        variant = self._grouped4_score_variant()
+        rows = q.shape[0]
+        query_heads = ((self.index_n_heads + 7) // 8) * 8
+        if not (
+            variant is not None
+            and q.is_cuda
+            and q.shape == (rows, query_heads, self.index_head_dim)
+            and q.dtype == torch.bfloat16
+            and cache.ndim == 4
+            and cache.shape[1:]
+            == (
+                getattr(self, "_numeric_page_size", cache.shape[1]),
+                self.index_kv_heads,
+                self.index_head_dim,
+            )
+            and cache.dtype == torch.bfloat16
+            and table.shape == (rows, (capacity + cache.shape[1] - 1) // cache.shape[1])
+            and table.dtype in (torch.int32, torch.int64)
+            and lengths.shape == (rows,)
+            and lengths.dtype in (torch.int32, torch.int64)
+            and q.device == cache.device == table.device == lengths.device
+            and capacity == getattr(self, "_numeric_score_capacity", 0)
+            and capacity > 0
+        ):
+            return None
+        signature = NumericSignature(
+            NumericOperation.SPARSE_SCORE,
+            rows,
+            query_heads,
+            self.index_kv_heads,
+            self.index_head_dim,
+            self.block_topk,
+            self.compress_ratio,
+            ScalarType.BF16,
+            context_bound=capacity,
+            variant=variant,
+            ctas_per_group=envs.SGLANG_QSA_GROUPED4_VERIFY_CHAIN_CTAS.get(),
+        )
+        if signature not in getattr(self, "_numeric_prepared_sparse", ()):
+            return None
+        run = numeric_operator(signature, prepared=True)
+        if run is None:
+            return None
+        scores = torch.empty((rows, capacity), dtype=torch.float32, device=q.device)
+        run(
+            SparseScoreIO(
+                q.contiguous(),
+                cache.contiguous(),
+                table.to(torch.int32).contiguous(),
+                lengths.to(torch.int32).contiguous(),
+                None,
+                None,
+                cache.shape[1],
+                self.compress_ratio,
+                math.sqrt(self.index_head_dim),
+                scores,
+                torch.empty(0, dtype=torch.uint8, device=q.device),
+            )
+        )
+        return scores
 
     @staticmethod
     def _validate_config(config) -> None:
@@ -919,6 +1023,7 @@ class QSAIndexer(MultiPlatformOp):
         score_q4_requests: torch.Tensor | None = None,
         rows_per_group: int = 1,
     ) -> torch.Tensor:
+        verify_rows_per_group = rows_per_group
         if not (
             rows_per_group > 1
             and get_parallel().tp_size == 1
@@ -958,14 +1063,26 @@ class QSAIndexer(MultiPlatformOp):
             and self.block_topk == 512
             and not is_batch_invariant_mode_enabled()
         )
-        logits = qsa_mqa_decode(
-            q,
-            compressed_cache,
-            compressed_page_table,
-            compressed_lengths,
-            max_model_len,
-            min_scored_len=self.block_topk if use_fast_topk else 0,
+        logits = (
+            self._numeric_grouped4_score(
+                q,
+                compressed_cache,
+                compressed_page_table,
+                compressed_lengths,
+                max_model_len,
+            )
+            if use_fast_topk and verify_rows_per_group == 4
+            else None
         )
+        if logits is None:
+            logits = qsa_mqa_decode(
+                q,
+                compressed_cache,
+                compressed_page_table,
+                compressed_lengths,
+                max_model_len,
+                min_scored_len=self.block_topk if use_fast_topk else 0,
+            )
         if use_fast_topk:
             # Decode rows start at zero, so compressed lengths double as row lengths;
             # skip the generic zero-fill + subtract.
@@ -1182,7 +1299,10 @@ class QSAIndexer(MultiPlatformOp):
             )
             rows_per_group = 1
             if (
-                envs.SGLANG_QSA_NUMERIC_SCORE.get()
+                (
+                    envs.SGLANG_QSA_NUMERIC_SCORE.get()
+                    or envs.SGLANG_ENABLE_QSA_GROUPED4_VERIFY.get()
+                )
                 and is_target_verify
                 and get_parallel().tp_size == 1
             ):

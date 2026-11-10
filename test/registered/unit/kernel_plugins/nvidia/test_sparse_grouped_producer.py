@@ -232,6 +232,145 @@ def test_outside_source_split_row_domain_is_stock(rows):
             lookup.assert_not_called()
 
 
+def grouped4_flags(stages=2, ctas=128, capability=(10, 7)):
+    stack = flags()
+    for field, value in [
+        (envs.SGLANG_ENABLE_QSA_GROUPED4_VERIFY, True),
+        (envs.SGLANG_ENABLE_QSA_GROUPED4_VERIFY_CHAIN, True),
+        (envs.SGLANG_QSA_GROUPED4_VERIFY_CHAIN_CTAS, ctas),
+        (envs.SGLANG_QSA_GROUPED4_VERIFY_PIPELINE_STAGES, stages),
+        (envs.SGLANG_QSA_GROUPED_SCORE_MAX_REQUESTS, 144),
+    ]:
+        stack.enter_context(field.override(value))
+    stack.enter_context(
+        patch.object(torch.cuda, "get_device_capability", return_value=capability)
+    )
+    return stack
+
+
+GROUPED4_WIDTHS = (4, 32, 64, 68, 88, 90, 480, 576, 580)
+
+
+def grouped4_declared(obj):
+    return {
+        s.rows: (s.variant, s.ctas_per_group)
+        for s in obj.numeric_preparation_signatures(8193 * 4, 16)
+        if s.operation == NumericOperation.SPARSE_SCORE and s.variant in (6, 7)
+    }
+
+
+@pytest.mark.parametrize("stages,variant,ctas", [(2, 7, 128), (0, 6, 512)])
+def test_grouped4_declares_its_cta_count_per_verify_width(stages, variant, ctas):
+    obj = indexer()
+    obj.numeric_signatures(GROUPED4_WIDTHS, 4)
+    with grouped4_flags(stages, ctas):
+        declared = grouped4_declared(obj)
+        others = obj._numeric_prepared_sparse - {
+            s for s in obj._numeric_prepared_sparse if s.variant in (6, 7)
+        }
+    assert declared == {rows: (variant, ctas) for rows in (68, 88, 480, 576)}
+    assert others and all(s.ctas_per_group == 0 for s in others)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("SGLANG_ENABLE_QSA_GROUPED4_VERIFY", False),
+        ("SGLANG_ENABLE_QSA_GROUPED4_VERIFY_CHAIN", False),
+        ("SGLANG_QSA_GROUPED_SCORE", False),
+        ("SGLANG_QSA_GROUPED4_VERIFY_PIPELINE_STAGES", 3),
+        ("SGLANG_QSA_GROUPED4_VERIFY_CHAIN_CTAS", 0),
+        ("SGLANG_QSA_GROUPED_SCORE_MAX_REQUESTS", 16),
+    ],
+)
+def test_grouped4_source_overrides_declare_nothing(field, value):
+    obj = indexer()
+    obj.numeric_signatures(GROUPED4_WIDTHS, 4)
+    with grouped4_flags(), getattr(envs, field).override(value):
+        assert grouped4_declared(obj) == {}
+
+
+@pytest.mark.parametrize("case", ["sm100", "tp4", "heads16"])
+def test_grouped4_device_tp_and_heads_outside_source_declare_nothing(case):
+    obj = indexer()
+    obj.index_n_heads = 16 if case == "heads16" else 4
+    obj.numeric_signatures(GROUPED4_WIDTHS, 4)
+    with grouped4_flags(capability=(10, 0) if case == "sm100" else (10, 7)):
+        if case == "tp4":
+            with patch.object(impl, "get_parallel", return_value=NS(tp_size=4)):
+                assert grouped4_declared(obj) == {}
+        else:
+            assert grouped4_declared(obj) == {}
+
+
+def grouped4_select(obj, rows, choose):
+    import sys
+
+    args = inputs(rows, 8)
+    native = torch.zeros((rows, 512), dtype=torch.int32)
+    topk = []
+    fake = NS(fast_topk=lambda *a, **kw: topk.append(a) or native)
+    with (
+        patch.dict(sys.modules, {"sglang.kernels.ops.attention.fast_topk": fake}),
+        patch.object(numeric_binding, "numeric_operator", side_effect=choose),
+        patch.object(
+            impl, "qsa_mqa_decode", return_value=torch.zeros((rows, args[4]))
+        ) as stock,
+    ):
+        out = obj.select_decode_tokens(
+            *args[:5], torch.zeros(rows), args[3], True, None, 4
+        )
+    assert out is native and len(topk) == 1
+    return args, topk[0], stock
+
+
+@pytest.mark.parametrize("rows", [68, 88, 576])
+def test_grouped4_scores_through_provider_then_stock_top_k(rows):
+    obj = indexer()
+    obj.numeric_signatures((rows,), 4)
+    with grouped4_flags():
+        declared = obj.numeric_preparation_signatures(8193 * 4, 16)
+        seen = []
+
+        def choose(signature, *, prepared):
+            assert prepared and signature in declared
+            assert (signature.variant, signature.ctas_per_group) == (7, 128)
+
+            def run(io):
+                seen.append(io)
+                io.scores_out.fill_(1.0)
+
+            return run
+
+        args, topk, stock = grouped4_select(obj, rows, choose)
+    stock.assert_not_called()
+    (io,) = seen
+    assert io.query.data_ptr() == args[0].data_ptr() and io.row_requests is None
+    assert (io.page_size, io.compress_ratio, io.scale) == (16, 4, 128**0.5)
+    assert io.compressed_slot_map.dtype == io.compressed_lengths.dtype == torch.int32
+    assert topk[0] is io.scores_out and io.scores_out.shape == (rows, args[4])
+
+
+@pytest.mark.parametrize("rows,change", [(64, None), (88, "ctas"), (88, "stages")])
+def test_grouped4_undeclared_or_changed_policy_is_stock(rows, change):
+    obj = indexer()
+    obj.numeric_signatures((rows,), 4)
+    with (
+        grouped4_flags(),
+        envs.SGLANG_QSA_NUMERIC_SCORE.override(False),
+        envs.SGLANG_QSA_SPLIT_TOPK.override(False),
+    ):
+        obj.numeric_preparation_signatures(8193 * 4, 16)
+        if change == "ctas":
+            envs.SGLANG_QSA_GROUPED4_VERIFY_CHAIN_CTAS.set(512)
+        elif change == "stages":
+            envs.SGLANG_QSA_GROUPED4_VERIFY_PIPELINE_STAGES.set(0)
+        _, _, stock = grouped4_select(
+            obj, rows, lambda *a, **kw: pytest.fail("unexpected provider lookup")
+        )
+    stock.assert_called_once()
+
+
 if __name__ == "__main__":
     import pytest
 

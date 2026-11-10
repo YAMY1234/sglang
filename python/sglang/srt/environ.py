@@ -302,6 +302,13 @@ class Envs:
     SGLANG_QSA_MK_SCORE_SHORT32 = EnvBool(False)
     SGLANG_QSA_GROUPED_SCORE = EnvBool(True)
     SGLANG_QSA_SPLIT_TOPK = EnvBool(True)
+    # TP1 target verify of 17..MAX_REQUESTS requests (at most 576 rows): the grouped4
+    # chain scorer; PIPELINE_STAGES 2 software-pipelines its key loads.
+    SGLANG_QSA_GROUPED_SCORE_MAX_REQUESTS = EnvInt(16)
+    SGLANG_ENABLE_QSA_GROUPED4_VERIFY = EnvBool(False)
+    SGLANG_ENABLE_QSA_GROUPED4_VERIFY_CHAIN = EnvBool(False)
+    SGLANG_QSA_GROUPED4_VERIFY_CHAIN_CTAS = EnvInt(512)
+    SGLANG_QSA_GROUPED4_VERIFY_PIPELINE_STAGES = EnvInt(0)
     # TP1 target verify on an FP8 KV pool: one union attention launch per layer.
     SGLANG_QSA_FP8_POOL_VERIFY = EnvBool(False)
     SGLANG_HC_GATE_MAX_ROWS = EnvInt(1)
