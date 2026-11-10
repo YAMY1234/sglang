@@ -1250,6 +1250,58 @@ def test_qsa_relative_prefill_scale_fold_is_bitwise_the_divide():
     assert torch.equal(folded[valid], stock[valid])
 
 
+@pytest.mark.parametrize("num_rows", [0, 1, 5, 9, 12, 40])
+def test_qsa_prefill_host_anchor_rows_match_the_device_rows(num_rows):
+    extend_lens = [3, 0, 2, 4, 1, 2]
+    pool_ids = [7, 8, 7, 7, 9, 2]
+    rows = torch.repeat_interleave(torch.tensor(pool_ids), torch.tensor(extend_lens))[
+        :num_rows
+    ]
+    is_last = torch.ones_like(rows, dtype=torch.bool)
+    if rows.numel() > 1:
+        is_last[:-1] = rows[:-1] != rows[1:]
+    assert (
+        qsa_backend_module._last_rows_of_runs(
+            extend_lens=extend_lens, pool_ids=pool_ids, num_rows=num_rows
+        )
+        == is_last.nonzero().flatten().tolist()
+    )
+
+
+@pytest.mark.parametrize(
+    "case", ["on", "off", "capturing", "host_short", "device_2d", "no_host"]
+)
+def test_qsa_prefill_host_path_reads_host_lens_only_when_they_line_up(
+    monkeypatch, case
+):
+    backend = object.__new__(QwenSparseAttnBackend)
+    backend._prefill_host_path = case != "off"
+    monkeypatch.setattr(
+        torch.cuda, "is_current_stream_capturing", lambda: case == "capturing"
+    )
+    host = {"host_short": [3, 4], "no_host": None}.get(case, [3, 4, 5])
+    device = torch.tensor([[3, 4, 5]] if case == "device_2d" else [3, 4, 5])
+    forward_batch = SimpleNamespace(
+        extend_seq_lens_cpu=host,
+        extend_seq_lens=device,
+        req_pool_indices_cpu=torch.tensor([5, 6, 7]),
+    )
+    rows = backend._host_extend_rows(
+        forward_batch=forward_batch, extend_seq_lens=device, batch_size=3
+    )
+    assert rows == (12 if case == "on" else None)
+    metadata = object()
+    backend._mtp_anchor_host_src = backend._mtp_anchor_host_source(
+        forward_batch=forward_batch, indexer_metadata=metadata, batch_size=3
+    )
+    anchor = backend._mtp_anchor_host_rows(metadata, 12)
+    if case == "on":
+        assert anchor == [2, 6, 11]
+        assert backend._mtp_anchor_host_rows(object(), 12) is None
+    else:
+        assert anchor is None
+
+
 def test_qsa_prefill_selection_microchunks_rows(monkeypatch):
     rows, keys, heads, head_dim = 65, 64, 4, 8
     token_topk, compress_ratio = 8, 4

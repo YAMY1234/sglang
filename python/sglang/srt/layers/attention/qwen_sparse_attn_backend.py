@@ -54,12 +54,38 @@ from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPoo
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_spec, get_stream
-from sglang.srt.utils import is_hip, is_sm100_supported, is_sm120
+from sglang.srt.utils import async_h2d, is_hip, is_sm100_supported, is_sm120
 
 logger = logging.getLogger(__name__)
 
 
 _TRTLLM_SPARSE_PAGE_SIZE = 64
+
+
+def _last_rows_of_runs(*, extend_lens, pool_ids, num_rows: int) -> list:
+    """Host twin of ``is_last.nonzero()`` in capture_mtp_sparse_indices.
+
+    Rows are laid out as ``repeat_interleave(arange(bs), extend_lens)`` cut to the
+    first ``num_rows``; a row is last when the next row's request-pool id differs,
+    and the final row always is.
+    """
+    limit = min(int(num_rows), sum(extend_lens))
+    rows = []
+    start = 0
+    # (pool id, last row inside the limit) of the previous non-empty request
+    prev = None
+    for extend_len, pool_id in zip(extend_lens, pool_ids):
+        if extend_len <= 0:
+            continue
+        if start >= limit:
+            break
+        if prev is not None and prev[0] != pool_id:
+            rows.append(prev[1])
+        start += extend_len
+        prev = (pool_id, min(start, limit) - 1)
+    if prev is not None:
+        rows.append(prev[1])
+    return rows
 
 
 @lru_cache(maxsize=1)
@@ -268,6 +294,11 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._graph_row_req_pool_indices = None
         self._trtllm_sparse_tables = {}
         self._mtp_shared_sparse_indices = None
+        from sglang.srt.environ import envs
+
+        self._prefill_host_path = envs.SGLANG_OPT_QSA_PREFILL_HOST_PATH.get()
+        # (metadata, host extend lens, host pool ids) of the last extend metadata.
+        self._mtp_anchor_host_src = None
         self._trtllm_workspace = None
         self._trtllm_counters = {}
         self._graph_extend_lens = None
@@ -672,6 +703,8 @@ class QwenSparseAttnBackend(AttentionBackend):
                 extend_seq_lens = forward_batch.extend_seq_lens
                 if extend_seq_lens is None:
                     raise ValueError("QSA extend metadata requires extend_seq_lens")
+                # A host output_size keeps repeat_interleave from reading its
+                # length back from the device; None keeps that read.
                 token_to_batch_idx = torch.repeat_interleave(
                     torch.arange(
                         batch_size,
@@ -679,6 +712,11 @@ class QwenSparseAttnBackend(AttentionBackend):
                         dtype=torch.int32,
                     ),
                     extend_seq_lens.to(torch.long),
+                    output_size=self._host_extend_rows(
+                        forward_batch=forward_batch,
+                        extend_seq_lens=extend_seq_lens,
+                        batch_size=batch_size,
+                    ),
                 )
                 # More mapped rows than physical would index past them;
                 # fewer is fine (DP MAX_LEN padding is trimmed downstream).
@@ -780,12 +818,77 @@ class QwenSparseAttnBackend(AttentionBackend):
             ),
             prefill_sequence_lengths_cpu=prefill_sequence_lengths_cpu,
         )
+        if self._prefill_host_path and self._mtp_shared_sparse_indices is not None:
+            self._mtp_anchor_host_src = (
+                None
+                if decode_like
+                else self._mtp_anchor_host_source(
+                    forward_batch=forward_batch,
+                    indexer_metadata=indexer_metadata,
+                    batch_size=row_req_pool_indices.shape[0],
+                )
+            )
         return QwenSparseAttnMetadata(
             sequence_lengths=sequence_lengths,
             token_to_batch_idx=token_to_batch_idx,
             token_slot_table=token_slot_table,
             indexer_metadata=indexer_metadata,
             row_req_pool_indices=row_req_pool_indices,
+        )
+
+    def _host_extend_rows(self, *, forward_batch, extend_seq_lens, batch_size: int):
+        """Total extend rows from the host lens the device lens were copied from;
+        None when the host path is off, the host list does not line up with the
+        device tensor, or a graph is being captured."""
+        if not self._prefill_host_path or torch.cuda.is_current_stream_capturing():
+            return None
+        host_lens = forward_batch.extend_seq_lens_cpu
+        if (
+            host_lens is None
+            or len(host_lens) != batch_size
+            or extend_seq_lens.dim() != 1
+            or extend_seq_lens.shape[0] != batch_size
+        ):
+            return None
+        return sum(int(x) for x in host_lens)
+
+    @staticmethod
+    def _mtp_anchor_host_source(*, forward_batch, indexer_metadata, batch_size: int):
+        """Host copies of what capture_mtp_sparse_indices' eager path reads on the
+        device: the extend lens behind token_to_batch_idx and each request's pool id."""
+        host_lens = forward_batch.extend_seq_lens_cpu
+        host_pool = forward_batch.req_pool_indices_cpu
+        extend_seq_lens = forward_batch.extend_seq_lens
+        if (
+            host_lens is None
+            or host_pool is None
+            or extend_seq_lens is None
+            or len(host_lens) != batch_size
+            or extend_seq_lens.dim() != 1
+            or extend_seq_lens.shape[0] != batch_size
+            or host_pool.dim() != 1
+            or host_pool.shape[0] < batch_size
+        ):
+            return None
+        return (
+            indexer_metadata,
+            tuple(int(x) for x in host_lens),
+            tuple(int(x) for x in host_pool[:batch_size].tolist()),
+        )
+
+    def _mtp_anchor_host_rows(self, metadata, num_rows: int):
+        """The seed rows of capture_mtp_sparse_indices' eager path, from host lists;
+        None unless this metadata's host lists were recorded."""
+        src = self._mtp_anchor_host_src
+        if (
+            not self._prefill_host_path
+            or src is None
+            or src[0] is not metadata
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return None
+        return _last_rows_of_runs(
+            extend_lens=src[1], pool_ids=src[2], num_rows=num_rows
         )
 
     def init_forward_metadata(self, forward_batch):
@@ -1250,10 +1353,16 @@ class QwenSparseAttnBackend(AttentionBackend):
         row_req_pool_indices = metadata.req_pool_indices[
             row_to_req[: topk_indices.shape[0]]
         ]
-        is_last = torch.ones_like(row_req_pool_indices, dtype=torch.bool)
-        if row_req_pool_indices.numel() > 1:
-            is_last[:-1] = row_req_pool_indices[:-1] != row_req_pool_indices[1:]
-        anchor_rows = is_last.nonzero().flatten()
+        host_rows = self._mtp_anchor_host_rows(metadata, topk_indices.shape[0])
+        if host_rows is not None:
+            anchor_rows = async_h2d(
+                host_rows, dtype=torch.long, device=row_req_pool_indices.device
+            )
+        else:
+            is_last = torch.ones_like(row_req_pool_indices, dtype=torch.bool)
+            if row_req_pool_indices.numel() > 1:
+                is_last[:-1] = row_req_pool_indices[:-1] != row_req_pool_indices[1:]
+            anchor_rows = is_last.nonzero().flatten()
         req_rows = row_req_pool_indices[anchor_rows]
         captured_lens = metadata.get_seqlens_expanded()[anchor_rows]
         state.capture(topk_indices[anchor_rows], req_rows, captured_lens, layer_id)
@@ -1539,9 +1648,19 @@ class QwenSparseAttnBackend(AttentionBackend):
 
         # Current-chunk K/V has already been committed to the cache above.
         pool = self.token_to_kv_pool
-        sequence_lens_tensor = torch.tensor(
-            sequence_lens, dtype=torch.int32, device=q.device
-        )
+        max_q = None
+        if self._prefill_host_path and not torch.cuda.is_current_stream_capturing():
+            # Staged in pinned memory, so the copy does not drain the stream; max_q
+            # is the host max of the lens cu_seqlens_q is built from.
+            sequence_lens_tensor = async_h2d(
+                sequence_lens, dtype=torch.int32, device=q.device
+            )
+            if len(extend_lens) == forward_batch.extend_seq_lens.shape[0]:
+                max_q = max(extend_lens)
+        else:
+            sequence_lens_tensor = torch.tensor(
+                sequence_lens, dtype=torch.int32, device=q.device
+            )
         cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
         packed_k, packed_v = pack_qsa_prefill_kv(
             k=pool.layer_router.read(layer.layer_id).key(),
@@ -1562,6 +1681,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             cu_seqlens_k,
             sequence_lens_tensor,
             layer.scaling,
+            max_q=max_q,
         )
         return self._pad_extend_output(output, num_output_rows)
 
