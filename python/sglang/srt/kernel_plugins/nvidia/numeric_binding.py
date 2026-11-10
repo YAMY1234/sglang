@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Collection, Sequence
+import logging
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import fields
 from typing import TYPE_CHECKING
 
@@ -45,6 +46,19 @@ from sglang.kernels.plugin_kernels.nvidia.numeric import (
     SparseSelectIO,
     numeric_registry,
 )
+from sglang.srt.environ import envs
+
+logger = logging.getLogger(__name__)
+
+_OFFER_LOG = envs.SGLANG_NVIDIA_MEGAKERNEL_OFFER_LOG.get()
+_offer_log_keys: set = set()
+
+
+def _log_offer(key, message: str, *args) -> None:
+    if key not in _offer_log_keys:
+        _offer_log_keys.add(key)
+        logger.info("NVIDIA megakernel offer: " + message, *args)
+
 
 _IO_TYPES = {
     NumericOperation.MTP_CAPTURE_SEED: MtpCaptureSeedIO,
@@ -75,19 +89,34 @@ def numeric_capability_supported(
     This is startup admission only. Forward calls still require an exact offer
     and complete caller-buffer preflight; they never resolve a spec here.
     """
-    from sglang.srt.environ import envs
     from sglang.srt.kernel_plugins.nvidia.binding import megakernel_enabled
 
     if not (
         megakernel_enabled() and envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
     ):
-        return False
+        return _capability_result(query, False, "plugin or runtime master off")
     callback = None if spec is None else getattr(spec, "numeric_capability", None)
     if callback is None:
-        return False
+        return _capability_result(query, False, "spec has no capability callback")
     supported = callback(query)
     if type(supported) is not bool:
         raise TypeError("numeric capability callback must return bool")
+    return _capability_result(
+        query, supported, "accepted" if supported else "rejected by the plugin"
+    )
+
+
+def _capability_result(
+    query: NumericCapabilityQuery, supported: bool, why: str
+) -> bool:
+    if _OFFER_LOG:
+        _log_offer(
+            query,
+            "capability %s %s: %s",
+            query.operation.name,
+            dict(query.attributes),
+            why,
+        )
     return supported
 
 
@@ -151,17 +180,24 @@ def numeric_operator(
     metadata refill and producer stream joins remain the producer's work.
     """
     if not prepared or signature.operation not in _IO_TYPES:
+        if _OFFER_LOG:
+            _log_dispatch(signature, "stock: view not prepared or operation unbound")
         return None
     offer = numeric_registry.get(signature)
     if offer is None:
+        if _OFFER_LOG:
+            _log_dispatch(signature, "stock: no provider offer")
         return None
-    from sglang.srt.environ import envs
     from sglang.srt.kernel_plugins.nvidia.binding import megakernel_enabled
 
     if not (
         megakernel_enabled() and envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
     ):
+        if _OFFER_LOG:
+            _log_dispatch(signature, "stock: plugin or runtime master off")
         return None
+    if _OFFER_LOG:
+        _log_dispatch(signature, "provider bound")
     return bind_numeric_operator(
         enabled=True,
         signature=signature,
@@ -171,14 +207,54 @@ def numeric_operator(
     )
 
 
+def _log_dispatch(signature: OperatorSignature, why: str) -> None:
+    _log_offer(("dispatch", signature), "dispatch %s: %s", signature, why)
+
+
+def log_numeric_offers(
+    model, declarations: Mapping[object, tuple[OperatorSignature, ...]], *, role: str
+) -> None:
+    """Per (role, layer, op), the declared rows with and without a provider offer.
+
+    Runs after the plugin registered its offers; a producer that declared nothing
+    stopped at its own source gates (env, TP size, shape).
+    """
+    for name, producer in model.named_modules():
+        declared = declarations.get(producer)
+        if declared is None:
+            continue
+        if not declared:
+            _log_offer((role, name), "%s %s: declared nothing", role, name)
+        rows = {}
+        for signature in declared:
+            offered = numeric_registry.get(signature) is not None
+            rows.setdefault(signature.operation.name, ([], []))[offered].append(
+                getattr(signature, "rows", None)
+            )
+        for operation, (missing, offered) in rows.items():
+            _log_offer(
+                (role, name, operation),
+                "%s %s %s: offered rows %s; no offer for rows %s",
+                role,
+                name,
+                operation,
+                offered,
+                missing,
+            )
+
+
 def collect_numeric_signatures(
     producers: Collection[object],
     widths: tuple[int, ...],
     tokens_per_request: int,
     *,
     capability_spec=None,
+    declarations: dict | None = None,
 ) -> tuple[OperatorSignature, ...]:
-    """Read framework producers at startup; no producer object reaches a plugin."""
+    """Read framework producers at startup; no producer object reaches a plugin.
+
+    ``declarations``, when given, receives each producer's own declaration.
+    """
     signatures = {}
     for producer in producers:
         if isinstance(producer, NumericMetadataProducer):
@@ -231,4 +307,6 @@ def collect_numeric_signatures(
                 ):
                     raise TypeError("deferred KV signatures cannot contain bool fields")
                 signatures[signature] = None
+            if declarations is not None:
+                declarations[producer] = declared
     return tuple(signatures)

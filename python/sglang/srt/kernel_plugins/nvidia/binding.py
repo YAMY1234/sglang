@@ -45,7 +45,10 @@ from sglang.srt.arg_groups.model_override_base import model_config_of, resolving
 from sglang.srt.environ import envs
 from sglang.srt.kernel_plugins.amd.binding import msa_serves
 from sglang.srt.kernel_plugins.nvidia.eagle_binding import EagleBinding
-from sglang.srt.kernel_plugins.nvidia.numeric_binding import collect_numeric_signatures
+from sglang.srt.kernel_plugins.nvidia.numeric_binding import (
+    collect_numeric_signatures,
+    log_numeric_offers,
+)
 from sglang.srt.mem_cache.layout.paged_view import paged_row_view
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.plugins import GENERAL_PLUGINS_GROUP
@@ -350,6 +353,8 @@ class MegakernelBinding:
     def __init__(self, *, model: torch.nn.Module):
         self._model = model
         self._numeric_spec = None
+        # Each producer's numeric declarations, kept only for the offer log.
+        self._numeric_declarations: Optional[dict] = None
         self._cache_sources: dict[int, tuple] = {}
         self._sealed: dict[str, _SealedSource] = {}
         self._preparation: Optional[PreparationView] = None
@@ -372,7 +377,9 @@ class MegakernelBinding:
                 producer, "numeric_state_preparation_signatures", None
             )
             if callable(prepare_state):
-                numeric_signatures.extend(prepare_state(model_runner))
+                numeric_signatures.extend(
+                    self._declared(producer, prepare_state(model_runner))
+                )
         prepare_numeric = tuple(
             producer.numeric_preparation_signatures
             for producer in self._model.modules()
@@ -389,11 +396,19 @@ class MegakernelBinding:
                 getattr(model_runner, "model_config", None), "context_len", 0
             )
             for prepare in prepare_numeric:
-                numeric_signatures.extend(prepare(context_len, page_size))
+                numeric_signatures.extend(
+                    self._declared(prepare.__self__, prepare(context_len, page_size))
+                )
         self._preparation = PreparationView(
             hybrid=hybrid, numeric_signatures=tuple(dict.fromkeys(numeric_signatures))
         )
         return self._preparation
+
+    def _declared(self, producer, signatures: tuple) -> tuple:
+        if self._numeric_declarations is not None:
+            previous = self._numeric_declarations.get(producer, ())
+            self._numeric_declarations[producer] = previous + tuple(signatures)
+        return signatures
 
     def forward_view(self, forward_batch: Optional[ForwardBatch] = None) -> ForwardView:
         """The view of the forward running now (a target step or a draft step)."""
@@ -1232,12 +1247,15 @@ def install_megakernel(
     tokens = _tokens_per_request()
     binding = _binding_class(hf_config.architectures)(model=model)
     binding._numeric_spec = spec
+    if envs.SGLANG_NVIDIA_MEGAKERNEL_OFFER_LOG.get():
+        binding._numeric_declarations = {}
     numeric_signatures = (
         collect_numeric_signatures(
             tuple(model.modules()),
             tuple(range(1, spec.numeric_max_rows + 1)),
             tokens,
             capability_spec=spec,
+            declarations=binding._numeric_declarations,
         )
         if spec.numeric_max_rows > 0
         else ()
@@ -1323,6 +1341,12 @@ def prepare_megakernel(model_runner: ModelRunner) -> None:
         installed.prepare(
             installed.built, installed.binding.preparation_view(model_runner)
         )
+    declarations = (
+        None if installed is None else installed.binding._numeric_declarations
+    )
+    if declarations is not None:
+        role = "draft" if model_runner.is_draft_worker else "target"
+        log_numeric_offers(model_runner.model, declarations, role=role)
 
 
 def bind_speculative_runtime_hooks(

@@ -431,6 +431,134 @@ class TestNumericStartupMetadata(unittest.TestCase):
         self.assertEqual(descriptor.numeric_max_rows, 0)
 
 
+class TestNumericOfferLog(unittest.TestCase):
+    LOGGER = "sglang.srt.kernel_plugins.nvidia.numeric_binding"
+
+    def setUp(self):
+        def select(rows):
+            return api.NumericSignature(
+                api.NumericOperation.SPARSE_SELECT,
+                rows,
+                8,
+                1,
+                128,
+                512,
+                4,
+                api.ScalarType.FP32,
+            )
+
+        self.offered, self.missing = select(4), select(8)
+        self.registry = api.NumericRegistry()
+        self.registry.register(api.NumericOffer(self.offered, lambda io: None))
+        for patcher in (
+            patch.object(numeric_binding, "numeric_registry", self.registry),
+            patch.object(numeric_binding, "_offer_log_keys", set()),
+            patch.object(numeric_binding, "_OFFER_LOG", True),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def messages(self, logs):
+        return [record.getMessage() for record in logs.records]
+
+    def test_off_by_default_and_silent_on_dispatch(self):
+        from sglang.srt.environ import envs
+
+        self.assertFalse(envs.SGLANG_NVIDIA_MEGAKERNEL_OFFER_LOG.get())
+        with (
+            patch.object(numeric_binding, "_OFFER_LOG", False),
+            self.assertNoLogs(self.LOGGER, level="INFO"),
+        ):
+            numeric_binding.numeric_operator(self.missing, prepared=False)
+            numeric_binding.numeric_operator(self.missing, prepared=True)
+
+    def test_dispatch_logs_each_stock_reason_and_binding_once(self):
+        from sglang.srt.environ import envs
+
+        with self.assertLogs(self.LOGGER, level="INFO") as logs:
+            for _ in range(2):
+                numeric_binding.numeric_operator(self.missing, prepared=False)
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("view not prepared", logs.records[0].getMessage())
+        for plugin, master, why in (
+            (True, False, "plugin or runtime master off"),
+            (True, True, "provider bound"),
+        ):
+            numeric_binding._offer_log_keys.clear()
+            with (
+                patch(
+                    "sglang.srt.kernel_plugins.nvidia.binding.megakernel_enabled",
+                    return_value=plugin,
+                ),
+                envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(master),
+                self.assertLogs(self.LOGGER, level="INFO") as logs,
+            ):
+                numeric_binding.numeric_operator(self.offered, prepared=True)
+                numeric_binding.numeric_operator(self.missing, prepared=True)
+            self.assertEqual(len(logs.records), 2)
+            self.assertIn(why, logs.records[0].getMessage())
+            self.assertIn("no provider offer", logs.records[1].getMessage())
+
+    def test_capability_outcome_logged_once_per_query(self):
+        from sglang.srt.environ import envs
+
+        spec = SimpleNamespace(
+            numeric_capability=lambda query: query.attributes[0][1] == 4
+        )
+        with (
+            patch(
+                "sglang.srt.kernel_plugins.nvidia.binding.megakernel_enabled",
+                return_value=True,
+            ),
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+            self.assertLogs(self.LOGGER, level="INFO") as logs,
+        ):
+            for signature in (self.offered, self.missing, self.missing):
+                numeric_binding.signature_capability_supported(
+                    signature, spec=spec, tp_size=4
+                )
+        messages = self.messages(logs)
+        self.assertEqual(len(messages), 2)
+        self.assertTrue(messages[0].endswith("accepted"))
+        self.assertIn("'tp_size': 4", messages[1])
+        self.assertTrue(messages[1].endswith("rejected by the plugin"))
+
+    def test_startup_ledger_names_role_layer_op_and_silent_producers(self):
+        import torch
+
+        offered, missing = self.offered, self.missing
+
+        class Producer(torch.nn.Module):
+            def __init__(self, declared):
+                super().__init__()
+                self.declared = declared
+
+            def numeric_signatures(self, widths, tokens):
+                return self.declared
+
+        model = torch.nn.Module()
+        model.indexer = Producer((offered, missing))
+        model.silent = Producer(())
+        declarations = {}
+        numeric_binding.collect_numeric_signatures(
+            tuple(model.modules()), (4, 8), 4, declarations=declarations
+        )
+        self.assertEqual(
+            declarations, {model.indexer: (offered, missing), model.silent: ()}
+        )
+        with self.assertLogs(self.LOGGER, level="INFO") as logs:
+            for _ in range(2):
+                numeric_binding.log_numeric_offers(model, declarations, role="target")
+        self.assertEqual(
+            self.messages(logs),
+            [
+                "NVIDIA megakernel offer: target indexer SPARSE_SELECT: "
+                "offered rows [4]; no offer for rows [8]",
+                "NVIDIA megakernel offer: target silent: declared nothing",
+            ],
+        )
+
+
 class TestLocalProducerViews(unittest.TestCase):
     def test_mix_passes_framework_buffers_and_explicit_tp_policy(self):
         import torch

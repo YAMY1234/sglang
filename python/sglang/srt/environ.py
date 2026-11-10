@@ -303,6 +303,9 @@ class Envs:
     SGLANG_QSA_GROUPED_SCORE = EnvBool(True)
     SGLANG_QSA_SPLIT_TOPK = EnvBool(True)
     SGLANG_HC_GATE_MAX_ROWS = EnvInt(1)
+    # Log once per role/layer/op whether a numeric provider was offered and bound,
+    # or why stock runs; read once at import, so it costs nothing when off.
+    SGLANG_NVIDIA_MEGAKERNEL_OFFER_LOG = EnvBool(False)
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
