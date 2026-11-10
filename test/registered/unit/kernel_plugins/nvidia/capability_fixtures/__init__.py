@@ -149,6 +149,14 @@ def contract_geometry(s):
                     )
                 )
             )
+        if s.operation == Op.POOL_UNION_ATTENTION:
+            return (
+                (s.query_heads, s.kv_heads, s.head_dim, s.selected_count)
+                == (24, 2, 256, 512)
+                and (s.compress_ratio, s.scalar_type, s.variant) == (4, 1, 0)
+                and 64 <= s.rows <= 576
+                and s.rows % 4 == 0
+            )
         return (
             s.operation == Op.DIRECT_POOL_ATTENTION
             and s.head_dim == 256
@@ -308,6 +316,7 @@ _SCHEMAS = {
     },
     NumericOperation.GDN_NATIVE_PDL: (NativeGdnPdlSignature, ()),
     NumericOperation.DIRECT_POOL_ATTENTION: (NumericSignature, ("tp_size",)),
+    NumericOperation.POOL_UNION_ATTENTION: (NumericSignature, ("tp_size",)),
     NumericOperation.LOCAL_EXPERTS: (
         ExpertSignature,
         (
@@ -442,6 +451,8 @@ def _source_supported(s, actual):
         return True
     if op == NumericOperation.DIRECT_POOL_ATTENTION:
         return actual["tp_size"] == (4 if s.variant == 0 else 1)
+    if op == NumericOperation.POOL_UNION_ATTENTION:
+        return actual["tp_size"] == 1
     if op == NumericOperation.LOCAL_EXPERTS:
         flags = (
             "sf_pack_enabled",

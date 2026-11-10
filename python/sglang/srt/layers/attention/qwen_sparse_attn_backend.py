@@ -1542,6 +1542,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             KvTensors,
             NumericOperation,
             NumericSignature,
+            PoolUnionAttentionIO,
             ScalarType,
         )
         from sglang.srt.environ import envs
@@ -1550,6 +1551,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             pool_decode_enabled,
             pool_device_sms,
             pool_scratch_elements,
+            union_workspace,
         )
 
         if not (
@@ -1566,6 +1568,15 @@ class QwenSparseAttnBackend(AttentionBackend):
             variant = 2
         else:
             return None
+        # An FP8 pool takes the union kernel: TP1 single-chain verify only.
+        union = key_pool.dtype == torch.float8_e4m3fn
+        if union and not (
+            variant == 1
+            and envs.SGLANG_QSA_FP8_POOL_VERIFY.get()
+            and int(getattr(forward_batch.spec_info, "topk", 1) or 1) == 1
+        ):
+            return None
+        kv_dtype = torch.float8_e4m3fn if union else torch.bfloat16
         rows = q.shape[0]
         indexer = metadata.indexer_metadata
         positions = None if indexer is None else indexer.decode_logical_positions
@@ -1594,12 +1605,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             and value_pool.shape == key_pool.shape
             and key_pool.is_contiguous()
             and value_pool.is_contiguous()
-            and key_pool.dtype
-            == value_pool.dtype
-            == q.dtype
-            == k.dtype
-            == v.dtype
-            == torch.bfloat16
+            and key_pool.dtype == value_pool.dtype == k.dtype == v.dtype == kv_dtype
+            and q.dtype == torch.bfloat16
             and q.is_cuda
             and k.shape == v.shape == (rows, key_pool.shape[1], layer.head_dim)
             and all(
@@ -1639,7 +1646,11 @@ class QwenSparseAttnBackend(AttentionBackend):
             return None
         run = numeric_operator(
             NumericSignature(
-                NumericOperation.DIRECT_POOL_ATTENTION,
+                (
+                    NumericOperation.POOL_UNION_ATTENTION
+                    if union
+                    else NumericOperation.DIRECT_POOL_ATTENTION
+                ),
                 rows,
                 layer.tp_q_head_num,
                 key_pool.shape[1],
@@ -1647,12 +1658,50 @@ class QwenSparseAttnBackend(AttentionBackend):
                 indices.shape[1],
                 self.compress_ratio,
                 ScalarType.BF16,
-                variant=variant,
+                variant=0 if union else variant,
             ),
             prepared=True,
         )
         if run is None:
             return None
+        query = q.view(rows, layer.tp_q_head_num, layer.head_dim)
+        selected = indices.to(torch.int32).contiguous()
+        output = torch.empty(
+            (rows, layer.tp_q_head_num, layer.head_dim), dtype=q.dtype, device=q.device
+        )
+        selection = DirectPoolSelection(
+            slot_map, row_requests, selected, metadata.sequence_lengths, positions
+        )
+        if union:
+            splits, integers, floats = union_workspace(
+                rows,
+                pool_device_sms(q.device),
+                kv_heads=key_pool.shape[1],
+                head_dim=layer.head_dim,
+                query_heads=layer.tp_q_head_num,
+                selected_count=indices.shape[1],
+                compress_ratio=self.compress_ratio,
+            )
+            # E4M3 widens to BF16 exactly; the pool carries no K/V scale.
+            run(
+                PoolUnionAttentionIO(
+                    query,
+                    None,
+                    k,
+                    v,
+                    locations,
+                    KvTensors(key_pool, value_pool, 1.0, 1.0, 1),
+                    selection,
+                    layer.scaling,
+                    width,
+                    not kv_prestored,
+                    output,
+                    torch.empty(floats, dtype=torch.float32, device=q.device),
+                    torch.empty(integers, dtype=torch.int32, device=q.device),
+                    splits,
+                )
+            )
+            return output.view(rows, -1)
         # Complete all caller storage/metadata before the first permitted KV write.
         scratch_elements = pool_scratch_elements(
             rows,
@@ -1662,11 +1711,6 @@ class QwenSparseAttnBackend(AttentionBackend):
             query_heads=layer.tp_q_head_num,
             selected_count=indices.shape[1],
             compress_ratio=self.compress_ratio,
-        )
-        query = q.view(rows, layer.tp_q_head_num, layer.head_dim)
-        selected = indices.to(torch.int32).contiguous()
-        output = torch.empty(
-            (rows, layer.tp_q_head_num, layer.head_dim), dtype=q.dtype, device=q.device
         )
         scratch = torch.empty(
             scratch_elements,
@@ -1681,13 +1725,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 v,
                 locations,
                 KvTensors(key_pool, value_pool, None, None, 1),
-                DirectPoolSelection(
-                    slot_map,
-                    row_requests,
-                    selected,
-                    metadata.sequence_lengths,
-                    positions,
-                ),
+                selection,
                 layer.scaling,
                 width,
                 not kv_prestored,

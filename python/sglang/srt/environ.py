@@ -302,6 +302,8 @@ class Envs:
     SGLANG_QSA_MK_SCORE_SHORT32 = EnvBool(False)
     SGLANG_QSA_GROUPED_SCORE = EnvBool(True)
     SGLANG_QSA_SPLIT_TOPK = EnvBool(True)
+    # TP1 target verify on an FP8 KV pool: one union attention launch per layer.
+    SGLANG_QSA_FP8_POOL_VERIFY = EnvBool(False)
     SGLANG_HC_GATE_MAX_ROWS = EnvInt(1)
     # Log once per role/layer/op whether a numeric provider was offered and bound,
     # or why stock runs; read once at import, so it costs nothing when off.

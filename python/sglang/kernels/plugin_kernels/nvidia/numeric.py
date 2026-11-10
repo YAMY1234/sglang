@@ -31,6 +31,7 @@ class NumericOperation(IntEnum):
     SPARSE_SELECT = 3
     PACKED_ATTENTION = 4  # Reserved unsupported operation; no producer or IO surface.
     DIRECT_POOL_ATTENTION = 5
+    POOL_UNION_ATTENTION = 6
     MTP_CAPTURE_SEED = 7
     MTP_DEFERRED_KV_PREPARE = 8
     HC_GATE = 10
@@ -358,6 +359,17 @@ class DirectPoolAttentionIO:
 
 
 @dataclass(frozen=True, slots=True)
+class PoolUnionAttentionIO(DirectPoolAttentionIO):
+    """FP8-pool target verify; scratch_out is FP32, integer_scratch_out INT32.
+
+    split_count is the host-resolved split plan, fixed before capture.
+    """
+
+    integer_scratch_out: Tensor
+    split_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class HcGateIO:
     normed: Tensor
     inject_weight: Tensor
@@ -660,6 +672,7 @@ NumericIO = (
     SparseScoreIO
     | SparseSelectIO
     | DirectPoolAttentionIO
+    | PoolUnionAttentionIO
     | HcGateIO
     | HcApplyNormIO
     | HcApplyNormGateIO

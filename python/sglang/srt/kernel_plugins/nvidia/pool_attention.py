@@ -45,14 +45,21 @@ def pool_signatures(
         envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get() and pool_decode_enabled()
     ):
         return ()
+    routes = [
+        (NumericOperation.DIRECT_POOL_ATTENTION, variant, 1) for variant in (2, 1)
+    ]
+    if envs.SGLANG_QSA_FP8_POOL_VERIFY.get():
+        # The FP8 union serves width-4 target verify only.
+        routes.append((NumericOperation.POOL_UNION_ATTENTION, 0, 4))
     return tuple(
         signature
         for rows in widths
         if type(rows) is int and rows > 0
-        for variant in (2, 1)
-        if signature_capability_supported(
+        for operation, variant, width in routes
+        if rows % width == 0
+        and signature_capability_supported(
             signature := NumericSignature(
-                NumericOperation.DIRECT_POOL_ATTENTION,
+                operation,
                 rows,
                 query_heads,
                 kv_heads,
@@ -88,3 +95,26 @@ def pool_scratch_elements(
     splits = math.ceil(columns / chunk)
     padded_heads = 1 << ((query_heads // kv_heads) - 1).bit_length()
     return rows * kv_heads * splits * padded_heads * (head_dim + 2)
+
+
+def union_workspace(
+    rows, sms, *, kv_heads, head_dim, query_heads, selected_count, compress_ratio
+):
+    """The source W4 union plan: (splits, INT32 elements, FP32 elements)."""
+    requests = rows // 4
+    pairs = max(1, requests * kv_heads)
+    if pairs > sms:
+        splits = 2
+    else:
+        # Least wave-quantized work per CTA, each split charged 10% for its merge.
+        splits = min(
+            range(1, 17),
+            key=lambda s: (-(-pairs * s // sms) / s * (1.0 + 0.1 * s), s),
+        )
+    sort_width = 1 << (4 * selected_count - 1).bit_length()
+    tail = max(16, 1 << (4 + 2 * compress_ratio - 1).bit_length())
+    tokens = sort_width * compress_ratio + tail
+    padded_rows = max(16, 1 << (4 * query_heads // kv_heads - 1).bit_length())
+    stats = requests * kv_heads * splits * padded_rows
+    integers = requests * (2 * tokens + sort_width + 1) + rows
+    return splits, integers, stats * (head_dim + 2)

@@ -521,3 +521,110 @@ if __name__ == "__main__":
     import pytest
 
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def fp8_state(rows=128):
+    obj, args = state(rows, 4)
+    fp8 = torch.float8_e4m3fn
+    args[1] = torch.zeros((rows, 2, 256), dtype=fp8)
+    args[2] = torch.zeros((rows, 2, 256), dtype=fp8)
+    args[6] = torch.zeros((rows + 1, 2, 256), dtype=fp8)
+    args[7] = torch.zeros((rows + 1, 2, 256), dtype=fp8)
+    return obj, args
+
+
+def union_signatures(widths):
+    return [
+        s
+        for s in attention().numeric_signatures(widths, 4)
+        if s.operation == api.NumericOperation.POOL_UNION_ATTENTION
+    ]
+
+
+def test_fp8_union_declared_only_when_enabled():
+    widths = (4, 60, 64, 66, 128, 576, 580)
+    assert not union_signatures(widths)
+    with envs.SGLANG_QSA_FP8_POOL_VERIFY.override(True):
+        assert [s.rows for s in union_signatures(widths)] == [64, 128, 576]
+        assert all(s.variant == 0 for s in union_signatures(widths))
+        with patch.object(model, "get_parallel", return_value=NS(tp_size=4)):
+            assert not union_signatures(widths)
+
+
+@pytest.mark.parametrize("rows", [64, 128, 576])
+def test_fp8_union_caller_buffers_and_source_plan(rows):
+    obj, args = fp8_state(rows)
+    seen = []
+
+    def run(io):
+        seen.append(io)
+        io.output.fill_(3)
+
+    with envs.SGLANG_QSA_FP8_POOL_VERIFY.override(True):
+        registry = api.NumericRegistry()
+        (signature,) = union_signatures((rows,))
+        registry.register(api.NumericOffer(signature, run))
+        with patch.object(numeric_binding, "numeric_registry", registry):
+            output = obj._try_numeric_pool_attention(*args)
+    assert torch.equal(output, torch.full((rows, 6144), 3, dtype=torch.bfloat16))
+    (io,) = seen
+    assert type(io) is api.PoolUnionAttentionIO
+    assert io.new_k is args[1] and io.kv.k is args[6] and io.kv.v is args[7]
+    assert (io.kv.k_scale, io.kv.v_scale, io.query_width) == (1.0, 1.0, 4)
+    assert io.selection.selected_indices.dtype == torch.int32
+    splits, integers, floats = policy.union_workspace(
+        rows,
+        148,
+        kv_heads=2,
+        head_dim=256,
+        query_heads=24,
+        selected_count=512,
+        compress_ratio=4,
+    )
+    assert io.split_count == splits
+    assert io.integer_scratch_out.dtype == torch.int32
+    assert io.integer_scratch_out.numel() == integers
+    assert io.scratch_out.dtype == torch.float32 and io.scratch_out.numel() == floats
+
+
+@pytest.mark.parametrize("case", ["off", "decode", "topk", "bf16_new_kv"])
+def test_fp8_pool_outside_union_scope_keeps_stock(case):
+    obj, args = fp8_state()
+    if case == "decode":
+        args[4].forward_mode = ForwardMode.DECODE
+    elif case == "topk":
+        args[4].spec_info.topk = 4
+    elif case == "bf16_new_kv":
+        args[1] = args[1].to(torch.bfloat16)
+    with ExitStack() as stack:
+        if case != "off":
+            stack.enter_context(envs.SGLANG_QSA_FP8_POOL_VERIFY.override(True))
+        lookup = stack.enter_context(patch.object(numeric_binding, "numeric_operator"))
+        assert obj._try_numeric_pool_attention(*args) is None
+        lookup.assert_not_called()
+
+
+@pytest.mark.parametrize("sms", [80, 148, 256])
+@pytest.mark.parametrize("requests", [16, 43, 64, 86, 128, 144])
+def test_union_workspace_matches_original_source_plan(requests, sms):
+    # Literal source choose_union_splits and buffers at W4, Q24/KV2, 512 blocks.
+    pairs = requests * 2
+    if pairs > sms:
+        splits = 2
+    else:
+        cost = lambda s: -(-pairs * s // sms) / s * (1.0 + 0.1 * s)
+        splits = min(range(1, 17), key=lambda s: (cost(s), s))
+    nb, nt, qp = 2048, 2048 * 4 + 16, 64
+    assert policy.union_workspace(
+        requests * 4,
+        sms,
+        kv_heads=2,
+        head_dim=256,
+        query_heads=24,
+        selected_count=512,
+        compress_ratio=4,
+    ) == (
+        splits,
+        requests * (2 * nt + nb + 1) + requests * 4,
+        requests * 2 * splits * qp * (256 + 2),
+    )
