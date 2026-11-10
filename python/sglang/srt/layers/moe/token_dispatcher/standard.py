@@ -64,7 +64,8 @@ class StandardDispatchOutput(NamedTuple):
     topk_output: TopKOutput
     # Pre-quantized activation for ``hidden_states``, which itself stays bf16:
     # either a (q, scale) pair (per-token-group-128 fp8, q rows padded to a
-    # multiple of 4) or an ``Mxfp8RoutedInputPreQuant``.
+    # multiple of 4), an ``Mxfp8RoutedInputPreQuant``, or the model-neutral
+    # ``Nvfp4RoutedInputPreQuant`` (linear E4M3 scales).
     hidden_states_pre_quant: Optional[Tuple] = None
 
     @property

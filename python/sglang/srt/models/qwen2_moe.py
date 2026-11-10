@@ -723,11 +723,39 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             self.experts.supports_deferred_finalize and self.shared_expert is not None
         )
 
+    def _uses_nvfp4_trtllm_glue(self) -> bool:
+        """Glue on the TP1/EP1 unpadded per-tensor NVFP4 path."""
+        eligible = self.__dict__.get("_nvfp4_trtllm_glue")
+        if eligible is None:
+            from sglang.srt.layers.quantization.modelopt_quant import (
+                ModelOptNvFp4FusedMoEMethod,
+            )
+
+            experts = self.experts
+            backend = getattr(experts, "runner_backend", None)
+            eligible = bool(
+                _is_cuda
+                and not _SGLANG_EXPERIMENTAL_LORA_OPTI
+                and get_moe_a2a_backend().is_none()
+                and type(experts) is FusedMoE
+                and isinstance(experts.quant_method, ModelOptNvFp4FusedMoEMethod)
+                and backend is not None
+                and backend.is_flashinfer_trtllm()
+                and not experts.quant_method.quant_config.use_per_token_activation
+                and getattr(experts, "trtllm_padded_hidden_size", None) is None
+                and not getattr(experts, "_mega_moe_nvfp4", False)
+                and getattr(experts, "w13_input_scale_quant", None) is not None
+                and not self.enable_shared_expert_fusion
+            )
+            self._nvfp4_trtllm_glue = eligible
+        return eligible
+
     def _forward_router_experts(
         self,
         hidden_states: torch.Tensor,
         *,
         defer_finalize: bool = False,
+        routed_input=None,
     ):
         if _use_aiter and self.enable_shared_expert_fusion and not defer_finalize:
             topk_output = _smallm_router_topk_output(self, hidden_states)
@@ -735,6 +763,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 return self.experts(hidden_states, topk_output)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+        pre_quant = {} if routed_input is None else {"pre_quant_input": routed_input}
         topk_output = self.topk(hidden_states, router_logits)
         if defer_finalize:
             if not self.supports_deferred_finalize:
@@ -751,7 +780,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             topk_output
         ):
             topk_output = self._append_shared_to_topk_output(topk_output, hidden_states)
-        return self.experts(hidden_states, topk_output)
+        return self.experts(hidden_states, topk_output, **pre_quant)
 
     def _gate_shared_output_out_of_place(
         self,
@@ -793,6 +822,21 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             return router_output, shared_output
 
         self.alt_stream.wait_stream(current_stream)
+        routed_input = None
+        if (
+            envs.SGLANG_OPT_MOE_NVFP4_PREQUANT_OVERLAP.get()
+            and self.tp_size == 1
+            and self._uses_nvfp4_trtllm_glue()
+        ):
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                quantize_nvfp4_routed_input,
+            )
+
+            # On this (shared-expert) stream, beside the router GEMV on the routed
+            # stream rather than after it.
+            routed_input = quantize_nvfp4_routed_input(
+                hidden_states, self.experts.w13_input_scale_quant
+            )
         shared_output = (
             self._forward_shared_experts(
                 hidden_states.clone(), apply_gate=not use_fused_gate
@@ -818,7 +862,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # ===== END TO BE REFACTORED ====
 
         with torch.cuda.stream(self.alt_stream):
-            router_output = self._forward_router_experts(hidden_states)
+            router_output = self._forward_router_experts(
+                hidden_states, routed_input=routed_input
+            )
 
         current_stream.wait_stream(self.alt_stream)
 

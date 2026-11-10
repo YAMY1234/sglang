@@ -331,6 +331,11 @@ class Envs:
     SGLANG_OPT_DISAGG_TRANSFER_SHARD_BY_ROOM = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # Qwen MoE dual stream, TP1 NVFP4 TRT-LLM experts: quantize the routed input on
+    # the shared-expert stream beside the router GEMV (the runner's own quantize).
+    SGLANG_OPT_MOE_NVFP4_PREQUANT_OVERLAP = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
