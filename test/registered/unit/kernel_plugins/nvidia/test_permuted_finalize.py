@@ -178,6 +178,75 @@ def test_source_disabled_never_declares_or_requests_deferred(monkeypatch, reason
     )
 
 
+@pytest.mark.parametrize("max_tokens", [64, 480, 1024, 16384])
+def test_max_tokens_bounds_declared_rows_and_wide_rows_take_eight_warps(
+    monkeypatch, max_tokens
+):
+    monkeypatch.setenv(
+        "SGLANG_QWEN_MOE_FUSED_FINALIZE_GATE_MAX_TOKENS", str(max_tokens)
+    )
+    obj, *_ = inputs()
+    signatures = impl.numeric_signatures(obj, tuple(range(1, 1025)))
+    rows = {s.rows for s in signatures}
+    widths = set(range(1, min(max_tokens, 1024) + 1))
+    # Rows 0 covers captured prefill above the widest graph width.
+    assert rows == (widths | {0} if max_tokens > 1024 else widths)
+    assert len(signatures) == 2 * len(rows)
+    for s in signatures:
+        assert s.num_warps == (8 if s.rows in (0, 1024) else 16)
+
+
+def test_rows_above_the_graph_widths_take_the_rows_zero_offer(monkeypatch):
+    monkeypatch.setenv("SGLANG_QWEN_MOE_FUSED_FINALIZE_GATE_MAX_TOKENS", "16384")
+    obj, *_ = inputs()
+    impl.numeric_signatures(obj, (1, 480, 1024))
+    seen = []
+
+    def lookup(signature, *, prepared):
+        seen.append((signature.rows, signature.num_warps))
+        return lambda io: None
+
+    monkeypatch.setattr(numeric_binding, "numeric_operator", lookup)
+    for rows, expected in ((480, (480, 16)), (1024, (1024, 8)), (8192, (0, 8))):
+        seen.clear()
+        hidden = tensor((rows, 2560), label="hidden")
+        assert impl.prepare(
+            obj, hidden, use_fused_gate=True, ordered_finalize_sink=None
+        )
+        assert seen == [expected, expected]
+    seen.clear()
+    for rows in (16, 16385):
+        hidden = tensor((rows, 2560), label="hidden")
+        assert (
+            impl.prepare(obj, hidden, use_fused_gate=True, ordered_finalize_sink=None)
+            is None
+        )
+    assert not seen
+
+
+def test_extend_floor_also_bounds_the_rows_zero_offer(monkeypatch):
+    monkeypatch.setenv("SGLANG_QWEN_MOE_FUSED_FINALIZE_GATE_MAX_TOKENS", "16384")
+    monkeypatch.setattr(impl, "_SOURCE_EXTEND", True)
+    obj, *_ = inputs()
+    signatures = impl.numeric_signatures(obj, tuple(range(1, 1025)))
+    assert {s.rows for s in signatures} == set(range(1, 1024))
+    monkeypatch.setattr(impl, "_SOURCE_EXTEND_MIN_ROWS", 4096)
+    signatures = impl.numeric_signatures(obj, tuple(range(1, 1025)))
+    assert {s.rows for s in signatures} == set(range(0, 1025))
+
+    def lookup(signature, *, prepared):
+        return lambda io: None
+
+    monkeypatch.setattr(numeric_binding, "numeric_operator", lookup)
+    hidden = tensor((2048, 2560), label="hidden")
+    assert impl.prepare(obj, hidden, use_fused_gate=True, ordered_finalize_sink=None)
+    hidden = tensor((4096, 2560), label="hidden")
+    assert (
+        impl.prepare(obj, hidden, use_fused_gate=True, ordered_finalize_sink=None)
+        is None
+    )
+
+
 def test_extend_fast_path_offers_only_rows_below_its_floor(monkeypatch):
     # The source's extend path adds a register cap from its floor upward.
     monkeypatch.setattr(impl, "_SOURCE_EXTEND", True)

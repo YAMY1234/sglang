@@ -103,6 +103,15 @@ def contract_geometry(s):
             s.variant,
             s.ctas_per_group,
         ) == (0, 4, 1, 128, 512, 4, 1, 0, 0, 0) and 0 < s.context_bound <= 131072
+    if isinstance(s, FinalizePermutedSignature):
+        # Rows 0 is the one declaration above the graph widths.
+        return (
+            s.hidden_size == 2560
+            and s.topk == 10
+            and 0 <= s.rows <= 1024
+            and s.scalar_type == 1
+            and s.weight_scalar_type in (1, 3)
+        )
     if s.rows <= 0:
         return False
     if isinstance(s, HcSignature):
@@ -217,14 +226,6 @@ def contract_geometry(s):
                 (s.rows in (1, 4) and s.variant in (0, 1))
                 or (s.rows in (8, 16) and s.variant == 2)
             )
-        )
-    if isinstance(s, FinalizePermutedSignature):
-        return (
-            s.hidden_size == 2560
-            and s.topk == 10
-            and s.rows <= 64
-            and s.scalar_type == 1
-            and s.weight_scalar_type in (1, 3)
         )
     if isinstance(s, NativeGdnPdlSignature):
         return (

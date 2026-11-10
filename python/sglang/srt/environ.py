@@ -318,6 +318,8 @@ class Envs:
     SGLANG_ENABLE_QSA_TMA_PREFILL = EnvBool(False)
     SGLANG_QSA_TMA_PREFILL_STAGES = EnvInt(3)
     SGLANG_HC_GATE_MAX_ROWS = EnvInt(1)
+    # Rows up to which the permuted MoE finalize also applies the shared-expert gate.
+    SGLANG_QWEN_MOE_FUSED_FINALIZE_GATE_MAX_TOKENS = EnvInt(64)
     # Log once per role/layer/op whether a numeric provider was offered and bound,
     # or why stock runs; read once at import, so it costs nothing when off.
     SGLANG_NVIDIA_MEGAKERNEL_OFFER_LOG = EnvBool(False)

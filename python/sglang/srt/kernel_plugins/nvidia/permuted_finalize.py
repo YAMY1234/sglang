@@ -43,7 +43,11 @@ def _source_eligible(producer):
 
 def _source_rows(rows):
     """Whether the source finalizes ``rows`` with the plain fused launch."""
-    return not (_SOURCE_EXTEND and rows >= _SOURCE_EXTEND_MIN_ROWS)
+    from sglang.srt.environ import envs
+
+    return rows <= envs.SGLANG_QWEN_MOE_FUSED_FINALIZE_GATE_MAX_TOKENS.get() and not (
+        _SOURCE_EXTEND and rows >= _SOURCE_EXTEND_MIN_ROWS
+    )
 
 
 def _signature(producer, rows, weight_scalar_type):
@@ -62,13 +66,20 @@ def _signature(producer, rows, weight_scalar_type):
         producer.experts.top_k,
         ScalarType.BF16,
         weight_scalar_type,
-        num_warps=8 if is_batch_invariant_mode_enabled() else 16,
+        # Rows 0 stands for every row count above the graph widths (>= 1024).
+        num_warps=8
+        if rows == 0 or rows >= 1024 or is_batch_invariant_mode_enabled()
+        else 16,
         use_pdl=int(is_arch_support_pdl()),
     )
 
 
 def numeric_signatures(producer, widths):
-    """Ask for the actual native geometry before any expert deferral."""
+    """Ask for the actual native geometry before any expert deferral.
+
+    Captured prefill runs wider than the graph widths; one rows-0 declaration
+    covers those rows when the source would still fuse the first of them.
+    """
     from sglang.kernels.plugin_kernels.nvidia.numeric import ScalarType
     from sglang.srt.kernel_plugins.nvidia.numeric_binding import (
         signature_capability_supported,
@@ -77,10 +88,15 @@ def numeric_signatures(producer, widths):
 
     if not _source_eligible(producer):
         return ()
+    widest = max((rows for rows in widths if type(rows) is int), default=0)
+    declared_rows = [
+        rows for rows in widths if type(rows) is int and rows > 0 and _source_rows(rows)
+    ]
+    if widest > 0 and _source_rows(widest + 1):
+        declared_rows.append(0)
     signatures = tuple(
         signature
-        for rows in widths
-        if type(rows) is int and rows > 0 and _source_rows(rows)
+        for rows in declared_rows
         for weight_type in (ScalarType.BF16, ScalarType.FP32)
         if signature_capability_supported(
             signature := _signature(producer, rows, weight_type),
@@ -92,6 +108,7 @@ def numeric_signatures(producer, widths):
     )
 
     producer._numeric_permuted_finalize_signatures = frozenset(signatures)
+    producer._numeric_permuted_finalize_widest = widest
     return signatures
 
 
@@ -127,16 +144,22 @@ def prepare(producer, hidden, *, use_fused_gate, ordered_finalize_sink):
         and gate.is_contiguous()
     ):
         return None
+    if not _source_rows(rows):
+        return None
     declared = getattr(producer, "_numeric_permuted_finalize_signatures", ())
+    # Rows above the graph widths take the one rows-0 declaration.
+    key = (
+        rows if rows <= getattr(producer, "_numeric_permuted_finalize_widest", 0) else 0
+    )
     if any(
-        _signature(producer, rows, dtype) not in declared
+        _signature(producer, key, dtype) not in declared
         for dtype in (ScalarType.BF16, ScalarType.FP32)
     ):
         return None
     # FlashInfer accepts either weight dtype. Require BOTH exact offers before
     # requesting do_finalize=False rather than guessing its runtime output type.
-    bf16 = numeric_operator(_signature(producer, rows, ScalarType.BF16), prepared=True)
-    fp32 = numeric_operator(_signature(producer, rows, ScalarType.FP32), prepared=True)
+    bf16 = numeric_operator(_signature(producer, key, ScalarType.BF16), prepared=True)
+    fp32 = numeric_operator(_signature(producer, key, ScalarType.FP32), prepared=True)
     if bf16 is None or fp32 is None:
         return None
     return _Plan(bf16, fp32, producer.experts.top_k)

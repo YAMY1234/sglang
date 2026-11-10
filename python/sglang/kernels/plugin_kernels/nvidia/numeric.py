@@ -166,7 +166,10 @@ class ExpertSignature:
 
 @dataclass(frozen=True, slots=True)
 class FinalizePermutedSignature:
-    """Native permuted GEMM2 finalize plus gated, initially ungated shared rows."""
+    """Native permuted GEMM2 finalize plus gated, initially ungated shared rows.
+
+    Rows 0 is one declaration for every row count above the graph widths.
+    """
 
     operation: NumericOperation
     rows: int
