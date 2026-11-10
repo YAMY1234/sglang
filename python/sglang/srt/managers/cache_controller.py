@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
     from sglang.srt.mem_cache.pool_host import HostKVCache
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -344,6 +345,9 @@ def check_dcp_l3_extra_pool(entry: Any, anchor: Any) -> None:
 
 
 class HiCacheController:
+    # Set only around start_loading's index move (SGLANG_OPT_HICACHE_PINNED_INDEX_H2D).
+    _pin_load_indices: bool = False
+
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
@@ -1142,6 +1146,10 @@ class HiCacheController:
         # move indices to GPU if using kernels, to host if using direct indexing
         if self.io_backend == "kernel":
             if not host_indices.is_cuda:
+                if self._pin_load_indices and not host_indices.is_pinned():
+                    # A pageable copy can hold the host until the current stream, busy
+                    # with the forward in flight, drains; a pinned one is only enqueued.
+                    host_indices = host_indices.pin_memory()
                 host_indices = host_indices.to(self.device, non_blocking=True)
             return host_indices, device_indices
         elif self.io_backend == "direct":
@@ -1225,7 +1233,9 @@ class HiCacheController:
 
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
+        self._pin_load_indices = envs.SGLANG_OPT_HICACHE_PINNED_INDEX_H2D.get()
         host_indices, device_indices, pool_transfers = self._move_op_indices(op)
+        self._pin_load_indices = False
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()

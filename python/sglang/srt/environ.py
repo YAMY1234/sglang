@@ -356,6 +356,11 @@ class Envs:
     SGLANG_OPT_MOE_SHARED_EXPERT_NO_CLONE = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # HiCache load-back: stage pageable host indices through pinned memory, so their
+    # H2D copy is only enqueued instead of holding the scheduler behind the forward.
+    SGLANG_OPT_HICACHE_PINNED_INDEX_H2D = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
