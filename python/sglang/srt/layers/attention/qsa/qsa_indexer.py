@@ -45,6 +45,17 @@ from sglang.srt.utils import is_sm100_supported
 _QSA_PREFILL_LOGITS_BUDGET_BYTES = 128 * 1024 * 1024
 
 
+def _fast_select_chunk_rows(rows: int, width: int, sms: int) -> int:
+    """The source fast-select plan: stock's logits budget in 32-row blocks,
+    rounded down to whole top-k waves of 2 * sms rows."""
+    max_rows = max(32, _QSA_PREFILL_LOGITS_BUDGET_BYTES // (width * 4))
+    max_rows = max(32, max_rows // 32 * 32)
+    if rows <= max_rows:
+        return rows
+    unit = 2 * sms // 32 * 32
+    return max_rows // unit * unit if unit >= 32 and max_rows >= unit else max_rows
+
+
 def _qsa_prefill_row_chunk_size(rows: int, keys: int, heads: int) -> int:
     if rows <= 0 or keys <= 0:
         return max(rows, 1)
@@ -130,6 +141,7 @@ class QSAIndexer(MultiPlatformOp):
                 or envs.SGLANG_QSA_NUMERIC_SCORE.get()
                 or envs.SGLANG_QSA_SPLIT_TOPK.get()
                 or grouped4 is not None
+                or envs.SGLANG_ENABLE_QSA_PREFILL_FAST_SELECT.get()
             )
             and type(context_len) is int
             and context_len > 0
@@ -245,6 +257,25 @@ class QSAIndexer(MultiPlatformOp):
                     )
                 ) is not None:
                     signatures.append(signature)
+        if envs.SGLANG_ENABLE_QSA_PREFILL_FAST_SELECT.get():
+            # One declaration for every prefill length; rows vary per call.
+            signature = NumericSignature(
+                NumericOperation.PREFILL_SELECT,
+                0,
+                self.index_n_heads,
+                self.index_kv_heads,
+                self.index_head_dim,
+                self.block_topk,
+                self.compress_ratio,
+                ScalarType.BF16,
+                context_bound=capacity,
+            )
+            if signature_capability_supported(
+                signature,
+                spec=getattr(self, "_numeric_capability_spec", None),
+                **context,
+            ):
+                signatures.append(signature)
         declared = tuple(dict.fromkeys(signatures))
         if declared:
             self._numeric_score_capacity = capacity
@@ -514,6 +545,84 @@ class QSAIndexer(MultiPlatformOp):
         )
         select(SparseSelectIO(scores, lengths, self.block_topk, indices, None, scratch))
         return indices
+
+    def _numeric_prefill_select(
+        self, q, keys, starts, ends, positions, lengths, output, width
+    ):
+        """Fill ``output`` as the stock relative prefill path does, or return False."""
+        from sglang.kernels.plugin_kernels.nvidia.numeric import (
+            NumericOperation,
+            NumericSignature,
+            PrefillSelectIO,
+            ScalarType,
+        )
+        from sglang.srt.kernel_plugins.nvidia.numeric_binding import numeric_operator
+        from sglang.srt.kernel_plugins.nvidia.pool_attention import pool_device_sms
+
+        capacity = getattr(self, "_numeric_score_capacity", 0)
+        if not (
+            envs.SGLANG_ENABLE_QSA_PREFILL_FAST_SELECT.get()
+            and envs.SGLANG_OPT_QSA_PREFILL_SCALE_FOLD.get()
+            and type(width) is int
+            and 0 < width <= capacity
+            and q.dtype == torch.bfloat16
+            and q.shape[1:] == (self.index_n_heads, self.index_head_dim)
+            and keys.ndim == 3
+            and keys.shape[0] > 0
+            and keys.shape[1:] == (self.index_kv_heads, self.index_head_dim)
+            and keys.dtype == q.dtype
+            and not is_batch_invariant_mode_enabled()
+            # Captured prefill keeps stock; per-call workspace is eager only.
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            return False
+        signature = NumericSignature(
+            NumericOperation.PREFILL_SELECT,
+            0,
+            self.index_n_heads,
+            self.index_kv_heads,
+            self.index_head_dim,
+            self.block_topk,
+            self.compress_ratio,
+            ScalarType.BF16,
+            context_bound=capacity,
+        )
+        if signature not in getattr(self, "_numeric_prepared_sparse", ()):
+            return False
+        run = numeric_operator(signature, prepared=True)
+        if run is None:
+            return False
+        rows = q.shape[0]
+        sms = pool_device_sms(q.device)
+        chunk = _fast_select_chunk_rows(rows, width, sms)
+        padded = (chunk + 31) // 32 * 32
+        starts, ends, positions, lengths = (
+            t.to(device=q.device, dtype=torch.int32).contiguous()
+            for t in (starts, ends, positions, lengths)
+        )
+        i32 = dict(device=q.device, dtype=torch.int32)
+        run(
+            PrefillSelectIO(
+                q.contiguous(),
+                keys.contiguous(),
+                starts,
+                ends,
+                positions,
+                lengths,
+                output,
+                torch.empty((padded, *q.shape[1:]), device=q.device, dtype=q.dtype),
+                torch.empty(padded, **i32),
+                torch.empty(padded, **i32),
+                ends - starts,
+                torch.zeros(chunk, **i32),
+                torch.empty((rows, self.block_topk), **i32),
+                torch.empty((padded, width), device=q.device, dtype=torch.float32),
+                torch.empty(4096, **i32),
+                chunk,
+                sms,
+            )
+        )
+        return True
 
     def _numeric_grouped4_score(self, q, cache, table, lengths, capacity):
         """Scores of one target-verify grouped4 launch, or None for stock."""
@@ -954,6 +1063,17 @@ class QSAIndexer(MultiPlatformOp):
         relative = (
             max_row_keys is not None and max_row_keys > 0 and q.is_cuda and HAS_TILELANG
         )
+        if relative and self._numeric_prefill_select(
+            q,
+            compressed_keys,
+            row_starts,
+            row_ends,
+            query_positions,
+            sequence_lengths_for_rows,
+            output,
+            max_row_keys,
+        ):
+            return output
         row_chunk_size = _qsa_prefill_row_chunk_size(
             rows,
             max_row_keys if relative else compressed_keys.shape[0],

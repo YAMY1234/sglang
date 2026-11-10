@@ -80,6 +80,19 @@ def contract_geometry(s):
         RouterQuantSignature,
     )
 
+    if s.operation == Op.PREFILL_SELECT:
+        return (
+            s.rows,
+            s.query_heads,
+            s.kv_heads,
+            s.head_dim,
+            s.selected_count,
+            s.compress_ratio,
+            s.scalar_type,
+            s.rotary_dim,
+            s.variant,
+            s.ctas_per_group,
+        ) == (0, 4, 1, 128, 512, 4, 1, 0, 0, 0) and 0 < s.context_bound <= 131072
     if s.rows <= 0:
         return False
     if isinstance(s, HcSignature):
@@ -319,6 +332,7 @@ _SCHEMAS = {
         for op in (
             NumericOperation.SPARSE_SCORE,
             NumericOperation.SPARSE_SELECT,
+            NumericOperation.PREFILL_SELECT,
         )
     },
     NumericOperation.GDN_NATIVE_PDL: (NativeGdnPdlSignature, ()),
@@ -364,6 +378,12 @@ def _source_supported(s, actual):
     op = s.operation
     if op == NumericOperation.HC_MIX:
         return s.rows <= 32
+    if op == NumericOperation.PREFILL_SELECT:
+        return (
+            actual["tp_size"] > 0
+            and actual["sm100_supported"] == 1
+            and actual["unpadded_query_heads"] == s.query_heads
+        )
     fixed = _FIXED_CONTEXTS.get(op, {})
     if any(actual[name] != value for name, value in fixed.items()):
         return False

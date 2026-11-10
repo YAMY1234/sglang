@@ -315,6 +315,182 @@ def test_public_select_stock_fallback_and_selected_expansion():
         )
 
 
+def prefill_flags(tp=1, fold="1"):
+    from contextlib import ExitStack
+
+    from sglang.srt.kernel_plugins.nvidia import binding, pool_attention
+
+    stack = ExitStack()
+    for field, value in [
+        (envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION, True),
+        (envs.SGLANG_ENABLE_QSA_PREFILL_FAST_SELECT, True),
+        (envs.SGLANG_OPT_QSA_PREFILL_SCALE_FOLD, fold),
+        (envs.SGLANG_QSA_SPLIT_TOPK, False),
+    ]:
+        stack.enter_context(field.override(value))
+    for target, name, value in [
+        (binding, "megakernel_enabled", True),
+        (impl, "get_parallel", NS(tp_size=tp)),
+        (impl, "is_sm100_supported", True),
+        (impl, "is_batch_invariant_mode_enabled", False),
+        (torch.cuda, "is_current_stream_capturing", False),
+        (pool_attention, "pool_device_sms", 148),
+    ]:
+        stack.enter_context(patch.object(target, name, return_value=value))
+    stack.enter_context(patch.object(impl, "HAS_TILELANG", True))
+    return stack
+
+
+def prefill_args(rows, width=8193):
+    q = torch.zeros((rows, 4, 128), dtype=torch.bfloat16).as_subclass(DeviceMetadata)
+    positions = torch.arange(rows)
+    return [
+        q,
+        torch.zeros((2 * width, 1, 128), dtype=torch.bfloat16),
+        torch.zeros(rows, dtype=torch.int64),
+        torch.full((rows,), width, dtype=torch.int64),
+        positions,
+        positions + 1,
+        width,
+    ]
+
+
+@pytest.mark.parametrize(
+    "tp,heads,fast,declared",
+    [
+        (1, 4, True, True),
+        (4, 4, True, True),
+        (1, 8, True, False),
+        (1, 4, False, False),
+    ],
+)
+def test_prefill_select_declares_one_row_independent_signature(
+    tp, heads, fast, declared
+):
+    from sglang.kernels.plugin_kernels.nvidia.numeric import (
+        NumericSignature,
+        ScalarType,
+    )
+
+    obj = indexer()
+    obj.index_n_heads = heads
+    with (
+        prefill_flags(tp=tp),
+        envs.SGLANG_ENABLE_QSA_PREFILL_FAST_SELECT.override(fast),
+    ):
+        found = [
+            s
+            for s in obj.numeric_preparation_signatures(8193 * 4, 16)
+            if s.operation == NumericOperation.PREFILL_SELECT
+        ]
+    expected = NumericSignature(
+        NumericOperation.PREFILL_SELECT,
+        0,
+        4,
+        1,
+        128,
+        512,
+        4,
+        ScalarType.BF16,
+        context_bound=8208,
+    )
+    assert found == ([expected] if declared else [])
+
+
+@pytest.mark.parametrize("rows", [1, 33, 64])
+def test_prefill_select_fills_output_through_provider(rows):
+    obj = indexer()
+    args = prefill_args(rows)
+    with prefill_flags():
+        declared = obj.numeric_preparation_signatures(8193 * 4, 16)
+        seen = []
+
+        def choose(signature, *, prepared):
+            assert prepared and signature in declared
+            return seen.append
+
+        with (
+            patch.object(numeric_binding, "numeric_operator", side_effect=choose),
+            patch.object(impl, "qsa_mqa_prefill_relative") as stock,
+        ):
+            output = obj.select_prefill_tokens(*args)
+    stock.assert_not_called()
+    (io,) = seen
+    padded = (rows + 31) // 32 * 32
+    assert io.selected_indices_out is output and output.shape == (rows, 2051)
+    assert io.query.data_ptr() == args[0].data_ptr()
+    assert (io.chunk_rows, io.scorer_sms) == (rows, 148)
+    assert io.logits_out.shape == (padded, 8193)
+    assert io.query_scratch_out.shape == (padded, 4, 128)
+    assert io.block_indices_out.shape == (rows, 512)
+    assert io.split_tag.shape == (4096,) and io.zero_offsets.shape == (rows,)
+    assert all(
+        t.dtype == torch.int32
+        for t in (io.row_starts, io.row_ends, io.query_positions, io.sequence_lengths)
+    )
+    assert torch.equal(io.row_lengths, torch.full((rows,), 8193, dtype=torch.int32))
+
+
+def test_prefill_select_chunk_plan_matches_the_source():
+    # Literal source plan_chunk_rows with its 128 MiB budget and 2 * SMs top-k slots.
+    def source(rows, width, slots, budget=128 * 1024 * 1024):
+        max_rows = max(32, budget // (width * 4))
+        max_rows = max(32, max_rows // 32 * 32)
+        if rows <= max_rows:
+            return rows
+        unit = slots // 32 * 32
+        if unit >= 32 and max_rows >= unit:
+            return max_rows // unit * unit
+        return max_rows
+
+    for rows in (1, 31, 33, 4064, 4065, 20000, 131072):
+        for width in (1, 512, 4097, 8193, 32768, 131072):
+            for sms in (8, 148, 160):
+                assert impl._fast_select_chunk_rows(rows, width, sms) == source(
+                    rows, width, 2 * sms
+                )
+
+
+@pytest.mark.parametrize(
+    "case", ["fold_off", "wider_than_declared", "capturing", "batch_invariant", "off"]
+)
+def test_prefill_select_outside_source_policy_is_stock(case):
+    obj = indexer()
+    args = prefill_args(33, 8209 if case == "wider_than_declared" else 8193)
+    with prefill_flags(fold="0" if case == "fold_off" else "1"):
+        obj.numeric_preparation_signatures(8193 * 4, 16)
+        logits = torch.zeros((33, args[-1]))
+        with (
+            patch.object(
+                numeric_binding,
+                "numeric_operator",
+                side_effect=AssertionError("provider lookup"),
+            ),
+            patch.object(
+                torch.cuda,
+                "is_current_stream_capturing",
+                return_value=case == "capturing",
+            ),
+            patch.object(
+                impl,
+                "is_batch_invariant_mode_enabled",
+                return_value=case == "batch_invariant",
+            ),
+            envs.SGLANG_ENABLE_QSA_PREFILL_FAST_SELECT.override(case != "off"),
+            patch.object(
+                impl, "qsa_mqa_prefill_relative", return_value=logits
+            ) as stock,
+            patch.object(impl, "qsa_fast_topk", return_value=torch.zeros(33, 512)),
+            patch.object(
+                impl,
+                "expand_qsa_block_indices",
+                return_value=torch.zeros((33, 2051), dtype=torch.int32),
+            ),
+        ):
+            obj.select_prefill_tokens(*args)
+    stock.assert_called_once()
+
+
 @pytest.mark.parametrize(
     "context,page",
     [

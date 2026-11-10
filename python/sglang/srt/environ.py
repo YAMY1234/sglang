@@ -309,6 +309,9 @@ class Envs:
     SGLANG_ENABLE_QSA_GROUPED4_VERIFY_CHAIN = EnvBool(False)
     SGLANG_QSA_GROUPED4_VERIFY_CHAIN_CTAS = EnvInt(512)
     SGLANG_QSA_GROUPED4_VERIFY_PIPELINE_STAGES = EnvInt(0)
+    # Request-relative QSA prefill: the source's ordered fast select; it requires
+    # SGLANG_OPT_QSA_PREFILL_SCALE_FOLD, whose stored scores it reproduces.
+    SGLANG_ENABLE_QSA_PREFILL_FAST_SELECT = EnvBool(False)
     # TP1 target verify on an FP8 KV pool: one union attention launch per layer.
     SGLANG_QSA_FP8_POOL_VERIFY = EnvBool(False)
     SGLANG_HC_GATE_MAX_ROWS = EnvInt(1)

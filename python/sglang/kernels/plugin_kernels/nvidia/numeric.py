@@ -34,6 +34,7 @@ class NumericOperation(IntEnum):
     POOL_UNION_ATTENTION = 6
     MTP_CAPTURE_SEED = 7
     MTP_DEFERRED_KV_PREPARE = 8
+    PREFILL_SELECT = 9
     HC_GATE = 10
     HC_APPLY_NORM = 11
     HC_APPLY_NORM_GATE = 12
@@ -92,7 +93,8 @@ class NumericSignature:
     context_bound: int = 0
     # Sparse score: 0=MK, 3=MK short32, 4=grouped V7/W4 defaults,
     # 5=per-row defaults, 6=grouped4 chain, 7=grouped4 chain with a two-stage
-    # key pipeline. Sparse select: 0=MK, 1=split defaults.
+    # key pipeline. Sparse select: 0=MK, 1=split defaults. Prefill select: rows
+    # is 0 (packed prefill rows vary per call); context_bound bounds a row's keys.
     variant: int = 0
     # Grid CTAs per four-row request group of sparse score 6/7; 0 elsewhere.
     ctas_per_group: int = 0
@@ -310,6 +312,35 @@ class SparseScoreIO:
     scale: float
     scores_out: Tensor
     scratch_out: Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class PrefillSelectIO:
+    """Packed BF16 queries/keys, request-relative ranges and caller token IDs.
+
+    Ranges, positions and lengths are the call's live per-row metadata. All
+    transient workspace is caller-owned: ``chunk_rows`` rows per logits chunk
+    (padded to 32 in the scratch views), ``logits_out`` as wide as the call's
+    longest row, and ``split_tag`` whose length bounds the scorer's key split.
+    """
+
+    query: Tensor
+    compressed_keys: Tensor
+    row_starts: Tensor
+    row_ends: Tensor
+    query_positions: Tensor
+    sequence_lengths: Tensor
+    selected_indices_out: Tensor
+    query_scratch_out: Tensor
+    starts_scratch_out: Tensor
+    ends_scratch_out: Tensor
+    row_lengths: Tensor
+    zero_offsets: Tensor
+    block_indices_out: Tensor
+    logits_out: Tensor
+    split_tag: Tensor
+    chunk_rows: int
+    scorer_sms: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -672,7 +703,8 @@ class MtpDeferredKvIO:
 
 
 NumericIO = (
-    SparseScoreIO
+    PrefillSelectIO
+    | SparseScoreIO
     | SparseSelectIO
     | DirectPoolAttentionIO
     | PoolUnionAttentionIO
