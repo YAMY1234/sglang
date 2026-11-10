@@ -152,6 +152,32 @@ class TestNonbitwise(CustomTestCase):
             self.assertEqual(set(routes._routes), set(routes.ROUTES) | extra)
             self.assertEqual(routes._nonbitwise, frozenset(extra))
 
+    def test_low_m_opt_in_adds_its_own_keys(self):
+        self.assertEqual(
+            set(routes.NONBITWISE_LOWM_ROUTES)
+            & (set(routes.ROUTES) | set(routes.NONBITWISE_ROUTES)),
+            set(),
+        )
+        for (m, n, k), (kind, tactic) in routes.NONBITWISE_LOWM_ROUTES.items():
+            self.assertEqual(kind, "cl")
+            self.assertTrue(routes._cluster_ok(k, tactic, _SMEM_CAPACITY), (m, n, k))
+        source = b"# split-K kernel source\n"
+        digest = hashlib.sha256(source).hexdigest()
+        with (
+            mock.patch.dict(sys.modules, _fake_splitk(source)),
+            mock.patch.object(routes, "_FI_SPLITK_SHA256", digest),
+            envs.SGLANG_ENABLE_SM107_BF16_SMALLM_NONBITWISE_LOWM_ROUTES.override(True),
+        ):
+            self.assertTrue(
+                routes.install(
+                    device_sm=107, splitk_enabled=True, cutedsl_available=True
+                )
+            )
+        self.assertEqual(
+            set(routes._routes), set(routes.ROUTES) | set(routes.NONBITWISE_LOWM_ROUTES)
+        )
+        self.assertEqual(routes._nonbitwise, frozenset(routes.NONBITWISE_LOWM_ROUTES))
+
     def test_load_check_drops_only_the_keys_past_the_bound(self):
         """Bitwise keys are compared bit for bit; each non-bitwise key by relative L2."""
 

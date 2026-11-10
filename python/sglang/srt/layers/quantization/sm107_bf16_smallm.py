@@ -20,6 +20,8 @@ other shape, a bias, an addend or a non-contiguous operand takes the stock dispa
 
 ``NONBITWISE_ROUTES`` (opt-in, SGLANG_ENABLE_SM107_BF16_SMALLM_NONBITWISE_ROUTES=1) are faster kernels whose bits
 differ from stock in FP32 summation order; each is checked at load against a relative-L2 bound instead.
+``NONBITWISE_LOWM_ROUTES`` (opt-in, SGLANG_ENABLE_SM107_BF16_SMALLM_NONBITWISE_LOWM_ROUTES=1) are the same kind of
+key for the same shape at smaller M, checked the same way.
 """
 
 from __future__ import annotations
@@ -70,6 +72,14 @@ ROUTES = {
 # 212 SMs, where four K slices of 1536 run 160 CTAs.
 NONBITWISE_ROUTES = {
     (m, *_OUT_PROJ): ("cl", (64, 32, 4, 8, 128)) for m in range(20, 33)
+}
+# SGLANG_ENABLE_SM107_BF16_SMALLM_NONBITWISE_LOWM_ROUTES=1 (with the routes above on) adds the same shape at M 4-16
+# (verify of 1-4 requests, draft-extend and short extends): stock runs TGV cta64x16 on 40 CTAs there; four K slices
+# of 1536 run 160 CTAs (320 for mma_n 16 at M 9-16). Checked and dropped key by key exactly as NONBITWISE_ROUTES.
+# Tactics measured on SM107 (mb-mid2-op1): 5.5 against 7.4 us per call at M 4-8, 5.7 against 7.4 at M 9-16.
+NONBITWISE_LOWM_ROUTES = {
+    **{(m, *_OUT_PROJ): ("cl", (64, 8, 4, 8, 128)) for m in range(4, 9)},
+    **{(m, *_OUT_PROJ): ("cl", (64, 16, 4, 10, 128)) for m in range(9, 17)},
 }
 # Measured 1.2-1.7e-4 at these keys on SM107; one BF16 ulp on every output element is about 4e-3.
 _NONBITWISE_REL_L2_MAX = 1e-3
@@ -179,6 +189,8 @@ def install(device_sm: int, splitk_enabled: bool, cutedsl_available: bool) -> bo
     )
     if envs.SGLANG_ENABLE_SM107_BF16_SMALLM_NONBITWISE_ROUTES.get():
         _install_nonbitwise(fi_splitk._SMEM_CAPACITY_BYTES)
+    if envs.SGLANG_ENABLE_SM107_BF16_SMALLM_NONBITWISE_LOWM_ROUTES.get():
+        _install_nonbitwise_lowm(fi_splitk._SMEM_CAPACITY_BYTES)
     return True
 
 
@@ -197,6 +209,28 @@ def _install_nonbitwise(smem_capacity: int) -> None:
             return
     _routes = {**ROUTES, **NONBITWISE_ROUTES}
     _nonbitwise = frozenset(NONBITWISE_ROUTES)
+
+
+def _install_nonbitwise_lowm(smem_capacity: int) -> None:
+    """Add NONBITWISE_LOWM_ROUTES to the installed routes (after NONBITWISE_ROUTES, if on); an invalid tactic leaves
+    every other installed key alone. They serve after precompile's relative-L2 check, as NONBITWISE_ROUTES."""
+    global _routes, _nonbitwise
+    for (m, n, k), (kind, tactic) in NONBITWISE_LOWM_ROUTES.items():
+        if (
+            kind != "cl"
+            or not _cluster_ok(k, tactic, smem_capacity)
+            or (m, n, k) in _routes
+        ):
+            logger.warning(
+                "SGLANG_ENABLE_SM107_BF16_SMALLM_NONBITWISE_LOWM_ROUTES: route %s %s at %s is invalid or already "
+                "routed; the low-M keys keep the stock dispatch",
+                kind,
+                tactic,
+                (m, n, k),
+            )
+            return
+    _routes = {**_routes, **NONBITWISE_LOWM_ROUTES}
+    _nonbitwise = _nonbitwise | frozenset(NONBITWISE_LOWM_ROUTES)
 
 
 def _cluster_out(
@@ -343,6 +377,23 @@ def gemm(x: torch.Tensor, weight: torch.Tensor) -> Optional[torch.Tensor]:
                 kind,
                 tactic,
             )
+    if (
+        _nonbitwise
+        and not _precompiling
+        and "nonbitwise_lowm" not in _logged
+        and (m, *weight.shape) in NONBITWISE_LOWM_ROUTES
+        and (m, *weight.shape) in _nonbitwise
+    ):
+        _logged.add("nonbitwise_lowm")
+        logger.info(
+            "SM107 non-bitwise low-M route serving: m=%d n=%d k=%d %s %s "
+            "(first use; SGLANG_ENABLE_SM107_BF16_SMALLM_NONBITWISE_LOWM_ROUTES)",
+            m,
+            weight.shape[0],
+            k,
+            kind,
+            tactic,
+        )
     return out.view(*x.shape[:-1], weight.shape[0])
 
 
