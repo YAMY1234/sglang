@@ -316,6 +316,11 @@ class Envs:
     # With the routes above: also serve sm107_bf16_smallm.NONBITWISE_LOWM_ROUTES
     # (out_proj/o_proj at M 4-16), checked at load as NONBITWISE_ROUTES.
     SGLANG_ENABLE_SM107_BF16_SMALLM_NONBITWISE_LOWM_ROUTES = EnvBool(False)
+    # GDN ReplaySSM target verify: three software-pipeline stages instead of two
+    # (same output bits).
+    SGLANG_OPT_GDN_REPLAYSSM_VERIFY_3_STAGES = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Model configuration, discovery, and weight loading

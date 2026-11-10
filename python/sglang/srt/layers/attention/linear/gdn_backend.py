@@ -1895,6 +1895,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # Capacity folds are committed once across every GDN layer after
             # acceptance; the active path is therefore a single launch/layer.
             launch_mode="verify",
+            num_stages=3 if envs.SGLANG_OPT_GDN_REPLAYSSM_VERIFY_3_STAGES.get() else 2,
         )
         # Match the recurrent target_verify output shape (== value.shape).
         return out.reshape(value.shape)
