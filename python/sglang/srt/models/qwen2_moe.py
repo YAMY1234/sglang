@@ -795,6 +795,17 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             shared_output,
         )
 
+    def _shared_expert_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # The clone guards a routed runner that writes its input in place on the
+        # other stream while the shared expert reads it.
+        if (
+            envs.SGLANG_OPT_MOE_SHARED_EXPERT_NO_CLONE.get()
+            and isinstance(self.experts, FusedMoE)
+            and not self.experts.moe_runner_config.inplace
+        ):
+            return hidden_states
+        return hidden_states.clone()
+
     def forward_normal_dual_stream(
         self,
         hidden_states: torch.Tensor,
@@ -839,7 +850,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
         shared_output = (
             self._forward_shared_experts(
-                hidden_states.clone(), apply_gate=not use_fused_gate
+                self._shared_expert_input(hidden_states), apply_gate=not use_fused_gate
             )
             if self.shared_expert is not None
             else None

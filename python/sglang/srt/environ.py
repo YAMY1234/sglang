@@ -351,6 +351,11 @@ class Envs:
     SGLANG_OPT_SPEC_DRAFT_TOP1_ARGMAX = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # Qwen MoE dual stream: the shared expert reads hidden_states instead of a clone
+    # when the routed experts do not write their input in place (same bits).
+    SGLANG_OPT_MOE_SHARED_EXPERT_NO_CLONE = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Model configuration, discovery, and weight loading

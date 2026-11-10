@@ -296,6 +296,45 @@ def test_dual_stream_prequantizes_only_on_the_tp1_nvfp4_glue(
     assert kwargs["routed_input"] is (packet if selected else None)
 
 
+@pytest.mark.parametrize("master", [False, True])
+@pytest.mark.parametrize("child", [False, True])
+@pytest.mark.parametrize("inplace", [False, True])
+def test_dual_stream_shared_expert_skips_the_clone_only_without_inplace_experts(
+    monkeypatch, master, child, inplace
+):
+    from contextlib import nullcontext
+
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+    from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
+
+    experts = object.__new__(FusedMoE)
+    vars(experts).update(moe_runner_config=SimpleNamespace(inplace=inplace))
+    block = object.__new__(Qwen2MoeSparseMoeBlock)
+    vars(block).update(
+        alt_stream=Mock(),
+        tp_size=1,
+        shared_expert=Mock(),
+        experts=experts,
+        _nvfp4_trtllm_glue=False,
+        _forward_shared_experts=Mock(return_value="shared"),
+        _forward_router_experts=Mock(return_value="routed"),
+    )
+    monkeypatch.setattr(torch.cuda, "current_stream", Mock())
+    monkeypatch.setattr(torch.cuda, "stream", lambda _: nullcontext())
+    hidden = torch.randn(4, 64, dtype=torch.bfloat16)
+    with (
+        envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(master),
+        envs.SGLANG_OPT_MOE_SHARED_EXPERT_NO_CLONE.override(child),
+    ):
+        assert block.forward_normal_dual_stream(hidden) == ("routed", "shared")
+    ((args, kwargs),) = block._forward_shared_experts.call_args_list
+    assert kwargs == {"apply_gate": True}
+    assert torch.equal(args[0], hidden)
+    assert (args[0] is hidden) is (master and child and not inplace)
+    assert block._forward_router_experts.call_args.args == (hidden,)
+
+
 @pytest.mark.parametrize("routed_input", [None, "packet"])
 def test_router_experts_forward_the_routed_input_only_when_given(routed_input):
     from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
