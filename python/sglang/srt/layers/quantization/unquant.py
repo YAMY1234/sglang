@@ -194,6 +194,8 @@ _run_direct_dense = None
 _warp_splitk_tactic = None
 _run_warp_splitk_dense = None
 _enable_bf16_splitk_gemm = False
+# SGLANG_OPT_SM107_BF16_SMALLM_ROUTES: sm107_bf16_smallm serves its keys, bitwise to this dispatch.
+_sm107_smallm_on = False
 _mm_bf16 = None
 _flashinfer_autotuner = None
 # CuTe DSL tactics lose to the hand tables and TGV/cuBLAS at M = 24/32.
@@ -412,6 +414,15 @@ def precompile_splitk_tactics(
     so CUDA graph capture never hits a cold kernel."""
     if not _enable_bf16_splitk_gemm:
         return False
+    global _sm107_smallm_on
+    if _sm107_smallm_on and keys is None:
+        from sglang.srt.layers.quantization import sm107_bf16_smallm
+
+        # Checked against this dispatch with the routes off; a mismatch keeps them off.
+        _sm107_smallm_on = False
+        _sm107_smallm_on = sm107_bf16_smallm.precompile(
+            stock_gemm=lambda x, w: _bf16_gemm_dispatch_impl(x, w, None)
+        )
     if keys is None:
         keys = {**_BF16_SPLITK_TUNED_TACTICS, **_active_warp_splitk_tactics}
     device = torch.cuda.current_device()
@@ -539,6 +550,17 @@ def initialize_bf16_gemm_config() -> None:
             _mm_bf16 = mm_bf16
             _flashinfer_autotuner = AutoTuner.get()
 
+    global _sm107_smallm_on
+    _sm107_smallm_on = False
+    if envs.SGLANG_OPT_SM107_BF16_SMALLM_ROUTES.get():
+        from sglang.srt.layers.quantization import sm107_bf16_smallm
+
+        _sm107_smallm_on = sm107_bf16_smallm.install(
+            device_sm=get_platform().device_sm,
+            splitk_enabled=_enable_bf16_splitk_gemm,
+            cutedsl_available=_cutedsl_bf16_gemm is not None,
+        )
+
     _BF16_GEMM_BACKEND = backend
 
 
@@ -653,6 +675,12 @@ def _bf16_gemm_dispatch_impl(
     bias: Optional[torch.Tensor],
     addend: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    if _sm107_smallm_on and bias is None and addend is None:
+        from sglang.srt.layers.quantization import sm107_bf16_smallm
+
+        output = sm107_bf16_smallm.gemm(x, weight)
+        if output is not None:
+            return output
     output = _bf16_low_m_autotune(x, weight, bias)
     if output is not None:
         return output if addend is None else output.add_(addend)

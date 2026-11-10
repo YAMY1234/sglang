@@ -305,6 +305,11 @@ class Envs:
     SGLANG_OPT_QSA_PREFILL_HOST_PATH = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # SM107 small-M BF16 GEMMs listed in sm107_bf16_smallm.ROUTES run as one kernel,
+    # bitwise to the stock dispatch (checked at load; a mismatch keeps the stock one).
+    SGLANG_OPT_SM107_BF16_SMALLM_ROUTES = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
