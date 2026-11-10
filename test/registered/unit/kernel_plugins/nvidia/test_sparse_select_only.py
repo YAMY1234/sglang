@@ -22,7 +22,9 @@ def flags():
     stack = ExitStack()
     for field, value in [
         (envs.SGLANG_QSA_MK_SCORE, False),
-        (envs.SGLANG_QSA_NUMERIC_SCORE, False),
+        # A source-supported score preset would pair the select with a scorer.
+        (envs.SGLANG_QSA_SCORER_V2_ROWS, True),
+        (envs.SGLANG_QSA_GROUPED_SCORE, False),
         (envs.SGLANG_QSA_SPLIT_TOPK, True),
         (envs.SGLANG_QSA_TOPK_THREADS, None),
         (envs.SGLANG_QSA_TOPK_CLUSTER, None),
@@ -280,7 +282,7 @@ def test_pair_selected_still_returns_before_native_or_select_only():
         patch.object(
             impl, "qsa_mqa_decode", side_effect=AssertionError("native scorer")
         ),
-        envs.SGLANG_QSA_NUMERIC_SCORE.override(True),
+        patch.object(obj, "_numeric_score_capacity", 8192, create=True),
     ):
         q = torch.zeros((4, 8, 128), dtype=torch.bfloat16)
         assert obj.select_decode_tokens(q, q, q, q, 8192, q, q, True) == "paired"

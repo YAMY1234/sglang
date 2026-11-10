@@ -175,7 +175,6 @@ def test_finite_preparation_and_short_launch_variant():
     obj = indexer()
     with (
         envs.SGLANG_QSA_MK_SCORE.override(False),
-        envs.SGLANG_QSA_NUMERIC_SCORE.override(False),
         envs.SGLANG_QSA_SPLIT_TOPK.override(False),
     ):
         assert obj.numeric_preparation_signatures(32768, 16) == ()

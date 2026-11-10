@@ -20,7 +20,6 @@ register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
 def flags():
     stack = ExitStack()
     for field, value in [
-        (envs.SGLANG_QSA_NUMERIC_SCORE, True),
         (envs.SGLANG_QSA_MK_SCORE, True),
         (envs.SGLANG_QSA_GROUPED_SCORE, True),
         (envs.SGLANG_QSA_SPLIT_TOPK, True),
@@ -114,6 +113,26 @@ def test_declared_pair_and_real_public_dispatch(rows, group, variant, heads):
         native.assert_not_called()
 
 
+def test_source_default_flags_declare_the_native_pair():
+    obj = indexer()
+    obj.index_n_heads = 16
+    obj.numeric_signatures((4, 32), 4)
+    with flags(), envs.SGLANG_QSA_MK_SCORE.override(False):
+        # The source's grouped scorer and split top-k are on unless set to 0.
+        envs.SGLANG_QSA_GROUPED_SCORE.clear()
+        envs.SGLANG_QSA_SPLIT_TOPK.clear()
+        declared = obj.numeric_preparation_signatures(8193 * 4, 16)
+    assert {(s.operation, s.rows, s.variant) for s in declared} == {
+        (operation, rows, variant)
+        for rows in (4, 32)
+        for operation, variant in (
+            (NumericOperation.SPARSE_SELECT, 1),
+            (NumericOperation.SPARSE_SCORE, 5),
+            (NumericOperation.SPARSE_SCORE, 4),
+        )
+    }
+
+
 @pytest.mark.parametrize(
     "missing", [NumericOperation.SPARSE_SCORE, NumericOperation.SPARSE_SELECT]
 )
@@ -137,6 +156,7 @@ def test_pair_omission_does_not_execute_either(missing):
 @pytest.mark.parametrize(
     "field,value,group",
     [
+        ("SGLANG_QSA_GROUPED_SCORE", False, 4),
         ("SGLANG_QSA_SCORER_V2", False, 4),
         ("SGLANG_QSA_SCORER_V2_VER", 6, 4),
         ("SGLANG_QSA_SCORER_V2_C", 256, 4),
@@ -357,7 +377,6 @@ def test_grouped4_undeclared_or_changed_policy_is_stock(rows, change):
     obj.numeric_signatures((rows,), 4)
     with (
         grouped4_flags(),
-        envs.SGLANG_QSA_NUMERIC_SCORE.override(False),
         envs.SGLANG_QSA_SPLIT_TOPK.override(False),
     ):
         obj.numeric_preparation_signatures(8193 * 4, 16)
@@ -369,6 +388,97 @@ def test_grouped4_undeclared_or_changed_policy_is_stock(rows, change):
             obj, rows, lambda *a, **kw: pytest.fail("unexpected provider lookup")
         )
     stock.assert_called_once()
+
+
+def window(requests, draft_token_num=4):
+    return NS(
+        spec_info=NS(draft_token_num=draft_token_num),
+        req_pool_indices=torch.zeros(requests, dtype=torch.int64),
+    )
+
+
+@pytest.mark.parametrize(
+    "verify,draft,flag,tp,requests,rows,expected",
+    [
+        (True, False, False, 1, 22, 88, (4, False)),
+        (False, True, True, 1, 22, 88, (4, True)),
+        (False, True, True, 1, 4, 16, (4, True)),
+        (False, True, False, 1, 22, 88, (1, False)),
+        (False, True, True, 4, 22, 88, (1, False)),
+        (False, True, True, 1, 22, 87, (1, False)),
+        (False, True, True, 1, 0, 0, (1, False)),
+        (False, False, True, 1, 22, 88, (1, False)),
+    ],
+)
+def test_draft_extend_windows_group_by_four_only_when_enabled(
+    verify, draft, flag, tp, requests, rows, expected
+):
+    with (
+        grouped4_flags(),
+        envs.SGLANG_ENABLE_QSA_GROUPED4_DRAFT_EXTEND.override(flag),
+        patch.object(impl, "get_parallel", return_value=NS(tp_size=tp)),
+    ):
+        assert (
+            impl.QSAIndexer._decode_row_groups(window(requests), rows, verify, draft)
+            == expected
+        )
+
+
+def test_tp1_verify_windows_group_by_width_without_grouped4():
+    with (
+        envs.SGLANG_ENABLE_QSA_GROUPED4_VERIFY.override(False),
+        envs.SGLANG_ENABLE_QSA_GROUPED4_DRAFT_EXTEND.override(False),
+        patch.object(impl, "get_parallel", return_value=NS(tp_size=1)),
+    ):
+        assert impl.QSAIndexer._decode_row_groups(window(2), 8, True, False) == (
+            4,
+            False,
+        )
+
+
+def test_draft_extend_scores_through_the_grouped4_provider():
+    obj = indexer()
+    obj.numeric_signatures((88,), 4)
+    with grouped4_flags():
+        declared = obj.numeric_preparation_signatures(8193 * 4, 16)
+        seen = []
+
+        def choose(signature, *, prepared):
+            assert prepared and signature in declared and signature.variant == 7
+            return lambda io: seen.append(io)
+
+        import sys
+
+        args = inputs(88, 8)
+        native = torch.zeros((88, 512), dtype=torch.int32)
+        fake = NS(fast_topk=lambda *a, **kw: native)
+        with (
+            patch.dict(sys.modules, {"sglang.kernels.ops.attention.fast_topk": fake}),
+            patch.object(numeric_binding, "numeric_operator", side_effect=choose),
+            patch.object(impl, "qsa_mqa_decode") as stock,
+        ):
+            out = obj.select_decode_tokens(
+                *args[:5], torch.zeros(88), args[3], True, None, 4, grouped4_only=True
+            )
+    assert out is native and len(seen) == 1
+    stock.assert_not_called()
+
+
+@pytest.mark.parametrize("grouped4_only,expected", [(False, 4), (True, 1)])
+def test_grouped4_only_scores_small_windows_per_row(grouped4_only, expected):
+    obj = indexer()
+    args = inputs(16, 8)
+    obj._numeric_score_capacity = args[4]
+    with (
+        flags(),
+        patch.object(obj, "_numeric_score_select", return_value=None) as score,
+        patch.object(impl, "qsa_mqa_decode", side_effect=RuntimeError("stock")),
+        pytest.raises(RuntimeError, match="stock"),
+    ):
+        obj.select_decode_tokens(
+            *args[:5], torch.zeros(16), args[3], True, None, 4, grouped4_only
+        )
+    assert score.call_args.args[-1] == expected
 
 
 if __name__ == "__main__":

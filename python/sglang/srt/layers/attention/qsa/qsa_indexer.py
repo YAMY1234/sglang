@@ -138,7 +138,6 @@ class QSAIndexer(MultiPlatformOp):
         if not (
             (
                 envs.SGLANG_QSA_MK_SCORE.get()
-                or envs.SGLANG_QSA_NUMERIC_SCORE.get()
                 or envs.SGLANG_QSA_SPLIT_TOPK.get()
                 or grouped4 is not None
                 or envs.SGLANG_ENABLE_QSA_PREFILL_FAST_SELECT.get()
@@ -215,25 +214,24 @@ class QSAIndexer(MultiPlatformOp):
                         signature := admitted(operation, rows, scalar_type, variant)
                     ) is not None:
                         signatures.append(signature)
-            if envs.SGLANG_QSA_NUMERIC_SCORE.get():
-                if self._split_score_preset(rows, capacity):
-                    if (
-                        signature := admitted(
-                            NumericOperation.SPARSE_SELECT, rows, ScalarType.FP32, 1
-                        )
-                    ) is not None:
-                        signatures.append(signature)
-                    for group_rows, variant in ((1, 5), (4, 4)):
-                        if self._native_score_preset(rows, group_rows):
-                            if (
-                                signature := admitted(
-                                    NumericOperation.SPARSE_SCORE,
-                                    rows,
-                                    ScalarType.BF16,
-                                    variant,
-                                )
-                            ) is not None:
-                                signatures.append(signature)
+            if self._split_score_preset(rows, capacity):
+                if (
+                    signature := admitted(
+                        NumericOperation.SPARSE_SELECT, rows, ScalarType.FP32, 1
+                    )
+                ) is not None:
+                    signatures.append(signature)
+                for group_rows, variant in ((1, 5), (4, 4)):
+                    if self._native_score_preset(rows, group_rows):
+                        if (
+                            signature := admitted(
+                                NumericOperation.SPARSE_SCORE,
+                                rows,
+                                ScalarType.BF16,
+                                variant,
+                            )
+                        ) is not None:
+                            signatures.append(signature)
             if split_select:
                 if (
                     signature := admitted(
@@ -382,6 +380,7 @@ class QSAIndexer(MultiPlatformOp):
             group_rows == 4
             and rows > 0
             and rows % 4 == 0
+            and envs.SGLANG_QSA_GROUPED_SCORE.get()
             and envs.SGLANG_QSA_SCORER_V2.get()
             and envs.SGLANG_QSA_SCORER_V2_VER.get() == 7
             and envs.SGLANG_QSA_SCORER_V2_TARGET.get() == 4096
@@ -442,8 +441,7 @@ class QSAIndexer(MultiPlatformOp):
         rows = q.shape[0]
         query_heads = ((self.index_n_heads + 7) // 8) * 8
         if not (
-            (envs.SGLANG_QSA_MK_SCORE.get() or envs.SGLANG_QSA_NUMERIC_SCORE.get())
-            and q.is_cuda
+            q.is_cuda
             and is_sm100_supported()
             and not is_batch_invariant_mode_enabled()
             and q.shape == (rows, query_heads, self.index_head_dim)
@@ -467,8 +465,6 @@ class QSAIndexer(MultiPlatformOp):
             return None
         tp1 = get_parallel().tp_size == 1
         split = tp1 and self._split_score_preset(rows, capacity)
-        if split and not envs.SGLANG_QSA_NUMERIC_SCORE.get():
-            return None
         # A nondefault split policy may still take precedence in the source.
         if tp1 and envs.SGLANG_QSA_SPLIT_TOPK.get() and not split:
             return None
@@ -482,7 +478,7 @@ class QSAIndexer(MultiPlatformOp):
                 return None  # unsupported non-MK Q4/N16 route is not per-row
             score_variant = 3 if envs.SGLANG_QSA_MK_SCORE_SHORT32.get() else 0
         else:
-            if not envs.SGLANG_QSA_NUMERIC_SCORE.get() or not split:
+            if not split:
                 return None
             if not self._native_score_preset(rows, rows_per_group):
                 return None
@@ -625,7 +621,7 @@ class QSAIndexer(MultiPlatformOp):
         return True
 
     def _numeric_grouped4_score(self, q, cache, table, lengths, capacity):
-        """Scores of one target-verify grouped4 launch, or None for stock."""
+        """Scores of one verify or draft-extend grouped4 launch, or None for stock."""
         from sglang.kernels.plugin_kernels.nvidia.numeric import (
             NumericOperation,
             NumericSignature,
@@ -1142,10 +1138,13 @@ class QSAIndexer(MultiPlatformOp):
         defer_expansion: bool = False,
         score_q4_requests: torch.Tensor | None = None,
         rows_per_group: int = 1,
+        grouped4_only: bool = False,
     ) -> torch.Tensor:
         verify_rows_per_group = rows_per_group
+        # grouped4_only: rows outside the grouped4 scorer are scored per row.
         if not (
             rows_per_group > 1
+            and not grouped4_only
             and get_parallel().tp_size == 1
             and is_sm100_supported()
             and q.shape[0] % rows_per_group == 0
@@ -1163,7 +1162,8 @@ class QSAIndexer(MultiPlatformOp):
                 score_q4_requests,
                 rows_per_group,
             )
-            if (score_q4_requests is not None or envs.SGLANG_QSA_NUMERIC_SCORE.get())
+            if score_q4_requests is not None
+            or getattr(self, "_numeric_score_capacity", 0)
             else None
         )
         if selected is not None:
@@ -1320,6 +1320,25 @@ class QSAIndexer(MultiPlatformOp):
             ),
         )
 
+    @staticmethod
+    def _decode_row_groups(
+        forward_batch, num_valid_tokens, is_target_verify, is_draft_extend
+    ):
+        """(rows_per_group, grouped4_only) of a TP1 verify or draft-extend window."""
+        if get_parallel().tp_size != 1:
+            return 1, False
+        if is_target_verify:
+            width = int(getattr(forward_batch.spec_info, "draft_token_num", 1) or 1)
+            if width > 1 and num_valid_tokens % width == 0:
+                return width, False
+        if is_draft_extend and envs.SGLANG_ENABLE_QSA_GROUPED4_DRAFT_EXTEND.get():
+            # Spec-v2 draft extend packs one equal window per request in position
+            # order (graph_metadata mode 2), so four rows group like verify.
+            requests = forward_batch.req_pool_indices.numel()
+            if requests > 0 and num_valid_tokens == 4 * requests:
+                return 4, True
+        return 1, False
+
     def _forward_impl(
         self,
         hidden_states: torch.Tensor,
@@ -1417,18 +1436,9 @@ class QSAIndexer(MultiPlatformOp):
             compressed_cache, page_table, compressed_lengths, max_model_len = (
                 indexer_metadata.get_decode_mqa_inputs(self.layer_id)
             )
-            rows_per_group = 1
-            if (
-                (
-                    envs.SGLANG_QSA_NUMERIC_SCORE.get()
-                    or envs.SGLANG_ENABLE_QSA_GROUPED4_VERIFY.get()
-                )
-                and is_target_verify
-                and get_parallel().tp_size == 1
-            ):
-                width = int(getattr(forward_batch.spec_info, "draft_token_num", 1) or 1)
-                if width > 1 and num_valid_tokens % width == 0:
-                    rows_per_group = width
+            rows_per_group, grouped4_only = self._decode_row_groups(
+                forward_batch, num_valid_tokens, is_target_verify, is_draft_extend
+            )
             return self.select_decode_tokens(
                 q,
                 compressed_cache,
@@ -1449,6 +1459,7 @@ class QSAIndexer(MultiPlatformOp):
                 if (envs.SGLANG_QSA_MK_SCORE.get() or envs.SGLANG_QSA_Q4_SCORE.get())
                 else None,
                 rows_per_group=rows_per_group,
+                grouped4_only=grouped4_only,
             )
 
         compressed_keys, row_starts, row_ends, sequence_lengths = (
