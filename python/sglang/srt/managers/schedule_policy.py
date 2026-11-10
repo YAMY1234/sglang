@@ -482,11 +482,19 @@ class SchedulePolicy:
         ):
             return None
         remaining = len(chunked_req.full_untruncated_fill_ids) - chunked_req.prefix_len
+        min_pct = envs.SGLANG_SPF_CHUNK_MIN_PCT.get()
+        # The chunk keeps at least min_chunk tokens per batch, so it always progresses.
+        min_chunk = max(page_size, budget * min_pct // 100)
         reserved = 0
         for req in waiting_queue:
             work = self._shortest_prefill_work(req)
             charge = _ceil_div(work, page_size) * page_size
-            if work >= remaining or reserved + charge > budget - page_size:
+            if work >= remaining:
+                # With a floor, aged requests can sort ahead of shorter ones.
+                if min_pct:
+                    continue
+                break
+            if reserved + charge > budget - min_chunk:
                 break
             reserved += charge
         if not reserved:
