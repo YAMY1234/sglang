@@ -336,6 +336,11 @@ class Envs:
     SGLANG_OPT_MOE_NVFP4_PREQUANT_OVERLAP = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # HiCache device eviction: a tree step's, or a write-back batch's, page-exact
+    # token-KV frees reach the stock paged allocator as one segment (same free pages).
+    SGLANG_OPT_HICACHE_GROUPED_DEVICE_FREES = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
