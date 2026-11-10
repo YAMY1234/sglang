@@ -8,6 +8,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import CacheOperation, HiCacheController
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache import l2_transfer as transfer_module
@@ -562,6 +563,60 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         )
         self.assertIs(pool_transfers[0].host_indices, mock.sentinel.host_indices)
         self.assertIs(pool_transfers[0].device_indices, mock.sentinel.device_indices)
+
+    def test_load_back_index_move_pins_only_under_the_switch(self):
+        for master, child in [(False, True), (True, False), (True, True)]:
+            with self.subTest(master=master, child=child):
+                controller = mock.Mock(spec=HybridCacheController)
+                controller._pin_load_indices = False
+                controller.load_queue = [
+                    CacheOperation(_indices(0, 2), _indices(2, 4), 7)
+                ]
+                controller.layer_done_counter = mock.MagicMock()
+                controller.layer_done_counter.update_producer.return_value = 0
+                seen = []
+                controller._move_op_indices.side_effect = lambda op: (
+                    seen.append(controller._pin_load_indices)
+                    or (op.host_indices, op.device_indices, None)
+                )
+                controller.kv_storage = None
+                controller.load_fence_stream = None
+                controller.l2_transfer_engine = mock.Mock()
+                controller.l2_transfer_engine.submit_host_to_device.return_value = (
+                    SimpleNamespace(
+                        start_event=None, finish_event=None, timing_enabled=False
+                    )
+                )
+                controller.transfer_layer_id_max = 2
+                controller.ack_load_queue = []
+                with (
+                    envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(master),
+                    envs.SGLANG_OPT_HICACHE_PINNED_INDEX_H2D.override(child),
+                ):
+                    HiCacheController.start_loading(controller)
+                self.assertEqual(seen, [master and child])
+                self.assertFalse(controller._pin_load_indices)
+
+    def test_move_indices_pins_pageable_host_indices_only_for_a_load(self):
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.io_backend = "kernel"
+        controller.device = "cuda:0"
+        for pin, pinned in [(False, False), (True, True), (True, False)]:
+            with self.subTest(pin=pin, pinned=pinned):
+                host = mock.Mock(is_cuda=False)
+                host.is_pinned.return_value = pinned
+                controller._pin_load_indices = pin
+                moved, device = controller.move_indices(host, mock.sentinel.device)
+                self.assertIs(device, mock.sentinel.device)
+                if pin and not pinned:
+                    host.pin_memory.assert_called_once_with()
+                    staged = host.pin_memory.return_value
+                    host.to.assert_not_called()
+                else:
+                    host.pin_memory.assert_not_called()
+                    staged = host
+                staged.to.assert_called_once_with("cuda:0", non_blocking=True)
+                self.assertIs(moved, staged.to.return_value)
 
     def _patched_transfers(self, src_registry=None, module=MEMORY_POOL_HOST_MODULE):
         staged_side_effect = None
