@@ -7,6 +7,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.utils.device import is_hip
 
 try:
@@ -127,6 +128,17 @@ def _scoring_dtype(q: torch.Tensor, k: torch.Tensor) -> torch.dtype:
         return torch.float8_e4m3fn
     return torch.bfloat16
 
+
+# CUDA's div_ by a CPU scalar multiplies by the FP32 reciprocal: for sqrt(128)
+# that is 0x3DB504F3. Inline PTX keeps the multiply IEEE (.rn, no .ftz) under
+# fast math, for the scaled relative prefill kernel.
+_QSA_INV_SQRT128_PRELUDE = r"""
+__device__ __forceinline__ float qsa_mul_inv_sqrt128(float x) {
+  float y;
+  asm("mul.rn.f32 %0, %1, 0f3DB504F3;" : "=f"(y) : "f"(x));
+  return y;
+}
+"""
 
 if HAS_TILELANG:
 
@@ -273,6 +285,91 @@ if HAS_TILELANG:
                         if column >= 0:
                             if column < width:
                                 Logits[row_base + qi, column] = reduced[n, qi]
+
+        return kernel
+
+    # The relative kernel above with the 1/sqrt(128) scale folded into its store;
+    # GEMM, ReLU, head sum and written positions are unchanged.
+    @tilelang.jit(
+        pass_configs={
+            tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+            tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+            tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        }
+    )
+    def _tilelang_qsa_mqa_prefill_relative_scaled_kernel(
+        heads: int,
+        head_dim: int,
+        block_n: int = 64,
+        block_q: int = 32,
+        num_stages: int = 3,
+        threads: int = 512,
+        key_splits: int = 1,
+        dtype: str = "bfloat16",
+    ):
+        rows = T.dynamic("rows")
+        keys = T.dynamic("keys")
+        width = T.dynamic("width")
+
+        @T.prim_func
+        def kernel(
+            Q: T.Tensor([rows * heads, head_dim], dtype),  # type: ignore
+            K: T.Tensor([keys, head_dim], dtype),  # type: ignore
+            Logits: T.Tensor([rows, width], T.float32),  # type: ignore
+            Starts: T.Tensor([rows], T.int32),  # type: ignore
+            Ends: T.Tensor([rows], T.int32),  # type: ignore
+        ):
+            with T.Kernel(
+                T.ceildiv(rows, block_q),
+                key_splits,
+                threads=threads,
+                prelude=_QSA_INV_SQRT128_PRELUDE,
+            ) as (
+                bx,
+                by,
+            ):
+                q_shared = T.alloc_shared([block_q * heads, head_dim], dtype)
+                k_shared = T.alloc_shared([block_n, head_dim], dtype)
+                scores = T.alloc_fragment([block_n, block_q * heads], T.float32)
+                scores_3d = T.reshape(scores, (block_n, block_q, heads))
+                reduced = T.alloc_fragment([block_n, block_q], T.float32)
+                row_base = bx * block_q
+                start_min = T.alloc_var(T.int32)
+                end_max = T.alloc_var(T.int32)
+                start_min = 2147483647
+                end_max = -2147483648
+                for qi in T.serial(block_q):
+                    start_min = T.min(start_min, T.min(Starts[row_base + qi], keys))
+                    end_max = T.max(end_max, T.min(Ends[row_base + qi], keys))
+                num_tiles = T.ceildiv(end_max - start_min, block_n)
+                tiles_per_split = T.ceildiv(num_tiles, key_splits)
+                tile_begin = by * tiles_per_split
+                tile_count = T.max(T.min(num_tiles - tile_begin, tiles_per_split), 0)
+
+                T.copy(Q[row_base * heads, 0], q_shared)
+                for ti in T.Pipelined(tile_count, num_stages=num_stages):
+                    key_base = start_min + (tile_begin + ti) * block_n
+                    T.copy(K[key_base, 0], k_shared)
+                    T.gemm(
+                        k_shared,
+                        q_shared,
+                        scores,
+                        transpose_B=True,
+                        clear_accum=True,
+                        policy=T.GemmWarpPolicy.FullCol,
+                    )
+                    for n, qi, head in T.Parallel(block_n, block_q, heads):
+                        scores_3d[n, qi, head] = T.max(scores_3d[n, qi, head], 0.0)
+                    T.reduce_sum(scores_3d, reduced, dim=-1, clear=True)
+                    for qi, n in T.Parallel(block_q, block_n):
+                        column = key_base + n - Starts[row_base + qi]
+                        # A row block can straddle requests; keep each row to
+                        # its own window.
+                        if column >= 0:
+                            if column < width:
+                                Logits[row_base + qi, column] = T.call_extern(
+                                    "float32", "qsa_mul_inv_sqrt128", reduced[n, qi]
+                                )
 
         return kernel
 
@@ -515,7 +612,19 @@ def tilelang_qsa_mqa_prefill_relative(
         starts = torch.cat([starts, starts[-1:].expand(padding)])
         ends = torch.cat([ends, ends[-1:].expand(padding)])
 
-    _tilelang_qsa_mqa_prefill_relative_kernel(
+    # The store's constant is the FP32 reciprocal of sqrt(128); any other scale
+    # keeps the divide. The helper is inline PTX, so ROCm keeps the divide too.
+    fold = (
+        envs.SGLANG_OPT_QSA_PREFILL_SCALE_FOLD.get()
+        and score_scale is None
+        and head_dim == 128
+        and not is_hip()
+    )
+    (
+        _tilelang_qsa_mqa_prefill_relative_scaled_kernel
+        if fold
+        else _tilelang_qsa_mqa_prefill_relative_kernel
+    )(
         heads=heads,
         head_dim=head_dim,
         block_n=block_n,
@@ -532,7 +641,8 @@ def tilelang_qsa_mqa_prefill_relative(
         ends,
     )
     logits = logits[:rows]
-    logits.div_(score_scale or math.sqrt(head_dim))
+    if not fold:
+        logits.div_(score_scale or math.sqrt(head_dim))
     return logits
 
 

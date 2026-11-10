@@ -1170,6 +1170,86 @@ def test_qsa_weight_free_mqa_logits_matches_explicit_formula():
     torch.testing.assert_close(actual, expected)
 
 
+@pytest.mark.parametrize(
+    "master,child,score_scale,head_dim,folded",
+    [
+        (True, None, None, 128, True),
+        (True, "0", None, 128, False),
+        (False, "1", None, 128, False),
+        (True, None, 2.0, 128, False),
+        (True, None, None, 64, False),
+    ],
+)
+def test_qsa_relative_prefill_scale_fold_replaces_the_divide(
+    monkeypatch, master, child, score_scale, head_dim, folded
+):
+    from contextlib import ExitStack
+
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.attention.qsa import mqa
+
+    launched = []
+
+    def factory(name):
+        def prepare(**kwargs):
+            def run(q, k, logits, starts, ends):
+                launched.append(name)
+                logits.fill_(3.0)
+
+            return run
+
+        return prepare
+
+    monkeypatch.setattr(mqa, "HAS_TILELANG", True)
+    monkeypatch.setattr(mqa, "is_hip", lambda: False)
+    monkeypatch.setattr(mqa, "_num_sms", lambda index: 148)
+    for name, kind in (
+        ("_tilelang_qsa_mqa_prefill_relative_kernel", "stock"),
+        ("_tilelang_qsa_mqa_prefill_relative_scaled_kernel", "scaled"),
+    ):
+        monkeypatch.setattr(mqa, name, factory(kind), raising=False)
+    q = torch.zeros(5, 4, head_dim, dtype=torch.bfloat16)
+    k = torch.zeros(9, 1, head_dim, dtype=torch.bfloat16)
+    starts = torch.zeros(5, dtype=torch.int32)
+    ends = torch.full((5,), 9, dtype=torch.int32)
+    with ExitStack() as stack:
+        stack.enter_context(
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(master)
+        )
+        if child is not None:
+            stack.enter_context(envs.SGLANG_OPT_QSA_PREFILL_SCALE_FOLD.override(child))
+        logits = mqa.tilelang_qsa_mqa_prefill_relative(
+            q, k, starts, ends, 9, score_scale
+        )
+    assert launched == ["scaled" if folded else "stock"]
+    expected = torch.full((5, 9), 3.0)
+    if not folded:
+        expected.div_(score_scale or head_dim**0.5)
+    assert torch.equal(logits, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA TileLang kernels")
+def test_qsa_relative_prefill_scale_fold_is_bitwise_the_divide():
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.attention.qsa.mqa import qsa_mqa_prefill_relative
+
+    # The folded store constant is the FP32 reciprocal CUDA's div_ multiplies by.
+    inverse = torch.tensor(1.0) / torch.tensor(128**0.5, dtype=torch.float32)
+    assert inverse.view(torch.int32).item() == 0x3DB504F3
+    torch.manual_seed(7)
+    q = torch.randn(70, 4, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(300, 1, 128, device="cuda", dtype=torch.bfloat16)
+    lengths = torch.randint(1, 120, (70,), device="cuda", dtype=torch.int32)
+    starts = torch.randint(0, 180, (70,), device="cuda", dtype=torch.int32)
+    ends = starts + lengths
+    with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True):
+        with envs.SGLANG_OPT_QSA_PREFILL_SCALE_FOLD.override(False):
+            stock = qsa_mqa_prefill_relative(q, k, starts, ends, 120)
+        folded = qsa_mqa_prefill_relative(q, k, starts, ends, 120)
+    valid = torch.arange(120, device="cuda")[None, :] < lengths[:, None]
+    assert torch.equal(folded[valid], stock[valid])
+
+
 def test_qsa_prefill_selection_microchunks_rows(monkeypatch):
     rows, keys, heads, head_dim = 65, 64, 4, 8
     token_topk, compress_ratio = 8, 4

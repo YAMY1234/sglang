@@ -295,6 +295,11 @@ class Envs:
     SGLANG_OPT_OVERLAP_EVENT_REUSE = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # QSA relative prefill scorer: fold 1/sqrt(128) into its store (bitwise the
+    # same as the separate CUDA divide), saving one pass over the logits.
+    SGLANG_OPT_QSA_PREFILL_SCALE_FOLD = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
