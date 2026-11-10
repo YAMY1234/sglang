@@ -80,6 +80,16 @@ def contract_geometry(s):
         RouterQuantSignature,
     )
 
+    if s.operation == Op.PACKED_PREFILL_ATTENTION:
+        return (
+            s.rows == s.rotary_dim == s.context_bound == s.ctas_per_group == 0
+            and 0 < s.kv_heads
+            and s.query_heads % s.kv_heads == 0
+            and s.query_heads // s.kv_heads <= 16
+            and (s.head_dim, s.selected_count, s.compress_ratio, s.scalar_type)
+            == (256, 2051, 4, 1)
+            and 1 <= s.variant <= 8
+        )
     if s.operation == Op.PREFILL_SELECT:
         return (
             s.rows,
@@ -338,6 +348,7 @@ _SCHEMAS = {
     NumericOperation.GDN_NATIVE_PDL: (NativeGdnPdlSignature, ()),
     NumericOperation.DIRECT_POOL_ATTENTION: (NumericSignature, ("tp_size",)),
     NumericOperation.POOL_UNION_ATTENTION: (NumericSignature, ("tp_size",)),
+    NumericOperation.PACKED_PREFILL_ATTENTION: (NumericSignature, ("tp_size",)),
     NumericOperation.LOCAL_EXPERTS: (
         ExpertSignature,
         (
@@ -378,6 +389,8 @@ def _source_supported(s, actual):
     op = s.operation
     if op == NumericOperation.HC_MIX:
         return s.rows <= 32
+    if op == NumericOperation.PACKED_PREFILL_ATTENTION:
+        return actual["tp_size"] > 0
     if op == NumericOperation.PREFILL_SELECT:
         return (
             actual["tp_size"] > 0

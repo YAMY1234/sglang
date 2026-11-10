@@ -314,6 +314,9 @@ class Envs:
     SGLANG_ENABLE_QSA_PREFILL_FAST_SELECT = EnvBool(False)
     # TP1 target verify on an FP8 KV pool: one union attention launch per layer.
     SGLANG_QSA_FP8_POOL_VERIFY = EnvBool(False)
+    # TP1 prefix-chunk prefill attention with TMA-gathered K/V on the stock tile.
+    SGLANG_ENABLE_QSA_TMA_PREFILL = EnvBool(False)
+    SGLANG_QSA_TMA_PREFILL_STAGES = EnvInt(3)
     SGLANG_HC_GATE_MAX_ROWS = EnvInt(1)
     # Log once per role/layer/op whether a numeric provider was offered and bound,
     # or why stock runs; read once at import, so it costs nothing when off.

@@ -35,6 +35,7 @@ from sglang.srt.layers.attention.qsa.metadata import (
     compressed_decode_view,
 )
 from sglang.srt.layers.attention.qsa.sparse_attn import (
+    _get_best_config,
     pack_qsa_prefill_kv,
     qwen_sparse_fa2_cu_seqlens_triton,
     qwen_sparse_kv_extraction_compact_triton,
@@ -1976,17 +1977,100 @@ class QwenSparseAttnBackend(AttentionBackend):
             max_k=max(sequence_lens, default=1),
             output_dtype=q.dtype,
         )
-        output = sparse_gqa_fwd_interface_triton_ck(
+        output = self._numeric_packed_prefill(
             q.contiguous(),
+            layer,
+            forward_batch,
             packed_k,
             packed_v,
             topk_indices,
             cu_seqlens_q,
             cu_seqlens_k,
             sequence_lens_tensor,
-            layer.scaling,
+            extend_lens,
         )
+        if output is None:
+            output = sparse_gqa_fwd_interface_triton_ck(
+                q.contiguous(),
+                packed_k,
+                packed_v,
+                topk_indices,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                sequence_lens_tensor,
+                layer.scaling,
+            )
         return self._pad_extend_output(output, num_output_rows)
+
+    def _numeric_packed_prefill(
+        self, q, layer, forward_batch, k, v, indices, cu_q, cu_k, kv_lens, extend_lens
+    ):
+        """The stock prefix-chunk kernel's tile with TMA-gathered K/V, or None."""
+        from sglang.kernels.plugin_kernels.nvidia.numeric import (
+            NumericOperation,
+            NumericSignature,
+            PackedPrefillAttentionIO,
+            ScalarType,
+        )
+        from sglang.srt.environ import envs
+        from sglang.srt.kernel_plugins.nvidia.numeric_binding import numeric_operator
+
+        if not (
+            envs.SGLANG_ENABLE_QSA_TMA_PREFILL.get()
+            and is_sm100_supported()
+            # The grid takes the host max query rows; captured prefill stays stock.
+            and len(extend_lens) == forward_batch.extend_seq_lens.shape[0]
+            and not torch.cuda.is_current_stream_capturing()
+            and _get_best_config(q.shape[0]) == (16, 1, 2)
+            and q.dtype == k.dtype == v.dtype == torch.bfloat16
+            and q.ndim == k.ndim == 3
+            and k.shape == v.shape
+            and k.shape[1] > 0
+            and q.shape[1] % k.shape[1] == 0
+            and q.shape[2] == k.shape[2]
+            and k.is_contiguous()
+            and v.is_contiguous()
+            and indices.dtype == torch.int32
+            and indices.ndim == 2
+            and indices.stride(1) == 1
+            # TMA: int32 row coordinates and 16-byte aligned bases and rows.
+            and k.shape[0] < 2**31 - 1
+            and k.data_ptr() % 16 == v.data_ptr() % 16 == 0
+            and k.stride(0) * k.element_size() % 16 == 0
+        ):
+            return None
+        run = numeric_operator(
+            NumericSignature(
+                NumericOperation.PACKED_PREFILL_ATTENTION,
+                0,
+                q.shape[1],
+                k.shape[1],
+                q.shape[2],
+                indices.shape[1],
+                self.compress_ratio,
+                ScalarType.BF16,
+                variant=envs.SGLANG_QSA_TMA_PREFILL_STAGES.get(),
+            ),
+            prepared=True,
+        )
+        if run is None:
+            return None
+        output = torch.empty_like(q)
+        run(
+            PackedPrefillAttentionIO(
+                q,
+                k,
+                v,
+                indices,
+                cu_q,
+                cu_k,
+                kv_lens,
+                layer.scaling,
+                max(extend_lens),
+                output,
+            )
+        )
+        return output
 
     def prefetch_cp_kv(self, layer, k: torch.Tensor, v: torch.Tensor, forward_batch):
         """Run ``layer``'s prefill-CP K/V gather on a side stream; the layer's

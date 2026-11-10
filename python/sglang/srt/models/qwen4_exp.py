@@ -1948,6 +1948,21 @@ class Qwen4ExpAttentionDecoderLayer(
                 for rows in widths
                 if rows > 0
             )
+        if envs.SGLANG_ENABLE_QSA_TMA_PREFILL.get():
+            # One declaration for every prefill length; rows vary per call.
+            signatures.append(
+                NumericSignature(
+                    NumericOperation.PACKED_PREFILL_ATTENTION,
+                    0,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    self.indexer.token_topk + self.indexer.compress_ratio - 1,
+                    self.indexer.compress_ratio,
+                    ScalarType.BF16,
+                    variant=envs.SGLANG_QSA_TMA_PREFILL_STAGES.get(),
+                )
+            )
         from sglang.srt.kernel_plugins.nvidia.pool_attention import pool_signatures
 
         signatures.extend(

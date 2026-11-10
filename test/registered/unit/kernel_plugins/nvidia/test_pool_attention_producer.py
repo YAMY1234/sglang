@@ -71,7 +71,7 @@ def attention():
     obj.is_qsa = True
     obj.num_heads, obj.num_kv_heads, obj.head_dim = 24, 2, 256
     obj.rotary_emb = NS(rotary_dim=64)
-    obj.indexer = NS(block_topk=512, compress_ratio=4)
+    obj.indexer = NS(block_topk=512, compress_ratio=4, token_topk=2048)
     return obj
 
 
@@ -628,3 +628,119 @@ def test_union_workspace_matches_original_source_plan(requests, sms):
         requests * (2 * nt + nb + 1) + requests * 4,
         requests * 2 * splits * qp * (256 + 2),
     )
+
+
+def packed_prefill_signatures(stages=None):
+    with ExitStack() as stack:
+        stack.enter_context(envs.SGLANG_ENABLE_QSA_TMA_PREFILL.override(True))
+        if stages is not None:
+            stack.enter_context(envs.SGLANG_QSA_TMA_PREFILL_STAGES.override(stages))
+        return [
+            s
+            for s in attention().numeric_signatures((32, 600), 4)
+            if s.operation == api.NumericOperation.PACKED_PREFILL_ATTENTION
+        ]
+
+
+def test_packed_prefill_declares_one_row_independent_signature():
+    assert not [
+        s
+        for s in attention().numeric_signatures((32, 600), 4)
+        if s.operation == api.NumericOperation.PACKED_PREFILL_ATTENTION
+    ]
+    expected = api.NumericSignature(
+        api.NumericOperation.PACKED_PREFILL_ATTENTION,
+        0,
+        24,
+        2,
+        256,
+        2051,
+        4,
+        api.ScalarType.BF16,
+        variant=3,
+    )
+    assert packed_prefill_signatures() == [expected]
+    assert [s.variant for s in packed_prefill_signatures(stages=2)] == [2]
+    assert packed_prefill_signatures(stages=9) == []
+    # The source admits any TP; the layer's local heads carry the geometry.
+    with patch.object(model, "get_parallel", return_value=NS(tp_size=4)):
+        assert packed_prefill_signatures() == [expected]
+
+
+def packed_prefill_call(rows=600, extend_lens=(300, 300), **change):
+    obj = object.__new__(backend.QwenSparseAttnBackend)
+    obj.compress_ratio = 4
+    q = torch.zeros((rows, 24, 256), dtype=torch.bfloat16).as_subclass(DeviceMetadata)
+    k = torch.zeros((1200, 2, 256), dtype=torch.bfloat16)
+    v = torch.zeros_like(k)
+    args = dict(
+        q=q,
+        layer=NS(tp_q_head_num=24, head_dim=256, scaling=0.0625, layer_id=0),
+        forward_batch=NS(extend_seq_lens=torch.tensor(extend_lens)),
+        k=k,
+        v=v,
+        indices=torch.zeros((rows, 2051), dtype=torch.int32),
+        cu_q=torch.tensor([0, 300, 600], dtype=torch.int32),
+        cu_k=torch.tensor([0, 600, 1200], dtype=torch.int32),
+        kv_lens=torch.tensor([600, 600], dtype=torch.int32),
+        extend_lens=list(extend_lens),
+    )
+    args.update(change)
+    return obj, args
+
+
+def packed_prefill_registry(run):
+    (signature,) = packed_prefill_signatures()
+    registry = api.NumericRegistry()
+    registry.register(api.NumericOffer(signature, run))
+    return patch.object(numeric_binding, "numeric_registry", registry)
+
+
+def test_packed_prefill_serves_the_stock_tile_with_host_max_query_rows():
+    seen = []
+
+    def run(io):
+        seen.append(io)
+        io.output.fill_(7)
+
+    obj, args = packed_prefill_call(extend_lens=(250, 350))
+    with (
+        packed_prefill_registry(run),
+        envs.SGLANG_ENABLE_QSA_TMA_PREFILL.override(True),
+        patch.object(torch.cuda, "get_device_name", return_value="NVIDIA GB300"),
+    ):
+        output = obj._numeric_packed_prefill(**args)
+    (io,) = seen
+    assert io.max_query_rows == 350 and io.scale == 0.0625
+    assert io.query is args["q"] and io.packed_k is args["k"] and io.output is output
+    assert io.selected_indices is args["indices"] and io.cu_key is args["cu_k"]
+    assert output.shape == args["q"].shape and torch.all(output == 7)
+
+
+@pytest.mark.parametrize(
+    "case", ["off", "capturing", "stale_host_lens", "small_tile", "int64_indices"]
+)
+def test_packed_prefill_outside_source_admission_is_stock(case):
+    change = {}
+    if case == "stale_host_lens":
+        change["forward_batch"] = NS(extend_seq_lens=torch.tensor([300, 300, 0]))
+    if case == "small_tile":
+        change["q"] = torch.zeros((512, 24, 256), dtype=torch.bfloat16).as_subclass(
+            DeviceMetadata
+        )
+    if case == "int64_indices":
+        change["indices"] = torch.zeros((600, 2051), dtype=torch.int64)
+    obj, args = packed_prefill_call(**change)
+    with (
+        packed_prefill_registry(lambda io: pytest.fail("provider ran")),
+        envs.SGLANG_ENABLE_QSA_TMA_PREFILL.override(case != "off"),
+        patch.object(torch.cuda, "get_device_name", return_value="NVIDIA GB300"),
+        patch.object(
+            policy.torch.cuda,
+            "is_current_stream_capturing",
+            return_value=case == "capturing",
+        ),
+        patch.object(numeric_binding, "numeric_operator") as lookup,
+    ):
+        assert obj._numeric_packed_prefill(**args) is None
+    lookup.assert_not_called()

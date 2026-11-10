@@ -35,6 +35,7 @@ class NumericOperation(IntEnum):
     MTP_CAPTURE_SEED = 7
     MTP_DEFERRED_KV_PREPARE = 8
     PREFILL_SELECT = 9
+    PACKED_PREFILL_ATTENTION = 17
     HC_GATE = 10
     HC_APPLY_NORM = 11
     HC_APPLY_NORM_GATE = 12
@@ -93,8 +94,10 @@ class NumericSignature:
     context_bound: int = 0
     # Sparse score: 0=MK, 3=MK short32, 4=grouped V7/W4 defaults,
     # 5=per-row defaults, 6=grouped4 chain, 7=grouped4 chain with a two-stage
-    # key pipeline. Sparse select: 0=MK, 1=split defaults. Prefill select: rows
-    # is 0 (packed prefill rows vary per call); context_bound bounds a row's keys.
+    # key pipeline. Sparse select: 0=MK, 1=split defaults. Prefill select and
+    # packed prefill attention: rows is 0 (packed prefill rows vary per call);
+    # context_bound bounds a select row's keys, and attention's variant is its
+    # key-load pipeline stage count.
     variant: int = 0
     # Grid CTAs per four-row request group of sparse score 6/7; 0 elsewhere.
     ctas_per_group: int = 0
@@ -312,6 +315,25 @@ class SparseScoreIO:
     scale: float
     scores_out: Tensor
     scratch_out: Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class PackedPrefillAttentionIO:
+    """Packed BF16 prefix-chunk K/V with live request boundaries; caller output.
+
+    ``max_query_rows`` is the host maximum of the call's per-request query rows.
+    """
+
+    query: Tensor
+    packed_k: Tensor
+    packed_v: Tensor
+    selected_indices: Tensor
+    cu_query: Tensor
+    cu_key: Tensor
+    sequence_lengths: Tensor
+    scale: float
+    max_query_rows: int
+    output: Tensor
 
 
 @dataclass(frozen=True, slots=True)
@@ -703,7 +725,8 @@ class MtpDeferredKvIO:
 
 
 NumericIO = (
-    PrefillSelectIO
+    PackedPrefillAttentionIO
+    | PrefillSelectIO
     | SparseScoreIO
     | SparseSelectIO
     | DirectPoolAttentionIO
