@@ -17,6 +17,9 @@ routes off, and until that check has run (it runs when a model calls ``precompil
 as Qwen4-Exp does) the routes are not served. Keys where no bit-equal single kernel beat stock keep the stock
 route: gdn_in_proj and attn_qkv at M 1-4, the shared expert's gate_up at M 17-32 and out_proj below M 64. Any
 other shape, a bias, an addend or a non-contiguous operand takes the stock dispatch.
+
+``NONBITWISE_ROUTES`` (opt-in, SGLANG_ENABLE_SM107_BF16_SMALLM_NONBITWISE_ROUTES=1) are faster kernels whose bits
+differ from stock in FP32 summation order; each is checked at load against a relative-L2 bound instead.
 """
 
 from __future__ import annotations
@@ -26,6 +29,8 @@ import logging
 from typing import Callable, Optional
 
 import torch
+
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +63,16 @@ ROUTES = {
     # Stock runs TGV tactic 18 here; tactic 21 is the same unsplit K order.
     (64, *_OUT_PROJ): ("tgv", 21),
 }
+# SGLANG_ENABLE_SM107_BF16_SMALLM_NONBITWISE_ROUTES=1 (with the routes above on) adds these keys, whose output is
+# the same product with FP32 partial sums added in another order, so not the stock bits. ``precompile`` checks each
+# against the stock dispatch by relative L2 instead of bit equality and drops only a key that fails. GDN out_proj and
+# attention o_proj share (N 2560, K 6144); at M 20-32 (verify of 5-8 requests) stock runs TGV tactic 18, 80 CTAs on
+# 212 SMs, where four K slices of 1536 run 160 CTAs.
+NONBITWISE_ROUTES = {
+    (m, *_OUT_PROJ): ("cl", (64, 32, 4, 8, 128)) for m in range(20, 33)
+}
+# Measured 1.2-1.7e-4 at these keys on SM107; one BF16 ulp on every output element is about 4e-3.
+_NONBITWISE_REL_L2_MAX = 1e-3
 
 # FlashInfer 0.7.2's dense_bf16_gemm_sm100_splitk.py with FlashInfer #7443's hand-off fix, vendored as
 # kernels/ops/gemm/dense_bf16_gemm_sm100_splitk.py (0.7.2's tiles, K slices and reduction order, so 0.7.2's bits): the
@@ -69,6 +84,8 @@ _fi = None  # (FlashInfer split-K module, CUstream constructor)
 _compiled: dict = {}
 _logged: set = set()
 _checked = False  # set by precompile's check; routes serve only after it
+_nonbitwise: frozenset = frozenset()  # the NONBITWISE_ROUTES keys in _routes
+_precompiling = False
 
 
 def _cluster_smem(mma_m: int, mma_n: int, split_k: int, stages: int, cta_k: int) -> int:
@@ -107,9 +124,10 @@ def _tgvc_ok(cta_m: int, cta_n: int, stages: int, use_2cta: bool) -> bool:
 
 def install(device_sm: int, splitk_enabled: bool, cutedsl_available: bool) -> bool:
     """Install the routes; returns whether they are on. Called once by unquant.initialize_bf16_gemm_config."""
-    global _routes, _fi, _checked
+    global _routes, _fi, _checked, _nonbitwise
     _routes = None
     _checked = False
+    _nonbitwise = frozenset()
     if device_sm != 107:
         return False
     if not (splitk_enabled and cutedsl_available):
@@ -159,7 +177,26 @@ def install(device_sm: int, splitk_enabled: bool, cutedsl_available: bool) -> bo
         kinds.count("cl"),
         kinds.count("tgv") + kinds.count("tgvc"),
     )
+    if envs.SGLANG_ENABLE_SM107_BF16_SMALLM_NONBITWISE_ROUTES.get():
+        _install_nonbitwise(fi_splitk._SMEM_CAPACITY_BYTES)
     return True
+
+
+def _install_nonbitwise(smem_capacity: int) -> None:
+    """Add NONBITWISE_ROUTES to the installed routes; they serve after precompile's relative-L2 check."""
+    global _routes, _nonbitwise
+    for (m, n, k), (kind, tactic) in NONBITWISE_ROUTES.items():
+        if kind != "cl" or not _cluster_ok(k, tactic, smem_capacity):
+            logger.warning(
+                "SGLANG_ENABLE_SM107_BF16_SMALLM_NONBITWISE_ROUTES: route %s %s at %s is invalid; "
+                "only the bitwise routes serve",
+                kind,
+                tactic,
+                (m, n, k),
+            )
+            return
+    _routes = {**ROUTES, **NONBITWISE_ROUTES}
+    _nonbitwise = frozenset(NONBITWISE_ROUTES)
 
 
 def _cluster_out(
@@ -275,7 +312,8 @@ def route_for(x: torch.Tensor, weight: torch.Tensor) -> Optional[tuple]:
 
 
 def gemm(x: torch.Tensor, weight: torch.Tensor) -> Optional[torch.Tensor]:
-    """``x @ weight.T`` from one kernel for a listed (M, N, K) with the stock route's bits, or None."""
+    """``x @ weight.T`` from one kernel for a listed (M, N, K), or None: a ROUTES key with the stock route's bits,
+    a NONBITWISE_ROUTES key within its load-checked relative-L2 bound."""
     route = route_for(x, weight)
     if route is None:
         return None
@@ -294,6 +332,17 @@ def gemm(x: torch.Tensor, weight: torch.Tensor) -> Optional[torch.Tensor]:
             k,
             tactic,
         )
+    if _nonbitwise and not _precompiling and "nonbitwise" not in _logged:
+        if (m, *weight.shape) in _nonbitwise:
+            _logged.add("nonbitwise")
+            logger.info(
+                "SM107 non-bitwise small-M route serving: m=%d n=%d k=%d %s %s (first use)",
+                m,
+                weight.shape[0],
+                k,
+                kind,
+                tactic,
+            )
     return out.view(*x.shape[:-1], weight.shape[0])
 
 
@@ -304,7 +353,8 @@ def precompile(
 ) -> bool:
     """JIT-compile every key at load and check it bit for bit against ``stock_gemm`` (the dispatch with the routes
     off) on random operands, so a change on the stock side (cuBLAS's slicing) cannot go unnoticed; any mismatch turns
-    the routes off. Returns whether the routes stay on."""
+    the routes off. NONBITWISE_ROUTES keys are checked after, by relative L2, and a failure drops only that key.
+    Returns whether the routes stay on."""
     global _routes, _checked
     if _routes is None:
         return False
@@ -313,7 +363,7 @@ def precompile(
     gen = torch.Generator(device=device).manual_seed(0)
     _checked = True  # gemm() serves the routes during the check
     weights = {}
-    for m, n, k in sorted(_routes):
+    for m, n, k in sorted(key for key in _routes if key not in _nonbitwise):
         if (n, k) not in weights:
             weights[(n, k)] = (
                 torch.randn(n, k, generator=gen, device=device) * 0.02
@@ -333,4 +383,68 @@ def precompile(
             _routes = None
             _checked = False
             return False
+    if _nonbitwise:
+        _check_nonbitwise(stock_gemm=stock_gemm, device=device)
     return True
+
+
+def _rel_l2(got: Optional[torch.Tensor], want: torch.Tensor) -> float:
+    if got is None:
+        return float("inf")
+    return float(
+        torch.linalg.vector_norm(got.float() - want.float())
+        / torch.linalg.vector_norm(want.float())
+    )
+
+
+def _check_nonbitwise(
+    *,
+    stock_gemm: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    device,
+) -> None:
+    """Drop each NONBITWISE_ROUTES key farther than _NONBITWISE_REL_L2_MAX (relative L2) from ``stock_gemm`` on random
+    operands; the ROUTES keys are untouched."""
+    global _routes, _nonbitwise, _precompiling
+    gen = torch.Generator(device=device).manual_seed(1)
+    weights, errors = {}, {}
+    _precompiling = True
+    try:
+        for m, n, k in sorted(_nonbitwise):
+            if (n, k) not in weights:
+                weights[(n, k)] = (
+                    torch.randn(n, k, generator=gen, device=device) * 0.02
+                ).to(torch.bfloat16)
+            x = torch.randn(m, k, generator=gen, device=device).to(torch.bfloat16)
+            errors[(m, n, k)] = _rel_l2(
+                gemm(x, weights[(n, k)]), stock_gemm(x, weights[(n, k)])
+            )
+    finally:
+        _precompiling = False
+    # ``not <=`` also fails a NaN.
+    failed = {key for key, err in errors.items() if not err <= _NONBITWISE_REL_L2_MAX}
+    for key in sorted(failed):
+        logger.warning(
+            "SGLANG_ENABLE_SM107_BF16_SMALLM_NONBITWISE_ROUTES: route %s at %s is %.2e from the stock dispatch "
+            "(relative L2, bound %.0e); that key keeps the stock dispatch",
+            _routes[key],
+            key,
+            errors[key],
+            _NONBITWISE_REL_L2_MAX,
+        )
+    if failed:
+        _routes = {key: route for key, route in _routes.items() if key not in failed}
+        _nonbitwise = _nonbitwise - failed
+    if _nonbitwise:
+        logger.info(
+            "SM107 non-bitwise small-M BF16 GEMM routes on: %d of %d keys (%s), relative L2 to the stock dispatch "
+            "at most %.2e (bound %.0e)",
+            len(_nonbitwise),
+            len(errors),
+            ", ".join(
+                sorted(
+                    {f"N {n} K {k}: {_routes[(m, n, k)]}" for m, n, k in _nonbitwise}
+                )
+            ),
+            max(errors[key] for key in _nonbitwise),
+            _NONBITWISE_REL_L2_MAX,
+        )

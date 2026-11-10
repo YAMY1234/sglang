@@ -310,6 +310,9 @@ class Envs:
     SGLANG_OPT_SM107_BF16_SMALLM_ROUTES = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # With the routes above: also serve sm107_bf16_smallm.NONBITWISE_ROUTES, whose outputs
+    # differ from the stock dispatch in FP32 summation order (checked by relative L2 at load).
+    SGLANG_ENABLE_SM107_BF16_SMALLM_NONBITWISE_ROUTES = EnvBool(False)
 
     # ===================================================================
     # Model configuration, discovery, and weight loading

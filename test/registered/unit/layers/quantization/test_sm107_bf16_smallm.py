@@ -9,6 +9,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import sm107_bf16_smallm as routes
 from sglang.srt.layers.quantization import unquant
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -120,6 +121,68 @@ class TestInstall(CustomTestCase):
             self.assertEqual(
                 hashlib.sha256(f.read()).hexdigest(), routes._FI_SPLITK_SHA256
             )
+
+
+class TestNonbitwise(CustomTestCase):
+    def tearDown(self):
+        routes._routes = None
+        routes._fi = None
+        routes._checked = False
+        routes._nonbitwise = frozenset()
+
+    def test_opt_in_adds_only_valid_disjoint_keys(self):
+        self.assertEqual(set(routes.NONBITWISE_ROUTES) & set(routes.ROUTES), set())
+        for (m, n, k), (kind, tactic) in routes.NONBITWISE_ROUTES.items():
+            self.assertEqual(kind, "cl")
+            self.assertTrue(routes._cluster_ok(k, tactic, _SMEM_CAPACITY), (m, n, k))
+        source = b"# split-K kernel source\n"
+        digest = hashlib.sha256(source).hexdigest()
+        for on in (False, True):
+            with (
+                mock.patch.dict(sys.modules, _fake_splitk(source)),
+                mock.patch.object(routes, "_FI_SPLITK_SHA256", digest),
+                envs.SGLANG_ENABLE_SM107_BF16_SMALLM_NONBITWISE_ROUTES.override(on),
+            ):
+                self.assertTrue(
+                    routes.install(
+                        device_sm=107, splitk_enabled=True, cutedsl_available=True
+                    )
+                )
+            extra = set(routes.NONBITWISE_ROUTES) if on else set()
+            self.assertEqual(set(routes._routes), set(routes.ROUTES) | extra)
+            self.assertEqual(routes._nonbitwise, frozenset(extra))
+
+    def test_load_check_drops_only_the_keys_past_the_bound(self):
+        """Bitwise keys are compared bit for bit; each non-bitwise key by relative L2."""
+
+        def stock(x, w):
+            return torch.ones(x.shape[0], w.shape[0], dtype=torch.bfloat16)
+
+        def routed(x, w):
+            out = stock(x, w)
+            if (x.shape[0], *w.shape) == (24, 2560, 6144):
+                out *= 1.01  # relative L2 1e-2, past the 1e-3 bound
+            return out
+
+        cheap = mock.patch.object(
+            torch,
+            "randn",
+            lambda *shape, **kw: torch.zeros(*shape, device=kw.get("device")),
+        )
+        installed = {**routes.ROUTES, **routes.NONBITWISE_ROUTES}
+        with (
+            cheap,
+            mock.patch.object(routes, "_routes", installed),
+            mock.patch.object(
+                routes, "_nonbitwise", frozenset(routes.NONBITWISE_ROUTES)
+            ),
+            mock.patch.object(routes, "gemm", routed),
+        ):
+            self.assertTrue(routes.precompile(stock_gemm=stock, device="cpu"))
+            self.assertNotIn((24, 2560, 6144), routes._routes)
+            self.assertNotIn((24, 2560, 6144), routes._nonbitwise)
+            self.assertEqual(len(routes._nonbitwise), len(routes.NONBITWISE_ROUTES) - 1)
+            self.assertTrue(set(routes.ROUTES) <= set(routes._routes))
 
 
 class TestFailClosed(CustomTestCase):
