@@ -161,6 +161,26 @@ def _host_track_lists(forward_batch: ForwardBatch) -> Optional[tuple]:
     return lists
 
 
+def _install_gdn_prefill_tmem_dealloc_fix() -> None:
+    """SGLANG_OPT_GDN_PREFILL_TMEM_DEALLOC: FlashInfer #8854 on FlashInfer 0.7.3's
+    Blackwell (SM10x) GDN prefill kernels, which free TMEM only after every reading
+    warp's last tcgen05.ld (kernels/ops/mamba/gdn_prefill_tmem_dealloc.py). Same
+    values. With another FlashInfer nothing changes, with a warning."""
+    if (
+        not envs.SGLANG_OPT_GDN_PREFILL_TMEM_DEALLOC.get()
+        or torch.cuda.get_device_capability()[0] != 10
+    ):
+        return
+    try:
+        from sglang.kernels.ops.mamba.gdn_prefill_tmem_dealloc import install
+
+        install()
+    except Exception as e:
+        logger.warning(
+            f"GDN prefill TMEM dealloc fix (FlashInfer #8854) not applied: {e}"
+        )
+
+
 def _get_flashinfer_gdn_kernels():
     """Lazy import for FlashInfer GDN prefill, decode and verify (MTP) kernels.
 
@@ -194,6 +214,7 @@ def _get_flashinfer_gdn_kernels():
             )
             if _flashinfer_gdn_available:
                 logger.info("FlashInfer GDN kernels loaded successfully")
+                _install_gdn_prefill_tmem_dealloc_fix()
         except (ImportError, RuntimeError) as e:
             logger.warning(f"FlashInfer GDN kernels not available: {e}")
             _flashinfer_gdn_available = False

@@ -581,6 +581,11 @@ class Envs:
     SGLANG_OPT_GDN_PREFILL_NORM_RETILE = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # FlashInfer 0.7.3's SM10x GDN prefill kernels with FlashInfer #8854 (TMEM freed after
+    # the last tcgen05.ld of every reading warp), compiled under their own cache name.
+    SGLANG_OPT_GDN_PREFILL_TMEM_DEALLOC = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     # Triton causal conv1d forward tile "BLOCK_M,BLOCK_N,num_warps,num_stages" (A's
     # name); read only with the runtime master on. Same values for any tile.
     SGLANG_CAUSAL_CONV1D_FWD_CONFIG = EnvStr("")

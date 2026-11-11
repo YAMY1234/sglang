@@ -1,8 +1,11 @@
+import sys
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
+from sglang.srt.layers.attention.linear.kernels import gdn_flashinfer
 from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
     FlashInferGDNKernel,
 )
@@ -36,6 +39,38 @@ def _make_kernel_without_flashinfer() -> FlashInferGDNKernel:
     kernel._verify_intermediate_buffers = {}
     kernel._alignment_fallback_warned = False
     return kernel
+
+
+class TestGdnPrefillTmemDeallocInstall(unittest.TestCase):
+    def _install(self, *, enabled, major, install=None):
+        calls = []
+        fake = SimpleNamespace(install=install or (lambda: calls.append(1)))
+        env = {"SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION": "1"}
+        env["SGLANG_OPT_GDN_PREFILL_TMEM_DEALLOC"] = "1" if enabled else "0"
+        with (
+            mock.patch.dict("os.environ", env),
+            mock.patch.dict(
+                sys.modules, {"sglang.kernels.ops.mamba.gdn_prefill_tmem_dealloc": fake}
+            ),
+            mock.patch.object(
+                torch.cuda, "get_device_capability", return_value=(major, 0)
+            ),
+        ):
+            gdn_flashinfer._install_gdn_prefill_tmem_dealloc_fix()
+        return calls
+
+    def test_installs_only_on_sm10x_with_the_switch_on(self):
+        self.assertEqual(self._install(enabled=True, major=10), [1])
+        self.assertEqual(self._install(enabled=False, major=10), [])
+        self.assertEqual(self._install(enabled=True, major=9), [])
+        self.assertEqual(self._install(enabled=True, major=12), [])
+
+    def test_a_refused_install_keeps_the_stock_kernels_with_a_warning(self):
+        def refuse():
+            raise ImportError("not FlashInfer v0.7.2's gdn_prefill.py")
+
+        with self.assertLogs(gdn_flashinfer.logger, "WARNING"):
+            self._install(enabled=True, major=10, install=refuse)
 
 
 class TestFlashInferGDNAlignment(unittest.TestCase):
