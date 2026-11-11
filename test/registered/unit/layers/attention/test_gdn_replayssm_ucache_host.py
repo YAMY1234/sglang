@@ -135,6 +135,14 @@ class TestGdnUcacheHost(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "SM107"):
             self._flush_options((10, 3), PDL="1")
 
+    def test_flush_first_needs_the_sm107_kernel(self):
+        # The row order is a kernel argument, not a launch build: no kernel kwarg.
+        opts = self._flush_options((10, 7), FLUSH_FIRST="1")
+        self.assertTrue(opts.flush_first)
+        self.assertEqual(opts.kernel_kwargs(), {})
+        with self.assertRaisesRegex(ValueError, "SM107"):
+            self._flush_options((10, 0), FLUSH_FIRST="1")
+
     def test_retraction_backup_is_refused_only_under_the_ucache(self):
         self.assertFalse(
             ucache.gdn_ucache_blocks_state_backup(SimpleNamespace(gdn_ucache=None))

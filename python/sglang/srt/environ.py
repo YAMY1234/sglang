@@ -523,6 +523,8 @@ class Envs:
     SGLANG_OPT_GDN_UCACHE_STRIDED_QKV = EnvRuntimeBool(False)
     # launch it as a programmatic dependent of the conv before it,
     SGLANG_OPT_GDN_UCACHE_PDL = EnvRuntimeBool(False)
+    # and run the rows that fold their window first (one row order per verify).
+    SGLANG_OPT_GDN_UCACHE_FLUSH_FIRST = EnvRuntimeBool(False)
 
     # ===================================================================
     # Model configuration, discovery, and weight loading

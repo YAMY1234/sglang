@@ -79,6 +79,8 @@ class GdnUcacheFlushOptions(msgspec.Struct, frozen=True, kw_only=True):
     strided_qkv: bool = False
     # Programmatic dependent launch behind the conv.
     pdl: bool = False
+    # Rows that fold their window first in the launch order.
+    flush_first: bool = False
 
     def kernel_kwargs(self) -> dict:
         kw = {}
@@ -93,6 +95,7 @@ def gdn_ucache_flush_options(device: torch.device) -> GdnUcacheFlushOptions:
     opts = GdnUcacheFlushOptions(
         strided_qkv=envs.SGLANG_OPT_GDN_UCACHE_STRIDED_QKV.get(),
         pdl=envs.SGLANG_OPT_GDN_UCACHE_PDL.get(),
+        flush_first=envs.SGLANG_OPT_GDN_UCACHE_FLUSH_FIRST.get(),
     )
     if opts != GdnUcacheFlushOptions():
         # FlashInfer's SM100 kernel takes none of them.
@@ -310,6 +313,30 @@ def _zero_padded_rows_kernel(
             tl.zeros([BLOCK], dtype=out_ptr.dtype.element_ty),
             offs < row_numel,
         )
+
+
+# Stable partition of the verify's rows, folding rows (hist_len >= flush_min) first: the
+# flush kernel's row_order (flush_first_row_order's permutation, in one launch).
+@triton.jit
+def _flush_first_order_kernel(
+    hist_ptr,
+    order_ptr,
+    num_rows,
+    flush_min,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.arange(0, BLOCK)
+    valid = offs < num_rows
+    hist = tl.load(hist_ptr + offs, mask=valid, other=0)
+    folds = (valid & (hist >= flush_min)).to(tl.int32)
+    rest = (valid & (hist < flush_min)).to(tl.int32)
+    num_folds = tl.sum(folds, axis=0)
+    pos = tl.where(
+        folds == 1,
+        tl.cumsum(folds, axis=0) - 1,
+        num_folds + tl.cumsum(rest, axis=0) - 1,
+    )
+    tl.store(order_ptr + pos, offs.to(tl.int32), mask=valid)
 
 
 # Copies the packed [q | k | v] token rows of one strided view into three
@@ -617,6 +644,8 @@ class GdnUcacheVerifier:
         self._gate_refresh: list[tuple[torch.Tensor, torch.Tensor]] = []
         self._gate_refresh_tables: Optional[tuple[torch.Tensor, torch.Tensor]] = None
         self._rows: Optional[GdnUcacheRows] = None
+        # This verify's flush-first row order, shared by all layers.
+        self._row_order: Optional[torch.Tensor] = None
         self._strided_logged = False
         # Shared by all layers: a layer's output is consumed (gated norm and
         # out_proj) before the next GDN layer's verify overwrites it.
@@ -666,6 +695,10 @@ class GdnUcacheVerifier:
                 request_rows=None if request_rows is None else request_rows[:batch],
             )
             self._refresh_gate_params()
+            if self._options.flush_first:
+                self._row_order = _flush_first_order(
+                    hist_len=self._rows.hist_len, flush_min=buffers.flush_min
+                )
             # Last before the flush: under SGLANG_OPT_GDN_UCACHE_PDL its warps 0/1 read the row
             # order and cursors before griddepcontrol.wait, so the kernel just before it may write
             # only what they never read (padded output rows).
@@ -706,6 +739,7 @@ class GdnUcacheVerifier:
             flush_min=buffers.flush_min,
             restart_hist_on_flush=False,
             **self._kernel_kwargs,
+            **({"row_order": self._row_order} if self._options.flush_first else {}),
             **({"ring_indices": rows.ring_rows} if self._by_request_row else {}),
         )
         return output.reshape(value.shape)
@@ -765,6 +799,7 @@ class GdnUcacheVerifier:
         gate_param = zeros(num_v_heads, dtype=torch.float32)
         cursor = zeros(max_batch_size, dtype=torch.int32)
         padded = torch.full((max_batch_size,), -1, dtype=torch.int32, device=device)
+        order = torch.arange(max_batch_size, dtype=torch.int32, device=device)
         ring_rows = torch.zeros(max_batch_size, dtype=torch.int32, device=device)
         for batch in range(1, max_batch_size + 1):
             self._flush_kernel(
@@ -785,6 +820,7 @@ class GdnUcacheVerifier:
                 flush_min=flush_min,
                 restart_hist_on_flush=False,
                 **self._kernel_kwargs,
+                **({"row_order": order[:batch]} if self._options.flush_first else {}),
                 **({"ring_indices": ring_rows[:batch]} if self._by_request_row else {}),
             )
 
@@ -915,6 +951,20 @@ class GdnUcacheVerifier:
         _refresh_gate_params_kernel[(len(self._gate_refresh),)](
             src_ptrs, dst_ptrs, numel, BLOCK=triton.next_power_of_2(numel)
         )
+
+
+def _flush_first_order(*, hist_len: torch.Tensor, flush_min: int) -> torch.Tensor:
+    num_rows = hist_len.shape[0]
+    order = torch.empty(num_rows, dtype=torch.int32, device=hist_len.device)
+    if num_rows > 0:
+        _flush_first_order_kernel[(1,)](
+            hist_len,
+            order,
+            num_rows,
+            flush_min,
+            BLOCK=max(16, triton.next_power_of_2(num_rows)),
+        )
+    return order
 
 
 def _log_strided_inputs(*, q, k, v, a, b) -> None:
