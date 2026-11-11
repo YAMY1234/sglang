@@ -212,6 +212,7 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
                 positions=torch.zeros(bs, dtype=torch.int64, device=DEVICE),
                 return_logprob=logprob,
                 native_dtype_logits=False,
+                step_fold_slots=None,
                 sampling_info=SimpleNamespace(is_all_greedy=True),
                 spec_info=SimpleNamespace(
                     topk_p=torch.ones((bs, 1), device=DEVICE),
@@ -246,6 +247,98 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
                 worker.draft_forward(forward_batch)
                 self.assertEqual(seen, [expected] * (steps - 1))
                 self.assertFalse(forward_batch.native_dtype_logits)
+
+    def test_top1_step_fold_feeds_only_the_first_draft_forward(self):
+        """Q38_MTP_STEP_INPUT_FOLD: with capture slots, the first draft step's finalizer
+        writes the next forward's embedding rows; later steps keep the stock finalizer,
+        and a batch without slots (or with multimodal embeddings) never folds."""
+        bs, steps, vocab = 2, 3, 16
+        for case in ("fold", "no_slots", "mm"):
+            worker = _make_worker(num_steps=steps, num_draft_tokens=steps + 1)
+            worker.hot_token_id = None
+            worker.index_share_for_mtp_iteration = False
+            worker.seed_dsa_topk_from_draft_extend = False
+            worker._topk1_parents_prealloc = torch.zeros((8, steps), device=DEVICE)
+            worker._topk1_score_indices_prealloc = torch.zeros(
+                (8, steps), device=DEVICE
+            )
+            worker.draft_attn_backend = SimpleNamespace(attn_backends=[None] * steps)
+            embedding = torch.ones((bs, 4), device=DEVICE)
+            slot = SimpleNamespace(embedding=embedding)
+            seen = []
+
+            def forward(fb, seen=seen):
+                seen.append(fb.step_fold_embedding)
+                fb.step_fold_embedding = None  # the MTP model consumes it
+                return SimpleNamespace(
+                    logits_output=SimpleNamespace(
+                        next_token_logits=torch.zeros((bs, vocab), device=DEVICE),
+                        hidden_states=torch.zeros((bs, 4), device=DEVICE),
+                    )
+                )
+
+            worker.draft_runner = SimpleNamespace(
+                canary_manager=None,
+                forward=forward,
+                model_config=SimpleNamespace(model_is_mrope=False),
+            )
+            forward_batch = SimpleNamespace(
+                forward_mode=ForwardMode.DECODE,
+                batch_size=bs,
+                out_cache_loc=torch.arange(bs * steps, device=DEVICE),
+                positions=torch.zeros(bs, dtype=torch.int64, device=DEVICE),
+                return_logprob=False,
+                native_dtype_logits=False,
+                step_fold_slots=None if case == "no_slots" else (slot,),
+                step_fold_embedding=None,
+                mm_input_embeds=torch.zeros(1) if case == "mm" else None,
+                sampling_info=SimpleNamespace(is_all_greedy=True),
+                spec_info=SimpleNamespace(
+                    topk_p=torch.ones((bs, 1), device=DEVICE),
+                    topk_index=torch.zeros((bs, 1), dtype=torch.int64, device=DEVICE),
+                    hidden_states=torch.zeros((bs, 4), device=DEVICE),
+                ),
+            )
+            top1 = (
+                torch.ones((bs, 1), device=DEVICE),
+                torch.zeros((bs, 1), dtype=torch.int64, device=DEVICE),
+            )
+            fold = MagicMock(return_value=top1)
+            stock = MagicMock(return_value=top1)
+            with (
+                self.subTest(case=case),
+                patch(
+                    "sglang.srt.speculative.eagle_worker_v2.forward_context",
+                    side_effect=lambda *_a, **_k: contextlib.nullcontext(),
+                ),
+                patch("sglang.srt.speculative.eagle_worker_v2._is_cuda", True),
+                patch(
+                    "sglang.srt.speculative.eagle_worker_v2.get_spec",
+                    return_value=SimpleNamespace(
+                        speculative_use_rejection_sampling=False
+                    ),
+                ),
+                patch(
+                    "sglang.srt.speculative.eagle_worker_v2.draft_topk1_postprocess",
+                    stock,
+                ),
+                patch(
+                    "sglang.kernels.ops.speculative.draft_step_fold.finalize_next_input",
+                    fold,
+                ),
+            ):
+                worker.draft_forward(forward_batch)
+            if case == "fold":
+                self.assertEqual(fold.call_count, 1)
+                self.assertIs(fold.call_args.args[4], slot)
+                self.assertEqual(fold.call_args.args[3], 1)
+                self.assertEqual(stock.call_count, steps - 2)
+                self.assertIsNone(seen[0])
+                self.assertIs(seen[1], embedding)
+            else:
+                fold.assert_not_called()
+                self.assertEqual(stock.call_count, steps - 1)
+                self.assertEqual(seen, [None] * (steps - 1))
 
 
 class TestEagleWorkerV2BackendFallback(CustomTestCase):

@@ -666,6 +666,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # A top-1 draft decode step reads only the argmax of its logits: keep them in the
     # LM head's dtype (SGLANG_OPT_SPEC_DRAFT_TOP1_NATIVE_LOGITS)
     native_dtype_logits: bool = False
+    # Q38_MTP_STEP_INPUT_FOLD: a captured top-1 draft graph's fold slots, and the
+    # embedding rows a draft step's finalizer gathered for the next draft forward.
+    step_fold_slots: Optional[tuple] = None
+    step_fold_embedding: Optional[torch.Tensor] = None
 
     # For multimodal
     mm_input_embeds: Optional[torch.Tensor] = None

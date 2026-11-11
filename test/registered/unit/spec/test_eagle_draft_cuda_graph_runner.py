@@ -576,6 +576,30 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
         self.assertEqual(list(runner._planned_inputs.values()), [None])
         self.assertTrue(torch.equal(runner.buffers.seq_lens, forward_batch.seq_lens))
 
+    def test_step_fold_slots_only_for_the_fn_mtp_model(self):
+        """Q38_MTP_STEP_INPUT_FOLD: no slots unless the switch is on and the draft
+        model is the FN HC4 MTP with a CUDA BF16 [*, 2560] embedding."""
+        from sglang.kernels.ops.speculative import draft_step_fold
+        from sglang.srt.models.qwen4_exp_mtp import Qwen4ExpForCausalLMMTP
+
+        model = object.__new__(Qwen4ExpForCausalLMMTP)
+        with patch.dict("os.environ", {"Q38_MTP_STEP_INPUT_FOLD": "0"}):
+            self.assertIsNone(draft_step_fold.make_fold_slots(model, 1, 3))
+        with patch.dict("os.environ", {"Q38_MTP_STEP_INPUT_FOLD": "1"}):
+            self.assertIsNone(draft_step_fold.make_fold_slots(object(), 1, 3))
+
+    def test_mtp_model_consumes_the_folded_embedding_once(self):
+        from sglang.srt.models.qwen4_exp_mtp import Qwen4ExpForCausalLMMTP
+
+        folded = torch.ones(2, 4)
+        batch = SimpleNamespace(step_fold_embedding=folded)
+        model = object.__new__(Qwen4ExpForCausalLMMTP)
+        out = Qwen4ExpForCausalLMMTP._prepare_input_embeds(
+            model, torch.zeros(2, dtype=torch.int64), batch, None
+        )
+        self.assertIs(out, folded)
+        self.assertIsNone(batch.step_fold_embedding)
+
 
 if __name__ == "__main__":
     unittest.main()

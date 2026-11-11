@@ -143,6 +143,12 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         input_embeds: Optional[torch.Tensor],
     ) -> torch.Tensor:
         assert input_embeds is None
+        # Q38_MTP_STEP_INPUT_FOLD: the previous draft step's finalizer already
+        # gathered this step's embedding rows.
+        folded = forward_batch.step_fold_embedding
+        if folded is not None:
+            forward_batch.step_fold_embedding = None
+            return folded
         input_embeds = forward_batch.mm_input_embeds
         if (
             forward_batch.forward_mode.is_extend()

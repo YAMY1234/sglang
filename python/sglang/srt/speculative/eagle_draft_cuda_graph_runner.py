@@ -187,6 +187,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         self.extend_seq_lens_cpu = [self.seq_len_fill_value] * self.max_bs
         # SGLANG_OPT_SPEC_DRAFT_GRAPH_INPUT_PLAN: (raw_bs, field mask) -> (views, plan)
         self._planned_inputs = {}
+        # Q38_MTP_STEP_INPUT_FOLD: capture-owned slots, never reused across graph variants.
+        self._step_fold_slots = {}
 
         if self.enable_torch_compile:
             set_torch_compile_config()
@@ -536,6 +538,19 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             ),
         )
         self.model_runner.runner_ids.bind_runner_slots(forward_batch)
+        from sglang.kernels.ops.speculative.draft_step_fold import make_fold_slots
+
+        fold_slots = (
+            make_fold_slots(
+                self.model_runner.model, num_seqs, self.speculative_num_steps
+            )
+            if self.topk == 1 and self.captured_req_width == 1
+            else None
+        )
+        self._step_fold_slots[(size, variant_label, attention_variant)] = (
+            fold_slots
+        )
+        forward_batch.step_fold_slots = fold_slots
 
         def run_stock():
             output_cache_loc_backup = forward_batch.out_cache_loc

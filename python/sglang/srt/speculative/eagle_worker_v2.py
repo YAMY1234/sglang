@@ -825,6 +825,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 device=topk_index.device,
             )
             draft_tokens_topk1[:, :1].copy_(topk_index)
+        # Q38_MTP_STEP_INPUT_FOLD: slots exist only in captured FN HC4/TP1/K3 top-1 graphs.
+        fold_slots = forward_batch.step_fold_slots
+        if fold_slots is not None and (
+            draft_tokens_topk1 is None or forward_batch.mm_input_embeds is not None
+        ):
+            fold_slots = None
+        forward_batch.step_fold_embedding = None
         # SGLANG_OPT_SPEC_DRAFT_TOP1_NATIVE_LOGITS: only draft_topk1_postprocess reads the
         # steps' logits, and its argmax is the same on the LM head's BF16 values
         native_logits = forward_batch.native_dtype_logits
@@ -896,7 +903,23 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     draft_probs_list.append(probs)
                     forward_batch.positions.add_(1)
                 elif self.topk == 1:
-                    if _is_cuda or _is_hip:
+                    if (_is_cuda or _is_hip) and fold_slots is not None and i < len(
+                        fold_slots
+                    ):
+                        from sglang.kernels.ops.speculative.draft_step_fold import (
+                            finalize_next_input,
+                        )
+
+                        slot = fold_slots[i]
+                        topk_p, topk_index = finalize_next_input(
+                            logits_output.next_token_logits,
+                            forward_batch.positions,
+                            draft_tokens_topk1,
+                            i + 1,
+                            slot,
+                        )
+                        forward_batch.step_fold_embedding = slot.embedding
+                    elif _is_cuda or _is_hip:
                         topk_p, topk_index = draft_topk1_postprocess(
                             logits_output.next_token_logits,
                             forward_batch.positions,
