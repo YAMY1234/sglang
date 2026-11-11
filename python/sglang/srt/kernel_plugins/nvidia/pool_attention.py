@@ -137,8 +137,15 @@ def union_workspace(
     requests = rows // 4
     pairs = max(1, requests * kv_heads)
     if variant & _UNION_WS:
-        # The warp-specialized kernel: the most splits that keep one wave, at most 4.
-        splits = max(1, min(4, sms // pairs))
+        # The warp-specialized kernel: SGLANG_QSA_FP8_POOL_VERIFY_WS_SPLITS, else the
+        # most splits that keep one wave, at most 4.
+        splits = envs.SGLANG_QSA_FP8_POOL_VERIFY_WS_SPLITS.get()
+        if splits is None:
+            splits = max(1, min(4, sms // pairs))
+        elif not 1 <= splits <= 16:
+            raise ValueError(
+                f"SGLANG_QSA_FP8_POOL_VERIFY_WS_SPLITS must be in 1..16, got {splits}"
+            )
     elif pairs > sms:
         splits = 2
     else:

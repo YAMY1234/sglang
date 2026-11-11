@@ -349,6 +349,9 @@ class Envs:
     SGLANG_QSA_FP8_POOL_VERIFY_UNION_WARPS = EnvInt(8)
     # Its attention kernel warp-specialized (Gluon tcgen05; lazy rescale, not bitwise).
     SGLANG_QSA_FP8_POOL_VERIFY_WS = EnvBool(False)
+    # The warp-specialized kernel's split count (1..16); None keeps the source plan (the
+    # most splits within one wave, at most 4).
+    SGLANG_QSA_FP8_POOL_VERIFY_WS_SPLITS = EnvInt(None)
     # TP1 BF16-pool target verify: the attention output gate rides the pool attention's
     # split-K merge (fused_sigmoid_mul's arithmetic, so the same bits).
     SGLANG_ENABLE_QSA_POOL_MERGE_GATE = EnvBool(False)

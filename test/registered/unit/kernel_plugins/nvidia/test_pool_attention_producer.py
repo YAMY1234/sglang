@@ -745,6 +745,26 @@ def test_union_workspace_follows_the_ws_kernel_split_plan(requests, sms):
     )
 
 
+@pytest.mark.parametrize("value", [1, 2, 16])
+def test_union_workspace_takes_the_source_ws_split_count(value):
+    nb, nt, qp, requests = 2048, 2048 * 4 + 16, 64, 176
+    kwargs = dict(
+        kv_heads=2, head_dim=256, query_heads=24, selected_count=512, compress_ratio=4
+    )
+    with envs.SGLANG_QSA_FP8_POOL_VERIFY_WS_SPLITS.override(value):
+        assert policy.union_workspace(requests * 4, 212, **kwargs, variant=64 | 16) == (
+            value,
+            requests * (2 * nt + nb + 1) + requests * 4,
+            requests * 2 * value * qp * (256 + 2),
+        )
+        # Kernel 2 keeps its own plan.
+        assert policy.union_workspace(requests * 4, 212, **kwargs, variant=16)[0] == 2
+    for bad in (0, 17):
+        with envs.SGLANG_QSA_FP8_POOL_VERIFY_WS_SPLITS.override(bad):
+            with pytest.raises(ValueError):
+                policy.union_workspace(requests * 4, 212, **kwargs, variant=64)
+
+
 def packed_prefill_signatures(stages=None):
     with ExitStack() as stack:
         stack.enter_context(envs.SGLANG_ENABLE_QSA_TMA_PREFILL.override(True))
