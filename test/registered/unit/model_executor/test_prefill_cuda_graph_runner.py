@@ -754,11 +754,15 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
 
 class TestPrefillCudaGraphRunnerLayerLoads(CustomTestCase):
     @staticmethod
-    def _runner(counter, is_full_backend=True):
+    def _runner(counter, is_full_backend=True, linear_extend_in_graph=False):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._is_full_backend = is_full_backend
+        runner.use_captured_attn_metadata = linear_extend_in_graph
         runner.model_runner = SimpleNamespace(
-            token_to_kv_pool=SimpleNamespace(layer_transfer_counter=counter)
+            token_to_kv_pool=SimpleNamespace(layer_transfer_counter=counter),
+            attn_backend=SimpleNamespace(
+                breakable_cuda_graph_captures_linear_extend=linear_extend_in_graph
+            ),
         )
         return runner
 
@@ -792,6 +796,25 @@ class TestPrefillCudaGraphRunnerLayerLoads(CustomTestCase):
             daemon=True,
         )
         waiter.start()
+        waiter.join(timeout=5)
+        self.assertFalse(waiter.is_alive())
+
+    def test_breakable_replay_with_the_linear_extend_waits_for_every_layer(self):
+        """A captured linear extend's layers no longer break to wait for their
+        layer, so that replay waits for the whole load, as Full replay does."""
+        counter = LayerWiseLoadCounter(num_layers=3)
+        counter.set_consumer(counter.update_producer())
+        counter.complete(0, 0)
+        runner = self._runner(
+            counter, is_full_backend=False, linear_extend_in_graph=True
+        )
+        waiter = threading.Thread(target=runner._wait_for_layer_loads, daemon=True)
+        waiter.start()
+        waiter.join(timeout=0.2)
+        self.assertTrue(waiter.is_alive())
+
+        counter.complete(0, 1)
+        counter.complete(0, 2)
         waiter.join(timeout=5)
         self.assertFalse(waiter.is_alive())
 

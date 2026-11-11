@@ -343,10 +343,9 @@ class Envs:
     # epilogue of its gate_up split-K GEMM (sm107_shared_expert_act; checked bitwise at load).
     SGLANG_ENABLE_SM107_SHARED_EXPERT_FUSED_ACT = EnvBool(False)
     # GDN ReplaySSM verify commit: fold every request's checkpoints in one CUDA launch
-    # (compact layouts it supports) instead of the Triton kernel; not bitwise.
-    SGLANG_OPT_GDN_REPLAYSSM_CUDA_COMMIT = EnvRuntimeBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
+    # (compact layouts it supports) instead of the Triton kernel; not bitwise. Opt-in,
+    # as in the source (EnvBool(False)).
+    SGLANG_OPT_GDN_REPLAYSSM_CUDA_COMMIT = EnvRuntimeBool(False)
     # GDN ReplaySSM target verify: three software-pipeline stages instead of two
     # (same output bits).
     SGLANG_OPT_GDN_REPLAYSSM_VERIFY_3_STAGES = EnvRuntimeBool(
@@ -2393,6 +2392,13 @@ class Envs:
     # Sequences a captured GDN extend bucket accepts (at most the request pool); a
     # larger prefill batch runs the step eagerly. Bounds the padded grids and scratch.
     SGLANG_GDN_PREFILL_GRAPH_MAX_SEQS = EnvInt(128)
+    # With the FlashInfer GDN prefill kernel, the captured GDN extend runs the FlashInfer
+    # core (CP kernel for one-sequence batches, non-CP kernel for the rest) instead of
+    # breaking the prefill graph at every GDN layer. Opt-in, as in the source (EnvBool(False)).
+    SGLANG_OPT_GDN_PREFILL_GRAPH_FLASHINFER = EnvRuntimeBool(False)
+    # Static sequence count of that non-CP path (A's name; read only with the switch).
+    # Each unused row costs about 10 us per layer on GB300; larger batches run eagerly.
+    SGLANG_PERFPF_GDN_GRAPH_FI_MAX_SEQS = EnvInt(8)
 
     # ===================================================================
     # Tokenizer, request state, embeddings, and reasoning controls

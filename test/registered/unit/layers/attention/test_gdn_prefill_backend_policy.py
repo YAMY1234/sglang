@@ -3,6 +3,7 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, sentinel
 
+import numpy as np
 import torch
 
 from sglang.srt.environ import envs
@@ -88,7 +89,9 @@ def make_runner(
 
 class TestGDNPrefillGraphExtend(CustomTestCase):
     @contextmanager
-    def _setup(self, *, cuda=True, enable_mis=False, draft=False):
+    def _setup(
+        self, *, cuda=True, enable_mis=False, draft=False, kernel=TritonGDNKernel
+    ):
         """A target's GDN backend on a setup the graph-safe chain supports, unless
         cuda, enable_mis or draft say otherwise."""
         backend = GDNAttnBackend.__new__(GDNAttnBackend)
@@ -96,7 +99,7 @@ class TestGDNPrefillGraphExtend(CustomTestCase):
         backend.enable_mis = enable_mis
         backend._mamba_chunk_size = 64
         backend.kernel_dispatcher = SimpleNamespace(
-            extend_kernel=TritonGDNKernel.__new__(TritonGDNKernel)
+            extend_kernel=kernel.__new__(kernel)
         )
         cache = SimpleNamespace(conv=[torch.zeros(2, 3)], temporal=torch.zeros(2, 3))
         backend.state_pool = SimpleNamespace(mamba_cache=cache)
@@ -137,6 +140,89 @@ class TestGDNPrefillGraphExtend(CustomTestCase):
                 self._setup(**setup) as backend,
             ):
                 self.assertEqual(backend.supports_prefill_graph_extend(), captured)
+
+    def test_flashinfer_extend_is_captured_only_under_its_switch(self):
+        """SGLANG_OPT_GDN_PREFILL_GRAPH_FLASHINFER: with the FlashInfer prefill kernel
+        the captured extend runs its core where the setup supports it; otherwise, or
+        with the switch off, the layers keep breaking."""
+        from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+            FlashInferGDNKernel,
+        )
+
+        for switch, reason, captured in (
+            (False, None, False),
+            (True, None, True),
+            (True, "validated on SM100 only", False),
+        ):
+            with (
+                self.subTest(switch=switch, reason=reason),
+                envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+                envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.override(True),
+                envs.SGLANG_OPT_GDN_PREFILL_GRAPH_FLASHINFER.override(switch),
+                self._setup(kernel=FlashInferGDNKernel) as backend,
+                patch.object(
+                    GDNAttnBackend,
+                    "_flashinfer_graph_unsupported_reason",
+                    return_value=reason,
+                ),
+                patch.object(GDNAttnBackend, "_enable_flashinfer_graph") as enable,
+            ):
+                backend._fi_graph_cp_single = True
+                backend.prefill_graph_max_seqs = 8
+                self.assertEqual(backend.supports_prefill_graph_extend(), captured)
+                self.assertEqual(enable.call_count, int(captured))
+
+    def test_flashinfer_graph_tables_follow_the_batch(self):
+        """The captured FlashInfer core's static tables: a one-sequence batch on the CP
+        kernel, any other on the non-CP rows; checkpoints every 64 tokens; padded rows
+        read the dummy slot 0."""
+        from sglang.kernels.ops.mamba.gdn_prefill_track import (
+            TRACK_CHUNK_STATE,
+            TRACK_FINAL_STATE,
+        )
+        from sglang.srt.layers.attention.linear.gdn_prefill_graph import (
+            GDNFlashInferGraphTables,
+        )
+        from sglang.srt.layers.attention.linear.kda_prefill_graph import (
+            KDAPrefillTrackRows,
+        )
+
+        with patch.object(torch.Tensor, "pin_memory", lambda t: t):
+            t = GDNFlashInferGraphTables.allocate(
+                max_seqs=4, cp_single=True, device="cpu"
+            )
+            rows = KDAPrefillTrackRows(
+                chunk_rows=[(0, 0), (1, 2)],
+                final_rows=[2],
+                conv_rows=[],
+                conv_len=3,
+                dst=torch.zeros(3, dtype=torch.int64),
+            )
+            t.fill(
+                lens=np.array([70, 130, 64]),
+                cache_indices=torch.tensor([5, 7, -1, 9]),
+                track_rows=rows,
+            )
+            self.assertEqual(t.cp_cu_seqlens.tolist(), [0, 0])
+            self.assertEqual(t.ncp_cu_seqlens.tolist(), [0, 70, 200, 264, 264])
+            self.assertEqual(t.ncp_checkpoint_cu.tolist(), [0, 1, 3, 4, 4])
+            self.assertEqual(t.ncp_state_indices.tolist(), [5, 7, 0, 0])
+            self.assertEqual(t.cp_state_indices.tolist(), [0])
+            self.assertEqual(t.pre_track_mode.tolist(), [TRACK_FINAL_STATE, 0, 0, 0])
+            self.assertEqual(
+                t.track_mode.tolist(), [0, TRACK_CHUNK_STATE, TRACK_FINAL_STATE, 0]
+            )
+            # Row 1's chunk 2 is its second checkpoint: global checkpoint row 1 + 1.
+            self.assertEqual(t.track_h_row.tolist(), [0, 2, 0, 0])
+
+            t.fill(
+                lens=np.array([130]), cache_indices=torch.tensor([3]), track_rows=None
+            )
+            self.assertEqual(t.cp_cu_seqlens.tolist(), [0, 130])
+            self.assertEqual(t.cp_checkpoint_cu.tolist(), [0, 2])
+            self.assertEqual(t.ncp_cu_seqlens.tolist(), [0] * 5)
+            self.assertEqual(t.cp_state_indices.tolist(), [3])
+            self.assertEqual(t.ncp_state_indices.tolist(), [0] * 4)
 
 
 class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
@@ -465,6 +551,7 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
     def test_decode_tracking_without_h_source_skips_checkpoint_plan(self):
         backend = object.__new__(GDNAttnBackend)
         backend.device = "cpu"
+        backend.prefill_graph_flashinfer = False
         backend.kernel_dispatcher = SimpleNamespace(extend_uses_state_checkpoints=True)
         metadata = SimpleNamespace(has_mamba_track_mask=True, track_ssm_h_src=None)
         forward_batch = SimpleNamespace(

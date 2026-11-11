@@ -88,6 +88,11 @@ def _backend(conv_pool, ssm_pool):
     backend.conv_states_shape = conv_pool.shape
     backend.accept_lens_pool = None
     backend.prefill_graph_metadata = None
+    # __init__ sets it; the split-conv extend path (on with the runtime master) logs through it.
+    backend._split_conv_logged = set()
+    # __init__'s defaults that init_forward_metadata reads: no FlashInfer graph core, no MIS.
+    backend.prefill_graph_flashinfer = False
+    backend.enable_mis = False
     backend.kernel_dispatcher = GDNKernelDispatcher(
         LinearAttnKernelBackend.TRITON,
         LinearAttnKernelBackend.TRITON,
