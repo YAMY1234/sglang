@@ -2,6 +2,7 @@
 the torch implementations are the fallback and the reference."""
 
 import functools
+import logging
 import math
 from typing import Optional
 
@@ -24,6 +25,8 @@ except ImportError:
     tilelang = None
     T = None
     HAS_TILELANG = False
+
+logger = logging.getLogger(__name__)
 
 
 def _validate_q(q: torch.Tensor) -> None:
@@ -656,12 +659,45 @@ def _num_sms(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
-def _decode_ctas_per_row(rows: int, device: torch.device) -> int:
-    wanted = -(-4 * _num_sms(device.index or 0) // max(rows, 1))
-    for level in _DECODE_CTAS_PER_ROW_LEVELS:
+@functools.lru_cache(maxsize=None)
+def _parse_decode_ctas_per_row_levels(values: tuple[str, ...]) -> tuple[int, ...]:
+    levels = tuple(int(value) for value in values)
+    if levels[0] < 1 or list(levels) != sorted(set(levels)):
+        raise ValueError(
+            "SGLANG_QSA_DECODE_CTAS_PER_ROW_LEVELS must be strictly increasing "
+            f"positive integers, got {','.join(values)!r}"
+        )
+    logger.info(
+        "QSA decode scorer CTAs per row: levels %s "
+        "(SGLANG_QSA_DECODE_CTAS_PER_ROW_LEVELS)",
+        levels,
+    )
+    return levels
+
+
+def _decode_ctas_per_row_levels() -> tuple[int, ...]:
+    """The levels, from SGLANG_QSA_DECODE_CTAS_PER_ROW_LEVELS only with the master."""
+    values = envs.SGLANG_QSA_DECODE_CTAS_PER_ROW_LEVELS.get()
+    if not values or not envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
+        return _DECODE_CTAS_PER_ROW_LEVELS
+    return _parse_decode_ctas_per_row_levels(values)
+
+
+def _select_decode_ctas_per_row(
+    rows: int, num_sms: int, levels: tuple[int, ...]
+) -> int:
+    wanted = -(-4 * num_sms // max(rows, 1))
+    for level in levels:
         if level >= wanted:
             return level
-    return _DECODE_CTAS_PER_ROW_LEVELS[-1]
+    return levels[-1]
+
+
+def _decode_ctas_per_row(rows: int, device: torch.device) -> int:
+    # Each 64-key group is scored by one CTA, so the level changes the grid only.
+    return _select_decode_ctas_per_row(
+        rows, _num_sms(device.index or 0), _decode_ctas_per_row_levels()
+    )
 
 
 def tilelang_qsa_mqa_decode(

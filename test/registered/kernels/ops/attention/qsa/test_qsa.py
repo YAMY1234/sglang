@@ -21,6 +21,7 @@ from sglang.srt.layers.attention.qsa.metadata import (
     build_qsa_row_ranges,
 )
 from sglang.srt.layers.attention.qsa.mqa import (
+    HAS_TILELANG,
     qsa_mqa_decode,
     qsa_mqa_prefill,
 )
@@ -1444,6 +1445,86 @@ def test_qsa_decode_mqa_reads_paged_cache():
     positions = torch.arange(192).unsqueeze(0)
     expected.masked_fill_(positions >= context_lens[:, None], -float("inf"))
     torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "master, value, expected",
+    [
+        (False, None, (1, 16, 256)),
+        (False, "1,256", (1, 16, 256)),
+        (True, None, (1, 16, 256)),
+        (True, "1,256", (1, 256)),
+        (True, " 2 , 64 ", (2, 64)),
+    ],
+)
+def test_qsa_decode_ctas_per_row_levels_follow_the_master(master, value, expected):
+    from contextlib import ExitStack
+
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.attention.qsa import mqa
+
+    with ExitStack() as stack:
+        stack.enter_context(
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(master)
+        )
+        if value is not None:
+            stack.enter_context(
+                envs.SGLANG_QSA_DECODE_CTAS_PER_ROW_LEVELS.override(value)
+            )
+        assert mqa._decode_ctas_per_row_levels() == expected
+
+
+@pytest.mark.parametrize("value", ["0,16", "16,1", "1,16,16", "1,x"])
+def test_qsa_decode_ctas_per_row_levels_reject_malformed_lists(value):
+    from contextlib import ExitStack
+
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.attention.qsa import mqa
+
+    with ExitStack() as stack:
+        stack.enter_context(
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True)
+        )
+        stack.enter_context(envs.SGLANG_QSA_DECODE_CTAS_PER_ROW_LEVELS.override(value))
+        with pytest.raises(ValueError):
+            mqa._decode_ctas_per_row_levels()
+
+
+def test_qsa_decode_ctas_per_row_takes_the_first_level_covering_four_waves():
+    from sglang.srt.layers.attention.qsa import mqa
+
+    # 148 SMs: four waves need ceil(592 / rows) CTAs per row.
+    assert mqa._select_decode_ctas_per_row(1, 148, (1, 16, 256)) == 256
+    assert mqa._select_decode_ctas_per_row(64, 148, (1, 16, 256)) == 16
+    assert mqa._select_decode_ctas_per_row(64, 148, (1, 256)) == 256
+    assert mqa._select_decode_ctas_per_row(592, 148, (1, 256)) == 1
+    assert mqa._select_decode_ctas_per_row(1, 148, (1, 16)) == 16
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not HAS_TILELANG,
+    reason="needs CUDA and TileLang",
+)
+@pytest.mark.parametrize("rows", [4, 128, 512])
+def test_qsa_decode_ctas_per_row_levels_are_bitwise(monkeypatch, rows):
+    from sglang.srt.layers.attention.qsa import mqa
+
+    gen = torch.Generator().manual_seed(rows)
+    pages, page_size, max_pages = rows * 8 + 1, 16, 8
+    q = torch.zeros(rows, 8, 128, dtype=torch.bfloat16)
+    q[:, :4] = torch.randn(rows, 4, 128, generator=gen).to(torch.bfloat16)
+    cache = torch.randn(pages, page_size, 1, 128, generator=gen).to(torch.bfloat16)
+    table = (torch.randperm(pages - 1, generator=gen)[: rows * max_pages] + 1).view(
+        rows, max_pages
+    )
+    lens = torch.randint(1, max_pages * page_size + 1, (rows,), generator=gen)
+    args = (q.cuda(), cache.cuda(), table.int().cuda(), lens.int().cuda())
+    outputs = []
+    for levels in ((1, 16, 256), (1, 256), (1,)):
+        monkeypatch.setattr(mqa, "_decode_ctas_per_row_levels", lambda: levels)
+        outputs.append(mqa.tilelang_qsa_mqa_decode(*args, max_pages * page_size))
+    for other in outputs[1:]:
+        assert torch.equal(other.view(torch.int32), outputs[0].view(torch.int32))
 
 
 def test_qsa_mtp_step_out_cache_loc_matches_draft_forward_layout():

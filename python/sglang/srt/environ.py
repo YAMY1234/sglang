@@ -556,6 +556,9 @@ class Envs:
     SGLANG_OPT_QSA_PREFILL_TOPK_BRIDGE_DIRECT = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # The per-row QSA decode scorer's CTAs-per-row levels (comma list, strictly
+    # increasing); read only with the master, unset keeps (1, 16, 256). Output is the same.
+    SGLANG_QSA_DECODE_CTAS_PER_ROW_LEVELS = EnvTuple(tuple())
     # GDN prefill: the conv writes contiguous q / k / v planes, replacing the post-conv
     # q / k / v split copy (same values).
     SGLANG_OPT_GDN_PREFILL_SPLIT_CONV = EnvRuntimeBool(
