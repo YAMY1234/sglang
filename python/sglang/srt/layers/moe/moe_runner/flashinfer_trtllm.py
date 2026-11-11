@@ -33,6 +33,7 @@ from sglang.srt.layers.moe.flashinfer_trtllm_moe import (
     trtllm_fp8_per_tensor_scale_moe_wrapper,
     trtllm_fp8_per_tensor_scale_routed_moe_out_wrapper,
 )
+from sglang.srt.layers.moe.moe_runner import q38_fused_routing
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -46,6 +47,7 @@ from sglang.srt.runtime_context import (
     get_forward,
     get_parallel,
 )
+from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.device import is_flashinfer_available
 from sglang.srt.utils.log_utils import print_info_once
 from sglang.srt.utils.triton_utils import next_power_of_2
@@ -2009,6 +2011,20 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         )
         hidden_pad = quant_info.padded_hidden_size - unpadded_hidden_size
         hidden_states = torch.nn.functional.pad(hidden_states, (0, hidden_pad))
+    # SGLANG_OPT_MOE_FUSED_ROUTING: the stock quant is skipped and its buffers are
+    # filled by the fused routing kernel, or by the stock quant if that path misses.
+    # The local-experts provider (SGLANG_Q38_MK_MOE) quantizes for itself.
+    fused_route = (
+        pre_quant is None
+        and hidden_states_scale is None
+        and hidden_pad == 0
+        and not quant_info.use_per_token_activation
+        and not use_routed_topk
+        and _deferred_finalize_enabled.get()
+        and TopKOutputChecker.format_is_bypassed(topk_output)
+        and q38_fused_routing.wants(hidden_states.shape[0])
+        and not get_bool_env_var("SGLANG_Q38_MK_MOE", "False")
+    )
     if isinstance(pre_quant, Nvfp4RoutedInputPreQuant):
         hs_fp4, hs_scale_linear = pre_quant.x_fp4, pre_quant.x_sf
         if pre_quant.ready is not None:
@@ -2047,6 +2063,10 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         hs_scale_linear = hs_sf_bytes.view(torch.float8_e4m3fn).reshape(
             seq_len, hidden_size // 16
         )
+    elif fused_route:
+        from sglang.kernels.ops.moe.q38_fused_routing import alloc_quant_outputs
+
+        hs_fp4, hs_scale_linear = alloc_quant_outputs(hidden_states)
     else:
         hs_fp4, hs_scale_linear = quantize_hidden_states_fp4(
             hidden_states, quant_info.w13_input_scale_quant
@@ -2224,7 +2244,24 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
                 (num_tokens, hidden_size), dtype=torch.bfloat16
             )
 
-        result = trtllm_fp4_block_scale_moe(**moe_kwargs)
+        result = None
+        if fused_route:
+            result = q38_fused_routing.run(
+                hidden_states=hidden_states,
+                topk_output=topk_output,
+                quant_info=quant_info,
+                moe_kwargs=moe_kwargs,
+            )
+            if result is None:
+                hs_fp4, hs_scale_linear = quantize_hidden_states_fp4(
+                    hidden_states, quant_info.w13_input_scale_quant
+                )
+                moe_kwargs["hidden_states"] = hs_fp4
+                moe_kwargs["hidden_states_scale"] = hs_scale_linear.view(
+                    torch.float8_e4m3fn
+                ).reshape(*hs_scale_linear.shape[:-1], -1)
+        if result is None:
+            result = trtllm_fp4_block_scale_moe(**moe_kwargs)
         if defer_finalize:
             result = _make_deferred_finalize_output(result, top_k=topk_config.top_k)
         else:

@@ -193,6 +193,81 @@ def test_bypassed_call_profiles_the_tuned_full_width_output(
     assert kw["output"].dtype == torch.bfloat16
 
 
+@pytest.fixture
+def fused_routing(monkeypatch):
+    from sglang.kernels.ops.moe import q38_fused_routing as op
+
+    fused = runner.q38_fused_routing
+    monkeypatch.setattr(fused, "_ENABLED", True)
+    monkeypatch.setattr(fused, "_MAX_ROWS", 512)
+    monkeypatch.setattr(
+        op,
+        "alloc_quant_outputs",
+        lambda x: (
+            tensor((x.shape[0], 1280), torch.uint8),
+            tensor((x.shape[0], 160), torch.uint8),
+        ),
+    )
+    calls = SimpleNamespace(kwargs=[], result=None)
+
+    def run(*, hidden_states, topk_output, quant_info, moe_kwargs):
+        calls.kwargs.append(dict(moe_kwargs))
+        return calls.result
+
+    monkeypatch.setattr(fused, "run", run)
+    return calls
+
+
+@pytest.mark.parametrize("taken", [False, True])
+def test_fused_routing_takes_the_deferred_call_or_runs_the_stock_quant(
+    setup_runner, fused_routing, taken
+):
+    d, q, c = inputs(64)
+    d.hidden_states_pre_quant = None
+    fused_routing.result = ("gemm2", "weights", "expanded") if taken else None
+    token = runner._deferred_finalize_enabled.set(True)
+    try:
+        out = runner.fused_experts_none_to_flashinfer_trtllm_fp4(d, q, c)
+    finally:
+        runner._deferred_finalize_enabled.reset(token)
+    (kw,) = fused_routing.kwargs
+    # The fused path looks its tactic up with the tuned full-width output key.
+    assert profiled_output_shape(kw) == (64, 2560)
+    assert kw["do_finalize"] is False
+    assert kw["hidden_states"].shape == (64, 1280)
+    if taken:
+        assert out.hidden_states == fused_routing.result
+        setup_runner.quantize.assert_not_called()
+        setup_runner.launch.assert_not_called()
+        return
+    setup_runner.quantize.assert_called_once()
+    launched = setup_runner.launch.call_args.kwargs
+    assert launched["hidden_states"] is not kw["hidden_states"]
+    assert launched["hidden_states_scale"].dtype == torch.float8_e4m3fn
+
+
+@pytest.mark.parametrize("reason", ["finalize", "packet", "rows", "local_experts"])
+def test_fused_routing_leaves_other_calls_alone(
+    setup_runner, fused_routing, monkeypatch, reason
+):
+    d, q, c = inputs(600 if reason == "rows" else 64)
+    if reason != "packet":
+        d.hidden_states_pre_quant = None
+    if reason == "local_experts":
+        monkeypatch.setenv("SGLANG_Q38_MK_MOE", "1")
+        local = importlib.import_module(
+            "sglang.srt.kernel_plugins.nvidia.local_experts"
+        )
+        monkeypatch.setattr(local, "try_numeric_local_experts", lambda kw: None)
+    token = runner._deferred_finalize_enabled.set(reason != "finalize")
+    try:
+        runner.fused_experts_none_to_flashinfer_trtllm_fp4(d, q, c)
+    finally:
+        runner._deferred_finalize_enabled.reset(token)
+    assert fused_routing.kwargs == []
+    setup_runner.launch.assert_called_once()
+
+
 @pytest.mark.parametrize("other", [None, ("unrelated", "tuple")])
 def test_absent_or_other_packet_preserves_native_quantization(setup_runner, other):
     d, q, c = inputs()

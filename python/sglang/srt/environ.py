@@ -689,6 +689,14 @@ class Envs:
     SGLANG_QSA_UNION_PREFILL_MIN_ROWS = EnvInt(1024)
     SGLANG_QSA_UNION_PREFILL_CHECK_CALLS = EnvInt(0)
     SGLANG_QSA_UNION_PREFILL_RESCALE_LOG2 = EnvFloat(0.0)
+    # TP1 deferred-finalize NVFP4 TRT-LLM MoE with 512 experts, softmax top-10, hidden 2560
+    # and FlashInfer 0.7.3: one kernel computes the routing, the trtllm-gen routing metadata
+    # and the activation quant, and the MoE runs only its GEMMs from that metadata at the
+    # tactic the unfused call would get (moe_runner/q38_fused_routing.py). Opt-in: bitwise
+    # only by construction, and it mirrors FlashInfer 0.7.3 internals. The row cap keeps
+    # the original branch's name (at most 512; 33..512 rows run its cluster kernel).
+    SGLANG_OPT_MOE_FUSED_ROUTING = EnvRuntimeBool(False)
+    SGLANG_Q38_FUSED_ROUTING_MAX_ROWS = EnvInt(32)
     # Admit Q38_GDN_FRONT=1 (the verify's strided projection views) and Q38_GDN_PDL=1 (inert
     # there) with --enable-gdn-replayssm-ucache.
     SGLANG_ENABLE_GDN_UCACHE_FRONT = EnvBool(False)
