@@ -611,6 +611,14 @@ class Envs:
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
     SGLANG_GDN_VERIFY_NORM_RETILE_CONFIG = EnvStr("")
+    # GDN linear-chain target verify: the causal conv update on a [rows, block_n] tile
+    # that loads every x row up front (same values), SGLANG_GDN_VERIFY_CONV_RETILE_CONFIG
+    # "block_n,num_warps[,rows[,prefetch]]" (A's name; default 256,4,1,2), read only
+    # with this on. The u-cache fused conv, when it takes a verify, comes first.
+    SGLANG_OPT_GDN_VERIFY_CONV_RETILE = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    SGLANG_GDN_VERIFY_CONV_RETILE_CONFIG = EnvStr("")
     # Triton causal conv1d forward tile "BLOCK_M,BLOCK_N,num_warps,num_stages" (A's
     # name); read only with the runtime master on. Same values for any tile.
     SGLANG_CAUSAL_CONV1D_FWD_CONFIG = EnvStr("")

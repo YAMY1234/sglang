@@ -16,6 +16,7 @@ from sglang.kernels.ops.attention.fla.layernorm_gated import (
 )
 from sglang.kernels.ops.attention.linear import fused_gdn_gating as gating_mod
 from sglang.kernels.ops.mamba import gdn_prefill_state_glue as glue
+from sglang.kernels.ops.mamba import gdn_verify_conv_retile as conv_retile
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_qkv_split_gdn_prefill,
     qwen3_5_gdn_prefill_projection_views,
@@ -143,6 +144,30 @@ class TestGdnPrefillLaunchChoice(unittest.TestCase):
             self.assertFalse(
                 norm_mod.gdn_verify_norm_retile_applies(torch.zeros(8, 64))
             )
+
+    def test_verify_conv_retile_config_and_supported_calls(self):
+        parse = conv_retile.parse_retile_config
+        self.assertIsNone(parse(enabled=False, raw=""))
+        self.assertEqual(parse(enabled=True, raw=""), (256, 4, 1, 2))
+        self.assertEqual(parse(enabled=True, raw="128,2"), (128, 2, 1, 0))
+        for raw in ("100,4", "256,3", "256,4,3", "256,4,1,3", "256"):
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                parse(enabled=True, raw=raw)
+        reason = conv_retile.retile_unsupported_reason
+        window = torch.zeros(4, 4, 32, 3)
+        args = dict(conv_state=torch.zeros(4, 32, 3), weight=torch.zeros(32, 4))
+        x = torch.zeros(2, 32, 4)
+        self.assertIsNone(reason(x=x, intermediate_conv_window=window, **args))
+        for bad in (
+            dict(x=torch.zeros(2, 32, 3)),
+            dict(x=torch.zeros(2, 32, 9)),
+            dict(x=x, weight=torch.zeros(32, 3)),
+            dict(x=x.half()),
+            dict(x=x, intermediate_conv_window=window[0]),
+        ):
+            with self.subTest(bad=list(bad)):
+                call = {**args, "intermediate_conv_window": window, **bad}
+                self.assertIsNotNone(reason(**call))
 
     def test_qk_one_launch_needs_k_right_after_q(self):
         buf = torch.zeros(3 * 4 * 2 * 8)
@@ -493,6 +518,69 @@ class TestGdnPrefillLayout(unittest.TestCase):
                         activation="swish",
                     )
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_verify_conv_retile_matches_the_stock_update(self):
+        from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_update
+
+        batch, dim, slots = 5, 1280, 8
+        for seqlen, dedup, cfg in (
+            (4, False, conv_retile.RETILE_DEFAULT),
+            (4, True, conv_retile.RETILE_DEFAULT),
+            (8, True, conv_retile.RetileConfig(128, 2, 2, 1)),
+        ):
+            with self.subTest(seqlen=seqlen, dedup=dedup, cfg=cfg):
+                x = torch.randn(
+                    batch * seqlen, dim + 64, dtype=torch.bfloat16, device="cuda"
+                )[:, :dim]
+                x = x.view(batch, seqlen, dim).transpose(1, 2)
+                weight = torch.randn(dim, 4, dtype=x.dtype, device="cuda")
+                bias = torch.randn(dim, dtype=x.dtype, device="cuda")
+                state = torch.randn(slots, dim, 3, dtype=x.dtype, device="cuda")
+                slot = torch.tensor([5, -1, 2, 7, 1], dtype=torch.int32, device="cuda")
+                win_slot = torch.tensor(
+                    [0, 1, 2, 3, 4], dtype=torch.int32, device="cuda"
+                )
+
+                def window():
+                    if not dedup:
+                        return torch.zeros(
+                            slots, seqlen, dim, 3, dtype=x.dtype, device="cuda"
+                        )
+                    row = torch.zeros(
+                        slots, dim, seqlen + 2, dtype=x.dtype, device="cuda"
+                    )
+                    return row.as_strided(
+                        (slots, seqlen, dim, 3),
+                        (dim * (seqlen + 2), 1, seqlen + 2, 1),
+                    )
+
+                stock_state, retile_state = state.clone(), state.clone()
+                stock_win, retile_win = window(), window()
+                expected = causal_conv1d_update(
+                    x,
+                    stock_state,
+                    weight,
+                    bias,
+                    "silu",
+                    conv_state_indices=slot,
+                    intermediate_conv_window=stock_win,
+                    intermediate_state_indices=win_slot,
+                )
+                with mock.patch.object(conv_retile, "RETILE_CONFIG", cfg):
+                    actual = conv_retile.gdn_verify_conv_retiled(
+                        x,
+                        retile_state,
+                        weight,
+                        bias,
+                        "silu",
+                        slot,
+                        retile_win,
+                        win_slot,
+                    )
+                live = slot != -1
+                torch.testing.assert_close(actual[live], expected[live], rtol=0, atol=0)
+                torch.testing.assert_close(retile_state, stock_state, rtol=0, atol=0)
+                torch.testing.assert_close(retile_win, stock_win, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

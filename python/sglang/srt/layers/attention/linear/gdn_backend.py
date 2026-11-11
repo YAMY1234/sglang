@@ -23,6 +23,12 @@ from sglang.kernels.ops.mamba.gdn_prefill_state_glue import (
     gdn_track_conv_snapshot,
     gdn_track_state_rows,
 )
+from sglang.kernels.ops.mamba.gdn_verify_conv_retile import (
+    RETILE_CONFIG as VERIFY_CONV_RETILE_CONFIG,
+)
+from sglang.kernels.ops.mamba.gdn_verify_conv_retile import (
+    gdn_verify_conv_retiled,
+)
 from sglang.kernels.ops.mamba.gdn_prefill_track import (
     gdn_track_conv_window,
     gdn_track_ssm_state,
@@ -1793,19 +1799,39 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     device=mixed_qkv.device,
                 ).transpose(1, 2)
             else:
-                mixed_qkv_processed = causal_conv1d_update(
-                    mixed_qkv_reshaped,
-                    conv_states,
-                    layer.conv_weights,
-                    layer.bias,
-                    layer.activation,
-                    conv_state_indices=cache_indices[:batch_size],
-                    intermediate_conv_window=intermediate_conv_window_cache,
-                    intermediate_state_indices=intermediate_state_indices[:batch_size],
-                    retrieve_next_token=retrieve_next_token,
-                    retrieve_next_sibling=retrieve_next_sibling,
-                    retrieve_parent_token=retrieve_parent_token,
-                )
+                mixed_qkv_processed = None
+                if (
+                    VERIFY_CONV_RETILE_CONFIG is not None
+                    and retrieve_next_token is None
+                    and retrieve_next_sibling is None
+                    and retrieve_parent_token is None
+                ):
+                    mixed_qkv_processed = gdn_verify_conv_retiled(
+                        mixed_qkv_reshaped,
+                        conv_states,
+                        layer.conv_weights,
+                        layer.bias,
+                        layer.activation,
+                        cache_indices[:batch_size],
+                        intermediate_conv_window_cache,
+                        intermediate_state_indices[:batch_size],
+                    )
+                if mixed_qkv_processed is None:
+                    mixed_qkv_processed = causal_conv1d_update(
+                        mixed_qkv_reshaped,
+                        conv_states,
+                        layer.conv_weights,
+                        layer.bias,
+                        layer.activation,
+                        conv_state_indices=cache_indices[:batch_size],
+                        intermediate_conv_window=intermediate_conv_window_cache,
+                        intermediate_state_indices=intermediate_state_indices[
+                            :batch_size
+                        ],
+                        retrieve_next_token=retrieve_next_token,
+                        retrieve_next_sibling=retrieve_next_sibling,
+                        retrieve_parent_token=retrieve_parent_token,
+                    )
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
             if forward_metadata.has_mamba_track_mask and not (
