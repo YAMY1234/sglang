@@ -18,6 +18,7 @@ def _jit_module():
             ("gate", "HcCombineDecode::gate"),
             ("apply", "HcCombineDecode::apply"),
             ("apply_norm", "HcCombineNormDecode<2>::run"),
+            ("apply_norm_wide", "HcCombineNormDecodeWide::run"),
         ],
     )
 
@@ -86,6 +87,22 @@ def hc_combine_apply_norm(
         )
         return combined, normalized
     _jit_module().apply_norm(
+        block, residual, partials, weight, combined, normalized, eps
+    )
+    return combined, normalized
+
+
+def hc_combine_apply_norm_wide(
+    block: torch.Tensor,
+    residual: torch.Tensor,
+    partials: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """hc_combine_apply_norm at 33..128 rows: a two-CTA cluster per row-branch."""
+    combined = torch.empty_like(residual)
+    normalized = torch.empty_like(residual)
+    _jit_module().apply_norm_wide(
         block, residual, partials, weight, combined, normalized, eps
     )
     return combined, normalized

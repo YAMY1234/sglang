@@ -497,6 +497,96 @@ class TestActualHcAdmission(unittest.TestCase):
                 launch.assert_not_called()
                 self.assertIsNone(reader._premixed)
 
+    def test_fused_combine_cap_follows_the_master_and_the_kernel_limit(self):
+        for master, cap, expected in (
+            (False, 128, 0),
+            (True, 0, 0),
+            (True, 96, 96),
+            (True, 512, 128),
+        ):
+            with (
+                self.subTest(master=master, cap=cap),
+                envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(master),
+                envs.SGLANG_HC_FUSED_COMBINE_MAX_ROWS.override(cap),
+            ):
+                self.assertEqual(hc._hc_fused_combine_max_rows(), expected)
+
+    def test_fused_combine_rows_gate_on_the_side_stream_and_combine_with_the_next_norm(
+        self,
+    ):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        wide = Mock(name="wide_gate_stream")
+        current = Mock(name="current_stream")
+        for cap, rows, expected in (
+            (128, 64, True),
+            (128, 128, True),
+            (128, 32, False),
+            (96, 97, False),
+            (0, 64, False),
+        ):
+            with self.subTest(cap=cap, rows=rows):
+                layer = self.layer(hc, combine=True)
+                layer._fused_combine_max_rows = cap
+                layer._wide_gate_stream = wide if cap else None
+                wide.reset_mock()
+                current.reset_mock()
+                with (
+                    patch.object(
+                        torch.cuda,
+                        "stream",
+                        lambda stream: __import__("contextlib").nullcontext(),
+                    ),
+                    patch.object(torch.cuda, "current_stream", return_value=current),
+                    patch.object(
+                        torch.Tensor, "record_stream", lambda self, stream: None
+                    ),
+                ):
+                    result, gates, _ = self.execute_mix(
+                        hc, layer, rows=rows, offer=False
+                    )
+                self.assertEqual(bool(gates), expected)
+                if expected:
+                    wide.wait_stream.assert_called_once_with(current)
+                    self.assertEqual(tuple(result[1][2].shape), (rows, 8, 4))
+                block = torch.zeros((rows, 2560), dtype=torch.bfloat16).as_subclass(
+                    CudaMetadataTensor
+                )
+                residual = torch.zeros((rows, 10240), dtype=torch.bfloat16)
+                partials = torch.zeros((rows, 8, 4), dtype=torch.float32)
+                norm = SimpleNamespace(
+                    group_size=2560,
+                    weight=torch.zeros(10240, dtype=torch.bfloat16),
+                    variance_epsilon=1e-6,
+                )
+                calls = []
+                with (
+                    patch.object(
+                        hc_combine_decode,
+                        "hc_combine_apply_norm_wide",
+                        lambda *a: calls.append(a) or (residual, residual),
+                    ),
+                    patch.object(
+                        hc_combine_decode, "_numeric_hc_apply_norm", return_value=None
+                    ),
+                    patch.object(layer, "combine", return_value=residual) as stock,
+                    patch.object(torch.cuda, "current_stream", return_value=current),
+                    patch.object(
+                        torch.Tensor, "record_stream", lambda self, stream: None
+                    ),
+                ):
+                    out = layer.combine_and_normalize(
+                        block, (residual, residual, partials), norm
+                    )
+                self.assertEqual(bool(calls), expected)
+                if expected:
+                    self.assertIs(calls[0][2], partials)
+                    self.assertIs(calls[0][3], norm.weight)
+                    current.wait_stream.assert_called_with(wide)
+                    self.assertEqual(out, (residual, residual))
+                    stock.assert_not_called()
+
     def test_current_stream_partials_do_not_wait_none_and_side_stream_still_joins(self):
         from types import SimpleNamespace
 
@@ -528,6 +618,7 @@ class TestActualHcAdmission(unittest.TestCase):
                             hidden_size=2560,
                             _numeric_hc_macro=lambda rows: object() if macro else None,
                             _ext_rows=lambda *args: False,
+                            _fused_combine_max_rows=0,
                         )
                         args = (block, (residual, residual, partials)) + (
                             (norm,) if name == "combine_and_normalize" else ()

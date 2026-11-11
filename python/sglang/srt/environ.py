@@ -307,6 +307,11 @@ class Envs:
     # instead of the torch.compile chain's two GEMMs; not bitwise. Read only with the
     # runtime master; 0 keeps the chain.
     SGLANG_HC_MIX_SPLITK_MAX_ROWS = EnvInt(0)
+    # TP1 HC boundary (hc 4, hidden 2560) of 33..N rows, N <= 128: the read computes its gate partials on
+    # the side stream and the write-back runs the decode combine + next norm (two-CTA clusters) instead of
+    # hc_combine and the next grouped_gemma_rmsnorm; same arithmetic. Read only with the runtime master;
+    # 0 keeps the stock boundary.
+    SGLANG_HC_FUSED_COMBINE_MAX_ROWS = EnvInt(0)
     # HC write-backs of at least max(33, SGLANG_X_HC_EXTEND_MIN_ROWS) rows run one kernel
     # (hc_combine_extend) that combines, normalizes the streams for the next read and makes
     # that read's gate dot totals, in place of hc_combine plus the next grouped_gemma_rmsnorm
