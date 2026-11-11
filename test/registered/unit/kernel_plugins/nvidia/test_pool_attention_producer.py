@@ -749,6 +749,80 @@ def test_target_verify_defers_the_fp8_cast_to_the_union_write(enabled, pooled):
     assert seen.get("sparse", fp8) == fp8 and ("sparse" in seen) != pooled
 
 
+def draft_extend_state(rows=64):
+    obj, args = fp8_state(rows)
+    kc, vc = args[6], args[7]
+    obj.token_to_kv_pool = NS(
+        layer_router=NS(read=lambda layer_id: NS(key=lambda: kc, value=lambda: vc))
+    )
+    obj.qsa_profile = NS(block_topk=512, budget=2048)
+    args[4].forward_mode = ForwardMode.DRAFT_EXTEND_V2
+    q, k, v, layer, batch = args[:5]
+    k, v = (torch.zeros((rows, 2, 256), dtype=torch.bfloat16) for _ in range(2))
+    # The indexer's expanded token indices: block c's first token at column 4 * c.
+    blocks = torch.randint(0, 900, (rows, 512), dtype=torch.int32)
+    blocks[:, -3:] = -1
+    tokens = (blocks.repeat_interleave(4, 1) * 4 + torch.arange(4).repeat(512)).int()
+    tokens[blocks.repeat_interleave(4, 1) < 0] = -1
+    tokens = torch.cat((tokens, torch.full((rows, 3), 5, dtype=torch.int32)), 1)
+    return obj, (q, k, v, layer, batch, tokens), blocks
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_draft_extend_attends_on_the_union_provider(enabled):
+    rows = 64
+    obj, args, blocks = draft_extend_state(rows)
+    seen = []
+
+    def run(io):
+        seen.append(io)
+        io.output.fill_(5)
+
+    with (
+        envs.SGLANG_QSA_FP8_POOL_VERIFY.override(True),
+        envs.SGLANG_ENABLE_QSA_DRAFT_EXTEND_UNION.override(enabled),
+    ):
+        registry = api.NumericRegistry()
+        (signature,) = union_signatures((rows,))
+        registry.register(api.NumericOffer(signature, run))
+        with patch.object(numeric_binding, "numeric_registry", registry):
+            output = obj._try_draft_extend_union(*args)
+    if not enabled:
+        assert output is None and not seen
+        return
+    assert torch.equal(output, torch.full((rows, 6144), 5, dtype=torch.bfloat16))
+    (io,) = seen
+    assert torch.equal(io.selection.selected_indices, blocks)
+    assert io.store_new_kv and io.query_width == 4
+    assert io.new_k.dtype == torch.float8_e4m3fn
+
+
+@pytest.mark.parametrize("case", ["eager", "rows", "bf16_pool", "no_union", "verify"])
+def test_draft_extend_union_keeps_stock_outside_its_scope(case):
+    rows = 64
+    obj, args, _ = draft_extend_state(rows)
+    q, k, v, layer, batch, tokens = args
+    metadata = obj._resolve_metadata(batch)
+    if case == "eager":
+        metadata.is_cuda_graph = False
+    elif case == "rows":
+        args = (q, k, v, layer, batch, tokens[:-4])
+    elif case == "bf16_pool":
+        kc = torch.zeros((rows + 1, 2, 256), dtype=torch.bfloat16)
+        obj.token_to_kv_pool = NS(
+            layer_router=NS(read=lambda layer_id: NS(key=lambda: kc, value=lambda: kc))
+        )
+    elif case == "verify":
+        batch.forward_mode = ForwardMode.TARGET_VERIFY
+    with ExitStack() as stack:
+        stack.enter_context(envs.SGLANG_ENABLE_QSA_DRAFT_EXTEND_UNION.override(True))
+        if case != "no_union":
+            stack.enter_context(envs.SGLANG_QSA_FP8_POOL_VERIFY.override(True))
+        lookup = stack.enter_context(patch.object(numeric_binding, "numeric_operator"))
+        lookup.return_value = None
+        assert obj._try_draft_extend_union(*args) is None
+
+
 @pytest.mark.parametrize("case", ["off", "decode", "topk", "bf16_new_kv"])
 def test_fp8_pool_outside_union_scope_keeps_stock(case):
     obj, args = fp8_state()

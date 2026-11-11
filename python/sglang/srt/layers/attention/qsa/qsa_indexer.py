@@ -1326,10 +1326,14 @@ class QSAIndexer(MultiPlatformOp):
             from sglang.kernels.ops.attention.fast_topk import fast_topk
 
             block_indices = self._numeric_split_select(logits, compressed_lengths)
+            # SGLANG_ENABLE_QSA_DRAFT_EXTEND_UNION takes it for the grouped4 draft
+            # extend too, as the source does.
             if (
                 block_indices is None
                 and verify_rows_per_group > 1
-                and not grouped4_only
+                and (
+                    not grouped4_only or envs.SGLANG_ENABLE_QSA_DRAFT_EXTEND_UNION.get()
+                )
             ):
                 block_indices = self._numeric_verify_select(logits, compressed_lengths)
             if block_indices is None:

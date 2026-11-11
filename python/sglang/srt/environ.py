@@ -357,6 +357,9 @@ class Envs:
     # Its kernel 1 casts the target verify's BF16 new K/V to E4M3 in the pool write (one
     # launch for two torch casts and the copy; the provider checks the cast equals torch's).
     SGLANG_QSA_FUSED_FP8_KV_WRITE = EnvBool(False)
+    # A CUDA-graph MTP draft extend (four rows per request) on the same FP8 union provider,
+    # reading the pool in place instead of packing every row's tokens for trtllm decode.
+    SGLANG_ENABLE_QSA_DRAFT_EXTEND_UNION = EnvBool(False)
     # TP1 BF16-pool target verify: the attention output gate rides the pool attention's
     # split-K merge (fused_sigmoid_mul's arithmetic, so the same bits).
     SGLANG_ENABLE_QSA_POOL_MERGE_GATE = EnvBool(False)

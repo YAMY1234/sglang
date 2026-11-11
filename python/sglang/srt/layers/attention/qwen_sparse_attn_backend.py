@@ -1648,9 +1648,12 @@ class QwenSparseAttnBackend(AttentionBackend):
         *,
         kv_prestored=False,
         gate=None,
+        draft_extend=False,
     ):
         """The pool attention output, or (output, True) when the output gate rode the
-        split-K merge; None leaves the call to the caller's other routes."""
+        split-K merge; None leaves the call to the caller's other routes. A draft
+        extend (four rows per request, as a target verify lays them out) takes the
+        FP8 union route only."""
         from sglang.kernels.plugin_kernels.nvidia.numeric import (
             DirectPoolAttentionIO,
             DirectPoolSelection,
@@ -1681,14 +1684,18 @@ class QwenSparseAttnBackend(AttentionBackend):
         ):
             return None
         mode = forward_batch.forward_mode
-        if mode.is_target_verify() and width == 4:
+        if (
+            mode.is_draft_extend_v2() if draft_extend else mode.is_target_verify()
+        ) and width == 4:
             variant = verify_variant()
-        elif mode.is_decode() and width == 1:
+        elif mode.is_decode() and width == 1 and not draft_extend:
             variant = 2
         else:
             return None
         # An FP8 pool takes the union kernel: TP1 single-chain verify only.
         union = key_pool.dtype == torch.float8_e4m3fn
+        if draft_extend and not union:
+            return None
         if union and not (
             variant & ~POOL_MERGE_GATE == 1
             and envs.SGLANG_QSA_FP8_POOL_VERIFY.get()
@@ -1882,6 +1889,93 @@ class QwenSparseAttnBackend(AttentionBackend):
             return output.view(rows, -1), True
         return output.view(rows, -1)
 
+    def _try_draft_extend_union(self, q, k, v, layer, forward_batch, indices):
+        """SGLANG_ENABLE_QSA_DRAFT_EXTEND_UNION: a CUDA-graph spec-v2 draft extend (four
+        rows per request in position order, as a target verify) stores its new K/V and
+        attends through the FP8 union provider, reading the pool in place, instead of
+        store + packed trtllm decode; None keeps the stock path."""
+        from sglang.srt.environ import envs
+
+        ratio = self.compress_ratio
+        profile = self.qsa_profile
+        if not (
+            envs.SGLANG_ENABLE_QSA_DRAFT_EXTEND_UNION.get()
+            and forward_batch.forward_mode.is_draft_extend_v2()
+            and self._fused_kv_pool_eligible
+            and q.is_cuda
+            and k is not None
+            and v is not None
+            and isinstance(indices, torch.Tensor)
+            and profile is not None
+            and profile.budget == profile.block_topk * ratio
+            and indices.dim() == 2
+            and indices.shape[1] == profile.budget + ratio - 1
+        ):
+            return None
+        rows = indices.shape[0]
+        metadata = self._resolve_metadata(forward_batch)
+        indexer = metadata.indexer_metadata
+        loc = forward_batch.out_cache_loc
+        if not (
+            metadata.is_cuda_graph
+            and q.shape[0] == rows
+            and rows == forward_batch.req_pool_indices.numel() * 4
+            and indexer is not None
+            and indexer.decode_logical_positions is not None
+            and metadata.row_req_pool_indices is not None
+            and metadata.row_req_pool_indices.numel() == rows
+            and metadata.sequence_lengths.numel() == rows
+            and isinstance(loc, torch.Tensor)
+            and loc.ndim == 1
+            and loc.numel() == rows
+            and loc.is_contiguous()
+        ):
+            return None
+        kc = self.token_to_kv_pool.layer_router.read(layer.layer_id).key()
+        vc = self.token_to_kv_pool.layer_router.read(layer.layer_id).value()
+        if not (
+            kc.ndim == 3
+            and vc.shape == kc.shape
+            and kc.is_contiguous()
+            and vc.is_contiguous()
+            and kc.shape[-1] == 256
+            and kc.dtype == vc.dtype == torch.float8_e4m3fn
+            and q.dtype == torch.bfloat16
+        ):
+            return None
+        k = k.reshape(rows, kc.shape[1], 256)
+        v = v.reshape(rows, kc.shape[1], 256)
+        if not (
+            envs.SGLANG_QSA_FUSED_FP8_KV_WRITE.get()
+            and k.dtype == v.dtype == torch.bfloat16
+            and k.stride(1) == v.stride(1) == 256
+            and k.stride(2) == v.stride(2) == 1
+        ):
+            k = k.to(kc.dtype)
+            v = v.to(vc.dtype)
+        # Column ratio * c of the expanded indices holds block c's first token (or -1),
+        # and with length = position + 1 every selected block is whole: the blocks are
+        # those columns floor-divided by the ratio.
+        blocks = torch.div(
+            indices[:, : profile.block_topk * ratio : ratio],
+            ratio,
+            rounding_mode="floor",
+        )
+        return self._try_numeric_pool_attention(
+            q,
+            k,
+            v,
+            layer,
+            forward_batch,
+            blocks,
+            kc,
+            vc,
+            loc,
+            4,
+            metadata,
+            draft_extend=True,
+        )
+
     def _try_numeric_direct_attention(
         self,
         q,
@@ -2053,6 +2147,11 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             if fused_output is not None:
                 return fused_output
+            union_output = self._try_draft_extend_union(
+                q, k, v, layer, forward_batch, topk_indices
+            )
+            if union_output is not None:
+                return union_output
             self.kv_layers.layer(layer.layer_id).store(
                 layer, forward_batch.out_cache_loc, k, v
             )

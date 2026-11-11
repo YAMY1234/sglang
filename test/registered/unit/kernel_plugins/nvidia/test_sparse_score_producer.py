@@ -306,11 +306,18 @@ def test_verify_select_rejects_an_unknown_mode():
 
 
 @pytest.mark.parametrize(
-    "rows_per_group,grouped4_only,offered",
-    [(4, False, True), (1, False, False), (4, True, False)],
+    "rows_per_group,grouped4_only,draft_union,offered",
+    [
+        (4, False, False, True),
+        (1, False, False, False),
+        (4, True, False, False),
+        # SGLANG_ENABLE_QSA_DRAFT_EXTEND_UNION: the grouped4 draft extend takes it too.
+        (4, True, True, True),
+        (1, False, True, False),
+    ],
 )
 def test_verify_select_serves_only_target_verify_rows(
-    rows_per_group, grouped4_only, offered
+    rows_per_group, grouped4_only, draft_union, offered
 ):
     obj = indexer()
     q, cache, table, lengths, capacity, _ = tensors(8208)
@@ -329,6 +336,7 @@ def test_verify_select_serves_only_target_verify_rows(
 
     with (
         verify_flags(),
+        envs.SGLANG_ENABLE_QSA_DRAFT_EXTEND_UNION.override(draft_union),
         patch.dict(
             sys.modules,
             {
