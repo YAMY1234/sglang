@@ -2578,6 +2578,16 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         head = self.lm_head.weight if self.pp_group.is_last_rank else None
         return embed, head
 
+    def wants_prefill_autotune(self) -> bool:
+        from sglang.srt.layers.moe.prefill_autotune import wants_moe_prefill_autotune
+
+        return wants_moe_prefill_autotune(self)
+
+    def autotune_prefill_kernels(self, num_tokens: int, *, dtype: torch.dtype) -> int:
+        from sglang.srt.layers.moe.prefill_autotune import autotune_moe_prefill
+
+        return autotune_moe_prefill(self, num_tokens, dtype=dtype)
+
     @torch.no_grad()
     def forward(
         self,

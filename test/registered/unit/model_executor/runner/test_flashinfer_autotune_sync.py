@@ -352,6 +352,117 @@ class TestModelPrefillAutotune(CustomTestCase):
                 self.flashinfer_autotune_context.assert_not_called()
 
 
+class TestMoePrefillAutotune(CustomTestCase):
+    """SGLANG_OPT_MOE_PREFILL_AUTOTUNE: one routed-experts call at the prefill ceiling."""
+
+    def setUp(self):
+        from collections import namedtuple
+        from threading import Lock
+
+        from sglang.srt.layers.moe import prefill_autotune
+
+        self.module = prefill_autotune
+        Key = namedtuple("Key", "custom_op bucket")
+        self.winners = {Key("flashinfer::trtllm_fp4_block_scale_moe", 128): 0}
+        self.tuner = SimpleNamespace(_winner_cache=lambda: self.winners, _lock=Lock())
+
+        def route(hidden_states, *, precomputed_router):
+            self.calls.append((hidden_states, precomputed_router))
+            rows = hidden_states.shape[0]
+            for bucket in (1024, 2048, rows):
+                self.winners[Key("flashinfer::trtllm_fp4_block_scale_moe", bucket)] = 0
+            self.winners[Key("flashinfer::bmm_bf16", rows)] = 0
+
+        self.calls = []
+        self.block = SimpleNamespace(
+            tp_size=1,
+            gate=SimpleNamespace(weight=torch.empty((512, 64), dtype=torch.bfloat16)),
+            experts=SimpleNamespace(w13_input_scale_quant=torch.ones(1)),
+            _forward_router_experts=route,
+        )
+        from flashinfer import autotuner
+
+        from sglang.srt.layers.moe.moe_runner import flashinfer_trtllm
+
+        for target, attr, kwargs in (
+            (autotuner.AutoTuner, "get", {"return_value": self.tuner}),
+            (prefill_autotune, "_eligible_block", {"return_value": self.block}),
+            (
+                flashinfer_trtllm,
+                "quantize_nvfp4_routed_input",
+                {"side_effect": lambda x, scale: ("packet", x.shape)},
+            ),
+            (torch.cuda, "current_stream", {}),
+            (torch.cuda, "empty_cache", {}),
+        ):
+            p = patch.object(target, attr, **kwargs)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_switch_and_backend_gate_the_hook(self):
+        from sglang.srt.layers.dp_attention import is_dp_attention_enabled  # noqa: F401
+        from sglang.srt.layers.moe import utils as moe_utils
+
+        backend = SimpleNamespace(is_flashinfer_trtllm=lambda: True)
+        a2a = SimpleNamespace(is_none=lambda: True)
+        for master, switch, expected in (
+            (False, None, False),
+            (True, "0", False),
+            (True, None, True),
+        ):
+            with (
+                self.subTest(master=master, switch=switch),
+                autotune.envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(
+                    master
+                ),
+                patch.object(moe_utils, "get_moe_runner_backend", return_value=backend),
+                patch.object(moe_utils, "get_moe_a2a_backend", return_value=a2a),
+                patch(
+                    "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
+                    return_value=False,
+                ),
+            ):
+                if switch is not None:
+                    autotune.envs.SGLANG_OPT_MOE_PREFILL_AUTOTUNE.set(switch)
+                try:
+                    self.assertIs(
+                        self.module.wants_moe_prefill_autotune(object()), expected
+                    )
+                finally:
+                    autotune.envs.SGLANG_OPT_MOE_PREFILL_AUTOTUNE.clear()
+
+    def test_one_routed_call_at_the_ceiling_counts_new_moe_buckets(self):
+        for prequant in (True, False):
+            with (
+                self.subTest(prequant=prequant),
+                autotune.envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+                autotune.envs.SGLANG_OPT_MOE_NVFP4_PREQUANT_OVERLAP.override(prequant),
+                autotune.envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND.override(False),
+            ):
+                self.calls.clear()
+                tuned = self.module.autotune_moe_prefill(
+                    object(), 16384, dtype=torch.bfloat16
+                )
+                ((hidden, (logits, packet)),) = self.calls
+                self.assertEqual(tuple(hidden.shape), (16384, 64))
+                self.assertEqual(tuple(logits.shape), (16384, 512))
+                self.assertEqual(packet, ("packet", hidden.shape) if prequant else None)
+                # Only MoE entries count; the 128 bucket was already tuned.
+                self.assertEqual(tuned, 3 if prequant else 1)
+
+    def test_small_ceilings_and_the_extend_pass_return_zero(self):
+        self.assertEqual(
+            self.module.autotune_moe_prefill(object(), 16, dtype=torch.bfloat16), 0
+        )
+        self.assertEqual(self.calls, [])
+        with autotune.envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND.override(True):
+            self.assertEqual(
+                self.module.autotune_moe_prefill(object(), 4096, dtype=torch.bfloat16),
+                0,
+            )
+        self.assertEqual(len(self.calls), 1)
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "FlashInfer requires CUDA")
 class TestAutotuneCachePhases(CustomTestCase):
     """Loaded target tactics survive draft warmup, unless cache reuse is off."""

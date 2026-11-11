@@ -195,6 +195,9 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
     model_key_parts.append("skip_ops=" + ",".join(sorted(skip_ops)))
     if mr.is_draft_worker:
         model_key_parts.append(f"draft_quant={mr.model_config.quantization}")
+    if envs.SGLANG_OPT_MOE_PREFILL_AUTOTUNE.get():
+        # The MoE prefill buckets are tuned only with the hook on.
+        model_key_parts.append("moe_prefill_autotune")
     model_key = "|".join(model_key_parts)
     cache_key = hashlib.sha256(model_key.encode()).hexdigest()[:16]
     cache_dir = (

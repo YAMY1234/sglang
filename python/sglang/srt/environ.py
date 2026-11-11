@@ -697,6 +697,12 @@ class Envs:
     # the original branch's name (at most 512; 33..512 rows run its cluster kernel).
     SGLANG_OPT_MOE_FUSED_ROUTING = EnvRuntimeBool(False)
     SGLANG_Q38_FUSED_ROUTING_MAX_ROWS = EnvInt(32)
+    # Startup FlashInfer autotune also runs one routed-experts call of the NVFP4 TRT-LLM
+    # MoE (TP1/EP1 glue path) at the prefill token ceiling, so prefill-size calls find a
+    # tuned tactic instead of the default one (layers/moe/prefill_autotune.py).
+    SGLANG_OPT_MOE_PREFILL_AUTOTUNE = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     # Admit Q38_GDN_FRONT=1 (the verify's strided projection views) and Q38_GDN_PDL=1 (inert
     # there) with --enable-gdn-replayssm-ucache.
     SGLANG_ENABLE_GDN_UCACHE_FRONT = EnvBool(False)
