@@ -2568,5 +2568,78 @@ def test_qsa_union_prefill_matches_the_stock_chunk_kernel():
     assert torch.equal(out, actual)
 
 
+def test_qsa_prefill_pack_rows_serves_the_pack_when_it_applies(monkeypatch):
+    from sglang.srt.layers.attention.qsa import prefill_pack, sparse_attn
+
+    calls, launched = [], []
+
+    def pack_rows(**kwargs):
+        calls.append(kwargs["total_k"])
+        return ("k", "v") if kwargs["total_k"] == 3 else None
+
+    class StockKernel:
+        def __getitem__(self, grid):
+            return lambda *args, **kwargs: launched.append(grid)
+
+    monkeypatch.setattr(prefill_pack, "pack_rows", pack_rows)
+    monkeypatch.setattr(sparse_attn, "_pack_qsa_prefill_kv", StockKernel())
+    k = torch.zeros(4, 1, 16)
+    kwargs = dict(
+        k=k,
+        v=k,
+        req_to_token=torch.zeros(1, 4, dtype=torch.int32),
+        req_indices=torch.zeros(1, dtype=torch.int32),
+        cu_k=torch.tensor([0, 3], dtype=torch.int32),
+        max_k=3,
+    )
+    monkeypatch.setattr(prefill_pack, "ENABLED", True)
+    assert pack_qsa_prefill_kv(total_k=3, **kwargs) == ("k", "v")
+    assert launched == []
+    # A layout pack_rows does not cover (None) and the switch off run the stock pack.
+    packed_k, _ = pack_qsa_prefill_kv(total_k=2, **kwargs)
+    assert packed_k.shape == (2, 1, 16) and len(launched) == 1
+    monkeypatch.setattr(prefill_pack, "ENABLED", False)
+    pack_qsa_prefill_kv(total_k=3, **kwargs)
+    assert calls == [3, 2] and len(launched) == 2
+    # A CPU pool is not covered.
+    monkeypatch.setattr(prefill_pack, "ENABLED", True)
+    assert not prefill_pack.applies(k, k, torch.zeros(1, 4, dtype=torch.int32))
+
+
+@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_qsa_prefill_pack_rows_is_bitwise_the_stock_pack(monkeypatch, compact, dtype):
+    from sglang.srt.layers.attention.qsa import prefill_pack
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9):
+        pytest.skip("FP8-capable CUDA GPU required")
+    torch.manual_seed(5)
+    slots, heads, dim = 4096, 1, 256
+    k = torch.randn(slots, heads, dim, device="cuda").to(dtype)
+    v = torch.randn(slots, heads, dim, device="cuda").to(dtype)
+    # compact: many short requests behind one long one (the stock kernel's flat grid).
+    lens = [1500] + [3] * 4000 if compact else [700, 1, 333, 64]
+    table = torch.randint(0, slots, (len(lens), max(lens)), device="cuda").to(
+        torch.int32
+    )
+    kwargs = dict(
+        k=k,
+        v=v,
+        req_to_token=table,
+        req_indices=torch.arange(len(lens), device="cuda", dtype=torch.int32),
+        cu_k=torch.tensor([0, *accumulate(lens)], device="cuda", dtype=torch.int32),
+        total_k=sum(lens),
+        max_k=max(lens),
+        output_dtype=torch.bfloat16,
+    )
+    monkeypatch.setattr(prefill_pack, "ENABLED", False)
+    expected = pack_qsa_prefill_kv(**kwargs)
+    monkeypatch.setattr(prefill_pack, "ENABLED", True)
+    assert prefill_pack.applies(k, v, table)
+    actual = pack_qsa_prefill_kv(**kwargs)
+    for a, e in zip(actual, expected):
+        assert torch.equal(a.view(torch.uint8), e.view(torch.uint8))
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

@@ -543,6 +543,14 @@ class Envs:
     SGLANG_OPT_QSA_UNION_PREFILL_OUT_ALIAS = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # QSA prefill K/V pack: one program per 16 context tokens copying whole rows in
+    # 16-byte vectors instead of one per 1,024 elements (qsa/prefill_pack.py; same bytes).
+    SGLANG_OPT_QSA_PREFILL_PACK_ROWS = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    SGLANG_QSA_PREFILL_PACK_ROWS_TOKENS = EnvInt(16)
+    SGLANG_QSA_PREFILL_PACK_ROWS_WARPS = EnvInt(4)
+    SGLANG_QSA_PREFILL_PACK_ROWS_CHECK_CALLS = EnvInt(0)
     # --enable-gdn-replayssm-ucache options below are opt-in children of the master: off
     # unless set, also with the master on (they need the SM107 kernel or change rounding).
     # Size the k / u / g rings and their cursors by request row (request-lifetime scratch,
