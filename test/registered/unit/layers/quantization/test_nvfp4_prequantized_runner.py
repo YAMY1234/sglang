@@ -57,6 +57,7 @@ def setup_runner(monkeypatch):
     )
     monkeypatch.setattr(runner, "get_activation_type", lambda *a, **k: 0)
     monkeypatch.setattr(runner, "trtllm_moe_enable_pdl", lambda _: False)
+    monkeypatch.setattr(runner, "get_parallel", lambda: SimpleNamespace(tp_size=1))
     monkeypatch.setattr(runner, "_make_deferred_finalize_output", lambda x, **k: x)
     monkeypatch.setattr(
         runner,
@@ -156,6 +157,40 @@ def test_typed_input_skips_quant_once_through_actual_runner(
         s.stream.wait_event.assert_called_once_with(ready)
     else:
         s.current_stream.assert_not_called()
+
+
+def profiled_output_shape(kw):
+    """FlashInfer's first AutoTuner input: the caller's output, else the placeholder
+    alloc_trtllm_moe_output makes, (N, 0) when do_finalize is False."""
+    if kw.get("output") is not None:
+        return tuple(kw["output"].shape)
+    rows = kw["hidden_states"].shape[0]
+    return (rows, 2560) if kw["do_finalize"] else (rows, 0)
+
+
+@pytest.mark.parametrize("tp_size", [1, 4])
+@pytest.mark.parametrize("deferred", [False, True])
+def test_bypassed_call_profiles_the_tuned_full_width_output(
+    setup_runner, monkeypatch, tp_size, deferred
+):
+    # flashinfer#6077: the tuned entries all start with (N, hidden); a deferred
+    # finalize without an output would profile (N, 0) and fall back to tile 8.
+    monkeypatch.setattr(
+        runner, "get_parallel", lambda: SimpleNamespace(tp_size=tp_size)
+    )
+    d, q, c = inputs(8, standard=False)
+    token = runner._deferred_finalize_enabled.set(deferred)
+    try:
+        runner.fused_experts_none_to_flashinfer_trtllm_fp4(d, q, c)
+    finally:
+        runner._deferred_finalize_enabled.reset(token)
+    kw = setup_runner.launch.call_args.kwargs
+    assert kw["do_finalize"] is not deferred
+    if deferred and tp_size != 1:
+        assert "output" not in kw
+        return
+    assert profiled_output_shape(kw) == (8, 2560)
+    assert kw["output"].dtype == torch.bfloat16
 
 
 @pytest.mark.parametrize("other", [None, ("unrelated", "tuple")])
