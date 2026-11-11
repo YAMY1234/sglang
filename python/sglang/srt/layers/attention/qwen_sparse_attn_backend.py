@@ -1378,11 +1378,54 @@ class QwenSparseAttnBackend(AttentionBackend):
         deferred = lookup(self, forward_batch, logical_positions, layer_id)
         if deferred is not None:
             return deferred
+        if self._defers_mtp_lookup(forward_batch, logical_positions):
+            state = self._mtp_shared_sparse_indices
+            slot = state.layer_slots[int(layer_id)]
+            return DeferredMtpSparseIndices(
+                state.indices[slot],
+                state.captured_len[slot],
+                forward_batch.req_pool_indices,
+                logical_positions,
+                state._tail_offsets,
+            )
         return self._mtp_shared_sparse_indices.lookup(
             forward_batch.req_pool_indices,
             logical_positions,
             layer_id,
         )
+
+    def _defers_mtp_lookup(self, forward_batch, logical_positions) -> bool:
+        """SGLANG_Q38_LOOKUP_NATIVE at TP1: the draft-decode lookup is left to
+        fused_kv_prepare, for one request or, with SGLANG_ENABLE_QSA_MTP_LOOKUP_BATCHED,
+        any batch."""
+        from sglang.srt import runtime_context
+        from sglang.srt.environ import envs
+
+        num_requests = forward_batch.req_pool_indices.numel()
+        if not (
+            get_bool_env_var("SGLANG_Q38_LOOKUP_NATIVE")
+            and runtime_context.get_parallel().tp_size == 1
+            and runtime_context.get_spec().speculative_eagle_topk == 1
+            and self._fused_kv_pool_eligible
+            and self._mtp_shared_sparse_indices is not None
+            and forward_batch.forward_mode.is_decode()
+            and logical_positions.numel() == num_requests
+            and (
+                num_requests == 1
+                or (
+                    num_requests > 1 and envs.SGLANG_ENABLE_QSA_MTP_LOOKUP_BATCHED.get()
+                )
+            )
+        ):
+            return False
+        if not getattr(self, "_mtp_lookup_deferred_logged", False):
+            self._mtp_lookup_deferred_logged = True
+            logger.info(
+                "QSA MTP lookup resolved in the fused KV pack (SGLANG_Q38_LOOKUP_NATIVE, "
+                "SGLANG_ENABLE_QSA_MTP_LOOKUP_BATCHED; first bs=%d)",
+                num_requests,
+            )
+        return True
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
@@ -1516,7 +1559,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         metadata = self._resolve_metadata(forward_batch)
         if metadata.sequence_lengths.numel() != rows:
             return None
-        if output_gate is not None:
+        # A deferred MTP lookup is resolved by fused_kv_prepare only.
+        deferred = isinstance(indices, DeferredMtpSparseIndices)
+        if output_gate is not None and not deferred:
             fused = self._try_numeric_direct_attention(
                 q,
                 k,
@@ -1535,19 +1580,23 @@ class QwenSparseAttnBackend(AttentionBackend):
                 return fused, True
         if trtllm_decode is None:
             return None
-        pooled = self._try_numeric_pool_attention(
-            q,
-            k,
-            v,
-            layer,
-            forward_batch,
-            indices,
-            kc,
-            vc,
-            loc,
-            width,
-            metadata,
-            kv_prestored=kv_prestored,
+        pooled = (
+            None
+            if deferred
+            else self._try_numeric_pool_attention(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                indices,
+                kc,
+                vc,
+                loc,
+                width,
+                metadata,
+                kv_prestored=kv_prestored,
+            )
         )
         if pooled is not None:
             return (pooled, False) if output_gate is not None else pooled
@@ -1558,7 +1607,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             layer,
             forward_batch,
             metadata,
-            indices.to(torch.int32).contiguous(),
+            indices if deferred else indices.to(torch.int32).contiguous(),
             trtllm_decode,
             new_kv=(k, v, loc, width),
         )
@@ -2490,6 +2539,21 @@ class QwenSparseAttnBackend(AttentionBackend):
                     decode,
                     prepared_kv=(io.counts_out, io.packed_k_out, io.packed_v_out),
                 )
+            if save_kv_cache and layer.layer_id not in getattr(
+                self, "_numeric_mtp_deferred_signatures", {}
+            ):
+                # No packer declared (the TP1 deferral): fused_kv_prepare resolves it.
+                fused_output = self._try_fused_kv_attention(
+                    q,
+                    k,
+                    v,
+                    layer,
+                    forward_batch,
+                    topk_indices,
+                    output_gate=kwargs.get("numeric_output_gate"),
+                )
+                if fused_output is not None:
+                    return fused_output
             topk_indices = topk_indices.materialize()
         if save_kv_cache:
             fused_output = self._try_fused_kv_attention(

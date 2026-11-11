@@ -328,6 +328,9 @@ class Envs:
     # MTP draft-extend seed capture of a QSA layer as one integer-only launch at any
     # batch size (the source's switch; same seed rows and lengths as the torch path).
     SGLANG_ENABLE_QSA_MTP_CAPTURE_BATCHED = EnvBool(False)
+    # With SGLANG_Q38_LOOKUP_NATIVE at TP1: the MTP draft-decode lookup of every batch
+    # size (not only one request) is resolved inside the fused KV pack (same positions).
+    SGLANG_ENABLE_QSA_MTP_LOOKUP_BATCHED = EnvBool(False)
     # Request-relative QSA prefill: the source's ordered fast select; it requires
     # SGLANG_OPT_QSA_PREFILL_SCALE_FOLD, whose stored scores it reproduces.
     SGLANG_ENABLE_QSA_PREFILL_FAST_SELECT = EnvBool(False)

@@ -20,6 +20,7 @@ from sglang.kernels.plugin_kernels.nvidia.numeric import (
 )
 from sglang.kernels.plugin_kernels.nvidia.numeric import NumericOperation as O
 from sglang.srt import runtime_context
+from sglang.srt.environ import envs
 from sglang.srt.kernel_plugins.nvidia import binding
 from sglang.srt.kernel_plugins.nvidia import mtp_deferred_kv as policy
 from sglang.srt.kernel_plugins.nvidia import numeric_binding
@@ -390,6 +391,75 @@ def test_deferred_prepare_uses_attention_backend_interface(enabled, monkeypatch)
 
     assert "qwen_sparse_attn_backend" not in inspect.getsource(policy)
     assert backend.sparse_decode_page_size == 64
+
+
+@pytest.fixture
+def tp1_native(enabled, monkeypatch):
+    """The source's TP1 native lookup: no packer is declared, so no MK_MTP."""
+    monkeypatch.delenv("SGLANG_Q38_MK_MTP")
+    monkeypatch.setattr(runtime_context, "get_parallel", lambda: NS(tp_size=1))
+    return enabled
+
+
+@pytest.mark.parametrize(
+    "requests, batched, deferred",
+    [([2], False, True), ([2, 5], False, False), ([2, 5], True, True)],
+)
+def test_tp1_lookup_defers_one_request_or_any_batch_when_batched(
+    tp1_native, requests, batched, deferred
+):
+    _, _, _, backend, state, fb, *_ = setup()
+    state.captured_len[0, 5] = 101
+    fb.req_pool_indices = tensor(requests, torch.int64)
+    positions = tensor([102, 103][: len(requests)])
+    backend.forward_metadata.indexer_metadata.decode_logical_positions = positions
+    with envs.SGLANG_ENABLE_QSA_MTP_LOOKUP_BATCHED.override(batched):
+        actual = backend.lookup_mtp_sparse_indices(fb, 3)
+    expected = state.lookup(fb.req_pool_indices, positions, 3)
+    assert isinstance(actual, policy.DeferredMtpSparseIndices) == deferred
+    if deferred:
+        assert actual.indices.data_ptr() == state.indices[0].data_ptr()
+        assert actual.requests is fb.req_pool_indices
+        assert actual.positions is positions
+        actual = actual.materialize()
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("reason", ["native_off", "tp4", "extend"])
+def test_tp1_lookup_keeps_the_stock_lookup_outside_its_gate(
+    tp1_native, monkeypatch, reason
+):
+    _, _, _, backend, state, fb, *_ = setup()
+    if reason == "native_off":
+        monkeypatch.delenv("SGLANG_Q38_LOOKUP_NATIVE")
+    if reason == "tp4":
+        monkeypatch.setattr(runtime_context, "get_parallel", lambda: NS(tp_size=4))
+    if reason == "extend":
+        fb.forward_mode = ForwardMode.DRAFT_EXTEND_V2
+    actual = backend.lookup_mtp_sparse_indices(fb, 3)
+    assert isinstance(actual, torch.Tensor)
+
+
+def test_tp1_deferred_lookup_reaches_fused_kv_prepare_unmaterialized(
+    tp1_native, monkeypatch
+):
+    _, _, _, backend, _, fb, layer, q, k, v, md = setup()
+    indices = backend.lookup_mtp_sparse_indices(fb, 3)
+    assert isinstance(indices, policy.DeferredMtpSparseIndices)
+    seen = []
+
+    def pack(*args, **kwargs):
+        seen.append((args[7], kwargs["compress_ratio"], kwargs["query_positions"]))
+
+    monkeypatch.setattr(impl, "fused_kv_prepare", pack)
+    monkeypatch.setattr(
+        indices.__class__,
+        "materialize",
+        lambda self: pytest.fail("the TP1 pack resolves the lookup itself"),
+    )
+    output = backend.forward_decode(q, k, v, layer, fb, topk_indices=indices)
+    assert output.shape == (1, 1536)
+    assert seen == [(indices, 1, None)]
 
 
 if __name__ == "__main__":
