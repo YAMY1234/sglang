@@ -1559,6 +1559,8 @@ class _HCNorms:
     ffn_partials: Optional[torch.Tensor] = None
     output_partials: Optional[torch.Tensor] = None
     next_inject_weight: Optional[torch.Tensor] = None
+    # The module whose read next_norm belongs to (a one-launch boundary mixes for it).
+    next_mix: Optional[GatedResidual] = None
 
 
 def _has_ple(layer_id, config) -> bool:
@@ -1717,13 +1719,19 @@ class Qwen4ExpLayerExtensionMixin:
 
     @contextmanager
     def hc_norms(
-        self, normalized_input, next_norm, partials=None, next_inject_weight=None
+        self,
+        normalized_input,
+        next_norm,
+        partials=None,
+        next_inject_weight=None,
+        next_mix=None,
     ):
         norms = _HCNorms(
             normalized_input,
             next_norm,
             attn_partials=partials if normalized_input is not None else None,
             next_inject_weight=next_inject_weight,
+            next_mix=next_mix if next_norm is not None else None,
         )
         # A prepared norm can only follow its residual without row movement.
         self._hc_norms = (
@@ -1778,6 +1786,7 @@ class Qwen4ExpLayerExtensionMixin:
                 residuals,
                 self.mlp_hyper_connection.hc_norm,
                 self.mlp_hyper_connection.block_inject_weight.weight,
+                next_mix=self.mlp_hyper_connection,
             )
         )
         return hidden_states
@@ -1803,6 +1812,7 @@ class Qwen4ExpLayerExtensionMixin:
                 residuals,
                 self._hc_norms.next_norm,
                 self._hc_norms.next_inject_weight,
+                next_mix=self._hc_norms.next_mix,
             )
         )
         return hidden_states
@@ -2351,15 +2361,16 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                         )
             next_norm = None
             next_inject_weight = None
+            next_mix = None
             if i + 1 < self.end_layer:
                 next_layer = self.layers[i + 1]
                 if next_layer.ple is None:
-                    next_norm = next_layer.attn_hyper_connection.hc_norm
-                    next_inject_weight = (
-                        next_layer.attn_hyper_connection.block_inject_weight.weight
-                    )
+                    next_mix = next_layer.attn_hyper_connection
+                    next_norm = next_mix.hc_norm
+                    next_inject_weight = next_mix.block_inject_weight.weight
             elif self.pp_group.is_last_rank:
                 next_norm = self.hyper_connection_mixer.hc_norm
+                next_mix = self.hyper_connection_mixer
             with (
                 get_global_expert_distribution_recorder().with_current_layer(i),
                 layer.hc_norms(
@@ -2367,6 +2378,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                     next_norm,
                     gate_partials,
                     next_inject_weight,
+                    next_mix,
                 ) as norms,
             ):
                 hidden_states = layer(

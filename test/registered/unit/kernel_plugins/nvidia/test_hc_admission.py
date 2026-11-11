@@ -389,6 +389,114 @@ class TestActualHcAdmission(unittest.TestCase):
                     passed = stock_norm.call_args.args[1]
                     self.assertIsNone(passed[2])
 
+    def test_ks_boundary_cap_needs_the_master_and_the_extend_boundary(self):
+        for master, extend, cap, expected in (
+            (False, "1", 320, 0),
+            (True, "0", 320, 0),
+            (True, "1", 0, 0),
+            (True, "1", 256, 256),
+            (True, "1", 4096, 320),
+        ):
+            with (
+                self.subTest(master=master, extend=extend, cap=cap),
+                envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(master),
+                envs.SGLANG_OPT_HC_EXTEND_BOUNDARY.override(extend),
+                envs.SGLANG_HC_BOUNDARY_KS_MAX_ROWS.override(cap),
+            ):
+                self.assertEqual(hc._hc_boundary_ks_max_rows(), expected)
+
+    def test_ks_boundary_mixes_for_the_next_read_in_one_launch(self):
+        from sglang.kernels.ops.gemm import hc_boundary_ks
+
+        rows = 64
+        writer = self.layer(hc, combine=True)
+        reader = self.layer(hc, combine=True)
+        reader.hc_norm.to(torch.bfloat16)
+        writer._ext_min_rows = reader._ext_min_rows = 33
+        writer._ks_boundary_max_rows = reader._ks_boundary_max_rows = 320
+        block = torch.zeros((rows, 2560), dtype=torch.bfloat16).as_subclass(
+            CudaMetadataTensor
+        )
+        residual = torch.zeros((rows, 10240), dtype=torch.bfloat16)
+        totals = torch.zeros((rows, 4), dtype=torch.float32)
+        mixed = torch.ones((rows, 2560), dtype=torch.bfloat16)
+        for flags, gate, written in (
+            (3, True, False),
+            (7, True, True),
+            (3, False, True),
+        ):
+            with self.subTest(flags=flags, gate=gate):
+                calls = []
+
+                def launch(block_output, hyper_input, **kw):
+                    calls.append(kw)
+                    normed = (
+                        torch.empty_like(hyper_input) if kw["write_normed"] else None
+                    )
+                    return hyper_input, normed, totals if gate else None, mixed
+
+                next_weight = reader.block_inject_weight.weight if gate else None
+                with (
+                    patch.object(hc_boundary_ks, "supported", return_value=True),
+                    patch.object(hc_boundary_ks, "hc_boundary_ks", launch),
+                    envs.SGLANG_HC_BOUNDARY_KS_FLAGS.override(flags),
+                ):
+                    combined, normalized, partials = writer.combine_normalize_and_gate(
+                        block,
+                        (residual, residual, totals),
+                        reader.hc_norm,
+                        next_weight,
+                        next_mix=reader,
+                    )
+                self.assertEqual(len(calls), 1)
+                self.assertIs(calls[0]["partials"], totals)
+                self.assertIs(calls[0]["norm_weight"], reader.hc_norm.weight)
+                self.assertIs(calls[0]["next_inject_weight"], next_weight)
+                self.assertEqual(calls[0]["write_normed"], written)
+                self.assertEqual(normalized.numel() > 0, written)
+                self.assertIs(reader._premixed[1], mixed)
+                # The next read takes the stashed mix for exactly these streams.
+                out, state = reader.mix(combined, normalized_input=normalized)
+                self.assertIs(out, mixed)
+                self.assertIs(state[1], normalized)
+                self.assertIsNone(reader._premixed)
+
+    def test_ks_boundary_declines_without_extend_totals_or_above_its_cap(self):
+        from sglang.kernels.ops.gemm import hc_boundary_ks
+
+        writer = self.layer(hc, combine=True)
+        reader = self.layer(hc, combine=True)
+        reader.hc_norm.to(torch.bfloat16)
+        writer._ext_min_rows = reader._ext_min_rows = 33
+        writer._ks_boundary_max_rows = 320
+        reader._ks_boundary_max_rows = 128
+        for rows, decode_partials in ((64, True), (256, False), (32, False)):
+            with self.subTest(rows=rows, decode_partials=decode_partials):
+                block = torch.zeros((rows, 2560), dtype=torch.bfloat16).as_subclass(
+                    CudaMetadataTensor
+                )
+                residual = torch.zeros((rows, 10240), dtype=torch.bfloat16)
+                shape = (rows, 8, 4) if decode_partials else (rows, 4)
+                partials = torch.zeros(shape, dtype=torch.float32)
+                with (
+                    patch.object(hc_boundary_ks, "supported", return_value=True),
+                    patch.object(hc_boundary_ks, "hc_boundary_ks") as launch,
+                    patch.object(writer, "_combine_extend") as extend,
+                    patch.object(writer, "_numeric_hc_macro", return_value=None),
+                    patch.object(writer, "combine_and_normalize") as stock,
+                ):
+                    extend.return_value = (residual, residual, None)
+                    stock.return_value = (residual, None)
+                    writer.combine_normalize_and_gate(
+                        block,
+                        (residual, residual, partials),
+                        reader.hc_norm,
+                        reader.block_inject_weight.weight,
+                        next_mix=reader,
+                    )
+                launch.assert_not_called()
+                self.assertIsNone(reader._premixed)
+
     def test_current_stream_partials_do_not_wait_none_and_side_stream_still_joins(self):
         from types import SimpleNamespace
 

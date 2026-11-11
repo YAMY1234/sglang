@@ -316,6 +316,13 @@ class Envs:
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
     SGLANG_X_HC_EXTEND_MIN_ROWS = EnvInt(1024)
+    # With the extend boundary, TP1 (SGLANG_HC_MACRO, hc 4, hidden 2560, rank 320): a
+    # write-back of 33..N rows (N <= 320) and the next read's mix run as one K-sliced launch
+    # (hc_boundary_ks); not bitwise to the separate kernels. Read only with the runtime
+    # master; 0 keeps them. _FLAGS: hc_boundary_ks.FLAG_* bits (1 drop consumed L2 scratch,
+    # 2 tanh gate sigmoid, 4 always write the normalized streams).
+    SGLANG_HC_BOUNDARY_KS_MAX_ROWS = EnvInt(0)
+    SGLANG_HC_BOUNDARY_KS_FLAGS = EnvInt(3)
     SGLANG_QSA_Q4_SCORE = EnvBool(False)
     SGLANG_QSA_SCORER_V2 = EnvBool(True)
     SGLANG_QSA_SCORER_V2_ROWS = EnvBool(False)

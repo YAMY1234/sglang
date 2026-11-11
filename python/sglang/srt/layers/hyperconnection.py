@@ -63,6 +63,36 @@ def _hc_ext_ready(hc_count: int, hidden_size: int, dtype: torch.dtype) -> bool:
     return ready
 
 
+_KS_BOUNDARY_BUILT: list = []
+
+
+def _hc_boundary_ks_max_rows() -> int:
+    """Largest write-back the one-launch boundary serves; 0 = off."""
+    if not (
+        envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+        and envs.SGLANG_OPT_HC_EXTEND_BOUNDARY.get()
+    ):
+        return 0
+    from sglang.kernels.ops.gemm.hc_boundary_ks import MAX_ROWS
+
+    return min(envs.SGLANG_HC_BOUNDARY_KS_MAX_ROWS.get(), MAX_ROWS)
+
+
+def _hc_boundary_ks_ready() -> bool:
+    """Build (or load) the one-launch boundary and its scratch once per process,
+    before graph capture; a failure keeps the separate kernels."""
+    if not _KS_BOUNDARY_BUILT:
+        try:
+            from sglang.kernels.ops.gemm.hc_boundary_ks import warmup
+
+            warmup()
+            _KS_BOUNDARY_BUILT.append(True)
+        except Exception as e:  # keep the separate kernels
+            logger.warning("hc_boundary_ks unavailable (%s); separate HC kernels", e)
+            _KS_BOUNDARY_BUILT.append(False)
+    return _KS_BOUNDARY_BUILT[0]
+
+
 def _log_hc_ext_once(
     rows: int, min_rows: int, has_partials: bool, norm: bool, gate: bool
 ):
@@ -187,6 +217,12 @@ class HyperConnectionBase(nn.Module):
 
 
 class GatedResidual(HyperConnectionBase):
+    # Set by the previous write-back's one-launch boundary: (its normalized output,
+    # this read's mixed input), consumed by the next mix() of those streams.
+    _premixed: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+    # Largest write-back this module may run as a one-launch boundary, in either role.
+    _ks_boundary_max_rows: int = 0
+
     def numeric_signatures(self, widths, tokens_per_request):
         from sglang.kernels.plugin_kernels.nvidia.numeric import (
             HcSignature,
@@ -428,6 +464,22 @@ class GatedResidual(HyperConnectionBase):
                 and _hc_ext_ready(self.hc_count, self.hidden_size, config.params_dtype)
             ):
                 self._ext_min_rows = 0
+        # As a write-back it needs the extend boundary; as the next read, the mix weights.
+        ks_max_rows = _hc_boundary_ks_max_rows()
+        if (
+            ks_max_rows > _HC_EXT_FLOOR_ROWS - 1
+            and use_mix
+            and self._jit_mix_ok
+            and self.hc_count == 4
+            and self.hidden_size == 2560
+            and config.hc_lowrank == 320
+            and config.hc_per_branch_norm
+            and config.params_dtype == torch.bfloat16
+            and (self._ext_min_rows or not use_combine)
+            and self._numeric_mix_variant()
+            and _hc_boundary_ks_ready()
+        ):
+            self._ks_boundary_max_rows = ks_max_rows
 
         def _mix_compute(
             hyper_input_normed: torch.Tensor,
@@ -488,6 +540,11 @@ class GatedResidual(HyperConnectionBase):
                 (*hyper_input.shape[:-1], self.hidden_size), dtype=self.params_dtype
             )
             return mixed_input, (hyper_input, hyper_input, None)
+        premixed = self._premixed
+        if premixed is not None:
+            self._premixed = None
+            if normalized_input is premixed[0]:
+                return premixed[1], (hyper_input, normalized_input, partials)
 
         if partials is not None:
             assert normalized_input is not None
@@ -700,19 +757,114 @@ class GatedResidual(HyperConnectionBase):
             next_inject_weight=next_inject_weight,
         )
 
+    def _ks_boundary_admits(
+        self,
+        block_output: torch.Tensor,
+        residuals: tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
+        next_norm: GroupedGemmaRMSNorm,
+        next_inject_weight: Optional[torch.Tensor],
+        next_mix: "GatedResidual",
+    ) -> bool:
+        """Whether this write-back and next_mix's read run as one launch: the extend
+        boundary with its [rows, hc] gate totals, next_mix's own per-branch norm and
+        gate, contiguous rows, a resident grid."""
+        rows = block_output.shape[0]
+        hyper_input, hyper_input_normed, partials = residuals
+        if not (
+            _HC_EXT_FLOOR_ROWS
+            <= rows
+            <= min(self._ks_boundary_max_rows, next_mix._ks_boundary_max_rows)
+            and partials is not None
+            and partials.dim() == 2
+            and next_norm is next_mix.hc_norm
+            and next_norm._jit_group_size == self.hidden_size
+            and next_norm.weight.dtype == block_output.dtype
+            and (
+                next_inject_weight is None
+                or next_inject_weight is next_mix.block_inject_weight.weight
+            )
+            and self._ext_rows(block_output, hyper_input, hyper_input_normed, partials)
+            and block_output.is_contiguous()
+            and hyper_input.is_contiguous()
+            and partials.is_contiguous()
+        ):
+            return False
+        from sglang.kernels.ops.gemm.hc_boundary_ks import supported
+
+        return supported(rows, block_output.device.index)
+
+    def _combine_mix_ks(
+        self,
+        block_output: torch.Tensor,
+        residuals: tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
+        next_norm: GroupedGemmaRMSNorm,
+        next_inject_weight: Optional[torch.Tensor],
+        next_mix: "GatedResidual",
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """The write-back and next_mix's read in one launch; next_mix.mix() returns
+        the stashed mixed input."""
+        from sglang.kernels.ops.gemm.hc_boundary_ks import (
+            FLAG_WRITE_NORMED,
+            hc_boundary_ks,
+        )
+        from sglang.kernels.ops.gemm.hc_mix_splitk import permute_pad_up_weight
+
+        hyper_input, _, partials = residuals
+        if next_mix._mix_up_weight_padded is None:
+            next_mix._mix_up_weight_padded = permute_pad_up_weight(
+                next_mix.input_mix_weight_up.weight, next_mix.hc_count
+            )
+        flags = envs.SGLANG_HC_BOUNDARY_KS_FLAGS.get()
+        # With next gate totals and next_mix's extend boundary, next_mix's write-back
+        # reads the totals, never the normalized streams: they are not written, and a
+        # zero-size stand-in carries the hand-off (any other reader fails mix()'s
+        # shape check).
+        write_normed = bool(flags & FLAG_WRITE_NORMED) or not (
+            next_inject_weight is not None and next_mix._ext_min_rows
+        )
+        combined, normalized, next_partials, mixed = hc_boundary_ks(
+            block_output,
+            hyper_input,
+            partials=partials,
+            norm_weight=next_norm.weight,
+            eps=next_norm.variance_epsilon,
+            next_inject_weight=next_inject_weight,
+            w_down=next_mix.input_mix_weight_down.weight.data,
+            w_up_permuted=next_mix._mix_up_weight_padded,
+            write_normed=write_normed,
+            flags=flags,
+        )
+        if normalized is None:
+            normalized = hyper_input.new_empty((0,))
+        next_mix._premixed = (normalized, mixed)
+        return combined, normalized, next_partials
+
     def combine_normalize_and_gate(
         self,
         block_output: torch.Tensor,
         residuals: tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
         next_norm: Optional[GroupedGemmaRMSNorm],
         next_inject_weight: Optional[torch.Tensor],
+        next_mix: Optional["GatedResidual"] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Publish a local HC boundary; the caller carries the next read's gate.
 
         The two-result stock API remains unchanged. No prepared values cross a
-        history update, row redistribution, or pipeline boundary.
+        history update, row redistribution, or pipeline boundary. ``next_mix`` is
+        the module whose read ``next_norm`` belongs to, if the caller knows it.
         """
         residual, normed, partials = residuals
+        if (
+            next_mix is not None
+            and next_norm is not None
+            and self._ks_boundary_max_rows
+            and self._ks_boundary_admits(
+                block_output, residuals, next_norm, next_inject_weight, next_mix
+            )
+        ):
+            return self._combine_mix_ks(
+                block_output, residuals, next_norm, next_inject_weight, next_mix
+            )
         if self._ext_rows(block_output, residual, normed, partials):
             return self._combine_extend(
                 block_output, residuals, next_norm, next_inject_weight
