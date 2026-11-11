@@ -137,5 +137,48 @@ def test_update_table_and_compute_n_gram_ids_match_reference(batch_size: int) ->
     torch.testing.assert_close(n_gram_ids.cpu(), expected, atol=0, rtol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("requests", [1, 7, 128])
+@pytest.mark.parametrize("translated", [False, True])
+def test_qwen4_ple_verify_prepare_matches_the_torch_layout(requests, translated):
+    from sglang.kernels.ops.embeddings import qwen4_ple_verify_prepare as prepare
+
+    gen = torch.Generator().manual_seed(requests)
+    width, ctx, eos, slots = 4, 2, 17, 300
+    tokens = torch.randint(100, 1000, (requests * width,), generator=gen)
+    lengths = torch.randint(0, width + 1, (requests,), generator=gen)
+    reqs = torch.randperm(requests, generator=gen) + 1
+    locs = torch.randint(0, 3, (requests * width,), generator=gen)
+    slot_map = torch.randperm(slots, generator=gen).int()
+    v2p = torch.randperm(slots, generator=gen).int() if translated else None
+    history = torch.randint(0, 1000, (slots, ctx), generator=gen)
+    args = [tokens, lengths, reqs, locs, slot_map, v2p, history]
+    cuda = [None if t is None else t.cuda() for t in args]
+    assert prepare.can_prepare(*cuda, width, ctx + 1)
+    actual = prepare.prepare_verify_layout(*cuda, width, eos)
+
+    rows = torch.arange(requests * width)
+    req_rows, offsets = rows // width, rows % width
+    valid = offsets < lengths[req_rows]
+    live = lengths.ne(0) & locs.view(requests, width).ne(0).any(1)
+    state = slot_map[reqs].long()
+    state = state if v2p is None else v2p[state].long()
+    state = torch.where(live, state, 0)
+    context = torch.cat(
+        (history[state], torch.where(valid, tokens, eos).view(requests, width)), 1
+    )
+    expected = prepare.VerifyPLELayout(
+        lengths,
+        req_rows,
+        offsets,
+        valid,
+        state if v2p is None else state.int(),
+        context,
+        context.unfold(1, ctx + 1, 1)[req_rows, offsets],
+    )
+    for a, b in zip(actual, expected):
+        assert a.dtype == b.dtype and torch.equal(a.cpu(), b)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))

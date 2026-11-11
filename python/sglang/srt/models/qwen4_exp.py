@@ -316,6 +316,18 @@ def _prepare_ple_batch(
     physical_tokens = input_ids.shape[0]
     processed_tokens = _get_processed_token_count(forward_batch, physical_tokens)
     tokens = input_ids[:processed_tokens]
+    if envs.SGLANG_OPT_PLE_VERIFY_PREPARE_BATCHED.get():
+        batched = _try_prepare_ple_verify_batched(
+            tokens,
+            forward_batch,
+            mode,
+            physical_tokens=physical_tokens,
+            processed_tokens=processed_tokens,
+            ngram_size=ngram_size,
+            ngram_eos_token_id=ngram_eos_token_id,
+        )
+        if batched is not None:
+            return batched
     positions = torch.arange(processed_tokens, device=tokens.device, dtype=torch.long)
     packed_query_start_loc = None
 
@@ -459,6 +471,99 @@ def _prepare_ple_batch(
         ngram_context=ngram_context,
         ngram_eos_token_id=ngram_eos_token_id,
     )
+
+
+def _try_prepare_ple_verify_batched(
+    tokens: torch.Tensor,
+    forward_batch: ForwardBatch,
+    mode: ForwardMode,
+    *,
+    physical_tokens: int,
+    processed_tokens: int,
+    ngram_size: Optional[int],
+    ngram_eos_token_id: Optional[int],
+) -> Optional[_PLEBatch]:
+    """The target-verify branch of ``_prepare_ple_batch`` in one launch, bit-identical;
+    None (nothing launched) outside its contract, so the caller runs the torch ops."""
+    from sglang.kernels.ops.embeddings import qwen4_ple_verify_prepare as ple_prepare
+    from sglang.srt.mem_cache.kv.requests import RequestTable
+    from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+
+    if not (
+        mode.is_target_verify()
+        and forward_batch.forward_mode.is_target_verify()
+        and not is_in_breakable_cuda_graph()
+        and get_parallel().pp_size == 1
+        and not is_cp_active(forward_batch)
+        and forward_batch.spec_info is not None
+        and ngram_size is not None
+        and ngram_eos_token_id is not None
+    ):
+        return None
+    width = int(forward_batch.spec_info.draft_token_num)
+    if width <= 0 or processed_tokens == 0 or processed_tokens % width:
+        return None
+    count = processed_tokens // width
+    pool = get_req_to_token_pool()
+    router = get_token_to_kv_pool().layer_router
+    view = router.part_view(NGRAM_PART)
+    if type(pool) not in (HybridReqToTokenPool, RequestTable) or view is None:
+        return None
+    # The state id space's write is a gather through read_v2p (or the identity).
+    space = get_attn_backend().runner_ids.state_ids(pool.state_sub_pool)
+    slot_v2p = None if space.write is None else space.read_v2p
+    if space.write is not None and slot_v2p is None:
+        return None
+    requests = forward_batch.req_pool_indices[:count]
+    lengths = forward_batch.extend_seq_lens
+    if lengths is not None:
+        lengths = lengths[:count]
+    locations = forward_batch.out_cache_loc
+    if locations is not None:
+        locations = locations[:processed_tokens]
+    history = view.context
+    if not ple_prepare.can_prepare(
+        tokens,
+        lengths,
+        requests,
+        locations,
+        pool.req_index_to_mamba_index_mapping,
+        slot_v2p,
+        history,
+        width,
+        ngram_size,
+    ):
+        return None
+    # The torch branch waits here, before its history read.
+    router.wait_for_part(NGRAM_PART)
+    layout = ple_prepare.prepare_verify_layout(
+        tokens,
+        lengths,
+        requests,
+        locations,
+        pool.req_index_to_mamba_index_mapping,
+        slot_v2p,
+        history,
+        width,
+        ngram_eos_token_id,
+    )
+    batch = _PLEBatch(
+        mode=mode,
+        use_decode_fast_path=False,
+        physical_tokens=physical_tokens,
+        processed_tokens=processed_tokens,
+        lengths=layout.lengths,
+        row_width=width,
+        req_indices=layout.req_indices,
+        token_offsets=layout.token_offsets,
+        valid_tokens=layout.valid_tokens,
+        state_indices=layout.state_indices,
+        ngram_context=layout.ngram_context,
+        ngram_eos_token_id=ngram_eos_token_id,
+    )
+    # compute_ngram_ids' unfold + index for this batch, already written by the kernel.
+    pool.ple_window_cache = (batch, layout.contexts, None)
+    return batch
 
 
 def _commit_ple_batch(batch: Optional[_PLEBatch], forward_batch: ForwardBatch) -> None:

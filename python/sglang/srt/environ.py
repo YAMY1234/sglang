@@ -526,6 +526,11 @@ class Envs:
     SGLANG_OPT_PLE_PREFILL_FUSED_GATE = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # Qwen4 PLE target verify: the per-row layout, state slots and N-gram windows of
+    # _prepare_ple_batch's ~20 small torch ops written by one kernel (same tensors).
+    SGLANG_OPT_PLE_VERIFY_PREPARE_BATCHED = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     # The EAGLE post-verify graph pool's first capture takes the sampling scratch of the
     # largest decode-graph batch and frees it, so later batch sizes split that segment
     # instead of each adding one the private pool keeps.

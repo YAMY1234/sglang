@@ -161,6 +161,125 @@ class TestPLEStateCoordinates(unittest.TestCase):
         )
         self.assertEqual(storage.accounting_violations(), [])
 
+    def test_batched_verify_prepare_takes_the_physical_state_slots(self):
+        """SGLANG_OPT_PLE_VERIFY_PREPARE_BATCHED hands the kernel the request table's
+        slots and the state id space's table, and its layout is the torch branch's."""
+        for moved in (False, True):
+            with self.subTest(moved=moved):
+                self._check_batched_verify(moved)
+
+    def _check_batched_verify(self, moved):
+        from sglang.kernels.ops.embeddings import qwen4_ple_verify_prepare as prepare
+        from sglang.srt.models.qwen4_exp import _prepare_ple_batch
+
+        storage, _, _ = _build(state=True, ple=True)
+        alloc = storage.allocator
+        pool = alloc.get_kvcache()
+        alloc.state.bind_routes(pool.layer_router)
+        slots = alloc.state_slots.alloc(8)
+        if moved:
+            alloc.state_slots.free(slots[:4])
+            alloc.mamba_allocator.flush_for_allocation()
+        req = storage.requests
+        req.req_index_to_mamba_index_mapping[1] = slots[-1]
+        req.req_index_to_mamba_index_mapping[2] = slots[-2]
+        reader = RunnerIds(
+            req_to_token=req.req_to_token,
+            token_to_kv_pool_allocator=alloc,
+            token_to_kv_pool=pool,
+            page_size=4,
+            device="cpu",
+        )
+        ngram = alloc.state.ngram_pool
+        ngram.context.copy_(
+            torch.arange(ngram.context.shape[0])[:, None] * 100
+            + torch.tensor([11, 12, 13])
+        )
+        # Two requests of four draft tokens; the second is a short eager row and
+        # the third is graph padding (all locations zero).
+        fb = ForwardBatch(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            batch_size=3,
+            input_ids=torch.arange(40, 52),
+            req_pool_indices=torch.tensor([1, 2, 0]),
+            seq_lens=torch.tensor([9, 9, 1]),
+            seq_lens_sum=19,
+            seq_lens_cpu=torch.tensor([9, 9, 1]),
+            out_cache_loc=torch.tensor([5, 6, 7, 8, 9, 10, 11, 12, 0, 0, 0, 0]),
+            extend_seq_lens=torch.tensor([4, 2, 4]),
+            spec_info=SimpleNamespace(draft_token_num=4, topk=1),
+        )
+        launched = []
+
+        def reference(tokens, lengths, requests, locs, slot_map, v2p, history, w, eos):
+            launched.append(v2p)
+            n = requests.numel()
+            rows = torch.arange(n * w)
+            req_rows, offsets = rows // w, rows % w
+            lens = lengths.long()
+            valid = offsets < lens[req_rows]
+            live = lens.ne(0) & locs.view(n, w).ne(0).any(1)
+            state = slot_map[requests.long()].long()
+            state = state if v2p is None else v2p[state].long()
+            state = torch.where(live, state, 0)
+            padded = torch.where(valid, tokens, eos).view(n, w)
+            context = torch.cat((history[state], padded), 1)
+            return prepare.VerifyPLELayout(
+                lens,
+                req_rows,
+                offsets,
+                valid,
+                state if v2p is None else state.int(),
+                context,
+                context.unfold(1, history.shape[1] + 1, 1)[req_rows, offsets],
+            )
+
+        ctx = ForwardContext(
+            attn_backend=SimpleNamespace(
+                req_to_token_pool=req, token_to_kv_pool=pool, runner_ids=reader
+            )
+        )
+        batches = []
+        for batched in (False, True):
+            with (
+                forward_context(ctx),
+                envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+                envs.SGLANG_OPT_PLE_VERIFY_PREPARE_BATCHED.override(batched),
+                patch.object(prepare, "can_prepare", lambda *args: True),
+                patch.object(prepare, "prepare_verify_layout", reference),
+            ):
+                batches.append(
+                    _prepare_ple_batch(
+                        fb.input_ids, fb, ngram_size=4, ngram_eos_token_id=17
+                    )
+                )
+                cached = req.ple_window_cache
+        self.assertEqual(len(launched), 1)
+        # The chain allocator names state slots through its table, moved or not.
+        self.assertIs(launched[0], alloc.mamba_allocator.ids.virtual_to_physical)
+        stock, fused = batches
+        for name in (
+            "lengths",
+            "req_indices",
+            "token_offsets",
+            "valid_tokens",
+            "state_indices",
+            "ngram_context",
+        ):
+            a, b = getattr(stock, name), getattr(fused, name)
+            self.assertEqual(a.dtype, b.dtype, name)
+            self.assertTrue(torch.equal(a, b), name)
+        self.assertEqual(fused.row_width, 4)
+        self.assertIs(cached[0], fused)
+        expected = stock.ngram_context.unfold(1, 4, 1)[
+            stock.req_indices, stock.token_offsets
+        ]
+        self.assertTrue(torch.equal(cached[1], expected))
+        self.assertEqual(
+            fused.state_indices.tolist()[:2],
+            alloc.mamba_allocator.ids.translate(slots[[-1, -2]]).tolist(),
+        )
+
     def test_ascend_graph_metadata_checkpoints_static_ple_state(self):
         """Capture and replay save both PLE parts to the recurrent checkpoint rows."""
         from sglang.srt.mem_cache.kv.decl import STATE_PART

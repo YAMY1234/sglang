@@ -76,3 +76,14 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+register_kernel(
+    KernelSpec(
+        op="embeddings.qwen4_ple_verify_prepare",
+        backend=KernelBackend.TRITON,
+        target=(
+            "sglang.kernels.ops.embeddings.qwen4_ple_verify_prepare:"
+            "prepare_verify_layout"
+        ),
+        capabilities=CUDA_ONLY,
+    )
+)
