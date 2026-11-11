@@ -626,6 +626,13 @@ def test_fp8_union_declared_only_when_enabled():
             assert {s.variant for s in union_signatures(widths)} == {16}
             with envs.SGLANG_QSA_FP8_POOL_VERIFY_WS.override(True):
                 assert {s.variant for s in union_signatures(widths)} == {16 | 64}
+                with envs.SGLANG_QSA_FP8_POOL_VERIFY_WS_PDL.override(True):
+                    assert {s.variant for s in union_signatures(widths)} == {
+                        16 | 64 | 128
+                    }
+            # PDL rides only the warp-specialized kernel.
+            with envs.SGLANG_QSA_FP8_POOL_VERIFY_WS_PDL.override(True):
+                assert {s.variant for s in union_signatures(widths)} == {16}
         with (
             envs.SGLANG_QSA_FP8_POOL_VERIFY_UNION_WARPS.override(12),
             pytest.raises(ValueError, match="UNION_WARPS"),

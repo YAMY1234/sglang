@@ -352,6 +352,8 @@ class Envs:
     # The warp-specialized kernel's split count (1..16); None keeps the source plan (the
     # most splits within one wave, at most 4).
     SGLANG_QSA_FP8_POOL_VERIFY_WS_SPLITS = EnvInt(None)
+    # PDL into the warp-specialized kernel (it waits on kernel U after its setup).
+    SGLANG_QSA_FP8_POOL_VERIFY_WS_PDL = EnvBool(False)
     # TP1 BF16-pool target verify: the attention output gate rides the pool attention's
     # split-K merge (fused_sigmoid_mul's arithmetic, so the same bits).
     SGLANG_ENABLE_QSA_POOL_MERGE_GATE = EnvBool(False)
