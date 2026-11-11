@@ -430,7 +430,8 @@ def test_prestore_and_real_row_map_fallback_preserve_identity():
 
 
 def test_source_m4_tcgen_flag_does_not_veto_the_pool_offer(monkeypatch):
-    # The source TCGEN05 M4 core has no provider; its flag must not leave M4 stock.
+    # The source TCGEN05 M4 core is a separate direct variant; its flag must not
+    # leave the pool's M4 offer stock.
     monkeypatch.setenv("Q38_ATTN_CORE_V1", "1")
     obj, args = state(4, 4)
     for graph in (True, False):
@@ -499,6 +500,123 @@ def test_tp4_specialized_success_precedes_pool_and_fallback():
             *args[:6], output_gate=torch.zeros_like(args[0])
         )
     assert result is chosen and applied is True
+
+
+def direct_call(args, gate):
+    q, k, v, layer, batch, indices, kp, vp, loc, width, metadata = args
+    return (q, k, v, layer, batch, indices, gate, kp, vp, loc, width, metadata)
+
+
+def tcgen05_declared(tp_size, rows=(1, 4, 8, 32, 64)):
+    with patch.object(model, "get_parallel", return_value=NS(tp_size=tp_size)):
+        declared = attention().numeric_signatures(rows, 4)
+    return {
+        (s.rows, s.query_heads, s.kv_heads)
+        for s in declared
+        if s.operation == api.NumericOperation.DIRECT_POOL_ATTENTION
+        and s.variant == policy.DIRECT_TCGEN05_CORE
+    }
+
+
+@pytest.mark.parametrize("tp_size,expected", [(1, {(4, 24, 2)}), (4, set())])
+def test_tcgen05_core_declares_only_the_tp1_width4_verify(
+    monkeypatch, tp_size, expected
+):
+    assert tcgen05_declared(tp_size) == set()
+    monkeypatch.setenv("Q38_ATTN_CORE_V1", "1")
+    assert tcgen05_declared(tp_size) == expected
+
+
+@pytest.mark.parametrize(
+    "flags,looked_up",
+    [
+        ((), []),
+        (("SGLANG_Q38_ATTN_CORE_TP4",), [0]),
+        (("Q38_ATTN_CORE_V1",), [policy.DIRECT_TCGEN05_CORE]),
+        (
+            ("SGLANG_Q38_ATTN_CORE_TP4", "Q38_ATTN_CORE_V1"),
+            [0, policy.DIRECT_TCGEN05_CORE],
+        ),
+    ],
+)
+def test_direct_core_asks_each_enabled_source_variant(monkeypatch, flags, looked_up):
+    for name in flags:
+        monkeypatch.setenv(name, "1")
+    obj, args = state(4, 4)
+    gate = torch.zeros((4, 6144), dtype=torch.bfloat16).as_subclass(DeviceMetadata)
+    asked = []
+
+    def lookup(signature, *, prepared):
+        asked.append((signature.variant, prepared))
+        return None
+
+    with patch.object(numeric_binding, "numeric_operator", side_effect=lookup):
+        assert obj._try_numeric_direct_attention(*direct_call(args, gate)) is None
+    assert asked == [(variant, True) for variant in looked_up]
+
+
+@pytest.mark.parametrize("tp4_flag", [False, True])
+@pytest.mark.parametrize("gate_shape", [(4, 6144), (4, 24, 256)])
+def test_tcgen05_core_runs_the_startup_offer_on_two_head_scratch(
+    monkeypatch, tp4_flag, gate_shape
+):
+    if tp4_flag:
+        # Its TP4-only declaration has no TP1 offer; the TCGEN05 core still binds.
+        monkeypatch.setenv("SGLANG_Q38_ATTN_CORE_TP4", "1")
+    monkeypatch.setenv("Q38_ATTN_CORE_V1", "1")
+    obj, args = state(4, 4)
+    gate = torch.zeros(gate_shape, dtype=torch.bfloat16).as_subclass(DeviceMetadata)
+    seen = []
+
+    def run(io):
+        seen.append(io)
+        io.output.fill_(3)
+
+    registry = api.NumericRegistry()
+    for signature in numeric_binding.collect_numeric_signatures(
+        (attention(),), (4,), 4
+    ):
+        if signature.operation == api.NumericOperation.DIRECT_POOL_ATTENTION:
+            registry.register(api.NumericOffer(signature, run))
+    with patch.object(numeric_binding, "numeric_registry", registry):
+        output = obj._try_numeric_direct_attention(*direct_call(args, gate))
+    assert output.shape == (4, 6144) and bool(torch.all(output == 3))
+    (io,) = seen
+    assert io.gate is gate and io.store_new_kv is True and io.query_width == 4
+    assert io.q.shape == (4, 24, 256) and io.kv.k is args[6]
+    assert io.scratch_out.dtype == torch.float32
+    assert io.scratch_out.numel() == 4 * 2 * 33 * 16 * (256 + 2)
+    assert io.selection.selected_indices.dtype == torch.int32
+
+
+@pytest.mark.parametrize(
+    "change", ["rows8", "no_graph", "decode", "topk2", "float_kv", "no_positions"]
+)
+def test_tcgen05_core_keeps_the_source_eligibility(monkeypatch, change):
+    monkeypatch.setenv("Q38_ATTN_CORE_V1", "1")
+    rows = 8 if change == "rows8" else 4
+    obj, args = state(rows, 4)
+    metadata, batch = args[-1], args[4]
+    if change == "no_graph":
+        metadata.is_cuda_graph = False
+    elif change == "decode":
+        batch.forward_mode = ForwardMode.DECODE
+    elif change == "topk2":
+        batch.spec_info.topk = 2
+    elif change == "float_kv":
+        args[6], args[7] = args[6].float(), args[7].float()
+    elif change == "no_positions":
+        metadata.indexer_metadata = NS(decode_logical_positions=None)
+    gate = torch.zeros((rows, 6144), dtype=torch.bfloat16).as_subclass(DeviceMetadata)
+    asked = []
+
+    def lookup(signature, *, prepared):
+        asked.append(prepared)
+        return None
+
+    with patch.object(numeric_binding, "numeric_operator", side_effect=lookup):
+        assert obj._try_numeric_direct_attention(*direct_call(args, gate)) is None
+    assert asked == [False]
 
 
 @pytest.mark.parametrize("rows", range(1, 65))

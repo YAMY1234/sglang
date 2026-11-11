@@ -228,6 +228,12 @@ def contract_geometry(s):
                     and s.variant == 0
                     and s.rows == 4
                 )
+                # Bit 4: the TP1 TCGEN05 width-4 verify core.
+                or (
+                    (s.query_heads, s.kv_heads) == (24, 2)
+                    and s.variant == 16
+                    and s.rows == 4
+                )
             )
         )
     if isinstance(s, RouterQuantSignature):

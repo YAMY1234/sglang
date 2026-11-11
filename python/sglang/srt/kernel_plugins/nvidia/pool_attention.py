@@ -81,6 +81,9 @@ _UNION_WS_PDL = 1 << 7
 UNION_FP8_KV_WRITE = 1 << 8
 # DIRECT_POOL_ATTENTION variant bit 2: the output gate rides the split-K merge.
 POOL_MERGE_GATE = 1 << 2
+# DIRECT_POOL_ATTENTION variant bit 4: the source's Q38_ATTN_CORE_V1 TP1 TCGEN05
+# width-4 verify core, output gate in its merge (bits 0-3 stay the pool's).
+DIRECT_TCGEN05_CORE = 1 << 4
 
 
 def verify_variant():

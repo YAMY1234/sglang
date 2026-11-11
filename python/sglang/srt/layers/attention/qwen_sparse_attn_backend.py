@@ -2001,6 +2001,9 @@ class QwenSparseAttnBackend(AttentionBackend):
             ScalarType,
         )
         from sglang.srt.kernel_plugins.nvidia.numeric_binding import numeric_operator
+        from sglang.srt.kernel_plugins.nvidia.pool_attention import (
+            DIRECT_TCGEN05_CORE,
+        )
 
         if indices.ndim != 2:
             return None
@@ -2013,75 +2016,91 @@ class QwenSparseAttnBackend(AttentionBackend):
             None if indexer is None else indexer.decode_logical_positions
         )
         slot_map = self.req_to_token_pool.req_to_token
-        enabled = get_bool_env_var("SGLANG_Q38_ATTN_CORE_TP4", "False")
-        run = numeric_operator(
-            NumericSignature(
-                NumericOperation.DIRECT_POOL_ATTENTION,
-                rows,
-                layer.tp_q_head_num,
-                key_pool.shape[1],
-                layer.head_dim,
-                indices.shape[1],
-                self.compress_ratio,
-                ScalarType.BF16,
-            ),
-            prepared=(
-                enabled
-                and forward_batch.forward_mode.is_target_verify()
-                and int(getattr(forward_batch.spec_info, "topk", 1) or 1) == 1
-                and rows == width == 4
-                and metadata.is_cuda_graph
-                and self._uses_block_indices(indices)
-                and indices.shape == (rows, self.qsa_profile.block_topk)
-                and layer.tp_q_head_num > 0
-                and layer.head_dim > 0
-                and key_pool.shape[1] > 0
-                and key_pool.dtype
-                == value_pool.dtype
-                == q.dtype
-                == gate.dtype
-                == torch.bfloat16
-                and q.is_cuda
-                and gate.is_cuda
-                and q.numel() == rows * layer.tp_q_head_num * layer.head_dim
-                and tuple(gate.shape)
-                in (
-                    (rows, layer.tp_q_head_num, layer.head_dim),
-                    (rows, layer.tp_q_head_num * layer.head_dim),
-                )
-                and gate.stride(-1) == 1
-                and slot_map.ndim == 2
-                and slot_map.stride(1) == 1
-                and slot_map.dtype in (torch.int32, torch.int64)
-                and row_requests.numel() == rows
-                and logical_positions is not None
-                and logical_positions.numel() == rows
-                and all(
-                    x.device == q.device
-                    for x in (
-                        key_pool,
-                        value_pool,
-                        k,
-                        v,
-                        locations,
-                        indices,
-                        gate,
-                        row_requests,
-                        metadata.sequence_lengths,
-                        logical_positions,
-                        slot_map,
-                    )
-                )
-                and k.dtype == v.dtype == torch.bfloat16
-            ),
+        # Source switches: the TP4 core, and Q38_ATTN_CORE_V1's TP1 TCGEN05 core. Only
+        # the variant the plugin admitted for this TP size at startup has an offer.
+        cores = tuple(
+            variant
+            for variant, name in (
+                (0, "SGLANG_Q38_ATTN_CORE_TP4"),
+                (DIRECT_TCGEN05_CORE, "Q38_ATTN_CORE_V1"),
+            )
+            if get_bool_env_var(name, "False")
         )
+        eligible = bool(
+            cores
+            and forward_batch.forward_mode.is_target_verify()
+            and int(getattr(forward_batch.spec_info, "topk", 1) or 1) == 1
+            and rows == width == 4
+            and metadata.is_cuda_graph
+            and self._uses_block_indices(indices)
+            and indices.shape == (rows, self.qsa_profile.block_topk)
+            and layer.tp_q_head_num > 0
+            and layer.head_dim > 0
+            and key_pool.shape[1] > 0
+            and key_pool.dtype
+            == value_pool.dtype
+            == q.dtype
+            == gate.dtype
+            == torch.bfloat16
+            and q.is_cuda
+            and gate.is_cuda
+            and q.numel() == rows * layer.tp_q_head_num * layer.head_dim
+            and tuple(gate.shape)
+            in (
+                (rows, layer.tp_q_head_num, layer.head_dim),
+                (rows, layer.tp_q_head_num * layer.head_dim),
+            )
+            and gate.stride(-1) == 1
+            and slot_map.ndim == 2
+            and slot_map.stride(1) == 1
+            and slot_map.dtype in (torch.int32, torch.int64)
+            and row_requests.numel() == rows
+            and logical_positions is not None
+            and logical_positions.numel() == rows
+            and all(
+                x.device == q.device
+                for x in (
+                    key_pool,
+                    value_pool,
+                    k,
+                    v,
+                    locations,
+                    indices,
+                    gate,
+                    row_requests,
+                    metadata.sequence_lengths,
+                    logical_positions,
+                    slot_map,
+                )
+            )
+            and k.dtype == v.dtype == torch.bfloat16
+        )
+        run = None
+        for variant in cores:
+            run = numeric_operator(
+                NumericSignature(
+                    NumericOperation.DIRECT_POOL_ATTENTION,
+                    rows,
+                    layer.tp_q_head_num,
+                    key_pool.shape[1],
+                    layer.head_dim,
+                    indices.shape[1],
+                    self.compress_ratio,
+                    ScalarType.BF16,
+                    variant=variant,
+                ),
+                prepared=eligible,
+            )
+            if run is not None:
+                break
         if run is None:
             return None
         q = q.reshape(rows, layer.tp_q_head_num, layer.head_dim)
         output = torch.empty_like(q)
-        # Exact raw implementation layout: 33 tiles, 16 query lanes, two stats.
+        # Exact raw implementation layout: 33 tiles per KV head, 16 query lanes, two stats.
         scratch = torch.empty(
             rows
+            * key_pool.shape[1]
             * (
                 (indices.shape[1] * self.compress_ratio + self.compress_ratio - 1 + 63)
                 // 64

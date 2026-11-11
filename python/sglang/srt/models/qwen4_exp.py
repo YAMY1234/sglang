@@ -1932,22 +1932,31 @@ class Qwen4ExpAttentionDecoderLayer(
 
         if not self.is_qsa:
             return ()
+        from sglang.srt.kernel_plugins.nvidia.pool_attention import (
+            DIRECT_TCGEN05_CORE,
+        )
+
         signatures = []
-        if get_bool_env_var("SGLANG_Q38_ATTN_CORE_TP4", "False"):
-            signatures.extend(
-                NumericSignature(
-                    NumericOperation.DIRECT_POOL_ATTENTION,
-                    rows,
-                    self.num_heads,
-                    self.num_kv_heads,
-                    self.head_dim,
-                    self.indexer.block_topk,
-                    self.indexer.compress_ratio,
-                    ScalarType.BF16,
+        for variant, name in (
+            (0, "SGLANG_Q38_ATTN_CORE_TP4"),
+            (DIRECT_TCGEN05_CORE, "Q38_ATTN_CORE_V1"),
+        ):
+            if get_bool_env_var(name, "False"):
+                signatures.extend(
+                    NumericSignature(
+                        NumericOperation.DIRECT_POOL_ATTENTION,
+                        rows,
+                        self.num_heads,
+                        self.num_kv_heads,
+                        self.head_dim,
+                        self.indexer.block_topk,
+                        self.indexer.compress_ratio,
+                        ScalarType.BF16,
+                        variant=variant,
+                    )
+                    for rows in widths
+                    if rows > 0
                 )
-                for rows in widths
-                if rows > 0
-            )
         if envs.SGLANG_ENABLE_QSA_TMA_PREFILL.get():
             # One declaration for every prefill length; rows vary per call.
             signatures.append(
@@ -2165,7 +2174,10 @@ class Qwen4ExpAttentionDecoderLayer(
             and q.is_cuda
             and q.shape[0] == 4
             and forward_batch.forward_mode.is_target_verify()
-            and get_bool_env_var("SGLANG_Q38_ATTN_CORE_TP4", "False")
+            and (
+                get_bool_env_var("SGLANG_Q38_ATTN_CORE_TP4", "False")
+                or get_bool_env_var("Q38_ATTN_CORE_V1", "False")
+            )
             and get_bool_env_var("Q38_ATTN_GATE_V2", "False")
         ):
             attention_kwargs["numeric_output_gate"] = gate
