@@ -685,11 +685,13 @@ class GdnUcacheVerifier:
         num_draft_tokens: int,
         request_rows: Optional[torch.Tensor] = None,
         fused_conv=None,
+        fused_norm=None,
     ) -> torch.Tensor:
         """Returns the verify output in ``value``'s shape; padded rows are zero.
         ``request_rows`` (the batch's request-table rows) index the rings under
         ``by_request_row``. ``fused_conv`` (a GdnFusedConv, ``fused_conv_capable`` only): the
-        launch computes query / key / value, views of one [B, T, D] conv output, itself."""
+        launch computes query / key / value, views of one [B, T, D] conv output, itself.
+        ``fused_norm`` (a GdnFusedNorm, same kernel): the output is the gated RMSNorm of it."""
         num_v_heads, head_v_dim = value.shape[-2], value.shape[-1]
         num_k_heads, head_k_dim = key.shape[-2], key.shape[-1]
         batch = value.numel() // (num_draft_tokens * num_v_heads * head_v_dim)
@@ -751,6 +753,7 @@ class GdnUcacheVerifier:
             **({"row_order": self._row_order} if self._options.flush_first else {}),
             **({"ring_indices": rows.ring_rows} if self._by_request_row else {}),
             **({"fused_conv": fused_conv} if fused_conv is not None else {}),
+            **({"fused_norm": fused_norm} if fused_norm is not None else {}),
         )
         return output.reshape(value.shape)
 
@@ -766,11 +769,13 @@ class GdnUcacheVerifier:
         flush_min: int,
         max_eager_batch_size: int = 0,
         fused_conv: bool = False,
+        fused_norm_max_batch: int = 0,
     ) -> None:
         """Compiles the kernels, allocates the shared buffers and builds
         FlashInfer's per-batch-size helper tensors eagerly, so CUDA graph capture
-        creates none of them; with ``fused_conv``, those builds too. The shared buffers
-        also cover ``max_eager_batch_size`` so a later eager batch does not outgrow them."""
+        creates none of them; with ``fused_conv`` / ``fused_norm_max_batch`` (> 0), those
+        builds too. The shared buffers also cover ``max_eager_batch_size`` so a later eager
+        batch does not outgrow them."""
         num_k_heads, head_k_dim = k_ring.shape[1], k_ring.shape[3]
         num_v_heads, head_v_dim = u_ring.shape[1], u_ring.shape[3]
         device = state.device
@@ -834,7 +839,7 @@ class GdnUcacheVerifier:
                 **({"row_order": order[:batch]} if self._options.flush_first else {}),
                 **({"ring_indices": ring_rows[:batch]} if self._by_request_row else {}),
             )
-        if fused_conv and self.fused_conv_capable:
+        if (fused_conv or fused_norm_max_batch > 0) and self.fused_conv_capable:
             self._warm_up_fused(
                 q=q,
                 k=k,
@@ -851,6 +856,8 @@ class GdnUcacheVerifier:
                 order=order,
                 ring_rows=ring_rows,
                 flush_min=flush_min,
+                fused_conv=fused_conv,
+                fused_norm_max_batch=fused_norm_max_batch,
             )
 
     def _warm_up_fused(
@@ -871,11 +878,14 @@ class GdnUcacheVerifier:
         order,
         ring_rows,
         flush_min,
+        fused_conv,
+        fused_norm_max_batch,
     ) -> None:
-        """The conv-prologue builds (SGLANG_OPT_GDN_UCACHE_FUSED_CONV) at every batch size that
-        takes them. Every row is padded, so the launches touch no buffer."""
+        """The conv-prologue / gated-norm builds (SGLANG_OPT_GDN_UCACHE_FUSED_CONV / _NORM) at
+        every batch size that takes them. Every row is padded, so the launches touch no buffer."""
         from sglang.kernels.ops.attention.linear.gdn_ucache_rubin.gdn_replay_mtp_umma_rubin import (
             GdnFusedConv,
+            GdnFusedNorm,
             fused_conv_unsupported_reason,
         )
 
@@ -890,6 +900,8 @@ class GdnUcacheVerifier:
         weight = torch.zeros(D, 4, dtype=bf16, device=device)
         conv_state = torch.zeros(1, D, 3, dtype=bf16, device=device)
         win_rows = torch.zeros(max_batch, dtype=torch.int32, device=device)
+        z_all = torch.zeros(max_batch * T, HV, q.shape[3], dtype=bf16, device=device)
+        norm_w = torch.zeros(q.shape[3], dtype=bf16, device=device)
         built = 0
         for batch in range(1, max_batch + 1):
             fc = GdnFusedConv(
@@ -900,9 +912,18 @@ class GdnUcacheVerifier:
                 window_indices=win_rows[:batch],
             )
             if (
-                fused_conv_unsupported_reason(fc, num_k_heads=H, num_v_heads=HV)
+                not fused_conv
+                or fused_conv_unsupported_reason(fc, num_k_heads=H, num_v_heads=HV)
                 is not None
             ):
+                fc = None
+            fn = (
+                GdnFusedNorm(z=z_all[: batch * T], weight=norm_w, eps=1e-6)
+                if batch <= fused_norm_max_batch
+                and gdn_ucache_fused_norm_applies(batch * T * HV, device)
+                else None
+            )
+            if fc is None and fn is None:
                 continue
             built += 1
             self._flush_kernel(
@@ -922,13 +943,17 @@ class GdnUcacheVerifier:
                 cache_base=cursor[:batch],
                 flush_min=flush_min,
                 restart_hist_on_flush=False,
-                fused_conv=fc,
+                **({"fused_conv": fc} if fc is not None else {}),
+                **({"fused_norm": fn} if fn is not None else {}),
                 **self._kernel_kwargs,
                 **({"row_order": order[:batch]} if self._options.flush_first else {}),
                 **({"ring_indices": ring_rows[:batch]} if self._by_request_row else {}),
             )
         logger.info(
-            "SGLANG_OPT_GDN_UCACHE_FUSED_CONV: flush builds warmed at %d of %d batch sizes",
+            "SGLANG_OPT_GDN_UCACHE_FUSED_CONV / _NORM (%s / up to batch %d): flush builds warmed "
+            "at %d of %d batch sizes",
+            fused_conv,
+            fused_norm_max_batch,
             built,
             max_batch,
         )
@@ -1060,6 +1085,15 @@ class GdnUcacheVerifier:
         _refresh_gate_params_kernel[(len(self._gate_refresh),)](
             src_ptrs, dst_ptrs, numel, BLOCK=triton.next_power_of_2(numel)
         )
+
+
+def gdn_ucache_fused_norm_applies(rows: int, device) -> bool:
+    """SGLANG_OPT_GDN_UCACHE_FUSED_NORM: the flush epilogue reduces a 128-wide row as 16
+    threads x 8 elements, which is the stock gated-norm launch's order once it holds >= 2 rows per
+    program (verify B >= 3); smaller verifies keep the separate norm."""
+    from sglang.kernels.ops.attention.fla.layernorm_gated import calc_rows_per_block
+
+    return calc_rows_per_block(rows, device) >= 2
 
 
 def _flush_first_order(*, hist_len: torch.Tensor, flush_min: int) -> torch.Tensor:

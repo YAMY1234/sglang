@@ -529,6 +529,12 @@ class Envs:
     # inside the u-cache flush kernel, each (key head, row) CTA convolving its own q / k / v
     # channels before it reads them; launches whose CTAs split a key head keep the separate conv.
     SGLANG_OPT_GDN_UCACHE_FUSED_CONV = EnvRuntimeBool(False)
+    # The same flush launch applies the verify's gated RMSNorm to its output before storing it
+    # (16-lane x 8-row partial sums, as the Triton norm reduces a 128-wide row; not shown bitwise).
+    SGLANG_OPT_GDN_UCACHE_FUSED_NORM = EnvRuntimeBool(False)
+    # Verify batches above this keep the separate norm: measured VR200 chain, the fold is faster at
+    # B 32 / 48 and slower from B 60 (the per-head barrier sits on the flush's critical path).
+    SGLANG_GDN_UCACHE_FUSED_NORM_MAX_BATCH = EnvInt(48)
 
     # ===================================================================
     # Model configuration, discovery, and weight loading

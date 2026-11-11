@@ -184,6 +184,7 @@ _qknorm_use_alt_stream = _is_cuda or (
 _gdn_decode_fused_proj_conv = (
     _is_cuda and envs.SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV.get()
 )
+_GDN_UCACHE_FUSED_NORM = envs.SGLANG_OPT_GDN_UCACHE_FUSED_NORM.get()
 _gdn_online_mxfp4 = (
     ("in_proj_qkvz", "out_proj")
     if envs.SGLANG_ROCM_GDN_ONLINE_MXFP4.get() and _use_aiter and _is_gfx95
@@ -1031,12 +1032,39 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
             mixed_qkv = torch.cat((query, key, value), dim=-1)
 
-        attn_result = self.attn(
-            forward_batch,
-            mixed_qkv=mixed_qkv,
-            a=a,
-            b=b,
-        )
+        if (
+            _GDN_UCACHE_FUSED_NORM
+            and forward_batch.forward_mode.is_target_verify()
+            and not use_fused_proj_conv
+            and z is not None
+            and self.norm.group_size is None
+            and self.norm.bias is None
+            and self.norm.norm_before_gate
+            and self.norm.activation == "sigmoid"
+        ):
+            from sglang.srt.model_executor.forward_context import get_attn_backend
+
+            # SGLANG_OPT_GDN_UCACHE_FUSED_NORM: the u-cache flush may apply self.norm itself;
+            # it then returns (normalized output, True)
+            attn_result = get_attn_backend().forward(
+                layer=self.attn,
+                forward_batch=forward_batch,
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+                gdn_ucache_norm=(z, self.norm.weight, self.norm.eps),
+            )
+            if isinstance(attn_result, tuple):
+                # [tokens, HV, V] rows, gated and normalized
+                normalized = attn_result[0]
+                return self.out_proj(normalized.reshape(hidden_states.shape[0], -1))[0]
+        else:
+            attn_result = self.attn(
+                forward_batch,
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+            )
         if use_fused_proj_conv:
             if not isinstance(attn_result, tuple) or len(attn_result) != 2:
                 raise RuntimeError(

@@ -717,6 +717,27 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
         self._ucache_fused_conv_enabled = self._ucache_fused_conv_supported()
         self._ucache_fused_conv_logged: set = set()
+        self._ucache_fused_norm_enabled = (
+            envs.SGLANG_OPT_GDN_UCACHE_FUSED_NORM.get()
+            and not self.is_draft_worker
+            and self._gdn_ucache_verifier is not None
+            and self._gdn_ucache_verifier.fused_conv_capable
+        )
+        if (
+            envs.SGLANG_OPT_GDN_UCACHE_FUSED_NORM.get()
+            and not self._ucache_fused_norm_enabled
+            and not self.is_draft_worker
+        ):
+            logger.warning(
+                "SGLANG_OPT_GDN_UCACHE_FUSED_NORM not taken: needs --enable-gdn-replayssm-ucache "
+                "and the SM107 flush with SGLANG_OPT_GDN_UCACHE_STRIDED_QKV=1 and _PDL=1"
+            )
+        self._ucache_fused_norm_max_batch = (
+            envs.SGLANG_GDN_UCACHE_FUSED_NORM_MAX_BATCH.get()
+            if self._ucache_fused_norm_enabled
+            else 0
+        )
+        self._ucache_fused_norm_logged = False
 
     def _ucache_fused_conv_supported(self) -> bool:
         if not envs.SGLANG_OPT_GDN_UCACHE_FUSED_CONV.get() or self.is_draft_worker:
@@ -787,6 +808,53 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
         return fused if reason is None else None
 
+    def _ucache_fused_norm(
+        self,
+        *,
+        norm: Optional[tuple],
+        num_tokens: int,
+        num_draft_tokens: int,
+        num_v_heads: int,
+    ):
+        """The GdnFusedNorm for this verify's flush, or None (the model runs its gated norm): the
+        model passes ``norm`` = (z, weight, eps); T <= 4 and verifies whose separate norm reduces a
+        row as 16 threads x 8 elements (B >= 3), up to SGLANG_GDN_UCACHE_FUSED_NORM_MAX_BATCH."""
+        if (
+            norm is None
+            or not self._ucache_fused_norm_enabled
+            or num_draft_tokens > 4
+            or num_tokens > num_draft_tokens * self._ucache_fused_norm_max_batch
+        ):
+            return None
+        from sglang.kernels.ops.attention.linear.gdn_ucache_rubin.gdn_replay_mtp_umma_rubin import (
+            GdnFusedNorm,
+            fused_norm_unsupported_reason,
+        )
+        from sglang.srt.layers.attention.linear.gdn_replayssm_ucache import (
+            gdn_ucache_fused_norm_applies,
+        )
+
+        z, weight, eps = norm
+        if not gdn_ucache_fused_norm_applies(num_tokens * num_v_heads, z.device):
+            return None
+        fused = GdnFusedNorm(z=z, weight=weight, eps=float(eps))
+        reason = fused_norm_unsupported_reason(
+            fused,
+            batch=num_tokens // num_draft_tokens,
+            T=num_draft_tokens,
+            HV=num_v_heads,
+        )
+        if not self._ucache_fused_norm_logged:
+            self._ucache_fused_norm_logged = True
+            logger.info(
+                "SGLANG_OPT_GDN_UCACHE_FUSED_NORM %s (first verify %d tokens)",
+                "engaged: the u-cache flush stores the gated RMSNorm of its output"
+                if reason is None
+                else f"not taken: {reason}",
+                num_tokens,
+            )
+        return fused if reason is None else None
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         super().init_cuda_graph_state(max_bs, max_num_tokens)
         if self._gdn_ucache_verifier is not None and not self.is_draft_worker:
@@ -801,6 +869,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 flush_min=gdn_ucache.flush_min,
                 max_eager_batch_size=self.req_to_token_pool.size,
                 fused_conv=self._ucache_fused_conv_enabled,
+                fused_norm_max_batch=self._ucache_fused_norm_max_batch,
             )
 
     def supports_prefill_graph_extend(self) -> bool:
@@ -1628,6 +1697,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # verify, fold on commit), circular ring, or the snapshotting
             # fallback when neither ring is allocated.
             if self._gdn_ucache is not None:
+                ucache_fused_norm = self._ucache_fused_norm(
+                    norm=kwargs.get("gdn_ucache_norm"),
+                    num_tokens=seq_len,
+                    num_draft_tokens=forward_batch.spec_info.draft_token_num,
+                    num_v_heads=layer.num_v_heads,
+                )
                 core_attn_out = self._gdn_ucache_target_verify(
                     layer=layer,
                     query=query,
@@ -1641,7 +1716,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     retrieve_parent_token=retrieve_parent_token,
                     request_rows=forward_batch.req_pool_indices,
                     fused_conv=ucache_fused_conv,
+                    fused_norm=ucache_fused_norm,
                 )
+                if ucache_fused_norm is not None:
+                    # the model skips its gated norm on this (output, True)
+                    core_attn_out = (core_attn_out, True)
             elif use_replayssm_fold:
                 core_attn_out = self._replayssm_fold_target_verify(
                     layer=layer,
@@ -1923,6 +2002,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         retrieve_parent_token: Optional[torch.Tensor],
         request_rows: torch.Tensor,
         fused_conv=None,
+        fused_norm=None,
     ) -> torch.Tensor:
         assert retrieve_parent_token is None, (
             "GDN u-cache verify supports linear draft chains only (topk == 1)."
@@ -1948,6 +2028,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             num_draft_tokens=num_draft_tokens,
             request_rows=request_rows if gdn_ucache.by_request_row else None,
             fused_conv=fused_conv,
+            fused_norm=fused_norm,
         )
 
     def _replayssm_fold_target_verify(

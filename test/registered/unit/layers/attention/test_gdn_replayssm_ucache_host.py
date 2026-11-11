@@ -202,6 +202,41 @@ class TestGdnUcacheHost(CustomTestCase):
                 )
             )
 
+    def test_fused_norm_bounds(self):
+        """The model's gated norm stays separate without a norm, when off, above T 4 and
+        above SGLANG_GDN_UCACHE_FUSED_NORM_MAX_BATCH verify rows."""
+        backend = self._verify_backend()
+        backend._ucache_fused_norm_max_batch = 48
+        norm = (torch.zeros(4, HV, V), torch.zeros(V), 1e-6)
+        for enabled, norm_arg, tokens, T in (
+            (True, None, 16, 4),
+            (False, norm, 16, 4),
+            (True, norm, 40, 8),
+            (True, norm, 4 * 49, 4),
+        ):
+            backend._ucache_fused_norm_enabled = enabled
+            with self.subTest(enabled=enabled, norm=norm_arg is not None, T=T):
+                self.assertIsNone(
+                    backend._ucache_fused_norm(
+                        norm=norm_arg,
+                        num_tokens=tokens,
+                        num_draft_tokens=T,
+                        num_v_heads=HV,
+                    )
+                )
+        self.assertEqual(envs.SGLANG_GDN_UCACHE_FUSED_NORM_MAX_BATCH.get(), 48)
+
+    def test_fused_norm_follows_the_stock_reduction_order(self):
+        # The epilogue matches the stock gated-norm launch from 2 rows per program.
+        for rows_per_block, expected in ((1, False), (2, True), (4, True)):
+            with patch(
+                "sglang.kernels.ops.attention.fla.layernorm_gated.calc_rows_per_block",
+                return_value=rows_per_block,
+            ):
+                self.assertIs(
+                    ucache.gdn_ucache_fused_norm_applies(64, "cuda"), expected
+                )
+
     def test_plain_decode_is_refused(self):
         backend = self._verify_backend()
         qkv = torch.zeros(1, 3 * K)
