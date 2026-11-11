@@ -110,6 +110,66 @@ class TestPleFileTableAllocator(CustomTestCase):
         self.assertIsNone(make_ple_file_prefetcher(table))
 
 
+class TestPlePinnedHugepageTable(CustomTestCase):
+    """SGLANG_OPT_PLE_PINNED_HUGEPAGE: an anonymous mapping aligned to a PMD huge
+    page, MADV_HUGEPAGE, then cudaHostRegister; any failure keeps cudaHostAlloc."""
+
+    def _table(self, register_rc=0, advised=True):
+        from sglang.srt.models import qwen4_exp_ple_table as ple_table
+
+        calls = []
+
+        def register(addr, nbytes, flags):
+            calls.append((addr, nbytes, flags))
+            return register_rc
+
+        cudart = mock.Mock(cudaHostRegister=register)
+        with (
+            mock.patch.object(ple_table, "_madvise", return_value=advised) as advise,
+            mock.patch.object(torch.cuda, "cudart", return_value=cudart),
+            mock.patch.object(ple_table, "_clear_cuda_last_error"),
+        ):
+            table = ple_table._pinned_hugepage_table((6, 80), torch.bfloat16)
+        return table, calls, advise, ple_table
+
+    def test_registered_table_is_aligned_and_writable(self):
+        table, calls, advise, ple_table = self._table()
+        self.assertEqual((table.shape, table.dtype), ((6, 80), torch.bfloat16))
+        ((addr, nbytes, flags),) = calls
+        self.assertEqual((addr, nbytes, flags), (table.data_ptr(), 6 * 80 * 2, 0))
+        self.assertEqual(addr % ple_table._HUGEPAGE_ALIGN, 0)
+        advise.assert_called_once_with(addr, nbytes, ple_table._MADV_HUGEPAGE)
+        table.fill_(3)
+        self.assertTrue(bool((table == 3).all()))
+
+    def test_failures_fall_back_to_cuda_host_alloc(self):
+        self.assertIsNone(self._table(register_rc=1)[0])
+        self.assertIsNone(self._table(advised=False)[0])
+
+    def test_switch_is_an_opt_in_child_of_the_master(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.models import qwen4_exp_ple_table as ple_table
+
+        sentinel = torch.zeros(1)
+        for master, child, used in (
+            (True, True, True),
+            (True, None, False),
+            (False, True, False),
+        ):
+            with (
+                envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(master),
+                envs.SGLANG_OPT_PLE_PINNED_HUGEPAGE.override(child),
+                mock.patch.object(
+                    ple_table, "_pinned_hugepage_table", return_value=sentinel
+                ) as huge,
+                mock.patch.object(torch, "empty", return_value="pinned") as empty,
+            ):
+                table = allocate_ple_host_table((4, 4), torch.bfloat16, "pinned", None)
+            self.assertIs(table, sentinel if used else "pinned")
+            self.assertEqual(huge.called, used)
+            self.assertEqual(empty.called, not used)
+
+
 class TestPleFilePrefetcher(CustomTestCase):
     def test_page_set_covers_row_start_and_end(self):
         # 160-byte rows: row 25 spans bytes 4000-4159, i.e. pages 0 and 1.

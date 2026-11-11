@@ -540,6 +540,10 @@ class Envs:
     # as row-tiled Gluon programs. Opt-in: bitwise to the stock kernel only as one Triton
     # compiles its FMA contraction; ..._CHECK_CALLS compares the first eager calls.
     SGLANG_OPT_FUSED_QK_NORM_ROPE_ROWS = EnvRuntimeBool(False)
+    # The pinned PLE host table on transparent huge pages (anonymous mapping, MADV_HUGEPAGE,
+    # cudaHostRegister) instead of cudaHostAlloc: the gather's random 160 B row reads stop
+    # being bound by address translation. Opt-in (THP-dependent); falls back on failure.
+    SGLANG_OPT_PLE_PINNED_HUGEPAGE = EnvRuntimeBool(False)
     SGLANG_FUSED_QK_NORM_ROPE_ROWS_MIN_TOKENS = EnvInt(1024)
     SGLANG_FUSED_QK_NORM_ROPE_ROWS_ROWS = EnvInt(16)
     SGLANG_FUSED_QK_NORM_ROPE_ROWS_CHECK_CALLS = EnvInt(0)
