@@ -268,6 +268,97 @@ def test_hybrid_pool_preparation_uses_actual_leaf_page_size():
         assert obj._numeric_score_capacity == 0
 
 
+def verify_flags(mode="sampled"):
+    from contextlib import ExitStack
+
+    from sglang.srt.kernel_plugins.nvidia import binding
+
+    stack = ExitStack()
+    stack.enter_context(patch.object(binding, "megakernel_enabled", return_value=True))
+    stack.enter_context(envs.SGLANG_QSA_MK_SCORE.override(False))
+    stack.enter_context(envs.SGLANG_QSA_SPLIT_TOPK.override(False))
+    stack.enter_context(envs.SGLANG_QSA_VERIFY_TOPK.override(mode))
+    stack.enter_context(patch.object(impl, "get_parallel", return_value=NS(tp_size=1)))
+    stack.enter_context(patch.object(impl, "is_sm100_supported", return_value=True))
+    stack.enter_context(
+        patch.object(impl, "is_batch_invariant_mode_enabled", return_value=False)
+    )
+    return stack
+
+
+@pytest.mark.parametrize("mode,declared", [("sampled", True), ("stock", False)])
+def test_verify_select_declares_one_variant_two_per_width(mode, declared):
+    obj = indexer()
+    with verify_flags(mode):
+        found = [
+            s
+            for s in obj.numeric_preparation_signatures(8193 * 4, 16)
+            if s.operation == NumericOperation.SPARSE_SELECT
+        ]
+    assert [(s.rows, s.variant, s.context_bound) for s in found] == (
+        [(4, 2, 8208)] if declared else []
+    )
+
+
+def test_verify_select_rejects_an_unknown_mode():
+    with verify_flags("half"), pytest.raises(ValueError, match="stock or sampled"):
+        indexer().numeric_preparation_signatures(8193 * 4, 16)
+
+
+@pytest.mark.parametrize(
+    "rows_per_group,grouped4_only,offered",
+    [(4, False, True), (1, False, False), (4, True, False)],
+)
+def test_verify_select_serves_only_target_verify_rows(
+    rows_per_group, grouped4_only, offered
+):
+    obj = indexer()
+    q, cache, table, lengths, capacity, _ = tensors(8208)
+    scores = torch.zeros((4, capacity)).as_subclass(DeviceMetadata)
+    stock = torch.zeros((4, 512), dtype=torch.int32)
+    seen = []
+
+    def choose(signature, *, prepared):
+        def run(io):
+            seen.append((signature.variant, io.scratch_out.numel()))
+            io.selected_indices_out.fill_(7)
+
+        return run
+
+    import sys
+
+    with (
+        verify_flags(),
+        patch.dict(
+            sys.modules,
+            {
+                "sglang.kernels.ops.attention.fast_topk": NS(
+                    fast_topk=lambda *a, **kw: stock
+                )
+            },
+        ),
+        patch.object(impl, "qsa_mqa_decode", return_value=scores),
+        patch.object(obj, "_numeric_score_select", return_value=None),
+        patch.object(numeric_binding, "numeric_operator", side_effect=choose),
+    ):
+        obj.numeric_preparation_signatures(8193 * 4, 16)
+        selected = obj.select_decode_tokens(
+            q,
+            cache,
+            table,
+            lengths.to(torch.int32),
+            capacity,
+            torch.arange(4),
+            lengths,
+            True,
+            None,
+            rows_per_group,
+            grouped4_only,
+        )
+    assert seen == ([(2, 32)] if offered else [])
+    assert torch.equal(selected, torch.full((4, 512), 7) if offered else stock)
+
+
 def test_public_select_stock_fallback_and_selected_expansion():
     obj = indexer()
     args = list(tensors(8192))

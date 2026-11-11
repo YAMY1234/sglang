@@ -176,6 +176,7 @@ def contract_geometry(s):
                         and (
                             (s.variant == 0 and s.rows == 4 and s.query_heads == 8)
                             or (s.variant == 1 and s.rows <= 64)
+                            or (s.variant == 2 and s.rows > 0)
                         )
                     )
                     or (
@@ -493,7 +494,7 @@ def _source_supported(s, actual):
         ) and heads != 4:
             return False
         if (op == NumericOperation.SPARSE_SCORE and s.variant in (4, 5, 6, 7)) or (
-            op == NumericOperation.SPARSE_SELECT and s.variant == 1
+            op == NumericOperation.SPARSE_SELECT and s.variant in (1, 2)
         ):
             return actual["tp_size"] == 1
         return True

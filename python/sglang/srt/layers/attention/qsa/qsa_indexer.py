@@ -156,6 +156,7 @@ class QSAIndexer(MultiPlatformOp):
                 or envs.SGLANG_QSA_SPLIT_TOPK.get()
                 or grouped4 is not None
                 or envs.SGLANG_ENABLE_QSA_PREFILL_FAST_SELECT.get()
+                or self._verify_select_source_enabled()
             )
             and type(context_len) is int
             and context_len > 0
@@ -212,6 +213,7 @@ class QSAIndexer(MultiPlatformOp):
 
         signatures = []
         split_select = self._split_select_source_enabled()
+        verify_select = self._verify_select_source_enabled()
         # The source validated grouped4 bit-identical on SM107 only.
         if grouped4 is not None and torch.cuda.get_device_capability() != (10, 7):
             grouped4 = None
@@ -251,6 +253,13 @@ class QSAIndexer(MultiPlatformOp):
                 if (
                     signature := admitted(
                         NumericOperation.SPARSE_SELECT, rows, ScalarType.FP32, 1
+                    )
+                ) is not None:
+                    signatures.append(signature)
+            if verify_select:
+                if (
+                    signature := admitted(
+                        NumericOperation.SPARSE_SELECT, rows, ScalarType.FP32, 2
                     )
                 ) is not None:
                     signatures.append(signature)
@@ -334,6 +343,16 @@ class QSAIndexer(MultiPlatformOp):
         return {0: 6, 2: 7}.get(envs.SGLANG_QSA_GROUPED4_VERIFY_PIPELINE_STAGES.get())
 
     @staticmethod
+    def _verify_select_source_enabled():
+        """SGLANG_QSA_VERIFY_TOPK=sampled: the source's target-verify top-k (variant 2)."""
+        mode = (envs.SGLANG_QSA_VERIFY_TOPK.get() or "stock").strip().lower()
+        if mode not in ("stock", "sampled"):
+            raise ValueError(
+                f"SGLANG_QSA_VERIFY_TOPK must be stock or sampled, got {mode!r}"
+            )
+        return mode == "sampled" and get_parallel().tp_size == 1
+
+    @staticmethod
     def _split_select_source_enabled():
         return (
             envs.SGLANG_QSA_SPLIT_TOPK.get()
@@ -342,6 +361,60 @@ class QSAIndexer(MultiPlatformOp):
             and envs.SGLANG_QSA_TOPK_THREADS.get() in (None, 1024)
             and envs.SGLANG_QSA_TOPK_CLUSTER.get() is None
         )
+
+    def _numeric_verify_select(self, scores, lengths):
+        """Target-verify rows through the declared variant-2 selector, or None."""
+        from sglang.kernels.plugin_kernels.nvidia.numeric import (
+            NumericOperation,
+            NumericSignature,
+            ScalarType,
+            SparseSelectIO,
+        )
+        from sglang.srt.kernel_plugins.nvidia.numeric_binding import numeric_operator
+
+        if not (
+            scores.ndim == 2
+            and scores.is_cuda
+            and scores.dtype == torch.float32
+            and scores.shape[0] in getattr(self, "_numeric_split_select_widths", ())
+            and scores.shape[1] > 0
+            and scores.shape[1] == getattr(self, "_numeric_score_capacity", 0)
+            and scores.is_contiguous()
+            and lengths.shape == (scores.shape[0],)
+            and lengths.dtype in (torch.int32, torch.int64)
+            and lengths.device == scores.device
+            and lengths.is_contiguous()
+        ):
+            return None
+        rows, capacity = scores.shape
+        signature = NumericSignature(
+            NumericOperation.SPARSE_SELECT,
+            rows,
+            ((self.index_n_heads + 7) // 8) * 8,
+            self.index_kv_heads,
+            self.index_head_dim,
+            self.block_topk,
+            self.compress_ratio,
+            ScalarType.FP32,
+            context_bound=capacity,
+            variant=2,
+        )
+        if signature not in getattr(self, "_numeric_prepared_sparse", ()):
+            return None
+        run = numeric_operator(signature, prepared=True)
+        if run is None:
+            return None
+        output = torch.empty(
+            (rows, self.block_topk), dtype=torch.int32, device=scores.device
+        )
+        # Two int32 [rows] views for the provider: zero row starts and per-row flags.
+        scratch = torch.empty(8 * rows, dtype=torch.uint8, device=scores.device)
+        run(
+            SparseSelectIO(
+                scores, lengths.to(torch.int32), self.block_topk, output, None, scratch
+            )
+        )
+        return output
 
     def _numeric_split_select(self, scores, lengths):
         from sglang.kernels.plugin_kernels.nvidia.numeric import (
@@ -1253,6 +1326,12 @@ class QSAIndexer(MultiPlatformOp):
             from sglang.kernels.ops.attention.fast_topk import fast_topk
 
             block_indices = self._numeric_split_select(logits, compressed_lengths)
+            if (
+                block_indices is None
+                and verify_rows_per_group > 1
+                and not grouped4_only
+            ):
+                block_indices = self._numeric_verify_select(logits, compressed_lengths)
             if block_indices is None:
                 block_indices = fast_topk(
                     logits,

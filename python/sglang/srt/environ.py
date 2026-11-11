@@ -301,6 +301,9 @@ class Envs:
     SGLANG_QSA_MK_SCORE_SHORT32 = EnvBool(False)
     SGLANG_QSA_GROUPED_SCORE = EnvBool(True)
     SGLANG_QSA_SPLIT_TOPK = EnvBool(True)
+    # TP1 target-verify top-512: "stock" (fast_topk) or "sampled" (the prefill select's
+    # one-pass kernels on the same rows; fast_topk's ordered output, smallest-index ties).
+    SGLANG_QSA_VERIFY_TOPK = EnvStr("stock")
     # TP1 target verify of 17..MAX_REQUESTS requests (at most 576 rows): the grouped4
     # chain scorer; PIPELINE_STAGES 2 software-pipelines its key loads.
     SGLANG_QSA_GROUPED_SCORE_MAX_REQUESTS = EnvInt(16)
