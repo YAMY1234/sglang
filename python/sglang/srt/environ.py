@@ -604,6 +604,13 @@ class Envs:
     SGLANG_OPT_GDN_PREFILL_FUSED_TRACK = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # GDN target verify (Q38_GDN_FRONT strided gate views): the gated RMSNorm on a wider
+    # launch, SGLANG_GDN_VERIFY_NORM_RETILE_CONFIG "rows,num_warps" (A's name; default
+    # 16,8), read only with this on (same values per row).
+    SGLANG_OPT_GDN_VERIFY_NORM_RETILE = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    SGLANG_GDN_VERIFY_NORM_RETILE_CONFIG = EnvStr("")
     # Triton causal conv1d forward tile "BLOCK_M,BLOCK_N,num_warps,num_stages" (A's
     # name); read only with the runtime master on. Same values for any tile.
     SGLANG_CAUSAL_CONV1D_FWD_CONFIG = EnvStr("")

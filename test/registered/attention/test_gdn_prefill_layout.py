@@ -127,6 +127,23 @@ class TestGdnPrefillLaunchChoice(unittest.TestCase):
         )
         self.assertFalse(gdn_backend._fused_track_states(meta, None, ssm))
 
+    def test_verify_norm_retile_config(self):
+        parse = norm_mod.parse_verify_norm_cfg
+        self.assertIsNone(parse(enabled=False, raw="16,8"))
+        self.assertEqual(parse(enabled=True, raw=""), (16, 8))
+        self.assertEqual(parse(enabled=True, raw="32,4"), (32, 4))
+        for raw in ("8,8", "24,4", "16,32", "512,8"):
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                parse(enabled=True, raw=raw)
+        with mock.patch.object(norm_mod, "GDN_VERIFY_NORM_CFG", None):
+            self.assertFalse(
+                norm_mod.gdn_verify_norm_retile_applies(torch.zeros(8, 128))
+            )
+        with mock.patch.object(norm_mod, "GDN_VERIFY_NORM_CFG", (16, 8)):
+            self.assertFalse(
+                norm_mod.gdn_verify_norm_retile_applies(torch.zeros(8, 64))
+            )
+
     def test_qk_one_launch_needs_k_right_after_q(self):
         buf = torch.zeros(3 * 4 * 2 * 8)
         q = buf[:64].view(4, 2, 8)
@@ -448,6 +465,34 @@ class TestGdnPrefillLayout(unittest.TestCase):
             )
         )
         torch.testing.assert_close(fused, stock, rtol=0, atol=0)
+
+    def test_verify_norm_retile_matches_the_stock_norm(self):
+        heads = 48
+        weight = torch.randn(self.HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+        for batch in (2, 104):
+            with self.subTest(batch=batch):
+                rows = batch * 4 * heads
+                x = torch.randn(
+                    rows, self.HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+                )
+                z = torch.randn(
+                    batch * 4, heads, 2 * self.HEAD_DIM, dtype=x.dtype, device="cuda"
+                )[..., : self.HEAD_DIM]
+                expected = rms_norm_gated(
+                    x=x, weight=weight, bias=None, z=z, is_rms_norm=True
+                )
+                with mock.patch.object(norm_mod, "GDN_VERIFY_NORM_CFG", (16, 8)):
+                    if not norm_mod.gdn_verify_norm_retile_applies(x):
+                        continue
+                    actual = norm_mod.gdn_verify_norm_retiled(
+                        x=x,
+                        weight=weight,
+                        z=z,
+                        eps=1e-6,
+                        norm_before_gate=True,
+                        activation="swish",
+                    )
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

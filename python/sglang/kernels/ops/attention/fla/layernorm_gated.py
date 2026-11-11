@@ -431,6 +431,93 @@ if _is_npu:
     from sgl_kernel_npu.fla.layernorm_gated import layer_norm_fwd_npu as _layer_norm_fwd
 
 
+# Measured by the source on VR200 at verify rows B x 4 x 48, B 4-104; re-tune when the
+# kernel changes.
+GDN_VERIFY_NORM_DEFAULT = (16, 8)  # (ROWS_PER_BLOCK, num_warps)
+
+
+def parse_verify_norm_cfg(*, enabled: bool, raw: Optional[str]) -> Optional[tuple]:
+    """SGLANG_GDN_VERIFY_NORM_RETILE_CONFIG (A's name): "rows,num_warps". rows >= 2 *
+    num_warps keeps every 128-wide row on one warp's 16 lanes x 8 elements, the stock
+    reduction order."""
+    if not enabled:
+        return None
+    if raw is None or not raw.strip():
+        return GDN_VERIFY_NORM_DEFAULT
+    rows, warps = (int(v) for v in raw.split(","))
+    if not (
+        rows & (rows - 1) == 0
+        and warps & (warps - 1) == 0
+        and 1 <= warps <= 16
+        and 2 * warps <= rows <= 256
+    ):
+        raise ValueError(
+            "SGLANG_GDN_VERIFY_NORM_RETILE_CONFIG: rows and num_warps powers of 2 with "
+            f"2 * num_warps <= rows <= 256, got {raw!r}"
+        )
+    return rows, warps
+
+
+# SGLANG_OPT_GDN_VERIFY_NORM_RETILE: the GDN target-verify gated RMSNorm on a wider
+# launch (same values per row); read once. The NPU launcher takes no launch config.
+GDN_VERIFY_NORM_CFG = parse_verify_norm_cfg(
+    enabled=envs.SGLANG_OPT_GDN_VERIFY_NORM_RETILE.get() and not _is_npu,
+    raw=envs.SGLANG_GDN_VERIFY_NORM_RETILE_CONFIG.get(),
+)
+
+
+def gdn_verify_norm_retile_applies(x) -> bool:
+    """Whether GDN_VERIFY_NORM_CFG keeps the stock row reduction for x [rows, N]: only
+    for N == 128 where the stock launch holds >= 2 rows per program (8 elements x 16
+    lanes a row); at 1 row per program (M <= 2 x SMs) a stock row is 4 elements x 32
+    lanes."""
+    if GDN_VERIFY_NORM_CFG is None or x.shape[-1] != 128:
+        return False
+    if calc_rows_per_block(x.shape[0], x.device) >= 2:
+        return True
+    _log_verify_norm_once(
+        "stock",
+        "GDN verify norm retile: stock launch kept at %d rows (1 row per program)",
+        x.shape[0],
+    )
+    return False
+
+
+def gdn_verify_norm_retiled(*, x, weight, z, eps, norm_before_gate, activation):
+    """``rms_norm_gated`` of a GDN verify (x [rows, head_v_dim], z the gate view, no
+    bias, no groups) on GDN_VERIFY_NORM_CFG's launch: the same values per row."""
+    _log_verify_norm_once(
+        "on",
+        "GDN verify norm retile engaged (SGLANG_OPT_GDN_VERIFY_NORM_RETILE): "
+        "rows_per_block, num_warps = %s, first verify %d rows of %d",
+        GDN_VERIFY_NORM_CFG,
+        x.shape[0],
+        x.shape[1],
+    )
+    y, _, _ = _layer_norm_fwd(
+        x,
+        weight,
+        None,
+        eps,
+        z=z,
+        group_size=None,
+        norm_before_gate=norm_before_gate,
+        is_rms_norm=True,
+        activation=activation,
+        launch_cfg=GDN_VERIFY_NORM_CFG,
+    )
+    return y
+
+
+_verify_norm_logged: set = set()
+
+
+def _log_verify_norm_once(key: str, msg: str, *args) -> None:
+    if key not in _verify_norm_logged:
+        _verify_norm_logged.add(key)
+        logger.info(msg, *args)
+
+
 def rms_norm_gated(
     *,
     x,

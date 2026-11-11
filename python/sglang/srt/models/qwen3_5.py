@@ -25,7 +25,12 @@ from safetensors.torch import load_file
 from transformers.utils import cached_file
 
 from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
-from sglang.kernels.ops.attention.fla.layernorm_gated import _layer_norm_fwd
+from sglang.kernels.ops.attention.fla.layernorm_gated import (
+    GDN_VERIFY_NORM_CFG,
+    _layer_norm_fwd,
+    gdn_verify_norm_retile_applies,
+    gdn_verify_norm_retiled,
+)
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_qkvzba_split_reshape_cat_contiguous,
     qwen3_5_gdn_prefill_projection_views,
@@ -1104,7 +1109,25 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
             return self.out_proj(fp8)[0]
 
-        core_attn_out = self.norm(core_attn_out, z)
+        if (
+            GDN_VERIFY_NORM_CFG is not None
+            and use_strided_prefill_z
+            and forward_batch.forward_mode.is_target_verify()
+            and self.norm.group_size is None
+            and self.norm.bias is None
+            and core_attn_out.stride(-1) == 1
+            and gdn_verify_norm_retile_applies(core_attn_out)
+        ):
+            core_attn_out = gdn_verify_norm_retiled(
+                x=core_attn_out,
+                weight=self.norm.weight,
+                z=z,
+                eps=self.norm.eps,
+                norm_before_gate=self.norm.norm_before_gate,
+                activation=self.norm.activation,
+            )
+        else:
+            core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(
             *core_attn_out.shape[:-2],
