@@ -1328,6 +1328,7 @@ def commit_gdn_replayssm_circular(
     mamba_track_indices: torch.Tensor | None = None,
     mamba_steps_to_track: torch.Tensor | None = None,
     null_block_id: int = -1,
+    use_cuda: bool = False,
 ) -> None:
     """Materialize circular history only for capacity and track rows.
 
@@ -1345,6 +1346,33 @@ def commit_gdn_replayssm_circular(
     k_residual_buf = k_residual_cache if has_residual else k_cache
     BV = min(triton.next_power_of_2(V), 64)
     has_track = mamba_track_indices is not None and mamba_steps_to_track is not None
+    if use_cuda and _commit_cuda(
+        checkpoint_state=checkpoint_state,
+        d_cache=d_cache,
+        k_cache=k_cache,
+        g_cache=g_cache,
+        d_residual_cache=d_residual_cache if has_residual else None,
+        k_residual_cache=k_residual_cache if has_residual else None,
+        state_batch_indices=state_batch_indices,
+        replay_indices=replay_indices,
+        write_pos=write_pos,
+        cache_base=cache_base,
+        is_flush=is_flush,
+        accept_lens=accept_lens,
+        mamba_track_indices=mamba_track_indices if has_track else None,
+        mamba_steps_to_track=mamba_steps_to_track if has_track else None,
+        null_block_id=null_block_id,
+    ):
+        _finish_circular_fold(
+            write_pos=write_pos,
+            cache_base=cache_base,
+            is_flush=is_flush,
+            state_batch_indices=state_batch_indices,
+            replay_indices=replay_indices,
+            max_cache_len=max_cache_len,
+            null_block_id=null_block_id,
+        )
+        return
     if has_track:
         track_indices = mamba_track_indices
         track_steps = mamba_steps_to_track
@@ -1400,7 +1428,28 @@ def commit_gdn_replayssm_circular(
         num_warps=4,
         num_stages=2,
     )
-    block = triton.next_power_of_2(max(1, B))
+    _finish_circular_fold(
+        write_pos=write_pos,
+        cache_base=cache_base,
+        is_flush=is_flush,
+        state_batch_indices=state_batch_indices,
+        replay_indices=replay_indices,
+        max_cache_len=max_cache_len,
+        null_block_id=null_block_id,
+    )
+
+
+def _finish_circular_fold(
+    *,
+    write_pos: torch.Tensor,
+    cache_base: torch.Tensor,
+    is_flush: torch.Tensor,
+    state_batch_indices: torch.Tensor,
+    replay_indices: torch.Tensor,
+    max_cache_len: int,
+    null_block_id: int,
+) -> None:
+    B = state_batch_indices.shape[0]
     _finish_gdn_replayssm_circular_fold_kernel[(1,)](
         write_pos,
         cache_base,
@@ -1411,9 +1460,19 @@ def commit_gdn_replayssm_circular(
         stride_indices=state_batch_indices.stride(0),
         stride_replay_indices=replay_indices.stride(0),
         MAX_CACHE_LEN=max_cache_len,
-        BLOCK=block,
+        BLOCK=triton.next_power_of_2(max(1, B)),
         NULL_BLOCK_ID=null_block_id,
     )
+
+
+def _commit_cuda(**kw) -> bool:
+    """The compact commit as one CUDA launch when its shapes fit and it can be issued now
+    (compiled, or not under graph capture); False leaves the commit to the Triton kernel."""
+    from sglang.kernels.ops.attention.linear import (
+        gdn_replayssm_commit_cuda as cuda_commit,
+    )
+
+    return cuda_commit.try_commit(**kw)
 
 
 def commit_gdn_replayssm_after_verify(
@@ -1432,6 +1491,7 @@ def commit_gdn_replayssm_after_verify(
     mamba_steps_to_track: torch.Tensor | None = None,
     src_indices_raw: torch.Tensor | None = None,
     null_block_id: int = -1,
+    use_cuda: bool = False,
 ) -> None:
     """Commit one verify step of the compact GDN ring.
 
@@ -1475,6 +1535,7 @@ def commit_gdn_replayssm_after_verify(
         mamba_track_indices=mamba_track_indices,
         mamba_steps_to_track=mamba_steps_to_track,
         null_block_id=null_block_id,
+        use_cuda=use_cuda,
     )
     # Roll back the active conv state and snapshot its interval-crossing window.
     for conv_states, intermediate_conv_window in zip(

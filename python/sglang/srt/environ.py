@@ -342,6 +342,11 @@ class Envs:
     # With the routes above: the shared expert's act_and_mul at 1-16 rows runs in the
     # epilogue of its gate_up split-K GEMM (sm107_shared_expert_act; checked bitwise at load).
     SGLANG_ENABLE_SM107_SHARED_EXPERT_FUSED_ACT = EnvBool(False)
+    # GDN ReplaySSM verify commit: fold every request's checkpoints in one CUDA launch
+    # (compact layouts it supports) instead of the Triton kernel; not bitwise.
+    SGLANG_OPT_GDN_REPLAYSSM_CUDA_COMMIT = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     # GDN ReplaySSM target verify: three software-pipeline stages instead of two
     # (same output bits).
     SGLANG_OPT_GDN_REPLAYSSM_VERIFY_3_STAGES = EnvRuntimeBool(

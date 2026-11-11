@@ -4,6 +4,8 @@ from unittest.mock import MagicMock, patch
 import torch
 
 import sglang.srt
+from sglang.kernels.ops.attention.linear import gdn_replayssm_commit_cuda as cuda
+from sglang.kernels.ops.attention.linear import gdn_replayssm_spec_decode as replay
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -373,6 +375,78 @@ class TestMtpVerifyHookSignature(CustomTestCase):
                 f"{rel}:{lineno} {self.HOOK} is missing {sorted(missing)}; "
                 "the spec workers call this hook by keyword.",
             )
+
+
+def _cuda_commit_inputs():
+    return dict(
+        checkpoint_state=torch.zeros(1, 1, 1, 128, 128, dtype=torch.bfloat16),
+        d_cache=torch.zeros(1, 1, 1, 16, 128, dtype=torch.bfloat16),
+        k_cache=torch.zeros(1, 1, 1, 16, 128, dtype=torch.bfloat16),
+        g_cache=torch.zeros(1, 1, 1, 16),
+        d_residual_cache=None,
+        k_residual_cache=None,
+        state_batch_indices=torch.zeros(1, dtype=torch.int64),
+        replay_indices=torch.zeros(1, dtype=torch.int64),
+        write_pos=torch.zeros(1, dtype=torch.int32),
+        cache_base=torch.zeros(1, dtype=torch.int32),
+        is_flush=torch.zeros(1, dtype=torch.int8),
+        accept_lens=torch.ones(1, dtype=torch.int32),
+    )
+
+
+class TestGdnCudaCommitDispatch(CustomTestCase):
+    """SGLANG_OPT_GDN_REPLAYSSM_CUDA_COMMIT: CPU dispatch and ABI checks; no CUDA
+    compilation or numerical qualification."""
+
+    def test_dtype_ring_and_stride_support(self):
+        args = _cuda_commit_inputs()
+        state, d, k = (
+            args[name] for name in ("checkpoint_state", "d_cache", "k_cache")
+        )
+        self.assertTrue(cuda.supported(state, d, k))
+        self.assertFalse(cuda.supported(state.float(), d, k))
+        self.assertFalse(cuda.supported(state.transpose(-1, -2), d, k))
+        self.assertFalse(cuda.supported(state, d[..., :8, :], k))
+
+    def test_capture_before_compilation_falls_back_without_compiling(self):
+        with (
+            patch.object(cuda, "_KERNELS", {}),
+            patch("torch.cuda.is_current_stream_capturing", return_value=True),
+            patch.object(cuda, "_kernel") as compile_kernel,
+            patch.object(cuda, "commit") as launch,
+        ):
+            self.assertFalse(cuda.try_commit(**_cuda_commit_inputs()))
+            compile_kernel.assert_not_called()
+            launch.assert_not_called()
+
+    def test_cached_variants_keep_original_arguments(self):
+        args = _cuda_commit_inputs()
+        kernels = {(None, 1, 1, 16, track): object() for track in (False, True)}
+        with (
+            patch.object(cuda, "_KERNELS", kernels),
+            patch.object(cuda, "commit") as launch,
+        ):
+            self.assertTrue(cuda.try_commit(**args))
+            launch.assert_called_once_with(**args)
+
+    def test_cuda_success_and_native_fallback_finish_once(self):
+        for enabled, success in ((False, False), (True, False), (True, True)):
+            with (
+                self.subTest(enabled=enabled, success=success),
+                patch.object(replay, "_commit_cuda", return_value=success) as dispatch,
+                patch.object(replay, "_finish_circular_fold") as finish,
+                patch.object(
+                    replay, "gdn_replayssm_compact_commit_kernel", MagicMock()
+                ) as native,
+            ):
+                replay.commit_gdn_replayssm_circular(
+                    **_cuda_commit_inputs(), use_cuda=enabled
+                )
+                self.assertEqual(dispatch.call_count, int(enabled))
+                self.assertEqual(
+                    native.__getitem__.call_count, 0 if enabled and success else 1
+                )
+                finish.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -1414,6 +1414,7 @@ def commit_mamba_states_after_verify(
             mamba_steps_to_track=mamba_steps_to_track,
             src_indices_raw=src_indices_raw,
             null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
+            use_cuda=envs.SGLANG_OPT_GDN_REPLAYSSM_CUDA_COMMIT.get(),
         )
         commit_ple_states_after_verify(
             model_runner.token_to_kv_pool.layer_router,
