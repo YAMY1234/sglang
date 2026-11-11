@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -11,6 +12,7 @@ from sglang.kernels.ops.attention.fla.layernorm_gated import (
     RMSNorm,
     rms_norm_gated,
 )
+from sglang.kernels.ops.attention.linear import fused_gdn_gating as gating_mod
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_qkv_split_gdn_prefill,
     qwen3_5_gdn_prefill_projection_views,
@@ -47,6 +49,16 @@ class TestGdnSplitConvGate(unittest.TestCase):
             self.assertFalse(backend._split_conv_ok(bad_layer, x))
         # Column-major input (stride(0) == 1) keeps the stock conv.
         self.assertFalse(backend._split_conv_ok(layer(), torch.zeros(1280, 5).T))
+
+
+class TestGdnPrefillLaunchChoice(unittest.TestCase):
+    def test_gating_2d_takes_only_extend_sized_batches(self):
+        with mock.patch.object(gating_mod, "_GATING_2D", False):
+            self.assertIsNone(gating_mod._gating_2d_cfg(4096, None))
+            self.assertEqual(gating_mod._gating_2d_cfg(8, (32, 4)), (32, 4))
+        with mock.patch.object(gating_mod, "_GATING_2D", True):
+            self.assertIsNone(gating_mod._gating_2d_cfg(511, None))
+            self.assertEqual(gating_mod._gating_2d_cfg(512, None), (16, 2))
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
@@ -238,6 +250,24 @@ class TestGdnPrefillLayout(unittest.TestCase):
                     norm.weight.data.copy_(weight)
                     native = norm.forward_native(x, z)
                     torch.testing.assert_close(native, actual, rtol=1e-2, atol=1e-2)
+
+    def test_gating_2d_launch_matches_stock_launch(self):
+        num_heads = 48
+        a_log = torch.randn(num_heads, device="cuda")
+        dt_bias = torch.randn(num_heads, device="cuda")
+        for batch in (1, 600):
+            with self.subTest(batch=batch):
+                ba = torch.randn(
+                    batch, 2 * num_heads, dtype=torch.bfloat16, device="cuda"
+                )
+                b, a = ba[:, :num_heads], ba[:, num_heads:]
+                with mock.patch.object(gating_mod, "_GATING_2D", False):
+                    g, beta = gating_mod.fused_gdn_gating(a_log, a, b, dt_bias)
+                    g_2d, beta_2d = gating_mod.fused_gdn_gating(
+                        a_log, a, b, dt_bias, launch_cfg=(16, 2)
+                    )
+                torch.testing.assert_close(g_2d, g, rtol=0, atol=0)
+                torch.testing.assert_close(beta_2d, beta, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

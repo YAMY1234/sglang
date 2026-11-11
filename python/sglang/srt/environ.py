@@ -561,6 +561,11 @@ class Envs:
     SGLANG_OPT_GDN_PREFILL_SPLIT_CONV = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # GDN gating (g, beta) of extend-sized batches: one program per 16 tokens x all heads
+    # instead of one per (token, 8 heads) (same values).
+    SGLANG_OPT_GDN_PREFILL_GATING_2D = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     # Triton causal conv1d forward tile "BLOCK_M,BLOCK_N,num_warps,num_stages" (A's
     # name); read only with the runtime master on. Same values for any tile.
     SGLANG_CAUSAL_CONV1D_FWD_CONFIG = EnvStr("")
