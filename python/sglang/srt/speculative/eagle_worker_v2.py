@@ -832,16 +832,35 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         ):
             fold_slots = None
         forward_batch.step_fold_embedding = None
+        loop_glue = (
+            envs.SGLANG_Q38_LOOP_GLUE.get()
+            and fold_slots is not None
+            and not needs_draft_probs
+            and not forward_batch.return_logprob
+        )
         # SGLANG_OPT_SPEC_DRAFT_TOP1_NATIVE_LOGITS: only draft_topk1_postprocess reads the
         # steps' logits, and its argmax is the same on the LM head's BF16 values
         native_logits = forward_batch.native_dtype_logits
         forward_batch.native_dtype_logits = (
-            envs.SGLANG_OPT_SPEC_DRAFT_TOP1_NATIVE_LOGITS.get()
+            (envs.SGLANG_OPT_SPEC_DRAFT_TOP1_NATIVE_LOGITS.get() or loop_glue)
             and self.topk == 1
             and _is_cuda
             and not needs_draft_probs
             and not forward_batch.return_logprob
         )
+        mrope = (
+            forward_batch.mrope_positions
+            if loop_glue and self.draft_runner.model_config.model_is_mrope
+            else None
+        )
+        if mrope is not None and (
+            mrope.shape != (3, forward_batch.positions.numel())
+            or mrope.dtype != forward_batch.positions.dtype
+            or mrope.untyped_storage().data_ptr()
+            == forward_batch.positions.untyped_storage().data_ptr()
+        ):
+            # Aliased operands keep the sequential position updates.
+            mrope = None
 
         # Forward multiple steps
         scores = None
@@ -917,6 +936,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                             draft_tokens_topk1,
                             i + 1,
                             slot,
+                            mrope_positions=mrope,
                         )
                         forward_batch.step_fold_embedding = slot.embedding
                     elif _is_cuda or _is_hip:
@@ -925,6 +945,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                             forward_batch.positions,
                             draft_tokens_topk1,
                             i + 1,
+                            mrope_positions=mrope,
                         )
                     else:
                         topk_index = torch.argmax(
@@ -940,7 +961,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     )
                     topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
                     forward_batch.positions.add_(1)
-                if self.draft_runner.model_config.model_is_mrope:
+                if self.draft_runner.model_config.model_is_mrope and mrope is None:
                     forward_batch.mrope_positions.add_(1)
                 maybe_detect_oob(
                     topk_index,

@@ -340,6 +340,101 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
                 self.assertEqual(stock.call_count, steps - 1)
                 self.assertEqual(seen, [None] * (steps - 1))
 
+    def test_loop_glue_advances_mrope_in_the_finalizers(self):
+        """SGLANG_Q38_LOOP_GLUE: with fold slots, both top-1 finalizers advance the
+        MRoPE positions and the draft steps keep native logits; without the switch (or
+        the slots) each step adds to the MRoPE positions itself."""
+        bs, steps, vocab = 2, 3, 16
+        for glue, slots in ((True, True), (False, True), (True, False)):
+            worker = _make_worker(num_steps=steps, num_draft_tokens=steps + 1)
+            worker.hot_token_id = None
+            worker.index_share_for_mtp_iteration = False
+            worker.seed_dsa_topk_from_draft_extend = False
+            worker._topk1_parents_prealloc = torch.zeros((8, steps), device=DEVICE)
+            worker._topk1_score_indices_prealloc = torch.zeros(
+                (8, steps), device=DEVICE
+            )
+            worker.draft_attn_backend = SimpleNamespace(attn_backends=[None] * steps)
+            seen = []
+
+            def forward(fb, seen=seen):
+                seen.append(fb.native_dtype_logits)
+                fb.step_fold_embedding = None
+                return SimpleNamespace(
+                    logits_output=SimpleNamespace(
+                        next_token_logits=torch.zeros((bs, vocab), device=DEVICE),
+                        hidden_states=torch.zeros((bs, 4), device=DEVICE),
+                    )
+                )
+
+            worker.draft_runner = SimpleNamespace(
+                canary_manager=None,
+                forward=forward,
+                model_config=SimpleNamespace(model_is_mrope=True),
+            )
+            positions = torch.zeros(bs, dtype=torch.int64, device=DEVICE)
+            mrope = torch.zeros((3, bs), dtype=torch.int64, device=DEVICE)
+            forward_batch = SimpleNamespace(
+                forward_mode=ForwardMode.DECODE,
+                batch_size=bs,
+                out_cache_loc=torch.arange(bs * steps, device=DEVICE),
+                positions=positions,
+                mrope_positions=mrope,
+                return_logprob=False,
+                native_dtype_logits=False,
+                step_fold_slots=(SimpleNamespace(embedding=None),) if slots else None,
+                step_fold_embedding=None,
+                mm_input_embeds=None,
+                sampling_info=SimpleNamespace(is_all_greedy=True),
+                spec_info=SimpleNamespace(
+                    topk_p=torch.ones((bs, 1), device=DEVICE),
+                    topk_index=torch.zeros((bs, 1), dtype=torch.int64, device=DEVICE),
+                    hidden_states=torch.zeros((bs, 4), device=DEVICE),
+                ),
+            )
+            top1 = (
+                torch.ones((bs, 1), device=DEVICE),
+                torch.zeros((bs, 1), dtype=torch.int64, device=DEVICE),
+            )
+            fold = MagicMock(return_value=top1)
+            stock = MagicMock(return_value=top1)
+            with (
+                self.subTest(glue=glue, slots=slots),
+                envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+                envs.SGLANG_OPT_SPEC_DRAFT_TOP1_NATIVE_LOGITS.override(False),
+                envs.SGLANG_Q38_LOOP_GLUE.override(glue),
+                patch(
+                    "sglang.srt.speculative.eagle_worker_v2.forward_context",
+                    side_effect=lambda *_a, **_k: contextlib.nullcontext(),
+                ),
+                patch("sglang.srt.speculative.eagle_worker_v2._is_cuda", True),
+                patch(
+                    "sglang.srt.speculative.eagle_worker_v2.get_spec",
+                    return_value=SimpleNamespace(
+                        speculative_use_rejection_sampling=False
+                    ),
+                ),
+                patch(
+                    "sglang.srt.speculative.eagle_worker_v2.draft_topk1_postprocess",
+                    stock,
+                ),
+                patch(
+                    "sglang.kernels.ops.speculative.draft_step_fold.finalize_next_input",
+                    fold,
+                ),
+            ):
+                worker.draft_forward(forward_batch)
+            fused = glue and slots
+            calls = fold.call_args_list + stock.call_args_list
+            self.assertEqual(len(calls), steps - 1)
+            for call in calls:
+                self.assertIs(call.kwargs["mrope_positions"], mrope if fused else None)
+            # The finalizers are mocks: only the stock per-step add moves MRoPE here.
+            expected = 0 if fused else steps - 1
+            self.assertTrue(torch.equal(mrope, torch.full_like(mrope, expected)))
+            self.assertEqual(seen, [fused] * (steps - 1))
+            self.assertFalse(forward_batch.native_dtype_logits)
+
 
 class TestEagleWorkerV2BackendFallback(CustomTestCase):
     def setUp(self):

@@ -509,6 +509,9 @@ class Envs:
     SGLANG_OPT_SPEC_DRAFT_TOP1_NATIVE_LOGITS = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # With Q38_MTP_STEP_INPUT_FOLD slots: the draft steps' logits stay native and the
+    # top-1 finalizers also advance the MRoPE positions (no separate add per step).
+    SGLANG_Q38_LOOP_GLUE = EnvBool(False)
     # Each scheduler runs gc.collect() and gc.freeze() right before its event loop, so a
     # full collection while serving no longer walks the startup objects.
     SGLANG_OPT_SCHEDULER_GC_FREEZE = EnvRuntimeBool(
