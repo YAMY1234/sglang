@@ -156,6 +156,57 @@ class TestGdnUcacheHost(CustomTestCase):
                 with getattr(envs, f"SGLANG_OPT_GDN_UCACHE_{name}").override("1"):
                     self.assertFalse(gdn_ucache_track_rings_supported(), name)
 
+    def test_pd_handshake_names_the_gdn_state_dtype(self):
+        from sglang.srt.runtime_context import get_context
+
+        override = get_context().override_server_args(mamba_ssm_dtype="float16")
+        override.install()
+        self.addCleanup(override.restore)
+        self.assertEqual(ucache.gdn_ucache_pd_dtype_tag("fp8_e4m3"), "fp8_e4m3")
+        with (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+            envs.SGLANG_OPT_GDN_UCACHE_PD.override("1"),
+        ):
+            self.assertEqual(
+                ucache.gdn_ucache_pd_dtype_tag("fp8_e4m3"),
+                "fp8_e4m3+gdn_state_float16",
+            )
+
+    def test_newly_acquired_windows_start_empty(self):
+        """A PD decode slot (or request row) runs no target extend before its first
+        verify, so acquiring it must empty its window."""
+        from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
+        from sglang.srt.mem_cache.kv.state_storage import StateStorage
+
+        for by_request_row in (False, True):
+            buffers = _allocate(num_slots=6, by_request_row=by_request_row)
+            buffers.hist_len.fill_(7)
+            storage = StateStorage(
+                sub_pool="mamba",
+                pool=SimpleNamespace(
+                    replayssm_spec_write_pos=None,
+                    replayssm_write_pos=None,
+                    gdn_ucache=buffers,
+                ),
+                slots=MambaSlotAllocator(size=5, device="cpu"),
+                layer_map={},
+                short_conv_pool=None,
+                ngram_pool=None,
+            )
+            table = SimpleNamespace(
+                device="cpu",
+                enable_mamba_extra_buffer=False,
+                req_index_to_mamba_index_mapping=torch.zeros(6, dtype=torch.int32),
+            )
+            req = SimpleNamespace(
+                kv=SimpleNamespace(holds_mamba=False, mamba_pool_idx=None)
+            )
+            storage.acquire(table, [req], [2], [True])
+            expected = torch.full((6,), 7, dtype=torch.int32)
+            expected[2 if by_request_row else int(req.kv.mamba_pool_idx)] = 0
+            with self.subTest(by_request_row=by_request_row):
+                self.assertTrue(torch.equal(buffers.hist_len, expected))
+
     def test_retraction_backup_is_refused_only_under_the_ucache(self):
         self.assertFalse(
             ucache.gdn_ucache_blocks_state_backup(SimpleNamespace(gdn_ucache=None))

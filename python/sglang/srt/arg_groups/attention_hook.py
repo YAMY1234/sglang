@@ -327,6 +327,7 @@ def handle_linear_attn_backend(server_args: Any):
     if cfg.enable_gdn_replayssm_ucache:
         _check_gdn_replayssm_ucache(server_args)
         _pin_gdn_ucache_state_dtype_env(cfg, flag="--enable-gdn-replayssm-ucache")
+    ucache_pd_prefill = _is_gdn_ucache_pd_prefill(cfg)
 
     # SM100+ FlashInfer GDN decode requires bf16 state; SM90 uses float32.
     decode = cfg.linear_attn_decode_backend or cfg.linear_attn_backend
@@ -360,6 +361,7 @@ def handle_linear_attn_backend(server_args: Any):
         decode == "flashinfer"
         and cfg.mamba_ssm_dtype != "bfloat16"
         and not cfg.enable_gdn_replayssm_ucache
+        and not ucache_pd_prefill
         and get_platform().is_cuda
         and torch.cuda.get_device_capability()[0] >= 10
     ):
@@ -393,6 +395,7 @@ def handle_linear_attn_backend(server_args: Any):
         verify == "flashinfer"
         and cfg.mamba_ssm_dtype != "bfloat16"
         and not cfg.enable_gdn_replayssm_ucache
+        and not ucache_pd_prefill
         and get_platform().is_cuda
         and torch.cuda.get_device_capability()[0] >= 10
     ):
@@ -660,10 +663,16 @@ def _check_gdn_replayssm_ucache_cache(cfg: Any, *, flag: str) -> None:
             f"{flag} does not support --enable-mixed-chunk: decode rows of a mixed "
             "batch would read the checkpoint without its unfolded window."
         )
-    if cfg.disaggregation_mode != "null":
+    # A PD decode role holds its slots' rings and cursors from pre-allocation on (the
+    # prefill's state lands in a slot whose window is empty); a PD prefill runs no verify.
+    pd_decode = (
+        cfg.disaggregation_mode == "decode" and envs.SGLANG_OPT_GDN_UCACHE_PD.get()
+    )
+    if cfg.disaggregation_mode != "null" and not pd_decode:
         raise ValueError(
-            f"{flag} does not support PD disaggregation; "
-            f"got --disaggregation-mode={cfg.disaggregation_mode!r}."
+            f"{flag} does not support PD disaggregation except on a decode role "
+            "with SGLANG_OPT_GDN_UCACHE_PD=1; got "
+            f"--disaggregation-mode={cfg.disaggregation_mode!r}."
         )
     if cfg.enable_streaming_session:
         raise ValueError(
@@ -686,6 +695,25 @@ def _check_gdn_replayssm_ucache_megakernel(cfg: Any, *, flag: str) -> None:
             f"{flag} cannot run with --enable-nvidia-megakernel: its verify step "
             "reads the GDN pool without the u-cache rings."
         )
+
+
+def _is_gdn_ucache_pd_prefill(cfg: Any) -> bool:
+    """A PD prefill feeding u-cache decoders: it ships the fp16 GDN state they keep, and
+    runs no decode or verify kernel, so the bf16-state FlashInfer checks do not apply."""
+    if not envs.SGLANG_OPT_GDN_UCACHE_PD.get() or cfg.disaggregation_mode != "prefill":
+        return False
+    # The transfer copies state bytes as is; a bf16 prefill would feed fp16 decoders
+    # reinterpreted bits (the PD handshake also checks it, see gdn_ucache_pd_dtype_tag).
+    if cfg.mamba_ssm_dtype != "float16":
+        raise ValueError(
+            "SGLANG_OPT_GDN_UCACHE_PD=1 on a PD prefill requires --mamba-ssm-dtype "
+            f"float16, the GDN state of its u-cache decoders; got {cfg.mamba_ssm_dtype!r}."
+        )
+    logger.info(
+        "SGLANG_OPT_GDN_UCACHE_PD: PD prefill keeps an fp16 GDN state for "
+        "u-cache decoders."
+    )
+    return True
 
 
 def handle_gdn_replayssm_ucache_spec_shape(server_args: Any) -> None:

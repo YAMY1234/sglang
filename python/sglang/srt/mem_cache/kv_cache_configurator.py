@@ -1603,6 +1603,7 @@ class KVCacheConfigurator:
                 host_only_mamba_checkpoint() and self.hybrid_kda_config is not None
             ),
             allocate_intermediate_ssm=self.allocate_intermediate_ssm,
+            enable_gdn_replayssm_ucache=self._gdn_replayssm_ucache_active(),
         )
         return req_to_token_pool
 

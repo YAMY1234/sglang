@@ -535,6 +535,9 @@ class Envs:
     # Verify batches above this keep the separate norm: measured VR200 chain, the fold is faster at
     # B 32 / 48 and slower from B 60 (the per-head barrier sits on the flush's critical path).
     SGLANG_GDN_UCACHE_FUSED_NORM_MAX_BATCH = EnvInt(48)
+    # Under PD: set on both roles; the decode role runs the u-cache verify, the prefill role
+    # keeps the fp16 GDN state its transfers carry.
+    SGLANG_OPT_GDN_UCACHE_PD = EnvRuntimeBool(False)
 
     # ===================================================================
     # Model configuration, discovery, and weight loading

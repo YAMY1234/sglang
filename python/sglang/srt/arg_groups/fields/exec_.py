@@ -652,7 +652,8 @@ class ExecMamba(msgspec.Struct):
         "With the radix cache on, sets GDN_UCACHE_STATE_DTYPE=fp16 for FlashInfer "
         "and refuses another value. Refuses mixed chunk, "
         "streaming sessions, unified memory, int8 mamba checkpoints, the NVIDIA "
-        "megakernel and PD disaggregation; needs FlashInfer >= 0.7.3.",
+        "megakernel and PD disaggregation (except a decode role under "
+        "SGLANG_OPT_GDN_UCACHE_PD); needs FlashInfer >= 0.7.3.",
     ] = False
 
 

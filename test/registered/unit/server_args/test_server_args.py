@@ -25,6 +25,7 @@ from sglang.srt.arg_groups import attention_hook
 from sglang.srt.arg_groups.attention_hook import (
     _check_gdn_replayssm_ucache,
     _check_gdn_replayssm_ucache_cache,
+    _is_gdn_ucache_pd_prefill,
     _check_gdn_replayssm_ucache_megakernel,
     _check_gdn_replayssm_ucache_spec,
     _pin_gdn_ucache_state_dtype_env,
@@ -1564,6 +1565,44 @@ class TestGdnReplaySsmUcacheArgs(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "PD disaggregation"):
                 self._check(disable_radix_cache=True, disaggregation_mode=mode)
 
+    def test_pd_decode_role_is_accepted_under_the_pd_switch(self):
+        """SGLANG_OPT_GDN_UCACHE_PD: the decode role runs the u-cache verify; a prefill
+        role runs no verify and keeps refusing the flag."""
+        with (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+            envs.SGLANG_OPT_GDN_UCACHE_PD.override("1"),
+        ):
+            self._check(disable_radix_cache=True, disaggregation_mode="decode")
+            with self.assertRaisesRegex(ValueError, "PD disaggregation"):
+                self._check(disable_radix_cache=True, disaggregation_mode="prefill")
+            with self.assertRaisesRegex(ValueError, "aggregated serving only"):
+                self._check(
+                    mamba_radix_cache_strategy="extra_buffer",
+                    disaggregation_mode="decode",
+                )
+
+    def test_pd_prefill_keeps_an_fp16_state_for_ucache_decoders(self):
+        def pd_prefill(**kwargs):
+            return _is_gdn_ucache_pd_prefill(
+                resolving_view(ServerArgs(model_path="dummy", **kwargs))
+            )
+
+        self.assertFalse(
+            pd_prefill(disaggregation_mode="prefill", mamba_ssm_dtype="float16")
+        )
+        with (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+            envs.SGLANG_OPT_GDN_UCACHE_PD.override("1"),
+        ):
+            self.assertTrue(
+                pd_prefill(disaggregation_mode="prefill", mamba_ssm_dtype="float16")
+            )
+            self.assertFalse(
+                pd_prefill(disaggregation_mode="decode", mamba_ssm_dtype="float16")
+            )
+            with self.assertRaisesRegex(ValueError, "--mamba-ssm-dtype float16"):
+                pd_prefill(disaggregation_mode="prefill", mamba_ssm_dtype="bfloat16")
+
     def test_incompatible_cache_features_are_rejected(self):
         for kwargs, message in (
             (dict(enable_int8_mamba_checkpoint=True), "--enable-int8-mamba-checkpoint"),
@@ -1663,6 +1702,14 @@ class TestGdnReplaySsmUcacheArgs(unittest.TestCase):
                 ServerArgs(enable_gdn_replayssm_ucache=True, **kwargs)
             )
             check.assert_called_once()
+            # A PD prefill feeding u-cache decoders keeps the fp16 state too.
+            with (
+                envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+                envs.SGLANG_OPT_GDN_UCACHE_PD.override("1"),
+            ):
+                handle_linear_attn_backend(
+                    ServerArgs(disaggregation_mode="prefill", **kwargs)
+                )
 
 
 class TestKV4Compatibility(unittest.TestCase):

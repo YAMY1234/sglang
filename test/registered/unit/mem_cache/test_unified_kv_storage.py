@@ -455,7 +455,10 @@ def _state(slots: int) -> StateStorage:
     return StateStorage(
         sub_pool="mamba",
         pool=SimpleNamespace(
-            replayssm_spec_write_pos=None, replayssm_write_pos=None, size=slots
+            replayssm_spec_write_pos=None,
+            replayssm_write_pos=None,
+            gdn_ucache=None,
+            size=slots,
         ),
         slots=MambaSlotAllocator(slots, "cpu"),
         layer_map={0: 0},

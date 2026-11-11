@@ -133,6 +133,8 @@ class StateStorage:
         the extra buffer, its ping-pong tracking slots, and writes them into
         the table's columns. A request that already holds a slot (a radix hit,
         a continuing chunk) keeps it."""
+        gdn_ucache = self.pool.gdn_ucache
+        ucache_by_row = gdn_ucache is not None and gdn_ucache.by_request_row
         mamba_indices: list[torch.Tensor] = []
         mamba_ping_pong_track_buffers: list[torch.Tensor] = []
         # What this call hands out, given back if a later request finds no slot.
@@ -151,6 +153,12 @@ class StateStorage:
                 req.kv.mamba_pool_idx = mid
                 req.kv.mamba_needs_clear = True
             given_state.extend(needing)
+            # An empty u-cache window: a PD decode slot runs no target extend
+            # (whose reset_gdn_ucache_cursors covers agg) before its first verify.
+            if gdn_ucache is not None and not ucache_by_row:
+                gdn_ucache.hist_len.index_fill_(
+                    0, self.slots.translate(mids).to(torch.int64), 0
+                )
             # A zero write_pos empties the ReplaySSM ring;
             # decode then reads only the checkpoint written by prefill.
             if self.pool.replayssm_write_pos is not None:
@@ -193,12 +201,19 @@ class StateStorage:
         new request; on the forward stream (`RowResets`). Static pools only: a
         unified pool resets them with the rest of its request memory."""
         write_pos = self.pool.replayssm_spec_write_pos
-        if write_pos is None:
+        gdn_ucache = self.pool.gdn_ucache
+        ucache_by_row = gdn_ucache is not None and gdn_ucache.by_request_row
+        if write_pos is None and not ucache_by_row:
             return
         indices = async_h2d(rows, dtype=torch.int64, device=device)
-        write_pos.index_fill_(0, indices, 0)
-        self.pool.replayssm_cache_base.index_fill_(0, indices, 0)
-        self.pool.replayssm_is_flush.index_fill_(0, indices, 0)
+        if write_pos is not None:
+            write_pos.index_fill_(0, indices, 0)
+            self.pool.replayssm_cache_base.index_fill_(0, indices, 0)
+            self.pool.replayssm_is_flush.index_fill_(0, indices, 0)
+        if ucache_by_row:
+            # The row-indexed u-cache window restarts with its request (a PD decode
+            # row runs no target extend before its first verify).
+            gdn_ucache.hist_len.index_fill_(0, indices, 0)
 
     def alloc_ping_pong_buffer(self, table, req: Req) -> bool:
         """Return False if slots are exhausted. Lazy mode starts with one slot

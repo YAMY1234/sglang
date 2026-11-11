@@ -804,6 +804,17 @@ def _load_flush_kernel(device: torch.device) -> Callable:
     return gated_delta_rule_mtp_ucache_flush_umma
 
 
+def gdn_ucache_pd_dtype_tag(kv_cache_dtype_str: str) -> str:
+    """The KV dtype string a PD handshake compares between prefill and decode; under
+    SGLANG_OPT_GDN_UCACHE_PD it names the GDN state dtype too, since the state
+    transfer copies bytes and bf16 and fp16 slots have the same size."""
+    if not envs.SGLANG_OPT_GDN_UCACHE_PD.get():
+        return kv_cache_dtype_str
+    from sglang.srt.runtime_context import get_exec
+
+    return f"{kv_cache_dtype_str}+gdn_state_{get_exec().mamba.mamba_ssm_dtype}"
+
+
 def gdn_ucache_blocks_state_backup(mamba_pool) -> bool:
     """Whether a host backup of a slot's checkpoint would lose state: under the u-cache
     verify the checkpoint lags the slot's unfolded ring window, which no backup copies."""
@@ -872,11 +883,12 @@ class GdnUcacheVerifier:
         if not _engaged_logged:
             _engaged_logged = True
             logger.info(
-                "GDN u-cache verify engaged: %s.%s, first GDN layer %d, "
+                "GDN u-cache verify engaged: %s.%s, first GDN layer %d, PD decode %s, "
                 "radix extend-time checkpoints %s, flush options %s",
                 self._flush_kernel.__module__,
                 self._flush_kernel.__name__,
                 first_layer_id,
+                envs.SGLANG_OPT_GDN_UCACHE_PD.get(),
                 get_exec().mamba.enable_mamba_extra_buffer,
                 self._options,
             )

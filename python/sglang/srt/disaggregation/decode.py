@@ -358,6 +358,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         ngram_context_len: int = 0,
         ngram_eos_token_id: int = 0,
         replayssm_request_ring: bool = False,
+        enable_gdn_replayssm_ucache: bool = False,
     ):
         DecodeReqToTokenPool.__init__(
             self,
@@ -415,6 +416,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             replayssm_request_ring=replayssm_request_ring,
             ngram_context_len=ngram_context_len,
             ngram_eos_token_id=ngram_eos_token_id,
+            enable_gdn_replayssm_ucache=enable_gdn_replayssm_ucache,
         )
 
     def clear(self):
@@ -837,7 +839,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = get_parallel().dp_rank
-        kv_args.kv_cache_dtype_str = (
+        from sglang.srt.layers.attention.linear.gdn_replayssm_ucache import (
+            gdn_ucache_pd_dtype_tag,
+        )
+
+        kv_args.kv_cache_dtype_str = gdn_ucache_pd_dtype_tag(
             self.scheduler.tp_worker.model_runner.kv_cache_dtype_str
         )
         kv_args.kv_layout = get_pd_kv_layout(self.token_to_kv_pool)
