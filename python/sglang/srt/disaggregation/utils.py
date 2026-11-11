@@ -437,14 +437,48 @@ def check_state_wire(
     )
 
 
+def state_entry_keys(state_types: Sequence[str]) -> List[Tuple[str, int]]:
+    """Each state entry as (state type, occurrence of that type so far): a PP
+    prefill stage's entries pair with the decode entries of the same key."""
+    seen: Dict[str, int] = {}
+    keys = []
+    for state_type in state_types:
+        keys.append((state_type, seen.get(state_type, 0)))
+        seen[state_type] = seen.get(state_type, 0) + 1
+    return keys
+
+
+def resolve_state_component_dst_index(
+    src_state_types: Sequence, dst_state_types: Sequence, src_index: int
+) -> int:
+    """The decode entry a prefill state entry pairs with; positional when the
+    decode did not publish its state types."""
+    if not dst_state_types:
+        return src_index
+    key = state_entry_keys(src_state_types)[src_index]
+    dst_keys = state_entry_keys(dst_state_types)
+    if key not in dst_keys:
+        raise RuntimeError(
+            f"Decode peer has no state entry {key[0]} #{key[1]}: it registers "
+            f"{list(dst_state_types)}"
+        )
+    return dst_keys.index(key)
+
+
 def check_stage_state_wires(
     stage_wires: List[Optional[List[List[Optional[str]]]]],
     decode_wire: Optional[List[List[Optional[str]]]],
+    *,
+    by_type: bool = False,
 ) -> None:
     """For a decode receiving from every prefill stage: each stage's entries
-    pair with the decode's leading ones, and all registered stages together
-    reach its last entry. ``stage_wires`` is None for an unregistered stage."""
+    pair with the decode's leading ones, or with ``by_type`` the decode's of the
+    same type and occurrence, and all registered stages together cover the
+    decode's entries. ``stage_wires`` is None for an unregistered stage."""
     if decode_wire is None:
+        return
+    if by_type:
+        _check_stage_state_wires_by_type(stage_wires, decode_wire)
         return
     for wire in stage_wires:
         if wire is None:
@@ -459,6 +493,29 @@ def check_stage_state_wires(
                 f"PD state entry mismatch: the prefill's pipeline stages register "
                 f"{stage_wires}, but no stage registers the decode server's "
                 f"entries past the first {covered}: {decode_wire[covered:]}."
+            )
+
+
+def _check_stage_state_wires_by_type(
+    stage_wires: List[Optional[List[List[Optional[str]]]]],
+    decode_wire: List[List[Optional[str]]],
+) -> None:
+    decode_keys = state_entry_keys([entry[0] for entry in decode_wire])
+    covered = set()
+    for wire in stage_wires:
+        if wire is None:
+            continue
+        keys = state_entry_keys([entry[0] for entry in wire])
+        if not set(keys) <= set(decode_keys):
+            check_state_wire(wire, decode_wire)
+        check_state_wire(wire, [decode_wire[decode_keys.index(key)] for key in keys])
+        covered.update(keys)
+    if stage_wires and all(wire is not None for wire in stage_wires):
+        missing = [key for key in decode_keys if key not in covered]
+        if missing:
+            raise RuntimeError(
+                f"PD state entry mismatch: the prefill's pipeline stages register "
+                f"{stage_wires}, but none registers the decode server's {missing}."
             )
 
 
@@ -1895,25 +1952,15 @@ def _token_kv_view(token_to_kv_pool):
 
 
 def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
-    """Describe the positional transfer layout without pool capacities or pointers."""
+    """The DSpark contract every rank of both PD roles shares. A PP prefill stage
+    registers only its own entries, which pair by state type and layer id."""
     ratios = getattr(kv_args, "mla_compression_ratios", None) or []
     if 2 not in ratios or str(get_spec().speculative_algorithm).upper() != "DSPARK":
         return None
-
-    from sglang.srt.disaggregation.base.conn import StateType
-
-    if kv_args.state_types.count(StateType.SWA) != 2:
-        raise RuntimeError(
-            "DeepSeek-V4.1 DSpark PD requires target and draft SWA state"
-        )
-
     return {
+        "protocol_version": 2,
         "num_draft_tokens": get_spec().speculative_num_draft_tokens,
         "compression_ratios": list(ratios),
-        "kv_layer_ids": list(kv_args.kv_layer_ids),
-        "kv_item_lens": list(kv_args.kv_item_lens),
-        "state_types": [state_type.value for state_type in kv_args.state_types],
-        "state_item_lens": [list(items) for items in kv_args.state_item_lens],
     }
 
 

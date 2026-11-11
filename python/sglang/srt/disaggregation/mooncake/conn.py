@@ -59,6 +59,7 @@ from sglang.srt.disaggregation.utils import (
     filter_kv_indices_for_shard_rank,
     is_elided_entry,
     resolve_dcp_dst_entry_indices,
+    resolve_state_component_dst_index,
     should_send_replicated_state,
     slice_dsa_tail_dst_ptrs_for_pp,
 )
@@ -179,6 +180,8 @@ class KVArgsRegisterInfo:
     staging_base_ptr: int = 0
     staging_total_size: int = 0
     dst_aux_item_lens: Optional[List[int]] = None
+    # Parallel to dst_state_data_ptrs; empty from a decode that does not publish it.
+    dst_state_types: List[str] = dataclasses.field(default_factory=list)
     staging: Optional[StagingRegisterInfo] = None
 
     @classmethod
@@ -233,6 +236,9 @@ class KVArgsRegisterInfo:
                 else []
             ),
             dst_draft_rows_dcp_collapsed=(len(msg) > 21 and msg[21] == b"1"),
+            dst_state_types=(
+                msg[22].decode("ascii").split(",") if len(msg) > 22 and msg[22] else []
+            ),
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 15, slot_ids_index=19),
         )
@@ -267,6 +273,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     supports_role_switch = True
     # Bootstrap thread defers the ABORT ack until the transfer worker drains.
     supports_deferred_decode_kv_release = True
+    pairs_state_by_type = True
 
     def __init__(
         self,
@@ -1104,14 +1111,24 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             if not self._is_generic_kvcache_state_type(st):
                 # Mamba, DSA tail and MiniMax send paths check their own layout.
                 continue
+            try:
+                j = resolve_state_component_dst_index(
+                    [state_type.value for state_type in state_types],
+                    registration_info.dst_state_types,
+                    i,
+                )
+            except RuntimeError:
+                # The decode registers no such entry; let the send path report it.
+                fully_checked = False
+                continue
             dst_data_ptrs = (
-                registration_info.dst_state_data_ptrs[i]
-                if i < len(registration_info.dst_state_data_ptrs)
+                registration_info.dst_state_data_ptrs[j]
+                if j < len(registration_info.dst_state_data_ptrs)
                 else []
             )
             dst_item_lens = (
-                registration_info.dst_state_item_lens[i]
-                if i < len(registration_info.dst_state_item_lens)
+                registration_info.dst_state_item_lens[j]
+                if j < len(registration_info.dst_state_item_lens)
                 else []
             )
             if not dst_data_ptrs or not dst_item_lens:
@@ -1135,8 +1152,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         else []
                     ),
                     dst_layer_ids=(
-                        registration_info.dst_state_layer_ids[i]
-                        if i < len(registration_info.dst_state_layer_ids)
+                        registration_info.dst_state_layer_ids[j]
+                        if j < len(registration_info.dst_state_layer_ids)
                         else []
                     ),
                 )
@@ -2246,32 +2263,39 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             src_state_layer_ids = (
                 src_state_layer_ids[i] if i < len(src_state_layer_ids) else []
             )
+            # A PP stage registers a subset of the decode's state entries.
+            j = i
             if target_rank_registration_info is not None:
+                j = resolve_state_component_dst_index(
+                    [state_type.value for state_type in state_types],
+                    target_rank_registration_info.dst_state_types,
+                    i,
+                )
                 dst_data_ptrs = (
-                    target_rank_registration_info.dst_state_data_ptrs[i]
-                    if i < len(target_rank_registration_info.dst_state_data_ptrs)
+                    target_rank_registration_info.dst_state_data_ptrs[j]
+                    if j < len(target_rank_registration_info.dst_state_data_ptrs)
                     else []
                 )
                 dst_item_lens = (
-                    target_rank_registration_info.dst_state_item_lens[i]
-                    if i < len(target_rank_registration_info.dst_state_item_lens)
+                    target_rank_registration_info.dst_state_item_lens[j]
+                    if j < len(target_rank_registration_info.dst_state_item_lens)
                     else []
                 )
                 dst_dim_per_tensor = (
-                    target_rank_registration_info.dst_state_dim_per_tensor[i]
-                    if i < len(target_rank_registration_info.dst_state_dim_per_tensor)
+                    target_rank_registration_info.dst_state_dim_per_tensor[j]
+                    if j < len(target_rank_registration_info.dst_state_dim_per_tensor)
                     else []
                 )
                 dst_state_layer_ids = (
-                    target_rank_registration_info.dst_state_layer_ids[i]
-                    if i < len(target_rank_registration_info.dst_state_layer_ids)
+                    target_rank_registration_info.dst_state_layer_ids[j]
+                    if j < len(target_rank_registration_info.dst_state_layer_ids)
                     else []
                 )
             else:
                 dst_data_ptrs, dst_item_lens, dst_dim_per_tensor = [], [], []
                 dst_state_layer_ids = []
             dst_indices = (
-                req.dst_state_indices[i] if i < len(req.dst_state_indices) else []
+                req.dst_state_indices[j] if j < len(req.dst_state_indices) else []
             )
 
             if st == StateType.MAMBA:
@@ -3579,6 +3603,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 *self.kv_args.kv_item_lens,
             ),
             b"1" if self.kv_args.draft_rows_dcp_collapsed else b"0",
+            ",".join(st.value for st in self.kv_args.state_types).encode("ascii"),
         ]
 
     def build_receiver_metadata_message(

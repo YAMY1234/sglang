@@ -17,7 +17,7 @@ import msgspec
 import numpy as np
 import zmq
 
-from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
     CommonKVBootstrapServer,
     CommonKVManager,
@@ -174,6 +174,7 @@ class TestReceiverControlMessages(CustomTestCase):
             state_item_lens=[[32]],
             state_dim_per_tensor=[[4]],
             state_layer_ids=[[7]],
+            state_types=[StateType.SWA],
             engine_rank=0,
             gpu_id=0,
             draft_rows_dcp_collapsed=True,
@@ -237,6 +238,7 @@ class TestReceiverControlMessages(CustomTestCase):
                 b"",
                 struct.pack("Q", 16),
                 b"1",
+                b"swa",
             ],
             "nixl": [
                 b"NixlMsgGuard",
@@ -317,6 +319,8 @@ class TestReceiverControlMessages(CustomTestCase):
                 self.assertTrue(info.dst_draft_rows_dcp_collapsed)
                 if backend == "nixl":
                     self.assertEqual(info.dst_state_data_lens, [[512]])
+                else:
+                    self.assertEqual(info.dst_state_types, ["swa"])
 
     def test_metadata_wire_is_preserved_for_all_peers(self):
         for backend in self.backends:

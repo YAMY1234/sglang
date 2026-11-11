@@ -312,6 +312,9 @@ class CommonKVManager(BaseKVManager):
     defer_decode_allocation: bool = False
     deferred_bootstrap: Optional[DeferredBootstrap] = None
     _staging_ctx = None
+    # The prefill sender pairs each state entry with the decode entry of the same
+    # type and occurrence, so a PP stage may register any subset of them.
+    pairs_state_by_type: bool = False
 
     # Wire layout of the prefill->decode terminal status message. The legacy
     # layout (mooncake, and ascend which inherits it) is three untagged frames
@@ -1411,6 +1414,7 @@ class CommonKVManager(BaseKVManager):
                 for stage in range(info.pp_size)
             ],
             decode_wire,
+            by_type=self.pairs_state_by_type,
         )
 
     def try_ensure_parallel_info(self, bootstrap_addr: str) -> bool:

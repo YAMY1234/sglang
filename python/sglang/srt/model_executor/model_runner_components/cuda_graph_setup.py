@@ -542,6 +542,14 @@ def capture_prefill_graph(
     if model_runner.is_draft_worker and not force_for_draft_worker:
         return result(None)
 
+    # DeepSeek-V4.1 prefill graphs have not been validated under PP.
+    if (
+        get_parallel().pp_size > 1
+        and model_runner.model_config.hf_config.model_type == "deepseek_v41"
+    ):
+        logger.info("Disable prefill CUDA graph for DeepSeek-V4.1 PP; running eager.")
+        return result(eager_runner)
+
     if model_runner.is_draft_worker and get_parallel().enable_prefill_cp:
         from sglang.srt.layers.cp.base import is_interleave
 

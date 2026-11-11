@@ -171,6 +171,7 @@ class TestMiniMaxStateTransfer(CustomTestCase):
                         dst_state_item_lens=[[dst.itemsize]],
                         dst_state_dim_per_tensor=[[]],
                         dst_state_layer_ids=[[]],
+                        dst_state_types=[],
                         dst_attn_tp_size=1,
                     )
                     kwargs = dict(

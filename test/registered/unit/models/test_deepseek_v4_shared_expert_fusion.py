@@ -85,8 +85,9 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
 
     def test_v41_vision_admits_cuda_megamoe_with_dp_attention(self):
         """A vision-capable checkpoint must initialize for text or image serving
-        with DP attention and CUDA MegaMoE. CP, PP and other A2A paths still lack
-        vision routing support and must fail before constructing the tower.
+        with DP attention and CUDA MegaMoE. CP and other A2A paths still lack
+        vision routing support and must fail before constructing the tower; under
+        PP only the first stage builds it, a later stage receives its embeddings.
         """
         self._publish(enforce=False)
         config = DeepSeekV4Config(
@@ -108,24 +109,28 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
         backbone.start_layer = 0
         backbone.end_layer = 0
         cases = (
-            (MoeA2ABackend.MEGAMOE, True, 1, 1, True),
-            (MoeA2ABackend.NONE, True, 1, 1, True),
-            (MoeA2ABackend.MEGAMOE, False, 1, 1, False),
-            (MoeA2ABackend.DEEPEP, True, 1, 1, False),
-            (MoeA2ABackend.MEGAMOE, True, 2, 1, False),
-            (MoeA2ABackend.MEGAMOE, True, 1, 2, False),
+            (MoeA2ABackend.MEGAMOE, True, 1, 1, True, "vision"),
+            (MoeA2ABackend.NONE, True, 1, 1, True, "vision"),
+            (MoeA2ABackend.MEGAMOE, False, 1, 1, True, "raise"),
+            (MoeA2ABackend.DEEPEP, True, 1, 1, True, "raise"),
+            (MoeA2ABackend.MEGAMOE, True, 2, 1, True, "raise"),
+            (MoeA2ABackend.MEGAMOE, True, 1, 2, True, "vision"),
+            (MoeA2ABackend.MEGAMOE, True, 1, 2, False, "none"),
         )
-        for backend, cuda, cp, pp, admitted in cases:
-            with self.subTest(backend=backend, cuda=cuda, cp=cp, pp=pp):
+        for backend, cuda, cp, pp, first, expected in cases:
+            with self.subTest(backend=backend, cuda=cuda, cp=cp, pp=pp, first=first):
                 with (
                     get_parallel().override(
                         tp_size=4,
+                        tp_rank=0,
                         attn_dp_size=2,
                         attn_tp_size=2 // cp,
                         attn_cp_size=cp,
                         moe_ep_size=4,
                         pp_size=pp,
-                        pp_group=SimpleNamespace(world_size=pp, is_last_rank=True),
+                        pp_group=SimpleNamespace(
+                            world_size=pp, is_first_rank=first, is_last_rank=True
+                        ),
                     ),
                     get_flags().moe.override(a2a_backend=backend),
                     get_model().override(
@@ -140,13 +145,17 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
                     ),
                     patch.object(deepseek_v4, "get_attn_tp_context"),
                 ):
-                    if admitted:
-                        model = DeepseekV4ForCausalLM(config)
+                    if expected == "raise":
+                        with self.assertRaisesRegex(ValueError, "V4.1 vision"):
+                            DeepseekV4ForCausalLM(config)
+                        continue
+                    model = DeepseekV4ForCausalLM(config)
+                    self.assertTrue(model.dsv41_multimodal)
+                    if expected == "vision":
                         self.assertIsInstance(model.vision, nn.Module)
                         self.assertEqual(model.image_start.shape, (4,))
                     else:
-                        with self.assertRaisesRegex(ValueError, "V4.1 vision"):
-                            DeepseekV4ForCausalLM(config)
+                        self.assertIsNone(model.vision)
 
     def test_enables_shared_fusion_when_enforced(self):
         self._publish(enforce=True)

@@ -16,6 +16,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
     build_dspark_swa_page_indices,
     compute_dspark_window_gather,
 )
+from sglang.srt.disaggregation.utils import build_transfer_entry_pairs
 from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
@@ -776,6 +777,59 @@ class TestV41KVPoolLayouts(CustomTestCase):
         c4_kv_rows = _num_dsv4_physical_kv_pages(PAGE_SIZE, PAGE_SIZE // 4, PAGE_SIZE)
         self.assertEqual(rows[:2], [c4_kv_rows] * 2)  # c4 KV, then its indexer
         self.assertEqual(min(rows), c4_kv_rows)
+
+    def test_pp_stage_entries_pair_one_to_one_with_decode_entries(self):
+        """A PP prefill stage registers only its own layers, so its KV, SWA and
+        request-state entries reach the decode by layer id: every stage entry must
+        land on a decode entry of the same size, and the stages together must
+        write each decode entry exactly once."""
+        # DeepSeek-V4.1-Flash: layers 0-1 SWA only, 2-19 ratio 2, 20-39 ratio 1.
+        ratios = [0, 0] + [2] * 18 + [1] * 20
+        sources = [2, 8, 14, 20]
+        decode = self.make_pool(ratios, sources, KVLayout.V41)
+        registered = {
+            "kv": lambda pool: (pool.get_contiguous_buf_infos, pool.get_kv_layer_ids),
+            "swa": lambda pool: (pool.get_state_buf_infos, pool.get_state_layer_ids),
+            "request": lambda pool: (
+                pool.get_request_state_buf_infos,
+                pool.get_request_state_layer_ids,
+            ),
+        }
+        for boundary in (20, 8):
+            stages = [
+                self.make_pool(
+                    ratios, sources, KVLayout.V41, start_layer=start, end_layer=end
+                )
+                for start, end in ((0, boundary), (boundary, len(ratios)))
+            ]
+            # An entry's layer id names the buffer the layer itself reads.
+            for stage in stages:
+                kv_ptrs = stage.get_contiguous_buf_infos()[0]
+                for layer_id in sum(stage.sources_by_ratio.values(), []):
+                    item = stage.layer_mapping[layer_id]
+                    buffer = item.compress_kv_pool.kv_buffer[item.compress_layer_id]
+                    entry = stage.get_kv_layer_ids().index(layer_id)
+                    self.assertEqual(kv_ptrs[entry], buffer.data_ptr())
+                swa_ptrs = stage.get_state_buf_infos()[0]
+                for entry, layer_id in enumerate(stage.get_state_layer_ids()):
+                    buffer = stage.get_swa_raw_buffer(layer_id)
+                    self.assertEqual(swa_ptrs[entry], buffer.data_ptr())
+            for name, entries in registered.items():
+                with self.subTest(boundary=boundary, entries=name):
+                    infos, layer_ids = entries(decode)
+                    dst_ids, dst_item_lens = layer_ids(), infos()[2]
+                    self.assertEqual(len(dst_ids), len(dst_item_lens))
+                    written = []
+                    for stage in stages:
+                        infos, layer_ids = entries(stage)
+                        src_ids, src_item_lens = layer_ids(), infos()[2]
+                        self.assertEqual(len(src_ids), len(src_item_lens))
+                        for i, j in build_transfer_entry_pairs(
+                            src_ids, dst_ids, len(src_ids), len(dst_ids)
+                        ):
+                            self.assertEqual(src_item_lens[i], dst_item_lens[j])
+                            written.append(j)
+                    self.assertEqual(sorted(written), list(range(len(dst_ids))))
 
 
 class TestDSparkDraftRingWithEncoderReplay(CustomTestCase):

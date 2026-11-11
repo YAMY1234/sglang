@@ -16,7 +16,8 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVManager,
     PrefillServerInfo,
 )
-from sglang.srt.disaggregation.utils import get_spec_kv_layout
+from sglang.srt.disaggregation.base.conn import StateType
+from sglang.srt.disaggregation.utils import get_dsv41_spec_layout, get_spec_kv_layout
 from sglang.test.test_utils import CustomTestCase, published_topology
 
 PAGE = 64
@@ -193,6 +194,34 @@ class TestSpecKVLayoutBootstrap(CustomTestCase):
                 self.assertEqual(status, 200)
                 self.assertEqual(payload.get("spec_kv_layout"), expected)
                 self.assertEqual("spec_kv_layout" in payload, expected is not None)
+
+    def test_dsv41_pp_stages_publish_one_dspark_layout(self):
+        """BUG REGRESSION. A DeepSeek-V4.1 PP prefill stage registers only its own
+        KV and state entries (the draft SWA only on the last stage), yet the
+        bootstrap refuses ranks whose DSpark layouts differ."""
+        ratios = [0, 0] + [2] * 18 + [1] * 20 + [0] * 3
+        stages = [
+            SimpleNamespace(
+                mla_compression_ratios=ratios,
+                kv_layer_ids=[2, 8, 14, 2, 8, 14],
+                state_types=[StateType.SWA, StateType.DSV4_REQUEST_STATE],
+            ),
+            SimpleNamespace(
+                mla_compression_ratios=ratios,
+                kv_layer_ids=[20, 20],
+                state_types=[StateType.SWA, StateType.SWA, StateType.REQUEST_ROW],
+            ),
+        ]
+        with published_topology(
+            speculative_algorithm="DSPARK", speculative_num_draft_tokens=6
+        ):
+            layouts = [get_dsv41_spec_layout(kv_args) for kv_args in stages]
+        server = bootstrap_server()
+        for pp_rank, dsv41_spec_layout in enumerate(layouts):
+            status = register(
+                server, self.row, pp_rank=pp_rank, dsv41_spec_layout=dsv41_spec_layout
+            ).status
+            self.assertEqual(status, 200)
 
     def test_known_layouts_must_agree_across_ranks(self):
         server = bootstrap_server()

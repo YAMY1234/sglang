@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.arg_groups.engram_config import (
     EngramConfig,
@@ -91,6 +91,9 @@ def _engram_config_from_env(cfg) -> EngramConfig:
             if shared
             else EngramReplication.NONE,
         )
+    if cfg.pp_size > 1:
+        # A PP stage shards its Engram tables over its own TP group only.
+        return EngramConfig(placement=EngramPlacement.CPU)
     return EngramConfig()
 
 
@@ -350,6 +353,66 @@ def validate_deepseek_v41_encoder_replay_budget(server_args: ServerArgs) -> None
         )
 
 
+def dsv41_pp_foreign_source_layer(config, start: int, end: int) -> Optional[int]:
+    """The first layer in [start, end) that reads compressed KV, top-k or candidates
+    from a source layer before ``start``, else None."""
+    ratios = config.compress_ratios
+
+    def latest(sources, layer_id: int) -> int:
+        same_ratio = [
+            s for s in sources if s <= layer_id and ratios[s] == ratios[layer_id]
+        ]
+        return max(same_ratio, default=-1)
+
+    for layer_id in range(start, end):
+        if ratios[layer_id] not in (1, 2):
+            continue
+        sources = [
+            latest(config.kv_source_layer_ids, layer_id),
+            latest(config.index_source_layer_ids, layer_id),
+        ]
+        if (
+            layer_id in config.index_source_layer_ids
+            and 0 <= config.candidate_source_layer_id < layer_id
+        ):
+            sources.append(config.candidate_source_layer_id)
+        if min(sources) < start:
+            return layer_id
+    return None
+
+
+def _validate_deepseek_v41_pp(server_args: ServerArgs) -> None:
+    from sglang.srt.distributed.utils import get_pp_indices
+
+    cfg = resolving_view(server_args)
+    if cfg.disaggregation_mode != "prefill":
+        raise ValueError(
+            "DeepSeek-V4.1 pipeline parallelism runs only on a PD prefill server."
+        )
+    # Only Mooncake pairs a stage's state entries with the decode's by state type.
+    if cfg.disaggregation_transfer_backend != "mooncake":
+        raise ValueError(
+            "DeepSeek-V4.1 pipeline parallelism requires the Mooncake transfer backend."
+        )
+    config = model_config_of(server_args).hf_text_config
+    num_layers = config.num_hidden_layers
+    for pp_rank in range(1, cfg.pp_size):
+        start, end = get_pp_indices(num_layers, pp_rank, cfg.pp_size)
+        layer_id = dsv41_pp_foreign_source_layer(config, start, end)
+        if layer_id is not None:
+            boundaries = [
+                b
+                for b in range(1, num_layers)
+                if dsv41_pp_foreign_source_layer(config, b, num_layers) is None
+            ]
+            raise ValueError(
+                f"DeepSeek-V4.1 PP stage {pp_rank} (layers [{start}, {end})) starts "
+                f"after a source layer that layer {layer_id} reads. Set "
+                "SGLANG_PP_LAYER_PARTITION so that every stage starts at one of "
+                f"layers {boundaries}."
+            )
+
+
 def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
     from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
         is_unified_kv_triton,
@@ -426,7 +489,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             cfg.dsv4_attn_backend == "trtllm" and cfg.enable_encoder_swa_bounded_replay,
         ),
         ("two-batch overlap", cfg.enable_two_batch_overlap),
-        ("pipeline parallelism", cfg.pp_size > 1),
     )
     for feature, enabled in unsupported:
         if enabled:
@@ -434,6 +496,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 f"DeepSeek-V4.1 does not support {feature} yet; disable it to "
                 "serve this model."
             )
+    if cfg.pp_size > 1:
+        _validate_deepseek_v41_pp(server_args)
 
     if cfg.disaggregation_mode != "null" and cfg.speculative_algorithm is not None:
         from sglang.srt.speculative.ragged_verify import (

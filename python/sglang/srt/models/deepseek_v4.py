@@ -4018,6 +4018,14 @@ class DeepseekV4Model(nn.Module):
                 "decoder SWA bounded replay needs kv_source_layer_ids"
             )
             last_source = max(config.kv_source_layer_ids)
+            assert self.start_layer <= last_source, (
+                "a PP stage must not start inside the decoder SWA bounded replay tail"
+            )
+        # A PP stage that ends before the tail runs its layers over every row.
+        if (
+            get_exec().features.enable_decoder_swa_bounded_replay
+            and self.end_layer > last_source
+        ):
             self.tail_writes_source_kv = True
             self.late_layer_start = (
                 last_source if self.tail_writes_source_kv else last_source + 1
@@ -4126,8 +4134,8 @@ class DeepseekV4Model(nn.Module):
         input_ids_global: torch.Tensor,
         capture_dspark: bool,
         dspark_aux_hidden_states: Optional[AuxHiddenStatePacker],
+        prev_pre: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[LateLayerTail]]:
-        assert self.pp_group.world_size == 1, "pre-mix hand-off across PP is not wired"
         hash_ids = None
         cp_extend = (
             is_cp_active(forward_batch) and forward_batch.forward_mode.is_extend()
@@ -4197,7 +4205,7 @@ class DeepseekV4Model(nn.Module):
         # its producer update explicitly before these readers below.
         # mHC assumes full token rows per rank; LayerNorm SP needs its own path.
         assert not get_forward().sp_active
-        state = mhc.HcState(hidden_states)
+        state = mhc.HcState(hidden_states, prev_pre)
         if _is_cuda:
             residual_batch.start(forward_batch)
             hidden_states = residual_batch.set_written(state, forward_batch)
@@ -4571,6 +4579,7 @@ class DeepseekV4Model(nn.Module):
         input_embeds: Optional[torch.Tensor],
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        prev_pre = None
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -4587,6 +4596,8 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = hidden_states.view(
                     hidden_states.shape[0], self.hc_mult, self.hidden_size
                 )
+            # The previous stage's last sublayer computed this stage's first pre-mix.
+            prev_pre = pp_proxy_tensors.tensors.get("prev_pre")
 
         if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
             input_ids_global = torch.empty(
@@ -4657,6 +4668,7 @@ class DeepseekV4Model(nn.Module):
                 input_ids_global,
                 capture_dspark,
                 dspark_aux_hidden_states,
+                prev_pre,
             )
         elif run_tbo:
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
@@ -4727,7 +4739,10 @@ class DeepseekV4Model(nn.Module):
 
         if not self.pp_group.is_last_rank:
             # Flatten 3D mHC tensor for PP IPC.
-            return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
+            tensors = {"hidden_states": hidden_states.flatten(1)}
+            if last_pre is not None:
+                tensors["prev_pre"] = last_pre.contiguous()
+            return PPProxyTensors(tensors)
 
         pre_hc_head = hidden_states.flatten(1)
 
@@ -4831,21 +4846,19 @@ class DeepseekV4ForCausalLM(nn.Module):
         # The weight loader reads this after the build.
         self.num_fused_shared_experts = get_num_fused_shared_experts()
         self.vision = None
-        if (
+        self.dsv41_multimodal = (
             config.model_type == "deepseek_v41"
             and config.vision_n_layers > 0
             and not getattr(config, "language_model_only", False)
-        ):
-            if (
-                get_parallel().attn_cp_size != 1
-                or get_parallel().pp_group.world_size != 1
-                or not (
-                    get_moe_a2a_backend().is_none()
-                    or (_is_cuda and get_moe_a2a_backend().is_megamoe())
-                )
+        )
+        # Later PP stages receive the image embeddings inside the hidden states.
+        if self.dsv41_multimodal and get_parallel().pp_group.is_first_rank:
+            if get_parallel().attn_cp_size != 1 or not (
+                get_moe_a2a_backend().is_none()
+                or (_is_cuda and get_moe_a2a_backend().is_megamoe())
             ):
                 raise ValueError(
-                    "V4.1 vision supports TP/EP/DP without CP or PP; "
+                    "V4.1 vision supports TP/EP/DP without CP; "
                     "MoE A2A requires CUDA MegaMoE"
                 )
 
@@ -5015,6 +5028,14 @@ class DeepseekV4ForCausalLM(nn.Module):
             raise ValueError(
                 "DSPARK requires explicit layer_ids for aux hidden capture."
             )
+        if not all(
+            self.model.start_layer <= layer_id < self.model.end_layer
+            for layer_id in layer_ids
+        ):
+            raise ValueError(
+                f"DSPARK target layers {list(layer_ids)} must all run on the last "
+                f"PP stage, layers [{self.model.start_layer}, {self.model.end_layer})."
+            )
         self.capture_aux_hidden_states = True
         self.model.dspark_layers_to_capture = list(layer_ids)
 
@@ -5073,7 +5094,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             if input_embeds is not None:
                 raise ValueError("Cannot combine input_embeds and image inputs")
             input_embeds = self._prepare_mm_embeddings(input_ids, forward_batch)
-        if getattr(self, "vision", None) is not None and not (
+        if self.dsv41_multimodal and not (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
         ):
@@ -5551,7 +5572,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                         ("vision.", "aligner.", "image_")
                     ):
                         skip_group = "vision"
-                    elif self.vision is None and name.endswith(
+                    elif not self.dsv41_multimodal and name.endswith(
                         ".gate.e_score_correction_bias_vl"
                     ):
                         skip_group = "gate.bias_vl"

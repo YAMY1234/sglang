@@ -22,6 +22,7 @@ from sglang.srt.disaggregation.utils import (
     check_stage_state_wires,
     check_state_wire,
     record_network_transfer,
+    resolve_state_component_dst_index,
     setup_state_kv_args,
     state_indices_per_entry,
     state_wire,
@@ -310,6 +311,7 @@ class TestStateEntryAgreement(CustomTestCase):
             return SimpleNamespace(
                 pp_size=1,
                 pp_rank=0,
+                pairs_state_by_type=False,
                 kv_args=SimpleNamespace(
                     state_types=[entry[0] for entry in wire],
                     state_sub_pools=[entry[1] for entry in wire],
@@ -349,6 +351,7 @@ class TestStateEntryAgreement(CustomTestCase):
             return SimpleNamespace(
                 pp_size=1,
                 pp_rank=0,
+                pairs_state_by_type=False,
                 kv_args=SimpleNamespace(
                     state_types=[entry[0] for entry in wire],
                     state_wire_keys=[None] * len(wire),
@@ -365,6 +368,50 @@ class TestStateEntryAgreement(CustomTestCase):
             check_stage_state_wires([[["swa", None]]] * 2, decode_wire)
         # A stage not registered yet leaves the coverage to be judged later.
         check_stage_state_wires([[["swa", None]], None], decode_wire)
+
+    def test_type_paired_stages_register_any_subset_of_the_decode_entries(self):
+        """A DeepSeek-V4.1 PP prefill split at layer 20: the ratio-2 request state
+        sits on stage 0, the draft SWA and its row state on the last stage. Under
+        the leading-subset rule stage 1's draft SWA would land on the decode's
+        request state; a backend pairing by (type, occurrence) sends each stage
+        entry to the decode entry of the same kind and refuses an uncovered one."""
+        decode_types = ["swa", "c128_state", "swa", "request_row"]
+        decode_wire = [[t, None] for t in decode_types]
+        stage_types = [["swa", "c128_state"], ["swa", "swa", "request_row"]]
+        stage_wires = [[[t, None] for t in types] for types in stage_types]
+        server = CommonKVBootstrapServer("127.0.0.1", 0)
+        for pp_rank, wire in enumerate(stage_wires):
+            _register(server, pp_rank=pp_rank, pp_size=2, wire=wire)
+        info = _served_info(server)
+
+        def decode(by_type):
+            return SimpleNamespace(
+                pp_size=1,
+                pp_rank=0,
+                pairs_state_by_type=by_type,
+                kv_args=SimpleNamespace(
+                    state_types=decode_types,
+                    state_wire_keys=[None] * len(decode_types),
+                    state_window_tails=[None] * len(decode_types),
+                ),
+            )
+
+        with self.assertRaisesRegex(RuntimeError, "PD state entry mismatch"):
+            CommonKVManager._check_prefill_state_entries(decode(False), info)
+        CommonKVManager._check_prefill_state_entries(decode(True), info)
+        self.assertEqual(
+            [
+                resolve_state_component_dst_index(stage_types[1], decode_types, i)
+                for i in range(len(stage_types[1]))
+            ],
+            [0, 2, 3],
+        )
+        # A decode that publishes no types keeps positional pairing.
+        self.assertEqual(resolve_state_component_dst_index(["swa"], [], 0), 0)
+        with self.assertRaisesRegex(RuntimeError, "none registers"):
+            check_stage_state_wires(
+                [stage_wires[0], stage_wires[1][:2]], decode_wire, by_type=True
+            )
 
     def test_ranks_of_one_stage_must_agree(self):
         server = CommonKVBootstrapServer("127.0.0.1", 0)

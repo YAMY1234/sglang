@@ -26,9 +26,9 @@ from sglang.srt.runtime_context import get_parallel
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
 
-# Per engram layer: device table rows (fp8, or packed MXFP4), device e8m0 scales,
-# and the event of their copy.
-StagedRows = list[tuple[torch.Tensor, torch.Tensor, torch.cuda.Event]]
+# Per engram layer (by layer_hash_index; None for another PP stage's layer): device
+# table rows (fp8, or packed MXFP4), device e8m0 scales, and the event of their copy.
+StagedRows = list[Optional[tuple[torch.Tensor, torch.Tensor, torch.cuda.Event]]]
 
 _GATHER_THREADS = 16
 
@@ -38,9 +38,11 @@ class EngramRowStager:
         self,
         hasher: EngramHasher,
         embeds: list[EngramEmbedding],
+        hash_indices: list[int],
         device: torch.device,
     ):
         self.hasher = hasher
+        self.hash_indices = hash_indices
         # fp8 and e8m0 have no CPU index_select; the gather moves bytes.
         self.tables = [
             (e.weight.data.view(torch.uint8), e.scale.data.view(torch.uint8))
@@ -73,7 +75,7 @@ class EngramRowStager:
             return None
         for e in embeds:
             e.enable_scheduler_staging()
-        return cls(hasher, embeds, device)
+        return cls(hasher, embeds, [m.layer_hash_index for m in engrams], device)
 
     def stage(self, batch: ScheduleBatch) -> Optional[StagedRows]:
         """Stage every engram layer's rows for an extend batch, None to leave the
@@ -84,9 +86,9 @@ class EngramRowStager:
         if windows is None:
             return None
         ids, _ = self.hasher.hash_windows(*windows)
-        staged = []
-        for layer, (weight, scale) in enumerate(self.tables):
-            layer_ids = ids[:, layer].reshape(-1)
+        staged: StagedRows = [None] * (max(self.hash_indices) + 1)
+        for hash_index, (weight, scale) in zip(self.hash_indices, self.tables):
+            layer_ids = ids[:, hash_index].reshape(-1)
             rows = self._gather(weight, layer_ids)
             scales = self._gather(scale, layer_ids)
             with torch.cuda.stream(self.copy_stream):
@@ -94,7 +96,7 @@ class EngramRowStager:
                 scales = scales.to(self.device, non_blocking=True)
                 copied = torch.cuda.Event()
                 copied.record()
-            staged.append((rows, scales, copied))
+            staged[hash_index] = (rows, scales, copied)
         return staged
 
     def _windows(

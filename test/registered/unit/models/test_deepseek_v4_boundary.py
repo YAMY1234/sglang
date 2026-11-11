@@ -73,13 +73,112 @@ class TestHcConsumer(unittest.TestCase):
             ),
         ):
             output, pre, tail = model._forward_layers_hc_pre_from_prev(
-                positions, source, batch, positions, positions, True, aux
+                positions, source, batch, positions, positions, True, aux, None
             )
         torch.testing.assert_close(output, source + 3)
         torch.testing.assert_close(aux.finalize(), (source + 1).mean(1))
         torch.testing.assert_close(pre, torch.ones(3, 2))
         self.assertIsNone(tail)
         self.assertIsNone(batch.residual_stream)
+
+    def test_later_pp_stage_combines_its_first_input_with_the_shipped_pre(self):
+        """The pre-mix of a sublayer comes from the previous sublayer's post. A PP
+        stage after the first must resume with the pre its predecessor shipped:
+        without it the first combine would read stream 0 alone, a silent change
+        of the model's math."""
+        from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+        from sglang.srt.model_executor.forward_mode import ForwardMode
+        from sglang.srt.models import deepseek_v4
+
+        seen = []
+
+        class Layer(torch.nn.Module):
+            engram = None
+            hc_cfg = mhc.HcConfig(2, 4, 1e-5, 1e-6, 4, True, False)
+
+            def forward(self, hidden_states, forward_batch, **kwargs):
+                stream = residual_batch.stream_of(forward_batch)
+                stream.check(hidden_states)
+                seen.append(stream.residual.pre)
+                update = boundary.HcUpdate(self, False)
+                update.post = lambda value, state, **kw: mhc.HcState(
+                    state.residual + value, state.pre + 1
+                )
+                return stream.record(torch.ones(3, 2, 4), update)
+
+        model = deepseek_v4.DeepseekV4Model.__new__(deepseek_v4.DeepseekV4Model)
+        torch.nn.Module.__init__(model)
+        model.layers = torch.nn.ModuleList([torch.nn.Identity(), Layer()])
+        model.start_layer, model.end_layer = 1, 2
+        model.pp_group = SimpleNamespace(world_size=2)
+        model.engram_hasher = model.late_layer_start = None
+        positions = torch.arange(3)
+        batch = SimpleNamespace(
+            positions=positions,
+            input_ids=positions,
+            forward_mode=ForwardMode.EXTEND,
+            residual_stream=None,
+        )
+        shipped_pre = torch.full((3, 2), 0.25)
+        recorder = SimpleNamespace(with_current_layer=lambda _: nullcontext())
+        with (
+            patch.object(deepseek_v4, "_is_cuda", True),
+            patch.object(deepseek_v4, "_is_hip", False),
+            patch.object(deepseek_v4, "is_cp_active", return_value=False),
+            patch.object(deepseek_v4, "check_cuda_graph_backend", return_value=False),
+            patch.object(
+                deepseek_v4,
+                "get_global_expert_distribution_recorder",
+                return_value=recorder,
+            ),
+        ):
+            _, pre, _ = model._forward_layers_hc_pre_from_prev(
+                positions,
+                torch.zeros(3, 2, 4),
+                batch,
+                positions,
+                positions,
+                False,
+                None,
+                shipped_pre,
+            )
+        self.assertIs(seen[0], shipped_pre)
+        torch.testing.assert_close(pre, shipped_pre + 1)
+
+    def test_middle_pp_stage_forwards_the_pre_it_received_and_ships_its_own(self):
+        from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+        from sglang.srt.models import deepseek_v4
+
+        model = deepseek_v4.DeepseekV4Model.__new__(deepseek_v4.DeepseekV4Model)
+        torch.nn.Module.__init__(model)
+        model.pp_group = SimpleNamespace(is_first_rank=False, is_last_rank=False)
+        model.hc_mult, model.hidden_size = 2, 4
+        model.hc_pre_from_prev_sublayer = True
+        model.dspark_layers_to_capture = None
+        model._can_run_tbo = lambda forward_batch: False
+        last_pre = torch.full((3, 2), 0.75)
+        model._forward_layers_hc_pre_from_prev = Mock(
+            return_value=(torch.ones(3, 2, 4), last_pre, None)
+        )
+        received_pre = torch.full((3, 2), 0.25)
+        proxy = PPProxyTensors(
+            {"hidden_states": torch.zeros(3, 8), "prev_pre": received_pre}
+        )
+        with (
+            patch.object(
+                deepseek_v4,
+                "get_parallel",
+                return_value=SimpleNamespace(attn_dp_size=1),
+            ),
+            patch.object(deepseek_v4, "get_attn_backend"),
+        ):
+            output = model._forward_impl(
+                torch.arange(3), torch.arange(3), SimpleNamespace(), None, proxy
+            )
+        self.assertIs(
+            model._forward_layers_hc_pre_from_prev.call_args.args[-1], received_pre
+        )
+        torch.testing.assert_close(output["prev_pre"], last_pre)
 
     def test_replicated_shared_is_added_after_the_sum(self):
         routed = torch.tensor([[1.0, 1.0]], dtype=torch.bfloat16)

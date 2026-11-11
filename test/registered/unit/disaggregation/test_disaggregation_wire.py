@@ -298,6 +298,7 @@ class TestDisaggregationWire(unittest.TestCase):
                                 ],
                                 dst_state_dim_per_tensor=[[], []],
                                 dst_state_layer_ids=[layer_ids, layer_ids],
+                                dst_state_types=[],
                                 dst_attn_tp_size=1,
                                 dst_aux_ptrs=[0x6000],
                                 dst_aux_item_lens=None,
@@ -432,6 +433,7 @@ class TestDisaggregationWire(unittest.TestCase):
                         # Mamba disagrees too, but ships on its own path.
                         dst_state_item_lens=[[dst_item_len], [999]],
                         dst_state_layer_ids=[layer_ids, layer_ids],
+                        dst_state_types=[],
                     )
                     with get_context().override_server_args(
                         enable_unified_memory=False
@@ -486,6 +488,7 @@ class TestDisaggregationWire(unittest.TestCase):
                 dst_state_data_ptrs=[[0x2000]],
                 dst_state_item_lens=[[dst_item_len]],
                 dst_state_layer_ids=[[]],
+                dst_state_types=[],
                 dst_aux_ptrs=[],
             )
             with get_context().override_server_args(enable_unified_memory=False):
@@ -699,6 +702,7 @@ class TestDisaggregationWire(unittest.TestCase):
             dst_state_data_ptrs=[[0x2000]],
             dst_state_item_lens=[],
             dst_state_layer_ids=[[]],
+            dst_state_types=[],
         )
         with get_context().override_server_args(enable_unified_memory=False):
             fully_checked, reason = manager._validate_peer_state_layout(
@@ -1553,6 +1557,7 @@ class TestQwen4StateWire(unittest.TestCase):
             dst_state_item_lens=[[16]],
             dst_state_dim_per_tensor=[[]],
             dst_state_layer_ids=[[24]],
+            dst_state_types=[],
         )
         manager = self._qsa_compressed_manager(src_item_len=32)
         with self.assertRaisesRegex(RuntimeError, "QSA_COMPRESSED layout differs"):
@@ -1681,6 +1686,7 @@ class TestHeteroTpSwaStateTransfer(CustomTestCase):
             dst_state_item_lens=[[item_len] * len(dst_ptrs)],
             dst_state_dim_per_tensor=[[]],
             dst_state_layer_ids=[[]],
+            dst_state_types=[],
             dst_attn_tp_size=decode_tp,
             dst_tp_rank=dst_rank,
         )
@@ -2936,6 +2942,8 @@ def _make_dsv4_target(*, unified, mapping=None):
         _buf_infos(12) if unified else ([], [], [])
     )
     pool.get_request_state_buf_infos = lambda: ([], [], [])
+    pool.get_state_layer_ids = lambda: [0]
+    pool.get_request_state_layer_ids = lambda: []
     return pool
 
 

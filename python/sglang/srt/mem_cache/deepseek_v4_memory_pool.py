@@ -1475,6 +1475,53 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         return data_ptrs, data_lens, item_lens
 
+    def _compressed_layer_ids(self, ratio: int) -> List[int]:
+        """The layers whose compressed storage the ratio's pools hold, in buffer order."""
+        if ratio in (1, 2):
+            return list(self.sources_by_ratio.get(ratio, ()))
+        return [i for i in self.stage_layer_ids if self.compression_ratios[i] == ratio]
+
+    def get_kv_layer_ids(self) -> List[int]:
+        """The model layer of each get_contiguous_buf_infos entry; a PP stage
+        registers only its own layers, so PD peers pair the entries by layer."""
+        layer_ids: List[int] = []
+        for ratio, kv_pool in self.kv_pools.items():
+            layers = self._compressed_layer_ids(ratio)
+            if self._unified_kv:
+                layer_ids += layers * (2 if self._unified_kv_fp8 else 1)
+            elif kv_pool is not None:
+                layer_ids += layers
+            indexer_pool = self.index_pools.get(ratio)
+            if indexer_pool is not None and layers:
+                # Buffer groups (FP4 payload, scale) each list every layer.
+                groups = len(indexer_pool.contiguous_page_row_buffers()) // len(layers)
+                layer_ids += layers * groups
+        return layer_ids
+
+    def get_state_layer_ids(self) -> List[int]:
+        """The model layer of each get_state_buf_infos entry."""
+        swa_pool = (
+            self.request_window.state
+            if self.request_window is not None
+            else self.swa_kv_pool
+        )
+        layer_ids = self.swa_layer_ids() if swa_pool is not None else []
+        for pools in (self.compress_state_pools, self.indexer_compress_state_pools):
+            layer_ids += [
+                layer_id
+                for layer_id, pool in enumerate(pools)
+                if pool is not None and not pool.request_scoped
+            ]
+        return layer_ids
+
+    def get_request_state_layer_ids(self) -> List[int]:
+        """The model layer of each get_request_state_buf_infos entry."""
+        return [
+            layer_id
+            for layer_id, pool in enumerate(self.compress_state_pools)
+            if pool is not None and pool.request_scoped
+        ]
+
     def get_unified_swa_ring_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         # StateType.SWA_RING transfers [0, swa_pages) of each unified_kv layer;
         # its indices address individual ring rows.

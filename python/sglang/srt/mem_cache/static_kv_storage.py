@@ -880,6 +880,7 @@ def _static_owner_region(token_to_kv_pool) -> Region:
         token_to_kv_pool.get_kv_layer_ids()
         if token_to_kv_pool.layer_router.wrapped_view() is not None
         or isinstance(token_to_kv_pool, MiniMaxM3Nvfp4KVPool)
+        or _pairs_dsv4_entries_by_layer(token_to_kv_pool)
         else ()
     )
     return Region(
@@ -896,6 +897,15 @@ def _is_dsv4_npu(pool) -> bool:
     )
 
     return isinstance(pool, DSV4NPUTokenToKVPool)
+
+
+def _pairs_dsv4_entries_by_layer(pool) -> bool:
+    """A CUDA/HIP DeepSeek-V4 pool, whose PP stages register only their own layers."""
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+    return isinstance(pool, DeepSeekV4TokenToKVPool) and not (
+        is_npu() and _is_dsv4_npu(pool)
+    )
 
 
 def _static_state_entries(
@@ -1011,6 +1021,11 @@ def _static_state_entries(
                 data_ptrs,
                 data_lens,
                 item_lens,
+                layer_ids=(
+                    token_to_kv_pool.get_state_layer_ids()
+                    if _pairs_dsv4_entries_by_layer(token_to_kv_pool)
+                    else None
+                ),
                 kv_layout=swa_kv_layout,
                 # Read when asked, as the window's view was: not every pool
                 # with window state keeps a window pool of its own.
@@ -1053,6 +1068,11 @@ def _static_state_entries(
                         c128_ptrs,
                         c128_lens,
                         c128_item_lens,
+                        layer_ids=(
+                            token_to_kv_pool.get_request_state_layer_ids()
+                            if _pairs_dsv4_entries_by_layer(token_to_kv_pool)
+                            else None
+                        ),
                     )
         elif router.wrapped_view() is not None:
             dim = (

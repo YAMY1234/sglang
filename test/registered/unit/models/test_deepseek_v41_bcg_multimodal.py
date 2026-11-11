@@ -41,7 +41,9 @@ class TestDeepseekV41BCGMultimodal(CustomTestCase):
 
                 def outer_forward(ids, positions, batch):
                     model = SimpleNamespace(
-                        vision=object(), config=SimpleNamespace(image_token_id=image_id)
+                        vision=object(),
+                        dsv41_multimodal=True,
+                        config=SimpleNamespace(image_token_id=image_id),
                     )
                     mapped, _ = (
                         dsv4.DeepseekV4ForCausalLM.prepare_language_model_inputs(
@@ -119,7 +121,7 @@ class TestDeepseekV41BCGMultimodal(CustomTestCase):
                 patch.object(dsv4, "_is_hip", False),
             ):
                 actual, _, _ = dsv4.DeepseekV4Model._forward_layers_hc_pre_from_prev(
-                    model, torch.arange(3), hidden, batch, ids, ids, False, []
+                    model, torch.arange(3), hidden, batch, ids, ids, False, [], None
                 )
             torch.testing.assert_close(actual, expected)
 
