@@ -354,6 +354,9 @@ class Envs:
     SGLANG_QSA_FP8_POOL_VERIFY_WS_SPLITS = EnvInt(None)
     # PDL into the warp-specialized kernel (it waits on kernel U after its setup).
     SGLANG_QSA_FP8_POOL_VERIFY_WS_PDL = EnvBool(False)
+    # Its kernel 1 casts the target verify's BF16 new K/V to E4M3 in the pool write (one
+    # launch for two torch casts and the copy; the provider checks the cast equals torch's).
+    SGLANG_QSA_FUSED_FP8_KV_WRITE = EnvBool(False)
     # TP1 BF16-pool target verify: the attention output gate rides the pool attention's
     # split-K merge (fused_sigmoid_mul's arithmetic, so the same bits).
     SGLANG_ENABLE_QSA_POOL_MERGE_GATE = EnvBool(False)

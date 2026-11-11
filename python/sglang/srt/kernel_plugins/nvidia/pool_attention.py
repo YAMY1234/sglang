@@ -78,6 +78,7 @@ def pool_signatures(
 
 _UNION_WS = 1 << 6
 _UNION_WS_PDL = 1 << 7
+UNION_FP8_KV_WRITE = 1 << 8
 # DIRECT_POOL_ATTENTION variant bit 2: the output gate rides the split-K merge.
 POOL_MERGE_GATE = 1 << 2
 
@@ -91,7 +92,8 @@ def verify_variant():
 def union_variant():
     """POOL_UNION_ATTENTION's source options: bits 0-5 = the token-union pass's warp
     count (0 for the source's 8), bit 6 = the warp-specialized attention kernel, bit 7
-    = PDL into it (with bit 6 only)."""
+    = PDL into it (with bit 6 only), bit 8 = BF16 new K/V cast to E4M3 in the pool
+    write."""
     warps = envs.SGLANG_QSA_FP8_POOL_VERIFY_UNION_WARPS.get()
     if warps not in (1, 2, 4, 8, 16, 32):
         raise ValueError(
@@ -101,6 +103,8 @@ def union_variant():
     ws = _UNION_WS if envs.SGLANG_QSA_FP8_POOL_VERIFY_WS.get() else 0
     if ws and envs.SGLANG_QSA_FP8_POOL_VERIFY_WS_PDL.get():
         ws |= _UNION_WS_PDL
+    if envs.SGLANG_QSA_FUSED_FP8_KV_WRITE.get():
+        ws |= UNION_FP8_KV_WRITE
     return (0 if warps == 8 else warps) | ws
 
 

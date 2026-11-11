@@ -202,8 +202,8 @@ def contract_geometry(s):
                 == (24, 2, 256, 512)
                 and (s.compress_ratio, s.scalar_type) == (4, 1)
                 # Bits 0-5: the token-union pass's warps (0 = 8); bit 6: WS kernel;
-                # bit 7: PDL into it (with bit 6 only).
-                and (s.variant & ~(64 | 128)) in (0, 1, 2, 4, 8, 16, 32)
+                # bit 7: PDL into it (with bit 6 only); bit 8: BF16 new K/V cast write.
+                and (s.variant & ~(64 | 128 | 256)) in (0, 1, 2, 4, 8, 16, 32)
                 and (s.variant & 64 or not s.variant & 128)
                 and 64 <= s.rows <= 576
                 and s.rows % 4 == 0

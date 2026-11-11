@@ -1547,8 +1547,22 @@ class QwenSparseAttnBackend(AttentionBackend):
             or q.dtype != torch.bfloat16
         ):
             return None
-        k = k.reshape(rows, kc.shape[1], 256).to(kc.dtype)
-        v = v.reshape(rows, kc.shape[1], 256).to(vc.dtype)
+        k = k.reshape(rows, kc.shape[1], 256)
+        v = v.reshape(rows, kc.shape[1], 256)
+        from sglang.srt.environ import envs
+
+        # SGLANG_QSA_FUSED_FP8_KV_WRITE: a target verify's BF16 k/v stay uncast for the
+        # FP8 union's pool write; any other route casts them below, as stock does here.
+        if not (
+            envs.SGLANG_QSA_FUSED_FP8_KV_WRITE.get()
+            and mode.is_target_verify()
+            and kc.dtype == torch.float8_e4m3fn
+            and k.dtype == v.dtype == torch.bfloat16
+            and k.stride(1) == v.stride(1) == 256
+            and k.stride(2) == v.stride(2) == 1
+        ):
+            k = k.to(kc.dtype)
+            v = v.to(vc.dtype)
         if (
             k.stride(1) != 256
             or v.stride(1) != 256
@@ -1603,6 +1617,9 @@ class QwenSparseAttnBackend(AttentionBackend):
             return pooled
         if pooled is not None:
             return (pooled, False) if output_gate is not None else pooled
+        if k.dtype != kc.dtype:  # deferred for the union write: the stock casts
+            k = k.to(kc.dtype)
+            v = v.to(vc.dtype)
         return self._forward_trtllm_sparse(
             q.reshape(rows, layer.tp_q_head_num, layer.head_dim),
             kc,
@@ -1647,6 +1664,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         from sglang.srt.kernel_plugins.nvidia.numeric_binding import numeric_operator
         from sglang.srt.kernel_plugins.nvidia.pool_attention import (
             POOL_MERGE_GATE,
+            UNION_FP8_KV_WRITE,
             pool_decode_enabled,
             pool_device_sms,
             pool_scratch_elements,
@@ -1706,7 +1724,16 @@ class QwenSparseAttnBackend(AttentionBackend):
             and value_pool.shape == key_pool.shape
             and key_pool.is_contiguous()
             and value_pool.is_contiguous()
-            and key_pool.dtype == value_pool.dtype == k.dtype == v.dtype == kv_dtype
+            and key_pool.dtype == value_pool.dtype == kv_dtype
+            and k.dtype == v.dtype
+            and (
+                k.dtype == kv_dtype
+                or (
+                    union
+                    and union_variant() & UNION_FP8_KV_WRITE
+                    and k.dtype == torch.bfloat16
+                )
+            )
             and q.dtype == torch.bfloat16
             and q.is_cuda
             and k.shape == v.shape == (rows, key_pool.shape[1], layer.head_dim)

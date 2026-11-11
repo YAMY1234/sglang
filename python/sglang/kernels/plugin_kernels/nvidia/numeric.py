@@ -100,7 +100,8 @@ class NumericSignature:
     # [rows, heads, dim]) rides the split-K merge. Pool union attention: bits 0-5 =
     # the token-union pass's warp count (0 for 8), bit 6 = the warp-specialized
     # kernel (the caller's split plan follows it), bit 7 = PDL into that kernel
-    # (with bit 6 only). Prefill select and
+    # (with bit 6 only), bit 8 = BF16 new K/V cast to E4M3 in the pool write.
+    # Prefill select and
     # packed prefill attention: rows is 0 (packed prefill rows vary per call);
     # context_bound bounds a select row's keys, and attention's variant is its
     # key-load pipeline stage count. Prefill select's variant: bits 0-3 = the

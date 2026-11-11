@@ -633,6 +633,8 @@ def test_fp8_union_declared_only_when_enabled():
             # PDL rides only the warp-specialized kernel.
             with envs.SGLANG_QSA_FP8_POOL_VERIFY_WS_PDL.override(True):
                 assert {s.variant for s in union_signatures(widths)} == {16}
+            with envs.SGLANG_QSA_FUSED_FP8_KV_WRITE.override(True):
+                assert {s.variant for s in union_signatures(widths)} == {16 | 256}
         with (
             envs.SGLANG_QSA_FP8_POOL_VERIFY_UNION_WARPS.override(12),
             pytest.raises(ValueError, match="UNION_WARPS"),
@@ -685,6 +687,66 @@ def test_fp8_union_caller_buffers_and_source_plan(rows, warps, ws):
     assert io.integer_scratch_out.dtype == torch.int32
     assert io.integer_scratch_out.numel() == integers
     assert io.scratch_out.dtype == torch.float32 and io.scratch_out.numel() == floats
+
+
+def test_fp8_union_takes_bf16_new_kv_for_the_cast_write():
+    rows = 64
+    obj, args = fp8_state(rows)
+    args[1] = torch.zeros((rows, 3, 2, 256), dtype=torch.bfloat16)[:, 0]
+    args[2] = torch.zeros((rows, 3, 2, 256), dtype=torch.bfloat16)[:, 1]
+    seen = []
+
+    def run(io):
+        seen.append(io)
+        io.output.fill_(3)
+
+    with (
+        envs.SGLANG_QSA_FP8_POOL_VERIFY.override(True),
+        envs.SGLANG_QSA_FUSED_FP8_KV_WRITE.override(True),
+    ):
+        registry = api.NumericRegistry()
+        (signature,) = union_signatures((rows,))
+        assert signature.variant == policy.UNION_FP8_KV_WRITE
+        registry.register(api.NumericOffer(signature, run))
+        with patch.object(numeric_binding, "numeric_registry", registry):
+            obj._try_numeric_pool_attention(*args)
+    (io,) = seen
+    assert io.new_k is args[1] and io.new_v is args[2]
+    assert io.new_k.dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("pooled", [False, True])
+def test_target_verify_defers_the_fp8_cast_to_the_union_write(enabled, pooled):
+    rows = 64
+    obj, args = state(rows, 4)
+    fp8 = torch.float8_e4m3fn
+    kc = torch.zeros((rows + 1, 2, 256), dtype=fp8)
+    vc = torch.zeros_like(kc)
+    obj.token_to_kv_pool = NS(
+        layer_router=NS(read=lambda layer_id: NS(key=lambda: kc, value=lambda: vc))
+    )
+    q, k, v, layer, batch, indices = args[:6]
+    seen = {}
+
+    def pool(*a, **kw):
+        seen["pool"] = a[1].dtype
+        return torch.zeros((rows, 6144), dtype=torch.bfloat16) if pooled else None
+
+    def sparse(*a, **kw):
+        seen["sparse"] = kw["new_kv"][0].dtype
+        return torch.zeros((rows, 6144), dtype=torch.bfloat16)
+
+    with (
+        envs.SGLANG_QSA_FUSED_FP8_KV_WRITE.override(enabled),
+        patch.object(backend, "_resolve_trtllm_sparse_decode", return_value=object()),
+        patch.object(obj, "_try_numeric_pool_attention", pool, create=True),
+        patch.object(obj, "_forward_trtllm_sparse", sparse, create=True),
+    ):
+        obj._try_fused_kv_attention(q, k, v, layer, batch, indices)
+    assert seen["pool"] == (torch.bfloat16 if enabled else fp8)
+    # Any route other than the union write gets the stock casts.
+    assert seen.get("sparse", fp8) == fp8 and ("sparse" in seen) != pooled
 
 
 @pytest.mark.parametrize("case", ["off", "decode", "topk", "bf16_new_kv"])
