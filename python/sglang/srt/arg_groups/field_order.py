@@ -570,5 +570,6 @@ POSITIONAL_FIELD_ORDER = (
     "layernorm_sp_min_tokens",
     "paged_experts_host_memory_gb",
     "_max_running_requests_explicitly_set",
+    "enable_gdn_replayssm_ucache",
 )
 # fmt: on

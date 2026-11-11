@@ -30,7 +30,7 @@ from sglang.srt.mem_cache.hicache_storage import PoolTransfer
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
-from sglang.srt.runtime_context import get_serving, get_spec
+from sglang.srt.runtime_context import get_exec, get_serving, get_spec
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -313,6 +313,14 @@ def backup_kv_cache(
         device = token_to_kv_pool_allocator.get_kvcache().device
         torch.get_device_module(device).synchronize(device)
         return True
+    if get_exec().mamba.enable_gdn_replayssm_ucache:
+        from sglang.srt.layers.attention.linear.gdn_replayssm_ucache import (
+            gdn_ucache_blocks_state_backup,
+        )
+
+        state = token_to_kv_pool_allocator.state
+        if state is not None and gdn_ucache_blocks_state_backup(state.pool):
+            return False
     if backend == "cpu_tensor":
         req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
         return True

@@ -25,6 +25,10 @@ from sglang.srt.layers.attention.linear.gdn_prefill_graph import (
     GDNPrefillGraphMetadata,
     buckets_keep_chunk_o_block_size,
 )
+from sglang.srt.layers.attention.linear.gdn_replayssm_ucache import (
+    GdnUcacheBuffers,
+    GdnUcacheVerifier,
+)
 from sglang.srt.layers.attention.linear.kda_prefill_graph import (
     KDAPrefillTrackRows,
     build_track_rows,
@@ -643,6 +647,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
     # forward_extend then runs the graph-safe chain on these static tables.
     prefill_graph_metadata: Optional[GDNPrefillGraphMetadata] = None
 
+    # The u-cache verify (--enable-gdn-replayssm-ucache); off unless __init__ finds rings.
+    _gdn_ucache: Optional[GdnUcacheBuffers] = None
+    _gdn_ucache_verifier: Optional[GdnUcacheVerifier] = None
+
     def _create_kernel_dispatcher(self, backends):
         return GDNKernelDispatcher(backends.decode, backends.prefill, backends.verify)
 
@@ -674,6 +682,39 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self.prefill_graph_max_seqs = min(
             self.req_to_token_pool.size, envs.SGLANG_GDN_PREFILL_GRAPH_MAX_SEQS.get()
         )
+        self._gdn_ucache = self.state_pool.gdn_ucache
+        if (
+            get_exec().mamba.enable_gdn_replayssm_ucache
+            and self._gdn_ucache is None
+            and not self.is_draft_worker
+        ):
+            raise RuntimeError(
+                "--enable-gdn-replayssm-ucache: the GDN state pool carries no "
+                "u-cache rings, so verify would fall back to the snapshot path."
+            )
+        self._gdn_ucache_verifier = (
+            GdnUcacheVerifier(
+                device=torch.device(model_runner.device),
+                first_layer_id=min(self.state_layer_indices),
+            )
+            if self._gdn_ucache is not None
+            else None
+        )
+
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        super().init_cuda_graph_state(max_bs, max_num_tokens)
+        if self._gdn_ucache_verifier is not None and not self.is_draft_worker:
+            gdn_ucache = self._gdn_ucache
+            self._gdn_ucache_verifier.warm_up(
+                max_batch_size=max_bs,
+                num_draft_tokens=max_num_tokens // max_bs,
+                state=self.state_pool.mamba_cache.temporal[0],
+                k_ring=gdn_ucache.k_ring[0],
+                u_ring=gdn_ucache.u_ring[0],
+                g_ring=gdn_ucache.g_ring[0],
+                flush_min=gdn_ucache.flush_min,
+                max_eager_batch_size=self.req_to_token_pool.size,
+            )
 
     def supports_prefill_graph_extend(self) -> bool:
         # Read here, not in __init__: the support check reads model_config.
@@ -896,6 +937,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
             self._use_strided_target_verify_qkv = False
             return
 
+        if self._gdn_ucache is not None:
+            # The FlashInfer verify reads q/k/v contiguous.
+            self._use_strided_target_verify_qkv = False
+            return
         metadata = self.forward_metadata
         mamba_pool = self.state_pool
         mamba_cache = mamba_pool.mamba_cache
@@ -962,6 +1007,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if _is_hip and isinstance(mixed_qkv, torch.Tensor) and mixed_qkv.shape[0] == 0:
             return mixed_qkv.new_zeros((1, 0, layer.num_v_heads, layer.head_v_dim))
 
+        if self._gdn_ucache is not None:
+            raise RuntimeError(
+                "--enable-gdn-replayssm-ucache: a plain GDN decode would read the "
+                "checkpoint without its unfolded u-cache window."
+            )
         layer_cache = self.state_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
@@ -1466,7 +1516,20 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # ReplaySSM verify protocols: fold-every-commit (ring-write during
             # verify, fold on commit), circular ring, or the snapshotting
             # fallback when neither ring is allocated.
-            if use_replayssm_fold:
+            if self._gdn_ucache is not None:
+                core_attn_out = self._gdn_ucache_target_verify(
+                    layer=layer,
+                    query=query,
+                    key=key,
+                    value=value,
+                    a=a,
+                    b=b,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    num_draft_tokens=forward_batch.spec_info.draft_token_num,
+                    retrieve_parent_token=retrieve_parent_token,
+                )
+            elif use_replayssm_fold:
                 core_attn_out = self._replayssm_fold_target_verify(
                     layer=layer,
                     query=query,
@@ -1731,6 +1794,44 @@ class GDNAttnBackend(MambaAttnBackendBase):
             use_qk_l2norm_in_kernel=not qk_normalized,
         )
         return output
+
+    def _gdn_ucache_target_verify(
+        self,
+        *,
+        layer: RadixLinearAttention,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        num_draft_tokens: int,
+        retrieve_parent_token: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        assert retrieve_parent_token is None, (
+            "GDN u-cache verify supports linear draft chains only (topk == 1)."
+        )
+        gdn_ucache = self._gdn_ucache
+        layer_index = self.state_layer(layer.layer_id).view_layer_id
+        return self._gdn_ucache_verifier.target_verify(
+            layer_id=layer.layer_id,
+            query=query,
+            key=key,
+            value=value,
+            a=a,
+            b=b,
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            # GDN has K == V; the pool's [slots, HV, V, K] layout is FlashInfer's.
+            state=ssm_states,
+            k_ring=gdn_ucache.k_ring[layer_index],
+            u_ring=gdn_ucache.u_ring[layer_index],
+            g_ring=gdn_ucache.g_ring[layer_index],
+            buffers=gdn_ucache,
+            cache_indices=cache_indices,
+            num_draft_tokens=num_draft_tokens,
+        )
 
     def _replayssm_fold_target_verify(
         self,

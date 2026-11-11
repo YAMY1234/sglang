@@ -1673,8 +1673,15 @@ class KVCacheConfigurator:
                 host_only_mamba_checkpoint() and self.hybrid_kda_config is not None
             ),
             allocate_intermediate_ssm=self.allocate_intermediate_ssm,
+            enable_gdn_replayssm_ucache=self._gdn_replayssm_ucache_active(),
         )
         return req_to_token_pool
+
+    def _gdn_replayssm_ucache_active(self) -> bool:
+        return (
+            get_exec().mamba.enable_gdn_replayssm_ucache
+            and self.hybrid_gdn_config is not None
+        )
 
     def _build_default_req_pool(
         self,
@@ -3437,6 +3444,23 @@ class KVCacheConfigurator:
                 low = mid + 1
         return low * alignment
 
+    def _gdn_ucache_ring_charge(self, config, pp_layer_scale: float) -> tuple[int, int]:
+        """The u-cache rings' (fixed, per Mamba slot) bytes."""
+        from sglang.srt.layers.attention.linear.gdn_replayssm_ucache import (
+            gdn_ucache_ring_bytes_per_slot,
+        )
+
+        params = config.mamba2_cache_params
+        num_v_heads, head_v_dim, head_k_dim = params.shape.temporal
+        ring_bytes = gdn_ucache_ring_bytes_per_slot(
+            num_layers=len(params.layers),
+            num_k_heads=params.shape.num_k_heads_per_tp,
+            num_v_heads=num_v_heads,
+            head_k_dim=head_k_dim,
+            head_v_dim=head_v_dim,
+        )
+        return 0, int(ring_bytes * pp_layer_scale)
+
     def _handle_max_mamba_cache(self, total_rest_memory):
         config = self.mambaish_config
         assert config is not None
@@ -3500,12 +3524,26 @@ class KVCacheConfigurator:
             max_running_requests=get_schedule().max_running_requests,
             attn_dp_size=self.attn_dp_size,
         )
-        extra_per_slot = replayssm_ring_per_slot + int(
-            self.extra_mamba_cache_bytes_per_req * pp_layer_scale
+        # The u-cache rings, charged only under --enable-gdn-replayssm-ucache.
+        ucache_active = (
+            get_exec().mamba.enable_gdn_replayssm_ucache
+            and self._gdn_replayssm_ucache_active()
+        )
+        ucache_fixed_bytes, ucache_per_slot = (
+            self._gdn_ucache_ring_charge(config, pp_layer_scale)
+            if ucache_active
+            else (0, 0)
+        )
+        replayssm_fixed_bytes += ucache_fixed_bytes
+        extra_per_slot = (
+            replayssm_ring_per_slot
+            + ucache_per_slot
+            + int(self.extra_mamba_cache_bytes_per_req * pp_layer_scale)
         )
         reserves_spec_state = (
             has_spec_dec
             and not replayssm_active
+            and not ucache_active
             and not _pd_prefill_skips_mamba_spec_state()
             and self.allocate_intermediate_ssm
         )

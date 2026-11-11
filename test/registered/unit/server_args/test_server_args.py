@@ -21,9 +21,16 @@ from sglang.srt.arg_groups import (
     serving_hook,
     validation_hook,
 )
+from sglang.srt.arg_groups import attention_hook
 from sglang.srt.arg_groups.attention_hook import (
+    _check_gdn_replayssm_ucache,
+    _check_gdn_replayssm_ucache_cache,
+    _check_gdn_replayssm_ucache_megakernel,
+    _check_gdn_replayssm_ucache_spec,
     handle_attention_backend_compatibility,
     handle_deterministic_inference,
+    handle_gdn_replayssm_ucache_spec_shape,
+    handle_linear_attn_backend,
 )
 from sglang.srt.arg_groups.cuda_graph_hook import (
     apply_cuda_graph_compatibility,
@@ -58,6 +65,7 @@ from sglang.srt.arg_groups.mamba_hook import (
     handle_mamba_backend,
 )
 from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.arg_groups.model_path_hook import handle_load_format
 from sglang.srt.arg_groups.moe_hook import (
     handle_a2a_moe,
@@ -1483,6 +1491,154 @@ class TestInt8MambaCheckpointCompatibility(unittest.TestCase):
         handle_int8_mamba_checkpoint(
             ServerArgs(model_path="dummy", enable_unified_memory=True)
         )
+
+
+class TestGdnReplaySsmUcacheArgs(unittest.TestCase):
+    """--enable-gdn-replayssm-ucache: off by default, a runtime optimization under
+    SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION, and the radix tree holds only states
+    with an empty u-cache window."""
+
+    FLAG = "--enable-gdn-replayssm-ucache"
+
+    def _check(self, **kwargs):
+        server_args = ServerArgs(model_path="dummy", **kwargs)
+        _check_gdn_replayssm_ucache_cache(resolving_view(server_args), flag=self.FLAG)
+
+    def test_flag_is_off_by_default(self):
+        self.assertFalse(ServerArgs(model_path="dummy").enable_gdn_replayssm_ucache)
+
+    def test_requires_the_runtime_master(self):
+        with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(False):
+            with self.assertRaisesRegex(
+                ValueError, "SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION=1"
+            ):
+                _check_gdn_replayssm_ucache(
+                    ServerArgs(model_path="dummy", enable_gdn_replayssm_ucache=True)
+                )
+
+    def test_decode_inserts_with_extra_buffer_are_accepted(self):
+        for strategy in ("extra_buffer", "extra_buffer_lazy"):
+            self._check(mamba_radix_cache_strategy=strategy)
+
+    def test_decode_inserts_without_extra_buffer_are_rejected(self):
+        for strategy in ("auto", "no_buffer"):
+            with self.assertRaisesRegex(ValueError, "extra_buffer_lazy"):
+                self._check(mamba_radix_cache_strategy=strategy)
+
+    def test_radix_off_is_accepted_on_any_strategy(self):
+        self._check(disable_radix_cache=True, mamba_radix_cache_strategy="no_buffer")
+
+    def test_host_cache_offload_is_accepted(self):
+        for kwargs in (
+            dict(enable_hierarchical_cache=True),
+            dict(enable_lmcache=True),
+        ):
+            self._check(mamba_radix_cache_strategy="extra_buffer_lazy", **kwargs)
+
+    def test_pd_disaggregation_is_rejected(self):
+        for mode in ("prefill", "decode"):
+            with self.assertRaisesRegex(ValueError, "PD disaggregation"):
+                self._check(disable_radix_cache=True, disaggregation_mode=mode)
+
+    def test_incompatible_cache_features_are_rejected(self):
+        for kwargs, message in (
+            (dict(enable_int8_mamba_checkpoint=True), "--enable-int8-mamba-checkpoint"),
+            (dict(enable_mixed_chunk=True), "--enable-mixed-chunk"),
+            (dict(enable_streaming_session=True), "--enable-streaming-session"),
+            (dict(enable_unified_memory=True), "--enable-unified-memory"),
+            (
+                dict(
+                    disable_radix_cache=False,
+                    mamba_radix_cache_strategy="extra_buffer",
+                    enable_session_radix_cache=True,
+                ),
+                "--enable-session-radix-cache",
+            ),
+        ):
+            with self.subTest(kwargs=kwargs):
+                kwargs.setdefault("disable_radix_cache", True)
+                with self.assertRaisesRegex(ValueError, message):
+                    self._check(**kwargs)
+
+    def test_megakernel_is_rejected(self):
+        server_args = ServerArgs(model_path="dummy", enable_nvidia_megakernel=True)
+        with self.assertRaisesRegex(ValueError, "--enable-nvidia-megakernel"):
+            _check_gdn_replayssm_ucache_megakernel(
+                resolving_view(server_args), flag=self.FLAG
+            )
+
+    def test_spec_requirements(self):
+        for kwargs, message in (
+            (dict(), "speculative decoding"),
+            (
+                dict(speculative_algorithm="EAGLE", enable_linear_replayssm_spec=True),
+                "mutually exclusive",
+            ),
+        ):
+            with self.subTest(kwargs=kwargs):
+                server_args = ServerArgs(model_path="dummy", **kwargs)
+                with self.assertRaisesRegex(ValueError, message):
+                    _check_gdn_replayssm_ucache_spec(
+                        resolving_view(server_args), flag=self.FLAG
+                    )
+
+    def _spec_shape(self, **kwargs):
+        args = dict(
+            model_path="dummy",
+            enable_gdn_replayssm_ucache=True,
+            speculative_algorithm="EAGLE",
+            speculative_eagle_topk=1,
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+        )
+        args.update(kwargs)
+        handle_gdn_replayssm_ucache_spec_shape(ServerArgs(**args))
+
+    def test_draft_shape(self):
+        self._spec_shape()
+        with self.assertRaisesRegex(ValueError, "--speculative-eagle-topk 1"):
+            self._spec_shape(speculative_eagle_topk=2)
+        with self.assertRaisesRegex(ValueError, "1 to 8 draft tokens"):
+            self._spec_shape(speculative_num_steps=8, speculative_num_draft_tokens=9)
+
+    def test_adaptive_tiers_are_bounded_by_the_widest_candidate(self):
+        """The initial tier (4 tokens) passes alone; a step-8 candidate verifies 9."""
+        for candidate_steps, error in (([0, 1, 3, 7], None), ([1, 3, 8], "reach 9")):
+            with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+                json.dump({"1": {"candidate_steps": candidate_steps}}, f)
+                f.flush()
+                kwargs = dict(
+                    speculative_adaptive=True, speculative_adaptive_config=f.name
+                )
+                if error is None:
+                    self._spec_shape(**kwargs)
+                else:
+                    with self.assertRaisesRegex(ValueError, error):
+                        self._spec_shape(**kwargs)
+
+    @override_platform(is_cuda=True, is_sm100=True)
+    def test_fp16_state_with_flashinfer_decode_needs_the_flag_on_sm100_plus(self):
+        """FlashInfer GDN decode / verify take bf16 state on SM100+; the u-cache
+        verify replaces them, so an fp16 state passes only with the flag."""
+        kwargs = dict(
+            model_path="dummy",
+            linear_attn_decode_backend="flashinfer",
+            linear_attn_verify_backend="flashinfer",
+            mamba_ssm_dtype="float16",
+        )
+        with (
+            patch("torch.cuda.get_device_capability", return_value=(10, 7)),
+            patch.object(attention_hook, "_check_gdn_replayssm_ucache") as check,
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "requires --mamba-ssm-dtype bfloat16"
+            ):
+                handle_linear_attn_backend(ServerArgs(**kwargs))
+            check.assert_not_called()
+            handle_linear_attn_backend(
+                ServerArgs(enable_gdn_replayssm_ucache=True, **kwargs)
+            )
+            check.assert_called_once()
 
 
 class TestKV4Compatibility(unittest.TestCase):

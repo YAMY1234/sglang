@@ -21,6 +21,9 @@ from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     SharedReadEnds,
 )
+from sglang.srt.layers.attention.linear.gdn_replayssm_ucache import (
+    commit_gdn_ucache_cursors,
+)
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
@@ -1754,21 +1757,31 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
             return
 
-        assert (
-            mamba_caches.temporal.numel() == 0
-            or mamba_caches.intermediate_ssm is not None
-        ), (
-            "per-draft SSM snapshots are not allocated (ReplaySSM spec verify), "
-            "but no ReplaySSM commit handled this pool"
-        )
-        scatter_mamba_states_after_mtp_verify(
-            mamba_caches,
-            state_indices_tensor,
-            last_correct_step_indices,
-            mamba_track_indices,
-            mamba_steps_to_track,
-            src_indices_raw=src_indices_raw,
-        )
+        if mamba_pool.gdn_ucache is not None:
+            self._commit_gdn_ucache_after_verify(
+                mamba_pool=mamba_pool,
+                mamba_caches=mamba_caches,
+                state_indices_tensor=state_indices_tensor,
+                last_correct_step_indices=last_correct_step_indices,
+                mamba_track_indices=mamba_track_indices,
+                src_indices_raw=src_indices_raw,
+            )
+        else:
+            assert (
+                mamba_caches.temporal.numel() == 0
+                or mamba_caches.intermediate_ssm is not None
+            ), (
+                "per-draft SSM snapshots are not allocated (ReplaySSM spec verify), "
+                "but no ReplaySSM commit handled this pool"
+            )
+            scatter_mamba_states_after_mtp_verify(
+                mamba_caches,
+                state_indices_tensor,
+                last_correct_step_indices,
+                mamba_track_indices,
+                mamba_steps_to_track,
+                src_indices_raw=src_indices_raw,
+            )
 
         self._update_ple_state_after_mtp_verify(
             state_indices_tensor,
@@ -1777,6 +1790,39 @@ class HybridLinearAttnBackend(AttentionBackend):
             mamba_steps_to_track,
             src_indices_raw,
         )
+
+    def _commit_gdn_ucache_after_verify(
+        self,
+        *,
+        mamba_pool,
+        mamba_caches,
+        state_indices_tensor: torch.Tensor,
+        last_correct_step_indices: torch.Tensor,
+        mamba_track_indices: Optional[torch.Tensor],
+        src_indices_raw: Optional[torch.Tensor],
+    ) -> None:
+        """Commits a u-cache verify: the cursors, then the conv windows of the live slots."""
+        # The u-cache ring owns the SSM rollback: no intermediate_ssm to scatter.
+        assert mamba_track_indices is None, "u-cache verify tracks no decode state"
+        # Linear chain only, so the last accepted step + 1 counts the bonus.
+        commit_gdn_ucache_cursors(
+            buffers=mamba_pool.gdn_ucache,
+            slots=state_indices_tensor,
+            num_accept_tokens=last_correct_step_indices + 1,
+        )
+        # Per-conv-type scatter (as the ReplaySSM spec commit does): with no
+        # track rows it is cheaper than the single-launch multi-pair kernel.
+        for conv_states, intermediate_conv_window in zip(
+            mamba_caches.conv, mamba_caches.intermediate_conv_window
+        ):
+            if conv_states.numel() > 0:
+                fused_conv_window_scatter_with_mask(
+                    conv_states,
+                    intermediate_conv_window,
+                    state_indices_tensor,
+                    last_correct_step_indices,
+                    src_indices_raw,
+                )
 
     @staticmethod
     def _scatter_speculative_state_with_mask(
