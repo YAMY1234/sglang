@@ -429,6 +429,44 @@ class TestGdnCudaCommitDispatch(CustomTestCase):
             self.assertTrue(cuda.try_commit(**args))
             launch.assert_called_once_with(**args)
 
+    def test_tiled_commit_owns_its_shapes_ahead_of_the_cuda_commit(self):
+        """SGLANG_OPT_GDN_REPLAYSSM_TILED_COMMIT: supported shapes launch the tiled kernel, never the CUDA commit."""
+        for tiled in (False, True):
+            with (
+                self.subTest(tiled=tiled),
+                patch.object(replay, "_use_tiled_commit", return_value=tiled),
+                patch.object(replay, "_commit_cuda", return_value=False) as dispatch,
+                patch.object(replay, "_finish_circular_fold") as finish,
+                patch.object(
+                    replay, "gdn_replayssm_compact_commit_kernel", MagicMock()
+                ) as stock,
+                patch.object(
+                    replay, "gdn_replayssm_compact_commit_tiled_kernel", MagicMock()
+                ) as tiled_kernel,
+            ):
+                replay.commit_gdn_replayssm_circular(
+                    **_cuda_commit_inputs(), use_cuda=True
+                )
+                self.assertEqual(dispatch.call_count, 0 if tiled else 1)
+                self.assertEqual(tiled_kernel.__getitem__.call_count, int(tiled))
+                self.assertEqual(stock.__getitem__.call_count, int(not tiled))
+                finish.assert_called_once()
+                if tiled:
+                    grid = tiled_kernel.__getitem__.call_args.args[0]
+                    kw = tiled_kernel.__getitem__.return_value.call_args.kwargs
+                    self.assertEqual(
+                        grid[:2], (128 // 32, 1)
+                    )  # 32-row V tiles, one row per request
+                    self.assertEqual(
+                        (
+                            kw["BV"],
+                            kw["num_warps"],
+                            kw["num_stages"],
+                            kw["HEADS_PER_PROGRAM"],
+                        ),
+                        (32, 1, 1, 4),
+                    )
+
     def test_cuda_success_and_native_fallback_finish_once(self):
         for enabled, success in ((False, False), (True, False), (True, True)):
             with (
