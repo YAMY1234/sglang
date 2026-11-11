@@ -4,6 +4,8 @@
 # Adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/causal_conv1d/causal_conv1d_interface.py
 # and https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/mamba/ops/causal_conv1d.py
 
+import functools
+import logging
 from typing import List, Optional, Union
 
 import torch
@@ -11,6 +13,9 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.srt.environ import envs
+
+logger = logging.getLogger(__name__)
 
 PAD_SLOT_ID = -1
 
@@ -18,6 +23,74 @@ PAD_SLOT_ID = -1
 # Tokens per program of _causal_conv1d_fwd_kernel; a block_table enumerates
 # (sequence, chunk) pairs in these units.
 CAUSAL_CONV1D_FWD_BLOCK_M = 8
+
+_STOCK_FWD_LAUNCH = {
+    "BLOCK_M": CAUSAL_CONV1D_FWD_BLOCK_M,
+    "BLOCK_N": 256,
+    "num_stages": 2,
+}
+
+
+def _parse_fwd_launch_config(value: str) -> Optional[dict]:
+    """``"BLOCK_M,BLOCK_N,num_warps,num_stages"`` for the rectangular forward launch.
+
+    Each output is computed by one thread from the same inputs in tap order with no
+    cross-thread reduction, so the tile only decides which program computes it.
+    BLOCK_M >= 8 keeps a chunk's prior-token reads inside its sequence and the grid
+    no taller than the default's."""
+    value = value.strip()
+    if value in ("", "0"):
+        return None
+    try:
+        block_m, block_n, num_warps, num_stages = (int(v) for v in value.split(","))
+    except ValueError:
+        raise ValueError(
+            "SGLANG_CAUSAL_CONV1D_FWD_CONFIG must be "
+            f"'BLOCK_M,BLOCK_N,num_warps,num_stages' (e.g. '32,1024,4,2'), got {value!r}"
+        ) from None
+    if not (
+        8 <= block_m <= 1024
+        and num_warps in (1, 2, 4, 8, 16)
+        and block_n & (block_n - 1) == 0
+        and 32 * num_warps <= block_n <= 4096
+        and 1 <= num_stages <= 8
+    ):
+        raise ValueError(
+            "SGLANG_CAUSAL_CONV1D_FWD_CONFIG out of range: BLOCK_M 8..1024, num_warps "
+            "a power of 2 up to 16, BLOCK_N a power of 2 from 32 * num_warps to 4096, "
+            f"num_stages 1..8; got {value!r}"
+        )
+    return {
+        "BLOCK_M": block_m,
+        "BLOCK_N": block_n,
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+    }
+
+
+# A value knob of the runtime optimizations: read only with their master on.
+_FWD_LAUNCH_CONFIG = (
+    _parse_fwd_launch_config(envs.SGLANG_CAUSAL_CONV1D_FWD_CONFIG.get())
+    if envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+    else None
+)
+
+
+def _fwd_launch_config(block_table: Optional[torch.Tensor], width: int) -> dict:
+    # The block-table launch keeps the default tile: its table counts chunks of
+    # CAUSAL_CONV1D_FWD_BLOCK_M tokens. The kernel's tap chain covers widths 2-4.
+    if _FWD_LAUNCH_CONFIG is None or block_table is not None or not 2 <= width <= 4:
+        return _STOCK_FWD_LAUNCH
+    _log_fwd_launch_config_once()
+    return _FWD_LAUNCH_CONFIG
+
+
+@functools.lru_cache(maxsize=1)
+def _log_fwd_launch_config_once() -> None:
+    logger.info(
+        "causal_conv1d forward launch: %s (SGLANG_CAUSAL_CONV1D_FWD_CONFIG)",
+        _FWD_LAUNCH_CONFIG,
+    )
 
 
 @triton.jit()
@@ -607,11 +680,9 @@ def causal_conv1d_fn(
         USE_PAD_SLOT=pad_slot_id is not None,
         NP2_STATELEN=np2_statelen,
         # launch_cooperative_grid=True
-        BLOCK_M=CAUSAL_CONV1D_FWD_BLOCK_M,
-        BLOCK_N=256,
         USE_BLOCK_TABLE=block_table is not None,
         OUTPUT_SPLIT_SIZE=output_split_size,
-        num_stages=2,
+        **_fwd_launch_config(block_table, width),
     )
     return out
 

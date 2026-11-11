@@ -556,6 +556,9 @@ class Envs:
     SGLANG_OPT_QSA_PREFILL_TOPK_BRIDGE_DIRECT = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # Triton causal conv1d forward tile "BLOCK_M,BLOCK_N,num_warps,num_stages" (A's
+    # name); read only with the runtime master on. Same values for any tile.
+    SGLANG_CAUSAL_CONV1D_FWD_CONFIG = EnvStr("")
     # --enable-gdn-replayssm-ucache options below are opt-in children of the master: off
     # unless set, also with the master on (they need the SM107 kernel or change rounding).
     # Size the k / u / g rings and their cursors by request row (request-lifetime scratch,
