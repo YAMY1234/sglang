@@ -45,6 +45,10 @@ from sglang.srt.utils import is_sm100_supported
 _QSA_PREFILL_LOGITS_BUDGET_BYTES = 128 * 1024 * 1024
 
 
+# PREFILL_SELECT variant bits 0-3 per SGLANG_QSA_PREFILL_FAST_SELECT_TOPK.
+_FAST_SELECT_TOPK = {"sampled": 0, "onepass": 1}
+
+
 def _fast_select_chunk_rows(rows: int, width: int, sms: int) -> int:
     """The source fast-select plan: stock's logits budget in 32-row blocks,
     rounded down to whole top-k waves of 2 * sms rows."""
@@ -283,8 +287,16 @@ class QSAIndexer(MultiPlatformOp):
 
     @staticmethod
     def _prefill_select_variant():
-        """The source fast select's options: bit 4 = the tensor-core scorer."""
-        return 16 if envs.SGLANG_QSA_PREFILL_SCORER_TC.get() else 0
+        """The source fast select's options: bits 0-3 = the top-k (0 sampled,
+        1 one-pass), bit 4 = the tensor-core scorer."""
+        topk = envs.SGLANG_QSA_PREFILL_FAST_SELECT_TOPK.get()
+        if topk not in _FAST_SELECT_TOPK:
+            raise ValueError(
+                "SGLANG_QSA_PREFILL_FAST_SELECT_TOPK must be one of "
+                f"{tuple(_FAST_SELECT_TOPK)}, got {topk!r}"
+            )
+        scorer = 16 if envs.SGLANG_QSA_PREFILL_SCORER_TC.get() else 0
+        return _FAST_SELECT_TOPK[topk] | scorer
 
     @staticmethod
     def _grouped4_score_variant():

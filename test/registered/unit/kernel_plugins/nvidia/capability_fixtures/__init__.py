@@ -105,7 +105,7 @@ def contract_geometry(s):
             )
             == (0, 4, 1, 128, 512, 4, 1, 0, 0)
             and 0 < s.context_bound <= 131072
-            and s.variant in (0, 16)
+            and s.variant in (0, 1, 16, 17)
         )
     if isinstance(s, FinalizePermutedSignature):
         # Rows 0 is the one declaration above the graph widths.

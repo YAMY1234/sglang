@@ -316,6 +316,8 @@ class Envs:
     # Its scorer on tensor cores (tl.dot / tcgen05 instead of mma.sync; bitwise is the
     # hardware's, so opt-in).
     SGLANG_QSA_PREFILL_SCORER_TC = EnvBool(False)
+    # Its top-k 512: "sampled" or "onepass" (the same output from one pass per long row).
+    SGLANG_QSA_PREFILL_FAST_SELECT_TOPK = EnvStr("sampled")
     # TP1 target verify on an FP8 KV pool: one union attention launch per layer.
     SGLANG_QSA_FP8_POOL_VERIFY = EnvBool(False)
     # TP1 prefix-chunk prefill attention with TMA-gathered K/V on the stock tile.

@@ -430,8 +430,16 @@ def test_prefill_select_fills_output_through_provider(rows):
     assert torch.equal(io.row_lengths, torch.full((rows,), 8193, dtype=torch.int32))
 
 
-@pytest.mark.parametrize("tc,variant", [(False, 0), (True, 16)])
-def test_prefill_select_declares_and_calls_the_source_scorer_variant(tc, variant):
+@pytest.mark.parametrize(
+    "tc,topk,variant",
+    [
+        (False, "sampled", 0),
+        (True, "sampled", 16),
+        (False, "onepass", 1),
+        (True, "onepass", 17),
+    ],
+)
+def test_prefill_select_declares_and_calls_the_source_variant(tc, topk, variant):
     obj = indexer()
     seen = []
 
@@ -439,7 +447,11 @@ def test_prefill_select_declares_and_calls_the_source_scorer_variant(tc, variant
         seen.append(signature)
         return lambda io: None
 
-    with prefill_flags(), envs.SGLANG_QSA_PREFILL_SCORER_TC.override(tc):
+    with (
+        prefill_flags(),
+        envs.SGLANG_QSA_PREFILL_SCORER_TC.override(tc),
+        envs.SGLANG_QSA_PREFILL_FAST_SELECT_TOPK.override(topk),
+    ):
         found = [
             s
             for s in obj.numeric_preparation_signatures(8193 * 4, 16)
@@ -449,6 +461,16 @@ def test_prefill_select_declares_and_calls_the_source_scorer_variant(tc, variant
             obj.select_prefill_tokens(*prefill_args(33))
     assert [s.variant for s in found] == [variant]
     assert seen == found
+
+
+def test_prefill_select_rejects_an_unknown_top_k():
+    obj = indexer()
+    with (
+        prefill_flags(),
+        envs.SGLANG_QSA_PREFILL_FAST_SELECT_TOPK.override("half"),
+        pytest.raises(ValueError, match="sampled"),
+    ):
+        obj.numeric_preparation_signatures(8193 * 4, 16)
 
 
 def test_prefill_select_chunk_plan_matches_the_source():
