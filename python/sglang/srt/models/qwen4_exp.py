@@ -85,6 +85,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     get_tc_piecewise_forward_context,
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models import qwen4_exp_ple_fused as _ple_fused
 from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
 from sglang.srt.models.qwen3_5 import (
     Qwen3_5AttentionDecoderLayer,
@@ -1268,6 +1269,33 @@ class Qwen4ExpPLELayer(nn.Module):
                 track_indices, _ = track
                 conv_state[track_indices] = next_state.to(dtype=conv_state.dtype)
             return F.silu(conv_output)
+
+        if envs.SGLANG_OPT_PLE_FUSED_EXTEND_CONV.get() and _ple_fused.conv_engages(
+            x,
+            batch,
+            forward_batch.extend_seq_lens_cpu,
+            weight=(weight := self.conv1d.weight.to(dtype=x.dtype)),
+            conv_state=conv_state,
+            channels=self.conv_channels,
+            state_len=self.short_conv_state_len,
+        ):
+            # Stock's conv bytes from the token rows, without the padded [B, C, S + W] input.
+            state = conv_state.index_select(0, batch.state_indices).to(dtype=x.dtype)
+            track = _ple_track_targets(forward_batch, batch)
+            offsets = (batch.lengths,) if track is None else (batch.lengths, track[1])
+            conv_tokens, states = _ple_fused.fused_short_conv_extend(
+                x,
+                state,
+                weight,
+                batch,
+                dilation=self.short_conv_dilation,
+                state_offsets=offsets,
+            )
+            del state
+            conv_state[batch.state_indices] = states[0].to(dtype=conv_state.dtype)
+            if track is not None:
+                conv_state[track[0]] = states[1].to(dtype=conv_state.dtype)
+            return F.silu(conv_tokens)
 
         state = conv_state.index_select(0, batch.state_indices).to(dtype=x.dtype)
         padded_seq = x.new_zeros(

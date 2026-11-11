@@ -514,6 +514,12 @@ class Envs:
     SGLANG_OPT_SCHEDULER_GC_FREEZE = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # Qwen4 PLE extend/mixed passes: the short conv in one Triton launch over the token
+    # rows instead of the padded [B, C, S + W] layout (same bytes as the native depthwise
+    # kernel; passes stock hands to cuDNN keep stock).
+    SGLANG_OPT_PLE_FUSED_EXTEND_CONV = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     # --enable-gdn-replayssm-ucache options below are opt-in children of the master: off
     # unless set, also with the master on (they need the SM107 kernel or change rounding).
     # Size the k / u / g rings and their cursors by request row (request-lifetime scratch,
