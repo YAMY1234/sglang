@@ -225,6 +225,7 @@ def test_rows_above_the_graph_widths_take_the_rows_zero_offer(monkeypatch):
 
 
 def test_extend_floor_also_bounds_the_rows_zero_offer(monkeypatch):
+    monkeypatch.setenv("SGLANG_OPT_MOE_EXTEND_FUSED_FINALIZE", "0")
     monkeypatch.setenv("SGLANG_QWEN_MOE_FUSED_FINALIZE_GATE_MAX_TOKENS", "16384")
     monkeypatch.setattr(impl, "_SOURCE_EXTEND", True)
     obj, *_ = inputs()
@@ -249,6 +250,7 @@ def test_extend_floor_also_bounds_the_rows_zero_offer(monkeypatch):
 
 def test_extend_fast_path_offers_only_rows_below_its_floor(monkeypatch):
     # The source's extend path adds a register cap from its floor upward.
+    monkeypatch.setenv("SGLANG_OPT_MOE_EXTEND_FUSED_FINALIZE", "0")
     monkeypatch.setattr(impl, "_SOURCE_EXTEND", True)
     monkeypatch.setattr(impl, "_SOURCE_EXTEND_MIN_ROWS", 16)
     obj, hidden, *_ = inputs()
@@ -268,6 +270,38 @@ def test_extend_fast_path_offers_only_rows_below_its_floor(monkeypatch):
         impl.prepare(obj, wide, use_fused_gate=True, ordered_finalize_sink=None) is None
     )
     assert seen == [4, 4]
+
+
+def test_extend_fused_finalize_offers_rows_from_the_floor_past_the_row_limit(
+    monkeypatch,
+):
+    monkeypatch.setattr(impl, "_SOURCE_EXTEND", True)
+    monkeypatch.setattr(impl, "_SOURCE_EXTEND_MIN_ROWS", 1024)
+    obj, *_ = inputs()
+    # Graph widths below the default row limit of 64: rows 0 still covers the floor.
+    signatures = impl.numeric_signatures(obj, (1, 4, 16, 32, 64, 96))
+    assert {s.rows for s in signatures} == {0, 1, 4, 16, 32, 64}
+    assert {s.num_warps for s in signatures if s.rows == 0} == {8}
+    seen = []
+
+    def lookup(signature, *, prepared):
+        seen.append(signature.rows)
+        return lambda io: None
+
+    monkeypatch.setattr(numeric_binding, "numeric_operator", lookup)
+    for rows, offered in ((512, False), (1024, True), (32768, True)):
+        hidden = tensor((rows, 2560), label="hidden")
+        plan = impl.prepare(
+            obj, hidden, use_fused_gate=True, ordered_finalize_sink=None
+        )
+        assert (plan is not None) is offered
+    assert seen == [0, 0, 0, 0]
+    monkeypatch.setenv("SGLANG_OPT_MOE_EXTEND_FUSED_FINALIZE", "0")
+    hidden = tensor((1024, 2560), label="hidden")
+    assert (
+        impl.prepare(obj, hidden, use_fused_gate=True, ordered_finalize_sink=None)
+        is None
+    )
 
 
 @pytest.mark.parametrize(

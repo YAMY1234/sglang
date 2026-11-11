@@ -42,12 +42,14 @@ def _source_eligible(producer):
 
 
 def _source_rows(rows):
-    """Whether the source finalizes ``rows`` with the plain fused launch."""
+    """Whether the source finalizes ``rows`` with the fused launch."""
     from sglang.srt.environ import envs
 
-    return rows <= envs.SGLANG_QWEN_MOE_FUSED_FINALIZE_GATE_MAX_TOKENS.get() and not (
-        _SOURCE_EXTEND and rows >= _SOURCE_EXTEND_MIN_ROWS
-    )
+    if _SOURCE_EXTEND and rows >= _SOURCE_EXTEND_MIN_ROWS:
+        # The source's extend fused finalize: the same kernel at any row count
+        # (its register cap changes no value); otherwise these rows stay stock.
+        return envs.SGLANG_OPT_MOE_EXTEND_FUSED_FINALIZE.get()
+    return rows <= envs.SGLANG_QWEN_MOE_FUSED_FINALIZE_GATE_MAX_TOKENS.get()
 
 
 def _signature(producer, rows, weight_scalar_type):
@@ -92,7 +94,10 @@ def numeric_signatures(producer, widths):
     declared_rows = [
         rows for rows in widths if type(rows) is int and rows > 0 and _source_rows(rows)
     ]
-    if widest > 0 and _source_rows(widest + 1):
+    if widest > 0 and (
+        _source_rows(widest + 1)
+        or _source_rows(max(widest + 1, _SOURCE_EXTEND_MIN_ROWS))
+    ):
         declared_rows.append(0)
     signatures = tuple(
         signature

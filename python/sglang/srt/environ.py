@@ -152,6 +152,13 @@ class EnvBool(EnvField):
         raise ValueError(f'"{value}" is not a valid boolean value')
 
 
+class EnvRuntimeBool(EnvBool):
+    """A runtime child cannot enable an optimization while its master is off."""
+
+    def get(self) -> bool:
+        return envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get() and super().get()
+
+
 class EnvInt(EnvField):
     def parse(self, value: str) -> int:
         try:
@@ -284,6 +291,11 @@ class Envs:
     SGLANG_ENABLE_TORCH_INFERENCE_MODE = EnvBool(False)
     # Explicit child values override this default for megakernel runtime optimizations.
     SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION = EnvBool(False)
+    # With SGLANG_Q38_EXTEND_FASTPATH: MoE rows from its floor up take the fused permuted
+    # finalize + gated shared add instead of the stock finalize and gate (same values).
+    SGLANG_OPT_MOE_EXTEND_FUSED_FINALIZE = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     SGLANG_HC_MACRO = EnvBool(True)
     SGLANG_HC_MACRO_MIN_ROWS = EnvInt(2)
     SGLANG_QSA_Q4_SCORE = EnvBool(False)
