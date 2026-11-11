@@ -84,6 +84,9 @@ NV_MEGA_RUNTIME_CHILDREN = (
     "SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND",
 )
 
+# Opt-in children (EnvRuntimeBool(False)): off unless set, and the master still gates them.
+NV_MEGA_RUNTIME_OPT_IN_CHILDREN = ("SGLANG_OPT_GDN_UCACHE_REQUEST_RINGS",)
+
 RENAMED_NV_MEGA_RUNTIME_CHILDREN = {
     "SGLANG_OPT_SMALL_FIELD_COPY_VECTORIZED": "SGLANG_Q35MF_BK_VEC_COPY",
     "SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS": "SGLANG_Q35MF_MKH_N3B",
@@ -269,6 +272,21 @@ class TestEnvField(unittest.TestCase):
                                 self.assertTrue(child.is_set())
                                 child.clear()
                                 self.assertIs(child.get(), master_value)
+
+    def test_mega_runtime_opt_in_children_need_the_master_and_a_value(self):
+        master = envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION
+        for master_value in (False, True):
+            with master.override(master_value):
+                for name in NV_MEGA_RUNTIME_OPT_IN_CHILDREN:
+                    child = self.env_fields[name]
+                    with self.subTest(master=master_value, child=name):
+                        self.assertNotIn(name, NV_MEGA_RUNTIME_CHILDREN)
+                        child.clear()
+                        self.assertIs(child.get(), False)
+                        with child.override("1"):
+                            self.assertIs(child.get(), master_value)
+                        with child.override("0"):
+                            self.assertIs(child.get(), False)
 
     def test_mega_runtime_does_not_override_explicit_none(self):
         with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True):

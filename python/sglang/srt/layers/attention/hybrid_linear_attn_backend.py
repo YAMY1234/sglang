@@ -1765,6 +1765,12 @@ class HybridLinearAttnBackend(AttentionBackend):
                 last_correct_step_indices=last_correct_step_indices,
                 mamba_track_indices=mamba_track_indices,
                 src_indices_raw=src_indices_raw,
+                request_rows=(
+                    req_pool_indices[:request_number]
+                    if mamba_pool.gdn_ucache.by_request_row
+                    and req_pool_indices is not None
+                    else None
+                ),
             )
         else:
             assert (
@@ -1800,6 +1806,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         last_correct_step_indices: torch.Tensor,
         mamba_track_indices: Optional[torch.Tensor],
         src_indices_raw: Optional[torch.Tensor],
+        request_rows: Optional[torch.Tensor],
     ) -> None:
         """Commits a u-cache verify: the cursors, then the conv windows of the live slots."""
         # The u-cache ring owns the SSM rollback: no intermediate_ssm to scatter.
@@ -1809,6 +1816,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             buffers=mamba_pool.gdn_ucache,
             slots=state_indices_tensor,
             num_accept_tokens=last_correct_step_indices + 1,
+            request_rows=request_rows,
         )
         # Per-conv-type scatter (as the ReplaySSM spec commit does): with no
         # track rows it is cheaper than the single-launch multi-pair kernel.

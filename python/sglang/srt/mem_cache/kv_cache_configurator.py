@@ -3445,7 +3445,9 @@ class KVCacheConfigurator:
         return low * alignment
 
     def _gdn_ucache_ring_charge(self, config, pp_layer_scale: float) -> tuple[int, int]:
-        """The u-cache rings' (fixed, per Mamba slot) bytes."""
+        """The u-cache rings' (fixed, per Mamba slot) bytes: per slot, or, as request
+        scratch under SGLANG_OPT_GDN_UCACHE_REQUEST_RINGS, one row per request-table
+        row (max running requests + 1, plus a PD decode's pre-allocation rows)."""
         from sglang.srt.layers.attention.linear.gdn_replayssm_ucache import (
             gdn_ucache_ring_bytes_per_slot,
         )
@@ -3459,7 +3461,15 @@ class KVCacheConfigurator:
             head_k_dim=head_k_dim,
             head_v_dim=head_v_dim,
         )
-        return 0, int(ring_bytes * pp_layer_scale)
+        ring_bytes = int(ring_bytes * pp_layer_scale)
+        # MambaPool._allocate_gdn_ucache reads the same switch (gdn_ucache_request_rings).
+        if not envs.SGLANG_OPT_GDN_UCACHE_REQUEST_RINGS.get():
+            return 0, ring_bytes
+        rows = max(1, get_schedule().max_running_requests // self.attn_dp_size) + 1
+        disagg = get_disagg()
+        if disagg.disaggregation_mode == "decode" or disagg.enable_pd_role_switch:
+            rows += disagg.disaggregation_decode_extra_slots or 0
+        return ring_bytes * rows, 0
 
     def _handle_max_mamba_cache(self, total_rest_memory):
         config = self.mambaish_config

@@ -692,10 +692,22 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 "--enable-gdn-replayssm-ucache: the GDN state pool carries no "
                 "u-cache rings, so verify would fall back to the snapshot path."
             )
+        if self._gdn_ucache is not None and self._gdn_ucache.by_request_row:
+            # Ring rows are request-table rows: the table must not outgrow them.
+            num_ring_rows = self._gdn_ucache.hist_len.shape[0]
+            num_table_rows = self.req_to_token_pool.req_to_token.shape[0]
+            if num_ring_rows < num_table_rows:
+                raise RuntimeError(
+                    f"GDN u-cache rings by request row: {num_ring_rows} ring rows for "
+                    f"{num_table_rows} request rows."
+                )
         self._gdn_ucache_verifier = (
             GdnUcacheVerifier(
                 device=torch.device(model_runner.device),
                 first_layer_id=min(self.state_layer_indices),
+                by_request_row=self._gdn_ucache.by_request_row,
+                num_ring_rows=self._gdn_ucache.hist_len.shape[0],
+                num_state_slots=self.state_pool.size + 1,
             )
             if self._gdn_ucache is not None
             else None
@@ -1528,6 +1540,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     cache_indices=cache_indices,
                     num_draft_tokens=forward_batch.spec_info.draft_token_num,
                     retrieve_parent_token=retrieve_parent_token,
+                    request_rows=forward_batch.req_pool_indices,
                 )
             elif use_replayssm_fold:
                 core_attn_out = self._replayssm_fold_target_verify(
@@ -1808,6 +1821,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         cache_indices: torch.Tensor,
         num_draft_tokens: int,
         retrieve_parent_token: Optional[torch.Tensor],
+        request_rows: torch.Tensor,
     ) -> torch.Tensor:
         assert retrieve_parent_token is None, (
             "GDN u-cache verify supports linear draft chains only (topk == 1)."
@@ -1831,6 +1845,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             buffers=gdn_ucache,
             cache_indices=cache_indices,
             num_draft_tokens=num_draft_tokens,
+            request_rows=request_rows if gdn_ucache.by_request_row else None,
         )
 
     def _replayssm_fold_target_verify(

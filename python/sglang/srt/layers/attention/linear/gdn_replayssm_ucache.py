@@ -12,6 +12,11 @@ The cursors are shared by all GDN layers of a slot and committed once per verify
 from the accept count (bonus token included), with the ``hist_len`` the verify saw:
 a folded row restarts its window at the old window's end with the accepted
 records, any other row extends it. A fresh slot only needs ``hist_len = 0``.
+
+Under SGLANG_OPT_GDN_UCACHE_REQUEST_RINGS the rings and cursors are request-lifetime
+scratch indexed by the request's row in the request table (``by_request_row``), as the
+ReplaySSM spec rings are: only live requests verify, so the radix tree's cached slots
+carry no rings. The state ``S0`` stays at the Mamba slot; only ring addresses change.
 """
 
 from __future__ import annotations
@@ -24,6 +29,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
+
 logger = logging.getLogger(__name__)
 
 # FlashInfer u-cache ring geometry (gdn_replay_mtp_umma.RING_SLOTS / W_RING).
@@ -34,7 +41,8 @@ _CURSOR_BLOCK = 256
 
 
 class GdnUcacheBuffers(msgspec.Struct, frozen=True, kw_only=True):
-    """Per-layer rings and their cursors, indexed by the mamba state slot."""
+    """Per-layer rings and their cursors, indexed by the mamba state slot, or by the
+    request row under ``by_request_row``."""
 
     # [layers, slots, H, 32, K] bf16 normalized keys.
     k_ring: torch.Tensor
@@ -49,6 +57,8 @@ class GdnUcacheBuffers(msgspec.Struct, frozen=True, kw_only=True):
     cache_base: torch.Tensor
     # Rows whose window holds at least this many records fold it in the verify.
     flush_min: int
+    # The "slots" dimension above is the request table's rows (row 0 = padding), not Mamba slots.
+    by_request_row: bool = False
 
 
 class GdnUcacheRows(msgspec.Struct, frozen=True, kw_only=True):
@@ -57,6 +67,8 @@ class GdnUcacheRows(msgspec.Struct, frozen=True, kw_only=True):
     slots: torch.Tensor
     hist_len: torch.Tensor
     cache_base: torch.Tensor
+    # int32 ring row of each batch row (by_request_row only; 0 on padded rows).
+    ring_rows: Optional[torch.Tensor] = None
 
 
 def gdn_ucache_flush_min(max_num_draft_tokens: int) -> int:
@@ -78,6 +90,10 @@ def gdn_ucache_ring_bytes_per_slot(
     return (k_bytes + u_bytes + g_bytes) * num_layers
 
 
+def gdn_ucache_request_rings() -> bool:
+    return envs.SGLANG_OPT_GDN_UCACHE_REQUEST_RINGS.get()
+
+
 def allocate_gdn_ucache(
     *,
     num_layers: int,
@@ -88,6 +104,7 @@ def allocate_gdn_ucache(
     head_v_dim: int,
     max_num_draft_tokens: int,
     device: str,
+    by_request_row: bool = False,
 ) -> GdnUcacheBuffers:
     # Rings are zeroed once; the kernels never read a record outside the window.
     def zeros(shape, dtype):
@@ -106,6 +123,7 @@ def allocate_gdn_ucache(
         hist_len=zeros((num_slots,), torch.int32),
         cache_base=zeros((num_slots,), torch.int32),
         flush_min=gdn_ucache_flush_min(max_num_draft_tokens),
+        by_request_row=by_request_row,
     )
 
 
@@ -156,6 +174,61 @@ def _commit_cursors_kernel(
     new_hist = tl.where(folded, num_accept, hist + num_accept)
     tl.store(base_pool_ptr + slot, new_base, live)
     tl.store(hist_pool_ptr + slot, new_hist, live)
+
+
+# by_request_row: liveness still comes from the state slot (padded rows: slot <= 0), the
+# cursors and ring row from the request row.
+@triton.jit
+def _gather_request_rows_kernel(
+    slots_ptr,
+    rows_ptr,
+    hist_pool_ptr,
+    base_pool_ptr,
+    slots_out_ptr,
+    hist_out_ptr,
+    base_out_ptr,
+    ring_out_ptr,
+    num_rows,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    in_range = offs < num_rows
+    slot = tl.load(slots_ptr + offs, mask=in_range, other=-1).to(tl.int64)
+    live = in_range & (slot > 0)
+    row = tl.load(rows_ptr + offs, mask=live, other=0).to(tl.int64)
+    hist = tl.load(hist_pool_ptr + row, mask=live, other=0)
+    base = tl.load(base_pool_ptr + row, mask=live, other=0)
+    tl.store(slots_out_ptr + offs, tl.where(live, slot, -1).to(tl.int32), in_range)
+    tl.store(hist_out_ptr + offs, hist, in_range)
+    tl.store(base_out_ptr + offs, base, in_range)
+    tl.store(ring_out_ptr + offs, tl.where(live, row, 0).to(tl.int32), in_range)
+
+
+@triton.jit
+def _commit_request_cursors_kernel(
+    slots_ptr,
+    rows_ptr,
+    num_accept_tokens_ptr,
+    hist_pool_ptr,
+    base_pool_ptr,
+    num_rows,
+    flush_min,
+    RING_MASK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    in_range = offs < num_rows
+    slot = tl.load(slots_ptr + offs, mask=in_range, other=-1).to(tl.int64)
+    live = in_range & (slot > 0)
+    row = tl.load(rows_ptr + offs, mask=live, other=0).to(tl.int64)
+    hist = tl.load(hist_pool_ptr + row, mask=live, other=0)
+    base = tl.load(base_pool_ptr + row, mask=live, other=0)
+    num_accept = tl.load(num_accept_tokens_ptr + offs, mask=live, other=0).to(tl.int32)
+    folded = hist >= flush_min
+    new_base = tl.where(folded, (base + hist) & RING_MASK, base)
+    new_hist = tl.where(folded, num_accept, hist + num_accept)
+    tl.store(base_pool_ptr + row, new_base, live)
+    tl.store(hist_pool_ptr + row, new_hist, live)
 
 
 @triton.jit
@@ -238,7 +311,12 @@ def gather_gdn_ucache_rows(
     *,
     slots: torch.Tensor,
     buffers: GdnUcacheBuffers,
+    request_rows: Optional[torch.Tensor] = None,
 ) -> GdnUcacheRows:
+    if buffers.by_request_row:
+        return _gather_gdn_ucache_request_rows(
+            slots=slots, request_rows=request_rows, buffers=buffers
+        )
     num_rows = slots.shape[0]
     rows = GdnUcacheRows(
         slots=torch.empty(num_rows, dtype=torch.int32, device=slots.device),
@@ -259,16 +337,69 @@ def gather_gdn_ucache_rows(
     return rows
 
 
+def _gather_gdn_ucache_request_rows(
+    *,
+    slots: torch.Tensor,
+    request_rows: Optional[torch.Tensor],
+    buffers: GdnUcacheBuffers,
+) -> GdnUcacheRows:
+    num_rows = slots.shape[0]
+    if request_rows is None or request_rows.shape[0] < num_rows:
+        raise RuntimeError(
+            "GDN u-cache rings by request row: the verify needs its request rows."
+        )
+    device = slots.device
+    rows = GdnUcacheRows(
+        slots=torch.empty(num_rows, dtype=torch.int32, device=device),
+        hist_len=torch.empty(num_rows, dtype=torch.int32, device=device),
+        cache_base=torch.empty(num_rows, dtype=torch.int32, device=device),
+        ring_rows=torch.empty(num_rows, dtype=torch.int32, device=device),
+    )
+    if num_rows > 0:
+        _gather_request_rows_kernel[(triton.cdiv(num_rows, _CURSOR_BLOCK),)](
+            slots,
+            request_rows,
+            buffers.hist_len,
+            buffers.cache_base,
+            rows.slots,
+            rows.hist_len,
+            rows.cache_base,
+            rows.ring_rows,
+            num_rows,
+            BLOCK=_CURSOR_BLOCK,
+        )
+    return rows
+
+
 def commit_gdn_ucache_cursors(
     *,
     buffers: GdnUcacheBuffers,
     slots: torch.Tensor,
     num_accept_tokens: torch.Tensor,
+    request_rows: Optional[torch.Tensor] = None,
 ) -> None:
-    """Advance the cursors of the verified slots; must follow that verify and
-    precede the next one, with no other cursor write in between."""
+    """Advance the cursors of the verified slots (their request rows under
+    ``by_request_row``); must follow that verify and precede the next one, with no
+    other cursor write in between."""
     num_rows = slots.shape[0]
     if num_rows == 0:
+        return
+    if buffers.by_request_row:
+        if request_rows is None or request_rows.shape[0] < num_rows:
+            raise RuntimeError(
+                "GDN u-cache rings by request row: the commit needs its request rows."
+            )
+        _commit_request_cursors_kernel[(triton.cdiv(num_rows, _CURSOR_BLOCK),)](
+            slots,
+            request_rows,
+            num_accept_tokens,
+            buffers.hist_len,
+            buffers.cache_base,
+            num_rows,
+            buffers.flush_min,
+            RING_MASK=_RING_MASK,
+            BLOCK=_CURSOR_BLOCK,
+        )
         return
     _commit_cursors_kernel[(triton.cdiv(num_rows, _CURSOR_BLOCK),)](
         slots,
@@ -303,6 +434,31 @@ def reset_gdn_ucache_cursors(*, buffers: GdnUcacheBuffers, slots: torch.Tensor) 
         )
     _reset_cursors_kernel[(triton.cdiv(num_rows, _CURSOR_BLOCK),)](
         slots,
+        buffers.hist_len,
+        buffers.cache_base,
+        num_rows,
+        BLOCK=_CURSOR_BLOCK,
+    )
+
+
+def reset_gdn_ucache_request_rows(
+    *, buffers: GdnUcacheBuffers, request_rows: torch.Tensor
+) -> None:
+    """``reset_gdn_ucache_cursors`` under ``by_request_row``: empty the windows of the
+    request rows a target extend writes (row 0 is the padding row and left untouched)."""
+    global _reset_logged
+    assert buffers.by_request_row
+    num_rows = request_rows.shape[0]
+    if num_rows == 0:
+        return
+    if not _reset_logged:
+        _reset_logged = True
+        logger.info(
+            "GDN u-cache: target extends restart their request rows' windows (first: %d rows)",
+            num_rows,
+        )
+    _reset_cursors_kernel[(triton.cdiv(num_rows, _CURSOR_BLOCK),)](
+        request_rows,
         buffers.hist_len,
         buffers.cache_base,
         num_rows,
@@ -369,11 +525,29 @@ class GdnUcacheVerifier:
         *,
         device: torch.device,
         first_layer_id: int,
+        by_request_row: bool = False,
+        num_ring_rows: int = 0,
+        num_state_slots: int = 0,
     ):
         global _engaged_logged
         from sglang.srt.runtime_context import get_exec
 
         self._flush_kernel = _load_flush_kernel(device)
+        self._by_request_row = by_request_row
+        if by_request_row:
+            # Only the vendored SM107 kernel takes ring_indices; FlashInfer's SM100 one does not.
+            capability = torch.cuda.get_device_capability(device)
+            if capability != (10, 7):
+                raise ValueError(
+                    "SGLANG_OPT_GDN_UCACHE_REQUEST_RINGS needs the SM107 u-cache kernel, "
+                    f"got SM{capability[0]}{capability[1]}"
+                )
+            logger.info(
+                "SGLANG_OPT_GDN_UCACHE_REQUEST_RINGS: the u-cache rings and cursors are "
+                "indexed by request row (%d rows), the GDN state by Mamba slot (%d slots)",
+                num_ring_rows,
+                num_state_slots,
+            )
         if not _engaged_logged:
             _engaged_logged = True
             logger.info(
@@ -417,8 +591,11 @@ class GdnUcacheVerifier:
         buffers: GdnUcacheBuffers,
         cache_indices: torch.Tensor,
         num_draft_tokens: int,
+        request_rows: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Returns the verify output in ``value``'s shape; padded rows are zero."""
+        """Returns the verify output in ``value``'s shape; padded rows are zero.
+        ``request_rows`` (the batch's request-table rows) index the rings under
+        ``by_request_row``."""
         num_v_heads, head_v_dim = value.shape[-2], value.shape[-1]
         num_k_heads, head_k_dim = key.shape[-2], key.shape[-1]
         batch = value.numel() // (num_draft_tokens * num_v_heads * head_v_dim)
@@ -428,7 +605,9 @@ class GdnUcacheVerifier:
         )
         if layer_id == self._first_layer_id:
             self._rows = gather_gdn_ucache_rows(
-                slots=cache_indices[:batch], buffers=buffers
+                slots=cache_indices[:batch],
+                buffers=buffers,
+                request_rows=None if request_rows is None else request_rows[:batch],
             )
             self._refresh_gate_params()
             self._zero_padded_rows(output)
@@ -460,6 +639,7 @@ class GdnUcacheVerifier:
             cache_base=rows.cache_base,
             flush_min=buffers.flush_min,
             restart_hist_on_flush=False,
+            **({"ring_indices": rows.ring_rows} if self._by_request_row else {}),
         )
         return output.reshape(value.shape)
 
@@ -505,6 +685,7 @@ class GdnUcacheVerifier:
         gate_param = zeros(num_v_heads, dtype=torch.float32)
         cursor = zeros(max_batch_size, dtype=torch.int32)
         padded = torch.full((max_batch_size,), -1, dtype=torch.int32, device=device)
+        ring_rows = torch.zeros(max_batch_size, dtype=torch.int32, device=device)
         for batch in range(1, max_batch_size + 1):
             self._flush_kernel(
                 A_log=gate_param,
@@ -523,6 +704,7 @@ class GdnUcacheVerifier:
                 cache_base=cursor[:batch],
                 flush_min=flush_min,
                 restart_hist_on_flush=False,
+                **({"ring_indices": ring_rows[:batch]} if self._by_request_row else {}),
             )
 
     def _output_buffer(self, *, batch: int, row_shape: tuple) -> torch.Tensor:

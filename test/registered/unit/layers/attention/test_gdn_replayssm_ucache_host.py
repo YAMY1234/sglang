@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear import gdn_replayssm_ucache as ucache
 from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -64,6 +65,27 @@ class TestGdnUcacheHost(CustomTestCase):
             ),
             ring_bytes,
         )
+
+    def test_request_rings(self):
+        buffers = _allocate(num_slots=9, by_request_row=True)
+        self.assertTrue(buffers.by_request_row)
+        self.assertEqual(buffers.k_ring.shape[1], 9)
+        self.assertEqual(buffers.hist_len.shape, (9,))
+        self.assertFalse(_allocate().by_request_row)
+        slots = torch.tensor([3, -1], dtype=torch.int32)
+        with self.assertRaisesRegex(RuntimeError, "needs its request rows"):
+            ucache.gather_gdn_ucache_rows(slots=slots, buffers=buffers)
+        with self.assertRaisesRegex(RuntimeError, "needs its request rows"):
+            ucache.commit_gdn_ucache_cursors(
+                buffers=buffers, slots=slots, num_accept_tokens=slots
+            )
+
+    def test_request_rings_follow_the_master(self):
+        env = envs.SGLANG_OPT_GDN_UCACHE_REQUEST_RINGS
+        with env.override("1"):
+            for master in (False, True):
+                with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(master):
+                    self.assertIs(ucache.gdn_ucache_request_rings(), master)
 
     def test_retraction_backup_is_refused_only_under_the_ucache(self):
         self.assertFalse(

@@ -509,6 +509,12 @@ class Envs:
     SGLANG_OPT_SPEC_DRAFT_TOP1_NATIVE_LOGITS = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # --enable-gdn-replayssm-ucache options below are opt-in children of the master: off
+    # unless set, also with the master on (they need the SM107 kernel or change rounding).
+    # Size the k / u / g rings and their cursors by request row (request-lifetime scratch,
+    # max running requests + 1 rows) instead of by Mamba slot, so the radix tree's cached
+    # slots carry no rings (SM107 kernel only; same results).
+    SGLANG_OPT_GDN_UCACHE_REQUEST_RINGS = EnvRuntimeBool(False)
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
