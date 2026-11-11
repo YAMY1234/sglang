@@ -515,6 +515,9 @@ class Envs:
     # max running requests + 1 rows) instead of by Mamba slot, so the radix tree's cached
     # slots carry no rings (SM107 kernel only; same results).
     SGLANG_OPT_GDN_UCACHE_REQUEST_RINGS = EnvRuntimeBool(False)
+    # Keep the ring's normalized keys in fp16 (SM107 kernel only), the same k-hat the
+    # verify's readout uses, instead of bf16.
+    SGLANG_OPT_GDN_UCACHE_FP16_KEY_RING = EnvRuntimeBool(False)
 
     # ===================================================================
     # Model configuration, discovery, and weight loading

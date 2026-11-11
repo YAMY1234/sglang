@@ -44,7 +44,8 @@ class GdnUcacheBuffers(msgspec.Struct, frozen=True, kw_only=True):
     """Per-layer rings and their cursors, indexed by the mamba state slot, or by the
     request row under ``by_request_row``."""
 
-    # [layers, slots, H, 32, K] bf16 normalized keys.
+    # [layers, slots, H, 32, K] normalized keys: bf16, or fp16 under
+    # SGLANG_OPT_GDN_UCACHE_FP16_KEY_RING (gdn_ucache_key_ring_dtype).
     k_ring: torch.Tensor
     # [layers, slots, HV, 32, V] fp16 beta-scaled corrections (FlashInfer takes bf16 or fp16;
     # fp16 keeps 3 more mantissa bits through the deferred fold).
@@ -90,6 +91,19 @@ def gdn_ucache_ring_bytes_per_slot(
     return (k_bytes + u_bytes + g_bytes) * num_layers
 
 
+def gdn_ucache_key_ring_dtype(device) -> torch.dtype:
+    if not envs.SGLANG_OPT_GDN_UCACHE_FP16_KEY_RING.get():
+        return torch.bfloat16
+    # Only the vendored SM107 kernel takes an fp16 k ring; FlashInfer's SM100 one asserts bf16.
+    capability = torch.cuda.get_device_capability(device)
+    if capability != (10, 7):
+        raise ValueError(
+            "SGLANG_OPT_GDN_UCACHE_FP16_KEY_RING needs the SM107 u-cache kernel, "
+            f"got SM{capability[0]}{capability[1]}"
+        )
+    return torch.float16
+
+
 def gdn_ucache_request_rings() -> bool:
     return envs.SGLANG_OPT_GDN_UCACHE_REQUEST_RINGS.get()
 
@@ -113,7 +127,7 @@ def allocate_gdn_ucache(
     return GdnUcacheBuffers(
         k_ring=zeros(
             (num_layers, num_slots, num_k_heads, RING_SLOTS, head_k_dim),
-            torch.bfloat16,
+            gdn_ucache_key_ring_dtype(device),
         ),
         u_ring=zeros(
             (num_layers, num_slots, num_v_heads, RING_SLOTS, head_v_dim),

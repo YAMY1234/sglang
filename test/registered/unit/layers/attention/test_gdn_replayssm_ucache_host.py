@@ -6,6 +6,7 @@ runs on the host: ring allocation, the option gates and the backend routing.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -86,6 +87,19 @@ class TestGdnUcacheHost(CustomTestCase):
             for master in (False, True):
                 with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(master):
                     self.assertIs(ucache.gdn_ucache_request_rings(), master)
+
+    def test_fp16_key_ring_needs_the_sm107_kernel(self):
+        self.assertIs(ucache.gdn_ucache_key_ring_dtype("cpu"), torch.bfloat16)
+        with (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+            envs.SGLANG_OPT_GDN_UCACHE_FP16_KEY_RING.override("1"),
+        ):
+            with patch("torch.cuda.get_device_capability", return_value=(10, 7)):
+                self.assertIs(ucache.gdn_ucache_key_ring_dtype("cuda"), torch.float16)
+                self.assertIs(_allocate().k_ring.dtype, torch.float16)
+            with patch("torch.cuda.get_device_capability", return_value=(10, 0)):
+                with self.assertRaisesRegex(ValueError, "SM107"):
+                    ucache.gdn_ucache_key_ring_dtype("cuda")
 
     def test_retraction_backup_is_refused_only_under_the_ucache(self):
         self.assertFalse(
