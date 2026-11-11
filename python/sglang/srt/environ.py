@@ -556,6 +556,11 @@ class Envs:
     SGLANG_OPT_QSA_PREFILL_TOPK_BRIDGE_DIRECT = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # GDN prefill: the conv writes contiguous q / k / v planes, replacing the post-conv
+    # q / k / v split copy (same values).
+    SGLANG_OPT_GDN_PREFILL_SPLIT_CONV = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     # Triton causal conv1d forward tile "BLOCK_M,BLOCK_N,num_warps,num_stages" (A's
     # name); read only with the runtime master on. Same values for any tile.
     SGLANG_CAUSAL_CONV1D_FWD_CONFIG = EnvStr("")

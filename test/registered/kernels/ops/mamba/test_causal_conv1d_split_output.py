@@ -78,6 +78,65 @@ class TestSplitConvOutput(CustomTestCase):
             torch.testing.assert_close(after, before, rtol=0, atol=0)
         torch.testing.assert_close(states[1], states[0], rtol=0, atol=0)
 
+    def test_qkv_planes_match_the_stock_conv(self):
+        # GDN prefill: uneven q | k | v planes on 256-channel boundaries.
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA required")
+        from sglang.kernels.ops.mamba.causal_conv1d_triton import (
+            causal_conv1d_fn_split_qkv,
+        )
+
+        for block_table in (False, True):
+            with self.subTest(block_table=block_table):
+                torch.manual_seed(45)
+                lengths, q_dim, k_dim, v_dim = [1, 2, 7, 65], 256, 256, 768
+                tokens, dim = sum(lengths), q_dim + k_dim + v_dim
+                x = torch.randn(tokens, dim + 32, device="cuda", dtype=torch.bfloat16)
+                x = x[:, :dim]
+                weight = torch.randn(dim, 4, device="cuda", dtype=x.dtype)
+                bias = torch.randn(dim, device="cuda", dtype=x.dtype)
+                seed = torch.randn(6, 3, dim, device="cuda", dtype=x.dtype)
+                states = [seed.clone().transpose(-1, -2) for _ in range(2)]
+                cu = torch.tensor(
+                    [0, *accumulate(lengths)], device="cuda", dtype=torch.int32
+                )
+                slots = torch.tensor([4, 2, 1, 3], device="cuda", dtype=torch.int32)
+                initial = torch.tensor([False, True, False, True], device="cuda")
+                kwargs = dict(
+                    cache_indices=slots,
+                    has_initial_state=initial,
+                    activation="silu",
+                )
+                if block_table:
+                    kwargs["block_table"] = torch.tensor(
+                        [
+                            (i, j)
+                            for i, n in enumerate(lengths)
+                            for j in range((n + 7) // 8)
+                        ],
+                        device="cuda",
+                        dtype=torch.int32,
+                    )
+                seq_lens = None if block_table else lengths
+                expected = causal_conv1d_fn(
+                    x.T, weight, bias, states[0], cu, seq_lens, **kwargs
+                ).T.split([q_dim, k_dim, v_dim], dim=-1)
+                actual = causal_conv1d_fn_split_qkv(
+                    x.T,
+                    weight,
+                    bias,
+                    states[1],
+                    cu,
+                    seq_lens,
+                    q_dim,
+                    k_dim,
+                    **kwargs,
+                )
+                for before, after in zip(expected, actual):
+                    self.assertTrue(after.is_contiguous())
+                    torch.testing.assert_close(after, before, rtol=0, atol=0)
+                torch.testing.assert_close(states[1], states[0], rtol=0, atol=0)
+
 
 if __name__ == "__main__":
     unittest.main()

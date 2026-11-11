@@ -13,6 +13,9 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn as causal_conv1d_fn_triton,
 )
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
+    causal_conv1d_fn_split_qkv,
+)
+from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
 from sglang.kernels.ops.mamba.gdn_prefill_track import (
@@ -87,6 +90,8 @@ _fused_decode_proj_conv_logged = False
 _fused_decode_proj_conv_fallback_logged = False
 _fused_decode_proj_conv_layers_logged: set[int] = set()
 _fused_decode_real_tensor_verified_layers: set[int] = set()
+# The prefill conv writes contiguous q / k / v planes (same values).
+_SPLIT_CONV = is_cuda() and envs.SGLANG_OPT_GDN_PREFILL_SPLIT_CONV.get()
 _fused_decode_log_layer_hits = envs.SGLANG_GDN_DECODE_FUSION_LOG_LAYER_HITS.get()
 _fused_decode_verify_real_tensors = (
     envs.SGLANG_GDN_DECODE_FUSION_VERIFY_REAL_TENSORS.get()
@@ -667,6 +672,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self.enable_mis = get_exec().features.enable_mis
         self.mis_metadata: Optional[GDNMISMetadata] = None
         self.conv_states_shape = self.state_pool.mamba_cache.conv[0].shape
+        self._split_conv_logged: set = set()
         if not is_cpu() and not is_npu():
             assert self.conv_states_shape[-1] < FLA_CHUNK_SIZE, (
                 f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
@@ -1436,6 +1442,71 @@ class GDNAttnBackend(MambaAttnBackendBase):
             **conv_kwargs,
         ).transpose(0, 1)[: mixed_qkv.shape[0]]
 
+    def _split_conv_ok(
+        self, layer: RadixLinearAttention, mixed_qkv: torch.Tensor
+    ) -> bool:
+        """Whether the extend conv can emit split contiguous q / k / v: the Triton
+        launch on a channel-last view (what the stock CUDA dispatch also takes), width
+        4, q and q + k on 256-channel boundaries."""
+        return (
+            mixed_qkv.dim() == 2
+            and mixed_qkv.shape[0] > 1
+            and mixed_qkv.stride(1) == 1
+            and mixed_qkv.stride(0) != 1
+            and mixed_qkv.shape[1] == layer.q_dim + layer.k_dim + layer.v_dim
+            and layer.conv_weights.shape[-1] == 4
+            and layer.q_dim % 256 == 0
+            and (layer.q_dim + layer.k_dim) % 256 == 0
+            and layer.activation in (None, "silu", "swish")
+        )
+
+    def _log_split_conv_once(self, path: str, num_tokens: int) -> None:
+        if path not in self._split_conv_logged:
+            self._split_conv_logged.add(path)
+            logger.info(
+                "GDN prefill split q/k/v conv engaged (%s, first %d tokens) "
+                "(SGLANG_OPT_GDN_PREFILL_SPLIT_CONV)",
+                path,
+                num_tokens,
+            )
+
+    @staticmethod
+    def _split_conv_views(layer: RadixLinearAttention, q, k, v):
+        seq_len = q.shape[0]
+        return (
+            q.view(1, seq_len, layer.num_q_heads, layer.head_q_dim),
+            k.view(1, seq_len, layer.num_k_heads, layer.head_k_dim),
+            v.view(1, seq_len, layer.num_v_heads, layer.head_v_dim),
+        )
+
+    def _convolve_prefill_split(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        mixed_qkv: torch.Tensor,
+        conv_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+    ):
+        """_convolve_prefill and the q / k / v split in one conv launch."""
+        self._log_split_conv_once("eager", mixed_qkv.shape[0])
+        block_table = self.forward_metadata.conv_block_table
+        conv_kwargs = {"block_table": block_table} if block_table is not None else {}
+        q, k, v = causal_conv1d_fn_split_qkv(
+            mixed_qkv.transpose(0, 1),
+            layer.conv_weights,
+            layer.bias,
+            conv_states=conv_states,
+            query_start_loc=self.forward_metadata.query_start_loc,
+            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            q_dim=layer.q_dim,
+            k_dim=layer.k_dim,
+            activation=layer.activation,
+            has_initial_state=forward_batch.extend_prefix_lens > 0,
+            cache_indices=cache_indices,
+            **conv_kwargs,
+        )
+        return self._split_conv_views(layer, q, k, v)
+
     @staticmethod
     def _prefill_gates(
         layer: RadixLinearAttention, a: torch.Tensor, b: torch.Tensor
@@ -1492,19 +1563,39 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 track_dst=meta.track_dst,
                 num_tokens=meta.num_logical_tokens,
             )
-        mixed_qkv = causal_conv1d_fn_triton(
-            mixed_qkv.transpose(0, 1),
-            layer.conv_weights,
-            layer.bias,
-            conv_states=conv_states,
-            query_start_loc=meta.cu_seqlens,
-            seq_lens_cpu=None,
-            cache_indices=meta.cache_indices,
-            has_initial_state=meta.has_initial_state,
-            activation=layer.activation,
-            block_table=meta.conv_block_table,
-        ).transpose(0, 1)
-        query, key, value = self._split_prefill_qkv(layer, mixed_qkv)
+        if _SPLIT_CONV and self._split_conv_ok(layer, mixed_qkv):
+            self._log_split_conv_once("graph", mixed_qkv.shape[0])
+            query, key, value = self._split_conv_views(
+                layer,
+                *causal_conv1d_fn_split_qkv(
+                    mixed_qkv.transpose(0, 1),
+                    layer.conv_weights,
+                    layer.bias,
+                    conv_states=conv_states,
+                    query_start_loc=meta.cu_seqlens,
+                    seq_lens_cpu=None,
+                    q_dim=layer.q_dim,
+                    k_dim=layer.k_dim,
+                    cache_indices=meta.cache_indices,
+                    has_initial_state=meta.has_initial_state,
+                    activation=layer.activation,
+                    block_table=meta.conv_block_table,
+                ),
+            )
+        else:
+            mixed_qkv = causal_conv1d_fn_triton(
+                mixed_qkv.transpose(0, 1),
+                layer.conv_weights,
+                layer.bias,
+                conv_states=conv_states,
+                query_start_loc=meta.cu_seqlens,
+                seq_lens_cpu=None,
+                cache_indices=meta.cache_indices,
+                has_initial_state=meta.has_initial_state,
+                activation=layer.activation,
+                block_table=meta.conv_block_table,
+            ).transpose(0, 1)
+            query, key, value = self._split_prefill_qkv(layer, mixed_qkv)
         g, beta = self._prefill_gates(layer, a, b)
         core_attn_out, _, h = self.kernel_dispatcher.extend(
             q=query,
@@ -1627,6 +1718,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             state_cache_indices = cache_indices
 
         ucache_fused_conv = None
+        split_qkv = None
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
@@ -1676,17 +1768,28 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     mixed_qkv_to_track
                 )
 
-            mixed_qkv = self._convolve_prefill(
-                layer,
-                forward_batch,
-                mixed_qkv,
-                conv_states_contig,
-                state_cache_indices,
-            )
+            if _SPLIT_CONV and self._split_conv_ok(layer, mixed_qkv):
+                split_qkv = self._convolve_prefill_split(
+                    layer,
+                    forward_batch,
+                    mixed_qkv,
+                    conv_states_contig,
+                    state_cache_indices,
+                )
+            else:
+                mixed_qkv = self._convolve_prefill(
+                    layer,
+                    forward_batch,
+                    mixed_qkv,
+                    conv_states_contig,
+                    state_cache_indices,
+                )
 
         actual_seq_len = mixed_qkv.shape[0]
         qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
-        if (
+        if split_qkv is not None:
+            query, key, value = split_qkv
+        elif (
             (is_cuda() or is_hip() or is_xpu())
             and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM
             and not self._use_strided_target_verify_qkv

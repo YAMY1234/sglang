@@ -136,6 +136,11 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     BLOCK_N: tl.constexpr,
     USE_BLOCK_TABLE: tl.constexpr = False,
     OUTPUT_SPLIT_SIZE: tl.constexpr = 0,
+    # GDN split output: when SPLIT_D0 > 0, o_ptr is a flat buffer of three
+    # token-major planes [T, SPLIT_D0] | [T, SPLIT_D1 - SPLIT_D0] | [T, dim - SPLIT_D1]
+    # (q | k | v). BLOCK_N divides SPLIT_D0 and SPLIT_D1, so a program never straddles.
+    SPLIT_D0: tl.constexpr = 0,
+    SPLIT_D1: tl.constexpr = 0,
 ):
     conv_states_ptr = initial_states_ptr
     conv_state_indices_ptr = cache_indices_ptr
@@ -481,6 +486,20 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                 + output_token * OUTPUT_SPLIT_SIZE
                 + idx_feats % OUTPUT_SPLIT_SIZE
             )
+        elif SPLIT_D0 > 0:
+            feat0 = tl.program_id(2) * BLOCK_N
+            in_k = feat0 >= SPLIT_D0
+            in_v = feat0 >= SPLIT_D1
+            col_base = tl.where(in_v, SPLIT_D1, tl.where(in_k, SPLIT_D0, 0))
+            o_width = tl.where(
+                in_v, dim - SPLIT_D1, tl.where(in_k, SPLIT_D1 - SPLIT_D0, SPLIT_D0)
+            ).to(tl.int64)
+            o_ptrs = (
+                o_ptr
+                + col_base.to(tl.int64) * total_tokens
+                + output_token * o_width
+                + (idx_feats - col_base)
+            )
         else:
             o_ptrs = o_ptr + output_token * stride_o_token + idx_feats * stride_o_dim
 
@@ -501,6 +520,7 @@ def causal_conv1d_fn(
     validate_data=False,
     block_table: Optional[torch.Tensor] = None,
     output_split_size: int = 0,
+    split_dims: Optional[tuple] = None,
     **kwargs,
 ):
     """support varlen + continuous batching when x is 2D tensor
@@ -549,13 +569,23 @@ def causal_conv1d_fn(
         plane, or zero for the original layout. Must divide dim.
     out: same shape as `x`, or (dim // output_split_size, cu_seq_len,
         output_split_size) when output_split_size is nonzero.
+    split_dims: (d0, d1) for a flat output of three token-major planes
+        [cu_seq_len, d0] | [cu_seq_len, d1 - d0] | [cu_seq_len, dim - d1] (see
+        causal_conv1d_fn_split_qkv); d0 and d1 must be multiples of 256.
     """
     if isinstance(activation, bool) and activation:
         activation = "silu"
 
     is_channel_last = (x.stride(0) == 1) & (x.stride(1) > 1)
     dim, cu_seqlen = x.shape
-    if output_split_size:
+    if split_dims is not None:
+        # Flat [q | k | v] planes; the split launch keeps the stock 256-wide tile.
+        if output_split_size or split_dims[0] % 256 or split_dims[1] % 256:
+            raise ValueError(
+                "split_dims must be multiples of 256, without a split size"
+            )
+        out = torch.empty(x.numel(), dtype=x.dtype, device=x.device)
+    elif output_split_size:
         if output_split_size < 0 or dim % output_split_size:
             raise ValueError("output_split_size must be positive and divide dim")
         out = torch.empty(
@@ -594,7 +624,10 @@ def causal_conv1d_fn(
         stride_istate_dim = conv_states.stride(1)
         stride_istate_token = conv_states.stride(2)
         # assert stride_istate_dim == 1
-    if output_split_size:
+    if split_dims is not None:
+        # The kernel derives each plane's pitch from total_tokens.
+        stride_o_seq = stride_o_dim = stride_o_token = 0
+    elif output_split_size:
         # The plane pitch uses runtime total_tokens in the kernel; do not
         # specialize the launch on every ragged prefill's token count.
         stride_o_seq = 0
@@ -682,9 +715,47 @@ def causal_conv1d_fn(
         # launch_cooperative_grid=True
         USE_BLOCK_TABLE=block_table is not None,
         OUTPUT_SPLIT_SIZE=output_split_size,
-        **_fwd_launch_config(block_table, width),
+        SPLIT_D0=split_dims[0] if split_dims is not None else 0,
+        SPLIT_D1=split_dims[1] if split_dims is not None else 0,
+        **(
+            _STOCK_FWD_LAUNCH
+            if split_dims is not None
+            else _fwd_launch_config(block_table, width)
+        ),
     )
     return out
+
+
+def causal_conv1d_fn_split_qkv(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Union[torch.Tensor, None],
+    conv_states: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens_cpu: Optional[List[int]],
+    q_dim: int,
+    k_dim: int,
+    **kwargs,
+):
+    """causal_conv1d_fn whose output is three contiguous token-major tensors
+    q [T, q_dim], k [T, k_dim], v [T, dim - q_dim - k_dim]: bit-identical values to
+    causal_conv1d_fn(...).transpose(0, 1) split along the channel axis."""
+    dim, total = x.shape
+    out = causal_conv1d_fn(
+        x,
+        weight,
+        bias,
+        conv_states=conv_states,
+        query_start_loc=query_start_loc,
+        seq_lens_cpu=seq_lens_cpu,
+        split_dims=(q_dim, q_dim + k_dim),
+        **kwargs,
+    )
+    qk_end = total * (q_dim + k_dim)
+    q = out[: total * q_dim].view(total, q_dim)
+    k = out[total * q_dim : qk_end].view(total, k_dim)
+    v = out[qk_end:].view(total, dim - q_dim - k_dim)
+    return q, k, v
 
 
 # HAS_EAGLE_TREE_CUSTOM_ATTN_MASK is added to support eagle tree attention mask

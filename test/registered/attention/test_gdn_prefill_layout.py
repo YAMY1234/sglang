@@ -23,6 +23,32 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
 
 
+class TestGdnSplitConvGate(unittest.TestCase):
+    def test_split_conv_takes_only_the_channel_last_width4_extend(self):
+        backend = object.__new__(GDNAttnBackend)
+
+        def layer(q_dim=256, width=4, activation="silu"):
+            return SimpleNamespace(
+                q_dim=q_dim,
+                k_dim=256,
+                v_dim=768,
+                conv_weights=torch.zeros(q_dim + 1024, width),
+                activation=activation,
+            )
+
+        self.assertTrue(backend._split_conv_ok(layer(), torch.zeros(5, 1280)))
+        for bad_layer, rows in (
+            (layer(width=3), 5),
+            (layer(q_dim=128), 5),
+            (layer(activation="relu"), 5),
+            (layer(), 1),
+        ):
+            x = torch.zeros(rows, bad_layer.q_dim + 1024)
+            self.assertFalse(backend._split_conv_ok(bad_layer, x))
+        # Column-major input (stride(0) == 1) keeps the stock conv.
+        self.assertFalse(backend._split_conv_ok(layer(), torch.zeros(1280, 5).T))
+
+
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestGdnPrefillLayout(unittest.TestCase):
     TOKENS = 33
