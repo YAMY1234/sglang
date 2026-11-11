@@ -369,6 +369,10 @@ class Envs:
     SGLANG_HC_GATE_MAX_ROWS = EnvInt(1)
     # Rows up to which the permuted MoE finalize also applies the shared-expert gate.
     SGLANG_QWEN_MOE_FUSED_FINALIZE_GATE_MAX_TOKENS = EnvInt(64)
+    # The native permuted finalize + shared gate at 1..64 rows on a (row, column-chunk) grid of this many
+    # columns (128, 256, 512 or 1024; FINALIZE_PERMUTED_SHARED variant); 0 keeps one program per row.
+    # Same arithmetic per element; only the grid changes.
+    SGLANG_MOE_FINALIZE_GATE_COLUMN_CHUNK = EnvInt(0)
     # Log once per role/layer/op whether a numeric provider was offered and bound,
     # or why stock runs; read once at import, so it costs nothing when off.
     SGLANG_NVIDIA_MEGAKERNEL_OFFER_LOG = EnvBool(False)

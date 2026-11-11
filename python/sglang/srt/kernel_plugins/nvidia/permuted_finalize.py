@@ -52,6 +52,22 @@ def _source_rows(rows):
     return rows <= envs.SGLANG_QWEN_MOE_FUSED_FINALIZE_GATE_MAX_TOKENS.get()
 
 
+_COLUMN_CHUNKS = (128, 256, 512, 1024)
+# The source launches the fused finalize at <= 64 rows on a (row, column-chunk) grid.
+_COLUMN_CHUNK_MAX_ROWS = 64
+
+
+def _column_chunk(rows):
+    from sglang.srt.environ import envs
+
+    chunk = envs.SGLANG_MOE_FINALIZE_GATE_COLUMN_CHUNK.get()
+    if chunk not in (0,) + _COLUMN_CHUNKS:
+        raise ValueError(
+            f"SGLANG_MOE_FINALIZE_GATE_COLUMN_CHUNK must be 0 or one of {_COLUMN_CHUNKS}, got {chunk}"
+        )
+    return chunk if 0 < rows <= _COLUMN_CHUNK_MAX_ROWS else 0
+
+
 def _signature(producer, rows, weight_scalar_type):
     from sglang.kernels.jit.utils import is_arch_support_pdl
     from sglang.kernels.plugin_kernels.nvidia.numeric import (
@@ -73,6 +89,7 @@ def _signature(producer, rows, weight_scalar_type):
         if rows == 0 or rows >= 1024 or is_batch_invariant_mode_enabled()
         else 16,
         use_pdl=int(is_arch_support_pdl()),
+        variant=_column_chunk(rows),
     )
 
 

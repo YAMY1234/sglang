@@ -196,6 +196,24 @@ def test_max_tokens_bounds_declared_rows_and_wide_rows_take_eight_warps(
         assert s.num_warps == (8 if s.rows in (0, 1024) else 16)
 
 
+@pytest.mark.parametrize("chunk", [0, 128, 256, 512, 1024])
+def test_column_chunk_is_the_variant_of_rows_up_to_64(monkeypatch, chunk):
+    monkeypatch.setenv("SGLANG_QWEN_MOE_FUSED_FINALIZE_GATE_MAX_TOKENS", "16384")
+    monkeypatch.setenv("SGLANG_MOE_FINALIZE_GATE_COLUMN_CHUNK", str(chunk))
+    obj, *_ = inputs()
+    signatures = impl.numeric_signatures(obj, (1, 4, 64, 65, 512))
+    assert {s.rows for s in signatures} == {0, 1, 4, 64, 65, 512}
+    for s in signatures:
+        assert s.variant == (chunk if 0 < s.rows <= 64 else 0)
+
+
+def test_column_chunk_outside_the_source_values_is_rejected(monkeypatch):
+    obj, *_ = inputs()
+    monkeypatch.setenv("SGLANG_MOE_FINALIZE_GATE_COLUMN_CHUNK", "300")
+    with pytest.raises(ValueError, match="COLUMN_CHUNK"):
+        impl.numeric_signatures(obj, (4,))
+
+
 def test_rows_above_the_graph_widths_take_the_rows_zero_offer(monkeypatch):
     monkeypatch.setenv("SGLANG_QWEN_MOE_FUSED_FINALIZE_GATE_MAX_TOKENS", "16384")
     obj, *_ = inputs()

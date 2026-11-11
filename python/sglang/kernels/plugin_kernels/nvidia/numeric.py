@@ -189,6 +189,7 @@ class FinalizePermutedSignature:
     weight_scalar_type: int
     num_warps: int = 16
     use_pdl: int = 1
+    # Column chunk of a (row, chunk) grid at 1..64 rows (128/256/512/1024); 0 = one program per row.
     variant: int = 0
 
 
