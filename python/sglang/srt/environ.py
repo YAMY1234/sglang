@@ -349,6 +349,9 @@ class Envs:
     SGLANG_QSA_FP8_POOL_VERIFY_UNION_WARPS = EnvInt(8)
     # Its attention kernel warp-specialized (Gluon tcgen05; lazy rescale, not bitwise).
     SGLANG_QSA_FP8_POOL_VERIFY_WS = EnvBool(False)
+    # TP1 BF16-pool target verify: the attention output gate rides the pool attention's
+    # split-K merge (fused_sigmoid_mul's arithmetic, so the same bits).
+    SGLANG_ENABLE_QSA_POOL_MERGE_GATE = EnvBool(False)
     # TP1 prefix-chunk prefill attention with TMA-gathered K/V on the stock tile.
     SGLANG_ENABLE_QSA_TMA_PREFILL = EnvBool(False)
     SGLANG_QSA_TMA_PREFILL_STAGES = EnvInt(3)

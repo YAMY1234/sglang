@@ -115,7 +115,7 @@ def state(rows=32, width=4):
     return obj, args
 
 
-def install(rows, width, run):
+def install(rows, width, run, variant=None):
     registry = api.NumericRegistry()
     signatures = numeric_binding.collect_numeric_signatures(
         (attention(),), (rows,), width
@@ -124,7 +124,7 @@ def install(rows, width, run):
         s
         for s in signatures
         if s.operation == api.NumericOperation.DIRECT_POOL_ATTENTION
-        and s.variant == (1 if width == 4 else 2)
+        and s.variant == (variant or (1 if width == 4 else 2))
     )
     registry.register(api.NumericOffer(signature, run))
     return patch.object(numeric_binding, "numeric_registry", registry), signature
@@ -159,6 +159,81 @@ def test_installed_startup_declares_only_finite_source_rows(width, expected):
         == (24, 2, 256, 512, 4, 1, 0, 0, 1 if width == 4 else 2)
         for s in selected
     )
+
+
+def test_merge_gate_declares_gated_verify_rows_only():
+    with envs.SGLANG_ENABLE_QSA_POOL_MERGE_GATE.override(True):
+        declarations = numeric_binding.collect_numeric_signatures(
+            (attention(),), (1, 4, 32, 64), 4
+        )
+    assert {
+        (s.rows, s.variant)
+        for s in declarations
+        if s.operation == api.NumericOperation.DIRECT_POOL_ATTENTION
+    } == {(1, 2), (4, 2), (4, 5), (32, 2), (32, 5), (64, 2), (64, 5)}
+
+
+@pytest.mark.parametrize("layout", ["flat", "strided"])
+def test_merge_gate_rides_the_merge_and_says_so(layout):
+    rows = 32
+    obj, args = state(rows, 4)
+    q_gate = torch.zeros((rows, 24, 512), dtype=torch.bfloat16)
+    gate = (
+        q_gate[:, :, 256:]
+        if layout == "strided"
+        else torch.zeros((rows, 6144), dtype=torch.bfloat16)
+    )
+    seen = []
+
+    def run(io):
+        seen.append(io)
+        io.output.fill_(7)
+
+    with envs.SGLANG_ENABLE_QSA_POOL_MERGE_GATE.override(True):
+        guard, sig = install(rows, 4, run, variant=5)
+        with guard:
+            output, gated = obj._try_numeric_pool_attention(*args, gate=gate)
+    assert sig.variant == 1 | policy.POOL_MERGE_GATE and gated is True
+    assert torch.equal(output, torch.full((rows, 6144), 7, dtype=torch.bfloat16))
+    io = seen[0]
+    assert io.gate.shape == (rows, 24, 256) and io.gate.data_ptr() == gate.data_ptr()
+    assert io.gate.stride() == (
+        (24 * 512, 512, 1) if layout == "strided" else (6144, 256, 1)
+    )
+
+
+@pytest.mark.parametrize("change", ["missing", "float", "rows"])
+def test_merge_gate_without_a_usable_gate_leaves_the_call(change):
+    rows = 32
+    obj, args = state(rows, 4)
+    gate = {
+        "missing": None,
+        "float": torch.zeros((rows, 6144)),
+        "rows": torch.zeros((rows - 4, 6144), dtype=torch.bfloat16),
+    }[change]
+    seen = []
+    with envs.SGLANG_ENABLE_QSA_POOL_MERGE_GATE.override(True):
+        guard, _ = install(rows, 4, seen.append, variant=5)
+        with guard:
+            assert obj._try_numeric_pool_attention(*args, gate=gate) is None
+    assert not seen
+
+
+def test_merge_gate_off_keeps_the_ungated_verify():
+    rows = 32
+    obj, args = state(rows, 4)
+    seen = []
+
+    def run(io):
+        seen.append(io)
+        io.output.fill_(7)
+
+    guard, sig = install(rows, 4, run)
+    gate = torch.zeros((rows, 6144), dtype=torch.bfloat16)
+    with guard:
+        output = obj._try_numeric_pool_attention(*args, gate=gate)
+    assert sig.variant == 1 and isinstance(output, torch.Tensor)
+    assert seen[0].gate is None
 
 
 @pytest.mark.parametrize("value", ["0", "false", " FALSE ", "no", "off", ""])

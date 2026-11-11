@@ -1596,8 +1596,11 @@ class QwenSparseAttnBackend(AttentionBackend):
                 width,
                 metadata,
                 kv_prestored=kv_prestored,
+                gate=output_gate,
             )
         )
+        if isinstance(pooled, tuple):
+            return pooled
         if pooled is not None:
             return (pooled, False) if output_gate is not None else pooled
         return self._forward_trtllm_sparse(
@@ -1627,7 +1630,10 @@ class QwenSparseAttnBackend(AttentionBackend):
         metadata,
         *,
         kv_prestored=False,
+        gate=None,
     ):
+        """The pool attention output, or (output, True) when the output gate rode the
+        split-K merge; None leaves the call to the caller's other routes."""
         from sglang.kernels.plugin_kernels.nvidia.numeric import (
             DirectPoolAttentionIO,
             DirectPoolSelection,
@@ -1640,11 +1646,13 @@ class QwenSparseAttnBackend(AttentionBackend):
         from sglang.srt.environ import envs
         from sglang.srt.kernel_plugins.nvidia.numeric_binding import numeric_operator
         from sglang.srt.kernel_plugins.nvidia.pool_attention import (
+            POOL_MERGE_GATE,
             pool_decode_enabled,
             pool_device_sms,
             pool_scratch_elements,
             union_variant,
             union_workspace,
+            verify_variant,
         )
 
         if not (
@@ -1656,7 +1664,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             return None
         mode = forward_batch.forward_mode
         if mode.is_target_verify() and width == 4:
-            variant = 1
+            variant = verify_variant()
         elif mode.is_decode() and width == 1:
             variant = 2
         else:
@@ -1664,7 +1672,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         # An FP8 pool takes the union kernel: TP1 single-chain verify only.
         union = key_pool.dtype == torch.float8_e4m3fn
         if union and not (
-            variant == 1
+            variant & ~POOL_MERGE_GATE == 1
             and envs.SGLANG_QSA_FP8_POOL_VERIFY.get()
             and int(getattr(forward_batch.spec_info, "topk", 1) or 1) == 1
         ):
@@ -1759,6 +1767,20 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
         if run is None:
             return None
+        merge_gate = None
+        if not union and variant & POOL_MERGE_GATE:
+            # The model's gate is [rows, heads * dim] or its strided [rows, heads, dim]
+            # view; the merge reads [rows, heads, dim] with any row and head stride.
+            if not (
+                gate is not None
+                and gate.dtype == torch.bfloat16
+                and gate.device == q.device
+                and gate.shape[0] == rows
+                and gate.stride(-1) == 1
+                and gate.numel() == rows * layer.tp_q_head_num * layer.head_dim
+            ):
+                return None
+            merge_gate = gate.view(rows, layer.tp_q_head_num, layer.head_dim)
         query = q.view(rows, layer.tp_q_head_num, layer.head_dim)
         selected = indices.to(torch.int32).contiguous()
         output = torch.empty(
@@ -1816,7 +1838,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         run(
             DirectPoolAttentionIO(
                 query,
-                None,
+                merge_gate,
                 k,
                 v,
                 locations,
@@ -1829,6 +1851,8 @@ class QwenSparseAttnBackend(AttentionBackend):
                 scratch,
             )
         )
+        if merge_gate is not None:
+            return output.view(rows, -1), True
         return output.view(rows, -1)
 
     def _try_numeric_direct_attention(

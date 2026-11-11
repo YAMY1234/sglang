@@ -46,7 +46,8 @@ def pool_signatures(
     ):
         return ()
     routes = [
-        (NumericOperation.DIRECT_POOL_ATTENTION, variant, 1) for variant in (2, 1)
+        (NumericOperation.DIRECT_POOL_ATTENTION, variant, 1)
+        for variant in (2, verify_variant())
     ]
     if envs.SGLANG_QSA_FP8_POOL_VERIFY.get():
         # The FP8 union serves width-4 target verify only.
@@ -76,6 +77,14 @@ def pool_signatures(
 
 
 _UNION_WS = 1 << 6
+# DIRECT_POOL_ATTENTION variant bit 2: the output gate rides the split-K merge.
+POOL_MERGE_GATE = 1 << 2
+
+
+def verify_variant():
+    """DIRECT_POOL_ATTENTION's width-4 verify variant: 1, with POOL_MERGE_GATE under
+    the source's SGLANG_ENABLE_QSA_POOL_MERGE_GATE (decode, 2, never takes the gate)."""
+    return 1 | (POOL_MERGE_GATE if envs.SGLANG_ENABLE_QSA_POOL_MERGE_GATE.get() else 0)
 
 
 def union_variant():

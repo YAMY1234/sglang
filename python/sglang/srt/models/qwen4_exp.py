@@ -2169,6 +2169,17 @@ class Qwen4ExpAttentionDecoderLayer(
             and get_bool_env_var("Q38_ATTN_GATE_V2", "False")
         ):
             attention_kwargs["numeric_output_gate"] = gate
+        elif (
+            self.is_qsa
+            and gate is not None
+            and q.is_cuda
+            and q.dtype == torch.bfloat16
+            and forward_batch.forward_mode.is_target_verify()
+            and envs.SGLANG_ENABLE_QSA_POOL_MERGE_GATE.get()
+        ):
+            # Only the pool attention's merge consumes it (and says so); any other
+            # route leaves the gate to the fused_sigmoid_mul below.
+            attention_kwargs["numeric_output_gate"] = gate
         attn_output = self.attn(q, k, v, forward_batch, **attention_kwargs)
         gate_applied = False
         if isinstance(attn_output, tuple):

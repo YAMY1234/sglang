@@ -216,8 +216,9 @@ def contract_geometry(s):
                 (
                     (s.query_heads, s.kv_heads) == (24, 2)
                     and (
-                        (s.variant == 1 and s.rows <= 64 and s.rows % 4 == 0)
-                        or (s.variant == 2 and s.rows <= 64)
+                        # Bit 2: the output gate rides the split-K merge.
+                        (s.variant & ~4 == 1 and s.rows <= 64 and s.rows % 4 == 0)
+                        or (s.variant & ~4 == 2 and s.rows <= 64)
                     )
                 )
                 or (
