@@ -659,6 +659,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     next_token_logits_buffer: torch.Tensor = None
     temperature: torch.Tensor = None
     top_p: torch.Tensor = None
+    # A top-1 draft decode step reads only the argmax of its logits: keep them in the
+    # LM head's dtype (SGLANG_OPT_SPEC_DRAFT_TOP1_NATIVE_LOGITS)
+    native_dtype_logits: bool = False
 
     # For multimodal
     mm_input_embeds: Optional[torch.Tensor] = None

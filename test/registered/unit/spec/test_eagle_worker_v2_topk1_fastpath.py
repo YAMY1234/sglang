@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
@@ -167,6 +168,84 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
             result = worker.draft_forward(forward_batch)
 
         self.assertEqual(worker.draft_runner.forward.call_count, 2)
+
+    def test_top1_draft_steps_keep_native_logits_only_under_the_switch(self):
+        """SGLANG_OPT_SPEC_DRAFT_TOP1_NATIVE_LOGITS: a top-1 chain's draft steps ask the
+        logits processor for logits in the LM head's dtype, which only the split argmax
+        reads; with draft probabilities, logprobs or the switch off they do not, and
+        the batch's flag is restored after the steps."""
+        bs, steps, vocab = 2, 3, 16
+        for switch, logprob, expected in (
+            (False, False, False),
+            (True, True, False),
+            (True, False, True),
+        ):
+            worker = _make_worker(num_steps=steps, num_draft_tokens=steps + 1)
+            worker.hot_token_id = None
+            worker.index_share_for_mtp_iteration = False
+            worker.seed_dsa_topk_from_draft_extend = False
+            worker._topk1_parents_prealloc = torch.zeros((8, steps), device=DEVICE)
+            worker._topk1_score_indices_prealloc = torch.zeros(
+                (8, steps), device=DEVICE
+            )
+            worker.draft_attn_backend = SimpleNamespace(attn_backends=[None] * steps)
+            seen = []
+
+            def forward(fb, seen=seen):
+                seen.append(fb.native_dtype_logits)
+                return SimpleNamespace(
+                    logits_output=SimpleNamespace(
+                        next_token_logits=torch.zeros((bs, vocab), device=DEVICE),
+                        hidden_states=torch.zeros((bs, 4), device=DEVICE),
+                    )
+                )
+
+            worker.draft_runner = SimpleNamespace(
+                canary_manager=None,
+                forward=forward,
+                model_config=SimpleNamespace(model_is_mrope=False),
+            )
+            forward_batch = SimpleNamespace(
+                forward_mode=ForwardMode.DECODE,
+                batch_size=bs,
+                out_cache_loc=torch.arange(bs * steps, device=DEVICE),
+                positions=torch.zeros(bs, dtype=torch.int64, device=DEVICE),
+                return_logprob=logprob,
+                native_dtype_logits=False,
+                sampling_info=SimpleNamespace(is_all_greedy=True),
+                spec_info=SimpleNamespace(
+                    topk_p=torch.ones((bs, 1), device=DEVICE),
+                    topk_index=torch.zeros((bs, 1), dtype=torch.int64, device=DEVICE),
+                    hidden_states=torch.zeros((bs, 4), device=DEVICE),
+                ),
+            )
+            top1 = (
+                torch.ones((bs, 1), device=DEVICE),
+                torch.zeros((bs, 1), dtype=torch.int64, device=DEVICE),
+            )
+            with (
+                self.subTest(switch=switch, logprob=logprob),
+                envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+                envs.SGLANG_OPT_SPEC_DRAFT_TOP1_NATIVE_LOGITS.override(switch),
+                patch(
+                    "sglang.srt.speculative.eagle_worker_v2.forward_context",
+                    side_effect=lambda *_a, **_k: contextlib.nullcontext(),
+                ),
+                patch("sglang.srt.speculative.eagle_worker_v2._is_cuda", True),
+                patch(
+                    "sglang.srt.speculative.eagle_worker_v2.get_spec",
+                    return_value=SimpleNamespace(
+                        speculative_use_rejection_sampling=False
+                    ),
+                ),
+                patch(
+                    "sglang.srt.speculative.eagle_worker_v2.draft_topk1_postprocess",
+                    return_value=top1,
+                ),
+            ):
+                worker.draft_forward(forward_batch)
+                self.assertEqual(seen, [expected] * (steps - 1))
+                self.assertFalse(forward_batch.native_dtype_logits)
 
 
 class TestEagleWorkerV2BackendFallback(CustomTestCase):

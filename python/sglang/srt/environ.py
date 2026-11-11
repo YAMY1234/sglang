@@ -504,6 +504,11 @@ class Envs:
     SGLANG_OPT_SPEC_DRAFT_EXTEND_GRAPH_TOP1 = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # A top-1 chain's draft decode steps keep their logits in the LM head's dtype (BF16)
+    # instead of casting them to FP32: the split argmax reads them as they are.
+    SGLANG_OPT_SPEC_DRAFT_TOP1_NATIVE_LOGITS = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Model configuration, discovery, and weight loading

@@ -1,7 +1,9 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers import logits_processor
 from sglang.srt.layers.aux_hidden_states import pack_aux_hidden_states
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
@@ -89,6 +91,43 @@ class TestEagleDraftExtendLogitsPruning(unittest.TestCase):
             capture_hidden_mode=CaptureHiddenMode.FULL,
         )
         torch.testing.assert_close(actual, pack_aux_hidden_states(aux_hidden_states))
+
+
+class TestDraftTop1NativeLogits(unittest.TestCase):
+    def test_a_top1_draft_decode_keeps_its_logits_in_the_lm_head_dtype(self):
+        """SGLANG_OPT_SPEC_DRAFT_TOP1_NATIVE_LOGITS: a decode batch that asks for native
+        logits gets the LM head's BF16 / FP16 rows (vocabulary padding cut) instead of
+        an FP32 copy, whose argmax is the same; any other batch, softcapping or FP32
+        logits keep the cast."""
+        processor = LogitsProcessor.__new__(LogitsProcessor)
+        processor.vocab_size = 10
+        logits = torch.randn(3, 12).to(torch.bfloat16)
+        for native, mode, dtype, softcap, kept in (
+            (True, ForwardMode.DECODE, torch.bfloat16, None, True),
+            (True, ForwardMode.DECODE, torch.float16, None, True),
+            (False, ForwardMode.DECODE, torch.bfloat16, None, False),
+            (True, ForwardMode.DRAFT_EXTEND_V2, torch.bfloat16, None, False),
+            (True, ForwardMode.DECODE, torch.float32, None, False),
+            (True, ForwardMode.DECODE, torch.bfloat16, 30.0, False),
+        ):
+            metadata = LogitsMetadata(forward_mode=mode, native_dtype_logits=native)
+            with (
+                self.subTest(native=native, mode=mode, dtype=dtype, softcap=softcap),
+                patch.object(
+                    logits_processor,
+                    "softcap_to_float32_logits",
+                    lambda x, cap, out: x.float(),
+                ),
+            ):
+                out = processor._copy_logits_to_buffer(
+                    logits.to(dtype), metadata, softcap=softcap
+                )
+                self.assertEqual(tuple(out.shape), (3, 10))
+                self.assertEqual(out.dtype, dtype if kept else torch.float32)
+                self.assertTrue(
+                    torch.equal(out.argmax(-1), logits[:, :10].float().argmax(-1))
+                    or softcap is not None
+                )
 
 
 if __name__ == "__main__":

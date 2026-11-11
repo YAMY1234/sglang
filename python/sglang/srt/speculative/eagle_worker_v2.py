@@ -825,6 +825,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 device=topk_index.device,
             )
             draft_tokens_topk1[:, :1].copy_(topk_index)
+        # SGLANG_OPT_SPEC_DRAFT_TOP1_NATIVE_LOGITS: only draft_topk1_postprocess reads the
+        # steps' logits, and its argmax is the same on the LM head's BF16 values
+        native_logits = forward_batch.native_dtype_logits
+        forward_batch.native_dtype_logits = (
+            envs.SGLANG_OPT_SPEC_DRAFT_TOP1_NATIVE_LOGITS.get()
+            and self.topk == 1
+            and _is_cuda
+            and not needs_draft_probs
+            and not forward_batch.return_logprob
+        )
 
         # Forward multiple steps
         scores = None
@@ -918,6 +928,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 if self.hot_token_id is not None:
                     topk_index = self.hot_token_id[topk_index]
                 hidden_states = logits_output.hidden_states
+        forward_batch.native_dtype_logits = native_logits
 
         draft_probs = (
             torch.stack(draft_probs_list, dim=1) if needs_draft_probs else None

@@ -441,6 +441,9 @@ class LogitsMetadata:
     # TARGET_VERIFY: keep this batch's logits as vocabulary shards.
     verify_vocab_shards: bool = False
 
+    # DECODE: hand back BF16 / FP16 logits uncast (a top-1 draft step's argmax).
+    native_dtype_logits: bool = False
+
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
         # MLP-sync may turn an idle rank into a dummy EXTEND for DP prefill
@@ -481,6 +484,7 @@ class LogitsMetadata:
             forward_mode=forward_mode,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
             next_token_logits_buffer=forward_batch.next_token_logits_buffer,
+            native_dtype_logits=forward_batch.native_dtype_logits,
             extend_return_logprob=extend_return_logprob,
             extend_return_top_logprob=extend_return_top_logprob,
             extend_token_ids_logprob=extend_token_ids_logprob,
@@ -1579,6 +1583,14 @@ class LogitsProcessor(nn.Module):
         if logits.shape[-1] > self.vocab_size:
             logits = logits[:, : self.vocab_size]
         logits_width = logits.shape[-1]
+        if (
+            logits_metadata.native_dtype_logits
+            and softcap is None
+            and logits_metadata.forward_mode.is_decode()
+            and logits.dtype in (torch.float16, torch.bfloat16)
+        ):
+            # the cast to FP32 is exact, so the argmax is the same
+            return logits
         if softcap is not None:
             if logits_buffer is None or tuple(logits_buffer.shape) != tuple(
                 logits.shape
