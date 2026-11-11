@@ -147,7 +147,7 @@ def contract_geometry(s):
                 and s.variant in (0, 1)
             )
         if s.operation == Op.GDN_VERIFY_GLUE:
-            return s.rows in (8, 12, 16) and s.gate_scalar_type == 1
+            return 8 <= s.rows <= 32 and s.rows % 4 == 0 and s.gate_scalar_type == 1
         return (
             s.rows in (4, 8, 12)
             or (

@@ -296,6 +296,10 @@ class Envs:
     SGLANG_OPT_MOE_EXTEND_FUSED_FINALIZE = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # With SGLANG_GDN_FUSED_VERIFY_GLUE=1: the largest TP1 verify batch (requests) the
+    # one-launch GDN verify glue serves (A's name and default; the kernel's grid is one
+    # program per request and value head, so the batch only sets the grid).
+    SGLANG_GDN_FUSED_VERIFY_GLUE_MAX_BS = EnvInt(4)
     SGLANG_HC_MACRO = EnvBool(True)
     SGLANG_HC_MACRO_MIN_ROWS = EnvInt(2)
     SGLANG_QSA_Q4_SCORE = EnvBool(False)

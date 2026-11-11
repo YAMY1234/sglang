@@ -434,8 +434,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                         variant=variant,
                         gate_type=ScalarType.FP32,
                     )
-            if self._numeric_gdn_glue_layer_supported() and not _fp8_tuple_input(
-                self.out_proj, rows
+            if (
+                self._numeric_gdn_glue_layer_supported()
+                and not _fp8_tuple_input(self.out_proj, rows)
+                and rows
+                <= tokens_per_request * envs.SGLANG_GDN_FUSED_VERIFY_GLUE_MAX_BS.get()
             ):
                 admit(NumericOperation.GDN_VERIFY_GLUE, rows)
         self._numeric_gdn_signatures = frozenset(signatures)

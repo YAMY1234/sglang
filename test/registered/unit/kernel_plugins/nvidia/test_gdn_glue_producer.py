@@ -170,6 +170,20 @@ def test_startup_glue_independent_of_mk_and_front(model, monkeypatch):
     ]
 
 
+@pytest.mark.parametrize("max_bs,rows", [(4, (8, 12, 16)), (8, (8, 12, 16, 20, 24, 28, 32))])
+def test_startup_glue_rows_follow_the_max_batch(model, monkeypatch, max_bs, rows):
+    """SGLANG_GDN_FUSED_VERIFY_GLUE_MAX_BS (A's name, default 4) caps the declared
+    verify batch; the provider admits 2..8 requests."""
+    m, _, _, _, _ = model
+    m.attn_tp_size = 1
+    monkeypatch.setenv("SGLANG_Q38_MK_GDN", "0")
+    monkeypatch.setenv("SGLANG_GDN_FUSED_VERIFY_GLUE", "1")
+    monkeypatch.setenv("SGLANG_GDN_FUSED_VERIFY_GLUE_MAX_BS", str(max_bs))
+    sigs = m.numeric_signatures(tuple(range(4, 41, 4)), 4)
+    assert [s.rows for s in sigs] == list(rows)
+    assert {s.operation for s in sigs} == {NumericOperation.GDN_VERIFY_GLUE}
+
+
 @pytest.mark.parametrize("activation", ["silu", "sigmoid"])
 def test_model_glue_priority_skips_front_and_external_norm(
     model, route, monkeypatch, activation

@@ -15,6 +15,7 @@ from sglang.kernels.plugin_kernels.nvidia.numeric import (
     NumericOperation,
 )
 from sglang.srt.kernel_plugins.nvidia import numeric_binding
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
@@ -347,6 +348,7 @@ def model(monkeypatch):
             get_bool_env_var=lambda key, default: (
                 os.environ.get(key, default).lower() in ("true", "1")
             ),
+            envs=envs,
         ),
     )
     calls = []
