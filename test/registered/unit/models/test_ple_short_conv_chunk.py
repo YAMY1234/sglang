@@ -382,6 +382,74 @@ class TestPleFusedExtendConvCuda(_ShortConvHarness, unittest.TestCase):
                 self.assertTrue(torch.equal(_bits(state), _bits(state_ref)))
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+class TestPleFusedVerifyConvCuda(unittest.TestCase):
+    """SGLANG_OPT_PLE_FUSED_VERIFY_CONV: the one-launch verify conv writes the stock
+    prepare + F.conv1d + finish chain's output and intermediate windows bit for bit."""
+
+    def _run(self, enabled, inputs):
+        from sglang.kernels.ops.mamba.qwen4_short_conv import fused_qwen4_verify_conv
+
+        x, residual, weight, state, indices, valid, width, dilation, cache = inputs
+        cache = None if cache is None else cache.clone()
+        with (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+            envs.SGLANG_OPT_PLE_FUSED_VERIFY_CONV.override(enabled),
+        ):
+            out = fused_qwen4_verify_conv(
+                x, residual, weight, state, indices, valid, width, dilation, cache
+            )
+        torch.cuda.synchronize()
+        return out, cache
+
+    def test_one_kernel_is_the_stock_chain(self):
+        gen = torch.Generator().manual_seed(11)
+        for requests, channels, width, ksize, dilation, cache_dtype in (
+            (1, 640, 4, 4, 3, torch.bfloat16),
+            (48, 10240, 4, 4, 3, torch.float32),
+            (7, 300, 3, 3, 2, None),
+        ):
+            state_len = (ksize - 1) * dilation
+            rand = lambda *shape: torch.randn(*shape, generator=gen)
+            x = rand(requests * width, channels).bfloat16().cuda()
+            residual = rand(requests * width, channels).bfloat16().cuda()
+            weight = rand(channels, 1, ksize).bfloat16().cuda()
+            state = rand(requests + 3, channels, state_len).bfloat16().cuda()
+            indices = torch.randperm(requests + 3, generator=gen)[:requests].cuda()
+            valid = (torch.rand(requests * width, generator=gen) > 0.2).cuda()
+            cache = (
+                None
+                if cache_dtype is None
+                else torch.zeros(requests, width, channels, state_len)
+                .to(cache_dtype)
+                .cuda()
+            )
+            inputs = (
+                x,
+                residual,
+                weight,
+                state,
+                indices,
+                valid,
+                width,
+                dilation,
+                cache,
+            )
+            (stock, stock_cache), (fused, fused_cache) = (
+                self._run(False, inputs),
+                self._run(True, inputs),
+            )
+            self.assertTrue(
+                torch.equal(stock.view(torch.int16), fused.view(torch.int16))
+            )
+            if cache is not None:
+                self.assertTrue(
+                    torch.equal(
+                        stock_cache.view(torch.uint8), fused_cache.view(torch.uint8)
+                    )
+                )
+
+
 class TestPleFusedExtendConvDecision(unittest.TestCase):
     """conv_engages on CUDA-like host metadata: which passes leave the stock code."""
 

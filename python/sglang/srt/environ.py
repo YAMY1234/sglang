@@ -526,6 +526,11 @@ class Envs:
     SGLANG_OPT_PLE_PREFILL_FUSED_GATE = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # Qwen4 PLE target-verify short conv in one launch (state window, the native depthwise
+    # conv's arithmetic and the finish) instead of prepare + F.conv1d + finish (same bits).
+    SGLANG_OPT_PLE_FUSED_VERIFY_CONV = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     # Qwen4 PLE target verify: the per-row layout, state slots and N-gram windows of
     # _prepare_ple_batch's ~20 small torch ops written by one kernel (same tensors).
     SGLANG_OPT_PLE_VERIFY_PREPARE_BATCHED = EnvRuntimeBool(
