@@ -77,17 +77,22 @@ class GdnUcacheFlushOptions(msgspec.Struct, frozen=True, kw_only=True):
 
     # Read the packed post-conv q / k / v and the strided b / a views in place.
     strided_qkv: bool = False
+    # Programmatic dependent launch behind the conv.
+    pdl: bool = False
 
     def kernel_kwargs(self) -> dict:
         kw = {}
         if self.strided_qkv:
             kw["strided_inputs"] = True
+        if self.pdl:
+            kw["pdl"] = True
         return kw
 
 
 def gdn_ucache_flush_options(device: torch.device) -> GdnUcacheFlushOptions:
     opts = GdnUcacheFlushOptions(
         strided_qkv=envs.SGLANG_OPT_GDN_UCACHE_STRIDED_QKV.get(),
+        pdl=envs.SGLANG_OPT_GDN_UCACHE_PDL.get(),
     )
     if opts != GdnUcacheFlushOptions():
         # FlashInfer's SM100 kernel takes none of them.
@@ -661,6 +666,9 @@ class GdnUcacheVerifier:
                 request_rows=None if request_rows is None else request_rows[:batch],
             )
             self._refresh_gate_params()
+            # Last before the flush: under SGLANG_OPT_GDN_UCACHE_PDL its warps 0/1 read the row
+            # order and cursors before griddepcontrol.wait, so the kernel just before it may write
+            # only what they never read (padded output rows).
             self._zero_padded_rows(output)
         rows = self._rows
         assert rows is not None and rows.slots.shape[0] == batch

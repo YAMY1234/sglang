@@ -521,6 +521,8 @@ class Envs:
     # SM107 flush kernel launch options (same results): read the packed post-conv q / k / v
     # and the projection's b / a views in place,
     SGLANG_OPT_GDN_UCACHE_STRIDED_QKV = EnvRuntimeBool(False)
+    # launch it as a programmatic dependent of the conv before it,
+    SGLANG_OPT_GDN_UCACHE_PDL = EnvRuntimeBool(False)
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
