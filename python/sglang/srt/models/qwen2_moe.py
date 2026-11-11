@@ -63,6 +63,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.quantization import sm107_shared_expert_act
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
@@ -233,6 +234,11 @@ class Qwen2MoeMLP(nn.Module):
         self,
         x,
     ):
+        if sm107_shared_expert_act.is_enabled():
+            act = sm107_shared_expert_act.fused_act(self, x)
+            if act is not None:
+                x, _ = self.down_proj(act)
+                return x
         gate_up, _ = self.gate_up_proj(x)
         if can_run_silu_fp4_quant_fusion(self, gate_up):
             x, _ = self.down_proj(silu_and_mul_fp4_quant(self, gate_up))

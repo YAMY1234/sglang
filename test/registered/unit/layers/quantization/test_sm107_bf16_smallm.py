@@ -1,6 +1,7 @@
-"""SM107 bitwise small-M BF16 GEMM routes: tables, gating, fallback (CPU)."""
+"""SM107 bitwise small-M BF16 GEMM routes and the shared-expert fused act: tables, gating, fallback (CPU)."""
 
 import hashlib
+import struct
 import sys
 import tempfile
 import types
@@ -11,6 +12,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import sm107_bf16_smallm as routes
+from sglang.srt.layers.quantization import sm107_shared_expert_act as fused_act
 from sglang.srt.layers.quantization import unquant
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -339,6 +341,116 @@ class TestDispatch(CustomTestCase):
                 torch.nn.functional.linear(x, weight),
             )
         self.assertEqual(len(self.calls), 1)
+
+
+
+class TestSharedExpertFusedAct(CustomTestCase):
+    def tearDown(self):
+        fused_act._enabled = False
+        routes._fused_act = None
+
+    def test_epilogue_is_the_fast_math_sequence(self):
+        """Only div.approx reproduces act_and_mul's fast-math divide; div.full differs near gate -88."""
+        ptx = fused_act.SILU_MUL_PTX
+        self.assertIn("div.approx.ftz.f32", ptx)
+        self.assertNotIn("div.full", ptx)
+        self.assertNotIn("div.rn", ptx)
+        neg_log2e = struct.unpack(">f", bytes.fromhex("BFB8AA3B"))[0]
+        self.assertEqual(
+            neg_log2e, struct.unpack("f", struct.pack("f", -1.4426950408889634))[0]
+        )
+
+    def test_permuted_tile_holds_gate_then_up_of_the_same_columns(self):
+        weight = (
+            torch.arange(1280, dtype=torch.float32)[:, None]
+            .expand(1280, 4)
+            .contiguous()
+        )
+        rows = fused_act.permute_gate_up(weight)[:, 0].long().view(20, 64)
+        for t in range(20):
+            self.assertEqual(rows[t, :32].tolist(), list(range(32 * t, 32 * t + 32)))
+            self.assertEqual(
+                rows[t, 32:].tolist(), list(range(640 + 32 * t, 640 + 32 * t + 32))
+            )
+        with self.assertRaises(ValueError):
+            fused_act.permute_gate_up(torch.zeros(1288, 4))
+
+    def test_needs_the_routes(self):
+        with mock.patch.object(fused_act, "install") as install:
+            with envs.SGLANG_ENABLE_SM107_SHARED_EXPERT_FUSED_ACT.override(True):
+                routes._install_fused_act(False)
+                self.assertIsNone(routes._fused_act)
+                install.assert_not_called()
+                routes._install_fused_act(True)
+                self.assertIs(routes._fused_act, fused_act)
+            with envs.SGLANG_ENABLE_SM107_SHARED_EXPERT_FUSED_ACT.override(False):
+                routes._install_fused_act(True)
+                self.assertIsNone(routes._fused_act)
+        self.assertEqual(install.call_count, 1)
+
+    def test_falls_back_to_the_stock_pair(self):
+        """Off, past 16 rows, on another shape, without the route, or off CUDA: None, so the stock pair runs."""
+        mlp = types.SimpleNamespace(
+            gate_up_proj=types.SimpleNamespace(
+                weight=torch.zeros(1280, 2560, dtype=torch.bfloat16),
+                bias=None,
+                gather_output=False,
+                quant_method=object.__new__(unquant.UnquantizedLinearMethod),
+            ),
+            _enable_silu_fp4_quant_fusion=False,
+        )
+        x = torch.zeros(4, 2560, dtype=torch.bfloat16)
+        self.assertIsNone(fused_act.fused_act(mlp, x))
+        fused_act.install()
+        self.assertTrue(fused_act.is_enabled())
+        with mock.patch.object(fused_act, "run") as run:
+            self.assertIsNone(
+                fused_act.fused_act(mlp, torch.zeros(17, 2560, dtype=torch.bfloat16))
+            )
+            self.assertIsNone(fused_act.fused_act(mlp, x.view(2, 2, 2560)))
+            with mock.patch.object(unquant, "_sm107_smallm_on", False):
+                self.assertEqual(fused_act._ineligible(mlp, x, 4), "route")
+            with (
+                mock.patch.object(unquant, "_sm107_smallm_on", True),
+                mock.patch.object(routes, "_routes", routes.ROUTES),
+                mock.patch.object(routes, "_checked", True),
+                mock.patch.object(
+                    unquant,
+                    "get_bf16_gemm_backend",
+                    return_value=unquant.Bf16GemmBackend("cutedsl"),
+                ),
+            ):
+                self.assertEqual(fused_act._ineligible(mlp, x, 4), "dtype")
+                self.assertIsNone(fused_act.fused_act(mlp, x))
+            run.assert_not_called()
+
+    def test_shared_expert_mlp_takes_the_fused_act_or_the_stock_pair(self):
+        from sglang.srt.models.qwen2_moe import Qwen2MoeMLP
+
+        x = torch.zeros(4, 2560, dtype=torch.bfloat16)
+        act = torch.ones(4, 640, dtype=torch.bfloat16)
+        for fused in (act, None):
+            mlp = types.SimpleNamespace(
+                down_proj=mock.Mock(return_value=("down", None)),
+                gate_up_proj=mock.Mock(return_value=("gate_up", None)),
+                act_fn=mock.Mock(return_value="stock_act"),
+                _enable_silu_fp4_quant_fusion=False,
+            )
+            with (
+                mock.patch.object(fused_act, "is_enabled", return_value=True),
+                mock.patch.object(fused_act, "fused_act", return_value=fused),
+                mock.patch(
+                    "sglang.srt.models.qwen2_moe.can_run_silu_fp4_quant_fusion",
+                    return_value=False,
+                ),
+            ):
+                self.assertEqual(Qwen2MoeMLP.forward(mlp, x), "down")
+            if fused is None:
+                mlp.gate_up_proj.assert_called_once_with(x)
+                mlp.down_proj.assert_called_once_with("stock_act")
+            else:
+                mlp.gate_up_proj.assert_not_called()
+                mlp.down_proj.assert_called_once_with(act)
 
 
 if __name__ == "__main__":

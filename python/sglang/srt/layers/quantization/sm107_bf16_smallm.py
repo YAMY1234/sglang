@@ -94,6 +94,7 @@ _fi = None  # (FlashInfer split-K module, CUstream constructor)
 _compiled: dict = {}
 _logged: set = set()
 _checked = False  # set by precompile's check; routes serve only after it
+_fused_act = None  # sm107_shared_expert_act when SGLANG_ENABLE_SM107_SHARED_EXPERT_FUSED_ACT is on
 _nonbitwise: frozenset = frozenset()  # the NONBITWISE_ROUTES keys in _routes
 _precompiling = False
 
@@ -134,6 +135,30 @@ def _tgvc_ok(cta_m: int, cta_n: int, stages: int, use_2cta: bool) -> bool:
 
 def install(device_sm: int, splitk_enabled: bool, cutedsl_available: bool) -> bool:
     """Install the routes; returns whether they are on. Called once by unquant.initialize_bf16_gemm_config."""
+    routes_on = _install_routes(device_sm, splitk_enabled, cutedsl_available)
+    _install_fused_act(routes_on)
+    return routes_on
+
+
+def _install_fused_act(routes_on: bool) -> None:
+    global _fused_act
+    _fused_act = None
+    if not envs.SGLANG_ENABLE_SM107_SHARED_EXPERT_FUSED_ACT.get():
+        return
+    if not routes_on:
+        logger.warning(
+            "SGLANG_ENABLE_SM107_SHARED_EXPERT_FUSED_ACT needs the SM107 small-M routes on; the stock pair stays"
+        )
+        return
+    from sglang.srt.layers.quantization import sm107_shared_expert_act
+
+    sm107_shared_expert_act.install()
+    _fused_act = sm107_shared_expert_act
+
+
+def _install_routes(
+    device_sm: int, splitk_enabled: bool, cutedsl_available: bool
+) -> bool:
     global _routes, _fi, _checked, _nonbitwise
     _routes = None
     _checked = False
@@ -406,7 +431,7 @@ def precompile(
     off) on random operands, so a change on the stock side (cuBLAS's slicing) cannot go unnoticed; any mismatch turns
     the routes off. NONBITWISE_ROUTES keys are checked after, by relative L2, and a failure drops only that key.
     Returns whether the routes stay on."""
-    global _routes, _checked
+    global _routes, _fused_act, _checked
     if _routes is None:
         return False
     if device is None:
@@ -436,6 +461,10 @@ def precompile(
             return False
     if _nonbitwise:
         _check_nonbitwise(stock_gemm=stock_gemm, device=device)
+    if _fused_act is not None and not _fused_act.precompile(
+        stock_gemm=stock_gemm, device=device
+    ):
+        _fused_act = None
     return True
 
 
