@@ -313,6 +313,9 @@ class Envs:
     SGLANG_QSA_GROUPED4_VERIFY_PIPELINE_STAGES = EnvInt(0)
     # MTP draft extend (one four-row window per request) takes the same scorer.
     SGLANG_ENABLE_QSA_GROUPED4_DRAFT_EXTEND = EnvBool(False)
+    # MTP draft-extend seed capture of a QSA layer as one integer-only launch at any
+    # batch size (the source's switch; same seed rows and lengths as the torch path).
+    SGLANG_ENABLE_QSA_MTP_CAPTURE_BATCHED = EnvBool(False)
     # Request-relative QSA prefill: the source's ordered fast select; it requires
     # SGLANG_OPT_QSA_PREFILL_SCALE_FOLD, whose stored scores it reproduces.
     SGLANG_ENABLE_QSA_PREFILL_FAST_SELECT = EnvBool(False)

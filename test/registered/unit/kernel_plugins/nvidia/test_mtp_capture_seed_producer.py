@@ -325,3 +325,33 @@ if __name__ == "__main__":
     import pytest
 
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+@pytest.mark.parametrize("served", [True, False])
+def test_batched_capture_runs_before_the_torch_capture(monkeypatch, served):
+    from sglang.srt.layers.attention.qsa import mtp_capture
+
+    _, _, _, backend, state, fb, topk, md = setup()
+    md = NS(
+        get_seqlens_expanded=md.get_seqlens_expanded,
+        is_cuda_graph=True,
+        sequence_lengths=tensor([0, 0, 103]),
+        get_token_to_batch_idx=lambda: tensor([2, 2, 2, 2]),
+    )
+    calls = []
+
+    def batched(*args):
+        calls.append(args)
+        return served
+
+    monkeypatch.setattr(mtp_capture, "try_capture_metadata_batched", batched)
+    with envs.SGLANG_ENABLE_QSA_MTP_CAPTURE_BATCHED.override(True):
+        backend._capture_mtp_sparse_indices_from_extend_lens(topk, fb, md, 3)
+    (args,) = calls
+    assert args[0] is topk and args[3] == 0 and args[9] == state.trash_row
+    assert args[7].data_ptr() == state.indices[0].data_ptr()
+    # Served: the torch capture does not run; declined: it writes the seed as before.
+    assert torch.all(state.indices[0, 2, :2051] == -19) == served
+    with envs.SGLANG_ENABLE_QSA_MTP_CAPTURE_BATCHED.override(False):
+        backend._capture_mtp_sparse_indices_from_extend_lens(topk, fb, md, 3)
+    assert len(calls) == 1

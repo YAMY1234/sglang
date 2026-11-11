@@ -1298,6 +1298,10 @@ class QwenSparseAttnBackend(AttentionBackend):
 
         if capture_seed(self, topk_indices, forward_batch, metadata, layer_id):
             return
+        if self._capture_batched(
+            state, topk_indices, forward_batch, metadata, layer_id, bs
+        ):
+            return
         request_extend_lens = self._capture_extend_seq_lens(forward_batch)[:bs].long()
         block_ends = request_extend_lens.cumsum(0) - 1
         spec_info = forward_batch.spec_info
@@ -1325,6 +1329,44 @@ class QwenSparseAttnBackend(AttentionBackend):
             captured_lens,
             layer_id,
         )
+
+    def _capture_batched(
+        self, state, topk_indices, forward_batch, metadata, layer_id, bs
+    ):
+        """SGLANG_ENABLE_QSA_MTP_CAPTURE_BATCHED: the torch capture below as one launch
+        (qsa/mtp_capture.py); False when it is off or its contract does not hold."""
+        from sglang.srt.environ import envs
+
+        if not envs.SGLANG_ENABLE_QSA_MTP_CAPTURE_BATCHED.get():
+            return False
+        from sglang.srt.layers.attention.qsa.mtp_capture import (
+            try_capture_metadata_batched,
+        )
+
+        slot = state.layer_slots[int(layer_id)]
+        num_accept = getattr(forward_batch.spec_info, "num_accept_tokens", None)
+        has_accept = num_accept is not None and num_accept.numel() >= bs
+        if not try_capture_metadata_batched(
+            topk_indices,
+            self._capture_extend_seq_lens(forward_batch)[:bs],
+            num_accept[:bs] if has_accept else None,
+            int(forward_batch.spec_info.num_front_tokens) if has_accept else 0,
+            forward_batch.req_pool_indices[:bs],
+            metadata.sequence_lengths,
+            metadata.get_token_to_batch_idx(),
+            state.indices[slot],
+            state.captured_len[slot],
+            state.trash_row,
+        ):
+            return False
+        if not getattr(self, "_mtp_capture_batched_logged", False):
+            self._mtp_capture_batched_logged = True
+            logger.info(
+                "QSA MTP capture batched: one launch per layer "
+                "(SGLANG_ENABLE_QSA_MTP_CAPTURE_BATCHED; first bs=%d)",
+                bs,
+            )
+        return True
 
     def lookup_mtp_sparse_indices(self, forward_batch, layer_id: int) -> torch.Tensor:
         metadata = self.get_indexer_metadata(layer_id, forward_batch)
