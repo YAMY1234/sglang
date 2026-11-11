@@ -538,5 +538,209 @@ def test_qsa_cp_forward_metadata_joins_leftover_prefetch(monkeypatch):
     assert backend._cp_kv_pending is None
 
 
+
+def test_qsa_project_qk_uses_a_given_projection():
+    """Q38_QSA_PDL_INDEX: a projection made ahead of the indexer is not made again."""
+    hidden = torch.randn(4, 8)
+    projected = torch.randn(4, 8)
+    indexer = SimpleNamespace(
+        index_n_heads=1,
+        index_kv_heads=1,
+        index_head_dim=4,
+        index_qk_proj=Mock(side_effect=AssertionError("projected twice")),
+        q_layernorm=lambda value: value,
+        apply_rope=lambda positions, value, **kwargs: value,
+    )
+    q, token_k, stored = QSAIndexer.project_qk(
+        indexer, hidden, torch.arange(4), projected_qk=projected
+    )
+    assert not stored
+    torch.testing.assert_close(q.reshape(4, 4), projected[:, :4])
+    torch.testing.assert_close(token_k.reshape(4, 4), projected[:, 4:])
+
+
+def test_cuda_indexer_forwards_a_given_projection():
+    hidden, rope, batch, metadata, projected = (object() for _ in range(5))
+    indexer = SimpleNamespace(_forward_impl=Mock(return_value="topk"))
+    assert (
+        QSAIndexer.forward_cuda(
+            indexer, hidden, rope, batch, metadata, projected_qk=projected
+        )
+        == "topk"
+    )
+    indexer._forward_impl.assert_called_once_with(
+        hidden, rope, batch, metadata, None, projected
+    )
+
+
+def _pdl_index_layer(monkeypatch, rows=4, mode=ForwardMode.TARGET_VERIFY):
+    from sglang.srt.layers.quantization import unquant
+    from sglang.srt.models import qwen4_exp
+
+    monkeypatch.setenv("Q38_QSA_PDL_INDEX", "1")
+    monkeypatch.setattr(unquant, "_enable_bf16_splitk_gemm", True)
+    metadata = SimpleNamespace(
+        get_token_to_batch_idx=lambda: torch.zeros(rows, dtype=torch.int32)
+    )
+    sparse_backend = SimpleNamespace(get_indexer_metadata=Mock(return_value=metadata))
+    monkeypatch.setattr(qwen4_exp, "get_attn_backend", lambda: sparse_backend)
+    projection = Mock(side_effect=lambda value: (("projected", value), None))
+    projection.quant_method = unquant.UnquantizedLinearMethod()
+    projection.weight = torch.zeros(640, 2560, dtype=torch.bfloat16)
+    layer = SimpleNamespace(
+        layer_id=7,
+        attn_output_gate=True,
+        indexer=SimpleNamespace(
+            index_qk_proj=projection, _use_fused_prep=lambda tensor: True
+        ),
+    )
+    hidden = Mock(is_cuda=True, dtype=torch.bfloat16, shape=(max(rows, 4), 2560))
+    hidden.__getitem__ = Mock(side_effect=lambda key: ("rows", key))
+    return qwen4_exp, layer, SimpleNamespace(forward_mode=mode), hidden
+
+
+@pytest.mark.parametrize("rows", [1, 4, 8])
+@pytest.mark.parametrize(
+    "mode", [ForwardMode.TARGET_VERIFY, ForwardMode.DRAFT_EXTEND_V2]
+)
+def test_qsa_pdl_index_projects_tuned_small_rows(monkeypatch, rows, mode):
+    qwen4_exp, layer, batch, hidden = _pdl_index_layer(monkeypatch, rows, mode)
+    out = qwen4_exp.Qwen4ExpAttentionDecoderLayer._pdl_index_projection(
+        layer, hidden, batch
+    )
+    # Only the indexer's semantic rows are projected, once.
+    assert out == ("projected", ("rows", slice(None, rows)))
+    layer.indexer.index_qk_proj.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "env_off",
+        "no_gate",
+        "decode",
+        "extend",
+        "fp16",
+        "rows_16_untuned",
+        "rows_17",
+        "rows_0",
+        "splitk_off",
+        "shape",
+        "no_fused_prep",
+    ],
+)
+def test_qsa_pdl_index_keeps_the_side_stream_projection(monkeypatch, change):
+    rows = {"rows_16_untuned": 16, "rows_17": 17, "rows_0": 0}.get(change, 4)
+    mode = {"decode": ForwardMode.DECODE, "extend": ForwardMode.EXTEND}.get(
+        change, ForwardMode.TARGET_VERIFY
+    )
+    qwen4_exp, layer, batch, hidden = _pdl_index_layer(monkeypatch, rows, mode)
+    from sglang.srt.layers.quantization import unquant
+
+    if change == "env_off":
+        monkeypatch.delenv("Q38_QSA_PDL_INDEX")
+    elif change == "no_gate":
+        layer.attn_output_gate = False
+    elif change == "fp16":
+        hidden.dtype = torch.float16
+    elif change == "splitk_off":
+        monkeypatch.setattr(unquant, "_enable_bf16_splitk_gemm", False)
+    elif change == "shape":
+        layer.indexer.index_qk_proj.weight = torch.zeros(
+            1280, 2560, dtype=torch.bfloat16
+        )
+    elif change == "no_fused_prep":
+        layer.indexer._use_fused_prep = lambda tensor: False
+    assert (
+        qwen4_exp.Qwen4ExpAttentionDecoderLayer._pdl_index_projection(
+            layer, hidden, batch
+        )
+        is None
+    )
+    layer.indexer.index_qk_proj.assert_not_called()
+
+
+@pytest.mark.parametrize("pdl_index", [False, True])
+def test_qsa_pdl_index_forks_the_indexer_after_the_projection(monkeypatch, pdl_index):
+    from sglang.srt.layers.attention.qsa import capture_fork
+    from sglang.srt.models import qwen4_exp
+
+    decoder = qwen4_exp.Qwen4ExpAttentionDecoderLayer
+    events = []
+    main, side = Mock(name="main"), Mock(name="side")
+    main.wait_stream.side_effect = lambda stream: events.append("main_waits_side")
+    side.wait_stream.side_effect = lambda stream: events.append("side_waits_main")
+
+    class _On:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            events.append("enter_side")
+
+        def __exit__(self, *exc):
+            events.append("exit_side")
+
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: main)
+    monkeypatch.setattr(torch.cuda, "stream", _On)
+    monkeypatch.setattr(qwen4_exp, "get_is_capture_mode", lambda: True)
+    monkeypatch.setattr(qwen4_exp, "is_in_breakable_cuda_graph", lambda: False)
+    monkeypatch.setattr(qwen4_exp, "_shards_rows_over_cp", lambda _: False)
+    nodes = ("projection-node",)
+    monkeypatch.setattr(
+        capture_fork,
+        "projection_frontier",
+        lambda stream: events.append("frontier") or nodes,
+    )
+    monkeypatch.setattr(
+        capture_fork,
+        "fork_after_projection",
+        lambda stream, actual: events.append(("fork", stream, actual)),
+    )
+    hidden = torch.randn(4, 8)
+    positions = torch.arange(4)
+    q, k, v = (torch.randn(4, 8) for _ in range(3))
+    projected = Mock(name="projected_qk")
+    topk = Mock(name="topk")
+    batch = SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY)
+
+    def projection(actual_hidden, actual_batch):
+        events.append("projection")
+        return projected if pdl_index else None
+
+    def prepare(**kwargs):
+        events.append("qkv")
+        return q, k, v, None
+
+    def topk_indices(actual_hidden, actual_positions, actual_batch, *, projected_qk):
+        assert projected_qk is (projected if pdl_index else None)
+        events.append("indexer")
+        return topk
+
+    def attention(actual_q, actual_k, actual_v, actual_batch, **kwargs):
+        assert kwargs["topk_indices"] is topk
+        return q
+
+    layer = SimpleNamespace(
+        is_qsa=True,
+        alt_stream=side,
+        _pdl_index_projection=projection,
+        _prepare_qkv_gate=prepare,
+        _compute_qsa_topk_indices=topk_indices,
+        attn=attention,
+        o_proj=lambda value: (value, None),
+    )
+    decoder.self_attention(layer, positions, hidden, batch)
+    head = ["projection"] + (
+        ["frontier", "qkv", "side_waits_main", ("fork", side, nodes)]
+        if pdl_index
+        else ["side_waits_main", "qkv"]
+    )
+    assert events == head + ["enter_side", "indexer", "exit_side", "main_waits_side"]
+    if pdl_index:
+        projected.record_stream.assert_called_once_with(side)
+    topk.record_stream.assert_called_once_with(main)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
