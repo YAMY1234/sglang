@@ -6,8 +6,10 @@
 # The models we train have hidden dim up to 8k anyway (e.g. Llama 70B), so this is fine.
 
 
+import logging
 from contextlib import nullcontext
 from functools import lru_cache
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -18,6 +20,7 @@ from einops import rearrange
 from sglang.kernels.fused_op import BaseFusedOp
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -33,8 +36,17 @@ from sglang.srt.utils import (
 
 _is_npu = is_npu()
 
+logger = logging.getLogger(__name__)
+
 # Maximum rows per Triton block for layernorm gated kernel
 MAX_ROWS_PER_BLOCK = 4
+
+# SGLANG_OPT_GDN_PREFILL_NORM_RETILE: extend-sized single-group 128-wide inputs (the GDN
+# output norm) take 32 rows / 4 warps per program instead of 1 warp x <= 4 rows. Each row
+# keeps the stock 16-lane x 8-element reduction, so only the number of programs changes.
+_NORM_RETILE = envs.SGLANG_OPT_GDN_PREFILL_NORM_RETILE.get()
+NORM_RETILE_MIN_ROWS = 32768
+NORM_RETILE_CFG = (32, 4)  # (ROWS_PER_BLOCK, num_warps)
 
 _GATE_ACTIVATION_FNS = {
     "swish": F.silu,
@@ -267,6 +279,31 @@ def calc_rows_per_block(M: int, device: torch.device) -> int:
     return rows_per_block
 
 
+def _norm_retile_cfg(
+    M: int, block_n: int, ngroups: int, quant_heads: int
+) -> Optional[tuple]:
+    if (
+        _NORM_RETILE
+        and not quant_heads
+        and ngroups == 1
+        and block_n == 128
+        and M >= NORM_RETILE_MIN_ROWS
+        and not is_batch_invariant_mode_enabled()
+    ):
+        _log_norm_retile_once()
+        return NORM_RETILE_CFG
+    return None
+
+
+@lru_cache(maxsize=1)
+def _log_norm_retile_once() -> None:
+    logger.info(
+        "gated RMSNorm: launch %s for >= %d rows of 128 (SGLANG_OPT_GDN_PREFILL_NORM_RETILE)",
+        NORM_RETILE_CFG,
+        NORM_RETILE_MIN_ROWS,
+    )
+
+
 def _layer_norm_fwd(
     x,
     weight,
@@ -279,7 +316,9 @@ def _layer_norm_fwd(
     is_rms_norm=False,
     activation: str = "swish",
     quant_heads: int = 0,
+    launch_cfg: Optional[tuple] = None,
 ):
+    """launch_cfg: (rows per program, num_warps); None keeps the default launch."""
     M, N = x.shape
     if group_size is None:
         group_size = N
@@ -334,6 +373,10 @@ def _layer_norm_fwd(
         )
         s = torch.empty((M // quant_heads, 1), dtype=torch.float32, device=x.device)
         quant = {"Q": q, "S": s, "QUANT": True}
+    if launch_cfg is None:
+        launch_cfg = _norm_retile_cfg(M, BLOCK_N, ngroups, quant_heads)
+    if launch_cfg is not None:
+        rows_per_block, num_warps = launch_cfg
     # Update grid to use rows_per_block
     grid = (cdiv(M, rows_per_block), ngroups)
     pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}

@@ -9,6 +9,7 @@ from sglang.kernels.ops.attention.fla.l2norm import (
     gdn_prefill_qkv_prepare_fwd,
     l2norm_fwd,
 )
+from sglang.kernels.ops.attention.fla import layernorm_gated as norm_mod
 from sglang.kernels.ops.attention.fla.layernorm_gated import (
     RMSNorm,
     rms_norm_gated,
@@ -69,6 +70,19 @@ class TestGdnPrefillLaunchChoice(unittest.TestCase):
             self.assertEqual(l2norm_mod._l2norm_launch_cfg(16383, 128, None), (16, 8))
             self.assertEqual(l2norm_mod._l2norm_launch_cfg(16384, 256, None), (16, 8))
             self.assertEqual(l2norm_mod._l2norm_launch_cfg(16384, 128, None), (64, 8))
+
+    def test_norm_retile_takes_only_extend_sized_single_group_128_wide_inputs(self):
+        with mock.patch.object(norm_mod, "_NORM_RETILE", False):
+            self.assertIsNone(norm_mod._norm_retile_cfg(65536, 128, 1, 0))
+        with mock.patch.object(norm_mod, "_NORM_RETILE", True):
+            self.assertEqual(norm_mod._norm_retile_cfg(32768, 128, 1, 0), (32, 4))
+            for args in (
+                (32767, 128, 1, 0),
+                (32768, 256, 1, 0),
+                (32768, 128, 2, 0),
+                (32768, 128, 1, 4),
+            ):
+                self.assertIsNone(norm_mod._norm_retile_cfg(*args))
 
     def test_qk_one_launch_needs_k_right_after_q(self):
         buf = torch.zeros(3 * 4 * 2 * 8)
@@ -318,6 +332,30 @@ class TestGdnPrefillLayout(unittest.TestCase):
         torch.testing.assert_close(q_out, l2norm_fwd(q), rtol=0, atol=0)
         torch.testing.assert_close(k_out, l2norm_fwd(k), rtol=0, atol=0)
         self.assertEqual(v_out.data_ptr(), v.data_ptr())
+
+    def test_norm_retile_matches_stock_launch(self):
+        weight = torch.randn(self.HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+        for rows, norm_before_gate in ((33, True), (40000, True), (40000, False)):
+            with self.subTest(rows=rows, norm_before_gate=norm_before_gate):
+                x = torch.randn(
+                    rows, self.HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+                )
+                z = torch.randn_like(x)
+                outs = [
+                    norm_mod._layer_norm_fwd(
+                        x,
+                        weight,
+                        None,
+                        1e-6,
+                        z=z,
+                        norm_before_gate=norm_before_gate,
+                        is_rms_norm=True,
+                        launch_cfg=cfg,
+                    )
+                    for cfg in ((32, 4), (4, 1))
+                ]
+                torch.testing.assert_close(outs[0][0], outs[1][0], rtol=0, atol=0)
+                torch.testing.assert_close(outs[0][2], outs[1][2], rtol=0, atol=0)
 
 
 if __name__ == "__main__":
