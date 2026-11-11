@@ -2,6 +2,8 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+import functools
+import logging
 from typing import Optional
 
 import torch
@@ -10,8 +12,18 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.utils import input_guard
+from sglang.srt.environ import envs
+
+logger = logging.getLogger(__name__)
 
 BT_LIST = [8, 16, 32, 64, 128]
+
+# SGLANG_OPT_GDN_PREFILL_L2NORM_RETILE: 64 rows / 8 warps per program for extend-sized
+# 128-wide inputs instead of 16 rows. Every row keeps the stock 16-lane x 8-element
+# reduction, so only the number of programs changes.
+_L2NORM_RETILE = envs.SGLANG_OPT_GDN_PREFILL_L2NORM_RETILE.get()
+L2NORM_RETILE_MIN_ROWS = 16384
+L2NORM_RETILE_CFG = (64, 8)  # (BT, num_warps)
 
 
 # @triton.autotune(
@@ -73,9 +85,31 @@ def l2norm_fwd_kernel(
     tl.store(p_y, b_y.to(p_y.dtype.element_ty), mask=m_x)
 
 
+def _l2norm_launch_cfg(T: int, D: int, launch_cfg: Optional[tuple]) -> tuple:
+    if launch_cfg is not None:
+        return launch_cfg
+    if _L2NORM_RETILE and D == 128 and T >= L2NORM_RETILE_MIN_ROWS:
+        _log_l2norm_retile_once()
+        return L2NORM_RETILE_CFG
+    return 16, 8
+
+
+@functools.lru_cache(maxsize=1)
+def _log_l2norm_retile_once() -> None:
+    logger.info(
+        "l2norm: launch %s for >= %d rows of 128 (SGLANG_OPT_GDN_PREFILL_L2NORM_RETILE)",
+        L2NORM_RETILE_CFG,
+        L2NORM_RETILE_MIN_ROWS,
+    )
+
+
 def l2norm_fwd(
-    x: torch.Tensor, eps: float = 1e-6, output_dtype: Optional[torch.dtype] = None
+    x: torch.Tensor,
+    eps: float = 1e-6,
+    output_dtype: Optional[torch.dtype] = None,
+    launch_cfg: Optional[tuple] = None,
 ):
+    """launch_cfg: (BT, num_warps) for D <= 512; None picks it by row count."""
     x_shape_og = x.shape
     x = x.view(-1, x.shape[-1])
     # allocate output
@@ -93,6 +127,7 @@ def l2norm_fwd(
         raise RuntimeError("This layer doesn't support feature dim >= 64KB.")
 
     if D <= 512:
+        bt, num_warps = _l2norm_launch_cfg(T, D, launch_cfg)
 
         def grid(meta):
             return (triton.cdiv(T, meta["BT"]),)
@@ -104,8 +139,8 @@ def l2norm_fwd(
             T=T,
             D=D,
             BD=BD,
-            BT=16,
-            num_warps=8,
+            BT=bt,
+            num_warps=num_warps,
             num_stages=3,
         )
     else:

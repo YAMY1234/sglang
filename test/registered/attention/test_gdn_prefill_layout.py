@@ -4,6 +4,7 @@ from unittest import mock
 
 import torch
 
+from sglang.kernels.ops.attention.fla import l2norm as l2norm_mod
 from sglang.kernels.ops.attention.fla.l2norm import (
     gdn_prefill_qkv_prepare_fwd,
     l2norm_fwd,
@@ -59,6 +60,15 @@ class TestGdnPrefillLaunchChoice(unittest.TestCase):
         with mock.patch.object(gating_mod, "_GATING_2D", True):
             self.assertIsNone(gating_mod._gating_2d_cfg(511, None))
             self.assertEqual(gating_mod._gating_2d_cfg(512, None), (16, 2))
+
+    def test_l2norm_retile_takes_only_extend_sized_128_wide_inputs(self):
+        with mock.patch.object(l2norm_mod, "_L2NORM_RETILE", False):
+            self.assertEqual(l2norm_mod._l2norm_launch_cfg(65536, 128, None), (16, 8))
+            self.assertEqual(l2norm_mod._l2norm_launch_cfg(8, 128, (32, 4)), (32, 4))
+        with mock.patch.object(l2norm_mod, "_L2NORM_RETILE", True):
+            self.assertEqual(l2norm_mod._l2norm_launch_cfg(16383, 128, None), (16, 8))
+            self.assertEqual(l2norm_mod._l2norm_launch_cfg(16384, 256, None), (16, 8))
+            self.assertEqual(l2norm_mod._l2norm_launch_cfg(16384, 128, None), (64, 8))
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
@@ -268,6 +278,19 @@ class TestGdnPrefillLayout(unittest.TestCase):
                     )
                 torch.testing.assert_close(g_2d, g, rtol=0, atol=0)
                 torch.testing.assert_close(beta_2d, beta, rtol=0, atol=0)
+
+    def test_l2norm_retile_matches_stock_launch(self):
+        for rows in (33, 20000):
+            with self.subTest(rows=rows):
+                x = torch.randn(
+                    rows, self.HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+                )
+                torch.testing.assert_close(
+                    l2norm_fwd(x, launch_cfg=(64, 8)),
+                    l2norm_fwd(x, launch_cfg=(16, 8)),
+                    rtol=0,
+                    atol=0,
+                )
 
 
 if __name__ == "__main__":

@@ -566,6 +566,11 @@ class Envs:
     SGLANG_OPT_GDN_PREFILL_GATING_2D = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # l2norm of extend-sized 128-wide inputs (GDN prefill q / k): 64 rows / 8 warps per
+    # program instead of 16 rows (same values).
+    SGLANG_OPT_GDN_PREFILL_L2NORM_RETILE = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     # Triton causal conv1d forward tile "BLOCK_M,BLOCK_N,num_warps,num_stages" (A's
     # name); read only with the runtime master on. Same values for any tile.
     SGLANG_CAUSAL_CONV1D_FWD_CONFIG = EnvStr("")
