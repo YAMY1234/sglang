@@ -509,6 +509,11 @@ class Envs:
     SGLANG_OPT_SPEC_DRAFT_TOP1_NATIVE_LOGITS = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # Each scheduler runs gc.collect() and gc.freeze() right before its event loop, so a
+    # full collection while serving no longer walks the startup objects.
+    SGLANG_OPT_SCHEDULER_GC_FREEZE = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     # --enable-gdn-replayssm-ucache options below are opt-in children of the master: off
     # unless set, also with the master on (they need the SM107 kernel or change rounding).
     # Size the k / u / g rings and their cursors by request row (request-lifetime scratch,

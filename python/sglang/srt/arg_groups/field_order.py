@@ -571,5 +571,6 @@ POSITIONAL_FIELD_ORDER = (
     "paged_experts_host_memory_gb",
     "_max_running_requests_explicitly_set",
     "enable_gdn_replayssm_ucache",
+    "freeze_gc_after_startup",
 )
 # fmt: on
