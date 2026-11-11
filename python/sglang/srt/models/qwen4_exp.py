@@ -113,6 +113,9 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
 # bound and serializing them on one stream is faster than contending.
 _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD = 1024
+# SGLANG_OPT_QSA_PREFILL_TOPK_BRIDGE_DIRECT: see qsa_indexer.prefill_topk_output.
+_QSA_TOPK_BRIDGE_DIRECT = envs.SGLANG_OPT_QSA_PREFILL_TOPK_BRIDGE_DIRECT.get()
+_QSA_TOPK_BRIDGE_LOGGED = [False]
 
 
 def _ple_table_is_fp8(
@@ -139,6 +142,36 @@ def _breakable_qsa_indexer(layer, hidden_states, positions, output):
     allocates a new bridge when ``output`` is None."""
     # Read the live batch on every replay of this eager break.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
+    if output is not None and _QSA_TOPK_BRIDGE_DIRECT:
+        from sglang.srt.layers.attention.qsa.qsa_indexer import prefill_topk_output
+
+        # The selection writes the bridge's rows itself; rows past it end zero,
+        # as the stock fill_(0) + copy_ leaves them.
+        with prefill_topk_output(output):
+            topk = layer._compute_qsa_topk_indices_eager(
+                hidden_states=hidden_states,
+                positions=positions,
+                forward_batch=forward_batch,
+            )
+        if (
+            topk.data_ptr() == output.data_ptr()
+            and topk.shape[1] == output.shape[1]
+            and topk.shape[0] <= output.shape[0]
+        ):
+            if not _QSA_TOPK_BRIDGE_LOGGED[0]:
+                _QSA_TOPK_BRIDGE_LOGGED[0] = True
+                logger.info(
+                    "QSA prefill top-k written into the graph bridge "
+                    "(SGLANG_OPT_QSA_PREFILL_TOPK_BRIDGE_DIRECT; rows=%d of %d, width=%d)",
+                    topk.shape[0],
+                    output.shape[0],
+                    output.shape[1],
+                )
+            output[topk.shape[0] :].fill_(0)
+            return
+        output.fill_(0)
+        output[: topk.shape[0]].copy_(topk)
+        return
     topk = layer._compute_qsa_topk_indices_eager(
         hidden_states=hidden_states,
         positions=positions,

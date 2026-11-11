@@ -234,6 +234,48 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
         self.assertEqual(len(layer._qsa_prefill_topk_bridges), 1)
         self.assertEqual(captured.tolist(), [[5, 5]] * 2 + [[0, 0]] * 4)
 
+    def test_qsa_bridge_direct_hands_its_rows_to_the_prefill_selection(self):
+        from sglang.srt.layers.attention.qsa import qsa_indexer
+        from sglang.srt.models import qwen4_exp
+
+        batch = SimpleNamespace(rows=3)
+        context = SimpleNamespace(forward_batch=batch)
+        selections = []
+
+        def select(hidden_states, forward_batch, **kw):
+            # select_prefill_tokens' output: the offered bridge rows when they fit.
+            rows = forward_batch.rows
+            out = qsa_indexer._take_prefill_topk_output(rows, 2, hidden_states.device)
+            if out is None:
+                out = torch.empty((rows, 2), dtype=torch.int32)
+            selections.append(out.data_ptr())
+            out.copy_(hidden_states[:rows])
+            return out
+
+        layer = SimpleNamespace(_compute_qsa_topk_indices_eager=select)
+        bridge = torch.full((5, 2), 9, dtype=torch.int32)
+        x = torch.arange(10, dtype=torch.int32).reshape(5, 2)
+        with patch.object(
+            qwen4_exp, "get_tc_piecewise_forward_context", return_value=context
+        ):
+            for direct in (False, True):
+                bridge.fill_(9)
+                with patch.object(qwen4_exp, "_QSA_TOPK_BRIDGE_DIRECT", direct):
+                    qwen4_exp._breakable_qsa_indexer(layer, x, None, bridge)
+                self.assertEqual(bridge.tolist(), x[:3].tolist() + [[0, 0]] * 2)
+        # Off: a new tensor, then the bridge fill and copy; on: the selection wrote the bridge.
+        self.assertNotEqual(selections[0], bridge.data_ptr())
+        self.assertEqual(selections[1], bridge.data_ptr())
+        self.assertIsNone(qsa_indexer._PREFILL_TOPK_OUT[0])
+        # One shot, and a buffer of another width is not taken.
+        with qsa_indexer.prefill_topk_output(bridge):
+            self.assertIsNone(
+                qsa_indexer._take_prefill_topk_output(3, 3, bridge.device)
+            )
+            self.assertIsNone(
+                qsa_indexer._take_prefill_topk_output(3, 2, bridge.device)
+            )
+
     def test_ple_replay_uses_live_request_layout(self):
         from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
         from sglang.srt.model_executor.forward_context import (

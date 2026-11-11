@@ -551,6 +551,11 @@ class Envs:
     SGLANG_QSA_PREFILL_PACK_ROWS_TOKENS = EnvInt(16)
     SGLANG_QSA_PREFILL_PACK_ROWS_WARPS = EnvInt(4)
     SGLANG_QSA_PREFILL_PACK_ROWS_CHECK_CALLS = EnvInt(0)
+    # The breakable prefill graph's QSA top-k bridge rows are handed to the prefill
+    # selection as its output, so the bridge fill and copy are skipped (same values).
+    SGLANG_OPT_QSA_PREFILL_TOPK_BRIDGE_DIRECT = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     # --enable-gdn-replayssm-ucache options below are opt-in children of the master: off
     # unless set, also with the master on (they need the SM107 kernel or change rounding).
     # Size the k / u / g rings and their cursors by request row (request-lifetime scratch,

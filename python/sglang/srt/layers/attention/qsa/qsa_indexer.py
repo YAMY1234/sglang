@@ -50,6 +50,50 @@ def _qsa_prefill_row_chunk_size(rows: int, keys: int, heads: int) -> int:
     return min(rows, max_padded_rows)
 
 
+# SGLANG_OPT_QSA_PREFILL_TOPK_BRIDGE_DIRECT: the breakable prefill graph's top-k bridge
+# (models/qwen4_exp.py _breakable_qsa_indexer) lends its rows to the next prefill selection,
+# which writes them in place of a new tensor, so the bridge's full fill and its
+# [rows, token_topk + ratio - 1] int32 D2D copy are skipped. One shot: the bridge is taken by
+# the first select_prefill_tokens call inside prefill_topk_output() or by none.
+_PREFILL_TOPK_OUT: list = [None]
+
+
+class prefill_topk_output:
+    """Offer ``buffer`` (int32 [>= rows, token_topk + compress_ratio - 1], unit last stride) to the
+    next select_prefill_tokens call; withdrawn on exit whether taken or not."""
+
+    __slots__ = ("_buffer",)
+
+    def __init__(self, buffer: torch.Tensor):
+        self._buffer = buffer
+
+    def __enter__(self):
+        _PREFILL_TOPK_OUT[0] = self._buffer
+        return self
+
+    def __exit__(self, *exc):
+        _PREFILL_TOPK_OUT[0] = None
+        return False
+
+
+def _take_prefill_topk_output(rows: int, width: int, device) -> Optional[torch.Tensor]:
+    buffer = _PREFILL_TOPK_OUT[0]
+    if buffer is None:
+        return None
+    _PREFILL_TOPK_OUT[0] = None
+    if (
+        buffer.dtype != torch.int32
+        or buffer.dim() != 2
+        or buffer.shape[0] < rows
+        or buffer.shape[1] != width
+        or buffer.stride(1) != 1
+        or buffer.device != device
+    ):
+        return None
+    view = buffer[:rows]
+    return view if view.is_contiguous() else None
+
+
 class QSAIndexer(MultiPlatformOp):
     """Config-driven fused-QK, weight-free sparse-attention indexer."""
 
@@ -450,11 +494,19 @@ class QSAIndexer(MultiPlatformOp):
         top-k reads only each row's own section and returns indices relative to
         the row's start either way."""
         rows = q.shape[0]
-        output = torch.empty(
-            (rows, self.token_topk + self.compress_ratio - 1),
-            dtype=torch.int32,
-            device=q.device,
+        output = (
+            _take_prefill_topk_output(
+                rows, self.token_topk + self.compress_ratio - 1, q.device
+            )
+            if _PREFILL_TOPK_OUT[0] is not None
+            else None
         )
+        if output is None:
+            output = torch.empty(
+                (rows, self.token_topk + self.compress_ratio - 1),
+                dtype=torch.int32,
+                device=q.device,
+            )
         if rows == 0:
             return output
 
