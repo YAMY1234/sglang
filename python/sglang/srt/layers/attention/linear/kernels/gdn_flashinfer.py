@@ -16,6 +16,11 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.kernels.ops.mamba.gdn_prefill_state_glue import (
+    gdn_gather_state_rows,
+    gdn_scatter_state_rows,
+    gdn_state_rows_supported,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
@@ -159,6 +164,11 @@ def _host_track_lists(forward_batch: ForwardBatch) -> Optional[tuple]:
     if any(v is None or len(v) != forward_batch.batch_size for v in lists):
         return None
     return lists
+
+
+# SGLANG_OPT_GDN_PREFILL_FUSED_STATE_COPY: the prefill's pool-row gather and write-back
+# run as one copy launch each (same bytes, same padding rule as state_pool_io).
+_FUSED_STATE_COPY = envs.SGLANG_OPT_GDN_PREFILL_FUSED_STATE_COPY.get()
 
 
 def _install_gdn_prefill_tmem_dealloc_fix() -> None:
@@ -599,9 +609,15 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         alpha_fi = torch.exp(g[0].to(torch.float32))
         beta_fi = beta[0].to(torch.float32)
 
-        ssm_cache_indices, live_rows, initial_state_fi = gather_pool_states(
+        fused_rows = _FUSED_STATE_COPY and gdn_state_rows_supported(
             ssm_states, cache_indices
         )
+        if fused_rows:
+            initial_state_fi = gdn_gather_state_rows(ssm_states, cache_indices)
+        else:
+            ssm_cache_indices, live_rows, initial_state_fi = gather_pool_states(
+                ssm_states, cache_indices
+            )
         if not self.use_state_pool or self._prefill_needs_fp32_state:
             initial_state_fi = initial_state_fi.to(torch.float32)
         cu_seqlens = query_start_loc.to(torch.int64)
@@ -634,7 +650,12 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         )
 
         # Write back state to pool
-        scatter_pool_states(ssm_states, ssm_cache_indices, live_rows, output_state_fi)
+        if fused_rows:
+            gdn_scatter_state_rows(ssm_states, cache_indices, output_state_fi)
+        else:
+            scatter_pool_states(
+                ssm_states, ssm_cache_indices, live_rows, output_state_fi
+            )
 
         # Output: [seq, HV, V] -> [1, seq, HV, V]
         core_attn_out = output_fi.view(1, total_seq_len, num_v_heads, head_v_dim)

@@ -15,6 +15,7 @@ from sglang.kernels.ops.attention.fla.layernorm_gated import (
     rms_norm_gated,
 )
 from sglang.kernels.ops.attention.linear import fused_gdn_gating as gating_mod
+from sglang.kernels.ops.mamba import gdn_prefill_state_glue as glue
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_qkv_split_gdn_prefill,
     qwen3_5_gdn_prefill_projection_views,
@@ -83,6 +84,16 @@ class TestGdnPrefillLaunchChoice(unittest.TestCase):
                 (32768, 128, 1, 4),
             ):
                 self.assertIsNone(norm_mod._norm_retile_cfg(*args))
+
+    def test_fused_state_copy_needs_dense_pool_rows_and_a_slot_vector(self):
+        pool = torch.zeros(6, 4, 8, 8)
+        slots = torch.tensor([3, 0, 5], dtype=torch.int32)
+        self.assertTrue(glue.gdn_state_rows_supported(pool, slots))
+        self.assertFalse(glue.gdn_state_rows_supported(pool[:, :, :4], slots))
+        self.assertFalse(glue.gdn_state_rows_supported(pool, slots.view(3, 1)))
+        self.assertFalse(
+            glue.gdn_state_rows_supported(pool, torch.arange(6, dtype=torch.int32)[::2])
+        )
 
     def test_qk_one_launch_needs_k_right_after_q(self):
         buf = torch.zeros(3 * 4 * 2 * 8)
@@ -356,6 +367,27 @@ class TestGdnPrefillLayout(unittest.TestCase):
                 ]
                 torch.testing.assert_close(outs[0][0], outs[1][0], rtol=0, atol=0)
                 torch.testing.assert_close(outs[0][2], outs[1][2], rtol=0, atol=0)
+
+    def test_fused_state_copy_matches_the_stock_gather_and_write_back(self):
+        from sglang.srt.layers.attention.linear.kernels.state_pool_io import (
+            gather_pool_states,
+            scatter_pool_states,
+        )
+
+        pool = torch.randn(9, 4, 128, 128, dtype=torch.float16, device="cuda")
+        slots = torch.tensor([3, 0, 7, -1, 5], dtype=torch.int32, device="cuda")
+        safe, live, expected = gather_pool_states(pool, slots)
+        actual = glue.gdn_gather_state_rows(pool, slots)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        for dtype in (torch.float16, torch.float32):
+            with self.subTest(dtype=dtype):
+                updates = torch.randn(
+                    5, 4, 128, 128, dtype=dtype, device="cuda"
+                ).contiguous()
+                stock, fused = pool.clone(), pool.clone()
+                scatter_pool_states(stock, safe, live, updates)
+                glue.gdn_scatter_state_rows(fused, slots, updates)
+                torch.testing.assert_close(fused, stock, rtol=0, atol=0)
 
 
 if __name__ == "__main__":
