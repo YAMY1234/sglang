@@ -20,6 +20,15 @@ def _hc_gate_stream(device: int) -> torch.cuda.Stream:
     return torch.cuda.Stream(device=device)
 
 
+def _hc_mix_wide_max_rows() -> int:
+    """Largest row count hc_mix_wide serves (SGLANG_HC_MIX_SPLITK_MAX_ROWS); 0 = off."""
+    if not envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
+        return 0
+    from sglang.kernels.ops.gemm.hc_mix_splitk import WIDE_MAX_ROWS
+
+    return min(envs.SGLANG_HC_MIX_SPLITK_MAX_ROWS.get(), WIDE_MAX_ROWS)
+
+
 class HyperConnectionConfig(msgspec.Struct, frozen=True):
     hc_count: int = 4
     hidden_size: int = 64
@@ -312,6 +321,15 @@ class GatedResidual(HyperConnectionBase):
                 and lowrank % 8 == 0
             )
             self._mix_up_weight_padded = None
+            # hc_mix_wide's up GEMM tiles: 32 hidden columns, 64 low-rank columns.
+            self._mix_wide_max_rows = (
+                _hc_mix_wide_max_rows()
+                if self._jit_mix_ok
+                and self.hc_count == 4
+                and self.hidden_size % 32 == 0
+                and lowrank % 64 == 0
+                else 0
+            )
             # Resolved on the first mix(), once the weights are final.
             self._mix_flydsl_ok = None
             self._mix_flydsl_weights = None
@@ -451,6 +469,30 @@ class GatedResidual(HyperConnectionBase):
                 self.hc_count,
                 self.hidden_size,
                 numeric_variant=self._numeric_mix_variant(),
+            ).to(self.params_dtype)
+        elif (
+            32 < hyper_input_normed.shape[0] <= self._mix_wide_max_rows
+            and hyper_input_normed.is_cuda
+            and hyper_input_normed.dtype in (torch.bfloat16, torch.float16)
+            and hyper_input_normed.is_contiguous()
+            and self._numeric_mix_variant()
+            and not torch.compiler.is_compiling()
+        ):
+            from sglang.kernels.ops.gemm.hc_mix_splitk import (
+                hc_mix_wide,
+                permute_pad_up_weight,
+            )
+
+            if self._mix_up_weight_padded is None:
+                self._mix_up_weight_padded = permute_pad_up_weight(
+                    self.input_mix_weight_up.weight, self.hc_count
+                )
+            mixed_input = hc_mix_wide(
+                hyper_input_normed,
+                self.input_mix_weight_down.weight.data,
+                self._mix_up_weight_padded,
+                self.hc_count,
+                self.hidden_size,
             ).to(self.params_dtype)
         elif flydsl_hc_mix_supported(hyper_input_normed, self._flydsl_mix_ok()):
             from aiter.ops.flydsl.hc_mix import hc_mix, pack_hc_weights

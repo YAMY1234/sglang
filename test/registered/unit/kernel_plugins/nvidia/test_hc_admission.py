@@ -224,6 +224,59 @@ class TestActualHcAdmission(unittest.TestCase):
                 if calls:
                     self.assertEqual(calls, [int(tp == 1 and macro)])
 
+    def test_wide_mix_cap_follows_the_master_and_the_kernel_limit(self):
+        for master, cap, expected in (
+            (False, 512, 0),
+            (True, 0, 0),
+            (True, 320, 320),
+            (True, 4096, 512),
+        ):
+            with (
+                self.subTest(master=master, cap=cap),
+                envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(master),
+                envs.SGLANG_HC_MIX_SPLITK_MAX_ROWS.override(cap),
+            ):
+                self.assertEqual(hc._hc_mix_wide_max_rows(), expected)
+
+    def test_wide_mix_serves_tp1_rows_above_32_up_to_the_cap(self):
+        from sglang.kernels.ops.gemm import hc_mix_splitk
+
+        for tp, macro, cap, rows, expected in (
+            (1, True, 320, 33, True),
+            (1, True, 320, 320, True),
+            (1, True, 320, 321, False),
+            (1, True, 320, 32, False),
+            (1, False, 320, 64, False),
+            (4, True, 320, 64, False),
+            (1, True, 0, 64, False),
+        ):
+            with self.subTest(tp=tp, macro=macro, cap=cap, rows=rows):
+                layer = self.layer(hc, tp=tp)
+                layer._jit_mix_ok = True
+                layer._mix_wide_max_rows = cap
+                calls = []
+
+                def wide(normed, down, up, hc_count, hs):
+                    calls.append((normed.shape[0], tuple(up.shape), hc_count, hs))
+                    return layer._mix_compute(
+                        normed, down, layer.input_mix_weight_up.weight, hc_count, hs
+                    )
+
+                def narrow(normed, down, up, hc_count, hs, *, numeric_variant):
+                    return layer._mix_compute(
+                        normed, down, layer.input_mix_weight_up.weight, hc_count, hs
+                    )
+
+                with (
+                    patch.object(hc_mix_splitk, "hc_mix_wide", side_effect=wide),
+                    patch.object(hc_mix_splitk, "hc_mix", side_effect=narrow),
+                ):
+                    # The provider's HC_MIX serves at most 32 rows; none is offered here.
+                    self.execute_mix(hc, layer, rows=rows, offer=False, macro=macro)
+                self.assertEqual(bool(calls), expected)
+                if calls:
+                    self.assertEqual(calls, [(rows, (10240, 128), 4, 2560)])
+
     def test_current_stream_partials_do_not_wait_none_and_side_stream_still_joins(self):
         from types import SimpleNamespace
 

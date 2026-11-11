@@ -302,6 +302,11 @@ class Envs:
     SGLANG_GDN_FUSED_VERIFY_GLUE_MAX_BS = EnvInt(4)
     SGLANG_HC_MACRO = EnvBool(True)
     SGLANG_HC_MACRO_MIN_ROWS = EnvInt(2)
+    # TP1 HC mix (hc 4, with SGLANG_HC_MACRO) of 33..N rows, N <= 512: the CuTe split-K silu
+    # down GEMM and a Triton up GEMM with the gated mean fused (hc_mix_splitk.hc_mix_wide)
+    # instead of the torch.compile chain's two GEMMs; not bitwise. Read only with the
+    # runtime master; 0 keeps the chain.
+    SGLANG_HC_MIX_SPLITK_MAX_ROWS = EnvInt(0)
     SGLANG_QSA_Q4_SCORE = EnvBool(False)
     SGLANG_QSA_SCORER_V2 = EnvBool(True)
     SGLANG_QSA_SCORER_V2_ROWS = EnvBool(False)
