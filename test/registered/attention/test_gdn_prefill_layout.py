@@ -95,6 +95,38 @@ class TestGdnPrefillLaunchChoice(unittest.TestCase):
             glue.gdn_state_rows_supported(pool, torch.arange(6, dtype=torch.int32)[::2])
         )
 
+    def test_fused_track_declines_layouts_and_row_sets_it_does_not_cover(self):
+        from sglang.srt.layers.attention.linear import gdn_backend
+
+        pool = torch.zeros(6, 64, 3, dtype=torch.bfloat16)
+        rows = dict(token_rows=torch.zeros(2, 3, dtype=torch.int64))
+        dst = torch.tensor([4, 5])
+        x = torch.zeros(9, 64, dtype=torch.float16)
+        self.assertFalse(
+            glue.gdn_track_conv_snapshot(conv_pool=pool, x=x, dst_slots=dst, **rows)
+        )
+        x = torch.zeros(64, 9, dtype=torch.bfloat16).T
+        self.assertFalse(
+            glue.gdn_track_conv_snapshot(conv_pool=pool, x=x, dst_slots=dst, **rows)
+        )
+        ssm = torch.zeros(6, 2, 4, 4, dtype=torch.float16)
+        idx = torch.tensor([1])
+        empty = torch.zeros(0, dtype=torch.int64)
+        for h in (None, torch.zeros(3, 2, 4, 4, dtype=torch.float32)):
+            self.assertFalse(
+                glue.gdn_track_state_rows(
+                    pool=ssm, h=h, h_src=idx, h_dst=idx, f_src=empty, f_dst=empty
+                )
+            )
+        meta = SimpleNamespace(
+            track_ssm_h_src=idx,
+            track_ssm_h_dst=idx,
+            track_ssm_final_src=empty,
+            track_ssm_final_dst=empty,
+            track_ssm_recompute_dst=torch.tensor([2]),
+        )
+        self.assertFalse(gdn_backend._fused_track_states(meta, None, ssm))
+
     def test_qk_one_launch_needs_k_right_after_q(self):
         buf = torch.zeros(3 * 4 * 2 * 8)
         q = buf[:64].view(4, 2, 8)
@@ -388,6 +420,34 @@ class TestGdnPrefillLayout(unittest.TestCase):
                 scatter_pool_states(stock, safe, live, updates)
                 glue.gdn_scatter_state_rows(fused, slots, updates)
                 torch.testing.assert_close(fused, stock, rtol=0, atol=0)
+
+    def test_fused_track_matches_the_stock_track_copies(self):
+        conv_pool = torch.randn(8, 1280, 3, dtype=torch.bfloat16, device="cuda")
+        x = torch.randn(40, 1280 + 64, dtype=torch.bfloat16, device="cuda")[:, :1280]
+        tok = torch.tensor([[3, 4, 5], [20, 21, 22]], device="cuda")
+        dst = torch.tensor([6, 7], device="cuda")
+        stock, fused = conv_pool.clone(), conv_pool.clone()
+        stock[dst] = x[tok].transpose(1, 2)
+        self.assertTrue(
+            glue.gdn_track_conv_snapshot(
+                conv_pool=fused, x=x, token_rows=tok, dst_slots=dst
+            )
+        )
+        torch.testing.assert_close(fused, stock, rtol=0, atol=0)
+
+        pool = torch.randn(9, 4, 128, 128, dtype=torch.float16, device="cuda")
+        h = torch.randn(5, 4, 128, 128, dtype=torch.float16, device="cuda")
+        h_src, h_dst = (torch.tensor(v, device="cuda") for v in ([4, 1], [7, 8]))
+        f_src, f_dst = (torch.tensor(v, device="cuda") for v in ([2], [6]))
+        stock, fused = pool.clone(), pool.clone()
+        stock[h_dst] = h[h_src]
+        stock[f_dst] = stock[f_src]
+        self.assertTrue(
+            glue.gdn_track_state_rows(
+                pool=fused, h=h, h_src=h_src, h_dst=h_dst, f_src=f_src, f_dst=f_dst
+            )
+        )
+        torch.testing.assert_close(fused, stock, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

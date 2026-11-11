@@ -19,6 +19,10 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
+from sglang.kernels.ops.mamba.gdn_prefill_state_glue import (
+    gdn_track_conv_snapshot,
+    gdn_track_state_rows,
+)
 from sglang.kernels.ops.mamba.gdn_prefill_track import (
     gdn_track_conv_window,
     gdn_track_ssm_state,
@@ -93,6 +97,46 @@ _fused_decode_proj_conv_layers_logged: set[int] = set()
 _fused_decode_real_tensor_verified_layers: set[int] = set()
 # The prefill conv writes contiguous q / k / v planes (same values).
 _SPLIT_CONV = is_cuda() and envs.SGLANG_OPT_GDN_PREFILL_SPLIT_CONV.get()
+# The eager prefill's track copies (conv window, checkpoint and final states) run as one
+# launch per family (same bytes).
+_FUSED_TRACK = is_cuda() and envs.SGLANG_OPT_GDN_PREFILL_FUSED_TRACK.get()
+
+
+def _fused_track_conv(meta, mixed_qkv: torch.Tensor, conv_states: torch.Tensor) -> bool:
+    return gdn_track_conv_snapshot(
+        conv_pool=conv_states,
+        x=mixed_qkv,
+        token_rows=meta.track_conv_indices,
+        dst_slots=meta.conv_states_mask_indices,
+    )
+
+
+def _fused_track_states(
+    meta, h: Optional[torch.Tensor], ssm_states: torch.Tensor
+) -> bool:
+    """The track copies of _track_mamba_state_extend in one launch; False (nothing
+    written) when a row set it does not cover is present."""
+    if (
+        meta.track_ssm_h_src is None
+        or meta.track_ssm_h_dst is None
+        or meta.track_ssm_final_src is None
+        or meta.track_ssm_final_dst is None
+        or (
+            meta.track_ssm_recompute_dst is not None
+            and meta.track_ssm_recompute_dst.numel() > 0
+        )
+    ):
+        return False
+    return gdn_track_state_rows(
+        pool=ssm_states,
+        h=h.squeeze(0) if h is not None else None,
+        h_src=meta.track_ssm_h_src,
+        h_dst=meta.track_ssm_h_dst,
+        f_src=meta.track_ssm_final_src,
+        f_dst=meta.track_ssm_final_dst,
+    )
+
+
 _fused_decode_log_layer_hits = envs.SGLANG_GDN_DECODE_FUSION_LOG_LAYER_HITS.get()
 _fused_decode_verify_real_tensors = (
     envs.SGLANG_GDN_DECODE_FUSION_VERIFY_REAL_TENSORS.get()
@@ -1764,7 +1808,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
-            if forward_metadata.has_mamba_track_mask:
+            if forward_metadata.has_mamba_track_mask and not (
+                _FUSED_TRACK
+                and _fused_track_conv(forward_metadata, mixed_qkv, conv_states)
+            ):
                 mixed_qkv_to_track = mixed_qkv[
                     forward_metadata.track_conv_indices
                 ].transpose(1, 2)
@@ -1971,7 +2018,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     staged_pool_rows,
                 )
 
-            if forward_metadata.has_mamba_track_mask:
+            if forward_metadata.has_mamba_track_mask and not (
+                _FUSED_TRACK
+                and h_track_buf is None
+                and _fused_track_states(forward_metadata, h, ssm_states)
+            ):
                 self._track_mamba_state_extend(
                     forward_batch,
                     h,

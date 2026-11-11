@@ -599,6 +599,11 @@ class Envs:
     SGLANG_OPT_GDN_PREFILL_FUSED_STATE_COPY = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # GDN eager prefill: the prefix-cache track copies (conv window before the conv,
+    # checkpoint and final states after it) as one launch per family (same bytes).
+    SGLANG_OPT_GDN_PREFILL_FUSED_TRACK = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     # Triton causal conv1d forward tile "BLOCK_M,BLOCK_N,num_warps,num_stages" (A's
     # name); read only with the runtime master on. Same values for any tile.
     SGLANG_CAUSAL_CONV1D_FWD_CONFIG = EnvStr("")
