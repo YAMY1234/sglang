@@ -520,6 +520,12 @@ class Envs:
     SGLANG_OPT_PLE_FUSED_EXTEND_CONV = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # Qwen4 PLE gate outside decode: after torch's BF16 reduction, the scale, signed sqrt,
+    # sigmoid and broadcast multiply run as one kernel (bitwise; a startup self-test over
+    # every BF16 gate input keeps the eager chain on any mismatch).
+    SGLANG_OPT_PLE_PREFILL_FUSED_GATE = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     # --enable-gdn-replayssm-ucache options below are opt-in children of the master: off
     # unless set, also with the master on (they need the SM107 kernel or change rounding).
     # Size the k / u / g rings and their cursors by request row (request-lifetime scratch,

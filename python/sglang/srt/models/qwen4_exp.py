@@ -1507,10 +1507,29 @@ class Qwen4ExpPLELayer(nn.Module):
             and batch.mode.is_target_verify()
             and can_fuse_qwen4_gate_reduce(key_normed, query_normed, value)
         )
+        fused_gate_post = False
         if fused_gate_reduce:
             gated_value = fused_qwen4_gate_reduce(key_normed, query_normed, value)
         else:
             gate = (key_normed * query_normed).sum(dim=-1, keepdim=True)
+            if (
+                not batch.use_decode_fast_path
+                and envs.SGLANG_OPT_PLE_PREFILL_FUSED_GATE.get()
+            ):
+                from sglang.kernels.ops.elementwise.qwen4_gate import (
+                    can_fuse_qwen4_gate_post,
+                    fused_qwen4_gate_post,
+                    is_qwen4_gate_post_ready,
+                )
+
+                # The reduction above stays torch's; the rest of the chain is one
+                # kernel, bitwise to it (self-tested over every BF16 gate input).
+                fused_gate_post = can_fuse_qwen4_gate_post(
+                    gate, value
+                ) and is_qwen4_gate_post_ready(gate.device)
+        if fused_gate_post:
+            gated_value = fused_qwen4_gate_post(gate, value)
+        elif not fused_gate_reduce:
             gate = gate / math.sqrt(hidden_size)
             fused_gate_value = False
             if batch.use_decode_fast_path:

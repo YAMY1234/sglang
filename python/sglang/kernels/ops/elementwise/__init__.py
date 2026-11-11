@@ -49,6 +49,14 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="elementwise.fused_qwen4_gate_post",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.elementwise.qwen4_gate:fused_qwen4_gate_post",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
         op="elementwise.row_scale_bf16",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.elementwise.row_scale:row_scale_bf16",
