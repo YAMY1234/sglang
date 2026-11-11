@@ -538,6 +538,11 @@ class Envs:
     SGLANG_OPT_HICACHE_MAMBA_SLOT_STATE_ASYNC = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # With SGLANG_OPT_QSA_UNION_PREFILL: the union kernel writes the prefill graph's eager
+    # attention output buffer in place, so that break's D2D copy is skipped (same values).
+    SGLANG_OPT_QSA_UNION_PREFILL_OUT_ALIAS = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     # --enable-gdn-replayssm-ucache options below are opt-in children of the master: off
     # unless set, also with the master on (they need the SM107 kernel or change rounding).
     # Size the k / u / g rings and their cursors by request row (request-lifetime scratch,
@@ -576,6 +581,15 @@ class Envs:
     # parent_session_id and a Rust TreeCore built with the cache-residency bindings,
     # so it is opt-in).
     SGLANG_OPT_HICACHE_SUBAGENT_HOST_EVICT_FIRST = EnvRuntimeBool(False)
+    # QSA prefill attention over row-group token unions on tcgen05 (qsa/union_prefill.py):
+    # the stock result up to rounding, not bitwise, so opt-in. The knobs below keep A's names.
+    SGLANG_OPT_QSA_UNION_PREFILL = EnvRuntimeBool(False)
+    SGLANG_QSA_UNION_PREFILL_ROWS = EnvInt(0)
+    SGLANG_QSA_UNION_PREFILL_STAGES_K = EnvInt(2)
+    SGLANG_QSA_UNION_PREFILL_STAGES_V = EnvInt(2)
+    SGLANG_QSA_UNION_PREFILL_MIN_ROWS = EnvInt(1024)
+    SGLANG_QSA_UNION_PREFILL_CHECK_CALLS = EnvInt(0)
+    SGLANG_QSA_UNION_PREFILL_RESCALE_LOG2 = EnvFloat(0.0)
 
     # ===================================================================
     # Model configuration, discovery, and weight loading

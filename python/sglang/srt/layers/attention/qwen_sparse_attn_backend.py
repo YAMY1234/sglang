@@ -60,6 +60,7 @@ logger = logging.getLogger(__name__)
 
 
 _TRTLLM_SPARSE_PAGE_SIZE = 64
+_QSA_UNION_OUT_ALIAS_LOGGED = [False]
 
 
 def _last_rows_of_runs(*, extend_lens, pool_ids, num_rows: int) -> list:
@@ -297,6 +298,10 @@ class QwenSparseAttnBackend(AttentionBackend):
         from sglang.srt.environ import envs
 
         self._prefill_host_path = envs.SGLANG_OPT_QSA_PREFILL_HOST_PATH.get()
+        self._union_prefill = envs.SGLANG_OPT_QSA_UNION_PREFILL.get()
+        self._union_prefill_out_alias = (
+            self._union_prefill and envs.SGLANG_OPT_QSA_UNION_PREFILL_OUT_ALIAS.get()
+        )
         # (metadata, host extend lens, host pool ids) of the last extend metadata.
         self._mtp_anchor_host_src = None
         self._trtllm_workspace = None
@@ -1634,7 +1639,27 @@ class QwenSparseAttnBackend(AttentionBackend):
             forward_batch.extend_seq_lens.to(q.device, dtype=torch.int32).cumsum(0),
             (1, 0),
         ).contiguous()
+        union_out = (
+            self._union_prefill_out(q, forward_batch, num_output_rows)
+            if self._union_prefill_out_alias
+            else None
+        )
         if not any(prefix_lens):
+            if self._union_prefill:
+                output = self._qsa_union_cold_prefill(
+                    q=q.contiguous(),
+                    out=union_out,
+                    k=k[:num_valid_rows].contiguous(),
+                    v=v[:num_valid_rows].contiguous(),
+                    layer=layer,
+                    forward_batch=forward_batch,
+                    topk_indices=topk_indices,
+                    cu_seqlens_q=cu_seqlens_q,
+                    extend_lens=extend_lens,
+                    sequence_lens=sequence_lens,
+                )
+                if output is not None:
+                    return self._pad_extend_output(output, num_output_rows)
             output = sparse_gqa_fwd_interface_triton(
                 q.contiguous(),
                 k[:num_valid_rows].contiguous(),
@@ -1662,6 +1687,22 @@ class QwenSparseAttnBackend(AttentionBackend):
                 sequence_lens, dtype=torch.int32, device=q.device
             )
         cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
+        if self._union_prefill:
+            output = self._qsa_union_chunk_prefill(
+                q=q.contiguous(),
+                out=union_out,
+                layer=layer,
+                forward_batch=forward_batch,
+                topk_indices=topk_indices,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                extend_lens=extend_lens,
+                sequence_lens=sequence_lens,
+                sequence_lens_tensor=sequence_lens_tensor,
+                max_q=max_q,
+            )
+            if output is not None:
+                return self._pad_extend_output(output, num_output_rows)
         packed_k, packed_v = pack_qsa_prefill_kv(
             k=pool.layer_router.read(layer.layer_id).key(),
             v=pool.layer_router.read(layer.layer_id).value(),
@@ -1820,6 +1861,162 @@ class QwenSparseAttnBackend(AttentionBackend):
             # release there (unmap, cudaFreeAsync) after this stream's reads.
             get_stream("qsa_cp_kv").wait_stream(torch.cuda.current_stream())
         return self._pad_extend_output(output, num_output_rows)
+
+    def _qsa_union_chunk_prefill(
+        self,
+        *,
+        q,
+        layer,
+        forward_batch,
+        topk_indices,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        extend_lens,
+        sequence_lens,
+        sequence_lens_tensor,
+        max_q,
+        out=None,
+    ):
+        """SGLANG_OPT_QSA_UNION_PREFILL: the stock pack, then row-group union attention on
+        tcgen05 (qsa/union_prefill.py; not bitwise). None keeps the code below."""
+        from sglang.srt.layers.attention.qsa import union_prefill as qsa_union_prefill
+
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        layer_kv = self.token_to_kv_pool.layer_router.read(layer.layer_id)
+        kv_max = max(sequence_lens, default=1)
+        total_k = sum(sequence_lens)
+        if not qsa_union_prefill.applies(
+            q,
+            topk_indices,
+            kv_heads=layer_kv.key().shape[1],
+            kv_dtype=q.dtype,
+            extend_lens=extend_lens,
+            kv_max=kv_max,
+            total_k=total_k,
+        ):
+            return None
+        packed_k, packed_v = pack_qsa_prefill_kv(
+            k=layer_kv.key(),
+            v=layer_kv.value(),
+            req_to_token=self.req_to_token_pool.req_to_token,
+            req_indices=forward_batch.req_pool_indices,
+            cu_k=cu_seqlens_k,
+            total_k=total_k,
+            max_k=kv_max,
+            output_dtype=q.dtype,
+        )
+        kernel_args = (
+            q,
+            packed_k,
+            packed_v,
+            topk_indices,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            sequence_lens_tensor,
+            layer.scaling,
+        )
+        if not qsa_union_prefill.kv_ok(packed_k, packed_v):
+            return sparse_gqa_fwd_interface_triton_ck(*kernel_args, max_q=max_q)
+        qsa_union_prefill.log_once(q, packed_k, topk_indices)
+        return qsa_union_prefill.checked(
+            lambda: qsa_union_prefill.union_prefill(
+                *kernel_args, extend_lens=extend_lens, kv_max=kv_max, out=out
+            ),
+            lambda: sparse_gqa_fwd_interface_triton_ck(*kernel_args, max_q=max_q),
+            q.shape[0],
+            kv_max,
+            "replaced",
+        )
+
+    def _qsa_union_cold_prefill(
+        self,
+        *,
+        q,
+        k,
+        v,
+        layer,
+        forward_batch,
+        topk_indices,
+        cu_seqlens_q,
+        extend_lens,
+        sequence_lens,
+        out=None,
+    ):
+        """SGLANG_OPT_QSA_UNION_PREFILL on a pass without cached prefixes: the chunk's own K/V
+        are the context. None keeps the stock kernel."""
+        from sglang.srt.layers.attention.qsa import union_prefill as qsa_union_prefill
+
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        kv_max = max(extend_lens, default=1)
+        if not qsa_union_prefill.applies(
+            q,
+            topk_indices,
+            kv_heads=k.shape[1],
+            kv_dtype=k.dtype,
+            extend_lens=extend_lens,
+            kv_max=kv_max,
+            total_k=k.shape[0],
+        ):
+            return None
+        if k.ndim != 3 or v.dtype != k.dtype or not qsa_union_prefill.kv_ok(k, v):
+            return None
+        qsa_union_prefill.log_once(q, k, topk_indices)
+        kv_lens = forward_batch.extend_seq_lens.to(q.device, dtype=torch.int32)
+        return qsa_union_prefill.checked(
+            lambda: qsa_union_prefill.union_prefill(
+                q,
+                k,
+                v,
+                topk_indices,
+                cu_seqlens_q,
+                cu_seqlens_q,
+                kv_lens,
+                layer.scaling,
+                extend_lens=extend_lens,
+                kv_max=kv_max,
+                out=out,
+            ),
+            lambda: sparse_gqa_fwd_interface_triton(
+                q,
+                k,
+                v,
+                max(sequence_lens, default=1),
+                topk_indices,
+                cu_seqlens_q,
+                layer.scaling,
+            ),
+            q.shape[0],
+            kv_max,
+            "stock",
+        )
+
+    @staticmethod
+    def _union_prefill_out(q, forward_batch, num_output_rows):
+        """SGLANG_OPT_QSA_UNION_PREFILL_OUT_ALIAS: forward_batch._attn_output as the union
+        kernel's [rows, heads, 256] output, when it is exactly q's rows (no DP padding)
+        in q's dtype and contiguous; else None (a new tensor, then the stock copy)."""
+        out = forward_batch._attn_output
+        if (
+            out is None
+            or q.shape[0] != num_output_rows
+            or out.shape[0] != q.shape[0]
+            or out.numel() != q.numel()
+            or out.dtype != q.dtype
+            or out.device != q.device
+            or not out.is_contiguous()
+        ):
+            return None
+        if not _QSA_UNION_OUT_ALIAS_LOGGED[0]:
+            _QSA_UNION_OUT_ALIAS_LOGGED[0] = True
+            logger.info(
+                "QSA union prefill writes the attention output buffer in place "
+                "(SGLANG_OPT_QSA_UNION_PREFILL_OUT_ALIAS; rows=%d heads=%d)",
+                q.shape[0],
+                q.shape[1],
+            )
+        return out.view(q.shape)
 
     @staticmethod
     def _pad_extend_output(output: torch.Tensor, num_rows: int) -> torch.Tensor:

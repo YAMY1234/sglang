@@ -2364,5 +2364,209 @@ def test_qsa_large_fp8_prefill_float_reference(head_dim, heads):
         torch.testing.assert_close(actual[row].double(), expected, rtol=2e-2, atol=2e-2)
 
 
+@pytest.mark.parametrize(
+    ("master", "child", "alias", "expected"),
+    [
+        (False, True, None, (False, False)),
+        (True, None, None, (False, False)),
+        (True, True, None, (True, True)),
+        (True, True, False, (True, False)),
+    ],
+)
+def test_qsa_union_prefill_is_an_opt_in_child_of_the_master(
+    master, child, alias, expected
+):
+    from contextlib import ExitStack
+
+    from sglang.srt.environ import envs
+
+    with ExitStack() as stack:
+        stack.enter_context(
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(master)
+        )
+        if child is not None:
+            stack.enter_context(envs.SGLANG_OPT_QSA_UNION_PREFILL.override(child))
+        if alias is not None:
+            stack.enter_context(
+                envs.SGLANG_OPT_QSA_UNION_PREFILL_OUT_ALIAS.override(alias)
+            )
+        backend = QwenSparseAttnBackend()
+    assert (backend._union_prefill, backend._union_prefill_out_alias) == expected
+
+
+def test_qsa_union_prefill_plans_row_groups_and_union_capacity():
+    from sglang.srt.layers.attention.qsa import union_prefill
+
+    # 12 query heads per KV head: 10 rows x 12 heads fill the 128-row MMA.
+    assert union_prefill.rows_per_group(12, 1) == 10
+    assert union_prefill.group_count([25, 10, 1], 10) == 5
+    assert union_prefill.bitmap_words(64) == 3
+    # A group holds its rows' entries in whole 128-token tiles, bounded by the bitmap.
+    assert union_prefill.union_capacity(10, 2051, 100000) == 20608
+    assert union_prefill.union_capacity(10, 2051, 1000) == 1152
+
+
+def test_qsa_union_prefill_keeps_small_and_cpu_passes_on_the_stock_kernel():
+    from sglang.srt.layers.attention.qsa import union_prefill
+
+    def applies(rows):
+        q = torch.zeros(rows, 12, 256, dtype=torch.bfloat16)
+        indices = torch.zeros(rows, 8, dtype=torch.int32)
+        return union_prefill.applies(
+            q,
+            indices,
+            kv_heads=1,
+            kv_dtype=torch.bfloat16,
+            extend_lens=[rows],
+            kv_max=rows,
+            total_k=rows,
+        )
+
+    assert not applies(union_prefill.MIN_ROWS - 1)
+    assert not applies(union_prefill.MIN_ROWS)
+
+
+def test_qsa_union_prefill_out_alias_takes_only_an_exact_output_buffer():
+    q = torch.zeros(6, 12, 256, dtype=torch.bfloat16)
+    take = QwenSparseAttnBackend._union_prefill_out
+
+    batch = SimpleNamespace(_attn_output=None)
+    assert take(q, batch, 6) is None
+    batch._attn_output = torch.empty(6, 12 * 256, dtype=torch.bfloat16)
+    out = take(q, batch, 6)
+    assert out.shape == q.shape
+    assert out.data_ptr() == batch._attn_output.data_ptr()
+    # DP padding rows, another dtype or a strided buffer keep a new output tensor.
+    assert take(q, batch, 7) is None
+    batch._attn_output = torch.empty(6, 12 * 256, dtype=torch.float32)
+    assert take(q, batch, 6) is None
+    batch._attn_output = torch.empty(12 * 256, 6, dtype=torch.bfloat16).T
+    assert take(q, batch, 6) is None
+
+
+def test_qsa_union_prefill_runs_before_the_stock_cold_kernel(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    stock_rows = []
+
+    def fake_sparse_gqa(q, k, v, max_seqlen_k, indices, cu_seqlens, scale):
+        stock_rows.append(q.shape[0])
+        return q + 1
+
+    monkeypatch.setattr(
+        qsa_backend_module, "sparse_gqa_fwd_interface_triton", fake_sparse_gqa
+    )
+    backend = QwenSparseAttnBackend()
+    backend._union_prefill = True
+    backend._union_prefill_out_alias = False
+
+    class Pool:
+        def set_kv_buffer(self, layer, loc, k, v):
+            pass
+
+    pool = Pool()
+    backend.token_to_kv_pool = routed(pool)
+    layer = SimpleNamespace(tp_q_head_num=1, head_dim=2, layer_id=0, scaling=1.0)
+    topk = torch.zeros(4, 3, dtype=torch.int32, device="cuda")
+    values = torch.arange(8, dtype=torch.float32, device="cuda").reshape(4, 2)
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        token_to_kv_pool=routed(pool),
+        out_cache_loc=torch.arange(4, dtype=torch.int32, device="cuda"),
+        extend_seq_lens=torch.tensor([4], dtype=torch.int32, device="cuda"),
+        extend_seq_lens_cpu=[4],
+        seq_lens_cpu=[4],
+    )
+    union_calls = []
+
+    def union(served):
+        def run(**kwargs):
+            union_calls.append(kwargs["extend_lens"])
+            return kwargs["q"] + 2 if served else None
+
+        return run
+
+    def forward():
+        return backend.forward_extend(
+            values, values.clone(), values.clone(), layer, batch, topk_indices=topk
+        )
+
+    backend._qsa_union_cold_prefill = union(True)
+    torch.testing.assert_close(forward(), values + 2)
+    assert stock_rows == []
+    backend._qsa_union_cold_prefill = union(False)
+    torch.testing.assert_close(forward(), values + 1)
+    assert stock_rows == [4] and union_calls == [[4], [4]]
+
+
+def test_qsa_union_prefill_matches_the_stock_chunk_kernel():
+    from sglang.srt.layers.attention.qsa import union_prefill
+
+    if (
+        not torch.cuda.is_available()
+        or torch.cuda.get_device_capability()[0] != 10
+        or not union_prefill._GLUON
+    ):
+        pytest.skip("SM100-family GPU with Gluon required")
+    torch.manual_seed(23)
+    heads, head_dim, topk = 12, 256, 64
+    extend_lens, prefix = [37, 21], [64, 9]
+    kv_lens = [e + p for e, p in zip(extend_lens, prefix)]
+    rows = sum(extend_lens)
+    q = torch.randn(rows, heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(sum(kv_lens), 1, head_dim, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    blocks = []
+    for extend, before in zip(extend_lens, prefix):
+        visible = torch.arange(extend, device="cuda") + before + 1
+        picked = (
+            torch.arange(topk, device="cuda")[None, :]
+            + torch.arange(extend, device="cuda")[:, None] * 7
+        ) % visible[:, None]
+        # Rows that see fewer than topk tokens pad with -1.
+        picked = torch.where(
+            torch.arange(topk, device="cuda")[None, :] < visible[:, None], picked, -1
+        )
+        blocks.append(picked)
+    indices = torch.cat(blocks).to(torch.int32).contiguous()
+    cu_q = torch.tensor([0, *accumulate(extend_lens)], device="cuda", dtype=torch.int32)
+    cu_k = torch.tensor([0, *accumulate(kv_lens)], device="cuda", dtype=torch.int32)
+    lengths = torch.tensor(kv_lens, device="cuda", dtype=torch.int32)
+    scale = head_dim**-0.5
+    expected = sparse_gqa_fwd_interface_triton_ck(
+        q, k, v, indices, cu_q, cu_k, lengths, scale
+    )
+    actual = union_prefill.union_prefill(
+        q,
+        k,
+        v,
+        indices,
+        cu_q,
+        cu_k,
+        lengths,
+        scale,
+        extend_lens=extend_lens,
+        kv_max=max(kv_lens),
+    )
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    # The output alias: the same values written into the caller's buffer.
+    out = torch.empty_like(q)
+    union_prefill.union_prefill(
+        q,
+        k,
+        v,
+        indices,
+        cu_q,
+        cu_k,
+        lengths,
+        scale,
+        extend_lens=extend_lens,
+        kv_max=max(kv_lens),
+        out=out,
+    )
+    assert torch.equal(out, actual)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
