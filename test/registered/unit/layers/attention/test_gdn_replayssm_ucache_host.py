@@ -5,6 +5,7 @@ runs on the host: ring allocation, the option gates and the backend routing.
 """
 
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -101,6 +102,33 @@ class TestGdnUcacheHost(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, "SM107"):
                     ucache.gdn_ucache_key_ring_dtype("cuda")
 
+    def _flush_options(self, capability, **env):
+        with ExitStack() as stack:
+            stack.enter_context(
+                envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True)
+            )
+            for name, value in env.items():
+                stack.enter_context(
+                    getattr(envs, f"SGLANG_OPT_GDN_UCACHE_{name}").override(value)
+                )
+            stack.enter_context(
+                patch("torch.cuda.get_device_capability", return_value=capability)
+            )
+            return ucache.gdn_ucache_flush_options("cuda")
+
+    def test_flush_options_default_off(self):
+        # Without options the capability is not read: SM100 / SM103 take the FlashInfer kernel.
+        opts = self._flush_options((10, 0))
+        self.assertEqual(opts, ucache.GdnUcacheFlushOptions())
+        self.assertEqual(opts.kernel_kwargs(), {})
+
+    def test_strided_qkv_needs_the_sm107_kernel(self):
+        opts = self._flush_options((10, 7), STRIDED_QKV="1")
+        self.assertTrue(opts.strided_qkv)
+        self.assertEqual(opts.kernel_kwargs(), {"strided_inputs": True})
+        with self.assertRaisesRegex(ValueError, "SM107"):
+            self._flush_options((10, 0), STRIDED_QKV="1")
+
     def test_retraction_backup_is_refused_only_under_the_ucache(self):
         self.assertFalse(
             ucache.gdn_ucache_blocks_state_backup(SimpleNamespace(gdn_ucache=None))
@@ -115,11 +143,17 @@ class TestGdnUcacheHost(CustomTestCase):
         backend._use_strided_target_verify_qkv = True
         return backend
 
-    def test_target_verify_reads_contiguous_qkv(self):
-        backend = self._verify_backend()
+    def test_target_verify_qkv_routing(self):
+        """Contiguous q / k / v for the FlashInfer kernel; the packed conv-output
+        views under SGLANG_OPT_GDN_UCACHE_STRIDED_QKV."""
         batch = SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY)
-        backend._init_target_verify_qkv_routing(batch)
-        self.assertFalse(backend._use_strided_target_verify_qkv)
+        for strided in (False, True):
+            backend = self._verify_backend()
+            backend._gdn_ucache_verifier = SimpleNamespace(
+                options=ucache.GdnUcacheFlushOptions(strided_qkv=strided)
+            )
+            backend._init_target_verify_qkv_routing(batch)
+            self.assertIs(backend._use_strided_target_verify_qkv, strided)
 
     def test_plain_decode_is_refused(self):
         backend = self._verify_backend()

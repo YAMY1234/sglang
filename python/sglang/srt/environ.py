@@ -518,6 +518,9 @@ class Envs:
     # Keep the ring's normalized keys in fp16 (SM107 kernel only), the same k-hat the
     # verify's readout uses, instead of bf16.
     SGLANG_OPT_GDN_UCACHE_FP16_KEY_RING = EnvRuntimeBool(False)
+    # SM107 flush kernel launch options (same results): read the packed post-conv q / k / v
+    # and the projection's b / a views in place,
+    SGLANG_OPT_GDN_UCACHE_STRIDED_QKV = EnvRuntimeBool(False)
 
     # ===================================================================
     # Model configuration, discovery, and weight loading

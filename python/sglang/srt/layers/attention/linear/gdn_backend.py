@@ -950,8 +950,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
             return
 
         if self._gdn_ucache is not None:
-            # The FlashInfer verify reads q/k/v contiguous.
-            self._use_strided_target_verify_qkv = False
+            # The FlashInfer verify reads q/k/v contiguous; the SM107 flush under
+            # SGLANG_OPT_GDN_UCACHE_STRIDED_QKV reads the packed conv-output views in place.
+            self._use_strided_target_verify_qkv = (
+                self._gdn_ucache_verifier.options.strided_qkv
+            )
             return
         metadata = self.forward_metadata
         mamba_pool = self.state_pool

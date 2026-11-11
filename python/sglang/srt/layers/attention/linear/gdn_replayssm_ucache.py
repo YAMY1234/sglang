@@ -72,6 +72,34 @@ class GdnUcacheRows(msgspec.Struct, frozen=True, kw_only=True):
     ring_rows: Optional[torch.Tensor] = None
 
 
+class GdnUcacheFlushOptions(msgspec.Struct, frozen=True, kw_only=True):
+    """Launch options of the SM107 flush kernel; all off by default, none changes a result."""
+
+    # Read the packed post-conv q / k / v and the strided b / a views in place.
+    strided_qkv: bool = False
+
+    def kernel_kwargs(self) -> dict:
+        kw = {}
+        if self.strided_qkv:
+            kw["strided_inputs"] = True
+        return kw
+
+
+def gdn_ucache_flush_options(device: torch.device) -> GdnUcacheFlushOptions:
+    opts = GdnUcacheFlushOptions(
+        strided_qkv=envs.SGLANG_OPT_GDN_UCACHE_STRIDED_QKV.get(),
+    )
+    if opts != GdnUcacheFlushOptions():
+        # FlashInfer's SM100 kernel takes none of them.
+        capability = torch.cuda.get_device_capability(device)
+        if capability != (10, 7):
+            raise ValueError(
+                f"GDN u-cache flush options {opts} need the SM107 u-cache kernel, "
+                f"got SM{capability[0]}{capability[1]}"
+            )
+    return opts
+
+
 def gdn_ucache_flush_min(max_num_draft_tokens: int) -> int:
     # The laziest threshold that still fits T appended records in the window.
     return _MAX_WINDOW - max_num_draft_tokens + 1
@@ -532,7 +560,8 @@ class GdnUcacheVerifier:
 
     Per forward, the first GDN layer gathers the cursors, zeroes the padded rows of
     the shared output buffer and refreshes every layer's fp32 gate parameters; each
-    layer then costs one q/k/v split plus the FlashInfer launch."""
+    layer then costs one q/k/v split plus the FlashInfer launch (no split with
+    SGLANG_OPT_GDN_UCACHE_STRIDED_QKV, see GdnUcacheFlushOptions)."""
 
     def __init__(
         self,
@@ -547,6 +576,8 @@ class GdnUcacheVerifier:
         from sglang.srt.runtime_context import get_exec
 
         self._flush_kernel = _load_flush_kernel(device)
+        self._options = gdn_ucache_flush_options(device)
+        self._kernel_kwargs = self._options.kernel_kwargs()
         self._by_request_row = by_request_row
         if by_request_row:
             # Only the vendored SM107 kernel takes ring_indices; FlashInfer's SM100 one does not.
@@ -566,11 +597,12 @@ class GdnUcacheVerifier:
             _engaged_logged = True
             logger.info(
                 "GDN u-cache verify engaged: %s.%s, first GDN layer %d, "
-                "radix extend-time checkpoints %s",
+                "radix extend-time checkpoints %s, flush options %s",
                 self._flush_kernel.__module__,
                 self._flush_kernel.__name__,
                 first_layer_id,
                 get_exec().mamba.enable_mamba_extra_buffer,
+                self._options,
             )
         self._device = device
         self._first_layer_id = first_layer_id
@@ -580,12 +612,17 @@ class GdnUcacheVerifier:
         self._gate_refresh: list[tuple[torch.Tensor, torch.Tensor]] = []
         self._gate_refresh_tables: Optional[tuple[torch.Tensor, torch.Tensor]] = None
         self._rows: Optional[GdnUcacheRows] = None
+        self._strided_logged = False
         # Shared by all layers: a layer's output is consumed (gated norm and
         # out_proj) before the next GDN layer's verify overwrites it.
         self._output: Optional[torch.Tensor] = None
         self._qkv: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
         # Outgrown shared buffers stay alive: captured graphs hold their pointers.
         self._retired_buffers: list = []
+
+    @property
+    def options(self) -> GdnUcacheFlushOptions:
+        return self._options
 
     def target_verify(
         self,
@@ -628,12 +665,19 @@ class GdnUcacheVerifier:
         rows = self._rows
         assert rows is not None and rows.slots.shape[0] == batch
         A_log_fp32, dt_bias_fp32 = self._fp32_gate_params(layer_id, A_log, dt_bias)
-        q, k, v = self._contiguous_qkv(query, key, value)
+        if self._options.strided_qkv:
+            # The kernel reads the views in place (or copies them itself if it cannot).
+            q, k, v = query, key, value
+        else:
+            q, k, v = self._contiguous_qkv(query, key, value)
         q = q.reshape(*token_shape, num_k_heads, head_k_dim)
         k = k.reshape(*token_shape, num_k_heads, head_k_dim)
         v = v.reshape(*token_shape, num_v_heads, head_v_dim)
         a = a.reshape(*token_shape, num_v_heads)
         b = b.reshape(*token_shape, num_v_heads)
+        if self._options.strided_qkv and not self._strided_logged:
+            self._strided_logged = True
+            _log_strided_inputs(q=q, k=k, v=v, a=a, b=b)
         self._flush_kernel(
             A_log=A_log_fp32,
             a=a,
@@ -653,6 +697,7 @@ class GdnUcacheVerifier:
             cache_base=rows.cache_base,
             flush_min=buffers.flush_min,
             restart_hist_on_flush=False,
+            **self._kernel_kwargs,
             **({"ring_indices": rows.ring_rows} if self._by_request_row else {}),
         )
         return output.reshape(value.shape)
@@ -693,9 +738,22 @@ class GdnUcacheVerifier:
         def zeros(*shape, dtype=torch.bfloat16):
             return torch.zeros(shape, dtype=dtype, device=device)
 
-        q = k = zeros(*tokens, num_k_heads, head_k_dim)
-        v = zeros(*tokens, num_v_heads, head_v_dim)
-        a = b = zeros(*tokens, num_v_heads)
+        if self._options.strided_qkv:
+            # The served layout (the strides are compiled in): q / k / v of packed
+            # [q | k | v] token rows, b / a of [b | a] rows.
+            qk_cols, v_cols = num_k_heads * head_k_dim, num_v_heads * head_v_dim
+            packed = zeros(*tokens, 2 * qk_cols + v_cols)
+            q = packed[..., :qk_cols].unflatten(-1, (num_k_heads, head_k_dim))
+            k = packed[..., qk_cols : 2 * qk_cols].unflatten(
+                -1, (num_k_heads, head_k_dim)
+            )
+            v = packed[..., 2 * qk_cols :].unflatten(-1, (num_v_heads, head_v_dim))
+            gates = zeros(*tokens, 2 * num_v_heads)
+            b, a = gates[..., :num_v_heads], gates[..., num_v_heads:]
+        else:
+            q = k = zeros(*tokens, num_k_heads, head_k_dim)
+            v = zeros(*tokens, num_v_heads, head_v_dim)
+            a = b = zeros(*tokens, num_v_heads)
         gate_param = zeros(num_v_heads, dtype=torch.float32)
         cursor = zeros(max_batch_size, dtype=torch.int32)
         padded = torch.full((max_batch_size,), -1, dtype=torch.int32, device=device)
@@ -718,6 +776,7 @@ class GdnUcacheVerifier:
                 cache_base=cursor[:batch],
                 flush_min=flush_min,
                 restart_hist_on_flush=False,
+                **self._kernel_kwargs,
                 **({"ring_indices": ring_rows[:batch]} if self._by_request_row else {}),
             )
 
@@ -847,6 +906,26 @@ class GdnUcacheVerifier:
         src_ptrs, dst_ptrs = self._gate_refresh_tables
         _refresh_gate_params_kernel[(len(self._gate_refresh),)](
             src_ptrs, dst_ptrs, numel, BLOCK=triton.next_power_of_2(numel)
+        )
+
+
+def _log_strided_inputs(*, q, k, v, a, b) -> None:
+    from sglang.kernels.ops.attention.linear.gdn_ucache_rubin.gdn_replay_mtp_umma_rubin import (
+        strided_inputs_layout,
+    )
+
+    strides = dict(q=q.stride(), v=v.stride(), a=a.stride())
+    if strided_inputs_layout(q, k, v, a, b) is None:
+        logger.warning(
+            "SGLANG_OPT_GDN_UCACHE_STRIDED_QKV: the flush kernel copies q / k / v / a / b "
+            "(views it cannot address in place: strides %s)",
+            strides,
+        )
+    else:
+        logger.info(
+            "SGLANG_OPT_GDN_UCACHE_STRIDED_QKV: the flush kernel reads q / k / v / a / b "
+            "in place (strides %s)",
+            strides,
         )
 
 
