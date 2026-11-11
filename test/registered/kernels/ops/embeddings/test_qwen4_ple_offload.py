@@ -148,6 +148,40 @@ def test_qwen4_ple_pinned_gather_shard_boundaries_and_out_buffer():
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(DEVICE != "cuda", reason="the multi-row gather is CUDA-only")
+@pytest.mark.parametrize(
+    "rows_per_program,programs", [(2, 0), (32, 0), (32, 3), (128, 1)]
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_qwen4_ple_multi_row_gather_is_the_stock_gather(
+    rows_per_program, programs, dtype
+):
+    from sglang.srt.environ import envs
+
+    embedding_dim = 80
+    source = _make_source_embedding(
+        dtype=dtype,
+        embedding_dim=embedding_dim,
+        vocab_start=64,
+        vocab_end=1088,
+        org_vocab_size=2048,
+        tp_size=2,
+    )
+    offloaded = Qwen4ExpPinnedHostEmbedding(source)
+    rows = torch.randn(1024, embedding_dim, device=DEVICE).to(dtype)
+    _load_rows(offloaded, rows)
+    ids = torch.randint(-5, 1200, (3, 1037), device=DEVICE)
+    outputs = []
+    for value in (0, rows_per_program):
+        with (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+            envs.SGLANG_PLE_GATHER_ROWS.override(value),
+            envs.SGLANG_PLE_GATHER_PROGRAMS.override(programs),
+        ):
+            outputs.append(offloaded.gather(ids))
+    assert torch.equal(outputs[0].view(torch.int16), outputs[1].view(torch.int16))
+
+
 def test_qwen4_ple_pinned_gather_empty_input():
     offloaded = Qwen4ExpPinnedHostEmbedding(_make_source_embedding())
     _load_rows(offloaded, torch.zeros((8, 7), dtype=torch.bfloat16, device=DEVICE))

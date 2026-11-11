@@ -170,6 +170,34 @@ class TestPlePinnedHugepageTable(CustomTestCase):
             self.assertEqual(empty.called, not used)
 
 
+class TestPleGatherRows(CustomTestCase):
+    """SGLANG_PLE_GATHER_ROWS: read only with the runtime master; a power of two in
+    2..128, 0 keeps the stock one-row gather."""
+
+    def test_rows_follow_the_master_and_validate(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.models.qwen4_exp_ple_gather import gather_rows_from_env
+
+        for master, value, expected in (
+            (True, 32, 32),
+            (True, 0, 0),
+            (True, None, 0),
+            (False, 32, 0),
+        ):
+            with (
+                envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(master),
+                envs.SGLANG_PLE_GATHER_ROWS.override(value),
+            ):
+                self.assertEqual(gather_rows_from_env(), expected)
+        for bad in (1, 3, 256):
+            with (
+                envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+                envs.SGLANG_PLE_GATHER_ROWS.override(bad),
+            ):
+                with self.assertRaises(ValueError):
+                    gather_rows_from_env()
+
+
 class TestPleFilePrefetcher(CustomTestCase):
     def test_page_set_covers_row_start_and_end(self):
         # 160-byte rows: row 25 spans bytes 4000-4159, i.e. pages 0 and 1.

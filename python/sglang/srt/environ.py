@@ -544,6 +544,11 @@ class Envs:
     # cudaHostRegister) instead of cudaHostAlloc: the gather's random 160 B row reads stop
     # being bound by address translation. Opt-in (THP-dependent); falls back on failure.
     SGLANG_OPT_PLE_PINNED_HUGEPAGE = EnvRuntimeBool(False)
+    # With the master: the PLE host-table gather reads this many rows per program (a power
+    # of two in 2..128; 0 keeps the one-row stock kernel), same bits; PROGRAMS caps its grid
+    # (0: one program per row tile).
+    SGLANG_PLE_GATHER_ROWS = EnvInt(0)
+    SGLANG_PLE_GATHER_PROGRAMS = EnvInt(0)
     SGLANG_FUSED_QK_NORM_ROPE_ROWS_MIN_TOKENS = EnvInt(1024)
     SGLANG_FUSED_QK_NORM_ROPE_ROWS_ROWS = EnvInt(16)
     SGLANG_FUSED_QK_NORM_ROPE_ROWS_CHECK_CALLS = EnvInt(0)

@@ -87,6 +87,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models import qwen4_exp_ple_fused as _ple_fused
+from sglang.srt.models import qwen4_exp_ple_gather as _ple_gather
 from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
 from sglang.srt.models.qwen3_5 import (
     Qwen3_5AttentionDecoderLayer,
@@ -1223,6 +1224,20 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                     vocab_start=self.shard_indices.org_vocab_start_index,
                     vocab_end=self.shard_indices.org_vocab_end_index,
                 )
+            rows = _ple_gather.gather_rows_from_env()
+            if rows:
+                _ple_gather.gather_rows(
+                    weight_ptr=self.weight.data_ptr(),
+                    flat_ids=flat_ids,
+                    output=output,
+                    embedding_dim=self.embedding_dim,
+                    tp_vocab_start=self.shard_indices.org_vocab_start_index,
+                    tp_vocab_end=self.shard_indices.org_vocab_end_index,
+                    is_fp8=self.weight.dtype == torch.float8_e4m3fn,
+                    block_d=self._block_d,
+                    rows=rows,
+                )
+                return output
             _gather_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
                 self.weight.data_ptr(),
                 flat_ids,
