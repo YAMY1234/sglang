@@ -137,6 +137,58 @@ class TestSplitConvOutput(CustomTestCase):
                     torch.testing.assert_close(after, before, rtol=0, atol=0)
                 torch.testing.assert_close(states[1], states[0], rtol=0, atol=0)
 
+    def test_strip_kernel_matches_the_triton_split_launch(self):
+        # GDN prefill strip kernel (width 4, bf16) against the Triton split launch.
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA required")
+        from sglang.kernels.ops.mamba import gdn_prefill_conv_strip as strip
+
+        torch.manual_seed(46)
+        lengths, q_dim, k_dim, v_dim = [1, 33, 300, 2100], 256, 256, 768
+        tokens, dim = sum(lengths), q_dim + k_dim + v_dim
+        x = torch.randn(tokens, dim + 64, device="cuda", dtype=torch.bfloat16)
+        x = x[:, :dim]
+        weight = torch.randn(dim, 4, device="cuda", dtype=x.dtype)
+        cu = torch.tensor([0, *accumulate(lengths)], device="cuda", dtype=torch.int32)
+        slots = torch.tensor([4, 2, 1, 3], device="cuda", dtype=torch.int32)
+        initial = torch.tensor([False, True, False, True], device="cuda")
+        for bias in (None, torch.randn(dim, device="cuda", dtype=x.dtype)):
+            with self.subTest(bias=bias is not None):
+                seed = torch.randn(6, 3, dim, device="cuda", dtype=x.dtype)
+                states = [seed.clone().transpose(-1, -2) for _ in range(2)]
+                expected = causal_conv1d_fn(
+                    x.T,
+                    weight,
+                    bias,
+                    states[0],
+                    cu,
+                    lengths,
+                    cache_indices=slots,
+                    has_initial_state=initial,
+                    activation="silu",
+                    split_dims=(q_dim, q_dim + k_dim),
+                )
+                self.assertTrue(strip.supported(x.T, weight, states[1], q_dim, k_dim))
+                actual = strip.conv_split_qkv(
+                    x.T,
+                    weight,
+                    bias,
+                    states[1],
+                    cu,
+                    max(lengths),
+                    q_dim,
+                    k_dim,
+                    slots,
+                    initial,
+                    True,
+                    -1,
+                    128,
+                    32,
+                    4,
+                )
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                torch.testing.assert_close(states[1], states[0], rtol=0, atol=0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -14,6 +14,7 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
 )
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn_split_qkv,
+    warmup_prefill_conv_strip,
 )
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
@@ -673,6 +674,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self.mis_metadata: Optional[GDNMISMetadata] = None
         self.conv_states_shape = self.state_pool.mamba_cache.conv[0].shape
         self._split_conv_logged: set = set()
+        if _SPLIT_CONV:
+            # Build the split conv's strip kernel now, not on the first long prefill.
+            warmup_prefill_conv_strip()
         if not is_cpu() and not is_npu():
             assert self.conv_states_shape[-1] < FLA_CHUNK_SIZE, (
                 f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"

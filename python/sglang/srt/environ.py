@@ -586,6 +586,14 @@ class Envs:
     SGLANG_OPT_GDN_PREFILL_TMEM_DEALLOC = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # GDN prefill split conv of >= min_tokens eager tokens: a token-strip CUDA kernel that
+    # reads each input row once (same values). Its tile is SGLANG_GDN_PREFILL_CONV_RETILE
+    # (A's name, read only with this on): "" / "1" default, "0" off, or
+    # "tokens,threads,unroll[,min_tokens]".
+    SGLANG_OPT_GDN_PREFILL_CONV_STRIP = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    SGLANG_GDN_PREFILL_CONV_RETILE = EnvStr("")
     # Triton causal conv1d forward tile "BLOCK_M,BLOCK_N,num_warps,num_stages" (A's
     # name); read only with the runtime master on. Same values for any tile.
     SGLANG_CAUSAL_CONV1D_FWD_CONFIG = EnvStr("")

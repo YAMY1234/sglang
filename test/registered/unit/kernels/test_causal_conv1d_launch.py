@@ -69,5 +69,56 @@ class TestCausalConv1dLaunchConfig(CustomTestCase):
                 reload_with(value)
 
 
+class TestPrefillConvStrip(CustomTestCase):
+    def tearDown(self):
+        importlib.reload(conv)
+
+    def _reload(self, value, enabled=True, master=True):
+        with (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(master),
+            envs.SGLANG_OPT_GDN_PREFILL_CONV_STRIP.override(enabled),
+            envs.SGLANG_GDN_PREFILL_CONV_RETILE.override(value),
+        ):
+            importlib.reload(conv)
+
+    def test_switch_and_value_select_the_strip_tile(self):
+        default = conv._PrefillConvStrip(32, 128, 4, 2048)
+        for value, enabled, master, expected in (
+            ("", True, True, default),
+            ("1", True, True, default),
+            ("0", True, True, None),
+            ("64,256,8", True, True, conv._PrefillConvStrip(64, 256, 8, 2048)),
+            ("16,64,2,512", True, True, conv._PrefillConvStrip(16, 64, 2, 512)),
+            ("1", False, True, None),
+            ("1", True, False, None),
+        ):
+            with self.subTest(value=value, enabled=enabled, master=master):
+                self._reload(value, enabled, master)
+                self.assertEqual(conv._PREFILL_CONV_STRIP, expected)
+        for value in ("12,128,4", "32,96,4", "32,128,3", "8,128,16", "x"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self._reload(value)
+
+    def test_short_block_table_or_unsupported_calls_keep_the_triton_launch(self):
+        self._reload("1")
+        x = torch.zeros(1280, 4096, dtype=torch.bfloat16)
+        args = dict(
+            x=x,
+            weight=torch.zeros(1280, 4, dtype=torch.bfloat16),
+            bias=None,
+            conv_states=torch.zeros(2, 1280, 3, dtype=torch.bfloat16),
+            query_start_loc=torch.tensor([0, 4096], dtype=torch.int32),
+            seq_lens_cpu=[4096],
+            q_dim=256,
+            k_dim=256,
+        )
+        short = dict(args, x=x[:, :2047])
+        self.assertIsNone(conv._prefill_conv_strip(**short, kwargs={}))
+        table = {"block_table": torch.zeros(512, 2, dtype=torch.int32)}
+        self.assertIsNone(conv._prefill_conv_strip(**args, kwargs=table))
+        # A host tensor is not one the strip kernel serves.
+        self.assertIsNone(conv._prefill_conv_strip(**args, kwargs={}))
+
+
 if __name__ == "__main__":
     unittest.main()
