@@ -17,6 +17,26 @@ def pp_spec_stable_rows_enabled() -> bool:
     return envs.SGLANG_ENABLE_PP_SPEC.get()
 
 
+def gdn_ucache_track_rings_supported() -> bool:
+    # gdn_prefix_materialize reads the state and the rings at one slot id and takes
+    # bf16 k / u rings.
+    return not (
+        envs.SGLANG_OPT_GDN_UCACHE_REQUEST_RINGS.get()
+        or envs.SGLANG_OPT_GDN_UCACHE_FP16_KEY_RING.get()
+    )
+
+
+# Whether u-cache verify commits write radix decode-time track snapshots; otherwise
+# the u-cache tracks no decode-time state (extend-time track slots only).
+def gdn_ucache_track_snapshots() -> bool:
+    mamba = get_exec().mamba
+    return (
+        mamba.enable_gdn_replayssm_ucache
+        and mamba.enable_mamba_extra_buffer
+        and gdn_ucache_track_rings_supported()
+    )
+
+
 class LinearAttnKernelBackend(Enum):
     TRITON = "triton"
     CUTEDSL = "cutedsl"

@@ -19,6 +19,7 @@ import torch
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.linear.utils import gdn_ucache_track_snapshots
 from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
     RequestCustomizedInfo,
@@ -1716,11 +1717,12 @@ class SchedulerBatchResultProcessor:
         Lazy: keep the same index (prealloc handles the swap) and run
         post-decode cleanup to free the temporary second slot.
         """
-        # The u-cache tracks no decode-time state (prepare_mamba_track_for_verify):
-        # the keep slot stays the extend-time checkpoint a finished request donates.
-        if (
-            req.kv.mamba_ping_pong_track_buffer is None
-            or get_exec().mamba.enable_gdn_replayssm_ucache
+        # Without track snapshots the u-cache tracks no decode-time state
+        # (prepare_mamba_track_for_verify): the keep slot stays the extend-time
+        # checkpoint a finished request donates.
+        if req.kv.mamba_ping_pong_track_buffer is None or (
+            get_exec().mamba.enable_gdn_replayssm_ucache
+            and not gdn_ucache_track_snapshots()
         ):
             return
 

@@ -1764,6 +1764,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 state_indices_tensor=state_indices_tensor,
                 last_correct_step_indices=last_correct_step_indices,
                 mamba_track_indices=mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
                 src_indices_raw=src_indices_raw,
                 request_rows=(
                     req_pool_indices[:request_number]
@@ -1805,30 +1806,53 @@ class HybridLinearAttnBackend(AttentionBackend):
         state_indices_tensor: torch.Tensor,
         last_correct_step_indices: torch.Tensor,
         mamba_track_indices: Optional[torch.Tensor],
+        mamba_steps_to_track: Optional[torch.Tensor],
         src_indices_raw: Optional[torch.Tensor],
         request_rows: Optional[torch.Tensor],
     ) -> None:
-        """Commits a u-cache verify: the cursors, then the conv windows of the live slots."""
+        """Commits a u-cache verify: the cursors, then the radix track snapshots,
+        then the conv windows of the live and track slots."""
         # The u-cache ring owns the SSM rollback: no intermediate_ssm to scatter.
-        assert mamba_track_indices is None, "u-cache verify tracks no decode state"
         # Linear chain only, so the last accepted step + 1 counts the bonus.
+        num_accept_tokens = last_correct_step_indices + 1
         commit_gdn_ucache_cursors(
             buffers=mamba_pool.gdn_ucache,
             slots=state_indices_tensor,
-            num_accept_tokens=last_correct_step_indices + 1,
+            num_accept_tokens=num_accept_tokens,
             request_rows=request_rows,
         )
-        # Per-conv-type scatter (as the ReplaySSM spec commit does): with no
-        # track rows it is cheaper than the single-launch multi-pair kernel.
+        if mamba_track_indices is not None:
+            track = self.linear_attn_backend.gdn_ucache_track
+            if track is None:
+                raise RuntimeError(
+                    "GDN u-cache verify got mamba track indices without a "
+                    "track materializer (radix decode inserts are off)."
+                )
+            # Reads the cursors just committed, before the next verify folds S0.
+            track.materialize(
+                slots=state_indices_tensor,
+                num_accept_tokens=num_accept_tokens,
+                track_slots=mamba_track_indices,
+                steps_to_track=mamba_steps_to_track,
+            )
+        # One fused_conv_window_scatter_with_mask launch per (conv type, target).
+        # The live slots are always a target; when radix decode tracking passes
+        # mamba_track_indices, the track slots are a second target, which doubles
+        # the launches on that path.
+        conv_targets = [(state_indices_tensor, last_correct_step_indices)]
+        if mamba_track_indices is not None:
+            conv_targets.append((mamba_track_indices, mamba_steps_to_track))
         for conv_states, intermediate_conv_window in zip(
             mamba_caches.conv, mamba_caches.intermediate_conv_window
         ):
-            if conv_states.numel() > 0:
+            if conv_states.numel() == 0:
+                continue
+            for dst_indices, step_indices in conv_targets:
                 fused_conv_window_scatter_with_mask(
                     conv_states,
                     intermediate_conv_window,
-                    state_indices_tensor,
-                    last_correct_step_indices,
+                    dst_indices,
+                    step_indices,
                     src_indices_raw,
                 )
 

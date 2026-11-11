@@ -28,6 +28,7 @@ from sglang.srt.layers.attention.linear.gdn_prefill_graph import (
 )
 from sglang.srt.layers.attention.linear.gdn_replayssm_ucache import (
     GdnUcacheBuffers,
+    GdnUcacheTrackMaterializer,
     GdnUcacheVerifier,
 )
 from sglang.srt.layers.attention.linear.kda_prefill_graph import (
@@ -43,6 +44,7 @@ from sglang.srt.layers.attention.linear.utils import (
     LinearAttnBackends,
     LinearAttnKernelBackend,
     build_verify_intermediate_state_indices,
+    gdn_ucache_track_snapshots,
     pp_spec_stable_rows_enabled,
     select_verify_intermediate_state_indices,
 )
@@ -653,6 +655,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
     _gdn_ucache: Optional[GdnUcacheBuffers] = None
     _gdn_ucache_verifier: Optional[GdnUcacheVerifier] = None
     _ucache_fused_conv_enabled: bool = False
+    gdn_ucache_track: Optional[GdnUcacheTrackMaterializer] = None
 
     def _create_kernel_dispatcher(self, backends):
         return GDNKernelDispatcher(backends.decode, backends.prefill, backends.verify)
@@ -713,6 +716,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 num_state_slots=self.state_pool.size + 1,
             )
             if self._gdn_ucache is not None
+            else None
+        )
+        # Radix decode inserts: verify commits snapshot crossing rows into track slots.
+        self.gdn_ucache_track = (
+            GdnUcacheTrackMaterializer(
+                state=self.state_pool.mamba_cache.temporal, buffers=self._gdn_ucache
+            )
+            if self._gdn_ucache is not None
+            and not self.is_draft_worker
+            and gdn_ucache_track_snapshots()
             else None
         )
         self._ucache_fused_conv_enabled = self._ucache_fused_conv_supported()
@@ -870,6 +883,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 max_eager_batch_size=self.req_to_token_pool.size,
                 fused_conv=self._ucache_fused_conv_enabled,
                 fused_norm_max_batch=self._ucache_fused_norm_max_batch,
+            )
+        if self.gdn_ucache_track is not None:
+            # Eager verifies (bs > max_bs) run up to one row per request slot.
+            self.gdn_ucache_track.warm_up(
+                max_batch_size=max_bs, max_eager_batch_size=self.req_to_token_pool.size
             )
 
     def supports_prefill_graph_extend(self) -> bool:

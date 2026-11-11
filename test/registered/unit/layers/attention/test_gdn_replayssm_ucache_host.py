@@ -14,6 +14,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear import gdn_replayssm_ucache as ucache
 from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+from sglang.srt.layers.attention.linear.utils import gdn_ucache_track_rings_supported
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -142,6 +143,18 @@ class TestGdnUcacheHost(CustomTestCase):
         self.assertEqual(opts.kernel_kwargs(), {})
         with self.assertRaisesRegex(ValueError, "SM107"):
             self._flush_options((10, 0), FLUSH_FIRST="1")
+
+    def test_track_snapshots_need_slot_indexed_bf16_rings(self):
+        """gdn_prefix_materialize reads the state and the rings at one slot id with one
+        (bf16) ring dtype: snapshots engage only without request rings and the fp16 key
+        ring, and their pool keeps a bf16 u ring."""
+        self.assertIs(_allocate(track_snapshots=True).u_ring.dtype, torch.bfloat16)
+        self.assertIs(_allocate().u_ring.dtype, torch.float16)
+        with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True):
+            self.assertTrue(gdn_ucache_track_rings_supported())
+            for name in ("REQUEST_RINGS", "FP16_KEY_RING"):
+                with getattr(envs, f"SGLANG_OPT_GDN_UCACHE_{name}").override("1"):
+                    self.assertFalse(gdn_ucache_track_rings_supported(), name)
 
     def test_retraction_backup_is_refused_only_under_the_ucache(self):
         self.assertFalse(

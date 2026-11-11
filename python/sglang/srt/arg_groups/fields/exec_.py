@@ -643,10 +643,14 @@ class ExecMamba(msgspec.Struct):
         "SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION=1, "
         "a GDN hybrid model, a linear draft chain with at most 8 draft tokens "
         "(in every --speculative-adaptive tier), "
-        "--mamba-ssm-dtype float16 and either --disable-radix-cache or, in "
-        "aggregated serving, --mamba-radix-cache-strategy extra_buffer or "
-        "extra_buffer_lazy (prefill-written states only: decode-time state tracking "
-        "is off); no_buffer decode inserts are refused. Refuses mixed chunk, "
+        "--mamba-ssm-dtype float16. With the radix cache (aggregated serving "
+        "only), decode-time states are cached through --mamba-radix-cache-strategy "
+        "extra_buffer or extra_buffer_lazy (each crossing writes FlashInfer's "
+        "gdn_prefix_materialize fold of the window into the track slot; not with "
+        "SGLANG_OPT_GDN_UCACHE_REQUEST_RINGS or _FP16_KEY_RING, under which the tree "
+        "takes prefill-written states only); no_buffer decode inserts are refused. "
+        "With the radix cache on, sets GDN_UCACHE_STATE_DTYPE=fp16 for FlashInfer "
+        "and refuses another value. Refuses mixed chunk, "
         "streaming sessions, unified memory, int8 mamba checkpoints, the NVIDIA "
         "megakernel and PD disaggregation; needs FlashInfer >= 0.7.3.",
     ] = False

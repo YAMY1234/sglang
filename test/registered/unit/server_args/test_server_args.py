@@ -27,6 +27,7 @@ from sglang.srt.arg_groups.attention_hook import (
     _check_gdn_replayssm_ucache_cache,
     _check_gdn_replayssm_ucache_megakernel,
     _check_gdn_replayssm_ucache_spec,
+    _pin_gdn_ucache_state_dtype_env,
     handle_attention_backend_compatibility,
     handle_deterministic_inference,
     handle_gdn_replayssm_ucache_spec_shape,
@@ -1527,6 +1528,29 @@ class TestGdnReplaySsmUcacheArgs(unittest.TestCase):
 
     def test_radix_off_is_accepted_on_any_strategy(self):
         self._check(disable_radix_cache=True, mamba_radix_cache_strategy="no_buffer")
+
+    def _pin(self, **kwargs):
+        server_args = ServerArgs(model_path="dummy", **kwargs)
+        _pin_gdn_ucache_state_dtype_env(resolving_view(server_args), flag=self.FLAG)
+
+    def test_state_dtype_env_is_set_to_fp16_and_conflicts_rejected(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GDN_UCACHE_STATE_DTYPE", None)
+            self._pin(mamba_radix_cache_strategy="extra_buffer")
+            self.assertEqual(os.environ["GDN_UCACHE_STATE_DTYPE"], "fp16")
+        with patch.dict(os.environ, {"GDN_UCACHE_STATE_DTYPE": "bf16"}):
+            with self.assertRaisesRegex(ValueError, "GDN_UCACHE_STATE_DTYPE=fp16"):
+                self._pin(mamba_radix_cache_strategy="extra_buffer_lazy")
+
+    def test_state_dtype_env_is_left_alone_without_track_snapshots(self):
+        """Radix off, or rings the materialize kernel cannot address."""
+        with patch.dict(os.environ, {"GDN_UCACHE_STATE_DTYPE": "bf16"}):
+            self._pin(disable_radix_cache=True)
+            with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True):
+                for name in ("REQUEST_RINGS", "FP16_KEY_RING"):
+                    with getattr(envs, f"SGLANG_OPT_GDN_UCACHE_{name}").override("1"):
+                        self._pin(mamba_radix_cache_strategy="extra_buffer_lazy")
+            self.assertEqual(os.environ["GDN_UCACHE_STATE_DTYPE"], "bf16")
 
     def test_host_cache_offload_is_accepted(self):
         for kwargs in (

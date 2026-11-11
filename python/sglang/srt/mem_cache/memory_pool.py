@@ -1154,6 +1154,7 @@ class MambaPool:
             allocate_gdn_ucache,
             gdn_ucache_request_rings,
         )
+        from sglang.srt.layers.attention.linear.utils import gdn_ucache_track_snapshots
 
         if cache_params.is_kda or speculative_num_draft_tokens is None:
             raise ValueError(
@@ -1173,6 +1174,7 @@ class MambaPool:
             max_num_draft_tokens=speculative_num_draft_tokens,
             device=self.device,
             by_request_row=by_request_row,
+            track_snapshots=gdn_ucache_track_snapshots(),
         )
         logger.info(
             "GDN u-cache rings allocated: "

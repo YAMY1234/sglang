@@ -40,7 +40,10 @@ from sglang.srt.arg_groups.platform_hook import (
 from sglang.srt.configs.model_config import uses_kda_attention
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
+from sglang.srt.layers.attention.linear.utils import (
+    gdn_ucache_track_rings_supported,
+    pp_spec_stable_rows_enabled,
+)
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
@@ -323,6 +326,7 @@ def handle_linear_attn_backend(server_args: Any):
 
     if cfg.enable_gdn_replayssm_ucache:
         _check_gdn_replayssm_ucache(server_args)
+        _pin_gdn_ucache_state_dtype_env(cfg, flag="--enable-gdn-replayssm-ucache")
 
     # SM100+ FlashInfer GDN decode requires bf16 state; SM90 uses float32.
     decode = cfg.linear_attn_decode_backend or cfg.linear_attn_backend
@@ -570,6 +574,24 @@ def _check_gdn_replayssm_ucache(server_args: Any) -> None:
         )
 
 
+def _pin_gdn_ucache_state_dtype_env(cfg: Any, *, flag: str) -> None:
+    """Sets GDN_UCACHE_STATE_DTYPE=fp16, refusing another value, when decode-time
+    radix inserts load FlashInfer's gdn_prefix_materialize."""
+    # PM fixes its state dtype when flashinfer.gdn_kernels is first imported;
+    # scheduler processes inherit this. The UMMA verify kernels take their dtypes
+    # from the tensors, so the other configs leave the variable alone. After
+    # _check_gdn_replayssm_ucache_cache, the radix cache implies an extra_buffer
+    # strategy, which is when the backend builds the track materializer.
+    if cfg.disable_radix_cache or not gdn_ucache_track_rings_supported():
+        return
+    value = os.environ.setdefault("GDN_UCACHE_STATE_DTYPE", "fp16")
+    if value.strip().lower() != "fp16":
+        raise ValueError(
+            f"{flag} needs GDN_UCACHE_STATE_DTYPE=fp16 (an fp16 state pool for "
+            f"gdn_prefix_materialize); got {value!r}."
+        )
+
+
 def _check_gdn_replayssm_ucache_model(server_args: Any, *, flag: str) -> None:
     import torch
 
@@ -608,11 +630,11 @@ def _check_gdn_replayssm_ucache_spec(cfg: Any, *, flag: str) -> None:
 
 
 def _check_gdn_replayssm_ucache_cache(cfg: Any, *, flag: str) -> None:
-    # Prefill-written states have an empty window, so the tree holds exact
-    # checkpoints; every target extend restarts its slot's window. With the
-    # mamba extra buffer the u-cache turns decode-time state tracking off
-    # (prepare_mamba_track_for_verify), so the tree takes only extend-time track
-    # slots; no_buffer would donate the live slot, whose checkpoint lags its window.
+    # The tree must hold states with an empty window: prefill writes them, and
+    # each verify commit materializes decode-time track states into the extra
+    # buffer (gdn_ucache_track_snapshots; without it, e.g. under request rings,
+    # decode-time tracking is off); every target extend restarts its slot's
+    # window. no_buffer would donate the live slot, whose checkpoint lags its window.
     if not cfg.disable_radix_cache:
         if cfg.mamba_radix_cache_strategy not in ("extra_buffer", "extra_buffer_lazy"):
             raise ValueError(
