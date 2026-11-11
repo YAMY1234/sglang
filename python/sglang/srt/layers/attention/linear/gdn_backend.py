@@ -1,3 +1,4 @@
+import logging
 from typing import Optional, Tuple, Union
 
 import msgspec
@@ -79,6 +80,7 @@ if is_cuda() or is_hip() or is_xpu():
     )
 
 MAX_FUSED_QKV_SPLIT_DIM = 8192
+logger = logging.getLogger(__name__)
 _fused_decode_proj_conv_logged = False
 _fused_decode_proj_conv_fallback_logged = False
 _fused_decode_proj_conv_layers_logged: set[int] = set()
@@ -650,6 +652,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
     # The u-cache verify (--enable-gdn-replayssm-ucache); off unless __init__ finds rings.
     _gdn_ucache: Optional[GdnUcacheBuffers] = None
     _gdn_ucache_verifier: Optional[GdnUcacheVerifier] = None
+    _ucache_fused_conv_enabled: bool = False
 
     def _create_kernel_dispatcher(self, backends):
         return GDNKernelDispatcher(backends.decode, backends.prefill, backends.verify)
@@ -712,6 +715,77 @@ class GDNAttnBackend(MambaAttnBackendBase):
             if self._gdn_ucache is not None
             else None
         )
+        self._ucache_fused_conv_enabled = self._ucache_fused_conv_supported()
+        self._ucache_fused_conv_logged: set = set()
+
+    def _ucache_fused_conv_supported(self) -> bool:
+        if not envs.SGLANG_OPT_GDN_UCACHE_FUSED_CONV.get() or self.is_draft_worker:
+            return False
+        reason = None
+        if self._gdn_ucache_verifier is None:
+            reason = "needs --enable-gdn-replayssm-ucache"
+        elif not self._gdn_ucache_verifier.fused_conv_capable:
+            reason = (
+                "needs the SM107 flush with SGLANG_OPT_GDN_UCACHE_STRIDED_QKV=1 and "
+                "SGLANG_OPT_GDN_UCACHE_PDL=1"
+            )
+        if reason is not None:
+            logger.warning("SGLANG_OPT_GDN_UCACHE_FUSED_CONV not taken: %s", reason)
+            return False
+        return True
+
+    def _ucache_fused_conv(
+        self,
+        *,
+        layer: RadixLinearAttention,
+        mixed_qkv: torch.Tensor,
+        conv_states: torch.Tensor,
+        window: torch.Tensor,
+        window_indices: torch.Tensor,
+        batch_size: int,
+        draft_token_num: int,
+        linear_chain: bool,
+    ):
+        """The GdnFusedConv for this verify's flush launches, or None (the separate conv runs):
+        tree verifies and launches whose heads per CTA split a key head (small batches) keep it."""
+        if not self._ucache_fused_conv_enabled or not linear_chain:
+            return None
+        from sglang.kernels.ops.attention.linear.gdn_ucache_rubin.gdn_replay_mtp_umma_rubin import (
+            GdnFusedConv,
+            fused_conv_unsupported_reason,
+        )
+
+        fused = GdnFusedConv(
+            x=mixed_qkv.view(batch_size, draft_token_num, -1),
+            weight=layer.conv_weights,
+            conv_state=conv_states,
+            window=window,
+            window_indices=window_indices,
+        )
+        reason = (
+            f"conv bias / activation {layer.bias is not None} / {layer.activation}"
+            if layer.bias is not None or layer.activation not in ("silu", "swish")
+            else fused_conv_unsupported_reason(
+                fused, num_k_heads=layer.num_k_heads, num_v_heads=layer.num_v_heads
+            )
+        )
+        key = "kept" if reason is not None else "engaged"
+        if key not in self._ucache_fused_conv_logged:
+            self._ucache_fused_conv_logged.add(key)
+            if reason is None:
+                logger.info(
+                    "SGLANG_OPT_GDN_UCACHE_FUSED_CONV engaged: the u-cache flush runs the "
+                    "verify conv (%d channels, %d tokens; first batch %d)",
+                    mixed_qkv.shape[1],
+                    draft_token_num,
+                    batch_size,
+                )
+            else:
+                logger.info(
+                    "SGLANG_OPT_GDN_UCACHE_FUSED_CONV: separate verify conv kept (%s)",
+                    reason,
+                )
+        return fused if reason is None else None
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         super().init_cuda_graph_state(max_bs, max_num_tokens)
@@ -726,6 +800,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 g_ring=gdn_ucache.g_ring[0],
                 flush_min=gdn_ucache.flush_min,
                 max_eager_batch_size=self.req_to_token_pool.size,
+                fused_conv=self._ucache_fused_conv_enabled,
             )
 
     def supports_prefill_graph_extend(self) -> bool:
@@ -1464,25 +1539,46 @@ class GDNAttnBackend(MambaAttnBackendBase):
             ssm_states_contig = ssm_states
             state_cache_indices = cache_indices
 
+        ucache_fused_conv = None
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
             mixed_qkv_reshaped = mixed_qkv.view(
                 batch_size, draft_token_num, -1
             ).transpose(1, 2)
-            mixed_qkv_processed = causal_conv1d_update(
-                mixed_qkv_reshaped,
-                conv_states,
-                layer.conv_weights,
-                layer.bias,
-                layer.activation,
-                conv_state_indices=cache_indices[:batch_size],
-                intermediate_conv_window=intermediate_conv_window_cache,
-                intermediate_state_indices=intermediate_state_indices[:batch_size],
-                retrieve_next_token=retrieve_next_token,
-                retrieve_next_sibling=retrieve_next_sibling,
-                retrieve_parent_token=retrieve_parent_token,
+            ucache_fused_conv = self._ucache_fused_conv(
+                layer=layer,
+                mixed_qkv=mixed_qkv,
+                conv_states=conv_states,
+                window=intermediate_conv_window_cache,
+                window_indices=intermediate_state_indices[:batch_size],
+                batch_size=batch_size,
+                draft_token_num=draft_token_num,
+                linear_chain=retrieve_next_token is None
+                and retrieve_next_sibling is None
+                and retrieve_parent_token is None,
             )
+            if ucache_fused_conv is not None:
+                # the u-cache flush computes the conv into these rows (GdnFusedConv)
+                mixed_qkv_processed = torch.empty(
+                    (batch_size, draft_token_num, mixed_qkv.shape[1]),
+                    dtype=mixed_qkv.dtype,
+                    device=mixed_qkv.device,
+                ).transpose(1, 2)
+            else:
+                mixed_qkv_processed = causal_conv1d_update(
+                    mixed_qkv_reshaped,
+                    conv_states,
+                    layer.conv_weights,
+                    layer.bias,
+                    layer.activation,
+                    conv_state_indices=cache_indices[:batch_size],
+                    intermediate_conv_window=intermediate_conv_window_cache,
+                    intermediate_state_indices=intermediate_state_indices[:batch_size],
+                    retrieve_next_token=retrieve_next_token,
+                    retrieve_next_sibling=retrieve_next_sibling,
+                    retrieve_parent_token=retrieve_parent_token,
+                )
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
             if forward_metadata.has_mamba_track_mask:
@@ -1544,6 +1640,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     num_draft_tokens=forward_batch.spec_info.draft_token_num,
                     retrieve_parent_token=retrieve_parent_token,
                     request_rows=forward_batch.req_pool_indices,
+                    fused_conv=ucache_fused_conv,
                 )
             elif use_replayssm_fold:
                 core_attn_out = self._replayssm_fold_target_verify(
@@ -1825,6 +1922,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         num_draft_tokens: int,
         retrieve_parent_token: Optional[torch.Tensor],
         request_rows: torch.Tensor,
+        fused_conv=None,
     ) -> torch.Tensor:
         assert retrieve_parent_token is None, (
             "GDN u-cache verify supports linear draft chains only (topk == 1)."
@@ -1849,6 +1947,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             cache_indices=cache_indices,
             num_draft_tokens=num_draft_tokens,
             request_rows=request_rows if gdn_ucache.by_request_row else None,
+            fused_conv=fused_conv,
         )
 
     def _replayssm_fold_target_verify(

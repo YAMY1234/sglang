@@ -169,6 +169,39 @@ class TestGdnUcacheHost(CustomTestCase):
             backend._init_target_verify_qkv_routing(batch)
             self.assertIs(backend._use_strided_target_verify_qkv, strided)
 
+    def test_fused_conv_needs_the_strided_dependent_sm107_flush(self):
+        backend = self._verify_backend()
+        backend.is_draft_worker = False
+        for capable, expected in ((False, False), (True, True)):
+            backend._gdn_ucache_verifier = SimpleNamespace(fused_conv_capable=capable)
+            with self.subTest(capable=capable):
+                self.assertIs(backend._ucache_fused_conv_supported(), False)
+                with (
+                    envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+                    envs.SGLANG_OPT_GDN_UCACHE_FUSED_CONV.override("1"),
+                ):
+                    self.assertIs(backend._ucache_fused_conv_supported(), expected)
+                    backend.is_draft_worker = True
+                    self.assertIs(backend._ucache_fused_conv_supported(), False)
+                    backend.is_draft_worker = False
+
+    def test_fused_conv_is_not_offered_when_off_or_on_a_tree(self):
+        backend = self._verify_backend()
+        for enabled, linear_chain in ((False, True), (True, False)):
+            backend._ucache_fused_conv_enabled = enabled
+            self.assertIsNone(
+                backend._ucache_fused_conv(
+                    layer=None,
+                    mixed_qkv=None,
+                    conv_states=None,
+                    window=None,
+                    window_indices=None,
+                    batch_size=4,
+                    draft_token_num=4,
+                    linear_chain=linear_chain,
+                )
+            )
+
     def test_plain_decode_is_refused(self):
         backend = self._verify_backend()
         qkv = torch.zeros(1, 3 * K)

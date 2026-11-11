@@ -525,6 +525,10 @@ class Envs:
     SGLANG_OPT_GDN_UCACHE_PDL = EnvRuntimeBool(False)
     # and run the rows that fold their window first (one row order per verify).
     SGLANG_OPT_GDN_UCACHE_FLUSH_FIRST = EnvRuntimeBool(False)
+    # With the strided / PDL flush (SM107): the target-verify conv of a linear draft chain runs
+    # inside the u-cache flush kernel, each (key head, row) CTA convolving its own q / k / v
+    # channels before it reads them; launches whose CTAs split a key head keep the separate conv.
+    SGLANG_OPT_GDN_UCACHE_FUSED_CONV = EnvRuntimeBool(False)
 
     # ===================================================================
     # Model configuration, discovery, and weight loading

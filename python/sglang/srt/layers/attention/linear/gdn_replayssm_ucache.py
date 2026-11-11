@@ -609,6 +609,13 @@ class GdnUcacheVerifier:
 
         self._flush_kernel = _load_flush_kernel(device)
         self._options = gdn_ucache_flush_options(device)
+        # SGLANG_OPT_GDN_UCACHE_FUSED_CONV: the vendored SM107 kernel's conv prologue, which
+        # its strided, dependent launch carries
+        self.fused_conv_capable = (
+            self._options.strided_qkv
+            and self._options.pdl
+            and torch.cuda.get_device_capability(device) == (10, 7)
+        )
         self._kernel_kwargs = self._options.kernel_kwargs()
         self._by_request_row = by_request_row
         if by_request_row:
@@ -677,10 +684,12 @@ class GdnUcacheVerifier:
         cache_indices: torch.Tensor,
         num_draft_tokens: int,
         request_rows: Optional[torch.Tensor] = None,
+        fused_conv=None,
     ) -> torch.Tensor:
         """Returns the verify output in ``value``'s shape; padded rows are zero.
         ``request_rows`` (the batch's request-table rows) index the rings under
-        ``by_request_row``."""
+        ``by_request_row``. ``fused_conv`` (a GdnFusedConv, ``fused_conv_capable`` only): the
+        launch computes query / key / value, views of one [B, T, D] conv output, itself."""
         num_v_heads, head_v_dim = value.shape[-2], value.shape[-1]
         num_k_heads, head_k_dim = key.shape[-2], key.shape[-1]
         batch = value.numel() // (num_draft_tokens * num_v_heads * head_v_dim)
@@ -741,6 +750,7 @@ class GdnUcacheVerifier:
             **self._kernel_kwargs,
             **({"row_order": self._row_order} if self._options.flush_first else {}),
             **({"ring_indices": rows.ring_rows} if self._by_request_row else {}),
+            **({"fused_conv": fused_conv} if fused_conv is not None else {}),
         )
         return output.reshape(value.shape)
 
@@ -755,11 +765,12 @@ class GdnUcacheVerifier:
         g_ring: torch.Tensor,
         flush_min: int,
         max_eager_batch_size: int = 0,
+        fused_conv: bool = False,
     ) -> None:
         """Compiles the kernels, allocates the shared buffers and builds
         FlashInfer's per-batch-size helper tensors eagerly, so CUDA graph capture
-        creates none of them. The shared buffers also cover ``max_eager_batch_size``
-        so a later eager batch does not outgrow them."""
+        creates none of them; with ``fused_conv``, those builds too. The shared buffers
+        also cover ``max_eager_batch_size`` so a later eager batch does not outgrow them."""
         num_k_heads, head_k_dim = k_ring.shape[1], k_ring.shape[3]
         num_v_heads, head_v_dim = u_ring.shape[1], u_ring.shape[3]
         device = state.device
@@ -823,6 +834,104 @@ class GdnUcacheVerifier:
                 **({"row_order": order[:batch]} if self._options.flush_first else {}),
                 **({"ring_indices": ring_rows[:batch]} if self._by_request_row else {}),
             )
+        if fused_conv and self.fused_conv_capable:
+            self._warm_up_fused(
+                q=q,
+                k=k,
+                v=v,
+                a=a,
+                b=b,
+                gate_param=gate_param,
+                state=state,
+                k_ring=k_ring,
+                u_ring=u_ring,
+                g_ring=g_ring,
+                cursor=cursor,
+                padded=padded,
+                order=order,
+                ring_rows=ring_rows,
+                flush_min=flush_min,
+            )
+
+    def _warm_up_fused(
+        self,
+        *,
+        q,
+        k,
+        v,
+        a,
+        b,
+        gate_param,
+        state,
+        k_ring,
+        u_ring,
+        g_ring,
+        cursor,
+        padded,
+        order,
+        ring_rows,
+        flush_min,
+    ) -> None:
+        """The conv-prologue builds (SGLANG_OPT_GDN_UCACHE_FUSED_CONV) at every batch size that
+        takes them. Every row is padded, so the launches touch no buffer."""
+        from sglang.kernels.ops.attention.linear.gdn_ucache_rubin.gdn_replay_mtp_umma_rubin import (
+            GdnFusedConv,
+            fused_conv_unsupported_reason,
+        )
+
+        max_batch, T = q.shape[0], q.shape[1]
+        H, HV = q.shape[2], v.shape[2]
+        D = (2 * H + HV) * q.shape[3]
+        device = q.device
+        bf16 = torch.bfloat16
+        x_all = torch.zeros(max_batch * T * D, dtype=bf16, device=device)
+        win = torch.zeros(1, D, T + 2, dtype=bf16, device=device)
+        win_view = win.as_strided((1, T, D, 3), ((T + 2) * D, 1, T + 2, 1))
+        weight = torch.zeros(D, 4, dtype=bf16, device=device)
+        conv_state = torch.zeros(1, D, 3, dtype=bf16, device=device)
+        win_rows = torch.zeros(max_batch, dtype=torch.int32, device=device)
+        built = 0
+        for batch in range(1, max_batch + 1):
+            fc = GdnFusedConv(
+                x=x_all[: batch * T * D].view(batch, T, D),
+                weight=weight,
+                conv_state=conv_state,
+                window=win_view,
+                window_indices=win_rows[:batch],
+            )
+            if (
+                fused_conv_unsupported_reason(fc, num_k_heads=H, num_v_heads=HV)
+                is not None
+            ):
+                continue
+            built += 1
+            self._flush_kernel(
+                A_log=gate_param,
+                a=a[:batch],
+                dt_bias=gate_param,
+                q=q[:batch],
+                k=k[:batch],
+                v=v[:batch],
+                b=b[:batch],
+                initial_state_source=state,
+                initial_state_indices=padded[:batch],
+                k_cache=k_ring,
+                u_cache=u_ring,
+                g_cache=g_ring,
+                hist_len=cursor[:batch],
+                cache_base=cursor[:batch],
+                flush_min=flush_min,
+                restart_hist_on_flush=False,
+                fused_conv=fc,
+                **self._kernel_kwargs,
+                **({"row_order": order[:batch]} if self._options.flush_first else {}),
+                **({"ring_indices": ring_rows[:batch]} if self._by_request_row else {}),
+            )
+        logger.info(
+            "SGLANG_OPT_GDN_UCACHE_FUSED_CONV: flush builds warmed at %d of %d batch sizes",
+            built,
+            max_batch,
+        )
 
     def _output_buffer(self, *, batch: int, row_shape: tuple) -> torch.Tensor:
         out = self._output
