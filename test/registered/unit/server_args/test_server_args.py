@@ -1623,12 +1623,31 @@ class TestGdnReplaySsmUcacheArgs(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     self._check(**kwargs)
 
-    def test_megakernel_is_rejected(self):
+    def test_megakernel_flag_is_left_to_its_spec_check(self):
+        """A numeric-provider spec keeps the model forward and its u-cache verify;
+        megakernel_disable_reasons refuses a spec that runs whole forwards."""
         server_args = ServerArgs(model_path="dummy", enable_nvidia_megakernel=True)
-        with self.assertRaisesRegex(ValueError, "--enable-nvidia-megakernel"):
-            _check_gdn_replayssm_ucache_megakernel(
-                resolving_view(server_args), flag=self.FLAG
-            )
+        _check_gdn_replayssm_ucache_megakernel(
+            resolving_view(server_args), flag=self.FLAG
+        )
+
+    def test_gdn_front_knobs_need_the_front_admission(self):
+        """Q38_GDN_FRONT / Q38_GDN_PDL run with the u-cache only under
+        SGLANG_ENABLE_GDN_UCACHE_FRONT; the MK GDN front never does."""
+        cfg = resolving_view(ServerArgs(model_path="dummy"))
+        _check_gdn_replayssm_ucache_megakernel(cfg, flag=self.FLAG)
+        for name in ("Q38_GDN_FRONT", "Q38_GDN_PDL"):
+            with self.subTest(name=name), patch.dict(os.environ, {name: "1"}):
+                with self.assertRaisesRegex(ValueError, f"{name}=1"):
+                    _check_gdn_replayssm_ucache_megakernel(cfg, flag=self.FLAG)
+                with envs.SGLANG_ENABLE_GDN_UCACHE_FRONT.override(True):
+                    _check_gdn_replayssm_ucache_megakernel(cfg, flag=self.FLAG)
+        with (
+            patch.dict(os.environ, {"SGLANG_Q38_MK_GDN": "1"}),
+            envs.SGLANG_ENABLE_GDN_UCACHE_FRONT.override(True),
+        ):
+            with self.assertRaisesRegex(ValueError, "SGLANG_Q38_MK_GDN=1"):
+                _check_gdn_replayssm_ucache_megakernel(cfg, flag=self.FLAG)
 
     def test_spec_requirements(self):
         for kwargs, message in (

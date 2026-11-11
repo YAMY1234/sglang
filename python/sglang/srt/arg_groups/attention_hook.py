@@ -689,12 +689,32 @@ def _check_gdn_replayssm_ucache_cache(cfg: Any, *, flag: str) -> None:
         )
 
 
+# Megakernel binding knobs that route a GDN target verify through their own front;
+# read raw at their call sites, so mirrored here.
+_Q38_GDN_VERIFY_KNOBS = ("Q38_GDN_FRONT", "Q38_GDN_PDL")
+# Admitted under SGLANG_ENABLE_GDN_UCACHE_FRONT: the front's strided projection views feed
+# the u-cache verify the same q / k / v / b / a values; Q38_GDN_PDL only picks the
+# ReplaySSM verify kernel, which the u-cache verify never calls.
+_Q38_GDN_UCACHE_FRONT_KNOBS = ("Q38_GDN_FRONT", "Q38_GDN_PDL")
+
+
 def _check_gdn_replayssm_ucache_megakernel(cfg: Any, *, flag: str) -> None:
-    if cfg.enable_nvidia_megakernel:
-        raise ValueError(
-            f"{flag} cannot run with --enable-nvidia-megakernel: its verify step "
-            "reads the GDN pool without the u-cache rings."
-        )
+    # --enable-nvidia-megakernel is checked against the resolved spec instead
+    # (megakernel_disable_reasons): only a spec running whole forwards owns the verify.
+    # The MK GDN front and fused glue read the ReplaySSM rings, which the u-cache
+    # pool does not allocate.
+    if os.environ.get("SGLANG_Q38_MK_GDN", "0") == "1":
+        raise ValueError(f"{flag} cannot run with SGLANG_Q38_MK_GDN=1.")
+    for name in _Q38_GDN_VERIFY_KNOBS:
+        if os.environ.get(name, "0") != "1":
+            continue
+        if (
+            name in _Q38_GDN_UCACHE_FRONT_KNOBS
+            and envs.SGLANG_ENABLE_GDN_UCACHE_FRONT.get()
+        ):
+            logger.info("SGLANG_ENABLE_GDN_UCACHE_FRONT: %s=1 with %s.", name, flag)
+            continue
+        raise ValueError(f"{flag} cannot run with {name}=1.")
 
 
 def _is_gdn_ucache_pd_prefill(cfg: Any) -> bool:

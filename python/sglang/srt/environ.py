@@ -672,6 +672,9 @@ class Envs:
     SGLANG_QSA_UNION_PREFILL_MIN_ROWS = EnvInt(1024)
     SGLANG_QSA_UNION_PREFILL_CHECK_CALLS = EnvInt(0)
     SGLANG_QSA_UNION_PREFILL_RESCALE_LOG2 = EnvFloat(0.0)
+    # Admit Q38_GDN_FRONT=1 (the verify's strided projection views) and Q38_GDN_PDL=1 (inert
+    # there) with --enable-gdn-replayssm-ucache.
+    SGLANG_ENABLE_GDN_UCACHE_FRONT = EnvBool(False)
 
     # ===================================================================
     # Model configuration, discovery, and weight loading

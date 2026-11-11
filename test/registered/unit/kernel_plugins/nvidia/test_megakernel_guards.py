@@ -15,7 +15,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _fakes import ARCH, ISA, server_args  # noqa: E402
+from _fakes import ARCH, ISA, SPEC, server_args  # noqa: E402
 
 register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
 
@@ -50,6 +50,25 @@ class TestMegakernelGuards(CustomTestCase):
 
         self.assertTrue(tp_reasons("_fakes:SPEC"))
         self.assertEqual(tp_reasons("_fakes:ANY_TP"), [])
+
+    def test_the_ucache_verify_refuses_only_a_spec_running_whole_forwards(self):
+        hf_config = SimpleNamespace(architectures=[ARCH], model_type="fake")
+
+        def ucache_reasons(path, enabled):
+            registry._REGISTRY.clear()
+            registry.register(architecture=ARCH, path=path)
+            _, reasons = megakernel_disable_reasons(
+                cfg=server_args(enable_gdn_replayssm_ucache=enabled),
+                hf_config=hf_config,
+                isa=ISA,
+            )
+            return [r for r in reasons if "--enable-gdn-replayssm-ucache" in r]
+
+        self.assertGreater(SPEC.max_rows, 0)
+        self.assertTrue(ucache_reasons("_fakes:SPEC", True))
+        self.assertEqual(ucache_reasons("_fakes:SPEC", False), [])
+        # max_rows=0: no whole forward, the model's GDN verify stays the u-cache's
+        self.assertEqual(ucache_reasons("_fakes:DRAFT", True), [])
 
 
 if __name__ == "__main__":

@@ -1120,6 +1120,12 @@ def megakernel_disable_reasons(
         for what, value, want in exactly
         if value != want
     ]
+    if cfg.enable_gdn_replayssm_ucache and spec.max_rows > 0:
+        # A numeric-only spec keeps the model forward, whose GDN verify is the u-cache's.
+        reasons.append(
+            f"--enable-gdn-replayssm-ucache is set and {spec.name} runs whole "
+            "forwards, whose verify step reads the GDN pool without the u-cache rings"
+        )
     watchdog = cfg.watchdog_timeout
     if watchdog and deadline_s(watchdog) < MIN_DEADLINE_S:
         reasons.append(
