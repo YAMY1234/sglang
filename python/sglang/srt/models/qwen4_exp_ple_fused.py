@@ -15,6 +15,14 @@ copies of the same columns, and SiLU stays the caller's ``F.silu``. Passes stock
 cuDNN (not 32-bit indexable), non-EXTEND/MIXED passes, stream capture, non-CUDA tensors
 and host lengths that disagree with the pass keep the stock code.
 
+``SGLANG_OPT_PLE_FUSED_EXTEND_CONV_CUDNN_SHAPES`` (opt-in, only with the switch above) also
+fuses the cuDNN-shape passes holding at most 16 sequences with the longest at most 32768
+tokens. Stock there materializes the padded input three times (22.8 GiB for 15 sequences
+with a 26,606-token longest at C 10240). Over that envelope the original branch measured
+cuDNN's conv (``conv2d_grouped_direct_kernel``, torch 2.15.0+cu134 / cuDNN 9.26) byte-equal
+to the native kernel's tap order on crafted tap-order, random, signed-zero and subnormal
+data; other torch / cuDNN builds are not covered by that measurement.
+
 One INFO line is logged the first time it engages and one per decline reason.
 """
 
@@ -27,6 +35,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
+
 logger = logging.getLogger(__name__)
 
 # ATen canUse32BitIndexMath on a contiguous tensor: numel < INT32_MAX.
@@ -34,8 +44,16 @@ _INT32_MAX = 2**31 - 1
 _MAX_STATE_LEN = 16
 # BLOCK_T, BLOCK_C, warps of the conv kernel (measured on VR200 by the original branch).
 _CONV_TILE = (16, 256, 4)
+# The cuDNN-shape envelope whose stock bytes were measured equal to the forward tap order.
+_CUDNN_SHAPES_MAX_SEQS = 16
+_CUDNN_SHAPES_MAX_ROW = 32768
 
-STATS = {"conv_fused": 0, "conv_declined": 0, "conv_stock_cudnn_shape": 0}
+STATS = {
+    "conv_fused": 0,
+    "conv_declined": 0,
+    "conv_stock_cudnn_shape": 0,
+    "conv_fused_cudnn_shape": 0,
+}
 _noted = set()
 
 
@@ -118,16 +136,43 @@ def conv_engages(
         )
         return False
     if not native_depthwise(num_seqs, channels, state_len + batch.row_width):
-        STATS["conv_stock_cudnn_shape"] += 1
+        if not envs.SGLANG_OPT_PLE_FUSED_EXTEND_CONV_CUDNN_SHAPES.get():
+            STATS["conv_stock_cudnn_shape"] += 1
+            _note_once(
+                "conv-cudnn",
+                "PLE fused extend conv kept stock for a pass stock F.conv1d hands to "
+                "cuDNN (seqs=%d tokens=%d longest=%d); later such passes are counted only",
+                num_seqs,
+                tokens,
+                batch.row_width,
+            )
+            return False
+        if num_seqs > _CUDNN_SHAPES_MAX_SEQS or batch.row_width > _CUDNN_SHAPES_MAX_ROW:
+            STATS["conv_stock_cudnn_shape"] += 1
+            _note_once(
+                "conv-cudnn-outside",
+                "PLE fused extend conv kept stock for a pass stock F.conv1d hands to "
+                "cuDNN outside the envelope (seqs=%d tokens=%d longest=%d; envelope "
+                "seqs <= %d, longest <= %d); later such passes are counted only",
+                num_seqs,
+                tokens,
+                batch.row_width,
+                _CUDNN_SHAPES_MAX_SEQS,
+                _CUDNN_SHAPES_MAX_ROW,
+            )
+            return False
+        STATS["conv_fused_cudnn_shape"] += 1
         _note_once(
-            "conv-cudnn",
-            "PLE fused extend conv kept stock for a pass stock F.conv1d hands to cuDNN "
-            "(seqs=%d tokens=%d longest=%d); later such passes are counted only",
+            "conv-cudnn-fused",
+            "PLE fused extend conv fused a pass stock F.conv1d hands to cuDNN "
+            "(SGLANG_OPT_PLE_FUSED_EXTEND_CONV_CUDNN_SHAPES; seqs=%d tokens=%d "
+            "longest=%d; stock's padded temporaries about %.2f GiB); later such passes "
+            "are counted only",
             num_seqs,
             tokens,
             batch.row_width,
+            num_seqs * (3 * batch.row_width + state_len) * channels * 2 / 2**30,
         )
-        return False
     STATS["conv_fused"] += 1
     _note_once(
         "conv-on",

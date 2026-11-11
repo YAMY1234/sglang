@@ -549,6 +549,10 @@ class Envs:
     # Under PD: set on both roles; the decode role runs the u-cache verify, the prefill role
     # keeps the fp16 GDN state its transfers carry.
     SGLANG_OPT_GDN_UCACHE_PD = EnvRuntimeBool(False)
+    # With SGLANG_OPT_PLE_FUSED_EXTEND_CONV: also fuse the passes stock hands to cuDNN, up to
+    # 16 sequences with the longest at most 32768 tokens (opt-in: byte equality to cuDNN was
+    # measured on one torch / cuDNN build).
+    SGLANG_OPT_PLE_FUSED_EXTEND_CONV_CUDNN_SHAPES = EnvRuntimeBool(False)
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
