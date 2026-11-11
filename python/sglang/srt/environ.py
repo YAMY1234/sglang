@@ -327,6 +327,8 @@ class Envs:
     SGLANG_QSA_PREFILL_FAST_SELECT_WIDE_MIN_KEYS = EnvInt(24576)
     # TP1 target verify on an FP8 KV pool: one union attention launch per layer.
     SGLANG_QSA_FP8_POOL_VERIFY = EnvBool(False)
+    # Its token-union pass's warp count (1, 2, 4, 8, 16 or 32; the output does not depend on it).
+    SGLANG_QSA_FP8_POOL_VERIFY_UNION_WARPS = EnvInt(8)
     # TP1 prefix-chunk prefill attention with TMA-gathered K/V on the stock tile.
     SGLANG_ENABLE_QSA_TMA_PREFILL = EnvBool(False)
     SGLANG_QSA_TMA_PREFILL_STAGES = EnvInt(3)

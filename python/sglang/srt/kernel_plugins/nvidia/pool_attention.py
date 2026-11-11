@@ -50,7 +50,7 @@ def pool_signatures(
     ]
     if envs.SGLANG_QSA_FP8_POOL_VERIFY.get():
         # The FP8 union serves width-4 target verify only.
-        routes.append((NumericOperation.POOL_UNION_ATTENTION, 0, 4))
+        routes.append((NumericOperation.POOL_UNION_ATTENTION, union_variant(), 4))
     return tuple(
         signature
         for rows in widths
@@ -73,6 +73,18 @@ def pool_signatures(
             tp_size=tp_size,
         )
     )
+
+
+def union_variant():
+    """POOL_UNION_ATTENTION's source options: bits 0-5 = the token-union pass's warp
+    count (0 for the source's 8)."""
+    warps = envs.SGLANG_QSA_FP8_POOL_VERIFY_UNION_WARPS.get()
+    if warps not in (1, 2, 4, 8, 16, 32):
+        raise ValueError(
+            "SGLANG_QSA_FP8_POOL_VERIFY_UNION_WARPS must be 1, 2, 4, 8, 16 or 32, "
+            f"got {warps}"
+        )
+    return 0 if warps == 8 else warps
 
 
 @lru_cache(maxsize=None)

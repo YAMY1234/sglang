@@ -1552,6 +1552,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             pool_decode_enabled,
             pool_device_sms,
             pool_scratch_elements,
+            union_variant,
             union_workspace,
         )
 
@@ -1659,7 +1660,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 indices.shape[1],
                 self.compress_ratio,
                 ScalarType.BF16,
-                variant=0 if union else variant,
+                variant=union_variant() if union else variant,
             ),
             prepared=True,
         )

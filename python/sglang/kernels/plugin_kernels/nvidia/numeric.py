@@ -95,7 +95,8 @@ class NumericSignature:
     # Sparse score: 0=MK, 3=MK short32, 4=grouped V7/W4 defaults,
     # 5=per-row defaults, 6=grouped4 chain, 7=grouped4 chain with a two-stage
     # key pipeline. Sparse select: 0=MK, 1=split defaults, 2=sampled target-verify
-    # top-k (scratch_out: two int32 [rows] views). Prefill select and
+    # top-k (scratch_out: two int32 [rows] views). Pool union attention: bits 0-5 =
+    # the token-union pass's warp count (0 for 8). Prefill select and
     # packed prefill attention: rows is 0 (packed prefill rows vary per call);
     # context_bound bounds a select row's keys, and attention's variant is its
     # key-load pipeline stage count. Prefill select's variant: bits 0-3 = the

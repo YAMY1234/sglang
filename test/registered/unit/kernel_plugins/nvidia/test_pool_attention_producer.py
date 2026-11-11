@@ -547,12 +547,20 @@ def test_fp8_union_declared_only_when_enabled():
     with envs.SGLANG_QSA_FP8_POOL_VERIFY.override(True):
         assert [s.rows for s in union_signatures(widths)] == [64, 128, 576]
         assert all(s.variant == 0 for s in union_signatures(widths))
+        with envs.SGLANG_QSA_FP8_POOL_VERIFY_UNION_WARPS.override(16):
+            assert {s.variant for s in union_signatures(widths)} == {16}
+        with (
+            envs.SGLANG_QSA_FP8_POOL_VERIFY_UNION_WARPS.override(12),
+            pytest.raises(ValueError, match="UNION_WARPS"),
+        ):
+            union_signatures(widths)
         with patch.object(model, "get_parallel", return_value=NS(tp_size=4)):
             assert not union_signatures(widths)
 
 
+@pytest.mark.parametrize("warps", [8, 16])
 @pytest.mark.parametrize("rows", [64, 128, 576])
-def test_fp8_union_caller_buffers_and_source_plan(rows):
+def test_fp8_union_caller_buffers_and_source_plan(rows, warps):
     obj, args = fp8_state(rows)
     seen = []
 
@@ -560,9 +568,14 @@ def test_fp8_union_caller_buffers_and_source_plan(rows):
         seen.append(io)
         io.output.fill_(3)
 
-    with envs.SGLANG_QSA_FP8_POOL_VERIFY.override(True):
+    with (
+        envs.SGLANG_QSA_FP8_POOL_VERIFY.override(True),
+        envs.SGLANG_QSA_FP8_POOL_VERIFY_UNION_WARPS.override(warps),
+    ):
         registry = api.NumericRegistry()
         (signature,) = union_signatures((rows,))
+        # The offer is looked up with the declared variant.
+        assert signature.variant == (0 if warps == 8 else warps)
         registry.register(api.NumericOffer(signature, run))
         with patch.object(numeric_binding, "numeric_registry", registry):
             output = obj._try_numeric_pool_attention(*args)
