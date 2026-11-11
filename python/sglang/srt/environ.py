@@ -532,6 +532,12 @@ class Envs:
     SGLANG_OPT_POST_VERIFY_POOL_PRESIZE = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # HiCache Mamba side-state rows (PLE short-conv / n-gram) of a checkpoint slot are
+    # backed up to the pinned host pool by a stream-ordered kernel instead of blocking copies
+    # (and loaded the same way under SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT); same bytes.
+    SGLANG_OPT_HICACHE_MAMBA_SLOT_STATE_ASYNC = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     # --enable-gdn-replayssm-ucache options below are opt-in children of the master: off
     # unless set, also with the master on (they need the SM107 kernel or change rounding).
     # Size the k / u / g rings and their cursors by request row (request-lifetime scratch,
