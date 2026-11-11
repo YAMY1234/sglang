@@ -329,6 +329,8 @@ class Envs:
     SGLANG_QSA_FP8_POOL_VERIFY = EnvBool(False)
     # Its token-union pass's warp count (1, 2, 4, 8, 16 or 32; the output does not depend on it).
     SGLANG_QSA_FP8_POOL_VERIFY_UNION_WARPS = EnvInt(8)
+    # Its attention kernel warp-specialized (Gluon tcgen05; lazy rescale, not bitwise).
+    SGLANG_QSA_FP8_POOL_VERIFY_WS = EnvBool(False)
     # TP1 prefix-chunk prefill attention with TMA-gathered K/V on the stock tile.
     SGLANG_ENABLE_QSA_TMA_PREFILL = EnvBool(False)
     SGLANG_QSA_TMA_PREFILL_STAGES = EnvInt(3)

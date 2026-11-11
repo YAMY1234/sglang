@@ -549,6 +549,8 @@ def test_fp8_union_declared_only_when_enabled():
         assert all(s.variant == 0 for s in union_signatures(widths))
         with envs.SGLANG_QSA_FP8_POOL_VERIFY_UNION_WARPS.override(16):
             assert {s.variant for s in union_signatures(widths)} == {16}
+            with envs.SGLANG_QSA_FP8_POOL_VERIFY_WS.override(True):
+                assert {s.variant for s in union_signatures(widths)} == {16 | 64}
         with (
             envs.SGLANG_QSA_FP8_POOL_VERIFY_UNION_WARPS.override(12),
             pytest.raises(ValueError, match="UNION_WARPS"),
@@ -558,9 +560,10 @@ def test_fp8_union_declared_only_when_enabled():
             assert not union_signatures(widths)
 
 
+@pytest.mark.parametrize("ws", [False, True])
 @pytest.mark.parametrize("warps", [8, 16])
 @pytest.mark.parametrize("rows", [64, 128, 576])
-def test_fp8_union_caller_buffers_and_source_plan(rows, warps):
+def test_fp8_union_caller_buffers_and_source_plan(rows, warps, ws):
     obj, args = fp8_state(rows)
     seen = []
 
@@ -571,11 +574,12 @@ def test_fp8_union_caller_buffers_and_source_plan(rows, warps):
     with (
         envs.SGLANG_QSA_FP8_POOL_VERIFY.override(True),
         envs.SGLANG_QSA_FP8_POOL_VERIFY_UNION_WARPS.override(warps),
+        envs.SGLANG_QSA_FP8_POOL_VERIFY_WS.override(ws),
     ):
         registry = api.NumericRegistry()
         (signature,) = union_signatures((rows,))
         # The offer is looked up with the declared variant.
-        assert signature.variant == (0 if warps == 8 else warps)
+        assert signature.variant == (0 if warps == 8 else warps) | (64 if ws else 0)
         registry.register(api.NumericOffer(signature, run))
         with patch.object(numeric_binding, "numeric_registry", registry):
             output = obj._try_numeric_pool_attention(*args)
@@ -593,6 +597,7 @@ def test_fp8_union_caller_buffers_and_source_plan(rows, warps):
         query_heads=24,
         selected_count=512,
         compress_ratio=4,
+        variant=signature.variant,
     )
     assert io.split_count == splits
     assert io.integer_scratch_out.dtype == torch.int32
@@ -636,6 +641,28 @@ def test_union_workspace_matches_original_source_plan(requests, sms):
         query_heads=24,
         selected_count=512,
         compress_ratio=4,
+    ) == (
+        splits,
+        requests * (2 * nt + nb + 1) + requests * 4,
+        requests * 2 * splits * qp * (256 + 2),
+    )
+
+
+@pytest.mark.parametrize("sms", [80, 148, 212, 256])
+@pytest.mark.parametrize("requests", [16, 43, 44, 64, 128, 144])
+def test_union_workspace_follows_the_ws_kernel_split_plan(requests, sms):
+    # Literal source choose_ws_splits: the most splits within one wave, at most 4.
+    splits = max(1, min(4, sms // (requests * 2)))
+    nb, nt, qp = 2048, 2048 * 4 + 16, 64
+    assert policy.union_workspace(
+        requests * 4,
+        sms,
+        kv_heads=2,
+        head_dim=256,
+        query_heads=24,
+        selected_count=512,
+        compress_ratio=4,
+        variant=64 | 16,
     ) == (
         splits,
         requests * (2 * nt + nb + 1) + requests * 4,

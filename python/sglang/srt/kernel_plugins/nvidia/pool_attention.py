@@ -75,16 +75,20 @@ def pool_signatures(
     )
 
 
+_UNION_WS = 1 << 6
+
+
 def union_variant():
     """POOL_UNION_ATTENTION's source options: bits 0-5 = the token-union pass's warp
-    count (0 for the source's 8)."""
+    count (0 for the source's 8), bit 6 = the warp-specialized attention kernel."""
     warps = envs.SGLANG_QSA_FP8_POOL_VERIFY_UNION_WARPS.get()
     if warps not in (1, 2, 4, 8, 16, 32):
         raise ValueError(
             "SGLANG_QSA_FP8_POOL_VERIFY_UNION_WARPS must be 1, 2, 4, 8, 16 or 32, "
             f"got {warps}"
         )
-    return 0 if warps == 8 else warps
+    ws = _UNION_WS if envs.SGLANG_QSA_FP8_POOL_VERIFY_WS.get() else 0
+    return (0 if warps == 8 else warps) | ws
 
 
 @lru_cache(maxsize=None)
@@ -110,12 +114,23 @@ def pool_scratch_elements(
 
 
 def union_workspace(
-    rows, sms, *, kv_heads, head_dim, query_heads, selected_count, compress_ratio
+    rows,
+    sms,
+    *,
+    kv_heads,
+    head_dim,
+    query_heads,
+    selected_count,
+    compress_ratio,
+    variant=0,
 ):
     """The source W4 union plan: (splits, INT32 elements, FP32 elements)."""
     requests = rows // 4
     pairs = max(1, requests * kv_heads)
-    if pairs > sms:
+    if variant & _UNION_WS:
+        # The warp-specialized kernel: the most splits that keep one wave, at most 4.
+        splits = max(1, min(4, sms // pairs))
+    elif pairs > sms:
         splits = 2
     else:
         # Least wave-quantized work per CTA, each split charged 10% for its merge.

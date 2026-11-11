@@ -1646,6 +1646,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
         ):
             return None
+        if union:
+            variant = union_variant()
         run = numeric_operator(
             NumericSignature(
                 (
@@ -1660,7 +1662,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 indices.shape[1],
                 self.compress_ratio,
                 ScalarType.BF16,
-                variant=union_variant() if union else variant,
+                variant=variant,
             ),
             prepared=True,
         )
@@ -1683,6 +1685,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 query_heads=layer.tp_q_head_num,
                 selected_count=indices.shape[1],
                 compress_ratio=self.compress_ratio,
+                variant=variant,
             )
             # E4M3 widens to BF16 exactly; the pool carries no K/V scale.
             run(

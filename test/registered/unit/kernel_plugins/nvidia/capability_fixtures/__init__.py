@@ -201,8 +201,8 @@ def contract_geometry(s):
                 (s.query_heads, s.kv_heads, s.head_dim, s.selected_count)
                 == (24, 2, 256, 512)
                 and (s.compress_ratio, s.scalar_type) == (4, 1)
-                # Bits 0-5: the token-union pass's warps (0 = 8).
-                and s.variant in (0, 1, 2, 4, 8, 16, 32)
+                # Bits 0-5: the token-union pass's warps (0 = 8); bit 6: WS kernel.
+                and (s.variant & ~64) in (0, 1, 2, 4, 8, 16, 32)
                 and 64 <= s.rows <= 576
                 and s.rows % 4 == 0
             )
