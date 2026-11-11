@@ -1,3 +1,4 @@
+import logging
 from functools import lru_cache
 from typing import Optional
 
@@ -14,6 +15,16 @@ from sglang.srt.layers.hc_mix_flydsl import (
     weight_cache_key,
 )
 
+logger = logging.getLogger(__name__)
+
+# Extend boundary (SGLANG_OPT_HC_EXTEND_BOUNDARY) build outcome per (hc, hidden, dtype),
+# decided once per process, so every layer agrees on whether its [rows, hc] gate
+# totals are in use; and the row bands that have logged their first use.
+_HC_EXT_BUILT: dict = {}
+_HC_EXT_LOGGED: set = set()
+# Below this the decode paths (side-stream gate, HC macro) own the boundary.
+_HC_EXT_FLOOR_ROWS = 33
+
 
 @lru_cache(None)
 def _hc_gate_stream(device: int) -> torch.cuda.Stream:
@@ -27,6 +38,48 @@ def _hc_mix_wide_max_rows() -> int:
     from sglang.kernels.ops.gemm.hc_mix_splitk import WIDE_MAX_ROWS
 
     return min(envs.SGLANG_HC_MIX_SPLITK_MAX_ROWS.get(), WIDE_MAX_ROWS)
+
+
+def _hc_ext_min_rows() -> int:
+    """Smallest write-back the extend boundary serves; 0 = off."""
+    if not envs.SGLANG_OPT_HC_EXTEND_BOUNDARY.get():
+        return 0
+    return max(_HC_EXT_FLOOR_ROWS, envs.SGLANG_X_HC_EXTEND_MIN_ROWS.get())
+
+
+def _hc_ext_ready(hc_count: int, hidden_size: int, dtype: torch.dtype) -> bool:
+    key = (hc_count, hidden_size, dtype)
+    ready = _HC_EXT_BUILT.get(key)
+    if ready is None:
+        try:
+            from sglang.kernels.ops.elementwise.hc_combine_extend import warmup
+
+            warmup(hc_count, hidden_size, dtype)
+            ready = True
+        except Exception as e:  # keep the stock boundary
+            logger.warning("hc_combine_extend unavailable (%s); stock HC", e)
+            ready = False
+        _HC_EXT_BUILT[key] = ready
+    return ready
+
+
+def _log_hc_ext_once(
+    rows: int, min_rows: int, has_partials: bool, norm: bool, gate: bool
+):
+    band = "prefill" if rows >= 1024 else "verify"
+    if band in _HC_EXT_LOGGED:
+        return
+    _HC_EXT_LOGGED.add(band)
+    logger.info(
+        "HC extend boundary engaged (%s rows): rows=%d min_rows=%d partials=%s "
+        "norm=%s gate=%s (SGLANG_OPT_HC_EXTEND_BOUNDARY)",
+        band,
+        rows,
+        min_rows,
+        has_partials,
+        norm,
+        gate,
+    )
 
 
 class HyperConnectionConfig(msgspec.Struct, frozen=True):
@@ -336,6 +389,7 @@ class GatedResidual(HyperConnectionBase):
             self._mix_flydsl_weight_key = None
 
         self._gate_stream = None
+        self._ext_min_rows = 0
         self._gate_max_rows = envs.SGLANG_HC_GATE_MAX_ROWS.get()
         if self._gate_max_rows not in (1, 4, 16, 32):
             raise ValueError("HC gate max rows must be 1, 4, 16 or 32")
@@ -357,6 +411,23 @@ class GatedResidual(HyperConnectionBase):
                 and vecs % (8 * 160) == 0
                 and (self.hidden_size // 8) % (vecs // 8) == 0
             )
+            # The extend boundary replays grouped_gemma_rmsnorm's Blackwell (32-byte
+            # vector) reduction order; its source refuses to build for other targets.
+            # Built here, before graph capture; a failed build keeps the stock boundary.
+            self._ext_min_rows = _hc_ext_min_rows()
+            if not (
+                self._ext_min_rows
+                and config.hc_per_branch_norm
+                and self.hc_norm._jit_group_size == self.hidden_size
+                and self.hidden_size % 512 == 0
+                and (self.hc_count * self.hidden_size) % 2048 == 0
+                and self.hc_count <= 8
+                and config.params_dtype in (torch.bfloat16, torch.float16)
+                and torch.cuda.is_available()
+                and torch.cuda.get_device_capability()[0] >= 10
+                and _hc_ext_ready(self.hc_count, self.hidden_size, config.params_dtype)
+            ):
+                self._ext_min_rows = 0
 
         def _mix_compute(
             hyper_input_normed: torch.Tensor,
@@ -545,6 +616,90 @@ class GatedResidual(HyperConnectionBase):
             hyper_input_normed.record_stream(stream)
         return mixed_input, (hyper_input, hyper_input_normed, partials)
 
+    def _ext_rows(
+        self,
+        block_output: torch.Tensor,
+        hyper_input: torch.Tensor,
+        hyper_input_normed: torch.Tensor,
+        partials: Optional[torch.Tensor],
+    ) -> bool:
+        """Whether the extend boundary serves this write-back. Its partials are
+        [rows, hc] fp32 gate dot totals, made only by itself."""
+        rows = block_output.shape[0]
+        if not (self._ext_min_rows and rows >= self._ext_min_rows):
+            return False
+        dtype = block_output.dtype
+        if partials is None:
+            partials_ok = (
+                hyper_input_normed.dtype == dtype
+                and hyper_input_normed.shape == hyper_input.shape
+            )
+        else:
+            partials_ok = partials.dtype == torch.float32 and tuple(partials.shape) == (
+                rows,
+                self.hc_count,
+            )
+        return (
+            partials_ok
+            and block_output.dim() == 2
+            and hyper_input.dim() == 2
+            and hyper_input.dtype == dtype
+            and self.block_inject_weight.weight.dtype == dtype
+            and block_output.is_cuda
+            and not torch.compiler.is_compiling()
+        )
+
+    def _combine_extend(
+        self,
+        block_output: torch.Tensor,
+        residuals: tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
+        next_norm: Optional[GroupedGemmaRMSNorm],
+        next_inject_weight: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        from sglang.kernels.ops.elementwise.hc_combine_extend import (
+            hc_combine_extend,
+        )
+
+        hyper_input, hyper_input_normed, partials = residuals
+        dtype = block_output.dtype
+        width = self.hc_count * self.hidden_size
+        if next_norm is not None and not (
+            next_norm.group_size == self.hidden_size
+            and next_norm._jit_group_size == self.hidden_size
+            and next_norm.weight.dtype == dtype
+            and next_norm.weight.numel() == width
+        ):
+            next_norm = None
+        if next_norm is None or (
+            next_inject_weight is not None
+            and (
+                next_inject_weight.dtype != dtype
+                or tuple(next_inject_weight.shape) != (self.hc_count, width)
+            )
+        ):
+            next_inject_weight = None
+        _log_hc_ext_once(
+            block_output.shape[0],
+            self._ext_min_rows,
+            partials is not None,
+            next_norm is not None,
+            next_inject_weight is not None,
+        )
+        return hc_combine_extend(
+            block_output,
+            hyper_input,
+            self.hc_count,
+            self.hidden_size,
+            partials=partials,
+            normed_residual=hyper_input_normed if partials is None else None,
+            inject_weight=(
+                self.block_inject_weight.weight if partials is None else None
+            ),
+            norm_weight=next_norm.weight if next_norm is not None else None,
+            eps=next_norm.variance_epsilon if next_norm is not None else 0.0,
+            next_inject_weight=next_inject_weight,
+        )
+
     def combine_normalize_and_gate(
         self,
         block_output: torch.Tensor,
@@ -557,7 +712,17 @@ class GatedResidual(HyperConnectionBase):
         The two-result stock API remains unchanged. No prepared values cross a
         history update, row redistribution, or pipeline boundary.
         """
-        residual, _, partials = residuals
+        residual, normed, partials = residuals
+        if self._ext_rows(block_output, residual, normed, partials):
+            return self._combine_extend(
+                block_output, residuals, next_norm, next_inject_weight
+            )
+        if partials is not None and partials.dim() == 2:
+            # Extend-boundary gate totals, which the decode kernels ([rows, 8, hc]
+            # partials) cannot read; the gate recomputed from the normalized streams
+            # is the same.
+            partials = None
+            residuals = (residual, normed, None)
         rows = block_output.shape[0]
         if (
             partials is not None
@@ -683,6 +848,11 @@ class GatedResidual(HyperConnectionBase):
         residuals: tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
     ) -> torch.Tensor:
         hyper_input, hyper_input_normed, partials = residuals
+        if self._ext_rows(block_output, hyper_input, hyper_input_normed, partials):
+            return self._combine_extend(block_output, residuals, None, None)[0]
+        if partials is not None and partials.dim() == 2:
+            # Extend-boundary gate totals: recompute from the normalized streams.
+            partials = None
         if partials is not None:
             from sglang.kernels.ops.elementwise.hc_combine_decode import (
                 hc_combine_apply,

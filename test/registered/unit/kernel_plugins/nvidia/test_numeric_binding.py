@@ -610,6 +610,7 @@ class TestLocalHcBoundary(unittest.TestCase):
             combine_and_normalize=lambda *args: (
                 calls.append(args) or (combined, normalized)
             ),
+            _ext_rows=lambda *args: False,
         )
         block = torch.empty((4, 2560), dtype=torch.bfloat16)
         residual = torch.empty((4, 10240), dtype=torch.bfloat16)
@@ -651,6 +652,7 @@ class TestLocalHcBoundary(unittest.TestCase):
             combine_and_normalize=lambda *args: self.fail(
                 "stock must not replay after provider writes"
             ),
+            _ext_rows=lambda *args: False,
         )
         returned = GatedResidual.combine_normalize_and_gate(
             layer,

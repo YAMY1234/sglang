@@ -277,6 +277,118 @@ class TestActualHcAdmission(unittest.TestCase):
                 if calls:
                     self.assertEqual(calls, [(rows, (10240, 128), 4, 2560)])
 
+    def test_extend_boundary_floor_follows_the_switch(self):
+        for master, switch, floor, expected in (
+            (False, "1", 33, 0),
+            (True, "0", 33, 0),
+            (True, "1", 33, 33),
+            (True, "1", 8, 33),
+            (True, "1", 1024, 1024),
+        ):
+            with (
+                self.subTest(master=master, switch=switch, floor=floor),
+                envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(master),
+                envs.SGLANG_OPT_HC_EXTEND_BOUNDARY.override(switch),
+                envs.SGLANG_X_HC_EXTEND_MIN_ROWS.override(floor),
+            ):
+                self.assertEqual(hc._hc_ext_min_rows(), expected)
+
+    def test_extend_boundary_serves_write_backs_from_its_floor(self):
+        from sglang.kernels.ops.elementwise import hc_combine_extend
+
+        calls = []
+
+        def extend(block, residual, hc_count, hidden, **kw):
+            calls.append((block.shape[0], kw))
+            totals = torch.empty((block.shape[0], hc_count), dtype=torch.float32)
+            return residual, residual, totals
+
+        layer = self.layer(hc, combine=True)
+        layer._ext_min_rows = 33
+        norm = self.layer(hc, combine=True)
+        norm.hc_norm.to(torch.bfloat16)
+        for method, rows, expected in (
+            ("combine_normalize_and_gate", 33, True),
+            ("combine_normalize_and_gate", 512, True),
+            ("combine_normalize_and_gate", 32, False),
+            ("combine", 1024, True),
+            ("combine", 32, False),
+        ):
+            with self.subTest(method=method, rows=rows):
+                calls.clear()
+                block = torch.zeros((rows, 2560), dtype=torch.bfloat16).as_subclass(
+                    CudaMetadataTensor
+                )
+                residual = torch.zeros((rows, 10240), dtype=torch.bfloat16)
+                args = (block, (residual, residual, None))
+                if method == "combine_normalize_and_gate":
+                    args += (norm.hc_norm, norm.block_inject_weight.weight)
+                with (
+                    patch.object(hc_combine_extend, "hc_combine_extend", extend),
+                    patch.object(layer, "_numeric_hc_macro", return_value=None),
+                    patch.object(layer, "combine_and_normalize") as stock_norm,
+                    patch.object(layer, "_combine_compute", return_value=residual),
+                ):
+                    layer._jit_combine_ok = False
+                    stock_norm.return_value = (residual, None)
+                    out = getattr(layer, method)(*args)
+                self.assertEqual(bool(calls), expected)
+                if not calls:
+                    continue
+                kw = calls[0][1]
+                self.assertIs(kw["normed_residual"], residual)
+                self.assertIs(kw["inject_weight"], layer.block_inject_weight.weight)
+                if method == "combine":
+                    self.assertIsNone(kw["norm_weight"])
+                    self.assertIs(out, residual)
+                else:
+                    self.assertIs(kw["norm_weight"], norm.hc_norm.weight)
+                    self.assertIs(
+                        kw["next_inject_weight"], norm.block_inject_weight.weight
+                    )
+                    self.assertEqual(tuple(out[2].shape), (rows, 4))
+
+    def test_extend_gate_totals_reach_the_next_extend_or_are_dropped(self):
+        from sglang.kernels.ops.elementwise import hc_combine_extend
+
+        calls = []
+
+        def extend(block, residual, hc_count, hidden, **kw):
+            calls.append(kw)
+            return residual, residual, None
+
+        layer = self.layer(hc, combine=True)
+        norm = self.layer(hc, combine=True)
+        norm.hc_norm.to(torch.bfloat16)
+        for floor, rows in ((33, 64), (128, 64)):
+            with self.subTest(floor=floor):
+                calls.clear()
+                layer._ext_min_rows = floor
+                block = torch.zeros((rows, 2560), dtype=torch.bfloat16).as_subclass(
+                    CudaMetadataTensor
+                )
+                residual = torch.zeros((rows, 10240), dtype=torch.bfloat16)
+                totals = torch.zeros((rows, 4), dtype=torch.float32)
+                with (
+                    patch.object(hc_combine_extend, "hc_combine_extend", extend),
+                    patch.object(layer, "_numeric_hc_macro", return_value=None),
+                    patch.object(layer, "combine_and_normalize") as stock_norm,
+                ):
+                    stock_norm.return_value = (residual, None)
+                    layer.combine_normalize_and_gate(
+                        block,
+                        (residual, residual, totals),
+                        norm.hc_norm,
+                        norm.block_inject_weight.weight,
+                    )
+                if floor <= rows:
+                    self.assertIs(calls[0]["partials"], totals)
+                    self.assertIsNone(calls[0]["normed_residual"])
+                else:
+                    self.assertEqual(calls, [])
+                    passed = stock_norm.call_args.args[1]
+                    self.assertIsNone(passed[2])
+
     def test_current_stream_partials_do_not_wait_none_and_side_stream_still_joins(self):
         from types import SimpleNamespace
 
@@ -293,7 +405,8 @@ class TestActualHcAdmission(unittest.TestCase):
                         partials = SimpleNamespace(
                             record_stream=lambda stream: events.append(
                                 ("record", stream)
-                            )
+                            ),
+                            dim=lambda: 3,
                         )
                         block = torch.empty((4, 2560), dtype=torch.bfloat16)
                         residual = torch.empty((4, 10240), dtype=torch.bfloat16)
@@ -306,6 +419,7 @@ class TestActualHcAdmission(unittest.TestCase):
                             _gate_stream=side_stream,
                             hidden_size=2560,
                             _numeric_hc_macro=lambda rows: object() if macro else None,
+                            _ext_rows=lambda *args: False,
                         )
                         args = (block, (residual, residual, partials)) + (
                             (norm,) if name == "combine_and_normalize" else ()

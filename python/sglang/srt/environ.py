@@ -307,6 +307,15 @@ class Envs:
     # instead of the torch.compile chain's two GEMMs; not bitwise. Read only with the
     # runtime master; 0 keeps the chain.
     SGLANG_HC_MIX_SPLITK_MAX_ROWS = EnvInt(0)
+    # HC write-backs of at least max(33, SGLANG_X_HC_EXTEND_MIN_ROWS) rows run one kernel
+    # (hc_combine_extend) that combines, normalizes the streams for the next read and makes
+    # that read's gate dot totals, in place of hc_combine plus the next grouped_gemma_rmsnorm
+    # (and the next combine's gate dot); same bits. The row floor keeps the original
+    # branch's name.
+    SGLANG_OPT_HC_EXTEND_BOUNDARY = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    SGLANG_X_HC_EXTEND_MIN_ROWS = EnvInt(1024)
     SGLANG_QSA_Q4_SCORE = EnvBool(False)
     SGLANG_QSA_SCORER_V2 = EnvBool(True)
     SGLANG_QSA_SCORER_V2_ROWS = EnvBool(False)
