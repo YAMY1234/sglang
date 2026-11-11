@@ -267,6 +267,7 @@ class QSAIndexer(MultiPlatformOp):
                 self.compress_ratio,
                 ScalarType.BF16,
                 context_bound=capacity,
+                variant=self._prefill_select_variant(),
             )
             if signature_capability_supported(
                 signature,
@@ -279,6 +280,11 @@ class QSAIndexer(MultiPlatformOp):
             self._numeric_score_capacity = capacity
             self._numeric_prepared_sparse = frozenset(declared)
         return declared
+
+    @staticmethod
+    def _prefill_select_variant():
+        """The source fast select's options: bit 4 = the tensor-core scorer."""
+        return 16 if envs.SGLANG_QSA_PREFILL_SCORER_TC.get() else 0
 
     @staticmethod
     def _grouped4_score_variant():
@@ -582,6 +588,7 @@ class QSAIndexer(MultiPlatformOp):
             self.compress_ratio,
             ScalarType.BF16,
             context_bound=capacity,
+            variant=self._prefill_select_variant(),
         )
         if signature not in getattr(self, "_numeric_prepared_sparse", ()):
             return False

@@ -97,7 +97,8 @@ class NumericSignature:
     # key pipeline. Sparse select: 0=MK, 1=split defaults. Prefill select and
     # packed prefill attention: rows is 0 (packed prefill rows vary per call);
     # context_bound bounds a select row's keys, and attention's variant is its
-    # key-load pipeline stage count.
+    # key-load pipeline stage count. Prefill select's variant: bit 4 = the
+    # tensor-core scorer.
     variant: int = 0
     # Grid CTAs per four-row request group of sparse score 6/7; 0 elsewhere.
     ctas_per_group: int = 0

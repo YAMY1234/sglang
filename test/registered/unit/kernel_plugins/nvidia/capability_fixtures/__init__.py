@@ -92,17 +92,21 @@ def contract_geometry(s):
         )
     if s.operation == Op.PREFILL_SELECT:
         return (
-            s.rows,
-            s.query_heads,
-            s.kv_heads,
-            s.head_dim,
-            s.selected_count,
-            s.compress_ratio,
-            s.scalar_type,
-            s.rotary_dim,
-            s.variant,
-            s.ctas_per_group,
-        ) == (0, 4, 1, 128, 512, 4, 1, 0, 0, 0) and 0 < s.context_bound <= 131072
+            (
+                s.rows,
+                s.query_heads,
+                s.kv_heads,
+                s.head_dim,
+                s.selected_count,
+                s.compress_ratio,
+                s.scalar_type,
+                s.rotary_dim,
+                s.ctas_per_group,
+            )
+            == (0, 4, 1, 128, 512, 4, 1, 0, 0)
+            and 0 < s.context_bound <= 131072
+            and s.variant in (0, 16)
+        )
     if isinstance(s, FinalizePermutedSignature):
         # Rows 0 is the one declaration above the graph widths.
         return (

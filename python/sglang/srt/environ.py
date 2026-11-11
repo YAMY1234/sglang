@@ -313,6 +313,9 @@ class Envs:
     # Request-relative QSA prefill: the source's ordered fast select; it requires
     # SGLANG_OPT_QSA_PREFILL_SCALE_FOLD, whose stored scores it reproduces.
     SGLANG_ENABLE_QSA_PREFILL_FAST_SELECT = EnvBool(False)
+    # Its scorer on tensor cores (tl.dot / tcgen05 instead of mma.sync; bitwise is the
+    # hardware's, so opt-in).
+    SGLANG_QSA_PREFILL_SCORER_TC = EnvBool(False)
     # TP1 target verify on an FP8 KV pool: one union attention launch per layer.
     SGLANG_QSA_FP8_POOL_VERIFY = EnvBool(False)
     # TP1 prefix-chunk prefill attention with TMA-gathered K/V on the stock tile.

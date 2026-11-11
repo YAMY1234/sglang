@@ -430,6 +430,27 @@ def test_prefill_select_fills_output_through_provider(rows):
     assert torch.equal(io.row_lengths, torch.full((rows,), 8193, dtype=torch.int32))
 
 
+@pytest.mark.parametrize("tc,variant", [(False, 0), (True, 16)])
+def test_prefill_select_declares_and_calls_the_source_scorer_variant(tc, variant):
+    obj = indexer()
+    seen = []
+
+    def choose(signature, *, prepared):
+        seen.append(signature)
+        return lambda io: None
+
+    with prefill_flags(), envs.SGLANG_QSA_PREFILL_SCORER_TC.override(tc):
+        found = [
+            s
+            for s in obj.numeric_preparation_signatures(8193 * 4, 16)
+            if s.operation == NumericOperation.PREFILL_SELECT
+        ]
+        with patch.object(numeric_binding, "numeric_operator", side_effect=choose):
+            obj.select_prefill_tokens(*prefill_args(33))
+    assert [s.variant for s in found] == [variant]
+    assert seen == found
+
+
 def test_prefill_select_chunk_plan_matches_the_source():
     # Literal source plan_chunk_rows with its 128 MiB budget and 2 * SMs top-k slots.
     def source(rows, width, slots, budget=128 * 1024 * 1024):
