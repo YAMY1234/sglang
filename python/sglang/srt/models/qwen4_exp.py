@@ -99,7 +99,11 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     make_ple_file_prefetcher,
     make_ple_file_rss_trimmer,
 )
-from sglang.srt.runtime_context import get_parallel, linear_attn_parallel_group
+from sglang.srt.runtime_context import (
+    forward_helper_stream_kwargs,
+    get_parallel,
+    linear_attn_parallel_group,
+)
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, logger
 
 _is_cuda = is_cuda()
@@ -1172,7 +1176,9 @@ class Qwen4ExpPLELayer(nn.Module):
         )
         nn.init.zeros_(self.conv1d.weight)
         self._prefetch_stream = (
-            torch.get_device_module().Stream() if config.ple_offload_embedding else None
+            torch.get_device_module().Stream(**forward_helper_stream_kwargs())
+            if config.ple_offload_embedding
+            else None
         )
         self._graph_prefetch_buffers = {}
         self._eager_prefetch_buffer = None

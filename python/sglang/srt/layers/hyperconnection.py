@@ -12,11 +12,12 @@ from sglang.srt.layers.hc_mix_flydsl import (
     flydsl_hc_mix_weights_supported,
     weight_cache_key,
 )
+from sglang.srt.runtime_context import forward_helper_stream_kwargs
 
 
 @lru_cache(None)
 def _hc_gate_stream(device: int) -> torch.cuda.Stream:
-    return torch.cuda.Stream(device=device)
+    return torch.cuda.Stream(device=device, **forward_helper_stream_kwargs())
 
 
 class HyperConnectionConfig(msgspec.Struct, frozen=True):
