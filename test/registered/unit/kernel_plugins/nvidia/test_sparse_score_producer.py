@@ -491,6 +491,60 @@ def test_prefill_select_chunk_plan_matches_the_source():
                 assert impl._fast_select_chunk_rows(rows, width, sms) == source(
                     rows, width, 2 * sms
                 )
+                # The source's wide budget (SGLANG_QSA_PREFILL_FAST_SELECT_WIDE_LOGITS_MB).
+                wide = 256 * 1024 * 1024
+                assert impl._fast_select_chunk_rows(rows, width, sms, wide) == source(
+                    rows, width, 2 * sms, wide
+                )
+
+
+@pytest.mark.parametrize(
+    "mib,keys,variant",
+    [(0, 24576, 0), (256, 24576, 256 << 8 | 96 << 20), (64, 256, 64 << 8 | 1 << 20)],
+)
+def test_prefill_select_declares_the_wide_budget_and_plans_with_it(mib, keys, variant):
+    obj = indexer()
+    plans = []
+    plan = impl._fast_select_chunk_rows
+
+    def record(rows, width, sms, budget):
+        plans.append((width, budget))
+        return plan(rows, width, sms, budget)
+
+    with (
+        prefill_flags(),
+        envs.SGLANG_QSA_PREFILL_FAST_SELECT_WIDE_LOGITS_MB.override(mib),
+        envs.SGLANG_QSA_PREFILL_FAST_SELECT_WIDE_MIN_KEYS.override(keys),
+    ):
+        (found,) = [
+            s
+            for s in obj.numeric_preparation_signatures(30000 * 4, 16)
+            if s.operation == NumericOperation.PREFILL_SELECT
+        ]
+        with (
+            patch.object(
+                numeric_binding, "numeric_operator", return_value=lambda io: None
+            ),
+            patch.object(impl, "_fast_select_chunk_rows", side_effect=record),
+        ):
+            for width in (keys - 1, keys, 30000):
+                obj.select_prefill_tokens(*prefill_args(33, width))
+    assert found.variant == variant
+    stock = 128 << 20
+    wide = (mib << 20) or stock
+    assert plans == [(keys - 1, stock), (keys, wide), (30000, wide)]
+
+
+@pytest.mark.parametrize("mib,keys", [(4096, 24576), (256, 0), (256, 1000)])
+def test_prefill_select_rejects_a_wide_budget_it_cannot_declare(mib, keys):
+    obj = indexer()
+    with (
+        prefill_flags(),
+        envs.SGLANG_QSA_PREFILL_FAST_SELECT_WIDE_LOGITS_MB.override(mib),
+        envs.SGLANG_QSA_PREFILL_FAST_SELECT_WIDE_MIN_KEYS.override(keys),
+        pytest.raises(ValueError, match="WIDE"),
+    ):
+        obj.numeric_preparation_signatures(8193 * 4, 16)
 
 
 @pytest.mark.parametrize(

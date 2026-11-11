@@ -105,7 +105,10 @@ def contract_geometry(s):
             )
             == (0, 4, 1, 128, 512, 4, 1, 0, 0)
             and 0 < s.context_bound <= 131072
-            and s.variant in (0, 1, 16, 17)
+            # Top-k, tensor-core scorer, wide budget (MiB) and its width (x 256).
+            and (s.variant & 0xF) in (0, 1)
+            and not s.variant & ~(0x1F | (0xFFF << 8) | (0x7FF << 20))
+            and bool((s.variant >> 8) & 0xFFF) == bool((s.variant >> 20) & 0x7FF)
         )
     if isinstance(s, FinalizePermutedSignature):
         # Rows 0 is the one declaration above the graph widths.

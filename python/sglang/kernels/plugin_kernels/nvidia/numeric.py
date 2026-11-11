@@ -98,7 +98,9 @@ class NumericSignature:
     # packed prefill attention: rows is 0 (packed prefill rows vary per call);
     # context_bound bounds a select row's keys, and attention's variant is its
     # key-load pipeline stage count. Prefill select's variant: bits 0-3 = the
-    # top-k (0 sampled, 1 one-pass), bit 4 = the tensor-core scorer.
+    # top-k (0 sampled, 1 one-pass), bit 4 = the tensor-core scorer, bits 8-19 =
+    # a wide logits budget in MiB (0: none) and bits 20-30 = the call width from
+    # which it applies, in 256-key units; the caller's chunk plan follows it.
     variant: int = 0
     # Grid CTAs per four-row request group of sparse score 6/7; 0 elsewhere.
     ctas_per_group: int = 0

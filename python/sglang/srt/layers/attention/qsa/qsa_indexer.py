@@ -49,10 +49,21 @@ _QSA_PREFILL_LOGITS_BUDGET_BYTES = 128 * 1024 * 1024
 _FAST_SELECT_TOPK = {"sampled": 0, "onepass": 1}
 
 
-def _fast_select_chunk_rows(rows: int, width: int, sms: int) -> int:
-    """The source fast-select plan: stock's logits budget in 32-row blocks,
+def _fast_select_logits_budget(width: int, variant: int) -> int:
+    """The source budget rule the variant declares: its wide budget (bits 8-19, MiB)
+    for calls at least bits 20-30 (x 256 keys) wide, else stock's."""
+    wide_mib = variant >> 8 & 0xFFF
+    if wide_mib and width >= (variant >> 20 & 0x7FF) * 256:
+        return wide_mib << 20
+    return _QSA_PREFILL_LOGITS_BUDGET_BYTES
+
+
+def _fast_select_chunk_rows(
+    rows: int, width: int, sms: int, budget: int = _QSA_PREFILL_LOGITS_BUDGET_BYTES
+) -> int:
+    """The source fast-select plan: the logits budget in 32-row blocks,
     rounded down to whole top-k waves of 2 * sms rows."""
-    max_rows = max(32, _QSA_PREFILL_LOGITS_BUDGET_BYTES // (width * 4))
+    max_rows = max(32, budget // (width * 4))
     max_rows = max(32, max_rows // 32 * 32)
     if rows <= max_rows:
         return rows
@@ -288,15 +299,28 @@ class QSAIndexer(MultiPlatformOp):
     @staticmethod
     def _prefill_select_variant():
         """The source fast select's options: bits 0-3 = the top-k (0 sampled,
-        1 one-pass), bit 4 = the tensor-core scorer."""
+        1 one-pass), bit 4 = the tensor-core scorer, bits 8-19 / 20-30 = the wide
+        logits budget (MiB) and the width it starts at (256-key units)."""
         topk = envs.SGLANG_QSA_PREFILL_FAST_SELECT_TOPK.get()
         if topk not in _FAST_SELECT_TOPK:
             raise ValueError(
                 "SGLANG_QSA_PREFILL_FAST_SELECT_TOPK must be one of "
                 f"{tuple(_FAST_SELECT_TOPK)}, got {topk!r}"
             )
-        scorer = 16 if envs.SGLANG_QSA_PREFILL_SCORER_TC.get() else 0
-        return _FAST_SELECT_TOPK[topk] | scorer
+        variant = _FAST_SELECT_TOPK[topk]
+        if envs.SGLANG_QSA_PREFILL_SCORER_TC.get():
+            variant |= 16
+        wide_mib = envs.SGLANG_QSA_PREFILL_FAST_SELECT_WIDE_LOGITS_MB.get()
+        if wide_mib:
+            keys = envs.SGLANG_QSA_PREFILL_FAST_SELECT_WIDE_MIN_KEYS.get()
+            if not (0 < wide_mib < 4096 and 0 < keys < 2048 * 256 and keys % 256 == 0):
+                raise ValueError(
+                    "SGLANG_QSA_PREFILL_FAST_SELECT_WIDE_LOGITS_MB must be in "
+                    "[0, 4096) and SGLANG_QSA_PREFILL_FAST_SELECT_WIDE_MIN_KEYS a "
+                    f"positive multiple of 256 below 524288; got {wide_mib}, {keys}"
+                )
+            variant |= wide_mib << 8 | keys // 256 << 20
+        return variant
 
     @staticmethod
     def _grouped4_score_variant():
@@ -604,12 +628,13 @@ class QSAIndexer(MultiPlatformOp):
         )
         if signature not in getattr(self, "_numeric_prepared_sparse", ()):
             return False
+        budget = _fast_select_logits_budget(width, signature.variant)
         run = numeric_operator(signature, prepared=True)
         if run is None:
             return False
         rows = q.shape[0]
         sms = pool_device_sms(q.device)
-        chunk = _fast_select_chunk_rows(rows, width, sms)
+        chunk = _fast_select_chunk_rows(rows, width, sms, budget)
         padded = (chunk + 31) // 32 * 32
         starts, ends, positions, lengths = (
             t.to(device=q.device, dtype=torch.int32).contiguous()
