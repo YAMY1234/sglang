@@ -169,7 +169,12 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
 )
-from sglang.srt.utils import ceil_align, is_npu, rank_consensus_checker
+from sglang.srt.utils import (
+    ceil_align,
+    is_npu,
+    rank_consensus_checker,
+    scheduler_affinity,
+)
 from sglang.srt.utils.device import async_h2d
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -4089,7 +4094,7 @@ class SchedulerDisaggregationDecodeMixin:
 
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
-        self._start_overlap_host_loop()
+        pinned = self._start_overlap_host_loop()
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
         defer_prealloc = (
@@ -4157,6 +4162,8 @@ class SchedulerDisaggregationDecodeMixin:
                     pop_and_process()
             elif batch is None:
                 self.on_idle()
+                if pinned:
+                    scheduler_affinity.maybe_repin()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
