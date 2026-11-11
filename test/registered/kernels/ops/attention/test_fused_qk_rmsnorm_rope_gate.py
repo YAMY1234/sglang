@@ -190,6 +190,89 @@ class TestFusedQKRMSNormRoPEGate(CustomTestCase):
                 with self.assertRaises(AssertionError):
                     self.call(positions, mrope_axis_map=axis_map_passed)
 
+    def test_rows_path_is_bitwise_the_stock_kernel(self):
+        """SGLANG_OPT_FUSED_QK_NORM_ROPE_ROWS: the row-tiled programs write the stock
+        kernel's bits (the covered BF16 head 256 / rotary 64 gated shape)."""
+        from sglang.kernels.ops.attention import fused_qk_rmsnorm_rope_gate_rows as rows
+        from sglang.srt.environ import envs
+
+        if not rows._HAS_GLUON or torch.cuda.get_device_capability()[0] < 10:
+            self.skipTest("needs Gluon on SM100+")
+        tokens, q_heads, kv_heads, dim, rot = 1031, 6, 1, 256, 64
+        q_gate = torch.randn(tokens, q_heads * 2 * dim, device="cuda").bfloat16()
+        k = torch.randn(tokens, kv_heads * dim, device="cuda").bfloat16()
+        q_weight = torch.randn(dim, device="cuda").bfloat16()
+        k_weight = torch.randn(dim, device="cuda").bfloat16()
+        rope = self.build_mrope([11, 11, 10], interleaved=True)
+        flat = torch.randint(0, 512, (tokens,), device="cuda")
+        cases = (
+            (flat, self.cos_sin_cache, None),
+            (
+                torch.stack([flat, flat % 7, flat % 5]),
+                rope.cos_sin_cache,
+                rope.axis_map,
+            ),
+        )
+        for positions, cache, axis_map in cases:
+            outputs = []
+            for enabled in (False, True):
+                with (
+                    envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+                    envs.SGLANG_OPT_FUSED_QK_NORM_ROPE_ROWS.override(enabled),
+                ):
+                    self.assertEqual(
+                        rows.applies(q_gate, k, positions, tokens, dim, rot, True),
+                        enabled,
+                    )
+                    outputs.append(
+                        fused_qk_gemma_rmsnorm_rope_gate(
+                            q_gate,
+                            k,
+                            q_weight,
+                            k_weight,
+                            cache,
+                            positions,
+                            self.eps,
+                            q_heads,
+                            kv_heads,
+                            dim,
+                            rot,
+                            has_gate=True,
+                            mrope_axis_map=axis_map,
+                        )
+                    )
+            for stock, fused in zip(*outputs):
+                self.assertTrue(
+                    torch.equal(stock.view(torch.int16), fused.view(torch.int16))
+                )
+
+    def test_rows_path_keeps_small_or_uncovered_calls_on_the_stock_kernel(self):
+        from sglang.kernels.ops.attention import fused_qk_rmsnorm_rope_gate_rows as rows
+        from sglang.srt.environ import envs
+
+        q_gate = torch.zeros(2048, 6 * 512, device="cuda", dtype=torch.bfloat16)
+        k = torch.zeros(2048, 256, device="cuda", dtype=torch.bfloat16)
+        positions = torch.zeros(2048, device="cuda", dtype=torch.int64)
+        with (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+            envs.SGLANG_OPT_FUSED_QK_NORM_ROPE_ROWS.override(True),
+        ):
+            gluon = rows._HAS_GLUON
+            self.assertEqual(
+                rows.applies(q_gate, k, positions, 2048, 256, 64, True), gluon
+            )
+            self.assertFalse(rows.applies(q_gate, k, positions, 1023, 256, 64, True))
+            self.assertFalse(rows.applies(q_gate, k, positions, 2048, 128, 64, True))
+            self.assertFalse(rows.applies(q_gate, k, positions, 2048, 256, 64, False))
+            self.assertFalse(
+                rows.applies(q_gate.half(), k, positions, 2048, 256, 64, True)
+            )
+        with (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(False),
+            envs.SGLANG_OPT_FUSED_QK_NORM_ROPE_ROWS.override(True),
+        ):
+            self.assertFalse(rows.applies(q_gate, k, positions, 2048, 256, 64, True))
+
 
 if __name__ == "__main__":
     unittest.main()

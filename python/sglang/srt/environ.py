@@ -536,6 +536,13 @@ class Envs:
     SGLANG_OPT_MROPE_TEXT_DEVICE_POSITIONS = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # Prefill-sized fused QK GemmaRMSNorm + RoPE + gate calls (BF16, head 256 / rotary 64)
+    # as row-tiled Gluon programs. Opt-in: bitwise to the stock kernel only as one Triton
+    # compiles its FMA contraction; ..._CHECK_CALLS compares the first eager calls.
+    SGLANG_OPT_FUSED_QK_NORM_ROPE_ROWS = EnvRuntimeBool(False)
+    SGLANG_FUSED_QK_NORM_ROPE_ROWS_MIN_TOKENS = EnvInt(1024)
+    SGLANG_FUSED_QK_NORM_ROPE_ROWS_ROWS = EnvInt(16)
+    SGLANG_FUSED_QK_NORM_ROPE_ROWS_CHECK_CALLS = EnvInt(0)
     # The EAGLE post-verify graph pool's first capture takes the sampling scratch of the
     # largest decode-graph batch and frees it, so later batch sizes split that segment
     # instead of each adding one the private pool keeps.
