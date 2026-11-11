@@ -571,6 +571,11 @@ class Envs:
     # 16 sequences with the longest at most 32768 tokens (opt-in: byte equality to cuDNN was
     # measured on one torch / cuDNN build).
     SGLANG_OPT_PLE_FUSED_EXTEND_CONV_CUDNN_SHAPES = EnvRuntimeBool(False)
+    # HiCache write_back: when a session's next request arrives, rank its finished
+    # sub-agent sessions' nodes first for host eviction (needs requests'
+    # parent_session_id and a Rust TreeCore built with the cache-residency bindings,
+    # so it is opt-in).
+    SGLANG_OPT_HICACHE_SUBAGENT_HOST_EVICT_FIRST = EnvRuntimeBool(False)
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
@@ -1201,6 +1206,8 @@ class Envs:
     # (transfer_mamba_split.cuh, same bytes); None keeps the stock kernel.
     SGLANG_HICACHE_MAMBA_LOAD_BLOCK_QUOTA = EnvInt(None)
     SGLANG_HICACHE_MAMBA_BACKUP_BLOCK_QUOTA = EnvInt(None)
+    # Seconds between cumulative cache-residency counter log lines; 0 disables them.
+    SGLANG_HICACHE_RESIDENCY_LOG_INTERVAL = EnvInt(300)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
