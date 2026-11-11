@@ -24,6 +24,9 @@ BT_LIST = [8, 16, 32, 64, 128]
 _L2NORM_RETILE = envs.SGLANG_OPT_GDN_PREFILL_L2NORM_RETILE.get()
 L2NORM_RETILE_MIN_ROWS = 16384
 L2NORM_RETILE_CFG = (64, 8)  # (BT, num_warps)
+# SGLANG_OPT_GDN_PREFILL_QK_L2NORM_ONE_LAUNCH: q and k stored back to back in one buffer
+# (the split GDN prefill conv's planes) are normalized by one l2norm_fwd launch.
+_QK_L2NORM_ONE_LAUNCH = envs.SGLANG_OPT_GDN_PREFILL_QK_L2NORM_ONE_LAUNCH.get()
 
 
 # @triton.autotune(
@@ -232,6 +235,15 @@ def gdn_prefill_qkv_prepare_kernel(
         tl.store(v_output_block, v_values, mask=m_x)
 
 
+def _qk_adjacent(q: torch.Tensor, k: torch.Tensor) -> bool:
+    """Contiguous k starts where contiguous q ends, in the same storage."""
+    return (
+        q.numel() > 0
+        and k.data_ptr() == q.data_ptr() + q.numel() * q.element_size()
+        and q.untyped_storage().data_ptr() == k.untyped_storage().data_ptr()
+    )
+
+
 def gdn_prefill_qkv_prepare_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -260,6 +272,12 @@ def gdn_prefill_qkv_prepare_fwd(
     if D > 512:
         raise ValueError(f"GDN fused prepare supports head dim <= 512, got {D}")
     if q.is_contiguous() and k.is_contiguous() and v.is_contiguous():
+        if _QK_L2NORM_ONE_LAUNCH and _qk_adjacent(q, k):
+            # Rows are normalized independently: one launch over q's and k's rows.
+            qk = torch.as_strided(q, (2 * T * H_QK, D), (D, 1))
+            y = l2norm_fwd(qk, eps).view(-1)
+            n = q.numel()
+            return y[:n].view(q.shape), y[n:].view(k.shape), v
         return l2norm_fwd(q, eps), l2norm_fwd(k, eps), v
 
     q_out = torch.empty(q.shape, dtype=q.dtype, device=q.device)

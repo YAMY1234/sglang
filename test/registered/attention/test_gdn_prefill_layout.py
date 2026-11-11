@@ -70,6 +70,16 @@ class TestGdnPrefillLaunchChoice(unittest.TestCase):
             self.assertEqual(l2norm_mod._l2norm_launch_cfg(16384, 256, None), (16, 8))
             self.assertEqual(l2norm_mod._l2norm_launch_cfg(16384, 128, None), (64, 8))
 
+    def test_qk_one_launch_needs_k_right_after_q(self):
+        buf = torch.zeros(3 * 4 * 2 * 8)
+        q = buf[:64].view(4, 2, 8)
+        self.assertTrue(l2norm_mod._qk_adjacent(q, buf[64:128].view(4, 2, 8)))
+        self.assertFalse(l2norm_mod._qk_adjacent(q, buf[128:].view(4, 2, 8)))
+        self.assertFalse(l2norm_mod._qk_adjacent(q, torch.zeros(4, 2, 8)))
+        self.assertFalse(
+            l2norm_mod._qk_adjacent(buf[:0].view(0, 2, 8), buf[:0].view(0, 2, 8))
+        )
+
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestGdnPrefillLayout(unittest.TestCase):
@@ -291,6 +301,23 @@ class TestGdnPrefillLayout(unittest.TestCase):
                     rtol=0,
                     atol=0,
                 )
+
+    def test_qk_one_launch_matches_two_launches(self):
+        q_dim = self.NUM_QK_HEADS * self.HEAD_DIM
+        v_dim = self.NUM_V_HEADS * self.HEAD_DIM
+        flat = torch.randn(
+            self.TOKENS * (2 * q_dim + v_dim), dtype=torch.bfloat16, device="cuda"
+        )
+        shape = (self.TOKENS, self.NUM_QK_HEADS, self.HEAD_DIM)
+        n = self.TOKENS * q_dim
+        q, k = flat[:n].view(shape), flat[n : 2 * n].view(shape)
+        v = flat[2 * n :].view(self.TOKENS, self.NUM_V_HEADS, self.HEAD_DIM)
+        with mock.patch.object(l2norm_mod, "_QK_L2NORM_ONE_LAUNCH", True):
+            q_out, k_out, v_out = gdn_prefill_qkv_prepare_fwd(q, k, v)
+        self.assertEqual(k_out.data_ptr(), q_out.data_ptr() + n * q.element_size())
+        torch.testing.assert_close(q_out, l2norm_fwd(q), rtol=0, atol=0)
+        torch.testing.assert_close(k_out, l2norm_fwd(k), rtol=0, atol=0)
+        self.assertEqual(v_out.data_ptr(), v.data_ptr())
 
 
 if __name__ == "__main__":
