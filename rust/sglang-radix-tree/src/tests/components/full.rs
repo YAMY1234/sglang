@@ -639,6 +639,133 @@ fn host_walk_setup(tc: &mut UnifiedTreeCore<Vec<i64>>) -> (NodeIdx_, NodeIdx_, N
     (nodes[0], nodes[1], nodes[2])
 }
 
+fn host_peek_branch(tc: &mut UnifiedTreeCore<Vec<i64>>) -> (NodeIdx_, NodeIdx_, NodeIdx_) {
+    let root = tc.arena.root();
+    let parent = tc.arena.alloc_child(root, vec![100], 0, None).unwrap();
+    let a = tc.arena.alloc_child(parent, vec![2], 0, None).unwrap();
+    let b = tc.arena.alloc_child(parent, vec![3], 0, None).unwrap();
+    for (id, tick) in [(parent, 5), (a, 10), (b, 20)] {
+        tc.arena
+            .set_host_value(id, FULL, Tensor::from_slice(&[tick]));
+        tc.arena.node_mut(id).last_access_counter = tick;
+        tc.arena.node_mut(id).hash_value = Some(vec![format!("hash-{tick}")]);
+    }
+    tc.evictable_host_leaves.add(a);
+    tc.evictable_host_leaves.add(b);
+    (parent, a, b)
+}
+
+#[test]
+fn host_peek_is_read_only_and_copies_hashes() {
+    let mut tc = core();
+    let (parent, a, b) = host_peek_branch(&mut tc);
+    let leaves: Vec<_> = tc.evictable_host_leaves.iter().collect();
+    let mut preview = tc.peek_host_eviction_candidates(FULL, 100);
+    // The parent (tick 5) is colder than both children but only becomes a
+    // candidate once the walk has taken them.
+    assert_eq!(
+        preview.iter().map(|x| x.0).collect::<Vec<_>>(),
+        [a, b, parent].map(|id| tc.arena.node(id).id)
+    );
+    assert_eq!(tc.arena.len(), 4);
+    assert_eq!(tc.evictable_host_leaves.iter().collect::<Vec<_>>(), leaves);
+    assert_eq!(tc.arena.node(parent).children.len(), 2);
+    for id in [parent, a, b] {
+        assert!(tc.arena.node(id).has_host_value(FULL));
+        assert_eq!(tc.arena.node(id).host_lock_ref(FULL), 0);
+    }
+    preview[0].2.as_mut().unwrap()[0] = "external mutation".to_owned();
+    assert_eq!(tc.arena.node(a).hash_value.as_ref().unwrap()[0], "hash-10");
+    assert_eq!(tc.peek_host_eviction_candidates(FULL, 100).len(), 3);
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn host_peek_zero_budget_other_component_and_empty_tree() {
+    let mut tc = core();
+    assert!(tc.peek_host_eviction_candidates(FULL, 100).is_empty());
+    host_walk_setup(&mut tc);
+    assert!(tc.peek_host_eviction_candidates(FULL, 0).is_empty());
+    assert!(
+        tc.peek_host_eviction_candidates(crate::components::MAMBA, 100)
+            .is_empty()
+    );
+}
+
+#[test]
+fn host_peek_matches_real_cascade_for_every_policy() {
+    for policy in [
+        "lru", "lfu", "fifo", "mru", "filo", "priority", "slru", "tlru",
+    ] {
+        let mut tc = UnifiedTreeCore::new(
+            CacheInitParams {
+                eviction_policy: policy.to_owned(),
+                ..Default::default()
+            },
+            vec![FULL],
+        );
+        host_peek_branch(&mut tc);
+        let (a, b, c) = host_walk_setup(&mut tc);
+        // Make policy ordering and ties differ from arena allocation order.
+        tc.arena.node_mut(a).hit_count = 9;
+        tc.arena.node_mut(b).priority = 7;
+        tc.arena.node_mut(c).creation_counter = 3;
+        let preview = tc.peek_host_eviction_candidates(FULL, usize::MAX);
+        assert_eq!(preview.len(), 6, "{policy}");
+        for (handle, tokens, _) in preview {
+            let id = tc.arena.resolve(handle).unwrap();
+            let expected = tc.arena.node(id).host_value(FULL).copy();
+            let result = tc.drive_host_eviction(FULL, tokens);
+            assert_eq!(result.tracker[&FULL], tokens, "{policy}");
+            assert_eq!(result.host_frees[&FULL].len(), 1, "{policy}");
+            assert!(result.host_frees[&FULL][0].equal(&expected), "{policy}");
+            assert!(tc.arena.resolve(handle).is_err(), "{policy}");
+        }
+        assert_eq!(tc.arena.len(), 1, "{policy}");
+    }
+}
+
+#[test]
+fn host_peek_stops_after_whole_leaf_overshoots_budget() {
+    let mut tc = core();
+    let root = tc.arena.root();
+    let id = tc.arena.alloc_child(root, vec![1, 2, 3], 0, None).unwrap();
+    tc.arena
+        .set_host_value(id, FULL, Tensor::from_slice(&[10i64, 11, 12]));
+    tc.evictable_host_leaves.add(id);
+    let preview = tc.peek_host_eviction_candidates(FULL, 2);
+    assert_eq!(preview, vec![(tc.arena.node(id).id, 3, None)]);
+    assert_eq!(tc.arena.node(id).host_value_len(FULL), 3);
+}
+
+#[test]
+fn host_peek_parent_must_satisfy_every_non_child_leaf_predicate() {
+    for blocked in 0..5 {
+        let mut tc = core();
+        let (parent, a, b) = host_peek_branch(&mut tc);
+        match blocked {
+            0 => tc.arena.node_mut(parent).inc_host_lock_ref(FULL),
+            1 => tc.arena.node_mut(parent).inc_device_lock_ref(FULL),
+            2 => {
+                let handle = tc.arena.node(parent).id;
+                tc.arena.node_mut(parent).load_back_pending_id = Some(handle);
+            }
+            3 => tc
+                .arena
+                .set_device_value(parent, FULL, Tensor::from_slice(&[100i64])),
+            _ => {
+                tc.arena.node_mut(parent).take_host_value(FULL);
+            }
+        }
+        let preview = tc.peek_host_eviction_candidates(FULL, 100);
+        assert_eq!(
+            preview.iter().map(|x| x.0).collect::<Vec<_>>(),
+            [a, b].map(|id| tc.arena.node(id).id),
+            "predicate {blocked}"
+        );
+    }
+}
+
 #[test]
 fn host_drive_evicts_leaves_lowest_priority_first_until_the_budget() {
     let mut tc = core();

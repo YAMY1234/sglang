@@ -417,19 +417,22 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         if self.cfg.components != (ComponentType.FULL,) or self.cfg.is_eagle:
             self.skipTest("host-only FULL fixture")
 
-    def _host_only_l3_fixture(self, *, exclusive=True):
-        """Real CPU tree/slot allocator; mock only the controller's IO boundary."""
+    def _host_only_l3_fixture(self, *, exclusive=True, backend="python"):
+        """Real CPU tree/slot allocator; mock only the controller's IO boundary.
+        Most cases read Python nodes (node_by_id), so the core is pinned per case."""
         params = CacheInitParams(
             disable=False,
             req_to_token_pool=None,
             token_to_kv_pool_allocator=None,
             page_size=self.cfg.page_size,
             tree_slots=tree_slots_of((ComponentType.FULL,)),
-            # Exclusive tiering is Python-core only; the env default resolves to rust
-            # wherever the toolchain is present, so pin it instead of skipping there.
-            tree_core_backend="python",
+            tree_core_backend=backend,
         )
         cache = UnifiedRadixCache(params)
+        if cache._tree_core_backend != backend:
+            self.skipTest(f"no {backend} TreeCore here")
+        if backend == "rust" and not cache.tree_core.supports_host_eviction_peek:
+            self.skipTest("this Rust TreeCore build has no host-tail peek")
         pool = LogicalHostPool(8 * self.cfg.page_size, self.cfg.page_size)
         cache.host_pool_group = HostPoolGroup(
             [PoolEntry(PoolName.KV, pool, None, lambda layer: layer)]
@@ -516,6 +519,38 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
                     for node in expected:
                         with self.assertRaises(KeyError):
                             core.node_by_id(node)
+
+    def test_hicache_l3_host_peek_is_the_eviction_order_on_both_cores(self):
+        """The peek changes nothing, and drive_host_eviction then frees exactly
+        the pages it named (children, then their parent), on either TreeCore."""
+        self._require_host_only_l3_fixture()
+        ps = self.cfg.page_size
+        full = ComponentType.FULL
+        for backend in ("python", "rust"):
+            for pages in (2, 3):
+                with self.subTest(core=backend, pages=pages):
+                    cache, pool = self._host_only_l3_fixture(backend=backend)
+                    core = cache.tree_core
+                    parent = self._insert_host_page(cache, pool, 1000)
+                    self._insert_host_page(cache, pool, 2000, parent)
+                    self._insert_host_page(cache, pool, 3000, parent)
+                    self._insert_host_page(cache, pool, 4000)
+                    peek = core.peek_host_eviction_candidates(full, pages * ps)
+                    self.assertEqual(
+                        [(n, h) for _, n, h in peek],
+                        [(ps, ["h2000"]), (ps, ["h3000"]), (ps, ["h1000"])][:pages],
+                    )
+                    self.assertEqual(
+                        core.peek_host_eviction_candidates(full, pages * ps), peek
+                    )
+                    self.assertEqual(pool.available_size(), 4 * ps)
+                    result = core.drive_host_eviction(full, pages * ps)
+                    cache._free_values(result.device_frees, result.host_frees)
+                    self.assertEqual(pool.available_size(), (4 + pages) * ps)
+                    rest = core.peek_host_eviction_candidates(full, 8 * ps)
+                    self.assertEqual(
+                        [h for _, _, h in rest], [["h1000"], ["h4000"]][pages - 2 :]
+                    )
 
     def test_hicache_l3_dedup_requires_auxiliary_pool_coverage(self):
         self._require_host_only_l3_fixture()
@@ -674,8 +709,13 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         write-behind issues each cold tail node once, with every sidecar; an
         ack believes all five pools at the written prefix, so the node is
         then clean; a failed write believes nothing and the node is written
-        again."""
+        again. Both TreeCores."""
         self._require_host_only_l3_fixture()
+        for backend in ("python", "rust"):
+            with self.subTest(core=backend):
+                self._check_dsv4_sidecars_tier_with_the_kv(backend)
+
+    def _check_dsv4_sidecars_tier_with_the_kv(self, backend):
         ps = self.cfg.page_size
         sidecars = (
             PoolName.DEEPSEEK_V4_C1,
@@ -683,13 +723,12 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
             PoolName.DEEPSEEK_V4_C2,
             PoolName.DEEPSEEK_V4_C2_INDEXER,
         )
-        cache, pool = self._host_only_l3_fixture()
+        cache, pool = self._host_only_l3_fixture(backend=backend)
         cache.sidecar_pool_specs.extend(
             SidecarPoolSpec(name, PoolName.KV) for name in sidecars
         )
+        # Both cores age nodes by an insertion counter: h1000 is the coldest.
         nodes = [self._insert_host_page(cache, pool, 1000 * i) for i in range(1, 8)]
-        for age, node in enumerate(nodes):
-            cache.tree_core.node_by_id(node).last_access_time = age
         # One page free of the four-page reserve: the three coldest are written.
         for _ in range(8):
             cache._write_behind_host_tail()
@@ -710,6 +749,11 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         self._ack_backups(cache, {ops["h1000"]: ps, ops["h2000"]: ps, ops["h3000"]: 0})
         self.assertFalse(cache.ongoing_backup)
         self.assertFalse(cache._write_behind_inflight)
+        stats = cache.prefetch_outcome_stats_snapshot()
+        self.assertEqual(
+            (stats["wb_settled_ops"], stats["wb_settled_tokens"]), (3, 2 * ps)
+        )
+        self.assertEqual(stats["wb_failed_tokens"], ps)
         beliefs = cache.storage_existence_cache
         for name in (PoolName.KV, *sidecars):
             self.assertTrue(beliefs.pool(name).covered(["h1000", "h2000"]), name)

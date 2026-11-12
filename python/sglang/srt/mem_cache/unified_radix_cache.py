@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
 import json
 import logging
+import sys
 import threading
 import time
 import zlib
@@ -217,6 +219,16 @@ class _OngoingPrefetch(NamedTuple):
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
 
 
+def _tree_core_extension_identity(tree_core) -> str:
+    """The native TreeCore build a cache runs: its file and sha256 (Rust), or none."""
+    module = sys.modules.get("sglang.srt.mem_cache.rust_tree_core.mem_cache")
+    path = getattr(module, "__file__", None) if module is not None else None
+    if path is None or type(tree_core).__name__ == "UnifiedTreeCore":
+        return "no native extension"
+    with open(path, "rb") as f:
+        return f"extension {path} sha256 {hashlib.sha256(f.read()).hexdigest()}"
+
+
 class UnifiedRadixCache(BasePrefixCache):
     # Unlimited-OCR v2 split-document KV reuse; None for every other model.
     uocr_doc_reuse: Optional[DocReuse] = None
@@ -422,7 +434,11 @@ class UnifiedRadixCache(BasePrefixCache):
             "wb_issued_tokens": 0,
             "wb_clean_tokens": 0,
             "wb_unbacked_tokens": 0,
+            "wb_settled_ops": 0,
+            "wb_settled_tokens": 0,
+            "wb_failed_tokens": 0,
         }
+        self._l3_tier_logged_at = 0.0
         # op id -> [(pool, keys)] of each cache-mode storage write in ongoing_backup.
         self._backup_belief_keys: dict[int, list[tuple[str, list[str]]]] = {}
 
@@ -631,17 +647,25 @@ class UnifiedRadixCache(BasePrefixCache):
                     "SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT needs a host cache tier; "
                     "it does not apply to --hicache-host-memory-mode buffer_only"
                 )
-            if self._tree_core_backend != "python":
+            if self._tree_core_backend != "python" and not (
+                self._tree_core_backend == "rust"
+                and self.tree_core.supports_host_eviction_peek
+            ):
                 raise ValueError(
-                    "SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT requires "
-                    "SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python"
+                    "SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT needs the Python TreeCore or a "
+                    "Rust TreeCore built with the host-tail peek "
+                    "(HOST_EVICTION_PEEK_SCHEMA_VERSION 1)"
                 )
             self._l3_evict_write_reserve_fraction = (
                 envs.SGLANG_HICACHE_L3_EVICT_WRITE_RESERVE_FRACTION.get()
             )
             logger.info(
-                "HiCache L3 write-on-host-evict enabled: reserve fraction %.3f "
-                "of host pool (%d tokens)",
+                "HiCache L3 write-on-host-evict enabled: write-back L3 (exclusive "
+                "L2->L3), TreeCore %s (%s), %s; reserve fraction %.3f of host pool "
+                "(%d tokens)",
+                self._tree_core_backend,
+                type(self.tree_core).__name__,
+                _tree_core_extension_identity(self.tree_core),
                 self._l3_evict_write_reserve_fraction,
                 int(
                     self._l3_evict_write_reserve_fraction
@@ -2627,6 +2651,20 @@ class UnifiedRadixCache(BasePrefixCache):
         ]
         return operation_id
 
+    def _log_l3_tier_stats(self, period_s: float = 60.0) -> None:
+        """Cumulative write-behind counters, once a minute: L3 engagement in the log."""
+        now = time.monotonic()
+        if now - self._l3_tier_logged_at < period_s:
+            return
+        self._l3_tier_logged_at = now
+        stats = self._l3_tier_stats
+        logger.info(
+            "HiCache L3 write-behind (%s TreeCore): %s, inflight_tokens=%d",
+            self._tree_core_backend,
+            ", ".join(f"{k}={v}" for k, v in stats.items()),
+            sum(self._write_behind_inflight.values()),
+        )
+
     def _write_behind_host_tail(self) -> None:
         """Keep the reserve at the LRU host tail either free or already in
         storage, so drive_host_eviction only drops pages storage holds. Every
@@ -4115,7 +4153,11 @@ class UnifiedRadixCache(BasePrefixCache):
             )
         else:
             self._backup_requested_tokens.pop(operation.id, None)
-            self._write_behind_inflight.pop(operation.id, None)
+            if self._write_behind_inflight.pop(operation.id, None) is not None:
+                stats = self._l3_tier_stats
+                stats["wb_settled_ops"] += 1
+                stats["wb_settled_tokens"] += agreed_tokens
+                stats["wb_failed_tokens"] += (requested_tokens or 0) - agreed_tokens
             entry = self.ongoing_backup.pop(operation.id, None)
             if entry is not None:
                 node_id, lock_params = entry
@@ -4626,6 +4668,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self._vote_prefetch_deadlines()
         if self._l3_write_on_host_evict:
             self._write_behind_host_tail()
+            self._log_l3_tier_stats()
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.flush_pending_writes()
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:

@@ -20,11 +20,83 @@ use crate::unified_tree_core::{
 /// FULL attention component driver; owns the FULL device/host value slots.
 pub struct FullComponent;
 
+/// The same coldest-first heap drives eviction and its read-only L3 preview.
+/// Parent admission is decided by the caller: live leaves after real eviction,
+/// or a child-count simulation while peeking. No tree or tensor is cloned.
+struct HostEvictionWalk {
+    heap: BinaryHeap<Reverse<(PriorityKey, NodeIdx_)>>,
+}
+
+impl HostEvictionWalk {
+    fn new<K: ChildKeyType>(tree_core: &UnifiedTreeCore<K>) -> Self {
+        Self {
+            heap: tree_core
+                .evictable_host_leaves
+                .iter()
+                .map(|id| {
+                    Reverse((
+                        tree_core
+                            .eviction_strategy
+                            .get_priority(tree_core.arena.node(id)),
+                        id,
+                    ))
+                })
+                .collect(),
+        }
+    }
+
+    fn next(&mut self) -> Option<NodeIdx_> {
+        self.heap.pop().map(|Reverse((_, id))| id)
+    }
+
+    fn admit_parent<K: ChildKeyType>(&mut self, tree_core: &UnifiedTreeCore<K>, id: NodeIdx_) {
+        self.heap.push(Reverse((
+            tree_core
+                .eviction_strategy
+                .get_priority(tree_core.arena.node(id)),
+            id,
+        )));
+    }
+}
+
 impl FullComponent {
     /// The component's device value slot.
     pub const DEVICE: ValueSlotIdx = ValueSlotIdx::device(FULL);
     /// The component's host value slot.
     pub const HOST: ValueSlotIdx = ValueSlotIdx::host(FULL);
+
+    /// Simulate the FULL host-leaf cascade without changing residency, locks,
+    /// counters, hashes, or the arena's allocation generations.
+    pub(crate) fn peek_host_eviction_candidates<K: ChildKeyType>(
+        tree_core: &UnifiedTreeCore<K>,
+        num_tokens: usize,
+    ) -> Vec<(NodeId, usize, Option<Vec<String>>)> {
+        if num_tokens == 0 {
+            return Vec::new();
+        }
+        let mut walk = HostEvictionWalk::new(tree_core);
+        let mut children_left: HashMap<NodeIdx_, usize> = HashMap::new();
+        let mut candidates = Vec::new();
+        let mut covered = 0;
+        while covered < num_tokens {
+            let Some(id) = walk.next() else { break };
+            let node = tree_core.arena.node(id);
+            let tokens = node.key.atom_len();
+            candidates.push((node.id, tokens, node.hash_value.clone()));
+            covered += tokens;
+            if let Some(parent_id) = node.try_parent() {
+                let parent = tree_core.arena.node(parent_id);
+                let left = children_left
+                    .entry(parent_id)
+                    .or_insert(parent.children.len());
+                *left -= 1;
+                if *left == 0 && tree_core.is_evictable_host_leaf_ignoring_children_(parent) {
+                    walk.admit_parent(tree_core, parent_id);
+                }
+            }
+        }
+        candidates
+    }
 }
 
 impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
@@ -259,15 +331,9 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         cache_actions: &mut CacheActions,
     ) {
         let ct = FULL;
-        let arena = &tree_core.arena;
-        let strategy = &tree_core.eviction_strategy;
-        let mut heap: BinaryHeap<Reverse<(PriorityKey, NodeIdx_)>> = tree_core
-            .evictable_host_leaves
-            .iter()
-            .map(|id| Reverse((strategy.get_priority(arena.node(id)), id)))
-            .collect();
+        let mut walk = HostEvictionWalk::new(tree_core);
         while tracker[&ct] < num_tokens {
-            let Some(Reverse((_, x))) = heap.pop() else {
+            let Some(x) = walk.next() else {
                 break;
             };
             if !tree_core.evictable_host_leaves.contains(x) {
@@ -279,10 +345,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
             if let Some(parent) = parent
                 && tree_core.evictable_host_leaves.contains(parent)
             {
-                let key = tree_core
-                    .eviction_strategy
-                    .get_priority(tree_core.arena.node(parent));
-                heap.push(Reverse((key, parent)));
+                walk.admit_parent(tree_core, parent);
             }
         }
     }

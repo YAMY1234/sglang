@@ -982,11 +982,18 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         )
         return self._fill_evict_result(binding_result, DriveHostEvictionResult())
 
+    @property
+    def supports_host_eviction_peek(self) -> bool:
+        """Whether this build walks the host tail natively (schema 1)."""
+        return getattr(
+            self._bindings, "HOST_EVICTION_PEEK_SCHEMA_VERSION", None
+        ) == 1 and hasattr(self._binding, "peek_host_eviction_candidates")
+
     def peek_host_eviction_candidates(
         self, component_type: ComponentType, num_tokens: int
     ) -> list[tuple[NodeId, int, Optional[list[str]]]]:
-        raise NotImplementedError(
-            "SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT needs the python tree core"
+        return self._binding.peek_host_eviction_candidates(
+            int(component_type), num_tokens
         )
 
     def evict_excess_path_states(

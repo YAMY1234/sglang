@@ -3107,6 +3107,19 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         );
     }
 
+    /// Read-only cold FULL host tail for asynchronous L3 write-behind.
+    /// Other components have no independent token-tail preview.
+    pub fn peek_host_eviction_candidates(
+        &self,
+        component_type: ComponentType,
+        num_tokens: usize,
+    ) -> Vec<(NodeId, usize, Option<Vec<String>>)> {
+        if component_type != BASE_COMPONENT_TYPE {
+            return Vec::new();
+        }
+        FullComponent::peek_host_eviction_candidates(self, num_tokens)
+    }
+
     /// Evict a component's host-side resources.
     pub fn drive_host_eviction(
         &mut self,
@@ -3656,6 +3669,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
     /// Whether the node is an evictable Full host leaf.
     fn is_evictable_host_leaf_(&self, node: &Node<K>) -> bool {
+        node.children.is_empty() && self.is_evictable_host_leaf_ignoring_children_(node)
+    }
+
+    /// Host-leaf eligibility after a simulated removal of all children.
+    pub(crate) fn is_evictable_host_leaf_ignoring_children_(&self, node: &Node<K>) -> bool {
         if node.is_root() || !node.evicted() {
             return false;
         }
@@ -3671,9 +3689,6 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         // Segment locks count evicted nodes too: a device-locked candidate is
         // a live segment's anchor, and evict_host_leaf_ would delete it.
         if node.is_device_locked() {
-            return false;
-        }
-        if !node.children.is_empty() {
             return false;
         }
         true

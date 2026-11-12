@@ -2007,6 +2007,17 @@ macro_rules! tree_core_methods {
                 })
             }
 
+            /// Cold FULL host leaves in eviction order, without residency changes.
+            fn peek_host_eviction_candidates(
+                &self,
+                py: Python<'_>,
+                component_type: u8,
+                num_tokens: usize,
+            ) -> PyResult<Vec<(NodeId, usize, Option<Vec<String>>)>> {
+                let ct = parse_component_type(component_type)?;
+                Ok(py.detach(|| self.core().peek_host_eviction_candidates(ct, num_tokens)))
+            }
+
             /// Evict up to num_tokens of one component's host resources.
             fn drive_host_eviction(
                 &self,
@@ -3379,6 +3390,19 @@ macro_rules! tree_core_binding {
                 catch_native_panic(|| self.inner.demote(py, node_id))
             }
 
+            /// Cold FULL host leaves in eviction order, without residency changes.
+            fn peek_host_eviction_candidates(
+                &self,
+                py: Python<'_>,
+                component_type: u8,
+                num_tokens: usize,
+            ) -> PyResult<Vec<(NodeId, usize, Option<Vec<String>>)>> {
+                catch_native_panic(|| {
+                    self.inner
+                        .peek_host_eviction_candidates(py, component_type, num_tokens)
+                })
+            }
+
             /// Evict up to num_tokens of one component's host resources.
             #[pyo3(signature = (component_type, num_tokens, skip_full_duplicate_reclaim = false))]
             fn drive_host_eviction(
@@ -4023,6 +4047,8 @@ fn get_hash_str(
 }
 
 fn register_mem_cache_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Bumped when peek_host_eviction_candidates changes shape; the adapter checks it.
+    m.add("HOST_EVICTION_PEEK_SCHEMA_VERSION", 1u32)?;
     m.add_class::<TlruFloatConfigBinding>()?;
     m.add_function(wrap_pyfunction!(get_hash_str, m)?)?;
     m.add_class::<TreeCoreInitParamsBinding>()?;
