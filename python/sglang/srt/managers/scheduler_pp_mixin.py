@@ -20,6 +20,9 @@ from sglang.srt.managers.mm_utils import strip_mm_features_for_pp_relay
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.pp_prefill_lookahead import PPPreparedInput
+from sglang.srt.utils.common import flatten_arrays_to_pinned_cpu
+from sglang.srt.utils.device import is_pin_memory_available
 from sglang.srt.managers.scheduler_components.state_check import CheckPhase
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
@@ -93,6 +96,9 @@ class PPBatchMetadata:
     verify_out_cache_loc: Optional[torch.Tensor] = None
     # Rank-local; never sent over the wire.
     fpm_timing: Optional[FpmTiming] = None
+    # B1 owns input backing independently of the result slot generation.
+    input_generation: Optional[int] = None
+    prepared_input: Optional[PPPreparedInput] = None
 
 
 class SchedulerPPMixin:
@@ -261,6 +267,18 @@ class SchedulerPPMixin:
         release_rids: Optional[Dict[str, bool]] = None
         send_transfer_work = []
         send_release_work = []
+        overlap_b1 = envs.SGLANG_PP_PD_OVERLAP_B1.get()
+        if overlap_b1 and (get_parallel().pp_async_batch_depth != 0 or self._pp_spec_relay):
+            raise ValueError("SGLANG_PP_PD_OVERLAP_B1 requires PD PP depth0 without spec relay")
+        if overlap_b1:
+            generations = [0] * self.pp_loop_size
+            completed_generations = [0] * self.pp_loop_size
+            prepared_next = None
+            self._pp_pd_input_plan = None
+            self._pp_b1_used = 0
+            self._pp_b1_prepared = 0
+            self._pp_b1_selected = 0
+            b1_iterations = 0
 
         while True:
             server_is_idle = True
@@ -295,7 +313,17 @@ class SchedulerPPMixin:
                 self._process_hicache_events()
                 batch = None
                 if self._pp_may_launch():
+                    if overlap_b1:
+                        self._pp_pd_input_plan = (
+                            prepared_next
+                            if prepared_next is not None and prepared_next.can_commit(
+                                mb_id, generations[mb_id], completed_generations[mb_id]
+                            ) else None
+                        )
                     prefill_plan = self.get_new_batch_prefill(self.running_batch)
+                    if overlap_b1:
+                        self._pp_pd_input_plan = None
+                        prepared_next = None
                     batch = prefill_plan.batch_to_run
                     self.running_batch = prefill_plan.running_batch
                     batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
@@ -326,6 +354,31 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                if overlap_b1:
+                    if cur_batch:
+                        generations[mb_id] += 1
+                        self.mb_metadata[mb_id].input_generation = generations[mb_id]
+                        self.mb_metadata[mb_id].prepared_input = getattr(cur_batch, "pp_prepared_input", None)
+                    # No communication, CUDA submission, cache mutation or slot
+                    # replacement in the preparation phase.
+                    busy = {
+                        id(req) for mb in self.mbs if mb is not None for req in mb.reqs
+                    }
+                    if self.chunked_req is not None:
+                        busy.add(id(self.chunked_req))
+                    prepared_next = PPPreparedInput.prepare(
+                        next_mb_id, generations[next_mb_id] + 1,
+                        self.waiting_queue, busy,
+                        lambda ids: flatten_arrays_to_pinned_cpu(
+                            [ids], is_pin_memory_available(self.device)
+                        ),
+                    ) if cur_batch else None
+                    if prepared_next is not None:
+                        self._pp_b1_prepared += 1
+                    b1_iterations += 1
+                    if b1_iterations % 128 == 0:
+                        logger.info("PP_PD_B1 coverage prepared=%s selected=%s used=%s",
+                                    self._pp_b1_prepared, self._pp_b1_selected, self._pp_b1_used)
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -344,12 +397,16 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_release_work)
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
+                    if overlap_b1 and self.mb_metadata[next_mb_id].input_generation != generations[next_mb_id]:
+                        raise RuntimeError("PP PD B1 result slot generation mismatch")
                     d2h_event.synchronize()
                     self._pp_process_batch_result(
                         self.mbs[next_mb_id],
                         next_batch_result,
                     )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
+                    if overlap_b1:
+                        completed_generations[next_mb_id] = generations[next_mb_id]
 
                 if tmbs[next_mb_id] is not None:
                     self.process_disagg_prefill_transfer_queue(next_release_rids)

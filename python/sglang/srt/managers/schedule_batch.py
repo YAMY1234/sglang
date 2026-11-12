@@ -2332,7 +2332,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         _pin = is_pin_memory_available(self.device)
         # Stay on pinned CPU; H2D is deferred to forward stream via
         # resolve_forward_inputs.
-        pinned_input_ids = flatten_arrays_to_pinned_cpu(input_ids, _pin)
+        if envs.SGLANG_PP_PD_OVERLAP_B1.get():
+            prepared = getattr(self, "pp_prepared_input", None)
+            pinned_input_ids = prepared.for_batch(reqs) if prepared is not None else None
+            self.pp_prepared_input_used = pinned_input_ids is not None
+            if pinned_input_ids is None:
+                pinned_input_ids = flatten_arrays_to_pinned_cpu(input_ids, _pin)
+        else:
+            pinned_input_ids = flatten_arrays_to_pinned_cpu(input_ids, _pin)
         seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64, pin_memory=_pin).to(
             self.device, non_blocking=True
         )

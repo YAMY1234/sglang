@@ -4693,7 +4693,17 @@ class Scheduler(
                 self.tree_cache.ready_to_load_host_cache()
             )
 
+        if envs.SGLANG_PP_PD_OVERLAP_B1.get() and self.disaggregation_mode == DisaggregationMode.PREFILL:
+            new_batch.pp_prepared_input = getattr(self, "_pp_pd_input_plan", None)
+            if new_batch.pp_prepared_input is not None:
+                self._pp_b1_selected += 1
         new_batch.prepare_for_extend()
+        if getattr(new_batch, "pp_prepared_input_used", False):
+            self._pp_b1_used += 1
+            if self._pp_b1_used <= 4 or self._pp_b1_used % 256 == 0:
+                logger.info("PP_PD_B1 input generation committed count=%s generation=%s rid=%s",
+                            self._pp_b1_used, new_batch.pp_prepared_input.generation,
+                            new_batch.pp_prepared_input.rid)
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
