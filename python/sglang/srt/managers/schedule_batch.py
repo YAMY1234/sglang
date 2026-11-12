@@ -2048,7 +2048,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     encoder_swa_reset: Optional[List[bool]] = None
     # DeepSeek-V4.1 fused decode tails, decode steps only, rebuilt every step:
     # [bs, verify width] int64 prompt token forced after each verify row (-1:
-    # verify as usual), and [bs] int64 late-layer SWA floor (0 for other requests).
+    # verify as usual; -2: as usual, keeping the served accept), and [bs] int64
+    # late-layer SWA floor (0 for other requests).
     dsv41_forced_tokens: Optional[torch.Tensor] = None
     dsv41_swa_floor: Optional[torch.Tensor] = None
 
@@ -3624,6 +3625,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     if (
                         req.decode_batch_idx >= 1
                         and req.kv.holds_kv
+                        # A fed tail's seqlen counts prompt tokens its KV has not
+                        # reached; it keeps its window until the first output.
+                        and (req.dsv41_feed_floor is None or req.output_ids)
                         and window_evict_due(req)
                     ):
                         # Each window rechecks its own cursor against

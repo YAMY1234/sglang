@@ -106,22 +106,24 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
 
 
 def force_verify_rows(
-    next_token_logits: torch.Tensor, forced_tokens: torch.Tensor
+    next_token_logits: torch.Tensor, forced_tokens: torch.Tensor, vocab_start: int = 0
 ) -> None:
     """Make every verify row with a forced token (>= 0) pick exactly that token.
 
     forced_tokens is [bs, verify width], one entry per verify row in row order.
     A forced row's logits become one-hot (0 at the token, -inf elsewhere), so the
     unchanged accept takes the draft that equals it and draws it as the bonus
-    under any temperature; the other rows keep their logits.
+    under any temperature; the other rows keep their logits. vocab_start offsets
+    the token into logits that hold one vocab shard.
     """
-    rows = forced_tokens.reshape(-1)
+    rows = forced_tokens.reshape(-1) - vocab_start
     logits = next_token_logits[: rows.shape[0]]
-    forced = (rows >= 0).unsqueeze(1)
-    index = rows.clamp_min(0).unsqueeze(1)
-    kept = logits.gather(1, index)
+    forced = (forced_tokens.reshape(-1) >= 0).unsqueeze(1)
+    here = forced & ((rows >= 0) & (rows < logits.shape[1])).unsqueeze(1)
+    index = rows.clamp(0, logits.shape[1] - 1).unsqueeze(1)
     logits.masked_fill_(forced, float("-inf"))
-    logits.scatter_(1, index, torch.where(forced, torch.zeros_like(kept), kept))
+    kept = logits.gather(1, index)
+    logits.scatter_(1, index, torch.where(here, torch.zeros_like(kept), kept))
 
 
 class TargetVerifyResult(msgspec.Struct, frozen=True):

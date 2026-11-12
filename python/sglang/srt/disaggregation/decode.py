@@ -4522,6 +4522,10 @@ class SchedulerDisaggregationDecodeMixin:
         output token is sampled from the last prompt position. Progress is a
         function of this schedule alone (every forced row is accepted), so it
         runs ahead of the overlapped results.
+
+        Entries are -1 for requests not fed and -2 for a fed request's rows past
+        its prompt: those verify as usual but keep the served accept, so the first
+        output token is a real sample, as the tail extend's is.
         """
         batch.dsv41_forced_tokens = None
         batch.dsv41_swa_floor = None
@@ -4531,6 +4535,7 @@ class SchedulerDisaggregationDecodeMixin:
             return
         # The verify width the DSpark worker resolved (draft block + 1).
         width = self.model_worker.verify_num_draft_tokens
+        window = self.model_config.sliding_window_size
         forced = [[-1] * width for _ in batch.reqs]
         floor = [0] * len(batch.reqs)
         for i, req in enumerate(batch.reqs):
@@ -4539,10 +4544,15 @@ class SchedulerDisaggregationDecodeMixin:
                 continue
             prompt = req.origin_input_ids
             end = min(len(prompt), p + width + 1)
+            forced[i] = [-2] * width
             forced[i][: end - p - 1] = prompt[p + 1 : end]
-            floor[i] = req.dsv41_feed_floor
+            # The tail extend's bounded replay starts the late layers at the last
+            # window, one row past the tail start for a 129-token tail.
+            floor[i] = max(req.dsv41_feed_floor, len(prompt) - window)
             nxt = p + width
-            req.dsv41_feed_next = nxt if nxt + 1 < len(prompt) else None
+            # A step ending on the last prompt token leaves the first output to
+            # the next step, which stays in the feed with no prompt rows.
+            req.dsv41_feed_next = nxt if nxt < len(prompt) else None
         batch.dsv41_forced_tokens = async_h2d(
             forced, dtype=torch.int64, device=batch.device
         )

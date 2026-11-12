@@ -2505,6 +2505,10 @@ class DeepseekV4AttnBackend(
         tail has no late-layer KV below its start. Rows with floor 0 match the
         unfloored ones."""
         assert self.token_to_kv_pool.request_window is None
+        positions = core.positions_casual
+        # A row below its floor (the tail start of a 129-token tail) attends to
+        # itself only; no later row reads its late-layer KV.
+        row_floor = torch.minimum(row_floor, positions.clamp_min(0).to(row_floor.dtype))
         indices = BuildCausalSwaPageIndices.execute(
             req_to_token=self.req_to_token,
             full_to_swa_mapping=self.token_to_kv_pool.full_to_swa_index_mapping,
@@ -2514,7 +2518,6 @@ class DeepseekV4AttnBackend(
             page_index_aligned_size=PAGE_INDEX_ALIGNED_SIZE,
             swa_replay_start=row_floor,
         )
-        positions = core.positions_casual
         floored = positions - row_floor.to(positions.dtype) + 1
         lengths = torch.minimum(
             core.swa_topk_lengths,

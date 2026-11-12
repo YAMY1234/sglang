@@ -217,6 +217,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             and get_disagg().disaggregation_mode == "decode"
             and envs.SGLANG_DSV41_FUSED_TAIL.get()
         )
+        self._dsv41_forced_draft_logged = False
         self._decode_graph_allowed = (
             get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
             and not self._is_pd_prefill
@@ -1126,6 +1127,23 @@ class DSparkWorkerV2(BaseSpecWorker):
                     draft_tokens,
                 )
             )
+            draft_logits = draft_block.corrected_logits
+            if draft_logits is not None:
+                # A sampled accept rejects a draft its distribution gives no mass
+                # (an fp32 softmax underflows far below the max); a forced row
+                # must always be taken, so its draft distribution is one-hot too.
+                shard = draft_block.vocab_shard
+                force_verify_rows(
+                    draft_logits[:bs].view(bs * gamma, draft_logits.shape[-1]),
+                    forced_tokens[:, :gamma],
+                    vocab_start=0 if shard is None else shard.start,
+                )
+                if not self._dsv41_forced_draft_logged:
+                    self._dsv41_forced_draft_logged = True
+                    logger.info(
+                        "SGLANG_DSV41_FUSED_TAIL: forced verify rows carry a one-hot "
+                        "draft distribution (first step)."
+                    )
 
         verify_ids_2d = proposal.verify_ids
         if verify_ids_2d is None or forced_tokens is not None:
@@ -1276,9 +1294,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 prefix_lens=prefix_lens,
                 draft_tokens=draft_tokens,
                 simulate_bonus_sampling_info=simulate_bonus_sampling_info,
-                # Fed tails keep their forced accept under simulated acceptance.
+                # Fed tails keep their served accept under simulated acceptance.
                 forced_rows=(
-                    None if forced_tokens is None else (forced_tokens >= 0).any(dim=1)
+                    None if forced_tokens is None else (forced_tokens != -1).any(dim=1)
                 ),
             )
         if proposal.acceptance_features is not None and self._simulate_acc_len <= 0:

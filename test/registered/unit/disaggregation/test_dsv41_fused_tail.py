@@ -9,7 +9,7 @@ import torch
 from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
 from sglang.srt.disaggregation.utils import dsv41_encoder_prefix_len
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -25,6 +25,10 @@ from sglang.srt.managers.scheduler_components.request_list import (
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.kernels.ops.speculative.dspark.blockwise_rejection import (
+    blockwise_rejection_torch,
+    make_rejection_noise,
+)
 from sglang.kernels.ops.speculative.dspark.dspark_accept import AcceptGreedy
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     build_accept_outs,
@@ -63,7 +67,10 @@ def _decode_batch(reqs):
 
 
 def _sched():
-    return SimpleNamespace(model_worker=SimpleNamespace(verify_num_draft_tokens=WIDTH))
+    return SimpleNamespace(
+        model_worker=SimpleNamespace(verify_num_draft_tokens=WIDTH),
+        model_config=SimpleNamespace(sliding_window_size=128),
+    )
 
 
 class TestFeedSchedule(CustomTestCase):
@@ -85,7 +92,7 @@ class TestFeedSchedule(CustomTestCase):
             self.assertEqual(floor.tolist(), [0, start])
             # Row j sits at row0 + j and is forced to the prompt token after it.
             for j in range(WIDTH):
-                want = req.origin_input_ids[row0 + j + 1] if row0 + j + 1 < 1000 else -1
+                want = req.origin_input_ids[row0 + j + 1] if row0 + j + 1 < 1000 else -2
                 self.assertEqual(forced[1, j].item(), want, (steps, j))
             row0 += WIDTH
         # 128 tail tokens, six per step; the last row of the last step sits at the
@@ -97,6 +104,32 @@ class TestFeedSchedule(CustomTestCase):
         Mixin._set_dsv41_feed_inputs(sched, batch)
         self.assertIsNone(batch.dsv41_forced_tokens)
         self.assertIsNone(batch.dsv41_swa_floor)
+
+    def test_first_output_step_stays_in_the_feed(self):
+        # Block 3 (width 4) feeds a 129-token tail's 128 prompt tokens in 32 full
+        # steps; the next step samples the first output and keeps the served
+        # accept (-2 rows), so simulated acceptance cannot replace that token.
+        req = _fed_req(1001)
+        sched = _sched()
+        sched.model_worker.verify_num_draft_tokens = 4
+        rows = []
+        while req.dsv41_feed_next is not None:
+            batch = _decode_batch([req])
+            Mixin._set_dsv41_feed_inputs(sched, batch)
+            rows.append(batch.dsv41_forced_tokens[0].tolist())
+        self.assertEqual(len(rows), 33)
+        self.assertEqual(rows[31], req.origin_input_ids[997:1001])
+        self.assertEqual(rows[32], [-2] * 4)
+
+    def test_late_layer_floor_is_the_tail_extend_replay_start(self):
+        # The tail extend replays the late layers from seq_len - window: the tail
+        # start for a 128-token tail, one row later for a 129-token one.
+        for prompt_len, floor in ((1000, 872), (1001, 873)):
+            req = _fed_req(prompt_len)
+            self.assertEqual(req.dsv41_feed_floor, 872)
+            batch = _decode_batch([req])
+            Mixin._set_dsv41_feed_inputs(_sched(), batch)
+            self.assertEqual(batch.dsv41_swa_floor.tolist(), [floor])
 
     def test_only_decode_steps_get_feed_inputs(self):
         req = _fed_req(1000)
@@ -132,6 +165,98 @@ class TestForceVerifyRows(CustomTestCase):
                 self.assertTrue(torch.equal(logits[row], original[row]), row)
 
 
+class TestFeedKeepsItsWindow(CustomTestCase):
+    """Decode retires window rows behind seqlen - 1. A fed tail's seqlen is the
+    whole prompt while its KV still stands at the tail, so retiring then frees
+    the transferred encoder window its next rows read."""
+
+    def test_window_retires_only_after_the_first_output(self):
+        def req(floor, output_ids):
+            return SimpleNamespace(
+                decode_batch_idx=3,
+                kv=SimpleNamespace(holds_kv=True),
+                dsv41_feed_floor=floor,
+                output_ids=output_ids,
+                seqlen=1000 + len(output_ids),
+            )
+
+        feeding, fed, normal = req(872, []), req(872, [5]), req(None, [5, 6])
+        evict = MagicMock()
+        batch = SimpleNamespace(
+            tree_cache=SimpleNamespace(
+                supports_swa=lambda: True,
+                swa_retain_window=128,
+                window_sub_pools=lambda: ["swa"],
+            ),
+            token_to_kv_pool_allocator=MagicMock(),
+            forward_mode=ForwardMode.DECODE,
+            reqs=[feeding, fed, normal],
+            _window_eviction_trigger=lambda interval: ((lambda req: True), 1),
+            _evict_swa=evict,
+        )
+        ScheduleBatch.maybe_evict_swa(batch)
+        self.assertEqual(
+            [(c.args[0], c.args[1]) for c in evict.call_args_list],
+            [(fed, 1000), (normal, 1001)],
+        )
+
+
+class TestForcedDraftRows(CustomTestCase):
+    """A sampled accept takes a draft at p / q and turns away one its draft
+    distribution gives no mass, as an fp32 softmax does far below the max. The
+    feed assumes every forced row is taken, so the draft rows are one-hot too."""
+
+    VOCAB = 64
+
+    def _accept(self, candidates, target, draft_logits):
+        bs = candidates.shape[0]
+        temps = torch.ones(bs)
+        correct_len, bonus, _ = blockwise_rejection_torch(
+            candidates=candidates,
+            target_logits=target,
+            draft_logits=draft_logits,
+            target_temperatures=temps,
+            draft_temperatures=temps,
+            noise=make_rejection_noise(0, "cpu"),
+        )
+        return correct_len.tolist(), bonus.tolist()
+
+    def test_sampled_accept_takes_every_forced_row(self):
+        torch.manual_seed(0)
+        gamma = WIDTH - 1
+        prompt = [7, 8, 9, 10, 11, 12]
+        forced = torch.full((2, WIDTH), -1, dtype=torch.int64)
+        forced[1] = torch.tensor(prompt)
+        drafts = torch.tensor([[1, 2, 3, 4, 5], prompt[:gamma]])
+        candidates = torch.cat([torch.zeros(2, 1, dtype=torch.long), drafts], dim=1)
+        target = torch.randn(2 * WIDTH, self.VOCAB)
+        force_verify_rows(target, forced)
+        draft_logits = torch.randn(2, gamma, self.VOCAB)
+        # The Markov draft drafted its own chain: the prompt token at step 2 sits
+        # 120 below its max, so the fp32 draft probability is exactly zero.
+        draft_logits[1, 2, prompt[2]] = draft_logits[1, 2].max() - 120
+        self.assertEqual(torch.softmax(draft_logits[1, 2], -1)[prompt[2]].item(), 0.0)
+        before = draft_logits.clone()
+        before[1, 2, prompt[2]] = float("-inf")  # the accept's no-mass guard
+        self.assertEqual(self._accept(candidates, target, before)[0][1], 2)
+
+        original = draft_logits.clone()
+        force_verify_rows(draft_logits.view(2 * gamma, self.VOCAB), forced[:, :gamma])
+        self.assertTrue(torch.equal(draft_logits[0], original[0]))
+        for j, token in enumerate(prompt[:gamma]):
+            self.assertEqual(torch.softmax(draft_logits[1, j], -1)[token].item(), 1.0)
+        correct_len, bonus = self._accept(candidates, target, draft_logits)
+        self.assertEqual((correct_len[1], bonus[1]), (gamma, prompt[gamma]))
+
+    def test_vocab_shard_keeps_the_token_on_its_shard(self):
+        logits = torch.zeros(2, 8)
+        force_verify_rows(logits, torch.tensor([[20, 3]]), vocab_start=16)
+        self.assertEqual(
+            logits[0].tolist(), [float("-inf")] * 4 + [0.0] + [float("-inf")] * 3
+        )
+        self.assertTrue(torch.isneginf(logits[1]).all())
+
+
 class TestSimulatedAcceptance(CustomTestCase):
     """SGLANG_SIMULATE_ACC_LEN replaces every request's accept length. A fed tail
     must keep its served accept: _set_dsv41_feed_inputs advances the feed by the
@@ -163,7 +288,7 @@ class TestSimulatedAcceptance(CustomTestCase):
             target_logits=logits,
             simulate_bonus_sampling_info=sampling_info,
             simulated_bonus_seed=0,
-            forced_rows=(forced >= 0).any(dim=1),
+            forced_rows=(forced != -1).any(dim=1),
         )
         return accept, original
 
@@ -183,6 +308,18 @@ class TestSimulatedAcceptance(CustomTestCase):
             accept, _ = self._accept(forced, drafts, 2, sampling_info=object())
         self.assertEqual(accept.out_tokens[0, :2].tolist(), [1, sentinel])
         self.assertEqual(accept.out_tokens[1].tolist(), prompt)
+
+    def test_first_output_step_keeps_the_served_accept(self):
+        # The step after a full last feed step has no prompt rows (-2): its served
+        # accept stands, so the first output token is a real sample.
+        forced = torch.full((2, WIDTH), -1, dtype=torch.int64)
+        forced[1] = -2
+        drafts = torch.tensor([[1, 2, 3, 4, 5], [1, 2, 3, 4, 5]])
+        accept, original = self._accept(forced, drafts, simulated_len=4)
+        served = original[WIDTH].argmax().item()
+        self.assertNotEqual(served, drafts[1, 0].item())
+        self.assertEqual(accept.commit_lens.tolist(), [4, 1])
+        self.assertEqual(accept.out_tokens[1, 0].item(), served)
 
     def test_mid_feed_commits_the_whole_forced_width(self):
         prompt = [7, 8, 9, 10, 11, 12]
