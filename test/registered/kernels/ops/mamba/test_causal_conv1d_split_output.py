@@ -137,6 +137,88 @@ class TestSplitConvOutput(CustomTestCase):
                     torch.testing.assert_close(after, before, rtol=0, atol=0)
                 torch.testing.assert_close(states[1], states[0], rtol=0, atol=0)
 
+    def test_qkv_split_tile_matches_the_stock_tile(self):
+        # The split launch's 2D tile (width 4) against the per-token stock tile:
+        # full interior chunks, partial chunks, prefixes, and an uneven last plane.
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA required")
+        from unittest import mock
+
+        from sglang.kernels.ops.mamba import causal_conv1d_triton as conv
+
+        self.assertEqual(
+            conv._split_fwd_launch(4, 1280),
+            dict(
+                BLOCK_M=8,
+                BLOCK_N=256,
+                num_stages=2,
+                num_warps=4,
+                TILE_2D=True,
+                EVEN_FEATS=True,
+            ),
+        )
+        self.assertFalse(conv._split_fwd_launch(4, 1216)["EVEN_FEATS"])
+        self.assertIs(conv._split_fwd_launch(3, 1280), conv._STOCK_FWD_LAUNCH)
+        lengths, q_dim, k_dim = [1, 2, 7, 65, 300], 256, 256
+        for v_dim, block_table in (
+            (768, False),
+            (768, True),
+            (704, False),
+            (704, True),
+        ):
+            with self.subTest(v_dim=v_dim, block_table=block_table):
+                torch.manual_seed(47)
+                tokens, dim = sum(lengths), q_dim + k_dim + v_dim
+                x = torch.randn(tokens, dim + 32, device="cuda", dtype=torch.bfloat16)
+                x = x[:, :dim]
+                weight = torch.randn(dim, 4, device="cuda", dtype=x.dtype)
+                bias = torch.randn(dim, device="cuda", dtype=x.dtype)
+                seed = torch.randn(6, 3, dim, device="cuda", dtype=x.dtype)
+                states = [seed.clone().transpose(-1, -2) for _ in range(2)]
+                cu = torch.tensor(
+                    [0, *accumulate(lengths)], device="cuda", dtype=torch.int32
+                )
+                kwargs = dict(
+                    cache_indices=torch.tensor(
+                        [4, 2, 1, 3, 5], device="cuda", dtype=torch.int32
+                    ),
+                    has_initial_state=torch.tensor(
+                        [False, True, False, True, True], device="cuda"
+                    ),
+                    activation="silu",
+                )
+                if block_table:
+                    kwargs["block_table"] = torch.tensor(
+                        [
+                            (i, j)
+                            for i, n in enumerate(lengths)
+                            for j in range((n + 7) // 8)
+                        ],
+                        device="cuda",
+                        dtype=torch.int32,
+                    )
+                seq_lens = None if block_table else lengths
+                with mock.patch.object(
+                    conv, "_split_fwd_launch", lambda width, dim: conv._STOCK_FWD_LAUNCH
+                ):
+                    expected = conv.causal_conv1d_fn_split_qkv(
+                        x.T,
+                        weight,
+                        bias,
+                        states[0],
+                        cu,
+                        seq_lens,
+                        q_dim,
+                        k_dim,
+                        **kwargs,
+                    )
+                actual = conv.causal_conv1d_fn_split_qkv(
+                    x.T, weight, bias, states[1], cu, seq_lens, q_dim, k_dim, **kwargs
+                )
+                for before, after in zip(expected, actual):
+                    torch.testing.assert_close(after, before, rtol=0, atol=0)
+                torch.testing.assert_close(states[1], states[0], rtol=0, atol=0)
+
     def test_strip_kernel_matches_the_triton_split_launch(self):
         # GDN prefill strip kernel (width 4, bf16) against the Triton split launch.
         if not torch.cuda.is_available():

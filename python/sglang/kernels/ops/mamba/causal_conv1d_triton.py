@@ -31,6 +31,19 @@ _STOCK_FWD_LAUNCH = {
 }
 
 
+def _split_fwd_launch(width: int, dim: int) -> dict:
+    """The split q / k / v launch: the GDN front 2D tile (BLOCK_N 256, 4 warps,
+    2 stages, the block-table BLOCK_M, 2D tile) at width 4; the stock tile otherwise."""
+    if width != 4:
+        return _STOCK_FWD_LAUNCH
+    return {
+        **_STOCK_FWD_LAUNCH,
+        "num_warps": 4,
+        "TILE_2D": True,
+        "EVEN_FEATS": dim % _STOCK_FWD_LAUNCH["BLOCK_N"] == 0,
+    }
+
+
 def _parse_fwd_launch_config(value: str) -> Optional[dict]:
     """``"BLOCK_M,BLOCK_N,num_warps,num_stages"`` for the rectangular forward launch.
 
@@ -141,6 +154,11 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     # (q | k | v). BLOCK_N divides SPLIT_D0 and SPLIT_D1, so a program never straddles.
     SPLIT_D0: tl.constexpr = 0,
     SPLIT_D1: tl.constexpr = 0,
+    # Split q / k / v launch only (KERNEL_WIDTH == 4): the whole [BLOCK_M, BLOCK_N]
+    # chunk from KERNEL_WIDTH shifted 2D loads instead of the per-token loop, with the
+    # same per-element taps in the same order (the GDN front 2D tile).
+    TILE_2D: tl.constexpr = False,
+    EVEN_FEATS: tl.constexpr = False,  # dim % BLOCK_N == 0 (unmasked interior chunks)
 ):
     conv_states_ptr = initial_states_ptr
     conv_state_indices_ptr = cache_indices_ptr
@@ -426,84 +444,162 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         w_ptrs = w_base + (3 * stride_w_width)  # [BLOCK_N] tensor
         w_col3 = tl.load(w_ptrs, mask_w, other=0.0)
     mask_x_1d = idx_feats < dim
-    for idx_token in range(segment_len):
-        acc = acc_preload
-
-        matrix_w = w_col0
-        matrix_x = col0
-        for j in tl.static_range(KERNEL_WIDTH):
-            if KERNEL_WIDTH == 2:
-                if j == 1:  # KERNEL_WIDTH-1:
-                    matrix_w = w_col1
-                    x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
-            elif KERNEL_WIDTH == 3:
-                if j == 1:
-                    matrix_w = w_col1
-                    matrix_x = col1
+    if TILE_2D:
+        feat0 = tl.program_id(2) * BLOCK_N
+        in_k = feat0 >= SPLIT_D0
+        in_v = feat0 >= SPLIT_D1
+        col_base = tl.where(in_v, SPLIT_D1, tl.where(in_k, SPLIT_D0, 0))
+        o_width = tl.where(
+            in_v, dim - SPLIT_D1, tl.where(in_k, SPLIT_D1 - SPLIT_D0, SPLIT_D0)
+        ).to(tl.int64)
+        t_loc = tl.arange(0, BLOCK_M)
+        tok = token_offset + t_loc  # token index inside the sequence
+        x_rows = (
+            x_ptr
+            + sequence_start_index.to(tl.int64) * stride_x_token
+            + (idx_feats * stride_x_dim)[None, :]
+        )
+        o_ptrs2 = (
+            o_ptr
+            + col_base.to(tl.int64) * total_tokens
+            + (idx_feats - col_base)[None, :]
+            + ((sequence_start_index + tok).to(tl.int64) * o_width)[:, None]
+        )
+        acc2 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32) + acc_preload[None, :]
+        if (chunk_offset > 0) & (segment_len == BLOCK_M) & EVEN_FEATS:
+            # Interior chunk: every tap row is a real token of this sequence.
+            for j in tl.static_range(KERNEL_WIDTH):
+                xv = tl.load(
+                    x_rows
+                    + ((tok - (KERNEL_WIDTH - 1 - j)).to(tl.int64) * stride_x_token)[
+                        :, None
+                    ]
+                )
+                if j == 0:
+                    w2 = w_col0
+                elif j == 1:
+                    w2 = w_col1
                 elif j == 2:
-                    matrix_w = w_col2
-                    x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
-            elif KERNEL_WIDTH == 4:
-                if j == 1:
-                    matrix_w = w_col1
-                    matrix_x = col1
-                elif j == 2:
-                    matrix_w = w_col2
-                    matrix_x = col2
-                elif j == 3:
-                    matrix_w = w_col3
-                    x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
-
-            acc += matrix_x * matrix_w  # [BLOCK_N]
-
-        if KERNEL_WIDTH == 2:
-            col0 = matrix_x
-        elif KERNEL_WIDTH == 3:
-            col0 = col1
-            col1 = matrix_x
-        elif KERNEL_WIDTH == 4:
-            col0 = col1
-            col1 = col2
-            col2 = matrix_x
-
-        if SILU_ACTIVATION:
-            acc = acc / (1 + tl.exp(-acc))
-        mask_1d = (idx_token < segment_len) & (
-            idx_feats < dim
-        )  # token-index  # feature-index
-        output_token = (sequence_start_index + token_offset + idx_token).to(tl.int64)
-        if OUTPUT_SPLIT_SIZE:
-            # Store each channel group as a contiguous [tokens, channels] plane.
-            # KDA can consume Q/K/V directly without three materialization copies.
-            o_ptrs = (
-                o_ptr
-                + (idx_feats // OUTPUT_SPLIT_SIZE).to(tl.int64)
-                * total_tokens
-                * OUTPUT_SPLIT_SIZE
-                + output_token * OUTPUT_SPLIT_SIZE
-                + idx_feats % OUTPUT_SPLIT_SIZE
-            )
-        elif SPLIT_D0 > 0:
-            feat0 = tl.program_id(2) * BLOCK_N
-            in_k = feat0 >= SPLIT_D0
-            in_v = feat0 >= SPLIT_D1
-            col_base = tl.where(in_v, SPLIT_D1, tl.where(in_k, SPLIT_D0, 0))
-            o_width = tl.where(
-                in_v, dim - SPLIT_D1, tl.where(in_k, SPLIT_D1 - SPLIT_D0, SPLIT_D0)
-            ).to(tl.int64)
-            o_ptrs = (
-                o_ptr
-                + col_base.to(tl.int64) * total_tokens
-                + output_token * o_width
-                + (idx_feats - col_base)
-            )
+                    w2 = w_col2
+                else:
+                    w2 = w_col3
+                acc2 += xv * w2[None, :]
+            if SILU_ACTIVATION:
+                acc2 = acc2 / (1 + tl.exp(-acc2))
+            tl.store(o_ptrs2, acc2)
         else:
-            o_ptrs = o_ptr + output_token * stride_o_token + idx_feats * stride_o_dim
+            row_ok = t_loc < segment_len
+            for j in tl.static_range(KERNEL_WIDTH):
+                src = tok - (KERNEL_WIDTH - 1 - j)
+                m2 = (row_ok & (src >= 0))[:, None] & mask_x_1d[None, :]
+                xv = tl.load(
+                    x_rows + (src.to(tl.int64) * stride_x_token)[:, None],
+                    mask=m2,
+                    other=0.0,
+                )
+                # Taps before the sequence start take the prologue's col0..col2
+                # (the conv state, or zeros without an initial state).
+                if j <= 2:
+                    xv = tl.where((src == -1)[:, None], col2[None, :], xv)
+                if j <= 1:
+                    xv = tl.where((src == -2)[:, None], col1[None, :], xv)
+                if j == 0:
+                    xv = tl.where((src == -3)[:, None], col0[None, :], xv)
+                if j == 0:
+                    w2 = w_col0
+                elif j == 1:
+                    w2 = w_col1
+                elif j == 2:
+                    w2 = w_col2
+                else:
+                    w2 = w_col3
+                acc2 += xv * w2[None, :]
+            if SILU_ACTIVATION:
+                acc2 = acc2 / (1 + tl.exp(-acc2))
+            tl.store(o_ptrs2, acc2, mask=row_ok[:, None] & mask_x_1d[None, :])
+    else:
+        for idx_token in range(segment_len):
+            acc = acc_preload
 
-        tl.store(o_ptrs, acc, mask=mask_1d)
+            matrix_w = w_col0
+            matrix_x = col0
+            for j in tl.static_range(KERNEL_WIDTH):
+                if KERNEL_WIDTH == 2:
+                    if j == 1:  # KERNEL_WIDTH-1:
+                        matrix_w = w_col1
+                        x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
+                        matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+                elif KERNEL_WIDTH == 3:
+                    if j == 1:
+                        matrix_w = w_col1
+                        matrix_x = col1
+                    elif j == 2:
+                        matrix_w = w_col2
+                        x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
+                        matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+                elif KERNEL_WIDTH == 4:
+                    if j == 1:
+                        matrix_w = w_col1
+                        matrix_x = col1
+                    elif j == 2:
+                        matrix_w = w_col2
+                        matrix_x = col2
+                    elif j == 3:
+                        matrix_w = w_col3
+                        x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
+                        matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+
+                acc += matrix_x * matrix_w  # [BLOCK_N]
+
+            if KERNEL_WIDTH == 2:
+                col0 = matrix_x
+            elif KERNEL_WIDTH == 3:
+                col0 = col1
+                col1 = matrix_x
+            elif KERNEL_WIDTH == 4:
+                col0 = col1
+                col1 = col2
+                col2 = matrix_x
+
+            if SILU_ACTIVATION:
+                acc = acc / (1 + tl.exp(-acc))
+            mask_1d = (idx_token < segment_len) & (
+                idx_feats < dim
+            )  # token-index  # feature-index
+            output_token = (sequence_start_index + token_offset + idx_token).to(
+                tl.int64
+            )
+            if OUTPUT_SPLIT_SIZE:
+                # Store each channel group as a contiguous [tokens, channels] plane.
+                # KDA can consume Q/K/V directly without three materialization copies.
+                o_ptrs = (
+                    o_ptr
+                    + (idx_feats // OUTPUT_SPLIT_SIZE).to(tl.int64)
+                    * total_tokens
+                    * OUTPUT_SPLIT_SIZE
+                    + output_token * OUTPUT_SPLIT_SIZE
+                    + idx_feats % OUTPUT_SPLIT_SIZE
+                )
+            elif SPLIT_D0 > 0:
+                feat0 = tl.program_id(2) * BLOCK_N
+                in_k = feat0 >= SPLIT_D0
+                in_v = feat0 >= SPLIT_D1
+                col_base = tl.where(in_v, SPLIT_D1, tl.where(in_k, SPLIT_D0, 0))
+                o_width = tl.where(
+                    in_v, dim - SPLIT_D1, tl.where(in_k, SPLIT_D1 - SPLIT_D0, SPLIT_D0)
+                ).to(tl.int64)
+                o_ptrs = (
+                    o_ptr
+                    + col_base.to(tl.int64) * total_tokens
+                    + output_token * o_width
+                    + (idx_feats - col_base)
+                )
+            else:
+                o_ptrs = (
+                    o_ptr + output_token * stride_o_token + idx_feats * stride_o_dim
+                )
+
+            tl.store(o_ptrs, acc, mask=mask_1d)
 
 
 def causal_conv1d_fn(
@@ -579,7 +675,7 @@ def causal_conv1d_fn(
     is_channel_last = (x.stride(0) == 1) & (x.stride(1) > 1)
     dim, cu_seqlen = x.shape
     if split_dims is not None:
-        # Flat [q | k | v] planes; the split launch keeps the stock 256-wide tile.
+        # Flat [q | k | v] planes on the 256-wide split tile (_split_fwd_launch).
         if output_split_size or split_dims[0] % 256 or split_dims[1] % 256:
             raise ValueError(
                 "split_dims must be multiples of 256, without a split size"
@@ -718,7 +814,7 @@ def causal_conv1d_fn(
         SPLIT_D0=split_dims[0] if split_dims is not None else 0,
         SPLIT_D1=split_dims[1] if split_dims is not None else 0,
         **(
-            _STOCK_FWD_LAUNCH
+            _split_fwd_launch(width, dim)
             if split_dims is not None
             else _fwd_launch_config(block_table, width)
         ),
