@@ -13,7 +13,8 @@ from sglang.kernels.jit.utils import cache_once, load_jit
 from sglang.srt.utils import get_device_core_count
 from sglang.srt.utils.custom_op import register_custom_op
 
-MAX_ROWS = 1024
+# No row limit in the kernel itself; the prefill kernel starts at 4096 rows.
+MAX_ROWS = 4096
 SPLIT4_MAX_ROWS = 128
 SPLIT2_MAX_ROWS = 640
 
