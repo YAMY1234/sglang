@@ -198,6 +198,13 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
     if envs.SGLANG_OPT_MOE_PREFILL_AUTOTUNE.get():
         # The MoE prefill buckets are tuned only with the hook on.
         model_key_parts.append("moe_prefill_autotune")
+    # Tactics settled by a tuning file must not be served to a boot without it,
+    # nor survive a changed tuning file.
+    pin_file = envs.SGLANG_FLASHINFER_TACTIC_PIN_FILE.get()
+    if pin_file:
+        from sglang.srt.layers.moe.flashinfer_tactic_pins import tuning_file_digest
+
+        model_key_parts.append("tactic_pins=" + tuning_file_digest(pin_file))
     model_key = "|".join(model_key_parts)
     cache_key = hashlib.sha256(model_key.encode()).hexdigest()[:16]
     cache_dir = (
@@ -414,6 +421,14 @@ def run_flashinfer_autotune_forward(
     """Run flashinfer autotune forward."""
     with flashinfer_autotune_context(model_runner, run_lm_head=run_lm_head):
         forward_fn()
+        if envs.SGLANG_FLASHINFER_TACTIC_PIN_FILE.get():
+            from sglang.srt.layers.moe.flashinfer_tactic_pins import (
+                pin_decode_moe_tactics,
+            )
+
+            # Inside the context, so the saved autotune cache holds the pinned
+            # tactics; before any CUDA graph captures them.
+            pin_decode_moe_tactics()
 
 
 def maybe_flashinfer_autotune_speculative_draft(

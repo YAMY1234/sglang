@@ -10,9 +10,11 @@ captured prefill segment uses, so it stores the cache keys served prefill calls
 look up. The router GEMM and the shared expert are not called, so no other op is
 tuned at prefill sizes.
 
-Only the choice among FlashInfer's precompiled tactics changes. Each boot with
-the hook on runs one extra tuning pass over the prefill buckets, unless the
-autotune cache already holds them.
+Only the choice among FlashInfer's precompiled tactics changes. A tuning file
+(``SGLANG_FLASHINFER_TACTIC_PIN_FILE``, see ``flashinfer_tactic_pins``) can pin
+the tactic per prefill bucket and exclude split-K tactics. Each boot with the hook
+on runs one extra tuning pass over the prefill buckets, unless the autotune cache
+already holds them.
 """
 
 from __future__ import annotations
@@ -24,10 +26,16 @@ import time
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.flashinfer_tactic_pins import (
+    DEFAULT_TACTIC,
+    MOE_OP,
+    active_moe_tactic_pins,
+    settle_prefill_tactics,
+    valid_tactics_by_bucket,
+)
 
 logger = logging.getLogger(__name__)
 
-_MOE_OP = "flashinfer::trtllm_fp4_block_scale_moe"
 # The dual-stream MoE forward's router-front paths serve at most 16 tokens; the
 # hook mirrors its larger-M branch.
 _MIN_TOKENS = 17
@@ -36,6 +44,15 @@ _MIN_TOKENS = 17
 @functools.lru_cache(maxsize=None)
 def _log_inert_once(reason: str) -> None:
     logger.debug("MoE prefill autotune inactive: %s", reason)
+
+
+@functools.lru_cache(maxsize=None)
+def _warn_table_unmatched_once(shape) -> None:
+    logger.warning(
+        "The tuning file's prefill MoE table (shape %s) matched no tuned entry; "
+        "the tuner's picks are kept",
+        shape,
+    )
 
 
 def _eligible_block(model):
@@ -107,7 +124,7 @@ def _route_one_call(block, num_tokens: int, dtype: torch.dtype) -> bool:
 
 
 def _moe_entries(winners: dict) -> set:
-    return {key for key in winners if key.custom_op == _MOE_OP}
+    return {key for key in winners if key.custom_op == MOE_OP}
 
 
 def autotune_moe_prefill(model, num_tokens: int, *, dtype: torch.dtype) -> int:
@@ -117,6 +134,8 @@ def autotune_moe_prefill(model, num_tokens: int, *, dtype: torch.dtype) -> int:
     if block is None or num_tokens < _MIN_TOKENS:
         _log_inert_once(f"no eligible block, or {num_tokens} tokens < {_MIN_TOKENS}")
         return 0
+    # Read before any GPU work: a malformed tuning file fails the boot.
+    pins = active_moe_tactic_pins()
 
     tuner = AutoTuner.get()
     before = _moe_entries(tuner._winner_cache())
@@ -138,12 +157,33 @@ def autotune_moe_prefill(model, num_tokens: int, *, dtype: torch.dtype) -> int:
         torch.cuda.empty_cache()  # Free the dummy rows before graph capture sizes memory.
 
     with tuner._lock:
-        tuned = len(_moe_entries(tuner._winner_cache()) - before)
+        winners = tuner._winner_cache()
+        new_keys = _moe_entries(winners) - before
+        valid = {}
+        if pins is not None and pins.prefill is not None:
+            from flashinfer.fused_moe.backends.trtllm.sm100_runner import MoERunner
+
+            valid = valid_tactics_by_bucket(MoERunner.valid_tactics_dict, pins.shape)
+        rows = settle_prefill_tactics(winners, new_keys, pins=pins, valid=valid)
+    for bucket, final, tuned, source in rows:
+        logger.debug(
+            "MoE prefill autotune: bucket=%d tactic=%s tuned=%s source=%s",
+            bucket,
+            final,
+            tuned,
+            source,
+        )
+    from_table = sum(1 for row in rows if row[3].startswith("pin"))
+    if pins is not None and pins.prefill is not None and rows and not from_table:
+        _warn_table_unmatched_once(pins.shape)
     logger.info(
         "MoE prefill autotune (SGLANG_OPT_MOE_PREFILL_AUTOTUNE): %d tokens, %d "
-        "buckets tuned this boot, prequant=%s, %.1f s%s",
+        "buckets tuned this boot, %d set from the tuning file, %d on the default "
+        "tactic; prequant=%s, %.1f s%s",
         num_tokens,
-        tuned,
+        len(rows),
+        from_table,
+        sum(1 for row in rows if row[1] == DEFAULT_TACTIC),
         prequant,
         time.perf_counter() - started,
         ", skipped after OOM" if oom else "",
@@ -152,4 +192,4 @@ def autotune_moe_prefill(model, num_tokens: int, *, dtype: torch.dtype) -> int:
         return 0
     if envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND.get():
         return 0  # An explicitly requested whole-model EXTEND pass still runs.
-    return max(1, tuned)
+    return max(1, len(rows))

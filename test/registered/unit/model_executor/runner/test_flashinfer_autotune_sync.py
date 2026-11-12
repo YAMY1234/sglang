@@ -362,16 +362,22 @@ class TestMoePrefillAutotune(CustomTestCase):
         from sglang.srt.layers.moe import prefill_autotune
 
         self.module = prefill_autotune
-        Key = namedtuple("Key", "custom_op bucket")
-        self.winners = {Key("flashinfer::trtllm_fp4_block_scale_moe", 128): 0}
+        # AutoTuner keys and (tactic, profile) winners, as the tuning-file settle reads them.
+        Key = namedtuple("Key", "custom_op nearest_profile extras")
+
+        def key(op, bucket):
+            return Key(op, ((bucket,),) * 5, _moe_extras())
+
+        moe_op = "flashinfer::trtllm_fp4_block_scale_moe"
+        self.winners = {key(moe_op, 128): ([8, 1], None)}
         self.tuner = SimpleNamespace(_winner_cache=lambda: self.winners, _lock=Lock())
 
         def route(hidden_states, *, precomputed_router):
             self.calls.append((hidden_states, precomputed_router))
             rows = hidden_states.shape[0]
             for bucket in (1024, 2048, rows):
-                self.winners[Key("flashinfer::trtllm_fp4_block_scale_moe", bucket)] = 0
-            self.winners[Key("flashinfer::bmm_bf16", rows)] = 0
+                self.winners[key(moe_op, bucket)] = ([32, 1], None)
+            self.winners[key("flashinfer::bmm_bf16", rows)] = (0, None)
 
         self.calls = []
         self.block = SimpleNamespace(
@@ -461,6 +467,413 @@ class TestMoePrefillAutotune(CustomTestCase):
                 0,
             )
         self.assertEqual(len(self.calls), 1)
+
+
+def _moe_extras(hidden=2560, intermediate=640, experts=512, top_k=10, fused_shared=0):
+    # MoERunner.get_cache_key_extras layout of FlashInfer 0.7.2 and 0.7.3.
+    extras = [0] * 16
+    extras[1], extras[2], extras[4] = top_k, experts, fused_shared
+    extras[8], extras[10] = hidden, intermediate
+    return tuple(extras)
+
+
+class _PinKey(SimpleNamespace):
+    __hash__ = object.__hash__
+
+
+PIN_SHAPE = (2560, 640, 512, 10)  # hidden, intermediate, experts, top_k
+PIN_METADATA = {
+    "flashinfer_version": "0.7.3",
+    "cuda_version": "13.4",
+    "cublas_version": "13.8.1",
+    "gpu": "NVIDIA Graphics Device",
+    "sm": "10.7",
+}
+PIN_MOE_SECTION = dict(
+    hidden_size=2560, intermediate_size=640, num_experts=512, top_k=10
+)
+# Synthetic tactics: none of these is a tuned choice.
+TA, TB, TC, SPLIT = (64, 7), (64, 9), (256, 3), (4, 11)
+
+
+def _pin_key(bucket, **shape):
+    from sglang.srt.layers.moe.flashinfer_tactic_pins import MOE_OP
+
+    return _PinKey(
+        custom_op=MOE_OP, nearest_profile=[(bucket,)] * 5, extras=_moe_extras(**shape)
+    )
+
+
+def _pin_winners(*entries):
+    """{key: (tactic, profile)} the way FlashInfer's AutoTuner stores winners."""
+    return {_pin_key(bucket): (tactic, "profile") for bucket, tactic in entries}
+
+
+def _pins(prefill=None, split_k=(), decode=None):
+    from sglang.srt.layers.moe.flashinfer_tactic_pins import MoeTacticPins
+
+    return MoeTacticPins(
+        flashinfer_version="0.7.3",
+        shape=PIN_SHAPE,
+        split_k=frozenset(split_k),
+        prefill=prefill,
+        decode=decode,
+    )
+
+
+class _TuningFileCase(CustomTestCase):
+    def setUp(self):
+        from sglang.srt.layers.moe import flashinfer_tactic_pins as pins_module
+
+        self.pins_module = pins_module
+        for cached in (pins_module.read_tuning_file, pins_module._moe_pins_of):
+            cached.cache_clear()
+            self.addCleanup(cached.cache_clear)
+
+    def _file(self, document):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(document, f)
+        self.addCleanup(os.unlink, f.name)
+        return f.name
+
+
+class TestTacticPinFile(_TuningFileCase):
+    """SGLANG_FLASHINFER_TACTIC_PIN_FILE: the file applies only to the stack it was written for."""
+
+    def test_parses_tables_and_rejects_malformed_entries(self):
+        parse = self.pins_module.parse_moe_tactic_pins
+        section = dict(PIN_MOE_SECTION, split_k_tactics=[list(SPLIT)])
+        section["prefill"] = {"1024": list(TA), "8192": -1}
+        section["decode"] = {"4": list(TB), "512": -1}
+        pins = parse({"_metadata": PIN_METADATA, "trtllm_fp4_block_scale_moe": section})
+        self.assertEqual(pins.shape, PIN_SHAPE)
+        self.assertEqual(pins.split_k, frozenset({SPLIT}))
+        self.assertEqual(pins.prefill, {1024: TA, 8192: -1})
+        self.assertEqual(pins.decode, {4: TB, 512: -1})
+        for bad_section in (
+            {"prefill": {"1024": [64]}},
+            {"prefill": {"1024": [64, -1]}},
+            {"prefill": {"0": -1}},
+            {"prefill": {"x": -1}},
+            {"prefill": [[1024, 64, 7]]},
+            {"split_k_tactics": [-1]},
+            {"hidden_size": None},
+            {"decode": {"3": -1}},
+            {"decode": {"1024": -1}},
+        ):
+            with self.subTest(bad_section=bad_section), self.assertRaises(ValueError):
+                parse(
+                    {
+                        "_metadata": PIN_METADATA,
+                        "trtllm_fp4_block_scale_moe": dict(
+                            PIN_MOE_SECTION, **bad_section
+                        ),
+                    }
+                )
+        for field in PIN_METADATA:
+            metadata = {k: v for k, v in PIN_METADATA.items() if k != field}
+            with self.subTest(missing=field), self.assertRaises(ValueError):
+                parse(
+                    {
+                        "_metadata": metadata,
+                        "trtllm_fp4_block_scale_moe": PIN_MOE_SECTION,
+                    }
+                )
+
+    def test_pins_apply_only_on_the_exact_stack_and_device(self):
+        # Tactic indices move between FlashInfer builds, cuBLAS and CUDA versions,
+        # devices and SMs, so every field must match exactly; the device name is
+        # what tells a node reporting "NVIDIA Graphics Device" from a VR NVL72.
+        path = self._file(
+            {"_metadata": PIN_METADATA, "trtllm_fp4_block_scale_moe": PIN_MOE_SECTION}
+        )
+        cases = [({}, True)] + [
+            ({field: value}, False)
+            for field, value in (
+                ("flashinfer_version", "0.7.3.post1"),
+                ("cuda_version", "13.0"),
+                ("cublas_version", "13.1.0"),
+                ("gpu", "NVIDIA VR NVL72"),
+                ("sm", "10.0"),
+            )
+        ]
+        with autotune.envs.SGLANG_FLASHINFER_TACTIC_PIN_FILE.override(path):
+            for change, applies in cases:
+                with (
+                    self.subTest(change=change),
+                    patch.object(
+                        self.pins_module,
+                        "_current_metadata",
+                        return_value={**PIN_METADATA, **change},
+                    ),
+                ):
+                    self.assertEqual(
+                        self.pins_module.active_moe_tactic_pins() is not None, applies
+                    )
+        self.assertIsNone(self.pins_module.active_moe_tactic_pins())
+
+    def test_only_flashinfer_builds_with_a_known_cache_key_layout(self):
+        for version, applies in (("0.7.2", True), ("0.7.3", True), ("0.7.4", False)):
+            metadata = {**PIN_METADATA, "flashinfer_version": version}
+            path = self._file(
+                {"_metadata": metadata, "trtllm_fp4_block_scale_moe": PIN_MOE_SECTION}
+            )
+            for cached in (
+                self.pins_module.read_tuning_file,
+                self.pins_module._moe_pins_of,
+            ):
+                cached.cache_clear()
+            with (
+                self.subTest(version=version),
+                autotune.envs.SGLANG_FLASHINFER_TACTIC_PIN_FILE.override(path),
+                patch.object(
+                    self.pins_module, "_current_metadata", return_value=metadata
+                ),
+            ):
+                self.assertEqual(
+                    self.pins_module.active_moe_tactic_pins() is not None, applies
+                )
+
+    def test_indeterminate_metadata_never_matches(self):
+        for value in ("unknown", "None"):
+            unknown = {**PIN_METADATA, "cublas_version": value}
+            path = self._file(
+                {"_metadata": unknown, "trtllm_fp4_block_scale_moe": PIN_MOE_SECTION}
+            )
+            for cached in (
+                self.pins_module.read_tuning_file,
+                self.pins_module._moe_pins_of,
+            ):
+                cached.cache_clear()
+            with (
+                self.subTest(value=value),
+                autotune.envs.SGLANG_FLASHINFER_TACTIC_PIN_FILE.override(path),
+                patch.object(
+                    self.pins_module, "_current_metadata", return_value=unknown
+                ),
+            ):
+                self.assertIsNone(self.pins_module.active_moe_tactic_pins())
+
+    def test_tuning_file_gets_its_own_autotune_cache(self):
+        """With cache reuse on, a boot loads the saved tactics before any tuning, so
+        settled tactics must not be found by a boot without the same file."""
+        cache_dir = tempfile.mkdtemp()
+        self.addCleanup(
+            lambda: __import__("shutil").rmtree(cache_dir, ignore_errors=True)
+        )
+        runner = SimpleNamespace(
+            device="cuda",
+            dtype=torch.bfloat16,
+            is_draft_worker=False,
+            model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+        )
+        parallel = SimpleNamespace(
+            tp_size=1,
+            pp_size=1,
+            attn_dp_size=1,
+            moe_ep_size=1,
+            tp_rank=0,
+            pp_rank=0,
+            dp_rank=0,
+        )
+
+        def cache_path():
+            with (
+                patch.dict(
+                    sys.modules, {"flashinfer": SimpleNamespace(__version__="0.7.3")}
+                ),
+                patch.object(torch.cuda, "get_device_capability", return_value=(10, 7)),
+                patch.multiple(
+                    autotune,
+                    get_model=lambda: SimpleNamespace(model_path="m", quantization="q"),
+                    get_exec=lambda: SimpleNamespace(
+                        moe=SimpleNamespace(moe_runner_backend="flashinfer_trtllm")
+                    ),
+                    get_parallel=lambda: parallel,
+                    get_flashinfer_autotune_skip_ops=lambda mr: set(),
+                ),
+                autotune.envs.SGLANG_CACHE_DIR.override(cache_dir),
+            ):
+                return autotune.flashinfer_autotune_cache_path(runner)
+
+        document = {
+            "_metadata": PIN_METADATA,
+            "trtllm_fp4_block_scale_moe": dict(PIN_MOE_SECTION, decode={"8": list(TA)}),
+        }
+        stock = cache_path()
+        path = self._file(document)
+        with autotune.envs.SGLANG_FLASHINFER_TACTIC_PIN_FILE.override(path):
+            pinned = cache_path()
+            document["trtllm_fp4_block_scale_moe"]["decode"] = {"8": list(TB)}
+            with open(path, "w") as f:
+                json.dump(document, f)
+            changed = cache_path()
+        self.assertEqual(len({stock, pinned, changed}), 3)
+        self.assertEqual(cache_path(), stock)
+
+
+class TestSettleTactics(CustomTestCase):
+    def setUp(self):
+        from sglang.srt.layers.moe import flashinfer_tactic_pins as pins_module
+
+        self.pins_module = pins_module
+
+    def _settle_prefill(self, winners, pins, valid):
+        before = dict(winners)
+        rows = self.pins_module.settle_prefill_tactics(
+            winners, list(winners), pins=pins, valid=valid
+        )
+        changed = {k for k in winners if winners[k] != before[k]}
+        return {row[0]: row[1:] for row in rows}, changed
+
+    def test_prefill_without_pins_the_tuner_picks_stand(self):
+        winners = _pin_winners((768, list(SPLIT)), (1024, list(TB)))
+        rows, changed = self._settle_prefill(winners, None, {})
+        self.assertEqual(changed, set())
+        self.assertEqual(rows[768], (SPLIT, SPLIT, "tuner"))
+
+    def test_prefill_table_falls_back_to_the_default_tactic_not_the_tuner(self):
+        winners = _pin_winners(
+            (768, list(SPLIT)),
+            (1024, list(TC)),
+            (2048, list(TC)),
+            (4096, list(TC)),
+            (8192, list(TC)),
+        )
+        pins = _pins(
+            prefill={768: TA, 1024: -1, 2048: (64, 999), 4096: SPLIT}, split_k={SPLIT}
+        )
+        rows, _ = self._settle_prefill(
+            winners, pins, {768: {TA}, 2048: {TB}, 4096: {SPLIT}}
+        )
+        self.assertEqual(rows[768][0::2], (TA, "pin"))
+        self.assertEqual(rows[1024][0::2], (-1, "pin_default"))
+        self.assertEqual(rows[2048][0::2], (-1, "pin_invalid"))
+        self.assertEqual(rows[4096][0::2], (-1, "pin_split_k"))
+        self.assertEqual(rows[8192][0::2], (-1, "pin_absent"))
+        stored = {k.nearest_profile[4][0]: v[0] for k, v in winners.items()}
+        self.assertEqual(
+            stored, {768: list(TA), 1024: -1, 2048: -1, 4096: -1, 8192: -1}
+        )
+
+    def test_prefill_split_k_is_excluded_from_tuner_picks_too(self):
+        winners = _pin_winners((768, list(SPLIT)), (1024, list(TB)))
+        rows, _ = self._settle_prefill(winners, _pins(split_k={SPLIT}), {})
+        self.assertEqual(rows[768][0::2], (-1, "tuner_split_k"))
+        self.assertEqual(rows[1024][0::2], (TB, "tuner"))
+
+    def test_valid_tactics_read_per_bucket_on_both_flashinfer_key_layouts(self):
+        def query_072(num_tokens, experts=512):
+            return (0, 0, 0, 10, 2560, 2560, 640, experts, 0, 0, 0, 0, num_tokens, 0)
+
+        def query_073(num_tokens, experts=512):
+            # 0.7.3 adds the global expert count after the local one.
+            return (
+                0,
+                0,
+                0,
+                10,
+                2560,
+                2560,
+                640,
+                experts,
+                512,
+                0,
+                0,
+                0,
+                0,
+                num_tokens,
+                0,
+            )
+
+        for query in (query_072, query_073):
+            with self.subTest(layout=query.__name__):
+                valid = self.pins_module.valid_tactics_by_bucket(
+                    {
+                        ("runner", query(768)): [list(TA), [-1, -1]],
+                        ("runner", query(768, experts=256)): [list(TB)],
+                        ("runner", query(1024)): [TC],
+                        ("runner", (0,) * 13): [TC],
+                    },
+                    PIN_SHAPE,
+                )
+                self.assertEqual(valid, {768: {TA, -1}, 1024: {TC}})
+
+    def test_refused_decode_pins_keep_the_tuner_pick(self):
+        # Decode buckets are tuned at startup, so unlike prefill the stock choice a
+        # refused pin falls back to is the tuner's pick, not the default tactic.
+        winners = _pin_winners(
+            (4, list(TC)), (8, list(TB)), (16, list(TB)), (32, list(TC)), (64, list(TB))
+        )
+        other_shape = _PinKey(**vars(_pin_key(4, intermediate=1024)))
+        winners[other_shape] = (list(TC), "profile")
+        pins = _pins(
+            decode={4: TA, 8: SPLIT, 16: (64, 999), 32: -1, 128: TA}, split_k={SPLIT}
+        )
+        rows = self.pins_module.settle_decode_tactics(
+            winners, pins=pins, valid={4: {TA}, 8: {SPLIT}, 16: {TB}}
+        )
+        self.assertEqual(
+            sorted((row[0], row[3]) for row in rows),
+            [
+                (4, "pin"),
+                (4, "pin_shape_skip"),
+                (8, "pin_split_k_refused"),
+                (16, "pin_invalid"),
+                (32, "pin_default"),
+            ],
+        )
+        stored = {
+            (k.nearest_profile[4][0], k is other_shape): v[0]
+            for k, v in winners.items()
+        }
+        self.assertEqual(
+            stored,
+            {
+                (4, False): list(TA),
+                (4, True): list(TC),
+                (8, False): list(TB),
+                (16, False): list(TB),
+                (32, False): -1,
+                (64, False): list(TB),
+            },
+        )
+
+    def test_decode_pins_are_settled_before_the_cache_is_saved(self):
+        # With cache reuse the next boot serves the saved tactics without tuning,
+        # so the pins must be in place when the autotune context saves on exit.
+        events = []
+
+        class _Context:
+            def __enter__(self):
+                events.append("enter")
+
+            def __exit__(self, *exc):
+                events.append("save")
+
+        with (
+            patch.object(
+                autotune, "flashinfer_autotune_context", lambda *a, **k: _Context()
+            ),
+            patch.object(
+                self.pins_module,
+                "pin_decode_moe_tactics",
+                side_effect=lambda: events.append("pin"),
+            ),
+        ):
+            with autotune.envs.SGLANG_FLASHINFER_TACTIC_PIN_FILE.override(None):
+                autotune.run_flashinfer_autotune_forward(
+                    None, lambda: events.append("tune"), run_lm_head=False
+                )
+            self.assertEqual(events, ["enter", "tune", "save"])
+            events.clear()
+            with autotune.envs.SGLANG_FLASHINFER_TACTIC_PIN_FILE.override(
+                "/tuning.json"
+            ):
+                autotune.run_flashinfer_autotune_forward(
+                    None, lambda: events.append("tune"), run_lm_head=False
+                )
+            self.assertEqual(events, ["enter", "tune", "pin", "save"])
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "FlashInfer requires CUDA")
