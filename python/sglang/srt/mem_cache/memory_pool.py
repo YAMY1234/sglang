@@ -85,12 +85,13 @@ from sglang.srt.mem_cache.layout.token_major import (
 )
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_flags, get_parallel, get_platform
+from sglang.srt.runtime_context import get_flags, get_memory, get_parallel, get_platform
 from sglang.srt.utils import (
     ceil_align,
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
+    is_float4_e2m1fn_x2,
     is_gfx95_supported,
     is_hip,
     is_npu,
@@ -4231,7 +4232,16 @@ class HybridLinearKVPool(KVCache):
             DSAPoolClass = (
                 full_kv_pool_class
                 if full_kv_pool_class is not None
-                else DSATokenToKVPool
+                else (
+                    DSANVFP4TokenToKVPool
+                    if is_float4_e2m1fn_x2(dtype)
+                    else DSATokenToKVPool
+                )
+            )
+            dsa_quant_kwargs = (
+                {"quant_method": quant_method}
+                if issubclass(DSAPoolClass, DSANVFP4TokenToKVPool)
+                else {}
             )
             self.full_kv_pool = DSAPoolClass(
                 size=size,
@@ -4251,6 +4261,7 @@ class HybridLinearKVPool(KVCache):
                 skip_topk_layers=skip_topk_layers,
                 kv_scale_ue8m0=kv_scale_ue8m0,
                 use_fp4_indexer=use_fp4_indexer,
+                **dsa_quant_kwargs,
             )
         else:
             MLAPoolClass = (
@@ -4439,6 +4450,11 @@ class HybridLinearKVPool(KVCache):
         self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_raw_kv_buffer(layer_id)
+
+    def get_nvfp4_mla_buffers(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
+        self._wait_for_layer(layer_id)
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_nvfp4_mla_buffers(layer_id)
 
     def get_dequant_workspace(self) -> tuple[torch.Tensor, torch.Tensor]:
         return self.full_kv_pool.get_dequant_workspace()
@@ -5736,6 +5752,155 @@ class DSATokenToKVPool(MLATokenToKVPool):
         for index_k_cache in self.index_k_with_scale_buffer:
             kv_size_bytes += get_tensor_size_bytes(index_k_cache)
         return kv_size_bytes
+
+
+class DSANVFP4TokenToKVPool(DSATokenToKVPool):
+    """DSA pool with NVFP4 storage for the main MLA cache.
+
+    The indexer cache inherited from :class:`DSATokenToKVPool` remains in its
+    existing FP8+scale format.  Each token's 576-element MLA row is stored as
+    one packed uint8 row: 288 bytes of E2M1 pairs (low nibble first) followed
+    by 36 E4M3 scales, one per block of 16 elements.  ``kv_cache_dim`` is the
+    packed width (324), so HiCache host pools and disaggregation transfers move
+    the row as opaque bytes, like the FP8 packed rows.
+
+    This first implementation intentionally omits TensorRT-LLM's optional
+    64-element residual.  The raw buffers are exposed to the DSA backend, which
+    gathers selected rows and dequantizes them into compact FP8 before invoking
+    TRTLLM-GEN.
+    """
+
+    scale_block_size = 16
+
+    def __init__(self, *args, quant_method=None, **kwargs):
+        self.quant_method = quant_method
+        super().__init__(*args, **kwargs)
+
+    @property
+    def nvfp4_head_dim(self) -> int:
+        """Logical (dequantized) MLA row width."""
+        return self.kv_lora_rank + self.qk_rope_head_dim
+
+    def _create_buffers(self):
+        head_dim = self.nvfp4_head_dim
+        assert head_dim % self.scale_block_size == 0, (
+            f"NVFP4 MLA cache dim {head_dim} must be divisible by "
+            f"{self.scale_block_size}"
+        )
+        self.kv_cache_dim = head_dim // 2 + head_dim // self.scale_block_size
+        self.store_dtype = torch.uint8
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                rows = self.size + self.page_size
+                self.kv_buffer = [
+                    torch.zeros(
+                        (rows, 1, self.kv_cache_dim),
+                        dtype=torch.uint8,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                # One dequantization scale per local cache layer, the same on
+                # every rank and role, so it never travels with the rows.
+                self.kv_global_scales = torch.ones(
+                    self.layer_num, dtype=torch.float32, device=self.device
+                )
+        if self.quant_method is not None:
+            # Indexed by global layer id; set before any read, so rows that
+            # arrive by PD or HiCache decode with the writer's scale.
+            scales = self.quant_method.k_scales_float
+            for idx in range(self.layer_num):
+                layer_id = self.start_layer + idx
+                if layer_id < len(scales):
+                    self.kv_global_scales[idx] = scales[layer_id]
+
+    def _clear_buffers(self):
+        if hasattr(self, "kv_global_scales"):
+            del self.kv_global_scales
+        super()._clear_buffers()
+
+    def get_device_pool_infos(self) -> tuple[DevicePoolInfo, ...]:
+        io_backend = get_memory().hicache_io_backend
+        if io_backend != "direct":
+            raise ValueError(
+                "HiCache with the NVFP4 DSA cache requires --hicache-io-backend "
+                f"direct (got {io_backend}): the packed {self.kv_cache_dim}-byte "
+                "row is not a multiple of the kernel backend's 8-byte copy unit."
+            )
+        return super().get_device_pool_infos()
+
+    def _local_layer_idx(self, layer_id: int) -> int:
+        idx = layer_id - self.start_layer
+        assert 0 <= idx < self.layer_num, (
+            f"NVFP4 MLA layer {layer_id} is outside local range "
+            f"[{self.start_layer}, {self.start_layer + self.layer_num})"
+        )
+        return idx
+
+    def _global_scale_for_write(self, layer: RadixAttention, idx: int) -> torch.Tensor:
+        scale = None
+        if self.quant_method is not None:
+            scales = getattr(self.quant_method, "k_scales_gpu", None)
+            if scales is not None and layer.layer_id < scales.numel():
+                scale = scales[layer.layer_id : layer.layer_id + 1]
+        if scale is None:
+            scale = getattr(layer, "k_scale", None)
+        if scale is None:
+            scale = getattr(layer, "k_scale_float", None)
+        if scale is None:
+            scale = 1.0
+        dst = self.kv_global_scales[idx : idx + 1]
+        if isinstance(scale, torch.Tensor):
+            dst.copy_(scale.reshape(-1)[:1].to(device=dst.device, dtype=dst.dtype))
+        else:
+            dst.fill_(float(scale))
+        return dst
+
+    def set_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc_info,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+        layer_id_override: Optional[int] = None,
+    ):
+        assert not get_parallel().dcp_enabled, (
+            "The basic NVFP4 DSA cache path does not yet support DCP-sharded writes."
+        )
+        loc, _, _ = unwrap_write_loc(loc_info)
+        self._check_physical_write_loc(loc_info, "set_mla_kv_buffer (DSA-NVFP4)")
+        maybe_detect_oob(
+            loc, 0, self.size + self.page_size, "set_mla_kv_buffer (DSA-NVFP4)"
+        )
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
+        idx = self._local_layer_idx(layer_id)
+        if cache_k_rope is None or cache_k_rope.numel() == 0:
+            cache_k = cache_k_nope
+        else:
+            cache_k = torch.cat((cache_k_nope, cache_k_rope), dim=-1)
+        cache_k = cache_k.reshape(cache_k.shape[0], 1, self.nvfp4_head_dim).contiguous()
+
+        from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4KVQuantizeUtil
+
+        global_scale = self._global_scale_for_write(layer, idx)
+        packed, block_scales, _ = NVFP4KVQuantizeUtil.quantize(cache_k, global_scale)
+        self.kv_buffer[idx][loc] = torch.cat(
+            (packed.view(torch.uint8), block_scales.view(torch.uint8)), dim=-1
+        )
+
+    def get_nvfp4_mla_buffers(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Packed ``[slots, 1, 324]`` uint8 rows and the layer's global scale."""
+        idx = self._local_layer_idx(layer_id)
+        # Same HiCache load-back barrier as get_key_buffer.
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(idx)
+        return self.kv_buffer[idx], self.kv_global_scales[idx : idx + 1]
 
 
 def move_kv_cache_native(

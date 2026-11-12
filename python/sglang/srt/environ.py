@@ -893,6 +893,36 @@ class Envs:
     # Buffer mode: store only the SWA window ending at each node (what a
     # prefetch ending there restores) instead of every SWA page.
     SGLANG_ENABLE_HICACHE_SWA_TAIL_ONLY_BACKUP = EnvBool(False)
+    # Cache mode: write L3 when a host page is evicted, not at L2 admission; a page
+    # leaves the host pool only after its L3 write is acknowledged.
+    SGLANG_OPT_HICACHE_STORAGE_WRITE_BACK = EnvBool(False)
+    # Host-pool fraction one eviction shortfall writes to L3 ahead of need.
+    # Arbitrary; no evidence this is the right size.
+    SGLANG_HICACHE_STORAGE_WRITE_BACK_BATCH_FRACTION = EnvFloat(0.01)
+    # Seconds a write-back process waits at SIGTERM / exit for its L3 writes in
+    # flight before the final stats line; keep it inside the launcher's SIGKILL grace.
+    SGLANG_HICACHE_STORAGE_WRITE_BACK_DRAIN_TIMEOUT = EnvFloat(20.0)
+    # Write-back as a dirty-page cleaner (needs the Rust TreeCore): host copies are
+    # not pinned; a page storage lacks is "dirty" and only host-leaf eviction skips
+    # it. Fractions are of the host pool's pages, per rank.
+    SGLANG_HICACHE_STORAGE_WRITE_BACK_CLEANER = EnvBool(False)
+    # Begin writing the coldest dirty pages when unissued dirty pages exceed this.
+    SGLANG_HICACHE_STORAGE_WRITE_BACK_DIRTY_START_FRACTION = EnvFloat(0.5)
+    # Clean (or free) pages the cleaner aims to keep; below it is a floor breach.
+    SGLANG_HICACHE_STORAGE_WRITE_BACK_MIN_CLEAN_FRACTION = EnvFloat(0.3)
+    # Cap on cleaner writes ahead of eviction: written + in flight - host evicted.
+    SGLANG_HICACHE_STORAGE_WRITE_BACK_PREFETCH_BUDGET_FRACTION = EnvFloat(0.5)
+    # Cap on the cleaner's writes in flight per rank (each PP rank writes its own layers).
+    SGLANG_HICACHE_STORAGE_WRITE_BACK_MAX_INFLIGHT_FRACTION = EnvFloat(0.04)
+    # Pages per storage IO call (one NIXL transfer per service carries all of them).
+    SGLANG_HICACHE_STORAGE_BATCH_PAGES = EnvInt(128)
+    # Cache mode: write L3 from the coldest L2 pages ahead of eviction instead of at
+    # L2 admission, so the two tiers hold different pages. Python tree core only.
+    SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT = EnvBool(False)
+    # Fraction of the host pool kept free-or-already-in-L3 at the LRU tail. It must
+    # exceed (storage write latency) x (host eviction rate) / (host pool tokens);
+    # 0.05 leaves ~2x headroom for a ~1 s write and a 30M-token pool churning 1M tok/s.
+    SGLANG_HICACHE_L3_EVICT_WRITE_RESERVE_FRACTION = EnvFloat(0.05)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the

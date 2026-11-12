@@ -64,6 +64,7 @@ from sglang.srt.disaggregation.utils import (
     kv_layout_signature,
     poll_and_all_reduce_attn_cp_tp_group,
     poll_and_all_reduce_prefill_pp,
+    poll_and_all_reduce_prefill_pp_sections,
     prepare_abort,
     setup_state_kv_args,
 )
@@ -246,6 +247,13 @@ class PrefillBootstrapQueue:
         )
         self.transfer_backend = transfer_backend
         self.pp_poll_sync_work_list: List = []
+        # Retraction recomputes whose room's previous request has not been
+        # released yet; see add().
+        self.room_waiters = IndexedReqList(
+            ListKind.PD_ROOM_WAITERS,
+            abort=self._abort_room_waiters,
+            req_of=lambda waiter: waiter[0],
+        )
         if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
             if self.is_mla_backend:
                 raise RuntimeError(
@@ -391,6 +399,14 @@ class PrefillBootstrapQueue:
             self.scheduler.model_config.num_hidden_layers,
         )
 
+        if self.transfer_backend == TransferBackend.MOONCAKE:
+            from sglang.srt.disaggregation.nvfp4_pd import bind_source
+            if get_parallel().attn_cp_size != 1 or get_parallel().attn_dcp_size != 1:
+                if hasattr(self.token_to_kv_pool, "get_nvfp4_mla_buffers"):
+                    raise ValueError("H28 mixed PD currently supports CP1/DCP1 only")
+            bind_source(kv_args, self.token_to_kv_pool, draft_kv_pool,
+                        self.scheduler.model_config.num_hidden_layers)
+
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager_kwargs = (
             {"dcp_remote_decode_layout": dcp_remote_decode_layout}
@@ -491,9 +507,41 @@ class PrefillBootstrapQueue:
         if is_unadmitted_reject(req):
             self.scheduler.retire_unadmitted_request(req)
             return
+        deferred = self.kv_manager.deferred_bootstrap
+        if (
+            deferred is not None
+            and req.bootstrap_host != FAKE_BOOTSTRAP_HOST
+            and deferred.awaits_release(req.bootstrap_room)
+        ):
+            # Decode heard the previous request's Success from the transfer
+            # worker and recomputes before this side released the room. Every
+            # PP stage releases at the same loop iteration, so they agree.
+            self.room_waiters.join([(req, num_kv_heads)])
+            return
         if not self.create_sender(req, num_kv_heads):
             return
         self.queue.join([req])
+
+    def admit_room_waiters(self) -> None:
+        """Enqueue the waiting recomputes whose rooms have been released."""
+        if not self.room_waiters:
+            return
+        deferred = self.kv_manager.deferred_bootstrap
+        waiters = list(self.room_waiters.items())
+        self.room_waiters.clear()
+        for req, num_kv_heads in waiters:
+            if deferred.awaits_release(req.bootstrap_room):
+                self.room_waiters.join([(req, num_kv_heads)])
+            elif self.create_sender(req, num_kv_heads):
+                self.queue.join([req])
+
+    def _abort_room_waiters(self, recv_req: AbortReq) -> None:
+        # Waiters have no sender yet and hold no KV.
+        for req in self.room_waiters.take(lambda req: recv_req.matches(req.rid)):
+            logger.debug(f"Abort room-waiting request. {req.rid=}")
+            self.scheduler.request_retirer.abort(
+                req, finished_reason=recv_req.finished_reason
+            )
 
     def extend(self, reqs: List[Req], num_kv_heads: int) -> None:
         for req in reqs:
@@ -537,9 +585,14 @@ class PrefillBootstrapQueue:
         )
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
-    def pop_bootstrapped(self) -> List[Req]:
-        """Pop the reqs which have finished bootstrapping."""
+    def pop_bootstrapped(self, polls: Optional[List[int]] = None) -> List[Req]:
+        """Pop the reqs which have finished bootstrapping.
 
+        ``polls`` is a PP consensus poll of ``self.queue`` the caller already synced.
+        """
+
+        if polls is None:
+            self.admit_room_waiters()
         bootstrapped_reqs = []
         indices_to_remove = set()
 
@@ -548,7 +601,9 @@ class PrefillBootstrapQueue:
 
         # The polls are reduced across ranks in this order.
         queue = list(self.queue)
-        if self.pp_size > 1:
+        if polls is not None:
+            pass
+        elif self.pp_size > 1:
             polls = poll_and_all_reduce_prefill_pp(
                 [req.disagg_kv_sender for req in queue],
                 self.scheduler.attn_cp_cpu_group,
@@ -1075,14 +1130,6 @@ class SchedulerDisaggregationPrefillMixin:
         draft_input = result.next_draft_input
         draft_hidden_states_cpu = None
         draft_dsa_topk_indices_cpu = None
-        if self.spec_algorithm.is_eagle() and draft_input is not None:
-            draft_hidden_states_cpu = draft_input.hidden_states.to(
-                "cpu", non_blocking=False
-            )
-            if batch.spec_info.dsa_topk_indices is not None:
-                draft_dsa_topk_indices_cpu = batch.spec_info.dsa_topk_indices.to(
-                    "cpu", non_blocking=False
-                )
         # Transfer kv for prefill completed requests and add it into disagg_prefill_transfer_queue
         next_token_ids = result.next_token_ids.tolist()
         self.batch_result_processor.move_logprobs_to_cpu(
@@ -1145,6 +1192,22 @@ class SchedulerDisaggregationPrefillMixin:
                         aborted_reqs.append(req)
                     advance_logprob_pt(i, req)
                     continue
+
+                # Materialize auxiliary CPU data only for a completed request
+                # that survives abort/retry/sampling checks. Keep the existing
+                # synchronous copy and per-request clone ownership contract.
+                if (
+                    draft_hidden_states_cpu is None
+                    and self.spec_algorithm.is_eagle()
+                    and draft_input is not None
+                ):
+                    draft_hidden_states_cpu = draft_input.hidden_states.to(
+                        "cpu", non_blocking=False
+                    )
+                    if batch.spec_info.dsa_topk_indices is not None:
+                        draft_dsa_topk_indices_cpu = batch.spec_info.dsa_topk_indices.to(
+                            "cpu", non_blocking=False
+                        )
 
                 req.output_ids.append(next_token_id)
                 if req.grammar is not None:
@@ -1319,6 +1382,12 @@ class SchedulerDisaggregationPrefillMixin:
         for req, poll in zip(transfer_queue, polls):
             if rids_to_check is not None:
                 if req.rid not in rids_to_check:
+                    undone_reqs.append(req)
+                    continue
+
+                # Only pop_bootstrapped_and_resolve_parked_pp may finalize or
+                # fail a parked request under PP; this poll is stage-local.
+                if req.pending_bootstrap:
                     undone_reqs.append(req)
                     continue
 
@@ -1539,12 +1608,94 @@ class SchedulerDisaggregationPrefillMixin:
         Returns True if bootstrap is finished."""
         if not req.pending_bootstrap:
             return True
+        if get_parallel().pp_size > 1:
+            # A stage-local poll would let PP stages diverge on this request;
+            # it resolves after prefill in pop_bootstrapped_and_resolve_parked_pp.
+            return False
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender],
             self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
         )
         return self.handle_pending_bootstrap(req, polls[0])
+
+    @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
+    def pop_bootstrapped_and_resolve_parked_pp(self: Scheduler) -> List[Req]:
+        """Pop bootstrapped requests and resolve pending ones on one PP consensus poll.
+
+        A stage's send of this poll completes only once the next stage receives
+        it in the same loop iteration, so a second poll sync per iteration
+        deadlocks the pipeline.
+        """
+        bootstrap_queue = self.disagg_prefill_bootstrap_queue
+        # Before the poll sections are fixed: the queue must match on every stage.
+        bootstrap_queue.admit_room_waiters()
+        # A pending chunked_req resolves once parked: freeing it here would race
+        # its earlier chunks still queued on the forward stream.
+        waiting = [
+            req
+            for req in self.waiting_queue
+            if req.pending_bootstrap and not is_aborted(req)
+        ]
+        parked = [
+            req for req in self.disagg_prefill_transfer_queue if req.pending_bootstrap
+        ]
+        if not (bootstrap_queue.queue or waiting or parked):
+            return []
+        queued_polls, waiting_polls, parked_polls = (
+            poll_and_all_reduce_prefill_pp_sections(
+                [
+                    [req.disagg_kv_sender for req in reqs]
+                    for reqs in (bootstrap_queue.queue, waiting, parked)
+                ],
+                self.attn_cp_cpu_group,
+                self.attn_tp_cpu_group,
+                self.pp_group,
+                bootstrap_queue.pp_rank,
+                bootstrap_queue.pp_size,
+                bootstrap_queue.pp_poll_sync_work_list,
+            )
+        )
+        self._drop_failed_waiting_bootstrap(waiting=waiting, polls=waiting_polls)
+        bootstrapped = bootstrap_queue.pop_bootstrapped(polls=queued_polls)
+        self._resolve_parked_bootstrap(parked=parked, polls=parked_polls)
+        return bootstrapped
+
+    def _drop_failed_waiting_bootstrap(
+        self: Scheduler, *, waiting: List[Req], polls: List[int]
+    ) -> None:
+        failed_rids = set()
+        for req, poll in zip(waiting, polls, strict=True):
+            if poll == KVPoll.Failed:
+                self.handle_bootstrap_failure(req)
+                failed_rids.add(req.rid)
+        if failed_rids:
+            self.waiting_queue.leave(
+                [req for req in self.waiting_queue if req.rid in failed_rids]
+            )
+
+    def _resolve_parked_bootstrap(
+        self: Scheduler, *, parked: List[Req], polls: List[int]
+    ) -> None:
+        """Finalize or fail parked requests on a PP consensus poll.
+
+        Finalizing re-checkpoints the request into the radix cache, so every PP
+        stage must act on the same poll in the same loop iteration.
+        """
+        failed_rids = set()
+        for req, poll in zip(parked, polls, strict=True):
+            if self.handle_pending_bootstrap(req, poll):
+                self.send_kv_chunk(req, last_chunk=True)
+            elif poll == KVPoll.Failed:
+                failed_rids.add(req.rid)
+        if failed_rids:
+            self.disagg_prefill_transfer_queue.leave(
+                [
+                    req
+                    for req in self.disagg_prefill_transfer_queue
+                    if req.rid in failed_rids
+                ]
+            )
 
     def process_prefill_chunk(
         self: Scheduler,

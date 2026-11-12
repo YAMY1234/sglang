@@ -184,6 +184,8 @@ class StorageBackendFactory:
             return backend_class(storage_config, mem_pool_host)
         elif backend_name == "nixl":
             return backend_class(storage_config)
+        elif backend_name == "nixl_dram":
+            return backend_class(storage_config, mem_pool_host)
         elif backend_name == "mooncake":
             backend = backend_class(storage_config, mem_pool_host)
             return backend
@@ -241,6 +243,12 @@ StorageBackendFactory.register_backend(
     "nixl",
     "sglang.srt.mem_cache.storage.nixl.hicache_nixl",
     "HiCacheNixl",
+)
+
+StorageBackendFactory.register_backend(
+    "nixl_dram",
+    "sglang.srt.mem_cache.storage.nixl_dram.nixl_dram_store",
+    "HiCacheNixlDram",
 )
 
 StorageBackendFactory.register_backend(

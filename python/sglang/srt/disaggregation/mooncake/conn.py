@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import dataclasses
 import logging
+import json
 import os
 import struct
 import threading
@@ -178,6 +179,7 @@ class KVArgsRegisterInfo:
     staging_total_size: int = 0
     dst_aux_item_lens: Optional[List[int]] = None
     staging: Optional[StagingRegisterInfo] = None
+    nvfp4_pd: Optional[dict] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -230,6 +232,7 @@ class KVArgsRegisterInfo:
                 if len(msg) > 20 and msg[20]
                 else []
             ),
+            nvfp4_pd=json.loads(msg[21]) if len(msg) > 21 and msg[21] else None,
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 15, slot_ids_index=19),
         )
@@ -291,6 +294,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         # Set by teardown() to make worker threads exit (P<->D role switch).
         self._stopped = False
         self._worker_threads: List[threading.Thread] = []
+        self._nvfp4_pd_senders = {}
         # Checked in every role, so a bad value fails startup rather than a
         # later decode -> prefill role switch.
         self.enable_failed_session_probe = envs.SGLANG_ENABLE_FAILED_SESSION_PROBE.get()
@@ -966,6 +970,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         Checked for MLA pools, pools that publish KV layer ids, and plain MHA
         pools at the same attn TP size; not for TP-sliced MHA.
         """
+        if getattr(self.kv_args, "nvfp4_pd_sources", None) is not None and info.nvfp4_pd is not None:
+            from sglang.srt.disaggregation.nvfp4_pd import validate_peer
+            try:
+                if info.requires_dcp_relayout:
+                    raise ValueError("H28 mixed PD does not support DCP relayout")
+                validate_peer(self.kv_args.nvfp4_pd_sources, self.kv_args.kv_item_lens,
+                              info.nvfp4_pd, info.dst_kv_ptrs, info.dst_kv_item_lens)
+                return None
+            except ValueError as error:
+                return str(error)
         if (
             not self.kv_args.kv_item_lens
             or not info.dst_kv_item_lens
@@ -2637,6 +2651,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         worker_index=0,
     ):
         staging_strategy = None
+        nvfp4_sender = None
         if self.enable_trace:
             trace_set_thread_info(
                 f"mooncake transfer worker {worker_index}",
@@ -2652,6 +2667,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # the worker: FastQueue.get() blocks indefinitely, so checking
                 # _stopped alone can never wake a parked worker during a role switch.
                 if kv_chunk is None:
+                    if nvfp4_sender is not None:
+                        nvfp4_sender.close()
                     break
                 if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
@@ -2811,6 +2828,19 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             or skip_kv
                         ):
                             ret = 0
+                        elif (getattr(self.kv_args, "nvfp4_pd_sources", None) is not None
+                              and target_rank_registration_info.nvfp4_pd is not None):
+                            if is_dcp_transfer or chunked_dst_device_kv_indice is not None:
+                                raise ValueError("H28 mixed PD supports plain CP1/DCP1 device destinations only")
+                            if nvfp4_sender is None:
+                                from sglang.srt.disaggregation.nvfp4_pd import NVFP4PDSender
+                                nvfp4_sender = NVFP4PDSender(self)
+                                self._nvfp4_pd_senders[worker_index] = nvfp4_sender
+                            ret = nvfp4_sender.send(
+                                req.mooncake_session_id, kv_chunk.prefill_kv_indices,
+                                target_rank_registration_info.dst_kv_ptrs, chunked_dst_kv_indice,
+                                target_rank_registration_info.dst_kv_item_lens,
+                                target_rank_registration_info.nvfp4_pd, executor, kv_chunk.room)
                         elif is_dcp_transfer:
                             dcp_token_item_lens = (
                                 target_rank_registration_info.dcp_token_item_lens
@@ -3439,6 +3469,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 f"{len(self.kv_args.kv_item_lens)}Q",
                 *self.kv_args.kv_item_lens,
             ),
+            json.dumps(getattr(self.kv_args, "nvfp4_pd_destination", None)).encode("utf-8"),
         ]
 
     def build_receiver_metadata_message(
