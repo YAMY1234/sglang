@@ -550,9 +550,12 @@ class SupportsRecurrentCommit(Protocol):
 
     SGLang calls commit_recurrent_state after each target verify, where it would
     commit the state of the linear-attention layers. It launches the commit on the
-    current stream, capturable, with no collective and no allocation, and returns
-    True; SGLang then commits only the side states it keeps per request (PLE).
-    False launches nothing, and SGLang commits as without it.
+    current stream and returns True; SGLang then commits only the side states it
+    keeps per request (PLE). False launches nothing, and SGLang commits as without
+    it. The call may be captured in a CUDA graph: it runs no collective and no host
+    sync, and while capturing allocates only per-capture temporaries from the
+    graph's pool (a small arange, an int32 cast); every buffer it keeps across
+    calls exists before the capture (allocate it in prepare).
     """
 
     def commit_recurrent_state(self, io: RecurrentCommitIO) -> bool: ...
