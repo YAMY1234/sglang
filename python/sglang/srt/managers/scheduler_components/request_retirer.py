@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Callable, Optional
 
+from sglang.srt.disaggregation.utils import dsv41_encoder_only_prefill_enabled
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.scheduler_components.exit_ledger import record_exit
 from sglang.srt.managers.utils import make_abort_req
@@ -11,6 +12,7 @@ from sglang.srt.mem_cache.common import (
     discard_kv_cache_backup,
     release_kv_cache,
 )
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.runtime_context import get_disagg
 
 if TYPE_CHECKING:
@@ -100,7 +102,22 @@ class RequestRetirer:
         if req.kv.holds_kv and self.hisparse_coordinator is not None:
             self.hisparse_coordinator.release_request(req)
         if req.kv.holds_kv or req.kv.holds_mamba:
-            release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
+            self._release_kv(req, checkpoint=checkpoint)
+
+    def _release_kv(self, req: Req, *, checkpoint: bool) -> None:
+        if (
+            req.kv.holds_kv
+            and dsv41_encoder_only_prefill_enabled()
+            and req.kv.is_kv_released
+        ):
+            # PD decode: an encoder-only handoff within one window holds a row
+            # and no KV until its tail extend.
+            kv_storage_of(
+                self.tree_cache.req_to_token_pool,
+                self.tree_cache.token_to_kv_pool_allocator,
+            ).release_row(req)
+            return
+        release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
 
     def retract(self, req: Req, *, offload_kv: bool) -> bool:
         """Release a retracted request's memory uncheckpointed; return whether it can resume."""
@@ -123,7 +140,7 @@ class RequestRetirer:
             resumable = req.resumable_by_rebootstrap
         # TODO (csy): for preempted requests, we may want to insert into the tree
         if req.kv.holds_kv or req.kv.holds_mamba:
-            release_kv_cache(req, self.tree_cache, checkpoint=False)
+            self._release_kv(req, checkpoint=False)
         return resumable
 
     def abort_retracted(self, req: Req, *, reason: FINISH_ABORT) -> None:
