@@ -187,6 +187,17 @@ def test_actual_post_pool_publishes_only_real_state(
     assert state.temporal.shape[0] != state.replayssm_d.shape[0]
 
 
+@pytest.mark.parametrize("three", [False, True])
+def test_signature_carries_the_verify_stage_count(context, monkeypatch, three):
+    """SGLANG_OPT_GDN_REPLAYSSM_VERIFY_3_STAGES reaches the native PDL provider as the signature's stage count."""
+    from sglang.srt.environ import envs
+
+    with envs.SGLANG_OPT_GDN_REPLAYSSM_VERIFY_3_STAGES.override(three):
+        model, backend, layer, _, _ = setup()
+        view = prepare(model, backend, monkeypatch)
+    assert {s.num_stages for s in view.numeric_signatures} == {3 if three else 2}
+
+
 @pytest.mark.parametrize(
     "reason",
     ["off", "tokens", "widths", "kda", "fold", "invalid_metadata", "partial_storage"],

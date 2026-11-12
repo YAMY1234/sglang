@@ -11,6 +11,7 @@ from sglang.kernels.plugin_kernels.nvidia.numeric import (
     NumericOperation,
     ScalarType,
 )
+from sglang.srt.environ import envs
 
 
 def _view(tensor, tail, dtype, rows=None):
@@ -103,6 +104,7 @@ def state_signature(layer, params, pool, rows, *, prefetch, precision):
         storage_mode=modes[extras],
         state_prefetch=prefetch,
         dot_precision=precision,
+        num_stages=3 if envs.SGLANG_OPT_GDN_REPLAYSSM_VERIFY_3_STAGES.get() else 2,
     )
 
 

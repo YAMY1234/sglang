@@ -218,6 +218,8 @@ class NativeGdnPdlSignature:
     wait_for_gate_producer: int = 0
     state_prefetch: int = 0
     dot_precision: int = 0  # GdnDotPrecision.TF32 or IEEE, resolved by framework.
+    # Software-pipeline stages of the verify launch (2 or 3; same output bits).
+    num_stages: int = 2
 
 
 @dataclass(frozen=True, slots=True)
