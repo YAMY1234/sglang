@@ -428,6 +428,7 @@ class SchedulerPPMixin:
             )
         generations = [0] * self.pp_loop_size
         pending = None
+        reported_post_launch_commit = False
         tmbs = [None] * self.pp_loop_size
         release_rids = None
         send_transfer_work = []
@@ -487,6 +488,12 @@ class SchedulerPPMixin:
                     )
                 if pending is not None:
                     # If there is no next forward (idle/pause), drain here.
+                    if cur_batch and not reported_post_launch_commit:
+                        logger.info(
+                            "PP PD B2 post-launch commit: slot=%d generation=%d",
+                            pending.slot, pending.generation,
+                        )
+                        reported_post_launch_commit = True
                     self._pp_b2_commit_result(pending, generations)
                     pending = None
                 self.mbs[mb_id] = cur_batch
