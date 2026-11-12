@@ -260,6 +260,12 @@ class SchedulerPPMixin:
 
         """
         self.init_pp_loop_state()
+        early_publish = (
+            envs.SGLANG_PP_PD_EARLY_PUBLISH.get()
+            and get_parallel().pp_async_batch_depth == 0
+            and not self._pp_spec_relay
+            and not self.pp_group.is_last_rank
+        )
 
         # PD additional state initialization
         tmbs = [None] * self.pp_loop_size
@@ -395,6 +401,14 @@ class SchedulerPPMixin:
                 if tmbs[next_mb_id] is not None:
                     next_release_rids = self._pp_recv_pyobj_from_prev_stage()
                 self._pp_commit_comm_work(send_release_work)
+                # Publish current inputs/proxy while an older result is pending.
+                if early_publish:
+                    self.send_req_work = self._pp_send_reqs_to_next_stage(recv_reqs)
+                    send_transfer_work = self._pp_send_pyobj_to_next_stage(
+                        transferred_rids, async_send=True
+                    )
+                    if cur_batch:
+                        self._pp_send_proxy_to_next_stage(result)
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
                     if overlap_b1 and self.mb_metadata[next_mb_id].input_generation != generations[next_mb_id]:
@@ -410,7 +424,7 @@ class SchedulerPPMixin:
 
                 if tmbs[next_mb_id] is not None:
                     self.process_disagg_prefill_transfer_queue(next_release_rids)
-                if not self.pp_group.is_last_rank:
+                if not self.pp_group.is_last_rank and not early_publish:
                     self.send_req_work = self._pp_send_reqs_to_next_stage(recv_reqs)
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True

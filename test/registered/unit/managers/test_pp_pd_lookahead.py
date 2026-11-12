@@ -120,7 +120,7 @@ def execute(source,on,last):
             fake.emit("prepare");return PPPreparedInput.prepare(*args)
     ns=dict(Scheduler=Fake, ScheduleBatch=object, Optional=__import__('typing').Optional,
         List=list, Dict=dict, get_parallel=lambda:NS(pp_size=4,pp_async_batch_depth=0),
-        envs=NS(SGLANG_PP_PD_OVERLAP_B1=NS(get=lambda:on)),
+        envs=NS(SGLANG_PP_PD_OVERLAP_B1=NS(get=lambda:on), SGLANG_PP_PD_EARLY_PUBLISH=NS(get=lambda:False)),
         PPPreparedInput=Prepared,flatten_arrays_to_pinned_cpu=lambda parts,pin:Tensor(parts[0]),
         is_pin_memory_available=lambda dev:False,CheckPhase=NS(BUSY=1))
     module=ast.Module(body=[loop_function(source)],type_ignores=[])
