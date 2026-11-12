@@ -2722,5 +2722,61 @@ def test_qsa_prefill_pack_rows_is_bitwise_the_stock_pack(monkeypatch, compact, d
         assert torch.equal(a.view(torch.uint8), e.view(torch.uint8))
 
 
+@pytest.mark.parametrize("with_accept", [True, False])
+def test_qsa_mtp_capture_batched_matches_the_torch_capture(with_accept):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    from sglang.srt.layers.attention.qsa.mtp_capture import (
+        try_capture_metadata_batched,
+    )
+
+    torch.manual_seed(13)
+    device = "cuda"
+    bs, window, cols, trash = 37, 4, 2051, 64
+    extend = torch.randint(0, window + 1, (bs,), device=device, dtype=torch.int32)
+    rows = int(extend.sum())
+    accept = torch.randint(1, window + 1, (bs,), device=device, dtype=torch.int32)
+    req = torch.randperm(trash, device=device)[:bs].to(torch.int64)
+    req[0] = 0  # padding slot 0 goes to the trash row
+    seq_lens = torch.randint(10, 9000, (bs,), device=device, dtype=torch.int64)
+    t2b = torch.repeat_interleave(torch.arange(bs, device=device), extend.long())
+    topk = torch.randint(
+        -1, 9000, (max(rows, 1), cols), device=device, dtype=torch.int32
+    )
+
+    def torch_capture():
+        seed = torch.full((trash + 1, cols + 4), -19, device=device, dtype=torch.int32)
+        captured = torch.full((trash + 1,), -23, device=device, dtype=torch.int32)
+        lens = extend.long()
+        ends = lens.cumsum(0) - 1
+        anchor = ends - (lens - 0 - accept.long()) if with_accept else ends
+        anchor = anchor.clamp(min=0, max=topk.shape[0] - 1)
+        rows_out = torch.where((lens > 0) & (req > 0), req, trash)
+        expanded = seq_lens.to(torch.int32).index_select(0, t2b)
+        seed[:, :cols].index_copy_(0, rows_out, topk.index_select(0, anchor))
+        captured.index_copy_(0, rows_out, expanded[anchor])
+        return seed, captured
+
+    expected_seed, expected_captured = torch_capture()
+    seed = torch.full_like(expected_seed, -19)
+    captured = torch.full_like(expected_captured, -23)
+    assert try_capture_metadata_batched(
+        topk,
+        extend,
+        accept if with_accept else None,
+        0,
+        req,
+        seq_lens,
+        t2b,
+        seed,
+        captured,
+        trash,
+    )
+    real = torch.ones(trash + 1, dtype=torch.bool, device=device)
+    real[trash] = False  # several padded requests race on the trash row
+    assert torch.equal(seed[real], expected_seed[real])
+    assert torch.equal(captured[real], expected_captured[real])
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

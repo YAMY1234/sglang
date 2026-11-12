@@ -1792,6 +1792,12 @@ class _HCNorms:
     next_norm: Optional[GroupedGemmaRMSNorm]
     ffn_input: Optional[torch.Tensor] = None
     output: Optional[torch.Tensor] = None
+    attn_partials: Optional[torch.Tensor] = None
+    ffn_partials: Optional[torch.Tensor] = None
+    output_partials: Optional[torch.Tensor] = None
+    next_inject_weight: Optional[torch.Tensor] = None
+    # The module whose read next_norm belongs to (a one-launch boundary mixes for it).
+    next_mix: Optional[GatedResidual] = None
 
 
 def _has_ple(layer_id, config) -> bool:
@@ -1949,8 +1955,21 @@ class Qwen4ExpLayerExtensionMixin:
         self._decode_moe_comm = _prepare_decode_moe_comm(self.mlp)
 
     @contextmanager
-    def hc_norms(self, normalized_input, next_norm):
-        norms = _HCNorms(normalized_input, next_norm)
+    def hc_norms(
+        self,
+        normalized_input,
+        next_norm,
+        partials=None,
+        next_inject_weight=None,
+        next_mix=None,
+    ):
+        norms = _HCNorms(
+            normalized_input,
+            next_norm,
+            attn_partials=partials if normalized_input is not None else None,
+            next_inject_weight=next_inject_weight,
+            next_mix=next_mix if next_norm is not None else None,
+        )
         # A prepared norm can only follow its residual without row movement.
         self._hc_norms = (
             norms
@@ -1986,15 +2005,25 @@ class Qwen4ExpLayerExtensionMixin:
             else None
         )
         return self.attn_hyper_connection.mix(
-            residual, normalized_input=normalized_input
+            residual,
+            normalized_input=normalized_input,
+            partials=(
+                self._hc_norms.attn_partials
+                if self._hc_norms is not None and self.ple is None
+                else None
+            ),
         )
 
     def _attn_combine(self, hidden_states, residuals):
         if self._hc_norms is None:
             return self.attn_hyper_connection.combine(hidden_states, residuals)
-        hidden_states, self._hc_norms.ffn_input = (
-            self.attn_hyper_connection.combine_and_normalize(
-                hidden_states, residuals, self.mlp_hyper_connection.hc_norm
+        hidden_states, self._hc_norms.ffn_input, self._hc_norms.ffn_partials = (
+            self.attn_hyper_connection.combine_normalize_and_gate(
+                hidden_states,
+                residuals,
+                self.mlp_hyper_connection.hc_norm,
+                self.mlp_hyper_connection.block_inject_weight.weight,
+                next_mix=self.mlp_hyper_connection,
             )
         )
         return hidden_states
@@ -2004,15 +2033,23 @@ class Qwen4ExpLayerExtensionMixin:
             self._hc_norms.ffn_input if self._hc_norms is not None else None
         )
         return self.mlp_hyper_connection.mix(
-            residual, normalized_input=normalized_input
+            residual,
+            normalized_input=normalized_input,
+            partials=self._hc_norms.ffn_partials
+            if self._hc_norms is not None
+            else None,
         )
 
     def _ffn_combine(self, hidden_states, residuals):
         if self._hc_norms is None:
             return self.mlp_hyper_connection.combine(hidden_states, residuals)
-        hidden_states, self._hc_norms.output = (
-            self.mlp_hyper_connection.combine_and_normalize(
-                hidden_states, residuals, self._hc_norms.next_norm
+        hidden_states, self._hc_norms.output, self._hc_norms.output_partials = (
+            self.mlp_hyper_connection.combine_normalize_and_gate(
+                hidden_states,
+                residuals,
+                self._hc_norms.next_norm,
+                self._hc_norms.next_inject_weight,
+                next_mix=self._hc_norms.next_mix,
             )
         )
         return hidden_states
@@ -2133,6 +2170,83 @@ class Qwen4ExpLinearDecoderLayer(
 class Qwen4ExpAttentionDecoderLayer(
     Qwen4ExpLayerExtensionMixin, Qwen3_5AttentionDecoderLayer
 ):
+    def numeric_signatures(self, widths, tokens_per_request):
+        from sglang.kernels.plugin_kernels.nvidia.numeric import (
+            NumericOperation,
+            NumericSignature,
+            ScalarType,
+        )
+
+        if not self.is_qsa:
+            return ()
+        from sglang.srt.kernel_plugins.nvidia.pool_attention import (
+            DIRECT_TCGEN05_CORE,
+        )
+
+        signatures = []
+        for variant, name in (
+            (0, "SGLANG_Q38_ATTN_CORE_TP4"),
+            (DIRECT_TCGEN05_CORE, "Q38_ATTN_CORE_V1"),
+        ):
+            if get_bool_env_var(name, "False"):
+                signatures.extend(
+                    NumericSignature(
+                        NumericOperation.DIRECT_POOL_ATTENTION,
+                        rows,
+                        self.num_heads,
+                        self.num_kv_heads,
+                        self.head_dim,
+                        self.indexer.block_topk,
+                        self.indexer.compress_ratio,
+                        ScalarType.BF16,
+                        variant=variant,
+                    )
+                    for rows in widths
+                    if rows > 0
+                )
+        if envs.SGLANG_ENABLE_QSA_TMA_PREFILL.get():
+            # One declaration for every prefill length; rows vary per call.
+            signatures.append(
+                NumericSignature(
+                    NumericOperation.PACKED_PREFILL_ATTENTION,
+                    0,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    self.indexer.token_topk + self.indexer.compress_ratio - 1,
+                    self.indexer.compress_ratio,
+                    ScalarType.BF16,
+                    variant=envs.SGLANG_QSA_TMA_PREFILL_STAGES.get(),
+                )
+            )
+        from sglang.srt.kernel_plugins.nvidia.pool_attention import pool_signatures
+
+        signatures.extend(
+            pool_signatures(
+                widths,
+                tp_size=get_parallel().tp_size,
+                query_heads=self.num_heads,
+                kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+                selected_count=self.indexer.block_topk,
+                compress_ratio=self.indexer.compress_ratio,
+                spec=getattr(self, "_numeric_capability_spec", None),
+            )
+        )
+        from sglang.srt.kernel_plugins.nvidia.numeric_binding import (
+            signature_capability_supported,
+        )
+
+        return tuple(
+            s
+            for s in signatures
+            if signature_capability_supported(
+                s,
+                spec=getattr(self, "_numeric_capability_spec", None),
+                tp_size=get_parallel().tp_size,
+            )
+        )
+
     def __init__(
         self,
         config: Qwen4ExpTextConfig,
@@ -2364,8 +2478,35 @@ class Qwen4ExpAttentionDecoderLayer(
                 hidden_states, positions, forward_batch
             )
 
+        if (
+            self.is_qsa
+            and gate is not None
+            and q.is_cuda
+            and q.shape[0] == 4
+            and forward_batch.forward_mode.is_target_verify()
+            and (
+                get_bool_env_var("SGLANG_Q38_ATTN_CORE_TP4", "False")
+                or get_bool_env_var("Q38_ATTN_CORE_V1", "False")
+            )
+            and get_bool_env_var("Q38_ATTN_GATE_V2", "False")
+        ):
+            attention_kwargs["numeric_output_gate"] = gate
+        elif (
+            self.is_qsa
+            and gate is not None
+            and q.is_cuda
+            and q.dtype == torch.bfloat16
+            and forward_batch.forward_mode.is_target_verify()
+            and envs.SGLANG_ENABLE_QSA_POOL_MERGE_GATE.get()
+        ):
+            # Only the pool attention's merge consumes it (and says so); any other
+            # route leaves the gate to the fused_sigmoid_mul below.
+            attention_kwargs["numeric_output_gate"] = gate
         attn_output = self.attn(q, k, v, forward_batch, **attention_kwargs)
-        if gate is not None:
+        gate_applied = False
+        if isinstance(attn_output, tuple):
+            attn_output, gate_applied = attn_output
+        if gate is not None and not gate_applied:
             if attn_output.is_cuda:
                 # The strided 3D gate view feeds the kernel directly, so the
                 # gate reshape copy disappears along with the sigmoid + mul.
@@ -2506,6 +2647,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             )
         aux_hidden_states = AuxHiddenStateList()
         normalized_input = None
+        gate_partials = None
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             if i + 1 < self.end_layer:
@@ -2518,15 +2660,26 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                             batch=ple_batch, forward_batch=forward_batch
                         )
             next_norm = None
+            next_inject_weight = None
+            next_mix = None
             if i + 1 < self.end_layer:
                 next_layer = self.layers[i + 1]
                 if next_layer.ple is None:
-                    next_norm = next_layer.attn_hyper_connection.hc_norm
+                    next_mix = next_layer.attn_hyper_connection
+                    next_norm = next_mix.hc_norm
+                    next_inject_weight = next_mix.block_inject_weight.weight
             elif self.pp_group.is_last_rank:
                 next_norm = self.hyper_connection_mixer.hc_norm
+                next_mix = self.hyper_connection_mixer
             with (
                 get_global_expert_distribution_recorder().with_current_layer(i),
-                layer.hc_norms(normalized_input, next_norm) as norms,
+                layer.hc_norms(
+                    normalized_input,
+                    next_norm,
+                    gate_partials,
+                    next_inject_weight,
+                    next_mix,
+                ) as norms,
             ):
                 hidden_states = layer(
                     positions=positions,
@@ -2541,6 +2694,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 )
 
             normalized_input = norms.output
+            gate_partials = norms.output_partials
 
         if breakable_ple:
             _breakable_commit_ple_batch(batch=ple_batch)

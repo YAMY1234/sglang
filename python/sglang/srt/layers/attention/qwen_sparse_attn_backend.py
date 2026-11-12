@@ -16,6 +16,7 @@ import msgspec
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.kernel_plugins.nvidia.mtp_deferred_kv import DeferredMtpSparseIndices
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.qsa.config import (
     is_qwen_qsa,
@@ -34,6 +35,7 @@ from sglang.srt.layers.attention.qsa.metadata import (
     compressed_decode_view,
 )
 from sglang.srt.layers.attention.qsa.sparse_attn import (
+    _get_best_config,
     pack_qsa_prefill_kv,
     qwen_sparse_fa2_cu_seqlens_triton,
     qwen_sparse_kv_extraction_compact_triton,
@@ -54,7 +56,13 @@ from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPoo
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_spec, get_stream
-from sglang.srt.utils import async_h2d, is_hip, is_sm100_supported, is_sm120
+from sglang.srt.utils import (
+    async_h2d,
+    get_bool_env_var,
+    is_hip,
+    is_sm100_supported,
+    is_sm120,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -246,6 +254,13 @@ class QSAMTPSharedSparseIndices:
 
 class QwenSparseAttnBackend(AttentionBackend):
     """QSA backend using trtllm-gen decode with a packed FA2/FA4 fallback."""
+
+    def sparse_decode_kernel(self):
+        return _resolve_trtllm_sparse_decode()
+
+    @property
+    def sparse_decode_page_size(self):
+        return _TRTLLM_SPARSE_PAGE_SIZE
 
     # Every seq_lens_cpu read here has a device fallback (one readback);
     # the graphed decode path never reads it, so opting out is safe.
@@ -1399,6 +1414,14 @@ class QwenSparseAttnBackend(AttentionBackend):
         bs = int(forward_batch.batch_size)
         if bs == 0 or forward_batch.req_pool_indices.numel() < bs:
             return
+        from sglang.srt.kernel_plugins.nvidia.mtp_capture_seed import capture_seed
+
+        if capture_seed(self, topk_indices, forward_batch, metadata, layer_id):
+            return
+        if self._capture_batched(
+            state, topk_indices, forward_batch, metadata, layer_id, bs
+        ):
+            return
         request_extend_lens = self._capture_extend_seq_lens(forward_batch)[:bs].long()
         block_ends = request_extend_lens.cumsum(0) - 1
         spec_info = forward_batch.spec_info
@@ -1427,16 +1450,102 @@ class QwenSparseAttnBackend(AttentionBackend):
             layer_id,
         )
 
+    def _capture_batched(
+        self, state, topk_indices, forward_batch, metadata, layer_id, bs
+    ):
+        """SGLANG_ENABLE_QSA_MTP_CAPTURE_BATCHED: the torch capture below as one launch
+        (qsa/mtp_capture.py); False when it is off or its contract does not hold."""
+        from sglang.srt.environ import envs
+
+        if not envs.SGLANG_ENABLE_QSA_MTP_CAPTURE_BATCHED.get():
+            return False
+        from sglang.srt.layers.attention.qsa.mtp_capture import (
+            try_capture_metadata_batched,
+        )
+
+        slot = state.layer_slots[int(layer_id)]
+        num_accept = getattr(forward_batch.spec_info, "num_accept_tokens", None)
+        has_accept = num_accept is not None and num_accept.numel() >= bs
+        if not try_capture_metadata_batched(
+            topk_indices,
+            self._capture_extend_seq_lens(forward_batch)[:bs],
+            num_accept[:bs] if has_accept else None,
+            int(forward_batch.spec_info.num_front_tokens) if has_accept else 0,
+            forward_batch.req_pool_indices[:bs],
+            metadata.sequence_lengths,
+            metadata.get_token_to_batch_idx(),
+            state.indices[slot],
+            state.captured_len[slot],
+            state.trash_row,
+        ):
+            return False
+        if not getattr(self, "_mtp_capture_batched_logged", False):
+            self._mtp_capture_batched_logged = True
+            logger.info(
+                "QSA MTP capture batched: one launch per layer "
+                "(SGLANG_ENABLE_QSA_MTP_CAPTURE_BATCHED; first bs=%d)",
+                bs,
+            )
+        return True
+
     def lookup_mtp_sparse_indices(self, forward_batch, layer_id: int) -> torch.Tensor:
         metadata = self.get_indexer_metadata(layer_id, forward_batch)
         logical_positions = metadata.decode_logical_positions
         if logical_positions is None:
             logical_positions = metadata.get_seqlens_expanded() - 1
+        from sglang.srt.kernel_plugins.nvidia.mtp_deferred_kv import lookup
+
+        deferred = lookup(self, forward_batch, logical_positions, layer_id)
+        if deferred is not None:
+            return deferred
+        if self._defers_mtp_lookup(forward_batch, logical_positions):
+            state = self._mtp_shared_sparse_indices
+            slot = state.layer_slots[int(layer_id)]
+            return DeferredMtpSparseIndices(
+                state.indices[slot],
+                state.captured_len[slot],
+                forward_batch.req_pool_indices,
+                logical_positions,
+                state._tail_offsets,
+            )
         return self._mtp_shared_sparse_indices.lookup(
             forward_batch.req_pool_indices,
             logical_positions,
             layer_id,
         )
+
+    def _defers_mtp_lookup(self, forward_batch, logical_positions) -> bool:
+        """SGLANG_Q38_LOOKUP_NATIVE at TP1: the draft-decode lookup is left to
+        fused_kv_prepare, for one request or, with SGLANG_ENABLE_QSA_MTP_LOOKUP_BATCHED,
+        any batch."""
+        from sglang.srt import runtime_context
+        from sglang.srt.environ import envs
+
+        num_requests = forward_batch.req_pool_indices.numel()
+        if not (
+            get_bool_env_var("SGLANG_Q38_LOOKUP_NATIVE")
+            and runtime_context.get_parallel().tp_size == 1
+            and runtime_context.get_spec().speculative_eagle_topk == 1
+            and self._fused_kv_pool_eligible
+            and self._mtp_shared_sparse_indices is not None
+            and forward_batch.forward_mode.is_decode()
+            and logical_positions.numel() == num_requests
+            and (
+                num_requests == 1
+                or (
+                    num_requests > 1 and envs.SGLANG_ENABLE_QSA_MTP_LOOKUP_BATCHED.get()
+                )
+            )
+        ):
+            return False
+        if not getattr(self, "_mtp_lookup_deferred_logged", False):
+            self._mtp_lookup_deferred_logged = True
+            logger.info(
+                "QSA MTP lookup resolved in the fused KV pack (SGLANG_Q38_LOOKUP_NATIVE, "
+                "SGLANG_ENABLE_QSA_MTP_LOOKUP_BATCHED; first bs=%d)",
+                num_requests,
+            )
+        return True
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
@@ -1505,7 +1614,17 @@ class QwenSparseAttnBackend(AttentionBackend):
             self.qsa_profile.budget,
         )
 
-    def _try_fused_kv_attention(self, q, k, v, layer, forward_batch, indices):
+    def _try_fused_kv_attention(
+        self,
+        q,
+        k,
+        v,
+        layer,
+        forward_batch,
+        indices,
+        output_gate=None,
+        kv_prestored=False,
+    ):
         if not self._fused_kv_pool_eligible or not q.is_cuda or k is None or v is None:
             return None
         mode = forward_batch.forward_mode
@@ -1516,7 +1635,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         else:
             return None
         trtllm_decode = _resolve_trtllm_sparse_decode()
-        if trtllm_decode is None:
+        if trtllm_decode is None and output_gate is None:
             return None
         pool = self.token_to_kv_pool
         loc = forward_batch.out_cache_loc
@@ -1548,8 +1667,22 @@ class QwenSparseAttnBackend(AttentionBackend):
             or q.dtype != torch.bfloat16
         ):
             return None
-        k = k.reshape(rows, kc.shape[1], 256).to(kc.dtype)
-        v = v.reshape(rows, kc.shape[1], 256).to(vc.dtype)
+        k = k.reshape(rows, kc.shape[1], 256)
+        v = v.reshape(rows, kc.shape[1], 256)
+        from sglang.srt.environ import envs
+
+        # SGLANG_QSA_FUSED_FP8_KV_WRITE: a target verify's BF16 k/v stay uncast for the
+        # FP8 union's pool write; any other route casts them below, as stock does here.
+        if not (
+            envs.SGLANG_QSA_FUSED_FP8_KV_WRITE.get()
+            and mode.is_target_verify()
+            and kc.dtype == torch.float8_e4m3fn
+            and k.dtype == v.dtype == torch.bfloat16
+            and k.stride(1) == v.stride(1) == 256
+            and k.stride(2) == v.stride(2) == 1
+        ):
+            k = k.to(kc.dtype)
+            v = v.to(vc.dtype)
         if (
             k.stride(1) != 256
             or v.stride(1) != 256
@@ -1560,6 +1693,53 @@ class QwenSparseAttnBackend(AttentionBackend):
         metadata = self._resolve_metadata(forward_batch)
         if metadata.sequence_lengths.numel() != rows:
             return None
+        # A deferred MTP lookup is resolved by fused_kv_prepare only.
+        deferred = isinstance(indices, DeferredMtpSparseIndices)
+        if output_gate is not None and not deferred:
+            fused = self._try_numeric_direct_attention(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                indices,
+                output_gate,
+                kc,
+                vc,
+                loc,
+                width,
+                metadata,
+            )
+            if fused is not None:
+                return fused, True
+        if trtllm_decode is None:
+            return None
+        pooled = (
+            None
+            if deferred
+            else self._try_numeric_pool_attention(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                indices,
+                kc,
+                vc,
+                loc,
+                width,
+                metadata,
+                kv_prestored=kv_prestored,
+                gate=output_gate,
+            )
+        )
+        if isinstance(pooled, tuple):
+            return pooled
+        if pooled is not None:
+            return (pooled, False) if output_gate is not None else pooled
+        if k.dtype != kc.dtype:  # deferred for the union write: the stock casts
+            k = k.to(kc.dtype)
+            v = v.to(vc.dtype)
         return self._forward_trtllm_sparse(
             q.reshape(rows, layer.tp_q_head_num, layer.head_dim),
             kc,
@@ -1567,10 +1747,513 @@ class QwenSparseAttnBackend(AttentionBackend):
             layer,
             forward_batch,
             metadata,
-            indices.to(torch.int32).contiguous(),
+            indices if deferred else indices.to(torch.int32).contiguous(),
             trtllm_decode,
             new_kv=(k, v, loc, width),
         )
+
+    def _try_numeric_pool_attention(
+        self,
+        q,
+        k,
+        v,
+        layer,
+        forward_batch,
+        indices,
+        key_pool,
+        value_pool,
+        locations,
+        width,
+        metadata,
+        *,
+        kv_prestored=False,
+        gate=None,
+        draft_extend=False,
+    ):
+        """The pool attention output, or (output, True) when the output gate rode the
+        split-K merge; None leaves the call to the caller's other routes. A draft
+        extend (four rows per request, as a target verify lays them out) takes the
+        FP8 union route only."""
+        from sglang.kernels.plugin_kernels.nvidia.numeric import (
+            DirectPoolAttentionIO,
+            DirectPoolSelection,
+            KvTensors,
+            NumericOperation,
+            NumericSignature,
+            PoolUnionAttentionIO,
+            ScalarType,
+        )
+        from sglang.srt.environ import envs
+        from sglang.srt.kernel_plugins.nvidia.numeric_binding import numeric_operator
+        from sglang.srt.kernel_plugins.nvidia.pool_attention import (
+            POOL_MERGE_GATE,
+            UNION_FP8_KV_WRITE,
+            pool_decode_enabled,
+            pool_device_sms,
+            pool_scratch_elements,
+            union_variant,
+            union_workspace,
+            verify_variant,
+        )
+
+        if not (
+            self._fused_kv_pool_eligible
+            and envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+            and pool_decode_enabled()
+            and is_sm100_supported()
+        ):
+            return None
+        mode = forward_batch.forward_mode
+        if (
+            mode.is_draft_extend_v2() if draft_extend else mode.is_target_verify()
+        ) and width == 4:
+            variant = verify_variant()
+        elif mode.is_decode() and width == 1 and not draft_extend:
+            variant = 2
+        else:
+            return None
+        # An FP8 pool takes the union kernel: TP1 single-chain verify only.
+        union = key_pool.dtype == torch.float8_e4m3fn
+        if draft_extend and not union:
+            return None
+        if union and not (
+            variant & ~POOL_MERGE_GATE == 1
+            and envs.SGLANG_QSA_FP8_POOL_VERIFY.get()
+            and int(getattr(forward_batch.spec_info, "topk", 1) or 1) == 1
+        ):
+            return None
+        kv_dtype = torch.float8_e4m3fn if union else torch.bfloat16
+        rows = q.shape[0]
+        indexer = metadata.indexer_metadata
+        positions = None if indexer is None else indexer.decode_logical_positions
+        row_requests = metadata.row_req_pool_indices
+        if row_requests is None:
+            row_requests = forward_batch.req_pool_indices
+        slot_map = self.req_to_token_pool.req_to_token
+        integer = (torch.int32, torch.int64)
+        if not (
+            rows > 0
+            and rows % width == 0
+            and rows == forward_batch.req_pool_indices.numel() * width
+            and layer.tp_q_head_num > 0
+            and layer.head_dim > 0
+            and self._uses_block_indices(indices)
+            and indices.shape == (rows, self.qsa_profile.block_topk)
+            and indices.dtype in integer
+            and q.ndim in (2, 3)
+            and q.numel() == rows * layer.tp_q_head_num * layer.head_dim
+            and q.stride(0) >= layer.tp_q_head_num * layer.head_dim
+            and q.stride(-1) == 1
+            and (q.ndim == 2 or q.stride(1) == layer.head_dim)
+            and key_pool.ndim == 3
+            and key_pool.shape[1] > 0
+            and key_pool.shape[2] == layer.head_dim
+            and value_pool.shape == key_pool.shape
+            and key_pool.is_contiguous()
+            and value_pool.is_contiguous()
+            and key_pool.dtype == value_pool.dtype == kv_dtype
+            and k.dtype == v.dtype
+            and (
+                k.dtype == kv_dtype
+                or (
+                    union
+                    and union_variant() & UNION_FP8_KV_WRITE
+                    and k.dtype == torch.bfloat16
+                )
+            )
+            and q.dtype == torch.bfloat16
+            and q.is_cuda
+            and k.shape == v.shape == (rows, key_pool.shape[1], layer.head_dim)
+            and all(
+                x.stride(0) >= key_pool.shape[1] * layer.head_dim
+                and x.stride(1) == layer.head_dim
+                and x.stride(2) == 1
+                for x in (k, v)
+            )
+            and isinstance(slot_map, torch.Tensor)
+            and slot_map.ndim == 2
+            and slot_map.stride(1) == 1
+            and slot_map.dtype in integer
+            and all(
+                isinstance(x, torch.Tensor)
+                and x.ndim == 1
+                and x.numel() == rows
+                and x.is_contiguous()
+                and x.dtype in integer
+                for x in (locations, row_requests, metadata.sequence_lengths, positions)
+            )
+            and all(
+                x.device == q.device
+                for x in (
+                    k,
+                    v,
+                    key_pool,
+                    value_pool,
+                    locations,
+                    slot_map,
+                    indices,
+                    row_requests,
+                    metadata.sequence_lengths,
+                    positions,
+                )
+            )
+        ):
+            return None
+        if union:
+            variant = union_variant()
+        run = numeric_operator(
+            NumericSignature(
+                (
+                    NumericOperation.POOL_UNION_ATTENTION
+                    if union
+                    else NumericOperation.DIRECT_POOL_ATTENTION
+                ),
+                rows,
+                layer.tp_q_head_num,
+                key_pool.shape[1],
+                layer.head_dim,
+                indices.shape[1],
+                self.compress_ratio,
+                ScalarType.BF16,
+                variant=variant,
+            ),
+            prepared=True,
+        )
+        if run is None:
+            return None
+        merge_gate = None
+        if not union and variant & POOL_MERGE_GATE:
+            # The model's gate is [rows, heads * dim] or its strided [rows, heads, dim]
+            # view; the merge reads [rows, heads, dim] with any row and head stride.
+            if not (
+                gate is not None
+                and gate.dtype == torch.bfloat16
+                and gate.device == q.device
+                and gate.shape[0] == rows
+                and gate.stride(-1) == 1
+                and gate.numel() == rows * layer.tp_q_head_num * layer.head_dim
+            ):
+                return None
+            merge_gate = gate.view(rows, layer.tp_q_head_num, layer.head_dim)
+        query = q.view(rows, layer.tp_q_head_num, layer.head_dim)
+        selected = indices.to(torch.int32).contiguous()
+        output = torch.empty(
+            (rows, layer.tp_q_head_num, layer.head_dim), dtype=q.dtype, device=q.device
+        )
+        selection = DirectPoolSelection(
+            slot_map, row_requests, selected, metadata.sequence_lengths, positions
+        )
+        if union:
+            splits, integers, floats = union_workspace(
+                rows,
+                pool_device_sms(q.device),
+                kv_heads=key_pool.shape[1],
+                head_dim=layer.head_dim,
+                query_heads=layer.tp_q_head_num,
+                selected_count=indices.shape[1],
+                compress_ratio=self.compress_ratio,
+                variant=variant,
+            )
+            # E4M3 widens to BF16 exactly; the pool carries no K/V scale.
+            run(
+                PoolUnionAttentionIO(
+                    query,
+                    None,
+                    k,
+                    v,
+                    locations,
+                    KvTensors(key_pool, value_pool, 1.0, 1.0, 1),
+                    selection,
+                    layer.scaling,
+                    width,
+                    not kv_prestored,
+                    output,
+                    torch.empty(floats, dtype=torch.float32, device=q.device),
+                    torch.empty(integers, dtype=torch.int32, device=q.device),
+                    splits,
+                )
+            )
+            return output.view(rows, -1)
+        # Complete all caller storage/metadata before the first permitted KV write.
+        scratch_elements = pool_scratch_elements(
+            rows,
+            pool_device_sms(q.device),
+            kv_heads=key_pool.shape[1],
+            head_dim=layer.head_dim,
+            query_heads=layer.tp_q_head_num,
+            selected_count=indices.shape[1],
+            compress_ratio=self.compress_ratio,
+        )
+        scratch = torch.empty(
+            scratch_elements,
+            dtype=torch.float32,
+            device=q.device,
+        )
+        run(
+            DirectPoolAttentionIO(
+                query,
+                merge_gate,
+                k,
+                v,
+                locations,
+                KvTensors(key_pool, value_pool, None, None, 1),
+                selection,
+                layer.scaling,
+                width,
+                not kv_prestored,
+                output,
+                scratch,
+            )
+        )
+        if merge_gate is not None:
+            return output.view(rows, -1), True
+        return output.view(rows, -1)
+
+    def _try_draft_extend_union(self, q, k, v, layer, forward_batch, indices):
+        """SGLANG_ENABLE_QSA_DRAFT_EXTEND_UNION: a CUDA-graph spec-v2 draft extend (four
+        rows per request in position order, as a target verify) stores its new K/V and
+        attends through the FP8 union provider, reading the pool in place, instead of
+        store + packed trtllm decode; None keeps the stock path."""
+        from sglang.srt.environ import envs
+
+        ratio = self.compress_ratio
+        profile = self.qsa_profile
+        if not (
+            envs.SGLANG_ENABLE_QSA_DRAFT_EXTEND_UNION.get()
+            and forward_batch.forward_mode.is_draft_extend_v2()
+            and self._fused_kv_pool_eligible
+            and q.is_cuda
+            and k is not None
+            and v is not None
+            and isinstance(indices, torch.Tensor)
+            and profile is not None
+            and profile.budget == profile.block_topk * ratio
+            and indices.dim() == 2
+            and indices.shape[1] == profile.budget + ratio - 1
+        ):
+            return None
+        rows = indices.shape[0]
+        metadata = self._resolve_metadata(forward_batch)
+        indexer = metadata.indexer_metadata
+        loc = forward_batch.out_cache_loc
+        if not (
+            metadata.is_cuda_graph
+            and q.shape[0] == rows
+            and rows == forward_batch.req_pool_indices.numel() * 4
+            and indexer is not None
+            and indexer.decode_logical_positions is not None
+            and metadata.row_req_pool_indices is not None
+            and metadata.row_req_pool_indices.numel() == rows
+            and metadata.sequence_lengths.numel() == rows
+            and isinstance(loc, torch.Tensor)
+            and loc.ndim == 1
+            and loc.numel() == rows
+            and loc.is_contiguous()
+        ):
+            return None
+        kc = self.token_to_kv_pool.layer_router.read(layer.layer_id).key()
+        vc = self.token_to_kv_pool.layer_router.read(layer.layer_id).value()
+        if not (
+            kc.ndim == 3
+            and vc.shape == kc.shape
+            and kc.is_contiguous()
+            and vc.is_contiguous()
+            and kc.shape[-1] == 256
+            and kc.dtype == vc.dtype == torch.float8_e4m3fn
+            and q.dtype == torch.bfloat16
+        ):
+            return None
+        k = k.reshape(rows, kc.shape[1], 256)
+        v = v.reshape(rows, kc.shape[1], 256)
+        if not (
+            envs.SGLANG_QSA_FUSED_FP8_KV_WRITE.get()
+            and k.dtype == v.dtype == torch.bfloat16
+            and k.stride(1) == v.stride(1) == 256
+            and k.stride(2) == v.stride(2) == 1
+        ):
+            k = k.to(kc.dtype)
+            v = v.to(vc.dtype)
+        # Column ratio * c of the expanded indices holds block c's first token (or -1),
+        # and with length = position + 1 every selected block is whole: the blocks are
+        # those columns floor-divided by the ratio.
+        blocks = torch.div(
+            indices[:, : profile.block_topk * ratio : ratio],
+            ratio,
+            rounding_mode="floor",
+        )
+        return self._try_numeric_pool_attention(
+            q,
+            k,
+            v,
+            layer,
+            forward_batch,
+            blocks,
+            kc,
+            vc,
+            loc,
+            4,
+            metadata,
+            draft_extend=True,
+        )
+
+    def _try_numeric_direct_attention(
+        self,
+        q,
+        k,
+        v,
+        layer,
+        forward_batch,
+        indices,
+        gate,
+        key_pool,
+        value_pool,
+        locations,
+        width,
+        metadata,
+    ):
+        """Publish existing full-pool views; keep KV ownership and graph metadata here."""
+        from sglang.kernels.plugin_kernels.nvidia.numeric import (
+            DirectPoolAttentionIO,
+            DirectPoolSelection,
+            KvTensors,
+            NumericOperation,
+            NumericSignature,
+            ScalarType,
+        )
+        from sglang.srt.kernel_plugins.nvidia.numeric_binding import numeric_operator
+        from sglang.srt.kernel_plugins.nvidia.pool_attention import (
+            DIRECT_TCGEN05_CORE,
+        )
+
+        if indices.ndim != 2:
+            return None
+        rows = q.shape[0]
+        indexer = metadata.indexer_metadata
+        row_requests = metadata.row_req_pool_indices
+        if row_requests is None:
+            row_requests = forward_batch.req_pool_indices
+        logical_positions = (
+            None if indexer is None else indexer.decode_logical_positions
+        )
+        slot_map = self.req_to_token_pool.req_to_token
+        # Source switches: the TP4 core, and Q38_ATTN_CORE_V1's TP1 TCGEN05 core. Only
+        # the variant the plugin admitted for this TP size at startup has an offer.
+        cores = tuple(
+            variant
+            for variant, name in (
+                (0, "SGLANG_Q38_ATTN_CORE_TP4"),
+                (DIRECT_TCGEN05_CORE, "Q38_ATTN_CORE_V1"),
+            )
+            if get_bool_env_var(name, "False")
+        )
+        eligible = bool(
+            cores
+            and forward_batch.forward_mode.is_target_verify()
+            and int(getattr(forward_batch.spec_info, "topk", 1) or 1) == 1
+            and rows == width == 4
+            and metadata.is_cuda_graph
+            and self._uses_block_indices(indices)
+            and indices.shape == (rows, self.qsa_profile.block_topk)
+            and layer.tp_q_head_num > 0
+            and layer.head_dim > 0
+            and key_pool.shape[1] > 0
+            and key_pool.dtype
+            == value_pool.dtype
+            == q.dtype
+            == gate.dtype
+            == torch.bfloat16
+            and q.is_cuda
+            and gate.is_cuda
+            and q.numel() == rows * layer.tp_q_head_num * layer.head_dim
+            and tuple(gate.shape)
+            in (
+                (rows, layer.tp_q_head_num, layer.head_dim),
+                (rows, layer.tp_q_head_num * layer.head_dim),
+            )
+            and gate.stride(-1) == 1
+            and slot_map.ndim == 2
+            and slot_map.stride(1) == 1
+            and slot_map.dtype in (torch.int32, torch.int64)
+            and row_requests.numel() == rows
+            and logical_positions is not None
+            and logical_positions.numel() == rows
+            and all(
+                x.device == q.device
+                for x in (
+                    key_pool,
+                    value_pool,
+                    k,
+                    v,
+                    locations,
+                    indices,
+                    gate,
+                    row_requests,
+                    metadata.sequence_lengths,
+                    logical_positions,
+                    slot_map,
+                )
+            )
+            and k.dtype == v.dtype == torch.bfloat16
+        )
+        run = None
+        for variant in cores:
+            run = numeric_operator(
+                NumericSignature(
+                    NumericOperation.DIRECT_POOL_ATTENTION,
+                    rows,
+                    layer.tp_q_head_num,
+                    key_pool.shape[1],
+                    layer.head_dim,
+                    indices.shape[1],
+                    self.compress_ratio,
+                    ScalarType.BF16,
+                    variant=variant,
+                ),
+                prepared=eligible,
+            )
+            if run is not None:
+                break
+        if run is None:
+            return None
+        q = q.reshape(rows, layer.tp_q_head_num, layer.head_dim)
+        output = torch.empty_like(q)
+        # Exact raw implementation layout: 33 tiles per KV head, 16 query lanes, two stats.
+        scratch = torch.empty(
+            rows
+            * key_pool.shape[1]
+            * (
+                (indices.shape[1] * self.compress_ratio + self.compress_ratio - 1 + 63)
+                // 64
+            )
+            * 16
+            * (layer.head_dim + 2),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        selection = DirectPoolSelection(
+            slot_map,
+            row_requests,
+            indices.to(torch.int32).contiguous(),
+            metadata.sequence_lengths,
+            logical_positions,
+        )
+        run(
+            DirectPoolAttentionIO(
+                q,
+                gate,
+                k,
+                v,
+                locations,
+                KvTensors(key_pool, value_pool, None, None, 1),
+                selection,
+                layer.scaling,
+                width,
+                True,
+                output,
+                scratch,
+            )
+        )
+        return output.reshape(rows, -1)
 
     def forward_extend(
         self,
@@ -1593,10 +2276,21 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
         if save_kv_cache:
             fused_output = self._try_fused_kv_attention(
-                q, k, v, layer, forward_batch, topk_indices
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                topk_indices,
+                output_gate=kwargs.get("numeric_output_gate"),
             )
             if fused_output is not None:
                 return fused_output
+            union_output = self._try_draft_extend_union(
+                q, k, v, layer, forward_batch, topk_indices
+            )
+            if union_output is not None:
+                return union_output
             self.kv_layers.layer(layer.layer_id).store(
                 layer, forward_batch.out_cache_loc, k, v
             )
@@ -1713,18 +2407,101 @@ class QwenSparseAttnBackend(AttentionBackend):
             max_k=max(sequence_lens, default=1),
             output_dtype=q.dtype,
         )
-        output = sparse_gqa_fwd_interface_triton_ck(
+        output = self._numeric_packed_prefill(
             q.contiguous(),
+            layer,
+            forward_batch,
             packed_k,
             packed_v,
             topk_indices,
             cu_seqlens_q,
             cu_seqlens_k,
             sequence_lens_tensor,
-            layer.scaling,
-            max_q=max_q,
+            extend_lens,
         )
+        if output is None:
+            output = sparse_gqa_fwd_interface_triton_ck(
+                q.contiguous(),
+                packed_k,
+                packed_v,
+                topk_indices,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                sequence_lens_tensor,
+                layer.scaling,
+                max_q=max_q,
+            )
         return self._pad_extend_output(output, num_output_rows)
+
+    def _numeric_packed_prefill(
+        self, q, layer, forward_batch, k, v, indices, cu_q, cu_k, kv_lens, extend_lens
+    ):
+        """The stock prefix-chunk kernel's tile with TMA-gathered K/V, or None."""
+        from sglang.kernels.plugin_kernels.nvidia.numeric import (
+            NumericOperation,
+            NumericSignature,
+            PackedPrefillAttentionIO,
+            ScalarType,
+        )
+        from sglang.srt.environ import envs
+        from sglang.srt.kernel_plugins.nvidia.numeric_binding import numeric_operator
+
+        if not (
+            envs.SGLANG_ENABLE_QSA_TMA_PREFILL.get()
+            and is_sm100_supported()
+            # The grid takes the host max query rows; captured prefill stays stock.
+            and len(extend_lens) == forward_batch.extend_seq_lens.shape[0]
+            and not torch.cuda.is_current_stream_capturing()
+            and _get_best_config(q.shape[0]) == (16, 1, 2)
+            and q.dtype == k.dtype == v.dtype == torch.bfloat16
+            and q.ndim == k.ndim == 3
+            and k.shape == v.shape
+            and k.shape[1] > 0
+            and q.shape[1] % k.shape[1] == 0
+            and q.shape[2] == k.shape[2]
+            and k.is_contiguous()
+            and v.is_contiguous()
+            and indices.dtype == torch.int32
+            and indices.ndim == 2
+            and indices.stride(1) == 1
+            # TMA: int32 row coordinates and 16-byte aligned bases and rows.
+            and k.shape[0] < 2**31 - 1
+            and k.data_ptr() % 16 == v.data_ptr() % 16 == 0
+            and k.stride(0) * k.element_size() % 16 == 0
+        ):
+            return None
+        run = numeric_operator(
+            NumericSignature(
+                NumericOperation.PACKED_PREFILL_ATTENTION,
+                0,
+                q.shape[1],
+                k.shape[1],
+                q.shape[2],
+                indices.shape[1],
+                self.compress_ratio,
+                ScalarType.BF16,
+                variant=envs.SGLANG_QSA_TMA_PREFILL_STAGES.get(),
+            ),
+            prepared=True,
+        )
+        if run is None:
+            return None
+        output = torch.empty_like(q)
+        run(
+            PackedPrefillAttentionIO(
+                q,
+                k,
+                v,
+                indices,
+                cu_q,
+                cu_k,
+                kv_lens,
+                layer.scaling,
+                max(extend_lens),
+                output,
+            )
+        )
+        return output
 
     def prefetch_cp_kv(self, layer, k: torch.Tensor, v: torch.Tensor, forward_batch):
         """Run ``layer``'s prefill-CP K/V gather on a side stream; the layer's
@@ -2079,6 +2856,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         topk_indices: torch.Tensor,
         trtllm_decode,
         new_kv=None,
+        prepared_kv=None,
     ) -> torch.Tensor:
         """Pack selected KV at page-aligned row strides for FlashInfer's paged decode,
         driven by a static arange block table and the per-row valid counts."""
@@ -2116,7 +2894,9 @@ class QwenSparseAttnBackend(AttentionBackend):
             packed_dtype,
             k_buffer.device,
         )
-        if new_kv is not None:
+        if prepared_kv is not None:
+            valid_counts, packed_k, packed_v = prepared_kv
+        elif new_kv is not None:
             k, v, loc, width = new_kv
             row_requests = metadata.row_req_pool_indices
             if row_requests is None:
@@ -2221,9 +3001,61 @@ class QwenSparseAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         if topk_indices is None:
             raise ValueError("QSA sparse attention requires topk_indices")
+        if isinstance(topk_indices, DeferredMtpSparseIndices):
+            from sglang.srt.kernel_plugins.nvidia.mtp_deferred_kv import bind_prepare
+
+            prepared = (
+                bind_prepare(
+                    self,
+                    q,
+                    k,
+                    v,
+                    layer,
+                    forward_batch,
+                    topk_indices,
+                )
+                if save_kv_cache
+                else None
+            )
+            if prepared is not None:
+                run, io, metadata, decode = prepared
+                run(io)
+                return self._forward_trtllm_sparse(
+                    q.reshape(q.shape[0], layer.tp_q_head_num, layer.head_dim),
+                    io.k_cache,
+                    io.v_cache,
+                    layer,
+                    forward_batch,
+                    metadata,
+                    topk_indices,
+                    decode,
+                    prepared_kv=(io.counts_out, io.packed_k_out, io.packed_v_out),
+                )
+            if save_kv_cache and layer.layer_id not in getattr(
+                self, "_numeric_mtp_deferred_signatures", {}
+            ):
+                # No packer declared (the TP1 deferral): fused_kv_prepare resolves it.
+                fused_output = self._try_fused_kv_attention(
+                    q,
+                    k,
+                    v,
+                    layer,
+                    forward_batch,
+                    topk_indices,
+                    output_gate=kwargs.get("numeric_output_gate"),
+                )
+                if fused_output is not None:
+                    return fused_output
+            topk_indices = topk_indices.materialize()
         if save_kv_cache:
             fused_output = self._try_fused_kv_attention(
-                q, k, v, layer, forward_batch, topk_indices
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                topk_indices,
+                output_gate=kwargs.get("numeric_output_gate"),
             )
             if fused_output is not None:
                 return fused_output

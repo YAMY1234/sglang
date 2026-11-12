@@ -1,0 +1,871 @@
+"""Installed paired producer with CPU-only CUDA/provider metadata doubles."""
+
+from types import SimpleNamespace as NS
+from unittest.mock import patch
+
+import pytest
+import torch
+
+from sglang.kernels.plugin_kernels.nvidia.numeric import NumericOperation
+from sglang.srt.environ import envs
+from sglang.srt.kernel_plugins.nvidia import numeric_binding
+from sglang.srt.layers.attention.qsa import qsa_indexer as impl
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
+
+
+class DeviceMetadata(torch.Tensor):
+    @property
+    def is_cuda(self):
+        return True
+
+
+def indexer():
+    obj = object.__new__(impl.QSAIndexer)
+    torch.nn.Module.__init__(obj)
+    obj.index_n_heads, obj.index_kv_heads, obj.index_head_dim = 4, 1, 128
+    obj.block_topk, obj.compress_ratio, obj.token_topk = 512, 4, 2048
+    from capability_fixtures import contract_spec
+
+    obj._numeric_capability_spec = contract_spec()
+    obj.numeric_signatures((4,), 4)
+    return obj
+
+
+def tensors(capacity):
+    q = torch.zeros((4, 8, 128), dtype=torch.bfloat16).as_subclass(DeviceMetadata)
+    return (
+        q,
+        torch.zeros((1, 16, 1, 128), dtype=torch.bfloat16),
+        torch.zeros((4, capacity // 16), dtype=torch.int64),
+        torch.full((4,), capacity, dtype=torch.int64),
+        capacity,
+        torch.ones(4, dtype=torch.int64),
+    )
+
+
+def flags():
+    from contextlib import ExitStack
+
+    stack = ExitStack()
+    from sglang.srt.kernel_plugins.nvidia import binding
+
+    stack.enter_context(patch.object(binding, "megakernel_enabled", return_value=True))
+    stack.enter_context(envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True))
+    stack.enter_context(envs.SGLANG_QSA_MK_SCORE.override(True))
+    stack.enter_context(envs.SGLANG_QSA_SPLIT_TOPK.override(False))
+    stack.enter_context(patch.object(impl, "get_parallel", return_value=NS(tp_size=4)))
+    stack.enter_context(patch.object(impl, "is_sm100_supported", return_value=True))
+    stack.enter_context(
+        patch.object(impl, "is_batch_invariant_mode_enabled", return_value=False)
+    )
+    return stack
+
+
+@pytest.mark.parametrize("length", [499, 512, 513, 4096, 4097, 8192, 8193])
+def test_actual_pool_capacity_and_paired_outputs_preserve_order(length):
+    obj = indexer()
+    with flags():
+        signatures = obj.numeric_preparation_signatures(length * 4, 16)
+        capacity = ((length + 15) // 16) * 16
+        assert len(signatures) == 2
+        assert all(s.context_bound == capacity for s in signatures)
+        args = list(tensors(capacity))
+        args[3].fill_(length)
+        calls, outputs = [], []
+        # A deliberately non-sorted order, including a tied cutoff, must pass
+        # through this orchestration unchanged. Raw GPU ordering is tested separately.
+        expected = torch.arange(511, -1, -1, dtype=torch.int32).expand(4, -1).clone()
+
+        def choose(sig, *, prepared):
+            assert prepared and sig in signatures
+
+            def run(io):
+                calls.append(sig.operation)
+                outputs.append(io)
+                if sig.operation == NumericOperation.SPARSE_SCORE:
+                    assert io.query.dtype == torch.bfloat16 and io.scale == 128**0.5
+                    assert (
+                        io.compressed_slot_map.dtype
+                        == io.compressed_lengths.dtype
+                        == torch.int32
+                    )
+                    assert (
+                        io.row_requests.dtype == torch.int64
+                        and io.query_weights is None
+                    )
+                    io.scores_out.zero_()
+                else:
+                    assert io.scores is outputs[0].scores_out
+                    assert io.counts_out is None
+                    io.selected_indices_out.copy_(expected)
+
+            return run
+
+        with patch.object(numeric_binding, "numeric_operator", side_effect=choose):
+            actual = obj._numeric_score_select(*args)
+        assert calls == [NumericOperation.SPARSE_SCORE, NumericOperation.SPARSE_SELECT]
+        assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "missing", [NumericOperation.SPARSE_SCORE, NumericOperation.SPARSE_SELECT]
+)
+def test_missing_either_offer_does_not_execute_either(missing):
+    obj = indexer()
+    with flags():
+        obj.numeric_preparation_signatures(32768, 16)
+        runs = []
+
+        def choose(sig, *, prepared):
+            return None if sig.operation == missing else lambda io: runs.append(io)
+
+        with patch.object(numeric_binding, "numeric_operator", side_effect=choose):
+            assert obj._numeric_score_select(*tensors(8192)) is None
+        assert runs == []
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "off",
+        "unprepared",
+        "wrongq",
+        "wrongcache",
+        "wrongrequest",
+        "batch_invariant",
+        "split_precedence",
+    ],
+)
+def test_ineligible_never_queries_registry(case):
+    obj = indexer()
+    with flags():
+        obj.numeric_preparation_signatures(32768, 16)
+        args = list(tensors(8192))
+        with patch.object(numeric_binding, "numeric_operator") as lookup:
+            if case == "off":
+                with envs.SGLANG_QSA_MK_SCORE.override(False):
+                    assert obj._numeric_score_select(*args) is None
+            elif case == "batch_invariant":
+                with patch.object(
+                    impl, "is_batch_invariant_mode_enabled", return_value=True
+                ):
+                    assert obj._numeric_score_select(*args) is None
+            elif case == "split_precedence":
+                with (
+                    patch.object(impl, "get_parallel", return_value=NS(tp_size=1)),
+                    envs.SGLANG_QSA_SPLIT_TOPK.override(True),
+                ):
+                    assert obj._numeric_score_select(*args) is None
+            else:
+                if case == "unprepared":
+                    obj._numeric_score_capacity = 0
+                if case == "wrongq":
+                    args[0] = args[0].float()
+                if case == "wrongcache":
+                    args[1] = args[1].float()
+                if case == "wrongrequest":
+                    args[5] = args[5].float()
+                assert obj._numeric_score_select(*args) is None
+            lookup.assert_not_called()
+
+
+def test_finite_preparation_and_short_launch_variant():
+    obj = indexer()
+    with (
+        envs.SGLANG_QSA_MK_SCORE.override(False),
+        envs.SGLANG_QSA_SPLIT_TOPK.override(False),
+    ):
+        assert obj.numeric_preparation_signatures(32768, 16) == ()
+    with flags():
+        for context, page in [(0, 16), (32768, 32), (524289, 16)]:
+            assert obj.numeric_preparation_signatures(context, page) == ()
+        with envs.SGLANG_QSA_MK_SCORE_SHORT32.override(True):
+            score, select = obj.numeric_preparation_signatures(32769, 16)
+            assert score.variant == 3 and select.variant == 0
+            assert score.context_bound == select.context_bound == 8208
+
+
+@pytest.mark.parametrize(
+    "target,draft,tp,grouped,graph,request_count,expected",
+    [
+        (True, False, 4, True, True, 1, True),
+        (True, False, 1, True, True, 1, False),
+        (True, False, 1, False, True, 1, True),
+        (False, True, 1, True, True, 1, True),
+        (False, False, 4, True, True, 1, False),
+        (True, False, 4, True, False, 1, False),
+        (True, False, 4, True, True, 2, False),
+    ],
+)
+def test_source_single_request_graph_admission(
+    target, draft, tp, grouped, graph, request_count, expected
+):
+    obj = indexer()
+    q, cache, *_ = tensors(8192)
+    with flags():
+        obj.numeric_preparation_signatures(32768, 16)
+    requests = torch.ones(4, dtype=torch.int64)
+    with (
+        flags(),
+        envs.SGLANG_QSA_GROUPED_SCORE.override(grouped),
+        patch.object(impl, "get_parallel", return_value=NS(tp_size=tp)),
+    ):
+        result = obj._score_requests(
+            q,
+            cache,
+            NS(is_cuda_graph=graph, req_pool_indices=requests),
+            NS(req_pool_indices=torch.ones(request_count)),
+            target,
+            draft,
+        )
+    assert (result is requests) == expected
+
+
+def test_post_pool_preparation_passes_only_frozen_exact_signatures():
+    from sglang.srt.kernel_plugins.nvidia import binding
+
+    obj = indexer()
+    model = torch.nn.Module()
+    model.add_module("indexer", obj)
+    runner = NS(
+        token_to_kv_pool=NS(qsa_compressed_page_size=16),
+        model_config=NS(context_len=32769),
+    )
+    bound = binding.MegakernelBinding(model=model)
+    bound._numeric_spec = obj._numeric_capability_spec
+    with (
+        flags(),
+        patch.object(bound, "_prepare_hybrid", return_value=None),
+        patch.object(bound, "assert_live"),
+    ):
+        prepared = bound.preparation_view(runner)
+        assert prepared.hybrid is None and len(prepared.numeric_signatures) == 2
+        assert all(s.context_bound == 8208 for s in prepared.numeric_signatures)
+        assert bound.preparation_view(runner) is prepared
+        assert all(
+            isinstance(getattr(s, field), int)
+            for s in prepared.numeric_signatures
+            for field in s.__dataclass_fields__
+        )
+
+
+def test_hybrid_pool_preparation_uses_actual_leaf_page_size():
+    from sglang.srt.kernel_plugins.nvidia import binding
+
+    obj = indexer()
+    model = torch.nn.Module()
+    model.add_module("indexer", obj)
+    runner = NS(
+        token_to_kv_pool=NS(full_kv_pool=NS(qsa_compressed_page_size=32)),
+        model_config=NS(context_len=32768),
+    )
+    bound = binding.MegakernelBinding(model=model)
+    bound._numeric_spec = obj._numeric_capability_spec
+    with flags(), patch.object(bound, "_prepare_hybrid", return_value=None):
+        assert bound.preparation_view(runner).numeric_signatures == ()
+        assert obj._numeric_score_capacity == 0
+
+
+def verify_flags(mode="sampled"):
+    from contextlib import ExitStack
+
+    from sglang.srt.kernel_plugins.nvidia import binding
+
+    stack = ExitStack()
+    stack.enter_context(patch.object(binding, "megakernel_enabled", return_value=True))
+    stack.enter_context(envs.SGLANG_QSA_MK_SCORE.override(False))
+    stack.enter_context(envs.SGLANG_QSA_SPLIT_TOPK.override(False))
+    stack.enter_context(envs.SGLANG_QSA_VERIFY_TOPK.override(mode))
+    stack.enter_context(patch.object(impl, "get_parallel", return_value=NS(tp_size=1)))
+    stack.enter_context(patch.object(impl, "is_sm100_supported", return_value=True))
+    stack.enter_context(
+        patch.object(impl, "is_batch_invariant_mode_enabled", return_value=False)
+    )
+    return stack
+
+
+@pytest.mark.parametrize("mode,declared", [("sampled", True), ("stock", False)])
+def test_verify_select_declares_one_variant_two_per_width(mode, declared):
+    obj = indexer()
+    with verify_flags(mode):
+        found = [
+            s
+            for s in obj.numeric_preparation_signatures(8193 * 4, 16)
+            if s.operation == NumericOperation.SPARSE_SELECT
+        ]
+    assert [(s.rows, s.variant, s.context_bound) for s in found] == (
+        [(4, 2, 8208)] if declared else []
+    )
+
+
+def test_verify_select_rejects_an_unknown_mode():
+    with verify_flags("half"), pytest.raises(ValueError, match="stock or sampled"):
+        indexer().numeric_preparation_signatures(8193 * 4, 16)
+
+
+@pytest.mark.parametrize(
+    "rows_per_group,grouped4_only,draft_union,offered",
+    [
+        (4, False, False, True),
+        (1, False, False, False),
+        (4, True, False, False),
+        # SGLANG_ENABLE_QSA_DRAFT_EXTEND_UNION: the grouped4 draft extend takes it too.
+        (4, True, True, True),
+        (1, False, True, False),
+    ],
+)
+def test_verify_select_serves_only_target_verify_rows(
+    rows_per_group, grouped4_only, draft_union, offered
+):
+    obj = indexer()
+    q, cache, table, lengths, capacity, _ = tensors(8208)
+    scores = torch.zeros((4, capacity)).as_subclass(DeviceMetadata)
+    stock = torch.zeros((4, 512), dtype=torch.int32)
+    seen = []
+
+    def choose(signature, *, prepared):
+        def run(io):
+            seen.append((signature.variant, io.scratch_out.numel()))
+            io.selected_indices_out.fill_(7)
+
+        return run
+
+    import sys
+
+    with (
+        verify_flags(),
+        envs.SGLANG_ENABLE_QSA_DRAFT_EXTEND_UNION.override(draft_union),
+        patch.dict(
+            sys.modules,
+            {
+                "sglang.kernels.ops.attention.fast_topk": NS(
+                    fast_topk=lambda *a, **kw: stock
+                )
+            },
+        ),
+        patch.object(impl, "qsa_mqa_decode", return_value=scores),
+        patch.object(obj, "_numeric_score_select", return_value=None),
+        patch.object(numeric_binding, "numeric_operator", side_effect=choose),
+    ):
+        obj.numeric_preparation_signatures(8193 * 4, 16)
+        selected = obj.select_decode_tokens(
+            q,
+            cache,
+            table,
+            lengths.to(torch.int32),
+            capacity,
+            torch.arange(4),
+            lengths,
+            True,
+            None,
+            rows_per_group,
+            grouped4_only,
+        )
+    assert seen == ([(2, 32)] if offered else [])
+    assert torch.equal(selected, torch.full((4, 512), 7) if offered else stock)
+
+
+def test_public_select_stock_fallback_and_selected_expansion():
+    obj = indexer()
+    args = list(tensors(8192))
+    q, cache, table, lengths, capacity, requests = args
+    positions = torch.arange(4)
+    scores = torch.zeros((4, capacity))
+    native = torch.zeros((4, 512), dtype=torch.int32)
+    fake_module = NS(fast_topk=lambda *a, **kw: native)
+    import sys
+
+    with (
+        patch.dict(
+            sys.modules, {"sglang.kernels.ops.attention.fast_topk": fake_module}
+        ),
+        patch.object(impl, "qsa_mqa_decode", return_value=scores) as score,
+        patch.object(impl, "is_batch_invariant_mode_enabled", return_value=False),
+        patch.object(obj, "_numeric_score_select", return_value=None),
+    ):
+        assert (
+            obj.select_decode_tokens(
+                q, cache, table, lengths, capacity, positions, lengths, True, requests
+            )
+            is native
+        )
+        score.assert_called_once_with(
+            q, cache, table, lengths, capacity, min_scored_len=512
+        )
+    selected = torch.ones((4, 512), dtype=torch.int32)
+    expanded = torch.ones((4, 2051), dtype=torch.int32)
+    with (
+        patch.object(obj, "_numeric_score_select", return_value=selected),
+        patch.object(impl, "qsa_mqa_decode") as native_score,
+        patch.object(impl, "expand_qsa_block_indices", return_value=expanded) as expand,
+    ):
+        assert (
+            obj.select_decode_tokens(
+                q, cache, table, lengths, capacity, positions, lengths, False, requests
+            )
+            is expanded
+        )
+        native_score.assert_not_called()
+        expand.assert_called_once_with(
+            selected, positions, lengths, compress_ratio=4, token_topk=2048
+        )
+
+
+def prefill_flags(tp=1, fold="1"):
+    from contextlib import ExitStack
+
+    from sglang.srt.kernel_plugins.nvidia import binding, pool_attention
+
+    stack = ExitStack()
+    for field, value in [
+        (envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION, True),
+        (envs.SGLANG_ENABLE_QSA_PREFILL_FAST_SELECT, True),
+        (envs.SGLANG_OPT_QSA_PREFILL_SCALE_FOLD, fold),
+        (envs.SGLANG_QSA_SPLIT_TOPK, False),
+    ]:
+        stack.enter_context(field.override(value))
+    for target, name, value in [
+        (binding, "megakernel_enabled", True),
+        (impl, "get_parallel", NS(tp_size=tp)),
+        (impl, "is_sm100_supported", True),
+        (impl, "is_batch_invariant_mode_enabled", False),
+        (torch.cuda, "is_current_stream_capturing", False),
+        (pool_attention, "pool_device_sms", 148),
+    ]:
+        stack.enter_context(patch.object(target, name, return_value=value))
+    stack.enter_context(patch.object(impl, "HAS_TILELANG", True))
+    return stack
+
+
+def prefill_args(rows, width=8193):
+    q = torch.zeros((rows, 4, 128), dtype=torch.bfloat16).as_subclass(DeviceMetadata)
+    positions = torch.arange(rows)
+    return [
+        q,
+        torch.zeros((2 * width, 1, 128), dtype=torch.bfloat16),
+        torch.zeros(rows, dtype=torch.int64),
+        torch.full((rows,), width, dtype=torch.int64),
+        positions,
+        positions + 1,
+        width,
+    ]
+
+
+@pytest.mark.parametrize(
+    "tp,heads,fast,declared",
+    [
+        (1, 4, True, True),
+        (4, 4, True, True),
+        (1, 8, True, False),
+        (1, 4, False, False),
+    ],
+)
+def test_prefill_select_declares_one_row_independent_signature(
+    tp, heads, fast, declared
+):
+    from sglang.kernels.plugin_kernels.nvidia.numeric import (
+        NumericSignature,
+        ScalarType,
+    )
+
+    obj = indexer()
+    obj.index_n_heads = heads
+    with (
+        prefill_flags(tp=tp),
+        envs.SGLANG_ENABLE_QSA_PREFILL_FAST_SELECT.override(fast),
+    ):
+        found = [
+            s
+            for s in obj.numeric_preparation_signatures(8193 * 4, 16)
+            if s.operation == NumericOperation.PREFILL_SELECT
+        ]
+    expected = NumericSignature(
+        NumericOperation.PREFILL_SELECT,
+        0,
+        4,
+        1,
+        128,
+        512,
+        4,
+        ScalarType.BF16,
+        context_bound=8208,
+    )
+    assert found == ([expected] if declared else [])
+
+
+@pytest.mark.parametrize("rows", [1, 33, 64])
+def test_prefill_select_fills_output_through_provider(rows):
+    obj = indexer()
+    args = prefill_args(rows)
+    with prefill_flags():
+        declared = obj.numeric_preparation_signatures(8193 * 4, 16)
+        seen = []
+
+        def choose(signature, *, prepared):
+            assert prepared and signature in declared
+            return seen.append
+
+        with (
+            patch.object(numeric_binding, "numeric_operator", side_effect=choose),
+            patch.object(impl, "qsa_mqa_prefill_relative") as stock,
+        ):
+            output = obj.select_prefill_tokens(*args)
+    stock.assert_not_called()
+    (io,) = seen
+    padded = (rows + 31) // 32 * 32
+    assert io.selected_indices_out is output and output.shape == (rows, 2051)
+    assert io.query.data_ptr() == args[0].data_ptr()
+    assert (io.chunk_rows, io.scorer_sms) == (rows, 148)
+    assert io.logits_out.shape == (padded, 8193)
+    assert io.query_scratch_out.shape == (padded, 4, 128)
+    assert io.block_indices_out.shape == (rows, 512)
+    assert io.split_tag.shape == (4096,) and io.zero_offsets.shape == (rows,)
+    assert all(
+        t.dtype == torch.int32
+        for t in (io.row_starts, io.row_ends, io.query_positions, io.sequence_lengths)
+    )
+    assert torch.equal(io.row_lengths, torch.full((rows,), 8193, dtype=torch.int32))
+
+
+@pytest.mark.parametrize(
+    "tc,topk,variant",
+    [
+        (False, "sampled", 0),
+        (True, "sampled", 16),
+        (False, "onepass", 1),
+        (True, "onepass", 17),
+    ],
+)
+def test_prefill_select_declares_and_calls_the_source_variant(tc, topk, variant):
+    obj = indexer()
+    seen = []
+
+    def choose(signature, *, prepared):
+        seen.append(signature)
+        return lambda io: None
+
+    with (
+        prefill_flags(),
+        envs.SGLANG_QSA_PREFILL_SCORER_TC.override(tc),
+        envs.SGLANG_QSA_PREFILL_FAST_SELECT_TOPK.override(topk),
+    ):
+        found = [
+            s
+            for s in obj.numeric_preparation_signatures(8193 * 4, 16)
+            if s.operation == NumericOperation.PREFILL_SELECT
+        ]
+        with patch.object(numeric_binding, "numeric_operator", side_effect=choose):
+            obj.select_prefill_tokens(*prefill_args(33))
+    assert [s.variant for s in found] == [variant]
+    assert seen == found
+
+
+def test_prefill_select_rejects_an_unknown_top_k():
+    obj = indexer()
+    with (
+        prefill_flags(),
+        envs.SGLANG_QSA_PREFILL_FAST_SELECT_TOPK.override("half"),
+        pytest.raises(ValueError, match="sampled"),
+    ):
+        obj.numeric_preparation_signatures(8193 * 4, 16)
+
+
+def test_prefill_select_chunk_plan_matches_the_source():
+    # Literal source plan_chunk_rows with its 128 MiB budget and 2 * SMs top-k slots.
+    def source(rows, width, slots, budget=128 * 1024 * 1024):
+        max_rows = max(32, budget // (width * 4))
+        max_rows = max(32, max_rows // 32 * 32)
+        if rows <= max_rows:
+            return rows
+        unit = slots // 32 * 32
+        if unit >= 32 and max_rows >= unit:
+            return max_rows // unit * unit
+        return max_rows
+
+    for rows in (1, 31, 33, 4064, 4065, 20000, 131072):
+        for width in (1, 512, 4097, 8193, 32768, 131072):
+            for sms in (8, 148, 160):
+                assert impl._fast_select_chunk_rows(rows, width, sms) == source(
+                    rows, width, 2 * sms
+                )
+                # The source's wide budget (SGLANG_QSA_PREFILL_FAST_SELECT_WIDE_LOGITS_MB).
+                wide = 256 * 1024 * 1024
+                assert impl._fast_select_chunk_rows(rows, width, sms, wide) == source(
+                    rows, width, 2 * sms, wide
+                )
+
+
+@pytest.mark.parametrize(
+    "mib,keys,variant",
+    [(0, 24576, 0), (256, 24576, 256 << 8 | 96 << 20), (64, 256, 64 << 8 | 1 << 20)],
+)
+def test_prefill_select_declares_the_wide_budget_and_plans_with_it(mib, keys, variant):
+    obj = indexer()
+    plans = []
+    plan = impl._fast_select_chunk_rows
+
+    def record(rows, width, sms, budget):
+        plans.append((width, budget))
+        return plan(rows, width, sms, budget)
+
+    with (
+        prefill_flags(),
+        envs.SGLANG_QSA_PREFILL_FAST_SELECT_WIDE_LOGITS_MB.override(mib),
+        envs.SGLANG_QSA_PREFILL_FAST_SELECT_WIDE_MIN_KEYS.override(keys),
+    ):
+        (found,) = [
+            s
+            for s in obj.numeric_preparation_signatures(30000 * 4, 16)
+            if s.operation == NumericOperation.PREFILL_SELECT
+        ]
+        with (
+            patch.object(
+                numeric_binding, "numeric_operator", return_value=lambda io: None
+            ),
+            patch.object(impl, "_fast_select_chunk_rows", side_effect=record),
+        ):
+            for width in (keys - 1, keys, 30000):
+                obj.select_prefill_tokens(*prefill_args(33, width))
+    assert found.variant == variant
+    stock = 128 << 20
+    wide = (mib << 20) or stock
+    assert plans == [(keys - 1, stock), (keys, wide), (30000, wide)]
+
+
+@pytest.mark.parametrize("mib,keys", [(4096, 24576), (256, 0), (256, 1000)])
+def test_prefill_select_rejects_a_wide_budget_it_cannot_declare(mib, keys):
+    obj = indexer()
+    with (
+        prefill_flags(),
+        envs.SGLANG_QSA_PREFILL_FAST_SELECT_WIDE_LOGITS_MB.override(mib),
+        envs.SGLANG_QSA_PREFILL_FAST_SELECT_WIDE_MIN_KEYS.override(keys),
+        pytest.raises(ValueError, match="WIDE"),
+    ):
+        obj.numeric_preparation_signatures(8193 * 4, 16)
+
+
+@pytest.mark.parametrize(
+    "case", ["fold_off", "wider_than_declared", "capturing", "batch_invariant", "off"]
+)
+def test_prefill_select_outside_source_policy_is_stock(case):
+    obj = indexer()
+    args = prefill_args(33, 8209 if case == "wider_than_declared" else 8193)
+    with prefill_flags(fold="0" if case == "fold_off" else "1"):
+        obj.numeric_preparation_signatures(8193 * 4, 16)
+        logits = torch.zeros((33, args[-1]))
+        with (
+            patch.object(
+                numeric_binding,
+                "numeric_operator",
+                side_effect=AssertionError("provider lookup"),
+            ),
+            patch.object(
+                torch.cuda,
+                "is_current_stream_capturing",
+                return_value=case == "capturing",
+            ),
+            patch.object(
+                impl,
+                "is_batch_invariant_mode_enabled",
+                return_value=case == "batch_invariant",
+            ),
+            envs.SGLANG_ENABLE_QSA_PREFILL_FAST_SELECT.override(case != "off"),
+            patch.object(
+                impl, "qsa_mqa_prefill_relative", return_value=logits
+            ) as stock,
+            patch.object(impl, "qsa_fast_topk", return_value=torch.zeros(33, 512)),
+            patch.object(
+                impl,
+                "expand_qsa_block_indices",
+                return_value=torch.zeros((33, 2051), dtype=torch.int32),
+            ),
+        ):
+            obj.select_prefill_tokens(*args)
+    stock.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "context,page",
+    [
+        (None, 16),
+        ("32768", 16),
+        (True, 16),
+        (-1, 16),
+        (32768, None),
+        (32768, "16"),
+        (32768, 0),
+        (524289, 16),
+    ],
+)
+def test_invalid_resolved_metadata_is_stock(context, page):
+    obj = indexer()
+    with flags():
+        assert obj.numeric_preparation_signatures(context, page) == ()
+        assert obj._numeric_score_capacity == 0
+
+
+@pytest.mark.parametrize(
+    "runner", [NS(), NS(token_to_kv_pool=NS()), NS(model_config=NS(context_len=32768))]
+)
+def test_missing_resolved_objects_are_stock(runner):
+    from sglang.srt.kernel_plugins.nvidia import binding
+
+    obj = indexer()
+    model = torch.nn.Module()
+    model.add_module("indexer", obj)
+    bound = binding.MegakernelBinding(model=model)
+    with flags(), patch.object(bound, "_prepare_hybrid", return_value=None):
+        assert bound.preparation_view(runner).numeric_signatures == ()
+        assert obj._numeric_score_capacity == 0
+
+
+def qpf_indexer():
+    obj = indexer()
+    obj.layer_id = 3
+    obj._rope_axis_map_cache = None
+    cache = torch.zeros((64, 64), dtype=torch.float32).as_subclass(DeviceMetadata)
+    obj.rotary_emb = NS(
+        rotary_dim=64, mrope_section=(16, 8, 8), is_neox_style=True, cos_sin_cache=cache
+    )
+    obj.q_layernorm = NS(
+        weight=torch.ones(128, dtype=torch.bfloat16), variance_epsilon=1e-6
+    )
+    obj.k_layernorm = NS(
+        weight=torch.ones(128, dtype=torch.bfloat16), variance_epsilon=2e-6
+    )
+    obj._numeric_capability_spec = NS(
+        numeric_capability=lambda q: q.operation == NumericOperation.QSA_PROLOGUE_FOLD
+    )
+    return obj
+
+
+def qpf_pool(out_dtype=torch.float8_e4m3fn):
+    ring = torch.zeros((32, 1, 128), dtype=torch.bfloat16).as_subclass(DeviceMetadata)
+    compressed = torch.zeros((16, 1, 128), dtype=out_dtype)
+    return NS(
+        qsa_compressed_dtype=out_dtype,
+        index_state_dtype=torch.bfloat16,
+        qsa_rope_position_buffer=torch.zeros((32, 3), dtype=torch.int64),
+        get_qsa_key_state_buffer=lambda layer_id: ring,
+        get_qsa_compressed_k_buffer=lambda layer_id: compressed,
+    )
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_qpf_declares_one_exact_signature_only_when_enabled(enabled, hybrid):
+    from sglang.kernels.plugin_kernels.nvidia.numeric import (
+        QsaPrologueFoldSignature,
+        ScalarType,
+    )
+
+    obj, pool = qpf_indexer(), qpf_pool()
+    runner = NS(token_to_kv_pool=NS(full_kv_pool=pool) if hybrid else pool)
+    with envs.SGLANG_QSA_QPF.override(enabled):
+        declared = obj._qpf_signatures(runner)
+    if not enabled:
+        assert declared == () and obj._numeric_prepared_qpf is None
+        return
+    expected = QsaPrologueFoldSignature(
+        NumericOperation.QSA_PROLOGUE_FOLD,
+        0,
+        4,
+        8,
+        128,
+        64,
+        3,
+        4,
+        ScalarType.BF16,
+        ScalarType.FP8_E4M3,
+        1,
+    )
+    assert declared == (expected,) and obj._numeric_prepared_qpf == expected
+
+
+def qpf_call(obj, pool, *, group_locs=None, operator=None):
+    tokens = 8
+    qk = torch.zeros((tokens, 5 * 128), dtype=torch.bfloat16).as_subclass(
+        DeviceMetadata
+    )
+    metadata = NS(
+        token_to_kv_pool=pool,
+        graph_ring_group_locs=(
+            torch.zeros((2, 4), dtype=torch.int32) if group_locs is None else group_locs
+        ),
+        graph_write_locs=torch.zeros(2, dtype=torch.int32),
+    )
+    calls = []
+
+    def bind(signature, *, prepared):
+        calls.append((signature, prepared))
+        return operator
+
+    with patch.object(numeric_binding, "numeric_operator", bind):
+        q, out_qk = obj._try_prologue_fold(
+            torch.zeros((tokens, 2560), dtype=torch.bfloat16),
+            torch.zeros((3, tokens), dtype=torch.int32),
+            metadata,
+            torch.arange(tokens, dtype=torch.int32),
+            qk,
+        )
+    return q, out_qk, qk, calls
+
+
+def test_qpf_launches_the_bound_provider_on_the_original_tensors():
+    from sglang.kernels.plugin_kernels.nvidia.numeric import QsaPrologueFoldIO
+
+    obj, pool = qpf_indexer(), qpf_pool()
+    with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True):
+        with envs.SGLANG_QSA_QPF.override(True):
+            obj._qpf_signatures(NS(token_to_kv_pool=pool))
+    views = []
+    q, out_qk, qk, calls = qpf_call(obj, pool, operator=views.append)
+    assert calls == [(obj._numeric_prepared_qpf, True)]
+    (io,) = views
+    assert isinstance(io, QsaPrologueFoldIO)
+    assert io.qk is qk and out_qk is qk and io.q_out is q
+    assert q.shape == (8, 8, 128) and q.dtype == torch.float8_e4m3fn
+    assert io.positions.dtype == torch.int64 and io.positions.shape == (3, 8)
+    assert io.cache_loc.dtype == torch.int64 and io.cache_loc.shape == (8,)
+    assert io.key_state_buffer.shape == (32, 128)
+    assert io.compressed_k_buffer.shape == (16, 128)
+    assert io.rope_position_buffer is pool.qsa_rope_position_buffer
+    assert (io.q_eps, io.k_eps) == (1e-6, 2e-6)
+
+
+@pytest.mark.parametrize("case", ["unprepared", "no_offer", "group_shape"])
+def test_qpf_keeps_the_two_launch_prologue(case):
+    obj, pool = qpf_indexer(), qpf_pool()
+    if case != "unprepared":
+        with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True):
+            with envs.SGLANG_QSA_QPF.override(True):
+                obj._qpf_signatures(NS(token_to_kv_pool=pool))
+    else:
+        obj._numeric_prepared_qpf = None
+    views = []
+    q, out_qk, qk, calls = qpf_call(
+        obj,
+        pool,
+        group_locs=(
+            torch.zeros((2, 3), dtype=torch.int32) if case == "group_shape" else None
+        ),
+        operator=None if case == "no_offer" else views.append,
+    )
+    assert q is None and out_qk is qk and views == []
+    assert len(calls) == (0 if case == "unprepared" else 1)
+
+
+@pytest.fixture(autouse=True)
+def capability_provider_enabled(monkeypatch):
+    from sglang.srt.kernel_plugins.nvidia import binding
+
+    monkeypatch.setattr(binding, "megakernel_enabled", lambda: True)
+    monkeypatch.setenv("SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION", "1")
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__, "-v"]))

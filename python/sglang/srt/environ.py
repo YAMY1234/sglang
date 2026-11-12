@@ -661,6 +661,11 @@ class Envs:
     SGLANG_OPT_GDN_PREFILL_TMEM_DEALLOC = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # With SGLANG_Q38_EXTEND_FASTPATH: MoE rows from its floor up take the fused permuted
+    # finalize + gated shared add instead of the stock finalize and gate (same values).
+    SGLANG_OPT_MOE_EXTEND_FUSED_FINALIZE = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     # GDN prefill split conv of >= min_tokens eager tokens: a token-strip CUDA kernel that
     # reads each input row once (same values). Its tile is SGLANG_GDN_PREFILL_CONV_RETILE
     # (A's name, read only with this on): "" / "1" default, "0" off, or
@@ -694,6 +699,10 @@ class Envs:
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
     SGLANG_GDN_VERIFY_CONV_RETILE_CONFIG = EnvStr("")
+    # With SGLANG_GDN_FUSED_VERIFY_GLUE=1: the largest TP1 verify batch (requests) the
+    # one-launch GDN verify glue serves (A's name and default; the kernel's grid is one
+    # program per request and value head, so the batch only sets the grid).
+    SGLANG_GDN_FUSED_VERIFY_GLUE_MAX_BS = EnvInt(4)
     # Triton causal conv1d forward tile "BLOCK_M,BLOCK_N,num_warps,num_stages" (A's
     # name); read only with the runtime master on. Same values for any tile.
     SGLANG_CAUSAL_CONV1D_FWD_CONFIG = EnvStr("")
@@ -758,6 +767,117 @@ class Envs:
     SGLANG_OPT_MOE_PREFILL_AUTOTUNE = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    SGLANG_HC_MACRO = EnvBool(True)
+    SGLANG_HC_MACRO_MIN_ROWS = EnvInt(2)
+    # TP1 HC mix (hc 4, with SGLANG_HC_MACRO) of 33..N rows, N <= 512: the CuTe split-K silu
+    # down GEMM and a Triton up GEMM with the gated mean fused (hc_mix_splitk.hc_mix_wide)
+    # instead of the torch.compile chain's two GEMMs; not bitwise. Read only with the
+    # runtime master; 0 keeps the chain.
+    SGLANG_HC_MIX_SPLITK_MAX_ROWS = EnvInt(0)
+    # TP1 HC boundary (hc 4, hidden 2560) of 33..N rows, N <= 128: the read computes its gate partials on
+    # the side stream and the write-back runs the decode combine + next norm (two-CTA clusters) instead of
+    # hc_combine and the next grouped_gemma_rmsnorm; same arithmetic. Read only with the runtime master;
+    # 0 keeps the stock boundary.
+    SGLANG_HC_FUSED_COMBINE_MAX_ROWS = EnvInt(0)
+    # HC write-backs of at least max(33, SGLANG_X_HC_EXTEND_MIN_ROWS) rows run one kernel
+    # (hc_combine_extend) that combines, normalizes the streams for the next read and makes
+    # that read's gate dot totals, in place of hc_combine plus the next grouped_gemma_rmsnorm
+    # (and the next combine's gate dot); same bits. The row floor keeps the original
+    # branch's name.
+    SGLANG_OPT_HC_EXTEND_BOUNDARY = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    SGLANG_X_HC_EXTEND_MIN_ROWS = EnvInt(1024)
+    # With the extend boundary, TP1 (SGLANG_HC_MACRO, hc 4, hidden 2560, rank 320): a
+    # write-back of 33..N rows (N <= 320) and the next read's mix run as one K-sliced launch
+    # (hc_boundary_ks); not bitwise to the separate kernels. Read only with the runtime
+    # master; 0 keeps them. _FLAGS: hc_boundary_ks.FLAG_* bits (1 drop consumed L2 scratch,
+    # 2 tanh gate sigmoid, 4 always write the normalized streams).
+    SGLANG_HC_BOUNDARY_KS_MAX_ROWS = EnvInt(0)
+    SGLANG_HC_BOUNDARY_KS_FLAGS = EnvInt(3)
+    SGLANG_QSA_Q4_SCORE = EnvBool(False)
+    SGLANG_QSA_SCORER_V2 = EnvBool(True)
+    SGLANG_QSA_SCORER_V2_ROWS = EnvBool(False)
+    SGLANG_QSA_SCORER_V2_VER = EnvInt(7)
+    SGLANG_QSA_SCORER_V2_TARGET = EnvInt(4096)
+    SGLANG_QSA_SCORER_V2_C = EnvInt(None)
+    SGLANG_QSA_SCORER_V2_NT = EnvInt(1)
+    SGLANG_QSA_SCORER_V2_GUARD = EnvBool(False)
+    SGLANG_QSA_SCORER_V2_PEEL = EnvBool(False)
+    SGLANG_QSA_TOPK_THREADS = EnvInt(None)
+    SGLANG_QSA_TOPK_CLUSTER = EnvInt(None)
+    SGLANG_QSA_MK_SCORE = EnvBool(False)
+    SGLANG_QSA_MK_SCORE_SHORT32 = EnvBool(False)
+    SGLANG_QSA_GROUPED_SCORE = EnvBool(True)
+    SGLANG_QSA_SPLIT_TOPK = EnvBool(True)
+    # Graph decode / verify / draft extend run the indexer prologue (index-Q norm + MRoPE,
+    # ring and RoPE-position stores, group compression) as one plugin launch instead of
+    # two (same values). Opt-in: the provider builds its source under the absolute
+    # node-local SGLANG_QSA_QPF_SRC_DIR.
+    SGLANG_QSA_QPF = EnvRuntimeBool(False)
+    # TP1 target-verify top-512: "stock" (fast_topk) or "sampled" (the prefill select's
+    # one-pass kernels on the same rows; fast_topk's ordered output, smallest-index ties).
+    SGLANG_QSA_VERIFY_TOPK = EnvStr("stock")
+    # TP1 target verify of 17..MAX_REQUESTS requests (at most 576 rows): the grouped4
+    # chain scorer; PIPELINE_STAGES 2 software-pipelines its key loads.
+    SGLANG_QSA_GROUPED_SCORE_MAX_REQUESTS = EnvInt(16)
+    SGLANG_ENABLE_QSA_GROUPED4_VERIFY = EnvBool(False)
+    SGLANG_ENABLE_QSA_GROUPED4_VERIFY_CHAIN = EnvBool(False)
+    SGLANG_QSA_GROUPED4_VERIFY_CHAIN_CTAS = EnvInt(512)
+    SGLANG_QSA_GROUPED4_VERIFY_PIPELINE_STAGES = EnvInt(0)
+    # MTP draft extend (one four-row window per request) takes the same scorer.
+    SGLANG_ENABLE_QSA_GROUPED4_DRAFT_EXTEND = EnvBool(False)
+    # MTP draft-extend seed capture of a QSA layer as one integer-only launch at any
+    # batch size (the source's switch; same seed rows and lengths as the torch path).
+    SGLANG_ENABLE_QSA_MTP_CAPTURE_BATCHED = EnvBool(False)
+    # With SGLANG_Q38_LOOKUP_NATIVE at TP1: the MTP draft-decode lookup of every batch
+    # size (not only one request) is resolved inside the fused KV pack (same positions).
+    SGLANG_ENABLE_QSA_MTP_LOOKUP_BATCHED = EnvBool(False)
+    # Request-relative QSA prefill: the source's ordered fast select; it requires
+    # SGLANG_OPT_QSA_PREFILL_SCALE_FOLD, whose stored scores it reproduces.
+    SGLANG_ENABLE_QSA_PREFILL_FAST_SELECT = EnvBool(False)
+    # Its scorer on tensor cores (tl.dot / tcgen05 instead of mma.sync; bitwise is the
+    # hardware's, so opt-in).
+    SGLANG_QSA_PREFILL_SCORER_TC = EnvBool(False)
+    # Its top-k 512: "sampled" or "onepass" (the same output from one pass per long row).
+    SGLANG_QSA_PREFILL_FAST_SELECT_TOPK = EnvStr("sampled")
+    # Calls at least WIDE_MIN_KEYS wide take a WIDE_LOGITS_MB logits budget instead of
+    # 128 MiB (0: off); fewer, larger chunks, the same selection.
+    SGLANG_QSA_PREFILL_FAST_SELECT_WIDE_LOGITS_MB = EnvInt(0)
+    SGLANG_QSA_PREFILL_FAST_SELECT_WIDE_MIN_KEYS = EnvInt(24576)
+    # TP1 target verify on an FP8 KV pool: one union attention launch per layer.
+    SGLANG_QSA_FP8_POOL_VERIFY = EnvBool(False)
+    # Its token-union pass's warp count (1, 2, 4, 8, 16 or 32; the output does not depend on it).
+    SGLANG_QSA_FP8_POOL_VERIFY_UNION_WARPS = EnvInt(8)
+    # Its attention kernel warp-specialized (Gluon tcgen05; lazy rescale, not bitwise).
+    SGLANG_QSA_FP8_POOL_VERIFY_WS = EnvBool(False)
+    # The warp-specialized kernel's split count (1..16); None keeps the source plan (the
+    # most splits within one wave, at most 4).
+    SGLANG_QSA_FP8_POOL_VERIFY_WS_SPLITS = EnvInt(None)
+    # PDL into the warp-specialized kernel (it waits on kernel U after its setup).
+    SGLANG_QSA_FP8_POOL_VERIFY_WS_PDL = EnvBool(False)
+    # Its kernel 1 casts the target verify's BF16 new K/V to E4M3 in the pool write (one
+    # launch for two torch casts and the copy; the provider checks the cast equals torch's).
+    SGLANG_QSA_FUSED_FP8_KV_WRITE = EnvBool(False)
+    # A CUDA-graph MTP draft extend (four rows per request) on the same FP8 union provider,
+    # reading the pool in place instead of packing every row's tokens for trtllm decode.
+    SGLANG_ENABLE_QSA_DRAFT_EXTEND_UNION = EnvBool(False)
+    # TP1 BF16-pool target verify: the attention output gate rides the pool attention's
+    # split-K merge (fused_sigmoid_mul's arithmetic, so the same bits).
+    SGLANG_ENABLE_QSA_POOL_MERGE_GATE = EnvBool(False)
+    # TP1 prefix-chunk prefill attention with TMA-gathered K/V on the stock tile.
+    SGLANG_ENABLE_QSA_TMA_PREFILL = EnvBool(False)
+    SGLANG_QSA_TMA_PREFILL_STAGES = EnvInt(3)
+    SGLANG_HC_GATE_MAX_ROWS = EnvInt(1)
+    # Rows up to which the permuted MoE finalize also applies the shared-expert gate.
+    SGLANG_QWEN_MOE_FUSED_FINALIZE_GATE_MAX_TOKENS = EnvInt(64)
+    # The native permuted finalize + shared gate at 1..64 rows on a (row, column-chunk) grid of this many
+    # columns (128, 256, 512 or 1024; FINALIZE_PERMUTED_SHARED variant); 0 keeps one program per row.
+    # Same arithmetic per element; only the grid changes.
+    SGLANG_MOE_FINALIZE_GATE_COLUMN_CHUNK = EnvInt(0)
+    # Log once per role/layer/op whether a numeric provider was offered and bound,
+    # or why stock runs; read once at import, so it costs nothing when off.
+    SGLANG_NVIDIA_MEGAKERNEL_OFFER_LOG = EnvBool(False)
     # Admit Q38_GDN_FRONT=1 (the verify's strided projection views) and Q38_GDN_PDL=1 (inert
     # there) with --enable-gdn-replayssm-ucache.
     SGLANG_ENABLE_GDN_UCACHE_FRONT = EnvBool(False)

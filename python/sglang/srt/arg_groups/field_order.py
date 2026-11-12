@@ -563,6 +563,11 @@ POSITIONAL_FIELD_ORDER = (
     "paged_experts_enable_disk",
     "disable_normalize_embedding",
     "log_schedule_decisions",
+    "enable_gdn_replayssm_ucache",
+    "freeze_gc_after_startup",
+    "enable_decode_warmup",
+    "decode_warmup_batch_sizes",
+    "decode_warmup_prompt_len",
     "speculative_dspark_lm_head_dtype",
     "speculative_dflash_draft_kv_ring",
     "media_url_timeout",
@@ -570,10 +575,5 @@ POSITIONAL_FIELD_ORDER = (
     "layernorm_sp_min_tokens",
     "paged_experts_host_memory_gb",
     "_max_running_requests_explicitly_set",
-    "enable_gdn_replayssm_ucache",
-    "freeze_gc_after_startup",
-    "enable_decode_warmup",
-    "decode_warmup_batch_sizes",
-    "decode_warmup_prompt_len",
 )
 # fmt: on

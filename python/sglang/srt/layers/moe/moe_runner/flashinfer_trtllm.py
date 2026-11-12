@@ -169,8 +169,6 @@ def round_up_to_multiple(x: int, m: int) -> int:
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
-        FlashinferCombineInput,
-        FlashinferDispatchOutput,
         StandardCombineInput,
         StandardDispatchOutput,
     )
@@ -2244,6 +2242,10 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
                 (num_tokens, hidden_size), dtype=torch.bfloat16
             )
 
+        from sglang.srt.kernel_plugins.nvidia.local_experts import (
+            try_numeric_local_experts,
+        )
+
         result = None
         if fused_route:
             result = q38_fused_routing.run(
@@ -2260,6 +2262,8 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
                 moe_kwargs["hidden_states_scale"] = hs_scale_linear.view(
                     torch.float8_e4m3fn
                 ).reshape(*hs_scale_linear.shape[:-1], -1)
+        if result is None:
+            result = try_numeric_local_experts(moe_kwargs)
         if result is None:
             result = trtllm_fp4_block_scale_moe(**moe_kwargs)
         if defer_finalize:

@@ -19,7 +19,6 @@ from sglang.kernels.ops.memory.small_field_copy import SmallFieldCopyPlan
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardStateSlots
-from sglang.srt.speculative import staged_next_draft
 from sglang.srt.speculative import post_verify_late_join, staged_next_draft
 from sglang.srt.speculative.eagle_worker_common import (
     STOCK_SPECULATIVE_RUNTIME_HOOKS,
@@ -101,8 +100,6 @@ class EaglePostVerifyGraphs:
     ):
         self._target_worker = target_worker
         self._speculative_runtime_hooks = speculative_runtime_hooks
-        # Whether the commit writes recurrent state slots; resolved at first use.
-        self._stages_state_slots: Optional[bool] = None
         # SGLANG_OPT_SPEC_POST_VERIFY_EXTEND_LAYOUT: the draft extend's layout in the
         # commit-outputs launch
         self._extend_layout = envs.SGLANG_OPT_SPEC_POST_VERIFY_EXTEND_LAYOUT.get()
@@ -110,6 +107,8 @@ class EaglePostVerifyGraphs:
             self._extend_layout
             and target_worker.model_runner.model_config.model_is_mrope
         )
+        # Whether the commit writes recurrent state slots; resolved at first use.
+        self._stages_state_slots: Optional[bool] = None
         self._graphs = _PostVerifyGraphs(
             body=self._body,
             commit=self._commit,

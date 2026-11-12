@@ -474,9 +474,11 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                     ids = torch.tensor([7, 99, 99])
                     hidden = torch.ones((3, 4))
                     batch = SimpleNamespace(
+                        batch_size=1,
+                        forward_mode=ForwardMode.EXTEND,
                         moe_num_token_non_padded=lambda: torch.tensor(
                             2, dtype=torch.int32
-                        )
+                        ),
                     )
 
                     def run_experts(_experts, x, topk_ids, weights, **kwargs):

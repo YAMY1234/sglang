@@ -159,3 +159,77 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__, "-v", "-s"]))
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="hc_combine_extend replays grouped_gemma_rmsnorm's Blackwell order",
+)
+@pytest.mark.parametrize("num_tokens", [33, 512, 4096])
+def test_hc_combine_extend_matches_the_stock_chain_bitwise(num_tokens):
+    from sglang.kernels.ops.elementwise.hc_combine_extend import hc_combine_extend
+    from sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm import (
+        grouped_gemma_rmsnorm,
+    )
+
+    block_output, residual, normed_residual, inject_weight = _make_inputs(
+        num_tokens, torch.bfloat16
+    )
+    norm_weight = torch.randn(HC_COUNT * HIDDEN_SIZE, dtype=torch.bfloat16).cuda()
+    next_weight = torch.randn_like(inject_weight)
+    combined = hc_combine(
+        block_output, residual, normed_residual, inject_weight, HC_COUNT, HIDDEN_SIZE
+    )
+    normalized = grouped_gemma_rmsnorm(combined, norm_weight, HIDDEN_SIZE, 1e-6)
+    next_combined = hc_combine(
+        block_output, combined, normalized, next_weight, HC_COUNT, HIDDEN_SIZE
+    )
+
+    out, normed, totals = hc_combine_extend(
+        block_output,
+        residual,
+        HC_COUNT,
+        HIDDEN_SIZE,
+        normed_residual=normed_residual,
+        inject_weight=inject_weight,
+        norm_weight=norm_weight,
+        eps=1e-6,
+        next_inject_weight=next_weight,
+    )
+    assert torch.equal(out, combined)
+    assert torch.equal(normed, normalized)
+    # The next boundary's gate from the totals equals the one from the streams.
+    next_out, _, _ = hc_combine_extend(
+        block_output, out, HC_COUNT, HIDDEN_SIZE, partials=totals
+    )
+    assert torch.equal(next_out, next_combined)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
+    reason="the wide decode combine-norm uses two-CTA clusters on the sm_100 family",
+)
+@pytest.mark.parametrize("num_tokens", [33, 64, 128])
+def test_hc_combine_apply_norm_wide_matches_the_stock_chain_bitwise(num_tokens):
+    from sglang.kernels.ops.elementwise.hc_combine_decode import (
+        hc_combine_apply_norm_wide,
+        hc_combine_gate,
+    )
+    from sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm import (
+        grouped_gemma_rmsnorm,
+    )
+
+    block_output, residual, normed_residual, inject_weight = _make_inputs(
+        num_tokens, torch.bfloat16
+    )
+    norm_weight = torch.randn(HC_COUNT * HIDDEN_SIZE, dtype=torch.bfloat16).cuda()
+    combined = hc_combine(
+        block_output, residual, normed_residual, inject_weight, HC_COUNT, HIDDEN_SIZE
+    )
+    normalized = grouped_gemma_rmsnorm(combined, norm_weight, HIDDEN_SIZE, 1e-6)
+    partials = hc_combine_gate(normed_residual, inject_weight)
+    out, normed = hc_combine_apply_norm_wide(
+        block_output, residual, partials, norm_weight, 1e-6
+    )
+    assert torch.equal(out, combined)
+    assert torch.equal(normed, normalized)

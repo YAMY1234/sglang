@@ -71,6 +71,7 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.moe.moe_runner import q38_fused_routing
 from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
     TopK,
@@ -760,6 +761,16 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             self.experts.supports_deferred_finalize and self.shared_expert is not None
         )
 
+    def numeric_signatures(self, widths, tokens_per_request):
+        from sglang.srt.kernel_plugins.nvidia.permuted_finalize import (
+            numeric_signatures,
+        )
+        from sglang.srt.kernel_plugins.nvidia.router_quant import (
+            numeric_signatures as router_signatures,
+        )
+
+        return numeric_signatures(self, widths) + router_signatures(self, widths)
+
     def _uses_nvfp4_trtllm_glue(self) -> bool:
         """Glue on the TP1/EP1 unpadded per-tensor NVFP4 path."""
         eligible = self.__dict__.get("_nvfp4_trtllm_glue")
@@ -792,6 +803,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         *,
         defer_finalize: bool = False,
+        fused_finalize: bool = False,
+        precomputed_router=None,
         routed_input=None,
     ):
         if _use_aiter and self.enable_shared_expert_fusion and not defer_finalize:
@@ -799,9 +812,19 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             if topk_output is not None:
                 return self.experts(hidden_states, topk_output)
         # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
-        pre_quant = {} if routed_input is None else {"pre_quant_input": routed_input}
+        if precomputed_router is None:
+            router_logits, _ = self.gate(hidden_states)
+            pre_quant = (
+                {} if routed_input is None else {"pre_quant_input": routed_input}
+            )
+        else:
+            router_logits, packet = precomputed_router
+            pre_quant = {"pre_quant_input": packet}
         topk_output = self.topk(hidden_states, router_logits)
+        if fused_finalize and TopKOutputChecker.format_is_bypassed(topk_output):
+            return self.experts.forward_deferred_finalize(
+                hidden_states, topk_output, **pre_quant
+            )
         if defer_finalize:
             if not self.supports_deferred_finalize:
                 raise RuntimeError(
@@ -812,7 +835,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 raise RuntimeError(
                     "Qwen deferred finalize requires logits-based bypassed TopK"
                 )
-            return self.experts.forward_deferred_finalize(hidden_states, topk_output)
+            return self.experts.forward_deferred_finalize(
+                hidden_states, topk_output, **pre_quant
+            )
         if self.enable_shared_expert_fusion and TopKOutputChecker.format_is_standard(
             topk_output
         ):
@@ -848,6 +873,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         use_fused_gate: bool = False,
         defer_finalize: bool = False,
+        ordered_finalize_sink=None,
+        precomputed_router=None,
     ) -> torch.Tensor:
         current_stream = torch.cuda.current_stream()
 
@@ -856,7 +883,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # the shared branch reads the same input and writes a separate output.
             self.alt_stream.wait_stream(current_stream)
             router_output = self._forward_router_experts(
-                hidden_states, defer_finalize=True
+                hidden_states,
+                defer_finalize=True,
+                precomputed_router=precomputed_router,
             )
             with torch.cuda.stream(self.alt_stream):
                 shared_output = self._forward_shared_experts(
@@ -869,12 +898,30 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             current_stream.wait_stream(self.alt_stream)
             return router_output, shared_output
 
+        from sglang.srt.kernel_plugins.nvidia.permuted_finalize import prepare
+
+        native_finalize = prepare(
+            self,
+            hidden_states,
+            use_fused_gate=use_fused_gate,
+            ordered_finalize_sink=ordered_finalize_sink,
+        )
         self.alt_stream.wait_stream(current_stream)
         routed_input = None
         if (
             envs.SGLANG_OPT_MOE_NVFP4_PREQUANT_OVERLAP.get()
             and self.tp_size == 1
+            # A router provider's packet is the routed input; the ordered-finalize
+            # route does not take one.
+            and precomputed_router is None
+            and ordered_finalize_sink is None
             and self._uses_nvfp4_trtllm_glue()
+            # The deferred call's fused routing (SGLANG_OPT_MOE_FUSED_ROUTING)
+            # quantizes the routed input itself.
+            and not (
+                native_finalize is not None
+                and q38_fused_routing.wants(hidden_states.shape[0])
+            )
         ):
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 quantize_nvfp4_routed_input,
@@ -910,11 +957,60 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # ===== END TO BE REFACTORED ====
 
         with torch.cuda.stream(self.alt_stream):
-            router_output = self._forward_router_experts(
-                hidden_states, routed_input=routed_input
-            )
+            if ordered_finalize_sink is not None:
+                from sglang.srt.kernel_plugins.nvidia.local_experts import (
+                    capture_local_finalize,
+                    prepare_local_shared_finalize,
+                )
+
+                run = prepare_local_shared_finalize(
+                    hidden_states,
+                    self.shared_expert_gate.weight.squeeze(),
+                    shared_output,
+                    intermediate_size=self.experts.intermediate_size_per_partition,
+                    expert_count=self.experts.num_experts,
+                    topk=self.experts.top_k,
+                )
+                if run is not None:
+                    with capture_local_finalize(ordered_finalize_sink, run=run):
+                        router_output = self._forward_router_experts(
+                            hidden_states, precomputed_router=precomputed_router
+                        )
+                else:
+                    router_output = self._forward_router_experts(
+                        hidden_states, precomputed_router=precomputed_router
+                    )
+            elif native_finalize is not None:
+                router_output = self._forward_router_experts(
+                    hidden_states,
+                    fused_finalize=True,
+                    precomputed_router=precomputed_router,
+                    routed_input=routed_input,
+                )
+            else:
+                router_output = self._forward_router_experts(
+                    hidden_states,
+                    precomputed_router=precomputed_router,
+                    routed_input=routed_input,
+                )
 
         current_stream.wait_stream(self.alt_stream)
+        if native_finalize is not None and not isinstance(router_output, torch.Tensor):
+            from sglang.srt.kernel_plugins.nvidia.permuted_finalize import finish
+
+            for tensor in (
+                router_output.gemm2_out,
+                router_output.expert_weights,
+                router_output.expanded_idx_to_permuted_idx,
+            ):
+                tensor.record_stream(current_stream)
+            return finish(
+                native_finalize,
+                hidden_states,
+                self.shared_expert_gate.weight.squeeze(0),
+                shared_output,
+                router_output,
+            ), None
 
         if staged and unstage_shared_expert_add() is None:
             # The dispatch consumed the staging (add already enqueued); skip the caller's add.
@@ -950,6 +1046,19 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             and not is_npu()
         )
 
+        ordered_finalize_sink = None
+        if (
+            not defer_finalize
+            and use_fused_gate
+            and hidden_states.is_cuda
+            and not _SGLANG_EXPERIMENTAL_LORA_OPTI
+            and get_bool_env_var("SGLANG_Q38_FINALIZE_SHARED", "False")
+        ):
+            ordered_finalize_sink = []
+
+        from sglang.srt.kernel_plugins.nvidia.router_quant import produce
+
+        precomputed_router = produce(self, hidden_states)
         if hidden_states.shape[0] == 0:
             # M=0 guard for idle DP ranks: skip shared_experts and gate
             # (which crash on empty tensors in FP4 GEMM), but still call
@@ -971,6 +1080,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 hidden_states,
                 use_fused_gate=use_fused_gate,
                 defer_finalize=defer_finalize,
+                ordered_finalize_sink=ordered_finalize_sink,
+                precomputed_router=precomputed_router,
             )
         else:
             shared_output = self._forward_shared_experts(
@@ -980,9 +1091,35 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 shared_output = self._gate_shared_output_out_of_place(
                     hidden_states, shared_output
                 )
-            final_hidden_states = self._forward_router_experts(
-                hidden_states, defer_finalize=defer_finalize
-            )
+            if ordered_finalize_sink is not None:
+                from sglang.srt.kernel_plugins.nvidia.local_experts import (
+                    capture_local_finalize,
+                    prepare_local_shared_finalize,
+                )
+
+                run = prepare_local_shared_finalize(
+                    hidden_states,
+                    self.shared_expert_gate.weight.squeeze(),
+                    shared_output,
+                    intermediate_size=self.experts.intermediate_size_per_partition,
+                    expert_count=self.experts.num_experts,
+                    topk=self.experts.top_k,
+                )
+                if run is not None:
+                    with capture_local_finalize(ordered_finalize_sink, run=run):
+                        final_hidden_states = self._forward_router_experts(
+                            hidden_states, precomputed_router=precomputed_router
+                        )
+                else:
+                    final_hidden_states = self._forward_router_experts(
+                        hidden_states, precomputed_router=precomputed_router
+                    )
+            else:
+                final_hidden_states = self._forward_router_experts(
+                    hidden_states,
+                    defer_finalize=defer_finalize,
+                    precomputed_router=precomputed_router,
+                )
 
         if defer_finalize:
             if shared_output is None:
@@ -998,6 +1135,19 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 reduce=sum_post_experts_output,
             )
 
+        if ordered_finalize_sink:
+            from sglang.srt.kernel_plugins.nvidia.local_experts import (
+                finish_local_shared_finalize,
+            )
+
+            finish_local_shared_finalize(
+                ordered_finalize_sink,
+                hidden_states,
+                self.shared_expert_gate.weight.squeeze(),
+                shared_output,
+                final_hidden_states,
+            )
+            shared_output = None
         if shared_output is not None:
             if use_fused_gate:
                 fused_gate_sigmoid_mul_add(

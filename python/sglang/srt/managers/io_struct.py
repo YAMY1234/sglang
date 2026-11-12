@@ -1310,13 +1310,13 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
     # LoRA adapter name; KV events namespace this request's blocks by it.
     lora_name: Optional[str] = None
+    # See GenerateReqInput.parent_session_id; a defaulted tail field.
+    parent_session_id: Optional[str] = None
     # GenerateReqInput.mm_routing_labels split by media type ("image",
     # "video", "audio"). Carried for multimodal inputs assembled in the
     # scheduler (encoder disaggregation). A defaulted tail field, so older
     # IPC senders decode as None.
     mm_routing_labels: Optional[Dict[str, List[str]]] = None
-    # See GenerateReqInput.parent_session_id; a defaulted tail field.
-    parent_session_id: Optional[str] = None
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_object_fields_as_pickle(self.mm_inputs)

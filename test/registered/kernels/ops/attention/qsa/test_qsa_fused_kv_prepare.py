@@ -113,6 +113,44 @@ def test_fused_kv_prepare(requests, width, dtype, padding, packed_dtype):
     verify()
 
 
+@pytest.mark.parametrize("requests", [1, 3, 128])
+def test_fused_kv_prepare_resolves_a_deferred_mtp_lookup(requests):
+    from sglang.srt.kernel_plugins.nvidia.mtp_deferred_kv import (
+        DeferredMtpSparseIndices,
+    )
+
+    torch.manual_seed(29)
+    heads, dim, length, columns, tail, stride = 2, 256, 4096, 2055, 4, 2112
+    mapping = (torch.randperm(requests * length, device="cuda") + 1).view(
+        requests, length
+    )
+    pool = torch.randint(-1, 3000, (requests + 1, columns), device="cuda").int()
+    captured = torch.randint(3000, 3100, (requests + 1,), device="cuda").int()
+    reqids = torch.randperm(requests, device="cuda").int()
+    positions = captured[reqids.long()] + torch.randint(-1, 4, (requests,)).cuda()
+    lens = (positions + 1).int()
+    loc = mapping[reqids.long(), positions.long()]
+    deferred = DeferredMtpSparseIndices(
+        pool, captured, reqids, positions.int(), torch.arange(tail, device="cuda")
+    )
+    nk = torch.randn(requests, heads, dim, device="cuda", dtype=torch.bfloat16)
+    nv = torch.randn_like(nk)
+    kc = torch.randn(requests * length + 1, heads, dim, device="cuda").bfloat16()
+    vc = torch.randn_like(kc)
+    outputs = []
+    for indices in (deferred.materialize(), deferred):
+        caches = (kc.clone(), vc.clone())
+        counts = torch.full((requests,), -1, device="cuda", dtype=torch.int32)
+        ok = torch.zeros(requests * stride, heads, dim, device="cuda").bfloat16()
+        ov = torch.zeros_like(ok)
+        fused_kv_prepare(
+            *caches, nk, nv, loc, mapping, reqids, indices, lens, counts, ok, ov, 1
+        )
+        outputs.append((*caches, counts, ok, ov))
+    for actual, expected in zip(outputs[1], outputs[0]):
+        assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+
+
 @pytest.mark.parametrize("width", [1, 4])
 def test_qsa_pool_routes_to_fused_prepare(monkeypatch, width):
     from types import SimpleNamespace

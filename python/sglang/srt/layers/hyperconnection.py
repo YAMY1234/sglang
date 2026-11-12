@@ -1,3 +1,4 @@
+import logging
 from functools import lru_cache
 from typing import Optional
 
@@ -15,10 +16,95 @@ from sglang.srt.layers.hc_mix_flydsl import (
 )
 from sglang.srt.runtime_context import forward_helper_stream_kwargs
 
+logger = logging.getLogger(__name__)
+
+# Extend boundary (SGLANG_OPT_HC_EXTEND_BOUNDARY) build outcome per (hc, hidden, dtype),
+# decided once per process, so every layer agrees on whether its [rows, hc] gate
+# totals are in use; and the row bands that have logged their first use.
+_HC_EXT_BUILT: dict = {}
+_HC_EXT_LOGGED: set = set()
+# Below this the decode paths (side-stream gate, HC macro) own the boundary.
+_HC_EXT_FLOOR_ROWS = 33
+
 
 @lru_cache(None)
 def _hc_gate_stream(device: int) -> torch.cuda.Stream:
     return torch.cuda.Stream(device=device, **forward_helper_stream_kwargs())
+
+
+def _hc_mix_wide_max_rows() -> int:
+    """Largest row count hc_mix_wide serves (SGLANG_HC_MIX_SPLITK_MAX_ROWS); 0 = off."""
+    if not envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
+        return 0
+    from sglang.kernels.ops.gemm.hc_mix_splitk import WIDE_MAX_ROWS
+
+    return min(envs.SGLANG_HC_MIX_SPLITK_MAX_ROWS.get(), WIDE_MAX_ROWS)
+
+
+def _tp_size() -> int:
+    from sglang.srt.runtime_context import get_parallel
+
+    return get_parallel().tp_size
+
+
+def _hc_fused_combine_max_rows() -> int:
+    """Largest HC boundary served by the side-stream gate + wide combine-norm; 0 = off."""
+    if not envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
+        return 0
+    return min(envs.SGLANG_HC_FUSED_COMBINE_MAX_ROWS.get(), 128)
+
+
+def _hc_ext_min_rows() -> int:
+    """Smallest write-back the extend boundary serves; 0 = off."""
+    if not envs.SGLANG_OPT_HC_EXTEND_BOUNDARY.get():
+        return 0
+    return max(_HC_EXT_FLOOR_ROWS, envs.SGLANG_X_HC_EXTEND_MIN_ROWS.get())
+
+
+def _hc_ext_ready(hc_count: int, hidden_size: int, dtype: torch.dtype) -> bool:
+    key = (hc_count, hidden_size, dtype)
+    ready = _HC_EXT_BUILT.get(key)
+    if ready is None:
+        try:
+            from sglang.kernels.ops.elementwise.hc_combine_extend import warmup
+
+            warmup(hc_count, hidden_size, dtype)
+            ready = True
+        except Exception as e:  # keep the stock boundary
+            logger.warning("hc_combine_extend unavailable (%s); stock HC", e)
+            ready = False
+        _HC_EXT_BUILT[key] = ready
+    return ready
+
+
+_KS_BOUNDARY_BUILT: list = []
+
+
+def _hc_boundary_ks_max_rows() -> int:
+    """Largest write-back the one-launch boundary serves; 0 = off."""
+    if not (
+        envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+        and envs.SGLANG_OPT_HC_EXTEND_BOUNDARY.get()
+    ):
+        return 0
+    from sglang.kernels.ops.gemm.hc_boundary_ks import MAX_ROWS
+
+    return min(envs.SGLANG_HC_BOUNDARY_KS_MAX_ROWS.get(), MAX_ROWS)
+
+
+def _hc_boundary_ks_ready() -> bool:
+    """Build (or load) the one-launch boundary and its scratch once per process,
+    before graph capture; a failure keeps the separate kernels."""
+    if not _KS_BOUNDARY_BUILT:
+        try:
+            from sglang.kernels.ops.gemm.hc_boundary_ks import warmup
+
+            warmup()
+            _KS_BOUNDARY_BUILT.append(True)
+        except Exception as e:  # keep the separate kernels
+            logger.warning("hc_boundary_ks unavailable (%s); separate HC kernels", e)
+            _KS_BOUNDARY_BUILT.append(False)
+    return _KS_BOUNDARY_BUILT[0]
 
 
 _BF16_GEMM_PINS = bool(envs.SGLANG_BF16_GEMM_PIN_FILE.get())
@@ -60,6 +146,25 @@ def _mix_gemms_pinned(lowrank: int, width: int) -> bool:
 
     return bf16_gemm_pins.has_shape(lowrank, width) or bf16_gemm_pins.has_shape(
         width, lowrank
+    )
+
+
+def _log_hc_ext_once(
+    rows: int, min_rows: int, has_partials: bool, norm: bool, gate: bool
+):
+    band = "prefill" if rows >= 1024 else "verify"
+    if band in _HC_EXT_LOGGED:
+        return
+    _HC_EXT_LOGGED.add(band)
+    logger.info(
+        "HC extend boundary engaged (%s rows): rows=%d min_rows=%d partials=%s "
+        "norm=%s gate=%s (SGLANG_OPT_HC_EXTEND_BOUNDARY)",
+        band,
+        rows,
+        min_rows,
+        has_partials,
+        norm,
+        gate,
     )
 
 
@@ -168,6 +273,154 @@ class HyperConnectionBase(nn.Module):
 
 
 class GatedResidual(HyperConnectionBase):
+    # Set by the previous write-back's one-launch boundary: (its normalized output,
+    # this read's mixed input), consumed by the next mix() of those streams.
+    _premixed: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+    # Largest write-back this module may run as a one-launch boundary, in either role.
+    _ks_boundary_max_rows: int = 0
+
+    def numeric_signatures(self, widths, tokens_per_request):
+        from sglang.kernels.plugin_kernels.nvidia.numeric import (
+            HcSignature,
+            NumericOperation,
+            ScalarType,
+        )
+
+        if self.params_dtype != torch.bfloat16:
+            return ()
+        operations = (
+            NumericOperation.HC_GATE,
+            NumericOperation.HC_APPLY_NORM,
+            NumericOperation.HC_APPLY_NORM_GATE,
+        )
+        signatures = [
+            HcSignature(op, rows, self.hc_count, self.hidden_size, ScalarType.BF16)
+            for rows in widths
+            if type(rows) is int and rows > 0
+            for op in operations
+        ]
+        # The tuning role is resolved here; a provider never queries the runtime.
+        mix_variant = self._numeric_mix_variant()
+        signatures.extend(
+            HcSignature(
+                NumericOperation.HC_MIX,
+                rows,
+                self.hc_count,
+                self.hidden_size,
+                ScalarType.BF16,
+                lowrank=self.config.hc_lowrank,
+                variant=mix_variant,
+            )
+            for rows in widths
+            if type(rows) is int and rows > 0
+        )
+        from sglang.srt.kernel_plugins.nvidia.numeric_binding import (
+            signature_capability_supported,
+        )
+
+        declared = tuple(
+            signature
+            for signature in signatures
+            if signature_capability_supported(
+                signature,
+                spec=getattr(self, "_numeric_capability_spec", None),
+            )
+        )
+        if (
+            self._gate_stream is None
+            and hasattr(self, "block_inject_weight")
+            and self.config.hc_per_branch_norm
+            and any(s.operation == NumericOperation.HC_GATE for s in declared)
+            and torch.cuda.is_available()
+        ):
+            # Existing startup lifecycle, after capability admission and before
+            # graph warmup; no stream is created for an unsupported shape.
+            self._gate_stream = _hc_gate_stream(torch.cuda.current_device())
+        return declared
+
+    def _numeric_hc_partials_supported(self, rows):
+        if rows == 1:
+            return True
+        from sglang.kernels.plugin_kernels.nvidia.numeric import (
+            HcSignature,
+            NumericOperation,
+            ScalarType,
+        )
+        from sglang.srt.kernel_plugins.nvidia.numeric_binding import numeric_operator
+
+        return (
+            numeric_operator(
+                HcSignature(
+                    NumericOperation.HC_APPLY_NORM,
+                    rows,
+                    self.hc_count,
+                    self.hidden_size,
+                    ScalarType.BF16,
+                ),
+                prepared=True,
+            )
+            is not None
+        )
+
+    def _numeric_hc_macro(self, rows):
+        from sglang.kernels.plugin_kernels.nvidia.numeric import (
+            HcSignature,
+            NumericOperation,
+            ScalarType,
+        )
+        from sglang.srt.environ import envs
+        from sglang.srt.kernel_plugins.nvidia.numeric_binding import numeric_operator
+
+        return numeric_operator(
+            HcSignature(
+                NumericOperation.HC_APPLY_NORM_GATE,
+                rows,
+                self.hc_count,
+                self.hidden_size,
+                ScalarType.BF16,
+            ),
+            prepared=(
+                envs.SGLANG_HC_MACRO.get()
+                and max(1, envs.SGLANG_HC_MACRO_MIN_ROWS.get()) <= rows
+                and self.config.hc_per_branch_norm
+                and hasattr(self, "block_inject_weight")
+                and self._numeric_mix_variant() == 1
+                and not torch.compiler.is_compiling()
+                and self._numeric_hc_partials_supported(rows)
+            ),
+        )
+
+    def _numeric_hc_mix_supported(self, rows):
+        from sglang.kernels.plugin_kernels.nvidia.numeric import (
+            HcSignature,
+            NumericOperation,
+            ScalarType,
+        )
+        from sglang.srt.kernel_plugins.nvidia.numeric_binding import numeric_operator
+
+        return (
+            numeric_operator(
+                HcSignature(
+                    NumericOperation.HC_MIX,
+                    rows,
+                    self.hc_count,
+                    self.hidden_size,
+                    ScalarType.BF16,
+                    lowrank=self.config.hc_lowrank,
+                    variant=self._numeric_mix_variant(),
+                ),
+                prepared=True,
+            )
+            is not None
+        )
+
+    @staticmethod
+    def _numeric_mix_variant():
+        from sglang.srt.environ import envs
+        from sglang.srt.runtime_context import get_parallel
+
+        return int(get_parallel().tp_size == 1 and envs.SGLANG_HC_MACRO.get())
+
     def __init__(
         self,
         config: HyperConnectionConfig,
@@ -213,12 +466,27 @@ class GatedResidual(HyperConnectionBase):
                 and lowrank % 8 == 0
             )
             self._mix_up_weight_padded = None
+            # hc_mix_wide's up GEMM tiles: 32 hidden columns, 64 low-rank columns.
+            self._mix_wide_max_rows = (
+                _hc_mix_wide_max_rows()
+                if self._jit_mix_ok
+                and self.hc_count == 4
+                and self.hidden_size % 32 == 0
+                and lowrank % 64 == 0
+                else 0
+            )
             # Resolved on the first mix(), once the weights are final.
             self._mix_flydsl_ok = None
             self._mix_flydsl_weights = None
             self._mix_flydsl_weight_key = None
 
         self._gate_stream = None
+        self._ext_min_rows = 0
+        self._fused_combine_max_rows = 0
+        self._wide_gate_stream = None
+        self._gate_max_rows = envs.SGLANG_HC_GATE_MAX_ROWS.get()
+        if self._gate_max_rows not in (1, 4, 16, 32):
+            raise ValueError("HC gate max rows must be 1, 4, 16 or 32")
         if use_combine:
             self.block_inject_weight = nn.Linear(
                 self.hidden_size * self.hc_count,
@@ -237,16 +505,53 @@ class GatedResidual(HyperConnectionBase):
                 and vecs % (8 * 160) == 0
                 and (self.hidden_size // 8) % (vecs // 8) == 0
             )
+            # The extend boundary replays grouped_gemma_rmsnorm's Blackwell (32-byte
+            # vector) reduction order; its source refuses to build for other targets.
+            # Built here, before graph capture; a failed build keeps the stock boundary.
+            self._ext_min_rows = _hc_ext_min_rows()
+            if not (
+                self._ext_min_rows
+                and config.hc_per_branch_norm
+                and self.hc_norm._jit_group_size == self.hidden_size
+                and self.hidden_size % 512 == 0
+                and (self.hc_count * self.hidden_size) % 2048 == 0
+                and self.hc_count <= 8
+                and config.params_dtype in (torch.bfloat16, torch.float16)
+                and torch.cuda.is_available()
+                and torch.cuda.get_device_capability()[0] >= 10
+                and _hc_ext_ready(self.hc_count, self.hidden_size, config.params_dtype)
+            ):
+                self._ext_min_rows = 0
+            fused_max_rows = _hc_fused_combine_max_rows()
             if (
-                self.hc_count == 4
+                fused_max_rows > 32
+                and self.hc_count == 4
                 and self.hidden_size == 2560
                 and config.hc_per_branch_norm
                 and config.params_dtype == torch.bfloat16
                 and torch.cuda.is_available()
                 and torch.cuda.get_device_capability()[0] == 10
+                and _tp_size() == 1
             ):
-                # Create before graph capture; all layers on a device share it.
-                self._gate_stream = _hc_gate_stream(torch.cuda.current_device())
+                self._fused_combine_max_rows = fused_max_rows
+                # Before graph capture; all layers on a device share it.
+                self._wide_gate_stream = _hc_gate_stream(torch.cuda.current_device())
+        # As a write-back it needs the extend boundary; as the next read, the mix weights.
+        ks_max_rows = _hc_boundary_ks_max_rows()
+        if (
+            ks_max_rows > _HC_EXT_FLOOR_ROWS - 1
+            and use_mix
+            and self._jit_mix_ok
+            and self.hc_count == 4
+            and self.hidden_size == 2560
+            and config.hc_lowrank == 320
+            and config.hc_per_branch_norm
+            and config.params_dtype == torch.bfloat16
+            and (self._ext_min_rows or not use_combine)
+            and self._numeric_mix_variant()
+            and _hc_boundary_ks_ready()
+        ):
+            self._ks_boundary_max_rows = ks_max_rows
 
         def _mix_compute(
             hyper_input_normed: torch.Tensor,
@@ -299,6 +604,7 @@ class GatedResidual(HyperConnectionBase):
         self,
         hyper_input: torch.Tensor,
         normalized_input: Optional[torch.Tensor] = None,
+        partials: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]]:
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         if hyper_input.shape[0] == 0:
@@ -306,7 +612,14 @@ class GatedResidual(HyperConnectionBase):
                 (*hyper_input.shape[:-1], self.hidden_size), dtype=self.params_dtype
             )
             return mixed_input, (hyper_input, hyper_input, None)
+        premixed = self._premixed
+        if premixed is not None:
+            self._premixed = None
+            if normalized_input is premixed[0]:
+                return premixed[1], (hyper_input, normalized_input, partials)
 
+        if partials is not None:
+            assert normalized_input is not None
         if normalized_input is not None:
             assert self.config.hc_per_branch_norm
             assert normalized_input.shape == hyper_input.shape
@@ -318,10 +631,43 @@ class GatedResidual(HyperConnectionBase):
                 hyper_input.unflatten(-1, (self.hc_count, self.hidden_size))
             ).flatten(-2)
         if (
+            partials is None
+            and hyper_input_normed.is_cuda
+            and hyper_input_normed.dtype == torch.bfloat16
+            and self._numeric_hc_macro(hyper_input.shape[0]) is not None
+        ):
+            from sglang.kernels.ops.elementwise.hc_combine_decode import hc_combine_gate
+
+            partials = hc_combine_gate(
+                hyper_input_normed, self.block_inject_weight.weight
+            )
+        if (
+            partials is None
+            and 32 < hyper_input.shape[0] <= self._fused_combine_max_rows
+            and hyper_input_normed.dtype == torch.bfloat16
+            and not torch.compiler.is_compiling()
+        ):
+            from sglang.kernels.ops.elementwise.hc_combine_decode import hc_combine_gate
+
+            # The write-back's gate, beside the mix on the side stream.
+            wide = self._wide_gate_stream
+            wide.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(wide):
+                partials = hc_combine_gate(
+                    hyper_input_normed, self.block_inject_weight.weight
+                )
+            hyper_input_normed.record_stream(wide)
+        if (
             self._jit_mix_ok
             and hyper_input_normed.is_cuda
             and hyper_input_normed.dtype in (torch.bfloat16, torch.float16)
-            and hyper_input_normed.shape[0] <= 24
+            and (
+                hyper_input_normed.shape[0] <= 24
+                or (
+                    self._numeric_mix_variant()
+                    and self._numeric_hc_mix_supported(hyper_input_normed.shape[0])
+                )
+            )
         ):
             from sglang.kernels.ops.gemm.hc_mix_splitk import (
                 hc_mix,
@@ -333,6 +679,31 @@ class GatedResidual(HyperConnectionBase):
                     self.input_mix_weight_up.weight, self.hc_count
                 )
             mixed_input = hc_mix(
+                hyper_input_normed,
+                self.input_mix_weight_down.weight.data,
+                self._mix_up_weight_padded,
+                self.hc_count,
+                self.hidden_size,
+                numeric_variant=self._numeric_mix_variant(),
+            ).to(self.params_dtype)
+        elif (
+            32 < hyper_input_normed.shape[0] <= self._mix_wide_max_rows
+            and hyper_input_normed.is_cuda
+            and hyper_input_normed.dtype in (torch.bfloat16, torch.float16)
+            and hyper_input_normed.is_contiguous()
+            and self._numeric_mix_variant()
+            and not torch.compiler.is_compiling()
+        ):
+            from sglang.kernels.ops.gemm.hc_mix_splitk import (
+                hc_mix_wide,
+                permute_pad_up_weight,
+            )
+
+            if self._mix_up_weight_padded is None:
+                self._mix_up_weight_padded = permute_pad_up_weight(
+                    self.input_mix_weight_up.weight, self.hc_count
+                )
+            mixed_input = hc_mix_wide(
                 hyper_input_normed,
                 self.input_mix_weight_down.weight.data,
                 self._mix_up_weight_padded,
@@ -378,11 +749,12 @@ class GatedResidual(HyperConnectionBase):
                 self.hc_count,
                 self.hidden_size,
             ).to(self.params_dtype)
-        partials = None
         stream = self._gate_stream
         if (
             stream is not None
-            and hyper_input.shape[0] == 1
+            and partials is None
+            and 0 < hyper_input.shape[0] <= self._gate_max_rows
+            and self._numeric_hc_partials_supported(hyper_input.shape[0])
             and hyper_input.dtype == torch.bfloat16
             and not torch.compiler.is_compiling()
         ):
@@ -396,6 +768,273 @@ class GatedResidual(HyperConnectionBase):
             hyper_input_normed.record_stream(stream)
         return mixed_input, (hyper_input, hyper_input_normed, partials)
 
+    def _ext_rows(
+        self,
+        block_output: torch.Tensor,
+        hyper_input: torch.Tensor,
+        hyper_input_normed: torch.Tensor,
+        partials: Optional[torch.Tensor],
+    ) -> bool:
+        """Whether the extend boundary serves this write-back. Its partials are
+        [rows, hc] fp32 gate dot totals, made only by itself."""
+        rows = block_output.shape[0]
+        if not (self._ext_min_rows and rows >= self._ext_min_rows):
+            return False
+        dtype = block_output.dtype
+        if partials is None:
+            partials_ok = (
+                hyper_input_normed.dtype == dtype
+                and hyper_input_normed.shape == hyper_input.shape
+            )
+        else:
+            partials_ok = partials.dtype == torch.float32 and tuple(partials.shape) == (
+                rows,
+                self.hc_count,
+            )
+        return (
+            partials_ok
+            and block_output.dim() == 2
+            and hyper_input.dim() == 2
+            and hyper_input.dtype == dtype
+            and self.block_inject_weight.weight.dtype == dtype
+            and block_output.is_cuda
+            and not torch.compiler.is_compiling()
+        )
+
+    def _combine_extend(
+        self,
+        block_output: torch.Tensor,
+        residuals: tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
+        next_norm: Optional[GroupedGemmaRMSNorm],
+        next_inject_weight: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        from sglang.kernels.ops.elementwise.hc_combine_extend import (
+            hc_combine_extend,
+        )
+
+        hyper_input, hyper_input_normed, partials = residuals
+        dtype = block_output.dtype
+        width = self.hc_count * self.hidden_size
+        if next_norm is not None and not (
+            next_norm.group_size == self.hidden_size
+            and next_norm._jit_group_size == self.hidden_size
+            and next_norm.weight.dtype == dtype
+            and next_norm.weight.numel() == width
+        ):
+            next_norm = None
+        if next_norm is None or (
+            next_inject_weight is not None
+            and (
+                next_inject_weight.dtype != dtype
+                or tuple(next_inject_weight.shape) != (self.hc_count, width)
+            )
+        ):
+            next_inject_weight = None
+        _log_hc_ext_once(
+            block_output.shape[0],
+            self._ext_min_rows,
+            partials is not None,
+            next_norm is not None,
+            next_inject_weight is not None,
+        )
+        return hc_combine_extend(
+            block_output,
+            hyper_input,
+            self.hc_count,
+            self.hidden_size,
+            partials=partials,
+            normed_residual=hyper_input_normed if partials is None else None,
+            inject_weight=(
+                self.block_inject_weight.weight if partials is None else None
+            ),
+            norm_weight=next_norm.weight if next_norm is not None else None,
+            eps=next_norm.variance_epsilon if next_norm is not None else 0.0,
+            next_inject_weight=next_inject_weight,
+        )
+
+    def _ks_boundary_admits(
+        self,
+        block_output: torch.Tensor,
+        residuals: tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
+        next_norm: GroupedGemmaRMSNorm,
+        next_inject_weight: Optional[torch.Tensor],
+        next_mix: "GatedResidual",
+    ) -> bool:
+        """Whether this write-back and next_mix's read run as one launch: the extend
+        boundary with its [rows, hc] gate totals, next_mix's own per-branch norm and
+        gate, contiguous rows, a resident grid."""
+        rows = block_output.shape[0]
+        hyper_input, hyper_input_normed, partials = residuals
+        if not (
+            _HC_EXT_FLOOR_ROWS
+            <= rows
+            <= min(self._ks_boundary_max_rows, next_mix._ks_boundary_max_rows)
+            and partials is not None
+            and partials.dim() == 2
+            and next_norm is next_mix.hc_norm
+            and next_norm._jit_group_size == self.hidden_size
+            and next_norm.weight.dtype == block_output.dtype
+            and (
+                next_inject_weight is None
+                or next_inject_weight is next_mix.block_inject_weight.weight
+            )
+            and self._ext_rows(block_output, hyper_input, hyper_input_normed, partials)
+            and block_output.is_contiguous()
+            and hyper_input.is_contiguous()
+            and partials.is_contiguous()
+        ):
+            return False
+        from sglang.kernels.ops.gemm.hc_boundary_ks import supported
+
+        return supported(rows, block_output.device.index)
+
+    def _combine_mix_ks(
+        self,
+        block_output: torch.Tensor,
+        residuals: tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
+        next_norm: GroupedGemmaRMSNorm,
+        next_inject_weight: Optional[torch.Tensor],
+        next_mix: "GatedResidual",
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """The write-back and next_mix's read in one launch; next_mix.mix() returns
+        the stashed mixed input."""
+        from sglang.kernels.ops.gemm.hc_boundary_ks import (
+            FLAG_WRITE_NORMED,
+            hc_boundary_ks,
+        )
+        from sglang.kernels.ops.gemm.hc_mix_splitk import permute_pad_up_weight
+
+        hyper_input, _, partials = residuals
+        if next_mix._mix_up_weight_padded is None:
+            next_mix._mix_up_weight_padded = permute_pad_up_weight(
+                next_mix.input_mix_weight_up.weight, next_mix.hc_count
+            )
+        flags = envs.SGLANG_HC_BOUNDARY_KS_FLAGS.get()
+        # With next gate totals and next_mix's extend boundary, next_mix's write-back
+        # reads the totals, never the normalized streams: they are not written, and a
+        # zero-size stand-in carries the hand-off (any other reader fails mix()'s
+        # shape check).
+        write_normed = bool(flags & FLAG_WRITE_NORMED) or not (
+            next_inject_weight is not None and next_mix._ext_min_rows
+        )
+        combined, normalized, next_partials, mixed = hc_boundary_ks(
+            block_output,
+            hyper_input,
+            partials=partials,
+            norm_weight=next_norm.weight,
+            eps=next_norm.variance_epsilon,
+            next_inject_weight=next_inject_weight,
+            w_down=next_mix.input_mix_weight_down.weight.data,
+            w_up_permuted=next_mix._mix_up_weight_padded,
+            write_normed=write_normed,
+            flags=flags,
+        )
+        if normalized is None:
+            normalized = hyper_input.new_empty((0,))
+        next_mix._premixed = (normalized, mixed)
+        return combined, normalized, next_partials
+
+    def combine_normalize_and_gate(
+        self,
+        block_output: torch.Tensor,
+        residuals: tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
+        next_norm: Optional[GroupedGemmaRMSNorm],
+        next_inject_weight: Optional[torch.Tensor],
+        next_mix: Optional["GatedResidual"] = None,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Publish a local HC boundary; the caller carries the next read's gate.
+
+        The two-result stock API remains unchanged. No prepared values cross a
+        history update, row redistribution, or pipeline boundary. ``next_mix`` is
+        the module whose read ``next_norm`` belongs to, if the caller knows it.
+        """
+        residual, normed, partials = residuals
+        if (
+            next_mix is not None
+            and next_norm is not None
+            and self._ks_boundary_max_rows
+            and self._ks_boundary_admits(
+                block_output, residuals, next_norm, next_inject_weight, next_mix
+            )
+        ):
+            return self._combine_mix_ks(
+                block_output, residuals, next_norm, next_inject_weight, next_mix
+            )
+        if self._ext_rows(block_output, residual, normed, partials):
+            return self._combine_extend(
+                block_output, residuals, next_norm, next_inject_weight
+            )
+        if partials is not None and partials.dim() == 2:
+            # Extend-boundary gate totals, which the decode kernels ([rows, 8, hc]
+            # partials) cannot read; the gate recomputed from the normalized streams
+            # is the same.
+            partials = None
+            residuals = (residual, normed, None)
+        rows = block_output.shape[0]
+        if (
+            partials is not None
+            and next_norm is not None
+            and next_inject_weight is not None
+            and next_norm.group_size == self.hidden_size
+            and block_output.is_cuda
+            and block_output.dtype
+            == residual.dtype
+            == next_norm.weight.dtype
+            == next_inject_weight.dtype
+            == torch.bfloat16
+            and block_output.shape == (rows, self.hidden_size)
+            and residual.shape == (rows, self.hc_count * self.hidden_size)
+            and partials.shape == (rows, 8, self.hc_count)
+            and partials.dtype == torch.float32
+            and next_norm.weight.numel() == self.hc_count * self.hidden_size
+            and next_inject_weight.shape
+            == (self.hc_count, self.hc_count * self.hidden_size)
+            and all(
+                t.device == block_output.device
+                for t in (residual, partials, next_norm.weight, next_inject_weight)
+            )
+            and all(
+                t.is_contiguous()
+                for t in (
+                    block_output,
+                    residual,
+                    partials,
+                    next_norm.weight,
+                    next_inject_weight,
+                )
+            )
+        ):
+            run = self._numeric_hc_macro(rows)
+            if run is not None:
+                from sglang.kernels.plugin_kernels.nvidia.numeric import (
+                    HcApplyNormGateIO,
+                )
+
+                combined = torch.empty_like(residual)
+                normalized = torch.empty_like(residual)
+                next_partials = torch.empty_like(partials)
+                run(
+                    HcApplyNormGateIO(
+                        block_output,
+                        residual,
+                        partials,
+                        next_norm.weight,
+                        next_inject_weight,
+                        next_norm.variance_epsilon,
+                        2,
+                        combined,
+                        normalized,
+                        next_partials,
+                    )
+                )
+                return combined, normalized, next_partials
+        combined, normalized = self.combine_and_normalize(
+            block_output,
+            residuals,
+            next_norm,
+        )
+        return combined, normalized, None
+
     def combine_and_normalize(
         self,
         block_output: torch.Tensor,
@@ -407,7 +1046,30 @@ class GatedResidual(HyperConnectionBase):
         The BF16 combine result is retained before calculating the next norm.
         Callers must only pass the norm when no PLE or other update intervenes.
         """
-        hyper_input, _, partials = residuals
+        hyper_input, hyper_input_normed, partials = residuals
+        if (
+            partials is not None
+            and partials.dim() == 3
+            and 32 < block_output.shape[0] <= self._fused_combine_max_rows
+            and next_norm is not None
+            and next_norm.group_size == self.hidden_size
+            and next_norm.weight.dtype == torch.bfloat16
+            and block_output.dtype == torch.bfloat16
+        ):
+            from sglang.kernels.ops.elementwise.hc_combine_decode import (
+                hc_combine_apply_norm_wide,
+            )
+
+            current = torch.cuda.current_stream()
+            current.wait_stream(self._wide_gate_stream)
+            partials.record_stream(current)
+            return hc_combine_apply_norm_wide(
+                block_output,
+                hyper_input,
+                partials,
+                next_norm.weight,
+                next_norm.variance_epsilon,
+            )
         if (
             partials is not None
             and next_norm is not None
@@ -416,12 +1078,31 @@ class GatedResidual(HyperConnectionBase):
             and block_output.dtype == torch.bfloat16
         ):
             from sglang.kernels.ops.elementwise.hc_combine_decode import (
+                _numeric_hc_apply_norm,
                 hc_combine_apply_norm,
             )
 
-            current = torch.cuda.current_stream()
-            current.wait_stream(self._gate_stream)
-            partials.record_stream(current)
+            if (
+                block_output.shape[0] > 4
+                and _numeric_hc_apply_norm(
+                    block_output,
+                    hyper_input,
+                    partials,
+                    next_norm.weight,
+                )
+                is None
+            ):
+                return self.combine(
+                    block_output,
+                    (hyper_input, hyper_input_normed, None),
+                ), None
+            if (
+                self._gate_stream is not None
+                and self._numeric_hc_macro(block_output.shape[0]) is None
+            ):
+                current = torch.cuda.current_stream()
+                current.wait_stream(self._gate_stream)
+                partials.record_stream(current)
             return hc_combine_apply_norm(
                 block_output,
                 hyper_input,
@@ -437,14 +1118,27 @@ class GatedResidual(HyperConnectionBase):
         residuals: tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
     ) -> torch.Tensor:
         hyper_input, hyper_input_normed, partials = residuals
+        if self._ext_rows(block_output, hyper_input, hyper_input_normed, partials):
+            return self._combine_extend(block_output, residuals, None, None)[0]
+        if partials is not None and partials.dim() == 2:
+            # Extend-boundary gate totals: recompute from the normalized streams.
+            partials = None
         if partials is not None:
             from sglang.kernels.ops.elementwise.hc_combine_decode import (
                 hc_combine_apply,
             )
 
-            current = torch.cuda.current_stream()
-            current.wait_stream(self._gate_stream)
-            partials.record_stream(current)
+            if (
+                self._gate_stream is not None
+                and self._numeric_hc_macro(block_output.shape[0]) is None
+            ):
+                current = torch.cuda.current_stream()
+                current.wait_stream(self._gate_stream)
+                partials.record_stream(current)
+            if 32 < block_output.shape[0] <= self._fused_combine_max_rows:
+                current = torch.cuda.current_stream()
+                current.wait_stream(self._wide_gate_stream)
+                partials.record_stream(current)
             return hc_combine_apply(block_output, hyper_input, partials)
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         assert block_output.shape[-1] == self.hidden_size

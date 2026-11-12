@@ -82,3 +82,24 @@ def test_fused_hc_mix_gate_rejects_prefill_rows():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
+    reason="hc_mix_wide's CuTe split-K down GEMM is tcgen05 (sm_100 family) only",
+)
+@pytest.mark.parametrize("num_tokens", [33, 144, 320, 512])
+def test_hc_mix_wide_matches_reference(num_tokens):
+    from sglang.kernels.ops.gemm.hc_mix_splitk import (
+        hc_mix_wide,
+        permute_pad_up_weight,
+    )
+
+    x, w_down, w_up = _make_inputs(num_tokens, torch.bfloat16)
+    out = hc_mix_wide(
+        x, w_down, permute_pad_up_weight(w_up, HC_COUNT), HC_COUNT, HIDDEN_SIZE
+    )
+    ref = _reference_mix(x, w_down, w_up, HC_COUNT, HIDDEN_SIZE)
+    torch.testing.assert_close(
+        out.to(torch.float64), ref, **_TOLERANCES[torch.bfloat16]
+    )
