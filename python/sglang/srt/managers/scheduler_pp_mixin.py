@@ -390,7 +390,9 @@ class SchedulerPPMixin:
                 if len(self.disagg_prefill_transfer_queue) == 0:
                     self.on_idle()
 
-    def _pp_b2_commit_result(self: Scheduler, pending, generations):
+    def _pp_b2_commit_result(
+        self: Scheduler, pending, generations, *, deferred=False, post_launch=False
+    ):
         # Keep the old ring entry and metadata intact until its CPU consumer
         # retires. The new forward uses its own metadata list in the meantime.
         slot = pending.slot
@@ -405,6 +407,21 @@ class SchedulerPPMixin:
         self.last_mbs[slot] = pending.batch
         if pending.has_transfer:
             self.process_disagg_prefill_transfer_queue(pending.release_rids)
+        counts = self._pp_b2_result_counts
+        first_deferred = deferred and counts[1] == 0
+        first_post_launch = post_launch and counts[2] == 0
+        counts[0] += 1
+        counts[1] += int(deferred)
+        counts[2] += int(post_launch)
+        if (
+            counts[0] % self._pp_b2_counter_interval == 0
+            or first_deferred
+            or first_post_launch
+        ):
+            logger.info(
+                "PP PD B2 result counts: total=%d deferred=%d post_launch=%d",
+                *counts,
+            )
 
     @DynamicGradMode()
     def event_loop_pp_disagg_prefill_overlap_b2(self: Scheduler):
@@ -429,6 +446,10 @@ class SchedulerPPMixin:
         generations = [0] * self.pp_loop_size
         pending = None
         reported_post_launch_commit = False
+        self._pp_b2_result_counts = [0, 0, 0]
+        self._pp_b2_counter_interval = max(
+            1, int(os.environ.get("SGLANG_PP_PD_OVERLAP_B2_COUNTER_INTERVAL", "128"))
+        )
         tmbs = [None] * self.pp_loop_size
         release_rids = None
         send_transfer_work = []
@@ -494,7 +515,10 @@ class SchedulerPPMixin:
                             pending.slot, pending.generation,
                         )
                         reported_post_launch_commit = True
-                    self._pp_b2_commit_result(pending, generations)
+                    self._pp_b2_commit_result(
+                        pending, generations, deferred=True,
+                        post_launch=cur_batch is not None,
+                    )
                     pending = None
                 self.mbs[mb_id] = cur_batch
                 self.running_mbs[mb_id] = self.running_batch

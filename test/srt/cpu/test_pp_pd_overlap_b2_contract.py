@@ -114,6 +114,26 @@ def run(ns, rank, on=False, **kw):
     return engine
 
 class Contracts(unittest.TestCase):
+    def test_result_counters_distinguish_launch_and_idle(self):
+        for empty, chunks in [(False, False), (True, False), (True, True)]:
+            e = run(NEW_NS, 0, on=True, empty=empty, chunks=chunks)
+            processed = [x[1] for x in e.trace if x[0] == 'process']
+            deferred = [f for f in processed if not (chunks and f % 5 == 0)]
+            launched = {x[1] for x in e.trace if x[0] == 'launch'}
+            self.assertEqual(e._pp_b2_result_counts, [
+                len(processed), len(deferred),
+                sum(f + 4 in launched for f in deferred),
+            ])
+        class OneBatch(Fake):
+            def get_new_batch_prefill(self, running):
+                return types.SimpleNamespace(
+                    batch_to_run=Batch(0) if self.frame == 0 else None,
+                    running_batch=running,
+                )
+        e = type('Engine', (OneBatch, NEW_NS['Loop']), {})(0)
+        with self.assertRaises(Done): e.event_loop_pp_disagg_prefill_overlap_b2()
+        self.assertEqual(e._pp_b2_result_counts, [1, 1, 0])
+
     def test_off_original_body_bytes(self):
         def body(s):
             at=s.index('    def event_loop_pp_disagg_prefill(self: Scheduler):')
