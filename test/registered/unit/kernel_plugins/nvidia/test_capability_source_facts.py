@@ -207,7 +207,7 @@ def test_callback_call_sites_are_startup_only():
         "router_quant.py": {"numeric_signatures"},
         "permuted_finalize.py": {"numeric_signatures"},
         "hyperconnection.py": {"numeric_signatures"},
-        "qsa_indexer.py": {"numeric_preparation_signatures"},
+        "qsa_indexer.py": {"numeric_preparation_signatures", "_qpf_signatures"},
         "gdn_backend.py": {"numeric_native_pdl_signatures"},
         "layer.py": {"numeric_signatures"},
         "qwen3_5.py": {"numeric_signatures"},

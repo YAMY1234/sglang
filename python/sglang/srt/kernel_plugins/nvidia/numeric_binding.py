@@ -43,6 +43,8 @@ from sglang.kernels.plugin_kernels.nvidia.numeric import (
     PackedPrefillAttentionIO,
     PoolUnionAttentionIO,
     PrefillSelectIO,
+    QsaPrologueFoldIO,
+    QsaPrologueFoldSignature,
     RouterQuantIO,
     RouterQuantSignature,
     SparseScoreIO,
@@ -84,6 +86,7 @@ _IO_TYPES = {
     NumericOperation.LOCAL_EXPERTS: LocalExpertsIO,
     NumericOperation.FINALIZE_SHARED: FinalizeSharedIO,
     NumericOperation.FINALIZE_PERMUTED_SHARED: FinalizePermutedSharedIO,
+    NumericOperation.QSA_PROLOGUE_FOLD: QsaPrologueFoldIO,
 }
 
 
@@ -282,6 +285,7 @@ def collect_numeric_signatures(
                         NativeGdnPdlSignature,
                         MtpCaptureSeedSignature,
                         MtpDeferredKvSignature,
+                        QsaPrologueFoldSignature,
                     ),
                 ) or not all(
                     isinstance(getattr(signature, field.name), int)
@@ -312,6 +316,13 @@ def collect_numeric_signatures(
                     for field in fields(signature)
                 ):
                     raise TypeError("deferred KV signatures cannot contain bool fields")
+                if isinstance(signature, QsaPrologueFoldSignature) and any(
+                    isinstance(getattr(signature, field.name), bool)
+                    for field in fields(signature)
+                ):
+                    raise TypeError(
+                        "QSA prologue signatures cannot contain bool fields"
+                    )
                 signatures[signature] = None
             if declarations is not None:
                 declarations[producer] = declared

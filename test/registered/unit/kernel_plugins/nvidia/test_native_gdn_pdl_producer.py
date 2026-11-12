@@ -294,7 +294,7 @@ def test_actual_collector_new_signature_bool_refused(context):
 
 def test_actual_collector_accepts_all_declared_signature_types():
     classes = get_args(OperatorSignature)
-    assert len(classes) == 9
+    assert len(classes) == 10
     signatures = tuple(
         cls(
             **{

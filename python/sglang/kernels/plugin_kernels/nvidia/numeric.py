@@ -36,6 +36,7 @@ class NumericOperation(IntEnum):
     MTP_DEFERRED_KV_PREPARE = 8
     PREFILL_SELECT = 9
     PACKED_PREFILL_ATTENTION = 17
+    QSA_PROLOGUE_FOLD = 18
     HC_GATE = 10
     HC_APPLY_NORM = 11
     HC_APPLY_NORM_GATE = 12
@@ -284,6 +285,25 @@ class MtpDeferredKvSignature:
     metadata_dtype_mask: int
 
 
+@dataclass(frozen=True, slots=True)
+class QsaPrologueFoldSignature:
+    """QSA indexer prologue in one launch for graph decode / verify / draft extend:
+    index-Q norm + MRoPE, raw-K ring and RoPE-position stores, and the graph group
+    compression. Rows 0: any token and group count. neox is 0 or 1."""
+
+    operation: NumericOperation
+    rows: int
+    q_heads: int
+    q_heads_padded: int
+    head_dim: int
+    rotary_dim: int
+    rope_axes: int
+    compress_ratio: int
+    scalar_type: int
+    out_scalar_type: int
+    neox: int
+
+
 OperatorSignature = (
     NumericSignature
     | HcSignature
@@ -294,6 +314,7 @@ OperatorSignature = (
     | NativeGdnPdlSignature
     | MtpCaptureSeedSignature
     | MtpDeferredKvSignature
+    | QsaPrologueFoldSignature
 )
 
 
@@ -738,6 +759,30 @@ class MtpDeferredKvIO:
     packed_v_out: Tensor
 
 
+@dataclass(frozen=True, slots=True)
+class QsaPrologueFoldIO:
+    """Borrowed tensors and the two layer epsilons. The provider writes q_out (all
+    padded heads), the ring rows and RoPE positions at cache_loc, and the compressed
+    rows at write_locs; it neither allocates nor casts. positions is [axes, tokens]
+    int64; key_state_buffer and compressed_k_buffer are [slots, head_dim] views."""
+
+    qk: Tensor
+    positions: Tensor
+    cos_sin_cache: Tensor
+    axis_map: Tensor
+    q_weight: Tensor
+    cache_loc: Tensor
+    key_state_buffer: Tensor
+    rope_position_buffer: Tensor
+    group_locs: Tensor
+    k_weight: Tensor
+    write_locs: Tensor
+    compressed_k_buffer: Tensor
+    q_out: Tensor
+    q_eps: float
+    k_eps: float
+
+
 NumericIO = (
     PackedPrefillAttentionIO
     | PrefillSelectIO
@@ -759,6 +804,7 @@ NumericIO = (
     | NativeGdnPdlIO
     | MtpCaptureSeedIO
     | MtpDeferredKvIO
+    | QsaPrologueFoldIO
 )
 NumericKernel = Callable[[NumericIO], None]
 

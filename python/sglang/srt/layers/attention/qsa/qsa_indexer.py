@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import Optional, Tuple
 
@@ -39,6 +40,8 @@ from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_sm100_supported
+
+logger = logging.getLogger(__name__)
 
 # Cap on the fp32 [query_rows, compressed_keys] prefill logits workspace;
 # top-k is per row, so tiling rows does not change the selection.
@@ -141,7 +144,159 @@ class QSAIndexer(MultiPlatformOp):
             prepare as prepare_kv,
         )
 
-        return prepare(self, model_runner) + prepare_kv(self, model_runner)
+        return (
+            prepare(self, model_runner)
+            + prepare_kv(self, model_runner)
+            + self._qpf_signatures(model_runner)
+        )
+
+    def _qpf_signatures(self, model_runner) -> tuple:
+        """SGLANG_QSA_QPF: the one-launch prologue's exact geometry (any row count)."""
+        self._numeric_prepared_qpf = None
+        if not envs.SGLANG_QSA_QPF.get():
+            return ()
+        from sglang.kernels.plugin_kernels.nvidia.numeric import (
+            NumericOperation,
+            QsaPrologueFoldSignature,
+            ScalarType,
+        )
+        from sglang.srt.kernel_plugins.nvidia.numeric_binding import (
+            signature_capability_supported,
+        )
+
+        pool = getattr(model_runner, "token_to_kv_pool", None)
+        if not hasattr(pool, "qsa_compressed_dtype"):
+            pool = getattr(pool, "full_kv_pool", None)
+        scalar = {torch.bfloat16: ScalarType.BF16, torch.float16: ScalarType.FP16}
+        out_scalar = {**scalar, torch.float8_e4m3fn: ScalarType.FP8_E4M3}
+        if (
+            pool is None
+            or not hasattr(pool, "qsa_compressed_dtype")
+            or not self._use_fused_compress(pool)
+            or pool.index_state_dtype not in scalar
+            or pool.qsa_compressed_dtype not in out_scalar
+            or self.index_kv_heads != 1
+            or not 0 < self.compress_ratio <= 16
+        ):
+            return ()
+        signature = QsaPrologueFoldSignature(
+            NumericOperation.QSA_PROLOGUE_FOLD,
+            0,
+            self.index_n_heads,
+            ((self.index_n_heads + 7) // 8) * 8,
+            self.index_head_dim,
+            self.rotary_emb.rotary_dim,
+            3 if getattr(self.rotary_emb, "mrope_section", None) else 1,
+            self.compress_ratio,
+            scalar[pool.index_state_dtype],
+            out_scalar[pool.qsa_compressed_dtype],
+            int(bool(self.rotary_emb.is_neox_style)),
+        )
+        if not signature_capability_supported(
+            signature, spec=getattr(self, "_numeric_capability_spec", None)
+        ):
+            return ()
+        self._numeric_prepared_qpf = signature
+        return (signature,)
+
+    def _try_prologue_fold(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        metadata,
+        state_slots: torch.Tensor | None,
+        projected_qk: torch.Tensor | None,
+    ) -> Tuple[torch.Tensor | None, torch.Tensor | None]:
+        """project_qk's fused q_prep and the graph compression (_compress_decode_cuda_graph's
+        fused branch) as one launch. Returns (q, qk); q is None when the rows do not
+        qualify, and qk (if projected here) is handed to the two-launch path."""
+        signature = getattr(self, "_numeric_prepared_qpf", None)
+        pool = metadata.token_to_kv_pool
+        group_locs = metadata.graph_ring_group_locs
+        write_locs = metadata.graph_write_locs
+        if (
+            signature is None
+            or pool is None
+            or state_slots is None
+            or group_locs is None
+            or write_locs is None
+            or hidden_states.shape[0] == 0
+            or not self._use_fused_compress(pool)
+        ):
+            return None, projected_qk
+        from sglang.kernels.plugin_kernels.nvidia.numeric import QsaPrologueFoldIO
+        from sglang.srt.kernel_plugins.nvidia.numeric_binding import numeric_operator
+
+        run = numeric_operator(signature, prepared=True)
+        if run is None:
+            return None, projected_qk
+        qk = projected_qk
+        if qk is None:
+            qk, _ = self.index_qk_proj(hidden_states)
+        key_state_buffer = pool.get_qsa_key_state_buffer(self.layer_id)
+        ring = key_state_buffer.view(key_state_buffer.shape[0], -1)
+        compressed_buffer = pool.get_qsa_compressed_k_buffer(self.layer_id)
+        compressed = compressed_buffer.view(compressed_buffer.shape[0], -1)
+        out_dtype = pool.qsa_compressed_dtype
+        rope_positions = positions.long()
+        if rope_positions.ndim == 1:
+            rope_positions = rope_positions.unsqueeze(0)
+        if (
+            qk.shape[0] == 0
+            or not self._use_fused_prep(qk)
+            or not qk.is_contiguous()
+            or ring.dtype != qk.dtype
+            or pool.index_state_dtype != qk.dtype
+            or not ring.is_contiguous()
+            or compressed.dtype != out_dtype
+            or group_locs.dtype != torch.int32
+            or write_locs.dtype != torch.int32
+            or group_locs.ndim != 2
+            or group_locs.shape[1] != self.compress_ratio
+            or group_locs.shape[0] == 0
+            or write_locs.shape != group_locs.shape[:1]
+            or not group_locs.is_contiguous()
+            or rope_positions.shape[0] != signature.rope_axes
+        ):
+            return None, qk
+        if not get_is_capture_mode() and hasattr(
+            self.rotary_emb, "_ensure_cos_sin_cache_length"
+        ):
+            self.rotary_emb._ensure_cos_sin_cache_length(int(positions.max().item()))
+        q = torch.empty(
+            (qk.shape[0], signature.q_heads_padded, self.index_head_dim),
+            dtype=out_dtype,
+            device=qk.device,
+        )
+        run(
+            QsaPrologueFoldIO(
+                qk=qk,
+                positions=rope_positions,
+                cos_sin_cache=self.rotary_emb.cos_sin_cache,
+                axis_map=self._rope_axis_map(qk.device),
+                q_weight=self.q_layernorm.weight.data,
+                cache_loc=state_slots[: qk.shape[0]].long(),
+                key_state_buffer=ring,
+                rope_position_buffer=pool.qsa_rope_position_buffer,
+                group_locs=group_locs,
+                k_weight=self.k_layernorm.weight.data,
+                write_locs=write_locs,
+                compressed_k_buffer=compressed,
+                q_out=q,
+                q_eps=self.q_layernorm.variance_epsilon,
+                k_eps=self.k_layernorm.variance_epsilon,
+            )
+        )
+        if not getattr(self, "_qpf_engaged_logged", False):
+            logger.info(
+                "Q38_QPF_ACTIVE layer=%s rows=%s groups=%s dtype=%s",
+                self.layer_id,
+                qk.shape[0],
+                group_locs.shape[0],
+                qk.dtype,
+            )
+            self._qpf_engaged_logged = True
+        return q, qk
 
     def numeric_preparation_signatures(self, context_len: int, page_size: int):
         """Describe actual scorer/select geometry; provider admission is separate."""
@@ -1539,26 +1694,31 @@ class QSAIndexer(MultiPlatformOp):
                 logical_positions,
                 indexer_metadata.compress_member_rows is not None,
             )
-        q, token_k, state_stored = self.project_qk(
-            hidden_states,
-            positions,
-            pool=indexer_metadata.token_to_kv_pool,
-            cache_loc=state_slots,
-            q_heads_padded=(
-                # The tilelang decode MQA kernel needs query heads in multiples of 8.
-                ((self.index_n_heads + 7) // 8) * 8
-                if (forward_mode.is_decode() or is_target_verify or is_draft_extend)
-                else None
-            ),
-        )
-        self.update_key_state_and_compress(
-            token_k,
-            logical_positions,
-            positions,
-            indexer_metadata,
-            state_slots=state_slots,
-            state_stored=state_stored,
-        )
+        is_decode_like = forward_mode.is_decode() or is_target_verify or is_draft_extend
+        q = None
+        if is_decode_like and indexer_metadata.is_cuda_graph:
+            q, _ = self._try_prologue_fold(
+                hidden_states, positions, indexer_metadata, state_slots, None
+            )
+        if q is None:
+            q, token_k, state_stored = self.project_qk(
+                hidden_states,
+                positions,
+                pool=indexer_metadata.token_to_kv_pool,
+                cache_loc=state_slots,
+                q_heads_padded=(
+                    # The tilelang decode MQA kernel needs query heads in multiples of 8.
+                    ((self.index_n_heads + 7) // 8) * 8 if is_decode_like else None
+                ),
+            )
+            self.update_key_state_and_compress(
+                token_k,
+                logical_positions,
+                positions,
+                indexer_metadata,
+                state_slots=state_slots,
+                state_stored=state_stored,
+            )
         if forward_mode.is_decode() or is_target_verify or is_draft_extend:
             compressed_cache, page_table, compressed_lengths, max_model_len = (
                 indexer_metadata.get_decode_mqa_inputs(self.layer_id)

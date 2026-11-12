@@ -17,7 +17,7 @@ register_cpu_ci(est_time=1, stage="base-a", runner_config="cpu")
 class TestNumericBinding(unittest.TestCase):
     def test_collector_accepts_every_declared_signature_type(self):
         classes = get_args(api.OperatorSignature)
-        self.assertEqual(len(classes), 9)
+        self.assertEqual(len(classes), 10)
         signatures = tuple(
             cls(
                 **{

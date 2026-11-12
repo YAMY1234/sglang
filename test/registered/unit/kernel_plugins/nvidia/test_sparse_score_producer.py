@@ -721,6 +721,142 @@ def test_missing_resolved_objects_are_stock(runner):
         assert obj._numeric_score_capacity == 0
 
 
+def qpf_indexer():
+    obj = indexer()
+    obj.layer_id = 3
+    obj._rope_axis_map_cache = None
+    cache = torch.zeros((64, 64), dtype=torch.float32).as_subclass(DeviceMetadata)
+    obj.rotary_emb = NS(
+        rotary_dim=64, mrope_section=(16, 8, 8), is_neox_style=True, cos_sin_cache=cache
+    )
+    obj.q_layernorm = NS(
+        weight=torch.ones(128, dtype=torch.bfloat16), variance_epsilon=1e-6
+    )
+    obj.k_layernorm = NS(
+        weight=torch.ones(128, dtype=torch.bfloat16), variance_epsilon=2e-6
+    )
+    obj._numeric_capability_spec = NS(
+        numeric_capability=lambda q: q.operation == NumericOperation.QSA_PROLOGUE_FOLD
+    )
+    return obj
+
+
+def qpf_pool(out_dtype=torch.float8_e4m3fn):
+    ring = torch.zeros((32, 1, 128), dtype=torch.bfloat16).as_subclass(DeviceMetadata)
+    compressed = torch.zeros((16, 1, 128), dtype=out_dtype)
+    return NS(
+        qsa_compressed_dtype=out_dtype,
+        index_state_dtype=torch.bfloat16,
+        qsa_rope_position_buffer=torch.zeros((32, 3), dtype=torch.int64),
+        get_qsa_key_state_buffer=lambda layer_id: ring,
+        get_qsa_compressed_k_buffer=lambda layer_id: compressed,
+    )
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_qpf_declares_one_exact_signature_only_when_enabled(enabled, hybrid):
+    from sglang.kernels.plugin_kernels.nvidia.numeric import (
+        QsaPrologueFoldSignature,
+        ScalarType,
+    )
+
+    obj, pool = qpf_indexer(), qpf_pool()
+    runner = NS(token_to_kv_pool=NS(full_kv_pool=pool) if hybrid else pool)
+    with envs.SGLANG_QSA_QPF.override(enabled):
+        declared = obj._qpf_signatures(runner)
+    if not enabled:
+        assert declared == () and obj._numeric_prepared_qpf is None
+        return
+    expected = QsaPrologueFoldSignature(
+        NumericOperation.QSA_PROLOGUE_FOLD,
+        0,
+        4,
+        8,
+        128,
+        64,
+        3,
+        4,
+        ScalarType.BF16,
+        ScalarType.FP8_E4M3,
+        1,
+    )
+    assert declared == (expected,) and obj._numeric_prepared_qpf == expected
+
+
+def qpf_call(obj, pool, *, group_locs=None, operator=None):
+    tokens = 8
+    qk = torch.zeros((tokens, 5 * 128), dtype=torch.bfloat16).as_subclass(
+        DeviceMetadata
+    )
+    metadata = NS(
+        token_to_kv_pool=pool,
+        graph_ring_group_locs=(
+            torch.zeros((2, 4), dtype=torch.int32) if group_locs is None else group_locs
+        ),
+        graph_write_locs=torch.zeros(2, dtype=torch.int32),
+    )
+    calls = []
+
+    def bind(signature, *, prepared):
+        calls.append((signature, prepared))
+        return operator
+
+    with patch.object(numeric_binding, "numeric_operator", bind):
+        q, out_qk = obj._try_prologue_fold(
+            torch.zeros((tokens, 2560), dtype=torch.bfloat16),
+            torch.zeros((3, tokens), dtype=torch.int32),
+            metadata,
+            torch.arange(tokens, dtype=torch.int32),
+            qk,
+        )
+    return q, out_qk, qk, calls
+
+
+def test_qpf_launches_the_bound_provider_on_the_original_tensors():
+    from sglang.kernels.plugin_kernels.nvidia.numeric import QsaPrologueFoldIO
+
+    obj, pool = qpf_indexer(), qpf_pool()
+    with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True):
+        with envs.SGLANG_QSA_QPF.override(True):
+            obj._qpf_signatures(NS(token_to_kv_pool=pool))
+    views = []
+    q, out_qk, qk, calls = qpf_call(obj, pool, operator=views.append)
+    assert calls == [(obj._numeric_prepared_qpf, True)]
+    (io,) = views
+    assert isinstance(io, QsaPrologueFoldIO)
+    assert io.qk is qk and out_qk is qk and io.q_out is q
+    assert q.shape == (8, 8, 128) and q.dtype == torch.float8_e4m3fn
+    assert io.positions.dtype == torch.int64 and io.positions.shape == (3, 8)
+    assert io.cache_loc.dtype == torch.int64 and io.cache_loc.shape == (8,)
+    assert io.key_state_buffer.shape == (32, 128)
+    assert io.compressed_k_buffer.shape == (16, 128)
+    assert io.rope_position_buffer is pool.qsa_rope_position_buffer
+    assert (io.q_eps, io.k_eps) == (1e-6, 2e-6)
+
+
+@pytest.mark.parametrize("case", ["unprepared", "no_offer", "group_shape"])
+def test_qpf_keeps_the_two_launch_prologue(case):
+    obj, pool = qpf_indexer(), qpf_pool()
+    if case != "unprepared":
+        with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True):
+            with envs.SGLANG_QSA_QPF.override(True):
+                obj._qpf_signatures(NS(token_to_kv_pool=pool))
+    else:
+        obj._numeric_prepared_qpf = None
+    views = []
+    q, out_qk, qk, calls = qpf_call(
+        obj,
+        pool,
+        group_locs=(
+            torch.zeros((2, 3), dtype=torch.int32) if case == "group_shape" else None
+        ),
+        operator=None if case == "no_offer" else views.append,
+    )
+    assert q is None and out_qk is qk and views == []
+    assert len(calls) == (0 if case == "unprepared" else 1)
+
+
 @pytest.fixture(autouse=True)
 def capability_provider_enabled(monkeypatch):
     from sglang.srt.kernel_plugins.nvidia import binding

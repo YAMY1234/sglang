@@ -317,6 +317,11 @@ class Envs:
     SGLANG_QSA_MK_SCORE_SHORT32 = EnvBool(False)
     SGLANG_QSA_GROUPED_SCORE = EnvBool(True)
     SGLANG_QSA_SPLIT_TOPK = EnvBool(True)
+    # Graph decode / verify / draft extend run the indexer prologue (index-Q norm + MRoPE,
+    # ring and RoPE-position stores, group compression) as one plugin launch instead of
+    # two (same values). Opt-in: the provider builds its source under the absolute
+    # node-local SGLANG_QSA_QPF_SRC_DIR.
+    SGLANG_QSA_QPF = EnvRuntimeBool(False)
     # TP1 target-verify top-512: "stock" (fast_topk) or "sampled" (the prefill select's
     # one-pass kernels on the same rows; fast_topk's ordered output, smallest-index ties).
     SGLANG_QSA_VERIFY_TOPK = EnvStr("stock")
