@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.kernels.ops.gemm.hc_mix import fused_hc_mix, fused_hc_mix_supported
+from sglang.srt.environ import envs
 from sglang.srt.layers.hc_mix_flydsl import (
     flydsl_hc_mix_supported,
     flydsl_hc_mix_weights_supported,
@@ -18,6 +19,48 @@ from sglang.srt.runtime_context import forward_helper_stream_kwargs
 @lru_cache(None)
 def _hc_gate_stream(device: int) -> torch.cuda.Stream:
     return torch.cuda.Stream(device=device, **forward_helper_stream_kwargs())
+
+
+_BF16_GEMM_PINS = bool(envs.SGLANG_BF16_GEMM_PIN_FILE.get())
+
+
+@lru_cache(None)
+def _pinned_mix_compute():
+    """torch.compile of GatedResidual's _mix_compute with its two GEMMs on the BF16 dispatch op, which serves
+    SGLANG_BF16_GEMM_PIN_FILE's pins; the ops, and so the pointwise kernels between the GEMMs, are _mix_compute's."""
+    from sglang.srt.layers.quantization.unquant import bf16_gemm_dispatch
+
+    def mix_compute(
+        hyper_input_normed: torch.Tensor,
+        input_mix_weight_down: torch.Tensor,
+        input_mix_weight_up: torch.Tensor,
+        hc: int,
+        hs: int,
+    ) -> torch.Tensor:
+        input_mix_weight = F.silu(
+            bf16_gemm_dispatch(hyper_input_normed, input_mix_weight_down, None) / hc
+        )
+        input_mix_weight = bf16_gemm_dispatch(
+            input_mix_weight, input_mix_weight_up, None
+        )
+        input_mix_weight = torch.sigmoid(input_mix_weight)
+        input_mix_weight = input_mix_weight.unflatten(-1, (hc, hs))
+        output = (input_mix_weight * hyper_input_normed.unflatten(-1, (hc, hs))).mean(
+            dim=-2
+        )
+        return output
+
+    return torch.compile(mix_compute)
+
+
+def _mix_gemms_pinned(lowrank: int, width: int) -> bool:
+    if not _BF16_GEMM_PINS:
+        return False
+    from sglang.srt.layers import bf16_gemm_pins
+
+    return bf16_gemm_pins.has_shape(lowrank, width) or bf16_gemm_pins.has_shape(
+        width, lowrank
+    )
 
 
 class HyperConnectionConfig(msgspec.Struct, frozen=True):
@@ -321,7 +364,14 @@ class GatedResidual(HyperConnectionBase):
                 self.hidden_size,
             ).to(self.params_dtype)
         else:
-            mixed_input = self._mix_compute(
+            mix_compute = (
+                _pinned_mix_compute()
+                if _mix_gemms_pinned(
+                    self.config.hc_lowrank, self.hc_count * self.hidden_size
+                )
+                else self._mix_compute
+            )
+            mixed_input = mix_compute(
                 hyper_input_normed,
                 self.input_mix_weight_down.weight,
                 self.input_mix_weight_up.weight,

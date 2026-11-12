@@ -80,6 +80,12 @@ from sglang.srt.utils.device import (
 )
 
 logger = logging.getLogger(__name__)
+_BF16_GEMM_PINS = bool(envs.SGLANG_BF16_GEMM_PIN_FILE.get())
+
+
+def _lm_head_matmul(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return torch.matmul(hidden_states.to(weight.dtype), weight.T)
+
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -1431,6 +1437,14 @@ class LogitsProcessor(nn.Module):
             elif _aiter_lm_head_ok(hidden_states, lm_head.weight):
                 logits = tgemm.mm(hidden_states, lm_head.weight)
             else:
+                if _BF16_GEMM_PINS:
+                    from sglang.srt.layers import bf16_gemm_pins
+
+                    logits = bf16_gemm_pins.gemm(
+                        hidden_states, lm_head.weight, _lm_head_matmul
+                    )
+                    if logits is not None:
+                        return logits
                 lhs = hidden_states.to(lm_head.weight.dtype)
                 if out is not None and out.dtype == lm_head.weight.dtype:
                     logits = torch.matmul(lhs, lm_head.weight.T, out=out)

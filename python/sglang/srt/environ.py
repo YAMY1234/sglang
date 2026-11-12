@@ -342,6 +342,9 @@ class Envs:
     # With the routes above: the shared expert's act_and_mul at 1-16 rows runs in the
     # epilogue of its gate_up split-K GEMM (sm107_shared_expert_act; checked bitwise at load).
     SGLANG_ENABLE_SM107_SHARED_EXPERT_FUSED_ACT = EnvBool(False)
+    # JSON file of BF16 GEMM kernels pinned per (M, N, K), each checked bit-equal to the stock dispatch;
+    # see layers/bf16_gemm_pins.py. Unset: off.
+    SGLANG_BF16_GEMM_PIN_FILE = EnvStr(None)
     # GDN ReplaySSM verify commit: the tiled Triton compact commit (one single-warp program per
     # [32-row V tile, request, layer x 4 value heads], software-pipelined over the heads), bit
     # for bit the stock commit's math, for the shapes it supports; it takes those shapes ahead of

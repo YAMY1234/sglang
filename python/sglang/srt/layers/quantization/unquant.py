@@ -196,6 +196,8 @@ _run_warp_splitk_dense = None
 _enable_bf16_splitk_gemm = False
 # SGLANG_OPT_SM107_BF16_SMALLM_ROUTES: sm107_bf16_smallm serves its keys, bitwise to this dispatch.
 _sm107_smallm_on = False
+# SGLANG_BF16_GEMM_PIN_FILE: bf16_gemm_pins serves its (M, N, K) keys, each checked bitwise to this dispatch.
+_bf16_gemm_pins_on = bool(envs.SGLANG_BF16_GEMM_PIN_FILE.get())
 _mm_bf16 = None
 _flashinfer_autotuner = None
 # CuTe DSL tactics lose to the hand tables and TGV/cuBLAS at M = 24/32.
@@ -421,7 +423,7 @@ def precompile_splitk_tactics(
         # Checked against this dispatch with the routes off; a mismatch keeps them off.
         _sm107_smallm_on = False
         _sm107_smallm_on = sm107_bf16_smallm.precompile(
-            stock_gemm=lambda x, w: _bf16_gemm_dispatch_impl(x, w, None)
+            stock_gemm=lambda x, w: _bf16_gemm_dispatch_unpinned(x, w, None)
         )
     if keys is None:
         keys = {**_BF16_SPLITK_TUNED_TACTICS, **_active_warp_splitk_tactics}
@@ -673,6 +675,21 @@ def _bf16_gemm_dispatch_impl(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: Optional[torch.Tensor],
+    addend: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if _bf16_gemm_pins_on and bias is None and addend is None:
+        from sglang.srt.layers import bf16_gemm_pins
+
+        output = bf16_gemm_pins.gemm(x, weight, _bf16_gemm_dispatch_unpinned)
+        if output is not None:
+            return output
+    return _bf16_gemm_dispatch_unpinned(x, weight, bias, addend)
+
+
+def _bf16_gemm_dispatch_unpinned(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
     addend: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if _sm107_smallm_on and bias is None and addend is None:

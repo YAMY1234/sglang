@@ -343,7 +343,6 @@ class TestDispatch(CustomTestCase):
         self.assertEqual(len(self.calls), 1)
 
 
-
 class TestSharedExpertFusedAct(CustomTestCase):
     def tearDown(self):
         fused_act._enabled = False
@@ -451,6 +450,148 @@ class TestSharedExpertFusedAct(CustomTestCase):
             else:
                 mlp.gate_up_proj.assert_not_called()
                 mlp.down_proj.assert_called_once_with(act)
+
+
+class TestBf16GemmPins(CustomTestCase):
+    """SGLANG_BF16_GEMM_PIN_FILE: per-(M, N, K) pins, served ahead of the dispatch only under their exact stack."""
+
+    METADATA = {
+        "flashinfer_version": "0.7.3",
+        "cuda_version": "13.4",
+        "cublas_version": "13.8.1",
+        "gpu": "NVIDIA Graphics Device",
+        "sm": "10.7",
+    }
+    ENTRIES = [
+        {
+            "m": 72,
+            "n": 320,
+            "k": 10240,
+            "kind": "cublaslt",
+            "algo": "ab" * 64,
+            "workspace": 1024,
+        },
+        {"m": 36, "n": 2560, "k": 6144, "kind": "tgv", "tactic": 21},
+    ]
+
+    def setUp(self):
+        from sglang.srt.layers import bf16_gemm_pins
+        from sglang.srt.layers.moe import flashinfer_tactic_pins
+
+        self.pins = bf16_gemm_pins
+        self.tactic_pins = flashinfer_tactic_pins
+        for cached in (flashinfer_tactic_pins.read_tuning_file,):
+            cached.cache_clear()
+            self.addCleanup(cached.cache_clear)
+        for name, value in (("_state", None), ("_runners", {})):
+            p = mock.patch.object(bf16_gemm_pins, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _file(self, entries, metadata=None):
+        import json
+        import os
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json.py", delete=False) as f:
+            json.dump(
+                {"_metadata": metadata or self.METADATA, "bf16_gemm_pins": entries}, f
+            )
+        self.addCleanup(os.unlink, f.name)
+        return f.name
+
+    def test_parse_accepts_both_kinds_and_rejects_malformed_entries(self):
+        entries = self.pins._parse({"bf16_gemm_pins": self.ENTRIES}, "f")
+        self.assertEqual(
+            entries[(72, 320, 10240)], ("cublaslt", bytes.fromhex("ab" * 64), 1024)
+        )
+        self.assertEqual(entries[(36, 2560, 6144)], ("tgv", 21))
+        for bad in (
+            [{"m": 1, "n": 2, "k": 3, "kind": "cutlass"}],
+            [{"m": 1, "n": 2, "k": 3, "kind": "cublaslt", "algo": "ab" * 63}],
+            [{"n": 2, "k": 3, "kind": "tgv", "tactic": 1}],
+            [{"m": 0, "n": 2, "k": 3, "kind": "tgv", "tactic": 1}],
+            [self.ENTRIES[1], dict(self.ENTRIES[1], tactic=3)],
+        ):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.pins._parse({"bf16_gemm_pins": bad}, "f")
+        with self.assertRaises(ValueError):
+            self.pins._parse({}, "f")
+
+    def test_pins_load_only_under_the_exact_stack(self):
+        path = self._file(self.ENTRIES)
+        for change, on in (({}, True), ({"gpu": "NVIDIA VR NVL72"}, False)):
+            with (
+                self.subTest(change=change),
+                envs.SGLANG_BF16_GEMM_PIN_FILE.override(path),
+                mock.patch.object(self.pins, "_state", None),
+                mock.patch.object(
+                    self.tactic_pins,
+                    "_current_metadata",
+                    return_value={**self.METADATA, **change},
+                ),
+            ):
+                self.assertEqual(self.pins.enabled(), on)
+                self.assertEqual(self.pins.has_shape(320, 10240), on)
+                self.assertFalse(self.pins.has_shape(320, 2560))
+        with envs.SGLANG_BF16_GEMM_PIN_FILE.override(None):
+            self.assertFalse(self.pins.enabled())
+
+    def test_unlisted_or_unservable_calls_take_the_stock_dispatch(self):
+        path = self._file(self.ENTRIES)
+        stock = mock.Mock(side_effect=AssertionError("stock called by gemm"))
+        weight = torch.zeros(320, 10240, dtype=torch.bfloat16)
+        with (
+            envs.SGLANG_BF16_GEMM_PIN_FILE.override(path),
+            mock.patch.object(
+                self.tactic_pins, "_current_metadata", return_value=self.METADATA
+            ),
+            mock.patch.object(self.pins, "_build", side_effect=AssertionError("built")),
+        ):
+            for x in (
+                torch.zeros(71, 10240, dtype=torch.bfloat16),  # M not listed
+                torch.zeros(72, 10240, dtype=torch.float32),  # not BF16
+                torch.zeros(72, 10240, dtype=torch.bfloat16),  # not on CUDA
+            ):
+                self.assertIsNone(self.pins.gemm(x, weight, stock))
+            self.assertIsNone(
+                self.pins.gemm(
+                    torch.zeros(72, 2560, dtype=torch.bfloat16),
+                    torch.zeros(320, 2560, dtype=torch.bfloat16),
+                    stock,
+                )
+            )
+
+    def test_dispatch_serves_pins_first_and_checks_them_against_the_unpinned_dispatch(
+        self,
+    ):
+        x = torch.randn(6, 2560).to(torch.bfloat16)
+        weight = torch.randn(512, 2560).to(torch.bfloat16)
+        bias = torch.randn(512).to(torch.bfloat16)
+        pinned = torch.full((6, 512), 3.0, dtype=torch.bfloat16)
+        seen = []
+
+        def gemm(x_, w_, stock):
+            seen.append(stock)
+            return pinned
+
+        with (
+            mock.patch.object(unquant, "_bf16_gemm_pins_on", True),
+            mock.patch.object(self.pins, "gemm", side_effect=gemm),
+        ):
+            self.assertIs(unquant._bf16_gemm_dispatch_impl(x, weight, None), pinned)
+            self.assertEqual(seen, [unquant._bf16_gemm_dispatch_unpinned])
+            torch.testing.assert_close(
+                unquant._bf16_gemm_dispatch_impl(x, weight, bias),
+                torch.nn.functional.linear(x, weight, bias),
+            )
+            self.assertEqual(len(seen), 1)
+        with mock.patch.object(
+            self.pins, "gemm", side_effect=AssertionError("pins off")
+        ):
+            torch.testing.assert_close(
+                unquant._bf16_gemm_dispatch_impl(x, weight, None),
+                torch.nn.functional.linear(x, weight),
+            )
 
 
 if __name__ == "__main__":
