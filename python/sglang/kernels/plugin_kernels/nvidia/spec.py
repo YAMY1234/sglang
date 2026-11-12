@@ -518,7 +518,9 @@ class SupportsStateSlotReset(Protocol):
     linear-attention state pool (a verify's ring of records and its cursors, for one),
     by state slot or by request row, and allocates it in its prepare.
 
-    SGLang charges state_bytes_per_slot to the state budget when it sizes the pool.
+    SGLang charges state_bytes_per_slot per state slot and
+    state_bytes_per_request_row per request-table row to the state budget when it
+    sizes the pool.
     With keeps_draft_ssm False it allocates no per-draft SSM scratch: the build then
     covers every target verify and commits it (SupportsRecurrentCommit).
 
@@ -535,6 +537,7 @@ class SupportsStateSlotReset(Protocol):
     """
 
     state_bytes_per_slot: int
+    state_bytes_per_request_row: int
     keeps_draft_ssm: bool
     tracks_decode_state: bool
     backs_up_state: bool

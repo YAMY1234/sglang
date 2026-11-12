@@ -730,6 +730,9 @@ class ModelRunner:
             extra_mamba_cache_bytes_per_req=(
                 0 if own_state is None else own_state.state_bytes_per_slot
             ),
+            extra_mamba_cache_bytes_per_request_row=(
+                0 if own_state is None else own_state.state_bytes_per_request_row
+            ),
             allocate_intermediate_ssm=own_state is None or own_state.keeps_draft_ssm,
         )
 

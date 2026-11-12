@@ -586,6 +586,7 @@ class TestMegakernelOwnState(CustomTestCase):
         return SimpleNamespace(
             **{
                 "state_bytes_per_slot": 64,
+                "state_bytes_per_request_row": 32,
                 "keeps_draft_ssm": False,
                 "tracks_decode_state": True,
                 "backs_up_state": True,
@@ -597,7 +598,10 @@ class TestMegakernelOwnState(CustomTestCase):
     def test_the_pool_is_sized_for_it(self):
         from sglang.srt.model_executor import model_runner
 
-        for own, extra, intermediate in ((None, 0, True), (self._own(), 64, False)):
+        for own, slot_bytes, row_bytes, intermediate in (
+            (None, 0, 0, True),
+            (self._own(), 64, 32, False),
+        ):
             with (
                 patch.object(model_runner, "megakernel_state", return_value=own),
                 patch.object(model_runner, "KVCacheConfigurator") as configurator,
@@ -606,7 +610,10 @@ class TestMegakernelOwnState(CustomTestCase):
             ):
                 model_runner.ModelRunner.init_kv_cache_configurator(MagicMock())
             kwargs = configurator.call_args.kwargs
-            self.assertEqual(kwargs["extra_mamba_cache_bytes_per_req"], extra)
+            self.assertEqual(kwargs["extra_mamba_cache_bytes_per_req"], slot_bytes)
+            self.assertEqual(
+                kwargs["extra_mamba_cache_bytes_per_request_row"], row_bytes
+            )
             self.assertEqual(kwargs["allocate_intermediate_ssm"], intermediate)
 
     def test_each_extend_restarts_it_from_the_checkpoint(self):
