@@ -20,7 +20,7 @@ defaults:
 | Key | Question | Values |
 |---|---|---|
 | `placement` | Where do the rows live? | `gpu` (default): device memory. `cpu`: pinned host memory, which the GPU reads in place; the HBM goes to the KV cache. |
-| `replication` | How many copies are there? | `none` (default): one table, its rows split across the TP group. `per_node`: each node holds the whole table, mapped by all of its ranks. `node_shared`: one whole table per node, mapped read-only by every server on it (e.g. several TP1 servers). |
+| `replication` | How many copies are there? | `none` (default): one table, its rows split across the TP group. `per_node`: each node holds the whole table, mapped by all of its ranks. `node_shared`: one whole table per socket, mapped read-only by every server on it (e.g. several TP1 servers). |
 | `lookup` | How does a rank get rows another rank holds? Only with `replication` `none`. | `auto` (default): `peer_read` for GPU tables whose TP group is one NVLink domain, otherwise a collective SGLang picks for each step. `all_reduce`, `reduce_scatter`, `all_to_all`: that collective (see below). `peer_read`: each rank reads its tokens' rows straight from the owning GPU's shard over NVLink, with no collective. |
 
 The configuration is logged at startup as `DeepSeek-V4.1 Engram tables: ...`, and the lookup
@@ -96,11 +96,13 @@ all-reduce.
 - **`replication` `per_node`**: one shared memory file per TP group, which the other ranks open
   through `/proc`. The TP group must sit on one node (`--nnodes 1`) and the ranks must share a PID
   namespace. This mapping usually gets no huge pages unless shmem transparent huge pages are on.
-- **`replication` `node_shared`**: the first server on the node to load allocates the table as CUDA
-  host memory, which every GPU maps at 2 MiB pages, and hands it to the others over an abstract
-  Unix socket; they wait for it to be loaded. The servers must share a network namespace (as
-  containers of one Slurm job do) and run as one user. If the builder dies before the table is
-  loaded, the waiting servers fail rather than read it.
+- **`replication` `node_shared`**: the first server on a socket to load allocates the table as CUDA
+  host memory on that NUMA node, which every GPU maps at 2 MiB pages, and hands it to the others
+  over an abstract Unix socket; they wait for it to be loaded. A GPU reads another socket's memory
+  several times slower, so each socket keeps a copy; `SGLANG_DSV41_ENGRAM_NODE_TABLE_PER_NUMA=0`
+  keeps one per node. The servers must share a network namespace (as containers of one Slurm job
+  do) and run as one user. If the builder dies before the table is loaded, the waiting servers
+  fail rather than read it. Each server logs the time of one chunk of lookups after loading.
 - **`lookup` `reduce_scatter` or `all_to_all`**: DP attention on CUDA; `all_to_all` also needs the
   hash columns to divide over `--tp-size`.
 - **`lookup` `peer_read`**: CUDA with peer access between the GPUs (POSIX handles within a node,

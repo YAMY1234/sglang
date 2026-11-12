@@ -2052,6 +2052,9 @@ class Envs:
     SGLANG_OPT_DSV41_ENGRAM_HOST_STAGING = EnvBool(False)
     # Deprecated for --engram-config "lookup".
     SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS = EnvBool(False)
+    # --engram-config replication node_shared: one copy per host NUMA node, read by
+    # the GPUs of that socket; false: one copy per node, spread over the sockets.
+    SGLANG_DSV41_ENGRAM_NODE_TABLE_PER_NUMA = EnvBool(True)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)

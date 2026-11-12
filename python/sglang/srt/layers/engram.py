@@ -865,6 +865,20 @@ class NodeTable:
         self.ready.set()
 
 
+def _gpu_numa_node(device: int) -> int:
+    """The host NUMA node of a GPU, from its PCI address; -1 if unknown."""
+    props = torch.cuda.get_device_properties(device)
+    path = (
+        f"/sys/bus/pci/devices/{props.pci_domain_id:04x}:{props.pci_bus_id:02x}:"
+        f"{props.pci_device_id:02x}.0/numa_node"
+    )
+    try:
+        with open(path) as f:
+            return int(f.read())
+    except (OSError, ValueError):
+        return -1
+
+
 def _host_numa_nodes() -> list[int]:
     """NUMA nodes with CPUs, i.e. host memory; [] if unknown."""
     try:
@@ -880,7 +894,7 @@ def _host_numa_nodes() -> list[int]:
 
 
 class _NodeSharedHostTable:
-    """One whole engram table shared by every server on a node (replication
+    """One whole engram table shared by every server on a node or socket (replication
     node_shared): a CUDA VMM allocation in host memory, which each GPU maps in its
     own page tables at the allocation granularity, so a row read needs no host
     page-table walk (shmem gets no huge pages unless transparent_hugepage/
@@ -1443,10 +1457,14 @@ class EngramEmbedding(nn.Module):
         s_bytes = n * (dim // FP8_BLOCK_SIZE)
         name, group = f"sglang_engram_{layer_id}", get_parallel().tp_group
         if replication == EngramReplication.NODE_SHARED:
-            # Spread the layers' tables over the sockets; any GPU reads either at
-            # the same speed (measured on VR200), the HiCache pools want the room.
-            nodes = _host_numa_nodes()
-            numa = nodes[layer_id % len(nodes)] if nodes else -1
+            if envs.SGLANG_DSV41_ENGRAM_NODE_TABLE_PER_NUMA.get():
+                # A GPU read rows from the other socket 9x slower on VR200 (2.9 vs
+                # 0.32 ms per 16K-token chunk), so each socket keeps its own copy.
+                numa = _gpu_numa_node(torch.cuda.current_device())
+                name = f"{name}_numa{numa}"
+            else:
+                nodes = _host_numa_nodes()
+                numa = nodes[layer_id % len(nodes)] if nodes else -1
             self.host_table = _NodeSharedHostTable(w_bytes + s_bytes, name, group, numa)
         else:
             self.host_table = _HostTable(
@@ -1517,6 +1535,42 @@ class EngramEmbedding(nn.Module):
             self.peer.connect(self.row_start, label)
         if self.host_table is not None:
             self.host_table.finish_load(label)
+            if self.host_table.replication == EngramReplication.NODE_SHARED:
+                self._log_lookup_time(label)
+
+    def _log_lookup_time(self, label: str) -> None:
+        """Time one 16K-token chunk of lookups (24 random rows per token): the GPU
+        reads the table at its page size, which only a measurement shows."""
+        device = torch.device("cuda", torch.cuda.current_device())
+        ids = torch.randint(
+            0, self.weight.shape[0], (16384 * 24,), device=device, dtype=torch.int64
+        )
+        out = torch.empty(ids.numel(), self.dim, dtype=torch.bfloat16, device=device)
+        times = []
+        for _ in range(5):
+            start, end = (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
+            start.record()
+            engram_gather(
+                *self._table_ptrs(),
+                ids,
+                out,
+                self.dim,
+                FP8_BLOCK_SIZE,
+                mxfp4=self.mxfp4,
+            )
+            end.record()
+            end.synchronize()
+            times.append(start.elapsed_time(end))
+        logger.info(
+            "engram host table %s: %d random rows in %.2f ms (VR200, local socket at "
+            "2 MiB pages: 0.32 ms)",
+            label,
+            ids.numel(),
+            sorted(times)[2],
+        )
 
     def forward(
         self,
