@@ -49,7 +49,7 @@ def _transition_rows(quant: bool):
     )
 
     device = torch.cuda.current_device()
-    rows = {1, MAX_ROWS}
+    rows = {1, 4 * 288, MAX_ROWS}  # 4 * 288: 288 requests at block 3
     for b in (SPLIT4_MAX_ROWS, SPLIT2_MAX_ROWS, _num_sms(device)):
         rows |= {b, b + 1}
     for threads in (640, 320, 160):
@@ -150,6 +150,7 @@ def test_gate_skips_batch_invariant_and_large_batches(monkeypatch):
     cfg = HcConfig(4, 20, 1e-6, 1e-6, HIDDEN, True, False)
     monkeypatch.setattr(mhc, "is_batch_invariant_mode_enabled", lambda: False)
     assert _can_use_decode_post_combine(cfg, MAX_ROWS)
+    assert _can_use_decode_post_combine(cfg, 4 * 288)
     assert not _can_use_decode_post_combine(cfg, MAX_ROWS + 1)
     assert not _can_use_decode_post_combine(cfg, 0)
     monkeypatch.setattr(mhc, "is_batch_invariant_mode_enabled", lambda: True)
