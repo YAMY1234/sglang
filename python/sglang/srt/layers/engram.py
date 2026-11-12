@@ -11,12 +11,17 @@ import dataclasses
 import errno
 import functools
 import glob
+import hashlib
+import json
 import logging
 import mmap
 import os
 import re
+import socket
+import struct
+import threading
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 import msgspec
 import numpy as np
@@ -715,6 +720,289 @@ def _registered_device_ptr(host_ptr: int) -> int:
     return device_ptr.value
 
 
+# How long a server waits for another server on its node to build a node-shared
+# table: that server loads every other weight of its checkpoint first.
+_NODE_TABLE_WAIT_S = 3600
+
+
+def node_table_address(model_path: str, name: str, nbytes: int) -> bytes:
+    """Abstract Unix socket name of one node-shared table, keyed by the user, the
+    checkpoint (path and config.json) and the table's name and size."""
+    model_path = os.path.realpath(model_path)
+    key = hashlib.sha256(f"{model_path}\0{name}\0{nbytes}\0".encode())
+    try:
+        with open(os.path.join(model_path, "config.json"), "rb") as f:
+            key.update(f.read())
+    except OSError:
+        pass
+    return f"\0sglang-engram-{os.getuid()}-{key.hexdigest()[:32]}".encode()
+
+
+class NodeTable:
+    """Rendezvous of the processes on a node that share one table.
+
+    The first to bind the abstract socket builds the table (``create_fd`` returns
+    the exportable descriptor of its memory) and serves that descriptor; the
+    others receive it at once (SCM_RIGHTS) and must not read the table before the
+    builder's ready byte. Abstract names live in the network namespace, which the
+    pyxis/enroot containers of a node share, and vanish with the builder: a
+    builder that dies before it is ready closes every connection, so its readers
+    fail instead of reading a partial table, and the next server to start builds
+    a new one. ``create_fd=None`` only attaches. Lives for the whole process.
+    """
+
+    _CRED = struct.Struct("3i")  # SO_PEERCRED: pid, uid, gid
+
+    def __init__(
+        self,
+        address: bytes,
+        nbytes: int,
+        name: str,
+        create_fd: Optional[Callable[[], int]],
+    ):
+        self.address, self.nbytes, self.name = address, nbytes, name
+        self.ready = threading.Event()
+        self.conn: Optional[socket.socket] = None  # a reader's, to the builder
+        self.owner_pid = os.getpid()
+        deadline = time.monotonic() + _NODE_TABLE_WAIT_S
+        while True:
+            fd = None if create_fd is None else self._build(create_fd)
+            if fd is None:
+                fd = self._attach()
+            if fd is not None:
+                self.fd = fd
+                self.built_here = self.conn is None
+                return
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"engram node-shared table {name}: no builder")
+            time.sleep(0.2)
+
+    def _build(self, create_fd: Callable[[], int]) -> Optional[int]:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.bind(self.address)
+        except OSError as e:
+            sock.close()
+            if e.errno == errno.EADDRINUSE:
+                return None
+            raise
+        fd = create_fd()
+        sock.listen(64)
+        threading.Thread(
+            target=self._serve, args=(sock, fd), name=f"{self.name}-serve", daemon=True
+        ).start()
+        return fd
+
+    def _attach(self) -> Optional[int]:
+        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        conn.settimeout(60)
+        try:
+            conn.connect(self.address)
+            msg, fds, _, _ = socket.recv_fds(conn, 4096, 1)
+        except OSError:
+            # Between the builder's bind and listen, or the builder just exited.
+            conn.close()
+            return None
+        if not fds:
+            conn.close()
+            return None
+        meta = json.loads(msg)
+        if meta["nbytes"] != self.nbytes:
+            conn.close()
+            raise RuntimeError(
+                f"engram node-shared table {self.name}: {self.nbytes} bytes here, "
+                f"{meta['nbytes']} in pid {meta['pid']}'s"
+            )
+        self.conn, self.owner_pid = conn, meta["pid"]
+        return fds[0]
+
+    def _serve(self, sock: socket.socket, fd: int) -> None:
+        while True:
+            conn, _ = sock.accept()
+            peer_uid = self._CRED.unpack(
+                conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, self._CRED.size)
+            )[1]
+            if peer_uid != os.getuid():
+                conn.close()
+                continue
+            threading.Thread(
+                target=self._hand_over, args=(conn, fd), daemon=True
+            ).start()
+
+    def _hand_over(self, conn: socket.socket, fd: int) -> None:
+        with conn:
+            try:
+                meta = {"pid": os.getpid(), "nbytes": self.nbytes}
+                socket.send_fds(conn, [json.dumps(meta).encode()], [fd])
+                self.ready.wait()
+                conn.sendall(b"R")
+            except OSError:
+                pass  # the reader is gone
+
+    def publish(self) -> None:
+        """Builder: every row is written; serve the table to readers."""
+        self.ready.set()
+
+    def wait_ready(self) -> None:
+        """Reader: block until the builder has written every row."""
+        if self.built_here or self.ready.is_set():
+            return
+        self.conn.settimeout(_NODE_TABLE_WAIT_S)
+        try:
+            got = self.conn.recv(1)
+        except OSError as e:
+            raise RuntimeError(
+                f"engram node-shared table {self.name}: no ready signal from pid "
+                f"{self.owner_pid}"
+            ) from e
+        finally:
+            self.conn.close()
+        if got != b"R":
+            raise RuntimeError(
+                f"engram node-shared table {self.name}: the server building it (pid "
+                f"{self.owner_pid}) exited before the table was ready"
+            )
+        self.ready.set()
+
+
+def _host_numa_nodes() -> list[int]:
+    """NUMA nodes with CPUs, i.e. host memory; [] if unknown."""
+    try:
+        with open("/sys/devices/system/node/has_cpu") as f:
+            spans = f.read().strip()
+    except OSError:
+        return []
+    nodes = []
+    for span in filter(None, spans.split(",")):
+        lo, _, hi = span.partition("-")
+        nodes.extend(range(int(lo), int(hi or lo) + 1))
+    return nodes
+
+
+class _NodeSharedHostTable:
+    """One whole engram table shared by every server on a node (replication
+    node_shared): a CUDA VMM allocation in host memory, which each GPU maps in its
+    own page tables at the allocation granularity, so a row read needs no host
+    page-table walk (shmem gets no huge pages unless transparent_hugepage/
+    shmem_enabled allows them). Its POSIX handle goes through NodeTable; the TP group
+    of the server that builds it writes the rows, every other server maps it
+    read-only. Same interface as _HostTable. Lives for the whole process.
+    """
+
+    replication = EngramReplication.NODE_SHARED
+
+    def __init__(self, nbytes: int, name: str, group, numa: int):
+        from sglang.srt.utils import cuda_vmm_utils as vmm
+
+        drv = vmm._get_cuda_driver()
+        self.nbytes, self.group, self.dirty = nbytes, group, False
+        device = torch.cuda.current_device()
+        prop = drv.CUmemAllocationProp()
+        prop.type = drv.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
+        if numa >= 0:
+            prop.location.type = drv.CUmemLocationType.CU_MEM_LOCATION_TYPE_HOST_NUMA
+            prop.location.id = numa
+        else:
+            prop.location.type = drv.CUmemLocationType.CU_MEM_LOCATION_TYPE_HOST
+        handle_type = (
+            drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+        )
+        prop.requestedHandleTypes = handle_type
+        self.granularity = vmm.get_allocation_granularity(prop)
+        self.size = vmm.align_up(nbytes, self.granularity)
+        address = node_table_address(get_model().model_path, name, self.size)
+        created = []
+
+        def create_fd() -> int:
+            handle = vmm.check_drv(drv.cuMemCreate(self.size, prop, 0), "cuMemCreate")
+            created.append(handle)
+            return vmm.check_drv(
+                drv.cuMemExportToShareableHandle(handle, handle_type, 0),
+                "cuMemExportToShareableHandle",
+            )
+
+        # Rank 0 settles who builds before its peers attach, so a peer never builds.
+        self.node, owner = None, None
+        if group.rank_in_group == 0:
+            self.node = NodeTable(address, self.size, name, create_fd)
+            owner = (self.node.built_here, self.node.owner_pid)
+        self.writes_rows, self.owner_pid = group.broadcast_object(owner, src=0)
+        if self.node is None:
+            self.node = NodeTable(address, self.size, name, None)
+        handle = (
+            created[0]
+            if created
+            else vmm.import_peer_handle(
+                None, self.node.fd, use_fabric=False, peer_rank=self.owner_pid
+            )
+        )
+        self.device_ptr = self._map(drv, vmm, handle, device)
+        self.bytes = torch.frombuffer(
+            (ctypes.c_uint8 * nbytes).from_address(self.device_ptr), dtype=torch.uint8
+        )
+        logger.info(
+            "engram host table %s: node_shared, %.1f GiB on NUMA node %d, %s",
+            name,
+            self.size / 2**30,
+            numa,
+            "built here" if self.writes_rows else f"pid {self.owner_pid}'s",
+        )
+
+    def _map(self, drv, vmm, handle, device: int) -> int:
+        """Map the allocation for this GPU and for the host (the loader writes the
+        rows through it); read-only unless this TP group builds it."""
+        flags = drv.CUmemAccess_flags
+        flag = flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
+        if not self.writes_rows:
+            flag = flags.CU_MEM_ACCESS_FLAGS_PROT_READ
+        va = int(
+            vmm.check_drv(
+                drv.cuMemAddressReserve(self.size, self.granularity, 0, 0),
+                "cuMemAddressReserve",
+            )
+        )
+        vmm.check_drv(drv.cuMemMap(va, self.size, 0, handle, 0), "cuMemMap")
+        descs = []
+        for location, location_id in (
+            (drv.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE, device),
+            (drv.CUmemLocationType.CU_MEM_LOCATION_TYPE_HOST, 0),
+        ):
+            desc = drv.CUmemAccessDesc()
+            desc.location.type = location
+            desc.location.id = location_id
+            desc.flags = flag
+            descs.append(desc)
+        vmm.check_drv(
+            drv.cuMemSetAccess(va, self.size, descs, len(descs)), "cuMemSetAccess"
+        )
+        # The mapping keeps the allocation alive.
+        vmm.check_drv(drv.cuMemRelease(handle), "cuMemRelease")
+        return va
+
+    def finish_load(self, label: str):
+        if not self.dirty:
+            return
+        self.dirty = False
+        t0 = time.perf_counter()
+        if not self.writes_rows:
+            self.node.wait_ready()
+        if self.group.world_size > 1:
+            self.group.barrier()
+        if self.writes_rows and self.node.built_here:
+            self.node.publish()
+        logger.info(
+            "engram host table %s: replication=node_shared (%s), %.0f MiB, "
+            "GPU-mapped at %d MiB pages%s",
+            label,
+            "built here" if self.writes_rows else f"pid {self.owner_pid}'s",
+            self.nbytes / 2**20,
+            self.granularity >> 20,
+            ""
+            if self.writes_rows
+            else f", ready after {time.perf_counter() - t0:.1f} s",
+        )
+
+
 class _HostTable:
     """Host-memory backing for one engram table: one shard per rank, or with
     replication per_node one whole table shared by the TP group.
@@ -1149,28 +1437,42 @@ class EngramEmbedding(nn.Module):
     def _init_host_table(
         self, num_embeddings: int, dim: int, layer_id: int, replication: str
     ):
-        per_node = replication == EngramReplication.PER_NODE
-        n = num_embeddings if per_node else self.rows
+        whole = replication in EngramReplication.WHOLE_TABLE
+        n = num_embeddings if whole else self.rows
         w_bytes = n * self.row_bytes
         s_bytes = n * (dim // FP8_BLOCK_SIZE)
-        self.host_table = _HostTable(
-            replication,
-            max(1, w_bytes + s_bytes),  # mmap requires storage even for an empty shard.
-            f"sglang_engram_{layer_id}",
-            get_parallel().tp_group,
-        )
+        name, group = f"sglang_engram_{layer_id}", get_parallel().tp_group
+        if replication == EngramReplication.NODE_SHARED:
+            # Spread the layers' tables over the sockets; any GPU reads either at
+            # the same speed (measured on VR200), the HiCache pools want the room.
+            nodes = _host_numa_nodes()
+            numa = nodes[layer_id % len(nodes)] if nodes else -1
+            self.host_table = _NodeSharedHostTable(w_bytes + s_bytes, name, group, numa)
+        else:
+            self.host_table = _HostTable(
+                replication,
+                max(
+                    1, w_bytes + s_bytes
+                ),  # mmap requires storage even for an empty shard.
+                name,
+                group,
+            )
         weight, scale = _table_views(self.host_table.bytes, n, dim, self.mxfp4)
         self.weight = nn.Parameter(weight, requires_grad=False)
         self.scale = nn.Parameter(scale, requires_grad=False)
         device_ptr = self.host_table.device_ptr
         self._host_table_ptrs = (device_ptr, device_ptr + w_bytes)
-        self._sort_host_reads = _sorted_host_reads(torch.cuda.current_device())
+        # A node-shared table is in the GPU's own page tables at large pages.
+        self._sort_host_reads = (
+            replication != EngramReplication.NODE_SHARED
+            and _sorted_host_reads(torch.cuda.current_device())
+        )
 
     @property
     def _shared(self) -> bool:
         return (
             self.host_table is not None
-            and self.host_table.replication == EngramReplication.PER_NODE
+            and self.host_table.replication in EngramReplication.WHOLE_TABLE
         )
 
     @property
@@ -1200,9 +1502,13 @@ class EngramEmbedding(nn.Module):
             f"{dst.dtype} {tuple(dst.shape)}; an MXFP4 table needs "
             "quantization_config.engram_embed_quant = 'mxfp4'"
         )
-        dst.copy_(src)
         if self.host_table is not None:
             self.host_table.dirty = True
+            if self.host_table.replication == EngramReplication.NODE_SHARED and (
+                not self.host_table.writes_rows
+            ):
+                return  # another server on this node fills the node-shared table
+        dst.copy_(src)
 
     def finish_load(self, label: str):
         """Collective in the shared layout and with peer shards: every rank calls
