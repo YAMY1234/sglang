@@ -518,7 +518,9 @@ class SupportsStateSlotReset(Protocol):
     linear-attention state pool (a verify's ring of records and its cursors, for one),
     by state slot or by request row, and allocates it in its prepare.
 
-    SGLang charges state_bytes_per_slot to the state budget when it sizes the pool.
+    SGLang charges state_bytes_per_slot per state slot and
+    state_bytes_per_request_row per request-table row to the state budget when it
+    sizes the pool.
     With keeps_draft_ssm False it allocates no per-draft SSM scratch: the build then
     covers every target verify and commits it (SupportsRecurrentCommit).
 
@@ -535,6 +537,7 @@ class SupportsStateSlotReset(Protocol):
     """
 
     state_bytes_per_slot: int
+    state_bytes_per_request_row: int
     keeps_draft_ssm: bool
     tracks_decode_state: bool
     backs_up_state: bool
@@ -550,9 +553,12 @@ class SupportsRecurrentCommit(Protocol):
 
     SGLang calls commit_recurrent_state after each target verify, where it would
     commit the state of the linear-attention layers. It launches the commit on the
-    current stream, capturable, with no collective and no allocation, and returns
-    True; SGLang then commits only the side states it keeps per request (PLE).
-    False launches nothing, and SGLang commits as without it.
+    current stream and returns True; SGLang then commits only the side states it
+    keeps per request (PLE). False launches nothing, and SGLang commits as without
+    it. The call may be captured in a CUDA graph: it runs no collective and no host
+    sync, and while capturing allocates only per-capture temporaries from the
+    graph's pool (a small arange, an int32 cast); every buffer it keeps across
+    calls exists before the capture (allocate it in prepare).
     """
 
     def commit_recurrent_state(self, io: RecurrentCommitIO) -> bool: ...

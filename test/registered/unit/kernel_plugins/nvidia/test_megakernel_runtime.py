@@ -364,6 +364,7 @@ class TestMegakernelRuntime(CustomTestCase):
 
         class OwnStateBuilt(FakeBuilt):
             state_bytes_per_slot = 64
+            state_bytes_per_request_row = 0
             keeps_draft_ssm = False
             tracks_decode_state = False
             backs_up_state = False
