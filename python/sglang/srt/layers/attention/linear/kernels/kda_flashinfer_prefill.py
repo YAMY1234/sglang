@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import functools
+import importlib.util
+import logging
 from itertools import accumulate
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -14,6 +18,51 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+logger = logging.getLogger(__name__)
+
+# SGLANG_K31_KDA_PREFILL_FI_SM107 runs FlashInfer v0.7.4's CuTe DSL KDA kernel module:
+# 0.7.2's decomp-chain kernel can deadlock (flashinfer#8684) and pass non-finite V
+# padding (#8599). On this path only that module differs, and it is imported lazily.
+_BT16 = "flashinfer.kda_kernels.kda_chunked_bt16"
+_BT16_V074 = (
+    Path(__file__).with_name("flashinfer_kda_v074") / "kda_chunked_bt16.py",
+    "65837616b001b3fdd5856bc936526930f4ae100e",
+)
+_BT16_BLOBS = {
+    "38903d429cbcfa05c3363a760f3c32902532e7cf": "0.7.2",
+    "65837616b001b3fdd5856bc936526930f4ae100e": "v0.7.4",
+}
+# kda_prefill_cute.py at 0.7.2 and v0.7.4: the vendored kernel's callers
+_PREFILL_CUTE_BLOBS = (
+    "150c7edc008ec68d6cf9dd96ac80b62ccace0921",
+    "a46ae62155472a982d0b61e4fcce866518882c88",
+)
+
+
+@functools.cache
+def _use_flashinfer_kda_bt16_v074() -> str:
+    """Load flashinfer.kda_kernels.kda_chunked_bt16 from FlashInfer v0.7.4; returns
+    the image's version of that module."""
+    from flashinfer import kda_prefill_cute
+
+    from sglang.srt.layers.attention.flashinfer_vendored import (
+        git_blob_sha1,
+        load_vendored,
+    )
+
+    spec = importlib.util.find_spec(_BT16)
+    image = spec and _BT16_BLOBS.get(git_blob_sha1(Path(spec.origin).read_bytes()))
+    caller = git_blob_sha1(Path(kda_prefill_cute.__file__).read_bytes())
+    if image is None or caller not in _PREFILL_CUTE_BLOBS:
+        raise RuntimeError(
+            "SGLANG_K31_KDA_PREFILL_FI_SM107 needs FlashInfer 0.7.2 or v0.7.4 "
+            f"{_BT16} and kda_prefill_cute; the image has other versions"
+        )
+    if image == "0.7.2":
+        load_vendored({_BT16: _BT16_V074})
+        logger.info(f"FlashInfer KDA prefill kernel: v0.7.4 from {_BT16_V074[0]}")
+    return image
 
 
 def build_flashinfer_kda_checkpoint_plan(
@@ -78,9 +127,25 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
     supports_safe_gate = True
 
     def __init__(self):
-        if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-            raise ValueError("FlashInfer KDA prefill requires SM100 or SM103")
+        from sglang.srt.environ import envs
+
+        capability = torch.cuda.get_device_capability()
+        sm107 = capability == (10, 7) and envs.SGLANG_K31_KDA_PREFILL_FI_SM107.get()
+        if capability not in ((10, 0), (10, 3)) and not sm107:
+            raise ValueError(
+                "FlashInfer KDA prefill requires SM100 or SM103 "
+                "(SM107 with SGLANG_K31_KDA_PREFILL_FI_SM107=1)"
+            )
         from flashinfer import kda
+
+        if envs.SGLANG_K31_KDA_PREFILL_FI_SM107.get():
+            _use_flashinfer_kda_bt16_v074()
+        if sm107:
+            # flashinfer#6201 (in 0.7.3) only adds (10, 7) to this set. A no-op on
+            # FlashInfer >= 0.7.3.
+            from flashinfer import kda_prefill_cute
+
+            kda_prefill_cute._SUPPORTED_COMPUTE_CAPABILITIES.add((10, 7))
 
         self._recurrent_kda = kda.recurrent_kda
         # Older FlashInfer installations retain the eager BCG break.

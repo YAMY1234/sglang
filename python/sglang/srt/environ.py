@@ -1780,6 +1780,11 @@ class Envs:
     # Sequences a captured KDA extend bucket accepts; a larger prefill batch on
     # any dp rank runs the step eagerly. Bounds the padded grids and scratch.
     SGLANG_KDA_PREFILL_GRAPH_MAX_SEQS = EnvInt(128)
+    # Admit SM107 (Rubin) to FlashInfer's CuTe DSL KDA prefill (flashinfer#6201), on
+    # FlashInfer v0.7.4's kernel module (#8684 hang and #8599 fixes; vendored).
+    SGLANG_K31_KDA_PREFILL_FI_SM107 = EnvBool(False)
+    # Build the PTX KDA prefill extension for sm_107a; not measured on SM107 upstream.
+    SGLANG_ENABLE_PTX_KDA_SM107 = EnvBool(False)
     # Experimental: breakable prefill CUDA graphs capture the Triton GDN extend
     # instead of breaking at every GDN layer (layers/attention/linear/
     # gdn_prefill_graph.py).
@@ -2096,6 +2101,9 @@ class Envs:
     # DSA backend (GLM 5 and DeepSeek V3.2)
     # ===================================================================
     SGLANG_DSA_FUSE_TOPK = EnvBool(True)
+    # Admit SM107 (Rubin) to the prims_ts DSA backend, on FlashInfer prims_ts 784bfaf5
+    # (flashinfer#8186; vendored beside dsa/prims_ts.py for 26bb6dc9 images).
+    SGLANG_ENABLE_PRIMS_TS_SM107 = EnvBool(False)
     # Enabled for supported CUDA KPool geometry; set to 0 to use ordinary metadata.
     SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION = EnvBool(True)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)

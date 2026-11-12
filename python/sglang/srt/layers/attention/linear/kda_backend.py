@@ -72,7 +72,8 @@ def _validate_flashinfer_kda_prefill(
 
 
 def flashinfer_kda_prefill_default(model_runner: ModelRunner) -> Optional[str]:
-    """Default safe-gate KDA prefill to FlashInfer on SM100/SM103."""
+    """Default safe-gate KDA prefill to FlashInfer on SM100/SM103 (and SM107 with
+    SGLANG_K31_KDA_PREFILL_FI_SM107=1)."""
     from sglang.srt.configs.bailing_hybrid import BailingHybridConfig
     from sglang.srt.configs.hybrid_arch import hybrid_kda_config
 
@@ -90,7 +91,13 @@ def flashinfer_kda_prefill_default(model_runner: ModelRunner) -> Optional[str]:
         and not execution.overlap.enable_two_batch_overlap
         and execution.graph.cuda_graph_config.prefill.backend != CudaGraphBackend.FULL
         and is_cuda()
-        and torch.cuda.get_device_capability() in ((10, 0), (10, 3))
+        and (
+            torch.cuda.get_device_capability() in ((10, 0), (10, 3))
+            or (
+                torch.cuda.get_device_capability() == (10, 7)
+                and envs.SGLANG_K31_KDA_PREFILL_FI_SM107.get()
+            )
+        )
     ):
         return "flashinfer"
     return None

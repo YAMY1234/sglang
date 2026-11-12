@@ -9,9 +9,89 @@ localization; only the attention kernel differs.
 
 from __future__ import annotations
 
+import functools
+import hashlib
+import importlib.util
+import logging
+import sys
+from pathlib import Path
 from typing import Optional
 
 import torch
+
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.flashinfer_vendored import load_vendored
+
+logger = logging.getLogger(__name__)
+
+# SGLANG_ENABLE_PRIMS_TS_SM107 runs FlashInfer prims_ts at 784bfaf5 (#8186). The
+# image overlays main 26bb6dc9's prims_ts/ (docker/k31-image); 784bfaf5 differs in
+# three files, vendored verbatim beside this module and loaded under their own names.
+_FI_784BFAF5_DIR = Path(__file__).with_name("flashinfer_prims_ts_784bfaf5")
+# module under flashinfer.attention.prims_ts: its git blob at 784bfaf5
+_FI_784BFAF5_FILES = {
+    "mla_decode": "8101912f87e572cca263092e8d69d40cb2a49532",
+    "kernels.mla_decode.helpers.nvfp4_kv": "194d608e0901e483f61aa74ef653a4182deb3887",
+    "kernels.mla_decode.throughput_2cta.nvfp4_kv_load": (
+        "12befbaebb3b1d74ce2ef6c48f2e0b411b8eca56"
+    ),
+}
+# sha256 over every *.py (relative path, NUL, bytes; sorted), as the image's marker
+_PRIMS_TS_TREES = {
+    "31ce036cc1e27ab7c4372b2b07bb0755a63d7590e579931df28cc6b84de15633": "26bb6dc9",
+    "ac72191a4a6db76cdaa8768e758ba87683f938e5021f1cbc62bc56a0d1fa0d97": "784bfaf5",
+}
+
+
+def _tree_sha256(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*.py")):
+        digest.update(str(path.relative_to(root)).encode() + b"\0" + path.read_bytes())
+    return digest.hexdigest()
+
+
+@functools.cache
+def _use_flashinfer_prims_ts_784bfaf5() -> str:
+    """Make flashinfer.attention.prims_ts FlashInfer 784bfaf5; returns the tree."""
+    package = "flashinfer.attention.prims_ts"
+    spec = importlib.util.find_spec(package)
+    if spec is None or not spec.submodule_search_locations:
+        raise RuntimeError(f"SGLANG_ENABLE_PRIMS_TS_SM107: {package} is not installed")
+    root = Path(next(iter(spec.submodule_search_locations)))
+    tree = _PRIMS_TS_TREES.get(_tree_sha256(root))
+    if tree == "784bfaf5":
+        return tree
+    if tree != "26bb6dc9":
+        raise RuntimeError(
+            "SGLANG_ENABLE_PRIMS_TS_SM107 needs FlashInfer prims_ts at 26bb6dc9 (the "
+            "vendored 784bfaf5 files replace three of them) or 784bfaf5; "
+            f"{root} is neither"
+        )
+    if package in sys.modules:
+        raise RuntimeError(
+            f"SGLANG_ENABLE_PRIMS_TS_SM107: {package} (26bb6dc9) was imported before "
+            "the 784bfaf5 files could be loaded"
+        )
+    load_vendored(
+        {
+            f"{package}.{name}": (
+                _FI_784BFAF5_DIR.joinpath(*name.split(".")).with_suffix(".py"),
+                blob,
+            )
+            for name, blob in _FI_784BFAF5_FILES.items()
+        }
+    )
+    logger.info(f"FlashInfer prims_ts: 784bfaf5 (#8186 files from {_FI_784BFAF5_DIR})")
+    return tree
+
+
+def _flashinfer_prims_ts():
+    if envs.SGLANG_ENABLE_PRIMS_TS_SM107.get():
+        _use_flashinfer_prims_ts_784bfaf5()
+    import flashinfer.attention.prims_ts as prims_ts
+
+    return prims_ts
+
 
 # Decode/verify graphs plan their exact row count; eager batches above this share
 # power-of-two capacity plans, so prefill chunks do not plan one kernel per size.
@@ -36,14 +116,16 @@ def check_prims_ts_sparse_mla_support(
             f"(kv_lora_rank 512, qk_rope_head_dim 64); got {kv_lora_rank}, "
             f"{qk_rope_head_dim}."
         )
-    if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3)):
-        raise ValueError("Prims-TS sparse MLA requires SM100 or SM103.")
-    try:
-        from flashinfer.attention.prims_ts import (
-            get_prims_ts_sparse_mla_decode_workspace_size,
+    allowed = ((10, 0), (10, 3))
+    if envs.SGLANG_ENABLE_PRIMS_TS_SM107.get():
+        allowed += ((10, 7),)
+    if torch.cuda.get_device_capability(device) not in allowed:
+        raise ValueError(
+            "Prims-TS sparse MLA requires SM100 or SM103 "
+            "(SM107 with SGLANG_ENABLE_PRIMS_TS_SM107=1)."
         )
-
-        get_prims_ts_sparse_mla_decode_workspace_size(
+    try:
+        _flashinfer_prims_ts().get_prims_ts_sparse_mla_decode_workspace_size(
             device,
             1,
             num_heads,
@@ -56,7 +138,8 @@ def check_prims_ts_sparse_mla_support(
     except (ImportError, TypeError, ValueError, NotImplementedError) as exc:
         raise RuntimeError(
             "--dsa-*-backend prims_ts needs FlashInfer Prims-TS with D576 native-FP8 "
-            "sparse MLA (flashinfer-ai/flashinfer#7410 and #7984)."
+            "sparse MLA (flashinfer-ai/flashinfer#7410 and #7984; SM107 also #8186): "
+            f"{exc}"
         ) from exc
 
 
@@ -77,8 +160,9 @@ class PrimsTSSparseMLA:
         self._qo_indptr: dict[tuple[int, int, int, bool], torch.Tensor] = {}
 
     def _wrapper(self, *, rows: int, heads: int, width: int):
-        from flashinfer.attention.prims_ts import BatchSparseMLADecodePagedTSWrapper
-
+        BatchSparseMLADecodePagedTSWrapper = (
+            _flashinfer_prims_ts().BatchSparseMLADecodePagedTSWrapper
+        )
         capacity = _plan_capacity(rows)
         packed = capacity is not None
         key = (capacity if packed else rows, heads, width, packed)
