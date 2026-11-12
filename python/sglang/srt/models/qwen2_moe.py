@@ -139,6 +139,11 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
+# SGLANG_ENABLE_SHARED_EXPERT_DOWN_TGV: the target's shared-expert down_proj of this shape (N, K) runs on the CuTe DSL
+# TGV kernel at these rows, where it beats the stock dispatch's cuBLAS kernel on SM107.
+_SHARED_DOWN_TGV_SHAPE = (2560, 640)
+_SHARED_DOWN_TGV_ROWS = (4, 8, 16)
+
 
 def get_num_shared_experts(config: PretrainedConfig) -> int:
     n_shared_experts = getattr(config, "n_shared_experts", None)
@@ -229,6 +234,21 @@ class Qwen2MoeMLP(nn.Module):
         # Lazily derived after weight load (input_scale_inv does not exist yet
         # at construction time); the fused kernel requires a 1-D global scale.
         self._down_input_scale_inv_1d = None
+        # Set by Qwen2MoeSparseMoeBlock (SGLANG_ENABLE_SHARED_EXPERT_DOWN_TGV).
+        self.down_tgv = False
+
+    def _down(self, x: torch.Tensor) -> torch.Tensor:
+        if (
+            self.down_tgv
+            and x.ndim == 2
+            and x.shape[0] in _SHARED_DOWN_TGV_ROWS
+            and x.dtype == torch.bfloat16
+        ):
+            from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import cutedsl_bf16_gemm
+
+            return cutedsl_bf16_gemm(x, self.down_proj.weight)
+        x, _ = self.down_proj(x)
+        return x
 
     def forward(
         self,
@@ -237,15 +257,13 @@ class Qwen2MoeMLP(nn.Module):
         if sm107_shared_expert_act.is_enabled():
             act = sm107_shared_expert_act.fused_act(self, x)
             if act is not None:
-                x, _ = self.down_proj(act)
-                return x
+                return self._down(act)
         gate_up, _ = self.gate_up_proj(x)
         if can_run_silu_fp4_quant_fusion(self, gate_up):
             x, _ = self.down_proj(silu_and_mul_fp4_quant(self, gate_up))
             return x
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
-        return x
+        return self._down(x)
 
 
 def _smallm_router_topk_output(block, hidden_states):
@@ -421,6 +439,19 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
         else:
             self.shared_expert = None
+        if (
+            envs.SGLANG_ENABLE_SHARED_EXPERT_DOWN_TGV.get()
+            and self.shared_expert is not None
+            and not is_nextn
+        ):
+            from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+            down = self.shared_expert.down_proj
+            self.shared_expert.down_tgv = (
+                isinstance(down.quant_method, UnquantizedLinearMethod)
+                and down.weight.dtype == torch.bfloat16
+                and tuple(down.weight.shape) == _SHARED_DOWN_TGV_SHAPE
+            )
         if _is_cpu and _is_cpu_amx_available:
             self.shared_expert_gate = ReplicatedLinear(
                 config.hidden_size,

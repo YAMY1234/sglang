@@ -2,16 +2,18 @@
 # kernels/ops/gemm/dense_bf16_gemm_sm100_splitk_epilogue.py (Apache-2.0); this file has been modified.
 """Shared-expert act_and_mul in the SM107 gate_up split-K epilogue (default off).
 
-Not bitwise on FlashInfer 0.7.3: R37 job 12458's exhaustive pair test (test_every_finite_pair_bitwise) finds about
-2% of finite (gate, up) pairs differ from the stock pair there, which the load-time check does not catch. Keep it off.
-
 SGLANG_ENABLE_SM107_SHARED_EXPERT_FUSED_ACT=1, with the SM107 small-M routes on (sm107_bf16_smallm): at 1-16 rows the
 routes run the shared expert's gate_up (N 1280, K 2560) on FlashInfer 0.7.2's cluster split-K kernel at tactic
-(64, 8, 4, 5), and the stock SiluAndMul then launches the JIT act_and_mul kernel (kernels/jit/csrc/elementwise/
-activation.cuh, built with --use_fast_math) on the BF16 gate_up output. Here Qwen2MoeMLP.forward runs one kernel
-instead: the same split-K GEMM, whose epilogue writes silu(gate) * up.
+(64, 8, 4, 5), and the stock SiluAndMul then launches the JIT act_and_mul kernel on the BF16 gate_up output. Here
+Qwen2MoeMLP.forward runs one kernel instead: the same split-K GEMM, whose epilogue writes silu(gate) * up.
 
-Output bits equal the stock pair's:
+The epilogue reproduces act_and_mul_kernel as it was built before #48942: x / (1 + expf(-x)) * up under
+--use_fast_math. Since #48942 that kernel computes silu as x * rcp.approx.ftz(1 + ex2.approx.ftz(-x * log2(e))), and
+An exhaustive check found it differs from the older one on 87,313,176 of the 4,261,478,400 finite (gate, up) pairs, none of
+them among the load-time check's random operands. The fused act therefore keeps the older stock pair's bits, which the
+GPU tests check against that kernel built from source.
+
+Output bits equal that older stock pair's:
 * The kernel is the vendored copy of that FlashInfer kernel (kernels/ops/gemm/dense_bf16_gemm_sm100_splitk_epilogue.py;
   its TMA, MMA and rank-ordered FP32 split-K reduction are FlashInfer 0.7.2's), at the same tactic. Only the epilogue
   warp is overridden, after the reduction.
@@ -22,7 +24,7 @@ Output bits equal the stock pair's:
   in shared memory as the vendored "gate" epilogue does, and computes act_and_mul_kernel's
   float(bf16(gate / (1 + expf(-gate)) * up)) with the instructions nvcc emits for it under --use_fast_math:
   mul.ftz by -log2(e), ex2.approx.ftz, add.ftz, div.approx.ftz, mul.ftz, then cvt.rn.bf16. Every finite (gate, up)
-  BF16 pair was checked equal to the stock kernel's output.
+  BF16 pair was checked equal to that kernel's output.
 
 The saving is per call; whether a step gets shorter depends on whether the shared-expert branch is on the critical
 path, which it is not when it already finishes before the routed experts.

@@ -397,6 +397,15 @@ _use_sm107_splitk_tactics = False
 _active_warp_splitk_tactics = _BF16_WARP_SPLITK_TUNED_TACTICS
 
 
+def _prefer_direct_bf16_gemm_fi072(m: int, n: int, k: int) -> bool:
+    """FlashInfer 0.7.2's direct-GEMM crossover (K 8192 only), kept on SM107. FlashInfer 0.7.3 widened it to
+    M * N <= 2048, which takes tuned split-K keys such as (4, 512, 2560) to its direct kernel: other bits, and
+    slower there under graph replay (5.0 vs 4.2 us at M 4)."""
+    return k == 8192 and (
+        (m == 1 and n <= 4608) or (m <= 4 and n <= 512) or (m <= 8 and n <= 256)
+    )
+
+
 def use_bf16_splitk_gemm(m: int, n: int, k: int) -> bool:
     key = (m, n, k)
     return key in _BF16_SPLITK_TUNED_TACTICS or key in _active_warp_splitk_tactics
@@ -522,19 +531,25 @@ def initialize_bf16_gemm_config() -> None:
             prefer_direct_bf16_gemm_sm100,
             run_direct_dense,
         )
-        from flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk import (
-            SplitKTactic,
-            run_splitk_dense,
-        )
         from flashinfer.gemm.kernels.dense_bf16_gemm_warp_splitk import (
             WarpSplitKTactic,
             run_warp_splitk_dense,
         )
 
+        # FlashInfer 0.7.2's cluster split-K with FlashInfer #7443's hand-off fix (vendored; 0.7.2's tiles and bits).
+        from sglang.kernels.ops.gemm.dense_bf16_gemm_sm100_splitk import (
+            SplitKTactic,
+            run_splitk_dense,
+        )
+
         _splitk_tactic = SplitKTactic
         _run_splitk_dense = run_splitk_dense
         _direct_default_tactic = default_tactic
-        _prefer_direct = prefer_direct_bf16_gemm_sm100
+        _prefer_direct = (
+            _prefer_direct_bf16_gemm_fi072
+            if get_platform().device_sm == 107
+            else prefer_direct_bf16_gemm_sm100
+        )
         _run_direct_dense = run_direct_dense
         _warp_splitk_tactic = WarpSplitKTactic
         _run_warp_splitk_dense = run_warp_splitk_dense

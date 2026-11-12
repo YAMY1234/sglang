@@ -342,6 +342,9 @@ class Envs:
     # With the routes above: the shared expert's act_and_mul at 1-16 rows runs in the
     # epilogue of its gate_up split-K GEMM (sm107_shared_expert_act; checked bitwise at load).
     SGLANG_ENABLE_SM107_SHARED_EXPERT_FUSED_ACT = EnvBool(False)
+    # The target's shared-expert down_proj (BF16, N 2560 K 640) at 4, 8 and 16 rows runs on the CuTe DSL TGV
+    # kernel instead of the stock dispatch (models/qwen2_moe.py). Draft (nextn) layers keep the stock dispatch.
+    SGLANG_ENABLE_SHARED_EXPERT_DOWN_TGV = EnvBool(False)
     # JSON file of BF16 GEMM kernels pinned per (M, N, K), each checked bit-equal to the stock dispatch;
     # see layers/bf16_gemm_pins.py. Unset: off.
     SGLANG_BF16_GEMM_PIN_FILE = EnvStr(None)
