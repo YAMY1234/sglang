@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections import defaultdict, deque
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -93,6 +94,18 @@ class PPBatchMetadata:
     verify_out_cache_loc: Optional[torch.Tensor] = None
     # Rank-local; never sent over the wire.
     fpm_timing: Optional[FpmTiming] = None
+
+
+@dataclass(frozen=True)
+class PPDeferredPrefillResult:
+    slot: int
+    generation: int
+    batch: ScheduleBatch
+    metadata: Optional[PPBatchMetadata]
+    result: GenerationBatchResult
+    event: torch.Event
+    has_transfer: bool
+    release_rids: Optional[Dict[str, bool]]
 
 
 class SchedulerPPMixin:
@@ -253,6 +266,9 @@ class SchedulerPPMixin:
         PPConsensusStore instead of the legacy two-round RID sync.
 
         """
+        if os.environ.get("SGLANG_PP_PD_OVERLAP_B2", "0") == "1":
+            return self.event_loop_pp_disagg_prefill_overlap_b2()
+
         self.init_pp_loop_state()
 
         # PD additional state initialization
@@ -370,6 +386,153 @@ class SchedulerPPMixin:
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
+                self._sched_idled = True
+                if len(self.disagg_prefill_transfer_queue) == 0:
+                    self.on_idle()
+
+    def _pp_b2_commit_result(self: Scheduler, pending, generations):
+        # Keep the old ring entry and metadata intact until its CPU consumer
+        # retires. The new forward uses its own metadata list in the meantime.
+        slot = pending.slot
+        if (
+            generations[slot] != pending.generation
+            or self.mbs[slot] is not pending.batch
+            or self.mb_metadata[slot] is not pending.metadata
+        ):
+            raise RuntimeError("PP B2: pending result generation was overwritten")
+        pending.event.synchronize()
+        self._pp_process_batch_result(pending.batch, pending.result)
+        self.last_mbs[slot] = pending.batch
+        if pending.has_transfer:
+            self.process_disagg_prefill_transfer_queue(pending.release_rids)
+
+    @DynamicGradMode()
+    def event_loop_pp_disagg_prefill_overlap_b2(self: Scheduler):
+        """Delay a disjoint final-prefill result until after the next launch.
+
+        Chunk continuation mutates Req.extend_end and checkpoints/sends KV
+        before scheduling. Those results retain the original commit boundary.
+        This opt-in path keeps depth, admission caps and PP wire order fixed.
+        """
+        self.init_pp_loop_state()
+        if (
+            get_parallel().pp_size != 4
+            or get_parallel().pp_async_batch_depth != 0
+            or self._pp_spec_relay
+            or self.enable_lora
+            or not self.server_args.disable_cuda_graph
+        ):
+            raise ValueError(
+                "SGLANG_PP_PD_OVERLAP_B2 requires PD prefill PP4, depth0, "
+                "disabled CUDA graphs, no LoRA and no PP spec relay"
+            )
+        generations = [0] * self.pp_loop_size
+        pending = None
+        tmbs = [None] * self.pp_loop_size
+        release_rids = None
+        send_transfer_work = []
+        send_release_work = []
+        logger.info("PP PD overlap B2 enabled (disjoint final-prefill results)")
+
+        while True:
+            server_is_idle = True
+            for mb_id in range(self.pp_loop_size):
+                self.increment_scheduler_iterations()
+                if pending is not None and pending.slot != mb_id:
+                    raise RuntimeError("PP B2: pending result is not the next slot")
+                self.running_batch = self.running_mbs[mb_id]
+                self.last_batch = (
+                    self.last_mbs[mb_id] if pending is None else None
+                )
+                next_mb_id = (mb_id + 1) % self.pp_loop_size
+                next_release_rids = None
+                recv_reqs = self._pp_ingest_requests()
+                if not self.pp_group.is_last_rank:
+                    self._pp_commit_comm_work(self.send_req_work)
+                self.process_bootstrapped_queue()
+                transferred_rids = self._pp_pd_get_prefill_transferred_ids()
+                self._pp_commit_comm_work(send_transfer_work)
+                tmbs[mb_id] = transferred_rids
+
+                self.process_prefill_chunk(
+                    last_batch=self.last_batch, running_batch=self.running_batch
+                )
+                self._process_hicache_events()
+                cur_batch = None
+                if self._pp_may_launch():
+                    plan = self.get_new_batch_prefill(self.running_batch)
+                    cur_batch = plan.batch_to_run
+                    self.running_batch = plan.running_batch
+                    cur_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
+                        cur_batch
+                    )
+                self.cur_batch_for_debug = cur_batch
+                # A real second input/metadata generation: do not install the
+                # next batch in the ring while its old CPU result is pending.
+                launch_metadata = list(self.mb_metadata)
+                if cur_batch:
+                    if pending is not None:
+                        old_reqs = {id(req) for req in pending.batch.reqs}
+                        if any(id(req) in old_reqs for req in cur_batch.reqs):
+                            raise RuntimeError("PP B2: next input shares a pending Req")
+                    server_is_idle = False
+                    pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                self._pp_commit_proxy_send_work()
+                if cur_batch:
+                    if self.enable_staging:
+                        self.maybe_prefetch_staging_for_batch(cur_batch)
+                    result, self.launch_event = self._pp_launch_batch(
+                        mb_id, cur_batch, pp_proxy_tensors,
+                        launch_metadata, self.last_rank_comm_queue,
+                    )
+                if pending is not None:
+                    # If there is no next forward (idle/pause), drain here.
+                    self._pp_b2_commit_result(pending, generations)
+                    pending = None
+                self.mbs[mb_id] = cur_batch
+                self.running_mbs[mb_id] = self.running_batch
+                self.mb_metadata[mb_id] = (
+                    launch_metadata[mb_id] if cur_batch else None
+                )
+                generations[mb_id] += 1
+                next_pp_outputs, next_batch_result, d2h_event = (
+                    self._pp_commit_send_output_work_and_preprocess_output_tensors(
+                        mb_id, next_mb_id,
+                    )
+                )
+                send_release_work, release_rids = (
+                    self._pp_pd_send_consensus_release_ids(
+                        tmbs, mb_id, release_rids, transferred_rids
+                    )
+                )
+                if tmbs[next_mb_id] is not None:
+                    next_release_rids = self._pp_recv_pyobj_from_prev_stage()
+                self._pp_commit_comm_work(send_release_work)
+                old_batch = self.mbs[next_mb_id]
+                if old_batch is not None:
+                    owner = PPDeferredPrefillResult(
+                        next_mb_id, generations[next_mb_id], old_batch,
+                        self.mb_metadata[next_mb_id], next_batch_result, d2h_event,
+                        tmbs[next_mb_id] is not None, next_release_rids,
+                    )
+                    if old_batch.chunked_req is None and self.chunked_req is None:
+                        pending = owner
+                    else:
+                        self._pp_b2_commit_result(owner, generations)
+                elif tmbs[next_mb_id] is not None:
+                    self.process_disagg_prefill_transfer_queue(next_release_rids)
+                if not self.pp_group.is_last_rank:
+                    self.send_req_work = self._pp_send_reqs_to_next_stage(recv_reqs)
+                    send_transfer_work = self._pp_send_pyobj_to_next_stage(
+                        transferred_rids, async_send=True
+                    )
+                    if cur_batch:
+                        self._pp_send_proxy_to_next_stage(result)
+                self.pp_outputs = next_pp_outputs
+                release_rids = next_release_rids
+                self.running_batch.batch_is_full = False
+                self.invariant_checker.run(CheckPhase.BUSY, cur_batch)
+            if server_is_idle and pending is None:
                 self._sched_idled = True
                 if len(self.disagg_prefill_transfer_queue) == 0:
                     self.on_idle()
