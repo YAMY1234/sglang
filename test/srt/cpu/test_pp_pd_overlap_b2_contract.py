@@ -39,6 +39,7 @@ class Batch:
         self.frame = frame
         self.reqs = [types.SimpleNamespace(rid=f'r{frame}')]
         self.chunked_req = self.reqs[0] if chunk else None
+        self.contains_last_prefill_chunk = not chunk
         self.batch_is_full = False
         self.spec_info = object()
         self.next_draft_input = self.spec_info
@@ -120,7 +121,7 @@ class Contracts(unittest.TestCase):
             processed = [x[1] for x in e.trace if x[0] == 'process']
             deferred = [f for f in processed if not (chunks and f % 5 == 0)]
             launched = {x[1] for x in e.trace if x[0] == 'launch'}
-            self.assertEqual(e._pp_b2_result_counts, [
+            self.assertEqual(e._pp_b2_result_counts[:3], [
                 len(processed), len(deferred),
                 sum(f + 4 in launched for f in deferred),
             ])
@@ -132,7 +133,34 @@ class Contracts(unittest.TestCase):
                 )
         e = type('Engine', (OneBatch, NEW_NS['Loop']), {})(0)
         with self.assertRaises(Done): e.event_loop_pp_disagg_prefill_overlap_b2()
-        self.assertEqual(e._pp_b2_result_counts, [1, 1, 0])
+        self.assertEqual(e._pp_b2_result_counts, [1, 1, 0, 0, 0, 0])
+
+    def test_skip_reasons_partition_non_deferred_results(self):
+        for mixed in [False, True]:
+            class ChunkFake(Fake):
+                def get_new_batch_prefill(self, running):
+                    plan = super().get_new_batch_prefill(running)
+                    if plan.batch_to_run and mixed:
+                        plan.batch_to_run.contains_last_prefill_chunk = True
+                    return plan
+            e = type('Engine', (ChunkFake, NEW_NS['Loop']), {})(0, chunks=True)
+            with self.assertRaises(Done): e.event_loop_pp_disagg_prefill_overlap_b2()
+            total, deferred, _, shared, nonfinal, other = e._pp_b2_result_counts
+            self.assertEqual(shared + nonfinal + other, total - deferred)
+            self.assertGreater(shared if mixed else nonfinal, 0)
+            self.assertEqual(nonfinal if mixed else shared, 0)
+            self.assertEqual(other, 0)
+
+    def test_global_chunk_guard_is_shared_not_nonfinal(self):
+        class GlobalChunkFake(Fake):
+            def get_new_batch_prefill(self, running):
+                self.chunked_req = object()
+                return super().get_new_batch_prefill(running)
+        e = type('Engine', (GlobalChunkFake, NEW_NS['Loop']), {})(0)
+        with self.assertRaises(Done): e.event_loop_pp_disagg_prefill_overlap_b2()
+        total, deferred, post, shared, nonfinal, other = e._pp_b2_result_counts
+        self.assertGreater(total, 0)
+        self.assertEqual([deferred, post, shared, nonfinal, other], [0, 0, total, 0, 0])
 
     def test_off_original_body_bytes(self):
         def body(s):

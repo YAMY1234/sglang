@@ -391,7 +391,8 @@ class SchedulerPPMixin:
                     self.on_idle()
 
     def _pp_b2_commit_result(
-        self: Scheduler, pending, generations, *, deferred=False, post_launch=False
+        self: Scheduler, pending, generations, *, deferred=False, post_launch=False,
+        skip_reason=None
     ):
         # Keep the old ring entry and metadata intact until its CPU consumer
         # retires. The new forward uses its own metadata list in the meantime.
@@ -413,13 +414,16 @@ class SchedulerPPMixin:
         counts[0] += 1
         counts[1] += int(deferred)
         counts[2] += int(post_launch)
+        if not deferred:
+            counts[{"shared_chunk": 3, "non_final_prefill": 4}.get(skip_reason, 5)] += 1
         if (
             counts[0] % self._pp_b2_counter_interval == 0
             or first_deferred
             or first_post_launch
         ):
             logger.info(
-                "PP PD B2 result counts: total=%d deferred=%d post_launch=%d",
+                "PP PD B2 result counts: total=%d deferred=%d post_launch=%d "
+                "shared_chunk=%d non_final_prefill=%d other=%d",
                 *counts,
             )
 
@@ -446,7 +450,7 @@ class SchedulerPPMixin:
         generations = [0] * self.pp_loop_size
         pending = None
         reported_post_launch_commit = False
-        self._pp_b2_result_counts = [0, 0, 0]
+        self._pp_b2_result_counts = [0, 0, 0, 0, 0, 0]
         self._pp_b2_counter_interval = max(
             1, int(os.environ.get("SGLANG_PP_PD_OVERLAP_B2_COUNTER_INTERVAL", "128"))
         )
@@ -549,7 +553,17 @@ class SchedulerPPMixin:
                     if old_batch.chunked_req is None and self.chunked_req is None:
                         pending = owner
                     else:
-                        self._pp_b2_commit_result(owner, generations)
+                        # Pure continuation batches have no final-prefill
+                        # request. Mixed/final batches still blocked by a chunk
+                        # marker belong to the shared-chunk guard category.
+                        skip_reason = (
+                            "non_final_prefill"
+                            if not old_batch.contains_last_prefill_chunk
+                            else "shared_chunk"
+                        )
+                        self._pp_b2_commit_result(
+                            owner, generations, skip_reason=skip_reason
+                        )
                 elif tmbs[next_mb_id] is not None:
                     self.process_disagg_prefill_transfer_queue(next_release_rids)
                 if not self.pp_group.is_last_rank:
