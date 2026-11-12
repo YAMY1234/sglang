@@ -3190,9 +3190,9 @@ class UnifiedRadixCache(BasePrefixCache):
         fetched_hashes = hash_value[: completed_tokens // self.page_size]
         self.storage_existence_cache.pool(PoolName.KV).add(fetched_hashes)
         # Sidecars keyed by the KV chain came back with it (all-or-nothing checked above).
-        for transfer in operation.pool_transfers or ():
-            if transfer.indices_from_pool == PoolName.KV:
-                self.storage_existence_cache.pool(transfer.name).add(fetched_hashes)
+        for spec in self.sidecar_pool_specs:
+            if spec.indices_from_pool == PoolName.KV:
+                self.storage_existence_cache.pool(spec.pool_name).add(fetched_hashes)
 
         if insert_result.host_insert_dropped:
             self._resolve_storage_prefetch_tokens(request, insert_result.prefix_len)
