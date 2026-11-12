@@ -67,6 +67,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_hip,
     is_npu,
+    print_info_once,
     support_triton,
 )
 from sglang.srt.utils.common import ceil_align
@@ -324,7 +325,10 @@ def prefill_graph_tolerates_sum_len() -> bool:
 
     if not get_moe_a2a_backend().is_megamoe():
         return False
-    if get_flags().dp.prefill_graph_has_dp_gather:
+    if (
+        get_flags().dp.prefill_graph_has_dp_gather
+        or envs.SGLANG_MEGAMOE_PREFILL_GRAPH_SHARED_BUCKET.get()
+    ):
         return False
     return not (is_dsa_enable_prefill_cp() or is_mla_cp_enabled())
 
@@ -1785,6 +1789,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 size for size in prefill_cg.bs if size >= max(global_num_tokens)
             )
             global_num_tokens = [bucket] * sync_group_size
+            if envs.SGLANG_MEGAMOE_PREFILL_GRAPH_SHARED_BUCKET.get():
+                print_info_once(
+                    "SGLANG_MEGAMOE_PREFILL_GRAPH_SHARED_BUCKET: prefill-graph steps "
+                    "replay one shared bucket on every DP rank (logged once)"
+                )
         if self.dp_spec_prefill_coordination_applied:
             # Preserve each rank's forward mode on coordinated steps.
             dp_padding_mode = DpPaddingMode.SUM_LEN

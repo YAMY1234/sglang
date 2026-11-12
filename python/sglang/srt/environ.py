@@ -1615,6 +1615,10 @@ class Envs:
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
     SGLANG_OPT_DEEPGEMM_MEGA_GATE = EnvBool(False)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE = EnvBool(False)
+    # Prefill-graph steps under DP attention replay one shared MAX_LEN bucket on
+    # every rank, idle ranks a fabricated extend, instead of per-rank buckets
+    # with an eager idle forward that MegaMoE's grid sync makes every rank wait for.
+    SGLANG_MEGAMOE_PREFILL_GRAPH_SHARED_BUCKET = EnvBool(False)
 
     # ===================================================================
     # Top-k kernels
