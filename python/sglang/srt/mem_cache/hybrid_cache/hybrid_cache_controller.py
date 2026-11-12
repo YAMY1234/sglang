@@ -1983,9 +1983,9 @@ class HybridCacheController(BaseHiCacheController):
         if transfer.name == PoolName.MAMBA:
             return True
 
-        # Mooncake gives MHA draft and draft-SWA objects rank-specific keys.
-        # MLA/DeepSeek-V4 draft pools remain TP0-only.
-        if self.storage_backend_type == "mooncake" and transfer.name in (
+        # Mooncake's key layout (nixl_dram reuses it) gives MHA draft and draft-SWA
+        # objects rank-specific keys. MLA/DeepSeek-V4 draft pools remain TP0-only.
+        if self.storage_backend_type in ("mooncake", "nixl_dram") and transfer.name in (
             PoolName.DRAFT,
             PoolName.DRAFT_SWA,
         ):

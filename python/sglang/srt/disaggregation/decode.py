@@ -876,6 +876,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         kv_args.ib_device = get_disagg().disaggregation_ib_device
         kv_args.gpu_id = get_device().gpu_id
+        if self.transfer_backend == TransferBackend.MOONCAKE:
+            from sglang.srt.disaggregation.nvfp4_pd import bind_destination
+            if get_parallel().attn_cp_size == 1 and get_parallel().attn_dcp_size == 1:
+                models = [self.scheduler.tp_worker.model_runner.model]
+                if self.scheduler.draft_worker is not None:
+                    models.extend(runner.model for runner in self.scheduler.draft_worker._draft_model_runners())
+                bind_destination(kv_args, self.token_to_kv_pool, self.draft_token_to_kv_pool,
+                                 self.scheduler.model_config.num_hidden_layers, models)
+
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
             kv_args,

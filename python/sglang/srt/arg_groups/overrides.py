@@ -538,7 +538,8 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
     assert kv_cache_dtype in [
         "bfloat16",
         "fp8_e4m3",
-    ], "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype"
+        "nvfp4",
+    ], "DeepSeek DSA only supports bf16/bfloat16, fp8_e4m3, or nvfp4 kv_cache_dtype"
     if kv_cache_dtype != view.kv_cache_dtype:
         return {"kv_cache_dtype": kv_cache_dtype}
     return {}
@@ -570,6 +571,15 @@ def _check_dsa_backend_constraints(
                 f"The {'/'.join(sorted(no_dcp_path))} DSA backend has no DCP path "
                 "on ROCm; use --dsa-prefill-backend triton --dsa-decode-backend "
                 "triton with --dcp-size > 1."
+            )
+
+    if kv_cache_dtype == "nvfp4":
+        unsupported = {backend for backend in chosen if backend not in (None, "trtllm")}
+        if hip or unsupported:
+            raise ValueError(
+                "NVFP4 DSA KV cache currently requires CUDA and the trtllm "
+                "backend for both prefill and decode; got "
+                f"prefill={prefill_backend}, decode={decode_backend}."
             )
 
     if hip or kv_cache_dtype != "fp8_e4m3" or "tilelang" not in chosen:
@@ -640,6 +650,35 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         return _kimi_k31_dsa_backends(view)
 
     kv_cache_dtype = view.kv_cache_dtype
+    if kv_cache_dtype == "nvfp4":
+        unsupported_modes = []
+        for enabled, option in (
+            (getattr(view, "dcp_size", 1) > 1, "--dcp-size > 1"),
+            (getattr(view, "enable_prefill_cp", False), "--enable-prefill-cp"),
+            (getattr(view, "attn_cp_size", 1) > 1, "--attn-cp-size > 1"),
+            (getattr(view, "enable_hisparse", False), "--enable-hisparse"),
+            (
+                getattr(view, "enable_dsa_cache_layer_split", False),
+                "--enable-dsa-cache-layer-split",
+            ),
+            (
+                getattr(view, "enable_unified_memory", False),
+                "--enable-unified-memory",
+            ),
+            (
+                getattr(view, "enable_unified_cache_external_linker", False),
+                "--enable-unified-cache-external-linker",
+            ),
+            (getattr(view, "enable_lmcache", False), "--enable-lmcache"),
+            (getattr(view, "enable_flexkv", False), "--enable-flexkv"),
+        ):
+            if enabled:
+                unsupported_modes.append(option)
+        if unsupported_modes:
+            raise ValueError(
+                "NVFP4 DSA does not yet support: " + ", ".join(unsupported_modes)
+            )
+
     user_set_prefill = view.dsa_prefill_backend is not None
     user_set_decode = view.dsa_decode_backend is not None
     declared: Dict[str, Any] = {}
@@ -717,8 +756,13 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
             declared["dsa_prefill_backend"] = "triton"
         if not user_set_decode:
             declared["dsa_decode_backend"] = "triton"
-    elif kv_cache_dtype == "fp8_e4m3":
-        # Blackwell FP8 defaults to trtllm; Hopper FP8 to flashmla_kv.
+    elif kv_cache_dtype in ("fp8_e4m3", "nvfp4"):
+        if kv_cache_dtype == "nvfp4" and major != 10:
+            raise ValueError(
+                "The NVFP4 DSA KV cache path requires an SM10x GPU for the "
+                "TRTLLM-GEN sparse MLA kernel."
+            )
+        # Blackwell FP8/NVFP4 defaults to trtllm; Hopper FP8 to flashmla_kv.
         default = "trtllm" if major >= 10 else "flashmla_kv"
         if not user_set_prefill:
             declared["dsa_prefill_backend"] = default
