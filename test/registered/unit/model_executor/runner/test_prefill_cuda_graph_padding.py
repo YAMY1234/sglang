@@ -256,6 +256,33 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
                 )
             )
 
+    def test_megamoe_shared_bucket_env_forces_shared_bucket(self):
+        """With SGLANG_MEGAMOE_PREFILL_GRAPH_SHARED_BUCKET every rank replays one
+        MAX_LEN bucket: a padded step replays everywhere, an unpadded sparse one
+        (too large for the graphs) stays eager on every rank."""
+        runner = self._make_runner()
+        flags, a2a, dsa_cp, mla_cp = self._megamoe_no_prefill_cp()
+        with (
+            flags,
+            a2a,
+            dsa_cp,
+            mla_cp,
+            forward_batch_info.envs.SGLANG_MEGAMOE_PREFILL_GRAPH_SHARED_BUCKET.override(
+                True
+            ),
+        ):
+            self.assertFalse(prefill_graph_tolerates_sum_len())
+            self.assertFalse(
+                runner._has_inactive_dp_rank(
+                    SimpleNamespace(global_num_tokens_cpu=[16, 16])
+                )
+            )
+            self.assertTrue(
+                runner._has_inactive_dp_rank(
+                    SimpleNamespace(global_num_tokens_cpu=[8, 0])
+                )
+            )
+
     def test_rejects_context_above_fixed_maximum(self):
         runner = self._make_runner()
         runner.max_context_size = 700
