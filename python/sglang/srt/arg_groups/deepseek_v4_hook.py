@@ -134,9 +134,10 @@ def _resolve_engram_config(server_args: ServerArgs) -> None:
                 f"columns to divide over --tp-size {cfg.tp_size}."
             )
     # One mapping per TP group, which its ranks open through /proc.
-    if config.replication == EngramReplication.PER_NODE and cfg.nnodes > 1:
+    if config.replication in EngramReplication.WHOLE_TABLE and cfg.nnodes > 1:
         raise ValueError(
-            "--engram-config: replication 'per_node' needs the TP group on one node."
+            f"--engram-config: replication {config.replication!r} needs the TP group "
+            "on one node."
         )
     declare_resolution(server_args, "_resolve_engram_config", engram_config=config)
     logger.info("DeepSeek-V4.1 Engram tables: %s", config)
