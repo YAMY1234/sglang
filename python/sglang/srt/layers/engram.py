@@ -905,11 +905,11 @@ class _NodeSharedHostTable:
 
     replication = EngramReplication.NODE_SHARED
 
-    def __init__(self, nbytes: int, name: str, group, numa: int):
+    def __init__(self, nbytes: int, name: str, numa: int):
         from sglang.srt.utils import cuda_vmm_utils as vmm
 
         drv = vmm._get_cuda_driver()
-        self.nbytes, self.group, self.dirty = nbytes, group, False
+        self.nbytes, self.dirty = nbytes, False
         device = torch.cuda.current_device()
         prop = drv.CUmemAllocationProp()
         prop.type = drv.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
@@ -935,14 +935,10 @@ class _NodeSharedHostTable:
                 "cuMemExportToShareableHandle",
             )
 
-        # Rank 0 settles who builds before its peers attach, so a peer never builds.
-        self.node, owner = None, None
-        if group.rank_in_group == 0:
-            self.node = NodeTable(address, self.size, name, create_fd)
-            owner = (self.node.built_here, self.node.owner_pid)
-        self.writes_rows, self.owner_pid = group.broadcast_object(owner, src=0)
-        if self.node is None:
-            self.node = NodeTable(address, self.size, name, None)
+        # Every process meets its own socket's table: TP peers may sit on another
+        # socket, so the builder writes every row itself (EngramEmbedding._load_rows).
+        self.node = NodeTable(address, self.size, name, create_fd)
+        self.writes_rows, self.owner_pid = self.node.built_here, self.node.owner_pid
         handle = (
             created[0]
             if created
@@ -998,12 +994,10 @@ class _NodeSharedHostTable:
             return
         self.dirty = False
         t0 = time.perf_counter()
-        if not self.writes_rows:
-            self.node.wait_ready()
-        if self.group.world_size > 1:
-            self.group.barrier()
-        if self.writes_rows and self.node.built_here:
+        if self.writes_rows:
             self.node.publish()
+        else:
+            self.node.wait_ready()
         logger.info(
             "engram host table %s: replication=node_shared (%s), %.0f MiB, "
             "GPU-mapped at %d MiB pages%s",
@@ -1465,7 +1459,7 @@ class EngramEmbedding(nn.Module):
             else:
                 nodes = _host_numa_nodes()
                 numa = nodes[layer_id % len(nodes)] if nodes else -1
-            self.host_table = _NodeSharedHostTable(w_bytes + s_bytes, name, group, numa)
+            self.host_table = _NodeSharedHostTable(w_bytes + s_bytes, name, numa)
         else:
             self.host_table = _HostTable(
                 replication,
@@ -1510,7 +1504,15 @@ class EngramEmbedding(nn.Module):
         return self._host_table_ptrs
 
     def _load_rows(self, param: nn.Parameter, loaded_weight: torch.Tensor):
-        rows = slice(self.row_start, self.row_start + self.rows)
+        node_shared = self.host_table is not None and (
+            self.host_table.replication == EngramReplication.NODE_SHARED
+        )
+        # A node-shared table's builder writes every row; its readers write none.
+        rows = (
+            slice(None)
+            if node_shared
+            else slice(self.row_start, self.row_start + self.rows)
+        )
         dst = param.data[rows] if self._shared else param.data
         src = loaded_weight[rows]
         # uint8 on either side is an MXFP4 table.
@@ -1522,10 +1524,8 @@ class EngramEmbedding(nn.Module):
         )
         if self.host_table is not None:
             self.host_table.dirty = True
-            if self.host_table.replication == EngramReplication.NODE_SHARED and (
-                not self.host_table.writes_rows
-            ):
-                return  # another server on this node fills the node-shared table
+            if node_shared and not self.host_table.writes_rows:
+                return
         dst.copy_(src)
 
     def finish_load(self, label: str):
