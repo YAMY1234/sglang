@@ -23,6 +23,7 @@ from _fakes import (  # noqa: E402
     DRAFT,
     ISA,
     SPEC,
+    FakeBuilt,
     Lm,
     batch,
     server_args,
@@ -341,6 +342,51 @@ class TestMegakernelRuntime(CustomTestCase):
         self.assertIsInstance(lm.context.binding, OtherBinding)
         self.assertIs(lm.context.binding.model, lm)
 
+    def test_a_spec_that_names_its_binding_gets_it_whatever_its_architecture(self):
+        with (
+            patch.dict(binding._BINDINGS, {ARCH: OtherBinding}),
+            patch.object(binding, "BINDING_KINDS", {"other": Mock}),
+        ):
+            lm = self._install_spec(replace(SPEC, binding="other"), tokens=1)
+        self.assertIsInstance(lm.context.binding, Mock)
+        self.assertIs(
+            binding._binding_class([ARCH], kind="eagle_hybrid"),
+            binding.BINDING_KINDS["eagle_hybrid"],
+        )
+        # an unknown kind is refused on every rank before build
+        with self.assertRaisesRegex(ValueError, "binding 'nope' is not one of"):
+            self._install_spec(replace(SPEC, binding="nope"), tokens=1)
+
+    def test_a_build_keeping_its_own_state_is_wired_to_the_state_storage(self):
+        """Its sizing and capabilities reach SGLang through the state storage, set
+        when the build is prepared; a build without them leaves the storage alone."""
+        from sglang.srt.mem_cache.kv.state_storage import StateStorage
+
+        class OwnStateBuilt(FakeBuilt):
+            state_bytes_per_slot = 64
+            keeps_draft_ssm = False
+            tracks_decode_state = False
+            backs_up_state = False
+
+            def reset_state_slots(self, slots, request_rows):
+                pass
+
+        own = replace(SPEC, build=lambda m, hf, ctx: OwnStateBuilt(ctx.widths))
+        for spec, keeps_own_state in ((SPEC, False), (own, True)):
+            with self.subTest(keeps_own_state=keeps_own_state):
+                lm = self._install_spec(spec, tokens=1)
+                built = binding.built_megakernel(lm)
+                state = StateStorage.empty("state")
+                runner = SimpleNamespace(
+                    model=lm, token_to_kv_pool_allocator=SimpleNamespace(state=state)
+                )
+                binding.prepare_megakernel(runner)
+                expected = built if keeps_own_state else None
+                self.assertIs(binding.megakernel_state(lm), expected)
+                self.assertIs(state.own_state, expected)
+                self.assertEqual(state.tracks_decode_state, not keeps_own_state)
+                self.assertEqual(state.backs_up_state, not keeps_own_state)
+
     def test_offered_entries_reach_sglang_only_when_every_rank_offers_them(self):
         registry.register(architecture="EagleDraft", path="_fakes:EAGLE_DRAFT")
         lm = install(archs=["EagleDraft"], is_draft=True)
@@ -505,6 +551,35 @@ class TestMegakernelRuntime(CustomTestCase):
         self.assertEqual(ran_step.view, "pview")
         MegakernelBinding.forward_view.assert_not_called()
         MegakernelBinding.seal_capture_view.assert_not_called()
+
+    def test_a_draft_extend_step_gets_the_captured_forward_view(self):
+        from sglang.kernels.plugin_kernels.nvidia.spec import Step
+
+        built = SimpleNamespace(
+            widths=(4,),
+            draft_sampler=None,
+            draft_loop=None,
+            draft_extend=None,
+            begin_draft_round=None,
+            graph_variants=None,
+            summary=lambda: "draft-extend-fake",
+            plan=lambda ids, fb, *a, **kw: Step(mode="draft_extend", rows=4),
+            forward=lambda step, orig, *a, **kw: step,
+        )
+        lm = self._install_spec(
+            replace(SPEC, build=lambda m, hf, ctx: built), tokens=1, is_draft=True
+        )
+        forward_batch = batch(4)
+        with (
+            patch.object(MegakernelBinding, "prefill_view") as prefill_view,
+            patch.object(torch.cuda, "is_current_stream_capturing", return_value=True),
+        ):
+            ran = lm(forward_batch.input_ids, None, forward_batch)
+        self.assertEqual((ran.mode, ran.view), ("draft_extend", "view"))
+        prefill_view.assert_not_called()
+        MegakernelBinding.seal_capture_view.assert_called_once_with(
+            forward_batch, "view"
+        )
 
     def test_decode_step_does_not_call_prefill_view(self):
         """A decode step must call forward_view(forward_batch) and not prefill_view."""

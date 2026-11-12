@@ -103,6 +103,8 @@ class Step(msgspec.Struct, frozen=True):
     mode is one of:
       "decode"        – autoregressive single-token decode; runs in a CUDA graph.
       "target_verify" – speculative-decoding target verify; runs in a CUDA graph.
+      "draft_extend"  – a draft model's extend over the verified rows; runs in a
+                        CUDA graph and gets the same view as "target_verify".
       "prefill"       – context prefill; runs eagerly (never captured in a graph).
     """
 
@@ -492,14 +494,68 @@ class SupportsDraftEmbed(Protocol):
     def attach_draft_embed(self, **kwargs: Any) -> None: ...
 
 
-@runtime_checkable
-class SupportsKdaCommit(Protocol):
-    """A target spec that commits the KDA state after a chain verify in one launch.
+class RecurrentCommitIO(msgspec.Struct, frozen=True):
+    """One chain verify's accepted recurrent state to commit, per request row."""
 
-    kda_commit returns False, launching nothing, when off; SGLang then commits itself.
+    # [bs] the verify forward's resolved state slots (the request table may already
+    # name other slots), and its prefix-cache checkpoint slots when it tracks
+    state_slots: torch.Tensor
+    track_slots: Optional[torch.Tensor]
+    request_rows: torch.Tensor  # [bs] request-table rows
+    accept_lens: torch.Tensor  # [bs] accepted tokens, including the bonus token
+    last_step: torch.Tensor  # [bs] the last accepted step
+    # [bs] the step whose state each tracked request checkpoints, when it tracks
+    track_steps: Optional[torch.Tensor]
+    draft_token_num: int  # verify rows per request
+    # [bs] the rows the verify wrote its per-step state at, when pipeline-stable
+    # rows keep them per request rather than per batch row
+    src_indices_raw: Optional[torch.Tensor]
+
+
+@runtime_checkable
+class SupportsStateSlotReset(Protocol):
+    """A target build that keeps recurrent state of its own beside SGLang's
+    linear-attention state pool (a verify's ring of records and its cursors, for one),
+    by state slot or by request row, and allocates it in its prepare.
+
+    SGLang charges state_bytes_per_slot to the state budget when it sizes the pool.
+    With keeps_draft_ssm False it allocates no per-draft SSM scratch: the build then
+    covers every target verify and commits it (SupportsRecurrentCommit).
+
+    reset_state_slots(slots, request_rows) empties that state for requests whose
+    checkpoint SGLang has just written or bound: before each target extend reads the
+    pool, on the forward stream, and for state slots newly bound to requests (a PD
+    decode slot runs no extend before its first verify). slots are physical state
+    slots, request_rows the requests' rows, one of each per request. No collective.
+
+    tracks_decode_state False: between commits the checkpoint lags the build's state
+    and its commit writes no decode-time checkpoints, so SGLang caches only the states
+    an extend writes. backs_up_state False: a host backup of a slot would miss the
+    build's state, so SGLang aborts a retracted request instead of backing it up.
     """
 
-    def kda_commit(self, **kwargs: Any) -> bool: ...
+    state_bytes_per_slot: int
+    keeps_draft_ssm: bool
+    tracks_decode_state: bool
+    backs_up_state: bool
+
+    def reset_state_slots(
+        self, slots: torch.Tensor, request_rows: torch.Tensor
+    ) -> None: ...
+
+
+@runtime_checkable
+class SupportsRecurrentCommit(Protocol):
+    """A target build that commits the recurrent state of a chain verify itself.
+
+    SGLang calls commit_recurrent_state after each target verify, where it would
+    commit the state of the linear-attention layers. It launches the commit on the
+    current stream, capturable, with no collective and no allocation, and returns
+    True; SGLang then commits only the side states it keeps per request (PLE).
+    False launches nothing, and SGLang commits as without it.
+    """
+
+    def commit_recurrent_state(self, io: RecurrentCommitIO) -> bool: ...
 
 
 @runtime_checkable
@@ -579,6 +635,9 @@ class MegakernelSpec(msgspec.Struct, frozen=True):
     tensor_verify_build: Optional[Callable[[Any, float], BuiltMegakernel]] = None
     # Pool preparation after allocation and before any forward or graph capture.
     prepare: Optional[Callable[[BuiltMegakernel, PreparationView], None]] = None
+    # The binding kind SGLang hands build and forward (BINDING_KINDS in
+    # sglang.srt.kernel_plugins.nvidia.binding); empty picks it by architecture.
+    binding: str = ""
 
 
 # HF architecture -> the "module:attribute" path of its spec
