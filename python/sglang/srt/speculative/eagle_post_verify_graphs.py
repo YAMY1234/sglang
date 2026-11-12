@@ -20,6 +20,7 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardStateSlots
 from sglang.srt.speculative import staged_next_draft
+from sglang.srt.speculative import post_verify_late_join, staged_next_draft
 from sglang.srt.speculative.eagle_worker_common import (
     STOCK_SPECULATIVE_RUNTIME_HOOKS,
     make_post_verify_io,
@@ -510,7 +511,9 @@ class _PostVerifyGraphs:
             if state.warmups < _NUM_WARMUP * 2:
                 state.warmups += 1
                 outputs = self._body(slot)
-                self._commit(slot, outputs)
+                # The side tiling compiles here, never inside a capture.
+                with post_verify_late_join.side_commit_tiling():
+                    self._commit(slot, outputs)
                 return outputs[:6]
             self._capture(slot)
         slot.graph.replay()
@@ -629,11 +632,14 @@ class _PostVerifyGraphs:
         # Captured after the main graph in the same pool and replayed after it.
         commit_graph = torch.cuda.CUDAGraph()
         self._side_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.graph(
-            commit_graph,
-            pool=self._pool,
-            stream=self._side_stream,
-            capture_error_mode="thread_local",
+        with (
+            torch.cuda.graph(
+                commit_graph,
+                pool=self._pool,
+                stream=self._side_stream,
+                capture_error_mode="thread_local",
+            ),
+            post_verify_late_join.side_commit_tiling(),
         ):
             self._commit(slot, outputs)
         torch.cuda.current_stream().wait_stream(self._side_stream)
