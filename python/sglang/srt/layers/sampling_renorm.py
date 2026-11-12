@@ -33,7 +33,7 @@ except ImportError:  # pragma: no cover - non-CUDA builds
 
 def _flashinfer_has_deterministic(name: str) -> bool:
     # top-p has had is_deterministic since 0.6.7; top-k only since
-    # flashinfer-ai/flashinfer#4831 (0.7.x). sglang pins 0.7.2, but a deployment
+    # flashinfer-ai/flashinfer#4831 (0.7.x; 0.7.2 and 0.7.3 have both). A deployment
     # on an older flashinfer must not fail at the first sampled request.
     if _flashinfer_sampling is None:
         return False

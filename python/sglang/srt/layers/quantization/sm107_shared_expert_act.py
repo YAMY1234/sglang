@@ -2,6 +2,9 @@
 # kernels/ops/gemm/dense_bf16_gemm_sm100_splitk_epilogue.py (Apache-2.0); this file has been modified.
 """Shared-expert act_and_mul in the SM107 gate_up split-K epilogue (default off).
 
+Not bitwise on FlashInfer 0.7.3: R37 job 12458's exhaustive pair test (test_every_finite_pair_bitwise) finds about
+2% of finite (gate, up) pairs differ from the stock pair there, which the load-time check does not catch. Keep it off.
+
 SGLANG_ENABLE_SM107_SHARED_EXPERT_FUSED_ACT=1, with the SM107 small-M routes on (sm107_bf16_smallm): at 1-16 rows the
 routes run the shared expert's gate_up (N 1280, K 2560) on FlashInfer 0.7.2's cluster split-K kernel at tactic
 (64, 8, 4, 5), and the stock SiluAndMul then launches the JIT act_and_mul kernel (kernels/jit/csrc/elementwise/

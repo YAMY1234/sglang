@@ -18,6 +18,6 @@ it the kernel takes the state indices in that parameter and never reads it).
 
 They are CuTe-DSL (nvidia-cutlass-dsl >= 4.8.0) and compile at first use; they import
 nothing from FlashInfer except, lazily on the uGPU path only, ``flashinfer.green_ctx``.
-``gdn_replayssm_ucache`` loads them on SM107 for images whose FlashInfer predates the
-Rubin build (0.7.2). Drop this package once the image's FlashInfer ships #6791.
+``gdn_replayssm_ucache`` always loads them on SM107: FlashInfer 0.7.2 and 0.7.3 have no
+Rubin build of this kernel. Drop this package once the image's FlashInfer ships #6791.
 """

@@ -11,7 +11,7 @@ as a cuBLAS split-K kernel plus a separate split-K reduce, or on a slower non-sp
   order); tactic ``(mma_m, mma_n, split_k, stages, cta_k)``.
 
 Every key was checked bit-equal to the stock dispatch on SM107 with cuBLAS 13.8 and FlashInfer 0.7.2, eagerly and
-under CUDA graph replay. The cluster routes install only against the vendored split-K source, and at load
+under CUDA graph replay; the load-time check below passes on FlashInfer 0.7.3 as well. The cluster routes install only against the vendored split-K source, and at load
 ``precompile`` checks every key once more against the live stock dispatch: a mismatch on either side turns the
 routes off, and until that check has run (it runs when a model calls ``precompile_splitk_tactics`` after loading,
 as Qwen4-Exp does) the routes are not served. Keys where no bit-equal single kernel beat stock keep the stock
