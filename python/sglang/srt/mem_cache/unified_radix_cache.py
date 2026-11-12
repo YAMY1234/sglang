@@ -379,7 +379,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self.insert_session_id: Optional[str] = None
         # Write-side dedupe: beliefs about what storage already holds, so
         # re-inserts of hot prefixes skip the redundant backup.
-        self.storage_existence_cache = StorageExistenceCache()
+        self.storage_existence_cache = StorageExistenceCache(
+            envs.SGLANG_HICACHE_EXISTENCE_CACHE_MAX_ENTRIES.get()
+        )
         # Cumulative prefetch-outcome counters, exported through the
         # log_storage_metrics flow.
         self._prefetch_outcome_stats: dict[str, float] = {
