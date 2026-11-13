@@ -510,6 +510,11 @@ class Envs:
     # parent_session_id and a Rust TreeCore built with the cache-residency bindings,
     # so it is opt-in).
     SGLANG_OPT_HICACHE_SUBAGENT_HOST_EVICT_FIRST = EnvRuntimeBool(False)
+    # Qwen4-Exp's pinned PLE host table on transparent huge pages (anonymous mapping,
+    # MADV_HUGEPAGE, cudaHostRegister) instead of cudaHostAlloc, so the gather's random 160 B
+    # rows are not bound by address translation; same bytes, cudaHostAlloc if a step fails.
+    # Opt-in: it needs THP available to the process. A's SGLANG_PLE_PINNED_HUGEPAGE.
+    SGLANG_OPT_PLE_PINNED_HUGEPAGE = EnvRuntimeBool(False)
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
