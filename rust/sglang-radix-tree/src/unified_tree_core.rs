@@ -2996,6 +2996,79 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.drive_host_eviction_with_options(component_type, num_tokens, false)
     }
 
+    /// Full host leaves in the order drive_host_eviction takes them, until their
+    /// tokens reach num_tokens, as (node id, tokens, page hashes); read-only. A
+    /// parent joins once all its children are taken, mirroring the leaf cascade.
+    /// Exclusive L2->L3 tiering writes these to storage ahead of host eviction.
+    pub fn peek_host_eviction_candidates(
+        &self,
+        component_type: ComponentType,
+        num_tokens: usize,
+    ) -> Vec<(NodeId, usize, Option<Vec<String>>)> {
+        if component_type != BASE_COMPONENT_TYPE
+            || self.try_component_by_type_(component_type).is_none()
+        {
+            return Vec::new();
+        }
+        let arena = &self.arena;
+        let strategy = &self.eviction_strategy;
+        let mut heap: BinaryHeap<Reverse<(PriorityKey, NodeIdx_)>> = self
+            .evictable_host_leaves
+            .iter()
+            .map(|id| Reverse((strategy.get_priority(arena.node(id)), id)))
+            .collect();
+        let mut children_left: HashMap<NodeIdx_, usize> = HashMap::new();
+        let mut out = Vec::new();
+        let mut covered = 0usize;
+        while covered < num_tokens {
+            let Some(Reverse((_, x))) = heap.pop() else {
+                break;
+            };
+            let node = arena.node(x);
+            let tokens = node.key.atom_len();
+            out.push((node.id, tokens, node.hash_value.clone()));
+            covered += tokens;
+            if let Some(p) = node.try_parent() {
+                let parent = arena.node(p);
+                let left = children_left.entry(p).or_insert(parent.children.len());
+                *left = left.saturating_sub(1);
+                if *left == 0 && self.is_host_leaf_once_childless_(parent) {
+                    heap.push(Reverse((strategy.get_priority(parent), p)));
+                }
+            }
+        }
+        out
+    }
+
+    /// The host leaves among the max_states coldest members of the Mamba host
+    /// LRU, in the order a Mamba host eviction meets them, as (node id, tokens,
+    /// page hashes); read-only. Such an eviction drops the whole leaf (its Full
+    /// pages too), so exclusive L2->L3 tiering writes these ahead of it.
+    pub fn peek_mamba_host_eviction_leaves(
+        &self,
+        max_states: usize,
+    ) -> Vec<(NodeId, usize, Option<Vec<String>>)> {
+        let mut out = Vec::new();
+        if self.try_component_by_type_(MAMBA).is_none() {
+            return out;
+        }
+        let lru = self.host_lru_list(MAMBA);
+        let mut x = lru.get_lru_no_lock(&self.arena);
+        let mut seen = 0usize;
+        while let Some(cur) = x {
+            if seen >= max_states || !lru.in_list(Some(cur)) {
+                break;
+            }
+            seen += 1;
+            if self.evictable_host_leaves.contains(cur) {
+                let node = self.arena.node(cur);
+                out.push((node.id, node.key.atom_len(), node.hash_value.clone()));
+            }
+            x = lru.get_prev_no_lock(cur, &self.arena);
+        }
+        out
+    }
+
     /// Skip Full duplicate reclaim when requested by the controller, while
     /// preserving the normal host-leaf eviction walk.
     pub fn drive_host_eviction_with_options(
@@ -3480,6 +3553,12 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
     /// Whether the node is an evictable Full host leaf.
     fn is_evictable_host_leaf_(&self, node: &Node<K>) -> bool {
+        self.is_host_leaf_once_childless_(node) && node.children.is_empty()
+    }
+
+    /// The H-leaf rule without the no-children clause: whether the node becomes
+    /// an evictable host leaf once its children are gone.
+    fn is_host_leaf_once_childless_(&self, node: &Node<K>) -> bool {
         if node.is_root() || !node.evicted() {
             return false;
         }
@@ -3495,9 +3574,6 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         // Segment locks count evicted nodes too: a device-locked candidate is
         // a live segment's anchor, and evict_host_leaf_ would delete it.
         if node.is_device_locked() {
-            return false;
-        }
-        if !node.children.is_empty() {
             return false;
         }
         true

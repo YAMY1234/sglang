@@ -2019,6 +2019,26 @@ macro_rules! tree_core_methods {
                 })
             }
 
+            /// Host leaves among the coldest Mamba host LRU members, read-only.
+            fn peek_mamba_host_eviction_leaves(
+                &self,
+                py: Python<'_>,
+                max_states: usize,
+            ) -> Vec<(NodeId, usize, Option<Vec<String>>)> {
+                py.detach(move || self.core().peek_mamba_host_eviction_leaves(max_states))
+            }
+
+            /// Full host leaves in drive_host_eviction's order, read-only.
+            fn peek_host_eviction_candidates(
+                &self,
+                py: Python<'_>,
+                component_type: u8,
+                num_tokens: usize,
+            ) -> PyResult<Vec<(NodeId, usize, Option<Vec<String>>)>> {
+                let ct = parse_component_type(component_type)?;
+                Ok(py.detach(move || self.core().peek_host_eviction_candidates(ct, num_tokens)))
+            }
+
             /// Evict up to num_tokens of one component's host resources.
             fn drive_host_eviction(
                 &self,
@@ -3393,6 +3413,30 @@ macro_rules! tree_core_binding {
             /// Release a node's device KV once its host copy exists.
             fn demote(&self, py: Python<'_>, node_id: NodeId) -> PyResult<DemoteResultBinding> {
                 catch_native_panic(|| self.inner.demote(py, node_id))
+            }
+
+            /// The host leaves among the max_states coldest Mamba host LRU members, in
+            /// Mamba host eviction order: [(node id, tokens, page hashes)]; read-only.
+            fn peek_mamba_host_eviction_leaves(
+                &self,
+                py: Python<'_>,
+                max_states: usize,
+            ) -> PyResult<Vec<(NodeId, usize, Option<Vec<String>>)>> {
+                catch_native_panic(|| Ok(self.inner.peek_mamba_host_eviction_leaves(py, max_states)))
+            }
+
+            /// Full host leaves in the order drive_host_eviction takes them, until
+            /// their tokens reach num_tokens: [(node id, tokens, page hashes)]; read-only.
+            fn peek_host_eviction_candidates(
+                &self,
+                py: Python<'_>,
+                component_type: u8,
+                num_tokens: usize,
+            ) -> PyResult<Vec<(NodeId, usize, Option<Vec<String>>)>> {
+                catch_native_panic(|| {
+                    self.inner
+                        .peek_host_eviction_candidates(py, component_type, num_tokens)
+                })
             }
 
             /// Evict up to num_tokens of one component's host resources.

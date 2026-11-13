@@ -2540,3 +2540,89 @@ fn release_after_a_restore_and_relock_keeps_the_other_lock() {
     assert_eq!(tc.evictable_size_(MAMBA), 1);
     assert_eq!(tc.protected_size_(MAMBA), 0);
 }
+
+/// Insert a one-page host-only node under `parent` (None: the root); returns its arena index.
+fn insert_host_page(
+    tc: &mut UnifiedTreeCore<Vec<i64>>,
+    parent: Option<NodeIdx_>,
+    token: i64,
+    slot: i64,
+) -> NodeIdx_ {
+    let parent_id = tc.arena.node(parent.unwrap_or_else(|| tc.arena.root())).id;
+    let id = tc
+        .insert_host(
+            parent_id,
+            /* extra_key = */ None,
+            vec![token],
+            Tensor::from_slice(&[slot]),
+            vec![format!("h{token}")],
+        )
+        .expect("live test node")
+        .inserted_host_node
+        .unwrap();
+    tc.arena.resolve(id).expect("live test node")
+}
+
+#[test]
+fn host_eviction_peeks_match_the_evictions() {
+    // Full: children first, then their newly eligible parent, in priority order.
+    for pages in [2usize, 3] {
+        let mut tc = mamba_core(/* page_size = */ 1);
+        tc.set_hicache_enabled();
+        let parent = insert_host_page(&mut tc, None, 1000, 100);
+        let child_a = insert_host_page(&mut tc, Some(parent), 2000, 101);
+        let child_b = insert_host_page(&mut tc, Some(parent), 3000, 102);
+        let other = insert_host_page(&mut tc, None, 4000, 103);
+        for (age, node) in [parent, child_a, child_b, other].into_iter().enumerate() {
+            tc.arena.node_mut(node).last_access_counter = age as i64;
+        }
+        let order: Vec<NodeId> =
+            [child_a, child_b, parent, other].iter().map(|&n| tc.arena.node(n).id).collect();
+        let peeked = tc.peek_host_eviction_candidates(FULL, pages);
+        assert_eq!(peeked.iter().map(|c| c.0).collect::<Vec<_>>(), order[..pages].to_vec());
+        assert!(peeked.iter().all(|c| c.1 == 1 && c.2.as_ref().is_some_and(|h| h.len() == 1)));
+        assert!(tc.peek_host_eviction_candidates(MAMBA, pages).is_empty());
+        let result = tc.drive_host_eviction(FULL, pages);
+        assert_eq!(result.tracker[&FULL], pages);
+        for id in &order[..pages] {
+            assert!(tc.arena.resolve(*id).is_err());
+        }
+        for id in &order[pages..] {
+            assert!(tc.arena.resolve(*id).is_ok());
+        }
+    }
+
+    // Mamba: only the host leaves among the coldest host-LRU members, coldest first.
+    let mut tc = mamba_core(/* page_size = */ 1);
+    tc.set_hicache_enabled();
+    let inner = insert_host_page(&mut tc, None, 1000, 100);
+    let _child = insert_host_page(&mut tc, Some(inner), 2000, 101);
+    let leaf_a = insert_host_page(&mut tc, None, 3000, 102);
+    let leaf_b = insert_host_page(&mut tc, None, 4000, 103);
+    for (node, slot) in [(inner, 8), (leaf_a, 9), (leaf_b, 10)] {
+        set_mamba_host(&mut tc, node, slot);
+        tc.host_lru_list_mut(MAMBA).insert_mru(node);
+    }
+    let ids = |nodes: &[NodeIdx_], tc: &UnifiedTreeCore<Vec<i64>>| -> Vec<NodeId> {
+        nodes.iter().map(|&n| tc.arena.node(n).id).collect()
+    };
+    let peek = |tc: &UnifiedTreeCore<Vec<i64>>, n| -> Vec<NodeId> {
+        tc.peek_mamba_host_eviction_leaves(n).iter().map(|c| c.0).collect()
+    };
+    assert_eq!(peek(&tc, 1), Vec::<NodeId>::new());
+    assert_eq!(peek(&tc, 2), ids(&[leaf_a], &tc));
+    assert_eq!(peek(&tc, 3), ids(&[leaf_a, leaf_b], &tc));
+    // The Mamba drive then takes leaf_a whole: the peek named a node whose Full pages leave too.
+    let leaf_a_id = tc.arena.node(leaf_a).id;
+    let mut tracker = HashMap::from([(MAMBA, 0)]);
+    mamba_component().drive_host_eviction(
+        &mut tc,
+        /* num_tokens = */ 2,
+        &mut tracker,
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+        &mut Vec::new(),
+    );
+    assert!(tc.arena.resolve(leaf_a_id).is_err());
+    assert!(tc.arena.resolve(tc.arena.node(inner).id).is_ok());
+}
