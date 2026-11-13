@@ -1325,6 +1325,9 @@ class Envs:
     # kernels/ops/gemm/mxfp8_sm107_dense.py (DECODE_TABLE) on its PDL / split-K copy
     # of FlashInfer's SM107 CuTe-DSL GEMM instead of mm_mxfp8(backend="cute-dsl").
     SGLANG_OPT_SM107_MXFP8_DENSE_TABLE = EnvBool(False)
+    # Kernel for the tabled shapes: "pdl" (the copy, PDL on), "nopdl" (the copy, PDL off),
+    # "stock" (FlashInfer's SM107 runner pinned to the table's tactic).
+    SGLANG_OPT_SM107_MXFP8_DENSE_TABLE_MODE = EnvStr("pdl")
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
 

@@ -1914,17 +1914,45 @@ def decode_linear(
     n = weight.shape[0]
     if split_k > 1 and not split_k_fits(m, n, tactic, split_k):
         split_k = 1
+    from sglang.srt.environ import envs
+
+    mode = envs.SGLANG_OPT_SM107_MXFP8_DENSE_TABLE_MODE.get()
     out = torch.empty((m, n), dtype=out_dtype, device=q_input.device)
-    mxfp8_sm107_gemm(q_input, x_scale, weight, weight_scale, out, tactic, split_k=split_k)
+    if mode == "stock":
+        split_k = 1
+        # The SM107 runner ignores the workspace slot.
+        _stock_runner()(
+            inputs=[q_input, weight.t(), x_scale, weight_scale, out_dtype, out, out],
+            tactic=tactic,
+        )
+    else:
+        mxfp8_sm107_gemm(
+            q_input,
+            x_scale,
+            weight,
+            weight_scale,
+            out,
+            tactic,
+            split_k=split_k,
+            use_pdl=mode != "nopdl",
+        )
     key = (n, weight.shape[1], tactic, split_k)
     if key not in _LOGGED:
         _LOGGED.add(key)
         logger.info(
-            "SM107 MXFP8 dense table: N=%d K=%d M=%d tactic=%s split_k=%d (PDL)",
+            "SM107 MXFP8 dense table: N=%d K=%d M=%d tactic=%s split_k=%d (mode %s)",
             n,
             weight.shape[1],
             m,
             tactic,
             split_k,
+            mode,
         )
     return out
+
+
+@lru_cache(maxsize=None)
+def _stock_runner():
+    from flashinfer.gemm import gemm_base
+
+    return gemm_base._cute_dsl_gemm_mxfp8_sm107_runner(torch.bfloat16)
