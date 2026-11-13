@@ -842,6 +842,9 @@ class Envs:
     # Under overlap, publish decode KV destinations one iteration later instead of
     # reading them back inline; False restores the inline publish.
     SGLANG_ENABLE_DISAGG_DECODE_DEFERRED_PUBLISH = EnvBool(True)
+    # With the deferred publish, read the destination ids back through pinned copies
+    # and send them once landed, instead of one blocking D2H per payload.
+    SGLANG_DISAGG_DECODE_ASYNC_PUBLISH_READBACK = EnvBool(False)
 
     # ===================================================================
     # Distributed and model-parallel runtime
