@@ -794,6 +794,9 @@ class Envs:
     # (supports_deferred_decode_kv_release).
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(True)
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
+    # PP prefill: PP0 decides each KV transfer's release from every stage's status
+    # (PPConsensusStore) and relays it in one pass, instead of the two-pass ring.
+    SGLANG_PP_PD_PREFILL_RELEASE_RELAY = EnvBool(False)
 
     # ===================================================================
     # Distributed and model-parallel runtime

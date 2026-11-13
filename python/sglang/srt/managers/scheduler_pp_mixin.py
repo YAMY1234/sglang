@@ -10,8 +10,13 @@ import torch
 import torch.distributed
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
+from sglang.srt.disaggregation.utils import (
+    poll_and_all_reduce_attn_cp_tp_group,
+    poll_pp_consensus_and_all_reduce,
+    pp_sync_polls,
+)
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
+from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
@@ -264,6 +269,13 @@ class SchedulerPPMixin:
         release_rids: Optional[List[str]] = None
         send_transfer_work = []
         send_release_work = []
+        # tmbs stays None under the relay, so the two-pass ring below never sends.
+        release_relay = envs.SGLANG_PP_PD_PREFILL_RELEASE_RELAY.get()
+        if release_relay:
+            logger.info(
+                "PP PD prefill: PP0 decides each KV transfer's release and relays "
+                "it in one pass (SGLANG_PP_PD_PREFILL_RELEASE_RELAY)."
+            )
 
         while True:
             server_is_idle = True
@@ -287,9 +299,10 @@ class SchedulerPPMixin:
 
                 self.process_bootstrapped_queue()
 
-                transferred_rids = self._pp_pd_get_prefill_transferred_ids()
-                self._pp_commit_comm_work(send_transfer_work)
-                tmbs[mb_id] = transferred_rids
+                if not release_relay:
+                    transferred_rids = self._pp_pd_get_prefill_transferred_ids()
+                    self._pp_commit_comm_work(send_transfer_work)
+                    tmbs[mb_id] = transferred_rids
 
                 # The pipeline loop builds its own batch instead of calling
                 # get_next_batch_to_run, so label the same work here.
@@ -357,15 +370,20 @@ class SchedulerPPMixin:
                     )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
-                if tmbs[next_mb_id] is not None:
+                if release_relay:
+                    self.process_disagg_prefill_inflight_queue(
+                        pp_consensus_polls=self._pp_pd_relay_prefill_release_polls()
+                    )
+                elif tmbs[next_mb_id] is not None:
                     self.process_disagg_prefill_inflight_queue(next_release_rids)
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
                         recv_reqs, async_send=True
                     )
-                    send_transfer_work = self._pp_send_pyobj_to_next_stage(
-                        transferred_rids, async_send=True
-                    )
+                    if not release_relay:
+                        send_transfer_work = self._pp_send_pyobj_to_next_stage(
+                            transferred_rids, async_send=True
+                        )
                     if cur_batch:
                         self._pp_send_proxy_to_next_stage(result)
 
@@ -622,6 +640,7 @@ class SchedulerPPMixin:
         self._pp_tensor_dict_inbox: Dict[
             str, deque[Tuple[Dict[str, torch.Tensor], Optional[torch.Event]]]
         ] = defaultdict(deque)
+        self.pp_release_sync_work_list: List[P2PWork] = []
 
     @scheduler_stage_method(SCHEDULER_STAGE_DISAGG_BOOKKEEPING)
     def process_bootstrapped_queue(self: Scheduler):
@@ -653,6 +672,37 @@ class SchedulerPPMixin:
                 set(prev_transferred_rids) & set(curr_transferred_rids)
             )
         return transferred_rids
+
+    @scheduler_stage_method(SCHEDULER_STAGE_PD_CONSENSUS)
+    def _pp_pd_relay_prefill_release_polls(self: Scheduler) -> List[int]:
+        """PP0 polls the inflight queue against every stage's transfer status
+        and relays the polls, so all stages release the same requests now."""
+        rids = [req.rid for req in self.disagg_prefill_inflight_queue]
+        data = None
+        if self.pp_group.is_first_rank:
+            data = (
+                rids,
+                poll_pp_consensus_and_all_reduce(
+                    [
+                        req.disagg_kv_sender
+                        for req in self.disagg_prefill_inflight_queue
+                    ],
+                    self.attn_cp_cpu_group,
+                    self.attn_tp_cpu_group,
+                ),
+            )
+        relayed_rids, polls = pp_sync_polls(
+            data,
+            self.pp_group,
+            get_parallel().pp_rank,
+            get_parallel().pp_size,
+            self.pp_release_sync_work_list,
+            tag=P2PTag.DISAGG_RELEASE_PP_SYNC,
+        )
+        assert (
+            relayed_rids == rids
+        ), f"PP rank {get_parallel().pp_rank}: inflight queue differs from PP0's"
+        return polls
 
     def _pp_pd_send_consensus_bootstrapped_ids(
         self: Scheduler,

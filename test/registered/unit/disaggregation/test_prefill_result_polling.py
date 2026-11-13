@@ -2,10 +2,12 @@
 
 import multiprocessing
 import tempfile
+import time
 import unittest
 from array import array
-from collections import Counter, deque
+from collections import Counter, defaultdict, deque
 from contextlib import contextmanager, nullcontext
+from functools import partial
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +17,8 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVSender
+from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
@@ -904,6 +908,153 @@ class TestCachedPrefixEarlySend(CustomTestCase):
                     )
                 else:
                     scheduler.send_kv_chunk.assert_not_called()
+
+
+class _RelayPPGroup:
+    """In-process PP group: a stage's send_object lands in the next stage's inbox."""
+
+    def __init__(self, rank, size, inboxes):
+        self.rank_in_group = rank
+        self.is_first_rank = rank == 0
+        self.is_last_rank = rank == size - 1
+        self._inboxes = inboxes
+
+    def broadcast_object(self, obj, src=0):
+        # PPConsensusStore shares PP0's address; every stage holds one inbox map.
+        if obj is not None:
+            self._inboxes["store"] = obj
+        return self._inboxes["store"]
+
+    def send_object(self, obj, dst, async_send=False, tag=0):
+        self._inboxes[(dst, tag)].append(obj)
+        return []
+
+    def recv_object(self, src, tag=0):
+        return self._inboxes[(self.rank_in_group, tag)].popleft()
+
+
+class TestPPPrefillReleaseRelay(CustomTestCase):
+    @unittest.skipUnless(dist.is_gloo_available(), "requires Gloo")
+    def test_every_stage_releases_what_pp0_decides_from_all_stages(self):
+        ok, sending, failed = KVPoll.Success, KVPoll.Transferring, KVPoll.Failed
+        # Room 1 is done on every stage, room 2 still sends on stage 2, and room 3
+        # failed on stage 1 only.
+        statuses = {1: (ok, ok, ok), 2: (ok, ok, sending), 3: (ok, failed, ok)}
+        pp_size = 3
+        inboxes = defaultdict(deque)
+        stores = [
+            PPConsensusStore(pp_size, k, _RelayPPGroup(k, pp_size, inboxes))
+            for k in range(pp_size)
+        ]
+        try:
+            for room, per_stage in statuses.items():
+                for stage, status in enumerate(per_stage):
+                    stores[stage][room] = status
+            deadline = time.monotonic() + 5
+            while any(
+                stores[0].collect(room) != list(per_stage)
+                for room, per_stage in statuses.items()
+            ):
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.01)
+
+            schedulers = []
+            for stage in range(pp_size):
+                kv_mgr = SimpleNamespace(
+                    request_status=stores[stage],
+                    _staging_outstanding={},
+                    defer_decode_allocation=False,
+                    reports_transfer_latency=False,
+                )
+                for check in ("check_status", "check_status_pp_consensus"):
+                    setattr(
+                        kv_mgr,
+                        check,
+                        partial(getattr(CommonKVManager, check), kv_mgr),
+                    )
+                queue = []
+                for room in statuses:
+                    sender = CommonKVSender.__new__(CommonKVSender)
+                    sender.conclude_state = None
+                    sender.bootstrap_room = room
+                    sender.kv_mgr = kv_mgr
+                    sender.trace_ctx = Mock()
+                    sender.clear = Mock()
+                    sender.get_transfer_metric = Mock()
+                    time_stats = Mock()
+                    time_stats.compute_and_observe_kv_transfer_metrics.return_value = {}
+                    queue.append(
+                        SimpleNamespace(
+                            rid=f"r{room}",
+                            disagg_kv_sender=sender,
+                            pending_bootstrap=False,
+                            return_routed_experts=False,
+                            return_logprob=False,
+                            finished_reason=None,
+                            cache_request_handle=None,
+                            bootstrap_host="10.0.0.1",
+                            time_stats=time_stats,
+                        )
+                    )
+                scheduler = Scheduler.__new__(Scheduler)
+                scheduler.scheduler_stage_metrics = None
+                scheduler.pp_group = _RelayPPGroup(stage, pp_size, inboxes)
+                scheduler.pp_release_sync_work_list = []
+                scheduler.disagg_prefill_inflight_queue = queue
+                scheduler.tree_cache = Mock()
+                scheduler.output_streamer = Mock()
+                scheduler.handle_inflight_transfer_failure = Mock()
+                scheduler.req_to_metadata_buffer_idx_allocator = Mock()
+                schedulers.append(scheduler)
+
+            with (
+                _single_rank_gloo_group(),
+                published_topology(),
+                patch("sglang.srt.disaggregation.prefill.release_kv_cache") as release,
+                patch(
+                    "sglang.srt.disaggregation.prefill.maybe_release_metadata_buffer"
+                ),
+            ):
+                for scheduler in schedulers:
+                    scheduler.attn_cp_cpu_group = dist.group.WORLD
+                    scheduler.attn_tp_cpu_group = dist.group.WORLD
+                # Stages run in pipeline order; each receives PP0's decision.
+                for stage, scheduler in enumerate(schedulers):
+                    with get_parallel().override(pp_size=pp_size, pp_rank=stage):
+                        polls = scheduler._pp_pd_relay_prefill_release_polls()
+                        self.assertEqual(polls, [ok, sending, failed])
+                        done = scheduler.process_disagg_prefill_inflight_queue(
+                            pp_consensus_polls=polls
+                        )
+                    self.assertEqual([req.rid for req in done], ["r1", "r3"])
+                    self.assertEqual(
+                        [req.rid for req in scheduler.disagg_prefill_inflight_queue],
+                        ["r2"],
+                    )
+                    scheduler.handle_inflight_transfer_failure.assert_called_once()
+                    self.assertEqual(
+                        scheduler.handle_inflight_transfer_failure.call_args.args[
+                            0
+                        ].rid,
+                        "r3",
+                    )
+                self.assertEqual(
+                    [c.args[0].rid for c in release.call_args_list], ["r1"] * pp_size
+                )
+
+                # A stage whose inflight queue differs from PP0's fails loudly.
+                extra = Mock(poll_pp_consensus=Mock(return_value=sending))
+                schedulers[0].disagg_prefill_inflight_queue.append(
+                    SimpleNamespace(rid="r4", disagg_kv_sender=extra)
+                )
+                with get_parallel().override(pp_size=pp_size, pp_rank=0):
+                    schedulers[0]._pp_pd_relay_prefill_release_polls()
+                with get_parallel().override(pp_size=pp_size, pp_rank=1):
+                    with self.assertRaises(AssertionError):
+                        schedulers[1]._pp_pd_relay_prefill_release_polls()
+        finally:
+            for store in stores:
+                store.close()
 
 
 if __name__ == "__main__":

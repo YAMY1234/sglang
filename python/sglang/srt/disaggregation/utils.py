@@ -59,6 +59,7 @@ def pp_sync_polls(
     pp_rank: int,
     pp_size: int,
     sync_work_list: List,
+    tag: P2PTag = P2PTag.DISAGG_BOOTSTRAP_PP_SYNC,
 ) -> List[int]:
     """Synchronize poll states from PP0 through the PP pipeline.
 
@@ -77,7 +78,7 @@ def pp_sync_polls(
     if pp_rank > 0:
         data = pp_group.recv_object(
             src=pp_rank - 1,
-            tag=P2PTag.DISAGG_BOOTSTRAP_PP_SYNC,
+            tag=tag,
         )
     if pp_rank + 1 < pp_size:
         sync_work_list.extend(
@@ -85,7 +86,7 @@ def pp_sync_polls(
                 data,
                 dst=pp_rank + 1,
                 async_send=True,
-                tag=P2PTag.DISAGG_BOOTSTRAP_PP_SYNC,
+                tag=tag,
             )
         )
     return data
@@ -126,6 +127,18 @@ def poll_and_all_reduce_prefill_pp(
     # Propagate PP0's data to other ranks
     polls = pp_sync_polls(polls, pp_group, pp_rank, pp_size, pp_poll_sync_work_list)
     return polls
+
+
+def poll_pp_consensus_and_all_reduce(
+    pollers: List[CommonKVSender],
+    attn_cp_cpu_group: dist.ProcessGroup,
+    attn_tp_cpu_group: dist.ProcessGroup,
+) -> List[int]:
+    """PP0 only: each room's minimum status over every PP stage, MIN-reduced
+    across attention TP and CP."""
+    polls = _poll_with_failure_injection_pp(pollers)
+    polls = _all_reduce_polls(polls, attn_tp_cpu_group)
+    return _all_reduce_polls(polls, attn_cp_cpu_group)
 
 
 def get_dsa_seed_metadata_dim(hf_config) -> int:

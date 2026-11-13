@@ -7,7 +7,7 @@ from collections import deque
 from contextlib import nullcontext
 from pathlib import Path
 from types import MethodType, ModuleType, SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from parameterized import parameterized
 
@@ -23,6 +23,9 @@ from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.observability.scheduler_stage_metrics import (
+    SchedulerStageMetricsRecorder,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -207,6 +210,43 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                             scheduler.on_idle.call_count,
                             0 if pending_transfer else 1 + (pattern == "idle_cycle"),
                         )
+
+    def test_pp_prefill_release_relay_replaces_the_ring(self):
+        for relay in (False, True):
+            with self.subTest(relay=relay):
+                schedule = self.make_batches(ForwardMode.EXTEND) + [None] * 2
+                scheduler = self.make_scheduler(schedule)
+                self.prepare_pp_scheduler(scheduler)
+                # The PP prefill loop labels its batch-building span.
+                scheduler.scheduler_stage_metrics = SchedulerStageMetricsRecorder(False)
+                scheduler._pp_pd_relay_prefill_release_polls = Mock(return_value=[3])
+                with (
+                    envs.SGLANG_PP_PD_PREFILL_RELEASE_RELAY.override(relay),
+                    get_parallel().override(pp_size=2, pp_async_batch_depth=0),
+                    patch(
+                        f"{PP_MODULE}.get_disagg",
+                        return_value=SimpleNamespace(
+                            disaggregation_decode_enable_offload_kvcache=False
+                        ),
+                    ),
+                    patch(f"{PP_MODULE}.set_time_batch"),
+                ):
+                    self.run_and_check(
+                        scheduler,
+                        Scheduler.event_loop_pp_disagg_prefill,
+                        ForwardMode.EXTEND,
+                        False,
+                    )
+                ring = scheduler._pp_pd_get_prefill_transferred_ids
+                relayed = scheduler._pp_pd_relay_prefill_release_polls
+                inflight = scheduler.process_disagg_prefill_inflight_queue
+                # One relay per micro-batch replaces the ring's transferred-rid pass.
+                self.assertEqual((ring if not relay else relayed).call_count, 6)
+                (relayed if not relay else ring).assert_not_called()
+                if relay:
+                    self.assertEqual(
+                        inflight.call_args_list, [call(pp_consensus_polls=[3])] * 6
+                    )
 
     def test_pdmux_idle_gap(self):
         for idle_iterations in (0, 1, 2):
