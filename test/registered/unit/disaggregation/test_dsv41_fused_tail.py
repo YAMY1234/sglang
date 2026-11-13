@@ -861,7 +861,11 @@ def _late_sched(waiting, require_mlp_sync=False):
         forward_ct=0,
         require_mlp_sync=require_mlp_sync,
     )
-    for name in ("_dsv41_late_tail_feed", "_retire_dsv41_late_staging"):
+    for name in (
+        "_dsv41_late_tail_feed",
+        "_retire_dsv41_late_staging",
+        "_dsv41_release_late_staging",
+    ):
         setattr(sched, name, getattr(Mixin, name).__get__(sched))
     return sched
 
@@ -883,7 +887,9 @@ class TestLateTailScheduling(CustomTestCase):
     def _reserve(self, sched, reqs):
         with envs.SGLANG_DSV41_LATE_TAIL_ROWS.override(64):
             for req in reqs:
-                req.dsv41_late_staging = Mixin._dsv41_late_reserve_staging(sched)
+                slot = Mixin._dsv41_late_reserve_staging(sched)
+                if slot is not None:
+                    Mixin._hold_dsv41_late_staging(sched, req, slot)
 
     def test_staged_tails_feed_the_budget_then_join_at_e(self):
         a, b = _late_req(1000, pool_idx=5), _late_req(1001, pool_idx=6)
@@ -959,9 +965,17 @@ class TestLateTailScheduling(CustomTestCase):
         Mixin._stage_dsv41_late_tails(sched, feed)
         self.assertEqual([r.dsv41_late_queued for r in late], [False, True, False])
         self.assertEqual(feed.pending_rows(), 128)
-        # A failed transfer hands its slot back at once.
+        # A failed transfer's slot rests: a write of it may still land.
         Mixin._dsv41_release_late_staging(sched, late[0])
-        self.assertEqual(list(sched.dsv41_late_free_slots), [9])
+        self.assertEqual(list(sched.dsv41_late_free_slots), [])
+        self.assertEqual(sched.dsv41_late_retiring, [(600, 9)])
+        # So does an aborted request's that never reached the feed.
+        late[2].dsv41_late_staging = None
+        Mixin._hold_dsv41_late_staging(sched, late[2], 4)
+        late[2].finished = lambda: True
+        Mixin._stage_dsv41_late_tails(sched, feed)
+        self.assertEqual(sorted(sched.dsv41_late_retiring), [(600, 4), (600, 9)])
+        self.assertIsNone(late[2].dsv41_late_staging)
 
     def test_an_aborted_tail_leaves_the_feed(self):
         a = _late_req(1000, pool_idx=5)

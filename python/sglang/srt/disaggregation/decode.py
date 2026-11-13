@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import heapq
 import logging
 import random
 import time
@@ -63,6 +64,10 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreResult,
 )
 from sglang.srt.disaggregation.dsv41_late_tail import LateTailFeed
+
+# Arbitrary: forward steps (about 10 s at 16 ms) before a slot an aborted late-fed
+# transfer may still write is reused.
+DSV41_LATE_ABORT_REST_STEPS = 600
 from sglang.srt.disaggregation.minimax import minimax_index_transfer_pages
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.utils import (
@@ -1807,7 +1812,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 slot = self.scheduler._dsv41_late_reserve_staging()
                 if slot is None:
                     break
-                decode_req.req.dsv41_late_staging = slot
+                self.scheduler._hold_dsv41_late_staging(decode_req.req, slot)
 
             if self.scheduler.enable_lora and not self.scheduler.can_schedule_lora_req(
                 decode_req.req, running_loras
@@ -4479,9 +4484,11 @@ class SchedulerDisaggregationDecodeMixin:
                 window=self.model_config.sliding_window_size,
             )
             self.dsv41_late_free_slots = deque(range(LATE_TAIL_STAGING_TAILS))
-            # (forward step from which the slot is free, slot): a slot the last
-            # scheduled steps read stays taken until they have run.
-            self.dsv41_late_retiring = deque()
+            # Slot -> the request it is reserved for, until its late rows ran.
+            self.dsv41_late_holders = {}
+            # Heap of (forward step from which the slot is free, slot): a slot the
+            # last scheduled steps read stays taken until they have run.
+            self.dsv41_late_retiring = []
         return self.dsv41_late_feed
 
     def _dsv41_late_reserve_staging(self: Scheduler) -> Optional[int]:
@@ -4493,22 +4500,38 @@ class SchedulerDisaggregationDecodeMixin:
             return None
         return self.dsv41_late_free_slots.popleft()
 
+    def _hold_dsv41_late_staging(self: Scheduler, req: Req, slot: int) -> None:
+        req.dsv41_late_staging = slot
+        self.dsv41_late_holders[slot] = req
+
     def _dsv41_release_late_staging(self: Scheduler, req: Req) -> None:
-        """A transfer that failed before any forward read its slot."""
-        if req.dsv41_late_staging is not None:
-            self.dsv41_late_free_slots.append(req.dsv41_late_staging)
+        """A request that leaves before its late rows ran: a write of its aborted
+        transfer may still land, so the slot rests before its next owner."""
+        slot = req.dsv41_late_staging
+        if slot is not None:
+            self.dsv41_late_holders.pop(slot, None)
+            heapq.heappush(
+                self.dsv41_late_retiring,
+                (self.forward_ct + DSV41_LATE_ABORT_REST_STEPS, slot),
+            )
             req.dsv41_late_staging = None
 
     def _retire_dsv41_late_staging(self: Scheduler) -> None:
         while self.dsv41_late_retiring and (
             self.dsv41_late_retiring[0][0] <= self.forward_ct
         ):
-            self.dsv41_late_free_slots.append(self.dsv41_late_retiring.popleft()[1])
+            self.dsv41_late_free_slots.append(
+                heapq.heappop(self.dsv41_late_retiring)[1]
+            )
 
     def _stage_dsv41_late_tails(self: Scheduler, feed: LateTailFeed) -> None:
         """Queue transferred late-fed tails on the feed, oldest first; each brought
         its staging slot from pre-allocation."""
         self._retire_dsv41_late_staging()
+        for req in [r for r in self.dsv41_late_holders.values() if r.finished()]:
+            if not req.dsv41_late_queued:
+                # Aborted before its transfer finished; the feed drops queued ones.
+                self._dsv41_release_late_staging(req)
         window = self.model_config.sliding_window_size
         for req in self.waiting_queue:
             if not req.dsv41_late_pending or req.dsv41_late_queued:
@@ -4542,7 +4565,8 @@ class SchedulerDisaggregationDecodeMixin:
         for req, slot in feed.drop(lambda req: req.finished()):
             req.dsv41_late_pending = False
             req.dsv41_late_staging = None
-            self.dsv41_late_retiring.append((self.forward_ct + 2, slot))
+            self.dsv41_late_holders.pop(slot, None)
+            heapq.heappush(self.dsv41_late_retiring, (self.forward_ct + 2, slot))
         step = feed.take()
         if step is None:
             batch.dsv41_late_tail = LateTailStepInputs(active=True)
@@ -4565,9 +4589,10 @@ class SchedulerDisaggregationDecodeMixin:
         for req in step.finished:
             req.dsv41_late_pending = False
             # Free once this step and the one overlapped with it have run.
-            self.dsv41_late_retiring.append(
-                (self.forward_ct + 2, req.dsv41_late_staging)
+            heapq.heappush(
+                self.dsv41_late_retiring, (self.forward_ct + 2, req.dsv41_late_staging)
             )
+            self.dsv41_late_holders.pop(req.dsv41_late_staging, None)
             req.dsv41_late_staging = None
         self.dsv41_late_tail_ct = getattr(self, "dsv41_late_tail_ct", 0) + len(
             step.finished
