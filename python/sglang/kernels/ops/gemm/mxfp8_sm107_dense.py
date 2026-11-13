@@ -30,18 +30,22 @@
 ``__call__`` and ``kernel_impl`` are copied from FlashInfer 0.7.3's
 ``gemm/kernels/dense_blockscaled_gemm_sm107.py`` (``Sm107BlockScaledPersistentDenseGemmKernel``,
 itself ported from CUTLASS's Rubin ``dense_blockscaled_gemm_persistent.py``; source sha256
-``SOURCE_SHA256`` below) with three changes:
+``SOURCE_SHA256`` below) with these changes:
 
-* the kernel is launched with PDL (``use_pdl=True``);
+* the kernel is launched with PDL;
 * the TMA warp issues the first tile's first ``num_ab_stage`` weight stages (and their scale
   factors) before ``griddepcontrol.wait`` and the activation stages after it, so the weight
   fetch overlaps the previous kernel; optionally it also L2-prefetches the rest of that tile's
   weights before the wait;
 * every CTA calls ``griddepcontrol.launch_dependents`` once its last load is issued;
-* optional L2 eviction policies on the weight and activation TMA loads.
+* optional L2 eviction policies on the weight and activation TMA loads;
+* an optional split-K mode (``split_k`` > 1): K split over the batch mode, FP32 partials
+  reduce-scattered through a workspace in a fixed split order. It is deterministic but
+  measured slower than stock at every decode shape, so DECODE_TABLE does not use it.
 
-Everything else (tiles, scheduler, MMA, epilogue, numerics) is the stock kernel's, so the output
-is bitwise identical to FlashInfer's ``mm_mxfp8(backend="cute-dsl")`` at the same tactic.
+With ``split_k`` = 1 everything else (tiles, scheduler, MMA, epilogue, numerics) is the stock
+kernel's, so the output is bitwise identical to FlashInfer's ``mm_mxfp8(backend="cute-dsl")``
+at the same tactic.
 """
 
 import hashlib
