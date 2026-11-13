@@ -47,6 +47,7 @@ class _FakeTreeCore:
                 ComponentType.MAMBA, self.tree_components, use_host_ptr=True
             )
         }
+        self.mamba_path_cap_counts_host = False
         self.evicted = []
         self.cascaded = []
         # The real eviction helper reports unbacked FULL evictions to the
@@ -61,7 +62,14 @@ class _FakeTreeCore:
         )
 
     def _cascade_evict(
-        self, node, component, tracker, device_frees, host_frees, cache_actions
+        self,
+        node,
+        component,
+        tracker,
+        device_frees,
+        host_frees,
+        cache_actions,
+        target=None,
     ):
         self.cascaded.append(node)
 
@@ -171,6 +179,72 @@ class TestMambaPathStateCap(unittest.TestCase):
         self.assertIsNone(mamba_data.value)
         self.assertIsNotNone(mamba_data.host_value)
         self.assertTrue(core.host_lru_lists[ComponentType.MAMBA].in_list(nodes[0]))
+
+    def _chain_with_host_copies(self):
+        # nodes[0]: host-only state; nodes[1]: device + host copy; nodes[2]: tail.
+        component, nodes, core, cache = _build_unified_chain(cap=1)
+        host_only = nodes[0].component_data[ComponentType.MAMBA]
+        host_only.value = None
+        core.lru_lists[ComponentType.MAMBA].remove_node(nodes[0])
+        core.component_evictable_size_[ComponentType.MAMBA] -= 1
+        host_only.host_value = torch.tensor([10])
+        core.host_lru_lists[ComponentType.MAMBA].insert_mru(nodes[0])
+        nodes[1].component_data[ComponentType.MAMBA].host_value = torch.tensor([11])
+        return component, nodes, core
+
+    def test_unified_cache_counts_and_frees_host_copies_when_opted_in(self):
+        for opted_in in (False, True):
+            with self.subTest(opted_in=opted_in):
+                component, nodes, core = self._chain_with_host_copies()
+                core.mamba_path_cap_counts_host = opted_in
+                device_frees = defaultdict(list)
+                host_frees = defaultdict(list)
+                component._evict_excess_path_states(
+                    nodes[-1], device_frees, host_frees, []
+                )
+                self.assertEqual(
+                    [v.item() for v in device_frees[ComponentType.MAMBA]], [1]
+                )
+                freed_host = [v.item() for v in host_frees[ComponentType.MAMBA]]
+                host_lru = core.host_lru_lists[ComponentType.MAMBA]
+                if opted_in:
+                    self.assertEqual(freed_host, [10, 11])
+                    for node in nodes[:2]:
+                        self.assertIsNone(
+                            node.component_data[ComponentType.MAMBA].host_value
+                        )
+                        self.assertFalse(host_lru.in_list(node))
+                else:
+                    self.assertEqual(freed_host, [])
+                    self.assertIsNotNone(
+                        nodes[0].component_data[ComponentType.MAMBA].host_value
+                    )
+                    self.assertTrue(host_lru.in_list(nodes[1]))
+                self.assertIsNotNone(
+                    nodes[-1].component_data[ComponentType.MAMBA].value
+                )
+
+    def test_unified_cache_keeps_host_copies_that_are_locked_or_in_flight(self):
+        for guard in ("host_lock", "backup", "load_back"):
+            with self.subTest(guard=guard):
+                component, nodes, core = self._chain_with_host_copies()
+                core.mamba_path_cap_counts_host = True
+                if guard == "host_lock":
+                    nodes[0].component_data[ComponentType.MAMBA].host_lock_ref = 1
+                elif guard == "backup":
+                    nodes[0].write_through_pending_id = 1
+                else:
+                    nodes[0].load_back_pending_id = 1
+                host_frees = defaultdict(list)
+                component._evict_excess_path_states(
+                    nodes[-1], defaultdict(list), host_frees, []
+                )
+                self.assertIsNotNone(
+                    nodes[0].component_data[ComponentType.MAMBA].host_value
+                )
+                self.assertEqual(
+                    [v.item() for v in host_frees[ComponentType.MAMBA]], [11]
+                )
 
     def test_unified_cache_negative_one_disables_cap(self):
         component, nodes, core, cache = _build_unified_chain(cap=-1)

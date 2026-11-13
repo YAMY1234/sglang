@@ -194,7 +194,9 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
     /// Mamba data stays on the original leaf; the new prefix node gets none.
     /// Evict shallow Mamba device checkpoints beyond the per-path cap on the
     /// tail's root path; Full KV, host backups, the tail, forks, locked nodes,
-    /// and device leaves are preserved (a best-effort soft cap).
+    /// and device leaves are preserved (a best-effort soft cap). With
+    /// `mamba_path_cap_counts_host`, host copies count toward the cap too and
+    /// a capped state loses its host copy unless that copy is locked or in flight.
     fn evict_excess_path_states(
         &self,
         tree_core: &mut UnifiedTreeCore<K>,
@@ -206,6 +208,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         let Some(cap) = self.mamba_max_states_per_path else {
             return;
         };
+        let count_host = tree_core.mamba_path_cap_counts_host;
         // Mamba-value holders on the root path, tail-first.
         let mut holders: Vec<NodeIdx_> = Vec::new();
         let mut cursor = Some(tail_node_id);
@@ -214,7 +217,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             if node.is_root() {
                 break;
             }
-            if node.has_device_value(MAMBA) {
+            if node.has_device_value(MAMBA) || (count_host && node.has_host_value(MAMBA)) {
                 holders.push(node_id);
             }
             cursor = node.parent;
@@ -236,24 +239,55 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             if tree_core.evictable_device_leaves.contains(node_id) {
                 continue;
             }
-            tree_core.evict_component_and_detach_lru_(
-                node_id,
-                MAMBA,
-                device_frees,
-                host_frees,
-                cache_actions,
-                EvictLayer::Device,
-                Some(&mut tracker),
-            );
-            tree_core.cascade_evict_(
-                node_id,
-                MAMBA,
-                &mut tracker,
-                device_frees,
-                host_frees,
-                cache_actions,
-                EvictLayer::Device,
-            );
+            let free_host = count_host
+                && node.has_host_value(MAMBA)
+                && node.host_lock_ref(MAMBA) == 0
+                && node.write_through_pending_id.is_none()
+                && !node.is_load_back_pending();
+            let has_device = node.has_device_value(MAMBA);
+            if !has_device && !free_host {
+                continue;
+            }
+            if has_device {
+                tree_core.evict_component_and_detach_lru_(
+                    node_id,
+                    MAMBA,
+                    device_frees,
+                    host_frees,
+                    cache_actions,
+                    EvictLayer::Device,
+                    Some(&mut tracker),
+                );
+                tree_core.cascade_evict_(
+                    node_id,
+                    MAMBA,
+                    &mut tracker,
+                    device_frees,
+                    host_frees,
+                    cache_actions,
+                    EvictLayer::Device,
+                );
+            }
+            if free_host {
+                tree_core.evict_component_and_detach_lru_(
+                    node_id,
+                    MAMBA,
+                    device_frees,
+                    host_frees,
+                    cache_actions,
+                    EvictLayer::Host,
+                    Some(&mut tracker),
+                );
+                tree_core.cascade_evict_(
+                    node_id,
+                    MAMBA,
+                    &mut tracker,
+                    device_frees,
+                    host_frees,
+                    cache_actions,
+                    EvictLayer::Host,
+                );
+            }
             excess -= 1;
         }
     }

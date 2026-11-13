@@ -843,6 +843,11 @@ class Envs:
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
+    # --mamba-max-states-per-path also counts host copies, and a capped state
+    # loses its host copy too (HiCache); 0 (default) caps device states only.
+    SGLANG_MAMBA_PATH_CAP_COUNTS_HOST = EnvBool(False)
+    # Seconds between "HiCache host usage" log lines (KV and Mamba pools); 0 = off.
+    SGLANG_HICACHE_HOST_USAGE_LOG_INTERVAL = EnvFloat(0.0)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)

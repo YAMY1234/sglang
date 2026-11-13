@@ -278,17 +278,21 @@ class MambaComponent(TreeComponent):
         Full KV and any existing host backup are retained. The tail, forks,
         locked nodes (including a pending backup chain's write-through locks),
         and device leaves are preserved, so the cap is a best-effort soft
-        limit. Freed slots are collected into the caller's dicts.
+        limit. Freed slots are collected into the caller's dicts. With
+        ``mamba_path_cap_counts_host``, host copies count toward the cap too and
+        a capped state loses its host copy unless it is locked or in flight.
         """
         cap = self.mamba_max_states_per_path
         if cap < 0:
             return
 
         ct = self.component_type
+        count_host = self.tree_core.mamba_path_cap_counts_host
         holders = []
         node = tail
         while node is not None and node is not self.tree_core.root_node:
-            if node.component_data[ct].value is not None:
+            cd = node.component_data[ct]
+            if cd.value is not None or (count_host and cd.host_value is not None):
                 holders.append(node)
             node = node.parent
 
@@ -304,23 +308,54 @@ class MambaComponent(TreeComponent):
                 continue
             if node in self.tree_core.evictable_device_leaves:
                 continue
-            self.tree_core._evict_component_and_detach_lru(
-                node,
-                self,
-                device_frees,
-                host_frees,
-                target=EvictLayer.DEVICE,
-                tracker=tracker,
-                cache_actions=cache_actions,
+            cd = node.component_data[ct]
+            free_host = (
+                count_host
+                and cd.host_value is not None
+                and cd.host_lock_ref == 0
+                and node.write_through_pending_id is None
+                and node.load_back_pending_id is None
             )
-            self.tree_core._cascade_evict(
-                node,
-                self,
-                tracker,
-                device_frees,
-                host_frees,
-                cache_actions=cache_actions,
-            )
+            has_device = cd.value is not None
+            if not has_device and not free_host:
+                continue
+            if has_device:
+                self.tree_core._evict_component_and_detach_lru(
+                    node,
+                    self,
+                    device_frees,
+                    host_frees,
+                    target=EvictLayer.DEVICE,
+                    tracker=tracker,
+                    cache_actions=cache_actions,
+                )
+                self.tree_core._cascade_evict(
+                    node,
+                    self,
+                    tracker,
+                    device_frees,
+                    host_frees,
+                    cache_actions=cache_actions,
+                )
+            if free_host:
+                self.tree_core._evict_component_and_detach_lru(
+                    node,
+                    self,
+                    device_frees,
+                    host_frees,
+                    target=EvictLayer.HOST,
+                    tracker=tracker,
+                    cache_actions=cache_actions,
+                )
+                self.tree_core._cascade_evict(
+                    node,
+                    self,
+                    tracker,
+                    device_frees,
+                    host_frees,
+                    cache_actions=cache_actions,
+                    target=EvictLayer.HOST,
+                )
             excess -= 1
 
     def redistribute_on_node_split(
@@ -1090,6 +1125,10 @@ class MambaComponent(TreeComponent):
                     result.host_frees,
                     result.cache_actions,
                 )
+                if self.cache._mamba_path_cap_counts_host:
+                    self.cache.mamba_retention_counts["path_cap_host_frees"] += len(
+                        result.host_frees.get(self.component_type, ())
+                    )
             finally:
                 self.cache._apply_eviction_result(result)
             return

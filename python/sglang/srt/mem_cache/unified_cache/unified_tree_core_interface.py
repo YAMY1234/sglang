@@ -589,6 +589,13 @@ class UnifiedTreeCoreInterface(ABC):
         """Mark the host tier as buffer-only: one node staged per backup intent."""
         ...
 
+    def set_mamba_path_cap_counts_host(self, enabled: bool) -> None:
+        """Make the per-path Mamba cap count host copies and free the host
+        copies of the states it caps (HiCache init)."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement SGLANG_MAMBA_PATH_CAP_COUNTS_HOST"
+        )
+
     @abstractmethod
     def insert_host(
         self,

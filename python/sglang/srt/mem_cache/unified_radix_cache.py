@@ -203,6 +203,10 @@ class _OngoingPrefetch(NamedTuple):
 
 
 class UnifiedRadixCache(BasePrefixCache):
+    # SGLANG_MAMBA_PATH_CAP_COUNTS_HOST, set by _init_mamba_path_cap_counts_host.
+    _mamba_path_cap_counts_host = False
+    mamba_retention_counts: Optional[dict[str, int]] = None
+
     def __init__(
         self,
         params: CacheInitParams,
@@ -578,6 +582,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller is not None
             and self.cache_controller.write_policy == "write_back"
         )
+        self._init_mamba_path_cap_counts_host()
         # Pre-seed the logical dropped-tokens series.
         if self.metrics_collector is not None and self.cache_controller is not None:
             reasons = ["host_pressure"]
@@ -606,6 +611,35 @@ class UnifiedRadixCache(BasePrefixCache):
                 enable_storage_metrics=self._enable_metrics_flag,
                 extra_metric_labels=self.extra_metric_labels,
             )
+
+    def _init_mamba_path_cap_counts_host(self) -> None:
+        """SGLANG_MAMBA_PATH_CAP_COUNTS_HOST: --mamba-max-states-per-path also
+        counts host copies, and a capped state loses its host copy. Off by default."""
+        if not envs.SGLANG_MAMBA_PATH_CAP_COUNTS_HOST.get():
+            return
+        cap = (
+            self.components[ComponentType.MAMBA].mamba_max_states_per_path
+            if self.is_mamba_enabled
+            else -1
+        )
+        if (
+            cap < 0
+            or self.cache_controller is None
+            or self.host_memory_mode == "buffer_only"
+        ):
+            logger.info(
+                "SGLANG_MAMBA_PATH_CAP_COUNTS_HOST ignored: it needs a Mamba tree with "
+                "--mamba-max-states-per-path and a HiCache host tier in cache mode"
+            )
+            return
+        self.tree_core.set_mamba_path_cap_counts_host(True)
+        self._mamba_path_cap_counts_host = True
+        self.mamba_retention_counts = {"path_cap_host_frees": 0}
+        logger.info(
+            "Mamba path cap counts host copies (cap %d, tree core %s)",
+            cap,
+            type(self.tree_core).__name__,
+        )
 
     def register_sidecar_pool(
         self, spec: SidecarPoolSpec, entry: Optional[PoolEntry] = None
