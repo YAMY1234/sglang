@@ -127,7 +127,33 @@ def _mega_moe_decode_block_m(
         num_topk=num_topk,
         mma_type=mma_type,
     )
-    return _MEGA_MOE_DECODE_BLOCK_M.get(default_block_m)
+    tiles = _MEGA_MOE_DECODE_BLOCK_M.get(default_block_m)
+    min_tokens = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_DECODE_BLOCK_M_96_MIN_TOKENS.get()
+    expected = num_tokens * num_ranks * num_topk / num_experts
+    if tiles is not None and tiles[0] == 96 and expected < min_tokens:
+        # Below the threshold a second 64-row block per expert is rarer than the cost of
+        # 96-row tiles (Kimi-K3.1 decode, 56 experts per rank, top-16, VR200).
+        _log_decode_block_m_kept_once(num_tokens, expected, min_tokens)
+        return None
+    return tiles
+
+
+_mega_moe_decode_block_m_kept_logged = False
+
+
+def _log_decode_block_m_kept_once(num_tokens: int, expected: float, min_tokens: float):
+    global _mega_moe_decode_block_m_kept_logged
+    if _mega_moe_decode_block_m_kept_logged:
+        return
+    _mega_moe_decode_block_m_kept_logged = True
+    logger.info(
+        "MegaMoE decode BLOCK_M kept at 64 below %.1f expected tokens per expert "
+        "(SGLANG_OPT_DEEPGEMM_MEGA_MOE_DECODE_BLOCK_M_96_MIN_TOKENS): first such call "
+        "%d rows/rank, %.1f expected",
+        min_tokens,
+        num_tokens,
+        expected,
+    )
 
 
 def _use_mega_moe_decode_tiles(forward_batch: Optional[ForwardBatch]) -> bool:
@@ -205,6 +231,41 @@ def _check_mega_moe_decode_block_m(
         f"expected {decode_block_m}. Set "
         "SGLANG_OPT_DEEPGEMM_MEGA_MOE_RAISE_DECODE_BLOCK_M=0."
     )
+
+
+def _is_mega_moe_localization_enabled() -> bool:
+    return envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE.get() and _device_sm == 107
+
+
+_mega_moe_localize_logged = False
+
+
+def localize_mega_moe_weights(l1_pair, l2_pair):
+    """(weights, SF) pairs -> the same with (domains, experts, N / domains, K) weights in
+    die-local memory (SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE; sgl-project/sglang #47976,
+    #48099). The SF tensors stay; the kernel reads the domain count from the weights."""
+    global _mega_moe_localize_logged
+    import deep_gemm
+
+    if not hasattr(deep_gemm, "localize"):
+        raise RuntimeError(
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE=1 needs deep_gemm.localize "
+            "(sgl-deep-gemm 0.2.5 or newer); this DeepGEMM has none. Unset the flag."
+        )
+    l1_pair = (deep_gemm.localize(l1_pair[0]), l1_pair[1])
+    l2_pair = (deep_gemm.localize(l2_pair[0]), l2_pair[1])
+    if not _mega_moe_localize_logged:
+        _mega_moe_localize_logged = True
+        native = getattr(deep_gemm, "uses_native_locality_domains", None)
+        logger.info(
+            "MegaMoE weights localized (SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE=1): "
+            "L1 %s, L2 %s, localization available %s, native locality domains %s",
+            tuple(l1_pair[0].shape),
+            tuple(l2_pair[0].shape),
+            deep_gemm.is_localization_available(),
+            native() if native is not None else "?",
+        )
+    return l1_pair, l2_pair
 
 
 def check_mega_moe_shapes(hidden: int, intermediate: int, mma_type: str) -> None:

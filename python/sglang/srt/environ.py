@@ -1536,6 +1536,12 @@ class Envs:
     # Opt-in: raise DeepGEMM's BLOCK_M (16/32 -> 64, 64 -> 96) for FP8xFP4 calls in
     # decode and target-verify CUDA graphs.
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RAISE_DECODE_BLOCK_M = EnvBool(False)
+    # With the raise on: keep BLOCK_M 64 (instead of 96) while the expected tokens per expert
+    # (rows per rank x ranks x top-k / experts) stay below this. 0: always raise.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_DECODE_BLOCK_M_96_MIN_TOKENS = EnvFloat(0.0)
+    # Opt-in, SM107: split each FP8xFP4 MegaMoE weight between the GPU's two locality domains
+    # (deep_gemm.localize; DeepGEMM 0.2.5 or newer) so every SM streams die-local weights.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE = EnvBool(False)
 
     # ===================================================================
     # Top-k kernels

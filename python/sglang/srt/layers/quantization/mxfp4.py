@@ -787,12 +787,31 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     (layer.w2_weight.data, layer.w2_weight_scale.data),
                     mma_type=mma_type,
                 )
+                from sglang.srt.layers.moe.mega_moe import (
+                    _is_mega_moe_localization_enabled,
+                    localize_mega_moe_weights,
+                )
+
+                localized = (
+                    mma_type == "fp8xfp4" and _is_mega_moe_localization_enabled()
+                )
+                if localized:
+                    l1_pair, l2_pair = localize_mega_moe_weights(l1_pair, l2_pair)
                 layer.mega_l1_weights = l1_pair
                 layer.mega_l2_weights = l2_pair
-                layer.w13_weight.data = l1_pair[0]
+                # Localized weights are (domains, experts, ...): the params keep an
+                # expert-major view of the same memory and the plain copies are freed.
+                layer.w13_weight.data = (
+                    l1_pair[0].transpose(0, 1) if localized else l1_pair[0]
+                )
                 layer.w13_weight_scale.data = l1_pair[1]
-                layer.w2_weight.data = l2_pair[0]
+                layer.w2_weight.data = (
+                    l2_pair[0].transpose(0, 1) if localized else l2_pair[0]
+                )
                 layer.w2_weight_scale.data = l2_pair[1]
+                layer._mega_moe_weights_localized = localized
+                if localized:
+                    torch.cuda.empty_cache()
                 layer._mega_moe_weights_built = True
             layer._mxfp4_backend = "deep_gemm"
             return
