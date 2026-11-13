@@ -854,6 +854,12 @@ class Envs:
     # micro-batches later; only the last stage, which samples the first token, sends
     # the first-token metadata (aux).
     SGLANG_PP_PD_PREFILL_EARLY_SEND = EnvBool(False)
+    # --disaggregation-decode-allocation-policy prefill_complete extensions; set
+    # each identically on prefill and decode. The first also defers a request's
+    # Mamba state slot and DFLASH draft KV ring rows with its KV; the second
+    # allows attention TP > 1 and DCP when both roles use the same sizes.
+    SGLANG_PREFILL_COMPLETE_ALLOW_REQUEST_STATE_POOLS = EnvBool(False)
+    SGLANG_PREFILL_COMPLETE_ALLOW_MATCHED_TP_DCP = EnvBool(False)
 
     # ===================================================================
     # Distributed and model-parallel runtime

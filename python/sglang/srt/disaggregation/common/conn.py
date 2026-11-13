@@ -100,6 +100,22 @@ def _get_bootstrap_session(bootstrap_addr: str) -> requests.Session:
     return session
 
 
+# Request-row state that both roles' payload builders read by request slot when
+# decode reserves KV and when prefill sends its last chunk, so deferring that
+# reservation leaves the transfer layout unchanged.
+PREFILL_COMPLETE_REQUEST_STATE_TYPES = frozenset(
+    {StateType.MAMBA, StateType.DRAFT_RING, StateType.REQUEST_ROW}
+)
+
+
+def prefill_complete_unsupported_states(state_types) -> List[StateType]:
+    """The state pools prefill_complete cannot defer with the KV."""
+    supported = {StateType.DSA}
+    if envs.SGLANG_PREFILL_COMPLETE_ALLOW_REQUEST_STATE_POOLS.get():
+        supported |= PREFILL_COMPLETE_REQUEST_STATE_TYPES
+    return [state for state in state_types if state not in supported]
+
+
 class KVTransferError(Exception):
     def __init__(
         self,
@@ -132,6 +148,8 @@ class PrefillServerInfo:
     decode_allocation_policy: str = "early"
     # Each prefill shard-group rank owns a subset of logical KV pages.
     enable_kv_cache_sharding: bool = False
+    # Decode context-parallel width; omitted from the payload when 1.
+    dcp_size: int = 1
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
     # already knows the prefill host (the bootstrap_addr host), so it can POST
@@ -152,6 +170,7 @@ class PrefillServerInfo:
         self.attn_cp_size = int(self.attn_cp_size)
         self.dp_size = int(self.dp_size)
         self.pp_size = int(self.pp_size)
+        self.dcp_size = int(self.dcp_size)
         self.page_size = int(self.page_size) if self.page_size is not None else None
         self.kv_cache_dtype = (
             str(self.kv_cache_dtype) if self.kv_cache_dtype is not None else None
@@ -420,9 +439,30 @@ class CommonKVManager(BaseKVManager):
         )
         self.deferred_bootstrap = None
         if self.defer_decode_allocation:
-            if any(state != StateType.DSA for state in args.state_types):
+            unsupported_states = prefill_complete_unsupported_states(args.state_types)
+            if unsupported_states:
                 raise ValueError(
-                    "prefill_complete currently supports full-attention and DSA KV pools only"
+                    "prefill_complete currently supports full-attention and DSA KV "
+                    "pools only (with SGLANG_PREFILL_COMPLETE_ALLOW_REQUEST_STATE_POOLS, "
+                    "also Mamba state and the DFLASH draft KV ring); got "
+                    f"{[state.value for state in unsupported_states]}"
+                )
+            deferred_request_states = [
+                state.value
+                for state in args.state_types
+                if state in PREFILL_COMPLETE_REQUEST_STATE_TYPES
+            ]
+            if deferred_request_states:
+                logger.info(
+                    "prefill_complete defers request state pools %s with the KV",
+                    deferred_request_states,
+                )
+            if self.attn_tp_size > 1 or self.dcp_size > 1:
+                logger.info(
+                    "prefill_complete with attention TP %d and DCP %d; peers must "
+                    "use the same sizes",
+                    self.attn_tp_size,
+                    self.dcp_size,
                 )
             if disaggregation_mode == DisaggregationMode.PREFILL:
                 self.deferred_bootstrap = DeferredBootstrap(
@@ -1627,6 +1667,9 @@ class CommonKVManager(BaseKVManager):
         payload["decode_allocation_policy"] = (
             get_disagg().disaggregation_decode_allocation_policy
         )
+        if self.defer_decode_allocation and self.dcp_size > 1:
+            # Decode pairs prefill_complete ranks only across equal DCP sizes.
+            payload["dcp_size"] = self.dcp_size
 
         if envs.SGLANG_RUST_SERVER.get() and self.attn_dp_size > 1:
             topology_rows = get_parallel().world_group.all_gather_object(payload)
@@ -2566,10 +2609,13 @@ class CommonKVReceiver(BaseKVReceiver):
                 f"prefill={info.decode_allocation_policy}, decode={policy}. "
                 "Set --disaggregation-decode-allocation-policy identically on both roles."
             )
-        elif policy == "prefill_complete" and (
-            info.attn_tp_size != 1 or info.attn_cp_size != 1
-        ):
-            reason = "prefill_complete requires peer attention TP1/CP1"
+        elif policy == "prefill_complete" and not self._prefill_complete_peer_ok(info):
+            reason = (
+                "prefill_complete requires peer attention TP1/CP1, or with "
+                "SGLANG_PREFILL_COMPLETE_ALLOW_MATCHED_TP_DCP the decode's "
+                f"attention TP and DCP (peer attn_tp={info.attn_tp_size} "
+                f"attn_cp={info.attn_cp_size} dcp={info.dcp_size})"
+            )
         if reason is not None:
             self.kv_mgr.record_failure(self.bootstrap_room, reason)
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
@@ -2616,6 +2662,20 @@ class CommonKVReceiver(BaseKVReceiver):
                     )
         except zmq.ZMQError:
             self.abort()
+
+    def _prefill_complete_peer_ok(self, info: PrefillServerInfo) -> bool:
+        if info.attn_cp_size != 1:
+            return False
+        if not envs.SGLANG_PREFILL_COMPLETE_ALLOW_MATCHED_TP_DCP.get():
+            return info.attn_tp_size == 1
+        # Equal attention TP maps each decode rank to one prefill rank and equal
+        # DCP needs no relayout, so each prefill rank's room has one endpoint.
+        return (
+            info.attn_tp_size == self.kv_mgr.attn_tp_size
+            and info.dcp_size == self.kv_mgr.dcp_size
+            and info.required_dst_info_num == 1
+            and not info.enable_kv_cache_sharding
+        )
 
     def poll(self) -> KVPoll:
         with self._lifecycle_lock:
@@ -3068,6 +3128,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.enable_kv_cache_sharding: Optional[bool] = None
+        self.dcp_size: Optional[int] = None
         self.prefill_http_port: Optional[int] = None
         self.decode_allocation_policy = "early"
         self.prefill_port_table: Dict[
@@ -3193,6 +3254,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 data.get("enable_kv_cache_sharding", False)
             )
 
+        if self.dcp_size is None:
+            self.dcp_size = int(data.get("dcp_size", 1))
+
         if system_dp_size == 1:
             dp_group = attn_dp_rank
         else:
@@ -3260,6 +3324,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 ),
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
                 enable_kv_cache_sharding=bool(self.enable_kv_cache_sharding),
+                dcp_size=self.dcp_size or 1,
                 prefill_http_port=self.prefill_http_port,
                 decode_allocation_policy=self.decode_allocation_policy,
             )
@@ -3268,6 +3333,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 payload.pop("dsv41_spec_layout")
             if info.kv_layout is None:
                 payload.pop("kv_layout")
+            if info.dcp_size == 1:
+                # Decode workers that predate the field reject unknown keys.
+                payload.pop("dcp_size")
             return web.json_response(payload, status=200)
 
         if not self._is_ready():
