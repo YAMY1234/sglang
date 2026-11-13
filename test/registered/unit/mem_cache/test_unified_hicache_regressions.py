@@ -9,7 +9,11 @@ import torch
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo, MambaStateBufferInfo
 from sglang.srt.mem_cache.hicache_storage import PoolName
-from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import _split_hicache_size
+from sglang.srt.environ import envs
+from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+    _split_hicache_size,
+    _split_hicache_size_with_mamba_share,
+)
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -47,6 +51,26 @@ class TestHiCacheIndexDomains(unittest.TestCase):
             for n in (600, 300, 100)
         ]
         self.assertEqual(_split_hicache_size(10, tuple(pools)), (6, 3, 1))
+
+    def test_mamba_host_scale_moves_the_mamba_share_to_the_kv_pools(self):
+        def pools(*sizes):
+            return [
+                SimpleNamespace(host_capacity_bytes=n, get_kv_size_bytes=lambda: (0, 0))
+                for n in sizes
+            ]
+
+        full, swa, mamba = pools(300, 100, 600)
+        self.assertEqual(
+            _split_hicache_size_with_mamba_share(10, (full, swa), mamba), (3, 1, 6)
+        )
+        with envs.SGLANG_HICACHE_MAMBA_HOST_SCALE.override(0.5):
+            self.assertEqual(
+                _split_hicache_size_with_mamba_share(10, (full, swa), mamba),
+                (5.25, 1.75, 3.0),
+            )
+        with envs.SGLANG_HICACHE_MAMBA_HOST_SCALE.override(2.0):
+            with self.assertRaises(ValueError):
+                _split_hicache_size_with_mamba_share(10, (full, swa), mamba)
 
 
 class TestHostGateCapacity(unittest.TestCase):

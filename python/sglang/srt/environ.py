@@ -846,6 +846,9 @@ class Envs:
     # --mamba-max-states-per-path also counts host copies, and a capped state
     # loses its host copy too (HiCache); 0 (default) caps device states only.
     SGLANG_MAMBA_PATH_CAP_COUNTS_HOST = EnvBool(False)
+    # Scales the hierarchical Mamba host pool's share of --hicache-size (the KV
+    # host pools take the rest); unset (default) splits it as the device pools are.
+    SGLANG_HICACHE_MAMBA_HOST_SCALE = EnvFloat(None)
     # Seconds between "HiCache host usage" log lines (KV and Mamba pools); 0 = off.
     SGLANG_HICACHE_HOST_USAGE_LOG_INTERVAL = EnvFloat(0.0)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
