@@ -608,15 +608,17 @@ class TestLateTailSplit(CustomTestCase):
 
     def test_late_fed_prefix_stops_one_or_two_tokens_short_and_even(self):
         with envs.SGLANG_DSV41_LATE_TAIL_ROWS.override(64):
-            for prompt_len, end in ((1000, 998), (1001, 1000), (130, 128), (129, 128)):
+            for prompt_len, end in ((1000, 998), (1001, 1000), (132, 130), (131, 130)):
                 self.assertEqual(dsv41_encoder_prefix_len(prompt_len, 128), end)
-            # Too short to hold a window of late rows: the encoder split as before.
+            # Too short to start the late window at position 2: the encoder split.
+            self.assertEqual(dsv41_encoder_prefix_len(130, 128), 2)
+            self.assertEqual(dsv41_encoder_prefix_len(129, 128), 0)
             self.assertEqual(dsv41_encoder_prefix_len(128, 128), 0)
             self.assertEqual(dsv41_encoder_prefix_len(5, 128), 0)
         self.assertIsNone(dsv41_late_tail_prefix_len(128, 128))
 
     def test_late_rows_are_one_window_floored_at_the_prompt_window(self):
-        for prompt_len in (1000, 1001, 129, 130, 65665):
+        for prompt_len in (1000, 1001, 131, 132, 65665):
             start, end, floor = dsv41_late_tail_rows(prompt_len, 128)
             self.assertEqual(end - start, 128)
             self.assertEqual(end, dsv41_late_tail_prefix_len(prompt_len, 128))

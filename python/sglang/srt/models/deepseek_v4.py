@@ -4591,11 +4591,21 @@ class DeepseekV4Model(nn.Module):
                 capture = getattr(get_attn_backend(), "late_tail_capture", None)
                 if capture is not None and forward_batch.forward_mode.is_extend():
                     # SGLANG_DSV41_LATE_TAIL_ROWS: the late layers' input for each
-                    # late-fed request's window rows, shipped to decode.
+                    # late-fed request's window rows, shipped to decode. Rows map to
+                    # requests as this layer's KV sources map them.
+                    md = get_attn_backend().forward_metadata
+                    row_req = getattr(md, "low_ratio_req_indices", None)
+                    row_pos = getattr(md, "low_ratio_pos_i64", None)
+                    if row_pos is None:
+                        row_pos = positions
+                        row_req = token_req_indices(
+                            forward_batch, num_tokens=positions.shape[0]
+                        )
+                    n = min(row_pos.shape[0], state.residual.shape[0])
                     capture.capture(
-                        residual=state.residual,
-                        row_req=token_req_indices(forward_batch),
-                        positions=positions,
+                        residual=state.residual[:n],
+                        row_req=row_req[:n],
+                        positions=row_pos[:n],
                     )
                 self.layers[i].write_global_cache_only(
                     positions=positions,

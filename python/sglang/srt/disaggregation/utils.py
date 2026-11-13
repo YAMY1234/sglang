@@ -2031,10 +2031,11 @@ def dsv41_late_tail_prefix_len(prompt_len: int, window: int) -> Optional[int]:
     Prefill runs the early layers over [0, e) and ships the late layers' input for
     the window rows [e - window, e); decode runs only the late layers over those, then
     verifies the one or two prompt tokens from e on. e stays even, as the encoder
-    split's prefix does.
+    split's prefix does. The window starts at 2 or later: padding rows sit at
+    position 0, and prefill's capture must not take one for a window row.
     """
     end = (prompt_len - 1) // 2 * 2
-    return end if end >= window else None
+    return end if end >= window + 2 else None
 
 
 def dsv41_late_tail_rows(prompt_len: int, window: int) -> Tuple[int, int, int]:
