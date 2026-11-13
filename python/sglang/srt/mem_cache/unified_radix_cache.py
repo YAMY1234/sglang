@@ -210,6 +210,10 @@ class _OngoingPrefetch(NamedTuple):
 
 
 class UnifiedRadixCache(BasePrefixCache):
+    # SGLANG_HICACHE_WB_EVICT_BATCH in scope (init_hicache); the walk below
+    # takes the per-victim path unless it is set.
+    _wb_evict_batch = False
+
     def __init__(
         self,
         params: CacheInitParams,
@@ -365,6 +369,11 @@ class UnifiedRadixCache(BasePrefixCache):
         self._wb_overlap_watermark = -1
         self._wb_overlap_barrier_seq = 0
         self._wb_overlap_counts = {"overlap": 0, "fresh": 0, "scope": 0}
+        # Batched write_back eviction (_backup_full_leaf_batched): host locks of
+        # victims whose queued D2H copies the walk has not waited for yet.
+        self._wb_batch_locks: list[tuple[NodeId, DecLockRefParams]] = []
+        self._wb_batch_stream: Optional[torch.Stream] = None
+        self._wb_batch_stats = [0, 0]  # waits, victims
         # Write-side dedupe: beliefs about what storage already holds, so
         # re-inserts of hot prefixes skip the redundant backup.
         self.storage_existence_cache = StorageExistenceCache()
@@ -617,6 +626,17 @@ class UnifiedRadixCache(BasePrefixCache):
             get_disagg().disaggregation_mode == "prefill"
             and envs.SGLANG_HICACHE_WB_EVICT_RELAXED_FENCE.get()
         )
+        self._wb_evict_batch = (
+            self.is_write_back
+            and self.buffer_pipeline is None
+            and self._wb_overlap_in_scope
+            and envs.SGLANG_HICACHE_WB_EVICT_BATCH.get()
+        )
+        if self._wb_evict_batch:
+            logger.info(
+                "HiCache write_back eviction: one D2H wait per eviction walk "
+                "(SGLANG_HICACHE_WB_EVICT_BATCH)."
+            )
         # Pre-seed the logical dropped-tokens series.
         if self.metrics_collector is not None and self.cache_controller is not None:
             reasons = ["host_pressure"]
@@ -1130,7 +1150,10 @@ class UnifiedRadixCache(BasePrefixCache):
                         backup_kv = self._evict_device_leaf(node_id, tracker)
                     if node_id is not None and backup_kv is not None:
                         # Deferred demote: run the D->H backup, demote only on success.
-                        written = self._backup_full_leaf_for_write_back(backup_kv)
+                        if self._wb_evict_batch:
+                            written = self._backup_full_leaf_batched(backup_kv)
+                        else:
+                            written = self._backup_full_leaf_for_write_back(backup_kv)
                         if written > 0:
                             self._demote(node_id, tracker)
                         elif self._drop_subtree_no_host(node_id, tracker):
@@ -1150,7 +1173,11 @@ class UnifiedRadixCache(BasePrefixCache):
                     if target_reached(ct):
                         break
             finally:
-                self.tree_core.evict_device_end(ct)
+                try:
+                    if self._wb_evict_batch:
+                        self._wb_batch_flush()
+                finally:
+                    self.tree_core.evict_device_end(ct)
 
     def _tracks_write_through_unbacked_evictions(self) -> bool:
         return (
@@ -3702,6 +3729,77 @@ class UnifiedRadixCache(BasePrefixCache):
             if written > 0:
                 self.writing_check(write_back=True, relaxed_fence=True)
         return written
+
+    def _backup_full_leaf_batched(self, backup_kv: BackupKV) -> int:
+        """Queue a Full-leaf victim's chain backup without waiting for the copy;
+        the walk waits once in _wb_batch_flush before it returns.
+
+        The caller demotes the victim right away, so the walk sees the same
+        victims and frees as the per-victim path. Its device slots go back to
+        the allocator before the copy lands, which is safe because the walk
+        writes no device memory and nothing allocates before the flush. The
+        chain stays host-locked until the flush: host eviction for a later
+        victim cannot reclaim these host slots and hand them to a second copy
+        in the same merged transfer.
+        """
+        stream = self._wb_evict_overlap_stream(backup_kv)
+        if self._wb_batch_locks and stream is not self._wb_batch_stream:
+            self._wb_batch_flush()
+        while True:
+            with (
+                contextlib.nullcontext()
+                if stream is None
+                else device_module.stream(stream)
+            ):
+                written = self._execute_and_commit_kv_backup(
+                    backup_kv, write_back=True
+                )
+            if written > 0 or not self._wb_batch_locks:
+                break
+            # Queued victims may hold the host space: land them, retry once.
+            self._wb_batch_flush()
+        if written > 0:
+            self._wb_batch_stream = stream
+            # Every node whose host slots the queued copy writes: the chain and
+            # the nodes its component (Mamba) transfers cover.
+            lock_ids = list(backup_kv.node_ids)
+            for chain_node_id in backup_kv.node_ids:
+                pending = self.ongoing_write_through.get(chain_node_id)
+                if pending is not None:
+                    lock_ids.extend(pending.publish_node_ids)
+            for lock_id in dict.fromkeys(lock_ids):
+                params = self.inc_host_lock_ref(lock_id).to_dec_params()
+                self._wb_batch_locks.append((lock_id, params))
+            self._wb_batch_stats[1] += 1
+        return written
+
+    def _wb_batch_flush(self) -> None:
+        """Submit the walk's queued backups as one transfer, wait for it, then
+        release the victims' host locks."""
+        locks = self._wb_batch_locks
+        if not locks:
+            return
+        stream = self._wb_batch_stream
+        self._wb_batch_locks = []
+        self._wb_batch_stream = None
+        try:
+            with (
+                contextlib.nullcontext()
+                if stream is None
+                else device_module.stream(stream)
+            ):
+                self.writing_check(write_back=True, relaxed_fence=True)
+        finally:
+            for node_id, params in locks:
+                self.dec_host_lock_ref(node_id, params)
+        stats = self._wb_batch_stats
+        stats[0] += 1
+        if stats[0] % 1024 == 0:
+            logger.info(
+                "HiCache write_back eviction batch: %d waits, %.1f victims per wait.",
+                stats[0],
+                stats[1] / stats[0],
+            )
 
     def _wb_overlap_sync_watermark(self) -> None:
         # Node ids only grow: at the first look after a WAR barrier, every id

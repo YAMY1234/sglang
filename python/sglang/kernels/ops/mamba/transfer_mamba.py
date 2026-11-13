@@ -33,6 +33,14 @@ def _jit_transfer_mamba_module() -> Module:
         cuda_wrappers=[
             ("transfer_kv_mamba_pf_lf", "&TransferMambaKernel::run_pf_lf"),
             ("transfer_kv_mamba_lf_pf", "&TransferMambaKernel::run_lf_pf"),
+            (
+                "transfer_kv_mamba_pf_lf_chunked",
+                "&TransferMambaKernel::run_pf_lf_chunked",
+            ),
+            (
+                "transfer_kv_mamba_lf_pf_chunked",
+                "&TransferMambaKernel::run_lf_pf_chunked",
+            ),
         ],
     )
 
@@ -47,8 +55,22 @@ def transfer_kv_mamba_pf_lf(
     item_size: int,
     src_layout_dim: int,
     num_warps_per_item: int = 32,
+    block_quota: int = 0,
 ):
     module = _jit_transfer_mamba_module()
+    if block_quota > 0:
+        # Grid sized to the transfer (chunks of each item), capped at block_quota.
+        module.transfer_kv_mamba_pf_lf_chunked(
+            src,
+            dst,
+            src_indices,
+            dst_indices,
+            layer_id,
+            item_size,
+            src_layout_dim,
+            block_quota,
+        )
+        return
     module.transfer_kv_mamba_pf_lf(
         src,
         dst,
@@ -70,8 +92,21 @@ def transfer_kv_mamba_lf_pf(
     dst_layout_dim: int,
     num_layers: int,
     num_warps_per_item: int = 32,
+    block_quota: int = 0,
 ):
     module = _jit_transfer_mamba_module()
+    if block_quota > 0:
+        module.transfer_kv_mamba_lf_pf_chunked(
+            src_ptrs,
+            dst,
+            src_indices,
+            dst_indices,
+            item_size,
+            dst_layout_dim,
+            num_layers,
+            block_quota,
+        )
+        return
     module.transfer_kv_mamba_lf_pf(
         src_ptrs,
         dst,

@@ -19,6 +19,7 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.mem_cache.device_pool_info import MLABufferInfo, MLASplitBuffers
 from sglang.srt.mem_cache.pool_host._kvcacheio import (
@@ -95,6 +96,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     Capacity and reserved CP rows remain caller policy. Transfer methods retain
     the shared HostKVCache signature but use the captured tensors and slot map.
     """
+
+    # Grid cap of the host-to-device load kernel (SGLANG_HICACHE_LOAD_BLOCK_QUOTA);
+    # None keeps the kernel default.
+    _load_block_quota: Optional[int] = None
 
     def __init__(
         self,
@@ -265,6 +270,23 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             page_size=self.page_size,
             element_size=self.kv_cache_dim * self.dtype.itemsize,
         )
+        load_quota = envs.SGLANG_HICACHE_LOAD_BLOCK_QUOTA.get()
+        # Compile the widened load module here rather than at the first load-back.
+        if (
+            self.can_use_jit
+            and load_quota > 0
+            and can_use_hicache_jit_kernel(
+                page_size=self.page_size,
+                element_size=self.kv_cache_dim * self.dtype.itemsize,
+                block_quota=load_quota,
+            )
+        ):
+            self._load_block_quota = load_quota
+            logger.info(
+                "HiCache load-back grids capped at %d blocks for MLA/DSA KV, DSA "
+                "indexer and Mamba state (SGLANG_HICACHE_LOAD_BLOCK_QUOTA).",
+                load_quota,
+            )
 
         if self.layout in ("page_first", "page_first_kv_split"):
             # Transpose [page, layer, ...] -> [layer, page, ...] to get per-layer views
@@ -730,6 +752,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         indices_dst=device_indices,
                         indices_src=host_indices,
                         element_dim=self.kv_cache_dim,
+                        block_quota=self._load_block_quota,
                     )
                 else:
                     self._require_packed_device_rows("transfer_kv_per_layer_mla")
@@ -749,6 +772,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         indices_dst=device_indices,
                         indices_src=host_indices,
                         element_dim=self.kv_cache_dim,
+                        block_quota=self._load_block_quota,
                     )
                 else:
                     self._require_packed_device_rows("transfer_kv_per_layer_mla_pf_lf")

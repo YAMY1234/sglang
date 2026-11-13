@@ -866,6 +866,14 @@ class Envs:
     # PD prefill + write_back: Full-leaf eviction backups (D2H) wait only for
     # work issued before the in-flight forward; 0 (default) waits for that forward too.
     SGLANG_HICACHE_WB_EVICT_RELAXED_FENCE = EnvBool(False)
+    # write_back device eviction: queue every victim's D2H copy and wait once per
+    # walk instead of once per victim (victims stay host-locked until the wait).
+    SGLANG_HICACHE_WB_EVICT_BATCH = EnvBool(False)
+    # Grid cap for HiCache host-to-device load kernels (MLA/DSA KV, DSA indexer,
+    # Mamba state); 0 keeps each kernel's default (2-4 blocks).
+    SGLANG_HICACHE_LOAD_BLOCK_QUOTA = EnvInt(0)
+    # Grid cap for the Mamba state device-to-host backup kernel; 0 keeps 2 blocks.
+    SGLANG_HICACHE_MAMBA_BACKUP_BLOCK_QUOTA = EnvInt(0)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)
