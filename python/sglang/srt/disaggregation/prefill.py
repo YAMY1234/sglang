@@ -507,19 +507,6 @@ class PrefillBootstrapQueue:
             elif self.create_sender(req, num_kv_heads):
                 self.queue.append(req)
 
-    def take_room_waiters(self, rid: str, abort_all: bool) -> List[Req]:
-        """Remove and return the waiting recomputes an abort matches. Waiters
-        have no sender yet and hold no KV."""
-        taken = [
-            req for req, _ in self.room_waiters if abort_all or req.rid.startswith(rid)
-        ]
-        if taken:
-            taken_ids = {id(req) for req in taken}
-            self.room_waiters = [
-                waiter for waiter in self.room_waiters if id(waiter[0]) not in taken_ids
-            ]
-        return taken
-
     def extend(self, reqs: List[Req], num_kv_heads: int) -> None:
         for req in reqs:
             self.add(req, num_kv_heads)

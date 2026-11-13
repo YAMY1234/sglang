@@ -6259,15 +6259,20 @@ class Scheduler(
 
             # Retraction recomputes waiting for their room's release hold no
             # sender or KV yet: retire them like a waiting-queue request.
-            for req in self.disagg_prefill_bootstrap_queue.take_room_waiters(
-                recv_req.rid, recv_req.abort_all
-            ):
+            room_waiters = self.disagg_prefill_bootstrap_queue.room_waiters
+            kept_waiters = []
+            for req, num_kv_heads in room_waiters:
+                if not (recv_req.abort_all or req.rid.startswith(recv_req.rid)):
+                    kept_waiters.append((req, num_kv_heads))
+                    continue
                 logger.debug(f"Abort room-waiting request. {req.rid=}")
                 self._release_aborted_request(req)
                 self.beam_coordinator.retire_group(req)
                 self.send_abort_output(
                     _make_abort_req(req, finished_reason=recv_req.finished_reason), req
                 )
+            if len(kept_waiters) != len(room_waiters):
+                self.disagg_prefill_bootstrap_queue.room_waiters = kept_waiters
 
             # Abort in-flight requests
             for req in self.disagg_prefill_inflight_queue:
