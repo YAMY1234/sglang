@@ -1989,6 +1989,33 @@ def dsv41_encoder_prefix_len(prompt_len: int, window: int) -> int:
     return max(0, prompt_len - window) // 2 * 2
 
 
+def append_dsv41_late_tail_state(kv_args: KVArgs, attn_backend) -> None:
+    """SGLANG_DSV41_LATE_TAIL_ROWS: register prefill's capture pool or decode's
+    staging pool as one more state component, after every other on both sides."""
+    from sglang.srt.disaggregation.base.conn import StateType
+
+    pool = getattr(attn_backend, "late_tail_capture", None) or getattr(
+        attn_backend, "late_tail", None
+    )
+    if pool is None:
+        return
+    ptrs, lens, item_lens = pool.transfer_buf_infos()
+    append_state_component(
+        kv_args, StateType.DSV41_LATE_TAIL_ROWS, ptrs, lens, item_lens
+    )
+    if getattr(kv_args, "state_window_tails", None) is not None:
+        kv_args.state_window_tails.append(None)
+
+
+def dsv41_late_tail_enabled() -> bool:
+    """SGLANG_DSV41_LATE_TAIL_ROWS on an encoder-only split; set alike on prefill
+    and decode."""
+    return (
+        envs.SGLANG_DSV41_LATE_TAIL_ROWS.get() > 0
+        and dsv41_encoder_only_prefill_enabled()
+    )
+
+
 def dsv41_late_tail_fed(prompt_len: int, window: int) -> bool:
     """Whether dsv41_encoder_prefix_len splits this prompt for a late-fed tail."""
     return (

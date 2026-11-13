@@ -1026,7 +1026,12 @@ class TestLateTailCapture(CustomTestCase):
         self.assertEqual(cap.pool[4:8, 0, 0].tolist(), [16.0, 17.0, 18.0, 19.0])
         # Slot 0 stays untouched; outside rows only reach the trash row.
         self.assertEqual(cap.pool[:4, 0, 0].tolist(), [0.0] * 4)
-        cap.unbind(5)
+        # Row 5 now belongs to another request: releasing slot 0 leaves it bound.
+        cap.release(req_pool_idx=5, slot=0)
+        run([5], [17])
+        self.assertEqual(cap.pool[5, 0, 0].item(), 17.0)
+        cap.release(req_pool_idx=5, slot=1)
+        self.assertEqual(list(cap.free_slots), [1, 0, 1])
         cap.capture(
             residual=torch.full((1, 1, 1), 99.0),
             row_req=torch.tensor([5]),

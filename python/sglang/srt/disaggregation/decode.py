@@ -44,7 +44,6 @@ import msgspec
 import numpy as np
 import torch
 import torch.distributed as dist
-
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
@@ -63,6 +62,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
     HiCacheRestoreResult,
 )
+from sglang.srt.disaggregation.dsv41_late_tail import LateTailFeed
 from sglang.srt.disaggregation.minimax import minimax_index_transfer_pages
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.utils import (
@@ -74,11 +74,13 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     _is_fake_transfer,
     all_reduce_flags,
+    append_dsv41_late_tail_state,
     build_kv_layer_ids,
     build_staging_slot_metadata,
     dsv41_encoder_only_prefill_enabled,
     dsv41_encoder_only_unsupported,
     dsv41_encoder_prefix_len,
+    dsv41_late_tail_enabled,
     dsv41_late_tail_fed,
     dsv41_late_tail_prefix_len,
     dsv41_tail_can_feed,
@@ -101,6 +103,10 @@ from sglang.srt.disaggregation.utils import (
     state_indices_per_entry,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsv4.late_tail_inputs import (
+    LATE_TAIL_STAGING_TAILS,
+    LateTailStepInputs,
+)
 from sglang.srt.layers.dcp.layout import dsa_index_k_page_tokens
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import NextBatchPlan, ScheduleBatch
@@ -178,11 +184,6 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import ceil_align, is_npu, rank_consensus_checker
 from sglang.srt.utils.device import async_h2d
-from sglang.srt.disaggregation.dsv41_late_tail import LateTailFeed
-from sglang.srt.layers.attention.dsv4.late_tail_inputs import (
-    LATE_TAIL_STAGING_TAILS,
-    LateTailStepInputs,
-)
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -930,6 +931,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
             window_tails=storage.retained_window_lengths(),
         )
+        if dsv41_late_tail_enabled():
+            append_dsv41_late_tail_state(
+                kv_args, self.scheduler.tp_worker.model_runner.attn_backend
+            )
         if get_disagg().disaggregation_decode_host_receive_threshold < 1:
             pool = self.token_to_kv_pool
             group = self.tree_cache.host_pool_group
@@ -1794,7 +1799,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 break
 
             if (
-                decode_req.req.dsv41_late_fed
+                dsv41_late_tail_enabled()
+                and decode_req.req.dsv41_late_fed
                 and decode_req.req.dsv41_late_staging is None
             ):
                 # The late-only rows land in this slot; no slot, no transfer yet.
@@ -2249,6 +2255,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         def _request_row_payload():
             return np.array([decode_req.req.kv.req_pool_idx], dtype=np.int32)
 
+        def _late_tail_rows_payload():
+            slot = decode_req.req.dsv41_late_staging
+            return np.array([] if slot is None else [slot], dtype=np.int32)
+
         if StateType.DSV4_REQUEST_STATE in state_types and isinstance(
             self.token_to_kv_pool, DeepSeekV4TokenToKVPool
         ):
@@ -2269,6 +2279,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             StateType.SWA_RING: _swa_ring_payload,
             StateType.DSV4_REQUEST_STATE: _request_state_payload,
             StateType.REQUEST_ROW: _request_row_payload,
+            StateType.DSV41_LATE_TAIL_ROWS: _late_tail_rows_payload,
             StateType.BLOCK_SCALE: _full_kv_pages_payload,
             StateType.BLOCK_SCALE_SWA: _swa_payload,
         }
@@ -4008,7 +4019,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self._unregister_staging_room(room)
         # release pre-allocated kv cache, but don't insert into the tree since it's failed
         self.scheduler.request_retirer.release(decode_req.req, checkpoint=False)
-        self.scheduler._dsv41_release_late_staging(decode_req.req)
+        if dsv41_late_tail_enabled():
+            self.scheduler._dsv41_release_late_staging(decode_req.req)
         self.metadata_buffers.clear_slot(idx)
         self.req_to_metadata_buffer_idx_allocator.free(idx)
         if not self._is_host_destination(decode_req):

@@ -75,6 +75,8 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.layers.attention.dsv4.late_tail_inputs import (
+    LATE_TAIL_CAPTURE_SLOTS,
+    LateTailCapture,
     LateTailInputs,
     LateTailStepInputs,
     VerifyLateInputs,
@@ -1491,6 +1493,9 @@ class DeepseekV4AttnBackend(
         self.late_tail: Optional[LateTailInputs] = self._make_late_tail_inputs(
             model_runner
         )
+        self.late_tail_capture: Optional[LateTailCapture] = (
+            self._make_late_tail_capture(model_runner)
+        )
         self._verify_mask = None
         self.cuda_graph_swa_out_cache_loc: Optional[torch.Tensor] = None
         # Once a draft runner glues this prep (glue_draft_metadata): the draft
@@ -2543,6 +2548,25 @@ class DeepseekV4AttnBackend(
         )
 
         return Dsv41LateTailGraphVariants(inner=variants, backend=self)
+
+    def _make_late_tail_capture(self, model_runner) -> Optional[LateTailCapture]:
+        if not (
+            envs.SGLANG_DSV41_LATE_TAIL_ROWS.get() > 0
+            and get_disagg().dsv41_encoder_only_prefill
+            and get_disagg().disaggregation_mode == "prefill"
+            and not self.is_draft_runner
+        ):
+            return None
+        config = model_runner.model_config.hf_text_config
+        return LateTailCapture(
+            slots=LATE_TAIL_CAPTURE_SLOTS,
+            window=SWA_WINDOW,
+            num_req_rows=self.req_to_token.shape[0],
+            hc_mult=config.hc_mult,
+            hidden_size=config.hidden_size,
+            dtype=model_runner.dtype,
+            device=self.device,
+        )
 
     def set_verify_late_tail(self, step: Optional[LateTailStepInputs]) -> None:
         """Before each target verify, like set_verify_swa_floor."""

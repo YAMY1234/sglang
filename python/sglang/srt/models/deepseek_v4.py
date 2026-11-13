@@ -73,6 +73,7 @@ from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
     DeepseekV41Compressor,
     DeepseekV41Indexer,
+    token_req_indices,
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
 from sglang.srt.layers.attention.graph_utils import (
@@ -4587,6 +4588,15 @@ class DeepseekV4Model(nn.Module):
             if i == self.encoder_only_boundary_layer:
                 if _is_cuda:
                     state = hc_boundary.materialize(hidden_states, forward_batch)
+                capture = getattr(get_attn_backend(), "late_tail_capture", None)
+                if capture is not None and forward_batch.forward_mode.is_extend():
+                    # SGLANG_DSV41_LATE_TAIL_ROWS: the late layers' input for each
+                    # late-fed request's window rows, shipped to decode.
+                    capture.capture(
+                        residual=state.residual,
+                        row_req=token_req_indices(forward_batch),
+                        positions=positions,
+                    )
                 self.layers[i].write_global_cache_only(
                     positions=positions,
                     state=state,

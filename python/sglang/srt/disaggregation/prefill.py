@@ -29,7 +29,6 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 
 import numpy as np
 import torch
-
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.checksum import (
@@ -52,11 +51,14 @@ from sglang.srt.disaggregation.utils import (
     NetworkTransferWaiter,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    append_dsv41_late_tail_state,
     build_kv_layer_ids,
     build_staging_slot_metadata,
     dsv41_encoder_only_prefill_enabled,
     dsv41_encoder_only_unsupported,
     dsv41_encoder_prefix_len,
+    dsv41_late_tail_enabled,
+    dsv41_late_tail_fed,
     get_dsa_tail_state_indices,
     get_kv_class,
     get_kv_transfer_buf_infos,
@@ -459,6 +461,10 @@ class PrefillBootstrapQueue:
             self.scheduler.model_config.num_hidden_layers,
             window_tails=storage.retained_window_lengths(),
         )
+        if dsv41_late_tail_enabled():
+            append_dsv41_late_tail_state(
+                kv_args, self.scheduler.tp_worker.model_runner.attn_backend
+            )
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager_kwargs = (
@@ -529,6 +535,16 @@ class PrefillBootstrapQueue:
         assert req.pending_bootstrap, "finalize_bootstrap is not idempotent"
         if not self.ensure_metadata_buffer(req):
             return False
+        if (
+            dsv41_late_tail_enabled()
+            and req.dsv41_late_fed
+            and req.dsv41_late_capture_slot is None
+        ):
+            # The window's late-layer input ships from this slot; wait for one.
+            capture = self.scheduler._dsv41_late_capture()
+            if not capture.free_slots:
+                return False
+            req.dsv41_late_capture_slot = capture.free_slots.popleft()
 
         req.time_stats.set_bootstrap_done_time()
         decode_prefix_len = req.disagg_kv_sender.pop_decode_prefix_len()
@@ -705,11 +721,39 @@ class SchedulerDisaggregationPrefillMixin:
             return False
         # Decode computes every logit, so prefill returns none.
         req.return_logprob = False
-        prefix_len = dsv41_encoder_prefix_len(
-            len(req.origin_input_ids), self.model_config.sliding_window_size
-        )
+        prompt_len = len(req.origin_input_ids)
+        window = self.model_config.sliding_window_size
+        prefix_len = dsv41_encoder_prefix_len(prompt_len, window)
         req.origin_input_ids = req.origin_input_ids[:prefix_len]
+        # SGLANG_DSV41_LATE_TAIL_ROWS: the late layers' input of the last window
+        # ships with the KV.
+        if dsv41_late_tail_enabled():
+            req.dsv41_late_fed = dsv41_late_tail_fed(prompt_len, window)
+        if req.dsv41_late_fed:
+            req.dsv41_late_capture_start = prefix_len - window
         return True
+
+    def _dsv41_late_capture(self: Scheduler):
+        return self.tp_worker.model_runner.attn_backend.late_tail_capture
+
+    def _bind_dsv41_late_capture(self: Scheduler, batch: ScheduleBatch) -> None:
+        """Point each late-fed request's pool row at its capture slot before the
+        forward that computes its window."""
+        capture = self._dsv41_late_capture()
+        for req in batch.reqs:
+            if req.dsv41_late_capture_slot is not None:
+                capture.bind(
+                    req_pool_idx=req.kv.req_pool_idx,
+                    slot=req.dsv41_late_capture_slot,
+                    window_start=req.dsv41_late_capture_start,
+                )
+
+    def _release_dsv41_late_capture(self: Scheduler, req: Req) -> None:
+        if req.dsv41_late_capture_slot is not None:
+            self._dsv41_late_capture().release(
+                req_pool_idx=req.kv.req_pool_idx, slot=req.dsv41_late_capture_slot
+            )
+            req.dsv41_late_capture_slot = None
 
     def send_dsv41_empty_handoff(self: Scheduler, req: Req) -> None:
         """Hand off a prompt that fits in one window: decode runs all of it."""
@@ -746,6 +790,8 @@ class SchedulerDisaggregationPrefillMixin:
             except Exception:
                 logger.exception("Failed to clear KV sender for %s", req.rid)
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
+        if dsv41_late_tail_enabled():
+            self._release_dsv41_late_capture(req)
         req.pending_bootstrap = False
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
@@ -813,6 +859,8 @@ class SchedulerDisaggregationPrefillMixin:
         prefill_plan = self.get_new_batch_prefill(running_batch)
         batch = prefill_plan.batch_to_run
         running_batch = prefill_plan.running_batch
+        if batch is not None and dsv41_late_tail_enabled():
+            self._bind_dsv41_late_capture(batch)
         batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
 
         if batch:
@@ -1508,6 +1556,8 @@ class SchedulerDisaggregationPrefillMixin:
             maybe_release_metadata_buffer(
                 req, self.req_to_metadata_buffer_idx_allocator
             )
+            if dsv41_late_tail_enabled():
+                self._release_dsv41_late_capture(req)
 
         return done_reqs
 
@@ -1904,6 +1954,10 @@ class SchedulerDisaggregationPrefillMixin:
             def _request_row_payload():
                 return np.array([req.kv.req_pool_idx], dtype=np.int32)
 
+            def _late_tail_rows_payload():
+                slot = req.dsv41_late_capture_slot
+                return np.array([] if slot is None else [slot], dtype=np.int32)
+
             state_types = (
                 self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
             )
@@ -1919,6 +1973,7 @@ class SchedulerDisaggregationPrefillMixin:
                 StateType.SWA_RING: _swa_ring_payload,
                 StateType.DSV4_REQUEST_STATE: _request_state_payload,
                 StateType.REQUEST_ROW: _request_row_payload,
+                StateType.DSV41_LATE_TAIL_ROWS: _late_tail_rows_payload,
                 StateType.BLOCK_SCALE: _full_kv_pages_payload,
                 StateType.BLOCK_SCALE_SWA: _swa_payload,
             }
@@ -2077,6 +2132,8 @@ class SchedulerDisaggregationPrefillMixin:
             maybe_release_metadata_buffer(
                 req, self.req_to_metadata_buffer_idx_allocator
             )
+            if dsv41_late_tail_enabled():
+                self._release_dsv41_late_capture(req)
             move([req], self.disagg_prefill_bootstrap_queue.queue)
         else:
             req.prefill_attempt_count += 1

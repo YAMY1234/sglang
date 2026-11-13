@@ -18,6 +18,9 @@ import torch
 # Arbitrary: tails staged per decode rank (5.24 MB each at window 128); the scheduler
 # admits no more late-fed transfers than this.
 LATE_TAIL_STAGING_TAILS = 64
+# Arbitrary: late-fed requests a prefill rank holds from bootstrap to the end of their
+# transfer; bootstrap waits when all are taken.
+LATE_TAIL_CAPTURE_SLOTS = 64
 
 
 class LateTailStepInputs(msgspec.Struct, frozen=True):
@@ -73,6 +76,14 @@ class LateTailInputs:
         )
         self.active = False
         self._row_offsets = torch.arange(width, dtype=torch.int64, device=device)
+
+    def transfer_buf_infos(self):
+        window = self.staging.shape[0] // LATE_TAIL_STAGING_TAILS
+        return (
+            [self.staging.data_ptr()],
+            [self.staging.nbytes],
+            [self.staging[:window].nbytes],
+        )
 
     def set_step(self, step: Optional[LateTailStepInputs]) -> None:
         """Before each target verify; None or an inactive step clears every slot."""
@@ -160,17 +171,27 @@ class LateTailCapture:
         )
         self.start_of_row = torch.zeros(num_req_rows, dtype=torch.int64, device=device)
         self.free_slots = deque(range(slots))
+        # Host mirror of slot_of_row's bound entries: a row the pool reused for
+        # another request keeps that request's binding.
+        self._bound = {}
 
     def transfer_buf_infos(self):
         rows = self.pool[: self.pool.shape[0] - 1]
         return [rows.data_ptr()], [rows.nbytes], [self.pool[: self.window].nbytes]
 
     def bind(self, *, req_pool_idx: int, slot: int, window_start: int) -> None:
+        if self._bound.get(req_pool_idx) == slot:
+            return
+        self._bound[req_pool_idx] = slot
         self.slot_of_row[req_pool_idx] = slot
         self.start_of_row[req_pool_idx] = window_start
 
-    def unbind(self, req_pool_idx: int) -> None:
-        self.slot_of_row[req_pool_idx] = -1
+    def release(self, *, req_pool_idx: Optional[int], slot: int) -> None:
+        """Return the slot once its transfer is over; clear the row if still its."""
+        if req_pool_idx is not None and self._bound.get(req_pool_idx) == slot:
+            del self._bound[req_pool_idx]
+            self.slot_of_row[req_pool_idx] = -1
+        self.free_slots.append(slot)
 
     def capture(
         self, *, residual: torch.Tensor, row_req: torch.Tensor, positions: torch.Tensor
