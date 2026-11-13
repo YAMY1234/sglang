@@ -994,10 +994,11 @@ class TestLateTailScheduling(CustomTestCase):
         self.assertEqual(list(sched.dsv41_late_retiring), [(2, 0)])
 
 
+@patch("sglang.srt.disaggregation.decode.dsv41_late_tail_enabled", return_value=True)
 @patch("sglang.srt.disaggregation.decode.set_time_batch")
 @patch("sglang.srt.disaggregation.decode.ScheduleBatch")
 class TestLateFedAdmission(CustomTestCase):
-    def test_late_fed_tail_floors_at_the_prompt_window(self, schedule_batch, _):
+    def test_late_fed_tail_floors_at_the_prompt_window(self, schedule_batch, *_):
         done = _late_req(1001, pool_idx=1)
         done.dsv41_late_pending = False
         pending = _late_req(1001, pool_idx=2)
@@ -1006,8 +1007,10 @@ class TestLateFedAdmission(CustomTestCase):
         with envs.SGLANG_DSV41_FUSED_TAIL.override(True):
             Mixin._admit_dsv41_fed_tails(sched, running)
         self.assertEqual(schedule_batch.init_new.call_args.args[0], [done])
-        # Fed from e = 1000; the late layers read the window the late rows wrote.
-        self.assertEqual((done.dsv41_feed_next, done.dsv41_feed_prompt_left), (1000, 0))
+        # Fed from e = 1000, which is also the KV it enters with (prepare_for_prebuilt);
+        # the late layers read the window the late rows wrote.
+        self.assertEqual((done.dsv41_feed_floor, done.dsv41_feed_next), (1000, 1000))
+        self.assertEqual(done.dsv41_feed_prompt_left, 0)
         batch = _decode_batch([done])
         Mixin._set_dsv41_feed_inputs(_sched(), batch)
         self.assertEqual(batch.dsv41_swa_floor.tolist(), [1001 - 128])

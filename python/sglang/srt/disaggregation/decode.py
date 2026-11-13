@@ -4667,12 +4667,7 @@ class SchedulerDisaggregationDecodeMixin:
             req.already_computed = start
             req._cache_breakdown_computed = True
             req.dsv41_tail_start = None
-            # A late-fed tail's late layers already hold the window below start.
-            req.dsv41_feed_floor = (
-                start - self.model_config.sliding_window_size
-                if req.dsv41_late_fed
-                else start
-            )
+            req.dsv41_feed_floor = start
             req.dsv41_feed_next = start
             req.dsv41_feed_prompt_left = len(req.origin_input_ids) - 1 - start
         set_time_batch(fed, "set_forward_entry_time")
@@ -4730,6 +4725,7 @@ class SchedulerDisaggregationDecodeMixin:
         # The verify width the DSpark worker resolved (draft block + 1).
         width = self.model_worker.verify_num_draft_tokens
         window = self.model_config.sliding_window_size
+        late_tail = dsv41_late_tail_enabled()
         forced = [[-1] * width for _ in batch.reqs]
         floor = [0] * len(batch.reqs)
         for i, req in enumerate(batch.reqs):
@@ -4741,8 +4737,13 @@ class SchedulerDisaggregationDecodeMixin:
             forced[i] = [-2] * width
             forced[i][: end - p - 1] = prompt[p + 1 : end]
             # The tail extend's bounded replay starts the late layers at the last
-            # window, one row past the tail start for a 129-token tail.
-            floor[i] = max(req.dsv41_feed_floor, len(prompt) - window)
+            # window, one row past the tail start for a 129-token tail. A late-fed
+            # tail's late layers already hold that window below its start.
+            floor[i] = (
+                len(prompt) - window
+                if late_tail and req.dsv41_late_fed
+                else max(req.dsv41_feed_floor, len(prompt) - window)
+            )
             nxt = p + width
             # A step ending on the last prompt token leaves the first output to
             # the next step, which stays in the feed with no prompt rows.
