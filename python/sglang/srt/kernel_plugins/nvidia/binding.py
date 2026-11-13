@@ -37,6 +37,7 @@ from sglang.kernels.plugin_kernels.nvidia.spec import (
     PostVerifyStrategy,
     SpeculativeRuntimeHooks,
     Step,
+    SupportsPrefillBody,
     SupportsStateSlotReset,
     find_spec,
     registered_architectures,
@@ -394,7 +395,7 @@ class MegakernelBinding:
         return view
 
     def prefill_view(self) -> ForwardView:
-        """The view for an eager prefill step, without graph-static decode metadata."""
+        """The view for a prefill step or body, without graph-static decode metadata."""
         return self.forward_view(forward_batch=None)
 
     def seal_capture_view(self, forward_batch: ForwardBatch, view: ForwardView) -> None:
@@ -1269,6 +1270,8 @@ def install_megakernel(
     )
     dispatch = _Dispatch(built=built, original=model.forward, binding=binding)
     model.forward = dispatch.wrapped()
+    if spec.prefill_graph:
+        _install_prefill_body(model, spec=spec, dispatch=dispatch)
     if _decode_graphs_enabled():
         capture_tail_hooks.append(_CaptureCheck(spec=spec, dispatch=dispatch))
 
@@ -1567,6 +1570,50 @@ class _Dispatch:
             )
 
         return forward
+
+    def wrapped_body(self, original: Callable) -> Callable:
+        # The prefill graph runner inspects the layer module's forward signature.
+        @functools.wraps(original)
+        def forward(input_ids, positions, forward_batch, *args, **kwargs):
+            step = self.built.plan_body(input_ids, forward_batch, *args, **kwargs)
+            if step is None:
+                return original(input_ids, positions, forward_batch, *args, **kwargs)
+            view = (
+                self.binding.prefill_view()
+                if isinstance(self.binding, MegakernelBinding)
+                else self.binding.prefill_view(forward_batch)
+            )
+            return self.built.forward_body(
+                msgspec.structs.replace(step, view=view),
+                original,
+                input_ids,
+                positions,
+                forward_batch,
+                *args,
+                **kwargs,
+            )
+
+        return forward
+
+
+def _install_prefill_body(
+    model: torch.nn.Module, *, spec: MegakernelSpec, dispatch: _Dispatch
+) -> None:
+    """Route the transformer body a breakable prefill graph captures (the layer
+    module's forward, resolved as the graph runner resolves it) to the build."""
+    from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+        _resolve_transformer_layer_model,
+    )
+
+    if not isinstance(dispatch.built, SupportsPrefillBody):
+        _refuse([f"{spec.name} sets prefill_graph without plan_body / forward_body"])
+    layer_model = _resolve_transformer_layer_model(model)
+    layer_model.forward = dispatch.wrapped_body(layer_model.forward)
+    logger.info(
+        "NVIDIA megakernel: %s plans the prefill body (%s.forward)",
+        spec.name,
+        type(layer_model).__name__,
+    )
 
 
 class _CaptureCheck:

@@ -601,6 +601,13 @@ class TestEagleBinding(CustomTestCase):
         self.assertIs(view.extend_prefix_lens, forward_batch.extend_prefix_lens)
         self.assertIs(view.track_chunk_idx, meta.track_chunk_idx)
         self.assertIs(view.track_ssm_h_batch_src, meta.track_ssm_h_batch_src)
+        self.assertEqual((view.is_graph, view.prefill_graph_metadata), (False, None))
+        # a prefill graph's capture or replay reads the bucket's static tables
+        linear.prefill_graph_metadata = SimpleNamespace(flashinfer=None)
+        with patch.object(eb, "get_attn_backend", return_value=backend):
+            view = binding.prefill_view(forward_batch)
+        self.assertTrue(view.is_graph)
+        self.assertIs(view.prefill_graph_metadata, linear.prefill_graph_metadata)
 
     def test_existing_forward_wrapper_selects_the_prefill_data_view(self):
         views = SimpleNamespace(
