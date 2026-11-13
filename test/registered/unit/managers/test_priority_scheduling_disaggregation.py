@@ -510,6 +510,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         scheduler.request_receiver.has_pending.return_value = False
         scheduler.enable_hierarchical_cache = False
         scheduler.enable_lmcache = False
+        scheduler.enable_hisparse = False
 
         self.assertTrue(scheduler.is_fully_idle(for_health_check=True))
         self.assertFalse(scheduler.is_fully_idle())

@@ -738,7 +738,7 @@ class TestAllocationIntegration(CustomTestCase):
                 )
             queue.pp_rank, queue.pp_size = pp_rank, len(senders)
             queue.pp_poll_sync_work_list = []
-            queue.room_waiters = IndexedReqList(ListKind.PD_ROOM_WAITERS)
+            queue.room_waiters = []
             scheduler.processed_tokens_counter = 0
             queue.scheduler = scheduler
             queue.scheduler_stage_metrics = None
@@ -895,10 +895,8 @@ class TestAllocationIntegration(CustomTestCase):
         table.conclude(1)
         queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
         queue.kv_manager = SimpleNamespace(deferred_bootstrap=table)
-        queue.queue = IndexedReqList(ListKind.PD_BOOTSTRAP)
-        queue.room_waiters = IndexedReqList(
-            ListKind.PD_ROOM_WAITERS, req_of=lambda waiter: waiter[0]
-        )
+        queue.queue = []
+        queue.room_waiters = []
         queue.create_sender = Mock(return_value=True)
         req = SimpleNamespace(
             to_finish=None,
@@ -1080,8 +1078,15 @@ class TestAllocationIntegration(CustomTestCase):
         self.prefill.conclude_transfer(
             bootstrap_room=1, status=KVPoll.Success, targets=[DECODE]
         )
+        # afcd7d6b's sender.abort() concludes through conclude_transfer, which
+        # also calls send_kv_status_message with no targets; count wire sends.
         self.assertEqual(
-            [call.kwargs["status"] for call in send.call_args_list], [KVPoll.Failed]
+            [
+                call.kwargs["status"]
+                for call in send.call_args_list
+                if call.kwargs["targets"]
+            ],
+            [KVPoll.Failed],
         )
         self.flush()
         self.assertEqual(receiver.poll(), KVPoll.Failed)
