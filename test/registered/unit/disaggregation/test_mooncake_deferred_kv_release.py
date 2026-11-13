@@ -21,6 +21,7 @@ from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import AckTarget, CommonKVManager
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, TransferInfo
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -228,6 +229,41 @@ class TestMooncakeAbortNotification(
 
                 manager.send_aux.assert_called_once()
                 self.assertEqual(manager._sent, [])
+
+
+class TestMooncakeLastChunkWithoutAux(CustomTestCase):
+    """A PP prefill stage that sends its last chunk before the first token reaches
+    it (SGLANG_PP_PD_PREFILL_EARLY_SEND) leaves the aux write to the last stage."""
+
+    def test_last_chunk_without_aux_sends_state_and_concludes(self):
+        manager = _manager()
+        TestMooncakeAbortNotification._prepare_worker(self, manager)
+        manager.disaggregation_mode = DisaggregationMode.PREFILL
+        manager.transfer_queues = [MagicMock()]
+        (info,) = manager.transfer_infos[ROOM].values()
+        manager.transfer_infos[ROOM] = {f"{DECODE_IP}:{DECODE_PORT}": info}
+        with self.assertRaises(AssertionError):
+            manager.add_transfer_request(
+                ROOM, np.array([1], dtype=np.int32), slice(0, 1), True
+            )
+        manager.add_transfer_request(
+            ROOM,
+            np.array([1], dtype=np.int32),
+            slice(0, 1),
+            True,
+            aux_index=3,
+            state_indices=[[1]],
+            send_aux=False,
+        )
+        chunk = manager.transfer_queues[0].put.call_args.args[0]
+        self.assertIsNone(chunk.prefill_aux_index)
+
+        queue = MagicMock()
+        queue.get.side_effect = [chunk, None]
+        manager.transfer_worker(queue, MagicMock())
+        manager.maybe_send_extra.assert_called_once()
+        manager.send_aux.assert_not_called()
+        self.assertEqual(manager.request_status[ROOM], KVPoll.Success)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
+from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -162,3 +163,57 @@ class TestPrefillCompleteResult(CustomTestCase):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+class TestEarlySentLastChunkResult(CustomTestCase):
+    """SGLANG_PP_PD_PREFILL_EARLY_SEND: a PP stage already sent the last chunk when
+    its forward completed; the result still records the request but sends nothing."""
+
+    def setUp(self):
+        super().setUp()
+        override = get_context().override_server_args(
+            disaggregation_decode_allocation_policy="early"
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+    @patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache")
+    def test_result_skips_the_early_sent_send(self, checkpoint):
+        for early_sent in (True, False):
+            with self.subTest(early_sent=early_sent):
+                scheduler = _Scheduler()
+                del scheduler.send_kv_chunk  # the real one, over a stub transfer
+                scheduler._send_kv_chunk = Mock()
+                scheduler.kv_checksum_computer = None
+                req = _Req(inflight_middle_chunks=0)
+                req.to_finish = None
+                req.pending_bootstrap = False
+                req.bootstrap_room = 5
+                req.time_stats.set_prefill_transfer_queue_entry_time = Mock()
+                order = []
+                status = SimpleNamespace(
+                    get=lambda room: order.append("transfer ended") or KVPoll.Success
+                )
+                req.disagg_kv_sender.kv_mgr = SimpleNamespace(
+                    request_status=status, _staging_outstanding={}
+                )
+                scheduler.disagg_prefill_early_sent_rids = (
+                    {req.rid} if early_sent else set()
+                )
+                # Its transfer must have ended before the checkpoint can dedupe:
+                # the PP loop settles the batch's early sends first.
+                checkpoint.side_effect = lambda *a: order.append("checkpoint")
+                batch = _batch(req)
+                scheduler._pp_pd_settle_early_sends(batch)
+                scheduler.process_batch_result_disagg_prefill(batch, _result())
+                self.assertEqual(req.output_ids, [11])
+                self.assertEqual(scheduler.disagg_prefill_inflight_queue, [req])
+                self.assertEqual(scheduler.disagg_prefill_early_sent_rids, set())
+                if early_sent:
+                    self.assertEqual(order[:2], ["transfer ended", "checkpoint"])
+                    scheduler._send_kv_chunk.assert_not_called()
+                else:
+                    self.assertEqual(order, ["checkpoint"])
+                    scheduler._send_kv_chunk.assert_called_once_with(
+                        req, last_chunk=True, end_idx=None
+                    )

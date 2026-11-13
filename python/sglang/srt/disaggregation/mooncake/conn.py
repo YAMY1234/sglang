@@ -3019,11 +3019,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     )
                                     break
 
-                            # Only the last chunk we need to send the aux data
-                            ret = self.send_aux(
-                                req,
-                                kv_chunk.prefill_aux_index,
-                                target_rank_registration_info.dst_aux_ptrs,
+                            # Only the last chunk we need to send the aux data;
+                            # no aux index: another PP stage sends it.
+                            ret = (
+                                0
+                                if kv_chunk.prefill_aux_index is None
+                                else self.send_aux(
+                                    req,
+                                    kv_chunk.prefill_aux_index,
+                                    target_rank_registration_info.dst_aux_ptrs,
+                                )
                             )
                             if ret != 0:
                                 # The aux write targets decode's metadata
@@ -3316,9 +3321,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         wait_event: Optional[object] = None,
         indices_event: Optional[object] = None,
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
+        send_aux: bool = True,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
-        assert not is_last_chunk or (is_last_chunk and aux_index is not None)
+        assert not is_last_chunk or not send_aux or aux_index is not None
+        if not send_aux:
+            # Another PP stage writes this room's aux
+            # (SGLANG_PP_PD_PREFILL_EARLY_SEND).
+            aux_index = None
 
         if (
             bootstrap_room not in self.request_status
@@ -3544,12 +3554,14 @@ class MooncakeKVSender(CommonKVSender):
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
         indices_event: Optional[object] = None,
+        send_aux: bool = True,
     ):
         super().send(
             kv_indices=kv_indices,
             state_indices=state_indices,
             num_kv_tokens=num_kv_tokens,
             indices_event=indices_event,
+            send_aux=send_aux,
         )
 
     def _record_transfer_indices(

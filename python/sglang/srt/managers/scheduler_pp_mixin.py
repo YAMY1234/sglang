@@ -115,6 +115,8 @@ class SchedulerPPMixin:
     # ran init_pp_loop_state (plain TP, unit-test doubles) read False;
     # init_pp_loop_state overwrites it per instance.
     _pp_spec_relay: bool = False
+    # Scheduler.__init__ sets it under SGLANG_HICACHE_WB_EVICT_RELAXED_FENCE.
+    _hicache_fence_controller = None
 
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -280,6 +282,16 @@ class SchedulerPPMixin:
                 release_relay,
                 pp_sync_window(),
             )
+        early_send = self._pp_pd_early_send_enabled()
+        if early_send:
+            self.disagg_prefill_early_sent_rids = set()
+            self.disagg_prefill_early_send_pending = deque()
+            self.disagg_prefill_early_send_stats = {"early": 0, "waited": 0}
+            logger.info(
+                "PP PD prefill: each stage sends a request's last KV chunk when its "
+                "own forward of it completes; the last stage sends the first-token "
+                "metadata (SGLANG_PP_PD_PREFILL_EARLY_SEND)."
+            )
 
         while True:
             server_is_idle = True
@@ -346,6 +358,12 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                    if early_send:
+                        self._pp_pd_early_send_last_chunks(
+                            cur_batch, result, self.launch_event
+                        )
+                if early_send:
+                    self._pp_pd_flush_early_sends()
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -368,6 +386,14 @@ class SchedulerPPMixin:
                         SCHEDULER_STAGE_PP_OUTPUT_WAIT
                     ):
                         d2h_event.synchronize()
+                    if early_send:
+                        # This result must find its early sends made and ended. Forwards
+                        # before the one just launched are done by now or nearly, and
+                        # that one is queued, so waiting on them leaves the GPU busy.
+                        self._pp_pd_flush_early_sends(
+                            max(self.mbs[next_mb_id].forward_iter, self.forward_ct - 1)
+                        )
+                        self._pp_pd_settle_early_sends(self.mbs[next_mb_id])
                     self._pp_process_batch_result(
                         self.mbs[next_mb_id],
                         next_batch_result,
@@ -1748,6 +1774,12 @@ class SchedulerPPMixin:
         with torch.profiler.record_function("run_batch"):
             with self.forward_stream_ctx:
                 self._pp_wait_forward_dependencies()
+                if self._hicache_fence_controller is not None:
+                    # Write-back eviction fence (SGLANG_HICACHE_WB_EVICT_RELAXED_FENCE):
+                    # covers earlier forwards and the schedule work this one waited on.
+                    self._hicache_fence_controller.record_forward_start(
+                        self.forward_stream.record_event()
+                    )
                 set_time_batch(
                     cur_batch.reqs,
                     "set_run_batch_cpu_start_time",
@@ -1778,6 +1810,12 @@ class SchedulerPPMixin:
                             ),
                         )
                     )
+        if self._hicache_fence_controller is not None:
+            # The PP loop has no WAR barrier; its proxy or output send makes the
+            # schedule stream wait on this forward, so mark that point here.
+            self._hicache_fence_controller.record_war_barrier(
+                self.schedule_stream.record_event()
+            )
         return result, event
 
     def get_rids(
