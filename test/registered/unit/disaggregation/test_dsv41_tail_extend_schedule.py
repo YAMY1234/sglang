@@ -45,6 +45,7 @@ def _req(prompt_len):
         already_computed=0,
         _cache_breakdown_computed=False,
         logprob_start_len=prompt_len,
+        dsv41_late_pending=False,
     )
 
 

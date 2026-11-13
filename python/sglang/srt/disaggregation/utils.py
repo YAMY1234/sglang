@@ -1989,6 +1989,14 @@ def dsv41_encoder_prefix_len(prompt_len: int, window: int) -> int:
     return max(0, prompt_len - window) // 2 * 2
 
 
+def dsv41_late_tail_fed(prompt_len: int, window: int) -> bool:
+    """Whether dsv41_encoder_prefix_len splits this prompt for a late-fed tail."""
+    return (
+        envs.SGLANG_DSV41_LATE_TAIL_ROWS.get() > 0
+        and dsv41_late_tail_prefix_len(prompt_len, window) is not None
+    )
+
+
 def dsv41_late_tail_prefix_len(prompt_len: int, window: int) -> Optional[int]:
     """The prefix a late-fed tail's prefill covers (SGLANG_DSV41_LATE_TAIL_ROWS), or
     None for a prompt too short to late-feed.
@@ -2051,6 +2059,7 @@ def dsv41_tail_can_feed(req: Req) -> bool:
         and req.kv.kv_allocated_len == req.dsv41_tail_start
         and len(req.output_ids) == 0
         and req.grammar is None
+        and not req.dsv41_late_pending
     )
 
 

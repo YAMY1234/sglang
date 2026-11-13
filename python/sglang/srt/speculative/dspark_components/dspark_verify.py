@@ -280,15 +280,23 @@ class TargetVerifyExecutor:
         *,
         batch: ScheduleBatch,
         idle_layout: Optional[RaggedVerifyLayout],
+        dense_slot: bool = False,
     ) -> None:
         """Run a dummy target-verify forward so an idle DP rank joins the
-        token-keyed collective ops of the busy ranks' verify step."""
+        token-keyed collective ops of the busy ranks' verify step. ``dense_slot``
+        runs one dummy verify slot in the dense layout, the carrier of this step's
+        late-only tail rows (SGLANG_DSV41_LATE_TAIL_ROWS)."""
         device = self.model_runner.device
         if self.verify_epilogue is not None:
             self.verify_epilogue.begin_step(None, armed=False)
-        num_dummy_tokens = (
-            idle_layout.graph_num_tokens if idle_layout is not None else 0
-        )
+        if idle_layout is not None:
+            num_dummy_slots = int(idle_layout.verify_lens.numel())
+            num_dummy_tokens = idle_layout.graph_num_tokens
+        elif dense_slot:
+            num_dummy_slots = 1
+            num_dummy_tokens = self.verify_num_draft_tokens
+        else:
+            num_dummy_slots = num_dummy_tokens = 0
         verify_input = DFlashVerifyInput(
             draft_token=torch.zeros(
                 (num_dummy_tokens,), dtype=torch.int64, device=device
@@ -304,8 +312,7 @@ class TargetVerifyExecutor:
         batch.out_cache_loc = torch.zeros(
             (num_dummy_tokens,), dtype=torch.int64, device=device
         )
-        if idle_layout is not None:
-            num_dummy_slots = int(idle_layout.verify_lens.numel())
+        if num_dummy_slots:
             batch.seq_lens = torch.ones(
                 (num_dummy_slots,), dtype=torch.int64, device=device
             )

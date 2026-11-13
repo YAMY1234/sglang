@@ -1003,6 +1003,9 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         if batch.forward_mode.is_idle():
             self._observers.note_idle_decode_step()
+            late_slot = (
+                batch.dsv41_late_tail is not None and batch.dsv41_late_tail.active
+            )
             if get_parallel().attn_dp_enabled:
                 if self._draft_is_moe:
                     self._proposer.run_idle_participation(batch)
@@ -1011,7 +1014,13 @@ class DSparkWorkerV2(BaseSpecWorker):
                         batch, "target", rank, local_only=target_local_only
                     )
                 self._verify_executor.run_idle_participation(
-                    batch=batch, idle_layout=self._idle_verify_ragged_layout(batch)
+                    batch=batch,
+                    idle_layout=self._idle_verify_ragged_layout(batch),
+                    dense_slot=late_slot,
+                )
+            elif late_slot:
+                self._verify_executor.run_idle_participation(
+                    batch=batch, idle_layout=None, dense_slot=True
                 )
             return self._decode_idle_result(on_publish=on_publish)
 

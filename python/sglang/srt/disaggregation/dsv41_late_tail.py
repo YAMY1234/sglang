@@ -71,6 +71,14 @@ class LateTailFeed:
             )
         )
 
+    def drop(self, predicate) -> List[Tuple["Req", int]]:
+        """Remove the tails whose request matches (aborted ones); returns each with
+        its staging slot."""
+        dropped = [(t.req, t.staging_slot) for t in self._tails if predicate(t.req)]
+        if dropped:
+            self._tails = deque(t for t in self._tails if not predicate(t.req))
+        return dropped
+
     def pending_rows(self) -> int:
         return sum(t.end - t.next_position for t in self._tails)
 

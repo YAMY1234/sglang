@@ -516,6 +516,12 @@ class Req(ReqDllmMixin):
         self.dsv41_feed_floor: Optional[int] = None
         self.dsv41_feed_next: Optional[int] = None
         self.dsv41_feed_prompt_left: int = 0
+        # SGLANG_DSV41_LATE_TAIL_ROWS: the transferred prefix ends at the late-fed
+        # split (late_fed); its late-only rows are still to run (late_pending), from
+        # this staging slot once staged.
+        self.dsv41_late_fed: bool = False
+        self.dsv41_late_pending: bool = False
+        self.dsv41_late_staging: Optional[int] = None
         self.dllm_initialized: bool = False
 
         self.session = session
@@ -1538,6 +1544,8 @@ class Req(ReqDllmMixin):
         self.dsv41_feed_floor = None
         self.dsv41_feed_next = None
         self.dsv41_feed_prompt_left = 0
+        self.dsv41_late_fed = False
+        self.dsv41_late_pending = False
         self.mamba_branching_seqlen = None
         self.already_computed = 0
         self.kv.reset_for_retract()
@@ -2055,6 +2063,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # SGLANG_DSV41_LATE_TAIL_ROWS: this step's late-only pseudo-slots
     # (LateTailStepInputs), decode verify steps only, rebuilt every step.
     dsv41_late_tail: Optional[object] = None
+    # Gathered in the MLP sync: whether any attention-DP rank runs late rows this step.
+    dsv41_late_tail_any: bool = False
 
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
     seq_lens: torch.Tensor = None  # shape: [b], int64

@@ -79,6 +79,8 @@ from sglang.srt.disaggregation.utils import (
     dsv41_encoder_only_prefill_enabled,
     dsv41_encoder_only_unsupported,
     dsv41_encoder_prefix_len,
+    dsv41_late_tail_fed,
+    dsv41_late_tail_prefix_len,
     dsv41_tail_can_feed,
     end_network_transfer,
     get_dsa_tail_state_indices,
@@ -176,6 +178,11 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import ceil_align, is_npu, rank_consensus_checker
 from sglang.srt.utils.device import async_h2d
+from sglang.srt.disaggregation.dsv41_late_tail import LateTailFeed
+from sglang.srt.layers.attention.dsv4.late_tail_inputs import (
+    LATE_TAIL_STAGING_TAILS,
+    LateTailStepInputs,
+)
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -1155,10 +1162,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # prompt plus all output but the pending last id); the tail extend here
             # runs the rest and samples the next token.
             req.dsv41_tail_start = None
-            req.dsv41_tail_start = dsv41_encoder_prefix_len(
-                pre_alloc_fill_len(req),
-                self.scheduler.model_config.sliding_window_size,
-            )
+            fill_len = pre_alloc_fill_len(req)
+            window = self.scheduler.model_config.sliding_window_size
+            req.dsv41_tail_start = dsv41_encoder_prefix_len(fill_len, window)
+            # SGLANG_DSV41_LATE_TAIL_ROWS: prefill ran the tail's early layers too;
+            # its late-only rows run before the tail joins decode.
+            req.dsv41_late_fed = dsv41_late_tail_fed(fill_len, window)
+            req.dsv41_late_pending = req.dsv41_late_fed
 
         if self._check_if_req_exceed_kv_capacity(req):
             return
@@ -4302,6 +4312,9 @@ class SchedulerDisaggregationDecodeMixin:
         can_run_list: List[Req] = []
         num_tokens = num_alloc_tokens = 0
         for req in self.waiting_queue:
+            if req.dsv41_late_pending:
+                # Its late-only rows still run in the verify steps first.
+                continue
             fill_len = len(req.full_untruncated_fill_ids)
             tail_len = fill_len - req.dsv41_tail_start
             alloc_len = ceil_align(fill_len, page_size) - ceil_align(
@@ -4365,7 +4378,11 @@ class SchedulerDisaggregationDecodeMixin:
         self: Scheduler, running_batch: ScheduleBatch
     ) -> NextBatchPlan:
         """Process prebuilt batch and schedule the next decode batch."""
+        late_feed = None
         if dsv41_encoder_only_prefill_enabled():
+            late_feed = self._dsv41_late_tail_feed()
+            if late_feed is not None:
+                self._stage_dsv41_late_tails(late_feed)
             running_batch = self._merge_dsv41_tail_extend(running_batch)
             running_batch = self._admit_dsv41_fed_tails(running_batch)
             tail_batch = self._get_new_dsv41_tail_extend_batch(running_batch)
@@ -4412,12 +4429,106 @@ class SchedulerDisaggregationDecodeMixin:
             running_batch = self.update_running_batch(running_batch)
             ret = running_batch if not running_batch.is_empty() else None
 
-        ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret)
+        late_rows = 0 if late_feed is None else late_feed.pending_rows()
+        if ret is None and late_rows > 0:
+            # Late-only rows run in a verify step even with nothing running here.
+            ret = self.dp_attn_adapter.get_idle_batch()
+        ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
+            ret, late_tail_rows=late_rows
+        )
         if ret:
             if dsv41_encoder_only_prefill_enabled():
                 self._set_dsv41_feed_inputs(ret)
+                if late_feed is not None:
+                    self._set_dsv41_late_tail_inputs(ret, late_feed)
             set_schedule_time_batch(ret)
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+
+    def _dsv41_late_tail_feed(self: Scheduler) -> Optional[LateTailFeed]:
+        """SGLANG_DSV41_LATE_TAIL_ROWS: this rank's late-only row feed, or None."""
+        rows = envs.SGLANG_DSV41_LATE_TAIL_ROWS.get()
+        if rows <= 0:
+            return None
+        if getattr(self, "dsv41_late_feed", None) is None:
+            self.dsv41_late_feed = LateTailFeed(
+                rows_per_step=rows,
+                width=self.model_worker.verify_num_draft_tokens,
+                window=self.model_config.sliding_window_size,
+            )
+            self.dsv41_late_free_slots = deque(range(LATE_TAIL_STAGING_TAILS))
+            # (forward step from which the slot is free, slot): a slot the last
+            # scheduled steps read stays taken until they have run.
+            self.dsv41_late_retiring = deque()
+        return self.dsv41_late_feed
+
+    def _stage_dsv41_late_tails(self: Scheduler, feed: LateTailFeed) -> None:
+        """Queue transferred late-fed tails on the feed, oldest first, while staging
+        slots last."""
+        while self.dsv41_late_retiring and (
+            self.dsv41_late_retiring[0][0] <= self.forward_ct
+        ):
+            self.dsv41_late_free_slots.append(self.dsv41_late_retiring.popleft()[1])
+        window = self.model_config.sliding_window_size
+        for req in self.waiting_queue:
+            if not req.dsv41_late_pending or req.dsv41_late_staging is not None:
+                continue
+            if req.kv.kv_allocated_len != req.dsv41_tail_start:
+                continue
+            if not self.dsv41_late_free_slots:
+                break
+            prompt_len = len(req.full_untruncated_fill_ids)
+            assert dsv41_late_tail_prefix_len(prompt_len, window) == (
+                req.dsv41_tail_start
+            ), (prompt_len, req.dsv41_tail_start)
+            req.dsv41_late_staging = self.dsv41_late_free_slots.popleft()
+            feed.push(
+                req=req, prompt_len=prompt_len, staging_slot=req.dsv41_late_staging
+            )
+
+    def _set_dsv41_late_tail_inputs(
+        self: Scheduler, batch: ScheduleBatch, feed: LateTailFeed
+    ) -> None:
+        """This step's late-only pseudo-slots; every rank runs them when any has some."""
+        batch.dsv41_late_tail = None
+        if not (batch.forward_mode.is_decode() or batch.forward_mode.is_idle()):
+            return
+        active = (
+            batch.dsv41_late_tail_any
+            if self.require_mlp_sync
+            else feed.pending_rows() > 0
+        )
+        if not active:
+            return
+        for req, slot in feed.drop(lambda req: req.finished()):
+            req.dsv41_late_pending = False
+            req.dsv41_late_staging = None
+            self.dsv41_late_retiring.append((self.forward_ct + 2, slot))
+        step = feed.take()
+        if step is None:
+            batch.dsv41_late_tail = LateTailStepInputs(active=True)
+            return
+        window = self.model_config.sliding_window_size
+        slots = step.slots
+
+        def to_device(values):
+            return async_h2d(values, dtype=torch.int64, device=batch.device)
+
+        batch.dsv41_late_tail = LateTailStepInputs(
+            active=True,
+            req_pool_indices=to_device([s.req.req_pool_idx for s in slots]),
+            positions=to_device([s.position for s in slots]),
+            floors=to_device([s.floor for s in slots]),
+            staging_rows=to_device(
+                [s.staging_slot * window + s.staging_row for s in slots]
+            ),
+        )
+        for req in step.finished:
+            req.dsv41_late_pending = False
+            # Free once this step and the one overlapped with it have run.
+            self.dsv41_late_retiring.append(
+                (self.forward_ct + 2, req.dsv41_late_staging)
+            )
+            req.dsv41_late_staging = None
 
     def _admit_dsv41_fed_tails(
         self: Scheduler, running_batch: ScheduleBatch
@@ -4478,7 +4589,12 @@ class SchedulerDisaggregationDecodeMixin:
             req.already_computed = start
             req._cache_breakdown_computed = True
             req.dsv41_tail_start = None
-            req.dsv41_feed_floor = start
+            # A late-fed tail's late layers already hold the window below start.
+            req.dsv41_feed_floor = (
+                start - self.model_config.sliding_window_size
+                if req.dsv41_late_fed
+                else start
+            )
             req.dsv41_feed_next = start
             req.dsv41_feed_prompt_left = len(req.origin_input_ids) - 1 - start
         set_time_batch(fed, "set_forward_entry_time")

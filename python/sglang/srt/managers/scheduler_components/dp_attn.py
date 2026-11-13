@@ -175,11 +175,14 @@ class MLPSyncBatchInfo:
     is_shutting_down: bool = False
     # This rank's listener drain state (see DPDrainColumn).
     drain_state: int = 0
+    # SGLANG_DSV41_LATE_TAIL_ROWS: late-only rows this decode rank has pending.
+    late_tail_rows: int = 0
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
     any_health_check: bool = False
     any_shutting_down: bool = False
+    any_late_tail_rows: bool = False
     sync_wait_seconds: float = 0.0
     global_num_tokens: list[int] = None
     global_num_tokens_for_logprob: list[int] = None
@@ -204,6 +207,7 @@ class MLPSyncBatchInfo:
                 self.attention_pairs,
                 int(self.is_shutting_down),
                 self.drain_state,
+                self.late_tail_rows,
             ],
             device=device,
             dtype=dtype,
@@ -225,6 +229,7 @@ class MLPSyncBatchInfo:
                 0,  # attention_pairs
                 0,  # is_shutting_down
                 DRAIN_STATE_NO_LISTENER,  # drain_state
+                0,  # late_tail_rows
             ],
             device=device,
             dtype=dtype,
@@ -238,6 +243,7 @@ class MLPSyncBatchInfo:
         self.global_attention_pairs = [self.attention_pairs]
         self.any_health_check = self.is_health_check
         self.any_shutting_down = self.is_shutting_down
+        self.any_late_tail_rows = self.late_tail_rows > 0
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 self.tp0_info_cpu[:, 5].tolist()
@@ -315,6 +321,7 @@ class MLPSyncBatchInfo:
         self.any_health_check = bool(tp0_info_cpu[:, 9].max())
         self.global_attention_pairs = tp0_info_cpu[:, 10].tolist()
         self.any_shutting_down = bool(tp0_info_cpu[:, 11].max())
+        self.any_late_tail_rows = bool(tp0_info_cpu[:, 13].max())
         self.sync_wait_seconds = time.perf_counter() - sync_start
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
@@ -596,6 +603,7 @@ def prepare_mlp_sync_batch_raw(
     sync_wait_carry: Optional[DPSyncWaitCarry] = None,
     shutdown_vote: Optional[DPShutdownVote] = None,
     drain_column: Optional[DPDrainColumn] = None,
+    late_tail_rows: int = 0,
 ):
     parallel = get_parallel()
     num_dp_ranks = parallel.num_dp_ranks
@@ -713,6 +721,7 @@ def prepare_mlp_sync_batch_raw(
         attention_pairs=_local_attention_pairs(local_batch),
         is_shutting_down=shutdown_vote is not None and shutdown_vote.local,
         drain_state=drain_column.local if drain_column is not None else 0,
+        late_tail_rows=late_tail_rows,
     )
 
     if num_dp_ranks == 1:
@@ -740,7 +749,10 @@ def prepare_mlp_sync_batch_raw(
         # Skip idle batch when attn-dp=1 (and always under DWDP: ranks run independently)
         need_idle_batch = not dwdp and num_dp_ranks > 1
     else:
-        need_idle_batch = max(mlp_sync_info.global_num_tokens) > 0
+        # A rank with only late-only tail rows still runs a verify step.
+        need_idle_batch = (
+            max(mlp_sync_info.global_num_tokens) > 0 or mlp_sync_info.any_late_tail_rows
+        )
 
     batch_to_gather = local_batch
     if need_idle_batch:
@@ -750,6 +762,8 @@ def prepare_mlp_sync_batch_raw(
             # NOTE: for prebuilt batch, we add an inner idle batch to run MLP sync
             batch_to_gather = local_batch.inner_idle_batch = get_idle_batch()
 
+    if local_batch is not None:
+        local_batch.dsv41_late_tail_any = mlp_sync_info.any_late_tail_rows
     if batch_to_gather is not None:
         _update_gather_batch(
             batch_to_gather,
@@ -838,7 +852,9 @@ class SchedulerDPAttnAdapter:
         """The iteration produced no batch, so its gather waits have no step to land on."""
         self.sync_wait_carry.seconds = 0.0
 
-    def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
+    def prepare_mlp_sync_batch(
+        self, local_batch: ScheduleBatch, late_tail_rows: int = 0
+    ):
         draft_require_mlp_tp_gather = None
         if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
             draft_moe_a2a_backend = get_spec().speculative_moe_a2a_backend
@@ -863,6 +879,7 @@ class SchedulerDPAttnAdapter:
             sync_wait_carry=self.sync_wait_carry,
             shutdown_vote=shutdown_vote,
             drain_column=drain_column,
+            late_tail_rows=late_tail_rows,
         )
         if drain_column.rows is not None and self.on_drain_rows is not None:
             self.on_drain_rows(drain_column.rows)
@@ -880,6 +897,7 @@ class SchedulerDPAttnAdapter:
         self,
         batch: Optional[ScheduleBatch],
         need_sync: Optional[bool] = None,
+        late_tail_rows: int = 0,
     ) -> Optional[ScheduleBatch]:
         """
         Helper to prepare MLP sync batch for DP attention.
@@ -890,7 +908,7 @@ class SchedulerDPAttnAdapter:
             need_sync: If specified, overrides self.get_require_mlp_sync() for prepare_mlp_sync_batch decision
         """
         if need_sync if need_sync is not None else self.get_require_mlp_sync():
-            batch = self.prepare_mlp_sync_batch(batch)
+            batch = self.prepare_mlp_sync_batch(batch, late_tail_rows=late_tail_rows)
         return batch
 
     def maybe_convert_decode_to_extend(

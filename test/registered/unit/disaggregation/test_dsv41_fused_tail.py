@@ -12,6 +12,7 @@ from sglang.srt.disaggregation.utils import (
     dsv41_encoder_prefix_len,
     dsv41_late_tail_prefix_len,
     dsv41_late_tail_rows,
+    dsv41_tail_can_feed,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.late_tail_inputs import (
@@ -498,6 +499,9 @@ def _waiting_req(prompt_len, **fields):
         dsv41_feed_floor=None,
         dsv41_feed_next=None,
         dsv41_feed_prompt_left=0,
+        dsv41_late_fed=False,
+        dsv41_late_pending=False,
+        dsv41_late_staging=None,
     )
     values.update(fields)
     return _Req(**values)
@@ -830,6 +834,145 @@ class TestVerifyLateRowsSwap(CustomTestCase):
         get_moe_a2a_backend.return_value = SimpleNamespace(is_none=lambda: True)
         with self.assertRaises(AssertionError):
             enter_verify_late_rows(SimpleNamespace(), "late", None)
+
+
+def _late_req(prompt_len, pool_idx, **fields):
+    with envs.SGLANG_DSV41_LATE_TAIL_ROWS.override(16):
+        req = _waiting_req(prompt_len, **fields)
+    fields_ = dict(
+        dsv41_late_fed=True,
+        dsv41_late_pending=True,
+        req_pool_idx=pool_idx,
+        full_untruncated_fill_ids=list(range(prompt_len)),
+        finished=lambda: False,
+    )
+    for key, value in fields_.items():
+        setattr(req, key, value)
+    return req
+
+
+def _late_sched(waiting, require_mlp_sync=False):
+    return SimpleNamespace(
+        waiting_queue=_waiting(waiting),
+        model_worker=SimpleNamespace(verify_num_draft_tokens=4),
+        model_config=SimpleNamespace(sliding_window_size=128),
+        forward_ct=0,
+        require_mlp_sync=require_mlp_sync,
+    )
+
+
+def _late_batch(any_rank=False, mode=ForwardMode.DECODE):
+    return SimpleNamespace(
+        forward_mode=mode,
+        device="cpu",
+        dsv41_late_tail=None,
+        dsv41_late_tail_any=any_rank,
+    )
+
+
+class TestLateTailScheduling(CustomTestCase):
+    def _feed(self, sched):
+        with envs.SGLANG_DSV41_LATE_TAIL_ROWS.override(64):
+            return Mixin._dsv41_late_tail_feed(sched)
+
+    def test_staged_tails_feed_the_budget_then_join_at_e(self):
+        a, b = _late_req(1000, pool_idx=5), _late_req(1001, pool_idx=6)
+        self.assertEqual((a.dsv41_tail_start, b.dsv41_tail_start), (998, 1000))
+        sched = _late_sched([a, b])
+        feed = self._feed(sched)
+        Mixin._stage_dsv41_late_tails(sched, feed)
+        self.assertEqual((a.dsv41_late_staging, b.dsv41_late_staging), (0, 1))
+        self.assertEqual(feed.pending_rows(), 256)
+        # Pending tails are neither fed nor extended until their late rows ran.
+        self.assertFalse(dsv41_tail_can_feed(a))
+        steps = []
+        while feed.pending_rows():
+            batch = _late_batch()
+            Mixin._set_dsv41_late_tail_inputs(sched, batch, feed)
+            steps.append(batch.dsv41_late_tail)
+            sched.forward_ct += 1
+        self.assertEqual(len(steps), 4)
+        first = steps[0]
+        self.assertTrue(first.active)
+        self.assertEqual(first.req_pool_indices.tolist(), [5] * 16)
+        self.assertEqual(first.positions.tolist(), list(range(870, 934, 4)))
+        self.assertEqual(set(first.floors.tolist()), {872})
+        self.assertEqual(first.staging_rows.tolist(), list(range(0, 64, 4)))
+        last = steps[-1]
+        self.assertEqual(last.positions.tolist()[-1], 996)
+        self.assertEqual(last.staging_rows.tolist()[0], 128 + 64)
+        self.assertFalse(a.dsv41_late_pending or b.dsv41_late_pending)
+        self.assertTrue(dsv41_tail_can_feed(a))
+        # A slot frees only after the steps that read it have run.
+        self.assertEqual(list(sched.dsv41_late_retiring), [(3, 0), (5, 1)])
+        sched.forward_ct = 5
+        Mixin._stage_dsv41_late_tails(sched, feed)
+        self.assertEqual(list(sched.dsv41_late_free_slots)[-2:], [0, 1])
+
+    def test_inactive_step_takes_nothing_and_a_peer_rank_activates_it(self):
+        a = _late_req(1000, pool_idx=5)
+        sched = _late_sched([a], require_mlp_sync=True)
+        feed = self._feed(sched)
+        Mixin._stage_dsv41_late_tails(sched, feed)
+        batch = _late_batch(any_rank=False)
+        Mixin._set_dsv41_late_tail_inputs(sched, batch, feed)
+        self.assertIsNone(batch.dsv41_late_tail)
+        self.assertEqual(feed.pending_rows(), 128)
+        # An extend step never carries late rows.
+        batch = _late_batch(any_rank=True, mode=ForwardMode.EXTEND)
+        Mixin._set_dsv41_late_tail_inputs(sched, batch, feed)
+        self.assertIsNone(batch.dsv41_late_tail)
+        batch = _late_batch(any_rank=True, mode=ForwardMode.IDLE)
+        Mixin._set_dsv41_late_tail_inputs(sched, batch, feed)
+        self.assertEqual(len(batch.dsv41_late_tail.positions), 16)
+        # A rank with nothing pending still runs the late variant with its peers.
+        empty = _late_sched([], require_mlp_sync=True)
+        empty_feed = self._feed(empty)
+        batch = _late_batch(any_rank=True)
+        Mixin._set_dsv41_late_tail_inputs(empty, batch, empty_feed)
+        self.assertTrue(batch.dsv41_late_tail.active)
+        self.assertIsNone(batch.dsv41_late_tail.positions)
+
+    def test_staging_waits_for_the_transfer_and_a_free_slot(self):
+        late = [_late_req(1000, pool_idx=i) for i in range(3)]
+        late[0].kv = SimpleNamespace(kv_allocated_len=0)  # still transferring
+        sched = _late_sched(late)
+        feed = self._feed(sched)
+        sched.dsv41_late_free_slots.clear()
+        sched.dsv41_late_free_slots.append(9)
+        Mixin._stage_dsv41_late_tails(sched, feed)
+        self.assertEqual([r.dsv41_late_staging for r in late], [None, 9, None])
+
+    def test_an_aborted_tail_leaves_the_feed(self):
+        a = _late_req(1000, pool_idx=5)
+        sched = _late_sched([a])
+        feed = self._feed(sched)
+        Mixin._stage_dsv41_late_tails(sched, feed)
+        a.finished = lambda: True
+        batch = _late_batch()
+        Mixin._set_dsv41_late_tail_inputs(sched, batch, feed)
+        self.assertEqual(feed.pending_rows(), 0)
+        self.assertIsNone(batch.dsv41_late_tail.positions)
+        self.assertEqual(list(sched.dsv41_late_retiring), [(2, 0)])
+
+
+@patch("sglang.srt.disaggregation.decode.set_time_batch")
+@patch("sglang.srt.disaggregation.decode.ScheduleBatch")
+class TestLateFedAdmission(CustomTestCase):
+    def test_late_fed_tail_floors_at_the_prompt_window(self, schedule_batch, _):
+        done = _late_req(1001, pool_idx=1)
+        done.dsv41_late_pending = False
+        pending = _late_req(1001, pool_idx=2)
+        sched, running = _admit_sched([pending, done], running_size=4)
+        sched.model_config = SimpleNamespace(sliding_window_size=128)
+        with envs.SGLANG_DSV41_FUSED_TAIL.override(True):
+            Mixin._admit_dsv41_fed_tails(sched, running)
+        self.assertEqual(schedule_batch.init_new.call_args.args[0], [done])
+        # Fed from e = 1000; the late layers read the window the late rows wrote.
+        self.assertEqual((done.dsv41_feed_next, done.dsv41_feed_prompt_left), (1000, 0))
+        batch = _decode_batch([done])
+        Mixin._set_dsv41_feed_inputs(_sched(), batch)
+        self.assertEqual(batch.dsv41_swa_floor.tolist(), [1001 - 128])
 
 
 if __name__ == "__main__":

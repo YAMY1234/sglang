@@ -247,6 +247,30 @@ class TestDPBalanceStats(CustomTestCase):
             )
         self.assertEqual(info._get_local_tensor(device="cpu")[10].item(), 12)
 
+    def test_late_tail_rows_column_marks_a_late_step(self):
+        """A rank with only late-only tail rows (no tokens) must still pull every
+        rank into a verify step; the column is gathered after all others."""
+        info = dp_attn.MLPSyncBatchInfo(
+            num_dp_ranks=1,
+            tp_size=1,
+            cp_size=1,
+            num_tokens=0,
+            num_tokens_for_logprob=0,
+            can_run_decode_cuda_graph=True,
+            can_run_draft_cuda_graph=True,
+            can_run_prefill_cuda_graph=False,
+            is_extend_in_batch=False,
+            local_can_run_tbo=False,
+            local_forward_mode=ForwardMode.IDLE.value,
+            late_tail_rows=64,
+        )
+        local = info._get_local_tensor(device="cpu")
+        fallback = info._get_fallback_tensor(device="cpu")
+        self.assertEqual(local.shape, fallback.shape)
+        self.assertEqual((local[13].item(), fallback[13].item()), (64, 0))
+        info.finalize_local()
+        self.assertTrue(info.any_late_tail_rows)
+
     def test_prefill_chunk_pairs_are_causal(self):
         """A chunk after prefix p reads p keys per query plus the causal
         triangle inside the chunk; a one-token chunk after prefix p therefore
