@@ -1525,6 +1525,9 @@ class Envs:
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_FUSE_SHARED_EXPERTS = EnvBool(True)
     SGLANG_OPT_DEEPGEMM_MEGA_GATE = EnvBool(False)
+    # Opt-in: raise DeepGEMM's BLOCK_M (16/32 -> 64, 64 -> 96) for FP8xFP4 calls in
+    # decode and target-verify CUDA graphs.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_RAISE_DECODE_BLOCK_M = EnvBool(False)
 
     # ===================================================================
     # Top-k kernels
@@ -2285,6 +2288,21 @@ class Envs:
     # dense GEMMs, the side-stream [f_a | b] TGV, and attention side streams up
     # to 288 rows (kimi_k3._k31_gb300_tuning). 0 restores the generic picks.
     SGLANG_K31_DECODE_GEMM_TACTICS = EnvBool(True)
+    # Kimi-K3.1 on VR200 (SM107), default off: the per-M TGV tactics of the
+    # decode dense GEMMs measured on SM107 (through the PD-decode DFLASH verify
+    # rows), the side-stream [f_a | b] TGV, and the SM107 attention side-stream
+    # row caps below (kimi_k3._k31_sm107_tuning). Off: SM107 keeps the generic
+    # picks and the 128-row side streams.
+    SGLANG_K31_SM107_GEMM_TACTICS = EnvBool(False)
+    # Optional path of a JSON table that replaces the built-in SM107 table.
+    SGLANG_K31_SM107_GEMM_TABLE = EnvStr(None)
+    # Under SGLANG_K31_SM107_GEMM_TACTICS on SM107: the largest graphed rows
+    # whose KDA [f_a | b] GEMM runs on the side stream beside [q,k,v,g]
+    # (default 1152 = the largest verify rows, the stable table's
+    # side_cap_bfa), and whose MLA output gate runs on the side stream beside
+    # attention (default 128, today's cap: raising it measured no gain).
+    SGLANG_K31_SM107_BFA_SIDE_MAX_TOKENS = EnvInt(1152)
+    SGLANG_K31_SM107_GATE_SIDE_MAX_TOKENS = EnvInt(128)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)

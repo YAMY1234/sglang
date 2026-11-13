@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
 
@@ -103,6 +104,37 @@ DEFAULT_WORKSPACE_SIZE_MB = envs.SGLANG_TRTLLM_MLA_WORKSPACE_MB.get()
 TRTLLM_BLOCK_CONSTRAINT = 128
 
 TRTLLM_MLA_MAX_BATCH_SIZE = 8192
+
+# SGLANG_K31_DRAFT_SWA_INPLACE_Q (default off): a sliding-window MLA layer
+# whose query head count has no trtllm-gen kernel (64 < heads < 128, the 96-head
+# DFlash draft under DCP8) gets its FP8 query from RopeQuantize written straight
+# into a persistent 128-head buffer whose pad heads were zeroed once, instead of
+# new_zeros + a strided copy per layer; under the a2a / fi_a2a DCP reduce its
+# 96-head partials go to the pack as a strided view instead of a .contiguous()
+# copy.
+_DRAFT_SWA_INPLACE_Q_ENV = "SGLANG_K31_DRAFT_SWA_INPLACE_Q"
+_TRTLLM_GEN_MLA_PAD_HEADS = 128
+_draft_swa_engaged_logged = False
+
+
+def draft_swa_inplace_q_requested() -> bool:
+    return os.environ.get(_DRAFT_SWA_INPLACE_Q_ENV, "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def make_draft_swa_q_pad_buffer(
+    rows: int, head_dim: int, device, heads: int = _TRTLLM_GEN_MLA_PAD_HEADS
+) -> torch.Tensor:
+    """[rows, heads, head_dim] FP8, all bytes zero (FP8 +0.0, what new_zeros
+    writes). Only the live heads' slice is ever written, so the pad heads stay
+    zero for the process's lifetime."""
+    return torch.zeros((rows, heads, head_dim), dtype=torch.uint8, device=device).view(
+        torch.float8_e4m3fn
+    )
 
 
 def _multi_ctas_kv_counter_bytes(
@@ -322,6 +354,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self._window_index_cache = None
         self._window_counter_buffer = None
         self._window_row_indptr = None
+        # SGLANG_K31_DRAFT_SWA_INPLACE_Q: persistent zero-padded FP8 query buffer
+        # and whether the DCP window path returns strided partials.
+        self._swa_q_pad = None
+        self._swa_strided_partials = False
 
         self._megakernel = megakernel_enabled()
         # A compact draft req_to_token holds the committed suffix at [0, seq_len)
@@ -354,6 +390,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             self._window_row_indptr = torch.arange(
                 max_rows + 1, dtype=torch.int32, device=self.device
             )
+            self._init_draft_swa_inplace_q(max_rows)
         self.dense_q_indptr_verify = (
             self.q_indptr_decode * self.num_draft_tokens
             if self.num_draft_tokens
@@ -1471,6 +1508,100 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
         return output.flatten(1), lse
 
+    def _init_draft_swa_inplace_q(self, max_rows: int) -> None:
+        """SGLANG_K31_DRAFT_SWA_INPLACE_Q=1:
+        Allocates, outside any graph capture, the FP8 [max_rows, 128, 576]
+        query buffer shared by every sliding-window layer of this process
+        (layers run one after another on one stream)."""
+        if not draft_swa_inplace_q_requested():
+            return
+        heads = self.num_decode_q_heads
+        parallel = get_parallel()
+        reason = None
+        if self.data_type != torch.float8_e4m3fn:
+            reason = f"KV cache dtype {self.data_type} is not FP8"
+        elif not (64 < heads < _TRTLLM_GEN_MLA_PAD_HEADS):
+            reason = f"{heads} query heads need no head padding"
+        if reason is not None:
+            logger.info(
+                "Draft SWA in-place q off (%s=1): %s",
+                _DRAFT_SWA_INPLACE_Q_ENV,
+                reason,
+            )
+            return
+        head_dim = self.kv_cache_dim
+        self._swa_q_pad = get_buffer(
+            f"draft_swa_q_pad_{max_rows}x{_TRTLLM_GEN_MLA_PAD_HEADS}x{head_dim}",
+            lambda: make_draft_swa_q_pad_buffer(
+                max_rows, head_dim, torch.device(self.device)
+            ),
+        )
+        self._swa_strided_partials = parallel.dcp_enabled and (
+            parallel.dcp_comm_backend in ("a2a", "fi_a2a")
+        )
+        logger.info(
+            "Draft SWA in-place q on (%s=1): FP8 q "
+            "buffer %d rows x %d heads x %d (%.1f MiB, pad heads zeroed once) for "
+            "%d live heads; strided DCP partials %s (dcp_comm_backend=%s)",
+            _DRAFT_SWA_INPLACE_Q_ENV,
+            max_rows,
+            _TRTLLM_GEN_MLA_PAD_HEADS,
+            head_dim,
+            self._swa_q_pad.numel() / 2**20,
+            heads,
+            "on" if self._swa_strided_partials else "off",
+            parallel.dcp_comm_backend if parallel.dcp_enabled else "none",
+        )
+
+    def _draft_swa_q_out(
+        self, layer: RadixAttention, q_rope: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """The live-head slice [rows, heads, 576] of the persistent padded
+        buffer for RopeQuantize to write into, or None (today's path)."""
+        buf = self._swa_q_pad
+        if buf is None or layer.sliding_window_size < 0 or q_rope.dim() != 3:
+            return None
+        rows, heads = q_rope.shape[0], q_rope.shape[1]
+        if (
+            heads != layer.tp_q_head_num
+            or not (64 < heads < buf.shape[1])
+            or layer.head_dim != buf.shape[2]
+            or not (0 < rows <= buf.shape[0])
+        ):
+            return None
+        return buf[:rows, :heads]
+
+    def _draft_swa_padded_query(
+        self, query: torch.Tensor, rows: int, kernel_heads: int
+    ) -> Optional[torch.Tensor]:
+        """The padded [rows, 1, 128, 576] kernel query when ``query`` is the
+        buffer view _draft_swa_q_out handed out (so RopeQuantize already wrote
+        it in place), else None."""
+        global _draft_swa_engaged_logged
+        buf = self._swa_q_pad
+        if (
+            buf is None
+            or kernel_heads != buf.shape[1]
+            or rows > buf.shape[0]
+            or query.dtype != buf.dtype
+            or query.data_ptr() != buf.data_ptr()
+            or query.shape[3] != buf.shape[2]
+            or query.stride(0) != buf.stride(0)
+            or query.stride(2) != buf.stride(1)
+            or query.stride(3) != 1
+        ):
+            return None
+        if not _draft_swa_engaged_logged:
+            _draft_swa_engaged_logged = True
+            logger.info(
+                "Draft SWA in-place q engaged: "
+                "rows=%d heads=%d->%d, no pad memset/copy",
+                rows,
+                query.shape[2],
+                kernel_heads,
+            )
+        return buf[:rows].unsqueeze(1)
+
     def _window_sparse_indices(
         self, layer: RadixAttention, forward_batch: ForwardBatch
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1548,8 +1679,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         kernel_heads = 128 if 64 < heads < 128 else heads
         query = q.reshape(rows, 1, heads, head_dim)
         if kernel_heads != heads:
-            padded = query.new_zeros((rows, 1, kernel_heads, head_dim))
-            padded[:, :, :heads].copy_(query)
+            padded = self._draft_swa_padded_query(query, rows, kernel_heads)
+            if padded is None:
+                padded = query.new_zeros((rows, 1, kernel_heads, head_dim))
+                padded[:, :, :heads].copy_(query)
             query = padded
         out, lse = dcp_trtllm_sparse_attention(
             query=query,
@@ -1575,6 +1708,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         lse = lse[:, :heads]
         if self.dcp_lse_base_on_e:
             lse = lse * math.log(2.0)  # -inf rows (no owned key) stay -inf
+        if self._swa_strided_partials and kernel_heads != heads:
+            # The a2a / fi_a2a pack reads [rows, heads, 512] partials and the
+            # LSE through their strides (dcp_pack_a2a_send), and forward_mla
+            # skips its .contiguous() for sliding-window layers under the same
+            # flag: hand over views, not copies. flatten(1) is a view here (the
+            # head stride equals the head size).
+            return out.flatten(1), lse
         return out.contiguous().flatten(1), lse.contiguous()
 
     def forward_extend(
@@ -1674,6 +1814,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     is_neox,
                     self.kv_lora_rank,
                     self.qk_rope_head_dim,
+                    q_out=(
+                        self._draft_swa_q_out(layer, q_rope)
+                        if self._swa_q_pad is not None
+                        else None
+                    ),
                 )
             merge_query = False
 
