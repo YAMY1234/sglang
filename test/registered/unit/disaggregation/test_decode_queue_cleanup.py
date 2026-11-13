@@ -757,6 +757,127 @@ class TestDeferredDestinationPublish(CustomTestCase):
         self.assertEqual(self.storage.holds, {})
         self.assertEqual(self.storage.ended, ["deferred"])
 
+    def _dsv4_publish_payloads(self, *, async_readback: bool):
+        """Publish one deferred destination with DeepSeek-V4's state types and
+        return what reached send_metadata, plus the forward-fence event factory."""
+        receiver = _PollingReceiver()
+        decode_req = self._decode_req(receiver)
+        decode_req.req.bootstrap_host = "127.0.0.1"
+        queue = self._deferring_queue([decode_req])
+        queue._async_publish_readback = async_readback
+        queue.scheduler.disagg_decode_prealloc_queue = queue
+        state_types = [
+            StateType.SWA,
+            StateType.SWA_RING,
+            StateType.DSV4_REQUEST_STATE,
+            StateType.REQUEST_ROW,
+            StateType.BLOCK_SCALE,
+        ]
+        queue.kv_manager.kv_args.state_types = state_types
+        queue.kv_manager.kv_args.state_sub_pools = ["swa", None, None, None, None]
+        queue.token_to_kv_pool = SimpleNamespace(
+            page_size=2,
+            unified_swa_ring_size=4,
+            unified_swa_window=3,
+            request_state_transfer_indices=lambda row, seq_len: np.array(
+                [row * 10 + seq_len], dtype=np.int32
+            ),
+        )
+        self.storage.resume_units = lambda sub_pool, req, **_: SimpleNamespace(
+            unit_ids=torch.tensor([3, 1, 2], dtype=torch.int64)
+        )
+        queue.move_preallocated(queue.transfer_queue.queue)
+
+        landed = MagicMock()
+        landed.query.return_value = False
+        original_empty, original_copy = torch.empty, torch.Tensor.copy_
+        copies = []
+
+        def pinned_empty(shape, *, dtype, pin_memory):
+            self.assertTrue(pin_memory)
+            return original_empty(shape, dtype=dtype)
+
+        def copy(host, device, *, non_blocking):
+            copies.append(non_blocking)
+            return original_copy(host, device)
+
+        with (
+            patch(
+                "sglang.srt.disaggregation.decode.all_reduce_flags",
+                side_effect=_local_reduce,
+            ),
+            patch(
+                "sglang.srt.disaggregation.decode.torch.cuda.Event", return_value=landed
+            ),
+            patch(
+                "sglang.srt.disaggregation.decode.torch.empty", side_effect=pinned_empty
+            ),
+            patch.object(torch.Tensor, "copy_", copy),
+        ):
+            queue.publish_pending_destinations()
+            transfer = DecodeTransferQueue.__new__(DecodeTransferQueue)
+            transfer.queue = queue.transfer_queue.queue
+            transfer.gloo_group = object()
+            transfer.scheduler = queue.scheduler
+            if async_readback:
+                # Nothing is sent before the pinned readback lands.
+                self.assertEqual(receiver.send_metadata.call_count, 0)
+                transfer.publish_pending_metadata()
+                self.assertEqual(receiver.send_metadata.call_count, 0)
+                landed.query.return_value = True
+                transfer.publish_pending_metadata()
+        receiver.send_metadata.assert_called_once()
+        self.assertIsNone(decode_req.pending_metadata)
+        self.assertTrue(all(copies) and (len(copies) > 0) == async_readback)
+        pages, slot, states = receiver.send_metadata.call_args.args
+        sent = (
+            (pages.dtype.str, pages.tolist()),
+            slot,
+            [(x.dtype.str, x.tolist()) for x in states],
+            receiver.send_metadata.call_args.kwargs,
+        )
+        return sent, queue.scheduler.device_module.Event
+
+    def test_async_readback_sends_the_blocking_payloads_once_landed(self):
+        """SGLANG_DISAGG_DECODE_ASYNC_PUBLISH_READBACK: a deferred publish with
+        DeepSeek-V4's state types sends the blocking readback's payloads, values
+        and dtypes, only once its pinned copies land, and adds no wait on the
+        in-flight forward (the side stream already waits on the allocation)."""
+        blocking, _ = self._dsv4_publish_payloads(async_readback=False)
+        landed, forward_event = self._dsv4_publish_payloads(async_readback=True)
+        self.assertEqual(landed, blocking)
+        forward_event.assert_not_called()
+        self.assertEqual(
+            blocking,
+            (
+                ("<i4", [8, 9, 10, 11, 12]),
+                0,
+                [
+                    ("<i8", [3, 1, 2]),
+                    ("<i4", [6, 7, 4]),
+                    ("<i4", [15]),
+                    ("<i4", [1]),
+                    ("<i8", [4, 5, 6]),
+                ],
+                {"decode_prefix_len": 0},
+            ),
+        )
+
+    def test_async_readback_only_for_supported_state_types(self):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        live = self._decode_req(_PollingReceiver())
+        live.req.bootstrap_host = "127.0.0.1"
+        for on, state_types, expected in (
+            (True, [StateType.SWA, StateType.DSV4_REQUEST_STATE], True),
+            (True, [StateType.MAMBA], True),
+            (True, [], True),
+            (True, [StateType.SWA, StateType.DSA], False),
+            (False, [StateType.SWA], False),
+        ):
+            with self.subTest(on=on, state_types=state_types):
+                queue._async_publish_readback = on
+                self.assertEqual(queue._reads_back_async(live, state_types), expected)
+
     def test_released_receiver_keeps_the_publish_reduction_aligned(self):
         """A pending request the transfer queue released keeps its slot in the
         all-reduced polls, polls as failed and is not published."""
