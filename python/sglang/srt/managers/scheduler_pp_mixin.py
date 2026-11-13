@@ -14,6 +14,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_attn_cp_tp_group,
     poll_pp_consensus_and_all_reduce,
     pp_sync_polls,
+    pp_sync_window,
 )
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.distributed.communication_tags import P2PTag
@@ -698,6 +699,7 @@ class SchedulerPPMixin:
             get_parallel().pp_size,
             self.pp_release_sync_work_list,
             tag=P2PTag.DISAGG_RELEASE_PP_SYNC,
+            window=pp_sync_window(),
         )
         assert (
             relayed_rids == rids

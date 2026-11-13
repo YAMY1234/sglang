@@ -797,6 +797,9 @@ class Envs:
     # PP prefill: PP0 decides each KV transfer's release from every stage's status
     # (PPConsensusStore) and relays it in one pass, instead of the two-pass ring.
     SGLANG_PP_PD_PREFILL_RELEASE_RELAY = EnvBool(False)
+    # PP: leave pp_size + pp_async_batch_depth rounds of HiCache, PD bootstrap and
+    # PD release relay sends un-waited, not one (a gloo send completes on the recv).
+    SGLANG_PP_SYNC_WINDOW = EnvBool(False)
 
     # ===================================================================
     # Distributed and model-parallel runtime

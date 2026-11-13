@@ -64,6 +64,7 @@ from sglang.srt.disaggregation.utils import (
     kv_layout_signature,
     poll_and_all_reduce_attn_cp_tp_group,
     poll_and_all_reduce_prefill_pp,
+    pp_sync_window,
     prepare_abort,
     setup_state_kv_args,
 )
@@ -513,6 +514,7 @@ class PrefillBootstrapQueue:
                 self.pp_rank,
                 self.pp_size,
                 self.pp_poll_sync_work_list,
+                window=pp_sync_window(),
             )
         else:
             polls = poll_and_all_reduce_attn_cp_tp_group(

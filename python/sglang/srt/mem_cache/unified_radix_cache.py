@@ -6,6 +6,7 @@ import logging
 import threading
 import time
 from array import array
+from collections import deque
 from dataclasses import replace
 from http import HTTPStatus
 from queue import Queue
@@ -126,6 +127,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_model,
     get_observability,
+    get_parallel,
 )
 from sglang.srt.session.streaming_session import StreamingSession, is_virtual_node
 from sglang.srt.utils.common import ceil_align, get_device_module, is_cuda, is_hip
@@ -320,6 +322,10 @@ class UnifiedRadixCache(BasePrefixCache):
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
         self.work_list: list[torch.distributed.Work] = []
+        self.pp_sync_window = 1
+        if envs.SGLANG_PP_SYNC_WINDOW.get() and self.pp_size > 1:
+            self.pp_sync_window = self.pp_size + get_parallel().pp_async_batch_depth
+        self.pp_sync_rounds: deque[list[torch.distributed.Work]] = deque()
 
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
@@ -399,7 +405,15 @@ class UnifiedRadixCache(BasePrefixCache):
         Called at the start of each event round, so work_list holds the sends
         accumulated since the last round. This bounds it and applies
         backpressure when a downstream PP rank lags. Scheduler thread only.
+        With SGLANG_PP_SYNC_WINDOW, only rounds older than pp_sync_window are waited.
         """
+        if self.pp_sync_window > 1:
+            self.pp_sync_rounds.append(self.work_list)
+            self.work_list = []
+            while len(self.pp_sync_rounds) >= self.pp_sync_window:
+                for work in self.pp_sync_rounds.popleft():
+                    work.wait()
+            return
         for work in self.work_list:
             work.wait()
         self.work_list.clear()

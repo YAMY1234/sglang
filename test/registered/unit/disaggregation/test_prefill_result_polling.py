@@ -20,7 +20,7 @@ from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVSender
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import DisaggregationMode, pp_sync_polls
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     ContinueGenerationReqInput,
@@ -1055,6 +1055,27 @@ class TestPPPrefillReleaseRelay(CustomTestCase):
         finally:
             for store in stores:
                 store.close()
+
+    def test_relay_window_waits_only_rounds_older_than_the_window(self):
+        for window in (1, 3):
+            with self.subTest(window=window):
+                sends = []
+
+                def send_object(obj, dst, async_send=False, tag=0):
+                    sends.append(Mock())
+                    return [SimpleNamespace(work=sends[-1])]
+
+                group = SimpleNamespace(send_object=send_object)
+                work_list = []
+                for k in range(6):
+                    self.assertEqual(
+                        pp_sync_polls([k], group, 0, 3, work_list, window=window), [k]
+                    )
+                    # Round k's send is waited when round k + window opens.
+                    self.assertEqual(
+                        [send.wait.called for send in sends],
+                        [j + window <= k for j in range(k + 1)],
+                    )
 
 
 if __name__ == "__main__":

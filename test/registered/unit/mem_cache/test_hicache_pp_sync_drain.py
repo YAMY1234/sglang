@@ -1,6 +1,7 @@
 """Unit tests for HiCache PP synchronization."""
 
 import unittest
+from collections import deque
 from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -109,6 +110,26 @@ class TestUnifiedPPSyncBatching(unittest.TestCase):
             extra_release_counts={},
             log_metrics=True,
         )
+
+
+class TestUnifiedPPSyncWindow(unittest.TestCase):
+    def test_window_waits_only_rounds_older_than_the_window(self):
+        for window in (1, 3):
+            with self.subTest(window=window):
+                cache = object.__new__(UnifiedRadixCache)
+                cache.pp_sync_window = window
+                cache.pp_sync_rounds = deque()
+                cache.work_list = []
+                rounds = []
+                for _ in range(5):
+                    cache._drain_async_work()
+                    rounds.append([MagicMock(), MagicMock()])
+                    cache.work_list.extend(rounds[-1])
+                cache._drain_async_work()
+                # Round k's sends are waited when round k + window opens.
+                waited = [all(w.wait.called for w in r) for r in rounds]
+                self.assertEqual(waited, [k + window <= 5 for k in range(5)])
+                self.assertFalse(any(w.wait.called for w in cache.work_list))
 
 
 if __name__ == "__main__":
