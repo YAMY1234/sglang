@@ -184,6 +184,9 @@ _CANDIDATE_CLUSTER_FLOOR = 16384
 # workloads (32K and 100K contexts, all 24 DSA layers), a rank held at most 339
 # of a row's global top-2048 keys under DCP8, so 384 needs no fallback there.
 _DCP_MERGE_CAND_K = 384
+# DCP4 (push mode only): 768 keeps the union at 3072 >= 2048 keys, as 8 x 384,
+# so no rank can certify fewer than the global top-2048 it holds.
+_DCP_MERGE_CAND_K_BY_WORLD = {4: 768}
 
 
 class DcpTopKMerge:
@@ -219,6 +222,9 @@ class DcpTopKMerge:
         world = group.world_size
         # 16 ranks only on megakernel paths; stock DCP16 keeps the all-gather.
         worlds = (8, 16) if split or megakernel_enabled() else (8,)
+        if self.push:
+            worlds += (4,)
+        self.cand_k = _DCP_MERGE_CAND_K_BY_WORLD.get(world, _DCP_MERGE_CAND_K)
         if world not in worlds or topk != 2048:
             print_info_once(
                 "DSA DCP top-k merge off: it needs 8 or 16 ranks and top-k 2048"
@@ -231,7 +237,7 @@ class DcpTopKMerge:
         ):
             return
         buffer = symm_mem.empty(
-            dcp_topk_merge_buffer_numel(world, max_rows, topk, _DCP_MERGE_CAND_K),
+            dcp_topk_merge_buffer_numel(world, max_rows, topk, self.cand_k),
             dtype=torch.int64,
             device=group.device,
         )
@@ -254,7 +260,7 @@ class DcpTopKMerge:
             # the pushed merge's fallback reads the failed ranks' slots directly
             print_info_once(
                 f"DSA DCP top-k merge: the local top-k pushes its best "
-                f"{_DCP_MERGE_CAND_K} keys per row to the merge, no local "
+                f"{self.cand_k} keys per row to the merge, no local "
                 f"top-{topk} (SGLANG_DSA_DCP_TOPK_PUSH)"
             )
             return
@@ -286,7 +292,7 @@ class DcpTopKMerge:
             out_fallback=self.fallback[: out.shape[0]],
             rank=self.rank,
             span=span,
-            cand_k=_DCP_MERGE_CAND_K,
+            cand_k=self.cand_k,
             split=self.split,
         )
 
@@ -299,7 +305,7 @@ class DcpTopKMerge:
         out: torch.Tensor,
         span: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Push mode: this rank's top-``_DCP_MERGE_CAND_K`` candidates straight
+        """Push mode: this rank's top-``cand_k`` candidates straight
         into every rank's buffer, then the merge. Fills ``out`` (as ``__call__``)
         and returns the same keys localized, as ``dcp_localize_compact(out)``."""
         rows = out.shape[0]
@@ -310,8 +316,8 @@ class DcpTopKMerge:
             counters=self.counters,
             world=self.world,
             rank=self.rank,
-            cand_k=_DCP_MERGE_CAND_K,
-            slot=self.world * _DCP_MERGE_CAND_K + out.shape[1],
+            cand_k=self.cand_k,
+            slot=self.world * self.cand_k + out.shape[1],
             cluster_size=candidates_cluster_size(rows),
             cluster_floor=_CANDIDATE_CLUSTER_FLOOR,
         )
@@ -331,7 +337,7 @@ class DcpTopKMerge:
             out_fallback=self.fallback[:rows],
             rank=self.rank,
             span=span,
-            cand_k=_DCP_MERGE_CAND_K,
+            cand_k=self.cand_k,
         )
         return local, lengths
 

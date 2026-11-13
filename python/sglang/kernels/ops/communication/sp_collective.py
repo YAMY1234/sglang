@@ -104,6 +104,37 @@ _SM107_TABLES: dict[tuple[int, int], dict] = {
             },
         }
     },
+    # TP4 on one compute tray (decode with attention DP 4), buckets 256-1280
+    # (eager, us, NCCL -> chosen): RS 35.4->11.2, 65.9->14.1, 64.2->17.0,
+    # 67.2->19.8, 364.6->24.7; AG 31.8->11.8, 65.4->15.2, 66.3->19.4,
+    # 66.1->23.3, 67.5->28.3; nvb 7 read + AG 31.9->19.3, 70.4->22.8,
+    # 70.3->22.6, 76.1->26.4, 75.4->29.6.
+    (4, 7168): {
+        "configs": {
+            "reduce_scatter": {
+                "256": _push(128, 512),
+                "512": _push(64, 512),
+                "768": _push(128, 512),
+                "1024": _push(128, 512),
+                "1280": _push(128, 512),
+            },
+            "all_gather": {
+                "256": {"strategy": "push", "num_blocks": 128, "block_size": 512},
+                "512": {"strategy": "push", "num_blocks": 128, "block_size": 512},
+                "768": {"strategy": "push", "num_blocks": 128, "block_size": 512},
+                "1024": {"strategy": "push", "num_blocks": 128, "block_size": 512},
+                "1280": {"strategy": "push", "num_blocks": 128, "block_size": 512},
+            },
+            "reduce_scatter_attn_res": {"256": _SEPARATE},
+            "attn_res_all_gather": {
+                "256": _fused_direct(64),
+                "512": _fused_direct(64),
+                "768": _fused_direct(128),
+                "1024": _fused_direct(64),
+                "1280": _fused_direct(64),
+            },
+        }
+    },
 }
 
 
