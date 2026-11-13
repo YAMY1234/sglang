@@ -61,10 +61,12 @@ def buckets_keep_chunk_o_block_size(capture_num_tokens: list[int]) -> bool:
 
 
 class GDNFlashInferGraphTables(msgspec.Struct, frozen=True):
-    """Static tables of the captured FlashInfer GDN core. A one-sequence batch
-    runs on the CP kernel (``cp_*``) when ``cp_single``, any other batch on the
-    non-CP kernel (``ncp_*``, ``max_seqs`` rows); the idle kernel gets an empty
-    batch. Empty rows read and write the dummy state slot 0."""
+    """Static tables of a captured FlashInfer GDN core, which an external prefill
+    body runs. A one-sequence batch takes the CP kernel (``cp_*``) when
+    ``cp_single``, any other batch the non-CP kernel (``ncp_*``, ``max_seqs``
+    rows); the idle kernel gets an empty batch. Empty rows read and write the
+    dummy state slot 0. Checkpoint j of a sequence is its state after
+    (j + 1) * 64 tokens."""
 
     max_seqs: int
     # FlashInfer's own split for one sequence; when off the CP kernel is not captured.

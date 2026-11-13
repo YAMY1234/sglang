@@ -30,6 +30,9 @@ from sglang.srt.layers.attention.linear.utils import (
 )
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+    set_external_prefill_body,
+)
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -104,6 +107,7 @@ class TestGDNPrefillGraphExtend(CustomTestCase):
         capability=(10, 0),
         extra_buffer=False,
         cache_chunk=64,
+        external_body=True,
     ):
         """A target's GDN backend on a setup the graph-safe chain supports, unless
         the arguments say otherwise."""
@@ -120,7 +124,9 @@ class TestGDNPrefillGraphExtend(CustomTestCase):
         backend.req_to_token_pool = SimpleNamespace(size=64)
         backend.prefill_graph_max_seqs = 64
         backend.device = "cpu"
-        backend._model_runner = SimpleNamespace(dtype=torch.bfloat16)
+        backend._model_runner = SimpleNamespace(model=torch.nn.Module())
+        if external_body:
+            set_external_prefill_body(backend._model_runner.model)
         graph = SimpleNamespace(
             cuda_graph_config=SimpleNamespace(prefill=SimpleNamespace(bs=[512]))
         )
@@ -171,15 +177,17 @@ class TestGDNPrefillGraphExtend(CustomTestCase):
             ):
                 self.assertEqual(backend.supports_prefill_graph_extend(), captured)
 
-    def test_flashinfer_core_is_captured_only_where_validated(self):
+    def test_flashinfer_tables_are_built_only_for_an_external_body(self):
         """With the FlashInfer prefill kernel the GDN layers keep breaking unless
-        SGLANG_OPT_GDN_PREFILL_GRAPH_FLASHINFER is on; on, the FlashInfer core is
-        captured on SM10x with a bf16 state pool and a 64-token cache chunk, for
-        up to SGLANG_GDN_PREFILL_GRAPH_FLASHINFER_MAX_SEQS sequences."""
+        SGLANG_OPT_GDN_PREFILL_GRAPH_FLASHINFER is on and an external prefill body
+        runs the core; then the tables are built on SM10x with a bf16 state pool
+        and a 64-token cache chunk, for up to
+        SGLANG_GDN_PREFILL_GRAPH_FLASHINFER_MAX_SEQS sequences."""
         bf16 = torch.zeros(1, 2, 4, 8, 8, dtype=torch.bfloat16)
         for switch, setup, captured in (
             (False, {}, False),
             (True, {}, True),
+            (True, dict(external_body=False), False),
             (True, dict(extra_buffer=True), True),
             (True, dict(extra_buffer=True, cache_chunk=256), False),
             (True, dict(capability=(9, 0)), False),
@@ -198,13 +206,11 @@ class TestGDNPrefillGraphExtend(CustomTestCase):
                 self.assertEqual(backend.supports_prefill_graph_extend(), captured)
                 self.assertEqual(backend.prefill_graph_flashinfer, captured)
                 self.assertEqual(backend.prefill_graph_max_seqs, 8 if captured else 64)
-                if captured:
-                    self.assertEqual(backend._fi_graph_output.shape, (512, 4, 8))
-                    self.assertTrue(backend._fi_graph_cp_single)
+                self.assertTrue(backend._fi_graph_cp_single)
 
-    def test_flashinfer_core_skips_the_cp_kernel_with_many_heads(self):
+    def test_flashinfer_tables_skip_the_cp_call_with_many_heads(self):
         """FlashInfer takes its CP kernel only while heads x 4 < SMs, so with 64
-        heads a one-sequence batch is captured on the non-CP kernel too."""
+        heads a one-sequence batch goes to the non-CP tables too."""
         temporal = torch.zeros(1, 2, 64, 8, 8, dtype=torch.bfloat16)
         with (
             envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.override(True),

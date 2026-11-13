@@ -642,7 +642,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
     # Set while a breakable prefill CUDA graph captures or replays a bucket:
     # forward_extend then runs the graph-safe chain on these static tables.
     prefill_graph_metadata: Optional[GDNPrefillGraphMetadata] = None
-    # Set by supports_prefill_graph_extend when the captured core is FlashInfer's.
+    # Set by supports_prefill_graph_extend when the tables are for an external
+    # prefill body that runs the FlashInfer core itself.
     prefill_graph_flashinfer: bool = False
     _fi_graph_cp_single: bool = True
 
@@ -690,6 +691,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
     def _prefill_graph_extend_supported(self) -> bool:
         from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
             get_prefill_num_tokens_to_capture,
+            has_external_prefill_body,
         )
 
         mamba_cache = self.state_pool.mamba_cache
@@ -708,19 +710,19 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel):
             supported = common and buckets_keep_chunk_o_block_size(capture_tokens)
         elif envs.SGLANG_OPT_GDN_PREFILL_GRAPH_FLASHINFER.get():
-            reason = (
-                "needs CUDA, no MIS, chunk size 64 and a contiguous pool"
-                if not common
-                else self._flashinfer_graph_unsupported_reason(capture_tokens)
-            )
+            # SGLang's chain has no FlashInfer core: only an external body runs it.
+            if not has_external_prefill_body(self._model_runner.model):
+                reason = "no external prefill body runs the FlashInfer core"
+            elif not common:
+                reason = "needs CUDA, no MIS, chunk size 64 and a contiguous pool"
+            else:
+                reason = self._flashinfer_graph_unsupported_reason()
             supported = reason is None
             if supported:
-                self._enable_flashinfer_graph(capture_tokens)
+                self._enable_flashinfer_graph()
                 how = (
-                    f"on (FlashInfer core, up to {self.prefill_graph_max_seqs} "
-                    "sequences; larger batches run eagerly"
-                    + ("" if self._fi_graph_cp_single else "; no CP kernel")
-                    + ")"
+                    "on (FlashInfer tables for the external prefill body, "
+                    f"up to {self.prefill_graph_max_seqs} sequences)"
                 )
             else:
                 rank0_log(f"GDN extend graph: FlashInfer unsupported here ({reason})")
@@ -732,9 +734,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
         return supported
 
-    def _flashinfer_graph_unsupported_reason(
-        self, capture_tokens: list[int]
-    ) -> Optional[str]:
+    def _flashinfer_graph_unsupported_reason(self) -> Optional[str]:
         from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
             FlashInferGDNKernel,
         )
@@ -755,32 +755,21 @@ class GDNAttnBackend(MambaAttnBackendBase):
         cache_chunk = mamba_cache_chunk_size()
         if get_exec().mamba.enable_mamba_extra_buffer and cache_chunk != FLA_CHUNK_SIZE:
             return f"mamba cache chunk {cache_chunk} != {FLA_CHUNK_SIZE}"
-        if not capture_tokens:
-            return "no prefill capture sizes"
         return None
 
-    def _enable_flashinfer_graph(self, capture_tokens: list[int]) -> None:
+    def _enable_flashinfer_graph(self) -> None:
         self.prefill_graph_flashinfer = True
         self.prefill_graph_max_seqs = min(
             self.req_to_token_pool.size,
             envs.SGLANG_GDN_PREFILL_GRAPH_FLASHINFER_MAX_SEQS.get(),
         )
-        num_v_heads, head_v_dim = self.state_pool.mamba_cache.temporal.shape[-3:-1]
+        num_v_heads = self.state_pool.mamba_cache.temporal.shape[-3]
         # FlashInfer's own split on SM10x takes CP only while sequences x heads x 4
         # < SMs, so with many heads per rank one sequence runs on the non-CP kernel.
         self._fi_graph_cp_single = (
             num_v_heads * 4
             < torch.cuda.get_device_properties(self.device).multi_processor_count
         )
-        # [max bucket, HV, V] output rows shared by every captured bucket and layer;
-        # rows past a batch keep the last finite values written there.
-        self._fi_graph_output = torch.zeros(
-            (max(capture_tokens), num_v_heads, head_v_dim),
-            dtype=self._model_runner.dtype,
-            device=self.device,
-        )
-        self._fi_graph_layers: dict[int, int] = {}
-        self._fi_graph_engage_logged = False
 
     def prefill_graph_extend_active(self) -> bool:
         return self.prefill_graph_metadata is not None
@@ -808,13 +797,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
     def refresh_prefill_graph_metadata(
         self, meta: GDNPrefillGraphMetadata, forward_batch: ForwardBatch
     ) -> None:
-        if meta.flashinfer is not None and not self._fi_graph_engage_logged:
-            # Every capture is done by the first replay.
-            self._fi_graph_engage_logged = True
-            rank0_log(
-                "GDN extend graph: FlashInfer core captured in layers per bucket "
-                f"{dict(sorted(self._fi_graph_layers.items()))}"
-            )
         self._fill_prefill_graph_metadata(
             meta=meta,
             forward_batch=forward_batch,
@@ -1334,6 +1316,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         tables, so every launch grid depends only on the bucket. Rows past the
         batch belong to no sequence; chunk_fwd_o leaves them zero."""
         meta = self.prefill_graph_metadata
+        if meta.flashinfer is not None:
+            raise RuntimeError(
+                "a FlashInfer GDN extend is captured only in an external prefill body"
+            )
         layer_cache = self.state_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
@@ -1361,16 +1347,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ).transpose(0, 1)
         query, key, value = self._split_prefill_qkv(layer, mixed_qkv)
         g, beta = self._prefill_gates(layer, a, b)
-        if meta.flashinfer is not None:
-            return self._flashinfer_core_in_graph(
-                meta=meta,
-                query=query,
-                key=key,
-                value=value,
-                g=g,
-                beta=beta,
-                ssm_states=ssm_states,
-            )
         core_attn_out, _, h = self.kernel_dispatcher.extend(
             q=query,
             k=key,
@@ -1393,60 +1369,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 cache_indices=meta.cache_indices,
             )
         return core_attn_out
-
-    def _flashinfer_core_in_graph(
-        self,
-        *,
-        meta: GDNPrefillGraphMetadata,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
-        ssm_states: torch.Tensor,
-    ) -> torch.Tensor:
-        """_forward_extend_in_graph's core on FlashInfer: in-place state by slot,
-        prefix-cache snapshots from the 64-token state checkpoints."""
-        tables = meta.flashinfer
-        num_tokens = query.shape[1]
-        if meta.track:
-            # A chunk-0 snapshot is the initial state, which the kernel overwrites.
-            gdn_track_ssm_state(
-                ssm_pool=ssm_states,
-                h=ssm_states.unsqueeze(0),
-                track_mode=tables.pre_track_mode,
-                track_h_row=tables.track_h_row,
-                track_dst=meta.track_dst,
-                cache_indices=meta.cache_indices,
-            )
-        output = self._fi_graph_output[:num_tokens]
-        checkpoints = self.kernel_dispatcher.extend_kernel.extend_in_graph(
-            query,
-            key,
-            value,
-            g,
-            beta,
-            ssm_states=ssm_states,
-            tables=tables,
-            output=output,
-            checkpoint_rows=num_tokens // FLA_CHUNK_SIZE if meta.track else 0,
-            checkpoint_every_n_tokens=FLA_CHUNK_SIZE,
-        )
-        if meta.track:
-            # Buckets under 64 tokens have no checkpoints and only final-state rows.
-            gdn_track_ssm_state(
-                ssm_pool=ssm_states,
-                h=checkpoints if checkpoints is not None else ssm_states.unsqueeze(0),
-                track_mode=tables.track_mode,
-                track_h_row=tables.track_h_row,
-                track_dst=meta.track_dst,
-                cache_indices=meta.cache_indices,
-            )
-        if torch.cuda.is_current_stream_capturing():
-            self._fi_graph_layers[num_tokens] = (
-                self._fi_graph_layers.get(num_tokens, 0) + 1
-            )
-        return output.view(1, num_tokens, *output.shape[1:])
 
     def forward_extend(
         self,
