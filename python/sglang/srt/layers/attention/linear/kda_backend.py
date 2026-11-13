@@ -53,6 +53,9 @@ from sglang.srt.runtime_context import (
 )
 
 
+_P1_HOIST_LOGGED = False
+
+
 def _validate_flashinfer_kda_prefill(
     *,
     chunk_size: int,
@@ -1871,9 +1874,22 @@ class KDAAttnBackend(MambaAttnBackendBase):
         replayssm_g: Optional[torch.Tensor] = None,
         replayssm_beta: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        from sglang.kernels.ops.attention.kda_decode_mtp import (
-            fused_kda_decode_mtp_dspark,
-        )
+        if envs.SGLANG_OPT_KDA_MTP_VERIFY_P1_HOIST.get():
+            from sglang.kernels.ops.attention.kda_decode_mtp_v2 import (
+                fused_kda_decode_mtp_dspark,
+            )
+
+            global _P1_HOIST_LOGGED
+            if not _P1_HOIST_LOGGED:
+                _P1_HOIST_LOGGED = True
+                rank0_log(
+                    "KDA verify: phase-1-hoisted CuTe MTP kernel "
+                    "(SGLANG_OPT_KDA_MTP_VERIFY_P1_HOIST)"
+                )
+        else:
+            from sglang.kernels.ops.attention.kda_decode_mtp import (
+                fused_kda_decode_mtp_dspark,
+            )
 
         seq_len = mixed_qkv.shape[0]
         h = layer.num_v_heads

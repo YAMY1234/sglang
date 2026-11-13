@@ -1713,6 +1713,12 @@ class Envs:
     SGLANG_OPT_DFLASH_BATCHED_SMALL_COPY = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION.get
     )
+    # KDA ReplaySSM spec commit: fold the accepted ring window with the CUDA
+    # row-parallel kernel (bit-identical to the Triton fold); off by default.
+    SGLANG_OPT_KDA_REPLAYSSM_FAST_FOLD = EnvBool(False)
+    # KDA CuTe DSpARK/DFLASH verify: the phase-1-hoisted kernel (backport of
+    # #49135, bit-identical outputs); off by default.
+    SGLANG_OPT_KDA_MTP_VERIFY_P1_HOIST = EnvBool(False)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
