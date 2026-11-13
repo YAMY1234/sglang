@@ -832,6 +832,17 @@ class Envs:
     SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS = EnvInt(16384)
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
+    # PD prefill with DP attention: an attention-DP rank with queued work beyond its
+    # next batch lends whole waiting requests to an under-filled peer of the same
+    # worker; the peer computes their full pages and returns them (prefill_lending.py).
+    SGLANG_ENABLE_DP_PREFILL_LENDING = EnvBool(False)
+    SGLANG_DP_PREFILL_LENDING_MAX_INFLIGHT = EnvInt(4)
+    SGLANG_DP_PREFILL_LENDING_MIN_UNCACHED_TOKENS = EnvInt(1024)
+    SGLANG_DP_PREFILL_LENDING_MARGIN_TOKENS = EnvInt(1024)
+    SGLANG_DP_PREFILL_LENDING_STATUS_MAX_AGE_S = EnvFloat(1.0)
+    SGLANG_DP_PREFILL_LENDING_TIMEOUT_S = EnvFloat(30.0)
+    # Tests only: lend every eligible request to any peer with an in-flight slot.
+    SGLANG_DP_PREFILL_LENDING_FORCE = EnvBool(False)
     SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL = EnvInt(120)
     # Deferred decode-side KV release: on abort, hold an in-flight request's KV
     # pages/slot until the prefill acks the transfer drained, or the timeout
