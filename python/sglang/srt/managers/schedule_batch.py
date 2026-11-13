@@ -522,6 +522,10 @@ class Req(ReqDllmMixin):
         self.dsv41_late_fed: bool = False
         self.dsv41_late_pending: bool = False
         self.dsv41_late_staging: Optional[int] = None
+        self.dsv41_late_queued: bool = False
+        # Prefill: the late window's first position and the capture slot it ships from.
+        self.dsv41_late_capture_start: Optional[int] = None
+        self.dsv41_late_capture_slot: Optional[int] = None
         self.dllm_initialized: bool = False
 
         self.session = session
@@ -1245,6 +1249,10 @@ class Req(ReqDllmMixin):
             max_prefix_len = min(max_prefix_len, self.dllm_block_offset)
         if self.return_logprob and self.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
+        if self.dsv41_late_capture_start is not None:
+            # SGLANG_DSV41_LATE_TAIL_ROWS: this forward captures the late window's
+            # rows, so a cache hit stops before it.
+            max_prefix_len = min(max_prefix_len, self.dsv41_late_capture_start)
         if self.is_dllm():
             # Appended masks and a partial prompt/output block are not reusable
             # KV: bidirectional attention depends on the rest of that block.
@@ -1546,6 +1554,7 @@ class Req(ReqDllmMixin):
         self.dsv41_feed_prompt_left = 0
         self.dsv41_late_fed = False
         self.dsv41_late_pending = False
+        self.dsv41_late_queued = False
         self.mamba_branching_seqlen = None
         self.already_computed = 0
         self.kv.reset_for_retract()

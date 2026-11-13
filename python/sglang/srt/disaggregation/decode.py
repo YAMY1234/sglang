@@ -1793,6 +1793,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:
                 break
 
+            if (
+                decode_req.req.dsv41_late_fed
+                and decode_req.req.dsv41_late_staging is None
+            ):
+                # The late-only rows land in this slot; no slot, no transfer yet.
+                slot = self.scheduler._dsv41_late_reserve_staging()
+                if slot is None:
+                    break
+                decode_req.req.dsv41_late_staging = slot
+
             if self.scheduler.enable_lora and not self.scheduler.can_schedule_lora_req(
                 decode_req.req, running_loras
             ):
@@ -3998,6 +4008,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self._unregister_staging_room(room)
         # release pre-allocated kv cache, but don't insert into the tree since it's failed
         self.scheduler.request_retirer.release(decode_req.req, checkpoint=False)
+        self.scheduler._dsv41_release_late_staging(decode_req.req)
         self.metadata_buffers.clear_slot(idx)
         self.req_to_metadata_buffer_idx_allocator.free(idx)
         if not self._is_host_destination(decode_req):
@@ -4461,26 +4472,43 @@ class SchedulerDisaggregationDecodeMixin:
             self.dsv41_late_retiring = deque()
         return self.dsv41_late_feed
 
-    def _stage_dsv41_late_tails(self: Scheduler, feed: LateTailFeed) -> None:
-        """Queue transferred late-fed tails on the feed, oldest first, while staging
-        slots last."""
+    def _dsv41_late_reserve_staging(self: Scheduler) -> Optional[int]:
+        """A staging slot for a late-fed transfer, or None while all are taken."""
+        if self._dsv41_late_tail_feed() is None:
+            return None
+        self._retire_dsv41_late_staging()
+        if not self.dsv41_late_free_slots:
+            return None
+        return self.dsv41_late_free_slots.popleft()
+
+    def _dsv41_release_late_staging(self: Scheduler, req: Req) -> None:
+        """A transfer that failed before any forward read its slot."""
+        if req.dsv41_late_staging is not None:
+            self.dsv41_late_free_slots.append(req.dsv41_late_staging)
+            req.dsv41_late_staging = None
+
+    def _retire_dsv41_late_staging(self: Scheduler) -> None:
         while self.dsv41_late_retiring and (
             self.dsv41_late_retiring[0][0] <= self.forward_ct
         ):
             self.dsv41_late_free_slots.append(self.dsv41_late_retiring.popleft()[1])
+
+    def _stage_dsv41_late_tails(self: Scheduler, feed: LateTailFeed) -> None:
+        """Queue transferred late-fed tails on the feed, oldest first; each brought
+        its staging slot from pre-allocation."""
+        self._retire_dsv41_late_staging()
         window = self.model_config.sliding_window_size
         for req in self.waiting_queue:
-            if not req.dsv41_late_pending or req.dsv41_late_staging is not None:
+            if not req.dsv41_late_pending or req.dsv41_late_queued:
                 continue
             if req.kv.kv_allocated_len != req.dsv41_tail_start:
                 continue
-            if not self.dsv41_late_free_slots:
-                break
             prompt_len = len(req.full_untruncated_fill_ids)
             assert dsv41_late_tail_prefix_len(prompt_len, window) == (
                 req.dsv41_tail_start
             ), (prompt_len, req.dsv41_tail_start)
-            req.dsv41_late_staging = self.dsv41_late_free_slots.popleft()
+            assert req.dsv41_late_staging is not None, "reserved at pre-allocation"
+            req.dsv41_late_queued = True
             feed.push(
                 req=req, prompt_len=prompt_len, staging_slot=req.dsv41_late_staging
             )

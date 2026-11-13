@@ -16,6 +16,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.late_tail_inputs import (
+    LateTailCapture,
     LateTailInputs,
     LateTailStepInputs,
 )
@@ -842,6 +843,7 @@ def _late_req(prompt_len, pool_idx, **fields):
     fields_ = dict(
         dsv41_late_fed=True,
         dsv41_late_pending=True,
+        dsv41_late_queued=False,
         req_pool_idx=pool_idx,
         full_untruncated_fill_ids=list(range(prompt_len)),
         finished=lambda: False,
@@ -852,13 +854,16 @@ def _late_req(prompt_len, pool_idx, **fields):
 
 
 def _late_sched(waiting, require_mlp_sync=False):
-    return SimpleNamespace(
+    sched = SimpleNamespace(
         waiting_queue=_waiting(waiting),
         model_worker=SimpleNamespace(verify_num_draft_tokens=4),
         model_config=SimpleNamespace(sliding_window_size=128),
         forward_ct=0,
         require_mlp_sync=require_mlp_sync,
     )
+    for name in ("_dsv41_late_tail_feed", "_retire_dsv41_late_staging"):
+        setattr(sched, name, getattr(Mixin, name).__get__(sched))
+    return sched
 
 
 def _late_batch(any_rank=False, mode=ForwardMode.DECODE):
@@ -875,11 +880,17 @@ class TestLateTailScheduling(CustomTestCase):
         with envs.SGLANG_DSV41_LATE_TAIL_ROWS.override(64):
             return Mixin._dsv41_late_tail_feed(sched)
 
+    def _reserve(self, sched, reqs):
+        with envs.SGLANG_DSV41_LATE_TAIL_ROWS.override(64):
+            for req in reqs:
+                req.dsv41_late_staging = Mixin._dsv41_late_reserve_staging(sched)
+
     def test_staged_tails_feed_the_budget_then_join_at_e(self):
         a, b = _late_req(1000, pool_idx=5), _late_req(1001, pool_idx=6)
         self.assertEqual((a.dsv41_tail_start, b.dsv41_tail_start), (998, 1000))
         sched = _late_sched([a, b])
         feed = self._feed(sched)
+        self._reserve(sched, [a, b])
         Mixin._stage_dsv41_late_tails(sched, feed)
         self.assertEqual((a.dsv41_late_staging, b.dsv41_late_staging), (0, 1))
         self.assertEqual(feed.pending_rows(), 256)
@@ -913,6 +924,7 @@ class TestLateTailScheduling(CustomTestCase):
         a = _late_req(1000, pool_idx=5)
         sched = _late_sched([a], require_mlp_sync=True)
         feed = self._feed(sched)
+        self._reserve(sched, [a])
         Mixin._stage_dsv41_late_tails(sched, feed)
         batch = _late_batch(any_rank=False)
         Mixin._set_dsv41_late_tail_inputs(sched, batch, feed)
@@ -933,20 +945,29 @@ class TestLateTailScheduling(CustomTestCase):
         self.assertTrue(batch.dsv41_late_tail.active)
         self.assertIsNone(batch.dsv41_late_tail.positions)
 
-    def test_staging_waits_for_the_transfer_and_a_free_slot(self):
+    def test_slots_are_reserved_before_the_transfer_and_queued_after_it(self):
         late = [_late_req(1000, pool_idx=i) for i in range(3)]
         late[0].kv = SimpleNamespace(kv_allocated_len=0)  # still transferring
         sched = _late_sched(late)
         feed = self._feed(sched)
         sched.dsv41_late_free_slots.clear()
-        sched.dsv41_late_free_slots.append(9)
+        sched.dsv41_late_free_slots.extend([9, 4])
+        self._reserve(sched, late)
+        # Pre-allocation stops at the third: no slot left, so no transfer either.
+        self.assertEqual([r.dsv41_late_staging for r in late], [9, 4, None])
+        late[2].kv = SimpleNamespace(kv_allocated_len=0)
         Mixin._stage_dsv41_late_tails(sched, feed)
-        self.assertEqual([r.dsv41_late_staging for r in late], [None, 9, None])
+        self.assertEqual([r.dsv41_late_queued for r in late], [False, True, False])
+        self.assertEqual(feed.pending_rows(), 128)
+        # A failed transfer hands its slot back at once.
+        Mixin._dsv41_release_late_staging(sched, late[0])
+        self.assertEqual(list(sched.dsv41_late_free_slots), [9])
 
     def test_an_aborted_tail_leaves_the_feed(self):
         a = _late_req(1000, pool_idx=5)
         sched = _late_sched([a])
         feed = self._feed(sched)
+        self._reserve(sched, [a])
         Mixin._stage_dsv41_late_tails(sched, feed)
         a.finished = lambda: True
         batch = _late_batch()
@@ -973,6 +994,47 @@ class TestLateFedAdmission(CustomTestCase):
         batch = _decode_batch([done])
         Mixin._set_dsv41_feed_inputs(_sched(), batch)
         self.assertEqual(batch.dsv41_swa_floor.tolist(), [1001 - 128])
+
+
+class TestLateTailCapture(CustomTestCase):
+    def test_window_rows_land_in_their_slot_across_chunks(self):
+        cap = LateTailCapture(
+            slots=2,
+            window=4,
+            num_req_rows=8,
+            hc_mult=1,
+            hidden_size=1,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        slot = cap.free_slots.popleft()
+        self.assertEqual(slot, 0)
+        # Request row 5 has e = 20: its window is positions [16, 20).
+        cap.bind(req_pool_idx=5, slot=1, window_start=16)
+
+        def run(req_rows, positions):
+            positions = torch.tensor(positions)
+            cap.capture(
+                residual=positions.float()[:, None, None],
+                row_req=torch.tensor(req_rows),
+                positions=positions,
+            )
+
+        # Chunk 1 ends at 18, beside a request without a slot; chunk 2 holds the rest.
+        run([5, 5, 5, 5, 3, 3], [14, 15, 16, 17, 16, 17])
+        run([5, 5], [18, 19])
+        self.assertEqual(cap.pool[4:8, 0, 0].tolist(), [16.0, 17.0, 18.0, 19.0])
+        # Slot 0 stays untouched; outside rows only reach the trash row.
+        self.assertEqual(cap.pool[:4, 0, 0].tolist(), [0.0] * 4)
+        cap.unbind(5)
+        cap.capture(
+            residual=torch.full((1, 1, 1), 99.0),
+            row_req=torch.tensor([5]),
+            positions=torch.tensor([17]),
+        )
+        self.assertEqual(cap.pool[5, 0, 0].item(), 17.0)
+        ptrs, lens, items = cap.transfer_buf_infos()
+        self.assertEqual((lens[0], items[0]), (8 * 4, 4 * 4))
 
 
 if __name__ == "__main__":

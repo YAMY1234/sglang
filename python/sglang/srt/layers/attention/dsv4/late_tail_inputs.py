@@ -9,6 +9,7 @@ tensors; a step without late rows leaves every slot invalid.
 
 from __future__ import annotations
 
+from collections import deque
 from typing import Optional
 
 import msgspec
@@ -129,3 +130,55 @@ class LateTailInputs:
             positions=torch.cat([positions, row_positions.to(positions.dtype)]),
             residual_rows=self.staging[staging_index],
         )
+
+
+class LateTailCapture:
+    """Prefill side of SGLANG_DSV41_LATE_TAIL_ROWS: each late-fed request's window
+    rows of the late layers' input, written at the last KV source layer into a slot
+    the PD transfer sends from (one item per slot)."""
+
+    def __init__(
+        self,
+        *,
+        slots: int,
+        window: int,
+        num_req_rows: int,
+        hc_mult: int,
+        hidden_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        self.window = window
+        # [slots * window + 1, hc_mult, hidden]: the last row takes every row outside
+        # a capture window.
+        self.pool = torch.zeros(
+            slots * window + 1, hc_mult, hidden_size, dtype=dtype, device=device
+        )
+        # Per request-pool row: its capture slot (-1: none) and window start.
+        self.slot_of_row = torch.full(
+            (num_req_rows,), -1, dtype=torch.int64, device=device
+        )
+        self.start_of_row = torch.zeros(num_req_rows, dtype=torch.int64, device=device)
+        self.free_slots = deque(range(slots))
+
+    def transfer_buf_infos(self):
+        rows = self.pool[: self.pool.shape[0] - 1]
+        return [rows.data_ptr()], [rows.nbytes], [self.pool[: self.window].nbytes]
+
+    def bind(self, *, req_pool_idx: int, slot: int, window_start: int) -> None:
+        self.slot_of_row[req_pool_idx] = slot
+        self.start_of_row[req_pool_idx] = window_start
+
+    def unbind(self, req_pool_idx: int) -> None:
+        self.slot_of_row[req_pool_idx] = -1
+
+    def capture(
+        self, *, residual: torch.Tensor, row_req: torch.Tensor, positions: torch.Tensor
+    ) -> None:
+        """Device ops only: copy each row inside its request's window to its slot."""
+        slot = self.slot_of_row[row_req]
+        offset = positions.to(torch.int64) - self.start_of_row[row_req]
+        inside = (slot >= 0) & (offset >= 0) & (offset < self.window)
+        trash = self.pool.shape[0] - 1
+        dst = torch.where(inside, slot * self.window + offset, trash)
+        self.pool.index_copy_(0, dst, residual.to(self.pool.dtype))
