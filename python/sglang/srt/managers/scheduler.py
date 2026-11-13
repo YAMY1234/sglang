@@ -5876,6 +5876,7 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
+                idle &= len(self.disagg_prefill_bootstrap_queue.room_waiters) == 0
 
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
@@ -6255,6 +6256,18 @@ class Scheduler(
                         req.disagg_kv_sender.abort()
                     if get_parallel().pp_size > 1:
                         prepare_abort(req, "Aborted by AbortReq.")
+
+            # Retraction recomputes waiting for their room's release hold no
+            # sender or KV yet: retire them like a waiting-queue request.
+            for req in self.disagg_prefill_bootstrap_queue.take_room_waiters(
+                recv_req.rid, recv_req.abort_all
+            ):
+                logger.debug(f"Abort room-waiting request. {req.rid=}")
+                self._release_aborted_request(req)
+                self.beam_coordinator.retire_group(req)
+                self.send_abort_output(
+                    _make_abort_req(req, finished_reason=recv_req.finished_reason), req
+                )
 
             # Abort in-flight requests
             for req in self.disagg_prefill_inflight_queue:
