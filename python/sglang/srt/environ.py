@@ -2092,6 +2092,11 @@ class Envs:
     # the verify steps decode runs anyway, six prompt tokens per step, instead of a
     # separate extend step. Ranks without running requests keep the extend.
     SGLANG_DSV41_FUSED_TAIL = EnvBool(False)
+    # PD with --dsv41-encoder-only-prefill and SGLANG_DSV41_FUSED_TAIL, set alike on
+    # both sides: prefill also runs the tail's early layers and ships the late layers'
+    # input rows; each decode verify step runs this many of them (a multiple of the
+    # verify width) through the late layers only. 0 keeps the whole tail on decode.
+    SGLANG_DSV41_LATE_TAIL_ROWS = EnvInt(0)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16

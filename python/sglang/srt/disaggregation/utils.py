@@ -1982,7 +1982,33 @@ def dsv41_encoder_prefix_len(prompt_len: int, window: int) -> int:
     holds a pending half-pair: no request-scoped state crosses, and the peers'
     pair rings may differ in size (decode's grows with speculative decoding).
     """
+    if envs.SGLANG_DSV41_LATE_TAIL_ROWS.get() > 0:
+        late_end = dsv41_late_tail_prefix_len(prompt_len, window)
+        if late_end is not None:
+            return late_end
     return max(0, prompt_len - window) // 2 * 2
+
+
+def dsv41_late_tail_prefix_len(prompt_len: int, window: int) -> Optional[int]:
+    """The prefix a late-fed tail's prefill covers (SGLANG_DSV41_LATE_TAIL_ROWS), or
+    None for a prompt too short to late-feed.
+
+    Prefill runs the early layers over [0, e) and ships the late layers' input for
+    the window rows [e - window, e); decode runs only the late layers over those, then
+    verifies the one or two prompt tokens from e on. e stays even, as the encoder
+    split's prefix does.
+    """
+    end = (prompt_len - 1) // 2 * 2
+    return end if end >= window else None
+
+
+def dsv41_late_tail_rows(prompt_len: int, window: int) -> Tuple[int, int, int]:
+    """(start, end, floor) of a late-fed tail's late-only rows: positions [start, end)
+    and the late-layer SWA floor of every row, the one bounded replay applies to the
+    prompt's last window. The rows below the floor attend to themselves only."""
+    end = dsv41_late_tail_prefix_len(prompt_len, window)
+    assert end is not None, f"a {prompt_len}-token prompt is not late-fed"
+    return end - window, end, prompt_len - window
 
 
 def dsv41_encoder_only_unsupported(req: Req) -> Optional[str]:

@@ -7,7 +7,12 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
-from sglang.srt.disaggregation.utils import dsv41_encoder_prefix_len
+from sglang.srt.disaggregation.dsv41_late_tail import LateTailFeed
+from sglang.srt.disaggregation.utils import (
+    dsv41_encoder_prefix_len,
+    dsv41_late_tail_prefix_len,
+    dsv41_late_tail_rows,
+)
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
@@ -576,6 +581,78 @@ class TestAdmission(CustomTestCase):
         waiting, sched = self._admit(5, graph_bs=())
         self.assertEqual(schedule_batch.init_new.call_args.args[0], waiting)
         self.assertEqual(list(sched.waiting_queue), [])
+
+
+class TestLateTailSplit(CustomTestCase):
+    def test_prefix_is_unchanged_with_the_switch_off(self):
+        for prompt_len, start in ((1000, 872), (1001, 872), (129, 0), (5, 0)):
+            self.assertEqual(dsv41_encoder_prefix_len(prompt_len, 128), start)
+
+    def test_late_fed_prefix_stops_one_or_two_tokens_short_and_even(self):
+        with envs.SGLANG_DSV41_LATE_TAIL_ROWS.override(64):
+            for prompt_len, end in ((1000, 998), (1001, 1000), (130, 128), (129, 128)):
+                self.assertEqual(dsv41_encoder_prefix_len(prompt_len, 128), end)
+            # Too short to hold a window of late rows: the encoder split as before.
+            self.assertEqual(dsv41_encoder_prefix_len(128, 128), 0)
+            self.assertEqual(dsv41_encoder_prefix_len(5, 128), 0)
+        self.assertIsNone(dsv41_late_tail_prefix_len(128, 128))
+
+    def test_late_rows_are_one_window_floored_at_the_prompt_window(self):
+        for prompt_len in (1000, 1001, 129, 130, 65665):
+            start, end, floor = dsv41_late_tail_rows(prompt_len, 128)
+            self.assertEqual(end - start, 128)
+            self.assertEqual(end, dsv41_late_tail_prefix_len(prompt_len, 128))
+            self.assertEqual(floor, prompt_len - 128)
+            # One or two rows sit below the floor; the verify step covers the rest.
+            self.assertIn(floor - start, (1, 2))
+            self.assertIn(prompt_len - end, (1, 2))
+
+
+class TestLateTailFeed(CustomTestCase):
+    def _feed(self, rows=64):
+        return LateTailFeed(rows_per_step=rows, width=4, window=128)
+
+    def test_budget_takes_contiguous_slots_oldest_tail_first(self):
+        feed = self._feed(rows=48)
+        a, b = object(), object()
+        feed.push(req=a, prompt_len=1001, staging_slot=3)
+        feed.push(req=b, prompt_len=1000, staging_slot=7)
+        self.assertEqual(feed.pending_rows(), 256)
+        seen = {a: [], b: []}
+        finished = []
+        steps = 0
+        while (step := feed.take()) is not None:
+            steps += 1
+            self.assertLessEqual(len(step.slots), 12)
+            for slot in step.slots:
+                seen[slot.req].append(slot)
+            finished.append(step.finished)
+        self.assertEqual(steps, 6)
+        self.assertEqual(feed.pending_rows(), 0)
+        # a ends in the third step (32 slots = 12 + 12 + 8), and b starts there.
+        self.assertEqual(finished, [(), (), (a,), (), (), (b,)])
+        for req, start, floor, staging in ((a, 872, 873, 3), (b, 870, 872, 7)):
+            slots = seen[req]
+            self.assertEqual(
+                [s.position for s in slots], list(range(start, start + 128, 4))
+            )
+            self.assertEqual([s.staging_row for s in slots], list(range(0, 128, 4)))
+            self.assertEqual({s.floor for s in slots}, {floor})
+            self.assertEqual({s.staging_slot for s in slots}, {staging})
+
+    def test_full_budget_until_the_last_partial_step(self):
+        feed = self._feed(rows=64)
+        feed.push(req=object(), prompt_len=4000, staging_slot=0)
+        feed.push(req=object(), prompt_len=4000, staging_slot=1)
+        feed.push(req=object(), prompt_len=4000, staging_slot=2)
+        sizes = []
+        while (step := feed.take()) is not None:
+            sizes.append(len(step.slots))
+        self.assertEqual(sizes, [16] * 6)
+
+    def test_budget_must_be_whole_verify_slots(self):
+        with self.assertRaises(AssertionError):
+            self._feed(rows=50)
 
 
 if __name__ == "__main__":
