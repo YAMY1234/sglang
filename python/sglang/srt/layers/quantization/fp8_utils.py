@@ -2250,6 +2250,20 @@ def flashinfer_mxfp8_blockscaled_linear(
 
     if (
         backend == "cute-dsl"
+        and not pin_tactic
+        and envs.SGLANG_OPT_SM107_MXFP8_DENSE_TABLE.get()
+        and get_platform().device_sm == 107
+    ):
+        from sglang.kernels.ops.gemm.mxfp8_sm107_dense import decode_linear
+
+        output = decode_linear(q_input, x_scale_u8, weight, weight_scale, output_dtype)
+        if output is not None:
+            if bias is not None:
+                output += bias
+            return output.view(*output_shape)
+
+    if (
+        backend == "cute-dsl"
         and input_2d.shape[0] >= _SM107_CUDNN_MXFP8_MIN_M
         and (weight.shape[0], k) in _SM107_CUDNN_MXFP8_NK
         and get_platform().device_sm == 107
