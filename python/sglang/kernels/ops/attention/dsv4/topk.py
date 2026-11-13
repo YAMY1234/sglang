@@ -70,6 +70,25 @@ def _jit_topk_v2_module(stable_ties: bool = False):
     )
 
 
+@cache_once
+def _jit_topk_v2_push_module():
+    # the DSA DCP decode merge's candidate push; always stable ties, as the
+    # merge's tie order needs
+    args = make_cpp_args(is_arch_support_pdl(), True)
+    return load_jit(
+        make_name("topk_v2_push"),
+        *args,
+        extra_cuda_cflags=["-DSGL_TOPK_STABLE_TIES=1"],
+        cuda_files=["deepseek_v4/topk_v2.cuh"],
+        cuda_wrappers=[
+            (
+                "topk_transform_candidates_dcp_push",
+                f"TopKKernel<{args}>::transform_candidates_dcp_push",
+            )
+        ],
+    )
+
+
 def _topk_v2_module(stable_ties: bool):
     # one cache entry per variant, whichever way callers spell the default
     return (
@@ -273,6 +292,44 @@ def topk_transform_candidates_v2(
         int(page_bits),
         overflow_rows,
         int(coarse_bits),
+    )
+
+
+def topk_transform_candidates_dcp_push(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    push_mc: int,
+    counters: torch.Tensor,
+    world: int,
+    rank: int,
+    cand_k: int,
+    slot: int,
+    cluster_size: int = 0,
+    cluster_floor: int = 0,
+) -> None:
+    """DCP decode top-k that pushes its candidates to the merge.
+
+    Row ``i`` selects the top ``cand_k`` of ``scores[i, :seq_lens[i]]`` exactly
+    as :func:`topk_transform_candidates_v2` with ``stable_ties`` does (local
+    position ``l`` is global position ``l * world + rank``), and writes them,
+    ``(0, -1)`` padded, as tagged int64 entries into this rank's candidate block
+    of row slot ``i`` in every rank's merge buffer (``push_mc``: its multicast
+    address; ``slot`` entries per row slot, ``counters.shape[0]`` row slots per
+    parity; see ``jit/csrc/dsa/dcp_topk_merge.cuh``). ``counters``: [max_rows]
+    int64 merge calls per row slot; the merge advances them.
+    """
+    _jit_topk_v2_push_module().topk_transform_candidates_dcp_push(
+        scores,
+        seq_lens,
+        push_mc,
+        counters,
+        world,
+        rank,
+        cand_k,
+        slot,
+        int(cluster_size),
+        int(cluster_floor),
     )
 
 

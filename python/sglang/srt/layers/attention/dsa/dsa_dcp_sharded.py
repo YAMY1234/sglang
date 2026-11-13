@@ -40,9 +40,11 @@ from sglang.kernels.ops.attention.dcp_kernels import _gather_candidate_prefix_ke
 from sglang.kernels.ops.attention.dsa.dcp_topk_merge import (
     dcp_topk_merge,
     dcp_topk_merge_buffer_numel,
+    dcp_topk_merge_pushed,
 )
 from sglang.kernels.ops.attention.dsv4.topk import (
     candidates_cluster_size,
+    topk_transform_candidates_dcp_push,
     topk_transform_candidates_v2,
     topk_transform_packed_v2,
     topk_transform_paged_v2,
@@ -188,14 +190,24 @@ class DcpTopKMerge:
     """Exact global top-k merge of decode rows in one kernel; see
     jit/csrc/dsa/dcp_topk_merge.cuh. Needs 8 or 16 ranks (one warp each), top-k
     2048 and multicast; ``usable`` is False otherwise. ``split``: candidates come
-    from the context-split verify indexer."""
+    from the context-split verify indexer. ``push`` (token interleave only): the
+    local top-k selects only the candidates and pushes them (``merge_pushed``)."""
 
-    def __init__(self, group, max_rows: int, topk: int, split: bool = False):
+    def __init__(
+        self,
+        group,
+        max_rows: int,
+        topk: int,
+        split: bool = False,
+        push: bool = False,
+    ):
         import torch.distributed._symmetric_memory as symm_mem
 
         self.rank = group.rank_in_group
+        self.world = group.world_size
         self.max_rows = max_rows
         self.split = split
+        self.push = push and not split
         self.buffer: Optional[torch.Tensor] = None
         self.multicast_ptr = 0
         self.peer_ptrs: Optional[torch.Tensor] = None
@@ -238,6 +250,14 @@ class DcpTopKMerge:
         )
         self.counters = torch.zeros(max_rows, dtype=torch.int64, device=group.device)
         self.fallback = torch.zeros(max_rows, dtype=torch.int32, device=group.device)
+        if self.push:
+            # the pushed merge's fallback reads the failed ranks' slots directly
+            print_info_once(
+                f"DSA DCP top-k merge: the local top-k pushes its best "
+                f"{_DCP_MERGE_CAND_K} keys per row to the merge, no local "
+                f"top-{topk} (SGLANG_DSA_DCP_TOPK_PUSH)"
+            )
+            return
         self.union_scratch = torch.empty(
             (max_rows, world * topk), dtype=torch.int64, device=group.device
         )
@@ -270,8 +290,56 @@ class DcpTopKMerge:
             split=self.split,
         )
 
+    def merge_pushed(
+        self,
+        logits: torch.Tensor,
+        local_lens: torch.Tensor,
+        global_lens: torch.Tensor,
+        page_table: torch.Tensor,
+        out: torch.Tensor,
+        span: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Push mode: this rank's top-``_DCP_MERGE_CAND_K`` candidates straight
+        into every rank's buffer, then the merge. Fills ``out`` (as ``__call__``)
+        and returns the same keys localized, as ``dcp_localize_compact(out)``."""
+        rows = out.shape[0]
+        topk_transform_candidates_dcp_push(
+            logits,
+            local_lens,
+            push_mc=self.multicast_ptr,
+            counters=self.counters,
+            world=self.world,
+            rank=self.rank,
+            cand_k=_DCP_MERGE_CAND_K,
+            slot=self.world * _DCP_MERGE_CAND_K + out.shape[1],
+            cluster_size=candidates_cluster_size(rows),
+            cluster_floor=_CANDIDATE_CLUSTER_FLOOR,
+        )
+        local = torch.empty_like(out)
+        lengths = torch.empty(rows, dtype=torch.int32, device=out.device)
+        dcp_topk_merge_pushed(
+            logits,
+            local_lens,
+            global_lens,
+            page_table,
+            buffer=self.buffer,
+            peer_ptrs=self.peer_ptrs,
+            counters=self.counters,
+            out_slots=out,
+            out_local=local,
+            out_lengths=lengths,
+            out_fallback=self.fallback[:rows],
+            rank=self.rank,
+            span=span,
+            cand_k=_DCP_MERGE_CAND_K,
+        )
+        return local, lengths
+
 
 _TOPK_MERGE: Optional[DcpTopKMerge] = None
+# (slots, localized rows, counts) of the last pushed merge: dcp_localize_compact
+# returns the last two for that very slots tensor instead of recomputing them
+_PUSHED_LOCALIZED: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
 
 
 def init_dcp_topk_merge(max_rows: int, topk: int) -> None:
@@ -287,7 +355,9 @@ def init_dcp_topk_merge(max_rows: int, topk: int) -> None:
         parallel.attn_dcp_size,
         parallel.attn_dcp_rank,
     )
-    _TOPK_MERGE = DcpTopKMerge(group, max_rows, topk)
+    _TOPK_MERGE = DcpTopKMerge(
+        group, max_rows, topk, push=envs.SGLANG_DSA_DCP_TOPK_PUSH.get()
+    )
 
 
 def _zeros_i32(n: int, device: torch.device) -> torch.Tensor:
@@ -382,6 +452,8 @@ def _localize_compact_kernel(
 def dcp_localize_compact(slots: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Global top-k slots [rows, topk] -> (this rank's rows compacted to the
     front, -1 after; [rows] counts) for FlashMLA's ``topk_length``."""
+    if _PUSHED_LOCALIZED is not None and _PUSHED_LOCALIZED[0] is slots:
+        return _PUSHED_LOCALIZED[1], _PUSHED_LOCALIZED[2]
     parallel = get_parallel()
     rows, topk = slots.shape
     out = torch.empty_like(slots)
@@ -464,6 +536,13 @@ def dcp_global_topk(
     if rows == 0:
         return out
     if all_gather is None and _TOPK_MERGE is not None and _TOPK_MERGE.usable(rows):
+        if _TOPK_MERGE.push:
+            global _PUSHED_LOCALIZED
+            local, lengths = _TOPK_MERGE.merge_pushed(
+                logits, local_lens, global_lens, page_table, out, span
+            )
+            _PUSHED_LOCALIZED = (out, local, lengths)
+            return out
         candidates = _local_candidates(logits, local_lens, topk)
         _TOPK_MERGE(candidates, global_lens, page_table, out, span)
         return out

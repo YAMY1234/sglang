@@ -2143,6 +2143,13 @@ class Envs:
     # DSA backend (GLM 5 and DeepSeek V3.2)
     # ===================================================================
     SGLANG_DSA_FUSE_TOPK = EnvBool(True)
+    # DCP decode top-k: the local top-k selects only the merge's candidates and
+    # pushes them itself; the merge skips the local top-2048 and also returns the
+    # localized rows (dsa/dsa_dcp_sharded.py).
+    SGLANG_DSA_DCP_TOPK_PUSH = EnvBool(False)
+    # DCP sparse MLA split into workspace-bounded calls: each call writes its
+    # rows of one output in place of a cat (dsa/dsa_dcp.py).
+    SGLANG_DSA_DCP_ATTN_INPLACE_OUT = EnvBool(False)
     # Admit SM107 (Rubin) to the prims_ts DSA backend, on FlashInfer prims_ts 784bfaf5
     # (flashinfer#8186; vendored beside dsa/prims_ts.py for 26bb6dc9 images).
     SGLANG_ENABLE_PRIMS_TS_SM107 = EnvBool(False)
