@@ -19,9 +19,28 @@ Selection checks do not mutate cache state. Shared-pool load preparation
 realizes the selected reservation before a host transfer pins device rows.
 """
 
+import logging
 from typing import Optional
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
+
+logger = logging.getLogger(__name__)
+_park_chunked_prefill_logged = False
+
+
+def park_chunked_prefill_enabled() -> bool:
+    """SGLANG_K31_PARK_CHUNKED_PREFILL (#44823 backport via #50040): a spent KV
+    budget parks the chunked continuation for the pass. Logs once when on."""
+    global _park_chunked_prefill_logged
+    enabled = envs.SGLANG_K31_PARK_CHUNKED_PREFILL.get()
+    if enabled and not _park_chunked_prefill_logged:
+        _park_chunked_prefill_logged = True
+        logger.info(
+            "K31 park-chunked-prefill: on (sgl-project/sglang#44823 backport: a "
+            "spent KV budget parks the chunked continuation)"
+        )
+    return enabled
 
 
 def estimate_swa_kv_tokens(
@@ -141,8 +160,15 @@ class PrefillBudget:
 
     def available_chunk_tokens(self, chunk_limit: int) -> int | None:
         available = min(chunk_limit, int(self.remaining_total))
+        if available > 0:
+            return available
+        if park_chunked_prefill_enabled():
+            # Park the continuation for this pass (#44823): nothing is free or
+            # evictable, so a chunk would only fail in the allocator. Its KV is
+            # released by inflight transfers and finishing requests, not by it.
+            return None
         # Single-pool continuation must make progress to release its KV.
-        return available if available > 0 else chunk_limit
+        return chunk_limit
 
     def fit_chunk(
         self,

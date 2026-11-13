@@ -35,6 +35,7 @@ from sglang.srt.mem_cache.prefill_budget import (
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -1924,6 +1925,142 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIsNone(result)
         self.assertEqual((req.prefix_len, req.extend_end), (0, 200))
         self.assertIn(req, adder.can_run_list)
+
+    # Prefill KV exhaustion (K3.1 c640 PD jobs died in alloc_extend with
+    # "Prefill out of memory"): a continuation forced into a spent budget
+    # (#44823 park) and SPF admissions spending a chunk's tail.
+    PAGE = 64
+
+    def _kv_adder(self, *, available, rem_chunk_tokens=65536, park=True, tail=True):
+        override = get_context().override_server_args(
+            schedule_policy="shortest-prefill-first"
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = True
+        self.mock_tree_cache.evictable_size.return_value = 0
+        self.mock_token_allocator.available_size.return_value = available
+        for env, value in (
+            (envs.SGLANG_K31_PARK_CHUNKED_PREFILL, park),
+            (envs.SGLANG_K31_PF_SPF_RESERVE_CHUNKED_TAIL, tail),
+        ):
+            ctx = env.override(value)
+            ctx.__enter__()
+            self.addCleanup(ctx.__exit__, None, None, None)
+        return self.create_adder(
+            self.create_running_batch(),
+            page_size=self.PAGE,
+            rem_input_tokens=1 << 20,
+            rem_chunk_tokens=rem_chunk_tokens,
+        )
+
+    def _continuation(self, *, prefix_len, remaining):
+        req = self.create_shared_req("chunked")
+        req.prefix_len = prefix_len
+        req.extend_end = prefix_len
+        req.full_untruncated_fill_ids = list(range(prefix_len + remaining))
+        return req
+
+    def _tail(self, remaining, max_new=4):
+        return remaining + self.PAGE + max_new
+
+    def test_spent_budget_parks_continuation(self):
+        # 1054133: pool and evictable both 0, 36224 tokens left in the chunk.
+        for park in (False, True):
+            with self.subTest(park=park):
+                adder = self._kv_adder(available=0, park=park)
+                req = self._continuation(prefix_len=39040, remaining=36224)
+                result = adder.add_chunked_req(req)
+                if not park:
+                    # The gap: a full chunk is admitted with nothing allocatable.
+                    self.assertIsNone(result)
+                    self.assertEqual(adder.can_run_list, [req])
+                    self.assertEqual(req.extend_len, 36224)
+                else:
+                    self.assertIs(result, req)
+                    self.assertEqual(adder.can_run_list, [])
+                    self.assertEqual(req.extend_end, 39040)
+                    self.assertEqual(
+                        adder.memory_budget.total_offset, self._tail(36224)
+                    )
+
+    def _tail_then_new_req(self, *, tail, host_hit_length=0):
+        # SPF caps the chunk to leave chunk budget for a new request; without
+        # the tail reservation it takes the pages the next chunk needs.
+        adder = self._kv_adder(available=100032, rem_chunk_tokens=131072, tail=tail)
+        chunked = self._continuation(prefix_len=32768, remaining=65536)
+        adder.chunked_req_limit = 32768
+        self.assertIs(adder.add_chunked_req(chunked), chunked)
+        new = self.create_shared_req("new", max_new_tokens=16)
+        new.full_untruncated_fill_ids = list(range(40000))
+        if host_hit_length:
+            new.host_hit_length = host_hit_length
+            new.best_match_node = new.last_node
+            new.needs_host_load_back.return_value = True
+            self.mock_tree_cache.init_load_back.return_value = (
+                host_hit_length,
+                new.last_node,
+            )
+        result = adder.add_one_req(
+            new, has_chunked_req=True, truncation_align_size=None
+        )
+        return adder, chunked, new, result
+
+    def test_spf_new_request_cannot_take_chunked_tail(self):
+        for host_hit_length in (0, 30016):
+            for tail in (False, True):
+                with self.subTest(tail=tail, host_hit=host_hit_length):
+                    self.mock_tree_cache.init_load_back.reset_mock()
+                    adder, chunked, new, result = self._tail_then_new_req(
+                        tail=tail, host_hit_length=host_hit_length
+                    )
+                    if not tail:
+                        # The gap: 100032 - 32768 - 40000 = 27264 tokens remain
+                        # for a 32768-token tail.
+                        self.assertEqual(adder.can_run_list, [chunked, new])
+                    else:
+                        # Host-hit tokens count like extend tokens, and the
+                        # load-back is never issued for a rejected request.
+                        self.assertIs(result, AddReqResult.NO_TOKEN)
+                        self.assertEqual(adder.can_run_list, [chunked])
+                        self.mock_tree_cache.init_load_back.assert_not_called()
+                        self.assertEqual(
+                            adder.memory_budget.total_offset,
+                            32768 + self.PAGE + self._tail(32768),
+                        )
+
+    def test_spf_new_chunked_request_reserves_its_tail(self):
+        adder = self._kv_adder(available=1 << 20, rem_chunk_tokens=8192)
+        req = self.create_shared_req("long")
+        req.full_untruncated_fill_ids = list(range(20000))
+        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+        self.assertIs(adder.new_chunked_req, req)
+        self.assertEqual(req.extend_len, 8192)
+        self.assertEqual(
+            adder.memory_budget.total_offset,
+            8192 + self.PAGE + self._tail(adder.ceil_paged_tokens(20000 - 8192)),
+        )
+
+    def test_spf_chunk_not_shrunk_for_request_without_kv_headroom(self):
+        policy = SchedulePolicy(
+            policy="shortest-prefill-first",
+            tree_cache=RadixCache.create_simulated(),
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+        )
+        chunked = self._continuation(prefix_len=32768, remaining=65536)
+        short = self.create_shared_req("short")
+        short.origin_input_ids = short.full_untruncated_fill_ids = list(range(512))
+        short.num_matched_prefix_tokens = 0
+        for available, limited in ((1 << 20, True), (65536 + 512, False)):
+            with self.subTest(available=available):
+                adder = self._kv_adder(available=available)
+                limit = policy.shortest_prefill_chunk_limit(
+                    chunked, [short], 65536, self.PAGE, adder=adder
+                )
+                self.assertEqual(limit, 65536 - 512 if limited else None)
 
     def _adder_with_extend_lens(self, extend_lens):
         adder = PrefillAdder.__new__(PrefillAdder)

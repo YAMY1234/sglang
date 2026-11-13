@@ -144,5 +144,37 @@ class TestStashGatePreservesPrefix(CustomTestCase):
         )
 
 
+class TestPdPrefillParkedChunk(CustomTestCase):
+    """PD prefill's process_prefill_chunk mirrors the stash gate: a chunk
+    parked for lack of KV pages is neither re-published nor re-sent."""
+
+    def _process(self, *, fill_len: int, enable_overlap: bool):
+        req = _make_req(
+            req_pool_idx=4, fill_ids=list(range(64)), prefix_len=8, fill_len=fill_len
+        )
+        s = Scheduler.__new__(Scheduler)
+        s.chunked_req = req
+        s.enable_overlap = enable_overlap
+        s.checkpoint_disagg_prefill = MagicMock()
+        s.check_bootstrap = MagicMock(return_value=True)
+        s.send_kv_chunk = MagicMock()
+        running_batch = SimpleNamespace(batch_is_full=True)
+        Scheduler.process_prefill_chunk(s, last_batch=None, running_batch=running_batch)
+        self.assertFalse(running_batch.batch_is_full)
+        return s
+
+    def test_parked_chunk_is_not_republished_or_resent(self):
+        for overlap in (False, True):
+            with self.subTest(overlap=overlap):
+                s = self._process(fill_len=8, enable_overlap=overlap)
+                s.checkpoint_disagg_prefill.assert_not_called()
+                s.send_kv_chunk.assert_not_called()
+
+    def test_computed_chunk_is_published_and_sent(self):
+        s = self._process(fill_len=32, enable_overlap=False)
+        s.checkpoint_disagg_prefill.assert_called_once()
+        s.send_kv_chunk.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

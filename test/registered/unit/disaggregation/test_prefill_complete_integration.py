@@ -445,7 +445,13 @@ class TestAllocationIntegration(CustomTestCase):
                     )
                     override.install()
                     try:
-                        req = Mock(finished_reason=None, to_finish=None)
+                        # A chunk ran since the last checkpoint (not parked).
+                        req = Mock(
+                            finished_reason=None,
+                            to_finish=None,
+                            extend_end=32,
+                            prefix_len=16,
+                        )
                         scheduler = SimpleNamespace(
                             chunked_req=req,
                             tree_cache=Mock(),

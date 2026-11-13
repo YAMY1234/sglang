@@ -784,6 +784,15 @@ class Envs:
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)
+    # Prefill KV exhaustion. The two K31 switches are sgl-project/sglang#50040's
+    # (default off there): park a chunked continuation whose KV budget is spent
+    # (#44823) instead of forcing a full chunk into a full pool, and, under
+    # shortest-prefill-first, hold a truncated chunk's tail in the budget.
+    SGLANG_K31_PARK_CHUNKED_PREFILL = EnvBool(True)
+    SGLANG_K31_PF_SPF_RESERVE_CHUNKED_TAIL = EnvBool(True)
+    # PD prefill backstop: a built batch whose paged KV demand exceeds free plus
+    # evictable pages is undone and retried next step instead of raising.
+    SGLANG_PREFILL_DEFER_ON_KV_SHORTFALL = EnvBool(True)
     SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS = EnvInt(16384)
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
