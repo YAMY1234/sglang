@@ -4529,6 +4529,19 @@ class SchedulerDisaggregationDecodeMixin:
                 (self.forward_ct + 2, req.dsv41_late_staging)
             )
             req.dsv41_late_staging = None
+        self.dsv41_late_tail_ct = getattr(self, "dsv41_late_tail_ct", 0) + len(
+            step.finished
+        )
+        now = time.monotonic()
+        if now - getattr(self, "dsv41_late_tail_log_t", -1e9) > 5:
+            self.dsv41_late_tail_log_t = now
+            logger.info(
+                "SGLANG_DSV41_LATE_TAIL_ROWS: %d tails ran their late-only rows so far, "
+                "%d slots this step, %d rows pending",
+                self.dsv41_late_tail_ct,
+                len(slots),
+                feed.pending_rows(),
+            )
 
     def _admit_dsv41_fed_tails(
         self: Scheduler, running_batch: ScheduleBatch
