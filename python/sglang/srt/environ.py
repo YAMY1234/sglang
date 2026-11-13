@@ -623,6 +623,9 @@ class Envs:
     SGLANG_OPT_DSV41_BLOCKWISE_REJECTION = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # DSpark eager sampled accept (no in-graph accept): the target verify keeps its
+    # BF16 LM-head logits; batches off the block-wise rejection path get the FP32 cast.
+    SGLANG_OPT_DSPARK_BF16_VERIFY_LOGITS = EnvBool(False)
     # The deferred draft KV store's staging (write locations, positions, state slots,
     # commit lengths) in one Triton launch instead of four copies and a fill.
     SGLANG_OPT_DSV41_DSPARK_ONE_LAUNCH_COMMIT_STAGE = EnvBool(

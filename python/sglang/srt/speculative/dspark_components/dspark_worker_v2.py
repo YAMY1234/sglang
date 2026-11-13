@@ -9,6 +9,7 @@ from sglang.kernels.ops.speculative.dspark.blockwise_rejection import (
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_tp_group
+from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -81,6 +82,7 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     TargetVerifyExecutor,
     target_model_type,
     verify_logits_adjustments_are_noop,
+    widen_verify_logits,
 )
 from sglang.srt.speculative.online_acceptance_estimator import (
     OnlineAcceptanceEstimator,
@@ -532,6 +534,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             block_verification=get_spec().speculative_use_block_verification,
             rejection_noise=self._rejection_noise,
         )
+        self._bf16_verify_logits = self._keep_verify_logits_dtype()
+        self._bf16_verify_logits_noted = False
 
         self._forced_budget_frac: Optional[float] = None
         self._need_mamba_verify_commit = False
@@ -547,6 +551,59 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         if self._is_pd_prefill and not self._draft_is_moe:
             self.draft_model.prune_to_ctx_kv_injection()
+
+    def _keep_verify_logits_dtype(self) -> bool:
+        """SGLANG_OPT_DSPARK_BF16_VERIFY_LOGITS: opt the target LM head out of its FP32
+        cast while every verify-logits consumer runs eagerly after the graph."""
+        if not (
+            envs.SGLANG_OPT_DSPARK_BF16_VERIFY_LOGITS.get()
+            and is_cuda()
+            and self._rejection_noise is not None
+            and self._verify_epilogue is None
+            and self._sampling_accept_graph is None
+            and not self._verify_planner.is_compact_mode
+        ):
+            return False
+        processors = [
+            module
+            for module in self.target_worker.model_runner.model.modules()
+            if isinstance(module, LogitsProcessor)
+        ]
+        if len(processors) != 1:
+            return False
+        processors[0].verify_keeps_lm_head_dtype = True
+        log_info_on_rank0(
+            logger, "DSpark target verify keeps the LM head's logits dtype"
+        )
+        return True
+
+    def _verify_logits_stay_lm_head_dtype(
+        self, *, batch: ScheduleBatch, sampling_info, draft_block
+    ) -> bool:
+        """The batch's only verify-logits readers widen on load: the block-wise
+        rejection and, under simulated acceptance, the temperature-only bonus."""
+        return (
+            not batch.has_grammar
+            and not batch.return_logprob
+            and self._verify_executor.accepts_blockwise(
+                sampling_info=sampling_info, draft_block=draft_block
+            )
+            and verify_logits_adjustments_are_noop(sampling_info)
+            and not sampling_info.need_min_p_sampling
+            and not sampling_info.has_watermark_candidates
+            and sampling_info.sampling_mask_batch_indices is None
+        )
+
+    def _note_bf16_verify_logits(self, batch: ScheduleBatch, dtype) -> None:
+        if self._bf16_verify_logits_noted:
+            return
+        self._bf16_verify_logits_noted = True
+        unit = all(req.sampling_params.temperature == 1.0 for req in batch.reqs)
+        log_info_on_rank0(
+            logger,
+            f"DSpark verify accept reads {dtype} logits (bs={len(batch.reqs)}, "
+            f"all temperatures 1.0: {unit})",
+        )
 
     def _build_acceptance_estimator(self) -> Optional[OnlineAcceptanceEstimator]:
         if (
@@ -1172,6 +1229,15 @@ class DSparkWorkerV2(BaseSpecWorker):
                 hidden_strided = None
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
+        if logits_output.next_token_logits.dtype != torch.float32:
+            if self._verify_logits_stay_lm_head_dtype(
+                batch=batch, sampling_info=sampling_info, draft_block=draft_block
+            ):
+                self._note_bf16_verify_logits(
+                    batch, logits_output.next_token_logits.dtype
+                )
+            else:
+                widen_verify_logits(logits_output)
         if batch.has_grammar:
             # run_compact scatters its rows back to (bs * chain_len), so the mask
             # lines up with the logits on both verify paths.

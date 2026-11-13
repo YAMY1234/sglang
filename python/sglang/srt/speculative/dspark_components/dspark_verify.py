@@ -6,6 +6,7 @@ from typing import Optional
 import msgspec
 import torch
 
+from sglang.kernels.ops.activation.softcap import cast_to_float32_logits
 from sglang.kernels.ops.embeddings.engram_hash import engram_commit_history
 from sglang.kernels.ops.sampling import argmax as sampling_argmax
 from sglang.kernels.ops.speculative.dspark.blockwise_rejection import (
@@ -237,6 +238,22 @@ class TargetVerifyExecutor:
             simulated_bonus_seed=self._simulated_bonus_seed,
         )
 
+    def accepts_blockwise(self, *, sampling_info, draft_block: DraftBlockResult) -> bool:
+        """Whether accept_draft_tokens would take the block-wise rejection on every
+        row: a sampled batch without greedy rows, off the draft vocab shards."""
+        return (
+            sampling_info is not None
+            and not sampling_info.is_any_greedy
+            and not _accepts_on_shards(
+                draft_block, sampling_info, self._block_verification
+            )
+            and _blockwise_rejection_applies(
+                sampling_info=sampling_info,
+                rejection_noise=self._rejection_noise,
+                block_verification=self._block_verification,
+            )
+        )
+
     def begin_simulated_step(self) -> None:
         """Draw this step's SGLANG_SIMULATE_ACC_LEN correct length and bonus seed,
         before the target verify, so the folded accept in the graph applies them too."""
@@ -348,6 +365,8 @@ class TargetVerifyExecutor:
         )
 
         if sampling_info is not None:
+            if not verify_logits_adjustments_are_noop(sampling_info):
+                widen_verify_logits(result.logits_output)
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=result.logits_output.next_token_logits,
                 sampling_info=sampling_info,
@@ -1225,6 +1244,15 @@ def sample_simulated_bonus(
             rows_per_request=verify_num_draft_tokens,
         )
     return bonus.to(greedy_bonus.dtype).view_as(greedy_bonus)
+
+
+def widen_verify_logits(logits_output: LogitsProcessorOutput) -> None:
+    """Replace a verify's BF16/FP16 logits by the FP32 copy the stock verify returns."""
+    logits = logits_output.next_token_logits
+    if logits.dtype == torch.float32:
+        return
+    out = torch.empty(logits.shape, dtype=torch.float32, device=logits.device)
+    logits_output.next_token_logits = cast_to_float32_logits(logits, out)
 
 
 def _simulated_rows(correct_len: torch.Tensor, rows_per_request: int) -> torch.Tensor:
