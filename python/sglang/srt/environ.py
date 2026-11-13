@@ -1785,6 +1785,8 @@ class Envs:
     )
     # PD decode optimizations follow the shared switch unless explicitly disabled.
     SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION = EnvBool(True)
+    # Preallocate queued PD-decode requests after the batch launch, beside the forward.
+    SGLANG_DISAGG_DECODE_DEFER_PREALLOC = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
