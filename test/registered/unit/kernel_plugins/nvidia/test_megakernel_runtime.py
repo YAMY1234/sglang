@@ -15,6 +15,7 @@ from sglang.srt.kernel_plugins.nvidia import binding
 from sglang.srt.kernel_plugins.nvidia.binding import MegakernelBinding, PreparationView
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     _build_layer_model_forward_kwargs,
+    has_external_prefill_body,
 )
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -658,6 +659,7 @@ class TestMegakernelRuntime(CustomTestCase):
         self.assertEqual((step.mode, step.rows, step.view), ("prefill", 4, "pview"))
         self.assertIs(original.__func__, stock)
         MegakernelBinding.forward_view.assert_not_called()
+        self.assertTrue(has_external_prefill_body(lm))
 
     def test_a_declined_body_runs_the_layer_model_forward(self):
         lm = self._install_body()
@@ -671,6 +673,7 @@ class TestMegakernelRuntime(CustomTestCase):
     def test_without_prefill_graph_the_layer_model_keeps_its_forward(self):
         lm = self._install_body(prefill_graph=False)
         self.assertNotIn("forward", lm.model.__dict__)
+        self.assertFalse(has_external_prefill_body(lm))
         self.assertIn("forward", lm.__dict__)
 
     def test_prefill_graph_without_a_body_is_refused(self):

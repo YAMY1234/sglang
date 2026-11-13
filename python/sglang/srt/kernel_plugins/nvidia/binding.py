@@ -1603,17 +1603,15 @@ def _install_prefill_body(
     module's forward, resolved as the graph runner resolves it) to the build."""
     from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
         _resolve_transformer_layer_model,
+        set_external_prefill_body,
     )
 
     if not isinstance(dispatch.built, SupportsPrefillBody):
         _refuse([f"{spec.name} sets prefill_graph without plan_body / forward_body"])
     layer_model = _resolve_transformer_layer_model(model)
     layer_model.forward = dispatch.wrapped_body(layer_model.forward)
-    logger.info(
-        "NVIDIA megakernel: %s plans the prefill body (%s.forward)",
-        spec.name,
-        type(layer_model).__name__,
-    )
+    set_external_prefill_body(model)
+    logger.info("NVIDIA megakernel: %s plans the prefill body", spec.name)
 
 
 class _CaptureCheck:
