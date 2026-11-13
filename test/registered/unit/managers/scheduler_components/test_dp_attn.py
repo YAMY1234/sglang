@@ -996,5 +996,148 @@ class TestSyncRowExchangeGloo(CustomTestCase):
                     self.assertEqual(drain, [(r + round_idx) % 8 for r in range(sub)])
 
 
+_SHM_WORLD = 6
+# Simulated hosts per layout: one host (shm only), two (a leader TCP link), three
+# (a leader mesh).
+_SHM_HOST_LAYOUTS = (1, 2, 3)
+
+
+def _shm_exchange_worker(rank, init_dir, out_q):
+    """One rank of a 6-rank group on 1, 2 or 3 simulated hosts: the shm exchange
+    under SGLANG_DP_SYNC_SHM_EXCHANGE against the gloo all-gather, with arrival
+    skew and int64 values the 40-bit table cannot hold unfolded."""
+    import random
+
+    from sglang.srt.managers.scheduler_components import shm_tag_exchange
+
+    for hosts in _SHM_HOST_LAYOUTS:
+
+        def host_of(r, hosts=hosts):
+            return f"host{r * hosts // _SHM_WORLD}"
+
+        def same_node(pg, source_rank=0):
+            return [host_of(r) == host_of(source_rank) for r in range(_SHM_WORLD)]
+
+        dist.init_process_group(
+            "gloo",
+            init_method=f"file://{init_dir}/hosts{hosts}",
+            rank=rank,
+            world_size=_SHM_WORLD,
+            timeout=datetime.timedelta(seconds=60),
+        )
+        group = dist.group.WORLD
+        rng = random.Random(100 * hosts + rank)
+        try:
+            with (
+                envs.SGLANG_DP_SYNC_SHM_EXCHANGE.override(True),
+                patch.object(
+                    shm_tag_exchange,
+                    "get_device",
+                    return_value=SimpleNamespace(sleep_on_idle=False),
+                ),
+                patch(
+                    "sglang.srt.distributed.parallel_state.in_the_same_node_as",
+                    side_effect=same_node,
+                ),
+                patch.object(
+                    shm_tag_exchange.socket,
+                    "gethostname",
+                    return_value=host_of(rank),
+                ),
+                patch(
+                    "sglang.srt.utils.network.get_local_ip_auto",
+                    return_value="127.0.0.1",
+                ),
+            ):
+                for round_idx in range(4):
+                    local = torch.tensor(
+                        [rank, -1 - rank, (1 << 62) + round_idx, -(1 << 63), 1 << 40]
+                        + [rank * 1000 + round_idx] * 8,
+                        dtype=torch.int64,
+                    )
+                    reference = torch.zeros(_SHM_WORLD * 13, dtype=torch.int64)
+                    dp_attn.all_gather_single(reference, local, group=group)
+                    time.sleep(rng.uniform(0.0, 0.02))
+                    exchanged = torch.zeros_like(reference)
+                    dp_attn.exchange_sync_rows(exchanged, local, group=group)
+                    out_q.put(
+                        (hosts, round_idx, rank, torch.equal(exchanged, reference))
+                    )
+                exchange = shm_tag_exchange._EXCHANGES[(id(group), "dpsync", 26)]
+                hier = isinstance(exchange, shm_tag_exchange.HierTagExchange)
+                out_q.put(
+                    (
+                        hosts,
+                        "path",
+                        rank,
+                        (
+                            type(exchange).__name__,
+                            hier and exchange.link is not None,
+                            hier and exchange.mesh is not None,
+                        ),
+                    )
+                )
+        finally:
+            for exchange in shm_tag_exchange._EXCHANGES.values():
+                if isinstance(exchange, shm_tag_exchange.HierTagExchange):
+                    exchange.local.close()
+                    exchange.full.close()
+                elif exchange is not None:
+                    exchange.close()
+            shm_tag_exchange._EXCHANGES.clear()
+            dist.destroy_process_group()
+
+
+class TestSyncRowExchangeShm(CustomTestCase):
+    def test_shm_exchange_matches_all_gather_on_one_two_and_three_hosts(self):
+        """SGLANG_DP_SYNC_SHM_EXCHANGE: every rank reads every rank's row bitwise
+        as the gloo all-gather gives it (negative and > 2**40 values included),
+        through one host's table, a two-host leader link and a three-host mesh."""
+        import tempfile
+
+        ctx = mp.get_context("forkserver")
+        ctx.set_forkserver_preload([__name__])
+        out_q = ctx.Queue()
+        with tempfile.TemporaryDirectory() as init_dir:
+            procs = [
+                ctx.Process(target=_shm_exchange_worker, args=(r, init_dir, out_q))
+                for r in range(_SHM_WORLD)
+            ]
+            results = {}
+            try:
+                for proc in procs:
+                    proc.start()
+                for _ in range(len(_SHM_HOST_LAYOUTS) * 5 * _SHM_WORLD):
+                    hosts, round_idx, rank, value = out_q.get(timeout=240)
+                    results[(hosts, round_idx, rank)] = value
+                for proc in procs:
+                    proc.join(timeout=60)
+                    self.assertEqual(proc.exitcode, 0)
+            finally:
+                for proc in procs:
+                    if proc.is_alive():
+                        proc.kill()
+                        proc.join(timeout=10)
+        paths = {
+            1: ("ShmTagExchange", False, False),
+            2: ("HierTagExchange", True, False),
+            3: ("HierTagExchange", False, True),
+        }
+        for hosts in _SHM_HOST_LAYOUTS:
+            leaders = {r * hosts // _SHM_WORLD: r for r in reversed(range(_SHM_WORLD))}
+            for rank in range(_SHM_WORLD):
+                for round_idx in range(4):
+                    self.assertTrue(
+                        results[(hosts, round_idx, rank)],
+                        f"{hosts} hosts round {round_idx} rank {rank} differs",
+                    )
+                kind, link, mesh = paths[hosts]
+                is_leader = rank in leaders.values()
+                self.assertEqual(
+                    results[(hosts, "path", rank)],
+                    (kind, link and is_leader, mesh and is_leader),
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
