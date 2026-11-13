@@ -116,3 +116,64 @@ def exit_late_layer_dp(forward_batch: ForwardBatch, saved: tuple) -> None:
         fb.num_token_non_padded,
     ) = saved
     set_dp_buffer_len_from_batch(fb)
+
+
+def enter_verify_late_rows(
+    forward_batch: ForwardBatch, late_metadata, late_rows
+) -> tuple:
+    """SGLANG_DSV41_LATE_TAIL_ROWS: switch the late layers of a target verify onto the
+    verify rows plus the late-only pseudo-slots; returns what exit_verify_late_rows
+    restores. Every row is real for the MoE: the pseudo-slots follow the graph's
+    padded verify rows, so the non-padded prefix bound cannot describe them."""
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+    from sglang.srt.model_executor.forward_context import get_attn_backend
+
+    assert get_parallel().attn_dp_size == 1 or not get_moe_a2a_backend().is_none(), (
+        "late-only verify rows need an MoE that dispatches each rank's own rows"
+    )
+    fb = forward_batch
+    backend = get_attn_backend()
+    saved = (
+        backend.forward_metadata,
+        fb.out_cache_loc,
+        fb.positions,
+        fb.req_pool_indices,
+        fb.seq_lens,
+        fb.batch_size,
+        fb.num_token_non_padded,
+        fb.global_num_token_non_padded,
+        fb.global_num_token_non_padded_cpu,
+    )
+    rows = late_rows.positions.shape[0]
+    backend.forward_metadata = late_metadata
+    fb.out_cache_loc = late_rows.out_cache_loc
+    fb.positions = late_rows.positions
+    fb.req_pool_indices = late_rows.req_pool_indices
+    fb.seq_lens = late_rows.seq_lens
+    fb.batch_size = late_rows.req_pool_indices.shape[0]
+    if fb.num_token_non_padded is not None:
+        fb.num_token_non_padded = torch.full_like(fb.num_token_non_padded, rows)
+    if fb.global_num_token_non_padded is not None:
+        fb.global_num_token_non_padded = torch.full_like(
+            fb.global_num_token_non_padded, rows
+        )
+    if fb.global_num_token_non_padded_cpu is not None:
+        fb.global_num_token_non_padded_cpu = rows
+    return saved
+
+
+def exit_verify_late_rows(forward_batch: ForwardBatch, saved: tuple) -> None:
+    from sglang.srt.model_executor.forward_context import get_attn_backend
+
+    fb = forward_batch
+    (
+        get_attn_backend().forward_metadata,
+        fb.out_cache_loc,
+        fb.positions,
+        fb.req_pool_indices,
+        fb.seq_lens,
+        fb.batch_size,
+        fb.num_token_non_padded,
+        fb.global_num_token_non_padded,
+        fb.global_num_token_non_padded_cpu,
+    ) = saved

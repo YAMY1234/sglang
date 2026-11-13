@@ -217,6 +217,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             and get_disagg().disaggregation_mode == "decode"
             and envs.SGLANG_DSV41_FUSED_TAIL.get()
         )
+        # SGLANG_DSV41_LATE_TAIL_ROWS: late-only tail rows ride the verify too.
+        self._dsv41_late_tail = (
+            self._dsv41_fused_tail and envs.SGLANG_DSV41_LATE_TAIL_ROWS.get() > 0
+        )
         self._dsv41_forced_draft_logged = False
         self._decode_graph_allowed = (
             get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
@@ -972,6 +976,12 @@ class DSparkWorkerV2(BaseSpecWorker):
         if not isinstance(draft_input, DFlashDraftInputV2):
             raise RuntimeError(
                 "DSpark spec-v2 expected DFlashDraftInputV2 state on the running batch."
+            )
+        if self._dsv41_late_tail:
+            # Every decode step, idle ones included, so no step reuses a stale
+            # step's late rows; the verify graph variant follows it.
+            self.target_worker.model_runner.attn_backend.set_verify_late_tail(
+                batch.dsv41_late_tail
             )
 
         global_num_reqs = (

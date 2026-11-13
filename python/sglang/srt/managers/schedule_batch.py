@@ -2052,6 +2052,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # late-layer SWA floor (0 for other requests).
     dsv41_forced_tokens: Optional[torch.Tensor] = None
     dsv41_swa_floor: Optional[torch.Tensor] = None
+    # SGLANG_DSV41_LATE_TAIL_ROWS: this step's late-only pseudo-slots
+    # (LateTailStepInputs), decode verify steps only, rebuilt every step.
+    dsv41_late_tail: Optional[object] = None
 
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
     seq_lens: torch.Tensor = None  # shape: [b], int64

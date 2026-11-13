@@ -274,6 +274,14 @@ class AttentionBackend(ABC):
         """Decode graph variants to capture, or None for one graph per batch size."""
         return None
 
+    def wrap_decode_graph_variants(
+        self,
+        variants: Optional[AttentionGraphVariants],
+        capture_forward_mode: ForwardMode,
+    ) -> Optional[AttentionGraphVariants]:
+        """The variants to capture after the backend adds its own, if any."""
+        return variants
+
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         """Declare where this backend's scheduler-shared reads end per mode.
         Override only for audited deviations from this conservative default."""

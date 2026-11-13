@@ -95,10 +95,43 @@ def create_attention_graph_variants(hf_config) -> Optional[AttentionGraphVariant
 
 DSV41_CANDIDATE_FILTERED = "candidate_filtered"
 DSV41_CANDIDATE_UNFILTERED = "candidate_unfiltered"
+# SGLANG_DSV41_LATE_TAIL_ROWS: the twin of a verify graph that also runs late-only rows.
+DSV41_LATE_TAIL_SUFFIX = "+late_tail"
 # SGLANG_OPT_DSV41_TARGET_METADATA_EARLY serves these target verify variants.
 DSV41_EARLY_VERIFY_VARIANTS = frozenset(
-    {DSV41_CANDIDATE_UNFILTERED, DSV41_CANDIDATE_FILTERED}
+    label + suffix
+    for label in (DSV41_CANDIDATE_UNFILTERED, DSV41_CANDIDATE_FILTERED)
+    for suffix in ("", DSV41_LATE_TAIL_SUFFIX)
 )
+
+
+def is_late_tail_variant(label: Optional[str]) -> bool:
+    return label is not None and label.endswith(DSV41_LATE_TAIL_SUFFIX)
+
+
+class Dsv41LateTailGraphVariants(msgspec.Struct, frozen=True):
+    """The inner verify variants, plus one graph for steps that also run late-only
+    rows. It runs the full low-ratio and candidate path: a late-fed tail may be
+    longer than every running request the inner variants are keyed by."""
+
+    inner: Optional[AttentionGraphVariants]
+    # Its late_tail inputs say whether this step runs late-only rows.
+    backend: object
+
+    @property
+    def late_label(self) -> str:
+        base = DSV41_CANDIDATE_FILTERED if self.inner is not None else "dense"
+        return base + DSV41_LATE_TAIL_SUFFIX
+
+    @property
+    def capture_labels(self) -> tuple[str, ...]:
+        base = self.inner.capture_labels if self.inner is not None else ("dense",)
+        return tuple(base) + (self.late_label,)
+
+    def select(self, forward_batch: ForwardBatch) -> str:
+        if self.backend.late_tail.active:
+            return self.late_label
+        return self.inner.select(forward_batch) if self.inner is not None else "dense"
 
 
 @dataclass(frozen=True)

@@ -74,6 +74,11 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
     token_req_indices,
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
+from sglang.srt.layers.attention.dsv4.late_tail_inputs import (
+    LateTailInputs,
+    LateTailStepInputs,
+    VerifyLateInputs,
+)
 from sglang.srt.layers.attention.dsv4.metadata import (
     _LARGE_INDEXER_QUERY_THRESHOLD,
     PagedIndexerMetadata,
@@ -1153,6 +1158,11 @@ class DSV4Metadata:
     # swa_topk_lengths), floored at each fed tail's start; the model swaps them in
     # from late_layer_start on.
     verify_late_swa: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    # SGLANG_DSV41_LATE_TAIL_ROWS target verify: the late layers' metadata over the
+    # verify rows plus the late-only pseudo-slots, and their inputs; the model
+    # switches onto both at late_layer_start.
+    verify_late: Optional["DSV4Metadata"] = None
+    verify_late_inputs: Optional[VerifyLateInputs] = None
 
     @property
     def core_metadata(self) -> DSV4AttnMetadata:
@@ -1478,6 +1488,9 @@ class DeepseekV4AttnBackend(
 
         self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
         self.is_draft_runner = model_runner.is_draft_worker
+        self.late_tail: Optional[LateTailInputs] = self._make_late_tail_inputs(
+            model_runner
+        )
         self._verify_mask = None
         self.cuda_graph_swa_out_cache_loc: Optional[torch.Tensor] = None
         # Once a draft runner glues this prep (glue_draft_metadata): the draft
@@ -2372,7 +2385,9 @@ class DeepseekV4AttnBackend(
         raw_metadata: DSV4RawVerifyMetadata,
         online_c128_state_slot_offset: int = 0,
         graph_backed: bool = False,
+        late_only: bool = False,
     ) -> DSV4Metadata:
+        """``late_only`` builds what the late layers read (SWA and the c1 indexer)."""
         req_pool_indices = raw_metadata.req_pool_indices
         seq_lens = raw_metadata.seq_lens
         out_cache_loc = raw_metadata.out_cache_loc
@@ -2420,7 +2435,7 @@ class DeepseekV4AttnBackend(
             self.init_forward_metadata_indexer(
                 core_attn_metadata, use_prefill_cuda_graph=graph_backed
             )
-            if self.has_c4
+            if self.has_c4 and not late_only
             else None
         )
         create = functools.partial(
@@ -2438,7 +2453,7 @@ class DeepseekV4AttnBackend(
             online_state_slot_offset=online_c128_state_slot_offset,
         )
         c128_compress_metadata = raw_metadata.c128_compress_metadata
-        if c128_compress_metadata is None and self.has_c128:
+        if c128_compress_metadata is None and self.has_c128 and not late_only:
             c128_compress_metadata = create(compress_ratio=128)
         low = core_attn_metadata.low_ratios
         rows_per_request = 1 if is_ragged else num_draft_tokens
@@ -2462,10 +2477,12 @@ class DeepseekV4AttnBackend(
                     rows_per_request=rows_per_request,
                     use_prefill_cuda_graph=graph_backed,
                 )
-                if 2 in low
+                if 2 in low and not late_only
                 else None
             ),
-            c4_compress_metadata=create(compress_ratio=4) if self.has_c4 else None,
+            c4_compress_metadata=(
+                create(compress_ratio=4) if self.has_c4 and not late_only else None
+            ),
             c128_compress_metadata=c128_compress_metadata,
             verify_late_swa=(
                 self._floored_verify_swa(
@@ -2493,6 +2510,103 @@ class DeepseekV4AttnBackend(
         buf.zero_()
         if floor is not None:
             buf[: floor.shape[0]].copy_(floor)
+
+    def _make_late_tail_inputs(self, model_runner) -> Optional[LateTailInputs]:
+        rows = envs.SGLANG_DSV41_LATE_TAIL_ROWS.get()
+        if not (
+            rows > 0
+            and self.verify_swa_floor_enabled
+            and get_disagg().disaggregation_mode == "decode"
+            and not self.is_draft_runner
+        ):
+            return None
+        width = self.speculative_num_draft_tokens
+        assert width and rows % width == 0, (
+            f"SGLANG_DSV41_LATE_TAIL_ROWS={rows} must be whole verify slots of {width}"
+        )
+        config = model_runner.model_config.hf_text_config
+        return LateTailInputs(
+            slots=rows // width,
+            width=width,
+            window=SWA_WINDOW,
+            hc_mult=config.hc_mult,
+            hidden_size=config.hidden_size,
+            dtype=model_runner.dtype,
+            device=self.device,
+        )
+
+    def wrap_decode_graph_variants(self, variants, capture_forward_mode):
+        if self.late_tail is None or capture_forward_mode != ForwardMode.TARGET_VERIFY:
+            return variants
+        from sglang.srt.layers.attention.graph_variants import (
+            Dsv41LateTailGraphVariants,
+        )
+
+        return Dsv41LateTailGraphVariants(inner=variants, backend=self)
+
+    def set_verify_late_tail(self, step: Optional[LateTailStepInputs]) -> None:
+        """Before each target verify, like set_verify_swa_floor."""
+        self.late_tail.set_step(step)
+
+    def _verify_late_tail_active(self) -> bool:
+        from sglang.srt.layers.attention.graph_variants import is_late_tail_variant
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_capture_attention_variant,
+            get_is_capture_mode,
+        )
+
+        if self.late_tail is None:
+            return False
+        if get_is_capture_mode():
+            return is_late_tail_variant(get_capture_attention_variant())
+        return self.late_tail.active
+
+    def _attach_verify_late(
+        self, metadata: DSV4Metadata, forward_batch: ForwardBatch
+    ) -> None:
+        """Recorded in the verify graph: the late layers' metadata over the verify
+        rows and the pseudo-slots, every row floored as the fused tail floors."""
+        bs = forward_batch.req_pool_indices.shape[0]
+        late = self.late_tail
+        view = late.build_view(
+            req_to_token=self.req_to_token,
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens,
+            out_cache_loc=forward_batch.out_cache_loc,
+            positions=forward_batch.positions,
+        )
+        width = self.speculative_num_draft_tokens
+        num_slots = bs + late.slots
+        floors = torch.cat(
+            [self.verify_swa_floor_buffer(self.device)[:bs], late.floors]
+        )
+        self.extend_seq_lens_buffer[:num_slots].fill_(width)
+        raw = DSV4RawVerifyMetadata(
+            req_pool_indices=view.req_pool_indices,
+            seq_lens=view.seq_lens,
+            out_cache_loc=view.out_cache_loc,
+            extend_seq_lens=self.extend_seq_lens_buffer[:num_slots],
+            total_verify_tokens=width * num_slots,
+            swa_floor=floors,
+        )
+        late_metadata = self.make_forward_metadata_from_raw_verify(
+            raw_metadata=raw, graph_backed=True, late_only=True
+        )
+        core = late_metadata.core_attn_metadata
+        core.swa_page_indices, core.swa_topk_lengths = late_metadata.verify_late_swa
+        late_metadata.verify_late_swa = None
+        pool = self.token_to_kv_pool
+        if pool.request_window is None and pool.swa_req_ring_size is None:
+            core.swa_out_cache_loc = pool.translate_loc_from_full_to_swa(
+                view.out_cache_loc
+            ).to(torch.int32)
+        if core.low_ratios:
+            late_metadata.low_ratio_req_indices = view.req_pool_indices.to(
+                torch.int64
+            ).repeat_interleave(width)
+            late_metadata.low_ratio_pos_i64 = view.positions.to(torch.int64)
+        metadata.verify_late = late_metadata
+        metadata.verify_late_inputs = view
 
     def _floored_verify_swa(
         self,
@@ -2664,14 +2778,22 @@ class DeepseekV4AttnBackend(
         # records like the in-graph upgrade (the prep's copy diverged at long context).
         if id(self.forward_metadata) in self._early_verify_metadata_ids:
             _replan_topk_in_graph(self.forward_metadata)
+            if self._verify_late_tail_active():
+                self._attach_verify_late(self.forward_metadata, forward_batch)
             return
         # Upgrade Raw->Full so compress + core_attn + indexer materialization is
         # recorded inside the cuda graph.
         if isinstance(self.forward_metadata, DSV4RawVerifyMetadata):
+            late_tail = self._verify_late_tail_active()
+            assert not (late_tail and self.forward_metadata.verify_lens is not None), (
+                "SGLANG_DSV41_LATE_TAIL_ROWS needs the dense verify layout"
+            )
             self.forward_metadata = self.make_forward_metadata_from_raw_verify(
                 raw_metadata=self.forward_metadata,
                 online_c128_state_slot_offset=self.online_c128_mtp.state_slot_offset(),
             )
+            if late_tail:
+                self._attach_verify_late(self.forward_metadata, forward_batch)
             # Decode/verify graphs have no late-layer tail; drop the one the
             # prefill graph capture or replay before this batch left behind.
             self.tail_forward_metadata = None
@@ -2683,18 +2805,21 @@ class DeepseekV4AttnBackend(
 
         metadata = self.forward_metadata
         if isinstance(metadata, DSV4Metadata):
-            core = metadata.core_metadata
-            for ratio in core.low_ratios:
-                if skip_low_ratio_indexer(ratio):
-                    # Share the full-position indices across layers of this ratio.
-                    fill_all_compressed_indices(
-                        core.page_table,
-                        core.sparse_topk_lengths(ratio),
-                        core.sparse_page_indices(ratio),
-                        compress_ratio=ratio,
-                        page_size=core.page_size,
-                        raw_indices=core.sparse_raw_indices(ratio),
-                    )
+            for part in (metadata, metadata.verify_late):
+                if part is None:
+                    continue
+                core = part.core_metadata
+                for ratio in core.low_ratios:
+                    if skip_low_ratio_indexer(ratio):
+                        # Share the full-position indices across layers of this ratio.
+                        fill_all_compressed_indices(
+                            core.page_table,
+                            core.sparse_topk_lengths(ratio),
+                            core.sparse_page_indices(ratio),
+                            compress_ratio=ratio,
+                            page_size=core.page_size,
+                            raw_indices=core.sparse_raw_indices(ratio),
+                        )
 
         # Recorded inside the cuda graph, so replay re-reads the live out_cache_loc
         # buffer (spec-v2 and DP padding rebind it). flash_mla needs int32 indices.

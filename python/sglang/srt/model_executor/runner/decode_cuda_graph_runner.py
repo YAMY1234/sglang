@@ -410,6 +410,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.capture_forward_mode, self.captured_req_width
             )
         )
+        self.attention_graph_variants = self.attn_backend.wrap_decode_graph_variants(
+            self.attention_graph_variants, self.capture_forward_mode
+        )
 
         if (
             self.dllm_attention is not None

@@ -14,6 +14,19 @@ from sglang.srt.disaggregation.utils import (
     dsv41_late_tail_rows,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsv4.late_tail_inputs import (
+    LateTailInputs,
+    LateTailStepInputs,
+)
+from sglang.srt.layers.attention.graph_variants import (
+    DSV41_EARLY_VERIFY_VARIANTS,
+    Dsv41LateTailGraphVariants,
+    is_late_tail_variant,
+)
+from sglang.srt.models.deepseek_common.decoder_swa_bounded_replay import (
+    enter_verify_late_rows,
+    exit_verify_late_rows,
+)
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -653,6 +666,170 @@ class TestLateTailFeed(CustomTestCase):
     def test_budget_must_be_whole_verify_slots(self):
         with self.assertRaises(AssertionError):
             self._feed(rows=50)
+
+
+def _late_inputs(slots=3, width=4, window=8):
+    return LateTailInputs(
+        slots=slots,
+        width=width,
+        window=window,
+        hc_mult=2,
+        hidden_size=3,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+
+
+def _late_step(slots, active=True):
+    if not slots:
+        return LateTailStepInputs(active=active)
+    req, pos, floor, row = zip(*slots)
+    t = lambda xs: torch.tensor(xs, dtype=torch.int64)
+    return LateTailStepInputs(
+        active=active,
+        req_pool_indices=t(req),
+        positions=t(pos),
+        floors=t(floor),
+        staging_rows=t(row),
+    )
+
+
+class TestLateTailInputs(CustomTestCase):
+    def setUp(self):
+        self.late = _late_inputs()
+        # Pool row r, position p holds KV slot 1000 * r + p.
+        self.req_to_token = torch.arange(4)[:, None] * 1000 + torch.arange(64)
+        self.late.staging.copy_(
+            torch.arange(self.late.staging.shape[0], dtype=torch.float32)[
+                :, None, None
+            ].expand_as(self.late.staging)
+        )
+
+    def _view(self):
+        return self.late.build_view(
+            req_to_token=self.req_to_token,
+            req_pool_indices=torch.tensor([3, 1]),
+            seq_lens=torch.tensor([40, 50]),
+            out_cache_loc=torch.arange(8, dtype=torch.int64) + 7000,
+            positions=torch.tensor([40, 41, 42, 43, 50, 51, 52, 53]),
+        )
+
+    def test_pseudo_slots_follow_the_verify_rows(self):
+        # Two valid slots of request 2 at positions 20 and 24, staged at rows 8 and 12.
+        self.late.set_step(_late_step([(2, 20, 21, 8), (2, 24, 21, 12)]))
+        view = self._view()
+        self.assertEqual(view.req_pool_indices.tolist(), [3, 1, 2, 2, 0])
+        self.assertEqual(view.seq_lens.tolist(), [40, 50, 20, 24, 0])
+        self.assertEqual(
+            view.positions.tolist()[8:], list(range(20, 28)) + [0, 1, 2, 3]
+        )
+        # Valid rows write their own KV slots; the empty slot writes padding slot 0.
+        self.assertEqual(
+            view.out_cache_loc.tolist(),
+            list(range(7000, 7008)) + [2000 + p for p in range(20, 28)] + [0] * 4,
+        )
+        self.assertEqual(
+            view.residual_rows[:, 0, 0].tolist()[:8], [float(r) for r in range(8, 16)]
+        )
+        self.assertEqual(view.residual_rows.shape, (12, 2, 3))
+
+    def test_an_inactive_or_empty_step_clears_every_slot(self):
+        self.late.set_step(_late_step([(2, 20, 21, 8)]))
+        self.assertTrue(self.late.active)
+        self.late.set_step(None)
+        self.assertFalse(self.late.active)
+        self.assertEqual(self._view().out_cache_loc.tolist()[8:], [0] * 12)
+        # Active with no slots of its own: a peer rank has late rows.
+        self.late.set_step(_late_step([]))
+        self.assertTrue(self.late.active)
+        self.assertEqual(self._view().out_cache_loc.tolist()[8:], [0] * 12)
+
+    def test_more_slots_than_the_budget_is_refused(self):
+        with self.assertRaises(AssertionError):
+            self.late.set_step(_late_step([(1, 0, 0, 0)] * 4))
+
+
+class TestLateTailGraphVariants(CustomTestCase):
+    def _variants(self, inner):
+        backend = SimpleNamespace(late_tail=SimpleNamespace(active=False))
+        return backend, Dsv41LateTailGraphVariants(inner=inner, backend=backend)
+
+    def test_one_late_graph_on_top_of_the_inner_variants(self):
+        inner = SimpleNamespace(
+            capture_labels=("candidate_unfiltered", "candidate_filtered"),
+            select=lambda fb: "candidate_unfiltered",
+        )
+        backend, variants = self._variants(inner)
+        self.assertEqual(
+            variants.capture_labels,
+            (
+                "candidate_unfiltered",
+                "candidate_filtered",
+                "candidate_filtered+late_tail",
+            ),
+        )
+        self.assertEqual(variants.select(None), "candidate_unfiltered")
+        backend.late_tail.active = True
+        # The late graph runs the full candidate path whatever the running lengths.
+        self.assertEqual(variants.select(None), "candidate_filtered+late_tail")
+        self.assertTrue(is_late_tail_variant(variants.select(None)))
+        self.assertIn(variants.select(None), DSV41_EARLY_VERIFY_VARIANTS)
+
+    def test_without_inner_variants(self):
+        backend, variants = self._variants(None)
+        self.assertEqual(variants.capture_labels, ("dense", "dense+late_tail"))
+        self.assertFalse(is_late_tail_variant(variants.select(None)))
+        backend.late_tail.active = True
+        self.assertEqual(variants.select(None), "dense+late_tail")
+
+
+class TestVerifyLateRowsSwap(CustomTestCase):
+    @patch("sglang.srt.layers.moe.utils.get_moe_a2a_backend")
+    @patch("sglang.srt.model_executor.forward_context.get_attn_backend")
+    @patch("sglang.srt.models.deepseek_common.decoder_swa_bounded_replay.get_parallel")
+    def test_late_layers_see_every_row_then_the_verify_batch_returns(
+        self, get_parallel, get_attn_backend, get_moe_a2a_backend
+    ):
+        get_parallel.return_value = SimpleNamespace(attn_dp_size=4)
+        get_moe_a2a_backend.return_value = SimpleNamespace(is_none=lambda: False)
+        backend = SimpleNamespace(forward_metadata="verify")
+        get_attn_backend.return_value = backend
+        fb = SimpleNamespace(
+            out_cache_loc=torch.arange(8),
+            positions=torch.arange(8),
+            req_pool_indices=torch.tensor([1, 2]),
+            seq_lens=torch.tensor([10, 20]),
+            batch_size=2,
+            num_token_non_padded=torch.tensor(6),
+            global_num_token_non_padded=torch.tensor(6),
+            global_num_token_non_padded_cpu=6,
+        )
+        before = dict(vars(fb))
+        late = SimpleNamespace(
+            out_cache_loc=torch.arange(16),
+            positions=torch.arange(16),
+            req_pool_indices=torch.tensor([1, 2, 3, 3]),
+            seq_lens=torch.tensor([10, 20, 30, 34]),
+        )
+        saved = enter_verify_late_rows(fb, "late", late)
+        self.assertEqual(backend.forward_metadata, "late")
+        self.assertIs(fb.out_cache_loc, late.out_cache_loc)
+        self.assertEqual(fb.batch_size, 4)
+        # The pseudo-slots sit after the graph's padded rows: no prefix bound fits.
+        self.assertEqual(int(fb.num_token_non_padded), 16)
+        self.assertEqual(fb.global_num_token_non_padded_cpu, 16)
+        exit_verify_late_rows(fb, saved)
+        self.assertEqual(backend.forward_metadata, "verify")
+        for key, value in before.items():
+            self.assertIs(getattr(fb, key), value, key)
+
+    @patch("sglang.srt.layers.moe.utils.get_moe_a2a_backend")
+    @patch("sglang.srt.models.deepseek_common.decoder_swa_bounded_replay.get_parallel")
+    def test_dp_gathered_moe_is_refused(self, get_parallel, get_moe_a2a_backend):
+        get_parallel.return_value = SimpleNamespace(attn_dp_size=4)
+        get_moe_a2a_backend.return_value = SimpleNamespace(is_none=lambda: True)
+        with self.assertRaises(AssertionError):
+            enter_verify_late_rows(SimpleNamespace(), "late", None)
 
 
 if __name__ == "__main__":

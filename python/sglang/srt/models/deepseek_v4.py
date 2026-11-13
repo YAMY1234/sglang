@@ -174,7 +174,9 @@ from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
 )
 from sglang.srt.models.deepseek_common.decoder_swa_bounded_replay import (
     enter_late_layer_dp,
+    enter_verify_late_rows,
     exit_late_layer_dp,
+    exit_verify_late_rows,
     late_layer_dp_counts,
 )
 from sglang.srt.models.deepseek_common.moe_transport import (
@@ -4391,6 +4393,8 @@ class DeepseekV4Model(nn.Module):
             residual_batch.start(forward_batch)
             hidden_states = residual_batch.set_written(state, forward_batch)
         verify_floor_core = verify_saved_swa = None
+        late_rows = late_saved = None
+        num_verify_rows = None
         for i in range(self.start_layer, self.end_layer):
             if (
                 i == self.late_layer_start
@@ -4400,6 +4404,10 @@ class DeepseekV4Model(nn.Module):
                 # tail's start, so their SWA window is floored there.
                 verify_metadata = get_attn_backend().forward_metadata
                 late_swa = getattr(verify_metadata, "verify_late_swa", None)
+                # SGLANG_DSV41_LATE_TAIL_ROWS: its late metadata floors every row.
+                late_rows = getattr(verify_metadata, "verify_late_inputs", None)
+                if late_rows is not None:
+                    late_swa = None
                 if late_swa is not None:
                     verify_floor_core = verify_metadata.core_attn_metadata
                     verify_saved_swa = (
@@ -4414,7 +4422,7 @@ class DeepseekV4Model(nn.Module):
                 layer = self.layers[i]
                 if (
                     (
-                        (tail is not None or use_tail_graph)
+                        (tail is not None or use_tail_graph or late_rows is not None)
                         and i == self.late_layer_start
                     )
                     or layer.engram is not None
@@ -4432,6 +4440,22 @@ class DeepseekV4Model(nn.Module):
                     hidden_states = state = hc_boundary.materialize(
                         hidden_states, forward_batch, next=next_boundary
                     )
+            if late_rows is not None and i == self.late_layer_start:
+                num_verify_rows = positions.shape[0]
+                state = mhc.HcState(
+                    torch.cat([state.residual, late_rows.residual_rows]), None
+                )
+                if _is_cuda:
+                    hidden_states = residual_batch.set_written(state, forward_batch)
+                positions = late_rows.positions
+                input_ids = torch.cat(
+                    [input_ids, input_ids.new_zeros(late_rows.residual_rows.shape[0])]
+                )
+                if input_ids_global is not None:
+                    input_ids_global = input_ids
+                late_saved = enter_verify_late_rows(
+                    forward_batch, verify_metadata.verify_late, late_rows
+                )
             if tail is not None and i == self.late_layer_start:
                 if self.tail_writes_source_kv:
                     source = self.layers[i]
@@ -4556,6 +4580,8 @@ class DeepseekV4Model(nn.Module):
                 aux = state.residual
                 if tail is not None and i < self.late_layer_start:
                     aux = tail.rows(aux)
+                if num_verify_rows is not None:
+                    aux = aux[:num_verify_rows]
                 mhc_stream_mean(aux, out=dspark_aux_hidden_states.slot(aux[:, 0]))
                 del aux
             if i == self.encoder_only_boundary_layer:
@@ -4607,6 +4633,9 @@ class DeepseekV4Model(nn.Module):
             )
             residual_batch.clear(forward_batch)
         state = state.materialized(self.layers[self.end_layer - 1].hc_cfg)
+        if late_saved is not None:
+            state = state.take_rows(lambda t: t[:num_verify_rows])
+            exit_verify_late_rows(forward_batch, late_saved)
         if verify_saved_swa is not None:
             (
                 verify_floor_core.swa_page_indices,
