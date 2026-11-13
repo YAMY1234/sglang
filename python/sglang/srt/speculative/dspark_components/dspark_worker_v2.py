@@ -894,6 +894,48 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         return batch_output
 
+    def _inject_late_tail_draft_kv(self) -> None:
+        """SGLANG_DSV41_LATE_TAIL_ROWS: the late-only rows' target captures fill the
+        draft KV of their positions, as a verify step's committed rows do."""
+        from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
+            BuildCommitInjectLayout,
+            build_ring_commit_inject_layout,
+        )
+
+        late = self.target_worker.model_runner.attn_backend.late_tail
+        if late is None or not late.active or late.draft_aux is None:
+            return
+        pool = self.draft_model_runner.token_to_kv_pool
+        width = late.width
+        commit_lens = late.valid.to(torch.int32) * width
+        offsets = self._block_pos_offsets[:width]
+        if pool.swa_req_ring_size is not None:
+            layout = build_ring_commit_inject_layout(
+                req_pool_indices=late.req_pool_indices,
+                prefix_lens=late.positions,
+                block_pos_offsets=offsets,
+                commit_lens=commit_lens,
+                stride=width,
+                ring_stride=pool.swa_req_ring_size,
+            )
+        else:
+            layout = BuildCommitInjectLayout.execute(
+                req_pool_indices=late.req_pool_indices,
+                req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                prefix_lens=late.positions,
+                block_pos_offsets=offsets,
+                full_to_swa_mapping=pool.full_to_swa_index_mapping,
+                commit_lens=commit_lens,
+                stride=width,
+            )
+        with torch.inference_mode(), self._draft_context():
+            self.draft_model.write_target_hidden_kv(
+                main_hidden=late.draft_aux,
+                swa_loc=layout.swa_loc,
+                positions=layout.positions,
+                pool=pool,
+            )
+
     def _idle_verify_ragged_layout(self, batch: ScheduleBatch):
         if batch.global_num_tokens is None or not self._verify_planner.is_compact_mode:
             return None
@@ -1022,6 +1064,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 self._verify_executor.run_idle_participation(
                     batch=batch, idle_layout=None, dense_slot=True
                 )
+            if late_slot:
+                self._inject_late_tail_draft_kv()
             return self._decode_idle_result(on_publish=on_publish)
 
         batch.seq_lens.record_stream(
@@ -1244,6 +1288,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                     sampling_info=sampling_info,
                 )
                 hidden_strided = None
+        if self._dsv41_late_tail:
+            self._inject_late_tail_draft_kv()
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
         if batch.has_grammar:

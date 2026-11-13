@@ -61,6 +61,10 @@ class LateTailInputs:
     ) -> None:
         self.slots = slots
         self.width = width
+        # [slots * width, captures * hidden]: the late rows' DSpark target captures, in
+        # the verify rows' packed layout, for the draft KV of their positions. Made
+        # by the first (eager warmup) forward that captures.
+        self.draft_aux: Optional[torch.Tensor] = None
         self.req_pool_indices = torch.zeros(slots, dtype=torch.int64, device=device)
         self.positions = torch.zeros(slots, dtype=torch.int64, device=device)
         self.floors = torch.zeros(slots, dtype=torch.int64, device=device)
@@ -108,6 +112,17 @@ class LateTailInputs:
         self.floors[:n].copy_(step.floors)
         self.staging_rows[:n].copy_(step.staging_rows)
         self.valid[:n] = True
+
+    def draft_aux_slot(
+        self, *, capture: int, num_captures: int, like: torch.Tensor
+    ) -> torch.Tensor:
+        h = like.shape[-1]
+        if self.draft_aux is None:
+            assert not torch.cuda.is_current_stream_capturing(), (
+                "late-tail draft captures must be made before graph capture"
+            )
+            self.draft_aux = like.new_zeros(self.slots * self.width, num_captures * h)
+        return self.draft_aux[:, capture * h : (capture + 1) * h]
 
     def per_row(self, per_slot: torch.Tensor) -> torch.Tensor:
         return per_slot.repeat_interleave(self.width)

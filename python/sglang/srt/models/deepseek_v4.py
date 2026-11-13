@@ -4582,6 +4582,15 @@ class DeepseekV4Model(nn.Module):
                 if tail is not None and i < self.late_layer_start:
                     aux = tail.rows(aux)
                 if num_verify_rows is not None:
+                    # The late rows' captures feed their own draft KV (late_tail).
+                    mhc_stream_mean(
+                        aux[num_verify_rows:],
+                        out=get_attn_backend().late_tail.draft_aux_slot(
+                            capture=self.dspark_layers_to_capture.index(i),
+                            num_captures=len(self.dspark_layers_to_capture),
+                            like=aux[num_verify_rows:, 0],
+                        ),
+                    )
                     aux = aux[:num_verify_rows]
                 mhc_stream_mean(aux, out=dspark_aux_hidden_states.slot(aux[:, 0]))
                 del aux
