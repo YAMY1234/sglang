@@ -55,14 +55,14 @@ FAKE_BOOTSTRAP_HOST = "2.2.2.2"
 
 
 def pp_sync_polls(
-    polls: Optional[List[int]],
+    polls: Optional[list],
     pp_group: GroupCoordinator,
     pp_rank: int,
     pp_size: int,
     sync_work_list: List,
     tag: P2PTag = P2PTag.DISAGG_BOOTSTRAP_PP_SYNC,
     window: int = 1,
-) -> List[int]:
+) -> list:
     """Synchronize poll states from PP0 through the PP pipeline.
 
     PP0 provides the data. Each later PP rank receives it from the previous
@@ -134,12 +134,46 @@ def poll_and_all_reduce_prefill_pp(
 ) -> List[int]:
     polls: List[int] = []
     if pp_rank == 0:
-        polls = _poll_with_failure_injection_pp(pollers)
-        polls = _all_reduce_polls(polls, attn_tp_cpu_group)
-        polls = _all_reduce_polls(polls, attn_cp_cpu_group)
+        polls = poll_pp_consensus_and_all_reduce(pollers, attn_cp_cpu_group, attn_tp_cpu_group)
     # Propagate PP0's data to other ranks
     polls = pp_sync_polls(
         polls, pp_group, pp_rank, pp_size, pp_poll_sync_work_list, window=window
+    )
+    return polls
+
+
+def poll_and_all_reduce_prefill_pp_sections(
+    sections: List[List[CommonKVSender]],
+    attn_cp_cpu_group: dist.ProcessGroup,
+    attn_tp_cpu_group: dist.ProcessGroup,
+    pp_group: GroupCoordinator,
+    pp_rank: int,
+    pp_size: int,
+    pp_poll_sync_work_list: List[torch.distributed.Work],
+) -> List[List[int]]:
+    """PP0's consensus polls, one list per section, in a single PP sync.
+
+    Carrying each section's bootstrap rooms lets a stage whose sections differ
+    from PP0's, in membership or order, fail instead of applying a poll to
+    another request.
+    """
+    rooms = [[poller.bootstrap_room for poller in section] for section in sections]
+    payload = None
+    if pp_rank == 0:
+        flat = iter(
+            poll_pp_consensus_and_all_reduce(
+                [poller for section in sections for poller in section],
+                attn_cp_cpu_group,
+                attn_tp_cpu_group,
+            )
+        )
+        payload = [rooms, [[next(flat) for _ in section] for section in sections]]
+    pp0_rooms, polls = pp_sync_polls(
+        payload, pp_group, pp_rank, pp_size, pp_poll_sync_work_list
+    )
+    assert pp0_rooms == rooms, (
+        f"PP stages disagree on polled requests: PP0 polled rooms {pp0_rooms}, "
+        f"PP{pp_rank} holds {rooms}"
     )
     return polls
 
