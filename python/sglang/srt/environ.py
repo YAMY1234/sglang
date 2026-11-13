@@ -1776,6 +1776,9 @@ class Envs:
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get,
         deprecated_name="SGLANG_Q35MF_EDGE_MULTIHOST_TCP",
     )
+    # The DP-attention MLP sync rows through the same per-host shared-memory table; across
+    # hosts only the host leaders meet, over TCP (one link, or a mesh beyond two hosts).
+    SGLANG_DP_SYNC_SHM_EXCHANGE = EnvBool(False)
     # PD decode optimizations follow the shared switch unless explicitly disabled.
     SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION = EnvBool(True)
     # Preallocate queued PD-decode requests after the batch launch, beside the forward.

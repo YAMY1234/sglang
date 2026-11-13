@@ -4,6 +4,7 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Optional
 
+import numpy as np
 import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
@@ -24,6 +25,9 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
 )
 from sglang.srt.managers.scheduler_components.recv_skipper import (
     SchedulerRecvSkipper,
+)
+from sglang.srt.managers.scheduler_components.shm_tag_exchange import (
+    get_dp_sync_exchange,
 )
 from sglang.srt.managers.utils import is_health_check_generate_req
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -74,7 +78,13 @@ def exchange_sync_rows(
     """Fill ``global_flat`` with every rank's ``local_row`` in group-rank order,
     like ``all_gather_single``. On gloo the all-gather is a ring of world_size - 1
     serial hops; gather + broadcast is one hop plus a log-depth tree. At two
-    ranks the ring is the single hop, so it stays."""
+    ranks the ring is the single hop, so it stays. With SGLANG_DP_SYNC_SHM_EXCHANGE
+    the rows go through a per-host shared-memory table instead."""
+    if local_row.device.type == "cpu" and local_row.dtype == torch.int64:
+        exchange = get_dp_sync_exchange(group, width=2 * local_row.numel())
+        if exchange is not None:
+            global_flat.copy_(_exchange_rows_through_shm(exchange, local_row))
+            return
     world_size = torch.distributed.get_world_size(group)
     if local_row.device.type != "cpu" or world_size <= 2:
         all_gather_single(global_flat, local_row, group=group)
@@ -88,6 +98,13 @@ def exchange_sync_rows(
     else:
         torch.distributed.gather(local_row, dst=root, group=group)
     torch.distributed.broadcast(global_flat, src=root, group=group)
+
+
+def _exchange_rows_through_shm(exchange, local_row: torch.Tensor) -> torch.Tensor:
+    # The table holds values in [0, 2**40): each int64 travels as its two 32-bit halves.
+    halves = local_row.numpy().view(np.uint32).astype(np.int64)
+    rows = exchange.allgather_array(halves)
+    return torch.from_numpy(rows.astype(np.uint32).view(np.int64)).reshape(-1)
 
 
 def _spec_input_cuda_graph_compatible(
