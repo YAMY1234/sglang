@@ -626,6 +626,9 @@ class Envs:
     # DSpark eager sampled accept (no in-graph accept): the target verify keeps its
     # BF16 LM-head logits; batches off the block-wise rejection path get the FP32 cast.
     SGLANG_OPT_DSPARK_BF16_VERIFY_LOGITS = EnvBool(False)
+    # DSpark's block-wise resample and local Markov draft steps draw by inverse CDF
+    # (inverse_cdf.py): one uniform per row instead of a Gumbel-max over the vocab.
+    SGLANG_OPT_DSPARK_INVERSE_CDF_SAMPLING = EnvBool(False)
     # The deferred draft KV store's staging (write locations, positions, state slots,
     # commit lengths) in one Triton launch instead of four copies and a fill.
     SGLANG_OPT_DSV41_DSPARK_ONE_LAUNCH_COMMIT_STAGE = EnvBool(

@@ -29,6 +29,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     build_ring_commit_inject_layout,
     scatter_compact_to_strided_into,
 )
+from sglang.kernels.ops.speculative.dspark.inverse_cdf import InverseCdfCounters
 from sglang.kernels.ops.speculative.dspark.sharded_accept_hip import (
     accept_sampling_sharded,
 )
@@ -1394,6 +1395,15 @@ def accept_draft_tokens(
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
         )
+    blockwise = not _accepts_on_shards(
+        draft_block, sampling_info, block_verification
+    ) and _blockwise_rejection_applies(
+        sampling_info=sampling_info,
+        rejection_noise=rejection_noise,
+        block_verification=block_verification,
+    )
+    if envs.SGLANG_OPT_DSPARK_INVERSE_CDF_SAMPLING.get():
+        InverseCdfCounters.note(inverse=blockwise, requests=candidates.shape[0])
     if _accepts_on_shards(draft_block, sampling_info, block_verification):
         # Block-wise rejection scans the whole draft vocab. This kernel is the
         # same chain rule and reads the draft logits on the local shard.

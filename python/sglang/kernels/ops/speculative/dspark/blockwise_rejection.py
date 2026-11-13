@@ -28,6 +28,7 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
+from sglang.srt.environ import envs
 
 # XORed into the server seed so the rejection draws differ from other samplers'.
 _REJECTION_NOISE_DOMAIN = 0x5B1E3C7A9D2F4E61
@@ -401,6 +402,12 @@ class BlockwiseRejection:
         cls, *args, **kwargs
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if inputs_on_cuda(*args, **kwargs):
+            if envs.SGLANG_OPT_DSPARK_INVERSE_CDF_SAMPLING.get():
+                from sglang.kernels.ops.speculative.dspark.inverse_cdf import (
+                    blockwise_rejection_inverse_cdf,
+                )
+
+                return blockwise_rejection_inverse_cdf(*args, **kwargs)
             return blockwise_rejection_triton(*args, **kwargs)
         return blockwise_rejection_torch(*args, **kwargs)
 
