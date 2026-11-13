@@ -417,6 +417,8 @@ class DecodeRequest:
     # Overlap without the deferred publish: (ready event, send_metadata args,
     # kwargs) until the forward and any pinned metadata readback are done.
     pending_metadata: Optional[Tuple[Any, tuple, dict]] = None
+    # Later requests preallocated ahead of this one while its KV did not fit.
+    num_prealloc_overtakes: int = 0
 
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
@@ -445,6 +447,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     """
 
     _defer_publish: bool = False
+    prealloc_max_overtakes: int = 0
+    _num_overtaking_admissions: int = 0
+    _num_overtake_limit_stops: int = 0
+    _overtake_log_time: float = float("-inf")
 
     def __init__(
         self,
@@ -511,6 +517,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             abort=self._abort_prealloc,
             req_of=lambda x: x.req,
         )
+        self.prealloc_max_overtakes = (
+            envs.SGLANG_DISAGG_DECODE_PREALLOC_MAX_OVERTAKES.get()
+        )
+        if self.prealloc_max_overtakes > 0:
+            logger.info(
+                "Disagg decode preallocation admits past a request whose KV does "
+                f"not fit yet, up to {self.prealloc_max_overtakes} time(s) per request"
+            )
         self.retracted_queue = IndexedReqList(
             ListKind.PD_RETRACTED, abort=self._abort_retracted
         )
@@ -615,6 +629,33 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             swa_tokens,
             full_budget_tokens=full_allocatable_tokens,
             swa_budget_tokens=swa_allocatable_tokens,
+        )
+
+    def _may_pass_over(self, decode_req: DecodeRequest) -> bool:
+        if self.prealloc_max_overtakes <= 0:
+            return False
+        if decode_req.num_prealloc_overtakes < self.prealloc_max_overtakes:
+            return True
+        self._num_overtake_limit_stops += 1
+        return False
+
+    def _note_overtake(self, passed_over: List[DecodeRequest]) -> bool:
+        self._num_overtaking_admissions += 1
+        for decode_req in passed_over:
+            decode_req.num_prealloc_overtakes += 1
+        now = time.monotonic()
+        if now - self._overtake_log_time >= 60:
+            self._overtake_log_time = now
+            logger.info(
+                "Disagg decode preallocation out of order: "
+                f"{self._num_overtaking_admissions} admission(s) past a request "
+                f"that did not fit, {self._num_overtake_limit_stops} pass(es) "
+                f"held at the limit of {self.prealloc_max_overtakes} (since start)"
+            )
+        # True stops the pass: a request at its limit must not be overtaken again.
+        return any(
+            decode_req.num_prealloc_overtakes >= self.prealloc_max_overtakes
+            for decode_req in passed_over
         )
 
     def _reclaim_swa_tail_capacity(
@@ -1558,6 +1599,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             running_loras.update(req.lora_id for req in self.scheduler.waiting_queue)
 
         # Then, preallocate the remaining requests if possible
+        passed_over: List[DecodeRequest] = []
         for i, decode_req in enumerate(queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
@@ -1692,7 +1734,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if prefix_match is not None and prefix_match.l1_prefix_len > 0:
                     self.tree_cache.unlock(decode_req.req.lock)
                     decode_req.req.lock = None
-                break
+                if not self._may_pass_over(decode_req):
+                    break
+                passed_over.append(decode_req)
+                continue
 
             if swa_allocatable_tokens is not None:
                 reclaim_error = self._reclaim_swa_tail_capacity(
@@ -1795,6 +1840,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             indices_to_remove.add(i)
             if self.scheduler.enable_lora:
                 running_loras.add(decode_req.req.lora_id)
+            if passed_over and self._note_overtake(passed_over):
+                break
 
         if failed_reqs:
             failed_ids = {id(r) for r in failed_reqs}

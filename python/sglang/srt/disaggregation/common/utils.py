@@ -35,6 +35,8 @@ class TransferKVChunk:
     wait_event: Optional[object] = None
     # Must complete before reading asynchronously copied host indices.
     indices_event: Optional[object] = None
+    # time.perf_counter() when queued, for transfer-worker stats.
+    enqueue_time: float = 0.0
 
 
 def bind_thread_to_device(gpu_id: int) -> None:
@@ -154,6 +156,28 @@ def group_concurrent_contiguous(
     dst_groups = [g.tolist() for g in dst_groups]
 
     return src_groups, dst_groups
+
+
+def concurrent_contiguous_runs(
+    src_indices: npt.NDArray[np.int32], dst_indices: npt.NDArray[np.int32]
+) -> Tuple[npt.NDArray[np.int64], npt.NDArray[np.int64], npt.NDArray[np.int64]]:
+    """The runs of group_concurrent_contiguous as (src_starts, dst_starts, lengths)."""
+    src = np.asarray(src_indices, dtype=np.int64)
+    dst = np.asarray(dst_indices, dtype=np.int64)
+    if src.size == 0 or dst.size == 0:
+        empty = np.empty(0, dtype=np.int64)
+        return empty, empty, empty
+
+    if src.size != dst.size:
+        raise ValueError(
+            "concurrent_contiguous_runs requires equal-length src/dst index arrays, "
+            f"got {src.size} and {dst.size}"
+        )
+
+    starts = np.flatnonzero((np.diff(src) != 1) | (np.diff(dst) != 1)) + 1
+    starts = np.concatenate(([0], starts))
+    lengths = np.diff(np.append(starts, src.size))
+    return src[starts], dst[starts], lengths
 
 
 @dataclasses.dataclass(frozen=True)

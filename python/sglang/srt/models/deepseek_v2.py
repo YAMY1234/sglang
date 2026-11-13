@@ -114,9 +114,13 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
     post_experts_all_reduce,
+    route_quant_handoff,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+from sglang.srt.layers.moe.flashinfer_megamoe import (
+    flashinfer_megamoe_hands_off_epilogue,
+)
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
@@ -1013,6 +1017,22 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_ascend_ops()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
+        # Hands its reduced routed rows and replicated shared output to the next
+        # layer's input norm (SGLANG_OPT_FLASHINFER_MEGAMOE_FUSED_EPILOGUE).
+        self._hands_off_megamoe_epilogue = (
+            get_moe_runner_backend().is_flashinfer_megamoe()
+            and self._shared_expert_tp1
+            and not self.reduce_results
+            and flashinfer_megamoe_hands_off_epilogue(self.experts)
+        )
+        # Offers the routed input to the router, which may stage it into the MegaMoE
+        # workspace in its own launch (SGLANG_OPT_FLASHINFER_MEGAMOE_FUSED_ROUTE_QUANT).
+        self._stages_megamoe_route_quant = (
+            envs.SGLANG_OPT_FLASHINFER_MEGAMOE_FUSED_ROUTE_QUANT.get()
+            and get_moe_runner_backend().is_flashinfer_megamoe()
+            and self.num_fused_shared_experts == 0
+            and not self.is_hash
+        )
         # SGLANG_OPT_MOE_QUANT_ONCE eligibility, resolved lazily on first
         # forward (weights and runner are final by then). None = undecided.
         self._moe_quant_once: Optional[bool] = None
@@ -1234,6 +1254,8 @@ class DeepseekV2MoE(nn.Module):
                     input_ids_global,
                 )
             else:
+                if self._stages_megamoe_route_quant:
+                    route_quant_handoff.stage(hidden_states, layer=self.experts)
                 topk_output = self.topk(
                     hidden_states,
                     router_logits,
@@ -1266,6 +1288,16 @@ class DeepseekV2MoE(nn.Module):
             return_moe_output
             and isinstance(self.experts.quant_method, Mxfp4FlashinferTrtllmMoEMethod)
         )
+        hands_off_epilogue = (
+            self._hands_off_megamoe_epilogue
+            and has_shared_output
+            and not deferred_finalize
+            and not use_flashinfer_trtllm_bypass
+            and routed_pre_quant_input is None
+            and not (return_moe_output or leave_output_sum)
+            and get_forward().defer_moe_finalize
+            and self._adds_replicated_output()
+        )
         if deferred_finalize:
             final_hidden_states = self.experts.forward_deferred_finalize(
                 hidden_states, topk_output, pre_quant_input=routed_pre_quant_input
@@ -1278,6 +1310,8 @@ class DeepseekV2MoE(nn.Module):
             )
         else:
             final_hidden_states = self.experts(hidden_states, topk_output)
+        if self._stages_megamoe_route_quant:
+            route_quant_handoff.clear()
         if (
             not _is_cuda
             and not _is_musa
@@ -1297,6 +1331,15 @@ class DeepseekV2MoE(nn.Module):
 
         # The routed-input pre-quant was already joined inside the routed MoE apply.
         current_stream.wait_stream(self.alt_stream)
+
+        if hands_off_epilogue:
+            from sglang.srt.layers.layer_boundary.fusions.megamoe_epilogue import (
+                MegaMoeEpilogueHandoff,
+            )
+
+            return MegaMoeEpilogueHandoff(
+                routed=final_hidden_states, shared=shared_output
+            )
 
         if deferred_finalize and get_forward().defer_moe_finalize:
             # deferred_finalize excludes _shared_expert_tp1, so the shared add folds in.
@@ -1423,6 +1466,8 @@ class DeepseekV2MoE(nn.Module):
                     input_ids_global,
                 )
             else:
+                if self._stages_megamoe_route_quant:
+                    route_quant_handoff.stage(hidden_states, layer=self.experts)
                 topk_output = self.topk(
                     hidden_states,
                     router_logits,
@@ -1475,6 +1520,8 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states,
                 topk_output,
             )
+        if self._stages_megamoe_route_quant:
+            route_quant_handoff.clear()
         if (
             not _is_cuda
             and not _is_musa
@@ -2671,6 +2718,20 @@ def _use_mnnvl_cutedsl_fusion() -> bool:
     return _is_cuda and uses_cutedsl_ar_fusion()
 
 
+def _use_megamoe_epilogue_fusion() -> bool:
+    # The fused kernel reads whole rows: no attention TP or CP slices.
+    parallel = get_parallel()
+    return (
+        _is_cuda
+        and envs.SGLANG_OPT_FLASHINFER_MEGAMOE_FUSED_EPILOGUE.get()
+        and get_moe_a2a_backend().is_flashinfer_megamoe()
+        and get_moe_runner_backend().is_flashinfer_megamoe()
+        and parallel.attn_tp_size == 1
+        and parallel.attn_cp_size == 1
+        and not parallel.enable_prefill_cp
+    )
+
+
 class DeepseekV2DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -2830,6 +2891,12 @@ class DeepseekV2DecoderLayer(nn.Module):
             from sglang.srt.layers.layer_boundary.fusions.cutedsl import CuteDSLFusion
 
             fusions = CuteDSLFusion()
+        elif not self.is_nextn and _use_megamoe_epilogue_fusion():
+            from sglang.srt.layers.layer_boundary.fusions.megamoe_epilogue import (
+                MegaMoeEpilogueFusion,
+            )
+
+            fusions = MegaMoeEpilogueFusion(defers_finalize=self.is_layer_sparse)
         attn, ffn = self.stage_facts(
             self.config, self.layer_id, is_nextn=self.is_nextn, **modules
         )

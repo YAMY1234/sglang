@@ -261,6 +261,17 @@ class SchedulerPPMixin:
         release_rids: Optional[Dict[str, bool]] = None
         send_transfer_work = []
         send_release_work = []
+        # A peer stage reports Success before its staging chunks land.
+        stream_early_finish = (
+            envs.SGLANG_OPT_DISAGG_PP_PREFILL_EARLY_FINISH.get()
+            and self.pp_group.is_first_rank
+            and not self.enable_staging
+        )
+        if stream_early_finish:
+            logger.info(
+                "PP prefill streams a request's finish once every stage sent its KV "
+                "(SGLANG_OPT_DISAGG_PP_PREFILL_EARLY_FINISH)"
+            )
 
         while True:
             server_is_idle = True
@@ -353,6 +364,8 @@ class SchedulerPPMixin:
 
                 if tmbs[next_mb_id] is not None:
                     self.process_disagg_prefill_transfer_queue(next_release_rids)
+                if stream_early_finish:
+                    self.stream_pp_transferred_finish()
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_reqs_to_next_stage(recv_reqs)
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
@@ -651,7 +664,11 @@ class SchedulerPPMixin:
         ] = defaultdict(deque)
 
     def process_bootstrapped_queue(self: Scheduler):
-        reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+        # Under PP, only prefill_complete keeps optimistic prefill, which parks requests.
+        if get_disagg().disaggregation_decode_allocation_policy == "prefill_complete":
+            reqs = self.pop_bootstrapped_and_resolve_parked_pp()
+        else:
+            reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
         self.waiting_queue.join(reqs)
 
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler) -> Dict[str, bool]:

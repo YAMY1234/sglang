@@ -5,6 +5,7 @@ import os
 from typing import TYPE_CHECKING, Any
 
 from sglang.srt.arg_groups.arg_utils import record_fields
+from sglang.srt.arg_groups.hicache_hook import hicache_storage_write_back_enabled
 from sglang.srt.arg_groups.model_override_base import (
     model_config_of,
     resolved_view,
@@ -213,11 +214,17 @@ def _validate_prefill_complete(server_args: ServerArgs) -> None:
         unsupported.append("aggregated serving")
     if cfg.disaggregation_transfer_backend != "mooncake":
         unsupported.append("transfer backends other than Mooncake")
-    if cfg.pp_size != 1 or cfg.attn_cp_size != 1 or cfg.dcp_size != 1:
-        unsupported.append("pipeline or attention context parallelism")
-    attn_dp_size = cfg.dp_size if cfg.enable_dp_attention else 1
-    if cfg.tp_size != attn_dp_size:
-        unsupported.append("attention tensor parallelism greater than one")
+    if cfg.attn_cp_size != 1 or cfg.dcp_size != 1:
+        unsupported.append("attention context parallelism")
+    if cfg.disaggregation_mode == "decode" and cfg.pp_size != 1:
+        unsupported.append("decode pipeline parallelism")
+    # Compared as a product, not divided: the validators that reject
+    # non-positive or non-dividing widths run after this hook.
+    if cfg.tp_size != cfg.attn_dp_size * cfg.attn_cp_size:
+        unsupported.append(
+            "attention tensor parallelism other than one "
+            "(tp_size must equal attn_dp_size * attn_cp_size)"
+        )
     if cfg.decoupled_spec_role != "null":
         unsupported.append("decoupled speculation")
     if cfg.enable_pd_role_switch:
@@ -232,11 +239,16 @@ def _validate_prefill_complete(server_args: ServerArgs) -> None:
         cfg.disaggregation_decode_enable_radix_cache or cfg.enable_hierarchical_cache
     ):
         unsupported.append("decode radix cache or decode HiCache")
+    # Under storage write-back, L3 reads only pinned host copies, never the
+    # request KV this policy holds and frees.
     if (
         cfg.disaggregation_mode == "prefill"
         and cfg.enable_hierarchical_cache
         and (
-            cfg.hicache_storage_backend is not None
+            (
+                cfg.hicache_storage_backend is not None
+                and not hicache_storage_write_back_enabled(cfg)
+            )
             or cfg.hicache_write_policy != "write_back"
         )
     ):

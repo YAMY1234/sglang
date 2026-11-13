@@ -43,6 +43,7 @@ from sglang.srt.layers.layer_boundary.ops import (
     all_reduce_to_dp_local,
     dp_reduce_scatter,
     dp_reduce_scatterv,
+    keep_output,
     sum_output,
     to_dp_local,
 )
@@ -308,6 +309,12 @@ class ExitPolicy:
             self.plan.fusions is not None
             and self.plan.fusions.can_defer_finalize(self.plan, forward_batch)
         )
+        if defer_moe_finalize and _hands_on_finalize_only(steps, self.plan):
+            return ExitDecision(
+                defer_moe_finalize=True,
+                sum_in_reduce_scatter=sum_in_reduce_scatter,
+                complete=complete_now,
+            )
         # An FFN that writes its output at a pipeline handoff completes it here.
         if steps.writes_at_handoff or (
             not steps.output.may_defer_to_next
@@ -467,6 +474,20 @@ class ExitPolicy:
             and not sum_in_reduce_scatter
             and dp_step is None
         )
+
+
+def _hands_on_finalize_only(steps, plan) -> bool:
+    """A complete output already on the next input's rows owes no sum and no
+    move, so its MoE finalize alone may be handed on; a tensor completes now."""
+    return (
+        steps.output.group is None
+        and not steps.writes_at_handoff
+        and not steps.returns_over_dp
+        and steps.output_move is keep_output
+        and steps.output.transform is None
+        and not steps.output.update.applied_at_exit
+        and not plan.terminal
+    )
 
 
 def _batch_allows_deferred_sum(

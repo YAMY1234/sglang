@@ -10,6 +10,7 @@ import random
 import socket
 from typing import Any
 
+from sglang.srt.arg_groups.hicache_hook import hicache_storage_write_back_enabled
 from sglang.srt.arg_groups.model_override_base import model_config_of, resolving_view
 from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.environ import envs
@@ -501,8 +502,16 @@ def handle_other_validations(server_args: Any):
 
     # Handle optimistic prefill validation
     if cfg.optimistic_prefill_attempts > 0 and cfg.disaggregation_mode == "prefill":
-        if cfg.pp_size > 1:
-            logger.warning("Optimistic prefill does not support pp_size > 1")
+        # Under PP only prefill_complete resolves parked requests on a PP-wide
+        # consensus; the other policies' yield paths act on per-stage polls.
+        if (
+            cfg.pp_size > 1
+            and cfg.disaggregation_decode_allocation_policy != "prefill_complete"
+        ):
+            logger.warning(
+                "Optimistic prefill supports pp_size > 1 only with "
+                "--disaggregation-decode-allocation-policy prefill_complete"
+            )
             declare_resolution(
                 server_args,
                 "_handle_other_validations",
@@ -517,6 +526,11 @@ def handle_other_validations(server_args: Any):
                 cfg.hicache_storage_backend is not None
                 and cfg.hicache_host_memory_mode == "buffer_only"
                 and cfg.hicache_write_policy == "write_through"
+            )
+            or (
+                cfg.disaggregation_decode_allocation_policy == "prefill_complete"
+                and cfg.hicache_write_policy == "write_back"
+                and hicache_storage_write_back_enabled(cfg)
             )
         ):
             logger.warning(

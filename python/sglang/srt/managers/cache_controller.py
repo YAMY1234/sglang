@@ -691,6 +691,7 @@ class HiCacheController:
                     "npu_memcache",
                     "eic",
                     "nixl",
+                    "nixl_dram",
                     "simm",
                     "mori",
                     "tensorcast",

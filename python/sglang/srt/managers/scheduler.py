@@ -340,6 +340,7 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.common import checkpoint_kv_cache, storage_prefetch_end
 from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionTracker
@@ -441,6 +442,9 @@ def _prewarm_hccl_group(device, group, device_module):
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
+TEST_HICACHE_EVICT_DEVICE_BEFORE_PREFILL = (
+    envs.SGLANG_TEST_HICACHE_EVICT_DEVICE_BEFORE_PREFILL.get()
+)
 
 
 STEP_MAX_US = 2_000_000
@@ -4440,6 +4444,17 @@ class Scheduler(
             running_batch.batch_is_full = True
             return None, running_batch
 
+        # Runs before any waiting request is matched, so prefixes that finished
+        # requests released are matched in the host tier rather than on device.
+        if (
+            TEST_HICACHE_EVICT_DEVICE_BEFORE_PREFILL
+            and self.tree_cache.evictable_size()
+        ):
+            evicted = self.tree_cache.evict(
+                EvictParams(num_tokens=self.tree_cache.evictable_size())
+            ).num_tokens_evicted
+            logger.info("Test eviction before prefill: %d device tokens.", evicted)
+
         # Get priority queue
         self.waiting_queue.replace(
             self.policy.calc_priority(
@@ -4802,6 +4817,9 @@ class Scheduler(
         # Read at call time: a PD role switch rebuilds the PD queues.
         if self.disagg_prefill_bootstrap_queue is not None:
             lists[ListKind.PD_BOOTSTRAP] = self.disagg_prefill_bootstrap_queue.queue
+            lists[ListKind.PD_ROOM_WAITERS] = (
+                self.disagg_prefill_bootstrap_queue.room_waiters
+            )
         lists[ListKind.PD_SENDING] = self.disagg_prefill_transfer_queue
         if self.dllm_config is not None:
             # Its staging queue is the part of this queue the current round runs.
