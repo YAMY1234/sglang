@@ -357,14 +357,18 @@ class TestBatchedEviction(CustomTestCase):
 
     CHAINS = {5: [5], 6: [3, 6], 7: [7]}
 
-    def _walk(self, *, batch, backups=(3, 3, 3), streams=None, demote_error=None):
+    def _walk(
+        self, *, batch, backups=(3, 3, 3), streams=None, demote_error=None, host_only=()
+    ):
         cache = _cache()
-        cache.tree_components = (ComponentType.FULL,)
+        cache.tree_core.component_has_host_value_only.side_effect = (
+            lambda n, ct: n in host_only and ct == ComponentType.MAMBA
+        )
         cache.tree_core.full_evictable_size.return_value = 0
         cache._wb_evict_batch = batch
         cache._wb_batch_locks = []
         cache._wb_batch_stream = None
-        cache._wb_batch_stats = [0, 0]
+        cache._wb_batch_stats = [0, 0, 0]
         order = MagicMock()
         cache._evict_device_next_node = MagicMock(
             side_effect=[(5, True), (6, True), (7, True), (None, False)]
@@ -399,11 +403,14 @@ class TestBatchedEviction(CustomTestCase):
         cache.tree_core.evict_device_end.side_effect = lambda ct: order.end()
         if streams is not None:
             cache._wb_evict_overlap_stream = MagicMock(side_effect=streams)
+        # The Mamba walk has nothing to do (request 0); only the Full walk runs.
+        request = {ComponentType.FULL: 1, ComponentType.MAMBA: 0}
+        tracker = {ComponentType.FULL: 0, ComponentType.MAMBA: 0}
         if demote_error is None:
-            cache._evict_components({ComponentType.FULL: 1}, {ComponentType.FULL: 0})
+            cache._evict_components(request, tracker)
         else:
             with self.assertRaises(RuntimeError):
-                cache._evict_components({ComponentType.FULL: 1}, {ComponentType.FULL: 0})
+                cache._evict_components(request, tracker)
         return cache, list(order.mock_calls)
 
     def test_off_waits_per_victim(self):
@@ -437,13 +444,36 @@ class TestBatchedEviction(CustomTestCase):
             ],
         )
         self.assertEqual(cache._wb_batch_locks, [])
-        self.assertEqual(cache._wb_batch_stats, [1, 3])
+        self.assertEqual(cache._wb_batch_stats, [1, 3, 0])
+
+    def test_host_only_aux_state_waits_at_once_unlocked(self):
+        # A host lock would move node 6's host-only Mamba state to the MRU end
+        # of the Mamba host LRU; its backup waits at once instead, unlocked,
+        # and that wait also lands the queued copy of victim 5.
+        cache, calls = self._walk(batch=True, host_only={6})
+        wait = call.wait({"write_back": True, "relaxed_fence": True}, [])
+        self.assertEqual(
+            calls,
+            [
+                call.backup(5), call.lock(5), call.demote(5),
+                call.backup(6), wait, call.unlock(5, "r5"), call.demote(6),
+                call.backup(7), call.lock(7), call.demote(7),
+                wait, call.unlock(7, "r7"),
+                call.end(),
+            ],
+        )
+        self.assertEqual(cache._wb_batch_locks, [])
+        self.assertEqual(cache._wb_batch_stats, [2, 3, 1])
+        names = ("backup", "demote")
+        per_victim = [c for c in self._walk(batch=False)[1] if c[0] in names]
+        self.assertEqual(per_victim, [c for c in calls if c[0] in names])
 
     def test_nodes_covered_by_component_transfers_are_locked(self):
         cache = _cache()
+        cache.tree_core.component_has_host_value_only.return_value = False
         cache._wb_batch_locks = []
         cache._wb_batch_stream = None
-        cache._wb_batch_stats = [0, 0]
+        cache._wb_batch_stats = [0, 0, 0]
 
         def backup(bkv, **k):
             for n in bkv.node_ids:

@@ -373,7 +373,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # victims whose queued D2H copies the walk has not waited for yet.
         self._wb_batch_locks: list[tuple[NodeId, DecLockRefParams]] = []
         self._wb_batch_stream: Optional[torch.Stream] = None
-        self._wb_batch_stats = [0, 0]  # waits, victims
+        self._wb_batch_stats = [0, 0, 0]  # waits, victims, victims waited unlocked
         # Write-side dedupe: beliefs about what storage already holds, so
         # re-inserts of hot prefixes skip the redundant backup.
         self.storage_existence_cache = StorageExistenceCache()
@@ -3740,7 +3740,9 @@ class UnifiedRadixCache(BasePrefixCache):
         writes no device memory and nothing allocates before the flush. The
         chain stays host-locked until the flush: host eviction for a later
         victim cannot reclaim these host slots and hand them to a second copy
-        in the same merged transfer.
+        in the same merged transfer. A chain holding host-only aux state is not
+        locked (the lock would reorder that state's host LRU); its backup waits
+        at once, as on the per-victim path, and lands the queued copies too.
         """
         stream = self._wb_evict_overlap_stream(backup_kv)
         if self._wb_batch_locks and stream is not self._wb_batch_stream:
@@ -3760,6 +3762,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self._wb_batch_flush()
         if written > 0:
             self._wb_batch_stream = stream
+            self._wb_batch_stats[1] += 1
             # Every node whose host slots the queued copy writes: the chain and
             # the nodes its component (Mamba) transfers cover.
             lock_ids = list(backup_kv.node_ids)
@@ -3767,17 +3770,31 @@ class UnifiedRadixCache(BasePrefixCache):
                 pending = self.ongoing_write_through.get(chain_node_id)
                 if pending is not None:
                     lock_ids.extend(pending.publish_node_ids)
-            for lock_id in dict.fromkeys(lock_ids):
+            lock_ids = list(dict.fromkeys(lock_ids))
+            if any(map(self._has_host_only_aux_state, lock_ids)):
+                # A host lock takes host-only aux state out of its host LRU and
+                # the release puts it back as most recent, so a stale ancestor
+                # state would outlive its descendants; wait now, unlocked.
+                self._wb_batch_stats[2] += 1
+                self._wb_batch_flush(force=True)
+                return written
+            for lock_id in lock_ids:
                 params = self.inc_host_lock_ref(lock_id).to_dec_params()
                 self._wb_batch_locks.append((lock_id, params))
-            self._wb_batch_stats[1] += 1
         return written
 
-    def _wb_batch_flush(self) -> None:
+    def _has_host_only_aux_state(self, node_id: NodeId) -> bool:
+        return any(
+            ct != BASE_COMPONENT_TYPE
+            and self.tree_core.component_has_host_value_only(node_id, ct)
+            for ct in self.tree_components
+        )
+
+    def _wb_batch_flush(self, force: bool = False) -> None:
         """Submit the walk's queued backups as one transfer, wait for it, then
         release the victims' host locks."""
         locks = self._wb_batch_locks
-        if not locks:
+        if not locks and not force:
             return
         stream = self._wb_batch_stream
         self._wb_batch_locks = []
@@ -3796,9 +3813,11 @@ class UnifiedRadixCache(BasePrefixCache):
         stats[0] += 1
         if stats[0] % 1024 == 0:
             logger.info(
-                "HiCache write_back eviction batch: %d waits, %.1f victims per wait.",
+                "HiCache write_back eviction batch: %d waits, %.1f victims per wait, "
+                "%d victims waited unlocked (host-only aux state).",
                 stats[0],
                 stats[1] / stats[0],
+                stats[2],
             )
 
     def _wb_overlap_sync_watermark(self) -> None:
