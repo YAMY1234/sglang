@@ -30,8 +30,11 @@ from sglang.srt.configs.model_config import is_kimi_k31
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_dcp_sharded import (
     dcp_all_visible,
+    dcp_fused_gather_rows,
+    dcp_fused_gather_supported,
     dcp_gather_request_rows,
     dcp_global_topk,
+    dcp_row_gather_plan,
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import DSANPUIndexerMixin
@@ -2241,6 +2244,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         rows = k_fp8.shape[0]
         k_bytes = k_fp8.view(torch.uint8).view(rows, -1)
         s_bytes = k_scale.view(torch.uint8).view(rows, -1)
+        if dcp_fused_gather_supported(k_bytes.shape[1], s_bytes.shape[1]):
+            plan = dcp_row_gather_plan(seq_lens_cpu, k_bytes.device)
+            outputs = [
+                k_bytes.new_empty((plan.total, k_bytes.shape[1])),
+                s_bytes.new_empty((plan.total, s_bytes.shape[1])),
+            ]
+            dcp_fused_gather_rows(
+                [(k_bytes.contiguous(), None), (s_bytes.contiguous(), None)],
+                plan,
+                outputs,
+            )
+            return outputs[0], outputs[1]
         gathered = dcp_gather_request_rows(
             torch.cat([k_bytes, s_bytes], dim=-1), seq_lens_cpu
         )

@@ -26,7 +26,7 @@ from sglang.srt.layers.attention.linear.utils import (
     select_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu
+from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, print_info_once
 from sglang.srt.utils.common import is_gfx95_supported, rank0_log
 
 # KDA always uses the triton causal_conv1d_fn (no CUDA override).
@@ -1039,10 +1039,23 @@ class KDAAttnBackend(MambaAttnBackendBase):
         mixed_qkv: torch.Tensor,
         conv_states: torch.Tensor,
         cache_indices: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return Q/K/V, using contiguous planes for equal-width FlashInfer prefill."""
         # Depthwise conv is channel-independent, so one packed call over the
         # full qkv width matches the decode path and saves two kernel launches.
-        return causal_conv1d_fn(
+        split_size = (
+            layer.q_dim
+            if envs.SGLANG_KDA_PREFILL_CONV_QKV_PLANES.get()
+            and self.kernel_dispatcher.prefill_backend.is_flashinfer()
+            and layer.q_dim == layer.k_dim == layer.v_dim
+            else 0
+        )
+        if split_size:
+            print_info_once(
+                "KDA prefill: causal conv writes contiguous Q/K/V planes "
+                "(SGLANG_KDA_PREFILL_CONV_QKV_PLANES)"
+            )
+        conv_output = causal_conv1d_fn(
             mixed_qkv.transpose(0, 1),
             layer.conv_weights,
             layer.bias,
@@ -1052,7 +1065,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
             cache_indices=cache_indices,
             query_start_loc=self.forward_metadata.query_start_loc,
             seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        ).transpose(0, 1)
+            output_split_size=split_size,
+        )
+        if split_size:
+            return conv_output.unbind(0)
+        return conv_output.transpose(0, 1).split(
+            [layer.q_dim, layer.k_dim, layer.v_dim], dim=-1
+        )
 
     def forward_extend(
         self,
@@ -1136,10 +1155,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 self.forward_metadata.conv_states_mask_indices
             ] = mixed_qkv[self.forward_metadata.track_conv_indices]
 
-        qkv = self._convolve_prefill(
+        q, k, v = self._convolve_prefill(
             layer, forward_batch, mixed_qkv, conv_states, cache_indices
         )
-        q, k, v = qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
 
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d

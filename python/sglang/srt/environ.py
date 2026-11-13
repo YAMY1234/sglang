@@ -1809,6 +1809,14 @@ class Envs:
     # Admit SM107 (Rubin) to FlashInfer's CuTe DSL KDA prefill (flashinfer#6201), on
     # FlashInfer v0.7.4's kernel module (#8684 hang and #8599 fixes; vendored).
     SGLANG_K31_KDA_PREFILL_FI_SM107 = EnvBool(False)
+    # KDA prefill on FlashInfer: the causal conv writes Q, K and V as separate
+    # contiguous planes instead of one token-major tensor the kernel copies three
+    # times (backport of #46738).
+    SGLANG_KDA_PREFILL_CONV_QKV_PLANES = EnvBool(False)
+    # DSA prefill under sharded DCP: gather the KV and index-K rows with one pack
+    # kernel into the all-gather buffer and one reorder kernel out of it, instead
+    # of the cat / pad / transpose / split copies around the all-gather.
+    SGLANG_DSA_DCP_PREFILL_FUSED_GATHER = EnvBool(False)
     # Build the PTX KDA prefill extension for sm_107a; not measured on SM107 upstream.
     SGLANG_ENABLE_PTX_KDA_SM107 = EnvBool(False)
     # Experimental: breakable prefill CUDA graphs capture the Triton GDN extend

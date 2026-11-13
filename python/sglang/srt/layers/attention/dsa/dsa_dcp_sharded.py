@@ -27,7 +27,9 @@ resolve by global position at both steps. With 8 or 16 ranks and multicast,
 decode rows instead merge in one kernel (``DcpTopKMerge``).
 """
 
+from collections import OrderedDict
 from functools import partial
+from itertools import accumulate
 from typing import Callable, Optional
 
 import torch
@@ -49,6 +51,7 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
     is_one_nvlink_clique,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
+from sglang.srt.environ import envs
 from sglang.srt.kernel_plugins.nvidia.binding import megakernel_enabled
 from sglang.srt.layers.dcp.comm import all_gather_kv_cache_for_dcp
 from sglang.srt.runtime_context import get_parallel, get_platform
@@ -551,3 +554,199 @@ def dcp_gather_request_rows(
     top-k indices).
     """
     return all_gather_kv_cache_for_dcp(local_rows, local_rows[:, :0], seq_lens_cpu)
+
+
+# Fused prefill gather (SGLANG_DSA_DCP_PREFILL_FUSED_GATHER): one gather kernel
+# packs this rank's rows straight from their source into the all-gather send
+# buffer, and one writes the request-ordered result from the rank-major receive
+# buffer. It replaces dcp_gather_request_rows' cat / per-request pad copies,
+# the transpose reorder, the per-request cat, and the caller's pad or split.
+@triton.jit
+def _gather_rows_kernel(
+    src,
+    src_pitch,
+    idx,
+    idx2,
+    dst,
+    dst_pitch,
+    n_rows,
+    n_idx,
+    WIDTH: tl.constexpr,
+    HAS_IDX2: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+):
+    # dst[row, :WIDTH] = src[idx2[idx[row]] if HAS_IDX2 else idx[row], :WIDTH];
+    # rows past n_idx or with a negative index become zeros. Pointers and
+    # pitches are in 32-bit words.
+    rows = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
+    in_range = rows < n_rows
+    src_rows = tl.load(idx + rows, mask=rows < n_idx, other=-1).to(tl.int64)
+    if HAS_IDX2:
+        src_rows = tl.load(idx2 + src_rows, mask=src_rows >= 0, other=-1).to(tl.int64)
+    valid = src_rows >= 0
+    src_base = src + src_rows * src_pitch
+    dst_base = dst + rows.to(tl.int64) * dst_pitch
+    for col in tl.static_range(0, WIDTH, BLOCK_W):
+        cols = col + tl.arange(0, BLOCK_W)
+        col_ok = cols < WIDTH
+        value = tl.load(
+            src_base[:, None] + cols[None, :],
+            mask=valid[:, None] & col_ok[None, :],
+            other=0,
+        )
+        tl.store(
+            dst_base[:, None] + cols[None, :],
+            value,
+            mask=in_range[:, None] & col_ok[None, :],
+        )
+
+
+def _gather_rows(
+    src: torch.Tensor,
+    idx: torch.Tensor,
+    dst: torch.Tensor,
+    idx2: Optional[torch.Tensor] = None,
+) -> None:
+    """``dst[i] = src[idx2[idx[i]]]`` (or ``src[idx[i]]``) for 2D int32 views
+    whose rows may be strided; rows past ``idx`` or with a negative index
+    become zeros."""
+    rows, width = dst.shape
+    if rows == 0:
+        return
+    assert src.dtype == dst.dtype == torch.int32 and src.shape[1] == width
+    assert src.stride(1) == 1 and dst.stride(1) == 1 and idx.numel() <= rows
+    block_w = min(triton.next_power_of_2(width), 64)
+    block_r = max(1, 2048 // block_w)
+    _gather_rows_kernel[(triton.cdiv(rows, block_r),)](
+        src,
+        src.stride(0),
+        idx,
+        idx if idx2 is None else idx2,
+        dst,
+        dst.stride(0),
+        rows,
+        idx.numel(),
+        WIDTH=width,
+        HAS_IDX2=idx2 is not None,
+        BLOCK_R=block_r,
+        BLOCK_W=block_w,
+        num_warps=4,
+    )
+
+
+class DcpRowGatherPlan:
+    """Row maps of a fused DCP prefill gather; they depend only on the request
+    lengths and the group, so a forward's layers (KV and index-K) share one.
+
+    Global position p of a request lives on rank p % N at local position
+    p // N. Rank r sends ceil(len / N) rows per request (its rows, then zero
+    padding), so the all-gather output is [N, rows_per_rank] rank-major.
+    """
+
+    def __init__(
+        self,
+        seq_lens: list[int],
+        world: int,
+        rank: int,
+        device: torch.device,
+    ):
+        padded = [(n + world - 1) // world for n in seq_lens]
+        local = [max(0, (n - rank + world - 1) // world) for n in seq_lens]
+        p_starts = [0, *accumulate(padded)]
+        l_starts = [0, *accumulate(local)]
+        s_starts = [0, *accumulate(seq_lens)]
+        self.rows_per_rank = p_starts[-1]
+        self.num_local = l_starts[-1]
+        self.total = s_starts[-1]
+        table = torch.tensor(
+            [padded, local, p_starts[:-1], l_starts[:-1], s_starts[:-1], seq_lens],
+            dtype=torch.int64,
+            pin_memory=device.type == "cuda",
+        ).to(device, non_blocking=True)
+        padded_t, local_t, p_t, l_t, s_t, lens_t = table.unbind(0)
+        reqs = torch.arange(len(seq_lens), device=device)
+
+        # send row -> this rank's local row (or -1 for padding)
+        req = torch.repeat_interleave(reqs, padded_t, output_size=self.rows_per_rank)
+        j = torch.arange(self.rows_per_rank, device=device) - p_t[req]
+        self.send_local = torch.where(j < local_t[req], l_t[req] + j, -1).to(
+            torch.int32
+        )
+        # output row -> all-gather row
+        req = torch.repeat_interleave(reqs, lens_t, output_size=self.total)
+        p = torch.arange(self.total, device=device) - s_t[req]
+        self.out_src = (
+            (p % world) * self.rows_per_rank + p_t[req] + p // world
+        ).to(torch.int32)
+
+
+_ROW_GATHER_PLANS: "OrderedDict[tuple, DcpRowGatherPlan]" = OrderedDict()
+
+
+def dcp_row_gather_plan(
+    seq_lens_cpu: torch.Tensor, device: torch.device
+) -> DcpRowGatherPlan:
+    parallel = get_parallel()
+    key = (
+        tuple(seq_lens_cpu.tolist()),
+        parallel.dcp_size,
+        parallel.dcp_rank,
+        device,
+    )
+    plan = _ROW_GATHER_PLANS.get(key)
+    if plan is None:
+        plan = DcpRowGatherPlan(list(key[0]), *key[1:])
+        _ROW_GATHER_PLANS[key] = plan
+        while len(_ROW_GATHER_PLANS) > 4:
+            _ROW_GATHER_PLANS.popitem(last=False)
+    return plan
+
+
+def dcp_fused_gather_supported(*widths_bytes: int) -> bool:
+    return (
+        envs.SGLANG_DSA_DCP_PREFILL_FUSED_GATHER.get()
+        and all(w % 4 == 0 for w in widths_bytes)
+        and not torch.cuda.is_current_stream_capturing()
+    )
+
+
+def dcp_fused_gather_rows(
+    sources: list[tuple[torch.Tensor, Optional[torch.Tensor]]],
+    plan: DcpRowGatherPlan,
+    outputs: list[torch.Tensor],
+) -> None:
+    """Prefill: ``dcp_gather_request_rows`` without its pack / reorder copies.
+
+    ``sources``: (rows, index) pairs, each [*, W_i] byte rows of this rank; the
+    send row of local row l is ``rows[index[l]]`` (``rows[l]`` without an
+    index). ``outputs``: [>= plan.total, W_i] byte tensors that receive the
+    request-ordered rows (zeros past plan.total).
+    """
+    print_info_once(
+        "DSA DCP prefill: fused KV / index-K gather "
+        "(SGLANG_DSA_DCP_PREFILL_FUSED_GATHER)"
+    )
+    parallel = get_parallel()
+    device = outputs[0].device
+    widths = [out.shape[1] // 4 for out in outputs]
+    width = sum(widths)
+    send = torch.empty((plan.rows_per_rank, width), dtype=torch.int32, device=device)
+    col = 0
+    for (rows, index), w in zip(sources, widths):
+        _gather_rows(
+            rows.view(torch.int32), plan.send_local, send[:, col : col + w], index
+        )
+        col += w
+    recv = torch.empty(
+        (parallel.dcp_size * plan.rows_per_rank, width),
+        dtype=torch.int32,
+        device=device,
+    )
+    parallel.dcp_group.all_gather_into_tensor(
+        recv.view(torch.uint8), send.view(torch.uint8)
+    )
+    col = 0
+    for out, w in zip(outputs, widths):
+        _gather_rows(recv[:, col : col + w], plan.out_src, out.view(torch.int32))
+        col += w
