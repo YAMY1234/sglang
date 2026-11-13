@@ -609,6 +609,31 @@ class TestSpCollectiveSm107Table(CustomTestCase):
                 )
                 self.assertEqual(None if got is None else tuple(got), want)
 
+    def test_the_tp4_decode_buckets(self):
+        device = torch.device("cpu")
+        for kind, rows, want in (
+            ("reduce_scatter", 1, ("push", 128, 512)),
+            ("reduce_scatter", 600, ("push", 64, 512)),
+            ("reduce_scatter", 1280, ("push", 128, 512)),
+            ("all_gather", 700, ("push", 128, 512)),
+            ("reduce_scatter", 2048, None),
+            ("all_gather", 32768, None),
+        ):
+            with self.subTest(kind=kind, rows=rows):
+                got = self.dispatch(
+                    (10, 7), lambda m: m.get_dispatch(kind, 4, 7168, rows, device)
+                )
+                self.assertEqual(
+                    None if got is None else (got.strategy, *got.tuning), want
+                )
+        for rows, want in ((1, ("fused_direct", 64)), (800, ("fused_direct", 128)), (4096, None)):
+            with self.subTest(kind="attn_res_all_gather", rows=rows):
+                got = self.dispatch(
+                    (10, 7),
+                    lambda m: m.get_fusion_dispatch("attn_res_all_gather", 4, 7168, rows, device),
+                )
+                self.assertEqual(None if got is None else tuple(got), want)
+
     def test_other_devices_and_widths_keep_nccl(self):
         device = torch.device("cpu")
         for capability, world in (((10, 3), 8), ((10, 7), 4), ((10, 7), 16)):

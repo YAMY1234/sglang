@@ -196,6 +196,8 @@ class DcpTopKMerge:
     from the context-split verify indexer. ``push`` (token interleave only): the
     local top-k selects only the candidates and pushes them (``merge_pushed``)."""
 
+    cand_k = _DCP_MERGE_CAND_K
+
     def __init__(
         self,
         group,
