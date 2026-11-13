@@ -4078,6 +4078,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             )
 
 
+def defer_decode_prealloc() -> bool:
+    """Whether the overlap loop preallocates after launching its batch, so the
+    allocation runs beside the forward instead of ahead of the DP shape sync."""
+    return envs.SGLANG_DISAGG_DECODE_DEFER_PREALLOC.get() or (
+        envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+        and envs.SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION.get()
+    )
+
+
 class SchedulerDisaggregationDecodeMixin:
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
@@ -4128,10 +4137,7 @@ class SchedulerDisaggregationDecodeMixin:
     def event_loop_overlap_disagg_decode(self: Scheduler):
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
-        defer_prealloc = (
-            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
-            and envs.SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION.get()
-        )
+        defer_prealloc = defer_decode_prealloc()
 
         def pop_and_process():
             tmp_batch, tmp_result = self.result_queue.popleft()

@@ -16,6 +16,7 @@ from sglang.srt.disaggregation.decode import (
     DecodeTransferQueue,
     SchedulerDisaggregationDecodeMixin,
     _PendingPublish,
+    defer_decode_prealloc,
 )
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
@@ -781,6 +782,61 @@ class TestDeferredDestinationPublish(CustomTestCase):
         self.assertFalse(live.awaiting_publish)
         # Both holds end: the released one unpublished, the live one published.
         self.assertEqual(self.storage.ended, ["deferred", "deferred"])
+
+
+class TestDeferredPrealloc(CustomTestCase):
+    def setUp(self):
+        _run_as_single_rank(self)
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
+    def test_its_own_switch_or_the_shared_one_defers(self):
+        cases = [
+            (False, False, True, False),
+            (True, False, True, True),
+            (False, True, True, True),
+            (False, True, False, False),
+        ]
+        for own, shared, pddec, expected in cases:
+            with self.subTest(own=own, shared=shared, pddec=pddec):
+                with (
+                    envs.SGLANG_DISAGG_DECODE_DEFER_PREALLOC.override(own),
+                    envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(shared),
+                    envs.SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION.override(
+                        pddec
+                    ),
+                ):
+                    self.assertEqual(defer_decode_prealloc(), expected)
+
+    def test_a_deferred_pass_leaves_prealloc_to_the_loop(self):
+        for defer in (False, True):
+            with self.subTest(defer=defer):
+                transfer = SimpleNamespace(
+                    resolve_deferred_releases=MagicMock(),
+                    publish_pending_metadata=MagicMock(),
+                    move_transferred=MagicMock(return_value=[]),
+                )
+                scheduler = SimpleNamespace(
+                    scheduler_stage_metrics=None,
+                    tree_cache=SimpleNamespace(linker=None),
+                    enable_decode_hicache=False,
+                    enable_hisparse=False,
+                    disagg_decode_prealloc_queue=SimpleNamespace(
+                        publish_pending_destinations=MagicMock(),
+                        move_resumed=lambda dst: [],
+                        retracted_queue=[],
+                    ),
+                    disagg_decode_transfer_queue=transfer,
+                    waiting_queue=IndexedReqList(ListKind.WAITING),
+                    _preallocate_new_requests=MagicMock(),
+                )
+                deferred = SchedulerDisaggregationDecodeMixin.process_decode_queue(
+                    scheduler, defer_prealloc=defer
+                )
+                self.assertEqual(deferred, defer)
+                self.assertEqual(scheduler._preallocate_new_requests.called, not defer)
+                transfer.move_transferred.assert_called_once()
 
 
 class TestPublishedDestinationHandoff(CustomTestCase):
