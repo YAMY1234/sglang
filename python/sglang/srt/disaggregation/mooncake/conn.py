@@ -2172,6 +2172,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             StateType.SWA_RING,
             StateType.DSV4_REQUEST_STATE,
             StateType.REQUEST_ROW,
+            StateType.DSV41_LATE_TAIL_ROWS,
             StateType.BLOCK_SCALE,
             StateType.BLOCK_SCALE_SWA,
         )
@@ -2184,6 +2185,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             StateType.SWA_RING,
             StateType.DSV4_REQUEST_STATE,
             StateType.REQUEST_ROW,
+            StateType.DSV41_LATE_TAIL_ROWS,
         )
 
     def _prepare_sharded_dsa_indices(self, src_indices, dst_indices):
