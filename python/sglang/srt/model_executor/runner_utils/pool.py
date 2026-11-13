@@ -28,7 +28,7 @@ from typing import Any, Iterator, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_resources, get_stream
+from sglang.srt.runtime_context import get_resources, get_stream, set_stream
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.cuda_vmm_utils import BumpArenaStub
 
@@ -121,6 +121,9 @@ def get_or_create_global_graph_capture_stream() -> Any:
 
     CUDA only — the NPU / XPU / CPU graph runners keep their own streams.
     """
+    priority = envs.SGLANG_OPT_GRAPH_CAPTURE_STREAM_PRIORITY.get()
+    if priority and _CAPTURE_STREAM_NAME not in get_resources().streams:
+        set_stream(_CAPTURE_STREAM_NAME, torch.cuda.Stream(priority=priority))
     return get_stream(_CAPTURE_STREAM_NAME)
 
 
