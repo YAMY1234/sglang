@@ -12,7 +12,12 @@ from sglang.srt.disaggregation.prefill_lending import (
     LendRequest,
     OwnerAction,
     OwnerLedger,
+    PeerRegions,
     RankStatus,
+    SeedDone,
+    SeedReady,
+    decode_message,
+    encode_message,
     full_page_split,
     page_runs,
     plan_lends,
@@ -234,6 +239,26 @@ class TestBorrowerLedger(unittest.TestCase):
         self.ledger.add(lend(), now=0.0)
         self.ledger.finish(0, 1)
         self.assertEqual(self.ledger.on_cancel(LendCancel(lend_id=1, owner=0))[0], BorrowAction.IGNORE)
+
+
+class TestWire(unittest.TestCase):
+    def test_every_message_round_trips_as_its_own_type(self):
+        """Ranks dispatch on the decoded type; a message missing from the wire union
+        would decode as another type or fail at runtime on the peer."""
+        msgs = [
+            status(1),
+            PeerRegions(rank=1, session_id="h:1", kv_ptrs=[1 << 40], kv_item_lens=[36864], page_size=256),
+            lend(),
+            SeedReady(lend_id=1, borrower=1, borrower_prefix_pages=[3, 4]),
+            SeedDone(lend_id=1, owner=0, ok=True),
+            LendDone(lend_id=1, borrower=1, ok=False, reason="oom", elapsed_s=0.5),
+            LendCancel(lend_id=1, owner=0),
+            LendCancelAck(lend_id=1, borrower=1),
+        ]
+        for m in msgs:
+            back = decode_message(encode_message(m))
+            self.assertIs(type(back), type(m))
+            self.assertEqual(back, m)
 
 
 if __name__ == "__main__":

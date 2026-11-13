@@ -34,6 +34,7 @@ import time
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import msgspec
+import msgspec.msgpack
 
 
 class LendingConfig(msgspec.Struct, frozen=True):
@@ -63,7 +64,7 @@ class LendingConfig(msgspec.Struct, frozen=True):
 # ---------------------------------------------------------------- status and policy
 
 
-class RankStatus(msgspec.Struct, frozen=True):
+class RankStatus(msgspec.Struct, frozen=True, tag=True):
     """What a rank publishes after it forms a batch."""
 
     rank: int
@@ -206,7 +207,7 @@ def full_page_split(prefix_tokens: int, input_tokens: int, page_size: int) -> Tu
 # ---------------------------------------------------------------- wire messages
 
 
-class LendRequest(msgspec.Struct):
+class LendRequest(msgspec.Struct, tag=True):
     lend_id: int
     owner: int
     rid: str
@@ -218,7 +219,7 @@ class LendRequest(msgspec.Struct):
     extra_key: Optional[str] = None
 
 
-class LendDone(msgspec.Struct):
+class LendDone(msgspec.Struct, tag=True):
     lend_id: int
     borrower: int
     ok: bool
@@ -227,17 +228,17 @@ class LendDone(msgspec.Struct):
     elapsed_s: float = 0.0
 
 
-class LendCancel(msgspec.Struct):
+class LendCancel(msgspec.Struct, tag=True):
     lend_id: int
     owner: int
 
 
-class LendCancelAck(msgspec.Struct):
+class LendCancelAck(msgspec.Struct, tag=True):
     lend_id: int
     borrower: int
 
 
-class PeerRegions(msgspec.Struct):
+class PeerRegions(msgspec.Struct, tag=True):
     """A rank's pool regions for copies, exchanged once at startup."""
 
     rank: int
@@ -245,6 +246,37 @@ class PeerRegions(msgspec.Struct):
     kv_ptrs: List[int]
     kv_item_lens: List[int]
     page_size: int
+
+
+class SeedReady(msgspec.Struct, tag=True):
+    """Borrower to owner: pages allocated for the prefix; write them."""
+
+    lend_id: int
+    borrower: int
+    borrower_prefix_pages: List[int]
+
+
+class SeedDone(msgspec.Struct, tag=True):
+    """Owner to borrower: the prefix pages have landed (ok) or the lend is off."""
+
+    lend_id: int
+    owner: int
+    ok: bool
+
+
+LendMessage = (
+    RankStatus | PeerRegions | LendRequest | SeedReady | SeedDone | LendDone | LendCancel | LendCancelAck
+)
+_ENCODER = msgspec.msgpack.Encoder()
+_DECODER = msgspec.msgpack.Decoder(LendMessage)
+
+
+def encode_message(msg: LendMessage) -> bytes:
+    return _ENCODER.encode(msg)
+
+
+def decode_message(data: bytes) -> LendMessage:
+    return _DECODER.decode(data)
 
 
 # ---------------------------------------------------------------- owner ledger
