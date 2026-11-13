@@ -325,6 +325,10 @@ class UnifiedRadixCache(BasePrefixCache):
         self.pp_sync_window = 1
         if envs.SGLANG_PP_SYNC_WINDOW.get() and self.pp_size > 1:
             self.pp_sync_window = self.pp_size + get_parallel().pp_async_batch_depth
+            logger.info(
+                "HiCache PP-sync window: %d rounds (SGLANG_PP_SYNC_WINDOW).",
+                self.pp_sync_window,
+            )
         self.pp_sync_rounds: deque[list[torch.distributed.Work]] = deque()
 
         # HiCache D↔H defaults (overridden by init_hicache)

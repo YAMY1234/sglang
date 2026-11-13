@@ -272,10 +272,13 @@ class SchedulerPPMixin:
         send_release_work = []
         # tmbs stays None under the relay, so the two-pass ring below never sends.
         release_relay = envs.SGLANG_PP_PD_PREFILL_RELEASE_RELAY.get()
-        if release_relay:
+        if release_relay or pp_sync_window() > 1:
             logger.info(
-                "PP PD prefill: PP0 decides each KV transfer's release and relays "
-                "it in one pass (SGLANG_PP_PD_PREFILL_RELEASE_RELAY)."
+                "PP PD prefill: release relayed from PP0 in one pass: %s "
+                "(SGLANG_PP_PD_PREFILL_RELEASE_RELAY); relay window %d rounds "
+                "(SGLANG_PP_SYNC_WINDOW).",
+                release_relay,
+                pp_sync_window(),
             )
 
         while True:
