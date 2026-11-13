@@ -4579,7 +4579,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         batch.dsv41_late_tail = LateTailStepInputs(
             active=True,
-            req_pool_indices=to_device([s.req.req_pool_idx for s in slots]),
+            req_pool_indices=to_device([s.req.kv.req_pool_idx for s in slots]),
             positions=to_device([s.position for s in slots]),
             floors=to_device([s.floor for s in slots]),
             staging_rows=to_device(

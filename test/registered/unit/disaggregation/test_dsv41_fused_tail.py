@@ -846,12 +846,13 @@ def _late_req(prompt_len, pool_idx, **fields):
         dsv41_late_fed=True,
         dsv41_late_pending=True,
         dsv41_late_queued=False,
-        req_pool_idx=pool_idx,
         full_untruncated_fill_ids=list(range(prompt_len)),
         finished=lambda: False,
     )
     for key, value in fields_.items():
         setattr(req, key, value)
+    # The pool row lives on the request's KV state, as on Req.
+    req.kv.req_pool_idx = pool_idx
     return req
 
 
@@ -955,7 +956,7 @@ class TestLateTailScheduling(CustomTestCase):
 
     def test_slots_are_reserved_before_the_transfer_and_queued_after_it(self):
         late = [_late_req(1000, pool_idx=i) for i in range(3)]
-        late[0].kv = SimpleNamespace(kv_allocated_len=0)  # still transferring
+        late[0].kv = SimpleNamespace(kv_allocated_len=0, req_pool_idx=0)  # transferring
         sched = _late_sched(late)
         feed = self._feed(sched)
         sched.dsv41_late_free_slots.clear()
@@ -963,7 +964,7 @@ class TestLateTailScheduling(CustomTestCase):
         self._reserve(sched, late)
         # Pre-allocation stops at the third: no slot left, so no transfer either.
         self.assertEqual([r.dsv41_late_staging for r in late], [9, 4, None])
-        late[2].kv = SimpleNamespace(kv_allocated_len=0)
+        late[2].kv = SimpleNamespace(kv_allocated_len=0, req_pool_idx=2)
         Mixin._stage_dsv41_late_tails(sched, feed)
         self.assertEqual([r.dsv41_late_queued for r in late], [False, True, False])
         self.assertEqual(feed.pending_rows(), 128)
