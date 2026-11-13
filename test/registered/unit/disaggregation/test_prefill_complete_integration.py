@@ -12,11 +12,13 @@ from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
 from sglang.srt.arg_groups.serving_hook import handle_other_validations
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.bootstrap import DeferredBootstrap
 from sglang.srt.disaggregation.common.conn import (
     CommonKVReceiver,
     KVTransferError,
     PrefillServerInfo,
+    prefill_complete_unsupported_states,
 )
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeRequest
@@ -32,6 +34,7 @@ from sglang.srt.disaggregation.prefill import (
     SchedulerDisaggregationPrefillMixin,
 )
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_prefill_pp_sections
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
@@ -125,6 +128,51 @@ class TestAllocationConfiguration(CustomTestCase):
                 values.update(changed)
                 with self.assertRaisesRegex(ValueError, "prefill_complete"):
                     handle_pd_disaggregation(ServerArgs(**values))
+
+    def test_matched_tp_dcp_flag_admits_only_attention_tp_and_dcp(self):
+        base = dict(
+            model_path="dummy",
+            disaggregation_decode_allocation_policy="prefill_complete",
+        )
+        prefill = dict(base, disaggregation_mode="prefill", tp_size=8, dcp_size=8)
+        decode = dict(
+            base, disaggregation_mode="decode", tp_size=16, dcp_size=8, attn_dp_size=2
+        )
+        with envs.SGLANG_PREFILL_COMPLETE_ALLOW_MATCHED_TP_DCP.override(True):
+            for values in (prefill, decode):
+                with self.subTest(values=values):
+                    handle_pd_disaggregation(ServerArgs(**values))
+            for changed in (
+                {"attn_cp_size": 2},
+                {"enable_kv_cache_sharding": True},
+                {"disaggregation_decode_enable_radix_cache": True},
+            ):
+                with self.subTest(changed=changed):
+                    with self.assertRaisesRegex(ValueError, "prefill_complete"):
+                        handle_pd_disaggregation(ServerArgs(**decode, **changed))
+        for values in (prefill, decode):
+            with self.subTest(values=values, flag=False):
+                with self.assertRaisesRegex(ValueError, "attention"):
+                    handle_pd_disaggregation(ServerArgs(**values))
+
+    def test_request_state_pools_need_their_flag(self):
+        kimi_states = [
+            StateType.MAMBA,
+            StateType.DSA,
+            StateType.DRAFT_RING,
+            StateType.REQUEST_ROW,
+        ]
+        self.assertEqual(prefill_complete_unsupported_states([StateType.DSA]), [])
+        self.assertEqual(
+            prefill_complete_unsupported_states(kimi_states),
+            [StateType.MAMBA, StateType.DRAFT_RING, StateType.REQUEST_ROW],
+        )
+        with envs.SGLANG_PREFILL_COMPLETE_ALLOW_REQUEST_STATE_POOLS.override(True):
+            self.assertEqual(prefill_complete_unsupported_states(kimi_states), [])
+            self.assertEqual(
+                prefill_complete_unsupported_states([StateType.SWA, StateType.DSA]),
+                [StateType.SWA],
+            )
 
 
 class TestAllocationIntegration(CustomTestCase):
@@ -348,6 +396,54 @@ class TestAllocationIntegration(CustomTestCase):
         self.assertEqual(receiver.conclude_state, KVPoll.Failed)
         self.assertIn("policy mismatch", self.decode.failure_records[1])
         setup.assert_not_called()
+
+    def test_matched_tp_dcp_peer_needs_flag_and_equal_layout(self):
+        # Decode attention TP8 + DCP8; one prefill rank per decode rank only
+        # when the prefill uses the same attention TP and DCP.
+        self.decode.attn_tp_size, self.decode.dcp_size = 8, 8
+        cases = [
+            (True, dict(attn_tp_size=8, dcp_size=8, required_dst_info_num=1), True),
+            (False, dict(attn_tp_size=8, dcp_size=8, required_dst_info_num=1), False),
+            (True, dict(attn_tp_size=8, dcp_size=1, required_dst_info_num=1), False),
+            (True, dict(attn_tp_size=1, dcp_size=1, required_dst_info_num=8), False),
+            (True, dict(attn_tp_size=2, dcp_size=8, required_dst_info_num=4), False),
+        ]
+        for room, (flag, peer, admitted) in enumerate(cases, start=1):
+            with self.subTest(flag=flag, peer=peer):
+                receiver = MooncakeKVReceiver(self.decode, "prefill:8998", room)
+                receiver.bootstrap_infos = [{"rank_ip": "prefill", "rank_port": 1}]
+                self.decode.prefill_info_table = {
+                    receiver.bootstrap_addr: PrefillServerInfo(
+                        attn_cp_size=1,
+                        dp_size=1,
+                        pp_size=1,
+                        page_size=1,
+                        kv_cache_dtype=None,
+                        follow_bootstrap_room=True,
+                        decode_allocation_policy="prefill_complete",
+                        target_tp_rank=0,
+                        target_tp_ranks=[0],
+                        target_cp_ranks=[0],
+                        target_pp_ranks=[0],
+                        required_prefill_response_num=1,
+                        **peer,
+                    )
+                }
+                receiver._connect_to_bootstrap_server = Mock(
+                    return_value=(Mock(), threading.Lock())
+                )
+                with (
+                    envs.SGLANG_PREFILL_COMPLETE_ALLOW_MATCHED_TP_DCP.override(flag),
+                    patch.object(receiver, "_setup_bootstrap_infos"),
+                ):
+                    receiver.init(0)
+                if admitted:
+                    self.assertEqual(receiver.poll(), KVPoll.Bootstrapping)
+                    receiver._connect_to_bootstrap_server.assert_called_once()
+                else:
+                    self.assertEqual(receiver.conclude_state, KVPoll.Failed)
+                    self.assertIn("peer attention", self.decode.failure_records[room])
+                    receiver._connect_to_bootstrap_server.assert_not_called()
 
     def test_scheduler_does_not_reserve_request_rows_for_unready_prefill(self):
         sender, receiver = self.sender(), self.receiver()
