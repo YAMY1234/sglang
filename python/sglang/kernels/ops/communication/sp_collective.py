@@ -48,6 +48,65 @@ def _device_name(device: torch.device) -> str:
     return torch.cuda.get_device_name(device).replace(" ", "_").replace("/", "_")
 
 
+def _push(num_blocks: int, block_size: int) -> dict:
+    return {"strategy": "push", "num_blocks": num_blocks, "block_size": block_size}
+
+
+def _pull(num_blocks: int, block_size: int) -> dict:
+    return {"strategy": "pull", "num_blocks": num_blocks, "block_size": block_size}
+
+
+def _direct(num_blocks: int, block_size: int) -> dict:
+    return {"strategy": "direct", "num_blocks": num_blocks, "block_size": block_size}
+
+
+def _fused_direct(max_blocks: int) -> dict:
+    return {"strategy": "fused_direct", "max_blocks": max_blocks}
+
+
+_SEPARATE = {"strategy": "separate"}
+
+# VR200 NVL72 (SM107), keyed by (world_size, hidden_size); used when no JSON
+# names the device. TP8 over two compute trays, bf16, each candidate checked
+# against NCCL 2.30 (NVLS off, as served) and taken only where strictly faster.
+# Global-token buckets 1024-32768 were measured (us, NCCL -> chosen):
+#   RS  104.5->38.7, 162.4->82.4, 201.6->132.6, 263.6->238.4, 517.1->453.1
+#   AG  99.6->45.9, 167.1->79.5, 189.9->125.3, 284.7->232.0, 526.6->435.0
+#   shard attention-residual read + AG, nvb 7, NCCL -> fused direct AG:
+#       128.7->41.1, 173.8->75.0, 206.9->128.3, 323.8->229.2, 579.5->449.5
+# The fused pull RS + FFN-side read did not beat the separate path (it lost
+# from 16384 rows), so it stays separate. Fewer rows take the 1024 bucket, as
+# the GB300 tables' push RS / direct AG do there.
+_SM107_TABLES: dict[tuple[int, int], dict] = {
+    (8, 7168): {
+        "configs": {
+            "reduce_scatter": {
+                "1024": _push(32, 512),
+                "4096": _pull(128, 512),
+                "8192": _pull(192, 1024),
+                "16384": _pull(128, 1024),
+                "32768": _pull(192, 512),
+            },
+            "all_gather": {
+                "1024": _direct(2, 1024),
+                "4096": _direct(4, 512),
+                "8192": _direct(64, 1024),
+                "16384": _direct(32, 512),
+                "32768": _direct(32, 1024),
+            },
+            "reduce_scatter_attn_res": {"1024": _SEPARATE},
+            "attn_res_all_gather": {
+                "1024": _fused_direct(128),
+                "4096": _fused_direct(64),
+                "8192": _fused_direct(128),
+                "16384": _fused_direct(64),
+                "32768": _fused_direct(128),
+            },
+        }
+    },
+}
+
+
 def _table(world_size: int, hidden_size: int, device: torch.device) -> Optional[dict]:
     path = os.path.join(
         _CONFIG_DIR,
@@ -57,6 +116,8 @@ def _table(world_size: int, hidden_size: int, device: torch.device) -> Optional[
         if os.path.exists(path):
             with open(path) as f:
                 _TABLES[path] = json.load(f)
+        elif tuple(torch.cuda.get_device_capability(device)) == (10, 7):
+            _TABLES[path] = _SM107_TABLES.get((world_size, hidden_size))
         else:
             _TABLES[path] = None
     return _TABLES[path]

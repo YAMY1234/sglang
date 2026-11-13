@@ -40,7 +40,11 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateList,
     AuxHiddenStatePacker,
 )
-from sglang.srt.layers.communication import k3_ar_fusion, k3_sp_collective
+from sglang.srt.layers.communication import (
+    k3_ar_fusion,
+    k3_sp_collective,
+    k3_sp_rs_overlap,
+)
 from sglang.srt.layers.cp.interleave import (
     cp_interleave_to_sequence_order,
     cp_sequence_to_interleave_order,
@@ -612,11 +616,12 @@ def _k3_reduce_scatter_add(hidden_states, residual, forward_batch):
     return k3_sp_collective.reduce_scatter_res(hidden_states, residual)
 
 
-def _route_sp_o_proj_output(o_proj: RowParallelLinear) -> None:
+def _route_sp_o_proj_output(o_proj: RowParallelLinear, wrapped: bool) -> None:
     """Under SP-MoE, write o_proj's TP-partial output into K3's persistent
     symmetric buffer whenever K3's tuned reduce-scatter for that row count
     reads through it (the bank's FFN read); otherwise the stage boundary
-    reduce-scatters it from regular memory."""
+    reduce-scatters it from regular memory. ``wrapped``: o_proj carries
+    k3_sp_rs_overlap's wrapper, whose fused GEMM-RS needs neither."""
     if k3_sp_collective.enabled():
         # The table selects NVLS pull RS for larger token buckets.
         # Only those o_proj outputs come from the persistent symmetric
@@ -625,7 +630,10 @@ def _route_sp_o_proj_output(o_proj: RowParallelLinear) -> None:
 
         def _sp_o_proj_forward(x, *args, **kwargs):
             output_rows = x.shape[0]
-            if k3_sp_collective.requires_symmetric_rs(
+            # A fused GEMM-RS of these rows reduces out of its own buffer.
+            if not (
+                wrapped and k3_sp_rs_overlap.takes_gemm_rs(o_proj, x)
+            ) and k3_sp_collective.requires_symmetric_rs(
                 output_rows, x.device, x.element_size()
             ):
                 output = k3_sp_collective.get_o_proj_output_buffer(
@@ -639,6 +647,16 @@ def _route_sp_o_proj_output(o_proj: RowParallelLinear) -> None:
             return _sp_inner_o_proj_forward(x, *args, **kwargs)
 
         o_proj.forward = _sp_o_proj_forward
+
+
+def _overlaps_sp_o_proj_rs(config: KimiLinearConfig, sp_moe: bool) -> bool:
+    """Whether an SP-MoE layer's o_proj overlaps its GEMM with the
+    reduce-scatter (k3_sp_rs_overlap), whose output the bank's FFN read takes."""
+    return (
+        sp_moe
+        and config.attn_res_block_size is not None
+        and k3_sp_rs_overlap.installs(config.hidden_size)
+    )
 
 
 def _k3_symm_o_proj_out(o_proj: RowParallelLinear, x: torch.Tensor) -> torch.Tensor:
@@ -2482,8 +2500,12 @@ class KimiK3DeltaAttention(nn.Module):
         # Set by _prepare_fused_decode() once weights are loaded.
         self._kda_fused_decode_ready = False
         self._kda_hip_fused_decode_ready = False
+        if _overlaps_sp_o_proj_rs(config, sp_moe):
+            k3_sp_rs_overlap.wrap_o_proj(self.o_proj)
         if sp_moe:
-            _route_sp_o_proj_output(self.o_proj)
+            _route_sp_o_proj_output(
+                self.o_proj, _overlaps_sp_o_proj_rs(config, sp_moe)
+            )
 
     def forward_qkvbfg(self, hidden_states: torch.Tensor):
         qkv, _ = self.qkv_proj(hidden_states)
@@ -2987,6 +3009,9 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             # Allocate o_proj's output in the attention-TP group's symmetric
             # memory, where the stage boundary sums it.
             self.o_proj.use_dp_attention_reduce = True
+        # Under the output-gate wrap below, so it sees the gated input.
+        if _overlaps_sp_o_proj_rs(config, sp_moe):
+            k3_sp_rs_overlap.wrap_o_proj(self.o_proj)
         if self.use_output_gate:
             projection_size = config.num_attention_heads * config.v_head_dim
             # Shard by attn-TP to match the attention output (DSV2 MLA shards
@@ -3036,7 +3061,9 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
 
             self.o_proj.forward = _gated_o_proj_forward
         if sp_moe:
-            _route_sp_o_proj_output(self.o_proj)
+            _route_sp_o_proj_output(
+                self.o_proj, _overlaps_sp_o_proj_rs(config, sp_moe)
+            )
 
     @staticmethod
     def _split_kv_b_weight_loader(param, loaded_weight) -> None:
@@ -3125,20 +3152,22 @@ def _fuses_attn_all_reduce(config: KimiLinearConfig) -> bool:
     )
 
 
-def _carries_bank_slices(config: KimiLinearConfig, sp_collective: bool) -> bool:
+def _carries_bank_slices(config: KimiLinearConfig) -> bool:
     """Whether consecutive SP-MoE layers keep the stream and the
     attention-residual bank on each rank's attention-TP shard of the rows
     (SGLANG_K3_SP_ATTN_RES): each layer reads its attention input there, then
-    gathers what it read. DSpark gathers the pre-norm mixture at its capture
-    layers, but other aux-capture and pipeline paths need the whole bank;
-    this is decided at construction. Nor can a
+    gathers what it read. The DSpark and DFLASH aux captures (DFLASH reuses
+    the DSpark taps, see set_dflash_layers_to_capture) mix this rank's bank
+    rows and gather the mixture, so they work on the shards; EAGLE3's capture
+    and pipeline paths need the whole bank. This is decided at construction.
+    Nor can a
     dense layer after an SP-MoE one, whose FFN reads every row of the bank:
-    every layer from the first MoE layer on must be one. ``sp_collective``:
-    whether K3's SP collective is enabled on this rank."""
+    every layer from the first MoE layer on must be one. This layout also
+    works with NCCL: custom collective kernels only fuse the local bank
+    read with the gather, and are not required to keep the bank sharded."""
     if not (
         _shards_moe_rows()
         and config.attn_res_block_size is not None
-        and sp_collective
         and envs.SGLANG_K3_SP_ATTN_RES.get()
         and get_parallel().pp_size == 1
     ):
@@ -3147,7 +3176,7 @@ def _carries_bank_slices(config: KimiLinearConfig, sp_collective: bool) -> bool:
     if True not in moe or not all(moe[moe.index(True) :]):
         return False
     spec = SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm)
-    return spec.is_dspark() or not (spec.is_eagle3() or spec.is_dflash_family())
+    return not spec.is_eagle3()
 
 
 def _latent_moe_writes_stream(config: KimiLinearConfig, layer_idx: int) -> bool:
@@ -3186,9 +3215,7 @@ def _stage_facts(
     ffn_ops = dict(read=NormReadout(reads_before_dp_gather=True))
     if config.attn_res_block_size is not None:
         if bank is None:
-            bank = AttnBankState.facts(
-                reads_slices=_carries_bank_slices(config, sp_collective)
-            )
+            bank = AttnBankState.facts(reads_slices=_carries_bank_slices(config))
         attn_ops = dict(
             read=bank.attn_readout,
             update=bank.attn_update,
@@ -3262,6 +3289,7 @@ class KimiK3DecoderLayer(nn.Module):
         self._sp_moe = self._is_moe_layer and _shards_moe_rows()
 
         self.all_reduce_fusion = not self._sp_moe and _fuses_attn_all_reduce(config)
+        self._sp_rs_overlap = _overlaps_sp_o_proj_rs(config, self._sp_moe)
 
         # Attention
         if config.is_kda_layer(layer_idx):
@@ -3359,11 +3387,14 @@ class KimiK3DecoderLayer(nn.Module):
                 self.mlp_res_proj,
                 self.mlp_res_norm,
                 writes_block=self.is_block_write_layer,
+                leading_fusions=(
+                    (k3_sp_rs_overlap.presummed_fusion,) if self._sp_rs_overlap else ()
+                ),
                 ffn_input_fusions=self._ffn_input_fusions(),
                 fuses_slice_collectives=self._sp_moe
                 and sp_collective
                 and envs.SGLANG_K3_SP_ATTN_RES.get(),
-                reads_slices=_carries_bank_slices(config, sp_collective),
+                reads_slices=_carries_bank_slices(config),
             ).residual_ops()
         attn, ffn = _stage_facts(
             config, layer_idx, sp_collective=sp_collective, bank=bank
@@ -3494,7 +3525,13 @@ class KimiK3LinearModel(nn.Module):
         # Whether K3's SP collective is enabled on this rank, which the layers'
         # stage declarations depend on: settled once, before any is built.
         sp_collective = k3_sp_collective.enabled()
-        self.carries_bank_slices = _carries_bank_slices(config, sp_collective)
+        self.carries_bank_slices = _carries_bank_slices(config)
+        if self.carries_bank_slices:
+            logger.info(
+                "K3 attention-residual bank kept on attention-TP shards "
+                "(SGLANG_K3_SP_ATTN_RES; gathers: %s)",
+                "K3 SP collective" if sp_collective else "NCCL",
+            )
 
         if self.pp_group.is_first_rank:
             embedding_quant_config = (
@@ -3669,6 +3706,7 @@ class KimiK3LinearModel(nn.Module):
                 aux_hidden_states.append(
                     self._dspark_capture_stream(i, hidden_states, forward_batch)
                 )
+        k3_sp_rs_overlap.check_consumed()
 
         if not self.pp_group.is_last_rank:
             if self.attn_bank is not None:

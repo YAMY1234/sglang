@@ -2296,7 +2296,8 @@ class Envs:
     SGLANG_K3_AR_FUSION = EnvBool(SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION.get)
     # K3 SP-MoE fused residual + reduce-scatter and matching all-gather over
     # CustomAllReduceV2's MNNVL push workspace. Auto-probed for checked-in
-    # TP4/TP8 GB300 and TP16 GB200/GB300 tuning; set 0/1 to override. See
+    # TP4/TP8 GB300 and TP16 GB200/GB300 tuning; set 0/1 to override. On SM107
+    # only an explicit 1 enables it, and only with a checked-in table. See
     # srt/layers/communication/k3_sp_collective.py.
     SGLANG_K3_SP_COLLECTIVE = EnvBool(False)
     # DCP MLA decode: push each peer's head partials straight into its
@@ -2309,8 +2310,22 @@ class Envs:
     # Keep K3's post-MoE residual stream token-sharded between consecutive
     # SP-MoE layers. The next attention-residual aggregation and snapshot
     # bank write run on the local shard, then only the normalized attention
-    # input is all-gathered. Requires SGLANG_K3_SP_COLLECTIVE.
+    # input is all-gathered. Works with NCCL or SGLANG_K3_SP_COLLECTIVE.
     SGLANG_K3_SP_ATTN_RES = EnvBool(False)
+    # SP-MoE prefill: compute o_proj's TP-partial output in N column chunks
+    # and reduce-scatter each chunk over attention TP on a side stream while
+    # the next chunk's GEMM runs (0: off). Taken only for eager batches of at
+    # least SGLANG_K3_SP_RS_OVERLAP_MIN_TOKENS rows whose reduce-scatter NCCL
+    # would run (not the K3 SP collective). See
+    # srt/layers/communication/k3_sp_rs_overlap.py.
+    SGLANG_K3_SP_RS_OVERLAP_CHUNKS = EnvInt(0)
+    SGLANG_K3_SP_RS_OVERLAP_MIN_TOKENS = EnvInt(8192)
+    # SP-MoE prefill: run o_proj's GEMM and its attention-TP reduce-scatter as
+    # one CUTLASS kernel whose epilogue reduces through NVLink multicast
+    # (sp_collective_gemm.matmul_reduce_scatter), for eager batches of at least
+    # this many rows (0: off). Takes precedence over the chunked overlap and the
+    # K3 SP collective's reduce-scatter. See k3_sp_rs_overlap.py.
+    SGLANG_K3_SP_GEMM_RS_MIN_TOKENS = EnvInt(0)
     # Merge the router gate and routed_expert_down_proj weights so the K3 MoE
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
