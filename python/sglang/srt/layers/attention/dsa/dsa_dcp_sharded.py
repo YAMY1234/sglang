@@ -38,6 +38,7 @@ import triton.language as tl
 
 from sglang.kernels.ops.attention.dcp_kernels import _gather_candidate_prefix_kernel
 from sglang.kernels.ops.attention.dsa.dcp_topk_merge import (
+    DCP_TOPK_MERGE_NUM_STATS,
     dcp_topk_merge,
     dcp_topk_merge_buffer_numel,
     dcp_topk_merge_pushed,
@@ -219,6 +220,13 @@ class DcpTopKMerge:
         self.counters: Optional[torch.Tensor] = None
         # 1 where a row's candidates could not certify the result (for tests)
         self.fallback: Optional[torch.Tensor] = None
+        # running totals of the kernels (DCP_TOPK_MERGE_NUM_STATS), reported by
+        # log_line from a copy one report old, so reading them never syncs
+        self.stats: Optional[torch.Tensor] = None
+        self._stats_host: Optional[torch.Tensor] = None
+        self._stats_copied: Optional[torch.cuda.Event] = None
+        self._stats_reported = [0] * DCP_TOPK_MERGE_NUM_STATS
+        self._report_index = 0
         self.union_scratch: Optional[torch.Tensor] = None
 
         world = group.world_size
@@ -258,6 +266,10 @@ class DcpTopKMerge:
         )
         self.counters = torch.zeros(max_rows, dtype=torch.int64, device=group.device)
         self.fallback = torch.zeros(max_rows, dtype=torch.int32, device=group.device)
+        self.stats = torch.zeros(
+            DCP_TOPK_MERGE_NUM_STATS, dtype=torch.int64, device=group.device
+        )
+        self._stats_host = torch.zeros_like(self.stats, device="cpu").pin_memory()
         if self.push:
             # the pushed merge's fallback reads the failed ranks' slots directly
             print_info_once(
@@ -296,6 +308,7 @@ class DcpTopKMerge:
             span=span,
             cand_k=self.cand_k,
             split=self.split,
+            stats=self.stats,
         )
 
     def merge_pushed(
@@ -340,11 +353,42 @@ class DcpTopKMerge:
             rank=self.rank,
             span=span,
             cand_k=self.cand_k,
+            stats=self.stats,
         )
         return local, lengths
 
+    def log_line(self, decode_step: int) -> Optional[str]:
+        """Fallback counts since the previous line, every
+        SGLANG_DSA_DCP_TOPK_MERGE_LOG_INTERVAL decode steps (0: never)."""
+        interval = envs.SGLANG_DSA_DCP_TOPK_MERGE_LOG_INTERVAL.get()
+        if self.stats is None or interval <= 0 or decode_step // interval == self._report_index:
+            return None
+        self._report_index = decode_step // interval
+        line = None
+        if self._stats_copied is not None and self._stats_copied.query():
+            now = self._stats_host.tolist()
+            fallback, published, selected, rows = (
+                a - b for a, b in zip(now, self._stats_reported)
+            )
+            self._stats_reported = now
+            line = (
+                f"DSA DCP top-k merge (DCP{self.world}, {self.cand_k} candidates): "
+                f"certificate failed on {fallback} of {rows} merged rows "
+                f"({100 * fallback / max(rows, 1):.4f}%); this rank published "
+                f"{published} of them, {selected} needing a top-k select"
+            )
+        self._stats_host.copy_(self.stats, non_blocking=True)
+        self._stats_copied = torch.cuda.Event()
+        self._stats_copied.record()
+        return line
+
 
 _TOPK_MERGE: Optional[DcpTopKMerge] = None
+
+
+def topk_merge_log_line(decode_step: int) -> Optional[str]:
+    return None if _TOPK_MERGE is None else _TOPK_MERGE.log_line(decode_step)
+
 # (slots, localized rows, counts) of the last pushed merge: dcp_localize_compact
 # returns the last two for that very slots tensor instead of recomputing them
 _PUSHED_LOCALIZED: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None

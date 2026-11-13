@@ -48,6 +48,10 @@ namespace dcp_topk_merge {
 
 // One warp per rank (warp q polls rank q's candidates), up to 16 ranks.
 constexpr int kMaxWarps = 16;
+// Running totals in `stats`: rows whose certificate failed, of them the rows
+// this rank published its keys for, of those the rows where it had to select
+// among more than kTopK keys, and all merged rows.
+enum { kStatFallback, kStatPublished, kStatSelected, kStatRows, kNumStats };
 constexpr uint32_t kEmptyPos = 0xFFFFFFu;  // 24-bit position field of an empty entry
 
 struct Smem {
@@ -223,6 +227,7 @@ struct Params {
   int32_t* __restrict__ out;             // [rows, kTopK] widened slots, -1 after
   int32_t* __restrict__ fallback;        // [rows] 1 when the certificate failed
   uint64_t* __restrict__ union_scratch;  // [max_rows, kNumRanks * kTopK] fallback union; global, so smem stays small
+  unsigned long long* __restrict__ stats;  // [4] running totals, see kStat*
   int32_t rank;
   int32_t span;  // page_size * kNumRanks
   int32_t max_rows;
@@ -369,7 +374,11 @@ __global__ void __launch_bounds__(32 * kNumRanks) merge_kernel(const __grid_cons
   for (int q = 0; q < kNumRanks; ++q) {
     if (want > 0 && s.kept[q] == s.sent[q] && local_len<kNumRanks, kSplit>(L, q) > s.sent[q]) fail |= 1u << q;
   }
-  if (tid == 0) p.fallback[row] = fail != 0;
+  if (tid == 0) {
+    p.fallback[row] = fail != 0;
+    if (fail) atomicAdd(&p.stats[kStatFallback], 1ull);
+    if (row == 0) atomicAdd(&p.stats[kStatRows], static_cast<unsigned long long>(gridDim.x));
+  }
   if (fail) t = fallback_kth<kNumRanks, kTopK, kCandK>(p, row, fail, full_off, tag, cand, s);
 
   int32_t* const out = p.out + static_cast<int64_t>(row) * kTopK;
@@ -422,10 +431,10 @@ __global__ void __launch_bounds__(32 * kNumRanks) merge_kernel(const __grid_cons
 //   1. poll the kNumRanks x kCandK candidates (warp q: rank q);
 //   2. t* and the certificate as merge_kernel; the select starts at the highest
 //      bit where the candidate keys differ;
-//   3. a rank that fails the certificate selects its local top-k from its own
-//      logits and stores it, tagged, in its full slot, which every rank polls:
-//      the union of the failed ranks' local top-k and the other ranks'
-//      candidates holds the global top-k, as in merge_kernel's fallback;
+//   3. a rank that fails the certificate stores its keys >= t* (or, past kTopK
+//      of them, its local top-k), tagged, in its full slot, which every rank
+//      polls: the union of those and the other ranks' candidates holds the
+//      global top-k, as in merge_kernel's fallback (publish_local_topk);
 //   4. this rank's keys >= t* as widened slots and as local KV rows (slot /
 //      kNumRanks, what dcp_localize_compact computes), -1 after, and their count.
 // Buffer reuse is merge_kernel's argument: the pushes of call c + 2 into a
@@ -543,38 +552,67 @@ struct PushedParams {
   int32_t* __restrict__ out_local;    // [rows, kTopK] local KV rows, -1 after
   int32_t* __restrict__ out_lengths;  // [rows]
   int32_t* __restrict__ fallback;     // [rows] 1 when the certificate failed
+  unsigned long long* __restrict__ stats;  // [kNumStats] running totals
   int32_t rank;
   int32_t span;  // page_size * kNumRanks
   int32_t max_rows;
 };
 
-// This rank failed the certificate: its local top-k, selected from its logits,
-// tagged into its full slot (kTopK entries, empty-padded) for every rank to poll.
+// This rank failed the certificate: its keys >= t_lo, tagged into its full slot
+// (kTopK entries, empty-padded) for every rank to poll. t_lo, the k-th candidate
+// key, is at most the global k-th key, so these hold every global top-k key of
+// this rank, and the other ranks' candidates hold theirs (merge_kernel's
+// argument). One counting pass finds at most kTopK of them on almost every row;
+// otherwise the slot gets this rank's local top-k, selected among them.
+// Returns whether it had to select.
 template <int kNumRanks, int kTopK>
-SGL_DEVICE void publish_local_topk(const PushedParams& p, int row, int64_t full_off, uint64_t tag, PushSmem& s) {
+SGL_DEVICE bool
+publish_local_topk(const PushedParams& p, int row, int64_t full_off, uint64_t tag, uint64_t t_lo, PushSmem& s) {
   constexpr int kThreads = 32 * kNumRanks;
+  constexpr int kTile = 8;  // entries per thread per compaction round
   const int tid = threadIdx.x;
   const float* const scores = p.logits + static_cast<int64_t>(row) * p.logits_stride;
   const int n = p.local_lens[row];
   const auto key_at = [&](int l) { return make_topk_key(__float_as_int(scores[l]), l * kNumRanks + p.rank); };
-  const auto visit = [&](auto f) {
-    for (int l = tid; l < n; l += kThreads)
-      f(key_at(l));
-  };
-  const uint64_t t = select_kth_adaptive(visit, min(n, kTopK), s);
+  int mine = 0, above;
+  for (int l = tid; l < n; l += kThreads)
+    mine += key_at(l) >= t_lo;
+  block_exclusive_sum<kNumRanks>(mine, above, s);
+  uint64_t t = t_lo;
+  const bool select = above > kTopK;
+  if (select) {
+    const auto visit = [&](auto f) {
+      for (int l = tid; l < n; l += kThreads) {
+        const uint64_t k = key_at(l);
+        f(k >= t_lo ? k : uint64_t{0});
+      }
+    };
+    t = select_kth_adaptive(visit, kTopK, s);
+  }
   uint64_t* const dst = p.buffer + full_off;
   int written = 0;
-  for (int l0 = 0; l0 < n; l0 += kThreads) {
-    const int l = l0 + tid;
-    const uint64_t k = l < n ? key_at(l) : 0;
-    const bool sel = k != 0 && k >= t;
+  for (int l0 = 0; l0 < n; l0 += kThreads * kTile) {
+    int32_t bits[kTile];
+    bool sel[kTile];
+    int cnt = 0;
+#pragma unroll
+    for (int j = 0; j < kTile; ++j) {
+      const int l = l0 + j * kThreads + tid;
+      bits[j] = l < n ? __float_as_int(scores[l]) : 0;
+      sel[j] = l < n && make_topk_key(bits[j], l * kNumRanks + p.rank) >= t;
+      cnt += sel[j];
+    }
     int total;
-    const int at = written + block_exclusive_sum<kThreads / 32>(sel, total, s);
-    if (sel) device::ptx::store_relaxed_sys(dst + at, pack_entry(__float_as_int(scores[l]), l * kNumRanks + p.rank, tag));
+    int at = written + block_exclusive_sum<kNumRanks>(cnt, total, s);
+#pragma unroll
+    for (int j = 0; j < kTile; ++j)
+      if (sel[j])
+        device::ptx::store_relaxed_sys(dst + at++, pack_entry(bits[j], (l0 + j * kThreads + tid) * kNumRanks + p.rank, tag));
     written += total;
   }
   for (int e = written + tid; e < kTopK; e += kThreads)
     device::ptx::store_relaxed_sys(dst + e, pack_entry(0, -1, tag));
+  return select;
 }
 
 template <int kNumRanks, int kTopK, int kCandK, bool kUsePDL>
@@ -628,9 +666,19 @@ __global__ void __launch_bounds__(32 * kNumRanks, kNumRanks == 8 ? 4 : 1)
   for (int q = 0; q < kNumRanks; ++q) {
     if (want > 0 && s.kept[q] == s.sent[q] && local_len<kNumRanks, false>(L, q) > s.sent[q]) fail |= 1u << q;
   }
-  if (tid == 0) p.fallback[row] = fail != 0;
+  if (tid == 0) {
+    p.fallback[row] = fail != 0;
+    if (fail) atomicAdd(&p.stats[kStatFallback], 1ull);
+    if (row == 0) atomicAdd(&p.stats[kStatRows], static_cast<unsigned long long>(gridDim.x));
+  }
   if (fail) {
-    if (fail >> p.rank & 1) publish_local_topk<kNumRanks, kTopK>(p, row, full_off, tag, s);
+    if (fail >> p.rank & 1) {
+      const bool selected = publish_local_topk<kNumRanks, kTopK>(p, row, full_off, tag, t, s);
+      if (tid == 0) {
+        atomicAdd(&p.stats[kStatPublished], 1ull);
+        if (selected) atomicAdd(&p.stats[kStatSelected], 1ull);
+      }
+    }
     // every thread polls its entries of each failed rank's full slot once; the
     // rounds below re-read them (unchanged until this rank's call c + 1)
 #pragma unroll 1
@@ -739,6 +787,7 @@ struct DcpTopKMergeKernel {
       tvm::ffi::TensorView out_slots,
       tvm::ffi::TensorView out_fallback,
       tvm::ffi::TensorView union_scratch,
+      tvm::ffi::TensorView stats,
       int64_t rank,
       int64_t span) {
     using namespace host;
@@ -756,6 +805,7 @@ struct DcpTopKMergeKernel {
     TensorMatcher({R, kTopK}).with_dtype<int32_t>().with_device(device_).verify(out_slots);
     TensorMatcher({R}).with_dtype<int32_t>().with_device(device_).verify(out_fallback);
     TensorMatcher({M, kNumRanks * kTopK}).with_dtype<int64_t>().with_device(device_).verify(union_scratch);
+    TensorMatcher({static_cast<int64_t>(dcp_topk_merge::kNumStats)}).with_dtype<int64_t>().with_device(device_).verify(stats);
 
     const auto rows = static_cast<int32_t>(R.unwrap());
     const auto max_rows = static_cast<int32_t>(M.unwrap());
@@ -781,6 +831,7 @@ struct DcpTopKMergeKernel {
         .out = static_cast<int32_t*>(out_slots.data_ptr()),
         .fallback = static_cast<int32_t*>(out_fallback.data_ptr()),
         .union_scratch = static_cast<uint64_t*>(union_scratch.data_ptr()),
+        .stats = static_cast<unsigned long long*>(stats.data_ptr()),
         .rank = static_cast<int32_t>(rank),
         .span = static_cast<int32_t>(span),
         .max_rows = max_rows,
@@ -810,6 +861,7 @@ struct DcpTopKMergePushedKernel {
       tvm::ffi::TensorView out_local,
       tvm::ffi::TensorView out_lengths,
       tvm::ffi::TensorView out_fallback,
+      tvm::ffi::TensorView stats,
       int64_t rank,
       int64_t span) {
     using namespace host;
@@ -829,6 +881,7 @@ struct DcpTopKMergePushedKernel {
     TensorMatcher({R, kTopK}).with_strides({kTopK, 1}).with_dtype<int32_t>().with_device(device_).verify(out_local);
     TensorMatcher({R}).with_dtype<int32_t>().with_device(device_).verify(out_lengths);
     TensorMatcher({R}).with_dtype<int32_t>().with_device(device_).verify(out_fallback);
+    TensorMatcher({static_cast<int64_t>(dcp_topk_merge::kNumStats)}).with_dtype<int64_t>().with_device(device_).verify(stats);
 
     const auto rows = static_cast<int32_t>(R.unwrap());
     const auto max_rows = static_cast<int32_t>(M.unwrap());
@@ -854,6 +907,7 @@ struct DcpTopKMergePushedKernel {
         .out_local = static_cast<int32_t*>(out_local.data_ptr()),
         .out_lengths = static_cast<int32_t*>(out_lengths.data_ptr()),
         .fallback = static_cast<int32_t*>(out_fallback.data_ptr()),
+        .stats = static_cast<unsigned long long*>(stats.data_ptr()),
         .rank = static_cast<int32_t>(rank),
         .span = static_cast<int32_t>(span),
         .max_rows = max_rows,

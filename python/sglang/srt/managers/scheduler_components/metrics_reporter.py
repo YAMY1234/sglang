@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import math
+import sys
 import tempfile
 import time
 from collections import defaultdict, deque
@@ -1069,6 +1070,12 @@ class SchedulerMetricsReporter:
 
         if self.is_stats_logging_rank:
             logger.info(msg)
+            # DSA DCP top-k merge fallback counts, when a DSA model loaded it
+            merge = sys.modules.get("sglang.srt.layers.attention.dsa.dsa_dcp_sharded")
+            if merge is not None and (
+                line := merge.topk_merge_log_line(self.forward_ct_decode)
+            ):
+                logger.info(line)
         if self.current_scheduler_metrics_enabled:
             priority_enabled = self.scheduler.enable_priority_scheduling
 

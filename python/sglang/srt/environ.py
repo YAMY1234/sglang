@@ -2159,6 +2159,8 @@ class Envs:
     # pushes them itself; the merge skips the local top-2048 and also returns the
     # localized rows (dsa/dsa_dcp_sharded.py).
     SGLANG_DSA_DCP_TOPK_PUSH = EnvBool(False)
+    # Decode steps between the DCP top-k merge's fallback-count log lines; 0 off.
+    SGLANG_DSA_DCP_TOPK_MERGE_LOG_INTERVAL = EnvInt(400)
     # DCP sparse MLA split into workspace-bounded calls: each call writes its
     # rows of one output in place of a cat (dsa/dsa_dcp.py).
     SGLANG_DSA_DCP_ATTN_INPLACE_OUT = EnvBool(False)
