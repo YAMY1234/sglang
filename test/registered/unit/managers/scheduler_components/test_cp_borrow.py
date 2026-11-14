@@ -281,5 +281,62 @@ class TestInterleaveAndPrivateMapping(unittest.TestCase):
             self.assertEqual(plan.final_rank, (plan.n - 1) % 4)
 
 
+class TestPrefixDoubleBuffer(unittest.TestCase):
+    def test_chunked_overlap_matches_one_shot_all_bytes(self):
+        import random
+
+        source = bytes((j * 31 + 7) % 256 for j in range(509))
+        for seed in range(8):
+            ops = list(borrow.prefix_copy_schedule(len(source), 64, (0, 1, 3)))
+            owner_slabs = [bytearray(64), bytearray(64)]
+            helper_slabs = {r: [bytearray(64), bytearray(64)] for r in (0, 1, 3)}
+            dest = {r: bytearray(len(source)) for r in helper_slabs}
+            completed = set()
+            rng = random.Random(seed)
+            while ops:
+                ready = [op for op in ops if set(op.wait_for) <= completed]
+                self.assertTrue(ready, "Pipeline dependency cycle")
+                op = rng.choice(ready)
+                start, stop = op.offset, op.offset + op.size
+                if op.kind == "gather":
+                    owner_slabs[op.slot][:op.size] = source[start:stop]
+                elif op.kind == "copy":
+                    helper_slabs[op.helper][op.slot][:op.size] = owner_slabs[op.slot][:op.size]
+                else:
+                    for j, value in enumerate(helper_slabs[op.helper][op.slot][:op.size], start):
+                        dest[op.helper][j * 17 % len(source)] = value
+                completed.add(op.event)
+                ops.remove(op)
+            expected = bytearray(len(source))
+            for j, value in enumerate(source):
+                expected[j * 17 % len(source)] = value
+            for result in dest.values():
+                self.assertEqual(result, expected)
+
+    def test_next_copy_does_not_wait_for_previous_other_slab_scatter(self):
+        ops = borrow.prefix_copy_schedule(256, 64, (1, 2, 3))
+        by_event = {op.event: op for op in ops}
+        second_copy = next(op for op in ops if op.kind == "copy" and op.offset == 64 and op.helper == 1)
+        first_scatter = next(op for op in ops if op.kind == "scatter" and op.offset == 0 and op.helper == 1)
+        deps = set(second_copy.wait_for)
+        for event in tuple(deps):
+            deps.update(by_event[event].wait_for)
+        self.assertNotIn(first_scatter.event, deps)
+
+    def test_reused_slabs_wait_for_all_readers_and_scatter(self):
+        ops = borrow.prefix_copy_schedule(192, 64, (1, 2, 3))
+        gather2 = next(op for op in ops if op.kind == "gather" and op.offset == 128)
+        self.assertEqual(len(gather2.wait_for), 3)
+        for helper in (1, 2, 3):
+            copy2 = next(op for op in ops if op.kind == "copy" and op.offset == 128 and op.helper == helper)
+            old_scatter = next(op for op in ops if op.kind == "scatter" and op.offset == 0 and op.helper == helper)
+            self.assertIn(old_scatter.event, copy2.wait_for)
+
+    def test_empty_and_invalid_capacity(self):
+        self.assertEqual(borrow.prefix_copy_schedule(0, 64, (1, 2, 3)), ())
+        with self.assertRaises(ValueError):
+            borrow.prefix_copy_schedule(1, 0, (1, 2, 3))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
