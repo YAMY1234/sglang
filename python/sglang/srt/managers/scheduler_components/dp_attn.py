@@ -775,7 +775,9 @@ def prepare_mlp_sync_batch_raw(
         if local_batch is not None:
             local_batch.dadp_sync_metadata = dict(
                 mlp_sync_round=_DADP_SYNC_ROUND,
-                global_num_tokens=list(mlp_sync_info.global_num_tokens),
+                global_num_tokens=(
+                    list(mlp_sync_info.global_num_tokens) if metadata_ready else None
+                ),
                 global_attention_pairs=(
                     list(mlp_sync_info.global_attention_pairs)
                     if metadata_ready

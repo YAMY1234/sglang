@@ -240,8 +240,11 @@ class SchedulerOutputStreamer:
             visible = []
             for req in reqs:
                 if is_dadp_shadow(req.rid):
-                    if req.finished():
+                    if req.finished() and not req.finished_output:
                         req.finished_output = True
+                        record_send(req, "dadp_shadow")
+                        if req.finished_len is None:
+                            req.finished_len = len(req.output_ids)
                 else:
                     visible.append(req)
             reqs = visible

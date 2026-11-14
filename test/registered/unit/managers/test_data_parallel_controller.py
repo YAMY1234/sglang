@@ -807,6 +807,38 @@ class TestDadpWorkloadControls(CustomTestCase):
                 {k: v for k, v in before.items() if k != "max_new_tokens"},
             )
 
+    def test_prefill_cap_is_applied_by_tokenizer_before_dispatch(self):
+        from sglang.srt.managers import tokenizer_manager as mod
+
+        manager = mod.TokenizerManager.__new__(mod.TokenizerManager)
+        manager.preferred_sampling_params = {}
+        manager.sampling_params_class = SamplingParams
+        manager.tokenizer = None
+        manager.model_config = SimpleNamespace(vocab_size=32000)
+        manager.tokenized_generate_req_type = io_struct.TokenizedGenerateReqInput
+        manager.rid_to_state = {"user": SimpleNamespace(time_stats=MagicMock())}
+        req = io_struct.GenerateReqInput(
+            rid="user",
+            input_ids=[1, 2],
+            sampling_params={"max_new_tokens": 16, "ignore_eos": True},
+        )
+        results = []
+        for flag in ["", "1"]:
+            with (
+                patch.object(mod, "DADP_MAX_NEW_TOKENS", flag),
+                patch.object(
+                    mod,
+                    "get_disagg",
+                    return_value=SimpleNamespace(
+                        disaggregation_transfer_backend="mooncake"
+                    ),
+                ),
+            ):
+                result = manager._create_tokenized_object(req, None, [1, 2])
+                results.append(result.sampling_params)
+        self.assertEqual([r.max_new_tokens for r in results], [16, 1])
+        self.assertTrue(all(r.ignore_eos for r in results))
+
     def test_shadow_abort_and_release_never_reach_frontend(self):
         from sglang.srt.managers.scheduler_components.output_sender import SenderWrapper
 
@@ -830,7 +862,11 @@ class TestDadpWorkloadControls(CustomTestCase):
         )
 
         shadow = SimpleNamespace(
-            rid="user__dadp_shadow_rank_1", finished=lambda: True, finished_output=False
+            rid="user__dadp_shadow_rank_1",
+            finished=lambda: True,
+            finished_output=False,
+            finished_len=None,
+            output_ids=[42],
         )
         original = SimpleNamespace(rid="user")
         streamer = SimpleNamespace(
