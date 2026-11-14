@@ -1794,3 +1794,60 @@ class TestPostVerifyLateJoin(CustomTestCase):
                 with patch.object(worker._post_verify_graphs, "join") as join:
                     _verify_kwargs(worker)
                 self.assertEqual(join.call_count, int(expected))
+
+    def test_the_side_commit_takes_two_warps_once_active(self):
+        """Once the late join is active, the side-stream commit runs the tiled commit
+        at SIDE_COMMIT_WARPS in its warmups and its capture; the body, and the commit
+        without the late join, at the kernel's own."""
+        from sglang.kernels.ops.attention.linear import gdn_replayssm_spec_decode as gdn
+
+        @contextmanager
+        def graph(*args, **kwargs):
+            yield
+
+        cuda = torch.cuda
+        for active in (False, True):
+            seen = []
+            graphs = eagle_post_verify_graphs._PostVerifyGraphs(
+                body=lambda slot: (
+                    seen.append(("body", gdn._TILED_COMMIT_WARPS_OVERRIDE)) or ("out",)
+                ),
+                commit=lambda slot, outputs: seen.append(
+                    ("commit", gdn._TILED_COMMIT_WARPS_OVERRIDE)
+                ),
+                sim_rng=torch.Generator(),
+            )
+            with (
+                self.subTest(active=active),
+                patch.object(
+                    post_verify_late_join, "_graphs", graphs if active else None
+                ),
+                patch.object(cuda, "graph_pool_handle", return_value="pool"),
+                patch.object(cuda, "Stream", MagicMock),
+                patch.object(cuda, "Event", MagicMock),
+                patch.object(cuda, "CUDAGraph", MagicMock),
+                patch.object(cuda, "current_stream", MagicMock()),
+                patch.object(cuda, "graph", graph),
+                patch(
+                    "sglang.srt.distributed.parallel_state.graph_capture",
+                    _graph_capture,
+                ),
+            ):
+                # A first round warms up; the capture follows the warmups.
+                graphs.run(
+                    key=("key",),
+                    inputs={"seq_lens": torch.tensor([3])},
+                    make_slot=lambda staged: SimpleNamespace(),
+                    sim_max_len=4,
+                )
+                graphs._capture(SimpleNamespace(num_requests=1, device="cpu"))
+            warps = post_verify_late_join.SIDE_COMMIT_WARPS if active else None
+            self.assertEqual(
+                seen,
+                [("body", None), ("commit", warps), ("body", None), ("commit", warps)],
+            )
+            self.assertIsNone(gdn._TILED_COMMIT_WARPS_OVERRIDE)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -13,10 +13,14 @@ post-verify graph pool is also presized (as SGLANG_OPT_POST_VERIFY_POOL_PRESIZE)
 the tiled commit at 2 warps (each element's fold order is the tiling's, so the values do not change).
 """
 
+import contextlib
 import logging
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+# The side-stream commit graph's tiled-commit warps (the forward's stays at the kernel default).
+SIDE_COMMIT_WARPS = 2
 
 _graphs = None  # the _PostVerifyGraphs whose commit joins late, once activated
 _wait_counts: dict = {}
@@ -27,6 +31,18 @@ def _warn_once(key: str, msg: str, *args) -> None:
     if key not in _logged:
         _logged.add(key)
         logger.warning(msg, *args)
+
+
+def side_commit_tiling():
+    """Context for running or capturing the side-stream commit: the tiled commit at SIDE_COMMIT_WARPS once the late
+    join is active (activation precedes the first warmup and capture)."""
+    if _graphs is None:
+        return contextlib.nullcontext()
+    from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode import (
+        tiled_commit_warps,
+    )
+
+    return tiled_commit_warps(SIDE_COMMIT_WARPS)
 
 
 def late_join_refusal() -> Optional[str]:
