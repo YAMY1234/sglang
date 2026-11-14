@@ -874,6 +874,14 @@ class Envs:
     SGLANG_HICACHE_LOAD_BLOCK_QUOTA = EnvInt(0)
     # Grid cap for the Mamba state device-to-host backup kernel; 0 keeps 2 blocks.
     SGLANG_HICACHE_MAMBA_BACKUP_BLOCK_QUOTA = EnvInt(0)
+    # --mamba-max-states-per-path also counts host copies, and a capped state
+    # loses its host copy too (HiCache); 0 (default) caps device states only.
+    SGLANG_MAMBA_PATH_CAP_COUNTS_HOST = EnvBool(False)
+    # Scales the hierarchical Mamba host pool's share of --hicache-size (the KV
+    # host pools take the rest); unset (default) splits it as the device pools are.
+    SGLANG_HICACHE_MAMBA_HOST_SCALE = EnvFloat(None)
+    # Seconds between "HiCache host usage" log lines (KV and Mamba pools); 0 = off.
+    SGLANG_HICACHE_HOST_USAGE_LOG_INTERVAL = EnvFloat(0.0)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)

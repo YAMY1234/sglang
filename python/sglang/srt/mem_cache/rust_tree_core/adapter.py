@@ -877,6 +877,18 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def set_host_memory_buffer_only(self) -> None:
         self._binding.set_host_memory_buffer_only()
 
+    def set_mamba_path_cap_counts_host(self, enabled: bool) -> None:
+        try:
+            setter = self._binding.set_mamba_path_cap_counts_host
+        except AttributeError:
+            # An extension built before the switch existed (e.g. an image's).
+            raise RuntimeError(
+                "SGLANG_MAMBA_PATH_CAP_COUNTS_HOST needs a Rust TreeCore extension "
+                "that has set_mamba_path_cap_counts_host; rebuild "
+                "rust/sglang-radix-tree or set SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python"
+            ) from None
+        setter(enabled)
+
     @property
     def is_host_memory_buffer_only(self) -> bool:
         return self._binding.is_host_memory_buffer_only()
