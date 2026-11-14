@@ -11,6 +11,52 @@ from pathlib import Path
 import torch
 
 DADP_STEPLOG_DIR = os.environ.get("SGLANG_DADP_STEPLOG_DIR", "")
+_route_log_file = None
+_route_receive_round = 0
+
+
+def record_dadp_route_broadcast(seconds, envelope_count):
+    """Time only the extra replicate broadcast, including empty receive rounds."""
+    global _route_log_file, _route_receive_round
+    from sglang.srt.runtime_context import get_parallel
+
+    parallel = get_parallel()
+    if _route_log_file is None:
+        directory = Path(DADP_STEPLOG_DIR)
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / (
+            f"route-{socket.gethostname()}-tp{parallel.tp_rank}-{os.getpid()}.jsonl"
+        )
+        _route_log_file = path.open("x", buffering=1024 * 1024)
+        atexit.register(close_dadp_route_log)
+    _route_receive_round += 1
+    _route_log_file.write(
+        json.dumps(
+            dict(
+                schema="sglang-dadp-route/1",
+                receive_round=_route_receive_round,
+                cpu_monotonic_ns=time.monotonic_ns(),
+                dp_rank=parallel.attn_dp_rank,
+                tp_rank=parallel.tp_rank,
+                broadcast_seconds=seconds,
+                envelope_count=envelope_count,
+            ),
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+
+
+def close_dadp_route_log():
+    global _route_log_file
+    if _route_log_file is not None:
+        _route_log_file.close()
+        _route_log_file = None
+
+
+def flush_dadp_route_log():
+    if _route_log_file is not None:
+        _route_log_file.flush()
 
 
 class DadpStepLogger:

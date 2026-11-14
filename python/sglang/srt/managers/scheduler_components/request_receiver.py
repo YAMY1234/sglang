@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import pickle
+import time
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
@@ -35,6 +36,10 @@ from sglang.srt.managers.mm_utils import (
     discard_shm_features,
     has_shm_features,
     unwrap_shm_features,
+)
+from sglang.srt.managers.scheduler_components.dadp_step_logger import (
+    DADP_STEPLOG_DIR,
+    record_dadp_route_broadcast,
 )
 from sglang.srt.managers.scheduler_components.shm_tag_exchange import (
     ShmTagExchange,
@@ -202,12 +207,18 @@ class SchedulerRequestReceiver:
                     else None
                 )
                 if get_parallel().tp_size != 1:
+                    if DADP_STEPLOG_DIR:
+                        broadcast_start = time.perf_counter()
                     envelopes = broadcast_pyobj(
                         envelopes,
                         tp_group.rank,
                         tp_group.cpu_group,
                         src=tp_group.ranks[0],
                     )
+                    if DADP_STEPLOG_DIR:
+                        record_dadp_route_broadcast(
+                            time.perf_counter() - broadcast_start, len(envelopes or [])
+                        )
                 if recv_reqs is not None:
                     recv_reqs = [
                         r for r in recv_reqs if not isinstance(r, DadpReplicateReqInput)

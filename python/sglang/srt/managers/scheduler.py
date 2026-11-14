@@ -72,6 +72,8 @@ from torch.distributed import barrier
 from sglang.srt.managers.scheduler_components.dadp_step_logger import (
     DADP_STEPLOG_DIR,
     DadpStepLogger,
+    close_dadp_route_log,
+    flush_dadp_route_log,
 )
 
 if TYPE_CHECKING:
@@ -5964,6 +5966,8 @@ class Scheduler(
     @scheduler_stage_method(SCHEDULER_STAGE_IDLE)
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
+        if DADP_STEPLOG_DIR:
+            flush_dadp_route_log()
         if DADP_STEPLOG_DIR and hasattr(self, "dadp_step_logger"):
             self.dadp_step_logger.drain(flush=True)
         self.dp_attn_adapter.drop_sync_wait_carry()
@@ -7119,6 +7123,8 @@ def run_scheduler_process(
                 pass
     finally:
         if scheduler is not None:
+            if DADP_STEPLOG_DIR:
+                close_dadp_route_log()
             if DADP_STEPLOG_DIR and hasattr(scheduler, "dadp_step_logger"):
                 scheduler.dadp_step_logger.close()
             # FPM has a background ZMQ publisher thread that needs explicit
