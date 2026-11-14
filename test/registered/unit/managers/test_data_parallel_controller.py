@@ -709,6 +709,53 @@ class TestDadpWorkloadControls(CustomTestCase):
         )
         self.assertEqual(result.replicas[1].sampling_params.max_new_tokens, 16)
 
+    def test_replicas_enter_each_rank_at_one_global_receive_boundary(self):
+        from sglang.srt.managers.dadp import make_dadp_replicas
+        from sglang.srt.managers.scheduler_components import request_receiver as mod
+
+        replicas = make_dadp_replicas(self._generate(), [0, 1], 0)
+        envelope = io_struct.DadpReplicateReqInput(replicas=replicas)
+        receiver = mod.SchedulerRequestReceiver.__new__(mod.SchedulerRequestReceiver)
+        for rank in [0, 1]:
+            for local_control in [True, False]:
+                with (
+                    self.subTest(rank=rank, local_control=local_control),
+                    patch.object(
+                        mod,
+                        "get_exec",
+                        return_value=SimpleNamespace(
+                            moe=SimpleNamespace(is_ep_scale_joiner=False)
+                        ),
+                    ),
+                    patch.object(mod, "DADP_ROUTE", "replicate"),
+                    patch.object(
+                        mod,
+                        "get_parallel",
+                        return_value=SimpleNamespace(
+                            attn_dp_enabled=True,
+                            attn_tp_rank=0,
+                            attn_cp_rank=0,
+                            attn_dp_rank=rank,
+                            tp_size=2,
+                            enable_dp_attention_local_control_broadcast=local_control,
+                            tp_group=SimpleNamespace(
+                                rank=rank, ranks=[0, 1], cpu_group=object()
+                            ),
+                        ),
+                    ),
+                    patch.object(
+                        mod, "attn_cp_tp_broadcast_pyobj", side_effect=lambda x: x
+                    ),
+                    patch.object(
+                        mod, "broadcast_pyobj", side_effect=[[envelope], []]
+                    ) as broadcast,
+                ):
+                    result = receiver._broadcast_reqs_across_ranks(
+                        [envelope] if rank == 0 else []
+                    )
+                    self.assertEqual([r.rid for r in result], [replicas[rank].rid])
+                    self.assertEqual(broadcast.call_count, 1 if local_control else 2)
+
     def test_heavy_threshold_overrides_explicit_route_only_for_long_requests(self):
         ctl = _make_controller(4)
         ctl.dispatching = MagicMock()
@@ -748,11 +795,15 @@ class TestDadpWorkloadControls(CustomTestCase):
             params = SamplingParams(
                 max_new_tokens=limit, ignore_eos=True, temperature=0.2
             )
-            before = vars(params).copy()
+            before = msgspec.structs.asdict(params)
             clamp_dadp_max_new_tokens(params)
             self.assertEqual(params.max_new_tokens, expected)
             self.assertEqual(
-                {k: v for k, v in vars(params).items() if k != "max_new_tokens"},
+                {
+                    k: v
+                    for k, v in msgspec.structs.asdict(params).items()
+                    if k != "max_new_tokens"
+                },
                 {k: v for k, v in before.items() if k != "max_new_tokens"},
             )
 

@@ -67,12 +67,15 @@ import psutil  # isort: skip
 import setproctitle
 import torch
 import torch.distributed
+from sglang.srt.managers.scheduler_components.dadp_step_logger import (
+    DADP_STEPLOG_DIR,
+    DadpStepLogger,
+)
 from torch.distributed import barrier
 
 if TYPE_CHECKING:
-    from torch.cuda import Stream as CudaStream
-
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from torch.cuda import Stream as CudaStream
 
 try:
     from sglang.kernels.ops.mamba.triton_ops import (
@@ -5300,6 +5303,22 @@ class Scheduler(
                 self.maybe_send_cached_prefix_chunk(req, allow_send=not load_pending)
 
         # Run forward
+        dadp_observation = None
+        if DADP_STEPLOG_DIR:
+            if not hasattr(self, "dadp_step_logger"):
+                parallel = get_parallel()
+                self.dadp_step_logger = DadpStepLogger(
+                    DADP_STEPLOG_DIR,
+                    dp_rank=parallel.attn_dp_rank,
+                    tp_rank=parallel.tp_rank,
+                    pp_rank=parallel.pp_rank,
+                )
+            dadp_stream = (
+                self.forward_stream
+                if self.enable_overlap
+                else torch.cuda.current_stream()
+            )
+            dadp_observation = self.dadp_step_logger.begin(batch, dadp_stream)
         if self.is_generation:
             if self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
@@ -5603,6 +5622,8 @@ class Scheduler(
 
         self._maybe_report_active_ranks()
 
+        if DADP_STEPLOG_DIR:
+            self.dadp_step_logger.end(dadp_observation, dadp_stream)
         ret.forward_launch = launch
         return ret
 
@@ -5941,6 +5962,8 @@ class Scheduler(
     @scheduler_stage_method(SCHEDULER_STAGE_IDLE)
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
+        if DADP_STEPLOG_DIR and hasattr(self, "dadp_step_logger"):
+            self.dadp_step_logger.drain(flush=True)
         self.dp_attn_adapter.drop_sync_wait_carry()
         self.deferred_responses.stream_released()
         # Flush any health-check signal deferred while the engine was busy.
@@ -7094,6 +7117,8 @@ def run_scheduler_process(
                 pass
     finally:
         if scheduler is not None:
+            if DADP_STEPLOG_DIR and hasattr(scheduler, "dadp_step_logger"):
+                scheduler.dadp_step_logger.close()
             # FPM has a background ZMQ publisher thread that needs explicit
             # teardown to flush queued metrics and close the socket cleanly.
             scheduler.metrics_reporter._shutdown_fpm()

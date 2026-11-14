@@ -1,5 +1,7 @@
 import datetime
+import json
 import socket
+import tempfile
 import time
 import unittest
 from types import SimpleNamespace
@@ -9,7 +11,6 @@ from unittest.mock import Mock, patch
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -195,6 +196,26 @@ class TestDPBalanceStats(CustomTestCase):
         self.assertEqual(stats.imbalance_tokens, 4)
         self.assertAlmostEqual(stats.max_over_mean, 8 * 2 / 12)
         self.assertGreater(stats.sync_wait_seconds, 0)
+
+    def test_dadp_log_metadata_reuses_gather_vectors_and_sync_wait(self):
+        with patch.object(dp_attn, "DADP_STEPLOG_DIR", "/node-local/log"):
+            result = self._prepare_dp2_batch(
+                ForwardMode.DECODE, local_tokens=2, peer_tokens=4, wait_seconds=0.25
+            )
+        metadata = result.dadp_sync_metadata
+        self.assertEqual(metadata["global_num_tokens"], [2, 4])
+        self.assertEqual(metadata["global_attention_pairs"], [2, 4])
+        self.assertEqual(
+            metadata["sync_wait_seconds"], result.dp_balance_stats.sync_wait_seconds
+        )
+        self.assertTrue(metadata["metadata_ready"])
+
+    def test_dadp_log_default_off_does_not_add_batch_metadata(self):
+        with patch.object(dp_attn, "DADP_STEPLOG_DIR", ""):
+            result = self._prepare_dp2_batch(
+                ForwardMode.DECODE, local_tokens=2, peer_tokens=4
+            )
+        self.assertFalse(hasattr(result, "dadp_sync_metadata"))
 
     def test_attention_pairs_follow_context_not_rows(self):
         """Fewer rows with longer contexts is the busier rank in pairs.
@@ -994,6 +1015,76 @@ class TestSyncRowExchangeGloo(CustomTestCase):
                     self.assertEqual(stop, round_idx == _EXCHANGE_ROUNDS - 1)
                     # Every rank's drain state, one row per DP rank.
                     self.assertEqual(drain, [(r + round_idx) % 8 for r in range(sub)])
+
+
+class TestDadpStepLogger(CustomTestCase):
+    def _batch(self):
+        return SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            reqs=[SimpleNamespace(rid="r", seqlen=42)],
+            seq_lens_cpu=None,
+            forward_iter=17,
+            dadp_sync_metadata={"mlp_sync_round": 21, "global_num_tokens": [1, 0]},
+        )
+
+    def test_events_are_queried_later_without_synchronizing(self):
+        from sglang.srt.managers.scheduler_components.dadp_step_logger import (
+            DadpStepLogger,
+        )
+
+        start, end = Mock(), Mock()
+        end.query.side_effect = [False, True]
+        start.elapsed_time.return_value = 3.5
+        with tempfile.TemporaryDirectory() as directory:
+            logger = DadpStepLogger(directory, dp_rank=0, tp_rank=0, pp_rank=0)
+            with patch("torch.cuda.Event", side_effect=[start, end]):
+                observation = logger.begin(self._batch(), stream=object())
+                logger.end(observation, stream=object())
+            start.elapsed_time.assert_not_called()
+            logger.drain()
+            start.elapsed_time.assert_not_called()
+            logger.drain(flush=True)
+            record = json.loads(logger.path.read_text())
+            self.assertEqual(record["decode_seq_lens"], [42])
+            self.assertEqual(record["mlp_sync_round"], 21)
+            self.assertEqual(record["gpu_forward_ms"], 3.5)
+            start.synchronize.assert_not_called()
+            end.synchronize.assert_not_called()
+            logger.close()
+
+    def test_exit_preserves_incomplete_events_without_wait(self):
+        from sglang.srt.managers.scheduler_components.dadp_step_logger import (
+            DadpStepLogger,
+        )
+
+        start, end = Mock(), Mock()
+        end.query.return_value = False
+        with tempfile.TemporaryDirectory() as directory:
+            logger = DadpStepLogger(directory, dp_rank=0, tp_rank=0, pp_rank=0)
+            with patch("torch.cuda.Event", side_effect=[start, end]):
+                logger.end(logger.begin(self._batch(), object()), object())
+            logger.close()
+            record = json.loads(logger.path.read_text())
+            self.assertIsNone(record["gpu_forward_ms"])
+            self.assertEqual(record["gpu_timing_status"], "pending_at_exit")
+            start.elapsed_time.assert_not_called()
+            end.synchronize.assert_not_called()
+
+    def test_same_server_disable_switch_creates_no_events(self):
+        from sglang.srt.managers.scheduler_components.dadp_step_logger import (
+            DadpStepLogger,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            logger = DadpStepLogger(directory, dp_rank=0, tp_rank=0, pp_rank=0)
+            logger.disabled_file.touch()
+            with patch("torch.cuda.Event") as event:
+                observation = logger.begin(self._batch(), object())
+                logger.end(observation, object())
+                self.assertIsNone(observation)
+                event.assert_not_called()
+            logger.close()
+            self.assertEqual(logger.path.read_text(), "")
 
 
 if __name__ == "__main__":

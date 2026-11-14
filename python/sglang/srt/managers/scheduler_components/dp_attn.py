@@ -5,7 +5,6 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
-
 from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.utils import all_gather_single
@@ -18,6 +17,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.scheduler_components.dadp_step_logger import DADP_STEPLOG_DIR
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     _decode_total_seq_lens,
     _prefill_attention_pairs,
@@ -57,6 +57,7 @@ if TYPE_CHECKING:
 
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
+_DADP_SYNC_ROUND = 0
 
 # The MLP-sync gather carries each attention-DP group's listener drain state
 # (see DPDrainColumn).
@@ -767,6 +768,25 @@ def prepare_mlp_sync_batch_raw(
                 mlp_sync_info.tp0_info_cpu[:, 5].tolist()
             )
         )
+
+    if DADP_STEPLOG_DIR:
+        global _DADP_SYNC_ROUND
+        _DADP_SYNC_ROUND += 1
+        if local_batch is not None:
+            local_batch.dadp_sync_metadata = dict(
+                mlp_sync_round=_DADP_SYNC_ROUND,
+                global_num_tokens=list(mlp_sync_info.global_num_tokens),
+                global_attention_pairs=(
+                    list(mlp_sync_info.global_attention_pairs)
+                    if metadata_ready
+                    else None
+                ),
+                sync_wait_seconds=(
+                    mlp_sync_info.sync_wait_seconds
+                    + (sync_wait_carry.seconds if sync_wait_carry is not None else 0.0)
+                ),
+                metadata_ready=metadata_ready,
+            )
 
     if _ENABLE_METRICS_DP_ATTENTION and local_batch is not None:
         local_batch.dp_cooperation_info = mlp_sync_info.dp_cooperation_info
