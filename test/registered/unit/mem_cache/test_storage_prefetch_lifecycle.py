@@ -722,6 +722,7 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
             handle=handle,
             storage_hit_count=6,
             stats_requested_tokens=8,
+            stats_tree_kv_tokens=0,
             is_terminated=lambda: False,
             all_hash_values=None,
             deadline_expired=False,
