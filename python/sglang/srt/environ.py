@@ -2150,9 +2150,6 @@ class Envs:
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
-    # CUDA priority of the graph capture stream (lower is higher; 0 = default). The side
-    # streams keep the default (lowest) priority, so a negative value favours the main path.
-    SGLANG_OPT_GRAPH_CAPTURE_STREAM_PRIORITY = EnvInt(0)
 
     # ===================================================================
     # Inkling
