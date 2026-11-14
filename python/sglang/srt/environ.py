@@ -909,7 +909,7 @@ class Envs:
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
     # Staged write-back: one cudaMemcpyBatchAsync per staging chunk, adjacent host rows merged.
     SGLANG_OPT_HICACHE_BATCH_WRITE_BACK_COPY = EnvBool(False)
-    # write_back eviction: later streams wait on the D2H copies instead of the scheduler thread.
+    # write_back eviction walks: the forward stream waits on the D2H copies, not the scheduler thread.
     SGLANG_OPT_HICACHE_DEVICE_ORDERED_WRITE_BACK = EnvBool(False)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).

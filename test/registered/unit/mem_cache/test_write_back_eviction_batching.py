@@ -7,13 +7,11 @@ that wait, host room made per victim, and the load-back chain check.
 """
 
 import unittest
-from contextlib import nullcontext
 from array import array
 from types import SimpleNamespace
 from unittest import mock
 
 from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored, StorageMedium
-from sglang.srt.mem_cache import unified_radix_cache
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams, InsertParams
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
@@ -626,27 +624,27 @@ class _WriteBackBatchingSuite:
             cache.sanity_check()
 
     def _device_ordered(self, cache, cc):
-        """Order cache's write-back acks on the device; each consumer-stream
-        wait logs ("wait", n) for submission n."""
+        """Fence cache's write-back walks on the forward stream; each wait logs
+        ("wait", n) for submission n."""
         cache.device_ordered_write_back = True
-        stream = SimpleNamespace(
-            wait_event=lambda event: cc.log.append(("wait", event.n))
-        )
-        return mock.patch.object(
-            unified_radix_cache, "_write_back_consumer_streams", return_value=[stream]
+        cc.load_fence_stream = cc.write_fence_stream
+        cc.forward_on_fence_stream = True
+        cc.write_fence_stream.wait_event = lambda event: cc.log.append(
+            ("wait", event.n)
         )
 
     def test_device_ordered_write_back_frees_after_a_stream_wait(self):
-        """Device-ordered write-back never waits on a copy on the host, makes
-        the consumer streams wait on it before a page it reads is freed, and
-        leaves the tree the host-ordered path leaves."""
+        """A fenced write-back walk never waits on a copy on the host, makes the
+        forward stream wait on it before a page it reads is freed, and leaves
+        the tree the host-ordered walk leaves."""
         cache, allocator, host_pool = self._fill_host_with_one_batch()
         for seq in batch_seqs(1):
             insert_seq(cache, allocator, seq)
         cc = _FencedController(cache.cache_controller, {id(host_pool): "kv"})
         cache.cache_controller = cc
 
-        with cc.record_frees("kv", allocator), self._device_ordered(cache, cc):
+        self._device_ordered(cache, cc)
+        with cc.record_frees("kv", allocator):
             result = cache.evict(EvictParams(num_tokens=BATCH_TOKENS))
 
         self.assertEqual(result.num_tokens_evicted, BATCH_TOKENS)
@@ -671,35 +669,35 @@ class _WriteBackBatchingSuite:
 
     def test_device_ordered_write_back_churn_matches_host_ordered(self):
         """Five rounds of insert-and-evict end in the same device and host
-        state with device-ordered acks as with the host wait."""
+        state with fenced walks as with the host wait."""
 
         def churn(device_ordered):
             cache, allocator, host_pool = self._fill_host_with_one_batch()
             cc = _FencedController(cache.cache_controller, {id(host_pool): "kv"})
             cache.cache_controller = cc
-            ctx = self._device_ordered(cache, cc) if device_ordered else nullcontext()
+            if device_ordered:
+                self._device_ordered(cache, cc)
             state = []
-            with ctx:
-                for batch in range(1, 6):
-                    for seq in batch_seqs(batch):
-                        insert_seq(cache, allocator, seq)
-                    evicted = cache.evict(EvictParams(num_tokens=BATCH_TOKENS))
-                    cache.sanity_check()
-                    state.append(
-                        (
-                            evicted.num_tokens_evicted,
-                            allocator.available_size(),
-                            host_pool.available_size(),
-                            [
-                                (m.device_prefix_len, m.host_hit_length)
-                                for m in (
-                                    match_seq(cache, seq)
-                                    for b in range(batch + 1)
-                                    for seq in batch_seqs(b)
-                                )
-                            ],
-                        )
+            for batch in range(1, 6):
+                for seq in batch_seqs(batch):
+                    insert_seq(cache, allocator, seq)
+                evicted = cache.evict(EvictParams(num_tokens=BATCH_TOKENS))
+                cache.sanity_check()
+                state.append(
+                    (
+                        evicted.num_tokens_evicted,
+                        allocator.available_size(),
+                        host_pool.available_size(),
+                        [
+                            (m.device_prefix_len, m.host_hit_length)
+                            for m in (
+                                match_seq(cache, seq)
+                                for b in range(batch + 1)
+                                for seq in batch_seqs(b)
+                            )
+                        ],
                     )
+                )
             syncs = sum(event[0] == "sync" for event in cc.log)
             return state, syncs, len(cc.submitted)
 

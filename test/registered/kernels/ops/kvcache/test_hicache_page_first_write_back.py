@@ -827,10 +827,12 @@ def test_mha_batched_write_back_copy_is_bitwise_stock(pattern: str, page_count: 
 _FORWARD_SLEEP_CYCLES = 200_000_000
 
 
-def test_device_ordered_write_back_orders_the_consumer_streams() -> None:
-    """Without a host wait, the forward and schedule streams write an evicted row
-    and the load-back stream reads its host copy only after the copy; with no
-    ordering at all the same work corrupts the copy (the race it prevents)."""
+@pytest.mark.parametrize("overlap", [True, False])
+def test_fenced_write_back_orders_the_next_writer_and_load(overlap: bool) -> None:
+    """With no host wait, the next forward's write of an evicted row (forward
+    stream with overlap, current stream without) and a later load-back of its
+    host copy both run after the copy; with no fence the same writes corrupt it."""
+    from collections import deque
     from types import SimpleNamespace
 
     from sglang.srt.managers.cache_controller import HiCacheAck
@@ -843,17 +845,19 @@ def test_device_ordered_write_back_orders_the_consumer_streams() -> None:
     loaded = torch.empty_like(original)
     d2h, forward, schedule, h2d = (torch.cuda.Stream() for _ in range(4))
     cc = SimpleNamespace(
+        start_writing=lambda: None,
         ack_write_queue=[],
         write_fence_stream=forward,
         load_fence_stream=forward,
-        l2_transfer_engine=SimpleNamespace(host_to_device_stream=h2d),
+        forward_on_fence_stream=overlap,
     )
     cache = object.__new__(UnifiedRadixCache)
-    cache._pending_write_ack_metrics = []
+    cache.cache_controller = cc
     cache.metrics_collector = None
+    cache._fenced_write_acks = deque()
     cache._finish_write_through_ack = lambda ack_id: cache.ongoing_write_through.pop(ack_id)
 
-    def evict_then_reuse(device_ordered: bool):
+    def evict_then_reuse(fenced: bool):
         src.copy_(original)
         host.zero_()
         loaded.zero_()
@@ -870,26 +874,28 @@ def test_device_ordered_write_back_orders_the_consumer_streams() -> None:
                 HiCacheAck(start_event=start, finish_event=finish, node_ids=[7])
             )
             cache.ongoing_write_through = {7: None}
-            if device_ordered:
-                UnifiedRadixCache._finish_write_back_on_device(cache, cc)
+            if fenced:
+                UnifiedRadixCache._fence_write_back_on_streams(cache)
                 assert not finish.query(), "returned only after the copy"
                 assert not cache.ongoing_write_through and not cc.ack_write_queue
             else:
                 cc.ack_write_queue.clear()
-            with torch.cuda.stream(forward):
-                src[: n // 2].fill_(255)
-            src[n // 2 :].fill_(255)
+            writer = forward if overlap else schedule
+            with torch.cuda.stream(writer):
+                src.fill_(255)
+            # start_loading fences the load-back stream on load_fence_stream.
+            h2d.wait_stream(forward)
             with torch.cuda.stream(h2d):
                 loaded.copy_(host, non_blocking=True)
         torch.cuda.synchronize()
         return host.clone(), loaded.clone()
 
-    host_copy, load_back = evict_then_reuse(device_ordered=True)
+    host_copy, load_back = evict_then_reuse(fenced=True)
     assert torch.equal(host_copy, original.cpu())
     assert torch.equal(load_back, original)
-    host_copy, _ = evict_then_reuse(device_ordered=False)
+    assert not cache._fenced_write_acks or cache._fenced_write_acks[0].finish_event.query()
+    host_copy, _ = evict_then_reuse(fenced=False)
     assert not torch.equal(host_copy, original.cpu())
-
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
