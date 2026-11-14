@@ -700,5 +700,196 @@ def test_registered_mmap_page_first_kernel_operands_and_graph(
         host_pool.destroy()
 
 
+
+def _host_rows(pattern: str, count: int, capacity: int, gen: torch.Generator):
+    """Distinct host rows for ``count`` pages: one ascending run, short runs at
+    scattered offsets, or a shuffle (no two neighbours adjacent in general)."""
+    if pattern == "ascending":
+        return torch.arange(3, 3 + count, dtype=torch.int64)
+    if pattern == "shuffled":
+        return torch.randperm(capacity, generator=gen)[:count].to(torch.int64)
+    rows, start = [], 1
+    while len(rows) < count:
+        length = int(torch.randint(1, 10, (1,), generator=gen))
+        rows.extend(range(start, start + length))
+        start += length + int(torch.randint(1, 4, (1,), generator=gen))
+    rows = torch.tensor(rows[:count], dtype=torch.int64)
+    blocks = list(torch.split(rows, 7))
+    order = torch.randperm(len(blocks), generator=gen).tolist()
+    return torch.cat([blocks[i] for i in order])
+
+
+# The four DSv4 page rows a TP1 prefill writes back (layers x item bytes =
+# 110,592, 73,728, 26,112 and 17,408 B), all under the 128 KiB batch threshold.
+@pytest.mark.parametrize(
+    "layers,item_bytes", [(24, 4608), (36, 2048), (17, 1536), (17, 1024)]
+)
+@pytest.mark.parametrize("pattern", ["ascending", "runs", "shuffled"])
+@pytest.mark.parametrize("page_count", [1, 64, 65, 300])
+def test_dsv4_batched_write_back_copy_is_bitwise_stock(
+    layers: int, item_bytes: int, pattern: str, page_count: int
+) -> None:
+    from sglang.srt.environ import envs
+    from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
+    from sglang.srt.mem_cache.pool_host.common import (
+        ALLOC_MEMORY_FUNCS,
+        alloc_with_pin_memory,
+    )
+
+    slot = 256
+    host_pages = 4 * page_count + 16
+    device_pages = page_count + 8
+    gen = torch.Generator().manual_seed(page_count * 31 + item_bytes)
+    device_buffers = [
+        torch.randint(0, 256, (device_pages, item_bytes), dtype=torch.uint8, generator=gen).to(DEVICE)
+        for _ in range(layers)
+    ]
+    garbage = torch.randint(0, 256, (host_pages, layers, item_bytes), dtype=torch.uint8, generator=gen)
+    original_alloc = ALLOC_MEMORY_FUNCS[DEVICE]
+    ALLOC_MEMORY_FUNCS[DEVICE] = alloc_with_pin_memory
+    try:
+        pools = [
+            DeepSeekV4PagedHostPool(
+                pool_name="c4",
+                device_buffers=device_buffers,
+                item_bytes=item_bytes,
+                num_host_pages=host_pages,
+                slot_page_size=slot,
+                layout="page_first",
+                device="cpu",
+                pin_memory=True,
+            )
+            for _ in range(2)
+        ]
+    finally:
+        ALLOC_MEMORY_FUNCS[DEVICE] = original_alloc
+    assert all(pool.can_use_write_back_jit for pool in pools)
+
+    host_rows = _host_rows(pattern, page_count, host_pages, gen)
+    device_rows = torch.randperm(device_pages, generator=gen)[:page_count]
+    offsets = torch.arange(slot, dtype=torch.int64)
+    host_indices = (host_rows[:, None] * slot + offsets).reshape(-1)
+    device_indices = (device_rows[:, None] * slot + offsets).reshape(-1).to(DEVICE)
+    for pool, batched in zip(pools, (False, True)):
+        pool.kv_buffer.copy_(garbage)
+        with envs.SGLANG_OPT_HICACHE_BATCH_WRITE_BACK_COPY.override(batched):
+            pool.backup_from_device_all_layer(None, host_indices, device_indices, "kernel")
+    torch.cuda.synchronize()
+
+    stock, batched = pools[0].kv_buffer, pools[1].kv_buffer
+    assert torch.equal(stock, batched)
+    expected = torch.stack([buf[device_rows.to(DEVICE)].cpu() for buf in device_buffers], dim=1)
+    assert torch.equal(batched[host_rows], expected)
+
+
+@pytest.mark.parametrize("pattern", ["ascending", "runs", "shuffled"])
+@pytest.mark.parametrize("page_count", [1, 65, 129])
+def test_mha_batched_write_back_copy_is_bitwise_stock(pattern: str, page_count: int) -> None:
+    from sglang.kernels.ops.kvcache.hicache import transfer_hicache_all_layer_staged_lf_pf
+    from sglang.srt.environ import envs
+
+    page, layers, dim, capacity_pages = 16, 3, 256, 64
+    gen = torch.Generator().manual_seed(page_count)
+    device_tokens = (page_count + 4) * page
+    k_layers = [torch.randn(device_tokens, dim, generator=gen).to(DEVICE, torch.bfloat16) for _ in range(layers)]
+    v_layers = [torch.randn(device_tokens, dim, generator=gen).to(DEVICE, torch.bfloat16) for _ in range(layers)]
+    k_ptr = torch.tensor([t.data_ptr() for t in k_layers], dtype=torch.uint64, device=DEVICE)
+    v_ptr = torch.tensor([t.data_ptr() for t in v_layers], dtype=torch.uint64, device=DEVICE)
+    host_pages = 4 * page_count + 8
+    host_rows = _host_rows(pattern, page_count, host_pages, gen)
+    device_pages = torch.randperm(page_count + 4, generator=gen)[:page_count]
+    offsets = torch.arange(page, dtype=torch.int64)
+    dst_indices = (host_rows[:, None] * page + offsets).reshape(-1)
+    src_indices = (device_pages[:, None] * page + offsets).reshape(-1).to(DEVICE)
+    garbage = torch.randn(host_pages * page, layers, dim, generator=gen).to(torch.bfloat16)
+    outs = []
+    for batched in (False, True):
+        dst_k = garbage.clone().pin_memory()
+        dst_v = (garbage + 1).pin_memory()
+        staging_k = torch.empty(capacity_pages * page, layers, dim, dtype=torch.bfloat16, device=DEVICE)
+        staging_v = torch.empty_like(staging_k)
+        with envs.SGLANG_OPT_HICACHE_BATCH_WRITE_BACK_COPY.override(batched):
+            transfer_hicache_all_layer_staged_lf_pf(
+                k_ptr, v_ptr, src_indices, dst_indices, staging_k, staging_v, dst_k, dst_v, page_size=page
+            )
+        torch.cuda.synchronize()
+        outs.append((dst_k, dst_v))
+    assert torch.equal(outs[0][0], outs[1][0]) and torch.equal(outs[0][1], outs[1][1])
+    rows = dst_indices.view(-1, page)
+    for layer in range(layers):
+        src_cpu = src_indices.cpu()
+        assert torch.equal(outs[1][0][dst_indices, layer], k_layers[layer][src_cpu.to(DEVICE)].cpu())
+        assert torch.equal(outs[1][1][dst_indices, layer], v_layers[layer][src_cpu.to(DEVICE)].cpu())
+    assert rows.shape[0] == page_count
+
+
+# About 100 ms at 2 GHz: the write-back copy sits behind a long in-flight forward.
+_FORWARD_SLEEP_CYCLES = 200_000_000
+
+
+def test_device_ordered_write_back_orders_the_consumer_streams() -> None:
+    """Without a host wait, the forward and schedule streams write an evicted row
+    and the load-back stream reads its host copy only after the copy; with no
+    ordering at all the same work corrupts the copy (the race it prevents)."""
+    from types import SimpleNamespace
+
+    from sglang.srt.managers.cache_controller import HiCacheAck
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    n = 1 << 22
+    original = torch.randint(0, 255, (n,), dtype=torch.uint8, device=DEVICE)
+    src = torch.empty_like(original)
+    host = torch.empty(n, dtype=torch.uint8, pin_memory=True)
+    loaded = torch.empty_like(original)
+    d2h, forward, schedule, h2d = (torch.cuda.Stream() for _ in range(4))
+    cc = SimpleNamespace(
+        ack_write_queue=[],
+        write_fence_stream=forward,
+        load_fence_stream=forward,
+        l2_transfer_engine=SimpleNamespace(host_to_device_stream=h2d),
+    )
+    cache = object.__new__(UnifiedRadixCache)
+    cache._pending_write_ack_metrics = []
+    cache.metrics_collector = None
+    cache._finish_write_through_ack = lambda ack_id: cache.ongoing_write_through.pop(ack_id)
+
+    def evict_then_reuse(device_ordered: bool):
+        src.copy_(original)
+        host.zero_()
+        loaded.zero_()
+        torch.cuda.synchronize()
+        with torch.cuda.stream(schedule):
+            d2h.wait_stream(schedule)
+            with torch.cuda.stream(d2h):
+                torch.cuda._sleep(_FORWARD_SLEEP_CYCLES)
+                start, finish = torch.cuda.Event(), torch.cuda.Event()
+                start.record()
+                host.copy_(src, non_blocking=True)
+                finish.record()
+            cc.ack_write_queue.append(
+                HiCacheAck(start_event=start, finish_event=finish, node_ids=[7])
+            )
+            cache.ongoing_write_through = {7: None}
+            if device_ordered:
+                UnifiedRadixCache._finish_write_back_on_device(cache, cc)
+                assert not finish.query(), "returned only after the copy"
+                assert not cache.ongoing_write_through and not cc.ack_write_queue
+            else:
+                cc.ack_write_queue.clear()
+            with torch.cuda.stream(forward):
+                src[: n // 2].fill_(255)
+            src[n // 2 :].fill_(255)
+            with torch.cuda.stream(h2d):
+                loaded.copy_(host, non_blocking=True)
+        torch.cuda.synchronize()
+        return host.clone(), loaded.clone()
+
+    host_copy, load_back = evict_then_reuse(device_ordered=True)
+    assert torch.equal(host_copy, original.cpu())
+    assert torch.equal(load_back, original)
+    host_copy, _ = evict_then_reuse(device_ordered=False)
+    assert not torch.equal(host_copy, original.cpu())
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))

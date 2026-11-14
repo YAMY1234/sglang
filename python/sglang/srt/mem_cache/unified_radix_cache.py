@@ -180,6 +180,24 @@ COMPONENT_REGISTRY: dict[str, type[TreeComponent]] = {
 
 
 logger = logging.getLogger(__name__)
+
+
+def _write_back_consumer_streams(cc) -> list:
+    """Streams whose later work may write an evicted device row or read its host
+    copy: the caller's (the schedule stream; each forward waits on it), the
+    forward stream, the load-back stream and the legacy default stream."""
+    candidates = [
+        torch.cuda.current_stream(),
+        cc.write_fence_stream,
+        cc.load_fence_stream,
+        cc.l2_transfer_engine.host_to_device_stream,
+        torch.cuda.default_stream(),
+    ]
+    streams = {}
+    for stream in candidates:
+        if stream is not None:
+            streams.setdefault(stream.cuda_stream, stream)
+    return list(streams.values())
 device_module = get_device_module()
 
 
@@ -375,6 +393,10 @@ class UnifiedRadixCache(BasePrefixCache):
         # constructs the pipeline collaborator (None = cache mode).
         self.host_memory_mode = "cache"
         self.buffer_pipeline: Optional[BufferModePipeline] = None
+        # write_back eviction copies ordered on the device instead of by a host wait.
+        self.device_ordered_write_back = False
+        # Acks finished under that ordering whose timing waits for their copies.
+        self._pending_write_ack_metrics: list[HiCacheAck] = []
         # Session of the insert whose actions are being applied (see ``insert``).
         self.insert_session_id: Optional[str] = None
         # Write-side dedupe: beliefs about what storage already holds, so
@@ -631,6 +653,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller is not None
             and self.cache_controller.write_policy == "write_back"
         )
+        self.device_ordered_write_back = self._resolve_device_ordered_write_back()
         # Pre-seed the logical dropped-tokens series.
         if self.metrics_collector is not None and self.cache_controller is not None:
             reasons = ["host_pressure"]
@@ -4183,6 +4206,9 @@ class UnifiedRadixCache(BasePrefixCache):
         if write_back:
             # Blocking: submit what is still queued, then wait for every ack.
             cc.start_writing()
+            if self.device_ordered_write_back and not self.enable_storage:
+                self._finish_write_back_on_device(cc)
+                return
             while self.ongoing_write_through:
                 for ack in cc.ack_write_queue:
                     ack.finish_event.synchronize()
@@ -4214,6 +4240,54 @@ class UnifiedRadixCache(BasePrefixCache):
                 self._finish_write_through_ack(ack_id)
             self._log_write_ack_metrics(ack)
             finish_count -= 1
+
+    def _resolve_device_ordered_write_back(self) -> bool:
+        if not envs.SGLANG_OPT_HICACHE_DEVICE_ORDERED_WRITE_BACK.get():
+            return False
+        reason = None
+        if not self.is_write_back:
+            reason = "the write policy is not write_back"
+        elif self.buffer_pipeline is not None:
+            reason = "buffer host memory mode"
+        elif get_memory().enable_hisparse:
+            reason = "HiSparse reads the host pool outside these streams"
+        elif get_disagg().disaggregation_mode == "decode":
+            reason = "PD decode receives KV into the host pool"
+        elif not torch.cuda.is_available():
+            reason = "it needs CUDA streams"
+        if reason is not None:
+            logger.warning(
+                "SGLANG_OPT_HICACHE_DEVICE_ORDERED_WRITE_BACK ignored: %s.", reason
+            )
+            return False
+        logger.info(
+            "HiCache write_back: eviction copies are ordered on the device, the "
+            "scheduler does not wait for them (SGLANG_OPT_HICACHE_DEVICE_ORDERED_WRITE_BACK)."
+        )
+        return True
+
+    def _finish_write_back_on_device(self, cc) -> None:
+        """Finish write_back acks without a host wait: every stream that can next
+        touch an evicted device row or its new host copy first waits for the copies."""
+        self._drain_write_ack_metrics()
+        if not self.ongoing_write_through:
+            return
+        streams = _write_back_consumer_streams(cc)
+        for ack in cc.ack_write_queue:
+            for stream in streams:
+                stream.wait_event(ack.finish_event)
+            for ack_id in ack.node_ids:
+                if ack_id in self.ongoing_write_through:
+                    self._finish_write_through_ack(ack_id)
+            if self.metrics_collector is not None:
+                self._pending_write_ack_metrics.append(ack)
+        cc.ack_write_queue.clear()
+        assert len(self.ongoing_write_through) == 0
+
+    def _drain_write_ack_metrics(self) -> None:
+        pending = self._pending_write_ack_metrics
+        while pending and pending[0].finish_event.query():
+            self._log_write_ack_metrics(pending.pop(0))
 
     def _log_write_ack_metrics(self, ack: HiCacheAck) -> None:
         """Record D->H backup volume and duration for a completed write ack."""
