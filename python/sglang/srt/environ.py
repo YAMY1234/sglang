@@ -341,6 +341,10 @@ class Envs:
     SGLANG_OPT_HICACHE_GROUPED_DEVICE_FREES = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # Host-only Mamba checkpoint of a running request: read whether its ping-pong
+    # tracking slot is empty from the host-side flag instead of the device tensor,
+    # which would wait behind the in-flight forward. Same decision. Opt-in.
+    SGLANG_OPT_MAMBA_CHECKPOINT_HOST_EMPTY_FLAG = EnvRuntimeBool(False)
     # EAGLE draft extend, top-1: take the token with the sampler's split-row argmax
     # (the verify's) instead of torch.argmax's one block per row; same token unless NaN.
     SGLANG_OPT_SPEC_DRAFT_TOP1_ARGMAX = EnvRuntimeBool(
