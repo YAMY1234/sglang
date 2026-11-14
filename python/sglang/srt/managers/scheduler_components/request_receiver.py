@@ -93,6 +93,8 @@ class SchedulerRequestReceiver:
         return self.max_recv_per_poll >= 0 and num_recv_reqs >= self.max_recv_per_poll
 
     def has_pending(self) -> bool:
+        if DADP_ROUTE == "replicate":
+            return bool(DADP_REPLICA_INBOX.envelopes or DADP_REPLICA_INBOX.ready)
         return False
 
     def wait_for_progress(self) -> None:

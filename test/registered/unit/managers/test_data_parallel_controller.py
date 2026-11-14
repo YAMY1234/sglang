@@ -764,12 +764,15 @@ class TestDadpWorkloadControls(CustomTestCase):
                     )
                     self.assertEqual(broadcast.call_count, 0 if local_control else 1)
                     self.assertEqual(len(inbox.envelopes), 1 if rank == 0 else 0)
+                    self.assertEqual(receiver.has_pending(), rank == 0)
                     # The intervening existing MLP-sync delivers the same vote.
                     inbox.ready = True
+                    self.assertTrue(receiver.has_pending())
                     result = receiver._broadcast_reqs_across_ranks([])
                     self.assertEqual([r.rid for r in result], [replicas[rank].rid])
                     self.assertFalse(inbox.ready)
                     self.assertFalse(inbox.envelopes)
+                    self.assertFalse(receiver.has_pending())
                     self.assertEqual(receiver._broadcast_reqs_across_ranks([]), [])
                     self.assertEqual(broadcast.call_count, 1 if local_control else 4)
 
