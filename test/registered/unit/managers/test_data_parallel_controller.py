@@ -825,6 +825,7 @@ class TestDadpWorkloadControls(CustomTestCase):
         results = []
         for flag in ["", "1"]:
             with (
+                get_context().override_server_args(),
                 patch.object(mod, "DADP_MAX_NEW_TOKENS", flag),
                 patch.object(
                     mod,
