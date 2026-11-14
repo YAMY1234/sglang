@@ -1092,7 +1092,10 @@ class TestDadpStepLogger(CustomTestCase):
             logger.drain()
             start.elapsed_time.assert_not_called()
             logger.drain(flush=True)
-            record = json.loads(logger.path.read_text())
+            records = [json.loads(line) for line in logger.path.read_text().splitlines()]
+            dictionary, record = records
+            self.assertEqual(dictionary["request_rids"], ["r"])
+            self.assertEqual(record["batch_id"], dictionary["batch_id"])
             self.assertEqual(record["decode_seq_lens"], [42])
             self.assertEqual(record["mlp_sync_round"], 21)
             self.assertEqual(record["gpu_forward_ms"], 3.5)
@@ -1112,7 +1115,10 @@ class TestDadpStepLogger(CustomTestCase):
             with patch("torch.cuda.Event", side_effect=[start, end]):
                 logger.end(logger.begin(self._batch(), object()), object())
             logger.close()
-            record = json.loads(logger.path.read_text())
+            records = [json.loads(line) for line in logger.path.read_text().splitlines()]
+            dictionary, record = records
+            self.assertEqual(dictionary["request_rids"], ["r"])
+            self.assertEqual(record["batch_id"], dictionary["batch_id"])
             self.assertIsNone(record["gpu_forward_ms"])
             self.assertEqual(record["gpu_timing_status"], "pending_at_exit")
             start.elapsed_time.assert_not_called()
@@ -1133,6 +1139,88 @@ class TestDadpStepLogger(CustomTestCase):
                 event.assert_not_called()
             logger.close()
             self.assertEqual(logger.path.read_text(), "")
+
+
+    def test_switch_is_cached_for_256_forward_steps(self):
+        from sglang.srt.managers.scheduler_components.dadp_step_logger import (
+            DadpStepLogger,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            logger = DadpStepLogger(directory, dp_rank=0, tp_rank=0, pp_rank=0)
+            with patch.object(type(logger.disabled_file), "exists", return_value=True) as stat:
+                with patch("torch.cuda.Event") as event:
+                    for _ in range(256):
+                        self.assertIsNone(logger.begin(self._batch(), object()))
+                    stat.assert_called_once()
+                    event.assert_not_called()
+                stat.return_value = False
+                with patch("torch.cuda.Event"):
+                    self.assertIsNotNone(logger.begin(self._batch(), object()))
+                self.assertEqual(stat.call_count, 2)
+            logger.close()
+
+    def test_batch_dictionary_and_lengths_are_immutable_snapshots(self):
+        from sglang.srt.managers.scheduler_components.dadp_step_logger import (
+            DadpStepLogger,
+        )
+
+        start, end = Mock(), Mock()
+        end.query.return_value = False
+        batch = self._batch()
+        batch.reqs = [SimpleNamespace(rid=f"r{i}") for i in range(3)]
+        batch.seq_lens_cpu = torch.tensor([2047, 2048, 2049])
+        with tempfile.TemporaryDirectory() as directory:
+            logger = DadpStepLogger(directory, dp_rank=2, tp_rank=3, pp_rank=0)
+            with patch("torch.cuda.Event", side_effect=[start, end] * 3):
+                logger.end(logger.begin(batch, object()), object())
+                batch.seq_lens_cpu.add_(1)
+                logger.end(logger.begin(batch, object()), object())
+                batch.reqs[0].rid = "changed"
+                logger.end(logger.begin(batch, object()), object())
+            self.assertEqual(logger.path.read_bytes(), b"")
+            logger.close()
+            records = [json.loads(line) for line in logger.path.read_text().splitlines()]
+            dictionaries = {r["batch_id"]: r for r in records if r["schema"] == "sglang-dadp-batch/1"}
+            steps = [r for r in records if r["schema"] == "sglang-dadp-step/1"]
+            self.assertEqual(len(dictionaries), 2)
+            self.assertEqual(dictionaries[steps[0]["batch_id"]]["request_rids"], ["r0", "r1", "r2"])
+            self.assertEqual(steps[0]["batch_id"], steps[1]["batch_id"])
+            self.assertNotEqual(steps[1]["batch_id"], steps[2]["batch_id"])
+            self.assertEqual(steps[0]["decode_seq_lens"], [2047, 2048, 2049])
+            self.assertEqual(steps[1]["decode_seq_lens"], [2048, 2049, 2050])
+            seen = set()
+            for record in records:
+                self.assertEqual((record["dp_rank"], record["tp_rank"]), (2, 3))
+                if record["schema"] == "sglang-dadp-batch/1":
+                    seen.add(record["batch_id"])
+                else:
+                    self.assertIn(record["batch_id"], seen)
+                    self.assertNotIn("request_rids", record)
+                    self.assertNotIn("global_attention_pairs", record)
+                    self.assertEqual(record["gpu_timing_status"], "pending_at_exit")
+
+    def test_stream_buffers_rows_and_flushes_final_partial_batch(self):
+        from sglang.srt.managers.scheduler_components.dadp_step_logger import (
+            DadpStepLogger,
+        )
+
+        start, end = Mock(), Mock()
+        end.query.return_value = True
+        start.elapsed_time.return_value = 1.0
+        with tempfile.TemporaryDirectory() as directory:
+            logger = DadpStepLogger(directory, dp_rank=0, tp_rank=0, pp_rank=0)
+            with patch("torch.cuda.Event", side_effect=[start, end]):
+                for _ in range(65):
+                    logger.end(logger.begin(self._batch(), object()), object())
+            # The final event and short serialization buffer survive until flush.
+            logger.drain(flush=True)
+            records = [json.loads(line) for line in logger.path.read_text().splitlines()]
+            self.assertEqual(len(records), 66)
+            self.assertEqual(records[0]["schema"], "sglang-dadp-batch/1")
+            self.assertEqual([r["step"] for r in records[1:]], list(range(1, 66)))
+            self.assertTrue(all(r["gpu_timing_status"] == "complete" for r in records[1:]))
+            logger.close()
 
 
 if __name__ == "__main__":

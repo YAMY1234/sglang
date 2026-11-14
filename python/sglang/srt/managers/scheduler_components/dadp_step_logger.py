@@ -10,6 +10,11 @@ from pathlib import Path
 
 import torch
 
+try:
+    import orjson
+except ImportError:
+    orjson = None
+
 DADP_STEPLOG_DIR = os.environ.get("SGLANG_DADP_STEPLOG_DIR", "")
 _route_log_file = None
 _route_receive_round = 0
@@ -67,11 +72,15 @@ class DadpStepLogger:
         self.path = directory / (
             f"steps-{socket.gethostname()}-dp{dp_rank}-tp{tp_rank}-pp{pp_rank}-{os.getpid()}.jsonl"
         )
-        self.file = self.path.open("x", buffering=1024 * 1024)
+        self.file = self.path.open("xb", buffering=1024 * 1024)
         self.ranks = dict(dp_rank=dp_rank, tp_rank=tp_rank, pp_rank=pp_rank)
         self.pending = deque()
         self.free_events = []
         self.step = 0
+        self.disabled = False
+        self.rows = []
+        self.batch_rids = None
+        self.batch_id = 0
         self.closed = False
         atexit.register(self.close)
 
@@ -79,7 +88,9 @@ class DadpStepLogger:
         self.drain()
         self.step += 1
         # A node-local switch permits a same-server observer overhead test.
-        if self.disabled_file.exists():
+        if (self.step - 1) % 256 == 0:
+            self.disabled = self.disabled_file.exists()
+        if self.disabled:
             return None
         mode = batch.forward_mode
         decoding = (
@@ -87,7 +98,11 @@ class DadpStepLogger:
         )
         if mode.is_decode():
             decode_lens = (
-                batch.seq_lens_cpu.tolist()
+                (
+                    batch.seq_lens_cpu.numpy().copy()
+                    if orjson is not None
+                    else batch.seq_lens_cpu.tolist()
+                )
                 if batch.seq_lens_cpu is not None
                 else [r.seqlen for r in batch.reqs]
             )
@@ -103,6 +118,19 @@ class DadpStepLogger:
             decode_lens = [r.seqlen for r in batch.reqs if id(r) in decoding]
         else:
             extend, decode_lens = [], []
+        rids = tuple(r.rid for r in batch.reqs)
+        if rids != self.batch_rids:
+            self.batch_id += 1
+            self.batch_rids = rids
+            # Emit before any reference, including when CUDA events are pending.
+            self._append(
+                dict(
+                    schema="sglang-dadp-batch/1",
+                    batch_id=self.batch_id,
+                    request_rids=rids,
+                    **self.ranks,
+                )
+            )
         record = dict(
             schema="sglang-dadp-step/1",
             step=self.step,
@@ -110,7 +138,7 @@ class DadpStepLogger:
             cpu_time_ns=time.time_ns(),
             cpu_monotonic_ns=time.monotonic_ns(),
             forward_mode=mode.name,
-            request_rids=[r.rid for r in batch.reqs],
+            batch_id=self.batch_id,
             extend=extend,
             decode_seq_lens=decode_lens,
             **self.ranks,
@@ -149,9 +177,31 @@ class DadpStepLogger:
             else:
                 break
             self.pending.popleft()
-            self.file.write(json.dumps(record, separators=(",", ":")) + "\n")
+            self._append(record)
         if closing or flush:
+            self._write_rows()
             self.file.flush()
+
+    def _append(self, record):
+        self.rows.append(record)
+        if len(self.rows) >= 64:
+            self._write_rows()
+
+    def _write_rows(self):
+        if not self.rows:
+            return
+        if orjson is not None:
+            lines = (
+                orjson.dumps(record, option=orjson.OPT_SERIALIZE_NUMPY)
+                for record in self.rows
+            )
+        else:
+            lines = (
+                json.dumps(record, separators=(",", ":")).encode()
+                for record in self.rows
+            )
+        self.file.write(b"\n".join(lines) + b"\n")
+        self.rows.clear()
 
     def close(self):
         if not self.closed:
