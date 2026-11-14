@@ -71,7 +71,7 @@ class TestWireUnchanged(unittest.TestCase):
         name = "_get_fallback_tensor" if fallback else "_get_local_tensor"
         method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == name)
         env = dict(
-            torch=SimpleNamespace(int64="int64", tensor=lambda value, **kw: value),
+            torch=SimpleNamespace(Tensor=list, int64="int64", tensor=lambda value, **kw: value),
             DADP_ROUTE=route,
             DADP_REPLICA_INBOX=SimpleNamespace(envelopes=[object()]),
             ForwardMode=SimpleNamespace(IDLE=SimpleNamespace(value=IDLE)),
