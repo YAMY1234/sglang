@@ -35,6 +35,7 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers import deep_gemm_wrapper, offloader
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
+from sglang.srt.layers.quantization.mxfp8_input import batch_invariant_or_deterministic
 from sglang.srt.runtime_context import (
     get_exec,
     get_platform,
@@ -2248,11 +2249,13 @@ def flashinfer_mxfp8_blockscaled_linear(
         else:
             output_dtype = torch.bfloat16
 
+    # Not keyed on pin_tactic: the table pins its own tactics, and DSV4.1 keeps
+    # pin_tactic=True whenever its prefill autotune pass is skipped.
     if (
         backend == "cute-dsl"
-        and not pin_tactic
         and envs.SGLANG_OPT_SM107_MXFP8_DENSE_TABLE.get()
         and get_platform().device_sm == 107
+        and not batch_invariant_or_deterministic()
     ):
         from sglang.kernels.ops.gemm.mxfp8_sm107_dense import decode_linear
 
