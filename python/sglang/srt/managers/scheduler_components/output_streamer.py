@@ -17,13 +17,13 @@ from typing import (
 
 import torch
 import zmq
-
 from sglang.srt.beam_search.output import (
     beam_completion_tokens,
     pack_beam_search_output,
 )
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.managers.dadp import DADP_ROUTE, is_dadp_shadow
 from sglang.srt.managers.incremental_detokenize import build_detokenize_header
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
@@ -236,6 +236,15 @@ class SchedulerOutputStreamer:
         skip_req: Optional[Req] = None,
     ):
         """Stream the output to detokenizer."""
+        if DADP_ROUTE == "replicate":
+            visible = []
+            for req in reqs:
+                if is_dadp_shadow(req.rid):
+                    if req.finished():
+                        req.finished_output = True
+                else:
+                    visible.append(req)
+            reqs = visible
         if self.defer_outputs:
             # The scheduler releases held requests after their work completes.
             reqs = [req for req in reqs if not req.defer_output]

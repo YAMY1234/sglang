@@ -57,7 +57,6 @@ import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
-
 from sglang.srt.beam_search.output import (
     build_beam_search_out,
     try_build_beam_search_out_dict,
@@ -87,6 +86,7 @@ from sglang.srt.layers.joint_schema_head import (
 )
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
+from sglang.srt.managers.dadp import DADP_MAX_NEW_TOKENS, clamp_dadp_max_new_tokens
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.embed_types import (
     PositionalEmbeds,
@@ -1664,6 +1664,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             sampling_kwargs["custom_params"] = custom_params
         sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
+        if DADP_MAX_NEW_TOKENS and isinstance(obj, GenerateReqInput):
+            clamp_dadp_max_new_tokens(sampling_params)
         sampling_params.verify(self.model_config.vocab_size)
         _validate_watermark_request(sampling_params)
 

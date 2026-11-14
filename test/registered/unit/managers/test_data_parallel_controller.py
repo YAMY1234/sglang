@@ -15,12 +15,12 @@ those.
 import threading
 import time
 import unittest
+from array import array
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import msgspec.structs
-
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -36,6 +36,7 @@ from sglang.srt.managers.data_parallel_controller import (
 from sglang.srt.managers.io_struct import ActiveRanksOutput
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -639,6 +640,162 @@ class TestRefreshLoadBudgetThrottle(CustomTestCase):
             after_burst,
             "a stale-timestamp snapshot must not wipe the speculative state",
         )
+
+
+class TestDadpWorkloadControls(CustomTestCase):
+    @staticmethod
+    def _generate(rid="user", length=8, routed_dp_rank=None):
+        return io_struct.TokenizedGenerateReqInput(
+            rid=rid,
+            input_text=None,
+            input_ids=array("q", range(length)),
+            input_embeds=None,
+            mm_inputs=None,
+            token_type_ids=None,
+            sampling_params=SamplingParams(max_new_tokens=16, ignore_eos=True),
+            return_logprob=False,
+            logprob_start_len=-1,
+            top_logprobs_num=0,
+            token_ids_logprob=None,
+            stream=True,
+            routed_dp_rank=routed_dp_rank,
+        )
+
+    def test_replication_has_one_visible_original_and_abort_covers_shadows(self):
+        from sglang.srt.managers.dadp import is_dadp_shadow
+
+        ctl = _make_controller(4)
+        req = self._generate(routed_dp_rank=2)
+        with patch(
+            "sglang.srt.managers.data_parallel_controller.DADP_ROUTE", "replicate"
+        ):
+            ctl.dispatch_dadp(req)
+        envelope = ctl.workers[0].send_pyobj.call_args.args[0]
+        self.assertIsInstance(envelope, io_struct.DadpReplicateReqInput)
+        self.assertEqual([r.routed_dp_rank for r in envelope.replicas], [0, 1, 2, 3])
+        self.assertEqual(
+            [r.rid for r in envelope.replicas if not is_dadp_shadow(r.rid)], ["user"]
+        )
+        self.assertEqual(envelope.replicas[2].rid, "user")
+        for replica in envelope.replicas:
+            self.assertEqual(replica.input_ids, req.input_ids)
+            self.assertTrue(io_struct.AbortReq(rid="user").matches(replica.rid))
+            self.assertIsNot(replica.sampling_params, req.sampling_params)
+        for worker in ctl.workers[1:]:
+            worker.send_pyobj.assert_not_called()
+
+    def test_replication_skips_inactive_ranks_and_checks_primary(self):
+        ctl = _make_controller(4)
+        ctl._active_workers = [0, 2]
+        with patch(
+            "sglang.srt.managers.data_parallel_controller.DADP_ROUTE", "replicate"
+        ):
+            ctl.dispatch_dadp(self._generate())
+            envelope = ctl.workers[0].send_pyobj.call_args.args[0]
+            self.assertEqual([r.routed_dp_rank for r in envelope.replicas], [0, 2])
+            with self.assertRaisesRegex(ValueError, "not active"):
+                ctl.dispatch_dadp(self._generate(routed_dp_rank=1))
+
+    def test_replication_envelope_roundtrips_msgpack(self):
+        from sglang.srt.managers.dadp import make_dadp_replicas
+
+        req = self._generate()
+        envelope = io_struct.DadpReplicateReqInput(
+            replicas=make_dadp_replicas(req, [0, 1], 0)
+        )
+        result = io_struct.msgpack_decode(io_struct.msgpack_encode(envelope))
+        self.assertEqual(
+            [r.rid for r in result.replicas], [r.rid for r in envelope.replicas]
+        )
+        self.assertEqual(result.replicas[1].sampling_params.max_new_tokens, 16)
+
+    def test_heavy_threshold_overrides_explicit_route_only_for_long_requests(self):
+        ctl = _make_controller(4)
+        ctl.dispatching = MagicMock()
+        with (
+            patch(
+                "sglang.srt.managers.data_parallel_controller.DADP_ROUTE",
+                "heavy_to_rank0",
+            ),
+            patch.dict("os.environ", {"SGLANG_DADP_HEAVY_ISL": "8"}),
+        ):
+            long = self._generate(length=8, routed_dp_rank=3)
+            short = self._generate(length=7, routed_dp_rank=3)
+            ctl.dispatch_dadp(long)
+            ctl.dispatch_dadp(short)
+        ctl.workers[0].send_pyobj.assert_called_once_with(long, flags=0, protocol=5)
+        ctl.dispatching.assert_called_once_with(short)
+
+    def test_heavy_input_embeds_uses_row_count(self):
+        ctl = _make_controller(4)
+        req = self._generate()
+        req.input_ids = None
+        req.input_embeds = [[0.0]] * 8
+        with (
+            patch(
+                "sglang.srt.managers.data_parallel_controller.DADP_ROUTE",
+                "heavy_to_rank0",
+            ),
+            patch.dict("os.environ", {"SGLANG_DADP_HEAVY_ISL": "8"}),
+        ):
+            ctl.dispatch_dadp(req)
+        self.assertEqual(ctl.workers[0].send_pyobj.call_count, 1)
+
+    def test_prefill_cap_preserves_other_sampling_fields_and_zero(self):
+        from sglang.srt.managers.dadp import clamp_dadp_max_new_tokens
+
+        for limit, expected in [(16, 1), (None, 1), (0, 0)]:
+            params = SamplingParams(
+                max_new_tokens=limit, ignore_eos=True, temperature=0.2
+            )
+            before = vars(params).copy()
+            clamp_dadp_max_new_tokens(params)
+            self.assertEqual(params.max_new_tokens, expected)
+            self.assertEqual(
+                {k: v for k, v in vars(params).items() if k != "max_new_tokens"},
+                {k: v for k, v in before.items() if k != "max_new_tokens"},
+            )
+
+    def test_shadow_abort_and_release_never_reach_frontend(self):
+        from sglang.srt.managers.scheduler_components.output_sender import SenderWrapper
+
+        socket = MagicMock()
+        sender = SenderWrapper(socket)
+        with patch(
+            "sglang.srt.managers.scheduler_components.output_sender.DADP_ROUTE",
+            "replicate",
+        ):
+            sender.send_output(io_struct.AbortReq(rid="user__dadp_shadow_rank_1"))
+            sender.send_output(
+                io_struct.DetokenizeReleaseReq(rid="user__dadp_shadow_rank_1")
+            )
+            socket.send_pyobj.assert_not_called()
+            sender.send_output(io_struct.AbortReq(rid="user"))
+        self.assertEqual(socket.send_pyobj.call_count, 1)
+
+    def test_shadow_stream_is_suppressed_before_detokenization(self):
+        from sglang.srt.managers.scheduler_components.output_streamer import (
+            SchedulerOutputStreamer,
+        )
+
+        shadow = SimpleNamespace(
+            rid="user__dadp_shadow_rank_1", finished=lambda: True, finished_output=False
+        )
+        original = SimpleNamespace(rid="user")
+        streamer = SimpleNamespace(
+            defer_outputs=False,
+            is_generation=True,
+            _stream_output_generation=MagicMock(),
+        )
+        with patch(
+            "sglang.srt.managers.scheduler_components.output_streamer.DADP_ROUTE",
+            "replicate",
+        ):
+            SchedulerOutputStreamer.stream_output(streamer, [shadow, original], False)
+        streamer._stream_output_generation.assert_called_once_with(
+            [original], False, None
+        )
+        self.assertTrue(shadow.finished_output)
 
 
 if __name__ == "__main__":

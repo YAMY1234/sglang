@@ -1328,6 +1328,12 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
         self.time_stats = unwrap_from_pickle(self.time_stats)
 
 
+class DadpReplicateReqInput(BaseReq, kw_only=True):
+    # A control-channel envelope: all attention-DP ranks admit the same cohort
+    # at the same receive boundary, even with local control broadcast enabled.
+    replicas: List[TokenizedGenerateReqInput]
+
+
 class BatchTokenizedGenerateReqInput(BaseBatchReq, kw_only=True):
     # The batch of tokenized requests
     # Routing for request i is batch[i].http_worker_ipc, not http_worker_ipcs[i].

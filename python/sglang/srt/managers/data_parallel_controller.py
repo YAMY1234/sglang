@@ -16,6 +16,7 @@
 import faulthandler
 import logging
 import multiprocessing as mp
+import os
 import signal
 import threading
 import time
@@ -28,7 +29,6 @@ from multiprocessing.connection import Connection, wait
 import psutil
 import setproctitle
 import zmq
-
 from sglang.srt.elastic_ep.topology import (
     attn_replica_size,
     physical_ep_rank_to_dp_rank,
@@ -37,11 +37,17 @@ from sglang.srt.elastic_ep.topology import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
+from sglang.srt.managers.dadp import (
+    DADP_ROUTE,
+    make_dadp_replicas,
+    validate_dadp_config,
+)
 from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     BlockReqInput,
+    DadpReplicateReqInput,
     ElasticScaleUpdateReq,
     ProfileReq,
     TokenizedEmbeddingReqInput,
@@ -174,6 +180,12 @@ class DataParallelController:
         )
         self.run_scheduler_process_func = run_scheduler_process_func
         self.prelaunched_schedulers = prelaunched_schedulers
+        validate_dadp_config()
+        if DADP_ROUTE == "replicate":
+            if not get_parallel().attn_dp_enabled or get_parallel().pp_size != 1:
+                raise ValueError("DADP replication requires attention DP and PP=1")
+            if get_exec().moe.elastic_ep_backend is not None:
+                raise ValueError("DADP replication does not support elastic EP")
 
         # Init inter-process communication
         self.context = zmq.Context(1 + get_parallel().num_dp_ranks)
@@ -365,10 +377,34 @@ class DataParallelController:
         req.time_stats = wrap_as_pickle(time_stats)
         if is_health_check:
             self.dispatch_health_check(req)
+        elif isinstance(req, TokenizedGenerateReqInput) and DADP_ROUTE:
+            self.dispatch_dadp(req)
         else:
             self.dispatching(req)
         req.time_stats = time_stats
         req.time_stats.set_dp_dispatch_finish_time()
+
+    def dispatch_dadp(self, req: TokenizedGenerateReqInput):
+        if DADP_ROUTE == "replicate":
+            active = self._active_workers
+            if not active or active[0] != 0:
+                raise ValueError("DADP replication requires an active DP rank 0")
+            primary = req.routed_dp_rank if req.routed_dp_rank is not None else 0
+            if primary not in active:
+                raise ValueError(f"DP rank {primary} is not active.")
+            replicas = make_dadp_replicas(req, active, primary)
+            sock_send(self.workers[0], DadpReplicateReqInput(replicas=replicas))
+            return
+        if DADP_ROUTE == "heavy_to_rank0":
+            length = len(
+                req.input_ids if req.input_ids is not None else req.input_embeds
+            )
+            if length >= int(os.environ["SGLANG_DADP_HEAVY_ISL"]):
+                if 0 not in self._active_workers:
+                    raise ValueError("DP rank 0 is not active.")
+                sock_send(self.workers[0], req)
+                return
+        self.dispatching(req)
 
     def dispatch_batch_generate(self, batch_req: BatchTokenizedGenerateReqInput):
         has_user_request = any(

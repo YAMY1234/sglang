@@ -1,7 +1,7 @@
 from typing import Optional, Union
 
 import zmq
-
+from sglang.srt.managers.dadp import DADP_ROUTE, is_dadp_shadow
 from sglang.srt.managers.io_struct import BaseBatchReq, BaseReq, sock_send
 
 
@@ -16,6 +16,9 @@ class SenderWrapper:
     ):
         if self.socket is None:
             return
+        if DADP_ROUTE == "replicate" and isinstance(output, BaseReq):
+            if output.rid is not None and is_dadp_shadow(output.rid):
+                return
 
         http_worker_ipc = getattr(recv_obj, "http_worker_ipc", None)
         if (
