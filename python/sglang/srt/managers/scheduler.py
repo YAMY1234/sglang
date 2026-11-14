@@ -67,15 +67,17 @@ import psutil  # isort: skip
 import setproctitle
 import torch
 import torch.distributed
+from torch.distributed import barrier
+
 from sglang.srt.managers.scheduler_components.dadp_step_logger import (
     DADP_STEPLOG_DIR,
     DadpStepLogger,
 )
-from torch.distributed import barrier
 
 if TYPE_CHECKING:
-    from sglang.srt.model_executor.model_runner import ModelRunner
     from torch.cuda import Stream as CudaStream
+
+    from sglang.srt.model_executor.model_runner import ModelRunner
 
 try:
     from sglang.kernels.ops.mamba.triton_ops import (

@@ -15,6 +15,8 @@ from typing import (
 
 import torch
 import zmq
+from torch.distributed import ReduceOp, all_reduce, barrier
+
 from sglang.srt.disaggregation.utils import prepare_abort
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.environ import envs
@@ -48,7 +50,6 @@ from sglang.srt.utils import (
     broadcast_pyobj,
     point_to_point_pyobj,
 )
-from torch.distributed import ReduceOp, all_reduce, barrier
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
