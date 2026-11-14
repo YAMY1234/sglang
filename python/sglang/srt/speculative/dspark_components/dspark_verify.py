@@ -29,6 +29,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     build_ring_commit_inject_layout,
     scatter_compact_to_strided_into,
 )
+from sglang.kernels.ops.speculative.dspark.forced_rows import fill_forced_rows
 from sglang.kernels.ops.speculative.dspark.inverse_cdf import InverseCdfCounters
 from sglang.kernels.ops.speculative.dspark.sharded_accept_hip import (
     accept_sampling_sharded,
@@ -107,6 +108,16 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
     return True
 
 
+_forced_row_fill_logged = False
+
+
+def _log_forced_row_fill_once() -> None:
+    global _forced_row_fill_logged
+    if not _forced_row_fill_logged:
+        _forced_row_fill_logged = True
+        logger.info("DSpark forced verify rows: one-hot fill of the forced rows only.")
+
+
 def force_verify_rows(
     next_token_logits: torch.Tensor, forced_tokens: torch.Tensor, vocab_start: int = 0
 ) -> None:
@@ -118,6 +129,16 @@ def force_verify_rows(
     under any temperature; the other rows keep their logits. vocab_start offsets
     the token into logits that hold one vocab shard.
     """
+    if (
+        envs.SGLANG_OPT_DSPARK_FORCED_ROW_FILL.get()
+        and next_token_logits.is_cuda
+        and next_token_logits.stride(1) == 1
+        and forced_tokens.dim() == 2
+        and forced_tokens.numel() <= next_token_logits.shape[0]
+    ):
+        _log_forced_row_fill_once()
+        fill_forced_rows(next_token_logits, forced_tokens, vocab_start)
+        return
     rows = forced_tokens.reshape(-1) - vocab_start
     logits = next_token_logits[: rows.shape[0]]
     forced = (forced_tokens.reshape(-1) >= 0).unsqueeze(1)

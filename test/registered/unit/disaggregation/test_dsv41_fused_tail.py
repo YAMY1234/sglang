@@ -165,6 +165,82 @@ class TestForceVerifyRows(CustomTestCase):
                 self.assertTrue(torch.equal(logits[row], original[row]), row)
 
 
+class TestForcedRowFill(CustomTestCase):
+    """SGLANG_OPT_DSPARK_FORCED_ROW_FILL writes only the forced rows; the logits
+    must stay bitwise equal to the masked fill over every row."""
+
+    VOCAB = 129280
+
+    def _both(self, logits, forced, vocab_start=0):
+        reference = logits.clone()
+        with envs.SGLANG_OPT_DSPARK_FORCED_ROW_FILL.override(False):
+            force_verify_rows(reference, forced, vocab_start=vocab_start)
+        with envs.SGLANG_OPT_DSPARK_FORCED_ROW_FILL.override(True):
+            force_verify_rows(logits, forced, vocab_start=vocab_start)
+        return logits, reference
+
+    def _assert_bitwise(self, got, want):
+        bits = torch.int16 if got.element_size() == 2 else torch.int32
+        self.assertTrue(torch.equal(got.view(bits), want.view(bits)))
+
+    def _forced(self, bs, width, kind, vocab, gen, device):
+        tokens = torch.randint(0, vocab, (bs, width), generator=gen, device=device)
+        if kind == "none":
+            mask = torch.zeros(bs, width, dtype=torch.bool, device=device)
+        elif kind == "all":
+            mask = torch.ones(bs, width, dtype=torch.bool, device=device)
+        else:
+            mask = torch.rand(bs, width, generator=gen, device=device) < 0.3
+        filler = torch.where(
+            torch.rand(bs, width, generator=gen, device=device) < 0.5, -1, -2
+        )
+        return torch.where(mask, tokens, filler)
+
+    def test_cpu_keeps_the_masked_fill(self):
+        gen = torch.Generator().manual_seed(0)
+        logits = torch.randn(3 * WIDTH + 2, 50, generator=gen)
+        forced = self._forced(3, WIDTH, "mixed", 50, gen, "cpu")
+        got, want = self._both(logits, forced)
+        self._assert_bitwise(got, want)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "the forced-row fill is a CUDA kernel")
+    def test_matches_the_masked_fill_on_random_inputs(self):
+        gen = torch.Generator(device="cuda").manual_seed(0)
+        for dtype in (torch.bfloat16, torch.float32):
+            for bs, width, kind, pad_rows, pad_cols in (
+                (212, 4, "none", 0, 0),
+                (212, 4, "all", 0, 0),
+                (212, 4, "mixed", 0, 0),
+                (265, 4, "mixed", 3, 64),
+                (5, WIDTH, "mixed", 2, 0),
+                (1, 4, "all", 0, 64),
+            ):
+                buf = torch.randn(
+                    bs * width + pad_rows, self.VOCAB + pad_cols, generator=gen, device="cuda"
+                ).to(dtype)
+                buf[0, :8] = torch.tensor(
+                    [float("nan"), float("inf"), float("-inf"), -0.0, 0.0, 1, 2, 3]
+                )
+                padding = buf[:, self.VOCAB :].clone()
+                logits = buf[:, : self.VOCAB]
+                forced = self._forced(bs, width, kind, self.VOCAB, gen, "cuda")
+                got, want = self._both(logits, forced)
+                self._assert_bitwise(got, want)
+                self._assert_bitwise(buf[:, self.VOCAB :], padding)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "the forced-row fill is a CUDA kernel")
+    def test_draft_rows_shard_and_column_slice(self):
+        gen = torch.Generator(device="cuda").manual_seed(1)
+        bs, gamma, shard = 64, 3, 32320
+        forced = self._forced(bs, gamma + 1, "mixed", 4 * shard, gen, "cuda")
+        for start in (0, shard, 3 * shard):
+            draft = torch.randn(bs + 2, gamma, shard, generator=gen, device="cuda")
+            view = draft[:bs].view(bs * gamma, shard)
+            got, want = self._both(view, forced[:, :gamma], vocab_start=start)
+            self._assert_bitwise(got, want)
+            self.assertTrue(torch.isneginf(view[forced[:, :gamma].reshape(-1) >= 0]).any())
+
+
 class TestFeedKeepsItsWindow(CustomTestCase):
     """Decode retires window rows behind seqlen - 1. A fed tail's seqlen is the
     whole prompt while its KV still stands at the tail, so retiring then frees

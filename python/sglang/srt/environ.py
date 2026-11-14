@@ -629,6 +629,9 @@ class Envs:
     # DSpark's block-wise resample and local Markov draft steps draw by inverse CDF
     # (inverse_cdf.py): one uniform per row instead of a Gumbel-max over the vocab.
     SGLANG_OPT_DSPARK_INVERSE_CDF_SAMPLING = EnvBool(False)
+    # Fused-tail forced verify rows (dspark_verify.force_verify_rows) are made one-hot by
+    # a Triton kernel that writes only the forced rows, instead of a masked fill of all rows.
+    SGLANG_OPT_DSPARK_FORCED_ROW_FILL = EnvBool(False)
     # The deferred draft KV store's staging (write locations, positions, state slots,
     # commit lengths) in one Triton launch instead of four copies and a fill.
     SGLANG_OPT_DSV41_DSPARK_ONE_LAUNCH_COMMIT_STAGE = EnvBool(
