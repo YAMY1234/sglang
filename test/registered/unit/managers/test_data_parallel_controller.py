@@ -710,7 +710,7 @@ class TestDadpWorkloadControls(CustomTestCase):
         self.assertEqual(result.replicas[1].sampling_params.max_new_tokens, 16)
 
     def test_replicas_enter_each_rank_at_one_global_receive_boundary(self):
-        from sglang.srt.managers.dadp import make_dadp_replicas
+        from sglang.srt.managers.dadp import DadpReplicaInbox, make_dadp_replicas
         from sglang.srt.managers.scheduler_components import request_receiver as mod
 
         replicas = make_dadp_replicas(self._generate(), [0, 1], 0)
@@ -718,6 +718,7 @@ class TestDadpWorkloadControls(CustomTestCase):
         receiver = mod.SchedulerRequestReceiver.__new__(mod.SchedulerRequestReceiver)
         for rank in [0, 1]:
             for local_control in [True, False]:
+                inbox = DadpReplicaInbox()
                 with (
                     self.subTest(rank=rank, local_control=local_control),
                     patch.object(
@@ -728,6 +729,7 @@ class TestDadpWorkloadControls(CustomTestCase):
                         ),
                     ),
                     patch.object(mod, "DADP_ROUTE", "replicate"),
+                    patch.object(mod, "DADP_REPLICA_INBOX", inbox),
                     patch.object(
                         mod,
                         "get_parallel",
@@ -747,14 +749,45 @@ class TestDadpWorkloadControls(CustomTestCase):
                         mod, "attn_cp_tp_broadcast_pyobj", side_effect=lambda x: x
                     ),
                     patch.object(
-                        mod, "broadcast_pyobj", side_effect=[[envelope], []]
+                        mod,
+                        "broadcast_pyobj",
+                        side_effect=(
+                            [[envelope]] if local_control else [[], [envelope], [], []]
+                        ),
                     ) as broadcast,
                 ):
-                    result = receiver._broadcast_reqs_across_ranks(
-                        [envelope] if rank == 0 else []
+                    self.assertEqual(
+                        receiver._broadcast_reqs_across_ranks(
+                            [envelope] if rank == 0 else []
+                        ),
+                        [],
                     )
+                    self.assertEqual(broadcast.call_count, 0 if local_control else 1)
+                    self.assertEqual(len(inbox.envelopes), 1 if rank == 0 else 0)
+                    # The intervening existing MLP-sync delivers the same vote.
+                    inbox.ready = True
+                    result = receiver._broadcast_reqs_across_ranks([])
                     self.assertEqual([r.rid for r in result], [replicas[rank].rid])
-                    self.assertEqual(broadcast.call_count, 1 if local_control else 2)
+                    self.assertFalse(inbox.ready)
+                    self.assertFalse(inbox.envelopes)
+                    self.assertEqual(receiver._broadcast_reqs_across_ranks([]), [])
+                    self.assertEqual(broadcast.call_count, 1 if local_control else 4)
+
+    def test_abort_deferred_with_envelopes_is_replayed_after_admission(self):
+        from sglang.srt.managers.dadp import DadpReplicaInbox, make_dadp_replicas
+
+        replicas = make_dadp_replicas(self._generate(), [0, 1], 0)
+        envelope = io_struct.DadpReplicateReqInput(replicas=replicas)
+        abort = io_struct.AbortReq(rid=replicas[0].rid)
+        inbox = DadpReplicaInbox()
+        inbox.defer([envelope], [])
+        inbox.defer([], [abort])
+        received = inbox.take()
+        self.assertIs(received[0], envelope)
+        self.assertIs(received[1], abort)
+        self.assertTrue(all(abort.matches(r.rid) for r in replicas))
+        self.assertFalse(inbox.envelopes)
+        self.assertFalse(inbox.aborts)
 
     def test_heavy_threshold_overrides_explicit_route_only_for_long_requests(self):
         ctl = _make_controller(4)

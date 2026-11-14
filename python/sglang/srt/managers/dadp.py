@@ -12,6 +12,32 @@ DADP_MAX_NEW_TOKENS = os.environ.get("SGLANG_DADP_MAX_NEW_TOKENS", "")
 DADP_SHADOW_SUFFIX = "__dadp_shadow_rank_"
 
 
+class DadpReplicaInbox:
+    """Hold rank-0 envelopes until an existing MLP-sync notifies every rank."""
+
+    def __init__(self):
+        self.envelopes = []
+        self.aborts = []
+        self.ready = False
+
+    def defer(self, envelopes, aborts):
+        self.envelopes.extend(envelopes)
+        if self.envelopes:
+            # An abort can arrive before the deferred request is admitted.
+            # Replay it after admission as well as on the normal control path.
+            self.aborts.extend(aborts)
+
+    def take(self):
+        result = self.envelopes + self.aborts
+        self.envelopes = []
+        self.aborts = []
+        self.ready = False
+        return result
+
+
+DADP_REPLICA_INBOX = DadpReplicaInbox()
+
+
 def is_dadp_shadow(rid: str) -> bool:
     _, marker, rank = rid.rpartition(DADP_SHADOW_SUFFIX)
     return bool(marker and rank.isdecimal())

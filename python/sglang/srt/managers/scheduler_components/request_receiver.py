@@ -21,7 +21,7 @@ from torch.distributed import ReduceOp, all_reduce, barrier
 from sglang.srt.disaggregation.utils import prepare_abort
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.environ import envs
-from sglang.srt.managers.dadp import DADP_ROUTE
+from sglang.srt.managers.dadp import DADP_REPLICA_INBOX, DADP_ROUTE
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchTokenizedEmbeddingReqInput,
@@ -201,34 +201,49 @@ class SchedulerRequestReceiver:
         if get_parallel().attn_dp_enabled:
             if DADP_ROUTE == "replicate":
                 tp_group = get_parallel().tp_group
-                envelopes = (
-                    [r for r in recv_reqs or [] if isinstance(r, DadpReplicateReqInput)]
-                    if tp_group.rank == 0
-                    else None
-                )
-                if get_parallel().tp_size != 1:
-                    if DADP_STEPLOG_DIR:
-                        broadcast_start = time.perf_counter()
-                    envelopes = broadcast_pyobj(
-                        envelopes,
-                        tp_group.rank,
-                        tp_group.cpu_group,
-                        src=tp_group.ranks[0],
+                inbox = DADP_REPLICA_INBOX
+                if tp_group.rank == 0:
+                    inbox.defer(
+                        [
+                            r
+                            for r in recv_reqs or []
+                            if isinstance(r, DadpReplicateReqInput)
+                        ],
+                        [r for r in recv_reqs or [] if isinstance(r, AbortReq)],
                     )
-                    if DADP_STEPLOG_DIR:
-                        record_dadp_route_broadcast(
-                            time.perf_counter() - broadcast_start, len(envelopes or [])
-                        )
                 if recv_reqs is not None:
                     recv_reqs = [
                         r for r in recv_reqs if not isinstance(r, DadpReplicateReqInput)
                     ]
-                    for envelope in envelopes or []:
-                        recv_reqs.extend(
-                            r
-                            for r in envelope.replicas
-                            if r.routed_dp_rank == get_parallel().attn_dp_rank
+                # All ranks consume the same pending vote from the previous
+                # MLP-sync. Empty receive rounds add no global broadcast.
+                if inbox.ready or (get_parallel().tp_size == 1 and inbox.envelopes):
+                    envelopes = inbox.take() if tp_group.rank == 0 else None
+                    if DADP_STEPLOG_DIR:
+                        broadcast_start = time.perf_counter()
+                    if get_parallel().tp_size != 1:
+                        envelopes = broadcast_pyobj(
+                            envelopes,
+                            tp_group.rank,
+                            tp_group.cpu_group,
+                            src=tp_group.ranks[0],
                         )
+                    inbox.ready = False
+                    if DADP_STEPLOG_DIR:
+                        record_dadp_route_broadcast(
+                            time.perf_counter() - broadcast_start,
+                            sum(isinstance(r, DadpReplicateReqInput) for r in envelopes),
+                        )
+                    if recv_reqs is not None:
+                        for envelope in envelopes:
+                            if isinstance(envelope, DadpReplicateReqInput):
+                                recv_reqs.extend(
+                                    r
+                                    for r in envelope.replicas
+                                    if r.routed_dp_rank == get_parallel().attn_dp_rank
+                                )
+                            else:
+                                recv_reqs.append(envelope)
             if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
                 work_reqs, control_reqs = self._split_work_and_control_reqs(recv_reqs)
                 work_reqs.extend(local_reqs)

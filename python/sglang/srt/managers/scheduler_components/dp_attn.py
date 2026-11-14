@@ -17,6 +17,7 @@ from sglang.srt.layers.dp_attention import (
     world_dp_gather_enabled,
 )
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+from sglang.srt.managers.dadp import DADP_REPLICA_INBOX, DADP_ROUTE
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler_components.dadp_step_logger import DADP_STEPLOG_DIR
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
@@ -206,6 +207,11 @@ class MLPSyncBatchInfo:
                 self.attention_pairs,
                 int(self.is_shutting_down),
                 self.drain_state,
+                *(
+                    [int(bool(DADP_REPLICA_INBOX.envelopes))]
+                    if DADP_ROUTE == "replicate"
+                    else []
+                ),
             ],
             device=device,
             dtype=dtype,
@@ -227,6 +233,7 @@ class MLPSyncBatchInfo:
                 0,  # attention_pairs
                 0,  # is_shutting_down
                 DRAIN_STATE_NO_LISTENER,  # drain_state
+                *([0] if DADP_ROUTE == "replicate" else []),
             ],
             device=device,
             dtype=dtype,
@@ -695,6 +702,8 @@ def prepare_mlp_sync_batch_raw(
             local_forward_mode=local_forward_mode,
         )
     skip_all_gather = should_skip_scheduler_all_gather(num_dp_ranks)
+    if DADP_ROUTE == "replicate" and num_dp_ranks > 1 and skip_all_gather:
+        raise ValueError("DADP replication requires scheduler MLP-sync all-gather")
 
     mlp_sync_info = MLPSyncBatchInfo(
         num_dp_ranks=num_dp_ranks,
@@ -727,6 +736,8 @@ def prepare_mlp_sync_batch_raw(
         )
 
     metadata_ready = mlp_sync_info.tp0_info_cpu is not None
+    if DADP_ROUTE == "replicate" and metadata_ready:
+        DADP_REPLICA_INBOX.ready = bool(mlp_sync_info.tp0_info_cpu[:, 13].max())
     if shutdown_vote is not None and metadata_ready:
         shutdown_vote.any = mlp_sync_info.any_shutting_down
     if drain_column is not None and metadata_ready:

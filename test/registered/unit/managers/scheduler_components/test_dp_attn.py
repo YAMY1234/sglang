@@ -102,6 +102,7 @@ class TestDPBalanceStats(CustomTestCase):
         get_idle_batch=None,
         sync_wait_carry=None,
         wait_seconds=None,
+        peer_dadp_pending=False,
     ):
         if reqs is None:
             # One-token rows, the shortest a decode row can be.
@@ -130,6 +131,8 @@ class TestDPBalanceStats(CustomTestCase):
             peer[10] = (
                 peer_tokens if peer_attention_pairs is None else peer_attention_pairs
             )
+            if local.numel() == 14:
+                peer[13] = int(peer_dadp_pending)
             output.copy_(torch.stack([local, peer]).flatten())
 
         # all_gather reads the clock once before and once after the collective.
@@ -216,6 +219,51 @@ class TestDPBalanceStats(CustomTestCase):
                 ForwardMode.DECODE, local_tokens=2, peer_tokens=4
             )
         self.assertFalse(hasattr(result, "dadp_sync_metadata"))
+
+    def test_dadp_nonreplicate_gather_rows_match_baseline(self):
+        info = dp_attn.MLPSyncBatchInfo(
+            num_dp_ranks=2, tp_size=1, cp_size=1,
+            num_tokens=3, num_tokens_for_logprob=2,
+            can_run_decode_cuda_graph=True, can_run_draft_cuda_graph=True,
+            can_run_prefill_cuda_graph=False, is_extend_in_batch=False,
+            local_can_run_tbo=True, local_forward_mode=ForwardMode.DECODE.value,
+            prefill_cuda_graph_max_prefix_len=32, attention_pairs=99,
+            drain_state=7,
+        )
+        # bd47834099's exact 13-column wire layout and values.
+        expected = [3, 2, 1, 0, 1, ForwardMode.DECODE.value, 0, 32, 1, 0, 99, 0, 7]
+        fallback = [
+            0, 0, 1, 0, 1, ForwardMode.IDLE.value, 0, 0, 1, 0, 0, 0,
+            dp_attn.DRAIN_STATE_NO_LISTENER,
+        ]
+        for route in ("", "heavy_to_rank0"):
+            with self.subTest(route=route), patch.object(dp_attn, "DADP_ROUTE", route):
+                self.assertEqual(info._get_local_tensor("cpu").tolist(), expected)
+                self.assertEqual(info._get_fallback_tensor("cpu").tolist(), fallback)
+
+    def test_dadp_pending_vote_uses_existing_gather_and_clears(self):
+        from sglang.srt.managers.dadp import DadpReplicaInbox
+
+        inbox = DadpReplicaInbox()
+        with (
+            patch.object(dp_attn, "DADP_ROUTE", "replicate"),
+            patch.object(dp_attn, "DADP_REPLICA_INBOX", inbox),
+        ):
+            self._prepare_dp2_batch(
+                ForwardMode.DECODE, local_tokens=1, peer_tokens=1,
+                peer_dadp_pending=True,
+            )
+            self.assertTrue(inbox.ready)
+            self._prepare_dp2_batch(
+                ForwardMode.DECODE, local_tokens=1, peer_tokens=1,
+            )
+            self.assertFalse(inbox.ready)
+            inbox.defer([object()], [])
+            self._prepare_dp2_batch(
+                ForwardMode.DECODE, local_tokens=1, peer_tokens=1,
+            )
+            self.assertTrue(inbox.ready)
+            self.assertEqual(len(inbox.envelopes), 1)
 
     def test_attention_pairs_follow_context_not_rows(self):
         """Fewer rows with longer contexts is the busier rank in pairs.
