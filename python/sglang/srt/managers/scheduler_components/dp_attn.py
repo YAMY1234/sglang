@@ -934,6 +934,10 @@ class SchedulerDPAttnAdapter:
         extend view when a peer rank runs extend this step, so the step stays
         mode-homogeneous and every rank replays the extend graphs instead of
         all falling to eager."""
+        if DADP_STEPLOG_DIR and batch is not None:
+            # Snapshot before conversion, including every non-converting return.
+            batch.dadp_logical_forward_mode = batch.forward_mode.name
+            batch.dadp_converted_decode_count = 0
         if envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get():
             # Keep verification rows in their native mode on heterogeneous steps.
             return batch
@@ -958,6 +962,8 @@ class SchedulerDPAttnAdapter:
             # decode for eager mixed.
             return batch
         batch.convert_decode_to_extend()
+        if DADP_STEPLOG_DIR:
+            batch.dadp_converted_decode_count = batch.batch_size()
         return batch
 
     def get_idle_batch(self) -> ScheduleBatch:

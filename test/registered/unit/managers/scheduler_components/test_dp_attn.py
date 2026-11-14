@@ -1223,5 +1223,95 @@ class TestDadpStepLogger(CustomTestCase):
             logger.close()
 
 
+class TestDadpLogicalForwardMode(CustomTestCase):
+    def _batch(self, mode=ForwardMode.DECODE, *, eligible=True):
+        batch = SimpleNamespace(
+            forward_mode=mode,
+            reqs=[
+                SimpleNamespace(rid=rid, refresh_fill_ids=Mock()) for rid in ("a", "b")
+            ],
+            seq_lens_cpu=torch.tensor([42, 64]),
+            batch_size=lambda: 2,
+            is_extend_in_batch=True,
+            can_run_dp_prefill_cuda_graph=eligible,
+            global_num_tokens=[2, 4],
+            encoder_swa_reset=None,
+            forward_iter=17,
+            prefix_lens=[41, 63],
+            extend_lens=[1, 1],
+            decoding_reqs=None,
+            dadp_sync_metadata={"mlp_sync_round": 21},
+        )
+        batch.convert_decode_to_extend = lambda: (
+            dp_attn.ScheduleBatch.convert_decode_to_extend(batch)
+        )
+        return batch
+
+    def test_snapshot_distinguishes_conversion_and_native_execution(self):
+        from sglang.srt.managers.scheduler_components.dadp_step_logger import (
+            DadpStepLogger,
+        )
+
+        cases = (
+            (ForwardMode.DECODE, True, 2),
+            (ForwardMode.DECODE, False, 0),
+            (ForwardMode.EXTEND, True, 0),
+        )
+        for mode, eligible, count in cases:
+            with self.subTest(mode=mode, eligible=eligible):
+                batch = self._batch(mode, eligible=eligible)
+                with (
+                    patch.object(dp_attn, "DADP_STEPLOG_DIR", "enabled"),
+                    envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.override(False),
+                ):
+                    result = (
+                        dp_attn.SchedulerDPAttnAdapter.maybe_convert_decode_to_extend(
+                            None, batch
+                        )
+                    )
+                self.assertIs(result, batch)
+                self.assertEqual(batch.dadp_logical_forward_mode, mode.name)
+                self.assertEqual(batch.dadp_converted_decode_count, count)
+                self.assertIn(count, (0, batch.batch_size()))
+                start, end = Mock(), Mock()
+                end.query.return_value = True
+                start.elapsed_time.return_value = 1.0
+                with tempfile.TemporaryDirectory() as directory:
+                    logger = DadpStepLogger(directory, dp_rank=0, tp_rank=0, pp_rank=0)
+                    with patch("torch.cuda.Event", side_effect=[start, end]):
+                        observation = logger.begin(batch, object())
+                        logger.end(observation, object(), cuda_graph_replayed=eligible)
+                    # Later scheduler reuse must not change this step's snapshot.
+                    batch.dadp_logical_forward_mode = "changed"
+                    batch.dadp_converted_decode_count = 99
+                    logger.close()
+                    records = [
+                        json.loads(line)
+                        for line in logger.path.read_text().splitlines()
+                    ]
+                    record = records[-1]
+                    self.assertEqual(record["logical_forward_mode"], mode.name)
+                    self.assertEqual(record["converted_decode_count"], count)
+                    self.assertEqual(record["cuda_graph_replayed"], eligible)
+                    execution = ForwardMode.EXTEND if count else mode
+                    self.assertEqual(record["forward_mode"], execution.name)
+                    if execution.is_extend():
+                        self.assertEqual(record["extend"], [[41, 1], [63, 1]])
+                        self.assertEqual(record["decode_seq_lens"], [])
+                    else:
+                        self.assertEqual(record["extend"], [])
+                        self.assertEqual(record["decode_seq_lens"], [42, 64])
+
+    def test_disabled_instrumentation_leaves_conversion_unchanged(self):
+        batch = self._batch()
+        with (
+            patch.object(dp_attn, "DADP_STEPLOG_DIR", ""),
+            envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.override(False),
+        ):
+            dp_attn.SchedulerDPAttnAdapter.maybe_convert_decode_to_extend(None, batch)
+        self.assertEqual(batch.forward_mode, ForwardMode.EXTEND)
+        self.assertFalse(hasattr(batch, "dadp_logical_forward_mode"))
+        self.assertFalse(hasattr(batch, "dadp_converted_decode_count"))
+
 if __name__ == "__main__":
     unittest.main()

@@ -5627,7 +5627,11 @@ class Scheduler(
         self._maybe_report_active_ranks()
 
         if DADP_STEPLOG_DIR:
-            self.dadp_step_logger.end(dadp_observation, dadp_stream)
+            self.dadp_step_logger.end(
+                dadp_observation,
+                dadp_stream,
+                cuda_graph_replayed=getattr(ret, "can_run_cuda_graph", None),
+            )
         ret.forward_launch = launch
         return ret
 

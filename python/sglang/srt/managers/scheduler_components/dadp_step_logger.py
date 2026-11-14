@@ -138,6 +138,8 @@ class DadpStepLogger:
             cpu_time_ns=time.time_ns(),
             cpu_monotonic_ns=time.monotonic_ns(),
             forward_mode=mode.name,
+            logical_forward_mode=getattr(batch, "dadp_logical_forward_mode", None),
+            converted_decode_count=getattr(batch, "dadp_converted_decode_count", None),
             batch_id=self.batch_id,
             extend=extend,
             decode_seq_lens=decode_lens,
@@ -156,12 +158,13 @@ class DadpStepLogger:
         start.record(stream)
         return record, start, end
 
-    def end(self, observation, stream):
+    def end(self, observation, stream, *, cuda_graph_replayed=None):
         if observation is None:
             return
         record, start, end = observation
         end.record(stream)
         record["cpu_enqueue_end_ns"] = time.monotonic_ns()
+        record["cuda_graph_replayed"] = cuda_graph_replayed
         self.pending.append((record, start, end))
 
     def drain(self, *, closing=False, flush=False):
