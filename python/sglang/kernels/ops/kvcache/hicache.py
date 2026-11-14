@@ -92,23 +92,25 @@ def _jit_hicache_staged_module(
     )
 
 
-_logged_coalesced_write_back = False
+# Calls, then pages and host runs over every 16th call: how far merging adjacent rows can go.
+_coalesced_write_back_stats = [0, 0, 0]
 
 
 def _use_coalesced_write_back(dst_indices: torch.Tensor, page_size: int) -> bool:
-    global _logged_coalesced_write_back
     if not envs.SGLANG_OPT_HICACHE_BATCH_WRITE_BACK_COPY.get():
         return False
-    if not _logged_coalesced_write_back:
-        _logged_coalesced_write_back = True
+    stats = _coalesced_write_back_stats
+    stats[0] += 1
+    if stats[0] % 16 == 1 and dst_indices.numel():
         rows = dst_indices[::page_size]
-        runs = 1 + int((rows[1:] - rows[:-1] != page_size).sum()) if rows.numel() else 0
+        stats[1] += rows.numel()
+        stats[2] += 1 + int(torch.count_nonzero(torch.diff(rows) != page_size))
+    if stats[0] == 1 or stats[0] % 4096 == 0:
         logging.getLogger(__name__).info(
             "HiCache staged write-back: one batched copy per staging chunk, "
-            "merging adjacent host rows (SGLANG_OPT_HICACHE_BATCH_WRITE_BACK_COPY); "
-            "first call %d pages in %d host runs",
-            rows.numel(),
-            runs,
+            "adjacent host rows merged (SGLANG_OPT_HICACHE_BATCH_WRITE_BACK_COPY); "
+            "%d calls, sampled %d pages in %d host runs",
+            *stats,
         )
     return True
 
