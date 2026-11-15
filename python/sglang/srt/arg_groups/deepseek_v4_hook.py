@@ -372,6 +372,27 @@ def validate_deepseek_v41_tail_stage_server(server_args: ServerArgs) -> None:
     missing = [name for name, ok in required if not ok]
     if missing:
         raise ValueError(f"--dsv41-tail-stage-server requires {', '.join(missing)}")
+    _validate_tail_stage_advertised_host()
+
+
+def _validate_tail_stage_advertised_host() -> None:
+    """Decode reaches PP rank 1 at the address the tail server registers; its KV
+    manager binds get_local_ip_auto() (CommonKVManager), so another one never answers."""
+    from sglang.srt.utils.network import get_local_ip_auto
+
+    host = envs.SGLANG_DSV41_TAIL_STAGE_HOST.get()
+    bind = get_local_ip_auto()
+    if host and host != bind:
+        logger.error(
+            "DSV4.1 tail stage: SGLANG_DSV41_TAIL_STAGE_HOST=%s is not the KV "
+            "manager's bind address %s; refusing to start",
+            host,
+            bind,
+        )
+        raise ValueError(
+            f"SGLANG_DSV41_TAIL_STAGE_HOST={host} differs from the address the tail "
+            f"server's KV manager binds ({bind}); unset it or set it to {bind}"
+        )
 
 
 def validate_deepseek_v41_encoder_only_prefill(server_args: ServerArgs) -> None:

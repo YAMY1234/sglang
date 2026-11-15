@@ -258,5 +258,30 @@ class TestTailStageAcrossLanes(CustomTestCase):
         self.assertEqual(self.batches, [])
 
 
+class TestTailStageAdvertisedHost(CustomTestCase):
+    def test_a_host_other_than_the_bind_address_refuses_to_start(self):
+        """Debug 1 hung: the tail server registered 127.0.0.1 while its KV manager
+        listened on the node IP, so decode's transfer info never reached PP rank 1."""
+        from sglang.srt.arg_groups.deepseek_v4_hook import (
+            _validate_tail_stage_advertised_host,
+        )
+        from sglang.srt.environ import envs
+
+        with patch(
+            "sglang.srt.utils.network.get_local_ip_auto", return_value="10.0.0.9"
+        ):
+            for host, refused in (
+                (None, False),
+                ("10.0.0.9", False),
+                ("127.0.0.1", True),
+            ):
+                with envs.SGLANG_DSV41_TAIL_STAGE_HOST.override(host):
+                    if refused:
+                        with self.assertRaises(ValueError):
+                            _validate_tail_stage_advertised_host()
+                    else:
+                        _validate_tail_stage_advertised_host()
+
+
 if __name__ == "__main__":
     unittest.main()
