@@ -4,12 +4,12 @@ registration as PP rank 1 of every encoder-only prefill's bootstrap table."""
 import asyncio
 import json
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import torch
 import zmq
-from types import SimpleNamespace
-
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
     CommonKVBootstrapServer,
@@ -17,6 +17,7 @@ from sglang.srt.disaggregation.common.conn import (
     PrefillServerInfo,
 )
 from sglang.srt.disaggregation.dsv41_tail_stage import protocol as P
+from sglang.srt.disaggregation.dsv41_tail_stage import transport
 from sglang.srt.disaggregation.dsv41_tail_stage.batcher import (
     TailBatchPolicy,
     parse_buckets,
@@ -45,6 +46,7 @@ from sglang.srt.disaggregation.dsv41_tail_stage.slots import (
     SlotState,
     SlotTable,
 )
+from sglang.srt.disaggregation.utils import check_state_wire, state_wire
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -638,6 +640,48 @@ class TestTailStageLayout(CustomTestCase):
         np.testing.assert_array_equal(pages, [5, 2])
         pages = tail_swa_page_ids(pool, row, start=1000 - WINDOW, end=1000)
         np.testing.assert_array_equal(pages, [5])
+
+
+class TestTailStageKVArgs(CustomTestCase):
+    def test_w0_entries_are_empty_and_the_tail_entries_carry_buffers(self):
+        """Decode pairs entries by position: stage 1 must register W0 (sending none of
+        it) and then exactly the tail entries, over the late layers only."""
+        pool = _Pool(range(20, 40))
+        aux = torch.zeros(3, WINDOW, 3 * 8, dtype=torch.bfloat16)
+        fwd = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                token_to_kv_pool=pool, kv_cache_dtype_str="fp8"
+            ),
+            aux=aux,
+        )
+        with (
+            patch.object(
+                transport,
+                "get_disagg",
+                return_value=SimpleNamespace(disaggregation_ib_device=None),
+            ),
+            patch.object(
+                transport, "get_device", return_value=SimpleNamespace(gpu_id=0)
+            ),
+            patch.object(transport, "get_pd_kv_layout", return_value=None),
+        ):
+            kv_args = transport.tail_kv_args(
+                fwd, stage0_wire=W0, start_layer=20, end_layer=40
+            )
+        wire = state_wire(kv_args)
+        self.assertEqual(wire, tail_stage_wire(W0, True))
+        check_state_wire(wire, tail_stage_wire(W0, True))
+        self.assertEqual(kv_args.state_data_ptrs[: len(W0)], [[]] * len(W0))
+        self.assertEqual(
+            kv_args.state_data_ptrs[len(W0)],
+            [b.data_ptr() for b in pool.swa_kv_pool.kv_buffer],
+        )
+        self.assertEqual(kv_args.state_item_lens[len(W0) + 1], [aux[0].nbytes])
+        self.assertEqual(
+            (kv_args.pp_rank, kv_args.prefill_start_layer, kv_args.prefill_end_layer),
+            (1, 20, 40),
+        )
+        self.assertEqual((kv_args.kv_data_ptrs, kv_args.aux_data_ptrs), ([], []))
 
 
 class _Sender:

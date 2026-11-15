@@ -14,7 +14,6 @@ from collections import deque
 from typing import Callable, Deque, Dict, List, Optional, Protocol
 
 import msgspec
-
 from sglang.srt.disaggregation.dsv41_tail_stage.protocol import (
     Error,
     SlotDefer,

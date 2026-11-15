@@ -7,7 +7,6 @@ from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-
 from sglang.srt.disaggregation.base.conn import KVArgs, StateType
 from sglang.srt.disaggregation.dsv41_tail_stage import protocol as P
 from sglang.srt.disaggregation.dsv41_tail_stage.forward import (
@@ -76,7 +75,7 @@ class TailStageKVManager(MooncakeKVManager):
 
 
 def tail_kv_args(
-    fwd: TailStageForward, *, stage0_wire: List[list], start_layer: int
+    fwd: TailStageForward, *, stage0_wire: List[list], start_layer: int, end_layer: int
 ) -> KVArgs:
     """W0 as empty entries (stage 0 sends them), then the entries stage 1 sends."""
     pool = fwd.model_runner.token_to_kv_pool
@@ -88,7 +87,7 @@ def tail_kv_args(
     kv_args.kv_cache_dtype_str = fwd.model_runner.kv_cache_dtype_str
     kv_args.kv_layout = get_pd_kv_layout(pool)
     kv_args.prefill_start_layer = start_layer
-    kv_args.prefill_end_layer = pool.end_layer
+    kv_args.prefill_end_layer = end_layer
     kv_args.kv_data_ptrs, kv_args.kv_data_lens, kv_args.kv_item_lens = [], [], []
     kv_args.kv_layer_ids = []
     kv_args.num_draft_entries = 0
@@ -115,7 +114,7 @@ def tail_kv_args(
         append_state_component(
             kv_args, StateType(entry[0]), [], [], [], wire_key=entry[1]
         )
-    swa = tail_swa_buf_infos(pool, range(start_layer, pool.end_layer))
+    swa = tail_swa_buf_infos(pool, range(start_layer, end_layer))
     append_state_component(
         kv_args, StateType.DSV41_TAIL_SWA, swa.ptrs, swa.lens, swa.item_lens
     )
@@ -141,11 +140,16 @@ class MooncakeTailBackend:
         self.server_args = server_args
         self.mgr: Optional[TailStageKVManager] = None
         self.stage0_wire_len = 0
-        self.start_layer = fwd.model_runner.model.model.tail_stage_start_layer
+        model = fwd.model_runner.model.model
+        self.start_layer = model.tail_stage_start_layer
+        self.end_layer = model.end_layer
 
     def start(self, stage0_wire: List[list]) -> Tuple[str, int, P.Welcome]:
         kv_args = tail_kv_args(
-            self.fwd, stage0_wire=stage0_wire, start_layer=self.start_layer
+            self.fwd,
+            stage0_wire=stage0_wire,
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
         )
         self.stage0_wire_len = len(stage0_wire)
         self.mgr = TailStageKVManager(
