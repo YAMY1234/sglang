@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import statistics
 import time
+from types import SimpleNamespace
 from typing import Sequence
 
 import torch
@@ -27,6 +28,7 @@ def build_forward(scheduler) -> TailStageForward:
         tree_cache=scheduler.tree_cache,
         model_config=scheduler.model_config,
         num_slots=envs.SGLANG_DSV41_TAIL_STAGE_SLOTS.get(),
+        max_tails=envs.SGLANG_DSV41_TAIL_STAGE_MAX_TAILS.get(),
         window=SWA_WINDOW,
         draft_aux=envs.SGLANG_DSV41_TAIL_STAGE_DRAFT_AUX.get(),
     )
@@ -71,12 +73,21 @@ def self_bench(
     torch.manual_seed(0)
     fwd.residual.normal_()
     tail_graph = fwd.model_runner.model.model.decoder_replay_tail
+    memory = fwd.memory
     for n in sorted(counts, reverse=True):
         prep_ms, fwd_ms = [], []
         for it in range(warmup + iters):
-            reqs = [fwd.admit(rid=f"bench-{n}-{it}-{i}", e=e) for i in range(n)]
-            assert all(req is not None for req in reqs), "bench prefixes do not fit"
-            tails = [TailRun(req=req, slot=i, s=s) for i, req in enumerate(reqs)]
+            grants = [SimpleNamespace(room=-(i + 1), slot=i, e=e) for i in range(n)]
+            assert all(memory.take(g) is not None for g in grants), (
+                "prefixes do not fit"
+            )
+            memory.end_round()
+            tails = [
+                TailRun(
+                    slot=g.slot, s=s, e=e, window_full=memory.held[g.room].window_full
+                )
+                for g in grants
+            ]
             torch.cuda.synchronize()
             t0 = time.perf_counter()
             prepared = fwd.prepare(tails)
@@ -84,8 +95,8 @@ def self_bench(
             fwd.execute(tails, prepared)
             torch.cuda.synchronize()
             t2 = time.perf_counter()
-            for tail in tails:
-                fwd.release(tail.req)
+            for g in grants:
+                memory.give_back(g)
             if it >= warmup:
                 prep_ms.append((t1 - t0) * 1e3)
                 fwd_ms.append((t2 - t1) * 1e3)

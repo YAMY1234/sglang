@@ -31,6 +31,11 @@ from sglang.srt.disaggregation.dsv41_tail_stage.layout import (
     tail_swa_buf_infos,
     tail_swa_page_ids,
 )
+from sglang.srt.disaggregation.dsv41_tail_stage.memory import (
+    PageStack,
+    TailMemory,
+    window_swa,
+)
 from sglang.srt.disaggregation.dsv41_tail_stage.registration import (
     Stage0Peers,
     entry_sender,
@@ -46,6 +51,7 @@ from sglang.srt.disaggregation.dsv41_tail_stage.service import (
 )
 from sglang.srt.disaggregation.dsv41_tail_stage.slots import (
     CountedPages,
+    Reply,
     SlotState,
     SlotTable,
 )
@@ -332,6 +338,146 @@ class TestTailStageSlots(CustomTestCase):
         self.assertEqual(finished, len(rooms))
         self.assertEqual(table.counts()["free_slots"], 3)
         self.assertEqual(sorted(table.pages.free), list(range(1, 41)))
+
+
+def _memory(*, slots=4, pages=64, writes=None):
+    """Owned memory over fake rows (100 + slot), SWA pages (slot * 2, slot * 2 + 1)
+    and full pages 1..pages; `writes` collects each round's plan."""
+    plans = writes if writes is not None else []
+    return TailMemory(
+        rows=[100 + k for k in range(slots)],
+        swa_pages=np.arange(2 * slots, dtype=np.int64).reshape(slots, 2),
+        full_pages=np.arange(1, pages + 1, dtype=np.int64),
+        page_size=PAGE,
+        swa_page_size=PAGE,
+        window=WINDOW,
+        write_round=plans.append,
+    )
+
+
+def _owned_table(*, slots=4, pages=64, writes=None):
+    clock = _Clock()
+    table = SlotTable(
+        num_slots=slots,
+        pages=_memory(slots=slots, pages=pages, writes=writes),
+        page_size=PAGE,
+        window=WINDOW,
+        queue_cap=64,
+        ready_timeout_s=10.0,
+        clock=clock,
+    )
+    return table, clock
+
+
+class TestTailStageOwnedMemory(CustomTestCase):
+    def test_a_round_of_grants_is_one_write(self):
+        """Grants take host pages only; their row and window writes go out once per
+        round, together, never per room."""
+        writes = []
+        table, _ = _owned_table(writes=writes)
+        for room, s in ((1, 1001), (2, 600), (3, 2 * PAGE + 140)):
+            table.request("a", _req(room, s))
+        self.assertEqual(writes, [])
+        table.pages.end_round()
+        self.assertEqual(len(writes), 1)
+        plan = writes[0]
+        held = table.pages.held
+        # Each tail's pages cover [0, e) and land at columns 0.. of its own row.
+        for room in (1, 2, 3):
+            tail, hold = table.tails[room], held[room]
+            self.assertEqual(len(hold.pages), -(-tail.e // PAGE))
+            mine = plan.rows == hold.row
+            np.testing.assert_array_equal(plan.cols[mine], np.arange(len(hold.pages)))
+            np.testing.assert_array_equal(plan.pages[mine], hold.pages)
+        self.assertEqual(len(plan.window_full), 3 * WINDOW)
+        table.pages.end_round()
+        self.assertEqual(len(writes), 1)  # nothing pending: no write
+
+    def test_grant_lists_the_prefix_pages_and_the_window_follows_positions(self):
+        writes = []
+        table, _ = _owned_table(writes=writes)
+        e = 2 * PAGE + 60  # window [444, 572) crosses the page at 512
+        (grant,) = _msgs(table.request("a", _req(1, e + 1)), P.SlotGrant)
+        hold = table.pages.held[1]
+        self.assertEqual(grant.c1_pages, hold.pages[:2].tolist())  # [0, 444)
+        self.assertEqual(len(hold.pages), 3)
+        positions = np.arange(e - WINDOW, e)
+        np.testing.assert_array_equal(
+            hold.window_full,
+            hold.pages[positions // PAGE] * PAGE + positions % PAGE,
+        )
+        slot_swa = table.pages.swa_pages[grant.slot]
+        self.assertEqual(hold.swa_payload, slot_swa.tolist())  # two SWA pages
+        np.testing.assert_array_equal(
+            hold.window_swa[:68], slot_swa[0] * PAGE + positions[:68] % PAGE
+        )
+        np.testing.assert_array_equal(
+            hold.window_swa[68:], slot_swa[1] * PAGE + positions[68:] % PAGE
+        )
+        _, payload = window_swa(slot_swa, e=1000, swa_page_size=PAGE, window=WINDOW)
+        self.assertEqual(payload, [slot_swa[0]])  # [872, 1000) in one page
+
+    def test_freed_pages_come_back_in_bulk_and_a_freed_grant_writes_nothing(self):
+        writes = []
+        table, _ = _owned_table(slots=2, pages=8, writes=writes)
+        table.request("a", _req(1, 4 * PAGE + 1))  # 4 pages
+        table.request("a", _req(2, 4 * PAGE + 1))  # 4 pages: the pool is empty
+        self.assertEqual(table.request("a", _req(3, 2 * PAGE + 1)), [])  # waits
+        # Room 1 gives up before the round is written: its write must not go out,
+        # or it would race room 3's write of the same row in one round.
+        replies = table.ready("a", P.TailReady(room=1, slot=0, ok=False))
+        (grant,) = _msgs(replies, P.SlotGrant)
+        self.assertEqual((grant.room, grant.slot), (3, 0))
+        table.pages.end_round()
+        (plan,) = writes
+        self.assertEqual(sorted(set(plan.rows.tolist())), [100, 101])
+        self.assertEqual(int((plan.rows == 100).sum()), 2)  # room 3's 2 pages only
+        self.assertEqual(table.pages.stack.available(), 2)
+
+    def test_page_stack_reuses_returned_pages(self):
+        stack = PageStack(np.arange(1, 5))
+        a = stack.take(3)
+        self.assertIsNone(stack.take(2))
+        stack.give(a)
+        b = stack.take(4)
+        self.assertEqual(sorted(b.tolist()), [1, 2, 3, 4])
+        self.assertIsNone(stack.take(1))
+
+
+class TestTailStageExpiryHeap(CustomTestCase):
+    def test_a_stale_deadline_does_not_fail_a_room_that_moved_on(self):
+        table, clock = _table(slots=2, ready_timeout_s=10.0)
+        table.request("a", _req(1, 1001))
+        table.ready("a", P.TailReady(room=1, slot=0, ok=True))
+        clock.t += 11
+        self.assertEqual(table.expire(silent_stage0s=[]), [])
+        self.assertEqual(table.tails[1].state, SlotState.READY)
+
+    def test_a_failed_slot_is_held_for_its_own_timeout_not_its_grants(self):
+        """A granted slot failed at t=105 stays held until 105 + timeout, even though
+        its grant's deadline (100 + timeout) comes first."""
+        table, clock = _table(slots=1, ready_timeout_s=10.0)
+        table.request("b", _req(1, 1001))  # granted at 100
+        clock.t = 105.0
+        table.expire(silent_stage0s=["b"])  # FAILED, held
+        clock.t = 111.0
+        table.expire(silent_stage0s=["b"])
+        self.assertEqual(table.counts()["free_slots"], 0)
+        clock.t = 116.0
+        table.expire(silent_stage0s=["b"])
+        self.assertEqual(table.counts()["free_slots"], 1)
+
+    def test_a_silent_stage0_is_scanned_once(self):
+        table, clock = _table(slots=2, ready_timeout_s=100.0)
+        table.request("b", _req(1, 1001))
+        (done,) = _msgs(table.expire(silent_stage0s=["b"]), P.TailDone)
+        self.assertEqual(done.reason, "stage 0 silent")
+        table.request("b", _req(2, 1001))  # it came back and asked again
+        self.assertEqual(table.expire(silent_stage0s=["b"]), [])
+        self.assertEqual(table.tails[2].state, SlotState.GRANTED)
+        self.assertEqual(table.expire(silent_stage0s=[]), [])
+        (done,) = _msgs(table.expire(silent_stage0s=["b"]), P.TailDone)
+        self.assertEqual((done.room, done.reason), (2, "stage 0 silent"))
 
 
 class TestTailStageBatcher(CustomTestCase):
@@ -804,6 +950,22 @@ class TestTailStageService(CustomTestCase):
         while self.stage0.poll(10):
             out.append(P.decode(self.stage0.recv()))
         return out
+
+    def test_one_device_write_per_loop_step(self):
+        """Requests drained in one step are granted together and written once."""
+        writes = []
+        table, _ = _owned_table(slots=4, pages=128, writes=writes)
+        table.clock = self.clock
+        self.service.table = table
+        hello = TestTailStageRegistration._hello(None)
+        _put(self.bootstrap, _stage0_payload())
+        self._exchange(hello)
+        got = self._exchange(_req(1, 4001), _req(2, 4001), _req(3, 9001))
+        self.assertEqual(len(_msgs([Reply("x", m) for m in got], P.SlotGrant)), 3)
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(len(set(writes[0].rows.tolist())), 3)
+        self._exchange()
+        self.assertEqual(len(writes), 1)
 
     def test_a_room_from_hello_to_done(self):
         hello = TestTailStageRegistration._hello(None)
