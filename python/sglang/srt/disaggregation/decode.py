@@ -893,6 +893,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 hidden_size=config.hf_text_config.hidden_size,
                 dtype=self.scheduler.tp_worker.model_runner.dtype,
                 device=self.token_to_kv_pool.device,
+                mem_pool=self.token_to_kv_pool.custom_mem_pool,
             )
         boundary = max(config.hf_text_config.kv_source_layer_ids)
         append_tail_stage_entries(

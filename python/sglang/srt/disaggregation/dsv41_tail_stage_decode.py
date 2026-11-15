@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import heapq
 from collections import deque
+from contextlib import nullcontext
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -41,11 +42,15 @@ class TailAuxStaging:
         hidden_size: int,
         dtype: torch.dtype,
         device: torch.device,
+        mem_pool=None,
     ) -> None:
         self.window = window
-        self.buf = torch.zeros(
-            slots * window, captures * hidden_size, dtype=dtype, device=device
-        )
+        # The tail server writes it over Mooncake: under a custom memory pool (MNNVL)
+        # it must come from that pool, as the KV pools' buffers do.
+        with torch.cuda.use_mem_pool(mem_pool) if mem_pool else nullcontext():
+            self.buf = torch.zeros(
+                slots * window, captures * hidden_size, dtype=dtype, device=device
+            )
         self._free = deque(range(slots))
         # Slot -> the request it is reserved for, until its rows were read.
         self._holders: Dict[int, object] = {}
