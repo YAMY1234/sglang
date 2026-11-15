@@ -10,6 +10,7 @@ import torch
 import torch.distributed
 
 from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.distributed.parallel_state import P2PWork
@@ -123,6 +124,8 @@ class SchedulerPPMixin:
     _pp_pd_local_result_enabled: bool = False
     _pp_hicache_piggyback: bool = False
     _pp_prefetch_verdict_relay: bool = False
+    _pp_prefill_relay_before_d2h: bool = False
+    _pp_prefill_host_output_copy: bool = False
 
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -377,9 +380,18 @@ class SchedulerPPMixin:
                 if tmbs[next_mb_id] is not None:
                     next_release_rids = self._pp_recv_pyobj_from_prev_stage()
                 self._pp_commit_comm_work(send_release_work)
+                # The current forward is already submitted. Publish its inputs
+                # after the release protocol, before waiting on the OLD result.
+                if self._pp_prefill_relay_before_d2h and not self.pp_group.is_last_rank:
+                    self.send_req_work = self._pp_send_reqs_to_next_stage(recv_reqs)
+                    send_transfer_work = self._pp_send_pyobj_to_next_stage(
+                        transferred_rids, async_send=True
+                    )
+                    if cur_batch:
+                        self._pp_send_proxy_to_next_stage(result)
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
-                    d2h_event.synchronize()
+                    self._pp_prefill_output_d2h_sync(d2h_event)
                     self._pp_process_batch_result(
                         self.mbs[next_mb_id],
                         next_batch_result,
@@ -390,7 +402,7 @@ class SchedulerPPMixin:
                     self.process_disagg_prefill_transfer_queue(next_release_rids)
                 if stream_early_finish:
                     self.stream_pp_transferred_finish()
-                if not self.pp_group.is_last_rank:
+                if not self._pp_prefill_relay_before_d2h and not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_reqs_to_next_stage(recv_reqs)
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
@@ -712,6 +724,31 @@ class SchedulerPPMixin:
             # Auxiliary sampling outputs reach the first stage only over the ring.
             and self.tp_worker.model_runner.sampling_observer is None
         )
+        self._pp_prefill_relay_before_d2h = (
+            envs.SGLANG_PP_PREFILL_RELAY_BEFORE_D2H.get()
+        )
+        if self._pp_prefill_relay_before_d2h and (
+            _is_npu or parallel.tp_size != 1 or parallel.pp_size < 2
+            or parallel.attn_dp_enabled or parallel.pp_async_batch_depth != 0
+            or self._pp_spec_relay
+            or envs.SGLANG_PP_HICACHE_COUNTS_PIGGYBACK.get()
+        ):
+            raise ValueError("early prefill relay requires TP1 PP>1, async depth0, "
+                             "no attention DP, spec relay, or counts piggyback")
+        logger.info("PP prefill relay before old-result D2H: %s",
+                    self._pp_prefill_relay_before_d2h)
+        self._pp_prefill_host_output_copy = (
+            envs.SGLANG_PP_PREFILL_HOST_OUTPUT_COPY.get()
+        )
+        if self._pp_prefill_host_output_copy and (
+            not str(self.device).startswith("cuda") or parallel.tp_size != 1
+            or parallel.pp_size < 2 or parallel.pp_async_batch_depth != 0
+            or self._pp_spec_relay
+        ):
+            raise ValueError("prefill host output copy requires CUDA TP1 PP>1, "
+                             "async depth0, no spec relay")
+        logger.info("PP prefill old-result host copy: %s",
+                    self._pp_prefill_host_output_copy)
         tree_cache = self.tree_cache
         self._pp_hicache_piggyback = (
             envs.SGLANG_PP_HICACHE_COUNTS_PIGGYBACK.get()
@@ -739,6 +776,10 @@ class SchedulerPPMixin:
             self._pp_hicache_piggyback,
             self._pp_prefetch_verdict_relay,
         )
+
+    def _pp_prefill_output_d2h_sync(self: Scheduler, event) -> None:
+        # One direct wait scope, timed by the diagnostic helper in BOTH arms.
+        event.synchronize()
 
     def _pp_pd_local_result(self: Scheduler, batch: ScheduleBatch) -> bool:
         """Whether this PD prefill batch skips the output ring.
@@ -1747,7 +1788,15 @@ class SchedulerPPMixin:
                     target, mb_metadata[next_mb_id], next_pp_outputs
                 )
                 d2h_event = self.device_module.Event()
-                if (
+                # On odd ranks recv precedes send. Copy the old result here,
+                # before a later send queues the current forward's wait on the
+                # scheduler stream used by the CPU result processor.
+                async_prefill_output = (
+                    self._pp_prefill_host_output_copy
+                    and self.disaggregation_mode == DisaggregationMode.PREFILL
+                    and target.forward_mode.is_extend()
+                )
+                if async_prefill_output or (
                     batch_result.logits_output is not None
                     and batch_result.logits_output.sampling_mask_output is not None
                 ):
@@ -1755,6 +1804,12 @@ class SchedulerPPMixin:
                     batch_result.copy_to_cpu(
                         return_logprob=target.return_logprob,
                         return_hidden_states=False,
+                        fence_logprob_copy_devices=async_prefill_output,
+                        return_pd_prefill_draft=(
+                            async_prefill_output
+                            and self.disaggregation_mode == DisaggregationMode.PREFILL
+                            and self.spec_algorithm.is_eagle()
+                        ),
                     )
                 else:
                     d2h_event.record(self.device_module.current_stream())

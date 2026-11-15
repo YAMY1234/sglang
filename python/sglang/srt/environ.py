@@ -751,6 +751,10 @@ class Envs:
     # Run PP tensor communication on a dedicated stream so asynchronous sends
     # do not fence the next forward through the scheduler stream.
     SGLANG_PP_COMM_OVERLAP = EnvBool(False)
+    # PD prefill: relay the current launch before waiting on an old result.
+    SGLANG_PP_PREFILL_RELAY_BEFORE_D2H = EnvBool(False)
+    # Snapshot old PD result host consumers on copy_stream before proxy fences.
+    SGLANG_PP_PREFILL_HOST_OUTPUT_COPY = EnvBool(False)
     # PP rank 0 posts its output recv only after its own forward. Enable it if PP
     # hangs or stalls on kernels that need every SM (e.g. flashinfer MLA).
     SGLANG_ENABLE_PP_OUTPUT_RECV_AFTER_FORWARD = EnvBool(False)
@@ -2264,6 +2268,8 @@ class Envs:
     # DSA backend (GLM 5 and DeepSeek V3.2)
     # ===================================================================
     SGLANG_DSA_FUSE_TOPK = EnvBool(True)
+    SGLANG_DSA_TOPK_OVERFLOW_PREFIX = EnvBool(False)
+    SGLANG_DSA_TOPK_ACTIVATION_LOG = EnvBool(False)
     # Bound the per-replay DSA metadata kernels (decode, target verify, draft
     # extend) by a program budget that strides over each row's live kv blocks,
     # instead of one program per 128 columns of the --context-length-wide table

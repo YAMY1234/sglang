@@ -32,6 +32,19 @@ from sglang.srt.utils.device import async_d2h as _async_d2h
 from sglang.srt.utils.device import is_cuda
 from sglang.srt.utils.weight_versions import compute_weight_version_spans
 
+
+def _async_logprob_d2h(tensor, copy_stream):
+    host = _async_d2h(tensor)
+    # PP pickles nested logprob tensors as metadata, preserving their CUDA
+    # device. A copy from another device uses that device's current stream;
+    # join it into the stream on which copy_done will be recorded.
+    if tensor.device.type == "cuda" and tensor.device != copy_stream.device:
+        source_stream = torch.cuda.current_stream(tensor.device)
+        copied = torch.cuda.Event()
+        copied.record(source_stream)
+        copy_stream.wait_event(copied)
+    return host
+
 if TYPE_CHECKING:
     from sglang.srt.managers.async_d2h_copy_worker import HostCopyDone
     from sglang.srt.managers.auxiliary_output import (
@@ -172,6 +185,11 @@ class GenerationBatchResult:
     # ForwardObserver output, copied together with the sampling observer's.
     forward_auxiliary_output: Optional[DeviceAuxiliaryOutput] = None
     auxiliary_host_output: Optional[HostAuxiliaryOutput] = None
+    # PD CPU consumers need these snapshots, while next_draft_input stays on GPU
+    # for the PP relay/future_map. Covered by copy_done, like next_token_ids.
+    prefill_host_draft: Optional[
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]
+    ] = None
 
     @property
     def has_sampled_token_ids(self) -> bool:
@@ -183,33 +201,43 @@ class GenerationBatchResult:
         return self.num_correct_drafts + batch_size * self.num_non_draft_tokens_per_req
 
     @torch.profiler.record_function("copy_result_to_cpu")
-    def copy_to_cpu(self, return_logprob: bool, return_hidden_states: bool = True):
+    def copy_to_cpu(
+        self,
+        return_logprob: bool,
+        return_hidden_states: bool = True,
+        return_pd_prefill_draft: bool = False,
+        fence_logprob_copy_devices: bool = False,
+    ):
         """Copy tensors to CPU in overlap scheduling.
         Only the tensors which are needed for processing results are copied,
         e.g., next_token_ids, logits outputs
         """
         if return_logprob:
+            copy_logprob = _async_d2h
+            if fence_logprob_copy_devices:
+                copy_stream = torch.cuda.current_stream()
+                copy_logprob = lambda tensor: _async_logprob_d2h(tensor, copy_stream)
             if self.logits_output.next_token_logprobs is not None:
-                self.logits_output.next_token_logprobs = _async_d2h(
+                self.logits_output.next_token_logprobs = copy_logprob(
                     self.logits_output.next_token_logprobs
                 )
             if self.logits_output.input_token_logprobs is not None:
-                self.logits_output.input_token_logprobs = _async_d2h(
+                self.logits_output.input_token_logprobs = copy_logprob(
                     self.logits_output.input_token_logprobs
                 )
             if self.logits_output.next_token_top_logprobs_val is not None:
                 self.logits_output.next_token_top_logprobs_val = [
-                    _async_d2h(v) if torch.is_tensor(v) else v
+                    copy_logprob(v) if torch.is_tensor(v) else v
                     for v in self.logits_output.next_token_top_logprobs_val
                 ]
             if self.logits_output.next_token_top_logprobs_idx is not None:
                 self.logits_output.next_token_top_logprobs_idx = [
-                    _async_d2h(x) if torch.is_tensor(x) else x
+                    copy_logprob(x) if torch.is_tensor(x) else x
                     for x in self.logits_output.next_token_top_logprobs_idx
                 ]
             if self.logits_output.next_token_token_ids_logprobs_val is not None:
                 self.logits_output.next_token_token_ids_logprobs_val = [
-                    _async_d2h(v) if torch.is_tensor(v) else v
+                    copy_logprob(v) if torch.is_tensor(v) else v
                     for v in self.logits_output.next_token_token_ids_logprobs_val
                 ]
         if return_hidden_states and self.logits_output.hidden_states is not None:
@@ -217,6 +245,17 @@ class GenerationBatchResult:
                 self.logits_output.hidden_states
             )
         self.next_token_ids = _async_d2h(self.next_token_ids)
+
+        if return_pd_prefill_draft and self.next_draft_input is not None:
+            draft = self.next_draft_input
+            self.prefill_host_draft = (
+                _async_d2h(draft.topk_p),
+                _async_d2h(draft.topk_index),
+                _async_d2h(draft.hidden_states),
+                _async_d2h(draft.dsa_topk_indices)
+                if draft.dsa_topk_indices is not None
+                else None,
+            )
 
         if self.accept_lens is not None:
             self.accept_lens = _async_d2h(self.accept_lens)
