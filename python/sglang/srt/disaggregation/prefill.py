@@ -575,31 +575,29 @@ class PrefillBootstrapQueue:
             transfer=kv_manager.engine.batch_transfer_sync,
             heartbeat_s=1.0,
             timeout_s=envs.SGLANG_DSV41_TAIL_STAGE_HEARTBEAT_TIMEOUT_S.get(),
+            heartbeat_thread=True,
         )
 
-    def _tail_stage_granted(self, req: Req) -> bool:
-        """Ask the tail server for the room's slot; a late-fed request waits for it
-        here, so a slow tail server shows as bootstrap queue. A room the tail
-        server cannot serve fails, and decode with it."""
+    def _tail_stage_admits(self, req: Req) -> bool:
+        """A pass-through room is announced here, so the tail server answers decode
+        for it; a late-fed room asks for its slot only at its final chunk (a grant
+        held through the prefill queue starved the slots). A room the tail server
+        cannot serve fails here, and decode with it."""
         client = self.tail_stage
         room = req.bootstrap_room
         if req.bootstrap_host == FAKE_BOOTSTRAP_HOST:
             return True
-        client.request(
-            room=room,
-            rid=req.rid,
-            s=req.dsv41_prompt_len,
-            e=len(req.origin_input_ids),
-            late_fed=req.dsv41_late_fed,
-        )
         if not req.dsv41_late_fed:
+            client.request(
+                room=room, rid=req.rid, s=req.dsv41_prompt_len, e=0, late_fed=False
+            )
             return True
         error = client.error(room)
         if error is not None:
             client.abort(room)
             self.kv_manager.conclude_failure(bootstrap_room=room, failure_reason=error)
             return False
-        return client.grant(room) is not None
+        return True
 
     def create_sender(self, req: Req, num_kv_heads: int) -> None:
         """Create a KV sender for the request without enqueuing it."""
@@ -634,7 +632,7 @@ class PrefillBootstrapQueue:
         assert req.pending_bootstrap, "finalize_bootstrap is not idempotent"
         if not self.ensure_metadata_buffer(req):
             return False
-        if self.tail_stage is not None and not self._tail_stage_granted(req):
+        if self.tail_stage is not None and not self._tail_stage_admits(req):
             return False
         if (
             dsv41_tail_stage_enabled()
@@ -844,17 +842,32 @@ class SchedulerDisaggregationPrefillMixin:
     def _dsv41_late_capture(self: Scheduler):
         return self.tp_worker.model_runner.attn_backend.late_tail_capture
 
-    def _bind_dsv41_late_capture(self: Scheduler, batch: ScheduleBatch) -> None:
+    def _prepare_dsv41_tail_batch(self: Scheduler, batch: ScheduleBatch) -> None:
         """Point each late-fed request's pool row at its capture slot before the
-        forward that computes its window."""
+        forward that computes its window, and ask for its tail slot with its final
+        chunk, so the grant arrives during that forward."""
         capture = self._dsv41_late_capture()
         for req in batch.reqs:
-            if req.dsv41_late_capture_slot is not None:
-                capture.bind(
-                    req_pool_idx=req.kv.req_pool_idx,
-                    slot=req.dsv41_late_capture_slot,
-                    window_start=req.dsv41_late_capture_start,
-                )
+            if req.dsv41_late_capture_slot is None:
+                continue
+            capture.bind(
+                req_pool_idx=req.kv.req_pool_idx,
+                slot=req.dsv41_late_capture_slot,
+                window_start=req.dsv41_late_capture_start,
+            )
+            if req.extend_end >= len(req.full_untruncated_fill_ids):
+                self._request_dsv41_tail_slot(req)
+
+    def _request_dsv41_tail_slot(self: Scheduler, req: Req) -> None:
+        client = self.disagg_prefill_bootstrap_queue.tail_stage
+        if client is not None and req.bootstrap_host != FAKE_BOOTSTRAP_HOST:
+            client.request(
+                room=req.bootstrap_room,
+                rid=req.rid,
+                s=req.dsv41_prompt_len,
+                e=len(req.origin_input_ids),
+                late_fed=True,
+            )
 
     def _abort_dsv41_tail_stage(self: Scheduler, req: Req) -> None:
         client = self.disagg_prefill_bootstrap_queue.tail_stage
@@ -864,12 +877,19 @@ class SchedulerDisaggregationPrefillMixin:
     def _dsv41_tail_push_pending(self: Scheduler, req: Req) -> bool:
         """SGLANG_DSV41_TAIL_STAGE: write the granted slot (the prefix's c1 pages and
         the window) as soon as the forward has run all of the prefix, and report it
-        ready when the write returns. True while the write runs: the request's pages
-        stay held until both it and the decode send have ended."""
+        ready when the write returns. True while the grant or the write is pending:
+        the request's pages stay held until both it and the decode send have ended."""
         client = self.disagg_prefill_bootstrap_queue.tail_stage
         room = req.bootstrap_room
-        if client is None or client.grant(room) is None:
+        if client is None or req.dsv41_tail_written:
             return False
+        # Asked with the final chunk; this covers a request that skipped that batch.
+        self._request_dsv41_tail_slot(req)
+        error = client.error(room)
+        if error is not None:
+            return self._fail_dsv41_tail(req, error)
+        if client.grant(room) is None:
+            return True
         if not client.pushing(room):
             # The tail server recomputes the window's own c1 rows; it takes the
             # pages of the prefix below it, [0, e - window).
@@ -886,7 +906,12 @@ class SchedulerDisaggregationPrefillMixin:
         ok = client.push_result(room)
         if ok is None:
             return True
-        client.ready(room, ok=ok)
+        if not ok:
+            return self._fail_dsv41_tail(
+                req, client.error(room) or "DSV4.1 tail stage slot write failed"
+            )
+        client.ready(room, ok=True)
+        req.dsv41_tail_written = True
         now = time.monotonic()
         if now - getattr(self, "dsv41_tail_pushed_log_t", -1e9) > 5:
             self.dsv41_tail_pushed_log_t = now
@@ -895,6 +920,17 @@ class SchedulerDisaggregationPrefillMixin:
                 client.tails_pushed,
             )
         return False
+
+    def _fail_dsv41_tail(self: Scheduler, req: Req, reason: str) -> bool:
+        """The tail stage will not serve the room: give its slot back and fail the
+        room to decode, which waits for both stages. True: the request leaves through
+        the transfer failure path once its sender reports Failed."""
+        self.disagg_prefill_bootstrap_queue.tail_stage.abort(req.bootstrap_room)
+        status = self.disagg_prefill_bootstrap_queue.kv_manager.conclude_failure(
+            bootstrap_room=req.bootstrap_room, failure_reason=reason
+        )
+        # None: the room is already cleared, so nothing waits on it.
+        return status is not None
 
     def _release_dsv41_late_capture(self: Scheduler, req: Req) -> None:
         if req.dsv41_late_capture_slot is not None:
@@ -1009,7 +1045,7 @@ class SchedulerDisaggregationPrefillMixin:
         batch = prefill_plan.batch_to_run
         running_batch = prefill_plan.running_batch
         if batch is not None and dsv41_tail_stage_enabled():
-            self._bind_dsv41_late_capture(batch)
+            self._prepare_dsv41_tail_batch(batch)
         batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
 
         if batch:

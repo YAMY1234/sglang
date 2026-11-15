@@ -1,16 +1,17 @@
 """SGLANG_DSV41_TAIL_STAGE on an encoder-only prefill (stage 0): the tail server's client.
 
-Stage 0 asks the tail server for a slot at bootstrap (a late-fed request waits there for
-its grant). Once its forward has run all of the prefix [0, e), it writes the prefix's c1
-KV and c1-index pages and the window's late-layer input into the granted slot, reports
-the slot ready, and holds its pages until both this write and its decode send have
-ended. Messages are in `dsv41_tail_stage.protocol`, buffers in `dsv41_tail_stage.layout`.
+Stage 0 asks the tail server for a late-fed request's slot when the request's final
+prefill chunk is scheduled. Once its forward has run all of the prefix [0, e), it writes
+the prefix's c1 KV and c1-index pages and the window's late-layer input into the granted
+slot, reports the slot ready, and holds its pages until both this write and its decode
+send have ended. Messages are in `dsv41_tail_stage.protocol`, buffers in `dsv41_tail_stage.layout`.
 """
 
 from __future__ import annotations
 
 import concurrent.futures
 import logging
+import threading
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -41,6 +42,10 @@ logger = logging.getLogger(__name__)
 HELLO_RETRY_S = 5.0
 # Period of the per-request timing summary.
 STATS_LOG_S = 5.0
+# Arbitrary: slot writes in flight at once, and parallel Mooncake batches per write
+# (the KV sender also spreads one request over its executors under the NVLink pool).
+WRITE_ROOMS = 4
+WRITE_PARTS = 8
 UNREACHABLE = "DSV4.1 tail stage unreachable"
 
 
@@ -122,6 +127,25 @@ def push_blocks(
     return blocks
 
 
+def split_blocks(
+    blocks: List[Tuple[int, int, int]], *, parts: int
+) -> List[List[Tuple[int, int, int]]]:
+    """The writes cut into at most `parts` runs of consecutive blocks of about equal
+    bytes, one Mooncake batch each."""
+    total = sum(length for _, _, length in blocks)
+    target = max(1, -(-total // parts))
+    out, part, size = [], [], 0
+    for block in blocks:
+        part.append(block)
+        size += block[2]
+        if size >= target and len(out) < parts - 1:
+            out.append(part)
+            part, size = [], 0
+    if part:
+        out.append(part)
+    return out
+
+
 class _Room(msgspec.Struct):
     request: SlotRequest
     t_request: float
@@ -131,6 +155,8 @@ class _Room(msgspec.Struct):
     grant: Optional[SlotGrant] = None
     error: Optional[str] = None
     push: Optional[concurrent.futures.Future] = None
+    descriptors: int = 0
+    nbytes: int = 0
     # The request left; the message goes once the slot's write has ended.
     closing: Optional[object] = None
 
@@ -142,6 +168,8 @@ class _Timings:
         "wait_grant",
         "grant_to_ready",
         "write",
+        "descriptors",
+        "write_mb",
         "s1_queue",
         "s1_forward",
         "s1_send",
@@ -164,7 +192,8 @@ class _Timings:
 
 class TailStageClient:
     """One per stage-0 scheduler. Every method runs on the scheduler thread except
-    the Mooncake writes, which run on a worker and are read back by `push_result`."""
+    the Mooncake writes, which run on workers and are read back by `push_result`, and
+    the heartbeat thread, which keeps a stalled scheduler (a cold forward) alive."""
 
     def __init__(
         self,
@@ -176,6 +205,7 @@ class TailStageClient:
         heartbeat_s: float,
         timeout_s: float,
         clock=time.monotonic,
+        heartbeat_thread: bool = False,
     ) -> None:
         self._socket = socket
         self._hello = hello
@@ -187,8 +217,13 @@ class TailStageClient:
         self._clock = clock
         self._rooms: Dict[int, _Room] = {}
         self._executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="dsv41-tail-push"
+            max_workers=WRITE_ROOMS, thread_name_prefix="dsv41-tail-push"
         )
+        self._part_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=WRITE_PARTS, thread_name_prefix="dsv41-tail-push-part"
+        )
+        # The socket is not thread-safe: the heartbeat thread shares it under this lock.
+        self._socket_lock = threading.Lock()
         self.welcome: Optional[Welcome] = None
         self.refused: Optional[str] = None
         self._heard_at: Optional[float] = None
@@ -197,13 +232,18 @@ class TailStageClient:
         self.tails_pushed = 0
         self._timings = _Timings()
         self._timings_at = clock()
+        self._stop = threading.Event()
+        if heartbeat_thread:
+            threading.Thread(
+                target=self._heartbeat_loop, name="dsv41-tail-beat", daemon=True
+            ).start()
 
     # -- the scheduler loop --
 
     def poll(self) -> None:
         """Drain the tail server's messages, resend due requests, keep alive."""
         now = self._clock()
-        while (data := self._socket.recv()) is not None:
+        while (data := self._recv()) is not None:
             try:
                 self._on_message(decode(data), now)
             except ProtocolError as exc:
@@ -223,9 +263,7 @@ class TailStageClient:
             if room.retry_at is not None and now >= room.retry_at:
                 room.retry_at = None
                 self._send(room.request)
-        if self.welcome is not None and now - self._beat_at >= self._heartbeat_s:
-            self._beat_at = now
-            self._send(Heartbeat(inflight=len(self._rooms)))
+        self._heartbeat(now)
         if now - self._timings_at >= STATS_LOG_S:
             summary = self._timings.summary()
             if summary:
@@ -256,9 +294,14 @@ class TailStageClient:
             # Nothing comes back that stage 0 waits for.
             del self._rooms[room]
 
+    def requested(self, room: int) -> bool:
+        return room in self._rooms
+
     def grant(self, room: int) -> Optional[SlotGrant]:
         entry = self._rooms.get(room)
-        return None if entry is None or entry.closing is not None else entry.grant
+        if entry is None or entry.closing is not None or entry.error is not None:
+            return None
+        return entry.grant
 
     def error(self, room: int) -> Optional[str]:
         """Why the room's slot will never come, if it will not."""
@@ -271,9 +314,13 @@ class TailStageClient:
 
     def start_push(
         self, *, room: int, src_pages: np.ndarray, capture_slot: int
-    ) -> None:
+    ) -> bool:
+        """Start the slot's writes; refused (False) once the slot has failed, as the
+        tail server may hand a freed slot to another room."""
+        if self.grant(room) is None:
+            return False
         entry = self._rooms[room]
-        assert entry.grant is not None and entry.push is None
+        assert entry.push is None
         blocks = push_blocks(
             pools=self._pools,
             welcome=self.welcome,
@@ -282,14 +329,18 @@ class TailStageClient:
             capture_slot=capture_slot,
         )
         entry.t_push = self._clock()
+        entry.descriptors = len(blocks)
+        entry.nbytes = sum(length for _, _, length in blocks)
         entry.push = self._executor.submit(self._write, blocks)
+        return True
 
     def push_result(self, room: int) -> Optional[bool]:
-        """None while the room's writes run, else whether they succeeded."""
-        push = self._rooms[room].push
-        if push is None or not push.done():
+        """None while the room's writes run, else whether they succeeded; a write
+        into a slot that failed meanwhile does not count."""
+        entry = self._rooms[room]
+        if entry.push is None or not entry.push.done():
             return None
-        return push.result()
+        return entry.push.result() and entry.error is None
 
     def pushing(self, room: int) -> bool:
         entry = self._rooms.get(room)
@@ -306,6 +357,8 @@ class TailStageClient:
         self._timings.add("grant_to_ready", (now - entry.t_grant) * 1e3)
         if entry.t_push is not None:
             self._timings.add("write", (now - entry.t_push) * 1e3)
+            self._timings.add("descriptors", entry.descriptors)
+            self._timings.add("write_mb", entry.nbytes / 1e6)
 
     def abort(self, room: int) -> None:
         """The request left before its slot was ready. A granted slot is given back
@@ -329,11 +382,20 @@ class TailStageClient:
         self._send(msg)
 
     def close(self) -> None:
+        self._stop.set()
         self._executor.shutdown(wait=False, cancel_futures=True)
+        self._part_executor.shutdown(wait=False, cancel_futures=True)
 
     # -- internals --
 
     def _write(self, blocks: List[Tuple[int, int, int]]) -> bool:
+        parts = split_blocks(blocks, parts=WRITE_PARTS)
+        if len(parts) == 1:
+            return self._write_part(parts[0])
+        futures = [self._part_executor.submit(self._write_part, p) for p in parts]
+        return all([f.result() for f in futures])
+
+    def _write_part(self, blocks: List[Tuple[int, int, int]]) -> bool:
         src, dst, lengths = zip(*blocks)
         rc = self._transfer(
             self.welcome.tail_session, list(src), list(dst), list(lengths)
@@ -342,8 +404,24 @@ class TailStageClient:
             logger.error("DSV4.1 tail stage: slot write failed (rc=%s)", rc)
         return rc == 0
 
+    def _heartbeat(self, now: float) -> None:
+        with self._socket_lock:
+            if self.welcome is None or now - self._beat_at < self._heartbeat_s:
+                return
+            self._beat_at = now
+            self._socket.send(encode(Heartbeat(inflight=len(self._rooms))))
+
+    def _heartbeat_loop(self) -> None:
+        while not self._stop.wait(self._heartbeat_s / 2):
+            self._heartbeat(self._clock())
+
     def _send(self, msg) -> None:
-        self._socket.send(encode(msg))
+        with self._socket_lock:
+            self._socket.send(encode(msg))
+
+    def _recv(self) -> Optional[bytes]:
+        with self._socket_lock:
+            return self._socket.recv()
 
     def _on_message(self, msg, now: float) -> None:
         self._heard_at = now
@@ -394,6 +472,11 @@ class TailStageClient:
                     msg.status,
                     msg.reason,
                 )
+                entry = self._rooms.get(msg.room)
+                if entry is not None and entry.closing is None:
+                    # No write may start into the slot; the request fails, and its
+                    # answer (TailReady(ok=False) or TailAbort) frees the slot.
+                    entry.error = f"tail stage {msg.status}: {msg.reason}"
         elif not isinstance(msg, Heartbeat):
             logger.warning("DSV4.1 tail stage: unexpected %s", type(msg).__name__)
 
