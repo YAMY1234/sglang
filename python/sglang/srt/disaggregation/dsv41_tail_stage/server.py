@@ -36,12 +36,16 @@ def run_tail_stage(scheduler) -> None:
     fwd = build_forward(scheduler)
     counts = envs.SGLANG_DSV41_TAIL_STAGE_SELF_BENCH.get()
     if counts:
-        self_bench(
-            fwd,
-            counts=parse_buckets(counts),
-            prefix_len=envs.SGLANG_DSV41_TAIL_STAGE_SELF_BENCH_PREFIX.get(),
-            iters=envs.SGLANG_DSV41_TAIL_STAGE_SELF_BENCH_ITERS.get(),
-        )
+        for prefix_len in parse_buckets(
+            envs.SGLANG_DSV41_TAIL_STAGE_SELF_BENCH_PREFIX.get()
+        ):
+            self_bench(
+                fwd,
+                counts=parse_buckets(counts),
+                prefix_len=prefix_len,
+                iters=envs.SGLANG_DSV41_TAIL_STAGE_SELF_BENCH_ITERS.get(),
+            )
+        logger.info("DSV4.1 tail stage bench: all done")
     if envs.SGLANG_DSV41_TAIL_STAGE_PORT.get():
         from sglang.srt.disaggregation.dsv41_tail_stage.service import build_service
 

@@ -214,12 +214,12 @@ class TestTailStageAcrossLanes(CustomTestCase):
         # Decode receives both stages' wires: W0, and W0 plus the tail entries.
         self.assertEqual(info["state_wires"], [W0, tail_stage_wire(W0, True)])
 
-        self.client.request(room=7, rid="a", s=4001, e=4000, late_fed=True)
+        self.client.request(room=7, rid="a", s=4101, e=4100, late_fed=True)
         self.client.request(room=8, rid="b", s=100, e=0, late_fed=False)
         self._turn()
         grant = self.client.grant(7)
         self.assertIsNotNone(grant)
-        self.assertEqual(len(grant.c1_pages), 16)  # ceil(4000 / 256)
+        self.assertEqual(len(grant.c1_pages), 16)  # ceil((4100 - 128) / 256)
         self.assertIsNone(self.client.grant(8))
         self.assertEqual(sorted(self.senders), [7, 8])
 

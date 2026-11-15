@@ -2140,9 +2140,10 @@ class Envs:
     # Send decode the tail rows' DSpark captures; decode must run DSpark.
     SGLANG_DSV41_TAIL_STAGE_DRAFT_AUX = EnvBool(True)
     # Startup timing of the tail server's forward: comma-separated tail counts, each
-    # over SELF_BENCH_PREFIX-token prefixes, SELF_BENCH_ITERS timed runs.
+    # over each of the comma-separated SELF_BENCH_PREFIX token prefixes,
+    # SELF_BENCH_ITERS timed runs.
     SGLANG_DSV41_TAIL_STAGE_SELF_BENCH = EnvStr(None)
-    SGLANG_DSV41_TAIL_STAGE_SELF_BENCH_PREFIX = EnvInt(142720)
+    SGLANG_DSV41_TAIL_STAGE_SELF_BENCH_PREFIX = EnvStr("142720")
     SGLANG_DSV41_TAIL_STAGE_SELF_BENCH_ITERS = EnvInt(10)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)

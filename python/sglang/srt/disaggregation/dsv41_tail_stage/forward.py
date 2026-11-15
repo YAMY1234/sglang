@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 from array import array
+from contextlib import nullcontext
 from typing import Dict, List, Optional, Sequence
 
 import msgspec
@@ -26,6 +27,18 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
+
+
+def window_row_floors(
+    *, prompt_lens: Sequence[int], window: int, positions: torch.Tensor
+) -> torch.Tensor:
+    """Each window row's late-layer SWA floor: s - W, the floor bounded replay gives
+    the prompt's last window; a row below it (1 or 2 per tail) attends to itself
+    only, as a fed tail's do on decode (_floored_verify_swa)."""
+    floors = torch.tensor(
+        prompt_lens, dtype=torch.int64, device=positions.device
+    ).repeat_interleave(window)
+    return torch.minimum(floors - window, positions.to(torch.int64))
 
 
 class TailRun(msgspec.Struct):
@@ -59,27 +72,31 @@ class TailStageForward:
         self.storage = kv_storage_of(req_to_token_pool, allocator)
         config = model_config.hf_text_config
         device = model_runner.device
-        # [slots, W, hc_mult, hidden] bf16: the late layers' input stage 0 writes.
-        self.residual = torch.zeros(
-            num_slots,
-            window,
-            config.hc_mult,
-            config.hidden_size,
-            dtype=torch.bfloat16,
-            device=device,
-        )
-        self.aux: Optional[torch.Tensor] = None
-        if draft_aux:
-            layers = list(config.dspark_target_layer_ids)
-            model_runner.model.set_dspark_layers_to_capture(layers)
-            # [slots, W, captures * hidden] bf16, in dspark_layers_to_capture order.
-            self.aux = torch.zeros(
+        mem_pool = model_runner.token_to_kv_pool.custom_mem_pool
+        # Mooncake reads and writes these as the KV pools: under a custom memory
+        # pool (MNNVL) they must come from it, as the pools' buffers do.
+        with torch.cuda.use_mem_pool(mem_pool) if mem_pool else nullcontext():
+            # [slots, W, hc_mult, hidden] bf16: the late layers' input stage 0 writes.
+            self.residual = torch.zeros(
                 num_slots,
                 window,
-                len(layers) * config.hidden_size,
+                config.hc_mult,
+                config.hidden_size,
                 dtype=torch.bfloat16,
                 device=device,
             )
+            self.aux: Optional[torch.Tensor] = None
+            if draft_aux:
+                layers = list(config.dspark_target_layer_ids)
+                model_runner.model.set_dspark_layers_to_capture(layers)
+                # [slots, W, captures * hidden] bf16, in dspark_layers_to_capture order.
+                self.aux = torch.zeros(
+                    num_slots,
+                    window,
+                    len(layers) * config.hidden_size,
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
 
     def admit(
         self, *, rid: str, e: int, tail_token_ids: Optional[Sequence[int]] = None
@@ -155,15 +172,10 @@ class TailStageForward:
         forward_batch = ForwardBatch.init_new(
             batch, self.model_runner, return_hidden_states_before_norm=False
         )
-        floors = torch.tensor(
-            [t.s - self.window for t in tails],
-            dtype=torch.int64,
-            device=self.residual.device,
-        ).repeat_interleave(self.window)
-        # Rows below the late-layer floor s - W attend to themselves only, as a
-        # fed tail's do on decode.
-        forward_batch.encoder_swa_row_floor = torch.minimum(
-            floors, forward_batch.positions.to(torch.int64)
+        forward_batch.encoder_swa_row_floor = window_row_floors(
+            prompt_lens=[t.s for t in tails],
+            window=self.window,
+            positions=forward_batch.positions,
         )
         return forward_batch
 
