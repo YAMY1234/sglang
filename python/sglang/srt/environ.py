@@ -764,6 +764,12 @@ class Envs:
     # Opt-in, PP prefill: the first stage streams a request's finish once every
     # stage's KV transfer succeeded; the PP release consensus still frees its KV.
     SGLANG_OPT_DISAGG_PP_PREFILL_EARLY_FINISH = EnvBool(False)
+    # Opt-in, PP prefill (PD, Mooncake): no output ring. The last stage processes
+    # its own output and alone sends the first token and draft state to decode.
+    SGLANG_PP_PD_LOCAL_RESULT = EnvBool(False)
+    # Opt-in, PP prefill (PD): PP0's HiCache ready counts ride the request relay
+    # instead of a blocking PP0 -> PP1 -> ... send/recv chain.
+    SGLANG_PP_HICACHE_COUNTS_PIGGYBACK = EnvBool(False)
     # Override NVML Confidential Computing autodetection. None = autodetect.
     SGLANG_FORCE_CONFIDENTIAL_COMPUTE = EnvBool(None)
 

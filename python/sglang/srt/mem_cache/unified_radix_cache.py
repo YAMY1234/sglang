@@ -6,6 +6,7 @@ import logging
 import threading
 import time
 from array import array
+from collections import deque
 from contextlib import nullcontext
 from dataclasses import replace
 from http import HTTPStatus
@@ -362,6 +363,12 @@ class UnifiedRadixCache(BasePrefixCache):
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
         self.work_list: list[torch.distributed.Work] = []
+        # Set by the PP prefill scheduler: ready counts ride its request relay.
+        # PP0 queues its reduced counts in pp_counts_out; later stages take them
+        # from pp_counts_in and forward them through pp_counts_out.
+        self.pp_counts_piggyback = False
+        self.pp_counts_in: deque[list[int]] = deque()
+        self.pp_counts_out: list[list[int]] = []
 
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
@@ -4081,6 +4088,8 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         if self.host_memory_mode == "buffer_only" and self.pp_size > 1:
             self._all_reduce_attn_groups(ready_counts, torch.distributed.ReduceOp.MIN)
+        elif self.pp_counts_piggyback:
+            ready_counts = self._piggyback_ready_counts(ready_counts)
         else:
             self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
 
@@ -4094,6 +4103,21 @@ class UnifiedRadixCache(BasePrefixCache):
             tuple(count_values[2:-2]),
             extra_pool_names,
         )
+
+    def _piggyback_ready_counts(self, ready_counts: torch.Tensor) -> torch.Tensor:
+        """Same values as _all_reduce: PP0 reduces over its attention TP/CP ranks
+        and every later stage adopts PP0's result, here taken from the request
+        relay received earlier in the same loop iteration."""
+        if self.pp_rank == 0:
+            self._all_reduce_attn_groups(ready_counts, torch.distributed.ReduceOp.MIN)
+            counts = ready_counts.tolist()
+        else:
+            assert self.pp_counts_in, "HiCache ready counts missing from the PP relay"
+            counts = self.pp_counts_in.popleft()
+            ready_counts = torch.tensor(counts, dtype=torch.int64, device="cpu")
+        if self.pp_rank + 1 < self.pp_size:
+            self.pp_counts_out.append(counts)
+        return ready_counts
 
     def _shm_count_exchange(self) -> Optional[ShmTagExchange]:
         # Only the single-group, single-stage layout; anything else keeps the gloo reduce.

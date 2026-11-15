@@ -28,6 +28,7 @@ from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Deque,
     Dict,
     List,
@@ -2268,12 +2269,17 @@ class Scheduler(
         for prev_batch, prev_result in self.result_queue:
             self.batch_result_processor.advance_grammar_fsm(prev_result, prev_batch)
 
-    def ingest_requests(self, stop_at_pause: bool = False) -> List:
+    def ingest_requests(
+        self,
+        stop_at_pause: bool = False,
+        take_relay_extras: Optional[Callable[[List], List]] = None,
+    ) -> List:
         """Receive and broadcast input, then dispatch queued requests in order.
 
         With stop_at_pause, retain the first pause and all following inputs
         until the caller reaches a scheduling boundary. Receiving and broadcasting
-        continue each pass; all ranks retain the same suffix.
+        continue each pass; all ranks retain the same suffix. take_relay_extras
+        removes non-request items a PP stage appended to its relay.
 
         The one place a new per-iteration input source belongs; the return
         value, held requests included, exists for the pipeline stages that
@@ -2294,6 +2300,8 @@ class Scheduler(
             local_reqs = self._poll_timeout_aborts()
         recv_start_ns = time.monotonic_ns()
         received_reqs = self.request_receiver.recv_requests(local_reqs=local_reqs)
+        if take_relay_extras is not None:
+            received_reqs = take_relay_extras(received_reqs)
         self._deferred_input_requests.extend(received_reqs)
 
         num_requests_to_process = len(self._deferred_input_requests)

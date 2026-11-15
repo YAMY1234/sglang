@@ -3046,12 +3046,21 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     )
                                     break
 
-                            # Only the last chunk we need to send the aux data
-                            ret = self.send_aux(
-                                req,
-                                kv_chunk.prefill_aux_index,
-                                target_rank_registration_info.dst_aux_ptrs,
-                                target_rank_registration_info.dst_aux_item_lens,
+                            # Only the last chunk we need to send the aux data.
+                            # PD local result: only the last PP stage holds the
+                            # sampled token and draft state, so it alone writes
+                            # decode's aux slot; that write lands before its
+                            # Success, and decode waits for every stage's Success.
+                            ret = (
+                                0
+                                if envs.SGLANG_PP_PD_LOCAL_RESULT.get()
+                                and self.pp_rank != self.pp_size - 1
+                                else self.send_aux(
+                                    req,
+                                    kv_chunk.prefill_aux_index,
+                                    target_rank_registration_info.dst_aux_ptrs,
+                                    target_rank_registration_info.dst_aux_item_lens,
+                                )
                             )
                             if ret != 0:
                                 # The aux write targets decode's metadata
