@@ -63,7 +63,6 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
     HiCacheRestoreResult,
 )
-from sglang.srt.disaggregation.dsv41_tail_stage.layout import tail_swa_page_ids
 from sglang.srt.disaggregation.dsv41_tail_stage_decode import (
     TAIL_AUX_ABORT_REST_STEPS,
     TAIL_AUX_READ_REST_STEPS,
@@ -494,6 +493,8 @@ _ASYNC_READBACK_STATE_TYPES = frozenset(
         StateType.SWA_RING,
         StateType.DSV4_REQUEST_STATE,
         StateType.REQUEST_ROW,
+        StateType.DSV41_TAIL_SWA,
+        StateType.DSV41_TAIL_DRAFT_AUX,
         StateType.BLOCK_SCALE,
         StateType.BLOCK_SCALE_SWA,
     }
@@ -2322,17 +2323,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             return np.array([decode_req.req.kv.req_pool_idx], dtype=np.int32)
 
         def _tail_swa_payload():
-            # The SWA pages of the window the tail server runs, [e - window, e).
+            # The window pages of [e - window, e), the window the tail server runs:
+            # the window entry's own rule (layers 20-39 instead of 0-19), no host sync.
             req = decode_req.req
             if not req.dsv41_late_fed:
                 return np.empty((0,), dtype=np.int32)
             e = req.dsv41_tail_start
-            return tail_swa_page_ids(
-                self.token_to_kv_pool,
-                self.req_to_token_pool.req_to_token[req.kv.req_pool_idx],
-                start=e - self.scheduler.model_config.sliding_window_size,
-                end=e,
+            storage = kv_storage_of(
+                self.req_to_token_pool, self.token_to_kv_pool_allocator
             )
+            pages = storage.resume_units(
+                window_sub_pool_of(self.token_to_kv_pool_allocator),
+                req,
+                token_start=e - self.scheduler.model_config.sliding_window_size,
+                token_boundary=e,
+            ).unit_ids
+            return pages if non_blocking_metadata else pages.cpu().numpy()
 
         def _tail_aux_payload():
             slot = decode_req.req.dsv41_tail_aux_slot
