@@ -213,7 +213,9 @@ class TestTailStageClient(CustomTestCase):
         transfer = MagicMock(return_value=0)
         client, sock, _ = _welcomed(transfer)
         client.request(room=1, rid="r", s=1001, e=1000, late_fed=True)
-        sock.inbox.append(P.SlotGrant(room=1, slot=3, residual_slot=4, c1_pages=[8, 9, 10, 11]))
+        sock.inbox.append(
+            P.SlotGrant(room=1, slot=3, residual_slot=4, c1_pages=[8, 9, 10, 11])
+        )
         client.poll()
         client.start_push(room=1, src_pages=np.array([0, 1, 2, 3]), capture_slot=6)
         client._rooms[1].push.result(timeout=5)
@@ -238,17 +240,24 @@ class TestTailStageClient(CustomTestCase):
         client.ready(1, ok=False)
         self.assertFalse(sock.take(P.TailReady)[0].ok)
 
-    def test_ready_while_the_write_runs_is_not_ok(self):
+    def test_abort_waits_for_a_write_in_flight(self):
+        """The tail server reuses a slot once it hears of the abort, so a write still
+        in flight must land before TailAbort leaves."""
         gate = threading.Event()
-        client, sock, _ = _welcomed(lambda *_: gate.wait(5) and 0)
+        client, sock, _ = _welcomed(lambda *_: 0 if gate.wait(5) else -1)
         client.request(room=1, rid="r", s=1001, e=1000, late_fed=True)
         sock.inbox.append(P.SlotGrant(room=1, slot=3, residual_slot=4, c1_pages=[8]))
         client.poll()
         client.start_push(room=1, src_pages=np.array([0]), capture_slot=0)
-        self.assertIsNone(client.push_result(1))
-        client.ready(1, ok=True)
+        client.abort(1)
+        client.poll()
+        self.assertEqual(sock.take(P.TailAbort), [])
+        self.assertIsNone(client.grant(1))
         gate.set()
-        self.assertFalse(sock.take(P.TailReady)[0].ok)
+        client._rooms[1].push.result(timeout=5)
+        client.poll()
+        self.assertEqual(sock.take(P.TailAbort)[0].room, 1)
+        self.assertNotIn(1, client._rooms)
 
     def test_abort_before_ready_and_a_late_grant_go_back(self):
         client, sock, _ = _welcomed()
@@ -301,7 +310,9 @@ class TestBootstrapWait(CustomTestCase):
         self.assertFalse(wait(queue, req))
         self.assertFalse(wait(queue, req))
         self.assertEqual(len(sock.take(P.SlotRequest)), 1)
-        sock.inbox.append(P.SlotGrant(room=1, slot=0, residual_slot=0, c1_pages=[0] * 4))
+        sock.inbox.append(
+            P.SlotGrant(room=1, slot=0, residual_slot=0, c1_pages=[0] * 4)
+        )
         client.poll()
         self.assertTrue(wait(queue, req))
         queue.kv_manager.conclude_failure.assert_not_called()
@@ -328,7 +339,9 @@ class TestPushAfterDecodeSuccess(CustomTestCase):
         client, sock, _ = _welcomed()
         queue, req = _granted_queue(client)
         self.assertFalse(PrefillBootstrapQueue._tail_stage_granted(queue, req))
-        sock.inbox.append(P.SlotGrant(room=1, slot=2, residual_slot=2, c1_pages=[5, 6, 7, 8]))
+        sock.inbox.append(
+            P.SlotGrant(room=1, slot=2, residual_slot=2, c1_pages=[5, 6, 7, 8])
+        )
         client.poll()
         req.kv = SimpleNamespace(req_pool_idx=1)
         req.dsv41_late_capture_slot = 9
@@ -381,9 +394,11 @@ class TestAdvertisedStages(CustomTestCase):
             ),
         )
         for flag, pp_size in ((False, 1), (True, 2)):
-            with patch.multiple(conn, **context), patch(
-                f"{conn}.dsv41_tail_stage_enabled", return_value=flag
-            ), patch.object(CommonKVManager, "_register_topology_row") as put:
+            with (
+                patch.multiple(conn, **context),
+                patch(f"{conn}.dsv41_tail_stage_enabled", return_value=flag),
+                patch.object(CommonKVManager, "_register_topology_row") as put,
+            ):
                 mgr.register_to_bootstrap()
             payload = put.call_args.args[1]
             self.assertEqual((payload["pp_size"], payload["pp_rank"]), (pp_size, 0))

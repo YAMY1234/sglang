@@ -1,9 +1,10 @@
 """SGLANG_DSV41_TAIL_STAGE on an encoder-only prefill (stage 0): the tail server's client.
 
 Stage 0 asks the tail server for a slot at bootstrap (a late-fed request waits there for
-its grant), and once its own decode transfer has succeeded writes the c1 KV and c1-index
-pages of the prefix [0, e) and the window's late-layer input into the granted slot, then
-reports the slot ready. Messages are in `dsv41_tail_stage.protocol`.
+its grant). Once its forward has run all of the prefix [0, e), it writes the prefix's c1
+KV and c1-index pages and the window's late-layer input into the granted slot, reports
+the slot ready, and holds its pages until both this write and its decode send have
+ended. Messages are in `dsv41_tail_stage.protocol`, buffers in `dsv41_tail_stage.layout`.
 """
 
 from __future__ import annotations
@@ -52,23 +53,6 @@ class Stage0Pools(msgspec.Struct, frozen=True):
     c1_index_item_lens: List[int]
     residual_ptr: int
     residual_item_len: int
-
-
-def c1_buf_infos(pool) -> Tuple[List[int], List[int], List[int], List[int]]:
-    """The ratio-1 (c1) KV and index-K entries of a DeepSeek-V4.1 pool, addressed by
-    full page id as `get_contiguous_buf_infos` registers them for PD."""
-    kv_ptrs, kv_items, index_ptrs, index_items = [], [], [], []
-    for buf in pool.kv_pools[1].kv_buffer:
-        assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
-        kv_ptrs.append(buf.data_ptr())
-        kv_items.append(buf[0].nbytes)
-    index_pool = pool.index_pools[1]
-    index_pages_per_full_page = pool.page_size // index_pool.page_size
-    for buf in index_pool.contiguous_page_row_buffers():
-        assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
-        index_ptrs.append(buf.data_ptr())
-        index_items.append(buf[0].nbytes * index_pages_per_full_page)
-    return kv_ptrs, kv_items, index_ptrs, index_items
 
 
 def layout_error(pools: Stage0Pools, welcome: Welcome) -> Optional[str]:
@@ -142,6 +126,8 @@ class _Room(msgspec.Struct):
     grant: Optional[SlotGrant] = None
     error: Optional[str] = None
     push: Optional[concurrent.futures.Future] = None
+    # The request left; the message goes once the slot's write has ended.
+    closing: Optional[object] = None
 
 
 class TailStageClient:
@@ -194,7 +180,12 @@ class TailStageClient:
         ):
             self._hello_at = now
             self._send(self._hello)
-        for room in self._rooms.values():
+        for room_id, room in list(self._rooms.items()):
+            if room.closing is not None:
+                if room.push.done():
+                    del self._rooms[room_id]
+                    self._send(room.closing)
+                continue
             if room.retry_at is not None and now >= room.retry_at:
                 room.retry_at = None
                 self._send(room.request)
@@ -216,7 +207,9 @@ class TailStageClient:
         server answers decode for it."""
         if room in self._rooms:
             return
-        msg = SlotRequest(room=room, rid=rid, s=s, e=e if late_fed else 0, late_fed=late_fed)
+        msg = SlotRequest(
+            room=room, rid=rid, s=s, e=e if late_fed else 0, late_fed=late_fed
+        )
         self._rooms[room] = _Room(request=msg)
         self._send(msg)
         if not late_fed:
@@ -225,7 +218,7 @@ class TailStageClient:
 
     def grant(self, room: int) -> Optional[SlotGrant]:
         entry = self._rooms.get(room)
-        return None if entry is None else entry.grant
+        return None if entry is None or entry.closing is not None else entry.grant
 
     def error(self, room: int) -> Optional[str]:
         """Why the room's slot will never come, if it will not."""
@@ -236,7 +229,9 @@ class TailStageClient:
         entry = self._rooms.get(room)
         return None if entry is None else entry.error
 
-    def start_push(self, *, room: int, src_pages: np.ndarray, capture_slot: int) -> None:
+    def start_push(
+        self, *, room: int, src_pages: np.ndarray, capture_slot: int
+    ) -> None:
         entry = self._rooms[room]
         assert entry.grant is not None and entry.push is None
         blocks = push_blocks(
@@ -261,20 +256,27 @@ class TailStageClient:
 
     def ready(self, room: int, *, ok: bool) -> None:
         """The slot's writes have returned (or stage 0 gave up on it)."""
-        entry = self._rooms.pop(room, None)
-        if entry is None or entry.grant is None:
+        entry = self._rooms.get(room)
+        if entry is None or entry.grant is None or entry.closing is not None:
             return
-        if entry.push is not None and not entry.push.done():
-            # A write still in flight may yet land; its result is dropped.
-            ok = False
-        self._send(TailReady(room=room, slot=entry.grant.slot, ok=ok))
+        self._close(room, TailReady(room=room, slot=entry.grant.slot, ok=ok))
         self.tails_pushed += ok
 
     def abort(self, room: int) -> None:
         """The request left before its slot was ready."""
-        entry = self._rooms.pop(room, None)
-        if entry is not None:
-            self._send(TailAbort(room=room))
+        entry = self._rooms.get(room)
+        if entry is not None and entry.closing is None:
+            self._close(room, TailAbort(room=room))
+
+    def _close(self, room: int, msg) -> None:
+        entry = self._rooms[room]
+        if entry.push is not None and not entry.push.done():
+            # The slot is reused once the tail server hears of it: a write still
+            # in flight must land first.
+            entry.closing = msg
+            return
+        del self._rooms[room]
+        self._send(msg)
 
     def close(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
@@ -298,7 +300,9 @@ class TailStageClient:
         if isinstance(msg, Welcome):
             self.refused = layout_error(self._pools, msg)
             if self.refused is not None:
-                logger.error("DSV4.1 tail stage: %s; late-fed requests fail", self.refused)
+                logger.error(
+                    "DSV4.1 tail stage: %s; late-fed requests fail", self.refused
+                )
                 return
             if self.welcome is None:
                 logger.info(
@@ -320,16 +324,17 @@ class TailStageClient:
             if entry is not None:
                 entry.retry_at = now + msg.retry_ms / 1000
         elif isinstance(msg, Error):
-            logger.error(
-                "DSV4.1 tail stage error (room %s): %s", msg.room, msg.reason
-            )
+            logger.error("DSV4.1 tail stage error (room %s): %s", msg.room, msg.reason)
             entry = None if msg.room is None else self._rooms.get(msg.room)
             if entry is not None:
                 entry.error = msg.reason
         elif isinstance(msg, TailDone):
             if msg.status != "ok":
                 logger.warning(
-                    "DSV4.1 tail stage: room %d %s (%s)", msg.room, msg.status, msg.reason
+                    "DSV4.1 tail stage: room %d %s (%s)",
+                    msg.room,
+                    msg.status,
+                    msg.reason,
                 )
         elif not isinstance(msg, Heartbeat):
             logger.warning("DSV4.1 tail stage: unexpected %s", type(msg).__name__)

@@ -44,12 +44,15 @@ from sglang.srt.disaggregation.common.staging_buffer import (
     staging_grid_tokens,
 )
 from sglang.srt.disaggregation.minimax import minimax_index_transfer_pages
+from sglang.srt.disaggregation.dsv41_tail_stage.layout import (
+    c1_buf_infos,
+    c1_page_ids,
+)
 from sglang.srt.disaggregation.dsv41_tail_stage.protocol import Hello
 from sglang.srt.disaggregation.dsv41_tail_stage_client import (
     Stage0Pools,
     TailStageClient,
     ZmqDealer,
-    c1_buf_infos,
 )
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.disaggregation.utils import (
@@ -520,12 +523,13 @@ class PrefillBootstrapQueue:
         capture_ptrs, capture_lens, capture_items = capture.transfer_buf_infos()
         # The window's late-layer input is written from here; it is no PD state entry.
         kv_manager.engine.batch_register(capture_ptrs, capture_lens)
-        kv_ptrs, kv_items, index_ptrs, index_items = c1_buf_infos(self.token_to_kv_pool)
+        c1_kv, c1_index = c1_buf_infos(self.token_to_kv_pool)
+        kv_items, index_items = c1_kv.item_lens, c1_index.item_lens
         pools = Stage0Pools(
             page_size=self.token_to_kv_pool.page_size,
-            c1_kv_ptrs=kv_ptrs,
+            c1_kv_ptrs=c1_kv.ptrs,
             c1_kv_item_lens=kv_items,
-            c1_index_ptrs=index_ptrs,
+            c1_index_ptrs=c1_index.ptrs,
             c1_index_item_lens=index_items,
             residual_ptr=capture_ptrs[0],
             residual_item_len=capture_items[0],
@@ -854,21 +858,22 @@ class SchedulerDisaggregationPrefillMixin:
             client.abort(req.bootstrap_room)
 
     def _dsv41_tail_push_pending(self: Scheduler, req: Req) -> bool:
-        """SGLANG_DSV41_TAIL_STAGE: once the decode transfer has succeeded, write the
-        granted slot (the prefix's c1 pages and the window), then report it ready.
-        The slot's layer-20 rows then land on decode after this prefill's, and the
-        pages stay held until both sends end."""
+        """SGLANG_DSV41_TAIL_STAGE: write the granted slot (the prefix's c1 pages and
+        the window) as soon as the forward has run all of the prefix, and report it
+        ready when the write returns. True while the write runs: the request's pages
+        stay held until both it and the decode send have ended."""
         client = self.disagg_prefill_bootstrap_queue.tail_stage
         room = req.bootstrap_room
         if client is None or client.grant(room) is None:
             return False
         if not client.pushing(room):
-            page_size = self.token_to_kv_pool_allocator.page_size
-            e = len(req.origin_input_ids)
-            locs = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :e:page_size]
             client.start_push(
                 room=room,
-                src_pages=(locs // page_size).cpu().numpy(),
+                src_pages=c1_page_ids(
+                    self.req_to_token_pool.req_to_token[req.kv.req_pool_idx],
+                    e=len(req.origin_input_ids),
+                    page_size=self.token_to_kv_pool_allocator.page_size,
+                ),
                 capture_slot=req.dsv41_late_capture_slot,
             )
             return True
@@ -1640,11 +1645,18 @@ class SchedulerDisaggregationPrefillMixin:
                     self.optimistic_release_and_requeue(req)
                 continue
 
+            # A request reaches this queue once its forward has run all of its
+            # prefix: its tail-stage write starts beside the decode send.
+            tail_pending = (
+                req.dsv41_late_fed
+                and poll != KVPoll.Failed
+                and self._dsv41_tail_push_pending(req)
+            )
             if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
                 # todo: set Transferring correctly in backend
                 pass
             elif poll == KVPoll.Success:  # transfer done
-                if req.dsv41_late_fed and self._dsv41_tail_push_pending(req):
+                if tail_pending:
                     continue
                 if req.return_routed_experts:
                     self.batch_result_processor._maybe_collect_routed_experts(req)
