@@ -132,6 +132,12 @@ class Disagg(msgspec.Struct):
         "prompt; decode receives that KV plus the encoder SWA window, runs the "
         "final window through the full model, and samples the first token.",
     ] = False
+    dsv41_tail_stage_server: A[
+        bool,
+        "DeepSeek-V4.1 tail server for encoder-only PD (SGLANG_DSV41_TAIL_STAGE). "
+        "Set by its entrypoint, not on the command line: the server loads only the "
+        "layers from the last KV source on and runs prompt windows through them.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Encode prefill disaggregation

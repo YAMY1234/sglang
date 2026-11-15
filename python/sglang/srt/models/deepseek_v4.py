@@ -337,6 +337,12 @@ def dsv41_encoder_only_prefill_weight_needed(name: str, boundary: int) -> bool:
     return True
 
 
+def dsv41_tail_stage_weight_needed(name: str, start: int, num_layers: int) -> bool:
+    """Whether a remapped checkpoint tensor belongs to the tail server's layers."""
+    layer_id = get_layer_id(name)
+    return layer_id is not None and start <= layer_id < num_layers
+
+
 def _is_fused_mhc_post_pre_enabled_xpu() -> bool:
     if _is_xpu:
         return envs.SGLANG_OPT_FUSE_MHC_POST_PRE.get()
@@ -4053,6 +4059,7 @@ class DeepseekV4Model(nn.Module):
     # Class-level defaults for instances built without running __init__.
     decoder_replay_tail: Optional[DecoderReplayTail] = None
     encoder_only_boundary_layer: Optional[int] = None
+    tail_stage_start_layer: Optional[int] = None
 
     def __init__(
         self,
@@ -4071,7 +4078,14 @@ class DeepseekV4Model(nn.Module):
         self.encoder_only_boundary_layer = (
             max(config.kv_source_layer_ids) if self.encoder_only_prefill else None
         )
-        if self.pp_group.is_first_rank:
+        # SGLANG_DSV41_TAIL_STAGE server: layers from the last KV source on, fed the
+        # residual the encoder-only prefill captured at that layer.
+        self.tail_stage_start_layer = (
+            max(config.kv_source_layer_ids)
+            if get_disagg().dsv41_tail_stage_server
+            else None
+        )
+        if self.pp_group.is_first_rank and self.tail_stage_start_layer is None:
             embedding_quant_config = (
                 quant_config
                 if quant_config is not None and quant_config.get_name() == "expert_pack"
@@ -4127,6 +4141,11 @@ class DeepseekV4Model(nn.Module):
         self.engram_layout = EngramLayout.from_config(config)
 
         def make_layer(idx: int, prefix: str) -> nn.Module:
+            if (
+                self.tail_stage_start_layer is not None
+                and idx < self.tail_stage_start_layer
+            ):
+                return PPMissingLayer()
             if self.encoder_only_boundary_layer is not None:
                 if idx > self.encoder_only_boundary_layer:
                     return PPMissingLayer()
@@ -4160,7 +4179,12 @@ class DeepseekV4Model(nn.Module):
         )
         if self.encoder_only_boundary_layer is not None:
             self.end_layer = self.encoder_only_boundary_layer + 1
-        if self.pp_group.is_last_rank and not self.encoder_only_prefill:
+        if self.tail_stage_start_layer is not None:
+            self.start_layer = self.tail_stage_start_layer
+        builds_head = (
+            not self.encoder_only_prefill and self.tail_stage_start_layer is None
+        )
+        if self.pp_group.is_last_rank and builds_head:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
@@ -4172,7 +4196,7 @@ class DeepseekV4Model(nn.Module):
         self.hc_head_fn = self.hc_head_base = self.hc_head_scale = None
         if (
             self.pp_group.is_last_rank
-            and not self.encoder_only_prefill
+            and builds_head
             and not self.hc_pre_from_prev_sublayer
         ):
             (
@@ -4181,7 +4205,8 @@ class DeepseekV4Model(nn.Module):
                 self.hc_head_scale,
             ) = make_hc_head_params(hc_mult, config.hidden_size)
         self.engram_hasher = None
-        if self.engram_layout is not None:
+        # Every Engram layer sits below the tail server's layers.
+        if self.engram_layout is not None and self.tail_stage_start_layer is None:
             self.engram_hasher = EngramHasher.from_config(
                 config,
                 self.engram_layout,
@@ -4793,7 +4818,7 @@ class DeepseekV4Model(nn.Module):
         input_embeds: Optional[torch.Tensor],
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Optional[Union[torch.Tensor, PPProxyTensors]]:
-        if self.pp_group.is_first_rank:
+        if self.pp_group.is_first_rank and self.tail_stage_start_layer is None:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
             else:
@@ -4801,6 +4826,16 @@ class DeepseekV4Model(nn.Module):
             from sglang.kernels.ops.layernorm.mhc import hc_broadcast
 
             hidden_states = hc_broadcast(hidden_states, self.hc_mult)
+        elif pp_proxy_tensors is None and self.tail_stage_start_layer is not None:
+            # A tail server's warmup and dummy runs carry no residual; the
+            # residual stream is bf16, as stage 0 captures it.
+            hidden_states = torch.zeros(
+                input_ids.shape[0],
+                self.hc_mult,
+                self.hidden_size,
+                dtype=torch.bfloat16,
+                device=input_ids.device,
+            )
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
@@ -4882,6 +4917,13 @@ class DeepseekV4Model(nn.Module):
             )
             if hidden_states is None:
                 return None
+            if self.tail_stage_start_layer is not None:
+                # The tail server's output is the DSpark captures alone.
+                return (
+                    dspark_aux_hidden_states.finalize()
+                    if capture_dspark
+                    else hidden_states
+                )
         elif run_tbo:
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
             # disabled here (each layer self-contained), so no trailing hc_post.
@@ -5052,6 +5094,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.quant_config = quant_config
         self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
         self.use_npu_arch35_mxfp8_wo_a = use_npu_arch35_mxfp8_wo_a(quant_config)
+        self.tail_stage = get_disagg().dsv41_tail_stage_server
         self.encoder_only_prefill = (
             get_disagg().dsv41_encoder_only_prefill
             and get_disagg().disaggregation_mode == "prefill"
@@ -5061,6 +5104,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.vision = None
         if (
             not self.encoder_only_prefill
+            and not self.tail_stage
             and config.model_type == "deepseek_v41"
             and config.vision_n_layers > 0
             and not getattr(config, "language_model_only", False)
@@ -5088,7 +5132,11 @@ class DeepseekV4ForCausalLM(nn.Module):
             config, quant_config, prefix=add_prefix("model", prefix)
         )
         self.pp_group = get_parallel().pp_group
-        if self.pp_group.is_last_rank and not self.encoder_only_prefill:
+        if (
+            self.pp_group.is_last_rank
+            and not self.encoder_only_prefill
+            and not self.tail_stage
+        ):
             if self.pp_group.world_size == 1 and config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
             else:
@@ -5346,7 +5394,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             )
         if hidden_states is None:
             return None
-        if not self.pp_group.is_last_rank:
+        if not self.pp_group.is_last_rank or self.tail_stage:
             return hidden_states
 
         return self._postprocess_output(hidden_states, input_ids, forward_batch)
@@ -5734,6 +5782,27 @@ class DeepseekV4ForCausalLM(nn.Module):
                         encoder_only_skipped += 1
 
             weights = encoder_weights_only()
+        elif self.tail_stage:
+            unfiltered_weights = weights
+
+            def tail_stage_weights_only():
+                nonlocal encoder_only_skipped
+                for name, loaded_weight in unfiltered_weights:
+                    remapped = self.remap_weight_name_to_dpsk_hf_format(
+                        name,
+                        is_nextn=is_nextn,
+                        num_hidden_layers=self.config.num_hidden_layers,
+                    )
+                    if dsv41_tail_stage_weight_needed(
+                        remapped,
+                        self.model.tail_stage_start_layer,
+                        self.config.num_hidden_layers,
+                    ):
+                        yield name, loaded_weight
+                    else:
+                        encoder_only_skipped += 1
+
+            weights = tail_stage_weights_only()
 
         # Must mirror MQALayer.__init__'s `quantize_wo_a`: dequantizing wo_a here
         # while the layer allocated an FP8 parameter (or vice versa) fails the

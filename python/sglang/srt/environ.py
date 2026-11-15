@@ -2124,6 +2124,26 @@ class Envs:
     SGLANG_DSV41_TAIL_STAGE = EnvBool(False)
     # Seconds without a heartbeat before a tail-stage peer counts as down.
     SGLANG_DSV41_TAIL_STAGE_HEARTBEAT_TIMEOUT_S = EnvFloat(5.0)
+    # The tail server (--dsv41-tail-stage-server): its ROUTER port (0 serves nothing)
+    # and the address it registers with each prefill's bootstrap server.
+    SGLANG_DSV41_TAIL_STAGE_PORT = EnvInt(0)
+    SGLANG_DSV41_TAIL_STAGE_HOST = EnvStr(None)
+    # Arbitrary: 64 tails of 5.24 MB residual each, as the prefill's capture slots.
+    SGLANG_DSV41_TAIL_STAGE_SLOTS = EnvInt(64)
+    # A forward runs at MIN_TAILS ready tails, or once the oldest waited WAIT_MS; at
+    # most MAX_TAILS (whose rows the tail graphs and MegaMoE cap must cover).
+    SGLANG_DSV41_TAIL_STAGE_MIN_TAILS = EnvInt(8)
+    SGLANG_DSV41_TAIL_STAGE_MAX_TAILS = EnvInt(32)
+    SGLANG_DSV41_TAIL_STAGE_WAIT_MS = EnvFloat(15.0)
+    SGLANG_DSV41_TAIL_STAGE_QUEUE_CAP = EnvInt(256)
+    SGLANG_DSV41_TAIL_STAGE_READY_TIMEOUT_S = EnvFloat(600.0)
+    # Send decode the tail rows' DSpark captures; decode must run DSpark.
+    SGLANG_DSV41_TAIL_STAGE_DRAFT_AUX = EnvBool(True)
+    # Startup timing of the tail server's forward: comma-separated tail counts, each
+    # over SELF_BENCH_PREFIX-token prefixes, SELF_BENCH_ITERS timed runs.
+    SGLANG_DSV41_TAIL_STAGE_SELF_BENCH = EnvStr(None)
+    SGLANG_DSV41_TAIL_STAGE_SELF_BENCH_PREFIX = EnvInt(142720)
+    SGLANG_DSV41_TAIL_STAGE_SELF_BENCH_ITERS = EnvInt(10)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
