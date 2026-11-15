@@ -36,9 +36,9 @@ class StateType(str, enum.Enum):
     # DSpark draft's SWA valid-from.
     REQUEST_ROW = "request_row"
     # SGLANG_DSV41_TAIL_STAGE: what the DeepSeek-V4.1 tail server sends decode as PP
-    # rank 1. The late layers' SWA of a tail, one item per token row of one layer,
-    # indexed by the rows of the tail's positions on each side.
-    DSV41_TAIL_SWA_ROWS = "dsv41_tail_swa_rows"
+    # rank 1. The late layers' SWA of a tail's window, one item per logical SWA page
+    # of one layer (dsv41_tail_stage.layout).
+    DSV41_TAIL_SWA = "dsv41_tail_swa"
     # The tail rows' DSpark target captures, one item per tail.
     DSV41_TAIL_DRAFT_AUX = "dsv41_tail_draft_aux"
     # A block-scaled KV dtype keeps its per-block scales in buffers parallel to
