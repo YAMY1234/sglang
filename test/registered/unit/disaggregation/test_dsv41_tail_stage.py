@@ -4,6 +4,7 @@ registration as PP rank 1 of every encoder-only prefill's bootstrap table."""
 import asyncio
 import json
 import unittest
+from collections import Counter
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -39,6 +40,7 @@ from sglang.srt.disaggregation.dsv41_tail_stage.registration import (
     tail_stage_wire,
 )
 from sglang.srt.disaggregation.dsv41_tail_stage.service import (
+    SENDER_SWEEP_S,
     Backend,
     TailStageService,
 )
@@ -836,13 +838,73 @@ class TestTailStageService(CustomTestCase):
             sorted((d.room, d.status) for d in done), [(1, "ok"), (2, "ok")]
         )
         self.assertEqual(self.service.table.counts()["free_slots"], 2)
-        # Decode failing a granted room holds its slot until stage 0's TailReady.
+        # Decode failing a granted room holds its slot until stage 0's TailReady; a
+        # sender without a pending send is polled once per sweep.
         self.senders[4].status = KVPoll.Failed
+        self.clock.t += SENDER_SWEEP_S
         self.assertEqual([m for m in self._exchange() if isinstance(m, P.TailDone)], [])
         self.assertEqual(self.service.table.counts()["free_slots"], 2)
         (done,) = self._exchange(P.TailReady(room=4, slot=grants[4].slot, ok=True))
         self.assertEqual((done.room, done.status), (4, "aborted"))
         self.assertEqual(self.service.table.counts()["free_slots"], 3)
+
+    def _welcomed_with_slots(self, slots):
+        table, _ = _table(slots=slots, pages=400)
+        table.clock = self.clock
+        self.service.table = table
+        _put(self.bootstrap, _stage0_payload())
+        self._exchange(TestTailStageRegistration._hello(None))
+
+    def test_forwards_overlap_and_their_outputs_wait_for_them(self):
+        """r2 at the multi-turn ramp: the loop waited out each forward and plateaued at
+        about 340 tails/s. A forward is launched without waiting; the next one queues
+        behind it only when full, and a slot is sent only after its forward ran."""
+        finished = []
+
+        def run(tails):
+            self.batches.append([t.room for t in tails])
+            flag = [False]
+            finished.append(flag)
+            return lambda: flag[0]
+
+        self.service.backend.run = run
+        self._welcomed_with_slots(8)
+        got = self._exchange(*[_req(room, 4001) for room in range(1, 7)])
+        slot = {m.room: m.slot for m in got if isinstance(m, P.SlotGrant)}
+        ready = lambda room: P.TailReady(room=room, slot=slot[room], ok=True)
+        self._exchange(ready(1), ready(2))
+        self.assertEqual(self.batches, [[1, 2]])
+        self._exchange(ready(3), ready(4), ready(5))
+        self.assertEqual(self.batches, [[1, 2]])
+        self._exchange(ready(6))
+        self.assertEqual(self.batches, [[1, 2], [3, 4, 5, 6]])
+        for room in range(1, 7):
+            self.senders[room].status = KVPoll.WaitingForInput
+        self._exchange()
+        self.assertEqual(self.sent, [])
+        finished[0][0] = True
+        self._exchange()
+        self.assertEqual(sorted(r for r, _ in self.sent), [1, 2])
+        finished[1][0] = True
+        self._exchange()
+        self.assertEqual(sorted(r for r, _ in self.sent), [1, 2, 3, 4, 5, 6])
+
+    def test_only_senders_with_a_send_are_polled_each_step(self):
+        """r2: every open sender was polled on every loop step."""
+        self._welcomed_with_slots(8)
+        got = self._exchange(*[_req(room, 4001) for room in range(1, 5)])
+        slot = {m.room: m.slot for m in got if isinstance(m, P.SlotGrant)}
+        self._exchange(*[P.TailReady(room=r, slot=slot[r], ok=True) for r in (1, 2)])
+        polls = Counter()
+        for room, sender in self.senders.items():
+            sender.poll = lambda room=room, sender=sender: (
+                polls.update([room]) or sender.status
+            )
+        self._exchange()
+        self.assertEqual(sorted(polls), [1, 2])
+        self.clock.t += SENDER_SWEEP_S
+        self._exchange()
+        self.assertEqual(sorted(polls), [1, 2, 3, 4])
 
     def test_requests_before_hello_and_bad_versions_are_refused(self):
         (err,) = self._exchange(_req(1, 4001))

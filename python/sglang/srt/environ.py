@@ -2150,7 +2150,9 @@ class Envs:
     SGLANG_DSV41_TAIL_STAGE_MIN_TAILS = EnvInt(8)
     SGLANG_DSV41_TAIL_STAGE_MAX_TAILS = EnvInt(32)
     SGLANG_DSV41_TAIL_STAGE_WAIT_MS = EnvFloat(15.0)
-    SGLANG_DSV41_TAIL_STAGE_QUEUE_CAP = EnvInt(256)
+    # Requests waiting for a slot beyond this are deferred and retried; arbitrary, high
+    # enough that waiting rooms queue in the table instead of retrying.
+    SGLANG_DSV41_TAIL_STAGE_QUEUE_CAP = EnvInt(1 << 20)
     SGLANG_DSV41_TAIL_STAGE_READY_TIMEOUT_S = EnvFloat(600.0)
     # Send decode the tail rows' DSpark captures; decode must run DSpark.
     SGLANG_DSV41_TAIL_STAGE_DRAFT_AUX = EnvBool(True)

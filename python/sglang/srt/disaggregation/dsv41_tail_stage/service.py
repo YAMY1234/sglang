@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections import Counter
+from collections import Counter, deque
 from typing import Callable, Dict, List, Optional
 
 import msgspec
@@ -35,6 +35,10 @@ logger = logging.getLogger(__name__)
 
 # Arbitrary: how often the loop logs its counters.
 LOG_PERIOD_S = 5.0
+# Arbitrary: how often senders without a pending send are polled, for decode-side failures.
+SENDER_SWEEP_S = 0.2
+# Forwards queued on the GPU at once: the next is launched while one runs, if it is full.
+MAX_INFLIGHT_BATCHES = 2
 
 
 class Backend(msgspec.Struct):
@@ -46,7 +50,9 @@ class Backend(msgspec.Struct):
     # (bootstrap_addr, room) -> a PP-rank-1 sender for the room.
     make_sender: Callable[[str, int], object]
     send: Callable[[object, TailSlot], None]
-    run: Callable[[List[TailSlot]], None]
+    # Launches the forward; returns None once it has run, else a check that is True
+    # once the slots' outputs can be sent.
+    run: Callable[[List[TailSlot]], Optional[Callable[[], bool]]]
     put: Callable[[str, dict], bool]
 
 
@@ -75,6 +81,11 @@ class TailStageService:
         self.senders: Dict[int, object] = {}
         # Rooms whose forward ran and whose send waits for decode's transfer info.
         self.ready_to_send: Dict[int, TailSlot] = {}
+        # Rooms whose send to decode was issued and has not ended.
+        self._sent: set = set()
+        # Forwards launched and not yet finished, oldest first: (tails, done check).
+        self._inflight: deque = deque()
+        self._last_sweep = 0.0
         self.identities: Dict[str, bytes] = {}
         self.stats = Counter()
         self._last_heartbeat = 0.0
@@ -89,12 +100,14 @@ class TailStageService:
             self.step(poll_ms=1)
 
     def step(self, *, poll_ms: int) -> None:
-        self._receive(poll_ms)
+        # While a forward runs, the loop does not sleep in the socket poll.
+        self._receive(0 if self._inflight else poll_ms)
         now = self.clock()
         silent = self.peers.silent(now=now, timeout_s=self.heartbeat_timeout_s)
         self._expire(silent)
         self._heartbeat(now)
-        self._poll_senders()
+        self._finish_batches()
+        self._poll_senders(now)
         self._run_batch()
         self._busy_samples.append(self.table.num_slots - len(self.table.free_slots))
         self._log(now)
@@ -188,10 +201,17 @@ class TailStageService:
                 # Stage 0 fails the request to decode; nothing is sent from here.
                 self.senders.pop(msg.room, None)
                 self.ready_to_send.pop(msg.room, None)
+                self._sent.discard(msg.room)
                 self.stats["tails_failed"] += 1
         self._deliver(replies)
 
     def _run_batch(self) -> None:
+        if self._inflight and (
+            len(self._inflight) >= MAX_INFLIGHT_BATCHES
+            or self.table.num_ready() < self.policy.max_tails
+        ):
+            # The GPU is busy: queue the next forward behind it only when it is full.
+            return
         n = self.policy.take_count(
             ready=self.table.num_ready(),
             oldest_wait_ms=self.table.oldest_ready_wait_ms(),
@@ -199,24 +219,45 @@ class TailStageService:
         if n == 0:
             return
         tails = self.table.take(n)
-        self.backend.run(tails)
+        done = self.backend.run(tails)
         self.stats["batches"] += 1
         self.stats[f"batch_{len(tails)}"] += 1
-        for tail in tails:
-            self.table.sending(tail.room)
-            self.ready_to_send[tail.room] = tail
+        self._inflight.append((tails, done))
+        self._finish_batches()
 
-    def _poll_senders(self) -> None:
-        for room, sender in list(self.senders.items()):
+    def _finish_batches(self) -> None:
+        while self._inflight:
+            tails, done = self._inflight[0]
+            if done is not None and not done():
+                return
+            self._inflight.popleft()
+            for tail in tails:
+                self.table.sending(tail.room)
+                self.ready_to_send[tail.room] = tail
+
+    def _poll_senders(self, now: float) -> None:
+        """Each step, the senders with a send pending or issued; every SENDER_SWEEP_S,
+        all of them, for rooms decode gave up on before their forward."""
+        if now - self._last_sweep >= SENDER_SWEEP_S:
+            self._last_sweep = now
+            rooms = list(self.senders)
+        else:
+            rooms = [*self.ready_to_send, *self._sent]
+        for room in rooms:
+            sender = self.senders.get(room)
+            if sender is None:
+                continue
             status = sender.poll()
             if status == KVPoll.WaitingForInput and room in self.ready_to_send:
                 self.backend.send(sender, self.ready_to_send.pop(room))
+                self._sent.add(room)
             elif status in (KVPoll.Success, KVPoll.Failed):
                 self._conclude(room, ok=status == KVPoll.Success)
 
     def _conclude(self, room: int, *, ok: bool) -> None:
         self.senders.pop(room)
         self.ready_to_send.pop(room, None)
+        self._sent.discard(room)
         tail = self.table.tails.get(room)
         if tail is not None and tail.state in (SlotState.GRANTED, SlotState.FAILED):
             # Stage 0 may still write the slot: it frees at TailReady.

@@ -18,7 +18,6 @@ from sglang.srt.disaggregation.dsv41_tail_stage.layout import (
     c1_buf_infos,
     item_lens_error,
     tail_swa_buf_infos,
-    tail_swa_page_ids,
 )
 from sglang.srt.disaggregation.dsv41_tail_stage.registration import (
     TAIL_STAGE_PP_RANK,
@@ -143,6 +142,15 @@ class MooncakeTailBackend:
         model = fwd.model_runner.model.model
         self.start_layer = model.tail_stage_start_layer
         self.end_layer = model.end_layer
+        # The windows' SWA page ids, read on the host once their forward has run: one
+        # pinned buffer per forward in flight (the service runs at most two at once).
+        rows = envs.SGLANG_DSV41_TAIL_STAGE_MAX_TAILS.get() * fwd.window
+        self._pinned = [
+            torch.empty(rows, dtype=torch.int64, pin_memory=True) for _ in range(2)
+        ]
+        self._next_pinned = 0
+        # room -> logical SWA page ids of its window, for the send to decode.
+        self._swa_pages: dict = {}
 
     def start(self, stage0_wire: List[list]) -> Tuple[str, int, P.Welcome]:
         kv_args = tail_kv_args(
@@ -194,14 +202,7 @@ class MooncakeTailBackend:
         sender.init(0, aux_index=0)
         swa_rows = None
         if tail.slot >= 0:
-            req = self.pages.reqs[tail.room]
-            row = self.fwd.req_to_token_pool.req_to_token[req.kv.req_pool_idx]
-            swa_rows = tail_swa_page_ids(
-                self.fwd.model_runner.token_to_kv_pool,
-                row,
-                start=tail.e - self.fwd.window,
-                end=tail.e,
-            ).tolist()
+            swa_rows = self._swa_pages.pop(tail.room)
         sender.send(
             _NO_PAGES,
             state_indices=stage1_state_indices(
@@ -212,9 +213,31 @@ class MooncakeTailBackend:
             ),
         )
 
-    def run(self, tails) -> None:
-        self.fwd.run(
-            [TailRun(req=self.pages.reqs[t.room], slot=t.slot, s=t.s) for t in tails]
+    def run(self, tails):
+        """Launch the forward without waiting for it; the check turns True once it has
+        run, so the transfer threads may read the windows' SWA rows and the aux."""
+        reqs = [self.pages.reqs[t.room] for t in tails]
+        self.fwd.run([TailRun(req=r, slot=t.slot, s=t.s) for r, t in zip(reqs, tails)])
+        pool = self.fwd.model_runner.token_to_kv_pool
+        table = self.fwd.req_to_token_pool.req_to_token
+        window = self.fwd.window
+        locs = torch.cat(
+            [table[r.kv.req_pool_idx, t.e - window : t.e] for r, t in zip(reqs, tails)]
         )
-        # The transfer threads read the window's SWA rows and the aux.
-        torch.cuda.current_stream().synchronize()
+        pages = pool.translate_loc_from_full_to_swa(locs) // pool.swa_page_size
+        host = self._pinned[self._next_pinned][: pages.numel()]
+        self._next_pinned ^= 1
+        host.copy_(pages, non_blocking=True)
+        event = torch.cuda.Event()
+        event.record()
+
+        def done() -> bool:
+            if not event.query():
+                return False
+            per_window = host.numpy().reshape(len(tails), window)
+            for tail, ids in zip(tails, per_window):
+                first_of_run = np.r_[True, ids[1:] != ids[:-1]]
+                self._swa_pages[tail.room] = ids[first_of_run].astype(np.int32).tolist()
+            return True
+
+        return done
