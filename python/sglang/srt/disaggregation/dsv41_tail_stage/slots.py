@@ -1,0 +1,289 @@
+"""Stage 1's slot accounting: requests, grants with backpressure, and the ready queue.
+
+A slot holds one tail from grant to the end of its send to decode: a residual slot,
+the c1 pages of its prefix [0, e), its SWA rows and its aux row. Grants go strictly
+first-come over every stage 0, so a long prompt is never passed over; a stage 0 waits
+in bootstrap until its grant arrives.
+"""
+
+from __future__ import annotations
+
+import enum
+import time
+from collections import deque
+from typing import Callable, Deque, Dict, List, Optional
+
+import msgspec
+
+from sglang.srt.disaggregation.dsv41_tail_stage.protocol import (
+    Error,
+    SlotDefer,
+    SlotGrant,
+    SlotRequest,
+    TailDone,
+    TailMessage,
+    TailReady,
+    slot_request_error,
+)
+
+# Arbitrary: how long a stage 0 waits before resending a deferred request.
+DEFER_RETRY_MS = 20
+
+
+class SlotState(enum.IntEnum):
+    REQUESTED = 0
+    GRANTED = 1
+    READY = 2
+    RUNNING = 3
+    SENDING = 4
+
+
+class TailSlot(msgspec.Struct):
+    room: int
+    stage0_id: str
+    rid: str
+    s: int
+    e: int
+    state: SlotState
+    t_request: float
+    slot: int = -1
+    c1_pages: List[int] = []
+    t_grant: float = 0.0
+    t_ready: float = 0.0
+    t_run: float = 0.0
+    t_send: float = 0.0
+    # An abort that arrived while the slot's buffers were in use; the slot frees
+    # when its send ends.
+    abort_pending: bool = False
+
+
+class Reply(msgspec.Struct, frozen=True):
+    stage0_id: str
+    msg: TailMessage
+
+
+class SlotTable:
+    def __init__(
+        self,
+        *,
+        num_slots: int,
+        num_pages: int,
+        page_size: int,
+        window: int,
+        queue_cap: int,
+        ready_timeout_s: float,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.num_slots = num_slots
+        self.num_pages = num_pages
+        self.page_size = page_size
+        self.window = window
+        self.queue_cap = queue_cap
+        self.ready_timeout_s = ready_timeout_s
+        self.clock = clock
+        self.free_slots: Deque[int] = deque(range(num_slots))
+        # Page 0 holds the padding token slot 0, as in every SGLang KV pool.
+        self.free_pages: Deque[int] = deque(range(1, num_pages + 1))
+        self.queue: Deque[int] = deque()
+        self.ready_order: Deque[int] = deque()
+        self.tails: Dict[int, TailSlot] = {}
+        # Pass-through rooms: no slot, an empty send to decode.
+        self.passthrough: Dict[int, str] = {}
+
+    def pages_for(self, e: int) -> int:
+        return -(-e // self.page_size)
+
+    def counts(self) -> Dict[str, int]:
+        by_state = {state: 0 for state in SlotState}
+        for tail in self.tails.values():
+            by_state[tail.state] += 1
+        return {
+            "free_slots": len(self.free_slots),
+            "free_pages": len(self.free_pages),
+            "queued": by_state[SlotState.REQUESTED],
+            "granted": by_state[SlotState.GRANTED],
+            "ready": by_state[SlotState.READY],
+            "running": by_state[SlotState.RUNNING],
+            "sending": by_state[SlotState.SENDING],
+            "passthrough": len(self.passthrough),
+        }
+
+    def request(self, stage0_id: str, req: SlotRequest) -> List[Reply]:
+        err = slot_request_error(req, self.window)
+        if err is not None:
+            return [Reply(stage0_id, Error(reason=err, room=req.room))]
+        owner = self._owner(req.room)
+        if owner is not None:
+            if owner != stage0_id:
+                return [Reply(stage0_id, Error(reason="room_in_use", room=req.room))]
+            return self._repeat(req.room)
+        if not req.late_fed:
+            self.passthrough[req.room] = stage0_id
+            grant = SlotGrant(room=req.room, slot=-1, residual_slot=-1, c1_pages=[])
+            return [Reply(stage0_id, grant)]
+        if self.pages_for(req.e) > self.num_pages:
+            reason = f"prefix of {req.e} tokens exceeds the tail stage's KV budget"
+            return [Reply(stage0_id, Error(reason=reason, room=req.room))]
+        if len(self.queue) >= self.queue_cap:
+            defer = SlotDefer(room=req.room, retry_ms=DEFER_RETRY_MS)
+            return [Reply(stage0_id, defer)]
+        self.tails[req.room] = TailSlot(
+            room=req.room,
+            stage0_id=stage0_id,
+            rid=req.rid,
+            s=req.s,
+            e=req.e,
+            state=SlotState.REQUESTED,
+            t_request=self.clock(),
+        )
+        self.queue.append(req.room)
+        return self._grant()
+
+    def ready(self, stage0_id: str, msg: TailReady) -> List[Reply]:
+        tail = self.tails.get(msg.room)
+        if (
+            tail is None
+            or tail.stage0_id != stage0_id
+            or tail.slot != msg.slot
+            or tail.state != SlotState.GRANTED
+        ):
+            reason = f"TailReady for room {msg.room} slot {msg.slot} not granted"
+            return [Reply(stage0_id, Error(reason=reason, room=msg.room))]
+        if not msg.ok:
+            return self.finish(msg.room, status="failed", reason="stage 0 gave up")
+        tail.state = SlotState.READY
+        tail.t_ready = self.clock()
+        self.ready_order.append(msg.room)
+        return []
+
+    def num_ready(self) -> int:
+        return len(self.ready_order)
+
+    def oldest_ready_wait_ms(self) -> float:
+        if not self.ready_order:
+            return 0.0
+        return (self.clock() - self.tails[self.ready_order[0]].t_ready) * 1e3
+
+    def take(self, n: int) -> List[TailSlot]:
+        """Up to n ready tails, oldest first, into RUNNING."""
+        taken = []
+        now = self.clock()
+        while self.ready_order and len(taken) < n:
+            tail = self.tails[self.ready_order.popleft()]
+            tail.state = SlotState.RUNNING
+            tail.t_run = now
+            taken.append(tail)
+        return taken
+
+    def sending(self, room: int) -> None:
+        tail = self.tails[room]
+        assert tail.state == SlotState.RUNNING, tail.state
+        tail.state = SlotState.SENDING
+        tail.t_send = self.clock()
+
+    def abort(self, room: int, *, stage0_id: Optional[str] = None) -> List[Reply]:
+        """From stage 0 (its own rooms only) or from decode (stage0_id None)."""
+        owner = self._owner(room)
+        if owner is None or (stage0_id is not None and owner != stage0_id):
+            return []
+        tail = self.tails.get(room)
+        if tail is not None and tail.state in (SlotState.RUNNING, SlotState.SENDING):
+            tail.abort_pending = True
+            return []
+        return self.finish(room, status="aborted", reason="aborted")
+
+    def finish(self, room: int, *, status: str, reason: str = "") -> List[Reply]:
+        """Free the room's slot and pages; the freed room can be granted again."""
+        if self.passthrough.pop(room, None) is not None:
+            return []
+        tail = self.tails.pop(room, None)
+        if tail is None:
+            return []
+        if tail.state == SlotState.REQUESTED:
+            self.queue.remove(room)
+        elif tail.state == SlotState.READY:
+            self.ready_order.remove(room)
+        if tail.slot >= 0:
+            self.free_slots.append(tail.slot)
+            self.free_pages.extend(tail.c1_pages)
+        if tail.abort_pending and status == "ok":
+            status, reason = "aborted", "aborted while running"
+        now = self.clock()
+        done = TailDone(
+            room=room,
+            slot=tail.slot,
+            status=status,
+            reason=reason,
+            queue_ms=_ms(tail.t_request, tail.t_grant or now),
+            forward_ms=_ms(tail.t_run, tail.t_send) if tail.t_run else 0.0,
+            send_ms=_ms(tail.t_send, now) if tail.t_send else 0.0,
+        )
+        return [Reply(tail.stage0_id, done)] + self._grant()
+
+    def expire(self, *, silent_stage0s: List[str]) -> List[Reply]:
+        """Fail granted slots whose TailReady is overdue, and every queued or granted
+        slot of a stage 0 that went silent (its TailReady cannot come)."""
+        now = self.clock()
+        silent = set(silent_stage0s)
+        replies = []
+        for tail in list(self.tails.values()):
+            if tail.state not in (SlotState.REQUESTED, SlotState.GRANTED):
+                continue
+            if tail.stage0_id in silent:
+                replies += self.finish(
+                    tail.room, status="failed", reason="stage 0 silent"
+                )
+            elif (
+                tail.state == SlotState.GRANTED
+                and now - tail.t_grant > self.ready_timeout_s
+            ):
+                replies += self.finish(
+                    tail.room, status="failed", reason="ready timeout"
+                )
+        for room, owner in list(self.passthrough.items()):
+            if owner in silent:
+                del self.passthrough[room]
+        return replies
+
+    def _owner(self, room: int) -> Optional[str]:
+        tail = self.tails.get(room)
+        return tail.stage0_id if tail is not None else self.passthrough.get(room)
+
+    def _repeat(self, room: int) -> List[Reply]:
+        """A resent request for a live room: repeat its grant, if it has one."""
+        tail = self.tails.get(room)
+        if tail is None:
+            grant = SlotGrant(room=room, slot=-1, residual_slot=-1, c1_pages=[])
+            return [Reply(self.passthrough[room], grant)]
+        if tail.state == SlotState.GRANTED:
+            return [Reply(tail.stage0_id, self._grant_msg(tail))]
+        return []
+
+    def _grant(self) -> List[Reply]:
+        replies = []
+        now = self.clock()
+        while self.queue and self.free_slots:
+            tail = self.tails[self.queue[0]]
+            need = self.pages_for(tail.e)
+            if need > len(self.free_pages):
+                break
+            self.queue.popleft()
+            tail.slot = self.free_slots.popleft()
+            tail.c1_pages = [self.free_pages.popleft() for _ in range(need)]
+            tail.state = SlotState.GRANTED
+            tail.t_grant = now
+            replies.append(Reply(tail.stage0_id, self._grant_msg(tail)))
+        return replies
+
+    @staticmethod
+    def _grant_msg(tail: TailSlot) -> SlotGrant:
+        return SlotGrant(
+            room=tail.room,
+            slot=tail.slot,
+            residual_slot=tail.slot,
+            c1_pages=list(tail.c1_pages),
+        )
+
+
+def _ms(start: float, end: float) -> float:
+    return max(0.0, (end - start) * 1e3)
