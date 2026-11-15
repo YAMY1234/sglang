@@ -211,6 +211,11 @@ class PrefetchOperation(StorageOperation):
         self._lock = threading.Lock()
         self._terminated_flag = False
         self.storage_hit_count = 0
+        # This rank's own storage query result, set only once that query ran;
+        # None while unqueried, cancelled or failed (the default count is 0).
+        self.local_query_tokens: Optional[int] = None
+        # Ended early on PP0's own miss; the late agreed result still feeds accounting.
+        self.local_miss_terminated = False
         # KV pages the hit-time plan skips in front of the KV transfer: the
         # device trim, then the span head a component's block groups serve.
         self.prefetch_kv_page_offset = 0

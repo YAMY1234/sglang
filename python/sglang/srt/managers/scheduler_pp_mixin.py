@@ -107,6 +107,13 @@ class PPHiCacheCounts:
     counts: List[List[int]]
 
 
+@dataclass
+class PPPrefetchVerdicts:
+    """PP0's prefetch stop verdicts of one loop iteration, in call order."""
+
+    verdicts: List[int]
+
+
 class SchedulerPPMixin:
     # Gated PP+spec relay flow. Class-level default so schedulers that never
     # ran init_pp_loop_state (plain TP, unit-test doubles) read False;
@@ -115,6 +122,7 @@ class SchedulerPPMixin:
     # Opt-in PD prefill options, set by _pp_init_pd_async_options.
     _pp_pd_local_result_enabled: bool = False
     _pp_hicache_piggyback: bool = False
+    _pp_prefetch_verdict_relay: bool = False
 
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -617,7 +625,9 @@ class SchedulerPPMixin:
         return self.ingest_requests(
             stop_at_pause=has_unprocessed_mb,
             take_relay_extras=(
-                self._pp_take_hicache_counts if self._pp_hicache_piggyback else None
+                self._pp_take_relay_extras
+                if self._pp_hicache_piggyback or self._pp_prefetch_verdict_relay
+                else None
             ),
         )
 
@@ -714,10 +724,20 @@ class SchedulerPPMixin:
         )
         if self._pp_hicache_piggyback:
             tree_cache.pp_counts_piggyback = True
+        self._pp_prefetch_verdict_relay = (
+            envs.SGLANG_PREFETCH_VERDICT_RELAY.get()
+            and parallel.pp_size > 1
+            and not parallel.attn_dp_enabled
+            and isinstance(tree_cache, UnifiedRadixCache)
+        )
+        if self._pp_prefetch_verdict_relay:
+            tree_cache.prefetch_verdict_relay = True
         logger.info(
-            "PP PD prefill: local result %s, HiCache counts piggyback %s",
+            "PP PD prefill: local result %s, HiCache counts piggyback %s, "
+            "prefetch verdict relay %s",
             self._pp_pd_local_result_enabled,
             self._pp_hicache_piggyback,
+            self._pp_prefetch_verdict_relay,
         )
 
     def _pp_pd_local_result(self: Scheduler, batch: ScheduleBatch) -> bool:
@@ -774,12 +794,17 @@ class SchedulerPPMixin:
             d2h_event.record(self.device_module.current_stream())
         return None, batch_result, d2h_event
 
-    def _pp_take_hicache_counts(self: Scheduler, reqs: List) -> List:
-        """Move relayed HiCache counts from the received requests to the cache."""
+    def _pp_take_relay_extras(self: Scheduler, reqs: List) -> List:
+        """Move relayed HiCache counts and prefetch verdicts to the cache."""
         kept = []
         for req in reqs:
             if isinstance(req, PPHiCacheCounts):
                 self.tree_cache.pp_counts_in.extend(req.counts)
+            elif isinstance(req, PPPrefetchVerdicts):
+                # The previous iteration's admission consumed all of its verdicts;
+                # a leftover would bind a stale verdict to another request.
+                assert not self.tree_cache.pp_verdicts_in, "unconsumed prefetch verdicts"
+                self.tree_cache.pp_verdicts_in.extend(req.verdicts)
             else:
                 kept.append(req)
         return kept
@@ -935,6 +960,9 @@ class SchedulerPPMixin:
             # This iteration's counts, taken on every rank so none accumulate.
             payload.append(PPHiCacheCounts(self.tree_cache.pp_counts_out))
             self.tree_cache.pp_counts_out = []
+        if self._pp_prefetch_verdict_relay:
+            payload.append(PPPrefetchVerdicts(self.tree_cache.pp_verdicts_out))
+            self.tree_cache.pp_verdicts_out = []
         return self._pp_send_pyobj_to_next_stage(payload, async_send=True)
 
     def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):

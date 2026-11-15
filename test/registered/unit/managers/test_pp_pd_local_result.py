@@ -253,7 +253,7 @@ class TestHiCacheCountsPiggyback(CustomTestCase):
             local = torch.tensor(pp0_counts if rank == 0 else [0, 0, 5, -5])
             if rank > 0:
                 received = schedulers[rank - 1].relayed[-1]
-                kept = schedulers[rank]._pp_take_hicache_counts(received)
+                kept = schedulers[rank]._pp_take_relay_extras(received)
                 self.assertEqual(kept, [])
             reduced = caches[rank]._piggyback_ready_counts(local)
             self.assertEqual(reduced.tolist(), pp0_counts)

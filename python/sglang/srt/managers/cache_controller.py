@@ -48,6 +48,7 @@ from sglang.srt.mem_cache.hicache_key_scheme import (
 )
 from sglang.srt.mem_cache.kv.memory.views import KVLayoutView, MLAKVView
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
+from sglang.srt.mem_cache.prefetch_timing import prefetch_timing
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.runtime_context import get_memory, get_parallel
 from sglang.srt.utils import get_device_module
@@ -286,6 +287,9 @@ class PrefetchOperation(StorageOperation):
         self._terminated_flag = False
         self.storage_hit_count = 0
         self.start_time = time.monotonic()
+        # Same meaning as on the hybrid PrefetchOperation.
+        self.local_query_tokens: Optional[int] = None
+        self.local_miss_terminated = False
 
         super().__init__(None, token_ids, last_hash, prefix_keys=prefix_keys)
 
@@ -1475,12 +1479,17 @@ class HiCacheController:
         """
         Manage prefetching operations from storage backend to host memory.
         """
+        timing = prefetch_timing(lambda: get_parallel().pp_rank)
         while (not self.storage_stop_event.is_set()) or not self.prefetch_queue.empty():
             try:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
                 self._on_prefetch_dequeue(operation)
+                if timing is not None:
+                    timing.record("dequeue", operation.request_id,
+                                  queued_s=time.monotonic() - operation.start_time)
+                query_start = time.monotonic()
                 try:
                     if operation.is_terminated():
                         hash_value, storage_hit_count = [], 0
@@ -1488,16 +1497,27 @@ class HiCacheController:
                         hash_value, storage_hit_count = self._storage_hit_query(
                             operation
                         )
+                        # Only a query that ran is evidence; the default count is not.
+                        operation.local_query_tokens = storage_hit_count
                 except Exception:
                     logger.exception(
                         "HiCache storage query failed for request %s",
                         operation.request_id,
                     )
                     hash_value, storage_hit_count = [], 0
+                if timing is not None:
+                    timing.record("query", operation.request_id,
+                                  dur_s=time.monotonic() - query_start,
+                                  local_tokens=operation.local_query_tokens)
 
+                min_start = time.monotonic()
                 storage_hit_count = self._sync_prefetch_hit_query(
                     operation, storage_hit_count
                 )
+                if timing is not None:
+                    timing.record("min", operation.request_id,
+                                  dur_s=time.monotonic() - min_start,
+                                  agreed_tokens=storage_hit_count)
 
                 # Record the TP-synced hit count; the scheduler thread decides
                 # at drain time whether to revoke (below threshold) or allocate.

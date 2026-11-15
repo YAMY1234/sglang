@@ -770,6 +770,16 @@ class Envs:
     # Opt-in, PP prefill (PD): PP0's HiCache ready counts ride the request relay
     # instead of a blocking PP0 -> PP1 -> ... send/recv chain.
     SGLANG_PP_HICACHE_COUNTS_PIGGYBACK = EnvBool(False)
+    # Opt-in, L3 prefetch (cache mode): buffered timing events for the query,
+    # hit agreement, drain and admission checks, written as JSONL by a thread.
+    SGLANG_PREFETCH_TIMING = EnvBool(False)
+    SGLANG_PREFETCH_TIMING_DIR = EnvStr("/logs")
+    # Opt-in, L3 prefetch with the timeout policy: PP0 ends a prefetch whose own
+    # storage query found nothing; the stage MIN can only agree on zero.
+    SGLANG_PREFETCH_PP0_MISS_SHORTCUT = EnvBool(False)
+    # Opt-in, PP prefill: PP0's prefetch stop verdicts ride the request relay
+    # instead of a blocking PP0 -> PP1 -> ... send/recv chain.
+    SGLANG_PREFETCH_VERDICT_RELAY = EnvBool(False)
     # Override NVML Confidential Computing autodetection. None = autodetect.
     SGLANG_FORCE_CONFIDENTIAL_COMPUTE = EnvBool(None)
 

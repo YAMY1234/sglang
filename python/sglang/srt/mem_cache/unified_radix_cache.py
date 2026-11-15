@@ -33,6 +33,7 @@ from sglang.srt.managers.scheduler_components.shm_tag_exchange import (
     fold_u64,
     get_shm_exchange,
 )
+from sglang.srt.mem_cache.prefetch_timing import PrefetchTiming, prefetch_timing
 from sglang.srt.mem_cache.allocator.page_interleave import (
     page_interleave_shard_size,
 )
@@ -175,6 +176,9 @@ COMPONENT_REGISTRY: dict[str, type[TreeComponent]] = {
 
 
 logger = logging.getLogger(__name__)
+
+# PP0's prefetch stop verdict under the timeout policy (MAX-reduced: a miss is final).
+_STOP_WAIT, _STOP_DEADLINE, _STOP_LOCAL_MISS = 0, 1, 2
 device_module = get_device_module()
 
 
@@ -221,6 +225,12 @@ class UnifiedRadixCache(BasePrefixCache):
     _l3_write_on_host_evict: bool = False
     # Final stats at SIGTERM / exit under SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT.
     _l3_tier_final: Optional[WriteOnHostEvictFinalStats] = None
+    # PP relay and prefetch flags read on the same object.__new__ stubs; __init__
+    # and the PP prefill scheduler set the real values.
+    pp_counts_piggyback: bool = False
+    prefetch_verdict_relay: bool = False
+    prefetch_pp0_miss_shortcut: bool = False
+    _prefetch_timing: Optional[PrefetchTiming] = None
 
     def __init__(
         self,
@@ -369,6 +379,13 @@ class UnifiedRadixCache(BasePrefixCache):
         self.pp_counts_piggyback = False
         self.pp_counts_in: deque[list[int]] = deque()
         self.pp_counts_out: list[list[int]] = []
+        # Set by the PP prefill scheduler: PP0's prefetch stop verdicts ride its
+        # request relay; later stages take them in order from pp_verdicts_in.
+        self.prefetch_verdict_relay = False
+        self.pp_verdicts_in: deque[int] = deque()
+        self.pp_verdicts_out: list[int] = []
+        self.prefetch_pp0_miss_shortcut = envs.SGLANG_PREFETCH_PP0_MISS_SHORTCUT.get()
+        self._prefetch_timing = prefetch_timing(self.pp_rank)
 
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
@@ -2857,9 +2874,44 @@ class UnifiedRadixCache(BasePrefixCache):
             should_terminate_tensor = torch.tensor(
                 int(should_terminate), dtype=torch.int, device="cpu"
             )
-            self._all_reduce(should_terminate_tensor, torch.distributed.ReduceOp.MAX)
+            self._exchange_pp0_verdict(should_terminate_tensor)
             return should_terminate_tensor.item() == 1
         return True
+
+    def _exchange_pp0_verdict(self, verdict: torch.Tensor) -> None:
+        """PP0's verdict, MAX over its attention ranks, reaches every stage:
+        over the PP chain, or on the same loop iteration's request relay."""
+        started = time.monotonic()
+        if not self.prefetch_verdict_relay:
+            self._all_reduce(verdict, torch.distributed.ReduceOp.MAX)
+        elif self.pp_rank == 0:
+            self._all_reduce_attn_groups(verdict, torch.distributed.ReduceOp.MAX)
+            self.pp_verdicts_out.append(int(verdict.item()))
+        else:
+            assert self.pp_verdicts_in, "prefetch verdict missing from the PP relay"
+            verdict.fill_(self.pp_verdicts_in.popleft())
+            if self.pp_rank + 1 < self.pp_size:
+                self.pp_verdicts_out.append(int(verdict.item()))
+        if self._prefetch_timing is not None:
+            self._prefetch_timing.record("verdict_exchange", None,
+                                         dur_s=time.monotonic() - started,
+                                         relay=self.prefetch_verdict_relay,
+                                         verdict=int(verdict.item()))
+
+    @rank_consensus(same_results=True)
+    def _prefetch_stop_verdict(self, operation: PrefetchOperation) -> int:
+        """Timeout policy with the PP0 miss shortcut: _STOP_WAIT, _STOP_DEADLINE,
+        or _STOP_LOCAL_MISS when PP0's own storage query found nothing. Every
+        stage's hit is MIN-agreed, so one rank's miss makes the agreed hit zero."""
+        verdict = _STOP_WAIT
+        if self.pp_rank == 0:
+            if operation.local_query_tokens == 0:
+                verdict = _STOP_LOCAL_MISS
+            elif self._prefetch_deadline_expired(operation):
+                verdict = _STOP_DEADLINE
+        verdict_tensor = torch.tensor(verdict, dtype=torch.int, device="cpu")
+        self._exchange_pp0_verdict(verdict_tensor)
+        return int(verdict_tensor.item())
 
     def has_ongoing_prefetch(self, handle: CacheRequestHandle) -> bool:
         return handle in self.ongoing_prefetch
@@ -2953,10 +3005,25 @@ class UnifiedRadixCache(BasePrefixCache):
         operation = self.ongoing_prefetch[request].operation
 
         if not operation.is_terminated():
-            if not self._can_terminate_prefetch(operation):
+            started = time.monotonic()
+            local_miss = False
+            if self.prefetch_pp0_miss_shortcut and self.prefetch_stop_policy == "timeout":
+                verdict = self._prefetch_stop_verdict(operation)
+                terminate = verdict != _STOP_WAIT
+                local_miss = verdict == _STOP_LOCAL_MISS
+            else:
+                terminate = self._can_terminate_prefetch(operation)
+            if self._prefetch_timing is not None:
+                self._prefetch_timing.record("check", request.rid,
+                                             dur_s=time.monotonic() - started,
+                                             terminate=terminate, local_miss=local_miss)
+            if not terminate:
                 self._start_storage_prefetch_wait(operation)
                 return False
-            if self.prefetch_stop_policy == "timeout":
+            if local_miss:
+                # Same retirement as a drained zero hit (no deadline: a miss may retry).
+                operation.local_miss_terminated = True
+            elif self.prefetch_stop_policy == "timeout":
                 self._mark_prefetch_deadline_expired(operation)
 
         self.cache_controller.terminate_prefetch(operation)
@@ -3746,9 +3813,17 @@ class UnifiedRadixCache(BasePrefixCache):
                 request = operation.handle
                 hit_tokens = operation.storage_hit_count
                 info = self.ongoing_prefetch.get(request)
+                if self._prefetch_timing is not None:
+                    self._prefetch_timing.record("hit_drain", request.rid,
+                                                 agreed_tokens=hit_tokens,
+                                                 retired=info is None,
+                                                 local_miss=operation.local_miss_terminated)
                 if info is None:
                     if hit_tokens > 0:
                         self.discard_storage_prefetch_accounting(request)
+                    if operation.local_miss_terminated:
+                        # The agreed (zero) hit is the L3 verdict a drained miss records.
+                        self._account_prefetch_outcome(operation, revoked=True)
                     continue
                 if hit_tokens > 0:
                     self._record_storage_prefetch_hit(request, hit_tokens)
