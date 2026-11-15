@@ -132,6 +132,12 @@ class Disagg(msgspec.Struct):
         "prompt; decode receives that KV plus the encoder SWA window, runs the "
         "final window through the full model, and samples the first token.",
     ] = False
+    dsv41_tail_stage_addr: A[
+        Optional[str],
+        "DeepSeek-V4.1 encoder-only prefill with SGLANG_DSV41_TAIL_STAGE: HOST:PORT "
+        "of the shared tail server, which runs every late-fed request's last window "
+        "through the late layers as pipeline stage 1.",
+    ] = None
 
     # -------------------------------------------------------------------------
     # Encode prefill disaggregation

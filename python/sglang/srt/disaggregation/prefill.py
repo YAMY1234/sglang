@@ -44,6 +44,13 @@ from sglang.srt.disaggregation.common.staging_buffer import (
     staging_grid_tokens,
 )
 from sglang.srt.disaggregation.minimax import minimax_index_transfer_pages
+from sglang.srt.disaggregation.dsv41_tail_stage.protocol import Hello
+from sglang.srt.disaggregation.dsv41_tail_stage_client import (
+    Stage0Pools,
+    TailStageClient,
+    ZmqDealer,
+    c1_buf_infos,
+)
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.disaggregation.utils import (
     CustomizedInfoError,
@@ -117,6 +124,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import is_npu, rank_consensus_checker
 from sglang.srt.utils.device import async_d2h
+from sglang.srt.utils.network import NetworkAddress
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import AbortReq
@@ -338,6 +346,9 @@ class PrefillBootstrapQueue:
                     "supported by Mooncake."
                 )
         self.kv_manager = self._init_kv_manager()
+        self.tail_stage: Optional[TailStageClient] = (
+            self._init_tail_stage_client() if dsv41_tail_stage_enabled() else None
+        )
         kv_storage_of(
             self.scheduler.req_to_token_pool, self.scheduler.token_to_kv_pool_allocator
         ).set_network_waiter(_send_waiter(self.scheduler))
@@ -498,6 +509,90 @@ class PrefillBootstrapQueue:
                 )
         return kv_manager
 
+    def _init_tail_stage_client(self) -> TailStageClient:
+        """SGLANG_DSV41_TAIL_STAGE: connect to the tail server, which registers as
+        PP rank 1 with this prefill's bootstrap server on our Hello."""
+        addr = get_disagg().dsv41_tail_stage_addr
+        if addr is None:
+            raise ValueError("SGLANG_DSV41_TAIL_STAGE needs --dsv41-tail-stage-addr")
+        kv_manager = self.kv_manager
+        capture = self.scheduler.tp_worker.model_runner.attn_backend.late_tail_capture
+        capture_ptrs, capture_lens, capture_items = capture.transfer_buf_infos()
+        # The window's late-layer input is written from here; it is no PD state entry.
+        kv_manager.engine.batch_register(capture_ptrs, capture_lens)
+        kv_ptrs, kv_items, index_ptrs, index_items = c1_buf_infos(self.token_to_kv_pool)
+        pools = Stage0Pools(
+            page_size=self.token_to_kv_pool.page_size,
+            c1_kv_ptrs=kv_ptrs,
+            c1_kv_item_lens=kv_items,
+            c1_index_ptrs=index_ptrs,
+            c1_index_item_lens=index_items,
+            residual_ptr=capture_ptrs[0],
+            residual_item_len=capture_items[0],
+        )
+        registration = kv_manager.bootstrap_registration
+        bootstrap_addr = NetworkAddress(
+            registration["rank_ip"], kv_manager.bootstrap_port
+        ).to_host_port_str()
+        dp_group = (
+            registration["attn_dp_rank"]
+            if registration["system_dp_size"] == 1
+            else registration["system_dp_rank"]
+        )
+        stage0_id = f"{bootstrap_addr}/dp{dp_group}"
+        hello = Hello(
+            stage0_id=stage0_id,
+            bootstrap_addr=bootstrap_addr,
+            registration=registration,
+            mooncake_session=kv_manager.engine.get_session_id(),
+            page_size=pools.page_size,
+            c1_kv_item_lens=kv_items,
+            c1_index_item_lens=index_items,
+            residual_item_len=pools.residual_item_len,
+            window=self.scheduler.model_config.sliding_window_size,
+        )
+        logger.info(
+            "DSV4.1 tail stage: stage 0 %s connects to %s (c1 items %s / %s, "
+            "residual item %d)",
+            stage0_id,
+            addr,
+            kv_items,
+            index_items,
+            pools.residual_item_len,
+        )
+        return TailStageClient(
+            socket=ZmqDealer(addr=addr, identity=stage0_id),
+            hello=hello,
+            pools=pools,
+            transfer=kv_manager.engine.batch_transfer_sync,
+            heartbeat_s=1.0,
+            timeout_s=envs.SGLANG_DSV41_TAIL_STAGE_HEARTBEAT_TIMEOUT_S.get(),
+        )
+
+    def _tail_stage_granted(self, req: Req) -> bool:
+        """Ask the tail server for the room's slot; a late-fed request waits for it
+        here, so a slow tail server shows as bootstrap queue. A room the tail
+        server cannot serve fails, and decode with it."""
+        client = self.tail_stage
+        room = req.bootstrap_room
+        if req.bootstrap_host == FAKE_BOOTSTRAP_HOST:
+            return True
+        client.request(
+            room=room,
+            rid=req.rid,
+            s=req.dsv41_prompt_len,
+            e=len(req.origin_input_ids),
+            late_fed=req.dsv41_late_fed,
+        )
+        if not req.dsv41_late_fed:
+            return True
+        error = client.error(room)
+        if error is not None:
+            client.abort(room)
+            self.kv_manager.conclude_failure(bootstrap_room=room, failure_reason=error)
+            return False
+        return client.grant(room) is not None
+
     def create_sender(self, req: Req, num_kv_heads: int) -> None:
         """Create a KV sender for the request without enqueuing it."""
         backend = (
@@ -530,6 +625,8 @@ class PrefillBootstrapQueue:
         Returns False if no metadata buffer is available (non-terminal)."""
         assert req.pending_bootstrap, "finalize_bootstrap is not idempotent"
         if not self.ensure_metadata_buffer(req):
+            return False
+        if self.tail_stage is not None and not self._tail_stage_granted(req):
             return False
         if (
             dsv41_tail_stage_enabled()
@@ -613,6 +710,8 @@ class PrefillBootstrapQueue:
 
         bootstrapped_reqs = []
 
+        if self.tail_stage is not None:
+            self.tail_stage.poll()
         if len(self.queue) == 0:
             return []
 
@@ -724,6 +823,7 @@ class SchedulerDisaggregationPrefillMixin:
         window = self.model_config.sliding_window_size
         prefix_len = dsv41_encoder_prefix_len(prompt_len, window)
         req.origin_input_ids = req.origin_input_ids[:prefix_len]
+        req.dsv41_prompt_len = prompt_len
         # SGLANG_DSV41_TAIL_STAGE: the late layers' input of the last window ships
         # to the tail stage.
         req.dsv41_late_fed = dsv41_tail_stage_enabled() and dsv41_late_tail_fed(
@@ -747,6 +847,43 @@ class SchedulerDisaggregationPrefillMixin:
                     slot=req.dsv41_late_capture_slot,
                     window_start=req.dsv41_late_capture_start,
                 )
+
+    def _abort_dsv41_tail_stage(self: Scheduler, req: Req) -> None:
+        client = self.disagg_prefill_bootstrap_queue.tail_stage
+        if client is not None:
+            client.abort(req.bootstrap_room)
+
+    def _dsv41_tail_push_pending(self: Scheduler, req: Req) -> bool:
+        """SGLANG_DSV41_TAIL_STAGE: once the decode transfer has succeeded, write the
+        granted slot (the prefix's c1 pages and the window), then report it ready.
+        The slot's layer-20 rows then land on decode after this prefill's, and the
+        pages stay held until both sends end."""
+        client = self.disagg_prefill_bootstrap_queue.tail_stage
+        room = req.bootstrap_room
+        if client is None or client.grant(room) is None:
+            return False
+        if not client.pushing(room):
+            page_size = self.token_to_kv_pool_allocator.page_size
+            e = len(req.origin_input_ids)
+            locs = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :e:page_size]
+            client.start_push(
+                room=room,
+                src_pages=(locs // page_size).cpu().numpy(),
+                capture_slot=req.dsv41_late_capture_slot,
+            )
+            return True
+        ok = client.push_result(room)
+        if ok is None:
+            return True
+        client.ready(room, ok=ok)
+        now = time.monotonic()
+        if now - getattr(self, "dsv41_tail_pushed_log_t", -1e9) > 5:
+            self.dsv41_tail_pushed_log_t = now
+            logger.info(
+                "SGLANG_DSV41_TAIL_STAGE: %d tails written to the tail stage so far",
+                client.tails_pushed,
+            )
+        return False
 
     def _release_dsv41_late_capture(self: Scheduler, req: Req) -> None:
         if req.dsv41_late_capture_slot is not None:
@@ -792,6 +929,7 @@ class SchedulerDisaggregationPrefillMixin:
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         if dsv41_tail_stage_enabled():
             self._release_dsv41_late_capture(req)
+            self._abort_dsv41_tail_stage(req)
         req.pending_bootstrap = False
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
@@ -1506,6 +1644,8 @@ class SchedulerDisaggregationPrefillMixin:
                 # todo: set Transferring correctly in backend
                 pass
             elif poll == KVPoll.Success:  # transfer done
+                if req.dsv41_late_fed and self._dsv41_tail_push_pending(req):
+                    continue
                 if req.return_routed_experts:
                     self.batch_result_processor._maybe_collect_routed_experts(req)
                 if not isinstance(req.finished_reason, FINISH_ABORT):
@@ -1580,6 +1720,8 @@ class SchedulerDisaggregationPrefillMixin:
             logger.debug(error_message)
         else:
             logger.warning(error_message)
+        if dsv41_tail_stage_enabled():
+            self._abort_dsv41_tail_stage(req)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
         if not isinstance(req.finished_reason, FINISH_ABORT):
             prepare_abort(

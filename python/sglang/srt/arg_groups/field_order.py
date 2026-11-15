@@ -567,5 +567,6 @@ POSITIONAL_FIELD_ORDER = (
     "media_url_timeout",
     "allow_local_media_files",
     "dsv41_encoder_only_prefill",
+    "dsv41_tail_stage_addr",
 )
 # fmt: on

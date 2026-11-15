@@ -519,7 +519,9 @@ class Req(ReqDllmMixin):
         # SGLANG_DSV41_TAIL_STAGE: the transferred prefix ends at the late-fed split,
         # and the tail stage runs the late layers over the window below it.
         self.dsv41_late_fed: bool = False
-        # Prefill: the late window's first position and the capture slot it ships from.
+        # Prefill: the prompt length before the split, the late window's first
+        # position and the capture slot it ships from.
+        self.dsv41_prompt_len: Optional[int] = None
         self.dsv41_late_capture_start: Optional[int] = None
         self.dsv41_late_capture_slot: Optional[int] = None
         self.dllm_initialized: bool = False
