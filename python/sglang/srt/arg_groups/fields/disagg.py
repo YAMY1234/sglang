@@ -138,6 +138,12 @@ class Disagg(msgspec.Struct):
         "of the shared tail server, which runs every late-fed request's last window "
         "through the late layers as pipeline stage 1.",
     ] = None
+    dsv41_tail_stage_server: A[
+        bool,
+        "DeepSeek-V4.1 tail server for encoder-only PD (SGLANG_DSV41_TAIL_STAGE). "
+        "Set by its entrypoint, not on the command line: the server loads only the "
+        "layers from the last KV source on and runs prompt windows through them.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Encode prefill disaggregation

@@ -10,7 +10,6 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 import msgspec
-
 from sglang.srt.disaggregation.base.conn import StateType
 
 TAIL_STAGE_PP_SIZE = 2

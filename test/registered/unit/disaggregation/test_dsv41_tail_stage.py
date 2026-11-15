@@ -4,18 +4,20 @@ registration as PP rank 1 of every encoder-only prefill's bootstrap table."""
 import asyncio
 import json
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import torch
-from types import SimpleNamespace
-
-from sglang.srt.disaggregation.base.conn import StateType
+import zmq
+from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
     CommonKVBootstrapServer,
     CommonKVManager,
     PrefillServerInfo,
 )
 from sglang.srt.disaggregation.dsv41_tail_stage import protocol as P
+from sglang.srt.disaggregation.dsv41_tail_stage import transport
 from sglang.srt.disaggregation.dsv41_tail_stage.batcher import (
     TailBatchPolicy,
     parse_buckets,
@@ -35,7 +37,16 @@ from sglang.srt.disaggregation.dsv41_tail_stage.registration import (
     stage1_state_indices,
     tail_stage_wire,
 )
-from sglang.srt.disaggregation.dsv41_tail_stage.slots import SlotState, SlotTable
+from sglang.srt.disaggregation.dsv41_tail_stage.service import (
+    Backend,
+    TailStageService,
+)
+from sglang.srt.disaggregation.dsv41_tail_stage.slots import (
+    CountedPages,
+    SlotState,
+    SlotTable,
+)
+from sglang.srt.disaggregation.utils import check_state_wire, state_wire
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -68,7 +79,7 @@ def _table(*, slots=2, pages=64, queue_cap=8, ready_timeout_s=10.0):
     clock = _Clock()
     table = SlotTable(
         num_slots=slots,
-        num_pages=pages,
+        pages=CountedPages(num_pages=pages, page_size=PAGE, window=WINDOW),
         page_size=PAGE,
         window=WINDOW,
         queue_cap=queue_cap,
@@ -145,10 +156,10 @@ class TestTailStageSlots(CustomTestCase):
         table, _ = _table()
         (grant,) = _msgs(table.request("a", _req(1, 1001)), P.SlotGrant)
         self.assertEqual(grant.slot, grant.residual_slot)
-        # [0, 1000) needs 4 pages of 256; page 0 is the padding page.
+        # The prefix [0, 1000 - 128) needs 4 pages of 256; page 0 is the padding page.
         self.assertEqual(len(grant.c1_pages), 4)
         self.assertNotIn(0, grant.c1_pages)
-        self.assertEqual(table.counts()["free_pages"], 60)
+        self.assertEqual(len(table.pages.free), 60)
 
     def test_stage0_waits_until_a_slot_frees(self):
         table, _ = _table(slots=2)
@@ -174,7 +185,12 @@ class TestTailStageSlots(CustomTestCase):
         self.assertEqual(table.request("a", _req(2, 4 * PAGE + 1)), [])  # 4 > 2 free
         self.assertEqual(table.request("b", _req(3, 2 * PAGE - 1)), [])  # fits, waits
         self.assertEqual(table.counts()["queued"], 2)
-        replies = table.abort(1, stage0_id="a")
+        # Stage 0 may still write a granted slot: it frees at its TailReady.
+        self.assertEqual(table.abort(1, stage0_id="a"), [])
+        self.assertEqual(table.counts()["queued"], 2)
+        replies = table.ready("a", P.TailReady(room=1, slot=0, ok=True))
+        (done,) = _msgs(replies, P.TailDone)
+        self.assertEqual(done.status, "aborted")
         self.assertEqual([g.room for g in _msgs(replies, P.SlotGrant)], [2, 3])
         self.assertEqual(table.counts()["queued"], 0)
 
@@ -188,7 +204,8 @@ class TestTailStageSlots(CustomTestCase):
 
     def test_a_prefix_beyond_the_budget_is_refused(self):
         table, _ = _table(pages=4)
-        (err,) = _msgs(table.request("a", _req(1, 4 * PAGE + 3)), P.Error)
+        self.assertTrue(_msgs(table.request("a", _req(1, 4 * PAGE + 129)), P.SlotGrant))
+        (err,) = _msgs(table.request("a", _req(2, 4 * PAGE + 131)), P.Error)
         self.assertIn("budget", err.reason)
 
     def test_rooms_belong_to_one_stage0_and_repeats_are_idempotent(self):
@@ -286,7 +303,7 @@ class TestTailStageSlots(CustomTestCase):
                 finished += 1
         self.assertEqual(finished, len(rooms))
         self.assertEqual(table.counts()["free_slots"], 3)
-        self.assertEqual(sorted(table.free_pages), list(range(1, 41)))
+        self.assertEqual(sorted(table.pages.free), list(range(1, 41)))
 
 
 class TestTailStageBatcher(CustomTestCase):
@@ -623,6 +640,171 @@ class TestTailStageLayout(CustomTestCase):
         np.testing.assert_array_equal(pages, [5, 2])
         pages = tail_swa_page_ids(pool, row, start=1000 - WINDOW, end=1000)
         np.testing.assert_array_equal(pages, [5])
+
+
+class TestTailStageKVArgs(CustomTestCase):
+    def test_w0_entries_are_empty_and_the_tail_entries_carry_buffers(self):
+        """Decode pairs entries by position: stage 1 must register W0 (sending none of
+        it) and then exactly the tail entries, over the late layers only."""
+        pool = _Pool(range(20, 40))
+        aux = torch.zeros(3, WINDOW, 3 * 8, dtype=torch.bfloat16)
+        fwd = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                token_to_kv_pool=pool, kv_cache_dtype_str="fp8"
+            ),
+            aux=aux,
+        )
+        with (
+            patch.object(
+                transport,
+                "get_disagg",
+                return_value=SimpleNamespace(disaggregation_ib_device=None),
+            ),
+            patch.object(
+                transport, "get_device", return_value=SimpleNamespace(gpu_id=0)
+            ),
+            patch.object(transport, "get_pd_kv_layout", return_value=None),
+        ):
+            kv_args = transport.tail_kv_args(
+                fwd, stage0_wire=W0, start_layer=20, end_layer=40
+            )
+        wire = state_wire(kv_args)
+        self.assertEqual(wire, tail_stage_wire(W0, True))
+        check_state_wire(wire, tail_stage_wire(W0, True))
+        self.assertEqual(kv_args.state_data_ptrs[: len(W0)], [[]] * len(W0))
+        self.assertEqual(
+            kv_args.state_data_ptrs[len(W0)],
+            [b.data_ptr() for b in pool.swa_kv_pool.kv_buffer],
+        )
+        self.assertEqual(kv_args.state_item_lens[len(W0) + 1], [aux[0].nbytes])
+        self.assertEqual(
+            (kv_args.pp_rank, kv_args.prefill_start_layer, kv_args.prefill_end_layer),
+            (1, 20, 40),
+        )
+        self.assertEqual((kv_args.kv_data_ptrs, kv_args.aux_data_ptrs), ([], []))
+
+
+class _Sender:
+    def __init__(self, room):
+        self.room = room
+        self.status = KVPoll.Bootstrapping
+
+    def poll(self):
+        return self.status
+
+
+class TestTailStageService(CustomTestCase):
+    """The loop over real ZMQ sockets and a real bootstrap server; fake forward and
+    decode transport."""
+
+    def setUp(self):
+        self.ctx = zmq.Context()
+        self.router = self.ctx.socket(zmq.ROUTER)
+        self.router.bind(f"inproc://tail-{id(self)}")
+        self.stage0 = self.ctx.socket(zmq.DEALER)
+        self.stage0.setsockopt(zmq.IDENTITY, b"h:8998/dp0")
+        self.stage0.connect(f"inproc://tail-{id(self)}")
+        self.bootstrap = CommonKVBootstrapServer("127.0.0.1", 0)
+        self.senders, self.sent, self.batches = {}, [], []
+        welcome = P.Welcome(
+            tail_session="10.0.0.9:15100",
+            c1_kv_ptrs=[1],
+            c1_kv_item_lens=[73728],
+            c1_index_ptrs=[2],
+            c1_index_item_lens=[17408],
+            residual_ptr=3,
+            residual_item_len=5242880,
+            page_size=PAGE,
+            num_slots=3,
+        )
+
+        def make_sender(addr, room):
+            self.senders[room] = _Sender(room)
+            return self.senders[room]
+
+        backend = Backend(
+            start_transport=lambda wire: ("10.0.0.9", 17100, welcome),
+            make_sender=make_sender,
+            send=lambda sender, tail: self.sent.append((sender.room, tail.slot)),
+            run=lambda tails: self.batches.append([t.room for t in tails]),
+            put=lambda addr, payload: _put(self.bootstrap, payload).status == 200,
+        )
+        self.clock = _Clock()
+        table, _ = _table(slots=3)
+        table.clock = self.clock
+        self.service = TailStageService(
+            backend=backend,
+            socket=self.router,
+            table=table,
+            peers=Stage0Peers(page_size=PAGE, window=WINDOW, draft_aux=True),
+            policy=TailBatchPolicy(min_tails=2, max_tails=4, wait_ms=15, buckets=(4,)),
+            heartbeat_s=1e9,
+            heartbeat_timeout_s=5.0,
+            clock=self.clock,
+        )
+
+    def tearDown(self):
+        self.bootstrap.close()
+        self.stage0.close(0)
+        self.router.close(0)
+        self.ctx.term()
+
+    def _exchange(self, *msgs):
+        for msg in msgs:
+            self.stage0.send(P.encode(msg))
+        self.service.step(poll_ms=50)
+        out = []
+        while self.stage0.poll(10):
+            out.append(P.decode(self.stage0.recv()))
+        return out
+
+    def test_a_room_from_hello_to_done(self):
+        hello = TestTailStageRegistration._hello(None)
+        _put(self.bootstrap, _stage0_payload())
+        (welcome,) = self._exchange(hello)
+        self.assertIsInstance(welcome, P.Welcome)
+        self.assertEqual(self.bootstrap._registered_count, 2)
+        got = self._exchange(
+            _req(1, 4001), _req(2, 4001), _req(3, 90, late_fed=False), _req(4, 4001)
+        )
+        grants = {m.room: m for m in got if isinstance(m, P.SlotGrant)}
+        self.assertEqual(sorted(grants), [1, 2, 3, 4])
+        self.assertEqual(grants[3].slot, -1)
+        self.assertEqual(sorted(self.senders), [1, 2, 3, 4])
+        # One ready tail waits for a second (min_tails 2) or the 15 ms window.
+        self._exchange(P.TailReady(room=1, slot=grants[1].slot, ok=True))
+        self.assertEqual(self.batches, [])
+        self._exchange(P.TailReady(room=2, slot=grants[2].slot, ok=True))
+        self.assertEqual(self.batches, [[1, 2]])
+        # Sends wait for decode's transfer info (WaitingForInput).
+        self.assertEqual(self.sent, [])
+        for room in (1, 2, 3):
+            self.senders[room].status = KVPoll.WaitingForInput
+        self._exchange()
+        self.assertEqual(
+            sorted(self.sent), [(1, grants[1].slot), (2, grants[2].slot), (3, -1)]
+        )
+        for room in (1, 2, 3):
+            self.senders[room].status = KVPoll.Success
+        done = [m for m in self._exchange() if isinstance(m, P.TailDone)]
+        self.assertEqual(
+            sorted((d.room, d.status) for d in done), [(1, "ok"), (2, "ok")]
+        )
+        self.assertEqual(self.service.table.counts()["free_slots"], 2)
+        # Decode failing a granted room holds its slot until stage 0's TailReady.
+        self.senders[4].status = KVPoll.Failed
+        self.assertEqual([m for m in self._exchange() if isinstance(m, P.TailDone)], [])
+        self.assertEqual(self.service.table.counts()["free_slots"], 2)
+        (done,) = self._exchange(P.TailReady(room=4, slot=grants[4].slot, ok=True))
+        self.assertEqual((done.room, done.status), (4, "aborted"))
+        self.assertEqual(self.service.table.counts()["free_slots"], 3)
+
+    def test_requests_before_hello_and_bad_versions_are_refused(self):
+        (err,) = self._exchange(_req(1, 4001))
+        self.assertEqual(err.reason, "no Hello")
+        self.stage0.send(P.encode(P.TailAbort(room=1, version=99)))
+        self.service.step(poll_ms=50)
+        self.assertIn("version", P.decode(self.stage0.recv()).reason)
 
 
 def _fields(msg):

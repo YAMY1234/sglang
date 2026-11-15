@@ -1,7 +1,7 @@
 """Stage 1's slot accounting: requests, grants with backpressure, and the ready queue.
 
 A slot holds one tail from grant to the end of its send to decode: a residual slot,
-the c1 pages of its prefix [0, e), its SWA rows and its aux row. Grants go strictly
+the c1 pages of its prefix [0, e - W), its SWA rows and its aux row. Grants go strictly
 first-come over every stage 0, so a long prompt is never passed over; a stage 0 waits
 in bootstrap until its grant arrives.
 """
@@ -11,10 +11,9 @@ from __future__ import annotations
 import enum
 import time
 from collections import deque
-from typing import Callable, Deque, Dict, List, Optional
+from typing import Callable, Deque, Dict, List, Optional, Protocol
 
 import msgspec
-
 from sglang.srt.disaggregation.dsv41_tail_stage.protocol import (
     Error,
     SlotDefer,
@@ -52,8 +51,8 @@ class TailSlot(msgspec.Struct):
     t_ready: float = 0.0
     t_run: float = 0.0
     t_send: float = 0.0
-    # An abort that arrived while the slot's buffers were in use; the slot frees
-    # when its send ends.
+    # An abort that arrived while stage 0 may still write the slot or its send
+    # reads it; the slot frees at TailReady or when the send ends.
     abort_pending: bool = False
 
 
@@ -62,12 +61,48 @@ class Reply(msgspec.Struct, frozen=True):
     msg: TailMessage
 
 
+class PageSource(Protocol):
+    """Where a granted tail's prefix pages come from: stage 0 writes the c1 KV of
+    [0, e - window) into them."""
+
+    capacity: int
+
+    def take(self, tail: TailSlot) -> Optional[List[int]]:
+        """The prefix's page ids in position order, or None while they do not fit."""
+
+    def give_back(self, tail: TailSlot) -> None: ...
+
+
+class CountedPages:
+    """Page ids 1..num_pages handed out first come first served (page 0 holds the
+    padding token slot, as in every SGLang KV pool)."""
+
+    def __init__(self, *, num_pages: int, page_size: int, window: int) -> None:
+        self.capacity = num_pages
+        self.page_size = page_size
+        self.window = window
+        self.free: Deque[int] = deque(range(1, num_pages + 1))
+
+    def take(self, tail: TailSlot) -> Optional[List[int]]:
+        need = prefix_pages(e=tail.e, window=self.window, page_size=self.page_size)
+        if need > len(self.free):
+            return None
+        return [self.free.popleft() for _ in range(need)]
+
+    def give_back(self, tail: TailSlot) -> None:
+        self.free.extend(tail.c1_pages)
+
+
+def prefix_pages(*, e: int, window: int, page_size: int) -> int:
+    return -(-(e - window) // page_size)
+
+
 class SlotTable:
     def __init__(
         self,
         *,
         num_slots: int,
-        num_pages: int,
+        pages: PageSource,
         page_size: int,
         window: int,
         queue_cap: int,
@@ -75,23 +110,18 @@ class SlotTable:
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.num_slots = num_slots
-        self.num_pages = num_pages
+        self.pages = pages
         self.page_size = page_size
         self.window = window
         self.queue_cap = queue_cap
         self.ready_timeout_s = ready_timeout_s
         self.clock = clock
         self.free_slots: Deque[int] = deque(range(num_slots))
-        # Page 0 holds the padding token slot 0, as in every SGLang KV pool.
-        self.free_pages: Deque[int] = deque(range(1, num_pages + 1))
         self.queue: Deque[int] = deque()
         self.ready_order: Deque[int] = deque()
         self.tails: Dict[int, TailSlot] = {}
         # Pass-through rooms: no slot, an empty send to decode.
         self.passthrough: Dict[int, str] = {}
-
-    def pages_for(self, e: int) -> int:
-        return -(-e // self.page_size)
 
     def counts(self) -> Dict[str, int]:
         by_state = {state: 0 for state in SlotState}
@@ -99,7 +129,6 @@ class SlotTable:
             by_state[tail.state] += 1
         return {
             "free_slots": len(self.free_slots),
-            "free_pages": len(self.free_pages),
             "queued": by_state[SlotState.REQUESTED],
             "granted": by_state[SlotState.GRANTED],
             "ready": by_state[SlotState.READY],
@@ -121,7 +150,8 @@ class SlotTable:
             self.passthrough[req.room] = stage0_id
             grant = SlotGrant(room=req.room, slot=-1, residual_slot=-1, c1_pages=[])
             return [Reply(stage0_id, grant)]
-        if self.pages_for(req.e) > self.num_pages:
+        need = prefix_pages(e=req.e, window=self.window, page_size=self.page_size)
+        if need > self.pages.capacity:
             reason = f"prefix of {req.e} tokens exceeds the tail stage's KV budget"
             return [Reply(stage0_id, Error(reason=reason, room=req.room))]
         if len(self.queue) >= self.queue_cap:
@@ -149,6 +179,8 @@ class SlotTable:
         ):
             reason = f"TailReady for room {msg.room} slot {msg.slot} not granted"
             return [Reply(stage0_id, Error(reason=reason, room=msg.room))]
+        if tail.abort_pending:
+            return self.finish(msg.room, status="aborted", reason="aborted")
         if not msg.ok:
             return self.finish(msg.room, status="failed", reason="stage 0 gave up")
         tail.state = SlotState.READY
@@ -187,7 +219,11 @@ class SlotTable:
         if owner is None or (stage0_id is not None and owner != stage0_id):
             return []
         tail = self.tails.get(room)
-        if tail is not None and tail.state in (SlotState.RUNNING, SlotState.SENDING):
+        if tail is not None and tail.state in (
+            SlotState.GRANTED,
+            SlotState.RUNNING,
+            SlotState.SENDING,
+        ):
             tail.abort_pending = True
             return []
         return self.finish(room, status="aborted", reason="aborted")
@@ -205,7 +241,7 @@ class SlotTable:
             self.ready_order.remove(room)
         if tail.slot >= 0:
             self.free_slots.append(tail.slot)
-            self.free_pages.extend(tail.c1_pages)
+            self.pages.give_back(tail)
         if tail.abort_pending and status == "ok":
             status, reason = "aborted", "aborted while running"
         now = self.clock()
@@ -264,12 +300,12 @@ class SlotTable:
         now = self.clock()
         while self.queue and self.free_slots:
             tail = self.tails[self.queue[0]]
-            need = self.pages_for(tail.e)
-            if need > len(self.free_pages):
+            pages = self.pages.take(tail)
+            if pages is None:
                 break
             self.queue.popleft()
             tail.slot = self.free_slots.popleft()
-            tail.c1_pages = [self.free_pages.popleft() for _ in range(need)]
+            tail.c1_pages = pages
             tail.state = SlotState.GRANTED
             tail.t_grant = now
             replies.append(Reply(tail.stage0_id, self._grant_msg(tail)))

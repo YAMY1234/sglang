@@ -6810,6 +6810,10 @@ def _dispatch_event_loop_once(scheduler: Scheduler):
     # A PD role switch can select a different loop on the same scheduler.
     scheduler.enable_continuous_input_polling = False
     scheduler.enable_skip_finishing_decode = False
+    if get_disagg().dsv41_tail_stage_server:
+        from sglang.srt.disaggregation.dsv41_tail_stage.server import run_tail_stage
+
+        return run_tail_stage(scheduler)
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
     if disaggregation_mode == DisaggregationMode.NULL:
         if get_parallel().pp_size > 1:
