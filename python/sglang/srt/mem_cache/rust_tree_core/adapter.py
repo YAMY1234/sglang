@@ -1343,7 +1343,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         return self._fill_evict_result(binding_result, result)
 
     def is_external_cache_stored(self, node_id: NodeId) -> bool:
-        return self._binding.inspect_is_external_cache_stored(node_id)
+        return self._binding.is_external_cache_stored(node_id)
 
     def mark_write_through_pending(
         self, node_ids: list[NodeId], ack_id: NodeId

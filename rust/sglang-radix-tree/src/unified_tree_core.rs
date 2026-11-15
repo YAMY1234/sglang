@@ -3013,6 +3013,12 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         Ok((true, result))
     }
 
+    /// Whether the external store is known to hold the node.
+    pub fn is_external_cache_stored(&self, node_id: NodeId) -> Result<bool, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
+        Ok(self.arena.node(node_id).external_cache_stored)
+    }
+
     /// Free the host-only subtree below a D-leaf, deepest first; false, with
     /// nothing freed, when a node in it is locked or has a copy in flight.
     fn drop_host_only_descendants_(

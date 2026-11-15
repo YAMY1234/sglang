@@ -2218,6 +2218,12 @@ macro_rules! tree_core_methods {
                 })
             }
 
+            /// Whether the external store is known to hold the node.
+            fn is_external_cache_stored(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
+                py.detach(|| self.core().is_external_cache_stored(node_id))
+                    .map_err(node_access_error)
+            }
+
             /// Mark the nodes one write-through backup covers; returns them ancestors first.
             fn mark_write_through_pending(
                 &self,
@@ -3531,6 +3537,11 @@ macro_rules! tree_core_binding {
                 node_id: NodeId,
             ) -> PyResult<DropSubtreeResultBinding> {
                 catch_native_panic(|| self.inner.release_host_value(py, node_id))
+            }
+
+            /// Whether the external store is known to hold the node.
+            fn is_external_cache_stored(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
+                catch_native_panic(|| self.inner.is_external_cache_stored(py, node_id))
             }
 
             /// Mark the nodes one write-through backup covers; returns them ancestors first.
