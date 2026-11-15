@@ -109,6 +109,8 @@ class TailStageService:
         self._finish_batches()
         self._poll_senders(now)
         self._run_batch()
+        # This step's grants (from requests, expiries and finished sends) at once.
+        self.table.pages.end_round()
         self._busy_samples.append(self.table.num_slots - len(self.table.free_slots))
         self._log(now)
 
@@ -360,8 +362,7 @@ def build_service(scheduler, fwd) -> TailStageService:
         NullDecodeSender,
     )
 
-    pages = fwd.page_source()
-    mooncake = MooncakeTailBackend(fwd, pages, scheduler.server_args)
+    mooncake = MooncakeTailBackend(fwd, scheduler.server_args)
     null_decode = envs.SGLANG_DSV41_TAIL_STAGE_NULL_DECODE.get()
     if null_decode:
         # No stage 0 writes the slots: give the late layers non-degenerate input.
@@ -378,7 +379,7 @@ def build_service(scheduler, fwd) -> TailStageService:
     )
     table = SlotTable(
         num_slots=fwd.residual.shape[0],
-        pages=pages,
+        pages=fwd.memory,
         page_size=fwd.page_size,
         window=fwd.window,
         queue_cap=envs.SGLANG_DSV41_TAIL_STAGE_QUEUE_CAP.get(),

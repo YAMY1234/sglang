@@ -9,9 +9,10 @@ in bootstrap until its grant arrives.
 from __future__ import annotations
 
 import enum
+import heapq
 import time
 from collections import deque
-from typing import Callable, Deque, Dict, List, Optional, Protocol
+from typing import Callable, Deque, Dict, List, Optional, Protocol, Set, Tuple
 
 import msgspec
 from sglang.srt.disaggregation.dsv41_tail_stage.protocol import (
@@ -73,7 +74,11 @@ class PageSource(Protocol):
     capacity: int
 
     def take(self, tail: TailSlot) -> Optional[List[int]]:
-        """The prefix's page ids in position order, or None while they do not fit."""
+        """The prefix's page ids in position order, or None while they do not fit.
+        `tail.slot` is already the slot it gets."""
+
+    def end_round(self) -> None:
+        """Once per loop step, after its grants: their device writes, at once."""
 
     def give_back(self, tail: TailSlot) -> None: ...
 
@@ -93,6 +98,9 @@ class CountedPages:
         if need > len(self.free):
             return None
         return [self.free.popleft() for _ in range(need)]
+
+    def end_round(self) -> None:
+        pass
 
     def give_back(self, tail: TailSlot) -> None:
         self.free.extend(tail.c1_pages)
@@ -127,6 +135,11 @@ class SlotTable:
         self.tails: Dict[int, TailSlot] = {}
         # Pass-through rooms: no slot, an empty send to decode.
         self.passthrough: Dict[int, str] = {}
+        # (deadline, room, stamp): a granted or failed slot's timeout. Stale entries
+        # (the room moved on) are dropped when they come due.
+        self._deadlines: List[Tuple[float, int, float]] = []
+        # Silent stage 0s whose queued and granted rooms were already failed.
+        self._silenced: Set[str] = set()
 
     def counts(self) -> Dict[str, int]:
         by_state = {state: 0 for state in SlotState}
@@ -278,39 +291,44 @@ class SlotTable:
     def expire(self, *, silent_stage0s: List[str]) -> List[Reply]:
         """Fail granted slots whose TailReady is overdue, and every queued or granted
         slot of a stage 0 that went silent (its TailReady cannot come). A granted slot
-        is held as FAILED until stage 0 answers, or for another ready timeout."""
+        is held as FAILED until stage 0 answers, or for another ready timeout. Due
+        deadlines come off a heap; a stage 0's rooms are scanned once, when it falls
+        silent."""
         now = self.clock()
-        silent = set(silent_stage0s)
         replies = []
-        for tail in list(self.tails.values()):
-            if tail.state == SlotState.FAILED:
-                if now - tail.t_fail > self.ready_timeout_s:
-                    replies += self.finish(tail.room, status="failed", notify=False)
+        newly_silent = set(silent_stage0s) - self._silenced
+        self._silenced &= set(silent_stage0s)
+        if newly_silent:
+            self._silenced |= newly_silent
+            for tail in list(self.tails.values()):
+                if tail.stage0_id in newly_silent:
+                    replies += self._expire_one(tail, reason="stage 0 silent", now=now)
+            for room, owner in list(self.passthrough.items()):
+                if owner in newly_silent:
+                    del self.passthrough[room]
+        while self._deadlines and self._deadlines[0][0] <= now:
+            _, room, stamp = heapq.heappop(self._deadlines)
+            tail = self.tails.get(room)
+            if tail is None:
                 continue
-            if tail.state not in (SlotState.REQUESTED, SlotState.GRANTED):
-                continue
-            if tail.stage0_id in silent:
-                reason = "stage 0 silent"
-            elif (
-                tail.state == SlotState.GRANTED
-                and now - tail.t_grant > self.ready_timeout_s
-            ):
-                reason = "ready timeout"
-            else:
-                continue
-            if tail.state == SlotState.REQUESTED:
-                replies += self.finish(tail.room, status="failed", reason=reason)
-            else:
-                replies += self._fail_granted(tail, reason=reason, now=now)
-        for room, owner in list(self.passthrough.items()):
-            if owner in silent:
-                del self.passthrough[room]
+            if tail.state == SlotState.FAILED and tail.t_fail == stamp:
+                replies += self.finish(room, status="failed", notify=False)
+            elif tail.state == SlotState.GRANTED and tail.t_grant == stamp:
+                replies += self._expire_one(tail, reason="ready timeout", now=now)
         return replies
+
+    def _expire_one(self, tail: TailSlot, *, reason: str, now: float) -> List[Reply]:
+        if tail.state == SlotState.REQUESTED:
+            return self.finish(tail.room, status="failed", reason=reason)
+        if tail.state == SlotState.GRANTED:
+            return self._fail_granted(tail, reason=reason, now=now)
+        return []
 
     def _fail_granted(self, tail: TailSlot, *, reason: str, now: float) -> List[Reply]:
         tail.state = SlotState.FAILED
         tail.t_fail = now
         tail.fail_reason = reason
+        heapq.heappush(self._deadlines, (now + self.ready_timeout_s, tail.room, now))
         done = TailDone(
             room=tail.room,
             slot=tail.slot,
@@ -339,14 +357,19 @@ class SlotTable:
         now = self.clock()
         while self.queue and self.free_slots:
             tail = self.tails[self.queue[0]]
+            tail.slot = self.free_slots[0]
             pages = self.pages.take(tail)
             if pages is None:
+                tail.slot = -1
                 break
             self.queue.popleft()
-            tail.slot = self.free_slots.popleft()
+            self.free_slots.popleft()
             tail.c1_pages = pages
             tail.state = SlotState.GRANTED
             tail.t_grant = now
+            heapq.heappush(
+                self._deadlines, (now + self.ready_timeout_s, tail.room, now)
+            )
             replies.append(Reply(tail.stage0_id, self._grant_msg(tail)))
         return replies
 
