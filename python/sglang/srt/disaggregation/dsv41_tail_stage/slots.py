@@ -35,6 +35,9 @@ class SlotState(enum.IntEnum):
     READY = 2
     RUNNING = 3
     SENDING = 4
+    # Failed by stage 1 after its grant: stage 0 may still be writing the slot, so the
+    # slot and pages stay held until stage 0 answers (TailReady or TailAbort).
+    FAILED = 5
 
 
 class TailSlot(msgspec.Struct):
@@ -51,6 +54,8 @@ class TailSlot(msgspec.Struct):
     t_ready: float = 0.0
     t_run: float = 0.0
     t_send: float = 0.0
+    t_fail: float = 0.0
+    fail_reason: str = ""
     # An abort that arrived while stage 0 may still write the slot or its send
     # reads it; the slot frees at TailReady or when the send ends.
     abort_pending: bool = False
@@ -134,6 +139,7 @@ class SlotTable:
             "ready": by_state[SlotState.READY],
             "running": by_state[SlotState.RUNNING],
             "sending": by_state[SlotState.SENDING],
+            "failed_held": by_state[SlotState.FAILED],
             "passthrough": len(self.passthrough),
         }
 
@@ -171,6 +177,13 @@ class SlotTable:
 
     def ready(self, stage0_id: str, msg: TailReady) -> List[Reply]:
         tail = self.tails.get(msg.room)
+        if (
+            tail is not None
+            and tail.stage0_id == stage0_id
+            and tail.slot == msg.slot
+            and tail.state == SlotState.FAILED
+        ):
+            return self.finish(msg.room, status="failed", notify=False)
         if (
             tail is None
             or tail.stage0_id != stage0_id
@@ -219,6 +232,10 @@ class SlotTable:
         if owner is None or (stage0_id is not None and owner != stage0_id):
             return []
         tail = self.tails.get(room)
+        if tail is not None and tail.state == SlotState.FAILED:
+            if stage0_id is None:
+                return []
+            return self.finish(room, status="failed", notify=False)
         if tail is not None and tail.state in (
             SlotState.GRANTED,
             SlotState.RUNNING,
@@ -228,7 +245,9 @@ class SlotTable:
             return []
         return self.finish(room, status="aborted", reason="aborted")
 
-    def finish(self, room: int, *, status: str, reason: str = "") -> List[Reply]:
+    def finish(
+        self, room: int, *, status: str, reason: str = "", notify: bool = True
+    ) -> List[Reply]:
         """Free the room's slot and pages; the freed room can be granted again."""
         if self.passthrough.pop(room, None) is not None:
             return []
@@ -254,32 +273,52 @@ class SlotTable:
             forward_ms=_ms(tail.t_run, tail.t_send) if tail.t_run else 0.0,
             send_ms=_ms(tail.t_send, now) if tail.t_send else 0.0,
         )
-        return [Reply(tail.stage0_id, done)] + self._grant()
+        return ([Reply(tail.stage0_id, done)] if notify else []) + self._grant()
 
     def expire(self, *, silent_stage0s: List[str]) -> List[Reply]:
         """Fail granted slots whose TailReady is overdue, and every queued or granted
-        slot of a stage 0 that went silent (its TailReady cannot come)."""
+        slot of a stage 0 that went silent (its TailReady cannot come). A granted slot
+        is held as FAILED until stage 0 answers, or for another ready timeout."""
         now = self.clock()
         silent = set(silent_stage0s)
         replies = []
         for tail in list(self.tails.values()):
+            if tail.state == SlotState.FAILED:
+                if now - tail.t_fail > self.ready_timeout_s:
+                    replies += self.finish(tail.room, status="failed", notify=False)
+                continue
             if tail.state not in (SlotState.REQUESTED, SlotState.GRANTED):
                 continue
             if tail.stage0_id in silent:
-                replies += self.finish(
-                    tail.room, status="failed", reason="stage 0 silent"
-                )
+                reason = "stage 0 silent"
             elif (
                 tail.state == SlotState.GRANTED
                 and now - tail.t_grant > self.ready_timeout_s
             ):
-                replies += self.finish(
-                    tail.room, status="failed", reason="ready timeout"
-                )
+                reason = "ready timeout"
+            else:
+                continue
+            if tail.state == SlotState.REQUESTED:
+                replies += self.finish(tail.room, status="failed", reason=reason)
+            else:
+                replies += self._fail_granted(tail, reason=reason, now=now)
         for room, owner in list(self.passthrough.items()):
             if owner in silent:
                 del self.passthrough[room]
         return replies
+
+    def _fail_granted(self, tail: TailSlot, *, reason: str, now: float) -> List[Reply]:
+        tail.state = SlotState.FAILED
+        tail.t_fail = now
+        tail.fail_reason = reason
+        done = TailDone(
+            room=tail.room,
+            slot=tail.slot,
+            status="failed",
+            reason=reason,
+            queue_ms=_ms(tail.t_request, tail.t_grant),
+        )
+        return [Reply(tail.stage0_id, done)]
 
     def _owner(self, room: int) -> Optional[str]:
         tail = self.tails.get(room)

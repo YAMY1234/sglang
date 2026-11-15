@@ -2126,14 +2126,16 @@ class Envs:
     # decode admits the request with one fused step (the prefill needs
     # --dsv41-tail-stage-addr).
     SGLANG_DSV41_TAIL_STAGE = EnvBool(False)
-    # Seconds without a heartbeat before a tail-stage peer counts as down.
-    SGLANG_DSV41_TAIL_STAGE_HEARTBEAT_TIMEOUT_S = EnvFloat(5.0)
+    # Seconds without a heartbeat before a tail-stage peer counts as down; a cold
+    # first forward blocked the tail server's loop for tens of seconds.
+    SGLANG_DSV41_TAIL_STAGE_HEARTBEAT_TIMEOUT_S = EnvFloat(120.0)
     # The tail server (--dsv41-tail-stage-server): its ROUTER port (0 serves nothing)
     # and the address it registers with each prefill's bootstrap server.
     SGLANG_DSV41_TAIL_STAGE_PORT = EnvInt(0)
     SGLANG_DSV41_TAIL_STAGE_HOST = EnvStr(None)
-    # Arbitrary: 64 tails of 5.24 MB residual each, as the prefill's capture slots.
-    SGLANG_DSV41_TAIL_STAGE_SLOTS = EnvInt(64)
+    # Tails in flight from grant to the end of their send to decode: 9.2 MB each
+    # (residual and DSpark captures); 256 is arbitrary within the tail GPU's spare memory.
+    SGLANG_DSV41_TAIL_STAGE_SLOTS = EnvInt(256)
     # A forward runs at MIN_TAILS ready tails, or once the oldest waited WAIT_MS; at
     # most MAX_TAILS (whose rows the tail graphs and MegaMoE cap must cover).
     SGLANG_DSV41_TAIL_STAGE_MIN_TAILS = EnvInt(8)

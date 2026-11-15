@@ -285,6 +285,31 @@ class TestTailStageSlots(CustomTestCase):
         done = _msgs(table.expire(silent_stage0s=[]), P.TailDone)
         self.assertEqual([(d.room, d.reason) for d in done], [(1, "ready timeout")])
 
+    def test_a_failed_granted_slot_is_held_until_stage0_answers(self):
+        """A slot failed after its grant must not be granted again while its stage 0
+        may still write it: it frees on that stage 0's TailReady or TailAbort."""
+        table, clock = _table(slots=1, ready_timeout_s=10.0)
+        table.request("a", _req(1, 1001))
+        self.assertEqual(table.request("b", _req(2, 1001)), [])
+        clock.t += 5
+        (done,) = _msgs(table.expire(silent_stage0s=["a"]), P.TailDone)
+        self.assertEqual((done.room, done.status), (1, "failed"))
+        self.assertEqual(table.counts()["failed_held"], 1)
+        self.assertEqual(_msgs(table.expire(silent_stage0s=[]), P.SlotGrant), [])
+        # Decode's abort does not free it either; stage 0's answer does, quietly.
+        self.assertEqual(table.abort(1), [])
+        replies = table.ready("a", P.TailReady(room=1, slot=0, ok=False))
+        self.assertEqual(_msgs(replies, P.TailDone), [])
+        (grant,) = _msgs(replies, P.SlotGrant)
+        self.assertEqual((grant.room, grant.slot), (2, 0))
+        # A stage 0 that never answers gives the slot back after another timeout.
+        clock.t += 11
+        table.expire(silent_stage0s=[])
+        self.assertEqual(table.counts()["failed_held"], 1)
+        clock.t += 11
+        table.expire(silent_stage0s=[])
+        self.assertEqual(table.counts()["free_slots"], 1)
+
     def test_slots_and_pages_balance_over_a_long_run(self):
         table, clock = _table(slots=3, pages=40, queue_cap=100)
         rooms = list(range(1, 60))

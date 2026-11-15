@@ -89,7 +89,7 @@ class TailStageService:
         self._receive(poll_ms)
         now = self.clock()
         silent = self.peers.silent(now=now, timeout_s=self.heartbeat_timeout_s)
-        self._deliver(self.table.expire(silent_stage0s=silent))
+        self._expire(silent)
         self._heartbeat(now)
         self._poll_senders()
         self._run_batch()
@@ -175,6 +175,17 @@ class TailStageService:
     def _abort(self, room: int, *, stage0_id: Optional[str]) -> None:
         self._deliver(self.table.abort(room, stage0_id=stage0_id))
 
+    def _expire(self, silent: List[str]) -> None:
+        replies = self.table.expire(silent_stage0s=silent)
+        for reply in replies:
+            msg = reply.msg
+            if isinstance(msg, P.TailDone) and msg.status != "ok":
+                # Stage 0 fails the request to decode; nothing is sent from here.
+                self.senders.pop(msg.room, None)
+                self.ready_to_send.pop(msg.room, None)
+                self.stats["tails_failed"] += 1
+        self._deliver(replies)
+
     def _run_batch(self) -> None:
         n = self.policy.take_count(
             ready=self.table.num_ready(),
@@ -202,7 +213,7 @@ class TailStageService:
         self.senders.pop(room)
         self.ready_to_send.pop(room, None)
         tail = self.table.tails.get(room)
-        if tail is not None and tail.state == SlotState.GRANTED:
+        if tail is not None and tail.state in (SlotState.GRANTED, SlotState.FAILED):
             # Stage 0 may still write the slot: it frees at TailReady.
             self._deliver(self.table.abort(room))
             return
