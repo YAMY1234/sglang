@@ -871,11 +871,13 @@ class SchedulerDisaggregationPrefillMixin:
         if client is None or client.grant(room) is None:
             return False
         if not client.pushing(room):
+            # The tail server recomputes the window's own c1 rows; it takes the
+            # pages of the prefix below it, [0, e - window).
             client.start_push(
                 room=room,
                 src_pages=c1_page_ids(
                     self.req_to_token_pool.req_to_token[req.kv.req_pool_idx],
-                    e=len(req.origin_input_ids),
+                    e=req.dsv41_late_capture_start,
                     page_size=self.token_to_kv_pool_allocator.page_size,
                 ),
                 capture_slot=req.dsv41_late_capture_slot,

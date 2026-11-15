@@ -361,6 +361,9 @@ class TestPushAfterDecodeSuccess(CustomTestCase):
     def test_slot_written_after_decode_success_then_released(self):
         client, sock, _ = _welcomed()
         queue, req = _granted_queue(client)
+        # e = 1100: the tail server takes the c1 pages of [0, e - 128), 4 not 5.
+        req.origin_input_ids = list(range(1100))
+        req.dsv41_prompt_len, req.dsv41_late_capture_start = 1101, 972
         self.assertFalse(PrefillBootstrapQueue._tail_stage_granted(queue, req))
         sock.inbox.append(
             P.SlotGrant(room=1, slot=2, residual_slot=2, c1_pages=[5, 6, 7, 8])
@@ -368,7 +371,7 @@ class TestPushAfterDecodeSuccess(CustomTestCase):
         client.poll()
         req.kv = SimpleNamespace(req_pool_idx=1)
         req.dsv41_late_capture_slot = 9
-        req_to_token = torch.arange(2 * 1024).reshape(2, 1024) + 256 * 10
+        req_to_token = torch.arange(2 * 2048).reshape(2, 2048) + 256 * 10
         sched = SimpleNamespace(
             disagg_prefill_bootstrap_queue=queue,
             token_to_kv_pool_allocator=SimpleNamespace(page_size=256),
@@ -377,8 +380,9 @@ class TestPushAfterDecodeSuccess(CustomTestCase):
         self.assertTrue(Mixin._dsv41_tail_push_pending(sched, req))
         client._rooms[1].push.result(timeout=5)
         src = client._transfer.call_args.args[1]
-        # Row 1 holds locs 1024 + 2560 ...: pages 14..17 of [0, 1000).
-        self.assertEqual(src[0], POOLS.c1_kv_ptrs[0] + 14 * 100)
+        # Row 1 holds locs 2048 + 2560 ...: pages 18..21 of [0, 972), one run.
+        self.assertEqual(src[0], POOLS.c1_kv_ptrs[0] + 18 * 100)
+        self.assertEqual(client._transfer.call_args.args[3][0], 4 * 100)
         self.assertEqual(src[-1], POOLS.residual_ptr + 9 * POOLS.residual_item_len)
         self.assertFalse(Mixin._dsv41_tail_push_pending(sched, req))
         self.assertTrue(sock.take(P.TailReady)[0].ok)
