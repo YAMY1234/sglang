@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 from array import array
+from contextlib import nullcontext
 from typing import Dict, List, Optional, Sequence
 
 import msgspec
@@ -59,27 +60,31 @@ class TailStageForward:
         self.storage = kv_storage_of(req_to_token_pool, allocator)
         config = model_config.hf_text_config
         device = model_runner.device
-        # [slots, W, hc_mult, hidden] bf16: the late layers' input stage 0 writes.
-        self.residual = torch.zeros(
-            num_slots,
-            window,
-            config.hc_mult,
-            config.hidden_size,
-            dtype=torch.bfloat16,
-            device=device,
-        )
-        self.aux: Optional[torch.Tensor] = None
-        if draft_aux:
-            layers = list(config.dspark_target_layer_ids)
-            model_runner.model.set_dspark_layers_to_capture(layers)
-            # [slots, W, captures * hidden] bf16, in dspark_layers_to_capture order.
-            self.aux = torch.zeros(
+        mem_pool = model_runner.token_to_kv_pool.custom_mem_pool
+        # Mooncake reads and writes these as the KV pools: under a custom memory
+        # pool (MNNVL) they must come from it, as the pools' buffers do.
+        with torch.cuda.use_mem_pool(mem_pool) if mem_pool else nullcontext():
+            # [slots, W, hc_mult, hidden] bf16: the late layers' input stage 0 writes.
+            self.residual = torch.zeros(
                 num_slots,
                 window,
-                len(layers) * config.hidden_size,
+                config.hc_mult,
+                config.hidden_size,
                 dtype=torch.bfloat16,
                 device=device,
             )
+            self.aux: Optional[torch.Tensor] = None
+            if draft_aux:
+                layers = list(config.dspark_target_layer_ids)
+                model_runner.model.set_dspark_layers_to_capture(layers)
+                # [slots, W, captures * hidden] bf16, in dspark_layers_to_capture order.
+                self.aux = torch.zeros(
+                    num_slots,
+                    window,
+                    len(layers) * config.hidden_size,
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
 
     def admit(
         self, *, rid: str, e: int, tail_token_ids: Optional[Sequence[int]] = None
