@@ -85,6 +85,10 @@ from sglang.srt.mem_cache.kv.plan import (
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage.lease_refresh import (
+    StorageLeaseRefresher,
+    create_storage_lease_refresher,
+)
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
@@ -380,6 +384,12 @@ class UnifiedRadixCache(BasePrefixCache):
         # Write-side dedupe: beliefs about what storage already holds, so
         # re-inserts of hot prefixes skip the redundant backup.
         self.storage_existence_cache = StorageExistenceCache()
+        self.storage_lease_refresh_interval = (
+            envs.SGLANG_HICACHE_STORAGE_LEASE_REFRESH_INTERVAL.get()
+        )
+        # The backend the refresher was built for (None = not decided yet).
+        self._lease_refresh_backend: object = None
+        self._lease_refresher: Optional[StorageLeaseRefresher] = None
         # Cumulative prefetch-outcome counters, exported through the
         # log_storage_metrics flow.
         self._prefetch_outcome_stats: dict[str, float] = {
@@ -2542,6 +2552,51 @@ class UnifiedRadixCache(BasePrefixCache):
     def get_prefix_hash_values(self, node_id: NodeId) -> list[str]:
         return self.tree_core.get_prefix_hash_values(node_id)
 
+    def refresh_storage_leases(self, node: NodeId) -> None:
+        if self.storage_lease_refresh_interval <= 0 or self.tree_core.is_root(node):
+            return
+        refresher = self._storage_lease_refresher()
+        if refresher is None:
+            return
+        path = [info.node_id for info in self.tree_core.collect_path_info([node])[0]]
+        start, stamp = refresher.stale_start(path)
+        renewed, page_hashes = [], []
+        for node_id in path[start:]:
+            hashes = self.tree_core.get_hash_values(node_id)
+            if not hashes:
+                # Unhashed nodes have no L3 objects yet, and nor do their children.
+                break
+            renewed.append(node_id)
+            page_hashes.extend(hashes)
+        if page_hashes:
+            refresher.submit(renewed, stamp, page_hashes)
+
+    def _storage_lease_refresher(self) -> Optional[StorageLeaseRefresher]:
+        """The refresher for the attached backend, rebuilt after a re-attach."""
+        backend = (
+            self.cache_controller.storage_backend
+            if self.enable_storage and self.cache_controller is not None
+            else None
+        )
+        if backend is self._lease_refresh_backend:
+            return self._lease_refresher
+        self._stop_storage_lease_refresher()
+        self._lease_refresh_backend = backend
+        if backend is not None:
+            self._lease_refresher = create_storage_lease_refresher(
+                backend=backend,
+                sidecar_pool_specs=self.sidecar_pool_specs,
+                interval_s=self.storage_lease_refresh_interval,
+                max_keys_per_s=envs.SGLANG_HICACHE_STORAGE_LEASE_REFRESH_MAX_KEYS_PER_S.get(),
+            )
+        return self._lease_refresher
+
+    def _stop_storage_lease_refresher(self) -> None:
+        if self._lease_refresher is not None:
+            self._lease_refresher.stop()
+        self._lease_refresher = None
+        self._lease_refresh_backend = None
+
     def rotation_base_of(self, node_id: Optional[NodeId]) -> Optional[int]:
         if node_id is None:
             return None
@@ -4057,6 +4112,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def shutdown(self) -> None:
         """Best-effort auto-detach of the storage backend on process shutdown."""
+        self._stop_storage_lease_refresher()
         if self._storage_attachment is not None:
             self._storage_attachment.shutdown()
 

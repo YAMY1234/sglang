@@ -790,6 +790,12 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def discard_storage_prefetch_accounting(self, handle: CacheRequestHandle) -> None:
         """Forget storage-hit lifecycle state without emitting a result."""
 
+    def refresh_storage_leases(self, node: Any) -> None:
+        """Renew the L3 leases of the prefix ending at a node served from L1/L2.
+
+        Caches without a lease-evicting storage tier have nothing to renew.
+        """
+
     def waiting_storage_span(
         self, request: CacheRequestHandle
     ) -> Optional[tuple[int, int]]:

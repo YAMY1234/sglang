@@ -3696,6 +3696,7 @@ class Scheduler(
 
             matched_len = req.prefix_len + req.host_hit_length
             req.storage_prefetch_last_match_len = matched_len
+            tree_cache.refresh_storage_leases(last_host_node)
 
             if (
                 tree_cache.is_backuped(last_host_node)

@@ -920,6 +920,12 @@ class Envs:
     # to consumption so eviction cannot waste the fetch. Cap = fraction of
     # the pool the pins may hold; 0 disables pinning.
     SGLANG_HICACHE_BUFFER_ANCHOR_LOCK_CAP = EnvFloat(0.5)
+    # Seconds between L3 lease refreshes of a prefix served from L1/L2: an
+    # existence query renews the pages' leases, so an L3 that evicts the
+    # oldest lease first keeps them. 0 disables (Mooncake only).
+    SGLANG_HICACHE_STORAGE_LEASE_REFRESH_INTERVAL = EnvFloat(0.0)
+    # Cap on the lease refresh existence queries, in object keys per second.
+    SGLANG_HICACHE_STORAGE_LEASE_REFRESH_MAX_KEYS_PER_S = EnvInt(100000)
     # Buffer mode: store only the SWA window ending at each node (what a
     # prefetch ending there restores) instead of every SWA page.
     SGLANG_ENABLE_HICACHE_SWA_TAIL_ONLY_BACKUP = EnvBool(False)
