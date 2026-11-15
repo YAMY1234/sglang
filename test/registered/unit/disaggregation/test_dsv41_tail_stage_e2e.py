@@ -226,9 +226,10 @@ class TestTailStageAcrossLanes(CustomTestCase):
         self.client.start_push(room=7, src_pages=np.arange(16), capture_slot=1)
         self.client._rooms[7].push.result(timeout=5)
         self.assertTrue(self.client.push_result(7))
-        session, src, dst, lengths = self.writes[0]
-        self.assertEqual(session, "10.0.0.9:15100")
-        self.assertEqual(dst[-1], (13 << 20) + grant.residual_slot * 5242880)
+        # One write may go out as several Mooncake batches, in any order.
+        self.assertEqual({w[0] for w in self.writes}, {"10.0.0.9:15100"})
+        dst = [d for w in self.writes for d in w[2]]
+        self.assertIn((13 << 20) + grant.residual_slot * 5242880, dst)
         self.client.ready(7, ok=True)
         self._turn()
         self.assertEqual(self.batches, [[7]])
@@ -256,6 +257,32 @@ class TestTailStageAcrossLanes(CustomTestCase):
         self._turn()
         self.assertEqual(self.service.table.counts()["free_slots"], 2)
         self.assertEqual(self.batches, [])
+
+    def test_a_slot_failed_while_stage0_holds_it_is_not_written_or_reused(self):
+        """Debug 2: the tail server failed a silent stage 0's granted slots and could
+        grant them again while that stage 0 still held the grants."""
+        self.put("127.0.0.1:8998", self.registration)
+        self._turn()
+        self.client.request(room=11, rid="d", s=4001, e=4000, late_fed=True)
+        self.client.request(room=12, rid="e", s=4001, e=4000, late_fed=True)
+        self.client.request(room=13, rid="f", s=4001, e=4000, late_fed=True)
+        self._turn()
+        self.assertIsNotNone(self.client.grant(11))
+        self.assertEqual(self.service.table.counts()["queued"], 1)
+        self.service.table.clock = lambda: 1e12  # every slot overdue
+        self._turn()
+        self.assertIsNone(self.client.grant(11))
+        self.assertFalse(
+            self.client.start_push(room=11, src_pages=np.arange(16), capture_slot=1)
+        )
+        self.assertEqual(self.writes, [])
+        # Held, not granted to room 13, until stage 0 gives the slots back.
+        self.assertEqual(self.service.table.counts()["failed_held"], 2)
+        self.assertIsNone(self.client.grant(13))
+        for room in (11, 12):
+            self.client.abort(room)
+        self._turn()
+        self.assertEqual(self.service.table.counts()["failed_held"], 0)
 
 
 class TestTailStageAdvertisedHost(CustomTestCase):
