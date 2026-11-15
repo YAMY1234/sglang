@@ -2162,6 +2162,9 @@ class Envs:
     SGLANG_DSV41_TAIL_STAGE_SELF_BENCH = EnvStr(None)
     SGLANG_DSV41_TAIL_STAGE_SELF_BENCH_PREFIX = EnvStr("142720")
     SGLANG_DSV41_TAIL_STAGE_SELF_BENCH_ITERS = EnvInt(10)
+    # Rate benchmark only: the tail server registers nowhere, sends to no decode (each
+    # send ends at once) and runs on random residuals, for a driver of synthetic rooms.
+    SGLANG_DSV41_TAIL_STAGE_NULL_DECODE = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16

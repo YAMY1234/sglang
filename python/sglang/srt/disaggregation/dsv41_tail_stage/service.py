@@ -357,16 +357,24 @@ def build_service(scheduler, fwd) -> TailStageService:
     """The serving loop over the scheduler's forward and Mooncake."""
     from sglang.srt.disaggregation.dsv41_tail_stage.transport import (
         MooncakeTailBackend,
+        NullDecodeSender,
     )
 
     pages = fwd.page_source()
     mooncake = MooncakeTailBackend(fwd, pages, scheduler.server_args)
+    null_decode = envs.SGLANG_DSV41_TAIL_STAGE_NULL_DECODE.get()
+    if null_decode:
+        # No stage 0 writes the slots: give the late layers non-degenerate input.
+        fwd.residual.normal_()
+        logger.warning("DSV4.1 tail stage: NULL_DECODE, a rate benchmark only")
     backend = Backend(
         start_transport=mooncake.start,
-        make_sender=mooncake.make_sender,
+        make_sender=(lambda addr, room: NullDecodeSender())
+        if null_decode
+        else mooncake.make_sender,
         send=mooncake.send,
         run=mooncake.run,
-        put=put_registration,
+        put=(lambda addr, payload: True) if null_decode else put_registration,
     )
     table = SlotTable(
         num_slots=fwd.residual.shape[0],

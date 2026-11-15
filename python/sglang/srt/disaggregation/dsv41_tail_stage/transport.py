@@ -7,7 +7,7 @@ from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-from sglang.srt.disaggregation.base.conn import KVArgs, StateType
+from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.dsv41_tail_stage import protocol as P
 from sglang.srt.disaggregation.dsv41_tail_stage.forward import (
     TailPages,
@@ -130,6 +130,26 @@ def tail_kv_args(
         entry[2] if len(entry) > 2 else None for entry in stage0_wire
     ] + [None] * len(tail_entries(fwd.aux is not None))
     return kv_args
+
+
+class NullDecodeSender:
+    """SGLANG_DSV41_TAIL_STAGE_NULL_DECODE (rate benchmark only): a decode that is
+    always ready and takes every send at once."""
+
+    def __init__(self) -> None:
+        self.status = KVPoll.WaitingForInput
+
+    def poll(self) -> KVPoll:
+        return self.status
+
+    def pop_decode_prefix_len(self) -> int:
+        return 0
+
+    def init(self, *args, **kwargs) -> None:
+        pass
+
+    def send(self, *args, **kwargs) -> None:
+        self.status = KVPoll.Success
 
 
 class MooncakeTailBackend:
