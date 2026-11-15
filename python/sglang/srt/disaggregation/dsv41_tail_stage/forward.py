@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 from array import array
-from typing import List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 import msgspec
 import numpy as np
@@ -84,9 +84,13 @@ class TailStageForward:
 
     def admit(
         self, *, rid: str, e: int, tail_token_ids: Optional[Sequence[int]] = None
-    ) -> Req:
-        """A request holding the prefix [0, e - W), ready for stage 0's c1 pages."""
+    ) -> Optional[Req]:
+        """A request holding the prefix [0, e - W), ready for stage 0's c1 pages;
+        None while the pool cannot hold its prefix and window."""
         prefix_len = e - self.window
+        # The window's extend takes at most one page beyond the prefix's last.
+        if self.allocator.owner_available_size() < prefix_len + 2 * self.page_size:
+            return None
         ids = array("q", bytes(8 * e))
         if tail_token_ids is not None:
             ids[prefix_len:e] = array("q", tail_token_ids)
@@ -98,7 +102,8 @@ class TailStageForward:
         )
         req.full_untruncated_fill_ids = req.origin_input_ids
         req.logprob_start_len = -1
-        assert self.storage.acquire([req]) is not None, "no free request row"
+        if self.storage.acquire([req]) is None:
+            return None
         req.kv.commit_prealloc(prefix_len)
         window_tails = self.storage.window_tails(prefix_len, keep_insert_boundary=False)
         kv_loc = alloc_for_decode_prealloc(
@@ -178,3 +183,26 @@ class TailStageForward:
 
     def release(self, req: Req) -> None:
         release_kv_cache(req, self.tree_cache, checkpoint=False)
+
+    def page_source(self) -> TailPages:
+        return TailPages(self)
+
+
+class TailPages:
+    """The slot table's PageSource on the scheduler's pools: a grant admits the
+    tail's request with its prefix preallocated; a freed slot releases it."""
+
+    def __init__(self, fwd: TailStageForward) -> None:
+        self.fwd = fwd
+        self.capacity = fwd.allocator.owner_available_size() // fwd.page_size
+        self.reqs: Dict[int, Req] = {}
+
+    def take(self, tail) -> Optional[List[int]]:
+        req = self.fwd.admit(rid=tail.rid, e=tail.e)
+        if req is None:
+            return None
+        self.reqs[tail.room] = req
+        return self.fwd.c1_pages(req).tolist()
+
+    def give_back(self, tail) -> None:
+        self.fwd.release(self.reqs.pop(tail.room))

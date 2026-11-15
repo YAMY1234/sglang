@@ -44,9 +44,9 @@ def run_tail_stage(scheduler) -> None:
             iters=envs.SGLANG_DSV41_TAIL_STAGE_SELF_BENCH_ITERS.get(),
         )
     if envs.SGLANG_DSV41_TAIL_STAGE_PORT.get():
-        from sglang.srt.disaggregation.dsv41_tail_stage.service import TailStageService
+        from sglang.srt.disaggregation.dsv41_tail_stage.service import build_service
 
-        TailStageService(fwd).serve_forever()
+        build_service(scheduler, fwd).serve_forever()
     logger.info("DSV4.1 tail stage: no port set, idle")
     while True:
         time.sleep(60)
@@ -71,10 +71,9 @@ def self_bench(
     for n in sorted(counts, reverse=True):
         prep_ms, fwd_ms = [], []
         for it in range(warmup + iters):
-            tails = [
-                TailRun(req=fwd.admit(rid=f"bench-{n}-{it}-{i}", e=e), slot=i, s=s)
-                for i in range(n)
-            ]
+            reqs = [fwd.admit(rid=f"bench-{n}-{it}-{i}", e=e) for i in range(n)]
+            assert all(req is not None for req in reqs), "bench prefixes do not fit"
+            tails = [TailRun(req=req, slot=i, s=s) for i, req in enumerate(reqs)]
             torch.cuda.synchronize()
             t0 = time.perf_counter()
             prepared = fwd.prepare(tails)

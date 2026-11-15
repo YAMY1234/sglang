@@ -63,7 +63,8 @@ class SlotRequest(TailMessage, tag="slot_request"):
 
 
 class SlotGrant(TailMessage, tag="slot_grant"):
-    """slot = -1 for a pass-through room. c1_pages cover [0, e) in position order."""
+    """slot = -1 for a pass-through room. c1_pages cover [0, e - W) in position
+    order; the tail server computes the window's own layer-20 c1 rows."""
 
     room: int
     slot: int
