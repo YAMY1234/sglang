@@ -101,6 +101,43 @@ class TestQRopeStore(CustomTestCase):
     def test_large_prefill_graph_replay(self):
         self._check_graph_replay(4097)
 
+    def test_row_launch_is_bitwise(self):
+        from sglang.srt.environ import envs
+
+        torch.manual_seed(917)
+        freqs = torch.polar(
+            torch.ones(8192, 32, device="cuda"), torch.randn(8192, 32, device="cuda")
+        )
+        for rows in (1, 5, 672, 954, 4097):
+            for heads in (8, 16, 63, 64, 65, 128):
+                for dtype in (torch.int32, torch.int64):
+                    for inverse in (False, True):
+                        q = torch.randn(
+                            rows, heads, 512, device="cuda", dtype=torch.bfloat16
+                        )
+                        positions = torch.randint(
+                            0, 8192, (rows,), device="cuda", dtype=dtype
+                        )
+                        expected, got = q.clone(), q.clone()
+                        with envs.SGLANG_OPT_DSV4_ROPE_ROW_LAUNCH.override(False):
+                            fused_rope_inplace(
+                                expected[..., 448:],
+                                None,
+                                freqs,
+                                positions,
+                                inverse=inverse,
+                            )
+                        with envs.SGLANG_OPT_DSV4_ROPE_ROW_LAUNCH.override(True):
+                            fused_rope_inplace(
+                                got[..., 448:], None, freqs, positions, inverse=inverse
+                            )
+                        self.assertTrue(
+                            torch.equal(
+                                got.view(torch.int16), expected.view(torch.int16)
+                            ),
+                            f"{rows=} {heads=} {dtype=} {inverse=}",
+                        )
+
 
 if __name__ == "__main__":
     unittest.main()

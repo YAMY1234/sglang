@@ -139,6 +139,17 @@ class DSparkAttention(MqaAttentionBase):
 
         self.alt_streams = alt_streams
         self._multi_stream_bs_limit = 128 if get_platform().is_blackwell else 64
+        # wq_a | wkv as one GEMM on the serial path; stacked from the checkpoint's wq_a and
+        # wkv at load (_stack_wqkv_a), which stay for the multi-stream path and context KV.
+        self.wqkv_a_stacked: Optional[ReplicatedLinear] = None
+        if _is_cuda and envs.SGLANG_OPT_DSPARK_FUSED_WQKV_A.get():
+            self.wqkv_a_stacked = ReplicatedLinear(
+                self.hidden_size,
+                self.q_lora_rank + self.head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("wqkv_a_stacked", prefix),
+            )
         if _is_npu:
             self.register_buffer(
                 "_q_post_norm_weight",
@@ -188,9 +199,11 @@ class DSparkAttention(MqaAttentionBase):
         x: torch.Tensor,
         positions: torch.Tensor,
         q_out: Optional[torch.Tensor] = None,
+        q_lora: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        q, _ = self.wq_a(x)
-        q = self.q_norm(q)
+        if q_lora is None:
+            q_lora, _ = self.wq_a(x)
+        q = self.q_norm(q_lora)
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if not self.q_head_norm:
@@ -300,6 +313,27 @@ class DSparkAttention(MqaAttentionBase):
                 )
             q = self._compute_q(hidden_states, positions, q_out=q_out)
             current_stream.wait_stream(stream_kv)
+        elif (
+            self.wqkv_a_stacked is not None
+            and not is_unified_kv_triton()
+            and not pool.uniform_fp8
+        ):
+            # The KV store reads the strided kv half in place (row stride q_lora_rank + head_dim).
+            qkv_a, _ = self.wqkv_a_stacked(hidden_states)
+            kv = qkv_a[..., self.q_lora_rank :]
+            self._store_block_kv(
+                kv=kv,
+                positions=positions,
+                forward_batch=forward_batch,
+                attn_backend=attn_backend,
+                pool=pool,
+            )
+            q = self._compute_q(
+                hidden_states,
+                positions,
+                q_out=q_out,
+                q_lora=qkv_a[..., : self.q_lora_rank],
+            )
         else:
             kv = self.kv_proj_only(hidden_states)
             self._store_block_kv(
@@ -379,6 +413,23 @@ class DSparkAttention(MqaAttentionBase):
     @staticmethod
     def accepts_mxfp8_swizzled_input():
         return False
+
+
+def _stack_wqkv_a(*, stages: Iterable[nn.Module], loaded_params: set) -> None:
+    # Runs on the checkpoint tensors, before process_weights_after_loading converts all
+    # three linears, so wqkv_a_stacked gets the quantized layout of the concatenation.
+    for i, stage in enumerate(stages):
+        attn = stage.self_attn
+        if attn.wqkv_a_stacked is None:
+            continue
+        loaded = {f"stages.{i}.self_attn.{n}.weight" for n in ("wq_a", "wkv")}
+        if not loaded <= loaded_params:
+            continue
+        stacked = attn.wqkv_a_stacked
+        stacked.weight.data.copy_(torch.cat([attn.wq_a.weight, attn.wkv.weight]))
+        stacked.weight_scale_inv.data.copy_(
+            torch.cat([attn.wq_a.weight_scale_inv, attn.wkv.weight_scale_inv])
+        )
 
 
 def _resolve_dspark_pool() -> DeepSeekV4TokenToKVPool:
@@ -1094,6 +1145,8 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self._assert_confidence_head_loaded(
             params_dict=params_dict, loaded_params=loaded_params
         )
+        if _is_cuda:
+            _stack_wqkv_a(stages=self.stages, loaded_params=loaded_params)
         self.post_load_weights()
 
     def post_load_weights(self, is_nextn=False, weight_names=None):

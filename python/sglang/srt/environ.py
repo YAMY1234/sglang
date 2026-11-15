@@ -632,6 +632,15 @@ class Envs:
     # Fused-tail forced verify rows (dspark_verify.force_verify_rows) are made one-hot by
     # a Triton kernel that writes only the forced rows, instead of a masked fill of all rows.
     SGLANG_OPT_DSPARK_FORCED_ROW_FILL = EnvBool(False)
+    # DSpark draft attention: wq_a and wkv as one wqkv_a GEMM on one input quantize
+    # (weights stacked at load; bitwise equal to the two GEMMs).
+    SGLANG_OPT_DSPARK_FUSED_WQKV_A = EnvBool(False)
+    # fused_rope_inplace on q only: one CTA per row looping over the heads, instead of
+    # one warp per (row, head). Same per-element arithmetic.
+    SGLANG_OPT_DSV4_ROPE_ROW_LAUNCH = EnvBool(False)
+    # Launch the q_lora RMSNorm + MXFP8 kernel (rmsnorm_mxfp8) with PDL, so it does not
+    # wait a full launch after wqkv_a.
+    SGLANG_OPT_DSV4_Q_NORM_PDL = EnvBool(False)
     # The deferred draft KV store's staging (write locations, positions, state slots,
     # commit lengths) in one Triton launch instead of four copies and a fill.
     SGLANG_OPT_DSV41_DSPARK_ONE_LAUNCH_COMMIT_STAGE = EnvBool(

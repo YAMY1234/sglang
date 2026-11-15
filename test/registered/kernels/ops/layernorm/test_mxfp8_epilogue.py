@@ -171,5 +171,26 @@ def test_k1280_matches_8warp_tl_sum(m, stride, kind, monkeypatch):
         assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
 
 
+@pytest.mark.parametrize("m", [1, 896, 1060, 1272, 4097])
+@pytest.mark.parametrize("stride", [1280, 1792])
+def test_pdl_launch_is_bitwise(m, stride):
+    from sglang.srt.environ import envs
+
+    torch.manual_seed(m + stride)
+    x = _inputs(m, stride, "row_scaled")
+    w = (torch.randn(1280, device="cuda") * 0.1 + 1).to(torch.bfloat16)
+    with envs.SGLANG_OPT_DSV4_Q_NORM_PDL.override(False):
+        ref = rmsnorm_mxfp8(x, w, 1e-6)
+    with envs.SGLANG_OPT_DSV4_Q_NORM_PDL.override(True):
+        got = rmsnorm_mxfp8(x, w, 1e-6)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            in_graph = rmsnorm_mxfp8(x, w, 1e-6)
+        graph.replay()
+    for a, b, c in zip(ref, got, in_graph):
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+        assert torch.equal(a.view(torch.uint8), c.view(torch.uint8))
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
