@@ -351,6 +351,29 @@ def validate_deepseek_v41_encoder_replay_budget(server_args: ServerArgs) -> None
         )
 
 
+def validate_deepseek_v41_tail_stage_server(server_args: ServerArgs) -> None:
+    """The tail server runs the late layers from a residual: one GPU, its own loop,
+    no draft model and no graphs that start the model at its first layer."""
+    cfg = resolving_view(server_args)
+    if not cfg.dsv41_tail_stage_server:
+        return
+    if model_config_of(server_args).hf_config.model_type != "deepseek_v41":
+        raise ValueError("--dsv41-tail-stage-server requires DeepSeek-V4.1")
+    required = (
+        ("--disaggregation-mode null", cfg.disaggregation_mode == "null"),
+        ("--tensor-parallel-size 1", cfg.tp_size == 1 and cfg.pp_size == 1),
+        ("no speculative decoding", cfg.speculative_algorithm is None),
+        ("--enable-decoder-swa-bounded-replay", cfg.enable_decoder_swa_bounded_replay),
+        ("no encoder SWA bounded replay", not cfg.enable_encoder_swa_bounded_replay),
+        ("--disable-prefill-cuda-graph", cfg.disable_prefill_cuda_graph),
+        ("--disable-decode-cuda-graph", cfg.disable_decode_cuda_graph),
+        ("--skip-server-warmup", cfg.skip_server_warmup),
+    )
+    missing = [name for name, ok in required if not ok]
+    if missing:
+        raise ValueError(f"--dsv41-tail-stage-server requires {', '.join(missing)}")
+
+
 def validate_deepseek_v41_encoder_only_prefill(server_args: ServerArgs) -> None:
     """Validate the asymmetric PD split; runs after decoder replay is resolved."""
     cfg = resolving_view(server_args)
