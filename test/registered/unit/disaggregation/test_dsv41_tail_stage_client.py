@@ -259,7 +259,14 @@ class TestTailStageClient(CustomTestCase):
         ) as logs:
             client.poll()
         line = logs.output[-1]
-        for name in ("wait_grant", "grant_to_ready", "write", "s1_queue 4.0/4.0"):
+        for name in (
+            "wait_grant",
+            "grant_to_ready",
+            "write_queue",
+            "write_xfer",
+            "ready_lag",
+            "s1_queue 4.0/4.0",
+        ):
             self.assertIn(name, line)
 
     def test_a_failed_write_reports_not_ok(self):
@@ -360,7 +367,27 @@ class TestTailStageClient(CustomTestCase):
         client._rooms[1].push.result(timeout=5)
         self.assertIs(client.push_result(1), False)
         client.poll()
-        self.assertFalse(sock.take(P.TailReady)[0].ok)
+        # The writer thread sends no TailReady(ok=True) for a failed slot.
+        (back,) = sock.take(P.TailReady)
+        self.assertFalse(back.ok)
+
+    def test_the_writer_reports_the_slot_ready_without_a_scheduler_poll(self):
+        """Twin r2: TailReady waited for the next scheduler iteration (50-80 ms under
+        load), which lengthens TTFT and slot hold."""
+        client, sock, _ = _welcomed()
+        client.request(room=1, rid="r", s=1001, e=1000, late_fed=True)
+        sock.inbox.append(P.SlotGrant(room=1, slot=3, residual_slot=3, c1_pages=[8]))
+        client.poll()
+        sock.sent.clear()
+        client.start_push(room=1, src_pages=np.array([0]), capture_slot=0)
+        client._rooms[1].push.result(timeout=5)
+        (ready,) = sock.take(P.TailReady)
+        self.assertEqual((ready.slot, ready.ok), (3, True))
+        self.assertTrue(client.push_result(1))
+        # Forgotten without a second message, and an abort now sends nothing.
+        client.abort(1)
+        self.assertEqual(sock.sent, [])
+        self.assertNotIn(1, client._rooms)
 
     def test_heartbeats_go_out_while_the_scheduler_does_not_poll(self):
         """Debug 2: a 27 s cold prefill kept the scheduler from polling, and the tail

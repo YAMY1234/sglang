@@ -42,8 +42,8 @@ logger = logging.getLogger(__name__)
 HELLO_RETRY_S = 5.0
 # Period of the per-request timing summary.
 STATS_LOG_S = 5.0
-# Arbitrary: slot writes in flight at once, and parallel Mooncake batches per write
-# (the KV sender also spreads one request over its executors under the NVLink pool).
+# Defaults of the client's write_rooms and write_parts (slot writes in flight at once,
+# and parallel Mooncake batches per write); arbitrary.
 WRITE_ROOMS = 4
 WRITE_PARTS = 8
 # Arbitrary: no write is cut into batches smaller than this.
@@ -163,6 +163,10 @@ class _Room(msgspec.Struct):
     push: Optional[concurrent.futures.Future] = None
     descriptors: int = 0
     nbytes: int = 0
+    t_write_start: Optional[float] = None
+    t_write_end: Optional[float] = None
+    # TailReady(ok=True) went out from the writer thread.
+    ready_sent: bool = False
     # The request left; the message goes once the slot's write has ended.
     closing: Optional[object] = None
 
@@ -174,6 +178,9 @@ class _Timings:
         "wait_grant",
         "grant_to_ready",
         "write",
+        "write_queue",
+        "write_xfer",
+        "ready_lag",
         "descriptors",
         "write_mb",
         "s1_queue",
@@ -198,8 +205,9 @@ class _Timings:
 
 class TailStageClient:
     """One per stage-0 scheduler. Every method runs on the scheduler thread except
-    the Mooncake writes, which run on workers and are read back by `push_result`, and
-    the heartbeat thread, which keeps a stalled scheduler (a cold forward) alive."""
+    the Mooncake writes, which run on workers and report their slot ready themselves,
+    and the heartbeat thread, which keeps a stalled scheduler (a cold forward) alive.
+    The room table and the socket are shared under one lock."""
 
     def __init__(
         self,
@@ -212,6 +220,8 @@ class TailStageClient:
         timeout_s: float,
         clock=time.monotonic,
         heartbeat_thread: bool = False,
+        write_rooms: int = WRITE_ROOMS,
+        write_parts: int = WRITE_PARTS,
     ) -> None:
         self._socket = socket
         self._hello = hello
@@ -222,14 +232,14 @@ class TailStageClient:
         self._timeout_s = timeout_s
         self._clock = clock
         self._rooms: Dict[int, _Room] = {}
+        self._write_parts = write_parts
         self._executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=WRITE_ROOMS, thread_name_prefix="dsv41-tail-push"
+            max_workers=write_rooms, thread_name_prefix="dsv41-tail-push"
         )
         self._part_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=WRITE_PARTS, thread_name_prefix="dsv41-tail-push-part"
+            max_workers=write_parts, thread_name_prefix="dsv41-tail-push-part"
         )
-        # The socket is not thread-safe: the heartbeat thread shares it under this lock.
-        self._socket_lock = threading.Lock()
+        self._lock = threading.RLock()
         self.welcome: Optional[Welcome] = None
         self.refused: Optional[str] = None
         self._heard_at: Optional[float] = None
@@ -248,7 +258,10 @@ class TailStageClient:
 
     def poll(self) -> None:
         """Drain the tail server's messages, resend due requests, keep alive."""
-        now = self._clock()
+        with self._lock:
+            self._poll(self._clock())
+
+    def _poll(self, now: float) -> None:
         while (data := self._recv()) is not None:
             try:
                 self._on_message(decode(data), now)
@@ -289,6 +302,10 @@ class TailStageClient:
     def request(self, *, room: int, rid: str, s: int, e: int, late_fed: bool) -> None:
         """Ask for the room's slot once; a pass-through room asks too, so the tail
         server answers decode for it."""
+        with self._lock:
+            self._request(room=room, rid=rid, s=s, e=e, late_fed=late_fed)
+
+    def _request(self, *, room: int, rid: str, s: int, e: int, late_fed: bool) -> None:
         if room in self._rooms:
             return
         msg = SlotRequest(
@@ -304,10 +321,11 @@ class TailStageClient:
         return room in self._rooms
 
     def grant(self, room: int) -> Optional[SlotGrant]:
-        entry = self._rooms.get(room)
-        if entry is None or entry.closing is not None or entry.error is not None:
-            return None
-        return entry.grant
+        with self._lock:
+            entry = self._rooms.get(room)
+            if entry is None or entry.closing is not None or entry.error is not None:
+                return None
+            return entry.grant
 
     def error(self, room: int) -> Optional[str]:
         """Why the room's slot will never come, if it will not."""
@@ -315,67 +333,74 @@ class TailStageClient:
             return self.refused
         if self.unreachable():
             return UNREACHABLE
-        entry = self._rooms.get(room)
-        return None if entry is None else entry.error
+        with self._lock:
+            entry = self._rooms.get(room)
+            return None if entry is None else entry.error
 
     def start_push(
         self, *, room: int, src_pages: np.ndarray, capture_slot: int
     ) -> bool:
         """Start the slot's writes; refused (False) once the slot has failed, as the
         tail server may hand a freed slot to another room."""
-        if self.grant(room) is None:
-            return False
-        entry = self._rooms[room]
-        assert entry.push is None
-        blocks = push_blocks(
-            pools=self._pools,
-            welcome=self.welcome,
-            grant=entry.grant,
-            src_pages=src_pages,
-            capture_slot=capture_slot,
-        )
-        entry.t_push = self._clock()
-        entry.descriptors = len(blocks)
-        entry.nbytes = sum(length for _, _, length in blocks)
-        entry.push = self._executor.submit(self._write, blocks)
-        return True
+        with self._lock:
+            if self.grant(room) is None:
+                return False
+            entry = self._rooms[room]
+            assert entry.push is None
+            blocks = push_blocks(
+                pools=self._pools,
+                welcome=self.welcome,
+                grant=entry.grant,
+                src_pages=src_pages,
+                capture_slot=capture_slot,
+            )
+            entry.t_push = self._clock()
+            entry.descriptors = len(blocks)
+            entry.nbytes = sum(length for _, _, length in blocks)
+            entry.push = self._executor.submit(self._push, room, entry, blocks)
+            return True
 
     def push_result(self, room: int) -> Optional[bool]:
         """None while the room's writes run, else whether they succeeded; a write
         into a slot that failed meanwhile does not count."""
-        entry = self._rooms[room]
-        if entry.push is None or not entry.push.done():
-            return None
-        return entry.push.result() and entry.error is None
+        with self._lock:
+            entry = self._rooms[room]
+            if entry.push is None or not entry.push.done():
+                return None
+            return entry.ready_sent or (entry.push.result() and entry.error is None)
 
     def pushing(self, room: int) -> bool:
-        entry = self._rooms.get(room)
-        return entry is not None and entry.push is not None
+        with self._lock:
+            entry = self._rooms.get(room)
+            return entry is not None and entry.push is not None
 
     def ready(self, room: int, *, ok: bool) -> None:
-        """The slot's writes have returned (or stage 0 gave up on it)."""
-        entry = self._rooms.get(room)
-        if entry is None or entry.grant is None or entry.closing is not None:
-            return
-        self._close(room, TailReady(room=room, slot=entry.grant.slot, ok=ok))
-        self.tails_pushed += ok
-        now = self._clock()
-        self._timings.add("grant_to_ready", (now - entry.t_grant) * 1e3)
-        if entry.t_push is not None:
-            self._timings.add("write", (now - entry.t_push) * 1e3)
-            self._timings.add("descriptors", entry.descriptors)
-            self._timings.add("write_mb", entry.nbytes / 1e6)
+        """The slot's writes have returned (or stage 0 gave up on it); a slot whose
+        writer already reported it ready is only forgotten here."""
+        with self._lock:
+            entry = self._rooms.get(room)
+            if entry is None or entry.grant is None or entry.closing is not None:
+                return
+            if entry.ready_sent:
+                del self._rooms[room]
+                return
+            self._close(room, TailReady(room=room, slot=entry.grant.slot, ok=ok))
+            self._add_write_timings(entry, now=self._clock())
 
     def abort(self, room: int) -> None:
         """The request left before its slot was ready. A granted slot is given back
         with TailReady(ok=False): the tail server holds a granted slot until that."""
-        entry = self._rooms.get(room)
-        if entry is None or entry.closing is not None:
-            return
-        if entry.grant is None:
-            self._close(room, TailAbort(room=room))
-        else:
-            self._close(room, TailReady(room=room, slot=entry.grant.slot, ok=False))
+        with self._lock:
+            entry = self._rooms.get(room)
+            if entry is None or entry.closing is not None:
+                return
+            if entry.ready_sent:
+                # The tail server owns the slot from TailReady on.
+                del self._rooms[room]
+            elif entry.grant is None:
+                self._close(room, TailAbort(room=room))
+            else:
+                self._close(room, TailReady(room=room, slot=entry.grant.slot, ok=False))
 
     def _close(self, room: int, msg) -> None:
         entry = self._rooms[room]
@@ -387,6 +412,19 @@ class TailStageClient:
         del self._rooms[room]
         self._send(msg)
 
+    def _add_write_timings(self, entry: _Room, *, now: float) -> None:
+        add = self._timings.add
+        add("grant_to_ready", (now - entry.t_grant) * 1e3)
+        if entry.t_push is None:
+            return
+        add("write", (now - entry.t_push) * 1e3)
+        if entry.t_write_end is not None:
+            add("write_queue", (entry.t_write_start - entry.t_push) * 1e3)
+            add("write_xfer", (entry.t_write_end - entry.t_write_start) * 1e3)
+            add("ready_lag", (now - entry.t_write_end) * 1e3)
+        add("descriptors", entry.descriptors)
+        add("write_mb", entry.nbytes / 1e6)
+
     def close(self) -> None:
         self._stop.set()
         self._executor.shutdown(wait=False, cancel_futures=True)
@@ -394,8 +432,32 @@ class TailStageClient:
 
     # -- internals --
 
+    def _push(
+        self, room: int, entry: _Room, blocks: List[Tuple[int, int, int]]
+    ) -> bool:
+        """Writer thread: the slot's writes, then TailReady(ok=True) at once while the
+        room is still live, so a busy scheduler loop does not delay the tail stage."""
+        start = self._clock()
+        ok = self._write(blocks)
+        end = self._clock()
+        with self._lock:
+            entry.t_write_start, entry.t_write_end = start, end
+            if (
+                ok
+                and entry.error is None
+                and entry.closing is None
+                and self._rooms.get(room) is entry
+            ):
+                self._send(TailReady(room=room, slot=entry.grant.slot, ok=True))
+                entry.ready_sent = True
+                self.tails_pushed += 1
+                self._add_write_timings(entry, now=self._clock())
+        return ok
+
     def _write(self, blocks: List[Tuple[int, int, int]]) -> bool:
-        parts = split_blocks(blocks, parts=WRITE_PARTS, min_bytes=MIN_WRITE_PART_BYTES)
+        parts = split_blocks(
+            blocks, parts=self._write_parts, min_bytes=MIN_WRITE_PART_BYTES
+        )
         if len(parts) == 1:
             return self._write_part(parts[0])
         futures = [self._part_executor.submit(self._write_part, p) for p in parts]
@@ -411,7 +473,7 @@ class TailStageClient:
         return rc == 0
 
     def _heartbeat(self, now: float) -> None:
-        with self._socket_lock:
+        with self._lock:
             if self.welcome is None or now - self._beat_at < self._heartbeat_s:
                 return
             self._beat_at = now
@@ -422,11 +484,11 @@ class TailStageClient:
             self._heartbeat(self._clock())
 
     def _send(self, msg) -> None:
-        with self._socket_lock:
+        with self._lock:
             self._socket.send(encode(msg))
 
     def _recv(self) -> Optional[bytes]:
-        with self._socket_lock:
+        with self._lock:
             return self._socket.recv()
 
     def _on_message(self, msg, now: float) -> None:
