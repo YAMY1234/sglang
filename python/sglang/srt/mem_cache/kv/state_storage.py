@@ -28,6 +28,9 @@ class StateSlotsExhausted(RuntimeError):
 class StateStorage:
     """The state sub-pool's storage, its slot allocator and its layer map."""
 
+    # A megakernel build's own recurrent state (spec.SupportsStateSlotReset).
+    own_state = None
+
     def __init__(
         self,
         *,
@@ -141,6 +144,7 @@ class StateStorage:
         # The requests holding no slot (a radix hit or a continuing chunk keeps
         # its own) take theirs in one allocation.
         needing = [req for req in reqs if not req.kv.holds_mamba]
+        needing_rows = [row for req, row in zip(reqs, rows) if not req.kv.holds_mamba]
         if needing:
             mids = self.slots.alloc(len(needing))
             if mids is None:
@@ -156,6 +160,12 @@ class StateStorage:
             if self.pool.replayssm_write_pos is not None:
                 self.pool.replayssm_write_pos.index_fill_(
                     0, self.slots.translate(mids).to(torch.int64), 0
+                )
+            # A PD decode slot runs no extend before its first verify.
+            if self.own_state is not None:
+                self.own_state.reset_state_slots(
+                    self.slots.translate(mids).to(torch.int64),
+                    async_h2d(needing_rows, dtype=torch.int64, device=table.device),
                 )
         for req in reqs:
             mamba_indices.append(req.kv.mamba_pool_idx)
@@ -187,6 +197,14 @@ class StateStorage:
             table.req_index_to_mamba_ping_pong_track_buffer_mapping[row_ids] = (
                 ping_pong_tensor
             )
+
+    @property
+    def tracks_decode_state(self) -> bool:
+        return self.own_state is None or self.own_state.tracks_decode_state
+
+    @property
+    def backs_up_state(self) -> bool:
+        return self.own_state is None or self.own_state.backs_up_state
 
     def reset_request_rows(self, rows: List[int], *, device) -> None:
         """Restart the speculative ReplaySSM cursors of ``rows``, which start a
