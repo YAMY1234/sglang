@@ -19,7 +19,7 @@ TAIL_STAGE_PP_RANK = 1
 
 def tail_entries(draft_aux: bool) -> List[List[Optional[str]]]:
     """The wire entries stage 1 owns, appended after W0 on stage 1 and decode."""
-    entries = [[StateType.DSV41_TAIL_SWA_ROWS.value, None]]
+    entries = [[StateType.DSV41_TAIL_SWA.value, None]]
     if draft_aux:
         entries.append([StateType.DSV41_TAIL_DRAFT_AUX.value, None])
     return entries

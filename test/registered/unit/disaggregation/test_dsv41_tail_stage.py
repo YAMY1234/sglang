@@ -4,6 +4,9 @@ registration as PP rank 1 of every encoder-only prefill's bootstrap table."""
 import asyncio
 import json
 import unittest
+
+import numpy as np
+import torch
 from types import SimpleNamespace
 
 from sglang.srt.disaggregation.base.conn import StateType
@@ -16,6 +19,13 @@ from sglang.srt.disaggregation.dsv41_tail_stage import protocol as P
 from sglang.srt.disaggregation.dsv41_tail_stage.batcher import (
     TailBatchPolicy,
     parse_buckets,
+)
+from sglang.srt.disaggregation.dsv41_tail_stage.layout import (
+    c1_buf_infos,
+    c1_page_ids,
+    item_lens_error,
+    tail_swa_buf_infos,
+    tail_swa_page_ids,
 )
 from sglang.srt.disaggregation.dsv41_tail_stage.registration import (
     Stage0Peers,
@@ -513,7 +523,7 @@ class TestTailStageOwnership(CustomTestCase):
         self.assertEqual(
             wire[len(W0) :],
             [
-                [StateType.DSV41_TAIL_SWA_ROWS.value, None],
+                [StateType.DSV41_TAIL_SWA.value, None],
                 [StateType.DSV41_TAIL_DRAFT_AUX.value, None],
             ],
         )
@@ -532,6 +542,87 @@ class TestTailStageOwnership(CustomTestCase):
             stage0_wire_len=len(W0), draft_aux=False, swa_rows=[1], aux_slot=None
         )
         self.assertEqual(payloads, [None, None, [1]])
+
+
+class _Pool:
+    """The fields of DeepSeekV4TokenToKVPool the layout helpers read."""
+
+    page_size = PAGE
+    swa_page_size = PAGE
+    request_window = None
+
+    def __init__(self, layer_ids):
+        self._layer_ids = list(layer_ids)
+        self.kv_pools = {
+            1: SimpleNamespace(kv_buffer=[torch.zeros(9, 288, dtype=torch.uint8)])
+        }
+        index_rows = [torch.zeros(36, 17, dtype=torch.uint8)]
+        self.index_pools = {
+            1: SimpleNamespace(
+                page_size=64, contiguous_page_row_buffers=lambda: index_rows
+            )
+        }
+        # Physical SWA pages of 64 rows under 256-row logical pages.
+        self.swa_kv_pool = SimpleNamespace(
+            page_size=64,
+            kv_buffer=[torch.zeros(16, 32, dtype=torch.uint8) for _ in self._layer_ids],
+        )
+        self.full_to_swa_index_mapping = torch.zeros(64 * PAGE, dtype=torch.int64)
+
+    def swa_layer_ids(self):
+        return list(self._layer_ids)
+
+    def translate_loc_from_full_to_swa(self, locs):
+        return self.full_to_swa_index_mapping[locs]
+
+
+def _row(pages, length):
+    """A req_to_token row whose positions sit in `pages`, page-aligned."""
+    positions = torch.arange(length)
+    return torch.tensor(pages)[positions // PAGE] * PAGE + positions % PAGE
+
+
+class TestTailStageLayout(CustomTestCase):
+    def test_c1_items_are_whole_full_pages(self):
+        kv, index = c1_buf_infos(_Pool(range(20, 40)))
+        self.assertEqual(kv.item_lens, [288])
+        # Four 64-slot index pages make one 256-token full page.
+        self.assertEqual(index.item_lens, [17 * 4])
+        row = _row([9, 4, 7, 30], 4 * PAGE)
+        np.testing.assert_array_equal(
+            c1_page_ids(row, e=600, page_size=PAGE), [9, 4, 7]
+        )
+        np.testing.assert_array_equal(
+            c1_page_ids(row, e=768, page_size=PAGE), [9, 4, 7]
+        )
+        np.testing.assert_array_equal(
+            c1_page_ids(row, e=769, page_size=PAGE), [9, 4, 7, 30]
+        )
+
+    def test_tail_swa_pairs_layer_by_layer_across_stage_ranges(self):
+        decode, stage1 = _Pool(range(40)), _Pool(range(20, 40))
+        late = range(20, 40)
+        dst, src = tail_swa_buf_infos(decode, late), tail_swa_buf_infos(stage1, late)
+        self.assertEqual(
+            dst.ptrs, [b.data_ptr() for b in decode.swa_kv_pool.kv_buffer[20:]]
+        )
+        self.assertEqual(src.ptrs, [b.data_ptr() for b in stage1.swa_kv_pool.kv_buffer])
+        self.assertEqual(src.item_lens, [32 * 4] * 20)
+        self.assertIsNone(item_lens_error("swa", src.item_lens, dst.item_lens))
+        self.assertIsNotNone(item_lens_error("swa", src.item_lens, dst.item_lens[:-1]))
+
+    def test_tail_swa_pages_follow_positions_through_the_swa_mapping(self):
+        pool = _Pool(range(40))
+        row = _row(list(range(10, 15)), 5 * PAGE)
+        # Positions 768-1023 live in SWA page 5, 1024-1279 in SWA page 2.
+        for page, swa_page in ((3, 5), (4, 2)):
+            full = row[page * PAGE : (page + 1) * PAGE]
+            pool.full_to_swa_index_mapping[full] = swa_page * PAGE + torch.arange(PAGE)
+        e = 1100
+        pages = tail_swa_page_ids(pool, row, start=e - WINDOW, end=e)
+        np.testing.assert_array_equal(pages, [5, 2])
+        pages = tail_swa_page_ids(pool, row, start=1000 - WINDOW, end=1000)
+        np.testing.assert_array_equal(pages, [5])
 
 
 def _fields(msg):
