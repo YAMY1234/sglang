@@ -535,8 +535,12 @@ class PrefillBootstrapQueue:
             residual_item_len=capture_items[0],
         )
         registration = kv_manager.bootstrap_registration
+        # Where the bootstrap server listens, as the tail server reaches it.
+        host = kv_manager.bootstrap_host
+        if host in ("0.0.0.0", "::"):
+            host = registration["rank_ip"]
         bootstrap_addr = NetworkAddress(
-            registration["rank_ip"], kv_manager.bootstrap_port
+            host, kv_manager.bootstrap_port
         ).to_host_port_str()
         dp_group = (
             registration["attn_dp_rank"]
