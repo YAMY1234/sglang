@@ -280,6 +280,15 @@ def _send_waiter(scheduler) -> NetworkTransferWaiter:
     )
 
 
+def _skips_dsv41_tail(req: Req) -> bool:
+    """A fake-bootstrap request (no decode) skips the tail stage, unless a rate
+    benchmark asks for its writes."""
+    return (
+        req.bootstrap_host == FAKE_BOOTSTRAP_HOST
+        and not envs.SGLANG_DSV41_TAIL_STAGE_PUSH_FAKE.get()
+    )
+
+
 class PrefillBootstrapQueue:
     """
     Store the requests in bootstrapping
@@ -589,7 +598,7 @@ class PrefillBootstrapQueue:
         cannot serve fails here, and decode with it."""
         client = self.tail_stage
         room = req.bootstrap_room
-        if req.bootstrap_host == FAKE_BOOTSTRAP_HOST:
+        if _skips_dsv41_tail(req):
             return True
         if not req.dsv41_late_fed:
             client.request(
@@ -865,7 +874,7 @@ class SchedulerDisaggregationPrefillMixin:
 
     def _request_dsv41_tail_slot(self: Scheduler, req: Req) -> None:
         client = self.disagg_prefill_bootstrap_queue.tail_stage
-        if client is not None and req.bootstrap_host != FAKE_BOOTSTRAP_HOST:
+        if client is not None and not _skips_dsv41_tail(req):
             client.request(
                 room=req.bootstrap_room,
                 rid=req.rid,
@@ -886,7 +895,7 @@ class SchedulerDisaggregationPrefillMixin:
         the request's pages stay held until both it and the decode send have ended."""
         client = self.disagg_prefill_bootstrap_queue.tail_stage
         room = req.bootstrap_room
-        if client is None or req.dsv41_tail_written:
+        if client is None or req.dsv41_tail_written or _skips_dsv41_tail(req):
             return False
         # Asked with the final chunk; this covers a request that skipped that batch.
         self._request_dsv41_tail_slot(req)
@@ -897,14 +906,16 @@ class SchedulerDisaggregationPrefillMixin:
             return True
         if not client.pushing(room):
             # The tail server recomputes the window's own c1 rows; it takes the
-            # pages of the prefix below it, [0, e - window).
+            # pages of the prefix below it, [0, e - window). The row stays the
+            # request's until the push ends; the writer thread reads it.
+            row = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx]
+            e, page_size = (
+                req.dsv41_late_capture_start,
+                self.token_to_kv_pool_allocator.page_size,
+            )
             client.start_push(
                 room=room,
-                src_pages=c1_page_ids(
-                    self.req_to_token_pool.req_to_token[req.kv.req_pool_idx],
-                    e=req.dsv41_late_capture_start,
-                    page_size=self.token_to_kv_pool_allocator.page_size,
-                ),
+                src_pages=lambda: c1_page_ids(row, e=e, page_size=page_size),
                 capture_slot=req.dsv41_late_capture_slot,
             )
             return True

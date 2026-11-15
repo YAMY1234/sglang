@@ -2165,6 +2165,9 @@ class Envs:
     # Rate benchmark only: the tail server registers nowhere, sends to no decode (each
     # send ends at once) and runs on random residuals, for a driver of synthetic rooms.
     SGLANG_DSV41_TAIL_STAGE_NULL_DECODE = EnvBool(False)
+    # Rate benchmark only: prefill requests with the fake bootstrap host also ask for
+    # tail slots and write them (by default they skip the tail stage).
+    SGLANG_DSV41_TAIL_STAGE_PUSH_FAKE = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16

@@ -13,7 +13,7 @@ import concurrent.futures
 import logging
 import threading
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import msgspec
 import numpy as np
@@ -338,26 +338,24 @@ class TailStageClient:
             return None if entry is None else entry.error
 
     def start_push(
-        self, *, room: int, src_pages: np.ndarray, capture_slot: int
+        self,
+        *,
+        room: int,
+        src_pages: Union[np.ndarray, Callable[[], np.ndarray]],
+        capture_slot: int,
     ) -> bool:
         """Start the slot's writes; refused (False) once the slot has failed, as the
-        tail server may hand a freed slot to another room."""
+        tail server may hand a freed slot to another room. A callable `src_pages` is
+        read, and the writes built, on the writer thread, off the scheduler's loop."""
         with self._lock:
             if self.grant(room) is None:
                 return False
             entry = self._rooms[room]
             assert entry.push is None
-            blocks = push_blocks(
-                pools=self._pools,
-                welcome=self.welcome,
-                grant=entry.grant,
-                src_pages=src_pages,
-                capture_slot=capture_slot,
-            )
             entry.t_push = self._clock()
-            entry.descriptors = len(blocks)
-            entry.nbytes = sum(length for _, _, length in blocks)
-            entry.push = self._executor.submit(self._push, room, entry, blocks)
+            entry.push = self._executor.submit(
+                self._push, room, entry, src_pages, capture_slot
+            )
             return True
 
     def push_result(self, room: int) -> Optional[bool]:
@@ -432,12 +430,23 @@ class TailStageClient:
 
     # -- internals --
 
-    def _push(
-        self, room: int, entry: _Room, blocks: List[Tuple[int, int, int]]
-    ) -> bool:
+    def _push(self, room: int, entry: _Room, src_pages, capture_slot: int) -> bool:
         """Writer thread: the slot's writes, then TailReady(ok=True) at once while the
         room is still live, so a busy scheduler loop does not delay the tail stage."""
         start = self._clock()
+        try:
+            blocks = push_blocks(
+                pools=self._pools,
+                welcome=self.welcome,
+                grant=entry.grant,
+                src_pages=src_pages() if callable(src_pages) else src_pages,
+                capture_slot=capture_slot,
+            )
+        except Exception as exc:  # noqa: BLE001 - the room fails; the scheduler goes on
+            logger.error("DSV4.1 tail stage: slot write not built: %s", exc)
+            return False
+        entry.descriptors = len(blocks)
+        entry.nbytes = sum(length for _, _, length in blocks)
         ok = self._write(blocks)
         end = self._clock()
         with self._lock:

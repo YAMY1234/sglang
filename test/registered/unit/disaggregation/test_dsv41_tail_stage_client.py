@@ -28,11 +28,13 @@ from sglang.srt.disaggregation.dsv41_tail_stage_decode import (
     TailAuxStaging,
     append_tail_stage_entries,
 )
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
 )
 from sglang.srt.disaggregation.utils import append_state_component, state_wire
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -509,6 +511,42 @@ class TestSlotAtFinalChunk(CustomTestCase):
         Mixin._prepare_dsv41_tail_batch(sched, batch)
         (asked,) = sock.take(P.SlotRequest)
         self.assertEqual((asked.room, asked.s, asked.e), (1, 1101, 1100))
+
+
+class TestPushOffTheScheduler(CustomTestCase):
+    def test_the_writes_are_built_on_the_writer_thread(self):
+        """r3: building a slot's writes (page ids, coalescing, up to ~3K descriptors)
+        took 15% of a stage-0 scheduler's loop."""
+        client, sock, _ = _welcomed()
+        client.request(room=1, rid="r", s=1001, e=1000, late_fed=True)
+        sock.inbox.append(P.SlotGrant(room=1, slot=3, residual_slot=3, c1_pages=[8]))
+        client.poll()
+        built_on = []
+
+        def pages():
+            built_on.append(threading.current_thread())
+            return np.array([0])
+
+        self.assertTrue(client.start_push(room=1, src_pages=pages, capture_slot=0))
+        client._rooms[1].push.result(timeout=5)
+        self.assertEqual(len(built_on), 1)
+        self.assertIsNot(built_on[0], threading.current_thread())
+        self.assertTrue(client.push_result(1))
+
+
+class TestFakeBootstrap(CustomTestCase):
+    def test_a_fake_bootstrap_request_skips_the_tail_stage(self):
+        """A fake-bootstrap prefill (no decode) never asked for a slot and was held
+        in the transfer queue for good."""
+        client, sock, _ = _welcomed()
+        sched, queue, req = _push_sched(client)
+        req.bootstrap_host = FAKE_BOOTSTRAP_HOST
+        self.assertTrue(PrefillBootstrapQueue._tail_stage_admits(queue, req))
+        self.assertFalse(Mixin._dsv41_tail_push_pending(sched, req))
+        self.assertEqual(sock.take(P.SlotRequest), [])
+        with envs.SGLANG_DSV41_TAIL_STAGE_PUSH_FAKE.override(True):
+            self.assertTrue(Mixin._dsv41_tail_push_pending(sched, req))
+        self.assertEqual(len(sock.take(P.SlotRequest)), 1)
 
 
 class TestPushAfterDecodeSuccess(CustomTestCase):
