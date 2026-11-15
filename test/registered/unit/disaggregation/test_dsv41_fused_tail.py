@@ -7,7 +7,12 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
-from sglang.srt.disaggregation.utils import dsv41_encoder_prefix_len
+from sglang.srt.disaggregation.utils import (
+    dsv41_encoder_prefix_len,
+    dsv41_late_tail_fed,
+    dsv41_late_tail_prefix_len,
+    dsv41_late_tail_rows,
+)
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
@@ -652,6 +657,36 @@ class TestAdmission(CustomTestCase):
         waiting, sched = self._admit(5, graph_bs=())
         self.assertEqual(schedule_batch.init_new.call_args.args[0], waiting)
         self.assertEqual(list(sched.waiting_queue), [])
+
+
+class TestLateTailSplit(CustomTestCase):
+    def test_prefix_is_unchanged_with_the_switch_off(self):
+        for prompt_len, start in ((1000, 872), (1001, 872), (129, 0), (5, 0)):
+            self.assertEqual(dsv41_encoder_prefix_len(prompt_len, 128), start)
+        self.assertFalse(dsv41_late_tail_fed(1000, 128))
+
+    def test_late_fed_prefix_stops_one_or_two_tokens_short_and_even(self):
+        with envs.SGLANG_DSV41_TAIL_STAGE.override(True):
+            for prompt_len, end in ((1000, 998), (1001, 1000), (131, 130), (132, 130)):
+                self.assertEqual(dsv41_encoder_prefix_len(prompt_len, 128), end)
+                self.assertTrue(dsv41_late_tail_fed(prompt_len, 128))
+            # Too short to hold a window of late rows off position 0: the encoder
+            # split as before.
+            for prompt_len, start in ((130, 2), (129, 0), (128, 0), (5, 0)):
+                self.assertEqual(dsv41_encoder_prefix_len(prompt_len, 128), start)
+                self.assertFalse(dsv41_late_tail_fed(prompt_len, 128))
+        self.assertIsNone(dsv41_late_tail_prefix_len(130, 128))
+
+    def test_late_rows_are_one_window_floored_at_the_prompt_window(self):
+        for prompt_len in (1000, 1001, 131, 132, 65665):
+            start, end, floor = dsv41_late_tail_rows(prompt_len, 128)
+            self.assertEqual(end - start, 128)
+            self.assertGreaterEqual(start, 2)
+            self.assertEqual(end, dsv41_late_tail_prefix_len(prompt_len, 128))
+            self.assertEqual(floor, prompt_len - 128)
+            # One or two rows sit below the floor; the verify step covers the rest.
+            self.assertIn(floor - start, (1, 2))
+            self.assertIn(prompt_len - end, (1, 2))
 
 
 if __name__ == "__main__":
