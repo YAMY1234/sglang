@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -171,6 +172,12 @@ class MooncakeTailBackend:
         self._next_pinned = 0
         # room -> logical SWA page ids of its window, for the send to decode.
         self._swa_pages: dict = {}
+        # Forwards run here, so the loop's reads on the default stream (a grant's c1
+        # page ids, prepare) never wait behind them.
+        self._fwd_stream = torch.cuda.Stream()
+        self._busy_ms = 0.0
+        self._busy_batches = 0
+        self._busy_since = time.monotonic()
 
     def start(self, stage0_wire: List[list]) -> Tuple[str, int, P.Welcome]:
         kv_args = tail_kv_args(
@@ -237,7 +244,8 @@ class MooncakeTailBackend:
         """Launch the forward without waiting for it; the check turns True once it has
         run, so the transfer threads may read the windows' SWA rows and the aux."""
         reqs = [self.pages.reqs[t.room] for t in tails]
-        self.fwd.run([TailRun(req=r, slot=t.slot, s=t.s) for r, t in zip(reqs, tails)])
+        runs = [TailRun(req=r, slot=t.slot, s=t.s) for r, t in zip(reqs, tails)]
+        prepared = self.fwd.prepare(runs)
         pool = self.fwd.model_runner.token_to_kv_pool
         table = self.fwd.req_to_token_pool.req_to_token
         window = self.fwd.window
@@ -248,16 +256,40 @@ class MooncakeTailBackend:
         host = self._pinned[self._next_pinned][: pages.numel()]
         self._next_pinned ^= 1
         host.copy_(pages, non_blocking=True)
-        event = torch.cuda.Event()
-        event.record()
+        copied = torch.cuda.Event()
+        copied.record()
+        self._fwd_stream.wait_stream(torch.cuda.current_stream())
+        start, end = (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
+        )
+        with torch.cuda.stream(self._fwd_stream):
+            start.record()
+            self.fwd.execute(runs, prepared)
+            end.record()
 
-        def done() -> bool:
-            if not event.query():
+        # The default argument keeps `prepared` alive until the forward that reads it ran.
+        def done(prepared=prepared) -> bool:
+            if not (end.query() and copied.query()):
                 return False
             per_window = host.numpy().reshape(len(tails), window)
             for tail, ids in zip(tails, per_window):
                 first_of_run = np.r_[True, ids[1:] != ids[:-1]]
                 self._swa_pages[tail.room] = ids[first_of_run].astype(np.int32).tolist()
+            self._account(start.elapsed_time(end))
             return True
 
         return done
+
+    def _account(self, forward_ms: float) -> None:
+        self._busy_ms += forward_ms
+        self._busy_batches += 1
+        now = time.monotonic()
+        if now - self._busy_since >= 5.0:
+            logger.info(
+                "DSV4.1 tail stage GPU forward busy %.0f%% (%d forwards, %.1f ms mean)",
+                100 * self._busy_ms / ((now - self._busy_since) * 1e3),
+                self._busy_batches,
+                self._busy_ms / self._busy_batches,
+            )
+            self._busy_ms, self._busy_batches, self._busy_since = 0.0, 0, now
