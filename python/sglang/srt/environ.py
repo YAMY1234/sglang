@@ -345,6 +345,9 @@ class Envs:
     # tracking slot is empty from the host-side flag instead of the device tensor,
     # which would wait behind the in-flight forward. Same decision. Opt-in.
     SGLANG_OPT_MAMBA_CHECKPOINT_HOST_EMPTY_FLAG = EnvRuntimeBool(False)
+    # Compact verify support: the full-distribution top-p bound in two split-row launches
+    # instead of the compiled one-pass reduction (same terms, other summation order). Opt-in.
+    SGLANG_OPT_SPEC_FUSED_TOP_P_MASS = EnvRuntimeBool(False)
     # EAGLE draft extend, top-1: take the token with the sampler's split-row argmax
     # (the verify's) instead of torch.argmax's one block per row; same token unless NaN.
     SGLANG_OPT_SPEC_DRAFT_TOP1_ARGMAX = EnvRuntimeBool(
