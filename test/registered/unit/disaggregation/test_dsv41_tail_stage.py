@@ -453,6 +453,20 @@ class TestTailStageExpiryHeap(CustomTestCase):
         self.assertEqual(table.expire(silent_stage0s=[]), [])
         self.assertEqual(table.tails[1].state, SlotState.READY)
 
+    def test_a_failed_slot_is_held_for_its_own_timeout_not_its_grants(self):
+        """A granted slot failed at t=105 stays held until 105 + timeout, even though
+        its grant's deadline (100 + timeout) comes first."""
+        table, clock = _table(slots=1, ready_timeout_s=10.0)
+        table.request("b", _req(1, 1001))  # granted at 100
+        clock.t = 105.0
+        table.expire(silent_stage0s=["b"])  # FAILED, held
+        clock.t = 111.0
+        table.expire(silent_stage0s=["b"])
+        self.assertEqual(table.counts()["free_slots"], 0)
+        clock.t = 116.0
+        table.expire(silent_stage0s=["b"])
+        self.assertEqual(table.counts()["free_slots"], 1)
+
     def test_a_silent_stage0_is_scanned_once(self):
         table, clock = _table(slots=2, ready_timeout_s=100.0)
         table.request("b", _req(1, 1001))
