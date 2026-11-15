@@ -236,9 +236,14 @@ class TestTailStageClient(CustomTestCase):
         client.start_push(room=1, src_pages=np.array([0, 1, 2, 3]), capture_slot=6)
         client._rooms[1].push.result(timeout=5)
         self.assertTrue(client.push_result(1))
-        session, src, dst, lengths = transfer.call_args.args
-        self.assertEqual(session, "tail:1")
-        self.assertEqual(len(src), 4)  # one run per c1 entry, plus the window
+        self.assertEqual({c.args[0] for c in transfer.call_args_list}, {"tail:1"})
+        written = _written(transfer)
+        # One run per c1 entry, then the window in pieces.
+        c1 = [b for b in written if b[0] < POOLS.residual_ptr]
+        self.assertEqual(len(c1), 3)
+        window = [b for b in written if b[0] >= POOLS.residual_ptr]
+        self.assertEqual(window[0][0], POOLS.residual_ptr + 6 * 5_242_880)
+        self.assertEqual(sum(b[2] for b in window), 5_242_880)
         client.ready(1, ok=True)
         (ready,) = sock.take(P.TailReady)
         self.assertEqual((ready.room, ready.slot, ready.ok), (1, 3, True))
@@ -375,14 +380,30 @@ class TestTailStageClient(CustomTestCase):
 
 
 class TestSplitBlocks(CustomTestCase):
-    def test_parts_keep_block_order_and_balance_bytes(self):
-        blocks = [(i, 1000 + i, 10) for i in range(40)] + [(99, 999, 5_000_000)]
-        parts = split_blocks(blocks, parts=WRITE_PARTS)
-        self.assertLessEqual(len(parts), WRITE_PARTS)
-        self.assertEqual([b for p in parts for b in p], blocks)
-        even = split_blocks([(i, i, 10) for i in range(80)], parts=8)
-        self.assertEqual([len(p) for p in even], [10] * 8)
-        self.assertEqual(split_blocks([(0, 0, 7)], parts=8), [[(0, 0, 7)]])
+    def test_parts_cover_every_byte_once_in_order_and_balance(self):
+        # The c1 KV of a 130K-token prefix as one run dominates the bytes.
+        blocks = [(1000, 9000, 46_000_000), (50, 60, 9_000_000), (7, 8, 5_242_880)]
+        parts = split_blocks(blocks, parts=WRITE_PARTS, min_bytes=1 << 20)
+        self.assertEqual(len(parts), WRITE_PARTS)
+        pieces = [b for p in parts for b in p]
+        covered = {}
+        for src, dst, length in pieces:
+            covered.setdefault((src - dst), []).append((src, length))
+        for src, dst, length in blocks:
+            spans = sorted(covered[src - dst])
+            self.assertEqual(spans[0][0], src)
+            self.assertEqual(sum(n for _, n in spans), length)
+            for (a, n), (b, _) in zip(spans, spans[1:]):
+                self.assertEqual(a + n, b)
+        sizes = [sum(n for _, _, n in p) for p in parts]
+        self.assertLessEqual(max(sizes) - min(sizes), max(sizes) // 2)
+        small = [(0, 0, 7), (100, 100, 900)]
+        self.assertEqual(split_blocks(small, parts=8, min_bytes=1 << 20), [small])
+
+
+def _written(transfer):
+    """Every (src, dst, length) a slot write sent, over all its Mooncake batches."""
+    return sorted(b for call in transfer.call_args_list for b in zip(*call.args[1:]))
 
 
 def _granted_queue(client, *, late_fed=True):
@@ -476,11 +497,12 @@ class TestPushAfterDecodeSuccess(CustomTestCase):
         client.poll()
         self.assertTrue(Mixin._dsv41_tail_push_pending(sched, req))
         client._rooms[1].push.result(timeout=5)
-        src = client._transfer.call_args.args[1]
+        written = _written(client._transfer)
         # Row 1 holds locs 2048 + 2560 ...: pages 18..21 of [0, 972), one run.
-        self.assertEqual(src[0], POOLS.c1_kv_ptrs[0] + 18 * 100)
-        self.assertEqual(client._transfer.call_args.args[3][0], 4 * 100)
-        self.assertEqual(src[-1], POOLS.residual_ptr + 9 * POOLS.residual_item_len)
+        self.assertEqual(written[0][0], POOLS.c1_kv_ptrs[0] + 18 * 100)
+        self.assertEqual(written[0][2], 4 * 100)
+        window = [b for b in written if b[0] >= POOLS.residual_ptr]
+        self.assertEqual(window[0][0], POOLS.residual_ptr + 9 * POOLS.residual_item_len)
         self.assertFalse(Mixin._dsv41_tail_push_pending(sched, req))
         self.assertTrue(sock.take(P.TailReady)[0].ok)
         # Nothing left to hold, and nothing asked again.
