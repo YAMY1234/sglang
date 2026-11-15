@@ -2,6 +2,7 @@
 writes and the bootstrap wait."""
 
 import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -16,9 +17,11 @@ from sglang.srt.disaggregation.dsv41_tail_stage.registration import tail_stage_w
 from sglang.srt.disaggregation.dsv41_tail_stage_client import (
     HELLO_RETRY_S,
     UNREACHABLE,
+    WRITE_PARTS,
     Stage0Pools,
     TailStageClient,
     push_blocks,
+    split_blocks,
 )
 from sglang.srt.disaggregation.dsv41_tail_stage_decode import (
     TAIL_AUX_ABORT_REST_STEPS,
@@ -88,8 +91,8 @@ class _Clock:
         return self.t
 
 
-def _client(transfer=None):
-    sock, clock = _Socket(), _Clock()
+def _client(transfer=None, *, clock=None, heartbeat_s=1.0, heartbeat_thread=False):
+    sock, clock = _Socket(), clock or _Clock()
     hello = P.Hello(
         stage0_id="p0:8998/dp0",
         bootstrap_addr="p0:8998",
@@ -106,9 +109,10 @@ def _client(transfer=None):
         hello=hello,
         pools=POOLS,
         transfer=transfer or MagicMock(return_value=0),
-        heartbeat_s=1.0,
+        heartbeat_s=heartbeat_s,
         timeout_s=5.0,
         clock=clock,
+        heartbeat_thread=heartbeat_thread,
     )
     return client, sock, clock
 
@@ -312,6 +316,74 @@ class TestTailStageClient(CustomTestCase):
         client.poll()
         self.assertIsNone(client.error(2))
 
+    def test_a_slot_failed_by_the_tail_server_is_never_written(self):
+        """Debug 2: the tail server failed granted slots while stage 0 still held the
+        grants; a write into a slot that may be granted again is refused, and the
+        answer that frees the slot waits for any write in flight."""
+        transfer = MagicMock(return_value=0)
+        client, sock, _ = _welcomed(transfer)
+        client.request(room=1, rid="r", s=1001, e=1000, late_fed=True)
+        sock.inbox.append(P.SlotGrant(room=1, slot=3, residual_slot=3, c1_pages=[8]))
+        sock.inbox.append(
+            P.TailDone(room=1, slot=3, status="failed", reason="stage 0 silent")
+        )
+        client.poll()
+        self.assertIsNone(client.grant(1))
+        self.assertIn("stage 0 silent", client.error(1))
+        self.assertFalse(
+            client.start_push(room=1, src_pages=np.array([0]), capture_slot=0)
+        )
+        transfer.assert_not_called()
+        client.abort(1)
+        (back,) = sock.take(P.TailReady)
+        self.assertEqual((back.room, back.slot, back.ok), (1, 3, False))
+
+    def test_a_write_in_flight_when_its_slot_fails_does_not_count(self):
+        gate = threading.Event()
+        client, sock, _ = _welcomed(lambda *_: 0 if gate.wait(5) else -1)
+        client.request(room=1, rid="r", s=1001, e=1000, late_fed=True)
+        sock.inbox.append(P.SlotGrant(room=1, slot=3, residual_slot=3, c1_pages=[8]))
+        client.poll()
+        self.assertTrue(
+            client.start_push(room=1, src_pages=np.array([0]), capture_slot=0)
+        )
+        sock.inbox.append(P.TailDone(room=1, slot=3, status="failed", reason="x"))
+        client.poll()
+        client.abort(1)
+        self.assertEqual(sock.take(P.TailReady), [])
+        gate.set()
+        client._rooms[1].push.result(timeout=5)
+        self.assertIs(client.push_result(1), False)
+        client.poll()
+        self.assertFalse(sock.take(P.TailReady)[0].ok)
+
+    def test_heartbeats_go_out_while_the_scheduler_does_not_poll(self):
+        """Debug 2: a 27 s cold prefill kept the scheduler from polling, and the tail
+        server failed every room of that stage 0 as silent."""
+        client, sock, _ = _client(
+            clock=time.monotonic, heartbeat_s=0.02, heartbeat_thread=True
+        )
+        try:
+            client.poll()
+            sock.inbox.append(_welcome())
+            client.poll()
+            sock.sent.clear()
+            time.sleep(0.3)
+            self.assertGreaterEqual(len(sock.take(P.Heartbeat)), 3)
+        finally:
+            client.close()
+
+
+class TestSplitBlocks(CustomTestCase):
+    def test_parts_keep_block_order_and_balance_bytes(self):
+        blocks = [(i, 1000 + i, 10) for i in range(40)] + [(99, 999, 5_000_000)]
+        parts = split_blocks(blocks, parts=WRITE_PARTS)
+        self.assertLessEqual(len(parts), WRITE_PARTS)
+        self.assertEqual([b for p in parts for b in p], blocks)
+        even = split_blocks([(i, i, 10) for i in range(80)], parts=8)
+        self.assertEqual([len(p) for p in even], [10] * 8)
+        self.assertEqual(split_blocks([(0, 0, 7)], parts=8), [[(0, 0, 7)]])
+
 
 def _granted_queue(client, *, late_fed=True):
     queue = SimpleNamespace(
@@ -330,57 +402,78 @@ def _granted_queue(client, *, late_fed=True):
 
 
 class TestBootstrapWait(CustomTestCase):
-    def test_late_fed_request_finalizes_only_once_granted(self):
+    def test_late_fed_request_bootstraps_without_a_slot(self):
+        """Debug 2: slots granted at bootstrap were held through the prefill queue
+        (grant to TailReady 70 s), so 64 slots served about one room per second."""
         client, sock, _ = _welcomed()
         queue, req = _granted_queue(client)
-        wait = PrefillBootstrapQueue._tail_stage_granted
-        self.assertFalse(wait(queue, req))
-        self.assertFalse(wait(queue, req))
-        self.assertEqual(len(sock.take(P.SlotRequest)), 1)
-        sock.inbox.append(
-            P.SlotGrant(room=1, slot=0, residual_slot=0, c1_pages=[0] * 4)
-        )
-        client.poll()
-        self.assertTrue(wait(queue, req))
+        self.assertTrue(PrefillBootstrapQueue._tail_stage_admits(queue, req))
+        self.assertEqual(sock.take(P.SlotRequest), [])
         queue.kv_manager.conclude_failure.assert_not_called()
 
-    def test_pass_through_request_does_not_wait(self):
+    def test_pass_through_request_is_announced_at_bootstrap(self):
         client, sock, _ = _welcomed()
         queue, req = _granted_queue(client, late_fed=False)
-        self.assertTrue(PrefillBootstrapQueue._tail_stage_granted(queue, req))
+        self.assertTrue(PrefillBootstrapQueue._tail_stage_admits(queue, req))
         self.assertEqual(sock.take(P.SlotRequest)[0].e, 0)
 
     def test_unreachable_tail_stage_fails_the_room_for_decode_too(self):
         client, sock, clock = _welcomed()
         queue, req = _granted_queue(client)
         clock.t += 6
-        self.assertFalse(PrefillBootstrapQueue._tail_stage_granted(queue, req))
+        self.assertFalse(PrefillBootstrapQueue._tail_stage_admits(queue, req))
         queue.kv_manager.conclude_failure.assert_called_once_with(
             bootstrap_room=1, failure_reason=UNREACHABLE
         )
-        self.assertEqual(sock.take(P.TailAbort)[0].room, 1)
+
+
+def _push_sched(client):
+    queue, req = _granted_queue(client)
+    # e = 1100: the tail server takes the c1 pages of [0, e - 128), 4 not 5.
+    req.origin_input_ids = list(range(1100))
+    req.dsv41_prompt_len, req.dsv41_late_capture_start = 1101, 972
+    req.dsv41_tail_written = False
+    req.kv = SimpleNamespace(req_pool_idx=1)
+    req.dsv41_late_capture_slot = 9
+    req_to_token = torch.arange(2 * 2048).reshape(2, 2048) + 256 * 10
+    sched = SimpleNamespace(
+        disagg_prefill_bootstrap_queue=queue,
+        token_to_kv_pool_allocator=SimpleNamespace(page_size=256),
+        req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+    )
+    for name in ("_request_dsv41_tail_slot", "_fail_dsv41_tail"):
+        setattr(sched, name, getattr(Mixin, name).__get__(sched))
+    return sched, queue, req
+
+
+class TestSlotAtFinalChunk(CustomTestCase):
+    def test_the_slot_is_asked_with_the_final_chunk_only(self):
+        client, sock, _ = _welcomed()
+        sched, _, req = _push_sched(client)
+        sched._dsv41_late_capture = lambda: SimpleNamespace(bind=MagicMock())
+        req.full_untruncated_fill_ids = req.origin_input_ids
+        batch = SimpleNamespace(reqs=[req])
+        req.extend_end = 512
+        Mixin._prepare_dsv41_tail_batch(sched, batch)
+        self.assertEqual(sock.take(P.SlotRequest), [])
+        req.extend_end = 1100
+        Mixin._prepare_dsv41_tail_batch(sched, batch)
+        (asked,) = sock.take(P.SlotRequest)
+        self.assertEqual((asked.room, asked.s, asked.e), (1, 1101, 1100))
 
 
 class TestPushAfterDecodeSuccess(CustomTestCase):
     def test_slot_written_after_decode_success_then_released(self):
         client, sock, _ = _welcomed()
-        queue, req = _granted_queue(client)
-        # e = 1100: the tail server takes the c1 pages of [0, e - 128), 4 not 5.
-        req.origin_input_ids = list(range(1100))
-        req.dsv41_prompt_len, req.dsv41_late_capture_start = 1101, 972
-        self.assertFalse(PrefillBootstrapQueue._tail_stage_granted(queue, req))
+        sched, _, req = _push_sched(client)
+        # Asked here if the final-chunk batch did not ask; held until granted.
+        self.assertTrue(Mixin._dsv41_tail_push_pending(sched, req))
+        self.assertEqual(len(sock.take(P.SlotRequest)), 1)
+        self.assertTrue(Mixin._dsv41_tail_push_pending(sched, req))
         sock.inbox.append(
             P.SlotGrant(room=1, slot=2, residual_slot=2, c1_pages=[5, 6, 7, 8])
         )
         client.poll()
-        req.kv = SimpleNamespace(req_pool_idx=1)
-        req.dsv41_late_capture_slot = 9
-        req_to_token = torch.arange(2 * 2048).reshape(2, 2048) + 256 * 10
-        sched = SimpleNamespace(
-            disagg_prefill_bootstrap_queue=queue,
-            token_to_kv_pool_allocator=SimpleNamespace(page_size=256),
-            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
-        )
         self.assertTrue(Mixin._dsv41_tail_push_pending(sched, req))
         client._rooms[1].push.result(timeout=5)
         src = client._transfer.call_args.args[1]
@@ -390,8 +483,21 @@ class TestPushAfterDecodeSuccess(CustomTestCase):
         self.assertEqual(src[-1], POOLS.residual_ptr + 9 * POOLS.residual_item_len)
         self.assertFalse(Mixin._dsv41_tail_push_pending(sched, req))
         self.assertTrue(sock.take(P.TailReady)[0].ok)
-        # Nothing left to hold: a second success check releases at once.
+        # Nothing left to hold, and nothing asked again.
         self.assertFalse(Mixin._dsv41_tail_push_pending(sched, req))
+        self.assertEqual(sock.take(P.SlotRequest), [])
+
+    def test_a_room_the_tail_server_failed_fails_to_decode(self):
+        client, sock, _ = _welcomed()
+        sched, queue, req = _push_sched(client)
+        Mixin._dsv41_tail_push_pending(sched, req)
+        sock.inbox.append(P.SlotGrant(room=1, slot=2, residual_slot=2, c1_pages=[5]))
+        sock.inbox.append(P.TailDone(room=1, slot=2, status="failed", reason="x"))
+        client.poll()
+        self.assertTrue(Mixin._dsv41_tail_push_pending(sched, req))
+        client._transfer.assert_not_called()
+        queue.kv_manager.conclude_failure.assert_called_once()
+        self.assertFalse(sock.take(P.TailReady)[0].ok)
 
 
 class TestAdvertisedStages(CustomTestCase):
