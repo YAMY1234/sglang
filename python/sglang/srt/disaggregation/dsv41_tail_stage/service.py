@@ -206,11 +206,9 @@ class TailStageService:
             # Stage 0 may still write the slot: it frees at TailReady.
             self._deliver(self.table.abort(room))
             return
-        if ok:
-            self.stats["tails_ok"] += 1
-        else:
-            self.stats["tails_failed"] += 1
         status = "ok" if ok else "failed"
+        kind = "tails" if tail is not None else "passthrough"
+        self.stats[f"{kind}_{status}"] += 1
         self._deliver(self.table.finish(room, status=status, reason=status))
 
     def _heartbeat(self, now: float) -> None:
