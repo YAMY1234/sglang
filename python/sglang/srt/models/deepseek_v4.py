@@ -5073,6 +5073,8 @@ def _is_quark_checkpoint(config: DeepSeekV4Config) -> bool:
 
 class DeepseekV4ForCausalLM(nn.Module):
     supports_cuda_vmm_feature_transport = True
+    # Subclasses that skip this __init__ (the NextN draft) are never tail servers.
+    tail_stage: bool = False
 
     @classmethod
     def get_hf_to_sglang_mapper(cls, config) -> Optional[WeightsMapper]:
@@ -6168,9 +6170,9 @@ class DeepseekV4ForCausalLM(nn.Module):
         if encoder_only_skipped:
             log_info_on_rank0(
                 logger,
-                "DeepSeek-V4.1 encoder-only Prefill skipped "
-                f"{encoder_only_skipped} checkpoint tensors outside the resident "
-                "submodel.",
+                f"DeepSeek-V4.1 {'tail server' if self.tail_stage else 'encoder-only Prefill'} "
+                f"skipped {encoder_only_skipped} checkpoint tensors outside the "
+                "resident submodel.",
             )
         unloaded_params = params_dict.keys() - loaded_params
 
