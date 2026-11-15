@@ -46,6 +46,8 @@ STATS_LOG_S = 5.0
 # (the KV sender also spreads one request over its executors under the NVLink pool).
 WRITE_ROOMS = 4
 WRITE_PARTS = 8
+# Arbitrary: no write is cut into batches smaller than this.
+MIN_WRITE_PART_BYTES = 1 << 20
 UNREACHABLE = "DSV4.1 tail stage unreachable"
 
 
@@ -128,16 +130,20 @@ def push_blocks(
 
 
 def split_blocks(
-    blocks: List[Tuple[int, int, int]], *, parts: int
+    blocks: List[Tuple[int, int, int]], *, parts: int, min_bytes: int
 ) -> List[List[Tuple[int, int, int]]]:
-    """The writes cut into at most `parts` runs of consecutive blocks of about equal
-    bytes, one Mooncake batch each."""
+    """The writes cut into at most `parts` runs of about equal bytes (at least
+    `min_bytes`), one Mooncake batch each; a larger block is cut into pieces."""
     total = sum(length for _, _, length in blocks)
-    target = max(1, -(-total // parts))
+    target = max(min_bytes, -(-total // parts))
+    pieces = []
+    for src, dst, length in blocks:
+        for offset in range(0, length, target):
+            pieces.append((src + offset, dst + offset, min(target, length - offset)))
     out, part, size = [], [], 0
-    for block in blocks:
-        part.append(block)
-        size += block[2]
+    for piece in pieces:
+        part.append(piece)
+        size += piece[2]
         if size >= target and len(out) < parts - 1:
             out.append(part)
             part, size = [], 0
@@ -389,7 +395,7 @@ class TailStageClient:
     # -- internals --
 
     def _write(self, blocks: List[Tuple[int, int, int]]) -> bool:
-        parts = split_blocks(blocks, parts=WRITE_PARTS)
+        parts = split_blocks(blocks, parts=WRITE_PARTS, min_bytes=MIN_WRITE_PART_BYTES)
         if len(parts) == 1:
             return self._write_part(parts[0])
         futures = [self._part_executor.submit(self._write_part, p) for p in parts]
