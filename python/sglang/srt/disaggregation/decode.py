@@ -79,7 +79,9 @@ from sglang.srt.disaggregation.utils import (
     dsv41_encoder_only_prefill_enabled,
     dsv41_encoder_only_unsupported,
     dsv41_encoder_prefix_len,
+    dsv41_late_tail_fed,
     dsv41_tail_can_feed,
+    dsv41_tail_stage_enabled,
     end_network_transfer,
     get_dsa_tail_state_indices,
     get_kv_class,
@@ -1187,9 +1189,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # prompt plus all output but the pending last id); the tail extend here
             # runs the rest and samples the next token.
             req.dsv41_tail_start = None
-            req.dsv41_tail_start = dsv41_encoder_prefix_len(
-                pre_alloc_fill_len(req),
-                self.scheduler.model_config.sliding_window_size,
+            fill_len = pre_alloc_fill_len(req)
+            window = self.scheduler.model_config.sliding_window_size
+            req.dsv41_tail_start = dsv41_encoder_prefix_len(fill_len, window)
+            # SGLANG_DSV41_TAIL_STAGE: the tail stage writes the late layers' window
+            # below the split; only the one or two rows from it are left here.
+            req.dsv41_late_fed = dsv41_tail_stage_enabled() and dsv41_late_tail_fed(
+                fill_len, window
             )
 
         if self._check_if_req_exceed_kv_capacity(req):
@@ -4565,6 +4571,13 @@ class SchedulerDisaggregationDecodeMixin:
                 "SGLANG_DSV41_FUSED_TAIL: %d tails fed through verify steps so far",
                 self.dsv41_fed_tail_ct,
             )
+            if dsv41_tail_stage_enabled():
+                steps = getattr(self, "dsv41_feed_slot_steps", 0)
+                logger.info(
+                    "SGLANG_DSV41_TAIL_STAGE: %d feed slot-steps so far, %.2f per fed tail",
+                    steps,
+                    steps / max(self.dsv41_fed_tail_ct, 1),
+                )
         return running_batch
 
     def _set_dsv41_feed_inputs(self: Scheduler, batch: ScheduleBatch) -> None:
@@ -4591,6 +4604,7 @@ class SchedulerDisaggregationDecodeMixin:
         # The verify width the DSpark worker resolved (draft block + 1).
         width = self.model_worker.verify_num_draft_tokens
         window = self.model_config.sliding_window_size
+        tail_stage = dsv41_tail_stage_enabled()
         forced = [[-1] * width for _ in batch.reqs]
         floor = [0] * len(batch.reqs)
         for i, req in enumerate(batch.reqs):
@@ -4602,12 +4616,21 @@ class SchedulerDisaggregationDecodeMixin:
             forced[i] = [-2] * width
             forced[i][: end - p - 1] = prompt[p + 1 : end]
             # The tail extend's bounded replay starts the late layers at the last
-            # window, one row past the tail start for a 129-token tail.
-            floor[i] = max(req.dsv41_feed_floor, len(prompt) - window)
+            # window, one row past the tail start for a 129-token tail. A late-fed
+            # tail's late layers already hold that window below its start.
+            floor[i] = (
+                len(prompt) - window
+                if tail_stage and req.dsv41_late_fed
+                else max(req.dsv41_feed_floor, len(prompt) - window)
+            )
             nxt = p + width
             # A step ending on the last prompt token leaves the first output to
             # the next step, which stays in the feed with no prompt rows.
             req.dsv41_feed_next = nxt if nxt < len(prompt) else None
+        if tail_stage:
+            self.dsv41_feed_slot_steps = getattr(
+                self, "dsv41_feed_slot_steps", 0
+            ) + sum(f[0] != -1 for f in forced)
         batch.dsv41_forced_tokens = async_h2d(
             forced, dtype=torch.int64, device=batch.device
         )

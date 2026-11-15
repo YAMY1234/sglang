@@ -660,6 +660,45 @@ class TestAdmission(CustomTestCase):
         self.assertEqual(list(sched.waiting_queue), [])
 
 
+@patch("sglang.srt.disaggregation.decode.dsv41_tail_stage_enabled", return_value=True)
+@patch("sglang.srt.disaggregation.decode.set_time_batch")
+@patch("sglang.srt.disaggregation.decode.ScheduleBatch")
+class TestTailStageAdmission(CustomTestCase):
+    def test_late_fed_tail_takes_one_verify_step_floored_at_the_prompt_window(
+        self, schedule_batch, *_
+    ):
+        for prompt_len, e, forced0 in ((1001, 1000, -2), (1000, 998, None)):
+            with envs.SGLANG_DSV41_TAIL_STAGE.override(True):
+                req = _waiting_req(prompt_len, dsv41_late_fed=True)
+            self.assertEqual(req.dsv41_tail_start, e)
+            sched, running = _admit_sched([req], running_size=4)
+            with envs.SGLANG_DSV41_FUSED_TAIL.override(True):
+                Mixin._admit_dsv41_fed_tails(sched, running)
+            self.assertEqual(schedule_batch.init_new.call_args.args[0], [req])
+            # Fed from e, which is also the KV it enters with (prepare_for_prebuilt).
+            self.assertEqual((req.dsv41_feed_floor, req.dsv41_feed_next), (e, e))
+            feed = _sched()
+            steps = []
+            while req.dsv41_feed_next is not None:
+                batch = _decode_batch([req])
+                Mixin._set_dsv41_feed_inputs(feed, batch)
+                steps.append(batch)
+            self.assertEqual(len(steps), 1)
+            # The tail stage wrote the late layers' window below e.
+            self.assertEqual(steps[0].dsv41_swa_floor.tolist(), [prompt_len - 128])
+            rows = steps[0].dsv41_forced_tokens[0].tolist()
+            want0 = req.origin_input_ids[e + 1] if forced0 is None else forced0
+            self.assertEqual(rows, [want0] + [-2] * (WIDTH - 1))
+            self.assertEqual(feed.dsv41_feed_slot_steps, 1)
+
+    def test_switch_on_leaves_a_tail_that_is_not_late_fed_as_before(self, *_):
+        req = _fed_req(1000)
+        req.dsv41_late_fed = False
+        batch = _decode_batch([req])
+        Mixin._set_dsv41_feed_inputs(_sched(), batch)
+        self.assertEqual(batch.dsv41_swa_floor.tolist(), [872])
+
+
 class TestLateTailSplit(CustomTestCase):
     def test_prefix_is_unchanged_with_the_switch_off(self):
         for prompt_len, start in ((1000, 872), (1001, 872), (129, 0), (5, 0)):
