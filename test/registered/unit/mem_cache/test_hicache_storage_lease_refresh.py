@@ -310,11 +310,11 @@ class TestUnifiedRadixCacheHook(CustomTestCase):
         refresher._take_pending(timeout=0)
         tree = FakeTreeCore(
             parents={1: 0, 2: 1, 3: 2, 4: 3},
-            hashes={1: ["a0"], 2: ["b0", "b1"], 3: ["c0"]},
+            hashes={1: ["a0"], 2: ["b0", "b1"], 4: ["d0"]},
         )
         self._cache(refresher, tree).refresh_storage_leases(4)
-        self.assertEqual(refresher._take_pending(timeout=0), [["b0", "b1", "c0"]])
-        self.assertEqual(refresher._chain_stamps, {1: 990.0, 2: 990.0, 3: 990.0})
+        self.assertEqual(refresher._take_pending(timeout=0), [["b0", "b1"]])
+        self.assertEqual(refresher._chain_stamps, {1: 990.0, 2: 990.0})
 
     def test_off_and_root_never_touch_the_tree(self):
         tree = MagicMock()
