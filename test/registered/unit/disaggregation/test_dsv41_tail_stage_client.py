@@ -8,9 +8,11 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import torch
-
+from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
 from sglang.srt.disaggregation.dsv41_tail_stage import protocol as P
+from sglang.srt.disaggregation.dsv41_tail_stage.registration import tail_stage_wire
 from sglang.srt.disaggregation.dsv41_tail_stage_client import (
     HELLO_RETRY_S,
     UNREACHABLE,
@@ -18,10 +20,16 @@ from sglang.srt.disaggregation.dsv41_tail_stage_client import (
     TailStageClient,
     push_blocks,
 )
+from sglang.srt.disaggregation.dsv41_tail_stage_decode import (
+    TAIL_AUX_ABORT_REST_STEPS,
+    TailAuxStaging,
+    append_tail_stage_entries,
+)
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
 )
+from sglang.srt.disaggregation.utils import append_state_component, state_wire
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -403,6 +411,185 @@ class TestAdvertisedStages(CustomTestCase):
             payload = put.call_args.args[1]
             self.assertEqual((payload["pp_size"], payload["pp_rank"]), (pp_size, 0))
             self.assertEqual(mgr.bootstrap_registration, payload)
+
+
+def _aux(slots=2, window=4):
+    return TailAuxStaging(
+        slots=slots,
+        window=window,
+        captures=3,
+        hidden_size=2,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+
+
+class TestDecodeTailEntries(CustomTestCase):
+    def test_decode_wire_is_the_tail_servers(self):
+        """Decode pairs the tail server's entries by position after W0, so its wire
+        must be exactly the tail server's (registration.tail_stage_wire)."""
+        layers = 40
+        swa = SimpleNamespace(
+            page_size=64,
+            kv_buffer=[torch.zeros(3, 8, dtype=torch.uint8) for _ in range(layers)],
+        )
+        pool = SimpleNamespace(
+            request_window=None,
+            swa_kv_pool=swa,
+            swa_page_size=128,
+            swa_layer_ids=lambda: list(range(layers)),
+        )
+        for draft_aux in (False, True):
+            kv_args = SimpleNamespace(
+                state_types=[],
+                state_sub_pools=[],
+                state_wire_keys=[],
+                state_data_ptrs=[],
+                state_data_lens=[],
+                state_item_lens=[],
+                state_dim_per_tensor=[],
+                state_conv_shard_groups=[],
+                state_slice_outer_counts=[],
+                state_layer_ids=[],
+                state_window_tails=[],
+            )
+            append_state_component(
+                kv_args, StateType.SWA, [1], [2], [3], sub_pool="swa", wire_key="swa"
+            )
+            kv_args.state_window_tails.append(2048)
+            w0 = state_wire(kv_args)
+            aux = _aux() if draft_aux else None
+            append_tail_stage_entries(
+                kv_args, pool=pool, layer_ids=range(20, 40), aux=aux
+            )
+            self.assertEqual(state_wire(kv_args), tail_stage_wire(w0, draft_aux))
+            self.assertEqual(len(kv_args.state_window_tails), len(kv_args.state_types))
+            # One item per logical SWA page of each of layers 20-39.
+            self.assertEqual(kv_args.state_item_lens[1], [16] * 20)
+            self.assertEqual(
+                kv_args.state_data_ptrs[1],
+                [buf.data_ptr() for buf in swa.kv_buffer[20:40]],
+            )
+            if draft_aux:
+                self.assertEqual(kv_args.state_item_lens[2], [4 * 6 * 4])
+
+
+class TestTailAuxStaging(CustomTestCase):
+    def test_a_read_slot_frees_soon_and_an_aborted_one_rests(self):
+        aux = _aux(slots=2)
+        a, b, c = (SimpleNamespace(finished=lambda: False) for _ in range(3))
+        self.assertEqual(aux.reserve(a, step=0), 0)
+        self.assertEqual(aux.reserve(b, step=0), 1)
+        self.assertIsNone(aux.reserve(c, step=0))
+        aux.release(0, step=10, rest=TAIL_AUX_ABORT_REST_STEPS)
+        aux.release(1, step=10, rest=2)
+        self.assertIsNone(aux.reserve(c, step=11))
+        self.assertEqual(aux.reserve(c, step=12), 1)
+        self.assertIsNone(aux.reserve(a, step=10 + TAIL_AUX_ABORT_REST_STEPS - 1))
+        self.assertEqual(aux.reserve(a, step=10 + TAIL_AUX_ABORT_REST_STEPS), 0)
+
+    def test_finished_holders_are_the_aborted_ones(self):
+        aux = _aux(slots=2)
+        live = SimpleNamespace(finished=lambda: False)
+        gone = SimpleNamespace(finished=lambda: True)
+        aux.reserve(live, step=0)
+        aux.reserve(gone, step=0)
+        self.assertEqual(aux.finished_holders(), [gone])
+
+
+class TestDraftKvAtAdmission(CustomTestCase):
+    def test_window_rows_go_to_the_draft_in_admission_order(self):
+        aux = _aux(slots=3, window=4)
+        aux.buf.copy_(
+            torch.arange(aux.buf.numel(), dtype=torch.float32).view_as(aux.buf)
+        )
+        self.assertEqual([aux.reserve(None, step=0) for _ in range(3)], [0, 1, 2])
+        reqs = []
+        for slot, (row, e) in zip((2, 0), ((5, 1000), (7, 2002))):
+            reqs.append(
+                SimpleNamespace(
+                    dsv41_tail_aux_slot=slot,
+                    kv=SimpleNamespace(req_pool_idx=row),
+                    dsv41_tail_start=e,
+                )
+            )
+        plain = SimpleNamespace(dsv41_tail_aux_slot=None)
+        writer = MagicMock()
+        sched = SimpleNamespace(
+            disagg_decode_prealloc_queue=SimpleNamespace(tail_aux=aux),
+            model_config=SimpleNamespace(sliding_window_size=4),
+            forward_stream_ctx=MagicMock(),
+            model_worker=SimpleNamespace(write_tail_draft_kv=writer),
+            forward_ct=50,
+        )
+        sched._tail_aux = lambda: aux
+        sched._release_dsv41_tail_aux = lambda req, rest: (
+            SchedulerDisaggregationDecodeMixin._release_dsv41_tail_aux(
+                sched, req, rest=rest
+            )
+        )
+        SchedulerDisaggregationDecodeMixin._write_dsv41_tail_draft_kv(
+            sched, [reqs[0], plain, reqs[1]]
+        )
+        kwargs = writer.call_args.kwargs
+        self.assertEqual(kwargs["req_pool_indices"].tolist(), [5, 7])
+        self.assertEqual(kwargs["starts"].tolist(), [996, 1998])
+        self.assertTrue(
+            torch.equal(kwargs["aux"], torch.cat([aux.rows(2), aux.rows(0)]))
+        )
+        self.assertEqual([r.dsv41_tail_aux_slot for r in reqs], [None, None])
+        self.assertEqual(sched.dsv41_tail_admit_ct, 2)
+        # Free two steps on, once the step that reads them has run.
+        self.assertIsNone(aux.reserve(None, step=51))
+        self.assertIsNotNone(aux.reserve(None, step=52))
+
+
+class TestTailDraftKvLayout(CustomTestCase):
+    def test_window_rows_address_their_positions_in_paged_and_ring_pools(self):
+        from contextlib import nullcontext
+
+        from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
+            DSparkWorkerV2,
+        )
+
+        req_to_token = torch.arange(3 * 64).view(3, 64) + 1000
+        full_to_swa = torch.arange(2000) * 10
+        for ring in (None, 32):
+            writer = MagicMock()
+            worker = SimpleNamespace(
+                _hosts_draft=True,
+                draft_model_runner=SimpleNamespace(
+                    token_to_kv_pool=SimpleNamespace(
+                        swa_req_ring_size=ring, full_to_swa_index_mapping=full_to_swa
+                    )
+                ),
+                model_runner=SimpleNamespace(
+                    req_to_token_pool=SimpleNamespace(req_to_token=req_to_token)
+                ),
+                draft_model=SimpleNamespace(write_target_hidden_kv=writer),
+                _draft_context=nullcontext,
+            )
+            aux = torch.randn(2 * 4, 6)
+            DSparkWorkerV2.write_tail_draft_kv(
+                worker,
+                req_pool_indices=torch.tensor([2, 0]),
+                starts=torch.tensor([10, 40]),
+                aux=aux,
+            )
+            kwargs = writer.call_args.kwargs
+            want_pos = [10, 11, 12, 13, 40, 41, 42, 43]
+            self.assertEqual(kwargs["positions"].tolist(), want_pos)
+            self.assertIs(kwargs["main_hidden"], aux)
+            if ring is None:
+                locs = [req_to_token[2, p] for p in want_pos[:4]] + [
+                    req_to_token[0, p] for p in want_pos[4:]
+                ]
+                want = [int(full_to_swa[loc]) for loc in locs]
+            else:
+                want = [2 * ring + p % ring for p in want_pos[:4]] + [
+                    0 * ring + p % ring for p in want_pos[4:]
+                ]
+            self.assertEqual(kwargs["swa_loc"].tolist(), want)
 
 
 if __name__ == "__main__":

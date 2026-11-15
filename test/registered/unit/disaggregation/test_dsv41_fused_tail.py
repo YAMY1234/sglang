@@ -672,9 +672,12 @@ class TestTailStageAdmission(CustomTestCase):
                 req = _waiting_req(prompt_len, dsv41_late_fed=True)
             self.assertEqual(req.dsv41_tail_start, e)
             sched, running = _admit_sched([req], running_size=4)
+            sched._write_dsv41_tail_draft_kv = MagicMock()
             with envs.SGLANG_DSV41_FUSED_TAIL.override(True):
                 Mixin._admit_dsv41_fed_tails(sched, running)
             self.assertEqual(schedule_batch.init_new.call_args.args[0], [req])
+            # Its window's draft KV is written as it joins.
+            sched._write_dsv41_tail_draft_kv.assert_called_once_with([req])
             # Fed from e, which is also the KV it enters with (prepare_for_prebuilt).
             self.assertEqual((req.dsv41_feed_floor, req.dsv41_feed_next), (e, e))
             feed = _sched()

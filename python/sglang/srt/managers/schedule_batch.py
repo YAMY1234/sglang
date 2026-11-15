@@ -524,6 +524,8 @@ class Req(ReqDllmMixin):
         self.dsv41_prompt_len: Optional[int] = None
         self.dsv41_late_capture_start: Optional[int] = None
         self.dsv41_late_capture_slot: Optional[int] = None
+        # Decode: the staging slot the tail server's draft captures land in.
+        self.dsv41_tail_aux_slot: Optional[int] = None
         self.dllm_initialized: bool = False
 
         self.session = session

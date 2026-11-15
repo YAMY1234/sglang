@@ -63,6 +63,14 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
     HiCacheRestoreResult,
 )
+from sglang.srt.disaggregation.dsv41_tail_stage.layout import tail_swa_page_ids
+from sglang.srt.disaggregation.dsv41_tail_stage_decode import (
+    TAIL_AUX_ABORT_REST_STEPS,
+    TAIL_AUX_READ_REST_STEPS,
+    TAIL_AUX_SLOTS,
+    TailAuxStaging,
+    append_tail_stage_entries,
+)
 from sglang.srt.disaggregation.minimax import minimax_index_transfer_pages
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.utils import (
@@ -499,6 +507,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     _defer_publish: bool = False
     _async_publish_readback: bool = False
+    # SGLANG_DSV41_TAIL_STAGE with DSpark: where the tail server's draft captures land.
+    tail_aux: Optional[TailAuxStaging] = None
 
     def __init__(
         self,
@@ -868,6 +878,29 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             {name: tokens + window_reserved for name, tokens in windows.items()},
         )
 
+    def _append_tail_stage_entries(self, kv_args) -> None:
+        """SGLANG_DSV41_TAIL_STAGE: the tail server's entries after the prefill's,
+        and the staging its draft captures land in when this server drafts."""
+        config = self.scheduler.model_config
+        model = self.scheduler.tp_worker.model_runner.model
+        captures = getattr(model.model, "dspark_layers_to_capture", None)
+        if self.scheduler.spec_algorithm.is_dspark() and captures:
+            self.tail_aux = TailAuxStaging(
+                slots=TAIL_AUX_SLOTS,
+                window=config.sliding_window_size,
+                captures=len(captures),
+                hidden_size=config.hf_text_config.hidden_size,
+                dtype=self.scheduler.tp_worker.model_runner.dtype,
+                device=self.token_to_kv_pool.device,
+            )
+        boundary = max(config.hf_text_config.kv_source_layer_ids)
+        append_tail_stage_entries(
+            kv_args,
+            pool=self.token_to_kv_pool,
+            layer_ids=range(boundary, config.num_hidden_layers),
+            aux=self.tail_aux,
+        )
+
     def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
@@ -957,6 +990,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
             window_tails=storage.retained_window_lengths(),
         )
+        if dsv41_tail_stage_enabled():
+            self._append_tail_stage_entries(kv_args)
         if get_disagg().disaggregation_decode_host_receive_threshold < 1:
             pool = self.token_to_kv_pool
             group = self.tree_cache.host_pool_group
@@ -1821,6 +1856,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:
                 break
 
+            if (
+                self.tail_aux is not None
+                and decode_req.req.dsv41_late_fed
+                and decode_req.req.dsv41_tail_aux_slot is None
+                and not _is_fake_transfer(decode_req.req)
+            ):
+                # The tail server's draft captures land in this slot; no slot, no
+                # transfer yet.
+                slot = self.tail_aux.reserve(
+                    decode_req.req, step=self.scheduler.forward_ct
+                )
+                if slot is None:
+                    break
+                decode_req.req.dsv41_tail_aux_slot = slot
+
             if self.scheduler.enable_lora and not self.scheduler.can_schedule_lora_req(
                 decode_req.req, running_loras
             ):
@@ -2271,6 +2321,23 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         def _request_row_payload():
             return np.array([decode_req.req.kv.req_pool_idx], dtype=np.int32)
 
+        def _tail_swa_payload():
+            # The SWA pages of the window the tail server runs, [e - window, e).
+            req = decode_req.req
+            if not req.dsv41_late_fed:
+                return np.empty((0,), dtype=np.int32)
+            e = req.dsv41_tail_start
+            return tail_swa_page_ids(
+                self.token_to_kv_pool,
+                self.req_to_token_pool.req_to_token[req.kv.req_pool_idx],
+                start=e - self.scheduler.model_config.sliding_window_size,
+                end=e,
+            )
+
+        def _tail_aux_payload():
+            slot = decode_req.req.dsv41_tail_aux_slot
+            return np.array([] if slot is None else [slot], dtype=np.int32)
+
         if StateType.DSV4_REQUEST_STATE in state_types and isinstance(
             self.token_to_kv_pool, DeepSeekV4TokenToKVPool
         ):
@@ -2291,6 +2358,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             StateType.SWA_RING: _swa_ring_payload,
             StateType.DSV4_REQUEST_STATE: _request_state_payload,
             StateType.REQUEST_ROW: _request_row_payload,
+            StateType.DSV41_TAIL_SWA: _tail_swa_payload,
+            StateType.DSV41_TAIL_DRAFT_AUX: _tail_aux_payload,
             StateType.BLOCK_SCALE: _full_kv_pages_payload,
             StateType.BLOCK_SCALE_SWA: _swa_payload,
         }
@@ -4043,6 +4112,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self._unregister_staging_room(room)
         # release pre-allocated kv cache, but don't insert into the tree since it's failed
         self.scheduler.request_retirer.release(decode_req.req, checkpoint=False)
+        if dsv41_tail_stage_enabled():
+            # A write of the failed transfer may still land in its aux slot.
+            self.scheduler._release_dsv41_tail_aux(
+                decode_req.req, rest=TAIL_AUX_ABORT_REST_STEPS
+            )
         self.metadata_buffers.clear_slot(idx)
         self.req_to_metadata_buffer_idx_allocator.free(idx)
         if not self._is_host_destination(decode_req):
@@ -4390,6 +4464,8 @@ class SchedulerDisaggregationDecodeMixin:
             )
         # As a collocated prefill's, until the merge into the running batch.
         move(can_run_list, self.prefill_launched_reqs)
+        if dsv41_tail_stage_enabled():
+            self._write_dsv41_tail_draft_kv(can_run_list)
 
         storage = kv_storage_of(self.req_to_token_pool, self.token_to_kv_pool_allocator)
         for req in can_run_list:
@@ -4427,6 +4503,8 @@ class SchedulerDisaggregationDecodeMixin:
     ) -> NextBatchPlan:
         """Process prebuilt batch and schedule the next decode batch."""
         if dsv41_encoder_only_prefill_enabled():
+            if dsv41_tail_stage_enabled():
+                self._reclaim_dsv41_tail_aux()
             running_batch = self._merge_dsv41_tail_extend(running_batch)
             running_batch = self._admit_dsv41_fed_tails(running_batch)
             tail_batch = self._get_new_dsv41_tail_extend_batch(running_batch)
@@ -4530,6 +4608,8 @@ class SchedulerDisaggregationDecodeMixin:
             return running_batch
         # They run from here on, as a prebuilt batch's do.
         move(fed, self.running_reqs)
+        if dsv41_tail_stage_enabled():
+            self._write_dsv41_tail_draft_kv(fed)
 
         for req in fed:
             start = req.dsv41_tail_start
@@ -4574,11 +4654,59 @@ class SchedulerDisaggregationDecodeMixin:
             if dsv41_tail_stage_enabled():
                 steps = getattr(self, "dsv41_feed_slot_steps", 0)
                 logger.info(
-                    "SGLANG_DSV41_TAIL_STAGE: %d feed slot-steps so far, %.2f per fed tail",
+                    "SGLANG_DSV41_TAIL_STAGE: %d feed slot-steps so far, %.2f per fed "
+                    "tail; %d draft windows written from the tail stage",
                     steps,
                     steps / max(self.dsv41_fed_tail_ct, 1),
+                    getattr(self, "dsv41_tail_admit_ct", 0),
                 )
         return running_batch
+
+    def _tail_aux(self: Scheduler) -> Optional[TailAuxStaging]:
+        return self.disagg_decode_prealloc_queue.tail_aux
+
+    def _release_dsv41_tail_aux(self: Scheduler, req: Req, *, rest: int) -> None:
+        slot = req.dsv41_tail_aux_slot
+        if slot is not None:
+            self._tail_aux().release(slot, step=self.forward_ct, rest=rest)
+            req.dsv41_tail_aux_slot = None
+
+    def _reclaim_dsv41_tail_aux(self: Scheduler) -> None:
+        """SGLANG_DSV41_TAIL_STAGE: aux slots of requests aborted after their
+        transfer and before admission."""
+        aux = self._tail_aux()
+        if aux is None:
+            return
+        for req in aux.finished_holders():
+            self._release_dsv41_tail_aux(req, rest=TAIL_AUX_ABORT_REST_STEPS)
+
+    def _write_dsv41_tail_draft_kv(self: Scheduler, reqs: List[Req]) -> None:
+        """SGLANG_DSV41_TAIL_STAGE: the admitted late-fed requests' draft KV of their
+        window, from the tail server's captures, ordered before their first step on
+        the forward stream; each aux slot is free once that step has run."""
+        staged = [req for req in reqs if req.dsv41_tail_aux_slot is not None]
+        if not staged:
+            return
+        aux = self._tail_aux()
+        window = self.model_config.sliding_window_size
+        device = aux.buf.device
+        with self.forward_stream_ctx:
+            self.model_worker.write_tail_draft_kv(
+                req_pool_indices=async_h2d(
+                    [req.kv.req_pool_idx for req in staged],
+                    dtype=torch.int64,
+                    device=device,
+                ),
+                starts=async_h2d(
+                    [req.dsv41_tail_start - window for req in staged],
+                    dtype=torch.int64,
+                    device=device,
+                ),
+                aux=torch.cat([aux.rows(req.dsv41_tail_aux_slot) for req in staged]),
+            )
+        for req in staged:
+            self._release_dsv41_tail_aux(req, rest=TAIL_AUX_READ_REST_STEPS)
+        self.dsv41_tail_admit_ct = getattr(self, "dsv41_tail_admit_ct", 0) + len(staged)
 
     def _set_dsv41_feed_inputs(self: Scheduler, batch: ScheduleBatch) -> None:
         """Give this decode step's fed requests their next prompt tokens.
