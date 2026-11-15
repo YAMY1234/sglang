@@ -248,6 +248,7 @@ from sglang.srt.managers.schedule_batch import (
     retract_all,
 )
 from sglang.srt.managers.schedule_policy import (
+    CLIP_MAX_NEW_TOKENS,
     AddReqResult,
     PrefillAdder,
     SchedulePolicy,
@@ -510,6 +511,13 @@ def _short_reserve_chunk_limit(chunked_req, waiting_queue, budget, page_size):
     if not reserved:
         return None
     return (budget - reserved) // page_size * page_size
+
+
+def _chunk_tail_hold(req, ceil_paged, start):
+    """KV the first-chunk check promised `req` past `start`: paged tokens plus clipped max_new."""
+    return ceil_paged(len(req.full_untruncated_fill_ids) - start) + min(
+        req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
+    )
 
 
 class Scheduler(
@@ -4544,11 +4552,23 @@ class Scheduler(
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
             if _SHORT_RESERVE > 0 and get_schedule().schedule_policy == "fcfs":
-                adder.chunked_req_limit = _short_reserve_chunk_limit(
-                    self.chunked_req,
-                    self.waiting_queue,
-                    adder.rem_chunk_tokens or 0,
-                    self.page_size,
+                # Shrink only when free KV covers the whole remaining request plus the reserve.
+                fits = adder.memory_budget.remaining_total >= _SHORT_RESERVE + (
+                    _chunk_tail_hold(
+                        self.chunked_req,
+                        adder.ceil_paged_tokens,
+                        self.chunked_req.prefix_len,
+                    )
+                )
+                adder.chunked_req_limit = (
+                    _short_reserve_chunk_limit(
+                        self.chunked_req,
+                        self.waiting_queue,
+                        adder.rem_chunk_tokens or 0,
+                        self.page_size,
+                    )
+                    if fits
+                    else None
                 )
             else:
                 adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
@@ -4558,6 +4578,12 @@ class Scheduler(
                     self.page_size,
                 )
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            if _SHORT_RESERVE > 0 and self.chunked_req is not None:
+                # Stock admits nothing behind a non-final chunk, which keeps the KV its
+                # first-chunk check promised; hold that tail so shorts cannot take it.
+                adder.memory_budget.total_offset += _chunk_tail_hold(
+                    self.chunked_req, adder.ceil_paged_tokens, self.chunked_req.extend_end
+                )
 
         if self.enable_lora:
             running_reqs = running_batch.reqs
