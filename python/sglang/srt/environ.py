@@ -341,6 +341,9 @@ class Envs:
     SGLANG_OPT_HICACHE_GROUPED_DEVICE_FREES = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # HiCache write-back eviction demotes without a host wait for the copies: the
+    # streams that next touch the freed pages or their host copies wait on them. Opt-in.
+    SGLANG_OPT_HICACHE_WRITE_BACK_ORDERED_DEMOTE = EnvRuntimeBool(False)
     # Host-only Mamba checkpoint of a running request: read whether its ping-pong
     # tracking slot is empty from the host-side flag instead of the device tensor,
     # which would wait behind the in-flight forward. Same decision. Opt-in.
