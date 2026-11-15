@@ -1672,9 +1672,9 @@ class PrefillAdder:
                 return AddReqResult.OTHER
             max_new_tokens = 0
         elif chunk_tokens_limit is not None and chunk_fit_tokens > chunk_tokens_limit:
-            if (
-                has_chunked_req
-                and get_schedule().schedule_policy == "shortest-prefill-first"
+            if has_chunked_req and (
+                get_schedule().schedule_policy == "shortest-prefill-first"
+                or int(os.environ.get("SGLANG_PREFILL_SHORT_RESERVE_TOKENS", "0")) > 0
             ):
                 # Only one unfinished chunked request can be tracked.
                 return AddReqResult.OTHER

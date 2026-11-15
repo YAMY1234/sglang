@@ -491,6 +491,27 @@ _is_npu = is_npu()
 _is_hip = is_hip()
 
 
+_SHORT_RESERVE = int(os.environ.get("SGLANG_PREFILL_SHORT_RESERVE_TOKENS", "0"))
+
+
+def _short_reserve_chunk_limit(chunked_req, waiting_queue, budget, page_size):
+    """Cap the resumed chunk to leave room for waiting requests that fit whole (queue order,
+    shorter than the chunk's remaining work), at most _SHORT_RESERVE tokens; None = no cap."""
+    if budget < 2 * page_size:
+        return None
+    remaining = len(chunked_req.full_untruncated_fill_ids) - chunked_req.prefix_len
+    room = min(_SHORT_RESERVE, budget - page_size)
+    reserved = 0
+    for req in waiting_queue:
+        work = SchedulePolicy._shortest_prefill_work(req)
+        charge = -(-work // page_size) * page_size
+        if work < remaining and reserved + charge <= room:
+            reserved += charge
+    if not reserved:
+        return None
+    return (budget - reserved) // page_size * page_size
+
+
 class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
@@ -4522,12 +4543,20 @@ class Scheduler(
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
-            adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
-                self.chunked_req,
-                self.waiting_queue,
-                adder.rem_chunk_tokens or 0,
-                self.page_size,
-            )
+            if _SHORT_RESERVE > 0 and get_schedule().schedule_policy == "fcfs":
+                adder.chunked_req_limit = _short_reserve_chunk_limit(
+                    self.chunked_req,
+                    self.waiting_queue,
+                    adder.rem_chunk_tokens or 0,
+                    self.page_size,
+                )
+            else:
+                adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
+                    self.chunked_req,
+                    self.waiting_queue,
+                    adder.rem_chunk_tokens or 0,
+                    self.page_size,
+                )
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
@@ -4632,6 +4661,25 @@ class Scheduler(
                 req.time_stats.observe_storage_staging_ready(staging_ready)
                 if not staging_ready:
                     continue
+            if (
+                _SHORT_RESERVE > 0
+                and self.chunked_req is not None
+                and adder.ceil_paged_tokens(
+                    len(req.full_untruncated_fill_ids)
+                    - req.prefix_len
+                    - req.host_hit_length
+                )
+                > (adder.rem_chunk_tokens or 0)
+            ):
+                # A chunk is in flight, so a request that cannot fit whole waits;
+                # later, shorter ones may still use the reserve.
+                req.kv.mamba_cow_src_index = None
+                req.kv.mamba_needs_clear = False
+                if req.kv.holds_mamba and not getattr(req, "session", None):
+                    kv_storage_of(
+                        self.req_to_token_pool, self.token_to_kv_pool_allocator
+                    ).release_state_slot(req)
+                continue
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
