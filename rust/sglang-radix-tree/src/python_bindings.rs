@@ -2199,6 +2199,25 @@ macro_rules! tree_core_methods {
                 })
             }
 
+            /// Free a device-resident node's Full host copy that the external store
+            /// also holds; not released while a copy, load-back or lock needs it.
+            fn release_host_value(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<DropSubtreeResultBinding> {
+                let (dropped, result) = py
+                    .detach(move || self.core().release_host_value(node_id))
+                    .map_err(node_access_error)?;
+                Ok(DropSubtreeResultBinding {
+                    dropped,
+                    tracker: tracker_to_py(result.tracker),
+                    new_device_frees: frees_to_py(py, result.device_frees)?,
+                    new_host_frees: frees_to_py(py, result.host_frees)?,
+                    cache_actions: cache_actions_to_py(py, result.cache_actions)?,
+                })
+            }
+
             /// Mark the nodes one write-through backup covers; returns them ancestors first.
             fn mark_write_through_pending(
                 &self,
@@ -3502,6 +3521,16 @@ macro_rules! tree_core_binding {
                 node_id: NodeId,
             ) -> PyResult<DropSubtreeResultBinding> {
                 catch_native_panic(|| self.inner.drop_subtree_no_host(py, node_id))
+            }
+
+            /// Free a device-resident node's Full host copy that the external store
+            /// also holds; not released while a copy, load-back or lock needs it.
+            fn release_host_value(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<DropSubtreeResultBinding> {
+                catch_native_panic(|| self.inner.release_host_value(py, node_id))
             }
 
             /// Mark the nodes one write-through backup covers; returns them ancestors first.

@@ -1824,7 +1824,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 && node.hit_count >= self.write_through_threshold;
         }
 
-        self.enable_hicache && !node.backuped() && node.hit_count >= self.write_through_threshold
+        // A node restored from the external store keeps its copy there, not on host.
+        self.enable_hicache
+            && !node.backuped()
+            && !node.external_cache_stored
+            && node.hit_count >= self.write_through_threshold
     }
 
     /// Insert device values to the tree per the provided key.
@@ -2964,7 +2968,16 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             return Ok((Some(backup), result));
         }
 
-        // Write-through: node has no backup, delete entirely.
+        // Write-through: node has no backup, delete entirely. Below a node whose
+        // host copy was released (it is in the external store) a later turn's
+        // backed child can be host-only; it goes with the node. A host lock (a
+        // storage prefetch anchored here), or a lock or copy below, defers it.
+        if self.arena.node(node_id).is_host_locked()
+            || !self.drop_host_only_descendants_(node_id, &mut result)
+        {
+            result.unbacked_tokens = self.tracked_unbacked_tokens.take().unwrap();
+            return Ok((None, result));
+        }
         self.delete_unbacked_device_leaf_(
             node_id,
             &mut result.tracker,
@@ -2974,6 +2987,81 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         );
         result.unbacked_tokens = self.tracked_unbacked_tokens.take().unwrap();
         Ok((None, result))
+    }
+
+    /// Free a device-resident node's Full host copy, keeping its device KV;
+    /// for a node the external store also holds. Declines (false) while a copy,
+    /// a load-back or a host lock still needs the host copy.
+    pub fn release_host_value(
+        &mut self,
+        node_id: NodeId,
+    ) -> Result<(bool, EvictionStepResult), NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
+        let mut result = EvictionStepResult::default();
+        if !self.can_reclaim_coexisting_host_value_(node_id, FULL) {
+            return Ok((false, result));
+        }
+        self.release_coexisting_host_value_(
+            node_id,
+            FULL,
+            &mut result.tracker,
+            &mut result.device_frees,
+            &mut result.host_frees,
+            &mut result.cache_actions,
+        );
+        self.full_coexisting_host_nodes.discard(node_id);
+        Ok((true, result))
+    }
+
+    /// Free the host-only subtree below a D-leaf, deepest first; false, with
+    /// nothing freed, when a node in it is locked or has a copy in flight.
+    fn drop_host_only_descendants_(
+        &mut self,
+        node_id: NodeIdx_,
+        result: &mut EvictionStepResult,
+    ) -> bool {
+        let mut descendants: Vec<NodeIdx_> = Vec::new();
+        let mut stack: Vec<NodeIdx_> = self
+            .arena
+            .node(node_id)
+            .children
+            .values()
+            .copied()
+            .collect();
+        while let Some(cur_id) = stack.pop() {
+            let cur = self.arena.node(cur_id);
+            if cur.is_device_locked()
+                || cur.is_host_locked()
+                || cur.write_through_pending_id.is_some()
+                || cur.is_load_back_pending()
+            {
+                return false;
+            }
+            descendants.push(cur_id);
+            stack.extend(cur.children.values().copied());
+        }
+        for &desc_id in descendants.iter().rev() {
+            {
+                let desc = self.arena.node(desc_id);
+                // Host-only by construction: a device descendant would contradict
+                // this node being a D-leaf, and D-leaves evict before ancestors.
+                assert!(
+                    desc.evicted() && desc.backuped(),
+                    "node {desc_id} not host-only"
+                );
+                assert!(desc.write_through_pending_id.is_none());
+            }
+            self.release_all_component_layers_(
+                desc_id,
+                StorageMedium::Cpu,
+                &mut result.tracker,
+                &mut result.device_frees,
+                &mut result.host_frees,
+                &mut result.cache_actions,
+            );
+            self.remove_leaf_from_parent_(desc_id);
+        }
+        true
     }
 
     /// Write-back fallback when a D-leaf's D->H backup fails under host
@@ -2999,46 +3087,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 return Ok((false, result));
             }
         }
-        let mut descendants: Vec<NodeIdx_> = Vec::new();
-        let mut stack: Vec<NodeIdx_> = self
-            .arena
-            .node(node_id)
-            .children
-            .values()
-            .copied()
-            .collect();
-        while let Some(cur_id) = stack.pop() {
-            let cur = self.arena.node(cur_id);
-            if cur.is_device_locked()
-                || cur.is_host_locked()
-                || cur.write_through_pending_id.is_some()
-                || cur.is_load_back_pending()
-            {
-                return Ok((false, result));
-            }
-            descendants.push(cur_id);
-            stack.extend(cur.children.values().copied());
-        }
-        for &desc_id in descendants.iter().rev() {
-            {
-                let desc = self.arena.node(desc_id);
-                // Host-only by construction: a device descendant would contradict
-                // this node being a D-leaf, and D-leaves evict before ancestors.
-                assert!(
-                    desc.evicted() && desc.backuped(),
-                    "node {desc_id} not host-only"
-                );
-                assert!(desc.write_through_pending_id.is_none());
-            }
-            self.release_all_component_layers_(
-                desc_id,
-                StorageMedium::Cpu,
-                &mut result.tracker,
-                &mut result.device_frees,
-                &mut result.host_frees,
-                &mut result.cache_actions,
-            );
-            self.remove_leaf_from_parent_(desc_id);
+        if !self.drop_host_only_descendants_(node_id, &mut result) {
+            return Ok((false, result));
         }
         self.delete_unbacked_device_leaf_(
             node_id,
@@ -4144,10 +4194,14 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
         // Under write-through, a host-only suffix below a device-only parent
         // would violate the invariant that a backed-up child has a backed-up
-        // parent. Keep any split actions produced by the walk, but do not
-        // materialize the suffix.
+        // parent (or one the external store holds). Keep any split actions
+        // produced by the walk, but do not materialize the suffix.
         let parent = self.arena.node(node_id);
-        if !self.is_write_back && !parent.is_root() && !parent.backuped() {
+        if !self.is_write_back
+            && !parent.is_root()
+            && !parent.backuped()
+            && !parent.external_cache_stored
+        {
             result.host_insert_dropped = true;
             return Ok(result);
         }
@@ -5447,7 +5501,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                         "node {node_id} device present but parent {parent_id} evicted"
                     ));
                 }
-                if full_hst && !parent.has_host_value(FULL) && !self.is_write_back {
+                if full_hst
+                    && !parent.has_host_value(FULL)
+                    && !self.is_write_back
+                    && !parent.external_cache_stored
+                {
                     errors.push(format!(
                         "node {node_id} backed up but parent {parent_id} not backed up"
                     ));

@@ -3701,6 +3701,7 @@ class Scheduler(
             if (
                 tree_cache.is_backuped(last_host_node)
                 or tree_cache.is_root(last_host_node)
+                or tree_cache.is_storage_backed(last_host_node)
                 or (
                     buffer_mode
                     and tree_cache.get_last_hash_value(last_host_node) is not None

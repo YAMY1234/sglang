@@ -2368,6 +2368,127 @@ def test_write_back_eviction_backs_up_then_drop_subtree_falls_back():
     core.sanity_check([], [])
 
 
+def _unbacked_parent_with_host_only_child(backend):
+    """Write-through tree: parent [1, 2] on device with no host copy (its copy
+    is in the external store), child [3, 4] backed up and demoted to host."""
+    core = _tree_core(backend)
+    core.set_hicache_enabled()
+    parent = _insert(core, [1, 2], [10, 11]).last_device_node
+    leaf = _insert(core, [1, 2, 3, 4], [10, 11, 12, 13]).last_device_node
+    core.commit_backup(leaf, torch.tensor([100, 101], dtype=torch.int64), {})
+    _accumulate_step(core.demote(leaf), {}, {}, {})
+    core.mark_external_cache_stored_path(parent, core.root_node_handle(None))
+    return core, parent, leaf
+
+
+@pytest.mark.parametrize("backend", ["rust", "python"])
+def test_write_through_evicts_unbacked_parent_with_its_host_only_subtree(backend):
+    """Evicting an unbacked write-through D-leaf whose child is host-only must
+    drop the child with it (the Rust core used to panic freeing a non-leaf)."""
+    core, parent, _ = _unbacked_parent_with_host_only_child(backend)
+    tracker = {ComponentType.FULL: 0}
+    device_frees, host_frees = {}, {}
+    step = core.evict_device_leaf(parent, is_write_back=False)
+    _accumulate_step(step, tracker, device_frees, host_frees)
+    assert [t.tolist() for t in device_frees[ComponentType.FULL]] == [[10, 11]]
+    assert [t.tolist() for t in host_frees[ComponentType.FULL]] == [[100, 101]]
+    result = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3, 4])))
+    assert result.device_prefix_len == 0 and core.is_root(result.best_match_node)
+    core.sanity_check([], [])
+
+
+@pytest.mark.parametrize("backend", ["rust", "python"])
+def test_write_through_eviction_waits_for_a_locked_host_only_child(backend):
+    core, parent, leaf = _unbacked_parent_with_host_only_child(backend)
+    host_lock = core.inc_host_lock_ref(leaf)
+    step = core.evict_device_leaf(parent, is_write_back=False)
+    device_frees, host_frees = {}, {}
+    _accumulate_step(step, {}, device_frees, host_frees)
+    assert device_frees == {} and host_frees == {}
+    assert core.match_prefix(MatchPrefixParams(key=_key([1, 2]))).device_prefix_len == 2
+    core.dec_host_lock_ref(leaf, host_lock.to_dec_params())
+    _accumulate_step(
+        core.evict_device_leaf(parent, is_write_back=False),
+        {},
+        device_frees,
+        host_frees,
+    )
+    assert [t.tolist() for t in host_frees[ComponentType.FULL]] == [[100, 101]]
+    core.sanity_check([], [])
+
+
+@pytest.mark.parametrize("backend", ["rust", "python"])
+def test_prefetch_anchor_lock_pins_a_device_only_stored_node(backend):
+    """A storage prefetch anchored at a device-only node the external store
+    holds must keep the anchor until the fetched span is inserted under it."""
+    core, parent, _ = _unbacked_parent_with_host_only_child(backend)
+    anchor_lock = core.inc_host_lock_ref(parent)
+    device_frees, host_frees = {}, {}
+    step = core.evict_device_leaf(parent, is_write_back=False)
+    _accumulate_step(step, {}, device_frees, host_frees)
+    assert device_frees == {} and host_frees == {}
+    core.dec_host_lock_ref(parent, anchor_lock.to_dec_params())
+    core.sanity_check([], [])
+
+
+@pytest.mark.parametrize("backend", ["rust", "python"])
+def test_storage_refill_lands_under_an_externally_stored_parent(backend):
+    """Write-through drops a host refill under an unbacked parent, but not
+    under one the external store holds: a prefetch may anchor there."""
+    core = _tree_core(backend)
+    core.set_hicache_enabled()
+    parent = _insert(core, [1, 2], [10, 11]).last_device_node
+    refill = dict(
+        key=_key([3, 4]), host_value=torch.tensor([100, 101]), hash_value=["h3", "h4"]
+    )
+    assert core.insert_host(parent, **refill).host_insert_dropped
+    core.mark_external_cache_stored_path(parent, core.root_node_handle(None))
+    inserted = core.insert_host(parent, **refill)
+    assert not inserted.host_insert_dropped and inserted.inserted_host_node is not None
+    result = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3, 4])))
+    assert (
+        result.device_prefix_len == 2
+        and result.best_match_node == inserted.inserted_host_node
+    )
+    core.sanity_check([], [])
+
+
+@pytest.mark.parametrize("backend", ["rust", "python"])
+def test_release_host_value_frees_only_the_host_copy(backend):
+    core = _tree_core(backend)
+    core.set_hicache_enabled()
+    node = _insert(core, [5, 6], [20, 21]).last_device_node
+    core.commit_backup(node, torch.tensor([200, 201], dtype=torch.int64), {})
+    host_lock = core.inc_host_lock_ref(node)
+    declined = core.release_host_value(node)
+    assert (
+        not declined.is_released
+        and declined.host_frees.get(ComponentType.FULL, []) == []
+    )
+    core.dec_host_lock_ref(node, host_lock.to_dec_params())
+    host_frees = {}
+    released = core.release_host_value(node)
+    assert released.is_released
+    _accumulate_step(released, {}, {}, host_frees)
+    assert [t.tolist() for t in host_frees[ComponentType.FULL]] == [[200, 201]]
+    assert not core.is_backuped(node)
+    assert core.match_prefix(MatchPrefixParams(key=_key([5, 6]))).device_prefix_len == 2
+    core.sanity_check([], [])
+
+
+@pytest.mark.parametrize("backend", ["rust", "python"])
+def test_externally_stored_node_earns_no_write_through_backup(backend):
+    core = _tree_core(backend)
+    core.set_hicache_enabled()
+    core.write_through_threshold = 1
+    stored = _insert(core, [7, 8], [30, 31]).last_device_node
+    core.mark_external_cache_stored_path(stored, core.root_node_handle(None))
+    assert core.is_external_cache_stored(stored)
+    inserted = _insert(core, [7, 8, 9], [30, 31, 32])
+    backups = [a for a in inserted.cache_actions if isinstance(a, BackupKV)]
+    assert backups == [BackupKV([inserted.last_device_node])]
+
+
 # ==== SWA wiring ====
 
 

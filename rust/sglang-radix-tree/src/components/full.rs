@@ -296,8 +296,13 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
     ) -> IncLockRefResult {
         // Only the last host node needs to be protected.
         if lock_host {
-            // write_back mode: the anchor may be device-only (no host_value); pin it anyway.
-            if !tree_core.arena.node(node_id).has_host_value(FULL) && !tree_core.is_write_back {
+            // write_back mode, or a node the external store holds: the anchor may
+            // be device-only (no host_value); pin it anyway.
+            let node = tree_core.arena.node(node_id);
+            if !node.has_host_value(FULL)
+                && !tree_core.is_write_back
+                && !node.external_cache_stored
+            {
                 return result;
             }
             let boundary_uuid = self.get_or_fill_uuid(tree_core, node_id, lock_host);

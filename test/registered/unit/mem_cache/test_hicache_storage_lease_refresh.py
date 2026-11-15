@@ -51,8 +51,9 @@ class FakeStopEvent:
 
 def _refresher(clock, *, interval_s=60.0, max_keys_per_s=0, renew=None, **kwargs):
     return StorageLeaseRefresher(
-        build_keys=lambda pages: [f"{p}_c1" for p in pages]
-        + [f"{p}_c2" for p in pages],
+        build_keys=lambda pages: (
+            [f"{p}_c1" for p in pages] + [f"{p}_c2" for p in pages]
+        ),
         renew=renew or (lambda keys: [1] * len(keys)),
         interval_s=interval_s,
         max_keys_per_s=max_keys_per_s,

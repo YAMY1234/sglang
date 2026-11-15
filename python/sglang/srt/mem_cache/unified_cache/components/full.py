@@ -290,8 +290,13 @@ class FullComponent(TreeComponent):
         # Only the last host node needs to be protected.
         if lock_host:
             cd = node.component_data[ct]
-            # write_back mode: the anchor may be device-only (no host_value); pin it anyway.
-            if cd.host_value is None and not self.tree_core.is_write_back:
+            # write_back mode, or a node the external store holds: the anchor may
+            # be device-only (no host_value); pin it anyway.
+            if (
+                cd.host_value is None
+                and not self.tree_core.is_write_back
+                and not node.external_cache_stored
+            ):
                 return result
             if cd.metadata.get("host_uuid") is None:
                 cd.metadata["host_uuid"] = next_component_uuid(ct)

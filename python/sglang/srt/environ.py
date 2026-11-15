@@ -926,6 +926,9 @@ class Envs:
     SGLANG_HICACHE_STORAGE_LEASE_REFRESH_INTERVAL = EnvFloat(0.0)
     # Cap on the lease refresh existence queries, in object keys per second.
     SGLANG_HICACHE_STORAGE_LEASE_REFRESH_MAX_KEYS_PER_S = EnvInt(100000)
+    # Write-through with storage: a span fetched from L3 keeps no L2 copy once
+    # loaded to the device, and is never written back to host (L3 holds it).
+    SGLANG_HICACHE_STORAGE_HIT_SKIP_L2 = EnvBool(False)
     # Buffer mode: store only the SWA window ending at each node (what a
     # prefetch ending there restores) instead of every SWA page.
     SGLANG_ENABLE_HICACHE_SWA_TAIL_ONLY_BACKUP = EnvBool(False)

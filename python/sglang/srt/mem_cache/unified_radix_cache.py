@@ -390,6 +390,11 @@ class UnifiedRadixCache(BasePrefixCache):
         # The backend the refresher was built for (None = not decided yet).
         self._lease_refresh_backend: object = None
         self._lease_refresher: Optional[StorageLeaseRefresher] = None
+        self.storage_hit_skip_l2 = envs.SGLANG_HICACHE_STORAGE_HIT_SKIP_L2.get()
+        # Load-back anchor -> the loaded nodes whose L2 copy goes at its ack.
+        self._skip_l2_after_load_back: dict[NodeId, list[NodeId]] = {}
+        self._skip_l2_released_tokens = 0
+        self._skip_l2_next_log = 0.0
         # Cumulative prefetch-outcome counters, exported through the
         # log_storage_metrics flow.
         self._prefetch_outcome_stats: dict[str, float] = {
@@ -637,6 +642,22 @@ class UnifiedRadixCache(BasePrefixCache):
         self.write_through_threshold = (
             1 if get_memory().hicache_write_policy == "write_through" else 2
         )
+        if self.storage_hit_skip_l2:
+            if (
+                self.host_memory_mode != "cache"
+                or get_memory().hicache_write_policy != "write_through"
+                or storage_backend is None
+            ):
+                logger.warning(
+                    "SGLANG_HICACHE_STORAGE_HIT_SKIP_L2 needs cache-mode write_through "
+                    "HiCache with a storage backend; it is off"
+                )
+                self.storage_hit_skip_l2 = False
+            else:
+                logger.info(
+                    "HiCache storage hits skip L2: a span loaded from L3 frees its "
+                    "L2 copy once it is on the device"
+                )
         self.is_write_back = (
             self.cache_controller is not None
             and self.cache_controller.write_policy == "write_back"
@@ -2437,6 +2458,14 @@ class UnifiedRadixCache(BasePrefixCache):
                 pending.append(receipt)
         else:
             self.ongoing_load_back[node_id] = receipt
+            if self.storage_hit_skip_l2:
+                stored = [
+                    loaded
+                    for loaded in kv_xfer.nodes_to_load or ()
+                    if self.tree_core.is_external_cache_stored(loaded)
+                ]
+                if stored:
+                    self._skip_l2_after_load_back[node_id] = stored
 
         return True
 
@@ -2570,6 +2599,26 @@ class UnifiedRadixCache(BasePrefixCache):
             page_hashes.extend(hashes)
         if page_hashes:
             refresher.submit(renewed, stamp, page_hashes)
+
+    def is_storage_backed(self, node: NodeId) -> bool:
+        return self.storage_hit_skip_l2 and self.tree_core.is_external_cache_stored(
+            node
+        )
+
+    def _release_l2_copy(self, node_id: NodeId) -> None:
+        """Free the L2 copy of a span loaded from L3, which keeps it; declined
+        while a copy, load-back or lock still needs it."""
+        result = self.tree_core.release_host_value(node_id)
+        released = sum(len(t) for t in result.host_frees.get(BASE_COMPONENT_TYPE, ()))
+        self._apply_eviction_result(result)
+        self._skip_l2_released_tokens += released
+        now = time.monotonic()
+        if released and now >= self._skip_l2_next_log:
+            logger.info(
+                "HiCache storage hits skip L2: %d L2 tokens released so far",
+                self._skip_l2_released_tokens,
+            )
+            self._skip_l2_next_log = now + 60.0
 
     def _storage_lease_refresher(self) -> Optional[StorageLeaseRefresher]:
         """The refresher for the attached backend, rebuilt after a re-attach."""
@@ -3116,6 +3165,13 @@ class UnifiedRadixCache(BasePrefixCache):
             self._apply_cache_actions(commit_actions)
             # The commit emits via commit_actions only; the walk's were applied above.
             assert not insert_result.cache_actions
+            if (
+                self.storage_hit_skip_l2
+                and insert_result.inserted_host_node is not None
+            ):
+                self.tree_core.mark_external_cache_stored_path(
+                    insert_result.inserted_host_node, last_host_node_id
+                )
 
             self.cache_controller.mem_pool_host.free(
                 host_indices[: insert_result.prefix_len]
@@ -4331,6 +4387,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.dec_host_lock_ref(node, host_lock_params)
                 # Unpin the loaded nodes; host copies stay as reclaimable duplicates.
                 self.tree_core.finish_load_back(node)
+                for loaded in self._skip_l2_after_load_back.pop(node, ()):
+                    self._release_l2_copy(loaded)
 
             if self.metrics_collector is not None:
                 for pool, num_tokens in (ack.num_tokens_by_pool or {}).items():
