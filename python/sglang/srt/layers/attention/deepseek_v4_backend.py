@@ -75,7 +75,6 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.layers.attention.dsv4.late_tail_capture import (
-    LATE_TAIL_CAPTURE_SLOTS,
     LateTailCapture,
 )
 from sglang.srt.layers.attention.dsv4.metadata import (
@@ -2502,7 +2501,7 @@ class DeepseekV4AttnBackend(
             return None
         config = model_runner.model_config.hf_text_config
         return LateTailCapture(
-            slots=LATE_TAIL_CAPTURE_SLOTS,
+            slots=envs.SGLANG_DSV41_TAIL_STAGE_CAPTURE_SLOTS.get(),
             window=SWA_WINDOW,
             num_req_rows=self.req_to_token.shape[0],
             hc_mult=config.hc_mult,

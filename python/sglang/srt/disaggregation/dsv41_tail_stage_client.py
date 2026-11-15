@@ -561,8 +561,10 @@ class ZmqDealer:
         self._sock = self._ctx.socket(zmq.DEALER)
         self._sock.setsockopt(zmq.IDENTITY, identity.encode())
         self._sock.setsockopt(zmq.LINGER, 0)
-        # Messages queue until the tail server is up; none may be dropped.
+        # Messages queue until the tail server is up, and grants queue while the
+        # scheduler is stalled; none may be dropped.
         self._sock.setsockopt(zmq.SNDHWM, 0)
+        self._sock.setsockopt(zmq.RCVHWM, 0)
         self._sock.connect(f"tcp://{addr}")
 
     def send(self, data: bytes) -> None:

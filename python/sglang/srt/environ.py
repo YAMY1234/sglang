@@ -2132,6 +2132,12 @@ class Envs:
     # Prefill: slot writes in flight at once, and Mooncake batches per write.
     SGLANG_DSV41_TAIL_STAGE_WRITE_ROOMS = EnvInt(4)
     SGLANG_DSV41_TAIL_STAGE_WRITE_PARTS = EnvInt(8)
+    # Prefill: late-fed requests a rank holds from bootstrap to the end of their slot
+    # write (5.24 MB each); bootstrap waits when all are taken.
+    SGLANG_DSV41_TAIL_STAGE_CAPTURE_SLOTS = EnvInt(64)
+    # Decode: late-fed transfers a rank holds draft captures for, from pre-allocation
+    # to admission (3.9 MB each at window 128); pre-allocation waits when all are taken.
+    SGLANG_DSV41_TAIL_STAGE_DECODE_AUX_SLOTS = EnvInt(64)
     # The tail server (--dsv41-tail-stage-server): its ROUTER port (0 serves nothing)
     # and the address it registers with each prefill's bootstrap server.
     SGLANG_DSV41_TAIL_STAGE_PORT = EnvInt(0)

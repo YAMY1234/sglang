@@ -209,7 +209,9 @@ class TestForcedRowFill(CustomTestCase):
         got, want = self._both(logits, forced)
         self._assert_bitwise(got, want)
 
-    @unittest.skipUnless(torch.cuda.is_available(), "the forced-row fill is a CUDA kernel")
+    @unittest.skipUnless(
+        torch.cuda.is_available(), "the forced-row fill is a CUDA kernel"
+    )
     def test_matches_the_masked_fill_on_random_inputs(self):
         gen = torch.Generator(device="cuda").manual_seed(0)
         for dtype in (torch.bfloat16, torch.float32):
@@ -222,7 +224,10 @@ class TestForcedRowFill(CustomTestCase):
                 (1, 4, "all", 0, 64),
             ):
                 buf = torch.randn(
-                    bs * width + pad_rows, self.VOCAB + pad_cols, generator=gen, device="cuda"
+                    bs * width + pad_rows,
+                    self.VOCAB + pad_cols,
+                    generator=gen,
+                    device="cuda",
                 ).to(dtype)
                 buf[0, :8] = torch.tensor(
                     [float("nan"), float("inf"), float("-inf"), -0.0, 0.0, 1, 2, 3]
@@ -234,7 +239,9 @@ class TestForcedRowFill(CustomTestCase):
                 self._assert_bitwise(got, want)
                 self._assert_bitwise(buf[:, self.VOCAB :], padding)
 
-    @unittest.skipUnless(torch.cuda.is_available(), "the forced-row fill is a CUDA kernel")
+    @unittest.skipUnless(
+        torch.cuda.is_available(), "the forced-row fill is a CUDA kernel"
+    )
     def test_draft_rows_shard_and_column_slice(self):
         gen = torch.Generator(device="cuda").manual_seed(1)
         bs, gamma, shard = 64, 3, 32320
@@ -244,7 +251,9 @@ class TestForcedRowFill(CustomTestCase):
             view = draft[:bs].view(bs * gamma, shard)
             got, want = self._both(view, forced[:, :gamma], vocab_start=start)
             self._assert_bitwise(got, want)
-            self.assertTrue(torch.isneginf(view[forced[:, :gamma].reshape(-1) >= 0]).any())
+            self.assertTrue(
+                torch.isneginf(view[forced[:, :gamma].reshape(-1) >= 0]).any()
+            )
 
 
 class TestFeedKeepsItsWindow(CustomTestCase):
@@ -594,6 +603,7 @@ def _admit_sched(
         spec_algorithm=None,
         ngram_embedding_manager=MagicMock(),
         future_map=MagicMock(),
+        disagg_decode_prealloc_queue=SimpleNamespace(tail_aux_waits=0),
     ), running
 
 

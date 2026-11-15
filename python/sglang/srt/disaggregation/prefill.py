@@ -349,6 +349,8 @@ class PrefillBootstrapQueue:
                     "supported by Mooncake."
                 )
         self.kv_manager = self._init_kv_manager()
+        # Bootstrap passes that waited for a late-tail capture slot.
+        self.capture_waits = 0
         self.tail_stage: Optional[TailStageClient] = (
             self._init_tail_stage_client() if dsv41_tail_stage_enabled() else None
         )
@@ -644,6 +646,7 @@ class PrefillBootstrapQueue:
             # The window's late-layer input ships from this slot; wait for one.
             slot = self.scheduler._dsv41_late_capture().take()
             if slot is None:
+                self.capture_waits += 1
                 return False
             req.dsv41_late_capture_slot = slot
 
@@ -918,8 +921,10 @@ class SchedulerDisaggregationPrefillMixin:
         if now - getattr(self, "dsv41_tail_pushed_log_t", -1e9) > 5:
             self.dsv41_tail_pushed_log_t = now
             logger.info(
-                "SGLANG_DSV41_TAIL_STAGE: %d tails written to the tail stage so far",
+                "SGLANG_DSV41_TAIL_STAGE: %d tails written to the tail stage so far; "
+                "%d bootstrap passes waited for a capture slot",
                 client.tails_pushed,
+                self.disagg_prefill_bootstrap_queue.capture_waits,
             )
         return False
 

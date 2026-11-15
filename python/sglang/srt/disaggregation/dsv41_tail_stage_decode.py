@@ -19,9 +19,6 @@ from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.dsv41_tail_stage.layout import tail_swa_buf_infos
 from sglang.srt.disaggregation.utils import append_state_component
 
-# Arbitrary: late-fed transfers a decode rank holds draft captures for (3.9 MB each at
-# window 128); pre-allocation waits when all are taken.
-TAIL_AUX_SLOTS = 64
 # Arbitrary: forward steps (about 10 s at 16 ms) before a slot an aborted transfer may
 # still write is reused.
 TAIL_AUX_ABORT_REST_STEPS = 600

@@ -10,10 +10,6 @@ from typing import Dict, Optional
 
 import torch
 
-# Arbitrary: late-fed requests a prefill rank holds from bootstrap to the end of their
-# transfer; bootstrap waits when all are taken.
-LATE_TAIL_CAPTURE_SLOTS = 64
-
 
 class LateTailCapture:
     def __init__(

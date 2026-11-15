@@ -437,6 +437,7 @@ def _granted_queue(client, *, late_fed=True):
     queue = SimpleNamespace(
         tail_stage=client,
         kv_manager=MagicMock(),
+        capture_waits=0,
     )
     req = SimpleNamespace(
         bootstrap_room=1,

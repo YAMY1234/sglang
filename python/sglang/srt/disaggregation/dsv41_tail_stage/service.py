@@ -304,6 +304,10 @@ def put_registration(bootstrap_addr: str, payload: dict) -> bool:
 def bind_router(port: int) -> zmq.Socket:
     socket = zmq.Context.instance().socket(zmq.ROUTER)
     socket.setsockopt(zmq.ROUTER_MANDATORY, 0)
+    # A ROUTER drops what a peer's full queue cannot take: a stage 0 stalled in a cold
+    # forward must still get every grant.
+    socket.setsockopt(zmq.SNDHWM, 0)
+    socket.setsockopt(zmq.RCVHWM, 0)
     socket.bind(f"tcp://*:{port}")
     return socket
 

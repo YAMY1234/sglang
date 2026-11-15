@@ -66,7 +66,6 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
 from sglang.srt.disaggregation.dsv41_tail_stage_decode import (
     TAIL_AUX_ABORT_REST_STEPS,
     TAIL_AUX_READ_REST_STEPS,
-    TAIL_AUX_SLOTS,
     TailAuxStaging,
     append_tail_stage_entries,
 )
@@ -510,6 +509,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     _async_publish_readback: bool = False
     # SGLANG_DSV41_TAIL_STAGE with DSpark: where the tail server's draft captures land.
     tail_aux: Optional[TailAuxStaging] = None
+    # Pre-allocation passes that stopped for want of a tail aux slot.
+    tail_aux_waits: int = 0
 
     def __init__(
         self,
@@ -887,7 +888,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         captures = getattr(model.model, "dspark_layers_to_capture", None)
         if self.scheduler.spec_algorithm.is_dspark() and captures:
             self.tail_aux = TailAuxStaging(
-                slots=TAIL_AUX_SLOTS,
+                slots=envs.SGLANG_DSV41_TAIL_STAGE_DECODE_AUX_SLOTS.get(),
                 window=config.sliding_window_size,
                 captures=len(captures),
                 hidden_size=config.hf_text_config.hidden_size,
@@ -1870,6 +1871,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     decode_req.req, step=self.scheduler.forward_ct
                 )
                 if slot is None:
+                    self.tail_aux_waits += 1
                     break
                 decode_req.req.dsv41_tail_aux_slot = slot
 
@@ -4662,11 +4664,13 @@ class SchedulerDisaggregationDecodeMixin:
                 steps, done = getattr(self, "dsv41_late_feed_steps", (0, 0))
                 logger.info(
                     "SGLANG_DSV41_TAIL_STAGE: %d late-fed tails fed in %d slot-steps "
-                    "(%.2f per tail); %d draft windows written from the tail stage",
+                    "(%.2f per tail); %d draft windows written from the tail stage; "
+                    "%d pre-allocation passes waited for an aux slot",
                     done,
                     steps,
                     steps / max(done, 1),
                     getattr(self, "dsv41_tail_admit_ct", 0),
+                    self.disagg_decode_prealloc_queue.tail_aux_waits,
                 )
         return running_batch
 
