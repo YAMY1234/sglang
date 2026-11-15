@@ -6148,9 +6148,9 @@ class DeepseekV4ForCausalLM(nn.Module):
         if encoder_only_skipped:
             log_info_on_rank0(
                 logger,
-                "DeepSeek-V4.1 encoder-only Prefill skipped "
-                f"{encoder_only_skipped} checkpoint tensors outside the resident "
-                "submodel.",
+                f"DeepSeek-V4.1 {'tail server' if self.tail_stage else 'encoder-only Prefill'} "
+                f"skipped {encoder_only_skipped} checkpoint tensors outside the "
+                "resident submodel.",
             )
         unloaded_params = params_dict.keys() - loaded_params
 
