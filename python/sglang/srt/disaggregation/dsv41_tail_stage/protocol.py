@@ -49,6 +49,9 @@ class Welcome(TailMessage, tag="welcome"):
     page_size: int
     num_slots: int
     registered_pp_rank: int = 1
+    # Item lengths of the state entries stage 1 sends decode (DSV41_TAIL_SWA, then
+    # DSV41_TAIL_DRAFT_AUX), for a decode stand-in to register matching buffers.
+    tail_state_item_lens: List[List[int]] = []
 
 
 class SlotRequest(TailMessage, tag="slot_request"):

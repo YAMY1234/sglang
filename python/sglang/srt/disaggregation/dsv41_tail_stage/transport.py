@@ -198,6 +198,9 @@ class MooncakeTailBackend:
             residual_item_len=residual[0].nbytes,
             page_size=self.fwd.page_size,
             num_slots=residual.shape[0],
+            tail_state_item_lens=[
+                list(kv_args.state_item_lens[i]) for i in self.mgr.owned_entries
+            ],
         )
         host = envs.SGLANG_DSV41_TAIL_STAGE_HOST.get() or self.mgr.local_ip
         logger.info(
