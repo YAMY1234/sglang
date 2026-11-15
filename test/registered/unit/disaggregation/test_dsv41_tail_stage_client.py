@@ -262,7 +262,7 @@ class TestTailStageClient(CustomTestCase):
 
     def test_abort_waits_for_a_write_in_flight(self):
         """The tail server reuses a slot once it hears of the abort, so a write still
-        in flight must land before TailAbort leaves."""
+        in flight must land before the slot is given back."""
         gate = threading.Event()
         client, sock, _ = _welcomed(lambda *_: 0 if gate.wait(5) else -1)
         client.request(room=1, rid="r", s=1001, e=1000, late_fed=True)
@@ -271,12 +271,15 @@ class TestTailStageClient(CustomTestCase):
         client.start_push(room=1, src_pages=np.array([0]), capture_slot=0)
         client.abort(1)
         client.poll()
-        self.assertEqual(sock.take(P.TailAbort), [])
+        self.assertEqual(sock.take(P.TailReady), [])
         self.assertIsNone(client.grant(1))
         gate.set()
         client._rooms[1].push.result(timeout=5)
         client.poll()
-        self.assertEqual(sock.take(P.TailAbort)[0].room, 1)
+        # The tail server holds a granted slot until a TailReady gives it back.
+        (back,) = sock.take(P.TailReady)
+        self.assertEqual((back.room, back.slot, back.ok), (1, 3, False))
+        self.assertEqual(sock.take(P.TailAbort), [])
         self.assertNotIn(1, client._rooms)
 
     def test_abort_before_ready_and_a_late_grant_go_back(self):

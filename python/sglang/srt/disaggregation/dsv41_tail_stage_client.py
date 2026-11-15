@@ -308,10 +308,15 @@ class TailStageClient:
             self._timings.add("write", (now - entry.t_push) * 1e3)
 
     def abort(self, room: int) -> None:
-        """The request left before its slot was ready."""
+        """The request left before its slot was ready. A granted slot is given back
+        with TailReady(ok=False): the tail server holds a granted slot until that."""
         entry = self._rooms.get(room)
-        if entry is not None and entry.closing is None:
+        if entry is None or entry.closing is not None:
+            return
+        if entry.grant is None:
             self._close(room, TailAbort(room=room))
+        else:
+            self._close(room, TailReady(room=room, slot=entry.grant.slot, ok=False))
 
     def _close(self, room: int, msg) -> None:
         entry = self._rooms[room]
