@@ -219,7 +219,7 @@ class TestTailStageClient(CustomTestCase):
 
     def test_push_then_ready(self):
         transfer = MagicMock(return_value=0)
-        client, sock, _ = _welcomed(transfer)
+        client, sock, clock = _welcomed(transfer)
         client.request(room=1, rid="r", s=1001, e=1000, late_fed=True)
         sock.inbox.append(
             P.SlotGrant(room=1, slot=3, residual_slot=4, c1_pages=[8, 9, 10, 11])
@@ -236,6 +236,18 @@ class TestTailStageClient(CustomTestCase):
         self.assertEqual((ready.room, ready.slot, ready.ok), (1, 3, True))
         self.assertEqual(client.tails_pushed, 1)
         self.assertIsNone(client.grant(1))
+        # Debug 2 reads the stage split from this summary.
+        sock.inbox.append(
+            P.TailDone(room=1, slot=3, status="ok", queue_ms=4, forward_ms=9, send_ms=2)
+        )
+        clock.t += 5
+        with self.assertLogs(
+            "sglang.srt.disaggregation.dsv41_tail_stage_client", "INFO"
+        ) as logs:
+            client.poll()
+        line = logs.output[-1]
+        for name in ("wait_grant", "grant_to_ready", "write", "s1_queue 4.0/4.0"):
+            self.assertIn(name, line)
 
     def test_a_failed_write_reports_not_ok(self):
         client, sock, _ = _welcomed(MagicMock(return_value=-1))

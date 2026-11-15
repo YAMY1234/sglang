@@ -39,6 +39,8 @@ logger = logging.getLogger(__name__)
 # Arbitrary: how often an unwelcomed stage 0 repeats its Hello (a tail server that
 # starts later, or restarted, answers the next one).
 HELLO_RETRY_S = 5.0
+# Period of the per-request timing summary.
+STATS_LOG_S = 5.0
 UNREACHABLE = "DSV4.1 tail stage unreachable"
 
 
@@ -122,12 +124,42 @@ def push_blocks(
 
 class _Room(msgspec.Struct):
     request: SlotRequest
+    t_request: float
+    t_grant: Optional[float] = None
+    t_push: Optional[float] = None
     retry_at: Optional[float] = None
     grant: Optional[SlotGrant] = None
     error: Optional[str] = None
     push: Optional[concurrent.futures.Future] = None
     # The request left; the message goes once the slot's write has ended.
     closing: Optional[object] = None
+
+
+class _Timings:
+    """Per-request milliseconds over one log period, by stage."""
+
+    NAMES = (
+        "wait_grant",
+        "grant_to_ready",
+        "write",
+        "s1_queue",
+        "s1_forward",
+        "s1_send",
+    )
+
+    def __init__(self) -> None:
+        self.samples: Dict[str, List[float]] = {name: [] for name in self.NAMES}
+
+    def add(self, name: str, ms: float) -> None:
+        self.samples[name].append(ms)
+
+    def summary(self) -> str:
+        parts = []
+        for name, values in self.samples.items():
+            if values:
+                p50, p90 = np.percentile(values, [50, 90])
+                parts.append(f"{name} {p50:.1f}/{p90:.1f} (n={len(values)})")
+        return ", ".join(parts)
 
 
 class TailStageClient:
@@ -163,6 +195,8 @@ class TailStageClient:
         self._hello_at = -float("inf")
         self._beat_at = -float("inf")
         self.tails_pushed = 0
+        self._timings = _Timings()
+        self._timings_at = clock()
 
     # -- the scheduler loop --
 
@@ -192,6 +226,12 @@ class TailStageClient:
         if self.welcome is not None and now - self._beat_at >= self._heartbeat_s:
             self._beat_at = now
             self._send(Heartbeat(inflight=len(self._rooms)))
+        if now - self._timings_at >= STATS_LOG_S:
+            summary = self._timings.summary()
+            if summary:
+                logger.info("DSV4.1 tail stage ms p50/p90: %s", summary)
+            self._timings = _Timings()
+            self._timings_at = now
 
     def unreachable(self) -> bool:
         """A welcomed tail server that has gone silent."""
@@ -210,7 +250,7 @@ class TailStageClient:
         msg = SlotRequest(
             room=room, rid=rid, s=s, e=e if late_fed else 0, late_fed=late_fed
         )
-        self._rooms[room] = _Room(request=msg)
+        self._rooms[room] = _Room(request=msg, t_request=self._clock())
         self._send(msg)
         if not late_fed:
             # Nothing comes back that stage 0 waits for.
@@ -241,6 +281,7 @@ class TailStageClient:
             src_pages=src_pages,
             capture_slot=capture_slot,
         )
+        entry.t_push = self._clock()
         entry.push = self._executor.submit(self._write, blocks)
 
     def push_result(self, room: int) -> Optional[bool]:
@@ -261,6 +302,10 @@ class TailStageClient:
             return
         self._close(room, TailReady(room=room, slot=entry.grant.slot, ok=ok))
         self.tails_pushed += ok
+        now = self._clock()
+        self._timings.add("grant_to_ready", (now - entry.t_grant) * 1e3)
+        if entry.t_push is not None:
+            self._timings.add("write", (now - entry.t_push) * 1e3)
 
     def abort(self, room: int) -> None:
         """The request left before its slot was ready."""
@@ -319,6 +364,8 @@ class TailStageClient:
                 self._send(TailReady(room=msg.room, slot=msg.slot, ok=False))
             else:
                 entry.grant = msg
+                entry.t_grant = now
+                self._timings.add("wait_grant", (now - entry.t_request) * 1e3)
         elif isinstance(msg, SlotDefer):
             entry = self._rooms.get(msg.room)
             if entry is not None:
@@ -329,6 +376,9 @@ class TailStageClient:
             if entry is not None:
                 entry.error = msg.reason
         elif isinstance(msg, TailDone):
+            self._timings.add("s1_queue", msg.queue_ms)
+            self._timings.add("s1_forward", msg.forward_ms)
+            self._timings.add("s1_send", msg.send_ms)
             if msg.status != "ok":
                 logger.warning(
                     "DSV4.1 tail stage: room %d %s (%s)",
