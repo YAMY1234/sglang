@@ -73,6 +73,7 @@ from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
     DeepseekV41Compressor,
     DeepseekV41Indexer,
+    token_req_indices,
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
 from sglang.srt.layers.attention.graph_utils import (
@@ -4561,6 +4562,25 @@ class DeepseekV4Model(nn.Module):
             if i == self.encoder_only_boundary_layer:
                 if _is_cuda:
                     state = hc_boundary.materialize(hidden_states, forward_batch)
+                capture = getattr(get_attn_backend(), "late_tail_capture", None)
+                if capture is not None and forward_batch.forward_mode.is_extend():
+                    # SGLANG_DSV41_TAIL_STAGE: the late layers' input for each
+                    # late-fed request's window rows, shipped to the tail stage. Rows
+                    # map to requests as this layer's KV sources map them.
+                    md = get_attn_backend().forward_metadata
+                    row_req = getattr(md, "low_ratio_req_indices", None)
+                    row_pos = getattr(md, "low_ratio_pos_i64", None)
+                    if row_pos is None:
+                        row_pos = positions
+                        row_req = token_req_indices(
+                            forward_batch, num_tokens=positions.shape[0]
+                        )
+                    n = min(row_pos.shape[0], state.residual.shape[0])
+                    capture.capture(
+                        residual=state.residual[:n],
+                        row_req=row_req[:n],
+                        positions=row_pos[:n],
+                    )
                 self.layers[i].write_global_cache_only(
                     positions=positions,
                     state=state,

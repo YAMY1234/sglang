@@ -14,6 +14,7 @@ from sglang.srt.disaggregation.utils import (
     dsv41_late_tail_rows,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsv4.late_tail_capture import LateTailCapture
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -687,6 +688,47 @@ class TestLateTailSplit(CustomTestCase):
             # One or two rows sit below the floor; the verify step covers the rest.
             self.assertIn(floor - start, (1, 2))
             self.assertIn(prompt_len - end, (1, 2))
+
+
+class TestLateTailCapture(CustomTestCase):
+    def test_window_rows_land_in_their_slot_across_chunks(self):
+        cap = LateTailCapture(
+            slots=2,
+            window=4,
+            num_req_rows=8,
+            hc_mult=1,
+            hidden_size=1,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        self.assertEqual((cap.take(), cap.take(), cap.take()), (0, 1, None))
+        # Request row 5 has e = 20: its window is positions [16, 20).
+        cap.bind(req_pool_idx=5, slot=1, window_start=16)
+
+        def run(req_rows, positions):
+            positions = torch.tensor(positions)
+            cap.capture(
+                residual=positions.float()[:, None, None],
+                row_req=torch.tensor(req_rows),
+                positions=positions,
+            )
+
+        # Chunk 1 ends at 18, beside a request without a slot; chunk 2 holds the rest.
+        run([5, 5, 5, 5, 3, 3], [14, 15, 16, 17, 16, 17])
+        run([5, 5], [18, 19])
+        self.assertEqual(cap.pool[4:8, 0, 0].tolist(), [16.0, 17.0, 18.0, 19.0])
+        # Slot 0 stays untouched; outside rows only reach the trash row.
+        self.assertEqual(cap.pool[:4, 0, 0].tolist(), [0.0] * 4)
+        # Releasing another slot leaves row 5 bound to slot 1.
+        cap.release(req_pool_idx=5, slot=0)
+        run([5], [17])
+        self.assertEqual(cap.pool[5, 0, 0].item(), 17.0)
+        cap.release(req_pool_idx=5, slot=1)
+        self.assertEqual(list(cap.free_slots), [0, 1])
+        run([5], [99])
+        self.assertEqual(cap.pool[4:8, 0, 0].tolist(), [16.0, 17.0, 18.0, 19.0])
+        ptrs, lens, items = cap.transfer_buf_infos()
+        self.assertEqual((lens[0], items[0]), (8 * 4, 4 * 4))
 
 
 if __name__ == "__main__":
