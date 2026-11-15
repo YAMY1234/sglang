@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import time
 from array import array
 from collections import deque
@@ -117,6 +118,29 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 logger = logging.getLogger(__name__)
+
+# H389: a host-index sender's DSA state pages take the same async copy as its KV pages;
+# the transfer worker waits on the send's indices_event before reading either.
+_DSA_STATE_ASYNC = os.environ.get("SGLANG_PD_DSA_STATE_ASYNC_INDICES", "0") == "1"
+# Validation: [sends left, checked, mismatches]; compares the first N sends per rank
+# with the blocking copy, then stops so later sends add no sync.
+_DSA_STATE_ASYNC_VALIDATE = [
+    int(os.environ.get("SGLANG_PD_DSA_STATE_ASYNC_VALIDATE_SENDS", "0")), 0, 0
+]
+
+
+def _validate_dsa_state_pages(pages: np.ndarray, kv_indices: torch.Tensor, page_size: int) -> None:
+    # The blocking copy syncs the stream, so the earlier async copy behind `pages` has landed.
+    expected = kv_to_page_indices(kv_indices, page_size)
+    state = _DSA_STATE_ASYNC_VALIDATE
+    state[0] -= 1
+    state[1] += 1
+    state[2] += int(not np.array_equal(pages, expected))
+    if state[1] % 100 == 0 or state[0] == 0:
+        logger.info(
+            "DSA_STATE_ASYNC_VALIDATE pp_rank=%d checked=%d mismatches=%d%s",
+            get_parallel().pp_rank, state[1], state[2], " done" if state[0] == 0 else "",
+        )
 
 # The default window of a window payload: the scheduler's sliding window.
 _SCHEDULER_WINDOW = object()
@@ -1971,6 +1995,20 @@ class SchedulerDisaggregationPrefillMixin:
                 # (decode_prefix_len, page-aligned), and its rows for a prefix
                 # still being restored point at no page yet: send only the
                 # suffix, positionally matching decode's _dsa_pages_payload.
+                if (
+                    _DSA_STATE_ASYNC
+                    and host_indices
+                    and not get_parallel().enable_kv_cache_sharding
+                ):
+                    # Same pages as suffix_page_indices without a blocking copy; sharding
+                    # is excluded because its sender reads DSA page values on this thread.
+                    kv_indices = self.req_to_token_pool.req_to_token[
+                        req.kv.req_pool_idx, req.disagg_decode_prefix_len : seq_len
+                    ]
+                    pages = state_page_indices(kv_indices)
+                    if _DSA_STATE_ASYNC_VALIDATE[0] > 0:
+                        _validate_dsa_state_pages(pages, kv_indices, page_size)
+                    return pages
                 return suffix_page_indices(
                     self.req_to_token_pool.req_to_token,
                     req.kv.req_pool_idx,
