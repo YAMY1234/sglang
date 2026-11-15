@@ -692,7 +692,7 @@ class TestTailStageAdmission(CustomTestCase):
             rows = steps[0].dsv41_forced_tokens[0].tolist()
             want0 = req.origin_input_ids[e + 1] if forced0 is None else forced0
             self.assertEqual(rows, [want0] + [-2] * (WIDTH - 1))
-            self.assertEqual(feed.dsv41_feed_slot_steps, 1)
+            self.assertEqual(feed.dsv41_late_feed_steps, (1, 1))
 
     def test_switch_on_leaves_a_tail_that_is_not_late_fed_as_before(self, *_):
         req = _fed_req(1000)

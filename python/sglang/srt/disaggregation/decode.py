@@ -4659,12 +4659,13 @@ class SchedulerDisaggregationDecodeMixin:
                 self.dsv41_fed_tail_ct,
             )
             if dsv41_tail_stage_enabled():
-                steps = getattr(self, "dsv41_feed_slot_steps", 0)
+                steps, done = getattr(self, "dsv41_late_feed_steps", (0, 0))
                 logger.info(
-                    "SGLANG_DSV41_TAIL_STAGE: %d feed slot-steps so far, %.2f per fed "
-                    "tail; %d draft windows written from the tail stage",
+                    "SGLANG_DSV41_TAIL_STAGE: %d late-fed tails fed in %d slot-steps "
+                    "(%.2f per tail); %d draft windows written from the tail stage",
+                    done,
                     steps,
-                    steps / max(self.dsv41_fed_tail_ct, 1),
+                    steps / max(done, 1),
                     getattr(self, "dsv41_tail_admit_ct", 0),
                 )
         return running_batch
@@ -4740,6 +4741,7 @@ class SchedulerDisaggregationDecodeMixin:
         width = self.model_worker.verify_num_draft_tokens
         window = self.model_config.sliding_window_size
         tail_stage = dsv41_tail_stage_enabled()
+        late_steps = late_done = 0
         forced = [[-1] * width for _ in batch.reqs]
         floor = [0] * len(batch.reqs)
         for i, req in enumerate(batch.reqs):
@@ -4762,10 +4764,12 @@ class SchedulerDisaggregationDecodeMixin:
             # A step ending on the last prompt token leaves the first output to
             # the next step, which stays in the feed with no prompt rows.
             req.dsv41_feed_next = nxt if nxt < len(prompt) else None
+            if tail_stage and req.dsv41_late_fed:
+                late_steps += 1
+                late_done += req.dsv41_feed_next is None
         if tail_stage:
-            self.dsv41_feed_slot_steps = getattr(
-                self, "dsv41_feed_slot_steps", 0
-            ) + sum(f[0] != -1 for f in forced)
+            steps, done = getattr(self, "dsv41_late_feed_steps", (0, 0))
+            self.dsv41_late_feed_steps = (steps + late_steps, done + late_done)
         batch.dsv41_forced_tokens = async_h2d(
             forced, dtype=torch.int64, device=batch.device
         )
