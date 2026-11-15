@@ -2509,6 +2509,7 @@ class DeepseekV4AttnBackend(
             hidden_size=config.hidden_size,
             dtype=model_runner.dtype,
             device=self.device,
+            mem_pool=self.token_to_kv_pool.custom_mem_pool,
         )
 
     def set_verify_swa_floor(self, floor: Optional[torch.Tensor]) -> None:

@@ -5,6 +5,7 @@ sends from (one item per slot) to the tail stage."""
 from __future__ import annotations
 
 from collections import deque
+from contextlib import nullcontext
 from typing import Dict, Optional
 
 import torch
@@ -25,13 +26,16 @@ class LateTailCapture:
         hidden_size: int,
         dtype: torch.dtype,
         device: torch.device,
+        mem_pool=None,
     ) -> None:
         self.window = window
         # [slots * window + 1, hc_mult, hidden]: the last row takes every row outside
-        # a capture window.
-        self.pool = torch.zeros(
-            slots * window + 1, hc_mult, hidden_size, dtype=dtype, device=device
-        )
+        # a capture window. Mooncake reads it: under a custom memory pool (MNNVL) it
+        # must come from that pool, as the KV pools' buffers do.
+        with torch.cuda.use_mem_pool(mem_pool) if mem_pool else nullcontext():
+            self.pool = torch.zeros(
+                slots * window + 1, hc_mult, hidden_size, dtype=dtype, device=device
+            )
         # Per request-pool row: its capture slot (-1: none) and window start.
         self.slot_of_row = torch.full(
             (num_req_rows,), -1, dtype=torch.int64, device=device
