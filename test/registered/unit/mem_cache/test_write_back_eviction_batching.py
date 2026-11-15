@@ -91,7 +91,7 @@ class _FencedController(InstantWriteBackController):
         self.submitted.append(pages)
         self.log.append(("submit", n))
         finish = SimpleNamespace(
-            synchronize=lambda: self.log.append(("sync", n)), query=lambda: True
+            n=n, synchronize=lambda: self.log.append(("sync", n)), query=lambda: True
         )
         return SimpleNamespace(
             start_event=None, finish_event=finish, timing_enabled=False
@@ -622,6 +622,91 @@ class _WriteBackBatchingSuite:
             for seq in batch_seqs(batch):
                 self.assertEqual(match_seq(cache, seq).host_hit_length, SEQ_TOKENS)
             cache.sanity_check()
+
+    def _device_ordered(self, cache, cc):
+        """Fence cache's write-back walks on the forward stream; each wait logs
+        ("wait", n) for submission n."""
+        cache.device_ordered_write_back = True
+        cc.load_fence_stream = cc.write_fence_stream
+        cc.forward_on_fence_stream = True
+        cc.write_fence_stream.wait_event = lambda event: cc.log.append(
+            ("wait", event.n)
+        )
+
+    def test_device_ordered_write_back_frees_after_a_stream_wait(self):
+        """A fenced write-back walk never waits on a copy on the host, makes the
+        forward stream wait on it before a page it reads is freed, and leaves
+        the tree the host-ordered walk leaves."""
+        cache, allocator, host_pool = self._fill_host_with_one_batch()
+        for seq in batch_seqs(1):
+            insert_seq(cache, allocator, seq)
+        cc = _FencedController(cache.cache_controller, {id(host_pool): "kv"})
+        cache.cache_controller = cc
+
+        self._device_ordered(cache, cc)
+        with cc.record_frees("kv", allocator):
+            result = cache.evict(EvictParams(num_tokens=BATCH_TOKENS))
+
+        self.assertEqual(result.num_tokens_evicted, BATCH_TOKENS)
+        self.assertFalse([event for event in cc.log if event[0] == "sync"])
+        self.assertTrue(any(event[0] == "free" for event in cc.log))
+        waited = set()
+        for event in cc.log:
+            if event[0] == "wait":
+                waited.add(event[1])
+            elif event[0] == "free":
+                for n, read in enumerate(cc.submitted):
+                    if event[2] & read.get("kv", set()):
+                        self.assertIn(n, waited, f"freed pages copy {n} reads")
+        self.assertEqual(host_pool.available_size(), 0)
+        for seq in batch_seqs(0):
+            self.assertEqual(match_seq(cache, seq).host_hit_length, 0)
+        for seq in batch_seqs(1):
+            match = match_seq(cache, seq)
+            self.assertEqual(match.device_prefix_len, 0)
+            self.assertEqual(match.host_hit_length, SEQ_TOKENS)
+        cache.sanity_check()
+
+    def test_device_ordered_write_back_churn_matches_host_ordered(self):
+        """Five rounds of insert-and-evict end in the same device and host
+        state with fenced walks as with the host wait."""
+
+        def churn(device_ordered):
+            cache, allocator, host_pool = self._fill_host_with_one_batch()
+            cc = _FencedController(cache.cache_controller, {id(host_pool): "kv"})
+            cache.cache_controller = cc
+            if device_ordered:
+                self._device_ordered(cache, cc)
+            state = []
+            for batch in range(1, 6):
+                for seq in batch_seqs(batch):
+                    insert_seq(cache, allocator, seq)
+                evicted = cache.evict(EvictParams(num_tokens=BATCH_TOKENS))
+                cache.sanity_check()
+                state.append(
+                    (
+                        evicted.num_tokens_evicted,
+                        allocator.available_size(),
+                        host_pool.available_size(),
+                        [
+                            (m.device_prefix_len, m.host_hit_length)
+                            for m in (
+                                match_seq(cache, seq)
+                                for b in range(batch + 1)
+                                for seq in batch_seqs(b)
+                            )
+                        ],
+                    )
+                )
+            syncs = sum(event[0] == "sync" for event in cc.log)
+            return state, syncs, len(cc.submitted)
+
+        stock, stock_syncs, stock_copies = churn(device_ordered=False)
+        ordered, ordered_syncs, ordered_copies = churn(device_ordered=True)
+        self.assertEqual(ordered, stock)
+        self.assertEqual(ordered_copies, stock_copies)
+        self.assertGreater(stock_syncs, 0)
+        self.assertEqual(ordered_syncs, 0)
 
     def _evict_past_pinned_copies(self, *, walk_order, num_tokens, batched):
         """Evict unbacked leaves and backed-up leaves whose host copies are
