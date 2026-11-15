@@ -22,6 +22,7 @@ from sglang.srt.disaggregation.dsv41_tail_stage.batcher import (
     TailBatchPolicy,
     parse_buckets,
 )
+from sglang.srt.disaggregation.dsv41_tail_stage.forward import window_row_floors
 from sglang.srt.disaggregation.dsv41_tail_stage.layout import (
     c1_buf_infos,
     c1_page_ids,
@@ -640,6 +641,25 @@ class TestTailStageLayout(CustomTestCase):
         np.testing.assert_array_equal(pages, [5, 2])
         pages = tail_swa_page_ids(pool, row, start=1000 - WINDOW, end=1000)
         np.testing.assert_array_equal(pages, [5])
+
+
+class TestTailStageFloors(CustomTestCase):
+    def test_rows_take_the_prompt_window_floor_and_lower_rows_attend_to_themselves(
+        self,
+    ):
+        """Stage 1 runs [e - W, e) but the late-layer floor is s - W (the prompt's
+        last window): rows from s - W attend back to it, the 1-2 rows below it to
+        themselves only, as decode floors a fed tail."""
+        e = 1000
+        positions = torch.cat([torch.arange(e - WINDOW, e)] * 2)
+        floors = window_row_floors(
+            prompt_lens=[e + 1, e + 2], window=WINDOW, positions=positions
+        )
+        first, second = floors[:WINDOW], floors[WINDOW:]
+        self.assertEqual(first[0].item(), e - WINDOW)  # below s - W: itself
+        self.assertTrue(bool((first[1:] == e + 1 - WINDOW).all()))
+        self.assertEqual(second[:2].tolist(), [e - WINDOW, e - WINDOW + 1])
+        self.assertTrue(bool((second[2:] == e + 2 - WINDOW).all()))
 
 
 class TestTailStageKVArgs(CustomTestCase):

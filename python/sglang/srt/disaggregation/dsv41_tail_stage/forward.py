@@ -29,6 +29,18 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 logger = logging.getLogger(__name__)
 
 
+def window_row_floors(
+    *, prompt_lens: Sequence[int], window: int, positions: torch.Tensor
+) -> torch.Tensor:
+    """Each window row's late-layer SWA floor: s - W, the floor bounded replay gives
+    the prompt's last window; a row below it (1 or 2 per tail) attends to itself
+    only, as a fed tail's do on decode (_floored_verify_swa)."""
+    floors = torch.tensor(
+        prompt_lens, dtype=torch.int64, device=positions.device
+    ).repeat_interleave(window)
+    return torch.minimum(floors - window, positions.to(torch.int64))
+
+
 class TailRun(msgspec.Struct):
     """One tail in a forward: its request, its staging slot and its prompt length."""
 
@@ -160,15 +172,10 @@ class TailStageForward:
         forward_batch = ForwardBatch.init_new(
             batch, self.model_runner, return_hidden_states_before_norm=False
         )
-        floors = torch.tensor(
-            [t.s - self.window for t in tails],
-            dtype=torch.int64,
-            device=self.residual.device,
-        ).repeat_interleave(self.window)
-        # Rows below the late-layer floor s - W attend to themselves only, as a
-        # fed tail's do on decode.
-        forward_batch.encoder_swa_row_floor = torch.minimum(
-            floors, forward_batch.positions.to(torch.int64)
+        forward_batch.encoder_swa_row_floor = window_row_floors(
+            prompt_lens=[t.s for t in tails],
+            window=self.window,
+            positions=forward_batch.positions,
         )
         return forward_batch
 
