@@ -106,17 +106,28 @@ class TestPDLocalResultProcessing(CustomTestCase):
         scheduler = _scheduler(is_last_rank=False)
         batch = _batch("a", reqs=[_req(), _req()])
         batch.spec_info = object()
-        md = PPBatchMetadata(can_run_cuda_graph=False, pd_local_result=True)
+        forward_event = object()
+        md = PPBatchMetadata(
+            can_run_cuda_graph=False, pd_local_result=True, forward_event=forward_event
+        )
 
         outputs, result, d2h_event = scheduler._pp_make_local_result(batch, md, 0)
 
         self.assertIsNone(outputs)
-        self.assertIsNotNone(d2h_event)
+        # The loop synchronizes on this before processing: it must be this mb's
+        # own forward completion, not an event on the schedule stream.
+        self.assertIs(d2h_event, forward_event)
         self.assertEqual(result.next_token_ids.device.type, "cpu")
         self.assertEqual(result.next_token_ids.tolist(), [0, 0])
         # process_batch_result_disagg_prefill asserts spec_info is next_draft_input.
         self.assertIsNone(batch.spec_info)
         self.assertIsNone(result.next_draft_input)
+
+    def test_earlier_stage_without_forward_event_fails_loudly(self):
+        scheduler = _scheduler(is_last_rank=False)
+        md = PPBatchMetadata(can_run_cuda_graph=False, pd_local_result=True)
+        with self.assertRaises(AssertionError):
+            scheduler._pp_make_local_result(_batch("a"), md, 0)
 
     def _run_last_stage(self, eligible):
         """Drive the last stage of PP4 (depth 0) through 8 loop iterations."""
@@ -199,9 +210,10 @@ class TestPDLocalResultProcessing(CustomTestCase):
         mb_metadata = [None]
         queue = deque()
 
-        scheduler._pp_launch_batch(0, batch, None, mb_metadata, queue)
+        _, launch_event = scheduler._pp_launch_batch(0, batch, None, mb_metadata, queue)
 
         self.assertTrue(mb_metadata[0].pd_local_result)
+        self.assertIs(mb_metadata[0].forward_event, launch_event)
         held = queue[0][1].tensors["next_token_ids"]
         self.assertEqual(held.tolist(), [7, 8])
         self.assertNotEqual(held.data_ptr(), token_ids.data_ptr())

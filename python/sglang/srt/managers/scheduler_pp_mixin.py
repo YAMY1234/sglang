@@ -95,6 +95,9 @@ class PPBatchMetadata:
     fpm_timing: Optional[FpmTiming] = None
     # Decided once at launch, identically on every stage: skip the output ring.
     pd_local_result: bool = False
+    # PD local result: this mb's forward-completion event. Without the ring, an
+    # earlier stage waits on it before checkpointing or sending the mb's KV.
+    forward_event: Optional[torch.Event] = None
 
 
 @dataclass
@@ -755,9 +758,11 @@ class SchedulerPPMixin:
                 can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
                 fpm_timing=mb_metadata.fpm_timing,
             )
-            d2h_event = self.device_module.Event()
-            d2h_event.record(self.device_module.current_stream())
-            return None, batch_result, d2h_event
+            # The caller synchronizes on it before processing: this mb's forward
+            # must have written its KV before it is checkpointed or sent. The
+            # ring's returned output used to imply that.
+            assert mb_metadata.forward_event is not None
+            return None, batch_result, mb_metadata.forward_event
         ready_event, local_outputs = self._pp_local_outputs.pop(mb_id)
         with self.copy_stream_ctx:
             self.copy_stream.wait_stream(self.schedule_stream)
@@ -1884,6 +1889,8 @@ class SchedulerPPMixin:
                 )
                 event = self.device_module.Event()
                 event.record(self.device_module.current_stream())
+                if pd_local_result:
+                    mb_metadata[mb_id].forward_event = event
                 if self.pp_group.is_last_rank:
                     tensor_dict = self._pp_prepare_tensor_dict(result, cur_batch)
                     ready_event = event
