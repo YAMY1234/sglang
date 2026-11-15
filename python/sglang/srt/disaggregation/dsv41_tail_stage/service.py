@@ -80,6 +80,9 @@ class TailStageService:
         self._last_heartbeat = 0.0
         self._last_log = 0.0
         self._tails_done_at_log = 0
+        # Slots held (granted to sent) per loop step, and SlotDefers, since the last log.
+        self._busy_samples: List[int] = []
+        self._defers_at_log = 0
 
     def serve_forever(self) -> None:
         while True:
@@ -93,6 +96,7 @@ class TailStageService:
         self._heartbeat(now)
         self._poll_senders()
         self._run_batch()
+        self._busy_samples.append(self.table.num_slots - len(self.table.free_slots))
         self._log(now)
 
     def _receive(self, poll_ms: int) -> None:
@@ -153,6 +157,7 @@ class TailStageService:
 
     def _slot_request(self, stage0_id: str, req: P.SlotRequest) -> None:
         replies = self.table.request(stage0_id, req)
+        self.stats["defers"] += sum(isinstance(r.msg, P.SlotDefer) for r in replies)
         refused = any(
             isinstance(r.msg, P.Error) and r.msg.room == req.room for r in replies
         )
@@ -262,6 +267,17 @@ class TailStageService:
             done,
             self.stats["tails_failed"],
         )
+        busy = sorted(self._busy_samples) or [0]
+        logger.info(
+            "DSV4.1 tail stage slots held p50/p90/max %d/%d/%d of %d, %d SlotDefer",
+            busy[len(busy) // 2],
+            busy[(len(busy) * 9) // 10],
+            busy[-1],
+            self.table.num_slots,
+            self.stats["defers"] - self._defers_at_log,
+        )
+        self._busy_samples = []
+        self._defers_at_log = self.stats["defers"]
 
 
 def put_registration(bootstrap_addr: str, payload: dict) -> bool:

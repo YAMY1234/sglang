@@ -576,6 +576,8 @@ class PrefillBootstrapQueue:
             heartbeat_s=1.0,
             timeout_s=envs.SGLANG_DSV41_TAIL_STAGE_HEARTBEAT_TIMEOUT_S.get(),
             heartbeat_thread=True,
+            write_rooms=envs.SGLANG_DSV41_TAIL_STAGE_WRITE_ROOMS.get(),
+            write_parts=envs.SGLANG_DSV41_TAIL_STAGE_WRITE_PARTS.get(),
         )
 
     def _tail_stage_admits(self, req: Req) -> bool:

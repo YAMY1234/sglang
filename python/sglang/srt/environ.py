@@ -2129,6 +2129,9 @@ class Envs:
     # Seconds without a heartbeat before a tail-stage peer counts as down; a cold
     # first forward blocked the tail server's loop for tens of seconds.
     SGLANG_DSV41_TAIL_STAGE_HEARTBEAT_TIMEOUT_S = EnvFloat(120.0)
+    # Prefill: slot writes in flight at once, and Mooncake batches per write.
+    SGLANG_DSV41_TAIL_STAGE_WRITE_ROOMS = EnvInt(4)
+    SGLANG_DSV41_TAIL_STAGE_WRITE_PARTS = EnvInt(8)
     # The tail server (--dsv41-tail-stage-server): its ROUTER port (0 serves nothing)
     # and the address it registers with each prefill's bootstrap server.
     SGLANG_DSV41_TAIL_STAGE_PORT = EnvInt(0)
