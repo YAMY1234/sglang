@@ -214,6 +214,10 @@ class TestTailStageClient(CustomTestCase):
         (req,) = sock.take(P.SlotRequest)
         self.assertEqual((req.e, req.late_fed), (0, False))
         self.assertIsNone(client.grant(2))
+        # Its slot -1 answer is not a slot to give back.
+        sock.inbox.append(P.SlotGrant(room=2, slot=-1, residual_slot=-1, c1_pages=[]))
+        client.poll()
+        self.assertEqual(sock.take(P.TailReady), [])
         client.abort(2)
         self.assertEqual(sock.take(P.TailAbort), [])
 

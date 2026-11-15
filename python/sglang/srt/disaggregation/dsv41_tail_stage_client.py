@@ -364,6 +364,9 @@ class TailStageClient:
             self.welcome = msg
         elif isinstance(msg, SlotGrant):
             entry = self._rooms.get(msg.room)
+            if msg.slot < 0:
+                # A pass-through room's answer: nothing to wait for or give back.
+                return
             if entry is None:
                 # Aborted meanwhile: give the slot back.
                 self._send(TailReady(room=msg.room, slot=msg.slot, ok=False))
