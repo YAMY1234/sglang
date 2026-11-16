@@ -31,6 +31,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     LayerWiseLoadCounter,
     UnifiedCacheLinker,
 )
+from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
@@ -269,6 +270,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             )
 
         self.register_buffers()
+        # Build the native page-hash extension at startup: its first use otherwise
+        # compiles it inside a request (about 3 s per node on the first store hit).
+        get_storage_hash_str([0] * self.page_size, page_size=self.page_size)
         self.mla_broadcaster = None
         self.tp_group = tp_group
         self.broadcast_loads = {}
