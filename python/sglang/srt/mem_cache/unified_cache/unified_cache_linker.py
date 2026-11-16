@@ -29,7 +29,7 @@ import logging
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, NamedTuple, Optional
@@ -275,6 +275,20 @@ class _ExternalCachePrefetch:
     discard: bool = False
 
 
+@dataclass
+class _PendingLookup:
+    """A queued request's store lookup running off the scheduler thread."""
+
+    key: RadixKey
+    hashes: list[str]
+    start: int
+    anchor_node_id: NodeId
+    anchor_lock: DecLockRefParams
+    future: Future[list[int]]
+    timeout_s: float = 0.0
+    wait_started: float | None = None
+
+
 class _PrefetchHold(NamedTuple):
     node_id: NodeId
     lock: DecLockRefParams
@@ -328,6 +342,14 @@ class UnifiedCacheLinkerWrapper:
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
         self.prefetches: dict[CacheRequestHandle, _ExternalCachePrefetch] = {}
+        # Store lookups in flight on worker threads, in submission order.
+        self.lookups: dict[CacheRequestHandle, _PendingLookup] = {}
+        lookup_threads = envs.SGLANG_EXTERNAL_LINKER_ASYNC_LOOKUP_THREADS.get()
+        self._lookup_executor = (
+            ThreadPoolExecutor(lookup_threads, thread_name_prefix="linker-lookup")
+            if self.load_mode == "prefetch" and lookup_threads > 0
+            else None
+        )
         # Published prefetches still locked for their waiting request.
         self.holds: dict[CacheRequestHandle, _PrefetchHold] = {}
         self.held_tokens = 0
@@ -436,10 +458,13 @@ class UnifiedCacheLinkerWrapper:
         for previous in self.prefetches:
             if previous.rid == request.rid and previous != request:
                 self._cancel_prefetch(previous)
+        for previous in [lk for lk in self.lookups if lk.rid == request.rid]:
+            if previous != request:
+                self._cancel_lookup(previous)
         for previous in [h for h in self.holds if h.rid == request.rid]:
             if previous != request:
                 self.release_hold(previous, admitted=False)
-        if self.cache.disable or request in self.prefetches:
+        if self.cache.disable or request in self.prefetches or request in self.lookups:
             return
         req.init_next_round_input(self.cache, cow_mamba=False)
         if is_virtual_node(req.last_node) or req.positional_embed_overrides is not None:
@@ -463,25 +488,60 @@ class UnifiedCacheLinkerWrapper:
         ]
         if any(t is None for t in lookups):
             return
+        timeout_s = (
+            self.cache.prefetch_timeout_base
+            + len(hashes) * self.cache.prefetch_timeout_per_page
+        )
+        if self._lookup_executor is not None:
+            # The anchor stays locked while the lookup runs, as for a load.
+            self.lookups[request] = _PendingLookup(
+                key,
+                hashes,
+                start,
+                req.last_node,
+                self.cache.inc_lock_ref(req.last_node).to_dec_params(),
+                self._lookup_executor.submit(
+                    self.cache_linker.lookup, req.rid, lookups
+                ),
+                timeout_s=timeout_s,
+            )
+            return
         try:
-            # TODO: Run storage lookup asynchronously to avoid blocking scheduling.
             restorable = self.cache_linker.lookup(req.rid, lookups)
         except Exception:
             logger.warning("External linker prefetch lookup failed", exc_info=True)
             restorable = []
+        anchor_lock = self.cache.inc_lock_ref(req.last_node).to_dec_params()
+        self._start_prefetch_load(
+            request, key, hashes, start, req.last_node, anchor_lock, restorable, timeout_s
+        )
+
+    def _start_prefetch_load(
+        self,
+        request: CacheRequestHandle,
+        key: RadixKey,
+        hashes: list[str],
+        start: int,
+        anchor_node_id: NodeId,
+        anchor_lock: DecLockRefParams,
+        restorable: list[int],
+        timeout_s: float,
+    ) -> None:
+        """Agree on the restorable prefix across ranks and queue its load."""
+        page = self.cache.page_size
         pages = self._sync_restorable_prefix(
             restorable, num_pages=len(hashes), device_hit_pages=0
         )
         if not pages:
+            self.cache.dec_lock_ref(anchor_node_id, anchor_lock)
             return
         end = start + pages * page
         state = _ExternalCachePrefetch(
             key[:end],
-            req.last_node,
-            self.cache.inc_lock_ref(req.last_node).to_dec_params(),
+            anchor_node_id,
+            anchor_lock,
             [],
-            timeout_s=self.cache.prefetch_timeout_base
-            + len(hashes) * self.cache.prefetch_timeout_per_page,
+            timeout_s=timeout_s,
         )
         self.prefetches[request] = state
         try:
@@ -504,7 +564,12 @@ class UnifiedCacheLinkerWrapper:
             self._cancel_prefetch(request)
             self.check_prefetch_events()
 
+    def has_pending_prefetch(self) -> bool:
+        return bool(self.prefetches or self.lookups)
+
     def check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
+        if request in self.lookups:
+            return self._check_lookup_progress(request)
         state = self.prefetches.get(request)
         if state is None or state.discard:
             return True
@@ -529,7 +594,64 @@ class UnifiedCacheLinkerWrapper:
         self._cancel_prefetch(request)
         return True
 
+    def _check_lookup_progress(self, request: CacheRequestHandle) -> bool:
+        """Admission poll while the request's lookup runs, under the stop
+        policy of a running load."""
+        lookup = self.lookups[request]
+        policy = self.cache.prefetch_stop_policy
+        if policy == "wait_complete":
+            return False
+        if policy == "timeout":
+            now = time.perf_counter()
+            expired = torch.tensor(
+                lookup.wait_started is not None
+                and now - lookup.wait_started > lookup.timeout_s,
+                dtype=torch.int,
+            )
+            self.cache._all_reduce_attn_groups(expired, torch.distributed.ReduceOp.MAX)
+            if not expired.item():
+                if lookup.wait_started is None:
+                    lookup.wait_started = now
+                return False
+        self._cancel_lookup(request)
+        return True
+
+    def _cancel_lookup(self, request: CacheRequestHandle) -> None:
+        lookup = self.lookups.pop(request, None)
+        if lookup is not None:
+            # A lookup reads store metadata only, so its result can be dropped.
+            lookup.future.cancel()
+            self.cache.dec_lock_ref(lookup.anchor_node_id, lookup.anchor_lock)
+
+    def _drain_lookups(self) -> None:
+        """Start the loads of lookups every rank has finished, in submission order."""
+        if not self.lookups:
+            return
+        pending = list(self.lookups.items())
+        done = torch.tensor([lk.future.done() for _, lk in pending], dtype=torch.int)
+        self.cache._all_reduce_attn_groups(done, torch.distributed.ReduceOp.MIN)
+        for (request, lookup), finished in zip(pending, done.tolist()):
+            if not finished:
+                continue
+            del self.lookups[request]
+            try:
+                restorable = lookup.future.result()
+            except Exception:
+                logger.warning("External linker prefetch lookup failed", exc_info=True)
+                restorable = []
+            self._start_prefetch_load(
+                request,
+                lookup.key,
+                lookup.hashes,
+                lookup.start,
+                lookup.anchor_node_id,
+                lookup.anchor_lock,
+                restorable,
+                lookup.timeout_s,
+            )
+
     def _cancel_prefetch(self, request: CacheRequestHandle) -> None:
+        self._cancel_lookup(request)
         state = self.prefetches.get(request)
         if state is not None:
             state.discard = True
@@ -546,6 +668,7 @@ class UnifiedCacheLinkerWrapper:
         )
 
     def check_prefetch_events(self) -> None:
+        self._drain_lookups()
         if not self.prefetches:
             return
         pending = list(self.prefetches.items())
@@ -961,6 +1084,8 @@ class UnifiedCacheLinkerWrapper:
     def _clear_state(self) -> None:
         for request in list(self.prefetches):
             self._finish_prefetch(request, publish=False)
+        for request in list(self.lookups):
+            self._cancel_lookup(request)
         for request in list(self.holds):
             self.release_hold(request, admitted=False)
         self.hit_markers.clear()
@@ -988,3 +1113,5 @@ class UnifiedCacheLinkerWrapper:
     def close(self) -> None:
         self.cache_linker.close()
         self._clear_state()
+        if self._lookup_executor is not None:
+            self._lookup_executor.shutdown(wait=False, cancel_futures=True)

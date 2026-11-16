@@ -579,6 +579,77 @@ class TestLinkerDevicePrefetch(CustomTestCase):
                 cache.linker.release_request(req.cache_request_handle)
                 self._assert_balanced(cache, allocator)
 
+    def _gated_lookup(self, backend):
+        """Make the fixture's store lookup block until the returned gate opens."""
+        gate = threading.Event()
+        restorable = list(backend.restorable)
+
+        def lookup(rid, transfers):
+            assert gate.wait(5)
+            return restorable
+
+        backend.lookup = MagicMock(side_effect=lookup)
+        return gate
+
+    def test_async_lookup_leaves_the_scheduler_thread_and_loads_on_return(self):
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_EXTERNAL_LINKER_ASYNC_LOOKUP_THREADS.override(1):
+            cache, backend, req, allocator = self._fixture()
+            gate = self._gated_lookup(backend)
+            handle = req.cache_request_handle
+            self._enqueue(cache, req)  # returns while the lookup still blocks
+            assert list(cache.linker.lookups) == [handle]
+            assert not backend.prefetch.called
+            assert not cache.check_prefetch_progress(handle)
+            gate.set()
+            cache.linker.lookups[handle].future.result(timeout=5)
+            cache.check_hicache_events()
+            assert backend.prefetch.called and not cache.linker.lookups
+            for future in backend.prefetch_futures:
+                future.set_result(True)
+            cache.check_hicache_events()
+            assert cache.check_prefetch_progress(handle)
+            assert self._match(cache, req).device_prefix_len == 6
+            cache.linker.release_request(handle)
+            self._assert_balanced(cache, allocator)
+
+    def test_async_lookup_cancelled_in_flight_releases_its_anchor(self):
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_EXTERNAL_LINKER_ASYNC_LOOKUP_THREADS.override(1):
+            cache, backend, first, allocator = self._fixture()
+            gate = self._gated_lookup(backend)
+            gate.set()
+            # Publish a 6-token prefix, so a longer request anchors on a device node.
+            self._enqueue(cache, first)
+            cache.linker.lookups[first.cache_request_handle].future.result(timeout=5)
+            cache.check_hicache_events()
+            for future in backend.prefetch_futures:
+                future.set_result(True)
+            cache.check_hicache_events()
+            cache.linker.release_request(first.cache_request_handle)
+            protected = cache.full_protected_size()
+            gate.clear()
+            req = Req(
+                rid="second",
+                origin_input_text=None,
+                origin_input_ids=array("q", [*range(1, 8), 99, 98]),
+                sampling_params=SamplingParams(max_new_tokens=1),
+            )
+            req.cache_request_handle = CacheRequestHandle("second", 0)
+            self._enqueue(cache, req)
+            handle = req.cache_request_handle
+            assert list(cache.linker.lookups) == [handle]
+            assert cache.full_protected_size() == protected + 6
+            cache.linker.release_request(handle)
+            assert not cache.linker.lookups
+            assert cache.full_protected_size() == protected
+            gate.set()
+            cache.check_hicache_events()
+            assert len(backend.prefetch_futures) == 1
+            self._assert_balanced(cache, allocator)
+
     def test_failure_falls_back_but_pending_peer_keeps_private_slots(self):
         for outcome, mamba in product(
             ("local-failure", "peer-failure", "peer-pending"), (False, True)

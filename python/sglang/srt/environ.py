@@ -924,6 +924,10 @@ class Envs:
     # locked until its request is admitted or released, while held prefixes
     # total at most this share of the Full device pool. 0 releases at publish.
     SGLANG_EXTERNAL_LINKER_PREFETCH_HOLD_FRACTION = EnvFloat(0.0)
+    # External linker prefetch mode: look a queued request up in the store on
+    # this many worker threads instead of the scheduler thread; the load starts
+    # when the lookup returns. 0 keeps the synchronous lookup.
+    SGLANG_EXTERNAL_LINKER_ASYNC_LOOKUP_THREADS = EnvInt(0)
     # Buffer mode: store only the SWA window ending at each node (what a
     # prefetch ending there restores) instead of every SWA page.
     SGLANG_ENABLE_HICACHE_SWA_TAIL_ONLY_BACKUP = EnvBool(False)
