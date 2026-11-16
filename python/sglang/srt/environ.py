@@ -950,6 +950,9 @@ class Envs:
     # off. Mooncake evicts the oldest lease first, and only a lookup or read
     # renews one, so a prefix that keeps hitting on the device ages from its write.
     SGLANG_LINKER_LEASE_REFRESH_INTERVAL = EnvFloat(0.0)
+    # The Mooncake master's default_kv_lease_ttl: a PP hit relayed at enqueue and
+    # older than this when its load starts is looked up again first.
+    SGLANG_LINKER_LEASE_TTL_SECS = EnvFloat(10.0)
     # Cap on the lease renewal existence queries, in object keys per second.
     SGLANG_LINKER_LEASE_REFRESH_MAX_KEYS_PER_S = EnvInt(100000)
     # Log each Mooncake linker load's wait, transfer time, bytes and rate.

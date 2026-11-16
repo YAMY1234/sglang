@@ -1609,6 +1609,92 @@ def test_device_hit_renews_its_store_leases(full_linker_component):
     assert backend.refreshed == [(6, ["device-6"])]
 
 
+def _relayed(value):
+    """_all_reduce for a later PP stage: PP0's value arrives over _pp_sync."""
+
+    def all_reduce(data, op):
+        data[0] = value
+
+    return all_reduce
+
+
+def test_pp_stale_hit_is_looked_up_again_and_shrinks_before_its_load(
+    full_linker_component,
+):
+    # Rhea 57360: a hit relayed at enqueue waited 354 s, its objects were
+    # evicted, and the load failed. A hit older than the lease is looked up
+    # again first; what is gone is recomputed, not a failed read.
+    with patch(
+        "sglang.srt.mem_cache.unified_cache.unified_cache_linker.get_storage_hash_str",
+        side_effect=_page_hashes,
+    ):
+        backend = _CountingLinker(stage_restorable=[1, 3])
+        pp0 = _match_wrapper(
+            full_linker_component,
+            backend,
+            pp_size=8,
+            pp_rank=0,
+            _all_reduce=lambda data, op: None,
+        )
+        req = SimpleNamespace(rid="r", linker_pp_hit=None, linker_pp_lookup_pending=True)
+        assert pp0.match(_KEY, req, _device_result(0)).host_hit_length == 6
+        req.linker_pp_lookup_pending = False
+        pp0.pp_lookup_time["r"] -= pp0.stale_after_s + 1
+        backend.stage_restorable = [1]  # pages 2-3 evicted while queued
+
+        assert pp0.load_back(req) is None
+        assert backend.stage_lookups == 2
+        assert req.linker_pp_hit == (0, [2])
+        assert (pp0.pp_relookups, pp0.pp_relookups_shrunk) == (1, 1)
+        # The next pass admits what is left, without another store query.
+        assert pp0.match(_KEY, req, _device_result(0)).host_hit_length == 2
+        assert backend.stage_lookups == 2
+
+
+def test_pp_fresh_hit_loads_without_a_second_lookup(full_linker_component):
+    with patch(
+        "sglang.srt.mem_cache.unified_cache.unified_cache_linker.get_storage_hash_str",
+        side_effect=_page_hashes,
+    ):
+        backend = _CountingLinker(stage_restorable=[1, 3])
+        pp0 = _match_wrapper(
+            full_linker_component,
+            backend,
+            pp_size=8,
+            pp_rank=0,
+            _all_reduce=lambda data, op: None,
+        )
+        req = SimpleNamespace(rid="r", linker_pp_hit=None, linker_pp_lookup_pending=True)
+        pp0.match(_KEY, req, _device_result(0))
+        assert pp0._pp_fresh_hit_pages(req, pp0.hit_markers["r"]) == 3
+        assert backend.stage_lookups == 1
+        assert pp0.pp_relookups == 0
+
+
+def test_later_pp_stage_takes_pp0s_relookup_without_a_store_query(
+    full_linker_component,
+):
+    with patch(
+        "sglang.srt.mem_cache.unified_cache.unified_cache_linker.get_storage_hash_str",
+        side_effect=_page_hashes,
+    ):
+        backend = _CountingLinker()
+        later = _match_wrapper(
+            full_linker_component,
+            backend,
+            pp_size=8,
+            pp_rank=5,
+            _all_reduce=_relayed(1),
+        )
+        req = SimpleNamespace(
+            rid="r", linker_pp_hit=(0, [2, 6]), linker_pp_lookup_pending=False
+        )
+        assert later.match(_KEY, req, _device_result(0)).host_hit_length == 6
+        assert later.load_back(req) is None
+        assert req.linker_pp_hit == (0, [2])
+        assert (backend.lookups, backend.stage_lookups) == (0, 0)
+
+
 @pytest.mark.parametrize("pp_rank", [0, 3])
 def test_linker_pp_enqueue_matches_once_and_only_pp0_looks_up(pp_rank):
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
