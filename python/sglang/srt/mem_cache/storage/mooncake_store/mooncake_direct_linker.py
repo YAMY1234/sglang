@@ -912,13 +912,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     self.stats["offload"] += 1
                     if self.stats["offload"] == 1:
                         logger.info("Mooncake direct linker offload: tokens=%d", tokens)
+                    # The store skips objects it already holds: count what it
+                    # put, and what was offered.
+                    put = self.storage.last_put_objects
                     for transfer in expanded:
-                        self.write_bytes[transfer.name] += (
-                            len(transfer.keys) * self.object_bytes[transfer.name]
-                        )
-                    self.write_bytes["states"] += sum(
-                        len(t.keys) for t in expanded if t.name == PoolName.MAMBA
-                    )
+                        size = self.object_bytes[transfer.name]
+                        self.write_bytes[transfer.name] += put.get(transfer.name, 0) * size
+                        self.write_bytes["offered"] += len(transfer.keys) * size
+                    self.write_bytes["states"] += put.get(PoolName.MAMBA, 0)
                     if self.state_path_cap:
                         self._remove_states(victims)
                 self.offload_results.put(success)
@@ -964,7 +965,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         written, self.write_bytes = self.write_bytes, Counter()
         looked, self.lookup_counts = self.lookup_counts, Counter()
         logger.info(
-            "Linker store writes in %.0f s: %s GB/s, %d states; states removed %d "
+            "Linker store writes in %.0f s: %s GB/s new (%.2f GB/s offered), %d new "
+            "states; states removed %d "
             "(failed %d, already gone %d, lease retries %d, pending %d) of %d "
             "tracked; lookups %d, hit pages %d, truncated at a state boundary %d "
             "pages in %d lookups",
@@ -973,6 +975,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 f"{name} {written[name] / window / 1e9:.2f}"
                 for name in self.object_bytes
             ),
+            written["offered"] / window / 1e9,
             written["states"],
             self.state_removed,
             self.state_remove_failed,

@@ -557,6 +557,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             # Use the backend tag and model name as a prefix to isolate tenants
             # and models sharing one store.
             self.config_prefix = None
+            # Per pool, the objects the last batch_set_v2 put (stored ones skipped).
+            self.last_put_objects: dict = {}
             config_prefix_parts = []
             if extra_config and extra_config.get("extra_backend_tag") is not None:
                 config_prefix_parts.append(str(extra_config["extra_backend_tag"]))
@@ -1276,6 +1278,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             assert exist_result is not None
             io_results = [0 if state == 1 else -1 for state in exist_result]
             missing_idx = [i for i, state in enumerate(exist_result) if state != 1]
+            # Objects this write actually puts, per pool: keys already stored
+            # are skipped, so this is what reaches the store.
+            self.last_put_objects = {
+                name: sum(start <= i < end for i in missing_idx)
+                for name, _, start, end in prepared
+            }
             if missing_idx:
                 put_results = self._put_batch_zero_copy_impl(
                     [all_key_strs[i] for i in missing_idx],

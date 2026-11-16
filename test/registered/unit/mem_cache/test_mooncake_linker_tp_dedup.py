@@ -399,6 +399,8 @@ class _SettingStorage:
         return [f"model_{key}" for key in keys]
 
     def batch_set_v2(self, transfers, extra_info):
+        # p1 and p2 were stored already: only p3's KV and state are put.
+        self.last_put_objects = {PoolName.KV: 1, PoolName.MAMBA: 1}
         return {t.name: [self.ok] * len(t.keys) for t in transfers}
 
 
@@ -423,9 +425,17 @@ class TestOffloadAccounting(CustomTestCase):
     def test_writes_split_by_pool_and_old_states_go_after_the_new_lands(self):
         linker = self._run(ok=True)
         self.assertEqual(linker.offload_results.get_nowait(), True)
-        # Logged once and reset: the window started at 0.
-        self.assertEqual(linker.write_bytes, Counter())
         self.assertEqual(linker.storage.store.removed, ["model_p1_tp0_cp0_pp0_mamba"])
+
+    def test_write_counts_only_what_the_store_put(self):
+        # 57360/58614: offered bytes (15.1 GB/s) were 7x what the store grew by
+        # (2.2 GB/s): batch_set_v2 skips objects it already holds.
+        with patch.object(MooncakeDirectLinker, "_maybe_log_stats"):
+            linker = self._run(ok=True)
+        self.assertEqual(
+            linker.write_bytes,
+            Counter({PoolName.KV: 100, PoolName.MAMBA: 5000, "offered": 5300, "states": 1}),
+        )
 
     def test_a_failed_write_keeps_the_older_state(self):
         linker = self._run(ok=False)

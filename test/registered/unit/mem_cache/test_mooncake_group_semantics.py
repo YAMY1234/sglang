@@ -484,6 +484,24 @@ class TestMooncakeGroupSemantics(CustomTestCase):
             ["sglang-hicache:page0", "sglang-hicache:page1"],
         )
 
+    def test_v2_put_records_only_the_objects_it_puts(self):
+        store, fake_store = _make_store(extra_backend_tag="tag", is_mla_model=True)
+        store.register_mem_host_pool_v2(FakeIndexerPool(), PoolName.INDEXER)
+        fake_store.existing_keys.add("tag_page0__indexer")
+
+        store.batch_set_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.INDEXER,
+                    keys=["page0", "page1"],
+                    host_indices=torch.tensor([0, 1]),
+                )
+            ]
+        )
+
+        self.assertEqual(store.last_put_objects, {PoolName.INDEXER: 1})
+        self.assertEqual(fake_store.batch_put_calls[0]["keys"], ["tag_page1__indexer"])
+
     def test_v2_indexer_group_ids_use_logical_page_key(self):
         store, fake_store = _make_store(extra_backend_tag="tag", is_mla_model=True)
         indexer_pool = FakeIndexerPool()

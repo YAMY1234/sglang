@@ -1956,6 +1956,7 @@ class TestOffloadReadyEvents(CustomTestCase):
         order = MagicMock()
         linker.storage = order.storage
         order.storage.batch_set_v2.return_value = {}
+        order.storage.last_put_objects = {}
         linker.stats = {"offload": 1}
         linker.offload_results = queue.Queue()
         linker.offload_queue = queue.Queue()
