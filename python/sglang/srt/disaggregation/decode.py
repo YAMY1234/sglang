@@ -173,6 +173,11 @@ def _bind_root_prefix(req: Req, tree_cache: BasePrefixCache) -> None:
     req.host_hit_length = 0
 
 
+def prealloc_cap_fits(reserved_tokens: int, fill_len: int, cap_tokens: float) -> bool:
+    # With nothing reserved, admit, so one request larger than the cap still runs.
+    return reserved_tokens == 0 or reserved_tokens + fill_len <= cap_tokens
+
+
 class DecodeReqToTokenPool:
     """
     The difference of DecodeReqToTokenPool and ReqToTokenPool is that
@@ -472,6 +477,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.max_total_num_tokens = min(
                 self.max_total_num_tokens,
                 self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens,
+            )
+        if envs.SGLANG_DISAGG_DECODE_PREALLOC_CAP.get() > 0:
+            logger.info(
+                "Decode prealloc cap: %.3f of %d KV tokens "
+                "(SGLANG_DISAGG_DECODE_PREALLOC_CAP)",
+                envs.SGLANG_DISAGG_DECODE_PREALLOC_CAP.get(),
+                self.max_total_num_tokens,
             )
 
         enable_kv_checksum = get_disagg().disaggregation_enable_kv_checksum
@@ -1458,6 +1470,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             running_loras.update(r.req.lora_id for r in self.transfer_queue.queue)
             running_loras.update(req.lora_id for req in self.scheduler.waiting_queue)
 
+        cap_fraction = envs.SGLANG_DISAGG_DECODE_PREALLOC_CAP.get()
+        prealloc_cap_tokens = (
+            cap_fraction * self.max_total_num_tokens if cap_fraction > 0 else None
+        )
+        reserved_tokens = (
+            self.num_tokens_pre_allocated if prealloc_cap_tokens is not None else 0
+        )
+
         # Then, preallocate the remaining requests if possible
         for i, decode_req in enumerate(self.queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
@@ -1494,6 +1514,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 continue
 
             if self.req_to_token_pool.available_size() <= 0:
+                break
+
+            reserve_len = self._pre_alloc_fill_len(decode_req.req)
+            if prealloc_cap_tokens is not None and not prealloc_cap_fits(
+                reserved_tokens, reserve_len, prealloc_cap_tokens
+            ):
                 break
 
             # Reserve enough Mamba capacity for radix COW and tracking buffers
@@ -1844,6 +1870,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 **metadata_kwargs,
             )
             num_device_preallocated += 1
+            reserved_tokens += reserve_len
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
             if self.scheduler.enable_lora:

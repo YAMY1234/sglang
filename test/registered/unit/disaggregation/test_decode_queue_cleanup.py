@@ -1,7 +1,10 @@
+import os
 import unittest
 from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import torch
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.common.conn import KVTransferError
@@ -13,10 +16,10 @@ from sglang.srt.disaggregation.decode import (
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
 )
-from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, enter_override
 
 register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
@@ -218,6 +221,136 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
         self.assertEqual(queue.queue, [decode_req])
         mock_prepare_abort.assert_not_called()
         mock_release_kv_cache.assert_not_called()
+
+
+def _waiting_decode_req(rid, input_len=8):
+    req = MagicMock()
+    req.rid = rid
+    req.origin_input_ids = list(range(input_len))
+    req.output_ids = [99]
+    req.finished_reason = None
+    req.pd_rebootstrap_in_progress = False
+    req.sampling_params.max_new_tokens = 16
+    return SimpleNamespace(
+        req=req, waiting_for_input=True, is_rebootstrap=False, kv_receiver=None
+    )
+
+
+def _reserved(extend_end, host_staged=False):
+    return SimpleNamespace(
+        req=SimpleNamespace(extend_end=extend_end), host_staged=host_staged
+    )
+
+
+class TestDecodePreallocCap(CustomTestCase):
+    """SGLANG_DISAGG_DECODE_PREALLOC_CAP bounds the KV reserved for requests
+    whose prefill KV has not arrived; the rest wait without a reservation."""
+
+    def setUp(self):
+        _run_as_single_rank(self)
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        mamba = patch(
+            "sglang.srt.disaggregation.decode.ensure_mamba_capacity",
+            return_value=True,
+        )
+        mamba.start()
+        self.addCleanup(mamba.stop)
+
+    def _queue(self, decode_reqs, reserved, max_total_num_tokens=100):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.pp_size = 1
+        queue.queue = list(decode_reqs)
+        queue.pending_reqs = []
+        queue.retracted_queue = []
+        queue.max_total_num_tokens = max_total_num_tokens
+        queue.num_reserved_decode_tokens = 0
+        queue._resolve_pending_reqs = MagicMock()
+        queue._update_handshake_waiters = MagicMock()
+        queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
+        queue._uses_swa_reservation = MagicMock(return_value=False)
+        queue._allocatable_token_budgets = MagicMock(return_value=10**9)
+        queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
+        queue._prealloc_reservation_fits = MagicMock(return_value=True)
+        queue._pre_alloc = MagicMock(return_value=torch.arange(8))
+        queue._send_kv_metadata = MagicMock()
+        queue.transfer_queue = SimpleNamespace(queue=list(reserved))
+        queue.tree_cache = MagicMock()
+        queue.req_to_token_pool = MagicMock()
+        queue.req_to_token_pool.available_size.return_value = 8
+        queue.req_to_metadata_buffer_idx_allocator = MagicMock()
+        queue.req_to_metadata_buffer_idx_allocator.available_size.return_value = 8
+        queue.token_to_kv_pool = MagicMock()
+        queue.token_to_kv_pool_allocator = MagicMock(page_size=1)
+        queue.kv_manager = SimpleNamespace(kv_args=SimpleNamespace(state_types=[]))
+        scheduler = MagicMock()
+        scheduler.running_batch.reqs = []
+        scheduler.enable_hisparse = False
+        scheduler.enable_lora = False
+        scheduler.enable_decode_hicache = False
+        scheduler.enable_priority_scheduling = False
+        queue.scheduler = scheduler
+        return queue
+
+    def _pop(self, queue, cap):
+        env = {} if cap is None else {"SGLANG_DISAGG_DECODE_PREALLOC_CAP": cap}
+        with patch.dict(os.environ, env):
+            return queue.pop_preallocated()
+
+    def test_unset_cap_reserves_every_ready_request(self):
+        reqs = [_waiting_decode_req("a"), _waiting_decode_req("b")]
+        queue = self._queue(reqs, reserved=[_reserved(90)])
+
+        preallocated, failed = self._pop(queue, cap=None)
+
+        self.assertEqual(preallocated, reqs)
+        self.assertEqual(failed, [])
+        self.assertEqual(queue.queue, [])
+
+    def test_cap_counts_reservations_made_in_the_same_pass(self):
+        first, second = _waiting_decode_req("a"), _waiting_decode_req("b")
+        queue = self._queue([first, second], reserved=[])
+
+        # 8 + 8 tokens exceed 0.1 x 100; the head is admitted with nothing held.
+        preallocated, failed = self._pop(queue, cap="0.1")
+
+        self.assertEqual(preallocated, [first])
+        self.assertEqual(failed, [])
+        self.assertEqual(queue.queue, [second])
+        queue._pre_alloc.assert_called_once()
+
+    def test_cap_counts_device_reservations_in_the_transfer_queue(self):
+        first, second = _waiting_decode_req("a"), _waiting_decode_req("b")
+        # Host-staged receives hold no device KV and are not counted.
+        reserved = [_reserved(30), _reserved(1000, host_staged=True)]
+        queue = self._queue([first, second], reserved=reserved)
+
+        # 30 + 8 fits 0.4 x 100; 30 + 8 + 8 does not.
+        preallocated, _ = self._pop(queue, cap="0.4")
+
+        self.assertEqual(preallocated, [first])
+        self.assertEqual(queue.queue, [second])
+
+    def test_cap_waits_before_matching_or_locking_a_prefix(self):
+        enter_override(
+            self,
+            get_context().override_server_args(
+                disaggregation_decode_enable_radix_cache=True
+            ),
+        )
+        waiting = _waiting_decode_req("a")
+        queue = self._queue([waiting], reserved=[_reserved(60)])
+        queue._match_prefix_and_lock = MagicMock(
+            side_effect=AssertionError("capped request must not lock a prefix")
+        )
+
+        preallocated, failed = self._pop(queue, cap="0.5")
+
+        self.assertEqual((preallocated, failed), ([], []))
+        self.assertEqual(queue.queue, [waiting])
+        queue._pre_alloc.assert_not_called()
+        queue.tree_cache.unlock.assert_not_called()
 
 
 if __name__ == "__main__":
