@@ -796,8 +796,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """Expected storage-hit span in logical tokens for a waiting request."""
         return None
 
-    def release_prefetch_hold(self, handle: CacheRequestHandle) -> None:
-        """Drop the lock a published prefetch holds for an admitted request."""
+    def release_prefetch_hold(self, handle: CacheRequestHandle, prefix_len: int) -> None:
+        """Drop the lock a published prefetch holds for a request admitted with a
+        ``prefix_len``-token device prefix."""
 
     def pop_prefetch_loaded_span(
         self, handle: CacheRequestHandle

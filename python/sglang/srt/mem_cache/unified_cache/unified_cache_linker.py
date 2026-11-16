@@ -360,8 +360,20 @@ class UnifiedCacheLinkerWrapper:
             if self.load_mode == "prefetch" and hold_fraction > 0
             else 0
         )
+        # Published prefetches left unheld (over the cap or not resident): their end.
+        self.unheld: dict[CacheRequestHandle, int] = {}
         self._hold_stats = dict.fromkeys(
-            ("held", "over_cap", "not_resident", "admitted", "released"), 0
+            (
+                "held",
+                "over_cap",
+                "not_resident",
+                "admitted",
+                "released",
+                "unheld_kept",
+                "unheld_evicted",
+                "unheld_evicted_tokens",
+            ),
+            0,
         )
         self._hold_next_log = 0.0
         if self.hold_cap_tokens:
@@ -766,8 +778,10 @@ class UnifiedCacheLinkerWrapper:
         resident = self.cache.match_prefix(MatchPrefixParams(key=key))
         if resident.device_prefix_len < end:
             stats["not_resident"] += 1
+            self.unheld[request] = end
         elif self.held_tokens + tokens > self.hold_cap_tokens:
             stats["over_cap"] += 1
+            self.unheld[request] = end
         else:
             node = resident.last_device_node
             lock = self.cache.inc_lock_ref(node).to_dec_params()
@@ -776,13 +790,25 @@ class UnifiedCacheLinkerWrapper:
             stats["held"] += 1
         self._log_holds()
 
-    def release_hold(self, request: CacheRequestHandle, *, admitted: bool) -> None:
+    def release_hold(
+        self, request: CacheRequestHandle, *, admitted: bool, prefix_len: int = 0
+    ) -> None:
+        stats = self._hold_stats
+        end = self.unheld.pop(request, None)
+        if end is not None and admitted:
+            # An unheld prefix the request no longer matches in full was evicted.
+            if prefix_len < end:
+                stats["unheld_evicted"] += 1
+                stats["unheld_evicted_tokens"] += end - prefix_len
+            else:
+                stats["unheld_kept"] += 1
         hold = self.holds.pop(request, None)
-        if hold is None:
-            return
-        self.cache.dec_lock_ref(hold.node_id, hold.lock)
-        self.held_tokens -= hold.tokens
-        self._hold_stats["admitted" if admitted else "released"] += 1
+        if hold is not None:
+            self.cache.dec_lock_ref(hold.node_id, hold.lock)
+            self.held_tokens -= hold.tokens
+            stats["admitted" if admitted else "released"] += 1
+        if admitted:
+            self._log_holds()
 
     def _log_holds(self) -> None:
         now = time.monotonic()
@@ -1098,6 +1124,7 @@ class UnifiedCacheLinkerWrapper:
             self._cancel_lookup(request)
         for request in list(self.holds):
             self.release_hold(request, admitted=False)
+        self.unheld.clear()
         self.hit_markers.clear()
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()

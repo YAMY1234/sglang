@@ -549,7 +549,7 @@ class TestLinkerDevicePrefetch(CustomTestCase):
                 cache.evict(EvictParams(num_tokens=6))
                 assert self._match(cache, req).device_prefix_len == 6
                 if admitted:
-                    cache.release_prefetch_hold(handle)
+                    cache.release_prefetch_hold(handle, 6)
                 else:
                     cache.linker.release_request(handle)
                 assert not cache.linker.holds and cache.linker.held_tokens == 0
@@ -559,6 +559,33 @@ class TestLinkerDevicePrefetch(CustomTestCase):
                 assert self._match(cache, req).device_prefix_len == 0
                 self._assert_balanced(cache, allocator)
                 cache.sanity_check()
+
+    def test_unheld_publication_counts_eviction_before_admission(self):
+        """A prefix published without a hold (over the cap) is counted at
+        admission as kept, or as evicted with the tokens the request lost."""
+        from sglang.srt.environ import envs
+
+        # 0.1 x 32 slots = 3 tokens, under the 6-token published prefix.
+        for evicted in (False, True):
+            with (
+                self.subTest(evicted=evicted),
+                envs.SGLANG_EXTERNAL_LINKER_PREFETCH_HOLD_FRACTION.override(0.1),
+            ):
+                cache, backend, req, allocator = self._fixture()
+                handle = req.cache_request_handle
+                self._publish(cache, backend, req)
+                assert cache.linker.unheld == {handle: 6}
+                if evicted:
+                    cache.evict(EvictParams(num_tokens=6))
+                cache.release_prefetch_hold(handle, self._match(cache, req).device_prefix_len)
+                stats = cache.linker._hold_stats
+                assert not cache.linker.unheld
+                if evicted:
+                    assert (stats["unheld_evicted"], stats["unheld_evicted_tokens"]) == (1, 6)
+                else:
+                    assert (stats["unheld_kept"], stats["unheld_evicted"]) == (1, 0)
+                cache.linker.release_request(handle)
+                self._assert_balanced(cache, allocator)
 
     def test_unheld_publication_stays_evictable_off_or_over_the_cap(self):
         from sglang.srt.environ import envs
