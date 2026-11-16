@@ -690,6 +690,8 @@ class TestLinkerDevicePrefetch(CustomTestCase):
             assert self._admit_poll(cache, req)
             self._land_last_prefetch(cache, backend, req)
             assert len(cache.linker._requery_waits) == 1
+            rq = cache.linker._phase_s["rq"]
+            assert rq["n"] == 1 and rq["rpc"] > 0 and rq["load"] > 0
             assert self._match(cache, req).device_prefix_len == 6
             self._admit_and_release(cache, req)
             self._assert_balanced(cache, allocator)
