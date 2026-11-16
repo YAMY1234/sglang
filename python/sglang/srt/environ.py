@@ -941,6 +941,9 @@ class Envs:
     # expected within QUEUE_LOCK_SECONDS of admissions; 0 keeps them unlocked.
     SGLANG_EXTERNAL_LINKER_QUEUE_LOCK_FRACTION = EnvFloat(0.0)
     SGLANG_EXTERNAL_LINKER_QUEUE_LOCK_SECONDS = EnvFloat(4.0)
+    # With the queue lock and device-loss re-query on: an enqueue-time load for a
+    # request queued beyond that window starts when the window reaches it.
+    SGLANG_EXTERNAL_LINKER_QUEUE_LOCK_DEFER_FAR_LOADS = EnvBool(False)
     # External linker prefetch mode: log lookup counters (issued, skipped for a
     # device anchor with no storage hash, zero restorable, re-queried) every 60 s.
     SGLANG_EXTERNAL_LINKER_LOOKUP_STATS = EnvBool(False)

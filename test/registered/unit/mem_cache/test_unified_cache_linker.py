@@ -934,6 +934,41 @@ class TestLinkerDevicePrefetch(CustomTestCase):
             self._admit_and_release(cache, req)
             self._assert_balanced(cache, allocator)
 
+    def test_queue_lock_defers_loads_beyond_the_window(self):
+        """With far loads deferred, a request arriving behind a full window is looked
+        up but starts no load until the window reaches it; one arriving inside the
+        window loads at once."""
+        from sglang.srt.environ import envs
+
+        with (
+            envs.SGLANG_EXTERNAL_LINKER_QUEUE_LOCK_FRACTION.override(0.5),
+            envs.SGLANG_EXTERNAL_LINKER_QUEUE_LOCK_DEFER_FAR_LOADS.override(True),
+            envs.SGLANG_EXTERNAL_LINKER_REQUERY_ON_DEVICE_LOSS.override(True),
+        ):
+            cache, backend, head, allocator = self._fixture()
+            linker = cache.linker
+            queued = [head, self._request(rid="second", start=30)]
+            cache.protect_queued_prefixes(queued, depth_override=1)
+            far = self._request(rid="far", start=50)
+            self._enqueue(cache, far)
+            assert backend.prefetch.call_count == 0
+            assert linker._lookup_stats["deferred_far"] == 1
+            assert linker.match_targets[far.cache_request_handle] == 6
+            cache.protect_queued_prefixes([far], depth_override=1)
+            assert linker._qlock_stats["lookahead_requeries"] == 1
+            near = self._request(rid="near", start=70)
+            self._enqueue(cache, near)
+            assert backend.prefetch.call_count == 1
+            cache.check_hicache_events()
+            assert backend.prefetch.call_count == 2
+            for req in queued + [far, near]:
+                linker.release_request(req.cache_request_handle)
+            for future in backend.prefetch_futures:
+                if not future.done():
+                    future.set_result(False)
+            cache.check_hicache_events()
+            self._assert_balanced(cache, allocator)
+
     def test_expired_poll_starts_no_load(self):
         """An admission poll that stops an expired prefetch settles reads but
         starts no load for a finished lookup; the event-loop boundary does."""

@@ -26,6 +26,7 @@ Prefetch publishes complete KV before admission and recomputes failed reads.
 from __future__ import annotations
 
 import collections
+import itertools
 import logging
 import math
 import time
@@ -419,9 +420,25 @@ class UnifiedCacheLinkerWrapper:
             and envs.SGLANG_EXTERNAL_LINKER_REQUERY_ON_DEVICE_LOSS.get()
         )
         self.match_targets: dict[CacheRequestHandle, int] = {}
+        # The look-ahead re-query loads a deferred request once the window reaches it.
+        self.qlock_defer_far = (
+            bool(self.qlock_cap_tokens)
+            and self.requery_on_device_loss
+            and envs.SGLANG_EXTERNAL_LINKER_QUEUE_LOCK_DEFER_FAR_LOADS.get()
+        )
+        # The last queue walk's window, and whether requests queued behind it.
+        self._window: set[CacheRequestHandle] = set()
+        self._window_full = False
         self.log_lookup_stats = envs.SGLANG_EXTERNAL_LINKER_LOOKUP_STATS.get()
         self._lookup_stats = dict.fromkeys(
-            ("issued", "skipped_no_hash", "zero_restorable", "requeried", "load_capped"),
+            (
+                "issued",
+                "skipped_no_hash",
+                "zero_restorable",
+                "requeried",
+                "load_capped",
+                "deferred_far",
+            ),
             0,
         )
         # Re-queries wait for the next event-loop boundary, so no load starts
@@ -606,7 +623,15 @@ class UnifiedCacheLinkerWrapper:
         anchor_lock = self.cache.inc_lock_ref(req.last_node).to_dec_params()
         t2 = time.perf_counter() if timed else 0.0
         self._start_prefetch_load(
-            request, key, hashes, start, req.last_node, anchor_lock, restorable, timeout_s
+            request,
+            key,
+            hashes,
+            start,
+            req.last_node,
+            anchor_lock,
+            restorable,
+            timeout_s,
+            kind=kind,
         )
         if timed:
             self._phase_s[kind]["load"] += time.perf_counter() - t2
@@ -631,6 +656,8 @@ class UnifiedCacheLinkerWrapper:
         anchor_lock: DecLockRefParams,
         restorable: list[int],
         timeout_s: float,
+        *,
+        kind: str,
     ) -> None:
         """Agree on the restorable prefix across ranks and queue its load."""
         page = self.cache.page_size
@@ -644,6 +671,11 @@ class UnifiedCacheLinkerWrapper:
         end = start + pages * page
         if request in self.match_targets:
             self.match_targets[request] = end
+        if kind == "enq" and self._beyond_window(request):
+            # The target stays, so the look-ahead re-query loads it in the window.
+            self._lookup_stats["deferred_far"] += 1
+            self.cache.dec_lock_ref(anchor_node_id, anchor_lock)
+            return
         cap = self._load_cap()
         if cap:
             # In-flight private slots (plus holds, under a shared cap) stay under the
@@ -871,6 +903,7 @@ class UnifiedCacheLinkerWrapper:
                     lookup.anchor_lock,
                     restorable,
                     lookup.timeout_s,
+                    kind=lookup.kind,
                 )
                 if self.log_lookup_stats:
                     self._phase_s[lookup.kind]["load"] += time.perf_counter() - t0
@@ -1035,6 +1068,9 @@ class UnifiedCacheLinkerWrapper:
             return
         # A pipeline stage that admits at other times takes stage 0's depth instead.
         depth_cap = self.qlock_depth_cap() if depth_override is None else depth_override
+        if self.qlock_defer_far:
+            self._window = {r.cache_request_handle for r in itertools.islice(reqs, depth_cap)}
+            self._window_full = len(reqs) > depth_cap
         # Look-ahead loads take load-cap room head first; a lookup the cap would refuse
         # is not sent, so a full cap does not turn into a lookup every loop.
         room = self._load_room()
@@ -1131,6 +1167,10 @@ class UnifiedCacheLinkerWrapper:
         self._pending_requeries[request] = req
         if self.log_lookup_stats:
             self._requery_started[request] = time.perf_counter()
+
+    def _beyond_window(self, request: CacheRequestHandle) -> bool:
+        """Queued behind the last walk's full window: new arrivals join the tail."""
+        return self.qlock_defer_far and self._window_full and request not in self._window
 
     def _load_room(self) -> float:
         """Load-cap tokens free for new loads now; unbounded without a cap."""
@@ -1470,6 +1510,8 @@ class UnifiedCacheLinkerWrapper:
             self._release_qlock(request, admitted=False)
         self._qlock_empty.clear()
         self._qlock_short.clear()
+        self._window.clear()
+        self._window_full = False
         self.unheld.clear()
         self.match_targets.clear()
         self._pending_requeries.clear()
