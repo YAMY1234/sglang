@@ -954,8 +954,9 @@ class Envs:
     SGLANG_LINKER_LEASE_REFRESH_MAX_KEYS_PER_S = EnvInt(100000)
     # Log each Mooncake linker load's wait, transfer time, bytes and rate.
     SGLANG_LINKER_LOG_LOAD_TIMING = EnvBool(False)
-    # JSON {"numa<N>": "hca,hca"}: the Mooncake HCAs for a GPU on NUMA node N (e.g.
-    # both of its rails), ahead of MOONCAKE_DEVICE, which stays a plain list.
+    # "numa0:hca,hca;numa1:hca,hca": the Mooncake HCAs for a GPU on each NUMA node
+    # (e.g. both of its rails), ahead of MOONCAKE_DEVICE, which stays a plain list.
+    # No braces: launchers format env values as templates.
     SGLANG_MOONCAKE_DEVICE_BY_NUMA = EnvStr("")
     MOONCAKE_MASTER = EnvStr(None)
     MOONCAKE_CLIENT = EnvStr(None)

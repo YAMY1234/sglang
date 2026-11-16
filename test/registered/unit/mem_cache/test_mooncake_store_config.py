@@ -74,7 +74,8 @@ class TestMooncakeDeviceNameResolution(CustomTestCase):
         self.assertEqual(self._resolve(self._BY_NUMA, 0, 0), "roce_vf0_r1,roce_vf0_r2")
 
     def test_numa_env_wins_over_a_plain_device_list(self):
-        with envs.SGLANG_MOONCAKE_DEVICE_BY_NUMA.override(self._BY_NUMA):
+        by_numa = "numa0:roce_vf0_r1,roce_vf0_r2;numa1:roce_vf0_r3,roce_vf0_r4"
+        with envs.SGLANG_MOONCAKE_DEVICE_BY_NUMA.override(by_numa):
             self.assertEqual(
                 self._resolve("roce_vf0_r1,roce_vf0_r3", 0, 1), "roce_vf0_r3,roce_vf0_r4"
             )

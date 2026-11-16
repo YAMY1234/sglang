@@ -315,7 +315,9 @@ def _resolve_device_name(device_name: str, tp_rank: Optional[int]) -> str:
     by_numa = envs.SGLANG_MOONCAKE_DEVICE_BY_NUMA.get()
     if by_numa:
         numa_node = _local_gpu_numa_node()
-        devices = json.loads(by_numa).get(f"numa{numa_node}")
+        devices = dict(
+            entry.strip().split(":", 1) for entry in by_numa.split(";") if entry.strip()
+        ).get(f"numa{numa_node}")
         if numa_node is not None and devices:
             logger.info(f"Mooncake devices for NUMA node {numa_node}: {devices}")
             return devices
