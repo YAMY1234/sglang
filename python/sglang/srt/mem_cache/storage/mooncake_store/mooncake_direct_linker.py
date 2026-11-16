@@ -4,6 +4,7 @@ import hashlib
 import logging
 import threading
 import time
+from collections.abc import Callable
 from copy import deepcopy
 from queue import Empty, Queue
 
@@ -16,8 +17,12 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
+)
+from sglang.srt.mem_cache.storage.mooncake_store.linker_lease_refresh import (
+    LinkerLeaseRefresher,
 )
 from sglang.srt.mem_cache.unified_cache.linker_mla_dedup import (
     LinkerMLADedupBroadcaster,
@@ -145,6 +150,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         forward_stream=None,
     ):
         self.forward_stream = forward_stream
+        self.log_load_timing = envs.SGLANG_LINKER_LOG_LOAD_TIMING.get()
         self.page_size = params.page_size
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         self.pool_group = resolve_hybrid_device_pool_group(
@@ -232,6 +238,36 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             dict(sorted(self.storage.pool_suffixes.items())),
         )
 
+        # Under PP, PP0 looks up every stage's objects (lookup_stages), so each
+        # stage publishes how its pools name them.
+        self.stage_schemas = [self._pool_key_schema()]
+        if params.pp_size > 1:
+            self.stage_schemas = [None] * params.pp_size
+            torch.distributed.all_gather_object(
+                self.stage_schemas, self._pool_key_schema(), group=params.pp_cache_group
+            )
+            logger.info(
+                "Mooncake direct linker PP stage key schemas: %s", self.stage_schemas
+            )
+        self.lease_refresher = None
+        interval = envs.SGLANG_LINKER_LEASE_REFRESH_INTERVAL.get()
+        # PP0 renews every stage's objects; other PP ranks renew none.
+        if interval > 0 and self.offload_owner and params.pp_rank == 0:
+            self.lease_refresher = LinkerLeaseRefresher(
+                build_keys=self._lease_keys,
+                renew=self.storage._batch_exist,
+                interval_s=interval,
+                max_keys_per_s=envs.SGLANG_LINKER_LEASE_REFRESH_MAX_KEYS_PER_S.get(),
+            )
+            self.lease_refresher.start()
+            logger.info(
+                "Mooncake direct linker lease refresh on: every %.0f s per prefix, "
+                "at most %d keys/s, e.g. %s",
+                interval,
+                envs.SGLANG_LINKER_LEASE_REFRESH_MAX_KEYS_PER_S.get(),
+                self._lease_keys(["<page>"]),
+            )
+
         self.register_buffers()
         self.mla_broadcaster = None
         self.tp_group = tp_group
@@ -311,6 +347,85 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 len(restorable),
             )
         return restorable
+
+    def _pool_key_schema(self) -> list[tuple[str, str, str, bool]]:
+        """(pool, object name, key suffix, trailing) for every pool a lookup
+        checks, as _get_hybrid_page_component_keys names their objects: one
+        object per page, or for a trailing pool one per stop point."""
+        schema = []
+        for name in self.pools:
+            obj = "k" if name == PoolName.KV else str(name)
+            suffix = self.storage.pool_suffixes.get(name, self.storage.mla_suffix)
+            schema.append((str(name), obj, suffix, name == PoolName.MAMBA))
+        return schema
+
+    def lookup_stages(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
+        """lookup() over every PP stage's objects, from one rank: the prefix
+        lengths (pages) at which all stages can restore every pool, so the hit
+        PP0 relays is one every stage can load. Trailing (state) objects are
+        sparse, so they are queried first and the all-pages objects only up to
+        the deepest common stop point."""
+        kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
+        page_keys = list(kv.keys)
+        num_pages = len(page_keys)
+        if not num_pages:
+            return []
+
+        def keys_for(entries, pages):
+            return self.storage._tag_keys(
+                [f"{page}_{suffix}_{obj}" for _, obj, suffix, _ in entries for page in pages]
+            )
+
+        trailing = [e for schema in self.stage_schemas for e in schema if e[3]]
+        all_pages = [e for schema in self.stage_schemas for e in schema if not e[3]]
+        stops = set(range(1, num_pages + 1))
+        if trailing:
+            exists = self.storage._batch_exist(keys_for(trailing, page_keys))
+            for i in range(len(trailing)):
+                part = exists[i * num_pages : (i + 1) * num_pages]
+                stops &= {p + 1 for p, value in enumerate(part) if value == 1}
+        if not stops:
+            self.stats["lookup"] += 1
+            return []
+        deepest = max(stops)
+        contiguous = deepest
+        exists = self.storage._batch_exist(keys_for(all_pages, page_keys[:deepest]))
+        for i in range(len(all_pages)):
+            part = exists[i * deepest : (i + 1) * deepest]
+            contiguous = min(
+                contiguous, next((p for p, value in enumerate(part) if value != 1), deepest)
+            )
+        restorable = sorted(p for p in stops if p <= contiguous)
+        self.stats["lookup"] += 1
+        if restorable:
+            logger.info(
+                "Mooncake direct linker PP lookup hit: rid=%s pages=%d candidates=%d "
+                "stages=%d",
+                rid,
+                restorable[-1],
+                len(restorable),
+                len(self.stage_schemas),
+            )
+        return restorable
+
+    def _lease_keys(self, page_hashes: list[str]) -> list[str]:
+        """Every stage's all-pages objects of these pages, and the state at the
+        last one (a device hit's stop point)."""
+        keys = []
+        for schema in self.stage_schemas:
+            for _, obj, suffix, is_trailing in schema:
+                pages = page_hashes[-1:] if is_trailing else page_hashes
+                keys.extend(f"{page}_{suffix}_{obj}" for page in pages)
+        return self.storage._tag_keys(keys)
+
+    def refresh_device_prefix(self, anchor: object, hashes: Callable) -> None:
+        """Renew the store leases of a device-served prefix ending at ``anchor``
+        (its page hashes from ``hashes()``), at most once per interval."""
+        refresher = self.lease_refresher
+        if refresher is not None and refresher.is_due(anchor):
+            page_hashes = hashes()
+            if page_hashes:
+                refresher.submit(anchor, page_hashes)
 
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
         # Query establishes a boundary at which every component is restorable;
@@ -648,6 +763,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.layer_done_counter.reset()
 
     def close(self) -> None:
+        if self.lease_refresher is not None:
+            self.lease_refresher.stop()
         self.reset()
         self.load_queue.put(None)
         self.offload_queue.put(None)

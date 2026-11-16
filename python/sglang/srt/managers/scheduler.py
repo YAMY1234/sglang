@@ -3557,6 +3557,14 @@ class Scheduler(
             recv_req.pp_prefetch_ticketed = bool(self._prefetch_kvcache(req))
             self.tree_cache.bind_prefetch_ticket(req.rid, recv_req.pp_prefetch_ticketed)
 
+        linker = getattr(self.tree_cache, "linker", None)
+        if linker is not None and linker.pp_size > 1:
+            # PP0 looks up every stage's store objects once; the result rides
+            # this request to the later stages (relayed after processing).
+            req.linker_pp_hit = recv_req.linker_pp_hit
+            self.tree_cache.linker_pp_enqueue(req)
+            recv_req.linker_pp_hit = req.linker_pp_hit
+
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:
             self._add_request_to_queue(req)

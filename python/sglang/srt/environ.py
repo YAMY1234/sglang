@@ -939,6 +939,21 @@ class Envs:
     # ===================================================================
     SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_MOONCAKE_REUSE_TE = EnvBool(True)
+    # External cache linker under pipeline parallelism: PP0 looks up every
+    # stage's objects once per request at enqueue and relays the restorable
+    # boundaries with the request, so every stage admits the same hit.
+    SGLANG_LINKER_PP = EnvBool(False)
+    # Reuse a request's store lookup across scheduling passes instead of one
+    # synchronous lookup per match (SPF matches every waiting request per pass).
+    SGLANG_LINKER_LOOKUP_ONCE = EnvBool(False)
+    # Seconds between store lease renewals of a prefix the device serves; 0 is
+    # off. Mooncake evicts the oldest lease first, and only a lookup or read
+    # renews one, so a prefix that keeps hitting on the device ages from its write.
+    SGLANG_LINKER_LEASE_REFRESH_INTERVAL = EnvFloat(0.0)
+    # Cap on the lease renewal existence queries, in object keys per second.
+    SGLANG_LINKER_LEASE_REFRESH_MAX_KEYS_PER_S = EnvInt(100000)
+    # Log each Mooncake linker load's wait, transfer time, bytes and rate.
+    SGLANG_LINKER_LOG_LOAD_TIMING = EnvBool(False)
     MOONCAKE_MASTER = EnvStr(None)
     MOONCAKE_CLIENT = EnvStr(None)
     MOONCAKE_LOCAL_HOSTNAME = EnvStr("localhost")

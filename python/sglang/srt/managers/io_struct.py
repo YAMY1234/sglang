@@ -1177,6 +1177,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
     # LoRA adapter name; KV events namespace this request's blocks by it.
     lora_name: Optional[str] = None
+    # Internal PP field, set by PP0 before forwarding the request: its external
+    # linker lookup (Req.linker_pp_hit). Append-only tail field.
+    linker_pp_hit: Optional[Tuple[int, List[int]]] = None
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)

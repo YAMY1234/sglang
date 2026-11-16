@@ -293,6 +293,45 @@ class MooncakeStoreConfig:
         )
 
 
+def _local_gpu_numa_node() -> Optional[int]:
+    """NUMA node of the current CUDA device from sysfs, or None when unknown."""
+    try:
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        bdf = (
+            f"{props.pci_domain_id:04x}:{props.pci_bus_id:02x}:"
+            f"{props.pci_device_id:02x}.0"
+        )
+        with open(f"/sys/bus/pci/devices/{bdf}/numa_node") as f:
+            node = int(f.read().strip())
+    except (AttributeError, OSError, RuntimeError, ValueError):
+        return None
+    return node if node >= 0 else None
+
+
+def _resolve_device_name(device_name: str, tp_rank: Optional[int]) -> str:
+    """A JSON device_name maps "numa<N>" (this GPU's NUMA node: e.g. both of its
+    rails, for one PP stage per GPU) or a TP rank to its HCAs; other values pass
+    through."""
+    if not device_name or not device_name.strip().startswith("{"):
+        return device_name
+    try:
+        device_config = json.loads(device_name)
+        numa_node = _local_gpu_numa_node()
+        if numa_node is not None and f"numa{numa_node}" in device_config:
+            logger.info(
+                f"Mooncake devices for NUMA node {numa_node}: "
+                f"{device_config[f'numa{numa_node}']}"
+            )
+            return device_config[f"numa{numa_node}"]
+        if tp_rank is None:
+            return ""
+        # Try both integer and string keys since JSON parsing may convert keys
+        return device_config.get(tp_rank, "") or device_config.get(str(tp_rank), "")
+    except (json.JSONDecodeError, AttributeError):
+        logger.warning(f"Failed to parse device_name as JSON: {device_name}")
+        return ""
+
+
 class MooncakeBaseStore:
     def __init__(self):
         self.store = None
@@ -491,24 +530,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             if self.config.check_server:
                 self.check_server()
 
-            # Handle JSON device_name configuration
-            device_name = self.config.device_name
-            if device_name and device_name.strip().startswith("{"):
-                try:
-                    device_config = json.loads(device_name)
-                    if storage_config and hasattr(storage_config, "tp_rank"):
-                        tp_rank = storage_config.tp_rank
-                        # Try both integer and string keys since JSON parsing may convert keys
-                        device_name = device_config.get(tp_rank, "")
-                        if not device_name:
-                            device_name = device_config.get(str(tp_rank), "")
-                    else:
-                        device_name = ""
-                except (json.JSONDecodeError, AttributeError):
-                    logger.warning(
-                        f"Failed to parse device_name as JSON: {device_name}"
-                    )
-                    device_name = ""
+            device_name = _resolve_device_name(
+                self.config.device_name,
+                getattr(storage_config, "tp_rank", None),
+            )
             if self.config.standalone_storage:
                 if not isinstance(mem_pool.allocator, MooncakeHostTensorAllocator):
                     raise RuntimeError(

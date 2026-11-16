@@ -23,6 +23,7 @@ reaches nothing but its own requests, which the scheduler aborts.
 from __future__ import annotations
 
 import logging
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
@@ -30,6 +31,7 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     MatchResult,
@@ -219,6 +221,15 @@ class UnifiedCacheLinker(ABC):
     def pop_completed_offload(self) -> bool:
         """Consume the oldest completed offload and return its result."""
 
+    def lookup_stages(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
+        """lookup() over every pipeline stage's objects (SGLANG_LINKER_PP)."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support pipeline parallelism."
+        )
+
+    def refresh_device_prefix(self, anchor: object, hashes: Callable) -> None:
+        """Renew the store leases of a prefix the device serves; optional."""
+
     @abstractmethod
     def reset(self) -> None:
         """Quiesce all transfers and reset backend state before returning."""
@@ -283,6 +294,16 @@ class UnifiedCacheLinkerWrapper:
         self.inflight_load_index = -1
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[_PendingOffload] = []
+        # Under PP every stage admits from PP0's lookup at enqueue
+        # (Req.linker_pp_hit); otherwise SGLANG_LINKER_LOOKUP_ONCE reuses a
+        # request's lookup across scheduling passes: rid -> (device prefix the
+        # lookup started from, restorable prefix lengths in tokens).
+        self.pp_size = getattr(cache, "pp_size", 1)
+        self.pp_rank = getattr(cache, "pp_rank", 0)
+        self.lookup_once = envs.SGLANG_LINKER_LOOKUP_ONCE.get()
+        self.lookup_cache: dict[str, tuple[int, list[int]]] = {}
+        # rid -> (device prefix, tail length, tail page hashes) of its last match.
+        self.tail_hash_cache: dict[str, tuple[int, int, list[str]]] = {}
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -312,18 +333,29 @@ class UnifiedCacheLinkerWrapper:
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
         device_hit_len = result.device_prefix_len
+        if device_hit_len > 0:
+            self.cache_linker.refresh_device_prefix(
+                result.last_device_node,
+                lambda: cache.tree_core.get_prefix_hash_values(result.last_device_node),
+            )
         if device_hit_len >= len(key):
             return result
 
-        tail_hashes = self._tail_hashes(key, result, device_hit_len)
+        known = self._known_restorable(req, device_hit_len)
+        if known is not None and not known:
+            return result
+
+        tail_hashes = self._cached_tail_hashes(key, req, result, device_hit_len)
         if not tail_hashes:
             return result
 
         lookup_transfers = self._lookup_transfers(tail_hashes)
         if not lookup_transfers:
             return result
+        if known is None:
+            known = self._lookup(req, device_hit_len, lookup_transfers)
         hit_pages = self._sync_restorable_prefix(
-            self.cache_linker.lookup(req.rid, lookup_transfers),
+            known,
             num_pages=len(tail_hashes),
             device_hit_pages=0,
         )
@@ -353,6 +385,58 @@ class UnifiedCacheLinkerWrapper:
                 result.mamba_host_hit_length, mamba_host_hit_length
             ),
         )
+
+    def _known_restorable(self, req: Req, device_hit_len: int) -> Optional[list[int]]:
+        """Restorable prefix lengths in pages past ``device_hit_len`` from an
+        earlier lookup, or None when this match must look the store up. Under PP
+        only PP0's enqueue match looks up; every rank then uses its relayed
+        result, so all stages admit the same hit without a store query."""
+        if self.pp_size > 1:
+            if req.linker_pp_lookup_pending:
+                return None
+            entry = req.linker_pp_hit
+            if entry is None or device_hit_len < entry[0]:
+                # Pages between this device hit and the looked-up start were not
+                # checked; deterministic on every stage.
+                return []
+        elif self.lookup_once:
+            entry = self.lookup_cache.get(req.rid)
+            if entry is None or device_hit_len < entry[0]:
+                return None
+        else:
+            return None
+        page = self.cache.page_size
+        return [(end - device_hit_len) // page for end in entry[1] if end > device_hit_len]
+
+    def _lookup(
+        self, req: Req, device_hit_len: int, transfers: list[PoolTransfer]
+    ) -> list[int]:
+        page = self.cache.page_size
+        if self.pp_size > 1:
+            pages = self.cache_linker.lookup_stages(req.rid, transfers)
+            req.linker_pp_hit = (device_hit_len, [device_hit_len + p * page for p in pages])
+            return pages
+        pages = self.cache_linker.lookup(req.rid, transfers)
+        if self.lookup_once:
+            self.lookup_cache[req.rid] = (
+                device_hit_len,
+                [device_hit_len + p * page for p in pages],
+            )
+        return pages
+
+    def _cached_tail_hashes(
+        self, key: RadixKey, req: Req, result: MatchResult, device_hit_len: int
+    ) -> list[str]:
+        """_tail_hashes, kept per request while its device prefix and length hold:
+        SPF re-matches every waiting request on every pass."""
+        if not (self.pp_size > 1 or self.lookup_once):
+            return self._tail_hashes(key, result, device_hit_len)
+        cached = self.tail_hash_cache.get(req.rid)
+        if cached is not None and cached[:2] == (device_hit_len, len(key)):
+            return cached[2]
+        hashes = self._tail_hashes(key, result, device_hit_len)
+        self.tail_hash_cache[req.rid] = (device_hit_len, len(key), hashes)
+        return hashes
 
     def _sync_restorable_prefix(
         self, restorable: list[int], *, num_pages: int, device_hit_pages: int
@@ -556,6 +640,19 @@ class UnifiedCacheLinkerWrapper:
             self.cache_linker.num_completed_offloads(), len(self.pending_offloads)
         )
 
+    def wait_completed_offloads(self, count: int, timeout_s: float = 600.0) -> None:
+        """Block until this rank has ``count`` finished offloads to take: a
+        later PP stage commits PP0's count, and its own puts of the same nodes
+        were issued at the same logical step, so they land within milliseconds."""
+        deadline = time.monotonic() + timeout_s
+        while self.cache_linker.num_completed_offloads() < count:
+            if time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"External linker offloads stalled: {count} committed on PP0, "
+                    f"{self.cache_linker.num_completed_offloads()} finished here."
+                )
+            time.sleep(0.0005)
+
     def take_completed_offloads(self, finish_count: int) -> list[bool]:
         assert finish_count <= len(self.pending_offloads)
         return [self.cache_linker.pop_completed_offload() for _ in range(finish_count)]
@@ -611,6 +708,8 @@ class UnifiedCacheLinkerWrapper:
     def reset(self) -> None:
         self.cache_linker.reset()
         self.hit_markers.clear()
+        self.lookup_cache.clear()
+        self.tail_hash_cache.clear()
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()
         self.inflight_load_index = -1
@@ -626,6 +725,8 @@ class UnifiedCacheLinkerWrapper:
 
     def release_request(self, rid: str) -> None:
         self.hit_markers.pop(rid, None)
+        self.lookup_cache.pop(rid, None)
+        self.tail_hash_cache.pop(rid, None)
         # A queued load targets slots the request owns and is about to free.
         # A started one is finished by finish_loads before anything is freed.
         if rid in self.inflight_load_rids and self.cache_linker.cancel_queued_load(rid):

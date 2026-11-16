@@ -4167,6 +4167,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
+        if self.linker is not None and self.pp_size > 1:
+            self._check_linker_events_pp()
+            return
         if self.linker is not None:
             finish_counts = torch.tensor(
                 [self.linker.num_completed_offloads()],
@@ -4222,6 +4225,44 @@ class UnifiedRadixCache(BasePrefixCache):
             if not hasattr(storage_metrics, "prefetch_stats"):
                 storage_metrics.prefetch_stats = self.prefetch_outcome_stats_snapshot()
             self.storage_metrics_collector.log_storage_metrics(storage_metrics)
+
+    def _check_linker_events_pp(self) -> None:
+        """Offload completions under PP: an offload holds a tree lock until it
+        commits, so every stage must commit the same offloads at the same step
+        or their trees (and admissions) diverge. PP0 decides the count and the
+        verdicts and _pp_sync carries them down; a later stage first waits for
+        its own puts of those nodes, issued at the same logical step."""
+        self._drain_async_work()
+        finish_counts = torch.tensor(
+            [self.linker.num_completed_offloads()], dtype=torch.int, device="cpu"
+        )
+        self._all_reduce(finish_counts, torch.distributed.ReduceOp.MIN)
+        offload_count = int(finish_counts.item())
+        if offload_count == 0:
+            return
+        if self.pp_rank > 0:
+            self.linker.wait_completed_offloads(offload_count)
+        successes = torch.tensor(
+            self.linker.take_completed_offloads(offload_count),
+            dtype=torch.int,
+            device="cpu",
+        )
+        self._all_reduce(successes, torch.distributed.ReduceOp.MIN)
+        self.linker.commit_completed_offloads(
+            [bool(success) for success in successes.tolist()]
+        )
+
+    def linker_pp_enqueue(self, req: Req) -> None:
+        """One device match per new request on every PP rank, at the same point
+        so the trees stay identical. On PP0 the external linker also looks up
+        every stage's objects (UnifiedCacheLinkerWrapper.match) into
+        req.linker_pp_hit, which the scheduler relays; later ranks arrive with
+        it already set."""
+        req.linker_pp_lookup_pending = self.pp_rank == 0
+        try:
+            req.init_next_round_input(self, cow_mamba=False)
+        finally:
+            req.linker_pp_lookup_pending = False
 
     def flush_pending_backups(self) -> None:
         """Submit pending D2H backups as a merged operation."""

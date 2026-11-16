@@ -1533,7 +1533,12 @@ class SchedulerDisaggregationPrefillMixin:
             != "prefill_complete"
             and self.kv_checksum_computer is None
             and not self.enable_staging
-            and not self.enable_unified_cache_external_linker
+            # A linker hit's pages land before the forward's layers launch, so
+            # the forward-fenced send reads them; allowed under SGLANG_LINKER_PP.
+            and (
+                not self.enable_unified_cache_external_linker
+                or envs.SGLANG_LINKER_PP.get()
+            )
             and not self.spec_algorithm.is_eagle()
             and not _is_npu
         )

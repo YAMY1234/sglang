@@ -1257,6 +1257,11 @@ class Req(ReqDllmMixin):
         self.host_hit_is_storage = False
         self.storage_prefetch_retry_attempts = 0
         self.staged_prefetch_plan: Optional[StagedPrefetchPlan] = None
+        # External linker under PP (SGLANG_LINKER_PP): PP0's store lookup at
+        # enqueue, relayed to every stage as (device prefix it started from,
+        # restorable prefix lengths in tokens), and PP0's request for it.
+        self.linker_pp_hit: Optional[tuple[int, list[int]]] = None
+        self.linker_pp_lookup_pending = False
         # The tree lock this request holds; None while it runs on a session
         # slot's record or holds no lock.
         self.lock: Optional[TreeLock] = None
