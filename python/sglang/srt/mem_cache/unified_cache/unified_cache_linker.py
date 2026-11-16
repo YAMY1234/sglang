@@ -151,6 +151,8 @@ class UnifiedCacheLinker(ABC):
     forward_stream: Optional[torch.cuda.Stream] = None
     # Log each request's load time and bytes.
     log_load_timing: bool = False
+    # Seconds the last pin_hit waited on the store.
+    last_pin_rpc_s: float = 0.0
 
     def record_offload_ready(self) -> list[torch.cuda.Event]:
         """Record the events an offload waits on before it reads device pages.
@@ -229,6 +231,15 @@ class UnifiedCacheLinker(ABC):
 
     def refresh_device_prefix(self, anchor: object, hashes: Callable) -> None:
         """Renew the store leases of a prefix the device serves; optional."""
+
+    def pin_hit(self, rid: str, transfers: list[PoolTransfer]) -> Optional[int]:
+        """Under PP, as a relayed hit is admitted: hold this stage's objects of
+        it until its load and return how many leading pages it can load. None:
+        not supported, so PP0 looks a stale or shrunk hit up again instead."""
+        return None
+
+    def unpin(self, rid: str) -> None:
+        """Release what pin_hit holds for ``rid`` when it will not load."""
 
     @abstractmethod
     def reset(self) -> None:
@@ -325,6 +336,11 @@ class UnifiedCacheLinkerWrapper:
             0,
         )
         self.pp_counts_logged_at = time.monotonic()
+        # PP admissions with a hit: (seconds in load_back, seconds of it waiting
+        # on pin_hit's store call); and pins that found an object gone.
+        self.admission_samples: list[tuple[float, float]] = []
+        self.admission_rpc_s = 0.0
+        self.pp_load_holes = 0
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -468,7 +484,45 @@ class UnifiedCacheLinkerWrapper:
     def _pp_fresh_hit_pages(
         self, req: Req, hit: ExternalCacheHitMarker, forced: bool = False
     ) -> int:
-        """Pages of ``hit`` to load, the same on every stage. PP0 looked the hit
+        """Pages of ``hit`` to load, the same on every stage. Every stage pins
+        its objects of the hit (pin_hit): the store's read-session start checks
+        them and holds them until the load. An object evicted since PP0's
+        lookup shrinks the hit to the deepest stop PP0 finds below it, and the
+        rest is recomputed rather than failed. Rhea 60076: looking every stale
+        or shrunk hit up again held PP0 on the master's ExistKey ceiling."""
+        admitted = len(hit.tail_hashes)
+        transfers = self._lookup_transfers(hit.tail_hashes)
+        pinned = self.cache_linker.pin_hit(req.rid, transfers) if transfers else None
+        if pinned is None:
+            return self._pp_relookup_hit_pages(req, hit, forced)
+        self.admission_rpc_s = self.cache_linker.last_pin_rpc_s
+        keep = torch.tensor([min(pinned, admitted)], dtype=torch.int64)
+        self.cache._all_reduce(keep, torch.distributed.ReduceOp.MIN)
+        if int(keep[0]) < admitted:
+            # Every stage drops its pins; the next pass pins the shorter hit.
+            self.cache_linker.unpin(req.rid)
+            self.pp_load_holes += 1
+            best = torch.tensor([admitted], dtype=torch.int64)
+            if self.pp_rank == 0:
+                pages = self.cache_linker.lookup_stages(req.rid, transfers)
+                best[0] = max((p for p in pages if p <= int(keep[0])), default=0)
+            self.cache._all_reduce(best, torch.distributed.ReduceOp.MIN)
+            logger.info(
+                "Linker PP admission found a hole: rid=%s, objects up to page %d of "
+                "%d; loading %d",
+                req.rid,
+                int(keep[0]),
+                admitted,
+                int(best[0]),
+            )
+            keep = best
+        self._maybe_log_pp_counts()
+        return int(keep[0])
+
+    def _pp_relookup_hit_pages(
+        self, req: Req, hit: ExternalCacheHitMarker, forced: bool
+    ) -> int:
+        """_pp_fresh_hit_pages for a linker that cannot pin. PP0 looked the hit
         up at enqueue; once that is older than the store's lease, its objects
         may have been evicted while the request queued (Rhea 57360: a 354 s wait
         failed its load), so PP0 looks them up again, as an unrelayed match
@@ -499,17 +553,46 @@ class UnifiedCacheLinkerWrapper:
                 self.pp_relookups_shrunk,
             )
         self.cache._all_reduce(keep, torch.distributed.ReduceOp.MIN)
-        if self.pp_rank == 0 and now - self.pp_counts_logged_at >= 60:
-            logger.info(
-                "Linker PP admissions in %.0f s: anchor-shrunk hits %d (re-looked "
-                "up %d: %d pages recovered, %d lost; %d without a re-lookup), stale "
-                "re-lookups %d (shrunk %d)",
-                now - self.pp_counts_logged_at,
-                *self.pp_counts.values(),
-            )
-            self.pp_counts = dict.fromkeys(self.pp_counts, 0)
-            self.pp_counts_logged_at = now
+        self._maybe_log_pp_counts()
         return int(keep[0])
+
+    def _maybe_log_pp_counts(self) -> None:
+        now = time.monotonic()
+        if self.pp_rank != 0 or now - self.pp_counts_logged_at < 60:
+            return
+        window = now - self.pp_counts_logged_at
+        logger.info(
+            "Linker PP admissions in %.0f s: anchor-shrunk hits %d (re-looked "
+            "up %d: %d pages recovered, %d lost; %d without a re-lookup), stale "
+            "re-lookups %d (shrunk %d)",
+            window,
+            *self.pp_counts.values(),
+        )
+        samples, self.admission_samples = self.admission_samples, []
+        total = sorted(seconds * 1e3 for seconds, _ in samples)
+        rpc = sorted(rpc_s * 1e3 for _, rpc_s in samples)
+        rest = sorted((seconds - rpc_s) * 1e3 for seconds, rpc_s in samples)
+
+        def pct(values, q):
+            return values[min(len(values) - 1, int(q * len(values)))] if values else 0.0
+
+        logger.info(
+            "Linker PP admission timing in %.0f s: %d admissions with a hit, ms "
+            "p50 %.1f p90 %.1f (session start p50 %.1f p90 %.1f, rest p50 %.1f "
+            "p90 %.1f); load holes %d",
+            window,
+            len(samples),
+            pct(total, 0.5),
+            pct(total, 0.9),
+            pct(rpc, 0.5),
+            pct(rpc, 0.9),
+            pct(rest, 0.5),
+            pct(rest, 0.9),
+            self.pp_load_holes,
+        )
+        self.pp_load_holes = 0
+        self.pp_counts = dict.fromkeys(self.pp_counts, 0)
+        self.pp_counts_logged_at = now
 
     def _cached_tail_hashes(
         self, key: RadixKey, req: Req, result: MatchResult, device_hit_len: int
@@ -576,6 +659,18 @@ class UnifiedCacheLinkerWrapper:
         computed KV after its forward, once :meth:`finish_loads` has confirmed
         the load.
         """
+        if self.pp_size == 1 or req.rid not in self.hit_markers:
+            return self._load_back(req)
+        began = time.monotonic()
+        self.admission_rpc_s = 0.0
+        try:
+            return self._load_back(req)
+        finally:
+            self.admission_samples.append(
+                (time.monotonic() - began, self.admission_rpc_s)
+            )
+
+    def _load_back(self, req: Req) -> tuple[int, NodeId]:
         cache = self.cache
         hit = self.hit_markers.pop(req.rid, None)
         if hit is None:
@@ -612,6 +707,7 @@ class UnifiedCacheLinkerWrapper:
                 LinkerTransferPhase.LOAD, None, tail_hashes
             )
             if transfer is None:
+                self.cache_linker.unpin(req.rid)
                 self._update_load(
                     ExternalLinkerLoadPhase.ABORT,
                     req,
@@ -631,11 +727,13 @@ class UnifiedCacheLinkerWrapper:
                 req.rid, [transfer for _, transfer in component_transfers]
             )
         except BaseException:
+            self.cache_linker.unpin(req.rid)
             self._update_load(
                 ExternalLinkerLoadPhase.ABORT, req, component_transfers, prefix_len
             )
             raise
         if not queued:
+            self.cache_linker.unpin(req.rid)
             self._update_load(
                 ExternalLinkerLoadPhase.ABORT, req, component_transfers, prefix_len
             )

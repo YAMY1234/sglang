@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+    PoolHitPolicy,
     PoolName,
     PoolTransfer,
 )
@@ -178,6 +179,33 @@ def _resident_by_numa(numa_maps: str = "/proc/self/numa_maps") -> dict[int, int]
     return held
 
 
+def _percentile(values: list[float], q: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    return ordered[min(len(ordered) - 1, int(q * len(ordered)))]
+
+
+class _RecentKeys:
+    """Object keys read from the store lately, oldest dropped past capacity: a
+    write-through of a tail that was just loaded skips their existence query
+    and put. Added on the scheduler thread, read on the offload thread."""
+
+    def __init__(self, capacity: int):
+        self.capacity = capacity
+        self.keys: dict[str, None] = {}
+
+    def add(self, keys: list[str]) -> None:
+        for key in keys:
+            self.keys.pop(key, None)
+            self.keys[key] = None
+        while len(self.keys) > self.capacity:
+            self.keys.pop(next(iter(self.keys)))
+
+    def __contains__(self, key: str) -> bool:
+        return key in self.keys
+
+
 class MooncakeDirectLinker(UnifiedCacheLinker):
     # Set False at init: the first lookup, load or offload logs NUMA headroom.
     _numa_first_request_logged = True
@@ -212,6 +240,15 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         }
         self.write_bytes: Counter = Counter()
         self.lookup_counts: Counter = Counter()
+        # (keys queried, seconds) per PP lookup and per admission pin, and the
+        # pins that found a hole, since the last stats line.
+        self.lookup_samples: list[tuple[int, float]] = []
+        self.pin_samples: list[tuple[int, float]] = []
+        self.pin_holes = 0
+        # rid -> object keys whose read sessions pin_hit started; the load
+        # thread ends them (load_pins: the batch's pinned rids by load index).
+        self.pinned: dict[str, list[str]] = {}
+        self.load_pins: dict[int, frozenset] = {}
         self.stats_logged_at = time.monotonic()
         # Store-side state path cap: each state this rank wrote -> the deepest
         # earlier state on its path (None at the root), and its child count.
@@ -265,6 +302,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.state_path_cap = 0
         self.storage.mem_pool_host = self.pool_group
         self.storage.registered_pools = self.pools
+        self.storage.recently_loaded = _RecentKeys(500_000)
         storage_suffix = _storage_suffix(
             rank_replicated=rank_replicated,
             tp_rank=tp_rank,
@@ -461,44 +499,85 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def lookup_stages(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
         """lookup() over every PP stage's objects, from one rank: the prefix
         lengths (pages) at which all stages can restore every pool, so the hit
-        PP0 relays is one every stage can load. Trailing (state) objects are
-        sparse, so they are queried first and the all-pages objects only up to
-        the deepest common stop point."""
+        PP0 relays is one every stage can load.
+
+        A stop point needs every stage's state there. States are sparse, so one
+        stage's are queried at every page and the other stages' only at its
+        stops. The all-pages objects are then probed at stops, deepest first
+        (binary search): a page with every stage's objects is taken to have all
+        earlier ones. A hole below it (an eviction) fails that stage's
+        admission pin (pin_hit), which shrinks the hit instead of a read.
+        Rhea 60076: querying every object of every page (about 24 per page)
+        held PP0 on the master's ExistKey ceiling."""
         self._log_numa_first_request()
+        began = time.monotonic()
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
         page_keys = list(kv.keys)
         num_pages = len(page_keys)
         if not num_pages:
             return []
+        queried = 0
 
         def keys_for(entries, pages):
             return self.storage._tag_keys(
                 [f"{page}_{suffix}_{obj}" for _, obj, suffix, _ in entries for page in pages]
             )
 
-        trailing = [e for schema in self.stage_schemas for e in schema if e[3]]
+        def exist(keys):
+            nonlocal queried
+            queried += len(keys)
+            return self.storage._batch_exist(keys) if keys else []
+
+        def all_found(found, entries, count):
+            # Per position: every entry's object exists (entry-major layout).
+            return [
+                all(found[i * count + j] == 1 for i in range(entries))
+                for j in range(count)
+            ]
+
+        first = [e for e in self.stage_schemas[0] if e[3]]
+        others = [e for schema in self.stage_schemas[1:] for e in schema if e[3]]
         all_pages = [e for schema in self.stage_schemas for e in schema if not e[3]]
-        stops = set(range(1, num_pages + 1))
-        if trailing:
-            exists = self.storage._batch_exist(keys_for(trailing, page_keys))
-            for i in range(len(trailing)):
-                part = exists[i * num_pages : (i + 1) * num_pages]
-                stops &= {p + 1 for p, value in enumerate(part) if value == 1}
-        if not stops:
-            self.stats["lookup"] += 1
-            self._count_lookup(page_keys, 0)
-            return []
-        deepest = max(stops)
-        contiguous = deepest
-        exists = self.storage._batch_exist(keys_for(all_pages, page_keys[:deepest]))
-        for i in range(len(all_pages)):
-            part = exists[i * deepest : (i + 1) * deepest]
-            contiguous = min(
-                contiguous, next((p for p, value in enumerate(part) if value != 1), deepest)
-            )
-        restorable = sorted(p for p in stops if p <= contiguous)
+        if first:
+            found = all_found(exist(keys_for(first, page_keys)), len(first), num_pages)
+            candidates = [page + 1 for page in range(num_pages) if found[page]]
+        else:
+            candidates = list(range(1, num_pages + 1))
+
+        stops = []
+        if candidates:
+            deepest = candidates[-1]
+            check = keys_for(others, [page_keys[p - 1] for p in candidates])
+            found = exist(check + keys_for(all_pages, [page_keys[deepest - 1]]))
+            have = all_found(found, len(others), len(candidates))
+            stops = [p for p, ok in zip(candidates, have) if ok]
+            probed = {deepest: all(value == 1 for value in found[len(check) :])}
+
+        def complete(stop):
+            if stop not in probed:
+                found = exist(keys_for(all_pages, [page_keys[stop - 1]]))
+                probed[stop] = all(value == 1 for value in found)
+            return probed[stop]
+
+        # Deepest stop whose page every stage holds; complete() is monotone
+        # (True up to the first hole, then False).
+        last = -1
+        low, high = 0, len(stops) - 1
+        if stops and complete(stops[high]):
+            last = high
+        else:
+            high -= 1
+            while low <= high:
+                mid = (low + high) // 2
+                if complete(stops[mid]):
+                    last, low = mid, mid + 1
+                else:
+                    high = mid - 1
+        restorable = stops[: last + 1]
         self.stats["lookup"] += 1
-        self._count_lookup(page_keys, restorable[-1] if restorable else 0)
+        self.lookup_counts["lookups"] += 1
+        self.lookup_counts["hit_pages"] += restorable[-1] if restorable else 0
+        self.lookup_samples.append((queried, time.monotonic() - began))
         if restorable:
             logger.info(
                 "Mooncake direct linker PP lookup hit: rid=%s pages=%d candidates=%d "
@@ -510,22 +589,63 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             )
         return restorable
 
-    def _count_lookup(self, page_keys: list[str], hit: int) -> None:
-        """Lookup counters; the pages past the hit whose KV this stage still
-        stores were lost at a state boundary (no state to resume from)."""
-        self.lookup_counts["lookups"] += 1
-        self.lookup_counts["hit_pages"] += hit
-        tail = page_keys[hit:]
-        if not tail:
-            return
-        _, obj, suffix, _ = next(e for e in self.stage_schemas[0] if e[1] == "k")
-        exists = self.storage._batch_exist(
-            self.storage._tag_keys([f"{page}_{suffix}_{obj}" for page in tail])
+    def _object_keys(
+        self, expanded: list[PoolTransfer]
+    ) -> tuple[list[str], list[tuple[bool, int, int]]]:
+        """This stage's object keys for ``expanded`` as a load reads them, and
+        per transfer (trailing, first, end) in that list."""
+        keys, spans = [], []
+        for transfer in expanded:
+            component_keys, _ = self.storage._get_hybrid_page_component_keys(
+                list(transfer.keys), transfer
+            )
+            first = len(keys)
+            keys.extend(self.storage._tag_keys(component_keys))
+            trailing = transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES
+            spans.append((trailing, first, len(keys)))
+        return keys, spans
+
+    def pin_hit(self, rid: str, transfers: list[PoolTransfer]) -> int | None:
+        """Start this stage's read sessions for a hit as it is admitted. The
+        session start is the admission check (an object evicted since the
+        lookup shows here, before any forward reads it) and the pin that keeps
+        the objects until the load ends the sessions. Returns how many leading
+        pages this stage can load: all, or up to the first object that is gone
+        (none of its sessions are kept then). None: no pin (MLA dedup peers
+        read through the source's broadcast)."""
+        if self.mla_broadcaster is not None:
+            return None
+        num_pages = len(
+            next(transfer for transfer in transfers if transfer.name == PoolName.KV).keys
         )
-        kv_pages = next((i for i, value in enumerate(exists) if value != 1), len(tail))
-        if kv_pages:
-            self.lookup_counts["truncated_pages"] += kv_pages
-            self.lookup_counts["truncated_lookups"] += 1
+        expanded = self.pool_group.resolve_transfers(
+            transfers, allow_partial=True, allow_missing_kv=True
+        )
+        keys, spans = self._object_keys(expanded)
+        began = time.monotonic()
+        result = list(self.storage.store.batch_get_session_start(keys)) if keys else []
+        self.last_pin_rpc_s = time.monotonic() - began
+        self.pin_samples.append((len(keys), self.last_pin_rpc_s))
+        if all(value == 0 for value in result):
+            self.pinned[rid] = keys
+            return num_pages
+        # Even a partial start may have installed some sessions.
+        self.storage.store.batch_get_session_end(keys)
+        self.pin_holes += 1
+        pages = num_pages
+        for trailing, first, end in spans:
+            missing = next(
+                (i for i, value in enumerate(result[first:end]) if value != 0), None
+            )
+            if missing is not None:
+                # A trailing object is the state at the last page only.
+                pages = min(pages, num_pages - 1 if trailing else missing)
+        return pages
+
+    def unpin(self, rid: str) -> None:
+        keys = self.pinned.pop(rid, None)
+        if keys:
+            self.storage.store.batch_get_session_end(keys)
 
     def _lease_keys(self, page_hashes: list[str]) -> list[str]:
         """Every stage's all-pages objects of these pages, and the state at the
@@ -559,12 +679,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if rid in self.pending_loads:
             raise RuntimeError(f"Mooncake load for rid={rid} is already queued.")
         self.pending_loads[rid] = expanded
+        self.storage.recently_loaded.add(
+            self.pinned.get(rid) or self._object_keys(expanded)[0]
+        )
         if self.log_load_timing:
             self.load_queued_at[rid] = time.monotonic()
         return True
 
     def cancel_queued_load(self, rid: str) -> bool:
         self.load_queued_at.pop(rid, None)
+        self.unpin(rid)
         return self.pending_loads.pop(rid, None) is not None
 
     def finish_layer_wise_loading(self, counter_index: int) -> bool:
@@ -608,6 +732,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         }
 
         counter_index = self.layer_done_counter.update_producer()
+        pins = frozenset(rid for rid in pending if self.pinned.pop(rid, None))
+        if pins:
+            self.load_pins[counter_index] = pins
         if broadcaster is not None:
             indices = {}
             for transfers in pending.values():
@@ -673,6 +800,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         counter_index,
                         list(pending.values()),
                         [(rid, queued_at.get(rid)) for rid in pending],
+                        pinned=self.load_pins.pop(counter_index, frozenset()),
                     )
                 except BaseException as error:
                     self.layer_done_counter.fail(counter_index, error)
@@ -726,10 +854,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         counter_index: int,
         request_transfers: list[list[PoolTransfer]],
         requests: list[tuple[str, float | None]] | None = None,
+        pinned: frozenset = frozenset(),
     ) -> None:
         """``requests`` names each entry of ``request_transfers`` and when its
         load was queued; with ``log_load_timing`` each one is logged once all
-        layers land."""
+        layers land. ``pinned``: rids whose sessions pin_hit already started;
+        their sessions end here with the rest."""
         started = []
         began = time.monotonic()
         timed = self.log_load_timing and requests is not None
@@ -737,8 +867,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         spans: list[list[tuple[PoolName, int, int]]] = []
         try:
             batches: dict[PoolName, tuple[list[str], list[int]]] = {}
-            for transfers in request_transfers:
+            unpinned: dict[PoolName, list[str]] = {}
+            rids = [rid for rid, _ in requests] if requests else []
+            for index, transfers in enumerate(request_transfers):
                 span = []
+                pinned_here = index < len(rids) and rids[index] in pinned
                 for transfer in transfers:
                     keys, locations = batches.setdefault(transfer.name, ([], []))
                     component_keys, _ = self.storage._get_hybrid_page_component_keys(
@@ -746,6 +879,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     )
                     first = len(keys)
                     keys.extend(self.storage._tag_keys(component_keys))
+                    if not pinned_here:
+                        unpinned.setdefault(transfer.name, []).extend(keys[first:])
                     span.append((transfer.name, first, len(keys)))
                     locations.extend(
                         self.pools[transfer.name].prepare_locations(
@@ -754,9 +889,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     )
                 spans.append(span)
             loaded = [0] * len(request_transfers)
-            for keys, _ in batches.values():
-                # Even a partial start failure may have installed some sessions.
-                started.append(keys)
+            # Ends every session of the batch, the pinned ones too; even a
+            # partial start failure may have installed some.
+            started.extend(keys for keys, _ in batches.values())
+            for keys in unpinned.values():
                 result = self.storage.store.batch_get_session_start(keys)
                 if list(result) != [0] * len(keys):
                     raise RuntimeError(
@@ -915,6 +1051,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     # The store skips objects it already holds: count what it
                     # put, and what was offered.
                     put = self.storage.last_put_objects
+                    self.write_bytes["exist_skipped"] += self.storage.last_exist_skipped
                     for transfer in expanded:
                         size = self.object_bytes[transfer.name]
                         self.write_bytes[transfer.name] += put.get(transfer.name, 0) * size
@@ -964,12 +1101,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         window, self.stats_logged_at = now - self.stats_logged_at, now
         written, self.write_bytes = self.write_bytes, Counter()
         looked, self.lookup_counts = self.lookup_counts, Counter()
+        lookups, self.lookup_samples = self.lookup_samples, []
+        pins, self.pin_samples = self.pin_samples, []
+        holes, self.pin_holes = self.pin_holes, 0
         logger.info(
             "Linker store writes in %.0f s: %s GB/s new (%.2f GB/s offered), %d new "
             "states; states removed %d "
             "(failed %d, already gone %d, lease retries %d, pending %d) of %d "
-            "tracked; lookups %d, hit pages %d, truncated at a state boundary %d "
-            "pages in %d lookups",
+            "tracked; lookups %d, hit pages %d",
             window,
             ", ".join(
                 f"{name} {written[name] / window / 1e9:.2f}"
@@ -985,8 +1124,30 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             len(self.state_parent),
             looked["lookups"],
             looked["hit_pages"],
-            looked["truncated_pages"],
-            looked["truncated_lookups"],
+        )
+        lookup_keys = [keys for keys, _ in lookups]
+        lookup_ms = [seconds * 1e3 for _, seconds in lookups]
+        pin_keys = [keys for keys, _ in pins]
+        pin_ms = [seconds * 1e3 for _, seconds in pins]
+        logger.info(
+            "Linker store queries in %.0f s: %d lookups (%.1f/s), keys per lookup "
+            "p50 %d p90 %d, lookup ms p50 %.1f p90 %.1f; %d session starts, keys "
+            "p50 %d p90 %d, ms p50 %.1f p90 %.1f, load holes %d; write-through "
+            "existence queries skipped for %d loaded objects",
+            window,
+            len(lookups),
+            len(lookups) / window,
+            _percentile(lookup_keys, 0.5),
+            _percentile(lookup_keys, 0.9),
+            _percentile(lookup_ms, 0.5),
+            _percentile(lookup_ms, 0.9),
+            len(pins),
+            _percentile(pin_keys, 0.5),
+            _percentile(pin_keys, 0.9),
+            _percentile(pin_ms, 0.5),
+            _percentile(pin_ms, 0.9),
+            holes,
+            written["exist_skipped"],
         )
 
     def num_completed_offloads(self) -> int:
@@ -996,6 +1157,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return self.offload_results.get_nowait()
 
     def reset(self) -> None:
+        for rid in list(self.pinned):
+            self.unpin(rid)
         self.pending_loads.clear()
         self.load_queued_at.clear()
         self.load_queue.join()

@@ -9,7 +9,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName
 from sglang.srt.mem_cache.storage.mooncake_store import mooncake_direct_linker
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
@@ -38,7 +38,10 @@ class _Pool:
 
 def _transfer(name, pages):
     return SimpleNamespace(
-        name=name, keys=[f"{name}-{i}" for i in range(pages)], host_indices=range(pages)
+        name=name,
+        keys=[f"{name}-{i}" for i in range(pages)],
+        host_indices=range(pages),
+        hit_policy=PoolHitPolicy.ALL_PAGES,
     )
 
 
@@ -48,6 +51,7 @@ def _linker(log_load_timing):
     linker.num_layers = 2
     linker.pools = {name: _Pool(name) for name in KEY_BYTES}
     linker.layer_done_counter = MagicMock()
+    linker.pinned, linker.load_pins = {}, {}
     store = MagicMock()
     store.batch_get_session_start.side_effect = lambda keys: [0] * len(keys)
     store.batch_get_into_multi_buffer_ranges.side_effect = (
@@ -57,6 +61,7 @@ def _linker(log_load_timing):
         store=store,
         _get_hybrid_page_component_keys=lambda keys, transfer: (keys, 1),
         _tag_keys=lambda keys: keys,
+        recently_loaded=mooncake_direct_linker._RecentKeys(16),
     )
     return linker
 
@@ -95,6 +100,19 @@ class TestMooncakeLinkerLoadTiming(CustomTestCase):
                         )
                 info.assert_not_called()
                 self.assertEqual(linker.layer_done_counter.fail.called, fail)
+
+    def test_sessions_pinned_at_admission_are_not_started_again(self):
+        linker = _linker(log_load_timing=False)
+        a, b = _transfer(PoolName.KV, 2), _transfer(PoolName.SWA, 1)
+        linker.load_layer_wise(
+            7, [[a], [b]], [("a", 0.0), ("b", 0.0)], pinned=frozenset({"a"})
+        )
+        store = linker.storage.store
+        # Only b's object is started; a's sessions (pinned) end with b's.
+        store.batch_get_session_start.assert_called_once_with(b.keys)
+        ended = [c.args[0] for c in store.batch_get_session_end.call_args_list]
+        self.assertEqual(sorted(sum(ended, [])), sorted(a.keys + b.keys))
+        linker.layer_done_counter.fail.assert_not_called()
 
     def test_queue_time_follows_the_request_into_the_load_thread(self):
         linker = _linker(log_load_timing=True)

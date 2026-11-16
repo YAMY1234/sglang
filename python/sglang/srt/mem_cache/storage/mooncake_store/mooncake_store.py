@@ -559,6 +559,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             self.config_prefix = None
             # Per pool, the objects the last batch_set_v2 put (stored ones skipped).
             self.last_put_objects: dict = {}
+            # Objects the last batch_set_v2 took as stored without asking.
+            self.last_exist_skipped = 0
             config_prefix_parts = []
             if extra_config and extra_config.get("extra_backend_tag") is not None:
                 config_prefix_parts.append(str(extra_config["extra_backend_tag"]))
@@ -1249,7 +1251,17 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if not prepared:
             return {}
 
-        exist_result = self._batch_exist(all_key_strs) if is_set else None
+        exist_result = None
+        if is_set:
+            # Objects a load just read are stored: skip their query (and put).
+            recent = getattr(self, "recently_loaded", None) or ()
+            ask = [i for i, key in enumerate(all_key_strs) if key not in recent]
+            exist_result = [1] * len(all_key_strs)
+            if ask:
+                found = self._batch_exist([all_key_strs[i] for i in ask])
+                for i, state in zip(ask, found):
+                    exist_result[i] = state
+            self.last_exist_skipped = len(all_key_strs) - len(ask)
         for host_pool, host_indices, key_strs, key_multiplier, start in buffer_requests:
             pool_ptrs, pool_sizes = self._build_pool_buffer_meta(
                 host_pool=host_pool,

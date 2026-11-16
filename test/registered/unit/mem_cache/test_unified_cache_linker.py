@@ -1733,6 +1733,63 @@ def test_pp_hit_relayed_with_no_stops_is_looked_up_again_when_its_device_prefix_
         assert "r2" not in pp0.pp_forced_relookup
 
 
+class _PinningLinker(_CountingLinker):
+    """pin_hit returns pages[rid] (default: the whole hit) and records it."""
+
+    def __init__(self, stage_restorable=(), pages=None):
+        super().__init__(stage_restorable=stage_restorable)
+        self.pages, self.pins, self.unpins = dict(pages or {}), [], []
+        self.last_pin_rpc_s = 0.004
+
+    def pin_hit(self, rid, transfers):
+        kv = next(t for t in transfers if t.name == PoolName.KV)
+        self.pins.append(rid)
+        return self.pages.get(rid, len(kv.keys))
+
+    def unpin(self, rid):
+        self.unpins.append(rid)
+
+
+def test_pp_admission_pins_the_hit_and_a_hole_shrinks_it_before_the_load(
+    full_linker_component,
+):
+    # Rhea 60076: every stale or shrunk hit was looked up again on PP0 at
+    # admission. The stages pin the hit instead; an object evicted since the
+    # lookup shrinks it to a stop PP0 finds below the hole, and the request
+    # waits a pass instead of failing its load.
+    with patch(
+        "sglang.srt.mem_cache.unified_cache.unified_cache_linker.get_storage_hash_str",
+        side_effect=_page_hashes,
+    ):
+        backend = _PinningLinker(stage_restorable=[1, 3], pages={"hole": 2})
+        pp0 = _match_wrapper(
+            full_linker_component,
+            backend,
+            pp_size=8,
+            pp_rank=0,
+            _all_reduce=lambda data, op: None,
+        )
+        req = SimpleNamespace(rid="r", linker_pp_hit=None, linker_pp_lookup_pending=True)
+        assert pp0.match(_KEY, req, _device_result(0)).host_hit_length == 6
+        pp0.pp_lookup_time["r"] -= pp0.stale_after_s + 1  # stale: pinned, not re-looked up
+        assert pp0._pp_fresh_hit_pages(req, pp0.hit_markers["r"]) == 3
+        assert (backend.pins, backend.unpins, backend.stage_lookups) == (["r"], [], 1)
+        assert pp0.admission_rpc_s == backend.last_pin_rpc_s
+
+        hole = SimpleNamespace(
+            rid="hole", linker_pp_hit=None, linker_pp_lookup_pending=True
+        )
+        pp0.match(_KEY, hole, _device_result(0))
+        hole.linker_pp_lookup_pending = False
+        backend.stage_restorable = [1]  # the deepest stop below the hole
+        assert pp0.load_back(hole) is None
+        assert backend.unpins == ["hole"]
+        assert (pp0.pp_load_holes, backend.stage_lookups) == (1, 3)
+        assert hole.linker_pp_hit == (0, [2])
+        assert len(pp0.admission_samples) == 1
+        assert pp0.match(_KEY, hole, _device_result(0)).host_hit_length == 2
+
+
 def test_pp_fresh_hit_loads_without_a_second_lookup(full_linker_component):
     with patch(
         "sglang.srt.mem_cache.unified_cache.unified_cache_linker.get_storage_hash_str",
@@ -2000,6 +2057,7 @@ class TestOffloadReadyEvents(CustomTestCase):
         linker.storage = order.storage
         order.storage.batch_set_v2.return_value = {}
         order.storage.last_put_objects = {}
+        order.storage.last_exist_skipped = 0
         linker.stats = {"offload": 1}
         linker.offload_results = queue.Queue()
         linker.offload_queue = queue.Queue()

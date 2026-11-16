@@ -5,12 +5,18 @@ holds both kinds at once, so the choice is per pool: KV, indexer and an MLA
 draft are shared, while TP-sharded KDA state keeps its own rank namespace."""
 
 import queue
+import random
 import unittest
 from collections import Counter, deque
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+)
 from sglang.srt.mem_cache.storage.mooncake_store.linker_lease_refresh import (
     LinkerLeaseRefresher,
 )
@@ -221,6 +227,7 @@ def _linker_over_stages(present, num_stages=3):
     linker.stage_schemas = [_stage_schema(stage) for stage in range(num_stages)]
     linker.stats = {"lookup": 0, "load": 0, "offload": 0}
     linker.lookup_counts = Counter()
+    linker.lookup_samples = []
     return linker
 
 
@@ -237,7 +244,7 @@ def _stored(stages, pages, states):
 class TestLookupStages(CustomTestCase):
     """Under PP, PP0 checks every stage's objects so the hit it relays is one
     every stage can load: a stop point needs every stage's state there and
-    every stage's KV and indexer pages up to it."""
+    every stage's KV and indexer pages up to it, probed at the stop."""
 
     def _lookup(self, linker):
         page_keys = [f"p{page}" for page in range(1, 5)]
@@ -249,29 +256,37 @@ class TestLookupStages(CustomTestCase):
         present.discard("model_p4_tp0_cp0_pp2_mamba")  # stage 2 lost its state at 4
         self.assertEqual(self._lookup(_linker_over_stages(present)), [2])
 
-    def test_a_missing_page_on_one_stage_caps_the_hit(self):
+    def test_a_missing_page_at_a_stop_caps_the_hit(self):
         present = _stored(range(3), range(1, 5), states={2, 4})
-        present.discard("model_p2_tp0_cp0_pp1_indexer")
+        present.discard("model_p4_tp0_cp0_pp1_indexer")
+        self.assertEqual(self._lookup(_linker_over_stages(present)), [2])
+        present.discard("model_p2_tp0_cp0_pp2_k")
         self.assertEqual(self._lookup(_linker_over_stages(present)), [])
+
+    def test_a_hole_below_a_probed_stop_is_left_to_the_admission_pin(self):
+        # Only stops are probed: page 3 is gone, page 4 is there, so the hit
+        # reaches 4 and pin_hit's session start finds the hole at admission.
         present = _stored(range(3), range(1, 5), states={2, 4})
         present.discard("model_p3_tp0_cp0_pp1_k")
-        self.assertEqual(self._lookup(_linker_over_stages(present)), [2])
+        self.assertEqual(self._lookup(_linker_over_stages(present)), [2, 4])
 
-    def test_all_page_objects_are_queried_only_up_to_the_deepest_stop(self):
+    def test_one_stage_states_every_page_the_others_only_at_its_stops(self):
         linker = _linker_over_stages(_stored(range(3), range(1, 5), states={2}))
         self.assertEqual(self._lookup(linker), [2])
-        trailing, all_pages, past_hit = linker.storage.queries
-        self.assertEqual(len(trailing), 3 * 4)  # every stage's state, every page
-        self.assertEqual(len(all_pages), 3 * 2 * 2)  # stages x pools x pages 1-2
-        # Truncation count: stage 0's KV past the hit, pages 3-4.
-        self.assertEqual(past_hit, ["model_p3_tp0_cp0_pp0_k", "model_p4_tp0_cp0_pp0_k"])
+        (states, stops_and_probe) = linker.storage.queries
+        self.assertEqual(states, [f"model_p{p}_tp0_cp0_pp0_mamba" for p in range(1, 5)])
+        # Stages 1-2's state at stop 2, then every stage's KV and indexer at 2.
+        self.assertEqual(
+            stops_and_probe,
+            ["model_p2_tp0_cp0_pp1_mamba", "model_p2_tp0_cp0_pp2_mamba"]
+            + [f"model_p2_tp0_cp0_pp{s}_{o}" for s in range(3) for o in ("k", "indexer")],
+        )
 
     def test_no_common_state_skips_the_page_query(self):
         linker = _linker_over_stages(_stored(range(2), range(1, 5), states={2}))
         self.assertEqual(self._lookup(linker), [])
-        # The state query, then only the truncation count's KV query.
         self.assertEqual(len(linker.storage.queries), 2)
-        self.assertEqual(linker.lookup_counts["truncated_pages"], 4)
+        self.assertEqual(dict(linker.lookup_counts), {"lookups": 1, "hit_pages": 0})
 
     def test_lease_keys_renew_every_stage_pages_and_the_last_state(self):
         linker = _linker_over_stages(set(), num_stages=2)
@@ -288,16 +303,145 @@ class TestLookupStages(CustomTestCase):
         )
 
 
-class TestLookupTruncation(CustomTestCase):
-    def test_kv_past_the_last_common_state_counts_as_truncated(self):
-        # KV and indexer on every stage up to page 4, states only at page 2.
-        linker = _linker_over_stages(_stored(range(3), range(1, 5), states={2}))
-        transfers = [PoolTransfer(name=PoolName.KV, keys=[f"p{p}" for p in range(1, 5)])]
-        self.assertEqual(linker.lookup_stages("rid", transfers), [2])
-        self.assertEqual(
-            dict(linker.lookup_counts),
-            {"lookups": 1, "hit_pages": 2, "truncated_pages": 2, "truncated_lookups": 1},
-        )
+def _full_scan(present, num_pages, num_stages):
+    """Stops where every stage holds its state, up to the first page any stage
+    lacks KV or indexer: the restorable prefixes a lookup must report."""
+    stops = [
+        p
+        for p in range(1, num_pages + 1)
+        if all(f"model_p{p}_tp0_cp0_pp{s}_mamba" in present for s in range(num_stages))
+    ]
+    contiguous = next(
+        (
+            p - 1
+            for p in range(1, num_pages + 1)
+            if not all(
+                f"model_p{p}_tp0_cp0_pp{s}_{o}" in present
+                for s in range(num_stages)
+                for o in ("k", "indexer")
+            )
+        ),
+        num_pages,
+    )
+    return [p for p in stops if p <= contiguous]
+
+
+class TestLookupCost(CustomTestCase):
+    """Rhea 60076: about 24 objects queried per page held PP0 on the master's
+    ExistKey ceiling. A lookup queries one stage's state per page and a
+    handful of keys per probed stop."""
+
+    def _lookup(self, linker, num_pages):
+        transfers = [
+            PoolTransfer(name=PoolName.KV, keys=[f"p{p}" for p in range(1, num_pages + 1)])
+        ]
+        return linker.lookup_stages("rid", transfers)
+
+    def test_the_search_matches_a_full_scan_on_contiguous_prefixes(self):
+        rng = random.Random(0)
+        for _ in range(300):
+            num_pages, num_stages = rng.randint(1, 40), rng.randint(1, 4)
+            present = set()
+            for stage in range(num_stages):
+                for obj in ("k", "indexer"):  # contiguous from page 1, no holes
+                    extent = rng.randint(0, num_pages)
+                    present |= {f"model_p{p}_tp0_cp0_pp{stage}_{obj}" for p in range(1, extent + 1)}
+                states = rng.sample(range(1, num_pages + 1), rng.randint(0, min(5, num_pages)))
+                present |= {f"model_p{p}_tp0_cp0_pp{stage}_mamba" for p in states}
+            linker = _linker_over_stages(present, num_stages)
+            self.assertEqual(
+                self._lookup(linker, num_pages), _full_scan(present, num_pages, num_stages)
+            )
+            # Only the first stage's state is asked for at every page.
+            self.assertEqual(len(linker.storage.queries[0]), num_pages)
+
+    def test_keys_per_lookup_are_bounded(self):
+        # 4,000 pages, states at two stops on every stage, everything stored.
+        num_pages, stages = 4000, 8
+        present = _stored(range(stages), range(1, num_pages + 1), states={1000, num_pages})
+        linker = _linker_over_stages(present, stages)
+        self.assertEqual(self._lookup(linker, num_pages), [1000, num_pages])
+        queried = sum(len(query) for query in linker.storage.queries)
+        # One stage's states, 7 stages x 2 stops, 8 stages x 2 pools at one probe.
+        self.assertEqual(queried, num_pages + 7 * 2 + 8 * 2)
+        self.assertLessEqual(len(linker.storage.queries), 2)
+        self.assertEqual(linker.lookup_samples[0][0], queried)
+
+
+class _PinStore:
+    """Read sessions over a fixed key set; records starts and ends."""
+
+    def __init__(self, present):
+        self.present, self.started, self.ended = set(present), [], []
+
+    def batch_get_session_start(self, keys):
+        self.started.append(list(keys))
+        return [0 if key in self.present else -704 for key in keys]
+
+    def batch_get_session_end(self, keys):
+        self.ended.append(list(keys))
+
+
+def _pinning_linker(present):
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.mla_broadcaster = None
+    linker.pinned, linker.pin_samples, linker.pin_holes = {}, [], 0
+    # This stage's pools: KV and indexer from the KV transfer, the state trailing.
+    linker.pool_group = SimpleNamespace(
+        resolve_transfers=lambda transfers, **kwargs: [
+            replace(t, name=name, hit_policy=PoolHitPolicy.ALL_PAGES)
+            for t in transfers
+            if t.name == PoolName.KV
+            for name in (PoolName.KV, PoolName.INDEXER)
+        ]
+        + [t for t in transfers if t.name == PoolName.MAMBA]
+    )
+    linker.storage = SimpleNamespace(
+        store=_PinStore(present),
+        _get_hybrid_page_component_keys=lambda keys, t: ([f"{k}_{t.name}" for k in keys], 1),
+        _tag_keys=lambda keys: keys,
+    )
+    return linker
+
+
+class TestPinHit(CustomTestCase):
+    """At admission each stage starts the read sessions of its objects of the
+    hit: that checks them and holds them until the load ends the sessions."""
+
+    pages = ["p1", "p2", "p3", "p4"]
+
+    def _pin(self, present):
+        linker = _pinning_linker(present)
+        transfers = [
+            PoolTransfer(name=PoolName.KV, keys=self.pages),
+            PoolTransfer(
+                name=PoolName.MAMBA, keys=["p4"], hit_policy=PoolHitPolicy.TRAILING_PAGES
+            ),
+        ]
+        return linker, linker.pin_hit("rid", transfers)
+
+    def _all(self):
+        return {f"{p}_{pool}" for p in self.pages for pool in ("kv", "indexer")} | {
+            "p4_mamba"
+        }
+
+    def test_a_complete_hit_stays_pinned_for_its_load(self):
+        linker, pages = self._pin(self._all())
+        self.assertEqual(pages, 4)
+        self.assertEqual(sorted(linker.pinned["rid"]), sorted(self._all()))
+        self.assertEqual(linker.storage.store.ended, [])
+        linker.unpin("rid")
+        self.assertEqual(linker.storage.store.ended, linker.storage.store.started)
+
+    def test_a_missing_object_returns_the_pages_before_it_and_pins_nothing(self):
+        linker, pages = self._pin(self._all() - {"p3_indexer"})
+        self.assertEqual(pages, 2)
+        self.assertEqual((linker.pinned, linker.pin_holes), ({}, 1))
+        self.assertEqual(linker.storage.store.ended, linker.storage.store.started)
+
+    def test_a_missing_end_state_rules_out_the_whole_hit(self):
+        _, pages = self._pin(self._all() - {"p4_mamba"})
+        self.assertEqual(pages, 3)
 
 
 class _RemovingStore:
@@ -392,6 +536,7 @@ class TestStatePathCap(CustomTestCase):
 class _SettingStorage:
     def __init__(self, ok=True):
         self.ok, self.store = ok, _RemovingStore()
+        self.last_exist_skipped = 0
         self.pool_suffixes = {name: "tp0_cp0_pp0" for name in (PoolName.KV, PoolName.MAMBA)}
         self.mla_suffix = "tp0_cp0_pp0"
 

@@ -502,6 +502,27 @@ class TestMooncakeGroupSemantics(CustomTestCase):
         self.assertEqual(store.last_put_objects, {PoolName.INDEXER: 1})
         self.assertEqual(fake_store.batch_put_calls[0]["keys"], ["tag_page1__indexer"])
 
+    def test_v2_put_skips_the_existence_query_for_objects_just_loaded(self):
+        # Rhea 60076: write-through re-offered every loaded tail, and asking the
+        # master whether each of its objects exists held it at its ceiling.
+        store, fake_store = _make_store(extra_backend_tag="tag", is_mla_model=True)
+        store.register_mem_host_pool_v2(FakeIndexerPool(), PoolName.INDEXER)
+        store.recently_loaded = {"tag_page0__indexer"}
+
+        store.batch_set_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.INDEXER,
+                    keys=["page0", "page1"],
+                    host_indices=torch.tensor([0, 1]),
+                )
+            ]
+        )
+
+        self.assertEqual(fake_store.batch_exist_calls, [["tag_page1__indexer"]])
+        self.assertEqual(store.last_exist_skipped, 1)
+        self.assertEqual(fake_store.batch_put_calls[0]["keys"], ["tag_page1__indexer"])
+
     def test_v2_indexer_group_ids_use_logical_page_key(self):
         store, fake_store = _make_store(extra_backend_tag="tag", is_mla_model=True)
         indexer_pool = FakeIndexerPool()
