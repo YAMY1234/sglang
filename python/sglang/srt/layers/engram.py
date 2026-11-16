@@ -1573,6 +1573,7 @@ class EngramEmbedding(nn.Module):
         mxfp4: bool = False,
     ):
         super().__init__()
+        self.num_embeddings = num_embeddings
         self.dim = dim
         self.mxfp4 = mxfp4
         self.row_bytes = _table_row_bytes(dim, mxfp4)
@@ -1717,6 +1718,8 @@ class EngramEmbedding(nn.Module):
         it after loading."""
         if self.peer is not None:
             self.peer.connect(self.row_start, label)
+            if isinstance(self.peer, _GroupShards):
+                self._log_lookup_time(label)
         if self.host_table is not None:
             self.host_table.finish_load(label)
             if self.host_table.replication == EngramReplication.NODE_SHARED:
@@ -1724,12 +1727,20 @@ class EngramEmbedding(nn.Module):
 
     def _log_lookup_time(self, label: str) -> None:
         """Time one 16K-token chunk of lookups (24 random rows per token): the GPU
-        reads the table at its page size, which only a measurement shows."""
+        reads the table at its page size or over the fabric, which only a
+        measurement shows."""
         device = torch.device("cuda", torch.cuda.current_device())
+        digest = envs.SGLANG_DSV41_ENGRAM_LOOKUP_DIGEST.get()
+        gen = torch.Generator(device=device).manual_seed(0) if digest else None
         ids = torch.randint(
-            0, self.weight.shape[0], (16384 * 24,), device=device, dtype=torch.int64
+            0,
+            self.num_embeddings,
+            (16384, 24),
+            device=device,
+            dtype=torch.int64,
+            generator=gen,
         )
-        out = torch.empty(ids.numel(), self.dim, dtype=torch.bfloat16, device=device)
+        out = torch.empty(*ids.shape, self.dim, dtype=torch.bfloat16, device=device)
         times = []
         for _ in range(5):
             start, end = (
@@ -1737,23 +1748,39 @@ class EngramEmbedding(nn.Module):
                 torch.cuda.Event(enable_timing=True),
             )
             start.record()
-            engram_gather(
-                *self._table_ptrs(),
-                ids,
-                out,
-                self.dim,
-                FP8_BLOCK_SIZE,
-                mxfp4=self.mxfp4,
-            )
+            if self.peer is not None:
+                out = self.peer.lookup(ids)
+            else:
+                engram_gather(
+                    *self._table_ptrs(),
+                    ids.view(-1),
+                    out.view(-1, self.dim),
+                    self.dim,
+                    FP8_BLOCK_SIZE,
+                    mxfp4=self.mxfp4,
+                )
             end.record()
             end.synchronize()
             times.append(start.elapsed_time(end))
+        kind = "group shards" if self.peer is not None else "host table"
+        note = ""
+        if digest:
+            # -0 and +0 hash alike: the peer gather writes +0 where the local one keeps -0.
+            bits = out.view(torch.int16).view(-1)
+            neg_zero = bits == -32768
+            canon = bits.masked_fill(neg_zero, 0).cpu().numpy().tobytes()
+            note = ", seed 0 sha256 %s (-0 entries %d)" % (
+                hashlib.sha256(canon).hexdigest()[:16],
+                int(neg_zero.sum()),
+            )
         logger.info(
-            "engram host table %s: %d random rows in %.2f ms (VR200, local socket at "
+            "engram %s %s: %d random rows in %.2f ms%s (VR200, local socket at "
             "2 MiB pages: 0.32 ms)",
+            kind,
             label,
             ids.numel(),
             sorted(times)[2],
+            note,
         )
 
     def forward(

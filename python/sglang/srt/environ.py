@@ -2222,6 +2222,9 @@ class Envs:
     # --engram-config replication node_shared: one copy per host NUMA node, read by
     # the GPUs of that socket; false: one copy per node, spread over the sockets.
     SGLANG_DSV41_ENGRAM_NODE_TABLE_PER_NUMA = EnvBool(True)
+    # The post-load engram lookup-time line also looks up seeded ids and logs a digest
+    # of the rows, so two table layouts can be compared row for row.
+    SGLANG_DSV41_ENGRAM_LOOKUP_DIGEST = EnvBool(False)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
