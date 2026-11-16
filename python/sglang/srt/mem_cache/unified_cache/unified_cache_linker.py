@@ -309,6 +309,13 @@ class UnifiedCacheLinkerWrapper:
         self.pp_lookup_time: dict[str, float] = {}
         self.stale_after_s = envs.SGLANG_LINKER_LEASE_TTL_SECS.get()
         self.pp_relookups = self.pp_relookups_shrunk = 0
+        # rids whose relayed hit outlived its device prefix: PP0 looks their
+        # whole tail up again before the load (every stage tracks them alike).
+        self.pp_forced_relookup: set[str] = set()
+        self.pp_counts: dict[str, int] = dict.fromkeys(
+            ("anchor_shrunk", "recovered_pages", "lost_pages", "relookups", "shrunk"), 0
+        )
+        self.pp_counts_logged_at = time.monotonic()
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -400,10 +407,15 @@ class UnifiedCacheLinkerWrapper:
             if req.linker_pp_lookup_pending:
                 return None
             entry = req.linker_pp_hit
-            if entry is None or device_hit_len < entry[0]:
-                # Pages between this device hit and the looked-up start were not
-                # checked; deterministic on every stage.
+            if entry is None:
                 return []
+            if device_hit_len < entry[0] and req.rid not in self.pp_forced_relookup:
+                # The device prefix shrank below the looked-up start while the
+                # request queued, so the pages in between were never checked:
+                # admit the relayed stops and let PP0 look the whole tail up again
+                # before the load (Rhea 57360 dropped such hits instead).
+                self.pp_forced_relookup.add(req.rid)
+                self.pp_counts["anchor_shrunk"] += 1
         elif self.lookup_once:
             entry = self.lookup_cache.get(req.rid)
             if entry is None or device_hit_len < entry[0]:
@@ -430,7 +442,9 @@ class UnifiedCacheLinkerWrapper:
             )
         return pages
 
-    def _pp_fresh_hit_pages(self, req: Req, hit: ExternalCacheHitMarker) -> int:
+    def _pp_fresh_hit_pages(
+        self, req: Req, hit: ExternalCacheHitMarker, forced: bool = False
+    ) -> int:
         """Pages of ``hit`` to load, the same on every stage. PP0 looked the hit
         up at enqueue; once that is older than the store's lease, its objects
         may have been evicted while the request queued (Rhea 57360: a 354 s wait
@@ -440,13 +454,17 @@ class UnifiedCacheLinkerWrapper:
         keep = torch.tensor([admitted], dtype=torch.int64)
         looked = self.pp_lookup_time.get(req.rid)
         now = time.monotonic()
-        if self.pp_rank == 0 and looked is not None and now - looked > self.stale_after_s:
+        if self.pp_rank == 0 and looked is not None and (
+            forced or now - looked > self.stale_after_s
+        ):
             transfers = self._lookup_transfers(hit.tail_hashes)
             pages = self.cache_linker.lookup_stages(req.rid, transfers) if transfers else []
             self.pp_lookup_time[req.rid] = time.monotonic()
             keep[0] = max((p for p in pages if p <= admitted), default=0)
             self.pp_relookups += 1
             self.pp_relookups_shrunk += int(keep[0]) < admitted
+            self.pp_counts["relookups"] += 1
+            self.pp_counts["shrunk"] += int(keep[0]) < admitted
             logger.info(
                 "Linker PP stale hit looked up again: rid=%s age=%.1f s, %d of %d "
                 "pages restorable; re-lookups %d, shrunk %d",
@@ -458,6 +476,15 @@ class UnifiedCacheLinkerWrapper:
                 self.pp_relookups_shrunk,
             )
         self.cache._all_reduce(keep, torch.distributed.ReduceOp.MIN)
+        if self.pp_rank == 0 and now - self.pp_counts_logged_at >= 60:
+            logger.info(
+                "Linker PP admissions in %.0f s: anchor-shrunk hits %d (re-looked "
+                "up: %d pages recovered, %d lost), stale re-lookups %d (shrunk %d)",
+                now - self.pp_counts_logged_at,
+                *self.pp_counts.values(),
+            )
+            self.pp_counts = dict.fromkeys(self.pp_counts, 0)
+            self.pp_counts_logged_at = now
         return int(keep[0])
 
     def _cached_tail_hashes(
@@ -530,13 +557,22 @@ class UnifiedCacheLinkerWrapper:
         if hit is None:
             return 0, req.last_node
         if self.pp_size > 1:
-            keep = self._pp_fresh_hit_pages(req, hit)
+            forced = req.rid in self.pp_forced_relookup
+            keep = self._pp_fresh_hit_pages(req, hit, forced)
+            anchor, stops = req.linker_pp_hit
+            end = hit.device_hit_len + keep * cache.page_size
+            if forced:
+                # Re-anchor at the device prefix this lookup started from.
+                self.pp_forced_relookup.discard(req.rid)
+                anchor = hit.device_hit_len
+                stops = sorted({stop for stop in stops if anchor < stop <= end} | {end})
+                req.linker_pp_hit = (anchor, stops)
+                self.pp_counts["recovered_pages"] += keep
+                self.pp_counts["lost_pages"] += len(hit.tail_hashes) - keep
             if keep < len(hit.tail_hashes):
                 # Part of the relayed hit was evicted while the request queued:
                 # leave it waiting, and its next match admits what is left; the
                 # missing pages are recomputed, not failed reads.
-                anchor, stops = req.linker_pp_hit
-                end = hit.device_hit_len + keep * cache.page_size
                 req.linker_pp_hit = (anchor, [stop for stop in stops if stop <= end])
                 return None
 
@@ -650,9 +686,12 @@ class UnifiedCacheLinkerWrapper:
     def _offload_node(self, node_id: NodeId, transfers: list[PoolTransfer]) -> None:
         cache = self.cache
         lock_params = cache.inc_lock_ref(node_id).to_dec_params()
+        path = {}
+        if getattr(self.cache_linker, "state_path_cap", 0):
+            path["path_hashes"] = lambda: cache.tree_core.get_prefix_hash_values(node_id)
         try:
             queued = self.cache_linker.offload(
-                transfers, session_id=getattr(cache, "insert_session_id", None)
+                transfers, session_id=getattr(cache, "insert_session_id", None), **path
             )
         except BaseException:
             cache.dec_lock_ref(node_id, lock_params)
@@ -757,6 +796,7 @@ class UnifiedCacheLinkerWrapper:
         self.lookup_cache.clear()
         self.tail_hash_cache.clear()
         self.pp_lookup_time.clear()
+        self.pp_forced_relookup.clear()
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()
         self.inflight_load_index = -1
@@ -775,6 +815,7 @@ class UnifiedCacheLinkerWrapper:
         self.lookup_cache.pop(rid, None)
         self.tail_hash_cache.pop(rid, None)
         self.pp_lookup_time.pop(rid, None)
+        self.pp_forced_relookup.discard(rid)
         # A queued load targets slots the request owns and is about to free.
         # A started one is finished by finish_loads before anything is freed.
         if rid in self.inflight_load_rids and self.cache_linker.cancel_queued_load(rid):

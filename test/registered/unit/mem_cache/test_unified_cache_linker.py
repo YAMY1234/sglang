@@ -1,9 +1,10 @@
 import queue
 import sys
 import threading
+import time
 import unittest
 from array import array
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -1589,9 +1590,11 @@ def test_pp_stages_admit_pp0s_relayed_lookup(full_linker_component):
         assert (later_backend.lookups, later_backend.stage_lookups) == (0, 0)
 
         # Pages between a shrunk device prefix and the looked-up start were
-        # never checked: no hit, on every stage alike.
+        # never checked: the relayed stop is admitted and PP0 looks the whole
+        # tail up again before the load, on every stage alike.
         req5.linker_pp_hit = (2, [6])
-        assert later.match(_KEY, req5, _device_result(0)).host_hit_length == 0
+        assert later.match(_KEY, req5, _device_result(0)).host_hit_length == 6
+        assert "r" in later.pp_forced_relookup
         req5.linker_pp_hit = None
         assert later.match(_KEY, req5, _device_result(0)).host_hit_length == 0
         assert (later_backend.lookups, later_backend.stage_lookups) == (0, 0)
@@ -1649,6 +1652,42 @@ def test_pp_stale_hit_is_looked_up_again_and_shrinks_before_its_load(
         # The next pass admits what is left, without another store query.
         assert pp0.match(_KEY, req, _device_result(0)).host_hit_length == 2
         assert backend.stage_lookups == 2
+
+
+def test_pp_hit_outliving_its_device_prefix_is_looked_up_again_not_dropped(
+    full_linker_component,
+):
+    # Rhea 57360: while a request queued, its device prefix shrank below the
+    # point its store hit was looked up from, and the relayed hit was dropped.
+    with patch(
+        "sglang.srt.mem_cache.unified_cache.unified_cache_linker.get_storage_hash_str",
+        side_effect=_page_hashes,
+    ):
+        backend = _CountingLinker(stage_restorable=[1, 2])
+        pp0 = _match_wrapper(
+            full_linker_component,
+            backend,
+            pp_size=8,
+            pp_rank=0,
+            _all_reduce=lambda data, op: None,
+        )
+        req = SimpleNamespace(rid="r", linker_pp_hit=None, linker_pp_lookup_pending=True)
+        # Enqueue: device prefix 2, store stops at 4 and 6 tokens.
+        pp0.match(_KEY, req, _device_result(2))
+        req.linker_pp_lookup_pending = False
+        assert req.linker_pp_hit == (2, [4, 6])
+        # The device prefix is gone by admission: the hit is kept, unchecked.
+        assert pp0.match(_KEY, req, _device_result(0)).host_hit_length == 6
+        assert pp0.pp_counts["anchor_shrunk"] == 1
+        # PP0 looks the tail from the device prefix up again though the hit is
+        # fresh; only the first page survived, and the hit re-anchors at 0.
+        backend.stage_restorable = [1]
+        assert pp0.load_back(req) is None
+        assert backend.stage_lookups == 2
+        assert req.linker_pp_hit == (0, [2])
+        assert "r" not in pp0.pp_forced_relookup
+        assert (pp0.pp_counts["recovered_pages"], pp0.pp_counts["lost_pages"]) == (1, 2)
+        assert pp0.match(_KEY, req, _device_result(0)).host_hit_length == 2
 
 
 def test_pp_fresh_hit_loads_without_a_second_lookup(full_linker_component):
@@ -1920,8 +1959,11 @@ class TestOffloadReadyEvents(CustomTestCase):
         linker.stats = {"offload": 1}
         linker.offload_results = queue.Queue()
         linker.offload_queue = queue.Queue()
+        linker.object_bytes, linker.write_bytes = {PoolName.KV: 1}, Counter()
+        linker.stats_logged_at = time.monotonic()
+        transfer = PoolTransfer(name=PoolName.KV, keys=[])
         linker.offload_queue.put(
-            (["transfer"], 1, [order.indices_ready, order.kv_written], "session-a")
+            ([transfer], 1, [order.indices_ready, order.kv_written], "session-a", [])
         )
         linker.offload_queue.put(None)
         linker.offload_thread_func()
@@ -1931,7 +1973,7 @@ class TestOffloadReadyEvents(CustomTestCase):
                 call.indices_ready.synchronize(),
                 call.kv_written.synchronize(),
                 call.storage.batch_set_v2(
-                    ["transfer"],
+                    [transfer],
                     HiCacheStorageExtraInfo(extra_info={"session_id": "session-a"}),
                 ),
             ],

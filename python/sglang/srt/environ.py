@@ -953,6 +953,10 @@ class Envs:
     # The Mooncake master's default_kv_lease_ttl: a PP hit relayed at enqueue and
     # older than this when its load starts is looked up again first.
     SGLANG_LINKER_LEASE_TTL_SECS = EnvFloat(10.0)
+    # Keep at most this many KDA states per path in the store (0: off). A
+    # conversation resumes from its deepest states; older linear ones are removed
+    # once a deeper one lands, branch points (shared prompts) are kept.
+    SGLANG_LINKER_STATE_PATH_CAP = EnvInt(0)
     # Cap on the lease renewal existence queries, in object keys per second.
     SGLANG_LINKER_LEASE_REFRESH_MAX_KEYS_PER_S = EnvInt(100000)
     # Log each Mooncake linker load's wait, transfer time, bytes and rate.

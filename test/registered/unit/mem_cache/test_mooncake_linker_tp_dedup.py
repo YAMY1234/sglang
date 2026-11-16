@@ -4,7 +4,9 @@ pages are byte-identical: attention CP (interleave PCP) and attention TP
 holds both kinds at once, so the choice is per pool: KV, indexer and an MLA
 draft are shared, while TP-sharded KDA state keeps its own rank namespace."""
 
+import queue
 import unittest
+from collections import Counter
 from types import SimpleNamespace
 
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
@@ -217,6 +219,7 @@ def _linker_over_stages(present, num_stages=3):
     linker.storage = _PresentKeys(present)
     linker.stage_schemas = [_stage_schema(stage) for stage in range(num_stages)]
     linker.stats = {"lookup": 0, "load": 0, "offload": 0}
+    linker.lookup_counts = Counter()
     return linker
 
 
@@ -256,14 +259,18 @@ class TestLookupStages(CustomTestCase):
     def test_all_page_objects_are_queried_only_up_to_the_deepest_stop(self):
         linker = _linker_over_stages(_stored(range(3), range(1, 5), states={2}))
         self.assertEqual(self._lookup(linker), [2])
-        trailing, all_pages = linker.storage.queries
+        trailing, all_pages, past_hit = linker.storage.queries
         self.assertEqual(len(trailing), 3 * 4)  # every stage's state, every page
         self.assertEqual(len(all_pages), 3 * 2 * 2)  # stages x pools x pages 1-2
+        # Truncation count: stage 0's KV past the hit, pages 3-4.
+        self.assertEqual(past_hit, ["model_p3_tp0_cp0_pp0_k", "model_p4_tp0_cp0_pp0_k"])
 
     def test_no_common_state_skips_the_page_query(self):
         linker = _linker_over_stages(_stored(range(2), range(1, 5), states={2}))
         self.assertEqual(self._lookup(linker), [])
-        self.assertEqual(len(linker.storage.queries), 1)
+        # The state query, then only the truncation count's KV query.
+        self.assertEqual(len(linker.storage.queries), 2)
+        self.assertEqual(linker.lookup_counts["truncated_pages"], 4)
 
     def test_lease_keys_renew_every_stage_pages_and_the_last_state(self):
         linker = _linker_over_stages(set(), num_stages=2)
@@ -278,6 +285,133 @@ class TestLookupStages(CustomTestCase):
                 )
             ),
         )
+
+
+class TestLookupTruncation(CustomTestCase):
+    def test_kv_past_the_last_common_state_counts_as_truncated(self):
+        # KV and indexer on every stage up to page 4, states only at page 2.
+        linker = _linker_over_stages(_stored(range(3), range(1, 5), states={2}))
+        transfers = [PoolTransfer(name=PoolName.KV, keys=[f"p{p}" for p in range(1, 5)])]
+        self.assertEqual(linker.lookup_stages("rid", transfers), [2])
+        self.assertEqual(
+            dict(linker.lookup_counts),
+            {"lookups": 1, "hit_pages": 2, "truncated_pages": 2, "truncated_lookups": 1},
+        )
+
+
+class _RemovingStore:
+    def __init__(self, refuse=()):
+        self.removed, self.refuse = [], set(refuse)
+
+    def remove(self, key):
+        self.removed.append(key)
+        return -1 if key in self.refuse else 0
+
+
+def _capped_linker(cap):
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.state_path_cap = cap
+    linker.state_parent, linker.state_children = {}, Counter()
+    linker.state_removed = linker.state_remove_failed = 0
+    return linker
+
+
+class TestStatePathCap(CustomTestCase):
+    """A conversation resumes from its deepest KDA states; each older linear
+    state past SGLANG_LINKER_STATE_PATH_CAP is dead weight in the store."""
+
+    def test_cap_one_drops_the_previous_turn_state_but_not_the_first(self):
+        linker = _capped_linker(1)
+        self.assertEqual(linker._cap_state_path(["s1"], ["a", "s1"]), [])
+        # s1 is the path's first state: another session may branch there.
+        self.assertEqual(linker._cap_state_path(["s2"], ["a", "s1", "b", "s2"]), [])
+        self.assertEqual(
+            linker._cap_state_path(["s3"], ["a", "s1", "b", "s2", "c", "s3"]), ["s2"]
+        )
+        self.assertEqual(linker.state_parent, {"s1": None, "s3": "s1"})
+
+    def test_cap_three_keeps_the_three_deepest(self):
+        linker = _capped_linker(3)
+        path = []
+        dropped = []
+        for turn in range(1, 6):
+            path += [f"x{turn}", f"s{turn}"]
+            dropped += linker._cap_state_path([f"s{turn}"], list(path))
+        self.assertEqual(dropped, ["s2"])
+        self.assertEqual(linker.state_parent, {"s1": None, "s3": "s1", "s4": "s3", "s5": "s4"})
+
+    def test_a_shared_prompt_state_stays_and_its_branches_relink(self):
+        linker = _capped_linker(1)
+        linker._cap_state_path(["sys"], ["p", "sys"])
+        linker._cap_state_path(["a1"], ["p", "sys", "a", "a1"])  # 'sys' has one child
+        linker._cap_state_path(["b1"], ["p", "sys", "b", "b1"])  # now two
+        self.assertEqual(linker.state_children["sys"], 2)
+        # a2 drops a1 but stops at the branch point, and hangs from it.
+        self.assertEqual(
+            linker._cap_state_path(["a2"], ["p", "sys", "a", "a1", "a", "a2"]), ["a1"]
+        )
+        self.assertEqual(linker.state_parent["a2"], "sys")
+        self.assertEqual(linker.state_children["sys"], 2)
+
+    def test_removal_uses_the_lookup_key_schema_and_counts_refusals(self):
+        linker = _linker_over_stages(set(), num_stages=1)
+        linker.storage.store = _RemovingStore(refuse={"model_s1_tp0_cp0_pp0_mamba"})
+        linker.storage.pool_suffixes = {
+            name: "tp0_cp0_pp0" for name in (PoolName.KV, PoolName.MAMBA, PoolName.INDEXER)
+        }
+        linker.storage.mla_suffix = "tp0_cp0_pp0"
+        linker.pools = {PoolName.KV: None, PoolName.MAMBA: None, PoolName.INDEXER: None}
+        linker.state_removed = linker.state_remove_failed = 0
+        linker._remove_states(["s1", "s2"])
+        self.assertEqual(
+            linker.storage.store.removed,
+            ["model_s1_tp0_cp0_pp0_mamba", "model_s2_tp0_cp0_pp0_mamba"],
+        )
+        self.assertEqual((linker.state_removed, linker.state_remove_failed), (1, 1))
+
+
+class _SettingStorage:
+    def __init__(self, ok=True):
+        self.ok, self.store = ok, _RemovingStore()
+        self.pool_suffixes = {name: "tp0_cp0_pp0" for name in (PoolName.KV, PoolName.MAMBA)}
+        self.mla_suffix = "tp0_cp0_pp0"
+
+    def _tag_keys(self, keys):
+        return [f"model_{key}" for key in keys]
+
+    def batch_set_v2(self, transfers, extra_info):
+        return {t.name: [self.ok] * len(t.keys) for t in transfers}
+
+
+class TestOffloadAccounting(CustomTestCase):
+    def _run(self, ok):
+        linker = _capped_linker(1)
+        linker.storage = _SettingStorage(ok)
+        linker.pools = {PoolName.KV: None, PoolName.MAMBA: None}
+        linker.object_bytes = {PoolName.KV: 100, PoolName.MAMBA: 5000}
+        linker.write_bytes, linker.lookup_counts = Counter(), Counter()
+        linker.stats, linker.stats_logged_at = {"offload": 0}, 0.0
+        linker.offload_queue, linker.offload_results = queue.Queue(), queue.Queue()
+        expanded = [
+            PoolTransfer(name=PoolName.KV, keys=["p1", "p2", "p3"]),
+            PoolTransfer(name=PoolName.MAMBA, keys=["p3"]),
+        ]
+        linker.offload_queue.put((expanded, 192, [], None, ["p1"]))
+        linker.offload_queue.put(None)
+        linker.offload_thread_func()
+        return linker
+
+    def test_writes_split_by_pool_and_old_states_go_after_the_new_lands(self):
+        linker = self._run(ok=True)
+        self.assertEqual(linker.offload_results.get_nowait(), True)
+        # Logged once and reset: the window started at 0.
+        self.assertEqual(linker.write_bytes, Counter())
+        self.assertEqual(linker.storage.store.removed, ["model_p1_tp0_cp0_pp0_mamba"])
+
+    def test_a_failed_write_keeps_the_older_state(self):
+        linker = self._run(ok=False)
+        self.assertEqual(linker.offload_results.get_nowait(), False)
+        self.assertEqual(linker.storage.store.removed, [])
 
 
 class TestLinkerLeaseRefresher(CustomTestCase):

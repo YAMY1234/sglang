@@ -7,6 +7,7 @@ import os
 import re
 import threading
 import time
+from collections import Counter
 from collections.abc import Callable
 from copy import deepcopy
 from queue import Empty, Queue
@@ -202,6 +203,20 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             components=components,
         )
         self.pools = self.pool_group.entry_map
+        # Bytes of one page object per pool (every buffer of the page).
+        self.object_bytes = {
+            name: sum(size for component in entry.buffer_meta for *_, size in component)
+            for name, entry in self.pools.items()
+        }
+        self.write_bytes: Counter = Counter()
+        self.lookup_counts: Counter = Counter()
+        self.stats_logged_at = time.monotonic()
+        # Store-side state path cap: each state this rank wrote -> the deepest
+        # earlier state on its path (None at the root), and its child count.
+        self.state_path_cap = envs.SGLANG_LINKER_STATE_PATH_CAP.get()
+        self.state_parent: dict[str, str | None] = {}
+        self.state_children: Counter = Counter()
+        self.state_removed = self.state_remove_failed = 0
         self.num_layers = self.pool_group.num_layers
 
         parallel = get_parallel()
@@ -238,6 +253,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.storage = MooncakeStore(storage_config, mem_pool=None)
         else:
             self.storage = storage
+        if self.state_path_cap and not callable(getattr(self.storage.store, "remove", None)):
+            logger.warning(
+                "SGLANG_LINKER_STATE_PATH_CAP needs Mooncake store.remove(); path cap off"
+            )
+            self.state_path_cap = 0
         self.storage.mem_pool_host = self.pool_group
         self.storage.registered_pools = self.pools
         storage_suffix = _storage_suffix(
@@ -461,6 +481,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 stops &= {p + 1 for p, value in enumerate(part) if value == 1}
         if not stops:
             self.stats["lookup"] += 1
+            self._count_lookup(page_keys, 0)
             return []
         deepest = max(stops)
         contiguous = deepest
@@ -472,6 +493,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             )
         restorable = sorted(p for p in stops if p <= contiguous)
         self.stats["lookup"] += 1
+        self._count_lookup(page_keys, restorable[-1] if restorable else 0)
         if restorable:
             logger.info(
                 "Mooncake direct linker PP lookup hit: rid=%s pages=%d candidates=%d "
@@ -482,6 +504,23 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 len(self.stage_schemas),
             )
         return restorable
+
+    def _count_lookup(self, page_keys: list[str], hit: int) -> None:
+        """Lookup counters; the pages past the hit whose KV this stage still
+        stores were lost at a state boundary (no state to resume from)."""
+        self.lookup_counts["lookups"] += 1
+        self.lookup_counts["hit_pages"] += hit
+        tail = page_keys[hit:]
+        if not tail:
+            return
+        _, obj, suffix, _ = next(e for e in self.stage_schemas[0] if e[1] == "k")
+        exists = self.storage._batch_exist(
+            self.storage._tag_keys([f"{page}_{suffix}_{obj}" for page in tail])
+        )
+        kv_pages = next((i for i, value in enumerate(exists) if value != 1), len(tail))
+        if kv_pages:
+            self.lookup_counts["truncated_pages"] += kv_pages
+            self.lookup_counts["truncated_lookups"] += 1
 
     def _lease_keys(self, page_hashes: list[str]) -> list[str]:
         """Every stage's all-pages objects of these pages, and the state at the
@@ -787,8 +826,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             )
 
     def offload(
-        self, transfers: list[PoolTransfer], session_id: str | None = None
+        self,
+        transfers: list[PoolTransfer],
+        session_id: str | None = None,
+        path_hashes: Callable[[], list[str]] | None = None,
     ) -> bool:
+        """``path_hashes`` gives the page hashes from the root to the node, for
+        the state path cap."""
         self._log_numa_first_request()
         expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
         if not expanded:
@@ -800,9 +844,53 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             return True
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
         tokens = len(kv.keys) * self.page_size
+        victims = []
+        state = next((t for t in expanded if t.name == PoolName.MAMBA), None)
+        if self.state_path_cap and state is not None and path_hashes is not None:
+            victims = self._cap_state_path(list(state.keys), path_hashes())
         ready_events = self.record_offload_ready()
-        self.offload_queue.put((expanded, tokens, ready_events, session_id))
+        self.offload_queue.put((expanded, tokens, ready_events, session_id, victims))
         return True
+
+    def _cap_state_path(self, new_states: list[str], path: list[str]) -> list[str]:
+        """Record the states this offload writes on their path and return the
+        older ones past SGLANG_LINKER_STATE_PATH_CAP to drop once it lands. A
+        conversation only resumes from its deepest states. A path's first state
+        and any state with more than one child stay: other sessions branch off
+        there (a shared prompt) or may still."""
+        written = set(new_states)
+        parent = next(
+            (h for h in reversed(path) if h in self.state_parent and h not in written),
+            None,
+        )
+        for state in new_states:
+            if state in self.state_parent:
+                continue
+            self.state_parent[state] = parent
+            if parent is not None:
+                self.state_children[parent] += 1
+            parent = state
+        kept, node = None, parent
+        for _ in range(self.state_path_cap):
+            if node is None:
+                return []
+            kept, node = node, self.state_parent.get(node)
+        # node: the first state past the cap; drop it and its linear ancestors.
+        victims = []
+        while (
+            node is not None
+            and self.state_children[node] <= 1
+            and self.state_parent.get(node) is not None
+        ):
+            above = self.state_parent.pop(node, None)
+            self.state_children.pop(node, None)
+            victims.append(node)
+            node = above
+        if victims:
+            # The kept chain now hangs from the surviving branch point, whose
+            # child count is unchanged: one child for another.
+            self.state_parent[kept] = node
+        return victims
 
     def offload_thread_func(self) -> None:
         while True:
@@ -810,7 +898,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             try:
                 if task is None:
                     return
-                expanded, tokens, ready_events, session_id = task
+                expanded, tokens, ready_events, session_id, victims = task
                 for event in ready_events:
                     event.synchronize()
                 extra_info = (
@@ -824,12 +912,58 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     self.stats["offload"] += 1
                     if self.stats["offload"] == 1:
                         logger.info("Mooncake direct linker offload: tokens=%d", tokens)
+                    for transfer in expanded:
+                        self.write_bytes[transfer.name] += (
+                            len(transfer.keys) * self.object_bytes[transfer.name]
+                        )
+                    self.write_bytes["states"] += sum(
+                        len(t.keys) for t in expanded if t.name == PoolName.MAMBA
+                    )
+                    self._remove_states(victims)
                 self.offload_results.put(success)
+                self._maybe_log_stats()
             except BaseException:
                 logger.exception("Mooncake offload failed")
                 self.offload_results.put(False)
             finally:
                 self.offload_queue.task_done()
+
+    def _remove_states(self, page_hashes: list[str]) -> None:
+        if not page_hashes:
+            return
+        _, obj, suffix, _ = next(e for e in self._pool_key_schema() if e[3])
+        keys = self.storage._tag_keys([f"{h}_{suffix}_{obj}" for h in page_hashes])
+        for key in keys:
+            if self.storage.store.remove(key) == 0:
+                self.state_removed += 1
+            else:
+                self.state_remove_failed += 1
+
+    def _maybe_log_stats(self, every_s: float = 60.0) -> None:
+        now = time.monotonic()
+        if now - self.stats_logged_at < every_s:
+            return
+        window, self.stats_logged_at = now - self.stats_logged_at, now
+        written, self.write_bytes = self.write_bytes, Counter()
+        looked, self.lookup_counts = self.lookup_counts, Counter()
+        logger.info(
+            "Linker store writes in %.0f s: %s GB/s, %d states; states removed %d "
+            "(failed %d) of %d tracked; lookups %d, hit pages %d, truncated at a "
+            "state boundary %d pages in %d lookups",
+            window,
+            ", ".join(
+                f"{name} {written[name] / window / 1e9:.2f}"
+                for name in self.object_bytes
+            ),
+            written["states"],
+            self.state_removed,
+            self.state_remove_failed,
+            len(self.state_parent),
+            looked["lookups"],
+            looked["hit_pages"],
+            looked["truncated_pages"],
+            looked["truncated_lookups"],
+        )
 
     def num_completed_offloads(self) -> int:
         return self.offload_results.qsize()
