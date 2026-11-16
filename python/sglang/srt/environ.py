@@ -945,6 +945,10 @@ class Envs:
     # shrank since its enqueue-time lookup (device eviction while it waited)
     # looks the lost range up again before admission, as HiCache storage does.
     SGLANG_EXTERNAL_LINKER_REQUERY_ON_DEVICE_LOSS = EnvBool(False)
+    # External linker prefetch mode: cap the Full device slots of loads in flight
+    # at this share of the pool, apart from holds; 0 keeps loads and holds under
+    # the hold cap together.
+    SGLANG_EXTERNAL_LINKER_LOAD_FRACTION = EnvFloat(0.0)
     # External linker prefetch mode: log lookup counters (issued, skipped for a
     # device anchor with no storage hash, zero restorable, re-queried) every 60 s.
     SGLANG_EXTERNAL_LINKER_LOOKUP_STATS = EnvBool(False)

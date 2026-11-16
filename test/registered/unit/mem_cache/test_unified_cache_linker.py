@@ -696,6 +696,8 @@ class TestLinkerDevicePrefetch(CustomTestCase):
             assert len(cache.linker._requery_waits) == 1
             rq = cache.linker._phase_s["rq"]
             assert rq["n"] == 1 and rq["rpc"] > 0 and rq["load"] > 0
+            ((rid, waited, outcome),) = cache.linker._requery_records
+            assert (rid, outcome) == (req.rid, "loaded") and waited > 0
             assert self._match(cache, req).device_prefix_len == 6
             self._admit_and_release(cache, req)
             self._assert_balanced(cache, allocator)
@@ -758,6 +760,35 @@ class TestLinkerDevicePrefetch(CustomTestCase):
                 linker.release_request(req.cache_request_handle)
             cache.check_hicache_events()
             self._assert_balanced(cache, allocator)
+
+    def test_load_fraction_caps_loads_apart_from_holds(self):
+        """With a load fraction, loads in flight have their own cap, so held prefixes
+        do not refuse new loads; without it, loads and holds share the hold cap."""
+        from sglang.srt.environ import envs
+
+        for load_fraction, started in ((0.5, 2), (0.0, 0)):
+            with (
+                self.subTest(load_fraction=load_fraction),
+                envs.SGLANG_EXTERNAL_LINKER_PREFETCH_HOLD_FRACTION.override(0.25),
+                envs.SGLANG_EXTERNAL_LINKER_LOAD_FRACTION.override(load_fraction),
+            ):
+                cache, backend, first, allocator = self._fixture()
+                self._publish(cache, backend, first)
+                linker = cache.linker
+                assert linker.held_tokens == 6
+                calls = backend.prefetch.call_count
+                others = [self._request(rid=f"more{i}", start=10 * i) for i in (1, 2)]
+                for req in others:
+                    self._enqueue(cache, req)
+                assert backend.prefetch.call_count - calls == started
+                assert linker._lookup_stats["load_capped"] == 2 - started
+                for req in [first] + others:
+                    linker.release_request(req.cache_request_handle)
+                for future in backend.prefetch_futures:
+                    if not future.done():
+                        future.set_result(False)
+                cache.check_hicache_events()
+                self._assert_balanced(cache, allocator)
 
     def test_expired_poll_starts_no_load(self):
         """An admission poll that stops an expired prefetch settles reads but
