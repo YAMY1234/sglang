@@ -641,6 +641,9 @@ class Envs:
     # fused_rope_inplace on q only: one CTA per row looping over the heads, instead of
     # one warp per (row, head). Same per-element arithmetic.
     SGLANG_OPT_DSV4_ROPE_ROW_LAUNCH = EnvBool(False)
+    # expand_prefill_causally on CUDA: tokens per program sized by the batch (sglang#49499)
+    # instead of 256, so a draft block spreads over many SMs. Same per-token arithmetic.
+    SGLANG_OPT_DSV4_EXPAND_CAUSAL_ROWS = EnvBool(False)
     # Launch the q_lora RMSNorm + MXFP8 kernel (rmsnorm_mxfp8) with PDL, so it does not
     # wait a full launch after wqkv_a.
     SGLANG_OPT_DSV4_Q_NORM_PDL = EnvBool(False)
@@ -2322,6 +2325,16 @@ class Envs:
     SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # The same sampling-accept graph under attention DP with attn_tp 1: each rank captures
+    # and replays its own region (no collective inside) at the verify graph's padded
+    # batch size; the verify graph itself folds nothing.
+    SGLANG_OPT_DSV41_DSPARK_DP_ACCEPT_GRAPH = EnvBool(False)
+    # The captured sampling-accept graph runs the draft KV projection and the simulated
+    # bonus on side streams beside the accept, joined where their results are read.
+    SGLANG_OPT_DSV41_DSPARK_ACCEPT_GRAPH_STREAMS = EnvBool(False)
+    # Debug: for this many sampling-accept graph steps, also run the eager accept on the
+    # same inputs and log whether every accept output matches bitwise (syncs the host).
+    SGLANG_DSPARK_ACCEPT_GRAPH_CHECK_STEPS = EnvInt(0)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # ===================================================================

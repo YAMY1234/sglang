@@ -75,6 +75,7 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     idle_ragged_layout,
 )
 from sglang.srt.speculative.dspark_components.dspark_sampling_accept_graph import (
+    AcceptGraphCheck,
     DsparkSamplingAcceptGraph,
 )
 from sglang.srt.speculative.dspark_components.dspark_verify import (
@@ -418,6 +419,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._verify_epilogue = None
         self._deferred_draft_kv: Optional[DeferredDraftKVStore] = None
         self._sampling_accept_graph: Optional[DsparkSamplingAcceptGraph] = None
+        self._accept_graph_check = AcceptGraphCheck(
+            steps=envs.SGLANG_DSPARK_ACCEPT_GRAPH_CHECK_STEPS.get()
+        )
         # Counter-based draws from the server seed: every TP rank draws the same coins,
         # so no accept broadcast is needed.
         self._rejection_noise = (
@@ -436,11 +440,19 @@ class DSparkWorkerV2(BaseSpecWorker):
             and torch.device(self.device).type == "cuda"
             else None
         )
+        # Each attention-DP rank runs its own batch: with attn_tp 1 the sampling-accept
+        # graph holds no collective, so it can serve one rank (the verify graph folds nothing).
+        self._dp_accept_graph = (
+            envs.SGLANG_OPT_DSV41_DSPARK_DP_ACCEPT_GRAPH.get()
+            and get_parallel().attn_dp_enabled
+            and get_parallel().attn_tp_size == 1
+            and is_cuda()
+        )
         static_epilogue_supported = (
             target_is_dsv41
             and self._verify_planner.mode_value == "static"
             and self._draft_is_moe
-            and not get_parallel().attn_dp_enabled
+            and (not get_parallel().attn_dp_enabled or self._dp_accept_graph)
             and get_parallel().pp_size == 1
         )
         # ROCm (V4.1 target only): inside a HIP graph the accept-site TP broadcasts
@@ -475,6 +487,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     static_epilogue_supported
                     and envs.SGLANG_OPT_DSV41_DSPARK_POST_FOLD.get()
                 ),
+                fold_accept=not self._dp_accept_graph,
                 commit_ctx=CommitInjectCtx(
                     draft_model=self.draft_model,
                     block_pos_offsets=self._block_pos_offsets,
@@ -498,7 +511,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                 self._verify_epilogue.capture_hook
             )
             if (
-                envs.SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH.get()
+                (
+                    envs.SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH.get()
+                    or self._dp_accept_graph
+                )
                 and static_epilogue_supported
                 and is_cuda()
             ):
@@ -509,7 +525,15 @@ class DSparkWorkerV2(BaseSpecWorker):
                     block_verification=get_spec().speculative_use_block_verification,
                     device=self.device,
                     rejection_noise=self._rejection_noise,
+                    rank_local=self._dp_accept_graph,
+                    side_streams=envs.SGLANG_OPT_DSV41_DSPARK_ACCEPT_GRAPH_STREAMS.get(),
                 )
+                if self._dp_accept_graph:
+                    log_info_on_rank0(
+                        logger,
+                        "DSpark sampling-accept graph per attention-DP rank; the verify "
+                        "graph folds no accept.",
+                    )
 
         self._simulate_acc_greedy = (
             self._simulate_acc_len > 0 and envs.SGLANG_SIMULATE_ACC_GREEDY.get()
@@ -570,8 +594,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             envs.SGLANG_OPT_DSPARK_BF16_VERIFY_LOGITS.get()
             and is_cuda()
             and self._rejection_noise is not None
-            and self._verify_epilogue is None
-            and self._sampling_accept_graph is None
+            # The per-DP-rank accept graph reads the verify graph's own logits buffer,
+            # so a batch widened to FP32 after the graph takes the eager accept.
+            and (self._verify_epilogue is None or self._dp_accept_graph)
+            and (self._sampling_accept_graph is None or self._dp_accept_graph)
             and not self._verify_planner.is_compact_mode
         ):
             return False
@@ -1285,6 +1311,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         # the cuda graph off its own buffers, where the mask below never lands.
         fold_eligible = (
             self._verify_executor.verify_epilogue is not None
+            and self._verify_executor.verify_epilogue.folds_accept
             and proposal.folded
             # The epilogue's in-graph accept is greedy (AcceptGreedy);
             # sampling batches must take the eager accept path even when the
@@ -1401,8 +1428,37 @@ class DSparkWorkerV2(BaseSpecWorker):
                 epilogue.begin_sim_bonus(
                     bs, simulate_bonus_sampling_info.temperatures[:bs]
                 )
-            region_accept = self._sampling_accept_graph.run(
-                bs=bs, target_logits=target_logits
+            region_accept = self._run_accept_region(
+                bs=bs,
+                target_logits=target_logits,
+                eager_accept=lambda: self._verify_executor.accept_and_finalize(
+                    folded_accept=False,
+                    bs=bs,
+                    verify_ids_2d=verify_ids_2d,
+                    target_logits=target_logits,
+                    draft_block=draft_block,
+                    sampling_info=sampling_info,
+                    draft_input=draft_input,
+                    layout=layout,
+                    prefix_lens=prefix_lens,
+                    draft_tokens=draft_tokens,
+                    simulate_bonus_sampling_info=simulate_bonus_sampling_info,
+                ),
+                live_io=lambda: (
+                    verify_ids_2d,
+                    prefix_lens,
+                    batch.req_pool_indices,
+                    verify_window.positions_2d.reshape(-1),
+                    self._kv_injector.ids_for(verify_window.iteration_ids),
+                ),
+                eager_kv_commit=lambda commit_lens: self._commit_hidden_eagerly(
+                    batch=batch,
+                    layout=layout,
+                    verify_window=verify_window,
+                    logits_output=logits_output,
+                    commit_lens=commit_lens,
+                    bs=bs,
+                ),
             )
         # The accept and its commits ran in a graph: the verify graph's fold or the
         # sampling-accept region replayed right after it.
@@ -1585,6 +1641,62 @@ class DSparkWorkerV2(BaseSpecWorker):
             sampling_info=sampling_info,
         )
         return target_logits, watermark_rows
+
+    def _run_accept_region(
+        self,
+        *,
+        bs: int,
+        target_logits: torch.Tensor,
+        eager_accept,
+        live_io,
+        eager_kv_commit,
+    ) -> Optional[AcceptOuts]:
+        """The sampling-accept graph's accept, or None for the eager path. Under
+        attention DP it replays at the verify graph's padded batch size."""
+        check = self._accept_graph_check.begin(self._rejection_noise)
+        region_accept = self._sampling_accept_graph.run(
+            bs=bs,
+            target_logits=target_logits,
+            graph_bs=(
+                self.target_worker.model_runner.decode_cuda_graph_runner.bs
+                if self._dp_accept_graph
+                else None
+            ),
+        )
+        if region_accept is not None and check is not None:
+            self._accept_graph_check.compare(
+                check,
+                region_accept=region_accept,
+                reference=eager_accept,
+                io=self._sampling_accept_graph.last_io,
+                live_io=live_io(),
+                kv_fingerprint=self._draft_kv_fingerprint,
+                eager_kv_commit=(
+                    eager_kv_commit if self._verify_epilogue.folds_commit else None
+                ),
+            )
+        return region_accept
+
+    def _commit_hidden_eagerly(self, *, commit_lens, **kwargs) -> None:
+        with self._draft_context():
+            self._verify_executor.commit_hidden(
+                hidden_strided=None, commit_lens=commit_lens, run_compact=False, **kwargs
+            )
+
+    def _draft_kv_fingerprint(self) -> torch.Tensor:
+        """Integer sums of the draft layers' SWA KV bytes (accept graph check)."""
+        pool = self.draft_model_runner.token_to_kv_pool
+        return torch.stack(
+            [
+                torch.sum(
+                    pool.get_swa_raw_buffer(stage.self_attn.layer_id)
+                    .reshape(-1)
+                    .view(torch.uint8),
+                    dtype=torch.int64,
+                )
+                for stage in self.draft_model.stages
+            ]
+        )
 
     def _sampling_graph_eligible(
         self,

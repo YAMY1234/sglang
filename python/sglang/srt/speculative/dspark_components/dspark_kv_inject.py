@@ -279,6 +279,41 @@ class TargetHiddenKvInjector:
                 pool=pool,
             )
 
+    def project_for_store(self, target_hidden: torch.Tensor) -> list:
+        """inject_target_hidden's draft KV projection on an MLA pool, without the
+        store; it reads no KV location, so it can run beside the accept."""
+        with torch.inference_mode():
+            return self.draft_model.project_commit_kv(
+                main_hidden=target_hidden,
+                pool=self.draft_model_runner.token_to_kv_pool,
+            )
+
+    def store_projected(
+        self,
+        *,
+        kvs: list,
+        cache_loc: torch.Tensor,
+        cache_loc_2d: torch.Tensor,
+        positions: torch.Tensor,
+        commit_lens: torch.Tensor,
+        state_slot: Optional[torch.Tensor],
+    ) -> None:
+        """inject_target_hidden's MLA store of ``project_for_store``'s kvs."""
+        pool = self.draft_model_runner.token_to_kv_pool
+        positions = positions.to(dtype=torch.int64)
+        swa_loc = self.committed_swa_loc(
+            pool=pool,
+            cache_loc=cache_loc.to(dtype=torch.int64),
+            positions=positions,
+            cache_loc_2d=cache_loc_2d.to(dtype=torch.int64),
+            commit_lens=commit_lens.to(dtype=torch.int32),
+            state_slot=None if state_slot is None else state_slot.to(torch.int64),
+        )
+        with torch.inference_mode():
+            self.draft_model.store_commit_kv(
+                kvs=kvs, swa_loc=swa_loc, positions=positions, pool=pool
+            )
+
     def committed_swa_loc(
         self,
         *,

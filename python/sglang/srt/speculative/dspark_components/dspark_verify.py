@@ -669,8 +669,12 @@ class DsparkVerifyEpilogue:
         accept_tail_max_bs: int = 0,
         deferred_draft_kv: Optional[DeferredDraftKVStore] = None,
         post_fold: bool = False,
+        fold_accept: bool = True,
     ) -> None:
         self.max_bs = int(max_bs)
+        # False (SGLANG_OPT_DSV41_DSPARK_DP_ACCEPT_GRAPH): static verify graphs only
+        # record their buffers; the accept and commits run in the sampling-accept graph.
+        self.folds_accept = bool(fold_accept)
         # SGLANG_OPT_DSV41_DSPARK_POST_FOLD: static graphs also scatter new seq lens
         # and the bonus into the FutureMap's slots; built at the first warmup.
         self._post_fold = bool(post_fold)
@@ -813,6 +817,8 @@ class DsparkVerifyEpilogue:
         )
         if capturing:
             self.static_io[bs] = io
+        if not self.folds_accept:
+            return
         committed_engram = self.run_static(
             io, accept=self._accept_static_greedy, gate=self.inject_gate_buf
         )
@@ -820,10 +826,17 @@ class DsparkVerifyEpilogue:
             self.folds_engram_commit = True
 
     def run_static(
-        self, io: StaticVerifyIO, *, accept, gate: torch.Tensor, kv_projected=False
+        self,
+        io: StaticVerifyIO,
+        *,
+        accept,
+        gate: torch.Tensor,
+        kv_projected=False,
+        projected_kvs=None,
     ) -> bool:
         """Run ``accept`` into the accept buffers, then the commits gated by ``gate``;
-        returns whether the engram history was committed."""
+        returns whether the engram history was committed. ``projected_kvs``: joins and
+        returns the draft KV projection a side stream ran beside the accept."""
         bs = io.candidates.shape[0]
         verify_lens = self.verify_lens_buf[:bs]
         folds = self.folds_commit
@@ -855,6 +868,16 @@ class DsparkVerifyEpilogue:
         ):
             deferred_draft_kv.stage(
                 cache_loc=cache_loc,
+                positions=io.positions,
+                commit_lens=gated_commit_lens,
+                state_slot=state_slot,
+            )
+            return committed_engram
+        if projected_kvs is not None:
+            self.commit_ctx.kv_injector.store_projected(
+                kvs=projected_kvs(),
+                cache_loc=cache_loc,
+                cache_loc_2d=cache_loc.view(bs, self.stride),
                 positions=io.positions,
                 commit_lens=gated_commit_lens,
                 state_slot=state_slot,
