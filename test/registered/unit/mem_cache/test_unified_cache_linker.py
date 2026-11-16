@@ -893,6 +893,27 @@ def test_cache_linker_rejects_unsupported_tree_components(component_type, load_m
     assert not cache.tree_core.enable_external_cache_linker
 
 
+def test_prefetch_admission_hooks_keep_their_rank_consensus():
+    """check_prefetch_progress and release_prefetch_hold run in lockstep on
+    every rank; each must carry its own rank_consensus marker."""
+    import ast
+    import inspect
+
+    from sglang.srt.mem_cache import unified_radix_cache
+
+    tree = ast.parse(inspect.getsource(unified_radix_cache))
+    decorated = {
+        node.name: [ast.unparse(d) for d in node.decorator_list]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name in ("check_prefetch_progress", "release_prefetch_hold")
+    }
+    assert decorated["check_prefetch_progress"] == [
+        "rank_consensus(same_params=True, same_results=True)"
+    ]
+    assert decorated["release_prefetch_hold"] == ["rank_consensus(same_params=True)"]
+
+
 def test_pipeline_parallelism_rejects_only_prefetch_mode():
     cache = _cache_for_wrapper(pp_size=2)
     UnifiedCacheLinkerWrapper(cache, _FakeLinker())
