@@ -271,5 +271,88 @@ def test_region_stages_the_deferred_draft_kv_from_the_joined_projection():
     assert calls == [("stage", 7)]
 
 
+
+def test_dp_region_replays_at_the_padded_verify_graph():
+    """SGLANG_OPT_DSV41_DSPARK_DP_ACCEPT_GRAPH: an attention-DP rank whose batch the
+    verify graph padded runs that graph's region; any other buffer takes the eager accept."""
+    logits = torch.zeros(4 * 128 * STRIDE, 8)
+    ios = {
+        bs: SimpleNamespace(candidates=torch.zeros(bs, STRIDE), logits=logits)
+        for bs in (64, 118, 128)
+    }
+    epi = SimpleNamespace(static_io=ios, engram_history=lambda: None)
+    epi.read_accept = lambda bs: ("accept", bs)
+    sampler = SimpleNamespace(
+        greedy_draft=False,
+        step_logits=torch.zeros(1),
+        params=SimpleNamespace(temperatures=torch.zeros(1)),
+    )
+    graph = sag.DsparkSamplingAcceptGraph(
+        epilogue=epi,
+        resolve_draft_sampler=lambda: sampler,
+        tp_sync=_tp_sync(),
+        block_verification=False,
+        device="cpu",
+        rank_local=True,
+    )
+    keys = []
+    graph._run = lambda key, region: keys.append(key)
+    assert graph.run(bs=96, target_logits=logits, graph_bs=128) == ("accept", 96)
+    assert keys[-1][0] == 128 and graph.last_io is ios[128]
+    assert graph.run(bs=96, target_logits=logits) == ("accept", 96)
+    assert keys[-1][0] == 118
+    assert graph.run(bs=96, target_logits=logits, graph_bs=64) is None
+    assert graph.run(bs=96, target_logits=torch.zeros(8, 8), graph_bs=128) is None
+    assert len(keys) == 2
+
+
+def test_region_stores_the_joined_projection():
+    """SGLANG_OPT_DSV41_DSPARK_ACCEPT_GRAPH_STREAMS: the KV store reads the projection
+    joined after the accept, with inject_target_hidden's locations and lengths."""
+    calls = []
+    injector = SimpleNamespace(
+        swa_ring_size=None,
+        store_projected=lambda **kw: calls.append(kw),
+        inject_target_hidden=lambda **kw: calls.append("inject"),
+    )
+    epi = dspark_verify.DsparkVerifyEpilogue(
+        max_bs=2,
+        verify_num_draft_tokens=STRIDE,
+        device="cpu",
+        tp_sync=_tp_sync(),
+        commit_ctx=dspark_verify.CommitInjectCtx(
+            draft_model=None,
+            block_pos_offsets=torch.arange(STRIDE),
+            resolve_pool=lambda: SimpleNamespace(
+                set_swa_key_buffer_radix_fused_norm_rope=None
+            ),
+            resolve_req_to_token=lambda: torch.zeros(4, 8),
+            kv_injector=injector,
+        ),
+    )
+    epi.begin_static_step(1, False)
+    io = SimpleNamespace(
+        candidates=torch.zeros(2, STRIDE, dtype=torch.int64),
+        req_pool_indices=torch.arange(2),
+        out_cache_loc=torch.arange(2 * STRIDE),
+        positions=torch.arange(2 * STRIDE),
+    )
+
+    def accept(io, *, verify_lens, gate, gated):
+        epi.commit_lens_buf[:2] = 3
+        return torch.minimum(epi.commit_lens_buf[:2], verify_lens.to(torch.int32)) * gate
+
+    epi.run_static(
+        io,
+        accept=accept,
+        gate=torch.ones(1, dtype=torch.int32),
+        kv_projected=True,
+        projected_kvs=lambda: ["kv"],
+    )
+    (kw,) = calls
+    assert kw["kvs"] == ["kv"] and kw["commit_lens"].tolist() == [3, 0]
+    assert torch.equal(kw["cache_loc_2d"], io.out_cache_loc.view(2, STRIDE))
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
