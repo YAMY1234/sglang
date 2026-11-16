@@ -8,6 +8,7 @@ import json
 import unittest
 from unittest.mock import patch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.storage.mooncake_store import mooncake_store
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
     MooncakeStoreConfig,
@@ -71,6 +72,14 @@ class TestMooncakeDeviceNameResolution(CustomTestCase):
     def test_numa_keys_pick_the_gpu_numa_node_hcas(self):
         self.assertEqual(self._resolve(self._BY_NUMA, 0, 1), "roce_vf0_r3,roce_vf0_r4")
         self.assertEqual(self._resolve(self._BY_NUMA, 0, 0), "roce_vf0_r1,roce_vf0_r2")
+
+    def test_numa_env_wins_over_a_plain_device_list(self):
+        with envs.SGLANG_MOONCAKE_DEVICE_BY_NUMA.override(self._BY_NUMA):
+            self.assertEqual(
+                self._resolve("roce_vf0_r1,roce_vf0_r3", 0, 1), "roce_vf0_r3,roce_vf0_r4"
+            )
+            # A node the map does not name keeps MOONCAKE_DEVICE.
+            self.assertEqual(self._resolve("mlx5_0", 0, 2), "mlx5_0")
 
     def test_tp_rank_keys_and_plain_names_are_unchanged(self):
         by_rank = json.dumps({"0": "mlx5_0", "1": "mlx5_1"})

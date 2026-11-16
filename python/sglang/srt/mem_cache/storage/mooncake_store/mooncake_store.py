@@ -311,7 +311,14 @@ def _local_gpu_numa_node() -> Optional[int]:
 def _resolve_device_name(device_name: str, tp_rank: Optional[int]) -> str:
     """A JSON device_name maps "numa<N>" (this GPU's NUMA node: e.g. both of its
     rails, for one PP stage per GPU) or a TP rank to its HCAs; other values pass
-    through."""
+    through. SGLANG_MOONCAKE_DEVICE_BY_NUMA's entry for this GPU wins."""
+    by_numa = envs.SGLANG_MOONCAKE_DEVICE_BY_NUMA.get()
+    if by_numa:
+        numa_node = _local_gpu_numa_node()
+        devices = json.loads(by_numa).get(f"numa{numa_node}")
+        if numa_node is not None and devices:
+            logger.info(f"Mooncake devices for NUMA node {numa_node}: {devices}")
+            return devices
     if not device_name or not device_name.strip().startswith("{"):
         return device_name
     try:
