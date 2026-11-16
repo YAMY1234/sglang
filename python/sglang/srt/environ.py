@@ -1841,6 +1841,10 @@ class Envs:
     # contiguous planes instead of one token-major tensor the kernel copies three
     # times (backport of #46738).
     SGLANG_KDA_PREFILL_CONV_QKV_PLANES = EnvBool(False)
+    # KDA prefill on FlashInfer: compile and autotune, at backend init, the Triton
+    # extend that one-token-per-sequence batches fall back to, so the first such
+    # batch in serving does not stall every PP stage on a JIT autotune.
+    SGLANG_KDA_TRITON_EXTEND_PRECOMPILE = EnvBool(False)
     # DSA prefill under sharded DCP: gather the KV and index-K rows with one pack
     # kernel into the all-gather buffer and one reorder kernel out of it, instead
     # of the cat / pad / transpose / split copies around the all-gather.

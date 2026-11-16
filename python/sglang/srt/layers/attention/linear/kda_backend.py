@@ -1,4 +1,5 @@
 import importlib.util
+import time
 from typing import Optional, Tuple, Union
 
 import torch
@@ -529,6 +530,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 enable_two_batch_overlap=get_exec().overlap.enable_two_batch_overlap,
                 prefill_cuda_graph_backend=get_exec().graph.cuda_graph_config.prefill.backend,
             )
+            if envs.SGLANG_KDA_TRITON_EXTEND_PRECOMPILE.get():
+                self._precompile_triton_extend(model_runner)
         # One-shot; emitted at the first fused-decode interception below.
         self._fused_override_notice = (
             "K3 fused KDA decode engaged: --linear-attn-decode-backend "
@@ -568,6 +571,76 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 dtype=torch.int32,
                 device=model_runner.device,
             )
+
+    # One-token-per-sequence batch sizes: 1 and 2 sequences take the fused
+    # small-grid inter_solve (NT * H <= 256 at H = 96), 3 and 16 the unfused one;
+    # T == 1, T % 16 == 0 and neither are Triton's integer specializations.
+    _TRITON_EXTEND_PRECOMPILE_SEQS = (1, 2, 3, 16)
+
+    def _precompile_triton_extend(self, model_runner: ModelRunner) -> None:
+        """Run the Triton extend that effective_extend_kernel picks for
+        one-token-per-sequence batches on dummy inputs shaped like this stage's
+        KDA layers, so its kernels compile and autotune before serving. Writes
+        only the reserved padding slot 0 of one layer's SSM pool."""
+        from sglang.srt.configs.hybrid_arch import hybrid_kda_config
+
+        pool = self.req_to_token_pool
+        ssm_states = pool.mamba2_layer_cache(next(iter(pool.mamba_map))).temporal
+        num_heads, head_k_dim, head_v_dim = ssm_states.shape[1:]
+        lower_bound = hybrid_kda_config(
+            model_runner.model_config
+        ).linear_attn_config.get("gate_lower_bound")
+        device, dtype = ssm_states.device, model_runner.model_config.dtype
+        a_log = torch.zeros(1, 1, num_heads, 1, dtype=torch.float32, device=device)
+        dt_bias = torch.zeros(
+            num_heads * head_k_dim, dtype=torch.float32, device=device
+        )
+        q_dim, v_dim = num_heads * head_k_dim, num_heads * head_v_dim
+        start = time.perf_counter()
+        for num_seqs in self._TRITON_EXTEND_PRECOMPILE_SEQS:
+            assert self.kernel_dispatcher.effective_extend_kernel(
+                lower_bound, num_seqs, num_seqs
+            ) is self.kernel_dispatcher.triton_kernel
+            # Contiguous Q/K/V planes (SGLANG_KDA_PREFILL_CONV_QKV_PLANES) and
+            # views into one packed conv output.
+            packed = torch.zeros(
+                num_seqs, 2 * q_dim + v_dim, dtype=dtype, device=device
+            )
+            for q, k, v in (
+                (packed.new_zeros(num_seqs, q_dim),) * 2
+                + (packed.new_zeros(num_seqs, v_dim),),
+                packed.split([q_dim, q_dim, v_dim], dim=-1),
+            ):
+                self.kernel_dispatcher.extend(
+                    q=q.unflatten(-1, (num_heads, head_k_dim)).unsqueeze(0),
+                    k=k.unflatten(-1, (num_heads, head_k_dim)).unsqueeze(0),
+                    v=v.unflatten(-1, (num_heads, head_v_dim)).unsqueeze(0),
+                    g=packed.new_zeros(1, num_seqs, num_heads, head_k_dim),
+                    beta=packed.new_zeros(1, num_seqs, num_heads),
+                    ssm_states=ssm_states,
+                    cache_indices=torch.zeros(
+                        num_seqs, dtype=torch.int32, device=device
+                    ),
+                    query_start_loc=torch.arange(
+                        num_seqs + 1, dtype=torch.int32, device=device
+                    ),
+                    A_log=a_log,
+                    dt_bias=dt_bias,
+                    lower_bound=lower_bound,
+                    beta_is_raw=True,
+                )
+        torch.cuda.synchronize(device)
+        rank0_log(
+            "KDA Triton extend precompiled for %s one-token sequences in %.1f s "
+            "(heads %d, k %d, v %d)"
+            % (
+                list(self._TRITON_EXTEND_PRECOMPILE_SEQS),
+                time.perf_counter() - start,
+                num_heads,
+                head_k_dim,
+                head_v_dim,
+            )
+        )
 
     @staticmethod
     def _can_fuse_accept_state(verify_backend) -> bool:
