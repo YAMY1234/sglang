@@ -309,31 +309,42 @@ def _local_gpu_numa_node() -> Optional[int]:
     return node if node >= 0 else None
 
 
-_MPOL_PREFERRED = 1
+_MPOL_PREFERRED, _MPOL_BIND = 1, 2
 _MPOL_MAX_NODES = 1024
 
 
 @contextmanager
-def _preferred_numa_node(node: int):
-    """This thread allocates new pages on ``node`` (elsewhere only once it is
-    full), then gets its previous memory policy back. Threads it starts inherit
-    the preference."""
+def _bound_numa_node(node: int):
+    """This thread allocates new pages only on ``node``, then gets its previous
+    memory policy back; threads it starts inherit the binding. A preferred
+    policy spills to another node when this one's free pages run low rather
+    than reclaiming its page cache (Rhea 57006), so it is only the fallback
+    where binding is denied, as numa_utils falls back for numactl."""
     numa = ctypes.CDLL("libnuma.so.1", use_errno=True)
     words = _MPOL_MAX_NODES // (8 * ctypes.sizeof(ctypes.c_ulong))
+    maxnode = ctypes.c_ulong(_MPOL_MAX_NODES + 1)
     mode, old = ctypes.c_int(), (ctypes.c_ulong * words)()
-    if numa.get_mempolicy(
-        ctypes.byref(mode), old, ctypes.c_ulong(_MPOL_MAX_NODES + 1), None, 0
-    ):
+    if numa.get_mempolicy(ctypes.byref(mode), old, maxnode, None, 0):
         raise OSError(ctypes.get_errno(), "get_mempolicy failed")
     mask = (ctypes.c_ulong * words)()
     bits = 8 * ctypes.sizeof(ctypes.c_ulong)
     mask[node // bits] = 1 << (node % bits)
-    if numa.set_mempolicy(_MPOL_PREFERRED, mask, ctypes.c_ulong(_MPOL_MAX_NODES + 1)):
-        raise OSError(ctypes.get_errno(), "set_mempolicy failed")
+    if numa.set_mempolicy(_MPOL_BIND, mask, maxnode) == 0:
+        logger.info("Mooncake segment memory bound to NUMA node %d", node)
+    else:
+        error = ctypes.get_errno()
+        if numa.set_mempolicy(_MPOL_PREFERRED, mask, maxnode):
+            raise OSError(ctypes.get_errno(), "set_mempolicy failed")
+        logger.warning(
+            "Binding Mooncake segment memory to NUMA node %d was denied (%s); "
+            "preferring it instead",
+            node,
+            os.strerror(error),
+        )
     try:
         yield
     finally:
-        numa.set_mempolicy(mode.value, old, ctypes.c_ulong(_MPOL_MAX_NODES + 1))
+        numa.set_mempolicy(mode.value, old, maxnode)
 
 
 def _resolve_device_name(device_name: str, tp_rank: Optional[int]) -> str:
@@ -653,7 +664,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                         with (
                             nullcontext()
                             if numa_node is None
-                            else _preferred_numa_node(numa_node)
+                            else _bound_numa_node(numa_node)
                         ):
                             ret_code = self.store.setup(
                                 client_hostname,

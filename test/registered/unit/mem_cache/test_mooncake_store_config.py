@@ -100,18 +100,36 @@ def _mempolicy():
 
 
 @unittest.skipUnless(ctypes.util.find_library("numa"), "libnuma not installed")
-class TestPreferredNumaNode(CustomTestCase):
-    def test_segment_allocation_prefers_the_node_then_restores_the_policy(self):
+class TestBoundNumaNode(CustomTestCase):
+    def test_segment_allocation_binds_to_the_node_then_restores_the_policy(self):
         before = _mempolicy()
-        with mooncake_store._preferred_numa_node(0):
+        with mooncake_store._bound_numa_node(0):
             mode, mask = _mempolicy()
-            self.assertEqual((mode, mask[0]), (1, 1))  # MPOL_PREFERRED, node 0
+            self.assertEqual((mode, mask[0]), (2, 1))  # MPOL_BIND, node 0
+        self.assertEqual(_mempolicy(), before)
+
+    def test_a_denied_binding_falls_back_to_preferring_the_node(self):
+        real = ctypes.CDLL("libnuma.so.1", use_errno=True)
+
+        class DenyBind:
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+            def set_mempolicy(self, mode, mask, maxnode):
+                return -1 if mode == 2 else real.set_mempolicy(mode, mask, maxnode)
+
+        before = _mempolicy()
+        with patch.object(mooncake_store.ctypes, "CDLL", return_value=DenyBind()):
+            with self.assertLogs(mooncake_store.logger, "WARNING"):
+                with mooncake_store._bound_numa_node(0):
+                    mode, mask = _mempolicy()
+                    self.assertEqual((mode, mask[0]), (1, 1))  # MPOL_PREFERRED
         self.assertEqual(_mempolicy(), before)
 
     def test_policy_is_restored_when_setup_raises(self):
         before = _mempolicy()
         with self.assertRaises(RuntimeError):
-            with mooncake_store._preferred_numa_node(0):
+            with mooncake_store._bound_numa_node(0):
                 raise RuntimeError("setup failed")
         self.assertEqual(_mempolicy(), before)
 
