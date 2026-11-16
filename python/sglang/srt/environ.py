@@ -1393,6 +1393,10 @@ class Envs:
     # static per-head power-of-two scales (folded into its UE8M0 weight scales) and FlashMLA's fp8 decode reads it
     # (QK and SV on e4m3 tensor cores). Needs a FlashMLA whose decode takes q_head_scale; changes attention numerics.
     SGLANG_OPT_DSV4_MEGA_FP8_Q = EnvBool(False)
+    # fp8xfp4 MegaMoE through the deep_gemm_fp4acts DeepGEMM build: routed tasks run MXFP4 activations
+    # (requantized in the dispatch; DG_MEGA_MOE_ACT_DTYPE defaults to mxfp4 under this switch), the fused shared
+    # expert stays FP8. Changes MoE numerics.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_FP4_ACTS = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
 
