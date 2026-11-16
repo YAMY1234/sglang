@@ -49,6 +49,34 @@ def max_packed_query_rows(*, max_running_requests: int, rows_per_request: int) -
     )
 
 
+def static_fp8_q_head_scale(
+    weight: torch.Tensor,
+    weight_scale_ue8m0: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    num_heads: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-head power-of-two scales for a static E4M3 Q, bounded from the weights as
+    vLLM's ``_init_fp8_q``: wq_b reads RMSNorm(x) * w with ||RMSNorm(x)|| = sqrt(K), so
+    |Q_n| <= sqrt(K) * ||w * W_n||; twice that, rounded up to a power of two, also bounds
+    the rotated RoPE pairs. ``weight`` [N, K] (MXFP8, scales [N, K / 32]) has its rows in
+    the MegaAttention query layout: row r feeds head r % (num_heads * 16) // 16.
+    Returns (scale [num_heads] fp32, log2 of each row's head scale [N] int32)."""
+    n, k = weight.shape
+    qn = q_norm_weight.float()
+    row_bound = torch.empty(n, dtype=torch.float32, device=weight.device)
+    step = 4096
+    for r0 in range(0, n, step):
+        w = weight[r0 : r0 + step].float() * torch.exp2(
+            weight_scale_ue8m0[r0 : r0 + step].view(torch.uint8).float() - 127
+        ).repeat_interleave(32, dim=1)
+        row_bound[r0 : r0 + step] = (w * qn).norm(dim=1)
+    row_bound *= k**0.5
+    head = torch.arange(n, device=weight.device) % (num_heads * 16) // 16
+    bound = row_bound.new_zeros(num_heads).scatter_reduce(0, head, row_bound, "amax")
+    scale = torch.exp2(torch.ceil(torch.log2(2 * bound / 448.0)))
+    return scale.contiguous(), torch.log2(scale).round().int()[head]
+
+
 def interleave_output_columns(w: torch.Tensor) -> torch.Tensor:
     return w.view(*w.shape[:-1], 8, 16, 32).transpose(-3, -2).reshape(w.shape)
 
@@ -129,6 +157,7 @@ class DeepseekV4MegaAttnBackend(DeepseekV4AttnBackend):
         extra_k_cache: Optional[torch.Tensor],
         extra_indices: Optional[torch.Tensor],
         extra_topk_lengths: Optional[torch.Tensor],
+        q_head_scale: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         from sglang.kernels.ops.attention import flash_mla_interface
 
@@ -145,6 +174,7 @@ class DeepseekV4MegaAttnBackend(DeepseekV4AttnBackend):
             extra_indices=extra_indices,
             extra_topk_length=extra_topk_lengths,
             use_legacy=not self._swa_interleaved,
+            q_head_scale=q_head_scale,
         )
         return data, scale
 

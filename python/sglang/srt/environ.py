@@ -1372,6 +1372,10 @@ class Envs:
     # Kernel for the tabled shapes: "pdl" (the copy, PDL on), "nopdl" (the copy, PDL off),
     # "stock" (FlashInfer's SM107 runner pinned to the table's tactic).
     SGLANG_OPT_SM107_MXFP8_DENSE_TABLE_MODE = EnvStr("pdl")
+    # DSV4.1 MegaAttention decode on SM107, compressed layers with an fp4 extra cache: wq_b writes Q as E4M3 at
+    # static per-head power-of-two scales (folded into its UE8M0 weight scales) and FlashMLA's fp8 decode reads it
+    # (QK and SV on e4m3 tensor cores). Needs a FlashMLA whose decode takes q_head_scale; changes attention numerics.
+    SGLANG_OPT_DSV4_MEGA_FP8_Q = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
 

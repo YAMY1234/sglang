@@ -4606,6 +4606,10 @@ class DeepseekV4AttnBackend(
                     if extra_indices is None
                     else extra_indices.squeeze(1),
                     extra_topk_lengths=extra_topk_lengths,
+                    # an E4M3 q holds Q / scale per head (the model's static FP8 Q)
+                    q_head_scale=getattr(layer, "mega_q_head_scale", None)
+                    if q.dtype == torch.float8_e4m3fn
+                    else None,
                 )
 
             if (
