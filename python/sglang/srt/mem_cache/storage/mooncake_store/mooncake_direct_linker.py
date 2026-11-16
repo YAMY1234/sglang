@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import glob
 import hashlib
 import logging
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -139,7 +141,28 @@ def _storage_sharing(
     return suffixes, offload_pools, cp_shared, tp_shared
 
 
+def _numa_available() -> list[tuple[int, int, int]]:
+    """(node, available bytes, MemTotal) per NUMA node, available as ARIA's NUMA
+    guard counts it: MemFree + clean file pages + SReclaimable."""
+    nodes = []
+    for path in glob.glob("/sys/devices/system/node/node[0-9]*/meminfo"):
+        m = {}
+        for line in open(path):
+            parts = line.split()  # Node 0 MemFree:  123 kB
+            if len(parts) >= 4 and parts[3].isdigit():
+                m[parts[2].rstrip(":")] = int(parts[3]) * 1024
+        clean = m.get("Active(file)", 0) + m.get("Inactive(file)", 0)
+        clean -= m.get("Dirty", 0) + m.get("Writeback", 0)
+        available = m.get("MemFree", 0) + max(clean, 0) + m.get("SReclaimable", 0)
+        node = int(re.search(r"node(\d+)/meminfo$", path).group(1))
+        nodes.append((node, available, m.get("MemTotal", 0)))
+    return sorted(nodes)
+
+
 class MooncakeDirectLinker(UnifiedCacheLinker):
+    # Set False at init: the first lookup, load or offload logs NUMA headroom.
+    _numa_first_request_logged = True
+
     def __init__(
         self,
         server_args,
@@ -273,6 +296,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         # Build the native page-hash extension at startup: its first use otherwise
         # compiles it inside a request (about 3 s per node on the first store hit).
         get_storage_hash_str([0] * self.page_size, page_size=self.page_size)
+        self._log_numa_available("after segment allocation")
+        self._numa_first_request_logged = False
         self.mla_broadcaster = None
         self.tp_group = tp_group
         self.broadcast_loads = {}
@@ -332,7 +357,27 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         f"error code: {result}."
                     )
 
+    def _log_numa_available(self, when: str) -> None:
+        nodes = _numa_available()
+        low = [node for node, available, total in nodes if available < 0.1 * total]
+        (logger.warning if low else logger.info)(
+            "Linker NUMA available %s: %s%s",
+            when,
+            " | ".join(
+                f"n{node} {available / 1e9:.1f} of {total / 1e9:.1f} GB "
+                f"({100 * available / max(total, 1):.1f}%)"
+                for node, available, total in nodes
+            ),
+            f"; UNDER 10% on nodes {low}" if low else "",
+        )
+
+    def _log_numa_first_request(self) -> None:
+        if not self._numa_first_request_logged:
+            self._numa_first_request_logged = True
+            self._log_numa_available("at first request")
+
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
+        self._log_numa_first_request()
         expanded = self.pool_group.resolve_transfers(transfers)
         if not expanded:
             return []
@@ -369,6 +414,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         PP0 relays is one every stage can load. Trailing (state) objects are
         sparse, so they are queried first and the all-pages objects only up to
         the deepest common stop point."""
+        self._log_numa_first_request()
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
         page_keys = list(kv.keys)
         num_pages = len(page_keys)
@@ -432,6 +478,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 refresher.submit(anchor, page_hashes)
 
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
+        self._log_numa_first_request()
         # Query establishes a boundary at which every component is restorable;
         # insert then removes pages already resident in L1. Loading is therefore
         # intentionally partial and may contain only a side pool such as SWA.
@@ -706,6 +753,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def offload(
         self, transfers: list[PoolTransfer], session_id: str | None = None
     ) -> bool:
+        self._log_numa_first_request()
         expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
         if not expanded:
             return False

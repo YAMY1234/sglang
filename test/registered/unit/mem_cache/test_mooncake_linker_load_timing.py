@@ -1,6 +1,8 @@
 """The Mooncake linker logs each request's load time and bytes on the timing rank."""
 
+import os
 import queue
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -115,6 +117,61 @@ class TestMooncakeLinkerLoadTiming(CustomTestCase):
             (index, list(pending), list(queued_at)), (3, ["kept"], ["kept"])
         )
         self.assertEqual(linker.load_queued_at, {})
+
+
+def _meminfo(node, total_kb, free_kb, file_kb, dirty_kb, reclaimable_kb):
+    return "".join(
+        f"Node {node} {key}: {value} kB\n"
+        for key, value in (
+            ("MemTotal", total_kb),
+            ("MemFree", free_kb),
+            ("Active(file)", file_kb),
+            ("Inactive(file)", 0),
+            ("Dirty", dirty_kb),
+            ("Writeback", 0),
+            ("SReclaimable", reclaimable_kb),
+        )
+    ) + f"Node {node} HugePages_Total:     0\n"
+
+
+class TestMooncakeLinkerNumaHeadroom(CustomTestCase):
+    def _sysfs(self, tmp, nodes):
+        paths = []
+        for node, info in nodes.items():
+            path = f"{tmp}/node{node}/meminfo"
+            os.makedirs(os.path.dirname(path))
+            with open(path, "w") as f:
+                f.write(info)
+            paths.append(path)
+        return patch.object(mooncake_direct_linker.glob, "glob", return_value=paths)
+
+    def test_available_counts_free_clean_file_and_reclaimable(self):
+        with tempfile.TemporaryDirectory() as tmp, self._sysfs(
+            tmp,
+            {1: _meminfo(1, 1000, 50, 30, 10, 5), 0: _meminfo(0, 1000, 400, 0, 0, 0)},
+        ):
+            nodes = mooncake_direct_linker._numa_available()
+        self.assertEqual(nodes, [(0, 400 * 1024, 1000 * 1024), (1, 75 * 1024, 1000 * 1024)])
+
+    def test_first_request_logs_once_and_flags_nodes_under_ten_percent(self):
+        linker = _linker(log_load_timing=False)
+        linker._numa_first_request_logged = False
+        with tempfile.TemporaryDirectory() as tmp, self._sysfs(
+            tmp,
+            {0: _meminfo(0, 1000, 400, 0, 0, 0), 1: _meminfo(1, 1000, 50, 30, 10, 5)},
+        ), self.assertLogs(LOGGER, level="INFO") as logs:
+            linker._log_numa_first_request()
+            linker._log_numa_first_request()
+        self.assertEqual(len(logs.records), 1)
+        self.assertEqual(logs.records[0].levelname, "WARNING")
+        self.assertIn("at first request", logs.output[0])
+        self.assertIn("UNDER 10% on nodes [1]", logs.output[0])
+
+    def test_linkers_built_without_init_never_log_headroom(self):
+        linker = _linker(log_load_timing=False)
+        with patch.object(mooncake_direct_linker, "_numa_available") as available:
+            linker._log_numa_first_request()
+        available.assert_not_called()
 
 
 if __name__ == "__main__":
