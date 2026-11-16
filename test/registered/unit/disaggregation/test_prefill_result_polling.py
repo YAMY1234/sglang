@@ -1235,6 +1235,20 @@ class TestPPPrefillEarlySend(CustomTestCase):
                 stage.spec_algorithm = SpeculativeAlgorithm.DFLASH
                 self.assertFalse(stage._pp_pd_early_send_enabled())
 
+    def test_gate_takes_the_external_linker_only_under_its_pp_mode(self):
+        stage = _PPEarlySendScheduler(is_last_rank=False)
+        stage.kv_checksum_computer = None
+        stage.enable_staging = False
+        stage.enable_unified_cache_external_linker = True
+        stage.spec_algorithm = SpeculativeAlgorithm.DFLASH
+        with (
+            published_topology(pp_size=8),
+            envs.SGLANG_PP_PD_PREFILL_EARLY_SEND.override(True),
+        ):
+            self.assertFalse(stage._pp_pd_early_send_enabled())
+            with envs.SGLANG_LINKER_PP.override(True):
+                self.assertTrue(stage._pp_pd_early_send_enabled())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -16,6 +16,7 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.arg_groups.hicache_hook import handle_hicache
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
@@ -201,6 +202,25 @@ class TestExternalLinkerConfig(unittest.TestCase):
             fields.update(overrides)
             with self.subTest(overrides=overrides), self.assertRaises(ValueError):
                 handle_hicache(ServerArgs(**fields))
+
+
+    def test_pipeline_parallelism_needs_opt_in_and_mooncake(self):
+        def args(backend, config):
+            return ServerArgs(
+                model_path="dummy",
+                enable_unified_cache_external_linker=True,
+                unified_cache_external_linker_backend=backend,
+                unified_cache_external_linker_config=config,
+                pp_size=8,
+            )
+
+        mooncake = {"master_server_address": "localhost:50051"}
+        with self.assertRaisesRegex(ValueError, "pipeline parallelism"):
+            handle_hicache(args("mooncake", mooncake))
+        with envs.SGLANG_LINKER_PP.override(True):
+            handle_hicache(args("mooncake", mooncake))
+            with self.assertRaisesRegex(ValueError, "only the Mooncake"):
+                handle_hicache(args("dynamic", _CONFIG))
 
 
 class TestExternalLinkerFactory(unittest.TestCase):

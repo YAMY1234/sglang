@@ -4,10 +4,14 @@ Regression for sgl-project/sglang#23457: runtime attach must resolve
 per-node local_hostname from process environment instead of a shared default.
 """
 
+import json
 import unittest
+from unittest.mock import patch
 
+from sglang.srt.mem_cache.storage.mooncake_store import mooncake_store
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
     MooncakeStoreConfig,
+    _resolve_device_name,
 )
 from sglang.srt.utils.common import temp_set_env
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -50,6 +54,30 @@ class TestMooncakeStoreConfigProtocol(CustomTestCase):
         with temp_set_env(MOONCAKE_PROTOCOL="efa"):
             cfg = self._load_from_extra_config({"protocol": "rdma"})
         self.assertEqual(cfg.protocol, "rdma")
+
+
+class TestMooncakeDeviceNameResolution(CustomTestCase):
+    """One PP stage per GPU leaves every rank at TP rank 0, so a JSON device map
+    can name each NUMA node's HCAs instead (both of its rails)."""
+
+    _BY_NUMA = json.dumps(
+        {"numa0": "roce_vf0_r1,roce_vf0_r2", "numa1": "roce_vf0_r3,roce_vf0_r4"}
+    )
+
+    def _resolve(self, device_name, tp_rank, numa_node):
+        with patch.object(mooncake_store, "_local_gpu_numa_node", return_value=numa_node):
+            return _resolve_device_name(device_name, tp_rank)
+
+    def test_numa_keys_pick_the_gpu_numa_node_hcas(self):
+        self.assertEqual(self._resolve(self._BY_NUMA, 0, 1), "roce_vf0_r3,roce_vf0_r4")
+        self.assertEqual(self._resolve(self._BY_NUMA, 0, 0), "roce_vf0_r1,roce_vf0_r2")
+
+    def test_tp_rank_keys_and_plain_names_are_unchanged(self):
+        by_rank = json.dumps({"0": "mlx5_0", "1": "mlx5_1"})
+        self.assertEqual(self._resolve(by_rank, 1, 0), "mlx5_1")
+        self.assertEqual(self._resolve(by_rank, None, 0), "")
+        self.assertEqual(self._resolve("mlx5_0,mlx5_1", 0, 1), "mlx5_0,mlx5_1")
+        self.assertEqual(self._resolve("{not json", 0, 1), "")
 
 
 if __name__ == "__main__":

@@ -7,8 +7,12 @@ draft are shared, while TP-sharded KDA state keeps its own rank namespace."""
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.storage.mooncake_store.linker_lease_refresh import (
+    LinkerLeaseRefresher,
+)
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
+    MooncakeDirectLinker,
     _shared_pool_suffix,
     _storage_sharing,
 )
@@ -181,6 +185,128 @@ class TestStorageSharing(CustomTestCase):
             self.assertEqual(
                 offload, sharded | {PoolName.MAMBA} if rank < 8 else {PoolName.MAMBA}
             )
+
+
+def _stage_schema(pp_rank):
+    """A PP8 TP1 K3.1 stage: KV, indexer and KDA state under its own pp suffix."""
+    suffix = f"tp0_cp0_pp{pp_rank}"
+    return [
+        ("kv", "k", suffix, False),
+        ("indexer", "indexer", suffix, False),
+        ("mamba", "mamba", suffix, True),
+    ]
+
+
+class _PresentKeys:
+    """A store holding a fixed key set; records every existence query."""
+
+    def __init__(self, present):
+        self.present = set(present)
+        self.queries = []
+
+    def _tag_keys(self, keys):
+        return [f"model_{key}" for key in keys]
+
+    def _batch_exist(self, keys):
+        self.queries.append(list(keys))
+        return [1 if key in self.present else 0 for key in keys]
+
+
+def _linker_over_stages(present, num_stages=3):
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.storage = _PresentKeys(present)
+    linker.stage_schemas = [_stage_schema(stage) for stage in range(num_stages)]
+    linker.stats = {"lookup": 0, "load": 0, "offload": 0}
+    return linker
+
+
+def _stored(stages, pages, states):
+    """Every stage's KV and indexer of ``pages`` and its state at ``states``."""
+    keys = set()
+    for stage in stages:
+        for page in pages:
+            keys |= {f"model_p{page}_tp0_cp0_pp{stage}_{obj}" for obj in ("k", "indexer")}
+        keys |= {f"model_p{page}_tp0_cp0_pp{stage}_mamba" for page in states}
+    return keys
+
+
+class TestLookupStages(CustomTestCase):
+    """Under PP, PP0 checks every stage's objects so the hit it relays is one
+    every stage can load: a stop point needs every stage's state there and
+    every stage's KV and indexer pages up to it."""
+
+    def _lookup(self, linker):
+        page_keys = [f"p{page}" for page in range(1, 5)]
+        transfers = [PoolTransfer(name=PoolName.KV, keys=page_keys)]
+        return linker.lookup_stages("rid", transfers)
+
+    def test_a_stop_point_needs_every_stage_state(self):
+        present = _stored(range(3), range(1, 5), states={2, 4})
+        present.discard("model_p4_tp0_cp0_pp2_mamba")  # stage 2 lost its state at 4
+        self.assertEqual(self._lookup(_linker_over_stages(present)), [2])
+
+    def test_a_missing_page_on_one_stage_caps_the_hit(self):
+        present = _stored(range(3), range(1, 5), states={2, 4})
+        present.discard("model_p2_tp0_cp0_pp1_indexer")
+        self.assertEqual(self._lookup(_linker_over_stages(present)), [])
+        present = _stored(range(3), range(1, 5), states={2, 4})
+        present.discard("model_p3_tp0_cp0_pp1_k")
+        self.assertEqual(self._lookup(_linker_over_stages(present)), [2])
+
+    def test_all_page_objects_are_queried_only_up_to_the_deepest_stop(self):
+        linker = _linker_over_stages(_stored(range(3), range(1, 5), states={2}))
+        self.assertEqual(self._lookup(linker), [2])
+        trailing, all_pages = linker.storage.queries
+        self.assertEqual(len(trailing), 3 * 4)  # every stage's state, every page
+        self.assertEqual(len(all_pages), 3 * 2 * 2)  # stages x pools x pages 1-2
+
+    def test_no_common_state_skips_the_page_query(self):
+        linker = _linker_over_stages(_stored(range(2), range(1, 5), states={2}))
+        self.assertEqual(self._lookup(linker), [])
+        self.assertEqual(len(linker.storage.queries), 1)
+
+    def test_lease_keys_renew_every_stage_pages_and_the_last_state(self):
+        linker = _linker_over_stages(set(), num_stages=2)
+        keys = linker._lease_keys(["p1", "p2"])
+        self.assertEqual(
+            sorted(keys),
+            sorted(
+                f"model_p{page}_tp0_cp0_pp{stage}_{obj}"
+                for stage in range(2)
+                for page, obj in (
+                    (1, "k"), (2, "k"), (1, "indexer"), (2, "indexer"), (2, "mamba")
+                )
+            ),
+        )
+
+
+class TestLinkerLeaseRefresher(CustomTestCase):
+    def _refresher(self, clock, renewed, max_keys_per_s=0):
+        return LinkerLeaseRefresher(
+            build_keys=lambda pages: [f"{page}_k" for page in pages],
+            renew=lambda keys: renewed.append(list(keys)) or [1] * len(keys),
+            interval_s=10.0,
+            max_keys_per_s=max_keys_per_s,
+            clock=clock,
+        )
+
+    def test_an_anchor_is_due_once_per_interval(self):
+        now = [100.0]
+        refresher = self._refresher(lambda: now[0], [])
+        self.assertTrue(refresher.is_due("node"))
+        refresher.submit("node", ["p1"])
+        self.assertFalse(refresher.is_due("node"))
+        now[0] += 10.5
+        self.assertTrue(refresher.is_due("node"))
+
+    def test_renewal_queries_in_bounded_chunks_and_counts_present(self):
+        renewed = []
+        refresher = self._refresher(lambda: 0.0, renewed)
+        refresher.renew_batch([[f"p{i}" for i in range(5000)], ["q"]])
+        self.assertEqual([len(chunk) for chunk in renewed], [4096, 905])
+        self.assertEqual(refresher.stats["keys"], 5001)
+        self.assertEqual(refresher.stats["present"], 5001)
+        self.assertEqual(refresher.stats["prefixes"], 2)
 
 
 if __name__ == "__main__":

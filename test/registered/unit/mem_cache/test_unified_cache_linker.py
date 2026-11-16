@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -1331,6 +1332,7 @@ def test_close_quiesces_backend_before_releasing_pending_loads():
 def test_check_hicache_events_commits_common_rank_results():
     committed = []
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.pp_size = 1
     cache.linker = SimpleNamespace(
         num_completed_offloads=lambda: 3,
         take_completed_offloads=lambda count: [True] * count,
@@ -1476,6 +1478,177 @@ def test_linker_filters_unstored_swa_from_lookup(full_linker_component):
         LinkerTransferPhase.LOOKUP,
     ]
     swa.build_external_linker_transfer.assert_not_called()
+
+
+def _page_hashes(tokens, prior_hash, page_size):
+    """A pure-Python stand-in for the chained page hash (no native extension)."""
+    hashes, last = [], prior_hash or "root"
+    for start in range(0, len(tokens), page_size):
+        last = f"{last}/{list(tokens[start : start + page_size])}"
+        hashes.append(last)
+    return hashes
+
+
+class _CountingLinker(_FakeLinker):
+    def __init__(self, restorable=(), stage_restorable=()):
+        super().__init__()
+        self.restorable = list(restorable)
+        self.stage_restorable = list(stage_restorable)
+        self.lookups = 0
+        self.stage_lookups = 0
+        self.refreshed = []
+
+    def lookup(self, rid, transfers):
+        self.lookups += 1
+        return list(self.restorable)
+
+    def lookup_stages(self, rid, transfers):
+        self.stage_lookups += 1
+        return list(self.stage_restorable)
+
+    def refresh_device_prefix(self, anchor, hashes):
+        self.refreshed.append((anchor, hashes()))
+
+
+def _match_wrapper(component, backend, **cache_kwargs):
+    cache = _cache_for_wrapper(
+        _components_tuple=(component,),
+        components={ComponentType.FULL: component},
+        tree_core=SimpleNamespace(
+            enable_external_cache_linker=False,
+            is_eagle=False,
+            get_prefix_hash_values=lambda node: [f"device-{node}"],
+        ),
+        page_size=2,
+        _all_reduce_attn_groups=lambda value, op: None,
+        get_last_hash_value=lambda node: f"anchor-{node}",
+        **cache_kwargs,
+    )
+    return UnifiedCacheLinkerWrapper(cache, backend)
+
+
+def _device_result(device_len):
+    return MatchResult(
+        device_prefix_len=device_len,
+        last_device_node=device_len,
+        last_host_node=device_len,
+        best_match_node=device_len,
+    )
+
+
+_KEY = RadixKey(array("q", [1, 2, 3, 4, 5, 6]))
+
+
+def test_lookup_once_reuses_a_request_lookup_across_passes(full_linker_component):
+    # SPF matches every waiting request on every scheduling pass; with
+    # SGLANG_LINKER_LOOKUP_ONCE only the first match queries the store.
+    backend = _CountingLinker(restorable=[1, 3])
+    with (
+        envs.SGLANG_LINKER_LOOKUP_ONCE.override(True),
+        patch(
+            "sglang.srt.mem_cache.unified_cache.unified_cache_linker.get_storage_hash_str",
+            side_effect=_page_hashes,
+        ) as hashed,
+    ):
+        wrapper = _match_wrapper(full_linker_component, backend)
+        req = SimpleNamespace(rid="r")
+        for _ in range(3):
+            assert wrapper.match(_KEY, req, _device_result(0)).host_hit_length == 6
+        assert backend.lookups == 1
+        assert hashed.call_count == 1
+        # A deeper device prefix reuses the lookup: the stop at 6 tokens remains.
+        assert wrapper.match(_KEY, req, _device_result(2)).host_hit_length == 4
+        assert backend.lookups == 1
+        # A shallower one, or a new lifetime, looks the store up again.
+        wrapper.release_request("r")
+        assert wrapper.match(_KEY, req, _device_result(0)).host_hit_length == 6
+        assert backend.lookups == 2
+
+
+def test_pp_stages_admit_pp0s_relayed_lookup(full_linker_component):
+    with patch(
+        "sglang.srt.mem_cache.unified_cache.unified_cache_linker.get_storage_hash_str",
+        side_effect=_page_hashes,
+    ):
+        pp0_backend = _CountingLinker(stage_restorable=[1, 3])
+        pp0 = _match_wrapper(full_linker_component, pp0_backend, pp_size=8, pp_rank=0)
+        req0 = SimpleNamespace(rid="r", linker_pp_hit=None, linker_pp_lookup_pending=True)
+        assert pp0.match(_KEY, req0, _device_result(0)).host_hit_length == 6
+        assert req0.linker_pp_hit == (0, [2, 6])
+        assert (pp0_backend.lookups, pp0_backend.stage_lookups) == (0, 1)
+
+        # A later stage admits from the relayed result with no store query.
+        later_backend = _CountingLinker()
+        later = _match_wrapper(full_linker_component, later_backend, pp_size=8, pp_rank=5)
+        req5 = SimpleNamespace(
+            rid="r", linker_pp_hit=req0.linker_pp_hit, linker_pp_lookup_pending=False
+        )
+        for device_len, hit in ((0, 6), (2, 4), (6, 0)):
+            matched = later.match(_KEY, req5, _device_result(device_len))
+            assert matched.host_hit_length == hit, device_len
+        assert (later_backend.lookups, later_backend.stage_lookups) == (0, 0)
+
+        # Pages between a shrunk device prefix and the looked-up start were
+        # never checked: no hit, on every stage alike.
+        req5.linker_pp_hit = (2, [6])
+        assert later.match(_KEY, req5, _device_result(0)).host_hit_length == 0
+        req5.linker_pp_hit = None
+        assert later.match(_KEY, req5, _device_result(0)).host_hit_length == 0
+        assert (later_backend.lookups, later_backend.stage_lookups) == (0, 0)
+
+
+def test_device_hit_renews_its_store_leases(full_linker_component):
+    backend = _CountingLinker()
+    with patch(
+        "sglang.srt.mem_cache.unified_cache.unified_cache_linker.get_storage_hash_str",
+        side_effect=_page_hashes,
+    ):
+        wrapper = _match_wrapper(full_linker_component, backend)
+        wrapper.match(_KEY, SimpleNamespace(rid="r"), _device_result(0))
+        wrapper.match(_KEY, SimpleNamespace(rid="r"), _device_result(6))
+    assert backend.refreshed == [(6, ["device-6"])]
+
+
+@pytest.mark.parametrize("pp_rank", [0, 3])
+def test_linker_pp_enqueue_matches_once_and_only_pp0_looks_up(pp_rank):
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.pp_rank = pp_rank
+    pending_at_match = []
+    req = SimpleNamespace(linker_pp_lookup_pending=False)
+    req.init_next_round_input = lambda tree_cache, cow_mamba: pending_at_match.append(
+        (tree_cache is cache, cow_mamba, req.linker_pp_lookup_pending)
+    )
+    cache.linker_pp_enqueue(req)
+    assert pending_at_match == [(True, False, pp_rank == 0)]
+    assert req.linker_pp_lookup_pending is False
+
+
+def test_pp_offload_commits_follow_pp0():
+    # Offloads lock their nodes until committed, so every stage commits PP0's
+    # count and verdicts; a later stage first waits for its own puts.
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.pp_size, cache.pp_rank = 8, 3
+    waited, committed = [], []
+    cache.linker = SimpleNamespace(
+        num_completed_offloads=lambda: 1,
+        wait_completed_offloads=waited.append,
+        take_completed_offloads=lambda count: [True] * count,
+        commit_completed_offloads=committed.append,
+    )
+    cache._drain_async_work = lambda: None
+    from_pp0 = [torch.tensor([3]), torch.tensor([1, 0, 1])]
+
+    def receive_from_pp0(value, op):
+        assert op == torch.distributed.ReduceOp.MIN
+        value.copy_(from_pp0.pop(0))
+
+    cache._all_reduce = receive_from_pp0
+
+    cache.check_hicache_events()
+
+    assert waited == [3]
+    assert committed == [[True, False, True]]
+    assert not from_pp0
 
 
 @pytest.mark.parametrize("swa_stored", [True, False], ids=["stored", "unstored"])
