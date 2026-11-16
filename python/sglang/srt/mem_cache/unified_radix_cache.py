@@ -2954,6 +2954,12 @@ class UnifiedRadixCache(BasePrefixCache):
             return staged.matched_len, staged.matched_len + staged.num_tokens
         return None
 
+    # Drops a tree lock: every rank must release the same hold in the same order.
+    @rank_consensus(same_params=True)
+    def release_prefetch_hold(self, request: CacheRequestHandle, prefix_len: int) -> None:
+        if self.linker is not None and self.linker.load_mode == "prefetch":
+            self.linker.release_hold(request, admitted=True, prefix_len=prefix_len)
+
     @rank_consensus(same_params=True, same_results=True)
     def check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
         if self.linker is not None and self.linker.load_mode == "prefetch":

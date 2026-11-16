@@ -524,6 +524,205 @@ class TestLinkerDevicePrefetch(CustomTestCase):
                 self._assert_balanced(cache, allocator)
                 cache.sanity_check()
 
+    def _publish(self, cache, backend, req):
+        self._enqueue(cache, req)
+        for future in backend.prefetch_futures:
+            future.set_result(True)
+        cache.check_hicache_events()
+        assert cache.check_prefetch_progress(req.cache_request_handle)
+
+    def test_hold_keeps_a_published_prefix_until_admission(self):
+        """A published prefetch stays locked while its request waits, so an
+        eviction cannot take it; admission or the request's release drops it."""
+        from sglang.srt.environ import envs
+
+        for admitted in (True, False):
+            with (
+                self.subTest(admitted=admitted),
+                envs.SGLANG_EXTERNAL_LINKER_PREFETCH_HOLD_FRACTION.override(0.5),
+            ):
+                cache, backend, req, allocator = self._fixture()
+                handle = req.cache_request_handle
+                self._publish(cache, backend, req)
+                assert list(cache.linker.holds) == [handle]
+                assert cache.linker.held_tokens == 6
+                cache.evict(EvictParams(num_tokens=6))
+                assert self._match(cache, req).device_prefix_len == 6
+                if admitted:
+                    cache.release_prefetch_hold(handle, 6)
+                else:
+                    cache.linker.release_request(handle)
+                assert not cache.linker.holds and cache.linker.held_tokens == 0
+                key = "admitted" if admitted else "released"
+                assert cache.linker._hold_stats[key] == 1
+                cache.evict(EvictParams(num_tokens=6))
+                assert self._match(cache, req).device_prefix_len == 0
+                self._assert_balanced(cache, allocator)
+                cache.sanity_check()
+
+    def test_unheld_publication_counts_eviction_before_admission(self):
+        """A prefix published without a hold (over the cap) is counted at
+        admission as kept, or as evicted with the tokens the request lost."""
+        from sglang.srt.environ import envs
+
+        # 0.1 x 32 slots = 3 tokens, under the 6-token published prefix.
+        for evicted in (False, True):
+            with (
+                self.subTest(evicted=evicted),
+                envs.SGLANG_EXTERNAL_LINKER_PREFETCH_HOLD_FRACTION.override(0.1),
+            ):
+                cache, backend, req, allocator = self._fixture()
+                handle = req.cache_request_handle
+                self._publish(cache, backend, req)
+                assert cache.linker.unheld == {handle: 6}
+                if evicted:
+                    cache.evict(EvictParams(num_tokens=6))
+                cache.release_prefetch_hold(handle, self._match(cache, req).device_prefix_len)
+                stats = cache.linker._hold_stats
+                assert not cache.linker.unheld
+                if evicted:
+                    assert (stats["unheld_evicted"], stats["unheld_evicted_tokens"]) == (1, 6)
+                else:
+                    assert (stats["unheld_kept"], stats["unheld_evicted"]) == (1, 0)
+                cache.linker.release_request(handle)
+                self._assert_balanced(cache, allocator)
+
+    def test_unheld_publication_stays_evictable_off_or_over_the_cap(self):
+        from sglang.srt.environ import envs
+
+        # 0.1 x 32 slots = 3 tokens, under the 6-token published prefix.
+        for fraction in (0.0, 0.1):
+            with (
+                self.subTest(fraction=fraction),
+                envs.SGLANG_EXTERNAL_LINKER_PREFETCH_HOLD_FRACTION.override(fraction),
+            ):
+                cache, backend, req, allocator = self._fixture()
+                self._publish(cache, backend, req)
+                assert not cache.linker.holds
+                if fraction:
+                    assert cache.linker._hold_stats["over_cap"] == 1
+                cache.evict(EvictParams(num_tokens=6))
+                assert self._match(cache, req).device_prefix_len == 0
+                cache.linker.release_request(req.cache_request_handle)
+                self._assert_balanced(cache, allocator)
+
+    def _gated_lookup(self, backend):
+        """Make the fixture's store lookup block until the returned gate opens."""
+        gate = threading.Event()
+        restorable = list(backend.restorable)
+
+        def lookup(rid, transfers):
+            assert gate.wait(5)
+            return restorable
+
+        backend.lookup = MagicMock(side_effect=lookup)
+        return gate
+
+    def test_async_lookup_leaves_the_scheduler_thread_and_loads_on_return(self):
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_EXTERNAL_LINKER_ASYNC_LOOKUP_THREADS.override(1):
+            cache, backend, req, allocator = self._fixture()
+            gate = self._gated_lookup(backend)
+            handle = req.cache_request_handle
+            self._enqueue(cache, req)  # returns while the lookup still blocks
+            assert list(cache.linker.lookups) == [handle]
+            assert not backend.prefetch.called
+            assert not cache.check_prefetch_progress(handle)
+            gate.set()
+            cache.linker.lookups[handle].future.result(timeout=5)
+            cache.check_hicache_events()
+            assert backend.prefetch.called and not cache.linker.lookups
+            for future in backend.prefetch_futures:
+                future.set_result(True)
+            cache.check_hicache_events()
+            assert cache.check_prefetch_progress(handle)
+            assert self._match(cache, req).device_prefix_len == 6
+            cache.linker.release_request(handle)
+            self._assert_balanced(cache, allocator)
+
+    def test_async_lookup_cancelled_in_flight_releases_its_anchor(self):
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_EXTERNAL_LINKER_ASYNC_LOOKUP_THREADS.override(1):
+            cache, backend, first, allocator = self._fixture()
+            gate = self._gated_lookup(backend)
+            gate.set()
+            # Publish a 6-token prefix, so a longer request anchors on a device node.
+            self._enqueue(cache, first)
+            cache.linker.lookups[first.cache_request_handle].future.result(timeout=5)
+            cache.check_hicache_events()
+            for future in backend.prefetch_futures:
+                future.set_result(True)
+            cache.check_hicache_events()
+            cache.linker.release_request(first.cache_request_handle)
+            protected = cache.full_protected_size()
+            gate.clear()
+            req = Req(
+                rid="second",
+                origin_input_text=None,
+                origin_input_ids=array("q", [*range(1, 8), 99, 98]),
+                sampling_params=SamplingParams(max_new_tokens=1),
+            )
+            req.cache_request_handle = CacheRequestHandle("second", 0)
+            self._enqueue(cache, req)
+            handle = req.cache_request_handle
+            assert list(cache.linker.lookups) == [handle]
+            assert cache.full_protected_size() == protected + 6
+            cache.linker.release_request(handle)
+            assert not cache.linker.lookups
+            assert cache.full_protected_size() == protected
+            gate.set()
+            cache.check_hicache_events()
+            assert len(backend.prefetch_futures) == 1
+            self._assert_balanced(cache, allocator)
+
+    def test_async_lookup_drain_survives_a_refused_load(self):
+        """Two finished lookups, the first refused at load: the refusal must not
+        re-enter the drain, and the second still starts its load."""
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_EXTERNAL_LINKER_ASYNC_LOOKUP_THREADS.override(1):
+            cache, backend, first, allocator = self._fixture()
+            gate = self._gated_lookup(backend)
+            second = self._request("second", start=100)
+            for req in (first, second):
+                self._enqueue(cache, req)
+            gate.set()
+            for lookup in list(cache.linker.lookups.values()):
+                lookup.future.result(timeout=5)
+
+            def submit(transfers):
+                if not backend.prefetch.call_count - 1:
+                    return None  # the first load is refused
+                future = Future()
+                backend.prefetch_futures.append(future)
+                return future
+
+            backend.prefetch = MagicMock(side_effect=submit)
+            depth = [0, 0]
+            drain = cache.linker._drain_lookups
+
+            def tracked():
+                depth[0] += 1
+                depth[1] = max(depth[1], depth[0])
+                try:
+                    return drain()
+                finally:
+                    depth[0] -= 1
+
+            cache.linker._drain_lookups = tracked
+            cache.check_hicache_events()
+            assert depth[1] == 1
+            assert backend.prefetch.call_count == 2 and not cache.linker.lookups
+            assert list(cache.linker.prefetches) == [second.cache_request_handle]
+            for future in backend.prefetch_futures:
+                future.set_result(True)
+            cache.check_hicache_events()
+            for req in (first, second):
+                cache.linker.release_request(req.cache_request_handle)
+            self._assert_balanced(cache, allocator)
+
     def test_failure_falls_back_but_pending_peer_keeps_private_slots(self):
         for outcome, mamba in product(
             ("local-failure", "peer-failure", "peer-pending"), (False, True)
@@ -765,6 +964,27 @@ def test_cache_linker_rejects_unsupported_tree_components(component_type, load_m
         UnifiedCacheLinkerWrapper(cache, backend)
 
     assert not cache.tree_core.enable_external_cache_linker
+
+
+def test_prefetch_admission_hooks_keep_their_rank_consensus():
+    """check_prefetch_progress and release_prefetch_hold run in lockstep on
+    every rank; each must carry its own rank_consensus marker."""
+    import ast
+    import inspect
+
+    from sglang.srt.mem_cache import unified_radix_cache
+
+    tree = ast.parse(inspect.getsource(unified_radix_cache))
+    decorated = {
+        node.name: [ast.unparse(d) for d in node.decorator_list]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name in ("check_prefetch_progress", "release_prefetch_hold")
+    }
+    assert decorated["check_prefetch_progress"] == [
+        "rank_consensus(same_params=True, same_results=True)"
+    ]
+    assert decorated["release_prefetch_hold"] == ["rank_consensus(same_params=True)"]
 
 
 def test_pipeline_parallelism_rejects_only_prefetch_mode():
