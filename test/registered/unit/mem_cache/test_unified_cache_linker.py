@@ -1690,6 +1690,49 @@ def test_pp_hit_outliving_its_device_prefix_is_looked_up_again_not_dropped(
         assert pp0.match(_KEY, req, _device_result(0)).host_hit_length == 2
 
 
+def test_pp_hit_relayed_with_no_stops_is_looked_up_again_when_its_device_prefix_shrinks(
+    full_linker_component,
+):
+    # Rhea 59439: a follow-up turn enqueued with its prompt on device, so PP0
+    # looked up only the new tail and relayed no stops. The prompt was evicted
+    # while the request queued and recomputed, though the store held it.
+    with patch(
+        "sglang.srt.mem_cache.unified_cache.unified_cache_linker.get_storage_hash_str",
+        side_effect=_page_hashes,
+    ):
+        backend = _CountingLinker(stage_restorable=[])
+        pp0 = _match_wrapper(
+            full_linker_component,
+            backend,
+            pp_size=8,
+            pp_rank=0,
+            _all_reduce=lambda data, op: None,
+        )
+        req = SimpleNamespace(rid="r", linker_pp_hit=None, linker_pp_lookup_pending=True)
+        # Enqueue: device prefix 4, nothing stored past it.
+        assert pp0.match(_KEY, req, _device_result(4)).host_hit_length == 0
+        req.linker_pp_lookup_pending = False
+        assert req.linker_pp_hit == (4, [])
+        # The device prefix is gone by admission: its end is admitted, unchecked.
+        assert pp0.match(_KEY, req, _device_result(0)).host_hit_length == 4
+        assert pp0.pp_counts["anchor_shrunk"] == 1
+        # PP0 looks it up again before the load; only the first page is left.
+        backend.stage_restorable = [1]
+        assert pp0.load_back(req) is None
+        assert backend.stage_lookups == 2
+        assert req.linker_pp_hit == (0, [2])
+        assert (pp0.pp_counts["recovered_pages"], pp0.pp_counts["lost_pages"]) == (1, 1)
+        assert pp0.match(_KEY, req, _device_result(0)).host_hit_length == 2
+        assert (pp0.pp_counts["shrunk_relooked"], pp0.pp_counts["shrunk_unlooked"]) == (1, 0)
+
+        # A shrunk request that still leaves match with no hit is counted.
+        req2 = SimpleNamespace(rid="r2", linker_pp_hit=(4, []), linker_pp_lookup_pending=False)
+        pp0.cache._all_reduce_attn_groups = lambda value, op: value.zero_()
+        assert pp0.match(_KEY, req2, _device_result(0)).host_hit_length == 0
+        assert pp0.pp_counts["shrunk_unlooked"] == 1
+        assert "r2" not in pp0.pp_forced_relookup
+
+
 def test_pp_fresh_hit_loads_without_a_second_lookup(full_linker_component):
     with patch(
         "sglang.srt.mem_cache.unified_cache.unified_cache_linker.get_storage_hash_str",

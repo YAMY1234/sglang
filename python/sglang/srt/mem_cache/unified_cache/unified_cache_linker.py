@@ -313,7 +313,16 @@ class UnifiedCacheLinkerWrapper:
         # whole tail up again before the load (every stage tracks them alike).
         self.pp_forced_relookup: set[str] = set()
         self.pp_counts: dict[str, int] = dict.fromkeys(
-            ("anchor_shrunk", "recovered_pages", "lost_pages", "relookups", "shrunk"), 0
+            (
+                "anchor_shrunk",
+                "shrunk_relooked",
+                "recovered_pages",
+                "lost_pages",
+                "shrunk_unlooked",
+                "relookups",
+                "shrunk",
+            ),
+            0,
         )
         self.pp_counts_logged_at = time.monotonic()
 
@@ -355,15 +364,15 @@ class UnifiedCacheLinkerWrapper:
 
         known = self._known_restorable(req, device_hit_len)
         if known is not None and not known:
-            return result
+            return self._no_hit(req, result)
 
         tail_hashes = self._cached_tail_hashes(key, req, result, device_hit_len)
         if not tail_hashes:
-            return result
+            return self._no_hit(req, result)
 
         lookup_transfers = self._lookup_transfers(tail_hashes)
         if not lookup_transfers:
-            return result
+            return self._no_hit(req, result)
         if known is None:
             known = self._lookup(req, device_hit_len, lookup_transfers)
         hit_pages = self._sync_restorable_prefix(
@@ -372,7 +381,7 @@ class UnifiedCacheLinkerWrapper:
             device_hit_pages=0,
         )
         if hit_pages == 0:
-            return result
+            return self._no_hit(req, result)
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
         hit_tokens = hit_pages * page
 
@@ -398,6 +407,15 @@ class UnifiedCacheLinkerWrapper:
             ),
         )
 
+    def _no_hit(self, req: Req, result: MatchResult) -> MatchResult:
+        """A request whose device prefix shrank but leaves match with no hit
+        skips load_back's re-lookup and recomputes those pages; counted, it
+        should stay 0."""
+        if req.rid in self.pp_forced_relookup:
+            self.pp_forced_relookup.discard(req.rid)
+            self.pp_counts["shrunk_unlooked"] += 1
+        return result
+
     def _known_restorable(self, req: Req, device_hit_len: int) -> Optional[list[int]]:
         """Restorable prefix lengths in pages past ``device_hit_len`` from an
         earlier lookup, or None when this match must look the store up. Under PP
@@ -409,13 +427,18 @@ class UnifiedCacheLinkerWrapper:
             entry = req.linker_pp_hit
             if entry is None:
                 return []
-            if device_hit_len < entry[0] and req.rid not in self.pp_forced_relookup:
+            if device_hit_len < entry[0]:
                 # The device prefix shrank below the looked-up start while the
                 # request queued, so the pages in between were never checked:
                 # admit the relayed stops and let PP0 look the whole tail up again
                 # before the load (Rhea 57360 dropped such hits instead).
-                self.pp_forced_relookup.add(req.rid)
-                self.pp_counts["anchor_shrunk"] += 1
+                if req.rid not in self.pp_forced_relookup:
+                    self.pp_forced_relookup.add(req.rid)
+                    self.pp_counts["anchor_shrunk"] += 1
+                # The start itself was on device, so written through: admit it
+                # too, or a hit relayed with no stops recomputes the whole prefix
+                # (Rhea 59439).
+                entry = (entry[0], [entry[0], *entry[1]])
         elif self.lookup_once:
             entry = self.lookup_cache.get(req.rid)
             if entry is None or device_hit_len < entry[0]:
@@ -479,7 +502,8 @@ class UnifiedCacheLinkerWrapper:
         if self.pp_rank == 0 and now - self.pp_counts_logged_at >= 60:
             logger.info(
                 "Linker PP admissions in %.0f s: anchor-shrunk hits %d (re-looked "
-                "up: %d pages recovered, %d lost), stale re-lookups %d (shrunk %d)",
+                "up %d: %d pages recovered, %d lost; %d without a re-lookup), stale "
+                "re-lookups %d (shrunk %d)",
                 now - self.pp_counts_logged_at,
                 *self.pp_counts.values(),
             )
@@ -567,6 +591,7 @@ class UnifiedCacheLinkerWrapper:
                 anchor = hit.device_hit_len
                 stops = sorted({stop for stop in stops if anchor < stop <= end} | {end})
                 req.linker_pp_hit = (anchor, stops)
+                self.pp_counts["shrunk_relooked"] += 1
                 self.pp_counts["recovered_pages"] += keep
                 self.pp_counts["lost_pages"] += len(hit.tail_hashes) - keep
             if keep < len(hit.tail_hashes):
