@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 import os
 import random
+import time
 from collections import Counter
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -209,6 +210,7 @@ class SchedulePolicy:
         self._waiting_prefix_refresh_calls = 0
         self._prefix_match_passes = 0
         self._prefix_matched_at: Dict[str, int] = {}
+        self._prefix_match_seconds = 0.0
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
@@ -238,9 +240,11 @@ class SchedulePolicy:
                     waiting_queue, self.priority_sign
                 )
         elif isinstance(policy, CacheAwarePolicy):
+            match_start = time.perf_counter()
             temporary_deprioritized = self._compute_prefix_matches(
                 waiting_queue, policy
             )
+            self._prefix_match_seconds += time.perf_counter() - match_start
             if policy == CacheAwarePolicy.LPM:
                 SchedulePolicy._sort_by_longest_prefix(
                     waiting_queue, temporary_deprioritized
@@ -257,11 +261,15 @@ class SchedulePolicy:
                 )
                 self._shortest_prefill_calls += 1
                 if waiting_queue and self._shortest_prefill_calls % 128 == 1:
+                    # prefix_match_ms: mean prefix-match time per pass since the last line.
                     logger.info(
-                        "Experimental shortest-prefill-first: queue=%d shortest_uncached=%d",
+                        "Experimental shortest-prefill-first: queue=%d shortest_uncached=%d "
+                        "prefix_match_ms=%.2f",
                         len(waiting_queue),
                         self._shortest_prefill_work(waiting_queue[0]),
+                        1e3 * self._prefix_match_seconds / 128,
                     )
+                    self._prefix_match_seconds = 0.0
             else:
                 raise ValueError(f"Unknown CacheAware Policy: {policy=}")
         else:
