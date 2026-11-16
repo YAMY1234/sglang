@@ -3791,6 +3791,16 @@ class Scheduler(
         self._retry_storage_prefetch(req)
         return True
 
+    def _linker_requery_after_device_loss(self, req: Req) -> bool:
+        """Re-query an external-linker range lost to device eviction while queued."""
+        max_attempts = get_memory().hicache_storage_prefetch_retry_max_attempts
+        if req.storage_prefetch_retry_attempts >= max_attempts:
+            return False
+        if not self.tree_cache.requery_prefetch_after_device_loss(req):
+            return False
+        req.storage_prefetch_retry_attempts += 1
+        return True
+
     def _add_request_to_queue(
         self,
         req: Req,
@@ -4698,6 +4708,12 @@ class Scheduler(
                 break
             if self.enable_hicache_storage and (
                 self._prefetch_after_device_hit_loss(req)
+            ):
+                if defer_cow_slot:
+                    self._drop_unadmitted_match(req)
+                continue
+            if self.enable_unified_cache_external_linker and (
+                self._linker_requery_after_device_loss(req)
             ):
                 if defer_cow_slot:
                     self._drop_unadmitted_match(req)

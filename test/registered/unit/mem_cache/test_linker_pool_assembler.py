@@ -740,6 +740,120 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         )
         self.assertTrue(set(expected_rope).issubset({t.name for t in resolved}))
 
+    def test_deepseek_v4_linker_and_hicache_register_the_same_pools(self):
+        """For one target + packed DSpark draft, the direct linker's device
+        pool group and HiCache's host pool group must carry the same pools, and
+        the SWA pool the same target + draft buffers: a shared store must hold
+        everything either tier restores."""
+        from sglang.srt.mem_cache.deepseek_v4_buffer_info import DSV4PagedBufferInfo
+        from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
+        from sglang.srt.mem_cache.hybrid_cache import (
+            hybrid_pool_assembler as assembler,
+        )
+
+        page = 2
+
+        def region(name, source, layer_ids, rows, width):
+            buffers = [torch.zeros((4, rows, width), dtype=torch.uint8)]
+            buffers *= len(layer_ids)
+            return DevicePoolInfo(
+                pool_name=name,
+                indices_from_pool=source,
+                layer_ids=layer_ids,
+                buffer_info=DSV4PagedBufferInfo.from_buffers(
+                    buffers, page_slots=rows, layout="v4"
+                ),
+            )
+
+        target_infos = (
+            region(PoolName.SWA, PoolName.SWA, (0, 1), page, 8),
+            region(PoolName.DEEPSEEK_V4_C4, PoolName.KV, (0,), 1, 16),
+            region(PoolName.DEEPSEEK_V4_C4_INDEXER, PoolName.KV, (0,), 1, 8),
+        )
+        kvcache = _dsv4_pool(
+            DeepSeekV4TokenToKVPool,
+            _unified_kv=False,
+            start_layer=0,
+            stage_layer_ids=(0, 1),
+            swa_page_size=page,
+            swa_kv_pool=object(),
+            c4_kv_pool=object(),
+            c4_indexer_kv_pool=object(),
+            c128_kv_pool=None,
+            get_device_pool_infos=lambda: target_infos,
+        )
+        draft_infos = (region(PoolName.SWA, PoolName.SWA, (0,), page, 8),)
+        draft = _dsv4_pool(
+            DeepSeekV4TokenToKVPool,
+            start_layer=0,
+            stage_layer_ids=(0,),
+            get_device_pool_infos=lambda: draft_infos,
+        )
+
+        linker = _build_deepseek_v4_device_pool_group(kvcache, page, (draft,))
+
+        def host_pool(**kwargs):
+            return SimpleNamespace(
+                **kwargs,
+                page_size=kwargs["slot_page_size"],
+                device="cpu",
+                size=kwargs["num_host_pages"] * kwargs["slot_page_size"],
+                logical_size=kwargs["num_host_pages"] * kwargs["slot_page_size"],
+                can_use_write_back_jit=False,
+            )
+
+        logical = SimpleNamespace(
+            layout="page_first",
+            page_size=page,
+            device="cpu",
+            size=8,
+            logical_size=8,
+            can_use_write_back_jit=False,
+        )
+        params = SimpleNamespace(
+            page_size=page,
+            token_to_kv_pool_allocator=SimpleNamespace(
+                size_full=8,
+                swa_attn_allocator=SimpleNamespace(alloc=Mock(), free=Mock()),
+            ),
+            mtp_draft_device_pools=(draft,),
+            tp_cache_group=None,
+            attn_cp_cache_group=None,
+            attn_tp_cache_group=None,
+            pp_cache_group=None,
+        )
+        memory = SimpleNamespace(
+            hicache_mem_layout="page_first",
+            hicache_write_policy="write_through",
+            hicache_io_backend="kernel",
+            hicache_host_memory_mode="cache",
+        )
+        with (
+            patch.object(assembler, "get_memory", return_value=memory),
+            patch.object(
+                assembler, "_deepseek_v4_num_host_pages", return_value=(4, 4, 0)
+            ),
+            patch.object(assembler, "_get_allocator_type", return_value="default"),
+            patch.object(assembler, "LogicalHostPool", return_value=logical),
+            patch.object(assembler, "DeepSeekV4PagedHostPool", side_effect=host_pool),
+            patch.object(assembler, "HybridCacheController", return_value=object()),
+        ):
+            hicache, _ = assembler.build_deepseek_v4_hicache_stack(
+                params=params,
+                kvcache=kvcache,
+                load_cache_event=None,
+                storage_backend=None,
+            )
+
+        # HiCache's KV entry is the logical anchor; the linker names it as the
+        # source of its sidecars instead.
+        self.assertEqual(set(linker.entry_map), set(hicache.entry_map) - {PoolName.KV})
+        self.assertEqual(
+            len(linker.entry_map[PoolName.SWA].components[0]),
+            len(hicache.entry_map[PoolName.SWA].host_pool.device_buffers),
+        )
+        self.assertEqual(len(linker.entry_map[PoolName.SWA].components[0]), 3)
+
     def test_deepseek_v4_still_rejects_hisparse(self):
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import HiSparseC4DevicePool
 
