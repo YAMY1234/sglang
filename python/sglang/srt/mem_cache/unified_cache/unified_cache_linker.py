@@ -41,6 +41,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     DecLockRefParams,
     InsertParams,
+    MatchPrefixParams,
     MatchResult,
 )
 from sglang.srt.mem_cache.hicache_storage import (
@@ -620,21 +621,22 @@ class UnifiedCacheLinkerWrapper:
             if mamba is not None and inserted.mamba_exist:
                 storage.free_state_slots(sub_pool, mamba.device_indices)
             if self.hold_cap_tokens:
-                self._hold(request, inserted, end, len(full))
+                self._hold(request, state.key, end, len(full))
             self.cache.prefetch_loaded_tokens_by_reqid[request] = len(full)
             self.cache.prefetch_loaded_storage_start_by_reqid[request] = start
         finally:
             self.cache.dec_lock_ref(state.anchor_node_id, state.anchor_lock)
 
-    def _hold(self, request, inserted, end: int, tokens: int) -> None:
+    def _hold(self, request, key: RadixKey, end: int, tokens: int) -> None:
         """Lock a just-published prefix for its waiting request, under the cap."""
         stats = self._hold_stats
-        if inserted.last_device_node is None or inserted.total_len < end:
+        resident = self.cache.match_prefix(MatchPrefixParams(key=key))
+        if resident.device_prefix_len < end:
             stats["not_resident"] += 1
         elif self.held_tokens + tokens > self.hold_cap_tokens:
             stats["over_cap"] += 1
         else:
-            node = inserted.last_device_node
+            node = resident.last_device_node
             lock = self.cache.inc_lock_ref(node).to_dec_params()
             self.holds[request] = _PrefetchHold(node, lock, tokens)
             self.held_tokens += tokens
