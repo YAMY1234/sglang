@@ -680,12 +680,16 @@ class TestLinkerDevicePrefetch(CustomTestCase):
         looked up again: the re-query target covers the loaded range."""
         from sglang.srt.environ import envs
 
-        with envs.SGLANG_EXTERNAL_LINKER_REQUERY_ON_DEVICE_LOSS.override(True):
+        with (
+            envs.SGLANG_EXTERNAL_LINKER_REQUERY_ON_DEVICE_LOSS.override(True),
+            envs.SGLANG_EXTERNAL_LINKER_LOOKUP_STATS.override(True),
+        ):
             cache, backend, req, allocator = self._fixture()
             self._publish(cache, backend, req)
             cache.evict(EvictParams(num_tokens=6))
             assert self._admit_poll(cache, req)
             self._land_last_prefetch(cache, backend, req)
+            assert len(cache.linker._requery_waits) == 1
             assert self._match(cache, req).device_prefix_len == 6
             self._admit_and_release(cache, req)
             self._assert_balanced(cache, allocator)

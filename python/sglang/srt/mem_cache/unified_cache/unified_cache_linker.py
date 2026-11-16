@@ -388,6 +388,9 @@ class UnifiedCacheLinkerWrapper:
             ("issued", "skipped_no_hash", "zero_restorable", "requeried"), 0
         )
         self._lookup_next_log = 0.0
+        # Re-queried request -> when its re-query started; waits until publication (s).
+        self._requery_started: dict[CacheRequestHandle, float] = {}
+        self._requery_waits: list[float] = []
         if self.hold_cap_tokens:
             logger.info(
                 "External linker prefetch holds on: up to %d tokens (%.2f of the "
@@ -670,15 +673,33 @@ class UnifiedCacheLinkerWrapper:
         ):
             return False
         self._lookup_stats["requeried"] += 1
+        started = time.perf_counter()
         self.prefetch(req)
-        return request in self.prefetches or request in self.lookups
+        pending = request in self.prefetches or request in self.lookups
+        if pending and self.log_lookup_stats:
+            self._requery_started[request] = started
+        return pending
 
     def _log_lookup_stats(self) -> None:
         now = time.monotonic()
         if not self.log_lookup_stats or now < self._lookup_next_log:
             return
         self._lookup_next_log = now + 60.0
-        logger.info("External linker lookups: %s", self._lookup_stats)
+        waits = sorted(self._requery_waits)
+        self._requery_waits.clear()
+        p50, p90 = (
+            (waits[len(waits) // 2], waits[len(waits) * 9 // 10])
+            if waits
+            else (0.0, 0.0)
+        )
+        logger.info(
+            "External linker lookups: %s; re-query waits since last log: %d, "
+            "p50 %.3f s, p90 %.3f s",
+            self._lookup_stats,
+            len(waits),
+            p50,
+            p90,
+        )
 
     def _cancel_lookup(self, request: CacheRequestHandle) -> None:
         lookup = self.lookups.pop(request, None)
@@ -765,6 +786,9 @@ class UnifiedCacheLinkerWrapper:
         state = self.prefetches.pop(request, None)
         if state is None:
             return
+        started = self._requery_started.pop(request, None)
+        if started is not None:
+            self._requery_waits.append(time.perf_counter() - started)
         # Event polling or reset/close has already quiesced every device writer.
         if state.future is not None:
             assert state.future.done()
@@ -1175,6 +1199,7 @@ class UnifiedCacheLinkerWrapper:
             self.release_hold(request, admitted=False)
         self.unheld.clear()
         self.match_targets.clear()
+        self._requery_started.clear()
         self.hit_markers.clear()
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()
@@ -1189,6 +1214,7 @@ class UnifiedCacheLinkerWrapper:
     def release_request(self, request: CacheRequestHandle) -> None:
         rid = request.rid
         self.hit_markers.pop(rid, None)
+        self._requery_started.pop(request, None)
         self._cancel_prefetch(request)
         self.release_hold(request, admitted=False)
         # A queued load targets slots the request owns and is about to free.
