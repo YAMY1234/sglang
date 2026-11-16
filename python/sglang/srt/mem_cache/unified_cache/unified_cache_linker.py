@@ -381,10 +381,19 @@ class UnifiedCacheLinkerWrapper:
         self.qlocked_tokens = 0
         # Queued requests whose device match was empty when the walk reached them.
         self._qlock_empty: set[CacheRequestHandle] = set()
+        # Queued requests whose look-ahead re-query waits for load-cap room: device tokens.
+        self._qlock_short: dict[CacheRequestHandle, int] = {}
         # Admission times over the last 30 s, for the window's depth in requests.
         self._admit_times: collections.deque[float] = collections.deque()
         self._qlock_stats = dict.fromkeys(
-            ("locked", "lookahead_requeries", "released_admitted", "released_other"), 0
+            (
+                "locked",
+                "lookahead_requeries",
+                "lookahead_deferred",
+                "released_admitted",
+                "released_other",
+            ),
+            0,
         )
         self._qlock_peak = [0, 0]  # window depth (requests), locked tokens; per log line
         # Published prefetches left unheld (over the cap or not resident): their end.
@@ -1026,6 +1035,9 @@ class UnifiedCacheLinkerWrapper:
             return
         # A pipeline stage that admits at other times takes stage 0's depth instead.
         depth_cap = self.qlock_depth_cap() if depth_override is None else depth_override
+        # Look-ahead loads take load-cap room head first; a lookup the cap would refuse
+        # is not sent, so a full cap does not turn into a lookup every loop.
+        room = self._load_room()
         keep: set[CacheRequestHandle] = set()
         tokens = depth = 0
         for req in reqs:
@@ -1042,8 +1054,20 @@ class UnifiedCacheLinkerWrapper:
             ):
                 continue
             qlock = self.qlocks.get(request)
+            short = self._qlock_short.get(request)
+            if short is not None:
+                need = self.match_targets.get(request, short) - short
+                if need > room:
+                    if qlock is None:
+                        continue
+                else:
+                    # An unlocked one is matched again below, which charges the room.
+                    del self._qlock_short[request]
+                    if qlock is not None:
+                        self._queue_lookahead(req)
+                        room -= need
             if qlock is None:
-                qlock = self._lock_queued(req)
+                qlock, room = self._lock_queued(req, room)
                 if qlock is None:
                     continue
             if tokens + qlock.tokens > self.qlock_cap_tokens:
@@ -1071,30 +1095,56 @@ class UnifiedCacheLinkerWrapper:
         span = max(now - self._admit_times[0], 1.0)
         return max(1, math.ceil(len(self._admit_times) / span * self.qlock_seconds))
 
-    def _lock_queued(self, req: Req) -> Optional[_PrefetchHold]:
+    def _lock_queued(
+        self, req: Req, room: float
+    ) -> tuple[Optional[_PrefetchHold], float]:
         """Lock ``req``'s current device match, or queue its look-ahead re-query when
-        the device lost part of the prefix its last lookup left there."""
+        the device lost part of the prefix its last lookup left there and ``room``
+        (load-cap tokens) takes it; return the lock and the room left."""
         request = req.cache_request_handle
         req.init_next_round_input(self.cache, cow_mamba=False)
         if is_virtual_node(req.last_node):
             self._qlock_empty.add(request)
-            return None
+            return None, room
         target = self.match_targets.get(request)
-        if self.requery_on_device_loss and target is not None and req.prefix_len < target:
-            self._lookup_stats["requeried"] += 1
-            self._qlock_stats["lookahead_requeries"] += 1
-            self._pending_requeries[request] = req
-            if self.log_lookup_stats:
-                self._requery_started[request] = time.perf_counter()
-            return None
+        need = 0
+        if self.requery_on_device_loss and target is not None:
+            need = target - req.prefix_len
+        if need > 0:
+            if need <= room:
+                self._queue_lookahead(req)
+                return None, room - need
+            # Lock what is left on device; the re-query waits for room.
+            self._qlock_short[request] = req.prefix_len
+            self._qlock_stats["lookahead_deferred"] += 1
         if not req.prefix_len:
-            self._qlock_empty.add(request)
-            return None
+            if need <= 0:
+                self._qlock_empty.add(request)
+            return None, room
         lock = self.cache.inc_lock_ref(req.last_node).to_dec_params()
-        return _PrefetchHold(req.last_node, lock, req.prefix_len)
+        return _PrefetchHold(req.last_node, lock, req.prefix_len), room
+
+    def _queue_lookahead(self, req: Req) -> None:
+        request = req.cache_request_handle
+        self._lookup_stats["requeried"] += 1
+        self._qlock_stats["lookahead_requeries"] += 1
+        self._pending_requeries[request] = req
+        if self.log_lookup_stats:
+            self._requery_started[request] = time.perf_counter()
+
+    def _load_room(self) -> float:
+        """Load-cap tokens free for new loads now; unbounded without a cap."""
+        cap = self._load_cap()
+        if not cap:
+            return math.inf
+        occupied = self.prefetch_size(PoolName.KV)
+        if not self.load_cap_tokens:
+            occupied += self.held_tokens
+        return cap - occupied
 
     def _release_qlock(self, request: CacheRequestHandle, *, admitted: bool) -> None:
         self._qlock_empty.discard(request)
+        self._qlock_short.pop(request, None)
         qlock = self.qlocks.pop(request, None)
         if qlock is None:
             return
@@ -1419,6 +1469,7 @@ class UnifiedCacheLinkerWrapper:
         for request in list(self.qlocks):
             self._release_qlock(request, admitted=False)
         self._qlock_empty.clear()
+        self._qlock_short.clear()
         self.unheld.clear()
         self.match_targets.clear()
         self._pending_requeries.clear()

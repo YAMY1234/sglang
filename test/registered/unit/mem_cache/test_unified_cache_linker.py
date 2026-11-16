@@ -890,6 +890,50 @@ class TestLinkerDevicePrefetch(CustomTestCase):
             self._admit_and_release(cache, req)
             self._assert_balanced(cache, allocator)
 
+    def test_queue_lock_lookahead_waits_for_load_cap_room(self):
+        """A look-ahead re-query the load cap cannot take is neither sent nor
+        re-matched on every pass; it is sent once loads leave room."""
+        from sglang.srt.environ import envs
+
+        with (
+            envs.SGLANG_EXTERNAL_LINKER_QUEUE_LOCK_FRACTION.override(0.5),
+            envs.SGLANG_EXTERNAL_LINKER_PREFETCH_HOLD_FRACTION.override(0.5),
+            envs.SGLANG_EXTERNAL_LINKER_REQUERY_ON_DEVICE_LOSS.override(True),
+        ):
+            cache, backend, _, allocator = self._fixture()
+            req = self._resident(cache, backend, "c", 1)
+            linker = cache.linker
+            cache.evict(EvictParams(num_tokens=32))
+            others = [self._request(rid=f"load{i}", start=10 * i) for i in (1, 2)]
+            for other in others:
+                self._enqueue(cache, other)
+            assert linker.prefetch_size(PoolName.KV) == 12  # 4 of the 16-token cap left
+            lookups = backend.lookup.call_count
+            with patch.object(
+                req, "init_next_round_input", wraps=req.init_next_round_input
+            ) as matched:
+                for _ in range(2):
+                    cache.protect_queued_prefixes([req])
+                    cache.check_hicache_events()
+                assert matched.call_count == 1
+            assert linker._qlock_stats["lookahead_requeries"] == 0
+            assert linker._qlock_stats["lookahead_deferred"] == 1
+            assert backend.lookup.call_count == lookups
+            for other in others:
+                linker.release_request(other.cache_request_handle)
+            for future in backend.prefetch_futures:
+                if not future.done():
+                    future.set_result(False)
+            cache.check_hicache_events()
+            cache.protect_queued_prefixes([req])
+            assert linker._qlock_stats["lookahead_requeries"] == 1
+            cache.check_hicache_events()
+            assert backend.lookup.call_count == lookups + 1
+            self._land_last_prefetch(cache, backend, req)
+            assert self._match(cache, req).device_prefix_len == 6
+            self._admit_and_release(cache, req)
+            self._assert_balanced(cache, allocator)
+
     def test_expired_poll_starts_no_load(self):
         """An admission poll that stops an expired prefetch settles reads but
         starts no load for a finished lookup; the event-loop boundary does."""
