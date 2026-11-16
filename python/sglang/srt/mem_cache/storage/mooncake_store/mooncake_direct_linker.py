@@ -7,7 +7,7 @@ import os
 import re
 import threading
 import time
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Callable
 from copy import deepcopy
 from queue import Empty, Queue
@@ -181,6 +181,8 @@ def _resident_by_numa(numa_maps: str = "/proc/self/numa_maps") -> dict[int, int]
 class MooncakeDirectLinker(UnifiedCacheLinker):
     # Set False at init: the first lookup, load or offload logs NUMA headroom.
     _numa_first_request_logged = True
+    # SGLANG_LINKER_STATE_PATH_CAP at init; 0 leaves the store's states alone.
+    state_path_cap = 0
 
     def __init__(
         self,
@@ -217,6 +219,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.state_parent: dict[str, str | None] = {}
         self.state_children: Counter = Counter()
         self.state_removed = self.state_remove_failed = 0
+        self.state_remove_counts: Counter = Counter()
+        # (retry at, key, attempts left): removals a live lease refused (-706).
+        self.state_remove_retries: deque = deque()
         self.num_layers = self.pool_group.num_layers
 
         parallel = get_parallel()
@@ -854,10 +859,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
     def _cap_state_path(self, new_states: list[str], path: list[str]) -> list[str]:
         """Record the states this offload writes on their path and return the
-        older ones past SGLANG_LINKER_STATE_PATH_CAP to drop once it lands. A
-        conversation only resumes from its deepest states. A path's first state
-        and any state with more than one child stay: other sessions branch off
-        there (a shared prompt) or may still."""
+        older ones past SGLANG_LINKER_STATE_PATH_CAP to drop once it lands: a
+        turn resumes from the deepest state on its path. A state with more than
+        one child is a branch point (a shared prompt) and stays."""
         written = set(new_states)
         parent = next(
             (h for h in reversed(path) if h in self.state_parent and h not in written),
@@ -877,11 +881,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             kept, node = node, self.state_parent.get(node)
         # node: the first state past the cap; drop it and its linear ancestors.
         victims = []
-        while (
-            node is not None
-            and self.state_children[node] <= 1
-            and self.state_parent.get(node) is not None
-        ):
+        while node is not None and self.state_children[node] <= 1:
             above = self.state_parent.pop(node, None)
             self.state_children.pop(node, None)
             victims.append(node)
@@ -919,7 +919,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     self.write_bytes["states"] += sum(
                         len(t.keys) for t in expanded if t.name == PoolName.MAMBA
                     )
-                    self._remove_states(victims)
+                    if self.state_path_cap:
+                        self._remove_states(victims)
                 self.offload_results.put(success)
                 self._maybe_log_stats()
             except BaseException:
@@ -928,14 +929,30 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             finally:
                 self.offload_queue.task_done()
 
+    _REMOVE_RETRIES = 6
+
     def _remove_states(self, page_hashes: list[str]) -> None:
-        if not page_hashes:
-            return
-        _, obj, suffix, _ = next(e for e in self._pool_key_schema() if e[3])
-        keys = self.storage._tag_keys([f"{h}_{suffix}_{obj}" for h in page_hashes])
-        for key in keys:
-            if self.storage.store.remove(key) == 0:
+        """Remove superseded state objects. Mooncake refuses an object under a
+        live lease (-706, e.g. one a lookup or the lease refresher touched in
+        the last lease TTL), so those are retried once it can have expired."""
+        now = time.monotonic()
+        due = []
+        while self.state_remove_retries and self.state_remove_retries[0][0] <= now:
+            due.append(self.state_remove_retries.popleft())
+        if page_hashes:
+            _, obj, suffix, _ = next(e for e in self._pool_key_schema() if e[3])
+            keys = self.storage._tag_keys([f"{h}_{suffix}_{obj}" for h in page_hashes])
+            due += [(now, key, self._REMOVE_RETRIES) for key in keys]
+        retry_at = now + envs.SGLANG_LINKER_LEASE_TTL_SECS.get() + 1
+        for _, key, attempts in due:
+            rc = self.storage.store.remove(key)
+            if rc == 0:
                 self.state_removed += 1
+            elif rc == -704:  # OBJECT_NOT_FOUND: already evicted
+                self.state_remove_counts["already_gone"] += 1
+            elif rc == -706 and attempts > 0:  # OBJECT_HAS_LEASE
+                self.state_remove_counts["lease_retries"] += 1
+                self.state_remove_retries.append((retry_at, key, attempts - 1))
             else:
                 self.state_remove_failed += 1
 
@@ -948,8 +965,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         looked, self.lookup_counts = self.lookup_counts, Counter()
         logger.info(
             "Linker store writes in %.0f s: %s GB/s, %d states; states removed %d "
-            "(failed %d) of %d tracked; lookups %d, hit pages %d, truncated at a "
-            "state boundary %d pages in %d lookups",
+            "(failed %d, already gone %d, lease retries %d, pending %d) of %d "
+            "tracked; lookups %d, hit pages %d, truncated at a state boundary %d "
+            "pages in %d lookups",
             window,
             ", ".join(
                 f"{name} {written[name] / window / 1e9:.2f}"
@@ -958,6 +976,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             written["states"],
             self.state_removed,
             self.state_remove_failed,
+            self.state_remove_counts["already_gone"],
+            self.state_remove_counts["lease_retries"],
+            len(self.state_remove_retries),
             len(self.state_parent),
             looked["lookups"],
             looked["hit_pages"],

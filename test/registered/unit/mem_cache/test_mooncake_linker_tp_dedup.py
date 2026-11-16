@@ -6,8 +6,9 @@ draft are shared, while TP-sharded KDA state keeps its own rank namespace."""
 
 import queue
 import unittest
-from collections import Counter
+from collections import Counter, deque
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.storage.mooncake_store.linker_lease_refresh import (
@@ -300,12 +301,12 @@ class TestLookupTruncation(CustomTestCase):
 
 
 class _RemovingStore:
-    def __init__(self, refuse=()):
-        self.removed, self.refuse = [], set(refuse)
+    def __init__(self, codes=None):
+        self.removed, self.codes = [], dict(codes or {})
 
     def remove(self, key):
         self.removed.append(key)
-        return -1 if key in self.refuse else 0
+        return self.codes.get(key, 0)
 
 
 def _capped_linker(cap):
@@ -313,6 +314,7 @@ def _capped_linker(cap):
     linker.state_path_cap = cap
     linker.state_parent, linker.state_children = {}, Counter()
     linker.state_removed = linker.state_remove_failed = 0
+    linker.state_remove_counts, linker.state_remove_retries = Counter(), deque()
     return linker
 
 
@@ -320,15 +322,14 @@ class TestStatePathCap(CustomTestCase):
     """A conversation resumes from its deepest KDA states; each older linear
     state past SGLANG_LINKER_STATE_PATH_CAP is dead weight in the store."""
 
-    def test_cap_one_drops_the_previous_turn_state_but_not_the_first(self):
+    def test_cap_one_keeps_only_the_deepest_state(self):
         linker = _capped_linker(1)
         self.assertEqual(linker._cap_state_path(["s1"], ["a", "s1"]), [])
-        # s1 is the path's first state: another session may branch there.
-        self.assertEqual(linker._cap_state_path(["s2"], ["a", "s1", "b", "s2"]), [])
+        self.assertEqual(linker._cap_state_path(["s2"], ["a", "s1", "b", "s2"]), ["s1"])
         self.assertEqual(
             linker._cap_state_path(["s3"], ["a", "s1", "b", "s2", "c", "s3"]), ["s2"]
         )
-        self.assertEqual(linker.state_parent, {"s1": None, "s3": "s1"})
+        self.assertEqual(linker.state_parent, {"s3": None})
 
     def test_cap_three_keeps_the_three_deepest(self):
         linker = _capped_linker(3)
@@ -337,37 +338,55 @@ class TestStatePathCap(CustomTestCase):
         for turn in range(1, 6):
             path += [f"x{turn}", f"s{turn}"]
             dropped += linker._cap_state_path([f"s{turn}"], list(path))
-        self.assertEqual(dropped, ["s2"])
-        self.assertEqual(linker.state_parent, {"s1": None, "s3": "s1", "s4": "s3", "s5": "s4"})
+        self.assertEqual(dropped, ["s1", "s2"])
+        self.assertEqual(linker.state_parent, {"s3": None, "s4": "s3", "s5": "s4"})
 
-    def test_a_shared_prompt_state_stays_and_its_branches_relink(self):
-        linker = _capped_linker(1)
+    def test_a_branch_point_stays_and_its_branches_relink(self):
+        linker = _capped_linker(2)
         linker._cap_state_path(["sys"], ["p", "sys"])
-        linker._cap_state_path(["a1"], ["p", "sys", "a", "a1"])  # 'sys' has one child
-        linker._cap_state_path(["b1"], ["p", "sys", "b", "b1"])  # now two
+        linker._cap_state_path(["a1"], ["p", "sys", "a", "a1"])
+        linker._cap_state_path(["b1"], ["p", "sys", "b", "b1"])
         self.assertEqual(linker.state_children["sys"], 2)
-        # a2 drops a1 but stops at the branch point, and hangs from it.
-        self.assertEqual(
-            linker._cap_state_path(["a2"], ["p", "sys", "a", "a1", "a", "a2"]), ["a1"]
-        )
+        path = ["p", "sys", "a", "a1", "a", "a2"]
+        self.assertEqual(linker._cap_state_path(["a2"], path), [])  # past the cap: 'sys'
+        # a3 drops a1 but stops at the branch point, and hangs a2 from it.
+        self.assertEqual(linker._cap_state_path(["a3"], path + ["a", "a3"]), ["a1"])
         self.assertEqual(linker.state_parent["a2"], "sys")
         self.assertEqual(linker.state_children["sys"], 2)
 
-    def test_removal_uses_the_lookup_key_schema_and_counts_refusals(self):
+    def test_cap_one_drops_a_shared_state_that_has_one_child_so_far(self):
+        linker = _capped_linker(1)
+        linker._cap_state_path(["sys"], ["p", "sys"])
+        self.assertEqual(linker._cap_state_path(["a1"], ["p", "sys", "a", "a1"]), ["sys"])
+
+    def test_removal_retries_a_leased_state_once_its_lease_can_expire(self):
+        # Mooncake refuses an object under a live lease (-706); a lookup or the
+        # lease refresher may have touched the old state within the lease TTL.
         linker = _linker_over_stages(set(), num_stages=1)
-        linker.storage.store = _RemovingStore(refuse={"model_s1_tp0_cp0_pp0_mamba"})
+        leased, gone = "model_s1_tp0_cp0_pp0_mamba", "model_s2_tp0_cp0_pp0_mamba"
+        linker.storage.store = _RemovingStore({leased: -706, gone: -704})
         linker.storage.pool_suffixes = {
             name: "tp0_cp0_pp0" for name in (PoolName.KV, PoolName.MAMBA, PoolName.INDEXER)
         }
         linker.storage.mla_suffix = "tp0_cp0_pp0"
         linker.pools = {PoolName.KV: None, PoolName.MAMBA: None, PoolName.INDEXER: None}
         linker.state_removed = linker.state_remove_failed = 0
-        linker._remove_states(["s1", "s2"])
-        self.assertEqual(
-            linker.storage.store.removed,
-            ["model_s1_tp0_cp0_pp0_mamba", "model_s2_tp0_cp0_pp0_mamba"],
-        )
-        self.assertEqual((linker.state_removed, linker.state_remove_failed), (1, 1))
+        linker.state_remove_counts, linker.state_remove_retries = Counter(), deque()
+        clock = "sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker.time.monotonic"
+        with patch(clock, return_value=100.0):
+            linker._remove_states(["s1", "s2", "s3"])
+        self.assertEqual(linker.state_removed, 1)  # s3
+        self.assertEqual(linker.state_remove_counts["already_gone"], 1)  # s2
+        self.assertEqual(len(linker.state_remove_retries), 1)  # s1
+        del linker.storage.store.codes[leased]  # its lease has run out
+        with patch(clock, return_value=105.0):
+            linker._remove_states([])  # not due yet
+        self.assertEqual(linker.state_removed, 1)
+        with patch(clock, return_value=112.0):
+            linker._remove_states([])
+        self.assertEqual(linker.state_removed, 2)
+        self.assertEqual(linker.storage.store.removed.count(leased), 2)
+        self.assertEqual(linker.state_remove_failed, 0)
 
 
 class _SettingStorage:
