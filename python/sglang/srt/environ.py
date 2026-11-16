@@ -920,6 +920,10 @@ class Envs:
     # to consumption so eviction cannot waste the fetch. Cap = fraction of
     # the pool the pins may hold; 0 disables pinning.
     SGLANG_HICACHE_BUFFER_ANCHOR_LOCK_CAP = EnvFloat(0.5)
+    # External linker prefetch mode: a published prefetch keeps its prefix
+    # locked until its request is admitted or released, while held prefixes
+    # total at most this share of the Full device pool. 0 releases at publish.
+    SGLANG_EXTERNAL_LINKER_PREFETCH_HOLD_FRACTION = EnvFloat(0.0)
     # Buffer mode: store only the SWA window ending at each node (what a
     # prefetch ending there restores) instead of every SWA page.
     SGLANG_ENABLE_HICACHE_SWA_TAIL_ONLY_BACKUP = EnvBool(False)

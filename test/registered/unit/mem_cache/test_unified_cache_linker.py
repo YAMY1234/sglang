@@ -524,6 +524,61 @@ class TestLinkerDevicePrefetch(CustomTestCase):
                 self._assert_balanced(cache, allocator)
                 cache.sanity_check()
 
+    def _publish(self, cache, backend, req):
+        self._enqueue(cache, req)
+        for future in backend.prefetch_futures:
+            future.set_result(True)
+        cache.check_hicache_events()
+        assert cache.check_prefetch_progress(req.cache_request_handle)
+
+    def test_hold_keeps_a_published_prefix_until_admission(self):
+        """A published prefetch stays locked while its request waits, so an
+        eviction cannot take it; admission or the request's release drops it."""
+        from sglang.srt.environ import envs
+
+        for admitted in (True, False):
+            with (
+                self.subTest(admitted=admitted),
+                envs.SGLANG_EXTERNAL_LINKER_PREFETCH_HOLD_FRACTION.override(0.5),
+            ):
+                cache, backend, req, allocator = self._fixture()
+                handle = req.cache_request_handle
+                self._publish(cache, backend, req)
+                assert list(cache.linker.holds) == [handle]
+                assert cache.linker.held_tokens == 6
+                cache.evict(EvictParams(num_tokens=6))
+                assert self._match(cache, req).device_prefix_len == 6
+                if admitted:
+                    cache.release_prefetch_hold(handle)
+                else:
+                    cache.linker.release_request(handle)
+                assert not cache.linker.holds and cache.linker.held_tokens == 0
+                key = "admitted" if admitted else "released"
+                assert cache.linker._hold_stats[key] == 1
+                cache.evict(EvictParams(num_tokens=6))
+                assert self._match(cache, req).device_prefix_len == 0
+                self._assert_balanced(cache, allocator)
+                cache.sanity_check()
+
+    def test_unheld_publication_stays_evictable_off_or_over_the_cap(self):
+        from sglang.srt.environ import envs
+
+        # 0.1 x 32 slots = 3 tokens, under the 6-token published prefix.
+        for fraction in (0.0, 0.1):
+            with (
+                self.subTest(fraction=fraction),
+                envs.SGLANG_EXTERNAL_LINKER_PREFETCH_HOLD_FRACTION.override(fraction),
+            ):
+                cache, backend, req, allocator = self._fixture()
+                self._publish(cache, backend, req)
+                assert not cache.linker.holds
+                if fraction:
+                    assert cache.linker._hold_stats["over_cap"] == 1
+                cache.evict(EvictParams(num_tokens=6))
+                assert self._match(cache, req).device_prefix_len == 0
+                cache.linker.release_request(req.cache_request_handle)
+                self._assert_balanced(cache, allocator)
+
     def test_failure_falls_back_but_pending_peer_keeps_private_slots(self):
         for outcome, mamba in product(
             ("local-failure", "peer-failure", "peer-pending"), (False, True)

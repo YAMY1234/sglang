@@ -2946,6 +2946,10 @@ class UnifiedRadixCache(BasePrefixCache):
         return None
 
     @rank_consensus(same_params=True, same_results=True)
+    def release_prefetch_hold(self, request: CacheRequestHandle) -> None:
+        if self.linker is not None and self.linker.load_mode == "prefetch":
+            self.linker.release_hold(request, admitted=True)
+
     def check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
         if self.linker is not None and self.linker.load_mode == "prefetch":
             return self.linker.check_prefetch_progress(request)

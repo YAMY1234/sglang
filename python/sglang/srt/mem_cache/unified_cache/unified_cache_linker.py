@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     DecLockRefParams,
@@ -273,6 +274,12 @@ class _ExternalCachePrefetch:
     discard: bool = False
 
 
+class _PrefetchHold(NamedTuple):
+    node_id: NodeId
+    lock: DecLockRefParams
+    tokens: int
+
+
 class _PendingOffload(NamedTuple):
     lock_node_id: NodeId
     lock_params: DecLockRefParams
@@ -320,6 +327,26 @@ class UnifiedCacheLinkerWrapper:
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
         self.prefetches: dict[CacheRequestHandle, _ExternalCachePrefetch] = {}
+        # Published prefetches still locked for their waiting request.
+        self.holds: dict[CacheRequestHandle, _PrefetchHold] = {}
+        self.held_tokens = 0
+        hold_fraction = envs.SGLANG_EXTERNAL_LINKER_PREFETCH_HOLD_FRACTION.get()
+        self.hold_cap_tokens = (
+            int(hold_fraction * cache.token_to_kv_pool_allocator.size_full)
+            if self.load_mode == "prefetch" and hold_fraction > 0
+            else 0
+        )
+        self._hold_stats = dict.fromkeys(
+            ("held", "over_cap", "not_resident", "admitted", "released"), 0
+        )
+        self._hold_next_log = 0.0
+        if self.hold_cap_tokens:
+            logger.info(
+                "External linker prefetch holds on: up to %d tokens (%.2f of the "
+                "Full device pool) stay locked until admission",
+                self.hold_cap_tokens,
+                hold_fraction,
+            )
         # Requests loading in the batch being built, then its counter index once
         # the batch starts; finish_loads consumes both after its forward.
         self.inflight_load_rids: list[str] = []
@@ -408,6 +435,9 @@ class UnifiedCacheLinkerWrapper:
         for previous in self.prefetches:
             if previous.rid == request.rid and previous != request:
                 self._cancel_prefetch(previous)
+        for previous in [h for h in self.holds if h.rid == request.rid]:
+            if previous != request:
+                self.release_hold(previous, admitted=False)
         if self.cache.disable or request in self.prefetches:
             return
         req.init_next_round_input(self.cache, cow_mamba=False)
@@ -589,10 +619,48 @@ class UnifiedCacheLinkerWrapper:
             )
             if mamba is not None and inserted.mamba_exist:
                 storage.free_state_slots(sub_pool, mamba.device_indices)
+            if self.hold_cap_tokens:
+                self._hold(request, inserted, end, len(full))
             self.cache.prefetch_loaded_tokens_by_reqid[request] = len(full)
             self.cache.prefetch_loaded_storage_start_by_reqid[request] = start
         finally:
             self.cache.dec_lock_ref(state.anchor_node_id, state.anchor_lock)
+
+    def _hold(self, request, inserted, end: int, tokens: int) -> None:
+        """Lock a just-published prefix for its waiting request, under the cap."""
+        stats = self._hold_stats
+        if inserted.last_device_node is None or inserted.total_len < end:
+            stats["not_resident"] += 1
+        elif self.held_tokens + tokens > self.hold_cap_tokens:
+            stats["over_cap"] += 1
+        else:
+            node = inserted.last_device_node
+            lock = self.cache.inc_lock_ref(node).to_dec_params()
+            self.holds[request] = _PrefetchHold(node, lock, tokens)
+            self.held_tokens += tokens
+            stats["held"] += 1
+        self._log_holds()
+
+    def release_hold(self, request: CacheRequestHandle, *, admitted: bool) -> None:
+        hold = self.holds.pop(request, None)
+        if hold is None:
+            return
+        self.cache.dec_lock_ref(hold.node_id, hold.lock)
+        self.held_tokens -= hold.tokens
+        self._hold_stats["admitted" if admitted else "released"] += 1
+
+    def _log_holds(self) -> None:
+        now = time.monotonic()
+        if now < self._hold_next_log:
+            return
+        self._hold_next_log = now + 60.0
+        logger.info(
+            "External linker prefetch holds: %d requests hold %d of %d tokens; %s",
+            len(self.holds),
+            self.held_tokens,
+            self.hold_cap_tokens,
+            self._hold_stats,
+        )
 
     def _sync_restorable_prefix(
         self, restorable: list[int], *, num_pages: int, device_hit_pages: int
@@ -891,6 +959,8 @@ class UnifiedCacheLinkerWrapper:
     def _clear_state(self) -> None:
         for request in list(self.prefetches):
             self._finish_prefetch(request, publish=False)
+        for request in list(self.holds):
+            self.release_hold(request, admitted=False)
         self.hit_markers.clear()
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()
@@ -906,6 +976,7 @@ class UnifiedCacheLinkerWrapper:
         rid = request.rid
         self.hit_markers.pop(rid, None)
         self._cancel_prefetch(request)
+        self.release_hold(request, admitted=False)
         # A queued load targets slots the request owns and is about to free.
         # A started one is finished by finish_loads before anything is freed.
         if rid in self.inflight_load_rids and self.cache_linker.cancel_queued_load(rid):
