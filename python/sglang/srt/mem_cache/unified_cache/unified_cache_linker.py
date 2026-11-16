@@ -361,6 +361,12 @@ class UnifiedCacheLinkerWrapper:
             if self.load_mode == "prefetch" and hold_fraction > 0
             else 0
         )
+        load_fraction = envs.SGLANG_EXTERNAL_LINKER_LOAD_FRACTION.get()
+        self.load_cap_tokens = (
+            int(load_fraction * cache.token_to_kv_pool_allocator.size_full)
+            if self.load_mode == "prefetch" and load_fraction > 0
+            else 0
+        )
         # Published prefetches left unheld (over the cap or not resident): their end.
         self.unheld: dict[CacheRequestHandle, int] = {}
         self._hold_stats = dict.fromkeys(
@@ -607,12 +613,15 @@ class UnifiedCacheLinkerWrapper:
         end = start + pages * page
         if request in self.match_targets:
             self.match_targets[request] = end
-        if self.hold_cap_tokens:
-            # In-flight private slots plus holds stay under the hold cap, except that
-            # one load may always run; a refused load keeps its target at `end`, so
-            # the admission re-query retries it.
-            occupied = self.prefetch_size(PoolName.KV) + self.held_tokens
-            if occupied and occupied + pages * page > self.hold_cap_tokens:
+        cap = self._load_cap()
+        if cap:
+            # In-flight private slots (plus holds, under a shared cap) stay under the
+            # cap, except that one load may always run; a refused load keeps its
+            # target at `end`, so the admission re-query retries it.
+            occupied = self.prefetch_size(PoolName.KV)
+            if not self.load_cap_tokens:
+                occupied += self.held_tokens
+            if occupied and occupied + pages * page > cap:
                 self._lookup_stats["load_capped"] += 1
                 self.cache.dec_lock_ref(anchor_node_id, anchor_lock)
                 return
@@ -647,6 +656,10 @@ class UnifiedCacheLinkerWrapper:
             # cancelled read right after it; re-entering would rerun the drain.
             if not self._draining_lookups:
                 self.check_prefetch_events(drain_lookups=False)
+
+    def _load_cap(self) -> int:
+        """Tokens loads may hold in flight: their own cap, else the hold cap they share."""
+        return self.load_cap_tokens or self.hold_cap_tokens
 
     def has_pending_prefetch(self) -> bool:
         return bool(self.prefetches or self.lookups)
@@ -771,7 +784,7 @@ class UnifiedCacheLinkerWrapper:
             p90,
             "; ".join(phases),
             self._occupied_peak,
-            self.hold_cap_tokens,
+            self._load_cap(),
         )
         self._occupied_peak = 0
 
