@@ -1,4 +1,7 @@
 import importlib.util
+import logging
+import sys
+import threading
 import time
 from typing import Optional, Tuple, Union
 
@@ -457,6 +460,148 @@ class KDAKernelDispatcher:
         )
 
 
+logger = logging.getLogger(__name__)
+
+# One call per distinct compile of the Triton extend that one-token-per-sequence
+# batches take (Rhea 56380 logged every compile of 15 shapes and layouts; only
+# these four compiled anything): (sequences, gate/beta as views of one fused
+# projection). 1 sequence: the fused small-grid inter_solve (NT * H <= 256 at
+# H = 96); 3: the unfused inter_solve and the w/u recompute; 33:
+# chunk_gated_delta_rule_fwd_h's NT_BUCKET 1; the views: a strided gate/beta.
+_TRITON_EXTEND_PRECOMPILE_CALLS = ((1, False), (1, True), (3, False), (33, False))
+# The side thread's handoff: thread, then seconds and layout, or error.
+_triton_extend_precompile: dict = {}
+
+
+def _state_layout(ssm_states: torch.Tensor) -> tuple:
+    return tuple(ssm_states.shape[1:]), ssm_states.dtype, ssm_states.stride()[1:]
+
+
+def _run_triton_extend_precompile(
+    kernel, ssm_states: torch.Tensor, lower_bound, dtype: torch.dtype
+) -> float:
+    """Each _TRITON_EXTEND_PRECOMPILE_CALLS extend on zeros shaped like these
+    SSM states (writes only their slot 0); returns the seconds it took."""
+    num_heads, head_k_dim, head_v_dim = ssm_states.shape[1:]
+    device = ssm_states.device
+    q_dim, v_dim = num_heads * head_k_dim, num_heads * head_v_dim
+    a_log = torch.zeros(1, 1, num_heads, 1, dtype=torch.float32, device=device)
+    dt_bias = torch.zeros(q_dim, dtype=torch.float32, device=device)
+    start = time.perf_counter()
+    for num_seqs, gate_beta_views in _TRITON_EXTEND_PRECOMPILE_CALLS:
+        qk = torch.zeros(num_seqs, q_dim, dtype=dtype, device=device)
+        v = torch.zeros(num_seqs, v_dim, dtype=dtype, device=device)
+        if gate_beta_views:
+            gate_beta = torch.zeros(
+                num_seqs, q_dim + num_heads, dtype=dtype, device=device
+            )
+            g = gate_beta[:, :q_dim].unflatten(-1, (num_heads, head_k_dim))[None]
+            beta = gate_beta[:, q_dim:][None]
+        else:
+            g = qk.new_zeros(1, num_seqs, num_heads, head_k_dim)
+            beta = qk.new_zeros(1, num_seqs, num_heads)
+        kernel.extend(
+            q=qk.unflatten(-1, (num_heads, head_k_dim)).unsqueeze(0),
+            k=qk.unflatten(-1, (num_heads, head_k_dim)).unsqueeze(0),
+            v=v.unflatten(-1, (num_heads, head_v_dim)).unsqueeze(0),
+            g=g,
+            beta=beta,
+            ssm_states=ssm_states,
+            cache_indices=torch.zeros(num_seqs, dtype=torch.int32, device=device),
+            query_start_loc=torch.arange(
+                num_seqs + 1, dtype=torch.int32, device=device
+            ),
+            A_log=a_log,
+            dt_bias=dt_bias,
+            lower_bound=lower_bound,
+            beta_is_raw=True,
+        )
+    torch.cuda.synchronize(device)
+    return time.perf_counter() - start
+
+
+def start_triton_extend_precompile(model_config, gpu_id: int) -> None:
+    """Precompile the Triton extend on a side thread and stream while the
+    weights load, on two-slot SSM states laid out as the pool's will be; the
+    KDA backend joins it."""
+    from sglang.srt.configs.hybrid_arch import hybrid_kda_config
+
+    config = hybrid_kda_config(model_config)
+    params = config.mamba2_cache_params
+    lower_bound = config.linear_attn_config.get("gate_lower_bound")
+
+    def run():
+        try:
+            torch.cuda.set_device(gpu_id)
+            with torch.cuda.stream(torch.cuda.Stream()):
+                ssm_states = torch.zeros(
+                    (2, *params.shape.temporal),
+                    dtype=params.dtype.temporal,
+                    device=f"cuda:{gpu_id}",
+                )
+                _triton_extend_precompile["layout"] = _state_layout(ssm_states)
+                _triton_extend_precompile["seconds"] = _run_triton_extend_precompile(
+                    TritonKDAKernel(), ssm_states, lower_bound, model_config.dtype
+                )
+        except BaseException as error:
+            _triton_extend_precompile["error"] = error
+
+    thread = threading.Thread(target=run, name="kda-triton-precompile", daemon=True)
+    _triton_extend_precompile["thread"] = thread
+    thread.start()
+
+
+def _kda_autotuners() -> dict:
+    """The FLA kernels' Triton autotuners, by name."""
+    from triton.runtime.autotuner import Autotuner
+
+    tuners = {}
+    for name, module in list(sys.modules.items()):
+        if not name.startswith("sglang.kernels.ops.attention.fla."):
+            continue
+        for attr, fn in vars(module).items():
+            while fn is not None and not isinstance(fn, Autotuner):
+                fn = getattr(fn, "fn", None)
+            if fn is not None:
+                tuners[f"{name.rsplit('.', 1)[1]}.{attr}"] = fn
+    return tuners
+
+
+def _verify_autotune_choices(kernel, ssm_states, lower_bound, dtype) -> None:
+    """Debug: autotune the precompile again now (GPU idle, no disk results)
+    and log whether every key picks the config the side thread picked."""
+    start = time.perf_counter()
+    tuners = _kda_autotuners()
+    first = {name: dict(t.cache) for name, t in tuners.items() if t.cache}
+    saved = {name: t.cache_results for name, t in tuners.items()}
+    for t in tuners.values():
+        t.cache.clear()
+        t.cache_results = False
+    try:
+        _run_triton_extend_precompile(kernel, ssm_states, lower_bound, dtype)
+    finally:
+        for name, t in tuners.items():
+            t.cache_results = saved[name]
+    keys = differ = 0
+    for name, choices in first.items():
+        for key, config in choices.items():
+            keys += 1
+            again = tuners[name].cache.get(key)
+            if str(again) != str(config):
+                differ += 1
+                logger.warning(
+                    "KDA autotune differs for %s %s: side thread %s, idle %s",
+                    name,
+                    key,
+                    config,
+                    again,
+                )
+    rank0_log(
+        "KDA precompile autotune check: %d of %d keys picked the same config "
+        "with the GPU idle (%.1f s)" % (keys - differ, keys, time.perf_counter() - start)
+    )
+
+
 def ragged_verify_dense_scatter_indices(
     *,
     query_start_loc: torch.Tensor,
@@ -572,90 +717,57 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 device=model_runner.device,
             )
 
-    # One-token-per-sequence batch sizes: 1 and 2 sequences take the fused
-    # small-grid inter_solve (NT * H <= 256 at H = 96), 3 and more the unfused
-    # one; T == 1, T % 16 == 0 and neither are Triton's integer specializations,
-    # and past 32 sequences chunk_gated_delta_rule_fwd_h compiles another variant
-    # (a 1-GPU check at H = 96, K = V = 128 left no miss for 1-100 sequences).
-    _TRITON_EXTEND_PRECOMPILE_SEQS = (1, 2, 3, 16, 33)
-
     def _precompile_triton_extend(self, model_runner: ModelRunner) -> None:
-        """Run the Triton extend that effective_extend_kernel picks for
-        one-token-per-sequence batches on dummy inputs shaped like this stage's
-        KDA layers, so its kernels compile and autotune before serving. Writes
-        only the reserved padding slot 0 of one layer's SSM pool."""
+        """Compile and autotune the Triton extend that effective_extend_kernel
+        picks for one-token-per-sequence batches before serving: join the side
+        thread that did it during weight loading, else do it here."""
         from sglang.srt.configs.hybrid_arch import hybrid_kda_config
 
-        pool = self.req_to_token_pool
-        ssm_states = pool.mamba2_layer_cache(next(iter(pool.mamba_map))).temporal
-        num_heads, head_k_dim, head_v_dim = ssm_states.shape[1:]
         lower_bound = hybrid_kda_config(
             model_runner.model_config
         ).linear_attn_config.get("gate_lower_bound")
-        device, dtype = ssm_states.device, model_runner.model_config.dtype
-        a_log = torch.zeros(1, 1, num_heads, 1, dtype=torch.float32, device=device)
-        dt_bias = torch.zeros(
-            num_heads * head_k_dim, dtype=torch.float32, device=device
-        )
-        q_dim, v_dim = num_heads * head_k_dim, num_heads * head_v_dim
-        start = time.perf_counter()
-        for num_seqs in self._TRITON_EXTEND_PRECOMPILE_SEQS:
+        for num_seqs, _ in _TRITON_EXTEND_PRECOMPILE_CALLS:
             assert self.kernel_dispatcher.effective_extend_kernel(
                 lower_bound, num_seqs, num_seqs
             ) is self.kernel_dispatcher.triton_kernel
-            # Q/K/V as contiguous planes (SGLANG_KDA_PREFILL_CONV_QKV_PLANES) or
-            # as views into one packed conv output; gate and beta as their own
-            # tensors or as views into one fused projection output. Strides
-            # change Triton's integer specializations, not the autotune keys.
-            packed = torch.zeros(
-                num_seqs, 2 * q_dim + v_dim, dtype=dtype, device=device
-            )
-            planes = (packed.new_zeros(num_seqs, q_dim),) * 2 + (
-                packed.new_zeros(num_seqs, v_dim),
-            )
-            gate_beta = packed.new_zeros(num_seqs, q_dim + num_heads)
-            own = (
-                packed.new_zeros(1, num_seqs, num_heads, head_k_dim),
-                packed.new_zeros(1, num_seqs, num_heads),
-            )
-            views = (
-                gate_beta[:, :q_dim].unflatten(-1, (num_heads, head_k_dim))[None],
-                gate_beta[:, q_dim:][None],
-            )
-            for (q, k, v), (g, beta) in (
-                (planes, own),
-                (packed.split([q_dim, q_dim, v_dim], dim=-1), own),
-                (planes, views),
-            ):
-                self.kernel_dispatcher.extend(
-                    q=q.unflatten(-1, (num_heads, head_k_dim)).unsqueeze(0),
-                    k=k.unflatten(-1, (num_heads, head_k_dim)).unsqueeze(0),
-                    v=v.unflatten(-1, (num_heads, head_v_dim)).unsqueeze(0),
-                    g=g,
-                    beta=beta,
-                    ssm_states=ssm_states,
-                    cache_indices=torch.zeros(
-                        num_seqs, dtype=torch.int32, device=device
-                    ),
-                    query_start_loc=torch.arange(
-                        num_seqs + 1, dtype=torch.int32, device=device
-                    ),
-                    A_log=a_log,
-                    dt_bias=dt_bias,
-                    lower_bound=lower_bound,
-                    beta_is_raw=True,
+        pool = self.req_to_token_pool
+        ssm_states = pool.mamba2_layer_cache(next(iter(pool.mamba_map))).temporal
+        dtype = model_runner.model_config.dtype
+        side = _triton_extend_precompile.pop("thread", None)
+        if side is not None:
+            waited = time.perf_counter()
+            side.join()
+            waited = time.perf_counter() - waited
+            if "error" in _triton_extend_precompile:
+                raise _triton_extend_precompile.pop("error")
+            layout = _triton_extend_precompile["layout"]
+            if layout == _state_layout(ssm_states):
+                rank0_log(
+                    "KDA Triton extend precompiled on a side thread during weight "
+                    "loading in %.1f s (%d calls, waited %.1f s at backend init)"
+                    % (
+                        _triton_extend_precompile["seconds"],
+                        len(_TRITON_EXTEND_PRECOMPILE_CALLS),
+                        waited,
+                    )
                 )
-        torch.cuda.synchronize(device)
-        rank0_log(
-            "KDA Triton extend precompiled for %s one-token sequences in %.1f s "
-            "(heads %d, k %d, v %d)"
-            % (
-                list(self._TRITON_EXTEND_PRECOMPILE_SEQS),
-                time.perf_counter() - start,
-                num_heads,
-                head_k_dim,
-                head_v_dim,
+                if envs.SGLANG_KDA_PRECOMPILE_VERIFY_CONFIGS.get():
+                    _verify_autotune_choices(
+                        TritonKDAKernel(), ssm_states, lower_bound, dtype
+                    )
+                return
+            logger.warning(
+                "KDA SSM pool layout %s differs from the side-thread precompile's "
+                "%s; precompiling again on the pool",
+                _state_layout(ssm_states),
+                layout,
             )
+        seconds = _run_triton_extend_precompile(
+            self.kernel_dispatcher.triton_kernel, ssm_states, lower_bound, dtype
+        )
+        rank0_log(
+            "KDA Triton extend precompiled in %.1f s (%d calls)"
+            % (seconds, len(_TRITON_EXTEND_PRECOMPILE_CALLS))
         )
 
     @staticmethod

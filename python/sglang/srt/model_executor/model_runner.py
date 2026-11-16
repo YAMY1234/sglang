@@ -746,6 +746,7 @@ class ModelRunner:
         self.maybe_init_elastic_ep()
         self.init_token_oracle()
         self.sampler = create_sampler()
+        self.maybe_start_kda_precompile()
         self.load_model()
         prepare_moe_topk(model=self.model, model_config=self.model_config)
         self.maybe_warmup_bf16_gemms()
@@ -1361,6 +1362,19 @@ class ModelRunner:
             f"bf16 GEMM warmup: {len(weights)} weight shapes x {len(ms)} M values "
             f"(max {max_m}) in {time.perf_counter() - tic:.1f}s"
         )
+
+    def maybe_start_kda_precompile(self):
+        """Overlap the KDA Triton extend precompile with weight loading."""
+        from sglang.srt.configs.hybrid_arch import hybrid_kda_config
+
+        if envs.SGLANG_KDA_TRITON_EXTEND_PRECOMPILE.get() and hybrid_kda_config(
+            self.model_config
+        ):
+            from sglang.srt.layers.attention.linear.kda_backend import (
+                start_triton_extend_precompile,
+            )
+
+            start_triton_extend_precompile(self.model_config, self.gpu_id)
 
     def load_model(self):
         tic_total = time.perf_counter()

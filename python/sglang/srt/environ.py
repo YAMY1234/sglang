@@ -1867,6 +1867,9 @@ class Envs:
     # extend that one-token-per-sequence batches fall back to, so the first such
     # batch in serving does not stall every PP stage on a JIT autotune.
     SGLANG_KDA_TRITON_EXTEND_PRECOMPILE = EnvBool(False)
+    # Debug only: after the side-thread precompile, autotune it again with the GPU
+    # idle and log whether every key picked the same config.
+    SGLANG_KDA_PRECOMPILE_VERIFY_CONFIGS = EnvBool(False)
     # DSA prefill under sharded DCP: gather the KV and index-K rows with one pack
     # kernel into the all-gather buffer and one reorder kernel out of it, instead
     # of the cat / pad / transpose / split copies around the all-gather.

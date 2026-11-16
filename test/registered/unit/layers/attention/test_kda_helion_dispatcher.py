@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.arg_groups.attention_hook import handle_linear_attn_backend
 from sglang.srt.arg_groups.overrides import resolution_result
+from sglang.srt.layers.attention.linear import kda_backend
 from sglang.srt.layers.attention.linear.kda_backend import KDAKernelDispatcher
 from sglang.srt.layers.attention.linear.kernels.kda_helion import HelionKDAKernel
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
@@ -222,6 +223,71 @@ class TestHelionKDADispatcher(unittest.TestCase):
                 self.assertEqual(
                     resolution_result(args, "linear_attn_verify_backend"), expected
                 )
+
+
+class TestKDATritonExtendPrecompile(unittest.TestCase):
+    """The KDA backend joins the precompile that overlapped weight loading."""
+
+    def _backend(self, pool_state):
+        backend = kda_backend.KDAAttnBackend.__new__(kda_backend.KDAAttnBackend)
+        dispatcher = MagicMock()
+        dispatcher.effective_extend_kernel.return_value = dispatcher.triton_kernel
+        backend.kernel_dispatcher = dispatcher
+        pool = MagicMock(mamba_map={4: 0})
+        pool.mamba2_layer_cache.return_value = SimpleNamespace(temporal=pool_state)
+        backend.req_to_token_pool = pool
+        return backend
+
+    def _precompile(self, backend, handoff):
+        runner = SimpleNamespace(model_config=SimpleNamespace(dtype=torch.bfloat16))
+        config = SimpleNamespace(linear_attn_config={"gate_lower_bound": -5.0})
+        with patch.dict(kda_backend._triton_extend_precompile, handoff, clear=True), patch(
+            "sglang.srt.configs.hybrid_arch.hybrid_kda_config", return_value=config
+        ), patch.object(
+            kda_backend, "_run_triton_extend_precompile", return_value=1.0
+        ) as inline, patch.object(kda_backend, "rank0_log"):
+            backend._precompile_triton_extend(runner)
+            left = dict(kda_backend._triton_extend_precompile)
+        return inline, left
+
+    def test_side_thread_result_is_used_when_the_pool_layout_matches(self):
+        state = torch.zeros(3, 2, 4, 4)
+        thread = MagicMock()
+        inline, left = self._precompile(
+            self._backend(state),
+            {"thread": thread, "seconds": 2.0, "layout": kda_backend._state_layout(state)},
+        )
+        thread.join.assert_called_once()
+        inline.assert_not_called()
+        self.assertNotIn("thread", left)
+
+    def test_a_different_pool_layout_precompiles_again_on_the_pool(self):
+        state = torch.zeros(3, 2, 4, 4)
+        other = kda_backend._state_layout(torch.zeros(3, 2, 4, 8))
+        backend = self._backend(state)
+        inline, _ = self._precompile(
+            backend, {"thread": MagicMock(), "seconds": 2.0, "layout": other}
+        )
+        inline.assert_called_once_with(
+            backend.kernel_dispatcher.triton_kernel, state, -5.0, torch.bfloat16
+        )
+
+    def test_a_side_thread_failure_is_raised_at_backend_init(self):
+        with self.assertRaisesRegex(RuntimeError, "compile failed"):
+            self._precompile(
+                self._backend(torch.zeros(3, 2, 4, 4)),
+                {"thread": MagicMock(), "error": RuntimeError("compile failed")},
+            )
+
+    def test_without_a_side_thread_it_precompiles_on_the_pool(self):
+        state = torch.zeros(3, 2, 4, 4)
+        backend = self._backend(state)
+        inline, _ = self._precompile(backend, {})
+        inline.assert_called_once()
+        self.assertEqual(
+            [c.args[1:] for c in backend.kernel_dispatcher.effective_extend_kernel.call_args_list],
+            [(n, n) for n, _ in kda_backend._TRITON_EXTEND_PRECOMPILE_CALLS],
+        )
 
 
 if __name__ == "__main__":
