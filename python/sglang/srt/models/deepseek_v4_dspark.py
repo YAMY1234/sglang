@@ -73,6 +73,7 @@ from sglang.srt.models.dspark import (
     project_through_lm_head,
 )
 from sglang.srt.runtime_context import (
+    get_exec,
     get_parallel,
     get_platform,
 )
@@ -158,6 +159,30 @@ class DSparkAttention(MqaAttentionBase):
                 quant_config=quant_config,
                 prefix=add_prefix("wqkv_a_stacked", prefix),
             )
+        # The target's MegaAttention path: wq_b rows and wo_a are laid out for it at load
+        # (setup_mega_attention), and wo_b reads the fp8 wo_a's MXFP8 output.
+        self.use_mega_attention = (
+            _is_cuda
+            and self.is_dsv41
+            and not self.q_head_norm
+            and envs.SGLANG_OPT_DSPARK_MEGA_ATTENTION.get()
+            and get_exec().kernel.dsv4_attn_backend == "flashmla_mega"
+        )
+        if self.use_mega_attention:
+            from sglang.kernels.ops.attention.dsv4.rope import precompute_cos_sin_table
+
+            self.mega_cos_sin_cache = precompute_cos_sin_table(**self.rope_kwargs)
+            self.mega_wo_a = None
+            self.mega_wq_b_permuted = False
+            # Attributes the shared mega helpers read (the target's MQALayer sets them in its init)
+            self._wo_a_cudnn_sf = None
+            self.mega_q_head_scale = None
+            self.mega_wq_b_fp8_q_sf = None
+            self._mega_fp8_q_step = False
+            self._mega_fp8_q_fp4_cache = None
+            self.wo_b.deepgemm_mxfp8_input = (
+                self.n_local_groups * self.o_lora_rank == self.wo_b.weight.shape[-1]
+            )
         if _is_npu:
             self.register_buffer(
                 "_q_post_norm_weight",
@@ -211,6 +236,11 @@ class DSparkAttention(MqaAttentionBase):
     ) -> torch.Tensor:
         if q_lora is None:
             q_lora, _ = self.wq_a(x)
+        if self.use_mega_attention:
+            # No RoPE here: MegaAttention applies it in the kernel.
+            _, q_for_wqb = self._normalize_q_lora(q_lora)
+            q, _ = self.wq_b(q_for_wqb)
+            return q.view(-1, self.n_local_heads, self.head_dim)
         q = self.q_norm(q_lora)
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
@@ -300,7 +330,7 @@ class DSparkAttention(MqaAttentionBase):
                 dtype=torch.float8_e4m3fn,
                 device=hidden_states.device,
             )
-        elif self.n_local_heads < _PAD_NUM_HEADS:
+        elif self.n_local_heads < _PAD_NUM_HEADS and not self.use_mega_attention:
             q_padded = hidden_states.new_empty(
                 hidden_states.shape[0], _PAD_NUM_HEADS, self.head_dim
             )
@@ -352,6 +382,25 @@ class DSparkAttention(MqaAttentionBase):
                 pool=pool,
             )
             q = self._compute_q(hidden_states, positions, q_out=q_out)
+
+        if self.use_mega_attention:
+            kernel_num_heads = 64 if self.n_local_heads <= 64 else 128
+            o = self._forward_mega(
+                q,
+                kernel_num_heads,
+                self._local_attn_sink(kernel_num_heads),
+                forward_batch,
+                attn_backend,
+            )
+            out, _ = self.wo_b(
+                o.flatten(1) if isinstance(o, torch.Tensor) else o,
+                skip_all_reduce=defer_all_reduce,
+            )
+            return (
+                mhc.AttnOutput(out)
+                if defer_all_reduce and self.attn_tp_size > 1
+                else out
+            )
 
         if q_padded is not None:
             q = q_padded
@@ -1180,6 +1229,16 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
     def post_load_weights(self, is_nextn=False, weight_names=None):
         for stage in self.stages:
             stage.refresh_mhc_norm_weight_cache()
+            stage.self_attn.setup_mega_attention()
+        if envs.SGLANG_OPT_DSPARK_MEGA_ATTENTION.get():
+            attns = [stage.self_attn for stage in self.stages]
+            logger.info(
+                "DSpark draft MegaAttention: %d/%d stages, wq_b interleaved %d, fp8 wo_a %d",
+                sum(a.use_mega_attention for a in attns),
+                len(attns),
+                sum(a.use_mega_attention and a.mega_wq_b_permuted for a in attns),
+                sum(a.use_mega_attention and a.mega_wo_a is not None for a in attns),
+            )
 
     def _assert_confidence_head_loaded(
         self, *, params_dict: dict, loaded_params: set

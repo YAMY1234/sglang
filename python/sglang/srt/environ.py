@@ -647,6 +647,10 @@ class Envs:
     # Launch the q_lora RMSNorm + MXFP8 kernel (rmsnorm_mxfp8) with PDL, so it does not
     # wait a full launch after wqkv_a.
     SGLANG_OPT_DSV4_Q_NORM_PDL = EnvBool(False)
+    # DSpark draft attention on the target's flashmla_mega path: q norm + MXFP8 quant,
+    # wq_b, MegaAttention (RoPE in the kernel, MXFP8 output) and the fp8 wo_a einsum.
+    # Changes draft numerics only (the attention output is MXFP8, as in the target).
+    SGLANG_OPT_DSPARK_MEGA_ATTENTION = EnvBool(False)
     # The deferred draft KV store's staging (write locations, positions, state slots,
     # commit lengths) in one Triton launch instead of four copies and a fill.
     SGLANG_OPT_DSV41_DSPARK_ONE_LAUNCH_COMMIT_STAGE = EnvBool(

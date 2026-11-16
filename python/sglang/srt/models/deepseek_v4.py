@@ -1544,6 +1544,321 @@ class MqaAttentionBase(nn.Module):
             else:
                 yield
 
+    def setup_mega_attention(self) -> None:
+        if not self.use_mega_attention:
+            return
+        from sglang.srt.layers.attention.deepseek_v4_mega_backend import (
+            interleave_output_columns,
+            interleave_query_rows,
+            quantize_wo_a,
+        )
+
+        self.mega_wq_b_permuted = (
+            self.n_local_heads in (64, 128) and self._wq_b_uses_flashinfer_mxfp8()
+        )
+        if self.mega_wq_b_permuted:
+            method = self.wq_b.quant_method
+            if method.use_mxfp8:
+                for param in (self.wq_b.weight, self.wq_b.weight_scale_inv):
+                    param.data.copy_(
+                        interleave_query_rows(param.data, self.n_local_heads)
+                    )
+                method._process_mxfp8_linear_weight_scale(self.wq_b)
+            else:
+                block_n, block_k = method.weight_block_size
+                sf = self.wq_b.weight_scale_inv.data.repeat_interleave(
+                    block_n // 16, dim=0
+                )
+                sf = (
+                    sf.view(self.n_local_heads, 32, -1)
+                    .transpose(0, 1)
+                    .reshape(sf.shape)
+                )
+                self.wq_b.weight.data.copy_(
+                    interleave_query_rows(self.wq_b.weight.data, self.n_local_heads)
+                )
+                self.wq_b.weight_scale_inv.data = sf.contiguous()
+                method.weight_block_size = [16, block_k]
+        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+        self.mega_wo_a = quantize_wo_a(interleave_output_columns(wo_a))
+        self._setup_mega_fp8_q()
+
+    def _setup_mega_fp8_q(self) -> None:
+        """Static FP8 Q for the MegaAttention decode of a compressed layer: wq_b writes
+        Q / scale as E4M3, the per-head power-of-two scales folded into its UE8M0 weight
+        scales, and FlashMLA's fp8 decode multiplies them back into the softmax scale."""
+        method = self.wq_b.quant_method
+        if not (
+            envs.SGLANG_OPT_DSV4_MEGA_FP8_Q.get()
+            and self.mega_wq_b_permuted
+            and self.n_local_heads == 64
+            and self.compress_ratio > 0
+            and get_platform().device_sm == 107
+            and method.mxfp8_dense_backend.is_flashinfer_cutedsl()
+        ):
+            return
+        from flashinfer import block_scale_interleave
+
+        from sglang.kernels.ops.attention.flash_mla_interface import (
+            mega_decode_takes_q_head_scale,
+        )
+        from sglang.srt.layers.attention.deepseek_v4_mega_backend import (
+            static_fp8_q_head_scale,
+        )
+        from sglang.srt.layers.quantization.fp8_utils import (
+            block_fp8_scale_to_mxfp8_e8m0,
+        )
+
+        if not mega_decode_takes_q_head_scale():
+            logger.warning(
+                "SGLANG_OPT_DSV4_MEGA_FP8_Q: the installed FlashMLA decode takes no "
+                "q_head_scale; keeping bf16 Q"
+            )
+            return
+        n, k = self.wq_b.weight.shape
+        # wq_b's per-row UE8M0 scales [N, K / 32], rows already in the query layout. A block-fp8
+        # checkpoint gets its MXFP8 view later (after this hook), from the same permuted block scales
+        if getattr(method, "use_mxfp8", False):
+            sf_u8 = self.wq_b.weight_scale_inv.data.view(torch.uint8).reshape(n, k // 32)
+        elif getattr(method, "block_fp8_as_mxfp8", False):
+            sf_u8 = block_fp8_scale_to_mxfp8_e8m0(
+                self.wq_b.weight_scale_inv.data, (n, k), method.weight_block_size
+            )
+        else:
+            return
+        scale, shift = static_fp8_q_head_scale(
+            self.wq_b.weight.data, sf_u8, self.q_norm.weight.data, self.n_local_heads
+        )
+        # Row r's exponents lowered by its head's log2 scale (wq_b then writes Q / scale; vLLM's
+        # _shift_f8_128x4_rows on the swizzled bytes), in FlashInfer's 128x4 layout
+        shifted = (sf_u8.int() - shift[:, None]).clamp(0, 254).to(torch.uint8)
+        self.mega_wq_b_fp8_q_sf = block_scale_interleave(shifted.contiguous()).contiguous()
+        self.mega_q_head_scale = scale
+        # The attention backend reads the scale from the layer it is handed
+        (self.attn_mqa if isinstance(self, MQALayer) else self.attn).mega_q_head_scale = (
+            scale
+        )
+        global _MEGA_FP8_Q_LAYERS
+        _MEGA_FP8_Q_LAYERS += 1
+        if _MEGA_FP8_Q_LAYERS == 1:
+            logger.info(
+                "DSV4 MegaAttention: static FP8 Q (E4M3 wq_b output) on the compressed "
+                "layers; layer %d head scales %s",
+                self.layer_id,
+                [float(x) for x in scale[:4]],
+            )
+
+    def _use_mega_fp8_q(self, forward_batch: ForwardBatch) -> bool:
+        """Static FP8 Q this step: decode or target-verify (the MegaAttention decode kernel)
+        over an fp4 extra cache."""
+        if self.mega_q_head_scale is None:
+            return False
+        mode = forward_batch.forward_mode
+        if not (mode.is_decode() or mode.is_target_verify()):
+            return False
+        if self._mega_fp8_q_fp4_cache is None:
+            self._mega_fp8_q_fp4_cache = (
+                get_token_to_kv_pool().get_extra_key_bytes_per_token(self.layer_id)
+                == 288
+            )
+        return self._mega_fp8_q_fp4_cache
+
+    def _wq_b_static_fp8_q(self, q) -> Optional[torch.Tensor]:
+        """wq_b with an E4M3 output at the static per-head scales, on the SM107 PDL MXFP8
+        GEMM at its decode-table tactic. None (bf16 Q) when the input is not FlashInfer's
+        swizzled MXFP8 or M is not tabled."""
+        if not isinstance(q, Mxfp8SwizzledInput):
+            return None
+        from sglang.kernels.ops.gemm import mxfp8_sm107_dense as dense
+
+        weight = self.wq_b.weight
+        m = q.data.shape[0]
+        for max_m, tactic, _ in dense.DECODE_TABLE.get(tuple(weight.shape), ()):
+            if m <= max_m:
+                break
+        else:
+            return None
+        if not dense._source_ok():
+            return None
+        out = torch.empty(
+            (m, weight.shape[0]), dtype=torch.float8_e4m3fn, device=q.data.device
+        )
+        return dense.mxfp8_sm107_gemm(
+            q.data,
+            q.scales,
+            weight,
+            self.mega_wq_b_fp8_q_sf,
+            out,
+            tactic,
+            use_pdl=envs.SGLANG_OPT_SM107_MXFP8_DENSE_TABLE_MODE.get() != "nopdl",
+        )
+
+    def _wq_b_uses_flashinfer_mxfp8(self) -> bool:
+        method = self.wq_b.quant_method
+        backend = getattr(method, "mxfp8_dense_backend", None)
+        return bool(
+            (
+                getattr(method, "use_mxfp8", False)
+                or getattr(method, "block_fp8_as_mxfp8", False)
+            )
+            and backend is not None
+            and (backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl())
+        )
+
+    def _forward_mega(
+        self,
+        q: torch.Tensor,
+        kernel_num_heads: int,
+        attn_sink: torch.Tensor,
+        forward_batch: ForwardBatch,
+        attn_backend,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.attention.deepseek_v4_mega_backend import pack_query
+
+        if forward_batch.forward_mode.is_idle():
+            return q.new_zeros(q.shape[0], self.n_local_groups, self.o_lora_rank)
+        if not self.mega_wq_b_permuted:
+            out = attn_backend.packed_query_buffer(
+                rows=q.shape[0], padded_heads=kernel_num_heads, dtype=q.dtype
+            )
+            q = pack_query(q, kernel_num_heads, out=out)
+        if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
+            rows = q.shape[0]
+            if self._mega_mxfp8_output(rows):
+                y, y_sf = mhc.empty_deepgemm_mxfp8_pair(
+                    rows,
+                    self.n_local_groups * self.o_lora_rank,
+                    q.device,
+                    flashinfer=deepgemm_pair_takes_flashinfer(),
+                )
+                bcg_deepseek_v4_mega_attention_with_mxfp8_output(
+                    self, q, y, y_sf, attn_sink
+                )
+                return deepgemm_mxfp8_linear_input(y, y_sf)
+            o = q.new_empty((rows, self.n_local_groups, self.o_lora_rank))
+            bcg_deepseek_v4_mega_attention_with_output(self, q, o, attn_sink)
+            return o
+        return self._mega_core(
+            q, attn_sink, forward_batch, attn_backend, allow_mxfp8_output=True
+        )
+
+    def _mega_mxfp8_output(self, rows: int) -> bool:
+        return self.wo_b.deepgemm_mxfp8_input and mhc.fused_mxfp8_rows(rows)
+
+    def _wo_a_cudnn_rows(self, rows: int) -> bool:
+        return (
+            envs.SGLANG_OPT_DSV41_WO_A_CUDNN.get()
+            and rows >= _WO_A_CUDNN_MIN_ROWS
+            and get_platform().device_sm == 107
+            and self.n_local_groups * 8 == self.n_local_heads
+            and self._mega_mxfp8_output(rows)
+            and deepgemm_pair_takes_flashinfer()
+        )
+
+    def _mega_core(
+        self,
+        q: torch.Tensor,
+        attn_sink: torch.Tensor,
+        forward_batch: ForwardBatch,
+        attn_backend,
+        allow_mxfp8_output: bool = False,
+        out: Optional[torch.Tensor | Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
+        """``out`` is a bf16 tensor or an (fp8, DeepGEMM-packed scale) pair."""
+        mhc.run_deferred_attn_stats_fork()
+        cudnn_wo_a = (
+            out is None
+            and allow_mxfp8_output
+            and self._wo_a_cudnn_rows(q.shape[0])
+        )
+        data, scale = attn_backend.forward(
+            q=q,
+            k=q,
+            v=q,
+            layer=self.attn_mqa if isinstance(self, MQALayer) else self.attn,
+            forward_batch=forward_batch,
+            compress_ratio=self.compress_ratio,
+            attn_sink=attn_sink,
+            save_kv_cache=False,
+            cos_sin_cache=self.mega_cos_sin_cache,
+            mega_sf_swizzled_128x4=cudnn_wo_a,
+        )
+        from sglang.srt.layers.attention.deepseek_v4_mega_backend import (
+            MegaPrefillSplit,
+        )
+
+        if isinstance(data, MegaPrefillSplit):
+            # The backend wrote per-group 128x4 scales for the 128-aligned rows (only when asked to).
+            if self._wo_a_cudnn_sf is None:
+                self._wo_a_cudnn_sf = _wo_a_weight_sf_128x4(self.mega_wo_a[1])
+                print_info_once("MegaAttention prefill wo_a: cuDNN MXFP8 BMM")
+            _WO_A_CUDNN_CALLS[0] += 1
+            n = _WO_A_CUDNN_CALLS[0]
+            if n & (n - 1) == 0:  # engagement count at powers of two
+                logger.info("wo_a cuDNN MXFP8 BMM calls: %d (rows %d)", n, q.shape[0])
+            return _cudnn_wo_a(data, *self.mega_wo_a, self._wo_a_cudnn_sf)
+        groups = self.n_local_groups
+        rows = data.shape[0]
+        o_fp8, o_s = data[:, :groups], scale[:, :groups]
+        if out is None and allow_mxfp8_output and self._mega_mxfp8_output(rows):
+            out = mhc.empty_deepgemm_mxfp8_pair(
+                rows,
+                groups * self.o_lora_rank,
+                data.device,
+                flashinfer=deepgemm_pair_takes_flashinfer(),
+            )
+        if isinstance(out, tuple):
+            y, y_sf = out
+            _fp8_wo_a_einsum(
+                o_fp8,
+                o_s,
+                *self.mega_wo_a,
+                recipe=(1, 1, 32),
+                out=(y.view(rows, groups, -1), y_sf),
+            )
+            return deepgemm_mxfp8_linear_input(y, y_sf)
+        return _fp8_wo_a_einsum(o_fp8, o_s, *self.mega_wo_a, recipe=(1, 1, 32), out=out)
+
+    def _normalize_q_lora(
+        self, q: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor | Mxfp8SwizzledInput]:
+        # The indexer needs the BF16 normalized row; wq_b needs the quantized one.
+        if _is_hip:
+            return _hip.q_norm_for_wq_b(self, q)
+        method = self.wq_b.quant_method
+        if (
+            _is_cuda
+            and self.is_dsv41
+            and get_platform().is_blackwell
+            and q.dtype == self.q_norm.weight.dtype == torch.bfloat16
+            and q.ndim == 2
+            and q.shape[0] > 0
+            and q.shape[1] == 1280
+            and q.stride(1) == 1
+            and getattr(method, "mxfp8_dense_backend", None)
+            == Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
+            and (
+                getattr(method, "use_mxfp8", False)
+                or getattr(self.wq_b, "block_fp8_mxfp8_ready", False)
+            )
+        ):
+            from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+            from sglang.srt.runtime_context import get_exec
+
+            if not (
+                is_batch_invariant_mode_enabled()
+                or get_exec().deterministic.enable_deterministic_inference
+            ):
+                from sglang.kernels.ops.layernorm.rmsnorm_mxfp8 import rmsnorm_mxfp8
+
+                y, quant, scale = rmsnorm_mxfp8(
+                    q, self.q_norm.weight, self.q_norm.variance_epsilon
+                )
+                return y, Mxfp8SwizzledInput(quant, scale)
+        q = self.q_norm(q)
+        return q, q
+
+
 
 class MQALayer(MqaAttentionBase):
     is_dsv41: bool = False
@@ -1745,283 +2060,8 @@ class MQALayer(MqaAttentionBase):
             self.indexer.compressor.fp4_sin = self.sin_cache[:, 0, 0, :]
         return result
 
-    def setup_mega_attention(self) -> None:
-        if not self.use_mega_attention:
-            return
-        from sglang.srt.layers.attention.deepseek_v4_mega_backend import (
-            interleave_output_columns,
-            interleave_query_rows,
-            quantize_wo_a,
-        )
-
-        self.mega_wq_b_permuted = (
-            self.n_local_heads in (64, 128) and self._wq_b_uses_flashinfer_mxfp8()
-        )
-        if self.mega_wq_b_permuted:
-            method = self.wq_b.quant_method
-            if method.use_mxfp8:
-                for param in (self.wq_b.weight, self.wq_b.weight_scale_inv):
-                    param.data.copy_(
-                        interleave_query_rows(param.data, self.n_local_heads)
-                    )
-                method._process_mxfp8_linear_weight_scale(self.wq_b)
-            else:
-                block_n, block_k = method.weight_block_size
-                sf = self.wq_b.weight_scale_inv.data.repeat_interleave(
-                    block_n // 16, dim=0
-                )
-                sf = (
-                    sf.view(self.n_local_heads, 32, -1)
-                    .transpose(0, 1)
-                    .reshape(sf.shape)
-                )
-                self.wq_b.weight.data.copy_(
-                    interleave_query_rows(self.wq_b.weight.data, self.n_local_heads)
-                )
-                self.wq_b.weight_scale_inv.data = sf.contiguous()
-                method.weight_block_size = [16, block_k]
-        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-        self.mega_wo_a = quantize_wo_a(interleave_output_columns(wo_a))
-        self._setup_mega_fp8_q()
-
-    def _setup_mega_fp8_q(self) -> None:
-        """Static FP8 Q for the MegaAttention decode of a compressed layer: wq_b writes
-        Q / scale as E4M3, the per-head power-of-two scales folded into its UE8M0 weight
-        scales, and FlashMLA's fp8 decode multiplies them back into the softmax scale."""
-        method = self.wq_b.quant_method
-        if not (
-            envs.SGLANG_OPT_DSV4_MEGA_FP8_Q.get()
-            and self.mega_wq_b_permuted
-            and self.n_local_heads == 64
-            and self.compress_ratio > 0
-            and get_platform().device_sm == 107
-            and method.mxfp8_dense_backend.is_flashinfer_cutedsl()
-        ):
-            return
-        from flashinfer import block_scale_interleave
-
-        from sglang.kernels.ops.attention.flash_mla_interface import (
-            mega_decode_takes_q_head_scale,
-        )
-        from sglang.srt.layers.attention.deepseek_v4_mega_backend import (
-            static_fp8_q_head_scale,
-        )
-        from sglang.srt.layers.quantization.fp8_utils import (
-            block_fp8_scale_to_mxfp8_e8m0,
-        )
-
-        if not mega_decode_takes_q_head_scale():
-            logger.warning(
-                "SGLANG_OPT_DSV4_MEGA_FP8_Q: the installed FlashMLA decode takes no "
-                "q_head_scale; keeping bf16 Q"
-            )
-            return
-        n, k = self.wq_b.weight.shape
-        # wq_b's per-row UE8M0 scales [N, K / 32], rows already in the query layout. A block-fp8
-        # checkpoint gets its MXFP8 view later (after this hook), from the same permuted block scales
-        if getattr(method, "use_mxfp8", False):
-            sf_u8 = self.wq_b.weight_scale_inv.data.view(torch.uint8).reshape(n, k // 32)
-        elif getattr(method, "block_fp8_as_mxfp8", False):
-            sf_u8 = block_fp8_scale_to_mxfp8_e8m0(
-                self.wq_b.weight_scale_inv.data, (n, k), method.weight_block_size
-            )
-        else:
-            return
-        scale, shift = static_fp8_q_head_scale(
-            self.wq_b.weight.data, sf_u8, self.q_norm.weight.data, self.n_local_heads
-        )
-        # Row r's exponents lowered by its head's log2 scale (wq_b then writes Q / scale; vLLM's
-        # _shift_f8_128x4_rows on the swizzled bytes), in FlashInfer's 128x4 layout
-        shifted = (sf_u8.int() - shift[:, None]).clamp(0, 254).to(torch.uint8)
-        self.mega_wq_b_fp8_q_sf = block_scale_interleave(shifted.contiguous()).contiguous()
-        self.mega_q_head_scale = scale
-        # The attention backend reads the scale from the layer it is handed
-        (self.attn_mqa if isinstance(self, MQALayer) else self.attn).mega_q_head_scale = (
-            scale
-        )
-        global _MEGA_FP8_Q_LAYERS
-        _MEGA_FP8_Q_LAYERS += 1
-        if _MEGA_FP8_Q_LAYERS == 1:
-            logger.info(
-                "DSV4 MegaAttention: static FP8 Q (E4M3 wq_b output) on the compressed "
-                "layers; layer %d head scales %s",
-                self.layer_id,
-                [float(x) for x in scale[:4]],
-            )
-
-    def _use_mega_fp8_q(self, forward_batch: ForwardBatch) -> bool:
-        """Static FP8 Q this step: decode or target-verify (the MegaAttention decode kernel)
-        over an fp4 extra cache."""
-        if self.mega_q_head_scale is None:
-            return False
-        mode = forward_batch.forward_mode
-        if not (mode.is_decode() or mode.is_target_verify()):
-            return False
-        if self._mega_fp8_q_fp4_cache is None:
-            self._mega_fp8_q_fp4_cache = (
-                get_token_to_kv_pool().get_extra_key_bytes_per_token(self.layer_id)
-                == 288
-            )
-        return self._mega_fp8_q_fp4_cache
-
-    def _wq_b_static_fp8_q(self, q) -> Optional[torch.Tensor]:
-        """wq_b with an E4M3 output at the static per-head scales, on the SM107 PDL MXFP8
-        GEMM at its decode-table tactic. None (bf16 Q) when the input is not FlashInfer's
-        swizzled MXFP8 or M is not tabled."""
-        if not isinstance(q, Mxfp8SwizzledInput):
-            return None
-        from sglang.kernels.ops.gemm import mxfp8_sm107_dense as dense
-
-        weight = self.wq_b.weight
-        m = q.data.shape[0]
-        for max_m, tactic, _ in dense.DECODE_TABLE.get(tuple(weight.shape), ()):
-            if m <= max_m:
-                break
-        else:
-            return None
-        if not dense._source_ok():
-            return None
-        out = torch.empty(
-            (m, weight.shape[0]), dtype=torch.float8_e4m3fn, device=q.data.device
-        )
-        return dense.mxfp8_sm107_gemm(
-            q.data,
-            q.scales,
-            weight,
-            self.mega_wq_b_fp8_q_sf,
-            out,
-            tactic,
-            use_pdl=envs.SGLANG_OPT_SM107_MXFP8_DENSE_TABLE_MODE.get() != "nopdl",
-        )
-
     def accepts_deepgemm_mxfp8_input(self) -> bool:
         return self.fuse_wqa_wkv and self.wqkv_a.deepgemm_mxfp8_input
-
-    def _wq_b_uses_flashinfer_mxfp8(self) -> bool:
-        method = self.wq_b.quant_method
-        backend = getattr(method, "mxfp8_dense_backend", None)
-        return bool(
-            (
-                getattr(method, "use_mxfp8", False)
-                or getattr(method, "block_fp8_as_mxfp8", False)
-            )
-            and backend is not None
-            and (backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl())
-        )
-
-    def _forward_mega(
-        self,
-        q: torch.Tensor,
-        kernel_num_heads: int,
-        attn_sink: torch.Tensor,
-        forward_batch: ForwardBatch,
-        attn_backend,
-    ) -> torch.Tensor:
-        from sglang.srt.layers.attention.deepseek_v4_mega_backend import pack_query
-
-        if forward_batch.forward_mode.is_idle():
-            return q.new_zeros(q.shape[0], self.n_local_groups, self.o_lora_rank)
-        if not self.mega_wq_b_permuted:
-            out = attn_backend.packed_query_buffer(
-                rows=q.shape[0], padded_heads=kernel_num_heads, dtype=q.dtype
-            )
-            q = pack_query(q, kernel_num_heads, out=out)
-        if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
-            rows = q.shape[0]
-            if self._mega_mxfp8_output(rows):
-                y, y_sf = mhc.empty_deepgemm_mxfp8_pair(
-                    rows,
-                    self.n_local_groups * self.o_lora_rank,
-                    q.device,
-                    flashinfer=deepgemm_pair_takes_flashinfer(),
-                )
-                bcg_deepseek_v4_mega_attention_with_mxfp8_output(
-                    self, q, y, y_sf, attn_sink
-                )
-                return deepgemm_mxfp8_linear_input(y, y_sf)
-            o = q.new_empty((rows, self.n_local_groups, self.o_lora_rank))
-            bcg_deepseek_v4_mega_attention_with_output(self, q, o, attn_sink)
-            return o
-        return self._mega_core(
-            q, attn_sink, forward_batch, attn_backend, allow_mxfp8_output=True
-        )
-
-    def _mega_mxfp8_output(self, rows: int) -> bool:
-        return self.wo_b.deepgemm_mxfp8_input and mhc.fused_mxfp8_rows(rows)
-
-    def _wo_a_cudnn_rows(self, rows: int) -> bool:
-        return (
-            envs.SGLANG_OPT_DSV41_WO_A_CUDNN.get()
-            and rows >= _WO_A_CUDNN_MIN_ROWS
-            and get_platform().device_sm == 107
-            and self.n_local_groups * 8 == self.n_local_heads
-            and self._mega_mxfp8_output(rows)
-            and deepgemm_pair_takes_flashinfer()
-        )
-
-    def _mega_core(
-        self,
-        q: torch.Tensor,
-        attn_sink: torch.Tensor,
-        forward_batch: ForwardBatch,
-        attn_backend,
-        allow_mxfp8_output: bool = False,
-        out: Optional[torch.Tensor | Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
-        """``out`` is a bf16 tensor or an (fp8, DeepGEMM-packed scale) pair."""
-        mhc.run_deferred_attn_stats_fork()
-        cudnn_wo_a = (
-            out is None
-            and allow_mxfp8_output
-            and self._wo_a_cudnn_rows(q.shape[0])
-        )
-        data, scale = attn_backend.forward(
-            q=q,
-            k=q,
-            v=q,
-            layer=self.attn_mqa,
-            forward_batch=forward_batch,
-            compress_ratio=self.compress_ratio,
-            attn_sink=attn_sink,
-            save_kv_cache=False,
-            cos_sin_cache=self.mega_cos_sin_cache,
-            mega_sf_swizzled_128x4=cudnn_wo_a,
-        )
-        from sglang.srt.layers.attention.deepseek_v4_mega_backend import (
-            MegaPrefillSplit,
-        )
-
-        if isinstance(data, MegaPrefillSplit):
-            # The backend wrote per-group 128x4 scales for the 128-aligned rows (only when asked to).
-            if self._wo_a_cudnn_sf is None:
-                self._wo_a_cudnn_sf = _wo_a_weight_sf_128x4(self.mega_wo_a[1])
-                print_info_once("MegaAttention prefill wo_a: cuDNN MXFP8 BMM")
-            _WO_A_CUDNN_CALLS[0] += 1
-            n = _WO_A_CUDNN_CALLS[0]
-            if n & (n - 1) == 0:  # engagement count at powers of two
-                logger.info("wo_a cuDNN MXFP8 BMM calls: %d (rows %d)", n, q.shape[0])
-            return _cudnn_wo_a(data, *self.mega_wo_a, self._wo_a_cudnn_sf)
-        groups = self.n_local_groups
-        rows = data.shape[0]
-        o_fp8, o_s = data[:, :groups], scale[:, :groups]
-        if out is None and allow_mxfp8_output and self._mega_mxfp8_output(rows):
-            out = mhc.empty_deepgemm_mxfp8_pair(
-                rows,
-                groups * self.o_lora_rank,
-                data.device,
-                flashinfer=deepgemm_pair_takes_flashinfer(),
-            )
-        if isinstance(out, tuple):
-            y, y_sf = out
-            _fp8_wo_a_einsum(
-                o_fp8,
-                o_s,
-                *self.mega_wo_a,
-                recipe=(1, 1, 32),
-                out=(y.view(rows, groups, -1), y_sf),
-            )
-            return deepgemm_mxfp8_linear_input(y, y_sf)
-        return _fp8_wo_a_einsum(o_fp8, o_s, *self.mega_wo_a, recipe=(1, 1, 32), out=out)
 
     def _get_npu_rope_position_cache(
         self,
@@ -2074,45 +2114,6 @@ class MQALayer(MqaAttentionBase):
         ok = all(_takes_swizzled(linear) for linear in linears)
         self._accepts_mxfp8_swizzled_input = ok
         return ok
-
-    def _normalize_q_lora(
-        self, q: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor | Mxfp8SwizzledInput]:
-        # The indexer needs the BF16 normalized row; wq_b needs the quantized one.
-        if _is_hip:
-            return _hip.q_norm_for_wq_b(self, q)
-        method = self.wq_b.quant_method
-        if (
-            _is_cuda
-            and self.is_dsv41
-            and get_platform().is_blackwell
-            and q.dtype == self.q_norm.weight.dtype == torch.bfloat16
-            and q.ndim == 2
-            and q.shape[0] > 0
-            and q.shape[1] == 1280
-            and q.stride(1) == 1
-            and getattr(method, "mxfp8_dense_backend", None)
-            == Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
-            and (
-                getattr(method, "use_mxfp8", False)
-                or getattr(self.wq_b, "block_fp8_mxfp8_ready", False)
-            )
-        ):
-            from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
-            from sglang.srt.runtime_context import get_exec
-
-            if not (
-                is_batch_invariant_mode_enabled()
-                or get_exec().deterministic.enable_deterministic_inference
-            ):
-                from sglang.kernels.ops.layernorm.rmsnorm_mxfp8 import rmsnorm_mxfp8
-
-                y, quant, scale = rmsnorm_mxfp8(
-                    q, self.q_norm.weight, self.q_norm.variance_epsilon
-                )
-                return y, Mxfp8SwizzledInput(quant, scale)
-        q = self.q_norm(q)
-        return q, q
 
     def _compute_q_a(
         self,
