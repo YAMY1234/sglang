@@ -800,6 +800,11 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """Drop the lock a published prefetch holds for a request admitted with a
         ``prefix_len``-token device prefix."""
 
+    def requery_prefetch_after_device_loss(self, req: Req) -> bool:
+        """Re-query a queued request's prefix lost on device since its lookup;
+        True while that lookup or load runs."""
+        return False
+
     def pop_prefetch_loaded_span(
         self, handle: CacheRequestHandle
     ) -> tuple[int, Optional[int]]:

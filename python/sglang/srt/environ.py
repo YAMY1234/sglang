@@ -928,6 +928,13 @@ class Envs:
     # this many worker threads instead of the scheduler thread; the load starts
     # when the lookup returns. 0 keeps the synchronous lookup.
     SGLANG_EXTERNAL_LINKER_ASYNC_LOOKUP_THREADS = EnvInt(0)
+    # External linker prefetch mode: a queued request whose device prefix
+    # shrank since its enqueue-time lookup (device eviction while it waited)
+    # looks the lost range up again before admission, as HiCache storage does.
+    SGLANG_EXTERNAL_LINKER_REQUERY_ON_DEVICE_LOSS = EnvBool(False)
+    # External linker prefetch mode: log lookup counters (issued, skipped for a
+    # device anchor with no storage hash, zero restorable, re-queried) every 60 s.
+    SGLANG_EXTERNAL_LINKER_LOOKUP_STATS = EnvBool(False)
     # Buffer mode: store only the SWA window ending at each node (what a
     # prefetch ending there restores) instead of every SWA page.
     SGLANG_ENABLE_HICACHE_SWA_TAIL_ONLY_BACKUP = EnvBool(False)

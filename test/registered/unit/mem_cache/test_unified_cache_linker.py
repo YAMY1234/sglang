@@ -606,6 +606,91 @@ class TestLinkerDevicePrefetch(CustomTestCase):
                 cache.linker.release_request(req.cache_request_handle)
                 self._assert_balanced(cache, allocator)
 
+    def _admit_poll(self, cache, req):
+        # The admission loop re-matches the device before it re-queries.
+        req.init_next_round_input(cache, cow_mamba=False)
+        scheduler = SimpleNamespace(tree_cache=cache)
+        return Scheduler._linker_requery_after_device_loss(scheduler, req)
+
+    def _land_last_prefetch(self, cache, backend, req):
+        backend.prefetch_futures[-1].set_result(True)
+        cache.check_hicache_events()
+        assert cache.check_prefetch_progress(req.cache_request_handle)
+
+    def _admit_and_release(self, cache, req):
+        handle = req.cache_request_handle
+        cache.release_prefetch_hold(handle, self._match(cache, req).device_prefix_len)
+        cache.linker.release_request(handle)
+
+    def test_partial_device_match_looks_up_the_rest_from_its_hash(self):
+        """A device match covering part of the prefix anchors the store lookup at
+        the matched node's hash; the lookup is not skipped for want of one."""
+        cache, backend, first, allocator = self._fixture()
+        backend.restorable = [1, 2]
+        self._publish(cache, backend, first)
+        self._admit_and_release(cache, first)
+        req = self._request(rid="next-turn")
+        backend.restorable = [1]
+        self._enqueue(cache, req)
+        assert req.prefix_len == 4
+        assert cache.get_last_hash_value(req.last_node) is not None
+        stats = cache.linker._lookup_stats
+        assert (stats["issued"], stats["skipped_no_hash"]) == (2, 0)
+        (kv,) = [t for t in backend.lookup.call_args.args[1] if t.name == PoolName.KV]
+        assert len(kv.keys) == 1
+        self._land_last_prefetch(cache, backend, req)
+        assert self._match(cache, req).device_prefix_len == 6
+        self._admit_and_release(cache, req)
+        self._assert_balanced(cache, allocator)
+        cache.sanity_check()
+
+    def test_device_loss_while_queued_requeries_the_store(self):
+        """A prefix the device held at enqueue but lost before admission is looked
+        up again with the re-query on; off, the request is admitted without it."""
+        from sglang.srt.environ import envs
+
+        for requery in (False, True):
+            with (
+                self.subTest(requery=requery),
+                envs.SGLANG_EXTERNAL_LINKER_REQUERY_ON_DEVICE_LOSS.override(requery),
+            ):
+                cache, backend, first, allocator = self._fixture()
+                self._publish(cache, backend, first)
+                self._admit_and_release(cache, first)
+                lookups = backend.lookup.call_count
+                req = self._request(rid="next-turn")
+                self._enqueue(cache, req)
+                # The device holds the whole prefix at enqueue: nothing to look up.
+                assert backend.lookup.call_count == lookups
+                cache.evict(EvictParams(num_tokens=6))
+                assert self._admit_poll(cache, req) is requery
+                assert req.prefix_len == 0
+                if requery:
+                    assert backend.lookup.call_count == lookups + 1
+                    self._land_last_prefetch(cache, backend, req)
+                    assert self._match(cache, req).device_prefix_len == 6
+                    assert cache.linker._lookup_stats["requeried"] == 1
+                self._admit_and_release(cache, req)
+                assert not self._admit_poll(cache, req)
+                self._assert_balanced(cache, allocator)
+                cache.sanity_check()
+
+    def test_unheld_load_evicted_before_admission_requeries(self):
+        """A load published without a hold and evicted while its request waits is
+        looked up again: the re-query target covers the loaded range."""
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_EXTERNAL_LINKER_REQUERY_ON_DEVICE_LOSS.override(True):
+            cache, backend, req, allocator = self._fixture()
+            self._publish(cache, backend, req)
+            cache.evict(EvictParams(num_tokens=6))
+            assert self._admit_poll(cache, req)
+            self._land_last_prefetch(cache, backend, req)
+            assert self._match(cache, req).device_prefix_len == 6
+            self._admit_and_release(cache, req)
+            self._assert_balanced(cache, allocator)
+            cache.sanity_check()
+
     def _gated_lookup(self, backend):
         """Make the fixture's store lookup block until the returned gate opens."""
         gate = threading.Event()

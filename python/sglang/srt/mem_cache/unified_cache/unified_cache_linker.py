@@ -376,6 +376,18 @@ class UnifiedCacheLinkerWrapper:
             0,
         )
         self._hold_next_log = 0.0
+        # Queued request -> the prefix its enqueue-time lookup left on device
+        # (device match plus the accepted load); a shorter match at admission re-queries.
+        self.requery_on_device_loss = (
+            self.load_mode == "prefetch"
+            and envs.SGLANG_EXTERNAL_LINKER_REQUERY_ON_DEVICE_LOSS.get()
+        )
+        self.match_targets: dict[CacheRequestHandle, int] = {}
+        self.log_lookup_stats = envs.SGLANG_EXTERNAL_LINKER_LOOKUP_STATS.get()
+        self._lookup_stats = dict.fromkeys(
+            ("issued", "skipped_no_hash", "zero_restorable", "requeried"), 0
+        )
+        self._lookup_next_log = 0.0
         if self.hold_cap_tokens:
             logger.info(
                 "External linker prefetch holds on: up to %d tokens (%.2f of the "
@@ -491,8 +503,13 @@ class UnifiedCacheLinkerWrapper:
             limit=req._compute_max_prefix_len(len(req.full_untruncated_fill_ids)),
         ).page_aligned(page)
         start = req.prefix_len
+        if self.requery_on_device_loss:
+            self.match_targets[request] = start
         last_hash = self.cache.get_last_hash_value(req.last_node)
-        if len(key) <= start or (start and last_hash is None):
+        if len(key) <= start:
+            return
+        if start and last_hash is None:
+            self._lookup_stats["skipped_no_hash"] += 1
             return
         hashes = get_storage_hash_str(key[start:], last_hash, page_size=page)
         lookups = [
@@ -505,6 +522,8 @@ class UnifiedCacheLinkerWrapper:
             self.cache.prefetch_timeout_base
             + len(hashes) * self.cache.prefetch_timeout_per_page
         )
+        self._lookup_stats["issued"] += 1
+        self._log_lookup_stats()
         if self._lookup_executor is not None:
             # The anchor stays locked while the lookup runs, as for a load.
             self.lookups[request] = _PendingLookup(
@@ -546,9 +565,12 @@ class UnifiedCacheLinkerWrapper:
             restorable, num_pages=len(hashes), device_hit_pages=0
         )
         if not pages:
+            self._lookup_stats["zero_restorable"] += 1
             self.cache.dec_lock_ref(anchor_node_id, anchor_lock)
             return
         end = start + pages * page
+        if request in self.match_targets:
+            self.match_targets[request] = end
         state = _ExternalCachePrefetch(
             key[:end],
             anchor_node_id,
@@ -631,6 +653,32 @@ class UnifiedCacheLinkerWrapper:
                 return False
         self._cancel_lookup(request)
         return True
+
+    def requery_after_device_loss(self, req: Req) -> bool:
+        """Look up again the prefix ``req`` lost on device since its last lookup.
+
+        True while the new lookup or load runs, so the request waits for it.
+        """
+        request = req.cache_request_handle
+        target = self.match_targets.get(request)
+        if (
+            target is None
+            or req.prefix_len >= target
+            or request in self.prefetches
+            or request in self.lookups
+            or request in self.holds
+        ):
+            return False
+        self._lookup_stats["requeried"] += 1
+        self.prefetch(req)
+        return request in self.prefetches or request in self.lookups
+
+    def _log_lookup_stats(self) -> None:
+        now = time.monotonic()
+        if not self.log_lookup_stats or now < self._lookup_next_log:
+            return
+        self._lookup_next_log = now + 60.0
+        logger.info("External linker lookups: %s", self._lookup_stats)
 
     def _cancel_lookup(self, request: CacheRequestHandle) -> None:
         lookup = self.lookups.pop(request, None)
@@ -794,6 +842,7 @@ class UnifiedCacheLinkerWrapper:
         self, request: CacheRequestHandle, *, admitted: bool, prefix_len: int = 0
     ) -> None:
         stats = self._hold_stats
+        self.match_targets.pop(request, None)
         end = self.unheld.pop(request, None)
         if end is not None and admitted:
             # An unheld prefix the request no longer matches in full was evicted.
@@ -1125,6 +1174,7 @@ class UnifiedCacheLinkerWrapper:
         for request in list(self.holds):
             self.release_hold(request, admitted=False)
         self.unheld.clear()
+        self.match_targets.clear()
         self.hit_markers.clear()
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()

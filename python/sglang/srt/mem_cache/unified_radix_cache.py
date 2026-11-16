@@ -2951,6 +2951,12 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.linker is not None and self.linker.load_mode == "prefetch":
             self.linker.release_hold(request, admitted=True, prefix_len=prefix_len)
 
+    @rank_consensus(same_params=["req.rid"], same_results=True)
+    def requery_prefetch_after_device_loss(self, req: Req) -> bool:
+        if self.linker is None or self.linker.load_mode != "prefetch":
+            return False
+        return self.linker.requery_after_device_loss(req)
+
     @rank_consensus(same_params=True, same_results=True)
     def check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
         if self.linker is not None and self.linker.load_mode == "prefetch":
