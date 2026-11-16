@@ -567,12 +567,13 @@ def _kda_autotuners() -> dict:
     return tuners
 
 
-def _verify_autotune_choices(kernel, ssm_states, lower_bound, dtype) -> None:
-    """Debug: autotune the precompile again now (GPU idle, no disk results)
-    and log whether every key picks the config the side thread picked."""
-    start = time.perf_counter()
+def _retune_idle(kernel, ssm_states, lower_bound, dtype) -> tuple[dict, dict]:
+    """Drop the FLA autotuners' choices and autotune the precompile calls again
+    with the GPU idle, skipping results cached on disk: the kernels are already
+    compiled, so this only benchmarks. Returns the tuners and their choices
+    from before."""
     tuners = _kda_autotuners()
-    first = {name: dict(t.cache) for name, t in tuners.items() if t.cache}
+    before = {name: dict(t.cache) for name, t in tuners.items() if t.cache}
     saved = {name: t.cache_results for name, t in tuners.items()}
     for t in tuners.values():
         t.cache.clear()
@@ -582,24 +583,29 @@ def _verify_autotune_choices(kernel, ssm_states, lower_bound, dtype) -> None:
     finally:
         for name, t in tuners.items():
             t.cache_results = saved[name]
-    keys = differ = 0
-    for name, choices in first.items():
+    return tuners, before
+
+
+def _same_choices(tuners: dict, before: dict, label: str) -> tuple[int, int]:
+    """How many of ``before``'s keys the tuners now resolve to the same config;
+    logs each one that differs."""
+    keys = same = 0
+    for name, choices in before.items():
         for key, config in choices.items():
             keys += 1
-            again = tuners[name].cache.get(key)
-            if str(again) != str(config):
-                differ += 1
-                logger.warning(
-                    "KDA autotune differs for %s %s: side thread %s, idle %s",
+            now = tuners[name].cache.get(key)
+            if str(now) == str(config):
+                same += 1
+            else:
+                logger.info(
+                    "KDA autotune %s differs for %s %s: %s, then %s",
+                    label,
                     name,
                     key,
                     config,
-                    again,
+                    now,
                 )
-    rank0_log(
-        "KDA precompile autotune check: %d of %d keys picked the same config "
-        "with the GPU idle (%.1f s)" % (keys - differ, keys, time.perf_counter() - start)
-    )
+    return same, keys
 
 
 def ragged_verify_dense_scatter_indices(
@@ -742,18 +748,36 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 raise _triton_extend_precompile.pop("error")
             layout = _triton_extend_precompile["layout"]
             if layout == _state_layout(ssm_states):
+                # Contention with weight loading skews the side thread's
+                # benchmarks, so pick configs again with the GPU idle, as a
+                # precompile-free run does (Rhea 57145: 2-4 of 6 keys moved).
+                retune = time.perf_counter()
+                tuners, overlapped = _retune_idle(
+                    TritonKDAKernel(), ssm_states, lower_bound, dtype
+                )
                 rank0_log(
                     "KDA Triton extend precompiled on a side thread during weight "
-                    "loading in %.1f s (%d calls, waited %.1f s at backend init)"
+                    "loading in %.1f s (%d calls, waited %.1f s at backend init), "
+                    "re-tuned with the GPU idle in %.1f s"
                     % (
                         _triton_extend_precompile["seconds"],
                         len(_TRITON_EXTEND_PRECOMPILE_CALLS),
                         waited,
+                        time.perf_counter() - retune,
                     )
                 )
                 if envs.SGLANG_KDA_PRECOMPILE_VERIFY_CONFIGS.get():
-                    _verify_autotune_choices(
+                    moved = _same_choices(tuners, overlapped, "overlapped vs idle")
+                    _, idle = _retune_idle(
                         TritonKDAKernel(), ssm_states, lower_bound, dtype
+                    )
+                    noise = _same_choices(tuners, idle, "idle vs idle")
+                    logger.info(
+                        "KDA autotune check: %d of %d keys kept their config from "
+                        "the overlapped tune to the idle one, %d of %d between two "
+                        "idle tunes",
+                        *moved,
+                        *noise,
                     )
                 return
             logger.warning(

@@ -245,9 +245,12 @@ class TestKDATritonExtendPrecompile(unittest.TestCase):
             "sglang.srt.configs.hybrid_arch.hybrid_kda_config", return_value=config
         ), patch.object(
             kda_backend, "_run_triton_extend_precompile", return_value=1.0
-        ) as inline, patch.object(kda_backend, "rank0_log"):
+        ) as inline, patch.object(kda_backend, "rank0_log"), patch.object(
+            kda_backend, "_retune_idle", return_value=({}, {})
+        ) as retune:
             backend._precompile_triton_extend(runner)
             left = dict(kda_backend._triton_extend_precompile)
+        self.retune = retune
         return inline, left
 
     def test_side_thread_result_is_used_when_the_pool_layout_matches(self):
@@ -259,6 +262,7 @@ class TestKDATritonExtendPrecompile(unittest.TestCase):
         )
         thread.join.assert_called_once()
         inline.assert_not_called()
+        self.retune.assert_called_once()  # configs picked again with the GPU idle
         self.assertNotIn("thread", left)
 
     def test_a_different_pool_layout_precompiles_again_on_the_pool(self):
@@ -271,6 +275,7 @@ class TestKDATritonExtendPrecompile(unittest.TestCase):
         inline.assert_called_once_with(
             backend.kernel_dispatcher.triton_kernel, state, -5.0, torch.bfloat16
         )
+        self.retune.assert_not_called()  # the inline precompile already tuned idle
 
     def test_a_side_thread_failure_is_raised_at_backend_init(self):
         with self.assertRaisesRegex(RuntimeError, "compile failed"):
@@ -287,6 +292,35 @@ class TestKDATritonExtendPrecompile(unittest.TestCase):
         self.assertEqual(
             [c.args[1:] for c in backend.kernel_dispatcher.effective_extend_kernel.call_args_list],
             [(n, n) for n, _ in kda_backend._TRITON_EXTEND_PRECOMPILE_CALLS],
+        )
+
+
+class _Tuner:
+    def __init__(self, cache, cache_results=True):
+        self.cache, self.cache_results = dict(cache), cache_results
+
+
+class TestKDAIdleRetune(unittest.TestCase):
+    def test_retune_drops_choices_and_disk_results_then_restores_disk_results(self):
+        tuners = {"kda.o": _Tuner({"k1": "A"}), "kda.w": _Tuner({}, False)}
+        seen = []
+
+        def tune(*args):
+            seen.append({n: (dict(t.cache), t.cache_results) for n, t in tuners.items()})
+            tuners["kda.o"].cache["k1"] = "B"
+
+        with patch.object(
+            kda_backend, "_kda_autotuners", return_value=tuners
+        ), patch.object(kda_backend, "_run_triton_extend_precompile", side_effect=tune):
+            got, before = kda_backend._retune_idle(None, None, None, None)
+        self.assertEqual(seen, [{"kda.o": ({}, False), "kda.w": ({}, False)}])
+        self.assertEqual(before, {"kda.o": {"k1": "A"}})
+        self.assertEqual(
+            (tuners["kda.o"].cache_results, tuners["kda.w"].cache_results), (True, False)
+        )
+        self.assertEqual(kda_backend._same_choices(got, before, "overlapped"), (0, 1))
+        self.assertEqual(
+            kda_backend._same_choices(got, {"kda.o": {"k1": "B"}}, "idle"), (1, 1)
         )
 
 
