@@ -354,5 +354,24 @@ def test_region_stores_the_joined_projection():
     assert torch.equal(kw["cache_loc_2d"], io.out_cache_loc.view(2, STRIDE))
 
 
+
+def test_region_keys_cover_every_verify_graph_size():
+    """A rank that ramps through more verify graph sizes than MAX_GRAPHS still warms
+    (and then captures) a region for each of them."""
+    sizes = list(range(1, sag.DsparkSamplingAcceptGraph.MAX_GRAPHS + 20))
+    epi = SimpleNamespace(static_io=dict.fromkeys(sizes))
+    graph = sag.DsparkSamplingAcceptGraph(
+        epilogue=epi,
+        resolve_draft_sampler=lambda: None,
+        tp_sync=_tp_sync(),
+        block_verification=False,
+        device="cpu",
+        rank_local=True,
+    )
+    for bs in sizes:
+        graph._run(bs, lambda: None)
+    assert len(graph._warmed_up) == len(sizes)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

@@ -240,6 +240,13 @@ class DsparkSamplingAcceptGraph:
             forks.join_all()
         return committed
 
+    def _max_graphs(self) -> int:
+        # A DP rank's batch ramps through the small verify graph sizes first, so a cap
+        # below their count would leave the large (steady-state) ones eager.
+        if self._rank_local:
+            return max(self.MAX_GRAPHS, len(self._epilogue.static_io))
+        return self.MAX_GRAPHS
+
     def _fallback(self, reason: str) -> None:
         """Count an eager step by reason; the first of each reason is logged."""
         n = self.eager_fallbacks.get(reason, 0) + 1
@@ -252,7 +259,7 @@ class DsparkSamplingAcceptGraph:
         graph = self._graphs.get(key)
         if graph is None:
             if key not in self._warmed_up:
-                if len(self._warmed_up) < self.MAX_GRAPHS:
+                if len(self._warmed_up) < self._max_graphs():
                     self._warmed_up.add(key)
                 region()
                 return
