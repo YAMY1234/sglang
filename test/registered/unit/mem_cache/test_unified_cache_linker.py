@@ -2,6 +2,7 @@ import ctypes
 import queue
 import sys
 import threading
+import time
 import unittest
 from array import array
 from collections import defaultdict
@@ -789,6 +790,102 @@ class TestLinkerDevicePrefetch(CustomTestCase):
                         future.set_result(False)
                 cache.check_hicache_events()
                 self._assert_balanced(cache, allocator)
+
+    def _resident(self, cache, backend, rid, start):
+        """Publish a 6-token prefix for ``rid``, admit it, and return its next turn."""
+        first = self._request(rid=rid, start=start)
+        self._enqueue(cache, first)
+        backend.prefetch_futures[-1].set_result(True)
+        cache.check_hicache_events()
+        assert cache.check_prefetch_progress(first.cache_request_handle)
+        self._admit_and_release(cache, first)
+        nxt = self._request(rid=rid + "-next", start=start)
+        self._enqueue(cache, nxt)
+        assert nxt.prefix_len == 6
+        return nxt
+
+    def test_queue_lock_keeps_a_queued_device_prefix_until_admission(self):
+        """A queued request's resident prefix stays locked through eviction until
+        it is admitted; then it is evictable again."""
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_EXTERNAL_LINKER_QUEUE_LOCK_FRACTION.override(0.5):
+            cache, backend, _, allocator = self._fixture()
+            req = self._resident(cache, backend, "a", 1)
+            cache.protect_queued_prefixes([req])
+            linker = cache.linker
+            assert list(linker.qlocks) == [req.cache_request_handle]
+            assert linker.qlocked_tokens == 6
+            cache.evict(EvictParams(num_tokens=32))
+            assert self._match(cache, req).device_prefix_len == 6
+            self._admit_and_release(cache, req)
+            assert not linker.qlocks and linker._qlock_stats["released_admitted"] == 1
+            cache.evict(EvictParams(num_tokens=32))
+            assert self._match(cache, req).device_prefix_len == 0
+            self._assert_balanced(cache, allocator)
+            cache.sanity_check()
+
+    def test_queue_lock_budget_covers_the_head_of_the_queue_first(self):
+        """Locks go to the requests next in line while their tokens fit the cap;
+        a later request is locked once an earlier one is admitted."""
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_EXTERNAL_LINKER_QUEUE_LOCK_FRACTION.override(0.25):
+            cache, backend, _, allocator = self._fixture()
+            queued = [self._resident(cache, backend, f"q{i}", 1 + 10 * i) for i in range(2)]
+            linker = cache.linker
+            assert linker.qlock_cap_tokens == 8
+            cache.protect_queued_prefixes(queued)
+            assert list(linker.qlocks) == [queued[0].cache_request_handle]
+            self._admit_and_release(cache, queued[0])
+            cache.protect_queued_prefixes(queued[1:])
+            assert list(linker.qlocks) == [queued[1].cache_request_handle]
+            self._admit_and_release(cache, queued[1])
+            self._assert_balanced(cache, allocator)
+
+    def test_queue_lock_depth_follows_the_admission_rate(self):
+        """The window holds about qlock_seconds of the observed admissions."""
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_EXTERNAL_LINKER_QUEUE_LOCK_FRACTION.override(0.5):
+            cache, backend, _, allocator = self._fixture()
+            queued = [self._resident(cache, backend, f"d{i}", 1 + 10 * i) for i in range(2)]
+            linker = cache.linker
+            now = time.monotonic()
+            linker._admit_times.clear()
+            linker._admit_times.extend([now - 10.0, now - 5.0])
+            linker.qlock_seconds = 4.0
+            cache.protect_queued_prefixes(queued)
+            assert list(linker.qlocks) == [queued[0].cache_request_handle]
+            for req in queued:
+                self._admit_and_release(cache, req)
+            self._assert_balanced(cache, allocator)
+
+    def test_queue_lock_requeries_a_lost_prefix_ahead_of_admission(self):
+        """A request that lost its prefix before the window reached it is looked up
+        again when the window does, not when it reaches admission."""
+        from sglang.srt.environ import envs
+
+        with (
+            envs.SGLANG_EXTERNAL_LINKER_QUEUE_LOCK_FRACTION.override(0.5),
+            envs.SGLANG_EXTERNAL_LINKER_REQUERY_ON_DEVICE_LOSS.override(True),
+        ):
+            cache, backend, _, allocator = self._fixture()
+            req = self._resident(cache, backend, "l", 1)
+            linker = cache.linker
+            assert linker.match_targets[req.cache_request_handle] == 6
+            cache.evict(EvictParams(num_tokens=32))
+            lookups = backend.lookup.call_count
+            cache.protect_queued_prefixes([req])
+            assert not linker.qlocks
+            assert linker._qlock_stats["lookahead_requeries"] == 1
+            assert req.cache_request_handle in linker._pending_requeries
+            cache.check_hicache_events()
+            assert backend.lookup.call_count == lookups + 1
+            self._land_last_prefetch(cache, backend, req)
+            assert self._match(cache, req).device_prefix_len == 6
+            self._admit_and_release(cache, req)
+            self._assert_balanced(cache, allocator)
 
     def test_expired_poll_starts_no_load(self):
         """An admission poll that stops an expired prefetch settles reads but

@@ -4225,6 +4225,8 @@ class Scheduler(
             or self.enable_lmcache
         ):
             self.tree_cache.check_hicache_events()
+            if self.enable_unified_cache_external_linker:
+                self.tree_cache.protect_queued_prefixes(self.waiting_queue)
             if self.enable_hicache_storage and should_retry_storage_prefetch:
                 self._process_storage_prefetch_retries()
 
