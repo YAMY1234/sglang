@@ -573,9 +573,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
             )
 
     # One-token-per-sequence batch sizes: 1 and 2 sequences take the fused
-    # small-grid inter_solve (NT * H <= 256 at H = 96), 3 and 16 the unfused one;
-    # T == 1, T % 16 == 0 and neither are Triton's integer specializations.
-    _TRITON_EXTEND_PRECOMPILE_SEQS = (1, 2, 3, 16)
+    # small-grid inter_solve (NT * H <= 256 at H = 96), 3 and more the unfused
+    # one; T == 1, T % 16 == 0 and neither are Triton's integer specializations,
+    # and past 32 sequences chunk_gated_delta_rule_fwd_h compiles another variant
+    # (a 1-GPU check at H = 96, K = V = 128 left no miss for 1-100 sequences).
+    _TRITON_EXTEND_PRECOMPILE_SEQS = (1, 2, 3, 16, 33)
 
     def _precompile_triton_extend(self, model_runner: ModelRunner) -> None:
         """Run the Triton extend that effective_extend_kernel picks for
@@ -601,22 +603,36 @@ class KDAAttnBackend(MambaAttnBackendBase):
             assert self.kernel_dispatcher.effective_extend_kernel(
                 lower_bound, num_seqs, num_seqs
             ) is self.kernel_dispatcher.triton_kernel
-            # Contiguous Q/K/V planes (SGLANG_KDA_PREFILL_CONV_QKV_PLANES) and
-            # views into one packed conv output.
+            # Q/K/V as contiguous planes (SGLANG_KDA_PREFILL_CONV_QKV_PLANES) or
+            # as views into one packed conv output; gate and beta as their own
+            # tensors or as views into one fused projection output. Strides
+            # change Triton's integer specializations, not the autotune keys.
             packed = torch.zeros(
                 num_seqs, 2 * q_dim + v_dim, dtype=dtype, device=device
             )
-            for q, k, v in (
-                (packed.new_zeros(num_seqs, q_dim),) * 2
-                + (packed.new_zeros(num_seqs, v_dim),),
-                packed.split([q_dim, q_dim, v_dim], dim=-1),
+            planes = (packed.new_zeros(num_seqs, q_dim),) * 2 + (
+                packed.new_zeros(num_seqs, v_dim),
+            )
+            gate_beta = packed.new_zeros(num_seqs, q_dim + num_heads)
+            own = (
+                packed.new_zeros(1, num_seqs, num_heads, head_k_dim),
+                packed.new_zeros(1, num_seqs, num_heads),
+            )
+            views = (
+                gate_beta[:, :q_dim].unflatten(-1, (num_heads, head_k_dim))[None],
+                gate_beta[:, q_dim:][None],
+            )
+            for (q, k, v), (g, beta) in (
+                (planes, own),
+                (packed.split([q_dim, q_dim, v_dim], dim=-1), own),
+                (planes, views),
             ):
                 self.kernel_dispatcher.extend(
                     q=q.unflatten(-1, (num_heads, head_k_dim)).unsqueeze(0),
                     k=k.unflatten(-1, (num_heads, head_k_dim)).unsqueeze(0),
                     v=v.unflatten(-1, (num_heads, head_v_dim)).unsqueeze(0),
-                    g=packed.new_zeros(1, num_seqs, num_heads, head_k_dim),
-                    beta=packed.new_zeros(1, num_seqs, num_heads),
+                    g=g,
+                    beta=beta,
                     ssm_states=ssm_states,
                     cache_indices=torch.zeros(
                         num_seqs, dtype=torch.int32, device=device
