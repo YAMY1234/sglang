@@ -650,6 +650,52 @@ class TestLinkerDevicePrefetch(CustomTestCase):
             assert len(backend.prefetch_futures) == 1
             self._assert_balanced(cache, allocator)
 
+    def test_async_lookup_drain_survives_a_refused_load(self):
+        """Two finished lookups, the first refused at load: the refusal must not
+        re-enter the drain, and the second still starts its load."""
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_EXTERNAL_LINKER_ASYNC_LOOKUP_THREADS.override(1):
+            cache, backend, first, allocator = self._fixture()
+            gate = self._gated_lookup(backend)
+            second = self._request("second", start=100)
+            for req in (first, second):
+                self._enqueue(cache, req)
+            gate.set()
+            for lookup in list(cache.linker.lookups.values()):
+                lookup.future.result(timeout=5)
+
+            def submit(transfers):
+                if not backend.prefetch.call_count - 1:
+                    return None  # the first load is refused
+                future = Future()
+                backend.prefetch_futures.append(future)
+                return future
+
+            backend.prefetch = MagicMock(side_effect=submit)
+            depth = [0, 0]
+            drain = cache.linker._drain_lookups
+
+            def tracked():
+                depth[0] += 1
+                depth[1] = max(depth[1], depth[0])
+                try:
+                    return drain()
+                finally:
+                    depth[0] -= 1
+
+            cache.linker._drain_lookups = tracked
+            cache.check_hicache_events()
+            assert depth[1] == 1
+            assert backend.prefetch.call_count == 2 and not cache.linker.lookups
+            assert list(cache.linker.prefetches) == [second.cache_request_handle]
+            for future in backend.prefetch_futures:
+                future.set_result(True)
+            cache.check_hicache_events()
+            for req in (first, second):
+                cache.linker.release_request(req.cache_request_handle)
+            self._assert_balanced(cache, allocator)
+
     def test_failure_falls_back_but_pending_peer_keeps_private_slots(self):
         for outcome, mamba in product(
             ("local-failure", "peer-failure", "peer-pending"), (False, True)

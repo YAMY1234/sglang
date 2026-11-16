@@ -344,6 +344,7 @@ class UnifiedCacheLinkerWrapper:
         self.prefetches: dict[CacheRequestHandle, _ExternalCachePrefetch] = {}
         # Store lookups in flight on worker threads, in submission order.
         self.lookups: dict[CacheRequestHandle, _PendingLookup] = {}
+        self._draining_lookups = False
         lookup_threads = envs.SGLANG_EXTERNAL_LINKER_ASYNC_LOOKUP_THREADS.get()
         self._lookup_executor = (
             ThreadPoolExecutor(lookup_threads, thread_name_prefix="linker-lookup")
@@ -562,7 +563,10 @@ class UnifiedCacheLinkerWrapper:
         self.cache._all_reduce_attn_groups(accepted, torch.distributed.ReduceOp.MIN)
         if not accepted.item():
             self._cancel_prefetch(request)
-            self.check_prefetch_events()
+            # A lookup drain is inside check_prefetch_events, which settles the
+            # cancelled read right after it; re-entering would rerun the drain.
+            if not self._draining_lookups:
+                self.check_prefetch_events()
 
     def has_pending_prefetch(self) -> bool:
         return bool(self.prefetches or self.lookups)
@@ -630,25 +634,31 @@ class UnifiedCacheLinkerWrapper:
         pending = list(self.lookups.items())
         done = torch.tensor([lk.future.done() for _, lk in pending], dtype=torch.int)
         self.cache._all_reduce_attn_groups(done, torch.distributed.ReduceOp.MIN)
-        for (request, lookup), finished in zip(pending, done.tolist()):
-            if not finished:
-                continue
-            del self.lookups[request]
-            try:
-                restorable = lookup.future.result()
-            except Exception:
-                logger.warning("External linker prefetch lookup failed", exc_info=True)
-                restorable = []
-            self._start_prefetch_load(
-                request,
-                lookup.key,
-                lookup.hashes,
-                lookup.start,
-                lookup.anchor_node_id,
-                lookup.anchor_lock,
-                restorable,
-                lookup.timeout_s,
-            )
+        self._draining_lookups = True
+        try:
+            for (request, _), finished in zip(pending, done.tolist()):
+                lookup = self.lookups.pop(request, None) if finished else None
+                if lookup is None:
+                    continue
+                try:
+                    restorable = lookup.future.result()
+                except Exception:
+                    logger.warning(
+                        "External linker prefetch lookup failed", exc_info=True
+                    )
+                    restorable = []
+                self._start_prefetch_load(
+                    request,
+                    lookup.key,
+                    lookup.hashes,
+                    lookup.start,
+                    lookup.anchor_node_id,
+                    lookup.anchor_lock,
+                    restorable,
+                    lookup.timeout_s,
+                )
+        finally:
+            self._draining_lookups = False
 
     def _cancel_prefetch(self, request: CacheRequestHandle) -> None:
         self._cancel_lookup(request)
