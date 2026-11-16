@@ -386,8 +386,14 @@ class UnifiedCacheLinkerWrapper:
         self.match_targets: dict[CacheRequestHandle, int] = {}
         self.log_lookup_stats = envs.SGLANG_EXTERNAL_LINKER_LOOKUP_STATS.get()
         self._lookup_stats = dict.fromkeys(
-            ("issued", "skipped_no_hash", "zero_restorable", "requeried"), 0
+            ("issued", "skipped_no_hash", "zero_restorable", "requeried", "load_capped"),
+            0,
         )
+        # Re-queries wait for the next event-loop boundary, so no load starts
+        # inside the admission loop after the batch budget was taken.
+        self._pending_requeries: dict[CacheRequestHandle, Req] = {}
+        # Device tokens held by in-flight loads plus holds, at their peak since the last log line.
+        self._occupied_peak = 0
         self._lookup_next_log = 0.0
         # Re-queried request -> when its re-query started; waits until publication (s).
         self._requery_started: dict[CacheRequestHandle, float] = {}
@@ -601,6 +607,16 @@ class UnifiedCacheLinkerWrapper:
         end = start + pages * page
         if request in self.match_targets:
             self.match_targets[request] = end
+        if self.hold_cap_tokens:
+            # In-flight private slots plus holds stay under the hold cap, except that
+            # one load may always run; a refused load keeps its target at `end`, so
+            # the admission re-query retries it.
+            occupied = self.prefetch_size(PoolName.KV) + self.held_tokens
+            if occupied and occupied + pages * page > self.hold_cap_tokens:
+                self._lookup_stats["load_capped"] += 1
+                self.cache.dec_lock_ref(anchor_node_id, anchor_lock)
+                return
+            self._occupied_peak = max(self._occupied_peak, occupied + pages * page)
         state = _ExternalCachePrefetch(
             key[:end],
             anchor_node_id,
@@ -630,7 +646,7 @@ class UnifiedCacheLinkerWrapper:
             # A lookup drain is inside check_prefetch_events, which settles the
             # cancelled read right after it; re-entering would rerun the drain.
             if not self._draining_lookups:
-                self.check_prefetch_events()
+                self.check_prefetch_events(drain_lookups=False)
 
     def has_pending_prefetch(self) -> bool:
         return bool(self.prefetches or self.lookups)
@@ -658,7 +674,8 @@ class UnifiedCacheLinkerWrapper:
                 return False
         # Consume any fully completed read before stopping. Running reads keep
         # their private slots until every rank has stopped writing to them.
-        self.check_prefetch_events()
+        # Admission polls this: start no new load here.
+        self.check_prefetch_events(drain_lookups=False)
         self._cancel_prefetch(request)
         return True
 
@@ -687,7 +704,8 @@ class UnifiedCacheLinkerWrapper:
     def requery_after_device_loss(self, req: Req) -> bool:
         """Look up again the prefix ``req`` lost on device since its last lookup.
 
-        True while the new lookup or load runs, so the request waits for it.
+        True while the re-query waits for the next event-loop boundary, where
+        its lookup starts; the request then waits on that lookup and its load.
         """
         request = req.cache_request_handle
         target = self.match_targets.get(request)
@@ -699,17 +717,25 @@ class UnifiedCacheLinkerWrapper:
             or request in self.holds
         ):
             return False
+        if request in self._pending_requeries:
+            return True
         self._lookup_stats["requeried"] += 1
-        started = time.perf_counter()
+        self._pending_requeries[request] = req
+        if self.log_lookup_stats:
+            self._requery_started[request] = time.perf_counter()
+        return True
+
+    def _start_pending_requeries(self) -> None:
+        """At the event-loop boundary: look up again the requests admission deferred."""
+        pending, self._pending_requeries = self._pending_requeries, {}
         self._lookup_kind = "rq"
         try:
-            self.prefetch(req)
+            for request, req in pending.items():
+                self.prefetch(req)
+                if request not in self.prefetches and request not in self.lookups:
+                    self._requery_started.pop(request, None)
         finally:
             self._lookup_kind = "enq"
-        pending = request in self.prefetches or request in self.lookups
-        if pending and self.log_lookup_stats:
-            self._requery_started[request] = started
-        return pending
 
     def _log_lookup_stats(self) -> None:
         now = time.monotonic()
@@ -737,13 +763,17 @@ class UnifiedCacheLinkerWrapper:
             self._phase_s[kind] = dict.fromkeys(phase, 0.0)
         logger.info(
             "External linker lookups: %s; re-query waits since last log: %d, "
-            "p50 %.3f s, p90 %.3f s; ms per lookup: %s",
+            "p50 %.3f s, p90 %.3f s; ms per lookup: %s; loads plus holds peak %d "
+            "of cap %d tokens",
             self._lookup_stats,
             len(waits),
             p50,
             p90,
             "; ".join(phases),
+            self._occupied_peak,
+            self.hold_cap_tokens,
         )
+        self._occupied_peak = 0
 
     def _cancel_lookup(self, request: CacheRequestHandle) -> None:
         lookup = self.lookups.pop(request, None)
@@ -805,8 +835,10 @@ class UnifiedCacheLinkerWrapper:
             if transfer.name == pool and transfer.device_indices is not None
         )
 
-    def check_prefetch_events(self) -> None:
-        self._drain_lookups()
+    def check_prefetch_events(self, drain_lookups: bool = True) -> None:
+        if drain_lookups:
+            self._start_pending_requeries()
+            self._drain_lookups()
         if not self.prefetches:
             return
         pending = list(self.prefetches.items())
@@ -1246,6 +1278,7 @@ class UnifiedCacheLinkerWrapper:
             self.release_hold(request, admitted=False)
         self.unheld.clear()
         self.match_targets.clear()
+        self._pending_requeries.clear()
         self._requery_started.clear()
         self.hit_markers.clear()
         self.inflight_load_rids.clear()
@@ -1261,6 +1294,7 @@ class UnifiedCacheLinkerWrapper:
     def release_request(self, request: CacheRequestHandle) -> None:
         rid = request.rid
         self.hit_markers.pop(rid, None)
+        self._pending_requeries.pop(request, None)
         self._requery_started.pop(request, None)
         self._cancel_prefetch(request)
         self.release_hold(request, admitted=False)
