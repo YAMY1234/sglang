@@ -695,6 +695,36 @@ class TestLinkerDevicePrefetch(CustomTestCase):
             self._assert_balanced(cache, allocator)
             cache.sanity_check()
 
+    def test_requery_with_async_lookup_waits_off_thread_then_loads(self):
+        """With async lookup, a re-query returns at once with its lookup pending,
+        and the request waits until the lookup and its load land."""
+        from sglang.srt.environ import envs
+
+        with (
+            envs.SGLANG_EXTERNAL_LINKER_REQUERY_ON_DEVICE_LOSS.override(True),
+            envs.SGLANG_EXTERNAL_LINKER_ASYNC_LOOKUP_THREADS.override(2),
+        ):
+            cache, backend, req, allocator = self._fixture()
+            handle = req.cache_request_handle
+            self._enqueue(cache, req)
+            cache.linker.lookups[handle].future.result(timeout=5)
+            cache.check_hicache_events()
+            self._land_last_prefetch(cache, backend, req)
+            cache.evict(EvictParams(num_tokens=6))
+            gate = self._gated_lookup(backend)
+            assert self._admit_poll(cache, req)
+            assert list(cache.linker.lookups) == [handle]
+            assert not cache.check_prefetch_progress(handle)
+            gate.set()
+            cache.linker.lookups[handle].future.result(timeout=5)
+            cache.check_hicache_events()
+            assert not cache.linker.lookups
+            self._land_last_prefetch(cache, backend, req)
+            assert self._match(cache, req).device_prefix_len == 6
+            self._admit_and_release(cache, req)
+            self._assert_balanced(cache, allocator)
+            cache.sanity_check()
+
     def _gated_lookup(self, backend):
         """Make the fixture's store lookup block until the returned gate opens."""
         gate = threading.Event()
