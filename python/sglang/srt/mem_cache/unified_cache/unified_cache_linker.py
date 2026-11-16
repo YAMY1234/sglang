@@ -287,6 +287,7 @@ class _PendingLookup:
     future: Future[list[int]]
     timeout_s: float = 0.0
     wait_started: float | None = None
+    kind: str = "enq"
 
 
 class _PrefetchHold(NamedTuple):
@@ -391,6 +392,9 @@ class UnifiedCacheLinkerWrapper:
         # Re-queried request -> when its re-query started; waits until publication (s).
         self._requery_started: dict[CacheRequestHandle, float] = {}
         self._requery_waits: list[float] = []
+        # Lookup kind ("enq" at enqueue, "rq" for a re-query) -> seconds per phase since the last log line.
+        self._lookup_kind = "enq"
+        self._phase_s = {k: dict.fromkeys(("n", "match", "keys", "rpc", "load"), 0.0) for k in ("enq", "rq")}
         if self.hold_cap_tokens:
             logger.info(
                 "External linker prefetch holds on: up to %d tokens (%.2f of the "
@@ -494,7 +498,11 @@ class UnifiedCacheLinkerWrapper:
                 self.release_hold(previous, admitted=False)
         if self.cache.disable or request in self.prefetches or request in self.lookups:
             return
+        timed = self.log_lookup_stats
+        kind = self._lookup_kind
+        t0 = time.perf_counter() if timed else 0.0
         req.init_next_round_input(self.cache, cow_mamba=False)
+        t1 = time.perf_counter() if timed else 0.0
         if is_virtual_node(req.last_node) or req.positional_embed_overrides is not None:
             return
         page = self.cache.page_size
@@ -521,6 +529,11 @@ class UnifiedCacheLinkerWrapper:
         ]
         if any(t is None for t in lookups):
             return
+        if timed:
+            phase = self._phase_s[kind]
+            phase["n"] += 1
+            phase["match"] += t1 - t0
+            phase["keys"] += time.perf_counter() - t1
         timeout_s = (
             self.cache.prefetch_timeout_base
             + len(hashes) * self.cache.prefetch_timeout_per_page
@@ -536,20 +549,34 @@ class UnifiedCacheLinkerWrapper:
                 req.last_node,
                 self.cache.inc_lock_ref(req.last_node).to_dec_params(),
                 self._lookup_executor.submit(
-                    self.cache_linker.lookup, req.rid, lookups
+                    self._timed_lookup, kind if timed else None, req.rid, lookups
                 ),
                 timeout_s=timeout_s,
+                kind=kind,
             )
             return
         try:
-            restorable = self.cache_linker.lookup(req.rid, lookups)
+            restorable = self._timed_lookup(kind if timed else None, req.rid, lookups)
         except Exception:
             logger.warning("External linker prefetch lookup failed", exc_info=True)
             restorable = []
         anchor_lock = self.cache.inc_lock_ref(req.last_node).to_dec_params()
+        t2 = time.perf_counter() if timed else 0.0
         self._start_prefetch_load(
             request, key, hashes, start, req.last_node, anchor_lock, restorable, timeout_s
         )
+        if timed:
+            self._phase_s[kind]["load"] += time.perf_counter() - t2
+
+    def _timed_lookup(self, kind, rid, lookups):
+        """The store lookup; with ``kind``, its time joins that kind's RPC phase (any thread)."""
+        if kind is None:
+            return self.cache_linker.lookup(rid, lookups)
+        t0 = time.perf_counter()
+        try:
+            return self.cache_linker.lookup(rid, lookups)
+        finally:
+            self._phase_s[kind]["rpc"] += time.perf_counter() - t0
 
     def _start_prefetch_load(
         self,
@@ -674,7 +701,11 @@ class UnifiedCacheLinkerWrapper:
             return False
         self._lookup_stats["requeried"] += 1
         started = time.perf_counter()
-        self.prefetch(req)
+        self._lookup_kind = "rq"
+        try:
+            self.prefetch(req)
+        finally:
+            self._lookup_kind = "enq"
         pending = request in self.prefetches or request in self.lookups
         if pending and self.log_lookup_stats:
             self._requery_started[request] = started
@@ -692,13 +723,26 @@ class UnifiedCacheLinkerWrapper:
             if waits
             else (0.0, 0.0)
         )
+        phases = []
+        for kind, phase in self._phase_s.items():
+            n = phase["n"]
+            phases.append(
+                f"{kind} n={int(n)}"
+                + "".join(
+                    f" {name} {1e3 * phase[name] / n:.1f}"
+                    for name in ("match", "keys", "rpc", "load")
+                    if n
+                )
+            )
+            self._phase_s[kind] = dict.fromkeys(phase, 0.0)
         logger.info(
             "External linker lookups: %s; re-query waits since last log: %d, "
-            "p50 %.3f s, p90 %.3f s",
+            "p50 %.3f s, p90 %.3f s; ms per lookup: %s",
             self._lookup_stats,
             len(waits),
             p50,
             p90,
+            "; ".join(phases),
         )
 
     def _cancel_lookup(self, request: CacheRequestHandle) -> None:
@@ -728,6 +772,7 @@ class UnifiedCacheLinkerWrapper:
                         "External linker prefetch lookup failed", exc_info=True
                     )
                     restorable = []
+                t0 = time.perf_counter() if self.log_lookup_stats else 0.0
                 self._start_prefetch_load(
                     request,
                     lookup.key,
@@ -738,6 +783,8 @@ class UnifiedCacheLinkerWrapper:
                     restorable,
                     lookup.timeout_s,
                 )
+                if self.log_lookup_stats:
+                    self._phase_s[lookup.kind]["load"] += time.perf_counter() - t0
         finally:
             self._draining_lookups = False
 
