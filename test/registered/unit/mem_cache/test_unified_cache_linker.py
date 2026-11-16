@@ -666,6 +666,9 @@ class TestLinkerDevicePrefetch(CustomTestCase):
                 assert self._admit_poll(cache, req) is requery
                 assert req.prefix_len == 0
                 if requery:
+                    # The lookup waits for the event-loop boundary, outside admission.
+                    assert backend.lookup.call_count == lookups
+                    cache.check_hicache_events()
                     assert backend.lookup.call_count == lookups + 1
                     self._land_last_prefetch(cache, backend, req)
                     assert self._match(cache, req).device_prefix_len == 6
@@ -688,6 +691,7 @@ class TestLinkerDevicePrefetch(CustomTestCase):
             self._publish(cache, backend, req)
             cache.evict(EvictParams(num_tokens=6))
             assert self._admit_poll(cache, req)
+            cache.check_hicache_events()
             self._land_last_prefetch(cache, backend, req)
             assert len(cache.linker._requery_waits) == 1
             rq = cache.linker._phase_s["rq"]
@@ -715,6 +719,8 @@ class TestLinkerDevicePrefetch(CustomTestCase):
             cache.evict(EvictParams(num_tokens=6))
             gate = self._gated_lookup(backend)
             assert self._admit_poll(cache, req)
+            assert not cache.linker.lookups
+            cache.check_hicache_events()
             assert list(cache.linker.lookups) == [handle]
             assert not cache.check_prefetch_progress(handle)
             gate.set()
@@ -726,6 +732,66 @@ class TestLinkerDevicePrefetch(CustomTestCase):
             self._admit_and_release(cache, req)
             self._assert_balanced(cache, allocator)
             cache.sanity_check()
+
+    def test_load_cap_bounds_a_burst_of_loads(self):
+        """Loads in flight plus holds stay under the hold cap, so a burst of hits
+        larger than the pool cannot take the slots a batch needs; a refused load
+        keeps its re-query target."""
+        from sglang.srt.environ import envs
+
+        with (
+            envs.SGLANG_EXTERNAL_LINKER_PREFETCH_HOLD_FRACTION.override(0.5),
+            envs.SGLANG_EXTERNAL_LINKER_REQUERY_ON_DEVICE_LOSS.override(True),
+        ):
+            cache, backend, first, allocator = self._fixture()
+            reqs = [first] + [self._request(rid=f"burst{i}", start=10 * i) for i in (1, 2, 3)]
+            for req in reqs:
+                self._enqueue(cache, req)
+            linker = cache.linker
+            assert backend.prefetch.call_count == 2
+            assert linker._lookup_stats["load_capped"] == 2
+            assert linker.prefetch_size(PoolName.KV) <= linker.hold_cap_tokens == 16
+            full = getattr(allocator, "full_attn_allocator", allocator)
+            assert full.available_size() >= 32 - 16
+            assert [linker.match_targets[r.cache_request_handle] for r in reqs[2:]] == [6, 6]
+            for req in reqs:
+                linker.release_request(req.cache_request_handle)
+            cache.check_hicache_events()
+            self._assert_balanced(cache, allocator)
+
+    def test_expired_poll_starts_no_load(self):
+        """An admission poll that stops an expired prefetch settles reads but
+        starts no load for a finished lookup; the event-loop boundary does."""
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_EXTERNAL_LINKER_ASYNC_LOOKUP_THREADS.override(1):
+            cache, backend, first, allocator = self._fixture(policy="timeout")
+            self._enqueue(cache, first)
+            cache.linker.lookups[first.cache_request_handle].future.result(timeout=5)
+            cache.check_hicache_events()
+            assert backend.prefetch.call_count == 1
+            other = self._request(rid="other", start=20)
+            self._enqueue(cache, other)
+            cache.linker.lookups[other.cache_request_handle].future.result(timeout=5)
+
+            def reduce(tensor, op):
+                if op == torch.distributed.ReduceOp.MAX:
+                    tensor.fill_(1)
+
+            cache._all_reduce_attn_groups = reduce
+            assert cache.check_prefetch_progress(first.cache_request_handle)
+            assert backend.prefetch.call_count == 1
+            assert other.cache_request_handle in cache.linker.lookups
+            del cache._all_reduce_attn_groups
+            cache.check_hicache_events()
+            assert backend.prefetch.call_count == 2
+            for req in (first, other):
+                cache.linker.release_request(req.cache_request_handle)
+            for future in backend.prefetch_futures:
+                if not future.done():
+                    future.set_result(False)
+            cache.check_hicache_events()
+            self._assert_balanced(cache, allocator)
 
     def _gated_lookup(self, backend):
         """Make the fixture's store lookup block until the returned gate opens."""
