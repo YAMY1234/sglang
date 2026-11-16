@@ -3,6 +3,8 @@
 import os
 import queue
 import tempfile
+import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -172,6 +174,64 @@ class TestMooncakeLinkerNumaHeadroom(CustomTestCase):
         with patch.object(mooncake_direct_linker, "_numa_available") as available:
             linker._log_numa_first_request()
         available.assert_not_called()
+
+
+class TestMooncakeLinkerNumaResidency(CustomTestCase):
+    def test_resident_bytes_sum_each_node_at_its_page_size(self):
+        maps = (
+            "aaaa default anon=3 dirty=3 N0=2 N1=1 kernelpagesize_kB=64\n"
+            "bbbb prefer:1 file=/x mapped=4 N1=4 kernelpagesize_kB=4\n"
+            "cccc default\n"
+        )
+        with tempfile.NamedTemporaryFile("w") as f:
+            f.write(maps)
+            f.flush()
+            held = mooncake_direct_linker._resident_by_numa(f.name)
+        self.assertEqual(held, {0: 2 * 65536, 1: 65536 + 4 * 4096})
+
+
+class TestMooncakeLinkerDebugWaitAllLayers(CustomTestCase):
+    def _start(self, flag):
+        linker = _linker(log_load_timing=False)
+        linker.mla_broadcaster = None
+        linker.pending_loads = {"r": [_transfer(PoolName.KV, 1)]}
+        linker.load_queued_at = {}
+        linker.gc_frozen = True
+        linker.broadcast_loads = {}
+        linker.stats = {"load": 0}
+        linker.load_queue = queue.Queue()
+        linker.layer_done_counter = mooncake_direct_linker.LayerWiseLoadCounter(2)
+        landed = []
+
+        def land():
+            index, *_ = linker.load_queue.get(timeout=5)
+            time.sleep(0.05)
+            for layer in range(2):
+                landed.append(layer)
+                linker.layer_done_counter.complete(index, layer)
+
+        loader = threading.Thread(target=land)
+        loader.start()
+        with patch.object(
+            mooncake_direct_linker.envs.SGLANG_LINKER_DEBUG_WAIT_ALL_LAYERS_FILE,
+            "get",
+            return_value=flag,
+        ), patch.object(mooncake_direct_linker, "device_module") as device:
+            linker.start_layer_wise_loading()
+            done_at_return = list(landed)
+        loader.join()
+        return done_at_return, device
+
+    def test_flag_file_makes_the_batch_wait_for_every_layer(self):
+        with tempfile.NamedTemporaryFile() as flag:
+            done, device = self._start(flag.name)
+        self.assertEqual(done, [0, 1])
+        device.synchronize.assert_called_once()
+
+    def test_without_the_flag_file_loading_stays_layer_wise(self):
+        done, device = self._start("/nonexistent/flag")
+        self.assertEqual(done, [])
+        device.synchronize.assert_not_called()
 
 
 if __name__ == "__main__":

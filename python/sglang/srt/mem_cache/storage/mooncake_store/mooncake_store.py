@@ -5,6 +5,7 @@ import os
 import time
 import uuid
 from collections.abc import Sequence
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
 
@@ -306,6 +307,33 @@ def _local_gpu_numa_node() -> Optional[int]:
     except (AttributeError, OSError, RuntimeError, ValueError):
         return None
     return node if node >= 0 else None
+
+
+_MPOL_PREFERRED = 1
+_MPOL_MAX_NODES = 1024
+
+
+@contextmanager
+def _preferred_numa_node(node: int):
+    """This thread allocates new pages on ``node`` (elsewhere only once it is
+    full), then gets its previous memory policy back. Threads it starts inherit
+    the preference."""
+    numa = ctypes.CDLL("libnuma.so.1", use_errno=True)
+    words = _MPOL_MAX_NODES // (8 * ctypes.sizeof(ctypes.c_ulong))
+    mode, old = ctypes.c_int(), (ctypes.c_ulong * words)()
+    if numa.get_mempolicy(
+        ctypes.byref(mode), old, ctypes.c_ulong(_MPOL_MAX_NODES + 1), None, 0
+    ):
+        raise OSError(ctypes.get_errno(), "get_mempolicy failed")
+    mask = (ctypes.c_ulong * words)()
+    bits = 8 * ctypes.sizeof(ctypes.c_ulong)
+    mask[node // bits] = 1 << (node % bits)
+    if numa.set_mempolicy(_MPOL_PREFERRED, mask, ctypes.c_ulong(_MPOL_MAX_NODES + 1)):
+        raise OSError(ctypes.get_errno(), "set_mempolicy failed")
+    try:
+        yield
+    finally:
+        numa.set_mempolicy(mode.value, old, ctypes.c_ulong(_MPOL_MAX_NODES + 1))
 
 
 def _resolve_device_name(device_name: str, tp_rank: Optional[int]) -> str:
@@ -615,19 +643,29 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 if self.config.tenant_id != DEFAULT_TENANT_ID:
                     setup_kwargs["tenant_id"] = self.config.tenant_id
 
+                # A hosted segment's pages land on this GPU's NUMA node, as
+                # the NUMA-local HCAs that serve it (Rhea 56750 split them).
+                numa_node = (
+                    _local_gpu_numa_node() if per_rank_global_segment_size > 0 else None
+                )
                 while True:
                     try:
-                        ret_code = self.store.setup(
-                            client_hostname,
-                            self.config.metadata_server,
-                            per_rank_global_segment_size,
-                            self.config.local_buffer_size,
-                            self.config.protocol,
-                            device_name,
-                            self.config.master_server_address,
-                            transfer_engine,
-                            **setup_kwargs,
-                        )
+                        with (
+                            nullcontext()
+                            if numa_node is None
+                            else _preferred_numa_node(numa_node)
+                        ):
+                            ret_code = self.store.setup(
+                                client_hostname,
+                                self.config.metadata_server,
+                                per_rank_global_segment_size,
+                                self.config.local_buffer_size,
+                                self.config.protocol,
+                                device_name,
+                                self.config.master_server_address,
+                                transfer_engine,
+                                **setup_kwargs,
+                            )
                         break
                     except TypeError as e:
                         unsupported_kwargs = [

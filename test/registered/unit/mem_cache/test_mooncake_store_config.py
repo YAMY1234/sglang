@@ -4,6 +4,8 @@ Regression for sgl-project/sglang#23457: runtime attach must resolve
 per-node local_hostname from process environment instead of a shared default.
 """
 
+import ctypes
+import ctypes.util
 import json
 import unittest
 from unittest.mock import patch
@@ -88,6 +90,30 @@ class TestMooncakeDeviceNameResolution(CustomTestCase):
         self.assertEqual(self._resolve(by_rank, None, 0), "")
         self.assertEqual(self._resolve("mlx5_0,mlx5_1", 0, 1), "mlx5_0,mlx5_1")
         self.assertEqual(self._resolve("{not json", 0, 1), "")
+
+
+def _mempolicy():
+    numa = ctypes.CDLL("libnuma.so.1")
+    mode, mask = ctypes.c_int(), (ctypes.c_ulong * 16)()
+    numa.get_mempolicy(ctypes.byref(mode), mask, ctypes.c_ulong(1025), None, 0)
+    return mode.value, list(mask)
+
+
+@unittest.skipUnless(ctypes.util.find_library("numa"), "libnuma not installed")
+class TestPreferredNumaNode(CustomTestCase):
+    def test_segment_allocation_prefers_the_node_then_restores_the_policy(self):
+        before = _mempolicy()
+        with mooncake_store._preferred_numa_node(0):
+            mode, mask = _mempolicy()
+            self.assertEqual((mode, mask[0]), (1, 1))  # MPOL_PREFERRED, node 0
+        self.assertEqual(_mempolicy(), before)
+
+    def test_policy_is_restored_when_setup_raises(self):
+        before = _mempolicy()
+        with self.assertRaises(RuntimeError):
+            with mooncake_store._preferred_numa_node(0):
+                raise RuntimeError("setup failed")
+        self.assertEqual(_mempolicy(), before)
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ from __future__ import annotations
 import glob
 import hashlib
 import logging
+import os
 import re
 import threading
 import time
@@ -159,6 +160,23 @@ def _numa_available() -> list[tuple[int, int, int]]:
     return sorted(nodes)
 
 
+def _resident_by_numa(numa_maps: str = "/proc/self/numa_maps") -> dict[int, int]:
+    """Bytes this process holds on each NUMA node (its pages, any page size)."""
+    held = {}
+    with open(numa_maps) as f:
+        for line in f:
+            fields = line.split()
+            page = next(
+                (int(x[18:]) * 1024 for x in fields if x.startswith("kernelpagesize_kB=")),
+                4096,
+            )
+            for x in fields:
+                if x[0] == "N" and "=" in x and x[1:x.index("=")].isdigit():
+                    node, pages = x[1:].split("=")
+                    held[int(node)] = held.get(int(node), 0) + int(pages) * page
+    return held
+
+
 class MooncakeDirectLinker(UnifiedCacheLinker):
     # Set False at init: the first lookup, load or offload logs NUMA headroom.
     _numa_first_request_logged = True
@@ -296,7 +314,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         # Build the native page-hash extension at startup: its first use otherwise
         # compiles it inside a request (about 3 s per node on the first store hit).
         get_storage_hash_str([0] * self.page_size, page_size=self.page_size)
-        self._log_numa_available("after segment allocation")
+        self._log_numa_available("after segment allocation", resident=True)
         self._numa_first_request_logged = False
         self.mla_broadcaster = None
         self.tp_group = tp_group
@@ -357,17 +375,24 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         f"error code: {result}."
                     )
 
-    def _log_numa_available(self, when: str) -> None:
-        nodes = _numa_available()
+    def _log_numa_available(self, when: str, resident: bool = False) -> None:
+        nodes = [entry for entry in _numa_available() if entry[2] > 0]
         low = [node for node, available, total in nodes if available < 0.1 * total]
+        held = ""
+        if resident:
+            held = "; this rank holds " + ", ".join(
+                f"n{node} {size / 1e9:.1f} GB"
+                for node, size in sorted(_resident_by_numa().items())
+            )
         (logger.warning if low else logger.info)(
-            "Linker NUMA available %s: %s%s",
+            "Linker NUMA available %s: %s%s%s",
             when,
             " | ".join(
                 f"n{node} {available / 1e9:.1f} of {total / 1e9:.1f} GB "
-                f"({100 * available / max(total, 1):.1f}%)"
+                f"({100 * available / total:.1f}%)"
                 for node, available, total in nodes
             ),
+            held,
             f"; UNDER 10% on nodes {low}" if low else "",
         )
 
@@ -558,6 +583,17 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if broadcaster is None or broadcaster.is_src:
             self.load_queue.put((counter_index, pending, ready_event, queued_at))
         self.stats["load"] += len(pending)
+        flag = envs.SGLANG_LINKER_DEBUG_WAIT_ALL_LAYERS_FILE.get()
+        if flag and os.path.exists(flag):
+            # Debug only: every layer lands before the forward is launched.
+            for future in self.layer_done_counter.futures[counter_index]:
+                future.exception()
+            device_module.synchronize()
+            logger.info(
+                "Linker debug: load batch %d landed all %d layers before its forward",
+                counter_index,
+                self.num_layers,
+            )
         return counter_index
 
     def _broadcast_loaded_layers(self, index: int, threshold: int) -> None:

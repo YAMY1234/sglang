@@ -954,6 +954,9 @@ class Envs:
     SGLANG_LINKER_LEASE_REFRESH_MAX_KEYS_PER_S = EnvInt(100000)
     # Log each Mooncake linker load's wait, transfer time, bytes and rate.
     SGLANG_LINKER_LOG_LOAD_TIMING = EnvBool(False)
+    # Debug only: while this file exists, a batch's external-linker loads all land
+    # before its forward starts (D2c load-race A/B).
+    SGLANG_LINKER_DEBUG_WAIT_ALL_LAYERS_FILE = EnvStr("")
     # "numa0:hca,hca;numa1:hca,hca": the Mooncake HCAs for a GPU on each NUMA node
     # (e.g. both of its rails), ahead of MOONCAKE_DEVICE, which stays a plain list.
     # No braces: launchers format env values as templates.
