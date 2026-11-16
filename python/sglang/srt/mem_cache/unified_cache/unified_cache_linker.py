@@ -404,6 +404,8 @@ class UnifiedCacheLinkerWrapper:
         # Re-queried request -> when its re-query started; waits until publication (s).
         self._requery_started: dict[CacheRequestHandle, float] = {}
         self._requery_waits: list[float] = []
+        # (rid, seconds waited, outcome) per re-query since the last log line, for joins with client exports.
+        self._requery_records: list[tuple[str, float, str]] = []
         # Lookup kind ("enq" at enqueue, "rq" for a re-query) -> seconds per phase since the last log line.
         self._lookup_kind = "enq"
         self._phase_s = {k: dict.fromkeys(("n", "match", "keys", "rpc", "load"), 0.0) for k in ("enq", "rq")}
@@ -746,7 +748,11 @@ class UnifiedCacheLinkerWrapper:
             for request, req in pending.items():
                 self.prefetch(req)
                 if request not in self.prefetches and request not in self.lookups:
-                    self._requery_started.pop(request, None)
+                    started = self._requery_started.pop(request, None)
+                    if started is not None:
+                        self._requery_records.append(
+                            (request.rid, time.perf_counter() - started, "none")
+                        )
         finally:
             self._lookup_kind = "enq"
 
@@ -787,6 +793,12 @@ class UnifiedCacheLinkerWrapper:
             self._load_cap(),
         )
         self._occupied_peak = 0
+        if self._requery_records:
+            logger.info(
+                "External linker re-queried rids (rid:wait_s:outcome): %s",
+                " ".join(f"{rid}:{w:.3f}:{o}" for rid, w, o in self._requery_records),
+            )
+            self._requery_records.clear()
 
     def _cancel_lookup(self, request: CacheRequestHandle) -> None:
         lookup = self.lookups.pop(request, None)
@@ -880,7 +892,9 @@ class UnifiedCacheLinkerWrapper:
             return
         started = self._requery_started.pop(request, None)
         if started is not None:
-            self._requery_waits.append(time.perf_counter() - started)
+            waited = time.perf_counter() - started
+            self._requery_waits.append(waited)
+            self._requery_records.append((request.rid, waited, "loaded" if publish else "aborted"))
         # Event polling or reset/close has already quiesced every device writer.
         if state.future is not None:
             assert state.future.done()
@@ -1293,6 +1307,7 @@ class UnifiedCacheLinkerWrapper:
         self.match_targets.clear()
         self._pending_requeries.clear()
         self._requery_started.clear()
+        self._requery_records.clear()
         self.hit_markers.clear()
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()
