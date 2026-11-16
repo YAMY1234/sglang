@@ -800,7 +800,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """Drop the lock a published prefetch holds for a request admitted with a
         ``prefix_len``-token device prefix."""
 
-    def protect_queued_prefixes(self, reqs: list[Req]) -> None:
+    def protect_queued_prefixes(
+        self, reqs: list[Req], depth_override: Optional[int] = None
+    ) -> None:
         """Keep the device prefixes of the queued requests next in line until
         admission (external linker queue locks); a no-op elsewhere."""
 

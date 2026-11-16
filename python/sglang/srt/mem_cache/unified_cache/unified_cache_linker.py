@@ -1017,14 +1017,15 @@ class UnifiedCacheLinkerWrapper:
                 self._admit_times.append(time.monotonic())
             self._log_holds()
 
-    def protect_queue(self, reqs: Sequence[Req]) -> None:
+    def protect_queue(self, reqs: Sequence[Req], depth_override: Optional[int] = None) -> None:
         """At the event-loop boundary: lock the device prefixes of the queued requests
         next in line, while their tokens fit the cap and the depth the expected
         admissions in qlock_seconds allow; queue a re-query for a request that
         reaches the window with part of its prefix already lost."""
         if not self.qlock_cap_tokens:
             return
-        depth_cap = self._qlock_depth_cap()
+        # A pipeline stage that admits at other times takes stage 0's depth instead.
+        depth_cap = self.qlock_depth_cap() if depth_override is None else depth_override
         keep: set[CacheRequestHandle] = set()
         tokens = depth = 0
         for req in reqs:
@@ -1059,7 +1060,7 @@ class UnifiedCacheLinkerWrapper:
         self.qlocked_tokens = tokens
         self._qlock_peak = [max(self._qlock_peak[0], depth), max(self._qlock_peak[1], tokens)]
 
-    def _qlock_depth_cap(self) -> int:
+    def qlock_depth_cap(self) -> int:
         """Requests in the window: those expected within qlock_seconds, from the
         last 30 s of admissions; unbounded (the token cap rules) until one is seen."""
         now = time.monotonic()

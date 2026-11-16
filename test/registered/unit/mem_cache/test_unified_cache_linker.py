@@ -857,6 +857,9 @@ class TestLinkerDevicePrefetch(CustomTestCase):
             linker.qlock_seconds = 4.0
             cache.protect_queued_prefixes(queued)
             assert list(linker.qlocks) == [queued[0].cache_request_handle]
+            # A pipeline stage given stage 0's depth uses it as is.
+            cache.protect_queued_prefixes(queued, depth_override=2)
+            assert list(linker.qlocks) == [r.cache_request_handle for r in queued]
             for req in queued:
                 self._admit_and_release(cache, req)
             self._assert_balanced(cache, allocator)
