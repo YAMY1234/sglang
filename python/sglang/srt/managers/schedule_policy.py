@@ -207,6 +207,8 @@ class SchedulePolicy:
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
         self._shortest_prefill_calls = 0
         self._waiting_prefix_refresh_calls = 0
+        self._prefix_match_passes = 0
+        self._prefix_matched_at: Dict[str, int] = {}
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
@@ -359,12 +361,18 @@ class SchedulePolicy:
     ) -> Set[int]:
         temporary_deprioritized: Set[int] = set()
         self.waiting_queue_radix_tree.reset()
+        rematch = self._prefix_rematch_rids(waiting_queue, policy)
 
         for r in waiting_queue:
-            prefix_ids = r.origin_input_ids + r.output_ids
+            if rematch is not None and not r.output_ids:
+                prefix_ids = r.origin_input_ids
+            else:
+                prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
             cache_salt = r.cache_salt
-            match_result = match_kv_cache(r, self.tree_cache, prefix_ids)
+            # A skipped request keeps the prefix fields of its last match.
+            if rematch is None or r.rid in rematch:
+                match_result = match_kv_cache(r, self.tree_cache, prefix_ids)
 
             # NOTE(sang): This logic is for in-batch prefix caching;
             # If there are more than 1 request that have small matching prefix from
@@ -405,6 +413,33 @@ class SchedulePolicy:
                         )
                     )
         return temporary_deprioritized
+
+    def _prefix_rematch_rids(
+        self, waiting_queue: List[Req], policy: CacheAwarePolicy
+    ) -> Optional[Set[str]]:
+        """With SGLANG_SPF_MATCH_REFRESH_PASSES=N under shortest-prefill-first,
+        the rids to match this pass: new requests plus the ceil(len/N) whose last
+        match is oldest. None matches every request. Admission re-matches anyway."""
+        refresh_passes = envs.SGLANG_SPF_MATCH_REFRESH_PASSES.get()
+        if refresh_passes <= 0 or policy != CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
+            return None
+        this_pass = self._prefix_match_passes
+        self._prefix_match_passes += 1
+        matched_at = self._prefix_matched_at
+        # Pass counts and queue order agree across ranks, so every rank picks
+        # the same requests.
+        seen = sorted(
+            (r for r in waiting_queue if r.rid in matched_at),
+            key=lambda r: matched_at[r.rid],
+        )
+        rematch = {r.rid for r in waiting_queue if r.rid not in matched_at}
+        budget = -(-len(waiting_queue) // refresh_passes)
+        rematch.update(r.rid for r in seen[:budget])
+        self._prefix_matched_at = {
+            r.rid: this_pass if r.rid in rematch else matched_at[r.rid]
+            for r in waiting_queue
+        }
+        return rematch
 
     @staticmethod
     def _shortest_prefill_work(r: Req) -> int:

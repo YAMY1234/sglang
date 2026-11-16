@@ -794,6 +794,9 @@ class Envs:
     # shortest-prefill-first, hold a truncated chunk's tail in the budget.
     SGLANG_K31_PARK_CHUNKED_PREFILL = EnvBool(True)
     SGLANG_K31_PF_SPF_RESERVE_CHUNKED_TAIL = EnvBool(True)
+    # Shortest-prefill-first: re-match each waiting request at least every N
+    # scheduling passes (new requests at once) instead of every pass; 0 = every pass.
+    SGLANG_SPF_MATCH_REFRESH_PASSES = EnvInt(0)
     # PD prefill backstop: a built batch whose paged KV demand exceeds free plus
     # evictable pages is undone and retried next step instead of raising.
     SGLANG_PREFILL_DEFER_ON_KV_SHORTFALL = EnvBool(True)
