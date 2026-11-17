@@ -823,6 +823,11 @@ class Envs:
     # Shortest-prefill-first: re-match each waiting request at least every N
     # scheduling passes (new requests at once) instead of every pass; 0 = every pass.
     SGLANG_SPF_MATCH_REFRESH_PASSES = EnvInt(0)
+    # Shortest-prefill-first anti-starvation: a request that has waited this many
+    # prefilled tokens goes to the head (one at a time, only with no chunk in
+    # flight); its chunks keep SGLANG_SPF_AGED_CHUNK_SHARE of each batch. 0 = off.
+    SGLANG_SPF_AGE_TOKENS = EnvInt(0)
+    SGLANG_SPF_AGED_CHUNK_SHARE = EnvFloat(0.5)
     # PD prefill backstop: a built batch whose paged KV demand exceeds free plus
     # evictable pages is undone and retried next step instead of raising.
     SGLANG_PREFILL_DEFER_ON_KV_SHORTFALL = EnvBool(True)

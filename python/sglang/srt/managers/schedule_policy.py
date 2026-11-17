@@ -211,6 +211,8 @@ class SchedulePolicy:
         self._prefix_match_passes = 0
         self._prefix_matched_at: Dict[str, int] = {}
         self._prefix_match_seconds = 0.0
+        self._spf_processed_tokens = 0
+        self._spf_aged_promotions = 0
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
@@ -221,6 +223,7 @@ class SchedulePolicy:
         running_batch: Optional[ScheduleBatch] = None,
         processed_tokens: int = 0,
         bootstrap_queue: List[Req] = [],
+        chunked_req: Optional[Req] = None,
     ) -> None:
         policy = self._determine_active_policy(waiting_queue)
 
@@ -259,15 +262,19 @@ class SchedulePolicy:
                 SchedulePolicy._sort_by_shortest_prefill(
                     waiting_queue, temporary_deprioritized
                 )
+                self._spf_processed_tokens = processed_tokens
+                if chunked_req is None:
+                    self._promote_aged_prefill(waiting_queue, temporary_deprioritized)
                 self._shortest_prefill_calls += 1
                 if waiting_queue and self._shortest_prefill_calls % 128 == 1:
                     # prefix_match_ms: mean prefix-match time per pass since the last line.
                     logger.info(
                         "Experimental shortest-prefill-first: queue=%d shortest_uncached=%d "
-                        "prefix_match_ms=%.2f",
+                        "prefix_match_ms=%.2f aged_promotions=%d",
                         len(waiting_queue),
                         self._shortest_prefill_work(waiting_queue[0]),
                         1e3 * self._prefix_match_seconds / 128,
+                        self._spf_aged_promotions,
                     )
                     self._prefix_match_seconds = 0.0
             else:
@@ -469,6 +476,30 @@ class SchedulePolicy:
             )
         )
 
+    def _spf_aged(self, req: Req) -> bool:
+        # Age in prefilled tokens, which every PP/TP rank counts alike (wall time does not).
+        age = envs.SGLANG_SPF_AGE_TOKENS.get()
+        return age > 0 and (
+            self._spf_processed_tokens - req.arrival_processed_tokens >= age
+        )
+
+    def _promote_aged_prefill(
+        self, waiting_queue: List[Req], temporary_deprioritized: Set[int]
+    ) -> None:
+        """Move the longest-waiting aged request to the head. The caller skips
+        this while a chunk is in flight: a second chunked request is refused."""
+        aged = [
+            i
+            for i, r in enumerate(waiting_queue)
+            if r.rid not in temporary_deprioritized and self._spf_aged(r)
+        ]
+        if not aged:
+            return
+        i = min(aged, key=lambda i: waiting_queue[i].arrival_processed_tokens)
+        if i:
+            waiting_queue.insert(0, waiting_queue.pop(i))
+            self._spf_aged_promotions += 1
+
     def shortest_prefill_chunk_limit(
         self,
         chunked_req: Req,
@@ -484,12 +515,17 @@ class SchedulePolicy:
         ):
             return None
         remaining = len(chunked_req.full_untruncated_fill_ids) - chunked_req.prefix_len
+        # An aged chunk keeps a fixed share; shorter requests get the rest.
+        keep = page_size
+        if self._spf_aged(chunked_req):
+            share = envs.SGLANG_SPF_AGED_CHUNK_SHARE.get()
+            keep = max(page_size, int(budget * share) // page_size * page_size)
         reserved = 0
         reserved_kv = 0
         for req in waiting_queue:
             work = self._shortest_prefill_work(req)
             charge = _ceil_div(work, page_size) * page_size
-            if work >= remaining or reserved + charge > budget - page_size:
+            if work >= remaining or reserved + charge > budget - keep:
                 break
             # A request the adder will park beside the chunk's reserved tail
             # must not shrink the chunk.

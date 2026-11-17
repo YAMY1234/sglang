@@ -4543,6 +4543,7 @@ class Scheduler(
                 if self.disagg_prefill_bootstrap_queue is not None
                 else []
             ),
+            chunked_req=self.chunked_req,
         )
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:

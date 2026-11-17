@@ -220,6 +220,62 @@ class TestShortestPrefillFirst(CustomTestCase):
                     )
                 )
 
+    def _aged_queue(self, processed):
+        # 'long' (400k uncached) arrived first; short ones keep the queue non-empty.
+        long = self.make_req("long", 400_000, arrived=0)
+        long.arrival_processed_tokens = 0
+        shorts = [self.make_req(f"s{i}", 2048, arrived=i + 1) for i in range(3)]
+        for r in shorts:
+            r.arrival_processed_tokens = processed
+        return long, [shorts[0], long, shorts[1], shorts[2]]
+
+    def test_aged_request_goes_to_head_without_chunk_in_flight(self):
+        long, queue = self._aged_queue(processed=5_000_000)
+        with patch.dict(os.environ, {"SGLANG_SPF_AGE_TOKENS": "4000000"}), patch.object(
+            self.policy, "_compute_prefix_matches", return_value=set()
+        ):
+            self.policy.calc_priority(queue, processed_tokens=5_000_000)
+        self.assertEqual(queue[0].rid, "long")
+        self.assertEqual([r.rid for r in queue[1:]], ["s0", "s1", "s2"])
+
+    def test_aged_request_waits_while_a_chunk_is_in_flight(self):
+        long, queue = self._aged_queue(processed=5_000_000)
+        with patch.dict(os.environ, {"SGLANG_SPF_AGE_TOKENS": "4000000"}), patch.object(
+            self.policy, "_compute_prefix_matches", return_value=set()
+        ):
+            self.policy.calc_priority(
+                queue,
+                processed_tokens=5_000_000,
+                chunked_req=self.make_req("chunk", 8192),
+            )
+        self.assertEqual(queue[-1].rid, "long")
+
+    def test_young_or_disabled_aging_keeps_shortest_first(self):
+        for env, processed in [({"SGLANG_SPF_AGE_TOKENS": "4000000"}, 3_000_000), ({}, 50_000_000)]:
+            with self.subTest(env=env, processed=processed):
+                long, queue = self._aged_queue(processed=processed)
+                with patch.dict(os.environ, env), patch.object(
+                    self.policy, "_compute_prefix_matches", return_value=set()
+                ):
+                    self.policy.calc_priority(queue, processed_tokens=processed)
+                self.assertEqual(queue[-1].rid, "long")
+
+    def test_aged_chunk_keeps_its_share_of_the_batch(self):
+        continuation = self.make_req("continuation", 400_000)
+        continuation.arrival_processed_tokens = 0
+        waiting = [self.make_req(f"s{i}", 2048) for i in range(8)]
+        with patch.dict(os.environ, {"SGLANG_SPF_AGE_TOKENS": "4000000"}):
+            self.policy._spf_processed_tokens = 1_000_000
+            self.assertEqual(
+                self.policy.shortest_prefill_chunk_limit(continuation, waiting, 16384, 64),
+                2048,
+            )
+            self.policy._spf_processed_tokens = 5_000_000
+            self.assertEqual(
+                self.policy.shortest_prefill_chunk_limit(continuation, waiting, 16384, 64),
+                8192,
+            )
+
     def test_other_policy_keeps_normal_chunk_limit(self):
         self.policy.policy = CacheAwarePolicy.HRRN
         self.assertIsNone(
