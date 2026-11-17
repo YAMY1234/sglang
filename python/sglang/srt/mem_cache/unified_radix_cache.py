@@ -2960,6 +2960,14 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.linker is not None and self.linker.load_mode == "prefetch":
             self.linker.release_hold(request, admitted=True, prefix_len=prefix_len)
 
+    # Locks tree nodes and may queue lookups: every rank walks the same queue.
+    @rank_consensus
+    def protect_queued_prefixes(
+        self, reqs: list[Req], depth_override: Optional[int] = None
+    ) -> None:
+        if self.linker is not None and self.linker.load_mode == "prefetch":
+            self.linker.protect_queue(reqs, depth_override=depth_override)
+
     @rank_consensus(same_params=["req.rid"], same_results=True)
     def requery_prefetch_after_device_loss(self, req: Req) -> bool:
         if self.linker is None or self.linker.load_mode != "prefetch":
