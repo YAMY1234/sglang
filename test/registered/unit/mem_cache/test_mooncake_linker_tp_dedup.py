@@ -6,6 +6,7 @@ draft are shared, while TP-sharded KDA state keeps its own rank namespace."""
 
 import queue
 import random
+import threading
 import unittest
 from collections import Counter, deque
 from dataclasses import replace
@@ -372,10 +373,11 @@ class _PinStore:
     """Read sessions over a fixed key set; records starts and ends."""
 
     def __init__(self, present):
-        self.present, self.started, self.ended = set(present), [], []
+        self.present, self.started, self.ended, self.threads = set(present), [], [], []
 
     def batch_get_session_start(self, keys):
         self.started.append(list(keys))
+        self.threads.append(threading.current_thread().name)
         return [0 if key in self.present else -704 for key in keys]
 
     def batch_get_session_end(self, keys):
@@ -387,6 +389,7 @@ def _pinning_linker(present, num_stages=1):
     linker.mla_broadcaster = None
     linker.pinned, linker.pin_samples, linker.pin_holes = {}, [], 0
     linker.pinned_others, linker.pin_expiry = {}, deque()
+    linker.prepins, linker.prepin_pool = {}, None
     # Stage 0's own keys come from its pools below; later stages' from schemas.
     linker.stage_schemas = [None] + [_stage_schema(s) for s in range(1, num_stages)]
     # This stage's pools: KV and indexer from the KV transfer, the state trailing.
@@ -463,6 +466,37 @@ class TestPinHit(CustomTestCase):
         (started,) = linker.storage.store.started
         self.assertEqual(len(started), 3 * (2 * 4 + 1))  # every stage's objects at once
         self.assertEqual(linker.storage.store.ended, [started])
+
+    def _transfers(self, last="p4"):
+        return [
+            PoolTransfer(name=PoolName.KV, keys=self.pages[:-1] + [last]),
+            PoolTransfer(
+                name=PoolName.MAMBA, keys=[last], hit_policy=PoolHitPolicy.TRAILING_PAGES
+            ),
+        ]
+
+    def test_a_prepin_pins_off_the_scheduler_thread_and_admission_takes_it(self):
+        # Hecate H112: the all-stage session start at admission was about 70 ms
+        # (p90 about 210 ms) of each hit's admission on PP0's scheduler thread.
+        linker = _pinning_linker(self._all_stages(3), 3)
+        linker.start_prepin("rid", self._transfers())
+        self.assertEqual(linker.prepins["rid"][1].result(timeout=5), (4, linker.pin_samples[0][1]))
+        self.assertTrue(linker.storage.store.threads[0].startswith("mooncake-prepin"))
+        self.assertEqual(linker.take_prepin("rid", self._transfers()), 4)
+        self.assertEqual(linker.last_pin_rpc_s, 0.0)  # admission did not wait
+        self.assertEqual(sorted(linker.pinned["rid"]), sorted(self._all()))
+        self.assertEqual(linker.prepins, {})
+
+    def test_a_prepin_of_another_hit_is_not_taken_and_a_stale_one_is_released(self):
+        linker = _pinning_linker(self._all_stages(3), 3)
+        linker.start_prepin("rid", self._transfers())
+        linker.prepins["rid"][1].result(timeout=5)
+        self.assertIsNone(linker.take_prepin("rid", self._transfers(last="p5")))
+        tag, future, pages, own, others, _ = linker.prepins["rid"]
+        linker.prepins["rid"] = (tag, future, pages, own, others, -1e9)
+        linker.release_stale_prepins()
+        self.assertEqual(linker.prepins, {})
+        self.assertEqual(linker.storage.store.ended, linker.storage.store.started)
 
     def test_later_stages_pins_are_held_apart_from_pp0s_own(self):
         linker, pages = self._pin(self._all_stages(3), 3)

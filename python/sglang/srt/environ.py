@@ -957,6 +957,10 @@ class Envs:
     # conversation resumes from its deepest states; older linear ones are removed
     # once a deeper one lands, branch points (shared prompts) are kept.
     SGLANG_LINKER_STATE_PATH_CAP = EnvInt(0)
+    # Under PP, after each scheduling pass PP0 starts the all-stage pins of the
+    # next this-many waiting requests with a hit on a worker thread, so their
+    # admission takes a finished pin instead of waiting on the store (0: off).
+    SGLANG_LINKER_PREPIN_DEPTH = EnvInt(0)
     # Cap on the lease renewal existence queries, in object keys per second.
     SGLANG_LINKER_LEASE_REFRESH_MAX_KEYS_PER_S = EnvInt(100000)
     # Log each Mooncake linker load's wait, transfer time, bytes and rate.

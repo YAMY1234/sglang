@@ -4428,6 +4428,8 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             running_batch=running_batch,
         )
+        if self.enable_unified_cache_external_linker:
+            self.tree_cache.linker_prepin(self.waiting_queue)
 
         if self.prefill_delayer:
             observed_prefill_bs = prefill_delayer_single_pass.finalize(

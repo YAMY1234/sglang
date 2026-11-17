@@ -1741,6 +1741,7 @@ class _PinningLinker(_CountingLinker):
     def __init__(self, stage_restorable=(), pages=None):
         super().__init__(stage_restorable=stage_restorable)
         self.pages, self.pins, self.unpins = dict(pages or {}), [], []
+        self.prepin_starts = []
         self.last_pin_rpc_s = 0.004
 
     def pin_hit(self, rid, transfers):
@@ -1750,6 +1751,14 @@ class _PinningLinker(_CountingLinker):
 
     def unpin(self, rid):
         self.unpins.append(rid)
+
+    prepinned = None
+
+    def start_prepin(self, rid, transfers):
+        self.prepin_starts.append(rid)
+
+    def take_prepin(self, rid, transfers):
+        return self.prepinned
 
 
 def test_pp_admission_pins_the_hit_and_a_hole_shrinks_it_before_the_load(
@@ -1816,6 +1825,46 @@ def test_only_pp0_pins_and_later_stages_take_its_relayed_verdict(
         assert later._pp_fresh_hit_pages(req, later.hit_markers["r"]) == 1
         assert backend.pins == []
         assert backend.unpins == ["r"]  # PP0 shrank the hit: nothing is held here
+
+
+def test_pp0_takes_a_finished_prepin_and_pins_itself_only_when_none_is_ready(
+    full_linker_component,
+):
+    # Hecate H112: the all-stage pin at admission held PP0's scheduler about
+    # 70 ms per hit; with SGLANG_LINKER_PREPIN_DEPTH the next waiting hits are
+    # pinned after each pass and admission takes the finished pin.
+    with (
+        envs.SGLANG_LINKER_PREPIN_DEPTH.override(2),
+        patch(
+            "sglang.srt.mem_cache.unified_cache.unified_cache_linker.get_storage_hash_str",
+            side_effect=_page_hashes,
+        ),
+    ):
+        backend = _PinningLinker(stage_restorable=[1, 3])
+        pp0 = _match_wrapper(
+            full_linker_component,
+            backend,
+            pp_size=8,
+            pp_rank=0,
+            _all_reduce=lambda data, op: None,
+        )
+        reqs = [
+            SimpleNamespace(rid=r, linker_pp_hit=None, linker_pp_lookup_pending=True)
+            for r in ("a", "b", "c")
+        ]
+        for req in reqs[:2] + reqs[2:]:
+            pp0.match(_KEY, req, _device_result(0))
+        miss = SimpleNamespace(rid="none", linker_pp_hit=None, linker_pp_lookup_pending=False)
+        pp0.prepin([miss] + reqs)  # the first two waiting requests with a hit
+        assert backend.prepin_starts == ["a", "b"]
+
+        backend.prepinned = 3
+        assert pp0._pp_fresh_hit_pages(reqs[0], pp0.hit_markers["a"]) == 3
+        assert backend.pins == []
+        backend.prepinned = None
+        assert pp0._pp_fresh_hit_pages(reqs[1], pp0.hit_markers["b"]) == 3
+        assert backend.pins == ["b"]
+        assert pp0.prepin_counts == {"ready": 1, "missed": 1}
 
 
 def test_pp_fresh_hit_loads_without_a_second_lookup(full_linker_component):

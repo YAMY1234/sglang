@@ -9,6 +9,7 @@ import threading
 import time
 from collections import Counter, OrderedDict, deque
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from queue import Empty, Queue
 
@@ -256,6 +257,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         # after _PIN_GRACE_S, when every stage's own load has started.
         self.pinned_others: dict[str, list[str]] = {}
         self.pin_expiry: deque = deque()
+        # PP0, SGLANG_LINKER_PREPIN_DEPTH: rid -> (hit tag, Future of
+        # _start_sessions, pages, own keys, other stages' keys, started at).
+        self.prepins: dict[str, tuple] = {}
+        self.prepin_pool: ThreadPoolExecutor | None = None
         self.stats_logged_at = time.monotonic()
         # Store-side state path cap: each state this rank wrote -> the deepest
         # earlier state on its path (None at the root), and its child count.
@@ -614,26 +619,20 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return keys, spans
 
     _PIN_GRACE_S = 30.0
+    # A pre-pin not taken within this long is released (the read sessions'
+    # leases are short); its request pins at admission instead.
+    _PREPIN_TTL_S = 3.0
 
-    def pin_hit(self, rid: str, transfers: list[PoolTransfer]) -> int:
-        """PP0, as a relayed hit is admitted: start the read sessions of every
-        stage's objects of it. The session start is the admission check (an
-        object evicted since the lookup shows here, on any stage, before a
-        forward reads it), and the pin that keeps the objects until each stage
-        has started its own load. Returns how many leading pages every stage
-        can load: all, or up to the first object that is gone (no sessions are
-        kept then). Later stages take this through the PP relay, which carries
-        PP0's value only (Hecate H106: per-stage pins were overwritten)."""
-        num_pages = len(
+    def _pin_keys(self, transfers: list[PoolTransfer]):
+        """Every stage's object keys of a hit: (pages, PP0's own keys, the other
+        stages' keys, per object group (trailing, first, end) over both)."""
+        page_keys = list(
             next(transfer for transfer in transfers if transfer.name == PoolName.KV).keys
         )
         expanded = self.pool_group.resolve_transfers(
             transfers, allow_partial=True, allow_missing_kv=True
         )
         own, spans = self._object_keys(expanded)
-        page_keys = list(
-            next(transfer for transfer in transfers if transfer.name == PoolName.KV).keys
-        )
         others = []
         for schema in self.stage_schemas[1:]:
             for _, obj, suffix, trailing in schema:
@@ -641,17 +640,17 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 first = len(own) + len(others)
                 others.extend(self.storage._tag_keys([f"{p}_{suffix}_{obj}" for p in pages]))
                 spans.append((trailing, first, len(own) + len(others)))
-        keys = own + others
-        self._end_expired_pins()
+        return len(page_keys), own, others, spans
+
+    def _start_sessions(self, keys, spans, num_pages) -> tuple[int, float]:
+        """Start read sessions on ``keys``: (leading pages every object holds,
+        seconds waited). Short of all pages, no session is kept."""
         began = time.monotonic()
         result = list(self.storage.store.batch_get_session_start(keys)) if keys else []
-        self.last_pin_rpc_s = time.monotonic() - began
-        self.pin_samples.append((len(keys), self.last_pin_rpc_s))
+        waited = time.monotonic() - began
+        self.pin_samples.append((len(keys), waited))
         if all(value == 0 for value in result):
-            self.pinned[rid] = own
-            if others:
-                self.pinned_others[rid] = others
-            return num_pages
+            return num_pages, waited
         # Even a partial start may have installed some sessions.
         self.storage.store.batch_get_session_end(keys)
         self.pin_holes += 1
@@ -663,7 +662,81 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             if missing is not None:
                 # A trailing object is the state at the last page only.
                 pages = min(pages, num_pages - 1 if trailing else missing)
+        return pages, waited
+
+    def pin_hit(self, rid: str, transfers: list[PoolTransfer]) -> int:
+        """PP0, as a relayed hit is admitted: start the read sessions of every
+        stage's objects of it. The session start is the admission check (an
+        object evicted since the lookup shows here, on any stage, before a
+        forward reads it), and the pin that keeps the objects until each stage
+        has started its own load. Returns how many leading pages every stage
+        can load: all, or up to the first object that is gone (no sessions are
+        kept then). Later stages take this through the PP relay, which carries
+        PP0's value only (Hecate H106: per-stage pins were overwritten)."""
+        num_pages, own, others, spans = self._pin_keys(transfers)
+        self._end_expired_pins()
+        pages, self.last_pin_rpc_s = self._start_sessions(own + others, spans, num_pages)
+        if pages == num_pages:
+            self._hold_pins(rid, own, others)
         return pages
+
+    def _hold_pins(self, rid: str, own: list[str], others: list[str]) -> None:
+        self.pinned[rid] = own
+        if others:
+            self.pinned_others[rid] = others
+
+    @staticmethod
+    def _prepin_tag(transfers: list[PoolTransfer]) -> tuple:
+        keys = next(t for t in transfers if t.name == PoolName.KV).keys
+        return len(keys), keys[0], keys[-1]
+
+    def start_prepin(self, rid: str, transfers: list[PoolTransfer]) -> None:
+        """PP0: pin_hit for a request still waiting, on a worker thread
+        (SGLANG_LINKER_PREPIN_DEPTH); its admission takes the result."""
+        tag = self._prepin_tag(transfers)
+        entry = self.prepins.get(rid)
+        if entry is not None:
+            if entry[0] == tag:
+                return
+            self._drop_prepin(rid)
+        if self.prepin_pool is None:
+            self.prepin_pool = ThreadPoolExecutor(1, thread_name_prefix="mooncake-prepin")
+        num_pages, own, others, spans = self._pin_keys(transfers)
+        future = self.prepin_pool.submit(
+            self._start_sessions, own + others, spans, num_pages
+        )
+        self.prepins[rid] = (tag, future, num_pages, own, others, time.monotonic())
+
+    def take_prepin(self, rid: str, transfers: list[PoolTransfer]) -> int | None:
+        """The pages a finished pre-pin of this same hit holds, now owned like
+        pin_hit's; None if there is none or it is still running."""
+        entry = self.prepins.get(rid)
+        if entry is None or entry[0] != self._prepin_tag(transfers) or not entry[1].done():
+            return None
+        del self.prepins[rid]
+        _, future, num_pages, own, others, _ = entry
+        pages, _ = future.result()
+        self.last_pin_rpc_s = 0.0
+        if pages == num_pages:
+            self._hold_pins(rid, own, others)
+        return pages
+
+    def release_stale_prepins(self) -> None:
+        now = time.monotonic()
+        for rid in [r for r, e in self.prepins.items() if now - e[5] > self._PREPIN_TTL_S]:
+            self._drop_prepin(rid)
+
+    def _drop_prepin(self, rid: str) -> None:
+        entry = self.prepins.pop(rid, None)
+        if entry is None:
+            return
+        _, future, num_pages, own, others, _ = entry
+
+        def end(done):
+            if done.result()[0] == num_pages:
+                self.storage.store.batch_get_session_end(own + others)
+
+        future.add_done_callback(end)
 
     def unpin(self, rid: str) -> None:
         keys = self.pinned.pop(rid, None) or []
@@ -1192,6 +1265,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return self.offload_results.get_nowait()
 
     def reset(self) -> None:
+        for rid in list(self.prepins):
+            self._drop_prepin(rid)
         for rid in list(self.pinned) + list(self.pinned_others):
             self.unpin(rid)
         self._end_expired_pins(float("inf"))

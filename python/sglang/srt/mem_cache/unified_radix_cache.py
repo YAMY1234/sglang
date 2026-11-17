@@ -4252,6 +4252,11 @@ class UnifiedRadixCache(BasePrefixCache):
             [bool(success) for success in successes.tolist()]
         )
 
+    def linker_prepin(self, waiting: list[Req]) -> None:
+        """PP0, after each prefill scheduling pass: see UnifiedCacheLinkerWrapper.prepin."""
+        if self.linker is not None and self.pp_size > 1 and self.pp_rank == 0:
+            self.linker.prepin(waiting)
+
     def linker_pp_enqueue(self, req: Req) -> None:
         """One device match per new request on every PP rank, at the same point
         so the trees stay identical. On PP0 the external linker also looks up

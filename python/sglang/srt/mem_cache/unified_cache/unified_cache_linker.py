@@ -243,6 +243,16 @@ class UnifiedCacheLinker(ABC):
     def unpin(self, rid: str) -> None:
         """Release what pin_hit holds for ``rid`` when it will not load."""
 
+    def start_prepin(self, rid: str, transfers: list[PoolTransfer]) -> None:
+        """PP0: begin pin_hit for a waiting request off the scheduler thread."""
+
+    def take_prepin(self, rid: str, transfers: list[PoolTransfer]) -> Optional[int]:
+        """PP0: the result of a finished start_prepin of this hit, else None."""
+        return None
+
+    def release_stale_prepins(self) -> None:
+        """PP0: release pre-pins whose requests were not admitted in time."""
+
     @abstractmethod
     def reset(self) -> None:
         """Quiesce all transfers and reset backend state before returning."""
@@ -341,6 +351,10 @@ class UnifiedCacheLinkerWrapper:
         # PP admissions with a hit: (seconds in load_back, seconds of it waiting
         # on pin_hit's store call); and pins that found an object gone.
         self.admission_samples: list[dict[str, float]] = []
+        # PP0: after each pass, pre-pin this many next waiting hits; admissions
+        # that found a finished pre-pin, and those that pinned themselves.
+        self.prepin_depth = envs.SGLANG_LINKER_PREPIN_DEPTH.get() if self.pp_size > 1 else 0
+        self.prepin_counts = {"ready": 0, "missed": 0}
         self.admission_rpc_s = 0.0
         self.admission_marks: dict[str, float] = {}
         self.pp_load_holes = 0
@@ -501,7 +515,13 @@ class UnifiedCacheLinkerWrapper:
         # Only PP0 pins: the relay below carries PP0's value, not a reduction.
         pinned = admitted
         if self.pp_rank == 0:
-            pinned = self.cache_linker.pin_hit(req.rid, transfers)
+            taken = None
+            if self.prepin_depth:
+                taken = self.cache_linker.take_prepin(req.rid, transfers)
+                self.prepin_counts["missed" if taken is None else "ready"] += 1
+            # Not ready: pin now. Deferring would end this pass's admission for
+            # every request behind it, and PP0's own stage alone is not enough.
+            pinned = self.cache_linker.pin_hit(req.rid, transfers) if taken is None else taken
             self.admission_rpc_s = self.cache_linker.last_pin_rpc_s
         keep = torch.tensor([min(pinned, admitted)], dtype=torch.int64)
         self.cache._all_reduce(keep, torch.distributed.ReduceOp.MIN)
@@ -525,6 +545,25 @@ class UnifiedCacheLinkerWrapper:
             keep = best
         self._maybe_log_pp_counts()
         return int(keep[0])
+
+    def prepin(self, waiting: Sequence[Req]) -> None:
+        """PP0, after a scheduling pass: start the all-stage pins of the next
+        ``prepin_depth`` waiting requests with a hit (in admission order), so
+        their admission takes a finished pin instead of waiting on the store."""
+        if not self.prepin_depth:
+            return
+        self.cache_linker.release_stale_prepins()
+        started = 0
+        for req in waiting:
+            hit = self.hit_markers.get(req.rid)
+            if hit is None:
+                continue
+            transfers = self._lookup_transfers(hit.tail_hashes)
+            if transfers:
+                self.cache_linker.start_prepin(req.rid, transfers)
+            started += 1
+            if started >= self.prepin_depth:
+                return
 
     def _pp_relookup_hit_pages(
         self, req: Req, hit: ExternalCacheHitMarker, forced: bool
@@ -589,7 +628,7 @@ class UnifiedCacheLinkerWrapper:
             "Linker PP admission timing in %.0f s: %d admissions with a hit, ms "
             "p50/p90 total %s = session start %s + relay %s + slot build %s "
             "(evict %s; %d hits evicted, mean %d max %d tokens) + load call %s + "
-            "prepare %s; load holes %d",
+            "prepare %s; load holes %d; pre-pins ready %d, missed %d",
             window,
             len(samples),
             ms("total"),
@@ -603,7 +642,10 @@ class UnifiedCacheLinkerWrapper:
             ms("load"),
             ms("prepare"),
             self.pp_load_holes,
+            self.prepin_counts["ready"],
+            self.prepin_counts["missed"],
         )
+        self.prepin_counts = dict.fromkeys(self.prepin_counts, 0)
         self.pp_load_holes = 0
         self.pp_counts = dict.fromkeys(self.pp_counts, 0)
         self.pp_counts_logged_at = now
