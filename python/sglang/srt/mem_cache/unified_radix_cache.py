@@ -4155,6 +4155,20 @@ class UnifiedRadixCache(BasePrefixCache):
             return []
         failed_rids = set(self.linker.finish_loads())
         failed = [req for req in reqs if req.rid in failed_rids]
+        if failed and self.pp_size > 1 and envs.SGLANG_LINKER_PP_LOAD_CONSENSUS.get():
+            # Aborting here alone would split the stages' queues (Hecate H112).
+            # Fail the KV send instead: PP0's release consensus sees it and every
+            # stage fails the request together, inserting none of its KV.
+            if all(req.disagg_kv_sender is not None for req in failed):
+                for req in failed:
+                    req.disagg_kv_sender.abort()
+                logger.warning(
+                    "External linker load failed on this stage; failing %d "
+                    "request(s) through the PP release consensus: %s",
+                    len(failed),
+                    [req.rid for req in failed],
+                )
+                return []
         if failed:
             from sglang.srt.managers.schedule_batch import FINISH_ABORT
 

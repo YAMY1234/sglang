@@ -23,6 +23,7 @@ reaches nothing but its own requests, which the scheduler aborts.
 from __future__ import annotations
 
 import logging
+import random
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
@@ -324,6 +325,14 @@ class UnifiedCacheLinkerWrapper:
         self.pp_size = getattr(cache, "pp_size", 1)
         self.pp_rank = getattr(cache, "pp_rank", 0)
         self.lookup_once = envs.SGLANG_LINKER_LOOKUP_ONCE.get()
+        self.insert_at_release = (
+            self.pp_size > 1 and envs.SGLANG_LINKER_PP_LOAD_CONSENSUS.get()
+        )
+        self.fail_load_prob = (
+            envs.SGLANG_TEST_LINKER_FAIL_LOAD_PROB.get()
+            if envs.SGLANG_TEST_LINKER_FAIL_LOAD_STAGE.get() == self.pp_rank
+            else 0.0
+        )
         self.lookup_cache: dict[str, tuple[int, list[int]]] = {}
         # rid -> (device prefix, tail length, tail page hashes) of its last match.
         self.tail_hash_cache: dict[str, tuple[int, int, list[str]]] = {}
@@ -844,6 +853,8 @@ class UnifiedCacheLinkerWrapper:
             req.swa_branching_seqlen = None
         self.private_load_indices[req.rid] = full_transfer.device_indices
         self.inflight_load_rids.append(req.rid)
+        if self.insert_at_release:
+            req.linker_insert_at_release = True
         return len(full_transfer.device_indices), req.last_node
 
     def _update_load(
@@ -973,6 +984,8 @@ class UnifiedCacheLinkerWrapper:
             [int(self.cache_linker.finish_layer_wise_loading(index))],
             dtype=torch.int,
         )
+        if self.fail_load_prob and random.random() < self.fail_load_prob:
+            landed[0] = 0
         self.cache._all_reduce_attn_groups(landed, torch.distributed.ReduceOp.MIN)
         for rid in rids:
             self.private_load_indices.pop(rid, None)

@@ -47,7 +47,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinkerWrapper,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.srt.runtime_context import get_disagg
+from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.kits.unified_radix_cache import fixtures as shared_cache_suite
 from sglang.test.kits.unified_radix_cache.config import (
@@ -352,6 +352,100 @@ class TestUnifiedCacheLinkerPythonBackend(
         req.kv.kv_allocated_len = len(prefix)
         req.extra_key = None
         req.lock = cache.lock(req.last_node)
+
+    def _pp_stages_loading(self, tokens, landed, insert_at_release):
+        """One PP stage per ``landed`` entry, each admitting the same store hit
+        of ``tokens`` and finishing its load as given."""
+        cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
+        self.cfg = cfg
+        stored_keys = defaultdict(set)
+        producer, allocator, req_pool = build_fixture(cfg)
+        producer_linker = _InMemoryUnifiedCacheLinker(stored_keys)
+        producer.init_cache_linker(producer_linker)
+        self._insert(producer, allocator, req_pool, tokens)
+        producer_linker.complete_next_offload(True)
+        producer.check_hicache_events()
+        stages = []
+        for stage_landed in landed:
+            cache, _, req_pool = build_fixture(cfg)
+            linker = _InMemoryUnifiedCacheLinker(stored_keys)
+            cache.init_cache_linker(linker)
+            cache.linker.insert_at_release = insert_at_release
+            req = self._make_req(req_pool)
+            match = cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
+            )
+            self._apply_match_to_req(req, match)
+            cache.init_load_back(
+                InitLoadBackParams(
+                    best_match_node=match.best_match_node,
+                    host_hit_length=match.host_hit_length,
+                    req=req,
+                )
+            )
+            self.assertGreaterEqual(cache.ready_to_load_host_cache(), 0)
+            loaded = cache.linker.private_load_indices[req.rid]
+            self._bind_loaded_request(cache, req_pool, req, tokens, loaded)
+            linker.load_landed = stage_landed
+            cache.pp_size = 2
+            req.disagg_kv_sender = MagicMock()
+            stages.append((cache, req))
+        return stages
+
+    def _device_prefix_len(self, cache, tokens):
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        return match.device_prefix_len
+
+    def test_pp_one_stage_load_failure_splits_the_stage_verdicts(self):
+        # Hecate H112: only the failed stage aborted the request, so the PP
+        # stages' inflight queues differed and the worker crashed.
+        stages = self._pp_stages_loading(list(range(1, 9)), (True, False), False)
+        verdicts = [cache.finish_external_linker_loads([req]) for cache, req in stages]
+        self.assertEqual(verdicts, [[], [stages[1][1]]])
+
+    def test_pp_load_consensus_fails_a_one_stage_failure_on_every_stage(self):
+        from sglang.srt.disaggregation.prefill import (
+            SchedulerDisaggregationPrefillMixin as Prefill,
+        )
+
+        tokens = list(range(1, 9))
+        stages = self._pp_stages_loading(tokens, (True, False), True)
+        with envs.SGLANG_LINKER_PP_LOAD_CONSENSUS.override(True):
+            verdicts = [
+                cache.finish_external_linker_loads([req]) for cache, req in stages
+            ]
+        self.assertEqual(verdicts, [[], []])  # no stage aborts alone
+        # The failed stage fails its send: PP0's release poll takes the minimum.
+        stages[0][1].disagg_kv_sender.abort.assert_not_called()
+        stages[1][1].disagg_kv_sender.abort.assert_called_once()
+        for cache, req in stages:  # every stage concludes the Failed release
+            req.disagg_kv_sender.failure_exception.side_effect = RuntimeError()
+            scheduler = SimpleNamespace(
+                tree_cache=cache,
+                _release_aborted_request=MagicMock(),
+                metrics_reporter=SimpleNamespace(enable_metrics=False),
+            )
+            with get_parallel().override(tp_rank=0):
+                Prefill.handle_inflight_transfer_failure(scheduler, req)
+            self.assertFalse(req.kv.holds_kv)
+            self.assertEqual(self._device_prefix_len(cache, tokens), 0)
+            cache.sanity_check()
+
+    def test_pp_load_consensus_inserts_a_loading_chunk_only_at_release(self):
+        from sglang.srt.disaggregation.prefill import (
+            SchedulerDisaggregationPrefillMixin as Prefill,
+        )
+
+        tokens = list(range(1, 9))
+        ((cache, req),) = self._pp_stages_loading(tokens, (True,), True)
+        self.assertTrue(req.linker_insert_at_release)
+        self.assertEqual(cache.finish_external_linker_loads([req]), [])
+        Prefill.checkpoint_disagg_prefill(SimpleNamespace(tree_cache=cache), req)
+        self.assertEqual(req.prefix_len, len(tokens))
+        self.assertEqual(self._device_prefix_len(cache, tokens), 0)
+        release_kv_cache(req, cache, checkpoint=True)  # release: Success
+        self.assertEqual(self._device_prefix_len(cache, tokens), len(tokens))
+        cache.sanity_check()
 
     def test_full_offload_load_round_trip_and_dedup(self):
         cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)

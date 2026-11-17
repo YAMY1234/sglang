@@ -594,6 +594,11 @@ class SchedulerDisaggregationPrefillMixin:
 
     def checkpoint_disagg_prefill(self: Scheduler, req: Req) -> None:
         cache = self.tree_cache
+        if req.linker_insert_at_release:
+            # A stage's load may have failed: insert at release, once PP0's
+            # consensus has the verdict of every stage.
+            req.prefix_len = req.extend_end
+            return
         if req.pending_bootstrap and _uses_write_through_cache(cache):
             cache.advance_unpublished_req(req)
             req.prefix_len = req.extend_end
@@ -1316,6 +1321,10 @@ class SchedulerDisaggregationPrefillMixin:
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
         if req.finished_reason is None:
             req.finished_reason = FINISH_LENGTH(length=0)
+        if req.linker_insert_at_release:
+            # Some stage's load of it may have failed: no stage caches it, so
+            # every stage's tree stays the same.
+            req.skip_radix_cache_insert = True
         # unlock the tree
         release_kv_cache(req, self.tree_cache, checkpoint=True)
         self._release_aborted_request(req)

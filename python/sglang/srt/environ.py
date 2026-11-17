@@ -964,6 +964,15 @@ class Envs:
     # Store each page's KV and DSA indexer as one Mooncake object ("ki") instead
     # of two, halving the store's objects per page and stage.
     SGLANG_LINKER_MERGE_INDEXER = EnvBool(False)
+    # Under PP disaggregated prefill, a stage whose external linker load failed
+    # fails the request's KV send instead of aborting it locally; PP0's release
+    # consensus then fails it on every stage at once, and a loading request
+    # enters the tree only at that release (no stage diverges).
+    SGLANG_LINKER_PP_LOAD_CONSENSUS = EnvBool(False)
+    # Test only: PP stage whose linker load batches fail at this rate after
+    # they land (-1 = none).
+    SGLANG_TEST_LINKER_FAIL_LOAD_STAGE = EnvInt(-1)
+    SGLANG_TEST_LINKER_FAIL_LOAD_PROB = EnvFloat(0.0)
     # Cap on the lease renewal existence queries, in object keys per second.
     SGLANG_LINKER_LEASE_REFRESH_MAX_KEYS_PER_S = EnvInt(100000)
     # Log each Mooncake linker load's wait, transfer time, bytes and rate.

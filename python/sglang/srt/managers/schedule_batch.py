@@ -1425,6 +1425,9 @@ class Req(ReqDllmMixin):
         # that forward's output is dropped and the request finishes with it.
         self.discard_output_reason: Optional[FINISH_ABORT] = None
         self.disagg_kv_sender: Optional[BaseKVSender] = None
+        # SGLANG_LINKER_PP_LOAD_CONSENSUS: this request loaded an external hit,
+        # so it enters the tree only at its PD release, once every stage agrees.
+        self.linker_insert_at_release = False
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
         self.disagg_prefill_dp_rank: Optional[int] = disagg_prefill_dp_rank
