@@ -913,6 +913,9 @@ class Envs:
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
     # Batch KV event construction without changing the published payload.
     SGLANG_HICACHE_BATCH_EVENTS = EnvBool(False)
+    # With batching: bigram KV-event token_ids pre-encoded as msgpack (byte-identical wire).
+    SGLANG_KV_EVENTS_RAW_TOKENS = EnvBool(False)
+    SGLANG_KV_EVENTS_RAW_TOKENS_VERIFY = EnvInt(0)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)
