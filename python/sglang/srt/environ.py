@@ -961,6 +961,9 @@ class Envs:
     # next this-many waiting requests with a hit on a worker thread, so their
     # admission takes a finished pin instead of waiting on the store (0: off).
     SGLANG_LINKER_PREPIN_DEPTH = EnvInt(0)
+    # Store each page's KV and DSA indexer as one Mooncake object ("ki") instead
+    # of two, halving the store's objects per page and stage.
+    SGLANG_LINKER_MERGE_INDEXER = EnvBool(False)
     # Cap on the lease renewal existence queries, in object keys per second.
     SGLANG_LINKER_LEASE_REFRESH_MAX_KEYS_PER_S = EnvInt(100000)
     # Log each Mooncake linker load's wait, transfer time, bytes and rate.

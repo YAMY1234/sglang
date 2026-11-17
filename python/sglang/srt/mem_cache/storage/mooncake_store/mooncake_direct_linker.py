@@ -504,7 +504,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         object per page, or for a trailing pool one per stop point."""
         schema = []
         for name in self.pools:
-            obj = "k" if name == PoolName.KV else str(name)
+            obj = getattr(self.pools[name], "object_name", None) or (
+                "k" if name == PoolName.KV else str(name)
+            )
             suffix = self.storage.pool_suffixes.get(name, self.storage.mla_suffix)
             schema.append((str(name), obj, suffix, name == PoolName.MAMBA))
         return schema

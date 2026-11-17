@@ -9,6 +9,7 @@ from typing import Any
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -168,6 +169,69 @@ class DevicePoolEntry:
                 sizes.extend([[value] for value in row_sizes])
                 offsets.extend([[value] for value in row_offsets])
         return ptrs, sizes, offsets
+
+
+class MergedPageEntry:
+    """Two DevicePoolEntries of the same pages stored as one object per page:
+    ``second``'s bytes follow ``first``'s (SGLANG_LINKER_MERGE_INDEXER, KV then
+    the DSA indexer). Halves the store objects per page and stage, and with them
+    the master's per-object work on lookups and loads (Rhea 60076)."""
+
+    def __init__(self, first: DevicePoolEntry, second: DevicePoolEntry, object_name: str):
+        flags = ("indices_from_pool", "page_size", "pcp_replicated", "tp_replicated", "dcp_sharded")
+        if not (first.packed and second.packed) or any(
+            getattr(first, f) != getattr(second, f) for f in flags
+        ):
+            raise ValueError(f"Cannot merge {first.name} and {second.name} into one object.")
+        self.first, self.second = first, second
+        self.name, self.object_name = first.name, object_name
+        for flag in flags:
+            setattr(self, flag, getattr(first, flag))
+        self.device_pool = first.device_pool
+        self.packed = True
+        self.layer_mapping = {**second.layer_mapping, **first.layer_mapping}
+        self.kv_buffer = first.kv_buffer + second.kv_buffer
+        self.buffer_meta = first.buffer_meta + second.buffer_meta
+        self._first_bytes = sum(size for c in first.buffer_meta for *_, size in c)
+
+    def get_hybrid_pool_buffer(self) -> list[torch.Tensor]:
+        return self.kv_buffer
+
+    def translate_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        return self.first.translate_indices(indices)
+
+    def get_page_buffer_meta(self, indices: torch.Tensor):
+        ptrs1, sizes1 = self.first.get_page_buffer_meta(indices)
+        ptrs2, sizes2 = self.second.get_page_buffer_meta(indices)
+        pages = indices.numel() // self.page_size
+        a, b = len(ptrs1) // max(pages, 1), len(ptrs2) // max(pages, 1)
+        ptrs, sizes = [], []
+        for page in range(pages):
+            ptrs += ptrs1[page * a : (page + 1) * a] + ptrs2[page * b : (page + 1) * b]
+            sizes += sizes1[page * a : (page + 1) * a] + sizes2[page * b : (page + 1) * b]
+        return ptrs, sizes
+
+    def prepare_locations(self, indices: torch.Tensor) -> list[tuple[int, int]]:
+        return list(
+            zip(self.first.prepare_locations(indices), self.second.prepare_locations(indices))
+        )
+
+    def get_prepared_layer_range_meta(self, locations, layer: int):
+        meta1 = self.first.get_prepared_layer_range_meta([l[0] for l in locations], layer)
+        meta2 = self.second.get_prepared_layer_range_meta([l[1] for l in locations], layer)
+        if meta1 is None and meta2 is None:
+            return None
+        empty = ([[] for _ in locations],) * 3
+        (p1, s1, o1), (p2, s2, o2) = meta1 or empty, meta2 or empty
+        offsets = [
+            first + [offset + self._first_bytes for offset in second]
+            for first, second in zip(o1, o2)
+        ]
+        return (
+            [a + b for a, b in zip(p1, p2)],
+            [a + b for a, b in zip(s1, s2)],
+            offsets,
+        )
 
 
 class DevicePoolGroup:
@@ -633,7 +697,7 @@ def _build_mamba_device_pool_group(
             mapping = _stage_local_layer_mapping(
                 kvcache.full_attention_layer_id_mapping, kvcache.start_layer
             )
-            entries.append(
+            indexer = (
                 DevicePoolEntry(
                     name=PoolName.INDEXER,
                     indices_from_pool=PoolName.KV,
@@ -650,6 +714,10 @@ def _build_mamba_device_pool_group(
                     index_mapper=dcp_mapper,
                 )
             )
+            if envs.SGLANG_LINKER_MERGE_INDEXER.get():
+                entries[0] = MergedPageEntry(entries[0], indexer, object_name="ki")
+            else:
+                entries.append(indexer)
     for draft_pool in params.sidecar_draft_device_pools:
         draft_dcp_sharded = draft_pool.rows_are_dcp_collapsed
         draft_page_size = page_size // dcp_size if draft_dcp_sharded else page_size

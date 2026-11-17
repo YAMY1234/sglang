@@ -69,6 +69,59 @@ class TestDevicePoolEntry(CustomTestCase):
         self.assertEqual(sizes, [[10], [22], [10], [22]])
         self.assertEqual(offsets, [[6], [14], [6], [14]])
 
+    def test_merged_page_entry_stores_kv_then_indexer_in_one_object(self):
+        # Rhea 60076 / Hecate H112: two objects per page and stage (KV, DSA
+        # indexer) doubled the master's per-object work on lookups and loads.
+        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+            MergedPageEntry,
+        )
+
+        kv0 = torch.zeros((8, 4), dtype=torch.uint8)
+        kv2 = torch.zeros((8, 4), dtype=torch.uint8)
+        ix = torch.zeros((4, 3), dtype=torch.uint8)  # one row per page, layer 2 only
+        kv = DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=None,
+            components=[[kv0, kv2]],
+            layer_mapping={0: 0, 2: 1},
+            page_size=2,
+            rows_are_pages=False,
+        )
+        indexer = DevicePoolEntry(
+            name=PoolName.INDEXER,
+            indices_from_pool=PoolName.KV,
+            device_pool=None,
+            components=[[ix]],
+            layer_mapping={2: 0},
+            page_size=2,
+            rows_are_pages=True,
+        )
+        pool = MergedPageEntry(kv, indexer, object_name="ki")
+        self.assertEqual((pool.name, pool.object_name), (PoolName.KV, "ki"))
+
+        indices = torch.tensor([0, 1, 4, 5])  # pages 0 and 2
+        locations = pool.prepare_locations(indices)
+        self.assertEqual(locations, [(0, 0), (4, 2)])
+        pointers, sizes = pool.get_page_buffer_meta(indices)
+        self.assertEqual(
+            pointers,
+            [kv0[0].data_ptr(), kv2[0].data_ptr(), ix[0].data_ptr()]
+            + [kv0[4].data_ptr(), kv2[4].data_ptr(), ix[2].data_ptr()],
+        )
+        self.assertEqual(sizes, [8, 8, 3] * 2)  # each object: the KV page, then the indexer row
+
+        pointers, sizes, offsets = pool.get_prepared_layer_range_meta(locations, 0)
+        self.assertEqual(pointers, [[kv0[0].data_ptr()], [kv0[4].data_ptr()]])
+        self.assertEqual(offsets, [[0], [0]])
+        pointers, sizes, offsets = pool.get_prepared_layer_range_meta(locations, 2)
+        self.assertEqual(
+            pointers, [[kv2[0].data_ptr(), ix[0].data_ptr()], [kv2[4].data_ptr(), ix[2].data_ptr()]]
+        )
+        self.assertEqual(sizes, [[8, 3], [8, 3]])
+        self.assertEqual(offsets, [[8, 16], [8, 16]])  # the indexer starts after both KV layers
+        self.assertIsNone(pool.get_prepared_layer_range_meta(locations, 1))
+
     def test_rejects_invalid_pages_and_empty_buffers(self):
         with self.assertRaisesRegex(ValueError, "has no storage buffers"):
             DevicePoolEntry(
@@ -817,6 +870,17 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                 entry.translate_indices(torch.tensor([4, 5]))
             )
             self.assertEqual(locations, [2], name)
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_LINKER_MERGE_INDEXER.override(True):
+            group = resolve(dcp_size=2)
+        self.assertNotIn(PoolName.INDEXER, group.entry_map)
+        merged = group.entry_map[PoolName.KV]
+        self.assertEqual(merged.object_name, "ki")
+        self.assertEqual(
+            merged.prepare_locations(merged.translate_indices(torch.tensor([4, 5]))),
+            [(2, 2)],
+        )
         params.mtp_draft_device_pools = (object(),)
         with self.assertRaisesRegex(ValueError, "plain MLA"):
             resolve()

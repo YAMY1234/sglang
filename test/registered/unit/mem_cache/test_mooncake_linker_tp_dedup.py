@@ -327,6 +327,22 @@ def _full_scan(present, num_pages, num_stages):
     return [p for p in stops if p <= contiguous]
 
 
+class TestMergedIndexerKeys(CustomTestCase):
+    def test_a_merged_page_object_is_one_key_per_page_and_stage(self):
+        # SGLANG_LINKER_MERGE_INDEXER: KV and the DSA indexer of a page are one
+        # object ("ki"), so lookups, pins and lease renewals ask half the keys.
+        linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        linker.pools = {
+            PoolName.KV: SimpleNamespace(object_name="ki"),
+            PoolName.MAMBA: SimpleNamespace(),
+        }
+        linker.storage = SimpleNamespace(pool_suffixes={}, mla_suffix="tp0_cp0_pp0")
+        self.assertEqual(
+            linker._pool_key_schema(),
+            [("kv", "ki", "tp0_cp0_pp0", False), ("mamba", "mamba", "tp0_cp0_pp0", True)],
+        )
+
+
 class TestLookupCost(CustomTestCase):
     """Rhea 60076: about 24 objects queried per page held PP0 on the master's
     ExistKey ceiling. A lookup queries one stage's state per page and a
