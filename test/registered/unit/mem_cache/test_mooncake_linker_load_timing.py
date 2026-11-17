@@ -178,6 +178,27 @@ def _meminfo(node, total_kb, free_kb, file_kb, dirty_kb, reclaimable_kb):
     ) + f"Node {node} HugePages_Total:     0\n"
 
 
+class TestRecentKeys(CustomTestCase):
+    def test_full_set_drops_its_oldest_keys_in_constant_time(self):
+        # Hecate H106: dropping a full plain dict's first key scanned the slots
+        # freed before it; every load then held its scheduler for seconds.
+        recent = mooncake_direct_linker._RecentKeys(500_000)
+        loads = [[f"k{load}-{i}" for i in range(4_800)] for load in range(125)]
+        for keys in loads[:105]:  # one load's objects at a time, past capacity
+            recent.add(keys)
+        began = time.perf_counter()
+        for keys in loads[105:]:
+            recent.add(keys)
+        self.assertLess(time.perf_counter() - began, 0.5)  # a plain dict took ~2 s
+        self.assertEqual(len(recent.keys), 500_000)
+        self.assertNotIn("k20-3999", recent)  # the oldest 100,000 keys are gone
+        self.assertIn("k20-4000", recent)
+        recent.add(["k20-4000"])  # a key read again moves to the newest end
+        recent.add(["newest"])
+        self.assertIn("k20-4000", recent)
+        self.assertNotIn("k20-4001", recent)
+
+
 class TestMooncakeLinkerNumaHeadroom(CustomTestCase):
     def _sysfs(self, tmp, nodes):
         paths = []

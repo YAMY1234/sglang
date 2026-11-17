@@ -7,7 +7,7 @@ import os
 import re
 import threading
 import time
-from collections import Counter, deque
+from collections import Counter, OrderedDict, deque
 from collections.abc import Callable
 from copy import deepcopy
 from queue import Empty, Queue
@@ -189,18 +189,20 @@ def _percentile(values: list[float], q: float) -> float:
 class _RecentKeys:
     """Object keys read from the store lately, oldest dropped past capacity: a
     write-through of a tail that was just loaded skips their existence query
-    and put. Added on the scheduler thread, read on the offload thread."""
+    and put. Added on the scheduler thread, read on the offload thread.
+    OrderedDict: dropping a plain dict's first key scans the slots freed before
+    it, which stalled Hecate H106's every load once full."""
 
     def __init__(self, capacity: int):
         self.capacity = capacity
-        self.keys: dict[str, None] = {}
+        self.keys: OrderedDict[str, None] = OrderedDict()
 
     def add(self, keys: list[str]) -> None:
         for key in keys:
-            self.keys.pop(key, None)
             self.keys[key] = None
+            self.keys.move_to_end(key)
         while len(self.keys) > self.capacity:
-            self.keys.pop(next(iter(self.keys)))
+            self.keys.popitem(last=False)
 
     def __contains__(self, key: str) -> bool:
         return key in self.keys

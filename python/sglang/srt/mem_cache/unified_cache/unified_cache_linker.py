@@ -673,7 +673,8 @@ class UnifiedCacheLinkerWrapper:
         computed KV after its forward, once :meth:`finish_loads` has confirmed
         the load.
         """
-        if self.pp_size == 1 or req.rid not in self.hit_markers:
+        # Timed on PP0, the rank that logs it.
+        if self.pp_size == 1 or self.pp_rank != 0 or req.rid not in self.hit_markers:
             return self._load_back(req)
         began = time.monotonic()
         self.admission_rpc_s = 0.0
