@@ -445,6 +445,138 @@ class TestDcpDsaIndexKTransfer(unittest.TestCase):
                     np.testing.assert_array_equal(dst_buffers[base], expected)
 
 
+class TestDcpVectorizedDescriptors(unittest.TestCase):
+    """SGLANG_DISAGG_DCP_VECTORIZED_BLOCKS builds the same Mooncake descriptors
+    as the per-run Python path, from NumPy runs."""
+
+    PAGE, DCP = 64, 8
+
+    @staticmethod
+    def _python_blocks(src_ptr, dst_ptr, item_len, src_rows, dst_rows):
+        from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
+
+        src_groups, dst_groups = group_concurrent_contiguous(src_rows, dst_rows)
+        return [
+            (
+                src_ptr + int(s[0]) * item_len,
+                dst_ptr + int(d[0]) * item_len,
+                len(s) * item_len,
+            )
+            for s, d in zip(src_groups, dst_groups)
+        ]
+
+    def test_runs_match_python_groups_on_random_layouts(self):
+        from sglang.srt.disaggregation.common.utils import (
+            contiguous_runs,
+            transfer_blocks_from_runs,
+        )
+
+        rng = np.random.default_rng(7)
+        for n in (0, 1, 2, 63, 64, 65, 1000):
+            for _ in range(5):
+                # Runs of random length with random jumps, as page-mapped rows are.
+                src = np.cumsum(rng.choice([1, 1, 1, 5, -40], size=n)) + 10**6
+                dst = np.cumsum(rng.choice([1, 1, 1, 1, 9], size=n)) + 10**5
+                with self.subTest(n=n):
+                    self.assertEqual(
+                        transfer_blocks_from_runs(
+                            1 << 40, 1 << 41, 656, contiguous_runs(src, dst)
+                        ),
+                        self._python_blocks(1 << 40, 1 << 41, 656, src, dst),
+                    )
+        with self.assertRaisesRegex(ValueError, "equal-length"):
+            contiguous_runs(np.arange(3), np.arange(4))
+
+    def _send(self, rank, tokens, page_offset, prefix, custom_pool, vectorized, seed):
+        rng = np.random.default_rng(seed)
+        src_pages = rng.permutation(4096)[: -(-tokens // self.PAGE)].astype(np.int32)
+        virtual_page = self.PAGE * self.DCP
+        dst_page_count = -(-(page_offset * self.PAGE + tokens) // virtual_page) + 1
+        dst_pages = rng.permutation(4096)[:dst_page_count].astype(np.int32)
+        item_lens = [656, 656, 656, 656, 1152]  # four target layers, one draft entry
+        sent = []
+        lock = Lock()
+
+        def transfer(session, blocks):
+            with lock:
+                sent.extend(blocks)
+            return 0
+
+        manager = SimpleNamespace(
+            is_mla_backend=False,
+            kv_args=SimpleNamespace(
+                page_size=self.PAGE,
+                kv_layer_ids=[1, 2, 3, 4, 99],
+                kv_data_ptrs=[1 << 40, 2 << 40, 3 << 40, 4 << 40, 5 << 40],
+                num_draft_entries=1,
+                engine_rank=0,
+            ),
+            attn_tp_size=1,
+            max_transfer_batch_indices=0,
+            enable_custom_mem_pool=custom_pool,
+            _transfer_data=transfer,
+            _await_transfer_futures=lambda futures: max(f.result() for f in futures),
+        )
+        env = {"SGLANG_DISAGG_DCP_VECTORIZED_BLOCKS": "1" if vectorized else "0"}
+        with (
+            patch.dict("os.environ", env),
+            concurrent.futures.ThreadPoolExecutor() as executor,
+        ):
+            result = MooncakeKVManager.send_kvcache_dcp(
+                manager,
+                "session",
+                src_pages,
+                [11 << 40, 12 << 40, 13 << 40, 14 << 40, 15 << 40, 16 << 40],
+                dst_pages,
+                dcp_token_item_lens=item_lens,
+                dst_dcp_size=self.DCP,
+                dst_dcp_rank=rank,
+                src_page_offset=page_offset,
+                decode_prefix_len=prefix,
+                num_kv_tokens=tokens,
+                executor=executor,
+                dst_layer_ids=[0, 1, 2, 3, 4, 99],
+                dst_kv_item_lens=[self.PAGE * 656] * 5 + [self.PAGE * self.DCP * 1152],
+            )
+        self.assertEqual(result, 0)
+        return sorted(sent)
+
+    def test_send_kvcache_dcp_vectorized_matches_python_path(self):
+        from sglang.srt.disaggregation.mooncake import conn
+
+        for rank in range(self.DCP):  # the draft goes to all eight ranks
+            shapes = ((1000, 0, 0), (1000, 3, 512), (16384, 0, 1024), (37, 2, 0))
+            for tokens, page_offset, prefix in shapes:
+                for custom_pool in (False, True):
+                    args = (rank, tokens, page_offset, prefix, custom_pool)
+                    with self.subTest(args=args):
+                        expected = self._send(*args, vectorized=False, seed=rank)
+                        with patch.object(
+                            conn, "contiguous_runs", wraps=conn.contiguous_runs
+                        ) as runs:
+                            actual = self._send(*args, vectorized=True, seed=rank)
+                        self.assertTrue(runs.called)
+                        self.assertEqual(actual, expected)
+                        self.assertTrue(expected)
+
+    def test_send_stats_log_reports_decode_prefix_hits(self):
+        manager_cls = MooncakeKVManager
+        stats = SimpleNamespace(
+            _dcp_send_stats_lock=Lock(),
+            _dcp_send_stats=manager_cls._new_dcp_send_stats(),
+            _new_dcp_send_stats=manager_cls._new_dcp_send_stats,
+        )
+        env = {"SGLANG_DISAGG_DCP_SEND_STATS_INTERVAL": "1e-9"}
+        with patch.dict("os.environ", env), self.assertLogs(
+            "sglang.srt.disaggregation.mooncake.conn", level="INFO"
+        ) as logs:
+            manager_cls._record_dcp_send(stats, 1000, 512, True, 0.004)
+        self.assertIn("1 sends, 1000 tokens", logs.output[0])
+        self.assertIn(
+            "decode prefix on 1/1 first chunks (mean 512 tokens)", logs.output[0]
+        )
+
+
 class TestDcpPackLifetime(CustomTestCase):
     def test_failed_transfer_drains_before_pack_buffer_reuse(self):
         """A failed layer must not release the pack buffer while another transfer reads it."""
