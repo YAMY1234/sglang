@@ -222,7 +222,7 @@ def on_kv_send(req, tokens: int) -> None:
         kv[3] += 1
 
 
-def on_batch_result(batch) -> None:
+def on_batch_result(batch, result=None) -> None:
     """Called once per processed batch; decode batches omit rids (join by rank + time)."""
     if not _BATCH:
         return
@@ -239,6 +239,10 @@ def on_batch_result(batch) -> None:
         "mode": mode.name if hasattr(mode, "name") else str(mode),
         "bs": len(reqs),
         "ext_tokens": batch.extend_num_tokens or 0,
+        # context tokens the step reads (decode cost driver) and accepted draft tokens (spec decoding, bonus excluded)
+        # seq_lens_cpu is a host tensor (no device sync); batch.copy() keeps it, unlike seq_lens_sum
+        "ctx": int(batch.seq_lens_cpu.sum()) if batch.seq_lens_cpu is not None else None,
+        "acc": getattr(result, "num_correct_drafts", None),
     }
     if mode.is_extend() and len(reqs) <= _BATCH_RIDS_MAX:
         rec["rids"] = [r.rid for r in reqs]

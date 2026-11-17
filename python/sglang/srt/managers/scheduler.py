@@ -5858,7 +5858,7 @@ class Scheduler(
 
         self._record_step_counters(batch, result)
         if req_profile.ENABLED:
-            req_profile.on_batch_result(batch)
+            req_profile.on_batch_result(batch, result)
 
         self.metrics_reporter.log_batch_result_stats(batch, result)
 
