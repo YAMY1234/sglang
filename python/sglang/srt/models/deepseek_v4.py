@@ -846,13 +846,14 @@ def _wo_a_weight_sf_128x4(weight_scale: torch.Tensor) -> torch.Tensor:
 
 
 def _cudnn_wo_a(
-    o_fp8: torch.Tensor,
-    o_sf: torch.Tensor,
+    split,
     weight: torch.Tensor,
+    weight_scale: torch.Tensor,
     weight_sf_128x4: torch.Tensor,
 ) -> Mxfp8SwizzledInput:
-    """wo_a on cuDNN: ``o_fp8 [m, g, k]`` with per-group 128x4 ``o_sf [g, words]`` ->
-    wo_b's MXFP8 input with token-tile-major 128x4 scales."""
+    """wo_a for a ``MegaPrefillSplit``: the 128-aligned head ``[m1, g, k]`` (per-group 128x4
+    scales) on one cuDNN BMM, a tail of < 128 rows (packed scales) on DeepGEMM's
+    fp8_einsum, both into one wo_b MXFP8 input with token-tile-major 128x4 scales."""
     from flashinfer.gemm.gemm_base import (
         DEFAULT_WORKSPACE_SIZE,
         _get_cache_buf,
@@ -860,20 +861,40 @@ def _cudnn_wo_a(
     )
 
     g, n, k = weight.shape
-    m = o_fp8.shape[0]
-    device = o_fp8.device
+    m1 = split.head_data.shape[0]
+    m = m1 + (0 if split.tail_data is None else split.tail_data.shape[0])
+    device = split.head_data.device
     z = torch.empty((m, g, n), dtype=torch.float8_e4m3fn, device=device)
-    z_sf = torch.empty((g, m // 128, 128 * n // 32), dtype=torch.uint8, device=device)
+    # FlashInfer's 128x4 layout: per 128-row tile, g * n / 128 atoms of 32 x 4 int32.
+    z_sf = mhc.empty_deepgemm_mxfp8_scales(m, g * n, device, flashinfer=True)
+    head_sf = torch.empty((g, m1 // 128, 128 * n // 32), dtype=torch.uint8, device=device)
     workspace = _get_cache_buf("bmm_mxfp8_workspace", DEFAULT_WORKSPACE_SIZE, device)
-    tensors = (o_fp8, weight, o_sf.view(torch.uint8).view(-1), weight_sf_128x4, z, z_sf)
-    _wo_a_cudnn_graph(g, n, k, m, device).execute(
+    tensors = (
+        split.head_data,
+        weight,
+        split.head_sf.view(torch.uint8).view(-1),
+        weight_sf_128x4,
+        z[:m1],
+        head_sf,
+    )
+    _wo_a_cudnn_graph(g, n, k, m1, device).execute(
         {uid + 1: t for uid, t in enumerate(tensors)},
         workspace,
         handle=_get_cudnn_handle(device, torch.cuda.current_stream(device)),
     )
     # cuDNN writes each group's scale atoms together; wo_b reads them token-tile major.
-    if m > 128:
-        z_sf = z_sf.view(torch.int64).transpose(0, 1).contiguous()
+    z_sf[: m1 // 128].view(torch.int64).view(m1 // 128, g, -1).copy_(
+        head_sf.view(torch.int64).transpose(0, 1)
+    )
+    if split.tail_data is not None:
+        _fp8_wo_a_einsum(
+            split.tail_data[:, :g],
+            split.tail_sf[:, :g],
+            weight,
+            weight_scale,
+            recipe=(1, 1, 32),
+            out=(z[m1:], z_sf[m1 // 128 :]),
+        )
     return Mxfp8SwizzledInput(z.view(m, g * n), z_sf.view(torch.uint8).view(-1))
 
 
@@ -1932,7 +1953,6 @@ class MQALayer(MqaAttentionBase):
         return (
             envs.SGLANG_OPT_DSV41_WO_A_CUDNN.get()
             and rows >= _WO_A_CUDNN_MIN_ROWS
-            and rows % 128 == 0
             and get_platform().device_sm == 107
             and self.n_local_groups * 8 == self.n_local_heads
             and self._mega_mxfp8_output(rows)
@@ -1967,16 +1987,20 @@ class MQALayer(MqaAttentionBase):
             cos_sin_cache=self.mega_cos_sin_cache,
             mega_sf_swizzled_128x4=cudnn_wo_a,
         )
-        if scale.dim() == 2:
-            # The backend wrote per-group 128x4 scales (only when asked to).
+        from sglang.srt.layers.attention.deepseek_v4_mega_backend import (
+            MegaPrefillSplit,
+        )
+
+        if isinstance(data, MegaPrefillSplit):
+            # The backend wrote per-group 128x4 scales for the 128-aligned rows (only when asked to).
             if self._wo_a_cudnn_sf is None:
                 self._wo_a_cudnn_sf = _wo_a_weight_sf_128x4(self.mega_wo_a[1])
                 print_info_once("MegaAttention prefill wo_a: cuDNN MXFP8 BMM")
             _WO_A_CUDNN_CALLS[0] += 1
             n = _WO_A_CUDNN_CALLS[0]
             if n & (n - 1) == 0:  # engagement count at powers of two
-                logger.info("wo_a cuDNN MXFP8 BMM calls: %d (rows %d)", n, data.shape[0])
-            return _cudnn_wo_a(data, scale, self.mega_wo_a[0], self._wo_a_cudnn_sf)
+                logger.info("wo_a cuDNN MXFP8 BMM calls: %d (rows %d)", n, q.shape[0])
+            return _cudnn_wo_a(data, *self.mega_wo_a, self._wo_a_cudnn_sf)
         groups = self.n_local_groups
         rows = data.shape[0]
         o_fp8, o_s = data[:, :groups], scale[:, :groups]
