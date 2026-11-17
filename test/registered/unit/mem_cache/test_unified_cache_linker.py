@@ -843,21 +843,33 @@ class TestLinkerDevicePrefetch(CustomTestCase):
             self._admit_and_release(cache, queued[1])
             self._assert_balanced(cache, allocator)
 
-    def test_queue_lock_depth_follows_the_admission_rate(self):
-        """The window holds about qlock_seconds of the observed admissions."""
+    def test_queue_lock_window_follows_the_admitted_work(self):
+        """The window holds the queued requests that start within qlock_seconds of
+        prefill at the observed rate of new tokens, not of admitted requests."""
         from sglang.srt.environ import envs
 
         with envs.SGLANG_EXTERNAL_LINKER_QUEUE_LOCK_FRACTION.override(0.5):
             cache, backend, _, allocator = self._fixture()
             queued = [self._resident(cache, backend, f"d{i}", 1 + 10 * i) for i in range(2)]
             linker = cache.linker
-            now = time.monotonic()
-            linker._admit_times.clear()
-            linker._admit_times.extend([now - 10.0, now - 5.0])
             linker.qlock_seconds = 4.0
+            now = time.monotonic()
+            # Each queued request brings 1 new token; 2 tokens in 10 s cover 0.8 tokens.
+            linker._admit_times.clear()
+            linker._admit_times.extend([(now - 10.0, 1), (now - 5.0, 1)])
             cache.protect_queued_prefixes(queued)
             assert list(linker.qlocks) == [queued[0].cache_request_handle]
+            # Two large admissions in 10 s: 4 tokens of work reach both requests.
+            linker._admit_times.clear()
+            linker._admit_times.extend([(now - 10.0, 5), (now - 5.0, 5)])
+            cache.protect_queued_prefixes(queued)
+            assert list(linker.qlocks) == [r.cache_request_handle for r in queued]
+            for req in queued:
+                linker._release_qlock(req.cache_request_handle, admitted=False)
+            linker._qlock_empty.clear()
             # A pipeline stage given stage 0's depth uses it as is.
+            linker._admit_times.clear()
+            linker._admit_times.extend([(now - 10.0, 1), (now - 5.0, 1)])
             cache.protect_queued_prefixes(queued, depth_override=2)
             assert list(linker.qlocks) == [r.cache_request_handle for r in queued]
             for req in queued:

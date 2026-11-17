@@ -384,8 +384,10 @@ class UnifiedCacheLinkerWrapper:
         self._qlock_empty: set[CacheRequestHandle] = set()
         # Queued requests whose look-ahead re-query waits for load-cap room: device tokens.
         self._qlock_short: dict[CacheRequestHandle, int] = {}
-        # Admission times over the last 30 s, for the window's depth in requests.
-        self._admit_times: collections.deque[float] = collections.deque()
+        # (time, new tokens) of the admissions over the last 30 s: the window's prefill rate.
+        self._admit_times: collections.deque[tuple[float, int]] = collections.deque()
+        # Queued request -> its input tokens, for the new tokens it brings at admission.
+        self._input_len: dict[CacheRequestHandle, int] = {}
         self._qlock_stats = dict.fromkeys(
             (
                 "locked",
@@ -556,6 +558,8 @@ class UnifiedCacheLinkerWrapper:
         for previous in [h for h in self.holds if h.rid == request.rid]:
             if previous != request:
                 self.release_hold(previous, admitted=False)
+        if self.qlock_cap_tokens:
+            self._input_len[request] = len(req.origin_input_ids)
         if self.cache.disable or request in self.prefetches or request in self.lookups:
             return
         timed = self.log_lookup_stats
@@ -1054,31 +1058,30 @@ class UnifiedCacheLinkerWrapper:
             self.held_tokens -= hold.tokens
             stats["admitted" if admitted else "released"] += 1
         self._release_qlock(request, admitted=admitted)
+        if self.qlock_cap_tokens:
+            input_len = self._input_len.pop(request, None)
+            if admitted and input_len is not None:
+                self._admit_times.append((time.monotonic(), max(input_len - prefix_len, 0)))
         if admitted:
-            if self.qlock_cap_tokens:
-                self._admit_times.append(time.monotonic())
             self._log_holds()
 
     def protect_queue(self, reqs: Sequence[Req], depth_override: Optional[int] = None) -> None:
         """At the event-loop boundary: lock the device prefixes of the queued requests
-        next in line, while their tokens fit the cap and the depth the expected
-        admissions in qlock_seconds allow; queue a re-query for a request that
+        in the window (those admitted within qlock_seconds at the observed prefill
+        rate) while their tokens fit the cap; queue a re-query for a request that
         reaches the window with part of its prefix already lost."""
         if not self.qlock_cap_tokens:
             return
-        # A pipeline stage that admits at other times takes stage 0's depth instead.
-        depth_cap = self.qlock_depth_cap() if depth_override is None else depth_override
+        window = self._window_requests(reqs, depth_override)
         if self.qlock_defer_far:
-            self._window = {r.cache_request_handle for r in itertools.islice(reqs, depth_cap)}
-            self._window_full = len(reqs) > depth_cap
+            self._window = {r.cache_request_handle for r in window}
+            self._window_full = len(window) < len(reqs)
         # Look-ahead loads take load-cap room head first; a lookup the cap would refuse
         # is not sent, so a full cap does not turn into a lookup every loop.
         room = self._load_room()
         keep: set[CacheRequestHandle] = set()
         tokens = depth = 0
-        for req in reqs:
-            if depth >= depth_cap:
-                break
+        for req in window:
             request = req.cache_request_handle
             depth += 1
             if (
@@ -1120,16 +1123,35 @@ class UnifiedCacheLinkerWrapper:
         self.qlocked_tokens = tokens
         self._qlock_peak = [max(self._qlock_peak[0], depth), max(self._qlock_peak[1], tokens)]
 
-    def qlock_depth_cap(self) -> int:
-        """Requests in the window: those expected within qlock_seconds, from the
-        last 30 s of admissions; unbounded (the token cap rules) until one is seen."""
+    def _window_requests(
+        self, reqs: Sequence[Req], depth_override: Optional[int]
+    ) -> list[Req]:
+        """The queue's head up to the first request that starts after qlock_seconds of
+        prefill work; a pipeline stage that admits at other times passes stage 0's depth."""
+        if depth_override is not None:
+            return list(itertools.islice(reqs, depth_override))
+        budget = self.qlock_window_tokens()
+        window: list[Req] = []
+        work = 0
+        for req in reqs:
+            if window and work >= budget:
+                break
+            window.append(req)
+            # A loaded prefix is not prefilled; its target is what the load leaves.
+            known = max(req.prefix_len, self.match_targets.get(req.cache_request_handle, 0))
+            work += max(len(req.origin_input_ids) - known, 0)
+        return window
+
+    def qlock_window_tokens(self) -> float:
+        """New tokens prefilled in qlock_seconds at the rate of the last 30 s of
+        admissions; unbounded (the token cap rules) until two are seen."""
         now = time.monotonic()
-        while self._admit_times and now - self._admit_times[0] > 30.0:
+        while self._admit_times and now - self._admit_times[0][0] > 30.0:
             self._admit_times.popleft()
         if len(self._admit_times) < 2:
-            return 1 << 30
-        span = max(now - self._admit_times[0], 1.0)
-        return max(1, math.ceil(len(self._admit_times) / span * self.qlock_seconds))
+            return math.inf
+        span = max(now - self._admit_times[0][0], 1.0)
+        return sum(n for _, n in self._admit_times) / span * self.qlock_seconds
 
     def _lock_queued(
         self, req: Req, room: float
@@ -1510,6 +1532,7 @@ class UnifiedCacheLinkerWrapper:
             self._release_qlock(request, admitted=False)
         self._qlock_empty.clear()
         self._qlock_short.clear()
+        self._input_len.clear()
         self._window.clear()
         self._window_full = False
         self.unheld.clear()
