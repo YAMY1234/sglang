@@ -772,6 +772,7 @@ def _fp8_wo_a_einsum(
 # SGLANG_OPT_DSV41_WO_A_CUDNN: prefill wo_a as one cuDNN MXFP8 BMM (the graph vLLM's
 # DSV4.1 MegaAttention builds), from rows where DeepGEMM's 128x256 tiles take several waves.
 _WO_A_CUDNN_MIN_ROWS = 4096
+_WO_A_CUDNN_CALLS = [0]
 
 
 @functools.lru_cache(maxsize=None)
@@ -1971,6 +1972,10 @@ class MQALayer(MqaAttentionBase):
             if self._wo_a_cudnn_sf is None:
                 self._wo_a_cudnn_sf = _wo_a_weight_sf_128x4(self.mega_wo_a[1])
                 print_info_once("MegaAttention prefill wo_a: cuDNN MXFP8 BMM")
+            _WO_A_CUDNN_CALLS[0] += 1
+            n = _WO_A_CUDNN_CALLS[0]
+            if n & (n - 1) == 0:  # engagement count at powers of two
+                logger.info("wo_a cuDNN MXFP8 BMM calls: %d (rows %d)", n, data.shape[0])
             return _cudnn_wo_a(data, scale, self.mega_wo_a[0], self._wo_a_cudnn_sf)
         groups = self.n_local_groups
         rows = data.shape[0]
