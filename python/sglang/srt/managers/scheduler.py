@@ -1285,6 +1285,8 @@ class Scheduler(
             self.model_worker = self.tp_worker
         else:
             self.model_worker = self.draft_worker
+        if req_profile.GPU_TIME:
+            req_profile.wrap_forward(self.model_worker)
 
         # Get token and memory info from the model worker
         (

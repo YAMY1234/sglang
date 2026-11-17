@@ -503,6 +503,8 @@ class Envs:
     # Request-level profiling export (observability/req_profile.py); empty = off.
     SGLANG_REQ_PROFILE_DIR = EnvStr("")
     SGLANG_REQ_PROFILE_BATCH = EnvBool(True)
+    # per-batch GPU time (CUDA event pair around each forward, read without host sync)
+    SGLANG_REQ_PROFILE_GPU_TIME = EnvBool(False)
     SGLANG_TRACE_ASYNC_FLUSH_THRESHOLD = EnvInt(100)
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
     SGLANG_ENABLE_METRICS_DP_ATTENTION = EnvBool(False)

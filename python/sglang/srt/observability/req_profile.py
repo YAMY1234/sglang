@@ -5,6 +5,7 @@ Each scheduler process appends to <dir>/reqprof-<host>-<pid>.jsonl:
   {"k": "anchor"}  every few seconds: wall ns, perf_counter, monotonic, written/dropped counts
   {"k": "req"}     once per request finished on this scheduler (attn TP rank 0 only)
   {"k": "batch"}   once per processed batch (attn TP rank 0 only)
+  {"k": "gpu"}     forward GPU time of a batch, joined to its batch record by iter (SGLANG_REQ_PROFILE_GPU_TIME)
 Times are raw time.perf_counter() / time.monotonic() seconds; anchors map them to wall clock
 offline, so the scheduler thread only builds a small dict. Encoding and I/O run on a daemon
 thread; when the backlog exceeds the cap, records are dropped and counted, never blocked on.
@@ -25,6 +26,7 @@ from sglang.srt.environ import envs
 _DIR = envs.SGLANG_REQ_PROFILE_DIR.get() or ""
 ENABLED = bool(_DIR)
 _BATCH = ENABLED and envs.SGLANG_REQ_PROFILE_BATCH.get()
+GPU_TIME = _BATCH and envs.SGLANG_REQ_PROFILE_GPU_TIME.get()
 _MAX_PENDING = 200_000
 _FLUSH_S = 0.5
 _ANCHOR_S = 5.0
@@ -268,3 +270,29 @@ def on_batch_result(batch, result=None) -> None:
         rec["rids"] = [r.rid for r in reqs]
         rec["ext_lens"] = list(batch.extend_lens) if batch.extend_lens is not None else None
     w.put(rec)
+
+
+def _on_gpu_time(t, iter):
+    w = _get()
+    if w is not None:
+        w.put({"k": "gpu", "iter": iter, "ms": round(t * 1e3, 3)})
+
+
+def wrap_forward(worker) -> None:
+    """Time each batch's forward with a CUDA event pair on the current stream (SGLang's DeviceTimer: intervals are
+    reported once their end event has completed, polled at later forwards, so the scheduler never waits on the GPU)."""
+    from sglang.srt.runtime_context import get_parallel
+    from sglang.srt.utils.device_timer import DeviceTimer
+
+    if get_parallel().attn_tp_rank != 0:
+        return
+    timer = DeviceTimer(reporter=_on_gpu_time)
+    forward = worker.forward_batch_generation
+
+    def timed(batch=None, *args, **kwargs):
+        if batch is None:  # PP + spec verify forward built outside a ScheduleBatch
+            return forward(batch, *args, **kwargs)
+        with timer.wrap(metadata={"iter": batch.forward_iter}):
+            return forward(batch, *args, **kwargs)
+
+    worker.forward_batch_generation = timed
