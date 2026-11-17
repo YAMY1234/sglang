@@ -199,6 +199,17 @@ class NVFP4RowCodec:
         dst.index_copy_(0, rows, fp8.view(rows.numel(), *dst.shape[1:]))
 
 
+    def decode_paged_rows(
+        self, src: torch.Tensor, rows: torch.Tensor, dst: torch.Tensor
+    ) -> None:
+        """Decode src[page, unit] ([pages, page_size, row_bytes], page-strided) into
+        dst[rows[page * page_size + unit]]."""
+        if self._fused is not None:
+            self._fused.decode_paged_rows(src, rows, dst, self.global_scale, dim=self.dim)
+            return
+        self.decode_rows(src.reshape(-1, src.shape[-1]), rows, dst)
+
+
 class IndexKeyPageCodec:
     """One DSA index-key page: [keys FP8 | per-token FP32 scales] ->
     [NVFP4 key rows | the same scales]. The scales stay exact."""
@@ -364,3 +375,46 @@ def load_one_layer(
             host_buffer, stage, h, host_layer, units_per_page, arange[: h.numel()]
         )
         codec.decode_rows(stage.view(h.numel(), -1), d, device_layer)
+
+
+def load_layer_group(
+    codec,
+    device_layers,
+    host_buffer: torch.Tensor,
+    first_host_layer: int,
+    host_units: torch.Tensor,
+    device_units: torch.Tensor,
+    *,
+    units_per_page: int,
+    chunk_pages: int,
+    arange: torch.Tensor,
+    copy_pages_from_host: Callable[
+        [torch.Tensor, torch.Tensor, torch.Tensor, int, torch.Tensor], None
+    ],
+) -> None:
+    """load_one_layer for len(device_layers) consecutive host layers: one copy per page
+    of the group's contiguous [layers, units, row_bytes] block into a device stage, then
+    one decode per layer from its page-strided slice.    """
+    total = host_units.numel()
+    if total == 0:
+        return
+    group = len(device_layers)
+    step = chunk_pages * units_per_page
+    for start in range(0, total, step):
+        h = host_units[start : start + step]
+        d = device_units[start : start + step]
+        pages = h.numel() // units_per_page
+        stage = torch.empty(
+            (pages, group, units_per_page, host_buffer.shape[-1]),
+            dtype=torch.uint8,
+            device=device_layers[0].device,
+        )
+        copy_pages_from_host(
+            host_buffer,
+            stage.view(pages, -1),
+            h[::units_per_page] // units_per_page,
+            first_host_layer,
+            arange[:pages],
+        )
+        for j, layer in enumerate(device_layers):
+            codec.decode_paged_rows(stage[:, j], d, layer)

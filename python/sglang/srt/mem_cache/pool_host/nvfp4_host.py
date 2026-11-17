@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.pool_host.nvfp4_host_codec import (
     IndexKeyPageCodec,
     NVFP4RowCodec,
     backup_all_layers,
+    load_layer_group,
     load_one_layer,
     nvfp4_row_bytes,
     scratch_chunk_pages,
@@ -61,6 +62,18 @@ def _copy_layer_from_host(
         dst_indices=stage_ids,
         layer_id=layer_id,
         page_size=units_per_page,
+    )
+
+
+def _copy_pages_from_host(host_buffer, stage, host_page_ids, first_layer, stage_ids):
+    # One copy per page of host layers [first_layer, first_layer + stage row bytes / layer bytes).
+    transfer_kv_per_layer_direct_pf_lf(
+        src_ptrs=[host_buffer],
+        dst_ptrs=[stage],
+        src_indices=host_page_ids,
+        dst_indices=stage_ids,
+        layer_id=first_layer,
+        page_size=1,
     )
 
 
@@ -136,6 +149,9 @@ class MLATokenToKVPoolNVFP4Host(MLATokenToKVPoolHost):
         self._arange = torch.arange(
             max(self._load_chunk_pages * self.page_size, self._backup_chunk_pages)
         )
+        self._load_group = max(1, envs.SGLANG_HICACHE_NVFP4_LOAD_GROUP.get())
+        if self._load_group > 1:
+            self._init_grouped_load()
         logger.info(
             "HiCache host KV stored as NVFP4, codec: %s. %d B per token-layer "
             "instead of %d, %d layers, %d tokens, index keys %s; device scratch "
@@ -170,6 +186,74 @@ class MLATokenToKVPoolNVFP4Host(MLATokenToKVPoolHost):
             arange=self._arange,
         )
 
+    def _init_grouped_load(self):
+        k, targets = self._load_group, list(self._target_layer_indices)
+        assert self.kv_buffer.is_contiguous(), "grouped load needs page-first contiguous host pages"
+        by_host = {self._host_layer_by_controller[layer]: layer for layer in targets}
+        assert sorted(by_host) == list(range(len(targets))), by_host
+        # Controller layer ids of host layers [first, first + k), per group.
+        self._group_layers = {
+            first: [by_host[h] for h in range(first, min(first + k, len(targets)))]
+            for first in range(0, len(targets), k)
+        }
+        self._group_chunk_pages = scratch_chunk_pages(self.page_size * k * self.kv_cache_dim)
+        self._group_loaded = None
+        self._group_verify_left = envs.SGLANG_HICACHE_NVFP4_LOAD_GROUP_VERIFY.get()
+        self._arange = torch.arange(max(self._arange.numel(), self._group_chunk_pages))
+        logger.info(
+            "HiCache NVFP4 grouped load: %d layers per page copy, %d groups, %d pages per "
+            "chunk, verify %d loads",
+            k, len(self._group_layers), self._group_chunk_pages, self._group_verify_left,
+        )
+
+    def _load_grouped(self, host_indices, device_indices, layer_id):
+        host_layer = self._host_layer_by_controller[layer_id]
+        first = host_layer - host_layer % self._load_group
+        key = (host_indices.data_ptr(), host_indices.numel(), device_indices.data_ptr(), first)
+        if host_layer != first:
+            # Already decoded with its group's first layer, earlier in this same submission.
+            assert self._group_loaded == key, ("grouped load out of order", self._group_loaded, key)
+            return
+        layers = self._group_layers[first]
+        load_layer_group(
+            self._codec,
+            [self.device_kv_buffers[self._buffer_index_by_layer[layer]] for layer in layers],
+            self.kv_buffer,
+            first,
+            host_indices,
+            device_indices,
+            units_per_page=self.page_size,
+            chunk_pages=self._group_chunk_pages,
+            arange=self._arange,
+            copy_pages_from_host=_copy_pages_from_host,
+        )
+        self._group_loaded = key
+        if self._group_verify_left > 0:
+            self._verify_group(layers, first, host_indices, device_indices)
+
+    def _verify_group(self, layers, first, host_indices, device_indices):
+        # The per-layer path into a scratch tensor must give the same bytes (syncs).
+        rows = torch.arange(host_indices.numel(), device=device_indices.device)
+        for j, layer in enumerate(layers):
+            device_layer = self.device_kv_buffers[self._buffer_index_by_layer[layer]]
+            ref = torch.empty(
+                (rows.numel(), *device_layer.shape[1:]),
+                dtype=device_layer.dtype,
+                device=device_layer.device,
+            )
+            load_one_layer(
+                self._codec, ref, self.kv_buffer, first + j, host_indices, rows,
+                units_per_page=self.page_size, copy_layer_from_host=_copy_layer_from_host,
+                chunk_pages=self._load_chunk_pages, arange=self._arange,
+            )
+            if not torch.equal(device_layer.index_select(0, device_indices), ref):
+                raise RuntimeError(f"NVFP4 grouped load differs from the per-layer load: host layer {first + j}")
+        self._group_verify_left -= 1
+        logger.info(
+            "NVFP4_GROUPED_LOAD_VERIFY_OK host layers %d-%d, %d tokens, %d loads left",
+            first, first + len(layers) - 1, rows.numel(), self._group_verify_left,
+        )
+
     def load_to_device_per_layer(
         self,
         device_pool,
@@ -183,6 +267,9 @@ class MLATokenToKVPoolNVFP4Host(MLATokenToKVPoolHost):
         if not is_draft and layer_id not in self._target_layer_indices:
             return
         _require_direct_io(io_backend)
+        if self._load_group > 1 and not is_draft:
+            self._load_grouped(host_indices, device_indices, layer_id)
+            return
         load_one_layer(
             self._codec,
             self.device_kv_buffers[self._buffer_index_by_layer[layer_id]],

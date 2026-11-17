@@ -150,6 +150,59 @@ def _nvfp4_decode_rows_kernel(
     )
 
 
+@triton.jit
+def _nvfp4_decode_paged_rows_kernel(
+    src_ptr,
+    idx_ptr,
+    dst_ptr,
+    gs_ptr,
+    n_blocks,
+    src_page_stride,
+    src_row_stride,
+    dst_row_stride,
+    PAGE_SIZE: tl.constexpr,
+    BLOCKS_PER_ROW: tl.constexpr,
+    DATA_BYTES: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+):
+    # _nvfp4_decode_rows_kernel with src row r at page r // PAGE_SIZE, unit r % PAGE_SIZE.
+    b = tl.program_id(0) * BLOCK_B + tl.arange(0, BLOCK_B)
+    valid = b < n_blocks
+    row = (b // BLOCKS_PER_ROW).to(tl.int64)
+    blk = (b % BLOCKS_PER_ROW).to(tl.int64)
+    src_row = (row // PAGE_SIZE) * src_page_stride + (row % PAGE_SIZE) * src_row_stride
+    k = tl.arange(0, 8)
+    packed = tl.load(
+        src_ptr + src_row[:, None] + blk[:, None] * 8 + k[None, :],
+        mask=valid[:, None],
+        other=0,
+    ).to(tl.int32)
+    code = tl.reshape(tl.join(packed & 0xF, packed >> 4), (BLOCK_B, 16))
+    sf = (
+        tl.load(src_ptr + src_row + DATA_BYTES + blk, mask=valid, other=0)
+        .to(tl.float8e4nv, bitcast=True)
+        .to(tl.float32)
+    )
+    m = code & 7
+    e = m >> 1
+    half = (m & 1).to(tl.float32) * 0.5
+    mag = tl.where(
+        e == 0,
+        half,
+        (1.0 + half) * tl.where(e == 1, 1.0, tl.where(e == 2, 2.0, 4.0)),
+    )
+    val = tl.where(code >= 8, -mag, mag)
+    gs = tl.load(gs_ptr)
+    out = _to_e4m3_byte(_round_to_bf16((val * sf[:, None]) * gs))
+    dst_row = tl.load(idx_ptr + row, mask=valid, other=0)
+    j = tl.arange(0, 16)
+    tl.store(
+        dst_ptr + dst_row[:, None] * dst_row_stride + blk[:, None] * 16 + j[None, :],
+        out,
+        mask=valid[:, None],
+    )
+
+
 def _grid(n_blocks: int):
     return (triton.cdiv(n_blocks, _BLOCKS_PER_PROGRAM),)
 
@@ -204,6 +257,37 @@ def decode_rows(
         n_blocks,
         src.stride(0),
         dst.stride(0),
+        BLOCKS_PER_ROW=dim // 16,
+        DATA_BYTES=dim // 2,
+        BLOCK_B=_BLOCKS_PER_PROGRAM,
+    )
+
+
+def decode_paged_rows(
+    src: torch.Tensor,
+    rows: torch.Tensor,
+    dst: torch.Tensor,
+    global_scale: torch.Tensor,
+    *,
+    dim: int,
+) -> None:
+    """Decode NVFP4 rows src[page, unit] ([pages, page_size, row_bytes], strided between
+    pages and units, bytes contiguous) into dst[rows[page * page_size + unit]]."""
+    assert src.dim() == 3 and src.stride(2) == 1, (tuple(src.shape), src.stride())
+    n_blocks = rows.numel() * (dim // 16)
+    if n_blocks == 0:
+        return
+    assert rows.numel() == src.shape[0] * src.shape[1], (rows.numel(), tuple(src.shape))
+    _nvfp4_decode_paged_rows_kernel[_grid(n_blocks)](
+        src,
+        rows,
+        dst,
+        global_scale,
+        n_blocks,
+        src.stride(0),
+        src.stride(1),
+        dst.stride(0),
+        PAGE_SIZE=src.shape[1],
         BLOCKS_PER_ROW=dim // 16,
         DATA_BYTES=dim // 2,
         BLOCK_B=_BLOCKS_PER_PROGRAM,

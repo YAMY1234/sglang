@@ -933,6 +933,10 @@ class Envs:
     SGLANG_ENABLE_HICACHE_SWA_TAIL_ONLY_BACKUP = EnvBool(False)
     # --hicache-host-kv-dtype nvfp4: also store DSA index keys as NVFP4 (0 keeps them FP8).
     SGLANG_ENABLE_HICACHE_NVFP4_HOST_INDEXER = EnvBool(True)
+    # NVFP4 MLA host load: stage this many consecutive layers per page with one copy each (1 = per layer).
+    SGLANG_HICACHE_NVFP4_LOAD_GROUP = EnvInt(1)
+    # Byte-compare the grouped load against the per-layer path for this many loads (syncs; 0 = off).
+    SGLANG_HICACHE_NVFP4_LOAD_GROUP_VERIFY = EnvInt(0)
     # Cache mode: write L3 when a host page is evicted, not at L2 admission; a page
     # leaves the host pool only after its L3 write is acknowledged.
     SGLANG_OPT_HICACHE_STORAGE_WRITE_BACK = EnvBool(False)
