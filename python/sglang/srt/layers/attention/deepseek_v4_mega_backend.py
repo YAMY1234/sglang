@@ -188,9 +188,14 @@ class DeepseekV4MegaAttnBackend(DeepseekV4AttnBackend):
         cos_sin_cache: torch.Tensor,
         attn_sink: torch.Tensor,
         topk_length: torch.Tensor,
+        sf_swizzled_128x4: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         from sglang.kernels.ops.attention import flash_mla_interface
 
+        # The 128x4 scales need whole 128-row tiles and the current kernels.
+        sf_swizzled_128x4 = (
+            sf_swizzled_128x4 and q.shape[0] % 128 == 0 and self._swa_interleaved
+        )
         data, scale, _, _ = flash_mla_interface.flash_mla_mega_prefill(
             q,
             kv,
@@ -201,5 +206,14 @@ class DeepseekV4MegaAttnBackend(DeepseekV4AttnBackend):
             attn_sink=attn_sink,
             topk_length=topk_length,
             use_legacy=not self._swa_interleaved,
+            out_sf_swizzled_128x4=sf_swizzled_128x4,
         )
+        if sf_swizzled_128x4:
+            # [n_wv_group, 128x4-swizzled words]: the 2-D shape marks the layout.
+            groups = data.shape[1]
+            scale = scale.as_strided(
+                (groups, scale.numel() // groups),
+                (scale.numel() // groups, 1),
+                scale.storage_offset(),
+            )
         return data, scale

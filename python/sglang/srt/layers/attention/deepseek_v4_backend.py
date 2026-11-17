@@ -4456,6 +4456,7 @@ class DeepseekV4AttnBackend(
         save_kv_cache: bool = True,
         attn_sink: Optional[torch.Tensor] = None,
         cos_sin_cache: Optional[torch.Tensor] = None,
+        mega_sf_swizzled_128x4: bool = False,
         **_,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if self.mtp_enabled and forward_batch.forward_mode.is_idle():
@@ -4590,6 +4591,7 @@ class DeepseekV4AttnBackend(
                     use_cutedsl_h16=_use_dsv4_cutedsl_h16_forward(
                         self.dsv4_prefill_backend, forward_batch
                     ),
+                    mega_sf_swizzled_128x4=mega_sf_swizzled_128x4,
                 )
 
             if cos_sin_cache is not None:
@@ -4726,6 +4728,7 @@ class DeepseekV4AttnBackend(
         attn_sink: torch.Tensor,
         cos_sin_cache: Optional[torch.Tensor] = None,
         use_cutedsl_h16: bool = False,
+        mega_sf_swizzled_128x4: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Gathers each request's SWA window and c4/c128 cache into a flat bf16
         workspace that flash_mla_sparse_fwd reads through per-query rebased indices."""
@@ -4822,6 +4825,7 @@ class DeepseekV4AttnBackend(
                 cos_sin_cache=cos_sin_cache,
                 attn_sink=attn_sink,
                 topk_length=combined_lens,
+                sf_swizzled_128x4=mega_sf_swizzled_128x4,
             )
 
         if use_cutedsl_h16:
