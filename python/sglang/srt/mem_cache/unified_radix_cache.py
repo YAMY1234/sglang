@@ -442,12 +442,15 @@ class UnifiedRadixCache(BasePrefixCache):
         # covered until host eviction consumes them, so a steady state with a
         # fully tiered tail does not re-walk the heap every step.
         self._write_behind_clean_tokens = 0
+        self._l3_wb_ack_credit = False
+        self._l3_wb_walk_every = 4
         self._l3_stats_logged_at = 0.0
         # Belief TTL (0: off): PP0's clock picks the rotation step for every rank.
         self._l3_belief_ttl_s = 0.0
         self._l3_beliefs_rotated_at = time.monotonic()
         self._l3_tier_stats: dict[str, int] = {
             "wb_walks": 0,
+            "wb_walk_us": 0,
             "wb_issued_tokens": 0,
             "wb_clean_tokens": 0,
             "wb_unbacked_tokens": 0,
@@ -703,6 +706,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self._l3_saved_token_threshold = (
             envs.SGLANG_HICACHE_L3_SAVED_TOKEN_THRESHOLD.get()
         )
+        self._l3_wb_ack_credit = envs.SGLANG_HICACHE_L3_WB_ACK_CREDIT.get()
+        self._l3_wb_walk_every = max(1, envs.SGLANG_HICACHE_L3_WB_WALK_EVERY.get())
         self._l3_write_state_on_tombstone = (
             envs.SGLANG_HICACHE_L3_WRITE_STATE_ON_TOMBSTONE.get()
         )
@@ -2655,8 +2660,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self._write_behind_step += 1
         if self._l3_belief_ttl_s > 0 and self._write_behind_step % 256 == 0:
             self._maybe_rotate_beliefs()
-        if self._write_behind_step % 4:
+        if self._write_behind_step % self._l3_wb_walk_every:
             return
+        walk_start = time.perf_counter()
         if self._l3_mamba_leaf_reserve:
             self._write_behind_mamba_leaves()
         pool = self.cache_controller.mem_pool_host
@@ -2670,6 +2676,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # Refill in quarter-reserve quanta: the candidate walk heapifies every
         # host leaf, so running it per freed page would eat the scheduler thread.
         if deficit < max(1, target // 4):
+            self._l3_tier_stats["wb_walk_us"] += int((time.perf_counter() - walk_start) * 1e6)
             return
         stats = self._l3_tier_stats
         stats["wb_walks"] += 1
@@ -2703,6 +2710,7 @@ class UnifiedRadixCache(BasePrefixCache):
             stats[f"wb_full_tokens_{kind}"] += num_tokens
         self._write_behind_clean_tokens = clean
         stats["wb_clean_tokens"] += clean
+        stats["wb_walk_us"] += int((time.perf_counter() - walk_start) * 1e6)
 
     def is_backuped(self, node_id: NodeId) -> bool:
         return self.tree_core.is_backuped(node_id)
@@ -4370,7 +4378,10 @@ class UnifiedRadixCache(BasePrefixCache):
                         )
                     ):
                         self._l3_tier_final.written_tokens += operation.completed_tokens
-                    self._write_behind_inflight.pop(operation.id, None)
+                    acked_tokens = self._write_behind_inflight.pop(operation.id, None)
+                    if acked_tokens and self._l3_wb_ack_credit:
+                        # Rank-replicated (issued) count, not completed_tokens.
+                        self._write_behind_clean_tokens += acked_tokens
                     self._write_behind_mamba_inflight.pop(operation.id, None)
                     # Added unconditionally: completed_tokens can diverge across ranks on
                     # backend failure and a divergent belief desyncs the rank collectives.

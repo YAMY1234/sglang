@@ -941,6 +941,11 @@ class Envs:
     # L2 admission, so the two tiers hold different pages. The Rust tree core needs
     # an extension with peek_host_eviction_candidates.
     SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT = EnvBool(False)
+    # Write-on-host-evict: credit an acked write-behind backup to the clean tail
+    # tokens, so acks draining does not retrigger a full tail walk.
+    SGLANG_HICACHE_L3_WB_ACK_CREDIT = EnvBool(False)
+    # Write-on-host-evict: scheduler steps between host-tail write-behind walks.
+    SGLANG_HICACHE_L3_WB_WALK_EVERY = EnvInt(4)
     # Fraction of the host pool kept free-or-already-in-L3 at the LRU tail. It must
     # exceed (storage write latency) x (host eviction rate) / (host pool tokens);
     # 0.05 leaves ~2x headroom for a ~1 s write and a 30M-token pool churning 1M tok/s.

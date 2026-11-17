@@ -613,6 +613,47 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
                     cache._write_behind_host_tail()
                 self.assertEqual(writes.call_count, 2)
 
+    def test_hicache_l3_write_behind_ack_credit_and_walk_interval(self):
+        self._require_host_only_l3_fixture()
+        ps = self.cfg.page_size
+        for credit in (False, True):
+            with self.subTest(credit=credit):
+                cache, pool = self._host_only_l3_fixture(exclusive=True)
+                for i in range(1, 8):
+                    self._insert_host_page(cache, pool, 1000 * i)
+                cache._l3_wb_ack_credit = credit
+                cache._l3_wb_walk_every = 8
+                writes = cache.cache_controller.write_storage
+                for _ in range(7):
+                    cache._write_behind_host_tail()
+                writes.assert_not_called()
+                cache._write_behind_host_tail()
+                self.assertEqual(cache._l3_tier_stats["wb_walks"], 1)
+                operation_id = next(iter(cache._write_behind_inflight))
+                tokens = cache._write_behind_inflight[operation_id]
+                clean = cache._write_behind_clean_tokens
+                cache.cache_controller.ack_backup_queue = Queue()
+                cache.cache_controller.ack_backup_queue.put(
+                    SimpleNamespace(
+                        id=operation_id,
+                        hash_value=None,
+                        pool_transfers=[],
+                        completed_tokens=ps,
+                    )
+                )
+                cache._drain_storage_control_queues_impl(
+                    n_storage_hit=0,
+                    n_ack_prefetch=0,
+                    n_backup=1,
+                    n_release=0,
+                    extra_release_counts={},
+                    log_metrics=False,
+                )
+                self.assertNotIn(operation_id, cache._write_behind_inflight)
+                self.assertEqual(
+                    cache._write_behind_clean_tokens, clean + tokens * credit
+                )
+
     def test_hicache_l3_belief_ttl_rewrites_a_page_the_store_may_have_dropped(self):
         self._require_host_only_l3_fixture()
         cache, pool = self._host_only_l3_fixture(exclusive=True)
