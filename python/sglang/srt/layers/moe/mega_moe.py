@@ -825,7 +825,8 @@ def build_mega_moe_experts_weights(experts) -> None:
     localize = _is_mega_moe_localization_enabled()
     mega_l1, mega_l2 = w13_interleaved, w2
     if localize:
-        import deep_gemm
+        # The build that runs the kernel localizes: it recognizes only its own localized memory
+        deep_gemm = _mega_moe_dg(mma_type)
 
         # (domains, experts, N / domains, K) for the kernel; the parameters get the
         # expert-major view of the same memory.
@@ -873,7 +874,8 @@ def build_mega_moe_shared_weights(
         (down_proj.weight.data, _transform_mega_moe_shared_sf(down_proj)),
     )
     if _is_mega_moe_localization_enabled():
-        import deep_gemm
+        # The fused shared expert runs inside the fp8xfp4 kernel; localize with its build
+        deep_gemm = _mega_moe_dg("fp8xfp4")
 
         l1 = (deep_gemm.localize(l1[0]), l1[1])
         l2 = (deep_gemm.localize(l2[0]), l2[1])
