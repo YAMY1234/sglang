@@ -1398,6 +1398,10 @@ class Envs:
     # fp8_einsum (a tail of < 128 rows stays on it). Same FP8 operands; output rounding differs in the last
     # FP8 bit on a few percent of values.
     SGLANG_OPT_DSV41_WO_A_CUDNN = EnvBool(False)
+    # DSV4.1 MegaAttention prefill, compressed layers (64 heads): gather the flat sparse-prefill KV workspace as
+    # e4m3 at unit scale instead of bf16, which selects FlashMLA's all-fp8 prefill (Q, K, V and P as e4m3 on the
+    # tensor cores). SWA-only layers keep bf16. Needs a FlashMLA whose prefill takes an e4m3 kv; changes numerics.
+    SGLANG_OPT_DSV41_FP8_PREFILL_ATTN = EnvBool(False)
     # DSV4.1 MegaAttention decode on SM107, compressed layers with an fp4 extra cache: wq_b writes Q as E4M3 at
     # static per-head power-of-two scales (folded into its UE8M0 weight scales) and FlashMLA's fp8 decode reads it
     # (QK and SV on e4m3 tensor cores). Needs a FlashMLA whose decode takes q_head_scale; changes attention numerics.

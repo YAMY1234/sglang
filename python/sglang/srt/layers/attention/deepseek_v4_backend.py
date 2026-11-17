@@ -176,6 +176,8 @@ _is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
 
+_fp8_prefill_attn_logged = False
+
 SWA_WINDOW = 128
 DEFAULT_INDEX_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
@@ -1470,6 +1472,10 @@ class DeepseekV4AttnBackend(
         ] = None
         self.online_c128_mtp = OnlineC128MTPController(self)
         self.sparse_prefill_kv_buffer = SparsePrefillKVBuffer(self.device)
+        # A separate e4m3 workspace: sharing the bf16 one would reallocate it and drop
+        # its cached compressed head at every SWA-only / compressed layer switch.
+        self.fp8_prefill_attn = envs.SGLANG_OPT_DSV41_FP8_PREFILL_ATTN.get()
+        self.sparse_prefill_kv_buffer_fp8 = SparsePrefillKVBuffer(self.device)
         # Keep CP low-ratio prefixes intact across interleaved ratio/SWA layers.
         self.shared_compressed_prefill_workspaces = {
             ratio: SparsePrefillKVBuffer(self.device) for ratio in (1, 2)
@@ -3204,6 +3210,7 @@ class DeepseekV4AttnBackend(
         num_qo_tokens: int,
     ) -> SparsePrefillChunkCache:
         self.sparse_prefill_kv_buffer.forget_head()
+        self.sparse_prefill_kv_buffer_fp8.forget_head()
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert seq_lens_cpu is not None
         # Decoder tails require explicit SWA indices to exclude unwritten history.
@@ -4717,6 +4724,22 @@ class DeepseekV4AttnBackend(
 
         raise NotImplementedError("ragged attention")
 
+    def _use_fp8_prefill_workspace(
+        self, *, compress_ratio: int, num_heads: int, mega: bool
+    ) -> bool:
+        # FlashMLA's all-fp8 prefill exists for 64 heads only; its kv is e4m3 at unit scale.
+        if not (
+            self.fp8_prefill_attn and mega and compress_ratio != 0 and num_heads == 64
+        ):
+            return False
+        global _fp8_prefill_attn_logged
+        if not _fp8_prefill_attn_logged:
+            _fp8_prefill_attn_logged = True
+            logger.info(
+                "MegaAttention prefill: FP8 KV workspace (e4m3, unit scale) on the compressed layers"
+            )
+        return True
+
     def _forward_prefill_sparse(
         self,
         q: torch.Tensor,
@@ -4748,6 +4771,16 @@ class DeepseekV4AttnBackend(
         extra_k_cache = None
         extra_page_size = None
         flat_token_ids = None
+        fp8_ws = self._use_fp8_prefill_workspace(
+            compress_ratio=compress_ratio,
+            num_heads=q_flat.shape[1],
+            mega=cos_sin_cache is not None and not use_cutedsl_h16,
+        )
+        kv_buffer = (
+            self.sparse_prefill_kv_buffer_fp8
+            if fp8_ws
+            else self.sparse_prefill_kv_buffer
+        )
         if compress_ratio == 0:
             workspace = self.sparse_prefill_kv_buffer.get(cache.swa_token_ids.shape[0])
             combined_indices = cache.c0_combined_indices
@@ -4768,18 +4801,20 @@ class DeepseekV4AttnBackend(
             if reuse_compressed:
                 workspace = self.shared_compressed_prefill_workspaces[
                     compress_ratio
-                ].get(n_compressed + cache.swa_token_ids.shape[0])
+                ].get(
+                    n_compressed + cache.swa_token_ids.shape[0],
+                    dtype=fp8_dtype if fp8_ws else torch.bfloat16,
+                )
                 compressed_slice = workspace[:n_compressed]
             else:
-                workspace, compressed_filled = (
-                    self.sparse_prefill_kv_buffer.get_with_head(
-                        n_compressed + cache.swa_token_ids.shape[0],
-                        head_source=(
-                            extra_k_cache.data_ptr(),
-                            flat_token_ids.data_ptr(),
-                            n_compressed,
-                        ),
-                    )
+                workspace, compressed_filled = kv_buffer.get_with_head(
+                    n_compressed + cache.swa_token_ids.shape[0],
+                    head_source=(
+                        extra_k_cache.data_ptr(),
+                        flat_token_ids.data_ptr(),
+                        n_compressed,
+                    ),
+                    dtype=fp8_dtype if fp8_ws else torch.bfloat16,
                 )
                 if not compressed_filled:
                     compressed_slice = workspace[:n_compressed]
