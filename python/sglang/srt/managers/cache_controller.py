@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Callable, List, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.mem_cache import pmicro_hoststats
 from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
     HiCacheStorageConfig,
@@ -940,7 +941,10 @@ class HiCacheController:
         if len(self.write_queue) == 0:
             return
 
+        t0 = time.perf_counter() if pmicro_hoststats.ON else 0.0
         op = CacheOperation.merge_ops(self.write_queue)
+        if pmicro_hoststats.ON:
+            pmicro_hoststats.count_d2h(op.host_indices, self.page_size)
         host_indices, device_indices, pool_transfers = self._move_write_operation(op)
         self.write_queue.clear()
 
@@ -974,6 +978,11 @@ class HiCacheController:
                 num_bytes=self._transfer_num_bytes(op),
             )
         )
+        if pmicro_hoststats.ON:
+            ack = self.ack_write_queue[-1]
+            pmicro_hoststats.OPS["backup_launch"].add(
+                time.perf_counter() - t0, ack.num_tokens, ack.num_bytes
+            )
 
     def _transfer_num_bytes(self, op: CacheOperation) -> int:
         return len(op.device_indices) * self.mem_pool_host.size_per_token

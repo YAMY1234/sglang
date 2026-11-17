@@ -295,7 +295,7 @@ from sglang.srt.managers.utils import (
     is_health_check_generate_req,
     validate_input_length,
 )
-from sglang.srt.mem_cache import kv_cache_builder
+from sglang.srt.mem_cache import kv_cache_builder, pmicro_hoststats
 from sglang.srt.mem_cache.allocation import paged_extend_num_tokens
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
@@ -5043,6 +5043,18 @@ class Scheduler(
             else:
                 batch.sampling_info = sched_sampling_info
 
+    def _pmicro_hoststat(self, batch: ScheduleBatch) -> None:
+        """p-micro rig: counters since the previous launch; per-op timings every 60 s."""
+        logger.info(
+            pmicro_hoststats.take_launch_line(
+                batch.forward_iter,
+                self.tree_cache.cache_controller.mem_pool_host.available_size(),
+            )
+        )
+        ops_line = pmicro_hoststats.take_ops_line(time.perf_counter())
+        if ops_line is not None:
+            logger.info(ops_line)
+
     @scheduler_stage_method(SCHEDULER_STAGE_RUN_BATCH)
     def run_batch(
         self,
@@ -5053,6 +5065,8 @@ class Scheduler(
         self.metrics_reporter.record_scheduler_active(time.monotonic_ns())
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
+        if pmicro_hoststats.ON and self.enable_hierarchical_cache:
+            self._pmicro_hoststat(batch)
         batch.launch_ts = time.monotonic()
         is_split_prefill = batch.forward_mode.is_split_prefill()
         if not is_split_prefill or batch.split_index == 0:

@@ -2,9 +2,12 @@
 in-flight forward, and the scheduler events they wait on. Streams are mocks."""
 
 import logging
+import re
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
+
+import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -15,6 +18,7 @@ import sglang.srt.mem_cache.unified_radix_cache as urc_mod
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import CacheOperation, HiCacheController
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache import pmicro_hoststats as hs
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
@@ -541,6 +545,160 @@ class TestBatchedEviction(CustomTestCase):
             ],
         )
         self.assertEqual(cache._wb_batch_locks, [])
+
+class TestPMicroHostStats(CustomTestCase):
+    """SGLANG_PMICRO_HOSTSTATS (rig only): host-side counters and per-op timings."""
+
+    LAUNCH = re.compile(
+        r"^PMICRO_HOSTSTAT iter=(\d+) host_avail=(\d+) d2h_subs=(\d+) "
+        r"d2h_tokens=(\d+) d2h_runs=(-?\d+) rebacked=(\d+) stat_us=(\d+)$"
+    )
+
+    def setUp(self):
+        for k in hs.COUNTS:
+            hs.COUNTS[k] = 0
+        hs._backed.clear()
+        for op in hs.OPS.values():
+            op.reset()
+        patcher = patch.object(hs, "ON", True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _pages(ids, ps=64):
+        if not ids:
+            return torch.empty(0, dtype=torch.int64)
+        return torch.cat([torch.arange(p * ps, (p + 1) * ps) for p in ids])
+
+    def test_default_off(self):
+        self.assertFalse(envs.SGLANG_PMICRO_HOSTSTATS.get())
+
+    def test_host_runs(self):
+        pages = self._pages
+        self.assertEqual(hs.host_runs(pages([10, 11, 12, 13, 14]), 64), 1)
+        self.assertEqual(hs.host_runs(pages([3, 4, 9, 10, 11, 40]), 64), 3)
+        self.assertEqual(hs.host_runs(pages([7, 6, 5]), 64), 3)
+        self.assertEqual(hs.host_runs(pages([]), 64), 0)
+        odd = torch.cat([pages([2, 3]), torch.arange(8 * 64, 8 * 64 + 10)])
+        self.assertEqual(hs.host_runs(odd, 64), 2)
+        self.assertEqual(hs.host_runs(pages([1, 2, 5]).to(torch.int32), 64), 2)
+
+    def test_rebacked_counts_a_second_backup_of_a_node(self):
+        hs.note_backup(7, 64)
+        hs.note_backup(8, 32)
+        self.assertEqual(hs.COUNTS["rebacked"], 0)
+        hs.note_backup(7, 128)
+        self.assertEqual(hs.COUNTS["rebacked"], 128)
+        with patch.object(hs, "BACKED_CAP", 2):
+            hs.note_backup(9, 16)  # the set restarts: a lower bound from here
+            hs.note_backup(7, 16)
+        self.assertEqual(hs.COUNTS["rebacked"], 128)
+
+    def test_launch_line_format_and_reset(self):
+        hs.COUNTS.update(d2h_subs=2, d2h_tokens=640, d2h_runs=3, rebacked=64)
+        line = hs.take_launch_line(41, 123456)
+        m = self.LAUNCH.match(line)
+        self.assertIsNotNone(m, line)
+        self.assertEqual(m.groups()[:6], ("41", "123456", "2", "640", "3", "64"))
+        self.assertNotIn("kv_bytes", line)
+        self.assertTrue(all(v == 0 for v in hs.COUNTS.values()))
+
+    def test_start_writing_counts_d2h_and_launch_cost(self):
+        cc = object.__new__(HiCacheController)
+        cc.page_size = 64
+        cc.write_queue = ["op"]
+        cc.ack_write_queue = []
+        cc._move_write_operation = MagicMock(return_value=("H", "D", None))
+        cc._l2_transfers = MagicMock(return_value=["T"])
+        cc._num_tokens_by_pool = MagicMock(return_value={})
+        cc._transfer_num_bytes = MagicMock(return_value=4096)
+        cc.l2_transfer_engine = MagicMock()
+        cc.mem_pool_device_allocator = MagicMock()
+        cc.write_fence_stream = None
+        merged = SimpleNamespace(
+            node_ids=[1],
+            host_indices=self._pages([3, 4, 9]),
+            device_indices=list(range(192)),
+        )
+        with patch.object(CacheOperation, "merge_ops", return_value=merged):
+            cc.start_writing()
+            with patch.object(hs, "ON", False):
+                cc.write_queue = ["op"]
+                cc.start_writing()
+        self.assertEqual(
+            (hs.COUNTS["d2h_subs"], hs.COUNTS["d2h_tokens"], hs.COUNTS["d2h_runs"]),
+            (1, 192, 2),
+        )
+        op = hs.OPS["backup_launch"]
+        self.assertEqual((op.n, op.tokens, op.nbytes), (1, 192, 4096))
+
+    def test_commit_backup_feeds_rebacked(self):
+        cache = _cache()
+        cache.buffer_pipeline = None
+        cache.tree_core.build_backup_spec.return_value = (torch.arange(4), {})
+        cache._build_backup_sidecar = MagicMock(return_value=None)
+        cache._execute_kv_backup = MagicMock(return_value=torch.arange(4))
+        cache._track_write_through_node = MagicMock()
+        for _ in range(2):
+            cache._execute_and_commit_kv_backup(
+                urc_mod.BackupKV(node_ids=[11]), write_back=True
+            )
+        self.assertEqual(hs.COUNTS["rebacked"], 4)
+
+    def test_eviction_wait_timed_only_when_acks_are_pending(self):
+        cache = _cache()
+        cache.writing_check(write_back=True)
+        self.assertEqual(hs.OPS["evict_wait"].n, 0)
+        ack = SimpleNamespace(finish_event=MagicMock(), node_ids=[3])
+        cache.cache_controller.ack_write_queue.append(ack)
+        cache.ongoing_write_through = {3: None}
+        cache._finish_write_through_ack = MagicMock(
+            side_effect=lambda n: cache.ongoing_write_through.pop(n)
+        )
+        cache._log_write_ack_metrics = MagicMock()
+        cache.writing_check(write_back=True)
+        ack.finish_event.synchronize.assert_called_once()
+        self.assertEqual(hs.OPS["evict_wait"].n, 1)
+
+    def test_host_eviction_and_its_l3_part_are_timed(self):
+        cache = _cache()
+        cache.host_memory_mode = "host"
+        cache._l3_trace = None
+        cache._l3_tier_final = None
+        cache._drive_host_eviction = MagicMock(return_value=2)
+        cache._storage_write_back = MagicMock()
+        cache._storage_write_back.evict_host.return_value = 5
+        self.assertEqual(cache.evict_host(5), 5)
+        self.assertEqual(cache.evict_host(1, ComponentType.MAMBA), 2)
+        self.assertEqual((hs.OPS["host_evict"].n, hs.OPS["host_evict_l3"].n), (2, 1))
+
+    def test_scheduler_logs_launch_line_and_ops_line_per_interval(self):
+        scheduler = SimpleNamespace(
+            tree_cache=SimpleNamespace(
+                cache_controller=SimpleNamespace(
+                    mem_pool_host=SimpleNamespace(available_size=lambda: 999)
+                )
+            )
+        )
+        hs.OPS["backup_launch"].add(0.002, 64, 8192)
+        hs.OPS["evict_wait"].add(0.010)
+        logger = urc_mod.logging.getLogger("sglang.srt.managers.scheduler")
+        with patch.object(hs, "_ops_window_start", float("-inf")):
+            with self.assertLogs(logger, level=logging.INFO) as logs:
+                Scheduler._pmicro_hoststat(scheduler, SimpleNamespace(forward_iter=7))
+                Scheduler._pmicro_hoststat(scheduler, SimpleNamespace(forward_iter=8))
+        msgs = [r.getMessage() for r in logs.records]
+        self.assertEqual(len(msgs), 3, msgs)
+        self.assertTrue(msgs[0].startswith("PMICRO_HOSTSTAT iter=7 host_avail=999 "))
+        self.assertIn("evict_wait n=1 sum_ms=10.0 p50_ms=10.000", msgs[1])
+        self.assertIn(
+            "backup_launch n=1 sum_ms=2.0 p50_ms=2.000 p90_ms=2.000 "
+            "tok_per_op=64 bytes_per_op=8192",
+            msgs[1],
+        )
+        self.assertTrue(msgs[2].startswith("PMICRO_HOSTSTAT iter=8 "))
+        self.assertEqual(hs.OPS["evict_wait"].n, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

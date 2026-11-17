@@ -31,6 +31,7 @@ from sglang.srt.managers.scheduler_components.shm_tag_exchange import (
     fold_u64,
     get_shm_exchange,
 )
+from sglang.srt.mem_cache import pmicro_hoststats
 from sglang.srt.mem_cache.allocator.page_interleave import (
     page_interleave_shard_size,
 )
@@ -1813,6 +1814,14 @@ class UnifiedRadixCache(BasePrefixCache):
         self, num_tokens: int, component_type: ComponentType = BASE_COMPONENT_TYPE
     ) -> int:
         """Evict host resources for a specific component to free host pool space."""
+        if not pmicro_hoststats.ON:
+            return self._evict_host(num_tokens, component_type)
+        t0 = time.perf_counter()
+        evicted = self._evict_host(num_tokens, component_type)
+        pmicro_hoststats.OPS["host_evict"].add(time.perf_counter() - t0)
+        return evicted
+
+    def _evict_host(self, num_tokens: int, component_type: ComponentType) -> int:
         if self.host_memory_mode == "buffer_only":
             # The tree never holds host values in buffer mode, and staging
             # is operation-owned (freed at each ack): nothing is evictable.
@@ -1824,7 +1833,10 @@ class UnifiedRadixCache(BasePrefixCache):
             self._storage_write_back is not None
             and component_type == BASE_COMPONENT_TYPE
         ):
+            t0 = time.perf_counter() if pmicro_hoststats.ON else 0.0
             evicted = self._storage_write_back.evict_host(num_tokens, evicted)
+            if pmicro_hoststats.ON:
+                pmicro_hoststats.OPS["host_evict_l3"].add(time.perf_counter() - t0)
         if self._l3_tier_final is not None and component_type == BASE_COMPONENT_TYPE:
             self._l3_tier_final.host_evicted_tokens += evicted
         return evicted
@@ -1833,7 +1845,12 @@ class UnifiedRadixCache(BasePrefixCache):
         self, num_tokens: int, component_type: ComponentType
     ) -> int:
         if self._l3_write_state_on_tombstone and component_type == ComponentType.MAMBA:
-            return self._drive_mamba_host_eviction_with_storage(num_tokens)
+            if not pmicro_hoststats.ON:
+                return self._drive_mamba_host_eviction_with_storage(num_tokens)
+            t0 = time.perf_counter()
+            evicted = self._drive_mamba_host_eviction_with_storage(num_tokens)
+            pmicro_hoststats.OPS["host_evict_l3"].add(time.perf_counter() - t0)
+            return evicted
         result = self.tree_core.drive_host_eviction(component_type, num_tokens)
         self._apply_eviction_result(result)
         evicted = result.tracker.get(component_type, 0)
@@ -2248,6 +2265,8 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             if host_indices is None:
                 return 0
+            if pmicro_hoststats.ON:
+                pmicro_hoststats.note_backup(node_id, len(host_indices))
             self.tree_core.commit_backup(node_id, host_indices, comp_xfers)
             lock_params = None
             if not write_back:
@@ -4929,6 +4948,11 @@ class UnifiedRadixCache(BasePrefixCache):
                         "Full-leaf victims (SGLANG_HICACHE_WB_EVICT_RELAXED_FENCE)."
                     )
             cc.start_writing(fence_event=fence_event)
+            t0 = (
+                time.perf_counter()
+                if pmicro_hoststats.ON and self.ongoing_write_through
+                else None
+            )
             while self.ongoing_write_through:
                 for ack in cc.ack_write_queue:
                     ack.finish_event.synchronize()
@@ -4938,6 +4962,8 @@ class UnifiedRadixCache(BasePrefixCache):
                     self._log_write_ack_metrics(ack)
                 cc.ack_write_queue.clear()
                 assert len(self.ongoing_write_through) == 0
+            if t0 is not None:
+                pmicro_hoststats.OPS["evict_wait"].add(time.perf_counter() - t0)
             return
 
         if finish_count is None:
@@ -5146,7 +5172,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 log_metrics=True,
             )
         if self._l3_write_on_host_evict:
+            t0 = time.perf_counter() if pmicro_hoststats.ON else 0.0
             self._write_behind_host_tail()
+            if pmicro_hoststats.ON:
+                pmicro_hoststats.OPS["write_behind"].add(time.perf_counter() - t0)
         if self.enable_storage and self.pp_rank == 0:
             # Diagnostics only: wall clock picks the log step, no decision reads it.
             now = time.monotonic()
