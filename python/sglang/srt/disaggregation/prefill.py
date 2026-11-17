@@ -98,6 +98,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.observability import req_profile
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_GET_NEXT_BATCH,
@@ -1732,6 +1733,8 @@ class SchedulerDisaggregationPrefillMixin:
                 end_idx,
             )
             return
+        if req_profile.ENABLED:
+            req_profile.on_kv_send(req, end_idx - start_idx)
 
         sender = req.disagg_kv_sender
         # The schedule stream may wait on the in-flight forward. A sender that takes

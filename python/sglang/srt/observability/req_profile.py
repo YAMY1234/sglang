@@ -197,9 +197,25 @@ def on_request_finished(req, mode: str, cached_details: Optional[dict] = None) -
         "t": t,
         "v": v,
     }
+    kv = req.reqprof_kv
+    if kv is not None:
+        t["kv_first_send_time"], t["kv_last_send_time"] = kv[0], kv[1]
+        v["kv_send_tokens"], v["kv_send_calls"] = kv[2], kv[3]
     if cached_details:
         rec["cached_details"] = cached_details
     w.put(rec)
+
+
+def on_kv_send(req, tokens: int) -> None:
+    """Called per prefill KV send call: first/last call time, tokens and calls per request."""
+    now = time.perf_counter()
+    kv = req.reqprof_kv
+    if kv is None:
+        req.reqprof_kv = [now, now, tokens, 1]
+    else:
+        kv[1] = now
+        kv[2] += tokens
+        kv[3] += 1
 
 
 def on_batch_result(batch) -> None:
