@@ -194,6 +194,8 @@ def on_request_finished(req, mode: str, cached_details: Optional[dict] = None) -
         "spec_verify_ct": req.spec_verify_ct,
         "finish": type(fr).__name__ if fr is not None else None,
         "routed_dp": req.disagg_prefill_dp_rank,
+        # first output token ids: tells an empty-text first token (special / split multi-byte) from a visible one
+        "first_ids": req.output_ids[:2],
         "t": t,
         "v": v,
     }
