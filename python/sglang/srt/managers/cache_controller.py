@@ -247,6 +247,7 @@ class StorageOperation:
         self.all_hash_values: Optional[List[str]] = None
         # Prefetch-outcome accounting, set at enqueue by the tree cache.
         self.stats_requested_tokens = 0
+        self.stats_tree_kv_tokens = 0
         # Absolute token offset at which this storage-prefetched span starts.
         self.storage_start = 0
 
@@ -689,6 +690,7 @@ class HiCacheController:
                     "npu_memcache",
                     "eic",
                     "nixl",
+                    "nixl_dram",
                     "simm",
                     "mori",
                     "tensorcast",

@@ -914,6 +914,64 @@ class Envs:
     # Only affects buffer mode: omit intermediate Mamba storage checkpoints.
     # Keep complete request endpoints; unknown/manual backup sources stay eligible.
     SGLANG_HICACHE_MAMBA_REQUEST_END_ONLY = EnvBool(False)
+    # Cache mode: write L3 when a host page is evicted, not at L2 admission; a page
+    # leaves the host pool only after its L3 write is acknowledged.
+    SGLANG_OPT_HICACHE_STORAGE_WRITE_BACK = EnvBool(False)
+    # Host-pool fraction one eviction shortfall writes to L3 ahead of need.
+    # Arbitrary; no evidence this is the right size.
+    SGLANG_HICACHE_STORAGE_WRITE_BACK_BATCH_FRACTION = EnvFloat(0.01)
+    # Seconds a write-back process waits at SIGTERM / exit for its L3 writes in
+    # flight before the final stats line; keep it inside the launcher's SIGKILL grace.
+    SGLANG_HICACHE_STORAGE_WRITE_BACK_DRAIN_TIMEOUT = EnvFloat(20.0)
+    # Write-back as a dirty-page cleaner (needs the Rust TreeCore): host copies are
+    # not pinned; a page storage lacks is "dirty" and only host-leaf eviction skips
+    # it. Fractions are of the host pool's pages, per rank.
+    SGLANG_HICACHE_STORAGE_WRITE_BACK_CLEANER = EnvBool(False)
+    # Begin writing the coldest dirty pages when unissued dirty pages exceed this.
+    SGLANG_HICACHE_STORAGE_WRITE_BACK_DIRTY_START_FRACTION = EnvFloat(0.5)
+    # Clean (or free) pages the cleaner aims to keep; below it is a floor breach.
+    SGLANG_HICACHE_STORAGE_WRITE_BACK_MIN_CLEAN_FRACTION = EnvFloat(0.3)
+    # Cap on cleaner writes ahead of eviction: written + in flight - host evicted.
+    SGLANG_HICACHE_STORAGE_WRITE_BACK_PREFETCH_BUDGET_FRACTION = EnvFloat(0.5)
+    # Cap on the cleaner's writes in flight per rank (each PP rank writes its own layers).
+    SGLANG_HICACHE_STORAGE_WRITE_BACK_MAX_INFLIGHT_FRACTION = EnvFloat(0.04)
+    # Pages per storage IO call (one NIXL transfer per service carries all of them).
+    SGLANG_HICACHE_STORAGE_BATCH_PAGES = EnvInt(128)
+    # Cache mode: write L3 from the coldest L2 pages ahead of eviction instead of at
+    # L2 admission, so the two tiers hold different pages. The Rust tree core needs
+    # an extension with peek_host_eviction_candidates.
+    SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT = EnvBool(False)
+    # Fraction of the host pool kept free-or-already-in-L3 at the LRU tail. It must
+    # exceed (storage write latency) x (host eviction rate) / (host pool tokens);
+    # 0.05 leaves ~2x headroom for a ~1 s write and a 30M-token pool churning 1M tok/s.
+    SGLANG_HICACHE_L3_EVICT_WRITE_RESERVE_FRACTION = EnvFloat(0.05)
+    # Hybrid (Mamba/KDA) trees under SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT: a Mamba
+    # host eviction takes a host leaf whole, Full pages too, so also write the host
+    # leaves among the coldest reserve-fraction of Mamba host states ahead of it.
+    SGLANG_HICACHE_L3_WRITE_MAMBA_HOST_LEAVES = EnvBool(False)
+    # Under SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT a written page is believed in L3
+    # for one to two half-TTLs after its last write (storage evicts unannounced), so
+    # a later host eviction re-writes it; set below the store's turnover. 0: forever.
+    SGLANG_HICACHE_L3_BELIEF_TTL_S = EnvFloat(900.0)
+    # Hybrid (Mamba) trees: when the tree holds KV past the deepest state (the tail state was
+    # dropped, the KV kept), query L3 from the end of that KV instead of from the state, so a
+    # tail L3 wrote on host eviction can resume the request through the tree's stateless KV.
+    SGLANG_HICACHE_L3_READ_PAST_TREE_KV = EnvBool(False)
+    # Preserve actual host-state tombstones while FullHost survives (depth >= 8192).
+    SGLANG_HICACHE_L3_WRITE_STATE_ON_TOMBSTONE = EnvBool(False)
+    # Admit a real storage checkpoint by total prefill saved, including reusable tree KV.
+    SGLANG_HICACHE_L3_SAVED_TOKEN_THRESHOLD = EnvBool(False)
+    # Recover checkpoints inside the resident KV span, beyond the deepest live state.
+    SGLANG_HICACHE_L3_READ_WITHIN_TREE_KV = EnvBool(False)
+    # Keyed PP0 lifetime evidence; the output directory must be explicitly provided.
+    SGLANG_HICACHE_L3_LIFETIME_LEDGER = EnvBool(False)
+    SGLANG_HICACHE_L3_LIFETIME_LEDGER_DIR = EnvStr(None)
+    # Diagnostics: PP0 logs the first N L3 lookups (>= 8192 tokens) that found KV pages, with per-pool hit pages.
+    SGLANG_HICACHE_L3_LOOKUP_LOG_N = EnvInt(0)
+    # Diagnostics: PP0 remembers when each page and KDA-state hash was issued to L3 and, per lookup
+    # (>= 8192 tokens), logs where in the queried span states were written; KV-absent lookups up to N.
+    SGLANG_HICACHE_L3_TRACE = EnvBool(False)
+    SGLANG_HICACHE_L3_TRACE_ABSENT_N = EnvInt(300)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the

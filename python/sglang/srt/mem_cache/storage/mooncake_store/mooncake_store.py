@@ -1042,6 +1042,18 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         ]
         return component_keys, key_multiplier
 
+    def batch_exists_mamba_states(self, keys: List[str]) -> List[bool]:
+        """Probe complete state checkpoints independently of KV object residency."""
+        transfer = PoolTransfer(name=PoolName.MAMBA)
+        component_keys, multiplier = self._get_hybrid_page_component_keys(keys, transfer)
+        exists = self._batch_exist(self._tag_keys(component_keys))
+        return [
+            multiplier > 0
+            and len(exists[i * multiplier : (i + 1) * multiplier]) == multiplier
+            and all(v == 1 for v in exists[i * multiplier : (i + 1) * multiplier])
+            for i in range(len(keys))
+        ]
+
     def batch_exists_v2(
         self,
         keys: List[str],

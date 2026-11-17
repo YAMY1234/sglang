@@ -71,9 +71,11 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
+    MambaStateRestoreOperation,
     PPPrefetchDecision,
     PrefetchOperation,
 )
+from sglang.srt.mem_cache.l3_lifetime_ledger import L3LifetimeLedger
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
@@ -104,6 +106,10 @@ from sglang.srt.mem_cache.unified_cache.session_ref_tracker import (
     UnifiedSessionRefTracker,
 )
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
+from sglang.srt.mem_cache.unified_cache.storage_write_back import (
+    StorageWriteBack,
+    WriteOnHostEvictFinalStats,
+)
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
     create_tree_core,
     select_tree_core_backend,
@@ -137,13 +143,13 @@ if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import HiCacheAck
     from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-    from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
-        BaseEvictionResult,
-    )
     from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
         PrefetchOperation,
     )
     from sglang.srt.mem_cache.pool_host import PoolEntry
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
+        BaseEvictionResult,
+    )
     from sglang.srt.server_args import ServerArgs
 
 from sglang.srt.utils.rank_consensus_checker import rank_consensus
@@ -216,6 +222,17 @@ class UnifiedRadixCache(BasePrefixCache):
     # SGLANG_MAMBA_PATH_CAP_COUNTS_HOST, set by _init_mamba_path_cap_counts_host.
     _mamba_path_cap_counts_host = False
     mamba_retention_counts: Optional[dict[str, int]] = None
+    # L2->L3 write-back (SGLANG_OPT_HICACHE_STORAGE_WRITE_BACK); set in init_hicache.
+    _storage_write_back: Optional[StorageWriteBack] = None
+    # check_hicache_events reads this on stubs built with object.__new__ in unit tests;
+    # init_hicache sets the real value.
+    _l3_write_on_host_evict: bool = False
+    _l3_write_state_on_tombstone: bool = False
+    _l3_saved_token_threshold: bool = False
+    _l3_lifetime_ledger: Optional[L3LifetimeLedger] = None
+    _l3_tombstone_quarantined_ops: frozenset[int] = frozenset()
+    # Final stats at SIGTERM / exit under SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT.
+    _l3_tier_final: Optional[WriteOnHostEvictFinalStats] = None
 
     def __init__(
         self,
@@ -285,6 +302,7 @@ class UnifiedRadixCache(BasePrefixCache):
             params=tree_params,
             components=self.components,
         )
+        logger.info("Radix cache tree core: %s", self._tree_core_backend)
         # Components execute boundary actions through the tree core.
         for component in self.components.values():
             component.tree_core = self.tree_core
@@ -397,7 +415,85 @@ class UnifiedRadixCache(BasePrefixCache):
             "l3_demand_requests": 0,
             "l3_miss_tokens": 0,
             "l1l2_miss_tokens": 0,
+            "full_miss_kv_absent": 0,
+            "full_miss_kv_present": 0,
+            # Lookups anchored past the deepest state (SGLANG_HICACHE_L3_READ_PAST_TREE_KV),
+            # their hits, and the tokens those hits make reusable (tree KV + L3).
+            "issued_past_tree_kv": 0,
+            "hits_past_tree_kv": 0,
+            "hit_tokens_past_tree_kv": 0,
+            "lookups_logged": 0,
         }
+        # Exclusive L2->L3 tiering: storage is written from the coldest host pages ahead
+        # of eviction, not at L2 admission. Resolved in init_hicache.
+        self._l3_write_on_host_evict = False
+        self._l3_evict_write_reserve_fraction = 0.0
+        # op id -> tokens of write-behind backups not yet acked; they count as
+        # covered reserve so a slow ack does not re-issue deeper into the tail.
+        self._write_behind_inflight: dict[int, int] = {}
+        # Hybrid trees: op id -> node of a Mamba host-leaf write-behind backup in flight.
+        self._write_behind_mamba_inflight: dict[int, NodeId] = {}
+        # Mamba host states kept free or behind written leaves; 0 disables the walk.
+        self._l3_mamba_leaf_reserve = 0
+        # Step counter (not wall clock: the walk must run on every rank in the
+        # same steps to keep backup issue order identical).
+        self._write_behind_step = 0
+        # Tail tokens the last walk found already in storage; they count as
+        # covered until host eviction consumes them, so a steady state with a
+        # fully tiered tail does not re-walk the heap every step.
+        self._write_behind_clean_tokens = 0
+        self._l3_stats_logged_at = 0.0
+        # Belief TTL (0: off): PP0's clock picks the rotation step for every rank.
+        self._l3_belief_ttl_s = 0.0
+        self._l3_beliefs_rotated_at = time.monotonic()
+        self._l3_tier_stats: dict[str, int] = {
+            "wb_walks": 0,
+            "wb_issued_tokens": 0,
+            "wb_clean_tokens": 0,
+            "wb_unbacked_tokens": 0,
+            "wb_mamba_walks": 0,
+            "belief_rotations": 0,
+            "wb_mamba_leaf_issued_tokens": 0,
+            # Diagnostics: write-behind ops by whether they carry a KDA state.
+            "wb_full_ops_state": 0,
+            "wb_full_ops_nostate": 0,
+            "wb_full_tokens_state": 0,
+            "wb_full_tokens_nostate": 0,
+            "wb_mamba_ops_state": 0,
+            "wb_mamba_ops_nostate": 0,
+            "trace_state_key_not_last_page": 0,
+            # Advisory pre-peek classification, not actual eviction/write outcomes.
+            # The lifetime ledger records actual tombstones and their storage ACKs.
+            "trace_mamba_evict_leaf_written": 0,
+            "trace_mamba_evict_leaf_inflight": 0,
+            "trace_mamba_evict_leaf_unwritten": 0,
+            "trace_mamba_evict_leaf_unwritten_tokens": 0,
+            "trace_mamba_evict_tombstone": 0,
+            # Diagnostics: pages and states PP0 issues again after an earlier write, by the
+            # age of that earlier write (the store may still hold them, or have dropped them).
+            "trace_rewrite_pages_lt10m": 0,
+            "trace_rewrite_pages_ge10m": 0,
+            "trace_rewrite_states_lt10m": 0,
+            "trace_rewrite_states_ge10m": 0,
+            "trace_written_pages": 0,
+            "trace_written_states": 0,
+            # Diagnostics: every lookup (>= 8192 tokens) after PP0's first L3 write, by when PP0
+            # wrote the first queried page (KV absent) or a state inside the found span (KV present).
+            "trace_absent_never": 0,
+            "trace_absent_lt7m": 0,
+            "trace_absent_7to15m": 0,
+            "trace_absent_ge15m": 0,
+            "trace_present_state_lt7m": 0,
+            "trace_present_state_older": 0,
+            "trace_present_no_state": 0,
+            # KV-absent lookups whose first page PP0 never wrote but where it wrote a later page
+            # and a state of the span less than 7 min ago: the ancestors stayed in the tree and
+            # only the tail went to L3 (a read that starts at the tree's KV end would hit).
+            "trace_absent_tail_in_l3": 0,
+            "trace_absent_tail_in_l3_tokens": 0,
+        }
+        self._l3_last_write_has_state = False
+        self._l3_trace: Optional[dict] = None
 
         self.reset()
         logger.info(
@@ -447,6 +543,13 @@ class UnifiedRadixCache(BasePrefixCache):
             self._all_reduce_attn_groups(data, tp_reduce_op)
         self._pp_sync(data)
 
+    def agree_on_all_ranks(self, flags: list[bool]) -> list[bool]:
+        """AND of per-rank flags with the same reduction as the drained counts
+        (TP on PP0, then propagated along PP), so every rank decides alike."""
+        data = torch.tensor(flags, dtype=torch.int)
+        self._all_reduce(data, torch.distributed.ReduceOp.MIN)
+        return [bool(flag) for flag in data.tolist()]
+
     def _pp_sync(self, data: torch.Tensor) -> None:
         """
         Synchronize data across the PP pipeline, where PPn (n>0) will receive PP0's data.
@@ -494,6 +597,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_loaded_tokens_by_reqid: dict[CacheRequestHandle, int] = {}
         self.prefetch_loaded_storage_start_by_reqid: dict[CacheRequestHandle, int] = {}
         self.ongoing_prefetch: dict[CacheRequestHandle, _OngoingPrefetch] = {}
+        self._mamba_state_restores: dict[
+            CacheRequestHandle, MambaStateRestoreOperation
+        ] = {}
         self._storage_prefetch_wait: dict[CacheRequestHandle, _StoragePrefetchWait] = {}
         # Rank-agreed L3-hit tokens not yet resolved as usable or unfulfilled.
         # Cache-mode entries survive L3->L2 until H2D succeeds or admission
@@ -503,6 +609,11 @@ class UnifiedRadixCache(BasePrefixCache):
         ] = {}
         self.storage_prefetch_retries = StoragePrefetchRetries()
         self.ongoing_backup: dict[int, tuple[NodeId, DecLockRefParams]] = {}
+        if self._storage_write_back is not None:
+            self._storage_write_back.reset()
+        self._write_behind_inflight.clear()
+        self._write_behind_mamba_inflight.clear()
+        self._write_behind_clean_tokens = 0
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.reset()
             # The dropped writes' content no longer reaches a storage ack.
@@ -584,6 +695,80 @@ class UnifiedRadixCache(BasePrefixCache):
                 swa = self.components[ComponentType.SWA]
                 self.tree_core.has_swa_host_pool = swa._swa_kv_pool_host is not None
 
+        self._l3_write_on_host_evict = bool(
+            envs.SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT.get()
+            and self.cache_controller is not None
+            and self.cache_controller.enable_storage
+        )
+        self._l3_saved_token_threshold = (
+            envs.SGLANG_HICACHE_L3_SAVED_TOKEN_THRESHOLD.get()
+        )
+        self._l3_write_state_on_tombstone = (
+            envs.SGLANG_HICACHE_L3_WRITE_STATE_ON_TOMBSTONE.get()
+        )
+        if self._l3_write_state_on_tombstone:
+            if (
+                self.host_memory_mode != "cache"
+                or not self.is_mamba_enabled
+                or self.cache_controller is None
+                or not self.cache_controller.enable_storage
+            ):
+                raise ValueError(
+                    "SGLANG_HICACHE_L3_WRITE_STATE_ON_TOMBSTONE requires "
+                    "a Mamba host cache and storage backend"
+                )
+            # Fail at initialization with an extension missing the two-phase walk.
+            self.tree_core.begin_mamba_host_eviction(0, min_depth=8192)
+        self._l3_lifetime_ledger = None
+        if self.pp_rank == 0 and envs.SGLANG_HICACHE_L3_LIFETIME_LEDGER.get():
+            self._l3_lifetime_ledger = L3LifetimeLedger.from_env(
+                self.pp_rank, get_parallel().tp_rank
+            )
+            if self._l3_lifetime_ledger is not None:
+                self.tree_core.set_l3_lifetime_ledger_enabled(True)
+        if self._l3_write_on_host_evict:
+            if self.host_memory_mode == "buffer_only":
+                raise ValueError(
+                    "SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT needs a host cache tier; "
+                    "it does not apply to --hicache-host-memory-mode buffer_only"
+                )
+            # Fails here, not at the first walk, on a Rust extension without the peek.
+            self.tree_core.peek_host_eviction_candidates(BASE_COMPONENT_TYPE, 0)
+            self._l3_evict_write_reserve_fraction = (
+                envs.SGLANG_HICACHE_L3_EVICT_WRITE_RESERVE_FRACTION.get()
+            )
+            self._l3_belief_ttl_s = envs.SGLANG_HICACHE_L3_BELIEF_TTL_S.get()
+            logger.info(
+                "HiCache L3 write-on-host-evict enabled: reserve fraction %.3f "
+                "of host pool (%d tokens)",
+                self._l3_evict_write_reserve_fraction,
+                int(
+                    self._l3_evict_write_reserve_fraction
+                    * self.cache_controller.mem_pool_host.size
+                ),
+            )
+            self._l3_tier_final = WriteOnHostEvictFinalStats.register(self)
+            if envs.SGLANG_HICACHE_L3_TRACE.get() and self.pp_rank == 0:
+                self._l3_trace = dict(kv={}, state={}, writes_logged=0, absent_logged=0,
+                                      present_logged=0, queried_logged=0)
+            if (
+                envs.SGLANG_HICACHE_L3_WRITE_MAMBA_HOST_LEAVES.get()
+                and self.is_mamba_enabled
+            ):
+                self.tree_core.peek_mamba_host_eviction_leaves(0)
+                states = self.cache_controller.mem_pool_host.get_pool(
+                    PoolName.MAMBA
+                ).size
+                self._l3_mamba_leaf_reserve = max(
+                    1, int(self._l3_evict_write_reserve_fraction * states)
+                )
+                logger.info(
+                    "HiCache L3 write-on-host-evict: also writing the host leaves "
+                    "among the %d coldest of %d Mamba host states",
+                    self._l3_mamba_leaf_reserve,
+                    states,
+                )
+
         if self.host_memory_mode == "buffer_only":
             self.tree_core.set_host_memory_buffer_only()
             swa = self.components.get(ComponentType.SWA)
@@ -641,6 +826,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 "(SGLANG_HICACHE_WB_EVICT_BATCH)."
             )
         self._init_mamba_path_cap_counts_host()
+        self._storage_write_back = StorageWriteBack.create(self)
         # Pre-seed the logical dropped-tokens series.
         if self.metrics_collector is not None and self.cache_controller is not None:
             reasons = ["host_pressure"]
@@ -1007,6 +1193,11 @@ class UnifiedRadixCache(BasePrefixCache):
             self._free_values(result.device_frees, result.host_frees)
         finally:
             self._apply_cache_actions(result.cache_actions)
+            self._drain_l3_lifetime_events()
+
+    def _drain_l3_lifetime_events(self) -> None:
+        if self._l3_lifetime_ledger is not None:
+            self._l3_lifetime_ledger.drain_tree(self.tree_core)
 
     def _accumulate_tracker(
         self,
@@ -1621,9 +1812,132 @@ class UnifiedRadixCache(BasePrefixCache):
             # The tree never holds host values in buffer mode, and staging
             # is operation-owned (freed at each ack): nothing is evictable.
             return 0
+        if self._l3_trace is not None and component_type == ComponentType.MAMBA:
+            self._l3_trace_mamba_host_eviction(num_tokens)
+        evicted = self._drive_host_eviction(num_tokens, component_type)
+        if (
+            self._storage_write_back is not None
+            and component_type == BASE_COMPONENT_TYPE
+        ):
+            evicted = self._storage_write_back.evict_host(num_tokens, evicted)
+        if self._l3_tier_final is not None and component_type == BASE_COMPONENT_TYPE:
+            self._l3_tier_final.host_evicted_tokens += evicted
+        return evicted
+
+    def _drive_host_eviction(
+        self, num_tokens: int, component_type: ComponentType
+    ) -> int:
+        if self._l3_write_state_on_tombstone and component_type == ComponentType.MAMBA:
+            return self._drive_mamba_host_eviction_with_storage(num_tokens)
         result = self.tree_core.drive_host_eviction(component_type, num_tokens)
         self._apply_eviction_result(result)
-        return result.tracker.get(component_type, 0)
+        evicted = result.tracker.get(component_type, 0)
+        if component_type == BASE_COMPONENT_TYPE and self._write_behind_clean_tokens:
+            self._write_behind_clean_tokens = max(
+                0, self._write_behind_clean_tokens - evicted
+            )
+        return evicted
+
+    def _drive_mamba_host_eviction_with_storage(self, num_states: int) -> int:
+        """Write an actual state-only victim before releasing its host slot.
+
+        The Rust walk pauses before eligible non-leaf tombstones. The scheduler
+        pins both source pools while the independent backup worker copies them;
+        it never waits on a scheduler-drained acknowledgment or enters a rank
+        collective from this allocator-dependent path.
+        """
+        evicted = 0
+        while evicted < num_states:
+            result = self.tree_core.begin_mamba_host_eviction(
+                num_states - evicted, min_depth=8192
+            )
+            self._apply_eviction_result(result)
+            evicted += result.tracker.get(ComponentType.MAMBA, 0)
+            node_id = result.mamba_storage_backup_node_id
+            if node_id is None:
+                break
+            # Advisory beliefs are not a transfer acknowledgment: force the
+            # backend to confirm the checkpoint, including after TTL eviction.
+            operation_id = self._write_backup_storage(
+                node_id, force=True, ledger_reason="state_tombstone"
+            )
+            if operation_id is None:
+                raise RuntimeError("Mamba tombstone victim has no writable host state")
+            self._wait_mamba_storage_backup(operation_id)
+            result = self.tree_core.finish_mamba_host_eviction(node_id)
+            self._apply_eviction_result(result)
+            freed = result.tracker.get(ComponentType.MAMBA, 0)
+            if freed == 0:
+                # No other scheduler mutation can run while we wait. A failed
+                # resume must not spin forever on the same allocator victim.
+                raise RuntimeError("Mamba tombstone victim changed while writing storage")
+            evicted += freed
+        return evicted
+
+    def _wait_mamba_storage_backup(self, operation_id: int) -> None:
+        cc = self.cache_controller
+        ack_queue = cc.ack_backup_queue
+        start = time.monotonic()
+        warn_at = start + 30.0
+        while True:
+            # Inspect only this operation; earlier ordinary ACKs belong to the
+            # synchronized drain. Failed receipts stay quarantined in the queue.
+            with ack_queue.mutex:
+                operation = next(
+                    (op for op in reversed(ack_queue.queue) if op.id == operation_id),
+                    None,
+                )
+            if operation is not None:
+                break
+            if cc.storage_stop_event.is_set() or not cc.backup_thread.is_alive():
+                # Do not unlock: without an ACK, source DMA completion is unknown.
+                self._l3_tombstone_quarantined_ops |= {operation_id}
+                raise RuntimeError("Storage worker stopped before Mamba tombstone ACK")
+            if time.monotonic() >= warn_at:
+                logger.warning(
+                    "Mamba tombstone waiting %.0f s for storage operation %d",
+                    time.monotonic() - start,
+                    operation_id,
+                )
+                warn_at += 30.0
+            time.sleep(0.0005)
+
+        state_written = False
+        succeeded = operation.completed_tokens >= len(operation.hash_value) * self.page_size
+        for transfer in operation.pool_transfers or ():
+            if not cc.should_backup(transfer):
+                continue
+            expected = len(transfer.keys or ())
+            written = operation.pool_storage_result.extra_pool_hit_pages.get(
+                transfer.name, 0
+            )
+            succeeded = succeeded and expected > 0 and written >= expected
+            state_written |= transfer.name == PoolName.MAMBA and expected > 0 and written >= expected
+        node_id, lock_params = self.ongoing_backup[operation_id]
+        if not succeeded or not state_written:
+            operation.l3_tombstone_quarantined = True
+            self._l3_tombstone_quarantined_ops |= {operation_id}
+        if self._l3_lifetime_ledger is not None:
+            self._l3_lifetime_ledger.emit(
+                "state_tombstone_write_ack", op_id=operation_id, node_id=node_id,
+                succeeded=bool(succeeded and state_written),
+                completed_tokens=operation.completed_tokens,
+                pool_hit_pages=dict(operation.pool_storage_result.extra_pool_hit_pages),
+            )
+        if not succeeded or not state_written:
+            # NIXL can ACK a failure after a transfer timeout while DMA is still
+            # reading these slots. Retain ownership and stop the scheduler; a
+            # later drain must not treat this receipt as permission to unlock.
+            raise RuntimeError("Storage backup failed before Mamba host-state eviction")
+        # This synchronous local write was issued after any enclosing drain's
+        # count snapshot. Remove only its own ACK, leaving that ordinary FIFO
+        # and count intact even if ranks wrote different numbers of tombstones.
+        # Do not seed rank-replicated write-behind beliefs from this local ACK.
+        with ack_queue.mutex:
+            ack_queue.queue.remove(operation)
+            ack_queue.not_full.notify()
+        self.ongoing_backup.pop(operation_id)
+        self.dec_host_lock_ref(node_id, lock_params)
 
     # ---- Decode retraction ----
 
@@ -2037,7 +2351,10 @@ class UnifiedRadixCache(BasePrefixCache):
         self.tree_core.finish_write_through(publish_node_ids, ack_id)
         if lock_params is not None:
             self.dec_lock_ref(lock_node_id, lock_params)
-        if self.enable_storage:
+        if self.enable_storage and self._storage_write_back is not None:
+            # Storage is written when these host copies are evicted.
+            self._storage_write_back.pin(publish_node_ids)
+        elif self.enable_storage and not self._l3_write_on_host_evict:
             # Back up each fragment: after a split, lock_node only holds the
             # suffix; the prefix fragment must be persisted as well.
             for node_id in publish_node_ids:
@@ -2212,15 +2529,46 @@ class UnifiedRadixCache(BasePrefixCache):
             )
         return transfers
 
+    def _storage_backup_is_covered(self, spec) -> bool:
+        beliefs = self.storage_existence_cache
+        if not beliefs.pool(PoolName.KV).covered(spec.hash_value):
+            return False
+        kv_xfer = PoolTransfer(
+            name=PoolName.KV, host_indices=spec.host_value, keys=spec.hash_value
+        )
+        aux_xfers = [x for xfers in spec.comp_xfers.values() for x in xfers]
+        aux_xfers.extend(
+            self._build_sidecar_transfers(
+                CacheTransferPhase.BACKUP_STORAGE, kv_xfer, spec.comp_xfers
+            )
+        )
+        # KV coverage alone does not prove that a checkpoint or sidecar was written.
+        return all(
+            transfer.keys is not None
+            and beliefs.pool(transfer.name).covered(transfer.keys)
+            for transfer in aux_xfers
+        )
+
     @rank_consensus
-    def write_backup_storage(self, node_id: NodeId) -> None:
+    def write_backup_storage(self, node_id: NodeId) -> Optional[int]:
+        """Issue the node's host->storage backup; returns the operation id, or
+        None when nothing was issued (no host copy or all pools covered)."""
+        return self._write_backup_storage(node_id)
+
+    def _write_backup_storage(
+        self, node_id: NodeId, *, force: bool = False, ledger_reason: str = "write_behind"
+    ) -> Optional[int]:
         if not self.enable_storage or self.cache_controller is None:
-            return
+            return None
         spec = self.tree_core.build_storage_backup_spec(
             node_id, self.hicache_storage_pass_prefix_keys
         )
         if spec is None:
-            return
+            return None
+        # A recompute after L2 eviction re-creates the node with backuped=False, so the
+        # flag alone would re-write content L3 holds; stale positives heal on prefetch miss.
+        if not force and self._storage_backup_is_covered(spec):
+            return None
 
         kv_xfer = PoolTransfer(
             name=PoolName.KV,
@@ -2233,17 +2581,128 @@ class UnifiedRadixCache(BasePrefixCache):
         aux_xfers = [x for xfers in spec.comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
 
-        operation_id = self.cache_controller.write_storage(
-            spec.host_value,
-            spec.token_ids,
-            spec.hash_value,
-            spec.prefix_keys,
-            extra_pools=aux_xfers or None,
+        lock_params = self.inc_host_lock_ref(node_id).to_dec_params()
+        try:
+            operation_id = self.cache_controller.write_storage(
+                spec.host_value,
+                spec.token_ids,
+                spec.hash_value,
+                spec.prefix_keys,
+                extra_pools=aux_xfers or None,
+                **(
+                    {"ledger_reason": ledger_reason}
+                    if force or self._l3_lifetime_ledger is not None
+                    else {}
+                ),
+            )
+        except Exception:
+            self.dec_host_lock_ref(node_id, lock_params)
+            raise
+        self._l3_last_write_has_state = any(x.name == PoolName.MAMBA for x in aux_xfers)
+        if self._l3_trace is not None:
+            self._l3_trace_write(spec.hash_value, aux_xfers)
+        self.ongoing_backup[operation_id] = (node_id, lock_params)
+        if self._l3_lifetime_ledger is not None:
+            self._l3_lifetime_ledger.emit(
+                "storage_write_issue", reason=ledger_reason, node_id=node_id,
+                op_id=operation_id, kv_keys=list(spec.hash_value),
+                pools={x.name.value: list(x.keys or ()) for x in aux_xfers},
+                depth=(
+                    len(self.tree_core.get_prefix_hash_values(node_id))
+                    + len(spec.hash_value)
+                ) * self.page_size,
+            )
+        return operation_id
+
+    def _write_behind_mamba_leaves(self) -> None:
+        """A Mamba host eviction takes a host leaf whole (Full pages and state)
+        without passing the Full walk below, so write the host leaves among the
+        coldest Mamba host states ahead of it. Rank-replicated inputs, as there."""
+        pool = self.cache_controller.mem_pool_host
+        deficit = self._l3_mamba_leaf_reserve - pool.available_size(PoolName.MAMBA)
+        if deficit <= 0:
+            return
+        stats = self._l3_tier_stats
+        stats["wb_mamba_walks"] += 1
+        inflight = set(self._write_behind_mamba_inflight.values())
+        for node_id, num_tokens, _ in self.tree_core.peek_mamba_host_eviction_leaves(
+            deficit
+        ):
+            if node_id in inflight:
+                continue
+            # None when all pools are covered already (or no host copy).
+            operation_id = self.write_backup_storage(node_id)
+            if operation_id is None:
+                continue
+            self._write_behind_mamba_inflight[operation_id] = node_id
+            stats["wb_mamba_leaf_issued_tokens"] += num_tokens
+            stats[f"wb_mamba_ops_{'state' if self._l3_last_write_has_state else 'nostate'}"] += 1
+
+    def _maybe_rotate_beliefs(self) -> None:
+        """Rotate the storage beliefs every half TTL, by PP0's clock agreed on all ranks
+        (one small collective every 256 steps)."""
+        now = time.monotonic()
+        due = now - self._l3_beliefs_rotated_at >= self._l3_belief_ttl_s / 2
+        if self.agree_on_all_ranks([self.pp_rank == 0 and due])[0]:
+            self.storage_existence_cache.rotate()
+            self._l3_beliefs_rotated_at = now
+            self._l3_tier_stats["belief_rotations"] += 1
+
+    def _write_behind_host_tail(self) -> None:
+        """Keep the reserve at the LRU host tail either free or already in
+        storage, so drive_host_eviction only drops pages storage holds. Every
+        input (pool state, tree, beliefs, in-flight set) is rank-replicated."""
+        self._write_behind_step += 1
+        if self._l3_belief_ttl_s > 0 and self._write_behind_step % 256 == 0:
+            self._maybe_rotate_beliefs()
+        if self._write_behind_step % 4:
+            return
+        if self._l3_mamba_leaf_reserve:
+            self._write_behind_mamba_leaves()
+        pool = self.cache_controller.mem_pool_host
+        target = int(self._l3_evict_write_reserve_fraction * pool.size)
+        covered = (
+            pool.available_size()
+            + sum(self._write_behind_inflight.values())
+            + self._write_behind_clean_tokens
         )
-        self.ongoing_backup[operation_id] = (
+        deficit = target - covered
+        # Refill in quarter-reserve quanta: the candidate walk heapifies every
+        # host leaf, so running it per freed page would eat the scheduler thread.
+        if deficit < max(1, target // 4):
+            return
+        stats = self._l3_tier_stats
+        stats["wb_walks"] += 1
+        # write_backup_storage repeats this check for its write-through callers;
+        # doing it here first lets clean tail tokens count toward the reserve.
+        beliefs = self.storage_existence_cache
+        clean = 0
+        for (
             node_id,
-            self.inc_host_lock_ref(node_id).to_dec_params(),
-        )
+            num_tokens,
+            hash_value,
+        ) in self.tree_core.peek_host_eviction_candidates(
+            BASE_COMPONENT_TYPE, target - pool.available_size()
+        ):
+            if hash_value and beliefs.pool(PoolName.KV).covered(hash_value):
+                spec = self.tree_core.build_storage_backup_spec(
+                    node_id, self.hicache_storage_pass_prefix_keys
+                )
+                if spec is not None and self._storage_backup_is_covered(spec):
+                    clean += num_tokens
+                    continue
+            operation_id = self.write_backup_storage(node_id)
+            if operation_id is None:
+                # No host copy to write from; the page leaves L2 without an L3 copy.
+                stats["wb_unbacked_tokens"] += num_tokens
+                continue
+            self._write_behind_inflight[operation_id] = num_tokens
+            stats["wb_issued_tokens"] += num_tokens
+            kind = "state" if self._l3_last_write_has_state else "nostate"
+            stats[f"wb_full_ops_{kind}"] += 1
+            stats[f"wb_full_tokens_{kind}"] += num_tokens
+        self._write_behind_clean_tokens = clean
+        stats["wb_clean_tokens"] += clean
 
     def is_backuped(self, node_id: NodeId) -> bool:
         return self.tree_core.is_backuped(node_id)
@@ -2261,6 +2720,162 @@ class UnifiedRadixCache(BasePrefixCache):
         if node_id is None:
             return None
         return self.tree_core.rotation_base_of(node_id)
+
+    def mamba_storage_match_length(
+        self, token_ids, extra_key=None, cache_salt=None
+    ) -> int:
+        """Usable joint prefix, including device KV behind a host-only state.
+
+        Such KV is exposed to the request only after the existing H2D state
+        load; prefix_len + host_hit_length intentionally undercounts it before
+        admission and is therefore not the saved-token baseline for another L3 read.
+        """
+        return self.tree_core.peek_prefix_len(
+            RadixKey(
+                array("q", token_ids),
+                extra_key=extra_key,
+                cache_salt=cache_salt,
+                is_bigram=self.tree_core.is_eagle,
+            )
+        )
+
+    def prefetch_mamba_state_within_tree(
+        self,
+        request: CacheRequestHandle,
+        token_ids: list[int],
+        matched_tokens: int,
+        full_tokens: int,
+        full_node_id: Optional[NodeId],
+        matched_node_id: Optional[NodeId],
+        on_complete: Callable[[], None],
+        extra_key: Optional[str] = None,
+        cache_salt: Optional[str] = None,
+    ) -> bool:
+        """Queue state-only recovery before the normal v4 suffix prefetch.
+
+        Enqueue even a local miss: worker collectives must see identical request
+        order while PP intake is still relaying requests to later stages.
+        """
+        if (
+            not envs.SGLANG_HICACHE_L3_READ_WITHIN_TREE_KV.get()
+            or not self.enable_storage
+            or self.host_memory_mode == "buffer_only"
+            or not self.supports_mamba()
+        ):
+            return False
+        pending = getattr(self, "_mamba_state_restores", None)
+        if pending is None:
+            pending = self._mamba_state_restores = {}
+        if request in pending:
+            return True
+        key = RadixKey(
+            array("q", token_ids),
+            extra_key=extra_key,
+            cache_salt=cache_salt,
+            is_bigram=self.tree_core.is_eagle,
+        ).page_aligned(self.page_size)
+        operation = MambaStateRestoreOperation(
+            request,
+            key,
+            matched_tokens,
+            full_tokens,
+            None,
+            self.prefetch_threshold
+            if envs.SGLANG_HICACHE_L3_SAVED_TOKEN_THRESHOLD.get()
+            else 1,
+        )
+        operation.on_complete = on_complete
+        # Pin both the Full endpoint and the previously usable state. An
+        # intermediate state may otherwise be tombstoned during slot allocation.
+        if full_node_id is not None and full_tokens > matched_tokens:
+            for node_id in dict.fromkeys((full_node_id, matched_node_id)):
+                if node_id is None:
+                    continue
+                device = self.inc_lock_ref(node_id).to_dec_params()
+                host = self.inc_host_lock_ref(node_id).to_dec_params()
+                operation.restore_locks.append((node_id, device, host))
+            operation.state_host_indices = self.components[
+                ComponentType.MAMBA
+            ].alloc_prefetch_staging(1)
+        stats = self._prefetch_outcome_stats
+        stats["within_tree_queries"] = stats.get("within_tree_queries", 0) + 1
+        if operation.restore_locks and operation.state_host_indices is None:
+            stats["within_tree_alloc_failed"] = (
+                stats.get("within_tree_alloc_failed", 0) + 1
+            )
+        pending[request] = operation
+        self.cache_controller.prefetch_queue.put(operation)
+        return True
+
+    def _cancel_mamba_state_restore(self, request: CacheRequestHandle) -> None:
+        operation = getattr(self, "_mamba_state_restores", {}).get(request)
+        if operation is not None:
+            # The worker owns the destination until its result reaches the
+            # scheduler. Never free a slot while a remote get may write to it.
+            operation.cancelled = True
+            operation.on_complete = None
+
+    def _finish_mamba_state_restore(self, operation) -> None:
+        pending = getattr(self, "_mamba_state_restores", {})
+        pending.pop(operation.handle, None)
+        indices = operation.state_host_indices
+        attached = False
+        try:
+            if not operation.cancelled and operation.state_end_tokens:
+                node_id, actions = self.tree_core.prepare_mamba_host_restore(
+                    operation.token_ids, operation.state_end_tokens
+                )
+                self._apply_cache_actions(actions)
+                if node_id is not None:
+                    attached = self.tree_core.commit_mamba_host_restore(
+                        node_id, indices
+                    )
+            stats = self._prefetch_outcome_stats
+            if attached:
+                stats["within_tree_hits"] = stats.get("within_tree_hits", 0) + 1
+                stats["within_tree_saved_tokens"] = (
+                    stats.get("within_tree_saved_tokens", 0)
+                    + operation.state_saved_tokens
+                )
+            elif operation.state_outcome in ("threshold_rejected", "transfer_failed"):
+                name = "within_tree_" + operation.state_outcome
+                stats[name] = stats.get(name, 0) + 1
+            ledger = getattr(self, "_l3_lifetime_ledger", None)
+            if ledger is not None:
+                end = operation.state_end_tokens
+                hashes = operation.state_hashes
+                ledger.emit(
+                    "state_lookup",
+                    wall_ns=operation.query_wall_ns or time.time_ns(),
+                    rid=operation.request_id,
+                    matched_tokens=operation.matched_tokens,
+                    tree_kv_tokens=operation.full_tokens,
+                    checkpoint_tokens=end,
+                    checkpoint_key=hashes[end // self.page_size - 1] if end else None,
+                    request_end_key=hashes[-1] if hashes else None,
+                    local_state_keys=[
+                        key
+                        for key, hit in zip(hashes, operation.state_exists)
+                        if hit
+                    ],
+                    outcome=operation.state_outcome,
+                    attached=attached,
+                    cancelled=operation.cancelled,
+                    saved_tokens=operation.state_saved_tokens if attached else 0,
+                    loaded_kv_tokens=0,
+                )
+        finally:
+            if indices is not None and not attached:
+                self.components[ComponentType.MAMBA].free_host_values([indices])
+            operation.state_host_indices = None
+            for node_id, device, host in reversed(operation.restore_locks):
+                self.dec_host_lock_ref(node_id, host)
+                self.dec_lock_ref(node_id, device)
+            operation.restore_locks.clear()
+        # State-only reads do not credit Full KV storage tokens. Rematch on the
+        # scheduler, then let the unchanged v4 path fetch beyond the tree's KV.
+        if operation.on_complete is not None:
+            operation.on_complete()
 
     def query_storage_hit_length(
         self,
@@ -2315,7 +2930,10 @@ class UnifiedRadixCache(BasePrefixCache):
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
         storage_hit_end: Optional[int] = None,
+        tree_kv_tokens: int = 0,
     ) -> Optional[bool]:
+        """tree_kv_tokens: stateless tree KV between the deepest state and this anchor; a
+        hit resumes the request through it, so it counts toward the threshold."""
         if not self.enable_storage or self.cache_controller is None:
             return
 
@@ -2373,7 +2991,7 @@ class UnifiedRadixCache(BasePrefixCache):
         stats = self._prefetch_outcome_stats
         if prefetch_length > 0:
             stats["attempts"] += 1
-        if prefetch_length < self.prefetch_threshold:
+        if prefetch_length + tree_kv_tokens < self.prefetch_threshold:
             if prefetch_length > 0:
                 stats["declined_too_short"] += 1
             # No lookup was issued, so no retry is armed: polling here would
@@ -2453,6 +3071,9 @@ class UnifiedRadixCache(BasePrefixCache):
         stats["issued"] += 1
         if operation.assume_stored:
             stats["issued_assumed_stored"] += 1
+        if tree_kv_tokens:
+            stats["issued_past_tree_kv"] += 1
+        operation.stats_tree_kv_tokens = tree_kv_tokens
         # Keep the requested span stable for the wait budget and miss accounting;
         # the hit hash chain can shrink as device coverage changes.
         operation.stats_requested_tokens = prefetch_length
@@ -2615,6 +3236,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=True, same_results=True)
     def check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
+        if request in getattr(self, "_mamba_state_restores", {}):
+            return False
         if (
             self.cache_controller is not None
             and self.cache_controller.pp_prefetch_decisions.get(request.rid)
@@ -2687,6 +3310,10 @@ class UnifiedRadixCache(BasePrefixCache):
             and self.storage_metrics_collector is not None
         ):
             self.storage_metrics_collector.log_prefetched_tokens(completed_tokens)
+        if self._storage_write_back is not None:
+            self._storage_write_back.on_storage_read(completed_tokens)
+        if self._l3_tier_final is not None:
+            self._l3_tier_final.read_tokens += completed_tokens
 
         if self.buffer_pipeline is not None:
             # No graft: release the rank-local tail beyond the synced usable
@@ -2706,7 +3333,14 @@ class UnifiedRadixCache(BasePrefixCache):
         # Apply the host-insert walk's actions before the transfer commit.
         self._apply_cache_actions(insert_result.cache_actions)
 
+        # The rank-synced fetch proves L3 presence even if the host insert is dropped.
+        self.storage_existence_cache.pool(PoolName.KV).add(
+            hash_value[: completed_tokens // self.page_size]
+        )
+
         if insert_result.host_insert_dropped:
+            if self._storage_write_back is not None:
+                self._storage_write_back.on_storage_read_dropped(completed_tokens)
             self._resolve_storage_prefetch_tokens(request, insert_result.prefix_len)
             self._finish_storage_prefetch(request, fulfilled_tokens=0, reason="dropped")
             self.cache_controller.append_host_mem_release(
@@ -2732,6 +3366,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 host_indices[: insert_result.prefix_len]
             )
             loaded_from_storage = completed_tokens - insert_result.prefix_len
+            if self._storage_write_back is not None and insert_result.prefix_len:
+                self._storage_write_back.on_storage_read_dropped(
+                    insert_result.prefix_len
+                )
             # Cache mode has only completed L3 -> L2 here. Keep the usable
             # storage span unresolved until admission proves that L2 -> L1
             # load-back actually materialized it for this request.
@@ -2873,6 +3511,24 @@ class UnifiedRadixCache(BasePrefixCache):
         self, request: CacheRequestHandle, num_tokens: int
     ) -> None:
         """Start accounting one rank-agreed positive L3 query result."""
+        if self._l3_lifetime_ledger is not None and num_tokens > 0:
+            pending = getattr(self, "_l3_ledger_prefetch", None)
+            if pending is None:
+                pending = self._l3_ledger_prefetch = {}
+            previous = pending.pop(request, None)
+            if previous is not None:
+                self._l3_lifetime_ledger.emit(
+                    "storage_prefetch_discard", rid=request.rid,
+                    op_id=previous["op_id"], remaining_tokens=previous["remaining"],
+                    reason="replaced",
+                )
+            info = self.ongoing_prefetch.get(request)
+            operation = info.operation if info is not None else None
+            pending[request] = {
+                "remaining": num_tokens,
+                "storage_start": operation.storage_start if operation else None,
+                "op_id": operation.id if operation else None,
+            }
         if (
             num_tokens <= 0
             or not self.enable_storage_metrics
@@ -2886,7 +3542,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 self._storage_prefetch_hit_remaining_by_reqid[request],
                 num_tokens,
             )
-            self.discard_storage_prefetch_accounting(request)
+            self._storage_prefetch_hit_remaining_by_reqid.pop(request, None)
         self._storage_prefetch_hit_remaining_by_reqid[request] = num_tokens
         self.storage_metrics_collector.log_storage_prefetch_hit_tokens(num_tokens)
 
@@ -2895,6 +3551,16 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> None:
         if num_tokens <= 0:
             return
+        if self._l3_lifetime_ledger is not None:
+            entry = getattr(self, "_l3_ledger_prefetch", {}).get(request)
+            if entry is not None:
+                resolved = min(num_tokens, entry["remaining"])
+                entry["remaining"] -= resolved
+                self._l3_lifetime_ledger.emit(
+                    "storage_prefetch_resolved", rid=request.rid,
+                    op_id=entry["op_id"], storage_start=entry["storage_start"],
+                    resolved_tokens=resolved, reason=reason or "tree_overlap",
+                )
         remaining = self._storage_prefetch_hit_remaining_by_reqid.get(request)
         if remaining is None:
             return
@@ -2921,6 +3587,16 @@ class UnifiedRadixCache(BasePrefixCache):
     def _finish_storage_prefetch(
         self, request: CacheRequestHandle, fulfilled_tokens: int, reason: Optional[str]
     ) -> None:
+        if self._l3_lifetime_ledger is not None:
+            entry = getattr(self, "_l3_ledger_prefetch", {}).pop(request, None)
+            if entry is not None:
+                fulfilled = min(fulfilled_tokens, entry["remaining"])
+                self._l3_lifetime_ledger.emit(
+                    "storage_prefetch_finish", rid=request.rid,
+                    op_id=entry["op_id"], storage_start=entry["storage_start"],
+                    fulfilled_tokens=fulfilled,
+                    unfulfilled_tokens=entry["remaining"] - fulfilled, reason=reason,
+                )
         remaining = self._storage_prefetch_hit_remaining_by_reqid.pop(request, None)
         if remaining is None:
             return
@@ -2963,6 +3639,13 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def discard_storage_prefetch_accounting(self, request: CacheRequestHandle) -> None:
         """Drop lifecycle state for cases intentionally excluded from metrics."""
+        if self._l3_lifetime_ledger is not None:
+            entry = getattr(self, "_l3_ledger_prefetch", {}).pop(request, None)
+            if entry is not None:
+                self._l3_lifetime_ledger.emit(
+                    "storage_prefetch_discard", rid=request.rid,
+                    op_id=entry["op_id"], remaining_tokens=entry["remaining"],
+                )
         self._storage_prefetch_hit_remaining_by_reqid.pop(request, None)
 
     def _handle_storage_prefetch_anchor_loss(self, request: CacheRequestHandle) -> None:
@@ -2986,13 +3669,17 @@ class UnifiedRadixCache(BasePrefixCache):
         self, request: CacheRequestHandle
     ) -> tuple[int, Optional[int]]:
         """Pop the loaded L3 token count and its absolute prefix start."""
+        loaded = self.prefetch_loaded_tokens_by_reqid.pop(request, 0)
+        if loaded and self._storage_write_back is not None:
+            self._storage_write_back.on_storage_hit(loaded)
         return (
-            self.prefetch_loaded_tokens_by_reqid.pop(request, 0),
+            loaded,
             self.prefetch_loaded_storage_start_by_reqid.pop(request, None),
         )
 
     @rank_consensus(same_params=True)
     def release_aborted_request(self, request: CacheRequestHandle) -> None:
+        self._cancel_mamba_state_restore(request)
         rid = request.rid
         self._storage_prefetch_wait.pop(request, None)
         if self.linker is not None:
@@ -3070,7 +3757,7 @@ class UnifiedRadixCache(BasePrefixCache):
         """Heal each pool's beliefs beyond its rank-agreed boundary (a
         chain-page pool also learns presence up to it); a pool without a
         verdict heals from the folded cut."""
-        if self.host_memory_mode != "buffer_only" or operation.deadline_expired:
+        if operation.deadline_expired:
             # A cut query's agreed hit may be a MIN over skipped lookups, not a verdict.
             return
         chain = operation.all_hash_values
@@ -3109,6 +3796,49 @@ class UnifiedRadixCache(BasePrefixCache):
             return
         stats = self._prefetch_outcome_stats
         hit = max(0, min(operation.storage_hit_count, requested))
+        if self._l3_lifetime_ledger is not None:
+            chain = operation.all_hash_values or operation.hash_value
+            hit_pages = hit // self.page_size
+            self._l3_lifetime_ledger.emit(
+                "storage_lookup", rid=operation.request_id, op_id=operation.id,
+                M=operation.storage_start - operation.stats_tree_kv_tokens,
+                K=operation.storage_start,
+                D=operation.storage_start + hit if hit else None,
+                requested_tokens=requested, hit_tokens=hit, revoked=revoked,
+                anchor_hash=operation.last_hash,
+                query_end_hash=chain[-1] if chain else None,
+                checkpoint_hash=chain[hit_pages - 1] if hit_pages else None,
+                pool_hit_pages=dict(operation.query_pool_hit_pages or {}),
+            )
+        pools = (operation.query_pool_hit_pages or {}) if requested >= 8192 else {}
+        kv_pages = pools.get(PoolName.KV, 0)
+        if requested >= 8192 and hit == 0:
+            # Diagnostics: a full miss with KV pages present lacks a state or sidecar.
+            stats["full_miss_kv_present" if kv_pages else "full_miss_kv_absent"] += 1
+        if (
+            requested >= 8192
+            and kv_pages > 0
+            and stats["lookups_logged"] < envs.SGLANG_HICACHE_L3_LOOKUP_LOG_N.get()
+            and self.pp_rank == 0
+        ):
+            stats["lookups_logged"] += 1
+            # Diagnostics: per-pool boundaries tell a missing page from a missing state.
+            logger.info(
+                "HiCache L3 lookup: rid=%s anchor=%s storage_start=%d requested=%d "
+                "hit=%d pool_hit_pages=%s restorable=%s",
+                operation.request_id,
+                "root" if operation.last_hash is None else "node",
+                operation.storage_start,
+                requested,
+                hit,
+                {str(k): v for k, v in (operation.query_pool_hit_pages or {}).items()},
+                (operation.pool_storage_result.restorable_prefix_pages or [])[-3:],
+            )
+        if self._l3_trace is not None and requested >= 8192:
+            self._l3_trace_lookup(operation, kv_pages)
+        if hit > 0 and not revoked and operation.stats_tree_kv_tokens:
+            stats["hits_past_tree_kv"] += 1
+            stats["hit_tokens_past_tree_kv"] += hit + operation.stats_tree_kv_tokens
         if revoked:
             if hit > 0:
                 stats["revoked_insufficient"] += 1
@@ -3119,8 +3849,124 @@ class UnifiedRadixCache(BasePrefixCache):
         stats["l1l2_miss_tokens"] += requested
         stats["l3_miss_tokens"] += miss
 
+    def _l3_trace_object_keys(self, page_hashes: list[str]):
+        """Diagnostics: the tagged KDA-state object keys the backend forms for these page hashes."""
+        backend = self.cache_controller.storage_backend
+        backend = getattr(backend, "_backend", backend)
+        try:
+            keys, _ = backend._get_hybrid_page_component_keys(
+                list(page_hashes), PoolTransfer(name=PoolName.MAMBA)
+            )
+            return backend._tag_keys(keys)
+        except Exception as e:  # diagnostics must not fail a write
+            return f"<{e!r}>"
+
+    def _l3_trace_write(self, hash_value: list[str], aux_xfers: list[PoolTransfer]) -> None:
+        """Diagnostics (PP0): remember when each page and state hash was issued to L3."""
+        trace, now = self._l3_trace, time.monotonic()
+        kv, stats = trace["kv"], self._l3_tier_stats
+        for h in hash_value:
+            then = kv.get(h)
+            if then is not None:
+                stats["trace_rewrite_pages_lt10m" if now - then < 600 else "trace_rewrite_pages_ge10m"] += 1
+            kv[h] = now
+        stats["trace_written_pages"] += len(hash_value)
+        for xfer in aux_xfers:
+            if xfer.name != PoolName.MAMBA or not xfer.keys:
+                continue
+            state_key = xfer.keys[-1]
+            then = trace["state"].get(state_key)
+            if then is not None:
+                stats["trace_rewrite_states_lt10m" if now - then[0] < 600 else "trace_rewrite_states_ge10m"] += 1
+            stats["trace_written_states"] += 1
+            trace["state"][state_key] = (now, len(hash_value))
+            if state_key != hash_value[-1]:
+                stats["trace_state_key_not_last_page"] += 1
+            if trace["writes_logged"] < 5:
+                trace["writes_logged"] += 1
+                logger.info(
+                    "HiCache L3 trace write: pages=%d last_page=%s state_key=%s object_keys=%s",
+                    len(hash_value), hash_value[-1], state_key,
+                    self._l3_trace_object_keys([state_key]),
+                )
+
+    def _l3_trace_mamba_host_eviction(self, num_states: int) -> None:
+        """Diagnostics (PP0): classify the coldest host states a Mamba host eviction is about
+        to take (read-only peek, same LRU order as the eviction)."""
+        stats, written = self._l3_tier_stats, self._l3_trace["state"]
+        inflight = set(self._write_behind_mamba_inflight.values())
+        leaves = self.tree_core.peek_mamba_host_eviction_leaves(num_states)
+        for node_id, num_tokens, hashes in leaves:
+            if hashes and hashes[-1] in written:
+                stats["trace_mamba_evict_leaf_written"] += 1
+            elif node_id in inflight:
+                stats["trace_mamba_evict_leaf_inflight"] += 1
+            else:
+                stats["trace_mamba_evict_leaf_unwritten"] += 1
+                stats["trace_mamba_evict_leaf_unwritten_tokens"] += num_tokens
+        stats["trace_mamba_evict_tombstone"] += max(0, num_states - len(leaves))
+
+    def _l3_trace_lookup(self, operation, kv_pages: int) -> None:
+        """Diagnostics (PP0): for one lookup, how much of the queried span PP0 ever wrote and
+        where (page, age) it wrote states, against the rank-agreed KV boundary."""
+        trace, now = self._l3_trace, time.monotonic()
+        chain = operation.all_hash_values or []
+        kv, states, stats = trace["kv"], trace["state"], self._l3_tier_stats
+        if not kv:  # before PP0's first write every lookup misses trivially
+            return
+        if kv_pages:
+            ages = [now - states[h][0] for h in chain[:kv_pages] if h in states]
+            stats["trace_present_no_state" if not ages else "trace_present_state_lt7m"
+                  if min(ages) < 420 else "trace_present_state_older"] += 1
+        else:
+            then = kv.get(chain[0]) if chain else None
+            age = None if then is None else now - then
+            stats["trace_absent_never" if age is None else "trace_absent_lt7m" if age < 420
+                  else "trace_absent_7to15m" if age < 900 else "trace_absent_ge15m"] += 1
+            if age is None:
+                fresh = [i for i, h in enumerate(chain) if h in states and now - states[h][0] < 420]
+                if fresh:
+                    stats["trace_absent_tail_in_l3"] += 1
+                    stats["trace_absent_tail_in_l3_tokens"] += (fresh[-1] + 1) * self.page_size
+        counter = "present_logged" if kv_pages else "absent_logged"
+        if not kv_pages and trace[counter] >= envs.SGLANG_HICACHE_L3_TRACE_ABSENT_N.get():
+            return
+        trace[counter] += 1
+        prefix = 0
+        for h in chain:
+            if h not in kv:
+                break
+            prefix += 1
+        ever = sum(h in kv for h in chain)
+        first_age = round(now - kv[chain[0]]) if chain and chain[0] in kv else None
+        at = [
+            (i + 1, round(now - states[h][0]), states[h][1])
+            for i, h in enumerate(chain)
+            if h in states
+        ]
+        logger.info(
+            "HiCache L3 trace lookup: rid=%s storage_start=%d pages=%d kv_found=%d hit_pages=%d "
+            "kv_written_prefix=%d kv_written_any=%d first_page_age_s=%s "
+            "states_written(page,age_s,node_pages)=%s",
+            operation.request_id, operation.storage_start, len(chain), kv_pages,
+            operation.storage_hit_count // self.page_size, prefix, ever, first_age, at[-8:],
+        )
+        if kv_pages and trace["queried_logged"] < 5:
+            trace["queried_logged"] += 1
+            pages = [p for p, _, _ in at[-2:]] + [min(kv_pages, len(chain))]
+            logger.info(
+                "HiCache L3 trace queried: rid=%s pages=%s object_keys=%s",
+                operation.request_id, pages,
+                self._l3_trace_object_keys([chain[p - 1] for p in pages]),
+            )
+
     def prefetch_outcome_stats_snapshot(self) -> dict:
-        return self._prefetch_outcome_stats.copy()
+        stats = self._prefetch_outcome_stats.copy()
+        if self._l3_write_on_host_evict:
+            stats.update(self._l3_tier_stats)
+            stats["wb_inflight_tokens"] = sum(self._write_behind_inflight.values())
+            stats["wb_mamba_inflight_ops"] = len(self._write_behind_mamba_inflight)
+        return stats
 
     def _prefetch_occupied_span(
         self, prefetch_key, host_indices, *, operation=None
@@ -3136,6 +3982,22 @@ class UnifiedRadixCache(BasePrefixCache):
                 return operation.buffer_host_occupied_units
             return len(host_indices) if host_indices is not None else 0
         return len(prefetch_key)
+
+    def _storage_prefetch_min_hit_tokens(self, operation) -> int:
+        """A positive L3 checkpoint remains mandatory even with tree KV credit."""
+        if not self._l3_saved_token_threshold:
+            return self.prefetch_threshold
+        tree_tokens = max(0, operation.stats_tree_kv_tokens)
+        return max(
+            self.page_size,
+            ceil_align(max(0, self.prefetch_threshold - tree_tokens), self.page_size),
+        )
+
+    def _storage_prefetch_meets_threshold(self, operation) -> bool:
+        return (
+            operation.storage_hit_count > 0
+            and operation.storage_hit_count >= self._storage_prefetch_min_hit_tokens(operation)
+        )
 
     def _alloc_prefetch_aux_staging(
         self, info: _OngoingPrefetch, hit_tokens: int
@@ -3243,6 +4105,8 @@ class UnifiedRadixCache(BasePrefixCache):
         log_metrics: bool,
     ) -> None:
         cc = self.cache_controller
+        write_back = self._storage_write_back
+        acks_taken_at_entry = 0 if write_back is None else write_back.acks_taken
 
         def _drain_queue(q: Queue[T], n: Optional[int]) -> Iterator[T]:
             """If n is None, consume all items from the queue.
@@ -3335,8 +4199,13 @@ class UnifiedRadixCache(BasePrefixCache):
             host_indices, alloc_len = cc.allocate_storage_hit(
                 operation,
                 hit_tokens,
-                allow_partial=True,
-                min_tokens=self.prefetch_threshold,
+                # A confirmed Mamba checkpoint belongs to this exact endpoint.
+                # A shorter KV allocation does not prove a state at its new end.
+                allow_partial=not (
+                    self._l3_saved_token_threshold
+                    and ComponentType.MAMBA in info.comp_xfers
+                ),
+                min_tokens=self._storage_prefetch_min_hit_tokens(operation),
                 evict_host=self.evict_host,
             )
             if host_indices is None:
@@ -3385,6 +4254,9 @@ class UnifiedRadixCache(BasePrefixCache):
                         break
                     parked.popleft()
             for operation in _drain_queue(cc.prefetch_hit_queue, n_storage_hit):
+                if isinstance(operation, MambaStateRestoreOperation):
+                    self._finish_mamba_state_restore(operation)
+                    continue
                 self._invalidate_absent_from_hit_query(operation)
                 request = operation.handle
                 hit_tokens = operation.storage_hit_count
@@ -3401,7 +4273,7 @@ class UnifiedRadixCache(BasePrefixCache):
                         reason = None
                         if operation.deadline_expired:
                             reason = "deadline"
-                        elif hit_tokens < self.prefetch_threshold:
+                        elif not self._storage_prefetch_meets_threshold(operation):
                             reason = "below_threshold"
                         self._finish_storage_prefetch(
                             request, fulfilled_tokens=0, reason=reason
@@ -3413,7 +4285,7 @@ class UnifiedRadixCache(BasePrefixCache):
                         self.storage_prefetch_retries.poll_miss(request.rid)
                     self.revoke_pending_prefetch(request)
                     continue
-                if hit_tokens < self.prefetch_threshold:
+                if not self._storage_prefetch_meets_threshold(operation):
                     # Below-threshold hits are not worth the transfer.
                     self._account_prefetch_outcome(operation, revoked=True)
                     self._finish_storage_prefetch(
@@ -3465,7 +4337,20 @@ class UnifiedRadixCache(BasePrefixCache):
 
         def _drain_backup():
             drained = 0
-            for operation in _drain_queue(cc.ack_backup_queue, n_backup):
+            n = n_backup
+            if write_back is not None and n:
+                # A write-back wait inside this drain took acks off the queue
+                # front; they count against the n agreed before it.
+                n = max(0, n - (write_back.acks_taken - acks_taken_at_entry))
+            write_back_acks = []
+            for operation in _drain_queue(cc.ack_backup_queue, n):
+                if (
+                    operation.id in self._l3_tombstone_quarantined_ops
+                    or getattr(operation, "l3_tombstone_quarantined", False)
+                ):
+                    raise RuntimeError(
+                        "Refusing to release a quarantined Mamba storage source"
+                    )
                 drained += 1
                 if buffer_mode:
                     # Storage write acked: free the staging.
@@ -3475,6 +4360,29 @@ class UnifiedRadixCache(BasePrefixCache):
                     if entry is not None:
                         node_id, lock_params = entry
                         self.dec_host_lock_ref(node_id, lock_params)
+                    if write_back is not None:
+                        write_back_acks.append(operation)
+                    if (
+                        self._l3_tier_final is not None
+                        and (
+                            operation.id in self._write_behind_inflight
+                            or operation.id in self._write_behind_mamba_inflight
+                        )
+                    ):
+                        self._l3_tier_final.written_tokens += operation.completed_tokens
+                    self._write_behind_inflight.pop(operation.id, None)
+                    self._write_behind_mamba_inflight.pop(operation.id, None)
+                    # Added unconditionally: completed_tokens can diverge across ranks on
+                    # backend failure and a divergent belief desyncs the rank collectives.
+                    if operation.hash_value:
+                        self.storage_existence_cache.pool(PoolName.KV).add(
+                            operation.hash_value
+                        )
+                    for transfer in operation.pool_transfers or ():
+                        if transfer.keys:
+                            self.storage_existence_cache.pool(transfer.name).add(
+                                transfer.keys
+                            )
                 if (
                     log_metrics
                     and self.enable_storage_metrics
@@ -3483,6 +4391,9 @@ class UnifiedRadixCache(BasePrefixCache):
                     self.storage_metrics_collector.log_backuped_tokens(
                         operation.completed_tokens
                     )
+            if write_back_acks:
+                # n is None only on the unsynchronized detach/shutdown drain.
+                write_back.on_backup_acks(write_back_acks, synced=n is not None)
             return drained
 
         def _drain_release():
@@ -3612,6 +4523,16 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def shutdown(self) -> None:
         """Best-effort auto-detach of the storage backend on process shutdown."""
+        if self._storage_write_back is not None:
+            try:
+                self._storage_write_back.finish(reason="exit")
+            except Exception:
+                logger.exception("HiCache L3 write-back: final stats failed.")
+        if self._l3_tier_final is not None:
+            try:
+                self._l3_tier_final.finish(reason="exit")
+            except Exception:
+                logger.exception("HiCache L3 write-on-host-evict: final stats failed.")
         if self._storage_attachment is not None:
             self._storage_attachment.shutdown()
 
@@ -4213,8 +5134,19 @@ class UnifiedRadixCache(BasePrefixCache):
                 extra_release_counts=extra_release_counts,
                 log_metrics=True,
             )
+        if self._l3_write_on_host_evict:
+            self._write_behind_host_tail()
+        if self.enable_storage and self.pp_rank == 0:
+            # Diagnostics only: wall clock picks the log step, no decision reads it.
+            now = time.monotonic()
+            if now - self._l3_stats_logged_at >= 60.0:
+                self._l3_stats_logged_at = now
+                logger.info(
+                    "HiCache L3 prefetch stats: %s", self.prefetch_outcome_stats_snapshot()
+                )
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.flush_pending_writes()
+        self._drain_l3_lifetime_events()
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             storage_metrics = self.cache_controller.storage_backend.get_stats()
             if storage_metrics is None:

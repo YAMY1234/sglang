@@ -141,6 +141,7 @@ def _staged_fixture(full_match=2):
 def _hit_drain_fixture():
     """A buffer-mode cache whose hit drain and outcome accounting are real."""
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache._l3_trace = None
     cache.host_memory_mode = "buffer_only"
     cache.prefetch_threshold = 2
     cache.enable_storage_metrics = False
@@ -721,6 +722,7 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
             handle=handle,
             storage_hit_count=6,
             stats_requested_tokens=8,
+            stats_tree_kv_tokens=0,
             is_terminated=lambda: False,
             all_hash_values=None,
             deadline_expired=False,
@@ -752,6 +754,123 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
         collector.log_storage_prefetch_unfulfilled_tokens.assert_called_once_with(
             6, "unservable_prefix"
         )
+
+
+
+class TestPrefetchAnchorGate(unittest.TestCase):
+    """Cache mode queries L3 below a device-only anchor only under write-back."""
+
+    def _query(self, write_back, backuped=False, root=False):
+        from sglang.srt.managers.scheduler import Scheduler
+
+        tree_cache = SimpleNamespace(
+            is_backuped=lambda node: backuped,
+            is_root=lambda node: root,
+            is_write_back=write_back,
+            get_last_hash_value=lambda node: "h64",
+            hicache_storage_pass_prefix_keys=False,
+            prefetch_from_storage=Mock(return_value=True),
+        )
+        req = SimpleNamespace(
+            init_next_round_input=Mock(),
+            last_host_node=7,
+            last_node=7,
+            prefix_len=64,
+            host_hit_length=0,
+            full_untruncated_fill_ids=list(range(4096)),
+            _compute_max_prefix_len=lambda n: n - 1,
+            cache_request_handle=_REQ,
+            extra_key=None,
+            cache_salt=None,
+        )
+        scheduler = SimpleNamespace(
+            enable_hicache_storage=True, enable_lmcache=False, tree_cache=tree_cache
+        )
+        memory = SimpleNamespace(hicache_host_memory_mode="cache")
+        with patch("sglang.srt.managers.scheduler.get_memory", return_value=memory):
+            Scheduler._prefetch_kvcache(scheduler, req)
+        return tree_cache.prefetch_from_storage
+
+    def test_write_back_queries_below_a_device_only_anchor(self):
+        query = self._query(write_back=True)
+        query.assert_called_once()
+        args = query.call_args.args
+        self.assertEqual((args[1], args[3]), (7, "h64"))
+        self.assertEqual(len(args[2]), 4095 - 64)
+
+    def test_write_through_keeps_the_backuped_gate(self):
+        self._query(write_back=False).assert_not_called()
+        self._query(write_back=False, backuped=True).assert_called_once()
+        self._query(write_back=False, root=True).assert_called_once()
+
+
+class TestPrefetchPastTreeKV(unittest.TestCase):
+    """Hybrid trees can hold KV past the deepest state; L3 then continues from its end."""
+
+    def _query(self, flag=True, full_kv_hit_length=640, full_kv_end_node=9, mamba=True):
+        from sglang.srt.environ import envs
+        from sglang.srt.managers.scheduler import Scheduler
+
+        hashes = {7: "h64", 9: "h640"}
+        tree_cache = SimpleNamespace(
+            is_backuped=lambda node: False,
+            is_root=lambda node: False,
+            is_write_back=True,
+            page_size=64,
+            supports_mamba=lambda: mamba,
+            get_last_hash_value=lambda node: hashes[node],
+            hicache_storage_pass_prefix_keys=False,
+            prefetch_from_storage=Mock(return_value=True),
+        )
+        # The deepest state ends at page 0 (64 tokens); the tree's KV runs to 640.
+        req = SimpleNamespace(
+            init_next_round_input=Mock(),
+            last_host_node=7,
+            last_node=7,
+            prefix_len=64,
+            host_hit_length=0,
+            full_kv_hit_length=full_kv_hit_length,
+            full_kv_end_node=full_kv_end_node,
+            full_untruncated_fill_ids=list(range(4096)),
+            _compute_max_prefix_len=lambda n: n - 1,
+            cache_request_handle=_REQ,
+            extra_key=None,
+            cache_salt=None,
+        )
+        scheduler = SimpleNamespace(
+            enable_hicache_storage=True, enable_lmcache=False, tree_cache=tree_cache
+        )
+        memory = SimpleNamespace(hicache_host_memory_mode="cache")
+        with (
+            envs.SGLANG_HICACHE_L3_READ_PAST_TREE_KV.override(flag),
+            patch("sglang.srt.managers.scheduler.get_memory", return_value=memory),
+        ):
+            Scheduler._prefetch_kvcache(scheduler, req)
+        self.assertEqual(req.storage_prefetch_last_match_len, 64)
+        tree_cache.prefetch_from_storage.assert_called_once()
+        return tree_cache.prefetch_from_storage.call_args
+
+    def test_anchors_at_the_end_of_the_tree_kv(self):
+        call = self._query()
+        _, anchor, new_tokens, last_hash, _ = call.args
+        self.assertEqual((anchor, last_hash), (9, "h640"))
+        self.assertEqual(list(new_tokens), list(range(640, 4095)))
+        self.assertEqual(list(call.kwargs["matched_prefix_tokens"]), list(range(640)))
+        self.assertEqual(call.kwargs["tree_kv_tokens"], 576)
+
+    def test_unchanged_without_tree_kv_past_the_state(self):
+        for kwargs in (
+            dict(flag=False),
+            dict(full_kv_hit_length=64),
+            dict(full_kv_hit_length=100),  # less than a page past the state
+            dict(full_kv_end_node=None),
+            dict(mamba=False),
+        ):
+            with self.subTest(**kwargs):
+                call = self._query(**kwargs)
+                self.assertEqual((call.args[1], call.args[3]), (7, "h64"))
+                self.assertEqual(len(call.args[2]), 4095 - 64)
+                self.assertNotIn("tree_kv_tokens", call.kwargs)
 
 
 if __name__ == "__main__":

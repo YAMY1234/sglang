@@ -3572,11 +3572,48 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_generate_request(tokenized_req)
 
-    def _prefetch_kvcache(self, req: Req, storage_hit_end: Optional[int] = None):
+    def _prefetch_kvcache(
+        self,
+        req: Req,
+        storage_hit_end: Optional[int] = None,
+        *,
+        within_tree_done: bool = False,
+    ):
         if self.enable_hicache_storage or self.enable_lmcache:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
             buffer_mode = get_memory().hicache_host_memory_mode == "buffer_only"
+            matched_len = req.prefix_len + req.host_hit_length
+            within_tree = (
+                envs.SGLANG_HICACHE_L3_READ_WITHIN_TREE_KV.get()
+                and not buffer_mode
+                and tree_cache.supports_mamba()
+            )
+            if within_tree:
+                state_query_tokens = req.full_untruncated_fill_ids[
+                    : req._compute_max_prefix_len(len(req.full_untruncated_fill_ids))
+                ]
+                matched_len = tree_cache.mamba_storage_match_length(
+                    state_query_tokens, extra_key=req.extra_key, cache_salt=req.cache_salt
+                )
+            if (
+                not within_tree_done
+                and within_tree
+                and tree_cache.prefetch_mamba_state_within_tree(
+                    req.cache_request_handle,
+                    state_query_tokens,
+                    matched_len,
+                    req.full_kv_hit_length,
+                    req.full_kv_end_node,
+                    req.last_host_node,
+                    lambda: self._prefetch_kvcache(
+                        req, storage_hit_end, within_tree_done=True
+                    ),
+                    extra_key=req.extra_key,
+                    cache_salt=req.cache_salt,
+                )
+            ):
+                return
             last_host_node = req.last_host_node
             # Buffer mode host-backups nothing, so match_prefix anchors at
             # root; re-anchor on the deepest device node. The anchor is only
@@ -3591,14 +3628,28 @@ class Scheduler(
             ):
                 last_host_node = req.last_node
 
-            matched_len = req.prefix_len + req.host_hit_length
             req.storage_prefetch_last_match_len = matched_len
+            # The tree may hold KV past the deepest state; L3 then has to continue from
+            # that KV's end, where the pages the tree lacks start.
+            tree_kv_tokens = 0
+            if (
+                envs.SGLANG_HICACHE_L3_READ_PAST_TREE_KV.get()
+                and not buffer_mode
+                and req.full_kv_end_node is not None
+                and req.full_kv_hit_length >= matched_len + tree_cache.page_size
+                and tree_cache.supports_mamba()
+            ):
+                tree_kv_tokens = req.full_kv_hit_length - matched_len
+                last_host_node = req.full_kv_end_node
+                matched_len = req.full_kv_hit_length
 
+            # Write-back keeps hot nodes device-only (never host-backed), and L3 written
+            # on host eviction can hold the suffix below such an anchor, as buffer mode.
             if (
                 tree_cache.is_backuped(last_host_node)
                 or tree_cache.is_root(last_host_node)
                 or (
-                    buffer_mode
+                    (buffer_mode or tree_cache.is_write_back)
                     and tree_cache.get_last_hash_value(last_host_node) is not None
                 )
             ):
@@ -3621,6 +3672,7 @@ class Scheduler(
                     extra_key=req.extra_key,
                     cache_salt=req.cache_salt,
                     storage_hit_end=storage_hit_end,
+                    **({"tree_kv_tokens": tree_kv_tokens} if tree_kv_tokens else {}),
                 )
 
     def _process_storage_prefetch_retries(self):

@@ -503,6 +503,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
                     tree_core
                         .arena
                         .set_host_value(node_id, FULL, host_indices.copy());
+                    tree_core.record_l3_lifetime_event_(node_id, FULL, "create", "host", "D2H_reserve");
                 }
             }
             CacheTransferPhase::LoadBack => {

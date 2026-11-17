@@ -78,7 +78,7 @@ class DropSubtreeNoHostResult(BaseEvictionResult):
 
 
 class DriveHostEvictionResult(BaseEvictionResult):
-    pass
+    mamba_storage_backup_node_id: Optional[NodeId] = None
 
 
 class DecSwaLockOnlyResult(BaseEvictionResult):
@@ -562,6 +562,22 @@ class UnifiedTreeCoreInterface(ABC):
         self, component_type: ComponentType, num_tokens: int
     ) -> DriveHostEvictionResult:
         """Evict a component's host-side resources; no-op if the component is absent."""
+        ...
+
+    @abstractmethod
+    def peek_host_eviction_candidates(
+        self, component_type: ComponentType, num_tokens: int
+    ) -> list[tuple[NodeId, int, Optional[list[str]]]]:
+        """Host leaves in the order drive_host_eviction would take them, until
+        their tokens reach num_tokens: (node_id, tokens, hash_value). Read-only."""
+        ...
+
+    @abstractmethod
+    def peek_mamba_host_eviction_leaves(
+        self, max_states: int
+    ) -> list[tuple[NodeId, int, Optional[list[str]]]]:
+        """The host leaves among the max_states coldest Mamba host LRU members,
+        in Mamba host eviction order: (node_id, tokens, hash_value). Read-only."""
         ...
 
     @abstractmethod
