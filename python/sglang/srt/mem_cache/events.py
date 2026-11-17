@@ -20,8 +20,11 @@ it; the recorder owns the queue and needs nothing back from its owner.
 
 from __future__ import annotations
 
+import logging
+from itertools import pairwise
 from typing import TYPE_CHECKING, Any, Iterable, Optional
 
+from sglang.srt.environ import envs
 from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
@@ -35,6 +38,8 @@ from sglang.srt.mem_cache.utils import (
     compute_node_hash_values,
     hash_str_to_int64,
 )
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.lora.lora_registry import LoRARef
@@ -132,10 +137,15 @@ class KVCacheEventRecorder:
         lora_names: Optional[KvEventLoraNames] = None,
     ):
         self.enabled = enabled
+        self._batch_events = envs.SGLANG_HICACHE_BATCH_EVENTS.get()
         self.page_size = page_size
         self.dynamo_format = dynamo_format
         self.lora_names = lora_names if lora_names is not None else KvEventLoraNames()
         self._queue: list = []
+        if self._batch_events:
+            self.record_store = self._record_store_fast
+            if self.enabled:
+                logger.info("KV event batching on (SGLANG_HICACHE_BATCH_EVENTS): one BlockStored per page run")
 
     def enqueue(self, event) -> None:
         """Append an event, coalescing it with a compatible queue tail.
@@ -269,6 +279,93 @@ class KVCacheEventRecorder:
 
             parent_block_hash = block_hash
             page_index += 1
+
+    def _record_store_fast(
+        self, node: Any, medium=None, *, session_id: Optional[str] = None
+    ) -> None:
+        # One BlockStored per ``page_size`` chunk.
+        # ``medium`` defaults to StorageMedium.GPU but callers may override
+        # for lower-tier insertions (e.g. StorageMedium.CPU for host/L2 cache).
+        if not self.enabled:
+            return
+        if medium is None:
+            medium = StorageMedium.GPU
+
+        event_hash_values = self._node_event_hash_values(node)
+        namespace_seed = self._namespace_seed(node)
+        parent_block_hash = self._parent_block_hash(node)
+        if parent_block_hash is not None:
+            parent_block_hash = namespaced_block_hash(
+                parent_block_hash, namespace_seed=namespace_seed
+            )
+        lora_name = (
+            self.lora_names.resolve(node.key.extra_key)
+            if self.dynamo_format
+            else self.lora_names.get(node.key.extra_key)
+        )
+
+        self._record_store_batched(
+            node,
+            medium,
+            session_id,
+            event_hash_values,
+            namespace_seed,
+            parent_block_hash,
+            lora_name,
+        )
+
+    def _record_store_batched(
+        self,
+        node,
+        medium,
+        session_id,
+        event_hash_values,
+        namespace_seed,
+        parent_block_hash,
+        lora_name,
+    ) -> None:
+        """Construct the same maximal equal-block-size runs as enqueue()."""
+        logical_len = len(node.key)
+        raw = node.key.token_ids
+        full_end = logical_len // self.page_size * self.page_size
+        # A short final page has a different block_size and cannot coalesce.
+        # pairwise builds the historical tuple payload in C without per-token indexing.
+        page_index = 0
+        for start, end, block_size in (
+            (0, full_end, self.page_size),
+            (full_end, logical_len, logical_len - full_end),
+        ):
+            if end <= start:
+                continue
+            if node.key.is_bigram:
+                page_tokens = list(pairwise(raw[start : end + 1]))
+            else:
+                page_tokens = list(raw[start:end])
+            block_hashes = [
+                namespaced_block_hash(
+                    hash_str_to_int64(event_hash_values[i]),
+                    namespace_seed=namespace_seed,
+                )
+                for i in range(
+                    page_index,
+                    page_index + (end - start + self.page_size - 1) // self.page_size,
+                )
+            ]
+            self.enqueue(
+                BlockStored(
+                    block_hashes=block_hashes,
+                    parent_block_hash=parent_block_hash,
+                    token_ids=page_tokens,
+                    block_size=block_size,
+                    lora_id=None,
+                    medium=medium,
+                    cache_salt=node.key.cache_salt,
+                    session_id=session_id,
+                    lora_name=lora_name,
+                )
+            )
+            parent_block_hash = block_hashes[-1]
+            page_index += len(block_hashes)
 
     def record_remove(self, node: Any, medium=None) -> None:
         # One BlockRemoved per radix node.

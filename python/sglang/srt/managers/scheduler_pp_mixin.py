@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 import logging
+import os
+import sys
 from collections import defaultdict, deque
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -41,6 +44,89 @@ from sglang.srt.utils.device import is_npu
 
 _is_npu = is_npu()
 logger = logging.getLogger(__name__)
+
+
+def _pp_stream_roles(scheduler):
+    """Read initialized CUDA stream attributes without creating streams or work.
+
+    Shared model streams keep their owner paths: repeated handles in this map
+    describe sharing, including intentional reuse of one alt stream by layers.
+    Streams created lazily after PP initialization are outside this snapshot.
+    """
+    roles = {}
+
+    def add_attributes(obj, prefix):
+        if obj is None:
+            return
+        for name, value in vars(obj).items():
+            path = f"{prefix}.{name}"
+            if isinstance(value, torch.cuda.Stream):
+                roles[path] = value
+            elif isinstance(value, (list, tuple)):
+                for index, item in enumerate(value):
+                    if isinstance(item, torch.cuda.Stream):
+                        roles[f"{path}[{index}]"] = item
+            elif isinstance(value, dict):
+                for key, item in value.items():
+                    if isinstance(item, torch.cuda.Stream):
+                        roles[f"{path}[{key!r}]"] = item
+
+    for name in ("forward_stream", "schedule_stream", "copy_stream", "pp_comm_stream"):
+        stream = getattr(scheduler, name, None)
+        if isinstance(stream, torch.cuda.Stream):
+            roles[name] = stream
+
+    runner_roles = {}
+    workers = [
+        (name, getattr(scheduler, name, None))
+        for name in ("tp_worker", "draft_worker")
+    ]
+    # EAGLEWorkerV2 owns a plan stream itself. Its EagleDraftWorker, when
+    # hosted on this rank, owns another plan stream and the draft runner.
+    eagle = getattr(scheduler, "draft_worker", None)
+    draft = getattr(eagle, "_draft_worker", None)
+    workers.append(("draft_worker._draft_worker", draft))
+    workers.append(
+        ("draft_worker._draft_worker.draft_worker", getattr(draft, "draft_worker", None))
+    )
+    for worker_name, worker in workers:
+        if worker is None:
+            continue
+        add_attributes(worker, worker_name)
+        for name, runner in vars(worker).items():
+            if not hasattr(runner, "model") or not hasattr(runner, "forward_stream"):
+                continue
+            prefix = f"{worker_name}.{name}"
+            if id(runner) in runner_roles:
+                for suffix, stream in runner_roles[id(runner)]:
+                    roles[prefix + suffix] = stream
+                continue
+            previous = set(roles)
+            add_attributes(runner, prefix)
+            backend = getattr(runner, "attn_backend", None)
+            add_attributes(backend, f"{prefix}.attn_backend")
+            for child in ("prefill_candidates", "decode_candidates"):
+                add_attributes(getattr(backend, child, None), f"{prefix}.attn_backend.{child}")
+            model = runner.model
+            if model is not None:
+                for module_name, module in model.named_modules():
+                    module_path = f"{prefix}.model"
+                    if module_name:
+                        module_path += f".{module_name}"
+                    add_attributes(module, module_path)
+            runner_roles[id(runner)] = [
+                (path[len(prefix):], roles[path]) for path in roles.keys() - previous
+            ]
+
+    controller = getattr(getattr(scheduler, "tree_cache", None), "cache_controller", None)
+    add_attributes(controller, "cache_controller")
+    engine = getattr(controller, "l2_transfer_engine", None)
+    add_attributes(engine, "cache_controller.l2_transfer_engine")
+    add_attributes(getattr(scheduler, "future_map", None), "future_map")
+    # Inspect only an already imported module; never create its lazy side stream.
+    dcp = sys.modules.get("sglang.srt.layers.attention.dsa.dsa_dcp_sharded")
+    add_attributes(dcp, "dsa_dcp_sharded")
+    return roles
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -693,10 +779,10 @@ class SchedulerPPMixin:
             and torch.cuda.is_available()
             and str(self.device).startswith("cuda")
         ):
-            self.pp_comm_stream = allocate_distinct_stream(
-                self.device_module,
-                (self.schedule_stream, self.forward_stream, self.copy_stream),
-            )
+            avoid_streams = (self.schedule_stream, self.forward_stream, self.copy_stream)
+            if envs.SGLANG_PP_COMM_STREAM_AVOID_SIDE_STREAMS.get():
+                avoid_streams += tuple(_pp_stream_roles(self).values())
+            self.pp_comm_stream = allocate_distinct_stream(self.device_module, avoid_streams)
             self.pp_comm_stream_ctx = self.device_module.stream(self.pp_comm_stream)
             logger.info(
                 "PP tensor communication overlap enabled on a dedicated CUDA stream"
@@ -707,6 +793,44 @@ class SchedulerPPMixin:
         ] = defaultdict(deque)
         # Last stage, PD local result: own outputs held until the mb is processed.
         self._pp_local_outputs: Dict[int, Tuple[torch.Event, PPProxyTensors]] = {}
+
+        if envs.SGLANG_PP_STREAM_IDENTITY_LOG.get():
+            self._pp_log_stream_identities()
+
+    def _pp_log_stream_identities(self):
+        """One init-only observer line, with no CUDA submissions or PG warmup."""
+        try:
+            roles = _pp_stream_roles(self)
+            handles = {name: int(stream.cuda_stream) for name, stream in roles.items()}
+            shared = defaultdict(list)
+            for name, handle in handles.items():
+                shared[handle].append(name)
+            receipt = {
+                "pp_rank": get_parallel().pp_rank,
+                "pid": os.getpid(),
+                "device": str(self.device),
+                "torch_version": torch.__version__,
+                "priority_range": torch.cuda.Stream.priority_range(),
+                "cuda_streams": handles,
+                "stream_priorities": {
+                    name: stream.priority for name, stream in roles.items()
+                },
+                "shared_handles": {
+                    str(handle): names for handle, names in shared.items() if len(names) > 1
+                },
+                "TORCH_NCCL_HIGH_PRIORITY": os.environ.get("TORCH_NCCL_HIGH_PRIORITY"),
+                "SGLANG_PLB_STREAM_PRIORITY": envs.SGLANG_PLB_STREAM_PRIORITY.get(),
+                "avoid_side_streams": envs.SGLANG_PP_COMM_STREAM_AVOID_SIDE_STREAMS.get(),
+                "pg_p2p_stream": {
+                    "status": "UNKNOWN",
+                    "reason": "ProcessGroupNCCL exposes no Python stream getter; caller events are not its internal stream",
+                },
+                "coverage": "initialized runner/model module stream attributes and cache_controller/L2 engine; lazy later streams excluded",
+            }
+            logger.info("PP_STREAM_IDENTITIES %s", json.dumps(receipt, sort_keys=True))
+        except Exception:
+            # Observation must not prevent the normal PP loop from starting.
+            logger.warning("PP_STREAM_IDENTITIES unavailable", exc_info=True)
 
     def _pp_init_pd_async_options(self: Scheduler) -> None:
         """Opt-in PD prefill options; with both off the loop is the stock one."""

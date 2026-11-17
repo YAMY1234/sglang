@@ -751,6 +751,8 @@ class Envs:
     # Run PP tensor communication on a dedicated stream so asynchronous sends
     # do not fence the next forward through the scheduler stream.
     SGLANG_PP_COMM_OVERLAP = EnvBool(False)
+    SGLANG_PP_STREAM_IDENTITY_LOG = EnvBool(False)
+    SGLANG_PP_COMM_STREAM_AVOID_SIDE_STREAMS = EnvBool(False)
     # PD prefill: relay the current launch before waiting on an old result.
     SGLANG_PP_PREFILL_RELAY_BEFORE_D2H = EnvBool(False)
     # Snapshot old PD result host consumers on copy_stream before proxy fences.
@@ -911,6 +913,8 @@ class Envs:
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
+    # Batch KV event construction without changing the published payload.
+    SGLANG_HICACHE_BATCH_EVENTS = EnvBool(False)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)
