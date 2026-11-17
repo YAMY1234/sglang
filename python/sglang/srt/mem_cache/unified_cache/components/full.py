@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import heapq
+import time
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
@@ -504,7 +505,10 @@ class FullComponent(TreeComponent):
             num_tokens = len(keys) * self.cache.page_size
             shortfall = max(0, num_tokens - allocator.available_size())
             if shortfall:
+                began = time.monotonic()
                 self.cache.evict(EvictParams(num_tokens=shortfall))
+                # (tokens, seconds): read by the external linker's admission timing.
+                self.load_evict = (shortfall, time.monotonic() - began)
             slots = allocator.alloc(num_tokens)
             if slots is None:
                 return None

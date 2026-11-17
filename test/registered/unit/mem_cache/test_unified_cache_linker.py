@@ -1736,6 +1736,8 @@ def test_pp_hit_relayed_with_no_stops_is_looked_up_again_when_its_device_prefix_
 class _PinningLinker(_CountingLinker):
     """pin_hit returns pages[rid] (default: the whole hit) and records it."""
 
+    pins_hits = True
+
     def __init__(self, stage_restorable=(), pages=None):
         super().__init__(stage_restorable=stage_restorable)
         self.pages, self.pins, self.unpins = dict(pages or {}), [], []
@@ -1788,6 +1790,32 @@ def test_pp_admission_pins_the_hit_and_a_hole_shrinks_it_before_the_load(
         assert hole.linker_pp_hit == (0, [2])
         assert len(pp0.admission_samples) == 1
         assert pp0.match(_KEY, hole, _device_result(0)).host_hit_length == 2
+
+
+def test_only_pp0_pins_and_later_stages_take_its_relayed_verdict(
+    full_linker_component,
+):
+    # Hecate H106: the keep relay carries PP0's value only, so a later
+    # stage's own pin was overwritten; PP0 pins every stage instead.
+    with patch(
+        "sglang.srt.mem_cache.unified_cache.unified_cache_linker.get_storage_hash_str",
+        side_effect=_page_hashes,
+    ):
+        backend = _PinningLinker()
+        later = _match_wrapper(
+            full_linker_component,
+            backend,
+            pp_size=8,
+            pp_rank=5,
+            _all_reduce=_relayed(1),
+        )
+        req = SimpleNamespace(
+            rid="r", linker_pp_hit=(0, [2, 6]), linker_pp_lookup_pending=False
+        )
+        assert later.match(_KEY, req, _device_result(0)).host_hit_length == 6
+        assert later._pp_fresh_hit_pages(req, later.hit_markers["r"]) == 1
+        assert backend.pins == []
+        assert backend.unpins == ["r"]  # PP0 shrank the hit: nothing is held here
 
 
 def test_pp_fresh_hit_loads_without_a_second_lookup(full_linker_component):

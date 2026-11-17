@@ -382,10 +382,13 @@ class _PinStore:
         self.ended.append(list(keys))
 
 
-def _pinning_linker(present):
+def _pinning_linker(present, num_stages=1):
     linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
     linker.mla_broadcaster = None
     linker.pinned, linker.pin_samples, linker.pin_holes = {}, [], 0
+    linker.pinned_others, linker.pin_expiry = {}, deque()
+    # Stage 0's own keys come from its pools below; later stages' from schemas.
+    linker.stage_schemas = [None] + [_stage_schema(s) for s in range(1, num_stages)]
     # This stage's pools: KV and indexer from the KV transfer, the state trailing.
     linker.pool_group = SimpleNamespace(
         resolve_transfers=lambda transfers, **kwargs: [
@@ -410,8 +413,8 @@ class TestPinHit(CustomTestCase):
 
     pages = ["p1", "p2", "p3", "p4"]
 
-    def _pin(self, present):
-        linker = _pinning_linker(present)
+    def _pin(self, present, num_stages=1):
+        linker = _pinning_linker(present, num_stages)
         transfers = [
             PoolTransfer(name=PoolName.KV, keys=self.pages),
             PoolTransfer(
@@ -442,6 +445,32 @@ class TestPinHit(CustomTestCase):
     def test_a_missing_end_state_rules_out_the_whole_hit(self):
         _, pages = self._pin(self._all() - {"p4_mamba"})
         self.assertEqual(pages, 3)
+
+    def _all_stages(self, num_stages):
+        later = set()
+        for stage in range(1, num_stages):
+            suffix = f"tp0_cp0_pp{stage}"
+            later |= {f"{p}_{suffix}_{o}" for p in self.pages for o in ("k", "indexer")}
+            later.add(f"p4_{suffix}_mamba")
+        return self._all() | later
+
+    def test_pp0_pins_every_stage_and_a_hole_on_a_later_stage_shrinks_the_hit(self):
+        # Hecate H106: under PP the keep relay carries PP0's value only, so a
+        # hole a later stage's own pin found was overwritten by PP0's.
+        linker, pages = self._pin(self._all_stages(3) - {"p3_tp0_cp0_pp2_indexer"}, 3)
+        self.assertEqual(pages, 2)
+        self.assertEqual((linker.pinned, linker.pinned_others, linker.pin_holes), ({}, {}, 1))
+        (started,) = linker.storage.store.started
+        self.assertEqual(len(started), 3 * (2 * 4 + 1))  # every stage's objects at once
+        self.assertEqual(linker.storage.store.ended, [started])
+
+    def test_later_stages_pins_are_held_apart_from_pp0s_own(self):
+        linker, pages = self._pin(self._all_stages(3), 3)
+        self.assertEqual(pages, 4)
+        self.assertEqual(sorted(linker.pinned["rid"]), sorted(self._all()))
+        self.assertEqual(len(linker.pinned_others["rid"]), 2 * (2 * 4 + 1))
+        linker.unpin("rid")
+        self.assertEqual(sorted(linker.storage.store.ended[0]), sorted(self._all_stages(3)))
 
 
 class _RemovingStore:

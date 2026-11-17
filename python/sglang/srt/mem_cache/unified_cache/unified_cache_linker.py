@@ -153,6 +153,8 @@ class UnifiedCacheLinker(ABC):
     log_load_timing: bool = False
     # Seconds the last pin_hit waited on the store.
     last_pin_rpc_s: float = 0.0
+    # Under PP: PP0's pin_hit checks and holds every stage's objects of a hit.
+    pins_hits: bool = False
 
     def record_offload_ready(self) -> list[torch.cuda.Event]:
         """Record the events an offload waits on before it reads device pages.
@@ -232,11 +234,11 @@ class UnifiedCacheLinker(ABC):
     def refresh_device_prefix(self, anchor: object, hashes: Callable) -> None:
         """Renew the store leases of a prefix the device serves; optional."""
 
-    def pin_hit(self, rid: str, transfers: list[PoolTransfer]) -> Optional[int]:
-        """Under PP, as a relayed hit is admitted: hold this stage's objects of
-        it until its load and return how many leading pages it can load. None:
-        not supported, so PP0 looks a stale or shrunk hit up again instead."""
-        return None
+    def pin_hit(self, rid: str, transfers: list[PoolTransfer]) -> int:
+        """PP0 with ``pins_hits``, as a relayed hit is admitted: hold every
+        stage's objects of it until their loads and return how many leading
+        pages every stage can load."""
+        raise NotImplementedError
 
     def unpin(self, rid: str) -> None:
         """Release what pin_hit holds for ``rid`` when it will not load."""
@@ -338,8 +340,9 @@ class UnifiedCacheLinkerWrapper:
         self.pp_counts_logged_at = time.monotonic()
         # PP admissions with a hit: (seconds in load_back, seconds of it waiting
         # on pin_hit's store call); and pins that found an object gone.
-        self.admission_samples: list[tuple[float, float]] = []
+        self.admission_samples: list[dict[str, float]] = []
         self.admission_rpc_s = 0.0
+        self.admission_marks: dict[str, float] = {}
         self.pp_load_holes = 0
 
         cache.tree_core.enable_external_cache_linker = True
@@ -484,18 +487,22 @@ class UnifiedCacheLinkerWrapper:
     def _pp_fresh_hit_pages(
         self, req: Req, hit: ExternalCacheHitMarker, forced: bool = False
     ) -> int:
-        """Pages of ``hit`` to load, the same on every stage. Every stage pins
-        its objects of the hit (pin_hit): the store's read-session start checks
-        them and holds them until the load. An object evicted since PP0's
-        lookup shrinks the hit to the deepest stop PP0 finds below it, and the
-        rest is recomputed rather than failed. Rhea 60076: looking every stale
-        or shrunk hit up again held PP0 on the master's ExistKey ceiling."""
+        """Pages of ``hit`` to load, the same on every stage. PP0 pins every
+        stage's objects of the hit (pin_hit): the store's read-session start
+        checks them and holds them until each stage's load. An object evicted
+        since PP0's lookup shrinks the hit to the deepest stop PP0 finds below
+        it, and the rest is recomputed rather than failed. Rhea 60076: looking
+        every stale or shrunk hit up again held PP0 on the master's ExistKey
+        ceiling."""
         admitted = len(hit.tail_hashes)
         transfers = self._lookup_transfers(hit.tail_hashes)
-        pinned = self.cache_linker.pin_hit(req.rid, transfers) if transfers else None
-        if pinned is None:
+        if not (self.cache_linker.pins_hits and transfers):
             return self._pp_relookup_hit_pages(req, hit, forced)
-        self.admission_rpc_s = self.cache_linker.last_pin_rpc_s
+        # Only PP0 pins: the relay below carries PP0's value, not a reduction.
+        pinned = admitted
+        if self.pp_rank == 0:
+            pinned = self.cache_linker.pin_hit(req.rid, transfers)
+            self.admission_rpc_s = self.cache_linker.last_pin_rpc_s
         keep = torch.tensor([min(pinned, admitted)], dtype=torch.int64)
         self.cache._all_reduce(keep, torch.distributed.ReduceOp.MIN)
         if int(keep[0]) < admitted:
@@ -569,25 +576,32 @@ class UnifiedCacheLinkerWrapper:
             *self.pp_counts.values(),
         )
         samples, self.admission_samples = self.admission_samples, []
-        total = sorted(seconds * 1e3 for seconds, _ in samples)
-        rpc = sorted(rpc_s * 1e3 for _, rpc_s in samples)
-        rest = sorted((seconds - rpc_s) * 1e3 for seconds, rpc_s in samples)
 
-        def pct(values, q):
-            return values[min(len(values) - 1, int(q * len(values)))] if values else 0.0
+        def ms(part):
+            values = sorted(sample[part] * 1e3 for sample in samples)
+            if not values:
+                return "-"
+            p50 = values[len(values) // 2]
+            return f"{p50:.1f}/{values[min(len(values) - 1, int(0.9 * len(values)))]:.1f}"
 
+        evicting = [s["evicted"] for s in samples if s["evicted"]]
         logger.info(
             "Linker PP admission timing in %.0f s: %d admissions with a hit, ms "
-            "p50 %.1f p90 %.1f (session start p50 %.1f p90 %.1f, rest p50 %.1f "
-            "p90 %.1f); load holes %d",
+            "p50/p90 total %s = session start %s + relay %s + slot build %s "
+            "(evict %s; %d hits evicted, mean %d max %d tokens) + load call %s + "
+            "prepare %s; load holes %d",
             window,
             len(samples),
-            pct(total, 0.5),
-            pct(total, 0.9),
-            pct(rpc, 0.5),
-            pct(rpc, 0.9),
-            pct(rest, 0.5),
-            pct(rest, 0.9),
+            ms("total"),
+            ms("pin"),
+            ms("relay"),
+            ms("build"),
+            ms("evict"),
+            len(evicting),
+            sum(evicting) // max(len(evicting), 1),
+            max(evicting, default=0),
+            ms("load"),
+            ms("prepare"),
             self.pp_load_holes,
         )
         self.pp_load_holes = 0
@@ -663,11 +677,28 @@ class UnifiedCacheLinkerWrapper:
             return self._load_back(req)
         began = time.monotonic()
         self.admission_rpc_s = 0.0
+        self.admission_marks = {}
+        self._components[0].load_evict = (0, 0.0)
         try:
             return self._load_back(req)
         finally:
+            end = time.monotonic()
+            marks = self.admission_marks
+            fresh = marks.get("fresh", end)
+            built = marks.get("built", fresh)
+            queued = marks.get("queued", built)
+            evicted, evict_s = self._components[0].load_evict
             self.admission_samples.append(
-                (time.monotonic() - began, self.admission_rpc_s)
+                {
+                    "total": end - began,
+                    "pin": self.admission_rpc_s,
+                    "relay": fresh - began - self.admission_rpc_s,
+                    "build": built - fresh,
+                    "evict": evict_s,
+                    "evicted": evicted,
+                    "load": queued - built,
+                    "prepare": end - queued,
+                }
             )
 
     def _load_back(self, req: Req) -> tuple[int, NodeId]:
@@ -678,6 +709,7 @@ class UnifiedCacheLinkerWrapper:
         if self.pp_size > 1:
             forced = req.rid in self.pp_forced_relookup
             keep = self._pp_fresh_hit_pages(req, hit, forced)
+            self.admission_marks["fresh"] = time.monotonic()
             anchor, stops = req.linker_pp_hit
             end = hit.device_hit_len + keep * cache.page_size
             if forced:
@@ -717,6 +749,7 @@ class UnifiedCacheLinkerWrapper:
                 return 0, req.last_node
             component_transfers.append((component, transfer))
 
+        self.admission_marks["built"] = time.monotonic()
         full_transfer = component_transfers[0][1]
         assert full_transfer.name == PoolName.KV
         # Queue before PREPARE touches the request, so a refused load only has
@@ -738,6 +771,7 @@ class UnifiedCacheLinkerWrapper:
                 ExternalLinkerLoadPhase.ABORT, req, component_transfers, prefix_len
             )
             return 0, req.last_node
+        self.admission_marks["queued"] = time.monotonic()
         self._update_load(
             ExternalLinkerLoadPhase.PREPARE,
             req,

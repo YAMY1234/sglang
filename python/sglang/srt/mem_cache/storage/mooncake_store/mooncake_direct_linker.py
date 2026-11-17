@@ -249,6 +249,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         # thread ends them (load_pins: the batch's pinned rids by load index).
         self.pinned: dict[str, list[str]] = {}
         self.load_pins: dict[int, frozenset] = {}
+        # PP0: rid -> the other stages' object keys pin_hit started; once the
+        # batch is launched they move to pin_expiry (end time, keys) and end
+        # after _PIN_GRACE_S, when every stage's own load has started.
+        self.pinned_others: dict[str, list[str]] = {}
+        self.pin_expiry: deque = deque()
         self.stats_logged_at = time.monotonic()
         # Store-side state path cap: each state this rank wrote -> the deepest
         # earlier state on its path (None at the root), and its child count.
@@ -389,6 +394,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             logger.info(
                 "MLA linker rank-0 loading enabled: tp_rank=%d/%d", tp_rank, tp_size
             )
+        self.pins_hits = self.mla_broadcaster is None
         self.layer_done_counter = LayerWiseLoadCounter(
             self.num_layers,
             self._broadcast_loaded_layers if self.mla_broadcaster else None,
@@ -605,29 +611,44 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             spans.append((trailing, first, len(keys)))
         return keys, spans
 
-    def pin_hit(self, rid: str, transfers: list[PoolTransfer]) -> int | None:
-        """Start this stage's read sessions for a hit as it is admitted. The
-        session start is the admission check (an object evicted since the
-        lookup shows here, before any forward reads it) and the pin that keeps
-        the objects until the load ends the sessions. Returns how many leading
-        pages this stage can load: all, or up to the first object that is gone
-        (none of its sessions are kept then). None: no pin (MLA dedup peers
-        read through the source's broadcast)."""
-        if self.mla_broadcaster is not None:
-            return None
+    _PIN_GRACE_S = 30.0
+
+    def pin_hit(self, rid: str, transfers: list[PoolTransfer]) -> int:
+        """PP0, as a relayed hit is admitted: start the read sessions of every
+        stage's objects of it. The session start is the admission check (an
+        object evicted since the lookup shows here, on any stage, before a
+        forward reads it), and the pin that keeps the objects until each stage
+        has started its own load. Returns how many leading pages every stage
+        can load: all, or up to the first object that is gone (no sessions are
+        kept then). Later stages take this through the PP relay, which carries
+        PP0's value only (Hecate H106: per-stage pins were overwritten)."""
         num_pages = len(
             next(transfer for transfer in transfers if transfer.name == PoolName.KV).keys
         )
         expanded = self.pool_group.resolve_transfers(
             transfers, allow_partial=True, allow_missing_kv=True
         )
-        keys, spans = self._object_keys(expanded)
+        own, spans = self._object_keys(expanded)
+        page_keys = list(
+            next(transfer for transfer in transfers if transfer.name == PoolName.KV).keys
+        )
+        others = []
+        for schema in self.stage_schemas[1:]:
+            for _, obj, suffix, trailing in schema:
+                pages = page_keys[-1:] if trailing else page_keys
+                first = len(own) + len(others)
+                others.extend(self.storage._tag_keys([f"{p}_{suffix}_{obj}" for p in pages]))
+                spans.append((trailing, first, len(own) + len(others)))
+        keys = own + others
+        self._end_expired_pins()
         began = time.monotonic()
         result = list(self.storage.store.batch_get_session_start(keys)) if keys else []
         self.last_pin_rpc_s = time.monotonic() - began
         self.pin_samples.append((len(keys), self.last_pin_rpc_s))
         if all(value == 0 for value in result):
-            self.pinned[rid] = keys
+            self.pinned[rid] = own
+            if others:
+                self.pinned_others[rid] = others
             return num_pages
         # Even a partial start may have installed some sessions.
         self.storage.store.batch_get_session_end(keys)
@@ -643,9 +664,15 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return pages
 
     def unpin(self, rid: str) -> None:
-        keys = self.pinned.pop(rid, None)
+        keys = self.pinned.pop(rid, None) or []
+        keys += self.pinned_others.pop(rid, None) or []
         if keys:
             self.storage.store.batch_get_session_end(keys)
+
+    def _end_expired_pins(self, now: float | None = None) -> None:
+        now = time.monotonic() if now is None else now
+        while self.pin_expiry and self.pin_expiry[0][0] <= now:
+            self.storage.store.batch_get_session_end(self.pin_expiry.popleft()[1])
 
     def _lease_keys(self, page_hashes: list[str]) -> list[str]:
         """Every stage's all-pages objects of these pages, and the state at the
@@ -735,6 +762,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         pins = frozenset(rid for rid in pending if self.pinned.pop(rid, None))
         if pins:
             self.load_pins[counter_index] = pins
+        now = time.monotonic()
+        for rid in pending:
+            others = self.pinned_others.pop(rid, None)
+            if others:
+                self.pin_expiry.append((now + self._PIN_GRACE_S, others))
+        self._end_expired_pins(now)
         if broadcaster is not None:
             indices = {}
             for transfers in pending.values():
@@ -1157,8 +1190,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return self.offload_results.get_nowait()
 
     def reset(self) -> None:
-        for rid in list(self.pinned):
+        for rid in list(self.pinned) + list(self.pinned_others):
             self.unpin(rid)
+        self._end_expired_pins(float("inf"))
         self.pending_loads.clear()
         self.load_queued_at.clear()
         self.load_queue.join()

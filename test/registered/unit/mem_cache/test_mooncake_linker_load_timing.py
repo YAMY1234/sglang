@@ -2,6 +2,7 @@
 
 import os
 import queue
+from collections import deque
 import tempfile
 import threading
 import time
@@ -52,6 +53,7 @@ def _linker(log_load_timing):
     linker.pools = {name: _Pool(name) for name in KEY_BYTES}
     linker.layer_done_counter = MagicMock()
     linker.pinned, linker.load_pins = {}, {}
+    linker.pinned_others, linker.pin_expiry = {}, deque()
     store = MagicMock()
     store.batch_get_session_start.side_effect = lambda keys: [0] * len(keys)
     store.batch_get_into_multi_buffer_ranges.side_effect = (
@@ -113,6 +115,28 @@ class TestMooncakeLinkerLoadTiming(CustomTestCase):
         ended = [c.args[0] for c in store.batch_get_session_end.call_args_list]
         self.assertEqual(sorted(sum(ended, [])), sorted(a.keys + b.keys))
         linker.layer_done_counter.fail.assert_not_called()
+
+    def test_later_stages_pins_outlive_the_launch_until_the_grace_ends(self):
+        linker = _linker(log_load_timing=False)
+        linker.pool_group = SimpleNamespace(
+            resolve_transfers=lambda transfers, **kwargs: transfers
+        )
+        linker.pending_loads, linker.load_queued_at = {}, {}
+        linker.mla_broadcaster, linker.gc_frozen = None, True
+        linker.load_queue, linker.broadcast_loads = queue.Queue(), {}
+        linker.stats = {"load": 0}
+        linker.layer_done_counter.update_producer.return_value = 3
+        linker.pinned_others = {"r": ["later-stage-key"]}
+        self.assertTrue(linker.load("r", [_transfer(PoolName.KV, 1)]))
+        with patch.object(mooncake_direct_linker, "device_module", MagicMock()):
+            linker.start_layer_wise_loading()
+        store = linker.storage.store
+        # Every later stage starts its own load after PP0's launch: held on.
+        store.batch_get_session_end.assert_not_called()
+        self.assertEqual(linker.pinned_others, {})
+        linker._end_expired_pins(time.monotonic() + linker._PIN_GRACE_S + 1)
+        store.batch_get_session_end.assert_called_once_with(["later-stage-key"])
+        self.assertEqual(len(linker.pin_expiry), 0)
 
     def test_queue_time_follows_the_request_into_the_load_thread(self):
         linker = _linker(log_load_timing=True)
