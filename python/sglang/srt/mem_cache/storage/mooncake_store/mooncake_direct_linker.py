@@ -621,6 +621,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return keys, spans
 
     _PIN_GRACE_S = 30.0
+    # Read results retried once: LEASE_EXPIRED (sessions renewed first) and a
+    # failed transfer.
+    _RETRY_CODES = (-707, -800)
     # A pre-pin not taken within this long is released (the read sessions'
     # leases are short); its request pins at admission instead.
     _PREPIN_TTL_S = 3.0
@@ -927,24 +930,25 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if len(result) != len(keys):
             return result
         expected = [sum(item) for item in sizes]
-        # Mooncake ErrorCode::LEASE_EXPIRED. Session leases can expire between
-        # layers of a long prefix. The synchronous read has drained its writers;
-        # reacquire only those immutable content-addressed objects and retry
-        # their current layer once. Other failures still abort the request.
-        expired = [i for i, value in enumerate(result) if value == -707]
-        if not expired or any(
-            value not in (want, -707) for value, want in zip(result, expected)
-        ):
+        # Retry this layer once for objects that failed transiently: an expired
+        # session lease (Mooncake LEASE_EXPIRED, -707: leases can lapse between
+        # layers of a long prefix; reacquire those immutable objects first) or a
+        # failed transfer (-800). Anything else, like a missing object (-704),
+        # still fails the load: under PP one stage's failure splits the stages'
+        # queues (Hecate H112), so a transient one should not get that far.
+        retry = [i for i, (v, want) in enumerate(zip(result, expected)) if v != want]
+        if not retry or any(result[i] not in self._RETRY_CODES for i in retry):
             return result
-        expired_keys = [keys[i] for i in expired]
-        renewed = list(store.batch_get_session_start(expired_keys))
+        expired_keys = [keys[i] for i in retry if result[i] == -707]
+        renewed = list(store.batch_get_session_start(expired_keys)) if expired_keys else []
         if renewed != [0] * len(expired_keys):
             raise RuntimeError(
                 f"Mooncake get session renewal failed: keys={len(expired_keys)}, "
                 f"result_sample={renewed[:8]}"
             )
+        expired = retry
         retried = store.batch_get_into_multi_buffer_ranges(
-            expired_keys,
+            [keys[i] for i in expired],
             [ptrs[i] for i in expired],
             [sizes[i] for i in expired],
             [offsets[i] for i in expired],
@@ -956,7 +960,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             raise RuntimeError("Mooncake renewed range get returned wrong result count")
         for index, value in zip(expired, retried):
             result[index] = value
-        logger.debug("Refreshed Mooncake read leases for %d objects", len(expired))
+        logger.warning(
+            "Mooncake range get retried %d objects (%d with renewed leases)",
+            len(expired),
+            len(expired_keys),
+        )
         return result
 
     def load_layer_wise(
@@ -1025,11 +1033,17 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         or isinstance(result, int)
                         or list(result) != expected
                     ):
+                        failed = (
+                            Counter(
+                                v for v, want in zip(result, expected) if v != want
+                            )
+                            if isinstance(result, list)
+                            else result
+                        )
                         raise RuntimeError(
                             f"Mooncake range get failed for pool={name}, "
-                            f"layer={layer}: objects={len(keys)}, "
-                            f"transferred_sample={result[:8] if isinstance(result, list) else result}, "
-                            f"expected_sample={expected[:8]}"
+                            f"layer={layer}: objects={len(keys)}, failed by code "
+                            f"{dict(failed) if isinstance(failed, Counter) else failed}"
                         )
                     if timed:
                         for index, span in enumerate(spans):

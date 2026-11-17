@@ -138,6 +138,51 @@ class TestMooncakeLinkerLoadTiming(CustomTestCase):
         store.batch_get_session_end.assert_called_once_with(["later-stage-key"])
         self.assertEqual(len(linker.pin_expiry), 0)
 
+    def _read_once_with(self, first_codes):
+        """A two-object KV load whose first range read returns ``first_codes``
+        (per object; None = read fine) and whose retry reads fine."""
+        linker = _linker(log_load_timing=False)
+        store = linker.storage.store
+        calls = []
+
+        def ranges(keys, ptrs, sizes, offsets):
+            good = [sum(item) for item in sizes]
+            calls.append(list(keys))
+            if len(calls) == 1:
+                return [good[i] if c is None else c for i, c in enumerate(first_codes)]
+            return good
+
+        store.batch_get_into_multi_buffer_ranges.side_effect = ranges
+        linker.num_layers = 1
+        with patch.object(mooncake_direct_linker.logger, "warning") as warning:
+            with patch.object(mooncake_direct_linker.logger, "exception") as exception:
+                linker.load_layer_wise(7, [[_transfer(PoolName.KV, 2)]], [("a", 0.0)])
+        return linker, calls, warning, exception
+
+    def test_a_failed_transfer_is_read_again_once_before_the_load_fails(self):
+        # Hecate H112: one stage's failed read aborted its requests there only,
+        # split the PP stages' queues and crashed the worker.
+        linker, calls, warning, _ = self._read_once_with([None, -800])
+        self.assertEqual(calls[1], ["kv-1"])
+        linker.layer_done_counter.fail.assert_not_called()
+        warning.assert_called_once()
+        self.assertIn("retried %d objects", warning.call_args.args[0])
+        linker.storage.store.batch_get_session_start.assert_called_once()  # no renewal
+
+    def test_an_expired_lease_is_renewed_before_the_read_again(self):
+        linker, calls, _, _ = self._read_once_with([-707, None])
+        self.assertEqual(calls[1], ["kv-0"])
+        store = linker.storage.store
+        self.assertEqual(store.batch_get_session_start.call_args.args[0], ["kv-0"])
+        linker.layer_done_counter.fail.assert_not_called()
+
+    def test_a_missing_object_still_fails_and_names_its_codes(self):
+        linker, calls, _, exception = self._read_once_with([-704, -800])
+        self.assertEqual(len(calls), 1)  # a permanent failure is not retried
+        linker.layer_done_counter.fail.assert_called()
+        error = linker.layer_done_counter.fail.call_args.args[1]
+        self.assertIn("failed by code {-704: 1, -800: 1}", str(error))
+
     def test_queue_time_follows_the_request_into_the_load_thread(self):
         linker = _linker(log_load_timing=True)
         linker.pool_group = SimpleNamespace(
