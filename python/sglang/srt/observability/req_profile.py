@@ -212,6 +212,8 @@ def on_request_finished(req, mode: str, cached_details: Optional[dict] = None) -
         "routed_dp": req.disagg_prefill_dp_rank,
         # DP rank pinned by the caller (e.g. Dynamo's KV router); None means the DP controller's balancer chose
         "ext_dp": req.routed_dp_rank,
+        # P side: prompt tokens the decode already held, so KV is sent from here (0 when decode has no prefix cache)
+        "d_prefix": req.disagg_decode_prefix_len,
         # first output token ids: tells an empty-text first token (special / split multi-byte) from a visible one
         "first_ids": [int(x) for x in req.output_ids[:2]],
         "t": t,
