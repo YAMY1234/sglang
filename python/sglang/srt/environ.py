@@ -784,6 +784,16 @@ class Envs:
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)
+    # PD decode: cap the KV held by reservations whose prefill KV has not arrived
+    # (transfer queue, the "pre-allocated usage" log field) at this fraction of
+    # the pool; 0 disables. One reservation is always allowed.
+    SGLANG_DISAGG_DECODE_PREALLOC_CAP = EnvFloat(0.0)
+    # PD DCP sends: build Mooncake descriptors from NumPy runs instead of per-run
+    # Python lists (same descriptors; cost no longer grows with Python objects).
+    SGLANG_DISAGG_DCP_VECTORIZED_BLOCKS = EnvBool(False)
+    # Seconds between PD DCP send-stat log lines (descriptor build time, decode
+    # prefix hits); 0 disables.
+    SGLANG_DISAGG_DCP_SEND_STATS_INTERVAL = EnvFloat(0.0)
     # Prefill KV exhaustion. The two K31 switches are sgl-project/sglang#50040's
     # (default off there): park a chunked continuation whose KV budget is spent
     # (#44823) instead of forcing a full chunk into a full pool, and, under
