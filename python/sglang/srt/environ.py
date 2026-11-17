@@ -2180,6 +2180,11 @@ class Envs:
     # pushes them itself; the merge skips the local top-2048 and also returns the
     # localized rows (dsa/dsa_dcp_sharded.py).
     SGLANG_DSA_DCP_TOPK_PUSH = EnvBool(False)
+    # merge_kernel (push off): stage the candidate push in smem, register fallback
+    # for <= 2 failed ranks (sgl-project/sglang#49922); same output. MIN_BLOCKS: its
+    # launch bounds' minimum blocks per SM.
+    SGLANG_K31_DCP_MERGE_STAGED = EnvBool(False)
+    SGLANG_K31_DCP_MERGE_MIN_BLOCKS = EnvInt(1)
     # Decode steps between the DCP top-k merge's fallback-count log lines; 0 off.
     SGLANG_DSA_DCP_TOPK_MERGE_LOG_INTERVAL = EnvInt(400)
     # DCP sparse MLA split into workspace-bounded calls: each call writes its

@@ -12,6 +12,10 @@ from sglang.kernels.ops.speculative.dflash import (
     compute_dflash_correct_drafts_and_bonus,
 )
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
+from sglang.kernels.ops.speculative.dspark.k31ht_softmax_split import (
+    k31ht_softmax_split,
+    k31ht_softmax_split_requested,
+)
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
@@ -280,6 +284,10 @@ class SoftmaxTemp:
     def execute(cls, *args, **kwargs) -> torch.Tensor:
         if not inputs_on_cuda(*args, **kwargs):
             return cls.torch(*args, **kwargs)
+        if k31ht_softmax_split_requested():
+            out = k31ht_softmax_split(*args, **kwargs)
+            if out is not None:
+                return out
         if _flashinfer_softmax is not None:
             return cls.flashinfer(*args, **kwargs)
         return cls.triton(*args, **kwargs)

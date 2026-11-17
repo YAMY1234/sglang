@@ -242,5 +242,97 @@ def test_invalid_ragged_indices_are_not_clamped(invalid, path):
         _capture(torch.tensor([[invalid, -1]], dtype=torch.int32), path=path)
 
 
+# DCP decode top-k: the K31HT switches choose the candidate select, merge launch
+# and push-combine kernel; off (the default), the stock kernels run.
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_k31ht_dsa_select_produces_the_dcp_merge_candidates(enabled):
+    from sglang.srt.layers.attention.dsa import dsa_dcp_sharded
+
+    logits = torch.randn(2, 16)
+    local_lens = torch.tensor([16, 9], dtype=torch.int32)
+    calls = []
+
+    def select(logits_, lens, out, world, rank, topk):
+        calls.append((world, rank, topk, lens.tolist()))
+        return out.fill_(7)
+
+    def stock(logits_, lens, *, out_candidates, world, rank, **kwargs):
+        calls.append(("stock", world, rank))
+        out_candidates.fill_(3)
+
+    switch = SimpleNamespace(ENABLED=enabled, local_candidates=select)
+    parallel = SimpleNamespace(attn_dcp_size=8, attn_dcp_rank=3)
+    with (
+        patch.object(dsa_dcp_sharded, "_k31ht_select", switch),
+        patch.object(dsa_dcp_sharded, "get_parallel", lambda: parallel),
+        patch.object(dsa_dcp_sharded, "topk_transform_candidates_v2", stock),
+        patch.object(dsa_dcp_sharded, "candidates_cluster_size", lambda rows: 1),
+    ):
+        out = dsa_dcp_sharded._local_candidates(logits, local_lens, 4)
+
+    assert tuple(out.shape) == (2, 4, 2) and out.dtype == torch.int32
+    if enabled:
+        assert calls == [(8, 3, 4, [16, 9])] and bool((out == 7).all())
+    else:
+        assert calls == [("stock", 8, 3)] and bool((out == 3).all())
+
+
+@pytest.mark.parametrize("staged,min_blocks", [(False, 1), (True, 1), (True, 2)])
+def test_dcp_topk_merge_staged_variant_launch_args(staged, min_blocks):
+    from sglang.kernels.ops.attention.dsa import dcp_topk_merge
+    from sglang.srt.environ import envs
+
+    loaded = []
+    with (
+        envs.SGLANG_K31_DCP_MERGE_STAGED.override(staged),
+        envs.SGLANG_K31_DCP_MERGE_MIN_BLOCKS.override(min_blocks),
+        patch.object(dcp_topk_merge, "_staged_launch", dcp_topk_merge._staged_launch.__wrapped__),
+        patch.object(dcp_topk_merge, "load_jit", lambda *a, **kw: loaded.append((a, kw))),
+    ):
+        dcp_topk_merge._jit_dcp_topk_merge_module.__wrapped__(8, 2048, 768, True)
+
+    (args, kwargs), = loaded
+    expected = (8, 2048, 768, 1) + ((1, min_blocks) if staged else ())
+    assert args[0] == "dcp_topk_merge" and len(args) == 1 + len(expected)
+    assert kwargs["cuda_wrappers"][0][1] == f"DcpTopKMergeKernel<{', '.join(map(str, expected))}>::run"
+
+
+def test_dcp_topk_merge_min_blocks_fail_closed():
+    from sglang.kernels.ops.attention.dsa import dcp_topk_merge
+    from sglang.srt.environ import envs
+
+    with (
+        envs.SGLANG_K31_DCP_MERGE_STAGED.override(True),
+        envs.SGLANG_K31_DCP_MERGE_MIN_BLOCKS.override(0),
+        pytest.raises(ValueError, match="MIN_BLOCKS"),
+    ):
+        dcp_topk_merge._staged_launch.__wrapped__()
+
+
+@pytest.mark.parametrize("form", ["0", "v3"])
+def test_dcp_push_combine_form_selects_the_kernel(form):
+    import os
+
+    from sglang.kernels.ops.attention import dcp_push_combine
+
+    loaded = []
+    with (
+        patch.object(dcp_push_combine, "COMBINE_FORM", form),
+        patch.object(dcp_push_combine, "load_jit", lambda *a, **kw: loaded.append((a, kw)) or "module"),
+    ):
+        assert dcp_push_combine._jit_module.__wrapped__(8) == "module"
+
+    (args, kwargs), = loaded
+    if form == "v3":
+        assert args[0] == "dcp_push_combine_v3"
+        assert os.path.isfile(kwargs["cuda_files"][0])
+        assert kwargs["cuda_wrappers"][0][1].startswith("DcpPushCombineV3Kernel<8, ")
+    else:
+        assert args[0] == "dcp_push_combine"
+        assert kwargs["cuda_files"] == ["dsa/dcp_push_combine.cuh"]
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

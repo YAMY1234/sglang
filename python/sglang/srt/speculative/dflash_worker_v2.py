@@ -132,6 +132,14 @@ from sglang.srt.speculative.spec_sampling_mask import (
     SpeculativeSamplingMaskCapture,
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
+from sglang.srt.speculative.k31ht_ctxkv_fuse import (
+    K31HTCtxKvFuse,
+    k31ht_draft_ctxkv_fuse_requested,
+)
+from sglang.srt.speculative.k31ht_seam_commit import (
+    k31ht_fused_sync_and_commit,
+    k31ht_seam_commit_fuse_engaged,
+)
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     SIMULATE_ACC_METHOD,
@@ -539,6 +547,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Under dp attention, peer DP ranks run different (idle) paths, so
         # spec broadcasts must stay within the attn-TP group.
         self._tp_sync = SpecTpSync(get_dp_tp_group())
+        # K31HT_SEAM_COMMIT_FUSE (default off): one packed accept broadcast + one commit kernel (bitwise to served).
+        self._k31ht_commit_fuse = k31ht_seam_commit_fuse_engaged()
         check_simulate_acc_token_mode()
 
         # DP drafts use per-DP attention TP, independent of idle peers. CP
@@ -739,6 +749,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
+        # K31HT_DRAFT_CTXKV_FUSE (default off): the MLA draft's context-KV append as one GEMM + one epilogue. Built in
+        # alloc_memory_pool: it writes the draft KV pool, which does not exist yet here.
+        self._k31ht_ctxkv: Optional[K31HTCtxKvFuse] = None
+        self._k31ht_ctxkv_requested = k31ht_draft_ctxkv_fuse_requested()
 
         supports_gpu_triton = is_cuda() or is_hip() or is_xpu()
         self._use_triton_prepare_block = supports_gpu_triton
@@ -931,6 +945,26 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
         if draft_kv_ring_enabled():
             self._init_draft_kv_ring()
+        if self._k31ht_ctxkv_requested:
+            self._k31ht_ctxkv = self._k31ht_setup_ctxkv()
+
+    def _k31ht_setup_ctxkv(self) -> Optional[K31HTCtxKvFuse]:
+        """K31HT_DRAFT_CTXKV_FUSE: build the fused context-KV writer, or log why the served loop stays."""
+        runner = self.draft_model_runner
+        pool = getattr(runner, "token_to_kv_pool", None) if runner is not None else None
+        fuse, reason = K31HTCtxKvFuse.build(self.draft_model, pool, is_cuda=is_cuda())
+        if fuse is not None:
+            logger.info(
+                "K31HT_DRAFT_CTXKV_FUSE ENGAGED: %d draft layers' context KV in one GEMM [%d, %d] + one epilogue "
+                "(rope %s, prefix-valid writes).",
+                fuse.num_layers,
+                int(fuse.wcat.shape[0]),
+                int(fuse.wcat.shape[1]),
+                "neox" if fuse.is_neox else "interleaved",
+            )
+            return fuse
+        logger.warning("K31HT_DRAFT_CTXKV_FUSE NOT ENGAGED: %s", reason)
+        return None
 
     def _init_draft_kv_ring(self) -> None:
         if self.use_compact_draft_cache:
@@ -2371,6 +2405,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                     )
                 if bs == 0:
                     return
+                if self._k31ht_ctxkv is not None and self._k31ht_ctxkv.write(
+                    ctx_hidden, positions, cache_loc_2d, commit_lens
+                ):
+                    return
                 if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
                     try:
                         self._append_target_hidden_fused(
@@ -3263,11 +3301,16 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             # Rank 0's decision to all ranks: one megakernel hop (rank-uniform branch),
             # else the two SGLANG_SPEC_TP_SYNC broadcasts.
-            bcast = self._megakernel_bcast if megakernel_enabled() else None
-            if bcast is None or not bcast.rank0_broadcast(accept_len, bonus):
-                self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, accept_len)
-                self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, bonus)
-            out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
+            if self._k31ht_commit_fuse and not megakernel_enabled():
+                accept_len, bonus, out_tokens, commit_lens = k31ht_fused_sync_and_commit(
+                    candidates, accept_len, bonus, self._tp_sync, SpecTpSyncSite.DFLASH_SELECTOR
+                )
+            else:
+                bcast = self._megakernel_bcast if megakernel_enabled() else None
+                if bcast is None or not bcast.rank0_broadcast(accept_len, bonus):
+                    self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, accept_len)
+                    self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, bonus)
+                out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         elif target_predict is None and (
             not _is_all_greedy(sampling_info) and is_dflash_sampling_verify_available()
         ):
@@ -3278,9 +3321,14 @@ class DFlashWorkerV2(BaseSpecWorker):
                 max_top_k=draft_input.max_top_k,
                 uniform_top_k_value=draft_input.uniform_top_k_value,
             )
-            self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, accept_len)
-            self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, bonus)
-            out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
+            if self._k31ht_commit_fuse:
+                accept_len, bonus, out_tokens, commit_lens = k31ht_fused_sync_and_commit(
+                    candidates, accept_len, bonus, self._tp_sync, SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE
+                )
+            else:
+                self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, accept_len)
+                self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, bonus)
+                out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         else:
             if target_predict is None:
                 target_predict = torch.argmax(next_token_logits, dim=-1)

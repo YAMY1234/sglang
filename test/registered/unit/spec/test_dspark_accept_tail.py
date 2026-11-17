@@ -1,5 +1,7 @@
+import os
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import msgspec
 import torch
@@ -229,6 +231,91 @@ class TestSimBonusSharedLength(CustomTestCase):
         full = simulated_bonus_partials_graph(correct_len=shared.repeat(bs), **args)
         self.assertTrue(torch.equal(view[0], full[0]))
         self.assertTrue(torch.equal(view[1], full[1]))
+
+
+_TRITON_OK = torch.cuda.is_available() or os.environ.get("TRITON_INTERPRET") == "1"
+
+
+def _device():
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+@unittest.skipUnless(_TRITON_OK, "needs CUDA or TRITON_INTERPRET=1")
+class TestK31HTSeamCommitFuse(CustomTestCase):
+    def test_packed_sync_and_commit_match_the_two_broadcasts_and_commit(self):
+        """K31HT_SEAM_COMMIT_FUSE: one broadcast of [accept_len; bonus] and one
+        commit kernel give the stock _commit_accept block bit for bit."""
+        from sglang.srt.speculative.dflash_worker_v2 import _commit_accept
+        from sglang.srt.speculative.k31ht_seam_commit import (
+            k31ht_fused_sync_and_commit,
+        )
+
+        dev = _device()
+        torch.manual_seed(0)
+        for bs, block in ((1, 5), (7, 6), (33, 5)):
+            candidates = torch.randint(0, 163840, (bs, block), device=dev)
+            accept_len = torch.randint(0, block, (bs,), dtype=torch.int32, device=dev)
+            accept_len[0] = block - 1
+            bonus = torch.randint(0, 163840, (bs,), device=dev)
+            sync = _RecordingTpSync()
+            acc, bon, out, commit = k31ht_fused_sync_and_commit(
+                candidates, accept_len, bonus, sync, SpecTpSyncSite.DFLASH_SELECTOR
+            )
+            ref_out, ref_commit = _commit_accept(candidates, accept_len, bonus)
+            self.assertTrue(torch.equal(out, ref_out))
+            self.assertTrue(torch.equal(commit, ref_commit))
+            self.assertTrue(torch.equal(acc, accept_len) and torch.equal(bon, bonus))
+            (site, packed), = sync.calls
+            self.assertEqual(site, SpecTpSyncSite.DFLASH_SELECTOR)
+            self.assertEqual(tuple(packed.shape), (2, bs))
+
+
+@unittest.skipUnless(_TRITON_OK, "needs CUDA or TRITON_INTERPRET=1")
+class TestK31HTSoftmaxSplit(CustomTestCase):
+    def test_split_softmax_matches_the_temperature_softmax(self):
+        """K31HT_SOFTMAX_SPLIT: softmax(logits / T) per request over the full
+        Kimi vocabulary within fp32 rounding (not bitwise: summation order)."""
+        from sglang.kernels.ops.speculative.dspark.dspark_accept import SoftmaxTemp
+        from sglang.kernels.ops.speculative.dspark.k31ht_softmax_split import (
+            k31ht_softmax_split,
+        )
+
+        dev = _device()
+        torch.manual_seed(0)
+        for dtype in (torch.float32, torch.bfloat16):
+            logits = (torch.randn(6, 163840, device=dev) * 4).to(dtype)
+            temps = torch.tensor([0.7, 1.0, 1.3], device=dev)
+            got = k31ht_softmax_split(logits=logits, temperatures=temps, rows_per_request=2)
+            ref = SoftmaxTemp.torch(logits=logits, temperatures=temps, rows_per_request=2)
+            torch.testing.assert_close(got, ref, rtol=1e-4, atol=2e-5)
+            torch.testing.assert_close(got.sum(-1), torch.ones(6, device=dev), rtol=0, atol=1e-6)
+        self.assertIsNone(
+            k31ht_softmax_split(
+                logits=torch.zeros(2, 3, 4, device=dev),
+                temperatures=torch.ones(1, device=dev),
+                rows_per_request=2,
+            )
+        )
+
+
+class TestK31HTSoftmaxSplitRouting(CustomTestCase):
+    def test_softmax_temp_takes_the_split_form_only_when_requested(self):
+        from sglang.kernels.ops.speculative.dspark import dspark_accept
+
+        kwargs = dict(logits=torch.zeros(2, 4), temperatures=torch.ones(1), rows_per_request=2)
+        for requested, split_out, expected in (
+            (False, "split", "stock"),
+            (True, "split", "split"),
+            (True, None, "stock"),
+        ):
+            with (
+                patch.object(dspark_accept, "inputs_on_cuda", lambda *a, **kw: True),
+                patch.object(dspark_accept, "k31ht_softmax_split_requested", lambda: requested),
+                patch.object(dspark_accept, "k31ht_softmax_split", lambda **kw: split_out),
+                patch.object(dspark_accept, "_flashinfer_softmax", None),
+                patch.object(dspark_accept.SoftmaxTemp, "triton", classmethod(lambda cls, **kw: "stock")),
+            ):
+                self.assertEqual(dspark_accept.SoftmaxTemp.execute(**kwargs), expected)
 
 
 if __name__ == "__main__":

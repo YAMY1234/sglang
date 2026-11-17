@@ -3,6 +3,7 @@ is described in ``jit/csrc/dsa/dcp_topk_merge.cuh``."""
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -13,16 +14,40 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.environ import envs
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
 @cache_once
+def _staged_launch() -> tuple[int, int]:
+    """(kStaged, kMinBlocks) of merge_kernel: SGLANG_K31_DCP_MERGE_STAGED (default
+    off) and, when staged, SGLANG_K31_DCP_MERGE_MIN_BLOCKS (default 1)."""
+    if not envs.SGLANG_K31_DCP_MERGE_STAGED.get():
+        return 0, 1
+    min_blocks = envs.SGLANG_K31_DCP_MERGE_MIN_BLOCKS.get()
+    if min_blocks < 1:
+        raise ValueError(f"SGLANG_K31_DCP_MERGE_MIN_BLOCKS must be >= 1, got {min_blocks}")
+    logger.info(
+        "DSA DCP top-k merge: staged push variant on (SGLANG_K31_DCP_MERGE_STAGED=1), "
+        "launch bounds min blocks %d (SGLANG_K31_DCP_MERGE_MIN_BLOCKS)",
+        min_blocks,
+    )
+    return 1, min_blocks
+
+
+@cache_once
 def _jit_dcp_topk_merge_module(
     num_ranks: int, topk: int, cand_k: int, split: bool = False
 ) -> Module:
-    args = make_cpp_args(num_ranks, topk, cand_k, int(split))
+    staged, min_blocks = _staged_launch()
+    if staged:
+        args = make_cpp_args(num_ranks, topk, cand_k, int(split), staged, min_blocks)
+    else:
+        args = make_cpp_args(num_ranks, topk, cand_k, int(split))
     return load_jit(
         "dcp_topk_merge",
         *args,

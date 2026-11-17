@@ -37,6 +37,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.dcp_kernels import _gather_candidate_prefix_kernel
+from sglang.kernels.ops.attention.dsa import k31ht_select as _k31ht_select
 from sglang.kernels.ops.attention.dsa.dcp_topk_merge import (
     DCP_TOPK_MERGE_NUM_STATS,
     dcp_topk_merge,
@@ -537,6 +538,10 @@ def _local_candidates(
     if logits.shape[1] == 0:
         out[..., 1] = -1
         return out
+    if _k31ht_select.ENABLED:  # K31HT_DSA_SELECT=gvrm (default off): same value-exact set, not tie-stable
+        return _k31ht_select.local_candidates(
+            logits, local_lens, out, parallel.attn_dcp_size, parallel.attn_dcp_rank, topk
+        )
     # v2 ragged top-k with the candidate epilogue: local positions ascend
     # with global ones, so its tie order matches the merge's
     topk_transform_candidates_v2(

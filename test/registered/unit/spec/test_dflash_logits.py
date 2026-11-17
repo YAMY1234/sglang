@@ -155,9 +155,10 @@ def test_selector_projects_a_quantized_target_lm_head_through_its_quant_method(
     torch.testing.assert_close(unary_logits, expected_logits)
 
 
+@pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("dp_lm_head", [False, True])
 def test_selector_gathers_global_candidates_across_vocab_shards(
-    monkeypatch, dp_lm_head
+    monkeypatch, dp_lm_head, packed
 ):
     """Pins the TP gather contract on the quantized path: the per-shard
     org-vocab restriction, the global id offset, and the fp32 cast before the
@@ -193,6 +194,15 @@ def test_selector_gathers_global_candidates_across_vocab_shards(
     )
 
     def fake_all_gather(x, dim):
+        if packed:
+            # K31HT_DRAFT_TOPK_GATHER_PACK: one gather of [N, K, 2] int32
+            # (fp32 score bits, id) along K.
+            assert x.dtype == torch.int32 and x.shape[-1] == 2 and dim == -2
+            rank0 = torch.stack(
+                (rank0_vals.float().view(torch.int32), rank0_ids.to(torch.int32)),
+                dim=-1,
+            )
+            return torch.cat([rank0, x], dim=dim)
         if x.is_floating_point():
             assert x.dtype == torch.float32
             return torch.cat([rank0_vals.float(), x], dim=dim)
@@ -213,6 +223,7 @@ def test_selector_gathers_global_candidates_across_vocab_shards(
     monkeypatch.setattr(
         "sglang.srt.models.dflash._flashinfer_top_k", _flashinfer_contract_topk
     )
+    monkeypatch.setattr("sglang.srt.models.dflash._K31HT_TOPK_GATHER_PACK", packed)
 
     candidate_ids, unary_logits = DFlash2DraftModel.compute_candidates(model, hidden)
 
@@ -221,6 +232,134 @@ def test_selector_gathers_global_candidates_across_vocab_shards(
     )
     torch.testing.assert_close(candidate_ids, expected_ids)
     torch.testing.assert_close(unary_logits, expected_logits.float())
+
+
+def test_k31ht_topk_gather_pack_is_bitwise_the_two_gathers():
+    """The packed gather returns the two gathers' values bit for bit (signed
+    zero and -inf included) and their ids in int32."""
+    from sglang.srt.models.dflash import k31ht_topk_gather_packed
+
+    vals = torch.tensor([[3.5, -0.0, float("-inf")], [1.0, 2.0, 0.5]])
+    ids = torch.tensor([[6, 9, 11], [7, 6, 8]])
+    peer_vals = torch.tensor([[4.0, 0.0, -1.0], [-2.0, 0.25, 9.0]])
+    peer_ids = torch.tensor([[0, 1, 2], [3, 4, 5]])
+
+    def all_gather(x, dim):
+        if x.dtype == torch.int32:
+            peer = torch.stack((peer_vals.view(torch.int32), peer_ids.int()), dim=-1)
+            return torch.cat([peer, x], dim=dim)
+        return torch.cat([peer_vals if x.is_floating_point() else peer_ids, x], dim=dim)
+
+    group = SimpleNamespace(world_size=2, all_gather=all_gather)
+    packed_vals, packed_ids = k31ht_topk_gather_packed(group, vals, ids)
+
+    assert packed_ids.dtype == torch.int32
+    assert torch.equal(packed_ids.long(), all_gather(ids, -1))
+    assert torch.equal(packed_vals.view(torch.int32), all_gather(vals, -1).view(torch.int32))
+
+
+@pytest.mark.parametrize(
+    "value,expected", [("", False), ("0", False), ("1", True), ("2", None)]
+)
+def test_k31ht_draft_knobs_fail_closed(monkeypatch, value, expected):
+    from sglang.srt.models.dflash import _k31ht_topk_gather_pack_requested
+    from sglang.srt.speculative.k31ht_seam_commit import (
+        k31ht_seam_commit_fuse_requested,
+    )
+
+    for knob, parse in (
+        ("K31HT_DRAFT_TOPK_GATHER_PACK", _k31ht_topk_gather_pack_requested),
+        ("K31HT_SEAM_COMMIT_FUSE", k31ht_seam_commit_fuse_requested),
+    ):
+        monkeypatch.setenv(knob, value)
+        if expected is None:
+            with pytest.raises(ValueError, match=knob):
+                parse()
+        else:
+            assert parse() is expected
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_selector_accept_takes_the_k31ht_packed_sync_and_commit(monkeypatch, fused):
+    """K31HT_SEAM_COMMIT_FUSE routes the selector accept through one packed
+    broadcast and the fused commit; off, the two broadcasts and _commit_accept."""
+    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+
+    monkeypatch.setattr(worker_mod, "megakernel_enabled", lambda: False)
+    fused_calls = []
+
+    def fake_fused(candidates, accept_len, bonus, tp_sync, site):
+        fused_calls.append(site)
+        tp_sync.sync(site, torch.stack((accept_len.long(), bonus)))
+        out_tokens, commit_lens = worker_mod._commit_accept(candidates, accept_len, bonus)
+        return accept_len.int(), bonus, out_tokens, commit_lens
+
+    monkeypatch.setattr(worker_mod, "k31ht_fused_sync_and_commit", fake_fused)
+    synced = []
+    worker = SimpleNamespace(
+        _selector_sample=(torch.zeros(1, 2, dtype=torch.long), torch.zeros(1, 2)),
+        _selector_sampling_accept=lambda **kwargs: (
+            torch.tensor([1], dtype=torch.int32),
+            torch.tensor([5]),
+        ),
+        _tp_sync=SimpleNamespace(sync=lambda site, t: synced.append((site, tuple(t.shape)))),
+        _k31ht_commit_fuse=fused,
+        _use_triton_accept_bonus=False,
+        block_size=3,
+    )
+
+    accept_len, commit_lens, bonus, out_tokens, _ = worker_mod.DFlashWorkerV2._accept_block(
+        worker,
+        candidates=torch.tensor([[9, 1, 2]]),
+        next_token_logits=torch.zeros(3, 4),
+        sampling_info=SimpleNamespace(is_all_greedy=False),
+        draft_input=object(),
+        prefix_lens=torch.tensor([3]),
+        bs=1,
+    )
+
+    site = worker_mod.SpecTpSyncSite.DFLASH_SELECTOR
+    assert fused_calls == ([site] if fused else [])
+    assert synced == ([(site, (2, 1))] if fused else [(site, (1,)), (site, (1,))])
+    assert out_tokens.tolist() == [[1, 5, 0]] and commit_lens.tolist() == [2]
+    assert accept_len.tolist() == [1] and bonus.tolist() == [5]
+
+
+def test_k31ht_draft_site_epi_declines_off_layout_forwards():
+    """K31HT_DRAFT_SITE_EPI replaces the draft layer loop only for bf16 [rows,
+    7168] hidden states over plain bf16 RMSNorms and 2-tap / 16-group convs
+    with reduce_results projections; anything else runs the stock loop."""
+    from sglang.srt.layers.layernorm import RMSNorm
+    from sglang.srt.models.dflash import DFlashDraftModel
+
+    def conv():
+        return SimpleNamespace(taps=2, group_size=16, base_kernel=torch.zeros(2, 2, dtype=torch.bfloat16))
+
+    def proj():
+        return SimpleNamespace(reduce_results=True)
+
+    def norm():
+        return RMSNorm(7168).to(torch.bfloat16)
+
+    layer = SimpleNamespace(
+        input_layernorm=norm(),
+        post_attention_layernorm=norm(),
+        attention_conv=conv(),
+        mlp_conv=conv(),
+        self_attn=SimpleNamespace(o_proj=proj()),
+        mlp=SimpleNamespace(down_proj=proj()),
+    )
+    model = SimpleNamespace(norm=norm(), layers=[layer])
+    reason = lambda h: DFlashDraftModel._k31ht_site_layout_reason(model, h)
+
+    assert reason(torch.zeros(4, 7168, dtype=torch.bfloat16)) is None
+    assert "dtype" in reason(torch.zeros(4, 7168))
+    assert "width" in reason(torch.zeros(4, 4096, dtype=torch.bfloat16))
+    layer.mlp_conv.taps = 3
+    assert "conv" in reason(torch.zeros(4, 7168, dtype=torch.bfloat16))
+    layer.mlp_conv.taps = 2
+    layer.self_attn.o_proj.reduce_results = False
+    assert "all-reduce" in reason(torch.zeros(4, 7168, dtype=torch.bfloat16))
 
 
 def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
