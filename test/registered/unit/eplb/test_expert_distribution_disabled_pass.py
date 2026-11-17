@@ -150,6 +150,55 @@ class TestDisabledForwardPass(CustomTestCase):
             self.assertTrue(recorder._record_current_pass)
         self.assertIsNotNone(recorder.get_current_pass_count_buffer())
 
+    def test_counts_in_graph_only_with_device_count_buffers(self):
+        """A tail graph may replay while recording only if every hook counts on device."""
+        gatherer = _SelectExpertsSinglePassGatherer.__new__(
+            _SelectExpertsSinglePassGatherer
+        )
+        gatherer._data = torch.zeros((2, 4), dtype=torch.int32)
+        self.assertTrue(self._make_recorder(gatherer=gatherer).counts_in_graph())
+        self.assertFalse(self._make_recorder().counts_in_graph())
+        self.assertFalse(_ExpertDistributionRecorderNoop().counts_in_graph())
+
+    def test_replayed_tail_counts_add_to_the_pass(self):
+        """Counting the tail rows again on replay adds them as the eager tail does;
+        the pass's other rows keep their counts."""
+        gatherer = _SelectExpertsSinglePassGatherer.__new__(
+            _SelectExpertsSinglePassGatherer
+        )
+        gatherer._data = torch.zeros((2, 4), dtype=torch.int32)
+        gatherer._expert_location_metadata = SimpleNamespace(num_physical_experts=4)
+        recorder = self._make_recorder(gatherer=gatherer)
+        recorder._record_current_pass = True
+        body = torch.tensor([[0, 1], [1, 2], [3, -1]])
+        tail = torch.tensor([[2, 2], [-1, 0]])
+        recorder.on_select_experts(topk_ids=body)
+        body_counts = gatherer._data[0].clone()
+        recorder.on_select_experts(topk_ids=tail)
+        self.assertEqual(body_counts.tolist(), [1, 2, 1, 1])
+        self.assertEqual((gatherer._data[0] - body_counts).tolist(), [1, 0, 2, 0])
+
+    def test_recording_blocks_tail_graph_unless_gated_on(self):
+        from unittest.mock import patch
+
+        from sglang.srt.environ import envs
+        from sglang.srt.models import deepseek_v4_replay_tail as tail_mod
+
+        recorder = Mock(recording=True)
+        recorder.counts_in_graph.return_value = True
+        with patch.object(
+            tail_mod, "get_global_expert_distribution_recorder", return_value=recorder
+        ), patch.object(tail_mod, "check_cuda_graph_backend", return_value=False):
+            with envs.SGLANG_DSV4_REPLAY_TAIL_GRAPH_WHILE_RECORDING.override(False):
+                self.assertTrue(tail_mod._recorder_blocks_tail_graph())
+            with envs.SGLANG_DSV4_REPLAY_TAIL_GRAPH_WHILE_RECORDING.override(True):
+                self.assertFalse(tail_mod._recorder_blocks_tail_graph())
+                recorder.counts_in_graph.return_value = False
+                self.assertTrue(tail_mod._recorder_blocks_tail_graph())
+                recorder.counts_in_graph.return_value = True
+                recorder.recording = False
+                self.assertFalse(tail_mod._recorder_blocks_tail_graph())
+
     def test_noop_recorder_still_runs_forward_body(self):
         recorder = _ExpertDistributionRecorderNoop()
         ran = []

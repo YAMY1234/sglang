@@ -214,6 +214,11 @@ class ExpertDistributionRecorder(ABC):
     def recording(self):
         return False
 
+    def counts_in_graph(self) -> bool:
+        """Whether every hook counts into fixed device buffers, so a CUDA graph captured
+        through the hooks records its routing when replayed."""
+        return False
+
     def _on_not_implemented(self):
         raise Exception(
             "Please set ServerArgs.expert_distribution_recorder_mode to use ExpertDistributionRecorder."
@@ -308,6 +313,12 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
 
     def on_select_experts(self, topk_ids: torch.Tensor):
         self._on_hook("on_select_experts", topk_ids=topk_ids)
+
+    def counts_in_graph(self) -> bool:
+        return all(
+            isinstance(g, _SelectExpertsSinglePassGatherer)
+            for g in self._single_pass_gatherers.values()
+        )
 
     def get_current_pass_count_buffer(self):
         if not self._hook_enabled():

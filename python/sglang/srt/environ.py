@@ -869,6 +869,9 @@ class Envs:
     # PD decode: a running request streams the prefill's token with its first decode
     # output, not at admission (sglang#50895); a request finished at admission still goes then.
     SGLANG_DISAGG_DECODE_STREAM_FIRST_TOKEN_WITH_DECODE = EnvBool(False)
+    # DeepSeek-V4.1 prefill: replay the decoder tail from its CUDA graph while the
+    # expert distribution recorder records (EPLB); the graph counts its routing in-graph.
+    SGLANG_DSV4_REPLAY_TAIL_GRAPH_WHILE_RECORDING = EnvBool(False)
 
     # ===================================================================
     # Distributed and model-parallel runtime
