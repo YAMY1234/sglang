@@ -242,8 +242,10 @@ def on_batch_result(batch, result=None) -> None:
         # context tokens the step reads (decode cost driver) and accepted draft tokens (spec decoding, bonus excluded)
         # seq_lens_cpu is a host tensor (no device sync); batch.copy() keeps it, unlike seq_lens_sum
         "ctx": int(batch.seq_lens_cpu.sum()) if batch.seq_lens_cpu is not None else None,
-        "acc": getattr(result, "num_correct_drafts", None),
     }
+    acc = getattr(result, "num_correct_drafts", None)
+    if isinstance(acc, int):  # some spec workers keep it as a device tensor; never sync for it
+        rec["acc"] = acc
     if mode.is_extend() and len(reqs) <= _BATCH_RIDS_MAX:
         rec["rids"] = [r.rid for r in reqs]
         rec["ext_lens"] = list(batch.extend_lens) if batch.extend_lens is not None else None
