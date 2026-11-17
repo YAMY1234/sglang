@@ -238,6 +238,25 @@ def _split_hicache_size(
     )
 
 
+def _pinned_state_host_gb(memory) -> Optional[float]:
+    """--hicache-mamba-size-gb; None keeps the proportional split."""
+    pinned = memory.hicache_mamba_size_gb
+    if pinned is None:
+        return None
+    if not 0 < pinned < memory.hicache_size:
+        raise ValueError(
+            f"--hicache-mamba-size-gb {pinned} must lie in (0, --hicache-size "
+            f"{memory.hicache_size})"
+        )
+    logger.info(
+        "HiCache: the Mamba state host pool takes %s of %s GB "
+        "(--hicache-mamba-size-gb)",
+        pinned,
+        memory.hicache_size,
+    )
+    return float(pinned)
+
+
 def build_pool_entry(
     *,
     name: PoolName,
@@ -1219,9 +1238,14 @@ def build_hybrid_mamba_stack(
     kv_pool = config.root
     kv_host_size, mamba_host_size = None, 0
     if get_memory().hicache_size > 0:
-        kv_host_size, mamba_host_size = _split_hicache_size(
-            get_memory().hicache_size, (kv_pool, mamba_pool)
-        )
+        pinned = _pinned_state_host_gb(get_memory())
+        if pinned is not None:
+            kv_host_size = get_memory().hicache_size - pinned
+            mamba_host_size = pinned
+        else:
+            kv_host_size, mamba_host_size = _split_hicache_size(
+                get_memory().hicache_size, (kv_pool, mamba_pool)
+            )
     index_bytes = _kv_budget_index_bytes(config)
     if index_bytes and kv_host_size is not None:
         kv_bytes = sum(kv_pool.get_kv_size_bytes())
@@ -1424,7 +1448,30 @@ def build_unified_host_stack(
         envelope = None
 
     host_sizes = {s.name: 0 if s.holds_state else None for s in sub_pools}
+    pinned = None
     if memory.hicache_size > 0 and envelope is None:
+        pinned = _pinned_state_host_gb(memory)
+    if pinned is not None:
+        state = [s.name for s in sub_pools if s.holds_state]
+        if len(state) != 1:
+            raise ValueError(
+                "--hicache-mamba-size-gb needs one recurrent-state sub-pool, "
+                f"got {state}"
+            )
+        rest = [s.name for s in sub_pools if not s.holds_state]
+        shares = dict(
+            zip(
+                rest,
+                _split_hicache_size(
+                    memory.hicache_size - pinned,
+                    tuple(storage.view(name) for name in rest),
+                ),
+            )
+        )
+        host_sizes = {
+            name: pinned if name == state[0] else shares[name] for name in host_sizes
+        }
+    elif memory.hicache_size > 0 and envelope is None:
         host_sizes = dict(
             zip(
                 host_sizes,
