@@ -2,7 +2,7 @@
 
 import os
 import queue
-from collections import deque
+from collections import Counter, deque
 import tempfile
 import threading
 import time
@@ -54,6 +54,7 @@ def _linker(log_load_timing):
     linker.layer_done_counter = MagicMock()
     linker.pinned, linker.load_pins = {}, {}
     linker.pinned_others, linker.pin_expiry = {}, deque()
+    linker.read_retries = Counter()
     store = MagicMock()
     store.batch_get_session_start.side_effect = lambda keys: [0] * len(keys)
     store.batch_get_into_multi_buffer_ranges.side_effect = (
@@ -168,6 +169,7 @@ class TestMooncakeLinkerLoadTiming(CustomTestCase):
         warning.assert_called_once()
         self.assertIn("retried %d objects", warning.call_args.args[0])
         linker.storage.store.batch_get_session_start.assert_called_once()  # no renewal
+        self.assertEqual(linker.read_retries, {"retried": 1, "recovered": 1})
 
     def test_an_expired_lease_is_renewed_before_the_read_again(self):
         linker, calls, _, _ = self._read_once_with([-707, None])
@@ -175,6 +177,17 @@ class TestMooncakeLinkerLoadTiming(CustomTestCase):
         store = linker.storage.store
         self.assertEqual(store.batch_get_session_start.call_args.args[0], ["kv-0"])
         linker.layer_done_counter.fail.assert_not_called()
+
+    def test_a_retry_that_fails_again_fails_the_load_and_is_not_recovered(self):
+        linker = _linker(log_load_timing=False)
+        linker.num_layers = 1
+        linker.storage.store.batch_get_into_multi_buffer_ranges.side_effect = (
+            lambda keys, ptrs, sizes, offsets: [-800] * len(keys)
+        )
+        with patch.object(mooncake_direct_linker.logger, "exception"):
+            linker.load_layer_wise(7, [[_transfer(PoolName.KV, 2)]], [("a", 0.0)])
+        linker.layer_done_counter.fail.assert_called()
+        self.assertEqual(linker.read_retries, {"retried": 2, "recovered": 0})
 
     def test_a_missing_object_still_fails_and_names_its_codes(self):
         linker, calls, _, exception = self._read_once_with([-704, -800])

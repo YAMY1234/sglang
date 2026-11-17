@@ -227,6 +227,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     ):
         self.forward_stream = forward_stream
         self.log_load_timing = envs.SGLANG_LINKER_LOG_LOAD_TIMING.get()
+        # Objects read again after a transient failure, and how many of them
+        # landed then; a recovered object is not a failed read.
+        self.read_retries = Counter()
         self.page_size = params.page_size
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         self.pool_group = resolve_hybrid_device_pool_group(
@@ -960,10 +963,15 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             raise RuntimeError("Mooncake renewed range get returned wrong result count")
         for index, value in zip(expired, retried):
             result[index] = value
+        self.read_retries["retried"] += len(expired)
+        self.read_retries["recovered"] += sum(result[i] == expected[i] for i in expired)
         logger.warning(
-            "Mooncake range get retried %d objects (%d with renewed leases)",
+            "Mooncake range get retried %d objects (%d with renewed leases); "
+            "this rank so far: %d retried, %d recovered",
             len(expired),
             len(expired_keys),
+            self.read_retries["retried"],
+            self.read_retries["recovered"],
         )
         return result
 
