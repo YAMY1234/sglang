@@ -866,6 +866,9 @@ class Envs:
     # With the deferred publish, read the destination ids back through pinned copies
     # and send them once landed, instead of one blocking D2H per payload.
     SGLANG_DISAGG_DECODE_ASYNC_PUBLISH_READBACK = EnvBool(False)
+    # PD decode: a running request streams the prefill's token with its first decode
+    # output, not at admission (sglang#50895); a request finished at admission still goes then.
+    SGLANG_DISAGG_DECODE_STREAM_FIRST_TOKEN_WITH_DECODE = EnvBool(False)
 
     # ===================================================================
     # Distributed and model-parallel runtime

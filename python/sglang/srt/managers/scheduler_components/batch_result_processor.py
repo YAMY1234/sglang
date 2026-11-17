@@ -49,6 +49,7 @@ from sglang.srt.sampling.sampling_params import (
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
+from sglang.srt.utils.log_utils import print_info_once
 
 if TYPE_CHECKING:
     from sglang.srt.beam_search.coordinator import BeamCoordinator
@@ -171,7 +172,13 @@ class SchedulerBatchResultProcessor:
                 self.request_retirer.release(req, checkpoint=True)
 
         # Note: Logprobs should be handled on the prefill engine.
-        self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
+        reqs = batch.reqs
+        if envs.SGLANG_DISAGG_DECODE_STREAM_FIRST_TOKEN_WITH_DECODE.get():
+            print_info_once(
+                "PD decode streams a running request's prefill token with its first decode output"
+            )
+            reqs = [req for req in reqs if req.finished()]
+        self.output_streamer.stream_output(reqs, batch.return_logprob)
         if use_free_group:
             self.token_to_kv_pool_allocator.free_group_end()
 

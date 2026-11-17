@@ -170,5 +170,45 @@ class TestFlushPrefill(CustomTestCase):
         )
 
 
+class TestPrebuiltFirstToken(CustomTestCase):
+    """PD decode admission streams the prefill token at once unless the first-token
+    switch is on; then only requests finished at admission go, the rest send it
+    with their first decode output."""
+
+    def _streamed(self, switch):
+        from sglang.srt.environ import envs
+
+        streamer = Mock()
+        kwargs = dict.fromkeys(
+            f.name for f in fields(SchedulerBatchResultProcessor) if f.default is MISSING
+        )
+        kwargs.update(
+            disaggregation_mode=DisaggregationMode.DECODE,
+            request_retirer=release_only_retirer(tree_cache=Mock()),
+            output_streamer=streamer,
+        )
+        reqs = [_req("done", 1), _req("running")]
+        for req in reqs:
+            req.output_ids = array("q", [7])
+        batch = ScheduleBatch(reqs=reqs, spec_algorithm=SpeculativeAlgorithm.NONE)
+        with (
+            envs.SGLANG_DISAGG_DECODE_STREAM_FIRST_TOKEN_WITH_DECODE.override(switch),
+            patch(
+                f"{BRP}.get_disagg",
+                lambda: SimpleNamespace(disaggregation_decode_enable_radix_cache=False),
+            ),
+            patch(f"{RETIRER}.release_kv_cache", lambda req, tree, *, checkpoint: None),
+        ):
+            SchedulerBatchResultProcessor(**kwargs).process_batch_result_prebuilt(batch)
+        (streamed, _), _ = streamer.stream_output.call_args
+        return [req.rid for req in streamed]
+
+    def test_admission_streams_every_request_by_default(self):
+        self.assertEqual(self._streamed(False), ["done", "running"])
+
+    def test_switch_streams_only_requests_finished_at_admission(self):
+        self.assertEqual(self._streamed(True), ["done"])
+
+
 if __name__ == "__main__":
     unittest.main()
