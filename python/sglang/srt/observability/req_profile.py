@@ -93,7 +93,12 @@ class _Writer:
         with self.lock:
             batch, self.pending = self.pending, []
         now = time.perf_counter()
-        lines = [json.dumps(r, separators=(",", ":")) for r in batch]
+        lines = []
+        for r in batch:
+            try:
+                lines.append(json.dumps(r, separators=(",", ":"), default=_jsonable))
+            except (TypeError, ValueError):  # one bad record must not drop the whole drain
+                self.dropped += 1
         if not self.header_done:
             lines.insert(0, json.dumps(_header(), separators=(",", ":")))
             self.header_done = True
@@ -123,6 +128,17 @@ class _Writer:
             self.fh.close()
         except Exception:
             pass
+
+
+def _jsonable(o):
+    # host-side sequences (array.array, numpy) become lists; anything else its repr
+    tolist = getattr(o, "tolist", None)
+    if tolist is not None:
+        return tolist()
+    try:
+        return list(o)
+    except TypeError:
+        return str(o)
 
 
 def _anchor(written: int, dropped: int) -> Dict[str, Any]:
@@ -197,7 +213,7 @@ def on_request_finished(req, mode: str, cached_details: Optional[dict] = None) -
         # DP rank pinned by the caller (e.g. Dynamo's KV router); None means the DP controller's balancer chose
         "ext_dp": req.routed_dp_rank,
         # first output token ids: tells an empty-text first token (special / split multi-byte) from a visible one
-        "first_ids": req.output_ids[:2],
+        "first_ids": [int(x) for x in req.output_ids[:2]],
         "t": t,
         "v": v,
     }
