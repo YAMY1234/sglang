@@ -792,6 +792,7 @@ class Req(ReqDllmMixin):
         self.time_stats.set_metrics_collector(metrics_collector)
         self.time_stats.set_scheduler_recv_time()
         self.has_log_time_stats: bool = False
+        self.reqprof_done: bool = False
 
         # For disaggregation
         self.bootstrap_host: str = bootstrap_host

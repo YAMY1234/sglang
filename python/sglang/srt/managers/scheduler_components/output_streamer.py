@@ -37,6 +37,7 @@ from sglang.srt.managers.req_types import BaseFinishReason
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.exit_ledger import record_send
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.observability import req_profile
 from sglang.srt.runtime_context import (
     get_observability,
     get_parallel,
@@ -377,6 +378,13 @@ class SchedulerOutputStreamer:
             and get_observability().enable_request_time_stats_logging
         ):
             req.log_time_stats()
+        if req_profile.ENABLED and req.finished() and not req.reqprof_done:
+            req.reqprof_done = True
+            req_profile.on_request_finished(
+                req,
+                req.time_stats.disagg_mode_str(),
+                self.get_cached_tokens_details(req),
+            )
 
     def _stream_output_embedding(self, reqs: List[Req]):
         rids = []

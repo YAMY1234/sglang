@@ -373,6 +373,7 @@ from sglang.srt.multimodal.token_space_mm_process.registry import (
 )
 from sglang.srt.multimodal.transport.receive_budget import ReceiveFeatureBudget
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
+from sglang.srt.observability import req_profile
 from sglang.srt.observability.req_time_stats import (
     flush_trace_batch,
     set_schedule_time_batch,
@@ -5856,6 +5857,8 @@ class Scheduler(
         self.tree_cache.flush_pending_backups()
 
         self._record_step_counters(batch, result)
+        if req_profile.ENABLED:
+            req_profile.on_batch_result(batch)
 
         self.metrics_reporter.log_batch_result_stats(batch, result)
 

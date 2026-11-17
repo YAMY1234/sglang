@@ -725,6 +725,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     scheduler_recv_time: float = 0.0
     last_chunked_prefill_finish_time: float = 0.0
     last_decode_finish_time: float = 0.0
+    first_decode_finish_time: float = 0.0
     decode_ct: int = 0
     last_decode_scheduled_time: float = 0.0
     last_forward_entry_time: float = 0.0
@@ -738,6 +739,10 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     # other
     transfer_speed_gb_s: float = 0.0
     transfer_total_mb: float = 0.0
+    # Kept for request-level profiling; compute_and_observe_kv_transfer_metrics fills them.
+    kv_transfer_latency_ms: Optional[float] = None
+    kv_bootstrap_ms: Optional[float] = None
+    kv_alloc_ms: Optional[float] = None
 
     # Seconds spent in the waiting queue over every entry (a retracted request
     # re-enters it).
@@ -959,6 +964,8 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         ts = ts or time.perf_counter()
         last_time = self.last_decode_finish_time
         self.last_decode_finish_time = ts
+        if not self.first_decode_finish_time:
+            self.first_decode_finish_time = ts
 
         if self.enable_metrics or self.trace_ctx.tracing_enable:
             if last_time == 0.0:
@@ -1048,6 +1055,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 self.transfer_speed_gb_s = speed_gb_s
 
             result["latency_ms"] = latency_ms
+            self.kv_transfer_latency_ms = latency_ms
             result["total_mb"] = total_mb
             result["speed_gb_s"] = speed_gb_s
 
@@ -1077,6 +1085,8 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
             result["bootstrap_ms"] = bootstrap_ms
             result["alloc_ms"] = alloc_ms
+            self.kv_bootstrap_ms = bootstrap_ms
+            self.kv_alloc_ms = alloc_ms
 
             if self.enable_metrics:
                 self.metrics_collector.observe_kv_transfer_bootstrap(
