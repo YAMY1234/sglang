@@ -992,6 +992,11 @@ class Envs:
     SGLANG_LINKER_ASYNC_BATCHED_RELAY = EnvBool(False)
     SGLANG_LINKER_PREPIN_THREADS = EnvInt(1)
     SGLANG_LINKER_PREPIN_WINDOW_MIN = EnvInt(2)
+    # Async admission progress guarantee: a hit skipped this many passes in a
+    # row, or for this many ms, is admitted as a miss of its unready pages
+    # (recomputed) on every stage. 0 disables either bound.
+    SGLANG_LINKER_SKIP_FALLBACK_PASSES = EnvInt(4)
+    SGLANG_LINKER_SKIP_FALLBACK_MS = EnvFloat(200.0)
     # A batch's external-linker load waits only for the GPU work queued before
     # the previous batch's launch, not for that batch's forward, so it runs
     # under the previous forward (default: it waits for all prior GPU work).

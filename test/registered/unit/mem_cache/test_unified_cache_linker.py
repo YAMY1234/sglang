@@ -2030,7 +2030,7 @@ def test_async_admission_skips_an_unready_hit_on_every_stage_until_its_prepin_la
         assert later._pp_fresh_hit_pages(req5, later.hit_markers["r"]) == 3
         assert pp0_backend.pins == []
         assert pp0.skip_counts == later.skip_counts == {}
-        assert pp0.async_counts == {"skipped": 1, "urgent": 0}
+        assert pp0.async_counts["skipped"] == 1 and pp0.async_counts["urgent"] == 0
 
 
 def test_async_admission_never_pins_at_admission_and_holds_a_starving_hits_pin(
@@ -2043,6 +2043,9 @@ def test_async_admission_never_pins_at_admission_and_holds_a_starving_hits_pin(
     with (
         envs.SGLANG_LINKER_PREPIN_DEPTH.override(2),
         envs.SGLANG_LINKER_ASYNC_ADMISSION.override(True),
+        # The progress bound off: this test holds a starving hit's pin.
+        envs.SGLANG_LINKER_SKIP_FALLBACK_PASSES.override(0),
+        envs.SGLANG_LINKER_SKIP_FALLBACK_MS.override(0),
         patch(
             "sglang.srt.mem_cache.unified_cache.unified_cache_linker.get_storage_hash_str",
             side_effect=_page_hashes,
@@ -2066,7 +2069,7 @@ def test_async_admission_never_pins_at_admission_and_holds_a_starving_hits_pin(
             assert pp0._pp_fresh_hit_pages(req, hit) == UnifiedCacheLinkerWrapper._SKIPPED
         assert backend.pins == []  # never pinned on the scheduler thread
         assert backend.urgent_starts == ["r"] * 3  # from the limit-th skip on
-        assert pp0.async_counts == {"skipped": limit + 2, "urgent": 3}
+        assert pp0.async_counts["skipped"] == limit + 2 and pp0.async_counts["urgent"] == 3
 
         # A deep queue of hits ahead of it in policy order cannot push its pin
         # out of the window: it is kept and held, the others fill the depth.
@@ -2203,6 +2206,202 @@ def test_batched_relay_verdicts_are_the_landed_prepins_of_the_window(
         sent = pp0.take_verdicts()
         assert sent.ready == {"a": (3, 3), "c": (3, 3)}
         assert pp0.take_verdicts().ready == {}  # sent once
+
+
+class _LandingPinLinker(_PinningLinker):
+    """Pre-pins land when the test says: landed[rid] = pages once it has."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.landed = {}
+
+    def take_prepin(self, rid, transfers):
+        return self.landed.pop(rid, None)
+
+    def peek_prepin(self, rid, transfers):
+        return self.landed.get(rid)
+
+
+def _hit_pair_reqs(pp0, later, rids):
+    reqs = {}
+    for rid in rids:
+        fields = dict(rid=rid, last_node=f"{rid}-node", kv=None, prefix_len=0)
+        fields.update(priority=0, swa_branching_seqlen=None)
+        r0 = SimpleNamespace(linker_pp_hit=None, linker_pp_lookup_pending=True, **fields)
+        pp0.match(_KEY, r0, _device_result(0))
+        r5 = SimpleNamespace(linker_pp_hit=r0.linker_pp_hit, linker_pp_lookup_pending=False, **fields)
+        r0.linker_pp_lookup_pending = False
+        reqs[rid] = (r0, r5)
+    return reqs
+
+
+def _admission_pass(pp0, later, reqs):
+    """One scheduling round on PP0 and a later stage, as the scheduler runs it:
+    PP0's verdicts ride the request relay to every stage (batched relay), each
+    stage matches and admits its waiting hits in the same order, then PP0
+    pre-pins the next window. Admitted requests leave ``reqs``. Returns
+    rid -> (PP0's load_back result, the later stage's)."""
+    verdicts = pp0.take_verdicts()
+    if verdicts is not None:
+        pp0.apply_verdicts(verdicts)
+        later.apply_verdicts(verdicts)
+    out = {}
+    for rid, (r0, r5) in list(reqs.items()):
+        pp0.match(_KEY, r0, _device_result(0))
+        later.match(_KEY, r5, _device_result(0))
+        out[rid] = (pp0.load_back(r0), later.load_back(r5))
+        if out[rid][0] is not LINKER_ADMISSION_SKIPPED:
+            del reqs[rid]
+    pp0.prepin([r0 for r0, _ in reqs.values()])
+    return out
+
+
+def _async_env(batched, passes=0, ms=0):
+    return (
+        envs.SGLANG_LINKER_PREPIN_DEPTH.override(8),
+        envs.SGLANG_LINKER_ASYNC_ADMISSION.override(True),
+        envs.SGLANG_LINKER_ASYNC_BATCHED_RELAY.override(batched),
+        envs.SGLANG_LINKER_SKIP_FALLBACK_PASSES.override(passes),
+        envs.SGLANG_LINKER_SKIP_FALLBACK_MS.override(ms),
+        patch(
+            "sglang.srt.mem_cache.unified_cache.unified_cache_linker.get_storage_hash_str",
+            side_effect=_page_hashes,
+        ),
+    )
+
+
+def _stage_pair(component, backend, batched):
+    if batched:
+        return _verdict_pair(component, backend, _PinningLinker())
+    pp0, later = _pp_pair(component, backend, _PinningLinker())
+    return pp0, later, None
+
+
+_SKIP = LINKER_ADMISSION_SKIPPED
+
+
+def test_batched_relay_admits_a_skipped_hit_once_its_late_prepin_lands(
+    full_linker_component,
+):
+    # Rhea pm-lk4: a hit skipped once never got a verdict again (68,800 skips a
+    # minute, every one urgent, no batch): load_back popped its hit marker
+    # before skipping, and the window gives verdicts only to hits holding one.
+    a, b, c, d, e, f = _async_env(batched=True)
+    with a, b, c, d, e, f:
+        backend = _LandingPinLinker(stage_restorable=[1, 3])
+        pp0, later, relays = _verdict_pair(full_linker_component, backend, _PinningLinker())
+        reqs = _hit_pair_reqs(pp0, later, ["r"])
+        assert _admission_pass(pp0, later, reqs) == {"r": (_SKIP, _SKIP)}
+        backend.landed["r"] = 3  # lands after the first window looked
+        assert _admission_pass(pp0, later, reqs) == {"r": (_SKIP, _SKIP)}
+        assert pp0.next_verdicts == {"r": (3, 3)}  # this window saw it land
+        r0, r5 = reqs["r"]
+        out = _admission_pass(pp0, later, reqs)
+        assert out["r"][0] is not _SKIP and out["r"][1] is not _SKIP
+        assert reqs == {} and backend.pins == [] and relays == []
+        assert pp0.skip_counts == later.skip_counts == {}
+        assert pp0.async_counts["fallback"] == 0
+
+
+def test_async_admission_a_skipped_hits_marker_lasts_until_its_next_match(
+    full_linker_component,
+):
+    # The marker a skip keeps feeds the next window only; a match that finds
+    # no linker hit (here: the whole key is on the device now) drops it.
+    a, b, c, d, e, f = _async_env(batched=True)
+    with a, b, c, d, e, f:
+        backend = _PinningLinker(stage_restorable=[1, 3])
+        pp0, later, _ = _verdict_pair(full_linker_component, backend, _PinningLinker())
+        reqs = _hit_pair_reqs(pp0, later, ["r"])
+        assert _admission_pass(pp0, later, reqs) == {"r": (_SKIP, _SKIP)}
+        assert pp0.has_hit("r") and later.has_hit("r")
+        r0, _ = reqs["r"]
+        pp0.match(_KEY, r0, _device_result(len(_KEY)))
+        assert not pp0.has_hit("r")
+
+
+@pytest.mark.parametrize("batched", [True, False])
+def test_async_admission_recomputes_a_hit_whose_prepin_never_lands(
+    full_linker_component, batched
+):
+    # The progress guarantee: a hit skipped SKIP_FALLBACK_PASSES passes in a
+    # row is admitted on every stage alike as a miss of its unready pages.
+    a, b, c, d, e, f = _async_env(batched, passes=4)
+    with a, b, c, d, e, f:
+        backend = _PinningLinker(stage_restorable=[1, 3])  # never lands
+        pp0, later, relays = _stage_pair(full_linker_component, backend, batched)
+        reqs = _hit_pair_reqs(pp0, later, ["r"])
+        r0, r5 = reqs["r"]
+        trace = [_admission_pass(pp0, later, reqs)["r"] for _ in range(5)]
+        assert trace[:4] == [(_SKIP, _SKIP)] * 4
+        assert trace[4] == ((0, "r-node"), (0, "r-node"))
+        assert reqs == {} and backend.pins == []
+        assert r0.linker_pp_hit == r5.linker_pp_hit == (0, [])
+        assert pp0.skip_counts == later.skip_counts == {}
+        assert pp0.async_counts["fallback"] == later.async_counts["fallback"] == 1
+        assert pp0.async_counts["fallback_pages"] == 3
+        assert "r" in backend.unpins
+        if batched:
+            assert relays == []
+
+
+def test_async_admission_recomputes_a_hit_skipped_longer_than_the_time_bound(
+    full_linker_component,
+):
+    a, b, c, d, e, f = _async_env(batched=True, passes=0, ms=5)
+    with a, b, c, d, e, f:
+        backend = _PinningLinker(stage_restorable=[1, 3])
+        pp0, later, _ = _verdict_pair(full_linker_component, backend, _PinningLinker())
+        reqs = _hit_pair_reqs(pp0, later, ["r"])
+        assert _admission_pass(pp0, later, reqs) == {"r": (_SKIP, _SKIP)}
+        assert _admission_pass(pp0, later, reqs) == {"r": (_SKIP, _SKIP)}
+        time.sleep(0.01)
+        assert _admission_pass(pp0, later, reqs) == {"r": (_SKIP, _SKIP)}
+        assert _admission_pass(pp0, later, reqs) == {"r": ((0, "r-node"), (0, "r-node"))}
+
+
+def test_async_admission_fallback_leaves_a_landed_prepin_to_load(
+    full_linker_component,
+):
+    # A pin that lands inside the bound loads its pages; nothing falls back.
+    a, b, c, d, e, f = _async_env(batched=True, passes=4, ms=200)
+    with a, b, c, d, e, f:
+        backend = _LandingPinLinker(stage_restorable=[1, 3])
+        pp0, later, _ = _verdict_pair(full_linker_component, backend, _PinningLinker())
+        reqs = _hit_pair_reqs(pp0, later, ["r"])
+        for _ in range(3):
+            assert _admission_pass(pp0, later, reqs) == {"r": (_SKIP, _SKIP)}
+        backend.landed["r"] = 3
+        assert _admission_pass(pp0, later, reqs) == {"r": (_SKIP, _SKIP)}
+        assert pp0.skip_counts["r"] == 4  # at the bound, but its pin is ready
+        out = _admission_pass(pp0, later, reqs)
+        assert out["r"][0] not in (_SKIP, (0, "r-node"))
+        assert out["r"][0] == out["r"][1]
+        assert pp0.async_counts["fallback"] == 0
+
+
+@pytest.mark.parametrize("batched", [True, False])
+def test_async_admission_keeps_admitting_when_every_hit_is_unready(
+    full_linker_component, batched
+):
+    # pm-lk4's shape: a deep queue of hits, no pre-pin ever ready. Every hit
+    # is admitted within SKIP_FALLBACK_PASSES + 1 passes, the same on both
+    # stages, and from then on no pass with waiting hits admits none.
+    a, b, c, d, e, f = _async_env(batched, passes=4)
+    with a, b, c, d, e, f:
+        backend = _PinningLinker(stage_restorable=[1, 3])
+        pp0, later, _ = _stage_pair(full_linker_component, backend, batched)
+        rids = [f"r{i}" for i in range(12)]
+        reqs = _hit_pair_reqs(pp0, later, rids)
+        admitted_per_pass = []
+        for _ in range(5):
+            out = _admission_pass(pp0, later, reqs)
+            assert all(p0 == p5 for p0, p5 in out.values())
+            admitted_per_pass.append(sum(p0 is not _SKIP for p0, _ in out.values()))
+        assert admitted_per_pass == [0, 0, 0, 0, 12]
+        assert reqs == {}
+        assert pp0.async_counts["fallback"] == 12
+        assert pp0.async_counts["fallback_pages"] == 36
 
 
 def test_async_admission_prepins_the_admission_window_and_ends_the_rest(

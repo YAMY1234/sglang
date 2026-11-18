@@ -316,6 +316,9 @@ class UnifiedCacheLinkerWrapper:
     # admission takes it (no starvation; PP0 still never pins at admission).
     _SKIPPED = -1
     _SKIP_LIMIT = 3
+    # Progress guarantee: the relayed verdict of a hit admitted as a miss of
+    # its unready pages (SGLANG_LINKER_SKIP_FALLBACK_*).
+    _FALLBACK = -2
 
     def __init__(
         self,
@@ -404,7 +407,14 @@ class UnifiedCacheLinkerWrapper:
             self.prepin_depth and envs.SGLANG_LINKER_ASYNC_ADMISSION.get()
         )
         self.skip_counts: dict[str, int] = {}
-        self.async_counts = {"skipped": 0, "urgent": 0}
+        self.async_counts = dict.fromkeys(
+            ("skipped", "urgent", "fallback", "fallback_pages"), 0
+        )
+        # PP0: rid -> when its current run of skips began; a run of
+        # fallback_passes skips or fallback_s seconds recomputes the hit.
+        self.skip_since: dict[str, float] = {}
+        self.fallback_passes = max(0, envs.SGLANG_LINKER_SKIP_FALLBACK_PASSES.get())
+        self.fallback_s = max(0.0, envs.SGLANG_LINKER_SKIP_FALLBACK_MS.get()) / 1e3
         # Batched relay: the verdict map every stage applies this pass, and the
         # one PP0 sends with the next round's requests.
         self.batched_relay = bool(
@@ -448,6 +458,8 @@ class UnifiedCacheLinkerWrapper:
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
         device_hit_len = result.device_prefix_len
+        # A skipped hit keeps its marker until it is matched again.
+        self.hit_markers.pop(req.rid, None)
         if device_hit_len > 0:
             self.cache_linker.refresh_device_prefix(
                 result.last_device_node,
@@ -582,7 +594,9 @@ class UnifiedCacheLinkerWrapper:
             if self.prepin_depth:
                 taken = self.cache_linker.take_prepin(req.rid, transfers)
                 self.prepin_counts["missed" if taken is None else "ready"] += 1
-            if taken is None and self.async_admission:
+            if taken is None and self.async_admission and self._falls_back(req.rid):
+                pinned = self._FALLBACK
+            elif taken is None and self.async_admission:
                 # Skip this pass rather than wait on the store; the relay
                 # carries the skip, so every stage skips it too.
                 pinned = self._SKIPPED
@@ -600,14 +614,15 @@ class UnifiedCacheLinkerWrapper:
                 self.admission_rpc_s = self.cache_linker.last_pin_rpc_s
         keep = torch.tensor([min(pinned, admitted)], dtype=torch.int64)
         self.cache._all_reduce(keep, torch.distributed.ReduceOp.MIN)
+        if int(keep[0]) == self._FALLBACK:
+            return self._fall_back(req, admitted)
         if int(keep[0]) == self._SKIPPED:
             # A TP peer of PP0 that took its pre-pin drops it with the rest.
             self.cache_linker.unpin(req.rid)
-            self.skip_counts[req.rid] = self.skip_counts.get(req.rid, 0) + 1
-            self.async_counts["skipped"] += 1
-            self._maybe_log_pp_counts()
+            self._count_skip(req.rid)
             return self._SKIPPED
         self.skip_counts.pop(req.rid, None)
+        self.skip_since.pop(req.rid, None)
         self.pass_hits += 1
         if int(keep[0]) < admitted:
             # Every stage drops its pins; the next pass pins the shorter hit.
@@ -635,16 +650,17 @@ class UnifiedCacheLinkerWrapper:
         this round's requests; no PP relay per hit. Only a hole (a pre-pin
         that found an object gone) still relays PP0's re-lookup."""
         verdict = self.verdicts.pop(req.rid, None)
+        if verdict == (admitted, self._FALLBACK):
+            return self._fall_back(req, admitted)
         if verdict is None or verdict[0] != admitted:
             if self.pp_rank == 0:
                 urgent = self.skip_counts.get(req.rid, 0) + 1 >= self._SKIP_LIMIT
                 self.async_counts["urgent"] += urgent
                 self.cache_linker.start_prepin(req.rid, transfers, urgent=urgent)
-            self.skip_counts[req.rid] = self.skip_counts.get(req.rid, 0) + 1
-            self.async_counts["skipped"] += 1
-            self._maybe_log_pp_counts()
+            self._count_skip(req.rid)
             return self._SKIPPED
         self.skip_counts.pop(req.rid, None)
+        self.skip_since.pop(req.rid, None)
         self.pass_hits += 1
         keep = min(verdict[1], admitted)
         if self.pp_rank == 0:
@@ -675,6 +691,34 @@ class UnifiedCacheLinkerWrapper:
             keep = int(best[0])
         self._maybe_log_pp_counts()
         return keep
+
+    def _count_skip(self, rid: str) -> None:
+        self.skip_counts[rid] = self.skip_counts.get(rid, 0) + 1
+        self.skip_since.setdefault(rid, time.monotonic())
+        self.async_counts["skipped"] += 1
+        self._maybe_log_pp_counts()
+
+    def _falls_back(self, rid: str) -> bool:
+        """PP0: whether a skipped hit whose pin is still not ready has waited
+        out the progress bound and is admitted as a miss instead."""
+        if rid not in self.skip_counts:
+            return False
+        if self.fallback_passes and self.skip_counts[rid] >= self.fallback_passes:
+            return True
+        return bool(
+            self.fallback_s
+            and time.monotonic() - self.skip_since[rid] >= self.fallback_s
+        )
+
+    def _fall_back(self, req: Req, admitted: int) -> int:
+        """Every stage, from PP0's verdict: drop the pins and recompute the hit."""
+        self.cache_linker.unpin(req.rid)
+        self.skip_counts.pop(req.rid, None)
+        self.skip_since.pop(req.rid, None)
+        self.async_counts["fallback"] += 1
+        self.async_counts["fallback_pages"] += admitted
+        self._maybe_log_pp_counts()
+        return self._FALLBACK
 
     def take_verdicts(self) -> Optional[LinkerAdmissionVerdicts]:
         """PP0, as the next round's requests are relayed: this pass's verdicts."""
@@ -740,16 +784,21 @@ class UnifiedCacheLinkerWrapper:
                 taken += 1
         self.cache_linker.keep_prepins(window, urgent)
         if self.batched_relay:
-            # Hits whose pre-pin has landed are admitted next pass on every stage.
+            # Hits whose pre-pin has landed are admitted next pass on every
+            # stage; skipped hits past the progress bound are recomputed.
             ready = {}
             for req in waiting:
                 hit = self.hit_markers.get(req.rid)
-                if hit is None or req.rid not in window:
+                if hit is None or (
+                    req.rid not in window and req.rid not in self.skip_counts
+                ):
                     continue
                 transfers = self._lookup_transfers(hit.tail_hashes)
                 pages = self.cache_linker.peek_prepin(req.rid, transfers) if transfers else None
                 if pages is not None:
                     ready[req.rid] = (len(hit.tail_hashes), pages)
+                elif self._falls_back(req.rid):
+                    ready[req.rid] = (len(hit.tail_hashes), self._FALLBACK)
             self.next_verdicts = ready
 
     def _pp_relookup_hit_pages(
@@ -953,7 +1002,17 @@ class UnifiedCacheLinkerWrapper:
             forced = req.rid in self.pp_forced_relookup
             keep = self._pp_fresh_hit_pages(req, hit, forced)
             if keep == self._SKIPPED:
+                # Keep the marker: the next window gives verdicts only to hits
+                # that hold one (pm-lk4: popped here, a skipped hit never got one).
+                self.hit_markers[req.rid] = hit
                 return LINKER_ADMISSION_SKIPPED
+            if keep == self._FALLBACK:
+                # Admitted as a miss on every stage: the adder re-selects this
+                # request with no host hit and recomputes the unready pages.
+                anchor, stops = req.linker_pp_hit
+                stops = [stop for stop in stops if stop <= hit.device_hit_len]
+                req.linker_pp_hit = (anchor, stops)
+                return 0, req.last_node
             self.admission_marks["fresh"] = time.monotonic()
             anchor, stops = req.linker_pp_hit
             end = hit.device_hit_len + keep * cache.page_size
@@ -1221,6 +1280,7 @@ class UnifiedCacheLinkerWrapper:
     def release_request(self, rid: str) -> None:
         self.hit_markers.pop(rid, None)
         self.skip_counts.pop(rid, None)
+        self.skip_since.pop(rid, None)
         self.lookup_cache.pop(rid, None)
         self.tail_hash_cache.pop(rid, None)
         self.pp_lookup_time.pop(rid, None)
