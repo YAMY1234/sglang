@@ -16,6 +16,7 @@ maybe_stub_sgl_kernel()
 
 import sglang.srt.mem_cache.unified_radix_cache as urc_mod
 from sglang.srt.environ import envs
+import sglang.srt.managers.cache_controller as cc_mod
 from sglang.srt.managers.cache_controller import CacheOperation, HiCacheController
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache import pmicro_hoststats as hs
@@ -560,6 +561,17 @@ class TestPMicroHostStats(CustomTestCase):
         hs._backed.clear()
         for op in hs.OPS.values():
             op.reset()
+        hs.D2H.reset()
+        hs.PUT.reset()
+        hs._d2h_pending.clear()
+        for name in ("_d2h_spans", "_put_spans", "_prev_put_spans"):
+            patcher = patch.object(hs, name, [])
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for name in ("_anchor", "_put_inflight_t0"):
+            patcher = patch.object(hs, name, None)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         patcher = patch.object(hs, "ON", True)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -698,6 +710,229 @@ class TestPMicroHostStats(CustomTestCase):
         )
         self.assertTrue(msgs[2].startswith("PMICRO_HOSTSTAT iter=8 "))
         self.assertEqual(hs.OPS["evict_wait"].n, 0)
+
+
+
+class _FakeEvent:
+    """A timing event at GPU time ``t`` ms that has completed iff ``done``."""
+
+    def __init__(self, t, done=True):
+        self.t = t
+        self.done = done
+
+    def query(self):
+        return self.done
+
+    def elapsed_time(self, end):
+        return end.t - self.t
+
+
+class TestPMicroD2HAndPutStats(CustomTestCase):
+    """D2H copy GPU time, L3 put timing and their overlap (PMICRO_HOSTOPS tail)."""
+
+    TAIL = re.compile(
+        r"\| d2h n=(\d+) ms_sum=([\d.]+) p50_ms=([\d.]+) p90_ms=([\d.]+) "
+        r"gbps=([\d.]+) \| put n=(\d+) ms_sum=([\d.]+) p50_ms=([\d.]+) "
+        r"p90_ms=([\d.]+) gbps=([\d.]+) win_gbps=([\d.]+) busy_frac=([\d.]+) "
+        r"\| overlap_frac=([\d.]+) ovl_n=(\d+)$"
+    )
+
+    _pages = staticmethod(TestPMicroHostStats._pages)
+
+    def setUp(self):
+        TestPMicroHostStats.setUp(self)
+        # GPU time 1000 ms <-> host time 50.0 s.
+        self.anchors = []
+
+        def record_anchor():
+            self.anchors.append((_FakeEvent(1000.0), 50.0))
+            return self.anchors[-1]
+
+        patcher = patch.object(hs, "_record_anchor", side_effect=record_anchor)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _copy(self, t0, t1, nbytes=1_000_000, done=True):
+        hs.note_d2h(_FakeEvent(t0), _FakeEvent(t1, done), nbytes)
+
+    def test_d2h_counts_only_completed_copies_in_order(self):
+        self._copy(1000.0, 1002.0)
+        self._copy(1003.0, 1007.0)
+        self._copy(1008.0, 1009.0, done=False)
+        self._copy(1010.0, 1011.0)  # behind an incomplete copy on the stream
+        hs.poll_d2h()
+        self.assertEqual((hs.D2H.n, hs.D2H.nbytes), (2, 2_000_000))
+        self.assertAlmostEqual(hs.D2H.sum_s, 0.006)
+        self.assertEqual(len(hs._d2h_pending), 2)
+        self.assertEqual(len(self.anchors), 1)
+        self.assertEqual(
+            [tuple(round(t, 6) for t in s) for s in hs._d2h_spans],
+            [(50.0, 50.002), (50.003, 50.007)],
+        )
+        hs._d2h_pending[0][1].done = True
+        hs.poll_d2h()
+        self.assertEqual(hs.D2H.n, 4)
+
+    def test_d2h_spans_wait_for_the_anchor(self):
+        self._copy(1000.0, 1002.0)
+        hs._anchor[0].done = False
+        hs.poll_d2h()
+        self.assertEqual((hs.D2H.n, len(hs._d2h_spans)), (1, 0))
+
+    def test_put_timing_bytes_busy_and_overlap(self):
+        self._copy(1000.0, 1002.0)  # host 50.000-50.002
+        self._copy(1003.0, 1007.0)  # host 50.003-50.007
+        hs.note_put_begin(50.001)
+        hs.note_put(50.001, 50.004, 1_000_000)
+        hs.note_put(50.010, 50.020, 3_000_000)
+        hs.note_put_begin(50.090)  # still in flight at the flush
+        m = self.TAIL.search("| " + hs.take_l3_fields(50.0, 50.1))
+        self.assertIsNotNone(m)
+        g = m.groups()
+        self.assertEqual(g[:5], ("2", "6.0", "4.000", "4.000", "0.33"))
+        self.assertEqual(g[5:7], ("2", "13.0"))
+        self.assertEqual(g[9:], ("0.31", "0.04", "0.230", "0.333", "2"))
+        # The window is reset and re-anchored; its puts still cover late copies.
+        self.assertEqual((hs.D2H.n, hs.PUT.n, len(hs._d2h_spans)), (0, 0, 0))
+        self.assertEqual(len(hs._prev_put_spans), 2)
+        self.assertEqual(len(self.anchors), 2)
+
+    def test_empty_window(self):
+        line = hs.take_l3_fields(0.0, 60.0)
+        self.assertEqual(
+            line,
+            "d2h n=0 ms_sum=0.0 p50_ms=0.000 p90_ms=0.000 gbps=0.00 | "
+            "put n=0 ms_sum=0.0 p50_ms=0.000 p90_ms=0.000 gbps=0.00 "
+            "win_gbps=0.00 busy_frac=0.000 | overlap_frac=0.000 ovl_n=0",
+        )
+        self.assertEqual(self.anchors, [])
+
+    def test_ops_line_ends_with_d2h_put_and_overlap(self):
+        hs.note_put(1.0, 1.5, 500_000_000)
+        with patch.object(hs, "_ops_window_start", 0.0):
+            line = hs.take_ops_line(100.0)
+        self.assertTrue(line.startswith("PMICRO_HOSTOPS window_s=100.0 | evict_wait"))
+        m = self.TAIL.search(line)
+        self.assertIsNotNone(m, line)
+        self.assertEqual(m.group(6), "1")
+        self.assertEqual(m.groups()[9:12], ("1.00", "0.01", "0.005"))
+
+    def _start_writing(self, timing_enabled):
+        cc = object.__new__(HiCacheController)
+        cc.page_size = 64
+        cc.write_queue = ["op"]
+        cc.ack_write_queue = []
+        cc._move_write_operation = MagicMock(return_value=("H", "D", None))
+        cc._l2_transfers = MagicMock(return_value=["T"])
+        cc._num_tokens_by_pool = MagicMock(return_value={})
+        cc._transfer_num_bytes = MagicMock(return_value=4096)
+        cc.l2_transfer_engine = MagicMock()
+        cc.l2_transfer_engine.submit_device_to_host.return_value = SimpleNamespace(
+            start_event="S", finish_event="E", timing_enabled=timing_enabled
+        )
+        cc.mem_pool_device_allocator = MagicMock()
+        cc.write_fence_stream = None
+        merged = SimpleNamespace(
+            node_ids=[1], host_indices=self._pages([3]), device_indices=list(range(64))
+        )
+        with patch.object(CacheOperation, "merge_ops", return_value=merged):
+            cc.start_writing()
+
+    def test_start_writing_queues_the_copy_events(self):
+        self._start_writing(timing_enabled=True)
+        self.assertEqual(list(hs._d2h_pending), [("S", "E", 4096)])
+        self._start_writing(timing_enabled=False)
+        with patch.object(hs, "ON", False):
+            self._start_writing(timing_enabled=True)
+        self.assertEqual(len(hs._d2h_pending), 1)
+
+    def _backup_controller(self, pacer=None):
+        cc = object.__new__(HiCacheController)
+        cc.page_size = 2
+        cc.storage_host_pool = SimpleNamespace(size_per_token=10)
+        cc.page_set_func = MagicMock(return_value=True)
+        if pacer is not None:
+            cc._storage_put_pacer = pacer
+        op = SimpleNamespace(
+            hash_value=["a", "b", "c"],
+            host_indices=torch.arange(6),
+            prefix_keys=None,
+            completed_tokens=0,
+        )
+        with patch.object(cc_mod, "STORAGE_BATCH_SIZE", 2):
+            cc._page_backup(op)
+        self.assertEqual(op.completed_tokens, 6)
+        self.assertEqual(cc.page_set_func.call_count, 2)
+
+    def test_page_backup_times_each_put_batch(self):
+        self._backup_controller()
+        self.assertEqual((hs.PUT.n, hs.PUT.nbytes, len(hs._put_spans)), (2, 60, 2))
+        self.assertIsNone(hs._put_inflight_t0)
+
+    def test_page_backup_untouched_when_off(self):
+        with patch.object(hs, "ON", False):
+            with patch.object(cc_mod.time, "perf_counter") as clock:
+                self._backup_controller()
+        clock.assert_not_called()
+        self.assertEqual(hs.PUT.n, 0)
+        self.assertIsNone(HiCacheController._storage_put_pacer)
+        self.assertEqual(envs.SGLANG_HICACHE_STORAGE_PUT_MAX_GBPS.get(), 0.0)
+
+    def test_page_backup_paces_each_put_batch(self):
+        pacer = MagicMock()
+        with patch.object(hs, "ON", False):
+            self._backup_controller(pacer)
+        self.assertEqual([c.args[1] for c in pacer.pace.call_args_list], [40, 20])
+        self.assertEqual(hs.PUT.n, 0)
+
+    def test_hybrid_sidecar_put_is_timed_with_slot_bytes(self):
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            HybridCacheController,
+        )
+
+        cc = object.__new__(HybridCacheController)
+        cc.storage_config = SimpleNamespace(is_storage_writer=True)
+        cc.should_backup = lambda transfer: True
+        cc._resolve_sidecar_kv_derived_pool_transfers = MagicMock()
+        cc._resolve_sidecar_nonkv_derived_pool_transfers = MagicMock()
+        cc.storage_backend = MagicMock()
+        cc.storage_backend.batch_set_v2.return_value = {}
+        pool = SimpleNamespace(size_per_token=100)
+        cc.mem_pool_host = SimpleNamespace(
+            entry_map={"mamba": SimpleNamespace(host_pool=pool)}
+        )
+        op = SimpleNamespace(
+            pool_transfers=[
+                SimpleNamespace(name="mamba", host_indices=torch.arange(3), keys=["c"]),
+                SimpleNamespace(name="other", host_indices=torch.arange(5), keys=None),
+            ],
+            prefix_keys=None,
+            hash_value=["a", "b", "c"],
+            pool_storage_result=MagicMock(),
+        )
+        with patch.object(HiCacheController, "_page_backup") as kv_backup:
+            cc._page_backup_with_stable_layout(op)
+        kv_backup.assert_called_once_with(op)
+        self.assertEqual((hs.PUT.n, hs.PUT.nbytes), (1, 300))
+
+    def test_pacer_sleeps_to_the_cap_without_idle_credit(self):
+        now = [0.0]
+        sleeps = []
+
+        def sleep(s):
+            sleeps.append(round(s, 6))
+            now[0] += s
+
+        pacer = cc_mod.StoragePutPacer(1.0, clock=lambda: now[0], sleep=sleep)
+        now[0] = 0.1  # 0.5 GB put in 0.1 s at 1 GB/s: sleep to 0.5 s
+        pacer.pace(0.0, 500_000_000)
+        now[0] += 0.1  # 1 GB more from 0.5 s: due at 1.5 s
+        pacer.pace(0.5, 1_000_000_000)
+        now[0] = 10.05  # after idle time the next put earns no credit
+        pacer.pace(10.0, 100_000_000)
+        now[0] = 12.0  # a put slower than the cap does not sleep
+        self.assertLess(pacer.pace(11.0, 100_000_000), 0)
+        self.assertEqual(sleeps, [0.4, 0.9, 0.05])
 
 
 if __name__ == "__main__":

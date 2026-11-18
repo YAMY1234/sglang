@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Callable, List, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache import pmicro_hoststats
 from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
@@ -332,7 +333,36 @@ def check_dcp_l3_extra_pool(entry: Any, anchor: Any) -> None:
     )
 
 
+class StoragePutPacer:
+    """Caps the average L3 put bandwidth of one backup thread.
+
+    Each put batch is booked on a virtual clock that never runs behind real
+    time, so idle time earns no burst credit; the thread sleeps (GIL released)
+    until the clock catches up. Under write-on-host-evict a host page is freed
+    only after its L3 write, so pacing also delays host eviction and can raise
+    host pressure (and stall layout changes waiting on a hybrid layout lease).
+    """
+
+    def __init__(self, max_gbps: float, clock=time.perf_counter, sleep=time.sleep):
+        self.bytes_per_s = max_gbps * 1e9
+        self.clock = clock
+        self.sleep = sleep
+        self.next_free = 0.0
+
+    def pace(self, t_start: float, nbytes: int) -> float:
+        """Book ``nbytes`` of a put that started at ``t_start``; sleep and
+        return the delay that keeps the rate under the cap."""
+        self.next_free = max(self.next_free, t_start) + nbytes / self.bytes_per_s
+        delay = self.next_free - self.clock()
+        if delay > 0:
+            self.sleep(delay)
+        return delay
+
+
 class HiCacheController:
+    # Set from SGLANG_HICACHE_STORAGE_PUT_MAX_GBPS; None leaves puts unpaced.
+    _storage_put_pacer: Optional[StoragePutPacer] = None
+
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
@@ -354,6 +384,9 @@ class HiCacheController:
     ):
         self.tp_group = tp_group
         self.host_memory_mode = host_memory_mode
+        put_max_gbps = envs.SGLANG_HICACHE_STORAGE_PUT_MAX_GBPS.get()
+        if put_max_gbps > 0:
+            self._storage_put_pacer = StoragePutPacer(put_max_gbps)
         self.attn_cp_group = attn_cp_group
         self.attn_tp_group = attn_tp_group
         self.pp_group = pp_group
@@ -983,6 +1016,10 @@ class HiCacheController:
             pmicro_hoststats.OPS["backup_launch"].add(
                 time.perf_counter() - t0, ack.num_tokens, ack.num_bytes
             )
+            if ack.timing_enabled:
+                pmicro_hoststats.note_d2h(
+                    ack.start_event, ack.finish_event, ack.num_bytes
+                )
 
     def _transfer_num_bytes(self, op: CacheOperation) -> int:
         return len(op.device_indices) * self.mem_pool_host.size_per_token
@@ -1477,6 +1514,21 @@ class HiCacheController:
             self.storage_backend.batch_set_v1(hash_values, host_indices, extra_info)
         )
 
+    def _storage_put_begin(self) -> Optional[float]:
+        """Start time of one L3 put batch if it is timed or paced, else None."""
+        if not pmicro_hoststats.ON and self._storage_put_pacer is None:
+            return None
+        t0 = time.perf_counter()
+        if pmicro_hoststats.ON:
+            pmicro_hoststats.note_put_begin(t0)
+        return t0
+
+    def _storage_put_end(self, t0: float, nbytes: int) -> None:
+        if pmicro_hoststats.ON:
+            pmicro_hoststats.note_put(t0, time.perf_counter(), nbytes)
+        if self._storage_put_pacer is not None:
+            self._storage_put_pacer.pace(t0, nbytes)
+
     # Backup batch by batch
     def _page_backup(self, operation):
         # Backup batch by batch
@@ -1489,7 +1541,15 @@ class HiCacheController:
             # Set one batch token, and record if success.
             # todo: allow partial success
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            t0 = self._storage_put_begin()
             success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
+            if t0 is not None:
+                self._storage_put_end(
+                    t0,
+                    len(batch_hashes)
+                    * self.page_size
+                    * self.storage_host_pool.size_per_token,
+                )
             if not success:
                 logger.warning(
                     f"Write page to storage: {len(batch_hashes)} pages failed."

@@ -1835,9 +1835,12 @@ class HybridCacheController(BaseHiCacheController):
             for extra_info, transfers in _trailing_chain_groups(
                 operation.prefix_keys, operation.hash_value, backup_transfers
             ):
+                t0 = self._storage_put_begin()
                 results.update(
                     self.storage_backend.batch_set_v2(transfers, extra_info=extra_info)
                 )
+                if t0 is not None:
+                    self._storage_put_end(t0, self._sidecar_put_bytes(transfers))
             pool_hits = count_pool_hits(results)
             operation.pool_storage_result.update_extra_pool_hit_pages(pool_hits)
 
@@ -1863,6 +1866,15 @@ class HybridCacheController(BaseHiCacheController):
             operation.completed_tokens = (
                 len(operation.hash_value) * self.page_size if sidecar_ok else 0
             )
+
+    def _sidecar_put_bytes(self, transfers: list[PoolTransfer]) -> int:
+        """Host slots x slot size of one sidecar put; index counts only."""
+        nbytes = 0
+        for transfer in transfers:
+            entry = self.mem_pool_host.entry_map.get(transfer.name)
+            if entry is not None and transfer.host_indices is not None:
+                nbytes += transfer.host_indices.numel() * entry.host_pool.size_per_token
+        return nbytes
 
     def should_backup(self, transfer: PoolTransfer) -> bool:
         if not self.backup_skip:

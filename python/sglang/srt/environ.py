@@ -882,6 +882,9 @@ class Envs:
     # p-micro rig only: per-launch host / D2H counters and per-op HiCache timings
     # (PMICRO_HOSTSTAT / PMICRO_HOSTOPS log lines, see mem_cache/pmicro_hoststats.py).
     SGLANG_PMICRO_HOSTSTATS = EnvBool(False)
+    # Cap on the L3 put bandwidth of the storage backup thread, in GB/s; it sleeps
+    # between put batches to stay under it. 0 (default) leaves puts unpaced.
+    SGLANG_HICACHE_STORAGE_PUT_MAX_GBPS = EnvFloat(0.0)
     # PD prefill + write_back: Full-leaf eviction backups (D2H) wait only for
     # work issued before the in-flight forward; 0 (default) waits for that forward too.
     SGLANG_HICACHE_WB_EVICT_RELAXED_FENCE = EnvBool(False)

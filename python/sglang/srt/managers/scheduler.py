@@ -5045,6 +5045,7 @@ class Scheduler(
 
     def _pmicro_hoststat(self, batch: ScheduleBatch) -> None:
         """p-micro rig: counters since the previous launch; per-op timings every 60 s."""
+        pmicro_hoststats.poll_d2h()
         logger.info(
             pmicro_hoststats.take_launch_line(
                 batch.forward_iter,
