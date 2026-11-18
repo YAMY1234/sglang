@@ -287,6 +287,95 @@ class TestAsyncAdmissionPrepins(CustomTestCase):
         self.assertEqual(linker.prepins, {})
 
 
+class TestLoadOverlap(CustomTestCase):
+    """SGLANG_LINKER_LOAD_OVERLAP: a batch's load waits for the GPU work queued
+    before the previous batch's launch, not for the previous forward."""
+
+    def _start_batches(self, overlap, batches):
+        linker = _linker(log_load_timing=False)
+        linker.pool_group = SimpleNamespace(
+            resolve_transfers=lambda transfers, **kwargs: transfers
+        )
+        linker.pending_loads, linker.load_queued_at = {}, {}
+        linker.mla_broadcaster, linker.gc_frozen = None, True
+        linker.load_queue, linker.broadcast_loads = queue.Queue(), {}
+        linker.stats = {"load": 0}
+        linker.load_overlap = overlap
+        events = []
+
+        def event():
+            events.append(MagicMock(name=f"event{len(events)}"))
+            return events[-1]
+
+        waits = []
+        with patch.object(mooncake_direct_linker, "device_module") as device:
+            device.Event.side_effect = event
+            for rid in batches:
+                if rid is not None:
+                    linker.load(rid, [_transfer(PoolName.KV, 1)])
+                linker.start_layer_wise_loading()
+                while not linker.load_queue.empty():
+                    waits.append(events.index(linker.load_queue.get_nowait()[2]))
+        return waits, events, linker
+
+    def test_a_load_waits_for_the_launch_before_the_previous_batch(self):
+        # Batch 0 loads (no earlier launch: its own ready event), batch 1 has no
+        # load, batch 2 loads and waits only for batch 1's launch event.
+        waits, events, linker = self._start_batches(True, ["a", None, "b"])
+        # Events: 0 launch(a), 1 ready(a), 2 launch(none), 3 launch(b), 4 ready(b).
+        self.assertEqual(waits, [1, 2])
+        self.assertEqual(linker.stats["load_overlapped"], 1)
+        for index in (0, 2, 3):
+            events[index].record.assert_called_once()
+
+    def test_without_the_flag_a_load_waits_for_all_prior_work(self):
+        waits, events, _ = self._start_batches(False, ["a", None, "b"])
+        self.assertEqual(waits, [0, 1])  # each batch's own ready event
+        self.assertEqual(len(events), 2)
+
+
+class TestLoadPerKey(CustomTestCase):
+    """SGLANG_LINKER_LOAD_PER_KEY: one range get per batch, every layer of a key
+    in its entry, the same bytes as the per-layer reads."""
+
+    def test_one_call_carries_every_layer_and_logs_the_same_bytes(self):
+        requests = [
+            [_transfer(PoolName.KV, 2), _transfer(PoolName.SWA, 1)],
+            [_transfer(PoolName.KV, 3)],
+        ]
+        logged = {}
+        for per_key in (False, True):
+            linker = _linker(log_load_timing=True)
+            linker.load_per_key = per_key
+            with self.assertLogs(LOGGER, level="INFO") as logs:
+                linker.load_layer_wise(7, requests, [("a", 0.0), ("b", 0.0)])
+            logged[per_key] = [
+                line.split("bytes=")[1].split()[0] for line in logs.output if "bytes=" in line
+            ]
+            calls = linker.storage.store.batch_get_into_multi_buffer_ranges.call_args_list
+            completed = [c.args for c in linker.layer_done_counter.complete.call_args_list]
+            self.assertEqual(completed, [(7, 0), (7, 1)])
+            linker.layer_done_counter.fail.assert_not_called()
+        self.assertEqual(logged[True], logged[False])
+        self.assertEqual(logged[True], ["420", "600"])
+        self.assertEqual(len(calls), 1)
+        keys, ptrs, sizes, offsets = calls[0].args
+        self.assertEqual(keys, ["kv-0", "kv-1", "kv-0", "kv-1", "kv-2", "swa-0"])
+        self.assertEqual(sizes[0], [100, 100])  # both layers of the key
+        self.assertEqual(sizes[-1], [10, 10])
+
+    def test_a_failed_object_fails_the_whole_batch(self):
+        linker = _linker(log_load_timing=False)
+        linker.load_per_key = True
+        linker.storage.store.batch_get_into_multi_buffer_ranges.side_effect = (
+            lambda keys, ptrs, sizes, offsets: [-704] + [sum(i) for i in sizes[1:]]
+        )
+        with patch.object(mooncake_direct_linker.logger, "exception"):
+            linker.load_layer_wise(7, [[_transfer(PoolName.KV, 2)]], [("a", 0.0)])
+        linker.layer_done_counter.fail.assert_called()
+        linker.layer_done_counter.complete.assert_not_called()
+
+
 class TestSessionRefcount(CustomTestCase):
     """Mooncake ends a key's read session for every holder in the client, so
     with refcounting a session starts on the first holder and ends with the

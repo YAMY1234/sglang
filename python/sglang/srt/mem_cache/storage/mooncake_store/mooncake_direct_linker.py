@@ -268,6 +268,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     # Refcount read sessions per key (async admission or load overlap).
     count_sessions = False
     _session_refs: "_SessionRefs | None" = None
+    # SGLANG_LINKER_LOAD_OVERLAP / _PER_KEY at init; the previous launch's event.
+    load_overlap = False
+    load_per_key = False
+    prev_launch_event = None
     # SGLANG_LINKER_STATE_PATH_CAP at init; 0 leaves the store's states alone.
     state_path_cap = 0
 
@@ -322,8 +326,18 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.prepins: dict[str, tuple] = {}
         self.prepin_pool: ThreadPoolExecutor | None = None
         self.prepin_renew_s = envs.SGLANG_LINKER_PREPIN_RENEW_SECS.get()
-        # Pre-pins held across loads of shared prefixes: refcount sessions.
-        self.count_sessions = envs.SGLANG_LINKER_ASYNC_ADMISSION.get()
+        self.load_overlap = envs.SGLANG_LINKER_LOAD_OVERLAP.get()
+        self.load_per_key = envs.SGLANG_LINKER_LOAD_PER_KEY.get()
+        self.num_load_threads = envs.SGLANG_LINKER_LOAD_THREADS.get() or (
+            2 if self.load_overlap else 1
+        )
+        # Pre-pins held across loads, or loads in flight together, can share a
+        # prefix's keys: refcount sessions.
+        self.count_sessions = (
+            envs.SGLANG_LINKER_ASYNC_ADMISSION.get()
+            or self.load_overlap
+            or self.num_load_threads > 1
+        )
         self.prepin_renewals = 0
         self.stats_logged_at = time.monotonic()
         # Store-side state path cap: each state this rank wrote -> the deepest
@@ -485,13 +499,17 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             tuple[list[PoolTransfer], int, list[object], str | None] | None
         ] = Queue()
         self.offload_results: Queue[bool] = Queue()
-        self.stats = {"lookup": 0, "load": 0, "offload": 0}
-        self.load_thread = threading.Thread(
-            target=self.load_thread_func,
-            daemon=True,
-            name=f"mooncake-load-tp{tp_rank}",
-        )
-        self.load_thread.start()
+        self.stats = {"lookup": 0, "load": 0, "offload": 0, "load_overlapped": 0}
+        self.load_threads = [
+            threading.Thread(
+                target=self.load_thread_func,
+                daemon=True,
+                name=f"mooncake-load-tp{tp_rank}-{i}",
+            )
+            for i in range(self.num_load_threads)
+        ]
+        for thread in self.load_threads:
+            thread.start()
         self.offload_thread = threading.Thread(
             target=self.offload_thread_func,
             daemon=True,
@@ -907,6 +925,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.gc_frozen = True
 
     def start_layer_wise_loading(self) -> int:
+        previous = None
+        if self.load_overlap:
+            # Called for every prefill batch as it is built, before its forward.
+            previous, self.prev_launch_event = (
+                self.prev_launch_event,
+                device_module.Event(),
+            )
+            self.prev_launch_event.record()
         broadcaster = self.mla_broadcaster
         if broadcaster is not None:
             # Compare the logical load order (not local slots), including empty
@@ -959,8 +985,15 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         ready_event.record()
         if broadcaster is not None:
             self.broadcast_loads[counter_index] = (0, prepared, ready_event)
+        wait_event = ready_event
+        if previous is not None and broadcaster is None:
+            # The load's slots are free pages: a freed page has no reader or
+            # writer queued (allocator invariant; evicted nodes are unlocked), so
+            # only the work queued before the previous batch's launch must finish.
+            wait_event = previous
+            self.stats["load_overlapped"] = self.stats.get("load_overlapped", 0) + 1
         if broadcaster is None or broadcaster.is_src:
-            self.load_queue.put((counter_index, pending, ready_event, queued_at))
+            self.load_queue.put((counter_index, pending, wait_event, queued_at))
         self.stats["load"] += len(pending)
         flag = envs.SGLANG_LINKER_DEBUG_WAIT_ALL_LAYERS_FILE.get()
         if flag and os.path.exists(flag):
@@ -1122,7 +1155,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     )
                 started.append(keys)
 
-            for layer in range(self.num_layers):
+            if self.load_per_key:
+                self._load_per_key(batches, spans, loaded if timed else None)
+                for layer in range(self.num_layers):
+                    self.layer_done_counter.complete(counter_index, layer)
+            # Per-key loads landed above; otherwise one read per layer and pool.
+            for layer in () if self.load_per_key else range(self.num_layers):
                 for name, (keys, locations) in batches.items():
                     meta = self.pools[name].get_prepared_layer_range_meta(
                         locations, layer
@@ -1171,6 +1209,49 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 except BaseException as error:
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load session cleanup failed")
+
+    def _load_per_key(self, batches, spans, loaded) -> None:
+        """SGLANG_LINKER_LOAD_PER_KEY: one range get for the batch, each key's
+        entry holding every layer's ranges (Hecate lbw microbench: 2-3x the
+        per-layer, per-pool reads). ``loaded`` (if given) gets each request's bytes."""
+        keys_all, ptrs_all, sizes_all, offsets_all, base = [], [], [], [], {}
+        for name, (keys, locations) in batches.items():
+            entries = [([], [], []) for _ in keys]
+            for layer in range(self.num_layers):
+                meta = self.pools[name].get_prepared_layer_range_meta(locations, layer)
+                if meta is None:
+                    continue
+                if len(meta[0]) != len(keys):
+                    raise RuntimeError(
+                        f"pool {name}: {len(meta[0])} range entries for {len(keys)} keys"
+                    )
+                for entry, ptrs, sizes, offsets in zip(entries, *meta):
+                    entry[0].extend(ptrs)
+                    entry[1].extend(sizes)
+                    entry[2].extend(offsets)
+            base[name] = len(keys_all)
+            keys_all.extend(keys)
+            for ptrs, sizes, offsets in entries:
+                ptrs_all.append(ptrs)
+                sizes_all.append(sizes)
+                offsets_all.append(offsets)
+        result = self._get_layer_ranges(keys_all, ptrs_all, sizes_all, offsets_all)
+        expected = [sum(item) for item in sizes_all]
+        if result is None or isinstance(result, int) or list(result) != expected:
+            failed = (
+                Counter(v for v, want in zip(result, expected) if v != want)
+                if isinstance(result, list)
+                else result
+            )
+            raise RuntimeError(
+                f"Mooncake range get failed for every pool and layer: objects="
+                f"{len(keys_all)}, failed by code "
+                f"{dict(failed) if isinstance(failed, Counter) else failed}"
+            )
+        if loaded is not None:
+            for index, span in enumerate(spans):
+                for pool, first, last in span:
+                    loaded[index] += sum(expected[base[pool] + first : base[pool] + last])
 
     @staticmethod
     def _log_load_timing(request_transfers, requests, loaded, began, landed):
@@ -1408,9 +1489,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if self.lease_refresher is not None:
             self.lease_refresher.stop()
         self.reset()
-        self.load_queue.put(None)
+        for _ in self.load_threads:
+            self.load_queue.put(None)
         self.offload_queue.put(None)
-        self.load_thread.join()
+        for thread in self.load_threads:
+            thread.join()
         self.offload_thread.join()
         logger.info("Mooncake direct linker stats: %s", self.stats)
         self.storage.close()

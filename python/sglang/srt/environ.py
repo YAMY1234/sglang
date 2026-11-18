@@ -969,6 +969,16 @@ class Envs:
     SGLANG_LINKER_ASYNC_ADMISSION = EnvBool(False)
     # Seconds between renewals of a waiting request's pre-pin (async admission).
     SGLANG_LINKER_PREPIN_RENEW_SECS = EnvFloat(2.0)
+    # A batch's external-linker load waits only for the GPU work queued before
+    # the previous batch's launch, not for that batch's forward, so it runs
+    # under the previous forward (default: it waits for all prior GPU work).
+    SGLANG_LINKER_LOAD_OVERLAP = EnvBool(False)
+    # Read a load batch in one store call, every layer of a key in one entry,
+    # instead of one call per layer and pool; its layers complete together.
+    SGLANG_LINKER_LOAD_PER_KEY = EnvBool(False)
+    # Load threads, each reading its own batch (0: 2 with SGLANG_LINKER_LOAD_OVERLAP,
+    # else 1).
+    SGLANG_LINKER_LOAD_THREADS = EnvInt(0)
     # Store each page's KV and DSA indexer as one Mooncake object ("ki") instead
     # of two, halving the store's objects per page and stage.
     SGLANG_LINKER_MERGE_INDEXER = EnvBool(False)
