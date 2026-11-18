@@ -1488,6 +1488,63 @@ class TestHybridMambaDeclaredIndexer(CustomTestCase):
         self.assertEqual(list(config.pool_names), [PoolName.KV, PoolName.INDEXER])
 
 
+class TestHicacheMambaSizeGb(CustomTestCase):
+    def _mamba_stack_host_sizes(self, hicache_mamba_size_gb):
+        """(KV, Mamba) host sizes for a 10 GB --hicache-size over 6 GB of device KV
+        and 4 GB of device Mamba state."""
+        kv_pool = SimpleNamespace(
+            host_capacity_bytes=None, get_kv_size_bytes=lambda: 6 << 30
+        )
+        mamba_pool = SimpleNamespace(
+            host_capacity_bytes=None, get_kv_size_bytes=lambda: 4 << 30
+        )
+        memory = SimpleNamespace(
+            hicache_size=10, hicache_mamba_size_gb=hicache_mamba_size_gb
+        )
+        with (
+            patch.object(hybrid_pool_assembler, "get_memory", return_value=memory),
+            patch.object(hybrid_pool_assembler, "_mamba_info"),
+            patch.object(
+                hybrid_pool_assembler, "_mamba_layer_mapping", return_value={1: 0}
+            ),
+            patch.object(
+                hybrid_pool_assembler,
+                "prepare_host_pool_config",
+                return_value=SimpleNamespace(
+                    root=kv_pool, packed_draft_device_pools=()
+                ),
+            ),
+            patch.object(
+                hybrid_pool_assembler, "_kv_budget_index_bytes", return_value=0
+            ),
+            patch.object(hybrid_pool_assembler, "build_kv_host_pool") as kv_host,
+            patch.object(hybrid_pool_assembler, "_build_pool_entries", return_value=[]),
+            patch.object(hybrid_pool_assembler, "_mamba_entry") as mamba_entry,
+            patch.object(hybrid_pool_assembler, "HostPoolGroup"),
+            patch.object(hybrid_pool_assembler, "_build_cache_controller"),
+        ):
+            hybrid_pool_assembler.build_hybrid_mamba_stack(
+                params=SimpleNamespace(page_size=1, mtp_draft_device_pools=()),
+                kv_pool=kv_pool,
+                mamba_pool=mamba_pool,
+                full_layer_mapping={0: 0},
+                start_layer=0,
+                load_cache_event=None,
+                storage_backend=None,
+            )
+        return (
+            kv_host.call_args.kwargs["host_size"],
+            mamba_entry.call_args.kwargs["host_size"],
+        )
+
+    def test_mamba_stack_gives_the_pin_to_mamba_and_the_rest_to_kv(self):
+        self.assertEqual(self._mamba_stack_host_sizes(None), (6.0, 4.0))
+        self.assertEqual(self._mamba_stack_host_sizes(3), (7.0, 3.0))
+        for bad in (0, 10, 12):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self._mamba_stack_host_sizes(bad)
+
+
 class TestDevicePoolPlanning(CustomTestCase):
     def test_rejects_invalid_sources_and_duplicate_names_before_allocation(self):
         pool = _dsa_pool_stub(layer_num=2)
