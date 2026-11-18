@@ -1,6 +1,7 @@
 import time
 import unittest
 from contextlib import ExitStack
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
@@ -151,7 +152,7 @@ class TestFakeSenderAsyncIndices(unittest.TestCase):
             1, -1
         )
 
-    def _send(self, sender, flag, *, start=0, end=None, last_chunk=True):
+    def _make(self, sender, *, start=0, end=None, bootstrap_host="2.2.2.2"):
         req = SimpleNamespace(
             rid="r",
             kv=SimpleNamespace(req_pool_idx=0),
@@ -160,9 +161,21 @@ class TestFakeSenderAsyncIndices(unittest.TestCase):
             start_send_idx=start,
             disagg_decode_prefix_len=0,
             disagg_kv_sender=sender,
+            bootstrap_host=bootstrap_host,
+            bootstrap_room=7,
+            pending_bootstrap=False,
+            metadata_buffer_index=0,
+            discard_output_reason=None,
+            to_finish=None,
+            finished_reason=None,
+            return_logprob=False,
+            return_sampling_mask=False,
+            grammar=None,
         )
         scheduler = SimpleNamespace(
             enable_staging=False,
+            chunked_req=None,
+            kv_checksum_computer=None,
             token_to_kv_pool_allocator=SimpleNamespace(
                 page_size=self.PAGE,
                 translate_kv_indices_for_transfer=lambda x: x,
@@ -179,7 +192,18 @@ class TestFakeSenderAsyncIndices(unittest.TestCase):
                 )
             ),
             disagg_prefill_pending_chunk_rids=set(),
+            disagg_prefill_early_sent_rids=set(),
+            disagg_prefill_early_send_stats={"early": 0, "waited": 0},
         )
+        mixin = SchedulerDisaggregationPrefillMixin
+        scheduler._send_kv_chunk = partial(mixin._send_kv_chunk, scheduler)
+        scheduler._settle_early_sent_last_chunk = partial(
+            mixin._settle_early_sent_last_chunk, scheduler
+        )
+        return scheduler, req
+
+    def _run(self, flag, fn, *args, backend="mooncake", **kwargs):
+        """Run fn under the flag; return (result, .cpu() calls, async_d2h mock)."""
         real_cpu = torch.Tensor.cpu
         cpu_calls = []
 
@@ -192,13 +216,30 @@ class TestFakeSenderAsyncIndices(unittest.TestCase):
             stack.enter_context(
                 envs.SGLANG_DISAGG_FAKE_SENDER_ASYNC_INDICES.override(flag)
             )
+            stack.enter_context(
+                get_context().override_server_args(
+                    disaggregation_transfer_backend=backend
+                )
+            )
             stack.enter_context(patch.object(torch.Tensor, "cpu", counting_cpu))
             stack.enter_context(patch.object(prefill_mod, "async_d2h", d2h))
             stack.enter_context(patch.object(torch.cuda, "Event", Mock()))
             stack.enter_context(patch.object(torch.cuda, "current_stream", Mock()))
-            SchedulerDisaggregationPrefillMixin._send_kv_chunk(
-                scheduler, req, last_chunk=last_chunk
-            )
+            out = fn(*args, **kwargs)
+        return out, cpu_calls, d2h
+
+    def _send(
+        self, sender, flag, *, start=0, end=None, last_chunk=True, backend="mooncake"
+    ):
+        scheduler, req = self._make(sender, start=start, end=end)
+        _, cpu_calls, d2h = self._run(
+            flag,
+            SchedulerDisaggregationPrefillMixin._send_kv_chunk,
+            scheduler,
+            req,
+            last_chunk=last_chunk,
+            backend=backend,
+        )
         return req, cpu_calls, d2h
 
     @staticmethod
@@ -210,11 +251,14 @@ class TestFakeSenderAsyncIndices(unittest.TestCase):
         return kv_to_page_indices(self.req_to_token[0, start:end], self.PAGE)
 
     def _fake_sender(self):
+        # On the rig a fake sender shares the real Mooncake manager; early-send
+        # settling reads its request_status / _staging_outstanding.
         sender = FakeKVSender(
-            mgr=FakeKVManager(
-                args=KVArgs(),
-                disaggregation_mode=DisaggregationMode.PREFILL,
-                server_args=MagicMock(),
+            mgr=SimpleNamespace(
+                request_status={},
+                _staging_outstanding={},
+                kv_shard_size=1,
+                enable_all_cp_ranks_for_transfer=False,
             ),
             bootstrap_addr="fake_addr:1234",
             bootstrap_room=7,
@@ -224,8 +268,13 @@ class TestFakeSenderAsyncIndices(unittest.TestCase):
         return sender
 
     def test_flag_on_fake_sender_skips_cpu_sync_and_concludes(self):
+        for backend in ("mooncake", "fake"):
+            with self.subTest(backend=backend):
+                self._check_flag_on_fake_send(backend)
+
+    def _check_flag_on_fake_send(self, backend):
         sender = self._fake_sender()
-        _, cpu_calls, d2h = self._send(sender, True)
+        _, cpu_calls, d2h = self._send(sender, True, backend=backend)
         self.assertEqual(cpu_calls, [])
         # KV pages + mamba state, both through the pinned readback.
         self.assertEqual(d2h.call_count, 2)
@@ -270,10 +319,7 @@ class TestFakeSenderAsyncIndices(unittest.TestCase):
         for backend, expect_async in (("nixl", False), ("mooncake", True)):
             with self.subTest(backend=backend):
                 sender = _RecordingSender()
-                with get_context().override_server_args(
-                    disaggregation_transfer_backend=backend
-                ):
-                    _, cpu_calls, d2h = self._send(sender, True)
+                _, cpu_calls, d2h = self._send(sender, True, backend=backend)
                 (kv_indices, _, kwargs), = sender.calls
                 self.assertEqual("indices_event" in kwargs, expect_async)
                 self.assertEqual(bool(d2h.call_count), expect_async)
@@ -281,6 +327,66 @@ class TestFakeSenderAsyncIndices(unittest.TestCase):
                 self.assertEqual(
                     self._host(kv_indices).tobytes(),
                     self._expected_pages(0, self.TOTAL).tobytes(),
+                )
+
+    def test_early_send_eligibility_matches_a_real_sender(self):
+        for flag in (False, True):
+            with self.subTest(flag=flag):
+                real_sched, real_req = self._make(
+                    _RecordingSender(), bootstrap_host="10.0.0.1"
+                )
+                fake_sched, fake_req = self._make(self._fake_sender())
+                mixin = SchedulerDisaggregationPrefillMixin
+                eligible = mixin._pp_pd_early_send_eligible
+                with envs.SGLANG_DISAGG_FAKE_SENDER_ASYNC_INDICES.override(flag):
+                    self.assertTrue(eligible(real_sched, real_req))
+                    self.assertEqual(eligible(fake_sched, fake_req), flag)
+                    # The other gates still apply to the fake request.
+                    fake_req.return_logprob = True
+                    self.assertFalse(eligible(fake_sched, fake_req))
+
+    def test_flag_on_fake_sender_early_send_then_result_concludes(self):
+        """Non-last stage (no aux) and last stage (first token as aux): the early
+        send uses the async readback, and the result's send is a no-op."""
+        for first_output_id in (None, 5):
+            with self.subTest(first_output_id=first_output_id):
+                sender = self._fake_sender()
+                scheduler, req = self._make(sender)
+                wait_event = None if first_output_id is not None else object()
+                _, cpu_calls, _ = self._run(
+                    True,
+                    SchedulerDisaggregationPrefillMixin._pp_pd_send_last_chunk_early,
+                    scheduler,
+                    req,
+                    wait_event,
+                    first_output_id,
+                )
+                self.assertEqual(cpu_calls, [])
+                args, kwargs = sender.send.call_args
+                self.assertIsNotNone(kwargs["indices_event"])
+                self.assertEqual(
+                    kwargs.get("send_aux", True), first_output_id is not None
+                )
+                self.assertEqual(
+                    self._host(args[0]).tobytes(),
+                    self._expected_pages(0, self.TOTAL).tobytes(),
+                )
+                if first_output_id is None:
+                    scheduler.disagg_metadata_buffers.set_buf.assert_not_called()
+                else:
+                    scheduler.disagg_metadata_buffers.set_buf.assert_called_once_with(
+                        req, first_output_id
+                    )
+                self.assertIn(req.rid, scheduler.disagg_prefill_early_sent_rids)
+                self.assertEqual(sender.poll(), KVPoll.Success)
+                # The result's last-chunk send settles at once and sends nothing.
+                SchedulerDisaggregationPrefillMixin.send_kv_chunk(
+                    scheduler, req, last_chunk=True
+                )
+                self.assertEqual(sender.send.call_count, 1)
+                self.assertNotIn(req.rid, scheduler.disagg_prefill_early_sent_rids)
+                self.assertEqual(
+                    scheduler.disagg_prefill_early_send_stats["waited"], 0
                 )
 
 
