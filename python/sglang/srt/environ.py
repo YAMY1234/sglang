@@ -966,6 +966,13 @@ class Envs:
     # A stored KDA state counts as this many pages toward that budget (its size
     # over a page's objects; the same on every stage).
     SGLANG_LINKER_STATE_PAGE_EQUIV = EnvInt(431)
+    # Under that budget, never evict a page used (loaded at admission or
+    # stored) within this many of the stage's last offload/load calls (0: off).
+    SGLANG_LINKER_STORE_PROTECT_TICKS = EnvInt(0)
+    # Under that budget, a page loaded or stored again within this many calls
+    # of its eviction is put back in the budget on every stage and its pending
+    # or lease-retried removal is dropped before the remove call (0: off).
+    SGLANG_LINKER_STORE_RECALL_TICKS = EnvInt(0)
     # Under PP, after each scheduling pass PP0 starts the all-stage pins of the
     # next this-many waiting requests with a hit on a worker thread, so their
     # admission takes a finished pin instead of waiting on the store (0: off).

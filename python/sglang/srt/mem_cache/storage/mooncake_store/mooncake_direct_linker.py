@@ -220,17 +220,70 @@ class _StoreTree:
     whole. Every PP stage must pick the same victims, so the inputs are only
     what every stage sees in the same order on its scheduler thread (offload
     and load calls, page counts with a state as ``state_units`` pages) and
-    ties break by tick then hash. Scheduler thread only."""
+    ties break by tick then hash. Scheduler thread only, except ``recalled``
+    which the offload thread reads before each removal.
 
-    def __init__(self, budget: int, state_units: int, low_fraction: float = 0.95):
+    ``protect``: a leaf used within that many ticks is never evicted.
+    ``recall``: a page loaded or stored again within that many ticks of its
+    eviction goes back in the tree (with its parent link, without a state: the
+    same on every stage whether or not its removals ran there), and
+    ``recalled[page]`` takes the tick so its removals decided before that tick
+    are dropped if they have not run yet."""
+
+    RECALLED_CAPACITY = 1 << 16
+
+    def __init__(
+        self,
+        budget: int,
+        state_units: int,
+        low_fraction: float = 0.95,
+        protect: int = 0,
+        recall: int = 0,
+    ):
         self.budget, self.state_units = budget, state_units
         self.low = int(budget * low_fraction)
+        self.protect, self.recall = protect, recall
         self.nodes: dict[str, list] = {}
         # Stored pages whose parent was not stored yet: parent -> count.
         self.orphans: Counter = Counter()
         self.heap: list[tuple[int, str]] = []
         self.units = self.tick = self.states = 0
         self.counts: Counter = Counter()
+        # Evicted within the last ``recall`` ticks: page -> (tick, parent).
+        self.evicted: OrderedDict = OrderedDict()
+        self.recalled: OrderedDict = OrderedDict()
+
+    def _insert(self, page: str, parent: str | None) -> list:
+        node = [parent, self.orphans.pop(page, 0), self.tick, False]
+        self.nodes[page] = node
+        self.units += 1
+        above = self.nodes.get(parent) if parent is not None else None
+        if above is not None:
+            above[1] += 1
+        elif parent is not None:
+            self.orphans[parent] += 1
+        return node
+
+    def _recall(self, page: str) -> list | None:
+        """Put an evicted page back if it was evicted within ``recall`` ticks."""
+        self._forget_evicted()
+        entry = self.evicted.pop(page, None)
+        if entry is None:
+            return None
+        self.recalled[page] = self.tick
+        self.recalled.move_to_end(page)
+        if len(self.recalled) > self.RECALLED_CAPACITY:
+            self.recalled.popitem(last=False)
+        self.counts["recalled"] += 1
+        return self._insert(page, entry[1])
+
+    def _forget_evicted(self) -> None:
+        while self.evicted and next(iter(self.evicted.values()))[0] < self.tick - self.recall:
+            self.evicted.popitem(last=False)
+
+    def is_recalled(self, page: str, decided: int) -> bool:
+        """Offload thread: was ``page`` used again after its eviction at ``decided``?"""
+        return self.recalled.get(page, -1) > decided
 
     def _push_if_leaf(self, page: str, node: list) -> None:
         if node[1] == 0:
@@ -242,15 +295,10 @@ class _StoreTree:
         self.tick += 1
         for page in pages:
             node = self.nodes.get(page)
+            if node is None and self.recall:
+                node = self._recall(page)  # stored again: drop its pending removal
             if node is None:
-                node = [parent, self.orphans.pop(page, 0), self.tick, False]
-                self.nodes[page] = node
-                self.units += 1
-                above = self.nodes.get(parent) if parent is not None else None
-                if above is not None:
-                    above[1] += 1
-                elif parent is not None:
-                    self.orphans[parent] += 1
+                node = self._insert(page, parent)
             else:
                 node[2] = self.tick
             self._push_if_leaf(page, node)
@@ -262,11 +310,24 @@ class _StoreTree:
                 self.units += self.state_units
                 self.states += 1
 
+    def _unlink(self, page: str, node: list) -> None:
+        parent = node[0]
+        above = self.nodes.get(parent) if parent is not None else None
+        if above is not None:
+            above[1] -= 1
+            self._push_if_leaf(parent, above)
+        elif parent is not None:
+            self.orphans[parent] -= 1
+            if self.orphans[parent] <= 0:
+                del self.orphans[parent]
+
     def touch(self, pages: Sequence[str]) -> None:
-        """A load of ``pages``: they are used now."""
+        """A load of ``pages`` (at admission, on every stage): used now."""
         self.tick += 1
         for page in pages:
             node = self.nodes.get(page)
+            if node is None and self.recall:
+                node = self._recall(page)
             if node is not None:
                 node[2] = self.tick
                 self._push_if_leaf(page, node)
@@ -284,7 +345,11 @@ class _StoreTree:
             return []
         victims = []
         while self.units > self.low and self.heap:
-            tick, page = heapq.heappop(self.heap)
+            tick, page = self.heap[0]
+            if self.protect and tick > self.tick - self.protect:
+                self.counts["protected_stops"] += 1
+                break  # the oldest leaf is recent: so is every other one
+            heapq.heappop(self.heap)
             node = self.nodes.get(page)
             if node is None or node[1] or node[2] != tick:
                 continue  # gone, not a leaf any more, or used since
@@ -292,16 +357,12 @@ class _StoreTree:
             self.units -= 1 + (self.state_units if node[3] else 0)
             self.states -= node[3]
             victims.append((page, node[3]))
-            parent = node[0]
-            above = self.nodes.get(parent) if parent is not None else None
-            if above is not None:
-                above[1] -= 1
-                self._push_if_leaf(parent, above)
-            elif parent is not None:
-                self.orphans[parent] -= 1
-                if self.orphans[parent] <= 0:
-                    del self.orphans[parent]
+            if self.recall:
+                self.evicted[page] = (self.tick, node[0])
+            self._unlink(page, node)
         self.counts["evicted"] += len(victims)
+        if self.recall:
+            self._forget_evicted()
         if len(self.heap) > 4 * len(self.nodes) + 1024:
             self.heap = [(n[2], p) for p, n in self.nodes.items() if n[1] == 0]
             heapq.heapify(self.heap)
@@ -605,7 +666,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if budget > 0 and self.offload_owner:
             if callable(getattr(self.storage.store, "remove", None)):
                 self.store_tree = _StoreTree(
-                    budget, envs.SGLANG_LINKER_STATE_PAGE_EQUIV.get()
+                    budget,
+                    envs.SGLANG_LINKER_STATE_PAGE_EQUIV.get(),
+                    protect=envs.SGLANG_LINKER_STORE_PROTECT_TICKS.get(),
+                    recall=envs.SGLANG_LINKER_STORE_RECALL_TICKS.get(),
                 )
                 logger.info(
                     "Linker store budget: %d pages per stage (a state counts %d), "
@@ -1666,12 +1730,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         thread after the puts queued before (one of them may write them)."""
         if not victims:
             return
-        keys = []
+        keys, pages = [], []
         for _, obj, suffix, trailing in self._pool_key_schema():
-            keys += [
-                f"{page}_{suffix}_{obj}" for page, had_state in victims if had_state or not trailing
-            ]
-        self.offload_queue.put(("remove", self.storage._tag_keys(keys)))
+            for page, had_state in victims:
+                if had_state or not trailing:
+                    keys.append(f"{page}_{suffix}_{obj}")
+                    pages.append(page)
+        tick = self.store_tree.tick
+        self.offload_queue.put(("remove", self.storage._tag_keys(keys), pages, tick))
 
     def _cap_state_path(self, new_states: list[str], path: list[str]) -> list[str]:
         """Record the states this offload writes on their path and return the
@@ -1715,7 +1781,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 if task is None:
                     return
                 if task[0] == "remove":
-                    self._remove_pages(task[1])
+                    self._remove_pages(task[1], task[2], task[3])
                     self._maybe_log_stats()
                     continue
                 expanded, tokens, ready_events, session_id, victims = task
@@ -1780,21 +1846,30 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             else:
                 self.state_remove_failed += 1
 
-    def _remove_pages(self, keys: list[str]) -> None:
+    def _remove_pages(
+        self, keys: list[str], pages: Sequence[str] = (), decided: int = 0
+    ) -> None:
         """Remove the objects of pages the store budget evicted (offload thread),
         and retry earlier ones a live lease refused (-706) once it can have
         expired. Until removed they still take store space; the budget counts
         them gone at once, since every stage has to decide alike and removals
         land at different times on each (the master's higher watermark covers
-        the slack)."""
+        the slack). A page loaded or stored again since its eviction keeps its
+        objects: its removal is dropped right before the call."""
         now = time.monotonic()
         due, retries = [], self.page_remove_retries
         while retries and retries[0][0] <= now:
             due.append(retries.popleft())
-        due += [(now, key, self._REMOVE_RETRIES) for key in keys]
+        due += [
+            (now, key, self._REMOVE_RETRIES, page, decided)
+            for key, page in zip(keys, pages)
+        ]
         retry_at = now + envs.SGLANG_LINKER_LEASE_TTL_SECS.get() + 1
-        counts = self.page_remove_counts
-        for _, key, attempts in due:
+        counts, tree = self.page_remove_counts, self.store_tree
+        for _, key, attempts, page, decided in due:
+            if tree.is_recalled(page, decided):
+                counts["recalled"] += 1
+                continue
             rc = self.storage.store.remove(key)
             if rc == 0:
                 counts["removed"] += 1
@@ -1802,7 +1877,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 counts["already_gone"] += 1
             elif rc == -706 and attempts > 0:  # OBJECT_HAS_LEASE
                 counts["lease_retries"] += 1
-                retries.append((retry_at, key, attempts - 1))
+                retries.append((retry_at, key, attempts - 1, page, decided))
             else:
                 counts["failed"] += 1
 
@@ -1842,13 +1917,17 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             counts = self.page_remove_counts
             logger.info(
                 "Linker store budget: %d of %d pages stored (%d pages with a state), "
-                "%d evicted so far; objects removed %d, already gone %d, lease "
-                "retries %d (pending %d), failed %d",
+                "%d evicted so far (%d put back, %d evictions stopped at a recent "
+                "page); objects removed %d, kept for a reuse %d, already gone %d, "
+                "lease retries %d (pending %d), failed %d",
                 tree.units,
                 tree.budget,
                 tree.states,
                 tree.counts["evicted"],
+                tree.counts["recalled"],
+                tree.counts["protected_stops"],
                 counts["removed"],
+                counts["recalled"],
                 counts["already_gone"],
                 counts["lease_retries"],
                 len(self.page_remove_retries),

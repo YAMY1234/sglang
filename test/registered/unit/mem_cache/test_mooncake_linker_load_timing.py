@@ -959,7 +959,7 @@ class _LeaseStore:
         return 0
 
 
-def _budget_linker(budget, stage, state_units=4, store=None):
+def _budget_linker(budget, stage, state_units=4, store=None, protect=0, recall=0):
     linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
     linker.pools = {PoolName.KV: _Pool(PoolName.KV), PoolName.MAMBA: _Pool(PoolName.MAMBA)}
     linker.pool_group = SimpleNamespace(resolve_transfers=lambda transfers, **kwargs: transfers)
@@ -977,7 +977,9 @@ def _budget_linker(budget, stage, state_units=4, store=None):
         mla_suffix=f"pp{stage}",
         recently_loaded=mooncake_direct_linker._RecentKeys(16),
     )
-    linker.store_tree = mooncake_direct_linker._StoreTree(budget, state_units)
+    linker.store_tree = mooncake_direct_linker._StoreTree(
+        budget, state_units, protect=protect, recall=recall
+    )
     linker.page_remove_retries, linker.page_remove_counts = deque(), Counter()
     return linker
 
@@ -1000,7 +1002,7 @@ def _queued_victim_pages(linker, drain=False):
         if task[0] == "remove":
             pages += sorted({key.split("_")[0] for key in task[1]})
             if drain:
-                linker._remove_pages(task[1])
+                linker._remove_pages(*task[1:])
     return pages
 
 
@@ -1067,7 +1069,7 @@ class TestStoreBudgetTailFirst(CustomTestCase):
         self.assertLessEqual(tree.units, 9)
         linker.offload_queue.get_nowait(), linker.offload_queue.get_nowait()
         removal = linker.offload_queue.get_nowait()
-        self.assertEqual(removal, ("remove", ["a3_pp0_k", "a3_pp0_mamba"]))
+        self.assertEqual(removal[:3], ("remove", ["a3_pp0_k", "a3_pp0_mamba"], ["a3", "a3"]))
 
     def test_a_page_stored_before_its_parent_keeps_the_parent(self):
         tree = mooncake_direct_linker._StoreTree(3, 4)
@@ -1083,6 +1085,106 @@ class TestStoreBudgetTailFirst(CustomTestCase):
         linker.store_tree = None
         linker.offload([_pages("a1")], path_hashes=lambda: ["a1"])
         self.assertEqual(linker.offload_queue.qsize(), 1)  # the put only
+
+
+def _run_due_retries(linker):
+    linker.page_remove_retries = deque(
+        (0.0, *entry[1:]) for entry in linker.page_remove_retries
+    )
+    linker._remove_pages([])
+
+
+class TestStoreBudgetKeepsReusedPages(CustomTestCase):
+    """Rhea pm-lk3: the budget removed pages PP0 had admitted (pinned, not yet
+    read on every stage); the removal waited out the pin's lease and the stage
+    loads then failed with -704. A page used again after its eviction keeps its
+    objects, and the tree takes it back alike on every stage."""
+
+    def _evict_b(self, linker, drain):
+        """Store a (4 pages) then b (3 pages) over a budget of 6: a3, a4 go."""
+        linker.offload([_pages("a1", "a2", "a3", "a4")], path_hashes=lambda: ["a1", "a2", "a3", "a4"])
+        linker.load("r-a", [_pages("a1", "a2")])  # a1, a2 used; a3, a4 not
+        linker.offload([_pages("b1", "b2", "b3")], path_hashes=lambda: ["b1", "b2", "b3"])
+        while not linker.offload_queue.empty():
+            task = linker.offload_queue.get_nowait()
+            if task[0] == "remove":
+                self.assertEqual(sorted(set(task[2])), ["a3", "a4"])
+                if drain:
+                    linker._remove_pages(*task[1:])
+                else:
+                    linker.offload_queue.put(task)
+                    break
+
+    def test_a_load_after_eviction_drops_pending_and_retried_removals(self):
+        # Stage 0 ran its removals and a lease refused a4 (pinned on PP0);
+        # stage 1 has not run any yet. Then the request using a3/a4 is admitted.
+        stage0 = _budget_linker(6, 0, store=_LeaseStore(leased={"a4_pp0_k"}), recall=64)
+        stage1 = _budget_linker(6, 1, recall=64)
+        self._evict_b(stage0, drain=True)
+        self._evict_b(stage1, drain=False)
+        for stage in (stage0, stage1):
+            stage.load("r-a2", [_pages("a1", "a2", "a3", "a4")])
+        self.assertEqual(stage0.store_tree.nodes, stage1.store_tree.nodes)
+        self.assertEqual(stage0.store_tree.units, stage1.store_tree.units)
+        self.assertIn("a4", stage0.store_tree.nodes)
+        # Stage 0: a3 was gone already, the lease retry of a4 is dropped.
+        _run_due_retries(stage0)
+        self.assertEqual(stage0.storage.store.removed, ["a3_pp0_k"])
+        self.assertEqual(stage0.page_remove_counts["recalled"], 1)
+        # Stage 1: both queued removals are dropped before the call.
+        task = stage1.offload_queue.get_nowait()
+        stage1._remove_pages(*task[1:])
+        self.assertEqual(stage1.storage.store.removed, [])
+        self.assertEqual(stage1.page_remove_counts["recalled"], 2)
+
+    def test_a_store_again_after_eviction_keeps_the_new_objects(self):
+        linker = _budget_linker(6, 0, store=_LeaseStore(leased={"a4_pp0_k"}), recall=64)
+        self._evict_b(linker, drain=True)
+        # a4 is written again under a3 before its lease retry runs.
+        linker.offload([_pages("a3", "a4")], path_hashes=lambda: ["a1", "a2", "a3", "a4"])
+        linker.offload_queue.get_nowait()  # the put
+        # Back over the budget: the re-stored page is the newest, b goes.
+        self.assertEqual(linker.offload_queue.get_nowait()[2], ["b3", "b2"])
+        _run_due_retries(linker)
+        self.assertEqual(linker.storage.store.removed, ["a3_pp0_k"])
+        tree = linker.store_tree
+        self.assertEqual(tree.nodes["a4"][0], "a3")
+        self.assertEqual(tree.nodes["a3"][1], 1)  # a4 hangs from a3 again
+        # A later eviction of the page is a new decision and does run.
+        tree.touch(["b1", "a1", "a2", "a3"])
+        tree.add(["c1", "c2"], None, ())
+        linker._queue_tail_eviction(tree.evict())
+        task = linker.offload_queue.get_nowait()
+        self.assertEqual(task[2][0], "a4")  # used least recently
+        linker.storage.store.leased.add("a4_pp0_k")  # and its lease retry too
+        linker._remove_pages(*task[1:])
+        self.assertNotIn("a4_pp0_k", linker.storage.store.removed)
+        _run_due_retries(linker)
+        self.assertIn("a4_pp0_k", linker.storage.store.removed)
+
+    def test_no_recall_past_the_window_or_when_off(self):
+        for recall in (0, 2):
+            linker = _budget_linker(6, 0, recall=recall)
+            self._evict_b(linker, drain=False)
+            for _ in range(3):
+                linker.store_tree.touch(["b1"])
+            linker.load("r-a2", [_pages("a1", "a2", "a3", "a4")])
+            self.assertNotIn("a4", linker.store_tree.nodes)
+            task = linker.offload_queue.get_nowait()
+            linker._remove_pages(*task[1:])
+            self.assertEqual(sorted(linker.storage.store.removed), ["a3_pp0_k", "a4_pp0_k"])
+
+    def test_recent_pages_are_never_evicted(self):
+        tree = mooncake_direct_linker._StoreTree(5, 4, protect=2)
+        tree.add(["a1", "a2", "a3", "a4"], None, ())  # tick 1
+        tree.touch(["a1", "a2"])  # tick 2
+        tree.add(["b1", "b2", "b3"], None, ())  # tick 3: 7 units > 5
+        # a3, a4 (tick 1) are past the window and go; a1, a2 (tick 2) stay
+        # although the tree is still over 95% of the budget.
+        self.assertEqual([page for page, _ in tree.evict()], ["a4", "a3"])
+        self.assertEqual(tree.units, 5)
+        self.assertEqual(tree.evict(), [])
+        self.assertEqual(tree.counts["protected_stops"], 1)
 
 
 if __name__ == "__main__":
