@@ -4383,13 +4383,18 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.tree_core.evictable_size()
 
     def protected_size(self) -> int:
-        return self.tree_core.protected_size()
+        return self.tree_core.protected_size() + self._linker_reserve_tokens()
+
+    def _linker_reserve_tokens(self) -> int:
+        # SGLANG_LINKER_LOAD_RESERVE_PAGES: held load slots, in no request or node.
+        reserve = getattr(self, "linker_load_reserve", None)
+        return reserve.held_tokens() if reserve is not None else 0
 
     def full_evictable_size(self) -> int:
         return self.tree_core.full_evictable_size()
 
     def full_protected_size(self) -> int:
-        return self.tree_core.full_protected_size()
+        return self.tree_core.full_protected_size() + self._linker_reserve_tokens()
 
     def swa_evictable_size(self) -> int:
         return self.tree_core.swa_evictable_size()

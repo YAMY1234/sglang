@@ -11,7 +11,15 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName
+import torch
+
+from sglang.srt.environ import envs
+from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
+from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import DevicePoolGroup
+from sglang.srt.mem_cache.unified_cache.components.base import LinkerTransferPhase
+from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
+from sglang.srt.mem_cache.unified_cache.load_slot_reserve import LoadSlotReserve
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.mem_cache.storage.mooncake_store import mooncake_direct_linker
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
@@ -215,10 +223,11 @@ class TestMooncakeLinkerLoadTiming(CustomTestCase):
         self.assertTrue(linker.cancel_queued_load("dropped"))
         with patch.object(mooncake_direct_linker, "device_module", MagicMock()):
             self.assertEqual(linker.start_layer_wise_loading(), 3)
-        index, pending, _, queued_at = linker.load_queue.get_nowait()
+        index, pending, _, queued_at, late = linker.load_queue.get_nowait()
         self.assertEqual(
             (index, list(pending), list(queued_at)), (3, ["kept"], ["kept"])
         )
+        self.assertIsNone(late)  # not overlapped: no pool waits again
         self.assertEqual(linker.load_queued_at, {})
 
 
@@ -357,6 +366,203 @@ class TestLoadOverlap(CustomTestCase):
         waits, events, _ = self._start_batches(False, ["a", None, "b"])
         self.assertEqual(waits, [0, 1])  # each batch's own ready event
         self.assertEqual(len(events), 2)
+
+
+class _FakeEvent:
+    def __init__(self):
+        self.done = False
+        self.recorded = False
+
+    def record(self):
+        self.recorded = True
+
+    def query(self):
+        return self.done
+
+
+class _PageAllocator:
+    """Hands out free pages in order; freed pages go back to the end."""
+
+    def __init__(self, num_pages, page_size):
+        self.page_size = page_size
+        self.free_pages = list(range(num_pages))
+
+    def alloc(self, num_tokens):
+        n = num_tokens // self.page_size
+        if n > len(self.free_pages):
+            return None
+        pages, self.free_pages = self.free_pages[:n], self.free_pages[n:]
+        return (
+            torch.tensor(pages)[:, None] * self.page_size + torch.arange(self.page_size)
+        ).reshape(-1)
+
+    def free(self, indices):
+        self.free_pages.extend((indices.view(-1, self.page_size)[:, 0] // self.page_size).tolist())
+
+
+def _pages_of(indices, page_size):
+    return set((indices.view(-1, page_size)[:, 0] // page_size).tolist())
+
+
+class TestLoadSlotReserve(CustomTestCase):
+    """SGLANG_LINKER_LOAD_RESERVE_PAGES: load slots whose ids are on the CPU, so
+    an overlapped load never reads an index the GPU has not written (Hecate D4b)."""
+
+    def _reserve(self, target=4, page_size=2, pages=16):
+        allocator = _PageAllocator(pages, page_size)
+        events = []
+
+        def event():
+            events.append(_FakeEvent())
+            return events[-1]
+
+        reserve = LoadSlotReserve(
+            target, page_size, torch.device("cpu"), allocator.alloc, event, pin_memory=False
+        )
+        return reserve, allocator, events
+
+    def test_slots_come_only_from_held_pages_never_from_live_or_evicted_ones(self):
+        reserve, allocator, events = self._reserve()
+        held = set(reserve.free)
+        in_flight = allocator.alloc(4)  # the running batch's pages
+        evicted = allocator.alloc(2)
+        allocator.free(evicted)  # just evicted: back in the allocator
+        cpu, device = reserve.take(2)
+        taken = _pages_of(cpu, 2)
+        self.assertTrue(taken <= held)
+        self.assertFalse(taken & _pages_of(in_flight, 2))
+        self.assertFalse(taken & _pages_of(evicted, 2))
+        self.assertEqual(cpu.device.type, "cpu")
+        self.assertTrue(torch.equal(cpu, device))
+
+    def test_a_replacement_joins_only_once_its_ids_are_on_the_cpu(self):
+        reserve, allocator, events = self._reserve(target=4)
+        self.assertIsNotNone(reserve.take(3))
+        self.assertEqual((len(reserve.free), reserve.held_pages()), (1, 4))
+        self.assertTrue(events[-1].recorded)
+        # The replacement's copy has not landed: too few ids, fall back.
+        self.assertIsNone(reserve.take(2))
+        self.assertEqual(reserve.counts["fallback"], 1)
+        events[-1].done = True
+        cpu, _ = reserve.take(2)
+        self.assertEqual(len(_pages_of(cpu, 2)), 2)
+
+    def test_held_pages_count_as_protected_in_the_tree_accounting(self):
+        reserve, _, _ = self._reserve(target=4)
+        reserve.take(1)
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.tree_core = SimpleNamespace(protected_size=lambda: 10, full_protected_size=lambda: 10)
+        self.assertEqual(cache.full_protected_size(), 10)
+        cache.linker_load_reserve = reserve
+        self.assertEqual(cache.full_protected_size(), 10 + reserve.held_tokens())
+        self.assertEqual(cache.protected_size(), 10 + 4 * 2)
+
+
+class TestReservedLoadSlotsInTheFullComponent(CustomTestCase):
+    def _component(self, pages=16):
+        component = FullComponent.__new__(FullComponent)
+        allocator = _PageAllocator(pages, 2)
+        allocator.device = "cpu"
+        allocator.available_size = lambda: len(allocator.free_pages) * 2
+        component.cache = SimpleNamespace(page_size=2, evict=MagicMock())
+        component._full_allocator = lambda: allocator
+        return component, allocator
+
+    def test_without_the_reserve_a_load_allocates_as_before(self):
+        component, _ = self._component()
+        with envs.SGLANG_LINKER_LOAD_RESERVE_PAGES.override(0):
+            transfer = component.build_external_linker_transfer(
+                LinkerTransferPhase.LOAD, None, ["a", "b"]
+            )
+        self.assertIsNone(transfer.cpu_indices)
+        self.assertEqual(transfer.device_indices.tolist(), [0, 1, 2, 3])
+        self.assertIsNone(getattr(component.cache, "linker_load_reserve", None))
+
+    def test_with_the_reserve_a_load_lands_in_cpu_known_slots(self):
+        component, _ = self._component()
+        with envs.SGLANG_LINKER_LOAD_RESERVE_PAGES.override(3):
+            first = component.build_external_linker_transfer(
+                LinkerTransferPhase.LOAD, None, ["a", "b"]
+            )
+            reserve = component.cache.linker_load_reserve
+            self.assertEqual(_pages_of(first.cpu_indices, 2), {0, 1})
+            self.assertTrue(torch.equal(first.cpu_indices, first.device_indices))
+            self.assertEqual(reserve.held_pages(), 3)  # replaced from the allocator
+
+    def test_a_load_larger_than_the_reserve_allocates_as_before(self):
+        component, _ = self._component()
+        with envs.SGLANG_LINKER_LOAD_RESERVE_PAGES.override(1):
+            transfer = component.build_external_linker_transfer(
+                LinkerTransferPhase.LOAD, None, ["a", "b"]
+            )
+        self.assertIsNone(transfer.cpu_indices)
+        self.assertEqual(component.cache.linker_load_reserve.counts["fallback"], 1)
+
+
+class TestResolveCpuSlots(CustomTestCase):
+    def _group(self, mapper):
+        entry = SimpleNamespace(
+            translate_indices=lambda x: x if mapper is None else mapper(x),
+            _index_mapper=mapper,
+        )
+        return SimpleNamespace(sources={PoolName.KV: PoolName.KV}, entry_map={PoolName.KV: entry})
+
+    def test_cpu_slots_resolve_to_cpu_locations_unless_a_mapper_needs_the_device(self):
+        cpu = torch.arange(4)
+        device = torch.arange(4) + 100  # stands in for the device copy
+        transfer = PoolTransfer(name=PoolName.KV, keys=["a"], device_indices=device, cpu_indices=cpu)
+        (plain,) = DevicePoolGroup.resolve_transfers(self._group(None), [transfer])
+        self.assertIs(plain.host_indices, cpu)
+        (mapped,) = DevicePoolGroup.resolve_transfers(self._group(lambda x: x + 1), [transfer])
+        self.assertEqual(mapped.host_indices.tolist(), [101, 102, 103, 104])
+
+
+class TestOverlappedLoadReadsCpuSlotsFirst(CustomTestCase):
+    """With overlap, a pool whose slot indices are on the CPU is read before
+    this batch's GPU work finishes; a pool with GPU-written indices (KDA state)
+    only after it (late_wait)."""
+
+    def _run(self, late_wait):
+        order = []
+        linker = _linker(log_load_timing=False)
+        linker.load_per_key, linker.stats = True, {}
+
+        class _Recording(_Pool):
+            def prepare_locations(self, host_indices):
+                order.append(("locate", self.name))
+                return list(range(len(list(host_indices))))
+
+        linker.pools = {name: _Recording(name) for name in KEY_BYTES}
+        store = linker.storage.store
+        store.batch_get_into_multi_buffer_ranges.side_effect = lambda keys, ptrs, sizes, offsets: (
+            order.append(("read", tuple(k.split("-")[0] for k in keys))) or [sum(s) for s in sizes]
+        )
+        state = _transfer(PoolName.SWA, 1)
+        state.host_indices = MagicMock(device=SimpleNamespace(type="cuda"), __iter__=lambda self: iter([0]))
+        kv = _transfer(PoolName.KV, 2)
+        kv.host_indices = torch.arange(2)
+        wait = (lambda: order.append(("wait",))) if late_wait else None
+        linker.load_layer_wise(7, [[kv, state]], [("a", 0.0)], late_wait=wait)
+        linker.layer_done_counter.fail.assert_not_called()
+        return order
+
+    def test_cpu_slot_pools_are_read_before_the_wait_and_the_rest_after(self):
+        kv, swa = PoolName.KV.value, PoolName.SWA.value
+        order = self._run(late_wait=True)
+        self.assertEqual(
+            order,
+            [("locate", PoolName.KV), ("read", (kv, kv)), ("wait",),
+             ("locate", PoolName.SWA), ("read", (swa,))],
+        )
+
+    def test_without_overlap_one_read_covers_every_pool(self):
+        order = self._run(late_wait=False)
+        self.assertEqual([o[0] for o in order], ["locate", "locate", "read"])
+
+    def test_overlap_needs_the_reserve(self):
+        self.assertFalse(MooncakeDirectLinker._overlap_enabled(True, 0))
+        self.assertTrue(MooncakeDirectLinker._overlap_enabled(True, 8))
+        self.assertFalse(MooncakeDirectLinker._overlap_enabled(False, 8))
 
 
 class TestLoadPerKey(CustomTestCase):

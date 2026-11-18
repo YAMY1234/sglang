@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import heapq
+import logging
 import time
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -19,6 +21,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.unified_cache.load_slot_reserve import LoadSlotReserve
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
     UpdatePendingBackupOnNodeSplit,
@@ -45,6 +48,8 @@ if TYPE_CHECKING:
         UnifiedTreeNode,
     )
 
+
+logger = logging.getLogger(__name__)
 
 class FullComponent(TreeComponent):
     component_type = ComponentType.FULL
@@ -501,15 +506,19 @@ class FullComponent(TreeComponent):
             return PoolTransfer(name=PoolName.KV, keys=list(keys))
 
         if phase == LinkerTransferPhase.LOAD:
-            allocator = self._full_allocator()
-            num_tokens = len(keys) * self.cache.page_size
-            shortfall = max(0, num_tokens - allocator.available_size())
-            if shortfall:
-                began = time.monotonic()
-                self.cache.evict(EvictParams(num_tokens=shortfall))
-                # (tokens, seconds): read by the external linker's admission timing.
-                self.load_evict = (shortfall, time.monotonic() - began)
-            slots = allocator.alloc(num_tokens)
+            reserve = self._load_reserve()
+            taken = reserve.take(len(keys)) if reserve is not None else None
+            if reserve is not None:
+                self._log_load_reserve(reserve)
+            if taken is not None:
+                cpu, slots = taken
+                return PoolTransfer(
+                    name=PoolName.KV,
+                    device_indices=slots,
+                    keys=list(keys),
+                    cpu_indices=cpu,
+                )
+            slots = self._evict_and_alloc(len(keys) * self.cache.page_size)
             if slots is None:
                 return None
 
@@ -518,6 +527,53 @@ class FullComponent(TreeComponent):
                 device_indices=slots.to(torch.int64),
                 keys=list(keys),
             )
+
+    def _evict_and_alloc(self, num_tokens: int) -> Optional[torch.Tensor]:
+        allocator = self._full_allocator()
+        shortfall = max(0, num_tokens - allocator.available_size())
+        if shortfall:
+            began = time.monotonic()
+            self.cache.evict(EvictParams(num_tokens=shortfall))
+            # (tokens, seconds): read by the external linker's admission timing.
+            self.load_evict = (shortfall, time.monotonic() - began)
+        return allocator.alloc(num_tokens)
+
+    def _load_reserve(self) -> Optional[LoadSlotReserve]:
+        """SGLANG_LINKER_LOAD_RESERVE_PAGES, built at the first load; kept on the
+        cache so its pages count as held, not leaked."""
+        reserve = getattr(self.cache, "linker_load_reserve", None)
+        if reserve is not None:
+            return reserve
+        pages = envs.SGLANG_LINKER_LOAD_RESERVE_PAGES.get()
+        if pages <= 0:
+            return None
+        device = torch.device(self._full_allocator().device)
+        reserve = LoadSlotReserve(
+            pages,
+            self.cache.page_size,
+            device,
+            self._evict_and_alloc,
+            torch.get_device_module(device).Event,
+            pin_memory=device.type == "cuda",
+        )
+        self.cache.linker_load_reserve = reserve
+        self.load_reserve_logged_at = time.monotonic()
+        return reserve
+
+    def _log_load_reserve(self, reserve: LoadSlotReserve) -> None:
+        now = time.monotonic()
+        if now - self.load_reserve_logged_at < 60:
+            return
+        logger.info(
+            "Linker load reserve in %.0f s: %s; held %d of %d pages (%d free on the CPU)",
+            now - self.load_reserve_logged_at,
+            dict(reserve.counts),
+            reserve.held_pages(),
+            reserve.target,
+            len(reserve.free),
+        )
+        reserve.counts.clear()
+        self.load_reserve_logged_at = now
 
     def update_external_linker_load(
         self,

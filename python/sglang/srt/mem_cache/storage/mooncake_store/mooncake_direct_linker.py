@@ -327,16 +327,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.prepin_pool: ThreadPoolExecutor | None = None
         self.urgent_pool: ThreadPoolExecutor | None = None
         self.prepin_renew_s = envs.SGLANG_LINKER_PREPIN_RENEW_SECS.get()
-        # Off until load slots are known on the CPU before the launch: the load
-        # thread reads its slot indices, which this batch's own allocation
-        # kernels write after the previous launch (Hecate D4b: misaligned reads
-        # and a request restored into the wrong slots).
-        self.load_overlap = False
-        if envs.SGLANG_LINKER_LOAD_OVERLAP.get():
-            logger.warning(
-                "SGLANG_LINKER_LOAD_OVERLAP is ignored: loads still wait for all "
-                "prior GPU work until their slots are reserved on the CPU."
-            )
+        self.load_overlap = self._overlap_enabled(
+            envs.SGLANG_LINKER_LOAD_OVERLAP.get(),
+            envs.SGLANG_LINKER_LOAD_RESERVE_PAGES.get(),
+        )
         self.load_per_key = envs.SGLANG_LINKER_LOAD_PER_KEY.get()
         self.num_load_threads = envs.SGLANG_LINKER_LOAD_THREADS.get() or (
             2 if self.load_overlap else 1
@@ -953,6 +947,20 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         freeze_gc("Mooncake direct linker")
         self.gc_frozen = True
 
+    @staticmethod
+    def _overlap_enabled(overlap: bool, reserve_pages: int) -> bool:
+        """Only CPU-known load slots (the reserve) may be read before this
+        batch's own GPU work: other slot indices are written by allocation
+        kernels queued after the previous launch (Hecate D4b: misaligned reads
+        and a request restored into the wrong slots)."""
+        if overlap and reserve_pages <= 0:
+            logger.warning(
+                "SGLANG_LINKER_LOAD_OVERLAP is ignored: loads still wait for all "
+                "prior GPU work unless SGLANG_LINKER_LOAD_RESERVE_PAGES reserves "
+                "CPU-known load slots."
+            )
+        return bool(overlap) and reserve_pages > 0
+
     def start_layer_wise_loading(self) -> int:
         previous = None
         if self.load_overlap:
@@ -1014,15 +1022,17 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         ready_event.record()
         if broadcaster is not None:
             self.broadcast_loads[counter_index] = (0, prepared, ready_event)
-        wait_event = ready_event
+        wait_event, late_event = ready_event, None
         if previous is not None and broadcaster is None:
-            # The load's slots are free pages: a freed page has no reader or
-            # writer queued (allocator invariant; evicted nodes are unlocked), so
-            # only the work queued before the previous batch's launch must finish.
-            wait_event = previous
+            # Pools whose slots are CPU-known (the reserve) start after the work
+            # queued before the previous launch; any other pool's indices are
+            # written by this batch's GPU work, so it waits for ready_event.
+            wait_event, late_event = previous, ready_event
             self.stats["load_overlapped"] = self.stats.get("load_overlapped", 0) + 1
         if broadcaster is None or broadcaster.is_src:
-            self.load_queue.put((counter_index, pending, wait_event, queued_at))
+            self.load_queue.put(
+                (counter_index, pending, wait_event, queued_at, late_event)
+            )
         self.stats["load"] += len(pending)
         flag = envs.SGLANG_LINKER_DEBUG_WAIT_ALL_LAYERS_FILE.get()
         if flag and os.path.exists(flag):
@@ -1063,7 +1073,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             try:
                 if task is None:
                     return
-                counter_index, pending, ready_event, queued_at = task
+                counter_index, pending, ready_event, queued_at, late_event = task
                 try:
                     ready_event.synchronize()
                     self.load_layer_wise(
@@ -1071,6 +1081,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         list(pending.values()),
                         [(rid, queued_at.get(rid)) for rid in pending],
                         pinned=self.load_pins.pop(counter_index, frozenset()),
+                        late_wait=(
+                            late_event.synchronize if late_event is not None else None
+                        ),
                     )
                 except BaseException as error:
                     self.layer_done_counter.fail(counter_index, error)
@@ -1135,11 +1148,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         request_transfers: list[list[PoolTransfer]],
         requests: list[tuple[str, float | None]] | None = None,
         pinned: frozenset = frozenset(),
+        late_wait: Callable[[], object] | None = None,
     ) -> None:
         """``requests`` names each entry of ``request_transfers`` and when its
         load was queued; with ``log_load_timing`` each one is logged once all
         layers land. ``pinned``: rids whose sessions pin_hit already started;
-        their sessions end here with the rest."""
+        their sessions end here with the rest. ``late_wait`` (overlapped loads):
+        called before the first read of a pool whose slot indices are not on the
+        CPU; pools with CPU-known slots are read before it."""
         started = []
         began = time.monotonic()
         timed = self.log_load_timing and requests is not None
@@ -1147,6 +1163,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         spans: list[list[tuple[PoolName, int, int]]] = []
         try:
             batches: dict[PoolName, tuple[list[str], list[int]]] = {}
+            slot_sources: dict[PoolName, list] = {}
             unpinned: dict[PoolName, list[str]] = {}
             rids = [rid for rid, _ in requests] if requests else []
             pinned_keys: list[str] = []
@@ -1165,12 +1182,27 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     else:
                         unpinned.setdefault(transfer.name, []).extend(keys[first:])
                     span.append((transfer.name, first, len(keys)))
-                    locations.extend(
-                        self.pools[transfer.name].prepare_locations(
-                            transfer.host_indices
-                        )
+                    slot_sources.setdefault(transfer.name, []).append(
+                        transfer.host_indices
                     )
                 spans.append(span)
+            # A pool is read early only when every slot index it uses is on
+            # the CPU; the others wait for this batch's own GPU work.
+            late = {
+                name
+                for name, sources in slot_sources.items()
+                if late_wait is not None
+                and any(getattr(x, "device", None) is not None and x.device.type != "cpu" for x in sources)
+            }
+
+            def locate(names):
+                for name in names:
+                    for host_indices in slot_sources[name]:
+                        batches[name][1].extend(
+                            self.pools[name].prepare_locations(host_indices)
+                        )
+
+            locate([name for name in batches if name not in late])
             loaded = [0] * len(request_transfers)
             # Ends every session of the batch, the pinned ones too (a failed
             # start keeps none).
@@ -1185,9 +1217,23 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 started.append(keys)
 
             if self.load_per_key:
-                self._load_per_key(batches, spans, loaded if timed else None)
+                early = {n: v for n, v in batches.items() if n not in late}
+                if early:
+                    self._load_per_key(early, spans, loaded if timed else None)
+                if late:
+                    late_wait()
+                    self.stats["late_waits"] = self.stats.get("late_waits", 0) + 1
+                    locate(late)
+                    self._load_per_key(
+                        {n: batches[n] for n in late}, spans, loaded if timed else None
+                    )
                 for layer in range(self.num_layers):
                     self.layer_done_counter.complete(counter_index, layer)
+            elif late:
+                # Per-layer reads interleave pools: wait before the first.
+                late_wait()
+                self.stats["late_waits"] = self.stats.get("late_waits", 0) + 1
+                locate(late)
             # Per-key loads landed above; otherwise one read per layer and pool.
             for layer in () if self.load_per_key else range(self.num_layers):
                 for name, (keys, locations) in batches.items():
@@ -1280,7 +1326,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if loaded is not None:
             for index, span in enumerate(spans):
                 for pool, first, last in span:
-                    loaded[index] += sum(expected[base[pool] + first : base[pool] + last])
+                    if pool in base:
+                        loaded[index] += sum(
+                            expected[base[pool] + first : base[pool] + last]
+                        )
 
     @staticmethod
     def _log_load_timing(request_transfers, requests, loaded, began, landed):

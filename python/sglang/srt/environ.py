@@ -975,6 +975,10 @@ class Envs:
     # Currently ignored with a warning: unsafe until load slots are reserved
     # on the CPU (the slot indices are written on the GPU after that launch).
     SGLANG_LINKER_LOAD_OVERLAP = EnvBool(False)
+    # Device KV pages held out of the allocator as landing slots for external-linker
+    # loads, their ids kept on the CPU (0: off). SGLANG_LINKER_LOAD_OVERLAP takes
+    # effect only with this on: a load into these slots reads no GPU-written index.
+    SGLANG_LINKER_LOAD_RESERVE_PAGES = EnvInt(0)
     # Read a load batch in one store call, every layer of a key in one entry,
     # instead of one call per layer and pool; its layers complete together.
     SGLANG_LINKER_LOAD_PER_KEY = EnvBool(False)

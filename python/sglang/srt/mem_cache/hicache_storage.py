@@ -153,6 +153,9 @@ class PoolTransfer:
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
     nodes_to_load: Optional[List[Any]] = None
     indices_from_pool: Optional[PoolName] = None
+    # device_indices' values already on the CPU (linker load slots from the
+    # SGLANG_LINKER_LOAD_RESERVE_PAGES reserve): readers use them, not a copy.
+    cpu_indices: Optional[torch.Tensor] = None
     # BLOCK_GROUPS geometry: FULL pages per block and keys (pages) per group.
     block_pages: int = 0
     group_pages: int = 0

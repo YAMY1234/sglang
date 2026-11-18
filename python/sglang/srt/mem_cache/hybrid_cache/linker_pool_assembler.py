@@ -278,12 +278,17 @@ class DevicePoolGroup:
             if source is None or not source.keys:
                 continue
             indices = source.device_indices
+            entry = self.entry_map[name]
+            # CPU-known slots (load reserve) stay on the CPU unless an index
+            # mapper (DCP) must run on the device copy.
+            if source.cpu_indices is not None and not _maps_indices(entry):
+                indices = source.cpu_indices
             resolved.append(
                 replace(
                     source,
                     name=name,
                     host_indices=(
-                        self.entry_map[name].translate_indices(indices)
+                        entry.translate_indices(indices)
                         if indices is not None
                         else None
                     ),
@@ -297,6 +302,11 @@ class DevicePoolGroup:
                 )
             )
         return resolved
+
+
+def _maps_indices(entry) -> bool:
+    first = getattr(entry, "first", entry)
+    return getattr(first, "_index_mapper", None) is not None
 
 
 def _deepseek_v4_state_views(state_pools: list[Any], global_layers: list[int]):
