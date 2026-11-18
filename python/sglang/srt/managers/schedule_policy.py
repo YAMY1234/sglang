@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 import os
 import random
+import time
 from collections import Counter
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -612,6 +613,57 @@ class AddReqResult(Enum):
     SKIP = auto()
 
 
+class PrefillStopStats:
+    """Why each prefill pass stopped admitting, summed and logged every 60 s.
+
+    A pass is one walk of the waiting queue. `notfull` keys the stop reason of
+    each built batch that left chunk budget unspent.
+    """
+
+    def __init__(self, interval: float = 60.0):
+        self.interval = interval
+        self.last = time.monotonic()
+        self._reset()
+
+    def _reset(self):
+        self.passes = self.batches = self.full = 0
+        self.tokens = self.budget = 0
+        self.reasons = Counter()
+        self.notfull = Counter()
+
+    def note(self, reason: str, adder: "PrefillAdder", chunk_budget) -> None:
+        self.passes += 1
+        self.reasons[reason] += 1
+        if adder.can_run_list:
+            self.batches += 1
+            rem = adder.rem_chunk_tokens
+            if chunk_budget is not None and chunk_budget > 0 and rem is not None:
+                self.tokens += chunk_budget - max(rem, 0)
+                self.budget += chunk_budget
+            if (rem is not None and rem <= 0) or adder.rem_input_tokens <= 0:
+                self.full += 1
+            else:
+                self.notfull[reason] += 1
+
+    def maybe_log(self, now: float) -> None:
+        if now - self.last < self.interval:
+            return
+        if self.passes:
+            logger.info(
+                "Prefill admission stops in %.0f s: passes=%d batches=%d full=%d "
+                "fill=%.3f reasons=%s notfull=%s",
+                now - self.last,
+                self.passes,
+                self.batches,
+                self.full,
+                self.tokens / self.budget if self.budget else 0.0,
+                dict(self.reasons.most_common()),
+                dict(self.notfull.most_common()),
+            )
+        self.last = now
+        self._reset()
+
+
 @dataclass(frozen=True, slots=True)
 class _PrefillAdmission:
     prefix_len: int
@@ -705,6 +757,8 @@ class PrefillAdder:
 
         self.req_states = None
         self.can_run_list = []
+        # Why the last add_one_req refused (see PrefillStopStats).
+        self.stop_reason: Optional[str] = None
         self.preempt_list = []
         self.new_chunked_req = None
         self.log_hit_tokens = 0
@@ -974,6 +1028,24 @@ class PrefillAdder:
                 return AddReqResult.OTHER
 
         return AddReqResult.CONTINUE
+
+    def budget_stop_reason(self) -> str:
+        """Name the budget that budget_state() found spent."""
+        if not self.memory_budget.has_capacity():
+            return "kv_capacity"
+        if self.rem_mamba_slots is not None and self.rem_mamba_slots <= 0:
+            return "mamba_slot"
+        if self.rem_input_tokens <= 0 or (
+            self.rem_chunk_tokens is not None and self.rem_chunk_tokens <= 0
+        ):
+            return "token_budget"
+        if self.dllm_config is not None and self.rem_dllm_tokens <= 0:
+            return "token_budget"
+        return "other:untagged"
+
+    def _stop(self, reason: str, result: AddReqResult) -> AddReqResult:
+        self.stop_reason = reason
+        return result
 
     def _update_prefill_budget(
         self,
@@ -1496,8 +1568,9 @@ class PrefillAdder:
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
+        self.stop_reason = None
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
-            return AddReqResult.OTHER
+            return self._stop("other:max_requests", AddReqResult.OTHER)
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
@@ -1523,7 +1596,7 @@ class PrefillAdder:
                     and self.tree_cache.buffer_pipeline is not None
                 ):
                     self.tree_cache.buffer_pipeline.defer_staged_admission(req, "mamba")
-                return AddReqResult.NO_TOKEN
+                return self._stop("mamba_slot", AddReqResult.NO_TOKEN)
         request_slot_reserve = self._request_slot_reserve_for_req(req)
         total_tokens += request_slot_reserve
 
@@ -1553,7 +1626,7 @@ class PrefillAdder:
                     waiting_queue_len=self.waiting_queue_len,
                 )
             ):
-                return AddReqResult.OTHER
+                return self._stop("other:prefill_delayer", AddReqResult.OTHER)
 
             # Reserve sharded scratch before any load-back is queued: a load
             # must be consumed by this batch, whose prefix gather waits on it.
@@ -1566,7 +1639,7 @@ class PrefillAdder:
                 if not self._kv_shard_reserve_scratch(
                     prefix_len=admission.prefix_len, extend_len=admission.extend_len
                 ):
-                    return AddReqResult.OTHER
+                    return self._stop("other:kv_shard_scratch", AddReqResult.OTHER)
 
             if req.needs_host_load_back():
                 load_max_new = min(max_new, admission.max_new_tokens)
@@ -1613,7 +1686,7 @@ class PrefillAdder:
                         self._defer_staged_for_capacity_if_idle(
                             req, pool="load_back_budget"
                         )
-                        return AddReqResult.NO_TOKEN
+                        return self._stop("load_back_budget", AddReqResult.NO_TOKEN)
                     promised_host_hit = req.host_hit_length
                     loaded = self.tree_cache.init_load_back(
                         InitLoadBackParams(
@@ -1623,7 +1696,7 @@ class PrefillAdder:
                         )
                     )
                 if loaded is None:
-                    return AddReqResult.OTHER
+                    return self._stop("hole", AddReqResult.OTHER)
                 if loaded is LINKER_ADMISSION_SKIPPED:
                     if self.kv_shard_scratch_spec is not None:
                         self.kv_shard_block_bound_pages, self.kv_shard_chunk_pages = (
@@ -1689,7 +1762,7 @@ class PrefillAdder:
                 if not self._kv_shard_reserve_scratch(
                     prefix_len=admission.prefix_len, extend_len=admission.extend_len
                 ):
-                    return AddReqResult.OTHER
+                    return self._stop("other:kv_shard_scratch", AddReqResult.OTHER)
 
             self._commit_prefill_admission(req, admission, mamba_gap_reserve)
 
@@ -1720,7 +1793,7 @@ class PrefillAdder:
             # The replay rows share the chunk with the extend.
             chunk_limit -= replay_len
             if chunk_limit <= 0:
-                return AddReqResult.OTHER
+                return self._stop("token_budget", AddReqResult.OTHER)
         can_admit, chunk_tokens_limit = self._check_prefill_budget(
             req,
             extend_input_len=extend_len,
@@ -1729,7 +1802,7 @@ class PrefillAdder:
             chunk_limit=chunk_limit,
         )
         if not can_admit:
-            return AddReqResult.NO_TOKEN
+            return self._stop("kv_capacity", AddReqResult.NO_TOKEN)
 
         # Without chunking, allow the first request even above the input cap.
         if (
@@ -1737,7 +1810,7 @@ class PrefillAdder:
             and self.can_run_list
             and input_tokens >= self.rem_input_tokens
         ):
-            return AddReqResult.OTHER
+            return self._stop("token_budget", AddReqResult.OTHER)
 
         is_chunked = False
         max_new_tokens = min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
@@ -1748,7 +1821,7 @@ class PrefillAdder:
             )
             extend_len = self._get_dllm_extend_len(req, prefix_len)
             if extend_len <= 0:
-                return AddReqResult.OTHER
+                return self._stop("other:dllm_extend", AddReqResult.OTHER)
             max_new_tokens = 0
         elif chunk_tokens_limit is not None and chunk_fit_tokens > chunk_tokens_limit:
             if (
@@ -1756,7 +1829,7 @@ class PrefillAdder:
                 and get_schedule().schedule_policy == "shortest-prefill-first"
             ):
                 # Only one unfinished chunked request can be tracked.
-                return AddReqResult.OTHER
+                return self._stop("other:one_chunked_req", AddReqResult.OTHER)
             if self.exact_chunk_fill:
                 # Take the remainder verbatim so the batch hits exactly
                 # chunked_prefill_size. `chunk_fit_tokens > chunk_tokens_limit`
@@ -1777,13 +1850,13 @@ class PrefillAdder:
                 end = (prefix_len + extend_len) // self.page_size * self.page_size
                 extend_len = end - prefix_len
             if extend_len <= 0:
-                return AddReqResult.OTHER
+                return self._stop("token_budget", AddReqResult.OTHER)
             is_chunked = True
             max_new_tokens = 0
             tile_tokens = extend_len
 
         if (verdict := self._check_prefill_tile_budget(tile_tokens)) is not None:
-            return verdict
+            return self._stop("other:tile_budget", verdict)
 
         return _PrefillAdmission(
             prefix_len, extend_len, max_new_tokens, is_chunked, replay_len

@@ -11,7 +11,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.managers.schedule_policy import AddReqResult
+from sglang.srt.managers.schedule_policy import AddReqResult, PrefillStopStats
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.allocation import paged_extend_num_tokens
@@ -63,6 +63,7 @@ class _BatchBuilt(Exception):
 class TestHeldRowAdmission(CustomTestCase):
     def _scheduler(self, disaggregation_mode, running, final_chunk, waiting):
         s = Scheduler.__new__(Scheduler)
+        s.prefill_stop_stats = PrefillStopStats()
         s.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
         s.enable_priority_preemption = False
         s.is_hybrid_swa = False

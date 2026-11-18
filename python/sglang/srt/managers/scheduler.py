@@ -224,6 +224,7 @@ from sglang.srt.managers.schedule_policy import (
     WAITING_QUEUE_PREFIX_MATCH_MAX,
     AddReqResult,
     PrefillAdder,
+    PrefillStopStats,
     SchedulePolicy,
     mamba_prefill_chunk_grid,
 )
@@ -1395,6 +1396,7 @@ class Scheduler(
         self._pending_chunked_abort_req = None
         # Built PD prefill batches undone for lack of KV pages.
         self.prefill_kv_deferrals = 0
+        self.prefill_stop_stats = PrefillStopStats()
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
@@ -4603,7 +4605,11 @@ class Scheduler(
         for req in self.waiting_queue:
             # A spent pass budget admits no one, even before the first
             # candidate: the resumed chunk or mixed decode rows can spend it.
-            if chunk_parked or adder.budget_state() == AddReqResult.OTHER:
+            if chunk_parked:
+                stop_reason = "chunk_parked"
+                break
+            if adder.budget_state() == AddReqResult.OTHER:
+                stop_reason = adder.budget_stop_reason()
                 break
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 continue
@@ -4634,6 +4640,7 @@ class Scheduler(
                 if not self.enable_priority_preemption or not adder.preempt_to_schedule(
                     req
                 ):
+                    stop_reason = "req_slots"
                     break
 
             if self.enable_hicache_storage or self.enable_lmcache:
@@ -4698,10 +4705,25 @@ class Scheduler(
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added:
                     self._revert_unadmitted_mamba(req)
+                stop_reason = adder.stop_reason or adder.budget_stop_reason()
                 break
+        else:
+            # Walked the whole queue: candidates after the last admitted one
+            # were skipped (pin not ready, prefetch, LoRA, pooling mode).
+            stop_reason = (
+                "remaining_skipped"
+                if self.waiting_queue
+                and not (
+                    adder.can_run_list
+                    and self.waiting_queue[-1] is adder.can_run_list[-1]
+                )
+                else "queue_exhausted"
+            )
 
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
+        self.prefill_stop_stats.note(stop_reason, adder, chunked_prefill_size)
+        self.prefill_stop_stats.maybe_log(time.monotonic())
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list

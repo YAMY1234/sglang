@@ -13,6 +13,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
+    PrefillStopStats,
     SchedulePolicy,
     estimate_prefill_extend_tile_metrics,
 )
@@ -1685,6 +1686,45 @@ class TestPrefillAdder(CustomTestCase):
         self.mock_tree_cache.init_load_back.return_value = (24, admitted.last_node)
         adder.add_one_req(admitted, False, None)
         self.assertEqual(adder.can_run_list, [admitted])
+
+    def test_stop_reason_names_a_hole_and_the_load_back_budget(self):
+        # The scheduler logs why each pass stopped: a hole (None load_back)
+        # and a load-back budget refusal are told apart from the token budget.
+        adder = self._create_delayer_adder(available_tokens=100_000, delayer=None)
+        req = self._create_host_hit_req(host_hit=24, tail=8)
+        self.mock_tree_cache.init_load_back.return_value = None
+        self.assertIs(adder.add_one_req(req, False, None), AddReqResult.OTHER)
+        self.assertEqual(adder.stop_reason, "hole")
+        adder = self._create_delayer_adder(available_tokens=100_000, delayer=None)
+        req = self._create_host_hit_req(host_hit=24, tail=8)
+        with patch.object(
+            adder.memory_budget, "prepare_load_back", return_value=False
+        ):
+            self.assertIs(adder.add_one_req(req, False, None), AddReqResult.NO_TOKEN)
+        self.assertEqual(adder.stop_reason, "load_back_budget")
+        self.mock_tree_cache.init_load_back.return_value = (24, req.last_node)
+        self.assertIs(adder.add_one_req(req, False, None), AddReqResult.CONTINUE)
+        self.assertIsNone(adder.stop_reason)
+
+    def test_stop_stats_count_passes_full_batches_and_reasons(self):
+        stats = PrefillStopStats(interval=60.0)
+        adder = self.create_adder(self.create_running_batch(), rem_chunk_tokens=0)
+        adder.can_run_list = [MagicMock()]
+        stats.note("token_budget", adder, 64)
+        adder = self.create_adder(self.create_running_batch(), rem_chunk_tokens=40)
+        adder.can_run_list = [MagicMock()]
+        stats.note("hole", adder, 64)
+        adder.can_run_list = []
+        stats.note("remaining_skipped", adder, 64)
+        self.assertEqual((stats.passes, stats.batches, stats.full), (3, 2, 1))
+        self.assertEqual(stats.notfull, {"hole": 1})
+        self.assertEqual((stats.tokens, stats.budget), (64 + 24, 128))
+        with self.assertLogs(
+            "sglang.srt.managers.schedule_policy", level="INFO"
+        ) as logs:
+            stats.maybe_log(stats.last + 61)
+        self.assertIn("Prefill admission stops in 61 s: passes=3", logs.output[0])
+        self.assertEqual(stats.passes, 0)
 
     def test_successful_load_back_commits_the_selected_shape_once(self):
         cases = (

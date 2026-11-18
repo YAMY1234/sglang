@@ -15,6 +15,7 @@ from sglang.test.test_utils import (
 maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.schedule_batch import NextBatchPlan
+from sglang.srt.managers.schedule_policy import PrefillStopStats
 from sglang.srt.managers.scheduler import Scheduler
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -25,6 +26,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         self.calls = Mock()
         self.scheduler = s = Scheduler.__new__(Scheduler)
         s.scheduler_stage_metrics = None
+        s.prefill_stop_stats = PrefillStopStats()
         s.enable_hierarchical_cache = True
         s.enable_unified_cache_external_linker = False
         s.enable_lmcache = False
