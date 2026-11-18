@@ -338,6 +338,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             or self.load_overlap
             or self.num_load_threads > 1
         )
+        logger.info(
+            "Mooncake linker load mode: overlap=%s per_key=%s threads=%d "
+            "session_refcount=%s",
+            self.load_overlap,
+            self.load_per_key,
+            self.num_load_threads,
+            self.count_sessions,
+        )
         self.prepin_renewals = 0
         self.stats_logged_at = time.monotonic()
         # Store-side state path cap: each state this rank wrote -> the deepest
