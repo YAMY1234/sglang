@@ -600,6 +600,14 @@ class SchedulerDisaggregationPrefillMixin:
             req.prefix_len = req.extend_end
             return
 
+        if getattr(req, "disagg_settle_deferred", False) and hasattr(
+            cache, "defer_device_frees"
+        ):
+            sink = getattr(req, "disagg_deferred_frees", None) or []
+            with cache.defer_device_frees(sink):
+                checkpoint_kv_cache(req, cache)
+            req.disagg_deferred_frees = sink
+            return
         checkpoint_kv_cache(req, cache)
 
     def release_aborted_prefill_waiting_req(self: Scheduler, req: Req) -> None:
@@ -1241,6 +1249,7 @@ class SchedulerDisaggregationPrefillMixin:
                 if not isinstance(req.finished_reason, FINISH_ABORT):
                     req.finished_reason = FINISH_LENGTH(length=0)
                 # unlock the tree
+                self._apply_deferred_frees(req)
                 release_kv_cache(req, self.tree_cache, checkpoint=True)
                 self.tree_cache.finish(
                     req.cache_request_handle, CacheRequestOutcome.SUCCESS
@@ -1250,6 +1259,7 @@ class SchedulerDisaggregationPrefillMixin:
                 done_reqs.append(req)
                 req.time_stats.set_prefill_kv_transfer_finish_time()
             elif poll == KVPoll.Failed:
+                self._apply_deferred_frees(req)
                 self.handle_inflight_transfer_failure(req)
                 done_reqs.append(req)
             else:
@@ -1340,6 +1350,7 @@ class SchedulerDisaggregationPrefillMixin:
     def _retire_aborted_prefill_result(self: Scheduler, req: Req) -> bool:
         """Release an aborted request when its last prefill result is safe."""
         self._settle_early_sent_last_chunk(req, forget=True)
+        self._apply_deferred_frees(req)
         self.clear_pending_chunk_send(req)
         owns_resources = (
             req.kv.holds_kv or req.kv.holds_mamba or req.metadata_buffer_index >= 0
@@ -1640,8 +1651,35 @@ class SchedulerDisaggregationPrefillMixin:
     def _pp_pd_settle_early_sends(self: Scheduler, batch: ScheduleBatch) -> None:
         """Before batch's result: its early-sent transfers must end on this stage, as
         the result's radix checkpoint (dedup) or abort release may free their pages."""
+        defer = envs.SGLANG_PP_PD_DEFER_EARLY_SETTLE.get()
         for req in batch.reqs:
+            if (
+                defer
+                and req.rid in self.disagg_prefill_early_sent_rids
+                and not self._early_send_ended(req)
+            ):
+                # The result runs now; its checkpoint frees wait for the transfer.
+                req.disagg_settle_deferred = True
+                self.disagg_prefill_early_send_stats["deferred"] = (
+                    self.disagg_prefill_early_send_stats.get("deferred", 0) + 1
+                )
+                continue
             self._settle_early_sent_last_chunk(req)
+
+    @staticmethod
+    def _early_send_ended(req: Req) -> bool:
+        kv_mgr = req.disagg_kv_sender.kv_mgr
+        room = req.bootstrap_room
+        return (
+            kv_mgr.request_status.get(room) in (None, KVPoll.Success, KVPoll.Failed)
+            and kv_mgr._staging_outstanding.get(room, 0) <= 0
+        )
+
+    def _apply_deferred_frees(self: Scheduler, req: Req) -> None:
+        frees = getattr(req, "disagg_deferred_frees", None)
+        if frees:
+            self.tree_cache.apply_deferred_frees(frees)
+        req.disagg_deferred_frees = None
 
     def _settle_early_sent_last_chunk(
         self: Scheduler, req: Req, forget: bool = False
@@ -1672,6 +1710,9 @@ class SchedulerDisaggregationPrefillMixin:
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
     ) -> None:
+        if last_chunk and getattr(req, "disagg_settle_deferred", False):
+            self.disagg_prefill_early_sent_rids.discard(req.rid)
+            return  # Sent at forward completion; its frees wait in the inflight queue.
         if last_chunk and self._settle_early_sent_last_chunk(req, forget=True):
             return  # Sent when this stage's forward of it completed.
         computer: Optional[KvChecksumComputer] = self.kv_checksum_computer

@@ -1769,7 +1769,27 @@ class UnifiedRadixCache(BasePrefixCache):
         finally:
             actions.reverse()
 
+    @contextlib.contextmanager
+    def defer_device_frees(self, sink: list):
+        """Collect device KV / slot frees into ``sink`` instead of freeing; the
+        caller applies them with ``apply_deferred_frees`` once nothing reads them."""
+        prev = getattr(self, "_deferred_free_sink", None)
+        self._deferred_free_sink = sink
+        try:
+            yield sink
+        finally:
+            self._deferred_free_sink = prev
+
+    def apply_deferred_frees(self, sink: list) -> None:
+        self._apply_cache_actions(sink)
+
     def _apply_cache_action(self, action: CacheAction | ComponentAction) -> None:
+        sink = getattr(self, "_deferred_free_sink", None)
+        if sink is not None and isinstance(
+            action, (FreeDeviceKV, FreeDeviceKVFullOnly, FreeComponentDeviceSlot)
+        ):
+            sink.append(action)
+            return
         # Component actions route to their component class; the rest are
         # cache-owned and handled here by type.
         if isinstance(action, ComponentAction):

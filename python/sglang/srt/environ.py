@@ -800,6 +800,9 @@ class Envs:
     # >0: KV transfer workers wait on CUDA events/streams by query() + sleep of this many us
     # instead of a spinning synchronize(), so the waiting thread leaves the CPU to the scheduler.
     SGLANG_DISAGG_TRANSFER_POLL_WAIT_US = EnvInt(0)
+    # PP PD prefill: an early-sent last chunk still in transfer does not block the result; the
+    # checkpoint's device frees for that request wait until its transfer ends (default off).
+    SGLANG_PP_PD_DEFER_EARLY_SETTLE = EnvBool(False)
     # Prefill KV exhaustion. The two K31 switches are sgl-project/sglang#50040's
     # (default off there): park a chunked continuation whose KV budget is spent
     # (#44823) instead of forcing a full chunk into a full pool, and, under

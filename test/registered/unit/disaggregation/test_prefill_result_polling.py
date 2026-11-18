@@ -1236,5 +1236,78 @@ class TestPPPrefillEarlySend(CustomTestCase):
                 self.assertFalse(stage._pp_pd_early_send_enabled())
 
 
+class TestDeferredEarlySettle(CustomTestCase):
+    """SGLANG_PP_PD_DEFER_EARLY_SETTLE: a result does not wait for its early-sent last
+    chunk; the checkpoint's device frees wait in the inflight queue instead."""
+
+    @staticmethod
+    def _req(status):
+        kv_mgr = SimpleNamespace(request_status={7: status}, _staging_outstanding={})
+        return SimpleNamespace(
+            rid="r", bootstrap_room=7, disagg_kv_sender=SimpleNamespace(kv_mgr=kv_mgr)
+        )
+
+    def _scheduler(self, cache=None):
+        mixin = SchedulerDisaggregationPrefillMixin
+        sched = SimpleNamespace(
+            disagg_prefill_early_sent_rids={"r"},
+            disagg_prefill_early_send_stats={"early": 1, "waited": 0},
+            _settle_early_sent_last_chunk=Mock(return_value=True),
+            _send_kv_chunk=Mock(),
+            kv_checksum_computer=None,
+            tree_cache=cache,
+        )
+        sched._early_send_ended = mixin._early_send_ended
+        sched._apply_deferred_frees = lambda req: mixin._apply_deferred_frees(sched, req)
+        return sched
+
+    def test_result_does_not_wait_and_last_chunk_is_not_resent(self):
+        mixin = SchedulerDisaggregationPrefillMixin
+        for enabled, status, deferred in (
+            (True, KVPoll.Transferring, True),
+            (True, KVPoll.Success, False),
+            (False, KVPoll.Transferring, False),
+        ):
+            with self.subTest(enabled=enabled, status=status):
+                sched, req = self._scheduler(), self._req(status)
+                with envs.SGLANG_PP_PD_DEFER_EARLY_SETTLE.override(enabled):
+                    mixin._pp_pd_settle_early_sends(sched, SimpleNamespace(reqs=[req]))
+                self.assertEqual(getattr(req, "disagg_settle_deferred", False), deferred)
+                self.assertEqual(sched._settle_early_sent_last_chunk.called, not deferred)
+                if deferred:
+                    mixin.send_kv_chunk(sched, req, last_chunk=True)
+                    sched._send_kv_chunk.assert_not_called()
+                    sched._settle_early_sent_last_chunk.assert_not_called()
+                    self.assertNotIn("r", sched.disagg_prefill_early_sent_rids)
+
+    def test_checkpoint_frees_are_held_until_the_transfer_ends(self):
+        from sglang.srt.mem_cache.unified_cache.cache_action import FreeDeviceKV
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache as URC
+
+        cache = SimpleNamespace(token_to_kv_pool_allocator=Mock())
+        cache._apply_cache_action = lambda a: URC._apply_cache_action(cache, a)
+        cache._apply_cache_actions = lambda a: URC._apply_cache_actions(cache, a)
+        cache.defer_device_frees = lambda sink: URC.defer_device_frees(cache, sink)
+        cache.apply_deferred_frees = lambda sink: URC.apply_deferred_frees(cache, sink)
+        dup = torch.arange(64)
+
+        def checkpoint(req, c):  # the insert finds the prefix in the tree: free the copy
+            c._apply_cache_actions([FreeDeviceKV(indices=[dup])])
+
+        sched = self._scheduler(cache)
+        req = SimpleNamespace(pending_bootstrap=False, disagg_settle_deferred=True)
+        with patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache", checkpoint):
+            SchedulerDisaggregationPrefillMixin.checkpoint_disagg_prefill(sched, req)
+        free = cache.token_to_kv_pool_allocator.free_segment
+        free.assert_not_called()
+        self.assertEqual(len(req.disagg_deferred_frees), 1)
+        sched._apply_deferred_frees(req)  # the inflight queue saw Success or Failed
+        free.assert_called_once_with(dup, start_pos=0)
+        self.assertIsNone(req.disagg_deferred_frees)
+        # outside the deferral, frees go straight to the allocator
+        cache._apply_cache_actions([FreeDeviceKV(indices=[dup])])
+        self.assertEqual(free.call_count, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
