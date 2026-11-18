@@ -784,6 +784,9 @@ class Envs:
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)
+    # Rig only: FakeKVSender takes Mooncake's non-blocking index readback, so a
+    # microbenchmark does not pay the .cpu() sync production never pays.
+    SGLANG_DISAGG_FAKE_SENDER_ASYNC_INDICES = EnvBool(False)
     # PD decode: cap the KV held by reservations whose prefill KV has not arrived
     # (transfer queue, the "pre-allocated usage" log field) at this fraction of
     # the pool; 0 disables. One reservation is always allowed.
