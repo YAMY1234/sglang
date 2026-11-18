@@ -545,6 +545,8 @@ class UnifiedCacheLinkerWrapper:
                 "state_capped",
                 "published",
                 "aborted",
+                "timeout_load",
+                "timeout_lookup",
             ),
             0,
         )
@@ -1387,6 +1389,7 @@ class UnifiedCacheLinkerWrapper:
                 if state.wait_started is None:
                     state.wait_started = now
                 return False
+            self._lookup_stats["timeout_load"] += 1
         # Consume any fully completed read before stopping. Running reads keep
         # their private slots until every rank has stopped writing to them.
         # Admission polls this: start no new load here.
@@ -1413,6 +1416,7 @@ class UnifiedCacheLinkerWrapper:
                 if lookup.wait_started is None:
                     lookup.wait_started = now
                 return False
+            self._lookup_stats["timeout_lookup"] += 1
         self._cancel_lookup(request)
         return True
 
