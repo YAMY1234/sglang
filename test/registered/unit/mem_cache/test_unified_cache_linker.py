@@ -2640,6 +2640,97 @@ def test_pp_offload_counts_piggyback_requires_the_relayed_row():
         later.check_hicache_events()
 
 
+class _FakeConsensusStore:
+    """PPConsensusStore stand-in: every rank's map, PP0 collects them all."""
+
+    def __init__(self, maps, rank):
+        self.maps, self.rank = maps, rank
+
+    def __setitem__(self, key, value):
+        self.maps[self.rank][key] = value
+
+    def pop(self, key, default=None):
+        return self.maps[self.rank].pop(key, default)
+
+    def collect(self, key):
+        return [m.get(key) for m in self.maps]
+
+
+def _consensus_stages(size, finished):
+    """Relays of ``size`` stages over one fake store; ``finished[r]`` is the list
+    of offload outcomes rank r's backend completes (handed out on demand)."""
+    from sglang.srt.mem_cache.unified_cache.pp_linker_relay import PPLinkerRelay
+
+    maps = [dict() for _ in range(size)]
+    stages = []
+    for rank in range(size):
+        log = {"waited": [], "committed": []}
+        queue_ = list(finished[rank])
+        w = SimpleNamespace(pp_rank=rank, pp_size=size)
+        w.num_completed_offloads = lambda q=queue_: len(q)
+        w.take_completed_offloads = lambda n, q=queue_: [q.pop(0) for _ in range(n)]
+        w.wait_completed_offloads = log["waited"].append
+        w.commit_completed_offloads = lambda s, log=log: log["committed"].append(list(s))
+        relay = PPLinkerRelay(w)
+        relay.attach_store(_FakeConsensusStore(maps, rank))
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.pp_size, cache.pp_rank = size, rank
+        cache.pp_counts_consensus = True
+        cache.linker = SimpleNamespace(pp_relay=relay)
+
+        def no_pp_comm(*args):
+            raise AssertionError("consensus mode must not touch the PP chain")
+
+        cache._drain_async_work = no_pp_comm
+        cache._all_reduce = no_pp_comm
+        stages.append((cache, relay, log, queue_))
+    return stages, maps
+
+
+def _consensus_step(stages):
+    """One loop iteration: every stage reports (PP0 also decides), then PP0's
+    actions are delivered to every stage in order. Later stages run first so PP0
+    sees this iteration's posts (in a server they land a step later)."""
+    for cache, *_ in reversed(stages):
+        cache._check_linker_events_pp()
+    actions = stages[0][1].take_actions()
+    if actions is not None:
+        for _, relay, _, _ in stages:
+            relay.receive(actions.actions)
+
+
+def test_pp_offload_consensus_commits_the_min_without_waiting():
+    # SGLANG_LINKER_PP_COUNTS_CONSENSUS: PP0 commits only what every stage has
+    # finished; a lagging stage holds the commit back instead of blocking.
+    stages, _ = _consensus_stages(3, [[True] * 3, [True] * 3, [True]])
+    _consensus_step(stages)
+    assert [log["committed"] for _, _, log, _ in stages] == [[[True]]] * 3
+    stages[2][3].extend([True, True])  # the lagging stage's puts land
+    _consensus_step(stages)
+    assert [log["committed"] for _, _, log, _ in stages] == [[[True], [True, True]]] * 3
+    assert all(not log["waited"] for _, _, log, _ in stages)
+    _consensus_step(stages)  # nothing new: no action, nothing committed
+    assert [len(log["committed"]) for _, _, log, _ in stages] == [2, 2, 2]
+
+
+def test_pp_offload_consensus_verdict_is_the_and_across_stages():
+    stages, maps = _consensus_stages(3, [[True, True, True], [True, False, True], [False, True, True]])
+    _consensus_step(stages)
+    assert [log["committed"] for _, _, log, _ in stages] == [[[False, False, True]]] * 3
+    # Committed failure votes are cleared from the store.
+    assert all(not any(k.startswith("lko0:") for k in m) for m in maps)
+
+
+def test_pp_offload_consensus_commit_order_follows_the_absolute_head():
+    stages, _ = _consensus_stages(2, [[True, False], [True]])
+    _consensus_step(stages)
+    stages[1][3].append(True)
+    _consensus_step(stages)
+    for _, relay, log, _ in stages:
+        assert log["committed"] == [[True], [False]]
+        assert relay.offload_head == 2 and relay.offload_results == []
+
+
 @pytest.mark.parametrize("swa_stored", [True, False], ids=["stored", "unstored"])
 @pytest.mark.parametrize(
     "completion", [True, False, None], ids=["success", "failure", "reset"]
