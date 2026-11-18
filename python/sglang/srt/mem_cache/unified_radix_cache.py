@@ -234,6 +234,11 @@ class UnifiedRadixCache(BasePrefixCache):
     _l3_tombstone_quarantined_ops: frozenset[int] = frozenset()
     # Final stats at SIGTERM / exit under SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT.
     _l3_tier_final: Optional[WriteOnHostEvictFinalStats] = None
+    # SGLANG_HICACHE_L3_ACK_LAG_STEPS on a PP>1 cache-mode PP0 (else 0); see
+    # _lag_backup_ack_count. Cumulative counts of this rank's ack_backup_queue.
+    _l3_ack_lag_steps: int = 0
+    _l3_ack_lag_hist: Optional[deque] = None
+    _l3_ack_removed: int = 0
 
     def __init__(
         self,
@@ -618,6 +623,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self._write_behind_inflight.clear()
         self._write_behind_mamba_inflight.clear()
         self._write_behind_clean_tokens = 0
+        self._reset_ack_lag()
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.reset()
             # The dropped writes' content no longer reaches a storage ack.
@@ -709,6 +715,7 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         self._l3_wb_ack_credit = envs.SGLANG_HICACHE_L3_WB_ACK_CREDIT.get()
         self._l3_wb_walk_every = max(1, envs.SGLANG_HICACHE_L3_WB_WALK_EVERY.get())
+        self._init_ack_lag()
         self._l3_write_state_on_tombstone = (
             envs.SGLANG_HICACHE_L3_WRITE_STATE_ON_TOMBSTONE.get()
         )
@@ -1962,6 +1969,8 @@ class UnifiedRadixCache(BasePrefixCache):
         with ack_queue.mutex:
             ack_queue.queue.remove(operation)
             ack_queue.not_full.notify()
+        if self._l3_ack_lag_steps:
+            self._l3_ack_removed += 1
         self.ongoing_backup.pop(operation_id)
         self.dec_host_lock_ref(node_id, lock_params)
 
@@ -4155,7 +4164,9 @@ class UnifiedRadixCache(BasePrefixCache):
         write_back = self._storage_write_back
         acks_taken_at_entry = 0 if write_back is None else write_back.acks_taken
 
-        def _drain_queue(q: Queue[T], n: Optional[int]) -> Iterator[T]:
+        def _drain_queue(
+            q: Queue[T], n: Optional[int], timed: bool = False
+        ) -> Iterator[T]:
             """If n is None, consume all items from the queue.
             Otherwise, consume n items from the queue.  Blocking if there are no enough n items.
 
@@ -4172,7 +4183,13 @@ class UnifiedRadixCache(BasePrefixCache):
                 for _ in range(n):
                     # Block when there are not enough elements.
                     # All TP/PP ranks must consume the same number of elements.
-                    item = q.get()
+                    if timed:
+                        blocked = q.empty()
+                        t0 = time.perf_counter()
+                        item = q.get()
+                        pmicro_hoststats.note_ack_get(time.perf_counter() - t0, blocked)
+                    else:
+                        item = q.get()
                     yield item
 
         buffer_mode = self.host_memory_mode == "buffer_only"
@@ -4390,7 +4407,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 # front; they count against the n agreed before it.
                 n = max(0, n - (write_back.acks_taken - acks_taken_at_entry))
             write_back_acks = []
-            for operation in _drain_queue(cc.ack_backup_queue, n):
+            for operation in _drain_queue(
+                cc.ack_backup_queue, n, timed=pmicro_hoststats.ON
+            ):
                 if (
                     operation.id in self._l3_tombstone_quarantined_ops
                     or getattr(operation, "l3_tombstone_quarantined", False)
@@ -4441,6 +4460,8 @@ class UnifiedRadixCache(BasePrefixCache):
                     self.storage_metrics_collector.log_backuped_tokens(
                         operation.completed_tokens
                     )
+            if self._l3_ack_lag_steps:
+                self._l3_ack_removed += drained
             if write_back_acks:
                 # n is None only on the unsynchronized detach/shutdown drain.
                 write_back.on_backup_acks(write_back_acks, synced=n is not None)
@@ -4539,6 +4560,7 @@ class UnifiedRadixCache(BasePrefixCache):
             },
             log_metrics=False,
         )
+        self._reset_ack_lag()
 
     # ---- HiCache: Storage backend lifecycle (delegated) ----
 
@@ -4598,6 +4620,44 @@ class UnifiedRadixCache(BasePrefixCache):
 
     # ---- HiCache: Async Event Management ----
 
+    def _init_ack_lag(self) -> None:
+        # Only PP0 of a cache-mode pipeline: its counts are the ones relayed down.
+        ack_lag = max(0, envs.SGLANG_HICACHE_L3_ACK_LAG_STEPS.get())
+        if (
+            ack_lag
+            and self.pp_size > 1
+            and self.pp_rank == 0
+            and self.host_memory_mode != "buffer_only"
+        ):
+            self._l3_ack_lag_steps = ack_lag
+            self._l3_ack_lag_hist = deque(maxlen=ack_lag + 1)
+            logger.info(
+                "HiCache L3: PP0 publishes storage write acks %d steps after they "
+                "are ready (SGLANG_HICACHE_L3_ACK_LAG_STEPS).",
+                ack_lag,
+            )
+
+    def _reset_ack_lag(self) -> None:
+        # The queue was emptied or replaced: restart the cumulative counts at it.
+        if self._l3_ack_lag_hist is not None:
+            self._l3_ack_lag_hist.clear()
+            self._l3_ack_removed = 0
+
+    def _lag_backup_ack_count(self, ready: int) -> int:
+        """SGLANG_HICACHE_L3_ACK_LAG_STEPS: the ack_backup_queue count to publish.
+
+        The queue is FIFO and every removal is counted, so ready + removed is the
+        cumulative number of acks that ever became ready here. Publishing that
+        cumulative from D steps ago minus removed releases only acks ready for at
+        least D steps; later PP stages issued the same puts at the same step and
+        drain this same relayed count, so their q.get() rarely blocks.
+        """
+        hist = self._l3_ack_lag_hist
+        hist.append(ready + self._l3_ack_removed)
+        if len(hist) < hist.maxlen:
+            return 0
+        return max(0, min(hist[0] - self._l3_ack_removed, ready))
+
     def _count_ready_acks(self, ack_queue) -> int:
         ready_count = 0
         for ack in ack_queue:
@@ -4635,6 +4695,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 if self.enable_storage
                 else ()
             )
+            if self._l3_ack_lag_steps and storage_queue_sizes:
+                lagged = self._lag_backup_ack_count(storage_queue_sizes[2])
+                storage_queue_sizes = (
+                    storage_queue_sizes[:2] + (lagged,) + storage_queue_sizes[3:]
+                )
 
         # Piggybacked TP check: [digest, -digest] MIN-reduces to [min, -max],
         # equal iff reclaim victim order matched on every rank.

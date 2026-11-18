@@ -970,6 +970,17 @@ class TestPMicroD2HAndPutStats(CustomTestCase):
             "ms_sum=0.0 l3_attrib_ms=0.0 other_ms=0.0",
         )
 
+    def test_ops_line_has_ack_drain_block_time_before_d2h(self):
+        hs.take_ackdrain_field()
+        hs.note_ack_get(0.002, True)
+        hs.note_ack_get(0.0005, False)
+        with patch.object(hs, "_ops_window_start", 0.0):
+            line = hs.take_ops_line(100.0)
+        self.assertIn(
+            " | ackdrain n=2 blocked=1 block_ms=2.5 max_ms=2.000 | d2h n=", line
+        )
+        self.assertIsNotNone(self.HOSTFREE.search(line), line)
+
     def test_l3_pending_counts_write_behind_and_write_back_writes(self):
         cache = _cache()
         cache._write_behind_inflight = {1: 128, 2: 64}

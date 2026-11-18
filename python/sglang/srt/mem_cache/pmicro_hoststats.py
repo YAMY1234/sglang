@@ -4,6 +4,17 @@ Host-side ints and time.perf_counter() samples only: no tensor reads beyond CPU
 host indices, no device sync. The scheduler flushes them as one PMICRO_HOSTSTAT
 line per launch and one PMICRO_HOSTOPS line per OPS_INTERVAL_S.
 
+After the per-op fields comes the counted L3 write-ack drain:
+
+  ... | ackdrain n= blocked= block_ms= max_ms= | ...
+
+ackdrain: q.get() calls of the synchronized ack_backup_queue drain, which takes
+  exactly the count relayed from PP0 and blocks until this rank has that many
+  acks (all ranks must release the same acks). n = gets, blocked = gets that
+  found the queue empty, block_ms = their summed host wall time (all gets),
+  max_ms = the longest one. Near zero on PP0; on later stages it is the time
+  the pipeline waits on this stage's own L3 puts.
+
 The PMICRO_HOSTOPS line ends with the eviction D2H copies and the L3 puts:
 
   ... | d2h n= ms_sum= p50_ms= p90_ms= gbps= | put n= ms_sum= p50_ms= p90_ms=
@@ -192,14 +203,40 @@ def take_ops_line(now: float):
     if window < OPS_INTERVAL_S:
         return None
     _ops_window_start = now
-    line = "PMICRO_HOSTOPS window_s=%.1f | %s | %s" % (
+    line = "PMICRO_HOSTOPS window_s=%.1f | %s | %s | %s" % (
         window,
         " | ".join(op.fmt(name) for name, op in OPS.items()),
+        take_ackdrain_field(),
         take_l3_fields(now - window, now),
     )
     line += " | " + take_hostfree_fields()
     for op in OPS.values():
         op.reset()
+    return line
+
+
+# ---- Synchronized L3 write-ack drain (after the per-op fields) ----
+
+_ackdrain = dict(n=0, blocked=0, sum_s=0.0, max_s=0.0)
+
+
+def note_ack_get(seconds: float, blocked: bool) -> None:
+    a = _ackdrain
+    a["n"] += 1
+    a["blocked"] += int(blocked)
+    a["sum_s"] += seconds
+    a["max_s"] = max(a["max_s"], seconds)
+
+
+def take_ackdrain_field() -> str:
+    a = _ackdrain
+    line = "ackdrain n=%d blocked=%d block_ms=%.1f max_ms=%.3f" % (
+        a["n"],
+        a["blocked"],
+        a["sum_s"] * 1e3,
+        a["max_s"] * 1e3,
+    )
+    a.update(n=0, blocked=0, sum_s=0.0, max_s=0.0)
     return line
 
 

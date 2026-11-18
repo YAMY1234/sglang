@@ -946,6 +946,9 @@ class Envs:
     SGLANG_HICACHE_STORAGE_WRITE_BACK_MAX_INFLIGHT_FRACTION = EnvFloat(0.04)
     # Pages per storage IO call (one NIXL transfer per service carries all of them).
     SGLANG_HICACHE_STORAGE_BATCH_PAGES = EnvInt(128)
+    # PP>1: PP0 publishes only L3 write acks it had ready this many scheduler steps ago,
+    # so later stages rarely block in the drain on their own puts. 0 (default): no lag.
+    SGLANG_HICACHE_L3_ACK_LAG_STEPS = EnvInt(0)
     # Cache mode: write L3 from the coldest L2 pages ahead of eviction instead of at
     # L2 admission, so the two tiers hold different pages. The Rust tree core needs
     # an extension with peek_host_eviction_candidates.
