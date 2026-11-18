@@ -1,5 +1,7 @@
 import queue
 import sys
+from concurrent.futures import Future
+from typing import NamedTuple
 import threading
 import time
 import unittest
@@ -40,6 +42,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     LinkerTransferPhase,
 )
 from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
+from sglang.srt.mem_cache.unified_cache.pp_linker_relay import PPLinkerRelay
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     LinkerAdmissionVerdicts,
     LINKER_ADMISSION_SKIPPED,
@@ -2780,6 +2783,328 @@ class TestOffloadReadyEvents(CustomTestCase):
             ],
         )
         self.assertTrue(linker.offload_results.get_nowait())
+
+
+# ---- prefetch mode (SGLANG_LINKER_LOAD_MODE=prefetch, GLM's model) ----
+
+
+def _done(value):
+    future = Future()
+    future.set_result(value)
+    return future
+
+
+def _prefetch_wrapper(components, backend, **cache_kwargs):
+    cache = _cache_for_wrapper(
+        _components_tuple=tuple(components),
+        components={c.component_type: c for c in components},
+        tree_core=SimpleNamespace(enable_external_cache_linker=False, is_eagle=False),
+        page_size=2,
+        _all_reduce_attn_groups=lambda value, op: None,
+        get_last_hash_value=lambda node: f"anchor-{node}",
+        token_to_kv_pool_allocator=SimpleNamespace(size_full=1000),
+        req_to_token_pool=SimpleNamespace(),
+        tp_world_size=1,
+        inc_lock_ref=lambda node_id: SimpleNamespace(to_dec_params=lambda: "lock"),
+        dec_lock_ref=MagicMock(),
+        **cache_kwargs,
+    )
+    with envs.SGLANG_LINKER_LOAD_MODE.override("prefetch"):
+        return UnifiedCacheLinkerWrapper(cache, backend)
+
+
+def _state_component(freed):
+    def build_transfer(phase, node, keys):
+        transfer = PoolTransfer(name=PoolName.MAMBA, keys=[keys[-1]])
+        if phase == LinkerTransferPhase.LOAD:
+            transfer.device_indices = torch.tensor([7])
+        return transfer
+
+    def update(phase, req, full_transfer, transfer, prefix_len):
+        freed.append((PoolName.MAMBA, phase))
+
+    return SimpleNamespace(
+        component_type=ComponentType.MAMBA,
+        build_external_linker_transfer=build_transfer,
+        update_external_linker_load=update,
+    )
+
+
+class _PrefetchLinker(_CountingLinker):
+    def __init__(self, landed=True):
+        super().__init__(restorable=[2])
+        self.landed = landed
+        self.prefetched = []
+
+    def prefetch(self, transfers):
+        self.prefetched.append(list(transfers))
+        return _done(self.landed)
+
+
+def test_prefetch_mode_is_off_by_default(full_linker_component):
+    backend = _CountingLinker(restorable=[2])
+    wrapper = _match_wrapper(full_linker_component, backend)
+    assert wrapper.load_mode == "layer_wise"
+    # Off, prefetch() touches neither the request nor the store.
+    assert wrapper.prefetch(SimpleNamespace()) is None
+    wrapper.check_prefetch_events()
+    assert not wrapper.has_pending_prefetch()
+    wrapper.match(_KEY, SimpleNamespace(rid="r"), _device_result(0))
+    assert backend.lookups == 1
+
+
+def test_prefetch_mode_matches_only_published_device_kv(full_linker_component):
+    backend = _PrefetchLinker()
+    wrapper = _prefetch_wrapper([full_linker_component], backend)
+    result = _device_result(2)
+    assert wrapper.match(_KEY, SimpleNamespace(rid="r"), result) is result
+    assert backend.lookups == 0
+
+
+def test_prefetch_state_cap_bounds_reads_holding_a_state_slot(full_linker_component):
+    backend = _PrefetchLinker()
+    with envs.SGLANG_LINKER_PREFETCH_MAX_STATES.override(1):
+        wrapper = _prefetch_wrapper(
+            [full_linker_component, _state_component([])], backend
+        )
+    handles = [_Handle("a"), _Handle("b")]
+    for handle in handles:
+        wrapper._start_prefetch_load(
+            handle, _KEY, ["h1", "h2", "h3"], 0, 0, "lock", [2], 1.0
+        )
+    assert list(wrapper.prefetches) == handles[:1]
+    assert wrapper._lookup_stats["state_capped"] == 1
+    wrapper.cache.dec_lock_ref.assert_called_once_with(0, "lock")
+    assert len(backend.prefetched) == 1
+
+
+@pytest.mark.parametrize("landed", [True, False])
+def test_prefetch_publishes_a_landed_read_and_frees_a_failed_one(
+    full_linker_component, landed
+):
+    freed = []
+    backend = _PrefetchLinker(landed=landed)
+    inserted = []
+    wrapper = _prefetch_wrapper(
+        [full_linker_component, _state_component(freed)],
+        backend,
+        path_device_indices=lambda node: torch.tensor([], dtype=torch.int64),
+        insert=lambda params: inserted.append(params) or SimpleNamespace(mamba_exist=False),
+        prefetch_loaded_tokens_by_reqid={},
+        prefetch_loaded_storage_start_by_reqid={},
+    )
+    wrapper.cache.req_to_token_pool = SimpleNamespace(
+        mamba_pool=SimpleNamespace(replayssm_write_pos=None)
+    )
+    handle = _Handle("a")
+    wrapper._start_prefetch_load(handle, _KEY, ["h1", "h2", "h3"], 0, 0, "lock", [2], 1.0)
+    wrapper.check_prefetch_events()
+    assert not wrapper.prefetches
+    if landed:
+        (params,) = inserted
+        assert len(params.key) == 4 and params.prev_prefix_len == 0
+        assert params.inserted_len == 4 and torch.equal(params.mamba_value, torch.tensor([7]))
+        assert wrapper.cache.prefetch_loaded_tokens_by_reqid[handle] == 4
+        assert freed == []
+    else:
+        assert inserted == []
+        assert freed == [(PoolName.MAMBA, ExternalLinkerLoadPhase.ABORT)]
+    # The anchor lock taken at lookup is released either way.
+    wrapper.cache.dec_lock_ref.assert_called_once_with(0, "lock")
+
+
+class _Handle(NamedTuple):
+    rid: str
+
+
+class _VoteStore:
+    """PPConsensusStore stand-in: every rank's map, collected on PP0."""
+
+    def __init__(self, maps, rank):
+        self.maps, self.rank = maps, rank
+
+    def __setitem__(self, key, value):
+        self.maps[self.rank][key] = value
+
+    def pop(self, key, default=None):
+        return self.maps[self.rank].pop(key, default)
+
+    def collect(self, key):
+        return [m.get(key) for m in self.maps]
+
+
+class _RelayWrapper:
+    def __init__(self, rank, size):
+        self.pp_rank, self.pp_size = rank, size
+        self.lookups, self.prefetches = {}, {}
+        self.cache = SimpleNamespace(page_size=2, dec_lock_ref=MagicMock())
+        self._draining_lookups = False
+        self.started, self.finished, self.cancelled = [], [], []
+
+    def _start_prefetch_load(self, handle, key, hashes, start, anchor, lock, restorable, timeout):
+        self.started.append((handle, restorable))
+        self.prefetches[handle] = SimpleNamespace(future=Future(), discard=False)
+
+    def _finish_prefetch(self, handle, publish, hold=True):
+        self.prefetches.pop(handle, None)
+        self.finished.append((handle, publish))
+
+    def _cancel_prefetch(self, handle):
+        self.cancelled.append(handle)
+        self.lookups.pop(handle, None)
+        state = self.prefetches.get(handle)
+        if state is not None:
+            state.discard = True
+
+
+def _relay_stages(size=2):
+    maps = [{} for _ in range(size)]
+    stages = []
+    for rank in range(size):
+        wrapper = _RelayWrapper(rank, size)
+        relay = PPLinkerRelay(wrapper)
+        relay.attach_store(_VoteStore(maps, rank))
+        stages.append((relay, wrapper))
+    return stages
+
+
+def _queue_lookup(stages, handle, restorable):
+    for relay, wrapper in stages:
+        relay.begin(SimpleNamespace(cache_request_handle=handle))
+        wrapper.lookups[handle] = SimpleNamespace(
+            key=_KEY,
+            hashes=["h1", "h2", "h3"],
+            start=0,
+            anchor_node_id=0,
+            anchor_lock="lock",
+            timeout_s=1.0,
+            wait_started=None,
+            future=_done(restorable) if wrapper.pp_rank == 0 else None,
+        )
+
+
+def _relay_round(stages):
+    """Every stage votes and PP0 decides; PP0's actions reach every stage."""
+    for relay, _ in reversed(stages):
+        relay.poll()
+    actions = stages[0][0].take_actions()
+    for relay, _ in stages:
+        if actions is not None:
+            relay.receive(actions.actions)
+
+
+def _progress(stages, handle, stop_due=lambda h: False):
+    return [relay.progress(handle, stop_due) for relay, _ in stages]
+
+
+@pytest.mark.parametrize("later_landed", [True, False])
+def test_pp_prefetch_relay_publishes_only_when_every_stage_landed(later_landed):
+    stages = _relay_stages()
+    handle = _Handle("a")
+    _queue_lookup(stages, handle, [1, 3])
+    _relay_round(stages)
+    # PP0's lookup becomes the same load on every stage.
+    assert [w.started for _, w in stages] == [[(handle, [3])]] * 2
+    assert _progress(stages, handle) == [False, False]
+    stages[0][1].prefetches[handle].future.set_result(True)
+    _relay_round(stages)
+    # A stage still reading holds the finish back everywhere.
+    assert [w.finished for _, w in stages] == [[], []]
+    stages[1][1].prefetches[handle].future.set_result(later_landed)
+    _relay_round(stages)
+    assert [w.finished for _, w in stages] == [[(handle, later_landed)]] * 2
+    assert _progress(stages, handle) == [True, True]
+    # The votes of a finished read leave the store.
+    assert all(not relay.store.maps[rank] for rank, (relay, _) in enumerate(stages))
+
+
+def test_pp_prefetch_relay_progress_changes_only_as_actions_apply():
+    stages = _relay_stages()
+    handle = _Handle("a")
+    _queue_lookup(stages, handle, [3])
+    _relay_round(stages)
+    for _, wrapper in stages:
+        wrapper.prefetches[handle].future.set_result(True)
+    for relay, _ in reversed(stages):
+        relay.poll()
+    # PP0 decided, but nothing applies until the relay delivers the finish.
+    assert _progress(stages, handle) == [False, False]
+    actions = stages[0][0].take_actions()
+    stages[0][0].receive(actions.actions)
+    assert _progress(stages, handle)[0] is True
+    stages[1][0].receive(actions.actions)
+    assert _progress(stages, handle) == [True, True]
+
+
+def test_pp_prefetch_relay_stop_ends_the_wait_on_every_stage_in_order():
+    stages = _relay_stages()
+    handle = _Handle("a")
+    _queue_lookup(stages, handle, [3])
+    _relay_round(stages)
+    # PP0 alone runs the stop policy; the stop applies everywhere.
+    assert _progress(stages, handle, stop_due=lambda h: True) == [False, False]
+    _relay_round(stages)
+    assert _progress(stages, handle) == [True, True]
+    assert [w.cancelled for _, w in stages] == [[handle]] * 2
+    # The read still finishes before its slots are freed, unpublished.
+    for _, wrapper in stages:
+        wrapper.prefetches[handle].future.set_result(True)
+    _relay_round(stages)
+    _relay_round(stages)
+    assert [w.finished for _, w in stages] == [[(handle, False)]] * 2
+
+
+def test_pp_prefetch_relay_settles_a_request_with_nothing_to_look_up():
+    stages = _relay_stages()
+    handle = _Handle("a")
+    for relay, _ in stages:
+        relay.begin(SimpleNamespace(cache_request_handle=handle))
+        relay.settle(handle)
+    assert _progress(stages, handle) == [True, True]
+    _relay_round(stages)
+    assert stages[0][0].take_actions() is None
+
+
+def test_pp_prefetch_relay_waits_for_the_request_before_its_action():
+    stages = _relay_stages()
+    handle = _Handle("a")
+    pp0, later = stages
+    pp0[0].begin(SimpleNamespace(cache_request_handle=handle))
+    pp0[1].lookups[handle] = SimpleNamespace(
+        key=_KEY, hashes=["h1"], start=0, anchor_node_id=0, anchor_lock="lock",
+        timeout_s=1.0, wait_started=None, future=_done([1]),
+    )
+    pp0[0].poll()
+    actions = pp0[0].take_actions()
+    later[0].receive(actions.actions)
+    assert later[0].inbox and later[1].started == []
+    _queue_lookup([later], handle, [1])
+    later[0].receive([])
+    assert later[1].started == [(handle, [1])] and not later[0].inbox
+
+
+def test_mooncake_prefetch_read_ends_its_sessions_and_reports_failure():
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.storage = MagicMock()
+    linker.storage._get_hybrid_page_component_keys.side_effect = (
+        lambda keys, transfer: (list(keys), 1)
+    )
+    linker.storage._tag_keys.side_effect = list
+    linker.pools = {PoolName.KV: MagicMock(prepare_locations=lambda idx: [0, 1])}
+    linker._session_refs = MagicMock()
+    linker._session_refs.start.return_value = [0, 0]
+    linker.load_per_key = True
+    linker.log_load_timing = False
+    linker.stats = {}
+    transfer = PoolTransfer(
+        name=PoolName.KV, keys=["p1", "p2"], host_indices=torch.arange(4)
+    )
+    linker._load_per_key = MagicMock()
+    assert linker._prefetch_read([transfer], MagicMock(), time.monotonic()) is True
+    linker._load_per_key = MagicMock(side_effect=RuntimeError("-704"))
+    assert linker._prefetch_read([transfer], MagicMock(), time.monotonic()) is False
+    assert linker._session_refs.end.call_args_list == [call(["p1", "p2"])] * 2
+    assert linker.stats["prefetch_failed"] == 1
 
 
 if __name__ == "__main__":

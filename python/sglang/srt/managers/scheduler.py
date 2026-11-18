@@ -472,6 +472,8 @@ class Scheduler(
 
     # Logical-to-physical KV capacity ratio; defaults to 1 before pool init.
     kv_shard_widening: int = 1
+    # SGLANG_LINKER_LOAD_MODE=prefetch on this scheduler's tree (set at pool init).
+    linker_prefetch_mode: bool = False
 
     # Class-level default so on_idle's stall gate works even if a fork
     # overrides init_load_publisher (which would otherwise not set it).
@@ -631,6 +633,9 @@ class Scheduler(
         )
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+        self.linker_prefetch_mode = self.enable_unified_cache_external_linker and (
+            getattr(self.tree_cache, "linker_prefetch_mode", False) is True
+        )
         # Told about forward launches and WAR barriers (write-back eviction fences).
         self._hicache_fence_controller = None
         if self.enable_hierarchical_cache:
@@ -2384,7 +2389,9 @@ class Scheduler(
             verdicts = self.tree_cache.linker_take_verdicts()
             if verdicts is not None:
                 local_reqs = [*local_reqs, verdicts]
-            actions = self.tree_cache.linker_take_actions()
+            actions = (
+                self.tree_cache.linker_take_actions() if self.linker_prefetch_mode else None
+            )
             if actions is not None:
                 local_reqs = [*local_reqs, actions]
         recv_start_ns = time.monotonic_ns()
@@ -3687,13 +3694,6 @@ class Scheduler(
                 req.storage_prefetch_retry_attempts,
             )
         self._prefetch_kvcache(req, storage_hit_end)
-
-    @property
-    def linker_prefetch_mode(self) -> bool:
-        """SGLANG_LINKER_LOAD_MODE=prefetch on this scheduler's tree."""
-        return self.enable_unified_cache_external_linker and getattr(
-            self.tree_cache, "linker_prefetch_mode", False
-        )
 
     def _linker_requery_after_device_loss(self, req: Req) -> bool:
         """Re-query an external-linker range lost to device eviction while queued."""

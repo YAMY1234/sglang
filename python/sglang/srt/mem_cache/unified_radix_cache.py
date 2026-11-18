@@ -2631,7 +2631,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @property
     def linker_prefetch_mode(self) -> bool:
-        return self.linker is not None and self.linker.load_mode == "prefetch"
+        return getattr(self.linker, "load_mode", None) == "prefetch"
 
     def linker_prefetch(self, req: Req) -> None:
         """Every rank, as a request is queued (SGLANG_LINKER_LOAD_MODE=prefetch)."""
@@ -4224,7 +4224,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
-        if self.linker is not None and self.linker.load_mode == "prefetch":
+        if self.linker_prefetch_mode:
             self.linker.check_prefetch_events()
         if self.linker is not None and self.pp_size > 1:
             self._check_linker_events_pp()
