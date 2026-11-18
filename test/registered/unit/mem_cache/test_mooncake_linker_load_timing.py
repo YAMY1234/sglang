@@ -457,6 +457,16 @@ class TestLoadSlotReserve(CustomTestCase):
         self.assertEqual(cache.full_protected_size(), 10 + reserve.held_tokens())
         self.assertEqual(cache.protected_size(), 10 + 4 * 2)
 
+    def test_a_cache_reset_drops_the_reserve_from_the_accounting(self):
+        reserve, _, _ = self._reserve(target=4)
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.tree_core = SimpleNamespace(protected_size=lambda: 0, full_protected_size=lambda: 0)
+        cache.linker, cache._reset_full = None, lambda: None
+        cache.linker_load_reserve = reserve
+        self.assertGreater(cache.full_protected_size(), 0)
+        cache.reset()
+        self.assertEqual((cache.full_protected_size(), cache.protected_size()), (0, 0))
+
 
 class TestReservedLoadSlotsInTheFullComponent(CustomTestCase):
     def _component(self, pages=16):

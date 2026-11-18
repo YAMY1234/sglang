@@ -477,6 +477,10 @@ class UnifiedRadixCache(BasePrefixCache):
     def reset(self) -> None:
         if self.linker is not None:
             self.linker.reset()
+        # The reset frees the reserved load slots with every other page; the
+        # next load builds the reserve again (Rhea D4e: a flush left them
+        # counted as protected and the idle leak check failed).
+        self.linker_load_reserve = None
         self._reset_full()
 
     def _reset_full(self) -> None:
