@@ -592,6 +592,7 @@ class Engine(EngineScoreMixin, EngineBase):
         bootstrap_port: Optional[Union[List[int], int]] = None,
         bootstrap_room: Optional[Union[List[int], int]] = None,
         routed_dp_rank: Optional[int] = None,
+        data_parallel_rank: Optional[int] = None,  # L6 measurement-only shim: the image's Dynamo still passes it
         disagg_prefill_dp_rank: Optional[int] = None,
         kv_hints: Optional[Dict] = None,
         external_trace_header: Optional[Dict] = None,
@@ -607,6 +608,7 @@ class Engine(EngineScoreMixin, EngineBase):
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
         Please refer to `GenerateReqInput` for the documentation.
         """
+        routed_dp_rank = routed_dp_rank if routed_dp_rank is not None else data_parallel_rank
         routed_dp_rank = self._resolve_routed_dp_rank(routed_dp_rank)
 
         obj = GenerateReqInput(
