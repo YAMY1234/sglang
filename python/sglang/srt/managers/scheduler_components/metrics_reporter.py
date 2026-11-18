@@ -810,7 +810,7 @@ class SchedulerMetricsReporter:
                 # Per-request admitted prefix, for comparing PP stages offline.
                 logger.info(
                     "PP admit trace: %s",
-                    " ".join(f"{r.rid}:{r.prefix_len}:{r.extend_input_len}" for r in batch.reqs),
+                    " ".join(f"{r.rid}:{r.prefix_len}:{r.extend_len}" for r in batch.reqs),
                 )
             if self.host_usage_log_interval > 0 and now >= self.next_host_usage_log_tic:
                 self.next_host_usage_log_tic = now + self.host_usage_log_interval
