@@ -1980,6 +1980,17 @@ class UnifiedCacheLinkerWrapper:
 
         cache.tree_core.mark_external_linker_offload_pending(node_id)
         self.pending_offloads.append(_PendingOffload(node_id, lock_params, [node_id]))
+        if self.log_lookup_stats:
+            tokens = self.__dict__.setdefault("pending_offload_tokens", {})
+            if len(tokens) > 4 * len(self.pending_offloads) + 64:
+                live = {p.lock_node_id for p in self.pending_offloads}
+                for stale in [k for k in tokens if k not in live]:
+                    del tokens[stale]
+            tokens[node_id] = sum(
+                len(t.device_indices)
+                for t in transfers
+                if t.name == PoolName.KV and t.device_indices is not None
+            )
 
     def replace_pending_offload_node(
         self, ack_id: NodeId, old_node_id: NodeId, new_node_ids: list[NodeId]

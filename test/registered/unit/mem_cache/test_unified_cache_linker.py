@@ -2666,7 +2666,7 @@ def _consensus_stages(size, finished):
     for rank in range(size):
         log = {"waited": [], "committed": []}
         queue_ = list(finished[rank])
-        w = SimpleNamespace(pp_rank=rank, pp_size=size)
+        w = SimpleNamespace(pp_rank=rank, pp_size=size, log_lookup_stats=True)
         w.num_completed_offloads = lambda q=queue_: len(q)
         w.take_completed_offloads = lambda n, q=queue_: [q.pop(0) for _ in range(n)]
         w.wait_completed_offloads = log["waited"].append
@@ -2752,13 +2752,42 @@ def test_pp_offload_consensus_waits_for_every_stage_to_ack():
     stages, _ = _consensus_stages(2, [[True, True], [True]])
     _consensus_step(stages)
     pp0, later = stages[0][1], stages[1][1]
-    assert later.serial == 1
+    assert later.offload_serial == 1
     stages[1][3].append(True)
-    later.serial = 0  # pretend stage 1 has not applied action 1 yet
+    later.offload_serial = 0  # pretend stage 1 has not applied offload action 1 yet
     later._ack_posted = None
     stages[1][0]._check_linker_events_pp()
     stages[0][0]._check_linker_events_pp()
     assert pp0.take_actions() is None
+
+
+def test_pp_offload_consensus_advances_under_continuous_prefetch_actions():
+    # Prefetch actions issued every step, delivered to stage 1 two steps late,
+    # never hold offload commits back: they are gated on offload actions only.
+    from sglang.srt.mem_cache.unified_cache.pp_linker_relay import _Request
+
+    stages, _ = _consensus_stages(2, [[True] * 40, [True] * 40])
+    for _, relay, _, _ in stages:
+        relay.entries["h"] = _Request(req=None, cycle=1, phase="ready")
+    pp0, later = stages[0][1], stages[1][1]
+    in_flight = []
+    committed = []
+    for step in range(12):
+        stages[0][3].append(True)
+        stages[1][3].append(True)
+        pp0._issue("h", pp0.entries["h"], "stop", None)
+        for cache, *_ in reversed(stages):
+            cache._check_linker_events_pp()
+        actions = pp0.take_actions().actions
+        pp0.receive(actions)
+        in_flight.append(actions)
+        if len(in_flight) > 2:
+            later.receive(in_flight.pop(0))
+        committed.append(pp0.offload_head)
+    # Commits keep advancing (once per offload round trip), never starve.
+    assert committed[-1] >= 40
+    assert all(b >= a for a, b in zip(committed, committed[1:]))
+    assert sum(b > a for a, b in zip(committed, committed[1:])) >= 3
 
 
 @pytest.mark.parametrize("swa_stored", [True, False], ids=["stored", "unstored"])

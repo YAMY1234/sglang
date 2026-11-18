@@ -15,6 +15,7 @@ change to fit this tree:
 
 from dataclasses import dataclass, field
 import logging
+import time
 
 from sglang.srt.environ import envs
 
@@ -69,6 +70,16 @@ class PPLinkerRelay:
         self.offload_issued_head = 0
         self._offload_posted = -1
         self._ack_posted = None
+        # Offload actions only: applied here, and (PP0) issued. Prefetch actions
+        # in flight never hold an offload commit back.
+        self.offload_serial = self.offload_issued = 0
+        # PP0 commit-lag stats (SGLANG_EXTERNAL_LINKER_LOOKUP_STATS).
+        self._decide_step = 0
+        self._covered = 0
+        self._covered_at = []
+        self._lag_steps, self._lag_ms = [], []
+        self._locked_max = (0, 0)
+        self._stats_next = time.monotonic() + 60.0
 
     def attach_store(self, store):
         self.store = store
@@ -161,25 +172,33 @@ class PPLinkerRelay:
         if done != self._offload_posted:
             self.store[f"lkoc{self.epoch}"] = done
             self._offload_posted = done
-        # GLM's acknowledgement: the epoch and the last action serial applied here.
-        if self._ack_posted != (self.epoch, self.serial):
+        # GLM's acknowledgement, on the offload actions only: the epoch and the
+        # number of offload commits applied here.
+        if self._ack_posted != (self.epoch, self.offload_serial):
             self.store["lkoe"] = self.epoch
-            self.store["lkos"] = self.serial
-            self._ack_posted = (self.epoch, self.serial)
+            self.store["lkos"] = self.offload_serial
+            self._ack_posted = (self.epoch, self.offload_serial)
 
     def offload_decide(self):
         """PP0: commit what every stage has finished, the AND of their outcomes,
         once every stage acknowledged this epoch and every action issued so far
         (GLM: a vote predating an action cannot authorize another offload unlock)."""
+        self._decide_step += 1
+        stats = self.w.log_lookup_stats
+        counts = self.store.collect(f"lkoc{self.epoch}")
+        finished = min((c or 0) for c in counts)
+        if stats and finished > self._covered:
+            now = time.monotonic()
+            self._covered_at.extend([(self._decide_step, now)] * (finished - self._covered))
+            self._covered = finished
+        if stats:
+            self._log_offload_stats()
         if any(e != self.epoch for e in self.store.collect("lkoe")) or any(
-            s != self.serial for s in self.store.collect("lkos")
+            s != self.offload_issued for s in self.store.collect("lkos")
         ):
             return
-        if self.issued != self.serial:
-            return  # PP0's own issued actions not applied here yet.
         assert self.offload_issued_head == self.offload_head, "PP linker offload head drift"
-        counts = self.store.collect(f"lkoc{self.epoch}")
-        count = min((c or 0) for c in counts) - self.offload_head
+        count = finished - self.offload_head
         if count <= 0:
             return
         head = self.offload_head
@@ -189,6 +208,40 @@ class PPLinkerRelay:
         ]
         self._issue(None, None, "offload", (head, successes))
         self.offload_issued_head += count
+        self.offload_issued += 1
+        if stats:
+            now = time.monotonic()
+            for step, at in self._covered_at[:count]:
+                self._lag_steps.append(self._decide_step - step)
+                self._lag_ms.append(1e3 * (now - at))
+            del self._covered_at[:count]
+
+    def _log_offload_stats(self):
+        w = self.w
+        pending = getattr(w, "pending_offloads", ())
+        tokens = getattr(w, "pending_offload_tokens", {})
+        locked = (len(pending), sum(tokens.get(p.lock_node_id, 0) for p in pending))
+        self._locked_max = max(self._locked_max, locked)
+        now = time.monotonic()
+        if now < self._stats_next:
+            return
+        self._stats_next = now + 60.0
+
+        def pct(xs):
+            xs = sorted(xs)
+            if not xs:
+                return "n=0"
+            return (f"n={len(xs)} p50 {xs[len(xs) // 2]:.0f} p90 "
+                    f"{xs[len(xs) * 9 // 10]:.0f} max {xs[-1]:.0f}")
+
+        logger.info(
+            "Linker PP offload commits: lag steps %s; lag ms %s; locked now %d nodes "
+            "%d tokens, max %d nodes %d tokens; committed head %d, finished on all %d",
+            pct(self._lag_steps), pct(self._lag_ms), locked[0], locked[1],
+            self._locked_max[0], self._locked_max[1], self.offload_head, self._covered,
+        )
+        self._lag_steps, self._lag_ms = [], []
+        self._locked_max = locked
 
     def _apply_offload(self, value):
         head, successes = value
@@ -201,6 +254,7 @@ class PPLinkerRelay:
                 self.store.pop(self._offload_key(head + i))
         del self.offload_results[:n]
         self.offload_head += n
+        self.offload_serial += 1
 
     def receive(self, actions):
         """Every stage, as the relay delivers PP0's actions (in order)."""
@@ -354,6 +408,8 @@ class PPLinkerRelay:
         self.epoch += 1
         self.serial = self.issued = 0
         self._ack_posted = None
+        self.offload_serial = self.offload_issued = 0
+        self._covered, self._covered_at = 0, []
         self.offload_head, self.offload_results = 0, []
         self.offload_issued_head = 0
         self._offload_posted = -1
