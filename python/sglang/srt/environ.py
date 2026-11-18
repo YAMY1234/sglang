@@ -937,6 +937,11 @@ class Envs:
     # Write-back eviction demotes without a host wait for its copies: the streams that
     # next touch the freed pages or their host copies wait on them instead.
     SGLANG_OPT_HICACHE_WRITE_BACK_ORDERED_DEMOTE = EnvBool(False)
+    # Rank finished sub-agent sessions first for host eviction (needs parent_session_id
+    # on requests and --hicache-write-policy write_back).
+    SGLANG_OPT_HICACHE_SUBAGENT_HOST_EVICT_FIRST = EnvBool(False)
+    # Seconds between cache-residency counter logs; 0 disables them.
+    SGLANG_HICACHE_RESIDENCY_LOG_INTERVAL = EnvInt(300)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)
