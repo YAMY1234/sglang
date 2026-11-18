@@ -23,6 +23,7 @@ reaches nothing but its own requests, which the scheduler aborts.
 from __future__ import annotations
 
 import logging
+import math
 import random
 import time
 from abc import ABC, abstractmethod
@@ -58,6 +59,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
+
+# init_load_back's result for a request skipped this pass (async admission):
+# the scheduler keeps admitting the requests behind it.
+LINKER_ADMISSION_SKIPPED = "linker_admission_skipped"
 
 _EXTERNAL_LINKER_SUPPORTED_COMPONENTS = frozenset(
     {
@@ -254,6 +259,10 @@ class UnifiedCacheLinker(ABC):
     def release_stale_prepins(self) -> None:
         """PP0: release pre-pins whose requests were not admitted in time."""
 
+    def keep_prepins(self, rids: Sequence[str]) -> None:
+        """PP0, async admission: end the pre-pins of requests not in ``rids``
+        and renew the kept ones before their sessions lapse."""
+
     @abstractmethod
     def reset(self) -> None:
         """Quiesce all transfers and reset backend state before returning."""
@@ -282,6 +291,11 @@ class _PendingOffload(NamedTuple):
 
 class UnifiedCacheLinkerWrapper:
     """Drives an external KV store on behalf of one :class:`UnifiedRadixCache`."""
+
+    # Async admission: the relayed verdict of a skipped hit, and the passes in a
+    # row a hit may be skipped before PP0 pins it at admission (no starvation).
+    _SKIPPED = -1
+    _SKIP_LIMIT = 3
 
     def __init__(
         self,
@@ -364,6 +378,16 @@ class UnifiedCacheLinkerWrapper:
         # that found a finished pre-pin, and those that pinned themselves.
         self.prepin_depth = envs.SGLANG_LINKER_PREPIN_DEPTH.get() if self.pp_size > 1 else 0
         self.prepin_counts = {"ready": 0, "missed": 0}
+        # Async admission (PP0 decides, every stage follows): rid -> passes in a
+        # row its pre-pin was not ready; after _SKIP_LIMIT PP0 pins it itself.
+        self.async_admission = bool(
+            self.prepin_depth and envs.SGLANG_LINKER_ASYNC_ADMISSION.get()
+        )
+        self.skip_counts: dict[str, int] = {}
+        self.async_counts = {"skipped": 0, "forced_sync": 0}
+        # Hits admitted in the current pass, and their moving average per pass.
+        self.pass_hits = 0
+        self.hits_per_pass = 0.0
         self.admission_rpc_s = 0.0
         self.admission_marks: dict[str, float] = {}
         self.pp_load_holes = 0
@@ -528,12 +552,37 @@ class UnifiedCacheLinkerWrapper:
             if self.prepin_depth:
                 taken = self.cache_linker.take_prepin(req.rid, transfers)
                 self.prepin_counts["missed" if taken is None else "ready"] += 1
-            # Not ready: pin now. Deferring would end this pass's admission for
-            # every request behind it, and PP0's own stage alone is not enough.
-            pinned = self.cache_linker.pin_hit(req.rid, transfers) if taken is None else taken
-            self.admission_rpc_s = self.cache_linker.last_pin_rpc_s
+            if (
+                taken is None
+                and self.async_admission
+                and self.skip_counts.get(req.rid, 0) < self._SKIP_LIMIT
+            ):
+                # Skip this pass rather than wait on the store; the relay
+                # carries the skip, so every stage skips it too.
+                pinned = self._SKIPPED
+                self.cache_linker.start_prepin(req.rid, transfers)
+            else:
+                # Not ready: pin now. Without async admission, deferring would
+                # end this pass's admission for every request behind it.
+                if taken is None and self.async_admission:
+                    self.async_counts["forced_sync"] += 1
+                pinned = (
+                    self.cache_linker.pin_hit(req.rid, transfers)
+                    if taken is None
+                    else taken
+                )
+                self.admission_rpc_s = self.cache_linker.last_pin_rpc_s
         keep = torch.tensor([min(pinned, admitted)], dtype=torch.int64)
         self.cache._all_reduce(keep, torch.distributed.ReduceOp.MIN)
+        if int(keep[0]) == self._SKIPPED:
+            # A TP peer of PP0 that took its pre-pin drops it with the rest.
+            self.cache_linker.unpin(req.rid)
+            self.skip_counts[req.rid] = self.skip_counts.get(req.rid, 0) + 1
+            self.async_counts["skipped"] += 1
+            self._maybe_log_pp_counts()
+            return self._SKIPPED
+        self.skip_counts.pop(req.rid, None)
+        self.pass_hits += 1
         if int(keep[0]) < admitted:
             # Every stage drops its pins; the next pass pins the shorter hit.
             self.cache_linker.unpin(req.rid)
@@ -561,6 +610,9 @@ class UnifiedCacheLinkerWrapper:
         their admission takes a finished pin instead of waiting on the store."""
         if not self.prepin_depth:
             return
+        if self.async_admission:
+            self._prepin_window(waiting)
+            return
         self.cache_linker.release_stale_prepins()
         started = 0
         for req in waiting:
@@ -573,6 +625,27 @@ class UnifiedCacheLinkerWrapper:
             started += 1
             if started >= self.prepin_depth:
                 return
+
+    def _prepin_window(self, waiting: Sequence[Req]) -> None:
+        """Async admission: pre-pin the hits of the requests the next passes
+        admit. ``waiting`` is the policy-sorted queue after this pass; the window
+        is twice the recent hits admitted per pass plus one, up to
+        prepin_depth. Pins outside it end; those inside are renewed."""
+        self.hits_per_pass = 0.8 * self.hits_per_pass + 0.2 * self.pass_hits
+        self.pass_hits = 0
+        depth = min(self.prepin_depth, max(2, math.ceil(2 * self.hits_per_pass) + 1))
+        window = []
+        for req in waiting:
+            if len(window) >= depth:
+                break
+            hit = self.hit_markers.get(req.rid)
+            if hit is None:
+                continue
+            transfers = self._lookup_transfers(hit.tail_hashes)
+            if transfers:
+                self.cache_linker.start_prepin(req.rid, transfers)
+                window.append(req.rid)
+        self.cache_linker.keep_prepins(window)
 
     def _pp_relookup_hit_pages(
         self, req: Req, hit: ExternalCacheHitMarker, forced: bool
@@ -654,6 +727,16 @@ class UnifiedCacheLinkerWrapper:
             self.prepin_counts["ready"],
             self.prepin_counts["missed"],
         )
+        if self.async_admission:
+            logger.info(
+                "Linker PP async admission in %.0f s: %s; pre-pin window %.1f hits "
+                "per pass; renewals %d",
+                window,
+                self.async_counts,
+                self.hits_per_pass,
+                getattr(self.cache_linker, "prepin_renewals", 0),
+            )
+            self.async_counts = dict.fromkeys(self.async_counts, 0)
         self.prepin_counts = dict.fromkeys(self.prepin_counts, 0)
         self.pp_load_holes = 0
         self.pp_counts = dict.fromkeys(self.pp_counts, 0)
@@ -731,8 +814,10 @@ class UnifiedCacheLinkerWrapper:
         self.admission_rpc_s = 0.0
         self.admission_marks = {}
         self._components[0].load_evict = (0, 0.0)
+        result = None
         try:
-            return self._load_back(req)
+            result = self._load_back(req)
+            return result
         finally:
             end = time.monotonic()
             marks = self.admission_marks
@@ -740,18 +825,19 @@ class UnifiedCacheLinkerWrapper:
             built = marks.get("built", fresh)
             queued = marks.get("queued", built)
             evicted, evict_s = self._components[0].load_evict
-            self.admission_samples.append(
-                {
-                    "total": end - began,
-                    "pin": self.admission_rpc_s,
-                    "relay": fresh - began - self.admission_rpc_s,
-                    "build": built - fresh,
-                    "evict": evict_s,
-                    "evicted": evicted,
-                    "load": queued - built,
-                    "prepare": end - queued,
-                }
-            )
+            if result is not LINKER_ADMISSION_SKIPPED:
+                self.admission_samples.append(
+                    {
+                        "total": end - began,
+                        "pin": self.admission_rpc_s,
+                        "relay": fresh - began - self.admission_rpc_s,
+                        "build": built - fresh,
+                        "evict": evict_s,
+                        "evicted": evicted,
+                        "load": queued - built,
+                        "prepare": end - queued,
+                    }
+                )
 
     def _load_back(self, req: Req) -> tuple[int, NodeId]:
         cache = self.cache
@@ -761,6 +847,8 @@ class UnifiedCacheLinkerWrapper:
         if self.pp_size > 1:
             forced = req.rid in self.pp_forced_relookup
             keep = self._pp_fresh_hit_pages(req, hit, forced)
+            if keep == self._SKIPPED:
+                return LINKER_ADMISSION_SKIPPED
             self.admission_marks["fresh"] = time.monotonic()
             anchor, stops = req.linker_pp_hit
             end = hit.device_hit_len + keep * cache.page_size
@@ -1025,6 +1113,7 @@ class UnifiedCacheLinkerWrapper:
 
     def release_request(self, rid: str) -> None:
         self.hit_markers.pop(rid, None)
+        self.skip_counts.pop(rid, None)
         self.lookup_cache.pop(rid, None)
         self.tail_hash_cache.pop(rid, None)
         self.pp_lookup_time.pop(rid, None)

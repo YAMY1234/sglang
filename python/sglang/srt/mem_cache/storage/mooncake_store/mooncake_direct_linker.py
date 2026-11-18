@@ -8,7 +8,7 @@ import re
 import threading
 import time
 from collections import Counter, OrderedDict, deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from queue import Empty, Queue
@@ -261,9 +261,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.pinned_others: dict[str, list[str]] = {}
         self.pin_expiry: deque = deque()
         # PP0, SGLANG_LINKER_PREPIN_DEPTH: rid -> (hit tag, Future of
-        # _start_sessions, pages, own keys, other stages' keys, started at).
+        # _start_sessions, pages, own keys, other stages' keys, started or last
+        # renewed at, object spans).
         self.prepins: dict[str, tuple] = {}
         self.prepin_pool: ThreadPoolExecutor | None = None
+        self.prepin_renew_s = envs.SGLANG_LINKER_PREPIN_RENEW_SECS.get()
+        self.prepin_renewals = 0
         self.stats_logged_at = time.monotonic()
         # Store-side state path cap: each state this rank wrote -> the deepest
         # earlier state on its path (None at the root), and its child count.
@@ -713,7 +716,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         future = self.prepin_pool.submit(
             self._start_sessions, own + others, spans, num_pages
         )
-        self.prepins[rid] = (tag, future, num_pages, own, others, time.monotonic())
+        self.prepins[rid] = (tag, future, num_pages, own, others, time.monotonic(), spans)
 
     def take_prepin(self, rid: str, transfers: list[PoolTransfer]) -> int | None:
         """The pages a finished pre-pin of this same hit holds, now owned like
@@ -722,7 +725,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if entry is None or entry[0] != self._prepin_tag(transfers) or not entry[1].done():
             return None
         del self.prepins[rid]
-        _, future, num_pages, own, others, _ = entry
+        _, future, num_pages, own, others, *_ = entry
         pages, _ = future.result()
         self.last_pin_rpc_s = 0.0
         if pages == num_pages:
@@ -734,16 +737,38 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         for rid in [r for r, e in self.prepins.items() if now - e[5] > self._PREPIN_TTL_S]:
             self._drop_prepin(rid)
 
+    def keep_prepins(self, rids: Sequence[str]) -> None:
+        """Async admission, after a pass: end the pre-pins of requests no longer
+        in ``rids`` (the next-admitted window) and renew the kept ones older
+        than the renewal interval. A renewal is a session start on the same
+        keys, as a LEASE_EXPIRED read renews them; it shows a hole the same way."""
+        keep = set(rids)
+        for rid in [r for r in self.prepins if r not in keep]:
+            self._drop_prepin(rid)
+        now = time.monotonic()
+        for rid, entry in list(self.prepins.items()):
+            tag, future, num_pages, own, others, started, spans = entry
+            if now - started < self.prepin_renew_s or not future.done():
+                continue
+            if future.result()[0] != num_pages:
+                continue  # a hole: no session is held, its admission shrinks the hit
+            renewed = self.prepin_pool.submit(
+                self._start_sessions, own + others, spans, num_pages
+            )
+            self.prepins[rid] = (tag, renewed, num_pages, own, others, now, spans)
+            self.prepin_renewals += 1
+
     def _drop_prepin(self, rid: str) -> None:
         entry = self.prepins.pop(rid, None)
         if entry is None:
             return
-        _, future, num_pages, own, others, _ = entry
+        _, future, num_pages, own, others, *_ = entry
 
         def end(done):
             if done.result()[0] == num_pages:
                 self.storage.store.batch_get_session_end(own + others)
 
+        # A renewal replaced the entry's future, so this ends after it.
         future.add_done_callback(end)
 
     def unpin(self, rid: str) -> None:

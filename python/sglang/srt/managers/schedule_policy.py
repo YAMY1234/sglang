@@ -77,6 +77,9 @@ from sglang.srt.mem_cache.unified_cache.components import (
     CacheTransferPhase,
     ComponentType,
 )
+from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+    LINKER_ADMISSION_SKIPPED,
+)
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.model_executor import encoder_swa_replay
 
@@ -604,6 +607,9 @@ class AddReqResult(Enum):
     CONTINUE = auto()  # Continue to add requests
     NO_TOKEN = auto()  # No token left
     OTHER = auto()  # Other reasons to stop adding requests
+    # Not admitted this pass; keep adding the requests behind it (external
+    # linker async admission: its store pin is not ready yet).
+    SKIP = auto()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1618,6 +1624,12 @@ class PrefillAdder:
                     )
                 if loaded is None:
                     return AddReqResult.OTHER
+                if loaded is LINKER_ADMISSION_SKIPPED:
+                    if self.kv_shard_scratch_spec is not None:
+                        self.kv_shard_block_bound_pages, self.kv_shard_chunk_pages = (
+                            scratch_mark
+                        )
+                    return AddReqResult.SKIP
                 req.host_loaded_length, req.last_node = loaded
                 if 0 < req.host_loaded_length < promised_host_hit:
                     raise RuntimeError(

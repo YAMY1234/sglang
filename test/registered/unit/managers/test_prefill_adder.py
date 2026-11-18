@@ -34,6 +34,9 @@ from sglang.srt.mem_cache.prefill_budget import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+    LINKER_ADMISSION_SKIPPED,
+)
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_context
@@ -1666,6 +1669,22 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIsNone(next_adder.add_chunked_req(req))
         self.assertEqual(next_adder.rem_mamba_slots, 0)
         self.assertEqual(next_adder.memory_budget.total_offset, 4 + 8 + 1)
+
+    def test_skipped_linker_admission_keeps_admitting_the_requests_behind_it(self):
+        # External linker async admission: a hit whose store pin is not ready is
+        # skipped for this pass, charging nothing; the next request is admitted.
+        adder = self._create_delayer_adder(available_tokens=100_000, delayer=None)
+        skipped = self._create_host_hit_req(host_hit=24, tail=8)
+        admitted = self._create_host_hit_req(host_hit=24, tail=8)
+        offset = adder.memory_budget.total_offset
+        self.mock_tree_cache.init_load_back.return_value = LINKER_ADMISSION_SKIPPED
+        self.assertIs(adder.add_one_req(skipped, False, None), AddReqResult.SKIP)
+        self.assertEqual(adder.can_run_list, [])
+        self.assertEqual(adder.memory_budget.total_offset, offset)
+        self.assertEqual(skipped.prefix_len, 0)
+        self.mock_tree_cache.init_load_back.return_value = (24, admitted.last_node)
+        adder.add_one_req(admitted, False, None)
+        self.assertEqual(adder.can_run_list, [admitted])
 
     def test_successful_load_back_commits_the_selected_shape_once(self):
         cases = (

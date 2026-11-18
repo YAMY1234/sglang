@@ -4667,6 +4667,10 @@ class Scheduler(
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+            if res == AddReqResult.SKIP:
+                # Its external-linker pin is not ready: it waits for a later pass.
+                self._revert_unadmitted_mamba(req)
+                continue
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)

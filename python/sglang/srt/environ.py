@@ -961,6 +961,14 @@ class Envs:
     # next this-many waiting requests with a hit on a worker thread, so their
     # admission takes a finished pin instead of waiting on the store (0: off).
     SGLANG_LINKER_PREPIN_DEPTH = EnvInt(0)
+    # With SGLANG_LINKER_PREPIN_DEPTH under PP: PP0 never pins at admission. A hit
+    # whose pre-pin is not ready is skipped for this pass (the requests behind it
+    # are still admitted) and every stage follows PP0's verdict; pre-pins follow
+    # the admission order, are renewed instead of expiring, and end once a request
+    # leaves the next-admitted window.
+    SGLANG_LINKER_ASYNC_ADMISSION = EnvBool(False)
+    # Seconds between renewals of a waiting request's pre-pin (async admission).
+    SGLANG_LINKER_PREPIN_RENEW_SECS = EnvFloat(2.0)
     # Store each page's KV and DSA indexer as one Mooncake object ("ki") instead
     # of two, halving the store's objects per page and stage.
     SGLANG_LINKER_MERGE_INDEXER = EnvBool(False)

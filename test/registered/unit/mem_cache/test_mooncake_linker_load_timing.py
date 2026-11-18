@@ -2,6 +2,7 @@
 
 import os
 import queue
+from concurrent.futures import Future, ThreadPoolExecutor
 from collections import Counter, deque
 import tempfile
 import threading
@@ -219,6 +220,71 @@ class TestMooncakeLinkerLoadTiming(CustomTestCase):
             (index, list(pending), list(queued_at)), (3, ["kept"], ["kept"])
         )
         self.assertEqual(linker.load_queued_at, {})
+
+
+class TestAsyncAdmissionPrepins(CustomTestCase):
+    """SGLANG_LINKER_ASYNC_ADMISSION: pre-pins are renewed while their request
+    stays in the next-admitted window and end once it leaves it."""
+
+    def _linker_with(self, entries, renew_s=2.0):
+        linker = _linker(log_load_timing=False)
+        linker.pin_samples, linker.pin_holes = [], 0
+        linker.prepin_pool = ThreadPoolExecutor(1)
+        linker.prepin_renew_s, linker.prepin_renewals = renew_s, 0
+        linker.prepins = {}
+        for rid, (pages, age) in entries.items():
+            done = Future()
+            done.set_result((pages, 0.0))
+            own, others = [f"{rid}-own"], [f"{rid}-other"]
+            linker.prepins[rid] = (
+                ("tag", rid), done, 2, own, others, time.monotonic() - age,
+                [(False, 0, 2)],
+            )
+        return linker
+
+    def _flush(self, linker):
+        linker.prepin_pool.submit(lambda: None).result(timeout=5)
+
+    def test_a_kept_prepin_is_renewed_after_the_interval_and_not_before(self):
+        linker = self._linker_with({"old": (2, 5.0), "new": (2, 0.0)})
+        store = linker.storage.store
+        linker.keep_prepins(["old", "new"])
+        self._flush(linker)
+        store.batch_get_session_start.assert_called_once_with(["old-own", "old-other"])
+        store.batch_get_session_end.assert_not_called()
+        self.assertEqual(linker.prepin_renewals, 1)
+        self.assertLess(time.monotonic() - linker.prepins["old"][5], 1.0)
+        # The renewed pin is what admission takes.
+        with patch.object(linker, "_prepin_tag", return_value=("tag", "old")):
+            self.assertEqual(linker.take_prepin("old", []), 2)
+        self.assertEqual(linker.pinned["old"], ["old-own"])
+
+    def test_a_prepin_leaving_the_window_ends_its_sessions_and_a_hole_holds_none(self):
+        linker = self._linker_with({"gone": (2, 0.0), "hole": (1, 0.0), "kept": (2, 0.0)})
+        linker.keep_prepins(["kept"])
+        self._flush(linker)
+        store = linker.storage.store
+        store.batch_get_session_end.assert_called_once_with(["gone-own", "gone-other"])
+        self.assertEqual(list(linker.prepins), ["kept"])
+
+    def test_a_drop_ends_the_sessions_only_after_a_queued_renewal(self):
+        linker = self._linker_with({"r": (2, 5.0)})
+        store = linker.storage.store
+        gate, order = threading.Event(), []
+
+        def start(keys):
+            gate.wait(5)
+            order.append("start")
+            return [0] * len(keys)
+
+        store.batch_get_session_start.side_effect = start
+        store.batch_get_session_end.side_effect = lambda keys: order.append("end")
+        linker.keep_prepins(["r"])  # renewal queued, blocked on the gate
+        linker.keep_prepins([])  # the request left the window
+        gate.set()
+        self._flush(linker)
+        self.assertEqual(order, ["start", "end"])
+        self.assertEqual(linker.prepins, {})
 
 
 def _meminfo(node, total_kb, free_kb, file_kb, dirty_kb, reclaimable_kb):

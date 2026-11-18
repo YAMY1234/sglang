@@ -41,6 +41,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
 )
 from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+    LINKER_ADMISSION_SKIPPED,
     ExternalCacheHitMarker,
     LayerWiseLoadCounter,
     UnifiedCacheLinker,
@@ -1959,6 +1960,143 @@ def test_pp0_takes_a_finished_prepin_and_pins_itself_only_when_none_is_ready(
         assert pp0._pp_fresh_hit_pages(reqs[1], pp0.hit_markers["b"]) == 3
         assert backend.pins == ["b"]
         assert pp0.prepin_counts == {"ready": 1, "missed": 1}
+
+
+def _pp_pair(component, pp0_backend, later_backend):
+    """PP0 and a later stage; the later stage's relay delivers PP0's last value."""
+    relayed = []
+
+    def pp0_reduce(data, op):
+        relayed.append(int(data[0]))
+
+    def later_reduce(data, op):
+        data[0] = relayed.pop(0)
+
+    pp0 = _match_wrapper(
+        component, pp0_backend, pp_size=8, pp_rank=0, _all_reduce=pp0_reduce
+    )
+    later = _match_wrapper(
+        component, later_backend, pp_size=8, pp_rank=5, _all_reduce=later_reduce
+    )
+    return pp0, later
+
+
+def test_async_admission_skips_an_unready_hit_on_every_stage_until_its_prepin_lands(
+    full_linker_component,
+):
+    # Hecate H117: PP0 pinned every unready hit on its scheduler thread, about
+    # 0.2 s per batch. With async admission an unready hit is skipped for the
+    # pass on every stage alike (the keep relay carries the skip); its pre-pin
+    # keeps running and a later pass admits it with no store call.
+    with (
+        envs.SGLANG_LINKER_PREPIN_DEPTH.override(4),
+        envs.SGLANG_LINKER_ASYNC_ADMISSION.override(True),
+        patch(
+            "sglang.srt.mem_cache.unified_cache.unified_cache_linker.get_storage_hash_str",
+            side_effect=_page_hashes,
+        ),
+    ):
+        pp0_backend, later_backend = _PinningLinker(stage_restorable=[1, 3]), _PinningLinker()
+        pp0, later = _pp_pair(full_linker_component, pp0_backend, later_backend)
+        req0 = SimpleNamespace(rid="r", linker_pp_hit=None, linker_pp_lookup_pending=True)
+        pp0.match(_KEY, req0, _device_result(0))
+        req5 = SimpleNamespace(
+            rid="r", linker_pp_hit=req0.linker_pp_hit, linker_pp_lookup_pending=False
+        )
+        req0.linker_pp_lookup_pending = False
+        later.match(_KEY, req5, _device_result(0))
+
+        assert pp0.load_back(req0) is LINKER_ADMISSION_SKIPPED
+        assert later.load_back(req5) is LINKER_ADMISSION_SKIPPED
+        assert pp0_backend.pins == [] and later_backend.pins == []
+        assert pp0_backend.prepin_starts == ["r"]
+        assert pp0_backend.queued_loads == {} and later_backend.queued_loads == {}
+        assert pp0.skip_counts == later.skip_counts == {"r": 1}
+        assert pp0.admission_samples == []  # a skip is not an admission
+
+        # The next pass matches again; the pre-pin has landed: both stages
+        # admit the whole hit, and PP0 made no store call at admission.
+        pp0_backend.prepinned = 3
+        pp0.match(_KEY, req0, _device_result(0))
+        later.match(_KEY, req5, _device_result(0))
+        assert pp0._pp_fresh_hit_pages(req0, pp0.hit_markers["r"]) == 3
+        assert later._pp_fresh_hit_pages(req5, later.hit_markers["r"]) == 3
+        assert pp0_backend.pins == []
+        assert pp0.skip_counts == later.skip_counts == {}
+        assert pp0.async_counts == {"skipped": 1, "forced_sync": 0}
+
+
+def test_async_admission_pins_a_hit_skipped_too_often_at_admission(
+    full_linker_component,
+):
+    with (
+        envs.SGLANG_LINKER_PREPIN_DEPTH.override(4),
+        envs.SGLANG_LINKER_ASYNC_ADMISSION.override(True),
+        patch(
+            "sglang.srt.mem_cache.unified_cache.unified_cache_linker.get_storage_hash_str",
+            side_effect=_page_hashes,
+        ),
+    ):
+        backend = _PinningLinker(stage_restorable=[1, 3])
+        pp0 = _match_wrapper(
+            full_linker_component,
+            backend,
+            pp_size=8,
+            pp_rank=0,
+            _all_reduce=lambda data, op: None,
+        )
+        req = SimpleNamespace(rid="r", linker_pp_hit=None, linker_pp_lookup_pending=True)
+        pp0.match(_KEY, req, _device_result(0))
+        for _ in range(UnifiedCacheLinkerWrapper._SKIP_LIMIT):
+            hit = pp0.hit_markers["r"]
+            assert pp0._pp_fresh_hit_pages(req, hit) == UnifiedCacheLinkerWrapper._SKIPPED
+        assert backend.pins == []
+        assert pp0._pp_fresh_hit_pages(req, pp0.hit_markers["r"]) == 3
+        assert backend.pins == ["r"]
+        assert pp0.async_counts == {"skipped": 3, "forced_sync": 1}
+
+
+def test_async_admission_prepins_the_admission_window_and_ends_the_rest(
+    full_linker_component,
+):
+    with (
+        envs.SGLANG_LINKER_PREPIN_DEPTH.override(8),
+        envs.SGLANG_LINKER_ASYNC_ADMISSION.override(True),
+        patch(
+            "sglang.srt.mem_cache.unified_cache.unified_cache_linker.get_storage_hash_str",
+            side_effect=_page_hashes,
+        ),
+    ):
+        backend = _PinningLinker(stage_restorable=[1, 3])
+        kept = []
+        backend.keep_prepins = lambda rids: kept.append(list(rids))
+        pp0 = _match_wrapper(
+            full_linker_component,
+            backend,
+            pp_size=8,
+            pp_rank=0,
+            _all_reduce=lambda data, op: None,
+        )
+        reqs = [
+            SimpleNamespace(rid=r, linker_pp_hit=None, linker_pp_lookup_pending=True)
+            for r in "abcdef"
+        ]
+        for req in reqs:
+            pp0.match(_KEY, req, _device_result(0))
+        miss = SimpleNamespace(rid="none", linker_pp_hit=None, linker_pp_lookup_pending=False)
+        # No admissions seen yet: the window is the floor of two hits.
+        pp0.prepin([miss] + reqs)
+        assert kept[-1] == ["a", "b"]
+        # Three hits a pass for a while: the window follows (2 x 3 + 1 = 7).
+        for _ in range(20):
+            pp0.pass_hits = 3
+            pp0.prepin(reqs)
+        assert kept[-1] == list("abcdef")
+        assert pp0.hits_per_pass > 2.9
+        # The policy reorders the queue: the window is the new head.
+        pp0.hits_per_pass, pp0.pass_hits = 0.0, 0
+        pp0.prepin(list(reversed(reqs)))
+        assert kept[-1] == ["f", "e"]
 
 
 def test_pp_fresh_hit_loads_without_a_second_lookup(full_linker_component):
