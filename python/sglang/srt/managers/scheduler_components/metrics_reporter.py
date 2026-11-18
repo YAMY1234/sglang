@@ -806,12 +806,6 @@ class SchedulerMetricsReporter:
 
         if self.is_stats_logging_rank:
             logger.info(msg)
-            if batch is not None and envs.SGLANG_LINKER_PP_ADMIT_TRACE.get():
-                # Per-request admitted prefix, for comparing PP stages offline.
-                logger.info(
-                    "PP admit trace: %s",
-                    " ".join(f"{r.rid}:{r.prefix_len}:{r.extend_len}" for r in batch.reqs),
-                )
             if self.host_usage_log_interval > 0 and now >= self.next_host_usage_log_tic:
                 self.next_host_usage_log_tic = now + self.host_usage_log_interval
                 self._log_hicache_host_usage()

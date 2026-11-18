@@ -161,6 +161,8 @@ class PPLinkerRelay:
                     w._draining_lookups = False
                 entry.tokens = value * w.cache.page_size
             elif lookup is not None:
+                # PP0 found nothing restorable past the device prefix on every stage.
+                w._lookup_stats["zero_restorable"] += 1
                 # Metadata-only RPCs never own private device writes.
                 if lookup.future is not None:
                     lookup.future.cancel()

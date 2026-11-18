@@ -4795,6 +4795,12 @@ class Scheduler(
             self.chunked_req.inflight_middle_chunks += 1
 
         set_time_batch(can_run_list, "set_forward_entry_time")
+        if envs.SGLANG_LINKER_PP_ADMIT_TRACE.get():
+            # Per-request admitted prefix and extend length, compared across PP stages offline.
+            logger.info(
+                "PP admit trace: %s",
+                " ".join(f"{r.rid}:{r.prefix_len}:{r.extend_len}" for r in can_run_list),
+            )
 
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
