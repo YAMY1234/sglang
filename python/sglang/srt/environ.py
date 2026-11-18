@@ -797,6 +797,9 @@ class Envs:
     # Seconds between PD DCP send-stat log lines (descriptor build time, decode
     # prefix hits); 0 disables.
     SGLANG_DISAGG_DCP_SEND_STATS_INTERVAL = EnvFloat(0.0)
+    # >0: KV transfer workers wait on CUDA events/streams by query() + sleep of this many us
+    # instead of a spinning synchronize(), so the waiting thread leaves the CPU to the scheduler.
+    SGLANG_DISAGG_TRANSFER_POLL_WAIT_US = EnvInt(0)
     # Prefill KV exhaustion. The two K31 switches are sgl-project/sglang#50040's
     # (default off there): park a chunked continuation whose KV budget is spent
     # (#44823) instead of forcing a full chunk into a full pool, and, under

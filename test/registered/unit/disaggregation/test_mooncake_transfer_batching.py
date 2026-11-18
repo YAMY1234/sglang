@@ -1,5 +1,6 @@
 import concurrent.futures
 import ctypes
+import os
 import unittest
 from collections import defaultdict
 from queue import SimpleQueue
@@ -804,6 +805,16 @@ class TestMooncakeEarlySend(CustomTestCase):
     def test_worker_preserves_no_event_path(self):
         manager, queue = self._worker(None)
         MooncakeKVManager.transfer_worker(manager, queue, MagicMock())
+        manager.send_kvcache.assert_called_once()
+
+    def test_worker_polls_events_without_spinning_when_enabled(self):
+        ready = MagicMock()
+        ready.query.side_effect = [False, False, True]
+        manager, queue = self._worker(ready)
+        with patch.dict(os.environ, {"SGLANG_DISAGG_TRANSFER_POLL_WAIT_US": "1"}):
+            MooncakeKVManager.transfer_worker(manager, queue, MagicMock())
+        self.assertEqual(ready.query.call_count, 3)
+        ready.synchronize.assert_not_called()
         manager.send_kvcache.assert_called_once()
 
 

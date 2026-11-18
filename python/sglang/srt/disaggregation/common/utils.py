@@ -2,6 +2,7 @@ import ctypes
 import dataclasses
 import struct
 import threading
+import time
 from collections import deque
 from typing import List, Optional, Tuple, Union
 
@@ -89,6 +90,19 @@ def unpack_int_lists(buf: bytes, fmt: str) -> List[List[int]]:
         for b in unpack_list_of_buffers(buf)
     ]
 
+
+
+def wait_cuda(work) -> None:
+    """Wait for a CUDA event or stream on a transfer worker thread; with
+    SGLANG_DISAGG_TRANSFER_POLL_WAIT_US > 0, poll instead of spinning in synchronize()."""
+    from sglang.srt.environ import envs
+
+    us = envs.SGLANG_DISAGG_TRANSFER_POLL_WAIT_US.get()
+    if us <= 0:
+        work.synchronize()
+        return
+    while not work.query():
+        time.sleep(us * 1e-6)
 
 class FastQueue:
     def __init__(self):

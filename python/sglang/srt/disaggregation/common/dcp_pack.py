@@ -9,6 +9,7 @@ import torch
 
 from sglang.kernels.ops.kvcache.pd_dcp_gather import copy_mla_rows_into_pack
 from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
+from sglang.srt.disaggregation.common.utils import wait_cuda
 from sglang.srt.utils import device_stream_context
 
 logger = logging.getLogger(__name__)
@@ -83,7 +84,7 @@ def try_pack_dcp_src(
         copy_mla_rows_into_pack(
             kv_data_ptrs, row_indices, pack, token_item_lens, src_token_item_lens
         )
-    gather_stream.synchronize()
+    wait_cuda(gather_stream)
 
     packed_ptrs: List[int] = []
     offset = 0

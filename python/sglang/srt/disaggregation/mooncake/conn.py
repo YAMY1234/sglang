@@ -47,6 +47,7 @@ from sglang.srt.disaggregation.common.utils import (
     run_on_device,
     transfer_blocks_from_runs,
     unpack_int_lists,
+    wait_cuda,
 )
 from sglang.srt.disaggregation.mooncake.utils import (
     _validate_efa_allocator_compatibility,
@@ -2844,10 +2845,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         kv_chunk.room in self.request_status
                         and self.check_status(kv_chunk.room) != KVPoll.Failed
                     ):
-                        kv_chunk.wait_event.synchronize()
+                        wait_cuda(kv_chunk.wait_event)
                     kv_chunk.wait_event = None
                 if kv_chunk.indices_event is not None:
-                    kv_chunk.indices_event.synchronize()
+                    wait_cuda(kv_chunk.indices_event)
                     kv_chunk.indices_event = None
                 if isinstance(kv_chunk.prefill_kv_indices, torch.Tensor):
                     kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices.numpy()
