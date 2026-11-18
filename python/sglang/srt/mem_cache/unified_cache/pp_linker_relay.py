@@ -14,6 +14,11 @@ change to fit this tree:
 """
 
 from dataclasses import dataclass, field
+import logging
+
+from sglang.srt.environ import envs
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -216,6 +221,12 @@ class PPLinkerRelay:
                     pages = max(
                         (n for n in restorable if 0 < n <= len(lookup.hashes)), default=0
                     )
+                    if envs.SGLANG_LINKER_PP_ADMIT_TRACE.get():
+                        logger.info(
+                            "PP lookup trace: rid=%s start=%d pages=%d restorable=%s -> %d",
+                            handle.rid, lookup.start, len(lookup.hashes),
+                            sorted(restorable)[-8:], pages,
+                        )
                 self._issue(handle, entry, "load", pages)
             elif entry.phase == "load":
                 if entry.voted is None:
