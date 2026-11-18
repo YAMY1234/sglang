@@ -1816,6 +1816,7 @@ class UnifiedRadixCache(BasePrefixCache):
         """Evict host resources for a specific component to free host pool space."""
         if not pmicro_hoststats.ON:
             return self._evict_host(num_tokens, component_type)
+        pmicro_hoststats.note_host_evict_call()
         t0 = time.perf_counter()
         evicted = self._evict_host(num_tokens, component_type)
         pmicro_hoststats.OPS["host_evict"].add(time.perf_counter() - t0)
@@ -1885,7 +1886,10 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             if operation_id is None:
                 raise RuntimeError("Mamba tombstone victim has no writable host state")
+            t0 = time.perf_counter() if pmicro_hoststats.ON else 0.0
             self._wait_mamba_storage_backup(operation_id)
+            if pmicro_hoststats.ON:
+                pmicro_hoststats.note_host_wait(time.perf_counter() - t0, True)
             result = self.tree_core.finish_mamba_host_eviction(node_id)
             self._apply_eviction_result(result)
             freed = result.tracker.get(ComponentType.MAMBA, 0)
@@ -2260,9 +2264,18 @@ class UnifiedRadixCache(BasePrefixCache):
             if device_value.numel() == 0 and not comp_xfers:
                 continue
             sidecar_xfers = self._build_backup_sidecar(device_value, comp_xfers)
+            if pmicro_hoststats.ON and write_back:
+                host_free = self.cache_controller.mem_pool_host.available_size()
+                host_evicts = pmicro_hoststats.HOST_EVICT_CALLS[0]
             host_indices = self._execute_kv_backup(
                 node_id, device_value, comp_xfers, sidecar_xfers
             )
+            if pmicro_hoststats.ON and write_back:
+                pmicro_hoststats.note_evict_backup(
+                    host_free,
+                    self._pmicro_l3_pending(),
+                    pmicro_hoststats.HOST_EVICT_CALLS[0] != host_evicts,
+                )
             if host_indices is None:
                 return 0
             if pmicro_hoststats.ON:
@@ -2277,6 +2290,13 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             written = len(host_indices)
         return written
+
+    def _pmicro_l3_pending(self) -> int:
+        """Host KV tokens host-locked by L3 writes not yet drained."""
+        tokens = sum(self._write_behind_inflight.values())
+        if self._storage_write_back is not None:
+            tokens += self._storage_write_back._inflight_tokens
+        return tokens
 
     @staticmethod
     def _backup_publish_node_ids(
@@ -4743,7 +4763,13 @@ class UnifiedRadixCache(BasePrefixCache):
             if written > 0 or not self._wb_batch_locks:
                 break
             # Queued victims may hold the host space: land them, retry once.
+            if not pmicro_hoststats.ON:
+                self._wb_batch_flush()
+                continue
+            l3_blocked = self._pmicro_l3_pending() > 0
+            t0 = time.perf_counter()
             self._wb_batch_flush()
+            pmicro_hoststats.note_host_wait(time.perf_counter() - t0, l3_blocked)
         if written > 0:
             self._wb_batch_stream = stream
             self._wb_batch_stats[1] += 1
@@ -5176,6 +5202,10 @@ class UnifiedRadixCache(BasePrefixCache):
             self._write_behind_host_tail()
             if pmicro_hoststats.ON:
                 pmicro_hoststats.OPS["write_behind"].add(time.perf_counter() - t0)
+        if pmicro_hoststats.ON and self.enable_storage:
+            pmicro_hoststats.sample_l3_pending(
+                self._pmicro_l3_pending(), len(self._write_behind_mamba_inflight)
+            )
         if self.enable_storage and self.pp_rank == 0:
             # Diagnostics only: wall clock picks the log step, no decision reads it.
             now = time.monotonic()

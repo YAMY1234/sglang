@@ -24,6 +24,30 @@ overlap_frac: share of D2H copy time that overlaps an in-flight put (this or the
   window (GPU time - anchor GPU time + anchor host time), so it is accurate to
   the anchor's launch latency (microseconds). ovl_n = copies with a span; copies
   polled before the anchor completed have none.
+
+Then host free space against pending L3 writes:
+
+  ... | l3pend mean= max= at_evict_p50= mamba_max= | hostfree_evict n=
+  need_host_evict_frac= free_p10= free_p50= | hostwait n= ms_sum= l3_attrib_ms=
+  other_ms=
+
+l3pend: host KV tokens held by an L3 write not yet drained (write-behind ops of
+  SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT plus StorageWriteBack writes). Each such
+  write holds a host lock until the scheduler drains its ack, and host eviction
+  skips locked nodes. mean/max over one sample per scheduler step (after the
+  drain and the write-behind walk); at_evict_p50 over the samples taken at each
+  write_back device eviction. mamba_max: Mamba host-leaf write-behind ops.
+hostfree_evict: per host allocation of a write_back device-eviction backup (one
+  per chain node with a transfer), the anchor host pool's available_size()
+  before it, and whether a host eviction (UnifiedRadixCache.evict_host, any
+  component) ran inside it. The Mamba/SWA slot pre-eviction of an internal-state
+  backup runs before this sample and is not counted.
+hostwait: time blocked because host space was not available: the batched
+  eviction's retry flush after a failed host allocation (nested in evict_wait),
+  Mamba tombstone L3 write waits, StorageWriteBack ack waits, and shared host
+  layout compaction waiting for I/O leases and transfer events. l3_attrib_ms:
+  waits that wait on an L3 write by construction, or (retry flush, compaction)
+  that began while l3pend > 0 / an I/O lease was held; other_ms: the rest.
 """
 
 import threading
@@ -173,6 +197,7 @@ def take_ops_line(now: float):
         " | ".join(op.fmt(name) for name, op in OPS.items()),
         take_l3_fields(now - window, now),
     )
+    line += " | " + take_hostfree_fields()
     for op in OPS.values():
         op.reset()
     return line
@@ -322,4 +347,76 @@ def take_l3_fields(window_start: float, now: float) -> str:
     # Re-anchor every window: GPU and host clocks drift apart over hours.
     if _anchor is not None:
         _anchor = _record_anchor()
+    return line
+
+
+# ---- Host free space vs pending L3 writes (end of the PMICRO_HOSTOPS line) ----
+
+# Bumped by every UnifiedRadixCache.evict_host call; an eviction backup compares it.
+HOST_EVICT_CALLS = [0]
+_l3pend = dict(n=0, sum=0, max=0, mamba_max=0)
+_l3pend_at_evict: list = []
+_evict_free: list = []
+_evict_n = [0, 0]  # backups, backups that evicted host first
+_hostwait = dict(n=0, l3_s=0.0, other_s=0.0)
+
+
+def note_host_evict_call() -> None:
+    HOST_EVICT_CALLS[0] += 1
+
+
+def sample_l3_pending(kv_tokens: int, mamba_ops: int = 0) -> None:
+    """One per scheduler step."""
+    p = _l3pend
+    p["n"] += 1
+    p["sum"] += kv_tokens
+    p["max"] = max(p["max"], kv_tokens)
+    p["mamba_max"] = max(p["mamba_max"], mamba_ops)
+
+
+def note_evict_backup(host_free: int, l3pend_tokens: int, evicted_host: bool) -> None:
+    _evict_n[0] += 1
+    _evict_n[1] += int(evicted_host)
+    if len(_evict_free) < SAMPLE_CAP:
+        _evict_free.append(host_free)
+        _l3pend_at_evict.append(l3pend_tokens)
+
+
+def note_host_wait(seconds: float, l3_blocked: bool) -> None:
+    _hostwait["n"] += 1
+    _hostwait["l3_s" if l3_blocked else "other_s"] += seconds
+
+
+def _pct(samples, f) -> int:
+    s = sorted(samples)
+    return s[min(len(s) - 1, int(f * len(s)))] if s else 0
+
+
+def take_hostfree_fields() -> str:
+    """The l3pend / hostfree_evict / hostwait tail; resets the window."""
+    p, w = _l3pend, _hostwait
+    line = (
+        "l3pend mean=%d max=%d at_evict_p50=%d mamba_max=%d | "
+        "hostfree_evict n=%d need_host_evict_frac=%.3f free_p10=%d free_p50=%d | "
+        "hostwait n=%d ms_sum=%.1f l3_attrib_ms=%.1f other_ms=%.1f"
+        % (
+            p["sum"] // p["n"] if p["n"] else 0,
+            p["max"],
+            _pct(_l3pend_at_evict, 0.5),
+            p["mamba_max"],
+            _evict_n[0],
+            _evict_n[1] / _evict_n[0] if _evict_n[0] else 0.0,
+            _pct(_evict_free, 0.1),
+            _pct(_evict_free, 0.5),
+            w["n"],
+            (w["l3_s"] + w["other_s"]) * 1e3,
+            w["l3_s"] * 1e3,
+            w["other_s"] * 1e3,
+        )
+    )
+    p.update(n=0, sum=0, max=0, mamba_max=0)
+    _l3pend_at_evict.clear()
+    _evict_free.clear()
+    _evict_n[:] = [0, 0]
+    w.update(n=0, l3_s=0.0, other_s=0.0)
     return line

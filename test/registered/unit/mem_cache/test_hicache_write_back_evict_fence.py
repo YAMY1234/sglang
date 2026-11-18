@@ -74,6 +74,8 @@ def _cache(
     cache._wb_overlap_watermark = -1
     cache._wb_overlap_barrier_seq = 0
     cache._wb_overlap_counts = {"overlap": 0, "fresh": 0, "scope": 0}
+    cache.cache_controller.mem_pool_host = SimpleNamespace(available_size=lambda: 0)
+    cache._write_behind_inflight = {}
     return cache
 
 
@@ -575,6 +577,8 @@ class TestPMicroHostStats(CustomTestCase):
         patcher = patch.object(hs, "ON", True)
         patcher.start()
         self.addCleanup(patcher.stop)
+        hs.take_hostfree_fields()
+        hs.HOST_EVICT_CALLS[0] = 0
 
     @staticmethod
     def _pages(ids, ps=64):
@@ -734,7 +738,7 @@ class TestPMicroD2HAndPutStats(CustomTestCase):
         r"\| d2h n=(\d+) ms_sum=([\d.]+) p50_ms=([\d.]+) p90_ms=([\d.]+) "
         r"gbps=([\d.]+) \| put n=(\d+) ms_sum=([\d.]+) p50_ms=([\d.]+) "
         r"p90_ms=([\d.]+) gbps=([\d.]+) win_gbps=([\d.]+) busy_frac=([\d.]+) "
-        r"\| overlap_frac=([\d.]+) ovl_n=(\d+)$"
+        r"\| overlap_frac=([\d.]+) ovl_n=(\d+)(?= \||$)"
     )
 
     _pages = staticmethod(TestPMicroHostStats._pages)
@@ -933,6 +937,196 @@ class TestPMicroD2HAndPutStats(CustomTestCase):
         now[0] = 12.0  # a put slower than the cap does not sleep
         self.assertLess(pacer.pace(11.0, 100_000_000), 0)
         self.assertEqual(sleeps, [0.4, 0.9, 0.05])
+
+    # ---- host free space vs pending L3 writes ----
+
+    HOSTFREE = re.compile(
+        r"\| l3pend mean=(\d+) max=(\d+) at_evict_p50=(\d+) mamba_max=(\d+) "
+        r"\| hostfree_evict n=(\d+) need_host_evict_frac=([\d.]+) "
+        r"free_p10=(\d+) free_p50=(\d+) \| hostwait n=(\d+) ms_sum=([\d.]+) "
+        r"l3_attrib_ms=([\d.]+) other_ms=([\d.]+)$"
+    )
+
+    def test_hostfree_fields_format_and_reset(self):
+        for kv, mamba in ((0, 0), (128, 1), (512, 3), (64, 0)):
+            hs.sample_l3_pending(kv, mamba)
+        for free, pend, evicted in ((0, 512, True), (64, 0, False), (640, 128, False)):
+            hs.note_evict_backup(free, pend, evicted)
+        hs.note_host_wait(0.004, True)
+        hs.note_host_wait(0.001, False)
+        with patch.object(hs, "_ops_window_start", 0.0):
+            line = hs.take_ops_line(100.0)
+        self.assertIsNotNone(self.TAIL.search(line), line)
+        m = self.HOSTFREE.search(line)
+        self.assertIsNotNone(m, line)
+        self.assertEqual(
+            m.groups(),
+            ("176", "512", "128", "3", "3", "0.333", "0", "64", "2", "5.0", "4.0", "1.0"),
+        )
+        self.assertEqual(
+            hs.take_hostfree_fields(),
+            "l3pend mean=0 max=0 at_evict_p50=0 mamba_max=0 | hostfree_evict n=0 "
+            "need_host_evict_frac=0.000 free_p10=0 free_p50=0 | hostwait n=0 "
+            "ms_sum=0.0 l3_attrib_ms=0.0 other_ms=0.0",
+        )
+
+    def test_l3_pending_counts_write_behind_and_write_back_writes(self):
+        cache = _cache()
+        cache._write_behind_inflight = {1: 128, 2: 64}
+        self.assertEqual(cache._pmicro_l3_pending(), 192)
+        cache._storage_write_back = SimpleNamespace(_inflight_tokens=256)
+        self.assertEqual(cache._pmicro_l3_pending(), 448)
+
+    def _backup_cache(self, host_free, evict_on=()):
+        """Write-back backups whose node in ``evict_on`` evicts host inside its
+        allocation; 256 host tokens are pending an L3 write."""
+        cache = _cache()
+        cache.buffer_pipeline = None
+        cache.host_memory_mode = "cache"
+        cache._write_behind_inflight = {5: 256}
+        cache.cache_controller.mem_pool_host = SimpleNamespace(
+            available_size=lambda: host_free
+        )
+        cache.tree_core.build_backup_spec.return_value = (torch.arange(4), {})
+        cache._build_backup_sidecar = MagicMock(return_value=None)
+        cache._evict_host = MagicMock(return_value=4)
+        cache._track_write_through_node = MagicMock()
+
+        def execute(node_id, *args):
+            if node_id in evict_on:
+                cache.evict_host(4)
+            return torch.arange(4)
+
+        cache._execute_kv_backup = MagicMock(side_effect=execute)
+        return cache
+
+    def test_eviction_backup_samples_host_free_and_host_eviction(self):
+        cache = self._backup_cache(host_free=0, evict_on=(12,))
+        for node_id in (11, 12):
+            cache._execute_and_commit_kv_backup(
+                urc_mod.BackupKV(node_ids=[node_id]), write_back=True
+            )
+        # Not an eviction backup: not sampled.
+        cache.inc_lock_ref = MagicMock()
+        cache._execute_and_commit_kv_backup(urc_mod.BackupKV(node_ids=[13]))
+        self.assertEqual(hs._evict_n, [2, 1])
+        self.assertEqual((hs._evict_free, hs._l3pend_at_evict), ([0, 0], [256, 256]))
+
+    def _retry_cache(self, pending):
+        """A batched eviction whose first host allocation fails behind one queued
+        victim; the flush lands it and the retry succeeds."""
+        cache = _cache()
+        cache._write_behind_inflight = pending
+        cache._wb_batch_locks = [(5, "r5")]
+        cache._wb_batch_stream = None
+        cache._wb_batch_stats = [0, 0, 0]
+        cache._wb_evict_overlap_stream = MagicMock(return_value=None)
+        cache.tree_core.component_has_host_value_only.return_value = False
+        cache._execute_and_commit_kv_backup = MagicMock(side_effect=[0, 4])
+        cache.inc_host_lock_ref = MagicMock()
+        cache._wb_batch_flush = MagicMock(
+            side_effect=lambda: cache._wb_batch_locks.clear()
+        )
+        return cache
+
+    def test_default_off_adds_nothing(self):
+        with patch.object(hs, "ON", False):
+            cache = self._backup_cache(host_free=0, evict_on=(11,))
+            cache._execute_and_commit_kv_backup(
+                urc_mod.BackupKV(node_ids=[11]), write_back=True
+            )
+            cache = self._retry_cache(pending={7: 128})
+            cache._backup_full_leaf_batched(SimpleNamespace(node_ids=[6]))
+            cache._wb_batch_flush.assert_called_once_with()
+        self.assertEqual(hs.HOST_EVICT_CALLS[0], 0)
+        self.assertEqual((hs._evict_n, hs._hostwait["n"]), ([0, 0], 0))
+
+    def test_retry_flush_is_a_host_wait_split_by_pending_l3(self):
+        for pending, key in (({7: 128}, "l3_s"), ({}, "other_s")):
+            cache = self._retry_cache(pending)
+            with patch.object(urc_mod.time, "perf_counter", side_effect=[1.0, 1.25]):
+                self.assertEqual(
+                    cache._backup_full_leaf_batched(SimpleNamespace(node_ids=[6])), 4
+                )
+            cache._wb_batch_flush.assert_called_once_with()
+            self.assertAlmostEqual(hs._hostwait[key], 0.25)
+        self.assertEqual(hs._hostwait["n"], 2)
+
+    def test_mamba_tombstone_wait_counts_as_l3(self):
+        cache = _cache()
+        cache.tree_core.begin_mamba_host_eviction.return_value = SimpleNamespace(
+            tracker={}, mamba_storage_backup_node_id=9
+        )
+        cache.tree_core.finish_mamba_host_eviction.return_value = SimpleNamespace(
+            tracker={ComponentType.MAMBA: 1}
+        )
+        cache._apply_eviction_result = MagicMock()
+        cache._write_backup_storage = MagicMock(return_value=42)
+        cache._wait_mamba_storage_backup = MagicMock()
+        self.assertEqual(cache._drive_mamba_host_eviction_with_storage(1), 1)
+        cache._wait_mamba_storage_backup.assert_called_once_with(42)
+        self.assertEqual((hs._hostwait["n"], hs._hostwait["other_s"]), (1, 0.0))
+
+    def test_storage_write_back_ack_wait_counts_as_l3(self):
+        from queue import Queue
+
+        from sglang.srt.mem_cache.unified_cache.storage_write_back import (
+            StorageWriteBack,
+        )
+
+        acks = Queue()
+        acks.put("op")
+        write_back = object.__new__(StorageWriteBack)
+        write_back._inflight = {1: 64, 2: 64}
+        write_back.acks_taken = 0
+        write_back._stats = {"evict_waits": 0, "evict_wait_s": 0.0}
+        write_back._cache = SimpleNamespace(
+            cache_controller=SimpleNamespace(
+                ack_backup_queue=acks, storage_stop_event=MagicMock()
+            ),
+            _drain_storage_control_queues_impl=MagicMock(),
+        )
+        write_back._wait(64)
+        self.assertEqual((write_back.acks_taken, hs._hostwait["n"]), (1, 1))
+        self.assertEqual(hs._hostwait["other_s"], 0.0)
+
+    def test_compaction_wait_attributed_to_a_held_io_lease(self):
+        import threading
+
+        from sglang.srt.mem_cache.pool_host.unified import (
+            _SharedPageEnvelopeHostBacking as Backing,
+        )
+
+        def backing(users):
+            b = object.__new__(Backing)
+            b._layout_lease_state = Backing._LayoutLeaseState()
+            b._layout_condition = threading.Condition(threading.RLock())
+            b._layout_users = users
+            b._compacting = False
+            b._pending_transfer_events = {"d2h": MagicMock()}
+            b.sides = {}
+            return b
+
+        held = backing(1)
+
+        def put_finishes():
+            with held._layout_condition:
+                held._layout_users = 0
+                held._layout_condition.notify_all()
+
+        timer = threading.Timer(0.05, put_finishes)
+        timer.start()
+        with held._layout_condition:
+            held._compact()
+        timer.join()
+        idle = backing(0)
+        event = idle._pending_transfer_events["d2h"]
+        with idle._layout_condition:
+            idle._compact()
+        event.synchronize.assert_called_once_with()
+        self.assertEqual(hs._hostwait["n"], 2)
+        self.assertGreaterEqual(hs._hostwait["l3_s"], 0.04)
+        self.assertLess(hs._hostwait["other_s"], 0.04)
 
 
 if __name__ == "__main__":

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Sequence
 from contextlib import contextmanager
 
 import torch
 
+from sglang.srt.mem_cache import pmicro_hoststats
 from sglang.srt.mem_cache.pool_host.base import HostKVCache, host_memory_budget_bytes
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
@@ -422,10 +424,15 @@ class _SharedPageEnvelopeHostBacking:
         )
 
     def _compact(self) -> None:
+        t0 = time.perf_counter() if pmicro_hoststats.ON else 0.0
+        # A lease held now is a storage thread's L3 put or read.
+        l3_lease = self._layout_users > 0
         events = self._begin_compaction()
         try:
             for event in events:
                 event.synchronize()
+            if pmicro_hoststats.ON:
+                pmicro_hoststats.note_host_wait(time.perf_counter() - t0, l3_lease)
             for side in self.sides.values():
                 self._compact_side(side)
         finally:

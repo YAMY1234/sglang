@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache import pmicro_hoststats
 from sglang.srt.mem_cache.hicache_storage import STORAGE_BATCH_SIZE, PoolHitPolicy
 from sglang.srt.mem_cache.unified_cache.component_type import BASE_COMPONENT_TYPE
 from sglang.srt.runtime_context import get_model
@@ -743,6 +744,8 @@ class StorageWriteBack:
         self.acks_taken += num_acks
         self._stats["evict_waits"] += 1
         self._stats["evict_wait_s"] += time.perf_counter() - start
+        if pmicro_hoststats.ON:
+            pmicro_hoststats.note_host_wait(time.perf_counter() - start, True)
 
     def _written_bytes(self, operation: StorageOperation) -> int:
         cache = self._cache
