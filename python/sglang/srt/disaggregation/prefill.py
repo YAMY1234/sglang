@@ -43,6 +43,7 @@ from sglang.srt.disaggregation.common.staging_buffer import (
     compute_grid_segments,
     staging_grid_tokens,
 )
+from sglang.srt.disaggregation.fake.conn import FakeKVSender
 from sglang.srt.disaggregation.minimax import minimax_index_transfer_pages
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
@@ -1746,6 +1747,11 @@ class SchedulerDisaggregationPrefillMixin:
                 sender.kv_mgr.enable_all_cp_ranks_for_transfer
                 and not get_parallel().enable_dsa_cache_layer_split
             )
+        ) or (
+            # Rig only: the fake sender reads no index values, so it can take the
+            # Mooncake readback path and skip a sync production never pays.
+            envs.SGLANG_DISAGG_FAKE_SENDER_ASYNC_INDICES.get()
+            and isinstance(sender, FakeKVSender)
         )
 
         def _host_indices(indices):
