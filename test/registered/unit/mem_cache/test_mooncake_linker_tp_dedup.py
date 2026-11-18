@@ -8,7 +8,7 @@ import queue
 import random
 import threading
 import unittest
-from collections import Counter, deque
+from collections import Counter, OrderedDict, deque
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.storage.mooncake_store.linker_lease_refresh import (
 )
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
+    _PutTrace,
     _shared_pool_suffix,
     _storage_sharing,
 )
@@ -521,6 +522,65 @@ class TestPinHit(CustomTestCase):
         self.assertEqual(len(linker.pinned_others["rid"]), 2 * (2 * 4 + 1))
         linker.unpin("rid")
         self.assertEqual(sorted(linker.storage.store.ended[0]), sorted(self._all_stages(3)))
+
+
+class TestHoleTrace(CustomTestCase):
+    """SGLANG_LINKER_HOLE_TRACE: a hole at admission is matched against when
+    each stage queued, landed or removed the puts of the pages behind it."""
+
+    pages = TestPinHit.pages
+    _log = "sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker"
+
+    def _traced(self, present, num_stages=3, stage=0):
+        linker = _pinning_linker(present, num_stages)
+        linker.hole_trace = _PutTrace(stage)
+        linker.hole_sessions, linker.pp_rank, linker.offload_owner = OrderedDict(), stage, True
+        return linker
+
+    def test_pp0_logs_the_missing_objects_with_their_stage_and_times(self):
+        present = TestPinHit._all_stages(TestPinHit(), 3) - {"p3_tp0_cp0_pp2_indexer"}
+        linker = self._traced(present)
+        transfers = TestPinHit._transfers(TestPinHit())
+        self.assertEqual(linker.pin_hit("rid", transfers), 2)
+        with self.assertLogs(self._log, level="INFO") as logs:
+            linker.trace_hole("rid", transfers, 2, looked_up=123.0)
+            linker.hole_trace.lines.join()
+        pin = next(line for line in logs.output if "hole trace PP0 pin" in line)
+        self.assertIn("rid=rid page 2 of 4", pin)
+        self.assertIn("(2, 'p3_tp0_cp0_pp2_indexer', -704)", pin)
+        self.assertIn("looked up at 123.000", pin)
+        hole = next(line for line in logs.output if "hole trace PP0: rid=rid" in line)
+        self.assertIn("p3: never written; p4: never written", hole)
+
+    def test_a_stage_reports_each_page_once_and_its_late_put_once(self):
+        trace = _PutTrace(stage=2)
+        trace.note(["p3"], "queued")
+        trace.note(["p3"], "submitted")
+        trace.note(["p4"], "completed")
+        with self.assertLogs(self._log, level="INFO") as logs:
+            trace.report("rid", ["p3", "p4"], hole=50.0)
+            trace.report("rid2", ["p3", "p4"], hole=51.0)  # reported already
+            trace.note(["p3"], "completed")
+            trace.note(["p3", "p4"], "completed")  # p4 never was a late put
+            trace.lines.join()
+        self.assertEqual(len(logs.output), 2)
+        self.assertRegex(logs.output[0], r"PP2: rid=rid hole at 50.000; p3: put queued at "
+                         r"[\d.]+, put submitted at [\d.]+; p4: put completed at")
+        self.assertRegex(logs.output[1], r"PP2: page p3 put completed at [\d.]+, .* ms "
+                         r"after its hole at 50.000")
+
+    def test_a_removed_page_reads_as_removed_and_the_map_is_bounded(self):
+        trace = _PutTrace(stage=1, capacity=2)
+        trace.note(["a", "b"], "completed")
+        trace.note(["a"], "removed", "budget")
+        self.assertIn("removed (budget) at", _PutTrace.describe(trace.pages["a"]))
+        trace.note(["c"], "queued")
+        self.assertEqual(list(trace.pages), ["a", "c"])
+
+    def test_off_by_default_records_nothing(self):
+        linker = _pinning_linker(set(), 3)
+        self.assertIsNone(linker.hole_trace)
+        linker.trace_hole("rid", TestPinHit._transfers(TestPinHit()), 0, None)
 
 
 class _RemovingStore:

@@ -210,6 +210,107 @@ class _RecentKeys:
         return key in self.keys
 
 
+class _PutTrace:
+    """SGLANG_LINKER_HOLE_TRACE: per page hash, the last time (wall clock, for
+    correlation across nodes) this stage queued, submitted, completed or
+    removed its objects; the newest ``capacity`` pages. A page reported for a
+    hole is logged once, and once more if its put completes after the hole.
+    Lines are formatted and logged on the trace's own thread."""
+
+    _EVENTS = ("queued", "submitted", "completed", "failed", "removed")
+
+    def __init__(self, stage: int, capacity: int = 200_000):
+        self.stage = stage
+        self.capacity = capacity
+        self.pages: OrderedDict[str, dict] = OrderedDict()
+        self.lock = threading.Lock()
+        self.lines: Queue = Queue()
+        threading.Thread(
+            target=self._log_loop, daemon=True, name="mooncake-hole-trace"
+        ).start()
+
+    def _entry(self, page: str) -> dict:
+        entry = self.pages.get(page)
+        if entry is None:
+            entry = self.pages[page] = {}
+            if len(self.pages) > self.capacity:
+                self.pages.popitem(last=False)
+        else:
+            self.pages.move_to_end(page)
+        return entry
+
+    def note(self, pages, event: str, why: str | None = None) -> None:
+        now = time.time()
+        with self.lock:
+            for page in pages:
+                entry = self._entry(page)
+                entry[event] = now
+                if why is not None:
+                    entry["why"] = why
+                hole = entry.pop("hole", None) if event == "completed" else None
+                if hole is not None:
+                    self.lines.put(("late", page, hole, now))
+
+    def report(self, rid: str, pages: Sequence[str], hole: float) -> None:
+        """A hole at ``hole`` (wall) on these pages: log what this stage did
+        with each, unless that page was reported before."""
+        states = []
+        with self.lock:
+            for page in pages:
+                entry = self._entry(page)
+                if entry.get("reported"):
+                    continue
+                entry["reported"] = True
+                states.append((page, dict(entry)))
+                if entry.get("completed", 0) <= max(
+                    entry.get("removed", 0), entry.get("failed", 0)
+                ):
+                    entry["hole"] = hole
+        if states:
+            self.lines.put(("hole", rid, states, hole))
+
+    @classmethod
+    def describe(cls, entry: dict) -> str:
+        done = [(entry[e], e) for e in cls._EVENTS if e in entry]
+        if not done:
+            return "never written"
+        parts = []
+        for at, event in sorted(done):
+            what = "put " + event if event != "removed" else f"removed ({entry.get('why')})"
+            parts.append(f"{what} at {at:.3f}")
+        return ", ".join(parts)
+
+    def _log_loop(self) -> None:
+        while True:
+            kind, *rest = self.lines.get()
+            try:
+                self._log(kind, rest)
+            finally:
+                self.lines.task_done()
+
+    def _log(self, kind: str, rest: list) -> None:
+        if kind == "hole":
+            rid, states, hole = rest
+            logger.info(
+                "Linker hole trace PP%d: rid=%s hole at %.3f; %s",
+                self.stage,
+                rid,
+                hole,
+                "; ".join(f"{page}: {self.describe(e)}" for page, e in states),
+            )
+        else:
+            page, hole, done = rest
+            logger.info(
+                "Linker hole trace PP%d: page %s put completed at %.3f, %.1f ms "
+                "after its hole at %.3f",
+                self.stage,
+                page,
+                done,
+                (done - hole) * 1e3,
+                hole,
+            )
+
+
 class _StoreTree:
     """SGLANG_LINKER_STORE_BUDGET_PAGES: the pages this stage offloaded, as a
     tree (page hash -> [parent hash, stored children, last-use tick, has a
@@ -529,6 +630,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     prev_launch_event = None
     # SGLANG_LINKER_STATE_PATH_CAP at init; 0 leaves the store's states alone.
     state_path_cap = 0
+    # SGLANG_LINKER_HOLE_TRACE at init (None: off).
+    hole_trace: "_PutTrace | None" = None
 
     def __init__(
         self,
@@ -566,6 +669,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.lookup_samples: list[tuple[int, float]] = []
         self.pin_samples: list[tuple[int, float]] = []
         self.pin_holes = 0
+        self.pp_rank = params.pp_rank
+        self.hole_trace = (
+            _PutTrace(params.pp_rank) if envs.SGLANG_LINKER_HOLE_TRACE.get() else None
+        )
+        # PP0 with the trace: first key of a session start that found objects
+        # missing -> (wall start, seconds, [(key index, code)] of the first few).
+        self.hole_sessions: OrderedDict[str, tuple] = OrderedDict()
         # rid -> object keys whose read sessions pin_hit started; the load
         # thread ends them (load_pins: the batch's pinned rids by load index).
         self.pinned: dict[str, list[str]] = {}
@@ -1041,6 +1151,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if renew:
             self.sessions.end(keys)
         self.pin_holes += 1
+        if self.hole_trace is not None and keys:
+            missing = [(i, v) for i, v in enumerate(result) if v != 0][:4]
+            self.hole_sessions[keys[0]] = (time.time() - waited, waited, missing)
+            while len(self.hole_sessions) > 4096:
+                self.hole_sessions.popitem(last=False)
         pages = num_pages
         for trailing, first, end in spans:
             missing = next(
@@ -1066,6 +1181,46 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if pages == num_pages:
             self._hold_pins(rid, own, others)
         return pages
+
+    def trace_hole(
+        self, rid: str, transfers: list[PoolTransfer], keep: int, looked_up: float | None
+    ) -> None:
+        """Every stage, as admission finds a hole past page ``keep``: report this
+        stage's puts of the first pages past it (and the last, for its state);
+        PP0 also logs the objects its session start found missing."""
+        if self.hole_trace is None:
+            return
+        now = time.time()
+        pages = list(next(t for t in transfers if t.name == PoolName.KV).keys)
+        if self.offload_owner:
+            self.hole_trace.report(rid, pages[keep : keep + 3] + pages[-1:], now)
+        if self.pp_rank != 0:
+            return
+        num_pages, own, others, _ = self._pin_keys(transfers)
+        keys = own + others
+        session = self.hole_sessions.get(keys[0]) if keys else None
+        # Stage of each key index: PP0's own keys, then each later stage's.
+        ends, end = [len(own)], len(own)
+        for schema in self.stage_schemas[1:]:
+            end += sum(1 if trailing else num_pages for *_, trailing in schema)
+            ends.append(end)
+        missing = [
+            (next(s for s, e in enumerate(ends) if i < e), keys[i], code)
+            for i, code in (session[2] if session else [])
+            if i < len(keys)
+        ]
+        logger.info(
+            "Linker hole trace PP0 pin: rid=%s page %d of %d; missing (stage, key, "
+            "code) %s; looked up at %s, session start at %s (%s ms), hole at %.3f",
+            rid,
+            keep,
+            num_pages,
+            missing,
+            "-" if looked_up is None else f"{looked_up:.3f}",
+            "-" if session is None else f"{session[0]:.3f}",
+            "-" if session is None else f"{session[1] * 1e3:.1f}",
+            now,
+        )
 
     def _hold_pins(self, rid: str, own: list[str], others: list[str]) -> None:
         self.pinned[rid] = own
@@ -1700,6 +1855,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if self.state_path_cap and state is not None and path is not None:
             victims = self._cap_state_path(list(state.keys), path)
         ready_events = self.record_offload_ready()
+        if self.hole_trace is not None:
+            self.hole_trace.note({k for t in expanded for k in t.keys}, "queued")
         self.offload_queue.put((expanded, tokens, ready_events, session_id, victims))
         tree = self.store_tree
         if tree is not None:
@@ -1792,8 +1949,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     if session_id
                     else None
                 )
+                trace = self.hole_trace
+                if trace is not None:
+                    traced = {k for t in expanded for k in t.keys}
+                    trace.note(traced, "submitted")
                 results = self.storage.batch_set_v2(expanded, extra_info)
                 success = all(all(pool_results) for pool_results in results.values())
+                if trace is not None:
+                    trace.note(traced, "completed" if success else "failed")
                 if success:
                     self.stats["offload"] += 1
                     if self.stats["offload"] == 1:
@@ -1830,6 +1993,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         while self.state_remove_retries and self.state_remove_retries[0][0] <= now:
             due.append(self.state_remove_retries.popleft())
         if page_hashes:
+            if self.hole_trace is not None:
+                self.hole_trace.note(page_hashes, "removed", "state cap")
             _, obj, suffix, _ = next(e for e in self._pool_key_schema() if e[3])
             keys = self.storage._tag_keys([f"{h}_{suffix}_{obj}" for h in page_hashes])
             due += [(now, key, self._REMOVE_RETRIES) for key in keys]
@@ -1871,6 +2036,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 counts["recalled"] += 1
                 continue
             rc = self.storage.store.remove(key)
+            if self.hole_trace is not None and rc in (0, -704):
+                self.hole_trace.note([page], "removed", "budget")
             if rc == 0:
                 counts["removed"] += 1
             elif rc == -704:  # OBJECT_NOT_FOUND: already evicted

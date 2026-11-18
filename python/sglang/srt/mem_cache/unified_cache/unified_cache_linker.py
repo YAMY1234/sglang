@@ -250,6 +250,13 @@ class UnifiedCacheLinker(ABC):
     def unpin(self, rid: str) -> None:
         """Release what pin_hit holds for ``rid`` when it will not load."""
 
+    def trace_hole(
+        self, rid: str, transfers: list[PoolTransfer], keep: int, looked_up
+    ) -> None:
+        """SGLANG_LINKER_HOLE_TRACE: every stage, as admission finds objects
+        of ``rid``'s hit gone past page ``keep``; ``looked_up``: PP0's lookup
+        (wall clock), if known. Optional."""
+
     def start_prepin(
         self, rid: str, transfers: list[PoolTransfer], urgent: bool = False
     ) -> None:
@@ -645,6 +652,13 @@ class UnifiedCacheLinkerWrapper:
         ``keep``. Returns the pages still restorable (below ``admitted``)."""
         self.cache_linker.unpin(req.rid)
         self.pp_load_holes += 1
+        looked = self.pp_lookup_time.get(req.rid)
+        self.cache_linker.trace_hole(
+            req.rid,
+            transfers,
+            keep,
+            None if looked is None else time.time() - (time.monotonic() - looked),
+        )
         if self.hole_fallback:
             # _load_back admits it as a miss; the shorter hit needs no lookup.
             logger.info(
