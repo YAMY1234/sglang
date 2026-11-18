@@ -325,6 +325,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         # renewed at, object spans).
         self.prepins: dict[str, tuple] = {}
         self.prepin_pool: ThreadPoolExecutor | None = None
+        self.urgent_pool: ThreadPoolExecutor | None = None
         self.prepin_renew_s = envs.SGLANG_LINKER_PREPIN_RENEW_SECS.get()
         self.load_overlap = envs.SGLANG_LINKER_LOAD_OVERLAP.get()
         self.load_per_key = envs.SGLANG_LINKER_LOAD_PER_KEY.get()
@@ -794,19 +795,28 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         keys = next(t for t in transfers if t.name == PoolName.KV).keys
         return len(keys), keys[0], keys[-1]
 
-    def start_prepin(self, rid: str, transfers: list[PoolTransfer]) -> None:
+    def start_prepin(
+        self, rid: str, transfers: list[PoolTransfer], urgent: bool = False
+    ) -> None:
         """PP0: pin_hit for a request still waiting, on a worker thread
-        (SGLANG_LINKER_PREPIN_DEPTH); its admission takes the result."""
+        (SGLANG_LINKER_PREPIN_DEPTH); its admission takes the result. An
+        ``urgent`` pin runs on its own thread, not behind the window's."""
         tag = self._prepin_tag(transfers)
         entry = self.prepins.get(rid)
         if entry is not None:
-            if entry[0] == tag:
+            # A pin still queued behind the window moves to the urgent thread.
+            if entry[0] == tag and not (urgent and entry[1].cancel()):
                 return
-            self._drop_prepin(rid)
+            if entry[0] == tag:
+                del self.prepins[rid]
+            else:
+                self._drop_prepin(rid)
         if self.prepin_pool is None:
             self.prepin_pool = ThreadPoolExecutor(1, thread_name_prefix="mooncake-prepin")
+        if urgent and self.urgent_pool is None:
+            self.urgent_pool = ThreadPoolExecutor(1, thread_name_prefix="mooncake-prepin-urgent")
         num_pages, own, others, spans = self._pin_keys(transfers)
-        future = self.prepin_pool.submit(
+        future = (self.urgent_pool if urgent else self.prepin_pool).submit(
             self._start_sessions, own + others, spans, num_pages
         )
         self.prepins[rid] = (tag, future, num_pages, own, others, time.monotonic(), spans)
@@ -830,18 +840,20 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         for rid in [r for r, e in self.prepins.items() if now - e[5] > self._PREPIN_TTL_S]:
             self._drop_prepin(rid)
 
-    def keep_prepins(self, rids: Sequence[str]) -> None:
+    def keep_prepins(self, rids: Sequence[str], urgent: Sequence[str] = ()) -> None:
         """Async admission, after a pass: end the pre-pins of requests no longer
         in ``rids`` (the next-admitted window) and renew the kept ones older
         than the renewal interval. A renewal is a session start on the same
         keys, as a LEASE_EXPIRED read renews them; it shows a hole the same way."""
-        keep = set(rids)
+        keep, held = set(rids), set(urgent)
         for rid in [r for r in self.prepins if r not in keep]:
             self._drop_prepin(rid)
         now = time.monotonic()
         for rid, entry in list(self.prepins.items()):
             tag, future, num_pages, own, others, started, spans = entry
-            if now - started < self.prepin_renew_s or not future.done():
+            # A renewal in flight reads as not ready: never renew a hit that
+            # admission is already waiting for.
+            if rid in held or now - started < self.prepin_renew_s or not future.done():
                 continue
             if future.result()[0] != num_pages:
                 continue  # a hole: no session is held, its admission shrinks the hit

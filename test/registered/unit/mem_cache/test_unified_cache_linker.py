@@ -1836,7 +1836,7 @@ class _PinningLinker(_CountingLinker):
     def __init__(self, stage_restorable=(), pages=None):
         super().__init__(stage_restorable=stage_restorable)
         self.pages, self.pins, self.unpins = dict(pages or {}), [], []
-        self.prepin_starts = []
+        self.prepin_starts, self.urgent_starts = [], []
         self.last_pin_rpc_s = 0.004
 
     def pin_hit(self, rid, transfers):
@@ -1849,8 +1849,11 @@ class _PinningLinker(_CountingLinker):
 
     prepinned = None
 
-    def start_prepin(self, rid, transfers):
+    def start_prepin(self, rid, transfers, urgent=False):
         self.prepin_starts.append(rid)
+        if urgent:
+            self.urgent_starts.append(rid)
+
 
     def take_prepin(self, rid, transfers):
         return self.prepinned
@@ -2023,14 +2026,18 @@ def test_async_admission_skips_an_unready_hit_on_every_stage_until_its_prepin_la
         assert later._pp_fresh_hit_pages(req5, later.hit_markers["r"]) == 3
         assert pp0_backend.pins == []
         assert pp0.skip_counts == later.skip_counts == {}
-        assert pp0.async_counts == {"skipped": 1, "forced_sync": 0}
+        assert pp0.async_counts == {"skipped": 1, "urgent": 0}
 
 
-def test_async_admission_pins_a_hit_skipped_too_often_at_admission(
+def test_async_admission_never_pins_at_admission_and_holds_a_starving_hits_pin(
     full_linker_component,
 ):
+    # A hit skipped _SKIP_LIMIT passes in a row used to be pinned synchronously
+    # on PP0's scheduler thread (the H117 cost again). Now it is still skipped,
+    # its pre-pin turns urgent and stays in the window beyond the depth, and the
+    # first pass after the pin lands admits it with no store call.
     with (
-        envs.SGLANG_LINKER_PREPIN_DEPTH.override(4),
+        envs.SGLANG_LINKER_PREPIN_DEPTH.override(2),
         envs.SGLANG_LINKER_ASYNC_ADMISSION.override(True),
         patch(
             "sglang.srt.mem_cache.unified_cache.unified_cache_linker.get_storage_hash_str",
@@ -2038,6 +2045,8 @@ def test_async_admission_pins_a_hit_skipped_too_often_at_admission(
         ),
     ):
         backend = _PinningLinker(stage_restorable=[1, 3])
+        kept = []
+        backend.keep_prepins = lambda rids, urgent=(): kept.append((list(rids), list(urgent)))
         pp0 = _match_wrapper(
             full_linker_component,
             backend,
@@ -2047,13 +2056,28 @@ def test_async_admission_pins_a_hit_skipped_too_often_at_admission(
         )
         req = SimpleNamespace(rid="r", linker_pp_hit=None, linker_pp_lookup_pending=True)
         pp0.match(_KEY, req, _device_result(0))
-        for _ in range(UnifiedCacheLinkerWrapper._SKIP_LIMIT):
+        limit = UnifiedCacheLinkerWrapper._SKIP_LIMIT
+        for _ in range(limit + 2):
             hit = pp0.hit_markers["r"]
             assert pp0._pp_fresh_hit_pages(req, hit) == UnifiedCacheLinkerWrapper._SKIPPED
-        assert backend.pins == []
+        assert backend.pins == []  # never pinned on the scheduler thread
+        assert backend.urgent_starts == ["r"] * 3  # from the limit-th skip on
+        assert pp0.async_counts == {"skipped": limit + 2, "urgent": 3}
+
+        # A deep queue of hits ahead of it in policy order cannot push its pin
+        # out of the window: it is kept and held, the others fill the depth.
+        others = []
+        for rid in ("a", "b", "c"):
+            other = SimpleNamespace(rid=rid, linker_pp_hit=None, linker_pp_lookup_pending=True)
+            pp0.match(_KEY, other, _device_result(0))
+            others.append(other)
+        pp0.prepin(others + [req])
+        rids, urgent = kept[-1]
+        assert urgent == ["r"] and rids[0] == "r" and len(rids) == 1 + 2
+
+        backend.prepinned = 3
         assert pp0._pp_fresh_hit_pages(req, pp0.hit_markers["r"]) == 3
-        assert backend.pins == ["r"]
-        assert pp0.async_counts == {"skipped": 3, "forced_sync": 1}
+        assert backend.pins == [] and pp0.skip_counts == {}
 
 
 def test_async_admission_prepins_the_admission_window_and_ends_the_rest(
@@ -2069,7 +2093,7 @@ def test_async_admission_prepins_the_admission_window_and_ends_the_rest(
     ):
         backend = _PinningLinker(stage_restorable=[1, 3])
         kept = []
-        backend.keep_prepins = lambda rids: kept.append(list(rids))
+        backend.keep_prepins = lambda rids, urgent=(): kept.append(list(rids))
         pp0 = _match_wrapper(
             full_linker_component,
             backend,

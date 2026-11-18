@@ -267,6 +267,31 @@ class TestAsyncAdmissionPrepins(CustomTestCase):
         store.batch_get_session_end.assert_called_once_with(["gone-own", "gone-other"])
         self.assertEqual(list(linker.prepins), ["kept"])
 
+    def test_an_urgent_prepin_is_held_unrenewed_and_jumps_the_window_queue(self):
+        # A hit admission keeps skipping must not lose its pin to a renewal in
+        # flight (it reads as not ready) nor wait behind the window's pins.
+        linker = self._linker_with({"r": (2, 5.0)})
+        store = linker.storage.store
+        linker.keep_prepins(["r"], urgent=["r"])
+        self._flush(linker)
+        store.batch_get_session_start.assert_not_called()
+        self.assertTrue(linker.prepins["r"][1].done())
+
+        linker.urgent_pool = None
+        gate = threading.Event()
+        linker.prepin_pool.submit(lambda: gate.wait(5))  # the window's thread is busy
+        queued = Future()  # a window pin of "q" still queued behind it
+        linker.prepins["q"] = (("tag", "q"), queued, 2, ["q-own"], [], time.monotonic(), [(False, 0, 2)])
+        store.batch_get_session_start.side_effect = lambda keys: [0] * len(keys)
+        with (
+            patch.object(linker, "_prepin_tag", return_value=("tag", "q")),
+            patch.object(linker, "_pin_keys", return_value=(2, ["q-own"], [], [(False, 0, 2)])),
+        ):
+            linker.start_prepin("q", [], urgent=True)
+            self.assertEqual(linker.prepins["q"][1].result(timeout=5)[0], 2)
+        self.assertTrue(queued.cancelled())
+        gate.set()
+
     def test_a_drop_ends_the_sessions_only_after_a_queued_renewal(self):
         linker = self._linker_with({"r": (2, 5.0)})
         store = linker.storage.store

@@ -249,8 +249,11 @@ class UnifiedCacheLinker(ABC):
     def unpin(self, rid: str) -> None:
         """Release what pin_hit holds for ``rid`` when it will not load."""
 
-    def start_prepin(self, rid: str, transfers: list[PoolTransfer]) -> None:
-        """PP0: begin pin_hit for a waiting request off the scheduler thread."""
+    def start_prepin(
+        self, rid: str, transfers: list[PoolTransfer], urgent: bool = False
+    ) -> None:
+        """PP0: begin pin_hit for a waiting request off the scheduler thread;
+        ``urgent``: a hit skipped too often, pinned ahead of the window."""
 
     def take_prepin(self, rid: str, transfers: list[PoolTransfer]) -> Optional[int]:
         """PP0: the result of a finished start_prepin of this hit, else None."""
@@ -259,9 +262,10 @@ class UnifiedCacheLinker(ABC):
     def release_stale_prepins(self) -> None:
         """PP0: release pre-pins whose requests were not admitted in time."""
 
-    def keep_prepins(self, rids: Sequence[str]) -> None:
+    def keep_prepins(self, rids: Sequence[str], urgent: Sequence[str] = ()) -> None:
         """PP0, async admission: end the pre-pins of requests not in ``rids``
-        and renew the kept ones before their sessions lapse."""
+        and renew the kept ones before their sessions lapse; ``urgent`` ones
+        (in ``rids``) are held as they are until admission takes them."""
 
     @abstractmethod
     def reset(self) -> None:
@@ -293,7 +297,8 @@ class UnifiedCacheLinkerWrapper:
     """Drives an external KV store on behalf of one :class:`UnifiedRadixCache`."""
 
     # Async admission: the relayed verdict of a skipped hit, and the passes in a
-    # row a hit may be skipped before PP0 pins it at admission (no starvation).
+    # row after which its pre-pin goes ahead of the window and is held until
+    # admission takes it (no starvation; PP0 still never pins at admission).
     _SKIPPED = -1
     _SKIP_LIMIT = 3
 
@@ -379,12 +384,12 @@ class UnifiedCacheLinkerWrapper:
         self.prepin_depth = envs.SGLANG_LINKER_PREPIN_DEPTH.get() if self.pp_size > 1 else 0
         self.prepin_counts = {"ready": 0, "missed": 0}
         # Async admission (PP0 decides, every stage follows): rid -> passes in a
-        # row its pre-pin was not ready; after _SKIP_LIMIT PP0 pins it itself.
+        # row its pre-pin was not ready; from _SKIP_LIMIT on its pin is urgent.
         self.async_admission = bool(
             self.prepin_depth and envs.SGLANG_LINKER_ASYNC_ADMISSION.get()
         )
         self.skip_counts: dict[str, int] = {}
-        self.async_counts = {"skipped": 0, "forced_sync": 0}
+        self.async_counts = {"skipped": 0, "urgent": 0}
         # Hits admitted in the current pass, and their moving average per pass.
         self.pass_hits = 0
         self.hits_per_pass = 0.0
@@ -552,20 +557,16 @@ class UnifiedCacheLinkerWrapper:
             if self.prepin_depth:
                 taken = self.cache_linker.take_prepin(req.rid, transfers)
                 self.prepin_counts["missed" if taken is None else "ready"] += 1
-            if (
-                taken is None
-                and self.async_admission
-                and self.skip_counts.get(req.rid, 0) < self._SKIP_LIMIT
-            ):
+            if taken is None and self.async_admission:
                 # Skip this pass rather than wait on the store; the relay
                 # carries the skip, so every stage skips it too.
                 pinned = self._SKIPPED
-                self.cache_linker.start_prepin(req.rid, transfers)
+                urgent = self.skip_counts.get(req.rid, 0) + 1 >= self._SKIP_LIMIT
+                self.async_counts["urgent"] += urgent
+                self.cache_linker.start_prepin(req.rid, transfers, urgent=urgent)
             else:
                 # Not ready: pin now. Without async admission, deferring would
                 # end this pass's admission for every request behind it.
-                if taken is None and self.async_admission:
-                    self.async_counts["forced_sync"] += 1
                 pinned = (
                     self.cache_linker.pin_hit(req.rid, transfers)
                     if taken is None
@@ -634,18 +635,25 @@ class UnifiedCacheLinkerWrapper:
         self.hits_per_pass = 0.8 * self.hits_per_pass + 0.2 * self.pass_hits
         self.pass_hits = 0
         depth = min(self.prepin_depth, max(2, math.ceil(2 * self.hits_per_pass) + 1))
-        window = []
+        # Hits skipped _SKIP_LIMIT passes in a row hold their pins outside the
+        # window's count, so a deep queue cannot push them out.
+        urgent = [
+            rid for rid, n in self.skip_counts.items() if n >= self._SKIP_LIMIT
+        ]
+        window = list(urgent)
+        taken = 0
         for req in waiting:
-            if len(window) >= depth:
+            if taken >= depth:
                 break
             hit = self.hit_markers.get(req.rid)
-            if hit is None:
+            if hit is None or req.rid in urgent:
                 continue
             transfers = self._lookup_transfers(hit.tail_hashes)
             if transfers:
                 self.cache_linker.start_prepin(req.rid, transfers)
                 window.append(req.rid)
-        self.cache_linker.keep_prepins(window)
+                taken += 1
+        self.cache_linker.keep_prepins(window, urgent)
 
     def _pp_relookup_hit_pages(
         self, req: Req, hit: ExternalCacheHitMarker, forced: bool
