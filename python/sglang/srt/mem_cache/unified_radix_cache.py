@@ -330,6 +330,12 @@ class UnifiedRadixCache(BasePrefixCache):
         self.pp_size = params.pp_size
         self.work_list: list[torch.distributed.Work] = []
         self.pp_sync_window = 1
+        # SGLANG_LINKER_PP_COUNTS_PIGGYBACK: PP0 queues its offload commits in
+        # pp_counts_out; later stages take them from pp_counts_in (filled from
+        # the request relay) and forward them through pp_counts_out.
+        self.pp_counts_piggyback = False
+        self.pp_counts_in: deque[list[int]] = deque()
+        self.pp_counts_out: list[list[int]] = []
         if envs.SGLANG_PP_SYNC_WINDOW.get() and self.pp_size > 1:
             self.pp_sync_window = self.pp_size + get_parallel().pp_async_batch_depth
             logger.info(
@@ -4291,6 +4297,9 @@ class UnifiedRadixCache(BasePrefixCache):
         or their trees (and admissions) diverge. PP0 decides the count and the
         verdicts and _pp_sync carries them down; a later stage first waits for
         its own puts of those nodes, issued at the same logical step."""
+        if self.pp_counts_piggyback:
+            self._piggyback_linker_offloads()
+            return
         self._drain_async_work()
         finish_counts = torch.tensor(
             [self.linker.num_completed_offloads()], dtype=torch.int, device="cpu"
@@ -4310,6 +4319,41 @@ class UnifiedRadixCache(BasePrefixCache):
         self.linker.commit_completed_offloads(
             [bool(success) for success in successes.tolist()]
         )
+
+    def _piggyback_linker_offloads(self) -> None:
+        """_check_linker_events_pp without PP communication: PP0 decides the
+        count and verdicts (reduced over its attention TP/CP ranks only) and every
+        later stage adopts them from the request relay received earlier in the
+        same loop iteration (GLM's _piggyback_ready_counts)."""
+        if self.pp_rank == 0:
+            finish_counts = torch.tensor(
+                [self.linker.num_completed_offloads()], dtype=torch.int, device="cpu"
+            )
+            self._all_reduce_attn_groups(finish_counts, torch.distributed.ReduceOp.MIN)
+            offload_count = int(finish_counts.item())
+            verdicts: list[int] = []
+            if offload_count:
+                successes = torch.tensor(
+                    self.linker.take_completed_offloads(offload_count),
+                    dtype=torch.int,
+                    device="cpu",
+                )
+                self._all_reduce_attn_groups(successes, torch.distributed.ReduceOp.MIN)
+                verdicts = [int(v) for v in successes.tolist()]
+            row = [offload_count, *verdicts]
+        else:
+            assert self.pp_counts_in, "linker offload counts missing from the PP relay"
+            row = self.pp_counts_in.popleft()
+            offload_count = row[0]
+            verdicts = row[1:]
+            if offload_count:
+                self.linker.wait_completed_offloads(offload_count)
+                # Local outcomes are dropped: PP0's verdicts bind every stage.
+                self.linker.take_completed_offloads(offload_count)
+        if self.pp_rank + 1 < self.pp_size:
+            self.pp_counts_out.append(row)
+        if offload_count:
+            self.linker.commit_completed_offloads([bool(v) for v in verdicts])
 
     def linker_take_verdicts(self):
         """PP0: the batched-relay admission verdicts to send with this round."""

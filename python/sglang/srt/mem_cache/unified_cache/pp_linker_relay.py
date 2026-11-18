@@ -27,6 +27,14 @@ class PPLinkerActions:
 
 
 @dataclass
+class PPLinkerOffloadCounts:
+    """PP0's linker offload commits of one loop iteration, appended to the request
+    relay: one [count, *verdicts] row per _check_linker_events_pp call."""
+
+    counts: list = field(default_factory=list)
+
+
+@dataclass
 class _Request:
     req: object
     cycle: int

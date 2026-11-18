@@ -383,7 +383,10 @@ from sglang.srt.utils.weight_versions import (
     compute_weight_version_spans,
     record_weight_version_events,
 )
-from sglang.srt.mem_cache.unified_cache.pp_linker_relay import PPLinkerActions
+from sglang.srt.mem_cache.unified_cache.pp_linker_relay import (
+    PPLinkerActions,
+    PPLinkerOffloadCounts,
+)
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import LinkerAdmissionVerdicts
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
@@ -2402,6 +2405,13 @@ class Scheduler(
         if verdicts:
             received = [r for r in received if not isinstance(r, LinkerAdmissionVerdicts)]
             self.tree_cache.linker_apply_verdicts(verdicts[-1])
+        # PP0's offload commits of the sending stage's iteration; consumed by this
+        # iteration's _check_linker_events_pp, forwarded by this stage's own send.
+        offload_counts = [r for r in received if isinstance(r, PPLinkerOffloadCounts)]
+        if offload_counts:
+            received = [r for r in received if not isinstance(r, PPLinkerOffloadCounts)]
+            for oc in offload_counts:
+                self.tree_cache.pp_counts_in.extend(oc.counts)
         # Prefetch-relay actions apply after this round's requests are queued.
         linker_actions = [r for r in received if isinstance(r, PPLinkerActions)]
         if linker_actions:

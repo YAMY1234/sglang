@@ -1014,6 +1014,10 @@ class Envs:
     SGLANG_LINKER_PREFETCH_MAX_STATES = EnvInt(64)
     # Log each admitted request's prefix and extend length per PP stage (debug).
     SGLANG_LINKER_PP_ADMIT_TRACE = EnvBool(False)
+    # PD prefill under PP: PP0's linker offload-commit counts and verdicts ride the
+    # request relay (as SGLANG_PP_HICACHE_COUNTS_PIGGYBACK does for HiCache) instead
+    # of a per-step PP-chain all-reduce.
+    SGLANG_LINKER_PP_COUNTS_PIGGYBACK = EnvBool(False)
     # Prefetch mode (GLM names): a published read keeps its prefix locked until
     # its request is admitted, the held prefixes under this share of the Full
     # device pool (0 releases at publish; PP requires > 0).

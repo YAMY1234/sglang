@@ -46,6 +46,7 @@ from sglang.srt.observability.scheduler_stage_metrics import (
     scheduler_stage_method,
 )
 from sglang.srt.runtime_context import get_disagg, get_parallel, get_spec
+from sglang.srt.mem_cache.unified_cache.pp_linker_relay import PPLinkerOffloadCounts
 from sglang.srt.sampling.sampling_observer_pp import (
     add_auxiliary_output_to_pp_tensors,
     pop_auxiliary_output_from_pp_tensors,
@@ -283,6 +284,18 @@ class SchedulerPPMixin:
                 pp_sync_window(),
             )
         early_send = self._pp_pd_early_send_enabled()
+        linker_counts_piggyback = (
+            envs.SGLANG_LINKER_PP_COUNTS_PIGGYBACK.get()
+            and get_parallel().pp_size > 1
+            and not get_parallel().attn_dp_enabled
+            and getattr(self.tree_cache, "linker", None) is not None
+        )
+        if linker_counts_piggyback:
+            self.tree_cache.pp_counts_piggyback = True
+            logger.info(
+                "PP PD prefill: linker offload commits ride the request relay "
+                "(SGLANG_LINKER_PP_COUNTS_PIGGYBACK)."
+            )
         if early_send:
             self.disagg_prefill_early_sent_rids = set()
             self.disagg_prefill_early_send_pending = deque()
@@ -407,6 +420,13 @@ class SchedulerPPMixin:
                 elif tmbs[next_mb_id] is not None:
                     self.process_disagg_prefill_inflight_queue(next_release_rids)
                 if not self.pp_group.is_last_rank:
+                    if linker_counts_piggyback:
+                        # This iteration's commits, taken on every rank so none accumulate.
+                        recv_reqs = [
+                            *recv_reqs,
+                            PPLinkerOffloadCounts(self.tree_cache.pp_counts_out),
+                        ]
+                        self.tree_cache.pp_counts_out = []
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
                         recv_reqs, async_send=True
                     )
