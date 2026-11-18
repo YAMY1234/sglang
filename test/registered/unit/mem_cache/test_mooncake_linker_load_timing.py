@@ -854,5 +854,145 @@ class TestMooncakeLinkerDebugWaitAllLayers(CustomTestCase):
         device.synchronize.assert_not_called()
 
 
+class _LeaseStore:
+    """remove(): -706 for keys in ``leased`` (once each), else 0."""
+
+    def __init__(self, leased=()):
+        self.leased, self.removed = set(leased), []
+
+    def remove(self, key):
+        if key in self.leased:
+            self.leased.discard(key)
+            return -706
+        self.removed.append(key)
+        return 0
+
+
+def _budget_linker(budget, stage, state_units=4, store=None):
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.pools = {PoolName.KV: _Pool(PoolName.KV), PoolName.MAMBA: _Pool(PoolName.MAMBA)}
+    linker.pool_group = SimpleNamespace(resolve_transfers=lambda transfers, **kwargs: transfers)
+    linker.offload_pools = {PoolName.KV, PoolName.MAMBA}
+    linker.gc_frozen, linker.state_path_cap, linker.page_size = True, 0, 64
+    linker.record_offload_ready = lambda: []
+    linker.offload_queue = queue.Queue()
+    linker.pending_loads, linker.load_queued_at, linker.pinned = {}, {}, {}
+    linker.log_load_timing = False
+    linker.storage = SimpleNamespace(
+        store=store or _LeaseStore(),
+        _tag_keys=lambda keys: keys,
+        _get_hybrid_page_component_keys=lambda keys, transfer: (keys, 1),
+        pool_suffixes={},
+        mla_suffix=f"pp{stage}",
+        recently_loaded=mooncake_direct_linker._RecentKeys(16),
+    )
+    linker.store_tree = mooncake_direct_linker._StoreTree(budget, state_units)
+    linker.page_remove_retries, linker.page_remove_counts = deque(), Counter()
+    return linker
+
+
+def _pages(*names):
+    return SimpleNamespace(name=PoolName.KV, keys=list(names), host_indices=range(len(names)),
+                           hit_policy=PoolHitPolicy.ALL_PAGES)
+
+
+def _state(page):
+    return SimpleNamespace(name=PoolName.MAMBA, keys=[page], host_indices=range(1),
+                           hit_policy=PoolHitPolicy.TRAILING_PAGES)
+
+
+def _queued_victim_pages(linker, drain=False):
+    """Pages whose removal is queued (each stage names its own objects)."""
+    pages = []
+    while not linker.offload_queue.empty():
+        task = linker.offload_queue.get_nowait()
+        if task[0] == "remove":
+            pages += sorted({key.split("_")[0] for key in task[1]})
+            if drain:
+                linker._remove_pages(task[1])
+    return pages
+
+
+class TestStoreBudgetTailFirst(CustomTestCase):
+    """SGLANG_LINKER_STORE_BUDGET_PAGES: each stage evicts its stored prefixes
+    leaf first, least recently used, and every stage picks the same pages
+    (Rhea pm-lk2: Mooncake's own eviction left holes in 13% of PP0 lookups)."""
+
+    EVENTS = [
+        ("offload", ["a1", "a2"], None, (), ["a1", "a2"]),
+        ("offload", ["a3", "a4"], None, ("a4",), ["a1", "a2", "a3", "a4"]),
+        ("offload", ["b1", "b2", "b3"], None, ("b3",), ["b1", "b2", "b3"]),
+        ("load", ["a1", "a2", "a3", "a4"]),
+        ("offload", ["c1", "c2", "c3"], None, (), ["c1", "c2", "c3"]),
+        ("offload", ["a5"], None, (), ["a1", "a2", "a3", "a4", "a5"]),
+        ("offload", ["d1", "d2"], None, ("d2",), ["d1", "d2"]),
+    ]
+
+    def _play(self, linker, drain):
+        victims = []
+        for event in self.EVENTS:
+            if event[0] == "offload":
+                _, pages, _, states, path = event
+                transfers = [_pages(*pages)] + [_state(page) for page in states]
+                linker.offload(transfers, path_hashes=lambda path=path: path)
+                # The put task goes first; removals queue after it.
+                linker.offload_queue.get_nowait()
+            else:
+                linker.load("r-" + event[1][0], [_pages(*event[1])])
+            victims.append(_queued_victim_pages(linker, drain))
+        return victims
+
+    def test_every_stage_evicts_the_same_pages_whatever_its_removals_did(self):
+        # Stage 0 removes at once and a lease refuses one of its removals;
+        # stage 1 has not run any removal yet. Their keys differ (own suffix).
+        stage0 = _budget_linker(16, 0, store=_LeaseStore(leased={"b3_pp0_k"}))
+        stage1 = _budget_linker(16, 1)
+        victims0, victims1 = self._play(stage0, drain=True), self._play(stage1, drain=False)
+        self.assertEqual(victims0, victims1)
+        self.assertTrue(any(victims0))
+        self.assertEqual(stage0.page_remove_counts["lease_retries"], 1)
+        self.assertEqual(len(stage0.page_remove_retries), 1)
+
+    def test_tail_first_and_a_loaded_prefix_outlives_an_untouched_one(self):
+        linker = _budget_linker(16, 0)
+        evicted = [page for batch in self._play(linker, drain=False) for page in batch]
+        tree = linker.store_tree
+        # Never a page whose stored child was kept: every survivor's parent survives.
+        for page, node in tree.nodes.items():
+            self.assertTrue(node[0] is None or node[0] in tree.nodes, page)
+        # b (written before the load of a, never used since) goes before a.
+        self.assertTrue({"b1", "b2", "b3"} <= set(evicted))
+        self.assertTrue({"a1", "a2", "a3", "a4", "a5"} <= set(tree.nodes))
+        self.assertEqual(evicted.index("b3"), 0)  # its tail first
+
+    def test_budget_hysteresis_and_state_pages(self):
+        linker = _budget_linker(10, 0, state_units=4)
+        tree = linker.store_tree
+        linker.offload([_pages("a1", "a2", "a3"), _state("a3")], path_hashes=lambda: ["a1", "a2", "a3"])
+        self.assertEqual(tree.units, 3 + 4)
+        self.assertEqual(tree.evict(), [])  # within the budget: nothing
+        linker.offload([_pages("b1", "b2"), _state("b2")], path_hashes=lambda: ["b1", "b2"])
+        # 13 units > 10: evict down to 95% (9), oldest leaf first (a3 with its state).
+        self.assertLessEqual(tree.units, 9)
+        linker.offload_queue.get_nowait(), linker.offload_queue.get_nowait()
+        removal = linker.offload_queue.get_nowait()
+        self.assertEqual(removal, ("remove", ["a3_pp0_k", "a3_pp0_mamba"]))
+
+    def test_a_page_stored_before_its_parent_keeps_the_parent(self):
+        tree = mooncake_direct_linker._StoreTree(3, 4)
+        tree.add(["c"], "b", ())  # b not stored yet
+        tree.add(["b"], "a", ())
+        tree.touch(["c"])  # c is now newer than b
+        tree.add(["x", "y"], None, ())  # 4 units > 3
+        # b still has a stored child: c goes first, then b, never b before c.
+        self.assertEqual([page for page, _ in tree.evict()], ["c", "b"])
+
+    def test_off_by_default(self):
+        linker = _budget_linker(16, 0)
+        linker.store_tree = None
+        linker.offload([_pages("a1")], path_hashes=lambda: ["a1"])
+        self.assertEqual(linker.offload_queue.qsize(), 1)  # the put only
+
+
 if __name__ == "__main__":
     unittest.main()

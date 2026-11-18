@@ -994,7 +994,9 @@ class UnifiedCacheLinkerWrapper:
         cache = self.cache
         lock_params = cache.inc_lock_ref(node_id).to_dec_params()
         path = {}
-        if getattr(self.cache_linker, "state_path_cap", 0):
+        if getattr(self.cache_linker, "state_path_cap", 0) or getattr(
+            self.cache_linker, "store_tree", None
+        ):
             path["path_hashes"] = lambda: cache.tree_core.get_prefix_hash_values(node_id)
         try:
             queued = self.cache_linker.offload(

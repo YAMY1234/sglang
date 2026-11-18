@@ -957,6 +957,15 @@ class Envs:
     # conversation resumes from its deepest states; older linear ones are removed
     # once a deeper one lands, branch points (shared prompts) are kept.
     SGLANG_LINKER_STATE_PATH_CAP = EnvInt(0)
+    # Each stage keeps at most this many of its own pages in the store (0: off),
+    # removing least recently used stored prefixes from the tail (leaf pages
+    # first) down to 95% of it once over, so the master's eviction, which drops
+    # single objects in the middle of prefixes, rarely runs: set its
+    # eviction_high_watermark_ratio above this budget's share of the store.
+    SGLANG_LINKER_STORE_BUDGET_PAGES = EnvInt(0)
+    # A stored KDA state counts as this many pages toward that budget (its size
+    # over a page's objects; the same on every stage).
+    SGLANG_LINKER_STATE_PAGE_EQUIV = EnvInt(431)
     # Under PP, after each scheduling pass PP0 starts the all-stage pins of the
     # next this-many waiting requests with a hit on a worker thread, so their
     # admission takes a finished pin instead of waiting on the store (0: off).

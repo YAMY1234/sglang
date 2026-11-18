@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import glob
 import hashlib
+import heapq
 import logging
 import os
 import re
@@ -209,6 +210,104 @@ class _RecentKeys:
         return key in self.keys
 
 
+class _StoreTree:
+    """SGLANG_LINKER_STORE_BUDGET_PAGES: the pages this stage offloaded, as a
+    tree (page hash -> [parent hash, stored children, last-use tick, has a
+    state]), evicted leaf first in least-recently-used order down to 95% of
+    the budget once over it. Mooncake's own eviction removes single objects
+    and leaves holes in the middle of stored prefixes (Rhea pm-lk2: holes in
+    13% of PP0 lookups from the store's watermark on); this keeps prefixes
+    whole. Every PP stage must pick the same victims, so the inputs are only
+    what every stage sees in the same order on its scheduler thread (offload
+    and load calls, page counts with a state as ``state_units`` pages) and
+    ties break by tick then hash. Scheduler thread only."""
+
+    def __init__(self, budget: int, state_units: int, low_fraction: float = 0.95):
+        self.budget, self.state_units = budget, state_units
+        self.low = int(budget * low_fraction)
+        self.nodes: dict[str, list] = {}
+        # Stored pages whose parent was not stored yet: parent -> count.
+        self.orphans: Counter = Counter()
+        self.heap: list[tuple[int, str]] = []
+        self.units = self.tick = self.states = 0
+        self.counts: Counter = Counter()
+
+    def _push_if_leaf(self, page: str, node: list) -> None:
+        if node[1] == 0:
+            heapq.heappush(self.heap, (node[2], page))
+
+    def add(self, pages: list[str], parent: str | None, states: Sequence[str]) -> None:
+        """An offload of ``pages`` (in path order) under ``parent``, with a
+        state stored at each of ``states``."""
+        self.tick += 1
+        for page in pages:
+            node = self.nodes.get(page)
+            if node is None:
+                node = [parent, self.orphans.pop(page, 0), self.tick, False]
+                self.nodes[page] = node
+                self.units += 1
+                above = self.nodes.get(parent) if parent is not None else None
+                if above is not None:
+                    above[1] += 1
+                elif parent is not None:
+                    self.orphans[parent] += 1
+            else:
+                node[2] = self.tick
+            self._push_if_leaf(page, node)
+            parent = page
+        for page in states:
+            node = self.nodes.get(page)
+            if node is not None and not node[3]:
+                node[3] = True
+                self.units += self.state_units
+                self.states += 1
+
+    def touch(self, pages: Sequence[str]) -> None:
+        """A load of ``pages``: they are used now."""
+        self.tick += 1
+        for page in pages:
+            node = self.nodes.get(page)
+            if node is not None:
+                node[2] = self.tick
+                self._push_if_leaf(page, node)
+
+    def drop_state(self, page: str) -> None:
+        node = self.nodes.get(page)
+        if node is not None and node[3]:
+            node[3] = False
+            self.units -= self.state_units
+            self.states -= 1
+
+    def evict(self) -> list[tuple[str, bool]]:
+        """(page, had a state) of the pages to remove, leaves first."""
+        if self.units <= self.budget:
+            return []
+        victims = []
+        while self.units > self.low and self.heap:
+            tick, page = heapq.heappop(self.heap)
+            node = self.nodes.get(page)
+            if node is None or node[1] or node[2] != tick:
+                continue  # gone, not a leaf any more, or used since
+            del self.nodes[page]
+            self.units -= 1 + (self.state_units if node[3] else 0)
+            self.states -= node[3]
+            victims.append((page, node[3]))
+            parent = node[0]
+            above = self.nodes.get(parent) if parent is not None else None
+            if above is not None:
+                above[1] -= 1
+                self._push_if_leaf(parent, above)
+            elif parent is not None:
+                self.orphans[parent] -= 1
+                if self.orphans[parent] <= 0:
+                    del self.orphans[parent]
+        self.counts["evicted"] += len(victims)
+        if len(self.heap) > 4 * len(self.nodes) + 1024:
+            self.heap = [(n[2], p) for p, n in self.nodes.items() if n[1] == 0]
+            heapq.heapify(self.heap)
+        return victims
+
+
 class _SessionRefs:
     """This client's read sessions. Mooncake keeps one session per key and
     client, so any end closes it for every holder: with ``counted`` a key's
@@ -267,6 +366,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     _numa_first_request_logged = True
     # Refcount read sessions per key (async admission or load overlap).
     count_sessions = False
+    # SGLANG_LINKER_STORE_BUDGET_PAGES: this stage's stored pages (None: off).
+    store_tree: "_StoreTree | None" = None
     # Held pins of launched loads are renewed this often (s); see _renew_held_pins.
     prepin_renew_s = 2.0
     prepin_pool: "ThreadPoolExecutor | None" = None
@@ -366,6 +467,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.state_remove_counts: Counter = Counter()
         # (retry at, key, attempts left): removals a live lease refused (-706).
         self.state_remove_retries: deque = deque()
+        # SGLANG_LINKER_STORE_BUDGET_PAGES removals: (retry at, key, attempts left).
+        self.page_remove_retries: deque = deque()
+        self.page_remove_counts: Counter = Counter()
         self.num_layers = self.pool_group.num_layers
 
         parallel = get_parallel()
@@ -407,6 +511,23 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 "SGLANG_LINKER_STATE_PATH_CAP needs Mooncake store.remove(); path cap off"
             )
             self.state_path_cap = 0
+        budget = envs.SGLANG_LINKER_STORE_BUDGET_PAGES.get()
+        self.store_tree = None
+        if budget > 0 and self.offload_owner:
+            if callable(getattr(self.storage.store, "remove", None)):
+                self.store_tree = _StoreTree(
+                    budget, envs.SGLANG_LINKER_STATE_PAGE_EQUIV.get()
+                )
+                logger.info(
+                    "Linker store budget: %d pages per stage (a state counts %d), "
+                    "evicted tail first",
+                    budget,
+                    self.store_tree.state_units,
+                )
+            else:
+                logger.warning(
+                    "SGLANG_LINKER_STORE_BUDGET_PAGES needs Mooncake store.remove(); off"
+                )
         self.storage.mem_pool_host = self.pool_group
         self.storage.registered_pools = self.pools
         self.storage.recently_loaded = _RecentKeys(500_000)
@@ -947,6 +1068,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             return False
         if rid in self.pending_loads:
             raise RuntimeError(f"Mooncake load for rid={rid} is already queued.")
+        if self.store_tree is not None:
+            kv = next((t for t in transfers if t.name == PoolName.KV), None)
+            if kv is not None:
+                self.store_tree.touch(list(kv.keys))
         self.pending_loads[rid] = expanded
         self.storage.recently_loaded.add(
             self.pinned.get(rid) or self._object_keys(expanded)[0]
@@ -1406,11 +1531,46 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         tokens = len(kv.keys) * self.page_size
         victims = []
         state = next((t for t in expanded if t.name == PoolName.MAMBA), None)
-        if self.state_path_cap and state is not None and path_hashes is not None:
-            victims = self._cap_state_path(list(state.keys), path_hashes())
+        path = path_hashes() if path_hashes is not None else None
+        if self.state_path_cap and state is not None and path is not None:
+            victims = self._cap_state_path(list(state.keys), path)
         ready_events = self.record_offload_ready()
         self.offload_queue.put((expanded, tokens, ready_events, session_id, victims))
+        tree = self.store_tree
+        if tree is not None:
+            for page in victims:
+                tree.drop_state(page)
+            pages = list(kv.keys)
+            tree.add(
+                pages,
+                self._parent_page(pages, path),
+                list(state.keys) if state is not None else (),
+            )
+            self._queue_tail_eviction(tree.evict())
         return True
+
+    @staticmethod
+    def _parent_page(pages: list[str], path: list[str] | None) -> str | None:
+        """The stored page before ``pages`` on their path (root to node)."""
+        if not path or not pages:
+            return None
+        try:
+            index = path.index(pages[0])
+        except ValueError:
+            return None
+        return path[index - 1] if index > 0 else None
+
+    def _queue_tail_eviction(self, victims: list[tuple[str, bool]]) -> None:
+        """This stage's objects of the evicted pages, removed on the offload
+        thread after the puts queued before (one of them may write them)."""
+        if not victims:
+            return
+        keys = []
+        for _, obj, suffix, trailing in self._pool_key_schema():
+            keys += [
+                f"{page}_{suffix}_{obj}" for page, had_state in victims if had_state or not trailing
+            ]
+        self.offload_queue.put(("remove", self.storage._tag_keys(keys)))
 
     def _cap_state_path(self, new_states: list[str], path: list[str]) -> list[str]:
         """Record the states this offload writes on their path and return the
@@ -1453,6 +1613,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             try:
                 if task is None:
                     return
+                if task[0] == "remove":
+                    self._remove_pages(task[1])
+                    self._maybe_log_stats()
+                    continue
                 expanded, tokens, ready_events, session_id, victims = task
                 for event in ready_events:
                     event.synchronize()
@@ -1478,6 +1642,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     self.write_bytes["states"] += put.get(PoolName.MAMBA, 0)
                     if self.state_path_cap:
                         self._remove_states(victims)
+                if self.store_tree is not None and self.page_remove_retries:
+                    self._remove_pages([])
                 self.offload_results.put(success)
                 self._maybe_log_stats()
             except BaseException:
@@ -1513,6 +1679,32 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             else:
                 self.state_remove_failed += 1
 
+    def _remove_pages(self, keys: list[str]) -> None:
+        """Remove the objects of pages the store budget evicted (offload thread),
+        and retry earlier ones a live lease refused (-706) once it can have
+        expired. Until removed they still take store space; the budget counts
+        them gone at once, since every stage has to decide alike and removals
+        land at different times on each (the master's higher watermark covers
+        the slack)."""
+        now = time.monotonic()
+        due, retries = [], self.page_remove_retries
+        while retries and retries[0][0] <= now:
+            due.append(retries.popleft())
+        due += [(now, key, self._REMOVE_RETRIES) for key in keys]
+        retry_at = now + envs.SGLANG_LINKER_LEASE_TTL_SECS.get() + 1
+        counts = self.page_remove_counts
+        for _, key, attempts in due:
+            rc = self.storage.store.remove(key)
+            if rc == 0:
+                counts["removed"] += 1
+            elif rc == -704:  # OBJECT_NOT_FOUND: already evicted
+                counts["already_gone"] += 1
+            elif rc == -706 and attempts > 0:  # OBJECT_HAS_LEASE
+                counts["lease_retries"] += 1
+                retries.append((retry_at, key, attempts - 1))
+            else:
+                counts["failed"] += 1
+
     def _maybe_log_stats(self, every_s: float = 60.0) -> None:
         now = time.monotonic()
         if now - self.stats_logged_at < every_s:
@@ -1544,6 +1736,23 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             looked["lookups"],
             looked["hit_pages"],
         )
+        tree = self.store_tree
+        if tree is not None:
+            counts = self.page_remove_counts
+            logger.info(
+                "Linker store budget: %d of %d pages stored (%d pages with a state), "
+                "%d evicted so far; objects removed %d, already gone %d, lease "
+                "retries %d (pending %d), failed %d",
+                tree.units,
+                tree.budget,
+                tree.states,
+                tree.counts["evicted"],
+                counts["removed"],
+                counts["already_gone"],
+                counts["lease_retries"],
+                len(self.page_remove_retries),
+                counts["failed"],
+            )
         lookup_keys = [keys for keys, _ in lookups]
         lookup_ms = [seconds * 1e3 for _, seconds in lookups]
         pin_keys = [keys for keys, _ in pins]
