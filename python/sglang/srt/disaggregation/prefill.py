@@ -1553,7 +1553,10 @@ class SchedulerDisaggregationPrefillMixin:
             and not req.return_logprob
             and not req.return_sampling_mask
             and req.grammar is None
-            and req.bootstrap_host != FAKE_BOOTSTRAP_HOST
+            and (
+                req.bootstrap_host != FAKE_BOOTSTRAP_HOST
+                or envs.SGLANG_DISAGG_FAKE_SENDER_ASYNC_INDICES.get()
+            )
             and getattr(req.disagg_kv_sender, "supports_host_tensor_indices", False)
         )
 
@@ -1750,8 +1753,8 @@ class SchedulerDisaggregationPrefillMixin:
         ) or (
             # Rig only: the fake sender reads no index values, so it can take the
             # Mooncake readback path and skip a sync production never pays.
-            envs.SGLANG_DISAGG_FAKE_SENDER_ASYNC_INDICES.get()
-            and isinstance(sender, FakeKVSender)
+            isinstance(sender, FakeKVSender)
+            and sender.supports_host_tensor_indices
         )
 
         def _host_indices(indices):
