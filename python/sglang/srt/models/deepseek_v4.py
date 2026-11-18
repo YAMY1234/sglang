@@ -227,6 +227,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
 )
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.utils.log_utils import print_info_once
 
 # NPU-only: bind torch_npu here so _compute_q_b / _forward_prepare can call
 # torch_npu.npu_rms_norm directly (imports elsewhere aren't visible in this module).
@@ -766,6 +767,135 @@ def _fp8_wo_a_einsum(
         "bhr,hdr->bhd", (o_fp8, o_s), (weight, weight_scale), out, recipe=recipe
     )
     return out
+
+
+# SGLANG_OPT_DSV41_WO_A_CUDNN: prefill wo_a as one cuDNN MXFP8 BMM (the graph vLLM's
+# DSV4.1 MegaAttention builds), from rows where DeepGEMM's 128x256 tiles take several waves.
+_WO_A_CUDNN_MIN_ROWS = 4096
+_WO_A_CUDNN_CALLS = [0]
+
+
+@functools.lru_cache(maxsize=None)
+def _wo_a_cudnn_graph(g: int, n: int, k: int, m: int, device: torch.device):
+    """``[m, g, k] x [g, n, k] -> [m, g, n]`` E4M3 with per-group F8_128x4 UE8M0 scales and
+    a fused MXFP8 quantize; uids 1..6 = x, w, x_sf, w_sf, z, z_sf. One graph per ``m``
+    (a multiple of 128): the fused quantize takes no override shapes."""
+    import cudnn
+    from flashinfer.gemm.gemm_base import _get_cudnn_handle
+
+    dt, f8_128x4 = cudnn.data_type, cudnn.tensor_reordering.F8_128x4
+    graph = cudnn.pygraph(
+        io_data_type=dt.FLOAT,
+        intermediate_data_type=dt.FLOAT,
+        compute_data_type=dt.FLOAT,
+        handle=_get_cudnn_handle(device, torch.cuda.current_stream(device)),
+    )
+    lay = [
+        [[g, m, k], [k, g * k, 1]],
+        [[g, k, n], [n * k, 1, k]],
+        [[g, m, k // 32], [m * k // 32, k // 32, 1]],
+        [[g, k // 32, n], [n * k // 32, 1, k // 32]],
+        [[g, m, n], [n, g * n, 1]],
+        [[g, m, n // 32], [m * n // 32, n // 32, 1]],
+    ]
+
+    def dequant(uid: int, block: List[int]):
+        q, sf = (
+            graph.tensor(
+                name=f"t{i}",
+                dim=lay[i][0],
+                stride=lay[i][1],
+                data_type=t,
+                reordering_type=r,
+            )
+            for i, t, r in ((uid, dt.FP8_E4M3, None), (uid + 2, dt.FP8_E8M0, f8_128x4))
+        )
+        q.set_uid(uid + 1)
+        sf.set_uid(uid + 3)
+        out = graph.block_scale_dequantize(q, sf, block_size=block)
+        out.set_data_type(dt.FLOAT)
+        return out
+
+    z = graph.matmul(dequant(0, [1, 32]), dequant(1, [32, 1]))
+    z.set_data_type(dt.FLOAT)
+    z, z_sf = graph.block_scale_quantize(z, block_size=32, axis=2, transpose=False)
+    for uid, t, dtype in ((4, z, dt.FP8_E4M3), (5, z_sf, dt.FP8_E8M0)):
+        t.set_output(True).set_data_type(dtype)
+        t.set_dim(lay[uid][0]).set_stride(lay[uid][1]).set_uid(uid + 1)
+    z_sf.set_reordering_type(f8_128x4)
+    graph.validate()
+    graph.build_operation_graph()
+    graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    graph.check_support()
+    graph.build_plans(cudnn.build_plan_policy.HEURISTICS_CHOICE)
+    return graph
+
+
+def _wo_a_weight_sf_128x4(weight_scale: torch.Tensor) -> torch.Tensor:
+    """DeepGEMM's packed-UE8M0 ``[g, n, k / 128]`` int32 weight scales as F8_128x4 bytes
+    of the ``[g * n, k / 32]`` matrix (n % 128 == 0, so no tile straddles a group)."""
+    g, n, kw = weight_scale.shape
+    sf = weight_scale.contiguous().view(torch.uint8).view(g * n, kw * 4)
+    rows, cols = sf.shape
+    return (
+        sf.view(rows // 128, 4, 32, cols // 4, 4)
+        .permute(0, 3, 2, 1, 4)
+        .contiguous()
+        .view(-1)
+    )
+
+
+def _cudnn_wo_a(
+    split,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_sf_128x4: torch.Tensor,
+) -> Mxfp8SwizzledInput:
+    """wo_a for a ``MegaPrefillSplit``: the 128-aligned head ``[m1, g, k]`` (per-group 128x4
+    scales) on one cuDNN BMM, a tail of < 128 rows (packed scales) on DeepGEMM's
+    fp8_einsum, both into one wo_b MXFP8 input with token-tile-major 128x4 scales."""
+    from flashinfer.gemm.gemm_base import (
+        DEFAULT_WORKSPACE_SIZE,
+        _get_cache_buf,
+        _get_cudnn_handle,
+    )
+
+    g, n, k = weight.shape
+    m1 = split.head_data.shape[0]
+    m = m1 + (0 if split.tail_data is None else split.tail_data.shape[0])
+    device = split.head_data.device
+    z = torch.empty((m, g, n), dtype=torch.float8_e4m3fn, device=device)
+    # FlashInfer's 128x4 layout: per 128-row tile, g * n / 128 atoms of 32 x 4 int32.
+    z_sf = mhc.empty_deepgemm_mxfp8_scales(m, g * n, device, flashinfer=True)
+    head_sf = torch.empty((g, m1 // 128, 128 * n // 32), dtype=torch.uint8, device=device)
+    workspace = _get_cache_buf("bmm_mxfp8_workspace", DEFAULT_WORKSPACE_SIZE, device)
+    tensors = (
+        split.head_data,
+        weight,
+        split.head_sf.view(torch.uint8).view(-1),
+        weight_sf_128x4,
+        z[:m1],
+        head_sf,
+    )
+    _wo_a_cudnn_graph(g, n, k, m1, device).execute(
+        {uid + 1: t for uid, t in enumerate(tensors)},
+        workspace,
+        handle=_get_cudnn_handle(device, torch.cuda.current_stream(device)),
+    )
+    # cuDNN writes each group's scale atoms together; wo_b reads them token-tile major.
+    z_sf[: m1 // 128].view(torch.int64).view(m1 // 128, g, -1).copy_(
+        head_sf.view(torch.int64).transpose(0, 1)
+    )
+    if split.tail_data is not None:
+        _fp8_wo_a_einsum(
+            split.tail_data[:, :g],
+            split.tail_sf[:, :g],
+            weight,
+            weight_scale,
+            recipe=(1, 1, 32),
+            out=(z[m1:], z_sf[m1 // 128 :]),
+        )
+    return Mxfp8SwizzledInput(z.view(m, g * n), z_sf.view(torch.uint8).view(-1))
 
 
 def _apply_gguf_grouped_wo_a(
@@ -1566,6 +1696,7 @@ class MQALayer(MqaAttentionBase):
 
             self.mega_cos_sin_cache = precompute_cos_sin_table(**self.rope_kwargs)
         self.mega_wo_a = None
+        self._wo_a_cudnn_sf: Optional[torch.Tensor] = None
         self.mega_wq_b_permuted = False
         # Static FP8 Q (SGLANG_OPT_DSV4_MEGA_FP8_Q): per-head scales, wq_b's shifted weight scales, and this step's choice
         self.mega_q_head_scale: Optional[torch.Tensor] = None
@@ -1818,6 +1949,16 @@ class MQALayer(MqaAttentionBase):
     def _mega_mxfp8_output(self, rows: int) -> bool:
         return self.wo_b.deepgemm_mxfp8_input and mhc.fused_mxfp8_rows(rows)
 
+    def _wo_a_cudnn_rows(self, rows: int) -> bool:
+        return (
+            envs.SGLANG_OPT_DSV41_WO_A_CUDNN.get()
+            and rows >= _WO_A_CUDNN_MIN_ROWS
+            and get_platform().device_sm == 107
+            and self.n_local_groups * 8 == self.n_local_heads
+            and self._mega_mxfp8_output(rows)
+            and deepgemm_pair_takes_flashinfer()
+        )
+
     def _mega_core(
         self,
         q: torch.Tensor,
@@ -1829,6 +1970,11 @@ class MQALayer(MqaAttentionBase):
     ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
         """``out`` is a bf16 tensor or an (fp8, DeepGEMM-packed scale) pair."""
         mhc.run_deferred_attn_stats_fork()
+        cudnn_wo_a = (
+            out is None
+            and allow_mxfp8_output
+            and self._wo_a_cudnn_rows(q.shape[0])
+        )
         data, scale = attn_backend.forward(
             q=q,
             k=q,
@@ -1839,7 +1985,22 @@ class MQALayer(MqaAttentionBase):
             attn_sink=attn_sink,
             save_kv_cache=False,
             cos_sin_cache=self.mega_cos_sin_cache,
+            mega_sf_swizzled_128x4=cudnn_wo_a,
         )
+        from sglang.srt.layers.attention.deepseek_v4_mega_backend import (
+            MegaPrefillSplit,
+        )
+
+        if isinstance(data, MegaPrefillSplit):
+            # The backend wrote per-group 128x4 scales for the 128-aligned rows (only when asked to).
+            if self._wo_a_cudnn_sf is None:
+                self._wo_a_cudnn_sf = _wo_a_weight_sf_128x4(self.mega_wo_a[1])
+                print_info_once("MegaAttention prefill wo_a: cuDNN MXFP8 BMM")
+            _WO_A_CUDNN_CALLS[0] += 1
+            n = _WO_A_CUDNN_CALLS[0]
+            if n & (n - 1) == 0:  # engagement count at powers of two
+                logger.info("wo_a cuDNN MXFP8 BMM calls: %d (rows %d)", n, q.shape[0])
+            return _cudnn_wo_a(data, *self.mega_wo_a, self._wo_a_cudnn_sf)
         groups = self.n_local_groups
         rows = data.shape[0]
         o_fp8, o_s = data[:, :groups], scale[:, :groups]

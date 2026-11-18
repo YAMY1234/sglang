@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -79,6 +79,16 @@ def static_fp8_q_head_scale(
 
 def interleave_output_columns(w: torch.Tensor) -> torch.Tensor:
     return w.view(*w.shape[:-1], 8, 16, 32).transpose(-3, -2).reshape(w.shape)
+
+
+class MegaPrefillSplit(NamedTuple):
+    """MegaAttention prefill output with per-group 128x4 scales for the 128-aligned head
+    rows and the packed scales for a tail of < 128 rows (None when there is none)."""
+
+    head_data: torch.Tensor
+    head_sf: torch.Tensor
+    tail_data: Optional[torch.Tensor]
+    tail_sf: Optional[torch.Tensor]
 
 
 def quantize_wo_a(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -188,18 +198,38 @@ class DeepseekV4MegaAttnBackend(DeepseekV4AttnBackend):
         cos_sin_cache: torch.Tensor,
         attn_sink: torch.Tensor,
         topk_length: torch.Tensor,
+        sf_swizzled_128x4: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         from sglang.kernels.ops.attention import flash_mla_interface
 
-        data, scale, _, _ = flash_mla_interface.flash_mla_mega_prefill(
-            q,
-            kv,
-            indices,
-            positions,
-            cos_sin_cache,
-            self.softmax_scale,
-            attn_sink=attn_sink,
-            topk_length=topk_length,
-            use_legacy=not self._swa_interleaved,
-        )
-        return data, scale
+        def run(rows: slice, swizzled: bool):
+            data, scale, _, _ = flash_mla_interface.flash_mla_mega_prefill(
+                q[rows],
+                kv,
+                indices[rows],
+                positions[rows],
+                cos_sin_cache,
+                self.softmax_scale,
+                attn_sink=attn_sink,
+                topk_length=topk_length[rows],
+                use_legacy=not self._swa_interleaved,
+                out_sf_swizzled_128x4=swizzled,
+            )
+            if swizzled:
+                # [n_wv_group, 128x4-swizzled words]
+                groups = data.shape[1]
+                scale = scale.as_strided(
+                    (groups, scale.numel() // groups),
+                    (scale.numel() // groups, 1),
+                    scale.storage_offset(),
+                )
+            return data, scale
+
+        # The 128x4 scales need whole 128-row tiles and the current kernels: the
+        # 128-aligned head gets them, a tail of < 128 rows keeps the packed ones.
+        head_rows = q.shape[0] // 128 * 128
+        if not (sf_swizzled_128x4 and head_rows and self._swa_interleaved):
+            return run(slice(None), False)
+        head = run(slice(0, head_rows), True)
+        tail = run(slice(head_rows, None), False) if head_rows < q.shape[0] else None
+        return MegaPrefillSplit(*head, *(tail or (None, None))), None

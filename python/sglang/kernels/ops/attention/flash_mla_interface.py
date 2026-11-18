@@ -197,8 +197,10 @@ def flash_mla_mega_prefill(
     enable_q_norm: bool = False,
     rms_norm_eps: float = 0.0,
     use_legacy: bool = True,
+    out_sf_swizzled_128x4: bool = False,
 ) -> Tuple[torch.Tensor, ...]:
-    """MegaAttention prefill over a bf16 ``kv``: (out_fp8, out_sf, max_logits, lse)."""
+    """MegaAttention prefill over a bf16 ``kv``: (out_fp8, out_sf, max_logits, lse).
+    ``out_sf_swizzled_128x4`` writes out_sf per wv group in the 128x4 layout (s_q % 128 == 0)."""
     return _mega.prefill(
         token_positions=positions,
         cos_sin_cache=cos_sin_cache,
@@ -212,6 +214,7 @@ def flash_mla_mega_prefill(
         enable_q_norm=enable_q_norm,
         rms_norm_eps=rms_norm_eps,
         use_legacy=use_legacy,
+        **({"out_sf_swizzled_128x4": True} if out_sf_swizzled_128x4 else {}),
         **_MEGA_FIXED_PARAMS,
     )
 

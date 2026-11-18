@@ -1389,6 +1389,19 @@ class Envs:
     # Kernel for the tabled shapes: "pdl" (the copy, PDL on), "nopdl" (the copy, PDL off),
     # "stock" (FlashInfer's SM107 runner pinned to the table's tactic).
     SGLANG_OPT_SM107_MXFP8_DENSE_TABLE_MODE = EnvStr("pdl")
+    # SM107 prefill (M >= 8192): run the MXFP8 dense linears whose (N, K) are in
+    # fp8_utils._SM107_CUBLASLT_MXFP8_NK on cuBLASLt (torch._scaled_mm) instead of
+    # FlashInfer's CuTe-DSL GEMM; same operands, bitwise-equal outputs.
+    SGLANG_OPT_SM107_MXFP8_PREFILL_CUBLASLT = EnvBool(False)
+    # DSV4.1 MegaAttention prefill (>= 4096 rows): wo_a of the 128-aligned rows as one cuDNN MXFP8 BMM with a
+    # fused MXFP8 quantize epilogue, on the attention kernel's 128x4 output scales, instead of DeepGEMM's
+    # fp8_einsum (a tail of < 128 rows stays on it). Same FP8 operands; output rounding differs in the last
+    # FP8 bit on a few percent of values.
+    SGLANG_OPT_DSV41_WO_A_CUDNN = EnvBool(False)
+    # DSV4.1 MegaAttention prefill, compressed layers (64 heads): gather the flat sparse-prefill KV workspace as
+    # e4m3 at unit scale instead of bf16, which selects FlashMLA's all-fp8 prefill (Q, K, V and P as e4m3 on the
+    # tensor cores). SWA-only layers keep bf16. Needs a FlashMLA whose prefill takes an e4m3 kv; changes numerics.
+    SGLANG_OPT_DSV41_FP8_PREFILL_ATTN = EnvBool(False)
     # DSV4.1 MegaAttention decode on SM107, compressed layers with an fp4 extra cache: wq_b writes Q as E4M3 at
     # static per-head power-of-two scales (folded into its UE8M0 weight scales) and FlashMLA's fp8 decode reads it
     # (QK and SV on e4m3 tensor cores). Needs a FlashMLA whose decode takes q_head_scale; changes attention numerics.
