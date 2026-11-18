@@ -1,3 +1,4 @@
+from collections import deque
 import queue
 import sys
 from concurrent.futures import Future
@@ -2576,6 +2577,67 @@ def test_pp_offload_commits_follow_pp0():
     assert waited == [3]
     assert committed == [[True, False, True]]
     assert not from_pp0
+
+
+def _piggyback_stage(pp_rank, completed, local_results=None):
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.pp_size, cache.pp_rank = 8, pp_rank
+    cache.pp_counts_piggyback = True
+    cache.pp_counts_in, cache.pp_counts_out = deque(), []
+    log = {"waited": [], "committed": []}
+    cache.linker = SimpleNamespace(
+        num_completed_offloads=lambda: completed,
+        wait_completed_offloads=log["waited"].append,
+        take_completed_offloads=lambda count: (local_results or [True] * count)[:count],
+        commit_completed_offloads=log["committed"].append,
+    )
+
+    def no_pp_comm(*args):
+        raise AssertionError("piggyback mode must not touch the PP chain")
+
+    cache._drain_async_work = no_pp_comm
+    cache._all_reduce = no_pp_comm
+    cache._all_reduce_attn_groups = lambda data, op: None
+    return cache, log
+
+
+def test_pp_offload_counts_piggyback_chain_follows_pp0():
+    # SGLANG_LINKER_PP_COUNTS_PIGGYBACK: PP0's commits ride the request relay;
+    # every stage commits PP0's count and verdicts, with no per-step PP comm.
+    pp0, log0 = _piggyback_stage(0, completed=2, local_results=[True, False])
+    pp0.check_hicache_events()
+    assert log0 == {"waited": [], "committed": [[True, False]]}
+    assert pp0.pp_counts_out == [[2, 1, 0]]
+
+    mid, log_mid = _piggyback_stage(3, completed=5, local_results=[True, True])
+    mid.pp_counts_in.extend(pp0.pp_counts_out)
+    mid.check_hicache_events()
+    assert log_mid == {"waited": [2], "committed": [[True, False]]}
+    assert mid.pp_counts_out == [[2, 1, 0]] and not mid.pp_counts_in
+
+    last, log_last = _piggyback_stage(7, completed=0)
+    last.pp_counts_in.extend(mid.pp_counts_out)
+    last.check_hicache_events()
+    assert log_last == {"waited": [2], "committed": [[True, False]]}
+    assert last.pp_counts_out == []
+
+
+def test_pp_offload_counts_piggyback_relays_a_row_every_step():
+    # A zero-count step still relays a row, so later stages consume one per step.
+    pp0, log0 = _piggyback_stage(0, completed=0)
+    pp0.check_hicache_events()
+    assert pp0.pp_counts_out == [[0]] and log0["committed"] == []
+    later, log = _piggyback_stage(2, completed=4)
+    later.pp_counts_in.extend(pp0.pp_counts_out)
+    later.check_hicache_events()
+    assert log == {"waited": [], "committed": []}
+    assert later.pp_counts_out == [[0]]
+
+
+def test_pp_offload_counts_piggyback_requires_the_relayed_row():
+    later, _ = _piggyback_stage(4, completed=1)
+    with pytest.raises(AssertionError, match="missing from the PP relay"):
+        later.check_hicache_events()
 
 
 @pytest.mark.parametrize("swa_stored", [True, False], ids=["stored", "unstored"])

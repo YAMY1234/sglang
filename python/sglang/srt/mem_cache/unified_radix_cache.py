@@ -216,6 +216,7 @@ class UnifiedRadixCache(BasePrefixCache):
     # SGLANG_MAMBA_PATH_CAP_COUNTS_HOST, set by _init_mamba_path_cap_counts_host.
     _mamba_path_cap_counts_host = False
     mamba_retention_counts: Optional[dict[str, int]] = None
+    pp_counts_piggyback: bool = False
 
     def __init__(
         self,
