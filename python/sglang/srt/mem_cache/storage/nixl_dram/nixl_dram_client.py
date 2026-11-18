@@ -273,8 +273,9 @@ class NixlTransport:
         from nixl._api import nixl_agent, nixl_agent_config, nixl_thread_sync_t
 
         # Prefetch and backup threads post transfers concurrently.
+        # Rig diagnostics (default on / off): SGLANG_HICACHE_NIXL_DRAM_PROG_THREAD=0 drops NIXL's progress thread.
         conf = nixl_agent_config(
-            enable_prog_thread=True,
+            enable_prog_thread=os.environ.get("SGLANG_HICACHE_NIXL_DRAM_PROG_THREAD", "1") != "0",
             enable_listen_thread=False,
             backends=[],
             sync_mode=nixl_thread_sync_t.NIXL_THREAD_SYNC_RW,
@@ -646,6 +647,10 @@ class NixlDramClient:
 
     def register_buffer(self, ptr: int, size: int) -> int:
         ptr, size = int(ptr), int(size)
+        if os.environ.get("SGLANG_HICACHE_NIXL_DRAM_SKIP_HOST_REGISTER") == "1":
+            # Rig diagnostic: no UCX registration of the host pool; any L3 transfer would then fail.
+            logger.info("HiCache NIXL DRAM L3: host buffer 0x%x (%.2f GiB) NOT registered (SKIP_HOST_REGISTER)", ptr, size / (1 << 30))
+            return 0
         ranges = registration_ranges(
             ptr, size, self.page_units.get(ptr, 0), self.cfg.reg_chunk_mib << 20
         )
