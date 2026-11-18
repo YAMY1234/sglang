@@ -641,6 +641,20 @@ class SchedulerPPMixin:
             and not self.spec_algorithm.is_none()
         )
 
+        if (
+            self.linker_prefetch_mode
+            and get_parallel().pp_size > 1
+            and getattr(self, "_linker_relay_store", None) is None
+        ):
+            # Prefetch-relay votes reach PP0 through their own replicated map;
+            # every stage creates it here, at its PP loop start (a collective).
+            from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
+
+            self._linker_relay_store = PPConsensusStore(
+                get_parallel().pp_size, get_parallel().pp_rank, get_parallel().pp_group
+            )
+            self.tree_cache.linker_attach_relay_store(self._linker_relay_store)
+
         self.send_req_work = []
         self.send_proxy_work = []
         self.send_output_work = []

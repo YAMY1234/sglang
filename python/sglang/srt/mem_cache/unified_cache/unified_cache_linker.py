@@ -29,14 +29,17 @@ import random
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
     DecLockRefParams,
+    InsertParams,
+    MatchPrefixParams,
     MatchResult,
 )
 from sglang.srt.mem_cache.hicache_storage import (
@@ -50,7 +53,9 @@ from sglang.srt.mem_cache.unified_cache.components import (
     LinkerTransferPhase,
     TreeComponent,
 )
+from sglang.srt.mem_cache.unified_cache.pp_linker_relay import PPLinkerRelay
 from sglang.srt.mem_cache.utils import get_storage_hash_str
+from sglang.srt.session.streaming_session import is_virtual_node
 from sglang.srt.utils import get_device_module
 
 if TYPE_CHECKING:
@@ -214,6 +219,12 @@ class UnifiedCacheLinker(ABC):
     def cancel_queued_load(self, rid: str) -> bool:
         """Cancel a load that has not started yet."""
 
+    def prefetch(self, transfers: list[PoolTransfer]) -> Optional[Future]:
+        """SGLANG_LINKER_LOAD_MODE=prefetch: read all layers of ``transfers``
+        into their device slots. The future (True when every byte landed)
+        completes after all device writes stop; None when nothing was queued."""
+        return None
+
     @abstractmethod
     def offload(
         self, transfers: list[PoolTransfer], session_id: Optional[str] = None
@@ -313,6 +324,41 @@ class _PendingOffload(NamedTuple):
     lock_node_id: NodeId
     lock_params: DecLockRefParams
     publish_node_ids: list[NodeId]
+
+
+@dataclass
+class _ExternalCachePrefetch:
+    key: RadixKey
+    anchor_node_id: NodeId
+    anchor_lock: DecLockRefParams
+    component_transfers: list[tuple[TreeComponent, PoolTransfer]]
+    future: Future[bool] | None = None
+    timeout_s: float = 0.0
+    wait_started: float | None = None
+    discard: bool = False
+
+
+@dataclass
+class _PendingLookup:
+    """A queued request's store lookup running off the scheduler thread. Under
+    PP only PP0 runs it (``future``); the other stages keep the key and wait
+    for PP0's relayed result."""
+
+    key: RadixKey
+    hashes: list[str]
+    start: int
+    anchor_node_id: NodeId
+    anchor_lock: DecLockRefParams
+    future: Future[list[int]] | None
+    timeout_s: float = 0.0
+    wait_started: float | None = None
+    kind: str = "enq"
+
+
+class _PrefetchHold(NamedTuple):
+    node_id: NodeId
+    lock: DecLockRefParams
+    tokens: int
 
 
 class UnifiedCacheLinkerWrapper:
@@ -445,9 +491,122 @@ class UnifiedCacheLinkerWrapper:
         self.admission_rpc_s = 0.0
         self.admission_marks: dict[str, float] = {}
         self.pp_load_holes = 0
+        self._init_prefetch_state()
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
+
+    def _init_prefetch_state(self) -> None:
+        """SGLANG_LINKER_LOAD_MODE=prefetch, ported from GLM's linker: lookup at
+        enqueue, a read into request-private slots, publication into the tree
+        once every rank (under PP: every stage) landed it. Otherwise inert."""
+        cache = self.cache
+        prefetch = envs.SGLANG_LINKER_LOAD_MODE.get() == "prefetch"
+        self.load_mode = "prefetch" if prefetch else "layer_wise"
+        self.pp_relay = None
+        # Reads in flight into slots private to their queued request.
+        self.prefetches: dict[CacheRequestHandle, _ExternalCachePrefetch] = {}
+        # Store lookups in flight on worker threads, in submission order.
+        self.lookups: dict[CacheRequestHandle, _PendingLookup] = {}
+        self._draining_lookups = False
+        self._lookup_executor = None
+        # Published prefetches still locked for their waiting request.
+        self.holds: dict[CacheRequestHandle, _PrefetchHold] = {}
+        self.held_tokens = 0
+        self.hold_cap_tokens = 0
+        self.load_cap_tokens = 0
+        self.max_prefetch_states = 0
+        # Published prefetches left unheld (over the cap or not resident): their end.
+        self.unheld: dict[CacheRequestHandle, int] = {}
+        self._hold_stats = dict.fromkeys(
+            (
+                "held",
+                "over_cap",
+                "not_resident",
+                "admitted",
+                "released",
+                "unheld_kept",
+                "unheld_evicted",
+                "unheld_evicted_tokens",
+            ),
+            0,
+        )
+        self._hold_next_log = 0.0
+        self.requery_on_device_loss = False
+        self.match_targets: dict[CacheRequestHandle, int] = {}
+        self.log_lookup_stats = False
+        self._lookup_stats = dict.fromkeys(
+            (
+                "issued",
+                "skipped_no_hash",
+                "zero_restorable",
+                "requeried",
+                "load_capped",
+                "state_capped",
+                "published",
+                "aborted",
+            ),
+            0,
+        )
+        self._pending_requeries: dict[CacheRequestHandle, Req] = {}
+        self._occupied_peak = 0
+        self._lookup_next_log = 0.0
+        self._requery_started: dict[CacheRequestHandle, float] = {}
+        self._requery_waits: list[float] = []
+        self._requery_records: list[tuple[str, float, str]] = []
+        self._lookup_kind = "enq"
+        self._phase_s = {
+            k: dict.fromkeys(("n", "match", "keys", "rpc", "load"), 0.0)
+            for k in ("enq", "rq")
+        }
+        if not prefetch:
+            return
+        if ComponentType.SWA in cache.components:
+            # GLM binds the SWA window of a published read (bind_window); this
+            # tree has no such API, and K3.1 has no SWA.
+            raise ValueError("External linker prefetch mode does not support SWA.")
+        if getattr(cache.req_to_token_pool, "mamba_ckpt_pool", None) is not None:
+            raise ValueError(
+                "External linker prefetch mode publishes recurrent states into the "
+                "active state pool; int8 state checkpoints are not supported."
+            )
+        hold_fraction = envs.SGLANG_EXTERNAL_LINKER_PREFETCH_HOLD_FRACTION.get()
+        lookup_threads = envs.SGLANG_EXTERNAL_LINKER_ASYNC_LOOKUP_THREADS.get()
+        if self.pp_size > 1:
+            if cache.tp_world_size != 1:
+                raise ValueError("External linker PP prefetch is qualified for TP1 only.")
+            if hold_fraction <= 0:
+                raise ValueError("External linker PP prefetch requires a hold on every stage.")
+            # PP0 looks up every stage's objects; it must not block its scheduler.
+            lookup_threads = max(1, lookup_threads) if self.pp_rank == 0 else 0
+            self.pp_relay = PPLinkerRelay(self)
+        if lookup_threads > 0:
+            self._lookup_executor = ThreadPoolExecutor(
+                lookup_threads, thread_name_prefix="linker-lookup"
+            )
+        size_full = cache.token_to_kv_pool_allocator.size_full
+        if hold_fraction > 0:
+            self.hold_cap_tokens = int(hold_fraction * size_full)
+        load_fraction = envs.SGLANG_EXTERNAL_LINKER_LOAD_FRACTION.get()
+        if load_fraction > 0:
+            self.load_cap_tokens = int(load_fraction * size_full)
+        if ComponentType.MAMBA in cache.components:
+            self.max_prefetch_states = max(
+                0, envs.SGLANG_LINKER_PREFETCH_MAX_STATES.get()
+            )
+        self.requery_on_device_loss = (
+            envs.SGLANG_EXTERNAL_LINKER_REQUERY_ON_DEVICE_LOSS.get()
+        )
+        self.log_lookup_stats = envs.SGLANG_EXTERNAL_LINKER_LOOKUP_STATS.get()
+        logger.info(
+            "External linker prefetch mode: lookup threads %d, hold cap %d tokens, "
+            "load cap %d tokens, state cap %d reads, PP relay %s",
+            lookup_threads,
+            self.hold_cap_tokens,
+            self.load_cap_tokens,
+            self.max_prefetch_states,
+            self.pp_relay is not None,
+        )
 
     def _lookup_transfers(self, hashes: list[str]) -> list[PoolTransfer]:
         transfers = []
@@ -474,6 +633,9 @@ class UnifiedCacheLinkerWrapper:
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
         device_hit_len = result.device_prefix_len
+        if self.load_mode == "prefetch":
+            # Prefetch is issued on enqueue; only published device KV is matchable.
+            return result
         # A skipped hit keeps its marker until it is matched again.
         self.hit_markers.pop(req.rid, None)
         if device_hit_len > 0:
@@ -975,6 +1137,619 @@ class UnifiedCacheLinkerWrapper:
             page_size=page,
         )
 
+    # ---- prefetch (SGLANG_LINKER_LOAD_MODE=prefetch, ported from GLM) ----
+
+    def prefetch(self, req: Req) -> None:
+        """Stage a queued request; publish only after all ranks succeed."""
+        if self.load_mode != "prefetch":
+            return
+        request = req.cache_request_handle
+        if self.pp_relay is not None:
+            self.pp_relay.begin(req)
+        for previous in [p for p in self.prefetches if p.rid == request.rid]:
+            if previous != request:
+                self._cancel_prefetch(previous)
+        for previous in [lk for lk in self.lookups if lk.rid == request.rid]:
+            if previous != request:
+                self._cancel_lookup(previous)
+        for previous in [h for h in self.holds if h.rid == request.rid]:
+            if previous != request:
+                self.release_hold(previous, admitted=False)
+        if self.cache.disable or request in self.prefetches or request in self.lookups:
+            return
+        if not self._stage_lookup(req, request) and self.pp_relay is not None:
+            # Every stage made the same decision from the same tree: nothing to load.
+            self.pp_relay.settle(request)
+
+    def _stage_lookup(self, req: Req, request: CacheRequestHandle) -> bool:
+        """GLM's prefetch body after its guards; True when a lookup (or under
+        PP, on stages past PP0, its placeholder) was queued."""
+        timed = self.log_lookup_stats
+        kind = self._lookup_kind
+        t0 = time.perf_counter() if timed else 0.0
+        req.init_next_round_input(self.cache, cow_mamba=False)
+        t1 = time.perf_counter() if timed else 0.0
+        if is_virtual_node(req.last_node) or req.positional_embed_overrides is not None:
+            return False
+        page = self.cache.page_size
+        key = RadixKey(
+            req.full_untruncated_fill_ids,
+            extra_key=req.extra_key,
+            cache_salt=req.cache_salt,
+            is_bigram=self.cache.tree_core.is_eagle,
+            limit=req._compute_max_prefix_len(len(req.full_untruncated_fill_ids)),
+        ).page_aligned(page)
+        start = req.prefix_len
+        if self.requery_on_device_loss:
+            self.match_targets[request] = start
+        last_hash = self.cache.get_last_hash_value(req.last_node)
+        if len(key) <= start:
+            return False
+        if start and last_hash is None:
+            self._lookup_stats["skipped_no_hash"] += 1
+            return False
+        hashes = get_storage_hash_str(key[start:], last_hash, page_size=page)
+        lookups = [
+            c.build_external_linker_transfer(LinkerTransferPhase.LOOKUP, None, hashes)
+            for c in self._components
+        ]
+        if any(t is None for t in lookups):
+            return False
+        if timed:
+            phase = self._phase_s[kind]
+            phase["n"] += 1
+            phase["match"] += t1 - t0
+            phase["keys"] += time.perf_counter() - t1
+        timeout_s = (
+            self.cache.prefetch_timeout_base
+            + len(hashes) * self.cache.prefetch_timeout_per_page
+        )
+        self._lookup_stats["issued"] += 1
+        self._log_lookup_stats()
+        if self._lookup_executor is not None or self.pp_relay is not None:
+            # The anchor stays locked while the lookup runs, as for a load.
+            future = (
+                self._lookup_executor.submit(
+                    self._timed_lookup, kind if timed else None, req.rid, lookups
+                )
+                if self._lookup_executor is not None
+                else None
+            )
+            self.lookups[request] = _PendingLookup(
+                key,
+                hashes,
+                start,
+                req.last_node,
+                self.cache.inc_lock_ref(req.last_node).to_dec_params(),
+                future,
+                timeout_s=timeout_s,
+                kind=kind,
+            )
+            return True
+        try:
+            restorable = self._timed_lookup(kind if timed else None, req.rid, lookups)
+        except Exception:
+            logger.warning("External linker prefetch lookup failed", exc_info=True)
+            restorable = []
+        anchor_lock = self.cache.inc_lock_ref(req.last_node).to_dec_params()
+        t2 = time.perf_counter() if timed else 0.0
+        self._start_prefetch_load(
+            request, key, hashes, start, req.last_node, anchor_lock, restorable, timeout_s
+        )
+        if timed:
+            self._phase_s[kind]["load"] += time.perf_counter() - t2
+        return True
+
+    def _store_lookup(self, rid: str, lookups: list[PoolTransfer]) -> list[int]:
+        # Under PP, PP0 looks up every stage's objects at once (lookup_stages).
+        if self.pp_size > 1:
+            return self.cache_linker.lookup_stages(rid, lookups)
+        return self.cache_linker.lookup(rid, lookups)
+
+    def _timed_lookup(self, kind, rid, lookups):
+        """The store lookup; with ``kind``, its time joins that kind's RPC phase (any thread)."""
+        if kind is None:
+            return self._store_lookup(rid, lookups)
+        t0 = time.perf_counter()
+        try:
+            return self._store_lookup(rid, lookups)
+        finally:
+            self._phase_s[kind]["rpc"] += time.perf_counter() - t0
+
+    def _prefetch_states(self) -> int:
+        """In-flight reads holding a recurrent-state slot."""
+        return sum(
+            1
+            for state in self.prefetches.values()
+            for _, transfer in state.component_transfers
+            if transfer.name == PoolName.MAMBA and transfer.device_indices is not None
+        )
+
+    def _start_prefetch_load(
+        self,
+        request: CacheRequestHandle,
+        key: RadixKey,
+        hashes: list[str],
+        start: int,
+        anchor_node_id: NodeId,
+        anchor_lock: DecLockRefParams,
+        restorable: list[int],
+        timeout_s: float,
+    ) -> None:
+        """Agree on the restorable prefix across ranks and queue its load."""
+        page = self.cache.page_size
+        pages = self._sync_restorable_prefix(
+            restorable, num_pages=len(hashes), device_hit_pages=0
+        )
+        if not pages:
+            self._lookup_stats["zero_restorable"] += 1
+            self.cache.dec_lock_ref(anchor_node_id, anchor_lock)
+            return
+        end = start + pages * page
+        if request in self.match_targets:
+            self.match_targets[request] = end
+        cap = self._load_cap()
+        if cap:
+            # In-flight private slots (plus holds, under a shared cap) stay under the
+            # cap, except that one load may always run; a refused load keeps its
+            # target at `end`, so the admission re-query retries it.
+            occupied = self.prefetch_size(PoolName.KV)
+            if not self.load_cap_tokens:
+                occupied += self.held_tokens
+            if occupied and occupied + pages * page > cap:
+                self._lookup_stats["load_capped"] += 1
+                self.cache.dec_lock_ref(anchor_node_id, anchor_lock)
+                return
+            self._occupied_peak = max(self._occupied_peak, occupied + pages * page)
+        if self.max_prefetch_states and self._prefetch_states() >= self.max_prefetch_states:
+            # Each read holds one recurrent-state slot per stage until it is
+            # published; the pool has a few hundred. The request recomputes.
+            self._lookup_stats["state_capped"] += 1
+            self.cache.dec_lock_ref(anchor_node_id, anchor_lock)
+            return
+        state = _ExternalCachePrefetch(
+            key[:end],
+            anchor_node_id,
+            anchor_lock,
+            [],
+            timeout_s=timeout_s,
+        )
+        self.prefetches[request] = state
+        try:
+            for component in self._components:
+                transfer = component.build_external_linker_transfer(
+                    LinkerTransferPhase.LOAD, None, hashes[:pages]
+                )
+                if transfer is None:
+                    break
+                state.component_transfers.append((component, transfer))
+            if len(state.component_transfers) == len(self._components):
+                state.future = self.cache_linker.prefetch(
+                    [t for _, t in state.component_transfers]
+                )
+        except Exception:
+            logger.warning("External linker prefetch submission failed", exc_info=True)
+        accepted = torch.tensor([state.future is not None], dtype=torch.int)
+        self.cache._all_reduce_attn_groups(accepted, torch.distributed.ReduceOp.MIN)
+        if not accepted.item():
+            self._cancel_prefetch(request)
+            # A lookup drain is inside check_prefetch_events, which settles the
+            # cancelled read right after it; re-entering would rerun the drain.
+            if not self._draining_lookups:
+                self.check_prefetch_events(drain_lookups=False)
+
+    def _load_cap(self) -> int:
+        """Tokens loads may hold in flight: their own cap, else the hold cap they share."""
+        return self.load_cap_tokens or self.hold_cap_tokens
+
+    def has_pending_prefetch(self) -> bool:
+        return bool(self.prefetches or self.lookups)
+
+    def check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
+        if self.pp_relay is not None:
+            return self.pp_relay.progress(request, self._stop_due)
+        return self._local_check_prefetch_progress(request)
+
+    def _stop_due(self, request: CacheRequestHandle) -> bool:
+        """PP0 under PP: whether the stop policy ends the wait for ``request``'s
+        lookup or read now (GLM's timeout policy, without its local cancel: the
+        relay orders the stop on every stage)."""
+        policy = self.cache.prefetch_stop_policy
+        if policy != "timeout":
+            return False
+        pending = self.lookups.get(request) or self.prefetches.get(request)
+        if pending is None:
+            return False
+        now = time.perf_counter()
+        if pending.wait_started is None:
+            pending.wait_started = now
+            return False
+        return now - pending.wait_started > pending.timeout_s
+
+    def _local_check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
+        if request in self.lookups:
+            return self._check_lookup_progress(request)
+        state = self.prefetches.get(request)
+        if state is None or state.discard:
+            return True
+        policy = self.cache.prefetch_stop_policy
+        if policy == "wait_complete":
+            return False
+        if policy == "timeout":
+            now = time.perf_counter()
+            expired = torch.tensor(
+                state.wait_started is not None
+                and now - state.wait_started > state.timeout_s,
+                dtype=torch.int,
+            )
+            self.cache._all_reduce_attn_groups(expired, torch.distributed.ReduceOp.MAX)
+            if not expired.item():
+                if state.wait_started is None:
+                    state.wait_started = now
+                return False
+        # Consume any fully completed read before stopping. Running reads keep
+        # their private slots until every rank has stopped writing to them.
+        # Admission polls this: start no new load here.
+        self.check_prefetch_events(drain_lookups=False)
+        self._cancel_prefetch(request)
+        return True
+
+    def _check_lookup_progress(self, request: CacheRequestHandle) -> bool:
+        """Admission poll while the request's lookup runs, under the stop
+        policy of a running load."""
+        lookup = self.lookups[request]
+        policy = self.cache.prefetch_stop_policy
+        if policy == "wait_complete":
+            return False
+        if policy == "timeout":
+            now = time.perf_counter()
+            expired = torch.tensor(
+                lookup.wait_started is not None
+                and now - lookup.wait_started > lookup.timeout_s,
+                dtype=torch.int,
+            )
+            self.cache._all_reduce_attn_groups(expired, torch.distributed.ReduceOp.MAX)
+            if not expired.item():
+                if lookup.wait_started is None:
+                    lookup.wait_started = now
+                return False
+        self._cancel_lookup(request)
+        return True
+
+    def requery_after_device_loss(self, req: Req) -> bool:
+        if self.load_mode != "prefetch":
+            return False
+        # Under PP every stage reaches the same decision from the same tree and
+        # targets, so no verdict is exchanged.
+        return self._local_requery_after_device_loss(req)
+
+    def _local_requery_after_device_loss(self, req: Req) -> bool:
+        """Look up again the prefix ``req`` lost on device since its last lookup.
+
+        True while the re-query waits for the next event-loop boundary, where
+        its lookup starts; the request then waits on that lookup and its load.
+        """
+        request = req.cache_request_handle
+        target = self.match_targets.get(request)
+        if (
+            target is None
+            or req.prefix_len >= target
+            or request in self.prefetches
+            or request in self.lookups
+            or request in self.holds
+        ):
+            return False
+        if request in self._pending_requeries:
+            return True
+        self._lookup_stats["requeried"] += 1
+        self._pending_requeries[request] = req
+        if self.log_lookup_stats:
+            self._requery_started[request] = time.perf_counter()
+        return True
+
+    def _start_pending_requeries(self) -> None:
+        """At the event-loop boundary: look up again the requests admission deferred."""
+        pending, self._pending_requeries = self._pending_requeries, {}
+        self._lookup_kind = "rq"
+        try:
+            for request, req in pending.items():
+                self.prefetch(req)
+                if request not in self.prefetches and request not in self.lookups:
+                    started = self._requery_started.pop(request, None)
+                    if started is not None:
+                        self._requery_records.append(
+                            (request.rid, time.perf_counter() - started, "none")
+                        )
+        finally:
+            self._lookup_kind = "enq"
+
+    def _log_lookup_stats(self) -> None:
+        now = time.monotonic()
+        if not self.log_lookup_stats or now < self._lookup_next_log:
+            return
+        self._lookup_next_log = now + 60.0
+        waits = sorted(self._requery_waits)
+        self._requery_waits.clear()
+        p50, p90 = (
+            (waits[len(waits) // 2], waits[len(waits) * 9 // 10])
+            if waits
+            else (0.0, 0.0)
+        )
+        phases = []
+        for kind, phase in self._phase_s.items():
+            n = phase["n"]
+            phases.append(
+                f"{kind} n={int(n)}"
+                + "".join(
+                    f" {name} {1e3 * phase[name] / n:.1f}"
+                    for name in ("match", "keys", "rpc", "load")
+                    if n
+                )
+            )
+            self._phase_s[kind] = dict.fromkeys(phase, 0.0)
+        logger.info(
+            "External linker lookups: %s; re-query waits since last log: %d, "
+            "p50 %.3f s, p90 %.3f s; ms per lookup: %s; loads plus holds peak %d "
+            "of cap %d tokens; reads in flight %d (%d states)",
+            self._lookup_stats,
+            len(waits),
+            p50,
+            p90,
+            "; ".join(phases),
+            self._occupied_peak,
+            self._load_cap(),
+            len(self.prefetches),
+            self._prefetch_states(),
+        )
+        self._occupied_peak = 0
+        if self._requery_records:
+            logger.info(
+                "External linker re-queried rids (rid:wait_s:outcome): %s",
+                " ".join(f"{rid}:{w:.3f}:{o}" for rid, w, o in self._requery_records),
+            )
+            self._requery_records.clear()
+
+    def _cancel_lookup(self, request: CacheRequestHandle) -> None:
+        lookup = self.lookups.pop(request, None)
+        if lookup is not None:
+            # A lookup reads store metadata only, so its result can be dropped.
+            if lookup.future is not None:
+                lookup.future.cancel()
+            self.cache.dec_lock_ref(lookup.anchor_node_id, lookup.anchor_lock)
+
+    def _drain_lookups(self) -> None:
+        """Start the loads of lookups every rank has finished, in submission order."""
+        if not self.lookups:
+            return
+        pending = list(self.lookups.items())
+        done = torch.tensor([lk.future.done() for _, lk in pending], dtype=torch.int)
+        self.cache._all_reduce_attn_groups(done, torch.distributed.ReduceOp.MIN)
+        self._draining_lookups = True
+        try:
+            for (request, _), finished in zip(pending, done.tolist()):
+                lookup = self.lookups.pop(request, None) if finished else None
+                if lookup is None:
+                    continue
+                try:
+                    restorable = lookup.future.result()
+                except Exception:
+                    logger.warning(
+                        "External linker prefetch lookup failed", exc_info=True
+                    )
+                    restorable = []
+                t0 = time.perf_counter() if self.log_lookup_stats else 0.0
+                self._start_prefetch_load(
+                    request,
+                    lookup.key,
+                    lookup.hashes,
+                    lookup.start,
+                    lookup.anchor_node_id,
+                    lookup.anchor_lock,
+                    restorable,
+                    lookup.timeout_s,
+                )
+                if self.log_lookup_stats:
+                    self._phase_s[lookup.kind]["load"] += time.perf_counter() - t0
+        finally:
+            self._draining_lookups = False
+
+    def _cancel_prefetch(self, request: CacheRequestHandle) -> None:
+        self._cancel_lookup(request)
+        state = self.prefetches.get(request)
+        if state is not None:
+            state.discard = True
+            if state.future is not None:
+                state.future.cancel()
+
+    def prefetch_size(self, pool: PoolName) -> int:
+        """Device slots still owned by prefetch, including discarded writes."""
+        return sum(
+            len(transfer.device_indices)
+            for state in self.prefetches.values()
+            for _, transfer in state.component_transfers
+            if transfer.name == pool and transfer.device_indices is not None
+        )
+
+    def check_prefetch_events(self, drain_lookups: bool = True) -> None:
+        if self.load_mode != "prefetch":
+            return
+        if self.pp_relay is not None:
+            if drain_lookups:
+                self._start_pending_requeries()
+                self.pp_relay.poll()
+            return
+        if drain_lookups:
+            self._start_pending_requeries()
+            self._drain_lookups()
+        if not self.prefetches:
+            return
+        pending = list(self.prefetches.items())
+        progress = []
+        for _, state in pending:
+            future = state.future
+            done = future is None or future.done()
+            landed = False
+            try:
+                if done and future is not None and not future.cancelled():
+                    landed = future.result() is True
+            except Exception:
+                logger.warning("External linker prefetch failed", exc_info=True)
+            progress.append([done, landed and not state.discard])
+        # Keep the same operation order on every rank, including discarded
+        # reads. Local cancellation must not change collective participation.
+        verdicts = torch.tensor(progress, dtype=torch.int)
+        self.cache._all_reduce_attn_groups(verdicts, torch.distributed.ReduceOp.MIN)
+        for (request, _), (done, landed) in zip(pending, verdicts.tolist()):
+            if done:
+                self._finish_prefetch(request, publish=bool(landed))
+
+    def _finish_prefetch(
+        self, request: CacheRequestHandle, *, publish: bool, hold: bool = True
+    ) -> None:
+        """``hold``: False for a request already released (finished), whose
+        published prefix nobody would unlock."""
+        state = self.prefetches.pop(request, None)
+        if state is None:
+            return
+        started = self._requery_started.pop(request, None)
+        if started is not None:
+            waited = time.perf_counter() - started
+            self._requery_waits.append(waited)
+            self._requery_records.append((request.rid, waited, "loaded" if publish else "aborted"))
+        # Event polling or reset/close has already quiesced every device writer.
+        if state.future is not None:
+            assert state.future.done()
+        end = len(state.key)
+        try:
+            if not publish:
+                self._lookup_stats["aborted"] += 1
+                self._update_load(
+                    ExternalLinkerLoadPhase.ABORT, None, state.component_transfers, end
+                )
+                return
+            by_pool = {t.name: t for _, t in state.component_transfers}
+            full = by_pool[PoolName.KV].device_indices
+            start = end - len(full)
+            prefix = self.cache.path_device_indices(state.anchor_node_id)
+            assert len(prefix) == start
+            mamba = by_pool.get(PoolName.MAMBA)
+            if mamba is not None:
+                # A restored state has no pending replay updates (GLM: restart_replay).
+                pool = self.cache.req_to_token_pool
+                write_pos = pool.mamba_pool.replayssm_write_pos
+                if write_pos is not None:
+                    write_pos[pool.translate_mamba_indices(mamba.device_indices)] = 0
+            # The normal insert protects the borrowed prefix and frees duplicate
+            # fetched slots; inserted_len=end counts no hit, so the just-fetched
+            # data is not written back to the store.
+            inserted = self.cache.insert(
+                InsertParams(
+                    key=state.key,
+                    value=torch.cat([prefix.to(full.dtype), full]),
+                    mamba_value=mamba.device_indices if mamba is not None else None,
+                    prev_prefix_len=start,
+                    inserted_len=end,
+                )
+            )
+            if mamba is not None and inserted.mamba_exist:
+                self.cache.req_to_token_pool.mamba_allocator.free(mamba.device_indices)
+            self._lookup_stats["published"] += 1
+            if not hold:
+                return
+            if self.hold_cap_tokens:
+                self._hold(request, state.key, end, len(full))
+            self.cache.prefetch_loaded_tokens_by_reqid[request] = len(full)
+            self.cache.prefetch_loaded_storage_start_by_reqid[request] = start
+        finally:
+            self.cache.dec_lock_ref(state.anchor_node_id, state.anchor_lock)
+
+    def _hold(self, request, key: RadixKey, end: int, tokens: int) -> None:
+        """Lock a just-published prefix for its waiting request, under the cap."""
+        stats = self._hold_stats
+        resident = self.cache.match_prefix(MatchPrefixParams(key=key))
+        if resident.device_prefix_len < end:
+            stats["not_resident"] += 1
+            self.unheld[request] = end
+        elif self.held_tokens + tokens > self.hold_cap_tokens:
+            stats["over_cap"] += 1
+            self.unheld[request] = end
+        else:
+            node = resident.last_device_node
+            lock = self.cache.inc_lock_ref(node).to_dec_params()
+            self.holds[request] = _PrefetchHold(node, lock, tokens)
+            self.held_tokens += tokens
+            stats["held"] += 1
+        self._log_holds()
+
+    def release_hold(
+        self, request: CacheRequestHandle, *, admitted: bool, prefix_len: int = 0
+    ) -> None:
+        stats = self._hold_stats
+        self.match_targets.pop(request, None)
+        end = self.unheld.pop(request, None)
+        if end is not None and admitted:
+            # An unheld prefix the request no longer matches in full was evicted.
+            if prefix_len < end:
+                stats["unheld_evicted"] += 1
+                stats["unheld_evicted_tokens"] += end - prefix_len
+            else:
+                stats["unheld_kept"] += 1
+        hold = self.holds.pop(request, None)
+        if hold is not None:
+            self.cache.dec_lock_ref(hold.node_id, hold.lock)
+            self.held_tokens -= hold.tokens
+            stats["admitted" if admitted else "released"] += 1
+        if self.pp_relay is not None:
+            self.pp_relay.release(request)
+        if admitted:
+            self._log_holds()
+
+    def _log_holds(self) -> None:
+        now = time.monotonic()
+        if now < self._hold_next_log:
+            return
+        self._hold_next_log = now + 60.0
+        logger.info(
+            "External linker prefetch holds: %d requests hold %d of %d tokens; %s; "
+            "lookups %s",
+            len(self.holds),
+            self.held_tokens,
+            self.hold_cap_tokens,
+            self._hold_stats,
+            self._lookup_stats,
+        )
+
+    def _release_prefetch_request(self, rid: str) -> None:
+        """GLM's release_request for the prefetch state of ``rid``."""
+        handles = {
+            h
+            for table in (self.prefetches, self.lookups, self.holds, self._pending_requeries)
+            for h in table
+            if h.rid == rid
+        }
+        if self.pp_relay is not None:
+            handles.update(h for h in self.pp_relay.entries if h.rid == rid)
+        for request in handles:
+            self._pending_requeries.pop(request, None)
+            self._requery_started.pop(request, None)
+            self._cancel_prefetch(request)
+            self.release_hold(request, admitted=False)
+
+    def _clear_prefetch_state(self) -> None:
+        for request in list(self.prefetches):
+            self._finish_prefetch(request, publish=False)
+        for request in list(self.lookups):
+            self._cancel_lookup(request)
+        for request in list(self.holds):
+            self.release_hold(request, admitted=False)
+        self.unheld.clear()
+        self.match_targets.clear()
+        self._pending_requeries.clear()
+        self._requery_started.clear()
+        self._requery_records.clear()
+        if self.pp_relay is not None:
+            self.pp_relay.reset()
+
     # ---- init_load_back: remote -> request-private device slots ----
 
     def load_back(self, req: Req) -> tuple[int, NodeId]:
@@ -1293,6 +2068,8 @@ class UnifiedCacheLinkerWrapper:
 
     def reset(self) -> None:
         self.cache_linker.reset()
+        if self.load_mode == "prefetch":
+            self._clear_prefetch_state()
         self.hit_markers.clear()
         self.lookup_cache.clear()
         self.tail_hash_cache.clear()
@@ -1312,6 +2089,8 @@ class UnifiedCacheLinkerWrapper:
         self.pending_offloads.clear()
 
     def release_request(self, rid: str) -> None:
+        if self.load_mode == "prefetch":
+            self._release_prefetch_request(rid)
         self.hit_markers.pop(rid, None)
         self.skip_counts.pop(rid, None)
         self.skip_since.pop(rid, None)
@@ -1327,6 +2106,10 @@ class UnifiedCacheLinkerWrapper:
 
     def close(self) -> None:
         self.cache_linker.close()
+        if self.load_mode == "prefetch":
+            self._clear_prefetch_state()
+            if self._lookup_executor is not None:
+                self._lookup_executor.shutdown(wait=False, cancel_futures=True)
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()
         self._release_pending_offloads()

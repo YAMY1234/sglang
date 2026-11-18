@@ -1004,6 +1004,29 @@ class Envs:
     # queued, landed or removed (wall clock), to tell a read-after-write race
     # from an eviction.
     SGLANG_LINKER_HOLE_TRACE = EnvBool(False)
+    # "prefetch": GLM's external-linker model. A queued request is looked up at
+    # enqueue and read into slots private to it; the read joins the tree once
+    # every stage has it, and admission only waits for that. Default (empty):
+    # admission-time layer-wise loads.
+    SGLANG_LINKER_LOAD_MODE = EnvStr("")
+    # Prefetch mode: in-flight reads that hold a recurrent-state slot (one per
+    # read per stage, from a pool of a few hundred), beyond which reads wait.
+    SGLANG_LINKER_PREFETCH_MAX_STATES = EnvInt(64)
+    # Prefetch mode (GLM names): a published read keeps its prefix locked until
+    # its request is admitted, the held prefixes under this share of the Full
+    # device pool (0 releases at publish; PP requires > 0).
+    SGLANG_EXTERNAL_LINKER_PREFETCH_HOLD_FRACTION = EnvFloat(0.0)
+    # Prefetch mode: store lookups on this many worker threads (0: on the
+    # scheduler thread; PP uses at least 1 on PP0).
+    SGLANG_EXTERNAL_LINKER_ASYNC_LOOKUP_THREADS = EnvInt(0)
+    # Prefetch mode: a queued request whose device prefix shrank since its
+    # lookup looks the lost range up again before admission.
+    SGLANG_EXTERNAL_LINKER_REQUERY_ON_DEVICE_LOSS = EnvBool(False)
+    # Prefetch mode: cap the Full device slots of reads in flight at this share
+    # of the pool, apart from holds; 0 keeps reads and holds under the hold cap.
+    SGLANG_EXTERNAL_LINKER_LOAD_FRACTION = EnvFloat(0.0)
+    # Prefetch mode: log lookup and hold counters every 60 s.
+    SGLANG_EXTERNAL_LINKER_LOOKUP_STATS = EnvBool(False)
     # A batch's external-linker load waits only for the GPU work queued before
     # the previous batch's launch, not for that batch's forward, so it runs
     # under the previous forward (default: it waits for all prior GPU work).

@@ -702,10 +702,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         # Pre-pins held across loads, or loads in flight together, can share a
         # prefix's keys: refcount sessions.
+        self.prefetch_mode = envs.SGLANG_LINKER_LOAD_MODE.get() == "prefetch"
         self.count_sessions = (
             envs.SGLANG_LINKER_ASYNC_ADMISSION.get()
             or self.load_overlap
             or self.num_load_threads > 1
+            or self.prefetch_mode
         )
         logger.info(
             "Mooncake linker load mode: overlap=%s per_key=%s threads=%d "
@@ -911,6 +913,15 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         ]
         for thread in self.load_threads:
             thread.start()
+        # Prefetch mode: whole-request reads, SGLANG_LINKER_LOAD_THREADS at a time.
+        self.prefetch_executor = (
+            ThreadPoolExecutor(
+                self.num_load_threads, thread_name_prefix=f"mooncake-prefetch-tp{tp_rank}"
+            )
+            if self.prefetch_mode
+            else None
+        )
+        self.prefetch_futures: set = set()
         self.offload_thread = threading.Thread(
             target=self.offload_thread_func,
             daemon=True,
@@ -1398,6 +1409,100 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         if self.log_load_timing:
             self.load_queued_at[rid] = time.monotonic()
+        return True
+
+    def prefetch(self, transfers: list[PoolTransfer]):
+        """Prefetch mode: read every layer of one request's restorable prefix
+        into its private slots off the scheduler thread. The slot indices are
+        ready once the work queued so far on this stream has run."""
+        if self.prefetch_executor is None:
+            return None
+        if self.mla_broadcaster is not None:
+            raise RuntimeError("Mooncake linker prefetch mode does not support MLA dedup.")
+        self._log_numa_first_request()
+        expanded = self.pool_group.resolve_transfers(
+            transfers, allow_partial=True, allow_missing_kv=True
+        )
+        if not expanded:
+            return None
+        self.freeze_gc_once()
+        if self.store_tree is not None:
+            kv = next((t for t in transfers if t.name == PoolName.KV), None)
+            if kv is not None:
+                self.store_tree.touch(list(kv.keys))
+        # Objects a read takes are stored: their publication skips the put.
+        self.storage.recently_loaded.add(self._object_keys(expanded)[0])
+        ready = device_module.Event()
+        ready.record()
+        future = self.prefetch_executor.submit(
+            self._prefetch_read, expanded, ready, time.monotonic()
+        )
+        self.prefetch_futures.add(future)
+        future.add_done_callback(self.prefetch_futures.discard)
+        self.stats["prefetch"] = self.stats.get("prefetch", 0) + 1
+        return future
+
+    def _prefetch_read(self, expanded: list[PoolTransfer], ready, queued: float) -> bool:
+        """One request's read, as load_layer_wise reads a batch (per key or per
+        layer, with its lease renewal and retry), with no layer counter."""
+        began = time.monotonic()
+        ready.synchronize()
+        batches: dict[PoolName, tuple[list[str], list[int]]] = {}
+        for transfer in expanded:
+            keys, locations = batches.setdefault(transfer.name, ([], []))
+            component_keys, _ = self.storage._get_hybrid_page_component_keys(
+                list(transfer.keys), transfer
+            )
+            keys.extend(self.storage._tag_keys(component_keys))
+            locations.extend(self.pools[transfer.name].prepare_locations(transfer.host_indices))
+        keys = [key for names, _ in batches.values() for key in names]
+        result = self.sessions.start(keys)
+        if result != [0] * len(keys):
+            failed = Counter(v for v in result if v != 0)
+            logger.warning(
+                "Mooncake linker prefetch: session start failed for %d of %d objects "
+                "by code %s",
+                sum(failed.values()),
+                len(keys),
+                dict(failed),
+            )
+            self.stats["prefetch_failed"] = self.stats.get("prefetch_failed", 0) + 1
+            return False
+        try:
+            if self.load_per_key:
+                self._load_per_key(batches, [], None)
+            else:
+                for layer in range(self.num_layers):
+                    for name, (names, locations) in batches.items():
+                        meta = self.pools[name].get_prepared_layer_range_meta(
+                            locations, layer
+                        )
+                        if meta is None:
+                            continue
+                        ptrs, sizes, offsets = meta
+                        got = self._get_layer_ranges(names, ptrs, sizes, offsets)
+                        if (
+                            got is None
+                            or isinstance(got, int)
+                            or list(got) != [sum(item) for item in sizes]
+                        ):
+                            raise RuntimeError(
+                                f"Mooncake range get failed for pool={name}, layer={layer}"
+                            )
+        except Exception:
+            logger.warning("Mooncake linker prefetch read failed", exc_info=True)
+            self.stats["prefetch_failed"] = self.stats.get("prefetch_failed", 0) + 1
+            return False
+        finally:
+            self.sessions.end(keys)
+        if self.log_load_timing:
+            logger.info(
+                "Mooncake linker prefetch pages=%d objects=%d wait=%.0fms xfer=%.0fms",
+                next((len(t.keys) for t in expanded if t.name == PoolName.KV), 0),
+                len(keys),
+                (began - queued) * 1e3,
+                (time.monotonic() - began) * 1e3,
+            )
         return True
 
     def cancel_queued_load(self, rid: str) -> bool:
@@ -2139,6 +2244,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self._end_expired_pins(float("inf"))
         self.pending_loads.clear()
         self.load_queued_at.clear()
+        # Prefetch reads write device slots until they return.
+        for future in list(self.prefetch_futures):
+            future.cancel()
+            if not future.cancelled():
+                future.exception()
         self.load_queue.join()
         self.offload_queue.join()
         self.broadcast_loads.clear()
@@ -2159,6 +2269,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         for thread in self.load_threads:
             thread.join()
         self.offload_thread.join()
+        if self.prefetch_executor is not None:
+            self.prefetch_executor.shutdown(wait=True)
         logger.info("Mooncake direct linker stats: %s", self.stats)
         self.storage.close()
         if self.mla_broadcaster is not None:

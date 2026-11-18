@@ -2617,8 +2617,47 @@ class UnifiedRadixCache(BasePrefixCache):
             return staged.matched_len, staged.matched_len + staged.num_tokens
         return None
 
+    # Drops a tree lock: every rank must release the same hold in the same order.
+    @rank_consensus(same_params=True)
+    def release_prefetch_hold(self, request: CacheRequestHandle, prefix_len: int) -> None:
+        if self.linker is not None and self.linker.load_mode == "prefetch":
+            self.linker.release_hold(request, admitted=True, prefix_len=prefix_len)
+
+    @rank_consensus(same_params=["req.rid"], same_results=True)
+    def requery_prefetch_after_device_loss(self, req: Req) -> bool:
+        if self.linker is None or self.linker.load_mode != "prefetch":
+            return False
+        return self.linker.requery_after_device_loss(req)
+
+    @property
+    def linker_prefetch_mode(self) -> bool:
+        return self.linker is not None and self.linker.load_mode == "prefetch"
+
+    def linker_prefetch(self, req: Req) -> None:
+        """Every rank, as a request is queued (SGLANG_LINKER_LOAD_MODE=prefetch)."""
+        if self.linker_prefetch_mode:
+            self.linker.prefetch(req)
+
+    def linker_attach_relay_store(self, store) -> None:
+        if self.linker_prefetch_mode and self.linker.pp_relay is not None:
+            self.linker.pp_relay.attach_store(store)
+
+    def linker_take_actions(self):
+        """PP0: the prefetch relay's actions to send with this round."""
+        if self.linker_prefetch_mode and self.linker.pp_relay is not None and self.pp_rank == 0:
+            return self.linker.pp_relay.take_actions()
+        return None
+
+    def linker_apply_actions(self, actions: list) -> None:
+        """Every PP rank, in relay order, before its admission pass."""
+        if self.linker_prefetch_mode and self.linker.pp_relay is not None:
+            for batch in actions:
+                self.linker.pp_relay.receive(batch.actions)
+
     @rank_consensus(same_params=True, same_results=True)
     def check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
+        if self.linker is not None and self.linker.load_mode == "prefetch":
+            return self.linker.check_prefetch_progress(request)
         if (
             self.cache_controller is not None
             and self.cache_controller.pp_prefetch_decisions.get(request.rid)
@@ -4185,6 +4224,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
+        if self.linker is not None and self.linker.load_mode == "prefetch":
+            self.linker.check_prefetch_events()
         if self.linker is not None and self.pp_size > 1:
             self._check_linker_events_pp()
             return

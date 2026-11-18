@@ -383,6 +383,7 @@ from sglang.srt.utils.weight_versions import (
     compute_weight_version_spans,
     record_weight_version_events,
 )
+from sglang.srt.mem_cache.unified_cache.pp_linker_relay import PPLinkerActions
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import LinkerAdmissionVerdicts
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
@@ -2383,6 +2384,9 @@ class Scheduler(
             verdicts = self.tree_cache.linker_take_verdicts()
             if verdicts is not None:
                 local_reqs = [*local_reqs, verdicts]
+            actions = self.tree_cache.linker_take_actions()
+            if actions is not None:
+                local_reqs = [*local_reqs, actions]
         recv_start_ns = time.monotonic_ns()
         received = self.request_receiver.recv_requests(local_reqs=local_reqs)
         # Linker admission verdicts apply on every stage before this round's
@@ -2391,6 +2395,10 @@ class Scheduler(
         if verdicts:
             received = [r for r in received if not isinstance(r, LinkerAdmissionVerdicts)]
             self.tree_cache.linker_apply_verdicts(verdicts[-1])
+        # Prefetch-relay actions apply after this round's requests are queued.
+        linker_actions = [r for r in received if isinstance(r, PPLinkerActions)]
+        if linker_actions:
+            received = [r for r in received if not isinstance(r, PPLinkerActions)]
         self._deferred_input_requests.extend(received)
 
         num_requests_to_process = len(self._deferred_input_requests)
@@ -2406,7 +2414,9 @@ class Scheduler(
             # Count successful receive/broadcast time as active; empty polls stay idle.
             self.metrics_reporter.record_scheduler_active(recv_start_ns)
         self.process_input_requests(recv_reqs)
-        return [*recv_reqs, *verdicts]
+        if linker_actions:
+            self.tree_cache.linker_apply_actions(linker_actions)
+        return [*recv_reqs, *verdicts, *linker_actions]
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_REQUESTS)
     def process_input_requests(self, recv_reqs: List):
@@ -3570,7 +3580,7 @@ class Scheduler(
             self.tree_cache.bind_prefetch_ticket(req.rid, recv_req.pp_prefetch_ticketed)
 
         linker = getattr(self.tree_cache, "linker", None)
-        if linker is not None and linker.pp_size > 1:
+        if linker is not None and linker.pp_size > 1 and linker.load_mode != "prefetch":
             # PP0 looks up every stage's store objects once; the result rides
             # this request to the later stages (relayed after processing).
             req.linker_pp_hit = recv_req.linker_pp_hit
@@ -3593,6 +3603,8 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req, storage_hit_end: Optional[int] = None):
+        if self.linker_prefetch_mode:
+            return self.tree_cache.linker_prefetch(req)
         if self.enable_hicache_storage or self.enable_lmcache:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
@@ -3675,6 +3687,23 @@ class Scheduler(
                 req.storage_prefetch_retry_attempts,
             )
         self._prefetch_kvcache(req, storage_hit_end)
+
+    @property
+    def linker_prefetch_mode(self) -> bool:
+        """SGLANG_LINKER_LOAD_MODE=prefetch on this scheduler's tree."""
+        return self.enable_unified_cache_external_linker and getattr(
+            self.tree_cache, "linker_prefetch_mode", False
+        )
+
+    def _linker_requery_after_device_loss(self, req: Req) -> bool:
+        """Re-query an external-linker range lost to device eviction while queued."""
+        max_attempts = get_memory().hicache_storage_prefetch_retry_max_attempts
+        if req.storage_prefetch_retry_attempts >= max_attempts:
+            return False
+        if not self.tree_cache.requery_prefetch_after_device_loss(req):
+            return False
+        req.storage_prefetch_retry_attempts += 1
+        return True
 
     def _k31_note_chunk_park(self, parked: bool, adder) -> None:
         """Log each park episode of a chunked continuation once, and its end."""
@@ -4643,7 +4672,11 @@ class Scheduler(
                     stop_reason = "req_slots"
                     break
 
-            if self.enable_hicache_storage or self.enable_lmcache:
+            if (
+                self.enable_hicache_storage
+                or self.enable_lmcache
+                or self.linker_prefetch_mode
+            ):
                 prefetch_done = self.tree_cache.check_prefetch_progress(
                     req.cache_request_handle
                 )
@@ -4670,6 +4703,11 @@ class Scheduler(
                 )
             if self.enable_hicache_storage and (
                 self._prefetch_after_device_hit_loss(req)
+            ):
+                self._revert_unadmitted_mamba(req)
+                continue
+            if self.linker_prefetch_mode and (
+                self._linker_requery_after_device_loss(req)
             ):
                 self._revert_unadmitted_mamba(req)
                 continue
@@ -5706,6 +5744,10 @@ class Scheduler(
                 or self.disaggregation_mode != DisaggregationMode.NULL
                 or self.enable_lmcache
                 or self._deferred_responses
+                or (
+                    self.linker_prefetch_mode
+                    and self.tree_cache.linker.has_pending_prefetch()
+                )
             ):
                 # Storage, transfer, and deferred-output workers need the GIL
                 # between I/O calls. Singleton PD polls no longer yield through
@@ -5852,6 +5894,9 @@ class Scheduler(
                         idle &= tc.buffer_pipeline.is_idle()
             elif self.enable_lmcache:
                 idle &= not self.tree_cache.has_pending_cache_operations()
+
+            if self.linker_prefetch_mode:
+                idle &= not self.tree_cache.linker.has_pending_prefetch()
 
         return idle
 
