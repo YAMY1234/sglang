@@ -972,6 +972,8 @@ class Envs:
     # A batch's external-linker load waits only for the GPU work queued before
     # the previous batch's launch, not for that batch's forward, so it runs
     # under the previous forward (default: it waits for all prior GPU work).
+    # Currently ignored with a warning: unsafe until load slots are reserved
+    # on the CPU (the slot indices are written on the GPU after that launch).
     SGLANG_LINKER_LOAD_OVERLAP = EnvBool(False)
     # Read a load batch in one store call, every layer of a key in one entry,
     # instead of one call per layer and pool; its layers complete together.

@@ -327,7 +327,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.prepin_pool: ThreadPoolExecutor | None = None
         self.urgent_pool: ThreadPoolExecutor | None = None
         self.prepin_renew_s = envs.SGLANG_LINKER_PREPIN_RENEW_SECS.get()
-        self.load_overlap = envs.SGLANG_LINKER_LOAD_OVERLAP.get()
+        # Off until load slots are known on the CPU before the launch: the load
+        # thread reads its slot indices, which this batch's own allocation
+        # kernels write after the previous launch (Hecate D4b: misaligned reads
+        # and a request restored into the wrong slots).
+        self.load_overlap = False
+        if envs.SGLANG_LINKER_LOAD_OVERLAP.get():
+            logger.warning(
+                "SGLANG_LINKER_LOAD_OVERLAP is ignored: loads still wait for all "
+                "prior GPU work until their slots are reserved on the CPU."
+            )
         self.load_per_key = envs.SGLANG_LINKER_LOAD_PER_KEY.get()
         self.num_load_threads = envs.SGLANG_LINKER_LOAD_THREADS.get() or (
             2 if self.load_overlap else 1
