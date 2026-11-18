@@ -1012,6 +1012,8 @@ class Envs:
     # Prefetch mode: in-flight reads that hold a recurrent-state slot (one per
     # read per stage, from a pool of a few hundred), beyond which reads wait.
     SGLANG_LINKER_PREFETCH_MAX_STATES = EnvInt(64)
+    # Log each admitted request's prefix and extend length per PP stage (debug).
+    SGLANG_LINKER_PP_ADMIT_TRACE = EnvBool(False)
     # Prefetch mode (GLM names): a published read keeps its prefix locked until
     # its request is admitted, the held prefixes under this share of the Full
     # device pool (0 releases at publish; PP requires > 0).
