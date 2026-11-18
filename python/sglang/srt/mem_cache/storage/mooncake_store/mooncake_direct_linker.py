@@ -267,6 +267,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     _numa_first_request_logged = True
     # Refcount read sessions per key (async admission or load overlap).
     count_sessions = False
+    # Held pins of launched loads are renewed this often (s); see _renew_held_pins.
+    prepin_renew_s = 2.0
+    prepin_pool: "ThreadPoolExecutor | None" = None
+    pin_renewals = 0
     _session_refs: "_SessionRefs | None" = None
     # SGLANG_LINKER_LOAD_OVERLAP / _PER_KEY at init; the previous launch's event.
     load_overlap = False
@@ -351,6 +355,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.count_sessions,
         )
         self.prepin_renewals = 0
+        self.pin_renewals = 0
         self.stats_logged_at = time.monotonic()
         # Store-side state path cap: each state this rank wrote -> the deepest
         # earlier state on its path (None at the root), and its child count.
@@ -717,7 +722,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     _PIN_GRACE_S = 30.0
     # Read results retried once: LEASE_EXPIRED (sessions renewed first) and a
     # failed transfer.
-    _RETRY_CODES = (-707, -800)
+    _RETRY_CODES = (-600, -707, -800)
     # A pre-pin not taken within this long is released (the read sessions'
     # leases are short); its request pins at admission instead.
     _PREPIN_TTL_S = 3.0
@@ -852,6 +857,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         for rid in [r for r in self.prepins if r not in keep]:
             self._drop_prepin(rid)
         now = time.monotonic()
+        self._renew_held_pins(now)
         for rid, entry in list(self.prepins.items()):
             tag, future, num_pages, own, others, started, spans = entry
             # A renewal in flight reads as not ready: never renew a hit that
@@ -889,6 +895,26 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         now = time.monotonic() if now is None else now
         while self.pin_expiry and self.pin_expiry[0][0] <= now:
             self.sessions.end(self.pin_expiry.popleft()[1])
+
+    def _renew_held_pins(self, now: float | None = None) -> None:
+        """PP0: renew the later stages' pinned objects of launched loads until
+        their grace ends. A session lapses with the store lease (about 10 s):
+        under a deep queue a later stage started its own load after that and
+        found the objects evicted (Rhea pm-lk1: -704 at its session start).
+        Renewals run off the scheduler thread; a renewal that finds an object
+        gone changes nothing here, that stage's load reports it."""
+        if not self.pin_expiry or self.prepin_renew_s <= 0:
+            return
+        now = time.monotonic() if now is None else now
+        due = [entry for entry in self.pin_expiry if now - entry[2] >= self.prepin_renew_s]
+        if not due:
+            return
+        if self.prepin_pool is None:
+            self.prepin_pool = ThreadPoolExecutor(1, thread_name_prefix="mooncake-prepin")
+        for entry in due:
+            entry[2] = now
+            self.prepin_pool.submit(self.sessions.renew, list(entry[1]))
+            self.pin_renewals += 1
 
     def _lease_keys(self, page_hashes: list[str]) -> list[str]:
         """Every stage's all-pages objects of these pages, and the state at the
@@ -1004,8 +1030,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         for rid in pending:
             others = self.pinned_others.pop(rid, None)
             if others:
-                self.pin_expiry.append((now + self._PIN_GRACE_S, others))
+                self.pin_expiry.append([now + self._PIN_GRACE_S, others, now])
         self._end_expired_pins(now)
+        self._renew_held_pins(now)
         if broadcaster is not None:
             indices = {}
             for transfers in pending.values():
@@ -1102,14 +1129,17 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         expected = [sum(item) for item in sizes]
         # Retry this layer once for objects that failed transiently: an expired
         # session lease (Mooncake LEASE_EXPIRED, -707: leases can lapse between
-        # layers of a long prefix; reacquire those immutable objects first) or a
-        # failed transfer (-800). Anything else, like a missing object (-704),
-        # still fails the load: under PP one stage's failure splits the stages'
-        # queues (Hecate H112), so a transient one should not get that far.
+        # layers of a long prefix; reacquire those immutable objects first), a
+        # session another holder ended or that lapsed (-600, INVALID_PARAMS:
+        # renewed too; Rhea pm-lk1 failed a per-key read on -707 and -600
+        # together) or a failed transfer (-800). Anything else, like a missing
+        # object (-704), still fails the load: under PP one stage's failure
+        # splits the stages' queues (Hecate H112), so a transient one should
+        # not get that far.
         retry = [i for i, (v, want) in enumerate(zip(result, expected)) if v != want]
         if not retry or any(result[i] not in self._RETRY_CODES for i in retry):
             return result
-        expired_keys = [keys[i] for i in retry if result[i] == -707]
+        expired_keys = [keys[i] for i in retry if result[i] in (-600, -707)]
         renewed = self.sessions.renew(expired_keys)
         if renewed != [0] * len(expired_keys):
             raise RuntimeError(

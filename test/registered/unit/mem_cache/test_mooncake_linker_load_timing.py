@@ -148,6 +148,42 @@ class TestMooncakeLinkerLoadTiming(CustomTestCase):
         store.batch_get_session_end.assert_called_once_with(["later-stage-key"])
         self.assertEqual(len(linker.pin_expiry), 0)
 
+    def test_launched_loads_keep_the_later_stages_pins_renewed_until_the_grace_ends(self):
+        # Rhea pm-lk1: a later stage started its own load after the store lease
+        # (about 10 s) and found PP0's pinned objects evicted (-704).
+        linker = _linker(log_load_timing=False)
+        linker.pool_group = SimpleNamespace(
+            resolve_transfers=lambda transfers, **kwargs: transfers
+        )
+        linker.pending_loads, linker.load_queued_at = {}, {}
+        linker.mla_broadcaster, linker.gc_frozen = None, True
+        linker.load_queue, linker.broadcast_loads = queue.Queue(), {}
+        linker.stats = {"load": 0}
+        linker.layer_done_counter.update_producer.return_value = 3
+        linker.pinned_others = {"r": ["later-stage-key"]}
+        linker.prepin_renew_s = 2.0
+        linker.prepin_pool = ThreadPoolExecutor(1)
+        self.assertTrue(linker.load("r", [_transfer(PoolName.KV, 1)]))
+        with patch.object(mooncake_direct_linker, "device_module", MagicMock()):
+            linker.start_layer_wise_loading()
+        store = linker.storage.store
+        t0 = linker.pin_expiry[0][2]
+        renewals = lambda: [c.args[0] for c in store.batch_get_session_start.call_args_list
+                            if c.args[0] == ["later-stage-key"]]
+        linker._renew_held_pins(t0 + 1.0)  # not due yet
+        linker.prepin_pool.submit(lambda: None).result(timeout=5)
+        self.assertEqual(renewals(), [])
+        linker._renew_held_pins(t0 + 2.5)
+        linker._renew_held_pins(t0 + 3.0)  # renewed at 2.5: not due again
+        linker.prepin_pool.submit(lambda: None).result(timeout=5)
+        self.assertEqual(renewals(), [["later-stage-key"]])
+        self.assertEqual(linker.pin_renewals, 1)
+        linker._end_expired_pins(t0 + linker._PIN_GRACE_S + 1)
+        linker._renew_held_pins(t0 + linker._PIN_GRACE_S + 5)  # ended: nothing left
+        linker.prepin_pool.submit(lambda: None).result(timeout=5)
+        self.assertEqual(len(renewals()), 1)
+        store.batch_get_session_end.assert_called_with(["later-stage-key"])
+
     def _read_once_with(self, first_codes):
         """A two-object KV load whose first range read returns ``first_codes``
         (per object; None = read fine) and whose retry reads fine."""
@@ -186,6 +222,16 @@ class TestMooncakeLinkerLoadTiming(CustomTestCase):
         store = linker.storage.store
         self.assertEqual(store.batch_get_session_start.call_args.args[0], ["kv-0"])
         linker.layer_done_counter.fail.assert_not_called()
+
+    def test_a_lapsed_or_cut_session_is_renewed_before_the_read_again(self):
+        # Rhea pm-lk1: a per-key read failed on -707 and -600 together and was
+        # not retried, which aborted its requests on every stage.
+        linker, calls, _, _ = self._read_once_with([-600, -707])
+        self.assertEqual(calls[1], ["kv-0", "kv-1"])
+        store = linker.storage.store
+        self.assertEqual(store.batch_get_session_start.call_args.args[0], ["kv-0", "kv-1"])
+        linker.layer_done_counter.fail.assert_not_called()
+        self.assertEqual(linker.read_retries, {"retried": 2, "recovered": 2})
 
     def test_a_retry_that_fails_again_fails_the_load_and_is_not_recovered(self):
         linker = _linker(log_load_timing=False)
