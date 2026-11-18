@@ -313,12 +313,25 @@ class _SessionRefs:
     client, so any end closes it for every holder: with ``counted`` a key's
     session starts on its first holder and ends with its last (Hecate r5: two
     loads ending each other's shared keys failed 16 of 96 with -600). A start
-    is all or nothing: on any failed key it keeps no session."""
+    is all or nothing: on any failed key it keeps no session.
+
+    Counted, the lock guards only the counts: no store RPC runs under it
+    (Rhea pm-lk3: PP0's scheduler thread waited on it while pre-pin threads
+    held it across their session starts). A key with an RPC in flight is in
+    ``inflight``; a start of that key waits for it. ``end_async`` drops the
+    counts on the caller's thread and ends the keys that reached zero on one
+    background thread, in order; a key started again before that runs keeps
+    its session (an end only closes keys still at zero holders)."""
 
     def __init__(self, store, counted: bool):
         self.store, self.counted = store, counted
         self.counts: Counter = Counter()
         self.lock = threading.Lock()
+        self.inflight: dict[str, threading.Event] = {}
+        # key -> the sequence number of the end that will close it
+        self.pending_end: dict[str, int] = {}
+        self.end_seq = 0
+        self.ender: ThreadPoolExecutor | None = None
 
     def start(self, keys: list[str]) -> list[int]:
         if not keys:
@@ -328,28 +341,55 @@ class _SessionRefs:
             if any(result):
                 self.store.batch_get_session_end(keys)
             return result
-        with self.lock:
-            new = [key for key in dict.fromkeys(keys) if not self.counts[key]]
+        unique = list(dict.fromkeys(keys))
+        while True:
+            with self.lock:
+                waits = [self.inflight[key] for key in unique if key in self.inflight]
+                if not waits:
+                    new = [key for key in unique if not self.counts[key]]
+                    started = threading.Event()
+                    for key in new:
+                        self.inflight[key] = started
+                    self.counts.update(keys)
+                    break
+            for event in waits:
+                event.wait()
+        try:
             codes = dict(zip(new, self.store.batch_get_session_start(new))) if new else {}
-            result = [codes.get(key, 0) for key in keys]
+        except BaseException:
+            codes = {key: -1 for key in new}
+            failed = True
+        else:
+            failed = False
+        result = [codes.get(key, 0) for key in keys]
+        ok_started = [key for key in new if codes.get(key) == 0]
+        with self.lock:
+            for key in new:
+                self.inflight.pop(key, None)
             if any(result):
-                started = [key for key in new if codes[key] == 0]
-                if started:
-                    self.store.batch_get_session_end(started)
+                self.counts.subtract(keys)
+                for key in unique:
+                    if self.counts[key] <= 0:
+                        del self.counts[key]
+                # Sessions this call opened whose count is back to zero.
+                close = [key for key in ok_started if not self.counts[key]]
             else:
-                self.counts.update(keys)
+                close = []
+        started.set()
+        if close:
+            self.store.batch_get_session_end(close)
+        if failed:
+            raise RuntimeError("Mooncake get session start raised")
         return result
 
     def renew(self, keys: list[str]) -> list[int]:
         """Start again sessions this client holds (extends their leases)."""
         return list(self.store.batch_get_session_start(keys)) if keys else []
 
-    def end(self, keys: list[str]) -> None:
-        if not self.counted:
-            self.store.batch_get_session_end(keys)
-            return
+    def _release(self, keys: list[str]) -> list[str]:
+        """Drop one hold of each key; the keys whose count reached zero."""
+        last = []
         with self.lock:
-            last = []
             for key in keys:
                 held = self.counts.get(key, 0)
                 if held > 1:
@@ -357,8 +397,57 @@ class _SessionRefs:
                 elif held == 1:
                     del self.counts[key]
                     last.append(key)
-            if last:
-                self.store.batch_get_session_end(last)
+        return last
+
+    def end(self, keys: list[str]) -> None:
+        if not self.counted:
+            self.store.batch_get_session_end(keys)
+            return
+        last = self._release(keys)
+        if last:
+            self._end_now(last, None)
+
+    def end_async(self, keys: list[str]) -> None:
+        """``end`` without the store RPC on this thread (counted only; an
+        uncounted client ends at once, as before)."""
+        if not self.counted:
+            self.store.batch_get_session_end(keys)
+            return
+        last = self._release(keys)
+        if not last:
+            return
+        with self.lock:
+            self.end_seq += 1
+            seq = self.end_seq
+            for key in last:
+                self.pending_end[key] = seq
+        if self.ender is None:
+            self.ender = ThreadPoolExecutor(1, thread_name_prefix="mooncake-session-end")
+        self.ender.submit(self._end_now, last, seq)
+
+    def _end_now(self, keys: list[str], seq: int | None) -> None:
+        with self.lock:
+            if seq is not None:
+                keys = [k for k in keys if self.pending_end.get(k) == seq and not self.counts[k]]
+                for key in keys:
+                    del self.pending_end[key]
+            done = threading.Event()
+            for key in keys:
+                self.inflight[key] = done
+        try:
+            if keys:
+                self.store.batch_get_session_end(keys)
+        finally:
+            with self.lock:
+                for key in keys:
+                    if self.inflight.get(key) is done:
+                        del self.inflight[key]
+            done.set()
+
+    def flush(self) -> None:
+        """Wait for queued ends (tests and shutdown)."""
+        if self.ender is not None:
+            self.ender.submit(lambda: None).result()
 
 
 class MooncakeDirectLinker(UnifiedCacheLinker):
@@ -1001,7 +1090,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
         def end(done):
             if done.result()[0] == num_pages:
-                self.sessions.end(own + others)
+                self.sessions.end_async(own + others)
 
         # A renewal replaced the entry's future, so this ends after it.
         future.add_done_callback(end)
@@ -1010,12 +1099,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         keys = self.pinned.pop(rid, None) or []
         keys += self.pinned_others.pop(rid, None) or []
         if keys:
-            self.sessions.end(keys)
+            self.sessions.end_async(keys)
 
     def _end_expired_pins(self, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now
         while self.pin_expiry and self.pin_expiry[0][0] <= now:
-            self.sessions.end(self.pin_expiry.popleft()[1])
+            # Off the scheduler thread (Rhea pm-lk3: 24% of PP0's).
+            self.sessions.end_async(self.pin_expiry.popleft()[1])
 
     def _renew_held_pins(self, now: float | None = None) -> None:
         """PP0: renew the later stages' pinned objects of launched loads until

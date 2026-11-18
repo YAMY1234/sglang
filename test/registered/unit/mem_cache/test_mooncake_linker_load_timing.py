@@ -712,6 +712,82 @@ class TestSessionRefcount(CustomTestCase):
         linker.sessions.end(["kv-0"])
         self.assertEqual(store.batch_get_session_end.call_args.args[0], ["kv-0"])
 
+    def test_an_async_end_leaves_the_rpc_to_its_thread_and_a_restart_cancels_it(self):
+        # Rhea pm-lk3: ending expired pins took 24% of PP0's scheduler thread.
+        refs, store = self._refs()
+        gate = threading.Event()
+        refs.ender = ThreadPoolExecutor(1)
+        refs.ender.submit(gate.wait, 5)  # the end thread is busy
+        refs.start(["a", "b"])
+        refs.end_async(["a", "b"])
+        store.batch_get_session_end.assert_not_called()  # not on this thread
+        self.assertEqual(refs.counts, {})
+        refs.start(["b"])  # b is held again before its end runs
+        gate.set()
+        refs.flush()
+        store.batch_get_session_end.assert_called_once_with(["a"])
+        self.assertEqual(refs.counts, {"b": 1})
+
+    def test_no_store_rpc_runs_under_the_count_lock(self):
+        refs, store = self._refs()
+        entered, release = threading.Event(), threading.Event()
+
+        def slow(keys):
+            if keys == ["a"]:
+                entered.set()
+                release.wait(5)
+            return [0] * len(keys)
+
+        store.batch_get_session_start.side_effect = slow
+        first = threading.Thread(target=refs.start, args=(["a"],))
+        first.start()
+        self.assertTrue(entered.wait(5))
+        done = threading.Event()
+        threading.Thread(target=lambda: (refs.start(["x"]), done.set())).start()
+        self.assertTrue(done.wait(5))  # another key's start is not held up
+        release.set()
+        first.join(5)
+        self.assertEqual(refs.counts, {"a": 1, "x": 1})
+
+    def test_a_start_waits_for_an_end_of_the_same_key_already_on_the_wire(self):
+        refs, store = self._refs()
+        order, entered, release = [], threading.Event(), threading.Event()
+
+        def end(keys):
+            entered.set()
+            release.wait(5)
+            order.append(("end", list(keys)))
+
+        store.batch_get_session_end.side_effect = end
+        store.batch_get_session_start.side_effect = lambda keys: (
+            order.append(("start", list(keys))) or [0] * len(keys)
+        )
+        refs.start(["k"])
+        refs.end_async(["k"])
+        self.assertTrue(entered.wait(5))
+        starter = threading.Thread(target=refs.start, args=(["k"],))
+        starter.start()
+        release.set()
+        starter.join(5)
+        refs.flush()
+        self.assertEqual(order, [("start", ["k"]), ("end", ["k"]), ("start", ["k"])])
+        self.assertEqual(refs.counts, {"k": 1})
+
+    def test_expired_pins_end_off_the_scheduler_thread(self):
+        linker = _linker(log_load_timing=False)
+        linker.count_sessions = True
+        linker.sessions.start(["later-stage-key"])
+        gate = threading.Event()
+        linker.sessions.ender = ThreadPoolExecutor(1)
+        linker.sessions.ender.submit(gate.wait, 5)
+        linker.pin_expiry.append([0.0, ["later-stage-key"], 0.0])
+        linker._end_expired_pins(1.0)
+        store = linker.storage.store
+        store.batch_get_session_end.assert_not_called()
+        gate.set()
+        linker.sessions.flush()
+        store.batch_get_session_end.assert_called_once_with(["later-stage-key"])
+
     def test_without_refcounting_every_end_reaches_the_store(self):
         linker = _linker(log_load_timing=False)
         linker.sessions.start(["kv-0"])
