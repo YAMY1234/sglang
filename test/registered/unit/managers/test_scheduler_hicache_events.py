@@ -1,6 +1,7 @@
 """HiCache progress must not depend on whether a prefill batch is admitted."""
 
 import unittest
+import unittest.mock
 from types import SimpleNamespace
 from unittest.mock import Mock, call
 
@@ -117,6 +118,57 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
             self.calls.mock_calls,
             [call.drain(), call.retry(), call.admit(self.running_batch)],
         )
+
+
+class TestLinkerVerdictsRideTheRequestRelay(unittest.TestCase):
+    """SGLANG_LINKER_ASYNC_BATCHED_RELAY: PP0's admission verdicts ride the
+    request list it relays each round; every stage applies them before its
+    pass, never processes them as a request, and forwards them on."""
+
+    def _scheduler(self, received):
+        s = Scheduler.__new__(Scheduler)
+        s._deferred_input_requests = []
+        s._poll_timeout_aborts = lambda: []
+        s.enable_unified_cache_external_linker = True
+        s.tree_cache = Mock()
+        s.request_receiver = Mock()
+        s.request_receiver.recv_requests.side_effect = lambda local_reqs: [*received, *local_reqs]
+        s.metrics_reporter = Mock()
+        s.process_input_requests = Mock()
+        return s
+
+    def _ingest(self, s, pp_rank):
+        from sglang.srt.managers import scheduler as scheduler_module
+
+        parallel = SimpleNamespace(pp_rank=pp_rank, attn_tp_rank=0, attn_cp_rank=0)
+        with unittest.mock.patch.object(scheduler_module, "get_parallel", return_value=parallel):
+            return s.ingest_requests()
+
+    def test_pp0_sends_applies_and_forwards_its_verdicts(self):
+        from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+            LinkerAdmissionVerdicts,
+        )
+
+        verdicts = LinkerAdmissionVerdicts(ready={"r": (3, 3)})
+        s = self._scheduler(received=["req"])
+        s.tree_cache.linker_take_verdicts.return_value = verdicts
+        forwarded = self._ingest(s, pp_rank=0)
+        s.tree_cache.linker_apply_verdicts.assert_called_once_with(verdicts)
+        s.process_input_requests.assert_called_once_with(["req"])
+        self.assertEqual(forwarded, ["req", verdicts])
+
+    def test_a_later_stage_applies_and_forwards_without_processing_them(self):
+        from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+            LinkerAdmissionVerdicts,
+        )
+
+        verdicts = LinkerAdmissionVerdicts(ready={})
+        s = self._scheduler(received=["req", verdicts])
+        forwarded = self._ingest(s, pp_rank=3)
+        s.tree_cache.linker_take_verdicts.assert_not_called()
+        s.tree_cache.linker_apply_verdicts.assert_called_once_with(verdicts)
+        s.process_input_requests.assert_called_once_with(["req"])
+        self.assertEqual(forwarded, ["req", verdicts])
 
 
 if __name__ == "__main__":

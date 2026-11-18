@@ -4270,6 +4270,16 @@ class UnifiedRadixCache(BasePrefixCache):
             [bool(success) for success in successes.tolist()]
         )
 
+    def linker_take_verdicts(self):
+        """PP0: the batched-relay admission verdicts to send with this round."""
+        if self.linker is not None and self.pp_size > 1 and self.pp_rank == 0:
+            return self.linker.take_verdicts()
+        return None
+
+    def linker_apply_verdicts(self, verdicts) -> None:
+        if self.linker is not None:
+            self.linker.apply_verdicts(verdicts)
+
     def linker_prepin(self, waiting: list[Req]) -> None:
         """PP0, after each prefill scheduling pass: see UnifiedCacheLinkerWrapper.prepin."""
         if self.linker is not None and self.pp_size > 1 and self.pp_rank == 0:

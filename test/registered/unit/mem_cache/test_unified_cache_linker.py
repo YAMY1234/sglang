@@ -41,6 +41,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
 )
 from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+    LinkerAdmissionVerdicts,
     LINKER_ADMISSION_SKIPPED,
     ExternalCacheHitMarker,
     LayerWiseLoadCounter,
@@ -1858,6 +1859,9 @@ class _PinningLinker(_CountingLinker):
     def take_prepin(self, rid, transfers):
         return self.prepinned
 
+    def peek_prepin(self, rid, transfers):
+        return self.prepinned
+
 
 def test_pp_admission_pins_the_hit_and_a_hole_shrinks_it_before_the_load(
     full_linker_component,
@@ -2078,6 +2082,127 @@ def test_async_admission_never_pins_at_admission_and_holds_a_starving_hits_pin(
         backend.prepinned = 3
         assert pp0._pp_fresh_hit_pages(req, pp0.hit_markers["r"]) == 3
         assert backend.pins == [] and pp0.skip_counts == {}
+
+
+def _verdict_pair(component, pp0_backend, later_backend):
+    """PP0 and a later stage in batched-relay mode; counts each per-hit relay."""
+    relays = []
+
+    def pp0_reduce(data, op):
+        relays.append(("pp0", int(data[0])))
+
+    def later_reduce(data, op):
+        data[0] = next(v for who, v in reversed(relays) if who == "pp0")
+        relays.append(("later", int(data[0])))
+
+    pp0 = _match_wrapper(component, pp0_backend, pp_size=8, pp_rank=0, _all_reduce=pp0_reduce)
+    later = _match_wrapper(component, later_backend, pp_size=8, pp_rank=5, _all_reduce=later_reduce)
+    return pp0, later, relays
+
+
+def test_batched_relay_admits_and_skips_alike_without_a_relay_per_hit(
+    full_linker_component,
+):
+    # Rhea pm-lk3: one PP relay per hit (640-930 skips a minute) kept PP0 in
+    # _drain_async_work 29% of its scheduler thread. The verdicts ride the
+    # request relay once per round; every stage applies the same map.
+    with (
+        envs.SGLANG_LINKER_PREPIN_DEPTH.override(4),
+        envs.SGLANG_LINKER_ASYNC_ADMISSION.override(True),
+        envs.SGLANG_LINKER_ASYNC_BATCHED_RELAY.override(True),
+        patch(
+            "sglang.srt.mem_cache.unified_cache.unified_cache_linker.get_storage_hash_str",
+            side_effect=_page_hashes,
+        ),
+    ):
+        pp0_backend, later_backend = _PinningLinker(stage_restorable=[1, 3]), _PinningLinker()
+        pp0, later, relays = _verdict_pair(full_linker_component, pp0_backend, later_backend)
+        reqs = {}
+        for rid in ("ready", "unready"):
+            r0 = SimpleNamespace(rid=rid, linker_pp_hit=None, linker_pp_lookup_pending=True)
+            pp0.match(_KEY, r0, _device_result(0))
+            r5 = SimpleNamespace(rid=rid, linker_pp_hit=r0.linker_pp_hit, linker_pp_lookup_pending=False)
+            r0.linker_pp_lookup_pending = False
+            later.match(_KEY, r5, _device_result(0))
+            reqs[rid] = (r0, r5)
+        verdicts = LinkerAdmissionVerdicts(ready={"ready": (3, 3)})
+        pp0.apply_verdicts(verdicts)
+        later.apply_verdicts(verdicts)
+        pp0_backend.prepinned = 3
+        for rid, want in (("ready", 3), ("unready", UnifiedCacheLinkerWrapper._SKIPPED)):
+            r0, r5 = reqs[rid]
+            assert pp0._pp_fresh_hit_pages(r0, pp0.hit_markers[rid]) == want
+            assert later._pp_fresh_hit_pages(r5, later.hit_markers[rid]) == want
+        assert relays == []  # no per-hit relay at all
+        assert pp0.skip_counts == later.skip_counts == {"unready": 1}
+        assert pp0_backend.prepin_starts == ["unready"] and later_backend.prepin_starts == []
+
+
+def test_batched_relay_skips_a_stale_verdict_and_relays_only_a_hole(
+    full_linker_component,
+):
+    with (
+        envs.SGLANG_LINKER_PREPIN_DEPTH.override(4),
+        envs.SGLANG_LINKER_ASYNC_ADMISSION.override(True),
+        envs.SGLANG_LINKER_ASYNC_BATCHED_RELAY.override(True),
+        patch(
+            "sglang.srt.mem_cache.unified_cache.unified_cache_linker.get_storage_hash_str",
+            side_effect=_page_hashes,
+        ),
+    ):
+        pp0_backend, later_backend = _PinningLinker(stage_restorable=[1, 3]), _PinningLinker()
+        pp0, later, relays = _verdict_pair(full_linker_component, pp0_backend, later_backend)
+        r0 = SimpleNamespace(rid="r", linker_pp_hit=None, linker_pp_lookup_pending=True)
+        pp0.match(_KEY, r0, _device_result(0))
+        r5 = SimpleNamespace(rid="r", linker_pp_hit=r0.linker_pp_hit, linker_pp_lookup_pending=False)
+        r0.linker_pp_lookup_pending = False
+        later.match(_KEY, r5, _device_result(0))
+        # A verdict for a different hit length is stale: skipped everywhere.
+        for w in (pp0, later):
+            w.apply_verdicts(LinkerAdmissionVerdicts(ready={"r": (2, 2)}))
+        assert pp0._pp_fresh_hit_pages(r0, pp0.hit_markers["r"]) == UnifiedCacheLinkerWrapper._SKIPPED
+        assert later._pp_fresh_hit_pages(r5, later.hit_markers["r"]) == UnifiedCacheLinkerWrapper._SKIPPED
+        # A verdict whose pre-pin found a hole relays PP0's re-lookup, once.
+        for w in (pp0, later):
+            w.apply_verdicts(LinkerAdmissionVerdicts(ready={"r": (3, 2)}))
+        pp0.match(_KEY, r0, _device_result(0))
+        later.match(_KEY, r5, _device_result(0))
+        got = pp0._pp_fresh_hit_pages(r0, pp0.hit_markers["r"])
+        assert later._pp_fresh_hit_pages(r5, later.hit_markers["r"]) == got == 1
+        assert [who for who, _ in relays] == ["pp0", "later"]
+
+
+def test_batched_relay_verdicts_are_the_landed_prepins_of_the_window(
+    full_linker_component,
+):
+    with (
+        envs.SGLANG_LINKER_PREPIN_DEPTH.override(8),
+        envs.SGLANG_LINKER_ASYNC_ADMISSION.override(True),
+        envs.SGLANG_LINKER_ASYNC_BATCHED_RELAY.override(True),
+        envs.SGLANG_LINKER_PREPIN_WINDOW_MIN.override(3),
+        patch(
+            "sglang.srt.mem_cache.unified_cache.unified_cache_linker.get_storage_hash_str",
+            side_effect=_page_hashes,
+        ),
+    ):
+        backend = _PinningLinker(stage_restorable=[1, 3])
+        landed = {"a": 3, "c": 3, "d": 3}  # d landed but is outside the window
+        backend.peek_prepin = lambda rid, transfers: landed.get(rid)
+        kept = []
+        backend.keep_prepins = lambda rids, urgent=(): kept.append(list(rids))
+        pp0 = _match_wrapper(full_linker_component, backend, pp_size=8, pp_rank=0, _all_reduce=lambda d, op: None)
+        reqs = []
+        for rid in ("a", "b", "c", "d"):
+            r = SimpleNamespace(rid=rid, linker_pp_hit=None, linker_pp_lookup_pending=True)
+            pp0.match(_KEY, r, _device_result(0))
+            reqs.append(r)
+        pp0.prepin(reqs)
+        # The window floor (3) holds although no hit was admitted yet; the
+        # verdicts are the window's landed pre-pins only (d is outside it).
+        assert kept[-1] == ["a", "b", "c"]
+        sent = pp0.take_verdicts()
+        assert sent.ready == {"a": (3, 3), "c": (3, 3)}
+        assert pp0.take_verdicts().ready == {}  # sent once
 
 
 def test_async_admission_prepins_the_admission_window_and_ends_the_rest(

@@ -978,6 +978,13 @@ class Envs:
     SGLANG_LINKER_ASYNC_ADMISSION = EnvBool(False)
     # Seconds between renewals of a waiting request's pre-pin (async admission).
     SGLANG_LINKER_PREPIN_RENEW_SECS = EnvFloat(2.0)
+    # Async admission: PP0 relays the next pass's admit/skip verdicts once per
+    # round on the request relay (every stage applies the same map) instead of
+    # one PP relay per hit; pre-pin session starts run on this many threads; the
+    # pre-pin window holds at least this many hits.
+    SGLANG_LINKER_ASYNC_BATCHED_RELAY = EnvBool(False)
+    SGLANG_LINKER_PREPIN_THREADS = EnvInt(1)
+    SGLANG_LINKER_PREPIN_WINDOW_MIN = EnvInt(2)
     # A batch's external-linker load waits only for the GPU work queued before
     # the previous batch's launch, not for that batch's forward, so it runs
     # under the previous forward (default: it waits for all prior GPU work).

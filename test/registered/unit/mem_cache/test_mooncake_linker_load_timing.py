@@ -347,6 +347,21 @@ class TestAsyncAdmissionPrepins(CustomTestCase):
         self.assertTrue(queued.cancelled())
         gate.set()
 
+    def test_prepins_start_on_the_configured_number_of_threads(self):
+        # Rhea pm-lk3: one pre-pin thread at 44-61 ms p50 per session start left
+        # most hits unready when admission reached them.
+        linker = self._linker_with({})
+        linker.prepin_pool = None
+        linker.storage.store.batch_get_session_start.side_effect = lambda keys: [0] * len(keys)
+        with (
+            envs.SGLANG_LINKER_PREPIN_THREADS.override(4),
+            patch.object(linker, "_prepin_tag", return_value=("tag", "r")),
+            patch.object(linker, "_pin_keys", return_value=(1, ["k"], [], [(False, 0, 1)])),
+        ):
+            linker.start_prepin("r", [])
+        self.assertEqual(linker.prepin_pool._max_workers, 4)
+        self.assertEqual(linker.prepins["r"][1].result(timeout=5)[0], 1)
+
     def test_a_drop_ends_the_sessions_only_after_a_queued_renewal(self):
         linker = self._linker_with({"r": (2, 5.0)})
         store = linker.storage.store

@@ -1030,7 +1030,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             else:
                 self._drop_prepin(rid)
         if self.prepin_pool is None:
-            self.prepin_pool = ThreadPoolExecutor(1, thread_name_prefix="mooncake-prepin")
+            self.prepin_pool = ThreadPoolExecutor(
+                max(1, envs.SGLANG_LINKER_PREPIN_THREADS.get()),
+                thread_name_prefix="mooncake-prepin",
+            )
         if urgent and self.urgent_pool is None:
             self.urgent_pool = ThreadPoolExecutor(1, thread_name_prefix="mooncake-prepin-urgent")
         num_pages, own, others, spans = self._pin_keys(transfers)
@@ -1038,6 +1041,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self._start_sessions, own + others, spans, num_pages
         )
         self.prepins[rid] = (tag, future, num_pages, own, others, time.monotonic(), spans)
+
+    def peek_prepin(self, rid: str, transfers: list[PoolTransfer]) -> int | None:
+        """The pages a finished pre-pin of this same hit holds, without taking
+        it; None if there is none or it is still running."""
+        entry = self.prepins.get(rid)
+        if entry is None or entry[0] != self._prepin_tag(transfers) or not entry[1].done():
+            return None
+        return entry[1].result()[0]
 
     def take_prepin(self, rid: str, transfers: list[PoolTransfer]) -> int | None:
         """The pages a finished pre-pin of this same hit holds, now owned like

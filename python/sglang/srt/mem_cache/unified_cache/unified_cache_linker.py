@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import math
+from dataclasses import dataclass
 import random
 import time
 from abc import ABC, abstractmethod
@@ -255,6 +256,10 @@ class UnifiedCacheLinker(ABC):
         """PP0: begin pin_hit for a waiting request off the scheduler thread;
         ``urgent``: a hit skipped too often, pinned ahead of the window."""
 
+    def peek_prepin(self, rid: str, transfers: list[PoolTransfer]) -> Optional[int]:
+        """PP0: take_prepin's result without taking the pin."""
+        return None
+
     def take_prepin(self, rid: str, transfers: list[PoolTransfer]) -> Optional[int]:
         """PP0: the result of a finished start_prepin of this hit, else None."""
         return None
@@ -274,6 +279,16 @@ class UnifiedCacheLinker(ABC):
     @abstractmethod
     def close(self) -> None:
         """Quiesce all transfers and release backend resources."""
+
+
+@dataclass
+class LinkerAdmissionVerdicts:
+    """SGLANG_LINKER_ASYNC_BATCHED_RELAY: PP0's admission verdicts for the next
+    pass, rid -> (hit pages, pages its pre-pin holds). Rides the request relay
+    PP0 already forwards to every stage each round, so every stage applies the
+    same map before its pass; a hit not in it is skipped everywhere."""
+
+    ready: dict
 
 
 class ExternalCacheHitMarker(NamedTuple):
@@ -390,6 +405,14 @@ class UnifiedCacheLinkerWrapper:
         )
         self.skip_counts: dict[str, int] = {}
         self.async_counts = {"skipped": 0, "urgent": 0}
+        # Batched relay: the verdict map every stage applies this pass, and the
+        # one PP0 sends with the next round's requests.
+        self.batched_relay = bool(
+            self.async_admission and envs.SGLANG_LINKER_ASYNC_BATCHED_RELAY.get()
+        )
+        self.verdicts: dict = {}
+        self.next_verdicts: Optional[dict] = None
+        self.window_min = max(1, envs.SGLANG_LINKER_PREPIN_WINDOW_MIN.get())
         # Hits admitted in the current pass, and their moving average per pass.
         self.pass_hits = 0
         self.hits_per_pass = 0.0
@@ -550,6 +573,8 @@ class UnifiedCacheLinkerWrapper:
         transfers = self._lookup_transfers(hit.tail_hashes)
         if not (self.cache_linker.pins_hits and transfers):
             return self._pp_relookup_hit_pages(req, hit, forced)
+        if self.batched_relay:
+            return self._pp_verdict_hit_pages(req, hit, transfers, admitted)
         # Only PP0 pins: the relay below carries PP0's value, not a reduction.
         pinned = admitted
         if self.pp_rank == 0:
@@ -605,6 +630,63 @@ class UnifiedCacheLinkerWrapper:
         self._maybe_log_pp_counts()
         return int(keep[0])
 
+    def _pp_verdict_hit_pages(self, req: Req, hit, transfers, admitted: int) -> int:
+        """Batched relay: admit or skip from the verdict map PP0 relayed with
+        this round's requests; no PP relay per hit. Only a hole (a pre-pin
+        that found an object gone) still relays PP0's re-lookup."""
+        verdict = self.verdicts.pop(req.rid, None)
+        if verdict is None or verdict[0] != admitted:
+            if self.pp_rank == 0:
+                urgent = self.skip_counts.get(req.rid, 0) + 1 >= self._SKIP_LIMIT
+                self.async_counts["urgent"] += urgent
+                self.cache_linker.start_prepin(req.rid, transfers, urgent=urgent)
+            self.skip_counts[req.rid] = self.skip_counts.get(req.rid, 0) + 1
+            self.async_counts["skipped"] += 1
+            self._maybe_log_pp_counts()
+            return self._SKIPPED
+        self.skip_counts.pop(req.rid, None)
+        self.pass_hits += 1
+        keep = min(verdict[1], admitted)
+        if self.pp_rank == 0:
+            taken = self.cache_linker.take_prepin(req.rid, transfers)
+            self.prepin_counts["ready" if taken is not None else "missed"] += 1
+            if taken is None:
+                # The verdict stands on every stage; the loads start their own
+                # sessions. Counted, not expected.
+                self.async_counts["verdict_unpinned"] = (
+                    self.async_counts.get("verdict_unpinned", 0) + 1
+                )
+        if keep < admitted:
+            self.cache_linker.unpin(req.rid)
+            self.pp_load_holes += 1
+            best = torch.tensor([admitted], dtype=torch.int64)
+            if self.pp_rank == 0:
+                pages = self.cache_linker.lookup_stages(req.rid, transfers)
+                best[0] = max((p for p in pages if p <= keep), default=0)
+            self.cache._all_reduce(best, torch.distributed.ReduceOp.MIN)
+            logger.info(
+                "Linker PP admission found a hole: rid=%s, objects up to page %d of "
+                "%d; loading %d",
+                req.rid,
+                keep,
+                admitted,
+                int(best[0]),
+            )
+            keep = int(best[0])
+        self._maybe_log_pp_counts()
+        return keep
+
+    def take_verdicts(self) -> Optional[LinkerAdmissionVerdicts]:
+        """PP0, as the next round's requests are relayed: this pass's verdicts."""
+        if not self.batched_relay:
+            return None
+        ready, self.next_verdicts = self.next_verdicts or {}, None
+        return LinkerAdmissionVerdicts(ready=ready)
+
+    def apply_verdicts(self, verdicts: LinkerAdmissionVerdicts) -> None:
+        """Every stage, PP0 too, before its next pass."""
+        self.verdicts = dict(verdicts.ready)
+
     def prepin(self, waiting: Sequence[Req]) -> None:
         """PP0, after a scheduling pass: start the all-stage pins of the next
         ``prepin_depth`` waiting requests with a hit (in admission order), so
@@ -634,7 +716,10 @@ class UnifiedCacheLinkerWrapper:
         prepin_depth. Pins outside it end; those inside are renewed."""
         self.hits_per_pass = 0.8 * self.hits_per_pass + 0.2 * self.pass_hits
         self.pass_hits = 0
-        depth = min(self.prepin_depth, max(2, math.ceil(2 * self.hits_per_pass) + 1))
+        depth = min(
+            self.prepin_depth,
+            max(self.window_min, math.ceil(2 * self.hits_per_pass) + 1),
+        )
         # Hits skipped _SKIP_LIMIT passes in a row hold their pins outside the
         # window's count, so a deep queue cannot push them out.
         urgent = [
@@ -654,6 +739,18 @@ class UnifiedCacheLinkerWrapper:
                 window.append(req.rid)
                 taken += 1
         self.cache_linker.keep_prepins(window, urgent)
+        if self.batched_relay:
+            # Hits whose pre-pin has landed are admitted next pass on every stage.
+            ready = {}
+            for req in waiting:
+                hit = self.hit_markers.get(req.rid)
+                if hit is None or req.rid not in window:
+                    continue
+                transfers = self._lookup_transfers(hit.tail_hashes)
+                pages = self.cache_linker.peek_prepin(req.rid, transfers) if transfers else None
+                if pages is not None:
+                    ready[req.rid] = (len(hit.tail_hashes), pages)
+            self.next_verdicts = ready
 
     def _pp_relookup_hit_pages(
         self, req: Req, hit: ExternalCacheHitMarker, forced: bool

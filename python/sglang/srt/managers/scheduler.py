@@ -382,6 +382,7 @@ from sglang.srt.utils.weight_versions import (
     compute_weight_version_spans,
     record_weight_version_events,
 )
+from sglang.srt.mem_cache.unified_cache.unified_cache_linker import LinkerAdmissionVerdicts
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 if is_mps():
@@ -2376,10 +2377,19 @@ class Scheduler(
             and get_parallel().attn_cp_rank == 0
         ):
             local_reqs = self._poll_timeout_aborts()
+        if self.enable_unified_cache_external_linker and get_parallel().pp_rank == 0:
+            verdicts = self.tree_cache.linker_take_verdicts()
+            if verdicts is not None:
+                local_reqs = [*local_reqs, verdicts]
         recv_start_ns = time.monotonic_ns()
-        self._deferred_input_requests.extend(
-            self.request_receiver.recv_requests(local_reqs=local_reqs)
-        )
+        received = self.request_receiver.recv_requests(local_reqs=local_reqs)
+        # Linker admission verdicts apply on every stage before this round's
+        # pass and ride on to the next stage with the requests.
+        verdicts = [r for r in received if isinstance(r, LinkerAdmissionVerdicts)]
+        if verdicts:
+            received = [r for r in received if not isinstance(r, LinkerAdmissionVerdicts)]
+            self.tree_cache.linker_apply_verdicts(verdicts[-1])
+        self._deferred_input_requests.extend(received)
 
         num_requests_to_process = len(self._deferred_input_requests)
         if stop_at_pause:
@@ -2394,7 +2404,7 @@ class Scheduler(
             # Count successful receive/broadcast time as active; empty polls stay idle.
             self.metrics_reporter.record_scheduler_active(recv_start_ns)
         self.process_input_requests(recv_reqs)
-        return recv_reqs
+        return [*recv_reqs, *verdicts]
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_REQUESTS)
     def process_input_requests(self, recv_reqs: List):

@@ -123,6 +123,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
 
     launch_batch_sample_if_needed = Scheduler.launch_batch_sample_if_needed
     _copy_result_to_cpu = Scheduler._copy_result_to_cpu
+    enable_unified_cache_external_linker = False
     pause_generation = Scheduler.pause_generation
     continue_generation = Scheduler.continue_generation
 
