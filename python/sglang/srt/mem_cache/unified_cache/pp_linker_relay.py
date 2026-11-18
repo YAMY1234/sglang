@@ -62,6 +62,12 @@ class PPLinkerRelay:
         # PPConsensusStore, attached when the PP event loop starts.
         self.store = None
         self.polling = False
+        # SGLANG_LINKER_PP_COUNTS_CONSENSUS (GLM's offload commit): this stage's
+        # finished offloads not yet committed, their absolute index head, and on
+        # PP0 the head of what it has already issued.
+        self.offload_head, self.offload_results = 0, []
+        self.offload_issued_head = 0
+        self._offload_posted = -1
 
     def attach_store(self, store):
         self.store = store
@@ -127,9 +133,59 @@ class PPLinkerRelay:
 
     def _issue(self, handle, entry, op, value):
         self.issued += 1
-        if op != "stop":
+        if entry is not None and op != "stop":
             entry.pending = True
-        self.outbox.append((self.epoch, self.issued, handle, entry.cycle, op, value))
+        cycle = entry.cycle if entry is not None else 0
+        self.outbox.append((self.epoch, self.issued, handle, cycle, op, value))
+
+    # ---- offload commits (GLM's report/poll 'offload', votes on the store) ----
+
+    def _offload_key(self, index):
+        return f"lko{self.epoch}:{index}"
+
+    def offload_report(self):
+        """Every stage, each step: harvest this stage's finished offloads (no
+        waiting) and post the absolute count harvested; a failed one is posted
+        before the count, on the same ordered channel."""
+        w = self.w
+        n = w.num_completed_offloads()
+        if n:
+            base = self.offload_head + len(self.offload_results)
+            results = w.take_completed_offloads(n)
+            for i, ok in enumerate(results):
+                if not ok:
+                    self.store[self._offload_key(base + i)] = 0
+            self.offload_results.extend(results)
+        done = self.offload_head + len(self.offload_results)
+        if done != self._offload_posted:
+            self.store[f"lkoc{self.epoch}"] = done
+            self._offload_posted = done
+
+    def offload_decide(self):
+        """PP0: commit what every stage has finished, the AND of their outcomes."""
+        counts = self.store.collect(f"lkoc{self.epoch}")
+        count = min((c or 0) for c in counts) - self.offload_issued_head
+        if count <= 0:
+            return
+        head = self.offload_issued_head
+        successes = [
+            all(v is None for v in self.store.collect(self._offload_key(head + i)))
+            for i in range(count)
+        ]
+        self._issue(None, None, "offload", (head, successes))
+        self.offload_issued_head += count
+
+    def _apply_offload(self, value):
+        head, successes = value
+        assert head == self.offload_head, "PP linker offload commit order"
+        n = len(successes)
+        assert n <= len(self.offload_results), "PP linker offload committed before it finished here"
+        self.w.commit_completed_offloads(successes)
+        for i in range(n):
+            if not self.offload_results[i]:
+                self.store.pop(self._offload_key(head + i))
+        del self.offload_results[:n]
+        self.offload_head += n
 
     def receive(self, actions):
         """Every stage, as the relay delivers PP0's actions (in order)."""
@@ -141,6 +197,12 @@ class PPLinkerRelay:
             epoch, serial, handle, cycle, op, value = self.inbox[0]
             if epoch < self.epoch:
                 self.inbox.pop(0)
+                continue
+            if op == "offload":
+                self.inbox.pop(0)
+                assert epoch == self.epoch and serial == self.serial + 1, "PP linker action order"
+                self.serial = serial
+                self._apply_offload(value)
                 continue
             entry = self.entries.get(handle)
             if entry is None or entry.cycle != cycle:
@@ -270,6 +332,9 @@ class PPLinkerRelay:
                     self.store.pop(self._key(entry))
         self.epoch += 1
         self.serial = self.issued = 0
+        self.offload_head, self.offload_results = 0, []
+        self.offload_issued_head = 0
+        self._offload_posted = -1
         self.entries.clear()
         self.inbox.clear()
         self.outbox.clear()

@@ -217,6 +217,7 @@ class UnifiedRadixCache(BasePrefixCache):
     _mamba_path_cap_counts_host = False
     mamba_retention_counts: Optional[dict[str, int]] = None
     pp_counts_piggyback: bool = False
+    pp_counts_consensus: bool = False
 
     def __init__(
         self,
@@ -4298,6 +4299,12 @@ class UnifiedRadixCache(BasePrefixCache):
         or their trees (and admissions) diverge. PP0 decides the count and the
         verdicts and _pp_sync carries them down; a later stage first waits for
         its own puts of those nodes, issued at the same logical step."""
+        if self.pp_counts_consensus:
+            relay = self.linker.pp_relay
+            relay.offload_report()
+            if self.pp_rank == 0:
+                relay.offload_decide()
+            return
         if self.pp_counts_piggyback:
             self._piggyback_linker_offloads()
             return

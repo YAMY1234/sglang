@@ -285,11 +285,29 @@ class SchedulerPPMixin:
             )
         early_send = self._pp_pd_early_send_enabled()
         linker_counts_piggyback = (
-            envs.SGLANG_LINKER_PP_COUNTS_PIGGYBACK.get()
+            (
+                envs.SGLANG_LINKER_PP_COUNTS_PIGGYBACK.get()
+                or envs.SGLANG_LINKER_PP_COUNTS_CONSENSUS.get()
+            )
             and get_parallel().pp_size > 1
             and not get_parallel().attn_dp_enabled
             and getattr(self.tree_cache, "linker", None) is not None
         )
+        linker = getattr(self.tree_cache, "linker", None)
+        if (
+            linker_counts_piggyback
+            and envs.SGLANG_LINKER_PP_COUNTS_CONSENSUS.get()
+            and getattr(linker, "pp_relay", None) is not None
+            and linker.pp_relay.store is not None
+        ):
+            # GLM's offload commit: votes on the consensus store, commits as
+            # ordered relay actions; the per-step counts row is not used.
+            self.tree_cache.pp_counts_consensus = True
+            linker_counts_piggyback = False
+            logger.info(
+                "PP PD prefill: linker offload commits by store consensus "
+                "(SGLANG_LINKER_PP_COUNTS_CONSENSUS)."
+            )
         if linker_counts_piggyback:
             self.tree_cache.pp_counts_piggyback = True
             logger.info(

@@ -1018,6 +1018,10 @@ class Envs:
     # request relay (as SGLANG_PP_HICACHE_COUNTS_PIGGYBACK does for HiCache) instead
     # of a per-step PP-chain all-reduce.
     SGLANG_LINKER_PP_COUNTS_PIGGYBACK = EnvBool(False)
+    # Prefetch mode under PP (GLM's offload commit): each stage posts the offloads
+    # it finished to the PP consensus store and PP0 commits the minimum, the AND of
+    # their outcomes, as an ordered relay action; no stage waits for its puts.
+    SGLANG_LINKER_PP_COUNTS_CONSENSUS = EnvBool(False)
     # Prefetch mode (GLM names): a published read keeps its prefix locked until
     # its request is admitted, the held prefixes under this share of the Full
     # device pool (0 releases at publish; PP requires > 0).
