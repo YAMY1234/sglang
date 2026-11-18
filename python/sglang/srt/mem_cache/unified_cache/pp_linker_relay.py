@@ -68,6 +68,7 @@ class PPLinkerRelay:
         self.offload_head, self.offload_results = 0, []
         self.offload_issued_head = 0
         self._offload_posted = -1
+        self._ack_posted = None
 
     def attach_store(self, store):
         self.store = store
@@ -160,14 +161,28 @@ class PPLinkerRelay:
         if done != self._offload_posted:
             self.store[f"lkoc{self.epoch}"] = done
             self._offload_posted = done
+        # GLM's acknowledgement: the epoch and the last action serial applied here.
+        if self._ack_posted != (self.epoch, self.serial):
+            self.store["lkoe"] = self.epoch
+            self.store["lkos"] = self.serial
+            self._ack_posted = (self.epoch, self.serial)
 
     def offload_decide(self):
-        """PP0: commit what every stage has finished, the AND of their outcomes."""
+        """PP0: commit what every stage has finished, the AND of their outcomes,
+        once every stage acknowledged this epoch and every action issued so far
+        (GLM: a vote predating an action cannot authorize another offload unlock)."""
+        if any(e != self.epoch for e in self.store.collect("lkoe")) or any(
+            s != self.serial for s in self.store.collect("lkos")
+        ):
+            return
+        if self.issued != self.serial:
+            return  # PP0's own issued actions not applied here yet.
+        assert self.offload_issued_head == self.offload_head, "PP linker offload head drift"
         counts = self.store.collect(f"lkoc{self.epoch}")
-        count = min((c or 0) for c in counts) - self.offload_issued_head
+        count = min((c or 0) for c in counts) - self.offload_head
         if count <= 0:
             return
-        head = self.offload_issued_head
+        head = self.offload_head
         successes = [
             all(v is None for v in self.store.collect(self._offload_key(head + i)))
             for i in range(count)
@@ -330,8 +345,15 @@ class PPLinkerRelay:
             for entry in self.entries.values():
                 if entry.voted is not None:
                     self.store.pop(self._key(entry))
+        if self.store is not None:
+            # This epoch's offload votes: uncommitted failures and the count.
+            for i, ok in enumerate(self.offload_results):
+                if not ok:
+                    self.store.pop(self._offload_key(self.offload_head + i))
+            self.store.pop(f"lkoc{self.epoch}")
         self.epoch += 1
         self.serial = self.issued = 0
+        self._ack_posted = None
         self.offload_head, self.offload_results = 0, []
         self.offload_issued_head = 0
         self._offload_posted = -1

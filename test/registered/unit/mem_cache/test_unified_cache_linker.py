@@ -2731,6 +2731,36 @@ def test_pp_offload_consensus_commit_order_follows_the_absolute_head():
         assert relay.offload_head == 2 and relay.offload_results == []
 
 
+def test_pp_offload_consensus_flush_drops_stale_votes():
+    # A flush (relay reset) between the stages' reports and PP0's decision:
+    # nothing from the old epoch is committed, and its store votes are cleared.
+    stages, maps = _consensus_stages(2, [[False], [True]])
+    for cache, *_ in stages:
+        cache.linker.pp_relay.offload_report()
+    assert maps[0] == {"lko0:0": 0, "lkoc0": 1, "lkoe": 0, "lkos": 0}
+    for _, relay, _, _ in stages:
+        relay.reset()
+    assert not any(k.startswith(("lko0:", "lkoc0")) for m in maps for k in m)
+    _consensus_step(stages)
+    assert all(log["committed"] == [] for _, _, log, _ in stages)
+    assert stages[0][1].take_actions() is None
+
+
+def test_pp_offload_consensus_waits_for_every_stage_to_ack():
+    # GLM's acknowledgement: PP0 decides no offload while a stage has not
+    # applied every action issued so far.
+    stages, _ = _consensus_stages(2, [[True, True], [True]])
+    _consensus_step(stages)
+    pp0, later = stages[0][1], stages[1][1]
+    assert later.serial == 1
+    stages[1][3].append(True)
+    later.serial = 0  # pretend stage 1 has not applied action 1 yet
+    later._ack_posted = None
+    stages[1][0]._check_linker_events_pp()
+    stages[0][0]._check_linker_events_pp()
+    assert pp0.take_actions() is None
+
+
 @pytest.mark.parametrize("swa_stored", [True, False], ids=["stored", "unstored"])
 @pytest.mark.parametrize(
     "completion", [True, False, None], ids=["success", "failure", "reset"]
