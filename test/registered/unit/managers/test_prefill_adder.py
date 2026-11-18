@@ -1706,6 +1706,19 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIs(adder.add_one_req(req, False, None), AddReqResult.CONTINUE)
         self.assertIsNone(adder.stop_reason)
 
+    def test_hole_fallback_miss_keeps_admitting_the_requests_behind_it(self):
+        # SGLANG_LINKER_HOLE_FALLBACK: a holed hit loads nothing, (0, node),
+        # so it is re-selected as a miss and the pass goes on.
+        adder = self._create_delayer_adder(available_tokens=100_000, delayer=None)
+        holed = self._create_host_hit_req(host_hit=24, tail=8)
+        behind = self._create_host_hit_req(host_hit=24, tail=8)
+        self.mock_tree_cache.init_load_back.return_value = (0, holed.last_node)
+        self.assertIs(adder.add_one_req(holed, False, None), AddReqResult.CONTINUE)
+        self.assertEqual(holed.prefix_len, 0)
+        self.mock_tree_cache.init_load_back.return_value = (24, behind.last_node)
+        adder.add_one_req(behind, False, None)
+        self.assertEqual(adder.can_run_list, [holed, behind])
+
     def test_stop_stats_count_passes_full_batches_and_reasons(self):
         stats = PrefillStopStats(interval=60.0)
         adder = self.create_adder(self.create_running_batch(), rem_chunk_tokens=0)

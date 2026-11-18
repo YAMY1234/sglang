@@ -2345,6 +2345,43 @@ def test_async_admission_recomputes_a_hit_whose_prepin_never_lands(
             assert relays == []
 
 
+@pytest.mark.parametrize("batched", [True, False])
+@pytest.mark.parametrize("hole_fallback", [True, False])
+def test_hole_fallback_admits_a_holed_hit_as_a_miss_on_every_stage(
+    full_linker_component, batched, hole_fallback
+):
+    # Rhea pm-lk5: a hole returned None, which ended the admission pass for
+    # every request behind it (>= 87 of 268 non-full batches). With
+    # SGLANG_LINKER_HOLE_FALLBACK the holed hit is recomputed on every stage
+    # alike and the hit behind it loads in the same pass.
+    a, b, c, d, e, f = _async_env(batched)
+    with a, b, c, d, e, f, envs.SGLANG_LINKER_HOLE_FALLBACK.override(hole_fallback):
+        backend = _LandingPinLinker(stage_restorable=[1, 3])
+        backend.landed.update(h=2, r=3)  # h's pin found page 2 of 3 gone
+        pp0, later, relays = _stage_pair(full_linker_component, backend, batched)
+        reqs = _hit_pair_reqs(pp0, later, ["h", "r"])
+        h0, h5 = reqs["h"]
+        out = _admission_pass(pp0, later, reqs)
+        if batched:
+            assert out == {"h": (_SKIP, _SKIP), "r": (_SKIP, _SKIP)}
+            backend.landed.update(h=2, r=3)  # peeked, not yet taken
+            out = _admission_pass(pp0, later, reqs)
+        if hole_fallback:
+            assert out["h"] == ((0, "h-node"), (0, "h-node"))
+            assert h0.linker_pp_hit == h5.linker_pp_hit == (0, [])
+            assert pp0.async_counts["hole_fallback"] == 1
+            assert later.async_counts["hole_fallback"] == 1
+            assert pp0.async_counts["hole_fallback_pages"] == 3
+            assert backend.stage_lookups == 2  # the matches: no re-lookup
+        else:
+            assert out["h"] == (None, None)
+            assert pp0.async_counts["hole_fallback"] == 0
+            assert h0.linker_pp_hit == h5.linker_pp_hit == (0, [2])
+            assert backend.stage_lookups == 3
+        assert out["r"][0] == out["r"][1] and out["r"][0][0] > 0
+        assert "h" in backend.unpins and pp0.pp_load_holes == later.pp_load_holes == 1
+
+
 def test_async_admission_recomputes_a_hit_skipped_longer_than_the_time_bound(
     full_linker_component,
 ):

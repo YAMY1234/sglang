@@ -408,8 +408,17 @@ class UnifiedCacheLinkerWrapper:
         )
         self.skip_counts: dict[str, int] = {}
         self.async_counts = dict.fromkeys(
-            ("skipped", "urgent", "fallback", "fallback_pages"), 0
+            (
+                "skipped",
+                "urgent",
+                "fallback",
+                "fallback_pages",
+                "hole_fallback",
+                "hole_fallback_pages",
+            ),
+            0,
         )
+        self.hole_fallback = envs.SGLANG_LINKER_HOLE_FALLBACK.get()
         # PP0: rid -> when its current run of skips began; a run of
         # fallback_passes skips or fallback_s seconds recomputes the hit.
         self.skip_since: dict[str, float] = {}
@@ -624,26 +633,42 @@ class UnifiedCacheLinkerWrapper:
         self.skip_counts.pop(req.rid, None)
         self.skip_since.pop(req.rid, None)
         self.pass_hits += 1
-        if int(keep[0]) < admitted:
+        keep = int(keep[0])
+        if keep < admitted:
             # Every stage drops its pins; the next pass pins the shorter hit.
-            self.cache_linker.unpin(req.rid)
-            self.pp_load_holes += 1
-            best = torch.tensor([admitted], dtype=torch.int64)
-            if self.pp_rank == 0:
-                pages = self.cache_linker.lookup_stages(req.rid, transfers)
-                best[0] = max((p for p in pages if p <= int(keep[0])), default=0)
-            self.cache._all_reduce(best, torch.distributed.ReduceOp.MIN)
+            keep = self._pp_hole(req, transfers, keep, admitted)
+        self._maybe_log_pp_counts()
+        return keep
+
+    def _pp_hole(self, req: Req, transfers, keep: int, admitted: int) -> int:
+        """Every stage: PP0's pin found objects of the hit gone past page
+        ``keep``. Returns the pages still restorable (below ``admitted``)."""
+        self.cache_linker.unpin(req.rid)
+        self.pp_load_holes += 1
+        if self.hole_fallback:
+            # _load_back admits it as a miss; the shorter hit needs no lookup.
             logger.info(
                 "Linker PP admission found a hole: rid=%s, objects up to page %d of "
-                "%d; loading %d",
+                "%d; admitted as a miss",
                 req.rid,
-                int(keep[0]),
+                keep,
                 admitted,
-                int(best[0]),
             )
-            keep = best
-        self._maybe_log_pp_counts()
-        return int(keep[0])
+            return keep
+        best = torch.tensor([admitted], dtype=torch.int64)
+        if self.pp_rank == 0:
+            pages = self.cache_linker.lookup_stages(req.rid, transfers)
+            best[0] = max((p for p in pages if p <= keep), default=0)
+        self.cache._all_reduce(best, torch.distributed.ReduceOp.MIN)
+        logger.info(
+            "Linker PP admission found a hole: rid=%s, objects up to page %d of "
+            "%d; loading %d",
+            req.rid,
+            keep,
+            admitted,
+            int(best[0]),
+        )
+        return int(best[0])
 
     def _pp_verdict_hit_pages(self, req: Req, hit, transfers, admitted: int) -> int:
         """Batched relay: admit or skip from the verdict map PP0 relayed with
@@ -673,22 +698,7 @@ class UnifiedCacheLinkerWrapper:
                     self.async_counts.get("verdict_unpinned", 0) + 1
                 )
         if keep < admitted:
-            self.cache_linker.unpin(req.rid)
-            self.pp_load_holes += 1
-            best = torch.tensor([admitted], dtype=torch.int64)
-            if self.pp_rank == 0:
-                pages = self.cache_linker.lookup_stages(req.rid, transfers)
-                best[0] = max((p for p in pages if p <= keep), default=0)
-            self.cache._all_reduce(best, torch.distributed.ReduceOp.MIN)
-            logger.info(
-                "Linker PP admission found a hole: rid=%s, objects up to page %d of "
-                "%d; loading %d",
-                req.rid,
-                keep,
-                admitted,
-                int(best[0]),
-            )
-            keep = int(best[0])
+            keep = self._pp_hole(req, transfers, keep, admitted)
         self._maybe_log_pp_counts()
         return keep
 
@@ -1026,6 +1036,16 @@ class UnifiedCacheLinkerWrapper:
                 self.pp_counts["recovered_pages"] += keep
                 self.pp_counts["lost_pages"] += len(hit.tail_hashes) - keep
             if keep < len(hit.tail_hashes):
+                if self.hole_fallback:
+                    # keep is reduced over every stage, so all admit it as a
+                    # miss and the pass goes on to the requests behind it.
+                    req.linker_pp_hit = (
+                        anchor,
+                        [stop for stop in stops if stop <= hit.device_hit_len],
+                    )
+                    self.async_counts["hole_fallback"] += 1
+                    self.async_counts["hole_fallback_pages"] += len(hit.tail_hashes)
+                    return 0, req.last_node
                 # Part of the relayed hit was evicted while the request queued:
                 # leave it waiting, and its next match admits what is left; the
                 # missing pages are recomputed, not failed reads.
