@@ -1,12 +1,20 @@
 import time
 import unittest
-from unittest.mock import MagicMock
+from contextlib import ExitStack
+from types import SimpleNamespace
+from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
+import torch
 
-from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
+from sglang.srt.disaggregation import prefill as prefill_mod
+from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.fake.conn import FakeKVManager, FakeKVSender
+from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
+from sglang.srt.mem_cache.common import kv_to_page_indices
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
@@ -108,6 +116,172 @@ class TestFakeKVSender(unittest.TestCase):
         for _ in range(100):
             self.assertEqual(self.sender.poll(), KVPoll.WaitingForInput)
         self.assertIsNone(self.sender.waiting_since)
+
+
+class _RecordingSender:
+    """A real-backend stand-in: records send() and claims host-index support."""
+
+    supports_host_tensor_indices = True
+
+    def __init__(self):
+        self.kv_mgr = SimpleNamespace(
+            kv_shard_size=1, enable_all_cp_ranks_for_transfer=False
+        )
+        self.calls = []
+
+    def get_max_transfer_tokens(self):
+        return None
+
+    def should_send_kv_chunk(self, num_pages, last_chunk):
+        return num_pages > 0 or last_chunk
+
+    def send(self, kv_indices, state_indices=None, num_kv_tokens=None, **kwargs):
+        self.calls.append((kv_indices, state_indices, kwargs))
+
+
+class TestFakeSenderAsyncIndices(unittest.TestCase):
+    """SGLANG_DISAGG_FAKE_SENDER_ASYNC_INDICES: the fake sender takes Mooncake's
+    async_d2h readback (no .cpu()) and still concludes; other senders keep the
+    existing gate."""
+
+    TOTAL, PAGE = 200, 8
+
+    def setUp(self):
+        self.req_to_token = (torch.arange(self.TOTAL, dtype=torch.int32) + 64).reshape(
+            1, -1
+        )
+
+    def _send(self, sender, flag, *, start=0, end=None, last_chunk=True):
+        req = SimpleNamespace(
+            rid="r",
+            kv=SimpleNamespace(req_pool_idx=0),
+            origin_input_ids=[0] * self.TOTAL,
+            extend_end=self.TOTAL if end is None else end,
+            start_send_idx=start,
+            disagg_decode_prefix_len=0,
+            disagg_kv_sender=sender,
+        )
+        scheduler = SimpleNamespace(
+            enable_staging=False,
+            token_to_kv_pool_allocator=SimpleNamespace(
+                page_size=self.PAGE,
+                translate_kv_indices_for_transfer=lambda x: x,
+            ),
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=self.req_to_token,
+                req_index_to_mamba_index_mapping=torch.tensor([17]),
+                translate_mamba_indices=lambda x: x,
+            ),
+            disagg_metadata_buffers=Mock(),
+            disagg_prefill_bootstrap_queue=SimpleNamespace(
+                kv_manager=SimpleNamespace(
+                    kv_args=SimpleNamespace(state_types=[StateType.MAMBA])
+                )
+            ),
+            disagg_prefill_pending_chunk_rids=set(),
+        )
+        real_cpu = torch.Tensor.cpu
+        cpu_calls = []
+
+        def counting_cpu(t, *a, **k):
+            cpu_calls.append(t.shape)
+            return real_cpu(t, *a, **k)
+
+        d2h = Mock(side_effect=prefill_mod.async_d2h)
+        with ExitStack() as stack:
+            stack.enter_context(
+                envs.SGLANG_DISAGG_FAKE_SENDER_ASYNC_INDICES.override(flag)
+            )
+            stack.enter_context(patch.object(torch.Tensor, "cpu", counting_cpu))
+            stack.enter_context(patch.object(prefill_mod, "async_d2h", d2h))
+            stack.enter_context(patch.object(torch.cuda, "Event", Mock()))
+            stack.enter_context(patch.object(torch.cuda, "current_stream", Mock()))
+            SchedulerDisaggregationPrefillMixin._send_kv_chunk(
+                scheduler, req, last_chunk=last_chunk
+            )
+        return req, cpu_calls, d2h
+
+    @staticmethod
+    def _host(pages):
+        # The async path hands over the pinned tensor, as Mooncake receives it.
+        return pages.numpy() if isinstance(pages, torch.Tensor) else pages
+
+    def _expected_pages(self, start, end):
+        return kv_to_page_indices(self.req_to_token[0, start:end], self.PAGE)
+
+    def _fake_sender(self):
+        sender = FakeKVSender(
+            mgr=FakeKVManager(
+                args=KVArgs(),
+                disaggregation_mode=DisaggregationMode.PREFILL,
+                server_args=MagicMock(),
+            ),
+            bootstrap_addr="fake_addr:1234",
+            bootstrap_room=7,
+        )
+        sender.init(-(-self.TOTAL // self.PAGE), 0)
+        sender.send = Mock(wraps=sender.send)
+        return sender
+
+    def test_flag_on_fake_sender_skips_cpu_sync_and_concludes(self):
+        sender = self._fake_sender()
+        _, cpu_calls, d2h = self._send(sender, True)
+        self.assertEqual(cpu_calls, [])
+        # KV pages + mamba state, both through the pinned readback.
+        self.assertEqual(d2h.call_count, 2)
+        sender.send.assert_called_once()
+        args, kwargs = sender.send.call_args
+        self.assertIsNotNone(kwargs["indices_event"])
+        self.assertIsInstance(args[0], torch.Tensor)
+        expected = self._expected_pages(0, self.TOTAL)
+        self.assertEqual(self._host(args[0]).dtype, expected.dtype)
+        self.assertEqual(self._host(args[0]).tobytes(), expected.tobytes())
+        self.assertEqual(int(args[1][0][0]), 17)
+        self.assertEqual(sender.poll(), KVPoll.Success)
+
+    def test_flag_on_fake_sender_chunked_sends_match_sync_pages(self):
+        """Non-last chunk ends page-aligned; the last chunk sends the rest."""
+        sender = self._fake_sender()
+        req, cpu_calls, _ = self._send(sender, True, end=77, last_chunk=False)
+        self.assertEqual(req.start_send_idx, 72)
+        self.assertEqual(sender.poll(), KVPoll.Success)  # fake: any send concludes
+        req2, cpu_calls2, _ = self._send(sender, True, start=72, last_chunk=True)
+        self.assertEqual(cpu_calls + cpu_calls2, [])
+        sent = [self._host(c.args[0]) for c in sender.send.call_args_list]
+        self.assertEqual(sent[0].tobytes(), self._expected_pages(0, 72).tobytes())
+        self.assertEqual(
+            sent[1].tobytes(), self._expected_pages(72, self.TOTAL).tobytes()
+        )
+        self.assertEqual(req2.start_send_idx, self.TOTAL)
+
+    def test_flag_off_fake_sender_unchanged(self):
+        sender = self._fake_sender()
+        _, cpu_calls, d2h = self._send(sender, False)
+        d2h.assert_not_called()
+        self.assertEqual(len(cpu_calls), 2)  # KV pages + mamba state
+        args, kwargs = sender.send.call_args
+        self.assertNotIn("indices_event", kwargs)
+        self.assertEqual(
+            args[0].tobytes(), self._expected_pages(0, self.TOTAL).tobytes()
+        )
+        self.assertEqual(sender.poll(), KVPoll.Success)
+
+    def test_flag_on_non_fake_sender_keeps_backend_gate(self):
+        for backend, expect_async in (("nixl", False), ("mooncake", True)):
+            with self.subTest(backend=backend):
+                sender = _RecordingSender()
+                with get_context().override_server_args(
+                    disaggregation_transfer_backend=backend
+                ):
+                    _, cpu_calls, d2h = self._send(sender, True)
+                (kv_indices, _, kwargs), = sender.calls
+                self.assertEqual("indices_event" in kwargs, expect_async)
+                self.assertEqual(bool(d2h.call_count), expect_async)
+                self.assertEqual(not cpu_calls, expect_async)
+                self.assertEqual(
+                    self._host(kv_indices).tobytes(),
+                    self._expected_pages(0, self.TOTAL).tobytes(),
+                )
 
 
 if __name__ == "__main__":

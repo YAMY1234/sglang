@@ -784,6 +784,9 @@ class Envs:
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)
+    # Rig only: FakeKVSender takes Mooncake's non-blocking index readback, so a
+    # microbenchmark does not pay the .cpu() sync production never pays.
+    SGLANG_DISAGG_FAKE_SENDER_ASYNC_INDICES = EnvBool(False)
     # Prefill KV exhaustion. The two K31 switches are sgl-project/sglang#50040's
     # (default off there): park a chunked continuation whose KV budget is spent
     # (#44823) instead of forcing a full chunk into a full pool, and, under
