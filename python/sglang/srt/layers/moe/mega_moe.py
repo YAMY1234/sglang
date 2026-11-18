@@ -115,6 +115,11 @@ def _log_fp4_acts_build_once(dg) -> None:
     )
 
 
+@functools.lru_cache(maxsize=1)
+def _log_tile_by_ep_average_once() -> None:
+    logger.info("MegaMoE FP4-act tiles sized by the EP-average batch on a light rank")
+
+
 def _mega_moe_dg(mma_type: str):
     """The DeepGEMM build that runs this MegaMoE kind's buffer and kernel."""
     if mma_type == "fp8xfp4" and envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_FP4_ACTS.get():
@@ -141,7 +146,7 @@ def _get_block_m_for_mega_moe(
             buf.group.size(),
             buf.num_experts,
             buf.num_max_tokens_per_rank,
-            num_tokens,
+            _mega_moe_tiling_tokens(buf, num_tokens, global_num_tokens),
             buf.num_topk,
             buf.mma_type,
         )
@@ -154,6 +159,20 @@ def _get_block_m_for_mega_moe(
         mma_type=buf.mma_type,
         global_num_tokens=global_num_tokens,
     )
+
+
+def _mega_moe_tiling_tokens(
+    buf, num_tokens: int, global_num_tokens: Optional[int]
+) -> int:
+    """Tokens per rank the FP4-act build sizes its tiles for: at least the EP average.
+
+    Every rank's experts receive tokens from all EP ranks, so a light or idle rank
+    tiling for its own rows runs the busy ranks' tokens on tiny tiles.
+    """
+    if not envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_TILE_BY_EP_AVERAGE.get() or not global_num_tokens:
+        return num_tokens
+    average = -(-global_num_tokens // buf.group.size())
+    return min(max(num_tokens, average), buf.num_max_tokens_per_rank)
 
 
 def check_mega_moe_shapes(hidden: int, intermediate: int, mma_type: str) -> None:
@@ -689,6 +708,11 @@ def run_mega_routed_experts(
     kernel_dg = _mega_moe_dg(buf.mma_type)
     if global_num_tokens is not None and kernel_dg is deep_gemm:
         mega_kwargs["global_num_tokens"] = global_num_tokens
+    elif kernel_dg is not deep_gemm:
+        tiling_tokens = _mega_moe_tiling_tokens(buf, num_tokens, global_num_tokens)
+        if tiling_tokens != num_tokens:
+            _log_tile_by_ep_average_once()
+            mega_kwargs["num_expected_tokens_per_rank"] = tiling_tokens
     if eplb_load_row is not None:
         mega_kwargs["cumulative_local_expert_recv_stats"] = eplb_load_row
 

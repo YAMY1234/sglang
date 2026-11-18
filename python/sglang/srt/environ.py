@@ -1704,6 +1704,8 @@ class Envs:
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
     SGLANG_OPT_DEEPGEMM_MEGA_GATE = EnvBool(False)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE = EnvBool(False)
+    # FP4-act MegaMoE: size a light or idle DP rank's tiles for the EP-average batch.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_TILE_BY_EP_AVERAGE = EnvBool(False)
 
     # ===================================================================
     # Top-k kernels
