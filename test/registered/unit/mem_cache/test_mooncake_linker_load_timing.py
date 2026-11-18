@@ -287,6 +287,63 @@ class TestAsyncAdmissionPrepins(CustomTestCase):
         self.assertEqual(linker.prepins, {})
 
 
+class TestSessionRefcount(CustomTestCase):
+    """Mooncake ends a key's read session for every holder in the client, so
+    with refcounting a session starts on the first holder and ends with the
+    last (Hecate r5: two loads on shared keys failed with -600)."""
+
+    def _refs(self, codes=None):
+        store = MagicMock()
+        store.batch_get_session_start.side_effect = lambda keys: [
+            (codes or {}).get(key, 0) for key in keys
+        ]
+        return mooncake_direct_linker._SessionRefs(store, counted=True), store
+
+    def test_shared_keys_start_on_the_first_holder_and_end_with_the_last(self):
+        refs, store = self._refs()
+        self.assertEqual(refs.start(["a", "b"]), [0, 0])
+        self.assertEqual(refs.start(["b", "c", "c"]), [0, 0, 0])
+        starts = [c.args[0] for c in store.batch_get_session_start.call_args_list]
+        self.assertEqual(starts, [["a", "b"], ["c"]])
+        refs.end(["a", "b"])
+        store.batch_get_session_end.assert_called_once_with(["a"])
+        refs.end(["b", "c"])
+        refs.end(["c"])
+        ends = [c.args[0] for c in store.batch_get_session_end.call_args_list]
+        self.assertEqual(ends, [["a"], ["b"], ["c"]])
+        self.assertEqual(refs.counts, {})
+
+    def test_a_failed_start_keeps_no_session_and_counts_nothing(self):
+        refs, store = self._refs(codes={"gone": -704})
+        refs.start(["held"])
+        self.assertEqual(refs.start(["held", "new", "gone"]), [0, 0, -704])
+        store.batch_get_session_end.assert_called_once_with(["new"])
+        self.assertEqual(refs.counts, {"held": 1})
+        refs.end(["held", "gone"])  # an end of a key never held is a no-op
+        self.assertEqual(store.batch_get_session_end.call_args.args[0], ["held"])
+
+    def test_a_load_sharing_a_prepinned_prefix_leaves_the_pin_held(self):
+        linker = _linker(log_load_timing=False)
+        linker.count_sessions = True
+        store = linker.storage.store
+        transfer = _transfer(PoolName.KV, 2)
+        linker.sessions.start(["kv-0"])  # another request's pre-pin
+        linker.load_layer_wise(7, [[transfer]], [("b", 0.0)])
+        starts = [c.args[0] for c in store.batch_get_session_start.call_args_list]
+        self.assertEqual(starts, [["kv-0"], ["kv-1"]])
+        store.batch_get_session_end.assert_called_once_with(["kv-1"])
+        linker.layer_done_counter.fail.assert_not_called()
+        linker.sessions.end(["kv-0"])
+        self.assertEqual(store.batch_get_session_end.call_args.args[0], ["kv-0"])
+
+    def test_without_refcounting_every_end_reaches_the_store(self):
+        linker = _linker(log_load_timing=False)
+        linker.sessions.start(["kv-0"])
+        linker.load_layer_wise(7, [[_transfer(PoolName.KV, 2)]], [("b", 0.0)])
+        store = linker.storage.store
+        store.batch_get_session_end.assert_called_once_with(["kv-0", "kv-1"])
+
+
 def _meminfo(node, total_kb, free_kb, file_kb, dirty_kb, reclaimable_kb):
     return "".join(
         f"Node {node} {key}: {value} kB\n"

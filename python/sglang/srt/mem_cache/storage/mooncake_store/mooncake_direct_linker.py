@@ -209,9 +209,65 @@ class _RecentKeys:
         return key in self.keys
 
 
+class _SessionRefs:
+    """This client's read sessions. Mooncake keeps one session per key and
+    client, so any end closes it for every holder: with ``counted`` a key's
+    session starts on its first holder and ends with its last (Hecate r5: two
+    loads ending each other's shared keys failed 16 of 96 with -600). A start
+    is all or nothing: on any failed key it keeps no session."""
+
+    def __init__(self, store, counted: bool):
+        self.store, self.counted = store, counted
+        self.counts: Counter = Counter()
+        self.lock = threading.Lock()
+
+    def start(self, keys: list[str]) -> list[int]:
+        if not keys:
+            return []
+        if not self.counted:
+            result = list(self.store.batch_get_session_start(keys))
+            if any(result):
+                self.store.batch_get_session_end(keys)
+            return result
+        with self.lock:
+            new = [key for key in dict.fromkeys(keys) if not self.counts[key]]
+            codes = dict(zip(new, self.store.batch_get_session_start(new))) if new else {}
+            result = [codes.get(key, 0) for key in keys]
+            if any(result):
+                started = [key for key in new if codes[key] == 0]
+                if started:
+                    self.store.batch_get_session_end(started)
+            else:
+                self.counts.update(keys)
+        return result
+
+    def renew(self, keys: list[str]) -> list[int]:
+        """Start again sessions this client holds (extends their leases)."""
+        return list(self.store.batch_get_session_start(keys)) if keys else []
+
+    def end(self, keys: list[str]) -> None:
+        if not self.counted:
+            self.store.batch_get_session_end(keys)
+            return
+        with self.lock:
+            last = []
+            for key in keys:
+                held = self.counts.get(key, 0)
+                if held > 1:
+                    self.counts[key] = held - 1
+                elif held == 1:
+                    del self.counts[key]
+                    last.append(key)
+            if last:
+                self.store.batch_get_session_end(last)
+
+
 class MooncakeDirectLinker(UnifiedCacheLinker):
     # Set False at init: the first lookup, load or offload logs NUMA headroom.
     _numa_first_request_logged = True
+    # Refcount read sessions per key (async admission or load overlap).
+    count_sessions = False
+    _session_refs: "_SessionRefs | None" = None
     # SGLANG_LINKER_STATE_PATH_CAP at init; 0 leaves the store's states alone.
     state_path_cap = 0
 
@@ -266,6 +322,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.prepins: dict[str, tuple] = {}
         self.prepin_pool: ThreadPoolExecutor | None = None
         self.prepin_renew_s = envs.SGLANG_LINKER_PREPIN_RENEW_SECS.get()
+        # Pre-pins held across loads of shared prefixes: refcount sessions.
+        self.count_sessions = envs.SGLANG_LINKER_ASYNC_ADMISSION.get()
         self.prepin_renewals = 0
         self.stats_logged_at = time.monotonic()
         # Store-side state path cap: each state this rank wrote -> the deepest
@@ -653,17 +711,26 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 spans.append((trailing, first, len(own) + len(others)))
         return len(page_keys), own, others, spans
 
-    def _start_sessions(self, keys, spans, num_pages) -> tuple[int, float]:
+    @property
+    def sessions(self) -> _SessionRefs:
+        if self._session_refs is None:
+            self._session_refs = _SessionRefs(self.storage.store, self.count_sessions)
+        return self._session_refs
+
+    def _start_sessions(
+        self, keys, spans, num_pages, renew: bool = False
+    ) -> tuple[int, float]:
         """Start read sessions on ``keys``: (leading pages every object holds,
-        seconds waited). Short of all pages, no session is kept."""
+        seconds waited). Short of all pages, no session is kept; a renewal
+        (``renew``) that finds a hole gives up the ones it held."""
         began = time.monotonic()
-        result = list(self.storage.store.batch_get_session_start(keys)) if keys else []
+        result = self.sessions.renew(keys) if renew else self.sessions.start(keys)
         waited = time.monotonic() - began
         self.pin_samples.append((len(keys), waited))
         if all(value == 0 for value in result):
             return num_pages, waited
-        # Even a partial start may have installed some sessions.
-        self.storage.store.batch_get_session_end(keys)
+        if renew:
+            self.sessions.end(keys)
         self.pin_holes += 1
         pages = num_pages
         for trailing, first, end in spans:
@@ -753,7 +820,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             if future.result()[0] != num_pages:
                 continue  # a hole: no session is held, its admission shrinks the hit
             renewed = self.prepin_pool.submit(
-                self._start_sessions, own + others, spans, num_pages
+                self._start_sessions, own + others, spans, num_pages, True
             )
             self.prepins[rid] = (tag, renewed, num_pages, own, others, now, spans)
             self.prepin_renewals += 1
@@ -766,7 +833,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
         def end(done):
             if done.result()[0] == num_pages:
-                self.storage.store.batch_get_session_end(own + others)
+                self.sessions.end(own + others)
 
         # A renewal replaced the entry's future, so this ends after it.
         future.add_done_callback(end)
@@ -775,12 +842,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         keys = self.pinned.pop(rid, None) or []
         keys += self.pinned_others.pop(rid, None) or []
         if keys:
-            self.storage.store.batch_get_session_end(keys)
+            self.sessions.end(keys)
 
     def _end_expired_pins(self, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now
         while self.pin_expiry and self.pin_expiry[0][0] <= now:
-            self.storage.store.batch_get_session_end(self.pin_expiry.popleft()[1])
+            self.sessions.end(self.pin_expiry.popleft()[1])
 
     def _lease_keys(self, page_hashes: list[str]) -> list[str]:
         """Every stage's all-pages objects of these pages, and the state at the
@@ -968,7 +1035,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if not retry or any(result[i] not in self._RETRY_CODES for i in retry):
             return result
         expired_keys = [keys[i] for i in retry if result[i] == -707]
-        renewed = list(store.batch_get_session_start(expired_keys)) if expired_keys else []
+        renewed = self.sessions.renew(expired_keys)
         if renewed != [0] * len(expired_keys):
             raise RuntimeError(
                 f"Mooncake get session renewal failed: keys={len(expired_keys)}, "
@@ -1020,6 +1087,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             batches: dict[PoolName, tuple[list[str], list[int]]] = {}
             unpinned: dict[PoolName, list[str]] = {}
             rids = [rid for rid, _ in requests] if requests else []
+            pinned_keys: list[str] = []
             for index, transfers in enumerate(request_transfers):
                 span = []
                 pinned_here = index < len(rids) and rids[index] in pinned
@@ -1030,7 +1098,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     )
                     first = len(keys)
                     keys.extend(self.storage._tag_keys(component_keys))
-                    if not pinned_here:
+                    if pinned_here:
+                        pinned_keys.extend(keys[first:])
+                    else:
                         unpinned.setdefault(transfer.name, []).extend(keys[first:])
                     span.append((transfer.name, first, len(keys)))
                     locations.extend(
@@ -1040,16 +1110,17 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     )
                 spans.append(span)
             loaded = [0] * len(request_transfers)
-            # Ends every session of the batch, the pinned ones too; even a
-            # partial start failure may have installed some.
-            started.extend(keys for keys, _ in batches.values())
+            # Ends every session of the batch, the pinned ones too (a failed
+            # start keeps none).
+            started.append(pinned_keys)
             for keys in unpinned.values():
-                result = self.storage.store.batch_get_session_start(keys)
-                if list(result) != [0] * len(keys):
+                result = self.sessions.start(keys)
+                if result != [0] * len(keys):
                     raise RuntimeError(
                         f"Mooncake get session start failed: keys={len(keys)}, "
-                        f"result_sample={list(result)[:8]}"
+                        f"result_sample={result[:8]}"
                     )
+                started.append(keys)
 
             for layer in range(self.num_layers):
                 for name, (keys, locations) in batches.items():
@@ -1093,8 +1164,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             logger.exception("Mooncake layer-wise load batch failed")
         finally:
             for keys in started:
+                if not keys:
+                    continue
                 try:
-                    self.storage.store.batch_get_session_end(keys)
+                    self.sessions.end(keys)
                 except BaseException as error:
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load session cleanup failed")
