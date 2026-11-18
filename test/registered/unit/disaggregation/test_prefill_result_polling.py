@@ -1308,6 +1308,20 @@ class TestDeferredEarlySettle(CustomTestCase):
         cache._apply_cache_actions([FreeDeviceKV(indices=[dup])])
         self.assertEqual(free.call_count, 2)
 
+    def test_idle_pool_log_reports_held_frees(self):
+        sched = self._scheduler()
+        sched.pool_stats_observer = SimpleNamespace(
+            get_pool_stats=lambda: SimpleNamespace(
+                full_num_used=0, full_available_size=900, full_evictable_size=100,
+                full_capacity=1000, mamba_num_used=0, mamba_available_size=8,
+            )
+        )
+        sched.disagg_prefill_inflight_queue = [SimpleNamespace(disagg_deferred_frees=[1])]
+        with self.assertLogs("sglang.srt.disaggregation.prefill", level="INFO") as logs:
+            SchedulerDisaggregationPrefillMixin._log_pool_at_idle(sched)
+        self.assertIn("full used=0 available=900", logs.output[0])
+        self.assertIn("holding deferred frees=1", logs.output[0])
+
 
 if __name__ == "__main__":
     unittest.main()

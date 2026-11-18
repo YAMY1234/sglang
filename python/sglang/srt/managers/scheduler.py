@@ -5771,6 +5771,12 @@ class Scheduler(
             # tree cache sanity check
             self.invariant_checker._check_tree_cache()
 
+        if (
+            self.disaggregation_mode == DisaggregationMode.PREFILL
+            and envs.SGLANG_PP_PD_DEFER_EARLY_SETTLE.get()
+        ):
+            self._log_pool_at_idle()
+
         # metrics every 30s
         self.metrics_reporter._maybe_log_idle_metrics()
 

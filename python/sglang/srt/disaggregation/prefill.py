@@ -1675,6 +1675,26 @@ class SchedulerDisaggregationPrefillMixin:
             and kv_mgr._staging_outstanding.get(room, 0) <= 0
         )
 
+    def _log_pool_at_idle(self: Scheduler) -> None:
+        """Deferred early-settle leak check: idle pool counts per PP stage, every 30 s."""
+        now = time.monotonic()
+        if now - getattr(self, "_pool_idle_log_t", 0.0) < 30:
+            return
+        self._pool_idle_log_t = now
+        ps = self.pool_stats_observer.get_pool_stats()
+        held = sum(
+            1 for r in self.disagg_prefill_inflight_queue
+            if getattr(r, "disagg_deferred_frees", None)
+        )
+        logger.info(
+            "PD prefill idle pool: full used=%d available=%d evictable=%d capacity=%s, "
+            "mamba used=%s available=%s, inflight=%d, holding deferred frees=%d, deferred settles=%d",
+            ps.full_num_used, ps.full_available_size, ps.full_evictable_size,
+            ps.full_capacity, ps.mamba_num_used, ps.mamba_available_size,
+            len(self.disagg_prefill_inflight_queue), held,
+            self.disagg_prefill_early_send_stats.get("deferred", 0),
+        )
+
     def _apply_deferred_frees(self: Scheduler, req: Req) -> None:
         frees = getattr(req, "disagg_deferred_frees", None)
         if frees:
