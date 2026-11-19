@@ -100,6 +100,10 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         assert len(indices) == req.prefix_len, (req.rid, len(indices), req.prefix_len)
         return indices
 
+    def match_state_key(self) -> None:
+        # LMCache hits change with the external store, outside the tree.
+        return None
+
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Report LMCache hits through host fields until GPU slots are ready."""
         requested_key_len = len(params.key)

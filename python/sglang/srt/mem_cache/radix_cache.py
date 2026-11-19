@@ -279,6 +279,9 @@ class TreeNode:
 
 
 class RadixCache(BasePrefixCache):
+    # Bumped by every call that can change a match or the recency it refreshes.
+    match_epoch = 0
+
     def __init__(self, params: CacheInitParams):
         self.disable = params.disable
         self.req_to_token_pool = params.req_to_token_pool
@@ -341,6 +344,7 @@ class RadixCache(BasePrefixCache):
     ##### Public API #####
 
     def reset(self):
+        self.match_epoch += 1
         # Initialize root with minimum priority so any real priority overrides it
         self.root_node = TreeNode(priority=-sys.maxsize)
         self.root_node.key = RadixKey(token_ids=array("q"), extra_key=None)
@@ -397,6 +401,7 @@ class RadixCache(BasePrefixCache):
                 to expose a precise boundary; this structural refinement improves
                 subsequent match efficiency and does not duplicate data.
         """
+        self.match_epoch += 1
         key = params.key
         key, _ = key.maybe_to_bigram_view(self.is_eagle)
 
@@ -417,6 +422,7 @@ class RadixCache(BasePrefixCache):
         )
 
     def touch_prefix(self, key: RadixKey) -> None:
+        self.match_epoch += 1
         key, _ = key.maybe_to_bigram_view(self.is_eagle)
         if self.disable or len(key) == 0:
             return
@@ -426,6 +432,7 @@ class RadixCache(BasePrefixCache):
         self._match_prefix_helper(self.root_node, key)
 
     def insert(self, params: InsertParams) -> InsertResult:
+        self.match_epoch += 1
         if self.disable:
             return InsertResult(prefix_len=0)
 
@@ -550,6 +557,7 @@ class RadixCache(BasePrefixCache):
         return self._total_size_helper()
 
     def evict(self, params: EvictParams) -> EvictResult:
+        self.match_epoch += 1
         if self.disable:
             return EvictResult()
 
@@ -617,6 +625,9 @@ class RadixCache(BasePrefixCache):
 
     def supports_prefix_sharing(self) -> bool:
         return not self.disable
+
+    def match_state_key(self) -> Optional[tuple]:
+        return (self.match_epoch, self.evictable_size_, self.protected_size_)
 
     def evictable_size(self):
         return self.evictable_size_

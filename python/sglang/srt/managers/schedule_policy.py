@@ -95,6 +95,9 @@ CLIP_MAX_NEW_TOKENS = int(
     os.environ.get("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", "4096")
 )
 
+# Under SGLANG_SPF_FAST_MATCH, re-match an unchanged waiting queue at least this often.
+MAX_SKIPPED_MATCH_PASSES = 16
+
 
 @lru_cache(maxsize=1)
 def _use_exact_chunk_fill() -> bool:
@@ -211,6 +214,13 @@ class SchedulePolicy:
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
         self._shortest_prefill_calls = 0
         self._waiting_prefix_refresh_calls = 0
+        self.fast_match = envs.SGLANG_SPF_FAST_MATCH.get()
+        # The queue and cache state the last cache-aware sort saw (fast match only).
+        self._matched_policy: Optional[CacheAwarePolicy] = None
+        self._matched_queue: List[Req] = []
+        self._matched_state = None
+        self._skipped_in_row = 0
+        self.skipped_match_passes = 0
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
@@ -239,6 +249,11 @@ class SchedulePolicy:
                 SchedulePolicy._sort_by_priority_and_fcfs(
                     waiting_queue, self.priority_sign
                 )
+        elif isinstance(policy, CacheAwarePolicy) and self._matched_queue_unchanged(
+            waiting_queue, policy
+        ):
+            # Matching and sorting again would give the same matches and order.
+            self.skipped_match_passes += 1
         elif isinstance(policy, CacheAwarePolicy):
             temporary_deprioritized = self._compute_prefix_matches(
                 waiting_queue, policy
@@ -260,12 +275,16 @@ class SchedulePolicy:
                 self._shortest_prefill_calls += 1
                 if waiting_queue and self._shortest_prefill_calls % 128 == 1:
                     logger.info(
-                        "Experimental shortest-prefill-first: queue=%d shortest_uncached=%d",
+                        "Experimental shortest-prefill-first: queue=%d shortest_uncached=%d "
+                        "matched_passes=%d skipped_passes=%d",
                         len(waiting_queue),
                         self._shortest_prefill_work(waiting_queue[0]),
+                        self._shortest_prefill_calls,
+                        self.skipped_match_passes,
                     )
             else:
                 raise ValueError(f"Unknown CacheAware Policy: {policy=}")
+            self._remember_matched_queue(waiting_queue, policy)
         else:
             if policy == CacheAgnosticPolicy.FCFS:
                 pass
@@ -316,6 +335,37 @@ class SchedulePolicy:
         for r in reversed(waiting_queue[:WAITING_QUEUE_PREFIX_MATCH_MAX]):
             touch_waiting_prefix(r, self.tree_cache)
 
+    def _remember_matched_queue(
+        self, waiting_queue: List[Req], policy: CacheAwarePolicy
+    ) -> None:
+        if not self.fast_match or policy not in (
+            CacheAwarePolicy.LPM,
+            CacheAwarePolicy.SHORTEST_PREFILL_FIRST,
+        ):
+            return
+        # Taken after this pass's matches, which bump the cache's match epoch.
+        self._matched_policy = policy
+        self._matched_queue = list(waiting_queue)
+        self._matched_state = self.tree_cache.match_state_key()
+        self._skipped_in_row = 0
+
+    def _matched_queue_unchanged(
+        self, waiting_queue: List[Req], policy: CacheAwarePolicy
+    ) -> bool:
+        # These sorts depend only on the queue and on cached prefixes, so with
+        # neither changed, the last pass's matches and order still hold.
+        if (
+            self._matched_state is None
+            or policy != self._matched_policy
+            or self._skipped_in_row >= MAX_SKIPPED_MATCH_PASSES
+            or len(waiting_queue) != len(self._matched_queue)
+            or any(a is not b for a, b in zip(waiting_queue, self._matched_queue))
+            or self.tree_cache.match_state_key() != self._matched_state
+        ):
+            return False
+        self._skipped_in_row += 1
+        return True
+
     def _determine_active_policy(self, waiting_queue: List[Req]) -> Policy:
         if (
             self.policy
@@ -364,12 +414,11 @@ class SchedulePolicy:
         temporary_deprioritized: Set[int] = set()
         self.waiting_queue_radix_tree.reset()
 
-        no_copy = envs.SGLANG_SPF_FAST_MATCH.get()
         for r in waiting_queue:
             # Matching only reads the ids: skip the per-pass copy of the whole prompt.
             prefix_ids = (
                 r.origin_input_ids
-                if no_copy and not r.output_ids
+                if self.fast_match and not r.output_ids
                 else r.origin_input_ids + r.output_ids
             )
             extra_key = r.extra_key

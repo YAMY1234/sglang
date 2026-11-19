@@ -8,6 +8,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    Hashable,
     NamedTuple,
     Optional,
     Protocol,
@@ -457,6 +458,12 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def peek_prefix_len(self, key: RadixKey) -> Optional[int]:
         """Cached tokens for ``key`` without changing cache state (no split,
         LRU or access-time update); None when unsupported."""
+        return None
+
+    def match_state_key(self) -> Optional[Hashable]:
+        """A value that changes whenever matching a fixed key could return a
+        different result, or a match could refresh recency in a different
+        order, than at the last call. None when the cache cannot tell."""
         return None
 
     def touch_prefix(self, key: RadixKey) -> None:

@@ -153,6 +153,10 @@ class FlexKVRadixCache(RadixCache):
     # match_prefix
     # ------------------------------------------------------------------
 
+    def match_state_key(self) -> None:
+        # Host hits change as FlexKV stores complete, outside the tree.
+        return None
+
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:  # type: ignore[override]
         """Look up the longest cached prefix on host KV (FlexKV).
 

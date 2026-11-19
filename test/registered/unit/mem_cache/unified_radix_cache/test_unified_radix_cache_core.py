@@ -496,6 +496,28 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         self.assertGreaterEqual(result.num_tokens_evicted, len(seq_a))
         cache.sanity_check()
 
+    def test_match_state_key_moves_with_matchable_state(self):
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        seq_a = self._make_seq(1, 2)
+        seq_b = self._make_seq(500, 2)
+        keys = [cache.match_state_key()]
+        self._insert(cache, allocator, req_to_token_pool, seq_a)
+        keys.append(cache.match_state_key())
+        self._insert(cache, allocator, req_to_token_pool, seq_b)
+        keys.append(cache.match_state_key())
+        m = match_prefix(cache, seq_a)
+        keys.append(cache.match_state_key())
+        lock_result = cache.inc_lock_ref(m.last_device_node)
+        keys.append(cache.match_state_key())
+        # Eviction does not bump the epoch: the sizes it changes must move the key.
+        result = cache.evict(EvictParams(num_tokens=len(seq_b)))
+        self.assertGreaterEqual(result.num_tokens_evicted, len(seq_b))
+        keys.append(cache.match_state_key())
+        cache.dec_lock_ref(m.last_device_node, lock_result.to_dec_params())
+        keys.append(cache.match_state_key())
+        self.assertEqual(len(set(keys)), len(keys))
+        self.assertEqual(cache.match_state_key(), keys[-1])
+
     def test_prev_prefix_len(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         initial_avail = allocator.available_size()

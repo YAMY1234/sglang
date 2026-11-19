@@ -160,13 +160,14 @@ class TestShortestPrefillFirst(CustomTestCase):
         from sglang.srt.mem_cache.radix_cache import RadixKey
 
         def run(fast):
-            policy = SchedulePolicy(
-                policy="shortest-prefill-first",
-                tree_cache=RadixCache.create_simulated(),
-                enable_hierarchical_cache=True,
-                enable_priority_scheduling=False,
-                schedule_low_priority_values_first=False,
-            )
+            with patch.object(envs.SGLANG_SPF_FAST_MATCH, "get", return_value=fast):
+                policy = SchedulePolicy(
+                    policy="shortest-prefill-first",
+                    tree_cache=RadixCache.create_simulated(),
+                    enable_hierarchical_cache=True,
+                    enable_priority_scheduling=False,
+                    schedule_low_priority_values_first=False,
+                )
             shared = list(range(4096))
             policy.tree_cache.insert(InsertParams(key=RadixKey(token_ids=array("q", shared[:2048])), value=torch.arange(2048)))
             queue = [
@@ -177,12 +178,105 @@ class TestShortestPrefillFirst(CustomTestCase):
             for req in queue:
                 req.time_stats.wait_queue_entry_time = 0
             prompts = [list(req.origin_input_ids) for req in queue]
-            with patch.object(envs.SGLANG_SPF_FAST_MATCH, "get", return_value=fast):
-                policy.calc_priority(queue)
+            policy.calc_priority(queue)
             self.assertEqual([list(req.origin_input_ids) for req in sorted(queue, key=lambda r: r.rid)], prompts)
             return [(req.rid, req.prefix_len, req.num_matched_prefix_tokens) for req in queue]
 
         self.assertEqual(run(True), run(False))
+
+    def test_fast_match_skips_only_passes_that_cannot_change(self):
+        import random
+
+        import torch
+
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache.base_prefix_cache import EvictParams, InsertParams
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+
+        class Allocator:
+            device = "cpu"
+
+            def free_segment(self, value, start_pos=0):
+                pass
+
+        def make_policy(fast):
+            with patch.object(envs.SGLANG_SPF_FAST_MATCH, "get", return_value=fast):
+                return SchedulePolicy(
+                    policy="shortest-prefill-first",
+                    tree_cache=RadixCache.create_simulated(mock_allocator=Allocator()),
+                    enable_hierarchical_cache=True,
+                    enable_priority_scheduling=False,
+                    schedule_low_priority_values_first=False,
+                )
+
+        # The same random passes drive a full-match reference and a fast-match
+        # policy, each with its own tree and requests.
+        policies = (make_policy(False), make_policy(True))
+        queues = ([], [])
+        locked = []
+        ready = set()
+        admitted = ([], [])
+        rng = random.Random(0)
+        bases = [list(range(i * 10000, i * 10000 + 600)) for i in range(4)]
+
+        def insert(ids):
+            for policy in policies:
+                policy.tree_cache.insert(
+                    InsertParams(
+                        key=RadixKey(token_ids=array("q", ids)),
+                        value=torch.arange(len(ids)),
+                    )
+                )
+
+        for step in range(600):
+            op = rng.random()
+            if op < 0.12:
+                rid = f"r{step}"
+                ids = rng.choice(bases)[: rng.randrange(64, 600)]
+                ids += [100000 + step] * rng.randrange(1, 64)
+                for queue in queues:
+                    req = _make_req(rid, "", ids)
+                    req.time_stats.wait_queue_entry_time = step
+                    queue.append(req)
+            elif op < 0.2:
+                insert(rng.choice(bases)[: rng.randrange(1, 600)])
+            elif op < 0.25:
+                num_tokens = rng.randrange(1, 300)
+                for policy in policies:
+                    policy.tree_cache.evict(EvictParams(num_tokens=num_tokens))
+            elif op < 0.3 and locked:
+                for policy, node in zip(policies, locked.pop(0)):
+                    policy.tree_cache.dec_lock_ref(node)
+            elif op < 0.5:
+                # Admission takes the first ready request, locks its prefix and
+                # caches its prompt; the rest stay queued in sorted order.
+                index = next(
+                    (i for i, r in enumerate(queues[0]) if r.rid in ready), None
+                )
+                if index is not None:
+                    reqs = [queue.pop(index) for queue in queues]
+                    for policy, req, order in zip(policies, reqs, admitted):
+                        order.append(req.rid)
+                        policy.tree_cache.inc_lock_ref(req.last_node)
+                    locked.append(tuple(req.last_node for req in reqs))
+                    insert(list(reqs[0].origin_input_ids))
+            # Store readiness toggles on its own; it never enters the sort.
+            for req in queues[0]:
+                if rng.random() < 0.2:
+                    ready.symmetric_difference_update({req.rid})
+            for policy, queue in zip(policies, queues):
+                policy.calc_priority(queue)
+            expected, actual = (
+                [(r.rid, r.prefix_len, r.num_matched_prefix_tokens) for r in queue]
+                for queue in queues
+            )
+            self.assertEqual(actual, expected, f"step {step}")
+
+        self.assertEqual(admitted[1], admitted[0])
+        self.assertGreater(len(admitted[0]), 50)
+        self.assertEqual(policies[0].skipped_match_passes, 0)
+        self.assertGreater(policies[1].skipped_match_passes, 100)
+        self.assertGreater(policies[1]._shortest_prefill_calls, 100)
 
     def test_equal_work_uses_arrival_time(self):
         older = self.make_req("z", 32, arrived=1)

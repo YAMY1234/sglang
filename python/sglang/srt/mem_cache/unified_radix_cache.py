@@ -216,6 +216,8 @@ class UnifiedRadixCache(BasePrefixCache):
     # SGLANG_MAMBA_PATH_CAP_COUNTS_HOST, set by _init_mamba_path_cap_counts_host.
     _mamba_path_cap_counts_host = False
     mamba_retention_counts: Optional[dict[str, int]] = None
+    # Bumped by every call that can change a match or the recency it refreshes.
+    match_epoch = 0
     pp_counts_piggyback: bool = False
     # Admissions deferred because the mamba state pool had no free slot.
     state_pool_exhausted: int = 0
@@ -488,6 +490,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.linker = UnifiedCacheLinkerWrapper(self, cache_linker)
 
     def reset(self) -> None:
+        self.match_epoch += 1
         if self.linker is not None:
             self.linker.reset()
         # The reset frees the reserved load slots with every other page; the
@@ -736,6 +739,7 @@ class UnifiedRadixCache(BasePrefixCache):
         same_results=["result.full_kv_hit_length", "result.swa_host_hit_length"],
     )
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
+        self.match_epoch += 1
         result = self.session.try_match_prefix(params)
         if result is not None:
             return result
@@ -800,6 +804,27 @@ class UnifiedRadixCache(BasePrefixCache):
     def supports_fast_match_prefix(self) -> bool:
         return self.tree_core.supports_fast_match_prefix()
 
+    def match_state_key(self) -> Optional[tuple]:
+        # Host tiers, session slots and linkers that look the store up while
+        # matching change matches outside the tree; prefetch mode matches device KV.
+        if (
+            self.cache_controller is not None
+            or self.session.slots
+            or (self.linker is not None and self.linker.load_mode != "prefetch")
+        ):
+            return None
+        # Evictions and lock changes move these sizes; inserts and walks bump the epoch.
+        core = self.tree_core
+        return (
+            self.match_epoch,
+            core.full_evictable_size(),
+            core.full_protected_size(),
+            core.swa_evictable_size(),
+            core.swa_protected_size(),
+            core.mamba_evictable_size(),
+            core.mamba_protected_size(),
+        )
+
     def peek_prefix_len(self, key: RadixKey) -> Optional[int]:
         if self.disable:
             return 0
@@ -809,6 +834,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # Tree walk only; skips match_prefix's session shortcut, finalizers and linker.
         if self.disable:
             return
+        self.match_epoch += 1
         result = self.tree_core.match_prefix(MatchPrefixParams(key=key))
         self._apply_cache_actions(result.cache_actions)
 
@@ -822,6 +848,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
             return InsertResult(prefix_len=0)
+        self.match_epoch += 1
         # Fail fast on re-entrancy without touching the in-flight walk.
         assert not self.tree_core.has_ongoing_insert(), "re-entrant insert"
         if self.buffer_pipeline is not None:
