@@ -101,6 +101,11 @@ class SchedulerStageMetricsRecorder:
     _wall_ns: dict[tuple[str, str], int] = field(
         default_factory=lambda: defaultdict(int)
     )
+    # SGLANG_SCHED_STAGE_TRACE_DIR: one "epoch_ns,stage,span_ns" line per span, so
+    # per-step timelines of all PP ranks can be lined up offline.
+    trace_path: str | None = None
+    _trace: list = field(default_factory=list)
+    trace_flush: int = 4096
 
     def start(self, wall_ns: int) -> None:
         if not self.enabled:
@@ -172,6 +177,12 @@ class SchedulerStageMetricsRecorder:
         else:
             overlap = FORWARD_OVERLAP_NONE
         self._wall_ns[self._current_stage, overlap] += wall_ns - self._last_wall_ns
+        if self.trace_path is not None:
+            self._trace.append(f"{time.time_ns()},{self._current_stage},{wall_ns - self._last_wall_ns}\n")
+            if len(self._trace) >= self.trace_flush:
+                with open(self.trace_path, "a") as f:
+                    f.writelines(self._trace)
+                self._trace.clear()
         self._last_wall_ns = wall_ns
         self._last_forward_active = forward_active
 

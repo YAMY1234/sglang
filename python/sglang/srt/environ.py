@@ -1110,6 +1110,8 @@ class Envs:
     # A staged load that failed after its early vote: raise at its finish (debug
     # builds) instead of reading it from the store again (counted).
     SGLANG_LINKER_EARLY_STRICT = EnvBool(False)
+    # Debug: a directory for per-rank scheduler stage-span traces ("" off; needs --enable-metrics).
+    SGLANG_SCHED_STAGE_TRACE_DIR = EnvStr("")
     SGLANG_LINKER_EARLY_STATES = EnvInt(32)
     SGLANG_LINKER_HELPER = EnvBool(False)
     SGLANG_LINKER_HELPER_SEGMENT_MB = EnvInt(0)

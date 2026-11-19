@@ -683,6 +683,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             for name, entry in self.pools.items()
         }
         self.write_bytes: Counter = Counter()
+        # Offload thread seconds by work kind and queue depth seen at each get, per stats window.
+        self.offload_busy = Counter()
         self.lookup_counts: Counter = Counter()
         # (keys queried, seconds) per PP lookup and per admission pin, and the
         # pins that found a hole, since the last stats line.
@@ -2378,6 +2380,15 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def offload_thread_func(self) -> None:
         while True:
             task = self.offload_queue.get()
+            if self.offload_busy is None:
+                self.offload_busy = Counter()
+            busy = self.offload_busy
+            depth = self.offload_queue.qsize()
+            busy["depth_sum"] += depth
+            busy["depth_max"] = max(busy["depth_max"], depth)
+            kind = "remove" if task is not None and task[0] == "remove" else "put"
+            busy[f"n_{kind}"] += 1
+            started = time.perf_counter()
             try:
                 if task is None:
                     return
@@ -2426,18 +2437,24 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         self.write_bytes["offered"] += len(transfer.keys) * size
                     self.write_bytes["states"] += put.get(PoolName.MAMBA, 0)
                     if self.state_path_cap:
+                        t = time.perf_counter()
                         self._remove_states(victims)
+                        busy["states_s"] += time.perf_counter() - t
                 if self.store_tree is not None and self.page_remove_retries:
+                    t = time.perf_counter()
                     self._remove_pages([])
+                    busy["retries_s"] += time.perf_counter() - t
                 self.offload_results.put(success)
                 self._maybe_log_stats()
             except BaseException:
                 logger.exception("Mooncake offload failed")
                 self.offload_results.put(False)
             finally:
+                busy[f"{kind}_s"] += time.perf_counter() - started
                 self.offload_queue.task_done()
 
     _REMOVE_RETRIES = 6
+    offload_busy: Counter | None = None
 
     def _remove_states(self, page_hashes: list[str]) -> None:
         """Remove superseded state objects. Mooncake refuses an object under a
@@ -2608,6 +2625,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             len(self.state_parent),
             looked["lookups"],
             looked["hit_pages"],
+        )
+        busy, self.offload_busy = self.offload_busy or Counter(), Counter()
+        gets = max(busy["n_put"] + busy["n_remove"], 1)
+        logger.info(
+            "Linker offload thread in %.0f s: puts %.1f s (%d tasks; state removals %.1f s, retries %.1f s), "
+            "removals %.1f s (%d tasks); queue depth at get max %d, mean %.1f",
+            window, busy["put_s"], busy["n_put"], busy["states_s"], busy["retries_s"],
+            busy["remove_s"], busy["n_remove"], busy["depth_max"], busy["depth_sum"] / gets,
         )
         tree = self.store_tree
         if tree is not None:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import socket
 import dataclasses
 import logging
 import math
@@ -345,8 +347,14 @@ class SchedulerMetricsReporter:
             )
         # PDMux event polling across green-context streams is not validated;
         # keep its overlap label at `none` without disabling forward timing.
+        trace_dir = envs.SGLANG_SCHED_STAGE_TRACE_DIR.get()
         self.scheduler_stage_metrics = SchedulerStageMetricsRecorder(
             enabled=self.enable_metrics,
+            trace_path=(
+                os.path.join(trace_dir, f"stage-trace-pp{get_parallel().pp_rank}-{socket.gethostname()}.csv")
+                if trace_dir
+                else None
+            ),
             query_forward_active=(
                 self.forward_pass_device_timer.is_active
                 if self.enable_metrics

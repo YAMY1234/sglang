@@ -58,6 +58,25 @@ class TestSchedulerStageMetricsRecorder(CustomTestCase):
         )
         self.assertEqual(sum(wall_ns.values()), 100)
 
+    def test_stage_trace_writes_one_line_per_span(self):
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "trace.csv")
+            recorder = SchedulerStageMetricsRecorder(enabled=True, trace_path=path, trace_flush=2)
+            recorder.start(wall_ns=0)
+            with patch(
+                "sglang.srt.observability.scheduler_stage_metrics.time.monotonic_ns",
+                side_effect=[10, 30],
+            ):
+                outer = recorder.enter(SCHEDULER_STAGE_GET_NEXT_BATCH)
+                recorder.exit(outer)
+            with open(path) as f:
+                rows = [line.strip().split(",") for line in f]
+            self.assertEqual([r[1:] for r in rows], [["other", "10"], [SCHEDULER_STAGE_GET_NEXT_BATCH, "20"]])
+            self.assertTrue(all(int(r[0]) > 0 for r in rows))
+
     def test_decorator_restores_stage_after_exception(self):
         recorder = SchedulerStageMetricsRecorder(enabled=True)
         recorder.start(wall_ns=0)
