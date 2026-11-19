@@ -1312,13 +1312,14 @@ class TestStoreBudgetKeepsReusedPages(CustomTestCase):
 
 
 class _RemoveAllStore(_LeaseStore):
-    def __init__(self):
+    def __init__(self, passes=(7, 2, 0)):
         super().__init__()
         self.remove_all_calls = 0
+        self.passes = list(passes)
 
     def remove_all(self):
         self.remove_all_calls += 1
-        return 7
+        return self.passes.pop(0) if self.passes else 0
 
 
 def _toggle_linker(stage=0):
@@ -1361,7 +1362,8 @@ class TestRuntimeLinkerFlags(CustomTestCase):
     def test_reset_cold_clears_store_state_and_moves_the_namespace(self):
         linker = _toggle_linker(stage=0)
         linker.store_tree.add(["a1", "a2"], None, ())
-        linker.reset_cold()
+        with patch.object(mooncake_direct_linker.time, "sleep"):
+            linker.reset_cold()
         self.assertEqual(linker.store_tree.units, 0)
         self.assertEqual(linker.store_tree.budget, 16)
         for table in ("state_parent", "state_children", "state_remove_counts",
@@ -1370,9 +1372,24 @@ class TestRuntimeLinkerFlags(CustomTestCase):
         self.assertFalse(linker.state_remove_retries or linker.lookup_samples)
         self.assertEqual(linker.stats, {"lookup": 0, "load": 0})
         self.assertEqual(linker.storage.config_prefix, "tag_model-e1")
-        self.assertEqual(linker.storage.store.remove_all_calls, 1)
-        linker.reset_cold()
+        # Passes repeat until one removes nothing (leased / in-flight objects survive a pass).
+        self.assertEqual(linker.storage.store.remove_all_calls, 3)
+        with patch.object(mooncake_direct_linker.time, "sleep"):
+            linker.reset_cold()
         self.assertEqual(linker.storage.config_prefix, "tag_model-e2")
+        self.assertEqual(linker.storage.store.remove_all_calls, 4)
+
+    def test_reset_cold_remove_passes_stop_at_the_cap_or_an_error(self):
+        linker = _toggle_linker(stage=0)
+        linker.storage.store.passes = [5] * 40
+        with patch.object(mooncake_direct_linker.time, "sleep") as sleep:
+            linker.reset_cold()
+        self.assertEqual(linker.storage.store.remove_all_calls, linker.RESET_REMOVE_PASSES)
+        self.assertEqual(sleep.call_count, linker.RESET_REMOVE_PASSES)
+        linker.storage.store.passes, linker.storage.store.remove_all_calls = [9, -1, 9], 0
+        with patch.object(mooncake_direct_linker.time, "sleep"):
+            linker.reset_cold()
+        self.assertEqual(linker.storage.store.remove_all_calls, 2)
 
     def test_reset_cold_removes_store_objects_on_pp0_only(self):
         linker = _toggle_linker(stage=3)

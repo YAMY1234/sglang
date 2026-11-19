@@ -2439,6 +2439,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             if hasattr(envs, name)
         }
 
+    RESET_REMOVE_PASSES = 15
+
     def reset_cold(self) -> None:
         """After reset(): drop this stage's store bookkeeping and stats, move to a
         fresh store key namespace (late puts of the previous arm land in the old
@@ -2483,7 +2485,15 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if self.pp_rank == 0 and self.offload_owner:
             remove_all = getattr(self.storage.store, "remove_all", None)
             if callable(remove_all):
-                removed = remove_all()
+                # One pass leaves objects under a lease or still being put (0.2-0.4 M
+                # of ~8 M); repeat until a pass removes nothing (or returns an error).
+                removed = []
+                for _ in range(self.RESET_REMOVE_PASSES):
+                    n = remove_all()
+                    removed.append(n)
+                    if not n or n < 0:
+                        break
+                    time.sleep(1.0)
         logger.info(
             "Linker cold reset: store key prefix %s, store objects removed %s",
             self.storage.config_prefix,
