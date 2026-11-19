@@ -346,16 +346,21 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
             tail_seq = self._make_seq(1, 2)
             parent_seq = self._make_seq(3000, 2)
             child_seq = parent_seq + self._make_seq(5000, 2)
-            # A host-only filler leaves less free host space than the tail needs.
-            filler_pages = (host.available_size() - len(child_seq)) // page
-            filler_pages -= len(tail_seq) // page - 1
-            if filler_pages < 1 or allocator.available_size() < 6 * page:
-                self.skipTest("pools too small for a filler and three nodes")
-            filler_seq = self._make_seq(7000, filler_pages)
-            self._insert(cache, allocator, req_to_token_pool, filler_seq)
-            filler = match_prefix(cache, filler_seq).last_device_node
-            self._backup_node(cache, filler)
-            cache._demote(filler, {ct: 0 for ct in cache.tree_components})
+            # Host-only fillers leave less free host space than the tail needs.
+            filler_tokens = host.available_size() - len(child_seq) - len(tail_seq) + page
+            fillers = []
+            while filler_tokens > 0:
+                room = allocator.available_size() - 8 * page
+                if room < page:
+                    self.skipTest("device pool too small for a filler")
+                pages = -(-min(filler_tokens, room) // page)
+                seq = self._make_seq(100_000 * (len(fillers) + 1), pages)
+                self._insert(cache, allocator, req_to_token_pool, seq)
+                node = match_prefix(cache, seq).last_device_node
+                self._backup_node(cache, node)
+                cache._demote(node, {ct: 0 for ct in cache.tree_components})
+                fillers.append(seq)
+                filler_tokens -= len(seq)
             for seq in (tail_seq, parent_seq, child_seq):
                 self._insert(cache, allocator, req_to_token_pool, seq)
             tail = match_prefix(cache, tail_seq).last_device_node
@@ -376,7 +381,8 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
             # the host-only filler and the leaf duplicate (an imminent demote) stay.
             self.assertFalse(cache.tree_core.is_backuped(parent))
             self.assertTrue(cache.tree_core.is_backuped(child))
-            self.assertEqual(match_prefix(cache, filler_seq).host_hit_length, len(filler_seq))
+            for seq in fillers:
+                self.assertEqual(match_prefix(cache, seq).host_hit_length, len(seq))
 
             evicted = self._evict_without_copies(cache, len(tail_seq))
             self.assertEqual(evicted.num_tokens_evicted, len(tail_seq))
