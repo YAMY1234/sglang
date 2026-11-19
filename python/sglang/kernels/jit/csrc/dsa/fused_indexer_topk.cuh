@@ -362,19 +362,23 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
     uint32_t seq_k_end[kLoadSeqBounds ? BLOCK_Q : 1];
     const auto math_warpgroup_idx = warp_idx / 4;
     float sink_acc = 0.0f;
-    float tau[BLOCK_Q];
+    float tau[BLOCK_Q] = {};
 
-    // One (row-in-block i, key) result: store, accumulate, or filter into the row's list.
-    const auto handle = [&](const uint32_t q_block_idx, const uint32_t i, const uint32_t kv_offset, const float result) {
+    // One (row, key) result: store, accumulate, or filter into the row's list. Callers
+    // pass the row's window and tau as values so the per-row arrays stay in registers.
+    const auto handle = [&](const uint32_t row,
+                            const uint32_t win_start,
+                            const uint32_t win_len,
+                            const float row_tau,
+                            const uint32_t kv_offset,
+                            const float result) {
       if constexpr (kMode == kModeLogits) {
-        const auto q_offset = (q_block_idx * BLOCK_Q + i) * static_cast<uint64_t>(params.logits_stride);
-        params.logits[q_offset + kv_offset] = result;
+        params.logits[row * static_cast<uint64_t>(params.logits_stride) + kv_offset] = result;
       } else if constexpr (kMode == kModeNoStore) {
         sink_acc += result;
       } else if constexpr (kMode == kModeFilter) {
-        const uint32_t row = q_block_idx * BLOCK_Q + i;
-        const uint32_t rel = kv_offset - seq_k_start[i];
-        const bool take = rel < (seq_k_end[i] - seq_k_start[i]) and result >= tau[i];
+        const uint32_t rel = kv_offset - win_start;
+        const bool take = rel < win_len and result >= row_tau;
         const uint32_t mask = __ballot_sync(0xffffffffu, take);
         if (mask != 0) {
           uint32_t base = 0;
@@ -459,7 +463,13 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
               ptx::tcgen05_before_thread_sync();
               smem.empty_tmem_barriers[tmem_stage_idx].arrive();
             }
-            handle(q_block_idx, i, kv_offset, dg_reduce<kAluHeads>(accum, weights[i]) * scale_kv);
+            handle(
+                q_block_idx * BLOCK_Q + i,
+                seq_k_start[kLoadSeqBounds ? i : 0],
+                seq_k_end[kLoadSeqBounds ? i : 0] - seq_k_start[kLoadSeqBounds ? i : 0],
+                tau[i],
+                kv_offset,
+                dg_reduce<kAluHeads>(accum, weights[i]) * scale_kv);
           }
         }
 
@@ -479,6 +489,18 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
         CUTE_TIE_DECL(q_pipeline.advance(), q_stage_idx, q_phase);
         smem.full_q_barriers[q_stage_idx].wait(q_phase);
         load_tau(q_block_idx);
+        // This warpgroup's two rows, selected with constant indices (registers, not local memory).
+        uint32_t win_start[2] = {0, 0}, win_len[2] = {0, 0};
+        float row_tau[2] = {0.0f, 0.0f};
+        if constexpr (kMode == kModeFilter) {
+#pragma unroll
+          for (uint32_t r = 0; r < 2; ++r) {
+            const bool hi = math_warpgroup_idx != 0;
+            win_start[r] = hi ? seq_k_start[2 + r] : seq_k_start[r];
+            win_len[r] = (hi ? seq_k_end[2 + r] : seq_k_end[r]) - win_start[r];
+            row_tau[r] = hi ? tau[2 + r] : tau[r];
+          }
+        }
         if constexpr (kMode != kModeNoEpi) {
 #pragma unroll
           for (uint32_t r = 0; r < 2; ++r) {
@@ -523,8 +545,8 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
             const uint32_t kv_offset = kv_base + kv_split_idx * SPLIT_KV + h * UMMA_M + lane_key;
             const float r0 = dg_reduce<kAluHeads>(accum[0], weights[0]) * scale_kv[h];
             const float r1 = dg_reduce<kAluHeads>(accum[1], weights[1]) * scale_kv[h];
-            handle(q_block_idx, row0, kv_offset, r0);
-            handle(q_block_idx, row0 + 1, kv_offset, r1);
+            handle(q_block_idx * BLOCK_Q + row0, win_start[0], win_len[0], row_tau[0], kv_offset, r0);
+            handle(q_block_idx * BLOCK_Q + row0 + 1, win_start[1], win_len[1], row_tau[1], kv_offset, r1);
           }
         }
 

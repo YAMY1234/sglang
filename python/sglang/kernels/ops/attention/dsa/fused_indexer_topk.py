@@ -151,6 +151,8 @@ def fused_indexer_topk(
     cand_cap: int = 8192,
     keep_all: Optional[int] = None,
     order: Optional[torch.Tensor] = None,
+    row_split: bool = True,
+    alu_heads: int = 0,
     cuh_path: Optional[str] = None,
 ) -> FusedTopKResult:
     """Exact top-k of every packed row; rows listed in ``fallback_rows`` were not written."""
@@ -180,6 +182,8 @@ def fused_indexer_topk(
         mode=MODE_LOGITS,
         order=lpt_order(sks, ske, n_s),
         logits=sample_logits,
+        row_split=row_split,
+        alu_heads=alu_heads,
         cuh_path=cuh_path,
     )
     tau = torch.empty(rows, device=dev, dtype=torch.float32)
@@ -201,6 +205,8 @@ def fused_indexer_topk(
         cand_score=cand_score,
         cand_col=cand_col,
         cand_count=cand_count,
+        row_split=row_split,
+        alu_heads=alu_heads,
         cuh_path=cuh_path,
     )
     out = torch.empty(rows, topk, device=dev, dtype=torch.int32)
