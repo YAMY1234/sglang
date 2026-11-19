@@ -71,6 +71,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     zero_match_result,
 )
 from sglang.srt.mem_cache.common import match_kv_cache, touch_waiting_prefix
+from sglang.srt.mem_cache.prefill_budget import park_chunked_prefill_enabled
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.unified_cache.components import (
     CacheTransferPhase,
@@ -426,7 +427,12 @@ class SchedulePolicy:
         )
 
     def shortest_prefill_chunk_limit(
-        self, chunked_req: Req, waiting_queue: List[Req], budget: int, page_size: int
+        self,
+        chunked_req: Req,
+        waiting_queue: List[Req],
+        budget: int,
+        page_size: int,
+        adder: Optional[PrefillAdder] = None,
     ) -> Optional[int]:
         """Cap the active prefill chunk to reserve tokens for shorter waiting requests."""
         if (
@@ -436,11 +442,27 @@ class SchedulePolicy:
             return None
         remaining = len(chunked_req.full_untruncated_fill_ids) - chunked_req.prefix_len
         reserved = 0
+        reserved_kv = 0
         for req in waiting_queue:
             work = self._shortest_prefill_work(req)
             charge = _ceil_div(work, page_size) * page_size
             if work >= remaining or reserved + charge > budget - page_size:
                 break
+            # A request the adder will park beside the chunk's reserved tail
+            # must not shrink the chunk.
+            headroom = (
+                None if adder is None else adder.chunked_tail_headroom(chunked_req, req)
+            )
+            if headroom is not None:
+                # Host hits load into device KV, so they are not free here.
+                reserved_kv += (
+                    _ceil_div(work + req.host_hit_length, page_size) + 1
+                ) * page_size + min(
+                    max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
+                    CLIP_MAX_NEW_TOKENS,
+                )
+                if reserved_kv > headroom:
+                    break
             reserved += charge
         if not reserved:
             return None
@@ -648,6 +670,14 @@ class PrefillAdder:
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
         self.chunked_req_limit: Optional[int] = None
+        # Shortest-prefill-first admits requests beside a truncated chunk, and
+        # their KV stays locked until it is sent. Hold the chunk's uncomputed
+        # tail in the budget, or its later chunks find no KV left.
+        self.reserve_chunked_tail = (
+            envs.SGLANG_K31_PF_SPF_RESERVE_CHUNKED_TAIL.get()
+            and get_context().is_config_namespace_published("schedule")
+            and get_schedule().schedule_policy == "shortest-prefill-first"
+        )
         self.dllm_config = dllm_config
         # Mamba checkpoints only land on page-aligned chunk ends.
         self.exact_chunk_fill = (
@@ -869,6 +899,43 @@ class PrefillAdder:
 
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
+
+    def _chunked_tail_tokens(self, req: Req, start: int) -> int:
+        """KV a chunked request still needs past `start`: the part of its
+        admission check (extend, page overhead, decode headroom) no chunk
+        has charged yet."""
+        tail = len(req.full_untruncated_fill_ids) - start
+        if tail <= 0:
+            return 0
+        return (
+            self.memory_budget.ceil_paged_tokens(self.ceil_paged_tokens(tail))
+            + self.per_req_token_overhead
+            + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+        )
+
+    def _reserve_chunked_tail(self, req: Req, start: int) -> None:
+        # Reserved like decode headroom: in the total budget only, since this
+        # pass allocates none of it.
+        if self.reserve_chunked_tail:
+            self.memory_budget.total_offset += self._chunked_tail_tokens(req, start)
+
+    def chunked_tail_headroom(self, req: Req, beside: Req) -> Optional[int]:
+        """KV left for `beside` once the chunked request's whole remainder is
+        held, or None when the tail is not reserved. Pins `beside`'s cached
+        prefix, as its admission check will."""
+        if not self.reserve_chunked_tail:
+            return None
+        with (
+            self._lock_node(beside.last_node)
+            if beside.last_node is not None
+            else nullcontext()
+        ):
+            remaining = int(self.rem_total_tokens)
+        return (
+            remaining
+            - self._chunked_tail_tokens(req, req.prefix_len)
+            - self.per_req_token_overhead
+        )
 
     def floor_chunked_tokens(self, trunc_len: int, remaining: int) -> int:
         """Round a *truncated* chunk down to the mamba kernel chunk grid.
@@ -1155,6 +1222,7 @@ class PrefillAdder:
                 self.rem_chunk_tokens
             )
             if _rem_tokens is None:
+                self._reserve_chunked_tail(req, req.prefix_len)
                 return req
             if self.kv_shard_granule:
                 # Align the absolute boundary to keep pages within one scratch region.
@@ -1163,7 +1231,20 @@ class PrefillAdder:
                 floored = (
                     prefix_len + _rem_tokens
                 ) // self.kv_shard_granule * self.kv_shard_granule - prefix_len
-                _rem_tokens = floored if floored > 0 else self.rem_chunk_tokens
+                if floored > 0:
+                    _rem_tokens = floored
+                elif (
+                    park_chunked_prefill_enabled()
+                    and _rem_tokens < self.rem_chunk_tokens
+                ):
+                    # #44823: memory holds less than one aligned step; wait for
+                    # it instead of taking a full chunk past the budget.
+                    self._reserve_chunked_tail(req, req.prefix_len)
+                    return req
+                elif not park_chunked_prefill_enabled():
+                    _rem_tokens = self.rem_chunk_tokens
+                # Gate on: the chunk itself is shorter than one aligned step;
+                # take it unaligned so the continuation cannot park forever.
 
         # A mid-chunk rank prefills this pass regardless of the delayer
         # verdict, so report prefillable=True and ignore the result.
@@ -1187,6 +1268,7 @@ class PrefillAdder:
             chunk_limit=_rem_tokens,
         )
         if _rem_tokens is None:
+            self._reserve_chunked_tail(req, req.prefix_len)
             return req
         truncated = cand_extend_input_len > _rem_tokens
         new_len = self.floor_chunked_tokens(
@@ -1205,6 +1287,7 @@ class PrefillAdder:
             max_new_tokens=self._swa_new_tokens(req),
             chunk_limit=self.rem_chunk_tokens,
         ):
+            self._reserve_chunked_tail(req, req.prefix_len)
             return req
         # The continuing chunk must fit. Keep reservation outside assert for -O.
         reserved = self._kv_shard_reserve_scratch(
@@ -1227,6 +1310,8 @@ class PrefillAdder:
             request_slot_reserve=request_slot_reserve,
             is_chunked_continuation=True,
         )
+        if truncated:
+            self._reserve_chunked_tail(req, req.extend_end)
 
         # Return if chunked prefill not finished
         return req if truncated else None
@@ -1712,6 +1797,8 @@ class PrefillAdder:
             ),
             replay_len=admission.replay_len,
         )
+        if admission.is_chunked:
+            self._reserve_chunked_tail(req, req.extend_end)
         self._account_prefill_cache_admission(req, admission.prefix_len)
 
     def preempt_to_schedule(self, req: Req) -> bool:

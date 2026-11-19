@@ -3,11 +3,16 @@ is described in ``jit/csrc/dsa/dcp_topk_merge.cuh``."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
+from sglang.kernels.jit.utils import (
+    cache_once,
+    is_arch_support_pdl,
+    load_jit,
+    make_cpp_args,
+)
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -24,6 +29,23 @@ def _jit_dcp_topk_merge_module(
         cuda_files=["dsa/dcp_topk_merge.cuh"],
         cuda_wrappers=[("dcp_topk_merge", f"DcpTopKMergeKernel<{args}>::run")],
     )
+
+
+# Running totals a merge adds to (int64 ``stats``): rows whose certificate
+# failed, of them the rows this rank published its keys for, of those the rows
+# where it had to select among more than top-k keys, and all merged rows.
+DCP_TOPK_MERGE_NUM_STATS = 4
+_SCRATCH_STATS: dict[torch.device, torch.Tensor] = {}
+
+
+def _stats_or_scratch(stats: Optional[torch.Tensor], device: torch.device) -> torch.Tensor:
+    if stats is not None:
+        return stats
+    if device not in _SCRATCH_STATS:
+        _SCRATCH_STATS[device] = torch.zeros(
+            DCP_TOPK_MERGE_NUM_STATS, dtype=torch.int64, device=device
+        )
+    return _SCRATCH_STATS[device]
 
 
 def dcp_topk_merge_buffer_numel(
@@ -50,6 +72,7 @@ def dcp_topk_merge(
     span: int,
     cand_k: int,
     split: bool = False,
+    stats: Optional[torch.Tensor] = None,
 ) -> None:
     """Merge one batch of rows; every rank of the group must call it with the
     same rows, in the same order.
@@ -69,6 +92,7 @@ def dcp_topk_merge(
 
     ``split`` (KV replicated): rank q scored the 64-token pages p with
     p % num_ranks == q, and every rank writes all selected keys, not only its own.
+    ``stats``: [DCP_TOPK_MERGE_NUM_STATS] int64 running totals the merge adds to.
     """
     num_ranks = peer_ptrs.shape[0]
     module = _jit_dcp_topk_merge_module(num_ranks, candidates.shape[1], cand_k, split)
@@ -83,6 +107,70 @@ def dcp_topk_merge(
         out_slots,
         out_fallback,
         union_scratch,
+        _stats_or_scratch(stats, out_slots.device),
+        rank,
+        span,
+    )
+
+
+@cache_once
+def _jit_dcp_topk_merge_pushed_module(num_ranks: int, topk: int, cand_k: int) -> Module:
+    args = make_cpp_args(num_ranks, topk, cand_k, is_arch_support_pdl())
+    return load_jit(
+        "dcp_topk_merge_pushed",
+        *args,
+        cuda_files=["dsa/dcp_topk_merge.cuh"],
+        cuda_wrappers=[
+            ("dcp_topk_merge_pushed", f"DcpTopKMergePushedKernel<{args}>::run")
+        ],
+    )
+
+
+def dcp_topk_merge_pushed(
+    logits: torch.Tensor,
+    local_lens: torch.Tensor,
+    global_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    *,
+    buffer: torch.Tensor,
+    peer_ptrs: torch.Tensor,
+    counters: torch.Tensor,
+    out_slots: torch.Tensor,
+    out_local: torch.Tensor,
+    out_lengths: torch.Tensor,
+    out_fallback: torch.Tensor,
+    rank: int,
+    span: int,
+    cand_k: int,
+    stats: Optional[torch.Tensor] = None,
+) -> None:
+    """``dcp_topk_merge`` for candidates the local top-k already pushed
+    (``topk_transform_candidates_dcp_push`` with the same ``buffer``,
+    ``counters`` and ``cand_k``); token interleave only. Every rank must call it
+    with the same rows, in the same order, right after its push.
+
+    ``logits``: [rows, >= local_lens.max()] fp32, this rank's scores, read only
+    by a row whose certificate failed on this rank. ``out_slots`` as
+    ``dcp_topk_merge``; ``out_local``: [rows, topk] the same keys as this rank's
+    local KV rows (slot // num_ranks), -1 after them, and ``out_lengths``: [rows]
+    their count (what ``dcp_localize_compact`` returns for ``out_slots``).
+    ``stats`` as ``dcp_topk_merge``.
+    """
+    num_ranks = peer_ptrs.shape[0]
+    module = _jit_dcp_topk_merge_pushed_module(num_ranks, out_slots.shape[1], cand_k)
+    module.dcp_topk_merge_pushed(
+        logits,
+        local_lens,
+        buffer,
+        peer_ptrs,
+        counters,
+        global_lens,
+        page_table,
+        out_slots,
+        out_local,
+        out_lengths,
+        out_fallback,
+        _stats_or_scratch(stats, out_slots.device),
         rank,
         span,
     )

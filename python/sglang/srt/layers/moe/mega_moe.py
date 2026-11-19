@@ -16,6 +16,8 @@
 from __future__ import annotations
 
 import functools
+import logging
+import os
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
@@ -42,6 +44,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 
+logger = logging.getLogger(__name__)
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
 _is_hip = is_hip()
@@ -95,6 +98,174 @@ def _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
         yield
     finally:
         deep_gemm.set_num_sms(current_num_sms)
+
+
+# DeepGEMM's BLOCK_M -> (BLOCK_M, store BLOCK_M) for decode-graph calls (decode block-M tiers from
+# sgl-project/sglang pull request #46593).
+_MEGA_MOE_DECODE_BLOCK_M = {16: (64, 16), 32: (64, 16), 64: (96, 16)}
+
+
+@functools.lru_cache(maxsize=None)
+def _mega_moe_decode_block_m(
+    num_ranks: int,
+    num_experts: int,
+    num_max_tokens_per_rank: int,
+    num_tokens: int,
+    num_topk: int,
+    mma_type: str,
+) -> Optional[tuple[int, int]]:
+    """(BLOCK_M, store BLOCK_M) for a decode-graph call, or None to keep DeepGEMM's."""
+    import deep_gemm
+
+    if mma_type != "fp8xfp4":
+        return None
+    default_block_m = deep_gemm.get_block_m_for_mega_moe(
+        num_ranks=num_ranks,
+        num_experts=num_experts,
+        num_max_tokens_per_rank=num_max_tokens_per_rank,
+        num_tokens=max(num_tokens, 1),
+        num_topk=num_topk,
+        mma_type=mma_type,
+    )
+    tiles = _MEGA_MOE_DECODE_BLOCK_M.get(default_block_m)
+    min_tokens = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_DECODE_BLOCK_M_96_MIN_TOKENS.get()
+    expected = num_tokens * num_ranks * num_topk / num_experts
+    if tiles is not None and tiles[0] == 96 and expected < min_tokens:
+        # Below the threshold a second 64-row block per expert is rarer than the cost of
+        # 96-row tiles (Kimi-K3.1 decode, 56 experts per rank, top-16, VR200).
+        _log_decode_block_m_kept_once(num_tokens, expected, min_tokens)
+        return None
+    return tiles
+
+
+_mega_moe_decode_block_m_kept_logged = False
+
+
+def _log_decode_block_m_kept_once(num_tokens: int, expected: float, min_tokens: float):
+    global _mega_moe_decode_block_m_kept_logged
+    if _mega_moe_decode_block_m_kept_logged:
+        return
+    _mega_moe_decode_block_m_kept_logged = True
+    logger.info(
+        "MegaMoE decode BLOCK_M kept at 64 below %.1f expected tokens per expert "
+        "(SGLANG_OPT_DEEPGEMM_MEGA_MOE_DECODE_BLOCK_M_96_MIN_TOKENS): first such call "
+        "%d rows/rank, %.1f expected",
+        min_tokens,
+        num_tokens,
+        expected,
+    )
+
+
+def _use_mega_moe_decode_tiles(forward_batch: Optional[ForwardBatch]) -> bool:
+    return (
+        envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_RAISE_DECODE_BLOCK_M.get()
+        and forward_batch is not None
+        and get_is_capture_mode()
+        and (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
+        )
+    )
+
+
+_mega_moe_decode_tiles_logged = False
+
+
+@contextmanager
+def _mega_moe_tiles_env(buf, num_tokens: int, enabled: bool):
+    """Scope ``DG_MEGA_MOE_TILES``; yields the remapped BLOCK_M, or None."""
+    global _mega_moe_decode_tiles_logged
+    if not enabled or "DG_MEGA_MOE_TILES" in os.environ:
+        yield None
+        return
+    tiles = _mega_moe_decode_block_m(
+        num_ranks=buf.group.size(),
+        num_experts=buf.num_experts,
+        num_max_tokens_per_rank=buf.num_max_tokens_per_rank,
+        num_tokens=num_tokens,
+        num_topk=buf.num_topk,
+        mma_type=buf.mma_type,
+    )
+    if tiles is None:
+        yield None
+        return
+    block_m, store_block_m = tiles
+    # cluster, BLOCK_M, store BLOCK_M, BLOCK_K (8-bit units), epilogue warpgroups.
+    os.environ["DG_MEGA_MOE_TILES"] = f"2,{block_m},{store_block_m},128,2"
+    try:
+        if not _mega_moe_decode_tiles_logged:
+            # Once per process: DeepGEMM must take the hook (call sites without a
+            # shared-expert lookup check nothing else).
+            _mega_moe_decode_tiles_logged = True
+            import deep_gemm
+
+            seen = deep_gemm.get_block_m_for_mega_moe(
+                num_ranks=buf.group.size(),
+                num_experts=buf.num_experts,
+                num_max_tokens_per_rank=buf.num_max_tokens_per_rank,
+                num_tokens=max(num_tokens, 1),
+                num_topk=buf.num_topk,
+                mma_type=buf.mma_type,
+            )
+            _check_mega_moe_decode_block_m(seen, block_m)
+            logger.info(
+                "MegaMoE decode BLOCK_M raised (SGLANG_OPT_DEEPGEMM_MEGA_MOE_RAISE_DECODE_BLOCK_M=1): "
+                "first captured call %d rows/rank, %d experts, top-%d: BLOCK_M -> %d "
+                "(DeepGEMM confirms %d)",
+                num_tokens,
+                buf.num_experts,
+                buf.num_topk,
+                block_m,
+                seen,
+            )
+        yield block_m
+    finally:
+        os.environ.pop("DG_MEGA_MOE_TILES", None)
+
+
+def _check_mega_moe_decode_block_m(
+    shared_block_m: int, decode_block_m: Optional[int]
+) -> None:
+    assert decode_block_m is None or shared_block_m == decode_block_m, (
+        f"DeepGEMM ignored DG_MEGA_MOE_TILES: BLOCK_M {shared_block_m}, "
+        f"expected {decode_block_m}. Set "
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_RAISE_DECODE_BLOCK_M=0."
+    )
+
+
+def _is_mega_moe_localization_enabled() -> bool:
+    return envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE.get() and _device_sm == 107
+
+
+_mega_moe_localize_logged = False
+
+
+def localize_mega_moe_weights(l1_pair, l2_pair):
+    """(weights, SF) pairs -> the same with (domains, experts, N / domains, K) weights in
+    die-local memory (SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE; sgl-project/sglang #47976,
+    #48099). The SF tensors stay; the kernel reads the domain count from the weights."""
+    global _mega_moe_localize_logged
+    import deep_gemm
+
+    if not hasattr(deep_gemm, "localize"):
+        raise RuntimeError(
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE=1 needs deep_gemm.localize "
+            "(sgl-deep-gemm 0.2.5 or newer); this DeepGEMM has none. Unset the flag."
+        )
+    l1_pair = (deep_gemm.localize(l1_pair[0]), l1_pair[1])
+    l2_pair = (deep_gemm.localize(l2_pair[0]), l2_pair[1])
+    if not _mega_moe_localize_logged:
+        _mega_moe_localize_logged = True
+        native = getattr(deep_gemm, "uses_native_locality_domains", None)
+        logger.info(
+            "MegaMoE weights localized (SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE=1): "
+            "L1 %s, L2 %s, localization available %s, native locality domains %s",
+            tuple(l1_pair[0].shape),
+            tuple(l2_pair[0].shape),
+            deep_gemm.is_localization_available(),
+            native() if native is not None else "?",
+        )
+    return l1_pair, l2_pair
 
 
 def check_mega_moe_shapes(hidden: int, intermediate: int, mma_type: str) -> None:
@@ -316,15 +487,19 @@ def mega_moe_input_target(
     routed_sf = buf.x_sf[:num_tokens]
     if not routed_sf.is_contiguous():
         return None
-    shared_block_m = deep_gemm.get_block_m_for_mega_moe(
-        num_ranks=buf.group.size(),
-        num_experts=buf.num_experts,
-        num_max_tokens_per_rank=buf.num_max_tokens_per_rank,
-        num_tokens=num_tokens,
-        num_topk=buf.num_topk,
-        mma_type=buf.mma_type,
-        global_num_tokens=_mega_moe_global_tokens_hint(buf),
-    )
+    with _mega_moe_tiles_env(
+        buf, num_tokens, _use_mega_moe_decode_tiles(forward_batch)
+    ) as decode_block_m:
+        shared_block_m = deep_gemm.get_block_m_for_mega_moe(
+            num_ranks=buf.group.size(),
+            num_experts=buf.num_experts,
+            num_max_tokens_per_rank=buf.num_max_tokens_per_rank,
+            num_tokens=num_tokens,
+            num_topk=buf.num_topk,
+            mma_type=buf.mma_type,
+            global_num_tokens=_mega_moe_global_tokens_hint(buf),
+        )
+        _check_mega_moe_decode_block_m(shared_block_m, decode_block_m)
     return MegaMoeInput(
         buf,
         num_tokens,
@@ -410,6 +585,7 @@ def _run_mega_routed(
         shared_l1_weights=moe.mega_shared_l1_weights,
         shared_l2_weights=moe.mega_shared_l2_weights,
         routing_in_buffer=routing is not None and routing.in_buffer,
+        decode_tiles=_use_mega_moe_decode_tiles(forward_batch),
     )
 
 
@@ -430,6 +606,7 @@ def run_mega_routed_experts(
     shared_l1_weights=None,
     shared_l2_weights=None,
     routing_in_buffer: bool = False,
+    decode_tiles: bool = False,
 ) -> torch.Tensor:
     # Rows are this rank's tokens; the returned rows are fully combined.
     import deep_gemm
@@ -534,17 +711,19 @@ def run_mega_routed_experts(
     else:
         shared_block_m = 0
         if shared_l1_weights is not None:
-            shared_block_m = deep_gemm.get_block_m_for_mega_moe(
-                num_ranks=buf.group.size(),
-                num_experts=buf.num_experts,
-                # DeepGEMM rounds the requested capacity up for its buffer.
-                num_max_tokens_per_rank=buf.num_max_tokens_per_rank,
-                # Match the non-null output allocation passed to DeepGEMM.
-                num_tokens=max(num_tokens, 1),
-                num_topk=buf.num_topk,
-                mma_type=buf.mma_type,
-                global_num_tokens=global_num_tokens,
-            )
+            with _mega_moe_tiles_env(buf, num_tokens, decode_tiles) as decode_block_m:
+                shared_block_m = deep_gemm.get_block_m_for_mega_moe(
+                    num_ranks=buf.group.size(),
+                    num_experts=buf.num_experts,
+                    # DeepGEMM rounds the requested capacity up for its buffer.
+                    num_max_tokens_per_rank=buf.num_max_tokens_per_rank,
+                    # Match the non-null output allocation passed to DeepGEMM.
+                    num_tokens=max(num_tokens, 1),
+                    num_topk=buf.num_topk,
+                    mma_type=buf.mma_type,
+                    global_num_tokens=global_num_tokens,
+                )
+                _check_mega_moe_decode_block_m(shared_block_m, decode_block_m)
         if not (
             routing_in_buffer
             and _mega_moe_input_in_buffer(hidden_states, buf, num_tokens)
@@ -575,7 +754,10 @@ def run_mega_routed_experts(
         dtype=torch.bfloat16,
         device=hidden_states.device,
     )
-    with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
+    with (
+        _configure_mega_moe_deep_gemm_num_sms(deep_gemm),
+        _mega_moe_tiles_env(buf, num_tokens, decode_tiles),
+    ):
         deep_gemm.fp8_fp4_mega_moe(
             y,
             experts.mega_l1_weights,

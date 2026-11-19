@@ -94,6 +94,9 @@ class AttnBankState:
     # Kernels that complete the attention output's sum with the pending add
     # ahead of the FFN read.
     ffn_input_fusions: Tuple[ReadoutFusion, ...] = ()
+    # Fusions tried before every other one, the bank's own included: those
+    # that take an output its producer already reduced onto this rank's rows.
+    leading_fusions: Tuple[ReadoutFusion, ...] = ()
     # A read on this rank's attention-TP slice first tries the bank's kernels
     # that also run the collective around it.
     fuses_slice_collectives: bool = False
@@ -275,14 +278,14 @@ class _FfnReadout(_BankReadout):
     def completing_fusions(self) -> Tuple[ReadoutFusion, ...]:
         state = self.state
         if not state.fuses_slice_collectives:
-            return state.ffn_input_fusions
+            return (*state.leading_fusions, *state.ffn_input_fusions)
         reads = ReadoutFusion(
             SumGroup.ATTN_TP,
             state.reduce_scatter_and_read_ffn_input,
             scatters=True,
             reads=True,
         )
-        return (reads, *state.ffn_input_fusions)
+        return (*state.leading_fusions, reads, *state.ffn_input_fusions)
 
     def read(self, residual, norm, quant_format="", post_residual_addition=None):
         # The attention read of a write layer leaves the residual empty, so the
@@ -328,9 +331,11 @@ class AttnBankOutputRead:
         bank = self.bank.require()
         rows = _bank_rows(bank, hidden_states)
         read_args = (hidden_states, residual, self.score_proj, self.score_norm)
+        # NCCL-only carry has no custom gather. Skip fusion preparation there,
+        # which can materialize a pending residual add before declining.
         read = (
             None
-            if rows is None
+            if rows is None or self.attn_tp_gather is None
             else bank.forward_sp_all_gather(*read_args, self.norm, rows=rows)
         )
         if read is None:

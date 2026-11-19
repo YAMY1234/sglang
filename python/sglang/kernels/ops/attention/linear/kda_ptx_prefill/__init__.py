@@ -20,11 +20,16 @@ import os
 
 import torch
 
+from sglang.srt.environ import envs
+
 K = 128  # head dim (qk == v), fixed by the kernel
 CHUNK = 64  # kernel chunk size, fixed
 
 # Compute capability -> build target: B200 / GB200 and B300 / GB300.
 SM_ARCHS = {(10, 0): "100a", (10, 3): "103a"}
+if envs.SGLANG_ENABLE_PTX_KDA_SM107.get():
+    # Rubin: sm_107a; ptxas caps static smem at 48 KB for the sm_100f family target.
+    SM_ARCHS[(10, 7)] = "107a"
 
 _EXT_NAME = "kda_prefill_ptx"
 _ext = None

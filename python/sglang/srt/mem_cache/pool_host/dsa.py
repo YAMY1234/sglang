@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -15,6 +15,7 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_all_layer_mla_staged_lf_pf as jit_transfer_hicache_all_layer_mla_staged_lf_pf,
 )
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.mem_cache.pool_host._kvcacheio import (
@@ -144,6 +145,9 @@ class DSAIndexerPoolHost(HostKVCache):
     """Host-side DSA index buffers only. Slot layout matches the anchor MLA host pool."""
 
     device_pool: DSATokenToKVPool
+    # Grid cap of the host-to-device load kernel (SGLANG_HICACHE_LOAD_BLOCK_QUOTA);
+    # None keeps the kernel default.
+    _load_block_quota: Optional[int] = None
 
     def __init__(
         self,
@@ -206,6 +210,7 @@ class DSAIndexerPoolHost(HostKVCache):
 
         self.can_use_jit = False
         self.can_use_write_back_jit = False
+        self._load_block_quota = envs.SGLANG_HICACHE_LOAD_BLOCK_QUOTA.get() or None
         if is_dummy:
             self.index_k_with_scale_buffer = None
             self.index_k_device_ptrs = None
@@ -400,6 +405,11 @@ class DSAIndexerPoolHost(HostKVCache):
         )
         use_kernel = io_backend == "kernel" and self.indexer_page_stride_size % 8 == 0
         if use_kernel:
+            quota = (
+                {"block_quota": self._load_block_quota}
+                if self._load_block_quota
+                else {}
+            )
             if self.layout == "layer_first":
                 transfer_kv_per_layer_mla(
                     src=self.index_k_with_scale_buffer[host_layer_id],
@@ -407,6 +417,7 @@ class DSAIndexerPoolHost(HostKVCache):
                     src_indices=host_page_indices,
                     dst_indices=device_page_indices,
                     item_size=self.indexer_page_stride_size,
+                    **quota,
                 )
             elif self.layout == "page_first":
                 transfer_kv_per_layer_mla_pf_lf(
@@ -417,6 +428,7 @@ class DSAIndexerPoolHost(HostKVCache):
                     layer_id=host_layer_id,
                     item_size=self.indexer_page_stride_size,
                     src_layout_dim=self.indexer_layout_dim,
+                    **quota,
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")

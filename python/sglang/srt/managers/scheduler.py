@@ -296,7 +296,10 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
+from sglang.srt.mem_cache.allocation import paged_extend_num_tokens
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
+from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
     checkpoint_kv_cache,
@@ -305,6 +308,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.mem_cache.events import KvEventLoraNames
+from sglang.srt.mem_cache.prefill_budget import park_chunked_prefill_enabled
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -624,9 +628,13 @@ class Scheduler(
         )
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+        # Told about forward launches and WAR barriers (write-back eviction fences).
+        self._hicache_fence_controller = None
         if self.enable_hierarchical_cache:
             cache_controller = self.tree_cache.cache_controller
             if cache_controller is not None:
+                if envs.SGLANG_HICACHE_WB_EVICT_RELAXED_FENCE.get():
+                    self._hicache_fence_controller = cache_controller
                 cache_controller.load_fence_stream = (
                     self.tp_worker.model_runner.forward_stream
                 )
@@ -1384,6 +1392,8 @@ class Scheduler(
             self.chunked_prefill_size = None
         self.chunked_req = None
         self._pending_chunked_abort_req = None
+        # Built PD prefill batches undone for lack of KV pages.
+        self.prefill_kv_deferrals = 0
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
@@ -2178,6 +2188,11 @@ class Scheduler(
         runner = self.model_worker.last_shared_read_runner
         ev = runner.shared_read_done_event
         runner.shared_read_done_event = None
+        if self._hicache_fence_controller is not None:
+            # Recorded before the wait: covers queued scheduler work, not the forward.
+            self._hicache_fence_controller.record_war_barrier(
+                self.schedule_stream.record_event()
+            )
         if ev is not None and not envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get():
             self.schedule_stream.wait_event(ev)
         else:
@@ -3641,6 +3656,116 @@ class Scheduler(
             )
         self._prefetch_kvcache(req, storage_hit_end)
 
+    def _k31_note_chunk_park(self, parked: bool, adder) -> None:
+        """Log each park episode of a chunked continuation once, and its end."""
+        state = getattr(self, "_k31_chunk_park_state", None)
+        req = self.chunked_req
+        if parked:
+            if state is not None and state[0] is req:
+                state[2] += 1
+                return
+            self._k31_chunk_park_state = [req, time.perf_counter(), 1]
+            logger.info(
+                "K31 park-chunked-prefill: parked rid=%s prefix_len=%d "
+                "input_len=%d remaining_total=%d available=%d",
+                req.rid,
+                req.prefix_len,
+                len(req.origin_input_ids),
+                int(adder.memory_budget.remaining_total),
+                self.token_to_kv_pool_allocator.available_size(),
+            )
+        elif state is not None:
+            # Resumed: the parked request runs a chunk (its last one included).
+            if any(r is state[0] for r in adder.can_run_list):
+                logger.info(
+                    "K31 park-chunked-prefill: resumed rid=%s after %d passes, "
+                    "%.3f s parked",
+                    state[0].rid,
+                    state[2],
+                    time.perf_counter() - state[1],
+                )
+            self._k31_chunk_park_state = None
+
+    def _note_prefill_kv_deferral(self) -> None:
+        self.prefill_kv_deferrals += 1
+        n = self.prefill_kv_deferrals
+        if n & (n - 1) == 0:  # 1, 2, 4, ...: bounded logs
+            logger.warning(
+                "Prefill KV shortfall: deferred a built batch (%d so far); it "
+                "retries once transfers release KV.",
+                n,
+            )
+
+    def _prefill_kv_shortfall(self, reqs: List[Req], chunked_req: Optional[Req]) -> int:
+        """Tokens the batch's paged KV extend lacks after evicting all it can.
+
+        PD prefill on a plain paged pool only (0 elsewhere). It reads what
+        admission read, so every TP and PP rank reaches the same verdict.
+        """
+        if not (
+            self.disaggregation_mode == DisaggregationMode.PREFILL
+            and envs.SGLANG_PREFILL_DEFER_ON_KV_SHORTFALL.get()
+        ):
+            return 0
+        allocator = self.token_to_kv_pool_allocator
+        if (
+            not isinstance(
+                allocator, (PagedTokenToKVPoolAllocator, TokenToKVPoolAllocator)
+            )
+            or page_interleave_shard_size(allocator) > 1
+            or self.dllm_config is not None
+            or self.enable_unified_cache_external_linker
+            # A held row (other than the chunk) carries locks the undo cannot restore.
+            or any(r.kv.holds_kv and r is not chunked_req for r in reqs)
+        ):
+            return 0
+        demand = paged_extend_num_tokens(
+            [r.prefix_len for r in reqs],
+            [r.extend_end for r in reqs],
+            allocator.page_size,
+        )
+        evictable = (
+            self.tree_cache.full_evictable_size()
+            if self.tree_cache.supports_mamba()
+            else self.tree_cache.evictable_size()
+        )
+        return demand - (allocator.available_size() + evictable)
+
+    def _defer_unallocatable_prefill(
+        self,
+        adder: PrefillAdder,
+        chunked_req: Optional[Req],
+        chunk_end: Optional[int],
+    ) -> None:
+        """Undo an admission whose KV cannot be allocated; it retries next step.
+
+        Nothing is allocated yet: the new requests never left the waiting
+        queue, and the chunked request keeps its row and its next chunk.
+        """
+        controller = (
+            self.tree_cache.cache_controller if self.enable_hierarchical_cache else None
+        )
+        if controller is not None:
+            # A queued load-back may target rows freed below; land it first.
+            producer = self.tree_cache.ready_to_load_host_cache()
+            if producer >= 0:
+                controller.layer_done_counter.events[
+                    producer
+                ].finish_event.synchronize()
+        for req in adder.can_run_list:
+            if req is chunked_req:
+                req.extend_end = chunk_end
+                continue
+            self.tree_cache.unlock(req.lock)
+            req.lock = None
+            req.extend_end = None
+            req.host_loaded_length = 0
+            self._revert_unadmitted_mamba(req)
+        self.chunked_req = chunked_req
+        for req in adder.preempt_list:
+            self._add_request_to_queue(req)
+        self._note_prefill_kv_deferral()
+
     def _revert_unadmitted_mamba(self, req: Req) -> None:
         # init_next_round_input() may stage a deferred Mamba COW/clear and take a
         # slot before the request is left unadmitted. Drop both, so a later pass
@@ -4413,13 +4538,18 @@ class Scheduler(
             prefill_tile_block_m=prefill_tile_block_m,
         )
 
+        # Restored if the built batch turns out not to fit (see below).
+        prior_chunked_req = self.chunked_req
+        prior_chunk_end = None
         if self.chunked_req is not None:
+            prior_chunk_end = self.chunked_req.extend_end
             self.chunked_req.init_next_round_input()
             adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
                 self.chunked_req,
                 self.waiting_queue,
                 adder.rem_chunk_tokens or 0,
                 self.page_size,
+                adder=adder,
             )
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
@@ -4440,11 +4570,20 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
+        # #44823 (gated): a parked chunk found no budget in this pass. Admit no
+        # one ahead of it, so no batch carries a chunked request it does not run.
+        chunk_parked = False
+        if park_chunked_prefill_enabled():
+            chunk_parked = (
+                self.chunked_req is not None
+                and self.chunked_req not in adder.can_run_list
+            )
+            self._k31_note_chunk_park(chunk_parked, adder)
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             # A spent pass budget admits no one, even before the first
             # candidate: the resumed chunk or mixed decode rows can spend it.
-            if adder.budget_state() == AddReqResult.OTHER:
+            if chunk_parked or adder.budget_state() == AddReqResult.OTHER:
                 break
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 continue
@@ -4547,6 +4686,10 @@ class Scheduler(
             # though the request they made room for was not admitted.
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
+            return None, running_batch
+
+        if self._prefill_kv_shortfall(can_run_list, prior_chunked_req) > 0:
+            self._defer_unallocatable_prefill(adder, prior_chunked_req, prior_chunk_end)
             return None, running_batch
 
         can_run_set = set(can_run_list)
@@ -4908,6 +5051,10 @@ class Scheduler(
 
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)
+                    if self._hicache_fence_controller is not None:
+                        self._hicache_fence_controller.record_forward_start(
+                            self.forward_stream.record_event()
+                        )
                     if gpu_only_lens:
                         # publish_ready was recorded on forward_stream: stream order
                         # fences the gather, no host sync / event wait needed.

@@ -32,12 +32,150 @@ Linear chain only (dspark γ chain, topk<=1).
 
 from __future__ import annotations
 
+import functools
+import logging
+
 import torch
 import triton
 import triton.language as tl
 
+logger = logging.getLogger(__name__)
+
 # Measured on GB300 (K=V=128); any BV keeps the fold bit-identical, re-tune freely.
 KDA_FOLD_BLOCK_V = 8
+
+# SGLANG_OPT_KDA_REPLAYSSM_FAST_FOLD: value rows per work item of the CUDA row
+# fold (128 = a whole head), its cp.async pipeline depth, the tokens a stage
+# holds (longer accepted windows restage the rest in place) and the CTA width.
+# Measured on VR200 (69 layers x 12 heads, 198 requests): 128/2/8/256 is fastest.
+KDA_FAST_FOLD_ROWS = 128
+KDA_FAST_FOLD_STAGES = 2
+KDA_FAST_FOLD_MAX_TOK = 8
+KDA_FAST_FOLD_THREADS = 256
+
+_LOGGED: set = set()
+
+
+def _log_once(key: str, msg: str, *args) -> None:
+    if key not in _LOGGED:
+        _LOGGED.add(key)
+        logger.info(msg, *args)
+
+
+def _fast_fold_eligible(
+    checkpoint_state: torch.Tensor,
+    rawv_cache: torch.Tensor,
+    rawk_cache: torch.Tensor,
+    gk_cache: torch.Tensor,
+    beta_cache: torch.Tensor,
+) -> bool:
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_OPT_KDA_REPLAYSSM_FAST_FOLD.get():
+        return False
+    if not checkpoint_state.is_cuda or torch.version.hip is not None:
+        return False
+    if torch.cuda.get_device_capability(checkpoint_state.device)[0] < 10:
+        return False  # packed f32x2 PTX
+    num_layers, num_slots, HV, V, K = checkpoint_state.shape
+    L = rawv_cache.shape[-2]
+    ok = (
+        V == 128
+        and K == 128
+        and checkpoint_state.dtype == torch.float32
+        and rawv_cache.dtype == torch.bfloat16
+        and rawk_cache.dtype == torch.bfloat16
+        and gk_cache.dtype == torch.float32
+        and beta_cache.dtype == torch.float32
+        and checkpoint_state.stride()[2:] == (V * K, K, 1)
+        and rawv_cache.stride()[2:] == (L * V, V, 1)
+        and rawk_cache.stride()[2:] == (L * K, K, 1)
+        and gk_cache.stride()[2:] == (L * K, K, 1)
+        and beta_cache.stride()[2:] == (L, 1)
+        and L % 4 == 0
+        and all(
+            t.data_ptr() % 16 == 0 and all(s % 4 == 0 for s in t.stride()[:2])
+            for t in (checkpoint_state, rawv_cache, rawk_cache, gk_cache, beta_cache)
+        )
+    )
+    if not ok:
+        _log_once(
+            "fast_fold_ineligible",
+            "KDA ReplaySSM fast fold requested but the pool layout does not fit "
+            "(state %s %s, rawv %s); keeping the Triton fold",
+            tuple(checkpoint_state.shape),
+            checkpoint_state.dtype,
+            rawv_cache.dtype,
+        )
+    return ok
+
+
+@functools.lru_cache(maxsize=None)
+def _jit_fast_fold(rows: int, stages: int, max_tok: int, threads: int, has_track: bool):
+    from sglang.kernels.jit.utils import load_jit
+
+    cls = (
+        f"sglang::kda_fold::KdaReplayFold<{rows}, {stages}, {max_tok}, {threads}, "
+        f"{str(has_track).lower()}>"
+    )
+    return load_jit(
+        "kda_replayssm_fold",
+        str(rows),
+        str(stages),
+        str(max_tok),
+        str(threads),
+        str(int(has_track)),
+        cuda_files=["mamba/kda_replayssm_fold.cuh"],
+        cuda_wrappers=[("run", f"{cls}::run")],
+    )
+
+
+def _commit_fast_fold(
+    checkpoint_state: torch.Tensor,
+    rawv_cache: torch.Tensor,
+    rawk_cache: torch.Tensor,
+    gk_cache: torch.Tensor,
+    beta_cache: torch.Tensor,
+    ssm_state_indices: torch.Tensor,
+    accept_lens: torch.Tensor,
+    mamba_track_indices: torch.Tensor | None,
+    mamba_steps_to_track: torch.Tensor | None,
+    null_block_id: int,
+) -> None:
+    has_track = mamba_track_indices is not None and mamba_steps_to_track is not None
+    device_index = checkpoint_state.device.index
+    module = _jit_fast_fold(
+        KDA_FAST_FOLD_ROWS,
+        KDA_FAST_FOLD_STAGES,
+        KDA_FAST_FOLD_MAX_TOK,
+        KDA_FAST_FOLD_THREADS,
+        has_track,
+    )
+    _log_once(
+        "fast_fold",
+        "KDA ReplaySSM commit: CUDA row fold (SGLANG_OPT_KDA_REPLAYSSM_FAST_FOLD, "
+        "%d rows x %d stages x %d threads, %d layers x %d heads, track=%s)",
+        KDA_FAST_FOLD_ROWS,
+        KDA_FAST_FOLD_STAGES,
+        KDA_FAST_FOLD_THREADS,
+        checkpoint_state.shape[0],
+        checkpoint_state.shape[2],
+        has_track,
+    )
+    module.run(
+        checkpoint_state,
+        rawv_cache,
+        rawk_cache,
+        gk_cache,
+        beta_cache,
+        ssm_state_indices,
+        accept_lens,
+        mamba_track_indices if has_track else ssm_state_indices,
+        mamba_steps_to_track if has_track else accept_lens,
+        int(null_block_id),
+        0,  # grid: every resident CTA
+        torch.cuda.current_stream(device_index).cuda_stream,
+    )
 
 
 @triton.jit
@@ -271,6 +409,22 @@ def commit_kda_replayssm_spec_all_layers(
     the same per-slot recurrent replay. ssm_state_indices / accept_lens / track
     are per-request and shared across layers.
     """
+    if use_qk_l2norm_in_kernel and _fast_fold_eligible(
+        checkpoint_state, rawv_cache, rawk_cache, gk_cache, beta_cache
+    ):
+        _commit_fast_fold(
+            checkpoint_state,
+            rawv_cache,
+            rawk_cache,
+            gk_cache,
+            beta_cache,
+            ssm_state_indices,
+            accept_lens,
+            mamba_track_indices,
+            mamba_steps_to_track,
+            null_block_id,
+        )
+        return
     num_layers, num_slots, HV, V, K = checkpoint_state.shape
     B = ssm_state_indices.shape[0]
     BK = triton.next_power_of_2(K)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -65,6 +66,13 @@ logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 _ENABLE_DSA_Q8KV8_BORN_FP8_Q = envs.SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q.get()
 _ENABLE_DSA_Q8KV8_QPREP_OVERLAP = envs.SGLANG_ENABLE_DSA_Q8KV8_QPREP_OVERLAP.get()
+# SGLANG_K31_DRAFT_SWA_INPLACE_Q (default off): sliding-window layers hand
+# the a2a / fi_a2a reduce strided [rows, heads, 512] partials (see
+# trtllm_mla_backend._forward_sliding_window); the pack reads them as is.
+_DRAFT_SWA_STRIDED_PARTIALS = os.environ.get(
+    "SGLANG_K31_DRAFT_SWA_INPLACE_Q", "0"
+).strip().lower() in ("1", "true", "yes", "on")
+_K31_DSA_PREFILL_ROW_SPLIT = envs.SGLANG_K31_DSA_PREFILL_ROW_SPLIT.get()
 
 from sglang.srt.model_executor.runner_utils.forward_batch import get_forward_batch
 from sglang.srt.model_executor.runner_utils.prefill_graph import (
@@ -202,6 +210,36 @@ class DeepseekMLAForwardMixin:
             # K3.1's sharded DSA prefill attends over the gathered KV instead
             or (self.use_dsa and mode.is_extend() and not dsa_shards_index_k())
         )
+
+    def _dsa_row_split_v_weights(
+        self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
+    ) -> Optional[torch.Tensor]:
+        # The DCP group's w_vc for a sharded-DCP DSA prefill whose backend may
+        # split the sparse MLA rows across the group (SGLANG_K31_DSA_PREFILL_ROW_SPLIT);
+        # the backend then returns this rank's heads already multiplied by w_vc.
+        if not (
+            _K31_DSA_PREFILL_ROW_SPLIT
+            and self.use_dsa
+            and getattr(self, "dcp_v_preproject", False)
+            and dsa_shards_index_k()
+            and self.current_attention_backend in ("dsa", "nsa")
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and self.w_vc is not None
+            and self.w_vc.dtype == torch.bfloat16
+            and not self.use_deep_gemm_bmm
+            and self.v_head_dim < self.kv_lora_rank
+            and not _SGLANG_EXPERIMENTAL_LORA_OPTI
+            and not is_kv_b_lora_active(self)
+            and not getattr(self, "_kimi_split_gguf_kv_b", False)
+            and not torch.cuda.is_current_stream_capturing()
+            and not is_in_prefill_graph_scope()
+            and not get_in_autotune_dummy_run()
+        ):
+            return None
+        weights = getattr(self, "_dcp_v_weights", None)
+        if weights is None:
+            weights = self._prepare_dcp_v_weights(get_parallel().dcp_group)
+        return weights
 
     def is_dcp_q_replicate_phase(
         self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
@@ -879,6 +917,7 @@ class DeepseekMLAForwardMixin:
         attention_output_gate: Optional[torch.Tensor] = None,
     ):
         save_kv_cache = not self._kv_cache_saved_early
+        row_split_v_weights = None
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             extra_args = {}
@@ -925,6 +964,9 @@ class DeepseekMLAForwardMixin:
                     ),
                 )
             else:
+                row_split_v_weights = self._dsa_row_split_v_weights(forward_batch)
+                if row_split_v_weights is not None:
+                    extra_args["dsa_row_split_v_weights"] = row_split_v_weights
                 attn_output = self.attn_mqa(
                     q_nope_out,
                     k_nope,
@@ -1026,8 +1068,12 @@ class DeepseekMLAForwardMixin:
                         )
                     else:
                         # A2A exchange of head partials + LSE, then local Triton combine.
-                        if not (self.use_dsa and dsa_shards_index_k()):
+                        if not (self.use_dsa and dsa_shards_index_k()) and not (
+                            _DRAFT_SWA_STRIDED_PARTIALS
+                            and self.attn_mqa_for_dcp_decode.sliding_window_size >= 0
+                        ):
                             # K3.1's DSA partials are strided views the pack reads as is
+                            # (so are a sliding-window draft's under SGLANG_K31_DRAFT_SWA_INPLACE_Q)
                             attn_output = attn_output.contiguous()
                             lse = lse.contiguous()
                         attn_output = dcp_a2a_lse_reduce(
@@ -1048,6 +1094,14 @@ class DeepseekMLAForwardMixin:
         if dcp_v_projected:
             return _finish_absorb_output(
                 self, attn_output.flatten(1, 2), attention_output_gate, topk_indices
+            )
+        if row_split_v_weights is not None and attn_output.shape[-1] == self.v_head_dim:
+            # The backend split the rows and returned w_vc-projected local heads.
+            return _finish_absorb_output(
+                self,
+                attn_output.reshape(-1, self.num_local_heads * self.v_head_dim),
+                attention_output_gate,
+                topk_indices,
             )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 

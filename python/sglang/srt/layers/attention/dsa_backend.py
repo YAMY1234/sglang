@@ -74,14 +74,25 @@ from sglang.srt.layers.attention.dsa.dsa_dcp import (
     localize_dcp_page_table,
 )
 from sglang.srt.layers.attention.dsa.dsa_dcp_sharded import (
+    dcp_fused_gather_rows,
+    dcp_fused_gather_supported,
     dcp_gather_request_rows,
     dcp_localize_compact,
+    dcp_row_gather_plan,
     init_dcp_candidate_all_gather,
     init_dcp_topk_merge,
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import DSAIndexerMetadata
 from sglang.srt.layers.attention.dsa.dsa_metadata_manager import (
     DSAMetadataManagementMixin,
+)
+from sglang.srt.layers.attention.dsa.dsa_prefill_row_split import (
+    heads_to_rows,
+    pynccl_exchange,
+    row_split_bounds,
+    row_split_passes,
+    row_split_weights,
+    rows_to_heads,
 )
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
@@ -127,6 +138,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_xpu,
+    print_info_once,
     print_warning_once,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -781,6 +793,22 @@ class DeepseekSparseAttnBackend(
             )
             self._prims_ts = PrimsTSSparseMLA(torch.device(self.device))
         self._trtllm_q_pad_graph: Optional[torch.Tensor] = None
+        # SGLANG_K31_DSA_PREFILL_ROW_SPLIT (dsa/dsa_prefill_row_split.py): an eager
+        # sharded-DCP prefill attends a block of rows per rank with the group's heads.
+        self._row_split = (
+            _is_cuda
+            and self.attn_dcp_size > 1
+            and not model_runner.is_draft_worker
+            and envs.SGLANG_K31_DSA_PREFILL_ROW_SPLIT.get()
+        )
+        self._row_split_min_rows = max(
+            self.attn_dcp_size, envs.SGLANG_K31_DSA_PREFILL_ROW_SPLIT_MIN_ROWS.get()
+        )
+        self._row_split_pass_rows = (
+            envs.SGLANG_K31_DSA_PREFILL_ROW_SPLIT_PASS_ROWS.get()
+        )
+        self._row_split_cache: tuple = (None, None, -1, None)
+        self._row_split_q_bufs: dict[tuple, torch.Tensor] = {}
         self.flashmla_kv_num_q_heads_prefill = _flashmla_kv_padded_heads(
             self.local_num_q_heads
         )
@@ -817,8 +845,12 @@ class DeepseekSparseAttnBackend(
         from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
             is_in_tc_piecewise_cuda_graph,
         )
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_is_capture_mode,
+        )
         from sglang.srt.utils import get_device_sm, is_blackwell
 
+        self._get_is_capture_mode = get_is_capture_mode
         self._is_in_breakable_cuda_graph = is_in_breakable_cuda_graph
         self._is_in_tc_piecewise_cuda_graph = is_in_tc_piecewise_cuda_graph
         self._get_device_sm = get_device_sm
@@ -1313,6 +1345,15 @@ class DeepseekSparseAttnBackend(
         # DCP prefill: the batch's KV rows from all ranks, request after request
         # in position order, padded to whole pages (the ragged top-k layout)
         rows = kv_cache.view(torch.uint8).view(-1, self.kv_cache_dim)
+        if dcp_fused_gather_supported(self.kv_cache_dim):
+            plan = dcp_row_gather_plan(forward_batch.seq_lens_cpu, rows.device)
+            gathered = rows.new_empty(
+                (plan.total + (-plan.total % self.physical_page_size), rows.shape[1])
+            )
+            dcp_fused_gather_rows(
+                [(rows, metadata.dcp_local_kv_rows)], plan, [gathered]
+            )
+            return gathered.view(kv_cache.dtype)
         gathered = dcp_gather_request_rows(
             rows[metadata.dcp_local_kv_rows], forward_batch.seq_lens_cpu
         )
@@ -2455,6 +2496,7 @@ class DeepseekSparseAttnBackend(
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
         attn_sink: Optional[torch.Tensor] = None,
+        dsa_row_split_v_weights: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
         causal = not layer.is_cross_attention
@@ -2502,6 +2544,7 @@ class DeepseekSparseAttnBackend(
                 llama_4_scaling,
                 is_prefill=True,
                 use_prims_ts=dsa_impl == "prims_ts",
+                row_split_v_weights=dsa_row_split_v_weights,
             )
 
         if k is not None:
@@ -4236,6 +4279,7 @@ class DeepseekSparseAttnBackend(
         llama_4_scaling: Optional[torch.Tensor] = None,
         is_prefill: bool = False,
         use_prims_ts: bool = False,
+        row_split_v_weights: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward using TRT-LLM sparse MLA kernel, or Prims-TS with use_prims_ts."""
         import flashinfer.decode
@@ -4434,6 +4478,29 @@ class DeepseekSparseAttnBackend(
 
         batch_size, num_heads, head_dim = q_all.shape
 
+        if (
+            self._row_split
+            and is_prefill
+            and not dcp_partial
+            and sparse_mla_top_k_lens is None
+            and seq_lens is not None
+        ):
+            passes = self._prefill_row_split_passes(forward_batch, batch_size)
+            if passes is not None:
+                return self._forward_trtllm_row_split(
+                    passes,
+                    q_all=q_all,
+                    kv_cache=kv_cache,
+                    page_table_1=page_table_1,
+                    seq_lens=seq_lens[:batch_size],
+                    sparse_mla_top_k=sparse_mla_top_k,
+                    layer=layer,
+                    bmm1_scale=bmm1_scale,
+                    k_scale=k_scale,
+                    use_prims_ts=use_prims_ts,
+                    v_weights=row_split_v_weights,
+                )
+
         if use_prims_ts:
             return self._forward_prims_ts(
                 q_all=q_all,
@@ -4560,6 +4627,145 @@ class DeepseekSparseAttnBackend(
                 [lse, lse.new_full((num_decode_padding_rows, lse.shape[1]), -torch.inf)]
             )
         return out, lse
+
+    def _prefill_row_split_passes(
+        self, forward_batch: ForwardBatch, num_rows: int
+    ) -> Optional[list]:
+        """Each DCP rank's rows per pass when this prefill splits its sparse MLA
+        by rows, else None; once per forward. Every input is identical on all
+        ranks of the group, so all take the same branch."""
+        metadata = self.forward_metadata
+        cached_batch, cached_metadata, cached_rows, passes = self._row_split_cache
+        if (
+            cached_batch is forward_batch
+            and cached_metadata is metadata
+            and cached_rows == num_rows
+        ):
+            return passes
+        passes = None
+        group = get_parallel().dcp_group
+        comm = group.pynccl_comm
+        if (
+            num_rows >= self._row_split_min_rows
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and forward_batch.seq_lens_cpu is not None
+            and forward_batch.extend_seq_lens_cpu is not None
+            and not dsa_use_prefill_cp(forward_batch)
+            # eager only: the exchange and the host-side bounds are not graphed
+            and not self._get_is_capture_mode()
+            and not torch.cuda.is_current_stream_capturing()
+            and not self._is_in_tc_piecewise_cuda_graph()
+            and not get_in_autotune_dummy_run()
+            and comm is not None
+            and comm.available
+        ):
+            cum = row_split_weights(
+                forward_batch.seq_lens_cpu,
+                forward_batch.extend_seq_lens_cpu,
+                num_rows,
+                self.dsa_index_topk,
+            )
+            bounds = row_split_bounds(cum, group.world_size)
+            passes = row_split_passes(bounds, self._row_split_pass_rows, cum)
+        self._row_split_cache = (forward_batch, metadata, num_rows, passes)
+        return passes
+
+    def _row_split_q_buffer(
+        self, rows: int, heads: int, dim: int, dtype: torch.dtype
+    ) -> torch.Tensor:
+        # Pad heads (trtllm-gen runs 96 as 128) are zeroed at allocation and
+        # never written; shared by every layer's passes.
+        key = (heads, dim, dtype)
+        buf = self._row_split_q_bufs.get(key)
+        if buf is None or buf.shape[0] < rows:
+            buf = torch.zeros((rows, heads, dim), dtype=dtype, device=self.device)
+            self._row_split_q_bufs[key] = buf
+        return buf
+
+    def _forward_trtllm_row_split(
+        self,
+        passes: list,
+        *,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+        seq_lens: torch.Tensor,
+        sparse_mla_top_k: int,
+        layer: RadixAttention,
+        bmm1_scale: float,
+        k_scale: float,
+        use_prims_ts: bool,
+        v_weights: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Sharded-DCP prefill attention with this rank's rows and the group's
+        heads (dsa/dsa_prefill_row_split.py). Returns this rank's heads of every
+        row: [rows, heads, kv_lora_rank], or [rows, heads, v_head_dim] already
+        multiplied by w_vc when v_weights (the group's w_vc) is given."""
+        import flashinfer.decode
+
+        group = get_parallel().dcp_group
+        rank, world = group.rank_in_group, group.world_size
+        local_heads = layer.tp_q_head_num
+        heads = local_heads * world
+        kernel_heads = heads if use_prims_ts else _trtllm_padded_heads(heads)
+        if v_weights is not None:
+            assert v_weights.shape[0] == heads, (v_weights.shape, heads)
+        q_local = q_all[:, :local_heads].contiguous()
+        rows, _, head_dim = q_local.shape
+        out_dim = self.kv_lora_rank if v_weights is None else v_weights.shape[-1]
+        out = torch.empty(
+            (rows, local_heads, out_dim), dtype=torch.bfloat16, device=q_all.device
+        )
+        q_buf = self._row_split_q_buffer(
+            max(segs[rank][1] - segs[rank][0] for segs in passes),
+            kernel_heads,
+            head_dim,
+            q_local.dtype,
+        )
+        exchange = pynccl_exchange(group.pynccl_comm, rank)
+        kv = kv_cache.view(-1, 1, self.physical_page_size, self.kv_cache_dim)
+        print_info_once(
+            "DSA prefill: sparse MLA rows split across the DCP group "
+            f"(dcp={world}, {heads} heads per rank, w_vc before the return "
+            f"trip: {v_weights is not None}; SGLANG_K31_DSA_PREFILL_ROW_SPLIT)"
+        )
+        for segs in passes:
+            lo, hi = segs[rank]
+            m = hi - lo
+            heads_to_rows(q_local, segs, rank, exchange, q_buf)
+            if m == 0:
+                o_rows = q_buf.new_empty(
+                    (0, kernel_heads, self.kv_lora_rank), dtype=torch.bfloat16
+                )
+            elif use_prims_ts:
+                o_rows, _ = self._prims_ts.forward(
+                    q=q_buf[:m],
+                    kv_cache=kv_cache,
+                    indices=page_table_1[lo:hi],
+                    lengths=torch.clamp(seq_lens[lo:hi], max=page_table_1.shape[1]),
+                    sm_scale=layer.scaling,
+                    kv_scale=k_scale,
+                )
+            else:
+                o_rows = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+                    query=q_buf[:m].view(m, 1, kernel_heads, head_dim),
+                    kv_cache=kv,
+                    workspace_buffer=self.workspace_buffer,
+                    qk_nope_head_dim=self.qk_nope_head_dim,
+                    kv_lora_rank=self.kv_lora_rank,
+                    qk_rope_head_dim=self.qk_rope_head_dim,
+                    block_tables=page_table_1[lo:hi].unsqueeze(1),
+                    seq_lens=seq_lens[lo:hi],
+                    max_seq_len=self.forward_metadata.max_seq_len_k,
+                    sparse_mla_top_k=sparse_mla_top_k,
+                    bmm1_scale=bmm1_scale,
+                    backend="trtllm-gen",
+                    skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+                    sparse_mla_top_k_lens=None,
+                    multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_for(m),
+                ).view(m, kernel_heads, -1)
+            rows_to_heads(o_rows, segs, rank, exchange, out, v_weights)
+        return out
 
     def _trtllm_q_fp8(
         self,
