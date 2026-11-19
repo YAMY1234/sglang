@@ -654,6 +654,28 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
                     cache._write_behind_clean_tokens, clean + tokens * credit
                 )
 
+    def test_hicache_l3_evict_uncovered_tokens(self):
+        self._require_host_only_l3_fixture()
+        ps = self.cfg.page_size
+        for exclusive in (False, True):
+            with self.subTest(exclusive=exclusive):
+                cache, pool = self._host_only_l3_fixture(exclusive=exclusive)
+                for i in range(1, 8):
+                    self._insert_host_page(cache, pool, 1000 * i)
+                # One evicted page is known stored; the other leaves L2 without an L3 copy.
+                cache._write_behind_clean_tokens = ps
+                self.assertEqual(cache.evict_host(2 * ps), 2 * ps)
+                self.assertEqual(
+                    cache._l3_tier_stats["wb_evict_uncovered_tokens"],
+                    ps if exclusive else 0,
+                )
+                self.assertEqual(cache._write_behind_clean_tokens, 0)
+                self.assertEqual(cache.evict_host(ps), ps)
+                self.assertEqual(
+                    cache._l3_tier_stats["wb_evict_uncovered_tokens"],
+                    2 * ps if exclusive else 0,
+                )
+
     def test_hicache_l3_belief_ttl_rewrites_a_page_the_store_may_have_dropped(self):
         self._require_host_only_l3_fixture()
         cache, pool = self._host_only_l3_fixture(exclusive=True)

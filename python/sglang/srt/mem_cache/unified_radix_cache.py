@@ -460,6 +460,8 @@ class UnifiedRadixCache(BasePrefixCache):
             "wb_issued_tokens": 0,
             "wb_clean_tokens": 0,
             "wb_unbacked_tokens": 0,
+            # Host evictions past the tail the walk knows is in storage: pages that left L2 without an L3 copy.
+            "wb_evict_uncovered_tokens": 0,
             "wb_mamba_walks": 0,
             "belief_rotations": 0,
             "wb_mamba_leaf_issued_tokens": 0,
@@ -1894,6 +1896,10 @@ class UnifiedRadixCache(BasePrefixCache):
         result = self.tree_core.drive_host_eviction(component_type, num_tokens)
         self._apply_eviction_result(result)
         evicted = result.tracker.get(component_type, 0)
+        if component_type == BASE_COMPONENT_TYPE and self._l3_write_on_host_evict:
+            self._l3_tier_stats["wb_evict_uncovered_tokens"] += max(
+                0, evicted - self._write_behind_clean_tokens
+            )
         if component_type == BASE_COMPONENT_TYPE and self._write_behind_clean_tokens:
             self._write_behind_clean_tokens = max(
                 0, self._write_behind_clean_tokens - evicted
