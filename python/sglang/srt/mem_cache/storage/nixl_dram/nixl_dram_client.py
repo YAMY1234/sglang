@@ -46,6 +46,7 @@ ERR_SPACE = -6  # put: no slot
 ERR_LEASE = -7  # put: written, but the reservation had expired
 ERR_BUSY = -8  # put: another writer had the key reserved and has not stored it
 ERR_VERIFY = -9  # get: the bytes read differ from the CRC32 recorded when the object was written
+_OP_LOG = os.environ.get("SGLANG_HICACHE_NIXL_DRAM_OP_LOG") == "1"
 
 EXTRA_PREFIX = "nixl_dram_"
 
@@ -1045,6 +1046,11 @@ class NixlDramClient:
         )
         t3 = time.perf_counter()
         self._time("get", len(keys), t3 - t0, rpc=(t1 - t0) + (t3 - t2), xfer=t2 - t1)
+        if _OP_LOG:  # one line per batch read, for latency percentiles and per-read GB/s
+            logger.info(
+                "HiCache NIXL DRAM L3 op get keys=%d got=%d bytes=%d total_ms=%.3f xfer_ms=%.3f services=%d",
+                len(keys), got, got_bytes, 1e3 * (t3 - t0), 1e3 * (t2 - t1), len(plans),
+            )
         if got and not self._first["get"]:
             self._first["get"] = True
             logger.info(
