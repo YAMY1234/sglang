@@ -79,6 +79,9 @@ class DropSubtreeNoHostResult(BaseEvictionResult):
 
 class DriveHostEvictionResult(BaseEvictionResult):
     mamba_storage_backup_node_id: Optional[NodeId] = None
+    # Write-back duplicate reclaim: host copies freed while their device copy stays
+    # (included in tracker).
+    duplicate_reclaimed_tokens: int = 0
 
 
 class DecSwaLockOnlyResult(BaseEvictionResult):

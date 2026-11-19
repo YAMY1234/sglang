@@ -851,7 +851,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             num_tokens,
             envs.SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM.get(),
         )
-        return self._fill_evict_result(binding_result, DriveHostEvictionResult())
+        result = self._fill_evict_result(binding_result, DriveHostEvictionResult())
+        result.duplicate_reclaimed_tokens = binding_result.duplicate_reclaimed_tokens
+        return result
 
     def set_l3_lifetime_ledger_enabled(self, enabled: bool) -> None:
         self._binding.set_l3_lifetime_ledger_enabled(enabled)

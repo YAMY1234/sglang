@@ -1991,6 +1991,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     result.host_frees,
                     cache_actions=result.cache_actions,
                 )
+                result.duplicate_reclaimed_tokens = result.tracker.get(
+                    component_type, 0
+                )
             comp.drive_host_eviction(
                 num_tokens,
                 result.tracker,

@@ -600,6 +600,9 @@ pub struct EvictionStepResult {
     pub swa_backup_num_tokens: usize,
     /// Actual host-state victim suspended before its storage backup.
     pub mamba_storage_backup_node_id: Option<NodeId>,
+    /// Driven-component tokens the write-back duplicate reclaim freed (host copies whose
+    /// device copy stays); included in `tracker`.
+    pub duplicate_reclaimed_tokens: usize,
 }
 
 /// wall_ns, event, node, component, tier, page/state keys, endpoint depth, cause.
@@ -3244,6 +3247,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     &mut result.host_frees,
                     &mut result.cache_actions,
                 );
+                result.duplicate_reclaimed_tokens = result.tracker[&component_type];
             }
             component.drive_host_eviction(
                 self,
