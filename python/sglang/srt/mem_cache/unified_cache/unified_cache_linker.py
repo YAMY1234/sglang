@@ -474,6 +474,8 @@ class UnifiedCacheLinkerWrapper:
     # SGLANG_LINKER_EARLY_READS (None: off): this stage's EarlyReads and its slab.
     early = None
     _early_slab = None
+    # Finish-path waits (ms) for staged loads still being queued, since the last stats line.
+    _finish_wait_ms: tuple = ()
 
     # Async admission: the relayed verdict of a skipped hit, and the passes in a
     # row after which its pre-pin goes ahead of the window and is held until
@@ -1416,6 +1418,7 @@ class UnifiedCacheLinkerWrapper:
         if self.pp_rank == 0:
             early.send = channel.send
         self._early_slab, self._early_channel, self.early = slab, channel, early
+        self._finish_wait_ms = []
 
     def _early_plan(self, hashes: list[str]) -> dict:
         transfers = [
@@ -1667,8 +1670,12 @@ class UnifiedCacheLinkerWrapper:
         if self.timeline is not None:
             logger.info("Linker prefetch timeline (ms): %s", self.timeline.summary())
             if self.early is not None:
-                logger.info("Linker early reads: %s, slab free %s", dict(self.early.counts),
-                            {str(k): len(v) for k, v in self._early_slab.free.items()})
+                waits = sorted(self._finish_wait_ms)
+                self._finish_wait_ms = []
+                pick = lambda q: waits[min(len(waits) - 1, int(q * len(waits)))] if waits else 0.0
+                logger.info("Linker early reads: %s, slab free %s; finish waits n=%d p50 %.1f p99 %.1f max %.1f ms",
+                            dict(self.early.counts), {str(k): len(v) for k, v in self._early_slab.free.items()},
+                            len(waits), pick(0.5), pick(0.99), waits[-1] if waits else 0.0)
         waits = sorted(self._requery_waits)
         self._requery_waits.clear()
         p50, p90 = (
@@ -1856,9 +1863,7 @@ class UnifiedCacheLinkerWrapper:
             # indices on the staging thread); wait for that, counted.
             waited = time.perf_counter()
             state.future.result(timeout=120)
-            waited = (time.perf_counter() - waited) * 1e3
-            self.early.counts["finish_waits"] = self.early.counts.get("finish_waits", 0) + 1
-            self.early.counts["finish_wait_ms_max"] = max(self.early.counts.get("finish_wait_ms_max", 0), round(waited))
+            self._finish_wait_ms.append((time.perf_counter() - waited) * 1e3)
         # Event polling or reset/close has already quiesced every device writer.
         if state.future is not None:
             assert state.future.done()
