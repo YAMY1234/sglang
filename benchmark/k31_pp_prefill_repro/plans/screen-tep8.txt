@@ -1,0 +1,14 @@
+# TEP8+DCP8 DSA backend screen (not part of the result): prims_ts, then trtllm, same 5-min point.
+# Rule fixed in advance: use prims_ts only if its new tok/s > 1.02 x trtllm with no failed request; else trtllm.
+boot tep8-prims
+probe W128_90 2
+probe W32_0 1
+flush
+warm W128_90
+closed W128_90 64 45 240 screen-prims
+restart tep8
+probe W128_90 2
+probe W32_0 1
+flush
+warm W128_90
+closed W128_90 64 45 240 screen-trtllm

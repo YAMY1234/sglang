@@ -1,0 +1,23 @@
+# Main bench, PP8 arm. Order fixed in advance: boot 1: H1, H2, TTFT, S32a; boot 2: H3, S32b.
+# W128_90: 128k-token requests, 89.8% shared prefix (16 prefixes), closed loop c64, 45 s lead + 900 s window.
+# W32_0:   32k-token requests, no shared prefix, closed loop c32, 45 s lead + 300 s window.
+# TTFT:    Poisson at 3.246 req/s (= 0.7 x min(arm saturation) / 13,312 new tokens per request), same for both arms.
+boot pp8
+probe W128_90 1
+flush
+warm W128_90
+closed W128_90 64 45 900 H1
+flush
+warm W128_90
+closed W128_90 64 45 900 H2
+flush
+warm W128_90
+poisson W128_90 3.246 45 900 TTFT
+flush
+closed W32_0 32 45 300 S32a
+restart pp8
+flush
+warm W128_90
+closed W128_90 64 45 900 H3
+flush
+closed W32_0 32 45 300 S32b

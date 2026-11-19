@@ -1,0 +1,3 @@
+# PHASE NSYS_DELAY_S NSYS_DUR_S PYSPY_DELAY_S PYSPY_DUR_S  (seconds from the phase start; its window starts at +45)
+P128 240 14 340 60
+P32 150 14 0 0

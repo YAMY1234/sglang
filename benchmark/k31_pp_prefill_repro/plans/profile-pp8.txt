@@ -1,0 +1,9 @@
+# Profile run (not counted): same workload and point as the bench. nsys records 14 s inside the P128 window;
+# the unprofiled part of the window before it is the reference for profiler overhead. See profile.sched.
+boot pp8
+probe W128_90 1
+flush
+warm W128_90
+closed W128_90 64 45 420 P128
+flush
+closed W32_0 32 45 300 P32
