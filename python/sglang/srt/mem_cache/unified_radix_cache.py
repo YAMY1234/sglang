@@ -2654,6 +2654,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def linker_attach_relay_store(self, store) -> None:
         if self.linker_prefetch_mode and self.linker.pp_relay is not None:
             self.linker.pp_relay.attach_store(store)
+            self.linker.attach_early_reads()
 
     def linker_take_actions(self):
         """PP0: the prefetch relay's actions to send with this round."""

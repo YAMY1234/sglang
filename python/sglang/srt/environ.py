@@ -1094,6 +1094,12 @@ class Envs:
     # Prefetch mode: the direct linker's store reads and writes run in a helper
     # process (mooncake_store/linker_helper.py); needs a VMM KV pool
     # (SGLANG_MOONCAKE_CUSTOM_MEM_POOL). Its store client's own segment (MB) and threads.
+    # Prefetch mode under PP: every stage reads a looked-up prefix into pinned
+    # host staging as soon as PP0's lookup lands and votes early (pp_linker_relay.py,
+    # mooncake_store/linker_staging.py); slots for KV pages and for states.
+    SGLANG_LINKER_EARLY_READS = EnvBool(False)
+    SGLANG_LINKER_EARLY_PAGES = EnvInt(67200)
+    SGLANG_LINKER_EARLY_STATES = EnvInt(24)
     SGLANG_LINKER_HELPER = EnvBool(False)
     SGLANG_LINKER_HELPER_SEGMENT_MB = EnvInt(0)
     SGLANG_LINKER_HELPER_THREADS = EnvInt(4)

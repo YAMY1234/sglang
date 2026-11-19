@@ -471,6 +471,9 @@ class UnifiedCacheLinkerWrapper:
     """Drives an external KV store on behalf of one :class:`UnifiedRadixCache`."""
     # SGLANG_LINKER_PREFETCH_TIMELINE recorder (None: off); class default for test doubles.
     timeline: Optional["_PrefetchTimeline"] = None
+    # SGLANG_LINKER_EARLY_READS (None: off): this stage's EarlyReads and its slab.
+    early = None
+    _early_slab = None
 
     # Async admission: the relayed verdict of a skipped hit, and the passes in a
     # row after which its pre-pin goes ahead of the window and is held until
@@ -1393,6 +1396,43 @@ class UnifiedCacheLinkerWrapper:
             if transfer.name == PoolName.MAMBA and transfer.device_indices is not None
         )
 
+    def attach_early_reads(self) -> None:
+        """SGLANG_LINKER_EARLY_READS: every PP stage, at its PP loop start (the
+        channel's address goes out over the PP group, a collective)."""
+        if not envs.SGLANG_LINKER_EARLY_READS.get() or self.pp_relay is None:
+            return
+        linker = self.cache_linker
+        if not hasattr(linker, "prefetch_from_staging") or self.cache.tp_world_size != 1:
+            logger.warning("SGLANG_LINKER_EARLY_READS needs the Mooncake direct linker and one TP rank per stage; off")
+            return
+        from sglang.srt.mem_cache.storage.mooncake_store.linker_staging import EarlyChannel, EarlyReads
+        from sglang.srt.runtime_context import get_parallel
+
+        slab = linker.staging_slab(
+            envs.SGLANG_LINKER_EARLY_PAGES.get(), envs.SGLANG_LINKER_EARLY_STATES.get()
+        )
+        early = EarlyReads(slab, self._early_plan, linker.early_read)
+        channel = EarlyChannel(self.pp_rank, get_parallel().pp_group, on_message=early.start)
+        if self.pp_rank == 0:
+            early.send = channel.send
+        self._early_slab, self._early_channel, self.early = slab, channel, early
+
+    def _early_plan(self, hashes: list[str]) -> dict:
+        transfers = [
+            c.build_external_linker_transfer(LinkerTransferPhase.LOOKUP, None, hashes)
+            for c in self._components
+        ]
+        return self.cache_linker.early_objects(transfers)
+
+    def _start_prefetch_from_staging(self, request, *args, staged) -> None:
+        """The relay's load with a landed early read: as _start_prefetch_load, the
+        private slots filled from staging. A load refused here (caps) is refused on
+        every stage at this pass; its staging is freed."""
+        self._start_prefetch_load(request, *args, staged=staged)
+        state = self.prefetches.get(request)
+        if state is None or state.future is None:
+            self.early.release(staged)
+
     def _start_prefetch_load(
         self,
         request: CacheRequestHandle,
@@ -1403,6 +1443,7 @@ class UnifiedCacheLinkerWrapper:
         anchor_lock: DecLockRefParams,
         restorable: list[int],
         timeout_s: float,
+        staged=None,
     ) -> None:
         """Agree on the restorable prefix across ranks and queue its load."""
         page = self.cache.page_size
@@ -1454,9 +1495,13 @@ class UnifiedCacheLinkerWrapper:
                     break
                 state.component_transfers.append((component, transfer))
             if len(state.component_transfers) == len(self._components):
-                state.future = self.cache_linker.prefetch(
-                    [t for _, t in state.component_transfers]
-                )
+                transfers = [t for _, t in state.component_transfers]
+                if staged is not None:
+                    state.future = self.cache_linker.prefetch_from_staging(
+                        transfers, staged, self._early_slab, self.early.release
+                    )
+                else:
+                    state.future = self.cache_linker.prefetch(transfers)
                 if self.timeline is not None and state.future is not None:
                     timeline = self.timeline
                     state.future.add_done_callback(
@@ -1621,6 +1666,9 @@ class UnifiedCacheLinkerWrapper:
         self._lookup_next_log = now + 60.0
         if self.timeline is not None:
             logger.info("Linker prefetch timeline (ms): %s", self.timeline.summary())
+            if self.early is not None:
+                logger.info("Linker early reads: %s, slab free %s", dict(self.early.counts),
+                            {str(k): len(v) for k, v in self._early_slab.free.items()})
         waits = sorted(self._requery_waits)
         self._requery_waits.clear()
         p50, p90 = (
@@ -1805,6 +1853,10 @@ class UnifiedCacheLinkerWrapper:
         # Event polling or reset/close has already quiesced every device writer.
         if state.future is not None:
             assert state.future.done()
+            copy_event = getattr(state.future, "copy_event", None)
+            if copy_event is not None:
+                # Staged load: the forward (or a reuse of freed slots) runs after the scatter.
+                torch.cuda.current_stream().wait_event(copy_event)
         end = len(state.key)
         try:
             if not publish:

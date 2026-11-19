@@ -972,6 +972,106 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     f"error code: {result}."
                 )
 
+    # ---- SGLANG_LINKER_EARLY_READS: staged reads (linker_staging.py) -----------------
+
+    def staging_slab(self, pages: int, states: int):
+        """A pinned host slab of object slots, registered with the store: ``states``
+        for the state pool (MAMBA), ``pages`` for every other pool."""
+        from sglang.srt.mem_cache.storage.mooncake_store.linker_staging import StagingSlab
+
+        pools = {
+            name: (self.object_bytes[name], states if name == PoolName.MAMBA else pages)
+            for name in self.pool_group.sources
+        }
+        size = StagingSlab.size_of(pools)
+        buffer = torch.empty(size, dtype=torch.uint8, pin_memory=True)
+        rc = self.storage.store.register_buffer(buffer.data_ptr(), size)
+        if rc not in (0, None):
+            raise RuntimeError(f"early-read staging registration failed: {rc}")
+        self._early_executor = ThreadPoolExecutor(2, thread_name_prefix="mooncake-early")
+        self._staging_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+        logger.info("Mooncake linker early-read staging: %.1f GB pinned, %s", size / 2**30,
+                    {str(k): v for k, v in pools.items()})
+        return StagingSlab(pools, buffer, buffer.data_ptr())
+
+    def early_objects(self, transfers) -> dict:
+        """{physical pool: (object keys, object bytes)} of LOOKUP-phase transfers
+        (keys only), as a read of them would take them."""
+        by_name = {t.name: t for t in transfers if t is not None}
+        out = {}
+        for name, source in self.pool_group.sources.items():
+            transfer = by_name.get(source)
+            if transfer is None or not transfer.keys:
+                continue
+            keys, _ = self.storage._get_hybrid_page_component_keys(
+                list(transfer.keys), PoolTransfer(name=name)
+            )
+            out[name] = (self.storage._tag_keys(keys), self.object_bytes[name])
+        return out
+
+    def early_read(self, keys_by_pool: dict, ptrs_by_pool: dict):
+        return self._early_executor.submit(self._early_read, keys_by_pool, ptrs_by_pool)
+
+    def _early_read(self, keys_by_pool: dict, ptrs_by_pool: dict) -> bool:
+        keys, ptrs, sizes = [], [], []
+        for name, names in keys_by_pool.items():
+            keys += names
+            ptrs += [int(p) for p in ptrs_by_pool[name]]
+            sizes += [self.object_bytes[name]] * len(names)
+        if self.sessions.start(keys) != [0] * len(keys):
+            return False
+        try:
+            got = list(self.storage.store.batch_get_into(keys, ptrs, sizes))
+        finally:
+            self.sessions.end(keys)
+        return got == sizes
+
+    def prefetch_from_staging(self, transfers, staged, slab, release):
+        """Prefetch mode with a landed early read: fill the request's private slots
+        from its staged objects (one scatter on the staging stream) instead of a
+        store read. The future resolves True once the scatter is queued; its
+        ``copy_event`` orders any use (or reuse) of the slots after it, and the
+        staging slots are released once the event completes."""
+        from concurrent.futures import Future
+
+        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import coalesce_key_range_table
+        from sglang.srt.mem_cache.storage.mooncake_store.linker_staging import gpu_scatter, scatter_plan
+
+        if self.cpu_indices:
+            transfers = attach_cpu_indices(transfers)
+        expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True, allow_missing_kv=True)
+        ready = device_module.Event()
+        ready.record()
+        future: Future = Future()
+
+        def run():
+            ready.synchronize()
+            plans = []
+            for transfer in expanded:
+                entry = self.pools[transfer.name]
+                table = getattr(entry, "_coalesced_table", None)
+                full = entry.key_range_table(self.num_layers)
+                if table is None or table[0] is not full:
+                    table = (full, coalesce_key_range_table(full))
+                    entry._coalesced_table = table
+                rows = entry.key_range_rows(entry.prepare_locations(transfer.host_indices))
+                plans.append(scatter_plan(table[1], rows, slab.ptrs(transfer.name, staged.slots[transfer.name])))
+            done = gpu_scatter(plans, self._staging_stream)
+            future.copy_event = done
+            future.set_result(True)
+            done.synchronize()
+            release(staged)
+
+        def failed(f):
+            if f.exception() is not None:
+                # PP0 may already have published this read on the stage's early
+                # vote: continuing would leave this stage's tree behind the others.
+                logger.critical("Early-read staging load failed after its vote", exc_info=f.exception())
+                os._exit(1)
+
+        self._early_executor.submit(run).add_done_callback(failed)
+        return future
+
     def _start_helper(self):
         """SGLANG_LINKER_HELPER: start the store I/O helper (None: not supported here)."""
         from sglang.srt.mem_cache.storage.mooncake_store.linker_helper import (

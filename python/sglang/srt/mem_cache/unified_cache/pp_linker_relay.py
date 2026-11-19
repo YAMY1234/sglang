@@ -11,6 +11,14 @@ change to fit this tree:
   SGLANG_PP_PD_PREFILL_RELEASE_RELAY). PP0's actions ride the request relay and
   every stage, PP0 included, applies them as it receives them, before its
   admission pass, so all stages see the same phase at the same pass.
+
+SGLANG_LINKER_EARLY_READS (``wrapper.early``): when PP0 issues a load it also
+publishes the lookup out of band; every stage reads its objects into pinned host
+staging at once and posts an early vote (landed only) keyed by (epoch, cycle),
+which is the same on every stage. PP0 counts a stage's early vote in place of its
+normal one, so the finish no longer waits for the request to reach the last
+stage. A stage applies the load from its staging when (epoch, cycle, pages)
+match, otherwise as before; the load and finish still apply in relay order.
 """
 
 from dataclasses import dataclass, field
@@ -110,11 +118,18 @@ class PPLinkerRelay:
     def _key(self, entry):
         return f"lk{self.epoch}:{entry.cycle}"
 
+    def _early_key(self, epoch, cycle):
+        return f"lke{epoch}:{cycle}"
+
     def report(self):
         """Every stage: vote on each read that finished here."""
         if self.store is None:
             return
         w = self.w
+        early = getattr(w, "early", None)
+        if early is not None:
+            for epoch, cycle in early.take_landed():
+                self.store[self._early_key(epoch, cycle)] = _LANDED
         for handle, entry in self.entries.items():
             if entry.phase != "load" or entry.voted is not None:
                 continue
@@ -292,10 +307,16 @@ class PPLinkerRelay:
             assert entry.phase == "lookup"
             entry.pending = False
             lookup = w.lookups.pop(handle, None)
+            early = getattr(w, "early", None)
+            staged = (
+                early.take(self.epoch, entry.cycle, value)
+                if early is not None and value and lookup is not None
+                else None
+            )
             if value and lookup is not None:
                 w._draining_lookups = True
                 try:
-                    w._start_prefetch_load(
+                    args = (
                         handle,
                         lookup.key,
                         lookup.hashes,
@@ -305,6 +326,10 @@ class PPLinkerRelay:
                         [value],
                         lookup.timeout_s,
                     )
+                    if staged is not None:
+                        w._start_prefetch_from_staging(*args, staged=staged)
+                    else:
+                        w._start_prefetch_load(*args)
                 finally:
                     w._draining_lookups = False
                 entry.tokens = value * w.cache.page_size
@@ -324,11 +349,13 @@ class PPLinkerRelay:
                 w.timeline.mark(handle, "ready")
             if entry.voted is not None and self.store is not None:
                 self.store.pop(self._key(entry))
+            self._drop_early(entry)
             entry.phase = "ready"
         elif op == "stop":
             if entry.phase != "ready":
                 entry.stopped = True
                 w._cancel_prefetch(handle, "stopped")
+                self._drop_early(entry)
         else:
             raise AssertionError(op)
         if entry.phase == "ready" and entry.released:
@@ -375,10 +402,15 @@ class PPLinkerRelay:
                 if w.timeline is not None:
                     w.timeline.mark(handle, "load_issued")
                 self._issue(handle, entry, "load", pages)
+                early = getattr(w, "early", None)
+                if early is not None and pages:
+                    early.publish(self.epoch, entry.cycle, handle, lookup, pages)
             elif entry.phase == "load":
-                if entry.voted is None:
-                    continue
                 votes = self.store.collect(self._key(entry))
+                if getattr(w, "early", None) is not None:
+                    # A stage's early vote (landed only) stands in for its normal one.
+                    early = self.store.collect(self._early_key(self.epoch, entry.cycle))
+                    votes = [e if e is not None else v for e, v in zip(early, votes)]
                 if any(v is None for v in votes):
                     continue
                 publish = (
@@ -389,6 +421,15 @@ class PPLinkerRelay:
                 if w.timeline is not None:
                     w.timeline.mark(handle, "finish_issued")
                 self._issue(handle, entry, "finish", publish)
+
+    def _drop_early(self, entry):
+        """This request's early vote (this stage's) and unconsumed staging."""
+        early = getattr(self.w, "early", None)
+        if early is None:
+            return
+        early.drop(self.epoch, entry.cycle)
+        if self.store is not None:
+            self.store.pop(self._early_key(self.epoch, entry.cycle))
 
     def progress(self, handle, stop_due):
         """Admission: True once ``handle`` needs no more waiting. The answer
@@ -415,7 +456,13 @@ class PPLinkerRelay:
                 if not ok:
                     self.store.pop(self._offload_key(self.offload_head + i))
             self.store.pop(f"lkoc{self.epoch}")
+        early = getattr(self.w, "early", None)
+        if early is not None and self.store is not None:
+            for entry in self.entries.values():
+                self.store.pop(self._early_key(self.epoch, entry.cycle))
         self.epoch += 1
+        if early is not None:
+            early.reset(self.epoch)
         self.serial = self.issued = 0
         self._ack_posted = None
         self.offload_serial = self.offload_issued = 0

@@ -1359,5 +1359,125 @@ class TestLinkerHelper(CustomTestCase):
             shm.unlink()
 
 
+
+class TestLinkerStaging(CustomTestCase):
+    """SGLANG_LINKER_EARLY_READS: pinned-host staging of looked-up objects, the
+    scatter into a request's device rows, and the per-stage entry lifecycle."""
+
+    def test_scatter_plan_restores_the_device_rows_of_staged_objects(self):
+        import ctypes
+
+        from sglang.srt.mem_cache.storage.mooncake_store.linker_staging import (
+            StagingSlab,
+            cpu_scatter,
+            scatter_plan,
+        )
+
+        pool, (kv0, kv2, ix) = _merged_pool(lambda shape: torch.zeros(shape, dtype=torch.uint8))
+        for i, t in enumerate((kv0, kv2, ix)):
+            t.copy_(torch.randint(0, 255, t.shape, dtype=torch.uint8) + i)
+        table = pool.key_range_table(3)
+        obj_bytes = int((table[:, 3] + table[:, 4]).max())
+        src_rows = pool.key_range_rows(pool.prepare_locations(torch.tensor([2, 3, 6, 7])))
+        dst_idx = torch.tensor([0, 1, 4, 5])
+        dst_rows = pool.key_range_rows(pool.prepare_locations(dst_idx))
+        want = [kv0[[2, 3, 6, 7]].clone(), kv2[[2, 3, 6, 7]].clone(), ix[[1, 3]].clone()]
+        buf = np.zeros(StagingSlab.size_of({"kv": (obj_bytes, 4)}), dtype=np.uint8)
+        slab = StagingSlab({"kv": (obj_bytes, 4)}, buf, buf.ctypes.data)
+        slots = slab.alloc({"kv": 2})["kv"]
+        ptrs = slab.ptrs("kv", slots)
+        # The store object of each page, as the per-key read lays it out: item j at its offset.
+        _, base, stride, size, offset = table.T
+        for row, ptr in zip(src_rows, ptrs):
+            for j in range(len(table)):
+                ctypes.memmove(int(ptr + offset[j]), int(base[j] + row[table[j, 0]] * stride[j]), int(size[j]))
+        for t, rows in ((kv0, [0, 1, 4, 5]), (kv2, [0, 1, 4, 5]), (ix, [0, 2])):
+            t[rows] = 0
+        cpu_scatter(*scatter_plan(table, dst_rows, ptrs))
+        self.assertTrue(torch.equal(kv0[[0, 1, 4, 5]], want[0]))
+        self.assertTrue(torch.equal(kv2[[0, 1, 4, 5]], want[1]))
+        self.assertTrue(torch.equal(ix[[0, 2]], want[2]))
+        self.assertIsNone(slab.alloc({"kv": 3}))  # all or nothing: 2 of 4 slots left
+        slab.release({"kv": slots})
+        self.assertEqual(len(slab.free["kv"]), 4)
+
+    def test_early_reads_vote_once_never_block_and_release_every_slot(self):
+        from concurrent.futures import Future
+
+        from sglang.srt.mem_cache.storage.mooncake_store.linker_staging import (
+            EarlyMessage,
+            EarlyReads,
+            StagingSlab,
+        )
+
+        buf = np.zeros(StagingSlab.size_of({"kv": (8, 4)}), dtype=np.uint8)
+        slab = StagingSlab({"kv": (8, 4)}, buf, buf.ctypes.data)
+        reads = []
+
+        def read(keys, ptrs):
+            reads.append(Future())
+            return reads[-1]
+
+        early = EarlyReads(slab, lambda hashes: {"kv": ([f"k{h}" for h in hashes], 8)}, read)
+        early.start(EarlyMessage(0, 1, "a", ["h1", "h2"]))
+        early.start(EarlyMessage(0, 2, "b", ["h3", "h4"]))
+        early.start(EarlyMessage(0, 3, "c", ["h5"]))  # slab full: not staged, no read
+        self.assertEqual((len(reads), early.counts["full"]), (2, 1))
+        reads[0].set_result(True)
+        self.assertEqual(early.take_landed(), [(0, 1)])
+        self.assertEqual(early.take_landed(), [])  # voted once
+        entry = early.take(0, 1, 2)
+        self.assertIsNotNone(entry)
+        # Cycle 2 is still reading when its load applies: today's read is used, and
+        # the staged read, landing later, is released and never voted.
+        self.assertIsNone(early.take(0, 2, 2))
+        reads[1].set_result(True)
+        self.assertEqual(early.take_landed(), [])
+        early.release(entry)
+        self.assertEqual(len(slab.free["kv"]), 4)
+        # A failed read is not voted; a reset drops older epochs.
+        early.start(EarlyMessage(0, 4, "d", ["h6"]))
+        reads[2].set_result(False)
+        self.assertEqual((early.take_landed(), early.counts["failed"]), ([], 1))
+        early.start(EarlyMessage(0, 5, "e", ["h7"]))
+        reads[3].set_result(True)
+        early.reset(1)
+        self.assertEqual((early.take_landed(), len(slab.free["kv"])), ([], 4))
+        early.start(EarlyMessage(0, 6, "f", ["h8"]))  # an older epoch's message is ignored
+        self.assertEqual(len(reads), 4)
+
+    def test_early_channel_delivers_from_pp0_to_a_stage(self):
+        import threading
+        import time
+
+        from sglang.srt.mem_cache.storage.mooncake_store.linker_staging import EarlyChannel, EarlyMessage
+
+        got, seen = [], threading.Event()
+        info = {}
+
+        class _Group:
+            def __init__(self, rank):
+                self.rank = rank
+
+            def broadcast_object(self, obj, src=0):
+                if self.rank == 0:
+                    info["addr"] = obj
+                return info["addr"]
+
+        with patch("sglang.srt.utils.network.get_local_ip_auto", return_value="127.0.0.1"):
+            pp0 = EarlyChannel(0, _Group(0))
+            pp1 = EarlyChannel(1, _Group(1), on_message=lambda m: (got.append(m), seen.set()))
+        try:
+            msg = EarlyMessage(3, 7, "rid", ["h1", "h2"])
+            for _ in range(50):  # a SUB socket joins asynchronously
+                pp0.send(msg)
+                if seen.wait(0.1):
+                    break
+            self.assertEqual(got[0], msg)
+        finally:
+            pp0.close()
+            pp1.close()
+
+
 if __name__ == "__main__":
     unittest.main()

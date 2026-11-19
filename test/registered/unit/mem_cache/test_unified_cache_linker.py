@@ -3221,6 +3221,47 @@ class _RelayWrapper:
         if state is not None:
             state.discard = True
 
+    def _start_prefetch_from_staging(self, handle, key, hashes, start, anchor, lock, restorable, timeout, staged):
+        self.started.append((handle, restorable, "staged", staged))
+        future = Future()
+        future.set_result(True)  # the H2D copy is queued on the stream: landed for the vote
+        self.prefetches[handle] = SimpleNamespace(future=future, discard=False, abort_reason=None)
+
+
+class _EarlyStub:
+    """SGLANG_LINKER_EARLY_READS stand-in: what PP0 published, which staged reads
+    landed (the test lands them), staging taken / dropped by (epoch, cycle)."""
+
+    def __init__(self):
+        self.published, self.landed, self.dropped = [], [], []
+        self.staged = {}
+        self.epoch = 0
+
+    def publish(self, epoch, cycle, handle, lookup, pages):
+        self.published.append((epoch, cycle, handle, pages))
+
+    def land(self, epoch, cycle, pages):
+        self.staged[(epoch, cycle)] = (pages, f"slab-{cycle}")
+        self.landed.append((epoch, cycle))
+
+    def take_landed(self):
+        out, self.landed = self.landed, []
+        return out
+
+    def take(self, epoch, cycle, pages):
+        staged = self.staged.get((epoch, cycle))
+        if staged is None or staged[0] != pages:
+            return None
+        return self.staged.pop((epoch, cycle))[1]
+
+    def drop(self, epoch, cycle):
+        self.staged.pop((epoch, cycle), None)
+        self.dropped.append((epoch, cycle))
+
+    def reset(self, epoch):
+        self.staged.clear()
+        self.epoch = epoch
+
 
 def _relay_stages(size=2):
     maps = [{} for _ in range(size)]
@@ -3317,6 +3358,79 @@ def test_pp_prefetch_relay_stop_ends_the_wait_on_every_stage_in_order():
     _relay_round(stages)
     _relay_round(stages)
     assert [w.finished for _, w in stages] == [[(handle, False)]] * 2
+
+
+def _early_stages(size=2):
+    stages = _relay_stages(size)
+    for _, wrapper in stages:
+        wrapper.early = _EarlyStub()
+    return stages
+
+
+def test_pp_early_votes_finish_before_the_request_reaches_the_last_stage():
+    stages = _early_stages()
+    (pp0, w0), (pp1, w1) = stages
+    handle = _Handle("a")
+    _queue_lookup(stages[:1], handle, [1, 3])  # stage 1 has not received the request yet
+    _relay_round(stages)
+    assert w0.early.published == [(0, 1, handle, 3)]
+    assert w0.started == [(handle, [3])] and w1.started == [] and pp1.inbox
+    # Both stages land their staged reads; stage 1 still has no request.
+    w0.early.land(0, 1, 3)
+    w1.early.land(0, 1, 3)
+    w0.prefetches[handle].future.set_result(True)
+    _relay_round(stages)
+    assert w0.finished == [(handle, True)] and w1.finished == []
+    # The request reaches stage 1: its load (from staging) and the finish apply in order.
+    _queue_lookup(stages[1:], handle, None)
+    pp1.receive([])
+    assert w1.started == [(handle, [3], "staged", "slab-1")]
+    assert w1.finished == [(handle, True)] and not pp1.inbox
+    assert _progress(stages, handle) == [True, True]
+    _relay_round(stages)
+    # Every early vote and normal vote of the finished read left the store.
+    assert all(not relay.store.maps[rank] for rank, (relay, _) in enumerate(stages))
+
+
+def test_pp_early_read_failure_falls_back_to_the_stage_read_and_its_vote():
+    stages = _early_stages()
+    (pp0, w0), (pp1, w1) = stages
+    handle = _Handle("a")
+    _queue_lookup(stages, handle, [2])
+    _relay_round(stages)
+    w0.early.land(0, 1, 2)  # stage 1's early read failed: it posts nothing
+    _relay_round(stages)
+    assert w1.started == [(handle, [2])]  # no staging: today's read
+    assert [w.finished for _, w in stages] == [[], []]
+    w1.prefetches[handle].future.set_result(True)
+    _relay_round(stages)
+    assert [w.finished for _, w in stages] == [[(handle, True)]] * 2
+
+
+def test_pp_early_staging_is_used_only_for_the_issued_pages():
+    stages = _early_stages()
+    (pp0, w0), (pp1, w1) = stages
+    handle = _Handle("a")
+    w1.early.staged[(0, 1)] = (2, "slab-stale")  # staged for another page count
+    _queue_lookup(stages, handle, [3])
+    _relay_round(stages)
+    assert w1.started == [(handle, [3])] and (0, 1) in w1.early.staged
+
+
+def test_pp_early_stop_and_reset_drop_staging_and_votes():
+    stages = _early_stages()
+    (pp0, w0), (pp1, w1) = stages
+    handle = _Handle("a")
+    _queue_lookup(stages, handle, [3])
+    _relay_round(stages)
+    w1.early.land(0, 1, 3)
+    pp0.progress(handle, lambda h: True)  # PP0's stop policy fires
+    _relay_round(stages)
+    assert all((0, 1) in w.early.dropped for _, w in stages)
+    assert all(not relay.store.maps[rank] for rank, (relay, _) in enumerate(stages))
+    for relay, w in stages:
+        relay.reset()
+        assert w.early.epoch == 1
 
 
 def test_pp_prefetch_relay_settles_a_request_with_nothing_to_look_up():
