@@ -1653,11 +1653,9 @@ class SchedulerDisaggregationPrefillMixin:
         the result's radix checkpoint (dedup) or abort release may free their pages."""
         defer = envs.SGLANG_PP_PD_DEFER_EARLY_SETTLE.get()
         for req in batch.reqs:
-            if (
-                defer
-                and req.rid in self.disagg_prefill_early_sent_rids
-                and not self._early_send_ended(req)
-            ):
+            # Decided from early-send membership only, never this stage's transfer status:
+            # every PP/TP rank must defer the same checkpoint frees, or pool sizes diverge.
+            if defer and req.rid in self.disagg_prefill_early_sent_rids:
                 # The result runs now; its checkpoint frees wait for the transfer.
                 req.disagg_settle_deferred = True
                 self.disagg_prefill_early_send_stats["deferred"] = (
@@ -1665,15 +1663,6 @@ class SchedulerDisaggregationPrefillMixin:
                 )
                 continue
             self._settle_early_sent_last_chunk(req)
-
-    @staticmethod
-    def _early_send_ended(req: Req) -> bool:
-        kv_mgr = req.disagg_kv_sender.kv_mgr
-        room = req.bootstrap_room
-        return (
-            kv_mgr.request_status.get(room) in (None, KVPoll.Success, KVPoll.Failed)
-            and kv_mgr._staging_outstanding.get(room, 0) <= 0
-        )
 
     def _log_pool_at_idle(self: Scheduler) -> None:
         """Deferred early-settle leak check: idle pool counts per PP stage, every 30 s."""

@@ -1257,7 +1257,6 @@ class TestDeferredEarlySettle(CustomTestCase):
             kv_checksum_computer=None,
             tree_cache=cache,
         )
-        sched._early_send_ended = mixin._early_send_ended
         sched._apply_deferred_frees = lambda req: mixin._apply_deferred_frees(sched, req)
         return sched
 
@@ -1265,7 +1264,7 @@ class TestDeferredEarlySettle(CustomTestCase):
         mixin = SchedulerDisaggregationPrefillMixin
         for enabled, status, deferred in (
             (True, KVPoll.Transferring, True),
-            (True, KVPoll.Success, False),
+            (True, KVPoll.Success, True),
             (False, KVPoll.Transferring, False),
         ):
             with self.subTest(enabled=enabled, status=status):
@@ -1279,6 +1278,20 @@ class TestDeferredEarlySettle(CustomTestCase):
                     sched._send_kv_chunk.assert_not_called()
                     sched._settle_early_sent_last_chunk.assert_not_called()
                     self.assertNotIn("r", sched.disagg_prefill_early_sent_rids)
+
+    def test_ranks_with_different_local_status_defer_alike(self):
+        # PP stages send their own layers: one may have finished while another still sends.
+        mixin = SchedulerDisaggregationPrefillMixin
+        decisions = []
+        for status in (KVPoll.Success, KVPoll.Transferring, KVPoll.WaitingForInput, None):
+            sched, req = self._scheduler(), self._req(status)
+            req.bootstrap_room = 7
+            with envs.SGLANG_PP_PD_DEFER_EARLY_SETTLE.override(True):
+                mixin._pp_pd_settle_early_sends(sched, SimpleNamespace(reqs=[req]))
+            decisions.append(
+                (req.disagg_settle_deferred, sched._settle_early_sent_last_chunk.called)
+            )
+        self.assertEqual(decisions, [(True, False)] * 4)
 
     def test_checkpoint_frees_are_held_until_the_transfer_ends(self):
         from sglang.srt.mem_cache.unified_cache.cache_action import FreeDeviceKV
