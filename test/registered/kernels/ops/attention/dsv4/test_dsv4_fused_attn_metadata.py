@@ -16,9 +16,13 @@ from sglang.kernels.ops.attention.dsv4.fused_attn_metadata import (
     build_page_table_positions_2d,
     expand_index_page_table_pair,
     expand_same_length,
+    first_row_offsets,
     gather_int32,
+    prefill_k_slots_fused,
     row_group_indices,
 )
+from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+from sglang.kernels.ops.kvcache.dsv4_request_window_copy import commit_packed_rows
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     build_low_ratio_metadata,
 )
@@ -27,7 +31,10 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     _low_ratio_compression_metadata,
     _low_ratio_sparse_buffers,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.metadata import expand_index_page_table
+from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import prefill_k_slots
+from sglang.srt.mem_cache.dsv41_request_window import _first_row_offsets
 from sglang.srt.utils import is_cuda
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -180,6 +187,64 @@ def test_row_group_indices(group):
         cached = row_group_indices(num_rows=500, group=group, device=DEVICE, max_rows=1)
         missing = row_group_indices(num_rows=1 << 16, group=group, device=DEVICE, max_rows=1)
     assert cached is not None and missing is None
+
+
+@pytest.mark.parametrize("ratio", [1, 2])
+@pytest.mark.parametrize("seq_lens", [[1], [3, 0, 7], [110003, 97411, 121577, 1, 2, 88901, 131011, 4]])
+def test_prefill_k_slots(ratio, seq_lens):
+    gen = torch.Generator().manual_seed(len(seq_lens) * 10 + ratio)
+    req_to_token = _req_to_token(64, 131072 + 64, gen)
+    req_to_token[5, :8] = -3  # torch floor-divides negatives
+    req = torch.randperm(64, generator=gen)[: len(seq_lens)].to(DEVICE)
+    req[0] = 5
+    kw = dict(req_to_token=req_to_token, req_pool_indices=req, seq_lens_cpu=seq_lens, ratio=ratio)
+    with envs.SGLANG_OPT_DSV4_FUSED_ATTN_METADATA.override(False):
+        ref = prefill_k_slots(**kw)
+    _same(prefill_k_slots_fused(**kw), ref)
+
+
+@pytest.mark.parametrize("n", [1, 5, 1023, 1024, 1025, 32768, 65537])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_first_row_offsets(n, dtype):
+    gen = torch.Generator().manual_seed(n)
+    runs = torch.randint(1, max(2, n // 3), (n,), generator=gen)
+    req = torch.repeat_interleave(torch.randint(0, 9, (n,), generator=gen), runs)[:n]
+    req = req.to(dtype).to(DEVICE)
+    with envs.SGLANG_OPT_DSV4_FUSED_ATTN_METADATA.override(False):
+        ref = _first_row_offsets(req)
+    for got, want in zip(first_row_offsets(req), ref):
+        _same(got, want)
+
+
+@pytest.mark.parametrize("num_rows", [1, 300, 32768])
+def test_commit_packed_rows_persistent(num_rows):
+    gen = torch.Generator().manual_seed(num_rows)
+    layout, page, capacity = KVLayout.V41_NEW, 256, 256
+    pages = triton_cdiv(num_rows + 1, page)
+    stride = page * layout.bytes_per_token
+    src = torch.randint(0, 256, (pages, stride), generator=gen, dtype=torch.uint8).to(DEVICE)
+    num_reqs = triton_cdiv(num_rows, capacity)
+    window = SimpleNamespace(
+        write_loc=torch.randperm(pages * page, generator=gen)[:num_rows].to(DEVICE),
+        req=(torch.arange(num_rows) // capacity).to(DEVICE),
+        pos=torch.arange(num_rows).to(DEVICE),
+        commit_mask=(torch.rand(num_rows, generator=gen) < 0.05).to(DEVICE),
+    )
+    dst_pages = triton_cdiv(num_reqs * capacity, page)
+    outs = []
+    for persistent in (False, True):
+        dst = torch.zeros((dst_pages, stride), dtype=torch.uint8, device=DEVICE)
+        tags = torch.full((num_reqs * capacity,), -1, dtype=torch.int64, device=DEVICE)
+        with envs.SGLANG_OPT_DSV41_WINDOW_COMMIT_PERSISTENT.override(persistent):
+            commit_packed_rows(src, dst, tags, window, page_size=page, capacity=capacity, layout=layout)
+        outs.append((dst, tags))
+    # Each (req, pos % capacity) is distinct, so no two kept rows share a target.
+    _same(outs[1][0], outs[0][0])
+    _same(outs[1][1], outs[0][1])
+
+
+def triton_cdiv(a: int, b: int) -> int:
+    return (a + b - 1) // b
 
 
 if __name__ == "__main__":

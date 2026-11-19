@@ -27,6 +27,7 @@ from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_paged_v2,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.device import async_h2d
 
@@ -214,6 +215,17 @@ def prefill_k_slots(
 ) -> torch.Tensor:
     """[columns] int64 index-K pool slot of each flattened-K column: request by
     request, the compressed positions visible at its newest token."""
+    if envs.SGLANG_OPT_DSV4_FUSED_ATTN_METADATA.get() and req_to_token.is_cuda:
+        from sglang.kernels.ops.attention.dsv4.fused_attn_metadata import (
+            prefill_k_slots_fused,
+        )
+
+        return prefill_k_slots_fused(
+            req_to_token=req_to_token,
+            req_pool_indices=req_pool_indices,
+            seq_lens_cpu=seq_lens_cpu,
+            ratio=ratio,
+        )
     device = req_pool_indices.device
     lens_per_request = [s // ratio for s in seq_lens_cpu]
     columns = sum(lens_per_request)

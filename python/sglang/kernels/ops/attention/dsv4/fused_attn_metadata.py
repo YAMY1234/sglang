@@ -232,3 +232,127 @@ def row_group_indices(
         table = torch.arange(size, dtype=torch.int32, device=device) // group
         _ROW_GROUP_CACHE[key] = table
     return table[:num_rows]
+
+
+@triton.jit
+def _k_slots_kernel(
+    R2T, REQS, STARTS_LENS, OUT, num_reqs, r2t_stride, SHIFT: tl.constexpr, BLOCK: tl.constexpr
+):
+    r, blk = tl.program_id(0), tl.program_id(1)
+    start = tl.load(STARTS_LENS + r)
+    n = tl.load(STARTS_LENS + num_reqs + r)
+    j = blk * BLOCK + tl.arange(0, BLOCK)
+    m = j < n
+    rp = tl.load(REQS + r).to(tl.int64)
+    v = tl.load(R2T + rp * r2t_stride + j.to(tl.int64) * (1 << SHIFT), mask=m, other=0)
+    # Arithmetic shift is floor division, as torch's // is.
+    tl.store(OUT + start + j, v.to(tl.int64) >> SHIFT, mask=m)
+
+
+def prefill_k_slots_fused(
+    *, req_to_token: torch.Tensor, req_pool_indices: torch.Tensor, seq_lens_cpu, ratio: int
+) -> torch.Tensor:
+    """``prefill_k_slots`` (scoring.py) in one launch: request r's columns are the
+    index-K slots of its compressed positions 0 .. seq_len // ratio - 1."""
+    from sglang.srt.utils.device import async_h2d
+
+    assert ratio > 0 and ratio & (ratio - 1) == 0, ratio
+    assert req_to_token.stride(1) == 1
+    device = req_pool_indices.device
+    lens = [s // ratio for s in seq_lens_cpu]
+    starts, total = [], 0
+    for n in lens:
+        starts.append(total)
+        total += n
+    out = torch.empty(total, dtype=torch.int64, device=device)
+    if total:
+        starts_lens = async_h2d(starts + lens, dtype=torch.int64, device=device)
+        block = 1024
+        _k_slots_kernel[(len(lens), triton.cdiv(max(lens), block))](
+            req_to_token,
+            req_pool_indices,
+            starts_lens,
+            out,
+            len(lens),
+            req_to_token.stride(0),
+            ratio.bit_length() - 1,
+            block,
+        )
+    return out
+
+
+@triton.jit
+def _run_summary_kernel(REQ, SUM, n, BLOCK: tl.constexpr):
+    b = tl.program_id(0)
+    i = b * BLOCK + tl.arange(0, BLOCK)
+    m = i < n
+    cur = tl.load(REQ + i, mask=m, other=0)
+    prev = tl.load(REQ + i - 1, mask=m & (i > 0), other=0)
+    nxt = tl.load(REQ + i + 1, mask=i + 1 < n, other=0)
+    start = m & ((i == 0) | (cur != prev))
+    end = m & ((i == n - 1) | (cur != nxt))
+    i64 = i.to(tl.int64)
+    tl.store(SUM + b * 3, tl.sum(start.to(tl.int64), axis=0))
+    tl.store(SUM + b * 3 + 1, tl.max(tl.where(start, i64, -1), axis=0))
+    tl.store(SUM + b * 3 + 2, tl.min(tl.where(end, i64, n), axis=0))
+
+
+@triton.jit
+def _max_combine(a, b):
+    return tl.maximum(a, b)
+
+
+@triton.jit
+def _min_combine(a, b):
+    return tl.minimum(a, b)
+
+
+@triton.jit
+def _run_offsets_kernel(
+    REQ, SUM, GROUP, FIRST, LAST, n, num_blocks, BLOCK: tl.constexpr, SUM_BLOCK: tl.constexpr
+):
+    b = tl.program_id(0)
+    # Carries from the other blocks' summaries.
+    count, first, last = tl.zeros((), tl.int64), tl.full((), -1, tl.int64), tl.full((), n, tl.int64)
+    for s0 in range(0, num_blocks, SUM_BLOCK):
+        s = s0 + tl.arange(0, SUM_BLOCK)
+        before = s < b
+        after = (s > b) & (s < num_blocks)
+        count += tl.sum(tl.load(SUM + s * 3, mask=before, other=0), axis=0)
+        first = tl.maximum(first, tl.max(tl.load(SUM + s * 3 + 1, mask=before, other=-1), axis=0))
+        last = tl.minimum(last, tl.min(tl.load(SUM + s * 3 + 2, mask=after, other=n), axis=0))
+    i = b * BLOCK + tl.arange(0, BLOCK)
+    m = i < n
+    cur = tl.load(REQ + i, mask=m, other=0)
+    prev = tl.load(REQ + i - 1, mask=m & (i > 0), other=0)
+    start = m & ((i == 0) | (cur != prev))
+    i64 = i.to(tl.int64)
+    tl.store(GROUP + i, count + tl.cumsum(start.to(tl.int64), axis=0) - 1, mask=m)
+    run_first = tl.associative_scan(tl.where(start, i64, -1), 0, _max_combine)
+    tl.store(FIRST + i, tl.maximum(run_first, first), mask=m)
+    # The reverse scan for the run's last row: walk the block back to front.
+    ri = b * BLOCK + BLOCK - 1 - tl.arange(0, BLOCK)
+    rm = ri < n
+    rcur = tl.load(REQ + ri, mask=rm, other=0)
+    rnxt = tl.load(REQ + ri + 1, mask=rm & (ri + 1 < n), other=0)
+    rend = rm & ((ri == n - 1) | (rcur != rnxt))
+    run_last = tl.associative_scan(tl.where(rend, ri.to(tl.int64), n), 0, _min_combine)
+    tl.store(LAST + ri, tl.minimum(run_last, last), mask=rm)
+
+
+def first_row_offsets(req: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``_first_row_offsets`` (dsv41_request_window.py) in two launches: each row's
+    run index, and the first and last row of its run of equal ``req``."""
+    n = req.numel()
+    assert n > 0 and req.is_contiguous()
+    kw = dict(dtype=torch.int64, device=req.device)
+    group, first, last = (torch.empty(n, **kw) for _ in range(3))
+    block = 1024
+    num_blocks = triton.cdiv(n, block)
+    summary = torch.empty(num_blocks * 3, **kw)
+    _run_summary_kernel[(num_blocks,)](req, summary, n, block)
+    _run_offsets_kernel[(num_blocks,)](
+        req, summary, group, first, last, n, num_blocks, block,
+        min(triton.next_power_of_2(num_blocks), 1024),
+    )
+    return group, first, last

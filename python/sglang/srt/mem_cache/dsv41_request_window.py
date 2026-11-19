@@ -8,7 +8,7 @@ from sglang.kernels.ops.kvcache.dsv4_request_window_copy import (
     commit_packed_rows,
     copy_packed_rows,
 )
-from sglang.srt.environ import InvariantCheckLevel
+from sglang.srt.environ import InvariantCheckLevel, envs
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.invariants import Bucket, Invariant, IsTrue, expect, resolve_level
@@ -77,6 +77,12 @@ def _first_row_offsets(
     req: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     n = req.numel()
+    if req.is_cuda and envs.SGLANG_OPT_DSV4_FUSED_ATTN_METADATA.get():
+        from sglang.kernels.ops.attention.dsv4.fused_attn_metadata import (
+            first_row_offsets,
+        )
+
+        return first_row_offsets(req.contiguous())
     offset = torch.arange(n, device=req.device)
     starts = torch.ones(n, dtype=torch.bool, device=req.device)
     starts[1:] = req[1:] != req[:-1]

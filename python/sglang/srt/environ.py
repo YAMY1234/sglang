@@ -655,6 +655,9 @@ class Envs:
     # slots and lengths, indexer block tables, SWA write locations) in single Triton
     # launches instead of torch-op chains. Bitwise equal outputs.
     SGLANG_OPT_DSV4_FUSED_ATTN_METADATA = EnvBool(False)
+    # Request-window commit of new SWA rows with a few programs per SM striding over
+    # the rows instead of one program per row. Same copies.
+    SGLANG_OPT_DSV41_WINDOW_COMMIT_PERSISTENT = EnvBool(False)
     # The deferred draft KV store's staging (write locations, positions, state slots,
     # commit lengths) in one Triton launch instead of four copies and a fill.
     SGLANG_OPT_DSV41_DSPARK_ONE_LAUNCH_COMMIT_STAGE = EnvBool(
