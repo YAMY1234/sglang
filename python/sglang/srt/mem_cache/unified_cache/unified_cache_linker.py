@@ -364,8 +364,99 @@ class _PrefetchHold(NamedTuple):
     tokens: int
 
 
+
+class _PrefetchTimeline:
+    """SGLANG_LINKER_PREFETCH_TIMELINE: per-request prefetch milestones on this rank
+    (perf_counter), the interval percentiles between them, admission-pass skips of
+    not-ready requests and the interval between passes that admitted a batch."""
+
+    PAIRS = (
+        ("enqueue", "lookup_done"),
+        ("lookup_done", "load_issued"),
+        ("load_issued", "landed"),
+        ("landed", "finish_issued"),
+        ("finish_issued", "ready"),
+        ("enqueue", "ready"),
+        ("ready", "admitted"),
+    )
+
+    def __init__(self):
+        self.marks: dict = {}
+        self.intervals = {pair: [] for pair in self.PAIRS}
+        self.pass_skips: list[int] = []
+        self.skip_positions: list[int] = []
+        self.batch_times: list[float] = []
+        self._pass_t = None
+        self._pass_pos = 0
+        self._pass_skipped = 0
+        self._pass_admitted = 0
+
+    def mark(self, request, stage: str, t: Optional[float] = None) -> None:
+        self.marks.setdefault(request, {}).setdefault(
+            stage, time.perf_counter() if t is None else t
+        )
+
+    def admitted(self, request) -> None:
+        self._pass_admitted += 1
+        marks = self.marks.pop(request, None)
+        if not marks:
+            return
+        marks.setdefault("admitted", time.perf_counter())
+        for a, b in self.PAIRS:
+            if a in marks and b in marks:
+                self.intervals[(a, b)].append(1e3 * (marks[b] - marks[a]))
+
+    def drop(self, request) -> None:
+        self.marks.pop(request, None)
+
+    def pass_begin(self) -> None:
+        if self._pass_t is not None:
+            self.pass_skips.append(self._pass_skipped)
+            if self._pass_admitted:
+                self.batch_times.append(self._pass_t)
+        self._pass_t = time.perf_counter()
+        self._pass_pos = self._pass_skipped = self._pass_admitted = 0
+
+    def candidate(self, ready: bool) -> None:
+        if not ready:
+            self._pass_skipped += 1
+            self.skip_positions.append(self._pass_pos)
+        self._pass_pos += 1
+
+    @staticmethod
+    def _pct(values, q):
+        return values[min(len(values) - 1, int(len(values) * q))] if values else 0.0
+
+    def summary(self) -> str:
+        parts = []
+        for (a, b), values in self.intervals.items():
+            values.sort()
+            parts.append(
+                f"{a}->{b} n={len(values)} p50 {self._pct(values, 0.5):.0f} "
+                f"p90 {self._pct(values, 0.9):.0f} max {values[-1] if values else 0:.0f}"
+            )
+            values.clear()
+        gaps = sorted(
+            1e3 * (t1 - t0) for t0, t1 in zip(self.batch_times, self.batch_times[1:])
+        )
+        skips = sorted(self.pass_skips)
+        positions = sorted(self.skip_positions)
+        line = (
+            "; ".join(parts)
+            + f"; batch interval n={len(gaps)} mean "
+            + f"{(sum(gaps) / len(gaps) if gaps else 0.0):.0f} ms"
+            + f"; not-ready skips per pass p50 {self._pct(skips, 0.5)} p90 {self._pct(skips, 0.9)}"
+            + f"; skipped queue position p50 {self._pct(positions, 0.5)}"
+        )
+        self.batch_times = self.batch_times[-1:]
+        self.pass_skips.clear()
+        self.skip_positions.clear()
+        return line
+
 class UnifiedCacheLinkerWrapper:
     """Drives an external KV store on behalf of one :class:`UnifiedRadixCache`."""
+    # SGLANG_LINKER_PREFETCH_TIMELINE recorder (None: off); class default for test doubles.
+    timeline: Optional["_PrefetchTimeline"] = None
 
     # Async admission: the relayed verdict of a skipped hit, and the passes in a
     # row after which its pre-pin goes ahead of the window and is held until
@@ -610,6 +701,9 @@ class UnifiedCacheLinkerWrapper:
             envs.SGLANG_EXTERNAL_LINKER_REQUERY_ON_DEVICE_LOSS.get()
         )
         self.log_lookup_stats = envs.SGLANG_EXTERNAL_LINKER_LOOKUP_STATS.get()
+        self.timeline = (
+            _PrefetchTimeline() if envs.SGLANG_LINKER_PREFETCH_TIMELINE.get() else None
+        )
         self.max_requeries = envs.SGLANG_LINKER_MAX_REQUERIES.get()
         logger.info(
             "External linker prefetch mode: lookup threads %d, hold cap %d tokens, "
@@ -1228,6 +1322,13 @@ class UnifiedCacheLinkerWrapper:
                 if self._lookup_executor is not None
                 else None
             )
+            if self.timeline is not None:
+                self.timeline.mark(request, "enqueue")
+                if future is not None:
+                    timeline = self.timeline
+                    future.add_done_callback(
+                        lambda _f, r=request: timeline.mark(r, "lookup_done")
+                    )
             self.lookups[request] = _PendingLookup(
                 key,
                 hashes,
@@ -1340,6 +1441,11 @@ class UnifiedCacheLinkerWrapper:
                 state.future = self.cache_linker.prefetch(
                     [t for _, t in state.component_transfers]
                 )
+                if self.timeline is not None and state.future is not None:
+                    timeline = self.timeline
+                    state.future.add_done_callback(
+                        lambda _f, r=request: timeline.mark(r, "landed")
+                    )
         except Exception:
             logger.warning("External linker prefetch submission failed", exc_info=True)
         accepted = torch.tensor([state.future is not None], dtype=torch.int)
@@ -1360,8 +1466,17 @@ class UnifiedCacheLinkerWrapper:
 
     def check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
         if self.pp_relay is not None:
-            return self.pp_relay.progress(request, self._stop_due)
-        return self._local_check_prefetch_progress(request)
+            ready = self.pp_relay.progress(request, self._stop_due)
+        else:
+            ready = self._local_check_prefetch_progress(request)
+        if self.timeline is not None:
+            self.timeline.candidate(ready)
+        return ready
+
+    def admission_pass_begin(self) -> None:
+        """SGLANG_LINKER_PREFETCH_TIMELINE: a prefill admission pass starts."""
+        if self.timeline is not None:
+            self.timeline.pass_begin()
 
     def _stop_due(self, request: CacheRequestHandle) -> bool:
         """PP0 under PP: whether the stop policy ends the wait for ``request``'s
@@ -1488,6 +1603,8 @@ class UnifiedCacheLinkerWrapper:
         if not self.log_lookup_stats or now < self._lookup_next_log:
             return
         self._lookup_next_log = now + 60.0
+        if self.timeline is not None:
+            logger.info("Linker prefetch timeline (ms): %s", self.timeline.summary())
         waits = sorted(self._requery_waits)
         self._requery_waits.clear()
         p50, p90 = (
@@ -1739,6 +1856,11 @@ class UnifiedCacheLinkerWrapper:
         self, request: CacheRequestHandle, *, admitted: bool, prefix_len: int = 0
     ) -> None:
         stats = self._hold_stats
+        if self.timeline is not None:
+            if admitted:
+                self.timeline.admitted(request)
+            else:
+                self.timeline.drop(request)
         self.match_targets.pop(request, None)
         end = self.unheld.pop(request, None)
         if end is not None and admitted:

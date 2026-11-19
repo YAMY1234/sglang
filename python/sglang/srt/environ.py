@@ -1084,6 +1084,9 @@ class Envs:
     # KV integrity check: checksum this share of pages (sampled by store key) at
     # offload and again after a prefetch read lands; mismatches are logged (0: off).
     SGLANG_LINKER_PAGE_CHECKSUM = EnvFloat(0.0)
+    # Prefetch mode: log per-request prefetch milestone intervals, admission
+    # skips of not-ready requests and the batch interval every 60 s (LOOKUP_STATS).
+    SGLANG_LINKER_PREFETCH_TIMELINE = EnvBool(False)
     # Offload puts: build per-key buffer addresses with numpy and batch the
     # recent-key / result bookkeeping (the offload thread's GIL share).
     SGLANG_LINKER_VECTOR_PUT = EnvBool(False)

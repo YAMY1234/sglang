@@ -3194,6 +3194,7 @@ class _VoteStore:
 
 
 class _RelayWrapper:
+    timeline = None
     def __init__(self, rank, size):
         self.pp_rank, self.pp_size = rank, size
         self.lookups, self.prefetches = {}, {}
@@ -3374,3 +3375,46 @@ def test_mooncake_prefetch_read_ends_its_sessions_and_reports_failure():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def test_prefetch_timeline_intervals_skips_and_batch_interval():
+    from sglang.srt.mem_cache.unified_cache import unified_cache_linker as ucl
+
+    tl = ucl._PrefetchTimeline()
+    h = object()
+    for stage, t in (
+        ("enqueue", 1.000),
+        ("lookup_done", 1.010),
+        ("load_issued", 1.030),
+        ("landed", 1.130),
+        ("finish_issued", 1.330),
+        ("ready", 1.530),
+    ):
+        tl.mark(h, stage, t)
+    tl.mark(h, "enqueue", 9.0)  # a later mark of a recorded stage keeps the first
+    with patch.object(ucl.time, "perf_counter", return_value=1.600):
+        tl.pass_begin()
+    tl.candidate(False)
+    tl.candidate(False)
+    tl.candidate(True)
+    with patch.object(ucl.time, "perf_counter", return_value=1.600):
+        tl.admitted(h)
+    with patch.object(ucl.time, "perf_counter", return_value=1.800):
+        tl.pass_begin()
+    tl.admitted(object())  # admitted without marks: counts toward the pass only
+    with patch.object(ucl.time, "perf_counter", return_value=2.000):
+        tl.pass_begin()
+
+    got = {pair: list(v) for pair, v in tl.intervals.items()}
+    assert got[("enqueue", "lookup_done")] == [pytest.approx(10.0)]
+    assert got[("load_issued", "landed")] == [pytest.approx(100.0)]
+    assert got[("enqueue", "ready")] == [pytest.approx(530.0)]
+    assert got[("ready", "admitted")] == [pytest.approx(70.0)]
+    assert h not in tl.marks
+    assert tl.pass_skips == [2, 0]
+    assert tl.skip_positions == [0, 1]
+    line = tl.summary()
+    assert "batch interval n=1 mean 200 ms" in line
+    assert "not-ready skips per pass p50 2" in line
+    assert "skipped queue position p50 1" in line
+    assert all(not v for v in tl.intervals.values()) and not tl.pass_skips

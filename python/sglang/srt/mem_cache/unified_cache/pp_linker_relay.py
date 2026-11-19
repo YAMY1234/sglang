@@ -318,6 +318,8 @@ class PPLinkerRelay:
             assert entry.phase == "load"
             entry.pending = False
             w._finish_prefetch(handle, publish=value, hold=not entry.released)
+            if w.timeline is not None:
+                w.timeline.mark(handle, "ready")
             if entry.voted is not None and self.store is not None:
                 self.store.pop(self._key(entry))
             entry.phase = "ready"
@@ -368,6 +370,8 @@ class PPLinkerRelay:
                             handle.rid, lookup.start, len(lookup.hashes),
                             sorted(restorable)[-8:], pages,
                         )
+                if w.timeline is not None:
+                    w.timeline.mark(handle, "load_issued")
                 self._issue(handle, entry, "load", pages)
             elif entry.phase == "load":
                 if entry.voted is None:
@@ -380,6 +384,8 @@ class PPLinkerRelay:
                     and not entry.stopped
                     and not entry.stop_issued
                 )
+                if w.timeline is not None:
+                    w.timeline.mark(handle, "finish_issued")
                 self._issue(handle, entry, "finish", publish)
 
     def progress(self, handle, stop_due):

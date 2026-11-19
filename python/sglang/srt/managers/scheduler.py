@@ -4640,6 +4640,8 @@ class Scheduler(
                 and self.chunked_req not in adder.can_run_list
             )
             self._k31_note_chunk_park(chunk_parked, adder)
+        if self.linker_prefetch_mode and self.tree_cache.linker is not None:
+            self.tree_cache.linker.admission_pass_begin()
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             # A spent pass budget admits no one, even before the first
