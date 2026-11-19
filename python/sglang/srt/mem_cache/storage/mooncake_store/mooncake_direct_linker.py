@@ -1081,9 +1081,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 self._verify_page_checksums(self._read_batches(expanded))
 
         def failed(f):
-            if f.exception() is not None and not future.done():
+            if f.exception() is None:
+                return
+            if not future.done():
+                logger.error("Linker staged load failed before its copy was queued", exc_info=f.exception())
                 future.set_exception(f.exception())
-            elif f.exception() is not None:
+            else:
                 logger.warning("Early-read staging release failed", exc_info=f.exception())
 
         self._staging_executor.submit(run).add_done_callback(failed)

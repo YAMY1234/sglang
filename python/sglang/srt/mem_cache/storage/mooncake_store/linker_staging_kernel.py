@@ -81,8 +81,33 @@ def memcpy_batch(dst: np.ndarray, src: np.ndarray, sizes: np.ndarray, stream: in
     sizes = np.ascontiguousarray(sizes, dtype=np.uint64)
     attrs = MemcpyAttributes(_SRC_ACCESS_ORDER_STREAM, _MemLocation(), _MemLocation(), _FLAG_PREFER_OVERLAP_WITH_COMPUTE)
     idx = (ctypes.c_size_t * 1)(0)
-    rc = _runtime().cudaMemcpyBatchAsync(
-        dst.ctypes.data, src.ctypes.data, sizes.ctypes.data, len(dst), ctypes.byref(attrs), idx, 1, stream
-    )
+    def call(n):
+        return _runtime().cudaMemcpyBatchAsync(
+            dst.ctypes.data, src.ctypes.data, sizes.ctypes.data, n, ctypes.byref(attrs), idx, 1, stream
+        )
+
+    rc = call(len(dst))
     if rc != 0:
-        raise RuntimeError(f"cudaMemcpyBatchAsync({len(dst)} entries) failed: {rc}")
+        raise RuntimeError(f"cudaMemcpyBatchAsync({len(dst)} entries) failed: {_describe(rc, call, dst, src, sizes)}")
+
+
+def _describe(rc, call, dst, src, sizes) -> str:
+    """The error, the calling thread's device and the first failing entry (CUDA 13
+    reports no index: shortest failing prefix, re-copying the same bytes)."""
+    rt = _runtime()
+    rt.cudaGetErrorString.restype = ctypes.c_char_p
+    device = ctypes.c_int(-1)
+    rt.cudaGetDevice(ctypes.byref(device))
+    lo, hi = 1, len(dst)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        lo, hi = (lo, mid) if call(mid) != 0 else (mid + 1, hi)
+    i = lo - 1
+
+    def where(ptr):
+        attrs = (ctypes.c_int * 64)()  # cudaPointerAttributes starts {type, device}
+        err = rt.cudaPointerGetAttributes(attrs, ctypes.c_void_p(int(ptr)))
+        return f"type {attrs[0]} device {attrs[1]}" if err == 0 else f"attributes error {err}"
+
+    return (f"{rc} {rt.cudaGetErrorString(rc).decode()}; thread device {device.value}; entry {i} of {len(dst)}: "
+            f"dst {int(dst[i]):#x} ({where(dst[i])}), src {int(src[i]):#x} ({where(src[i])}), {int(sizes[i])} B")

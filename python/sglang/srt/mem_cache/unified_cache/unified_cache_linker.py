@@ -1870,6 +1870,9 @@ class UnifiedCacheLinkerWrapper:
         # Event polling or reset/close has already quiesced every device writer.
         if state.future is not None:
             assert state.future.done()
+            if getattr(state.future, "staged", False) and state.future.exception() is not None:
+                # Voted by its early read, so every stage publishes it; this stage's slots were never filled.
+                raise RuntimeError(f"staged load of {request.rid} failed after its vote") from state.future.exception()
             copy_event = getattr(state.future, "copy_event", None)
             if copy_event is not None:
                 # Staged load: the forward (or a reuse of freed slots) runs after the scatter.

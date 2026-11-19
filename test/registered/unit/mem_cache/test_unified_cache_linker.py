@@ -3177,6 +3177,19 @@ def test_prefetch_cancel_records_its_reason(full_linker_component):
     assert wrapper._abort_reasons == {"timeout": 1}
 
 
+def test_finish_of_a_failed_staged_load_raises_instead_of_publishing():
+    # The early read voted for it, so every stage publishes; this stage's slots were never filled.
+    wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+    future = Future()
+    future.staged = True
+    future.set_exception(RuntimeError("cudaMemcpyBatchAsync failed"))
+    handle = _Handle("a")
+    wrapper.prefetches = {handle: SimpleNamespace(future=future)}
+    wrapper._requery_started = {}
+    with pytest.raises(RuntimeError, match="failed after its vote"):
+        wrapper._finish_prefetch(handle, publish=True)
+
+
 class _VoteStore:
     """PPConsensusStore stand-in: every rank's map, collected on PP0."""
 
