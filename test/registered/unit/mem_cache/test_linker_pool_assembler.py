@@ -1530,6 +1530,18 @@ class TestLinkerStaging(CustomTestCase):
             print(f"{stage} {name}: {entries} entries per load, {ms:.1f} ms of driver time")
         self.assertLess(max(ms for _, ms in report.values()), 20.0)
 
+    def test_staged_copies_use_torchs_libcudart_by_path_only(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.linker_staging_kernel import torch_cudart_path
+
+        sp = "/opt/sglang/lib/python3.12/site-packages"
+        torch_rt = f"{sp}/nvidia/cu13/lib/libcudart.so.13"
+        vision_rt = f"{sp}/torchvision.libs/libcudart.a6a4ec3c.so.13"  # mapped beside it in every process
+        self.assertEqual(torch_cudart_path([vision_rt, torch_rt], sp), torch_rt)
+        self.assertEqual(torch_cudart_path([f"{sp}/torch/lib/../../nvidia/cu13/lib/libcudart.so.13", vision_rt], sp), torch_rt)
+        # Not torch's, or ambiguous: no runtime, so the kernel scatter runs.
+        self.assertIsNone(torch_cudart_path([vision_rt, "/usr/local/cuda/lib64/libcudart.so.13"], sp))
+        self.assertIsNone(torch_cudart_path([torch_rt, f"{sp}/nvidia/cu12/lib/libcudart.so.12"], sp))
+
     @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
     def test_memcpy_batch_scatters_pinned_ranges_into_device_rows(self):
         import time

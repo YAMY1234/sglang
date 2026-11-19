@@ -107,8 +107,14 @@ def copy_engine_scatter(plans, stream):
     the staging thread: the driver spends about 0.3 us per entry."""
     import torch
 
-    from sglang.srt.mem_cache.storage.mooncake_store.linker_staging_kernel import loaded_cudart, memcpy_batch
+    from sglang.srt.mem_cache.storage.mooncake_store.linker_staging_kernel import (
+        have_runtime,
+        loaded_cudart,
+        memcpy_batch,
+    )
 
+    if not have_runtime():
+        return gpu_scatter(plans, stream)
     with torch.cuda.stream(stream):
         for dst, src, sizes in plans:
             if len(dst):

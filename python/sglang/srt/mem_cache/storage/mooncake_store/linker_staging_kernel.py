@@ -54,25 +54,48 @@ _cudart = None
 _first_call = True
 
 
+def torch_cudart_path(mapped: list, site_packages: str):
+    """The one mapped libcudart under ``site_packages``/nvidia/*/lib (torch's
+    runtime), else None. Other mapped copies (e.g. torchvision.libs) are ignored."""
+    import os
+
+    root = os.path.realpath(os.path.join(site_packages, "nvidia")) + os.sep
+    found = {
+        os.path.realpath(p) for p in mapped
+        if os.path.realpath(p).startswith(root) and os.path.basename(os.path.dirname(p)) == "lib"
+        and os.path.basename(p).startswith("libcudart.so")
+    }
+    return found.pop() if len(found) == 1 else None
+
+
 def _runtime():
+    """torch's own libcudart (by path from /proc/self/maps, after CUDA init), or
+    None: then the staged copy runs as the kernel scatter. Never a bare soname
+    lookup: another copy's per-thread device would not be torch's."""
     global _cudart
     if _cudart is None:
-        try:
-            _cudart = ctypes.CDLL("libcudart.so.13")  # torch has loaded it already
-        except OSError:
-            import glob
-            import os
+        import os
 
-            import nvidia
+        import torch
 
-            _cudart = ctypes.CDLL(glob.glob(os.path.join(nvidia.__path__[0], "cu13", "lib", "libcudart.so.13*"))[0])
+        torch.cuda.init()
+        path = torch_cudart_path(loaded_cudart(), os.path.dirname(os.path.dirname(torch.__file__)))
+        if path is None:
+            logger.warning("Linker staged copies: torch's libcudart not found among %s; using the kernel scatter", loaded_cudart())
+            _cudart = False
+            return None
+        _cudart = ctypes.CDLL(path)
         fn = _cudart.cudaMemcpyBatchAsync
         fn.restype = ctypes.c_int
         fn.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
             ctypes.POINTER(MemcpyAttributes), ctypes.POINTER(ctypes.c_size_t), ctypes.c_size_t, ctypes.c_void_p,
         ]
-    return _cudart
+    return _cudart or None
+
+
+def have_runtime() -> bool:
+    return _runtime() is not None
 
 
 def memcpy_batch(dst: np.ndarray, src: np.ndarray, sizes: np.ndarray, stream: int, device: int) -> None:
