@@ -1397,6 +1397,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         )
         if vector is not None and len(vector[0]) == len(selected_keys):
             # SGLANG_LINKER_VECTOR_PUT: the packed per-page lists, built with numpy.
+            self.vector_put_batches = getattr(self, "vector_put_batches", 0) + 1
             if len(object_indices) == len(key_strs):
                 return vector
             ptr_list, element_size_list = vector

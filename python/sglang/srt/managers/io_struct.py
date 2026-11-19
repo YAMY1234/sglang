@@ -1864,6 +1864,19 @@ class FlushCacheReqOutput(BaseReq, kw_only=True):
     message: str = ""
 
 
+class LinkerFlagsReqInput(BaseReq, kw_only=True):
+    # Per-call external-linker switches to set (name -> value); reset leaves
+    # every cache and the linker's store state as cold as a fresh boot.
+    flags: Dict[str, str] = msgspec.field(default_factory=dict)
+    reset: bool = True
+
+
+class LinkerFlagsReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str = ""
+    effective: Dict[str, str] = msgspec.field(default_factory=dict)
+
+
 class AddExternalCorpusReqInput(BaseReq, kw_only=True):
     corpus_id: Optional[str] = None
     file_path: Optional[str] = None

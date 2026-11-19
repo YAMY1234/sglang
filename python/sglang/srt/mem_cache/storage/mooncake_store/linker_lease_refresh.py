@@ -64,6 +64,14 @@ class LinkerLeaseRefresher:
 
     # ---- scheduler thread ----
 
+    def clear(self) -> None:
+        """Forget submitted prefixes and queued renewals (cold reset)."""
+        self._stamps.clear()
+        with self._cond:
+            self._pending.clear()
+            self._pending_pages = 0
+        self.stats = dict.fromkeys(self.stats, 0)
+
     def is_due(self, anchor: object) -> bool:
         """Whether the prefix ending at ``anchor`` was not renewed this interval."""
         now = self._clock()

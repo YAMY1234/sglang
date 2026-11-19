@@ -147,6 +147,8 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqType,
     FinishReasonDict,
     FlushCacheReqInput,
+    LinkerFlagsReqInput,
+    LinkerFlagsReqOutput,
     FreezeGCReq,
     GetHiCacheL3LayoutReq,
     GetHiCacheL3LayoutReqOutput,
@@ -2015,6 +2017,7 @@ class Scheduler(
                 (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_wrapper.handle),
+                (LinkerFlagsReqInput, self.linker_flags_wrapped),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
@@ -5732,6 +5735,47 @@ class Scheduler(
                 message="Ngram speculative decoding is not enabled.",
             )
         return self.external_corpus_manager.list(recv_req)
+
+    # Per-call external-linker switches POST /linker_flags may change without a
+    # restart; anything that shapes allocation or boot still needs one.
+    LINKER_TOGGLE_FLAGS = (
+        "SGLANG_LINKER_VECTOR_META",
+        "SGLANG_LINKER_CPU_INDICES",
+        "SGLANG_LINKER_COALESCE_RANGES",
+        "SGLANG_LINKER_VECTOR_PUT",
+        "SGLANG_LINKER_STORE_ARRAYS",
+        "SGLANG_LINKER_MAX_REQUERIES",
+    )
+
+    def linker_flags_wrapped(self, recv_req: LinkerFlagsReqInput):
+        """Every PP stage handles this at the same point of the relayed request
+        stream, so all stages switch together; refused unless fully idle."""
+        allowed = {name for name in self.LINKER_TOGGLE_FLAGS if hasattr(envs, name)}
+        rejected = sorted(set(recv_req.flags) - allowed)
+        if rejected:
+            return LinkerFlagsReqOutput(
+                success=False, message=f"not switchable at runtime: {rejected}"
+            )
+        linker = getattr(self.tree_cache, "linker", None)
+        if linker is None:
+            return LinkerFlagsReqOutput(success=False, message="no external linker")
+        if not self.is_fully_idle():
+            return LinkerFlagsReqOutput(success=False, message="busy")
+        for name, value in recv_req.flags.items():
+            os.environ[name] = str(value)
+        if recv_req.reset:
+            if not self.flush_cache():
+                return LinkerFlagsReqOutput(success=False, message="flush_cache failed")
+            linker.reset_cold()
+        linker.refresh_flags()
+        effective = {name: str(getattr(envs, name).get()) for name in sorted(allowed)}
+        logger.info(
+            "Linker flags switched (PP%d, reset=%s): %s",
+            get_parallel().pp_rank,
+            recv_req.reset,
+            effective,
+        )
+        return LinkerFlagsReqOutput(success=True, effective=effective)
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
         if self.enable_hierarchical_cache or self.enable_lmcache:

@@ -1124,6 +1124,28 @@ async def list_external_corpora():
 
 
 # example usage:
+# curl -s -X POST http://127.0.0.1:30000/linker_flags \
+#   -d '{"flags": {"SGLANG_LINKER_VECTOR_META": "1"}, "reset": true}'
+@app.api_route("/linker_flags", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def linker_flags(request: Request):
+    """Switch per-call external-linker flags without a restart (idle only)."""
+    from sglang.srt.managers.io_struct import LinkerFlagsReqInput
+
+    body = await request.json()
+    ret = await _global_state.tokenizer_manager.linker_flags(
+        LinkerFlagsReqInput(
+            flags={k: str(v) for k, v in (body.get("flags") or {}).items()},
+            reset=bool(body.get("reset", True)),
+        )
+    )
+    return ORJSONResponse(
+        {"success": ret.success, "message": ret.message, "effective": ret.effective},
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+# example usage:
 # curl -s -X POST http://127.0.0.1:30000/hicache/storage-backend/clear
 @app.api_route("/hicache/storage-backend/clear", methods=["POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)

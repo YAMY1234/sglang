@@ -707,15 +707,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             envs.SGLANG_LINKER_LOAD_RESERVE_PAGES.get(),
         )
         self.load_per_key = envs.SGLANG_LINKER_LOAD_PER_KEY.get()
-        self.vector_meta = envs.SGLANG_LINKER_VECTOR_META.get()
-        self.coalesce_ranges = envs.SGLANG_LINKER_COALESCE_RANGES.get()
-        self.store_arrays = envs.SGLANG_LINKER_STORE_ARRAYS.get()
         self.page_checksum_rate = envs.SGLANG_LINKER_PAGE_CHECKSUM.get()
         self.page_checksums: OrderedDict[str, int] = OrderedDict()
         self.page_checksum_counts = Counter()
         self.page_checksum_lock = threading.Lock()
         self._checksum_stream = None
-        self.cpu_indices = envs.SGLANG_LINKER_CPU_INDICES.get()
+        # Per-call switches, re-read by refresh_flags (POST /linker_flags);
+        # flag_hits counts the calls that took each switched path.
+        self.flag_hits: Counter = Counter()
+        self.store_epoch = 0
+        self.refresh_flags()
         self.num_load_threads = envs.SGLANG_LINKER_LOAD_THREADS.get() or (
             2 if self.load_overlap else 1
         )
@@ -1441,6 +1442,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self._log_numa_first_request()
         if self.cpu_indices:
             transfers = attach_cpu_indices(transfers)
+            self.flag_hits["cpu_indices_attached"] += 1
         expanded = self.pool_group.resolve_transfers(
             transfers, allow_partial=True, allow_missing_kv=True
         )
@@ -1952,6 +1954,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             if vector is not None:
                 # Same lists as the per-layer loop below, built with numpy so the
                 # read thread holds the GIL for a few array ops, not O(keys x layers).
+                self.flag_hits["vector_meta_calls"] += 1
+                if self.coalesce_ranges:
+                    self.flag_hits["coalesced_keys"] += len(keys)
                 base[name] = len(keys_all)
                 keys_all.extend(keys)
                 ptrs_all.extend(vector[0])
@@ -2043,6 +2048,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self._log_numa_first_request()
         if self.cpu_indices:
             transfers = attach_cpu_indices(transfers)
+            self.flag_hits["cpu_indices_attached"] += 1
         expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
         if not expanded:
             return False
@@ -2332,6 +2338,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         lookups, self.lookup_samples = self.lookup_samples, []
         pins, self.pin_samples = self.pin_samples, []
         holes, self.pin_holes = self.pin_holes, 0
+        engaged = dict(self.flag_hits)
+        engaged["vector_put_batches"] = getattr(self.storage, "vector_put_batches", 0)
+        logger.info(
+            "Linker flag engagement since the last switch: %s; flags %s",
+            engaged,
+            self.flag_values(),
+        )
         logger.info(
             "Linker store writes in %.0f s: %s GB/s new (%.2f GB/s offered), %d new "
             "states; states removed %d "
@@ -2397,6 +2410,84 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             _percentile(pin_ms, 0.9),
             holes,
             written["exist_skipped"],
+        )
+
+    TOGGLE_FLAGS = (
+        "SGLANG_LINKER_VECTOR_META",
+        "SGLANG_LINKER_CPU_INDICES",
+        "SGLANG_LINKER_COALESCE_RANGES",
+        "SGLANG_LINKER_VECTOR_PUT",
+        "SGLANG_LINKER_STORE_ARRAYS",
+    )
+
+    def refresh_flags(self) -> None:
+        """Re-read the per-call switches from the environment."""
+        self.vector_meta = envs.SGLANG_LINKER_VECTOR_META.get()
+        self.coalesce_ranges = envs.SGLANG_LINKER_COALESCE_RANGES.get()
+        self.cpu_indices = envs.SGLANG_LINKER_CPU_INDICES.get()
+        store_arrays = getattr(envs, "SGLANG_LINKER_STORE_ARRAYS", None)
+        if store_arrays is not None:
+            self.store_arrays = store_arrays.get()
+        storage = getattr(self, "storage", None)
+        if storage is not None:
+            storage._vector_put_flag = None
+
+    def flag_values(self) -> dict:
+        return {
+            name: str(getattr(envs, name).get())
+            for name in self.TOGGLE_FLAGS
+            if hasattr(envs, name)
+        }
+
+    def reset_cold(self) -> None:
+        """After reset(): drop this stage's store bookkeeping and stats, move to a
+        fresh store key namespace (late puts of the previous arm land in the old
+        one and are never matched), and on PP0 remove every stored object."""
+        self.reset()
+        if self.store_tree is not None:
+            tree = self.store_tree
+            self.store_tree = _StoreTree(
+                tree.budget,
+                tree.state_units,
+                protect=tree.protect,
+                recall=tree.recall,
+            )
+        for table in (
+            self.state_parent,
+            self.state_children,
+            self.state_remove_counts,
+            self.page_remove_counts,
+            self.read_retries,
+            self.write_bytes,
+            self.lookup_counts,
+            self.flag_hits,
+        ):
+            table.clear()
+        self.state_remove_retries.clear()
+        self.page_remove_retries.clear()
+        self.lookup_samples.clear()
+        self.pin_samples.clear()
+        self.pin_holes = self.state_removed = self.state_remove_failed = 0
+        self.prepin_renewals = self.pin_renewals = 0
+        self.stats = dict.fromkeys(self.stats, 0)
+        self.storage.recently_loaded = _RecentKeys(500_000)
+        if getattr(self.storage, "vector_put_batches", None) is not None:
+            self.storage.vector_put_batches = 0
+        if self.lease_refresher is not None and hasattr(self.lease_refresher, "clear"):
+            self.lease_refresher.clear()
+        if self.store_epoch == 0:
+            self._base_config_prefix = self.storage.config_prefix or "linker"
+        self.store_epoch += 1
+        self.storage.config_prefix = f"{self._base_config_prefix}-e{self.store_epoch}"
+        removed = None
+        if self.pp_rank == 0 and self.offload_owner:
+            remove_all = getattr(self.storage.store, "remove_all", None)
+            if callable(remove_all):
+                removed = remove_all()
+        logger.info(
+            "Linker cold reset: store key prefix %s, store objects removed %s",
+            self.storage.config_prefix,
+            removed,
         )
 
     def num_completed_offloads(self) -> int:

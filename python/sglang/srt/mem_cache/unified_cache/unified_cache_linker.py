@@ -2285,6 +2285,32 @@ class UnifiedCacheLinkerWrapper:
         self.inflight_load_index = -1
         self._release_pending_offloads()
 
+    def refresh_flags(self) -> None:
+        """Re-read the backend's per-call switches (POST /linker_flags)."""
+        refresh = getattr(self.cache_linker, "refresh_flags", None)
+        if refresh is not None:
+            refresh()
+
+    def flag_values(self) -> dict:
+        values = getattr(self.cache_linker, "flag_values", None)
+        return values() if values is not None else {}
+
+    def reset_cold(self) -> None:
+        """reset() plus the backend's store state and every stats counter, so
+        the next request sees the linker as a fresh boot would."""
+        self.reset()
+        cold = getattr(self.cache_linker, "reset_cold", None)
+        if cold is not None:
+            cold()
+        for table in (self._lookup_stats, self._hold_stats):
+            for key in table:
+                table[key] = 0
+        for phase in self._phase_s.values():
+            for key in phase:
+                phase[key] = 0.0
+        self._occupied_peak = 0
+        self._requery_waits.clear()
+
     def _release_pending_offloads(self) -> None:
         for pending in self.pending_offloads:
             self.cache.tree_core.finish_external_linker_offload(

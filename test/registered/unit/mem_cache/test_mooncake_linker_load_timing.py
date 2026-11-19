@@ -753,6 +753,7 @@ class TestStoreArrays(CustomTestCase):
             linker, calls = self._linker(per_key=True)
             linker.store_arrays = arrays
             linker.vector_meta = linker.coalesce_ranges = True
+            linker.flag_hits = Counter()
             linker.pools = {PoolName.KV: _VectorPool(PoolName.KV)}
             linker.log_load_timing = False
             linker.load_layer_wise(7, [[_transfer(PoolName.KV, 3)]], [("a", 0.0)])
@@ -1309,6 +1310,147 @@ class TestStoreBudgetKeepsReusedPages(CustomTestCase):
         self.assertEqual(tree.evict(), [])
         self.assertEqual(tree.counts["protected_stops"], 1)
 
+
+class _RemoveAllStore(_LeaseStore):
+    def __init__(self):
+        super().__init__()
+        self.remove_all_calls = 0
+
+    def remove_all(self):
+        self.remove_all_calls += 1
+        return 7
+
+
+def _toggle_linker(stage=0):
+    linker = _budget_linker(16, stage, store=_RemoveAllStore())
+    linker.reset = lambda: None
+    linker.pp_rank, linker.offload_owner = stage, True
+    linker.lease_refresher = None
+    linker.store_epoch = 0
+    linker.storage.config_prefix = "tag_model"
+    linker.state_parent, linker.state_children = {"s": None}, Counter({"s": 1})
+    linker.state_remove_counts, linker.read_retries = Counter(a=1), Counter(b=1)
+    linker.write_bytes, linker.lookup_counts = Counter(c=1), Counter(d=1)
+    linker.flag_hits = Counter(vector_meta_calls=3)
+    linker.state_remove_retries = deque([1])
+    linker.lookup_samples, linker.pin_samples = [(1, 0.1)], [(1, 0.1)]
+    linker.pin_holes = linker.state_removed = linker.state_remove_failed = 2
+    linker.prepin_renewals = linker.pin_renewals = 2
+    linker.stats = {"lookup": 5, "load": 5}
+    return linker
+
+
+class TestRuntimeLinkerFlags(CustomTestCase):
+    """POST /linker_flags: per-call switches re-read without a restart, a cold
+    reset of the linker's store state, and per-flag engagement counters."""
+
+    def test_refresh_flags_switches_the_code_path(self):
+        linker = _toggle_linker()
+        with envs.SGLANG_LINKER_VECTOR_META.override(False), envs.SGLANG_LINKER_CPU_INDICES.override(False):
+            linker.refresh_flags()
+            self.assertFalse(linker.vector_meta)
+            self.assertFalse(linker.cpu_indices)
+        with envs.SGLANG_LINKER_VECTOR_META.override(True), envs.SGLANG_LINKER_CPU_INDICES.override(True), envs.SGLANG_LINKER_COALESCE_RANGES.override(True):
+            linker.storage._vector_put_flag = False
+            linker.refresh_flags()
+            self.assertTrue(linker.vector_meta and linker.cpu_indices and linker.coalesce_ranges)
+            # The store re-reads SGLANG_LINKER_VECTOR_PUT on its next put.
+            self.assertIsNone(linker.storage._vector_put_flag)
+            self.assertEqual(linker.flag_values()["SGLANG_LINKER_VECTOR_META"], "True")
+
+    def test_reset_cold_clears_store_state_and_moves_the_namespace(self):
+        linker = _toggle_linker(stage=0)
+        linker.store_tree.add(["a1", "a2"], None, ())
+        linker.reset_cold()
+        self.assertEqual(linker.store_tree.units, 0)
+        self.assertEqual(linker.store_tree.budget, 16)
+        for table in ("state_parent", "state_children", "state_remove_counts",
+                      "read_retries", "write_bytes", "lookup_counts", "flag_hits"):
+            self.assertFalse(getattr(linker, table), table)
+        self.assertFalse(linker.state_remove_retries or linker.lookup_samples)
+        self.assertEqual(linker.stats, {"lookup": 0, "load": 0})
+        self.assertEqual(linker.storage.config_prefix, "tag_model-e1")
+        self.assertEqual(linker.storage.store.remove_all_calls, 1)
+        linker.reset_cold()
+        self.assertEqual(linker.storage.config_prefix, "tag_model-e2")
+
+    def test_reset_cold_removes_store_objects_on_pp0_only(self):
+        linker = _toggle_linker(stage=3)
+        linker.reset_cold()
+        self.assertEqual(linker.storage.store.remove_all_calls, 0)
+        self.assertEqual(linker.storage.config_prefix, "tag_model-e1")
+
+    def test_engagement_counters_are_logged(self):
+        linker = _toggle_linker()
+        linker.flag_hits = Counter(cpu_indices_attached=4)
+        linker.storage.vector_put_batches = 2
+        linker.stats_logged_at = 0.0
+        with patch.object(mooncake_direct_linker.logger, "info") as info:
+            try:
+                linker._maybe_log_stats(every_s=0.0)
+            except Exception:
+                pass
+        line = info.call_args_list[0]
+        self.assertIn("flag engagement", line.args[0])
+        self.assertEqual(line.args[1], {"cpu_indices_attached": 4, "vector_put_batches": 2})
+
+    def test_scheduler_rejects_flags_outside_the_allowlist_and_when_busy(self):
+        from sglang.srt.managers.io_struct import LinkerFlagsReqInput
+        from sglang.srt.managers.scheduler import Scheduler
+
+        calls = []
+        linker = SimpleNamespace(
+            reset_cold=lambda: calls.append("cold"),
+            refresh_flags=lambda: calls.append("refresh"),
+        )
+        sched = SimpleNamespace(
+            LINKER_TOGGLE_FLAGS=Scheduler.LINKER_TOGGLE_FLAGS,
+            tree_cache=SimpleNamespace(linker=linker),
+            is_fully_idle=lambda: True,
+            flush_cache=lambda: calls.append("flush") or True,
+        )
+        bad = Scheduler.linker_flags_wrapped(
+            sched, LinkerFlagsReqInput(flags={"SGLANG_LINKER_LOAD_THREADS": "4"})
+        )
+        self.assertFalse(bad.success)
+        self.assertIn("SGLANG_LINKER_LOAD_THREADS", bad.message)
+        self.assertEqual(calls, [])
+        sched.is_fully_idle = lambda: False
+        busy = Scheduler.linker_flags_wrapped(
+            sched, LinkerFlagsReqInput(flags={"SGLANG_LINKER_VECTOR_META": "1"})
+        )
+        self.assertEqual((busy.success, busy.message), (False, "busy"))
+        sched.is_fully_idle = lambda: True
+        with envs.SGLANG_LINKER_VECTOR_META.override(False):
+            with patch("sglang.srt.managers.scheduler.get_parallel",
+                       return_value=SimpleNamespace(pp_rank=0)):
+                ok = Scheduler.linker_flags_wrapped(
+                    sched, LinkerFlagsReqInput(flags={"SGLANG_LINKER_VECTOR_META": "1"})
+                )
+            self.assertTrue(ok.success)
+            self.assertEqual(ok.effective["SGLANG_LINKER_VECTOR_META"], "True")
+        self.assertEqual(calls, ["flush", "cold", "refresh"])
+
+    def test_wrapper_reset_cold_zeroes_stats_after_reset(self):
+        from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+            UnifiedCacheLinkerWrapper,
+        )
+
+        calls = []
+        wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+        wrapper.reset = lambda: calls.append("reset")
+        wrapper.cache_linker = SimpleNamespace(reset_cold=lambda: calls.append("cold"))
+        wrapper._lookup_stats = {"issued": 9, "requeried": 2}
+        wrapper._hold_stats = {"held": 4}
+        wrapper._phase_s = {"enq": {"n": 3.0, "rpc": 1.5}}
+        wrapper._occupied_peak = 7
+        wrapper._requery_waits = [1.0]
+        wrapper.reset_cold()
+        self.assertEqual(calls, ["reset", "cold"])
+        self.assertEqual(wrapper._lookup_stats, {"issued": 0, "requeried": 0})
+        self.assertEqual(wrapper._hold_stats, {"held": 0})
+        self.assertEqual(wrapper._phase_s, {"enq": {"n": 0.0, "rpc": 0.0}})
+        self.assertEqual((wrapper._occupied_peak, wrapper._requery_waits), (0, []))
 
 if __name__ == "__main__":
     unittest.main()

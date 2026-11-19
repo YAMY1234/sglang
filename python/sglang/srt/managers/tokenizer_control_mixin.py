@@ -38,6 +38,8 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqType,
     FlushCacheReqInput,
     FlushCacheReqOutput,
+    LinkerFlagsReqInput,
+    LinkerFlagsReqOutput,
     GetHiCacheL3LayoutReq,
     GetHiCacheL3LayoutReqOutput,
     GetInternalStateReq,
@@ -128,6 +130,7 @@ _COMMUNICATOR_SPECS = [
     ("slow_down", SlowDownReqOutput),
     ("pd_role_switch", PdRoleSwitchReqOutput),
     ("flush_cache", FlushCacheReqOutput),
+    ("linker_flags", LinkerFlagsReqOutput),
     ("add_external_corpus", AddExternalCorpusReqOutput),
     ("remove_external_corpus", RemoveExternalCorpusReqOutput),
     ("list_external_corpora", ListExternalCorporaReqOutput),
@@ -332,6 +335,14 @@ class TokenizerControlMixin:
         if result.success and self.mm_processor is not None:
             self.mm_processor.clear_preprocess_cache()
         return result
+
+    async def linker_flags(
+        self: TokenizerManager, obj: LinkerFlagsReqInput
+    ) -> LinkerFlagsReqOutput:
+        self.auto_create_handle_loop()
+        results = await self.linker_flags_communicator(obj)
+        failed = [r for r in results if not r.success]
+        return failed[0] if failed else results[0]
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""
