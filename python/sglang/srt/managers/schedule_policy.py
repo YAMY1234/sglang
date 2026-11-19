@@ -364,8 +364,14 @@ class SchedulePolicy:
         temporary_deprioritized: Set[int] = set()
         self.waiting_queue_radix_tree.reset()
 
+        no_copy = envs.SGLANG_SPF_FAST_MATCH.get()
         for r in waiting_queue:
-            prefix_ids = r.origin_input_ids + r.output_ids
+            # Matching only reads the ids: skip the per-pass copy of the whole prompt.
+            prefix_ids = (
+                r.origin_input_ids
+                if no_copy and not r.output_ids
+                else r.origin_input_ids + r.output_ids
+            )
             extra_key = r.extra_key
             cache_salt = r.cache_salt
             match_result = match_kv_cache(r, self.tree_cache, prefix_ids)

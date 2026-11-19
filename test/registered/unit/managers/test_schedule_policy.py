@@ -152,6 +152,38 @@ class TestShortestPrefillFirst(CustomTestCase):
             self.policy.calc_priority(queue)
         self.assertEqual([req.rid for req in queue], ["cached", "short", "long"])
 
+    def test_fast_match_keeps_matches_and_order(self):
+        import torch
+
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+
+        def run(fast):
+            policy = SchedulePolicy(
+                policy="shortest-prefill-first",
+                tree_cache=RadixCache.create_simulated(),
+                enable_hierarchical_cache=True,
+                enable_priority_scheduling=False,
+                schedule_low_priority_values_first=False,
+            )
+            shared = list(range(4096))
+            policy.tree_cache.insert(InsertParams(key=RadixKey(token_ids=array("q", shared[:2048])), value=torch.arange(2048)))
+            queue = [
+                _make_req("a", "", shared + list(range(9000, 9100))),
+                _make_req("b", "", list(range(5000, 5300))),
+                _make_req("c", "", shared[:1024]),
+            ]
+            for req in queue:
+                req.time_stats.wait_queue_entry_time = 0
+            prompts = [list(req.origin_input_ids) for req in queue]
+            with patch.object(envs.SGLANG_SPF_FAST_MATCH, "get", return_value=fast):
+                policy.calc_priority(queue)
+            self.assertEqual([list(req.origin_input_ids) for req in sorted(queue, key=lambda r: r.rid)], prompts)
+            return [(req.rid, req.prefix_len, req.num_matched_prefix_tokens) for req in queue]
+
+        self.assertEqual(run(True), run(False))
+
     def test_equal_work_uses_arrival_time(self):
         older = self.make_req("z", 32, arrived=1)
         newer = self.make_req("a", 32, arrived=2)
