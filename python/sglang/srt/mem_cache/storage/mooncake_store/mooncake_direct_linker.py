@@ -399,6 +399,7 @@ class _StoreTree:
         """An offload of ``pages`` (in path order) under ``parent``, with a
         state stored at each of ``states``."""
         self.tick += 1
+        added = []
         for page in pages:
             node = self.nodes.get(page)
             if node is None and self.recall:
@@ -407,8 +408,13 @@ class _StoreTree:
                 node = self._insert(page, parent)
             else:
                 node[2] = self.tick
-            self._push_if_leaf(page, node)
+            added.append((page, node))
             parent = page
+        # Only the pages still leaves once the whole chain is in: an entry for a
+        # page that gets its child next is skipped by every evict, yet it grows
+        # the heap until the O(nodes) rebuild below stalls the scheduler.
+        for page, node in added:
+            self._push_if_leaf(page, node)
         for page in states:
             node = self.nodes.get(page)
             if node is not None and not node[3]:
@@ -452,13 +458,15 @@ class _StoreTree:
         victims = []
         while self.units > self.low and self.heap:
             tick, page = self.heap[0]
+            node = self.nodes.get(page)
+            if node is None or node[1] or node[2] != tick:
+                heapq.heappop(self.heap)
+                continue  # gone, not a leaf any more, or used since
             if self.protect and tick > self.tick - self.protect:
+                # Judged on a live leaf only, so stale entries never change the victims.
                 self.counts["protected_stops"] += 1
                 break  # the oldest leaf is recent: so is every other one
             heapq.heappop(self.heap)
-            node = self.nodes.get(page)
-            if node is None or node[1] or node[2] != tick:
-                continue  # gone, not a leaf any more, or used since
             del self.nodes[page]
             self.units -= 1 + (self.state_units if node[3] else 0)
             self.states -= node[3]

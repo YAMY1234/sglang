@@ -1204,6 +1204,57 @@ class TestStoreBudgetTailFirst(CustomTestCase):
         # b still has a stored child: c goes first, then b, never b before c.
         self.assertEqual([page for page, _ in tree.evict()], ["c", "b"])
 
+    def test_victims_unchanged_while_the_heap_holds_only_chain_ends(self):
+        """earlyab8: one heap entry per added page let the lazy heap reach 4x
+        the nodes and the O(nodes) rebuild stalled every stage (283 ms at 1.1M
+        pages). Pushing only the pages that stay leaves picks the same victims."""
+        import heapq
+        import random
+
+        class _EveryPage(mooncake_direct_linker._StoreTree):
+            def add(self, pages, parent, states):  # the previous push: every page as it goes in
+                self.tick += 1
+                for page in pages:
+                    node = self.nodes.get(page)
+                    if node is None and self.recall:
+                        node = self._recall(page)
+                    if node is None:
+                        node = self._insert(page, parent)
+                    else:
+                        node[2] = self.tick
+                    self._push_if_leaf(page, node)
+                    parent = page
+                for page in states:
+                    node = self.nodes.get(page)
+                    if node is not None and not node[3]:
+                        node[3] = True
+                        self.units += self.state_units
+                        self.states += 1
+
+        for seed in range(5):
+            rng, trees = random.Random(seed), []
+            for cls in (mooncake_direct_linker._StoreTree, _EveryPage):
+                trees.append(cls(400, 7, protect=3, recall=20))
+            chains, victims, n = [], [[], []], 0
+            for step in range(300):
+                if chains and rng.random() < 0.4:
+                    chain = rng.choice(chains)
+                    used = chain[: rng.randint(1, len(chain))]
+                    for tree in trees:
+                        tree.touch(used)
+                    continue
+                length = rng.randint(1, 30)
+                pages = [f"p{n + i}" for i in range(length)]
+                n += length
+                parent = rng.choice(chains)[-1] if chains and rng.random() < 0.5 else None
+                states = [pages[-1]] if rng.random() < 0.5 else []
+                for i, tree in enumerate(trees):
+                    tree.add(pages, parent, states)
+                    victims[i].append(tree.evict())
+                chains.append(pages)
+            self.assertEqual(victims[0], victims[1], seed)
+            self.assertLess(len(trees[0].heap), len(trees[1].heap), seed)
+
     def test_off_by_default(self):
         linker = _budget_linker(16, 0)
         linker.store_tree = None
