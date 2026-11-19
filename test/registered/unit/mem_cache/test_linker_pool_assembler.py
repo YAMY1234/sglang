@@ -183,6 +183,86 @@ class TestDevicePoolEntry(CustomTestCase):
         )
         self.assertIsNone(vector_key_range_meta(unpacked, [0], 1))
 
+    def test_coalesce_and_vector_put_meta_match_reference(self):
+        # SGLANG_LINKER_COALESCE_RANGES merges ranges contiguous in the object and
+        # in device memory, and is a no-op on separate tensors; SGLANG_LINKER_VECTOR_PUT
+        # builds the store's packed per-page buffer lists with numpy.
+        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+            MergedPageEntry,
+            vector_key_range_meta,
+            vector_page_buffer_meta,
+        )
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        big = torch.zeros((16, 8), dtype=torch.uint8)
+        halves = DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=None,
+            components=[[big[:, 0:4], big[:, 4:8]]],
+            layer_mapping={0: [0, 1]},
+            page_size=2,
+            rows_are_pages=True,
+        )
+        locations = halves.prepare_locations(torch.tensor([0, 1, 6, 7]))
+        ptrs, sizes, offsets = vector_key_range_meta(halves, locations, 1, coalesce=True)
+        self.assertEqual(sizes, [[8], [8]])
+        self.assertEqual(offsets, [[0], [0]])
+        self.assertEqual(ptrs, [[big[r].data_ptr()] for r in locations])
+
+        kv = [torch.zeros((16, 4), dtype=torch.uint8) for _ in range(3)]
+        ix = torch.zeros((8, 5), dtype=torch.uint8)
+        kv_pool = DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=None,
+            components=[kv],
+            layer_mapping={0: 0, 1: 1, 2: 2},
+            page_size=2,
+            rows_are_pages=False,
+        )
+        ix_pool = DevicePoolEntry(
+            name=PoolName.INDEXER,
+            indices_from_pool=PoolName.KV,
+            device_pool=None,
+            components=[[ix]],
+            layer_mapping={1: 0},
+            page_size=2,
+            rows_are_pages=True,
+        )
+        merged = MergedPageEntry(kv_pool, ix_pool, object_name="ki")
+        single = DevicePoolEntry(
+            name=PoolName.INDEXER,
+            indices_from_pool=PoolName.KV,
+            device_pool=None,
+            components=[[ix]],
+            layer_mapping={0: 0},
+            page_size=2,
+            rows_are_pages=True,
+        )
+        indices = torch.tensor([0, 1, 6, 7, 14, 15])
+        for pool in (kv_pool, merged, single):
+            with self.subTest(pool=type(pool).__name__):
+                locations = pool.prepare_locations(indices)
+                self.assertEqual(
+                    vector_key_range_meta(pool, locations, 3, coalesce=True),
+                    vector_key_range_meta(pool, locations, 3),
+                )
+                ptr_list, size_list = pool.get_page_buffer_meta(indices)
+                keys = [f"k{i}" for i in range(len(locations))]
+                expected = MooncakeStore._pack_multi_buffer_meta(keys, ptr_list, size_list)
+                self.assertEqual(vector_page_buffer_meta(pool, indices), expected)
+
+        store = MooncakeStore.__new__(MooncakeStore)
+        results = [0, -1, 5, 0]
+        for flag in (False, True):
+            store._vector_put_flag = flag
+            for is_set in (False, True):
+                got = store._batch_postprocess(results, is_set_operate=is_set, key_multiplier=1)
+                self.assertEqual(got, [r == 0 if is_set else r > 0 for r in results])
+
     def test_cpu_indices_keep_device_copies_off_linker_threads(self):
         # SGLANG_LINKER_CPU_INDICES: prefetch slots (allocator) and offload node
         # values are device tensors; the scheduler thread copies them to the CPU

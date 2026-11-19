@@ -28,6 +28,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     DevicePoolEntry,
     MergedPageEntry,
+    vector_page_buffer_meta,
 )
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -886,6 +887,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         for buf in self._iter_host_pool_buffers(host_pool):
             super().register_buffer(buf)
 
+    def _vector_put(self) -> bool:
+        flag = getattr(self, "_vector_put_flag", None)
+        if flag is None:
+            flag = self._vector_put_flag = envs.SGLANG_LINKER_VECTOR_PUT.get()
+        return flag
+
     def _tag_keys(self, keys: List[str]) -> List[str]:
         if self.config_prefix is None:
             return keys
@@ -1237,7 +1244,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             assert len(keys) > 0
             assert len(keys) == len(host_indices) // page_size
 
-            tagged_keys = self._tag_keys(keys)
+            tagged_keys = (
+                None
+                if self._vector_put() and not (is_set and self._can_use_group_semantics())
+                else self._tag_keys(keys)
+            )
             key_strs, key_multiplier = self._get_hybrid_page_component_keys(
                 keys, transfer
             )
@@ -1260,7 +1271,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if is_set:
             # Objects a load just read are stored: skip their query (and put).
             recent = getattr(self, "recently_loaded", None) or ()
-            ask = [i for i, key in enumerate(all_key_strs) if key not in recent]
+            if self._vector_put() and hasattr(recent, "keys"):
+                # SGLANG_LINKER_VECTOR_PUT: one dict probe per key, no method call.
+                recent_keys = recent.keys
+                ask = [i for i, key in enumerate(all_key_strs) if key not in recent_keys]
+            else:
+                ask = [i for i, key in enumerate(all_key_strs) if key not in recent]
             exist_result = [1] * len(all_key_strs)
             if ask:
                 found = self._batch_exist([all_key_strs[i] for i in ask])
@@ -1282,7 +1298,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             all_ptrs.extend(pool_ptrs)
             all_sizes.extend(pool_sizes)
 
-        if any(isinstance(ptr, Sequence) for ptr in all_ptrs):
+        if (
+            any(type(ptr) in (list, tuple) for ptr in all_ptrs)
+            if self._vector_put()
+            else any(isinstance(ptr, Sequence) for ptr in all_ptrs)
+        ):
             all_ptrs = [
                 list(ptr) if isinstance(ptr, Sequence) else [ptr] for ptr in all_ptrs
             ]
@@ -1370,7 +1390,18 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 ]
 
         selected_keys = [key_strs[i] for i in object_indices]
-        ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
+        vector = (
+            vector_page_buffer_meta(host_pool, host_indices)
+            if self._vector_put()
+            else None
+        )
+        if vector is not None and len(vector[0]) == len(selected_keys):
+            # SGLANG_LINKER_VECTOR_PUT: the packed per-page lists, built with numpy.
+            if len(object_indices) == len(key_strs):
+                return vector
+            ptr_list, element_size_list = vector
+        else:
+            ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
         if len(ptr_list) != len(selected_keys):
             ptr_list, element_size_list = self._pack_multi_buffer_meta(
                 selected_keys, ptr_list, element_size_list
@@ -1496,6 +1527,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 if self.should_split_heads:
                     key_multiplier *= self.split_factor
 
+        if key_multiplier == 1 and self._vector_put():
+            return [res == 0 for res in results] if is_set_operate else [res > 0 for res in results]
         result_groups = [
             results[i : i + key_multiplier]
             for i in range(0, len(results), key_multiplier)

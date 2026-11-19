@@ -211,20 +211,93 @@ class DevicePoolEntry:
         return np.asarray(locations, dtype=np.int64).reshape(-1, 1)
 
 
-def vector_key_range_meta(entry, locations, num_layers: int):
+def coalesce_key_range_table(table: np.ndarray) -> np.ndarray:
+    """Merge consecutive items that stay contiguous for every row: same source
+    location and stride, the next item's device base right after this one's bytes,
+    and the next object offset right after this one's. Exact for any row."""
+    if len(table) < 2:
+        return table
+    out = [list(table[0])]
+    for src, base, stride, size, offset in table[1:].tolist():
+        last = out[-1]
+        if (
+            src == last[0]
+            and stride == last[2]
+            and base == last[1] + last[3]
+            and offset == last[4] + last[3]
+        ):
+            last[3] += size
+        else:
+            out.append([src, base, stride, size, offset])
+    return np.array(out, dtype=np.int64).reshape(-1, 5)
+
+
+def vector_key_range_meta(entry, locations, num_layers: int, coalesce: bool = False):
     """Per-key (ptrs, sizes, offsets) lists for a packed or merged entry, equal to
     concatenating get_prepared_layer_range_meta over layers 0..num_layers-1; None
-    when the entry has no vector table (unpacked)."""
+    when the entry has no vector table (unpacked). With ``coalesce``
+    (SGLANG_LINKER_COALESCE_RANGES) contiguous items are merged and every key
+    shares one size list and one offset list (read-only for the store call)."""
     table = entry.key_range_table(num_layers)
     if table is None:
         return None
+    if coalesce:
+        cached = getattr(entry, "_coalesced_table", None)
+        if cached is None or cached[0] is not table:
+            cached = (table, coalesce_key_range_table(table))
+            entry._coalesced_table = cached
+        table = cached[1]
     rows = entry.key_range_rows(locations)
     src, base, stride, size, offset = table.T
     ptrs = base[None, :] + rows[:, src] * stride[None, :]
     count = rows.shape[0]
+    if coalesce:
+        size_row, offset_row = size.tolist(), offset.tolist()
+        return ptrs.tolist(), [size_row] * count, [offset_row] * count
     sizes = np.broadcast_to(size, (count, size.shape[0]))
     offsets = np.broadcast_to(offset, (count, offset.shape[0]))
     return ptrs.tolist(), sizes.tolist(), offsets.tolist()
+
+
+def page_buffer_table(entry):
+    """SGLANG_LINKER_VECTOR_PUT: (src, base, stride, size) per buffer of one page
+    object, in get_page_buffer_meta order (``first``'s buffers, then ``second``'s
+    for a merged entry); None for an entry it does not cover."""
+    cached = getattr(entry, "_page_buffer_table", None)
+    if cached is not None:
+        return cached
+    if isinstance(entry, MergedPageEntry):
+        parts = [(0, entry.first), (1, entry.second)]
+    elif isinstance(entry, DevicePoolEntry):
+        parts = [(0, entry)]
+    else:
+        return None
+    rows = [
+        (src, base, stride, size)
+        for src, part in parts
+        for component in part.buffer_meta
+        for base, stride, size in component
+    ]
+    table = np.array(rows, dtype=np.int64).reshape(-1, 4)
+    entry._page_buffer_table = table
+    return table
+
+
+def vector_page_buffer_meta(entry, indices):
+    """Per-page (ptrs, sizes) equal to get_page_buffer_meta followed by the store's
+    per-key packing: one list per page when a page has several buffers, a plain
+    int otherwise. None when ``entry`` has no table."""
+    table = page_buffer_table(entry)
+    if table is None:
+        return None
+    rows = entry.key_range_rows(entry.prepare_locations(indices))
+    src, base, stride, size = table.T
+    ptrs = base[None, :] + rows[:, src] * stride[None, :]
+    count = rows.shape[0]
+    if table.shape[0] == 1:
+        return ptrs[:, 0].tolist(), [int(size[0])] * count
+    size_row = size.tolist()
+    return ptrs.tolist(), [list(size_row) for _ in range(count)]
 
 
 class MergedPageEntry:

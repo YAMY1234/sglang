@@ -1057,6 +1057,13 @@ class Envs:
     # scheduler thread (non-blocking, before the ready event), so the linker threads
     # never D2H-copy indices against the forward.
     SGLANG_LINKER_CPU_INDICES = EnvBool(False)
+    # Per-key load (with VECTOR_META): merge a key's ranges that are contiguous in
+    # both the object and device memory, and share the identical size/offset lists
+    # across keys instead of building one per key.
+    SGLANG_LINKER_COALESCE_RANGES = EnvBool(False)
+    # Offload puts: build per-key buffer addresses with numpy and batch the
+    # recent-key / result bookkeeping (the offload thread's GIL share).
+    SGLANG_LINKER_VECTOR_PUT = EnvBool(False)
     # Load threads, each reading its own batch (0: 2 with SGLANG_LINKER_LOAD_OVERLAP,
     # else 1).
     SGLANG_LINKER_LOAD_THREADS = EnvInt(0)

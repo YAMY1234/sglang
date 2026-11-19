@@ -700,6 +700,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         self.load_per_key = envs.SGLANG_LINKER_LOAD_PER_KEY.get()
         self.vector_meta = envs.SGLANG_LINKER_VECTOR_META.get()
+        self.coalesce_ranges = envs.SGLANG_LINKER_COALESCE_RANGES.get()
         self.cpu_indices = envs.SGLANG_LINKER_CPU_INDICES.get()
         self.num_load_threads = envs.SGLANG_LINKER_LOAD_THREADS.get() or (
             2 if self.load_overlap else 1
@@ -1878,7 +1879,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         keys_all, ptrs_all, sizes_all, offsets_all, base = [], [], [], [], {}
         for name, (keys, locations) in batches.items():
             vector = (
-                vector_key_range_meta(self.pools[name], locations, self.num_layers)
+                vector_key_range_meta(
+                    self.pools[name], locations, self.num_layers, self.coalesce_ranges
+                )
                 if self.vector_meta
                 else None
             )
