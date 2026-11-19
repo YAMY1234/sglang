@@ -4528,7 +4528,13 @@ class DeepseekSparseAttnBackend(
             **attention_kwargs,
         )
         if kernel_heads != layer.tp_q_head_num:
-            out = out[..., : layer.tp_q_head_num, :].contiguous()
+            out = out[..., : layer.tp_q_head_num, :]
+            if not (
+                is_prefill
+                and getattr(layer, "mla_strided_out_ok", False)
+                and envs.SGLANG_DSA_MLA_PREFILL_STRIDED_OUT.get()
+            ):
+                out = out.contiguous()
         return _restore_trtllm_decode_dp_padding(out, num_decode_padding_rows)
 
     def _forward_prims_ts(

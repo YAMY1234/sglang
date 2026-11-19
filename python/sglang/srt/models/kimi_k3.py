@@ -2936,6 +2936,8 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             reduce_results=False,
             alt_stream=alt_stream,
         )
+        # forward_absorb_core reads a strided prefill MLA output in its bmm.
+        self.attn_mqa.mla_strided_out_ok = True
         if split_gguf_kv_b:
             del self.fused_qkv_a_proj_with_mqa
             del self.kv_b_proj

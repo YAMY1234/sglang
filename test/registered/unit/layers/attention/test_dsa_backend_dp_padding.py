@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention import graph_utils
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.layers.attention.dsa_backend import (
@@ -170,7 +171,20 @@ class TestDSABackendDPPadding(CustomTestCase):
     def test_trtllm_prefill_narrows_metadata_to_live_cp_queries(self):
         self._check_trtllm_padding(is_prefill=True)
 
-    def _check_trtllm_padding(self, *, is_prefill):
+    def test_trtllm_prefill_hands_head_slice_to_opted_in_layer(self):
+        # 96 heads run padded to 128; an opted-in layer gets the strided slice.
+        for strided_ok, env_on in ((False, True), (True, True), (True, False)):
+            with (
+                self.subTest(strided_ok=strided_ok, env_on=env_on),
+                envs.SGLANG_DSA_MLA_PREFILL_STRIDED_OUT.override(env_on),
+            ):
+                output = self._check_trtllm_padding(
+                    is_prefill=True, num_heads=96, strided_ok=strided_ok
+                )
+                self.assertEqual(output.is_contiguous(), not (strided_ok and env_on))
+
+    def _check_trtllm_padding(self, *, is_prefill, num_heads=2, strided_ok=False):
+        kernel_heads = 128 if num_heads == 96 else num_heads
         metadata = SimpleNamespace(
             cache_seqlens_int32=torch.tensor([8, 12], dtype=torch.int32),
             page_table_1=torch.zeros((2, 12), dtype=torch.int32),
@@ -194,8 +208,8 @@ class TestDSABackendDPPadding(CustomTestCase):
             dsa_index_topk=2,
             _multi_ctas_kv_counter_buffer=None,
             device="cpu",
-            num_q_heads=2,
-            num_dcp_q_heads=2,
+            num_q_heads=num_heads,
+            num_dcp_q_heads=num_heads,
             dcp_size=1,
         )
         backend._pad_topk_indices = MethodType(
@@ -210,13 +224,14 @@ class TestDSABackendDPPadding(CustomTestCase):
 
         layer = SimpleNamespace(
             layer_id=0,
-            tp_q_head_num=2,
+            tp_q_head_num=num_heads,
             head_dim=3,
             k_scale_float=None,
             scaling=1.0,
+            mla_strided_out_ok=strided_ok,
         )
         forward_batch = SimpleNamespace()
-        q = torch.arange(4 * 2 * 3, dtype=torch.float32).view(4, 2, 3)
+        q = torch.arange(4 * num_heads * 3, dtype=torch.float32).view(4, num_heads, 3)
         topk_indices = torch.arange(4 * 2, dtype=torch.int32).view(4, 2)
         if is_prefill:
             # The CP graph bridge has removed padded Q rows; metadata was
@@ -235,7 +250,9 @@ class TestDSABackendDPPadding(CustomTestCase):
 
         def fake_decode(**kwargs):
             captured.update(kwargs)
-            return torch.ones((2, 1, 2, 2), dtype=torch.bfloat16)
+            out = torch.ones((2, 1, kernel_heads, 2), dtype=torch.bfloat16)
+            out[:, :, num_heads:] = 7  # padded heads never reach the output
+            return out
 
         flashinfer_decode.trtllm_batch_decode_with_kv_cache_mla = fake_decode
         flashinfer.decode = flashinfer_decode
@@ -280,11 +297,12 @@ class TestDSABackendDPPadding(CustomTestCase):
                 is_prefill=is_prefill,
             )
 
-        self.assertEqual(captured["query"].shape, (2, 1, 2, 3))
+        self.assertEqual(captured["query"].shape, (2, 1, kernel_heads, 3))
         self.assertEqual(captured["seq_lens"].tolist(), [8, 12])
-        self.assertEqual(output.shape, (2 if is_prefill else 4, 1, 2, 2))
+        self.assertEqual(output.shape, (2 if is_prefill else 4, 1, num_heads, 2))
         self.assertTrue(torch.all(output[:2] == 1))
         self.assertTrue(torch.all(output[2:] == 0))
+        return output
 
 
 if __name__ == "__main__":

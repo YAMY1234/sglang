@@ -1064,6 +1064,17 @@ class DeepseekMLAForwardMixin:
 
         _kvb_v = None
         kv_b_lora = kv_b_lora_correction(self)
+        # A strided head slice (SGLANG_DSA_MLA_PREFILL_STRIDED_OUT) is read in
+        # place only by the plain BF16 bmm below.
+        if not attn_output.is_contiguous() and (
+            kv_b_lora
+            or _SGLANG_EXPERIMENTAL_LORA_OPTI
+            or _is_musa
+            or getattr(self, "_kimi_split_gguf_kv_b", False)
+            or self.use_deep_gemm_bmm
+            or self.w_vc.dtype != torch.bfloat16
+        ):
+            attn_output = attn_output.contiguous()
         if _SGLANG_EXPERIMENTAL_LORA_OPTI:
             # Fork the kv_b v-correction A-step onto the LoRA side stream to overlap the bmm.
             from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (

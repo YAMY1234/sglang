@@ -2281,6 +2281,9 @@ class Envs:
     # DSA backend (GLM 5 and DeepSeek V3.2)
     # ===================================================================
     SGLANG_DSA_FUSE_TOPK = EnvBool(True)
+    # Prefill TRT-LLM MLA: hand a head slice of the padded output to a layer that
+    # opted in (mla_strided_out_ok) instead of copying it with .contiguous().
+    SGLANG_DSA_MLA_PREFILL_STRIDED_OUT = EnvBool(True)
     # DCP decode top-k: the local top-k selects only the merge's candidates and
     # pushes them itself; the merge skips the local top-2048 and also returns the
     # localized rows (dsa/dsa_dcp_sharded.py).
