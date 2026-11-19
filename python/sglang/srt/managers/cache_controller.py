@@ -1045,22 +1045,24 @@ class HiCacheController:
         return device_indices
 
     def _pinned_indices_to_device(self, host_indices: torch.Tensor) -> torch.Tensor:
-        """Pageable host indices copied asynchronously through one of two reused pinned buffers; a buffer is
-        refilled only after the copy that last read it has finished (its event)."""
-        if not hasattr(self, "_index_pin_bufs"):
-            self._index_pin_bufs, self._index_pin_events, self._index_pin_slot = [None, None], [None, None], 0
-        slot = self._index_pin_slot = 1 - self._index_pin_slot
-        if self._index_pin_events[slot] is not None:
-            self._index_pin_events[slot].synchronize()
-        n, buf = host_indices.numel(), self._index_pin_bufs[slot]
-        if buf is None or buf.numel() < n or buf.dtype != host_indices.dtype:
+        """Pageable host indices uploaded asynchronously through a pinned buffer of their own: a buffer goes back to
+        the free list once its copy's event has completed (polled, never waited on), and the pool grows when every
+        buffer is still in flight (a load uploads one index set per pool)."""
+        pool = self.__dict__.setdefault("_index_pin_pool", {"free": [], "busy": []})
+        busy, pool["busy"] = pool["busy"], []
+        for buf, event in busy:
+            (pool["free"].append(buf) if event.query() else pool["busy"].append((buf, event)))
+        n = host_indices.numel()
+        fit = [i for i, b in enumerate(pool["free"]) if b.numel() >= n and b.dtype == host_indices.dtype]
+        if fit:
+            buf = pool["free"].pop(fit[0])
+        else:
             buf = torch.empty(max(n, 1 << 16), dtype=host_indices.dtype, pin_memory=True)
-            self._index_pin_bufs[slot] = buf
         buf[:n].copy_(host_indices.reshape(-1))
         out = buf[:n].to(self.device, non_blocking=True).view(host_indices.shape)
         event = device_module.Event()
         event.record()
-        self._index_pin_events[slot] = event
+        pool["busy"].append((buf, event))
         return out
 
     def move_indices(
@@ -1069,7 +1071,10 @@ class HiCacheController:
         # move indices to GPU if using kernels, to host if using direct indexing
         if self.io_backend == "kernel":
             if not host_indices.is_cuda:
-                if envs.SGLANG_HICACHE_PIN_LOAD_INDICES.get() and not host_indices.is_pinned():
+                # loads only: their transfer waits on start_event, recorded on this stream after the upload; a write
+                # fenced on fence_event does not wait on this stream
+                if (envs.SGLANG_HICACHE_PIN_LOAD_INDICES.get() and getattr(self, "_index_pin_load", False)
+                        and not host_indices.is_pinned()):
                     host_indices = self._pinned_indices_to_device(host_indices)
                 else:
                     host_indices = host_indices.to(self.device, non_blocking=True)
@@ -1155,7 +1160,11 @@ class HiCacheController:
 
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
-        host_indices, device_indices, pool_transfers = self._move_op_indices(op)
+        self._index_pin_load = True
+        try:
+            host_indices, device_indices, pool_transfers = self._move_op_indices(op)
+        finally:
+            self._index_pin_load = False
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
