@@ -1733,12 +1733,12 @@ class SchedulerDisaggregationPrefillMixin:
             d = diag.pop(room, {})
             t1 = time.perf_counter()
             if t1 - t0 > 0.05:
-                rel = {k: round((v - t0) * 1e3, 1) for k, v in d.items() if k in ("deq", "processed", "conclude")}
+                rel = {k: round((v - t0) * 1e3, 1) for k, v in d.items() if k in ("deq", "processed", "conclude", "prev_end") and v is not None}
                 logger.info(
                     "SETTLE_DIAG room=%s settle_ms=%.1f status_terminal_ms=%s rel_ms=%s info=%s",
                     room, (t1 - t0) * 1e3,
                     None if t_status is None else round((t_status - t0) * 1e3, 1), rel,
-                    {k: v for k, v in d.items() if k not in ("deq", "processed", "conclude")},
+                    {k: v for k, v in d.items() if k not in ("deq", "processed", "conclude", "prev_end")},
                 )
         return True
 

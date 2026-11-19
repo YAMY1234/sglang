@@ -372,6 +372,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 check_mooncake_custom_mem_pool_enabled()
             )
             self.settle_diag = {} if envs.SGLANG_DISAGG_SETTLE_DIAG.get() else None
+            self._diag_worker_end = {}
             self._staging_ctx = PrefillStagingContext() if self.enable_staging else None
             if self.enable_staging:
                 self._init_staging_buffers(len(self.transfer_queues))
@@ -3057,6 +3058,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     infos = self.transfer_infos.get(kv_chunk.room, {})
                     self.settle_diag.setdefault(kv_chunk.room, {}).update(
                         deq=time.perf_counter(), worker=worker_index, n_info=len(infos),
+                        prev_end=self._diag_worker_end.get(worker_index),
                         required=next((r.required_dst_info_num for r in infos.values()), None),
                     )
 
@@ -3393,6 +3395,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         n_info_end=len(self.transfer_infos.get(kv_chunk.room, {})),
                         deferred=staging_deferred,
                     )
+                if self.settle_diag is not None:
+                    self._diag_worker_end[worker_index] = time.perf_counter()
                 if staging_deferred:
                     continue
 
