@@ -895,6 +895,9 @@ class CommonKVManager(BaseKVManager):
 
         if targets is None:
             targets = self._room_notify_targets(bootstrap_room)
+        diag = getattr(self, "settle_diag", None)
+        if diag is not None:
+            diag.setdefault(bootstrap_room, {}).update(conclude=time.perf_counter(), status=int(status))
         self.update_status(bootstrap_room, status)
         if status == KVPoll.Success and self.deferred_bootstrap is not None:
             # Success permits decode to reuse the room after true retraction.

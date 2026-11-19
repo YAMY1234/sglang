@@ -357,6 +357,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.enable_custom_mem_pool, self.custom_mem_pool_type = (
                 check_mooncake_custom_mem_pool_enabled()
             )
+            self.settle_diag = {} if envs.SGLANG_DISAGG_SETTLE_DIAG.get() else None
             self._staging_ctx = PrefillStagingContext() if self.enable_staging else None
             if self.enable_staging:
                 self._init_staging_buffers(len(self.transfer_queues))
@@ -2834,6 +2835,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 if not kv_chunk.staging_counted:
                     self._staging_outstanding[kv_chunk.room] += 1
                     kv_chunk.staging_counted = True
+                if kv_chunk.is_last_chunk and self.settle_diag is not None:
+                    infos = self.transfer_infos.get(kv_chunk.room, {})
+                    self.settle_diag.setdefault(kv_chunk.room, {}).update(
+                        deq=time.perf_counter(), worker=worker_index, n_info=len(infos),
+                        required=next((r.required_dst_info_num for r in infos.values()), None),
+                    )
 
                 # Under overlap scheduling an early cached-prefix send can
                 # precede completion of the previous prefill forward. Wait on
@@ -3159,6 +3166,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         thread_finish_flag=True,
                     )
 
+                if kv_chunk.is_last_chunk and self.settle_diag is not None:
+                    self.settle_diag.setdefault(kv_chunk.room, {}).update(
+                        processed=time.perf_counter(), polls=len(polls),
+                        n_info_end=len(self.transfer_infos.get(kv_chunk.room, {})),
+                        deferred=staging_deferred,
+                    )
                 if staging_deferred:
                     continue
 

@@ -1713,15 +1713,33 @@ class SchedulerDisaggregationPrefillMixin:
         kv_mgr = req.disagg_kv_sender.kv_mgr
         room = req.bootstrap_room
         waited = False
+        t0 = time.perf_counter()
+        t_status = None
         while (
             kv_mgr.request_status.get(room)
             not in (None, KVPoll.Success, KVPoll.Failed)
             or kv_mgr._staging_outstanding.get(room, 0) > 0
         ):
+            if t_status is None and kv_mgr.request_status.get(room) in (
+                None, KVPoll.Success, KVPoll.Failed
+            ):
+                t_status = time.perf_counter()
             waited = True
             time.sleep(PREFILL_INPUT_POLL_INTERVAL_S)
         if waited:
             self.disagg_prefill_early_send_stats["waited"] += 1
+        diag = getattr(kv_mgr, "settle_diag", None)
+        if diag is not None:
+            d = diag.pop(room, {})
+            t1 = time.perf_counter()
+            if t1 - t0 > 0.05:
+                rel = {k: round((v - t0) * 1e3, 1) for k, v in d.items() if k in ("deq", "processed", "conclude")}
+                logger.info(
+                    "SETTLE_DIAG room=%s settle_ms=%.1f status_terminal_ms=%s rel_ms=%s info=%s",
+                    room, (t1 - t0) * 1e3,
+                    None if t_status is None else round((t_status - t0) * 1e3, 1), rel,
+                    {k: v for k, v in d.items() if k not in ("deq", "processed", "conclude")},
+                )
         return True
 
     def send_kv_chunk(

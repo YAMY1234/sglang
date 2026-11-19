@@ -806,6 +806,8 @@ class Envs:
     # Run each KV transfer worker thread on its own device stream, so the DCP pack gather's
     # producer edge orders only after that worker's own work, not the legacy default stream (default off).
     SGLANG_DISAGG_TRANSFER_WORKER_STREAM = EnvBool(False)
+    # Diagnostic: log the transfer worker's last-chunk timeline for PP PD settles longer than 50 ms.
+    SGLANG_DISAGG_SETTLE_DIAG = EnvBool(False)
     # PP PD prefill: an early-sent last chunk still in transfer does not block the result; the
     # checkpoint's device frees for that request wait until its transfer ends (default off).
     SGLANG_PP_PD_DEFER_EARLY_SETTLE = EnvBool(False)
