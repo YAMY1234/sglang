@@ -1602,6 +1602,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             first=0,
             prefix_hits=0,
             prefix_tokens=0,
+            packed=0,
+            per_rank=0,
             since=time.monotonic(),
         )
 
@@ -1628,7 +1630,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         logger.info(
             "PD DCP send stats over %.0f s: %d sends, %d tokens, descriptor build "
             "%.3f ms/send (%.4f ms per 1k tokens), decode prefix on %d/%d first "
-            "chunks (mean %.0f tokens), vectorized=%s",
+            "chunks (mean %.0f tokens), vectorized=%s, chunk_pack sends packed=%d per_rank=%d, "
+            "shard_by_room=%s queue_puts=%s, gather_high_priority=%s",
             elapsed,
             st["sends"],
             st["tokens"],
@@ -1638,6 +1641,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             st["first"],
             st["prefix_tokens"] / max(1, st["first"]),
             envs.SGLANG_DISAGG_DCP_VECTORIZED_BLOCKS.get(),
+            st["packed"],
+            st["per_rank"],
+            envs.SGLANG_DISAGG_TRANSFER_SHARD_BY_ROOM.get(),
+            list(getattr(self, "_queue_puts", [])),
+            envs.SGLANG_DISAGG_GATHER_STREAM_HIGH_PRIORITY.get(),
         )
 
     def _send_kvcache_dcp_chunk_packed(
@@ -1925,11 +1933,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 executor=executor,
             )
             if ret is not None:
+                self._dcp_send_stats["packed"] += 1
                 return ret
             if pack_cache is not None:
                 # The per-rank packs below overwrite the shared chunk pack.
                 pack_cache.clear()
 
+        self._dcp_send_stats["per_rank"] += 1
         target_src_kv_ptrs = src_kv_ptrs[:num_target]
         src_token_indices = plan.target_src_token_indices
         if pack_buffer is not None and src_token_indices.size:
@@ -3689,6 +3699,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
 
+        if envs.SGLANG_DISAGG_DCP_SEND_STATS_INTERVAL.get() > 0:
+            puts = getattr(self, "_queue_puts", None)
+            if puts is None:
+                puts = self._queue_puts = [0] * len(self.transfer_queues)
+            puts[shard_idx] += 1
         self.transfer_queues[shard_idx].put(
             TransferKVChunk(
                 room=bootstrap_room,
