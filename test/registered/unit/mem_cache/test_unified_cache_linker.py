@@ -3248,7 +3248,7 @@ class _EarlyStub:
         out, self.landed = self.landed, []
         return out
 
-    def take(self, epoch, cycle, pages):
+    def take(self, epoch, cycle, pages, rid=None):
         staged = self.staged.get((epoch, cycle))
         if staged is None or staged[0] != pages:
             return None

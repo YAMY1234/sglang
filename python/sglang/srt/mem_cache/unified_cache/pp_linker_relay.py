@@ -309,7 +309,7 @@ class PPLinkerRelay:
             lookup = w.lookups.pop(handle, None)
             early = getattr(w, "early", None)
             staged = (
-                early.take(self.epoch, entry.cycle, value)
+                early.take(self.epoch, entry.cycle, value, getattr(handle, "rid", None))
                 if early is not None and value and lookup is not None
                 else None
             )

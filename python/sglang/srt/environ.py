@@ -1100,7 +1100,7 @@ class Envs:
     # this many state slots, the rest page slots.
     SGLANG_LINKER_EARLY_READS = EnvBool(False)
     SGLANG_LINKER_EARLY_GB = EnvFloat(6.0)
-    SGLANG_LINKER_EARLY_STATES = EnvInt(16)
+    SGLANG_LINKER_EARLY_STATES = EnvInt(32)
     SGLANG_LINKER_HELPER = EnvBool(False)
     SGLANG_LINKER_HELPER_SEGMENT_MB = EnvInt(0)
     SGLANG_LINKER_HELPER_THREADS = EnvInt(4)

@@ -103,10 +103,10 @@ class EarlyMessage(msgspec.Struct, array_like=True, frozen=True):
 
 
 class _Staged:
-    __slots__ = ("pages", "slots", "state", "voted")
+    __slots__ = ("pages", "slots", "state", "voted", "rid")
 
-    def __init__(self, pages, slots):
-        self.pages, self.slots = pages, slots
+    def __init__(self, pages, slots, rid=None):
+        self.pages, self.slots, self.rid = pages, slots, rid
         self.state = "reading"  # reading -> landed | failed; dropped while reading -> released on completion
         self.voted = False
 
@@ -122,7 +122,7 @@ class EarlyReads:
         self.landed: deque = deque()
         self.lock = threading.Lock()
         self.epoch = 0
-        self.counts = {"staged": 0, "full": 0, "failed": 0, "used": 0, "dropped": 0, "voted_unused": 0}
+        self.counts = {"staged": 0, "full": 0, "failed": 0, "used": 0, "dropped": 0, "voted_unused": 0, "voted_direct": 0}
 
     # ---- PP0 ---------------------------------------------------------------------
     def publish(self, epoch, cycle, handle, lookup, pages) -> None:
@@ -140,7 +140,7 @@ class EarlyReads:
         if slots is None:
             self.counts["full"] += 1
             return
-        entry = _Staged(len(msg.hashes), slots)
+        entry = _Staged(len(msg.hashes), slots, msg.rid)
         with self.lock:
             self.entries[(msg.epoch, msg.cycle)] = entry
         ptrs = {name: self.slab.ptrs(name, ids) for name, ids in slots.items()}
@@ -178,12 +178,18 @@ class EarlyReads:
                     out.append(key)
         return out
 
-    def take(self, epoch, cycle, pages):
+    def take(self, epoch, cycle, pages, rid=None):
         """The landed staging of this load, removed from the table (the caller
-        consumes and then ``release``s it), or None (not staged, other pages)."""
+        consumes and then ``release``s it), or None (not staged, other pages).
+        ``rid``: counts a load that reads directly although an early read of the
+        same request was voted under any key (the divergence-risk case)."""
         with self.lock:
             entry = self.entries.get((epoch, cycle))
             if entry is None:
+                if rid is not None and any(e.voted and e.rid == rid for e in self.entries.values()):
+                    self.counts["voted_direct"] += 1
+                    logger.warning("Early read of %s voted under another key; load %s reads directly",
+                                   rid, (epoch, cycle))
                 return None
             if entry.voted and (entry.state != "landed" or entry.pages != pages):
                 # Near miss: PP0 may finish on this vote while the stage reads at load
