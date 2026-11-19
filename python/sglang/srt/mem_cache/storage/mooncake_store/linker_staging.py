@@ -107,18 +107,16 @@ def copy_engine_scatter(plans, stream):
     the staging thread: the driver spends about 0.3 us per entry."""
     import torch
 
-    from sglang.srt.mem_cache.storage.mooncake_store.linker_staging_kernel import memcpy_batch
+    from sglang.srt.mem_cache.storage.mooncake_store.linker_staging_kernel import loaded_cudart, memcpy_batch
 
     with torch.cuda.stream(stream):
         for dst, src, sizes in plans:
             if len(dst):
                 try:
-                    memcpy_batch(*coalesce_ranges(dst, src, sizes), stream.cuda_stream)
+                    memcpy_batch(*coalesce_ranges(dst, src, sizes), stream.cuda_stream, stream.device.index)
                 except RuntimeError as e:
-                    with open("/proc/self/maps") as maps:
-                        cudart = sorted({line.split()[-1] for line in maps if "libcudart" in line})
                     raise RuntimeError(
-                        f"{e}; stream {stream.device}, torch current {torch.cuda.current_device()}, cudart {cudart}"
+                        f"{e}; stream {stream.device}, torch current {torch.cuda.current_device()}, cudart {loaded_cudart()}"
                     ) from None
         event = torch.cuda.Event()
         event.record()

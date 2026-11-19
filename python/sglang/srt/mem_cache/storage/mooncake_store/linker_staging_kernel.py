@@ -4,6 +4,7 @@ cudaMemcpyBatchAsync on the copy engines (SGLANG_LINKER_EARLY_COPY=ce); the Trit
 kernel reads the sources through UVA on the SMs (=kernel)."""
 
 import ctypes
+import logging
 
 import numpy as np
 import torch
@@ -46,9 +47,11 @@ class MemcpyAttributes(ctypes.Structure):
     ]
 
 
+logger = logging.getLogger(__name__)
 _SRC_ACCESS_ORDER_STREAM = 0x1
 _FLAG_PREFER_OVERLAP_WITH_COMPUTE = 0x1
 _cudart = None
+_first_call = True
 
 
 def _runtime():
@@ -72,10 +75,10 @@ def _runtime():
     return _cudart
 
 
-def memcpy_batch(dst: np.ndarray, src: np.ndarray, sizes: np.ndarray, stream: int) -> None:
+def memcpy_batch(dst: np.ndarray, src: np.ndarray, sizes: np.ndarray, stream: int, device: int) -> None:
     """cudaMemcpyBatchAsync(dsts, srcs, sizes, count, attrs, attrsIdxs, numAttrs, stream):
     every entry with one attribute (stream-ordered source access, prefer overlap
-    with compute); the copies may complete in any order."""
+    with compute); the copies may complete in any order. ``device``: the stream's."""
     dst = np.ascontiguousarray(dst, dtype=np.uint64)
     src = np.ascontiguousarray(src, dtype=np.uint64)
     sizes = np.ascontiguousarray(sizes, dtype=np.uint64)
@@ -86,6 +89,21 @@ def memcpy_batch(dst: np.ndarray, src: np.ndarray, sizes: np.ndarray, stream: in
             dst.ctypes.data, src.ctypes.data, sizes.ctypes.data, n, ctypes.byref(attrs), idx, 1, stream
         )
 
+    # Set in the runtime ctypes resolved, which need not be torch's copy (a fresh
+    # thread's device there is 0, not the stream's).
+    global _first_call
+    before = ctypes.c_int(-1)
+    if _first_call:
+        _runtime().cudaGetDevice(ctypes.byref(before))
+    rc = _runtime().cudaSetDevice(device)
+    if rc != 0:
+        raise RuntimeError(f"cudaSetDevice({device}) failed: {rc}")
+    if _first_call:
+        _first_call = False
+        after = ctypes.c_int(-1)
+        _runtime().cudaGetDevice(ctypes.byref(after))
+        logger.info("Linker first staged copy: runtime %s, its device %d -> %d (stream device %d); libcudart loaded %s",
+                    _runtime_path(), before.value, after.value, device, loaded_cudart())
     rc = call(len(dst))
     if rc != 0:
         raise RuntimeError(f"cudaMemcpyBatchAsync({len(dst)} entries) failed: {_describe(rc, call, dst, src, sizes)}")
@@ -111,3 +129,21 @@ def _describe(rc, call, dst, src, sizes) -> str:
 
     return (f"{rc} {rt.cudaGetErrorString(rc).decode()}; thread device {device.value}; entry {i} of {len(dst)}: "
             f"dst {int(dst[i]):#x} ({where(dst[i])}), src {int(src[i]):#x} ({where(src[i])}), {int(sizes[i])} B")
+
+
+def loaded_cudart() -> list:
+    """Paths of every libcudart mapped into this process."""
+    with open("/proc/self/maps") as maps:
+        return sorted({line.split()[-1] for line in maps if "libcudart" in line})
+
+
+class _DlInfo(ctypes.Structure):
+    _fields_ = [("fname", ctypes.c_char_p), ("fbase", ctypes.c_void_p), ("sname", ctypes.c_char_p), ("saddr", ctypes.c_void_p)]
+
+
+def _runtime_path() -> str:
+    """The file the ctypes runtime's cudaMemcpyBatchAsync resolves to."""
+    info = _DlInfo()
+    fn = ctypes.cast(_runtime().cudaMemcpyBatchAsync, ctypes.c_void_p)
+    ok = ctypes.CDLL(None).dladdr(fn, ctypes.byref(info))
+    return info.fname.decode() if ok and info.fname else "?"

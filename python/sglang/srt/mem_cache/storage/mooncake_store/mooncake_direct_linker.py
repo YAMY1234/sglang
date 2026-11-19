@@ -996,8 +996,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         # Staged loads have their own thread: never queued behind early reads.
         self._staging_executor = ThreadPoolExecutor(1, thread_name_prefix="mooncake-staging")
         self._staging_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
-        logger.info("Mooncake linker early-read staging: %.1f GB pinned, %s", size / 2**30,
-                    {str(k): v for k, v in pools.items()})
+        from sglang.srt.mem_cache.storage.mooncake_store.linker_staging_kernel import loaded_cudart
+
+        logger.info("Mooncake linker early-read staging: %.1f GB pinned, %s; copy %s, libcudart loaded %s",
+                    size / 2**30, {str(k): v for k, v in pools.items()}, envs.SGLANG_LINKER_EARLY_COPY.get(),
+                    loaded_cudart())
         return StagingSlab(pools, buffer, buffer.data_ptr())
 
     def early_objects(self, transfers) -> dict:
