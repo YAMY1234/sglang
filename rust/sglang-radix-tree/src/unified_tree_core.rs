@@ -661,6 +661,9 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     /// The per-path Mamba cap also counts host copies and frees the host
     /// copies of the states it caps (opt-in, decided at HiCache init).
     pub(crate) mamba_path_cap_counts_host: bool,
+    /// Full host-leaf eviction takes leaves without a Mamba host state first;
+    /// set by each drive_host_eviction_with_options call.
+    pub(crate) host_evict_stateless_first: bool,
 
     /// Per-component monotonic sources for lock-segment UUIDs.
     pub(crate) component_uuid_counters: [i64; NUM_COMPONENT_TYPES],
@@ -997,6 +1000,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             namespaced_event_hashes: HashMap::new(),
             write_through_threshold: params.write_through_threshold,
             mamba_path_cap_counts_host: false,
+            host_evict_stateless_first: false,
             component_uuid_counters: COMPONENT_UUID_INITIAL_VALUES,
             device: params.device,
             empty_device_indices: Tensor::empty([0], (Kind::Int64, params.device)),
@@ -3003,7 +3007,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         component_type: ComponentType,
         num_tokens: usize,
     ) -> EvictionStepResult {
-        self.drive_host_eviction_with_options(component_type, num_tokens, false)
+        self.drive_host_eviction_with_options(component_type, num_tokens, false, false)
     }
 
     pub fn set_l3_lifetime_ledger_enabled(&mut self, enabled: bool) {
@@ -3156,6 +3160,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         &self,
         component_type: ComponentType,
         num_tokens: usize,
+        stateless_first: bool,
     ) -> Vec<(NodeId, usize, Option<Vec<String>>)> {
         if component_type != BASE_COMPONENT_TYPE
             || self.try_component_by_type_(component_type).is_none()
@@ -3163,11 +3168,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             return Vec::new();
         }
         let arena = &self.arena;
-        let strategy = &self.eviction_strategy;
-        let mut heap: BinaryHeap<Reverse<(PriorityKey, NodeIdx_)>> = self
+        let mut heap: BinaryHeap<Reverse<((bool, PriorityKey), NodeIdx_)>> = self
             .evictable_host_leaves
             .iter()
-            .map(|id| Reverse((strategy.get_priority(arena.node(id)), id)))
+            .map(|id| Reverse((self.host_eviction_key_(id, stateless_first), id)))
             .collect();
         let mut children_left: HashMap<NodeIdx_, usize> = HashMap::new();
         let mut out = Vec::new();
@@ -3185,7 +3189,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 let left = children_left.entry(p).or_insert(parent.children.len());
                 *left = left.saturating_sub(1);
                 if *left == 0 && self.is_host_leaf_once_childless_(parent) {
-                    heap.push(Reverse((strategy.get_priority(parent), p)));
+                    heap.push(Reverse((self.host_eviction_key_(p, stateless_first), p)));
                 }
             }
         }
@@ -3221,6 +3225,20 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         out
     }
 
+    /// Full host-leaf eviction key. With stateless_first, leaves without a Mamba
+    /// host state go first: a hybrid prefix is usable only up to its deepest state.
+    pub(crate) fn host_eviction_key_(
+        &self,
+        node_id: NodeIdx_,
+        stateless_first: bool,
+    ) -> (bool, PriorityKey) {
+        let node = self.arena.node(node_id);
+        (
+            stateless_first && node.has_host_value(MAMBA),
+            self.eviction_strategy.get_priority(node),
+        )
+    }
+
     /// Skip Full duplicate reclaim when requested by the controller, while
     /// preserving the normal host-leaf eviction walk.
     pub fn drive_host_eviction_with_options(
@@ -3228,8 +3246,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         component_type: ComponentType,
         num_tokens: usize,
         skip_full_duplicate_reclaim: bool,
+        host_evict_stateless_first: bool,
     ) -> EvictionStepResult {
         let mut result = EvictionStepResult::default();
+        self.host_evict_stateless_first = host_evict_stateless_first;
         if let Some(component) = self.try_component_by_type_(component_type) {
             // The drive gates on the driven component's entry, so seed it.
             result.tracker.insert(component_type, 0);

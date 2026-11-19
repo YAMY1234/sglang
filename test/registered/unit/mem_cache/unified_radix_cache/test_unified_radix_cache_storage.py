@@ -675,6 +675,12 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
                     cache._l3_tier_stats["wb_evict_uncovered_tokens"],
                     2 * ps if exclusive else 0,
                 )
+                # Full-only tree: KV tokens count, no Mamba host state goes with them.
+                self.assertEqual(
+                    cache._l3_tier_stats["host_evict_kv_tokens"],
+                    3 * ps if exclusive else 0,
+                )
+                self.assertEqual(cache._l3_tier_stats["host_evict_state_slots"], 0)
 
     def test_hicache_l3_belief_ttl_rewrites_a_page_the_store_may_have_dropped(self):
         self._require_host_only_l3_fixture()

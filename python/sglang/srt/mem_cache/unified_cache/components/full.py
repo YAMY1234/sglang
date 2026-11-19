@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Callable, Iterator, Optional, Sequence
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -206,6 +207,10 @@ class FullComponent(TreeComponent):
         ref = self.session_ref(node)
         return ref > 0, ref, self.tree_core.eviction_strategy.get_priority(node)
 
+    def _stateless_first_key(self, node: UnifiedTreeNode):
+        has_state = node.component_data[ComponentType.MAMBA].host_value is not None
+        return has_state, self.session_ref_eviction_strategy(node)
+
     def _evict_device_start(self, request_cnt: int) -> None:
         self._ensure_eviction_strategy()
         self._evict_device_request_cnt = request_cnt
@@ -253,17 +258,19 @@ class FullComponent(TreeComponent):
         """Yield host leaves coldest-first. After each yield a parent is pushed
         when ``parent_ready(child, parent)`` says it has become a host leaf."""
         self._ensure_eviction_strategy()
-        heap = [
-            (self.session_ref_eviction_strategy(n), n)
-            for n in self.tree_core.evictable_host_leaves
-        ]
+        key = self.session_ref_eviction_strategy
+        if envs.SGLANG_HICACHE_HOST_EVICT_STATELESS_FIRST.get():
+            # A hybrid prefix is usable only up to its deepest state: leaves
+            # without a Mamba host state go first.
+            key = self._stateless_first_key
+        heap = [(key(n), n) for n in self.tree_core.evictable_host_leaves]
         heapq.heapify(heap)
         while heap:
             _, x = heapq.heappop(heap)
             yield x
             p = x.parent
             if p is not None and parent_ready(x, p):
-                heapq.heappush(heap, (self.session_ref_eviction_strategy(p), p))
+                heapq.heappush(heap, (key(p), p))
 
     def drive_host_eviction(
         self,

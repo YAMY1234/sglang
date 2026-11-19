@@ -850,6 +850,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             int(component_type),
             num_tokens,
             envs.SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM.get(),
+            envs.SGLANG_HICACHE_HOST_EVICT_STATELESS_FIRST.get(),
         )
         return self._fill_evict_result(binding_result, DriveHostEvictionResult())
 
@@ -919,7 +920,11 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 "rust/sglang-radix-tree or set "
                 "SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python"
             ) from None
-        return peek(int(component_type), num_tokens)
+        return peek(
+            int(component_type),
+            num_tokens,
+            envs.SGLANG_HICACHE_HOST_EVICT_STATELESS_FIRST.get(),
+        )
 
     def peek_mamba_host_eviction_leaves(
         self, max_states: int

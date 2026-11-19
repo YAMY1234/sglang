@@ -251,12 +251,12 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         cache_actions: &mut CacheActions,
     ) {
         let ct = FULL;
-        let arena = &tree_core.arena;
-        let strategy = &tree_core.eviction_strategy;
-        let mut heap: BinaryHeap<Reverse<(PriorityKey, NodeIdx_)>> = tree_core
+        let stateless_first = tree_core.host_evict_stateless_first;
+        let tc = &*tree_core;
+        let mut heap: BinaryHeap<Reverse<((bool, PriorityKey), NodeIdx_)>> = tc
             .evictable_host_leaves
             .iter()
-            .map(|id| Reverse((strategy.get_priority(arena.node(id)), id)))
+            .map(|id| Reverse((tc.host_eviction_key_(id, stateless_first), id)))
             .collect();
         while tracker[&ct] < num_tokens {
             let Some(Reverse((_, x))) = heap.pop() else {
@@ -271,9 +271,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
             if let Some(parent) = parent
                 && tree_core.evictable_host_leaves.contains(parent)
             {
-                let key = tree_core
-                    .eviction_strategy
-                    .get_priority(tree_core.arena.node(parent));
+                let key = tree_core.host_eviction_key_(parent, stateless_first);
                 heap.push(Reverse((key, parent)));
             }
         }

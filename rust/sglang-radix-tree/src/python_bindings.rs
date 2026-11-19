@@ -2066,9 +2066,13 @@ macro_rules! tree_core_methods {
                 py: Python<'_>,
                 component_type: u8,
                 num_tokens: usize,
+                stateless_first: bool,
             ) -> PyResult<Vec<(NodeId, usize, Option<Vec<String>>)>> {
                 let ct = parse_component_type(component_type)?;
-                Ok(py.detach(move || self.core().peek_host_eviction_candidates(ct, num_tokens)))
+                Ok(py.detach(move || {
+                    self.core()
+                        .peek_host_eviction_candidates(ct, num_tokens, stateless_first)
+                }))
             }
 
             /// Evict up to num_tokens of one component's host resources.
@@ -2078,6 +2082,7 @@ macro_rules! tree_core_methods {
                 component_type: u8,
                 num_tokens: usize,
                 skip_full_duplicate_reclaim: bool,
+                host_evict_stateless_first: bool,
             ) -> PyResult<HostEvictionResultBinding> {
                 let ct = parse_component_type(component_type)?;
                 let result = py.detach(move || {
@@ -2085,6 +2090,7 @@ macro_rules! tree_core_methods {
                         ct,
                         num_tokens,
                         skip_full_duplicate_reclaim,
+                        host_evict_stateless_first,
                     )
                 });
                 Ok(HostEvictionResultBinding {
@@ -3489,26 +3495,33 @@ macro_rules! tree_core_binding {
 
             /// Full host leaves in the order drive_host_eviction takes them, until
             /// their tokens reach num_tokens: [(node id, tokens, page hashes)]; read-only.
+            #[pyo3(signature = (component_type, num_tokens, stateless_first = false))]
             fn peek_host_eviction_candidates(
                 &self,
                 py: Python<'_>,
                 component_type: u8,
                 num_tokens: usize,
+                stateless_first: bool,
             ) -> PyResult<Vec<(NodeId, usize, Option<Vec<String>>)>> {
                 catch_native_panic(|| {
-                    self.inner
-                        .peek_host_eviction_candidates(py, component_type, num_tokens)
+                    self.inner.peek_host_eviction_candidates(
+                        py,
+                        component_type,
+                        num_tokens,
+                        stateless_first,
+                    )
                 })
             }
 
             /// Evict up to num_tokens of one component's host resources.
-            #[pyo3(signature = (component_type, num_tokens, skip_full_duplicate_reclaim = false))]
+            #[pyo3(signature = (component_type, num_tokens, skip_full_duplicate_reclaim = false, host_evict_stateless_first = false))]
             fn drive_host_eviction(
                 &self,
                 py: Python<'_>,
                 component_type: u8,
                 num_tokens: usize,
                 skip_full_duplicate_reclaim: bool,
+                host_evict_stateless_first: bool,
             ) -> PyResult<HostEvictionResultBinding> {
                 catch_native_panic(|| {
                     self.inner.drive_host_eviction(
@@ -3516,6 +3529,7 @@ macro_rules! tree_core_binding {
                         component_type,
                         num_tokens,
                         skip_full_duplicate_reclaim,
+                        host_evict_stateless_first,
                     )
                 })
             }

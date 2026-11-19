@@ -1907,6 +1907,94 @@ def test_host_duplicate_reclaim_override_preserves_normal_host_eviction():
 
 
 @pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("stateless_first", [False, True])
+def test_host_eviction_stateless_first_spares_mamba_host_states(
+    backend, stateless_first
+):
+    from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+    from sglang.srt.mem_cache.unified_cache.components import CacheTransferPhase
+
+    with (
+        get_context().override_server_args(
+            _mamba_cache_chunk_size=256, mamba_max_states_per_path=-1
+        ),
+        envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(backend),
+    ):
+        cache = UnifiedRadixCache(
+            CacheInitParams(
+                disable=True,
+                req_to_token_pool=Mock(spec=HybridReqToTokenPool),
+                token_to_kv_pool_allocator=None,
+                page_size=1,
+                tree_components=(ComponentType.FULL, ComponentType.MAMBA),
+            )
+        )
+    core = cache.tree_core
+    core.set_hicache_enabled()
+    core.is_write_back = True
+    root = core.root_node_handle()
+    # Host-only, coldest first: a (state), p (state) -> q, r.
+    nodes, slots = {}, {}
+    for name, parent, token, state in (
+        ("a", None, 1, 11),
+        ("p", None, 2, 12),
+        ("q", "p", 3, None),
+        ("r", None, 4, None),
+    ):
+        slots[name] = [token * 100, token * 100 + 1]
+        inserted = core.insert_host(
+            nodes.get(parent, root),
+            _key([token * 10, token * 10 + 1]),
+            torch.tensor(slots[name]),
+            [f"{name}0", f"{name}1"],
+        )
+        nodes[name] = inserted.inserted_host_node
+        if state is not None:
+            actions = []
+            core.commit_hicache_transfers(
+                root,
+                CacheTransferPhase.PREFETCH,
+                {
+                    ComponentType.MAMBA: [
+                        PoolTransfer(
+                            name=PoolName.MAMBA, host_indices=torch.tensor([state])
+                        )
+                    ]
+                },
+                cache_actions=actions,
+                insert_result=inserted,
+                pool_storage_result=PoolTransferResult(
+                    kv_hit_pages=2, extra_pool_hit_pages={PoolName.MAMBA: 1}
+                ),
+            )
+            assert actions == []
+    core.sanity_check([], [])
+    freed = []
+    cache.components[ComponentType.FULL].free_host_values = lambda values: freed.append(
+        torch.cat(values).tolist()
+    )
+    cache._l3_write_on_host_evict = True
+    stats = cache._l3_tier_stats
+    order = "qrap" if stateless_first else "aqpr"
+    with (
+        envs.SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM.override(True),
+        envs.SGLANG_HICACHE_HOST_EVICT_STATELESS_FIRST.override(stateless_first),
+    ):
+        peeked = core.peek_host_eviction_candidates(ComponentType.FULL, 8)
+        assert [node for node, _, _ in peeked] == [nodes[n] for n in order]
+        states = []
+        # One two-token leaf per call: the evictions follow the peek exactly.
+        for _ in order:
+            assert cache._drive_host_eviction(2, ComponentType.FULL) == 2
+            states.append(stats["host_evict_state_slots"])
+    assert freed == [slots[n] for n in order]
+    # Stateless-first loses no Mamba host state before the state-less leaves are gone.
+    assert states == ([0, 0, 1, 2] if stateless_first else [1, 1, 2, 2])
+    assert stats["host_evict_kv_tokens"] == 8
+    core.sanity_check([], [])
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
 @pytest.mark.parametrize("backup_again", [False, True])
 def test_full_host_duplicates_preserve_backup_order(backend, backup_again):
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache

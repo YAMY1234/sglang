@@ -2578,10 +2578,10 @@ fn host_eviction_peeks_match_the_evictions() {
         }
         let order: Vec<NodeId> =
             [child_a, child_b, parent, other].iter().map(|&n| tc.arena.node(n).id).collect();
-        let peeked = tc.peek_host_eviction_candidates(FULL, pages);
+        let peeked = tc.peek_host_eviction_candidates(FULL, pages, false);
         assert_eq!(peeked.iter().map(|c| c.0).collect::<Vec<_>>(), order[..pages].to_vec());
         assert!(peeked.iter().all(|c| c.1 == 1 && c.2.as_ref().is_some_and(|h| h.len() == 1)));
-        assert!(tc.peek_host_eviction_candidates(MAMBA, pages).is_empty());
+        assert!(tc.peek_host_eviction_candidates(MAMBA, pages, false).is_empty());
         let result = tc.drive_host_eviction(FULL, pages);
         assert_eq!(result.tracker[&FULL], pages);
         for id in &order[..pages] {
@@ -2625,6 +2625,49 @@ fn host_eviction_peeks_match_the_evictions() {
     );
     assert!(tc.arena.resolve(leaf_a_id).is_err());
     assert!(tc.arena.resolve(tc.arena.node(inner).id).is_ok());
+}
+
+#[test]
+fn host_eviction_stateless_first_spares_mamba_host_states() {
+    // Coldest first: a (state), p (state) -> q, r. Duplicate reclaim skipped.
+    for stateless_first in [false, true] {
+        let mut tc = mamba_core(/* page_size = */ 1);
+        tc.set_hicache_enabled();
+        tc.is_write_back = true;
+        let a = insert_host_page(&mut tc, None, 1000, 100);
+        let p = insert_host_page(&mut tc, None, 2000, 101);
+        let q = insert_host_page(&mut tc, Some(p), 3000, 102);
+        let r = insert_host_page(&mut tc, None, 4000, 103);
+        for (age, node) in [a, p, q, r].into_iter().enumerate() {
+            tc.arena.node_mut(node).last_access_counter = age as i64;
+        }
+        for (node, slot) in [(a, 8), (p, 9)] {
+            set_mamba_host(&mut tc, node, slot);
+            tc.host_lru_list_mut(MAMBA).insert_mru(node);
+        }
+        let (order, states_after_two) = if stateless_first {
+            ([q, r, a, p], 0)
+        } else {
+            ([a, q, p, r], 1)
+        };
+        let ids: Vec<NodeId> = order.iter().map(|&n| tc.arena.node(n).id).collect();
+        let slots: Vec<i64> = order
+            .iter()
+            .map(|&n| tc.arena.node(n).host_value(FULL).int64_value(&[0]))
+            .collect();
+        let peeked = tc.peek_host_eviction_candidates(FULL, 4, stateless_first);
+        assert_eq!(peeked.iter().map(|c| c.0).collect::<Vec<_>>(), ids);
+        let mut freed = Vec::new();
+        let mut states = Vec::new();
+        for pages in [2, 2] {
+            let result = tc.drive_host_eviction_with_options(FULL, pages, true, stateless_first);
+            assert_eq!(result.tracker[&FULL], pages);
+            states.push(result.tracker.get(&MAMBA).copied().unwrap_or(0));
+            freed.extend(result.host_frees[&FULL].iter().map(|t| t.int64_value(&[0])));
+        }
+        assert_eq!(freed, slots);
+        assert_eq!(states, vec![states_after_two, 2 - states_after_two]);
+    }
 }
 
 #[test]

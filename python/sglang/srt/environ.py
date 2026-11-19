@@ -903,6 +903,8 @@ class Envs:
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
+    # Full host-leaf eviction takes leaves without a Mamba host state first, then LRU.
+    SGLANG_HICACHE_HOST_EVICT_STATELESS_FIRST = EnvBool(False)
     # p-micro rig only: per-launch host / D2H counters and per-op HiCache timings
     # (PMICRO_HOSTSTAT / PMICRO_HOSTOPS log lines, see mem_cache/pmicro_hoststats.py).
     SGLANG_PMICRO_HOSTSTATS = EnvBool(False)
