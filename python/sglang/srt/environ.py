@@ -2156,6 +2156,7 @@ class Envs:
     # With the task ring: residual and normed outputs of batches of 5000+ rows in a locality-striped pool sized for
     # LOCALITY_MAX_TOKENS rows (two slots), each die's SMs posting its own rows. Needs MLOPart.
     SGLANG_OPT_DSV41_MEGA_MHC_LOCALITY = EnvBool(False)
+    SGLANG_OPT_EXACT_CHUNK_BUDGET = EnvBool(False)
     SGLANG_OPT_DSV41_MEGA_MHC_LOCALITY_MAX_TOKENS = EnvInt(32768)
     # Deprecated for --engram-config "replication".
     SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("per_rank")

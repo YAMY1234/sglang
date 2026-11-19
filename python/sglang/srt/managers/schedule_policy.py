@@ -94,6 +94,19 @@ def _use_exact_chunk_fill() -> bool:
     on that kernel, against 1% for the hipBLASLt GEMMs that just run one extra
     partial tile.
     """
+    if envs.SGLANG_OPT_EXACT_CHUNK_BUDGET.get():
+        logger.info("Exact chunk budget on: prefill compute budget billed in raw tokens")
+        return True
+    return is_gfx95_supported()
+
+
+@lru_cache(maxsize=1)
+def _exact_chunk_cut() -> bool:
+    """Whether a chunked request may end off the page grid (gfx95 only).
+
+    SGLANG_OPT_EXACT_CHUNK_BUDGET bills raw tokens elsewhere but keeps chunk
+    ends on pages, so chunk boundaries stay where the KV layout expects them.
+    """
     return is_gfx95_supported()
 
 
@@ -1899,7 +1912,7 @@ class PrefillAdder:
                 # Only one unfinished chunked request can be tracked; a
                 # continuation cut short by memory leaves chunk budget to spare.
                 return AddReqResult.OTHER
-            if self.exact_chunk_fill:
+            if self.exact_chunk_fill and _exact_chunk_cut():
                 # Take the remainder verbatim so the batch hits exactly
                 # chunked_prefill_size. `chunk_fit_tokens > chunk_tokens_limit`
                 # here, so this never runs past the end of the prompt. Uses the
