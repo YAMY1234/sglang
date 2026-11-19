@@ -1066,6 +1066,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             future.set_result(True)
             done.synchronize()
             release(staged)
+            if self.page_checksum_rate:
+                # As _prefetch_read: the sampled pages of the request's slots, now
+                # written, against their checksums recorded at offload.
+                self._verify_page_checksums(self._read_batches(expanded))
 
         def failed(f):
             if f.exception() is not None:
