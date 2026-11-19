@@ -815,14 +815,9 @@ class UnifiedRadixCache(BasePrefixCache):
             return None
         # Evictions and lock changes move these sizes; inserts and walks bump the epoch.
         core = self.tree_core
-        return (
-            self.match_epoch,
-            core.full_evictable_size(),
-            core.full_protected_size(),
-            core.swa_evictable_size(),
-            core.swa_protected_size(),
-            core.mamba_evictable_size(),
-            core.mamba_protected_size(),
+        return (self.match_epoch,) + tuple(
+            (core.component_evictable_size(ct), core.component_protected_size(ct))
+            for ct in self.tree_components
         )
 
     def peek_prefix_len(self, key: RadixKey) -> Optional[int]:
