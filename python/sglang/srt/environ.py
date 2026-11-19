@@ -1087,6 +1087,11 @@ class Envs:
     # Prefetch mode: log per-request prefetch milestone intervals, admission
     # skips of not-ready requests and the batch interval every 60 s (LOOKUP_STATS).
     SGLANG_LINKER_PREFETCH_TIMELINE = EnvBool(False)
+    # Debug: a background thread holding the GIL this fraction of wall time in
+    # bursts of SGLANG_DEBUG_GIL_TAX_BURST_MS (utils/gil_tax.py); -1: no thread,
+    # 0: thread idle (POST /linker_flags can switch it on).
+    SGLANG_DEBUG_GIL_TAX = EnvFloat(-1.0)
+    SGLANG_DEBUG_GIL_TAX_BURST_MS = EnvFloat(2.0)
     # Offload puts: build per-key buffer addresses with numpy and batch the
     # recent-key / result bookkeeping (the offload thread's GIL share).
     SGLANG_LINKER_VECTOR_PUT = EnvBool(False)

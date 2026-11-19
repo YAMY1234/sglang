@@ -1359,6 +1359,28 @@ class TestRuntimeLinkerFlags(CustomTestCase):
             self.assertIsNone(linker.storage._vector_put_flag)
             self.assertEqual(linker.flag_values()["SGLANG_LINKER_VECTOR_META"], "True")
 
+    def test_refresh_flags_rereads_the_page_checksum_rate(self):
+        linker = _toggle_linker()
+        with envs.SGLANG_LINKER_PAGE_CHECKSUM.override(0.01):
+            linker.refresh_flags()
+            self.assertEqual(linker.page_checksum_rate, 0.01)
+        with envs.SGLANG_LINKER_PAGE_CHECKSUM.override(0.0):
+            linker.refresh_flags()
+            self.assertEqual(linker.page_checksum_rate, 0.0)
+        self.assertIn("SGLANG_LINKER_PAGE_CHECKSUM", linker.TOGGLE_FLAGS)
+
+    def test_gil_tax_duty_cycle(self):
+        from sglang.srt.utils.gil_tax import _calibrate, tax_sleep_s
+
+        # Bursts take ``duty`` of each burst + sleep cycle.
+        for duty in (0.03, 0.06, 0.5):
+            sleep = tax_sleep_s(duty, 0.002)
+            self.assertAlmostEqual(0.002 / (0.002 + sleep), duty)
+        n = _calibrate(0.002)
+        t = time.perf_counter()
+        sum(range(n))
+        self.assertLess(time.perf_counter() - t, 0.02)
+
     def test_reset_cold_clears_store_state_and_moves_the_namespace(self):
         linker = _toggle_linker(stage=0)
         linker.store_tree.add(["a1", "a2"], None, ())
@@ -1422,6 +1444,7 @@ class TestRuntimeLinkerFlags(CustomTestCase):
         )
         sched = SimpleNamespace(
             LINKER_TOGGLE_FLAGS=Scheduler.LINKER_TOGGLE_FLAGS,
+            DEBUG_TOGGLE_FLAGS=Scheduler.DEBUG_TOGGLE_FLAGS,
             tree_cache=SimpleNamespace(linker=linker),
             is_fully_idle=lambda: True,
             flush_cache=lambda: calls.append("flush") or True,
@@ -1447,6 +1470,32 @@ class TestRuntimeLinkerFlags(CustomTestCase):
             self.assertTrue(ok.success)
             self.assertEqual(ok.effective["SGLANG_LINKER_VECTOR_META"], "True")
         self.assertEqual(calls, ["flush", "cold", "refresh"])
+
+    def test_scheduler_switches_debug_flags_without_a_linker(self):
+        from sglang.srt.managers.io_struct import LinkerFlagsReqInput
+        from sglang.srt.managers.scheduler import Scheduler
+
+        calls = []
+        sched = SimpleNamespace(
+            LINKER_TOGGLE_FLAGS=Scheduler.LINKER_TOGGLE_FLAGS,
+            DEBUG_TOGGLE_FLAGS=Scheduler.DEBUG_TOGGLE_FLAGS,
+            tree_cache=SimpleNamespace(),
+            is_fully_idle=lambda: True,
+            flush_cache=lambda: calls.append("flush") or True,
+        )
+        refused = Scheduler.linker_flags_wrapped(
+            sched, LinkerFlagsReqInput(flags={"SGLANG_LINKER_VECTOR_META": "1"})
+        )
+        self.assertEqual((refused.success, refused.message), (False, "no external linker"))
+        with envs.SGLANG_DEBUG_GIL_TAX.override(-1.0):
+            with patch("sglang.srt.managers.scheduler.get_parallel",
+                       return_value=SimpleNamespace(pp_rank=0)):
+                ok = Scheduler.linker_flags_wrapped(
+                    sched, LinkerFlagsReqInput(flags={"SGLANG_DEBUG_GIL_TAX": "0.06"}, reset=True)
+                )
+            self.assertTrue(ok.success)
+            self.assertEqual(ok.effective["SGLANG_DEBUG_GIL_TAX"], "0.06")
+        self.assertEqual(calls, ["flush"])
 
     def test_wrapper_reset_cold_zeroes_stats_after_reset(self):
         from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (

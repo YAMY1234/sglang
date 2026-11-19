@@ -5745,19 +5745,26 @@ class Scheduler(
         "SGLANG_LINKER_VECTOR_PUT",
         "SGLANG_LINKER_STORE_ARRAYS",
         "SGLANG_LINKER_MAX_REQUERIES",
+        "SGLANG_LINKER_PAGE_CHECKSUM",
     )
+    # Debug switches that need no external linker (an Aw0f arm can switch them).
+    DEBUG_TOGGLE_FLAGS = ("SGLANG_DEBUG_GIL_TAX", "SGLANG_DEBUG_GIL_TAX_BURST_MS")
 
     def linker_flags_wrapped(self, recv_req: LinkerFlagsReqInput):
         """Every PP stage handles this at the same point of the relayed request
         stream, so all stages switch together; refused unless fully idle."""
-        allowed = {name for name in self.LINKER_TOGGLE_FLAGS if hasattr(envs, name)}
+        allowed = {
+            name
+            for name in self.LINKER_TOGGLE_FLAGS + self.DEBUG_TOGGLE_FLAGS
+            if hasattr(envs, name)
+        }
         rejected = sorted(set(recv_req.flags) - allowed)
         if rejected:
             return LinkerFlagsReqOutput(
                 success=False, message=f"not switchable at runtime: {rejected}"
             )
         linker = getattr(self.tree_cache, "linker", None)
-        if linker is None:
+        if linker is None and set(recv_req.flags) - set(self.DEBUG_TOGGLE_FLAGS):
             return LinkerFlagsReqOutput(success=False, message="no external linker")
         if not self.is_fully_idle():
             return LinkerFlagsReqOutput(success=False, message="busy")
@@ -5766,8 +5773,10 @@ class Scheduler(
         if recv_req.reset:
             if not self.flush_cache():
                 return LinkerFlagsReqOutput(success=False, message="flush_cache failed")
-            linker.reset_cold()
-        linker.refresh_flags()
+            if linker is not None:
+                linker.reset_cold()
+        if linker is not None:
+            linker.refresh_flags()
         effective = {name: str(getattr(envs, name).get()) for name in sorted(allowed)}
         logger.info(
             "Linker flags switched (PP%d, reset=%s): %s",
@@ -6936,6 +6945,9 @@ def run_scheduler_process(
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
 
+        from sglang.srt.utils.gil_tax import maybe_start_gil_tax
+
+        maybe_start_gil_tax()
         # Run the event loop (blocks until a ShutdownReq sets gracefully_exit)
         scheduler.run_event_loop()
 

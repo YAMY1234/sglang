@@ -2418,10 +2418,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         "SGLANG_LINKER_COALESCE_RANGES",
         "SGLANG_LINKER_VECTOR_PUT",
         "SGLANG_LINKER_STORE_ARRAYS",
+        "SGLANG_LINKER_PAGE_CHECKSUM",
     )
 
     def refresh_flags(self) -> None:
         """Re-read the per-call switches from the environment."""
+        self.page_checksum_rate = envs.SGLANG_LINKER_PAGE_CHECKSUM.get()
         self.vector_meta = envs.SGLANG_LINKER_VECTOR_META.get()
         self.coalesce_ranges = envs.SGLANG_LINKER_COALESCE_RANGES.get()
         self.cpu_indices = envs.SGLANG_LINKER_CPU_INDICES.get()
