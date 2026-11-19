@@ -1,7 +1,7 @@
 // Fused DSA indexer scorer + threshold candidate filter (FSTK) for SM100-family GPUs.
 //
 // The scoring core is DeepGEMM's legacy contiguous-KV FP8 MQA logits kernel
-// (sm100_mqa_logits: 32 heads x 128, BLOCK_Q 4, SPLIT_KV 256, 3 Q / 5 KV stages, two
+// (sm100_mqa_logits: 32 heads x 128, 4 rows per block, 256-key splits, 3 Q / 5 KV stages, two
 // 128-thread math warpgroups), reusing its UMMA instruction sequence and its epilogue
 // arithmetic in the same order, so every score is bitwise the one DeepGEMM writes.
 // What changes is around the score:
@@ -45,10 +45,7 @@ using namespace deep_gemm;
 
 constexpr uint32_t kNumHeads = 32;
 constexpr uint32_t kHeadDim = 128;
-constexpr uint32_t BLOCK_Q = 4;
-constexpr uint32_t SPLIT_KV = 256;
 constexpr uint32_t kNumQStages = 3;
-constexpr uint32_t kNumKVStages = 5;
 constexpr uint32_t kNumSpecializedThreads = 128;
 constexpr uint32_t kNumMathThreads = 256;
 constexpr uint32_t kNumMathWarpGroups = kNumMathThreads / 128;
@@ -78,9 +75,28 @@ struct ScoreParams {
   float* sink;  // kModeNoStore
 };
 
+// Score layouts. All three issue the same UMMA (kind::f8f6f4, M128, K32 x 4, A = 128 keys,
+// B = rows x 32 heads) per element, so every score is bitwise DeepGEMM's; they differ in how
+// many rows share a KV tile and how the two math warpgroups split the TMEM accumulators.
+//   0: DeepGEMM's (4 rows, N 128, 256-key splits, warpgroup g takes key half g, 3 stages).
+//   1: row split (4 rows, N 128, 256-key splits, warpgroup g takes rows 2g, 2g+1 of both halves).
+//   2: wide (8 rows, N 256, 128-key splits, warpgroup g takes rows 4g..4g+3): 48 instead of
+//      64 SMEM operand bytes per (row, key), the bound of the narrow layouts.
+template <int kLayout>
+struct LayoutTraits {
+  static constexpr uint32_t kBlockQ = kLayout == 2 ? 8 : 4;
+  static constexpr uint32_t kSplitKV = kLayout == 2 ? 128 : 256;
+  static constexpr uint32_t kNumTmemStages = kLayout == 0 ? 3 : (kLayout == 1 ? 4 : 2);
+  static constexpr uint32_t kNumKVStages = kLayout == 2 ? 6 : 5;
+  // Both warpgroups read every accumulator stage (layouts 1, 2) or one each (layout 0).
+  static constexpr bool kSharedStage = kLayout != 0;
+  static constexpr uint32_t kUmmaN = kBlockQ * kNumHeads;
+};
+
 // Snake round-robin over the caller's order: round r gives CTA b the entry
 // r*G + b (even r) or r*G + G-1-b (odd r); each round is a bijection, so every
 // q-block is visited exactly once.
+template <uint32_t kBlockQ, uint32_t kSplitKV>
 struct OrderedScheduler {
   const ScoreParams& p;
   uint32_t round = 0;
@@ -105,8 +121,8 @@ struct OrderedScheduler {
       uint32_t start = cute::numeric_limits<uint32_t>::max();
       uint32_t end = cute::numeric_limits<uint32_t>::min();
 #pragma unroll
-      for (uint32_t t = 0; t < BLOCK_Q; ++t) {
-        const auto row = cute::min(q_block_idx * BLOCK_Q + t, p.num_q_tokens - 1);
+      for (uint32_t t = 0; t < kBlockQ; ++t) {
+        const auto row = cute::min(q_block_idx * kBlockQ + t, p.num_q_tokens - 1);
         const auto k_start = cute::min(__ldg(p.ks + row), p.num_kv_tokens);
         const auto k_end = cute::min(__ldg(p.ke + row), p.num_kv_tokens);
         if constexpr (kLoadSeqBounds) {
@@ -117,7 +133,7 @@ struct OrderedScheduler {
         end = cute::max(end, k_end);
       }
       kv_token_base = start / 4 * 4;
-      num_kv_splits = math::ceil_div(end - kv_token_base, SPLIT_KV);
+      num_kv_splits = math::ceil_div(end - kv_token_base, kSplitKV);
       return true;
     }
   }
@@ -151,9 +167,7 @@ CUTLASS_DEVICE float dg_reduce(const float* accum, const float* w) {
   return (sum.x + sum.y) / 2;
 }
 
-// kRowSplit: each math warpgroup owns 2 of the 4 rows over both 128-key halves of a
-// split (4 TMEM stages, each read by both warpgroups) instead of all 4 rows of one half.
-template <int kMode, bool kReuseKV, bool kRowSplit, uint32_t kAluHeads>
+template <int kMode, bool kReuseKV, int kLayout, uint32_t kAluHeads>
 __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
     const __grid_constant__ ScoreParams params,
     const __grid_constant__ cute::TmaDescriptor tensor_map_q,
@@ -161,9 +175,13 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
     const __grid_constant__ cute::TmaDescriptor tensor_map_sf_kv,
     const __grid_constant__ cute::TmaDescriptor tensor_map_weights) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  using Traits = LayoutTraits<kLayout>;
   using qk_dtype_t = cutlass::float_e4m3_t;
   using reduce_dtype_t = float;
-  using logits_dtype_t = float;
+  using Scheduler = OrderedScheduler<Traits::kBlockQ, Traits::kSplitKV>;
+  constexpr uint32_t kBlockQ = Traits::kBlockQ;
+  constexpr uint32_t kSplitKV = Traits::kSplitKV;
+  constexpr uint32_t kNumKVStagesL = Traits::kNumKVStages;
 
   const auto warp_idx = cutlass::canonical_warp_idx_sync();
   const auto lane_idx = ptx::get_lane_idx();
@@ -176,29 +194,30 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
     cute::prefetch_tma_descriptor(&tensor_map_sf_kv);
   }
 
-  static constexpr uint32_t kNumTmemStages = kRowSplit ? 4 : 3;
+  static constexpr uint32_t kNumTmemStages = Traits::kNumTmemStages;
   static constexpr uint32_t UMMA_M = 128;
-  static constexpr uint32_t BLOCK_QH = BLOCK_Q * kNumHeads;
-  static constexpr uint32_t UMMA_N = math::constexpr_align(BLOCK_QH, 8u);
+  static constexpr uint32_t UMMA_N = Traits::kUmmaN;
   static constexpr uint32_t UMMA_K = 32;
+  static constexpr uint32_t kMmaPerSplit = kSplitKV / UMMA_M;
   static constexpr uint32_t kNumQKBytesPerToken = kHeadDim;
-  static constexpr uint32_t SMEM_Q_SIZE_PER_STAGE = BLOCK_QH * kNumQKBytesPerToken;
-  static constexpr uint32_t SMEM_KV_SIZE_PER_STAGE = SPLIT_KV * kNumQKBytesPerToken;
-  static constexpr uint32_t SMEM_SF_KV_SIZE_PER_STAGE = SPLIT_KV * sizeof(float);
+  static constexpr uint32_t SMEM_Q_SIZE_PER_STAGE = UMMA_N * kNumQKBytesPerToken;
+  static constexpr uint32_t SMEM_KV_SIZE_PER_STAGE = kSplitKV * kNumQKBytesPerToken;
+  static constexpr uint32_t SMEM_SF_KV_SIZE_PER_STAGE = kSplitKV * sizeof(float);
   static constexpr uint32_t kNumWeightBytesPerRow =
       math::constexpr_align(kNumHeads * static_cast<uint32_t>(sizeof(reduce_dtype_t)), 16u);
   static constexpr uint32_t kNumWeightElementsPerRow =
       kNumWeightBytesPerRow / static_cast<uint32_t>(sizeof(reduce_dtype_t));
-  static constexpr uint32_t SMEM_WEIGHT_SIZE_PER_STAGE = BLOCK_Q * kNumWeightBytesPerRow;
+  static constexpr uint32_t SMEM_WEIGHT_SIZE_PER_STAGE = kBlockQ * kNumWeightBytesPerRow;
+  static_assert(kMmaPerSplit * UMMA_M == kSplitKV and UMMA_N <= 256);
 
   using SharedStorage = fstk_dg_layout::MQALogitsSharedStorage<
       kNumHeads,
       kHeadDim,
       false,
-      BLOCK_Q,
-      SPLIT_KV,
+      kBlockQ,
+      kSplitKV,
       kNumQStages,
-      kNumKVStages,
+      kNumKVStagesL,
       kNumTmemStages,
       qk_dtype_t,
       reduce_dtype_t>;
@@ -215,14 +234,14 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
       smem.empty_q_barriers[i].init(kNumMathThreads + 32);
     }
 #pragma unroll
-    for (uint32_t i = 0; i < kNumKVStages; ++i) {
+    for (uint32_t i = 0; i < kNumKVStagesL; ++i) {
       smem.full_kv_barriers[i].init(1);
       smem.empty_kv_barriers[i].init(kNumMathThreads);
     }
 #pragma unroll
     for (uint32_t i = 0; i < kNumTmemStages; ++i) {
       smem.full_tmem_barriers[i].init(1);
-      smem.empty_tmem_barriers[i].init(kRowSplit ? kNumMathThreads : 128);
+      smem.empty_tmem_barriers[i].init(Traits::kSharedStage ? kNumMathThreads : 128);
     }
     cutlass::arch::fence_barrier_init();
   }
@@ -232,7 +251,7 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
   __syncthreads();
 
   RingPipeline<kNumQStages> q_pipeline;
-  RingPipeline<kNumKVStages> kv_pipeline;
+  RingPipeline<kNumKVStagesL> kv_pipeline;
   RingPipeline<kNumTmemStages> tmem_pipeline;
 
   constexpr uint32_t kNumSpecializedRegisters = 56;
@@ -243,20 +262,20 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
   if (warp_idx == kSpecWarpStart) {
     cutlass::arch::warpgroup_reg_dealloc<kNumSpecializedRegisters>();
     if (cute::elect_one_sync()) {
-      OrderedScheduler scheduler(params);
+      Scheduler scheduler(params);
       uint32_t q_block_idx, kv_base, num_kv_splits;
       while (scheduler.next_q_block(q_block_idx, kv_base, num_kv_splits)) {
         CUTE_TIE_DECL(q_pipeline.advance(), q_stage_idx, q_phase);
         smem.empty_q_barriers[q_stage_idx].wait(q_phase ^ 1);
 
-        const uint32_t q_token_base = q_block_idx * BLOCK_Q;
-        tma::copy<kHeadDim, BLOCK_Q * kNumHeads, 0>(
+        const uint32_t q_token_base = q_block_idx * kBlockQ;
+        tma::copy<kHeadDim, kBlockQ * kNumHeads, 0>(
             &tensor_map_q,
             &smem.full_q_barriers[q_stage_idx],
             smem.smem_q[q_stage_idx],
             0,
             q_token_base * kNumHeads);
-        tma::copy<kNumWeightElementsPerRow, BLOCK_Q, 0>(
+        tma::copy<kNumWeightElementsPerRow, kBlockQ, 0>(
             &tensor_map_weights,
             &smem.full_q_barriers[q_stage_idx],
             smem.smem_weights[q_stage_idx],
@@ -269,7 +288,7 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
   } else if (warp_idx == kSpecWarpStart + 1) {
     cutlass::arch::warpgroup_reg_dealloc<kNumSpecializedRegisters>();
     if (cute::elect_one_sync()) {
-      OrderedScheduler scheduler(params);
+      Scheduler scheduler(params);
       uint32_t q_block_idx, kv_base, num_kv_splits;
       uint32_t num_loaded = 0;
       while (scheduler.next_q_block(q_block_idx, kv_base, num_kv_splits)) {
@@ -277,29 +296,17 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
         for (uint32_t kv_split_idx = 0; kv_split_idx < num_kv_splits; ++kv_split_idx) {
           CUTE_TIE_DECL(kv_pipeline.advance(), kv_stage_idx, kv_phase);
           smem.empty_kv_barriers[kv_stage_idx].wait(kv_phase ^ 1);
-          if (kReuseKV and num_loaded >= kNumKVStages) {
+          if (kReuseKV and num_loaded >= kNumKVStagesL) {
             // Calibration only: the stage keeps the data of an earlier split.
             smem.full_kv_barriers[kv_stage_idx].arrive();
             continue;
           }
           ++num_loaded;
-          const uint32_t kv_tma_offset = kv_base + kv_split_idx * SPLIT_KV;
-          constexpr uint32_t kKVTmaTokens = 256;
-#pragma unroll
-          for (uint32_t i = 0; i < SPLIT_KV / kKVTmaTokens; ++i) {
-            tma::copy<kHeadDim, kKVTmaTokens, 0>(
-                &tensor_map_kv,
-                &smem.full_kv_barriers[kv_stage_idx],
-                smem.smem_kv[kv_stage_idx] + i * kKVTmaTokens * kNumQKBytesPerToken,
-                0,
-                kv_tma_offset + i * kKVTmaTokens);
-            tma::copy<kKVTmaTokens, 1, 0>(
-                &tensor_map_sf_kv,
-                &smem.full_kv_barriers[kv_stage_idx],
-                smem.smem_sf_kv[kv_stage_idx] + i * kKVTmaTokens,
-                kv_tma_offset + i * kKVTmaTokens,
-                0);
-          }
+          const uint32_t kv_tma_offset = kv_base + kv_split_idx * kSplitKV;
+          tma::copy<kHeadDim, kSplitKV, 0>(
+              &tensor_map_kv, &smem.full_kv_barriers[kv_stage_idx], smem.smem_kv[kv_stage_idx], 0, kv_tma_offset);
+          tma::copy<kSplitKV, 1, 0>(
+              &tensor_map_sf_kv, &smem.full_kv_barriers[kv_stage_idx], smem.smem_sf_kv[kv_stage_idx], kv_tma_offset, 0);
           smem.full_kv_barriers[kv_stage_idx].arrive_and_expect_tx(SMEM_KV_SIZE_PER_STAGE + SMEM_SF_KV_SIZE_PER_STAGE);
         }
       }
@@ -308,7 +315,7 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
   } else if (warp_idx == kSpecWarpStart + 2) {
     cutlass::arch::warpgroup_reg_dealloc<kNumSpecializedRegisters>();
 
-    OrderedScheduler scheduler(params);
+    Scheduler scheduler(params);
     uint32_t q_block_idx, kv_base, num_kv_splits;
     while (scheduler.next_q_block(q_block_idx, kv_base, num_kv_splits)) {
       CUTE_TIE_DECL(q_pipeline.advance(), q_stage_idx, q_phase);
@@ -320,7 +327,7 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
 
         if (cute::elect_one_sync()) {
 #pragma unroll
-          for (uint32_t i = 0; i < kNumMathWarpGroups; ++i) {
+          for (uint32_t i = 0; i < kMmaPerSplit; ++i) {
             CUTE_TIE_DECL(tmem_pipeline.advance(), tmem_stage_idx, tmem_phase);
             uint32_t tmem_addr = tmem_stage_idx * UMMA_N;
 
@@ -357,12 +364,12 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
   } else if (warp_idx < kSpecWarpStart) {
     cutlass::arch::warpgroup_reg_alloc<kNumMathRegisters>();
 
-    constexpr bool kLoadSeqBounds = (kMode == kModeFilter);
-    uint32_t seq_k_start[kLoadSeqBounds ? BLOCK_Q : 1];
-    uint32_t seq_k_end[kLoadSeqBounds ? BLOCK_Q : 1];
+    constexpr bool kFilter = (kMode == kModeFilter);
+    uint32_t seq_k_start[kFilter ? kBlockQ : 1];
+    uint32_t seq_k_end[kFilter ? kBlockQ : 1];
+    float tau[kFilter ? kBlockQ : 1] = {};
     const auto math_warpgroup_idx = warp_idx / 4;
     float sink_acc = 0.0f;
-    float tau[BLOCK_Q] = {};
 
     // One (row, key) result: store, accumulate, or filter into the row's list. Callers
     // pass the row's window and tau as values so the per-row arrays stay in registers.
@@ -376,7 +383,7 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
         params.logits[row * static_cast<uint64_t>(params.logits_stride) + kv_offset] = result;
       } else if constexpr (kMode == kModeNoStore) {
         sink_acc += result;
-      } else if constexpr (kMode == kModeFilter) {
+      } else if constexpr (kFilter) {
         const uint32_t rel = kv_offset - win_start;
         const bool take = rel < win_len and result >= row_tau;
         const uint32_t mask = __ballot_sync(0xffffffffu, take);
@@ -396,31 +403,35 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
       }
     };
     const auto load_tau = [&](const uint32_t q_block_idx) {
-      if constexpr (kMode == kModeFilter) {
+      if constexpr (kFilter) {
 #pragma unroll
-        for (uint32_t i = 0; i < BLOCK_Q; ++i) {
-          const uint32_t row = q_block_idx * BLOCK_Q + i;
+        for (uint32_t i = 0; i < kBlockQ; ++i) {
+          const uint32_t row = q_block_idx * kBlockQ + i;
           // Rows past the batch take no candidates.
           tau[i] = row < params.num_q_tokens ? __ldg(params.tau + row) : cute::numeric_limits<float>::infinity();
         }
       }
     };
+    // Row r of this warpgroup's group of kRows (rows kRows*g + r), by constant indices.
+    const auto pick = [&](const auto* arr, const uint32_t r, const uint32_t rows_per_wg) {
+      return math_warpgroup_idx != 0 ? arr[rows_per_wg + r] : arr[r];
+    };
 
-    if constexpr (not kRowSplit) {
+    if constexpr (kLayout == 0) {
       const auto math_thread_idx = warp_idx * 32 + lane_idx;
       tmem_pipeline.advance(math_warpgroup_idx);
-      float weights[BLOCK_Q][kNumHeads];
+      float weights[kBlockQ][kNumHeads];
       float accum[kNumHeads];
 
-      OrderedScheduler scheduler(params);
+      Scheduler scheduler(params);
       uint32_t q_block_idx, kv_base, num_kv_splits;
-      while (scheduler.template next_q_block<kLoadSeqBounds>(q_block_idx, kv_base, num_kv_splits, seq_k_start, seq_k_end)) {
+      while (scheduler.template next_q_block<kFilter>(q_block_idx, kv_base, num_kv_splits, seq_k_start, seq_k_end)) {
         CUTE_TIE_DECL(q_pipeline.advance(), q_stage_idx, q_phase);
         smem.full_q_barriers[q_stage_idx].wait(q_phase);
         load_tau(q_block_idx);
         if constexpr (kMode != kModeNoEpi) {
 #pragma unroll
-          for (uint32_t i = 0; i < BLOCK_Q; ++i) {
+          for (uint32_t i = 0; i < kBlockQ; ++i) {
             const auto smem_weights_row = smem.smem_weights[q_stage_idx] + i * kNumWeightElementsPerRow;
 #pragma unroll
             for (uint32_t j = 0; j < kNumHeads; ++j)
@@ -429,7 +440,7 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
         }
 
         for (uint32_t kv_split_idx = 0; kv_split_idx < num_kv_splits; ++kv_split_idx) {
-          const uint32_t kv_offset = kv_base + kv_split_idx * SPLIT_KV + math_thread_idx;
+          const uint32_t kv_offset = kv_base + kv_split_idx * kSplitKV + math_thread_idx;
 
           CUTE_TIE_DECL(kv_pipeline.advance(), kv_stage_idx, kv_phase);
           smem.full_kv_barriers[kv_stage_idx].wait(kv_phase);
@@ -451,7 +462,7 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
           }
 
 #pragma unroll
-          for (uint32_t i = 0; i < BLOCK_Q; ++i) {
+          for (uint32_t i = 0; i < kBlockQ; ++i) {
             uint32_t tmem_addr = tmem_stage_idx * UMMA_N + i * kNumHeads;
             ptx::tmem_load_32dp32b<kNumHeads / 2>(tmem_addr, reinterpret_cast<uint32_t*>(accum));
             cutlass::arch::fence_view_async_tmem_load();
@@ -459,15 +470,15 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
                 tmem_addr + kNumHeads / 2, reinterpret_cast<uint32_t*>(accum + kNumHeads / 2));
             cutlass::arch::fence_view_async_tmem_load();
 
-            if (i == BLOCK_Q - 1) {
+            if (i == kBlockQ - 1) {
               ptx::tcgen05_before_thread_sync();
               smem.empty_tmem_barriers[tmem_stage_idx].arrive();
             }
             handle(
-                q_block_idx * BLOCK_Q + i,
-                seq_k_start[kLoadSeqBounds ? i : 0],
-                seq_k_end[kLoadSeqBounds ? i : 0] - seq_k_start[kLoadSeqBounds ? i : 0],
-                tau[i],
+                q_block_idx * kBlockQ + i,
+                seq_k_start[kFilter ? i : 0],
+                seq_k_end[kFilter ? i : 0] - seq_k_start[kFilter ? i : 0],
+                tau[kFilter ? i : 0],
                 kv_offset,
                 dg_reduce<kAluHeads>(accum, weights[i]) * scale_kv);
           }
@@ -477,33 +488,32 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
         smem.empty_q_barriers[q_stage_idx].arrive();
       }
     } else {
-      // Thread t of warpgroup g: TMEM lane t (key t of each half), rows 2g and 2g+1.
+      // Thread t of warpgroup g: TMEM lane t (key t of each 128-key MMA), rows kRows*g + r.
+      constexpr uint32_t kRows = kBlockQ / 2;
       const uint32_t lane_key = (warp_idx % 4) * 32 + lane_idx;
-      const uint32_t row0 = 2 * math_warpgroup_idx;
-      float weights[2][kNumHeads];
-      float accum[2][kNumHeads];
+      const uint32_t row0 = kRows * math_warpgroup_idx;
+      float weights[kRows][kNumHeads];
+      float accum[kLayout == 1 ? 2 : 1][kNumHeads];
 
-      OrderedScheduler scheduler(params);
+      Scheduler scheduler(params);
       uint32_t q_block_idx, kv_base, num_kv_splits;
-      while (scheduler.template next_q_block<kLoadSeqBounds>(q_block_idx, kv_base, num_kv_splits, seq_k_start, seq_k_end)) {
+      while (scheduler.template next_q_block<kFilter>(q_block_idx, kv_base, num_kv_splits, seq_k_start, seq_k_end)) {
         CUTE_TIE_DECL(q_pipeline.advance(), q_stage_idx, q_phase);
         smem.full_q_barriers[q_stage_idx].wait(q_phase);
         load_tau(q_block_idx);
-        // This warpgroup's two rows, selected with constant indices (registers, not local memory).
-        uint32_t win_start[2] = {0, 0}, win_len[2] = {0, 0};
-        float row_tau[2] = {0.0f, 0.0f};
-        if constexpr (kMode == kModeFilter) {
+        uint32_t win_start[kRows] = {}, win_len[kRows] = {};
+        float row_tau[kRows] = {};
+        if constexpr (kFilter) {
 #pragma unroll
-          for (uint32_t r = 0; r < 2; ++r) {
-            const bool hi = math_warpgroup_idx != 0;
-            win_start[r] = hi ? seq_k_start[2 + r] : seq_k_start[r];
-            win_len[r] = (hi ? seq_k_end[2 + r] : seq_k_end[r]) - win_start[r];
-            row_tau[r] = hi ? tau[2 + r] : tau[r];
+          for (uint32_t r = 0; r < kRows; ++r) {
+            win_start[r] = pick(seq_k_start, r, kRows);
+            win_len[r] = pick(seq_k_end, r, kRows) - win_start[r];
+            row_tau[r] = pick(tau, r, kRows);
           }
         }
         if constexpr (kMode != kModeNoEpi) {
 #pragma unroll
-          for (uint32_t r = 0; r < 2; ++r) {
+          for (uint32_t r = 0; r < kRows; ++r) {
             const auto smem_weights_row = smem.smem_weights[q_stage_idx] + (row0 + r) * kNumWeightElementsPerRow;
 #pragma unroll
             for (uint32_t j = 0; j < kNumHeads; ++j)
@@ -514,19 +524,18 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
         for (uint32_t kv_split_idx = 0; kv_split_idx < num_kv_splits; ++kv_split_idx) {
           CUTE_TIE_DECL(kv_pipeline.advance(), kv_stage_idx, kv_phase);
           smem.full_kv_barriers[kv_stage_idx].wait(kv_phase);
-          float scale_kv[2] = {0.0f, 0.0f};
-          if constexpr (kMode != kModeNoEpi) {
+          float scale_kv[kMmaPerSplit];
 #pragma unroll
-            for (uint32_t h = 0; h < 2; ++h) scale_kv[h] = ptx::ld_shared(smem.smem_sf_kv[kv_stage_idx] + h * UMMA_M + lane_key);
-          }
+          for (uint32_t h = 0; h < kMmaPerSplit; ++h)
+            scale_kv[h] = kMode != kModeNoEpi ? ptx::ld_shared(smem.smem_sf_kv[kv_stage_idx] + h * UMMA_M + lane_key) : 0.0f;
 
 #pragma unroll
-          for (uint32_t h = 0; h < 2; ++h) {
+          for (uint32_t h = 0; h < kMmaPerSplit; ++h) {
             CUTE_TIE_DECL(tmem_pipeline.advance(), tmem_stage_idx, tmem_phase);
             smem.full_tmem_barriers[tmem_stage_idx].wait(tmem_phase);
             ptx::tcgen05_after_thread_sync();
-            if (h == 1) {
-              // Both halves' UMMAs have committed: the KV stage is free.
+            if (h == kMmaPerSplit - 1) {
+              // Every UMMA of the split has committed: the KV stage is free.
               cutlass::arch::fence_view_async_shared();
               smem.empty_kv_barriers[kv_stage_idx].arrive();
             }
@@ -536,17 +545,39 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
               continue;
             }
             const uint32_t tmem_addr = tmem_stage_idx * UMMA_N + row0 * kNumHeads;
-            ptx::tmem_load_32dp32b<kNumHeads>(tmem_addr, reinterpret_cast<uint32_t*>(accum[0]));
-            ptx::tmem_load_32dp32b<kNumHeads>(tmem_addr + kNumHeads, reinterpret_cast<uint32_t*>(accum[1]));
-            cutlass::arch::fence_view_async_tmem_load();
-            ptx::tcgen05_before_thread_sync();
-            smem.empty_tmem_barriers[tmem_stage_idx].arrive();
-
-            const uint32_t kv_offset = kv_base + kv_split_idx * SPLIT_KV + h * UMMA_M + lane_key;
-            const float r0 = dg_reduce<kAluHeads>(accum[0], weights[0]) * scale_kv[h];
-            const float r1 = dg_reduce<kAluHeads>(accum[1], weights[1]) * scale_kv[h];
-            handle(q_block_idx * BLOCK_Q + row0, win_start[0], win_len[0], row_tau[0], kv_offset, r0);
-            handle(q_block_idx * BLOCK_Q + row0 + 1, win_start[1], win_len[1], row_tau[1], kv_offset, r1);
+            const uint32_t kv_offset = kv_base + kv_split_idx * kSplitKV + h * UMMA_M + lane_key;
+            if constexpr (kLayout == 1) {
+              ptx::tmem_load_32dp32b<kNumHeads>(tmem_addr, reinterpret_cast<uint32_t*>(accum[0]));
+              ptx::tmem_load_32dp32b<kNumHeads>(tmem_addr + kNumHeads, reinterpret_cast<uint32_t*>(accum[1]));
+              cutlass::arch::fence_view_async_tmem_load();
+              ptx::tcgen05_before_thread_sync();
+              smem.empty_tmem_barriers[tmem_stage_idx].arrive();
+              const float r0 = dg_reduce<kAluHeads>(accum[0], weights[0]) * scale_kv[h];
+              const float r1 = dg_reduce<kAluHeads>(accum[1], weights[1]) * scale_kv[h];
+              handle(q_block_idx * kBlockQ + row0, win_start[0], win_len[0], row_tau[0], kv_offset, r0);
+              handle(q_block_idx * kBlockQ + row0 + 1, win_start[1], win_len[1], row_tau[1], kv_offset, r1);
+            } else {
+              // DeepGEMM's per-row load pattern over this warpgroup's 4 rows.
+#pragma unroll
+              for (uint32_t r = 0; r < kRows; ++r) {
+                const uint32_t addr = tmem_addr + r * kNumHeads;
+                ptx::tmem_load_32dp32b<kNumHeads / 2>(addr, reinterpret_cast<uint32_t*>(accum[0]));
+                cutlass::arch::fence_view_async_tmem_load();
+                ptx::tmem_load_32dp32b<kNumHeads / 2>(addr + kNumHeads / 2, reinterpret_cast<uint32_t*>(accum[0] + kNumHeads / 2));
+                cutlass::arch::fence_view_async_tmem_load();
+                if (r == kRows - 1) {
+                  ptx::tcgen05_before_thread_sync();
+                  smem.empty_tmem_barriers[tmem_stage_idx].arrive();
+                }
+                handle(
+                    q_block_idx * kBlockQ + row0 + r,
+                    win_start[r],
+                    win_len[r],
+                    row_tau[r],
+                    kv_offset,
+                    dg_reduce<kAluHeads>(accum[0], weights[r]) * scale_kv[h]);
+              }
+            }
           }
         }
 
@@ -565,6 +596,7 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
   }
 #endif
 }
+
 
 // ---------------------------------------------------------------------------
 // Exact selection over the candidate lists
@@ -797,7 +829,7 @@ inline CUtensorMap make_map_2d(
   return map;
 }
 
-template <int kMode, bool kReuseKV, bool kRowSplit, uint32_t kAluHeads>
+template <int kMode, bool kReuseKV, int kLayout, uint32_t kAluHeads>
 inline void score_impl(
     tvm::ffi::TensorView q,        // [T, 32, 128] e4m3
     tvm::ffi::TensorView kv,       // [N, 128] e4m3
@@ -813,6 +845,7 @@ inline void score_impl(
     tvm::ffi::TensorView cand_count,
     int64_t num_ctas) {
   using namespace sglang::host;
+  using Traits = LayoutTraits<kLayout>;
   const auto num_q = static_cast<uint32_t>(q.size(0));
   const auto num_kv = static_cast<uint32_t>(kv.size(0));
   RuntimeCheck(q.size(1) == kNumHeads and q.size(2) == kHeadDim, "fstk: q must be [T, 32, 128]");
@@ -823,7 +856,7 @@ inline void score_impl(
   ScoreParams params{};
   params.num_q_tokens = num_q;
   params.num_kv_tokens = num_kv;
-  params.num_q_blocks = (num_q + BLOCK_Q - 1) / BLOCK_Q;
+  params.num_q_blocks = (num_q + Traits::kBlockQ - 1) / Traits::kBlockQ;
   params.ks = static_cast<const uint32_t*>(ks.data_ptr());
   params.ke = static_cast<const uint32_t*>(ke.data_ptr());
   params.order = order.size(0) > 0 ? static_cast<const int32_t*>(order.data_ptr()) : nullptr;
@@ -843,29 +876,29 @@ inline void score_impl(
 
   const auto map_q = make_map_2d(
       q.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_UINT8, kHeadDim, uint64_t(num_q) * kNumHeads, kHeadDim, kHeadDim,
-      BLOCK_Q * kNumHeads, CU_TENSOR_MAP_SWIZZLE_128B);
+      Traits::kBlockQ * kNumHeads, CU_TENSOR_MAP_SWIZZLE_128B);
   const auto map_kv = make_map_2d(
-      kv.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_UINT8, kHeadDim, num_kv, kv.stride(0), kHeadDim, 256,
+      kv.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_UINT8, kHeadDim, num_kv, kv.stride(0), kHeadDim, Traits::kSplitKV,
       CU_TENSOR_MAP_SWIZZLE_128B);
   const auto map_sf_kv = make_map_2d(
-      kv_scale.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_FLOAT32, num_kv, 1, (uint64_t(num_kv) * 4 + 15) / 16 * 16, 256, 1,
-      CU_TENSOR_MAP_SWIZZLE_NONE);
+      kv_scale.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_FLOAT32, num_kv, 1, (uint64_t(num_kv) * 4 + 15) / 16 * 16,
+      Traits::kSplitKV, 1, CU_TENSOR_MAP_SWIZZLE_NONE);
   const auto map_w = make_map_2d(
       weights.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_FLOAT32, kNumHeads, num_q, weights.stride(0) * 4, kNumHeads,
-      BLOCK_Q, CU_TENSOR_MAP_SWIZZLE_NONE);
+      Traits::kBlockQ, CU_TENSOR_MAP_SWIZZLE_NONE);
 
   using SharedStorage = fstk_dg_layout::MQALogitsSharedStorage<
-      kNumHeads, kHeadDim, false, BLOCK_Q, SPLIT_KV, kNumQStages, kNumKVStages, (kRowSplit ? 4 : 3),
-      cutlass::float_e4m3_t, float>;
+      kNumHeads, kHeadDim, false, Traits::kBlockQ, Traits::kSplitKV, kNumQStages, Traits::kNumKVStages,
+      Traits::kNumTmemStages, cutlass::float_e4m3_t, float>;
   constexpr size_t kSmem = sizeof(SharedStorage);
-  constexpr auto kernel = fstk_score_kernel<kMode, kReuseKV, kRowSplit, kAluHeads>;
+  constexpr auto kernel = fstk_score_kernel<kMode, kReuseKV, kLayout, kAluHeads>;
   const DLDevice device = q.device();
   runtime::init_per_device(device, [=] { runtime::set_max_dynamic_smem(kernel, kSmem); });
   LaunchKernel(static_cast<uint32_t>(num_ctas), kNumThreads, device, kSmem)
       .enable_pdl(false)(kernel, params, map_q, map_kv, map_sf_kv, map_w);
 }
 
-template <bool kRowSplit, uint32_t kAluHeads>
+template <int kLayout, uint32_t kAluHeads>
 inline void score_dispatch(
     tvm::ffi::TensorView q,
     tvm::ffi::TensorView kv,
@@ -883,7 +916,7 @@ inline void score_dispatch(
     int64_t reuse_kv,
     int64_t num_ctas) {
 #define FSTK_SCORE(M, R) \
-  score_impl<M, R, kRowSplit, kAluHeads>(q, kv, kv_scale, weights, ks, ke, order, logits, tau, cand_score, cand_col, cand_count, num_ctas)
+  score_impl<M, R, kLayout, kAluHeads>(q, kv, kv_scale, weights, ks, ke, order, logits, tau, cand_score, cand_col, cand_count, num_ctas)
   switch (mode) {
     case kModeLogits:
       return FSTK_SCORE(kModeLogits, false);
@@ -902,6 +935,7 @@ inline void score_dispatch(
 
 struct FusedIndexerTopK {
   // mode: 0 logits, 1 no-epilogue, 2 no-store, 3 filter; reuse_kv only with mode 1 (calibration).
+  // layout: see LayoutTraits; alu_heads: 0 or 16 (dg_reduce).
   static void score(
       tvm::ffi::TensorView q,
       tvm::ffi::TensorView kv,
@@ -917,20 +951,26 @@ struct FusedIndexerTopK {
       tvm::ffi::TensorView cand_count,
       int64_t mode,
       int64_t reuse_kv,
-      int64_t row_split,
+      int64_t layout,
       int64_t alu_heads,
       int64_t num_ctas) {
-#define FSTK_DISPATCH(RS, AH) \
-  return score_dispatch<RS, AH>(q, kv, kv_scale, weights, ks, ke, order, logits, tau, cand_score, cand_col, cand_count, mode, reuse_kv, num_ctas)
+#define FSTK_DISPATCH(LY, AH) \
+  return score_dispatch<LY, AH>(q, kv, kv_scale, weights, ks, ke, order, logits, tau, cand_score, cand_col, cand_count, mode, reuse_kv, num_ctas)
     sglang::host::RuntimeCheck(alu_heads == 0 or alu_heads == 16, "fstk: alu_heads must be 0 or 16");
-    if (row_split) {
-      if (alu_heads) FSTK_DISPATCH(true, 16);
-      FSTK_DISPATCH(true, 0);
+    sglang::host::RuntimeCheck(layout >= 0 and layout <= 2, "fstk: layout must be 0, 1 or 2");
+    if (layout == 0) {
+      if (alu_heads) FSTK_DISPATCH(0, 16);
+      FSTK_DISPATCH(0, 0);
     }
-    if (alu_heads) FSTK_DISPATCH(false, 16);
-    FSTK_DISPATCH(false, 0);
+    if (layout == 1) {
+      if (alu_heads) FSTK_DISPATCH(1, 16);
+      FSTK_DISPATCH(1, 0);
+    }
+    if (alu_heads) FSTK_DISPATCH(2, 16);
+    FSTK_DISPATCH(2, 0);
 #undef FSTK_DISPATCH
   }
+
 
   static void select(
       tvm::ffi::TensorView cand_score,

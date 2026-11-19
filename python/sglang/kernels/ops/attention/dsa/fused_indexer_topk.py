@@ -19,9 +19,10 @@ import torch
 
 from sglang.kernels.jit.utils import cache_once, cuda_stubs_dir, load_jit
 
-BLOCK_Q = 4
-SPLIT_KV = 256
 MODE_LOGITS, MODE_NO_EPI, MODE_NO_STORE, MODE_FILTER = 0, 1, 2, 3
+# layout -> (rows per q-block, keys per split); see LayoutTraits in the kernel.
+LAYOUTS = {0: (4, 256), 1: (4, 256), 2: (8, 128)}
+DEFAULT_LAYOUT = 0
 
 
 def _deep_gemm_include() -> tuple[str, bool]:
@@ -64,19 +65,20 @@ def _empty(device, dtype=torch.float32):
     return torch.empty(0, device=device, dtype=dtype)
 
 
-def lpt_order(ks: torch.Tensor, ke: torch.Tensor, num_kv: int) -> torch.Tensor:
+def lpt_order(ks: torch.Tensor, ke: torch.Tensor, num_kv: int, layout: int = DEFAULT_LAYOUT) -> torch.Tensor:
     """q-blocks by descending KV span (the kernel deals them out snake-wise)."""
+    block_q, split_kv = LAYOUTS[layout]
     t = ks.shape[0]
-    nb = (t + BLOCK_Q - 1) // BLOCK_Q
-    pad = nb * BLOCK_Q - t
+    nb = (t + block_q - 1) // block_q
+    pad = nb * block_q - t
     s = ks.clamp(max=num_kv).to(torch.int64)
     e = ke.clamp(max=num_kv).to(torch.int64)
     if pad:
         s = torch.cat([s, s[-1:].expand(pad)])
         e = torch.cat([e, e[-1:].expand(pad)])
-    s = s.view(nb, BLOCK_Q).amin(1) // 4 * 4
-    e = e.view(nb, BLOCK_Q).amax(1)
-    span = (e - s + SPLIT_KV - 1) // SPLIT_KV
+    s = s.view(nb, block_q).amin(1) // 4 * 4
+    e = e.view(nb, block_q).amax(1)
+    span = (e - s + split_kv - 1) // split_kv
     return torch.argsort(span, descending=True, stable=True).to(torch.int32)
 
 
@@ -96,7 +98,7 @@ def score(
     cand_col: Optional[torch.Tensor] = None,
     cand_count: Optional[torch.Tensor] = None,
     reuse_kv: bool = False,
-    row_split: bool = True,
+    layout: int = DEFAULT_LAYOUT,
     alu_heads: int = 0,
     num_ctas: Optional[int] = None,
     cuh_path: Optional[str] = None,
@@ -119,7 +121,7 @@ def score(
         cand_count if cand_count is not None else _empty(dev, torch.int32),
         mode,
         int(reuse_kv),
-        int(row_split),
+        layout,
         alu_heads,
         num_ctas,
     )
@@ -151,7 +153,7 @@ def fused_indexer_topk(
     cand_cap: int = 8192,
     keep_all: Optional[int] = None,
     order: Optional[torch.Tensor] = None,
-    row_split: bool = True,
+    layout: int = DEFAULT_LAYOUT,
     alu_heads: int = 0,
     cuh_path: Optional[str] = None,
 ) -> FusedTopKResult:
@@ -161,7 +163,7 @@ def fused_indexer_topk(
     num_kv = kv_fp8.shape[0]
     keep_all = cand_cap if keep_all is None else keep_all
     if order is None:
-        order = lpt_order(ks, ke, num_kv)
+        order = lpt_order(ks, ke, num_kv, layout)
 
     # Sample keys: every sample_stride-th flattened position; a row's window [ks, ke)
     # holds the samples [ceil(ks / s), ceil(ke / s)).
@@ -170,8 +172,9 @@ def fused_indexer_topk(
     sks = (ks + sample_stride - 1) // sample_stride
     ske = (ke + sample_stride - 1) // sample_stride
     n_s = kv_s.shape[0]
-    stride_s = (n_s + 2 * SPLIT_KV + 255) // 256 * 256
-    sample_logits = torch.empty(rows + BLOCK_Q, stride_s, device=dev, dtype=torch.float32)
+    # Room for a q-block's span past the last key and for its padded rows.
+    stride_s = (n_s + 512 + 255) // 256 * 256
+    sample_logits = torch.empty(rows + 8, stride_s, device=dev, dtype=torch.float32)
     score(
         q_fp8,
         kv_s,
@@ -180,9 +183,9 @@ def fused_indexer_topk(
         sks,
         ske,
         mode=MODE_LOGITS,
-        order=lpt_order(sks, ske, n_s),
+        order=lpt_order(sks, ske, n_s, layout),
         logits=sample_logits,
-        row_split=row_split,
+        layout=layout,
         alu_heads=alu_heads,
         cuh_path=cuh_path,
     )
@@ -205,7 +208,7 @@ def fused_indexer_topk(
         cand_score=cand_score,
         cand_col=cand_col,
         cand_count=cand_count,
-        row_split=row_split,
+        layout=layout,
         alu_heads=alu_heads,
         cuh_path=cuh_path,
     )
