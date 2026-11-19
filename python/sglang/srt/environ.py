@@ -905,12 +905,14 @@ class Envs:
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
     # write_back: back up the device LRU tail ahead of eviction, off the eviction path, so
     # demotes need no D2H wait. The tail is K x the decayed peak of per-step device evictions,
-    # clamped to [MIN_TOKENS, MAX_TOKENS]; one batch in flight, committed ACK_LAG steps after PP0 sees it.
+    # clamped to [MIN_TOKENS, MAX_TOKENS]; each step writes its unbacked part as one batch (at most
+    # MAX_INFLIGHT batches), committed ACK_LAG steps after PP0 sees the copy done.
     SGLANG_HICACHE_DEVICE_WRITE_AHEAD = EnvBool(False)
     SGLANG_HICACHE_DEVICE_WRITE_AHEAD_K = EnvFloat(4.0)
     SGLANG_HICACHE_DEVICE_WRITE_AHEAD_MIN_TOKENS = EnvInt(32768)
     SGLANG_HICACHE_DEVICE_WRITE_AHEAD_MAX_TOKENS = EnvInt(2097152)
     SGLANG_HICACHE_DEVICE_WRITE_AHEAD_BATCH_MAX_TOKENS = EnvInt(1048576)
+    SGLANG_HICACHE_DEVICE_WRITE_AHEAD_MAX_INFLIGHT = EnvInt(4)
     SGLANG_HICACHE_DEVICE_WRITE_AHEAD_ACK_LAG = EnvInt(1)
     # Staged write-back: batch small page copies and merge adjacent host rows.
     SGLANG_OPT_HICACHE_BATCH_WRITE_BACK_COPY = EnvBool(False)

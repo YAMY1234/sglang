@@ -1206,10 +1206,20 @@ class TestDeviceWriteAhead(CustomTestCase):
             [call(), call(ack_queue=cc.ack_write_ahead_queue, stream="WA_STREAM")],
         )
         self.assertEqual(list(cache._wa_issue_steps), [1])
-        # In flight: the spare set refreshes, nothing new is written.
+        # Next step: in-flight nodes are pending; only a new unbacked one is written.
+        tc.peek_device_eviction_candidates.return_value = [
+            (5, 4, True, True), (8, 4, True, True), (9, 4, True, False)
+        ]
         cache._write_ahead_device_tail()
         self.assertEqual(tc.set_write_ahead_spare.call_count, 2)
-        self.assertEqual(cache._execute_kv_backup.call_count, 2)
+        self.assertEqual([c.args[0] for c in cache._execute_kv_backup.call_args_list], [5, 8, 9])
+        self.assertEqual(list(cache._wa_issue_steps), [1, 2])
+        # At the in-flight cap the spare set still refreshes, nothing is written.
+        tc.peek_device_eviction_candidates.return_value = [(10, 4, True, False)]
+        with envs.SGLANG_HICACHE_DEVICE_WRITE_AHEAD_MAX_INFLIGHT.override(2):
+            cache._write_ahead_device_tail()
+        self.assertEqual(tc.set_write_ahead_spare.call_count, 3)
+        self.assertEqual(cache._execute_kv_backup.call_count, 3)
 
     def test_tail_target_follows_the_decayed_eviction_peak(self):
         cache = self._wa_cache()

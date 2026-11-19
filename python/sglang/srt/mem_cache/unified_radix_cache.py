@@ -2777,10 +2777,12 @@ class UnifiedRadixCache(BasePrefixCache):
 
         The tail is K x the decayed peak of per-step device evictions. Its nodes
         are spared by the first duplicate-reclaim pass; the unbacked ones are
-        copied in one batch on a private stream behind the forward, locked until
-        the rank-agreed ack commits them (_write_ahead_commit). Every input is
-        rank-replicated: tree state, eviction counts and committed acks, never a
-        local event query, so all ranks issue the same batch at the same step.
+        copied in one batch per step on a private stream behind the forward,
+        locked until the rank-agreed ack commits them (_write_ahead_commit). A
+        node enters the tail's hot end about K steps before eviction reaches it,
+        so its copy has K steps to commit. Every input is rank-replicated: tree
+        state, eviction counts and committed acks, never a local event query, so
+        all ranks issue the same batch at the same step.
         """
         t0 = time.perf_counter() if pmicro_hoststats.ON else 0.0
         self._wa_step += 1
@@ -2802,7 +2804,10 @@ class UnifiedRadixCache(BasePrefixCache):
             BASE_COMPONENT_TYPE, target
         )
         self.tree_core.set_write_ahead_spare([node_id for node_id, *_ in tail])
-        if self.ongoing_write_ahead:
+        if (
+            len(self._wa_issue_steps)
+            >= envs.SGLANG_HICACHE_DEVICE_WRITE_AHEAD_MAX_INFLIGHT.get()
+        ):
             return
         cc = self.cache_controller
         # Writes queued by others keep their own ack queue and fence.
@@ -2831,7 +2836,7 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             budget -= num_tokens
             issued += num_tokens
-        if self.ongoing_write_ahead:
+        if issued:
             cc.start_writing(
                 ack_queue=cc.ack_write_ahead_queue, stream=self._write_ahead_stream()
             )
