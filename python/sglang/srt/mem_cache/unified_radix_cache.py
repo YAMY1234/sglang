@@ -2847,14 +2847,16 @@ class UnifiedRadixCache(BasePrefixCache):
             if is_cuda() or is_hip():
                 from sglang.srt.managers.utils import allocate_distinct_stream
 
+                avoid = [
+                    device_module.current_stream(),
+                    engine.device_to_host_stream,
+                    engine.host_to_device_stream,
+                    engine.index_stream,
+                ]
+                if self.cache_controller.write_fence_stream is not None:
+                    avoid.append(self.cache_controller.write_fence_stream)
                 self._write_ahead_stream_ = allocate_distinct_stream(
-                    device_module,
-                    [
-                        device_module.current_stream(),
-                        engine.device_to_host_stream,
-                        engine.host_to_device_stream,
-                        engine.index_stream,
-                    ],
+                    device_module, avoid
                 )
             else:
                 self._write_ahead_stream_ = device_module.Stream()

@@ -5704,3 +5704,90 @@ def test_load_back_action_tuple_preserves_chunk_order_and_tensor_ownership():
         assert torch.UntypedStorage._expired(storage_ref)
     finally:
         torch.UntypedStorage._free_weak_ref(storage_ref)
+
+
+def _back_up_and_ack(core, node, host: list[int]) -> None:
+    core.commit_backup(node, torch.tensor(host, dtype=torch.int64), {})
+    core.mark_write_through_pending([node], node)
+    core.finish_write_through([node], node)
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+def test_peek_device_eviction_candidates_follows_the_device_eviction_walk(backend):
+    core = _tree_core(backend)
+    core.set_hicache_enabled()
+    core.is_write_back = True
+    _insert(core, [1, 2, 3], [10, 11, 12])
+    _insert(core, [1, 2, 4, 5], [10, 11, 13, 14])
+    backed = _insert(core, [9, 8], [90, 91]).last_device_node
+    _back_up_and_ack(core, backed, [900, 901])
+    # A locked leaf (an in-flight write-ahead) keeps itself and its path out.
+    locked = _insert(core, [7], [70]).last_device_node
+    receipt = core.inc_lock_ref(locked)
+
+    peek = core.peek_device_eviction_candidates(ComponentType.FULL, 1 << 30)
+    assert core.peek_device_eviction_candidates(ComponentType.FULL, 3) == peek[:2]
+
+    walked = []
+    tracker, device_frees, host_frees = {ComponentType.FULL: 0}, {}, {}
+    core.evict_device_start(ComponentType.FULL, 1 << 30)
+    try:
+        while True:
+            step = core.evict_device_next_node(ComponentType.FULL, tracker)
+            node = step.node_id
+            _accumulate_step(step, tracker, device_frees, host_frees)
+            if node is None:
+                break
+            unbacked = not core.is_backuped(node)
+            before = tracker[ComponentType.FULL]
+            leaf = core.evict_device_leaf(node, is_write_back=True)
+            _accumulate_step(leaf, tracker, device_frees, host_frees)
+            if leaf.backup_kv is not None:
+                (spec, _) = core.build_backup_spec(node)
+                core.commit_backup(node, spec + 500, {})
+                _accumulate_step(core.demote(node), tracker, device_frees, host_frees)
+            freed = tracker[ComponentType.FULL] - before
+            walked.append((node, freed, unbacked, False))
+    finally:
+        core.evict_device_end(ComponentType.FULL)
+    assert peek == walked
+    assert len(peek) == 4 and (backed, 2, False, False) in peek
+    assert all(node != locked for node, *_ in peek)
+    core.dec_lock_ref(locked, receipt.to_dec_params())
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("spare_first", [False, True])
+def test_write_ahead_spare_survives_the_first_duplicate_reclaim_pass(
+    backend, spare_first
+):
+    core = _tree_core(backend)
+    core.set_hicache_enabled()
+    core.is_write_back = True
+    # Each backed parent keeps an unbacked device child, so neither is a D-leaf.
+    _insert(core, [1, 2, 3], [10, 11, 12])
+    _insert(core, [5, 6, 7], [50, 51, 52])
+    first = _insert(core, [1, 2], [10, 11]).last_device_node
+    second = _insert(core, [5, 6], [50, 51]).last_device_node
+    _back_up_and_ack(core, first, [200, 201])
+    _back_up_and_ack(core, second, [600, 601])
+    if spare_first:
+        core.set_write_ahead_spare([first])
+    host_frees = {}
+    with envs.SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM.override(False):
+        _accumulate_step(
+            core.drive_host_eviction(ComponentType.FULL, 2), {}, {}, host_frees
+        )
+    # Insertion order reclaims the first duplicate; sparing it moves on.
+    reclaimed = [600, 601] if spare_first else [200, 201]
+    assert torch.cat(host_frees[ComponentType.FULL]).tolist() == reclaimed
+    assert core.is_backuped(first) == spare_first
+    assert core.is_backuped(second) != spare_first
+    # Spared only in the first pass: with nothing else left it is reclaimed too.
+    host_frees = {}
+    with envs.SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM.override(False):
+        _accumulate_step(
+            core.drive_host_eviction(ComponentType.FULL, 2), {}, {}, host_frees
+        )
+    assert not core.is_backuped(first) and not core.is_backuped(second)
+    core.sanity_check([], [])

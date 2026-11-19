@@ -5,6 +5,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     Req,
 )
@@ -252,6 +253,134 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
             self.assertEqual(len(loaded_conv), len(expected_conv))
             for actual_conv, expected_conv_buf in zip(loaded_conv, expected_conv):
                 self.assertTrue(torch.equal(actual_conv, expected_conv_buf))
+        cache.sanity_check()
+
+
+    def _write_ahead_round(self, cache, tail_tokens):
+        """One write-ahead walk, the copy landing, the next walk, the commit."""
+        with envs.SGLANG_HICACHE_DEVICE_WRITE_AHEAD_MIN_TOKENS.override(tail_tokens):
+            cache._write_ahead_device_tail()
+            issued = set(cache.ongoing_write_ahead)
+            torch.cuda.synchronize()
+            cache._write_ahead_device_tail()
+        self.assertEqual(set(cache.ongoing_write_ahead), issued)
+        cache._write_ahead_commit(cache._write_ahead_publish_count())
+        self.assertEqual(cache.ongoing_write_ahead, {})
+        return issued
+
+    def _evict_without_copies(self, cache, num_tokens):
+        no_copy = AssertionError("device eviction waited on a D2H copy")
+        with (
+            mock.patch.object(cache, "_backup_full_leaf_for_write_back", side_effect=no_copy),
+            mock.patch.object(cache, "_backup_full_leaf_batched", side_effect=no_copy),
+        ):
+            return cache.evict(EvictParams(num_tokens=num_tokens))
+
+    @requires_hicache
+    @requires(lambda cfg: not cfg.has_swa, "SWA windows are not written ahead")
+    def test_hicache_device_write_ahead_backs_the_tail_before_eviction(self):
+        with envs.SGLANG_HICACHE_DEVICE_WRITE_AHEAD.override(True):
+            cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+            self._init_hicache(cache, write_policy="write_back")
+        seqs = [self._make_seq(1 + 1000 * i, 2) for i in range(3)]
+        for seq in seqs:
+            self._insert(cache, allocator, req_to_token_pool, seq)
+        expected = []
+        for marker, seq in enumerate(seqs, start=3):
+            node = match_prefix(cache, seq).last_device_node
+            indices = cache.path_device_indices(node).clone()
+            self._fill_full_kv(allocator, indices, marker=marker)
+            mamba = None
+            if self.cfg.has_mamba:
+                mamba = node_device_value(cache, node, ComponentType.MAMBA).clone()
+                self._fill_mamba_state(req_to_token_pool, mamba, marker=10 + marker)
+                mamba = self._snapshot_mamba_state(req_to_token_pool, mamba)
+            expected.append(
+                (seq, node, indices, self._snapshot_full_kv(allocator, indices), mamba)
+            )
+        total = sum(map(len, seqs))
+        nodes = {node for _, node, *_ in expected}
+
+        with envs.SGLANG_HICACHE_DEVICE_WRITE_AHEAD_MIN_TOKENS.override(total):
+            cache._write_ahead_device_tail()
+        self.assertEqual(set(cache.ongoing_write_ahead), nodes)
+        # In flight the batch is locked: eviction cannot take it.
+        self.assertEqual(cache.evict(EvictParams(num_tokens=total)).num_tokens_evicted, 0)
+        torch.cuda.synchronize()
+        cache._write_ahead_device_tail()
+        cache._write_ahead_commit(cache._write_ahead_publish_count())
+        self.assertEqual(cache.ongoing_write_ahead, {})
+        self.assertTrue(all(cache.tree_core.is_backuped(node) for node in nodes))
+
+        evicted = self._evict_without_copies(cache, total)
+        self.assertEqual(evicted.num_tokens_evicted, total)
+        for seq, node, indices, (k, v), mamba in expected:
+            self.assertTrue(cache.tree_core.is_full_device_evicted(node))
+            self._fill_full_kv(allocator, indices, marker=99)
+            self._load_back_node(cache, node)
+            loaded = cache.path_device_indices(match_prefix(cache, seq).last_device_node)
+            loaded_k, loaded_v = self._snapshot_full_kv(allocator, loaded)
+            self.assertTrue(torch.equal(loaded_k, k) and torch.equal(loaded_v, v))
+            if mamba is not None:
+                temporal, conv = self._snapshot_mamba_state(
+                    req_to_token_pool, node_device_value(cache, node, ComponentType.MAMBA)
+                )
+                self.assertTrue(torch.equal(temporal, mamba[0]))
+                self.assertTrue(all(map(torch.equal, conv, mamba[1])))
+        cache.sanity_check()
+
+    @requires_hicache
+    @requires(lambda cfg: not cfg.has_swa, "SWA windows are not written ahead")
+    def test_hicache_device_write_ahead_reclaims_duplicates_outside_the_tail(self):
+        """Duplicate reclaim on (DUPKEEP off): host pressure from the write-ahead
+        takes a device duplicate outside the tail, keeps host-only data, and the
+        tail then demotes without a D2H copy."""
+        with (
+            envs.SGLANG_HICACHE_DEVICE_WRITE_AHEAD.override(True),
+            envs.SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM.override(False),
+        ):
+            cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+            self._init_hicache(cache, write_policy="write_back")
+            host = cache.cache_controller.mem_pool_host
+            page = self.cfg.page_size
+            tail_seq = self._make_seq(1, 2)
+            parent_seq = self._make_seq(3000, 2)
+            child_seq = parent_seq + self._make_seq(5000, 2)
+            # A host-only filler leaves less free host space than the tail needs.
+            filler_pages = (host.available_size() - len(child_seq)) // page
+            filler_pages -= len(tail_seq) // page - 1
+            if filler_pages < 1 or allocator.available_size() < 6 * page:
+                self.skipTest("pools too small for a filler and three nodes")
+            filler_seq = self._make_seq(7000, filler_pages)
+            self._insert(cache, allocator, req_to_token_pool, filler_seq)
+            filler = match_prefix(cache, filler_seq).last_device_node
+            self._backup_node(cache, filler)
+            cache._demote(filler, {ct: 0 for ct in cache.tree_components})
+            for seq in (tail_seq, parent_seq, child_seq):
+                self._insert(cache, allocator, req_to_token_pool, seq)
+            tail = match_prefix(cache, tail_seq).last_device_node
+            parent = match_prefix(cache, parent_seq).last_device_node
+            child = match_prefix(cache, child_seq).last_device_node
+            self._backup_node(cache, child)
+            self.assertLess(host.available_size(), len(tail_seq))
+            self.assertEqual(
+                cache.tree_core.peek_device_eviction_candidates(
+                    ComponentType.FULL, len(tail_seq)
+                )[0][0],
+                tail,
+            )
+
+            self.assertEqual(self._write_ahead_round(cache, len(tail_seq)), {tail})
+            self.assertTrue(cache.tree_core.is_backuped(tail))
+            # The parent's host copy (a duplicate outside the tail) paid for it;
+            # the host-only filler and the leaf duplicate (an imminent demote) stay.
+            self.assertFalse(cache.tree_core.is_backuped(parent))
+            self.assertTrue(cache.tree_core.is_backuped(child))
+            self.assertEqual(match_prefix(cache, filler_seq).host_hit_length, len(filler_seq))
+
+            evicted = self._evict_without_copies(cache, len(tail_seq))
+            self.assertEqual(evicted.num_tokens_evicted, len(tail_seq))
+            self.assertTrue(cache.tree_core.is_full_device_evicted(tail))
         cache.sanity_check()
 
     @requires(
