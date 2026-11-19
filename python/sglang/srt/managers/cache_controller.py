@@ -1044,13 +1044,35 @@ class HiCacheController:
         )
         return device_indices
 
+    def _pinned_indices_to_device(self, host_indices: torch.Tensor) -> torch.Tensor:
+        """Pageable host indices copied asynchronously through one of two reused pinned buffers; a buffer is
+        refilled only after the copy that last read it has finished (its event)."""
+        if not hasattr(self, "_index_pin_bufs"):
+            self._index_pin_bufs, self._index_pin_events, self._index_pin_slot = [None, None], [None, None], 0
+        slot = self._index_pin_slot = 1 - self._index_pin_slot
+        if self._index_pin_events[slot] is not None:
+            self._index_pin_events[slot].synchronize()
+        n, buf = host_indices.numel(), self._index_pin_bufs[slot]
+        if buf is None or buf.numel() < n or buf.dtype != host_indices.dtype:
+            buf = torch.empty(max(n, 1 << 16), dtype=host_indices.dtype, pin_memory=True)
+            self._index_pin_bufs[slot] = buf
+        buf[:n].copy_(host_indices.reshape(-1))
+        out = buf[:n].to(self.device, non_blocking=True).view(host_indices.shape)
+        event = device_module.Event()
+        event.record()
+        self._index_pin_events[slot] = event
+        return out
+
     def move_indices(
         self, host_indices: torch.Tensor, device_indices: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # move indices to GPU if using kernels, to host if using direct indexing
         if self.io_backend == "kernel":
             if not host_indices.is_cuda:
-                host_indices = host_indices.to(self.device, non_blocking=True)
+                if envs.SGLANG_HICACHE_PIN_LOAD_INDICES.get() and not host_indices.is_pinned():
+                    host_indices = self._pinned_indices_to_device(host_indices)
+                else:
+                    host_indices = host_indices.to(self.device, non_blocking=True)
             return host_indices, device_indices
         elif self.io_backend == "direct":
             if self.mem_pool_host.layout == "layer_first":
