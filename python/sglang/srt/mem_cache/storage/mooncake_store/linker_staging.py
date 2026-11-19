@@ -74,43 +74,9 @@ def scatter_plan(table: np.ndarray, rows: np.ndarray, slot_ptrs: np.ndarray):
     return dst.reshape(-1), src.reshape(-1), np.ascontiguousarray(sizes).reshape(-1)
 
 
-def entry_row_sources(entry) -> list[tuple[int, int]]:
-    """(page_size, row_span) per row column of a DevicePoolEntry / MergedPageEntry."""
-    parts = [entry.first, entry.second] if hasattr(entry, "first") else [entry]
-    return [(p.page_size, p._row_span) for p in parts]
-
-
-def torch_scatter_plan(table, sources, indices, slot_ptrs):
-    """scatter_plan with the destination rows computed by torch from slot indices
-    (device tensors on GPUs: no host wait for the indices). ``table``: the read's
-    item table as a tensor on the indices' device; ``sources``: entry_row_sources;
-    ``slot_ptrs``: [keys] int64 tensor on the same device."""
-    import torch
-
-    idx = indices.to(torch.int64).reshape(-1)
-    cols = []
-    for page_size, row_span in sources:
-        starts = idx.view(-1, page_size)[:, 0]
-        cols.append(starts // page_size if row_span == 1 else starts)
-    rows = torch.stack(cols, dim=1)
-    src_col, base, stride, size, offset = table.unbind(1)
-    dst = base[None, :] + rows[:, src_col] * stride[None, :]
-    src = slot_ptrs[:, None] + offset[None, :]
-    return dst.reshape(-1), src.reshape(-1), size.expand_as(dst).reshape(-1)
-
-
 def cpu_scatter(dst, src, sizes) -> None:
     for d, s, n in zip(dst.tolist(), src.tolist(), sizes.tolist()):
         ctypes.memmove(d, s, n)
-
-
-def gpu_scatter_tensors(plans) -> None:
-    """Run (dst, src, sizes) device-tensor plans on the current stream."""
-    from sglang.srt.mem_cache.storage.mooncake_store.linker_staging_kernel import scatter_copy_tensors
-
-    for dst, src, sizes in plans:
-        if dst.numel():
-            scatter_copy_tensors(dst, src, sizes)
 
 
 def gpu_scatter(plans, stream):

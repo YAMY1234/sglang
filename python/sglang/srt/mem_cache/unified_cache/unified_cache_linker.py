@@ -1850,6 +1850,15 @@ class UnifiedCacheLinkerWrapper:
             waited = time.perf_counter() - started
             self._requery_waits.append(waited)
             self._requery_records.append((request.rid, waited, "loaded" if publish else "aborted"))
+        if state.future is not None and not state.future.done() and getattr(state.future, "staged", False):
+            # SGLANG_LINKER_EARLY_READS: the relay's finish can apply before the
+            # staged load's plan and scatter are queued (they wait for the slot
+            # indices on the staging thread); wait for that, counted.
+            waited = time.perf_counter()
+            state.future.result(timeout=120)
+            waited = (time.perf_counter() - waited) * 1e3
+            self.early.counts["finish_waits"] = self.early.counts.get("finish_waits", 0) + 1
+            self.early.counts["finish_wait_ms_max"] = max(self.early.counts.get("finish_wait_ms_max", 0), round(waited))
         # Event polling or reset/close has already quiesced every device writer.
         if state.future is not None:
             assert state.future.done()

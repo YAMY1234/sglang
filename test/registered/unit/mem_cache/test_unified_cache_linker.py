@@ -3450,9 +3450,17 @@ def test_pp_early_reads_late_completions_never_finish_a_pending_read(seed):
     stages = _relay_stages(size)
     pending_early, pending_direct = [], []
 
+    finish_waits = []
+
     class _Checked(_RelayWrapper):
         def _finish_prefetch(self, handle, publish, hold=True):
             state = self.prefetches.pop(handle, None)
+            if state is not None and not state.future.done() and getattr(state.future, "staged", False):
+                # The real finish waits for a staged load still being queued.
+                finish_waits.append(handle)
+                pending_direct.remove(state.future)
+                state.future.set_result(True)
+            # A direct read is never awaited here: its vote gated the finish.
             assert state is None or state.future.done(), (handle, self.pp_rank)
             self.finished.append((handle, publish))
 
@@ -3461,8 +3469,13 @@ def test_pp_early_reads_late_completions_never_finish_a_pending_read(seed):
             pending_direct.append(self.prefetches[handle].future)
 
         def _start_prefetch_from_staging(self, handle, *args, staged):
-            super()._start_prefetch_from_staging(handle, *args, staged=staged)
-            self.early.release(staged)  # its scatter is queued; the slots return after it
+            # The staging thread queues the scatter later: a pending, staged future.
+            super()._start_prefetch_load(handle, *args)
+            future = self.prefetches[handle].future
+            future.staged = True
+            pending_direct.append(future)
+            self.started[-1] = (handle, args[-2], "staged", staged)
+            self.early.release(staged)
 
     for rank, (relay, wrapper) in enumerate(stages):
         checked = _Checked(rank, size)
@@ -3511,6 +3524,7 @@ def test_pp_early_reads_late_completions_never_finish_a_pending_read(seed):
     for _, w in stages:
         assert w.early.counts["voted_direct"] == 0 and w.early.counts["voted_unused"] == 0
         assert len(w.early.slab.free["kv"]) == 6, (w.pp_rank, w.early.counts)
+    assert any(len(entry) == 4 for _, w in stages for entry in w.started)  # staged loads ran
 
 
 def test_pp_prefetch_relay_settles_a_request_with_nothing_to_look_up():

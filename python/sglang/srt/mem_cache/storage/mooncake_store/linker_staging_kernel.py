@@ -25,7 +25,3 @@ def scatter_copy(dst: np.ndarray, src: np.ndarray, sizes: np.ndarray, block: int
             for a in (dst, src, sizes)]
     _scatter_kernel[(len(dst),)](*args, BLOCK=block)
 
-
-def scatter_copy_tensors(dst: torch.Tensor, src: torch.Tensor, sizes: torch.Tensor, block: int = 4096) -> None:
-    """scatter_copy with the addresses already int64 device tensors."""
-    _scatter_kernel[(dst.numel(),)](dst, src, sizes, BLOCK=block)
