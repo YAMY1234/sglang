@@ -573,6 +573,20 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def peek_device_eviction_candidates(
+        self, component_type: ComponentType, num_tokens: int
+    ) -> list[tuple[NodeId, int, bool, bool]]:
+        """Device leaves in the order the device eviction walk would take them,
+        until their tokens reach num_tokens: (node_id, tokens, Full KV not on
+        host, write pending). Read-only."""
+        ...
+
+    @abstractmethod
+    def set_write_ahead_spare(self, node_ids: list[NodeId]) -> None:
+        """Replace the device-tail set the first Full duplicate-reclaim pass spares."""
+        ...
+
+    @abstractmethod
     def peek_mamba_host_eviction_leaves(
         self, max_states: int
     ) -> list[tuple[NodeId, int, Optional[list[str]]]]:

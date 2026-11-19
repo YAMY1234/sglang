@@ -9710,3 +9710,102 @@ fn overlap_context_reaches_swa_before_it_replaces_unlocked_full_ids() {
     assert!(step.actions.is_empty());
     tc.sanity_check(&[], &[]);
 }
+
+// Back up a device node's Full KV through the write-through ack path.
+fn back_up_and_ack(tc: &mut UnifiedTreeCore<Vec<i64>>, node_id: NodeId, host: &[i64]) {
+    tc.commit_backup(node_id, Tensor::from_slice(host), HashMap::new())
+        .expect("live test node");
+    tc.mark_write_through_pending(vec![node_id], node_id)
+        .expect("live test node");
+    tc.finish_write_through(vec![node_id], node_id)
+        .expect("live test node");
+}
+
+#[test]
+fn peek_device_eviction_candidates_follows_the_device_eviction_walk() {
+    let mut tc = write_back_core();
+    tc.insert(&insert_params(&vec![9, 8], &[90, 91]));
+    tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
+    tc.insert(&insert_params(&vec![1, 2, 4, 5], &[10, 11, 13, 14]));
+    tc.insert(&insert_params(&vec![7], &[70]));
+    let backed = tc.match_prefix(&match_params(&vec![9, 8])).best_match_node_id;
+    back_up_and_ack(&mut tc, backed, &[40, 41]);
+    // A locked leaf, like one with an in-flight write, keeps its branch out.
+    let locked = tc.match_prefix(&match_params(&vec![7])).best_match_node_id;
+    tc.inc_lock_ref(locked, ComponentSet::EMPTY).expect("live test node");
+
+    let peek = tc.peek_device_eviction_candidates(FULL, usize::MAX);
+    let partial = tc.peek_device_eviction_candidates(FULL, 3);
+    assert_eq!(partial[..], peek[..2]);
+
+    let mut walked = Vec::new();
+    let mut tracker = HashMap::from([(FULL, 0)]);
+    let (mut df, mut hf) = (HashMap::new(), HashMap::new());
+    tc.evict_device_start(FULL, usize::MAX);
+    loop {
+        let (candidate, step) = tc.evict_device_next_node(FULL, &tracker);
+        accumulate_step(step, &mut tracker, &mut df, &mut hf);
+        let Some(node_id) = candidate else { break };
+        let idx = tc.arena.resolve(node_id).expect("live test node");
+        let tokens = tc.arena.node(idx).key.atom_len();
+        walked.push((node_id, tokens, !tc.arena.node(idx).backuped(), false));
+        let (action, step) = tc.evict_device_leaf(node_id, true).expect("live test node");
+        accumulate_step(step, &mut tracker, &mut df, &mut hf);
+        if action.is_some() {
+            let host: Vec<i64> = (0..tokens as i64).map(|t| 500 + t).collect();
+            tc.commit_backup(node_id, Tensor::from_slice(&host), HashMap::new())
+                .expect("live test node");
+            let step = tc.demote(node_id).expect("backed live node");
+            accumulate_step(step, &mut tracker, &mut df, &mut hf);
+        }
+    }
+    tc.evict_device_end(FULL);
+    assert_eq!(peek, walked);
+    assert_eq!(peek.len(), 4);
+    assert!(peek.contains(&(backed, 2, false, false)));
+    assert!(peek.iter().all(|&(id, ..)| id != locked));
+}
+
+#[test]
+fn write_ahead_spare_survives_the_first_duplicate_reclaim_pass() {
+    let run = |spare_first: bool| {
+        let mut tc = write_back_core();
+        tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
+        tc.insert(&insert_params(&vec![5, 6, 7], &[50, 51, 52]));
+        // Split so each backed parent keeps an unbacked device child: not D-leaves.
+        tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
+        tc.insert(&insert_params(&vec![5, 6], &[50, 51]));
+        let first = tc.match_prefix(&match_params(&vec![1, 2])).best_match_node_id;
+        let second = tc.match_prefix(&match_params(&vec![5, 6])).best_match_node_id;
+        back_up_and_ack(&mut tc, first, &[20, 21]);
+        back_up_and_ack(&mut tc, second, &[60, 61]);
+        if spare_first {
+            tc.set_write_ahead_spare(vec![first]);
+        }
+        let result = tc.drive_host_eviction(FULL, 2);
+        assert_eq!(result.tracker[&FULL], 2);
+        (
+            tc.arena.node(tc.arena.resolve(first).unwrap()).backuped(),
+            tc.arena.node(tc.arena.resolve(second).unwrap()).backuped(),
+        )
+    };
+    // Insertion order reclaims the first duplicate; sparing it moves the reclaim on.
+    assert_eq!(run(false), (false, true));
+    assert_eq!(run(true), (true, false));
+}
+
+#[test]
+fn write_ahead_spare_is_a_first_pass_preference_only() {
+    let mut tc = write_back_core();
+    tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
+    tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
+    let parent = tc.match_prefix(&match_params(&vec![1, 2])).best_match_node_id;
+    back_up_and_ack(&mut tc, parent, &[20, 21]);
+    tc.set_write_ahead_spare(vec![parent]);
+    // Nothing else can free host space: the second pass still takes the spared copy.
+    let result = tc.drive_host_eviction(FULL, 2);
+    assert_eq!(result.tracker[&FULL], 2);
+    assert!(!tc.arena.node(tc.arena.resolve(parent).unwrap()).backuped());
+    tc.reset();
+    assert!(tc.write_ahead_spare.is_empty());
+}

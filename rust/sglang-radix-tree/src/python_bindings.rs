@@ -2060,6 +2060,21 @@ macro_rules! tree_core_methods {
                 py.detach(move || self.core().peek_mamba_host_eviction_leaves(max_states))
             }
 
+            /// Full device leaves in the device eviction walk's order, read-only.
+            fn peek_device_eviction_candidates(
+                &self,
+                py: Python<'_>,
+                component_type: u8,
+                num_tokens: usize,
+            ) -> PyResult<Vec<(NodeId, usize, bool, bool)>> {
+                let ct = parse_component_type(component_type)?;
+                Ok(py.detach(move || self.core().peek_device_eviction_candidates(ct, num_tokens)))
+            }
+
+            fn set_write_ahead_spare(&self, py: Python<'_>, node_ids: Vec<NodeId>) {
+                py.detach(move || self.core().set_write_ahead_spare(node_ids));
+            }
+
             /// Full host leaves in drive_host_eviction's order, read-only.
             fn peek_host_eviction_candidates(
                 &self,
@@ -3485,6 +3500,26 @@ macro_rules! tree_core_binding {
                 max_states: usize,
             ) -> PyResult<Vec<(NodeId, usize, Option<Vec<String>>)>> {
                 catch_native_panic(|| Ok(self.inner.peek_mamba_host_eviction_leaves(py, max_states)))
+            }
+
+            /// Full device leaves in the order the device eviction walk takes them, until
+            /// their tokens reach num_tokens: [(node id, tokens, Full KV not on host,
+            /// write pending)]; read-only.
+            fn peek_device_eviction_candidates(
+                &self,
+                py: Python<'_>,
+                component_type: u8,
+                num_tokens: usize,
+            ) -> PyResult<Vec<(NodeId, usize, bool, bool)>> {
+                catch_native_panic(|| {
+                    self.inner
+                        .peek_device_eviction_candidates(py, component_type, num_tokens)
+                })
+            }
+
+            /// Replace the device-tail set the first Full duplicate-reclaim pass spares.
+            fn set_write_ahead_spare(&self, py: Python<'_>, node_ids: Vec<NodeId>) -> PyResult<()> {
+                catch_native_panic(|| { self.inner.set_write_ahead_spare(py, node_ids); Ok(()) })
             }
 
             /// Full host leaves in the order drive_host_eviction takes them, until

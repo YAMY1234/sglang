@@ -622,6 +622,9 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     pub(crate) evictable_host_leaves: NodeSet,
     /// Full has no device LRU; track host/device duplicates in insertion order.
     pub(crate) full_coexisting_host_nodes: NodeSet,
+    /// Device-tail nodes the write-ahead walk keeps backed (SGLANG_HICACHE_DEVICE_WRITE_AHEAD); the first
+    /// Full duplicate-reclaim pass spares them like the imminent demotes. Ids guard against slot reuse.
+    pub(crate) write_ahead_spare: HashMap<NodeIdx_, NodeId>,
     pub(crate) write_back_coexist_reclaim_digest: i64,
     /// Present only during a device-eviction step, including its cascades.
     tracked_unbacked_tokens: Option<usize>,
@@ -972,6 +975,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             evictable_device_leaves: NodeSet::new(),
             evictable_host_leaves: NodeSet::new(),
             full_coexisting_host_nodes: NodeSet::new(),
+            write_ahead_spare: HashMap::new(),
             write_back_coexist_reclaim_digest: 0,
             tracked_unbacked_tokens: None,
             // Disabled components keep harmless empty lists, like component_states.
@@ -1017,6 +1021,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.evictable_device_leaves = NodeSet::new();
         self.evictable_host_leaves = NodeSet::new();
         self.full_coexisting_host_nodes = NodeSet::new();
+        self.write_ahead_spare.clear();
         self.write_back_coexist_reclaim_digest = 0;
         self.tracked_unbacked_tokens = None;
         self.lru_lists = Self::new_lru_lists();
@@ -3192,6 +3197,77 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         out
     }
 
+    /// Full device leaves in the order the device eviction walk takes them, until
+    /// their tokens reach num_tokens, as (node id, tokens, Full KV not on host,
+    /// write pending); read-only. A parent joins once its last device child is
+    /// taken. The write-ahead walk backs these up before eviction reaches them.
+    pub fn peek_device_eviction_candidates(
+        &self,
+        component_type: ComponentType,
+        num_tokens: usize,
+    ) -> Vec<(NodeId, usize, bool, bool)> {
+        if component_type != BASE_COMPONENT_TYPE
+            || self.try_component_by_type_(component_type).is_none()
+        {
+            return Vec::new();
+        }
+        let arena = &self.arena;
+        let strategy = &self.eviction_strategy;
+        let mut heap: BinaryHeap<Reverse<(PriorityKey, NodeIdx_)>> = self
+            .evictable_device_leaves
+            .iter()
+            .map(|id| Reverse((strategy.get_priority(arena.node(id)), id)))
+            .collect();
+        let mut children_left: HashMap<NodeIdx_, usize> = HashMap::new();
+        let mut out = Vec::new();
+        let mut covered = 0usize;
+        while covered < num_tokens {
+            let Some(Reverse((_, x))) = heap.pop() else {
+                break;
+            };
+            let node = arena.node(x);
+            let tokens = node.key.atom_len();
+            out.push((
+                node.id,
+                tokens,
+                !node.backuped(),
+                node.write_through_pending_id.is_some(),
+            ));
+            covered += tokens;
+            if let Some(p) = node.try_parent() {
+                let parent = arena.node(p);
+                let left = children_left.entry(p).or_insert_with(|| {
+                    parent
+                        .children
+                        .values()
+                        .filter(|&&c| arena.has_device_value(c, FULL))
+                        .count()
+                });
+                *left = left.saturating_sub(1);
+                if *left == 0 && self.is_device_leaf_once_childless_(parent) {
+                    heap.push(Reverse((strategy.get_priority(parent), p)));
+                }
+            }
+        }
+        out
+    }
+
+    /// Replace the device-tail set the first duplicate-reclaim pass spares.
+    pub fn set_write_ahead_spare(&mut self, node_ids: Vec<NodeId>) {
+        self.write_ahead_spare.clear();
+        for node_id in node_ids {
+            if let Ok(idx) = self.arena.resolve(node_id) {
+                self.write_ahead_spare.insert(idx, node_id);
+            }
+        }
+    }
+
+    pub(crate) fn is_write_ahead_spared_(&self, node_idx: NodeIdx_) -> bool {
+        self.write_ahead_spare
+            .get(&node_idx)
+            .is_some_and(|&id| self.arena.node(node_idx).id == id)
+    }
+
     /// The host leaves among the max_states coldest members of the Mamba host
     /// LRU, in the order a Mamba host eviction meets them, as (node id, tokens,
     /// page hashes); read-only. Such an eviction drops the whole leaf (its Full
@@ -3728,6 +3804,14 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             return false;
         }
         true
+    }
+
+    /// The D-leaf rule without the no-device-children clause.
+    fn is_device_leaf_once_childless_(&self, node: &Node<K>) -> bool {
+        !node.is_root()
+            && !node.evicted()
+            && !node.is_device_locked()
+            && !node.is_load_back_pending()
     }
 
     /// Whether the node is an evictable Full host leaf.

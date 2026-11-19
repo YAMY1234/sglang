@@ -238,6 +238,9 @@ class UnifiedRadixCache(BasePrefixCache):
     # _lag_backup_ack_count. Cumulative counts of this rank's ack_backup_queue.
     _l3_ack_lag_steps: int = 0
     _l3_ack_lag_hist: Optional[deque] = None
+    # SGLANG_HICACHE_DEVICE_WRITE_AHEAD under write_back (init_hicache); see
+    # _write_ahead_device_tail.
+    _device_write_ahead: bool = False
     _l3_ack_removed: int = 0
 
     def __init__(
@@ -603,6 +606,13 @@ class UnifiedRadixCache(BasePrefixCache):
         # Reset Controller.
         self.session.slots.clear()
         self.ongoing_write_through: dict[int, _OngoingWriteThrough] = {}
+        # Device write-ahead batches: locked until their rank-agreed ack commits.
+        self.ongoing_write_ahead: dict[int, _OngoingWriteThrough] = {}
+        self._wa_issue_steps: deque[int] = deque()
+        self._wa_step = 0
+        self._wa_evicted_tokens = 0
+        self._wa_peak_evicted = 0.0
+        self._wa_ready_count = 0
         self.ongoing_load_back: dict[int, _OngoingLoadBack] = {}
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[CacheRequestHandle, int] = {}
@@ -839,6 +849,20 @@ class UnifiedRadixCache(BasePrefixCache):
             logger.info(
                 "HiCache write_back eviction: one D2H wait per eviction walk "
                 "(SGLANG_HICACHE_WB_EVICT_BATCH)."
+            )
+        self._device_write_ahead = (
+            self.is_write_back
+            and self.buffer_pipeline is None
+            and envs.SGLANG_HICACHE_DEVICE_WRITE_AHEAD.get()
+        )
+        self._write_ahead_stream_ = None
+        if self._device_write_ahead:
+            logger.info(
+                "HiCache write_back: device LRU tail written ahead of eviction "
+                "(SGLANG_HICACHE_DEVICE_WRITE_AHEAD, K=%.1f, tail %d..%d tokens).",
+                envs.SGLANG_HICACHE_DEVICE_WRITE_AHEAD_K.get(),
+                envs.SGLANG_HICACHE_DEVICE_WRITE_AHEAD_MIN_TOKENS.get(),
+                envs.SGLANG_HICACHE_DEVICE_WRITE_AHEAD_MAX_TOKENS.get(),
             )
         self._init_mamba_path_cap_counts_host()
         self._storage_write_back = StorageWriteBack.create(self)
@@ -1193,6 +1217,8 @@ class UnifiedRadixCache(BasePrefixCache):
             and self.cache_controller.write_policy == "write_back"
         ):
             self.writing_check(write_back=True)
+        if self._device_write_ahead:
+            self._wa_evicted_tokens += tracker[BASE_COMPONENT_TYPE]
 
         # Report full-layer tokens only
         self.update_eviction_metrics(tracker[BASE_COMPONENT_TYPE], start_time)
@@ -2408,7 +2434,11 @@ class UnifiedRadixCache(BasePrefixCache):
     def _replace_pending_write_through_node(
         self, ack_id: int, old_node_id: NodeId, new_node_ids: list[NodeId]
     ) -> None:
-        pending = self.ongoing_write_through.get(ack_id)
+        ongoing = self.ongoing_write_through
+        pending = ongoing.get(ack_id)
+        if pending is None:
+            ongoing = self.ongoing_write_ahead
+            pending = ongoing.get(ack_id)
         if pending is None:
             return
 
@@ -2425,20 +2455,22 @@ class UnifiedRadixCache(BasePrefixCache):
         if not replaced:
             return
 
-        self.ongoing_write_through[ack_id] = _OngoingWriteThrough(
+        ongoing[ack_id] = _OngoingWriteThrough(
             lock_node_id,
             lock_params,
             updated_node_ids,
         )
 
-    def _finish_write_through_ack(self, ack_id: int) -> None:
+    def _finish_write_through_ack(
+        self, ack_id: int, ongoing: Optional[dict[int, _OngoingWriteThrough]] = None
+    ) -> None:
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.finish_backup_ack(ack_id)
             return
 
-        lock_node_id, lock_params, publish_node_ids = self.ongoing_write_through.pop(
-            ack_id
-        )
+        if ongoing is None:
+            ongoing = self.ongoing_write_through
+        lock_node_id, lock_params, publish_node_ids = ongoing.pop(ack_id)
         self.tree_core.finish_write_through(publish_node_ids, ack_id)
         if lock_params is not None:
             self.dec_lock_ref(lock_node_id, lock_params)
@@ -2738,6 +2770,125 @@ class UnifiedRadixCache(BasePrefixCache):
             self.storage_existence_cache.rotate()
             self._l3_beliefs_rotated_at = now
             self._l3_tier_stats["belief_rotations"] += 1
+
+    def _write_ahead_device_tail(self) -> None:
+        """Keep the device LRU tail backed on host so device eviction demotes
+        without a D2H wait (SGLANG_HICACHE_DEVICE_WRITE_AHEAD).
+
+        The tail is K x the decayed peak of per-step device evictions. Its nodes
+        are spared by the first duplicate-reclaim pass; the unbacked ones are
+        copied in one batch on a private stream behind the forward, locked until
+        the rank-agreed ack commits them (_write_ahead_commit). Every input is
+        rank-replicated: tree state, eviction counts and committed acks, never a
+        local event query, so all ranks issue the same batch at the same step.
+        """
+        t0 = time.perf_counter() if pmicro_hoststats.ON else 0.0
+        self._wa_step += 1
+        self._wa_peak_evicted = max(
+            self._wa_peak_evicted * 0.99, float(self._wa_evicted_tokens)
+        )
+        self._wa_evicted_tokens = 0
+        target = int(
+            min(
+                max(
+                    envs.SGLANG_HICACHE_DEVICE_WRITE_AHEAD_K.get()
+                    * self._wa_peak_evicted,
+                    envs.SGLANG_HICACHE_DEVICE_WRITE_AHEAD_MIN_TOKENS.get(),
+                ),
+                envs.SGLANG_HICACHE_DEVICE_WRITE_AHEAD_MAX_TOKENS.get(),
+            )
+        )
+        tail = self.tree_core.peek_device_eviction_candidates(
+            BASE_COMPONENT_TYPE, target
+        )
+        self.tree_core.set_write_ahead_spare([node_id for node_id, *_ in tail])
+        if self.ongoing_write_ahead:
+            return
+        cc = self.cache_controller
+        # Writes queued by others keep their own ack queue and fence.
+        cc.start_writing()
+        budget = envs.SGLANG_HICACHE_DEVICE_WRITE_AHEAD_BATCH_MAX_TOKENS.get()
+        issued = 0
+        for node_id, num_tokens, unbacked, pending in tail:
+            if not unbacked or pending:
+                continue
+            if num_tokens > budget:
+                break
+            device_value, comp_xfers = self.tree_core.build_backup_spec(node_id)
+            sidecar_xfers = self._build_backup_sidecar(device_value, comp_xfers)
+            host_indices = self._execute_kv_backup(
+                node_id, device_value, comp_xfers, sidecar_xfers
+            )
+            if host_indices is None:
+                break
+            self.tree_core.commit_backup(node_id, host_indices, comp_xfers)
+            lock_params = self.inc_lock_ref(node_id).to_dec_params()
+            publish_node_ids = self.tree_core.mark_write_through_pending(
+                self._backup_publish_node_ids(node_id, comp_xfers), ack_id=node_id
+            )
+            self.ongoing_write_ahead[node_id] = _OngoingWriteThrough(
+                node_id, lock_params, publish_node_ids
+            )
+            budget -= num_tokens
+            issued += num_tokens
+        if self.ongoing_write_ahead:
+            cc.start_writing(
+                ack_queue=cc.ack_write_ahead_queue, stream=self._write_ahead_stream()
+            )
+            self._wa_issue_steps.append(self._wa_step)
+        if pmicro_hoststats.ON:
+            pmicro_hoststats.OPS["write_ahead"].add(time.perf_counter() - t0, issued)
+
+    def _write_ahead_stream(self) -> torch.Stream:
+        """A private D2H stream: an eviction's fallback copy never queues behind
+        a write-ahead batch on the shared one."""
+        if self._write_ahead_stream_ is None:
+            engine = self.cache_controller.l2_transfer_engine
+            if is_cuda() or is_hip():
+                from sglang.srt.managers.utils import allocate_distinct_stream
+
+                self._write_ahead_stream_ = allocate_distinct_stream(
+                    device_module,
+                    [
+                        device_module.current_stream(),
+                        engine.device_to_host_stream,
+                        engine.host_to_device_stream,
+                        engine.index_stream,
+                    ],
+                )
+            else:
+                self._write_ahead_stream_ = device_module.Stream()
+        return self._write_ahead_stream_
+
+    def _write_ahead_publish_count(self) -> int:
+        """PP0's ready write-ahead acks issued at least ACK_LAG walks ago: later
+        PP stages issued the same batch at the same walk, so their own copies
+        have had as long to land before they commit this count."""
+        lag = envs.SGLANG_HICACHE_DEVICE_WRITE_AHEAD_ACK_LAG.get()
+        count = 0
+        for ack, step in zip(
+            self.cache_controller.ack_write_ahead_queue, self._wa_issue_steps
+        ):
+            if step > self._wa_step - lag or not ack.finish_event.query():
+                break
+            count += 1
+        return count
+
+    def _write_ahead_commit(self, finish_count: int) -> None:
+        """Commit the first finish_count write-ahead batches (rank-agreed, FIFO):
+        their nodes become backed host duplicates and unlock for eviction."""
+        t0 = time.perf_counter() if pmicro_hoststats.ON and finish_count else None
+        cc = self.cache_controller
+        while finish_count > 0:
+            ack = cc.ack_write_ahead_queue.pop(0)
+            self._wa_issue_steps.popleft()
+            ack.finish_event.synchronize()
+            for ack_id in ack.node_ids:
+                self._finish_write_through_ack(ack_id, self.ongoing_write_ahead)
+            self._log_write_ack_metrics(ack)
+            finish_count -= 1
+        if t0 is not None:
+            pmicro_hoststats.OPS["write_ahead_commit"].add(time.perf_counter() - t0)
 
     def _write_behind_host_tail(self) -> None:
         """Keep the reserve at the LRU host tail either free or already in
@@ -4713,6 +4864,7 @@ class UnifiedRadixCache(BasePrefixCache):
         if cc is None or (self.pp_rank > 0 and self.host_memory_mode != "buffer_only"):
             write_acks = 0
             load_acks = 0
+            wa_acks = 0
             # Zero placeholders shaped like PP0's slots: _pp_sync hands the
             # received tensor back in place, so all ranks must build the same
             # length or PP1+ would recv into a mismatched buffer.
@@ -4722,6 +4874,9 @@ class UnifiedRadixCache(BasePrefixCache):
         else:
             write_acks = self._count_ready_acks(cc.ack_write_queue)
             load_acks = self._count_ready_acks(cc.ack_load_queue)
+            wa_acks = (
+                self._write_ahead_publish_count() if self._device_write_ahead else 0
+            )
             storage_queue_sizes = (
                 (
                     cc.prefetch_hit_queue.qsize(),
@@ -4742,9 +4897,12 @@ class UnifiedRadixCache(BasePrefixCache):
         # Piggybacked TP check: [digest, -digest] MIN-reduces to [min, -max],
         # equal iff reclaim victim order matched on every rank.
         digest = self.tree_core.write_back_duplicate_reclaim_digest
+        # The write-ahead slot exists only when the flag is on (on every rank).
+        head = [write_acks, load_acks] + ([wa_acks] if self._device_write_ahead else [])
+        n_head = len(head)
         exchange = self._shm_count_exchange()
         if exchange is not None:
-            values = [write_acks, load_acks, *storage_queue_sizes, *fold_u64(digest)]
+            values = [*head, *storage_queue_sizes, *fold_u64(digest)]
             # Storage adds a count per extra host pool; a row wider than the table
             # takes the gloo reduce below.
             if len(values) <= exchange.width:
@@ -4753,11 +4911,11 @@ class UnifiedRadixCache(BasePrefixCache):
                     "write_back duplicate-reclaim victims diverged across TP ranks"
                 )
                 mins = [min(col) for col in zip(*rows)]
-                return mins[0], mins[1], tuple(mins[2:-2]), extra_pool_names
+                self._wa_ready_count = mins[2] if self._device_write_ahead else 0
+                return mins[0], mins[1], tuple(mins[n_head:-2]), extra_pool_names
         ready_counts = torch.tensor(
             [
-                write_acks,
-                load_acks,
+                *head,
                 *storage_queue_sizes,
                 digest,
                 -digest,
@@ -4774,10 +4932,11 @@ class UnifiedRadixCache(BasePrefixCache):
         assert digest == count_values[-2] and digest == -count_values[-1], (
             "write_back duplicate-reclaim victims diverged across PP/TP ranks"
         )
+        self._wa_ready_count = count_values[2] if self._device_write_ahead else 0
         return (
             count_values[0],
             count_values[1],
-            tuple(count_values[2:-2]),
+            tuple(count_values[n_head:-2]),
             extra_pool_names,
         )
 
@@ -5285,6 +5444,8 @@ class UnifiedRadixCache(BasePrefixCache):
         ) = self._sync_hicache_ready_counts()
         self.writing_check(finish_count=write_finish_count)
         self.loading_check(finish_count=load_finish_count)
+        if self._device_write_ahead:
+            self._write_ahead_commit(self._wa_ready_count)
 
         if self.enable_storage and storage_queue_sizes:
             n_storage_hit, n_ack_prefetch, n_backup, n_release = storage_queue_sizes[:4]
@@ -5300,6 +5461,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 extra_release_counts=extra_release_counts,
                 log_metrics=True,
             )
+        if self._device_write_ahead:
+            self._write_ahead_device_tail()
         if self._l3_write_on_host_evict:
             t0 = time.perf_counter() if pmicro_hoststats.ON else 0.0
             self._write_behind_host_tail()
@@ -5507,7 +5670,9 @@ class UnifiedRadixCache(BasePrefixCache):
             ]
         else:
             ongoing_write_through = [
-                (nid, wt.node_id) for nid, wt in self.ongoing_write_through.items()
+                (nid, wt.node_id)
+                for ongoing in (self.ongoing_write_through, self.ongoing_write_ahead)
+                for nid, wt in ongoing.items()
             ]
         ongoing_load_back = [
             (nid, lb.node_id) for nid, lb in self.ongoing_load_back.items()
