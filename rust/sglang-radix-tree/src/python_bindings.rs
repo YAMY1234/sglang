@@ -945,6 +945,7 @@ pub struct HostEvictionResultBinding {
     new_host_frees: Py<PyDict>,
     cache_actions: Py<PyList>,
     mamba_storage_backup_node_id: Option<NodeId>,
+    duplicate_reclaimed_tokens: usize,
 }
 
 impl HostEvictionResultBinding {
@@ -955,6 +956,7 @@ impl HostEvictionResultBinding {
             new_host_frees: frees_to_py(py, result.host_frees)?,
             cache_actions: cache_actions_to_py(py, result.cache_actions)?,
             mamba_storage_backup_node_id: result.mamba_storage_backup_node_id,
+            duplicate_reclaimed_tokens: result.duplicate_reclaimed_tokens,
         })
     }
 }
@@ -2093,6 +2095,7 @@ macro_rules! tree_core_methods {
                     new_host_frees: frees_to_py(py, result.host_frees)?,
                     cache_actions: cache_actions_to_py(py, result.cache_actions)?,
                     mamba_storage_backup_node_id: result.mamba_storage_backup_node_id,
+                    duplicate_reclaimed_tokens: result.duplicate_reclaimed_tokens,
                 })
             }
 
@@ -2112,6 +2115,7 @@ macro_rules! tree_core_methods {
                     new_host_frees: frees_to_py(py, result.host_frees)?,
                     cache_actions: cache_actions_to_py(py, result.cache_actions)?,
                     mamba_storage_backup_node_id: result.mamba_storage_backup_node_id,
+                    duplicate_reclaimed_tokens: result.duplicate_reclaimed_tokens,
                 })
             }
 

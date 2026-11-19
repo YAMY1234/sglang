@@ -7298,6 +7298,7 @@ fn drive_host_eviction_dispatches_reclaim_only_under_write_back() {
         vec![("reclaim", 0), ("drive", 2)]
     );
     assert_eq!(result.tracker, HashMap::from([(SWA, 5)]));
+    assert_eq!(result.duplicate_reclaimed_tokens, 2);
 
     recorder.host_eviction_calls.lock().unwrap().clear();
     tc.is_write_back = false;
@@ -7308,6 +7309,7 @@ fn drive_host_eviction_dispatches_reclaim_only_under_write_back() {
         vec![("drive", 0)]
     );
     assert_eq!(result.tracker, HashMap::from([(SWA, 3)]));
+    assert_eq!(result.duplicate_reclaimed_tokens, 0);
 }
 
 #[test]

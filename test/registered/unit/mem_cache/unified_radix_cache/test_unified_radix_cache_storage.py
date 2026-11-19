@@ -50,6 +50,9 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     ComponentType,
 )
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
+from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
+    DriveHostEvictionResult,
+)
 from sglang.srt.mem_cache.unified_radix_cache import (
     UnifiedRadixCache,
     _OngoingPrefetch,
@@ -675,6 +678,17 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
                     cache._l3_tier_stats["wb_evict_uncovered_tokens"],
                     2 * ps if exclusive else 0,
                 )
+        # Duplicate reclaim (DUPKEEP off) frees host copies whose KV stays on device: not
+        # uncovered, and the clean budget is left for the pages the walk wrote.
+        cache, pool = self._host_only_l3_fixture(exclusive=True)
+        cache._write_behind_clean_tokens = 2 * ps
+        step = DriveHostEvictionResult(
+            tracker={ComponentType.FULL: 3 * ps}, duplicate_reclaimed_tokens=2 * ps
+        )
+        with mock.patch.object(cache.tree_core, "drive_host_eviction", return_value=step):
+            self.assertEqual(cache._drive_host_eviction(3 * ps, ComponentType.FULL), 3 * ps)
+        self.assertEqual(cache._l3_tier_stats["wb_evict_uncovered_tokens"], 0)
+        self.assertEqual(cache._write_behind_clean_tokens, ps)
 
     def test_hicache_l3_belief_ttl_rewrites_a_page_the_store_may_have_dropped(self):
         self._require_host_only_l3_fixture()
