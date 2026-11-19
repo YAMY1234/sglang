@@ -674,6 +674,16 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                             if numa_node is None
                             else _bound_numa_node(numa_node)
                         ):
+                            # SGLANG_LINKER_HELPER sets up its client the same way.
+                            self.setup_args = (
+                                client_hostname,
+                                self.config.metadata_server,
+                                per_rank_global_segment_size,
+                                self.config.local_buffer_size,
+                                self.config.protocol,
+                                device_name,
+                                self.config.master_server_address,
+                            )
                             ret_code = self.store.setup(
                                 client_hostname,
                                 self.config.metadata_server,

@@ -1091,6 +1091,12 @@ class Envs:
     # bursts of SGLANG_DEBUG_GIL_TAX_BURST_MS (utils/gil_tax.py); -1: no thread,
     # 0: thread idle (POST /linker_flags can switch it on).
     SGLANG_DEBUG_GIL_TAX = EnvFloat(-1.0)
+    # Prefetch mode: the direct linker's store reads and writes run in a helper
+    # process (mooncake_store/linker_helper.py); needs a VMM KV pool
+    # (SGLANG_MOONCAKE_CUSTOM_MEM_POOL). Its store client's own segment (MB) and threads.
+    SGLANG_LINKER_HELPER = EnvBool(False)
+    SGLANG_LINKER_HELPER_SEGMENT_MB = EnvInt(0)
+    SGLANG_LINKER_HELPER_THREADS = EnvInt(4)
     SGLANG_DEBUG_GIL_TAX_BURST_MS = EnvFloat(2.0)
     # Offload puts: build per-key buffer addresses with numpy and batch the
     # recent-key / result bookkeeping (the offload thread's GIL share).

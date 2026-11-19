@@ -1204,5 +1204,160 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             )
 
 
+
+class FakeHelperStore:
+    """Dict-backed store for the linker helper tests (runs in the helper)."""
+
+    def __init__(self):
+        self.objects = {}
+
+    def batch_get_session_start(self, keys):
+        return [0] * len(keys)
+
+    def batch_get_session_end(self, keys):
+        return [0] * len(keys)
+
+    def batch_is_exist(self, keys):
+        return [1 if key in self.objects else 0 for key in keys]
+
+    def batch_put_from_multi_buffers(self, keys, ptrs, sizes):
+        import ctypes
+
+        for key, p, n in zip(keys, ptrs, sizes):
+            self.objects[key] = b"".join(ctypes.string_at(a, b) for a, b in zip(p, n))
+        return [0] * len(keys)
+
+    def batch_get_into_multi_buffer_ranges_arrays(self, keys, ptrs, sizes, offsets, indptr):
+        import ctypes
+
+        out = []
+        for i, key in enumerate(keys):
+            obj = self.objects.get(key)
+            if obj is None:
+                out.append(-704)
+                continue
+            got = 0
+            for j in range(int(indptr[i]), int(indptr[i + 1])):
+                off, n = int(offsets[j]), int(sizes[j])
+                ctypes.memmove(int(ptrs[j]), obj[off : off + n], n)
+                got += n
+            out.append(got)
+        return out
+
+
+def _merged_pool(make):
+    """KV pages (2 layers) plus a per-page indexer row on layer 2, as one object."""
+    from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import MergedPageEntry
+
+    kv0, kv2, ix = make((8, 4)), make((8, 4)), make((4, 3))
+    kv = DevicePoolEntry(
+        name=PoolName.KV, indices_from_pool=PoolName.KV, device_pool=None,
+        components=[[kv0, kv2]], layer_mapping={0: 0, 2: 1}, page_size=2, rows_are_pages=False,
+    )
+    indexer = DevicePoolEntry(
+        name=PoolName.INDEXER, indices_from_pool=PoolName.KV, device_pool=None,
+        components=[[ix]], layer_mapping={2: 0}, page_size=2, rows_are_pages=True,
+    )
+    return MergedPageEntry(kv, indexer, object_name="ki"), (kv0, kv2, ix)
+
+
+class TestLinkerHelper(CustomTestCase):
+    """SGLANG_LINKER_HELPER: the helper rebuilds keys and ranges from the pool
+    tables and runs the store calls in its own process."""
+
+    def test_helper_rebuilds_the_in_process_ranges_and_put_meta(self):
+        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+            vector_key_range_meta,
+            vector_page_buffer_meta,
+        )
+        from sglang.srt.mem_cache.storage.mooncake_store.linker_helper import (
+            HelperInit,
+            HelperWorker,
+            pool_table,
+        )
+
+        pool, _ = _merged_pool(lambda shape: torch.zeros(shape, dtype=torch.uint8))
+        table = pool_table(PoolName.KV, pool, "_r0_ki", num_layers=3)
+        indices = torch.tensor([2, 3, 6, 7])  # pages 1 and 3
+        for coalesce in (False, True):
+            worker = HelperWorker(
+                HelperInit(tables={"kv": table}, prefix="tag", coalesce=coalesce), FakeHelperStore(), []
+            )
+            want = vector_key_range_meta(
+                pool, pool.prepare_locations(indices), 3, coalesce=coalesce, arrays=True
+            )
+            got = worker.read_ranges("kv", indices.numpy())
+            for field in ("ptrs", "sizes", "offsets", "indptr"):
+                np.testing.assert_array_equal(getattr(got, field), getattr(want, field), field)
+        ptrs, sizes = worker.put_meta("kv", indices.numpy())
+        want_ptrs, want_sizes = vector_page_buffer_meta(pool, indices)
+        self.assertEqual((ptrs, sizes), (want_ptrs, want_sizes))
+        self.assertEqual(worker._keys("kv", ["h1", "h2"]), ["tag_h1_r0_ki", "tag_h2_r0_ki"])
+        with self.assertRaises(ValueError):
+            worker.read_ranges("kv", np.array([1, 2]))  # not page aligned
+
+    def test_helper_process_round_trip_restores_the_bytes(self):
+        from multiprocessing import shared_memory
+
+        from sglang.srt.mem_cache.storage.mooncake_store.linker_helper import (
+            HelperClient,
+            HelperInit,
+            pool_table,
+        )
+
+        shm = shared_memory.SharedMemory(create=True, size=4096)
+        try:
+            arena = torch.frombuffer(shm.buf, dtype=torch.uint8)
+            cursor = [0]
+
+            def make(shape):
+                n = shape[0] * shape[1]
+                view = arena[cursor[0] : cursor[0] + n].view(shape)
+                cursor[0] += (n + 63) // 64 * 64
+                return view
+
+            pool, (kv0, kv2, ix) = _merged_pool(make)
+            for i, t in enumerate((kv0, kv2, ix)):
+                t.copy_(torch.randint(0, 255, t.shape, dtype=torch.uint8) + i)
+            src = torch.tensor([2, 3, 6, 7])  # pages 1 and 3
+            dst = torch.tensor([0, 1, 4, 5])  # pages 0 and 2
+            dst_rows = ([0, 1, 4, 5], [0, 2])
+            init = HelperInit(
+                tables={"kv": pool_table(PoolName.KV, pool, "_r0_ki", num_layers=3)},
+                prefix="tag",
+                exports=[("shm", arena.data_ptr(), shm.size, shm.name)],
+                store_factory=FakeHelperStore,
+                threads=2,
+            )
+            client = HelperClient(init, start_timeout_s=120)
+            try:
+                results, info = client.submit("write", [("kv", ["p1", "p3"], src.numpy())]).result(60)
+                self.assertEqual(results, {"kv": [True, True]})
+                self.assertEqual(info["put_objects"], {"kv": 2})
+                want = [kv0[[2, 3, 6, 7]].clone(), kv2[[2, 3, 6, 7]].clone(), ix[[1, 3]].clone()]
+                for t, rows in ((kv0, dst_rows[0]), (kv2, dst_rows[0]), (ix, dst_rows[1])):
+                    t[rows] = 0
+                status, info = client.submit("read", [("kv", ["p1", "p3"], dst.numpy())]).result(60)
+                self.assertIs(status, True)
+                self.assertEqual(info["objects"], 2)
+                self.assertTrue(torch.equal(kv0[dst_rows[0]], want[0]))
+                self.assertTrue(torch.equal(kv2[dst_rows[0]], want[1]))
+                self.assertTrue(torch.equal(ix[dst_rows[1]], want[2]))
+                # A second write of the same pages: the read's keys skip the exist query and the put.
+                _, info = client.submit("write", [("kv", ["p1", "p3"], src.numpy())]).result(60)
+                self.assertEqual((info["put_objects"], info["exist_skipped"]), ({}, 2))
+                # A new key namespace (cold reset): the old objects are not found.
+                client.submit("prefix", "tag-e1").result(60)
+                status, _ = client.submit("read", [("kv", ["p1"], dst[:2].numpy())]).result(60)
+                self.assertIn("-704", status)
+                self.assertEqual(client.submit("stats").result(60)["reads"], 1)
+            finally:
+                client.close()
+            self.assertFalse(client.proc.is_alive())
+        finally:
+            shm.close()
+            shm.unlink()
+
+
 if __name__ == "__main__":
     unittest.main()

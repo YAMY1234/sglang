@@ -3373,6 +3373,33 @@ def test_mooncake_prefetch_read_ends_its_sessions_and_reports_failure():
     assert linker.stats["prefetch_failed"] == 1
 
 
+def test_mooncake_prefetch_read_through_the_helper_sends_hashes_and_slots():
+    from concurrent.futures import Future
+
+    def answer(value=None, error=None):
+        future = Future()
+        future.set_exception(error) if error else future.set_result(value)
+        return future
+
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.helper = MagicMock()
+    linker.log_load_timing = False
+    linker.stats = {}
+    transfer = PoolTransfer(name=PoolName.KV, keys=["p1", "p2"], host_indices=torch.arange(4))
+    linker.helper.submit.return_value = answer((True, {"objects": 2}))
+    assert linker._prefetch_read_helper([transfer], MagicMock(), time.monotonic()) is True
+    op, pools = linker.helper.submit.call_args.args
+    assert op == "read" and len(pools) == 1
+    name, keys, slots = pools[0]
+    assert (name, keys) == (str(PoolName.KV), ["p1", "p2"])
+    assert str(slots.dtype) == "int64" and slots.tolist() == [0, 1, 2, 3]
+    linker.helper.submit.return_value = answer(("read:failed by code {-704: 1}", {}))
+    assert linker._prefetch_read_helper([transfer], MagicMock(), time.monotonic()).startswith("read:")
+    linker.helper.submit.return_value = answer(error=RuntimeError("linker helper exited"))
+    assert "helper exited" in linker._prefetch_read_helper([transfer], MagicMock(), time.monotonic())
+    assert linker.stats["prefetch_failed"] == 2
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
 

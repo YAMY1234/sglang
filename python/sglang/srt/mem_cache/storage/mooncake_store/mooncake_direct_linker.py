@@ -636,6 +636,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     load_per_key = False
     # SGLANG_LINKER_STORE_ARRAYS at init; the list-call fallback logs once.
     store_arrays = False
+    # SGLANG_LINKER_HELPER client (None: store I/O in this process)
+    helper = None
     _store_arrays_fallback_logged = False
     prev_launch_event = None
     # SGLANG_LINKER_STATE_PATH_CAP at init; 0 leaves the store's states alone.
@@ -887,6 +889,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             )
 
         self.register_buffers()
+        self.helper = self._start_helper() if envs.SGLANG_LINKER_HELPER.get() else None
         # Build the native page-hash extension at startup: its first use otherwise
         # compiles it inside a request (about 3 s per node on the first store hit).
         get_storage_hash_str([0] * self.page_size, page_size=self.page_size)
@@ -949,21 +952,72 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         self.offload_thread.start()
 
-    def register_buffers(self) -> None:
-        seen = set()
+    def _buffer_ranges(self) -> list[tuple[int, int]]:
+        """(ptr, nbytes) of every distinct storage behind the linker's pools."""
+        seen = []
         for pool in self.pools.values():
             for buffer in pool.get_hybrid_pool_buffer():
                 storage = buffer.untyped_storage()
                 allocation = (int(storage.data_ptr()), int(storage.nbytes()))
-                if allocation in seen:
-                    continue
-                seen.add(allocation)
-                result = self.storage.store.register_buffer(*allocation)
-                if result not in (0, None):
-                    raise RuntimeError(
-                        "Failed to register GPU KV buffer with Mooncake, "
-                        f"error code: {result}."
-                    )
+                if allocation not in seen:
+                    seen.append(allocation)
+        return seen
+
+    def register_buffers(self) -> None:
+        for allocation in self._buffer_ranges():
+            result = self.storage.store.register_buffer(*allocation)
+            if result not in (0, None):
+                raise RuntimeError(
+                    "Failed to register GPU KV buffer with Mooncake, "
+                    f"error code: {result}."
+                )
+
+    def _start_helper(self):
+        """SGLANG_LINKER_HELPER: start the store I/O helper (None: not supported here)."""
+        from sglang.srt.mem_cache.storage.mooncake_store.linker_helper import (
+            HelperClient,
+            HelperInit,
+            mooncake_client,
+            pool_table,
+        )
+        from sglang.srt.mem_cache.storage.mooncake_store.linker_helper_vmm import export_fabric
+
+        if not self.prefetch_mode or self.storage._can_use_group_semantics():
+            logger.warning("SGLANG_LINKER_HELPER needs prefetch mode without group ids; staying in process")
+            return None
+        tables = {}
+        for name, entry in self.pools.items():
+            keys, _ = self.storage._get_hybrid_page_component_keys(["x"], PoolTransfer(name=name))
+            table = pool_table(name, entry, keys[0][1:], self.num_layers)
+            if table is None:
+                logger.warning("SGLANG_LINKER_HELPER: pool %s has no range table; staying in process", name)
+                return None
+            tables[str(name)] = table
+        ranges = self._buffer_ranges()
+        host, metadata, _, local_buffer, protocol, device_name, master = self.storage.setup_args
+        client = HelperClient(
+            HelperInit(
+                tables=tables,
+                prefix=self.storage.config_prefix,
+                exports=export_fabric(ranges),
+                store_factory=mooncake_client,
+                store_args=(
+                    host, metadata, envs.SGLANG_LINKER_HELPER_SEGMENT_MB.get() << 20,
+                    local_buffer, protocol, device_name, master,
+                ),
+                coalesce=True,
+                threads=envs.SGLANG_LINKER_HELPER_THREADS.get(),
+                counted_sessions=self.count_sessions,
+                put_config=("mooncake.store", "ReplicateConfig"),
+                registered=ranges,
+                device=torch.cuda.current_device(),
+            )
+        )
+        logger.info(
+            "Mooncake linker helper pid %d: %d pools, %d allocations exported",
+            client.pid, len(tables), len(ranges),
+        )
+        return client
 
     def _log_numa_available(self, when: str, resident: bool = False) -> None:
         nodes = [entry for entry in _numa_available() if entry[2] > 0]
@@ -1453,23 +1507,24 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             kv = next((t for t in transfers if t.name == PoolName.KV), None)
             if kv is not None:
                 self.store_tree.touch(list(kv.keys))
-        # Objects a read takes are stored: their publication skips the put.
-        self.storage.recently_loaded.add(self._object_keys(expanded)[0])
+        if self.helper is None:
+            # Objects a read takes are stored: their publication skips the put
+            # (the helper keeps this set itself).
+            self.storage.recently_loaded.add(self._object_keys(expanded)[0])
         ready = device_module.Event()
         ready.record()
         future = self.prefetch_executor.submit(
-            self._prefetch_read, expanded, ready, time.monotonic()
+            self._prefetch_read if self.helper is None else self._prefetch_read_helper,
+            expanded,
+            ready,
+            time.monotonic(),
         )
         self.prefetch_futures.add(future)
         future.add_done_callback(self.prefetch_futures.discard)
         self.stats["prefetch"] = self.stats.get("prefetch", 0) + 1
         return future
 
-    def _prefetch_read(self, expanded: list[PoolTransfer], ready, queued: float) -> bool | str:
-        """One request's read, as load_layer_wise reads a batch (per key or per
-        layer, with its lease renewal and retry), with no layer counter."""
-        began = time.monotonic()
-        ready.synchronize()
+    def _read_batches(self, expanded: list[PoolTransfer]) -> dict:
         batches: dict[PoolName, tuple[list[str], list[int]]] = {}
         for transfer in expanded:
             keys, locations = batches.setdefault(transfer.name, ([], []))
@@ -1478,6 +1533,48 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             )
             keys.extend(self.storage._tag_keys(component_keys))
             locations.extend(self.pools[transfer.name].prepare_locations(transfer.host_indices))
+        return batches
+
+    @staticmethod
+    def _helper_pools(expanded: list[PoolTransfer]) -> list:
+        """The helper's descriptor: page hashes and slot indices per pool."""
+        return [
+            (str(t.name), list(t.keys), t.host_indices.to(device="cpu", dtype=torch.int64).numpy())
+            for t in expanded
+        ]
+
+    def _prefetch_read_helper(self, expanded: list[PoolTransfer], ready, queued: float) -> bool | str:
+        """SGLANG_LINKER_HELPER: _prefetch_read with the keys, ranges and store
+        calls in the helper; this thread only waits (without the GIL)."""
+        began = time.monotonic()
+        ready.synchronize()
+        try:
+            status, info = self.helper.submit("read", self._helper_pools(expanded)).result()
+        except Exception as error:
+            logger.warning("Mooncake linker helper read failed: %s", error)
+            status, info = f"read:{str(error)[:80]}", {}
+        if status is not True:
+            self.stats["prefetch_failed"] = self.stats.get("prefetch_failed", 0) + 1
+            return status
+        if self.page_checksum_rate:
+            self._verify_page_checksums(self._read_batches(expanded))
+        if self.log_load_timing:
+            logger.info(
+                "Mooncake linker prefetch pages=%d objects=%d wait=%.0fms xfer=%.0fms helper=%.0fms",
+                next((len(t.keys) for t in expanded if t.name == PoolName.KV), 0),
+                info.get("objects", 0),
+                (began - queued) * 1e3,
+                (time.monotonic() - began) * 1e3,
+                info.get("ms", 0.0),
+            )
+        return True
+
+    def _prefetch_read(self, expanded: list[PoolTransfer], ready, queued: float) -> bool | str:
+        """One request's read, as load_layer_wise reads a batch (per key or per
+        layer, with its lease renewal and retry), with no layer counter."""
+        began = time.monotonic()
+        ready.synchronize()
+        batches = self._read_batches(expanded)
         keys = [key for names, _ in batches.values() for key in names]
         result = self.sessions.start(keys)
         if result != [0] * len(keys):
@@ -2163,7 +2260,17 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 if trace is not None:
                     traced = {k for t in expanded for k in t.keys}
                     trace.note(traced, "submitted")
-                results = self.storage.batch_set_v2(expanded, extra_info)
+                if self.helper is not None and extra_info is None:
+                    by_name, info = self.helper.submit(
+                        "write", self._helper_pools(expanded)
+                    ).result()
+                    results = {t.name: by_name.get(str(t.name), []) for t in expanded}
+                    put = {t.name: info["put_objects"].get(str(t.name), 0) for t in expanded}
+                    exist_skipped = info["exist_skipped"]
+                else:
+                    results = self.storage.batch_set_v2(expanded, extra_info)
+                    put = self.storage.last_put_objects
+                    exist_skipped = self.storage.last_exist_skipped
                 success = all(all(pool_results) for pool_results in results.values())
                 if trace is not None:
                     trace.note(traced, "completed" if success else "failed")
@@ -2175,8 +2282,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         logger.info("Mooncake direct linker offload: tokens=%d", tokens)
                     # The store skips objects it already holds: count what it
                     # put, and what was offered.
-                    put = self.storage.last_put_objects
-                    self.write_bytes["exist_skipped"] += self.storage.last_exist_skipped
+                    self.write_bytes["exist_skipped"] += exist_skipped
                     for transfer in expanded:
                         size = self.object_bytes[transfer.name]
                         self.write_bytes[transfer.name] += put.get(transfer.name, 0) * size
@@ -2483,6 +2589,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self._base_config_prefix = self.storage.config_prefix or "linker"
         self.store_epoch += 1
         self.storage.config_prefix = f"{self._base_config_prefix}-e{self.store_epoch}"
+        if self.helper is not None:
+            self.helper.submit("prefix", self.storage.config_prefix).result()
         removed = None
         if self.pp_rank == 0 and self.offload_owner:
             remove_all = getattr(self.storage.store, "remove_all", None)
@@ -2543,6 +2651,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.offload_thread.join()
         if self.prefetch_executor is not None:
             self.prefetch_executor.shutdown(wait=True)
+        if self.helper is not None:
+            self.helper.close()
         logger.info("Mooncake direct linker stats: %s", self.stats)
         self.storage.close()
         if self.mla_broadcaster is not None:
