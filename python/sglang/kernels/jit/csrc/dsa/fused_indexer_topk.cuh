@@ -50,6 +50,7 @@ constexpr uint32_t kNumSpecializedThreads = 128;
 constexpr uint32_t kNumMathThreads = 256;
 constexpr uint32_t kNumMathWarpGroups = kNumMathThreads / 128;
 constexpr uint32_t kNumThreads = kNumSpecializedThreads + kNumMathThreads;
+constexpr uint32_t kNumMathWarps = kNumMathThreads / 32;
 
 enum Mode : int {
   kModeLogits = 0,
@@ -68,10 +69,11 @@ struct ScoreParams {
   const int32_t* order;  // [num_q_blocks] q-block visit order; nullptr: identity
   float* logits;         // kModeLogits
   const float* tau;      // kModeFilter: per-row threshold
-  // kModeFilter: [num_q_tokens, cand_cap] select keys, (ordered score << 32) | ~window column
+  // kModeFilter: [num_q_tokens, kNumMathWarps, cand_sub_cap] select keys,
+  // (ordered score << 32) | ~window column; one sub-list per math warp of the row's CTA.
   uint64_t* cand_key;
-  int32_t* cand_count;  // kModeFilter: [num_q_tokens], written by the row's CTA (may exceed cand_cap)
-  uint32_t cand_cap;
+  int32_t* cand_count;  // kModeFilter: [num_q_tokens, kNumMathWarps], zeroed by the caller; may exceed the cap
+  uint32_t cand_sub_cap;
   float* sink;  // kModeNoStore
 };
 
@@ -256,10 +258,6 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
   }
   __syncwarp();
 
-  // Per-row candidate counters of the q-block in flight (kModeFilter), past DeepGEMM's layout.
-  auto* s_cand = reinterpret_cast<uint32_t*>(smem_buffer + math::constexpr_align(sizeof(SharedStorage), size_t(16)));
-  if (threadIdx.x < kBlockQ) s_cand[threadIdx.x] = 0;
-
   if (warp_idx == kSpecWarpStart + 2) cute::TMEM::Allocator1Sm().allocate(kNumTmemCols, &smem.tmem_ptr_in_smem);
   __syncthreads();
 
@@ -386,10 +384,14 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
 
     // One (row, key) result: store, accumulate, or filter into the row's list. Callers
     // pass the row's window and tau as values so the per-row arrays stay in registers.
-    // A row belongs to one CTA, so its list position comes from a shared-memory counter
-    // (no global atomic round trip in the scoring loop); the count is published per q-block.
+    // Each math warp appends to its own sub-list of the row, so the position is a
+    // warp-uniform register count plus the ballot prefix: no atomic in the scoring loop.
+    // ci: this warp's counter slot for the row (a compile-time index).
+    constexpr uint32_t kCnt = Traits::kBase == 0 ? kBlockQ : kBlockQ / 2;
+    uint32_t sub_cnt[kFilter ? kCnt : 1] = {};
     const auto handle = [&](const uint32_t q_block_idx,
                             const uint32_t li,
+                            const uint32_t ci,
                             const uint32_t win_start,
                             const uint32_t win_len,
                             const float row_tau,
@@ -404,30 +406,26 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
         const uint32_t rel = kv_offset - win_start;
         const bool take = rel < win_len and result >= row_tau;
         const uint32_t mask = __ballot_sync(0xffffffffu, take);
-        if (mask != 0) {
-          uint32_t base = 0;
-          if (lane_idx == 0) base = atomicAdd(s_cand + li, static_cast<uint32_t>(__popc(mask)));
-          base = __shfl_sync(0xffffffffu, base, 0);
-          if (take) {
-            const uint32_t pos = base + __popc(mask & ((1u << lane_idx) - 1u));
-            if (pos < params.cand_cap)
-              params.cand_key[static_cast<uint64_t>(row) * params.cand_cap + pos] =
-                  (static_cast<uint64_t>(ordered_key(result)) << 32) | static_cast<uint64_t>(~rel);
-          }
+        const uint32_t base = sub_cnt[kFilter ? ci : 0];
+        sub_cnt[kFilter ? ci : 0] = base + __popc(mask);
+        if (take) {
+          const uint32_t pos = base + __popc(mask & ((1u << lane_idx) - 1u));
+          if (pos < params.cand_sub_cap)
+            params.cand_key[(static_cast<uint64_t>(row) * kNumMathWarps + warp_idx) * params.cand_sub_cap + pos] =
+                (static_cast<uint64_t>(ordered_key(result)) << 32) | static_cast<uint64_t>(~rel);
         }
       }
     };
-    // Publishes and clears the q-block's counters once both warpgroups are done with it.
-    const auto flush_counts = [&](const uint32_t q_block_idx) {
+    // Publishes this warp's per-row counts of the q-block (li_of(ci): the row of slot ci).
+    const auto flush_counts = [&](const uint32_t q_block_idx, const uint32_t li_base) {
       if constexpr (kFilter) {
-        cutlass::arch::NamedBarrier(kNumMathThreads, 1).sync();
-        const uint32_t t = warp_idx * 32 + lane_idx;
-        if (t < kBlockQ) {
-          const uint32_t row = q_block_idx * kBlockQ + t;
-          if (row < params.num_q_tokens) params.cand_count[row] = static_cast<int32_t>(s_cand[t]);
-          s_cand[t] = 0;
+#pragma unroll
+        for (uint32_t c = 0; c < kCnt; ++c) {
+          const uint32_t row = q_block_idx * kBlockQ + li_base + c;
+          if (lane_idx == 0 and row < params.num_q_tokens)
+            params.cand_count[row * kNumMathWarps + warp_idx] = static_cast<int32_t>(sub_cnt[c]);
+          sub_cnt[c] = 0;
         }
-        cutlass::arch::NamedBarrier(kNumMathThreads, 1).sync();
       }
     };
     const auto load_tau = [&](const uint32_t q_block_idx) {
@@ -508,6 +506,7 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
                 handle(
                     q_block_idx,
                     ii,
+                    ii,
                     seq_k_start[kFilter ? ii : 0],
                     seq_k_end[kFilter ? ii : 0] - seq_k_start[kFilter ? ii : 0],
                     tau[kFilter ? ii : 0],
@@ -532,6 +531,7 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
               handle(
                   q_block_idx,
                   i,
+                  i,
                   seq_k_start[kFilter ? i : 0],
                   seq_k_end[kFilter ? i : 0] - seq_k_start[kFilter ? i : 0],
                   tau[kFilter ? i : 0],
@@ -541,7 +541,7 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
           }
         }
 
-        flush_counts(q_block_idx);
+        flush_counts(q_block_idx, 0);
         cutlass::arch::fence_view_async_shared();
         smem.empty_q_barriers[q_stage_idx].arrive();
       }
@@ -612,8 +612,8 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
               smem.empty_tmem_barriers[tmem_stage_idx].arrive();
               const float r0 = dg_reduce<kAluHeads>(accum[0], weights[0]) * scale_kv[h];
               const float r1 = dg_reduce<kAluHeads>(accum[1], weights[1]) * scale_kv[h];
-              handle(q_block_idx, row0, win_start[0], win_len[0], row_tau[0], kv_offset, r0);
-              handle(q_block_idx, row0 + 1, win_start[1], win_len[1], row_tau[1], kv_offset, r1);
+              handle(q_block_idx, row0, 0, win_start[0], win_len[0], row_tau[0], kv_offset, r0);
+              handle(q_block_idx, row0 + 1, 1, win_start[1], win_len[1], row_tau[1], kv_offset, r1);
             } else if constexpr (Traits::kPairLoads) {
 #pragma unroll
               for (uint32_t r = 0; r < kRows; r += 2) {
@@ -627,8 +627,8 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
                 }
                 const float r0 = dg_reduce<kAluHeads>(accum[0], weights[r]) * scale_kv[h];
                 const float r1 = dg_reduce<kAluHeads>(accum[1], weights[r + 1]) * scale_kv[h];
-                handle(q_block_idx, row0 + r, win_start[r], win_len[r], row_tau[r], kv_offset, r0);
-                handle(q_block_idx, row0 + r + 1, win_start[r + 1], win_len[r + 1], row_tau[r + 1], kv_offset, r1);
+                handle(q_block_idx, row0 + r, r, win_start[r], win_len[r], row_tau[r], kv_offset, r0);
+                handle(q_block_idx, row0 + r + 1, r + 1, win_start[r + 1], win_len[r + 1], row_tau[r + 1], kv_offset, r1);
               }
             } else {
               // DeepGEMM's per-row load pattern over this warpgroup's 4 rows.
@@ -646,6 +646,7 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
                 handle(
                     q_block_idx,
                     row0 + r,
+                    r,
                     win_start[r],
                     win_len[r],
                     row_tau[r],
@@ -656,7 +657,7 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
           }
         }
 
-        flush_counts(q_block_idx);
+        flush_counts(q_block_idx, row0);
         cutlass::arch::fence_view_async_shared();
         smem.empty_q_barriers[q_stage_idx].arrive();
       }
@@ -692,7 +693,7 @@ struct SelectParams {
   int64_t page_table_stride;
   uint32_t num_rows;
   uint32_t topk;
-  uint32_t cand_cap;
+  uint32_t cand_sub_cap;
   uint32_t page_bits;
 };
 
@@ -717,13 +718,30 @@ __global__ __launch_bounds__(kSelectThreads, 1) void fstk_select_kernel(const Se
     for (uint32_t t = tx; t < p.topk; t += kSelectThreads) out[t] = t < len ? to_slot(t) : -1;
     return;
   }
-  const uint32_t n = static_cast<uint32_t>(p.cand_count[row]);
-  if (n < p.topk or n > p.cand_cap) {
-    if (tx == 0) p.fallback[atomicAdd(p.num_fallback, 1)] = static_cast<int32_t>(row);
-    return;
+  // Gather the row's per-warp sub-lists; an overflowing sub-list or too few keys -> fallback.
+  __shared__ uint32_t s_off[kNumMathWarps + 1];
+  __shared__ uint32_t s_bad;
+  if (tx == 0) {
+    uint32_t acc = 0, bad = 0;
+    for (uint32_t w = 0; w < kNumMathWarps; ++w) {
+      const uint32_t c = static_cast<uint32_t>(p.cand_count[row * kNumMathWarps + w]);
+      bad |= c > p.cand_sub_cap;
+      s_off[w] = acc;
+      acc += c;
+    }
+    s_off[kNumMathWarps] = acc;
+    s_bad = bad or acc < p.topk;
+    if (s_bad) p.fallback[atomicAdd(p.num_fallback, 1)] = static_cast<int32_t>(row);
   }
-  const uint64_t base = static_cast<uint64_t>(row) * p.cand_cap;
-  for (uint32_t t = tx; t < n; t += kSelectThreads) keys[t] = p.cand_key[base + t];
+  __syncthreads();
+  if (s_bad) return;
+  const uint32_t n = s_off[kNumMathWarps];
+#pragma unroll 1
+  for (uint32_t w = 0; w < kNumMathWarps; ++w) {
+    const uint64_t* src = p.cand_key + (static_cast<uint64_t>(row) * kNumMathWarps + w) * p.cand_sub_cap;
+    const uint32_t c = s_off[w + 1] - s_off[w];
+    for (uint32_t t = tx; t < c; t += kSelectThreads) keys[s_off[w] + t] = src[t];
+  }
   uint64_t prefix = 0, prefix_mask = 0;
   uint32_t remaining = p.topk;
   __syncthreads();
@@ -934,9 +952,11 @@ inline void score_impl(
   if constexpr (kMode == kModeNoStore) params.sink = static_cast<float*>(logits.data_ptr());
   if constexpr (kMode == kModeFilter) {
     params.tau = static_cast<const float*>(tau.data_ptr());
+    RuntimeCheck(cand_key.size(1) == kNumMathWarps and cand_count.size(1) == kNumMathWarps,
+                 "fstk: candidate buffers must be [T, 8, sub_cap] and [T, 8]");
     params.cand_key = static_cast<uint64_t*>(cand_key.data_ptr());
     params.cand_count = static_cast<int32_t*>(cand_count.data_ptr());
-    params.cand_cap = static_cast<uint32_t>(cand_key.size(1));
+    params.cand_sub_cap = static_cast<uint32_t>(cand_key.size(2));
   }
 
   const auto map_q = make_map_2d(
@@ -955,7 +975,7 @@ inline void score_impl(
   using SharedStorage = fstk_dg_layout::MQALogitsSharedStorage<
       kNumHeads, kHeadDim, false, Traits::kBlockQ, Traits::kSplitKV, kNumQStages, Traits::kNumKVStages,
       Traits::kNumTmemStages, cutlass::float_e4m3_t, float>;
-  constexpr size_t kSmem = (sizeof(SharedStorage) + 15) / 16 * 16 + 64;  // + the q-block counters
+  constexpr size_t kSmem = sizeof(SharedStorage);
   constexpr auto kernel = fstk_score_kernel<kMode, kReuseKV, kLayout, kAluHeads>;
   const DLDevice device = q.device();
   runtime::init_per_device(device, [=] { runtime::set_max_dynamic_smem(kernel, kSmem); });
@@ -1066,11 +1086,11 @@ struct FusedIndexerTopK {
     p.page_table_stride = page_table.stride(0);
     p.num_rows = static_cast<uint32_t>(out.size(0));
     p.topk = static_cast<uint32_t>(out.size(1));
-    p.cand_cap = static_cast<uint32_t>(cand_key.size(1));
+    p.cand_sub_cap = static_cast<uint32_t>(cand_key.size(2));
     RuntimeCheck(page_size > 0 and (page_size & (page_size - 1)) == 0, "fstk: page_size must be a power of two");
     p.page_bits = static_cast<uint32_t>(__builtin_ctzll(static_cast<unsigned long long>(page_size)));
     if (p.num_rows == 0) return;
-    const size_t smem = static_cast<size_t>(p.cand_cap) * sizeof(uint64_t);
+    const size_t smem = static_cast<size_t>(p.cand_sub_cap) * kNumMathWarps * sizeof(uint64_t);
     const DLDevice device = out.device();
     runtime::init_per_device(device, [=] { runtime::set_max_dynamic_smem(fstk_select_kernel, smem); });
     LaunchKernel(p.num_rows, kSelectThreads, device, smem)(fstk_select_kernel, p);

@@ -23,6 +23,7 @@ MODE_LOGITS, MODE_NO_EPI, MODE_NO_STORE, MODE_FILTER = 0, 1, 2, 3
 # layout -> (rows per q-block, keys per split); see LayoutTraits in the kernel.
 LAYOUTS = {0: (4, 256), 1: (4, 256), 2: (8, 128), 3: (4, 256), 4: (8, 128)}
 DEFAULT_LAYOUT = 0
+MATH_WARPS = 8  # candidate sub-lists per row: one per math warp of the row's CTA
 
 
 def _deep_gemm_include() -> tuple[str, bool]:
@@ -148,7 +149,7 @@ def fused_indexer_topk(
     *,
     sample_stride: int = 16,
     rank: int = 192,
-    cand_cap: int = 8192,
+    cand_cap: int = 16384,
     keep_all: Optional[int] = None,
     order: Optional[torch.Tensor] = None,
     layout: int = DEFAULT_LAYOUT,
@@ -159,7 +160,8 @@ def fused_indexer_topk(
     dev = q_fp8.device
     rows = q_fp8.shape[0]
     num_kv = kv_fp8.shape[0]
-    keep_all = cand_cap if keep_all is None else keep_all
+    # Rows this short keep every score; the 8 sub-lists of such a row stay within the cap.
+    keep_all = cand_cap // 2 if keep_all is None else keep_all
     if order is None:
         order = lpt_order(ks, ke, num_kv, layout)
 
@@ -190,10 +192,10 @@ def fused_indexer_topk(
     tau = torch.empty(rows, device=dev, dtype=torch.float32)
     _jit_module(cuh_path).tau(sample_logits, sks, ske, lengths, tau, rank, topk, keep_all)
 
-    # Select keys: (order-preserving score bits << 32) | ~window column. Every row's count is
-    # written by the CTA that owns it.
-    cand_key = torch.empty(rows, cand_cap, device=dev, dtype=torch.int64)
-    cand_count = torch.empty(rows, device=dev, dtype=torch.int32)
+    # Select keys: (order-preserving score bits << 32) | ~window column, one sub-list per
+    # math warp; a warp that never sees a row leaves its zero count.
+    cand_key = torch.empty(rows, MATH_WARPS, cand_cap // MATH_WARPS, device=dev, dtype=torch.int64)
+    cand_count = torch.zeros(rows, MATH_WARPS, device=dev, dtype=torch.int32)
     score(
         q_fp8,
         kv_fp8,
