@@ -651,6 +651,10 @@ class Envs:
     # wq_b, MegaAttention (RoPE in the kernel, MXFP8 output) and the fp8 wo_a einsum.
     # Changes draft numerics only (the attention output is MXFP8, as in the target).
     SGLANG_OPT_DSPARK_MEGA_ATTENTION = EnvBool(False)
+    # Per-step DSV4 attention metadata (verify row expansion, page table, low-ratio
+    # slots and lengths, indexer block tables, SWA write locations) in single Triton
+    # launches instead of torch-op chains. Bitwise equal outputs.
+    SGLANG_OPT_DSV4_FUSED_ATTN_METADATA = EnvBool(False)
     # The deferred draft KV store's staging (write locations, positions, state slots,
     # commit lengths) in one Triton launch instead of four copies and a fill.
     SGLANG_OPT_DSV41_DSPARK_ONE_LAUNCH_COMMIT_STAGE = EnvBool(
