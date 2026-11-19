@@ -1012,6 +1012,9 @@ class Envs:
     # Prefetch mode: in-flight reads that hold a recurrent-state slot (one per
     # read per stage, from a pool of a few hundred), beyond which reads wait.
     SGLANG_LINKER_PREFETCH_MAX_STATES = EnvInt(64)
+    # Prefetch mode: re-query a request's lost device prefix at most this many
+    # times; after that it is admitted with what is on device (0: no cap).
+    SGLANG_LINKER_MAX_REQUERIES = EnvInt(3)
     # Log each admitted request's prefix and extend length per PP stage (debug).
     SGLANG_LINKER_PP_ADMIT_TRACE = EnvBool(False)
     # PD prefill under PP: PP0's linker offload-commit counts and verdicts ride the

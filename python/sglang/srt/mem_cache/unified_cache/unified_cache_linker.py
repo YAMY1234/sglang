@@ -28,6 +28,7 @@ from dataclasses import dataclass
 import random
 import time
 from abc import ABC, abstractmethod
+from collections import Counter
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, NamedTuple, Optional
@@ -336,6 +337,8 @@ class _ExternalCachePrefetch:
     timeout_s: float = 0.0
     wait_started: float | None = None
     discard: bool = False
+    # Why this read was dropped locally (cancel reason or read failure).
+    abort_reason: str | None = None
 
 
 @dataclass
@@ -547,9 +550,16 @@ class UnifiedCacheLinkerWrapper:
                 "aborted",
                 "timeout_load",
                 "timeout_lookup",
+                "requery_capped",
             ),
             0,
         )
+        # Aborted reads by reason (this rank's cancel reason, read failure, or
+        # "remote_vote" when another stage failed it), logged every 60 s.
+        self._abort_reasons: Counter[str] = Counter()
+        # Re-queries per request rid, capped by SGLANG_LINKER_MAX_REQUERIES.
+        self._requery_counts: Counter[str] = Counter()
+        self.max_requeries = 0
         self._pending_requeries: dict[CacheRequestHandle, Req] = {}
         self._occupied_peak = 0
         self._lookup_next_log = 0.0
@@ -600,6 +610,7 @@ class UnifiedCacheLinkerWrapper:
             envs.SGLANG_EXTERNAL_LINKER_REQUERY_ON_DEVICE_LOSS.get()
         )
         self.log_lookup_stats = envs.SGLANG_EXTERNAL_LINKER_LOOKUP_STATS.get()
+        self.max_requeries = envs.SGLANG_LINKER_MAX_REQUERIES.get()
         logger.info(
             "External linker prefetch mode: lookup threads %d, hold cap %d tokens, "
             "load cap %d tokens, state cap %d reads, PP relay %s",
@@ -1150,7 +1161,7 @@ class UnifiedCacheLinkerWrapper:
             self.pp_relay.begin(req)
         for previous in [p for p in self.prefetches if p.rid == request.rid]:
             if previous != request:
-                self._cancel_prefetch(previous)
+                self._cancel_prefetch(previous, "superseded")
         for previous in [lk for lk in self.lookups if lk.rid == request.rid]:
             if previous != request:
                 self._cancel_lookup(previous)
@@ -1334,7 +1345,7 @@ class UnifiedCacheLinkerWrapper:
         accepted = torch.tensor([state.future is not None], dtype=torch.int)
         self.cache._all_reduce_attn_groups(accepted, torch.distributed.ReduceOp.MIN)
         if not accepted.item():
-            self._cancel_prefetch(request)
+            self._cancel_prefetch(request, "not_submitted")
             # A lookup drain is inside check_prefetch_events, which settles the
             # cancelled read right after it; re-entering would rerun the drain.
             if not self._draining_lookups:
@@ -1394,7 +1405,7 @@ class UnifiedCacheLinkerWrapper:
         # their private slots until every rank has stopped writing to them.
         # Admission polls this: start no new load here.
         self.check_prefetch_events(drain_lookups=False)
-        self._cancel_prefetch(request)
+        self._cancel_prefetch(request, "timeout")
         return True
 
     def _check_lookup_progress(self, request: CacheRequestHandle) -> bool:
@@ -1445,6 +1456,11 @@ class UnifiedCacheLinkerWrapper:
             return False
         if request in self._pending_requeries:
             return True
+        if self.max_requeries and self._requery_counts[request.rid] >= self.max_requeries:
+            # Stop re-looking it up: admit with what is on device.
+            self._lookup_stats["requery_capped"] += 1
+            return False
+        self._requery_counts[request.rid] += 1
         self._lookup_stats["requeried"] += 1
         self._pending_requeries[request] = req
         if self.log_lookup_stats:
@@ -1512,6 +1528,10 @@ class UnifiedCacheLinkerWrapper:
                 " ".join(f"{rid}:{w:.3f}:{o}" for rid, w, o in self._requery_records),
             )
             self._requery_records.clear()
+        if self._abort_reasons:
+            logger.info(
+                "Linker prefetch aborts by reason: %s", dict(self._abort_reasons)
+            )
 
     def _cancel_lookup(self, request: CacheRequestHandle) -> None:
         lookup = self.lookups.pop(request, None)
@@ -1557,11 +1577,38 @@ class UnifiedCacheLinkerWrapper:
         finally:
             self._draining_lookups = False
 
-    def _cancel_prefetch(self, request: CacheRequestHandle) -> None:
+    @staticmethod
+    def local_abort_reason(state) -> str | None:
+        """This rank's reason a finished read did not land, or None if it did."""
+        if state is None:
+            return "missing"
+        if state.discard:
+            return state.abort_reason or "discard"
+        future = state.future
+        if future is None:
+            return "not_submitted"
+        if not future.done():
+            return None
+        if future.cancelled():
+            return "cancelled"
+        error = future.exception()
+        if error is not None:
+            return f"error:{type(error).__name__}"
+        result = future.result()
+        if result is True:
+            return None
+        # The backend returns a reason string (read return codes) on failure.
+        return result if isinstance(result, str) else "read_failed"
+
+    def _cancel_prefetch(
+        self, request: CacheRequestHandle, reason: str = "cancelled"
+    ) -> None:
         self._cancel_lookup(request)
         state = self.prefetches.get(request)
         if state is not None:
             state.discard = True
+            if state.abort_reason is None:
+                state.abort_reason = reason
             if state.future is not None:
                 state.future.cancel()
 
@@ -1598,6 +1645,8 @@ class UnifiedCacheLinkerWrapper:
                     landed = future.result() is True
             except Exception:
                 logger.warning("External linker prefetch failed", exc_info=True)
+            if done and not landed and state.abort_reason is None:
+                state.abort_reason = self.local_abort_reason(state)
             progress.append([done, landed and not state.discard])
         # Keep the same operation order on every rank, including discarded
         # reads. Local cancellation must not change collective participation.
@@ -1627,6 +1676,7 @@ class UnifiedCacheLinkerWrapper:
         try:
             if not publish:
                 self._lookup_stats["aborted"] += 1
+                self._abort_reasons[state.abort_reason or self.local_abort_reason(state) or "remote_vote"] += 1
                 self._update_load(
                     ExternalLinkerLoadPhase.ABORT, None, state.component_transfers, end
                 )
@@ -1725,6 +1775,7 @@ class UnifiedCacheLinkerWrapper:
 
     def _release_prefetch_request(self, rid: str) -> None:
         """GLM's release_request for the prefetch state of ``rid``."""
+        self._requery_counts.pop(rid, None)
         handles = {
             h
             for table in (self.prefetches, self.lookups, self.holds, self._pending_requeries)
@@ -1736,7 +1787,7 @@ class UnifiedCacheLinkerWrapper:
         for request in handles:
             self._pending_requeries.pop(request, None)
             self._requery_started.pop(request, None)
-            self._cancel_prefetch(request)
+            self._cancel_prefetch(request, "released")
             self.release_hold(request, admitted=False)
 
     def _clear_prefetch_state(self) -> None:
@@ -1751,6 +1802,7 @@ class UnifiedCacheLinkerWrapper:
         self._pending_requeries.clear()
         self._requery_started.clear()
         self._requery_records.clear()
+        self._requery_counts.clear()
         if self.pp_relay is not None:
             self.pp_relay.reset()
 

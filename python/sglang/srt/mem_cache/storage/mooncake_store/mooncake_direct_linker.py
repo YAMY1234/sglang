@@ -1449,7 +1449,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.stats["prefetch"] = self.stats.get("prefetch", 0) + 1
         return future
 
-    def _prefetch_read(self, expanded: list[PoolTransfer], ready, queued: float) -> bool:
+    def _prefetch_read(self, expanded: list[PoolTransfer], ready, queued: float) -> bool | str:
         """One request's read, as load_layer_wise reads a batch (per key or per
         layer, with its lease renewal and retry), with no layer counter."""
         began = time.monotonic()
@@ -1474,7 +1474,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 dict(failed),
             )
             self.stats["prefetch_failed"] = self.stats.get("prefetch_failed", 0) + 1
-            return False
+            # Not True, so the read fails; the string carries the return codes.
+            return "session_start:" + ",".join(f"{k}x{v}" for k, v in sorted(failed.items()))
         try:
             if self.load_per_key:
                 self._load_per_key(batches, [], None)
@@ -1496,10 +1497,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                             raise RuntimeError(
                                 f"Mooncake range get failed for pool={name}, layer={layer}"
                             )
-        except Exception:
+        except Exception as error:
             logger.warning("Mooncake linker prefetch read failed", exc_info=True)
             self.stats["prefetch_failed"] = self.stats.get("prefetch_failed", 0) + 1
-            return False
+            return f"read:{str(error)[:80]}"
         finally:
             self.sessions.end(keys)
         if self.log_load_timing:

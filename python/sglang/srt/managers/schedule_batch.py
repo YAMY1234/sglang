@@ -995,6 +995,9 @@ class ReqKvInfo:
     mamba_cow_src_index: Optional[torch.Tensor] = None
     # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
     mamba_needs_clear: bool = False
+    # Set when admission matched a device mamba state but the state pool had no
+    # free slot even after eviction: the request is deferred, not admitted.
+    mamba_alloc_failed: bool = False
 
     def swa_dead_lo(self, page_size: int) -> int:
         # Lowest SWA position this request may free itself: above the tree-owned

@@ -4706,7 +4706,19 @@ class Scheduler(
                     # marks the staged span below once it is surfaced.
                     req.host_hit_is_storage = False
 
-            req.init_next_round_input(self.tree_cache)
+            req.kv.mamba_alloc_failed = False
+            self.tree_cache.defer_state_exhaustion = True
+            try:
+                req.init_next_round_input(self.tree_cache)
+            finally:
+                self.tree_cache.defer_state_exhaustion = False
+            if req.kv.mamba_alloc_failed:
+                # No free state slot even after eviction: the request stays
+                # queued (every PP stage sees the same pool) and the pass ends.
+                req.kv.mamba_alloc_failed = False
+                self._revert_unadmitted_mamba(req)
+                stop_reason = "mamba_slot"
+                break
             if pp_full_chunk is not None:
                 chunked_prefill_size = self._pp_restore_full_chunk(
                     req, adder, chunked_prefill_size, pp_full_chunk

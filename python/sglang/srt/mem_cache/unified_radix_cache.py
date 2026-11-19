@@ -217,6 +217,11 @@ class UnifiedRadixCache(BasePrefixCache):
     _mamba_path_cap_counts_host = False
     mamba_retention_counts: Optional[dict[str, int]] = None
     pp_counts_piggyback: bool = False
+    # Admissions deferred because the mamba state pool had no free slot.
+    state_pool_exhausted: int = 0
+    # Set by prefill admission around its match: a failed state alloc defers
+    # the request instead of asserting (other callers keep the assert).
+    defer_state_exhaustion: bool = False
     pp_counts_consensus: bool = False
 
     def __init__(

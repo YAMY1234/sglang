@@ -222,7 +222,16 @@ class MambaComponent(TreeComponent):
                 self.cache.dec_lock_ref(
                     result.best_match_node, lock_result.to_dec_params()
                 )
-                assert dst_index is not None, "Can not alloc mamba cache"
+                assert dst_index is not None or self.cache.defer_state_exhaustion, (
+                    "Can not alloc mamba cache"
+                )
+                if dst_index is None:
+                    # State pool exhausted (e.g. in-flight prefetch reads hold
+                    # slots): defer the request; admission ends the pass.
+                    req.kv.mamba_alloc_failed = True
+                    req.kv.mamba_cow_src_index = None
+                    self.cache.state_pool_exhausted += 1
+                    return result
             req.kv.mamba_pool_idx = dst_index[0]
         req.kv.mamba_cow_src_index = src_index
         req.kv.mamba_needs_clear = False

@@ -133,6 +133,8 @@ class PPLinkerRelay:
                 )
             except Exception:
                 pass
+            if not landed and state is not None and state.abort_reason is None:
+                state.abort_reason = w.local_abort_reason(state)
             entry.voted = _LANDED if landed else _FAILED
             self.store[self._key(entry)] = entry.voted
 
@@ -322,7 +324,7 @@ class PPLinkerRelay:
         elif op == "stop":
             if entry.phase != "ready":
                 entry.stopped = True
-                w._cancel_prefetch(handle)
+                w._cancel_prefetch(handle, "stopped")
         else:
             raise AssertionError(op)
         if entry.phase == "ready" and entry.released:
