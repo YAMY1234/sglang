@@ -47,10 +47,8 @@ constexpr uint32_t kNumHeads = 32;
 constexpr uint32_t kHeadDim = 128;
 constexpr uint32_t kNumQStages = 3;
 constexpr uint32_t kNumSpecializedThreads = 128;
-constexpr uint32_t kNumMathThreads = 256;
-constexpr uint32_t kNumMathWarpGroups = kNumMathThreads / 128;
-constexpr uint32_t kNumThreads = kNumSpecializedThreads + kNumMathThreads;
-constexpr uint32_t kNumMathWarps = kNumMathThreads / 32;
+// Candidate sub-lists per row (one per math warp that can see the row).
+constexpr uint32_t kNumMathWarps = 8;
 
 enum Mode : int {
   kModeLogits = 0,
@@ -85,17 +83,25 @@ struct ScoreParams {
 //   2: wide (8 rows, N 256, 128-key splits, warpgroup g takes rows 4g..4g+3): 48 instead of
 //      64 SMEM operand bytes per (row, key), the bound of the narrow layouts.
 //   3, 4: layouts 0, 2 with two rows' accumulators loaded per TMEM wait (64 registers).
+//   5: four math warpgroups, warpgroup g takes row g of both 128-key halves (4 rows, N 128,
+//      256-key splits, 4 stages read by all): 32 weight registers per thread, so 4 math
+//      warps per SM sub-partition hide the TMEM load latency.
 template <int kLayout>
 struct LayoutTraits {
   static constexpr int kBase = kLayout == 3 ? 0 : (kLayout == 4 ? 2 : kLayout);
-  static constexpr bool kPairLoads = kLayout >= 3;
+  static constexpr bool kPairLoads = kLayout == 3 or kLayout == 4;
   static constexpr uint32_t kBlockQ = kBase == 2 ? 8 : 4;
   static constexpr uint32_t kSplitKV = kBase == 2 ? 128 : 256;
-  static constexpr uint32_t kNumTmemStages = kBase == 0 ? 3 : (kBase == 1 ? 4 : 2);
+  static constexpr uint32_t kNumTmemStages = kBase == 0 ? 3 : (kBase == 2 ? 2 : 4);
   static constexpr uint32_t kNumKVStages = kBase == 2 ? 6 : 5;
-  // Both warpgroups read every accumulator stage (layouts 1, 2) or one each (layout 0).
+  // Every math warpgroup reads every accumulator stage (layouts 1, 2, 5) or one each (layout 0).
   static constexpr bool kSharedStage = kBase != 0;
   static constexpr uint32_t kUmmaN = kBlockQ * kNumHeads;
+  static constexpr uint32_t kNumMathWG = kBase == 5 ? 4 : 2;
+  static constexpr uint32_t kNumMathThreads = kNumMathWG * 128;
+  static constexpr uint32_t kNumThreads = kNumSpecializedThreads + kNumMathThreads;
+  // The CTA's 64K registers: specialized warps keep 56, math warps get the rest (multiples of 8).
+  static constexpr uint32_t kNumMathRegisters = kNumMathWG == 2 ? 224 : 104;
 };
 
 // Snake round-robin over the caller's order: round r gives CTA b the entry
@@ -179,7 +185,7 @@ CUTLASS_DEVICE float dg_reduce(const float* accum, const float* w) {
 }
 
 template <int kMode, bool kReuseKV, int kLayout, uint32_t kAluHeads>
-__global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
+__global__ __launch_bounds__(LayoutTraits<kLayout>::kNumThreads, 1) void fstk_score_kernel(
     const __grid_constant__ ScoreParams params,
     const __grid_constant__ cute::TmaDescriptor tensor_map_q,
     const __grid_constant__ cute::TmaDescriptor tensor_map_kv,
@@ -196,6 +202,8 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
 
   const auto warp_idx = cutlass::canonical_warp_idx_sync();
   const auto lane_idx = ptx::get_lane_idx();
+  constexpr uint32_t kNumMathWarpGroups = Traits::kNumMathWG;
+  constexpr uint32_t kNumMathThreads = Traits::kNumMathThreads;
   constexpr uint32_t kSpecWarpStart = kNumMathWarpGroups * 4;
 
   if (warp_idx == kSpecWarpStart) {
@@ -266,7 +274,7 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
   RingPipeline<kNumTmemStages> tmem_pipeline;
 
   constexpr uint32_t kNumSpecializedRegisters = 56;
-  constexpr uint32_t kNumMathRegisters = 224;
+  constexpr uint32_t kNumMathRegisters = Traits::kNumMathRegisters;
 
   cudaGridDependencySynchronize();
 
@@ -387,8 +395,10 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
     // Each math warp appends to its own sub-list of the row, so the position is a
     // warp-uniform register count plus the ballot prefix: no atomic in the scoring loop.
     // ci: this warp's counter slot for the row (a compile-time index).
-    constexpr uint32_t kCnt = Traits::kBase == 0 ? kBlockQ : kBlockQ / 2;
+    constexpr uint32_t kCnt = Traits::kBase == 0 ? kBlockQ : (Traits::kBase == 5 ? 1 : kBlockQ / 2);
     uint32_t sub_cnt[kFilter ? kCnt : 1] = {};
+    // A row is seen by all 8 math warps (layout 0), by its warpgroup's 4 (layouts 1, 2, 5).
+    const uint32_t sub_idx = Traits::kBase == 5 ? warp_idx % 4 : warp_idx;
     const auto handle = [&](const uint32_t q_block_idx,
                             const uint32_t li,
                             const uint32_t ci,
@@ -411,7 +421,7 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
         if (take) {
           const uint32_t pos = base + __popc(mask & ((1u << lane_idx) - 1u));
           if (pos < params.cand_sub_cap)
-            params.cand_key[(static_cast<uint64_t>(row) * kNumMathWarps + warp_idx) * params.cand_sub_cap + pos] =
+            params.cand_key[(static_cast<uint64_t>(row) * kNumMathWarps + sub_idx) * params.cand_sub_cap + pos] =
                 (static_cast<uint64_t>(ordered_key(result)) << 32) | static_cast<uint64_t>(~rel);
         }
       }
@@ -423,7 +433,7 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
         for (uint32_t c = 0; c < kCnt; ++c) {
           const uint32_t row = q_block_idx * kBlockQ + li_base + c;
           if (lane_idx == 0 and row < params.num_q_tokens)
-            params.cand_count[row * kNumMathWarps + warp_idx] = static_cast<int32_t>(sub_cnt[c]);
+            params.cand_count[row * kNumMathWarps + sub_idx] = static_cast<int32_t>(sub_cnt[c]);
           sub_cnt[c] = 0;
         }
       }
@@ -542,6 +552,76 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
         }
 
         flush_counts(q_block_idx, 0);
+        cutlass::arch::fence_view_async_shared();
+        smem.empty_q_barriers[q_stage_idx].arrive();
+      }
+    } else if constexpr (Traits::kBase == 5) {
+      // Thread t of warpgroup g: TMEM lane t (key t of each 128-key half), row g.
+      const uint32_t lane_key = (warp_idx % 4) * 32 + lane_idx;
+      const uint32_t my_row = math_warpgroup_idx;
+      float weights[kNumHeads];
+      float accum[kNumHeads];
+
+      Scheduler scheduler(params);
+      uint32_t q_block_idx, kv_base, num_kv_splits;
+      while (scheduler.template next_q_block<kFilter>(q_block_idx, kv_base, num_kv_splits, seq_k_start, seq_k_end)) {
+        CUTE_TIE_DECL(q_pipeline.advance(), q_stage_idx, q_phase);
+        smem.full_q_barriers[q_stage_idx].wait(q_phase);
+        load_tau(q_block_idx);
+        uint32_t win_start = 0, win_len = 0;
+        float row_tau = 0.0f;
+        if constexpr (kFilter) {
+          // Constant indices only, so the per-row arrays stay in registers.
+#pragma unroll
+          for (uint32_t r = 0; r < kBlockQ; ++r) {
+            if (my_row == r) {
+              win_start = seq_k_start[r];
+              win_len = seq_k_end[r] - seq_k_start[r];
+              row_tau = tau[r];
+            }
+          }
+        }
+        if constexpr (kMode != kModeNoEpi) {
+          const auto smem_weights_row = smem.smem_weights[q_stage_idx] + my_row * kNumWeightElementsPerRow;
+#pragma unroll
+          for (uint32_t j = 0; j < kNumHeads; ++j)
+            weights[j] = ptx::ld_shared(smem_weights_row + j) * (j < kAluHeads ? 2.0f : 1.0f);
+        }
+
+        for (uint32_t kv_split_idx = 0; kv_split_idx < num_kv_splits; ++kv_split_idx) {
+          CUTE_TIE_DECL(kv_pipeline.advance(), kv_stage_idx, kv_phase);
+          smem.full_kv_barriers[kv_stage_idx].wait(kv_phase);
+          float scale_kv[kMmaPerSplit];
+#pragma unroll
+          for (uint32_t h = 0; h < kMmaPerSplit; ++h)
+            scale_kv[h] = kMode != kModeNoEpi ? ptx::ld_shared(smem.smem_sf_kv[kv_stage_idx] + h * UMMA_M + lane_key) : 0.0f;
+
+#pragma unroll
+          for (uint32_t h = 0; h < kMmaPerSplit; ++h) {
+            CUTE_TIE_DECL(tmem_pipeline.advance(), tmem_stage_idx, tmem_phase);
+            smem.full_tmem_barriers[tmem_stage_idx].wait(tmem_phase);
+            ptx::tcgen05_after_thread_sync();
+            if (h == kMmaPerSplit - 1) {
+              // Every UMMA of the split has committed: the KV stage is free.
+              cutlass::arch::fence_view_async_shared();
+              smem.empty_kv_barriers[kv_stage_idx].arrive();
+            }
+            if constexpr (kMode == kModeNoEpi) {
+              ptx::tcgen05_before_thread_sync();
+              smem.empty_tmem_barriers[tmem_stage_idx].arrive();
+              continue;
+            }
+            ptx::tmem_load_32dp32b<kNumHeads>(tmem_stage_idx * UMMA_N + my_row * kNumHeads, reinterpret_cast<uint32_t*>(accum));
+            cutlass::arch::fence_view_async_tmem_load();
+            ptx::tcgen05_before_thread_sync();
+            smem.empty_tmem_barriers[tmem_stage_idx].arrive();
+            const uint32_t kv_offset = kv_base + kv_split_idx * kSplitKV + h * UMMA_M + lane_key;
+            handle(q_block_idx, my_row, 0, win_start, win_len, row_tau, kv_offset,
+                   dg_reduce<kAluHeads>(accum, weights) * scale_kv[h]);
+          }
+        }
+
+        flush_counts(q_block_idx, my_row);
         cutlass::arch::fence_view_async_shared();
         smem.empty_q_barriers[q_stage_idx].arrive();
       }
@@ -979,7 +1059,7 @@ inline void score_impl(
   constexpr auto kernel = fstk_score_kernel<kMode, kReuseKV, kLayout, kAluHeads>;
   const DLDevice device = q.device();
   runtime::init_per_device(device, [=] { runtime::set_max_dynamic_smem(kernel, kSmem); });
-  LaunchKernel(static_cast<uint32_t>(num_ctas), kNumThreads, device, kSmem)
+  LaunchKernel(static_cast<uint32_t>(num_ctas), Traits::kNumThreads, device, kSmem)
       .enable_pdl(false)(kernel, params, map_q, map_kv, map_sf_kv, map_w);
 }
 
@@ -1040,7 +1120,7 @@ struct FusedIndexerTopK {
 #define FSTK_DISPATCH(LY, AH) \
   return score_dispatch<LY, AH>(q, kv, kv_scale, weights, ks, ke, order, logits, tau, cand_key, cand_count, mode, reuse_kv, num_ctas)
     sglang::host::RuntimeCheck(alu_heads == 0 or alu_heads == 16, "fstk: alu_heads must be 0 or 16");
-    sglang::host::RuntimeCheck(layout >= 0 and layout <= 4, "fstk: layout must be 0..4");
+    sglang::host::RuntimeCheck(layout >= 0 and layout <= 5, "fstk: layout must be 0..5");
     if (layout == 0) {
       if (alu_heads) FSTK_DISPATCH(0, 16);
       FSTK_DISPATCH(0, 0);
@@ -1056,6 +1136,10 @@ struct FusedIndexerTopK {
     if (layout == 4) {
       if (alu_heads) FSTK_DISPATCH(4, 16);
       FSTK_DISPATCH(4, 0);
+    }
+    if (layout == 5) {
+      if (alu_heads) FSTK_DISPATCH(5, 16);
+      FSTK_DISPATCH(5, 0);
     }
     if (alu_heads) FSTK_DISPATCH(2, 16);
     FSTK_DISPATCH(2, 0);
