@@ -366,6 +366,61 @@ class TestDevicePoolEntry(CustomTestCase):
         pool.prepare_locations(host)
         self.assertEqual(DevicePoolEntry.cuda_index_copies, before)
 
+    def test_page_checksum_detects_a_corrupted_page(self):
+        # SGLANG_LINKER_PAGE_CHECKSUM: a page copied intact checksums equal on both
+        # sides; one flipped byte in the destination shows as one mismatch.
+        import collections
+        import threading
+
+        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+            MergedPageEntry,
+            page_checksums,
+        )
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
+            MooncakeDirectLinker,
+        )
+
+        def pools(seed):
+            g = torch.Generator().manual_seed(seed)
+            kv = [torch.randint(0, 256, (16, 4), dtype=torch.uint8, generator=g) for _ in range(2)]
+            ix = torch.randint(0, 256, (8, 5), dtype=torch.uint8, generator=g)
+            kv_pool = DevicePoolEntry(
+                name=PoolName.KV, indices_from_pool=PoolName.KV, device_pool=None,
+                components=[kv], layer_mapping={0: 0, 1: 1}, page_size=2, rows_are_pages=False,
+            )
+            ix_pool = DevicePoolEntry(
+                name=PoolName.INDEXER, indices_from_pool=PoolName.KV, device_pool=None,
+                components=[[ix]], layer_mapping={1: 0}, page_size=2, rows_are_pages=True,
+            )
+            return MergedPageEntry(kv_pool, ix_pool, object_name="ki"), kv, ix
+
+        src, src_kv, src_ix = pools(0)
+        dst, dst_kv, dst_ix = pools(1)
+        src_loc = src.prepare_locations(torch.tensor([2, 3, 10, 11]))
+        dst_loc = dst.prepare_locations(torch.tensor([6, 7, 12, 13]))
+        for (s_tok, s_row), (d_tok, d_row) in zip(src_loc, dst_loc):  # the "read"
+            for a, b in zip(src_kv, dst_kv):
+                b[d_tok : d_tok + 2] = a[s_tok : s_tok + 2]
+            dst_ix[d_row] = src_ix[s_row]
+        self.assertEqual(page_checksums(src, src_loc), page_checksums(dst, dst_loc))
+
+        linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        linker.page_checksum_rate = 1.0
+        linker.page_checksums = collections.OrderedDict(
+            zip(["a", "b"], page_checksums(src, src_loc))
+        )
+        linker.page_checksum_counts = collections.Counter()
+        linker.page_checksum_lock = threading.Lock()
+        linker._checksum_stream = None
+        linker.pools = {PoolName.KV: dst}
+        linker._verify_page_checksums({PoolName.KV: (["a", "b"], dst_loc)})
+        self.assertEqual(linker.page_checksum_counts["mismatched"], 0)
+        self.assertEqual(linker.page_checksum_counts["checked"], 2)
+        dst_kv[1][dst_loc[1][0], 3] ^= 0xFF
+        linker._verify_page_checksums({PoolName.KV: (["a", "b", "c"], dst_loc + dst_loc[:1])})
+        self.assertEqual(linker.page_checksum_counts["mismatched"], 1)
+        self.assertEqual(linker.page_checksum_counts["missing"], 1)
+
     def test_rejects_invalid_pages_and_empty_buffers(self):
         with self.assertRaisesRegex(ValueError, "has no storage buffers"):
             DevicePoolEntry(

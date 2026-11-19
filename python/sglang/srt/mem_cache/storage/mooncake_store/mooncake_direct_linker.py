@@ -8,6 +8,7 @@ import os
 import re
 import threading
 import time
+import zlib
 from collections import Counter, OrderedDict, deque
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -26,6 +27,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+    page_checksums,
     RangeArrays,
     attach_cpu_indices,
     resolve_hybrid_device_pool_group,
@@ -706,6 +708,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.vector_meta = envs.SGLANG_LINKER_VECTOR_META.get()
         self.coalesce_ranges = envs.SGLANG_LINKER_COALESCE_RANGES.get()
         self.store_arrays = envs.SGLANG_LINKER_STORE_ARRAYS.get()
+        self.page_checksum_rate = envs.SGLANG_LINKER_PAGE_CHECKSUM.get()
+        self.page_checksums: OrderedDict[str, int] = OrderedDict()
+        self.page_checksum_counts = Counter()
+        self.page_checksum_lock = threading.Lock()
+        self._checksum_stream = None
         self.cpu_indices = envs.SGLANG_LINKER_CPU_INDICES.get()
         self.num_load_threads = envs.SGLANG_LINKER_LOAD_THREADS.get() or (
             2 if self.load_overlap else 1
@@ -1508,6 +1515,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             return f"read:{str(error)[:80]}"
         finally:
             self.sessions.end(keys)
+        if self.page_checksum_rate:
+            self._verify_page_checksums(batches)
         if self.log_load_timing:
             logger.info(
                 "Mooncake linker prefetch pages=%d objects=%d wait=%.0fms xfer=%.0fms",
@@ -2151,6 +2160,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 if trace is not None:
                     trace.note(traced, "completed" if success else "failed")
                 if success:
+                    if self.page_checksum_rate:
+                        self._record_page_checksums(expanded)
                     self.stats["offload"] += 1
                     if self.stats["offload"] == 1:
                         logger.info("Mooncake direct linker offload: tokens=%d", tokens)
@@ -2204,6 +2215,65 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             else:
                 self.state_remove_failed += 1
 
+    def _checksum_sampled(self, key: str) -> bool:
+        return zlib.crc32(key.encode()) % 100000 < self.page_checksum_rate * 100000
+
+    def _checksum_pages(self, name, keys, locations) -> list[tuple[str, int]]:
+        """Checksums of the sampled pages of one pool, on a side stream so the
+        forward stream is never synchronized (its writes were awaited already)."""
+        picked = [(k, loc) for k, loc in zip(keys, locations) if self._checksum_sampled(k)]
+        if not picked:
+            return []
+        entry = self.pools[name]
+        stream = None
+        if entry.kv_buffer[0].is_cuda:
+            if self._checksum_stream is None:
+                self._checksum_stream = torch.cuda.Stream(device=entry.kv_buffer[0].device)
+            stream = self._checksum_stream
+        if stream is None:
+            values = page_checksums(entry, [loc for _, loc in picked])
+        else:
+            with torch.cuda.stream(stream):
+                values = page_checksums(entry, [loc for _, loc in picked])
+        return [(k, v) for (k, _), v in zip(picked, values)]
+
+    def _record_page_checksums(self, expanded) -> None:
+        """Offload thread, after the put: remember the sampled pages' checksums."""
+        recorded = []
+        for transfer in expanded:
+            keys = self.storage._tag_keys(
+                self.storage._get_hybrid_page_component_keys(list(transfer.keys), transfer)[0]
+            )
+            locations = self.pools[transfer.name].prepare_locations(transfer.host_indices)
+            recorded += self._checksum_pages(transfer.name, keys, locations)
+        with self.page_checksum_lock:
+            for key, value in recorded:
+                # First write wins: a later put of the same key may be skipped by
+                # the store (already held), so its device bytes need not match.
+                self.page_checksums.setdefault(key, value)
+            while len(self.page_checksums) > 200_000:
+                self.page_checksums.popitem(last=False)
+            self.page_checksum_counts["recorded"] += len(recorded)
+
+    def _verify_page_checksums(self, batches) -> None:
+        """Prefetch thread, after the read landed and before publish."""
+        for name, (keys, locations) in batches.items():
+            for key, value in self._checksum_pages(name, keys, locations):
+                with self.page_checksum_lock:
+                    want = self.page_checksums.get(key)
+                counts = self.page_checksum_counts
+                if want is None:
+                    counts["missing"] += 1
+                    continue
+                counts["checked"] += 1
+                if value != want:
+                    counts["mismatched"] += 1
+                    if counts["mismatched"] <= 5:
+                        logger.warning(
+                            "Linker page checksum mismatch: key=%s pool=%s stored=%d read=%d",
+                            key, name, want, value,
+                        )
+
     def _remove_pages(
         self, keys: list[str], pages: Sequence[str] = (), decided: int = 0
     ) -> None:
@@ -2229,6 +2299,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 counts["recalled"] += 1
                 continue
             rc = self.storage.store.remove(key)
+            if self.page_checksum_rate and rc in (0, -704):
+                with self.page_checksum_lock:
+                    self.page_checksums.pop(key, None)
             if self.hole_trace is not None and rc in (0, -704):
                 self.hole_trace.note([page], "removed", "budget")
             if rc == 0:
@@ -2245,6 +2318,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         now = time.monotonic()
         if now - self.stats_logged_at < every_s:
             return
+        if self.page_checksum_rate:
+            c = self.page_checksum_counts
+            logger.info(
+                "Linker page checksum: checked %d, mismatched %d, missing %d (recorded %d)",
+                c["checked"], c["mismatched"], c["missing"], c["recorded"],
+            )
         window, self.stats_logged_at = now - self.stats_logged_at, now
         written, self.write_bytes = self.write_bytes, Counter()
         looked, self.lookup_counts = self.lookup_counts, Counter()

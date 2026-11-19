@@ -1081,6 +1081,9 @@ class Envs:
     # *_ranges_arrays method (patched Mooncake store.so) instead of nested lists the
     # binding converts under the GIL; falls back to the list call without it.
     SGLANG_LINKER_STORE_ARRAYS = EnvBool(False)
+    # KV integrity check: checksum this share of pages (sampled by store key) at
+    # offload and again after a prefetch read lands; mismatches are logged (0: off).
+    SGLANG_LINKER_PAGE_CHECKSUM = EnvFloat(0.0)
     # Offload puts: build per-key buffer addresses with numpy and batch the
     # recent-key / result bookkeeping (the offload thread's GIL share).
     SGLANG_LINKER_VECTOR_PUT = EnvBool(False)

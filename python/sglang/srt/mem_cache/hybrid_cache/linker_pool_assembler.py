@@ -212,6 +212,39 @@ class DevicePoolEntry:
         return np.asarray(locations, dtype=np.int64).reshape(-1, 1)
 
 
+_CHECKSUM_WEIGHTS: dict = {}
+
+
+def _weighted_byte_sum(rows: torch.Tensor) -> torch.Tensor:
+    """Position-weighted sum of a slice's bytes (int64, on its device)."""
+    data = rows.contiguous().view(torch.uint8).flatten()
+    key = (data.numel(), data.device)
+    weights = _CHECKSUM_WEIGHTS.get(key)
+    if weights is None:
+        weights = torch.arange(data.numel(), device=data.device, dtype=torch.int64) % 65521 + 1
+        _CHECKSUM_WEIGHTS[key] = weights
+    return (data.to(torch.int64) * weights).sum()
+
+
+def _entry_page_checksum(entry, location) -> torch.Tensor:
+    if isinstance(entry, MergedPageEntry):
+        first = _entry_page_checksum(entry.first, location[0])
+        return first * 1000003 + _entry_page_checksum(entry.second, location[1])
+    total = None
+    for index, buffer in enumerate(entry.kv_buffer):
+        value = _weighted_byte_sum(buffer[location : location + entry._row_span]) * (index + 1)
+        total = value if total is None else total + value
+    return total
+
+
+def page_checksums(entry, locations) -> list[int]:
+    """SGLANG_LINKER_PAGE_CHECKSUM: one checksum per page location over every
+    buffer the page's store object packs (KV, indexer, or the state)."""
+    if not locations:
+        return []
+    return torch.stack([_entry_page_checksum(entry, loc) for loc in locations]).tolist()
+
+
 def coalesce_key_range_table(table: np.ndarray) -> np.ndarray:
     """Merge consecutive items that stay contiguous for every row: same source
     location and stride, the next item's device base right after this one's bytes,
