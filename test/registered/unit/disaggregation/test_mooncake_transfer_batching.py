@@ -701,6 +701,25 @@ class TestMooncakeEarlySend(CustomTestCase):
         ready.synchronize.assert_not_called()
         indices_ready.synchronize.assert_not_called()
 
+    def test_shards_one_destination_by_room_when_enabled(self):
+        queues = [SimpleQueue() for _ in range(4)]
+        rooms = range(8)
+        manager = SimpleNamespace(
+            disaggregation_mode=DisaggregationMode.PREFILL,
+            request_status={r: KVPoll.WaitingForInput for r in rooms},
+            check_status=lambda room: KVPoll.WaitingForInput,
+            transfer_infos={r: {"127.0.0.1:80": object()} for r in rooms},
+            transfer_queues=queues,
+        )
+        with patch.dict(os.environ, {"SGLANG_DISAGG_TRANSFER_SHARD_BY_ROOM": "1"}):
+            for r in rooms:
+                for last in (False, True):
+                    MooncakeKVManager.add_transfer_request(manager, r, [0], slice(0, 1), last)
+        for i, q in enumerate(queues):
+            got = [q.get_nowait() for _ in range(q.qsize())]
+            self.assertEqual([(c.room, c.is_last_chunk) for c in got],
+                             [(r, last) for r in rooms if r % 4 == i for last in (False, True)])
+
     def _worker(self, event):
         chunk = TransferKVChunk(
             1, [0], slice(0, 1), False, None, None, wait_event=event

@@ -800,6 +800,9 @@ class Envs:
     # >0: KV transfer workers wait on CUDA events/streams by query() + sleep of this many us
     # instead of a spinning synchronize(), so the waiting thread leaves the CPU to the scheduler.
     SGLANG_DISAGG_TRANSFER_POLL_WAIT_US = EnvInt(0)
+    # Shard prefill KV transfer chunks across the transfer queues by bootstrap room instead of by
+    # destination session, so one decode instance's sends use every worker (default off).
+    SGLANG_DISAGG_TRANSFER_SHARD_BY_ROOM = EnvBool(False)
     # PP PD prefill: an early-sent last chunk still in transfer does not block the result; the
     # checkpoint's device frees for that request wait until its transfer ends (default off).
     SGLANG_PP_PD_DEFER_EARLY_SETTLE = EnvBool(False)
