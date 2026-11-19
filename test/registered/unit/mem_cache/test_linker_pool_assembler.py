@@ -1401,6 +1401,21 @@ class TestLinkerStaging(CustomTestCase):
         slab.release({"kv": slots})
         self.assertEqual(len(slab.free["kv"]), 4)
 
+    def test_slab_pools_give_every_stage_the_same_page_slots_within_the_cap(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.linker_staging import slab_pools
+
+        gb = 2**30
+        # Hecate ab4 object sizes: PP0-5 KV 135,936 B, PP7 KV 181,248 B; states 58.6 / 39.1 MB.
+        pp0 = slab_pools({"kv": 135936, "mamba": 58613760}, "mamba", 40000, 32, 9 * gb)
+        pp7 = slab_pools({"kv": 181248, "mamba": 39075840}, "mamba", 40000, 32, 9 * gb)
+        self.assertEqual((pp0["kv"][1], pp7["kv"][1]), (40000, 40000))
+        self.assertEqual((pp0["mamba"][1], pp7["mamba"][1]), (32, 32))
+        # A tighter cap shrinks the page slots to fit; the state slots stay.
+        tight = slab_pools({"kv": 181248, "mamba": 39075840}, "mamba", 40000, 32, 6 * gb)
+        self.assertEqual(tight["mamba"][1], 32)
+        self.assertEqual(tight["kv"][1], (6 * gb - 32 * 39075840) // 181248)
+        self.assertLessEqual(tight["kv"][1] * 181248 + 32 * 39075840, 6 * gb)
+
     def test_early_reads_vote_once_never_block_and_release_every_slot(self):
         from concurrent.futures import Future
 

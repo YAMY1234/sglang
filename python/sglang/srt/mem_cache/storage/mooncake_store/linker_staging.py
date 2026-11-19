@@ -62,6 +62,17 @@ class StagingSlab:
         return self.layout[name][1]
 
 
+def slab_pools(object_bytes: dict, state_pool, pages: int, states: int, cap_bytes: int) -> dict:
+    """{pool: (object bytes, slots)}: ``states`` slots for ``state_pool``, ``pages`` for
+    every other pool (the same page count on every stage, whatever its layer count);
+    when that exceeds ``cap_bytes`` the page slots shrink to fit."""
+    state_bytes = object_bytes.get(state_pool, 0) * states
+    page_bytes = sum(b for name, b in object_bytes.items() if name != state_pool)
+    if page_bytes and state_bytes + pages * page_bytes > cap_bytes:
+        pages = max(0, (cap_bytes - state_bytes) // page_bytes)
+    return {name: (b, states if name == state_pool else pages) for name, b in object_bytes.items()}
+
+
 def scatter_plan(table: np.ndarray, rows: np.ndarray, slot_ptrs: np.ndarray):
     """(dst, src, sizes) int64 arrays copying staged objects into device rows.
     ``table``: (src, base, stride, size, offset) per item of one key (the read's

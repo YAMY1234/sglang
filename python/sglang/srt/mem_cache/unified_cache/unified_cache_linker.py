@@ -1411,7 +1411,10 @@ class UnifiedCacheLinkerWrapper:
         from sglang.srt.runtime_context import get_parallel
 
         slab = linker.staging_slab(
-            envs.SGLANG_LINKER_EARLY_GB.get(), envs.SGLANG_LINKER_EARLY_STATES.get()
+            envs.SGLANG_LINKER_EARLY_GB.get(),
+            envs.SGLANG_LINKER_EARLY_STATES.get(),
+            envs.SGLANG_LINKER_EARLY_PAGES.get(),
+            envs.SGLANG_LINKER_EARLY_NODE_GB.get(),
         )
         early = EarlyReads(slab, self._early_plan, linker.early_read)
         channel = EarlyChannel(self.pp_rank, get_parallel().pp_group, on_message=early.start)

@@ -974,20 +974,19 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
     # ---- SGLANG_LINKER_EARLY_READS: staged reads (linker_staging.py) -----------------
 
-    def staging_slab(self, gb: float, states: int):
+    def staging_slab(self, gb: float, states: int, pages: int = 0, node_gb: float = 0.0):
         """A pinned host slab of object slots, registered with the store: ``states``
-        for the state pool (MAMBA); the rest of ``gb`` as page slots of every other
-        pool (one per page and pool)."""
-        from sglang.srt.mem_cache.storage.mooncake_store.linker_staging import StagingSlab
+        for the state pool (MAMBA) and, per other pool, ``pages`` slots (the same on
+        every stage) within this GPU's share of ``node_gb``; with ``pages`` 0, the
+        rest of ``gb`` as page slots."""
+        from sglang.srt.mem_cache.storage.mooncake_store.linker_staging import StagingSlab, slab_pools
 
-        state_bytes = self.object_bytes.get(PoolName.MAMBA, 0) * states
-        page_bytes = sum(b for name, b in self.object_bytes.items()
-                         if name != PoolName.MAMBA and name in self.pool_group.sources)
-        pages = max(0, int(gb * 2**30 - state_bytes) // max(page_bytes, 1))
-        pools = {
-            name: (self.object_bytes[name], states if name == PoolName.MAMBA else pages)
-            for name in self.pool_group.sources
-        }
+        object_bytes = {name: self.object_bytes[name] for name in self.pool_group.sources}
+        if pages:
+            cap = int(node_gb * 2**30) // max(torch.cuda.device_count(), 1)
+        else:
+            pages, cap = 1 << 40, int(gb * 2**30)
+        pools = slab_pools(object_bytes, PoolName.MAMBA, pages, states, cap)
         size = StagingSlab.size_of(pools)
         buffer = torch.empty(size, dtype=torch.uint8, pin_memory=True)
         rc = self.storage.store.register_buffer(buffer.data_ptr(), size)

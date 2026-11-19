@@ -1100,6 +1100,10 @@ class Envs:
     # this many state slots, the rest page slots.
     SGLANG_LINKER_EARLY_READS = EnvBool(False)
     SGLANG_LINKER_EARLY_GB = EnvFloat(6.0)
+    # Page slots per stage, the same on every stage (0: size by SGLANG_LINKER_EARLY_GB),
+    # within the pinned budget per node split over its GPUs.
+    SGLANG_LINKER_EARLY_PAGES = EnvInt(40000)
+    SGLANG_LINKER_EARLY_NODE_GB = EnvFloat(36.0)
     SGLANG_LINKER_EARLY_STATES = EnvInt(32)
     SGLANG_LINKER_HELPER = EnvBool(False)
     SGLANG_LINKER_HELPER_SEGMENT_MB = EnvInt(0)
