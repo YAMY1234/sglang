@@ -2,6 +2,7 @@
 argmax at temperature 0 and a Gumbel-max sample otherwise."""
 
 import functools
+import logging
 from typing import Callable, Optional
 
 import torch
@@ -10,9 +11,11 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
+logger = logging.getLogger(__name__)
 
 # Measured fastest for 1-64 rows, where the per-block Philox work sets latency.
 _BLOCK = 1024
@@ -165,6 +168,23 @@ def _markov_sample_finish_kernel(
     tl.store(OUT + row, result.to(tl.int64))
 
 
+_inverse_cdf_noted = set()
+
+
+def _note_inverse_cdf(inverse: bool) -> None:
+    # Once per process and outcome; graph capture runs the step once per graph.
+    if inverse in _inverse_cdf_noted:
+        return
+    _inverse_cdf_noted.add(inverse)
+    if inverse:
+        logger.info("DSpark Markov draft steps draw by inverse CDF")
+    else:
+        logger.warning(
+            "DSpark Markov draft steps keep the Gumbel-max draw under "
+            "SGLANG_OPT_DSPARK_INVERSE_CDF_SAMPLING: vocab-sharded or logits not kept"
+        )
+
+
 def _mul32(a: torch.Tensor, b: int) -> tuple[torch.Tensor, torch.Tensor]:
     # (high, low) 32-bit words of a * b; b splits in halves so int64 never overflows.
     product_lo = a * (b & 0xFFFF)
@@ -312,6 +332,34 @@ class MarkovSampleStep:
             gather_logits,
             logits_out,
         )
+        if (
+            envs.SGLANG_OPT_DSPARK_INVERSE_CDF_SAMPLING.get()
+            and gather is None
+            and gather_logits is None
+            and logits_out is not None
+            and has_sampled_rows is not False
+            and vocab_start == 0
+        ):
+            from sglang.kernels.ops.speculative.dspark.inverse_cdf import (
+                markov_step_inverse_cdf,
+            )
+
+            _note_inverse_cdf(True)
+            return markov_step_inverse_cdf(
+                base_logits=base_logits,
+                bias=bias,
+                temperatures=temperatures,
+                key=key,
+                offset=offset,
+                step=step,
+                round_code=_ROUND_CODE[step_dtype],
+                logits_out=logits_out,
+            )
+        if (
+            envs.SGLANG_OPT_DSPARK_INVERSE_CDF_SAMPLING.get()
+            and has_sampled_rows is not False
+        ):
+            _note_inverse_cdf(False)
         rows, width = bias.shape
         launch = functools.partial(
             _launch_partial,

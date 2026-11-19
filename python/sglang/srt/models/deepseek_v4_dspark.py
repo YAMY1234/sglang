@@ -16,7 +16,8 @@ from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_gather
 from sglang.srt.environ import envs
-from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_distribution import draft_expert_distribution_scope
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
     is_unified_kv_triton,
@@ -39,6 +40,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner import get_is_capture_mode
@@ -46,6 +52,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models import deepseek_v4_boundary as hc_boundary
 from sglang.srt.models import deepseek_v4_mhc as mhc
 from sglang.srt.models.deepseek_common.utils import _is_cuda
+from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 from sglang.srt.models.deepseek_v4 import (
     DEEPSEEK_V4_STACKED_PARAMS_MAPPING,
     DeepseekV4CudaDecoderLayer,
@@ -71,6 +78,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.dspark_components.dspark_config import (
     builds_confidence_head,
+    dspark_num_stages,
     get_dspark_sample_from_anchor,
     parse_dspark_draft_config,
 )
@@ -139,6 +147,17 @@ class DSparkAttention(MqaAttentionBase):
 
         self.alt_streams = alt_streams
         self._multi_stream_bs_limit = 128 if get_platform().is_blackwell else 64
+        # wq_a | wkv as one GEMM on the serial path; stacked from the checkpoint's wq_a and
+        # wkv at load (_stack_wqkv_a), which stay for the multi-stream path and context KV.
+        self.wqkv_a_stacked: Optional[ReplicatedLinear] = None
+        if _is_cuda and envs.SGLANG_OPT_DSPARK_FUSED_WQKV_A.get():
+            self.wqkv_a_stacked = ReplicatedLinear(
+                self.hidden_size,
+                self.q_lora_rank + self.head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("wqkv_a_stacked", prefix),
+            )
         if _is_npu:
             self.register_buffer(
                 "_q_post_norm_weight",
@@ -188,9 +207,11 @@ class DSparkAttention(MqaAttentionBase):
         x: torch.Tensor,
         positions: torch.Tensor,
         q_out: Optional[torch.Tensor] = None,
+        q_lora: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        q, _ = self.wq_a(x)
-        q = self.q_norm(q)
+        if q_lora is None:
+            q_lora, _ = self.wq_a(x)
+        q = self.q_norm(q_lora)
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if not self.q_head_norm:
@@ -300,6 +321,27 @@ class DSparkAttention(MqaAttentionBase):
                 )
             q = self._compute_q(hidden_states, positions, q_out=q_out)
             current_stream.wait_stream(stream_kv)
+        elif (
+            self.wqkv_a_stacked is not None
+            and not is_unified_kv_triton()
+            and not pool.uniform_fp8
+        ):
+            # The KV store reads the strided kv half in place (row stride q_lora_rank + head_dim).
+            qkv_a, _ = self.wqkv_a_stacked(hidden_states)
+            kv = qkv_a[..., self.q_lora_rank :]
+            self._store_block_kv(
+                kv=kv,
+                positions=positions,
+                forward_batch=forward_batch,
+                attn_backend=attn_backend,
+                pool=pool,
+            )
+            q = self._compute_q(
+                hidden_states,
+                positions,
+                q_out=q_out,
+                q_lora=qkv_a[..., : self.q_lora_rank],
+            )
         else:
             kv = self.kv_proj_only(hidden_states)
             self._store_block_kv(
@@ -379,6 +421,23 @@ class DSparkAttention(MqaAttentionBase):
     @staticmethod
     def accepts_mxfp8_swizzled_input():
         return False
+
+
+def _stack_wqkv_a(*, stages: Iterable[nn.Module], loaded_params: set) -> None:
+    # Runs on the checkpoint tensors, before process_weights_after_loading converts all
+    # three linears, so wqkv_a_stacked gets the quantized layout of the concatenation.
+    for i, stage in enumerate(stages):
+        attn = stage.self_attn
+        if attn.wqkv_a_stacked is None:
+            continue
+        loaded = {f"stages.{i}.self_attn.{n}.weight" for n in ("wq_a", "wkv")}
+        if not loaded <= loaded_params:
+            continue
+        stacked = attn.wqkv_a_stacked
+        stacked.weight.data.copy_(torch.cat([attn.wq_a.weight, attn.wkv.weight]))
+        stacked.weight_scale_inv.data.copy_(
+            torch.cat([attn.wq_a.weight_scale_inv, attn.wkv.weight_scale_inv])
+        )
 
 
 def _resolve_dspark_pool() -> DeepSeekV4TokenToKVPool:
@@ -720,10 +779,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         )
         self.sample_from_anchor = get_dspark_sample_from_anchor(config)
         self.block_size = self.gamma
-        if dspark_config.target_layer_ids is not None:
-            self.num_stages = len(dspark_config.target_layer_ids)
-        else:
-            self.num_stages = int(getattr(config, "num_nextn_predict_layers", 1) or 1)
+        self.num_stages = dspark_num_stages(draft_hf_config=config)
 
         target_num_layers = (
             int(dspark_config.num_target_layers)
@@ -817,6 +873,22 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self._opt_markov_w2_tp_shard = envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.get()
         if self.lm_head is not None:
             self.markov_head.configure_tp_shard(lm_head=self.lm_head)
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return ModelConfigForExpertLocation(
+            num_layers=dspark_num_stages(draft_hf_config=config),
+            num_logical_experts=_dspark_stage_config(config).n_routed_experts,
+            num_groups=None,
+        )
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        return {
+            stage.layer_id: stage.mlp.get_moe_weights()
+            for stage in self.stages
+            if isinstance(stage.mlp, DeepseekV2MoE)
+        }
 
     @property
     def enable_confidence_head(self) -> bool:
@@ -934,13 +1006,20 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         pre = None
         if _is_cuda:
             residual_batch.start(forward_batch)
-        # Draft stages do not have recorder layer indices.
-        with get_global_expert_distribution_recorder().disable_this_region():
+        with draft_expert_distribution_scope() as draft_recorder:
             for stage in self.stages:
-                if _is_cuda:
-                    x = stage(positions, x, forward_batch)
-                else:
-                    x, pre = stage(positions, x, forward_batch, pre)
+                with (
+                    draft_recorder.with_current_layer(stage.layer_id)
+                    if draft_recorder is not None
+                    and not check_cuda_graph_backend(
+                        Phase.PREFILL, Backend.TC_PIECEWISE
+                    )
+                    else nullcontext()
+                ):
+                    if _is_cuda:
+                        x = stage(positions, x, forward_batch)
+                    else:
+                        x, pre = stage(positions, x, forward_batch, pre)
         if _is_cuda:
             x = residual_batch.read_output(
                 x, forward_batch, hc_boundary.FinalRead(), None
@@ -1094,6 +1173,8 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self._assert_confidence_head_loaded(
             params_dict=params_dict, loaded_params=loaded_params
         )
+        if _is_cuda:
+            _stack_wqkv_a(stages=self.stages, loaded_params=loaded_params)
         self.post_load_weights()
 
     def post_load_weights(self, is_nextn=False, weight_names=None):

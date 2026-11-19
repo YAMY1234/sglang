@@ -505,6 +505,29 @@ class Req(ReqDllmMixin):
         self.full_untruncated_fill_ids = array("q")
         # This round extends fill ids [prefix_len, extend_end).
         self.extend_end: Optional[int] = None
+        # PD decode with --dsv41-encoder-only-prefill: the prompt position where
+        # the transferred encoder prefix ends and this worker's extend begins.
+        self.dsv41_tail_start: Optional[int] = None
+        # SGLANG_DSV41_FUSED_TAIL: the tail is fed through verify steps instead.
+        # feed_floor is the tail start (the late layers' SWA floor), feed_next the
+        # position of the next scheduled step's first verify row (None once the
+        # whole tail is scheduled), and feed_prompt_left the prompt tokens still to
+        # come back in accepted runs, which never become output.
+        self.dsv41_feed_floor: Optional[int] = None
+        self.dsv41_feed_next: Optional[int] = None
+        self.dsv41_feed_prompt_left: int = 0
+        # SGLANG_DSV41_TAIL_STAGE: the transferred prefix ends at the late-fed split,
+        # and the tail stage runs the late layers over the window below it.
+        self.dsv41_late_fed: bool = False
+        # Prefill: the prompt length before the split, the late window's first
+        # position and the capture slot it ships from.
+        self.dsv41_prompt_len: Optional[int] = None
+        self.dsv41_late_capture_start: Optional[int] = None
+        self.dsv41_late_capture_slot: Optional[int] = None
+        # Prefill: the tail slot's write ended and was reported ready.
+        self.dsv41_tail_written: bool = False
+        # Decode: the staging slot the tail server's draft captures land in.
+        self.dsv41_tail_aux_slot: Optional[int] = None
         self.dllm_initialized: bool = False
 
         self.session = session
@@ -1228,6 +1251,10 @@ class Req(ReqDllmMixin):
             max_prefix_len = min(max_prefix_len, self.dllm_block_offset)
         if self.return_logprob and self.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
+        if self.dsv41_late_capture_start is not None:
+            # SGLANG_DSV41_TAIL_STAGE: this forward captures the late window's
+            # rows, so a cache hit stops before it.
+            max_prefix_len = min(max_prefix_len, self.dsv41_late_capture_start)
         if self.is_dllm():
             # Appended masks and a partial prompt/output block are not reusable
             # KV: bidirectional attention depends on the rest of that block.
@@ -1523,6 +1550,11 @@ class Req(ReqDllmMixin):
         self.temp_input_top_logprobs_idx = None
         self.temp_input_token_ids_logprobs_val = None
         self.temp_input_token_ids_logprobs_idx = None
+        # A fed tail restarts from prefill like any retracted split request.
+        self.dsv41_feed_floor = None
+        self.dsv41_feed_next = None
+        self.dsv41_feed_prompt_left = 0
+        self.dsv41_late_fed = False
         self.mamba_branching_seqlen = None
         self.already_computed = 0
         self.kv.reset_for_retract()
@@ -2031,6 +2063,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Per engram layer, the rows the scheduler staged (EngramRowStager).
     engram_staged_rows: Optional[StagedRows] = None
     encoder_swa_reset: Optional[List[bool]] = None
+    # DeepSeek-V4.1 fused decode tails, decode steps only, rebuilt every step:
+    # [bs, verify width] int64 prompt token forced after each verify row (-1:
+    # verify as usual; -2: as usual, keeping the served accept), and [bs] int64
+    # late-layer SWA floor (0 for other requests).
+    dsv41_forced_tokens: Optional[torch.Tensor] = None
+    dsv41_swa_floor: Optional[torch.Tensor] = None
 
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
     seq_lens: torch.Tensor = None  # shape: [b], int64
@@ -3604,6 +3642,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     if (
                         req.decode_batch_idx >= 1
                         and req.kv.holds_kv
+                        # A fed tail's seqlen counts prompt tokens its KV has not
+                        # reached; it keeps its window until the first output.
+                        and (req.dsv41_feed_floor is None or req.output_ids)
                         and window_evict_due(req)
                     ):
                         # Each window rechecks its own cursor against

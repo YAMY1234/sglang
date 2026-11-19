@@ -725,6 +725,16 @@ class TpModelWorker(BaseTpWorker):
                     can_run_graph=can_run_cuda_graph,
                 )
 
+            if logits_output is None:
+                # DeepSeek-V4.1 encoder-only prefill stops at the last KV source
+                # and has nothing to sample; decode samples the first token.
+                batch_result.next_token_ids = torch.zeros(
+                    len(forward_batch.seq_lens),
+                    dtype=torch.long,
+                    device=forward_batch.input_ids.device,
+                )
+                return batch_result
+
             capture_pre_sample_logits(batch, forward_batch, logits_output)
 
             if is_verify:

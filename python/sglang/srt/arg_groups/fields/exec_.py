@@ -1174,7 +1174,7 @@ class ExecOffload(msgspec.Struct):
         Optional[Dict[str, Any]],
         Arg(
             help="Where the DeepSeek-V4.1 Engram tables live, as JSON: "
-            "'placement' gpu|cpu, 'replication' none|per_node, 'lookup' "
+            "'placement' gpu|cpu, 'replication' none|per_node|node_shared, 'lookup' "
             "auto|all_reduce|reduce_scatter|all_to_all|peer_read; an omitted key "
             "takes the first value. "
             "See docs/advanced_features/engram.",

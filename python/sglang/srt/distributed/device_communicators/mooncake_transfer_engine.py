@@ -334,10 +334,14 @@ def maybe_init_shared_mooncake_transfer_engine(*, gpu_id: int) -> None:
     1) PD disaggregation uses mooncake for KV transfer (prefill/decode)
     2) HiCache uses mooncake storage backend
     3) Encoder disaggregation uses mooncake
+    4) The DeepSeek-V4.1 tail server (PP rank 1 of the encoder-only prefills)
     """
     use_mooncake_te = (
         (
-            get_disagg().disaggregation_mode != "null"
+            (
+                get_disagg().disaggregation_mode != "null"
+                or get_disagg().dsv41_tail_stage_server
+            )
             and get_disagg().disaggregation_transfer_backend == "mooncake"
         )
         or (

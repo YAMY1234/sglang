@@ -35,6 +35,12 @@ class StateType(str, enum.Enum):
     # One item per request row (req_pool_idx), sent row to row: the DeepSeek-V4
     # DSpark draft's SWA valid-from.
     REQUEST_ROW = "request_row"
+    # SGLANG_DSV41_TAIL_STAGE: what the DeepSeek-V4.1 tail server sends decode as PP
+    # rank 1. The late layers' SWA of a tail's window, one item per logical SWA page
+    # of one layer (dsv41_tail_stage.layout).
+    DSV41_TAIL_SWA = "dsv41_tail_swa"
+    # The tail rows' DSpark target captures, one item per tail.
+    DSV41_TAIL_DRAFT_AUX = "dsv41_tail_draft_aux"
     # A block-scaled KV dtype keeps its per-block scales in buffers parallel to
     # K/V, one component per sub-pool so each carries the index payload of the
     # KV it describes (whole sequence for full attention, window for SWA).

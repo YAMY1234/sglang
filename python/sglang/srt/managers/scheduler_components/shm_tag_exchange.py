@@ -17,6 +17,10 @@ Enabled by SGLANG_OPT_SCHEDULER_SHM_SYNC=1 (default off). Groups that span hosts
 keep the stock gloo path unless SGLANG_OPT_SCHEDULER_SHM_SYNC_MULTIHOST=1 is also
 set: then each host exchanges through shared memory and only the host leaders
 meet in one small gloo all_gather (HierTagExchange).
+
+SGLANG_DP_SYNC_SHM_EXCHANGE=1 (default off) routes the DP-attention MLP sync rows
+through the same tables (get_dp_sync_exchange): whole rows are stored and read as
+arrays, and host leaders meet over TCP, one link for two hosts or a mesh beyond.
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ from multiprocessing import shared_memory
 from typing import Dict, List, Optional, Sequence
 from unittest.mock import patch
 
+import numpy as np
 import torch
 import torch.distributed as dist
 
@@ -85,6 +90,7 @@ class ShmTagExchange:
         self.table = (ctypes.c_int64 * (2 * self.rows * width)).from_buffer(
             self.shm.buf
         )
+        self._view = np.frombuffer(self.shm.buf, dtype=np.int64)
         dist.barrier(group=group)
 
     def allgather(self, values: Sequence[int]) -> List[List[int]]:
@@ -109,6 +115,48 @@ class ShmTagExchange:
         self.seq += 1
         tag = self.seq & _TAG_MASK
         return self._wait_rows((self.seq & 1) * self.rows * self.width, n, tag)
+
+    def allgather_array(self, values: np.ndarray) -> np.ndarray:
+        """allgather of an int64 vector, each value in [0, 2**40): [world, n]."""
+        assert values.shape[0] <= self.width and self.rows == self.world
+        self.seq += 1
+        tag = self.seq & _TAG_MASK
+        table = self._table_half(self.seq, values.shape[0])
+        _store_tagged(table[self.rank], values, tag)
+        return self._wait_table(table, tag)
+
+    def publish_array(self, rows: np.ndarray) -> None:
+        """publish_rows for an int64 [self.rows, n] array."""
+        self.seq += 1
+        _store_tagged(
+            self._table_half(self.seq, rows.shape[1]), rows, self.seq & _TAG_MASK
+        )
+
+    def read_array(self, n: int) -> np.ndarray:
+        self.seq += 1
+        return self._wait_table(self._table_half(self.seq, n), self.seq & _TAG_MASK)
+
+    def _table_half(self, seq: int, n: int) -> np.ndarray:
+        base = (seq & 1) * self.rows * self.width
+        half = self._view[base : base + self.rows * self.width]
+        return half.reshape(self.rows, self.width)[:, :n]
+
+    def _wait_table(self, table: np.ndarray, tag: int) -> np.ndarray:
+        deadline = None
+        while True:
+            # A ufunc reads each element with one 64-bit load; a memcpy-based copy
+            # could tear an element across a concurrent store.
+            snap = np.add(table, 0)
+            if ((snap >> _VAL_BITS) == tag).all():
+                return snap & _VAL_MASK
+            if deadline is None:
+                deadline = time.monotonic() + self.timeout_s
+            elif time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"shm exchange timed out after {self.timeout_s:.0f}s "
+                    f"(seq {self.seq}); a peer scheduler is stuck or dead"
+                )
+            os.sched_yield()
 
     def _store(self, start: int, values: Sequence[int], tag: int) -> None:
         tagged = tag << _VAL_BITS
@@ -142,7 +190,7 @@ class ShmTagExchange:
 
     def close(self):
         try:
-            del self.table
+            del self.table, self._view
             self.shm.close()
             if self._creator:
                 self.shm.unlink()
@@ -154,7 +202,13 @@ class _LeaderLink:
     """Persistent TCP connection between the two host leaders; one send and one exact
     receive per call (payloads are a few hundred bytes, so the sends never block)."""
 
-    def __init__(self, leaders: dist.ProcessGroup, first: bool, timeout_s: float):
+    def __init__(
+        self,
+        leaders: dist.ProcessGroup,
+        first: bool,
+        timeout_s: float,
+        spin: bool = False,
+    ):
         from sglang.srt.utils.network import get_local_ip_auto
 
         server = None
@@ -174,9 +228,20 @@ class _LeaderLink:
             self.sock = socket.create_connection(box[0], timeout=timeout_s)
         self.sock.settimeout(timeout_s)
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.timeout_s = timeout_s
+        # Spin on a non-blocking socket: no sleep and wakeup per receive.
+        self.spin = spin
+        if spin:
+            self.sock.setblocking(False)
 
     def swap(self, payload: bytes) -> bytes:
-        self.sock.sendall(len(payload).to_bytes(4, "little") + payload)
+        msg = len(payload).to_bytes(4, "little") + payload
+        if self.spin:
+            deadline = time.monotonic() + self.timeout_s
+            _spin_send(self.sock, msg, deadline)
+            size = int.from_bytes(_spin_recv(self.sock, 4, deadline), "little")
+            return _spin_recv(self.sock, size, deadline)
+        self.sock.sendall(msg)
         size = int.from_bytes(self._recv_exact(4), "little")
         return self._recv_exact(size)
 
@@ -192,11 +257,121 @@ class _LeaderLink:
         return bytes(buf)
 
 
+class _LeaderMesh:
+    """Persistent TCP connections between every pair of host leaders (more than two
+    hosts). A call sends this leader's rows to every peer, then spins until each peer
+    has delivered its rows: one network hop, where a gloo all_gather walks a ring."""
+
+    def __init__(self, leaders: dist.ProcessGroup, timeout_s: float):
+        from sglang.srt.utils.network import get_local_ip_auto
+
+        n = dist.get_world_size(leaders)
+        me = dist.get_rank(leaders)
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.bind(("0.0.0.0", 0))
+        server.listen(n)
+        addrs: List[Optional[tuple]] = [None] * n
+        dist.all_gather_object(
+            addrs, (get_local_ip_auto(), server.getsockname()[1]), group=leaders
+        )
+        # Leader j connects to every leader i < j and says who it is.
+        self.peers: Dict[int, socket.socket] = {}
+        for i in range(me):
+            sock = socket.create_connection(addrs[i], timeout=timeout_s)
+            sock.sendall(me.to_bytes(4, "little"))
+            self.peers[i] = sock
+        server.settimeout(timeout_s)
+        for _ in range(n - 1 - me):
+            sock, _ = server.accept()
+            sock.settimeout(timeout_s)
+            j = int.from_bytes(_recv_exact(sock, 4), "little")
+            self.peers[j] = sock
+        server.close()
+        for sock in self.peers.values():
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock.setblocking(False)
+        self.me = me
+        self.n = n
+        self.timeout_s = timeout_s
+
+    def all_gather(self, payload: bytes) -> List[bytes]:
+        msg = len(payload).to_bytes(4, "little") + payload
+        deadline = time.monotonic() + self.timeout_s
+        for sock in self.peers.values():
+            _spin_send(sock, msg, deadline)
+        out: List[bytes] = []
+        for i in range(self.n):
+            if i == self.me:
+                out.append(payload)
+            else:
+                sock = self.peers[i]
+                size = int.from_bytes(_spin_recv(sock, 4, deadline), "little")
+                out.append(_spin_recv(sock, size, deadline))
+        return out
+
+
+def _recv_exact(sock: socket.socket, n: int) -> bytes:
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise RuntimeError("Shared-memory exchange leader link closed by a peer")
+        buf += chunk
+    return bytes(buf)
+
+
+def _spin_send(sock: socket.socket, msg: bytes, deadline: float) -> None:
+    view = memoryview(msg)
+    while view:
+        try:
+            view = view[sock.send(view) :]
+        except BlockingIOError:
+            _spin_wait(deadline)
+
+
+def _spin_recv(sock: socket.socket, n: int, deadline: float) -> bytes:
+    buf = bytearray()
+    while len(buf) < n:
+        try:
+            chunk = sock.recv(n - len(buf))
+        except BlockingIOError:
+            _spin_wait(deadline)
+            continue
+        if not chunk:
+            raise RuntimeError("Shared-memory exchange leader link closed by a peer")
+        buf += chunk
+    return bytes(buf)
+
+
+def _spin_wait(deadline: float) -> None:
+    if time.monotonic() > deadline:
+        raise RuntimeError(
+            "Shared-memory exchange leader link timed out; a peer scheduler is "
+            "stuck or dead"
+        )
+    os.sched_yield()
+
+
+def _store_tagged(dst: np.ndarray, values: np.ndarray, tag: int) -> None:
+    if values.size and (values.min() < 0 or values.max() > _VAL_MASK):
+        raise ValueError("shm exchange value out of range")
+    # A ufunc writes each element with one 64-bit store (see _wait_table).
+    np.bitwise_or(values, tag << _VAL_BITS, out=dst)
+
+
 class HierTagExchange:
     """ShmTagExchange.allgather for a group that spans hosts: ranks exchange through
     shared memory on their host, and only the host leaders run one gloo all_gather."""
 
-    def __init__(self, group: dist.ProcessGroup, kind: str, width: int = 8):
+    def __init__(
+        self,
+        group: dist.ProcessGroup,
+        kind: str,
+        width: int = 8,
+        leader_tcp: Optional[bool] = None,
+    ):
+        """``leader_tcp``: None follows SGLANG_OPT_SCHEDULER_SHM_SYNC_LEADER_TCP (two
+        hosts); True spins on TCP between the leaders at any host count."""
         ranks = dist.get_process_group_ranks(group)
         me = dist.get_rank(group)
         hostnames: List[Optional[str]] = [None] * len(ranks)
@@ -225,12 +400,19 @@ class HierTagExchange:
         )
         # Two hosts: the leaders swap rows over one TCP connection instead of a gloo all_gather.
         self.link = None
-        if (
-            self.is_leader
-            and len(self.members) == 2
-            and envs.SGLANG_OPT_SCHEDULER_SHM_SYNC_LEADER_TCP.get()
-        ):
-            self.link = _LeaderLink(self.leaders, host == 0, self.local.timeout_s)
+        self.mesh = None
+        if leader_tcp is None:
+            leader_tcp = envs.SGLANG_OPT_SCHEDULER_SHM_SYNC_LEADER_TCP.get()
+            spin = False
+            mesh = False
+        else:
+            spin = mesh = leader_tcp
+        if self.is_leader and len(self.members) == 2 and leader_tcp:
+            self.link = _LeaderLink(
+                self.leaders, host == 0, self.local.timeout_s, spin=spin
+            )
+        elif self.is_leader and len(self.members) > 2 and mesh:
+            self.mesh = _LeaderMesh(self.leaders, self.local.timeout_s)
 
     def allgather(self, values: Sequence[int]) -> List[List[int]]:
         n = len(values)
@@ -257,6 +439,39 @@ class HierTagExchange:
         self.full.publish_rows(table)
         return table
 
+    def allgather_array(self, values: np.ndarray) -> np.ndarray:
+        """ShmTagExchange.allgather_array across hosts: [world, n] in group-rank order."""
+        n = values.shape[0]
+        rows_here = self.local.allgather_array(values)
+        if not self.is_leader:
+            return self.full.read_array(n)
+        table = np.empty((self.world, n), dtype=np.int64)
+        for members, rows in zip(self.members, self._host_rows(rows_here)):
+            table[members] = rows
+        self.full.publish_array(table)
+        return table
+
+    def _host_rows(self, rows_here: np.ndarray) -> List[np.ndarray]:
+        """Every host's local rows, in host order, as [ranks on that host, n]."""
+        n = rows_here.shape[1]
+        if self.link is not None:
+            peer = np.frombuffer(self.link.swap(rows_here.tobytes()), dtype=np.int64)
+            peer = peer.reshape(-1, n)
+            return [rows_here, peer] if self.host == 0 else [peer, rows_here]
+        if self.mesh is not None:
+            return [
+                np.frombuffer(raw, dtype=np.int64).reshape(-1, n)
+                for raw in self.mesh.all_gather(rows_here.tobytes())
+            ]
+        flat = torch.zeros(self.local_max * n, dtype=torch.int64)
+        flat[: rows_here.size] = torch.from_numpy(rows_here.reshape(-1))
+        outs = [torch.empty_like(flat) for _ in self.members]
+        dist.all_gather(outs, flat, group=self.leaders)
+        return [
+            out.numpy()[: len(m) * n].reshape(len(m), n)
+            for out, m in zip(outs, self.members)
+        ]
+
 
 _EXCHANGES: Dict[tuple, object] = {}
 
@@ -271,41 +486,64 @@ def get_shm_exchange(
         return None
     key = (id(group), kind)
     if key not in _EXCHANGES:
-        if (
-            not envs.SGLANG_OPT_SCHEDULER_SHM_SYNC.get()
-            # an idle rank 0 sleeps in its poller; the waiting ranks would spin meanwhile
-            or get_device().sleep_on_idle
-            or dist.get_world_size(group) <= 1
-        ):
-            _EXCHANGES[key] = None
-        else:
-            from sglang.srt.distributed.parallel_state import in_the_same_node_as
-
-            same = in_the_same_node_as(group, source_rank=0)
-            if all(same):
-                _EXCHANGES[key] = ShmTagExchange(group, kind)
-                logger.info(
-                    "Shared-memory exchange '%s' enabled for a %d-rank group",
-                    kind,
-                    dist.get_world_size(group),
-                )
-            elif (
-                multihost
-                and envs.SGLANG_OPT_SCHEDULER_SHM_SYNC_MULTIHOST.get()
-                and dist.get_world_size() == dist.get_world_size(group)
-            ):
-                # Only when this group is the whole default group, so the subgroup
-                # creation inside is collective over exactly these ranks.
-                _EXCHANGES[key] = HierTagExchange(group, kind)
-                logger.info(
-                    "Hierarchical shared-memory exchange '%s' enabled for a %d-rank group on %d hosts",
-                    kind,
-                    dist.get_world_size(group),
-                    len(_EXCHANGES[key].members),
-                )
-            else:
-                _EXCHANGES[key] = None
+        _EXCHANGES[key] = (
+            _new_exchange(
+                group,
+                kind,
+                multihost=multihost
+                and envs.SGLANG_OPT_SCHEDULER_SHM_SYNC_MULTIHOST.get(),
+            )
+            if envs.SGLANG_OPT_SCHEDULER_SHM_SYNC.get()
+            else None
+        )
     return _EXCHANGES[key]
+
+
+def get_dp_sync_exchange(group: dist.ProcessGroup, width: int):
+    """The exchange for the DP-attention MLP sync rows (SGLANG_DP_SYNC_SHM_EXCHANGE),
+    ``width`` values per rank; collective on first call, like get_shm_exchange."""
+    if not envs.SGLANG_DP_SYNC_SHM_EXCHANGE.get():
+        return None
+    key = (id(group), "dpsync", width)
+    if key not in _EXCHANGES:
+        _EXCHANGES[key] = _new_exchange(
+            group, "dps", width=width, multihost=True, leader_tcp=True
+        )
+    return _EXCHANGES[key]
+
+
+def _new_exchange(
+    group: dist.ProcessGroup,
+    kind: str,
+    *,
+    multihost: bool,
+    width: int = 8,
+    leader_tcp: Optional[bool] = None,
+):
+    # an idle rank 0 sleeps in its poller; the waiting ranks would spin meanwhile
+    if get_device().sleep_on_idle or dist.get_world_size(group) <= 1:
+        return None
+    from sglang.srt.distributed.parallel_state import in_the_same_node_as
+
+    if all(in_the_same_node_as(group, source_rank=0)):
+        logger.info(
+            "Shared-memory exchange '%s' enabled for a %d-rank group",
+            kind,
+            dist.get_world_size(group),
+        )
+        return ShmTagExchange(group, kind, width)
+    # Only when this group is the whole default group, so the subgroup creation
+    # inside is collective over exactly these ranks.
+    if not multihost or dist.get_world_size() != dist.get_world_size(group):
+        return None
+    exchange = HierTagExchange(group, kind, width, leader_tcp=leader_tcp)
+    logger.info(
+        "Hierarchical shared-memory exchange '%s' enabled for a %d-rank group on %d hosts",
+        kind,
+        dist.get_world_size(group),
+        len(exchange.members),
+    )
+    return exchange
 
 
 def fold_u64(x: int) -> List[int]:
