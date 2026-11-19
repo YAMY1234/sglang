@@ -18,6 +18,7 @@ from sglang.srt.layers.moe.topk import (
 from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
+from sglang.srt.utils.log_utils import print_info_once
 
 # Per-forward cache of the gate's row masks, installed by mega_gate_forward_scope.
 _ROW_MASKS_ATTR = "_mega_gate_row_masks"
@@ -145,16 +146,32 @@ def mega_gate_forward_scope(forward_batch):
 def _gate_row_masks(moe, num_tokens, bound, image_input_ids, device, forward_batch):
     """(valid-row mask, image-token mask) for the gate, built once per forward."""
     cache = getattr(forward_batch, _ROW_MASKS_ATTR, None)
+    # A graph captured inside a forward (decoder replay tail) must build its own
+    # masks: eager ones from its warm-up runs are freed when the forward ends.
+    graph = (
+        forward_batch
+        if envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE_MASKS_PER_CAPTURE.get()
+        and torch.cuda.is_current_stream_capturing()
+        else None
+    )
     key = (
         num_tokens,
         id(bound) if bound is not None else None,
         id(image_input_ids) if image_input_ids is not None else None,
+        id(graph) if graph is not None else None,
     )
     if isinstance(cache, dict):
         hit = cache.get(key)
         # The cached inputs are held, so their ids cannot be reused this forward.
-        if hit is not None and hit[0] is bound and hit[1] is image_input_ids:
+        if (
+            hit is not None
+            and hit[0] is bound
+            and hit[1] is image_input_ids
+            and hit[4] is graph
+        ):
             return hit[2], hit[3]
+    if graph is not None:
+        print_info_once("MegaGate row masks built inside the CUDA graph capture")
     valid = None
     if bound is not None:
         valid = (
@@ -165,7 +182,7 @@ def _gate_row_masks(moe, num_tokens, bound, image_input_ids, device, forward_bat
     if image_input_ids is not None:
         image = (image_input_ids[:num_tokens] == moe.config.image_token_id).contiguous()
     if isinstance(cache, dict):
-        cache[key] = (bound, image_input_ids, valid, image)
+        cache[key] = (bound, image_input_ids, valid, image, graph)
     return valid, image
 
 
