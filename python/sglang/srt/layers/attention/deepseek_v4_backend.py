@@ -5237,7 +5237,9 @@ class DeepseekV4AttnBackend(
             )
 
             build_pages = build_page_table_positions_small
-        elif self.fused_attn_metadata and seq_lens_casual.is_cuda:
+        elif self.fused_attn_metadata and not is_prefill and seq_lens_casual.is_cuda:
+            # Decode and verify tables span the whole context; a prefill table spans the
+            # batch's longest request, which the one-program-per-row kernel walks faster.
             build_pages = build_page_table_positions_2d
         # The c1/c2 slots and lengths from one launch; rows must be one per write.
         fused_low_ratio = (
