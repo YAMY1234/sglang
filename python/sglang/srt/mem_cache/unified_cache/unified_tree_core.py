@@ -17,6 +17,7 @@ cache for cache-level logic, but the TreeCore itself never touches it.
 from __future__ import annotations
 
 import logging
+import math
 import sys
 from array import array
 from collections import defaultdict
@@ -530,6 +531,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # Full KV on both tiers -> redundant host copy, reclaimed first by
         # write_back; insertion-ordered dict keeps victims TP-deterministic.
         self.full_host_duplicates: dict[NodeId, UnifiedTreeNode] = {}
+        # Per Full host-eviction call under DUPKEEP; see drive_host_eviction.
+        self._state_preserve_tail_frac: Optional[float] = None
+        self._state_preserve_reclaimed_tokens = 0
         # Rolling digest of reclaim victim ids, cross-checked across TP ranks.
         self.write_back_duplicate_reclaim_digest: int = 0
 
@@ -1979,8 +1983,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         result = DriveHostEvictionResult()
         comp = self.components_by_type.get(component_type)
         if comp is not None:
+            skip_reclaim = (
+                envs.SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM.get()
+                and component_type == BASE_COMPONENT_TYPE
+            )
             if (
-                not envs.SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM.get()
+                not skip_reclaim
                 and self.is_write_back
                 and component_type == BASE_COMPONENT_TYPE
             ):
@@ -1994,6 +2002,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 result.duplicate_reclaimed_tokens = result.tracker.get(
                     component_type, 0
                 )
+            self._state_preserve_tail_frac = (
+                envs.SGLANG_HICACHE_DUPKEEP_STATE_PRESERVE_TAIL_FRAC.get()
+                if skip_reclaim
+                and self.is_write_back
+                and envs.SGLANG_HICACHE_DUPKEEP_STATE_PRESERVE.get()
+                else None
+            )
+            self._state_preserve_reclaimed_tokens = 0
             comp.drive_host_eviction(
                 num_tokens,
                 result.tracker,
@@ -2001,6 +2017,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 result.host_frees,
                 cache_actions=result.cache_actions,
             )
+            result.duplicate_reclaimed_tokens += self._state_preserve_reclaimed_tokens
+            self._state_preserve_tail_frac = None
         return result
 
     def peek_host_eviction_candidates(
@@ -2073,6 +2091,22 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # Sweep after the walk: the dict must not be mutated mid-iteration.
         for nid in swept_ids:
             self.full_host_duplicates.pop(nid, None)
+
+    def _state_preserve_reclaim_candidates(
+        self, tail_frac: float
+    ) -> list[UnifiedTreeNode]:
+        """Full host duplicates a state-preserving reclaim may free, hottest last;
+        the coldest tail_frac by last access and the evictable D-leaves (the next
+        demotes) are spared, as freeing their host copy costs a fresh backup."""
+        live = [
+            node
+            for node in self.full_host_duplicates.values()
+            if node.component_data[BASE_COMPONENT_TYPE].value is not None
+            and node.component_data[BASE_COMPONENT_TYPE].host_value is not None
+        ]
+        live.sort(key=lambda node: node.last_access_time)
+        spared = math.ceil(len(live) * min(max(tail_frac, 0.0), 1.0))
+        return [n for n in live[spared:] if n not in self.evictable_device_leaves]
 
     def _can_reclaim_full_host_duplicate(self, node: UnifiedTreeNode) -> bool:
         """Full on both tiers, no in-flight DMA, no Full host lock; checked

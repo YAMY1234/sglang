@@ -625,6 +625,10 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     pub(crate) evictable_host_leaves: NodeSet,
     /// Full has no device LRU; track host/device duplicates in insertion order.
     pub(crate) full_coexisting_host_nodes: NodeSet,
+    /// Set for one Full host-eviction call under DUPKEEP (SGLANG_HICACHE_DUPKEEP_STATE_PRESERVE): a host
+    /// victim holding a Mamba state is first covered by reclaiming duplicates outside the coldest fraction.
+    pub(crate) state_preserve_tail_frac: Option<f64>,
+    pub(crate) state_preserve_reclaimed_tokens: usize,
     pub(crate) write_back_coexist_reclaim_digest: i64,
     /// Present only during a device-eviction step, including its cascades.
     tracked_unbacked_tokens: Option<usize>,
@@ -975,6 +979,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             evictable_device_leaves: NodeSet::new(),
             evictable_host_leaves: NodeSet::new(),
             full_coexisting_host_nodes: NodeSet::new(),
+            state_preserve_tail_frac: None,
+            state_preserve_reclaimed_tokens: 0,
             write_back_coexist_reclaim_digest: 0,
             tracked_unbacked_tokens: None,
             // Disabled components keep harmless empty lists, like component_states.
@@ -3232,13 +3238,29 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         num_tokens: usize,
         skip_full_duplicate_reclaim: bool,
     ) -> EvictionStepResult {
+        self.drive_host_eviction_with_state_preserve(
+            component_type,
+            num_tokens,
+            skip_full_duplicate_reclaim,
+            None,
+        )
+    }
+
+    /// `state_preserve_tail_frac` only acts when the duplicate reclaim is skipped (DUPKEEP).
+    pub fn drive_host_eviction_with_state_preserve(
+        &mut self,
+        component_type: ComponentType,
+        num_tokens: usize,
+        skip_full_duplicate_reclaim: bool,
+        state_preserve_tail_frac: Option<f64>,
+    ) -> EvictionStepResult {
         let mut result = EvictionStepResult::default();
         if let Some(component) = self.try_component_by_type_(component_type) {
             // The drive gates on the driven component's entry, so seed it.
             result.tracker.insert(component_type, 0);
-            if self.is_write_back
-                && !(skip_full_duplicate_reclaim && component_type == BASE_COMPONENT_TYPE)
-            {
+            let skip_reclaim =
+                skip_full_duplicate_reclaim && component_type == BASE_COMPONENT_TYPE;
+            if self.is_write_back && !skip_reclaim {
                 component.reclaim_coexisting_host_values(
                     self,
                     num_tokens,
@@ -3249,6 +3271,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 );
                 result.duplicate_reclaimed_tokens = result.tracker[&component_type];
             }
+            self.state_preserve_tail_frac = state_preserve_tail_frac
+                .filter(|_| self.is_write_back && skip_reclaim);
+            self.state_preserve_reclaimed_tokens = 0;
             component.drive_host_eviction(
                 self,
                 num_tokens,
@@ -3257,8 +3282,32 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 &mut result.host_frees,
                 &mut result.cache_actions,
             );
+            result.duplicate_reclaimed_tokens += self.state_preserve_reclaimed_tokens;
+            self.state_preserve_tail_frac = None;
         }
         result
+    }
+
+    /// Full host duplicates a state-preserving reclaim may free, hottest last: the coldest
+    /// `tail_frac` by last access and every evictable device leaf (the next demotes) are spared,
+    /// since freeing their host copy would cost a fresh backup on demotion (the DUPKEEP ping-pong).
+    pub(crate) fn state_preserve_reclaim_candidates_(&self, tail_frac: f64) -> Vec<NodeIdx_> {
+        let mut live: Vec<(i64, NodeIdx_)> = self
+            .full_coexisting_host_nodes
+            .iter()
+            .filter(|&id| {
+                let node = self.arena.node(id);
+                node.has_device_value(FULL) && node.has_host_value(FULL)
+            })
+            .map(|id| (self.arena.node(id).last_access_counter, id))
+            .collect();
+        live.sort_unstable();
+        let spared = ((live.len() as f64) * tail_frac.clamp(0.0, 1.0)).ceil() as usize;
+        live.into_iter()
+            .skip(spared)
+            .map(|(_, id)| id)
+            .filter(|&id| !self.evictable_device_leaves.contains(id))
+            .collect()
     }
 
     pub(crate) fn can_reclaim_coexisting_host_value_(

@@ -275,12 +275,36 @@ class FullComponent(TreeComponent):
     ) -> None:
         """Evict host leaves to free KV host pool space."""
         ct = self.component_type
-        leaves = self.tree_core.evictable_host_leaves
+        tc = self.tree_core
+        leaves = tc.evictable_host_leaves
+        hot_duplicates = None
         for x in self._host_eviction_walk(lambda _child, p: p in leaves):
             if tracker[ct] >= num_tokens:
                 break
             if x not in leaves:
                 continue
+            # Under DUPKEEP, cover a state-holding victim with hot duplicates first: freeing
+            # a host copy whose KV stays on device loses nothing, evicting the leaf loses its state.
+            if (
+                tc._state_preserve_tail_frac is not None
+                and x.component_data[ComponentType.MAMBA].host_value is not None
+            ):
+                if hot_duplicates is None:
+                    hot_duplicates = tc._state_preserve_reclaim_candidates(
+                        tc._state_preserve_tail_frac
+                    )
+                before = tracker[ct]
+                while tracker[ct] < num_tokens and hot_duplicates:
+                    node = hot_duplicates.pop()
+                    if not tc._can_reclaim_full_host_duplicate(node):
+                        continue
+                    tc._release_full_host_duplicate(
+                        node, tracker, device_frees, host_frees, cache_actions=cache_actions
+                    )
+                    tc.full_host_duplicates.pop(node.id, None)
+                tc._state_preserve_reclaimed_tokens += tracker[ct] - before
+                if tracker[ct] >= num_tokens:
+                    break
             self.tree_core._evict_host_leaf(
                 x, tracker, device_frees, host_frees, cache_actions=cache_actions
             )

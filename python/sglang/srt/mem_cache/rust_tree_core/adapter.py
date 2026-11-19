@@ -279,6 +279,12 @@ def _tracker_to_binding(tracker: dict[ComponentType, int]) -> dict[int, int]:
     return {int(component): freed for component, freed in tracker.items()}
 
 
+
+def _state_preserve_tail_frac() -> Optional[float]:
+    if not envs.SGLANG_HICACHE_DUPKEEP_STATE_PRESERVE.get():
+        return None
+    return envs.SGLANG_HICACHE_DUPKEEP_STATE_PRESERVE_TAIL_FRAC.get()
+
 class _RustKVCacheEventRecorder:
     """Expose the Rust event queue through the Python recorder interface."""
 
@@ -850,6 +856,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             int(component_type),
             num_tokens,
             envs.SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM.get(),
+            _state_preserve_tail_frac(),
         )
         result = self._fill_evict_result(binding_result, DriveHostEvictionResult())
         result.duplicate_reclaimed_tokens = binding_result.duplicate_reclaimed_tokens

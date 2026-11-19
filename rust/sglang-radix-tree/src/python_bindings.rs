@@ -2080,13 +2080,15 @@ macro_rules! tree_core_methods {
                 component_type: u8,
                 num_tokens: usize,
                 skip_full_duplicate_reclaim: bool,
+                state_preserve_tail_frac: Option<f64>,
             ) -> PyResult<HostEvictionResultBinding> {
                 let ct = parse_component_type(component_type)?;
                 let result = py.detach(move || {
-                    self.core().drive_host_eviction_with_options(
+                    self.core().drive_host_eviction_with_state_preserve(
                         ct,
                         num_tokens,
                         skip_full_duplicate_reclaim,
+                        state_preserve_tail_frac,
                     )
                 });
                 Ok(HostEvictionResultBinding {
@@ -3506,13 +3508,14 @@ macro_rules! tree_core_binding {
             }
 
             /// Evict up to num_tokens of one component's host resources.
-            #[pyo3(signature = (component_type, num_tokens, skip_full_duplicate_reclaim = false))]
+            #[pyo3(signature = (component_type, num_tokens, skip_full_duplicate_reclaim = false, state_preserve_tail_frac = None))]
             fn drive_host_eviction(
                 &self,
                 py: Python<'_>,
                 component_type: u8,
                 num_tokens: usize,
                 skip_full_duplicate_reclaim: bool,
+                state_preserve_tail_frac: Option<f64>,
             ) -> PyResult<HostEvictionResultBinding> {
                 catch_native_panic(|| {
                     self.inner.drive_host_eviction(
@@ -3520,6 +3523,7 @@ macro_rules! tree_core_binding {
                         component_type,
                         num_tokens,
                         skip_full_duplicate_reclaim,
+                        state_preserve_tail_frac,
                     )
                 })
             }

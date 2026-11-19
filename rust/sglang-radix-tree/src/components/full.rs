@@ -7,7 +7,7 @@ use std::collections::{BinaryHeap, HashMap};
 use tch::{Kind, Tensor};
 
 use crate::components::TreeComponent;
-use crate::components::{ComponentType, FULL};
+use crate::components::{ComponentType, FULL, MAMBA};
 use crate::node::ChildKeyType;
 use crate::node::Node;
 use crate::node::{NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx};
@@ -258,12 +258,43 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
             .iter()
             .map(|id| Reverse((strategy.get_priority(arena.node(id)), id)))
             .collect();
+        let mut hot_duplicates: Option<Vec<NodeIdx_>> = None;
         while tracker[&ct] < num_tokens {
             let Some(Reverse((_, x))) = heap.pop() else {
                 break;
             };
             if !tree_core.evictable_host_leaves.contains(x) {
                 continue;
+            }
+            // Under DUPKEEP, cover a state-holding victim with hot duplicates first: freeing a host
+            // copy whose KV stays on device loses nothing, evicting the leaf loses its Mamba state.
+            if let Some(tail_frac) = tree_core.state_preserve_tail_frac
+                && tree_core.arena.node(x).has_host_value(MAMBA)
+            {
+                let hot = hot_duplicates
+                    .get_or_insert_with(|| tree_core.state_preserve_reclaim_candidates_(tail_frac));
+                let before = tracker[&ct];
+                while tracker[&ct] < num_tokens {
+                    let Some(id) = hot.pop() else {
+                        break;
+                    };
+                    if !tree_core.can_reclaim_coexisting_host_value_(id, FULL) {
+                        continue;
+                    }
+                    tree_core.release_coexisting_host_value_(
+                        id,
+                        FULL,
+                        tracker,
+                        device_frees,
+                        host_frees,
+                        cache_actions,
+                    );
+                    tree_core.full_coexisting_host_nodes.discard(id);
+                }
+                tree_core.state_preserve_reclaimed_tokens += tracker[&ct] - before;
+                if tracker[&ct] >= num_tokens {
+                    break;
+                }
             }
             // The parent id is captured before the eviction frees the leaf.
             let parent = tree_core.arena.node(x).try_parent();

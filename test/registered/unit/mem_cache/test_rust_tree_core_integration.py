@@ -1951,6 +1951,161 @@ def test_full_host_duplicates_preserve_backup_order(backend, backup_again):
     core.sanity_check([], [])
 
 
+def _state_preserve_core(backend):
+    if backend == "rust":
+        core = _mamba_tree_core()
+    else:
+        from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+        from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
+        from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
+        from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
+
+        params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=Mock(spec=HybridReqToTokenPool),
+            token_to_kv_pool_allocator=None,
+            page_size=1,
+            tree_components=(ComponentType.FULL, ComponentType.MAMBA),
+        )
+        with get_context().override_server_args(
+            _mamba_cache_chunk_size=256, mamba_max_states_per_path=-1
+        ):
+            cache = SimpleNamespace(enable_session_radix_cache=False)
+            components = {
+                ComponentType.FULL: FullComponent(cache, params),
+                ComponentType.MAMBA: MambaComponent(cache, params),
+            }
+            core = UnifiedTreeCore(params, components)
+        for component in components.values():
+            component.tree_core = core
+    core.set_hicache_enabled()
+    core.is_write_back = True
+    return core
+
+
+def _back_up(core, node, host_kv, host_state=None, finish=True):
+    _, transfers = core.build_backup_spec(node)
+    if host_state is None:
+        transfers.pop(ComponentType.MAMBA, None)
+    else:
+        (state,) = transfers[ComponentType.MAMBA]
+        state.host_indices = torch.tensor([host_state], dtype=torch.int64)
+    core.mark_write_through_pending([node], node)
+    core.commit_backup(node, torch.tensor(host_kv, dtype=torch.int64), transfers)
+    if finish:
+        core.finish_write_through([node], node)
+
+
+def _stateful_host_leaf(core, token, slot):
+    """A host-only leaf holding its Mamba state (KV 100 + token, state 70 + token)."""
+    leaf = _mamba_insert(core, [token], [10 + token], slot).last_device_node
+    _back_up(core, leaf, [100 + token], 70 + token)
+    _accumulate_step(core.demote(leaf), {}, {}, {})
+    return leaf
+
+
+def _hot_duplicate(core, token, slot):
+    """An internal device node (a device child keeps it off the demote list) whose
+    KV also has a host copy (200 + token)."""
+    node = _mamba_insert(core, [token], [10 + token], slot).last_device_node
+    _mamba_insert(core, [token, token + 1], [10 + token, 11 + token], slot + 1)
+    _back_up(core, node, [200 + token])
+    return node
+
+
+def _drive_state_preserve(core, num_tokens, enabled=True, tail_frac=0.0):
+    host_frees, device_frees = {}, {}
+    with envs.SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM.override(
+        True
+    ), envs.SGLANG_HICACHE_DUPKEEP_STATE_PRESERVE.override(
+        enabled
+    ), envs.SGLANG_HICACHE_DUPKEEP_STATE_PRESERVE_TAIL_FRAC.override(
+        tail_frac
+    ):
+        step = core.drive_host_eviction(ComponentType.FULL, num_tokens)
+        reclaimed = step.duplicate_reclaimed_tokens
+        _accumulate_step(step, {}, device_frees, host_frees)
+    frees = {ct: torch.cat(t).tolist() for ct, t in host_frees.items() if t}
+    return frees, device_frees, reclaimed
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_dupkeep_state_preserve_reclaims_a_hot_duplicate_before_a_stateful_leaf(
+    backend, enabled
+):
+    core = _state_preserve_core(backend)
+    leaf = _stateful_host_leaf(core, 1, 7)
+    duplicate = _hot_duplicate(core, 3, 8)
+
+    frees, _, reclaimed = _drive_state_preserve(core, 1, enabled=enabled)
+
+    if enabled:
+        # The host copy of on-device KV goes; the leaf keeps its KV and Mamba state.
+        assert frees == {ComponentType.FULL: [203]}
+        assert reclaimed == 1
+        assert core.component_has_host_value_only(leaf, ComponentType.FULL)
+        assert core.component_has_host_value_only(leaf, ComponentType.MAMBA)
+        assert not core.is_backuped(duplicate)
+    else:
+        # Plain DUPKEEP: the LRU host leaf goes with its state, the duplicate stays.
+        assert frees == {ComponentType.FULL: [101], ComponentType.MAMBA: [71]}
+        assert reclaimed == 0
+        assert core.is_backuped(duplicate)
+    core.sanity_check([], [])
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+def test_dupkeep_state_preserve_spares_the_device_tail_and_the_next_demotes(backend):
+    core = _state_preserve_core(backend)
+    leaf = _stateful_host_leaf(core, 1, 7)
+    cold = _hot_duplicate(core, 3, 8)
+    hot = _hot_duplicate(core, 5, 10)
+    # A device leaf is the next demote: its host copy must stay so the demote is free.
+    next_demote = _mamba_insert(core, [9], [19], 12).last_device_node
+    _back_up(core, next_demote, [209])
+
+    # Of three duplicates the coldest quarter (ceil 0.75 = 1) is spared, the device
+    # leaf is spared, so one token comes from the hot node and one from the leaf.
+    frees, _, reclaimed = _drive_state_preserve(core, 2, tail_frac=0.25)
+
+    assert frees[ComponentType.FULL] == [205, 101]
+    assert frees[ComponentType.MAMBA] == [71]
+    assert reclaimed == 1
+    assert not core.is_backuped(hot)
+    # No new D2H is owed when the device tail later demotes.
+    assert core.is_backuped(cold) and core.is_backuped(next_demote)
+    _accumulate_step(core.demote(next_demote), {}, {}, {})
+    assert core.component_has_host_value_only(next_demote, ComponentType.FULL)
+    core.sanity_check([], [])
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+def test_dupkeep_state_preserve_skips_locked_and_in_flight_duplicates(backend):
+    core = _state_preserve_core(backend)
+    _stateful_host_leaf(core, 1, 7)
+    locked = _hot_duplicate(core, 3, 8)
+    host_lock = core.inc_host_lock_ref(locked)
+    # Mid-demotion: the backup is committed but its write is not acked yet.
+    in_flight = _mamba_insert(core, [5], [15], 10).last_device_node
+    _mamba_insert(core, [5, 6], [15, 16], 11)
+    _back_up(core, in_flight, [205], 75, finish=False)
+
+    frees, device_frees, reclaimed = _drive_state_preserve(core, 1)
+
+    # Neither duplicate may be reclaimed, so the stateful leaf is the victim.
+    assert frees == {ComponentType.FULL: [101], ComponentType.MAMBA: [71]}
+    assert reclaimed == 0
+    assert not device_frees.get(ComponentType.MAMBA)
+    assert core.is_backuped(locked)
+    assert core.get_component_device_value(
+        in_flight, ComponentType.MAMBA
+    ).tolist() == [10]
+    core.dec_host_lock_ref(locked, host_lock.to_dec_params())
+    core.finish_write_through([in_flight], in_flight)
+    core.sanity_check([], [])
+
+
 @pytest.mark.parametrize("backed_up", [False, True])
 def test_device_eviction_counts_only_full_tokens_without_a_host_copy(backed_up):
     core = _mamba_tree_core()

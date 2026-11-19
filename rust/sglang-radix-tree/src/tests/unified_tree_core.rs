@@ -7280,6 +7280,59 @@ fn drive_host_eviction_keeps_zero_delta_tracker_entries() {
 }
 
 #[test]
+fn drive_host_eviction_state_preserve_is_plain_dupkeep_without_mamba_states() {
+    // Two identical Full-only trees: a host-only leaf and a hot duplicate (internal device
+    // node with a host copy). With no Mamba state on any victim the state-preserving drive
+    // must free exactly what plain DUPKEEP frees, and report no duplicate reclaim.
+    let build = || {
+        let mut tc = core();
+        tc.set_hicache_enabled();
+        tc.is_write_back = true;
+        tc.insert(&insert_params(&vec![1], &[10]));
+        let leaf = tc.match_prefix(&match_params(&vec![1])).best_match_node_id;
+        tc.mark_write_through_pending(vec![leaf], /* ack_id = */ leaf)
+            .expect("live test node");
+        tc.commit_backup(leaf, Tensor::from_slice(&[100i64]), HashMap::new())
+            .expect("live test node");
+        tc.finish_write_through(vec![leaf], /* ack_id = */ leaf)
+            .expect("live test node");
+        tc.demote(leaf).expect("valid demote");
+        tc.insert(&insert_params(&vec![2, 3], &[20, 21]));
+        let dup = tc.match_prefix(&match_params(&vec![2])).best_match_node_id;
+        tc.mark_write_through_pending(vec![dup], /* ack_id = */ dup)
+            .expect("live test node");
+        tc.commit_backup(dup, Tensor::from_slice(&[200i64]), HashMap::new())
+            .expect("live test node");
+        tc.finish_write_through(vec![dup], /* ack_id = */ dup)
+            .expect("live test node");
+        tc
+    };
+    let host_freed = |result: &EvictionStepResult| -> Vec<i64> {
+        result.host_frees[&FULL]
+            .iter()
+            .flat_map(|t| Vec::<i64>::try_from(t).unwrap())
+            .collect()
+    };
+    let mut plain = build();
+    let mut preserve = build();
+    let a = plain.drive_host_eviction_with_options(FULL, 1, /* skip = */ true);
+    let b = preserve.drive_host_eviction_with_state_preserve(FULL, 1, true, Some(0.0));
+    assert_eq!(host_freed(&a), vec![100]);
+    assert_eq!(host_freed(&b), host_freed(&a));
+    assert_eq!(b.tracker, a.tracker);
+    assert_eq!(b.duplicate_reclaimed_tokens, 0);
+    assert_eq!(preserve.state_preserve_tail_frac, None);
+    // Without the skip the option is ignored: the duplicate reclaim runs as before.
+    let mut reclaim = build();
+    let c = reclaim.drive_host_eviction_with_state_preserve(FULL, 1, false, Some(0.0));
+    assert_eq!(host_freed(&c), vec![200]);
+    assert_eq!(c.duplicate_reclaimed_tokens, 1);
+    plain.sanity_check(&[], &[]);
+    preserve.sanity_check(&[], &[]);
+    reclaim.sanity_check(&[], &[]);
+}
+
+#[test]
 fn drive_host_eviction_dispatches_reclaim_only_under_write_back() {
     let mut tc = UnifiedTreeCore::new(
         CacheInitParams {

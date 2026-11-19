@@ -903,6 +903,10 @@ class Envs:
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
+    # With the skip above: a host victim holding a Mamba state is first covered by
+    # reclaiming duplicates, sparing the coldest fraction (the next demotes).
+    SGLANG_HICACHE_DUPKEEP_STATE_PRESERVE = EnvBool(False)
+    SGLANG_HICACHE_DUPKEEP_STATE_PRESERVE_TAIL_FRAC = EnvFloat(0.25)
     # p-micro rig only: per-launch host / D2H counters and per-op HiCache timings
     # (PMICRO_HOSTSTAT / PMICRO_HOSTOPS log lines, see mem_cache/pmicro_hoststats.py).
     SGLANG_PMICRO_HOSTSTATS = EnvBool(False)
