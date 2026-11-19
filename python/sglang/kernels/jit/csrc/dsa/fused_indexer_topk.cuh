@@ -125,13 +125,21 @@ struct OrderedScheduler {
 
 // The FP32 head reduction of one (row, key), operation for operation DeepGEMM's
 // (bitwise contract): pairs of heads, 2*relu as a + |a|, two f32x2 FMA chains.
+// kAluHeads: heads [0, kAluHeads) take relu as max(a, 0) on the ALU pipe against weights
+// stored doubled (fma(max(a,0), 2w, s) == fma(a+|a|, w, s) bit for bit: same exact product,
+// one rounding); the rest keep a + |a| on the FMA pipe. Balances the two pipes.
+template <uint32_t kAluHeads = 0>
 CUTLASS_DEVICE float dg_reduce(const float* accum, const float* w) {
+  static_assert(kAluHeads % 4 == 0 and kAluHeads <= kNumHeads);
   auto sum_0 = make_float2(0, 0);
   auto sum_1 = make_float2(0, 0);
   const auto transform = [&](const uint32_t& j, const float2& sum) {
+    auto b = make_float2(w[j], w[j + 1]);
+    if (j < kAluHeads) {
+      return __ffma2_rn(make_float2(fmaxf(accum[j], 0.0f), fmaxf(accum[j + 1], 0.0f)), b, sum);
+    }
     auto a_0 = make_float2(accum[j], accum[j + 1]);
     auto a_1 = make_float2(fabsf(accum[j]), fabsf(accum[j + 1]));
-    auto b = make_float2(w[j], w[j + 1]);
     return __ffma2_rn(__fadd2_rn(a_0, a_1), b, sum);
   };
 #pragma unroll
@@ -145,7 +153,7 @@ CUTLASS_DEVICE float dg_reduce(const float* accum, const float* w) {
 
 // kRowSplit: each math warpgroup owns 2 of the 4 rows over both 128-key halves of a
 // split (4 TMEM stages, each read by both warpgroups) instead of all 4 rows of one half.
-template <int kMode, bool kReuseKV, bool kRowSplit>
+template <int kMode, bool kReuseKV, bool kRowSplit, uint32_t kAluHeads>
 __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
     const __grid_constant__ ScoreParams params,
     const __grid_constant__ cute::TmaDescriptor tensor_map_q,
@@ -411,7 +419,8 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
           for (uint32_t i = 0; i < BLOCK_Q; ++i) {
             const auto smem_weights_row = smem.smem_weights[q_stage_idx] + i * kNumWeightElementsPerRow;
 #pragma unroll
-            for (uint32_t j = 0; j < kNumHeads; ++j) weights[i][j] = ptx::ld_shared(smem_weights_row + j);
+            for (uint32_t j = 0; j < kNumHeads; ++j)
+              weights[i][j] = ptx::ld_shared(smem_weights_row + j) * (j < kAluHeads ? 2.0f : 1.0f);
           }
         }
 
@@ -450,7 +459,7 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
               ptx::tcgen05_before_thread_sync();
               smem.empty_tmem_barriers[tmem_stage_idx].arrive();
             }
-            handle(q_block_idx, i, kv_offset, dg_reduce(accum, weights[i]) * scale_kv);
+            handle(q_block_idx, i, kv_offset, dg_reduce<kAluHeads>(accum, weights[i]) * scale_kv);
           }
         }
 
@@ -475,7 +484,8 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
           for (uint32_t r = 0; r < 2; ++r) {
             const auto smem_weights_row = smem.smem_weights[q_stage_idx] + (row0 + r) * kNumWeightElementsPerRow;
 #pragma unroll
-            for (uint32_t j = 0; j < kNumHeads; ++j) weights[r][j] = ptx::ld_shared(smem_weights_row + j);
+            for (uint32_t j = 0; j < kNumHeads; ++j)
+              weights[r][j] = ptx::ld_shared(smem_weights_row + j) * (j < kAluHeads ? 2.0f : 1.0f);
           }
         }
 
@@ -511,8 +521,8 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
             smem.empty_tmem_barriers[tmem_stage_idx].arrive();
 
             const uint32_t kv_offset = kv_base + kv_split_idx * SPLIT_KV + h * UMMA_M + lane_key;
-            const float r0 = dg_reduce(accum[0], weights[0]) * scale_kv[h];
-            const float r1 = dg_reduce(accum[1], weights[1]) * scale_kv[h];
+            const float r0 = dg_reduce<kAluHeads>(accum[0], weights[0]) * scale_kv[h];
+            const float r1 = dg_reduce<kAluHeads>(accum[1], weights[1]) * scale_kv[h];
             handle(q_block_idx, row0, kv_offset, r0);
             handle(q_block_idx, row0 + 1, kv_offset, r1);
           }
@@ -765,7 +775,7 @@ inline CUtensorMap make_map_2d(
   return map;
 }
 
-template <int kMode, bool kReuseKV, bool kRowSplit>
+template <int kMode, bool kReuseKV, bool kRowSplit, uint32_t kAluHeads>
 inline void score_impl(
     tvm::ffi::TensorView q,        // [T, 32, 128] e4m3
     tvm::ffi::TensorView kv,       // [N, 128] e4m3
@@ -826,14 +836,14 @@ inline void score_impl(
       kNumHeads, kHeadDim, false, BLOCK_Q, SPLIT_KV, kNumQStages, kNumKVStages, (kRowSplit ? 4 : 3),
       cutlass::float_e4m3_t, float>;
   constexpr size_t kSmem = sizeof(SharedStorage);
-  constexpr auto kernel = fstk_score_kernel<kMode, kReuseKV, kRowSplit>;
+  constexpr auto kernel = fstk_score_kernel<kMode, kReuseKV, kRowSplit, kAluHeads>;
   const DLDevice device = q.device();
   runtime::init_per_device(device, [=] { runtime::set_max_dynamic_smem(kernel, kSmem); });
   LaunchKernel(static_cast<uint32_t>(num_ctas), kNumThreads, device, kSmem)
       .enable_pdl(false)(kernel, params, map_q, map_kv, map_sf_kv, map_w);
 }
 
-template <bool kRowSplit>
+template <bool kRowSplit, uint32_t kAluHeads>
 inline void score_dispatch(
     tvm::ffi::TensorView q,
     tvm::ffi::TensorView kv,
@@ -851,7 +861,7 @@ inline void score_dispatch(
     int64_t reuse_kv,
     int64_t num_ctas) {
 #define FSTK_SCORE(M, R) \
-  score_impl<M, R, kRowSplit>(q, kv, kv_scale, weights, ks, ke, order, logits, tau, cand_score, cand_col, cand_count, num_ctas)
+  score_impl<M, R, kRowSplit, kAluHeads>(q, kv, kv_scale, weights, ks, ke, order, logits, tau, cand_score, cand_col, cand_count, num_ctas)
   switch (mode) {
     case kModeLogits:
       return FSTK_SCORE(kModeLogits, false);
@@ -886,10 +896,18 @@ struct FusedIndexerTopK {
       int64_t mode,
       int64_t reuse_kv,
       int64_t row_split,
+      int64_t alu_heads,
       int64_t num_ctas) {
-    if (row_split)
-      return score_dispatch<true>(q, kv, kv_scale, weights, ks, ke, order, logits, tau, cand_score, cand_col, cand_count, mode, reuse_kv, num_ctas);
-    return score_dispatch<false>(q, kv, kv_scale, weights, ks, ke, order, logits, tau, cand_score, cand_col, cand_count, mode, reuse_kv, num_ctas);
+#define FSTK_DISPATCH(RS, AH) \
+  return score_dispatch<RS, AH>(q, kv, kv_scale, weights, ks, ke, order, logits, tau, cand_score, cand_col, cand_count, mode, reuse_kv, num_ctas)
+    sglang::host::RuntimeCheck(alu_heads == 0 or alu_heads == 16, "fstk: alu_heads must be 0 or 16");
+    if (row_split) {
+      if (alu_heads) FSTK_DISPATCH(true, 16);
+      FSTK_DISPATCH(true, 0);
+    }
+    if (alu_heads) FSTK_DISPATCH(false, 16);
+    FSTK_DISPATCH(false, 0);
+#undef FSTK_DISPATCH
   }
 
   static void select(
