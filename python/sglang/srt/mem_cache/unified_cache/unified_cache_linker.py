@@ -52,6 +52,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage.lease_refresh import StorageLeaseRefresher
 from sglang.srt.mem_cache.unified_cache.components import (
     ComponentType,
     ExternalLinkerLoadPhase,
@@ -191,6 +192,13 @@ class UnifiedCacheLinker(ABC):
 
     def prefetch(self, transfers: list[PoolTransfer]) -> Future[bool] | None:
         """Read all layers; the future completes after all device writes stop."""
+        return None
+
+    def lease_refresh_fns(
+        self,
+    ) -> Optional[tuple[Callable[[list[str]], list[str]], Callable[[list[str]], list[int]]]]:
+        """(page hashes -> object keys, keys -> existence results that renew their
+        leases), or None when the store has no leases or another rank renews them."""
         return None
 
     @abstractmethod
@@ -422,6 +430,28 @@ class UnifiedCacheLinkerWrapper:
             and envs.SGLANG_EXTERNAL_LINKER_REQUERY_ON_DEVICE_LOSS.get()
         )
         self.match_targets: dict[CacheRequestHandle, int] = {}
+        # Renews the L3 leases of device-served prefixes (SGLANG_EXTERNAL_LINKER_LEASE_REFRESH_*).
+        self._lease_refresher: Optional[StorageLeaseRefresher] = None
+        lease_interval = envs.SGLANG_EXTERNAL_LINKER_LEASE_REFRESH_INTERVAL.get()
+        lease_fns = (
+            cache_linker.lease_refresh_fns()
+            if lease_interval > 0 and self.load_mode == "prefetch"
+            else None
+        )
+        if lease_fns is not None:
+            build_keys, renew = lease_fns
+            self._lease_refresher = StorageLeaseRefresher(
+                build_keys=build_keys,
+                renew=renew,
+                interval_s=lease_interval,
+                max_keys_per_s=envs.SGLANG_EXTERNAL_LINKER_LEASE_REFRESH_MAX_KEYS_PER_S.get(),
+            )
+            logger.info(
+                "External linker L3 lease refresh on: every %.0f s per chain, at most %d keys/s",
+                lease_interval,
+                envs.SGLANG_EXTERNAL_LINKER_LEASE_REFRESH_MAX_KEYS_PER_S.get(),
+            )
+            self._lease_refresher.start()
         # The look-ahead re-query loads a deferred request once the window reaches it.
         self.qlock_defer_far = (
             bool(self.qlock_cap_tokens)
@@ -569,6 +599,8 @@ class UnifiedCacheLinkerWrapper:
         t1 = time.perf_counter() if timed else 0.0
         if is_virtual_node(req.last_node) or req.positional_embed_overrides is not None:
             return
+        if self._lease_refresher is not None:
+            self._refresh_leases(req.last_node)
         page = self.cache.page_size
         key = RadixKey(
             req.full_untruncated_fill_ids,
@@ -639,6 +671,33 @@ class UnifiedCacheLinkerWrapper:
         )
         if timed:
             self._phase_s[kind]["load"] += time.perf_counter() - t2
+
+    def _refresh_leases(self, node: NodeId) -> None:
+        """Queue the device-matched path's stale pages for an L3 lease renewal.
+
+        A device hit never reaches L3, so its pages keep the lease of their
+        write and go first when the pool evicts; a later restore needs every
+        page after the device boundary, so one evicted old page voids it.
+        """
+        refresher = self._lease_refresher
+        tree = self.cache.tree_core
+        if tree.is_root(node):
+            return
+        t0 = time.perf_counter_ns()
+        path = [info.node_id for info in tree.collect_path_info([node])[0]]
+        start, stamp = refresher.stale_start(path)
+        renewed, page_hashes = [], []
+        for node_id in path[start:]:
+            hashes = tree.get_hash_values(node_id)
+            if not hashes:
+                # Not offloaded yet: no L3 objects here or below.
+                break
+            renewed.append(node_id)
+            page_hashes.extend(hashes)
+        if page_hashes:
+            refresher.submit(renewed, stamp, page_hashes)
+        refresher.stats["host_calls"] += 1
+        refresher.stats["host_ns"] += time.perf_counter_ns() - t0
 
     def _timed_lookup(self, kind, rid, lookups):
         """The store lookup; with ``kind``, its time joins that kind's RPC phase (any thread)."""
@@ -1565,6 +1624,9 @@ class UnifiedCacheLinkerWrapper:
             self.private_load_indices.pop(rid, None)
 
     def close(self) -> None:
+        if self._lease_refresher is not None:
+            self._lease_refresher.stop()
+            self._lease_refresher = None
         self.cache_linker.close()
         self._clear_state()
         if self._lookup_executor is not None:

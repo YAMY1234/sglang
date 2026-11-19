@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+    PoolHitPolicy,
     PoolName,
     PoolTransfer,
 )
@@ -278,6 +279,27 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         "Failed to register GPU KV buffer with Mooncake, "
                         f"error code: {result}."
                     )
+
+    def lease_refresh_fns(self):
+        # Rank-replicated objects are renewed by the rank that writes them.
+        if not self.offload_owner:
+            return None
+        return self.lease_refresh_keys, self.storage._batch_exist
+
+    def lease_refresh_keys(self, page_keys: list[str]) -> list[str]:
+        """The object keys a lookup over these pages requires on every page."""
+        expanded = self.pool_group.resolve_transfers(
+            [PoolTransfer(name=PoolName.KV, keys=list(page_keys))], allow_partial=True
+        )
+        keys = []
+        for transfer in expanded:
+            if transfer.hit_policy != PoolHitPolicy.ALL_PAGES:
+                continue
+            component_keys, _ = self.storage._get_hybrid_page_component_keys(
+                page_keys, transfer
+            )
+            keys.extend(self.storage._tag_keys(component_keys))
+        return keys
 
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
         expanded = self.pool_group.resolve_transfers(transfers)

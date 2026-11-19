@@ -976,6 +976,12 @@ class Envs:
     # External linker prefetch mode: log lookup counters (issued, skipped for a
     # device anchor with no storage hash, zero restorable, re-queried) every 60 s.
     SGLANG_EXTERNAL_LINKER_LOOKUP_STATS = EnvBool(False)
+    # Seconds between L3 lease renewals of a prefix the device serves: an
+    # existence query renews its pages' leases, so Mooncake (oldest lease
+    # evicted first) keeps hot prefixes. 0 disables.
+    SGLANG_EXTERNAL_LINKER_LEASE_REFRESH_INTERVAL = EnvFloat(0.0)
+    # Cap on the renewal existence queries, in object keys per second.
+    SGLANG_EXTERNAL_LINKER_LEASE_REFRESH_MAX_KEYS_PER_S = EnvInt(200000)
     # Buffer mode: store only the SWA window ending at each node (what a
     # prefetch ending there restores) instead of every SWA page.
     SGLANG_ENABLE_HICACHE_SWA_TAIL_ONLY_BACKUP = EnvBool(False)
