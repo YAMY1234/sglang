@@ -37,6 +37,8 @@ class TestMooncakeTransferBatching(unittest.TestCase):
         else:
             engine.batch_transfer_sync.side_effect = side_effect
         manager = SimpleNamespace(
+            _dcp_send_stats=MooncakeKVManager._new_dcp_send_stats(),
+            settle_diag=None,
             engine=engine,
             is_mla_backend=True,
             is_hybrid_mla_backend=False,
@@ -160,6 +162,8 @@ class TestMiniMaxStateTransfer(CustomTestCase):
                     src = np.arange(3, dtype=np.int32)
                     dst = np.full(3, -1, dtype=np.int32)
                     manager = MooncakeKVManager.__new__(MooncakeKVManager)
+                    manager._dcp_send_stats = MooncakeKVManager._new_dcp_send_stats()
+                    manager.settle_diag = None
                     manager.kv_args = SimpleNamespace(
                         state_types=[state],
                         state_data_ptrs=[[src.ctypes.data]],
@@ -286,6 +290,8 @@ class TestDcpDraftHeadTransfer(unittest.TestCase):
                     return 0
 
                 manager = SimpleNamespace(
+                    _dcp_send_stats=MooncakeKVManager._new_dcp_send_stats(),
+                    settle_diag=None,
                     is_mla_backend=pure_mla,
                     kv_args=SimpleNamespace(
                         page_size=page_size,
@@ -406,6 +412,8 @@ class TestDcpDsaIndexKTransfer(unittest.TestCase):
                     return 0
 
                 manager = SimpleNamespace(
+                    _dcp_send_stats=MooncakeKVManager._new_dcp_send_stats(),
+                    settle_diag=None,
                     is_mla_backend=False,
                     kv_args=SimpleNamespace(
                         page_size=page_size,
@@ -509,6 +517,8 @@ class TestDcpVectorizedDescriptors(unittest.TestCase):
             return 0
 
         manager = SimpleNamespace(
+            _dcp_send_stats=MooncakeKVManager._new_dcp_send_stats(),
+            settle_diag=None,
             is_mla_backend=False,
             kv_args=SimpleNamespace(
                 page_size=self.PAGE,
@@ -699,6 +709,8 @@ class TestMooncakeEarlySend(CustomTestCase):
         queue = SimpleQueue()
         ready = MagicMock()
         manager = SimpleNamespace(
+            _dcp_send_stats=MooncakeKVManager._new_dcp_send_stats(),
+            settle_diag=None,
             disaggregation_mode=DisaggregationMode.PREFILL,
             request_status={1: KVPoll.WaitingForInput},
             check_status=lambda room: KVPoll.WaitingForInput,
@@ -725,6 +737,8 @@ class TestMooncakeEarlySend(CustomTestCase):
         queues = [SimpleQueue() for _ in range(4)]
         rooms = range(8)
         manager = SimpleNamespace(
+            _dcp_send_stats=MooncakeKVManager._new_dcp_send_stats(),
+            settle_diag=None,
             disaggregation_mode=DisaggregationMode.PREFILL,
             request_status={r: KVPoll.WaitingForInput for r in rooms},
             check_status=lambda room: KVPoll.WaitingForInput,
@@ -734,7 +748,9 @@ class TestMooncakeEarlySend(CustomTestCase):
         with patch.dict(os.environ, {"SGLANG_DISAGG_TRANSFER_SHARD_BY_ROOM": "1"}):
             for r in rooms:
                 for last in (False, True):
-                    MooncakeKVManager.add_transfer_request(manager, r, [0], slice(0, 1), last)
+                    MooncakeKVManager.add_transfer_request(
+                        manager, r, [0], slice(0, 1), last, aux_index=0 if last else None
+                    )
         for i, q in enumerate(queues):
             got = [q.get_nowait() for _ in range(q.qsize())]
             self.assertEqual([(c.room, c.is_last_chunk) for c in got],
@@ -761,6 +777,8 @@ class TestMooncakeEarlySend(CustomTestCase):
             dst_attn_tp_size=1,
         )
         manager = SimpleNamespace(
+            _dcp_send_stats=MooncakeKVManager._new_dcp_send_stats(),
+            settle_diag=None,
             enable_trace=False,
             enable_staging=False,
             enable_deferred_decode_kv_release=True,

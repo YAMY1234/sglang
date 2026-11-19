@@ -92,6 +92,7 @@ class TestAllocationIntegration(CustomTestCase):
 
     def manager(self, ip, port):
         mgr = MooncakeKVManager.__new__(MooncakeKVManager)
+        mgr.settle_diag = None
         mgr.local_ip, mgr.rank_port = ip, port
         mgr.request_status = {}
         mgr.failure_lock = threading.Lock()
