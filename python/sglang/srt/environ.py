@@ -928,6 +928,8 @@ class Envs:
     SGLANG_HICACHE_MAMBA_HOST_SCALE = EnvFloat(None)
     # Seconds between "HiCache host usage" log lines (KV and Mamba pools); 0 = off.
     SGLANG_HICACHE_HOST_USAGE_LOG_INTERVAL = EnvFloat(0.0)
+    # Upload HiCache load/write host indices through a reused pinned buffer (a pageable .to(non_blocking) syncs the stream)
+    SGLANG_HICACHE_PIN_LOAD_INDICES = EnvBool(False)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)
