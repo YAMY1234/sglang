@@ -828,6 +828,8 @@ class Envs:
     # flight); its chunks keep SGLANG_SPF_AGED_CHUNK_SHARE of each batch. 0 = off.
     SGLANG_SPF_AGE_TOKENS = EnvInt(0)
     SGLANG_SPF_AGED_CHUNK_SHARE = EnvFloat(0.5)
+    # Rate limit for SPF aging: promote at most one aged request per N shortest-prefill passes (0 = every pass).
+    SGLANG_SPF_AGE_EVERY_N = EnvInt(0)
     # PD prefill backstop: a built batch whose paged KV demand exceeds free plus
     # evictable pages is undone and retried next step instead of raising.
     SGLANG_PREFILL_DEFER_ON_KV_SHORTFALL = EnvBool(True)

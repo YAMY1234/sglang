@@ -213,6 +213,7 @@ class SchedulePolicy:
         self._prefix_match_seconds = 0.0
         self._spf_processed_tokens = 0
         self._spf_aged_promotions = 0
+        self._spf_last_promotion_call = -(1 << 30)
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
@@ -495,10 +496,14 @@ class SchedulePolicy:
         ]
         if not aged:
             return
+        every = envs.SGLANG_SPF_AGE_EVERY_N.get()
+        if every > 0 and self._shortest_prefill_calls - self._spf_last_promotion_call < every:
+            return
         i = min(aged, key=lambda i: waiting_queue[i].arrival_processed_tokens)
         if i:
             waiting_queue.insert(0, waiting_queue.pop(i))
             self._spf_aged_promotions += 1
+            self._spf_last_promotion_call = self._shortest_prefill_calls
 
     def shortest_prefill_chunk_limit(
         self,
