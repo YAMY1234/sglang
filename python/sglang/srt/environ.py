@@ -1050,6 +1050,9 @@ class Envs:
     # Read a load batch in one store call, every layer of a key in one entry,
     # instead of one call per layer and pool; its layers complete together.
     SGLANG_LINKER_LOAD_PER_KEY = EnvBool(False)
+    # Per-key load: build each key's layer ranges with numpy instead of Python
+    # loops (the read threads held the GIL ~45% of the time on GB300 Lk20f).
+    SGLANG_LINKER_VECTOR_META = EnvBool(False)
     # Load threads, each reading its own batch (0: 2 with SGLANG_LINKER_LOAD_OVERLAP,
     # else 1).
     SGLANG_LINKER_LOAD_THREADS = EnvInt(0)

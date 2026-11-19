@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
+    vector_key_range_meta,
 )
 from sglang.srt.mem_cache.storage.mooncake_store.linker_lease_refresh import (
     LinkerLeaseRefresher,
@@ -697,6 +698,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             envs.SGLANG_LINKER_LOAD_RESERVE_PAGES.get(),
         )
         self.load_per_key = envs.SGLANG_LINKER_LOAD_PER_KEY.get()
+        self.vector_meta = envs.SGLANG_LINKER_VECTOR_META.get()
         self.num_load_threads = envs.SGLANG_LINKER_LOAD_THREADS.get() or (
             2 if self.load_overlap else 1
         )
@@ -1871,6 +1873,20 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         per-layer, per-pool reads). ``loaded`` (if given) gets each request's bytes."""
         keys_all, ptrs_all, sizes_all, offsets_all, base = [], [], [], [], {}
         for name, (keys, locations) in batches.items():
+            vector = (
+                vector_key_range_meta(self.pools[name], locations, self.num_layers)
+                if self.vector_meta
+                else None
+            )
+            if vector is not None:
+                # Same lists as the per-layer loop below, built with numpy so the
+                # read thread holds the GIL for a few array ops, not O(keys x layers).
+                base[name] = len(keys_all)
+                keys_all.extend(keys)
+                ptrs_all.extend(vector[0])
+                sizes_all.extend(vector[1])
+                offsets_all.extend(vector[2])
+                continue
             entries = [([], [], []) for _ in keys]
             for layer in range(self.num_layers):
                 meta = self.pools[name].get_prepared_layer_range_meta(locations, layer)

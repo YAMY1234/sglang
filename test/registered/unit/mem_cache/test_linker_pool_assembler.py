@@ -122,6 +122,67 @@ class TestDevicePoolEntry(CustomTestCase):
         self.assertEqual(offsets, [[8, 16], [8, 16]])  # the indexer starts after both KV layers
         self.assertIsNone(pool.get_prepared_layer_range_meta(locations, 1))
 
+    def test_vector_key_range_meta_matches_per_layer_loop(self):
+        # SGLANG_LINKER_VECTOR_META (GB300 Lk20f: the read threads held the GIL
+        # ~45% building these lists layer by layer) must build the same lists.
+        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+            MergedPageEntry,
+            vector_key_range_meta,
+        )
+
+        def per_layer(pool, locations, num_layers):
+            entries = [([], [], []) for _ in locations]
+            for layer in range(num_layers):
+                meta = pool.get_prepared_layer_range_meta(locations, layer)
+                if meta is None:
+                    continue
+                for entry, *parts in zip(entries, *meta):
+                    for dst, part in zip(entry, parts):
+                        dst.extend(part)
+            return tuple([e[i] for e in entries] for i in range(3))
+
+        kv = [torch.zeros((16, 4), dtype=torch.uint8) for _ in range(3)]
+        vk = [torch.zeros((16, 6), dtype=torch.uint8) for _ in range(3)]
+        ix = torch.zeros((8, 5), dtype=torch.uint8)
+        kv_pool = DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=None,
+            components=[kv, vk],
+            layer_mapping={0: 0, 1: [1, 2], 3: 2},
+            page_size=2,
+            rows_are_pages=False,
+        )
+        ix_pool = DevicePoolEntry(
+            name=PoolName.INDEXER,
+            indices_from_pool=PoolName.KV,
+            device_pool=None,
+            components=[[ix]],
+            layer_mapping={1: 0},
+            page_size=2,
+            rows_are_pages=True,
+        )
+        merged = MergedPageEntry(kv_pool, ix_pool, object_name="ki")
+        indices = torch.tensor([0, 1, 6, 7, 14, 15])
+        for pool in (kv_pool, merged):
+            locations = pool.prepare_locations(indices)
+            with self.subTest(pool=type(pool).__name__):
+                self.assertEqual(
+                    vector_key_range_meta(pool, locations, 4),
+                    per_layer(pool, locations, 4),
+                )
+        unpacked = DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=None,
+            components=[kv],
+            layer_mapping={0: 0},
+            page_size=2,
+            rows_are_pages=False,
+            packed=False,
+        )
+        self.assertIsNone(vector_key_range_meta(unpacked, [0], 1))
+
     def test_rejects_invalid_pages_and_empty_buffers(self):
         with self.assertRaisesRegex(ValueError, "has no storage buffers"):
             DevicePoolEntry(

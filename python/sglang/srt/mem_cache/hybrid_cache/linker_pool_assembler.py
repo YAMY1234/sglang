@@ -7,6 +7,7 @@ from dataclasses import replace
 from functools import partial
 from typing import Any
 
+import numpy as np
 import torch
 
 from sglang.srt.environ import envs
@@ -170,6 +171,55 @@ class DevicePoolEntry:
                 offsets.extend([[value] for value in row_offsets])
         return ptrs, sizes, offsets
 
+    def _layer_items(self, layer: int):
+        """(base_ptr, row_stride, size, offset) in get_prepared_layer_range_meta
+        order for one layer, or None when the layer has no buffer here."""
+        mapped = self.layer_mapping.get(layer)
+        if mapped is None:
+            return None
+        buffer_indices = [mapped] if isinstance(mapped, int) else list(mapped)
+        return [
+            (*component[buffer_index][:2], component[buffer_index][2], offsets[buffer_index])
+            for component, offsets in zip(self.buffer_meta, self._component_offsets)
+            for buffer_index in buffer_indices
+        ]
+
+    def key_range_table(self, num_layers: int):
+        """SGLANG_LINKER_VECTOR_META: every layer's items of one key, in the order
+        the per-key load concatenates them, as int64 arrays (src, base, stride,
+        size, offset); src indexes the location (always 0 here). Packed only."""
+        cached = getattr(self, "_key_range_table", None)
+        if cached is not None and cached[0] == num_layers:
+            return cached[1]
+        if not self.packed:
+            return None
+        rows = []
+        for layer in range(num_layers):
+            for item in self._layer_items(layer) or ():
+                rows.append((0, *item))
+        table = np.array(rows, dtype=np.int64).reshape(-1, 5)
+        self._key_range_table = (num_layers, table)
+        return table
+
+    def key_range_rows(self, locations) -> np.ndarray:
+        return np.asarray(locations, dtype=np.int64).reshape(-1, 1)
+
+
+def vector_key_range_meta(entry, locations, num_layers: int):
+    """Per-key (ptrs, sizes, offsets) lists for a packed or merged entry, equal to
+    concatenating get_prepared_layer_range_meta over layers 0..num_layers-1; None
+    when the entry has no vector table (unpacked)."""
+    table = entry.key_range_table(num_layers)
+    if table is None:
+        return None
+    rows = entry.key_range_rows(locations)
+    src, base, stride, size, offset = table.T
+    ptrs = base[None, :] + rows[:, src] * stride[None, :]
+    count = rows.shape[0]
+    sizes = np.broadcast_to(size, (count, size.shape[0]))
+    offsets = np.broadcast_to(offset, (count, offset.shape[0]))
+    return ptrs.tolist(), sizes.tolist(), offsets.tolist()
+
 
 class MergedPageEntry:
     """Two DevicePoolEntries of the same pages stored as one object per page:
@@ -232,6 +282,26 @@ class MergedPageEntry:
             [a + b for a, b in zip(s1, s2)],
             offsets,
         )
+
+    def key_range_table(self, num_layers: int):
+        """SGLANG_LINKER_VECTOR_META: per layer, ``first``'s items (src 0) then
+        ``second``'s (src 1, offset past ``first``'s bytes), as in
+        get_prepared_layer_range_meta."""
+        cached = getattr(self, "_key_range_table", None)
+        if cached is not None and cached[0] == num_layers:
+            return cached[1]
+        rows = []
+        for layer in range(num_layers):
+            for item in self.first._layer_items(layer) or ():
+                rows.append((0, *item))
+            for base, stride, size, offset in self.second._layer_items(layer) or ():
+                rows.append((1, base, stride, size, offset + self._first_bytes))
+        table = np.array(rows, dtype=np.int64).reshape(-1, 5)
+        self._key_range_table = (num_layers, table)
+        return table
+
+    def key_range_rows(self, locations) -> np.ndarray:
+        return np.asarray(locations, dtype=np.int64).reshape(-1, 2)
 
 
 class DevicePoolGroup:
