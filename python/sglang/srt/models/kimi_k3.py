@@ -4314,18 +4314,33 @@ class KimiK3LinearForCausalLM(nn.Module):
                 continue
             from sglang.kernels.ops.attention.fla.kda import (
                 precompile_k3_recompute_w_u_kernel,
+                precompile_k3_triton_one_token_extend,
             )
 
             o_proj_weight = getattr(layer.self_attn.o_proj, "weight", None)
             if o_proj_weight is None:
                 o_proj_weight = layer.self_attn.o_proj.qweight
+            dtype = (
+                getattr(layer.self_attn.o_proj, "params_dtype", None)
+                or o_proj_weight.dtype
+            )
             if precompile_k3_recompute_w_u_kernel(
                 num_heads=layer.self_attn.local_num_heads,
-                dtype=getattr(layer.self_attn.o_proj, "params_dtype", None)
-                or o_proj_weight.dtype,
+                dtype=dtype,
                 device=layer.self_attn.dt_bias.device,
             ):
                 rank0_log("Precompiled the Kimi-K3 KDA prefill kernel.")
+            attn = layer.self_attn
+            if precompile_k3_triton_one_token_extend(
+                num_heads=attn.local_num_heads,
+                head_k_dim=attn.head_k_dim,
+                head_v_dim=attn.head_v_dim,
+                dtype=dtype,
+                A_log=attn.A_log,
+                dt_bias=attn.dt_bias,
+                lower_bound=attn.attn.lower_bound,
+            ):
+                rank0_log("Precompiled the Kimi-K3 Triton one-token KDA extend path.")
             break
 
 

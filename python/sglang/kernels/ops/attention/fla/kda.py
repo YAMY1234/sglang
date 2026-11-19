@@ -1321,3 +1321,44 @@ def chunk_kda(
         chunk_indices=chunk_indices,
         chunk_offsets=chunk_offsets,
     )
+
+
+@torch.inference_mode()
+def precompile_k3_triton_one_token_extend(
+    *,
+    num_heads: int,
+    head_k_dim: int,
+    head_v_dim: int,
+    dtype: torch.dtype,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    lower_bound: Optional[float],
+) -> bool:
+    # K3 prefill batches where every sequence extends one token run this Triton path
+    # (kda_backend.effective_extend_kernel); its first use autotunes mid-serving on
+    # every PP stage. One run per chunk_kda_fwd grid branch (fused iff B*NT*H <= 256).
+    device = A_log.device
+    if not is_nvidia or device.type != "cuda":
+        return False
+    for n in sorted({1, 256 // num_heads + 1}):
+        q = torch.zeros((1, n, num_heads, head_k_dim), dtype=dtype, device=device)
+        v = torch.zeros((1, n, num_heads, head_v_dim), dtype=dtype, device=device)
+        state = torch.zeros(
+            (n, num_heads, head_v_dim, head_k_dim), dtype=torch.float32, device=device
+        )
+        chunk_kda(
+            q=q,
+            k=torch.zeros_like(q),
+            v=v,
+            g=torch.zeros_like(q),
+            beta=torch.zeros((1, n, num_heads), dtype=dtype, device=device),
+            initial_state=state,
+            initial_state_indices=torch.arange(n, dtype=torch.int32, device=device),
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=torch.arange(n + 1, dtype=torch.int32, device=device),
+            A_log=A_log,
+            dt_bias=dt_bias,
+            lower_bound=lower_bound,
+            beta_is_raw=True,
+        )
+    return True
