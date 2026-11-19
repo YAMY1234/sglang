@@ -803,6 +803,9 @@ class Envs:
     # Shard prefill KV transfer chunks across the transfer queues by bootstrap room instead of by
     # destination session, so one decode instance's sends use every worker (default off).
     SGLANG_DISAGG_TRANSFER_SHARD_BY_ROOM = EnvBool(False)
+    # Run each KV transfer worker thread on its own device stream, so the DCP pack gather's
+    # producer edge orders only after that worker's own work, not the legacy default stream (default off).
+    SGLANG_DISAGG_TRANSFER_WORKER_STREAM = EnvBool(False)
     # PP PD prefill: an early-sent last chunk still in transfer does not block the result; the
     # checkpoint's device frees for that request wait until its transfer ends (default off).
     SGLANG_PP_PD_DEFER_EARLY_SETTLE = EnvBool(False)

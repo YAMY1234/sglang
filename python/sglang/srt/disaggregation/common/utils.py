@@ -55,6 +55,13 @@ def bind_thread_to_device(gpu_id: int) -> None:
 def run_on_device(gpu_id: int, fn, *args) -> None:
     """Thread target: bind the thread to ``gpu_id``, then run ``fn(*args)``."""
     bind_thread_to_device(gpu_id)
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_DISAGG_TRANSFER_WORKER_STREAM.get():
+        import torch
+
+        # The current stream is thread-local; without this it is the legacy default stream.
+        torch.cuda.set_stream(torch.cuda.Stream())
     fn(*args)
 
 
