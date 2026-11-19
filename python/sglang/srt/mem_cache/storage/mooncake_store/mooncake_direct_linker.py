@@ -974,11 +974,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
     # ---- SGLANG_LINKER_EARLY_READS: staged reads (linker_staging.py) -----------------
 
-    def staging_slab(self, pages: int, states: int):
+    def staging_slab(self, gb: float, states: int):
         """A pinned host slab of object slots, registered with the store: ``states``
-        for the state pool (MAMBA), ``pages`` for every other pool."""
+        for the state pool (MAMBA); the rest of ``gb`` as page slots of every other
+        pool (one per page and pool)."""
         from sglang.srt.mem_cache.storage.mooncake_store.linker_staging import StagingSlab
 
+        state_bytes = self.object_bytes.get(PoolName.MAMBA, 0) * states
+        page_bytes = sum(b for name, b in self.object_bytes.items()
+                         if name != PoolName.MAMBA and name in self.pool_group.sources)
+        pages = max(0, int(gb * 2**30 - state_bytes) // max(page_bytes, 1))
         pools = {
             name: (self.object_bytes[name], states if name == PoolName.MAMBA else pages)
             for name in self.pool_group.sources

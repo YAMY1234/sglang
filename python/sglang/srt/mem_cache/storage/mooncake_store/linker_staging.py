@@ -122,7 +122,7 @@ class EarlyReads:
         self.landed: deque = deque()
         self.lock = threading.Lock()
         self.epoch = 0
-        self.counts = {"staged": 0, "full": 0, "failed": 0, "used": 0, "dropped": 0}
+        self.counts = {"staged": 0, "full": 0, "failed": 0, "used": 0, "dropped": 0, "voted_unused": 0}
 
     # ---- PP0 ---------------------------------------------------------------------
     def publish(self, epoch, cycle, handle, lookup, pages) -> None:
@@ -185,6 +185,12 @@ class EarlyReads:
             entry = self.entries.get((epoch, cycle))
             if entry is None:
                 return None
+            if entry.voted and (entry.state != "landed" or entry.pages != pages):
+                # Near miss: PP0 may finish on this vote while the stage reads at load
+                # time (the protocol rules it out; counted to size the risk).
+                self.counts["voted_unused"] += 1
+                logger.warning("Early read %s voted but not usable at load (state %s, pages %d vs %d)",
+                               (epoch, cycle), entry.state, entry.pages, pages)
             if entry.state != "landed" or entry.pages != pages:
                 # The stage reads at load time instead; a read still in flight must
                 # never be voted after this (its vote would stand for a read the

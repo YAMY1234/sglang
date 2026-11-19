@@ -1426,6 +1426,8 @@ class TestLinkerStaging(CustomTestCase):
         reads[0].set_result(True)
         self.assertEqual(early.take_landed(), [(0, 1)])
         self.assertEqual(early.take_landed(), [])  # voted once
+        self.assertIsNone(early.take(0, 1, 3))  # a voted read asked for other pages: a counted near miss
+        self.assertEqual(early.counts["voted_unused"], 1)
         entry = early.take(0, 1, 2)
         self.assertIsNotNone(entry)
         # Cycle 2 is still reading when its load applies: today's read is used, and

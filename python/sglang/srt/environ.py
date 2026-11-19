@@ -1096,10 +1096,11 @@ class Envs:
     # (SGLANG_MOONCAKE_CUSTOM_MEM_POOL). Its store client's own segment (MB) and threads.
     # Prefetch mode under PP: every stage reads a looked-up prefix into pinned
     # host staging as soon as PP0's lookup lands and votes early (pp_linker_relay.py,
-    # mooncake_store/linker_staging.py); slots for KV pages and for states.
+    # mooncake_store/linker_staging.py); a pinned slab of this many GB per GPU:
+    # this many state slots, the rest page slots.
     SGLANG_LINKER_EARLY_READS = EnvBool(False)
-    SGLANG_LINKER_EARLY_PAGES = EnvInt(67200)
-    SGLANG_LINKER_EARLY_STATES = EnvInt(24)
+    SGLANG_LINKER_EARLY_GB = EnvFloat(6.0)
+    SGLANG_LINKER_EARLY_STATES = EnvInt(16)
     SGLANG_LINKER_HELPER = EnvBool(False)
     SGLANG_LINKER_HELPER_SEGMENT_MB = EnvInt(0)
     SGLANG_LINKER_HELPER_THREADS = EnvInt(4)
