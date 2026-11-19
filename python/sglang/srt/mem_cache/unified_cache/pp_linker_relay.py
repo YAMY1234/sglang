@@ -136,6 +136,8 @@ class PPLinkerRelay:
             if not landed and state is not None and state.abort_reason is None:
                 state.abort_reason = w.local_abort_reason(state)
             entry.voted = _LANDED if landed else _FAILED
+            if w.timeline is not None:
+                w.timeline.mark(handle, "voted")
             self.store[self._key(entry)] = entry.voted
 
     def take_actions(self):

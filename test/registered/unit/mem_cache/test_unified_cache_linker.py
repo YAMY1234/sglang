@@ -3386,7 +3386,9 @@ def test_prefetch_timeline_intervals_skips_and_batch_interval():
         ("enqueue", 1.000),
         ("lookup_done", 1.010),
         ("load_issued", 1.030),
+        ("read_start", 1.035),
         ("landed", 1.130),
+        ("voted", 1.140),
         ("finish_issued", 1.330),
         ("ready", 1.530),
     ):
@@ -3410,6 +3412,8 @@ def test_prefetch_timeline_intervals_skips_and_batch_interval():
     assert got[("load_issued", "landed")] == [pytest.approx(100.0)]
     assert got[("enqueue", "ready")] == [pytest.approx(530.0)]
     assert got[("ready", "admitted")] == [pytest.approx(70.0)]
+    assert got[("enqueue", "read_start")] == [pytest.approx(35.0)]
+    assert got[("landed", "voted")] == [pytest.approx(10.0)]
     assert h not in tl.marks
     assert tl.pass_skips == [2, 0]
     assert tl.skip_positions == [0, 1]
@@ -3418,3 +3422,24 @@ def test_prefetch_timeline_intervals_skips_and_batch_interval():
     assert "not-ready skips per pass p50 2" in line
     assert "skipped queue position p50 1" in line
     assert all(not v for v in tl.intervals.values()) and not tl.pass_skips
+
+
+def test_prefetch_timeline_wall_line_for_sampled_rid():
+    from sglang.srt.mem_cache.unified_cache import unified_cache_linker as ucl
+
+    tl = ucl._PrefetchTimeline()
+    tl.wall_offset = 1000.0
+    class _Handle:
+        def __init__(self, rid):
+            self.rid = rid
+
+    sampled, other = _Handle("rid-9"), _Handle("rid-0")
+    for h in (sampled, other):
+        tl.mark(h, "enqueue", 1.0)
+        tl.mark(h, "read_start", 1.5)
+    with patch.object(ucl.logger, "info") as info:
+        tl.admitted(sampled)
+        tl.admitted(other)
+    assert info.call_count == 1
+    fmt, rid, stamps = info.call_args.args
+    assert rid == "rid-9" and stamps.startswith("enqueue=1001.000 read_start=1001.500")

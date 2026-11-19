@@ -27,6 +27,7 @@ import math
 from dataclasses import dataclass
 import random
 import time
+import zlib
 from abc import ABC, abstractmethod
 from collections import Counter
 from collections.abc import Callable, Sequence
@@ -378,9 +379,16 @@ class _PrefetchTimeline:
         ("finish_issued", "ready"),
         ("enqueue", "ready"),
         ("ready", "admitted"),
+        ("enqueue", "read_start"),
+        ("read_start", "landed"),
+        ("landed", "voted"),
     )
+    # Milestones of one request in 32, chosen by rid (the same requests on every
+    # stage), logged in wall-clock seconds so stages can be aligned by rid.
+    WALL = ("enqueue", "read_start", "landed", "voted", "finish_issued", "ready", "admitted")
 
     def __init__(self):
+        self.wall_offset = time.time() - time.perf_counter()
         self.marks: dict = {}
         self.intervals = {pair: [] for pair in self.PAIRS}
         self.pass_skips: list[int] = []
@@ -405,6 +413,12 @@ class _PrefetchTimeline:
         for a, b in self.PAIRS:
             if a in marks and b in marks:
                 self.intervals[(a, b)].append(1e3 * (marks[b] - marks[a]))
+        rid = getattr(request, "rid", None)
+        if rid is not None and zlib.crc32(str(rid).encode()) % 32 == 0:
+            logger.info(
+                "Linker prefetch wall rid=%s %s", rid,
+                " ".join(f"{k}={marks[k] + self.wall_offset:.3f}" for k in self.WALL if k in marks),
+            )
 
     def drop(self, request) -> None:
         self.marks.pop(request, None)
@@ -1429,6 +1443,8 @@ class UnifiedCacheLinkerWrapper:
             timeout_s=timeout_s,
         )
         self.prefetches[request] = state
+        if self.timeline is not None:
+            self.timeline.mark(request, "read_start")
         try:
             for component in self._components:
                 transfer = component.build_external_linker_transfer(
