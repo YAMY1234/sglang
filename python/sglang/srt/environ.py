@@ -1053,6 +1053,10 @@ class Envs:
     # Per-key load: build each key's layer ranges with numpy instead of Python
     # loops (the read threads held the GIL ~45% of the time on GB300 Lk20f).
     SGLANG_LINKER_VECTOR_META = EnvBool(False)
+    # Prefetch reads and offloads: copy device slot indices to the CPU on the
+    # scheduler thread (non-blocking, before the ready event), so the linker threads
+    # never D2H-copy indices against the forward.
+    SGLANG_LINKER_CPU_INDICES = EnvBool(False)
     # Load threads, each reading its own batch (0: 2 with SGLANG_LINKER_LOAD_OVERLAP,
     # else 1).
     SGLANG_LINKER_LOAD_THREADS = EnvInt(0)

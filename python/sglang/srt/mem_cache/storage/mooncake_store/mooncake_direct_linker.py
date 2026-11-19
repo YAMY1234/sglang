@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+    attach_cpu_indices,
     resolve_hybrid_device_pool_group,
     vector_key_range_meta,
 )
@@ -699,6 +700,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         self.load_per_key = envs.SGLANG_LINKER_LOAD_PER_KEY.get()
         self.vector_meta = envs.SGLANG_LINKER_VECTOR_META.get()
+        self.cpu_indices = envs.SGLANG_LINKER_CPU_INDICES.get()
         self.num_load_threads = envs.SGLANG_LINKER_LOAD_THREADS.get() or (
             2 if self.load_overlap else 1
         )
@@ -1422,6 +1424,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if self.mla_broadcaster is not None:
             raise RuntimeError("Mooncake linker prefetch mode does not support MLA dedup.")
         self._log_numa_first_request()
+        if self.cpu_indices:
+            transfers = attach_cpu_indices(transfers)
         expanded = self.pool_group.resolve_transfers(
             transfers, allow_partial=True, allow_missing_kv=True
         )
@@ -1960,6 +1964,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         """``path_hashes`` gives the page hashes from the root to the node, for
         the state path cap."""
         self._log_numa_first_request()
+        if self.cpu_indices:
+            transfers = attach_cpu_indices(transfers)
         expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
         if not expanded:
             return False

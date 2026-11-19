@@ -183,6 +183,45 @@ class TestDevicePoolEntry(CustomTestCase):
         )
         self.assertIsNone(vector_key_range_meta(unpacked, [0], 1))
 
+    def test_cpu_indices_keep_device_copies_off_linker_threads(self):
+        # SGLANG_LINKER_CPU_INDICES: prefetch slots (allocator) and offload node
+        # values are device tensors; the scheduler thread copies them to the CPU
+        # so _rows on the read/offload threads never D2H-copies against the forward.
+        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+            attach_cpu_indices,
+        )
+
+        host = torch.tensor([0, 1, 4, 5])
+        device = Mock(is_cuda=True, shape=host.shape, dtype=host.dtype)
+        pinned = Mock()
+        with patch(
+            "sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler.torch.empty",
+            return_value=pinned,
+        ) as empty:
+            out = attach_cpu_indices(
+                [
+                    PoolTransfer(name=PoolName.KV, keys=["a", "b"], device_indices=device),
+                    PoolTransfer(name=PoolName.MAMBA, keys=["s"], device_indices=host),
+                ]
+            )
+        empty.assert_called_once_with(host.shape, dtype=host.dtype, pin_memory=True)
+        pinned.copy_.assert_called_once_with(device, non_blocking=True)
+        self.assertIs(out[0].cpu_indices, pinned)
+        self.assertIsNone(out[1].cpu_indices)  # already on the CPU
+
+        pool = DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=None,
+            components=[[torch.zeros((8, 3), dtype=torch.uint8)]],
+            layer_mapping={0: 0},
+            page_size=2,
+            rows_are_pages=False,
+        )
+        before = DevicePoolEntry.cuda_index_copies
+        pool.prepare_locations(host)
+        self.assertEqual(DevicePoolEntry.cuda_index_copies, before)
+
     def test_rejects_invalid_pages_and_empty_buffers(self):
         with self.assertRaisesRegex(ValueError, "has no storage buffers"):
             DevicePoolEntry(

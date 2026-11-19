@@ -93,7 +93,13 @@ class DevicePoolEntry:
     def translate_indices(self, indices: torch.Tensor) -> torch.Tensor:
         return self._index_mapper(indices) if self._index_mapper else indices
 
+    # Device-tensor indices copied to the CPU here (SGLANG_LINKER_CPU_INDICES
+    # keeps the linker's read and offload threads at zero).
+    cuda_index_copies = 0
+
     def _rows(self, indices: torch.Tensor) -> list[int]:
+        if indices.is_cuda:
+            DevicePoolEntry.cuda_index_copies += 1
         slots = indices.detach().to(device="cpu", dtype=torch.int64).flatten()
         if slots.numel() % self.page_size:
             raise ValueError(
@@ -372,6 +378,23 @@ class DevicePoolGroup:
                 )
             )
         return resolved
+
+
+def attach_cpu_indices(transfers: list[PoolTransfer]) -> list[PoolTransfer]:
+    """SGLANG_LINKER_CPU_INDICES: on the scheduler thread, give each transfer with
+    device slot indices a CPU copy (non-blocking D2H on the current stream), so the
+    linker threads read CPU indices and never sync a D2H copy against the forward.
+    The caller records its ready event after this, so the copy has landed once a
+    thread waits on that event."""
+    out = []
+    for transfer in transfers:
+        indices = transfer.device_indices
+        if transfer.cpu_indices is None and indices is not None and indices.is_cuda:
+            cpu = torch.empty(indices.shape, dtype=indices.dtype, pin_memory=True)
+            cpu.copy_(indices, non_blocking=True)
+            transfer = replace(transfer, cpu_indices=cpu)
+        out.append(transfer)
+    return out
 
 
 def _maps_indices(entry) -> bool:
