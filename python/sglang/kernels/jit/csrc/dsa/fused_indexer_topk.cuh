@@ -416,13 +416,15 @@ __global__ __launch_bounds__(LayoutTraits<kLayout>::kNumThreads, 1) void fstk_sc
         const uint32_t rel = kv_offset - win_start;
         const bool take = rel < win_len and result >= row_tau;
         const uint32_t mask = __ballot_sync(0xffffffffu, take);
-        const uint32_t base = sub_cnt[kFilter ? ci : 0];
-        sub_cnt[kFilter ? ci : 0] = base + __popc(mask);
-        if (take) {
-          const uint32_t pos = base + __popc(mask & ((1u << lane_idx) - 1u));
-          if (pos < params.cand_sub_cap)
-            params.cand_key[(static_cast<uint64_t>(row) * kNumMathWarps + sub_idx) * params.cand_sub_cap + pos] =
-                (static_cast<uint64_t>(ordered_key(result)) << 32) | static_cast<uint64_t>(~rel);
+        if (mask != 0) {  // warp-uniform: most warps have no survivor and skip the rest
+          const uint32_t base = sub_cnt[kFilter ? ci : 0];
+          sub_cnt[kFilter ? ci : 0] = base + __popc(mask);
+          if (take) {
+            const uint32_t pos = base + __popc(mask & ((1u << lane_idx) - 1u));
+            if (pos < params.cand_sub_cap)
+              params.cand_key[(static_cast<uint64_t>(row) * kNumMathWarps + sub_idx) * params.cand_sub_cap + pos] =
+                  (static_cast<uint64_t>(ordered_key(result)) << 32) | static_cast<uint64_t>(~rel);
+          }
         }
       }
     };
