@@ -1817,6 +1817,19 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             forward_batch=forward_batch, q_offset=q_offset
         )
         row_lo, row_hi = (0, q_offset) if tp_split is None else tp_split[1:3]
+        if tp_split is None and self._fused_topk_applies(metadata, q_fp8, k_fp8):
+            return self._get_topk_fused(
+                metadata=metadata,
+                q_fp8=q_fp8[:q_offset],
+                weights=weights[:q_offset],
+                k_fp8=k_fp8,
+                k_scale=k_scale,
+                ks=ks,
+                ke=ke,
+                lengths=seq_lens_expanded,
+                row_to_batch=token_to_batch_idx,
+                topk_result=topk_result,
+            )
         need_chunk, logits_budget_bytes = mqa_logits_should_chunk(
             num_rows=row_hi - row_lo,
             num_cols=k_offset,
@@ -2007,6 +2020,92 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             # Rank order == row order, so the gather rebuilds rows [0, q_offset).
             group, _, _, sizes = tp_split
             group.all_gatherv(dst, sizes=sizes, output=topk_result[:q_offset])
+        return topk_result
+
+    def _fused_topk_applies(
+        self, metadata: BaseIndexerMetadata, q_fp8: torch.Tensor, k_fp8: torch.Tensor
+    ) -> bool:
+        if not (_is_cuda and envs.SGLANG_DSA_FUSED_INDEXER_TOPK.get()):
+            return False
+        from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import (
+            DSAIndexerMetadata,
+        )
+        from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
+            TopkTransformMethod,
+        )
+
+        # The fused kernel is DeepGEMM's 32-head FP8 scorer; its output contract is
+        # the v2 packed PAGED top-k's (an exact set, physical slots).
+        return (
+            isinstance(metadata, DSAIndexerMetadata)
+            and metadata.packed_extend_topk
+            and not metadata.force_unfused_topk
+            and metadata.topk_transform_method == TopkTransformMethod.PAGED
+            and metadata.topk_backend.should_use_topk_v2()
+            and envs.SGLANG_DSA_FUSE_TOPK.get()
+            and 0 < self.index_topk <= 2048
+            and self.num_init_tokens == 0
+            and self.num_local_tokens == 0
+            and q_fp8.shape[1:] == (32, 128)
+            and k_fp8.dtype == torch.float8_e4m3fn
+            and not get_is_capture_mode()
+            and not torch.cuda.is_current_stream_capturing()
+        )
+
+    def _get_topk_fused(
+        self,
+        *,
+        metadata: BaseIndexerMetadata,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        k_fp8: torch.Tensor,
+        k_scale: torch.Tensor,
+        ks: torch.Tensor,
+        ke: torch.Tensor,
+        lengths: torch.Tensor,
+        row_to_batch: torch.Tensor,
+        topk_result: torch.Tensor,
+    ) -> torch.Tensor:
+        from sglang.kernels.ops.attention.dsa.fused_indexer_topk import (
+            fused_indexer_topk,
+        )
+        from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
+            _topk_transform_v2_packed,
+        )
+
+        attn_metadata = metadata.attn_metadata
+        rows = q_fp8.shape[0]
+        res = fused_indexer_topk(
+            q_fp8,
+            k_fp8,
+            k_scale,
+            weights,
+            ks,
+            ke,
+            lengths.to(torch.int32),
+            row_to_batch.to(torch.int32),
+            attn_metadata.real_page_table,
+            attn_metadata.page_size,
+            self.index_topk,
+        )
+        topk_result[:rows] = res.out
+        # Host sync: rows whose sampled threshold missed (expected none) are rescored
+        # in full and selected by the packed v2 top-k.
+        num_fallback = int(res.num_fallback.item())
+        if num_fallback:
+            fb = res.fallback_rows[:num_fallback].long()
+            q_pad, w_pad, _ = self._pad_heads_for_deep_gemm(q_fp8[fb], weights[fb])
+            logits = resolve_fp8_mqa_logits_fn()(
+                q_pad, (k_fp8, k_scale), w_pad, ks[fb], ke[fb], clean_logits=False
+            )
+            topk_result[fb] = _topk_transform_v2_packed(
+                logits,
+                lengths[fb].to(torch.int32),
+                self.index_topk,
+                attn_metadata,
+                row_starts=ks[fb],
+                row_to_batch=row_to_batch[fb],
+            )
         return topk_result
 
     @staticmethod

@@ -2308,6 +2308,10 @@ class Envs:
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
     SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBool(False)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
+    # Packed PAGED prefill top-k from a fused scorer that never writes the score
+    # matrix (kernels/ops/attention/dsa/fused_indexer_topk.py); its unsettled rows
+    # take the chunked path.
+    SGLANG_DSA_FUSED_INDEXER_TOPK = EnvBool(False)
     # Requires a DeepGEMM paged-MQA scheduler supporting batches > SM count
     # (0.2.3 does); set to 0 for an older DeepGEMM.
     SGLANG_DSA_FULL_BATCH_MQA = EnvBool(True)
