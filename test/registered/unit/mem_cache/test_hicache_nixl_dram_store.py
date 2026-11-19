@@ -150,6 +150,7 @@ class _MemTransport:
         self.pool = (ctypes.c_char * pool_bytes)()
         self.base = ctypes.addressof(self.pool)
         self.local, self.posts = [], []
+        self.memmove = ctypes.memmove  # bound now, so tests can patch the staging copies' memmove alone
 
     def register_local(self, ranges):
         self.local.extend((p, p + n) for p, n in ranges)
@@ -157,10 +158,11 @@ class _MemTransport:
     def post(self, op, remote, local, remote_descs):
         self.posts.append((op, list(local)))
         for (la, n, _), (ra, _, _) in zip(local, remote_descs):
+            la, n, ra = int(la), int(n), int(ra)
             if not any(s <= la and la + n <= e for s, e in self.local):
                 raise NixlDramError(f"local range 0x{la:x}+{n} is not registered")
             dst, src = (self.base + ra, la) if op == "WRITE" else (la, self.base + ra)
-            ctypes.memmove(dst, src, n)
+            self.memmove(dst, src, n)
 
     def wait(self, posted, deadline):
         return "DONE"
@@ -177,12 +179,7 @@ def _staged_client(staging_mib, pool_bytes=1 << 20):
     client.counters = {"xfer_errors": 0}
     client._lock = threading.Lock()
     client._staging = None
-    if staging_mib:
-        with mock.patch.dict(os.environ, {"SGLANG_HICACHE_NIXL_DRAM_STAGING_MIB": str(staging_mib)}):
-            buf = mmap.mmap(-1, staging_mib << 20)
-            addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
-            client.transport.register_local([(addr, staging_mib << 20)])
-            client._staging, client._staging_lock = (buf, addr, staging_mib << 20), threading.Lock()
+    client._init_staging(staging_mib)
     return client
 
 
@@ -238,11 +235,49 @@ class TestNixlDramStaging(CustomTestCase):
         self.assertEqual(client._transfer("WRITE", {0: [(0, 0)]}, [[pa]], [[64]]), {0: "DONE"})
         self.assertEqual(client.transport.posts[0][1][0][0], pa)
 
+    def test_parts_inside_a_registered_host_buffer_move_as_torch_rows_both_ways(self):
+        client = _staged_client(1, pool_bytes=1 << 20)
+        page = 4096
+        pool, pp = _host(64 * page, 0)  # a host pool buffer of 64 pages, two "pools" of rows inside it
+        idx_pool, ip = _host(64 * 512, 0)
+        client.register_buffer(pp, 64 * page)
+        client.register_buffer(ip, 64 * 512)
+        pages = [5, 9, 40]
+        for k, pg in enumerate(pages):
+            ctypes.memset(pp + pg * page, 10 + k, page)
+            ctypes.memset(ip + pg * 512, 20 + k, 512)
+        ptrs = [[pp + pg * page, ip + pg * 512] for pg in pages]
+        sizes = [[page, 512]] * 3
+        plans = {0: [(k, k * (page + 512)) for k in range(3)]}
+        with mock.patch("ctypes.memmove", side_effect=AssertionError("row-aligned parts must not use memmove")):
+            self.assertEqual(client._transfer("WRITE", plans, ptrs, sizes), {0: "DONE"})
+        for k in range(3):
+            off = k * (page + 512)
+            self.assertEqual(client.transport.pool[off : off + page], bytes([10 + k]) * page)
+            self.assertEqual(client.transport.pool[off + page : off + page + 512], bytes([20 + k]) * 512)
+        ctypes.memset(pp, 0, 64 * page)
+        ctypes.memset(ip, 0, 64 * 512)
+        self.assertEqual(client._transfer("READ", plans, ptrs, sizes), {0: "DONE"})
+        for k, pg in enumerate(pages):
+            self.assertEqual(bytes(pool[pg * page : (pg + 1) * page]), bytes([10 + k]) * page)
+            self.assertEqual(bytes(idx_pool[pg * 512 : (pg + 1) * 512]), bytes([20 + k]) * 512)
+        self.assertEqual(bytes(pool[0:page]), bytes(page))  # untouched rows stay untouched
+
+    def test_failed_read_service_does_not_overwrite_host_rows(self):
+        client = _staged_client(1)
+        a, pa = _host(256, 0)
+        client.register_buffer(pa, 256)
+        client.transport.wait = lambda posted, deadline: "ERR"
+        self.assertEqual(client._transfer("READ", {0: [(0, 0)]}, [[pa]], [[256]]), {0: "ERR"})
+        self.assertEqual(bytes(a), bytes(256))
+
     def test_register_buffer_skips_the_host_pool_in_staging_mode(self):
         client = _staged_client(1)
         before = list(client.transport.local)
-        self.assertEqual(client.register_buffer(0x7F0000000000, 1 << 30), 0)
+        host, ph = _host(4096, 1)
+        self.assertEqual(client.register_buffer(ph, 4096), 0)
         self.assertEqual(client.transport.local, before)
+        self.assertEqual(len(client._host_views), 1)
 
 
 if __name__ == "__main__":

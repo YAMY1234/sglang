@@ -531,14 +531,22 @@ class NixlDramClient:
         # SGLANG_HICACHE_NIXL_DRAM_STAGING_MIB=N: register only an N MiB staging region and bounce every transfer
         # through it, instead of registering the whole host pool (registering ~1 TB per node slowed every step).
         self._staging = None
-        staging_mib = int(os.environ.get("SGLANG_HICACHE_NIXL_DRAM_STAGING_MIB", "0") or 0)
-        if staging_mib > 0:
-            buf = mmap.mmap(-1, staging_mib << 20)
-            addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
-            self.transport.register_local([(addr, staging_mib << 20)])
-            self._staging = (buf, addr, staging_mib << 20)
-            self._staging_lock = threading.Lock()
-            logger.info("HiCache NIXL DRAM L3: staging region %d MiB registered; host pool is not registered", staging_mib)
+        self._init_staging(int(os.environ.get("SGLANG_HICACHE_NIXL_DRAM_STAGING_MIB", "0") or 0))
+
+    def _init_staging(self, staging_mib: int):
+        if staging_mib <= 0:
+            return
+        import torch
+
+        buf = mmap.mmap(-1, staging_mib << 20)
+        addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
+        self.transport.register_local([(addr, staging_mib << 20)])
+        self._staging = (buf, addr, staging_mib << 20)
+        self._stage_t = torch.frombuffer(buf, dtype=torch.uint8)
+        self._staging_lock = threading.Lock()
+        self._host_views = []  # (base, size, uint8 tensor over the host buffer), from register_buffer
+        self._row_views = {}  # (buffer index, row bytes) -> [rows, row bytes] view of that buffer
+        logger.info("HiCache NIXL DRAM L3: staging region %d MiB registered; host pool is not registered", staging_mib)
 
     # -- helpers
     def _token(self) -> str:
@@ -619,48 +627,59 @@ class NixlDramClient:
             return self._transfer_staged(op, plans, ptr_parts, size_parts)
 
     def _transfer_staged(self, op, plans, ptr_parts, size_parts) -> Dict[int, str]:
-        """Bounce through the registered staging region: objects are packed into it in chunks; WRITE copies host
-        parts in before posting, READ copies them out after a DONE. A service's state is its worst chunk's."""
+        """Bounce through the registered staging region in chunks. Host parts are grouped by (host buffer, size) and
+        moved with one torch index_select / index_copy_ per group, so the copies run without the GIL; parts that do
+        not sit on a row of their buffer fall back to memmove. A service's state is its worst chunk's."""
+        import numpy as np
+
         _, base, cap = self._staging
         rank = {"DONE": 0, "TIMEOUT": 1, "ERR": 2}
         state: Dict[int, str] = {}
-        items = [(s, it) for s, its in plans.items() for it in its]
+        items = [(s, i, addr) for s, its in plans.items() for i, addr in its]
+        totals = [sum(int(x) for x in size_parts[i]) for _, i, _ in items]
         k = 0
         while k < len(items):
-            chunk, sp, ss, off = {}, {}, {}, 0
+            chunk, used = [], 0
             while k < len(items):
-                s, (i, addr) = items[k]
-                n = sum(int(x) for x in size_parts[i])
+                n = totals[k]
                 if n > cap:
                     logger.error("HiCache NIXL DRAM L3: object of %d bytes exceeds the %d byte staging region", n, cap)
-                    state[s] = "ERR"
+                    state[items[k][0]] = "ERR"
                     k += 1
                     continue
-                if off + n > cap:
+                if used + n > cap:
                     break
-                sp[i], ss[i] = [base + off], [n]
-                chunk.setdefault(s, []).append((i, addr))
-                off += n
+                chunk.append(k)
+                used += n
                 k += 1
             if not chunk:
                 continue
+            # flatten parts: service, host pointer, size, remote address
+            svc, ptr, size, raddr = [], [], [], []
+            for c in chunk:
+                s, i, addr = items[c]
+                off = 0
+                for p, n in zip(ptr_parts[i], size_parts[i]):
+                    svc.append(s)
+                    ptr.append(int(p))
+                    size.append(int(n))
+                    raddr.append(addr + off)
+                    off += int(n)
+            svc, ptr, size, raddr = (np.asarray(x, dtype=np.int64) for x in (svc, ptr, size, raddr))
+            dst = self._stage_layout(ptr, size)  # staging offset per part
             if op == "WRITE":
-                for its in chunk.values():
-                    for i, _ in its:
-                        d = sp[i][0]
-                        for p, n in zip(ptr_parts[i], size_parts[i]):
-                            ctypes.memmove(d, int(p), int(n))
-                            d += int(n)
-            st = self._transfer_direct(op, chunk, sp, ss)
+                self._stage_copy(True, ptr, size, dst)
+            descs = {}
+            for s in np.unique(svc):
+                m = svc == s
+                local = np.stack([base + dst[m], size[m], np.zeros(int(m.sum()), np.int64)], axis=1).astype(np.uint64)
+                remote = np.stack([raddr[m], size[m], np.zeros(int(m.sum()), np.int64)], axis=1).astype(np.uint64)
+                descs[int(s)] = (local, remote, sum(1 for c in chunk if items[c][0] == s))
+            st = self._post_wait(op, descs)
             if op == "READ":
-                for s, its in chunk.items():
-                    if st.get(s) != "DONE":
-                        continue
-                    for i, _ in its:
-                        src = sp[i][0]
-                        for p, n in zip(ptr_parts[i], size_parts[i]):
-                            ctypes.memmove(int(p), src, int(n))
-                            src += int(n)
+                done = np.isin(svc, [s for s, v in st.items() if v == "DONE"])
+                if done.any():
+                    self._stage_copy(False, ptr[done], size[done], dst[done])
             for s, v in st.items():
                 if rank.get(v, 2) > rank.get(state.get(s, "DONE"), 2):
                     state[s] = v
@@ -668,22 +687,75 @@ class NixlDramClient:
                     state.setdefault(s, v)
         return state
 
-    def _transfer_direct(
-        self, op: str, plans: Dict[int, list], ptr_parts, size_parts
-    ) -> Dict[int, str]:
-        """Post one transfer per service, then wait for all; {service: DONE | ERR | TIMEOUT}."""
+    def _stage_layout(self, ptr, size):
+        """Staging offset of each part: parts are laid out group by group ((host buffer, size) groups, in order of
+        first appearance), so each group is one contiguous [rows, size] block of the staging region."""
+        import numpy as np
+
+        bases = np.asarray([v[0] for v in self._host_views] or [0], dtype=np.int64)
+        buf = np.searchsorted(bases, ptr, side="right") - 1
+        key = buf * (1 << 40) + size
+        _, first, inv = np.unique(key, return_index=True, return_inverse=True)
+        order = np.argsort(first, kind="stable")  # group ids in order of first appearance
+        rank_of = np.empty_like(order)
+        rank_of[order] = np.arange(len(order))
+        g = rank_of[inv]
+        dst = np.empty(len(ptr), dtype=np.int64)
+        off = 0
+        for gi in range(len(order)):
+            m = np.nonzero(g == gi)[0]
+            dst[m] = off + np.arange(len(m), dtype=np.int64) * size[m[0]]
+            off += int(size[m].sum())
+        return dst
+
+    def _stage_copy(self, to_stage: bool, ptr, size, dst):
+        """Host parts <-> staging. One torch op per (host buffer, size) group whose parts sit on rows of the buffer;
+        the rest (unregistered addresses, unaligned parts) are copied one by one with memmove."""
+        import numpy as np
+        import torch
+
+        _, base, _ = self._staging
+        bases = np.asarray([v[0] for v in self._host_views] or [0], dtype=np.int64)
+        buf = np.searchsorted(bases, ptr, side="right") - 1
+        slow = np.ones(len(ptr), dtype=bool)
+        if self._host_views:
+            for b in np.unique(buf[buf >= 0]):
+                hb, hs, ht = self._host_views[int(b)]
+                for n in np.unique(size[buf == b]):
+                    m = np.nonzero((buf == b) & (size == n))[0]
+                    rel = ptr[m] - hb
+                    ok = (rel % n == 0) & (rel + n <= hs)
+                    m = m[ok]
+                    if len(m) == 0:
+                        continue
+                    if not np.all(np.diff(dst[m]) == n):  # staging rows of a group are contiguous by layout
+                        continue
+                    rows = self._row_views.get((int(b), int(n)))
+                    if rows is None:
+                        rows = ht[: (hs // int(n)) * int(n)].view(-1, int(n))
+                        self._row_views[(int(b), int(n))] = rows
+                    idx = torch.from_numpy((ptr[m] - hb) // n)
+                    stage = self._stage_t[int(dst[m[0]]) : int(dst[m[0]]) + len(m) * int(n)].view(len(m), int(n))
+                    if to_stage:
+                        torch.index_select(rows, 0, idx, out=stage)
+                    else:
+                        rows.index_copy_(0, idx, stage)
+                    slow[m] = False
+        for j in np.nonzero(slow)[0]:
+            a, b = (base + int(dst[j]), int(ptr[j])) if to_stage else (int(ptr[j]), base + int(dst[j]))
+            ctypes.memmove(a, b, int(size[j]))
+
+    def _post_wait(self, op: str, descs: Dict[int, tuple]) -> Dict[int, str]:
+        """descs: {service: (local, remote, object count)}; post one transfer per service, then wait for all."""
         posted, state = {}, {}
-        for s, items in plans.items():
-            if not items:
-                continue
-            local, remote = self._descs(items, ptr_parts, size_parts)
+        for s, (local, remote, count) in descs.items():
             try:
                 posted[s] = self.transport.post(op, self.remotes[s], local, remote)
             except Exception as e:
                 logger.error(
                     "HiCache NIXL DRAM L3: %s of %d object(s) on %s failed to post: %s",
                     op,
-                    len(items),
+                    count,
                     self.service_names[s],
                     e,
                 )
@@ -695,7 +767,7 @@ class NixlDramClient:
                 logger.error(
                     "HiCache NIXL DRAM L3: %s of %d object(s) on %s: %s%s",
                     op,
-                    len(plans[s]),
+                    descs[s][2],
                     self.service_names[s],
                     state[s],
                     (
@@ -710,6 +782,17 @@ class NixlDramClient:
             self._count(xfer_errors=failed)
         return state
 
+    def _transfer_direct(
+        self, op: str, plans: Dict[int, list], ptr_parts, size_parts
+    ) -> Dict[int, str]:
+        """Post one transfer per service, then wait for all; {service: DONE | ERR | TIMEOUT}."""
+        descs = {}
+        for s, items in plans.items():
+            if items:
+                local, remote = self._descs(items, ptr_parts, size_parts)
+                descs[s] = (local, remote, len(items))
+        return self._post_wait(op, descs)
+
     # -- the store interface MooncakeStore uses
     def set_page_units(self, units: Dict[int, int]):
         """{buffer address: a whole number of pages in bytes} for buffers registered later (reg_chunk_mib)."""
@@ -718,6 +801,13 @@ class NixlDramClient:
     def register_buffer(self, ptr: int, size: int) -> int:
         ptr, size = int(ptr), int(size)
         if self._staging is not None:
+            # Not registered; a uint8 view of it lets staged copies run as torch ops (staging mode).
+            view = (ctypes.c_uint8 * size).from_address(ptr)
+            import torch
+
+            self._host_views.append((ptr, size, torch.frombuffer(view, dtype=torch.uint8)))
+            self._host_views.sort(key=lambda v: v[0])
+            self._row_views.clear()
             logger.info("HiCache NIXL DRAM L3: host buffer 0x%x (%.2f GiB) not registered (staging mode)", ptr, size / (1 << 30))
             return 0
         if os.environ.get("SGLANG_HICACHE_NIXL_DRAM_SKIP_HOST_REGISTER") == "1":
