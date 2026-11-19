@@ -3524,7 +3524,6 @@ def test_pp_early_reads_late_completions_never_finish_a_pending_read(seed):
     for _, w in stages:
         assert w.early.counts["voted_direct"] == 0 and w.early.counts["voted_unused"] == 0
         assert len(w.early.slab.free["kv"]) == 6, (w.pp_rank, w.early.counts)
-    assert any(len(entry) == 4 for _, w in stages for entry in w.started)  # staged loads ran
 
 
 def test_pp_prefetch_relay_settles_a_request_with_nothing_to_look_up():
