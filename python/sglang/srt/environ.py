@@ -912,6 +912,8 @@ class Envs:
     SGLANG_HICACHE_DEVICE_WRITE_AHEAD_MAX_TOKENS = EnvInt(2097152)
     SGLANG_HICACHE_DEVICE_WRITE_AHEAD_BATCH_MAX_TOKENS = EnvInt(1048576)
     SGLANG_HICACHE_DEVICE_WRITE_AHEAD_ACK_LAG = EnvInt(1)
+    # Staged write-back: batch small page copies and merge adjacent host rows.
+    SGLANG_OPT_HICACHE_BATCH_WRITE_BACK_COPY = EnvBool(False)
     # p-micro rig only: per-launch host / D2H counters and per-op HiCache timings
     # (PMICRO_HOSTSTAT / PMICRO_HOSTOPS log lines, see mem_cache/pmicro_hoststats.py).
     SGLANG_PMICRO_HOSTSTATS = EnvBool(False)
