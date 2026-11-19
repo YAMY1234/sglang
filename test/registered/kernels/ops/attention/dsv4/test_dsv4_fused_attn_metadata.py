@@ -221,7 +221,7 @@ def test_first_row_offsets(n, dtype):
 
 
 @pytest.mark.parametrize("num_rows", [1, 300, 32768])
-def test_commit_packed_rows_persistent(num_rows):
+def test_commit_packed_rows_tiled(num_rows):
     gen = torch.Generator().manual_seed(num_rows)
     layout, page, capacity = KVLayout.V41_NEW, 256, 256
     pages = triton_cdiv(num_rows + 1, page)
@@ -236,10 +236,10 @@ def test_commit_packed_rows_persistent(num_rows):
     )
     dst_pages = triton_cdiv(num_reqs * capacity, page)
     outs = []
-    for persistent in (False, True):
+    for tiled in (False, True):
         dst = torch.zeros((dst_pages, stride), dtype=torch.uint8, device=DEVICE)
         tags = torch.full((num_reqs * capacity,), -1, dtype=torch.int64, device=DEVICE)
-        with envs.SGLANG_OPT_DSV41_WINDOW_COMMIT_PERSISTENT.override(persistent):
+        with envs.SGLANG_OPT_DSV41_WINDOW_COMMIT_TILED.override(tiled):
             commit_packed_rows(src, dst, tags, window, page_size=page, capacity=capacity, layout=layout)
         outs.append((dst, tags))
     # Each (req, pos % capacity) is distinct, so no two kept rows share a target.

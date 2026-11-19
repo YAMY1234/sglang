@@ -1,6 +1,5 @@
 """Copy packed request-window KV rows without materializing byte index grids."""
 
-import torch
 import triton
 import triton.language as tl
 
@@ -124,7 +123,7 @@ def _commit_packed_rows(
 
 
 @triton.jit
-def _commit_packed_rows_persistent(
+def _commit_packed_rows_tiled(
     src,
     dst,
     tags,
@@ -142,49 +141,43 @@ def _commit_packed_rows_persistent(
     DATA_STRIDE: tl.constexpr,
     SCALE_BASE: tl.constexpr,
     SCALE_STRIDE: tl.constexpr,
+    ROWS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    # _commit_packed_rows with a grid of a few programs per SM striding over the rows:
-    # most rows are discarded, and one program each made the launch the cost.
-    for row in range(tl.program_id(0), num_rows, tl.num_programs(0)):
-        if tl.load(keep + row):
-            source = tl.load(src_loc + row).to(tl.int64)
-            position = tl.load(pos + row).to(tl.int64)
-            target = tl.load(req + row).to(tl.int64) * CAPACITY + position % CAPACITY
-            col = tl.arange(0, BLOCK)
-            source_offset = _row_offset(
-                source, col, PAGE, DATA, DATA_STRIDE, SCALE_BASE, SCALE_STRIDE
-            )
-            target_offset = _row_offset(
-                target, col, PAGE, DATA, DATA_STRIDE, SCALE_BASE, SCALE_STRIDE
-            )
-            value = tl.load(
-                src + source // PAGE * SRC_STRIDE + source_offset,
-                mask=col < DATA + SCALE,
-                other=0,
-            )
-            tl.store(
-                dst + target // PAGE * DST_STRIDE + target_offset,
-                value,
-                mask=col < DATA + SCALE,
-            )
-            tl.store(tags + target, position)
+    # _commit_packed_rows over a tile of ROWS rows per program: most rows are
+    # discarded, and one program per row made the launch the cost.
+    row = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+    live = row < num_rows
+    kept = live & (tl.load(keep + row, mask=live, other=0) != 0)
+    source = tl.load(src_loc + row, mask=kept, other=0).to(tl.int64)
+    position = tl.load(pos + row, mask=kept, other=0).to(tl.int64)
+    target = (
+        tl.load(req + row, mask=kept, other=0).to(tl.int64) * CAPACITY
+        + position % CAPACITY
+    )
+    col = tl.arange(0, BLOCK)
+    source_offset = _row_offset(
+        source[:, None], col[None, :], PAGE, DATA, DATA_STRIDE, SCALE_BASE, SCALE_STRIDE
+    )
+    target_offset = _row_offset(
+        target[:, None], col[None, :], PAGE, DATA, DATA_STRIDE, SCALE_BASE, SCALE_STRIDE
+    )
+    m = kept[:, None] & (col[None, :] < DATA + SCALE)
+    value = tl.load(
+        src + (source // PAGE * SRC_STRIDE)[:, None] + source_offset, mask=m, other=0
+    )
+    tl.store(dst + (target // PAGE * DST_STRIDE)[:, None] + target_offset, value, mask=m)
+    tl.store(tags + target, position, mask=kept)
 
 
-_NUM_SMS = {}
-
-
-def _commit_programs(device, num_rows: int) -> int:
-    if device not in _NUM_SMS:
-        _NUM_SMS[device] = torch.cuda.get_device_properties(device).multi_processor_count
-    # Arbitrary; enough programs per SM to hide the kept rows' load latency.
-    return max(1, min(num_rows, 8 * _NUM_SMS[device]))
+# Arbitrary; few enough rows that a tile of bytes stays in registers.
+_COMMIT_TILE_ROWS = 8
 
 
 def commit_packed_rows(src, dst, tags, window, *, page_size, capacity, layout):
     num_rows = window.write_loc.numel()
-    if envs.SGLANG_OPT_DSV41_WINDOW_COMMIT_PERSISTENT.get() and num_rows:
-        _commit_packed_rows_persistent[(_commit_programs(src.device, num_rows),)](
+    if envs.SGLANG_OPT_DSV41_WINDOW_COMMIT_TILED.get() and num_rows:
+        _commit_packed_rows_tiled[(triton.cdiv(num_rows, _COMMIT_TILE_ROWS),)](
             src,
             dst,
             tags,
@@ -200,6 +193,7 @@ def commit_packed_rows(src, dst, tags, window, *, page_size, capacity, layout):
             layout.data_bytes,
             layout.scale_bytes,
             *layout.row_addressing(page_size),
+            _COMMIT_TILE_ROWS,
             triton.next_power_of_2(layout.bytes_per_token),
             num_warps=4,
         )
