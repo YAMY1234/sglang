@@ -68,9 +68,9 @@ struct ScoreParams {
   const int32_t* order;  // [num_q_blocks] q-block visit order; nullptr: identity
   float* logits;         // kModeLogits
   const float* tau;      // kModeFilter: per-row threshold
-  float* cand_score;     // kModeFilter: [num_q_tokens, cand_cap]
-  int32_t* cand_col;     // kModeFilter: [num_q_tokens, cand_cap]
-  int32_t* cand_count;   // kModeFilter: [num_q_tokens], zeroed by the caller
+  // kModeFilter: [num_q_tokens, cand_cap] select keys, (ordered score << 32) | ~window column
+  uint64_t* cand_key;
+  int32_t* cand_count;  // kModeFilter: [num_q_tokens], written by the row's CTA (may exceed cand_cap)
   uint32_t cand_cap;
   float* sink;  // kModeNoStore
 };
@@ -138,6 +138,12 @@ struct OrderedScheduler {
     }
   }
 };
+
+// Order-preserving float -> uint32 (larger key = larger score).
+CUTLASS_DEVICE uint32_t ordered_key(float x) {
+  const uint32_t bits = __float_as_uint(x);
+  return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+}
 
 // The FP32 head reduction of one (row, key), operation for operation DeepGEMM's
 // (bitwise contract): pairs of heads, 2*relu as a + |a|, two f32x2 FMA chains.
@@ -246,6 +252,10 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
     cutlass::arch::fence_barrier_init();
   }
   __syncwarp();
+
+  // Per-row candidate counters of the q-block in flight (kModeFilter), past DeepGEMM's layout.
+  auto* s_cand = reinterpret_cast<uint32_t*>(smem_buffer + math::constexpr_align(sizeof(SharedStorage), size_t(16)));
+  if (threadIdx.x < kBlockQ) s_cand[threadIdx.x] = 0;
 
   if (warp_idx == kSpecWarpStart + 2) cute::TMEM::Allocator1Sm().allocate(kNumTmemCols, &smem.tmem_ptr_in_smem);
   __syncthreads();
@@ -373,12 +383,16 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
 
     // One (row, key) result: store, accumulate, or filter into the row's list. Callers
     // pass the row's window and tau as values so the per-row arrays stay in registers.
-    const auto handle = [&](const uint32_t row,
+    // A row belongs to one CTA, so its list position comes from a shared-memory counter
+    // (no global atomic round trip in the scoring loop); the count is published per q-block.
+    const auto handle = [&](const uint32_t q_block_idx,
+                            const uint32_t li,
                             const uint32_t win_start,
                             const uint32_t win_len,
                             const float row_tau,
                             const uint32_t kv_offset,
                             const float result) {
+      const uint32_t row = q_block_idx * kBlockQ + li;
       if constexpr (kMode == kModeLogits) {
         params.logits[row * static_cast<uint64_t>(params.logits_stride) + kv_offset] = result;
       } else if constexpr (kMode == kModeNoStore) {
@@ -389,17 +403,28 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
         const uint32_t mask = __ballot_sync(0xffffffffu, take);
         if (mask != 0) {
           uint32_t base = 0;
-          if (lane_idx == 0) base = static_cast<uint32_t>(atomicAdd(params.cand_count + row, __popc(mask)));
+          if (lane_idx == 0) base = atomicAdd(s_cand + li, static_cast<uint32_t>(__popc(mask)));
           base = __shfl_sync(0xffffffffu, base, 0);
           if (take) {
             const uint32_t pos = base + __popc(mask & ((1u << lane_idx) - 1u));
-            if (pos < params.cand_cap) {
-              const uint64_t slot = static_cast<uint64_t>(row) * params.cand_cap + pos;
-              params.cand_score[slot] = result;
-              params.cand_col[slot] = static_cast<int32_t>(rel);
-            }
+            if (pos < params.cand_cap)
+              params.cand_key[static_cast<uint64_t>(row) * params.cand_cap + pos] =
+                  (static_cast<uint64_t>(ordered_key(result)) << 32) | static_cast<uint64_t>(~rel);
           }
         }
+      }
+    };
+    // Publishes and clears the q-block's counters once both warpgroups are done with it.
+    const auto flush_counts = [&](const uint32_t q_block_idx) {
+      if constexpr (kFilter) {
+        cutlass::arch::NamedBarrier(kNumMathThreads, 1).sync();
+        const uint32_t t = warp_idx * 32 + lane_idx;
+        if (t < kBlockQ) {
+          const uint32_t row = q_block_idx * kBlockQ + t;
+          if (row < params.num_q_tokens) params.cand_count[row] = static_cast<int32_t>(s_cand[t]);
+          s_cand[t] = 0;
+        }
+        cutlass::arch::NamedBarrier(kNumMathThreads, 1).sync();
       }
     };
     const auto load_tau = [&](const uint32_t q_block_idx) {
@@ -475,7 +500,8 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
               smem.empty_tmem_barriers[tmem_stage_idx].arrive();
             }
             handle(
-                q_block_idx * kBlockQ + i,
+                q_block_idx,
+                i,
                 seq_k_start[kFilter ? i : 0],
                 seq_k_end[kFilter ? i : 0] - seq_k_start[kFilter ? i : 0],
                 tau[kFilter ? i : 0],
@@ -484,6 +510,7 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
           }
         }
 
+        flush_counts(q_block_idx);
         cutlass::arch::fence_view_async_shared();
         smem.empty_q_barriers[q_stage_idx].arrive();
       }
@@ -554,8 +581,8 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
               smem.empty_tmem_barriers[tmem_stage_idx].arrive();
               const float r0 = dg_reduce<kAluHeads>(accum[0], weights[0]) * scale_kv[h];
               const float r1 = dg_reduce<kAluHeads>(accum[1], weights[1]) * scale_kv[h];
-              handle(q_block_idx * kBlockQ + row0, win_start[0], win_len[0], row_tau[0], kv_offset, r0);
-              handle(q_block_idx * kBlockQ + row0 + 1, win_start[1], win_len[1], row_tau[1], kv_offset, r1);
+              handle(q_block_idx, row0, win_start[0], win_len[0], row_tau[0], kv_offset, r0);
+              handle(q_block_idx, row0 + 1, win_start[1], win_len[1], row_tau[1], kv_offset, r1);
             } else {
               // DeepGEMM's per-row load pattern over this warpgroup's 4 rows.
 #pragma unroll
@@ -570,7 +597,8 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
                   smem.empty_tmem_barriers[tmem_stage_idx].arrive();
                 }
                 handle(
-                    q_block_idx * kBlockQ + row0 + r,
+                    q_block_idx,
+                    row0 + r,
                     win_start[r],
                     win_len[r],
                     row_tau[r],
@@ -581,6 +609,7 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
           }
         }
 
+        flush_counts(q_block_idx);
         cutlass::arch::fence_view_async_shared();
         smem.empty_q_barriers[q_stage_idx].arrive();
       }
@@ -605,8 +634,7 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
 constexpr uint32_t kSelectThreads = 1024;
 
 struct SelectParams {
-  const float* cand_score;
-  const int32_t* cand_col;
+  const uint64_t* cand_key;
   const int32_t* cand_count;
   const int32_t* lengths;       // per-row window length
   const int32_t* row_to_batch;  // per-row page-table row
@@ -620,11 +648,6 @@ struct SelectParams {
   uint32_t cand_cap;
   uint32_t page_bits;
 };
-
-SGL_DEVICE uint32_t ordered_key(float x) {
-  const uint32_t bits = __float_as_uint(x);
-  return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
-}
 
 // One CTA per row. Keys are (ordered score, ~column): unique, larger is better, so the
 // top-k is every key >= the k-th largest, found by an 8-bit radix select. Equal scores
@@ -653,10 +676,7 @@ __global__ __launch_bounds__(kSelectThreads, 1) void fstk_select_kernel(const Se
     return;
   }
   const uint64_t base = static_cast<uint64_t>(row) * p.cand_cap;
-  for (uint32_t t = tx; t < n; t += kSelectThreads) {
-    const uint32_t col = static_cast<uint32_t>(p.cand_col[base + t]);
-    keys[t] = (static_cast<uint64_t>(ordered_key(p.cand_score[base + t])) << 32) | static_cast<uint64_t>(~col);
-  }
+  for (uint32_t t = tx; t < n; t += kSelectThreads) keys[t] = p.cand_key[base + t];
   uint64_t prefix = 0, prefix_mask = 0;
   uint32_t remaining = p.topk;
   __syncthreads();
@@ -840,8 +860,7 @@ inline void score_impl(
     tvm::ffi::TensorView order,    // [num_q_blocks] int32 (or empty: identity)
     tvm::ffi::TensorView logits,   // kModeLogits: [T, stride] fp32
     tvm::ffi::TensorView tau,      // kModeFilter: [T] fp32
-    tvm::ffi::TensorView cand_score,
-    tvm::ffi::TensorView cand_col,
+    tvm::ffi::TensorView cand_key,
     tvm::ffi::TensorView cand_count,
     int64_t num_ctas) {
   using namespace sglang::host;
@@ -868,10 +887,9 @@ inline void score_impl(
   if constexpr (kMode == kModeNoStore) params.sink = static_cast<float*>(logits.data_ptr());
   if constexpr (kMode == kModeFilter) {
     params.tau = static_cast<const float*>(tau.data_ptr());
-    params.cand_score = static_cast<float*>(cand_score.data_ptr());
-    params.cand_col = static_cast<int32_t*>(cand_col.data_ptr());
+    params.cand_key = static_cast<uint64_t*>(cand_key.data_ptr());
     params.cand_count = static_cast<int32_t*>(cand_count.data_ptr());
-    params.cand_cap = static_cast<uint32_t>(cand_score.size(1));
+    params.cand_cap = static_cast<uint32_t>(cand_key.size(1));
   }
 
   const auto map_q = make_map_2d(
@@ -890,7 +908,7 @@ inline void score_impl(
   using SharedStorage = fstk_dg_layout::MQALogitsSharedStorage<
       kNumHeads, kHeadDim, false, Traits::kBlockQ, Traits::kSplitKV, kNumQStages, Traits::kNumKVStages,
       Traits::kNumTmemStages, cutlass::float_e4m3_t, float>;
-  constexpr size_t kSmem = sizeof(SharedStorage);
+  constexpr size_t kSmem = (sizeof(SharedStorage) + 15) / 16 * 16 + 64;  // + the q-block counters
   constexpr auto kernel = fstk_score_kernel<kMode, kReuseKV, kLayout, kAluHeads>;
   const DLDevice device = q.device();
   runtime::init_per_device(device, [=] { runtime::set_max_dynamic_smem(kernel, kSmem); });
@@ -909,14 +927,13 @@ inline void score_dispatch(
     tvm::ffi::TensorView order,
     tvm::ffi::TensorView logits,
     tvm::ffi::TensorView tau,
-    tvm::ffi::TensorView cand_score,
-    tvm::ffi::TensorView cand_col,
+    tvm::ffi::TensorView cand_key,
     tvm::ffi::TensorView cand_count,
     int64_t mode,
     int64_t reuse_kv,
     int64_t num_ctas) {
 #define FSTK_SCORE(M, R) \
-  score_impl<M, R, kLayout, kAluHeads>(q, kv, kv_scale, weights, ks, ke, order, logits, tau, cand_score, cand_col, cand_count, num_ctas)
+  score_impl<M, R, kLayout, kAluHeads>(q, kv, kv_scale, weights, ks, ke, order, logits, tau, cand_key, cand_count, num_ctas)
   switch (mode) {
     case kModeLogits:
       return FSTK_SCORE(kModeLogits, false);
@@ -946,8 +963,7 @@ struct FusedIndexerTopK {
       tvm::ffi::TensorView order,
       tvm::ffi::TensorView logits,
       tvm::ffi::TensorView tau,
-      tvm::ffi::TensorView cand_score,
-      tvm::ffi::TensorView cand_col,
+      tvm::ffi::TensorView cand_key,
       tvm::ffi::TensorView cand_count,
       int64_t mode,
       int64_t reuse_kv,
@@ -955,7 +971,7 @@ struct FusedIndexerTopK {
       int64_t alu_heads,
       int64_t num_ctas) {
 #define FSTK_DISPATCH(LY, AH) \
-  return score_dispatch<LY, AH>(q, kv, kv_scale, weights, ks, ke, order, logits, tau, cand_score, cand_col, cand_count, mode, reuse_kv, num_ctas)
+  return score_dispatch<LY, AH>(q, kv, kv_scale, weights, ks, ke, order, logits, tau, cand_key, cand_count, mode, reuse_kv, num_ctas)
     sglang::host::RuntimeCheck(alu_heads == 0 or alu_heads == 16, "fstk: alu_heads must be 0 or 16");
     sglang::host::RuntimeCheck(layout >= 0 and layout <= 2, "fstk: layout must be 0, 1 or 2");
     if (layout == 0) {
@@ -973,8 +989,7 @@ struct FusedIndexerTopK {
 
 
   static void select(
-      tvm::ffi::TensorView cand_score,
-      tvm::ffi::TensorView cand_col,
+      tvm::ffi::TensorView cand_key,
       tvm::ffi::TensorView cand_count,
       tvm::ffi::TensorView lengths,
       tvm::ffi::TensorView row_to_batch,
@@ -985,8 +1000,7 @@ struct FusedIndexerTopK {
       int64_t page_size) {
     using namespace sglang::host;
     SelectParams p{};
-    p.cand_score = static_cast<const float*>(cand_score.data_ptr());
-    p.cand_col = static_cast<const int32_t*>(cand_col.data_ptr());
+    p.cand_key = static_cast<const uint64_t*>(cand_key.data_ptr());
     p.cand_count = static_cast<const int32_t*>(cand_count.data_ptr());
     p.lengths = static_cast<const int32_t*>(lengths.data_ptr());
     p.row_to_batch = static_cast<const int32_t*>(row_to_batch.data_ptr());
@@ -997,7 +1011,7 @@ struct FusedIndexerTopK {
     p.page_table_stride = page_table.stride(0);
     p.num_rows = static_cast<uint32_t>(out.size(0));
     p.topk = static_cast<uint32_t>(out.size(1));
-    p.cand_cap = static_cast<uint32_t>(cand_score.size(1));
+    p.cand_cap = static_cast<uint32_t>(cand_key.size(1));
     RuntimeCheck(page_size > 0 and (page_size & (page_size - 1)) == 0, "fstk: page_size must be a power of two");
     p.page_bits = static_cast<uint32_t>(__builtin_ctzll(static_cast<unsigned long long>(page_size)));
     if (p.num_rows == 0) return;

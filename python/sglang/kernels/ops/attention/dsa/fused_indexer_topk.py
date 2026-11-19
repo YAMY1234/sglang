@@ -94,8 +94,7 @@ def score(
     order: Optional[torch.Tensor] = None,
     logits: Optional[torch.Tensor] = None,
     tau: Optional[torch.Tensor] = None,
-    cand_score: Optional[torch.Tensor] = None,
-    cand_col: Optional[torch.Tensor] = None,
+    cand_key: Optional[torch.Tensor] = None,
     cand_count: Optional[torch.Tensor] = None,
     reuse_kv: bool = False,
     layout: int = DEFAULT_LAYOUT,
@@ -116,8 +115,7 @@ def score(
         order if order is not None else _empty(dev, torch.int32),
         logits if logits is not None else _empty(dev),
         tau if tau is not None else _empty(dev),
-        cand_score if cand_score is not None else _empty(dev),
-        cand_col if cand_col is not None else _empty(dev, torch.int32),
+        cand_key if cand_key is not None else _empty(dev, torch.int64),
         cand_count if cand_count is not None else _empty(dev, torch.int32),
         mode,
         int(reuse_kv),
@@ -192,9 +190,10 @@ def fused_indexer_topk(
     tau = torch.empty(rows, device=dev, dtype=torch.float32)
     _jit_module(cuh_path).tau(sample_logits, sks, ske, lengths, tau, rank, topk, keep_all)
 
-    cand_score = torch.empty(rows, cand_cap, device=dev, dtype=torch.float32)
-    cand_col = torch.empty(rows, cand_cap, device=dev, dtype=torch.int32)
-    cand_count = torch.zeros(rows, device=dev, dtype=torch.int32)
+    # Select keys: (order-preserving score bits << 32) | ~window column. Every row's count is
+    # written by the CTA that owns it.
+    cand_key = torch.empty(rows, cand_cap, device=dev, dtype=torch.int64)
+    cand_count = torch.empty(rows, device=dev, dtype=torch.int32)
     score(
         q_fp8,
         kv_fp8,
@@ -205,8 +204,7 @@ def fused_indexer_topk(
         mode=MODE_FILTER,
         order=order,
         tau=tau,
-        cand_score=cand_score,
-        cand_col=cand_col,
+        cand_key=cand_key,
         cand_count=cand_count,
         layout=layout,
         alu_heads=alu_heads,
@@ -216,8 +214,7 @@ def fused_indexer_topk(
     fallback_rows = torch.empty(rows, device=dev, dtype=torch.int32)
     num_fallback = torch.zeros(1, device=dev, dtype=torch.int32)
     _jit_module(cuh_path).select(
-        cand_score,
-        cand_col,
+        cand_key,
         cand_count,
         lengths,
         row_to_batch,
