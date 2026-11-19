@@ -813,10 +813,12 @@ class UnifiedRadixCache(BasePrefixCache):
             or (self.linker is not None and self.linker.load_mode != "prefetch")
         ):
             return None
-        # Evictions and lock changes move these sizes; inserts and walks bump the epoch.
+        # Every eviction shrinks a component's cached total; inserts and walks bump
+        # the epoch. Lock changes move tokens between the two sizes but change no
+        # match or recency, so they keep the key.
         core = self.tree_core
         return (self.match_epoch,) + tuple(
-            (core.component_evictable_size(ct), core.component_protected_size(ct))
+            core.component_evictable_size(ct) + core.component_protected_size(ct)
             for ct in self.tree_components
         )
 

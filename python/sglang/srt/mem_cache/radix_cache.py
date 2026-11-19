@@ -627,7 +627,8 @@ class RadixCache(BasePrefixCache):
         return not self.disable
 
     def match_state_key(self) -> Optional[tuple]:
-        return (self.match_epoch, self.evictable_size_, self.protected_size_)
+        # Lock changes move tokens between the two sizes but change no match.
+        return (self.match_epoch, self.evictable_size_ + self.protected_size_)
 
     def evictable_size(self):
         return self.evictable_size_

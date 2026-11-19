@@ -507,16 +507,16 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         keys.append(cache.match_state_key())
         m = match_prefix(cache, seq_a)
         keys.append(cache.match_state_key())
+        # A lock changes no match or recency, so the key holds.
         lock_result = cache.inc_lock_ref(m.last_device_node)
-        keys.append(cache.match_state_key())
-        # Eviction does not bump the epoch: the sizes it changes must move the key.
+        self.assertEqual(cache.match_state_key(), keys[-1])
+        # Eviction does not bump the epoch: the smaller cached total moves the key.
         result = cache.evict(EvictParams(num_tokens=len(seq_b)))
         self.assertGreaterEqual(result.num_tokens_evicted, len(seq_b))
         keys.append(cache.match_state_key())
         cache.dec_lock_ref(m.last_device_node, lock_result.to_dec_params())
-        keys.append(cache.match_state_key())
-        self.assertEqual(len(set(keys)), len(keys))
         self.assertEqual(cache.match_state_key(), keys[-1])
+        self.assertEqual(len(set(keys)), len(keys))
 
     def test_prev_prefix_len(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
