@@ -476,6 +476,7 @@ class UnifiedCacheLinkerWrapper:
     _early_slab = None
     # Finish-path waits (ms) for staged loads still being queued, since the last stats line.
     _finish_wait_ms: tuple = ()
+    _staged_fallbacks: Counter | None = None
 
     # Async admission: the relayed verdict of a skipped hit, and the passes in a
     # row after which its pre-pin goes ahead of the window and is held until
@@ -1422,6 +1423,30 @@ class UnifiedCacheLinkerWrapper:
             early.send = channel.send
         self._early_slab, self._early_channel, self.early = slab, channel, early
         self._finish_wait_ms = []
+        self._staged_fallbacks = Counter()
+
+    def _staged_load_failed(self, request, state, publish: bool) -> bool:
+        """A staged load failed after its early vote counted, so every stage
+        publishes the request while this stage's slots were never filled: read them
+        from the store now (the scheduler waits), or raise under
+        SGLANG_LINKER_EARLY_STRICT. Returns whether this stage may publish."""
+        error = state.future.exception()
+        if envs.SGLANG_LINKER_EARLY_STRICT.get():
+            raise RuntimeError(f"staged load of {request.rid} failed after its vote") from error
+        logger.warning("Linker staged load of %s failed (%r); reading it from the store", request.rid, error)
+        self._staged_fallbacks["fallback"] += 1
+        transfers = [t for _, t in state.component_transfers]
+        for _ in range(2):
+            future = self.cache_linker.prefetch(transfers)
+            if future is not None and future.result(timeout=120) is True:
+                state.future = future
+                return publish
+        # Not publishing desyncs this stage's tree from the others; publishing would
+        # serve unfilled slots. Neither is safe: counted and logged loudly.
+        self._staged_fallbacks["fallback_failed"] += 1
+        state.abort_reason = "staged_fallback_failed"
+        logger.error("Linker staged load of %s: the store read failed too; not published on this stage", request.rid)
+        return False
 
     def _early_plan(self, hashes: list[str]) -> dict:
         transfers = [
@@ -1676,9 +1701,10 @@ class UnifiedCacheLinkerWrapper:
                 waits = sorted(self._finish_wait_ms)
                 self._finish_wait_ms = []
                 pick = lambda q: waits[min(len(waits) - 1, int(q * len(waits)))] if waits else 0.0
-                logger.info("Linker early reads: %s, slab free %s; finish waits n=%d p50 %.1f p99 %.1f max %.1f ms",
+                logger.info("Linker early reads: %s, slab free %s; finish waits n=%d p50 %.1f p99 %.1f max %.1f ms; "
+                            "staged loads read from the store %s",
                             dict(self.early.counts), {str(k): len(v) for k, v in self._early_slab.free.items()},
-                            len(waits), pick(0.5), pick(0.99), waits[-1] if waits else 0.0)
+                            len(waits), pick(0.5), pick(0.99), waits[-1] if waits else 0.0, dict(self._staged_fallbacks))
         waits = sorted(self._requery_waits)
         self._requery_waits.clear()
         p50, p90 = (
@@ -1871,8 +1897,7 @@ class UnifiedCacheLinkerWrapper:
         if state.future is not None:
             assert state.future.done()
             if getattr(state.future, "staged", False) and state.future.exception() is not None:
-                # Voted by its early read, so every stage publishes it; this stage's slots were never filled.
-                raise RuntimeError(f"staged load of {request.rid} failed after its vote") from state.future.exception()
+                publish = self._staged_load_failed(request, state, publish)
             copy_event = getattr(state.future, "copy_event", None)
             if copy_event is not None:
                 # Staged load: the forward (or a reuse of freed slots) runs after the scatter.

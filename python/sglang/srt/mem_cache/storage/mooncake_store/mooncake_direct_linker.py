@@ -1062,15 +1062,21 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
         def run():
             ready.synchronize()
-            plans = []
-            for transfer in expanded:
-                entry = self.pools[transfer.name]
-                table = getattr(entry, "_staging_table", None)
-                if table is None:
-                    table = entry._staging_table = coalesce_key_range_table(entry.key_range_table(self.num_layers))
-                rows = entry.key_range_rows(entry.prepare_locations(transfer.host_indices))
-                plans.append(scatter_plan(table, rows, slab.ptrs(transfer.name, staged.slots[transfer.name])))
-            done = scatter(plans, self._staging_stream)
+            try:
+                plans = []
+                for transfer in expanded:
+                    entry = self.pools[transfer.name]
+                    table = getattr(entry, "_staging_table", None)
+                    if table is None:
+                        table = entry._staging_table = coalesce_key_range_table(entry.key_range_table(self.num_layers))
+                    rows = entry.key_range_rows(entry.prepare_locations(transfer.host_indices))
+                    plans.append(scatter_plan(table, rows, slab.ptrs(transfer.name, staged.slots[transfer.name])))
+                done = scatter(plans, self._staging_stream)
+            except Exception:
+                # The finish reads these slots' data from the store instead; free the staging.
+                self._staging_stream.synchronize()
+                release(staged)
+                raise
             future.copy_event = done
             future.set_result(True)
             done.synchronize()

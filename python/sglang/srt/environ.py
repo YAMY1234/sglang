@@ -1107,6 +1107,9 @@ class Envs:
     # How a staged load reaches the request's slots: "ce" one cudaMemcpyBatchAsync on
     # the copy engines; "kernel" the Triton scatter on the SMs (UVA reads).
     SGLANG_LINKER_EARLY_COPY = EnvStr("ce")
+    # A staged load that failed after its early vote: raise at its finish (debug
+    # builds) instead of reading it from the store again (counted).
+    SGLANG_LINKER_EARLY_STRICT = EnvBool(False)
     SGLANG_LINKER_EARLY_STATES = EnvInt(32)
     SGLANG_LINKER_HELPER = EnvBool(False)
     SGLANG_LINKER_HELPER_SEGMENT_MB = EnvInt(0)

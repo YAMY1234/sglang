@@ -3177,17 +3177,44 @@ def test_prefetch_cancel_records_its_reason(full_linker_component):
     assert wrapper._abort_reasons == {"timeout": 1}
 
 
-def test_finish_of_a_failed_staged_load_raises_instead_of_publishing():
-    # The early read voted for it, so every stage publishes; this stage's slots were never filled.
+def _failed_staged_load(fallback_results):
     wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
     future = Future()
     future.staged = True
     future.set_exception(RuntimeError("cudaMemcpyBatchAsync failed"))
-    handle = _Handle("a")
-    wrapper.prefetches = {handle: SimpleNamespace(future=future)}
-    wrapper._requery_started = {}
-    with pytest.raises(RuntimeError, match="failed after its vote"):
-        wrapper._finish_prefetch(handle, publish=True)
+    reads = []
+
+    def prefetch(transfers):
+        read = Future()
+        read.set_result(fallback_results[len(reads)])
+        reads.append(transfers)
+        return read
+
+    wrapper.cache_linker = SimpleNamespace(prefetch=prefetch)
+    wrapper._staged_fallbacks = Counter()
+    state = SimpleNamespace(future=future, component_transfers=[(None, "kv"), (None, "mamba")], abort_reason=None)
+    return wrapper, state, reads
+
+
+def test_finish_of_a_failed_staged_load_raises_under_strict():
+    # The early read voted for it, so every stage publishes; this stage's slots were never filled.
+    wrapper, state, reads = _failed_staged_load([True])
+    with patch.object(envs.SGLANG_LINKER_EARLY_STRICT, "get", return_value=True):
+        with pytest.raises(RuntimeError, match="failed after its vote"):
+            wrapper._staged_load_failed(_Handle("a"), state, True)
+    assert reads == []
+
+
+def test_failed_staged_load_is_read_from_the_store_or_not_published():
+    wrapper, state, reads = _failed_staged_load([True])
+    assert wrapper._staged_load_failed(_Handle("a"), state, True) is True
+    assert reads == [["kv", "mamba"]] and state.future.result() is True
+    assert not hasattr(state.future, "copy_event")  # the forward does not wait on the failed copy
+    # Both store reads fail: never publish the unfilled slots; counted.
+    wrapper, state, reads = _failed_staged_load([False, "session_start:-704x2"])
+    assert wrapper._staged_load_failed(_Handle("b"), state, True) is False
+    assert len(reads) == 2 and state.abort_reason == "staged_fallback_failed"
+    assert wrapper._staged_fallbacks == {"fallback": 1, "fallback_failed": 1}
 
 
 class _VoteStore:
