@@ -56,9 +56,13 @@ def _same(a: torch.Tensor, b: torch.Tensor) -> None:
 
 
 def _req_to_token(num_reqs: int, width: int, gen) -> torch.Tensor:
+    # Built on the device: a host-side fill of up to 1M x 1024 takes minutes.
+    device_gen = torch.Generator(device=DEVICE).manual_seed(
+        int(torch.randint(0, 1 << 31, (1,), generator=gen))
+    )
     return torch.randint(
-        0, NUM_SLOTS, (num_reqs, width), generator=gen, dtype=torch.int32
-    ).to(DEVICE)
+        0, NUM_SLOTS, (num_reqs, width), generator=device_gen, dtype=torch.int32, device=DEVICE
+    )
 
 
 def _verify_rows(bs: int, qo: int, gen):
@@ -165,7 +169,7 @@ def test_page_table_and_low_ratio(rows_kind, size, max_seq_len):
 @pytest.mark.parametrize("n,pad", [(1, 0), (472, 0), (472, 168), (65536, 0)])
 def test_gather_int32(n, pad):
     gen = torch.Generator().manual_seed(n + pad)
-    mapping = torch.randint(0, 1 << 20, (NUM_SLOTS,), generator=gen).to(DEVICE)
+    mapping = torch.randint(0, 1 << 20, (NUM_SLOTS,), device=DEVICE)
     loc = torch.randint(0, NUM_SLOTS, (n,), generator=gen).to(DEVICE)
     loc[0] = -1  # torch wraps negative indices
     ref = mapping[loc].to(torch.int32)
