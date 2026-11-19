@@ -2148,6 +2148,13 @@ class Envs:
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
     SGLANG_OPT_ENGRAM_EXTEND_HASH = EnvBool(False)
     SGLANG_OPT_DSV41_MEGA_MHC_PREFILL = EnvBool(False)
+    # Prefill Mega mHC through the deep_gemm_fp4acts build's task-ring kernel (tasks claimed from a ticket ring, four
+    # IO stages); same outputs bitwise.
+    SGLANG_OPT_DSV41_MEGA_MHC_TASK_RING = EnvBool(False)
+    # With the task ring: residual and normed outputs of batches of 5000+ rows in a locality-striped pool sized for
+    # LOCALITY_MAX_TOKENS rows (two slots), each die's SMs posting its own rows. Needs MLOPart.
+    SGLANG_OPT_DSV41_MEGA_MHC_LOCALITY = EnvBool(False)
+    SGLANG_OPT_DSV41_MEGA_MHC_LOCALITY_MAX_TOKENS = EnvInt(32768)
     # Deprecated for --engram-config "replication".
     SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("per_rank")
     # Scheduler-side staging of shared host-table rows on GPUs without ATS
