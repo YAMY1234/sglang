@@ -4,7 +4,10 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
+import ctypes
+import mmap
 import os
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -13,7 +16,11 @@ import torch
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig, PoolName
 from sglang.srt.mem_cache.storage.nixl_dram.nixl_dram_store import HiCacheNixlDram
-from sglang.srt.mem_cache.storage.nixl_dram.nixl_dram_client import NixlTransport
+from sglang.srt.mem_cache.storage.nixl_dram.nixl_dram_client import (
+    NixlDramClient,
+    NixlDramError,
+    NixlTransport,
+)
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -134,6 +141,108 @@ class TestNixlDramPoolRegistration(CustomTestCase):
         with mock.patch.dict(os.environ, flags):
             self.assertEqual(transport.wait(["h", "ERR"], deadline=-1), "ERR")
         transport.agent.release_xfer_handle.assert_called_once_with("h")
+
+
+class _MemTransport:
+    """In-memory stand-in for NIXL: like ShmTransport, it refuses local ranges that were not registered."""
+
+    def __init__(self, pool_bytes):
+        self.pool = (ctypes.c_char * pool_bytes)()
+        self.base = ctypes.addressof(self.pool)
+        self.local, self.posts = [], []
+
+    def register_local(self, ranges):
+        self.local.extend((p, p + n) for p, n in ranges)
+
+    def post(self, op, remote, local, remote_descs):
+        self.posts.append((op, list(local)))
+        for (la, n, _), (ra, _, _) in zip(local, remote_descs):
+            if not any(s <= la and la + n <= e for s, e in self.local):
+                raise NixlDramError(f"local range 0x{la:x}+{n} is not registered")
+            dst, src = (self.base + ra, la) if op == "WRITE" else (la, self.base + ra)
+            ctypes.memmove(dst, src, n)
+
+    def wait(self, posted, deadline):
+        return "DONE"
+
+    def close(self):
+        pass
+
+
+def _staged_client(staging_mib, pool_bytes=1 << 20):
+    client = NixlDramClient.__new__(NixlDramClient)
+    client.cfg = SimpleNamespace(xfer_timeout_s=5.0)
+    client.transport = _MemTransport(pool_bytes)
+    client.remotes, client.service_names = [None], ["svc0"]
+    client.counters = {"xfer_errors": 0}
+    client._lock = threading.Lock()
+    client._staging = None
+    if staging_mib:
+        with mock.patch.dict(os.environ, {"SGLANG_HICACHE_NIXL_DRAM_STAGING_MIB": str(staging_mib)}):
+            buf = mmap.mmap(-1, staging_mib << 20)
+            addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
+            client.transport.register_local([(addr, staging_mib << 20)])
+            client._staging, client._staging_lock = (buf, addr, staging_mib << 20), threading.Lock()
+    return client
+
+
+def _host(n, fill):
+    b = (ctypes.c_char * n)(*([fill] * n))
+    return b, ctypes.addressof(b)
+
+
+class TestNixlDramStaging(CustomTestCase):
+    def test_write_and_read_bounce_through_staging_with_an_unregistered_host_pool(self):
+        client = _staged_client(1)
+        a, pa = _host(3000, 7)
+        b, pb = _host(5000, 9)
+        plans = {0: [(0, 0), (1, 8192)]}
+        ptrs, sizes = [[pa], [pb]], [[3000], [5000]]
+        self.assertEqual(client._transfer("WRITE", plans, ptrs, sizes), {0: "DONE"})
+        _, stage, cap = client._staging
+        for op, local in client.transport.posts:
+            self.assertTrue(all(stage <= la and la + n <= stage + cap for la, n, _ in local))
+        ctypes.memset(pa, 0, 3000)
+        ctypes.memset(pb, 0, 5000)
+        self.assertEqual(client._transfer("READ", plans, ptrs, sizes), {0: "DONE"})
+        self.assertEqual(bytes(a), bytes([7]) * 3000)
+        self.assertEqual(bytes(b), bytes([9]) * 5000)
+
+    def test_multi_part_object_is_packed_contiguously(self):
+        client = _staged_client(1)
+        a, pa = _host(100, 1)
+        b, pb = _host(200, 2)
+        self.assertEqual(client._transfer("WRITE", {0: [(0, 0)]}, [[pa, pb]], [[100, 200]]), {0: "DONE"})
+        self.assertEqual(client.transport.pool[0:300], bytes([1]) * 100 + bytes([2]) * 200)
+
+    def test_batch_larger_than_staging_is_sent_in_chunks(self):
+        client = _staged_client(1, pool_bytes=2 << 20)
+        objs = [_host(400 << 10, k + 1) for k in range(3)]  # 3 x 400 KiB through 1 MiB of staging
+        plans = {0: [(k, k * (400 << 10)) for k in range(3)]}
+        state = client._transfer("WRITE", plans, [[p] for _, p in objs], [[400 << 10]] * 3)
+        self.assertEqual(state, {0: "DONE"})
+        self.assertEqual(len(client.transport.posts), 2)
+        for k in range(3):
+            off = k * (400 << 10)
+            self.assertEqual(client.transport.pool[off : off + 16], bytes([k + 1]) * 16)
+
+    def test_object_larger_than_staging_fails_its_service(self):
+        client = _staged_client(1, pool_bytes=4 << 20)
+        big, pbig = _host(2 << 20, 3)
+        self.assertEqual(client._transfer("WRITE", {0: [(0, 0)]}, [[pbig]], [[2 << 20]]), {0: "ERR"})
+
+    def test_without_staging_the_host_pointers_are_posted_directly(self):
+        client = _staged_client(0)
+        a, pa = _host(64, 5)
+        client.transport.register_local([(pa, 64)])
+        self.assertEqual(client._transfer("WRITE", {0: [(0, 0)]}, [[pa]], [[64]]), {0: "DONE"})
+        self.assertEqual(client.transport.posts[0][1][0][0], pa)
+
+    def test_register_buffer_skips_the_host_pool_in_staging_mode(self):
+        client = _staged_client(1)
+        before = list(client.transport.local)
+        self.assertEqual(client.register_buffer(0x7F0000000000, 1 << 30), 0)
+        self.assertEqual(client.transport.local, before)
 
 
 if __name__ == "__main__":

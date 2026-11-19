@@ -20,6 +20,7 @@ import itertools
 import json
 import logging
 import math
+import mmap
 import os
 import socket
 import tempfile
@@ -527,6 +528,17 @@ class NixlDramClient:
             cfg.devices() or "any",
             ", verify on (CRC32 per object)" if cfg.verify else "",
         )
+        # SGLANG_HICACHE_NIXL_DRAM_STAGING_MIB=N: register only an N MiB staging region and bounce every transfer
+        # through it, instead of registering the whole host pool (registering ~1 TB per node slowed every step).
+        self._staging = None
+        staging_mib = int(os.environ.get("SGLANG_HICACHE_NIXL_DRAM_STAGING_MIB", "0") or 0)
+        if staging_mib > 0:
+            buf = mmap.mmap(-1, staging_mib << 20)
+            addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
+            self.transport.register_local([(addr, staging_mib << 20)])
+            self._staging = (buf, addr, staging_mib << 20)
+            self._staging_lock = threading.Lock()
+            logger.info("HiCache NIXL DRAM L3: staging region %d MiB registered; host pool is not registered", staging_mib)
 
     # -- helpers
     def _token(self) -> str:
@@ -601,6 +613,64 @@ class NixlDramClient:
     def _transfer(
         self, op: str, plans: Dict[int, list], ptr_parts, size_parts
     ) -> Dict[int, str]:
+        if self._staging is None:
+            return self._transfer_direct(op, plans, ptr_parts, size_parts)
+        with self._staging_lock:  # one staged transfer at a time per client bounds in-flight bytes
+            return self._transfer_staged(op, plans, ptr_parts, size_parts)
+
+    def _transfer_staged(self, op, plans, ptr_parts, size_parts) -> Dict[int, str]:
+        """Bounce through the registered staging region: objects are packed into it in chunks; WRITE copies host
+        parts in before posting, READ copies them out after a DONE. A service's state is its worst chunk's."""
+        _, base, cap = self._staging
+        rank = {"DONE": 0, "TIMEOUT": 1, "ERR": 2}
+        state: Dict[int, str] = {}
+        items = [(s, it) for s, its in plans.items() for it in its]
+        k = 0
+        while k < len(items):
+            chunk, sp, ss, off = {}, {}, {}, 0
+            while k < len(items):
+                s, (i, addr) = items[k]
+                n = sum(int(x) for x in size_parts[i])
+                if n > cap:
+                    logger.error("HiCache NIXL DRAM L3: object of %d bytes exceeds the %d byte staging region", n, cap)
+                    state[s] = "ERR"
+                    k += 1
+                    continue
+                if off + n > cap:
+                    break
+                sp[i], ss[i] = [base + off], [n]
+                chunk.setdefault(s, []).append((i, addr))
+                off += n
+                k += 1
+            if not chunk:
+                continue
+            if op == "WRITE":
+                for its in chunk.values():
+                    for i, _ in its:
+                        d = sp[i][0]
+                        for p, n in zip(ptr_parts[i], size_parts[i]):
+                            ctypes.memmove(d, int(p), int(n))
+                            d += int(n)
+            st = self._transfer_direct(op, chunk, sp, ss)
+            if op == "READ":
+                for s, its in chunk.items():
+                    if st.get(s) != "DONE":
+                        continue
+                    for i, _ in its:
+                        src = sp[i][0]
+                        for p, n in zip(ptr_parts[i], size_parts[i]):
+                            ctypes.memmove(int(p), src, int(n))
+                            src += int(n)
+            for s, v in st.items():
+                if rank.get(v, 2) > rank.get(state.get(s, "DONE"), 2):
+                    state[s] = v
+                else:
+                    state.setdefault(s, v)
+        return state
+
+    def _transfer_direct(
+        self, op: str, plans: Dict[int, list], ptr_parts, size_parts
+    ) -> Dict[int, str]:
         """Post one transfer per service, then wait for all; {service: DONE | ERR | TIMEOUT}."""
         posted, state = {}, {}
         for s, items in plans.items():
@@ -647,6 +717,9 @@ class NixlDramClient:
 
     def register_buffer(self, ptr: int, size: int) -> int:
         ptr, size = int(ptr), int(size)
+        if self._staging is not None:
+            logger.info("HiCache NIXL DRAM L3: host buffer 0x%x (%.2f GiB) not registered (staging mode)", ptr, size / (1 << 30))
+            return 0
         if os.environ.get("SGLANG_HICACHE_NIXL_DRAM_SKIP_HOST_REGISTER") == "1":
             # Rig diagnostic: no UCX registration of the host pool; any L3 transfer would then fail.
             logger.info("HiCache NIXL DRAM L3: host buffer 0x%x (%.2f GiB) NOT registered (SKIP_HOST_REGISTER)", ptr, size / (1 << 30))
