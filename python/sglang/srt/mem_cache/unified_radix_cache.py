@@ -1150,7 +1150,19 @@ class UnifiedRadixCache(BasePrefixCache):
             return self.req_to_token_pool.mamba_allocator.schedulable_available_size()
         raise ValueError(f"Unsupported cache component: {component_type}")
 
-    def _evict(
+    def _evict(self, params: EvictParams, *args, **kwargs) -> EvictResult:
+        # Eviction frees unlocked nodes only, never an in-flight transfer's pages: apply them
+        # now even under defer_device_frees, or an allocation that evicts to make room fails.
+        sink = getattr(self, "_deferred_free_sink", None)
+        if sink is None:
+            return self._evict_impl(params, *args, **kwargs)
+        self._deferred_free_sink = None
+        try:
+            return self._evict_impl(params, *args, **kwargs)
+        finally:
+            self._deferred_free_sink = sink
+
+    def _evict_impl(
         self,
         params: EvictParams,
         available_size_targets: Optional[
