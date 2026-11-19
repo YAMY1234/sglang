@@ -3433,6 +3433,86 @@ def test_pp_early_stop_and_reset_drop_staging_and_votes():
         assert w.early.epoch == 1
 
 
+@pytest.mark.parametrize("seed", list(range(1, 21)))
+def test_pp_early_reads_late_completions_never_finish_a_pending_read(seed):
+    """Real EarlyReads per stage; early reads land, fail or arrive late at random,
+    direct reads complete late, requests reach stage k k rounds after PP0. No stage
+    may apply a finish to an unfinished read, every stage publishes the same, and
+    every staging slot comes back."""
+    import random
+
+    import numpy as np
+
+    from sglang.srt.mem_cache.storage.mooncake_store.linker_staging import EarlyReads, StagingSlab
+
+    rng = random.Random(seed)
+    size, n_requests = 4, 12
+    stages = _relay_stages(size)
+    pending_early, pending_direct = [], []
+
+    class _Checked(_RelayWrapper):
+        def _finish_prefetch(self, handle, publish, hold=True):
+            state = self.prefetches.pop(handle, None)
+            assert state is None or state.future.done(), (handle, self.pp_rank)
+            self.finished.append((handle, publish))
+
+        def _start_prefetch_load(self, handle, *args):
+            super()._start_prefetch_load(handle, *args)
+            pending_direct.append(self.prefetches[handle].future)
+
+        def _start_prefetch_from_staging(self, handle, *args, staged):
+            super()._start_prefetch_from_staging(handle, *args, staged=staged)
+            self.early.release(staged)  # its scatter is queued; the slots return after it
+
+    for rank, (relay, wrapper) in enumerate(stages):
+        checked = _Checked(rank, size)
+        relay.w = checked
+        stages[rank] = (relay, checked)
+        buf = np.zeros(StagingSlab.size_of({"kv": (8, 6)}), dtype=np.uint8)
+
+        def read(keys, ptrs):
+            future = Future()
+            pending_early.append(future)
+            return future
+
+        checked.early = EarlyReads(
+            StagingSlab({"kv": (8, 6)}, buf, buf.ctypes.data),
+            lambda hashes: {"kv": ([f"k{h}" for h in hashes], 8)},
+            read,
+        )
+    others = [w.early for _, w in stages[1:]]
+    stages[0][1].early.send = lambda msg: [e.start(msg) for e in others]
+
+    handles = [_Handle(f"r{i}") for i in range(n_requests)]
+    arrive = {h: 2 * i for i, h in enumerate(handles)}
+    for rnd in range(400):
+        for k, (relay, w) in enumerate(stages):
+            for h in handles:
+                if arrive[h] + k == rnd:
+                    relay.begin(SimpleNamespace(cache_request_handle=h))
+                    w.lookups[h] = SimpleNamespace(
+                        key=_KEY, hashes=["h1", "h2", "h3"], start=0, anchor_node_id=0,
+                        anchor_lock="lock", timeout_s=1.0, wait_started=None,
+                        future=_done([rng.choice([2, 3])]) if k == 0 else None,
+                    )
+            # As ingest_requests: this round's requests first, then the actions held for them.
+            relay.receive([])
+        for futures in (pending_early, pending_direct):
+            for f in list(futures):
+                if rng.random() < 0.3:
+                    futures.remove(f)
+                    f.set_result(rng.random() < 0.9)
+        _relay_round(stages)
+        if all(len(w.finished) == n_requests for _, w in stages) and not pending_early:
+            break
+    finished = [w.finished for _, w in stages]
+    assert all(len(f) == n_requests for f in finished), [len(f) for f in finished]
+    assert all(f == finished[0] for f in finished)
+    for _, w in stages:
+        assert w.early.counts["voted_direct"] == 0 and w.early.counts["voted_unused"] == 0
+        assert len(w.early.slab.free["kv"]) == 6, (w.pp_rank, w.early.counts)
+
+
 def test_pp_prefetch_relay_settles_a_request_with_nothing_to_look_up():
     stages = _relay_stages()
     handle = _Handle("a")
