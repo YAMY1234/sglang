@@ -13,7 +13,11 @@ import torch
 
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
-from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender
+from sglang.srt.disaggregation.mooncake.conn import (
+    MooncakeKVManager,
+    MooncakeKVSender,
+    _mix_room_id,
+)
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -718,7 +722,7 @@ class TestMooncakeEarlySend(CustomTestCase):
         for i, q in enumerate(queues):
             got = [q.get_nowait() for _ in range(q.qsize())]
             self.assertEqual([(c.room, c.is_last_chunk) for c in got],
-                             [(r, last) for r in rooms if r % 4 == i for last in (False, True)])
+                             [(r, last) for r in rooms if _mix_room_id(r) % 4 == i for last in (False, True)])
 
     def _worker(self, event):
         chunk = TransferKVChunk(

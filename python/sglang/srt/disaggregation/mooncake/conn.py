@@ -104,6 +104,17 @@ class FailedSessionProbe:
     interval: float
 
 
+_UINT64_MASK = (1 << 64) - 1
+
+
+def _mix_room_id(room: int) -> int:
+    """Return the SplitMix64 hash of an integer room ID."""
+    mixed = (room + 0x9E3779B97F4A7C15) & _UINT64_MASK
+    mixed = ((mixed ^ (mixed >> 30)) * 0xBF58476D1CE4E5B9) & _UINT64_MASK
+    mixed = ((mixed ^ (mixed >> 27)) * 0x94D049BB133111EB) & _UINT64_MASK
+    return (mixed ^ (mixed >> 31)) & _UINT64_MASK
+
+
 # decode
 @dataclasses.dataclass
 class TransferInfo:
@@ -3451,9 +3462,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         # requests with the same dst_sessions will be added into the same
         # queue, which enables early abort with failed sessions.
         if envs.SGLANG_DISAGG_TRANSFER_SHARD_BY_ROOM.get():
-            # A room's chunks stay ordered on one queue; failed sessions are a shared set
-            # every worker checks, so early abort holds across queues.
-            shard_idx = bootstrap_room % len(self.transfer_queues)
+            # As upstream sgl-project#42163: a room's chunks stay ordered on one queue, and
+            # room IDs can be congruent with their DP rank, so mix all bits first.
+            shard_idx = _mix_room_id(bootstrap_room) % len(self.transfer_queues)
         else:
             dst_infos = self.transfer_infos[bootstrap_room].keys()
             session_port_sum = sum(
