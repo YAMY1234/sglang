@@ -1104,6 +1104,9 @@ class Envs:
     # within the pinned budget per node split over its GPUs.
     SGLANG_LINKER_EARLY_PAGES = EnvInt(40000)
     SGLANG_LINKER_EARLY_NODE_GB = EnvFloat(36.0)
+    # How a staged load reaches the request's slots: "ce" one cudaMemcpyBatchAsync on
+    # the copy engines; "kernel" the Triton scatter on the SMs (UVA reads).
+    SGLANG_LINKER_EARLY_COPY = EnvStr("ce")
     SGLANG_LINKER_EARLY_STATES = EnvInt(32)
     SGLANG_LINKER_HELPER = EnvBool(False)
     SGLANG_LINKER_HELPER_SEGMENT_MB = EnvInt(0)

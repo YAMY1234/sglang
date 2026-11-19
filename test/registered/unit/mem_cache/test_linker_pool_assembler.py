@@ -1466,6 +1466,93 @@ class TestLinkerStaging(CustomTestCase):
         early.start(EarlyMessage(0, 6, "f", ["h8"]))  # an older epoch's message is ignored
         self.assertEqual(len(reads), 4)
 
+    def test_coalesce_ranges_merges_only_ranges_contiguous_on_both_sides(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.linker_staging import coalesce_ranges, cpu_scatter
+
+        src_buf = np.random.randint(0, 255, 64, dtype=np.uint8)
+        dst_buf = np.zeros(64, dtype=np.uint8)
+        s, d = src_buf.ctypes.data, dst_buf.ctypes.data
+        # 0-4 and 4-8 join; 8-12 is contiguous in dst only; 20-24 in src only.
+        dst = np.array([d, d + 4, d + 8, d + 20, d + 40])
+        src = np.array([s, s + 4, s + 16, s + 20, s + 24])
+        sizes = np.array([4, 4, 4, 4, 4])
+        cd, cs, cn = coalesce_ranges(dst, src, sizes)
+        self.assertEqual((cd - d).tolist(), [0, 8, 20, 40])
+        self.assertEqual((cs - s).tolist(), [0, 16, 20, 24])
+        self.assertEqual(cn.tolist(), [8, 4, 4, 4])
+        cpu_scatter(cd, cs, cn)
+        want = np.zeros(64, dtype=np.uint8)
+        for a, b, n in zip(dst - d, src - s, sizes):
+            want[a : a + n] = src_buf[b : b + n]
+        self.assertTrue(np.array_equal(dst_buf, want))
+
+    def test_copy_engine_entries_per_request_at_ab4_sizes(self):
+        """Entries one staged load hands cudaMemcpyBatchAsync on the K3.1 PP8 rig,
+        and the driver time at GLM's measured 0.34 us per entry."""
+        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+            MergedPageEntry,
+            coalesce_key_range_table,
+        )
+        from sglang.srt.mem_cache.storage.mooncake_store.linker_staging import coalesce_ranges, scatter_plan
+
+        page, slab_pages = 64, 64
+        # ab4 PP0 cached pages per load (5,082 loads): p50 996, p99 5599. Every stage loads the
+        # same pages. KDA state: 9 layers (PP7: 6) x (temporal + conv) items, one object per load.
+        loads = {"p50": 996, "p99": 5599}
+        stages = {"PP0-5": (3, 18), "PP6": (2, 18), "PP7": (4, 12)}
+        report = {}
+        for stage, (attn_layers, state_items) in stages.items():
+            kvs = [torch.zeros((page * slab_pages, 576), dtype=torch.uint8) for _ in range(attn_layers)]
+            ixs = [torch.zeros((slab_pages, page * 132), dtype=torch.uint8) for _ in range(attn_layers)]
+            layers = {i: i for i in range(attn_layers)}
+            kv = DevicePoolEntry(
+                name=PoolName.KV, indices_from_pool=PoolName.KV, device_pool=None,
+                components=[kvs], layer_mapping=layers, page_size=page, rows_are_pages=False,
+            )
+            indexer = DevicePoolEntry(
+                name=PoolName.INDEXER, indices_from_pool=PoolName.KV, device_pool=None,
+                components=[ixs], layer_mapping=layers, page_size=page, rows_are_pages=True,
+            )
+            pool = MergedPageEntry(kv, indexer, object_name="ki")
+            table = coalesce_key_range_table(pool.key_range_table(attn_layers))
+            obj_bytes = int((table[:, 3] + table[:, 4]).max())
+            self.assertEqual(obj_bytes, attn_layers * 45312)
+            for name, pages in loads.items():
+                # Consecutive device pages and slots: the layout most favourable to coalescing.
+                tokens = torch.arange(pages * page) % (slab_pages * page)
+                rows = pool.key_range_rows(pool.prepare_locations(tokens))
+                ptrs = 4096 + np.arange(pages, dtype=np.int64) * obj_bytes
+                entries = len(coalesce_ranges(*scatter_plan(table, rows, ptrs))[0]) + state_items
+                # Objects are page-major in staging, device rows layer-major: nothing joins.
+                self.assertEqual(entries, pages * 2 * attn_layers + state_items)
+                report[(stage, name)] = (entries, entries * 0.34e-3)
+        for (stage, name), (entries, ms) in report.items():
+            print(f"{stage} {name}: {entries} entries per load, {ms:.1f} ms of driver time")
+        self.assertLess(max(ms for _, ms in report.values()), 20.0)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
+    def test_memcpy_batch_scatters_pinned_ranges_into_device_rows(self):
+        import time
+
+        from sglang.srt.mem_cache.storage.mooncake_store.linker_staging import copy_engine_scatter
+
+        n, size = 33612, 256  # PP0's p99 load
+        host = torch.randint(0, 255, (n * size,), dtype=torch.uint8).pin_memory()
+        dev = torch.zeros(2 * n * size, dtype=torch.uint8, device="cuda")
+        perm = torch.randperm(2 * n)[:n].numpy().astype(np.int64)
+        dst = dev.data_ptr() + perm * size
+        src = host.data_ptr() + np.arange(n, dtype=np.int64) * size
+        sizes = np.full(n, size, dtype=np.int64)
+        stream = torch.cuda.Stream()
+        copy_engine_scatter([(dst[:16], src[:16], sizes[:16])], stream).synchronize()  # warm
+        t = time.perf_counter()
+        done = copy_engine_scatter([(dst, src, sizes)], stream)
+        call_ms = (time.perf_counter() - t) * 1e3
+        done.synchronize()
+        got = dev.view(2 * n, size)[torch.from_numpy(perm).cuda()].cpu()
+        self.assertTrue(torch.equal(got, host.view(n, size)))
+        print(f"memcpy_batch: {n} entries, {call_ms:.1f} ms on the calling thread ({call_ms / n * 1e3:.2f} us/entry)")
+
     def test_early_channel_delivers_from_pp0_to_a_stage(self):
         import threading
         import time

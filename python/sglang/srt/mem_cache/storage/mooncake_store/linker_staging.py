@@ -90,6 +90,34 @@ def cpu_scatter(dst, src, sizes) -> None:
         ctypes.memmove(d, s, n)
 
 
+def coalesce_ranges(dst, src, sizes):
+    """Merge consecutive ranges that are contiguous on both sides (fewer entries
+    for the batched copy). Arrays of equal length, in copy order."""
+    dst, src, sizes = (np.asarray(a, dtype=np.int64) for a in (dst, src, sizes))
+    if len(dst) < 2:
+        return dst, src, sizes
+    joined = (dst[:-1] + sizes[:-1] == dst[1:]) & (src[:-1] + sizes[:-1] == src[1:])
+    starts = np.flatnonzero(np.concatenate(([True], ~joined)))
+    return dst[starts], src[starts], np.add.reduceat(sizes, starts)
+
+
+def copy_engine_scatter(plans, stream):
+    """Run (dst, src, sizes) plans as one cudaMemcpyBatchAsync each on ``stream``
+    (copy engines, no SM time); returns the event recorded after them. Called from
+    the staging thread: the driver spends about 0.3 us per entry."""
+    import torch
+
+    from sglang.srt.mem_cache.storage.mooncake_store.linker_staging_kernel import memcpy_batch
+
+    with torch.cuda.stream(stream):
+        for dst, src, sizes in plans:
+            if len(dst):
+                memcpy_batch(*coalesce_ranges(dst, src, sizes), stream.cuda_stream)
+        event = torch.cuda.Event()
+        event.record()
+    return event
+
+
 def gpu_scatter(plans, stream):
     """Run (dst, src, sizes) plans with one Triton launch each on ``stream`` (the GPU
     reads the pinned staging directly); returns the event recorded after them."""

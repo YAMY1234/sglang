@@ -3433,31 +3433,22 @@ def test_pp_early_stop_and_reset_drop_staging_and_votes():
         assert w.early.epoch == 1
 
 
-@pytest.mark.parametrize("seed", list(range(1, 21)))
-def test_pp_early_reads_late_completions_never_finish_a_pending_read(seed):
-    """Real EarlyReads per stage; early reads land, fail or arrive late at random,
-    direct reads complete late, requests reach stage k k rounds after PP0. No stage
-    may apply a finish to an unfinished read, every stage publishes the same, and
-    every staging slot comes back."""
-    import random
-
+def _early_read_stages(size):
+    """``size`` relay stages with real EarlyReads; staged and direct reads stay
+    pending until the test completes them (``pending_early`` / ``pending_direct``).
+    A finish on a staged load still being queued completes it, as the real wait
+    does; a finish on any other unfinished read fails."""
     import numpy as np
 
     from sglang.srt.mem_cache.storage.mooncake_store.linker_staging import EarlyReads, StagingSlab
 
-    rng = random.Random(seed)
-    size, n_requests = 4, 12
     stages = _relay_stages(size)
     pending_early, pending_direct = [], []
-
-    finish_waits = []
 
     class _Checked(_RelayWrapper):
         def _finish_prefetch(self, handle, publish, hold=True):
             state = self.prefetches.pop(handle, None)
             if state is not None and not state.future.done() and getattr(state.future, "staged", False):
-                # The real finish waits for a staged load still being queued.
-                finish_waits.append(handle)
                 pending_direct.remove(state.future)
                 state.future.set_result(True)
             # A direct read is never awaited here: its vote gated the finish.
@@ -3495,6 +3486,36 @@ def test_pp_early_reads_late_completions_never_finish_a_pending_read(seed):
         )
     others = [w.early for _, w in stages[1:]]
     stages[0][1].early.send = lambda msg: [e.start(msg) for e in others]
+    return stages, pending_early, pending_direct
+
+
+def _complete_some(rng, *pending):
+    for futures in pending:
+        for f in list(futures):
+            if rng.random() < 0.3:
+                futures.remove(f)
+                f.set_result(rng.random() < 0.9)
+
+
+def _lookup(rng, rank):
+    return SimpleNamespace(
+        key=_KEY, hashes=["h1", "h2", "h3"], start=0, anchor_node_id=0,
+        anchor_lock="lock", timeout_s=1.0, wait_started=None,
+        future=_done([rng.choice([2, 3])]) if rank == 0 else None,
+    )
+
+
+@pytest.mark.parametrize("seed", list(range(1, 21)))
+def test_pp_early_reads_late_completions_never_finish_a_pending_read(seed):
+    """Real EarlyReads per stage; early reads land, fail or arrive late at random,
+    direct reads complete late, requests reach stage k k rounds after PP0. No stage
+    may apply a finish to an unfinished read, every stage publishes the same, and
+    every staging slot comes back."""
+    import random
+
+    rng = random.Random(seed)
+    size, n_requests = 4, 12
+    stages, pending_early, pending_direct = _early_read_stages(size)
 
     handles = [_Handle(f"r{i}") for i in range(n_requests)]
     arrive = {h: 2 * i for i, h in enumerate(handles)}
@@ -3503,18 +3524,10 @@ def test_pp_early_reads_late_completions_never_finish_a_pending_read(seed):
             for h in handles:
                 if arrive[h] + k == rnd:
                     relay.begin(SimpleNamespace(cache_request_handle=h))
-                    w.lookups[h] = SimpleNamespace(
-                        key=_KEY, hashes=["h1", "h2", "h3"], start=0, anchor_node_id=0,
-                        anchor_lock="lock", timeout_s=1.0, wait_started=None,
-                        future=_done([rng.choice([2, 3])]) if k == 0 else None,
-                    )
+                    w.lookups[h] = _lookup(rng, k)
             # As ingest_requests: this round's requests first, then the actions held for them.
             relay.receive([])
-        for futures in (pending_early, pending_direct):
-            for f in list(futures):
-                if rng.random() < 0.3:
-                    futures.remove(f)
-                    f.set_result(rng.random() < 0.9)
+        _complete_some(rng, pending_early, pending_direct)
         _relay_round(stages)
         if all(len(w.finished) == n_requests for _, w in stages) and not pending_early:
             break
@@ -3524,6 +3537,50 @@ def test_pp_early_reads_late_completions_never_finish_a_pending_read(seed):
     for _, w in stages:
         assert w.early.counts["voted_direct"] == 0 and w.early.counts["voted_unused"] == 0
         assert len(w.early.slab.free["kv"]) == 6, (w.pp_rank, w.early.counts)
+
+
+@pytest.mark.parametrize("seed", list(range(1, 21)))
+def test_pp_early_reads_every_stage_admits_pp0s_batches(seed):
+    """Liveness under early reads: PP0's requests and actions of pass r reach stage
+    k at its pass r + k; with reads landing, failing and arriving late at random,
+    every stage's admission pass r + k admits exactly PP0's batch of pass r."""
+    import random
+
+    rng = random.Random(seed)
+    size, n_requests, lag = 4, 12, 3
+    stages, pending_early, pending_direct = _early_read_stages(size)
+    handles = [_Handle(f"r{i}") for i in range(n_requests)]
+    arrive = {h: lag * i for i, h in enumerate(handles)}
+    relayed = []  # PP0's pass r: (requests, actions)
+    batches = [[] for _ in range(size)]
+    admitted = [set() for _ in range(size)]
+    order = [[] for _ in range(size)]
+    for rnd in range(600):
+        for k, (relay, w) in enumerate(stages):
+            if k == 0:
+                new = [h for h in handles if arrive[h] == rnd]
+            elif rnd - k >= 0:
+                new = relayed[rnd - k][0]
+            else:
+                continue
+            for h in new:
+                relay.begin(SimpleNamespace(cache_request_handle=h))
+                w.lookups[h] = _lookup(rng, k)
+                order[k].append(h)
+            relay.poll()
+            if k == 0:
+                actions = relay.take_actions()
+                relayed.append((new, actions.actions if actions is not None else []))
+            relay.receive(relayed[rnd - k][1])
+            batch = [h for h in order[k] if h not in admitted[k] and relay.progress(h, lambda h: False)]
+            admitted[k].update(batch)
+            batches[k].append(batch)
+        _complete_some(rng, pending_early, pending_direct)
+        if len(admitted[-1]) == n_requests and not pending_early:
+            break
+    assert len(admitted[-1]) == n_requests, [len(a) for a in admitted]
+    for k in range(1, size):  # batches[k][i] is stage k's pass k + i
+        assert batches[k] == batches[0][: len(batches[k])], k
 
 
 def test_pp_prefetch_relay_settles_a_request_with_nothing_to_look_up():

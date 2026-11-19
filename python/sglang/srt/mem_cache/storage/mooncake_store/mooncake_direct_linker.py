@@ -1044,7 +1044,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         from concurrent.futures import Future
 
         from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import coalesce_key_range_table
-        from sglang.srt.mem_cache.storage.mooncake_store.linker_staging import gpu_scatter, scatter_plan
+        from sglang.srt.mem_cache.storage.mooncake_store.linker_staging import (
+            copy_engine_scatter,
+            gpu_scatter,
+            scatter_plan,
+        )
+
+        scatter = gpu_scatter if envs.SGLANG_LINKER_EARLY_COPY.get() == "kernel" else copy_engine_scatter
 
         if self.cpu_indices:
             transfers = attach_cpu_indices(transfers)
@@ -1064,7 +1070,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     table = entry._staging_table = coalesce_key_range_table(entry.key_range_table(self.num_layers))
                 rows = entry.key_range_rows(entry.prepare_locations(transfer.host_indices))
                 plans.append(scatter_plan(table, rows, slab.ptrs(transfer.name, staged.slots[transfer.name])))
-            done = gpu_scatter(plans, self._staging_stream)
+            done = scatter(plans, self._staging_stream)
             future.copy_event = done
             future.set_result(True)
             done.synchronize()
@@ -2636,6 +2642,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         "SGLANG_LINKER_VECTOR_PUT",
         "SGLANG_LINKER_STORE_ARRAYS",
         "SGLANG_LINKER_PAGE_CHECKSUM",
+        "SGLANG_LINKER_EARLY_COPY",
     )
 
     def refresh_flags(self) -> None:

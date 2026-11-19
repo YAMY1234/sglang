@@ -5746,6 +5746,7 @@ class Scheduler(
         "SGLANG_LINKER_STORE_ARRAYS",
         "SGLANG_LINKER_MAX_REQUERIES",
         "SGLANG_LINKER_PAGE_CHECKSUM",
+        "SGLANG_LINKER_EARLY_COPY",
     )
     # Debug switches that need no external linker (an Aw0f arm can switch them).
     DEBUG_TOGGLE_FLAGS = ("SGLANG_DEBUG_GIL_TAX", "SGLANG_DEBUG_GIL_TAX_BURST_MS")
