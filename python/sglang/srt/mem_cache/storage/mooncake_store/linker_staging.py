@@ -112,7 +112,14 @@ def copy_engine_scatter(plans, stream):
     with torch.cuda.stream(stream):
         for dst, src, sizes in plans:
             if len(dst):
-                memcpy_batch(*coalesce_ranges(dst, src, sizes), stream.cuda_stream)
+                try:
+                    memcpy_batch(*coalesce_ranges(dst, src, sizes), stream.cuda_stream)
+                except RuntimeError as e:
+                    with open("/proc/self/maps") as maps:
+                        cudart = sorted({line.split()[-1] for line in maps if "libcudart" in line})
+                    raise RuntimeError(
+                        f"{e}; stream {stream.device}, torch current {torch.cuda.current_device()}, cudart {cudart}"
+                    ) from None
         event = torch.cuda.Event()
         event.record()
     return event
