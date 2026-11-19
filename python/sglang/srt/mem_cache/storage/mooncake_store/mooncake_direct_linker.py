@@ -622,6 +622,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     _numa_first_request_logged = True
     # Refcount read sessions per key (async admission or load overlap).
     count_sessions = False
+    # SGLANG_LINKER_PAGE_CHECKSUM sample rate (0: off).
+    page_checksum_rate = 0.0
     # SGLANG_LINKER_STORE_BUDGET_PAGES: this stage's stored pages (None: off).
     store_tree: "_StoreTree | None" = None
     # Held pins of launched loads are renewed this often (s); see _renew_held_pins.
