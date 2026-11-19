@@ -1401,6 +1401,27 @@ class TestLinkerStaging(CustomTestCase):
         slab.release({"kv": slots})
         self.assertEqual(len(slab.free["kv"]), 4)
 
+    def test_torch_scatter_plan_matches_the_numpy_plan(self):
+        # The GPU path builds the destinations from the device slot indices (no host
+        # wait); on the same entry and slots it must give the numpy plan's ranges.
+        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import coalesce_key_range_table
+        from sglang.srt.mem_cache.storage.mooncake_store.linker_staging import (
+            entry_row_sources,
+            scatter_plan,
+            torch_scatter_plan,
+        )
+
+        pool, _ = _merged_pool(lambda shape: torch.zeros(shape, dtype=torch.uint8))
+        table = coalesce_key_range_table(pool.key_range_table(3))
+        indices = torch.tensor([2, 3, 6, 7])
+        slot_ptrs = np.array([1 << 20, 3 << 20], dtype=np.int64)
+        want = scatter_plan(table, pool.key_range_rows(pool.prepare_locations(indices)), slot_ptrs)
+        got = torch_scatter_plan(
+            torch.from_numpy(table), entry_row_sources(pool), indices, torch.from_numpy(slot_ptrs)
+        )
+        for w, g in zip(want, got):
+            np.testing.assert_array_equal(np.asarray(w), g.numpy())
+
     def test_early_reads_vote_once_never_block_and_release_every_slot(self):
         from concurrent.futures import Future
 

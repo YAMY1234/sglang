@@ -1033,37 +1033,50 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
     def prefetch_from_staging(self, transfers, staged, slab, release):
         """Prefetch mode with a landed early read: fill the request's private slots
-        from its staged objects (one scatter on the staging stream) instead of a
-        store read. The future resolves True once the scatter is queued; its
-        ``copy_event`` orders any use (or reuse) of the slots after it, and the
-        staging slots are released once the event completes."""
+        from its staged objects instead of a store read. Everything is queued from
+        this (scheduler) thread without a host wait: destination rows come from the
+        device slot indices, the scatter runs on the staging stream after the work
+        queued so far, and the returned future is already done (the relay may apply
+        the finish at the next pass). Its ``copy_event`` orders any use or reuse of
+        the slots after the scatter; a helper thread releases the staging (and
+        verifies the sampled checksums) once the event completes."""
         from concurrent.futures import Future
 
         from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import coalesce_key_range_table
-        from sglang.srt.mem_cache.storage.mooncake_store.linker_staging import gpu_scatter, scatter_plan
+        from sglang.srt.mem_cache.storage.mooncake_store.linker_staging import (
+            entry_row_sources,
+            gpu_scatter_tensors,
+            torch_scatter_plan,
+        )
 
-        if self.cpu_indices:
-            transfers = attach_cpu_indices(transfers)
         expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True, allow_missing_kv=True)
+        device = torch.device("cuda", torch.cuda.current_device())
         ready = device_module.Event()
         ready.record()
-        future: Future = Future()
-
-        def run():
-            ready.synchronize()
+        stream = self._staging_stream
+        stream.wait_event(ready)
+        with torch.cuda.stream(stream):
             plans = []
             for transfer in expanded:
                 entry = self.pools[transfer.name]
-                table = getattr(entry, "_coalesced_table", None)
-                full = entry.key_range_table(self.num_layers)
-                if table is None or table[0] is not full:
-                    table = (full, coalesce_key_range_table(full))
-                    entry._coalesced_table = table
-                rows = entry.key_range_rows(entry.prepare_locations(transfer.host_indices))
-                plans.append(scatter_plan(table[1], rows, slab.ptrs(transfer.name, staged.slots[transfer.name])))
-            done = gpu_scatter(plans, self._staging_stream)
-            future.copy_event = done
-            future.set_result(True)
+                cached = getattr(entry, "_staging_table", None)
+                if cached is None:
+                    table = coalesce_key_range_table(entry.key_range_table(self.num_layers))
+                    cached = (torch.from_numpy(table).to(device), entry_row_sources(entry))
+                    entry._staging_table = cached
+                ptrs = torch.from_numpy(slab.ptrs(transfer.name, staged.slots[transfer.name])).pin_memory()
+                plans.append(torch_scatter_plan(
+                    cached[0], cached[1], transfer.host_indices.to(device, non_blocking=True),
+                    ptrs.to(device, non_blocking=True),
+                ))
+            gpu_scatter_tensors(plans)
+            done = torch.cuda.Event()
+            done.record()
+        future: Future = Future()
+        future.copy_event = done
+        future.set_result(True)
+
+        def finish():
             done.synchronize()
             release(staged)
             if self.page_checksum_rate:
@@ -1073,12 +1086,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
         def failed(f):
             if f.exception() is not None:
-                # PP0 may already have published this read on the stage's early
-                # vote: continuing would leave this stage's tree behind the others.
-                logger.critical("Early-read staging load failed after its vote", exc_info=f.exception())
-                os._exit(1)
+                logger.warning("Early-read staging release failed", exc_info=f.exception())
 
-        self._early_executor.submit(run).add_done_callback(failed)
+        self._early_executor.submit(finish).add_done_callback(failed)
         return future
 
     def _start_helper(self):
