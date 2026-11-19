@@ -808,6 +808,9 @@ class Envs:
     SGLANG_DISAGG_TRANSFER_WORKER_STREAM = EnvBool(False)
     # Diagnostic: log the transfer worker's last-chunk timeline for PP PD settles longer than 50 ms.
     SGLANG_DISAGG_SETTLE_DIAG = EnvBool(False)
+    # PD DCP pack: run the gather on a high-priority stream so it is scheduled ahead of the
+    # in-flight forward's pending blocks (default off).
+    SGLANG_DISAGG_GATHER_STREAM_HIGH_PRIORITY = EnvBool(False)
     # PP PD prefill: an early-sent last chunk still in transfer does not block the result; the
     # checkpoint's device frees for that request wait until its transfer ends (default off).
     SGLANG_PP_PD_DEFER_EARLY_SETTLE = EnvBool(False)
