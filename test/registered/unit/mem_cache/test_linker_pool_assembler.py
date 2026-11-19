@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
+import numpy as np
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import (
@@ -262,6 +263,69 @@ class TestDevicePoolEntry(CustomTestCase):
             for is_set in (False, True):
                 got = store._batch_postprocess(results, is_set_operate=is_set, key_multiplier=1)
                 self.assertEqual(got, [r == 0 if is_set else r > 0 for r in results])
+
+    def test_store_arrays_match_the_range_lists(self):
+        # SGLANG_LINKER_STORE_ARRAYS hands the store flat uint64 arrays plus a CSR
+        # indptr; they must hold exactly the per-key lists of the list call.
+        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+            MergedPageEntry,
+            RangeArrays,
+            vector_key_range_meta,
+        )
+
+        kv = [torch.zeros((16, 4), dtype=torch.uint8) for _ in range(3)]
+        ix = torch.zeros((8, 5), dtype=torch.uint8)
+        kv_pool = DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=None,
+            components=[kv],
+            layer_mapping={0: 0, 1: 1, 2: 2},
+            page_size=2,
+            rows_are_pages=False,
+        )
+        ix_pool = DevicePoolEntry(
+            name=PoolName.INDEXER,
+            indices_from_pool=PoolName.KV,
+            device_pool=None,
+            components=[[ix]],
+            layer_mapping={1: 0},
+            page_size=2,
+            rows_are_pages=True,
+        )
+        merged = MergedPageEntry(kv_pool, ix_pool, object_name="ki")
+        indices = torch.tensor([0, 1, 6, 7, 14, 15])
+        for pool in (kv_pool, merged):
+            for coalesce in (False, True):
+                with self.subTest(pool=type(pool).__name__, coalesce=coalesce):
+                    locations = pool.prepare_locations(indices)
+                    lists = vector_key_range_meta(pool, locations, 3, coalesce)
+                    arrays = vector_key_range_meta(
+                        pool, locations, 3, coalesce, arrays=True
+                    )
+                    self.assertIsInstance(arrays, RangeArrays)
+                    for field in arrays:
+                        self.assertEqual(field.dtype, np.uint64)
+                        self.assertTrue(field.flags.c_contiguous)
+                    self.assertEqual(arrays.to_lists(), lists)
+                    self.assertEqual(
+                        RangeArrays.from_lists(*lists).to_lists(), lists
+                    )
+                    self.assertEqual(arrays.expected(), [sum(s) for s in lists[1]])
+
+        ragged = ([[1, 2], [], [3]], [[10, 20], [], [30]], [[0, 10], [], [0]])
+        parts = RangeArrays.from_lists(*ragged)
+        self.assertEqual(parts.indptr.tolist(), [0, 2, 2, 3])
+        self.assertEqual(parts.expected(), [30, 0, 30])
+        self.assertEqual(
+            parts.select([2, 0]).to_lists(),
+            ([[3], [1, 2]], [[30], [10, 20]], [[0], [0, 10]]),
+        )
+        both = RangeArrays.concat([parts, RangeArrays.from_lists([[4]], [[40]], [[5]])])
+        self.assertEqual(
+            both.to_lists(),
+            tuple(a + b for a, b in zip(ragged, ([[4]], [[40]], [[5]]))),
+        )
 
     def test_cpu_indices_keep_device_copies_off_linker_threads(self):
         # SGLANG_LINKER_CPU_INDICES: prefetch slots (allocator) and offload node

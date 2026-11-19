@@ -11,6 +11,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import torch
 
 from sglang.srt.environ import envs
@@ -676,6 +677,128 @@ class TestLoadPerKey(CustomTestCase):
             linker.load_layer_wise(7, [[_transfer(PoolName.KV, 2)]], [("a", 0.0)])
         linker.layer_done_counter.fail.assert_called()
         linker.layer_done_counter.complete.assert_not_called()
+
+
+def _array_sums(sizes, indptr):
+    bounds = indptr.tolist()
+    return [int(sizes[a:b].sum()) for a, b in zip(bounds, bounds[1:])]
+
+
+class TestStoreArrays(CustomTestCase):
+    """SGLANG_LINKER_STORE_ARRAYS: range gets pass flat uint64 arrays and a CSR
+    indptr to the store's *_arrays method when it has one, else the list call."""
+
+    def _linker(self, with_method=True, per_key=False, first_codes=None):
+        linker = _linker(log_load_timing=True)
+        linker.store_arrays = True
+        linker.load_per_key = per_key
+        linker.vector_meta = False
+        store = linker.storage.store
+        calls = []
+
+        def arrays(keys, ptrs, sizes, offsets, indptr):
+            for field in (ptrs, sizes, offsets, indptr):
+                self.assertEqual(field.dtype, np.uint64)
+            calls.append((list(keys), ptrs, sizes, offsets, indptr))
+            good = _array_sums(sizes, indptr)
+            if first_codes is not None and len(calls) == 1:
+                return [good[i] if c is None else c for i, c in enumerate(first_codes)]
+            return good
+
+        if with_method:
+            store.batch_get_into_multi_buffer_ranges_arrays.side_effect = arrays
+        else:
+            del store.batch_get_into_multi_buffer_ranges_arrays
+        return linker, calls
+
+    def _bytes(self, linker, requests):
+        with self.assertLogs(LOGGER, level="INFO") as logs:
+            linker.load_layer_wise(7, requests, [("a", 0.0), ("b", 0.0)][: len(requests)])
+        return [line.split("bytes=")[1].split()[0] for line in logs.output if "bytes=" in line]
+
+    def test_the_array_call_replaces_the_list_call_with_the_same_bytes(self):
+        requests = [
+            [_transfer(PoolName.KV, 2), _transfer(PoolName.SWA, 1)],
+            [_transfer(PoolName.KV, 3)],
+        ]
+        for per_key in (False, True):
+            with self.subTest(per_key=per_key):
+                linker, calls = self._linker(per_key=per_key)
+                self.assertEqual(self._bytes(linker, requests), ["420", "600"])
+                linker.storage.store.batch_get_into_multi_buffer_ranges.assert_not_called()
+                linker.layer_done_counter.fail.assert_not_called()
+                self.assertEqual(len(calls), 1 if per_key else 4)
+                keys, ptrs, sizes, offsets, indptr = calls[0]
+                if per_key:
+                    self.assertEqual(keys, ["kv-0", "kv-1", "kv-0", "kv-1", "kv-2", "swa-0"])
+                    self.assertEqual(indptr.tolist(), [0, 2, 4, 6, 8, 10, 12])
+                    self.assertEqual(sizes.tolist(), [100] * 10 + [10, 10])
+                else:
+                    self.assertEqual(indptr.tolist(), list(range(len(keys) + 1)))
+
+    def test_vector_meta_hands_the_numpy_ranges_to_the_store_as_built(self):
+        # VECTOR_META + COALESCE_RANGES: the per-key arrays reach the store without
+        # a round trip through Python lists, and equal what the list call gets.
+        table = np.array([[0, 1000, 64, 8, 0], [0, 1008, 64, 8, 8]], dtype=np.int64)
+
+        class _VectorPool(_Pool):
+            def key_range_table(self, num_layers):
+                return table
+
+            def key_range_rows(self, locations):
+                return np.asarray(locations, dtype=np.int64).reshape(-1, 1)
+
+        got = {}
+        for arrays in (False, True):
+            linker, calls = self._linker(per_key=True)
+            linker.store_arrays = arrays
+            linker.vector_meta = linker.coalesce_ranges = True
+            linker.pools = {PoolName.KV: _VectorPool(PoolName.KV)}
+            linker.log_load_timing = False
+            linker.load_layer_wise(7, [[_transfer(PoolName.KV, 3)]], [("a", 0.0)])
+            linker.layer_done_counter.fail.assert_not_called()
+            store = linker.storage.store
+            if arrays:
+                store.batch_get_into_multi_buffer_ranges.assert_not_called()
+                _, ptrs, sizes, offsets, indptr = calls[0]
+                got[arrays] = (ptrs.tolist(), sizes.tolist(), offsets.tolist(), indptr.tolist())
+            else:
+                _, ptrs, sizes, offsets = store.batch_get_into_multi_buffer_ranges.call_args.args
+                got[arrays] = (ptrs, sizes, offsets)
+        self.assertEqual(got[True][0], [1000, 1064, 1128])  # coalesced: one range a key
+        self.assertEqual(got[True][3], [0, 1, 2, 3])
+        bounds = got[True][3]
+        self.assertEqual(
+            tuple(
+                [field[a:b] for a, b in zip(bounds, bounds[1:])] for field in got[True][:3]
+            ),
+            got[False],
+        )
+
+    def test_retries_read_only_the_failed_keys_through_the_array_call(self):
+        linker, calls = self._linker(first_codes=[-707, None])
+        linker.num_layers = 1
+        with patch.object(mooncake_direct_linker.logger, "warning"):
+            linker.load_layer_wise(7, [[_transfer(PoolName.KV, 2)]], [("a", 0.0)])
+        self.assertEqual([c[0] for c in calls], [["kv-0", "kv-1"], ["kv-0"]])
+        self.assertEqual(calls[1][4].tolist(), [0, 1])
+        store = linker.storage.store
+        self.assertEqual(store.batch_get_session_start.call_args.args[0], ["kv-0"])
+        linker.layer_done_counter.fail.assert_not_called()
+        self.assertEqual(linker.read_retries, {"retried": 1, "recovered": 1})
+
+    def test_without_the_method_the_list_call_runs_and_logs_once(self):
+        requests = [[_transfer(PoolName.KV, 2)], [_transfer(PoolName.KV, 3)]]
+        for per_key in (False, True):
+            with self.subTest(per_key=per_key):
+                linker, calls = self._linker(with_method=False, per_key=per_key)
+                with patch.object(mooncake_direct_linker.logger, "warning") as warning:
+                    self.assertEqual(self._bytes(linker, requests), ["400", "600"])
+                    linker.load_layer_wise(7, requests, [("a", 0.0), ("b", 0.0)])
+                warning.assert_called_once()
+                self.assertIn("SGLANG_LINKER_STORE_ARRAYS", warning.call_args.args[0])
+                self.assertTrue(linker.storage.store.batch_get_into_multi_buffer_ranges.called)
+                linker.layer_done_counter.fail.assert_not_called()
 
 
 class TestSessionRefcount(CustomTestCase):

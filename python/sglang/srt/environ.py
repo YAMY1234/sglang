@@ -1064,6 +1064,10 @@ class Envs:
     # both the object and device memory, and share the identical size/offset lists
     # across keys instead of building one per key.
     SGLANG_LINKER_COALESCE_RANGES = EnvBool(False)
+    # Range gets: pass flat uint64 arrays plus a CSR indptr to the store's
+    # *_ranges_arrays method (patched Mooncake store.so) instead of nested lists the
+    # binding converts under the GIL; falls back to the list call without it.
+    SGLANG_LINKER_STORE_ARRAYS = EnvBool(False)
     # Offload puts: build per-key buffer addresses with numpy and batch the
     # recent-key / result bookkeeping (the offload thread's GIL share).
     SGLANG_LINKER_VECTOR_PUT = EnvBool(False)

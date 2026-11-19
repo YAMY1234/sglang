@@ -5,7 +5,8 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 from functools import partial
-from typing import Any
+from itertools import chain
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
@@ -232,12 +233,90 @@ def coalesce_key_range_table(table: np.ndarray) -> np.ndarray:
     return np.array(out, dtype=np.int64).reshape(-1, 5)
 
 
-def vector_key_range_meta(entry, locations, num_layers: int, coalesce: bool = False):
+class RangeArrays(NamedTuple):
+    """SGLANG_LINKER_STORE_ARRAYS: per-key ranges as flat uint64 arrays; key i owns
+    entries [indptr[i], indptr[i + 1]). Field order is the store's array call."""
+
+    ptrs: np.ndarray
+    sizes: np.ndarray
+    offsets: np.ndarray
+    indptr: np.ndarray
+
+    @classmethod
+    def from_lists(cls, ptrs, sizes, offsets) -> "RangeArrays":
+        counts = np.fromiter(map(len, ptrs), dtype=np.uint64, count=len(ptrs))
+        indptr = np.zeros(len(ptrs) + 1, dtype=np.uint64)
+        np.cumsum(counts, out=indptr[1:])
+        total = int(indptr[-1])
+
+        def flat(rows):
+            return np.fromiter(chain.from_iterable(rows), dtype=np.uint64, count=total)
+
+        return cls(flat(ptrs), flat(sizes), flat(offsets), indptr)
+
+    @classmethod
+    def from_rows(cls, ptrs, size_row, offset_row) -> "RangeArrays":
+        """``ptrs`` is [keys, items]; every key shares one size and offset row."""
+        count, items = ptrs.shape
+        return cls(
+            np.ascontiguousarray(ptrs, dtype=np.int64).reshape(-1).view(np.uint64),
+            np.tile(np.asarray(size_row, dtype=np.uint64), count),
+            np.tile(np.asarray(offset_row, dtype=np.uint64), count),
+            np.arange(count + 1, dtype=np.uint64) * np.uint64(items),
+        )
+
+    @classmethod
+    def concat(cls, parts: list["RangeArrays"]) -> "RangeArrays":
+        if len(parts) == 1:
+            return parts[0]
+        shifts = np.cumsum([0] + [int(p.indptr[-1]) for p in parts[:-1]], dtype=np.uint64)
+        return cls(
+            np.concatenate([p.ptrs for p in parts]),
+            np.concatenate([p.sizes for p in parts]),
+            np.concatenate([p.offsets for p in parts]),
+            np.concatenate(
+                [parts[0].indptr[:1]]
+                + [p.indptr[1:] + shift for p, shift in zip(parts, shifts)]
+            ),
+        )
+
+    def expected(self) -> list[int]:
+        """Bytes per key: the store's result for a complete read."""
+        total = np.zeros(len(self.sizes) + 1, dtype=np.uint64)
+        np.cumsum(self.sizes, out=total[1:])
+        return (total[self.indptr[1:]] - total[self.indptr[:-1]]).tolist()
+
+    def select(self, keys: list[int]) -> "RangeArrays":
+        index = np.asarray(keys, dtype=np.int64)
+        starts = self.indptr[index].astype(np.int64)
+        counts = self.indptr[index + 1].astype(np.int64) - starts
+        indptr = np.zeros(len(index) + 1, dtype=np.int64)
+        np.cumsum(counts, out=indptr[1:])
+        gather = np.repeat(starts - indptr[:-1], counts) + np.arange(indptr[-1])
+        return RangeArrays(
+            self.ptrs[gather],
+            self.sizes[gather],
+            self.offsets[gather],
+            indptr.astype(np.uint64),
+        )
+
+    def to_lists(self):
+        bounds = self.indptr.tolist()
+        return tuple(
+            [field[a:b] for a, b in zip(bounds, bounds[1:])]
+            for field in (self.ptrs.tolist(), self.sizes.tolist(), self.offsets.tolist())
+        )
+
+
+def vector_key_range_meta(
+    entry, locations, num_layers: int, coalesce: bool = False, arrays: bool = False
+):
     """Per-key (ptrs, sizes, offsets) lists for a packed or merged entry, equal to
     concatenating get_prepared_layer_range_meta over layers 0..num_layers-1; None
     when the entry has no vector table (unpacked). With ``coalesce``
     (SGLANG_LINKER_COALESCE_RANGES) contiguous items are merged and every key
-    shares one size list and one offset list (read-only for the store call)."""
+    shares one size list and one offset list (read-only for the store call). With
+    ``arrays`` (SGLANG_LINKER_STORE_ARRAYS) the same ranges come as a RangeArrays."""
     table = entry.key_range_table(num_layers)
     if table is None:
         return None
@@ -251,6 +330,8 @@ def vector_key_range_meta(entry, locations, num_layers: int, coalesce: bool = Fa
     src, base, stride, size, offset = table.T
     ptrs = base[None, :] + rows[:, src] * stride[None, :]
     count = rows.shape[0]
+    if arrays:
+        return RangeArrays.from_rows(ptrs, size, offset)
     if coalesce:
         size_row, offset_row = size.tolist(), offset.tolist()
         return ptrs.tolist(), [size_row] * count, [offset_row] * count

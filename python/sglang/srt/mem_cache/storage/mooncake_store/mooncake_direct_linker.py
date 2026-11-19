@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+    RangeArrays,
     attach_cpu_indices,
     resolve_hybrid_device_pool_group,
     vector_key_range_meta,
@@ -629,6 +630,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     # SGLANG_LINKER_LOAD_OVERLAP / _PER_KEY at init; the previous launch's event.
     load_overlap = False
     load_per_key = False
+    # SGLANG_LINKER_STORE_ARRAYS at init; the list-call fallback logs once.
+    store_arrays = False
+    _store_arrays_fallback_logged = False
     prev_launch_event = None
     # SGLANG_LINKER_STATE_PATH_CAP at init; 0 leaves the store's states alone.
     state_path_cap = 0
@@ -701,6 +705,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.load_per_key = envs.SGLANG_LINKER_LOAD_PER_KEY.get()
         self.vector_meta = envs.SGLANG_LINKER_VECTOR_META.get()
         self.coalesce_ranges = envs.SGLANG_LINKER_COALESCE_RANGES.get()
+        self.store_arrays = envs.SGLANG_LINKER_STORE_ARRAYS.get()
         self.cpu_indices = envs.SGLANG_LINKER_CPU_INDICES.get()
         self.num_load_threads = envs.SGLANG_LINKER_LOAD_THREADS.get() or (
             2 if self.load_overlap else 1
@@ -1676,15 +1681,47 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             finally:
                 self.load_queue.task_done()
 
-    def _get_layer_ranges(self, keys, ptrs, sizes, offsets):
-        store = self.storage.store
-        result = store.batch_get_into_multi_buffer_ranges(keys, ptrs, sizes, offsets)
+    def _store_arrays_get(self):
+        """SGLANG_LINKER_STORE_ARRAYS: the store's array range get, or None (the
+        flag is off, or the store lacks it: logged once, the list call is used)."""
+        if not self.store_arrays:
+            return None
+        method = getattr(
+            self.storage.store, "batch_get_into_multi_buffer_ranges_arrays", None
+        )
+        if method is None and not self._store_arrays_fallback_logged:
+            self._store_arrays_fallback_logged = True
+            logger.warning(
+                "SGLANG_LINKER_STORE_ARRAYS is set but the Mooncake store has no "
+                "batch_get_into_multi_buffer_ranges_arrays; using the list call"
+            )
+        return method
+
+    def _range_get(self, keys, ranges):
+        """One store range get; ``ranges`` is a RangeArrays or (ptrs, sizes, offsets)."""
+        method = self._store_arrays_get()
+        if method is not None:
+            if not isinstance(ranges, RangeArrays):
+                ranges = RangeArrays.from_lists(*ranges)
+            return method(keys, *ranges)
+        if isinstance(ranges, RangeArrays):
+            ranges = ranges.to_lists()
+        return self.storage.store.batch_get_into_multi_buffer_ranges(keys, *ranges)
+
+    def _get_layer_ranges(self, keys, ptrs, sizes=None, offsets=None):
+        """Range get with one retry of transient failures. ``ptrs`` is either the
+        per-key ptr lists (with ``sizes`` and ``offsets``) or a RangeArrays."""
+        ranges = ptrs if isinstance(ptrs, RangeArrays) else (ptrs, sizes, offsets)
+        result = self._range_get(keys, ranges)
         if result is None or isinstance(result, int):
             return result
         result = list(result)
         if len(result) != len(keys):
             return result
-        expected = [sum(item) for item in sizes]
+        if isinstance(ranges, RangeArrays):
+            expected = ranges.expected()
+        else:
+            expected = [sum(item) for item in sizes]
         # Retry this layer once for objects that failed transiently: an expired
         # session lease (Mooncake LEASE_EXPIRED, -707: leases can lapse between
         # layers of a long prefix; reacquire those immutable objects first), a
@@ -1705,11 +1742,15 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 f"result_sample={renewed[:8]}"
             )
         expired = retry
-        retried = store.batch_get_into_multi_buffer_ranges(
+        retried = self._range_get(
             [keys[i] for i in expired],
-            [ptrs[i] for i in expired],
-            [sizes[i] for i in expired],
-            [offsets[i] for i in expired],
+            ranges.select(expired)
+            if isinstance(ranges, RangeArrays)
+            else (
+                [ptrs[i] for i in expired],
+                [sizes[i] for i in expired],
+                [offsets[i] for i in expired],
+            ),
         )
         if retried is None or isinstance(retried, int):
             return retried
@@ -1878,14 +1919,25 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         entry holding every layer's ranges (Hecate lbw microbench: 2-3x the
         per-layer, per-pool reads). ``loaded`` (if given) gets each request's bytes."""
         keys_all, ptrs_all, sizes_all, offsets_all, base = [], [], [], [], {}
+        arrays = self._store_arrays_get() is not None
+        parts: list[RangeArrays] = []
         for name, (keys, locations) in batches.items():
             vector = (
                 vector_key_range_meta(
-                    self.pools[name], locations, self.num_layers, self.coalesce_ranges
+                    self.pools[name],
+                    locations,
+                    self.num_layers,
+                    self.coalesce_ranges,
+                    arrays=arrays,
                 )
                 if self.vector_meta
                 else None
             )
+            if arrays and vector is not None:
+                base[name] = len(keys_all)
+                keys_all.extend(keys)
+                parts.append(vector)
+                continue
             if vector is not None:
                 # Same lists as the per-layer loop below, built with numpy so the
                 # read thread holds the GIL for a few array ops, not O(keys x layers).
@@ -1910,12 +1962,22 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     entry[2].extend(offsets)
             base[name] = len(keys_all)
             keys_all.extend(keys)
+            if arrays:
+                parts.append(
+                    RangeArrays.from_lists(*([e[f] for e in entries] for f in range(3)))
+                )
+                continue
             for ptrs, sizes, offsets in entries:
                 ptrs_all.append(ptrs)
                 sizes_all.append(sizes)
                 offsets_all.append(offsets)
-        result = self._get_layer_ranges(keys_all, ptrs_all, sizes_all, offsets_all)
-        expected = [sum(item) for item in sizes_all]
+        if arrays:
+            ranges = RangeArrays.concat(parts) if parts else RangeArrays.from_lists([], [], [])
+            result = self._get_layer_ranges(keys_all, ranges)
+            expected = ranges.expected()
+        else:
+            result = self._get_layer_ranges(keys_all, ptrs_all, sizes_all, offsets_all)
+            expected = [sum(item) for item in sizes_all]
         if result is None or isinstance(result, int) or list(result) != expected:
             failed = (
                 Counter(v for v, want in zip(result, expected) if v != want)
