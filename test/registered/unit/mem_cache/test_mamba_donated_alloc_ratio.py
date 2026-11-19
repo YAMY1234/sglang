@@ -509,5 +509,54 @@ class TestExtraMambaCacheSizing(unittest.TestCase):
                 )
 
 
+class TestMambaStateExhaustionDefers(unittest.TestCase):
+    """Prefill admission defers a request whose state slot cannot be allocated
+    (in-flight prefetch reads may hold the pool); other callers still assert."""
+
+    def _finalize(self, defer):
+        cache = SimpleNamespace(
+            req_to_token_pool=SimpleNamespace(
+                mamba_allocator=SimpleNamespace(alloc=lambda n: None)
+            ),
+            inc_lock_ref=lambda node: SimpleNamespace(to_dec_params=lambda: None),
+            dec_lock_ref=lambda node, params: None,
+            evict_for_alloc=lambda params: None,
+            defer_state_exhaustion=defer,
+            state_pool_exhausted=0,
+        )
+        component = SimpleNamespace(
+            cache=cache,
+            component_type=ComponentType.MAMBA,
+            tree_core=SimpleNamespace(
+                get_component_device_value=lambda node, ct: torch.tensor([3])
+            ),
+        )
+        req = SimpleNamespace(
+            kv=SimpleNamespace(
+                holds_mamba=False,
+                mamba_pool_idx=None,
+                mamba_cow_src_index=None,
+                mamba_needs_clear=True,
+                mamba_alloc_failed=False,
+            )
+        )
+        params = SimpleNamespace(cow_mamba=True, req=req)
+        result = SimpleNamespace(best_match_node="n")
+        out = MambaComponent.finalize_match_result_in_cache(component, params, result)
+        return out, result, req, cache
+
+    def test_admission_defers_instead_of_asserting(self):
+        out, result, req, cache = self._finalize(defer=True)
+        self.assertIs(out, result)
+        self.assertTrue(req.kv.mamba_alloc_failed)
+        self.assertIsNone(req.kv.mamba_pool_idx)
+        self.assertIsNone(req.kv.mamba_cow_src_index)
+        self.assertEqual(cache.state_pool_exhausted, 1)
+
+    def test_other_callers_still_assert(self):
+        with self.assertRaisesRegex(AssertionError, "Can not alloc mamba cache"):
+            self._finalize(defer=False)
+
+
 if __name__ == "__main__":
     unittest.main()

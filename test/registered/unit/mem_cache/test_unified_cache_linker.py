@@ -3129,6 +3129,54 @@ class _Handle(NamedTuple):
     rid: str
 
 
+def test_prefetch_requery_is_capped_per_request(full_linker_component):
+    wrapper = _prefetch_wrapper([full_linker_component], _PrefetchLinker())
+    wrapper.requery_on_device_loss = True
+    handle = _Handle("r")
+    req = SimpleNamespace(cache_request_handle=handle, prefix_len=0, rid="r")
+    wrapper.match_targets[handle] = 4
+    with envs.SGLANG_LINKER_MAX_REQUERIES.override(2):
+        wrapper.max_requeries = envs.SGLANG_LINKER_MAX_REQUERIES.get()
+    outcomes = []
+    for _ in range(4):
+        outcomes.append(wrapper._local_requery_after_device_loss(req))
+        wrapper._pending_requeries.clear()  # the boundary started its lookup
+    assert outcomes == [True, True, False, False]
+    assert wrapper._lookup_stats["requeried"] == 2
+    assert wrapper._lookup_stats["requery_capped"] == 2
+    wrapper._release_prefetch_request("r")
+    assert wrapper._requery_counts["r"] == 0
+
+
+@pytest.mark.parametrize(
+    "result, reason", [(False, "read_failed"), ("session_start:-704x2", "session_start:-704x2")]
+)
+def test_prefetch_abort_counted_by_reason(full_linker_component, result, reason):
+    backend = _PrefetchLinker(landed=result)
+    wrapper = _prefetch_wrapper(
+        [full_linker_component, _state_component([])],
+        backend,
+        path_device_indices=lambda node: torch.tensor([], dtype=torch.int64),
+        insert=lambda params: SimpleNamespace(mamba_exist=False),
+        prefetch_loaded_tokens_by_reqid={},
+        prefetch_loaded_storage_start_by_reqid={},
+    )
+    handle = _Handle("a")
+    wrapper._start_prefetch_load(handle, _KEY, ["h1", "h2", "h3"], 0, 0, "lock", [2], 1.0)
+    wrapper.check_prefetch_events()
+    assert wrapper._abort_reasons == {reason: 1}
+
+
+def test_prefetch_cancel_records_its_reason(full_linker_component):
+    backend = _PrefetchLinker(landed=True)
+    wrapper = _prefetch_wrapper([full_linker_component, _state_component([])], backend)
+    handle = _Handle("a")
+    wrapper._start_prefetch_load(handle, _KEY, ["h1", "h2", "h3"], 0, 0, "lock", [2], 1.0)
+    wrapper._cancel_prefetch(handle, "timeout")
+    wrapper._finish_prefetch(handle, publish=False)
+    assert wrapper._abort_reasons == {"timeout": 1}
+
+
 class _VoteStore:
     """PPConsensusStore stand-in: every rank's map, collected on PP0."""
 
@@ -3155,13 +3203,17 @@ class _RelayWrapper:
 
     def _start_prefetch_load(self, handle, key, hashes, start, anchor, lock, restorable, timeout):
         self.started.append((handle, restorable))
-        self.prefetches[handle] = SimpleNamespace(future=Future(), discard=False)
+        self.prefetches[handle] = SimpleNamespace(
+            future=Future(), discard=False, abort_reason=None
+        )
 
     def _finish_prefetch(self, handle, publish, hold=True):
         self.prefetches.pop(handle, None)
         self.finished.append((handle, publish))
 
-    def _cancel_prefetch(self, handle):
+    local_abort_reason = staticmethod(UnifiedCacheLinkerWrapper.local_abort_reason)
+
+    def _cancel_prefetch(self, handle, reason="cancelled"):
         self.cancelled.append(handle)
         self.lookups.pop(handle, None)
         state = self.prefetches.get(handle)
@@ -3314,7 +3366,8 @@ def test_mooncake_prefetch_read_ends_its_sessions_and_reports_failure():
     linker._load_per_key = MagicMock()
     assert linker._prefetch_read([transfer], MagicMock(), time.monotonic()) is True
     linker._load_per_key = MagicMock(side_effect=RuntimeError("-704"))
-    assert linker._prefetch_read([transfer], MagicMock(), time.monotonic()) is False
+    # A failed read is not True; it returns its reason (here the error text).
+    assert linker._prefetch_read([transfer], MagicMock(), time.monotonic()) == "read:-704"
     assert linker._session_refs.end.call_args_list == [call(["p1", "p2"])] * 2
     assert linker.stats["prefetch_failed"] == 1
 
