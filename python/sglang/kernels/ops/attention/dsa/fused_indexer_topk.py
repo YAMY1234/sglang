@@ -96,6 +96,7 @@ def score(
     cand_col: Optional[torch.Tensor] = None,
     cand_count: Optional[torch.Tensor] = None,
     reuse_kv: bool = False,
+    row_split: bool = True,
     num_ctas: Optional[int] = None,
     cuh_path: Optional[str] = None,
 ) -> None:
@@ -117,6 +118,7 @@ def score(
         cand_count if cand_count is not None else _empty(dev, torch.int32),
         mode,
         int(reuse_kv),
+        int(row_split),
         num_ctas,
     )
 

@@ -123,7 +123,29 @@ struct OrderedScheduler {
   }
 };
 
-template <int kMode, bool kReuseKV>
+// The FP32 head reduction of one (row, key), operation for operation DeepGEMM's
+// (bitwise contract): pairs of heads, 2*relu as a + |a|, two f32x2 FMA chains.
+CUTLASS_DEVICE float dg_reduce(const float* accum, const float* w) {
+  auto sum_0 = make_float2(0, 0);
+  auto sum_1 = make_float2(0, 0);
+  const auto transform = [&](const uint32_t& j, const float2& sum) {
+    auto a_0 = make_float2(accum[j], accum[j + 1]);
+    auto a_1 = make_float2(fabsf(accum[j]), fabsf(accum[j + 1]));
+    auto b = make_float2(w[j], w[j + 1]);
+    return __ffma2_rn(__fadd2_rn(a_0, a_1), b, sum);
+  };
+#pragma unroll
+  for (uint32_t j = 0; j < kNumHeads; j += 4) {
+    sum_0 = transform(j, sum_0);
+    sum_1 = transform(j + 2, sum_1);
+  }
+  auto sum = __fadd2_rn(sum_0, sum_1);
+  return (sum.x + sum.y) / 2;
+}
+
+// kRowSplit: each math warpgroup owns 2 of the 4 rows over both 128-key halves of a
+// split (4 TMEM stages, each read by both warpgroups) instead of all 4 rows of one half.
+template <int kMode, bool kReuseKV, bool kRowSplit>
 __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
     const __grid_constant__ ScoreParams params,
     const __grid_constant__ cute::TmaDescriptor tensor_map_q,
@@ -146,7 +168,7 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
     cute::prefetch_tma_descriptor(&tensor_map_sf_kv);
   }
 
-  static constexpr uint32_t kNumTmemStages = 3;
+  static constexpr uint32_t kNumTmemStages = kRowSplit ? 4 : 3;
   static constexpr uint32_t UMMA_M = 128;
   static constexpr uint32_t BLOCK_QH = BLOCK_Q * kNumHeads;
   static constexpr uint32_t UMMA_N = math::constexpr_align(BLOCK_QH, 8u);
@@ -192,7 +214,7 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
 #pragma unroll
     for (uint32_t i = 0; i < kNumTmemStages; ++i) {
       smem.full_tmem_barriers[i].init(1);
-      smem.empty_tmem_barriers[i].init(128);
+      smem.empty_tmem_barriers[i].init(kRowSplit ? kNumMathThreads : 128);
     }
     cutlass::arch::fence_barrier_init();
   }
@@ -330,22 +352,38 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
     constexpr bool kLoadSeqBounds = (kMode == kModeFilter);
     uint32_t seq_k_start[kLoadSeqBounds ? BLOCK_Q : 1];
     uint32_t seq_k_end[kLoadSeqBounds ? BLOCK_Q : 1];
-    const auto local_math_warp_idx = warp_idx;
-    const auto math_warpgroup_idx = local_math_warp_idx / 4;
-    const auto math_thread_idx = local_math_warp_idx * 32 + lane_idx;
-    tmem_pipeline.advance(math_warpgroup_idx);
-
-    float weights[BLOCK_Q][kNumHeads];
-    float accum[kNumHeads];
+    const auto math_warpgroup_idx = warp_idx / 4;
     float sink_acc = 0.0f;
+    float tau[BLOCK_Q];
 
-    OrderedScheduler scheduler(params);
-    uint32_t q_block_idx, kv_base, num_kv_splits;
-    while (scheduler.template next_q_block<kLoadSeqBounds>(q_block_idx, kv_base, num_kv_splits, seq_k_start, seq_k_end)) {
-      CUTE_TIE_DECL(q_pipeline.advance(), q_stage_idx, q_phase);
-      smem.full_q_barriers[q_stage_idx].wait(q_phase);
-
-      float tau[BLOCK_Q];
+    // One (row-in-block i, key) result: store, accumulate, or filter into the row's list.
+    const auto handle = [&](const uint32_t q_block_idx, const uint32_t i, const uint32_t kv_offset, const float result) {
+      if constexpr (kMode == kModeLogits) {
+        const auto q_offset = (q_block_idx * BLOCK_Q + i) * static_cast<uint64_t>(params.logits_stride);
+        params.logits[q_offset + kv_offset] = result;
+      } else if constexpr (kMode == kModeNoStore) {
+        sink_acc += result;
+      } else if constexpr (kMode == kModeFilter) {
+        const uint32_t row = q_block_idx * BLOCK_Q + i;
+        const uint32_t rel = kv_offset - seq_k_start[i];
+        const bool take = rel < (seq_k_end[i] - seq_k_start[i]) and result >= tau[i];
+        const uint32_t mask = __ballot_sync(0xffffffffu, take);
+        if (mask != 0) {
+          uint32_t base = 0;
+          if (lane_idx == 0) base = static_cast<uint32_t>(atomicAdd(params.cand_count + row, __popc(mask)));
+          base = __shfl_sync(0xffffffffu, base, 0);
+          if (take) {
+            const uint32_t pos = base + __popc(mask & ((1u << lane_idx) - 1u));
+            if (pos < params.cand_cap) {
+              const uint64_t slot = static_cast<uint64_t>(row) * params.cand_cap + pos;
+              params.cand_score[slot] = result;
+              params.cand_col[slot] = static_cast<int32_t>(rel);
+            }
+          }
+        }
+      }
+    };
+    const auto load_tau = [&](const uint32_t q_block_idx) {
       if constexpr (kMode == kModeFilter) {
 #pragma unroll
         for (uint32_t i = 0; i < BLOCK_Q; ++i) {
@@ -354,99 +392,135 @@ __global__ __launch_bounds__(kNumThreads, 1) void fstk_score_kernel(
           tau[i] = row < params.num_q_tokens ? __ldg(params.tau + row) : cute::numeric_limits<float>::infinity();
         }
       }
+    };
 
-      if constexpr (kMode != kModeNoEpi) {
+    if constexpr (not kRowSplit) {
+      const auto math_thread_idx = warp_idx * 32 + lane_idx;
+      tmem_pipeline.advance(math_warpgroup_idx);
+      float weights[BLOCK_Q][kNumHeads];
+      float accum[kNumHeads];
+
+      OrderedScheduler scheduler(params);
+      uint32_t q_block_idx, kv_base, num_kv_splits;
+      while (scheduler.template next_q_block<kLoadSeqBounds>(q_block_idx, kv_base, num_kv_splits, seq_k_start, seq_k_end)) {
+        CUTE_TIE_DECL(q_pipeline.advance(), q_stage_idx, q_phase);
+        smem.full_q_barriers[q_stage_idx].wait(q_phase);
+        load_tau(q_block_idx);
+        if constexpr (kMode != kModeNoEpi) {
 #pragma unroll
-        for (uint32_t i = 0; i < BLOCK_Q; ++i) {
-          const auto smem_weights_row = smem.smem_weights[q_stage_idx] + i * kNumWeightElementsPerRow;
+          for (uint32_t i = 0; i < BLOCK_Q; ++i) {
+            const auto smem_weights_row = smem.smem_weights[q_stage_idx] + i * kNumWeightElementsPerRow;
 #pragma unroll
-          for (uint32_t j = 0; j < kNumHeads; ++j) weights[i][j] = ptx::ld_shared(smem_weights_row + j);
-        }
-      }
-
-      for (uint32_t kv_split_idx = 0; kv_split_idx < num_kv_splits; ++kv_split_idx) {
-        const uint32_t kv_offset = kv_base + kv_split_idx * SPLIT_KV + math_thread_idx;
-
-        CUTE_TIE_DECL(kv_pipeline.advance(), kv_stage_idx, kv_phase);
-        smem.full_kv_barriers[kv_stage_idx].wait(kv_phase);
-        float scale_kv = 0.0f;
-        if constexpr (kMode != kModeNoEpi) scale_kv = ptx::ld_shared(smem.smem_sf_kv[kv_stage_idx] + math_thread_idx);
-
-        CUTE_TIE_DECL(tmem_pipeline.advance(kNumMathWarpGroups), tmem_stage_idx, tmem_phase);
-        smem.full_tmem_barriers[tmem_stage_idx].wait(tmem_phase);
-        ptx::tcgen05_after_thread_sync();
-
-        // Release KV smem only after UMMA commits TMEM; earlier release races TMA overwrite
-        cutlass::arch::fence_view_async_shared();
-        smem.empty_kv_barriers[kv_stage_idx].arrive();
-
-        if constexpr (kMode == kModeNoEpi) {
-          ptx::tcgen05_before_thread_sync();
-          smem.empty_tmem_barriers[tmem_stage_idx].arrive();
-          continue;
+            for (uint32_t j = 0; j < kNumHeads; ++j) weights[i][j] = ptx::ld_shared(smem_weights_row + j);
+          }
         }
 
-#pragma unroll
-        for (uint32_t i = 0; i < BLOCK_Q; ++i) {
-          uint32_t tmem_addr = tmem_stage_idx * UMMA_N + i * kNumHeads;
-          ptx::tmem_load_32dp32b<kNumHeads / 2>(tmem_addr, reinterpret_cast<uint32_t*>(accum));
-          cutlass::arch::fence_view_async_tmem_load();
-          ptx::tmem_load_32dp32b<kNumHeads / 2>(
-              tmem_addr + kNumHeads / 2, reinterpret_cast<uint32_t*>(accum + kNumHeads / 2));
-          cutlass::arch::fence_view_async_tmem_load();
+        for (uint32_t kv_split_idx = 0; kv_split_idx < num_kv_splits; ++kv_split_idx) {
+          const uint32_t kv_offset = kv_base + kv_split_idx * SPLIT_KV + math_thread_idx;
 
-          if (i == BLOCK_Q - 1) {
+          CUTE_TIE_DECL(kv_pipeline.advance(), kv_stage_idx, kv_phase);
+          smem.full_kv_barriers[kv_stage_idx].wait(kv_phase);
+          float scale_kv = 0.0f;
+          if constexpr (kMode != kModeNoEpi) scale_kv = ptx::ld_shared(smem.smem_sf_kv[kv_stage_idx] + math_thread_idx);
+
+          CUTE_TIE_DECL(tmem_pipeline.advance(kNumMathWarpGroups), tmem_stage_idx, tmem_phase);
+          smem.full_tmem_barriers[tmem_stage_idx].wait(tmem_phase);
+          ptx::tcgen05_after_thread_sync();
+
+          // Release KV smem only after UMMA commits TMEM; earlier release races TMA overwrite
+          cutlass::arch::fence_view_async_shared();
+          smem.empty_kv_barriers[kv_stage_idx].arrive();
+
+          if constexpr (kMode == kModeNoEpi) {
             ptx::tcgen05_before_thread_sync();
             smem.empty_tmem_barriers[tmem_stage_idx].arrive();
+            continue;
           }
 
-          // DeepGEMM's FP32 reduction, operation for operation (bitwise contract).
-          auto sum_0 = make_float2(0, 0);
-          auto sum_1 = make_float2(0, 0);
-          const auto transform = [&](const uint32_t& j, const float2& sum) {
-            auto a_0 = make_float2(accum[j], accum[j + 1]);
-            auto a_1 = make_float2(fabsf(accum[j]), fabsf(accum[j + 1]));
-            auto b = make_float2(weights[i][j], weights[i][j + 1]);
-            return __ffma2_rn(__fadd2_rn(a_0, a_1), b, sum);
-          };
 #pragma unroll
-          for (uint32_t j = 0; j < kNumHeads; j += 4) {
-            sum_0 = transform(j, sum_0);
-            sum_1 = transform(j + 2, sum_1);
-          }
-          auto sum = __fadd2_rn(sum_0, sum_1);
-          const reduce_dtype_t reduced = (sum.x + sum.y) / 2;
-          const logits_dtype_t result = static_cast<logits_dtype_t>(reduced * scale_kv);
+          for (uint32_t i = 0; i < BLOCK_Q; ++i) {
+            uint32_t tmem_addr = tmem_stage_idx * UMMA_N + i * kNumHeads;
+            ptx::tmem_load_32dp32b<kNumHeads / 2>(tmem_addr, reinterpret_cast<uint32_t*>(accum));
+            cutlass::arch::fence_view_async_tmem_load();
+            ptx::tmem_load_32dp32b<kNumHeads / 2>(
+                tmem_addr + kNumHeads / 2, reinterpret_cast<uint32_t*>(accum + kNumHeads / 2));
+            cutlass::arch::fence_view_async_tmem_load();
 
-          if constexpr (kMode == kModeLogits) {
-            const auto q_offset = (q_block_idx * BLOCK_Q + i) * static_cast<uint64_t>(params.logits_stride);
-            params.logits[q_offset + kv_offset] = result;
-          } else if constexpr (kMode == kModeNoStore) {
-            sink_acc += result;
-          } else {
-            const uint32_t row = q_block_idx * BLOCK_Q + i;
-            const uint32_t rel = kv_offset - seq_k_start[i];
-            const bool take = rel < (seq_k_end[i] - seq_k_start[i]) and result >= tau[i];
-            const uint32_t mask = __ballot_sync(0xffffffffu, take);
-            if (mask != 0) {
-              uint32_t base = 0;
-              if (lane_idx == 0) base = static_cast<uint32_t>(atomicAdd(params.cand_count + row, __popc(mask)));
-              base = __shfl_sync(0xffffffffu, base, 0);
-              if (take) {
-                const uint32_t pos = base + __popc(mask & ((1u << lane_idx) - 1u));
-                if (pos < params.cand_cap) {
-                  const uint64_t slot = static_cast<uint64_t>(row) * params.cand_cap + pos;
-                  params.cand_score[slot] = result;
-                  params.cand_col[slot] = static_cast<int32_t>(rel);
-                }
-              }
+            if (i == BLOCK_Q - 1) {
+              ptx::tcgen05_before_thread_sync();
+              smem.empty_tmem_barriers[tmem_stage_idx].arrive();
             }
+            handle(q_block_idx, i, kv_offset, dg_reduce(accum, weights[i]) * scale_kv);
           }
         }
-      }
 
-      cutlass::arch::fence_view_async_shared();
-      smem.empty_q_barriers[q_stage_idx].arrive();
+        cutlass::arch::fence_view_async_shared();
+        smem.empty_q_barriers[q_stage_idx].arrive();
+      }
+    } else {
+      // Thread t of warpgroup g: TMEM lane t (key t of each half), rows 2g and 2g+1.
+      const uint32_t lane_key = (warp_idx % 4) * 32 + lane_idx;
+      const uint32_t row0 = 2 * math_warpgroup_idx;
+      float weights[2][kNumHeads];
+      float accum[2][kNumHeads];
+
+      OrderedScheduler scheduler(params);
+      uint32_t q_block_idx, kv_base, num_kv_splits;
+      while (scheduler.template next_q_block<kLoadSeqBounds>(q_block_idx, kv_base, num_kv_splits, seq_k_start, seq_k_end)) {
+        CUTE_TIE_DECL(q_pipeline.advance(), q_stage_idx, q_phase);
+        smem.full_q_barriers[q_stage_idx].wait(q_phase);
+        load_tau(q_block_idx);
+        if constexpr (kMode != kModeNoEpi) {
+#pragma unroll
+          for (uint32_t r = 0; r < 2; ++r) {
+            const auto smem_weights_row = smem.smem_weights[q_stage_idx] + (row0 + r) * kNumWeightElementsPerRow;
+#pragma unroll
+            for (uint32_t j = 0; j < kNumHeads; ++j) weights[r][j] = ptx::ld_shared(smem_weights_row + j);
+          }
+        }
+
+        for (uint32_t kv_split_idx = 0; kv_split_idx < num_kv_splits; ++kv_split_idx) {
+          CUTE_TIE_DECL(kv_pipeline.advance(), kv_stage_idx, kv_phase);
+          smem.full_kv_barriers[kv_stage_idx].wait(kv_phase);
+          float scale_kv[2] = {0.0f, 0.0f};
+          if constexpr (kMode != kModeNoEpi) {
+#pragma unroll
+            for (uint32_t h = 0; h < 2; ++h) scale_kv[h] = ptx::ld_shared(smem.smem_sf_kv[kv_stage_idx] + h * UMMA_M + lane_key);
+          }
+
+#pragma unroll
+          for (uint32_t h = 0; h < 2; ++h) {
+            CUTE_TIE_DECL(tmem_pipeline.advance(), tmem_stage_idx, tmem_phase);
+            smem.full_tmem_barriers[tmem_stage_idx].wait(tmem_phase);
+            ptx::tcgen05_after_thread_sync();
+            if (h == 1) {
+              // Both halves' UMMAs have committed: the KV stage is free.
+              cutlass::arch::fence_view_async_shared();
+              smem.empty_kv_barriers[kv_stage_idx].arrive();
+            }
+            if constexpr (kMode == kModeNoEpi) {
+              ptx::tcgen05_before_thread_sync();
+              smem.empty_tmem_barriers[tmem_stage_idx].arrive();
+              continue;
+            }
+            const uint32_t tmem_addr = tmem_stage_idx * UMMA_N + row0 * kNumHeads;
+            ptx::tmem_load_32dp32b<kNumHeads>(tmem_addr, reinterpret_cast<uint32_t*>(accum[0]));
+            ptx::tmem_load_32dp32b<kNumHeads>(tmem_addr + kNumHeads, reinterpret_cast<uint32_t*>(accum[1]));
+            cutlass::arch::fence_view_async_tmem_load();
+            ptx::tcgen05_before_thread_sync();
+            smem.empty_tmem_barriers[tmem_stage_idx].arrive();
+
+            const uint32_t kv_offset = kv_base + kv_split_idx * SPLIT_KV + h * UMMA_M + lane_key;
+            const float r0 = dg_reduce(accum[0], weights[0]) * scale_kv[h];
+            const float r1 = dg_reduce(accum[1], weights[1]) * scale_kv[h];
+            handle(q_block_idx, row0, kv_offset, r0);
+            handle(q_block_idx, row0 + 1, kv_offset, r1);
+          }
+        }
+
+        cutlass::arch::fence_view_async_shared();
+        smem.empty_q_barriers[q_stage_idx].arrive();
+      }
     }
 
     if constexpr (kMode == kModeNoStore) {
@@ -691,7 +765,7 @@ inline CUtensorMap make_map_2d(
   return map;
 }
 
-template <int kMode, bool kReuseKV>
+template <int kMode, bool kReuseKV, bool kRowSplit>
 inline void score_impl(
     tvm::ffi::TensorView q,        // [T, 32, 128] e4m3
     tvm::ffi::TensorView kv,       // [N, 128] e4m3
@@ -749,13 +823,49 @@ inline void score_impl(
       BLOCK_Q, CU_TENSOR_MAP_SWIZZLE_NONE);
 
   using SharedStorage = fstk_dg_layout::MQALogitsSharedStorage<
-      kNumHeads, kHeadDim, false, BLOCK_Q, SPLIT_KV, kNumQStages, kNumKVStages, 3, cutlass::float_e4m3_t, float>;
+      kNumHeads, kHeadDim, false, BLOCK_Q, SPLIT_KV, kNumQStages, kNumKVStages, (kRowSplit ? 4 : 3),
+      cutlass::float_e4m3_t, float>;
   constexpr size_t kSmem = sizeof(SharedStorage);
-  constexpr auto kernel = fstk_score_kernel<kMode, kReuseKV>;
+  constexpr auto kernel = fstk_score_kernel<kMode, kReuseKV, kRowSplit>;
   const DLDevice device = q.device();
   runtime::init_per_device(device, [=] { runtime::set_max_dynamic_smem(kernel, kSmem); });
   LaunchKernel(static_cast<uint32_t>(num_ctas), kNumThreads, device, kSmem)
       .enable_pdl(false)(kernel, params, map_q, map_kv, map_sf_kv, map_w);
+}
+
+template <bool kRowSplit>
+inline void score_dispatch(
+    tvm::ffi::TensorView q,
+    tvm::ffi::TensorView kv,
+    tvm::ffi::TensorView kv_scale,
+    tvm::ffi::TensorView weights,
+    tvm::ffi::TensorView ks,
+    tvm::ffi::TensorView ke,
+    tvm::ffi::TensorView order,
+    tvm::ffi::TensorView logits,
+    tvm::ffi::TensorView tau,
+    tvm::ffi::TensorView cand_score,
+    tvm::ffi::TensorView cand_col,
+    tvm::ffi::TensorView cand_count,
+    int64_t mode,
+    int64_t reuse_kv,
+    int64_t num_ctas) {
+#define FSTK_SCORE(M, R) \
+  score_impl<M, R, kRowSplit>(q, kv, kv_scale, weights, ks, ke, order, logits, tau, cand_score, cand_col, cand_count, num_ctas)
+  switch (mode) {
+    case kModeLogits:
+      return FSTK_SCORE(kModeLogits, false);
+    case kModeNoEpi:
+      if (reuse_kv) return FSTK_SCORE(kModeNoEpi, true);
+      return FSTK_SCORE(kModeNoEpi, false);
+    case kModeNoStore:
+      return FSTK_SCORE(kModeNoStore, false);
+    case kModeFilter:
+      return FSTK_SCORE(kModeFilter, false);
+    default:
+      sglang::host::RuntimeCheck(false, "fstk: bad mode ", mode);
+  }
+#undef FSTK_SCORE
 }
 
 struct FusedIndexerTopK {
@@ -775,21 +885,11 @@ struct FusedIndexerTopK {
       tvm::ffi::TensorView cand_count,
       int64_t mode,
       int64_t reuse_kv,
+      int64_t row_split,
       int64_t num_ctas) {
-    switch (mode) {
-      case kModeLogits:
-        return score_impl<kModeLogits, false>(q, kv, kv_scale, weights, ks, ke, order, logits, tau, cand_score, cand_col, cand_count, num_ctas);
-      case kModeNoEpi:
-        if (reuse_kv)
-          return score_impl<kModeNoEpi, true>(q, kv, kv_scale, weights, ks, ke, order, logits, tau, cand_score, cand_col, cand_count, num_ctas);
-        return score_impl<kModeNoEpi, false>(q, kv, kv_scale, weights, ks, ke, order, logits, tau, cand_score, cand_col, cand_count, num_ctas);
-      case kModeNoStore:
-        return score_impl<kModeNoStore, false>(q, kv, kv_scale, weights, ks, ke, order, logits, tau, cand_score, cand_col, cand_count, num_ctas);
-      case kModeFilter:
-        return score_impl<kModeFilter, false>(q, kv, kv_scale, weights, ks, ke, order, logits, tau, cand_score, cand_col, cand_count, num_ctas);
-      default:
-        sglang::host::RuntimeCheck(false, "fstk: bad mode ", mode);
-    }
+    if (row_split)
+      return score_dispatch<true>(q, kv, kv_scale, weights, ks, ke, order, logits, tau, cand_score, cand_col, cand_count, mode, reuse_kv, num_ctas);
+    return score_dispatch<false>(q, kv, kv_scale, weights, ks, ke, order, logits, tau, cand_score, cand_col, cand_count, mode, reuse_kv, num_ctas);
   }
 
   static void select(
