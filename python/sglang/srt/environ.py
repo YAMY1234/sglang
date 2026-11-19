@@ -1118,6 +1118,10 @@ class Envs:
     # MXFP4 trtllm-gen MoE: deferred-finalize calls above 32 rows pass the finalized
     # output shape, so they hit FlashInfer's tuned tactics (off: only 97-384 rows do).
     SGLANG_OPT_MXFP4_DEFERRED_FINALIZED_SHAPE = EnvBool(False)
+    # MXFP4 trtllm-gen MoE: log the per-expert route counts of every Nth call with at
+    # least MIN_TOKENS rows (prefill chunks), one line per call; 0 off (moe/expert_count_log.py).
+    SGLANG_K31_MOE_EXPERT_COUNT_LOG_INTERVAL = EnvInt(0)
+    SGLANG_K31_MOE_EXPERT_COUNT_MIN_TOKENS = EnvInt(1024)
     # Manual MoE input row limit (EPv1 and EPv2); 0 leaves it to SGLANG_MORI_RECV_BOUND.
     SGLANG_MORI_MOE_MAX_INPUT_TOKENS = EnvInt(0)
 
