@@ -2198,6 +2198,8 @@ class Envs:
     # How many layers ahead of its Engram layer the prefetch is issued, and the fewest rows it runs at.
     SGLANG_OPT_DSV41_ENGRAM_PREFETCH_LOOKAHEAD = EnvInt(1)
     SGLANG_OPT_DSV41_ENGRAM_PREFETCH_MIN_ROWS = EnvInt(4096)
+    # Programs of the prefetch's table gather (0: one per row block, which fills every SM).
+    SGLANG_OPT_DSV41_ENGRAM_PREFETCH_PROGRAMS = EnvInt(0)
     # Deprecated for --engram-config "lookup".
     SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS = EnvBool(False)
     # --engram-config replication node_shared: one copy per host NUMA node, read by

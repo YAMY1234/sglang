@@ -73,7 +73,7 @@ def unpack_mxfp4_rows(packed: torch.Tensor) -> torch.Tensor:
 
 
 @triton.jit
-def _engram_gather_kernel(
+def _gather_block(
     w_ptr,
     s_ptr,
     ids_ptr,
@@ -82,6 +82,7 @@ def _engram_gather_kernel(
     row_lo,
     row_hi,
     n,
+    block,
     DIM: tl.constexpr,
     BLK: tl.constexpr,
     ROWS: tl.constexpr,
@@ -91,7 +92,7 @@ def _engram_gather_kernel(
 ):
     # ROWS rows per program, so the dependent loads of a row (id, payload,
     # scales) overlap with those of the program's other rows.
-    row = tl.program_id(0).to(tl.int64) * ROWS + tl.arange(0, ROWS)
+    row = block.to(tl.int64) * ROWS + tl.arange(0, ROWS)
     valid = row < n
     idx = tl.load(ids_ptr + row, mask=valid, other=0).to(tl.int64)
     dst = tl.load(dst_ptr + row, mask=valid, other=0).to(tl.int64) if HAS_DST else row
@@ -117,6 +118,72 @@ def _engram_gather_kernel(
         out.to(tl.bfloat16),
         mask=valid[:, None],
     )
+
+
+@triton.jit
+def _engram_gather_kernel(
+    w_ptr,
+    s_ptr,
+    ids_ptr,
+    dst_ptr,
+    out_ptr,
+    row_lo,
+    row_hi,
+    n,
+    DIM: tl.constexpr,
+    BLK: tl.constexpr,
+    ROWS: tl.constexpr,
+    E8M0_ZERO: tl.constexpr,
+    HAS_DST: tl.constexpr,
+    MXFP4: tl.constexpr,
+):
+    _gather_block(w_ptr, s_ptr, ids_ptr, dst_ptr, out_ptr, row_lo, row_hi, n,
+                  tl.program_id(0), DIM, BLK, ROWS, E8M0_ZERO, HAS_DST, MXFP4)
+
+
+@triton.jit
+def _engram_gather_capped_kernel(
+    w_ptr,
+    s_ptr,
+    ids_ptr,
+    dst_ptr,
+    out_ptr,
+    row_lo,
+    row_hi,
+    n,
+    n_blocks,
+    DIM: tl.constexpr,
+    BLK: tl.constexpr,
+    ROWS: tl.constexpr,
+    E8M0_ZERO: tl.constexpr,
+    HAS_DST: tl.constexpr,
+    MXFP4: tl.constexpr,
+):
+    # A fixed number of programs strides over the row blocks, so a gather on a
+    # side stream leaves the other SMs to the main stream.
+    for block in range(tl.program_id(0), n_blocks, tl.num_programs(0)):
+        _gather_block(w_ptr, s_ptr, ids_ptr, dst_ptr, out_ptr, row_lo, row_hi, n,
+                      block, DIM, BLK, ROWS, E8M0_ZERO, HAS_DST, MXFP4)
+
+
+_PROGRAM_CAP = [0]
+
+
+class gather_program_cap:
+    """Within the block, engram_gather launches at most ``programs`` programs
+    (0: one per row block). Same rows and arithmetic either way."""
+
+    def __init__(self, programs: int):
+        self.programs = programs
+
+    def __enter__(self):
+        self.saved = _PROGRAM_CAP[0]
+        _PROGRAM_CAP[0] = self.programs
+        return self
+
+    def __exit__(self, *exc):
+        _PROGRAM_CAP[0] = self.saved
+        return False
 
 
 def _gather_rows_per_program() -> int:
@@ -163,7 +230,12 @@ def engram_gather(
         if sort_ids:
             ids, dst = torch.sort(ids)
         rows = _gather_rows_per_program()
-        _engram_gather_kernel[(triton.cdiv(n, rows),)](
+        n_blocks = triton.cdiv(n, rows)
+        cap = _PROGRAM_CAP[0]
+        capped = 0 < cap < n_blocks
+        kernel = _engram_gather_capped_kernel if capped else _engram_gather_kernel
+        extra = (n_blocks,) if capped else ()
+        kernel[(cap if capped else n_blocks,)](
             weight_ptr,
             scale_ptr,
             ids,
@@ -172,6 +244,7 @@ def engram_gather(
             row_lo,
             row_hi,
             n,
+            *extra,
             DIM=dim,
             BLK=block_size,
             ROWS=rows,

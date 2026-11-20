@@ -2046,7 +2046,10 @@ class Engram(nn.Module):
     ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """The half of ``forward`` that reads only the token ids: the table rows
         and, with ``with_kv``, their wkv projection. Runs on the caller's stream."""
-        emb = self.embed(hash_ids)
+        from sglang.kernels.ops.embeddings.engram_gather import gather_program_cap
+
+        with gather_program_cap(envs.SGLANG_OPT_DSV41_ENGRAM_PREFETCH_PROGRAMS.get()):
+            emb = self.embed(hash_ids)
         if not with_kv:
             return emb, None
         with _private_mxfp8_workspace(emb.device):

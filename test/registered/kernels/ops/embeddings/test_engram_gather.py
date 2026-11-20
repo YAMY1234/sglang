@@ -127,5 +127,34 @@ def test_engram_gather_rows_per_program_bit_exact(
         _assert_bits_equal(gather(rows_per_program, ids), gather(1, ids))
 
 
+@pytest.mark.parametrize("programs", [1, 3, 64])
+@pytest.mark.parametrize("mxfp4", [False, True])
+def test_engram_gather_program_cap_bit_exact(programs: int, mxfp4: bool) -> None:
+    """A capped number of strided programs gives the uncapped kernel's bits."""
+    packed, exps = _packed_table(rows=1024)
+    table = packed if mxfp4 else unpack_mxfp4_rows(packed)
+    gen = torch.Generator(device="cuda").manual_seed(2)
+
+    def gather(cap: int, ids: torch.Tensor) -> torch.Tensor:
+        out = torch.full(
+            (ids.numel(), _DIM), float("nan"), dtype=torch.bfloat16, device="cuda"
+        )
+        with engram_gather_module.gather_program_cap(cap):
+            engram_gather(
+                weight_ptr=table.data_ptr(),
+                scale_ptr=exps.data_ptr(),
+                ids=ids,
+                out=out,
+                dim=_DIM,
+                block_size=_BLOCK,
+                mxfp4=mxfp4,
+            )
+        return out
+
+    for n in (1, 9, 1000, 4099):
+        ids = torch.randint(0, table.shape[0], (n,), device="cuda", generator=gen)
+        _assert_bits_equal(gather(programs, ids), gather(0, ids))
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
