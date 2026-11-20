@@ -229,6 +229,8 @@ class DeepseekV41Indexer(nn.Module):
         self.candidate_block_size = config.candidate_block_size
         self.softmax_scale = self.index_head_dim**-0.5
         self.key_only = key_only
+        # (x, weights_proj(x)) staged by SGLANG_OPT_DSV41_HOIST_INDEX_WEIGHTS for this layer's indexer pass
+        self.hoisted_head_weights = None
         if not key_only:
             self.wq_b = ReplicatedLinear(
                 config.q_lora_rank,

@@ -169,12 +169,21 @@ def _index_q_and_weights(
     """fp4 index queries ``[rows, heads, 64]`` int8 with ``[rows, heads]`` packed
     ue8m0 scales, and fp32 head weights ``[rows, heads]``."""
     rows, heads = x.shape[0], indexer.n_local_heads
+    hoisted, indexer.hoisted_head_weights = indexer.hoisted_head_weights, None
     q, _ = indexer.wq_b(q_lora)
+    if (
+        hoisted is not None
+        and hoisted[0].data_ptr() == x.data_ptr()
+        and hoisted[0].shape == x.shape
+    ):
+        head_weights = hoisted[1]
+    else:
+        head_weights = indexer.head_weights_raw(x)
     q_fp4, q_sf, weights = index_q_rope_pack_weights(
         q.view(rows, heads, indexer.index_head_dim),
         torch.view_as_real(freqs_cis).flatten(-2),
         positions,
-        indexer.head_weights_raw(x),
+        head_weights,
         indexer.head_weight_scale,
     )
     return q_fp4.view(rows, heads, 64), q_sf.view(rows, heads), weights

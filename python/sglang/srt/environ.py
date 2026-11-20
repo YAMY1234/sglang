@@ -658,6 +658,10 @@ class Envs:
     # Decode/verify: the q_lora RMSNorm + MXFP8 (rmsnorm_mxfp8) and the kv RMSNorm + RoPE +
     # V4.1 SWA cache store in one launch before wq_b, instead of two. Bitwise equal outputs.
     SGLANG_OPT_DSV4_FUSED_QKV_NORM = EnvBool(False)
+    # Decode/verify, low-ratio multi-stream prepare: the index-source layers' head-weight GEMM
+    # (weights_proj(x)) runs in the source stream's compressor block, beside wqkv_a, instead of
+    # after the indexer wq_b. Same kernels and inputs (bitwise); only the stream order moves.
+    SGLANG_OPT_DSV41_HOIST_INDEX_WEIGHTS = EnvBool(False)
     # Request-window commit of new SWA rows with a tile of rows per program instead of
     # one program per row. Same copies.
     SGLANG_OPT_DSV41_WINDOW_COMMIT_TILED = EnvBool(False)

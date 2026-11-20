@@ -3788,6 +3788,26 @@ class DeepseekV4AttnBackend(
                     q_lora = _first_rows(q_lora, n)
             req, pos = hoisted_req[:n], hoisted_pos[:n]
         if (
+            not run_indexer
+            and layer.indexer is not None
+            and not layer.indexer.key_only
+            and (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
+            )
+            and envs.SGLANG_OPT_DSV41_HOIST_INDEX_WEIGHTS.get()
+        ):
+            from sglang.srt.model_executor.runner_utils.capture_mode import (
+                skip_low_ratio_indexer,
+            )
+
+            if not skip_low_ratio_indexer(layer.compress_ratio):
+                # Taken by this layer's indexer pass on the same stream (_index_q_and_weights).
+                layer.indexer.hoisted_head_weights = (
+                    x,
+                    layer.indexer.head_weights_raw(x),
+                )
+        if (
             forward_batch.forward_mode.is_extend()
             and self._low_ratio_in_prefill_graph()
         ):
