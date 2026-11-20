@@ -34,7 +34,7 @@
 #ifndef FSTK_SERVING
 #define FSTK_SERVING 0
 #endif
-// FSTK_VARIANTS=1 (not serving) builds only the layout-5 variants 6-9.
+// FSTK_VARIANTS=1 (not serving) builds only the layout-5 variants 6-10.
 #ifndef FSTK_VARIANTS
 #define FSTK_VARIANTS 0
 #endif
@@ -151,15 +151,17 @@ struct ScoreParams {
 //   5: four math warpgroups, warpgroup g takes row g of both 128-key halves (4 rows, N 128,
 //      256-key splits, 4 stages read by all): 32 weight registers per thread, so 4 math
 //      warps per SM sub-partition hide the TMEM load latency.
-//   6-9: layout 5 with one barrier arrive per warp instead of per thread; 7, 9: one vote per
-//      split and no window test inside a row's window; 8, 9: odd warpgroups take the split's
-//      second half first, so the warps of a sub-partition wait on different TMEM stages.
+//   6-10: layout 5 with one barrier arrive per warp instead of per thread; 7, 9, 10: one vote
+//      per split and no window test inside a row's window; 8, 9: odd warpgroups take the split's
+//      second half first, so the warps of a sub-partition wait on different TMEM stages; 10: a
+//      thread reduces both halves' keys together, 16 heads per TMEM load (8 FMA chains).
 template <int kLayout>
 struct LayoutTraits {
   static constexpr int kBase = kLayout == 3 ? 0 : (kLayout == 4 ? 2 : (kLayout >= 6 ? 5 : kLayout));
   static constexpr bool kWarpArrive = kLayout >= 6;
-  static constexpr bool kSplitVote = kLayout == 7 or kLayout == 9;
+  static constexpr bool kSplitVote = kLayout == 7 or kLayout == 9 or kLayout == 10;
   static constexpr bool kStagger = kLayout == 8 or kLayout == 9;
+  static constexpr bool kPairHalves = kLayout == 10;
   static constexpr bool kPairLoads = kLayout == 3 or kLayout == 4;
   static constexpr uint32_t kBlockQ = kBase == 2 ? 8 : 4;
   static constexpr uint32_t kSplitKV = kBase == 2 ? 128 : 256;
@@ -359,6 +361,28 @@ CUTLASS_DEVICE float dg_reduce(const float* accum, const float* w) {
     sum_0 = transform(j, sum_0);
     sum_1 = transform(j + 2, sum_1);
   }
+  auto sum = __fadd2_rn(sum_0, sum_1);
+  return (sum.x + sum.y) / 2;
+}
+
+// dg_reduce in two calls: heads [j0, j0 + 16) from accum16 (accum16[j - j0] is head j) into the two
+// f32x2 chains, in dg_reduce's order; dg_finish ends it. Same operations, so the same bits.
+template <uint32_t kAluHeads = 0>
+CUTLASS_DEVICE void dg_reduce_part(const float* accum16, const float* w, const uint32_t j0, float2& sum_0, float2& sum_1) {
+  const auto transform = [&](const uint32_t j, const float2& sum) {
+    auto b = make_float2(w[j], w[j + 1]);
+    const float x0 = accum16[j - j0], x1 = accum16[j + 1 - j0];
+    if (j < kAluHeads) return __ffma2_rn(make_float2(fmaxf(x0, 0.0f), fmaxf(x1, 0.0f)), b, sum);
+    return __ffma2_rn(__fadd2_rn(make_float2(x0, x1), make_float2(fabsf(x0), fabsf(x1))), b, sum);
+  };
+#pragma unroll
+  for (uint32_t j = j0; j < j0 + 16; j += 4) {
+    sum_0 = transform(j, sum_0);
+    sum_1 = transform(j + 2, sum_1);
+  }
+}
+
+CUTLASS_DEVICE float dg_finish(const float2& sum_0, const float2& sum_1) {
   auto sum = __fadd2_rn(sum_0, sum_1);
   return (sum.x + sum.y) / 2;
 }
@@ -975,7 +999,32 @@ __global__ __launch_bounds__(LayoutTraits<kLayout>::kNumThreads, 1) void fstk_sc
             };
             static_assert(kMmaPerSplit == 2);
             float r0, r1;
-            if (reverse_halves) {
+            if constexpr (Traits::kPairHalves and kMode != kModeNoEpi) {
+              // Both halves at once: 16 heads of each key per TMEM load, 8 FMA chains per thread.
+              smem.full_tmem_barriers[stage_of[0]].wait(phase_of[0]);
+              smem.full_tmem_barriers[stage_of[1]].wait(phase_of[1]);
+              ptx::tcgen05_after_thread_sync();
+              cutlass::arch::fence_view_async_shared();
+              release(smem.empty_kv_barriers[kv_stage_idx]);
+              float acc_a[kNumHeads / 2], acc_b[kNumHeads / 2];
+              float2 s0a = make_float2(0, 0), s1a = make_float2(0, 0), s0b = make_float2(0, 0), s1b = make_float2(0, 0);
+              const uint32_t col = my_row * kNumHeads;
+              ptx::tmem_load_32dp32b<kNumHeads / 2>(stage_of[0] * UMMA_N + col, reinterpret_cast<uint32_t*>(acc_a));
+              ptx::tmem_load_32dp32b<kNumHeads / 2>(stage_of[1] * UMMA_N + col, reinterpret_cast<uint32_t*>(acc_b));
+              cutlass::arch::fence_view_async_tmem_load();
+              dg_reduce_part<kAluHeads>(acc_a, weights, 0, s0a, s1a);
+              dg_reduce_part<kAluHeads>(acc_b, weights, 0, s0b, s1b);
+              ptx::tmem_load_32dp32b<kNumHeads / 2>(stage_of[0] * UMMA_N + col + kNumHeads / 2, reinterpret_cast<uint32_t*>(acc_a));
+              ptx::tmem_load_32dp32b<kNumHeads / 2>(stage_of[1] * UMMA_N + col + kNumHeads / 2, reinterpret_cast<uint32_t*>(acc_b));
+              cutlass::arch::fence_view_async_tmem_load();
+              ptx::tcgen05_before_thread_sync();
+              release(smem.empty_tmem_barriers[stage_of[0]]);
+              release(smem.empty_tmem_barriers[stage_of[1]]);
+              dg_reduce_part<kAluHeads>(acc_a, weights, kNumHeads / 2, s0a, s1a);
+              dg_reduce_part<kAluHeads>(acc_b, weights, kNumHeads / 2, s0b, s1b);
+              r0 = dg_finish(s0a, s1a) * scale_kv[0];
+              r1 = dg_finish(s0b, s1b) * scale_kv[1];
+            } else if (reverse_halves) {
               r1 = score_half(1);
               r0 = score_half(0);
             } else {
@@ -1715,7 +1764,7 @@ struct FusedIndexerTopK {
 #elif FSTK_VARIANTS
     // The layout-5 variants only (a build of its own).
     sglang::host::RuntimeCheck(alu_heads == 0 or alu_heads == 16, "fstk: alu_heads must be 0 or 16");
-    sglang::host::RuntimeCheck(layout >= 6 and layout <= 9, "fstk variants: layout must be 6..9");
+    sglang::host::RuntimeCheck(layout >= 6 and layout <= 10, "fstk variants: layout must be 6..10");
     if (layout == 6) {
       if (alu_heads) FSTK_DISPATCH(6, 16);
       FSTK_DISPATCH(6, 0);
@@ -1727,6 +1776,10 @@ struct FusedIndexerTopK {
     if (layout == 8) {
       if (alu_heads) FSTK_DISPATCH(8, 16);
       FSTK_DISPATCH(8, 0);
+    }
+    if (layout == 10) {
+      if (alu_heads) FSTK_DISPATCH(10, 16);
+      FSTK_DISPATCH(10, 0);
     }
     if (alu_heads) FSTK_DISPATCH(9, 16);
     FSTK_DISPATCH(9, 0);
