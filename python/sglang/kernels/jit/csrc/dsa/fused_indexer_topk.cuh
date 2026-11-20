@@ -75,12 +75,11 @@ struct ScoreParams {
   const int32_t* order;  // [num_q_blocks] q-block visit order; nullptr: identity
   float* logits;         // kModeLogits
   const float* tau;      // kModeFilter: per-row threshold
-  // kModeFilter: [num_q_tokens, cand_num_sub, cand_sub_cap] select keys,
-  // (ordered score << 32) | ~window column; one sub-list per math warp that sees the row.
+  // kModeFilter: [num_q_tokens, kNumMathWarps, cand_sub_cap] select keys,
+  // (ordered score << 32) | ~window column; one sub-list per math warp of the row's CTA.
   uint64_t* cand_key;
-  int32_t* cand_count;  // kModeFilter: [num_q_tokens, cand_num_sub], zeroed by the caller; may exceed the cap
+  int32_t* cand_count;  // kModeFilter: [num_q_tokens, kNumMathWarps], zeroed by the caller; may exceed the cap
   uint32_t cand_sub_cap;
-  uint32_t cand_num_sub;
   float* sink;  // kModeNoStore
 };
 
@@ -431,7 +430,7 @@ __global__ __launch_bounds__(LayoutTraits<kLayout>::kNumThreads, 1) void fstk_sc
           if (take) {
             const uint32_t pos = base + __popc(mask & ((1u << lane_idx) - 1u));
             if (pos < params.cand_sub_cap)
-              params.cand_key[(static_cast<uint64_t>(row) * params.cand_num_sub + sub_idx) * params.cand_sub_cap + pos] =
+              params.cand_key[(static_cast<uint64_t>(row) * kNumMathWarps + sub_idx) * params.cand_sub_cap + pos] =
                   (static_cast<uint64_t>(ordered_key(result)) << 32) | static_cast<uint64_t>(~rel);
           }
         }
@@ -444,7 +443,7 @@ __global__ __launch_bounds__(LayoutTraits<kLayout>::kNumThreads, 1) void fstk_sc
         for (uint32_t c = 0; c < kCnt; ++c) {
           const uint32_t row = q_block_idx * kBlockQ + li_base + c;
           if (lane_idx == 0 and row < params.num_q_tokens)
-            params.cand_count[row * params.cand_num_sub + sub_idx] = static_cast<int32_t>(sub_cnt[c]);
+            params.cand_count[row * kNumMathWarps + sub_idx] = static_cast<int32_t>(sub_cnt[c]);
           sub_cnt[c] = 0;
         }
       }
@@ -839,7 +838,6 @@ struct SelectParams {
   uint32_t num_rows;
   uint32_t topk;
   uint32_t cand_sub_cap;
-  uint32_t cand_num_sub;
   uint32_t page_bits;
 };
 
@@ -880,13 +878,13 @@ __global__ __launch_bounds__(kSelectThreads) void fstk_select_kernel(const Selec
   __shared__ uint32_t s_bad;
   if (tx == 0) {
     uint32_t acc = 0, bad = 0;
-    for (uint32_t w = 0; w < p.cand_num_sub; ++w) {
-      const uint32_t c = static_cast<uint32_t>(p.cand_count[row * p.cand_num_sub + w]);
+    for (uint32_t w = 0; w < kNumMathWarps; ++w) {
+      const uint32_t c = static_cast<uint32_t>(p.cand_count[row * kNumMathWarps + w]);
       bad |= c > p.cand_sub_cap;
       s_off[w] = acc;
       acc += c;
     }
-    for (uint32_t w = p.cand_num_sub; w <= kNumMathWarps; ++w) s_off[w] = acc;
+    s_off[kNumMathWarps] = acc;
     s_bad = bad or acc < p.topk or acc > kSelectMaxKeys;
     if (s_bad) p.fallback[atomicAdd(p.num_fallback, 1)] = static_cast<int32_t>(row);
   }
@@ -895,7 +893,7 @@ __global__ __launch_bounds__(kSelectThreads) void fstk_select_kernel(const Selec
   const uint32_t n = s_off[kNumMathWarps];
   uint64_t k_or = 0, k_and = ~0ull;
   // One flat pass over all sub-lists, so every thread's loads are in flight together.
-  const uint64_t* row_keys = p.cand_key + static_cast<uint64_t>(row) * p.cand_num_sub * p.cand_sub_cap;
+  const uint64_t* row_keys = p.cand_key + static_cast<uint64_t>(row) * kNumMathWarps * p.cand_sub_cap;
   for (uint32_t t = tx; t < n; t += kSelectThreads) {
     uint32_t w = 0;
 #pragma unroll
@@ -1101,14 +1099,11 @@ inline void score_impl(
   if constexpr (kMode == kModeNoStore) params.sink = static_cast<float*>(logits.data_ptr());
   if constexpr (kMode == kModeFilter) {
     params.tau = static_cast<const float*>(tau.data_ptr());
-    // Sub-lists per row: sub_idx is the math warp, or its index in the row's warpgroup (layout 5).
-    constexpr int64_t kNumSub = Traits::kBase == 5 ? 4 : kNumMathWarps;
-    RuntimeCheck(cand_key.size(1) == kNumSub and cand_count.size(1) == kNumSub,
-                 "fstk: candidate buffers must be [T, ", kNumSub, ", sub_cap] and [T, ", kNumSub, "]");
+    RuntimeCheck(cand_key.size(1) == kNumMathWarps and cand_count.size(1) == kNumMathWarps,
+                 "fstk: candidate buffers must be [T, 8, sub_cap] and [T, 8]");
     params.cand_key = static_cast<uint64_t*>(cand_key.data_ptr());
     params.cand_count = static_cast<int32_t*>(cand_count.data_ptr());
     params.cand_sub_cap = static_cast<uint32_t>(cand_key.size(2));
-    params.cand_num_sub = static_cast<uint32_t>(kNumSub);
   }
 
   const auto map_q = make_map_2d(
@@ -1256,9 +1251,6 @@ struct FusedIndexerTopK {
     p.num_rows = static_cast<uint32_t>(out.size(0));
     p.topk = static_cast<uint32_t>(out.size(1));
     p.cand_sub_cap = static_cast<uint32_t>(cand_key.size(2));
-    p.cand_num_sub = static_cast<uint32_t>(cand_key.size(1));
-    RuntimeCheck(p.cand_num_sub >= 1 and p.cand_num_sub <= kNumMathWarps and cand_count.size(1) == cand_key.size(1),
-                 "fstk: candidate buffers must be [T, S, sub_cap] and [T, S] with S <= 8");
     RuntimeCheck(page_size > 0 and (page_size & (page_size - 1)) == 0, "fstk: page_size must be a power of two");
     p.page_bits = static_cast<uint32_t>(__builtin_ctzll(static_cast<unsigned long long>(page_size)));
     if (p.num_rows == 0) return;

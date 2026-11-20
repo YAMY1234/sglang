@@ -26,12 +26,7 @@ MODE_LOGITS, MODE_NO_EPI, MODE_NO_STORE, MODE_FILTER = 0, 1, 2, 3
 # layout -> (rows per q-block, keys per split); see LayoutTraits in the kernel.
 LAYOUTS = {0: (4, 256), 1: (4, 256), 2: (8, 128), 3: (4, 256), 4: (8, 128), 5: (4, 256)}
 DEFAULT_LAYOUT = 5  # measured fastest for the filter pass (VR, 11-20)
-MATH_WARPS = 8  # candidate sub-list capacity is cand_cap // MATH_WARPS
-
-
-def num_sub_lists(layout: int) -> int:
-    """Candidate sub-lists per row: layout 5 gives each row one warpgroup (4 warps)."""
-    return 4 if layout == 5 else MATH_WARPS
+MATH_WARPS = 8  # candidate sub-lists per row: one per math warp of the row's CTA
 
 
 def _deep_gemm_include() -> tuple[str, bool]:
@@ -143,13 +138,10 @@ def _sample_stride_elems(num_samples: int) -> int:
     return (num_samples + 512 + 255) // 256 * 256
 
 
-def scratch_bytes_per_row(
-    num_kv: int, sample_stride: int = 16, cand_cap: int = 16384, layout: int = DEFAULT_LAYOUT
-) -> int:
+def scratch_bytes_per_row(num_kv: int, sample_stride: int = 16, cand_cap: int = 16384) -> int:
     """Device scratch of fused_indexer_topk per query row (sample scores, candidates)."""
     num_samples = (num_kv + sample_stride - 1) // sample_stride
-    nsub = num_sub_lists(layout)
-    return 4 * _sample_stride_elems(num_samples) + nsub * (8 * (cand_cap // MATH_WARPS) + 4) + 16
+    return 4 * _sample_stride_elems(num_samples) + 8 * cand_cap + 4 * MATH_WARPS + 16
 
 
 class FusedTopKResult(NamedTuple):
@@ -225,9 +217,8 @@ def fused_indexer_topk(
 
     # Select keys: (order-preserving score bits << 32) | ~window column, one sub-list per
     # math warp; a warp that never sees a row leaves its zero count.
-    nsub = num_sub_lists(layout)
-    cand_key = torch.empty(rows, nsub, cand_cap // MATH_WARPS, device=dev, dtype=torch.int64)
-    cand_count = torch.zeros(rows, nsub, device=dev, dtype=torch.int32)
+    cand_key = torch.empty(rows, MATH_WARPS, cand_cap // MATH_WARPS, device=dev, dtype=torch.int64)
+    cand_count = torch.zeros(rows, MATH_WARPS, device=dev, dtype=torch.int32)
     score(
         q_fp8,
         kv_fp8,
