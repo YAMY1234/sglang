@@ -74,24 +74,26 @@ def pp_sync_polls(
         assert polls is not None
         return polls
 
-    if window > 1:
-        sync_work_list.append([])
-        while len(sync_work_list) > window:
-            for p2p_work in sync_work_list.pop(0):
+    with pp_bubble_diag.wait("polls_drain." + tag.name):
+        if window > 1:
+            sync_work_list.append([])
+            while len(sync_work_list) > window:
+                for p2p_work in sync_work_list.pop(0):
+                    p2p_work.work.wait()
+            round_work_list = sync_work_list[-1]
+        else:
+            for p2p_work in sync_work_list:
                 p2p_work.work.wait()
-        round_work_list = sync_work_list[-1]
-    else:
-        for p2p_work in sync_work_list:
-            p2p_work.work.wait()
-        sync_work_list.clear()
-        round_work_list = sync_work_list
+            sync_work_list.clear()
+            round_work_list = sync_work_list
 
     data = polls
     if pp_rank > 0:
-        data = pp_group.recv_object(
-            src=pp_rank - 1,
-            tag=tag,
-        )
+        with pp_bubble_diag.wait("polls_recv." + tag.name):
+            data = pp_group.recv_object(
+                src=pp_rank - 1,
+                tag=tag,
+            )
     if pp_rank + 1 < pp_size:
         round_work_list.extend(
             pp_group.send_object(

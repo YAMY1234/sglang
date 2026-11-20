@@ -35,6 +35,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.observability.req_time_stats import set_time_batch
+from sglang.srt.managers import pp_bubble_diag
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_BUILD_BATCH,
     SCHEDULER_STAGE_DISAGG_BOOKKEEPING,
@@ -293,6 +294,7 @@ class SchedulerPPMixin:
                 "metadata (SGLANG_PP_PD_PREFILL_EARLY_SEND)."
             )
 
+        diag = self.pp_bubble_diag
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
@@ -308,11 +310,16 @@ class SchedulerPPMixin:
                 d2h_event = None
                 next_batch_result = None
 
+                if diag is not None:
+                    diag.maybe_log()
+                    diag.phase("ingest")
                 recv_reqs = self.ingest_requests()
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
 
+                if diag is not None:
+                    diag.phase("bootstrap")
                 self.process_bootstrapped_queue()
 
                 if not release_relay:
@@ -322,13 +329,21 @@ class SchedulerPPMixin:
 
                 # The pipeline loop builds its own batch instead of calling
                 # get_next_batch_to_run, so label the same work here.
+                if diag is not None:
+                    diag.phase("build")
                 with self.scheduler_stage_metrics.record(SCHEDULER_STAGE_BUILD_BATCH):
                     self.process_prefill_chunk(
                         last_batch=self.last_batch, running_batch=self.running_batch
                     )
                     self._process_hicache_events()
+                    if diag is not None:
+                        diag.phase("admit")
+                        diag.begin_pass(len(self.waiting_queue))
                     prefill_plan = self.get_new_batch_prefill(self.running_batch)
                     batch = prefill_plan.batch_to_run
+                    if diag is not None:
+                        diag.end_pass((batch.extend_num_tokens or 0) if batch else 0)
+                        diag.phase("build")
                     self.running_batch = prefill_plan.running_batch
                     batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
                 self.mbs[mb_id] = batch
@@ -336,6 +351,8 @@ class SchedulerPPMixin:
 
                 cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 self.cur_batch_for_debug = cur_batch
+                if diag is not None:
+                    diag.phase("launch")
                 if cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
@@ -364,6 +381,8 @@ class SchedulerPPMixin:
                         )
                 if early_send:
                     self._pp_pd_flush_early_sends()
+                if diag is not None:
+                    diag.phase("output")
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -384,7 +403,7 @@ class SchedulerPPMixin:
                 if self.mbs[next_mb_id] is not None:
                     with self.scheduler_stage_metrics.record(
                         SCHEDULER_STAGE_PP_OUTPUT_WAIT
-                    ):
+                    ), pp_bubble_diag.wait("d2h"):
                         d2h_event.synchronize()
                     if early_send:
                         # This result must find its early sends made and ended. Forwards
@@ -400,12 +419,16 @@ class SchedulerPPMixin:
                     )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
+                if diag is not None:
+                    diag.phase("release")
                 if release_relay:
                     self.process_disagg_prefill_inflight_queue(
                         pp_consensus_polls=self._pp_pd_relay_prefill_release_polls()
                     )
                 elif tmbs[next_mb_id] is not None:
                     self.process_disagg_prefill_inflight_queue(next_release_rids)
+                if diag is not None:
+                    diag.phase("send")
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
                         recv_reqs, async_send=True
@@ -424,6 +447,8 @@ class SchedulerPPMixin:
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
+                if diag is not None:
+                    diag.phase("idle")
                 self._sched_idled = True
                 if len(self.disagg_prefill_inflight_queue) == 0:
                     self.on_idle()
@@ -641,6 +666,12 @@ class SchedulerPPMixin:
             and not self.spec_algorithm.is_none()
         )
 
+        self.pp_bubble_diag = pp_bubble_diag.init(
+            pp_rank=get_parallel().pp_rank,
+            event_factory=self.device_module.Event,
+            chunk_budget=self.chunked_prefill_size,
+        )
+
         self.send_req_work = []
         self.send_proxy_work = []
         self.send_output_work = []
@@ -795,7 +826,7 @@ class SchedulerPPMixin:
         work: List[P2PWork],
         fence_next_forward: bool = False,
     ) -> None:
-        with self.pp_comm_stream_ctx:
+        with self.pp_comm_stream_ctx, pp_bubble_diag.wait_in_phase("send_commit"):
             for p2p_work in work:
                 p2p_work.work.wait()
         if fence_next_forward and work:
@@ -877,15 +908,16 @@ class SchedulerPPMixin:
                 * get_parallel().attn_cp_size
                 * get_parallel().attn_tp_size
             )
-            data = point_to_point_pyobj(
-                [],
-                get_parallel().pp_rank * get_parallel().tp_size + dp_offset,
-                self.world_group.cpu_group,
-                ((get_parallel().pp_rank - 1) % get_parallel().pp_size)
-                * get_parallel().tp_size
-                + dp_offset,
-                get_parallel().pp_rank * get_parallel().tp_size + dp_offset,
-            )
+            with pp_bubble_diag.wait_in_phase("pyobj_recv"):
+                data = point_to_point_pyobj(
+                    [],
+                    get_parallel().pp_rank * get_parallel().tp_size + dp_offset,
+                    self.world_group.cpu_group,
+                    ((get_parallel().pp_rank - 1) % get_parallel().pp_size)
+                    * get_parallel().tp_size
+                    + dp_offset,
+                    get_parallel().pp_rank * get_parallel().tp_size + dp_offset,
+                )
         else:
             data = None
 
@@ -1011,9 +1043,10 @@ class SchedulerPPMixin:
 
         while True:
             with self.pp_comm_stream_ctx:
-                tensor_dict = self.pp_group.recv_tensor_dict(
-                    all_gather_group=all_gather_group
-                )
+                with pp_bubble_diag.wait("dict_recv." + expected_kind):
+                    tensor_dict = self.pp_group.recv_tensor_dict(
+                        all_gather_group=all_gather_group
+                    )
                 recv_event = self._pp_record_comm_event()
             received_kind = tensor_dict.get("__msg_type__", "default")
             if received_kind == expected_kind:
@@ -1771,9 +1804,14 @@ class SchedulerPPMixin:
         mb_metadata: List[Optional[PPBatchMetadata]],
         last_rank_comm_queue: deque,
     ):
+        diag = self.pp_bubble_diag
         with torch.profiler.record_function("run_batch"):
             with self.forward_stream_ctx:
+                if diag is not None:
+                    diag_pre = diag.forward_event()
                 self._pp_wait_forward_dependencies()
+                if diag is not None:
+                    diag_start = diag.forward_event()
                 if self._hicache_fence_controller is not None:
                     # Write-back eviction fence (SGLANG_HICACHE_WB_EVICT_RELAXED_FENCE):
                     # covers earlier forwards and the schedule work this one waited on.
@@ -1800,6 +1838,15 @@ class SchedulerPPMixin:
                 )
                 event = self.device_module.Event()
                 event.record(self.device_module.current_stream())
+                if diag is not None:
+                    diag.on_forward(
+                        pre=diag_pre,
+                        start=diag_start,
+                        end=diag.forward_event(),
+                        new_tokens=cur_batch.extend_num_tokens or 0,
+                        cached_tokens=sum(cur_batch.prefix_lens or ()),
+                        has_load=cur_batch.hicache_consumer_index >= 0,
+                    )
                 if self.pp_group.is_last_rank:
                     # (last rank) buffer the outputs for async batch depth
                     last_rank_comm_queue.append(

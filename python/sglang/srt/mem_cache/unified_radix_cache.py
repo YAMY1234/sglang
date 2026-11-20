@@ -25,6 +25,7 @@ import torch
 
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
+from sglang.srt.managers import pp_bubble_diag
 from sglang.srt.managers.cache_controller import CacheOperation
 from sglang.srt.managers.scheduler_components.shm_tag_exchange import (
     ShmTagExchange,
@@ -533,16 +534,17 @@ class UnifiedRadixCache(BasePrefixCache):
         backpressure when a downstream PP rank lags. Scheduler thread only.
         With SGLANG_PP_SYNC_WINDOW, only rounds older than pp_sync_window are waited.
         """
-        if self.pp_sync_window > 1:
-            self.pp_sync_rounds.append(self.work_list)
-            self.work_list = []
-            while len(self.pp_sync_rounds) >= self.pp_sync_window:
-                for work in self.pp_sync_rounds.popleft():
-                    work.wait()
-            return
-        for work in self.work_list:
-            work.wait()
-        self.work_list.clear()
+        with pp_bubble_diag.wait("drain"):
+            if self.pp_sync_window > 1:
+                self.pp_sync_rounds.append(self.work_list)
+                self.work_list = []
+                while len(self.pp_sync_rounds) >= self.pp_sync_window:
+                    for work in self.pp_sync_rounds.popleft():
+                        work.wait()
+                return
+            for work in self.work_list:
+                work.wait()
+            self.work_list.clear()
 
     def _all_reduce(self, data: torch.Tensor, tp_reduce_op: torch.distributed.ReduceOp):
         """
@@ -571,12 +573,13 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.pp_size <= 1 or self.pp_group is None:
             return
         if self.pp_rank > 0:
-            torch.distributed.recv(
-                data,
-                group_src=self.pp_rank - 1,
-                group=self.pp_group,
-                tag=P2PTag.HICACHE_PP_SYNC,
-            )
+            with pp_bubble_diag.relay_wait():
+                torch.distributed.recv(
+                    data,
+                    group_src=self.pp_rank - 1,
+                    group=self.pp_group,
+                    tag=P2PTag.HICACHE_PP_SYNC,
+                )
         if self.pp_rank + 1 < self.pp_size:
             copy_of_data = data.clone()
             send_work = torch.distributed.isend(
@@ -2901,7 +2904,8 @@ class UnifiedRadixCache(BasePrefixCache):
         while finish_count > 0:
             ack = cc.ack_write_ahead_queue.pop(0)
             self._wa_issue_steps.popleft()
-            ack.finish_event.synchronize()
+            with pp_bubble_diag.wait("ack_sync.write_ahead"):
+                ack.finish_event.synchronize()
             for ack_id in ack.node_ids:
                 self._finish_write_through_ack(ack_id, self.ongoing_write_ahead)
             self._log_write_ack_metrics(ack)
@@ -3497,6 +3501,20 @@ class UnifiedRadixCache(BasePrefixCache):
         if staged is not None:
             return staged.matched_len, staged.matched_len + staged.num_tokens
         return None
+
+    def prefetch_skip_reason(self, request: CacheRequestHandle) -> str:
+        """Why check_prefetch_progress just returned False (diagnostics only)."""
+        if request in getattr(self, "_mamba_state_restores", {}):
+            return "kda_restore_pending"
+        if (
+            self.cache_controller is not None
+            and self.cache_controller.pp_prefetch_decisions.get(request.rid)
+            is PPPrefetchDecision.TICKETED
+        ):
+            return "ticket_not_ready"
+        if request in self.ongoing_prefetch:
+            return "prefetch_running"
+        return "other"
 
     @rank_consensus(same_params=True, same_results=True)
     def check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
@@ -5262,7 +5280,8 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             while self.ongoing_write_through:
                 for ack in cc.ack_write_queue:
-                    ack.finish_event.synchronize()
+                    with pp_bubble_diag.wait("ack_sync.write_flush"):
+                        ack.finish_event.synchronize()
                     for ack_id in ack.node_ids:
                         if ack_id in self.ongoing_write_through:
                             self._finish_write_through_ack(ack_id)
@@ -5288,7 +5307,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # Process completed acks
         while finish_count > 0:
             ack = cc.ack_write_queue.pop(0)
-            ack.finish_event.synchronize()
+            with pp_bubble_diag.wait("ack_sync.write"):
+                ack.finish_event.synchronize()
             for ack_id in ack.node_ids:
                 self._finish_write_through_ack(ack_id)
             self._log_write_ack_metrics(ack)
@@ -5334,7 +5354,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
         while finish_count > 0:
             ack = cc.ack_load_queue.pop(0)
-            ack.finish_event.synchronize()
+            with pp_bubble_diag.wait("ack_sync.load"):
+                ack.finish_event.synchronize()
             for ack_id in ack.node_ids:
                 if (
                     self.buffer_pipeline is not None
