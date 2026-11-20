@@ -55,6 +55,15 @@ namespace fstk {
 
 using namespace deep_gemm;
 
+namespace {
+// The once-per-device flags of the launches below: a static of a template instantiated with a
+// translation-unit-local tag is local to this module. With a non-local tag the flag would be one
+// unique symbol shared by every loaded build of this file (serving, full), and a build whose kernel
+// never got its shared-memory attribute could see the flag already set by another build.
+template <auto kKernel>
+struct SmemAttrTag {};
+}  // namespace
+
 constexpr uint32_t kNumHeads = 32;
 constexpr uint32_t kHeadDim = 128;
 constexpr uint32_t kNumQStages = 3;
@@ -1485,7 +1494,7 @@ inline void score_impl(
   constexpr size_t kSmem = sizeof(SharedStorage);
   constexpr auto kernel = fstk_score_kernel<kMode, kReuseKV, kLayout, kAluHeads>;
   const DLDevice device = q.device();
-  runtime::init_per_device(device, [=] { runtime::set_max_dynamic_smem(kernel, kSmem); });
+  runtime::init_per_device<SmemAttrTag<kernel>>(device, [=] { runtime::set_max_dynamic_smem(kernel, kSmem); });
   LaunchKernel(static_cast<uint32_t>(num_ctas), Traits::kNumThreads, device, kSmem)
       .enable_pdl(false)(kernel, params, map_q, map_kv, map_sf_kv, map_w);
 }
@@ -1653,7 +1662,7 @@ struct FusedIndexerTopK {
     const uint32_t grid = p.row_list != nullptr ? static_cast<uint32_t>(std::min<int64_t>(num_ctas, p.num_rows)) : p.num_rows;
     const size_t smem = static_cast<size_t>(smem_keys) * sizeof(uint64_t);
     const DLDevice device = out.device();
-    runtime::init_per_device(device, [=] {
+    runtime::init_per_device<SmemAttrTag<fstk_select_kernel>>(device, [=] {
       runtime::set_max_dynamic_smem(fstk_select_kernel, static_cast<size_t>(kSelectRepairKeys) * sizeof(uint64_t));
     });
     LaunchKernel(grid, kSelectThreads, device, smem)(fstk_select_kernel, p);
