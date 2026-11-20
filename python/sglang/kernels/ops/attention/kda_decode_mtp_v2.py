@@ -285,7 +285,7 @@ def kda_decode_mtp_kernel(
     APPLY_ONORM: cutlass.Constexpr[bool],
     onorm_eps: cutlass.Constexpr[float],
     ASYNC_P1: cutlass.Constexpr[bool],
-    P2_VLDS: cutlass.Constexpr[bool],
+    P2_VW: cutlass.Constexpr[int],
     prof: cute.Tensor,
     PROF: cutlass.Constexpr[bool],
     PF_DIST: cutlass.Constexpr[int],
@@ -1119,18 +1119,21 @@ def kda_decode_mtp_kernel(
                             r_decay[jv * 4 + c] = r_v4g[c]
             else:
                 r_beta_val = sBeta[i_t]
-                if cutlass.const_expr(P2_VLDS):
+                if cutlass.const_expr(P2_VW > 1):
                     # Lane-major sQ/sK/sG: a lane's P2_VEC channels are
-                    # contiguous, so each loads as P2_VEC // 4 128-bit vectors
-                    # straight into the operand registers (no staging).
+                    # contiguous, so each loads as P2_VW-wide vectors straight
+                    # into the operand registers (no staging).
                     for jv in range(P2_VEC // 4):
                         for src, dst in ((sQ, r_q), (sK, r_k), (sG, r_decay)):
-                            cute.autovec_copy(
-                                src[(i_t, k_grp, jv, None)],
-                                cute.make_tensor(
-                                    dst.iterator + jv * 4, cute.make_layout((4,))
-                                ),
-                            )
+                            v4 = src[(i_t, k_grp, jv, None)]
+                            for h in cutlass.range_constexpr(4 // P2_VW):
+                                cute.autovec_copy(
+                                    cute.local_tile(v4, (P2_VW,), (h,)),
+                                    cute.make_tensor(
+                                        dst.iterator + jv * 4 + h * P2_VW,
+                                        cute.make_layout((P2_VW,)),
+                                    ),
+                                )
                 else:
                     # Read once per token, and the resident state already claims
                     # every spare register, so don't pay for vector staging.
@@ -1282,7 +1285,7 @@ def _run_kda_decode_mtp_dspark(
     APPLY_ONORM: cutlass.Constexpr[bool],
     onorm_eps: cutlass.Constexpr[float],
     ASYNC_P1: cutlass.Constexpr[bool],
-    P2_VLDS: cutlass.Constexpr[bool],
+    P2_VW: cutlass.Constexpr[int],
     PROF: cutlass.Constexpr[bool],
     PF_DIST: cutlass.Constexpr[int],
     stream: cuda.CUstream,
@@ -1292,7 +1295,7 @@ def _run_kda_decode_mtp_dspark(
     p2_vec = TILE_K // p2_lanes
     # (token, lane row, vector, element within vector); see _qk_smem.
     qk_stride, qk_elems = _qk_smem(
-        block_threads=BLOCK_THREADS, num_spec=NUM_SPEC, async_p1=P2_VLDS
+        block_threads=BLOCK_THREADS, num_spec=NUM_SPEC, async_p1=P2_VW > 1
     )
     smem_qk_layout = cute.make_layout(
         (1 + NUM_SPEC, p2_lanes, p2_vec // 4, 4), stride=qk_stride
@@ -1389,7 +1392,7 @@ def _run_kda_decode_mtp_dspark(
         APPLY_ONORM,
         onorm_eps,
         ASYNC_P1,
-        P2_VLDS,
+        P2_VW,
         prof,
         PROF,
         PF_DIST,
@@ -1399,7 +1402,7 @@ def _run_kda_decode_mtp_dspark(
         smem=smem_bytes,
         stream=stream,
         use_pdl=True,
-        **_launch_bounds(ASYNC_P1, BLOCK_THREADS),
+        **_launch_bounds(ASYNC_P1 or P2_VW > 1, BLOCK_THREADS),
     )
 
 
@@ -1691,7 +1694,7 @@ def fused_kda_decode_mtp_dspark(
     async_p1 = num_spec >= 1 and _async_p1_enabled()
     import os
 
-    p2_vlds = async_p1 and os.environ.get("SGLANG_KDA_VERIFY_P2_VLDS", "0") == "1"
+    p2_vw = int(os.environ.get("SGLANG_KDA_VERIFY_P2_VW", "1")) if num_spec >= 1 else 1
     prof = prof_buf is not None
     pf_dist = 0
     if num_spec >= 1 and _l2pf_enabled():
@@ -1747,7 +1750,7 @@ def fused_kda_decode_mtp_dspark(
         apply_onorm,
         float(onorm_eps) if apply_onorm else 0.0,
         async_p1,
-        p2_vlds,
+        p2_vw,
         prof,
         pf_dist,
         float(scale),
@@ -1774,7 +1777,7 @@ def fused_kda_decode_mtp_dspark(
             APPLY_ONORM=apply_onorm,
             onorm_eps=float(onorm_eps) if apply_onorm else 0.0,
             ASYNC_P1=async_p1,
-            P2_VLDS=p2_vlds,
+            P2_VW=p2_vw,
             PROF=prof,
             PF_DIST=pf_dist,
             stream=stream,
