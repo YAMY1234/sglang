@@ -25,6 +25,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def precompile_transfer_mamba() -> None:
+    """Build and load the JIT module now instead of at the first host transfer."""
+    _jit_transfer_mamba_module()
+
+
 @cache_once
 def _jit_transfer_mamba_module() -> Module:
     return load_jit(
