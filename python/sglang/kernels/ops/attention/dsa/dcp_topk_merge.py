@@ -73,12 +73,21 @@ def _stats_or_scratch(stats: Optional[torch.Tensor], device: torch.device) -> to
     return _SCRATCH_STATS[device]
 
 
+# Entries after the full slot of a pushed-merge row slot (kPushExtra in dcp_topk_merge.cuh).
+DCP_TOPK_MERGE_PUSH_EXTRA = 4
+
+
 def dcp_topk_merge_buffer_numel(
-    num_ranks: int, max_rows: int, topk: int, cand_k: int
+    num_ranks: int, max_rows: int, topk: int, cand_k: int, push: bool = False
 ) -> int:
     """int64 entries of the symmetric buffer: two parities of max_rows row slots,
-    each holding every rank's candidates and this rank's full local top-k."""
-    return 2 * max_rows * (num_ranks * cand_k + topk)
+    each holding every rank's candidates and this rank's full local top-k (and,
+    for the pushed merge, DCP_TOPK_MERGE_PUSH_EXTRA stamps)."""
+    return 2 * max_rows * dcp_topk_merge_row_slot(num_ranks, topk, cand_k, push)
+
+
+def dcp_topk_merge_row_slot(num_ranks: int, topk: int, cand_k: int, push: bool) -> int:
+    return num_ranks * cand_k + topk + (DCP_TOPK_MERGE_PUSH_EXTRA if push else 0)
 
 
 def dcp_topk_merge(

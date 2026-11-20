@@ -527,9 +527,20 @@ __global__ void __launch_bounds__(32 * kNumRanks, kMinBlocks) merge_kernel(const
 // ---------------------------------------------------------------------------
 
 struct PushSmem : Smem {
-  uint64_t hi, lo;
+  uint64_t hi, lo, t_key;
   int n_out;
 };
+
+// After a row slot's kTopK full-slot entries (merge_pushed_kernel): [0] the owner's stamp
+// (call + 1) once its full slot holds this call's keys, which a full slot that is written only
+// on failures needs because its 8-bit tag repeats every 510 calls; [1] t* and [2] its stamp,
+// sent by the only failing rank.
+constexpr int kPushExtra = 4;
+enum { kExtraFullStamp, kExtraTKey, kExtraTStamp };
+
+SGL_DEVICE void fence_acquire_sys() {
+  asm volatile("fence.acq_rel.sys;" ::: "memory");
+}
 
 SGL_DEVICE uint64_t shr64(uint64_t k, int n) {
   return n >= 64 ? 0 : k >> n;
@@ -707,7 +718,7 @@ __global__ void __launch_bounds__(32 * kNumRanks, kNumRanks == 8 ? 4 : 1)
   static_assert(kCandK % 32 == 0 && kTopK % kThreads == 0 && kCandK <= kTopK);
   constexpr int kPerThread = kTopK / kThreads;  // full-slot entries per thread
   constexpr int kPerLane = kCandK / 32;         // candidates per lane
-  constexpr int64_t kSlot = static_cast<int64_t>(kNumRanks) * kCandK + kTopK;
+  constexpr int64_t kSlot = static_cast<int64_t>(kNumRanks) * kCandK + kTopK + kPushExtra;
   __shared__ PushSmem s;
 
   const int row = blockIdx.x, tid = threadIdx.x, warp = tid / 32;
@@ -760,23 +771,48 @@ __global__ void __launch_bounds__(32 * kNumRanks, kNumRanks == 8 ? 4 : 1)
   }
   // kCandK == kTopK never fails (above): no fallback code, and none of its registers
   constexpr bool kCanFail = kCandK < kTopK;
-  if (kCanFail && fail) {
-    if (fail >> p.rank & 1) {
+  const auto extra = [&](int q) {  // rank q's entries after its full slot of this row slot
+    return reinterpret_cast<uint64_t*>(p.peer_ptrs[q]) + full_off + kTopK;
+  };
+  const uint64_t stamp = static_cast<uint64_t>(c) + 1;
+  const bool failed = fail >> p.rank & 1;
+  if (kCanFail && fail && __popc(fail) == 1 && !failed) {
+    // one rank failed: it selects t* over every candidate and its own keys, and sends it here
+    if (tid == 0) {
+      const uint64_t* const mine = p.buffer + full_off + kTopK;
+      while (device::ptx::load_relaxed_sys(mine + kExtraTStamp) != stamp) {
+      }
+      fence_acquire_sys();
+      s.t_key = device::ptx::load_relaxed_sys(mine + kExtraTKey);
+    }
+    __syncthreads();
+    t = s.t_key;
+  } else if (kCanFail && fail) {
+    if (failed) {
       const bool selected = publish_local_topk<kNumRanks, kTopK>(p, row, full_off, tag, t, s);
+      __syncthreads();
       if (tid == 0) {
+        device::ptx::fence_release_sys();
+        device::ptx::store_relaxed_sys(p.buffer + full_off + kTopK + kExtraFullStamp, stamp);
         atomicAdd(&p.stats[kStatPublished], 1ull);
         if (selected) atomicAdd(&p.stats[kStatSelected], 1ull);
       }
     }
-    // every thread polls its entries of each failed rank's full slot once and, for up to two
-    // failed ranks, keeps the keys in registers; with more, the rounds below re-read them over
-    // NVLink (unchanged until this rank's call c + 1)
+    // every thread polls its entries of each failed rank's full slot once (after that rank's
+    // stamp) and, for up to two failed ranks, keeps the keys in registers; with more, the
+    // rounds below re-read them over NVLink (unchanged until this rank's call c + 1)
     const bool regs = __popc(fail) <= 2;
     const int q0 = __ffs(fail) - 1;
     uint64_t f0[kPerThread] = {}, f1[kPerThread] = {};
 #pragma unroll 1
     for (int q = 0; q < kNumRanks; ++q) {
       if (fail >> q & 1) {
+        if (tid == 0) {
+          while (device::ptx::load_relaxed_sys(extra(q) + kExtraFullStamp) != stamp) {
+          }
+          fence_acquire_sys();
+        }
+        __syncthreads();
         uint64_t tmp[kPerThread];
         poll_tagged<kPerThread>(reinterpret_cast<const uint64_t*>(p.peer_ptrs[q]) + full_off + tid, kThreads, tag, tmp);
         if (regs) {
@@ -815,6 +851,15 @@ __global__ void __launch_bounds__(32 * kNumRanks, kNumRanks == 8 ? 4 : 1)
     visit([&](uint64_t k) { mine += k != 0; });
     block_exclusive_sum<kNumRanks>(mine, n_union, s);
     t = select_kth_adaptive(visit, min(n_union, kTopK), s);
+    if (__popc(fail) == 1 && tid == 0) {  // this is the only failed rank: send t* to the others
+#pragma unroll 1
+      for (int q = 0; q < kNumRanks; ++q)
+        if (q != p.rank) device::ptx::store_relaxed_sys(extra(q) + kExtraTKey, t);
+      device::ptx::fence_release_sys();
+#pragma unroll 1
+      for (int q = 0; q < kNumRanks; ++q)
+        if (q != p.rank) device::ptx::store_relaxed_sys(extra(q) + kExtraTStamp, stamp);
+    }
   }
 
   // ---- this rank's keys >= t*, compacted ----
@@ -830,7 +875,7 @@ __global__ void __launch_bounds__(32 * kNumRanks, kNumRanks == 8 ? 4 : 1)
     out_local[e] = slot / kNumRanks;
   };
   int n;
-  if (kCanFail && (fail >> p.rank & 1)) {
+  if (kCanFail && failed) {
     // its keys >= t* are in its local top-k, in its own full slot
     const uint64_t* const src = p.buffer + full_off + tid;
     bool sel[kPerThread];
@@ -996,7 +1041,7 @@ struct DcpTopKMergePushedKernel {
     const auto max_rows = static_cast<int32_t>(M.unwrap());
     RuntimeCheck(rows <= max_rows, "dcp_topk_merge_pushed: rows ", rows, " > max_rows ", max_rows);
     RuntimeCheck(page_table.size(0) >= rows, "dcp_topk_merge_pushed: page_table has fewer rows than ", rows);
-    const int64_t need = 2LL * max_rows * (kNumRanks * kCandK + kTopK);
+    const int64_t need = 2LL * max_rows * (kNumRanks * kCandK + kTopK + dcp_topk_merge::kPushExtra);
     RuntimeCheck(buffer.size(0) >= need, "dcp_topk_merge_pushed: buffer numel ", buffer.size(0), " < ", need);
     const int64_t max_pos = page_table.size(1) * span;
     RuntimeCheck(max_pos <= dcp_topk_merge::kEmptyPos, "dcp_topk_merge_pushed: positions exceed 24 bits");
