@@ -4697,6 +4697,13 @@ class Scheduler(
                 )
                 req.time_stats.observe_storage_prefetch_ready(prefetch_done)
                 if not prefetch_done:
+                    diag = pp_bubble_diag.get()
+                    if diag is not None and self.enable_hicache_storage:
+                        diag.note_skip(
+                            self.tree_cache.prefetch_skip_reason(
+                                req.cache_request_handle
+                            )
+                        )
                     # skip staging requests that are ongoing prefetch
                     continue
                 # Pop the L3-loaded span. Unified cache exposes its absolute
