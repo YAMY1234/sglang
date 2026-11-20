@@ -1877,6 +1877,59 @@ DECODE_TABLE: dict = {
     ],
 }
 
+# Exact-M entries for the decode graph buckets, (N, K) -> {M: tactic}, taken before DECODE_TABLE when
+# SGLANG_OPT_SM107_MXFP8_DENSE_TABLE_BUCKETS is set. M = rows per rank of a captured bucket: B x 4 (target
+# verify, 384-704) and B x 3 (draft, 288-528) for the spec-decode buckets B 96-176; tactics are the dec-dense sweep's best per M
+# (40-layer CUDA-graph chains of real weights, bitwise to the served tactic).
+DECODE_TABLE_BUCKETS: dict = {
+    # q_a | kv, 1792 x 5120
+    (1792, 5120): {
+        288: ((256, 64), (2, 1), True, 256),
+        312: ((256, 64), (2, 4), False, 256),
+        336: ((256, 64), (2, 4), False, 256),
+        360: ((256, 64), (2, 4), False, 256),
+        384: ((256, 64), (2, 4), False, 256),
+        408: ((256, 64), (2, 4), False, 256),
+        416: ((256, 64), (2, 4), False, 256),
+        432: ((256, 64), (2, 4), False, 256),
+        448: ((256, 64), (2, 4), False, 256),
+        456: ((256, 64), (2, 4), False, 256),
+        480: ((256, 64), (2, 4), False, 256),
+        504: ((256, 64), (2, 4), False, 256),
+        512: ((256, 64), (2, 4), False, 256),
+        528: ((256, 64), (2, 4), False, 256),
+        544: ((256, 64), (2, 2), True, 256),
+        576: ((256, 64), (2, 4), False, 256),
+        608: ((256, 64), (2, 4), False, 256),
+        640: ((256, 64), (2, 2), True, 256),
+        672: ((256, 64), (2, 4), False, 256),
+        704: ((256, 64), (2, 4), False, 256),
+    },
+    # wo_b, 5120 x 8192
+    (5120, 8192): {
+        288: ((256, 128), (2, 4), False, 256),
+        312: ((256, 64), (2, 1), True, 256),
+        336: ((256, 128), (4, 1), True, 256),
+        360: ((256, 128), (2, 4), False, 256),
+        384: ((256, 128), (2, 4), False, 256),
+        408: ((256, 128), (2, 2), False, 256),
+        416: ((256, 128), (2, 2), False, 256),
+        432: ((256, 128), (2, 4), False, 256),
+        448: ((256, 128), (2, 4), False, 256),
+        456: ((256, 128), (2, 4), False, 256),
+        480: ((256, 128), (2, 4), False, 256),
+        504: ((256, 128), (2, 4), False, 256),
+        512: ((256, 128), (2, 1), False, 256),
+        528: ((256, 128), (2, 1), True, 256),
+        544: ((256, 128), (2, 1), True, 256),
+        576: ((256, 128), (2, 1), True, 256),
+        608: ((256, 128), (2, 1), True, 256),
+        640: ((256, 128), (2, 1), True, 256),
+        672: ((256, 192), (2, 4), False, 256),
+        704: ((256, 192), (2, 4), False, 256),
+    },
+}
+
 _LOGGED: set = set()
 
 
@@ -1900,22 +1953,26 @@ def decode_linear(
     out_dtype: torch.dtype,
 ) -> Optional[torch.Tensor]:
     """The tabled GEMM for an MXFP8 linear, or None when (N, K, M) is not tabled."""
-    entries = DECODE_TABLE.get(tuple(weight.shape))
-    if not entries or out_dtype != torch.bfloat16 or q_input.dim() != 2:
+    from sglang.srt.environ import envs
+
+    if out_dtype != torch.bfloat16 or q_input.dim() != 2:
         return None
     m = q_input.shape[0]
-    for max_m, tactic, split_k in entries:
-        if m <= max_m:
-            break
-    else:
-        return None
+    tactic = None
+    if envs.SGLANG_OPT_SM107_MXFP8_DENSE_TABLE_BUCKETS.get():
+        tactic = DECODE_TABLE_BUCKETS.get(tuple(weight.shape), {}).get(m)
+        split_k = 1
+    if tactic is None:
+        for max_m, tactic, split_k in DECODE_TABLE.get(tuple(weight.shape), ()):
+            if m <= max_m:
+                break
+        else:
+            return None
     if not _source_ok():
         return None
     n = weight.shape[0]
     if split_k > 1 and not split_k_fits(m, n, tactic, split_k):
         split_k = 1
-    from sglang.srt.environ import envs
-
     mode = envs.SGLANG_OPT_SM107_MXFP8_DENSE_TABLE_MODE.get()
     out = torch.empty((m, n), dtype=out_dtype, device=q_input.device)
     if mode == "stock":
