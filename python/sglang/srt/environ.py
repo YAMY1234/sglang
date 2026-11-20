@@ -869,6 +869,12 @@ class Envs:
     # this rate on the listed PP ranks, folded per diag label into stacks-pp<r>-<pid>.txt,
     # and time every GC collection on those ranks (logged when over 50 ms).
     SGLANG_PP_STACK_SAMPLE_HZ = EnvFloat(0.0)
+    # Scheduler: gc.freeze() after this many batches (0 off), then every
+    # SGLANG_SCHED_GC_FREEZE_EVERY batches (0: once); SGLANG_SCHED_GC_THRESHOLD
+    # "g0,g1,g2" sets gc thresholds with it.
+    SGLANG_SCHED_GC_FREEZE_AFTER = EnvInt(0)
+    SGLANG_SCHED_GC_FREEZE_EVERY = EnvInt(0)
+    SGLANG_SCHED_GC_THRESHOLD = EnvStr("")
     SGLANG_PP_STACK_SAMPLE_RANKS = EnvStr("0")
     # PP PD prefill (Mooncake): each stage sends a request's last KV chunk when its
     # own forward of that chunk completes, not when the result returns pp_size - 1

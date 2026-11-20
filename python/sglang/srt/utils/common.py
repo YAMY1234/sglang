@@ -4427,6 +4427,49 @@ def configure_gc_warning(warn_threshold_secs):
     gc.callbacks.append(gc_callback)
 
 
+class BatchCountGCFreezer:
+    """gc.freeze() once a process has run `after` batches, then every `every` batches
+    (0: once). A full collection walks every tracked object; frozen ones are skipped,
+    so the long-lived heap built so far stops costing collections. Cyclic garbage among
+    frozen objects is never reclaimed."""
+
+    def __init__(
+        self,
+        context: str,
+        after: int,
+        every: int = 0,
+        threshold: Optional[Sequence[int]] = None,
+    ):
+        self.context = context
+        self.next_at = after
+        self.every = every
+        if threshold:
+            gc.set_threshold(*threshold)
+        logger.info(
+            "%s GC: freeze after %d batches, every %d; threshold %s, freeze_count %d",
+            context,
+            after,
+            every,
+            gc.get_threshold(),
+            gc.get_freeze_count(),
+        )
+
+    def on_batch(self, count: int) -> bool:
+        if not self.next_at or count < self.next_at:
+            return False
+        t0 = time.perf_counter()
+        gc.freeze()
+        self.next_at = count + self.every if self.every else 0
+        logger.info(
+            "%s gc.freeze at batch %d: %d objects frozen, %.1f ms",
+            self.context,
+            count,
+            gc.get_freeze_count(),
+            (time.perf_counter() - t0) * 1e3,
+        )
+        return True
+
+
 def freeze_gc(context: str, gc_threshold: Optional[Sequence[int]] = None):
     if gc_threshold is not None:
         gc.set_threshold(*gc_threshold)

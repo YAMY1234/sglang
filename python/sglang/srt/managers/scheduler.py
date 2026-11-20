@@ -370,7 +370,11 @@ from sglang.srt.utils import (
     suppress_other_loggers,
     triton_load_watch,
 )
-from sglang.srt.utils.common import is_confidential_compute, is_npu
+from sglang.srt.utils.common import (
+    BatchCountGCFreezer,
+    is_confidential_compute,
+    is_npu,
+)
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -1356,6 +1360,15 @@ class Scheduler(
         self.enable_continuous_input_polling = False
         self.enable_skip_finishing_decode = False
         self.forward_ct = 0
+        self.gc_freezer = None
+        if envs.SGLANG_SCHED_GC_FREEZE_AFTER.get():
+            threshold = envs.SGLANG_SCHED_GC_THRESHOLD.get()
+            self.gc_freezer = BatchCountGCFreezer(
+                "Scheduler",
+                envs.SGLANG_SCHED_GC_FREEZE_AFTER.get(),
+                envs.SGLANG_SCHED_GC_FREEZE_EVERY.get(),
+                [int(x) for x in threshold.split(",")] if threshold else None,
+            )
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
             flush_cache=self.flush_cache,
@@ -5075,6 +5088,8 @@ class Scheduler(
         self.metrics_reporter.record_scheduler_active(time.monotonic_ns())
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
+        if self.gc_freezer is not None:
+            self.gc_freezer.on_batch(self.forward_ct)
         if pmicro_hoststats.ON and self.enable_hierarchical_cache:
             self._pmicro_hoststat(batch)
         batch.launch_ts = time.monotonic()

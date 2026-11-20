@@ -9,6 +9,7 @@ import torch
 from PIL import Image
 
 from sglang.srt.utils.common import (
+    BatchCountGCFreezer,
     _get_device_sm_via_nvml,
     _load_image,
     flatten_arrays_to_int64_tensor,
@@ -261,6 +262,19 @@ class TestFreezeGc(CustomTestCase):
     def test_applies_configured_threshold(self):
         freeze_gc("test", [700, 10, 1000])
         self.assertEqual(gc.get_threshold(), (700, 10, 1000))
+
+    def test_batch_count_freezer_freezes_at_after_then_every(self):
+        freezer = BatchCountGCFreezer(
+            "test", after=3, every=2, threshold=[700, 10, 1000]
+        )
+        self.assertEqual(gc.get_threshold(), (700, 10, 1000))
+        frozen = [n for n in range(1, 9) if freezer.on_batch(n)]
+        self.assertEqual(frozen, [3, 5, 7])
+        self.assertGreater(gc.get_freeze_count(), 0)
+
+    def test_batch_count_freezer_once_when_every_is_zero(self):
+        freezer = BatchCountGCFreezer("test", after=2)
+        self.assertEqual([n for n in range(1, 6) if freezer.on_batch(n)], [2])
 
 
 if __name__ == "__main__":
