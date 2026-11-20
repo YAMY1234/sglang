@@ -1818,7 +1818,8 @@ class SchedulerDisaggregationPrefillMixin:
             ps.full_num_used, ps.full_available_size, ps.full_evictable_size,
             ps.full_capacity, ps.mamba_num_used, ps.mamba_available_size,
             len(self.disagg_prefill_inflight_queue), held,
-            self.disagg_prefill_early_send_stats.get("deferred", 0),
+            # set only with early send, which prefill_complete turns off
+            getattr(self, "disagg_prefill_early_send_stats", {}).get("deferred", 0),
         )
 
     def _apply_deferred_frees(self: Scheduler, req: Req) -> None:

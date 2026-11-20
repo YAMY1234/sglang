@@ -1335,6 +1335,21 @@ class TestDeferredEarlySettle(CustomTestCase):
         self.assertIn("full used=0 available=900", logs.output[0])
         self.assertIn("holding deferred frees=1", logs.output[0])
 
+    def test_idle_pool_log_without_early_send(self):
+        # prefill_complete turns early send off, so its stats are never set
+        sched = self._scheduler()
+        del sched.disagg_prefill_early_send_stats
+        sched.pool_stats_observer = SimpleNamespace(
+            get_pool_stats=lambda: SimpleNamespace(
+                full_num_used=0, full_available_size=900, full_evictable_size=100,
+                full_capacity=1000, mamba_num_used=0, mamba_available_size=8,
+            )
+        )
+        sched.disagg_prefill_inflight_queue = []
+        with self.assertLogs("sglang.srt.disaggregation.prefill", level="INFO") as logs:
+            SchedulerDisaggregationPrefillMixin._log_pool_at_idle(sched)
+        self.assertIn("deferred settles=0", logs.output[0])
+
 
 if __name__ == "__main__":
     unittest.main()
