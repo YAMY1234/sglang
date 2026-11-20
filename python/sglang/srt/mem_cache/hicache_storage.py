@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Max pages per batched storage IO call.
-STORAGE_BATCH_SIZE = 128
+STORAGE_BATCH_SIZE = envs.SGLANG_HICACHE_STORAGE_BATCH_PAGES.get()
 
 
 @dataclass

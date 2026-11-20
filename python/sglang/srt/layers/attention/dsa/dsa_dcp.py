@@ -9,6 +9,7 @@ from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_dcp,
 )
 from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
+from sglang.srt.environ import envs
 
 TRTLLM_MAX_BATCH_ROWS = 65535
 # FlashInfer carves heads * rows * 256 float2 softmax slots out of the workspace per call;
@@ -97,6 +98,16 @@ def dcp_trtllm_sparse_attention(
     if rows > step:
         attention_kwargs["enable_pdl"] = False
     top_k_lens = attention_kwargs.pop("sparse_mla_top_k_lens", None)
+    # several calls write their rows of one output instead of being concatenated
+    out = (
+        torch.empty(
+            (rows, 1, heads, attention_kwargs["kv_lora_rank"]),
+            dtype=out_dtype,
+            device=query.device,
+        )
+        if rows > step and envs.SGLANG_DSA_DCP_ATTN_INPLACE_OUT.get()
+        else None
+    )
     outputs = []
     for start in range(0, rows, step):
         end = min(start + step, rows)
@@ -109,6 +120,7 @@ def dcp_trtllm_sparse_attention(
             sparse_mla_top_k_lens=(
                 None if top_k_lens is None else top_k_lens[start:end]
             ),
+            out=None if out is None else out[start:end],
             **attention_kwargs,
         )
         output = result[0] if need_lse else result
@@ -122,5 +134,7 @@ def dcp_trtllm_sparse_attention(
                 1,
             )
         outputs.append(output)
+    if out is not None:
+        return out, lse
     output = outputs[0] if len(outputs) == 1 else torch.cat(outputs)
     return output.view(rows, 1, heads, -1), lse

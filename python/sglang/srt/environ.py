@@ -784,6 +784,55 @@ class Envs:
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)
+    # Rig only: FakeKVSender takes Mooncake's non-blocking index readback, so a
+    # microbenchmark does not pay the .cpu() sync production never pays.
+    SGLANG_DISAGG_FAKE_SENDER_ASYNC_INDICES = EnvBool(False)
+    # PD decode: cap the KV held by reservations whose prefill KV has not arrived
+    # (transfer queue, the "pre-allocated usage" log field) at this fraction of
+    # the pool; 0 disables. One reservation is always allowed.
+    SGLANG_DISAGG_DECODE_PREALLOC_CAP = EnvFloat(0.0)
+    # PD DCP sends: build Mooncake descriptors from NumPy runs instead of per-run
+    # Python lists (same descriptors; cost no longer grows with Python objects).
+    SGLANG_DISAGG_DCP_VECTORIZED_BLOCKS = EnvBool(False)
+    # Seconds between PD DCP send-stat log lines (descriptor build time, decode
+    # prefix hits); 0 disables.
+    SGLANG_DISAGG_DCP_SEND_STATS_INTERVAL = EnvFloat(0.0)
+    # >0: KV transfer workers wait on CUDA events/streams by query() + sleep of this many us
+    # instead of a spinning synchronize(), so the waiting thread leaves the CPU to the scheduler.
+    SGLANG_DISAGG_TRANSFER_POLL_WAIT_US = EnvInt(0)
+    # Shard prefill KV transfer chunks across the transfer queues by bootstrap room instead of by
+    # destination session, so one decode instance's sends use every worker (default off).
+    SGLANG_DISAGG_TRANSFER_SHARD_BY_ROOM = EnvBool(False)
+    # Run each KV transfer worker thread on its own device stream, so the DCP pack gather's
+    # producer edge orders only after that worker's own work, not the legacy default stream (default off).
+    SGLANG_DISAGG_TRANSFER_WORKER_STREAM = EnvBool(False)
+    # Diagnostic: log the transfer worker's last-chunk timeline for PP PD settles longer than 50 ms.
+    SGLANG_DISAGG_SETTLE_DIAG = EnvBool(False)
+    # PD DCP pack: run the gather on a high-priority stream so it is scheduled ahead of the
+    # in-flight forward's pending blocks (default off).
+    SGLANG_DISAGG_GATHER_STREAM_HIGH_PRIORITY = EnvBool(False)
+    # PP PD prefill: an early-sent last chunk still in transfer does not block the result; the
+    # checkpoint's device frees for that request wait until its transfer ends (default off).
+    SGLANG_PP_PD_DEFER_EARLY_SETTLE = EnvBool(False)
+    # Prefill KV exhaustion. The two K31 switches are sgl-project/sglang#50040's
+    # (default off there): park a chunked continuation whose KV budget is spent
+    # (#44823) instead of forcing a full chunk into a full pool, and, under
+    # shortest-prefill-first, hold a truncated chunk's tail in the budget.
+    SGLANG_K31_PARK_CHUNKED_PREFILL = EnvBool(True)
+    SGLANG_K31_PF_SPF_RESERVE_CHUNKED_TAIL = EnvBool(True)
+    # Shortest-prefill-first: re-match each waiting request at least every N
+    # scheduling passes (new requests at once) instead of every pass; 0 = every pass.
+    SGLANG_SPF_MATCH_REFRESH_PASSES = EnvInt(0)
+    # Shortest-prefill-first anti-starvation: a request that has waited this many
+    # prefilled tokens goes to the head (one at a time, only with no chunk in
+    # flight); its chunks keep SGLANG_SPF_AGED_CHUNK_SHARE of each batch. 0 = off.
+    SGLANG_SPF_AGE_TOKENS = EnvInt(0)
+    SGLANG_SPF_AGED_CHUNK_SHARE = EnvFloat(0.5)
+    # Rate limit for SPF aging: promote at most one aged request per N shortest-prefill passes (0 = every pass).
+    SGLANG_SPF_AGE_EVERY_N = EnvInt(0)
+    # PD prefill backstop: a built batch whose paged KV demand exceeds free plus
+    # evictable pages is undone and retried next step instead of raising.
+    SGLANG_PREFILL_DEFER_ON_KV_SHORTFALL = EnvBool(True)
     SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS = EnvInt(16384)
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
@@ -794,6 +843,17 @@ class Envs:
     # (supports_deferred_decode_kv_release).
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(True)
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
+    # PP prefill: PP0 decides each KV transfer's release from every stage's status
+    # (PPConsensusStore) and relays it in one pass, instead of the two-pass ring.
+    SGLANG_PP_PD_PREFILL_RELEASE_RELAY = EnvBool(False)
+    # PP: leave pp_size + pp_async_batch_depth rounds of HiCache, PD bootstrap and
+    # PD release relay sends un-waited, not one (a gloo send completes on the recv).
+    SGLANG_PP_SYNC_WINDOW = EnvBool(False)
+    # PP PD prefill (Mooncake): each stage sends a request's last KV chunk when its
+    # own forward of that chunk completes, not when the result returns pp_size - 1
+    # micro-batches later; only the last stage, which samples the first token, sends
+    # the first-token metadata (aux).
+    SGLANG_PP_PD_PREFILL_EARLY_SEND = EnvBool(False)
 
     # ===================================================================
     # Distributed and model-parallel runtime
@@ -843,6 +903,46 @@ class Envs:
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
+    # write_back: back up the device LRU tail ahead of eviction, off the eviction path, so
+    # demotes need no D2H wait. The tail is K x the decayed peak of per-step device evictions,
+    # clamped to [MIN_TOKENS, MAX_TOKENS]; each step writes its unbacked part as one batch (at most
+    # MAX_INFLIGHT batches), committed ACK_LAG steps after PP0 sees the copy done.
+    SGLANG_HICACHE_DEVICE_WRITE_AHEAD = EnvBool(False)
+    SGLANG_HICACHE_DEVICE_WRITE_AHEAD_K = EnvFloat(4.0)
+    SGLANG_HICACHE_DEVICE_WRITE_AHEAD_MIN_TOKENS = EnvInt(32768)
+    SGLANG_HICACHE_DEVICE_WRITE_AHEAD_MAX_TOKENS = EnvInt(2097152)
+    SGLANG_HICACHE_DEVICE_WRITE_AHEAD_BATCH_MAX_TOKENS = EnvInt(1048576)
+    SGLANG_HICACHE_DEVICE_WRITE_AHEAD_MAX_INFLIGHT = EnvInt(4)
+    SGLANG_HICACHE_DEVICE_WRITE_AHEAD_ACK_LAG = EnvInt(1)
+    # Staged write-back: batch small page copies and merge adjacent host rows.
+    SGLANG_OPT_HICACHE_BATCH_WRITE_BACK_COPY = EnvBool(False)
+    # p-micro rig only: per-launch host / D2H counters and per-op HiCache timings
+    # (PMICRO_HOSTSTAT / PMICRO_HOSTOPS log lines, see mem_cache/pmicro_hoststats.py).
+    SGLANG_PMICRO_HOSTSTATS = EnvBool(False)
+    # Cap on the L3 put bandwidth of the storage backup thread, in GB/s; it sleeps
+    # between put batches to stay under it. 0 (default) leaves puts unpaced.
+    SGLANG_HICACHE_STORAGE_PUT_MAX_GBPS = EnvFloat(0.0)
+    # PD prefill + write_back: Full-leaf eviction backups (D2H) wait only for
+    # work issued before the in-flight forward; 0 (default) waits for that forward too.
+    SGLANG_HICACHE_WB_EVICT_RELAXED_FENCE = EnvBool(False)
+    # write_back device eviction: queue every victim's D2H copy and wait once per
+    # walk instead of once per victim (victims stay host-locked until the wait).
+    SGLANG_HICACHE_WB_EVICT_BATCH = EnvBool(False)
+    # Grid cap for HiCache host-to-device load kernels (MLA/DSA KV, DSA indexer,
+    # Mamba state); 0 keeps each kernel's default (2-4 blocks).
+    SGLANG_HICACHE_LOAD_BLOCK_QUOTA = EnvInt(0)
+    # Grid cap for the Mamba state device-to-host backup kernel; 0 keeps 2 blocks.
+    SGLANG_HICACHE_MAMBA_BACKUP_BLOCK_QUOTA = EnvInt(0)
+    # --mamba-max-states-per-path also counts host copies, and a capped state
+    # loses its host copy too (HiCache); 0 (default) caps device states only.
+    SGLANG_MAMBA_PATH_CAP_COUNTS_HOST = EnvBool(False)
+    # Scales the hierarchical Mamba host pool's share of --hicache-size (the KV
+    # host pools take the rest); unset (default) splits it as the device pools are.
+    SGLANG_HICACHE_MAMBA_HOST_SCALE = EnvFloat(None)
+    # Seconds between "HiCache host usage" log lines (KV and Mamba pools); 0 = off.
+    SGLANG_HICACHE_HOST_USAGE_LOG_INTERVAL = EnvFloat(0.0)
+    # Upload HiCache load/write host indices through a reused pinned buffer (a pageable .to(non_blocking) syncs the stream)
+    SGLANG_HICACHE_PIN_LOAD_INDICES = EnvBool(False)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)
@@ -862,6 +962,72 @@ class Envs:
     # Only affects buffer mode: omit intermediate Mamba storage checkpoints.
     # Keep complete request endpoints; unknown/manual backup sources stay eligible.
     SGLANG_HICACHE_MAMBA_REQUEST_END_ONLY = EnvBool(False)
+    # Cache mode: write L3 when a host page is evicted, not at L2 admission; a page
+    # leaves the host pool only after its L3 write is acknowledged.
+    SGLANG_OPT_HICACHE_STORAGE_WRITE_BACK = EnvBool(False)
+    # Host-pool fraction one eviction shortfall writes to L3 ahead of need.
+    # Arbitrary; no evidence this is the right size.
+    SGLANG_HICACHE_STORAGE_WRITE_BACK_BATCH_FRACTION = EnvFloat(0.01)
+    # Seconds a write-back process waits at SIGTERM / exit for its L3 writes in
+    # flight before the final stats line; keep it inside the launcher's SIGKILL grace.
+    SGLANG_HICACHE_STORAGE_WRITE_BACK_DRAIN_TIMEOUT = EnvFloat(20.0)
+    # Write-back as a dirty-page cleaner (needs the Rust TreeCore): host copies are
+    # not pinned; a page storage lacks is "dirty" and only host-leaf eviction skips
+    # it. Fractions are of the host pool's pages, per rank.
+    SGLANG_HICACHE_STORAGE_WRITE_BACK_CLEANER = EnvBool(False)
+    # Begin writing the coldest dirty pages when unissued dirty pages exceed this.
+    SGLANG_HICACHE_STORAGE_WRITE_BACK_DIRTY_START_FRACTION = EnvFloat(0.5)
+    # Clean (or free) pages the cleaner aims to keep; below it is a floor breach.
+    SGLANG_HICACHE_STORAGE_WRITE_BACK_MIN_CLEAN_FRACTION = EnvFloat(0.3)
+    # Cap on cleaner writes ahead of eviction: written + in flight - host evicted.
+    SGLANG_HICACHE_STORAGE_WRITE_BACK_PREFETCH_BUDGET_FRACTION = EnvFloat(0.5)
+    # Cap on the cleaner's writes in flight per rank (each PP rank writes its own layers).
+    SGLANG_HICACHE_STORAGE_WRITE_BACK_MAX_INFLIGHT_FRACTION = EnvFloat(0.04)
+    # Pages per storage IO call (one NIXL transfer per service carries all of them).
+    SGLANG_HICACHE_STORAGE_BATCH_PAGES = EnvInt(128)
+    # PP>1: PP0 publishes only L3 write acks it had ready this many scheduler steps ago,
+    # so later stages rarely block in the drain on their own puts. 0 (default): no lag.
+    SGLANG_HICACHE_L3_ACK_LAG_STEPS = EnvInt(0)
+    # Cache mode: write L3 from the coldest L2 pages ahead of eviction instead of at
+    # L2 admission, so the two tiers hold different pages. The Rust tree core needs
+    # an extension with peek_host_eviction_candidates.
+    SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT = EnvBool(False)
+    # Write-on-host-evict: credit an acked write-behind backup to the clean tail
+    # tokens, so acks draining does not retrigger a full tail walk.
+    SGLANG_HICACHE_L3_WB_ACK_CREDIT = EnvBool(False)
+    # Write-on-host-evict: scheduler steps between host-tail write-behind walks.
+    SGLANG_HICACHE_L3_WB_WALK_EVERY = EnvInt(4)
+    # Fraction of the host pool kept free-or-already-in-L3 at the LRU tail. It must
+    # exceed (storage write latency) x (host eviction rate) / (host pool tokens);
+    # 0.05 leaves ~2x headroom for a ~1 s write and a 30M-token pool churning 1M tok/s.
+    SGLANG_HICACHE_L3_EVICT_WRITE_RESERVE_FRACTION = EnvFloat(0.05)
+    # Hybrid (Mamba/KDA) trees under SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT: a Mamba
+    # host eviction takes a host leaf whole, Full pages too, so also write the host
+    # leaves among the coldest reserve-fraction of Mamba host states ahead of it.
+    SGLANG_HICACHE_L3_WRITE_MAMBA_HOST_LEAVES = EnvBool(False)
+    # Under SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT a written page is believed in L3
+    # for one to two half-TTLs after its last write (storage evicts unannounced), so
+    # a later host eviction re-writes it; set below the store's turnover. 0: forever.
+    SGLANG_HICACHE_L3_BELIEF_TTL_S = EnvFloat(900.0)
+    # Hybrid (Mamba) trees: when the tree holds KV past the deepest state (the tail state was
+    # dropped, the KV kept), query L3 from the end of that KV instead of from the state, so a
+    # tail L3 wrote on host eviction can resume the request through the tree's stateless KV.
+    SGLANG_HICACHE_L3_READ_PAST_TREE_KV = EnvBool(False)
+    # Preserve actual host-state tombstones while FullHost survives (depth >= 8192).
+    SGLANG_HICACHE_L3_WRITE_STATE_ON_TOMBSTONE = EnvBool(False)
+    # Admit a real storage checkpoint by total prefill saved, including reusable tree KV.
+    SGLANG_HICACHE_L3_SAVED_TOKEN_THRESHOLD = EnvBool(False)
+    # Recover checkpoints inside the resident KV span, beyond the deepest live state.
+    SGLANG_HICACHE_L3_READ_WITHIN_TREE_KV = EnvBool(False)
+    # Keyed PP0 lifetime evidence; the output directory must be explicitly provided.
+    SGLANG_HICACHE_L3_LIFETIME_LEDGER = EnvBool(False)
+    SGLANG_HICACHE_L3_LIFETIME_LEDGER_DIR = EnvStr(None)
+    # Diagnostics: PP0 logs the first N L3 lookups (>= 8192 tokens) that found KV pages, with per-pool hit pages.
+    SGLANG_HICACHE_L3_LOOKUP_LOG_N = EnvInt(0)
+    # Diagnostics: PP0 remembers when each page and KDA-state hash was issued to L3 and, per lookup
+    # (>= 8192 tokens), logs where in the queried span states were written; KV-absent lookups up to N.
+    SGLANG_HICACHE_L3_TRACE = EnvBool(False)
+    SGLANG_HICACHE_L3_TRACE_ABSENT_N = EnvInt(300)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
@@ -887,6 +1053,10 @@ class Envs:
     # synchronous all-layer Mooncake batch. Set to a positive value to split
     # larger transfers; 0 preserves the legacy single-batch behavior.
     SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES = EnvInt(0)
+    # PD DCP relayout (DCP-1 prefill to DCP-N decode): pack one transfer
+    # chunk's rows for every decode DCP rank with a single gather, and move a
+    # DCP-collapsed draft with the target rows. 0 restores the per-rank pack.
+    SGLANG_DISAGG_DCP_CHUNK_PACK = EnvBool(False)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
@@ -1502,6 +1672,15 @@ class Envs:
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_FUSE_SHARED_EXPERTS = EnvBool(True)
     SGLANG_OPT_DEEPGEMM_MEGA_GATE = EnvBool(False)
+    # Opt-in: raise DeepGEMM's BLOCK_M (16/32 -> 64, 64 -> 96) for FP8xFP4 calls in
+    # decode and target-verify CUDA graphs.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_RAISE_DECODE_BLOCK_M = EnvBool(False)
+    # With the raise on: keep BLOCK_M 64 (instead of 96) while the expected tokens per expert
+    # (rows per rank x ranks x top-k / experts) stay below this. 0: always raise.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_DECODE_BLOCK_M_96_MIN_TOKENS = EnvFloat(0.0)
+    # Opt-in, SM107: split each FP8xFP4 MegaMoE weight between the GPU's two locality domains
+    # (deep_gemm.localize; DeepGEMM 0.2.5 or newer) so every SM streams die-local weights.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE = EnvBool(False)
 
     # ===================================================================
     # Top-k kernels
@@ -1673,6 +1852,12 @@ class Envs:
     SGLANG_OPT_DFLASH_BATCHED_SMALL_COPY = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION.get
     )
+    # KDA ReplaySSM spec commit: fold the accepted ring window with the CUDA
+    # row-parallel kernel (bit-identical to the Triton fold); off by default.
+    SGLANG_OPT_KDA_REPLAYSSM_FAST_FOLD = EnvBool(False)
+    # KDA CuTe DSpARK/DFLASH verify: the phase-1-hoisted kernel (backport of
+    # #49135, bit-identical outputs); off by default.
+    SGLANG_OPT_KDA_MTP_VERIFY_P1_HOIST = EnvBool(False)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
@@ -1780,6 +1965,19 @@ class Envs:
     # Sequences a captured KDA extend bucket accepts; a larger prefill batch on
     # any dp rank runs the step eagerly. Bounds the padded grids and scratch.
     SGLANG_KDA_PREFILL_GRAPH_MAX_SEQS = EnvInt(128)
+    # Admit SM107 (Rubin) to FlashInfer's CuTe DSL KDA prefill (flashinfer#6201), on
+    # FlashInfer v0.7.4's kernel module (#8684 hang and #8599 fixes; vendored).
+    SGLANG_K31_KDA_PREFILL_FI_SM107 = EnvBool(False)
+    # KDA prefill on FlashInfer: the causal conv writes Q, K and V as separate
+    # contiguous planes instead of one token-major tensor the kernel copies three
+    # times (backport of #46738).
+    SGLANG_KDA_PREFILL_CONV_QKV_PLANES = EnvBool(False)
+    # DSA prefill under sharded DCP: gather the KV and index-K rows with one pack
+    # kernel into the all-gather buffer and one reorder kernel out of it, instead
+    # of the cat / pad / transpose / split copies around the all-gather.
+    SGLANG_DSA_DCP_PREFILL_FUSED_GATHER = EnvBool(False)
+    # Build the PTX KDA prefill extension for sm_107a; not measured on SM107 upstream.
+    SGLANG_ENABLE_PTX_KDA_SM107 = EnvBool(False)
     # Experimental: breakable prefill CUDA graphs capture the Triton GDN extend
     # instead of breaking at every GDN layer (layers/attention/linear/
     # gdn_prefill_graph.py).
@@ -2096,6 +2294,26 @@ class Envs:
     # DSA backend (GLM 5 and DeepSeek V3.2)
     # ===================================================================
     SGLANG_DSA_FUSE_TOPK = EnvBool(True)
+    # Prefill TRT-LLM MLA: hand a head slice of the padded output to a layer that
+    # opted in (mla_strided_out_ok) instead of copying it with .contiguous().
+    SGLANG_DSA_MLA_PREFILL_STRIDED_OUT = EnvBool(True)
+    # DCP decode top-k: the local top-k selects only the merge's candidates and
+    # pushes them itself; the merge skips the local top-2048 and also returns the
+    # localized rows (dsa/dsa_dcp_sharded.py).
+    SGLANG_DSA_DCP_TOPK_PUSH = EnvBool(False)
+    # merge_kernel (push off): stage the candidate push in smem, register fallback
+    # for <= 2 failed ranks (sgl-project/sglang#49922); same output. MIN_BLOCKS: its
+    # launch bounds' minimum blocks per SM.
+    SGLANG_K31_DCP_MERGE_STAGED = EnvBool(False)
+    SGLANG_K31_DCP_MERGE_MIN_BLOCKS = EnvInt(1)
+    # Decode steps between the DCP top-k merge's fallback-count log lines; 0 off.
+    SGLANG_DSA_DCP_TOPK_MERGE_LOG_INTERVAL = EnvInt(400)
+    # DCP sparse MLA split into workspace-bounded calls: each call writes its
+    # rows of one output in place of a cat (dsa/dsa_dcp.py).
+    SGLANG_DSA_DCP_ATTN_INPLACE_OUT = EnvBool(False)
+    # Admit SM107 (Rubin) to the prims_ts DSA backend, on FlashInfer prims_ts 784bfaf5
+    # (flashinfer#8186; vendored beside dsa/prims_ts.py for 26bb6dc9 images).
+    SGLANG_ENABLE_PRIMS_TS_SM107 = EnvBool(False)
     # Enabled for supported CUDA KPool geometry; set to 0 to use ordinary metadata.
     SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION = EnvBool(True)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
@@ -2227,7 +2445,8 @@ class Envs:
     SGLANG_K3_AR_FUSION = EnvBool(SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION.get)
     # K3 SP-MoE fused residual + reduce-scatter and matching all-gather over
     # CustomAllReduceV2's MNNVL push workspace. Auto-probed for checked-in
-    # TP4/TP8 GB300 and TP16 GB200/GB300 tuning; set 0/1 to override. See
+    # TP4/TP8 GB300 and TP16 GB200/GB300 tuning; set 0/1 to override. On SM107
+    # only an explicit 1 enables it, and only with a checked-in table. See
     # srt/layers/communication/k3_sp_collective.py.
     SGLANG_K3_SP_COLLECTIVE = EnvBool(False)
     # DCP MLA decode: push each peer's head partials straight into its
@@ -2240,8 +2459,22 @@ class Envs:
     # Keep K3's post-MoE residual stream token-sharded between consecutive
     # SP-MoE layers. The next attention-residual aggregation and snapshot
     # bank write run on the local shard, then only the normalized attention
-    # input is all-gathered. Requires SGLANG_K3_SP_COLLECTIVE.
+    # input is all-gathered. Works with NCCL or SGLANG_K3_SP_COLLECTIVE.
     SGLANG_K3_SP_ATTN_RES = EnvBool(False)
+    # SP-MoE prefill: compute o_proj's TP-partial output in N column chunks
+    # and reduce-scatter each chunk over attention TP on a side stream while
+    # the next chunk's GEMM runs (0: off). Taken only for eager batches of at
+    # least SGLANG_K3_SP_RS_OVERLAP_MIN_TOKENS rows whose reduce-scatter NCCL
+    # would run (not the K3 SP collective). See
+    # srt/layers/communication/k3_sp_rs_overlap.py.
+    SGLANG_K3_SP_RS_OVERLAP_CHUNKS = EnvInt(0)
+    SGLANG_K3_SP_RS_OVERLAP_MIN_TOKENS = EnvInt(8192)
+    # SP-MoE prefill: run o_proj's GEMM and its attention-TP reduce-scatter as
+    # one CUTLASS kernel whose epilogue reduces through NVLink multicast
+    # (sp_collective_gemm.matmul_reduce_scatter), for eager batches of at least
+    # this many rows (0: off). Takes precedence over the chunked overlap and the
+    # K3 SP collective's reduce-scatter. See k3_sp_rs_overlap.py.
+    SGLANG_K3_SP_GEMM_RS_MIN_TOKENS = EnvInt(0)
     # Merge the router gate and routed_expert_down_proj weights so the K3 MoE
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
@@ -2254,6 +2487,21 @@ class Envs:
     # dense GEMMs, the side-stream [f_a | b] TGV, and attention side streams up
     # to 288 rows (kimi_k3._k31_gb300_tuning). 0 restores the generic picks.
     SGLANG_K31_DECODE_GEMM_TACTICS = EnvBool(True)
+    # Kimi-K3.1 on VR200 (SM107), default off: the per-M TGV tactics of the
+    # decode dense GEMMs measured on SM107 (through the PD-decode DFLASH verify
+    # rows), the side-stream [f_a | b] TGV, and the SM107 attention side-stream
+    # row caps below (kimi_k3._k31_sm107_tuning). Off: SM107 keeps the generic
+    # picks and the 128-row side streams.
+    SGLANG_K31_SM107_GEMM_TACTICS = EnvBool(False)
+    # Optional path of a JSON table that replaces the built-in SM107 table.
+    SGLANG_K31_SM107_GEMM_TABLE = EnvStr(None)
+    # Under SGLANG_K31_SM107_GEMM_TACTICS on SM107: the largest graphed rows
+    # whose KDA [f_a | b] GEMM runs on the side stream beside [q,k,v,g]
+    # (default 1152 = the largest verify rows, the stable table's
+    # side_cap_bfa), and whose MLA output gate runs on the side stream beside
+    # attention (default 128, today's cap: raising it measured no gain).
+    SGLANG_K31_SM107_BFA_SIDE_MAX_TOKENS = EnvInt(1152)
+    SGLANG_K31_SM107_GATE_SIDE_MAX_TOKENS = EnvInt(128)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)

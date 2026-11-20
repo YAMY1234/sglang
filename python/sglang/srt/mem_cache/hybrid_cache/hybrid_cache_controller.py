@@ -6,6 +6,7 @@ import os
 import threading
 import time
 from array import array
+from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
 from queue import Empty, Queue
@@ -13,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import (
     CacheOperation,
 )
@@ -198,6 +200,28 @@ class PrefetchOperation(StorageOperation):
     def is_terminated(self) -> bool:
         with self._lock:
             return self._terminated_flag
+
+
+class MambaStateRestoreOperation(PrefetchOperation):
+    """A state-only read; Full KV stays pinned in the tree until scheduler commit."""
+
+    def __init__(
+        self, handle, key, matched_tokens, full_tokens, host_indices, min_saved_tokens
+    ):
+        super().__init__(handle, key)
+        self.matched_tokens = matched_tokens
+        self.full_tokens = full_tokens
+        self.state_host_indices = host_indices
+        self.min_saved_tokens = min_saved_tokens
+        self.state_exists = []
+        self.state_hashes = []
+        self.state_end_tokens = 0
+        self.state_saved_tokens = 0
+        self.state_outcome = "miss"
+        self.query_wall_ns = 0
+        self.restore_locks = []
+        self.on_complete = None
+        self.cancelled = False
 
 
 @dataclass(frozen=True)
@@ -1413,6 +1437,8 @@ class HybridCacheController(BaseHiCacheController):
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
+        ledger_reason: Optional[str] = None,
+        ledger_op_id: Optional[int] = None,
     ) -> int:
         operation = StorageOperation(
             host_indices,
@@ -1421,10 +1447,32 @@ class HybridCacheController(BaseHiCacheController):
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
         )
+        if envs.SGLANG_HICACHE_L3_LIFETIME_LEDGER.get():
+            operation.ledger_context = {
+                "reason": ledger_reason or "ordinary",
+                "op_id": operation.id if ledger_op_id is None else ledger_op_id,
+                "pp_rank": self.storage_config.pp_rank,
+                "tp_rank": self.storage_config.tp_rank,
+            }
         self.backup_queue.put(operation)
         return operation.id
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
+        if isinstance(operation, MambaStateRestoreOperation):
+            operation.query_wall_ns = time.time_ns()
+            operation.state_hashes = get_storage_hash_str(
+                operation.token_ids, page_size=self.page_size
+            )
+            count = len(operation.state_hashes)
+            operation.state_exists = [False] * count
+            start = operation.matched_tokens // self.page_size
+            end = min(count, operation.full_tokens // self.page_size)
+            if operation.state_host_indices is not None and end > start:
+                hits = self.query_mamba_states(operation.state_hashes[start:end])
+                if len(hits) != end - start:
+                    raise ValueError("State-only query returned an invalid bitmap size")
+                operation.state_exists[start:end] = hits
+            return [], 0
         hash_value = get_storage_hash_str(
             operation.token_ids, operation.last_hash, page_size=self.page_size
         )
@@ -1473,10 +1521,28 @@ class HybridCacheController(BaseHiCacheController):
             kv_hit_pages * self.page_size,
         )
 
+    def query_mamba_states(self, hashes: list[str]) -> list[bool]:
+        """Local state-only query; the scheduler intersects checkpoints across ranks."""
+        return self.storage_backend.batch_exists_mamba_states(hashes)
+
+    def load_mamba_state(self, state_hash: str, host_indices: torch.Tensor) -> bool:
+        """Read one checkpoint into its owned host slot without touching Full KV."""
+        transfer = PoolTransfer(
+            name=PoolName.MAMBA,
+            keys=[state_hash],
+            host_indices=host_indices,
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
+        with self.mem_pool_host.layout_lease():
+            results = self.storage_backend.batch_get_v2([transfer])
+        return count_pool_hits(results).get(PoolName.MAMBA, 0) == 1
+
     def _sync_prefetch_hit_query(self, operation, storage_hit_count: int) -> int:
         """One MIN collective for the folded hit count and every pool's own
         boundary, so per-pool beliefs stay rank-identical. A pool omitted
         by any rank heals from the folded cut without learning presence."""
+        if isinstance(operation, MambaStateRestoreOperation):
+            return self._sync_mamba_state_restore(operation)
         if any(
             transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES
             for transfer in operation.pool_transfers or []
@@ -1522,6 +1588,51 @@ class HybridCacheController(BaseHiCacheController):
             return int(reduced[0])
         restorable = reduced[: len(hits)]
         return max(i for i, ok in enumerate(restorable) if ok) * self.page_size
+
+    def _sync_mamba_state_restore(self, operation: MambaStateRestoreOperation) -> int:
+        # Every intake enqueues an operation, even with no local slot or Full
+        # coverage. Keep the collective shape independent of local tree state.
+        count = len(operation.token_ids) // self.page_size
+        local = operation.state_exists or [False] * count
+        packed = torch.tensor(
+            [-operation.matched_tokens] + local, dtype=torch.int
+        )
+        self._all_reduce(
+            packed, torch.distributed.ReduceOp.MIN, self.prefetch_hits_sync_groups
+        )
+        agreed = packed.tolist()
+        matched = -agreed[0]
+        end = max(
+            (i * self.page_size for i, hit in enumerate(agreed[1:], 1) if hit),
+            default=0,
+        )
+        saved = end - matched
+        if saved <= 0:
+            return 0
+        if saved < operation.min_saved_tokens:
+            operation.state_outcome = "threshold_rejected"
+            return 0
+        success = False
+        try:
+            success = self.load_mamba_state(
+                operation.state_hashes[end // self.page_size - 1],
+                operation.state_host_indices,
+            )
+        except Exception:
+            logger.exception("HiCache state-only get failed for %s", operation.request_id)
+        done = torch.tensor(int(success), dtype=torch.int)
+        self._all_reduce(
+            done, torch.distributed.ReduceOp.MIN, self.prefetch_hits_sync_groups
+        )
+        if done.item():
+            operation.state_end_tokens = end
+            operation.state_saved_tokens = saved
+            operation.state_outcome = "hit"
+        else:
+            operation.state_outcome = "transfer_failed"
+        # This operation transfers zero Full KV tokens. The scheduler handles
+        # its separate state result before the ordinary KV-prefetch drain.
+        return 0
 
     def _move_pool_indices(
         self, host_pool, host_indices, device_indices, *, write_back_jit: bool
@@ -1696,7 +1807,16 @@ class HybridCacheController(BaseHiCacheController):
         operation.storage_start += trim_tokens
 
     def _page_backup(self, operation):
-        with self.mem_pool_host.layout_lease():
+        metadata = getattr(operation, "ledger_context", None)
+        context = (
+            getattr(self.storage_backend, "write_ledger_context", None)
+            if metadata is not None
+            else None
+        )
+        ledger_scope = (
+            context(metadata) if context is not None else nullcontext()
+        )
+        with self.mem_pool_host.layout_lease(), ledger_scope:
             return self._page_backup_with_stable_layout(operation)
 
     def _page_backup_with_stable_layout(self, operation):
@@ -1715,9 +1835,12 @@ class HybridCacheController(BaseHiCacheController):
             for extra_info, transfers in _trailing_chain_groups(
                 operation.prefix_keys, operation.hash_value, backup_transfers
             ):
+                t0 = self._storage_put_begin()
                 results.update(
                     self.storage_backend.batch_set_v2(transfers, extra_info=extra_info)
                 )
+                if t0 is not None:
+                    self._storage_put_end(t0, self._sidecar_put_bytes(transfers))
             pool_hits = count_pool_hits(results)
             operation.pool_storage_result.update_extra_pool_hit_pages(pool_hits)
 
@@ -1744,6 +1867,15 @@ class HybridCacheController(BaseHiCacheController):
                 len(operation.hash_value) * self.page_size if sidecar_ok else 0
             )
 
+    def _sidecar_put_bytes(self, transfers: list[PoolTransfer]) -> int:
+        """Host slots x slot size of one sidecar put; index counts only."""
+        nbytes = 0
+        for transfer in transfers:
+            entry = self.mem_pool_host.entry_map.get(transfer.name)
+            if entry is not None and transfer.host_indices is not None:
+                nbytes += transfer.host_indices.numel() * entry.host_pool.size_per_token
+        return nbytes
+
     def should_backup(self, transfer: PoolTransfer) -> bool:
         if not self.backup_skip:
             return True
@@ -1753,9 +1885,9 @@ class HybridCacheController(BaseHiCacheController):
         if transfer.name == PoolName.MAMBA:
             return True
 
-        # Mooncake gives MHA draft and draft-SWA objects rank-specific keys.
-        # MLA/DeepSeek-V4 draft pools remain TP0-only.
-        if self.storage_backend_type == "mooncake" and transfer.name in (
+        # Mooncake's key layout (nixl_dram reuses it) gives MHA draft and draft-SWA
+        # objects rank-specific keys. MLA/DeepSeek-V4 draft pools remain TP0-only.
+        if self.storage_backend_type in ("mooncake", "nixl_dram") and transfer.name in (
             PoolName.DRAFT,
             PoolName.DRAFT_SWA,
         ):

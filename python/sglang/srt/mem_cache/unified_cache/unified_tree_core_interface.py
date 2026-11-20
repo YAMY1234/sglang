@@ -78,7 +78,7 @@ class DropSubtreeNoHostResult(BaseEvictionResult):
 
 
 class DriveHostEvictionResult(BaseEvictionResult):
-    pass
+    mamba_storage_backup_node_id: Optional[NodeId] = None
 
 
 class DecSwaLockOnlyResult(BaseEvictionResult):
@@ -565,6 +565,36 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def peek_host_eviction_candidates(
+        self, component_type: ComponentType, num_tokens: int
+    ) -> list[tuple[NodeId, int, Optional[list[str]]]]:
+        """Host leaves in the order drive_host_eviction would take them, until
+        their tokens reach num_tokens: (node_id, tokens, hash_value). Read-only."""
+        ...
+
+    @abstractmethod
+    def peek_device_eviction_candidates(
+        self, component_type: ComponentType, num_tokens: int
+    ) -> list[tuple[NodeId, int, bool, bool]]:
+        """Device leaves in the order the device eviction walk would take them,
+        until their tokens reach num_tokens: (node_id, tokens, Full KV not on
+        host, write pending). Read-only."""
+        ...
+
+    @abstractmethod
+    def set_write_ahead_spare(self, node_ids: list[NodeId]) -> None:
+        """Replace the device-tail set the first Full duplicate-reclaim pass spares."""
+        ...
+
+    @abstractmethod
+    def peek_mamba_host_eviction_leaves(
+        self, max_states: int
+    ) -> list[tuple[NodeId, int, Optional[list[str]]]]:
+        """The host leaves among the max_states coldest Mamba host LRU members,
+        in Mamba host eviction order: (node_id, tokens, hash_value). Read-only."""
+        ...
+
+    @abstractmethod
     def evict_excess_path_states(
         self,
         tail_node_id: NodeId,
@@ -588,6 +618,13 @@ class UnifiedTreeCoreInterface(ABC):
     def set_host_memory_buffer_only(self) -> None:
         """Mark the host tier as buffer-only: one node staged per backup intent."""
         ...
+
+    def set_mamba_path_cap_counts_host(self, enabled: bool) -> None:
+        """Make the per-path Mamba cap count host copies and free the host
+        copies of the states it caps (HiCache init)."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement SGLANG_MAMBA_PATH_CAP_COUNTS_HOST"
+        )
 
     @abstractmethod
     def insert_host(
