@@ -278,6 +278,59 @@ def test_hopper_compensated_mhc(num_tokens):
         assert layer._hc_attn_bf16_parts is None
 
 
+@pytest.mark.parametrize("num_tokens", [4096, 4097, 8192, 32000])
+def test_packed_compensated_mhc_prefill(num_tokens):
+    from sglang.srt.environ import envs
+    from sglang.srt.models import deepseek_v4_mhc as model_mhc
+    from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer
+
+    if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10):
+        pytest.skip("SM10x only")
+    torch.manual_seed(192 + num_tokens)
+    x = torch.randn(num_tokens, 4, 5120, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(24, 20480, device="cuda") * 0.01
+    scale = torch.tensor([0.5, 0.25, 0.25], device="cuda")
+    base = torch.randn(24, device="cuda")
+    norm = SimpleNamespace(weight=torch.ones(5120, device="cuda", dtype=torch.bfloat16))
+    layer = _hopper_mhc_layer(norm, w, scale, base)
+    with envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.override(True):
+        DeepseekV4DecoderLayer.refresh_mhc_norm_weight_cache(layer)
+        if layer._hc_attn_bf16_parts is None:
+            pytest.skip("DeepGEMM tf32_hc_prenorm_gemm unavailable")
+        stock = model_mhc.mix_stats(layer.attn_hc, x)
+        with envs.SGLANG_OPT_DSV41_HC_STATS_PACKED.override(True):
+            DeepseekV4DecoderLayer.refresh_mhc_norm_weight_cache(layer)
+            assert layer.attn_hc.bf16_packed is not None
+            packed = model_mhc.mix_stats(layer.attn_hc, x)
+    for a, b in zip(packed, stock):
+        assert a.shape == b.shape
+        torch.testing.assert_close(a, b, rtol=1e-5, atol=2e-6)
+
+
+@pytest.mark.parametrize("num_tokens", [8192, 32000])
+def test_packed_broadcast_stats_matches_full(num_tokens):
+    if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10):
+        pytest.skip("SM10x only")
+    torch.manual_seed(5 + num_tokens)
+    emb = torch.randn(num_tokens, 5120, device="cuda", dtype=torch.bfloat16)
+    streams = mhc.hc_broadcast(emb, 4)
+    w = torch.randn(24, 20480, device="cuda") * 0.01
+    scale = torch.tensor([0.5, 0.25, 0.25], device="cuda")
+    base = torch.randn(24, device="cuda")
+    packed = mhc.pack_bf16_hc_weight(mhc.split_bf16_hc_weight(w))
+    summed = mhc.pack_bf16_hc_weight(
+        mhc.split_bf16_hc_weight(w.view(24, 4, -1).sum(1).contiguous())
+    )
+    full = mhc.hc_mix_stats_sinkhorn_packed(
+        streams.flatten(1), packed, scale, base, 20, 1e-6, 1e-6
+    )
+    bcast = mhc.hc_mix_stats_sinkhorn_packed(
+        streams[:, 0, :], summed, scale, base, 20, 1e-6, 1e-6
+    )
+    for a, b in zip(bcast, full):
+        torch.testing.assert_close(a, b, rtol=1e-5, atol=2e-6)
+
+
 @pytest.mark.parametrize("num_tokens", [32, 100, 256, 512, 1024])
 def test_deepgemm_prenorm_dual_matches_two_calls(num_tokens):
     from types import SimpleNamespace

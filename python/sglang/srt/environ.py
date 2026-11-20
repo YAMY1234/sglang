@@ -2190,6 +2190,9 @@ class Envs:
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
+    # Prefill (8192-65536 rows, and the first layer from its broadcast embedding) mHC mix stats on Blackwell: packed K-major bf16x3 weights and a row-blocked
+    # reduce/Sinkhorn instead of _hc_mix_stats_bf16x3 + the per-row reduce. Same compensated precision.
+    SGLANG_OPT_DSV41_HC_STATS_PACKED = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
