@@ -1082,6 +1082,10 @@ class _LeaseStore:
         self.removed.append(key)
         return 0
 
+    def batch_remove(self, keys):
+        self.batches = getattr(self, "batches", []) + [len(keys)]
+        return [self.remove(key) for key in keys]
+
 
 def _budget_linker(budget, stage, state_units=4, store=None, protect=0, recall=0):
     linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
@@ -1169,6 +1173,27 @@ class TestStoreBudgetTailFirst(CustomTestCase):
         self.assertTrue(any(victims0))
         self.assertEqual(stage0.page_remove_counts["lease_retries"], 1)
         self.assertEqual(len(stage0.page_remove_retries), 1)
+
+    def test_batch_removal_matches_one_call_per_key(self):
+        # SGLANG_LINKER_BATCH_REMOVE: the same removed keys, counts and lease
+        # retries as one call per key, in one store call per pass.
+        keys = [f"p{i}_pp0_k" for i in range(10)]
+        pages = [f"p{i}" for i in range(10)]
+        runs = []
+        for batch in (False, True):
+            linker = _budget_linker(16, 0, store=_LeaseStore(leased={"p3_pp0_k"}))
+            linker.batch_remove = batch
+            linker.store_tree.evicted["p5"] = (0, None)
+            linker.store_tree.recalled["p5"] = 7  # stored again after this eviction
+            linker._remove_pages(keys, pages, decided=5)
+            runs.append(linker)
+        per_key, batched = runs
+        self.assertEqual(per_key.storage.store.removed, batched.storage.store.removed)
+        self.assertNotIn("p5_pp0_k", batched.storage.store.removed)
+        self.assertEqual(per_key.page_remove_counts, batched.page_remove_counts)
+        self.assertEqual(batched.page_remove_counts["lease_retries"], 1)
+        self.assertEqual(len(batched.page_remove_retries), 1)
+        self.assertEqual(batched.storage.store.batches, [9])
 
     def test_tail_first_and_a_loaded_prefix_outlives_an_untouched_one(self):
         linker = _budget_linker(16, 0)
