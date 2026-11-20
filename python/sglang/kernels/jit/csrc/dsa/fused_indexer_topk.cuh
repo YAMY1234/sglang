@@ -1647,7 +1647,8 @@ struct FusedIndexerTopK {
     RuntimeCheck(page_size > 0 and (page_size & (page_size - 1)) == 0, "fstk: page_size must be a power of two");
     p.page_bits = static_cast<uint32_t>(__builtin_ctzll(static_cast<unsigned long long>(page_size)));
     if (p.num_rows == 0) return;
-    RuntimeCheck(smem_keys == kSelectMaxKeys or smem_keys == kSelectRepairKeys, "fstk: select smem_keys 8192 or 16384");
+    RuntimeCheck(smem_keys >= 1024 and smem_keys <= kSelectRepairKeys and smem_keys % 1024 == 0,
+                 "fstk: select smem_keys must be a multiple of 1024 up to 16384");
     p.smem_keys = static_cast<uint32_t>(smem_keys);
     const uint32_t grid = p.row_list != nullptr ? static_cast<uint32_t>(std::min<int64_t>(num_ctas, p.num_rows)) : p.num_rows;
     const size_t smem = static_cast<size_t>(smem_keys) * sizeof(uint64_t);

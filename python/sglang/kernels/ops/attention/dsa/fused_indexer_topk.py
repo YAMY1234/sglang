@@ -229,6 +229,7 @@ def fused_indexer_topk(
     cand_cap: int = 16384,
     keep_all: Optional[int] = None,
     lpt: bool = False,
+    select_keys: int = SELECT_KEYS,
     out: Optional[torch.Tensor] = None,
     workspace: Optional[torch.Tensor] = None,
     stats: Optional[torch.Tensor] = None,
@@ -288,7 +289,7 @@ def fused_indexer_topk(
         dst = torch.empty(rows, topk, device=dev, dtype=torch.int32)
     repair_rows = ws.take((rows,), torch.int32, dev)
     jit.select(cand_key, cand_count, lengths, row_to_batch, page_table, dst,
-               repair_rows, num_repair, i32, i32, st, page_size, sms, SELECT_KEYS)
+               repair_rows, num_repair, i32, i32, st, page_size, sms, select_keys)
 
     # Device-side repair of the listed rows (overflowed, or tau too high): rescored by the
     # compacting filter and selected again; three launches that do nothing when the list is empty.
