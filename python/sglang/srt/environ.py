@@ -929,6 +929,9 @@ class Envs:
     # Check every per-path Mamba cap walk against the cap / anchor rule and log
     # the counts every N walks (diagnostic); 0 (default) records nothing.
     SGLANG_MAMBA_PATH_CAP_AUDIT_EVERY = EnvInt(0)
+    # Mid-prefill chunk Mamba states donated to the radix tree: all (default),
+    # none, or last (only the chunk after which one chunk of input remains).
+    SGLANG_MAMBA_CHUNK_CKPT = EnvStr("all")
     # Scales the hierarchical Mamba host pool's share of --hicache-size (the KV
     # host pools take the rest); unset (default) splits it as the device pools are.
     SGLANG_HICACHE_MAMBA_HOST_SCALE = EnvFloat(None)

@@ -14,6 +14,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import MambaEvictExcessPathStates
 from sglang.srt.mem_cache.unified_cache.components.base import (
@@ -233,6 +234,32 @@ class TestMambaPathStateCap(unittest.TestCase):
             cache.mamba_path_cap_audit_counts,
             dict(walks=2, exact=1, other=1, moved=2),
         )
+
+    def test_chunk_checkpoint_switch_keeps_all_none_or_the_last_chunk(self):
+        chunk = 16384
+        # remaining input after this chunk -> kept under all / none / last
+        cases = {
+            3 * chunk: (True, False, False),
+            chunk: (True, False, True),
+            0: (True, True, True),
+            -5: (True, True, True),
+        }
+        for remaining, expected in cases.items():
+            req = SimpleNamespace(
+                origin_input_ids=[0] * 100000, extend_end=100000 - remaining
+            )
+            for mode, keep in zip(("all", "none", "last"), expected):
+                with (
+                    self.subTest(remaining=remaining, mode=mode),
+                    envs.SGLANG_MAMBA_CHUNK_CKPT.override(mode),
+                    mock.patch(
+                        "sglang.srt.mem_cache.unified_cache.components.mamba.get_schedule",
+                        return_value=SimpleNamespace(chunked_prefill_size=chunk),
+                    ),
+                ):
+                    self.assertEqual(
+                        MambaComponent._skip_chunk_checkpoint(req), not keep
+                    )
 
     def test_unified_cache_anchor_falls_back_without_a_shallow_state(self):
         component, nodes, core, cache = _build_unified_chain(cap=2, length=6)

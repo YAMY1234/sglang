@@ -43,8 +43,10 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BaseEvictionResult,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_exec,
+    get_schedule,
     mamba_cache_chunk_size,
     mamba_checkpoint_grid,
 )
@@ -669,6 +671,19 @@ class MambaComponent(TreeComponent):
             return None
         return previous_cache_len, pool.get_mamba_ping_pong_other_idx(keep_idx)
 
+    @staticmethod
+    def _skip_chunk_checkpoint(req: Req) -> bool:
+        """SGLANG_MAMBA_CHUNK_CKPT: none skips every mid-prefill chunk state, last
+        keeps only the one whose remaining input fits in one more chunk."""
+        mode = envs.SGLANG_MAMBA_CHUNK_CKPT.get()
+        remaining = len(req.origin_input_ids) - req.extend_end
+        if mode == "all" or remaining <= 0:  # the input end or a decode checkpoint
+            return False
+        if mode == "none":
+            return True
+        assert mode == "last", f"SGLANG_MAMBA_CHUNK_CKPT={mode!r}: all, none or last"
+        return remaining > get_schedule().chunked_prefill_size
+
     def prepare_for_caching_req(
         self,
         req: Req,
@@ -713,7 +728,7 @@ class MambaComponent(TreeComponent):
                 insert_params.mamba_value = active_value
             return cache_len
         else:
-            if cache_len is None:
+            if cache_len is None or self._skip_chunk_checkpoint(req):
                 return 0
             # Donate the mamba index to the radix cache instead of copying.
             if self.int8_ckpt_pool is not None:
