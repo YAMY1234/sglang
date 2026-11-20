@@ -803,6 +803,9 @@ class Envs:
     # Shard prefill KV transfer chunks across the transfer queues by bootstrap room instead of by
     # destination session, so one decode instance's sends use every worker (default off).
     SGLANG_DISAGG_TRANSFER_SHARD_BY_ROOM = EnvBool(False)
+    # Shard prefill KV transfer chunks by destination session set, round-robin over the transfer queues on
+    # first sight, so each decode DP group gets its own worker (default off; ignored with SHARD_BY_ROOM).
+    SGLANG_DISAGG_TRANSFER_SHARD_BY_DST_RR = EnvBool(False)
     # Run each KV transfer worker thread on its own device stream, so the DCP pack gather's
     # producer edge orders only after that worker's own work, not the legacy default stream (default off).
     SGLANG_DISAGG_TRANSFER_WORKER_STREAM = EnvBool(False)
@@ -1066,6 +1069,13 @@ class Envs:
     # chunk's rows for every decode DCP rank with a single gather, and move a
     # DCP-collapsed draft with the target rows. 0 restores the per-rank pack.
     SGLANG_DISAGG_DCP_CHUNK_PACK = EnvBool(False)
+    # PD DCP relayout transfer chunk (and pack buffer) in tokens; 0 keeps the
+    # prefill chunk size. Larger chunks send a long request in fewer gathers
+    # and Mooncake calls. Keep tokens * max row bytes <= 65535 KiB (one gather).
+    SGLANG_DISAGG_DCP_PACK_MAX_TOKENS = EnvInt(0)
+    # Mooncake calls per decode DCP rank per chunk on the custom-mem-pool path;
+    # 0 keeps one call per KV/index-K entry. Each call costs a GIL round trip.
+    SGLANG_DISAGG_DCP_SEND_CALLS = EnvInt(0)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
