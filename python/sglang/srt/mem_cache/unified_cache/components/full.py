@@ -243,6 +243,42 @@ class FullComponent(TreeComponent):
             return x.id
         return None
 
+    def peek_device_eviction_candidates(
+        self, num_tokens: int
+    ) -> list[tuple[NodeId, int, bool, bool]]:
+        """The device eviction walk's order without the eviction, as (node id,
+        tokens, Full KV not on host, write pending): a parent joins once its
+        last device child is taken."""
+        self._ensure_eviction_strategy()
+        tc = self.tree_core
+        heap = [
+            (self.session_ref_eviction_strategy(n), n)
+            for n in tc.evictable_device_leaves
+        ]
+        heapq.heapify(heap)
+        children_left: dict[UnifiedTreeNode, int] = {}
+        out: list[tuple[NodeId, int, bool, bool]] = []
+        covered = 0
+        while covered < num_tokens and heap:
+            _, x = heapq.heappop(heap)
+            n = len(x.key)
+            out.append(
+                (x.id, n, not x.backuped, x.write_through_pending_id is not None)
+            )
+            covered += n
+            p = x.parent
+            if p is None:
+                continue
+            if p not in children_left:
+                children_left[p] = sum(
+                    c.component_data[self.component_type].value is not None
+                    for c in p.children.values()
+                )
+            children_left[p] -= 1
+            if children_left[p] == 0 and tc._is_device_leaf(p, ignore_children=True):
+                heapq.heappush(heap, (self.session_ref_eviction_strategy(p), p))
+        return out
+
     def _evict_device_end(self) -> None:
         self._evict_device_heap = []
         self._evict_device_last_node = None

@@ -530,6 +530,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # Full KV on both tiers -> redundant host copy, reclaimed first by
         # write_back; insertion-ordered dict keeps victims TP-deterministic.
         self.full_host_duplicates: dict[NodeId, UnifiedTreeNode] = {}
+        # Device-tail nodes the write-ahead walk keeps backed; the first
+        # duplicate-reclaim pass spares them like the imminent demotes.
+        self.write_ahead_spare: set[NodeId] = set()
         # Rolling digest of reclaim victim ids, cross-checked across TP ranks.
         self.write_back_duplicate_reclaim_digest: int = 0
 
@@ -2008,6 +2011,17 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             return []
         return comp.peek_host_eviction_candidates(num_tokens)
 
+    def peek_device_eviction_candidates(
+        self, component_type: ComponentType, num_tokens: int
+    ) -> list[tuple[NodeId, int, bool, bool]]:
+        comp = self.components_by_type.get(component_type)
+        if comp is None or component_type != BASE_COMPONENT_TYPE:
+            return []
+        return comp.peek_device_eviction_candidates(num_tokens)
+
+    def set_write_ahead_spare(self, node_ids: list[NodeId]) -> None:
+        self.write_ahead_spare = set(node_ids)
+
     def peek_mamba_host_eviction_leaves(
         self, max_states: int
     ) -> list[tuple[NodeId, int, Optional[list[str]]]]:
@@ -2047,7 +2061,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         """Reclaim Full host duplicates until num_tokens are freed; pass 1
-        spares evictable D-leaves (imminent free demotes), pass 2 takes them."""
+        spares evictable D-leaves (imminent free demotes), pass 2 takes them.
+        The written-ahead tail is spared by both passes."""
         swept_ids: list[NodeId] = []
         for spare_imminent_demotes in (True, False):
             if tracker[BASE_COMPONENT_TYPE] >= num_tokens:
@@ -2059,7 +2074,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 if cd.value is None or cd.host_value is None:
                     swept_ids.append(node.id)  # stale entry
                     continue
-                if spare_imminent_demotes and node in self.evictable_device_leaves:
+                if node.id in self.write_ahead_spare or (
+                    spare_imminent_demotes and node in self.evictable_device_leaves
+                ):
                     continue
                 if not self._can_reclaim_full_host_duplicate(node):
                     continue
@@ -2411,9 +2428,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             self._update_evictable_leaf_sets(parent)
             cur = parent
 
-    def _is_device_leaf(self, node: UnifiedTreeNode) -> bool:
+    def _is_device_leaf(
+        self, node: UnifiedTreeNode, *, ignore_children: bool = False
+    ) -> bool:
         """D-leaf: Full device value present, no child with Full KV on device,
-        unlocked, not root.
+        unlocked, not root. ``ignore_children`` answers "would this be a
+        D-leaf once its device children are gone" for eviction-order peeks.
 
         Only the Full (base) component is required; auxiliary components
         (Mamba, SWA) are not mandatory for D-leaf membership."""
@@ -2422,7 +2442,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             return False
         if any(cd.lock_ref > 0 for cd in node.component_data):
             return False
-        if any(
+        if not ignore_children and any(
             child.component_data[ct].value is not None
             for child in node.children.values()
         ):

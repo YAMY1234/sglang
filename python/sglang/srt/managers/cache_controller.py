@@ -454,6 +454,8 @@ class HiCacheController:
         # True while the schedule stream waits on the latest launched forward.
         self.war_barrier_after_forward = False
         self.ack_write_queue: List[HiCacheAck] = []
+        # Device write-ahead copies (SGLANG_HICACHE_DEVICE_WRITE_AHEAD): eviction never waits on them.
+        self.ack_write_ahead_queue: List[HiCacheAck] = []
 
         self.l2_transfer_engine = L2TransferEngine(io_backend)
 
@@ -891,6 +893,7 @@ class HiCacheController:
         self.write_queue.clear()
         self.load_queue.clear()
         self.ack_write_queue.clear()
+        self.ack_write_ahead_queue.clear()
         self.ack_load_queue.clear()
         if self.enable_storage:
             self.prefetch_queue.queue.clear()
@@ -929,6 +932,7 @@ class HiCacheController:
             self.write_queue
             or self.load_queue
             or self.ack_write_queue
+            or self.ack_write_ahead_queue
             or self.ack_load_queue
         )
 
@@ -967,12 +971,23 @@ class HiCacheController:
         self.war_barrier_seq += 1
         self.war_barrier_after_forward = self.forward_start_event is not None
 
-    def start_writing(self, fence_event: Optional[device_module.Event] = None) -> None:
+    def start_writing(
+        self,
+        fence_event: Optional[device_module.Event] = None,
+        ack_queue: Optional[List[HiCacheAck]] = None,
+        stream=None,
+    ) -> None:
         """Submit the queued D2H writes behind the forward stream, or only behind
         ``fence_event``. Pass the event only if no forward launched after it can
-        still write the queued sources."""
+        still write the queued sources. The ack goes to ``ack_queue`` (default
+        ``ack_write_queue``), the copy to ``stream`` (default the engine's D2H stream)."""
         if len(self.write_queue) == 0:
             return
+        if ack_queue is None:
+            ack_queue = self.ack_write_queue
+        d2h_stream = (
+            self.l2_transfer_engine.device_to_host_stream if stream is None else stream
+        )
 
         t0 = time.perf_counter() if pmicro_hoststats.ON else 0.0
         op = CacheOperation.merge_ops(self.write_queue)
@@ -982,25 +997,26 @@ class HiCacheController:
         self.write_queue.clear()
 
         if fence_event is not None:
-            self.l2_transfer_engine.device_to_host_stream.wait_event(fence_event)
+            d2h_stream.wait_event(fence_event)
         elif self.write_fence_stream is not None:
             # The copy may read KV a forward is still writing: under overlap
             # scheduling a finished request is cached while the next forward
             # writes its last token, and an evicted SWA page can belong to an
             # unfinished checkpoint. Later forwards still overlap with the copy.
-            self.l2_transfer_engine.device_to_host_stream.wait_stream(
-                self.write_fence_stream
-            )
+            d2h_stream.wait_stream(self.write_fence_stream)
 
-        completion = self.l2_transfer_engine.submit_device_to_host(
-            self._l2_transfers(host_indices, device_indices, pool_transfers)
+        transfers = self._l2_transfers(host_indices, device_indices, pool_transfers)
+        completion = (
+            self.l2_transfer_engine.submit_device_to_host(transfers)
+            if stream is None
+            else self.l2_transfer_engine.submit_device_to_host(transfers, stream=stream)
         )
 
         self.mem_pool_device_allocator.set_hicache_transfer_done_event(
             (id(self), "write"), completion.finish_event
         )
 
-        self.ack_write_queue.append(
+        ack_queue.append(
             HiCacheAck(
                 start_event=completion.start_event,
                 finish_event=completion.finish_event,
@@ -1012,8 +1028,10 @@ class HiCacheController:
             )
         )
         if pmicro_hoststats.ON:
-            ack = self.ack_write_queue[-1]
-            pmicro_hoststats.OPS["backup_launch"].add(
+            ack = ack_queue[-1]
+            pmicro_hoststats.OPS[
+                "backup_launch" if ack_queue is self.ack_write_queue else "write_ahead_launch"
+            ].add(
                 time.perf_counter() - t0, ack.num_tokens, ack.num_bytes
             )
             if ack.timing_enabled:

@@ -279,6 +279,13 @@ def _tracker_to_binding(tracker: dict[ComponentType, int]) -> dict[int, int]:
     return {int(component): freed for component, freed in tracker.items()}
 
 
+_WRITE_AHEAD_REBUILD = (
+    "SGLANG_HICACHE_DEVICE_WRITE_AHEAD needs a Rust TreeCore extension that has "
+    "peek_device_eviction_candidates and set_write_ahead_spare; rebuild "
+    "rust/sglang-radix-tree or set SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python"
+)
+
+
 class _RustKVCacheEventRecorder:
     """Expose the Rust event queue through the Python recorder interface."""
 
@@ -920,6 +927,22 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 "SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python"
             ) from None
         return peek(int(component_type), num_tokens)
+
+    def peek_device_eviction_candidates(
+        self, component_type: ComponentType, num_tokens: int
+    ) -> list[tuple[NodeId, int, bool, bool]]:
+        try:
+            peek = self._binding.peek_device_eviction_candidates
+        except AttributeError:
+            raise RuntimeError(_WRITE_AHEAD_REBUILD) from None
+        return peek(int(component_type), num_tokens)
+
+    def set_write_ahead_spare(self, node_ids: list[NodeId]) -> None:
+        try:
+            set_spare = self._binding.set_write_ahead_spare
+        except AttributeError:
+            raise RuntimeError(_WRITE_AHEAD_REBUILD) from None
+        set_spare(list(node_ids))
 
     def peek_mamba_host_eviction_leaves(
         self, max_states: int
