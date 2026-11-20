@@ -1925,7 +1925,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             forward_batch=forward_batch, q_offset=q_offset
         )
         row_lo, row_hi = (0, q_offset) if tp_split is None else tp_split[1:3]
-        if tp_split is None and self._fused_topk_applies(metadata, q_fp8, k_fp8):
+        if (
+            tp_split is None
+            and self._fused_topk_applies(metadata, q_fp8, k_fp8)
+            and self._fused_topk_pays(
+                indexer_seq_lens_cpu, forward_batch.extend_seq_lens_cpu, q_offset
+            )
+        ):
             return self._get_topk_fused(
                 device_index=device_index,
                 metadata=metadata,
@@ -2160,6 +2166,25 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             and not get_is_capture_mode()
             and not torch.cuda.is_current_stream_capturing()
         )
+
+    @staticmethod
+    def _fused_topk_pays(
+        seq_lens_cpu: torch.Tensor, extend_lens: List[int], rows: int
+    ) -> bool:
+        """Host-only gate: the fused path's fixed costs (threshold, select, one sync)
+        pay off once the mean row window reaches SGLANG_DSA_FUSED_INDEXER_TOPK_MIN_MEAN_KEYS."""
+        min_keys = envs.SGLANG_DSA_FUSED_INDEXER_TOPK_MIN_MEAN_KEYS.get()
+        if min_keys <= 0:
+            return True
+        seq = seq_lens_cpu.tolist()
+        if len(seq) != len(extend_lens) or rows <= 0:
+            return False
+        # Row p of a request with prefix L sees L + p + 1 keys.
+        keys = sum(e * (s - e) + e * (e + 1) // 2 for s, e in zip(seq, extend_lens))
+        if keys >= min_keys * rows:
+            return True
+        _fused_topk_stats().record_gated(rows)
+        return False
 
     def _get_topk_fused(
         self,

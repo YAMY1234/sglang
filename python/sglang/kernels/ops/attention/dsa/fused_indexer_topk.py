@@ -267,8 +267,16 @@ class FusedTopKStats:
         self.log_interval = log_interval
         self.check_interval = check_interval
         self.total = dict(calls=0, rows=0, long_rows=0, fallback_rows=0, max_fallback=0, chunks=0,
-                          budget_mb=0, check_rows=0, check_differ=0, check_tie_explained=0, check_tie_checked=0)
+                          budget_mb=0, gated_calls=0, gated_rows=0,
+                          check_rows=0, check_differ=0, check_tie_explained=0, check_tie_checked=0)
         self.window = dict(self.total)
+        self.events = 0
+
+    def _tick(self) -> None:
+        self.events += 1
+        if self.log_interval and self.events % self.log_interval == 0:
+            logger.info("FSTK window %s total %s", self.window, self.total)
+            self.window = {k: 0 for k in self.window}
 
     def record(self, *, rows: int, long_rows: int, fallback_rows: int, chunks: int = 1, budget: int = 0) -> bool:
         """Counts one call; True when this call should also run the stock-path check."""
@@ -280,11 +288,15 @@ class FusedTopKStats:
             d["max_fallback"] = max(d["max_fallback"], fallback_rows)
             d["chunks"] += chunks
             d["budget_mb"] = budget >> 20
-        calls = self.total["calls"]
-        if self.log_interval and calls % self.log_interval == 0:
-            logger.info("FSTK window %s total %s", self.window, self.total)
-            self.window = {k: 0 for k in self.window}
-        return bool(self.check_interval) and calls % self.check_interval == 0
+        self._tick()
+        return bool(self.check_interval) and self.total["calls"] % self.check_interval == 0
+
+    def record_gated(self, rows: int) -> None:
+        """A call left to the unfused path because its rows are too short to pay."""
+        for d in (self.total, self.window):
+            d["gated_calls"] += 1
+            d["gated_rows"] += rows
+        self._tick()
 
     def record_check(self, *, rows: int, differ: int, tie_explained: int, tie_checked: int) -> None:
         for d in (self.total, self.window):

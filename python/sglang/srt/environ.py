@@ -2314,6 +2314,9 @@ class Envs:
     SGLANG_DSA_FUSED_INDEXER_TOPK = EnvBool(False)
     # Log the fused path's row and fallback counters every N calls (0 = off).
     SGLANG_DSA_FUSED_INDEXER_TOPK_LOG_INTERVAL = EnvInt(64)
+    # Use the fused path only when the batch's mean row window has at least this many keys
+    # (1-GPU crossover: 0.90x at 48k, 1.02x at 64k, 1.30x at 128k keys per row; 0 = always).
+    SGLANG_DSA_FUSED_INDEXER_TOPK_MIN_MEAN_KEYS = EnvInt(65536)
     # Debug: every N calls, compare 256 rows with the unfused path and log (0 = off).
     SGLANG_DSA_FUSED_INDEXER_TOPK_CHECK_INTERVAL = EnvInt(0)
     # Debug: log the GPU time of the prefill top-k (CUDA events) every N calls (0 = off).
