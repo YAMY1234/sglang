@@ -725,11 +725,21 @@ def _registered_device_ptr(host_ptr: int) -> int:
 _NODE_TABLE_WAIT_S = 3600
 
 
+@functools.cache
+def _table_code_digest() -> bytes:
+    with open(__file__, "rb") as f:
+        return hashlib.sha256(f.read()).digest()
+
+
 def node_table_address(model_path: str, name: str, nbytes: int) -> bytes:
     """Abstract Unix socket name of one node-shared table, keyed by the user, the
-    checkpoint (path and config.json) and the table's name and size."""
+    checkpoint (path and config.json), the table's name and size, the code that
+    builds it, and the job. Abstract names are node-wide across jobs, so without
+    the job a table built by another job (and charged to its cgroup) is shared."""
     model_path = os.path.realpath(model_path)
-    key = hashlib.sha256(f"{model_path}\0{name}\0{nbytes}\0".encode())
+    scope = envs.SGLANG_ENGRAM_NODE_TABLE_SCOPE.get() or os.environ.get("SLURM_JOB_ID", "")
+    key = hashlib.sha256(f"{model_path}\0{name}\0{nbytes}\0{scope}\0".encode())
+    key.update(_table_code_digest())
     try:
         with open(os.path.join(model_path, "config.json"), "rb") as f:
             key.update(f.read())

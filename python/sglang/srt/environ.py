@@ -2189,6 +2189,8 @@ class Envs:
     SGLANG_OPT_DSV41_MEGA_MHC_LOCALITY_INPLACE = EnvBool(False)
     # Deprecated for --engram-config "replication".
     SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("per_rank")
+    # Who may share a node_shared engram table: servers with the same value (default: the same SLURM_JOB_ID).
+    SGLANG_ENGRAM_NODE_TABLE_SCOPE = EnvStr("")
     # Scheduler-side staging of shared host-table rows on GPUs without ATS
     # (engram_staging.py); pays off for large prefill batches.
     SGLANG_OPT_DSV41_ENGRAM_HOST_STAGING = EnvBool(False)
