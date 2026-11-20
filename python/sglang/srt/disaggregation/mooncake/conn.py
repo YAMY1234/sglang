@@ -1806,6 +1806,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         jobs = [blocks for blocks in jobs if blocks]
 
         if self.enable_custom_mem_pool:
+            num_calls = envs.SGLANG_DISAGG_DCP_SEND_CALLS.get()
+            if num_calls > 0 and jobs:
+                flat = [block for blocks in jobs for block in blocks]
+                step = -(-len(flat) // num_calls)
+                jobs = [flat[i : i + step] for i in range(0, len(flat), step)]
             futures = [
                 executor.submit(self._transfer_data, mooncake_session_id, blocks)
                 for blocks in jobs

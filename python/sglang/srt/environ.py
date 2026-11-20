@@ -1044,6 +1044,13 @@ class Envs:
     # chunk's rows for every decode DCP rank with a single gather, and move a
     # DCP-collapsed draft with the target rows. 0 restores the per-rank pack.
     SGLANG_DISAGG_DCP_CHUNK_PACK = EnvBool(False)
+    # PD DCP relayout transfer chunk (and pack buffer) in tokens; 0 keeps the
+    # prefill chunk size. Larger chunks send a long request in fewer gathers
+    # and Mooncake calls. Keep tokens * max row bytes <= 65535 KiB (one gather).
+    SGLANG_DISAGG_DCP_PACK_MAX_TOKENS = EnvInt(0)
+    # Mooncake calls per decode DCP rank per chunk on the custom-mem-pool path;
+    # 0 keeps one call per KV/index-K entry. Each call costs a GIL round trip.
+    SGLANG_DISAGG_DCP_SEND_CALLS = EnvInt(0)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
