@@ -1879,7 +1879,7 @@ DECODE_TABLE: dict = {
 
 # Exact-M entries for the decode graph buckets, (N, K) -> {M: tactic}, taken before DECODE_TABLE when
 # SGLANG_OPT_SM107_MXFP8_DENSE_TABLE_BUCKETS is set. M = rows per rank of a captured bucket: B x 4 (target
-# verify, 384-704) and B x 3 (draft, 288-528) for the spec-decode buckets B 96-176; tactics are the dec-dense sweep's best per M
+# verify, 320-704, incl. B 106 / 159) and B x 3 (draft, 288-528) for the spec-decode buckets B 80-176; tactics are the dec-dense sweep's best per M
 # (40-layer CUDA-graph chains of real weights, bitwise to the served tactic).
 DECODE_TABLE_BUCKETS: dict = {
     # q_a | kv, 1792 x 5120
@@ -1888,11 +1888,14 @@ DECODE_TABLE_BUCKETS: dict = {
     (1792, 5120): {
         288: ((256, 64), (2, 4), False, 256),
         312: ((256, 64), (2, 4), False, 256),
+        320: ((256, 64), (2, 4), False, 256),
         336: ((256, 64), (2, 4), False, 256),
+        352: ((256, 64), (2, 4), False, 256),
         360: ((256, 64), (2, 4), False, 256),
         384: ((256, 64), (2, 4), False, 256),
         408: ((256, 64), (2, 4), False, 256),
         416: ((256, 64), (2, 4), False, 256),
+        424: ((256, 64), (2, 4), False, 256),
         432: ((256, 64), (2, 4), False, 256),
         448: ((256, 64), (2, 4), False, 256),
         456: ((256, 64), (2, 4), False, 256),
@@ -1903,6 +1906,7 @@ DECODE_TABLE_BUCKETS: dict = {
         544: ((256, 64), (2, 4), False, 256),
         576: ((256, 64), (2, 4), False, 256),
         608: ((256, 64), (2, 4), False, 256),
+        636: ((256, 64), (2, 4), False, 256),
         640: ((256, 64), (2, 4), False, 256),
         672: ((256, 64), (2, 4), False, 256),
         704: ((256, 64), (2, 4), False, 256),
@@ -1911,11 +1915,14 @@ DECODE_TABLE_BUCKETS: dict = {
     (5120, 8192): {
         288: ((256, 128), (2, 4), False, 256),
         312: ((256, 64), (2, 1), True, 256),
+        320: ((256, 128), (2, 4), False, 256),
         336: ((256, 128), (4, 1), True, 256),
+        352: ((256, 128), (2, 4), False, 256),
         360: ((256, 128), (2, 4), False, 256),
         384: ((256, 128), (2, 4), False, 256),
         408: ((256, 128), (2, 2), False, 256),
         416: ((256, 128), (2, 2), False, 256),
+        424: ((256, 128), (2, 4), False, 256),
         432: ((256, 128), (2, 4), False, 256),
         448: ((256, 128), (2, 4), False, 256),
         456: ((256, 128), (2, 4), False, 256),
@@ -1926,6 +1933,7 @@ DECODE_TABLE_BUCKETS: dict = {
         544: ((256, 128), (2, 1), True, 256),
         576: ((256, 128), (2, 1), True, 256),
         608: ((256, 128), (2, 1), True, 256),
+        636: ((256, 192), (2, 4), False, 256),
         640: ((256, 128), (2, 1), True, 256),
         672: ((256, 192), (2, 4), False, 256),
         704: ((256, 192), (2, 4), False, 256),
