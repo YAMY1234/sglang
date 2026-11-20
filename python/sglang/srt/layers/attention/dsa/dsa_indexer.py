@@ -1650,13 +1650,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
         elif use_dg_native:
             mqa_fn = _chunked_fp8_paged_mqa_logits
-            if (
-                envs.SGLANG_K31_DSA_PAGED_MQA_ONEBLOCK.get()
-                and paged_mqa_logits_1blk.supports(next_n, *q_fp8.shape[1:])
-            ):
+            shadow = envs.SGLANG_K31_DSA_PAGED_MQA_ONEBLOCK_SHADOW.get()
+            one_blk_ok = paged_mqa_logits_1blk.supports(next_n, *q_fp8.shape[1:])
+            if envs.SGLANG_K31_DSA_PAGED_MQA_ONEBLOCK.get() and one_blk_ok and not shadow:
                 mqa_fn = paged_mqa_logits_1blk.fp8_paged_mqa_logits_1blk
-            logits = deepgemm_paged_mqa_logits_native(
-                mqa_fn,
+            native_args = (
                 q_fp8,
                 kv_cache_fp8,
                 weights,
@@ -1664,10 +1662,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 block_tables,
                 schedule_metadata,
                 max_seq_len,
-                q_offset=q_offset,
-                B=B,
-                next_n=next_n,
             )
+            native_kw = dict(q_offset=q_offset, B=B, next_n=next_n)
+            logits = deepgemm_paged_mqa_logits_native(mqa_fn, *native_args, **native_kw)
+            if shadow and one_blk_ok:
+                from sglang.srt.layers.attention.dsa import mqa1blk_shadow
+
+                other = deepgemm_paged_mqa_logits_native(
+                    paged_mqa_logits_1blk.fp8_paged_mqa_logits_1blk, *native_args, **native_kw
+                )
+                mqa1blk_shadow.compare(layer_id, logits, other, seqlens_32_2d, q_offset)
+                if shadow == 2:
+                    logits = other
         else:
             logits = deepgemm_paged_mqa_logits_split(
                 _chunked_fp8_paged_mqa_logits,

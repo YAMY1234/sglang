@@ -2346,6 +2346,8 @@ class Envs:
     # one Q block per request (kernels/ops/attention/dsa/paged_mqa_logits_1blk.py),
     # bitwise DeepGEMM's logits; DeepGEMM streams next_n > 4 requests' KV twice.
     SGLANG_K31_DSA_PAGED_MQA_ONEBLOCK = EnvBool(False)
+    # Debug only: 1 = serve DeepGEMM's logits and bitwise-compare the one-block kernel's, 2 = the reverse.
+    SGLANG_K31_DSA_PAGED_MQA_ONEBLOCK_SHADOW = EnvInt(0)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
