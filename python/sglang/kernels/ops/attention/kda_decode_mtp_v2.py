@@ -191,6 +191,19 @@ def _copy16_g2s_sync(smem_ptr, gmem_ptr):
     )
 
 
+def _prefetch_l2_bulk(gmem_ptr, nbytes: int):
+    """cp.async.bulk.prefetch.L2: pull nbytes (multiple of 16) at gmem_ptr into L2."""
+    llvm.inline_asm(
+        None,
+        [gmem_ptr.toint().ir_value(), cutlass.Int32(nbytes).ir_value()],
+        "cp.async.bulk.prefetch.L2.global [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=0,
+    )
+
+
 def _clock():
     i64 = ir.IntegerType.get_signless(64)
     return cutlass.Int64(
@@ -275,6 +288,7 @@ def kda_decode_mtp_kernel(
     P2_VLDS: cutlass.Constexpr[bool],
     prof: cute.Tensor,
     PROF: cutlass.Constexpr[bool],
+    PF_DIST: cutlass.Constexpr[int],
 ):
     """KDA MTP decode — SMEM pre-compute + register-resident state.
 
@@ -555,6 +569,21 @@ def kda_decode_mtp_kernel(
         _issue_state_tile(
             state_g2s_copy, thr_state_copy, gStateTiles, sState, i_v, STATE_STAGES
         )
+
+    if cutlass.const_expr(PF_DIST > 0):
+        # The block PF_DIST ahead (the next wave's occupant of a resident slot)
+        # gets its 64 KB state pulled into L2 while this wave computes.
+        if tidx == BLOCK_THREADS - WARP_SIZE:
+            n_hv, n_req, _ = cute.arch.grid_dim()
+            pf = cutlass.Int64(i_n) * n_hv + i_hv + PF_DIST
+            if pf < cutlass.Int64(n_req) * n_hv:
+                pf_hv = cutlass.Int32(pf % n_hv)
+                pf_slot = cutlass.Int64(ssm_state_indices[cutlass.Int32(pf // n_hv)])
+                if pf_slot >= 0:
+                    _prefetch_l2_bulk(
+                        h0.iterator + cute.crd2idx((pf_slot, pf_hv, 0, 0), h0.layout),
+                        HEAD_DIM * TILE_K * 4,
+                    )
 
     cute.arch.griddepcontrol_wait()
     if cutlass.const_expr(PROF):
@@ -1255,6 +1284,7 @@ def _run_kda_decode_mtp_dspark(
     ASYNC_P1: cutlass.Constexpr[bool],
     P2_VLDS: cutlass.Constexpr[bool],
     PROF: cutlass.Constexpr[bool],
+    PF_DIST: cutlass.Constexpr[int],
     stream: cuda.CUstream,
 ):
     """Launch the fixed Kimi-K3/DSpARK bonus + NUM_SPEC-draft specialization."""
@@ -1362,6 +1392,7 @@ def _run_kda_decode_mtp_dspark(
         P2_VLDS,
         prof,
         PROF,
+        PF_DIST,
     ).launch(
         grid=(H, N, 1),
         block=[BLOCK_THREADS, 1, 1],
@@ -1378,6 +1409,12 @@ def _launch_bounds(async_p1: bool, block_threads: int) -> dict:
         return {}
     blocks = 2 if block_threads == BLOCK_THREADS_NARROW else 1
     return dict(max_number_threads=(block_threads, 1, 1), min_blocks_per_mp=blocks)
+
+
+def _l2pf_enabled() -> bool:
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_OPT_KDA_MTP_VERIFY_L2PF.get()
 
 
 def _persist_enabled() -> bool:
@@ -1656,6 +1693,16 @@ def fused_kda_decode_mtp_dspark(
 
     p2_vlds = async_p1 and os.environ.get("SGLANG_KDA_VERIFY_P2_VLDS", "0") == "1"
     prof = prof_buf is not None
+    pf_dist = 0
+    if num_spec >= 1 and _l2pf_enabled():
+        # Resident blocks per wave: two narrow blocks per SM, one wide.
+        per_sm = 2 if block_threads == BLOCK_THREADS_NARROW else 1
+        pf_dist = (
+            per_sm
+            * torch.cuda.get_device_properties(
+                torch.cuda.current_device()
+            ).multi_processor_count
+        )
     out = torch.empty_like(x_v)
     args = (
         recurrent_state,
@@ -1702,6 +1749,7 @@ def fused_kda_decode_mtp_dspark(
         async_p1,
         p2_vlds,
         prof,
+        pf_dist,
         float(scale),
         float(lower_bound),
         *(_tensor_layout_key(tensor, fits) for tensor, fits in zip(args, fits_32bit)),
@@ -1728,6 +1776,7 @@ def fused_kda_decode_mtp_dspark(
             ASYNC_P1=async_p1,
             P2_VLDS=p2_vlds,
             PROF=prof,
+            PF_DIST=pf_dist,
             stream=stream,
         )
         _DSPARK_COMPILED[key] = compiled

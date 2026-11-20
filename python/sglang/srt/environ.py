@@ -1851,6 +1851,9 @@ class Envs:
     # KDA CuTe verify, persistent over (request, head) items: the next item's state
     # and inputs are cp.async'd while the current item recurs; bit-identical.
     SGLANG_OPT_KDA_MTP_VERIFY_PERSIST = EnvBool(False)
+    # KDA CuTe verify: each block bulk-prefetches into L2 the state of the block one
+    # resident wave ahead (pure prefetch, no arithmetic change).
+    SGLANG_OPT_KDA_MTP_VERIFY_L2PF = EnvBool(False)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
