@@ -312,15 +312,29 @@ def kda_decode_mtp_kernel(
     # arithmetic: the outputs, rings and conv scratch are bit-identical.
     if cutlass.const_expr(ASYNC_P1):
         sCW = smem.allocate_tensor(
-            cutlass.BFloat16, cute.make_layout((3, KERNEL_WIDTH - 1, HEAD_DIM)), 16
+            cutlass.BFloat16,
+            cute.make_layout(
+                (3, KERNEL_WIDTH - 1, HEAD_DIM),
+                stride=((KERNEL_WIDTH - 1) * HEAD_DIM, HEAD_DIM, 1),
+            ),
+            16,
         )
         sW = smem.allocate_tensor(
-            cutlass.Float32, cute.make_layout((3, HEAD_DIM, KERNEL_WIDTH)), 16
+            cutlass.Float32,
+            cute.make_layout(
+                (3, HEAD_DIM, KERNEL_WIDTH),
+                stride=(HEAD_DIM * KERNEL_WIDTH, KERNEL_WIDTH, 1),
+            ),
+            16,
         )
         sDtb = smem.allocate_tensor(cutlass.Float32, cute.make_layout((HEAD_DIM,)), 16)
         # q, k, v, g, onorm gate: row t holds token bos + min(t, n_tok - 1).
         sX = smem.allocate_tensor(
-            cutlass.BFloat16, cute.make_layout((5, T_LOOP, HEAD_DIM)), 16
+            cutlass.BFloat16,
+            cute.make_layout(
+                (5, T_LOOP, HEAD_DIM), stride=(T_LOOP * HEAD_DIM, HEAD_DIM, 1)
+            ),
+            16,
         )
         sBraw = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T_LOOP,)), 16)
         if cutlass.const_expr(not APPLY_ONORM):
