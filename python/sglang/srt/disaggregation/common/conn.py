@@ -2693,7 +2693,8 @@ class CommonKVReceiver(BaseKVReceiver):
         # room; tell it how many to expect (a one-endpoint frame stays unchanged).
         room_endpoints = (
             [str(self.required_dst_info_num).encode("ascii")]
-            if self.required_dst_info_num > 1
+            if envs.SGLANG_PREFILL_COMPLETE_ALLOW_MULTI_ENDPOINT.get()
+            and self.required_dst_info_num > 1
             else []
         )
         try:
