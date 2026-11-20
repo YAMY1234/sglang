@@ -2192,6 +2192,12 @@ class Envs:
     # Scheduler-side staging of shared host-table rows on GPUs without ATS
     # (engram_staging.py); pays off for large prefill batches.
     SGLANG_OPT_DSV41_ENGRAM_HOST_STAGING = EnvBool(False)
+    # Prefill: issue each Engram layer's input-only half on a side stream ahead of its layer
+    # (1: the table gather; 2: the gather and the wkv projection). 0 runs both in the layer.
+    SGLANG_OPT_DSV41_ENGRAM_PREFETCH = EnvInt(0)
+    # How many layers ahead of its Engram layer the prefetch is issued, and the fewest rows it runs at.
+    SGLANG_OPT_DSV41_ENGRAM_PREFETCH_LOOKAHEAD = EnvInt(1)
+    SGLANG_OPT_DSV41_ENGRAM_PREFETCH_MIN_ROWS = EnvInt(4096)
     # Deprecated for --engram-config "lookup".
     SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS = EnvBool(False)
     # --engram-config replication node_shared: one copy per host NUMA node, read by

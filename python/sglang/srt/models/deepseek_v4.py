@@ -1147,6 +1147,83 @@ def deepseek_v4_engram_hash_ids(
 bcg_deepseek_v4_engram_hash_ids = eager_on_graph(True)(deepseek_v4_engram_hash_ids)
 
 
+class _EngramPrefetch:
+    """SGLANG_OPT_DSV41_ENGRAM_PREFETCH: an Engram layer's table rows (and wkv
+    projection) depend only on the token ids, so a side stream computes them a few
+    layers ahead while the main stream runs those layers."""
+
+    _streams: dict = {}
+
+    def __init__(self, layers, hash_ids, with_kv: bool, lookahead: int):
+        self.layers, self.hash_ids = layers, hash_ids
+        self.with_kv, self.lookahead = with_kv, lookahead
+        dev = hash_ids.device
+        if dev not in self._streams:
+            self._streams[dev] = torch.cuda.Stream(dev)
+        self.stream = self._streams[dev]
+        self.pending: dict = {}
+        self.next = 0
+
+    @classmethod
+    def plan(cls, layers, hash_ids, forward_batch, cp_extend: bool):
+        mode = envs.SGLANG_OPT_DSV41_ENGRAM_PREFETCH.get()
+        if (
+            mode == 0
+            or not _is_cuda
+            or hash_ids is None
+            or cp_extend
+            or hash_ids.shape[0] < envs.SGLANG_OPT_DSV41_ENGRAM_PREFETCH_MIN_ROWS.get()
+            or not forward_batch.forward_mode.is_extend_without_speculative()
+            or is_in_breakable_cuda_graph()
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return None
+        engrams = [l.engram for l in layers if getattr(l, "engram", None) is not None]
+        if not engrams or not all(e.can_prefetch() for e in engrams):
+            return None
+        return cls(
+            layers,
+            hash_ids,
+            mode >= 2,
+            envs.SGLANG_OPT_DSV41_ENGRAM_PREFETCH_LOOKAHEAD.get(),
+        )
+
+    def issue_through(self, i: int, end: int) -> None:
+        last = min(i + self.lookahead, end - 1)
+        start = max(self.next, i)
+        if start > last:
+            return
+        main = torch.cuda.current_stream()
+        waited = False
+        for j in range(start, last + 1):
+            engram = getattr(self.layers[j], "engram", None)
+            if engram is None:
+                continue
+            if not waited:
+                self.stream.wait_stream(main)
+                waited = True
+            with torch.cuda.stream(self.stream):
+                emb, kv = engram.prefetch(
+                    self.hash_ids[:, engram.layer_hash_index], self.with_kv
+                )
+                done = torch.cuda.Event()
+                done.record(self.stream)
+            self.pending[j] = (emb, kv, done)
+        self.next = last + 1
+
+    def take(self, i: int):
+        entry = self.pending.pop(i, None)
+        if entry is None:
+            return None
+        emb, kv, done = entry
+        main = torch.cuda.current_stream()
+        main.wait_event(done)
+        for t in (emb, kv):
+            if t is not None:
+                t.record_stream(main)
+        return emb, kv
+
+
 def _engram_image_token_id(config) -> Optional[int]:
     """The image token Engram hashes as blocked and leaves ungated (V4.1 vision)."""
     if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
@@ -4784,7 +4861,12 @@ class DeepseekV4Model(nn.Module):
             residual_batch.start(forward_batch)
             hidden_states = residual_batch.set_written(state, forward_batch)
         verify_floor_core = verify_saved_swa = None
+        engram_prefetch = _EngramPrefetch.plan(
+            self.layers, hash_ids, forward_batch, cp_extend
+        )
         for i in range(self.start_layer, self.end_layer):
+            if engram_prefetch is not None:
+                engram_prefetch.issue_through(i, self.end_layer)
             if (
                 i == self.late_layer_start
                 and forward_batch.forward_mode.is_target_verify()
@@ -4938,6 +5020,9 @@ class DeepseekV4Model(nn.Module):
                     forward_batch,
                     input_ids=input_ids,
                     cp_all_tokens=cp_extend,
+                    prefetched=(
+                        None if engram_prefetch is None else engram_prefetch.take(i)
+                    ),
                 )
                 state = state.with_residual(hidden_states)
                 if _is_cuda:

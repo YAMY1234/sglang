@@ -1826,6 +1826,42 @@ class EngramEmbedding(nn.Module):
         return local.view(*indices.shape, self.dim)
 
 
+_SIDE_MXFP8_WORKSPACE: dict = {}
+
+
+class _private_mxfp8_workspace:
+    """FlashInfer's mm_mxfp8 takes one cached workspace per device; a GEMM issued
+    on a side stream gets its own so it cannot race the main stream's."""
+
+    def __init__(self, device: torch.device):
+        self.device = device
+
+    def __enter__(self):
+        from flashinfer import utils as fi_utils
+
+        self.cache = fi_utils._cache_buf
+        self.key = ("mm_mxfp8_workspace", self.device)
+        main = self.cache.get(self.key)
+        side = _SIDE_MXFP8_WORKSPACE.get(self.device)
+        if main is not None and (side is None or side.numel() < main.numel()):
+            side = torch.empty_like(main)
+            _SIDE_MXFP8_WORKSPACE[self.device] = side
+        self.main = main
+        if side is not None:
+            self.cache[self.key] = side
+        return self
+
+    def __exit__(self, *exc):
+        side = self.cache.get(self.key)
+        if side is not None:
+            _SIDE_MXFP8_WORKSPACE[self.device] = side
+        if self.main is not None:
+            self.cache[self.key] = self.main
+        else:
+            self.cache.pop(self.key, None)
+        return False
+
+
 def engram_gate(
     x: torch.Tensor,
     kv: torch.Tensor,
@@ -1923,12 +1959,16 @@ class Engram(nn.Module):
         *,
         input_ids: torch.Tensor,
         cp_all_tokens: bool = False,
+        prefetched: Optional[tuple] = None,
     ) -> torch.Tensor:
         """x [T, hc_mult, dim]; hash_ids [T, n_hash_cols] and input_ids [T] for this
-        layer."""
+        layer. ``prefetched`` is ``prefetch``'s (emb, kv), already on this stream."""
+        kv = None
+        if prefetched is not None:
+            emb, kv = prefetched
         # The lookup runs first even for an idle DP-attention batch: under DP
         # attention it is a collective every rank has to join.
-        if (
+        elif (
             self.embed.staged_by_scheduler
             and forward_batch is not None
             and forward_batch.forward_mode.is_extend_without_speculative()
@@ -1943,7 +1983,8 @@ class Engram(nn.Module):
             # Nothing to gate, and the MXFP8 quantize behind wkv rejects an
             # empty M.
             return x
-        kv, _ = self.wkv(emb.flatten(-2))
+        if kv is None:
+            kv, _ = self.wkv(emb.flatten(-2))
         image_ids = input_ids if self.image_token_id is not None else None
         from sglang.kernels.ops.layernorm.mhc_mega import locality_stream_out
 
@@ -1958,6 +1999,24 @@ class Engram(nn.Module):
             self.image_token_id,
             out=locality_stream_out(x),
         )
+
+    def can_prefetch(self) -> bool:
+        """The lookup reads a whole-table host mapping or mapped peer shards: no
+        collective, so it can run on a side stream."""
+        e = self.embed
+        return (e._shared or e.peer is not None) and not e.staged_by_scheduler
+
+    def prefetch(
+        self, hash_ids: torch.Tensor, with_kv: bool
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """The half of ``forward`` that reads only the token ids: the table rows
+        and, with ``with_kv``, their wkv projection. Runs on the caller's stream."""
+        emb = self.embed(hash_ids)
+        if not with_kv:
+            return emb, None
+        with _private_mxfp8_workspace(emb.device):
+            kv, _ = self.wkv(emb.flatten(-2))
+        return None, kv
 
     def embed_rows(
         self,
