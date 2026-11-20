@@ -533,6 +533,53 @@ struct TopKRadixBase : TopKConfig {
     }
   }
 
+  /// for_each_input (N == 1) with kUnroll 16-byte loads in flight per thread instead of one: the same
+  /// elements reach `fn` in the same per-thread order; a decode row of ~49k scores is otherwise bound by
+  /// one load latency per 4096 scores.
+  template <uint32_t kUnroll, typename F>
+  SGL_DEVICE static void for_each_input_mlp(const float* __restrict__ in, uint32_t seq_len, F&& fn) {
+    static_assert(kUnroll >= 2);
+    const auto vin = reinterpret_cast<const float4*>(in);
+    const auto num_full = seq_len / kVecSize;
+    const auto emit4 = [&](const float4& v, uint32_t base) {
+      fn(v.x, base + 0);
+      fn(v.y, base + 1);
+      fn(v.z, base + 2);
+      fn(v.w, base + 3);
+    };
+    uint32_t vi = threadIdx.x;
+#pragma unroll 1
+    for (; vi + (kUnroll - 1) * kBlockSize < num_full; vi += kUnroll * kBlockSize) {
+      float4 v[kUnroll];
+#pragma unroll
+      for (uint32_t u = 0; u < kUnroll; ++u) v[u] = __ldcg(vin + vi + u * kBlockSize);
+#pragma unroll
+      for (uint32_t u = 0; u < kUnroll; ++u) emit4(v[u], (vi + u * kBlockSize) * kVecSize);
+    }
+#pragma unroll 1
+    for (; vi < num_full; vi += kBlockSize) emit4(__ldcg(vin + vi), vi * kVecSize);
+    if (vi == num_full) {
+      const auto base = vi * kVecSize;
+      if (base == seq_len) return;
+      const float4 v = __ldcg(vin + vi);
+      const float e[kVecSize] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+      for (uint32_t j = 0; j < kVecSize; ++j) {
+        if (base + j < seq_len) fn(e[j], base + j);
+      }
+    }
+  }
+
+  /// One pass over the input: for_each_input<1>, or for_each_input_mlp when kUnroll > 0.
+  template <uint32_t kUnroll, typename F>
+  SGL_DEVICE static void scan_input(const float* __restrict__ in, uint32_t seq_len, F&& fn) {
+    if constexpr (kUnroll == 0) {
+      for_each_input(in, seq_len, fn);
+    } else {
+      for_each_input_mlp<kUnroll>(in, seq_len, fn);
+    }
+  }
+
   template <uint32_t kSize>
   SGL_DEVICE static void init_histogram(uint32_t (&histogram)[kSize], uint32_t tx) {
     static_assert(kSize % kBlockSize == 0);
@@ -590,6 +637,7 @@ struct TopKRadixBase : TopKConfig {
   /// Re-stages the tie buffer exactly when the threshold bin overflows it: radix
   /// rounds narrow the bin to one bucket, then a final scan emits what lies above
   /// it and stages the bucket for the caller's handle_tie.
+  template <uint32_t kUnroll = 0>
   SGL_DEVICE static void refine_ties(  //
       const TopKProblem& problem,
       Smem* smem,
@@ -606,6 +654,9 @@ struct TopKRadixBase : TopKConfig {
     // for_each_input's elements with one copy of `fn` and reversed lanes, so this
     // cold scan shares no load address (hence no registers) with the fast path.
     const auto scan = [&](auto&& fn) {
+      if constexpr (kUnroll != 0) {
+        return for_each_input_mlp<kUnroll>(problem.in, problem.seq_len, fn);
+      }
       const auto seq_len = problem.seq_len;
       const auto num_vec = (seq_len + kVecSize - 1) / kVecSize;
       uint32_t vi = kBlockSize - 1 - tx;
@@ -798,7 +849,10 @@ struct TopKRegister : TopKRadixBase<12> {
 // Streaming path: seq_len > 8192 -- two vectorized passes over global memory
 // ---------------------------------------------------------------------------
 
-struct TopKStreaming : TopKRadixBase<12> {
+/// kUnroll > 0: every pass over the input keeps kUnroll loads in flight per thread (for_each_input_mlp);
+/// the selection and its tie order are unchanged.
+template <uint32_t kUnroll = 0>
+struct TopKStreamingT : TopKRadixBase<12> {
  public:
   static constexpr uint32_t kMaxSeqLen = std::numeric_limits<uint32_t>::max();
 
@@ -816,7 +870,7 @@ struct TopKStreaming : TopKRadixBase<12> {
     PDLWaitPrimary<kUsePDL>();
 
     // Phase 1: Load and build histogram
-    for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t) {
+    scan_input<kUnroll>(problem.in, problem.seq_len, [&](float val, uint32_t) {
       const auto bin = extract_coarse_bin<kHistBits>(val);
       atomicAdd(&smem->histogram[bin], 1);
     });
@@ -847,7 +901,7 @@ struct TopKStreaming : TopKRadixBase<12> {
       if (tx == 0) smem->tie_nonzero = 0;
       __syncthreads();
     }
-    for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
+    scan_input<kUnroll>(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
       if (val >= v_hi) {
         const auto pos = atomicAdd(&smem->count_gt, 1);
         if (pos < topk) [[likely]] {
@@ -870,7 +924,7 @@ struct TopKStreaming : TopKRadixBase<12> {
     __syncthreads();
     if (smem->count_eq > kMaxNumTie && (!zero_bin || smem->tie_nonzero != 0)) [[unlikely]] {
       // See the register path.
-      refine_ties(problem, smem, v_lo, v_hi, smem->count_eq);
+      refine_ties<kUnroll>(problem, smem, v_lo, v_hi, smem->count_eq);
     }
     const auto count_gt = smem->count_gt;
     const auto count_eq = smem->count_eq;
@@ -879,6 +933,8 @@ struct TopKStreaming : TopKRadixBase<12> {
     handle_tie(smem->tie_values, problem, count_gt, tie_count, remain_topk, &smem->tie_handle);
   }
 };
+
+using TopKStreaming = TopKStreamingT<0>;
 
 // ---------------------------------------------------------------------------
 // Cluster path: very long seq_len, small batch. `kClusterSize` blocks cooperate

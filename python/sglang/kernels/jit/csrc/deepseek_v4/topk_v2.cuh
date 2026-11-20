@@ -252,7 +252,7 @@ using RaggedSmem = impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Sm
  * `score[row_start : row_start + seq_len]`: writes each selected column plus
  * `offset` into `out`. The head mask is explained at `topk_ragged_kernel`.
  */
-template <bool kPDL>
+template <bool kPDL, uint32_t kUnroll = 0>
 SGL_DEVICE void ragged_window_topk(
     float* score,
     const uint32_t row_start,
@@ -286,7 +286,7 @@ SGL_DEVICE void ragged_window_topk(
   } else if (problem.seq_len <= Register4::kMaxSeqLen) {
     Register4::forward<kPDL>(problem, smem);
   } else {
-    Streaming::forward<kPDL>(problem, smem);
+    impl::TopKStreamingT<kUnroll>::template forward<kPDL>(problem, smem);
   }
 }
 
@@ -517,7 +517,7 @@ struct CandidateSink {
  * staged in shared memory; the epilogue then reads each selected score and
  * writes (score bits, global position), `(0, -1)` padded.
  */
-template <bool kPDL, bool kPush = false>
+template <bool kPDL, bool kPush = false, uint32_t kUnroll = 0>
 SGL_DEVICE void
 candidates_one_block(const TopKCandidatesParams& params, const uint32_t bx, RaggedSmem* smem, int32_t* s_topk_indices) {
   const auto seq_len = static_cast<uint32_t>(params.seq_lens[bx]);
@@ -536,19 +536,40 @@ candidates_one_block(const TopKCandidatesParams& params, const uint32_t bx, Ragg
     return;
   }
 
-  ragged_window_topk<kPDL>(score, row_start, seq_len, topk, s_topk_indices, 0, smem);
+  ragged_window_topk<kPDL, kUnroll>(score, row_start, seq_len, topk, s_topk_indices, 0, smem);
   device::PDLTriggerSecondary<kPDL>();
   __syncthreads();
   const auto sink = CandidateSink<kPush>::make(params, bx);
   for_each_item(topk, [&](uint32_t tx, uint32_t) { emit(sink, tx, s_topk_indices[tx]); });
 }
 
-template <bool kPDL, bool kPush = false>
+/// kUnroll > 0: rows past the register paths stream with kUnroll loads in flight per thread (same selection).
+template <bool kPDL, bool kPush = false, uint32_t kUnroll = 0>
 TOPK_KERNEL void topk_candidates_kernel(const __grid_constant__ TopKCandidatesParams params) {
   device::enable_smem_spilling();
   __shared__ RaggedSmem smem;
   __shared__ int32_t s_topk_indices[kMaxTopK];
-  candidates_one_block<kPDL, kPush>(params, blockIdx.x, &smem, s_topk_indices);
+  candidates_one_block<kPDL, kPush, kUnroll>(params, blockIdx.x, &smem, s_topk_indices);
+}
+
+/// The one-block candidates launch with `unroll` (0 = today's streaming loop, 2 or 4) loads in flight.
+template <bool kPDL, bool kPush>
+inline void launch_candidates_one_block(
+    const TopKCandidatesParams& params, uint32_t rows, DLDevice device, int64_t unroll) {
+  using namespace host;
+  const auto launch = [&](auto kernel) {
+    LaunchKernel(rows, kBlockSize, device).config({.use_pdl = kPDL}).launch(kernel, params);
+  };
+  switch (unroll) {
+    case 0:
+      return launch(topk_candidates_kernel<kPDL, kPush>);
+    case 2:
+      return launch(topk_candidates_kernel<kPDL, kPush, 2>);
+    case 4:
+      return launch(topk_candidates_kernel<kPDL, kPush, 4>);
+    default:
+      RuntimeCheck(false, "unroll must be 0, 2 or 4, got ", unroll);
+  }
 }
 
 // Packed DSA extend layout.
@@ -2087,7 +2108,8 @@ struct TopKKernel {
       const int64_t world,
       const int64_t rank,
       const int64_t cluster_size,
-      const int64_t cluster_floor) {
+      const int64_t cluster_floor,
+      const int64_t unroll) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
     auto L = SymbolicSize{"max_seq_len"};
@@ -2136,6 +2158,7 @@ struct TopKKernel {
     const auto rows = static_cast<uint32_t>(B.unwrap());
 #if SUPPORT_CLUSTER
     if (cluster_size != 0 && rows > 0) {
+      RuntimeCheck(unroll == 0, "unroll applies to the one-block launch only");
       RuntimeCheck(row_starts_ptr == nullptr, "the cluster candidate top-k takes rows starting at column 0");
       RuntimeCheck(cluster_floor >= 0 && cluster_floor <= UINT32_MAX, "invalid cluster_floor");
       const auto floor = static_cast<uint32_t>(cluster_floor);
@@ -2157,9 +2180,7 @@ struct TopKKernel {
     RuntimeCheck(cluster_size == 0, "the cluster candidate top-k needs sm90 / sm100");
     static_cast<void>(cluster_floor);
 #endif
-    LaunchKernel(rows, kBlockSize, device_.unwrap())
-        .config({.use_pdl = kUsePDL})
-        .launch(topk_candidates_kernel<kUsePDL>, params);
+    launch_candidates_one_block<kUsePDL, false>(params, rows, device_.unwrap(), unroll);
   }
 
   /**
@@ -2180,7 +2201,8 @@ struct TopKKernel {
       const int64_t cand_k,
       const int64_t slot,
       const int64_t cluster_size,
-      const int64_t cluster_floor) {
+      const int64_t cluster_floor,
+      const int64_t unroll) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
     auto L = SymbolicSize{"max_seq_len"};
@@ -2227,6 +2249,7 @@ struct TopKKernel {
     if (rows == 0) return;
 #if SUPPORT_CLUSTER
     if (cluster_size != 0) {
+      RuntimeCheck(unroll == 0, "unroll applies to the one-block launch only");
       RuntimeCheck(cluster_floor >= 0 && cluster_floor <= UINT32_MAX, "invalid cluster_floor");
       const auto floor = static_cast<uint32_t>(cluster_floor);
       const auto launch = [&]<uint32_t kClusterSize>() {
@@ -2247,9 +2270,7 @@ struct TopKKernel {
     RuntimeCheck(cluster_size == 0, "the cluster candidate top-k needs sm90 / sm100");
     static_cast<void>(cluster_floor);
 #endif
-    LaunchKernel(rows, kBlockSize, device_.unwrap())
-        .config({.use_pdl = kUsePDL})
-        .launch(topk_candidates_kernel<kUsePDL, true>, params);
+    launch_candidates_one_block<kUsePDL, true>(params, rows, device_.unwrap(), unroll);
   }
 
   /**

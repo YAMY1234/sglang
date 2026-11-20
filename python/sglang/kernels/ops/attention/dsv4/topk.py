@@ -248,6 +248,7 @@ def topk_transform_candidates_v2(
     overflow_rows: Optional[torch.Tensor] = None,
     coarse_bits: int = 10,
     cluster_size: Optional[int] = None,
+    unroll: int = 0,
 ) -> None:
     """Ragged top-k emitting candidates for a distributed top-k merge.
 
@@ -264,7 +265,8 @@ def topk_transform_candidates_v2(
     the selection stays exact. ``overflow_rows`` (int32 [1]) counts rows redone past the
     tie buffer; ``coarse_bits`` (10 / 11 / 12) is the cluster pass's coarse bin width.
     ``cluster_size`` selects the DCP decode path, where ``page_bits``, ``overflow_rows``
-    and ``coarse_bits`` do not apply.
+    and ``coarse_bits`` do not apply; there ``unroll`` (0, 2 or 4) sets the loads in
+    flight per thread of the one-block streaming pass (cluster size 0 only).
 
     NOTE: ``scores`` is written in place as for the ragged entry point.
     """
@@ -279,6 +281,7 @@ def topk_transform_candidates_v2(
             rank,
             int(cluster_size),
             0 if cluster_floor is None else int(cluster_floor),
+            int(unroll),
         )
         return
     module.topk_transform_candidates(
@@ -307,6 +310,7 @@ def topk_transform_candidates_dcp_push(
     slot: int,
     cluster_size: int = 0,
     cluster_floor: int = 0,
+    unroll: int = 0,
 ) -> None:
     """DCP decode top-k that pushes its candidates to the merge.
 
@@ -317,7 +321,8 @@ def topk_transform_candidates_dcp_push(
     of row slot ``i`` in every rank's merge buffer (``push_mc``: its multicast
     address; ``slot`` entries per row slot, ``counters.shape[0]`` row slots per
     parity; see ``jit/csrc/dsa/dcp_topk_merge.cuh``). ``counters``: [max_rows]
-    int64 merge calls per row slot; the merge advances them.
+    int64 merge calls per row slot; the merge advances them. ``unroll`` (0, 2 or
+    4; cluster size 0 only): loads in flight per thread of the streaming pass.
     """
     _jit_topk_v2_push_module().topk_transform_candidates_dcp_push(
         scores,
@@ -330,6 +335,7 @@ def topk_transform_candidates_dcp_push(
         slot,
         int(cluster_size),
         int(cluster_floor),
+        int(unroll),
     )
 
 

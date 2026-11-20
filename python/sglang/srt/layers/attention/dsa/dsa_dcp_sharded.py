@@ -249,6 +249,7 @@ class DcpTopKMerge:
         if self.push:
             worlds += (4,)
         self.cand_k = _merge_cand_k(world, topk)
+        self.cand_unroll = envs.SGLANG_OPT_DSA_DCP_TOPK_CAND_UNROLL.get()
         if world not in worlds or topk != 2048:
             print_info_once(
                 "DSA DCP top-k merge off: it needs 8 or 16 ranks and top-k 2048"
@@ -338,6 +339,7 @@ class DcpTopKMerge:
         into every rank's buffer, then the merge. Fills ``out`` (as ``__call__``)
         and returns the same keys localized, as ``dcp_localize_compact(out)``."""
         rows = out.shape[0]
+        cluster = candidates_cluster_size(rows)
         topk_transform_candidates_dcp_push(
             logits,
             local_lens,
@@ -347,8 +349,9 @@ class DcpTopKMerge:
             rank=self.rank,
             cand_k=self.cand_k,
             slot=dcp_topk_merge_row_slot(self.world, out.shape[1], self.cand_k, push=True),
-            cluster_size=candidates_cluster_size(rows),
+            cluster_size=cluster,
             cluster_floor=_CANDIDATE_CLUSTER_FLOOR,
+            unroll=0 if cluster else self.cand_unroll,
         )
         local = torch.empty_like(out)
         lengths = torch.empty(rows, dtype=torch.int32, device=out.device)
