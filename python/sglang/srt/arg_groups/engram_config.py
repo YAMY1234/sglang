@@ -15,9 +15,14 @@ class EngramReplication:
     NONE = "none"
     PER_NODE = "per_node"
     NODE_SHARED = "node_shared"
-    ALL = (NONE, PER_NODE, NODE_SHARED)
+    # Benchmark rigs: a private whole table per rank in anonymous huge-page memory,
+    # freed at exit (node_shared stays charged to the job) and read as fast.
+    PER_RANK_ANON = "per_rank_anon"
+    ALL = (NONE, PER_NODE, NODE_SHARED, PER_RANK_ANON)
     # The whole table in one host mapping that every rank on the node reads.
-    WHOLE_TABLE = (PER_NODE, NODE_SHARED)
+    WHOLE_TABLE = (PER_NODE, NODE_SHARED, PER_RANK_ANON)
+    # Every rank writes every row of its own table.
+    BUILDS_WHOLE = (NODE_SHARED, PER_RANK_ANON)
 
 
 class EngramLookup:

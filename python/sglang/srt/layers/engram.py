@@ -1476,7 +1476,7 @@ class EngramEmbedding(nn.Module):
         self._host_table_ptrs = (device_ptr, device_ptr + w_bytes)
         # A node-shared table is in the GPU's own page tables at large pages.
         self._sort_host_reads = (
-            replication != EngramReplication.NODE_SHARED
+            replication not in EngramReplication.BUILDS_WHOLE
             and _sorted_host_reads(torch.cuda.current_device())
         )
 
@@ -1510,7 +1510,8 @@ class EngramEmbedding(nn.Module):
         # A node-shared table's builder writes every row; its readers write none.
         rows = (
             slice(None)
-            if node_shared
+            if self.host_table is not None
+            and self.host_table.replication in EngramReplication.BUILDS_WHOLE
             else slice(self.row_start, self.row_start + self.rows)
         )
         dst = param.data[rows] if self._shared else param.data
@@ -1535,7 +1536,7 @@ class EngramEmbedding(nn.Module):
             self.peer.connect(self.row_start, label)
         if self.host_table is not None:
             self.host_table.finish_load(label)
-            if self.host_table.replication == EngramReplication.NODE_SHARED:
+            if self.host_table.replication in EngramReplication.BUILDS_WHOLE:
                 self._log_lookup_time(label)
 
     def _log_lookup_time(self, label: str) -> None:
