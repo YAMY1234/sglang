@@ -1,5 +1,6 @@
 import os
 import unittest
+from collections import Counter
 from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -351,6 +352,29 @@ class TestDecodePreallocCap(CustomTestCase):
         self.assertEqual(queue.queue, [waiting])
         queue._pre_alloc.assert_not_called()
         queue.tree_cache.unlock.assert_not_called()
+
+    def test_break_diag_counts_each_stop_reason(self):
+        first, second = _waiting_decode_req("a"), _waiting_decode_req("b")
+        queue = self._queue([first, second], reserved=[])
+        queue.prealloc_break_counts = Counter()  # SGLANG_DISAGG_DECODE_PREALLOC_BREAK_DIAG
+
+        self._pop(queue, cap="0.1")  # the second waits on the cap
+        queue._prealloc_reservation_fits.return_value = False
+        self._pop(queue, cap=None)  # then on the KV pool
+        queue.req_to_metadata_buffer_idx_allocator.available_size.return_value = 0
+        self._pop(queue, cap=None)  # then on the metadata buffers
+
+        self.assertEqual(queue.queue, [second])
+        self.assertEqual(
+            queue.prealloc_break_counts, Counter(cap=1, kv_fit=1, metadata=1)
+        )
+
+    def test_break_diag_off_keeps_no_counts(self):
+        queue = self._queue([_waiting_decode_req("a")], reserved=[])
+        queue.req_to_metadata_buffer_idx_allocator.available_size.return_value = 0
+
+        self.assertEqual(self._pop(queue, cap=None), ([], []))
+        self.assertIsNone(queue.prealloc_break_counts)
 
 
 if __name__ == "__main__":
