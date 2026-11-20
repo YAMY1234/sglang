@@ -6,6 +6,7 @@ https://github.com/deepseek-ai/DeepGEMM
 
 import functools
 import logging
+from typing import Optional
 
 import torch
 
@@ -57,35 +58,62 @@ def _stripe_offset(rows: int) -> int:
 
 
 class _LocalityPool:
-    """Rotating locality-striped residual and normed-output buffers."""
+    """Locality-striped residual and normed-output buffers. Two rotating slots; with
+    SGLANG_OPT_DSV41_MEGA_MHC_LOCALITY_INPLACE one slot whose residual is updated in place."""
 
-    def __init__(self, dg, hc: int, hidden: int, max_rows: int, device) -> None:
+    def __init__(self, dg, hc: int, hidden: int, max_rows: int, device, slots: int) -> None:
         domains = dg.locality_domain
         self.rows = -(-max_rows // _STRIPE_TOKENS) * _STRIPE_TOKENS + 2 * _STRIPE_TOKENS
         b = torch.bfloat16.itemsize
         self.residuals = [
             domains.empty_striped([self.rows, hc, hidden], torch.bfloat16, _STRIPE_TOKENS * hc * hidden * b)
-            for _ in range(_POOL_SLOTS)
+            for _ in range(slots)
         ]
         self.ys = [
             domains.empty_striped([self.rows, hidden], torch.bfloat16, _STRIPE_TOKENS * hidden * b)
-            for _ in range(_POOL_SLOTS)
+            for _ in range(slots)
         ]
+        self.nbytes = sum(t.numel() * t.element_size() for t in self.residuals + self.ys)
         self.sm_domains = domains.get_sm_locality_domains().to(device=device, dtype=torch.uint8).contiguous()
         self.next_slot = 0
-        logger.info("Mega mHC locality pool: %d rows x %d slots (residual and normed output)", self.rows, _POOL_SLOTS)
+        self.in_place = slots == 1
+        logger.info(
+            "Mega mHC locality pool: %d rows x %d slots (residual and normed output), %.2f GiB%s",
+            self.rows,
+            slots,
+            self.nbytes / (1 << 30),
+            ", residual updated in place" if self.in_place else "",
+        )
 
-    def take(self, residual: torch.Tensor, rows: int):
-        """The next slot not holding this call's input residual: its residual and output rows, and their offset."""
+    def residual_rows(self, rows: int) -> torch.Tensor:
         offset = _stripe_offset(rows)
+        return self.residuals[0][offset : offset + rows]
+
+    def take(self, residual: torch.Tensor, x: torch.Tensor, rows: int):
+        """This call's residual and output rows and their offset, or None for plain outputs."""
+        offset = _stripe_offset(rows)
+        sl = slice(offset, offset + rows)
+        if self.in_place:
+            # The kernel TMA-loads each (rows, routes, hidden) tile before storing it and tiles are disjoint, so the
+            # residual can be posted onto itself. Any other overlap with the slot (other rows, x) goes plain.
+            buf, y = self.residuals[0], self.ys[0]
+            out = buf[sl]
+            if residual.data_ptr() == out.data_ptr() and residual.stride() == out.stride():
+                return out, y[sl], offset
+            if _overlaps(residual, buf) or _overlaps(x, y):
+                return None
+            return out, y[sl], offset
         while True:
             slot = self.next_slot
-            self.next_slot = (slot + 1) % _POOL_SLOTS
+            self.next_slot = (slot + 1) % len(self.residuals)
             buf = self.residuals[slot]
-            begin = buf.data_ptr()
-            if not begin <= residual.data_ptr() < begin + buf.numel() * buf.element_size():
-                sl = slice(offset, offset + rows)
+            if not _overlaps(residual, buf):
                 return buf[sl], self.ys[slot][sl], offset
+
+
+def _overlaps(t: torch.Tensor, buf: torch.Tensor) -> bool:
+    begin = buf.data_ptr()
+    return begin <= t.data_ptr() < begin + buf.numel() * buf.element_size()
 
 
 @functools.cache
@@ -97,7 +125,43 @@ def _locality_pool(hc: int, hidden: int, device):
     if ld.get_num_locality_domains() != 2 or not dg.is_localization_available():
         logger.warning("Mega mHC locality pool unavailable (no 2-domain MLOPart localization); plain outputs")
         return None
-    return _LocalityPool(dg, hc, hidden, envs.SGLANG_OPT_DSV41_MEGA_MHC_LOCALITY_MAX_TOKENS.get(), device)
+    slots = 1 if envs.SGLANG_OPT_DSV41_MEGA_MHC_LOCALITY_INPLACE.get() else _POOL_SLOTS
+    return _LocalityPool(dg, hc, hidden, envs.SGLANG_OPT_DSV41_MEGA_MHC_LOCALITY_MAX_TOKENS.get(), device, slots)
+
+
+_reserved_pool = None
+
+
+def reserve_locality_pool(*, hf_config, is_draft: bool) -> None:
+    """With LOCALITY_INPLACE: build the one-slot pool before the KV cache is sized. Prefill residuals and attention
+    inputs of 5000+ rows then live in it instead of the caching allocator, so the KV sizer charges it to the runtime
+    slack (`locality_pool_reserved_bytes`)."""
+    global _reserved_pool
+    if is_draft or not envs.SGLANG_OPT_DSV41_MEGA_MHC_LOCALITY_INPLACE.get():
+        return
+    from sglang.srt.runtime_context import get_exec
+
+    # One slot serves one forward at a time; two interleaved microbatches would share it.
+    assert not get_exec().overlap.enable_two_batch_overlap
+    device = torch.device("cuda", torch.cuda.current_device())
+    _reserved_pool = _locality_pool(hf_config.hc_mult, hf_config.hidden_size, device)
+
+
+def locality_pool_reserved_bytes() -> int:
+    return 0 if _reserved_pool is None else _reserved_pool.nbytes
+
+
+def locality_residual_rows(rows: int) -> Optional[torch.Tensor]:
+    """The reserved slot's residual rows for a fresh residual stream (the first layer's broadcast), or None."""
+    pool = _reserved_pool
+    if (
+        pool is None
+        or rows < _LOCALITY_MIN_TOKENS
+        or rows + 2 * _STRIPE_TOKENS > pool.rows
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        return None
+    return pool.residual_rows(rows)
 
 
 def mhc_mega_boundary(
@@ -133,8 +197,9 @@ def mhc_mega_boundary(
     pool = None
     if dg is not None and _LOCALITY_MIN_TOKENS <= rows and not torch.cuda.is_current_stream_capturing():
         pool = _locality_pool(hc, hidden, x.device)
-    if pool is not None and rows + 2 * _STRIPE_TOKENS <= pool.rows:
-        updated, normalized, offset = pool.take(residual, rows)
+    taken = pool.take(residual, x, rows) if pool is not None and rows + 2 * _STRIPE_TOKENS <= pool.rows else None
+    if taken is not None:
+        updated, normalized, offset = taken
         if moe_input is not None:
             # The MoE gate reads the normed rows in token order
             normalized = torch.empty_like(x)

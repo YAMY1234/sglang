@@ -5211,8 +5211,13 @@ class DeepseekV4Model(nn.Module):
             else:
                 hidden_states = input_embeds
             from sglang.kernels.ops.layernorm.mhc import hc_broadcast
+            from sglang.kernels.ops.layernorm.mhc_mega import locality_residual_rows
 
-            hidden_states = hc_broadcast(hidden_states, self.hc_mult)
+            hidden_states = hc_broadcast(
+                hidden_states,
+                self.hc_mult,
+                out=locality_residual_rows(hidden_states.shape[0]),
+            )
         elif pp_proxy_tensors is None and self.tail_stage_start_layer is not None:
             # A tail server's warmup and dummy runs carry no residual; the
             # residual stream is bf16, as stage 0 captures it.

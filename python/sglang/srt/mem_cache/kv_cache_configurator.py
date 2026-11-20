@@ -3017,6 +3017,19 @@ class KVCacheConfigurator:
         )
 
         slack_gb = pre_model_load_memory * (1 - get_schedule().mem_fraction_static)
+        if envs.SGLANG_OPT_DSV41_MEGA_MHC_LOCALITY_INPLACE.get():
+            from sglang.kernels.ops.layernorm.mhc_mega import (
+                locality_pool_reserved_bytes,
+            )
+
+            # The pool holds the prefill residual and attention input that the
+            # caching allocator would otherwise hold inside the slack.
+            pool_gb = locality_pool_reserved_bytes() / (1 << 30)
+            if pool_gb:
+                logger.info(
+                    f"Mega mHC locality pool {pool_gb:.2f} GiB charged to the runtime slack ({slack_gb:.2f} GiB)"
+                )
+                slack_gb = max(slack_gb - pool_gb, 0)
         # Every prefill batch fits a captured bucket when batches are capped at the
         # request slots; the exemption also needs an explicit Mamba size: a larger
         # rest_memory would otherwise auto-size a bigger physical Mamba pool below.

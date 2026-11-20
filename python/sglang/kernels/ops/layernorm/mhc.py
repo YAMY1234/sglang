@@ -3,7 +3,7 @@ import importlib
 import logging
 import math
 import threading
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import triton
@@ -1893,12 +1893,14 @@ def _hc_broadcast_kernel(
         tl.store(y_row + k * H + offs, x, mask=mask)
 
 
-def hc_broadcast(x: torch.Tensor, hc_mult: int) -> torch.Tensor:
+def hc_broadcast(
+    x: torch.Tensor, hc_mult: int, out: Optional[torch.Tensor] = None
+) -> torch.Tensor:
     """[T, H] -> [T, hc_mult, H], every copy equal to x: the initial mHC residual."""
     if not x.is_cuda or x.stride(-1) != 1:
         return x.unsqueeze(1).repeat(1, hc_mult, 1)
     num_tokens, hidden = x.shape
-    y = x.new_empty(num_tokens, hc_mult, hidden)
+    y = x.new_empty(num_tokens, hc_mult, hidden) if out is None else out
     if num_tokens == 0:
         return y
     block_h = 1024

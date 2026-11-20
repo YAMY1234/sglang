@@ -95,6 +95,7 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.layers.dp_attention import get_dp_tp_group, require_gathered_buffer
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.kernels.ops.layernorm.mhc_mega import reserve_locality_pool
 from sglang.srt.layers.moe.mega_moe import allocate_mega_moe_buffers
 from sglang.srt.layers.offloader import (
     create_offloader,
@@ -785,6 +786,9 @@ class ModelRunner:
             is_draft=self.is_draft_worker,
         )
         allocate_mega_moe_buffers(self.model)
+        reserve_locality_pool(
+            hf_config=self.model_config.hf_config, is_draft=self.is_draft_worker
+        )
 
     def init_memory_saver_adapter(self):
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
