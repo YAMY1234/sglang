@@ -93,5 +93,47 @@ class TestPPOutputExchangeOrder(CustomTestCase):
                     streams[1].popleft()
 
 
+
+class TestRingWaitWork(CustomTestCase):
+    """SGLANG_PP_RING_WAIT_WORK: queued host work runs while the ring output is in
+    flight and the rest right after it, so every stage has run the same items, in
+    order, before the slot's result (and the release after it) is processed."""
+
+    def _wait(self, ready_after, items, with_event=True, work=True):
+        log = []
+        scheduler = SchedulerPPMixin()
+        scheduler.pp_ring_wait_work = (
+            deque((lambda i=i: log.append(("item", i))) for i in range(items)) if work else None
+        )
+        polls = iter([False] * ready_after + [True] * 100)
+        event = SimpleNamespace(
+            query=lambda: log.append(("query",)) or next(polls),
+            synchronize=lambda: log.append(("sync",)),
+        )
+        scheduler._pp_ring_wait(event if with_event else None)
+        return log, scheduler
+
+    def test_items_run_in_flight_and_the_rest_right_after(self):
+        log, scheduler = self._wait(ready_after=2, items=4)
+        sync = log.index(("sync",))
+        self.assertEqual([e for e in log[:sync] if e[0] == "item"], [("item", 0), ("item", 1)])
+        self.assertEqual([e[1] for e in log if e[0] == "item"], [0, 1, 2, 3])
+        self.assertEqual(log.count(("sync",)), 1)
+        self.assertFalse(scheduler.pp_ring_wait_work)
+
+    def test_a_ready_output_runs_everything_after_the_sync(self):
+        log, _ = self._wait(ready_after=0, items=3)
+        self.assertEqual(log[:2], [("query",), ("sync",)])
+        self.assertEqual([e[1] for e in log if e[0] == "item"], [0, 1, 2])
+
+    def test_no_batch_in_the_slot_still_runs_the_queue(self):
+        log, _ = self._wait(ready_after=5, items=2, with_event=False)
+        self.assertEqual(log, [("item", 0), ("item", 1)])
+
+    def test_off_only_synchronizes(self):
+        log, _ = self._wait(ready_after=3, items=0, work=False)
+        self.assertEqual(log, [("sync",)])
+
+
 if __name__ == "__main__":
     unittest.main()

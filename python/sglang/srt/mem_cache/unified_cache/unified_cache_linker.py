@@ -2254,6 +2254,9 @@ class UnifiedCacheLinkerWrapper:
             self.cache_linker, "store_tree", None
         ):
             path["path_hashes"] = lambda: cache.tree_core.get_prefix_hash_values(node_id)
+        defer = getattr(cache, "ring_wait_work", None)
+        if defer is not None:
+            path["defer"] = defer
         try:
             queued = self.cache_linker.offload(
                 transfers, session_id=getattr(cache, "insert_session_id", None), **path
@@ -2368,7 +2371,15 @@ class UnifiedCacheLinkerWrapper:
 
     # ---- lifecycle ----
 
+    def _run_deferred_offloads(self) -> None:
+        """SGLANG_PP_RING_WAIT_WORK: queued offload tails go to the backend before it
+        resets, so its queue and results stay in step with pending_offloads."""
+        work = getattr(self.cache, "ring_wait_work", None)
+        while work:
+            work.popleft()()
+
     def reset(self) -> None:
+        self._run_deferred_offloads()
         self.cache_linker.reset()
         if self.load_mode == "prefetch":
             self._clear_prefetch_state()
@@ -2433,6 +2444,7 @@ class UnifiedCacheLinkerWrapper:
             self.private_load_indices.pop(rid, None)
 
     def close(self) -> None:
+        self._run_deferred_offloads()
         self.cache_linker.close()
         if self.load_mode == "prefetch":
             self._clear_prefetch_state()

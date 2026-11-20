@@ -1174,6 +1174,69 @@ class TestStoreBudgetTailFirst(CustomTestCase):
         self.assertEqual(stage0.page_remove_counts["lease_retries"], 1)
         self.assertEqual(len(stage0.page_remove_retries), 1)
 
+    def _offload_stage(self, defer, drain_at, in_wait=0):
+        """Play EVENTS on one stage. With ``defer``, after event i in ``drain_at`` the
+        queued tails run: ``in_wait`` of them first (as if during the ring wait), then
+        the rest (right after it); both before the next event, as the PP loop does."""
+        linker = _budget_linker(16, 0)
+        linker.cpu_indices, linker.state_path_cap = False, 0
+        linker.record_offload_ready = lambda: ["ready"]
+        for i, event in enumerate(self.EVENTS):
+            if event[0] == "offload":
+                _, pages, _, states, path = event
+                transfers = [_pages(*pages)] + [_state(page) for page in states]
+                linker.offload(
+                    transfers, path_hashes=lambda path=path: path,
+                    **({"defer": defer} if defer is not None else {}),
+                )
+            else:
+                linker.load("r-" + event[1][0], [_pages(*event[1])])
+            if defer is not None and (i in drain_at or i == len(self.EVENTS) - 1):
+                for _ in range(min(in_wait, len(defer))):
+                    defer.popleft()()
+                while defer:
+                    defer.popleft()()
+        tasks = []
+        while not linker.offload_queue.empty():
+            task = linker.offload_queue.get_nowait()
+            tasks.append(
+                ("remove", sorted(task[1])) if task[0] == "remove"
+                else ("put", [list(t.keys) for t in task[0]], task[1], task[2], task[4])
+            )
+        tree = linker.store_tree
+        return tasks, sorted(tree.nodes), tree.units, dict(tree.counts)
+
+    def test_deferred_offload_tails_drained_before_the_next_event_match_inline(self):
+        # SGLANG_PP_RING_WAIT_WORK: an offload records its ready events at once and
+        # defers the rest (state cap, put, store tree); run before the next event,
+        # the puts, removals and store tree are what inline offloads produce.
+        inline = self._offload_stage(None, ())
+        self.assertTrue(any(t[0] == "remove" for t in inline[0]))
+        self.assertEqual(
+            self._offload_stage(deque(), set(range(len(self.EVENTS)))), inline
+        )
+
+    def test_every_stage_gets_the_same_store_state_whatever_its_wait_ran(self):
+        # Drained at the same logical points (here every second event), a stage
+        # that ran some tails during the ring wait and one that ran none until
+        # after it end with the same puts, removals and store tree.
+        drain_at = {1, 3, 5}
+        reference = self._offload_stage(deque(), drain_at, in_wait=0)
+        for in_wait in (1, 2, 5):
+            self.assertEqual(self._offload_stage(deque(), drain_at, in_wait), reference)
+
+    def test_a_deferred_offload_puts_nothing_until_it_runs(self):
+        linker = _budget_linker(16, 0)
+        linker.cpu_indices, linker.state_path_cap = False, 0
+        linker.record_offload_ready = lambda: ["ready"]
+        defer = deque()
+        linker.offload([_pages("a1", "a2")], path_hashes=lambda: ["a1", "a2"], defer=defer)
+        self.assertTrue(linker.offload_queue.empty())
+        self.assertEqual(linker.store_tree.units, 0)
+        defer.popleft()()
+        self.assertEqual(linker.offload_queue.get_nowait()[2], ["ready"])
+        self.assertEqual(linker.store_tree.units, 2)
+
     def test_low_fraction_sets_the_pages_per_eviction_pass(self):
         # SGLANG_LINKER_STORE_LOW_FRACTION: closer to 1, fewer pages per pass.
         for low_fraction, per_pass in ((0.9, 11), (0.99, 2)):

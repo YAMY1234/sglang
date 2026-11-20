@@ -1050,6 +1050,9 @@ class Envs:
     # Direct linker: offload puts on this many threads (results still in queue order;
     # a removal waits for every task queued before it).
     SGLANG_LINKER_OFFLOAD_THREADS = EnvInt(1)
+    # PP PD prefill: producers may queue host work that runs while the ring output
+    # is in flight; whatever is left runs right after it, before that result.
+    SGLANG_PP_RING_WAIT_WORK = EnvBool(False)
     # Prefetch mode (GLM names): a published read keeps its prefix locked until
     # its request is admitted, the held prefixes under this share of the Full
     # device pool (0 releases at publish; PP requires > 0).

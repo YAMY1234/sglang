@@ -2283,9 +2283,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         transfers: list[PoolTransfer],
         session_id: str | None = None,
         path_hashes: Callable[[], list[str]] | None = None,
+        defer: "deque | None" = None,
     ) -> bool:
         """``path_hashes`` gives the page hashes from the root to the node, for
-        the state path cap."""
+        the state path cap. ``defer`` (SGLANG_PP_RING_WAIT_WORK): the ready events
+        are recorded now and the rest (state cap, put, store tree) is appended to
+        it, to run in order before the next PP result is processed."""
         self._log_numa_first_request()
         if self.cpu_indices:
             transfers = attach_cpu_indices(transfers)
@@ -2296,8 +2299,20 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.freeze_gc_once()
         expanded = [t for t in expanded if t.name in self.offload_pools]
         if not expanded:
-            self.offload_results.put(True)
+            if defer is not None:  # keep its place among the deferred tails
+                defer.append(lambda: self.offload_results.put(True))
+            else:
+                self.offload_results.put(True)
             return True
+        ready_events = self.record_offload_ready()
+        tail = (expanded, transfers, ready_events, session_id, path_hashes)
+        if defer is not None:
+            defer.append(lambda: self._offload_tail(*tail))
+        else:
+            self._offload_tail(*tail)
+        return True
+
+    def _offload_tail(self, expanded, transfers, ready_events, session_id, path_hashes) -> None:
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
         tokens = len(kv.keys) * self.page_size
         victims = []
@@ -2305,7 +2320,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         path = path_hashes() if path_hashes is not None else None
         if self.state_path_cap and state is not None and path is not None:
             victims = self._cap_state_path(list(state.keys), path)
-        ready_events = self.record_offload_ready()
         if self.hole_trace is not None:
             self.hole_trace.note({k for t in expanded for k in t.keys}, "queued")
         self.offload_queue.put((expanded, tokens, ready_events, session_id, victims))
@@ -2320,7 +2334,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 list(state.keys) if state is not None else (),
             )
             self._queue_tail_eviction(tree.evict())
-        return True
 
     @staticmethod
     def _parent_page(pages: list[str], path: list[str] | None) -> str | None:
