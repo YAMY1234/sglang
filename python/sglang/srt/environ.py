@@ -1041,6 +1041,9 @@ class Envs:
     # With SGLANG_LINKER_PP_COUNTS_CONSENSUS: how many offload commits PP0 may have
     # issued and not yet seen applied on every stage (1: each waits for the last).
     SGLANG_LINKER_PP_OFFLOAD_COMMIT_WINDOW = EnvInt(1)
+    # Direct linker: remove the store-budget and state-cap victims with Mooncake's
+    # batch_remove (4096 keys per call) instead of one remove() call per key.
+    SGLANG_LINKER_BATCH_REMOVE = EnvBool(False)
     # Prefetch mode (GLM names): a published read keeps its prefix locked until
     # its request is admitted, the held prefixes under this share of the Full
     # device pool (0 releases at publish; PP requires > 0).

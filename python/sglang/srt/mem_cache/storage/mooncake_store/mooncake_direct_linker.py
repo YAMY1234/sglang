@@ -720,6 +720,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         self.load_per_key = envs.SGLANG_LINKER_LOAD_PER_KEY.get()
         self.page_checksum_rate = envs.SGLANG_LINKER_PAGE_CHECKSUM.get()
+        self.batch_remove = envs.SGLANG_LINKER_BATCH_REMOVE.get()
         self.page_checksums: OrderedDict[str, int] = OrderedDict()
         self.page_checksum_counts = Counter()
         self.page_checksum_lock = threading.Lock()
@@ -2454,7 +2455,20 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 self.offload_queue.task_done()
 
     _REMOVE_RETRIES = 6
+    _BATCH_REMOVE_KEYS = 4096
     offload_busy: Counter | None = None
+    batch_remove = False
+
+    def _store_remove(self, keys: list[str]) -> list[int]:
+        """Status codes of removing ``keys``: SGLANG_LINKER_BATCH_REMOVE sends them in
+        batches (one call per batch instead of one per key), the same codes."""
+        store = self.storage.store
+        if not self.batch_remove:
+            return [store.remove(key) for key in keys]
+        codes = []
+        for i in range(0, len(keys), self._BATCH_REMOVE_KEYS):
+            codes += store.batch_remove(keys[i : i + self._BATCH_REMOVE_KEYS])
+        return codes
 
     def _remove_states(self, page_hashes: list[str]) -> None:
         """Remove superseded state objects. Mooncake refuses an object under a
@@ -2471,8 +2485,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             keys = self.storage._tag_keys([f"{h}_{suffix}_{obj}" for h in page_hashes])
             due += [(now, key, self._REMOVE_RETRIES) for key in keys]
         retry_at = now + envs.SGLANG_LINKER_LEASE_TTL_SECS.get() + 1
-        for _, key, attempts in due:
-            rc = self.storage.store.remove(key)
+        codes = self._store_remove([key for _, key, _ in due])
+        for (_, key, attempts), rc in zip(due, codes):
             if rc == 0:
                 self.state_removed += 1
             elif rc == -704:  # OBJECT_NOT_FOUND: already evicted
@@ -2562,11 +2576,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         ]
         retry_at = now + envs.SGLANG_LINKER_LEASE_TTL_SECS.get() + 1
         counts, tree = self.page_remove_counts, self.store_tree
-        for _, key, attempts, page, decided in due:
-            if tree.is_recalled(page, decided):
-                counts["recalled"] += 1
-                continue
-            rc = self.storage.store.remove(key)
+        live = [entry for entry in due if not tree.is_recalled(entry[3], entry[4])]
+        counts["recalled"] += len(due) - len(live)
+        codes = self._store_remove([key for _, key, _, _, _ in live])
+        for (_, key, attempts, page, decided), rc in zip(live, codes):
             if self.page_checksum_rate and rc in (0, -704):
                 with self.page_checksum_lock:
                     self.page_checksums.pop(key, None)

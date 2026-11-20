@@ -591,6 +591,10 @@ class _RemovingStore:
         self.removed.append(key)
         return self.codes.get(key, 0)
 
+    def batch_remove(self, keys):
+        self.batches = getattr(self, "batches", 0) + 1
+        return [self.remove(key) for key in keys]
+
 
 def _capped_linker(cap):
     linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
@@ -643,9 +647,18 @@ class TestStatePathCap(CustomTestCase):
         self.assertEqual(linker._cap_state_path(["a1"], ["p", "sys", "a", "a1"]), ["sys"])
 
     def test_removal_retries_a_leased_state_once_its_lease_can_expire(self):
+        self._removal_retries_a_leased_state(batch=False)
+
+    def test_batch_removal_retries_a_leased_state_once_its_lease_can_expire(self):
+        # SGLANG_LINKER_BATCH_REMOVE: the same outcome, one store call per pass.
+        linker = self._removal_retries_a_leased_state(batch=True)
+        self.assertEqual(linker.storage.store.batches, 2)
+
+    def _removal_retries_a_leased_state(self, batch):
         # Mooncake refuses an object under a live lease (-706); a lookup or the
         # lease refresher may have touched the old state within the lease TTL.
         linker = _linker_over_stages(set(), num_stages=1)
+        linker.batch_remove = batch
         leased, gone = "model_s1_tp0_cp0_pp0_mamba", "model_s2_tp0_cp0_pp0_mamba"
         linker.storage.store = _RemovingStore({leased: -706, gone: -704})
         linker.storage.pool_suffixes = {
@@ -670,6 +683,7 @@ class TestStatePathCap(CustomTestCase):
         self.assertEqual(linker.state_removed, 2)
         self.assertEqual(linker.storage.store.removed.count(leased), 2)
         self.assertEqual(linker.state_remove_failed, 0)
+        return linker
 
 
 class _SettingStorage:
