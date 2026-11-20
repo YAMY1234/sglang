@@ -662,6 +662,10 @@ class Envs:
     # (weights_proj(x)) runs in the source stream's compressor block, beside wqkv_a, instead of
     # after the indexer wq_b. Same kernels and inputs (bitwise); only the stream order moves.
     SGLANG_OPT_DSV41_HOIST_INDEX_WEIGHTS = EnvBool(False)
+    # CUDA-graph replay fill: the num_token_non_padded and global_num_tokens slots are written
+    # from their host ints by one write_host_ints launch, instead of sub + clamp + copy and two
+    # fills per replay. Same values.
+    SGLANG_OPT_GRAPH_FILL_HOST_INTS = EnvBool(False)
     # Request-window commit of new SWA rows with a tile of rows per program instead of
     # one program per row. Same copies.
     SGLANG_OPT_DSV41_WINDOW_COMMIT_TILED = EnvBool(False)
