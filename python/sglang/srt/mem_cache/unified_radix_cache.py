@@ -222,6 +222,8 @@ class UnifiedRadixCache(BasePrefixCache):
     _wb_evict_batch = False
     # SGLANG_MAMBA_PATH_CAP_COUNTS_HOST, set by _init_mamba_path_cap_counts_host.
     _mamba_path_cap_counts_host = False
+    # SGLANG_MAMBA_PATH_CAP_AUDIT_EVERY, set by _init_mamba_path_cap_anchor.
+    _mamba_path_cap_audit_every = 0
     mamba_retention_counts: Optional[dict[str, int]] = None
     # L2->L3 write-back (SGLANG_OPT_HICACHE_STORAGE_WRITE_BACK); set in init_hicache.
     _storage_write_back: Optional[StorageWriteBack] = None
@@ -313,6 +315,7 @@ class UnifiedRadixCache(BasePrefixCache):
         for component in self.components.values():
             component.tree_core = self.tree_core
         self._init_mamba_path_cap_anchor()
+        self._init_mamba_path_cap_audit()
 
         if (
             page_interleave_shard_size(params.token_to_kv_pool_allocator) > 1
@@ -894,6 +897,56 @@ class UnifiedRadixCache(BasePrefixCache):
             cap,
             type(self.tree_core).__name__,
         )
+
+    def _init_mamba_path_cap_audit(self) -> None:
+        every = envs.SGLANG_MAMBA_PATH_CAP_AUDIT_EVERY.get()
+        if every <= 0 or not self.is_mamba_enabled:
+            return
+        if self.components[ComponentType.MAMBA].mamba_max_states_per_path < 1:
+            return
+        self.tree_core.set_mamba_path_cap_audit(True)
+        self._mamba_path_cap_audit_every = every
+        self.mamba_path_cap_audit_counts = dict(walks=0, exact=0, other=0, moved=0)
+
+    def _audit_mamba_path_cap(self) -> None:
+        """Check drained per-path cap walks against the rule: keep the newest
+        cap (or, with the anchor, the newest cap-1 plus the deepest older state
+        at or below half the tail's depth). Locks and forks make "other" legal."""
+        cap = self.components[ComponentType.MAMBA].mamba_max_states_per_path
+        anchor_on = self.tree_core.mamba_path_cap_anchor and cap >= 2
+        counts = self.mamba_path_cap_audit_counts
+        for tail_depth, before, kept in self.tree_core.take_mamba_path_cap_audit():
+            expected = set(before[: cap - 1 if anchor_on else cap])
+            if anchor_on:
+                anchor = next(
+                    (d for d in before[cap - 1 :] if 2 * d <= tail_depth),
+                    before[cap - 1],
+                )
+                expected.add(anchor)
+                counts["moved"] += anchor != before[cap - 1]
+            counts["walks"] += 1
+            if set(kept) == expected:
+                counts["exact"] += 1
+            else:
+                counts["other"] += 1
+                if counts["other"] <= 20:
+                    logger.info(
+                        "Mamba path cap audit other: tail=%d before=%s kept=%s",
+                        tail_depth,
+                        before,
+                        kept,
+                    )
+            if counts["walks"] % self._mamba_path_cap_audit_every == 0:
+                logger.info(
+                    "Mamba path cap audit: %s (cap %d, anchor %s); last tail=%d "
+                    "before=%s kept=%s",
+                    counts,
+                    cap,
+                    anchor_on,
+                    tail_depth,
+                    before,
+                    kept,
+                )
 
     def _init_mamba_path_cap_counts_host(self) -> None:
         """SGLANG_MAMBA_PATH_CAP_COUNTS_HOST: --mamba-max-states-per-path also

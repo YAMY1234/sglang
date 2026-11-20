@@ -984,6 +984,12 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             ) from None
         setter(enabled)
 
+    def set_mamba_path_cap_audit(self, enabled: bool) -> None:
+        self._binding.set_mamba_path_cap_audit(enabled)
+
+    def take_mamba_path_cap_audit(self) -> list[tuple[int, list[int], list[int]]]:
+        return self._binding.take_mamba_path_cap_audit()
+
     @property
     def is_host_memory_buffer_only(self) -> bool:
         return self._binding.is_host_memory_buffer_only()

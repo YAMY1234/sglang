@@ -2298,6 +2298,18 @@ fn evict_excess_path_states_anchor_falls_back_to_the_default_without_a_shallow_s
 }
 
 #[test]
+fn evict_excess_path_states_audit_records_holder_and_kept_depths() {
+    let (mut tc, nodes) = anchored_path(3, &[1, 2, 3, 4, 5, 6]);
+    tc.set_mamba_path_cap_audit(true);
+    freed_device_slots(&mut tc, nodes[5]);
+    assert_eq!(
+        tc.take_mamba_path_cap_audit(),
+        vec![(6, vec![6, 5, 4, 3, 2, 1], vec![6, 5, 3])]
+    );
+    assert!(tc.take_mamba_path_cap_audit().is_empty());
+}
+
+#[test]
 fn evict_excess_path_states_anchor_off_keeps_the_newest_cap() {
     let (mut tc, nodes) = anchored_path(3, &[1, 2, 3, 4, 5, 6]);
     tc.set_mamba_path_cap_anchor(false);

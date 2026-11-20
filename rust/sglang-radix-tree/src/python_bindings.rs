@@ -2161,6 +2161,14 @@ macro_rules! tree_core_methods {
                 py.detach(|| self.core().set_mamba_path_cap_anchor(enabled));
             }
 
+            fn set_mamba_path_cap_audit(&self, py: Python<'_>, enabled: bool) {
+                py.detach(|| self.core().set_mamba_path_cap_audit(enabled));
+            }
+
+            fn take_mamba_path_cap_audit(&self, py: Python<'_>) -> Vec<crate::unified_tree_core::MambaPathCapAudit> {
+                py.detach(|| self.core().take_mamba_path_cap_audit())
+            }
+
             /// The current write-back (vs write-through) policy.
             fn is_write_back(&self, py: Python<'_>) -> bool {
                 self.core_attached(py).is_write_back()
@@ -3589,6 +3597,18 @@ macro_rules! tree_core_binding {
                     self.inner.set_mamba_path_cap_anchor(py, enabled);
                     Ok(())
                 })
+            }
+
+            /// Record each per-path Mamba cap walk for an audit (drained by the cache).
+            fn set_mamba_path_cap_audit(&self, py: Python<'_>, enabled: bool) -> PyResult<()> {
+                catch_native_panic(|| {
+                    self.inner.set_mamba_path_cap_audit(py, enabled);
+                    Ok(())
+                })
+            }
+
+            fn take_mamba_path_cap_audit(&self, py: Python<'_>) -> PyResult<Vec<crate::unified_tree_core::MambaPathCapAudit>> {
+                catch_native_panic(|| Ok(self.inner.take_mamba_path_cap_audit(py)))
             }
 
             /// Set the write-through backup hit threshold; decided at HiCache init.

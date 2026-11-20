@@ -4719,6 +4719,7 @@ def test_mamba_path_cap_anchor_keeps_a_half_depth_state_through_the_adapter():
 
     core = _mamba_tree_core_with_cap(3)
     core.set_mamba_path_cap_anchor(True)
+    core.set_mamba_path_cap_audit(True)
     for depth in range(1, 7):  # a state at each depth 1..6, slot = depth
         ids = list(range(1, depth + 1))
         result = _mamba_insert(core, ids, [10 + i for i in ids], depth)
@@ -4732,6 +4733,7 @@ def test_mamba_path_cap_anchor_keeps_a_half_depth_state_through_the_adapter():
     # Keeps the newest cap-1 (5, 6) and the anchor at half the tail's depth (3).
     assert sorted(t.item() for t in device_frees[ComponentType.MAMBA]) == [1, 2, 4]
     assert core.mamba_evictable_size() == 3
+    assert core.take_mamba_path_cap_audit() == [(6, [6, 5, 4, 3, 2, 1], [6, 5, 3])]
 
 
 def test_eagle_with_mamba_falls_back_to_the_unigram_binding():

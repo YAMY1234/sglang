@@ -310,6 +310,20 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             }
             excess -= 1;
         }
+        if tree_core.mamba_path_cap_audit.is_some() {
+            let depth = |i: usize| walked - below[i];
+            let kept = (0..holders.len())
+                .filter(|&i| {
+                    let node = tree_core.arena.node(holders[i]);
+                    node.has_device_value(MAMBA) || (count_host && node.has_host_value(MAMBA))
+                })
+                .map(depth)
+                .collect();
+            let before = (0..holders.len()).map(depth).collect();
+            if let Some(audit) = tree_core.mamba_path_cap_audit.as_mut() {
+                audit.push((walked, before, kept));
+            }
+        }
     }
 
     fn redistribute_on_node_split(

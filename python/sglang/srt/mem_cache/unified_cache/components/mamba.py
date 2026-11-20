@@ -291,6 +291,7 @@ class MambaComponent(TreeComponent):
         ct = self.component_type
         count_host = self.tree_core.mamba_path_cap_counts_host
         use_anchor = self.tree_core.mamba_path_cap_anchor and cap >= 2
+        audit = self.tree_core.mamba_path_cap_audit
         holders = []
         below = []  # atoms from each holder's end down to the tail's end
         walked = 0
@@ -300,7 +301,7 @@ class MambaComponent(TreeComponent):
             if cd.value is not None or (count_host and cd.host_value is not None):
                 holders.append(node)
                 below.append(walked)
-            if use_anchor:
+            if use_anchor or audit is not None:
                 walked += len(node.key)
             node = node.parent
 
@@ -377,6 +378,14 @@ class MambaComponent(TreeComponent):
                     target=EvictLayer.HOST,
                 )
             excess -= 1
+        if audit is not None:
+            kept = [
+                walked - b
+                for node, b in zip(holders, below)
+                if node.component_data[ct].value is not None
+                or (count_host and node.component_data[ct].host_value is not None)
+            ]
+            audit.append((walked, [walked - b for b in below], kept))
 
     def redistribute_on_node_split(
         self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode
@@ -1145,6 +1154,8 @@ class MambaComponent(TreeComponent):
                     result.host_frees,
                     result.cache_actions,
                 )
+                if self.cache._mamba_path_cap_audit_every:
+                    self.cache._audit_mamba_path_cap()
                 if self.cache._mamba_path_cap_counts_host:
                     self.cache.mamba_retention_counts["path_cap_host_frees"] += len(
                         result.host_frees.get(self.component_type, ())

@@ -607,6 +607,8 @@ pub struct EvictionStepResult {
 
 /// wall_ns, event, node, component, tier, page/state keys, endpoint depth, cause.
 pub type L3LifetimeEvent = (u64, String, NodeId, u8, String, Vec<String>, usize, String);
+/// One per-path Mamba cap walk: (tail depth, holder depths tail-first, kept depths).
+pub type MambaPathCapAudit = (usize, Vec<usize>, Vec<usize>);
 
 /// The radix tree mechanism: owns the tree structure, per-node values, the
 /// per-component LRUs, the size/leaf bookkeeping, and the component drivers,
@@ -667,6 +669,8 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     /// The per-path Mamba cap keeps one older anchor state at or below half
     /// the tail's depth (opt-in, decided at HiCache init).
     pub(crate) mamba_path_cap_anchor: bool,
+    /// Per-path cap walks recorded for an audit (opt-in, drained by the cache).
+    pub(crate) mamba_path_cap_audit: Option<Vec<MambaPathCapAudit>>,
 
     /// Per-component monotonic sources for lock-segment UUIDs.
     pub(crate) component_uuid_counters: [i64; NUM_COMPONENT_TYPES],
@@ -1004,6 +1008,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             write_through_threshold: params.write_through_threshold,
             mamba_path_cap_counts_host: false,
             mamba_path_cap_anchor: false,
+            mamba_path_cap_audit: None,
             component_uuid_counters: COMPONENT_UUID_INITIAL_VALUES,
             device: params.device,
             empty_device_indices: Tensor::empty([0], (Kind::Int64, params.device)),
@@ -3802,6 +3807,14 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     /// Make the per-path Mamba cap keep a half-depth anchor state; decided at HiCache init.
     pub fn set_mamba_path_cap_anchor(&mut self, enabled: bool) {
         self.mamba_path_cap_anchor = enabled;
+    }
+
+    pub fn set_mamba_path_cap_audit(&mut self, enabled: bool) {
+        self.mamba_path_cap_audit = enabled.then(Vec::new);
+    }
+
+    pub fn take_mamba_path_cap_audit(&mut self) -> Vec<MambaPathCapAudit> {
+        self.mamba_path_cap_audit.as_mut().map(std::mem::take).unwrap_or_default()
     }
 
     pub fn enable_storage(&self) -> bool {

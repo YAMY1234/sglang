@@ -9,6 +9,7 @@ register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
 import unittest
 from array import array
 from collections import defaultdict
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -22,7 +23,11 @@ from sglang.srt.mem_cache.unified_cache.components.mamba import (
     MambaComponent,
 )
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedLRUList, UnifiedTreeNode
+from sglang.srt.mem_cache.unified_radix_cache import (
+    UnifiedLRUList,
+    UnifiedRadixCache,
+    UnifiedTreeNode,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.test.kits.unified_radix_cache.config import (
     CacheConfig,
@@ -39,6 +44,7 @@ class _FakeTreeCore:
         self.evictable_device_leaves = set()
         self.mamba_path_cap_counts_host = False
         self.mamba_path_cap_anchor = False
+        self.mamba_path_cap_audit = None
         self.component_evictable_size_ = {ComponentType.MAMBA: 0}
         self.component_protected_size_ = {ComponentType.MAMBA: 0}
         self.lru_lists = {
@@ -196,6 +202,36 @@ class TestMambaPathStateCap(unittest.TestCase):
         self.assertEqual(
             self._anchored_frees(cap=1, anchor=True),
             self._anchored_frees(cap=1, anchor=False),
+        )
+
+    def test_unified_cache_audit_records_holder_and_kept_depths(self):
+        component, nodes, core, cache = _build_unified_chain(cap=3, length=6)
+        core.mamba_path_cap_anchor = True
+        core.mamba_path_cap_audit = []
+        component._evict_excess_path_states(
+            nodes[-1], defaultdict(list), defaultdict(list), []
+        )
+        self.assertEqual(
+            core.mamba_path_cap_audit, [(6, [6, 5, 4, 3, 2, 1], [6, 5, 3])]
+        )
+
+    def test_audit_counts_walks_that_follow_the_anchor_rule(self):
+        before = [6, 5, 4, 3, 2, 1]
+        core = mock.Mock(mamba_path_cap_anchor=True)
+        core.take_mamba_path_cap_audit.return_value = [
+            (6, before, [6, 5, 3]),
+            (6, before, [6, 5, 4]),
+        ]
+        cache = SimpleNamespace(
+            components={ComponentType.MAMBA: mock.Mock(mamba_max_states_per_path=3)},
+            tree_core=core,
+            mamba_path_cap_audit_counts=dict(walks=0, exact=0, other=0, moved=0),
+            _mamba_path_cap_audit_every=100,
+        )
+        UnifiedRadixCache._audit_mamba_path_cap(cache)
+        self.assertEqual(
+            cache.mamba_path_cap_audit_counts,
+            dict(walks=2, exact=1, other=1, moved=2),
         )
 
     def test_unified_cache_anchor_falls_back_without_a_shallow_state(self):

@@ -926,6 +926,9 @@ class Envs:
     # --mamba-max-states-per-path keeps one older state at or below half the
     # path's depth in place of the oldest of the newest cap (needs cap >= 2).
     SGLANG_MAMBA_PATH_CAP_ANCHOR = EnvBool(False)
+    # Check every per-path Mamba cap walk against the cap / anchor rule and log
+    # the counts every N walks (diagnostic); 0 (default) records nothing.
+    SGLANG_MAMBA_PATH_CAP_AUDIT_EVERY = EnvInt(0)
     # Scales the hierarchical Mamba host pool's share of --hicache-size (the KV
     # host pools take the rest); unset (default) splits it as the device pools are.
     SGLANG_HICACHE_MAMBA_HOST_SCALE = EnvFloat(None)

@@ -622,6 +622,19 @@ class UnifiedTreeCoreInterface(ABC):
             f"{type(self).__name__} does not implement SGLANG_MAMBA_PATH_CAP_ANCHOR"
         )
 
+    def set_mamba_path_cap_audit(self, enabled: bool) -> None:
+        """Record each per-path Mamba cap walk as (tail depth, holder depths
+        tail-first, kept depths) for SGLANG_MAMBA_PATH_CAP_AUDIT_EVERY."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement SGLANG_MAMBA_PATH_CAP_AUDIT_EVERY"
+        )
+
+    def take_mamba_path_cap_audit(self) -> list[tuple[int, list[int], list[int]]]:
+        """Drain the recorded per-path Mamba cap walks."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement SGLANG_MAMBA_PATH_CAP_AUDIT_EVERY"
+        )
+
     @abstractmethod
     def insert_host(
         self,
